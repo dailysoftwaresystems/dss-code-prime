@@ -109,6 +109,25 @@ BENCH_CORE="$SCRIPT_DIR/speedtest1_bench.py"
 # ── defaults ─────────────────────────────────────────────────────────────────
 SQLITE_DIR="${SQLITE_DIR:-$HOME/src/sqlite}"
 SRC_DIR="${SRC_DIR:-$HOME/src/dss-code-prime}"
+# ★★ ABSENT-HOST FALLBACK — the same clause as `build-and-test.sh`, for the same
+# measured reason, and it fires ONLY when the preferred default does not exist.
+# ✔MEASURED 2026-08-26: the arm64 VPS keeps its clone at `~/src/Github/dss-code-prime`
+# (per-host locations are declared in `scripts/leg-tree/leg-tree.sh`), so this leg
+# failed with `no dsscp binary found ... Searched under
+# /home/ubuntu/src/dss-code-prime/build/` — after a full Release build had just
+# succeeded a few directories away. ★ The benchmark did not measure a slow compiler;
+# it measured a wrong path, and reported neither.
+# ★ TWIN PARITY: `benchmark-speedtest1.ps1` ALREADY derives this
+# (`$DssSrc = Resolve-Path (Join-Path $ScriptDir '..\..\..')`), so the `.sh` side was
+# the half that guessed. Deriving is the house pattern; this restores it.
+# ⓘ NOT made the unconditional default, deliberately — see the `SELF_REPO` note in
+# `build-and-test.sh`: where two checkouts exist (the WSL gate tree vs a `/mnt/c`
+# one) deriving would silently change WHICH TREE is measured.
+if [[ ! -d "$SRC_DIR" ]]; then
+  dss_self_repo="$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd)" || dss_self_repo=""
+  if [[ -n "$dss_self_repo" && -e "$dss_self_repo/.git" ]]; then SRC_DIR="$dss_self_repo"; fi
+  unset dss_self_repo
+fi
 DSS_BIN="${DSS_BIN:-}"
 OUT_DIR=""
 WORK_SIZE=25
@@ -192,6 +211,103 @@ substitute_main_tu() {          # substitute_main_tu <tus-file> <speedtest1.c>
   return 0
 }
 
+# ── WHAT IS THIS COMPILER, REALLY? ──────────────────────────────────────────
+# reference_label <invoked-id> <version-line> -> the name to publish for it
+#
+# ★★ THE LABEL IS WHAT THE COMPILER SAYS IT IS, NOT WHAT WE TYPED TO INVOKE IT.
+# On macOS the invoked name `gcc` would otherwise publish a row reading
+# "gcc 21.0.0" — a version gcc has never had — over a measurement of Apple clang.
+# If the version text CONFIRMS the invoked name it stands; otherwise the compiler's
+# own self-description wins. Same principle as the make target further down:
+# ASK IT, DO NOT GUESS. `command -v gcc` says WHERE a name resolves, never WHAT
+# lives there.
+#
+# ★ "CONFIRMS" IS A **WHOLE-WORD** TEST, AND IT HAS TO BE NOW THAT `cc` IS ON THE
+# CATALOGUE. The rule used to be a bare substring — `case "$_ver" in *"$_id"*)` —
+# and `gcc (Ubuntu 13.3.0…)` CONTAINS the substring `cc`, so a `cc` that is really
+# gcc confirmed as itself and would have published a row labelled `cc`, hiding a
+# gcc measurement behind a name that names nothing. The version text is lowercased
+# and every character that cannot be part of a program name is turned into a
+# separator, so the invoked name has to appear as its own token. `.` is
+# deliberately one of those separators: MinGW answers `gcc.exe (MinGW-W64 …)` and
+# `gcc` must still confirm there.
+# The `"$id"` is DOUBLE-QUOTED inside the case glob so a name carrying a glob
+# character is matched literally rather than interpreted.
+reference_label() {             # reference_label <invoked-id> <version-line>
+  local id="$1" ver="$2" norm label
+  id="$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')"
+  norm=" $(printf '%s' "$ver" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_+-' ' ') "
+  case "$norm" in
+    *" $id "*) printf '%s\n' "$1"; return 0 ;;
+  esac
+  label="$(printf '%s' "$ver" | sed -E 's/ version .*//; s/ \(.*//')"
+  [[ -n "$label" ]] || label="$1"
+  printf '%s\n' "$label"
+}
+
+# ── ASK make WHAT IT CALLS AN EXECUTABLE, ON EVERY make THAT EXISTS ──────────
+# derive_make_texe <build-dir> <printer-makefile-path>
+#   stdout: the value of $(T.exe) — POSSIBLY EMPTY, which is the correct answer
+#           on every POSIX host — on rc 0
+#   stderr: make's whole transcript on every refusal
+#   rc 0 answered · 3 no answer came back · 4 that Makefile defines no T.exe
+#      5 make exited non-zero
+#
+# ★★★ WHY THIS IS NOT `make --eval=…`, WHICH IS WHAT IT USED TO BE.
+# `--eval` is GNU make 4.0+. ✔MEASURED 2026-08-25 on the operator's macOS host:
+# `/usr/bin/make` there is GNU Make 3.81 — the only make macOS ships, and it is
+# never getting a newer one — and it answers `--eval=…` with `unrecognized
+# option`, its 30-line usage banner, and rc 2. The old call swallowed all of that
+# with `2>/dev/null || true`, took the empty string, and spelled the target
+# `sqlite3d`. That is EXACTLY the POSIX guess this block's own headline forbids,
+# and it was right on macOS only by coincidence, because T.exe happens to be empty
+# there. On a Windows-configured tree the same silent fallback names a target that
+# matches no rule, and make answers `Nothing to be done` with EXIT STATUS 0.
+#
+# ⇒ A PRINTER MAKEFILE READ ALONGSIDE THE REAL ONE. Repeated `-f` and `$(info …)`
+# are both GNU make 3.81 features. ✔MEASURED 2026-08-25 on real 3.81 (macOS) and
+# real 4.3 (WSL): identical answers for T.exe='.exe', for T.exe='' and for a
+# makefile that never mentions it.
+#
+# ★★ AND AN EMPTY ANSWER IS NOT TRUSTED ON ITS OWN — `$(origin T.exe)` IS THE
+# CONTROL, AND IT IS WHAT CLOSES THE FAIL-OPEN. Empty is the RIGHT answer on every
+# POSIX host, so "empty" can never distinguish a good probe from a probe that read
+# nothing. `origin` can: `file` when the Makefile really defines the variable,
+# `undefined` when it does not. ✔MEASURED on both makes: a makefile that does not
+# mention T.exe answers `<> origin=<undefined>` with rc 0 — the fail-open shape,
+# now a named refusal.
+#
+# The sentinel is delimited with `<`/`>` rather than brackets deliberately: the
+# value is parsed out with bash parameter expansion, whose patterns are GLOBS, and
+# an unbalanced `[` in a glob is a trap that would only fire on the empty value.
+derive_make_texe() {
+  local bld="$1" mk="$2" out rc line val origin
+  {
+    printf '%s\n' '# GENERATED by benchmark-speedtest1.sh — safe to delete.'
+    printf '%s\n' '# Read alongside the build directory'\''s own Makefile so that make itself'
+    printf '%s\n' '# answers what it calls the executable suffix. `$(info)` and repeated `-f`'
+    printf '%s\n' '# are GNU make 3.81 features; `--eval` is 4.0+ and macOS ships 3.81.'
+    printf '%s\n' '$(info __dss_texe=<$(T.exe)> origin=<$(origin T.exe)>)'
+    printf '%s\n' '__dss_texe_probe: ;'
+  } > "$mk" || return 5
+  if out="$( cd "$bld" && make -s -f Makefile -f "$mk" __dss_texe_probe 2>&1 )"; then rc=0; else rc=$?; fi
+  # ⚠ THE ORDER OF THESE THREE IS AN ATTRIBUTION DECISION, AND IT WAS MEASURED.
+  # `$(info …)` fires while make is PARSING, so a build dir with NO Makefile at
+  # all still prints `origin=<undefined>` — on the way to make's own "No such file
+  # or directory" and rc 2. Checking `origin` first therefore blamed a MISSING
+  # Makefile on a Makefile that "does not define T.exe": true, useless, and it
+  # sends the reader to look at a file that is not there. ✔MEASURED 2026-08-25 by
+  # running the driver over a tree whose configure writes no Makefile. `rc` first
+  # separates the two, and the rc-4 case is unaffected because that one exits 0.
+  if [[ "$rc" != 0 ]]; then printf '%s\n' "$out" >&2; return 5; fi
+  line="$(printf '%s\n' "$out" | grep -E '^__dss_texe=<.*> origin=<[a-z ]*>$' | tail -1 || true)"
+  if [[ -z "$line" ]]; then printf '%s\n' "$out" >&2; return 3; fi
+  val="${line#__dss_texe=<}"; val="${val%%> origin=<*}"
+  origin="${line##*origin=<}"; origin="${origin%>}"
+  if [[ "$origin" == undefined ]]; then printf '%s\n' "$out" >&2; return 4; fi
+  printf '%s\n' "$val"
+}
+
 if [[ $SELFTEST == 1 ]]; then
   step "benchmark-speedtest1.sh — self-test"
   fails=0
@@ -203,7 +319,14 @@ if [[ $SELFTEST == 1 ]]; then
   ck "substitution reports success on a well-formed TU list" "$r"
   ck "shell.c is gone"      "$(grep -qE '/shell\.c$' "$t/tus" && echo no || echo ok)"
   ck "speedtest1.c is in"   "$(grep -qxF /s/test/speedtest1.c "$t/tus" && echo ok || echo no)"
-  ck "the other TUs survive" "$([[ $(wc -l < "$t/tus") == 3 ]] && echo ok || echo no)"
+  # ⚠ `| tr -d ' '` IS NOT DECORATION. BSD `wc` right-ALIGNS its count, so
+  # `wc -l < f` answers `       3` on macOS and `3` on GNU. ✔MEASURED 2026-08-25 on
+  # the operator's Mac: without the trim this arm FAILED there and only there, so
+  # `--selftest` had never passed on the one host whose bash and make are the
+  # oldest this driver supports — the host its portability arms exist for. The two
+  # production readers of this same value (TU_COUNT, INC_COUNT, further down)
+  # already trim; this arm was the one place that did not.
+  ck "the other TUs survive" "$([[ $(wc -l < "$t/tus" | tr -d ' ') == 3 ]] && echo ok || echo no)"
 
   # The complement: a list with NO shell.c must be REFUSED, not silently
   # appended to. That is the case where the recipe derivation changed shape and
@@ -220,6 +343,51 @@ if [[ $SELFTEST == 1 ]]; then
   ck "the manifest generator is present"      "$([[ -r $MANIFEST_GEN ]] && echo ok || echo no)"
   ck "the shared harness core exports dss_bh_emit_recipe" \
      "$(declare -F dss_bh_emit_recipe >/dev/null && echo ok || echo no)"
+
+  # ── the label rule ─────────────────────────────────────────────────────────
+  # Every arm here is a real version line shipped by a real toolchain, and the
+  # `cc`-is-really-gcc arm is RED-ON-DISABLE by construction: restore the old
+  # substring test (`case "$ver" in *"$id"*`) and it alone goes red, because
+  # `gcc (Ubuntu …)` contains the substring `cc`.
+  step "self-test: the reference LABEL rule"
+  _lbl() { [[ "$(reference_label "$1" "$2")" == "$3" ]] && echo ok || echo no; }
+  _gcc_ver='gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0'
+  _apple_ver='Apple clang version 21.0.0 (clang-2100.1.1.101)'
+  _mingw_ver='gcc.exe (MinGW-W64 x86_64-ucrt-posix-seh, built by Brecht Sanders, r3) 13.2.0'
+  ck "gcc invoked as 'gcc' stays 'gcc'"            "$(_lbl gcc   "$_gcc_ver"   gcc)"
+  ck "★ 'cc' that IS gcc is labelled 'gcc', not 'cc'" "$(_lbl cc  "$_gcc_ver"   gcc)"
+  ck "'gcc' that is Apple clang is labelled 'Apple clang'" \
+                                                   "$(_lbl gcc   "$_apple_ver" 'Apple clang')"
+  ck "'cc' that is Apple clang is labelled 'Apple clang'" \
+                                                   "$(_lbl cc    "$_apple_ver" 'Apple clang')"
+  ck "clang invoked as 'clang' stays 'clang'"      "$(_lbl clang 'clang version 18.1.3 (1ubuntu1)' clang)"
+  ck "MinGW 'gcc.exe' still labels 'gcc'"          "$(_lbl gcc   "$_mingw_ver" gcc)"
+  ck "tcc invoked as 'tcc' stays 'tcc'"            "$(_lbl tcc   'tcc version 0.9.27 (x86_64 Linux)' tcc)"
+  ck "an empty version line falls back to the invoked name" "$(_lbl gcc '' gcc)"
+
+  # ── the executable-suffix probe ────────────────────────────────────────────
+  # ★ EXERCISED AGAINST THE REAL make ON THIS HOST, never a stub: the whole point
+  # of the rewrite is that the question survives make 3.81, and only a real make
+  # can answer whether it does. The `undefined` arm is the red-on-disable one —
+  # delete the `origin` check and it returns 0 with an empty suffix, which is the
+  # exact fail-open this closes.
+  step "self-test: the executable-suffix probe (make $(make --version 2>/dev/null | head -1))"
+  command -v make >/dev/null 2>&1 || die "the self-test needs 'make' to exercise the suffix probe."
+  mkdir -p "$t/mk-win" "$t/mk-posix" "$t/mk-other" "$t/mk-none"
+  printf 'T.exe = .exe\nall:\n' > "$t/mk-win/Makefile"
+  printf 'T.exe =\nall:\n'      > "$t/mk-posix/Makefile"
+  printf 'NOT_SQLITE = 1\nall:\n' > "$t/mk-other/Makefile"
+  if r="$(derive_make_texe "$t/mk-win" "$t/p1.mk" 2>/dev/null)"; then r2=0; else r2=$?; fi
+  ck "a Windows-configured Makefile answers '.exe'" "$([[ $r2 == 0 && $r == .exe ]] && echo ok || echo no)"
+  if r="$(derive_make_texe "$t/mk-posix" "$t/p2.mk" 2>/dev/null)"; then r2=0; else r2=$?; fi
+  ck "a POSIX Makefile answers EMPTY, and that is rc 0" "$([[ $r2 == 0 && -z $r ]] && echo ok || echo no)"
+  derive_make_texe "$t/mk-other" "$t/p3.mk" >/dev/null 2>&1 && r2=0 || r2=$?
+  ck "★ a Makefile that defines no T.exe is REFUSED (rc 4), never read as empty" \
+     "$([[ $r2 == 4 ]] && echo ok || echo no)"
+  derive_make_texe "$t/mk-none" "$t/p4.mk" >/dev/null 2>&1 && r2=0 || r2=$?
+  ck "a build dir with no Makefile at all is REFUSED" "$([[ $r2 != 0 ]] && echo ok || echo no)"
+  ck "the probe leaves its makefile behind for a reader" \
+     "$([[ -s $t/p1.mk ]] && echo ok || echo no)"
 
   step "self-test: the measurement core's own arms"
   python3 "$BENCH_CORE" --selftest || fails=$((fails+1))
@@ -253,20 +421,60 @@ command -v tclsh >/dev/null 2>&1 || die "'tclsh' is not on PATH.
       recipe cannot be derived without it. apt: tcl. brew: tcl-tk.
       (speedtest1 itself links no Tcl — this is a build-host tool.)"
 
-# ★ THE BINARY IS `dss-code-prime`, NOT `dss`, AND SEARCHING FOR THE WRONG NAME
-# LOOKS EXACTLY LIKE "NOT BUILT YET". The compiler is `dss-code-prime[.exe]`
-# (a rename to `dsscp` is queued but has not landed); build-and-test.sh resolves
-# it by `find … -name dss-code-prime -perm -u+x`, and this does the same rather
-# than carrying a second list of guessed paths. Preference is rel over dbg,
-# because a debug compiler's build time is not a number worth publishing.
+# ★ THE BINARY IS `dsscp`, NOT `dss`, AND SEARCHING FOR THE WRONG NAME
+# LOOKS EXACTLY LIKE "NOT BUILT YET". The compiler is `dsscp[.exe]`.
+#
+# ★★★ THE BUILD TYPE IS *ASKED OF THE BUILD*, NEVER INFERRED FROM A DIRECTORY NAME.
+# This block's own comment used to say "preference is rel over dbg, because a debug
+# compiler's build time is not a number worth publishing" — the right intent, which
+# the code could not deliver: it tried `build/rel` then `build/dbg` BY NAME, and a
+# release tree called anything else was invisible to it. `CMAKE_BUILD_TYPE:STRING`
+# in each root's `CMakeCache.txt` is the authoritative answer, and it is what
+# `build-and-test.ps1` already reads ("build type READ from CMakeCache.txt").
+# ⚠ ✔MEASURED 2026-08-26 ON TWO HOSTS: the arm64 VPS keeps its Release tree in
+# `build/bench-rel` while `build/rel` exists with NO compiler in it, so the by-name
+# loop fell through to `build/dbg` and BENCHMARKED A DEBUG COMPILER — publishing a
+# number several times worse than the truth, attributed to DSS, with nothing said.
+# The WSL host produced a VALID number only by luck: it holds `bench-rel` (Release),
+# `rel` (Release) AND `dbg` (Debug), and `find` order happened to reach a Release
+# one first. **A benchmark cannot tell a slow compiler from a wrongly-selected one**,
+# so this is a measurement-VALIDITY defect, not a convenience.
+# ⇒ Enumerate every root that actually HOLDS a compiler, ask each what it is, prefer
+# Release, and REFUSE a non-Release one unless the operator says otherwise via
+# `DSS_ALLOW_NONRELEASE_COMPILER=1` — the same escape hatch, spelled the same way,
+# that `build-and-test.{sh,ps1}` already document.
 if [[ -z "$DSS_BIN" ]]; then
-  for _tree in rel dbg; do
-    DSS_BIN="$(find "$SRC_DIR/build/$_tree" -type f -name 'dss-code-prime*' \
-                 -perm -u+x -print -quit 2>/dev/null || true)"
-    [[ -n "$DSS_BIN" ]] && break
+  _dss_rel=""; _dss_other=""; _dss_other_type=""
+  for _cand in "$SRC_DIR"/build/*/; do
+    [[ -d "$_cand" ]] || continue
+    _bin="$(find "$_cand" -type f -name 'dsscp*' -perm -u+x -print -quit 2>/dev/null || true)"
+    [[ -n "$_bin" ]] || continue
+    # No cache => the root cannot state what it is. Treated as UNKNOWN rather than
+    # assumed Release: assuming is how the defect above happened.
+    _type="$(grep -m1 '^CMAKE_BUILD_TYPE:STRING=' "$_cand/CMakeCache.txt" 2>/dev/null | cut -d= -f2)"
+    case "$_type" in
+      Release|RelWithDebInfo|MinSizeRel)
+        [[ -n "$_dss_rel" ]] || { _dss_rel="$_bin"; DSS_BUILD_TYPE="$_type"; } ;;
+      *)
+        [[ -n "$_dss_other" ]] || { _dss_other="$_bin"; _dss_other_type="${_type:-<unstated>}"; } ;;
+    esac
   done
-  [[ -n "$DSS_BIN" ]] || DSS_BIN="$(find "$SRC_DIR/build" -type f -name 'dss-code-prime*' \
-                                      -perm -u+x -print -quit 2>/dev/null || true)"
+  if [[ -n "$_dss_rel" ]]; then
+    DSS_BIN="$_dss_rel"
+  elif [[ -n "$_dss_other" ]]; then
+    if [[ "${DSS_ALLOW_NONRELEASE_COMPILER:-0}" == "1" ]]; then
+      DSS_BIN="$_dss_other"; DSS_BUILD_TYPE="$_dss_other_type"
+      warn "measuring a NON-RELEASE compiler ($_dss_other_type) because DSS_ALLOW_NONRELEASE_COMPILER=1: $DSS_BIN"
+    else
+      die "the only dsscp under $SRC_DIR/build is a ${_dss_other_type} build: $_dss_other
+      A debug compiler's build time is not a number worth publishing, and a
+      benchmark cannot tell a slow compiler from a wrongly-selected one.
+      Build a release one:  scripts/local-build/local-build.sh --tree rel
+      Pass one explicitly:  --dss <path>
+      Or override on purpose: DSS_ALLOW_NONRELEASE_COMPILER=1 $0"
+    fi
+  fi
+  unset _dss_rel _dss_other _dss_other_type _cand _bin _type
 fi
 # ⚠ TWO DIFFERENT FACTS, TWO DIFFERENT MESSAGES. "You passed a path that is not
 # executable" and "nothing was found under the tree I searched" have different
@@ -274,22 +482,186 @@ fi
 # they already have. An instrument that misattributes is the failure this project
 # cares most about.
 if [[ -n "${DSS_BIN:-}" && ! -x "$DSS_BIN" ]]; then
-  die "the dss-code-prime path given is not an executable file: $DSS_BIN
-      (the compiler is named 'dss-code-prime[.exe]', not 'dss')"
+  die "the dsscp path given is not an executable file: $DSS_BIN
+      (the compiler is named 'dsscp[.exe]', not 'dss')"
 fi
-[[ -n "${DSS_BIN:-}" ]] || die "no dss-code-prime binary found.
+[[ -n "${DSS_BIN:-}" ]] || die "no dsscp binary found.
       Pass --dss <path>, or build one: scripts/local-build/local-build.sh --tree rel
-      Searched for an executable named dss-code-prime* under $SRC_DIR/build/."
-info "dss       : $DSS_BIN"
+      Searched for an executable named dsscp* under $SRC_DIR/build/."
+# ⚠ THE BUILD TYPE IS PRINTED BESIDE THE PATH, ALWAYS. A benchmark cannot tell a
+# slow compiler from a wrongly-selected one, so the reader must be able to. A path
+# alone let a Debug compiler be published as DSS's speed on 2026-08-26.
+# `<unstated>` when the root has no CMakeCache to ask, and `<explicit --dss>` when
+# the operator named the path and this script did no selecting.
+info "dss       : $DSS_BIN  (build type: ${DSS_BUILD_TYPE:-<explicit --dss / unstated>})"
 
-# The reference C compiler. A benchmark that silently picked whichever `cc`
-# happened to be first would compare against an unnamed toolchain; the version
-# is captured and printed in the report next to its number.
-[[ -n "$REF_CC" ]] || REF_CC="$(command -v gcc || command -v clang || true)"
-[[ -n "$REF_CC" ]] || die "no reference C compiler found (looked for gcc, then clang).
+# ── THE REFERENCE C COMPILERS, PLURAL ────────────────────────────────────────
+# A benchmark that silently picked whichever `cc` happened to be first would
+# compare against an unnamed toolchain; every version is captured and printed in
+# the report beside its own number.
+#
+# ★★ THIS TOOK THE FIRST HIT AND STOPPED — `command -v gcc || command -v clang`
+# — so on a host carrying BOTH, gcc always won the `||` and THE CLANG ARM COULD
+# NEVER APPEAR, whatever was installed. That is the failure class `compile-bench`
+# refuses by name: a benchmark that quietly drops a compiler reads exactly like
+# one where that compiler was absent. Here it was worse than quiet, because no
+# host configuration could have produced the missing row.
+# ⇒ EVERY reference found is measured, each as its own arm keyed on its own name.
+#   `--cc <path>` still pins exactly one, which is what a caller comparing
+#   against one specific build wants.
+#
+# ★★★ AND THE OTHER HALF OF THAT RULE: EVERY CANDIDATE THIS HOST DID **NOT**
+# MEASURE IS PRINTED, WITH THE PROBE THAT FAILED. The list above was written as an
+# inline `for _cand in gcc clang`, which looked for exactly two names, probed
+# nothing else, and said NOTHING AT ALL about a name that did not resolve. So a
+# host that ships only `cc`, or that has tcc installed, produced a report
+# indistinguishable from a host where those compilers were simply slow — the
+# failure `scripts/compile-bench/compile-bench.py` refuses by name ("a benchmark
+# that quietly drops a compiler reads exactly like one where that compiler was
+# fast"). This block now holds the same line, and borrows that tool's three words
+# for the three ways a candidate fails to become an arm:
+#   ABSENT      nothing by that name resolves on PATH
+#   UNUSABLE    something resolves and will not answer `--version` — a binary
+#               that cannot do that will not compile anything either
+#   DUPLICATE   it IS a compiler already measured, reached under another name
+# `cl.exe` is deliberately NOT on this list: MSVC does not resolve by name from a
+# plain shell even on a machine that has it, so it is resolved by the measurement
+# core (`speedtest1_bench.py --resolve-msvc`) and reported there as its own SKIP.
+#
+# THE ORDER IS LOAD-BEARING, not alphabetical: `gcc` and `clang` are probed before
+# `cc` so that a `cc` which IS one of them is the one reported DUPLICATE. The
+# reverse order publishes a row labelled `cc`, which tells a reader strictly less.
+REF_CC_CATALOGUE=(
+  "gcc|the GNU C compiler, and the reference every number in this repository's benchmark history was taken against"
+  "clang|LLVM's C compiler. On macOS it is also what 'gcc' and 'cc' resolve to, which is why the dedupe below is by VERSION and not only by path"
+  "cc|the POSIX name for 'the system C compiler'. Usually a link to one of the two above, and then reported DUPLICATE; it is the ONLY name that resolves on a host shipping neither under its own name"
+  "tcc|the Tiny C Compiler. Rarely installed — it is on the list so a host that HAS it yields a row instead of silence"
+)
+
+# The unmeasured ledger: <id> TAB <state> TAB <why>. A FILE and not a variable for
+# the reason base-harness's drop ledger is one — it is appended to from inside
+# loops whose shape is free to change, and a report that can be lost at a `|` is
+# not a report.
+REF_CCS_FILE="$(mktemp -t dss-speedtest1-refs.XXXXXX)"
+REF_SKIPS_FILE="$(mktemp -t dss-speedtest1-skips.XXXXXX)"
+trap 'rm -f "$REF_CCS_FILE" "$REF_SKIPS_FILE"' EXIT
+: > "$REF_CCS_FILE"; : > "$REF_SKIPS_FILE"
+note_ref_skip() {               # note_ref_skip <id> <state> <why>
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$REF_SKIPS_FILE"
+  return 0
+}
+
+REF_CC_CANDIDATES=()
+if [[ -n "$REF_CC" ]]; then
+  REF_CC_CANDIDATES=("$REF_CC")
+  # Honest about what was NOT looked at, in one line rather than four: `--cc`
+  # means the caller is comparing against one specific build, and the catalogue
+  # was never consulted. Saying so is not noise — it is the difference between
+  # "this host has no clang" and "nobody asked".
+  _catalogue_names=""
+  for _entry in "${REF_CC_CATALOGUE[@]}"; do _catalogue_names="$_catalogue_names ${_entry%%|*}"; done
+  note_ref_skip "${_catalogue_names# }" "NOT PROBED" \
+    "--cc pinned exactly one reference ($REF_CC), so no catalogue name was resolved"
+else
+  for _entry in "${REF_CC_CATALOGUE[@]}"; do
+    _cand="${_entry%%|*}"; _why="${_entry#*|}"
+    _p="$(command -v "$_cand" 2>/dev/null || true)"
+    if [[ -z "$_p" ]]; then
+      note_ref_skip "$_cand" ABSENT "no '$_cand' resolves on PATH — $_why"
+      continue
+    fi
+    REF_CC_CANDIDATES+=("$_p")
+  done
+fi
+((${#REF_CC_CANDIDATES[@]} > 0)) || die "no reference C compiler resolved on this host.
+$(sed 's/^/      not measured: /; s/\t/ — /g' "$REF_SKIPS_FILE")
       Pass --cc <path>. A benchmark with no reference is not a comparison."
-REF_CC_VERSION="$("$REF_CC" --version 2>/dev/null | head -1 || echo unknown)"
-info "reference : $REF_CC  ($REF_CC_VERSION)"
+
+# The label rule is `reference_label`, defined with the other self-tested helpers
+# above: it decides whether the name we INVOKED or the compiler's own
+# self-description goes in the report's row.
+#
+# ⚠ TWO NAMES CAN BE ONE BINARY. macOS answers `gcc` with Apple clang; a Linux
+# `cc` may symlink either way. Measuring that twice publishes two rows for one
+# compiler and invites the reader to compare them against each other. Dedupe on
+# the RESOLVED target — and RECORD the skip, because a silently-dropped arm is
+# the very thing this block was rewritten to stop doing.
+_seen=""
+for _cc in "${REF_CC_CANDIDATES[@]}"; do
+  _id="$(basename "$_cc")"; _id="${_id%.exe}"
+  _real="$(readlink -f "$_cc" 2>/dev/null || echo "$_cc")"
+  case ":$_seen:" in
+    *":$_real:"*)
+      note_ref_skip "$_id" DUPLICATE "$_cc resolves to $_real, which is already measured"
+      continue ;;
+  esac
+
+  # ★ A COMPILER THAT WILL NOT NAME ITSELF IS `UNUSABLE`, NOT A BLANK VERSION.
+  # This read used to be `… 2>/dev/null | head -1 || echo unknown`, whose `||`
+  # binds to `head` — which always succeeds — so a compiler that failed produced
+  # an EMPTY version string, an arm labelled from nothing, and a row in the
+  # report with a blank version cell. compile-bench's word for that state is
+  # UNUSABLE and it is a skip, not a measurement.
+  if _ver="$("$_cc" --version 2>/dev/null | head -1)" && [[ -n "$_ver" ]]; then
+    :
+  else
+    note_ref_skip "$_id" UNUSABLE \
+      "found at $_cc but it would not answer '--version' — a binary that cannot do that will not compile anything either"
+    continue
+  fi
+
+  # ⚠ THE PATH CHECK ABOVE IS NOT ENOUGH, AND macOS IS THE PROOF. ✔MEASURED
+  # 2026-08-25: `/usr/bin/gcc` and `/usr/bin/clang` are DISTINCT FILES that both
+  # report `Apple clang version 21.0.0 (clang-2100.1.1.101)`. Two rows for one
+  # compiler would invite the reader to compare them against each other.
+  # Same version line ⇒ same compiler, however it was invoked.
+  if cut -f4 "$REF_CCS_FILE" 2>/dev/null | grep -Fxq "$_ver"; then
+    note_ref_skip "$_id" DUPLICATE "$_cc is the same compiler as one already measured — '$_ver'"
+    continue
+  fi
+  _seen="$_seen:$_real"
+
+  _label="$(reference_label "$_id" "$_ver")"
+  printf '%s\t%s\t%s\t%s\n' "$_id" "$_cc" "$_label" "$_ver" >> "$REF_CCS_FILE"
+  if [[ "$_label" == "$_id" ]]; then
+    info "reference : $_cc  ($_ver)"
+  else
+    info "reference : $_cc  ($_ver)  — labelled '$_label', because the binary is not what its name says"
+  fi
+done
+[[ -s "$REF_CCS_FILE" ]] || die "every reference compiler found deduplicated away, which cannot happen.
+      This is a bug in the discovery block, not a property of the host."
+
+# ★★★ THE UNMEASURED LIST IS PRINTED UNCONDITIONALLY, AND "none" IS ALSO AN
+# ANSWER. An instrument that prints its skips only when it has some is one whose
+# silence has two meanings — "nothing was skipped" and "the skip reporting is
+# broken" — and this repository has paid for that ambiguity before. The `.ps1`
+# twin echoes this driver's whole stdout, so its readers get the same list from
+# the same implementation.
+if [[ -s "$REF_SKIPS_FILE" ]]; then
+  while IFS=$'\t' read -r _u_id _u_state _u_why; do
+    info "not measured: $_u_id — $_u_state: $_u_why"
+  done < "$REF_SKIPS_FILE"
+else
+  info "not measured: none — every catalogue reference resolved and was measured"
+fi
+
+# ★★ THERE IS NO "FIRST REFERENCE" POSITIONAL, AND REMOVING IT WAS THE FIX RATHER
+# THAN CORRECTING IT. Two variables used to be sliced out of the record file here
+# and handed to the plan writer below as `cc` / `cc_version`, justified as keeping
+# "the derivation's argument signature" stable for the `.ps1` twin. That
+# justification does not survive reading: the twin calls THIS FILE'S CLI
+# (`--derive-only --path-style windows`) and never the private heredoc those
+# positionals belonged to, so no caller outside this script could observe them.
+# And they were DEAD — `cc` was never read at all, and `cc_version` reached
+# exactly one `cc_version_short` that nothing used.
+# ★ WHICH IS THE ONLY REASON A REAL BUG SAT THERE UNNOTICED: the version was read
+# with `cut -f3`, and field 3 of `$_id \t $_cc \t $_label \t $_ver` is the LABEL.
+# A value nobody reads cannot be wrong out loud. Fixing the column would have kept
+# a dead argument correct; deleting it removes the place the next wrong column can
+# hide. The ARMS have always been built from $REF_CCS_FILE, which is the one
+# record of what was actually measured, and each arm's version comes from
+# `short_version(r["version"])` — field 4, by name, in the loop that reads it.
 
 # ★★ THE CONFIG ROOT IS PINNED, AND THE COMPILER IS PROVEN TO WORK WITH IT
 # BEFORE ANY MINUTES ARE SPENT. Two facts, one probe.
@@ -303,11 +675,56 @@ info "reference : $REF_CC  ($REF_CC_VERSION)"
 #     102-object reference build and a recipe derivation. The same refusal costs
 #     one second here, and it is the difference between "the benchmark told me my
 #     compiler is stale" and "the benchmark failed".
-DSS_CONFIG_ROOT_PIN="${DSS_CONFIG_ROOT:-$SRC_DIR/src/dss-config}"
-[[ -d "$DSS_CONFIG_ROOT_PIN" ]] || die "no dss config root at $DSS_CONFIG_ROOT_PIN
-      Pass --dss-src pointing at the checkout the compiler was built from, or set
-      DSS_CONFIG_ROOT. Leaving it unset would let the CWD decide which config the
-      measured binary reads."
+# ⚠⚠ THE PIN IS THE DIRECTORY THAT *CONTAINS* `src/dss-config`, NOT THAT
+# DIRECTORY ITSELF, AND GETTING THAT WRONG MADE THE PIN A NO-OP FOR ITS WHOLE
+# LIFE. [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+# `config_path_walk.hpp` states the contract: "`DSS_CONFIG_ROOT` (optional): a
+# directory that CONTAINS `src/dss-config/`", and the resolver composes
+# `$DSS_CONFIG_ROOT/src/dss-config`. This line used to default to
+# `$SRC_DIR/src/dss-config`, so the resolver probed
+# `…/src/dss-config/src/dss-config`, missed -- and "a set-but-miss falls
+# through", by documented design -- landing on the CWD ANCESTOR WALK. The
+# comment above promises the exact opposite: "Leaving it unset would let the CWD
+# decide which config the measured binary reads." It was never set effectively,
+# so the CWD decided every time.
+#
+# ✔MEASURED 2026-08-28, and it cost a 14x wrong number that was one edit away
+# from being published: the WSL leg driven with its cwd on `/mnt/c` resolved the
+# config tree across the 9P mount, and the SAME binary on the SAME manifest at
+# `--jobs 1` took **213.50 s at 13% CPU with 1,834,545 voluntary context
+# switches**, against **15.16 s at 90% CPU with 429** once the cwd moved to
+# ext4. `preprocess-splice` alone went 65.89 s -> 508 ms. Every descriptor stat
+# had become a 9P round trip.
+# ⓘ Invisible on Windows and on native Linux, where the cwd walk happens to find
+# the same tree -- which is exactly why a silently-ignored pin survives.
+DSS_CONFIG_ROOT_PIN="${DSS_CONFIG_ROOT:-$SRC_DIR}"
+[[ -d "$DSS_CONFIG_ROOT_PIN/src/dss-config" ]] || die \
+    "no dss config tree at $DSS_CONFIG_ROOT_PIN/src/dss-config
+      DSS_CONFIG_ROOT names the directory that CONTAINS src/dss-config (the
+      checkout root), not that directory itself -- the resolver composes the
+      'src/dss-config' part. Pass --dss-src pointing at the checkout the
+      compiler was built from, or set DSS_CONFIG_ROOT to it.
+      ⚠ The check is on the COMPOSED path on purpose: a pin whose own directory
+      exists but whose config tree does not is exactly the shape that used to
+      pass here and then silently fall through to the CWD walk."
+# ★★ THE TARGET IS RESOLVED HERE, BEFORE THE PRE-FLIGHT, AND THAT ORDER IS THE
+# WHOLE POINT (D-BENCH-COMPILER-AND-CONFIG-MAY-COME-FROM-DIFFERENT-COMMITS).
+# It used to be resolved in step 5, AFTER this check — so the probe compiled for
+# whatever dsscp defaults to, and a stale arm64/pe64 target document sailed past
+# a printed `preflight: OK` straight into a 3-minute measurement that then died
+# on it. ✔MEASURED 2026-08-26 on macOS AND Windows in the same run. A control
+# must match the TARGET; resolving the target late made that impossible.
+# ⓘ Pure computation from `uname` and `$TARGET_SPEC` — it reads nothing produced
+# by the steps it now precedes, which is what makes moving it safe rather than a
+# reordering that hides a dependency.
+if [[ -z "$TARGET_SPEC" ]]; then
+  case "$(uname -s)" in
+    Linux)  TARGET_SPEC="$(uname -m | sed 's/aarch64/arm64:elf64-aarch64-linux-exec/;s/x86_64/x86_64:elf64-x86_64-linux-exec/')" ;;
+    Darwin) TARGET_SPEC="$(uname -m | sed 's/arm64/arm64:macho64-arm64-darwin-exec/;s/x86_64/x86_64:macho64-x86_64-darwin-exec/')" ;;
+    MINGW*|MSYS*|CYGWIN*) TARGET_SPEC="x86_64:pe64-x86_64-windows-exec" ;;
+    *) die "this host's uname ($(uname -s)) has no default target spec here; pass --target." ;;
+  esac
+fi
 # ⚠ SKIPPED — AND SAID — WHEN THE COMPILER IS NOT NATIVE TO THIS SHELL. Under
 # `--derive-only --path-style windows` this script is deriving on behalf of the
 # PowerShell twin, so `$DSS_BIN` is a Windows `.exe` and only the twin's host can
@@ -316,7 +733,8 @@ DSS_CONFIG_ROOT_PIN="${DSS_CONFIG_ROOT:-$SRC_DIR/src/dss-config}"
 if [[ $DERIVE_ONLY == 1 && "$PATH_STYLE" == windows ]]; then
   info "dss pre-flight: skipped — the compiler is native to the CALLING host, which"
   info "                runs this same check (speedtest1_bench.py --preflight-dss)"
-elif python3 "$BENCH_CORE" --preflight-dss "$DSS_BIN" --config-root "$DSS_CONFIG_ROOT_PIN"; then
+elif python3 "$BENCH_CORE" --preflight-dss "$DSS_BIN" --config-root "$DSS_CONFIG_ROOT_PIN" \
+       --preflight-target "$TARGET_SPEC"; then
   :
 else
   die "the dss pre-flight refused (its diagnostic is above). Nothing is measured
@@ -383,12 +801,69 @@ _cfg_args=($STAGE_CONFIGURE_FLAGS)
 # build-and-test.sh never meets either because it builds `testfixture
 # USE_AMALGAMATION=0` first, which links the correct archive into being as a side
 # effect — an input this benchmark would otherwise have inherited by luck.
-if ( cd "$BLD" && make -s sqlite3d libsqlite3.a USE_AMALGAMATION=0 \
+# ── THE EXECUTABLE SUFFIX, ASKED OF make RATHER THAN ASSUMED ────────────────
+# `main.mk` declares this target as `sqlite3d$(T.exe)`. On a POSIX host `T.exe`
+# is empty and `sqlite3d` is the same string; on Windows it is `.exe`, and
+# `make sqlite3d` then matches NO RULE and answers `Nothing to be done` — with
+# EXIT STATUS 0 and an EMPTY recipe. ✔MEASURED on this host: `make -B -n
+# sqlite3d` emitted 0 compile lines where `make -B -n sqlite3d.exe` emitted 111.
+#
+# ★ THE AUTHORITY IS THE MAKEFILE THE BUILD WILL ACTUALLY USE, so it is asked,
+# with a target defined purely to print the variable. A suffix table here would be
+# the THIRD copy of one this repository already consolidated once — see
+# D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING, whose headline is
+# "ASK IT, DO NOT GUESS". That row fixed the ARTIFACT spelling; the same guess had
+# survived one layer up, in the MAKE TARGET.
+#
+# ⚠ AND THE MAKEFILE IT ASKS IS THE ONE **THIS SHELL'S OWN `configure` JUST
+# WROTE**, a dozen lines above. That ordering is the answer to a real hazard: the
+# build directory is shared across hosts (the `.ps1` twin derives inside WSL and
+# measures natively on Windows), so a Makefile FOUND there may have been generated
+# for the other host and carry the other host's `T.exe`. It is never read as
+# found; it is regenerated here, by the make that will run every recipe derived
+# from it, immediately before this question is asked. This is also why the answer
+# is asked of MAKE and not grepped out of the Makefile text: a grep would answer
+# from whatever file is on disk, with no way to know which host wrote it.
+TEXE_PROBE_MK="$OUT_DIR/texe-probe.mk"
+if T_EXE="$(derive_make_texe "$BLD" "$TEXE_PROBE_MK" 2>"$OUT_DIR/texe-probe.log")"; then
+  :
+else
+  case "$?" in
+    3) die "the executable-suffix probe produced NO ANSWER, and this driver does not
+      guess one. make ran cleanly in $BLD but printed nothing this probe
+      recognises. Its output is in $OUT_DIR/texe-probe.log
+      ★ The likeliest cause is that 'make' here is NOT GNU make: the answer is
+      emitted by \$(info …), and a non-GNU make expands that to nothing instead of
+      failing. SQLite's own build needs GNU make regardless; put it first on PATH
+      (BSD hosts usually ship it as 'gmake').
+      The empty string is not a safe fallback here: it spells the target
+      'sqlite3d', which on a Windows-configured tree matches no rule and answers
+      'Nothing to be done' with EXIT STATUS 0 — a reference build that compiles
+      nothing while reporting success." ;;
+    4) die "the Makefile in $BLD does not define \$(T.exe) at all (make answered
+      'origin: undefined'). That is not a POSIX host reporting an empty suffix —
+      it is this probe reading a Makefile that is not the one sqlite's configure
+      writes. See $OUT_DIR/texe-probe.log and $OUT_DIR/configure.log.
+      ★ This is the check that makes an EMPTY answer trustworthy: empty is the
+      correct value on every POSIX host, so 'empty' alone cannot tell a good
+      probe from one that read nothing." ;;
+    5) die "make exited non-zero while answering the executable-suffix probe in $BLD.
+      Its output is in $OUT_DIR/texe-probe.log. Every recipe this driver derives
+      comes out of that same Makefile, so a make that cannot evaluate one variable
+      from it is not a tree worth deriving from." ;;
+    *) die "the executable-suffix probe failed for an unclassified reason; see
+      $OUT_DIR/texe-probe.log" ;;
+  esac
+fi
+CLI_TARGET="sqlite3d${T_EXE}"
+info "make target: $CLI_TARGET   (T.exe='${T_EXE}', asked of make, not assumed)"
+
+if ( cd "$BLD" && make -s "$CLI_TARGET" libsqlite3.a USE_AMALGAMATION=0 \
         "OPTIONS=$STAGE_MAKE_OPTIONS" -j"$JOBS_HOST" ) \
      > "$OUT_DIR/reference-build.log" 2>&1; then
   pass "reference full-source CLI built (its derived sources are now on disk)"
 else
-  warn "the reference sqlite3d did not fully link — continuing, because what this"
+  warn "the reference $CLI_TARGET did not fully link — continuing, because what this"
   warn "step is FOR is the generated sources; the recipe floors below are the honest"
   warn "gate on whether enough of it succeeded. See $OUT_DIR/reference-build.log"
 fi
@@ -418,7 +893,7 @@ fi
 # line alone and loses SQLITE_CORE, after which ext/icu/icu.c stops compiling to
 # nothing and demands <unicode/*.h>.
 if _summary="$(dss_bh_emit_recipe \
-      --build-dir "$BLD" --make-target sqlite3d --recipe-file "$RECIPE" \
+      --build-dir "$BLD" --make-target "$CLI_TARGET" --recipe-file "$RECIPE" \
       --make-var "OPTIONS=$STAGE_MAKE_OPTIONS" \
       --prereq-mode link-line --always-make 1 --token-scope recipe \
       --archive "$AR" --archive-from-span 1 \
@@ -475,14 +950,12 @@ info "includes  : $INC_COUNT dirs (the six sqlite src/ext dirs + the generated-h
 
 # ── Step 5 — the manifest, and the ONE define set all three arms compile ─────
 step "5/6  Generate the DSS project manifest (it also fixes the shared define set)"
-if [[ -z "$TARGET_SPEC" ]]; then
-  case "$(uname -s)" in
-    Linux)  TARGET_SPEC="$(uname -m | sed 's/aarch64/arm64:elf64-aarch64-linux-exec/;s/x86_64/x86_64:elf64-x86_64-linux-exec/')" ;;
-    Darwin) TARGET_SPEC="$(uname -m | sed 's/arm64/arm64:macho64-arm64-darwin-exec/;s/x86_64/x86_64:macho64-x86_64-darwin-exec/')" ;;
-    MINGW*|MSYS*|CYGWIN*) TARGET_SPEC="x86_64:pe64-x86_64-windows-exec" ;;
-    *) die "this host's uname ($(uname -s)) has no default target spec here; pass --target." ;;
-  esac
-fi
+# ⓘ `$TARGET_SPEC` is ALREADY RESOLVED — it moved up beside the config-root pin so
+# the pre-flight could validate the document this step is about to generate against.
+# Nothing is recomputed here; see the note at that site for why the order matters.
+[[ -n "$TARGET_SPEC" ]] || die "internal: TARGET_SPEC is empty at step 5 — it is
+      resolved beside DSS_CONFIG_ROOT_PIN, and reaching here empty means that
+      resolution was removed or bypassed rather than defaulting quietly."
 # The transform follows the TARGET, matching the catalogue's own declaration:
 # every pe64 leg declares `windows-selfconfig`, every POSIX leg `none`.
 [[ -n "$RECIPE_TRANSFORM" ]] || \
@@ -526,22 +999,18 @@ step "6/6  Write the benchmark plan"
 # one program produced, rather than three sets three call sites believe are equal.
 PLAN_OUT="${PLAN_OUT:-$OUT_DIR/benchmark-plan.json}"
 STYLE="$PATH_STYLE" REF_LINK_FLAGS="$REF_LINK_FLAGS" CFG_ROOT="$DSS_CONFIG_ROOT_PIN" \
-python3 - "$MANIFEST" "$PLAN_OUT" "$OUT_DIR" "$DSS_BIN" "$REF_CC" \
-    "$REF_CC_VERSION" "$SQLITE_DIR" "$SQLITE_HEAD" "$TARGET_SPEC" \
+REF_CCS_FILE="$REF_CCS_FILE" \
+python3 - "$MANIFEST" "$PLAN_OUT" "$OUT_DIR" "$DSS_BIN" \
+    "$SQLITE_DIR" "$SQLITE_HEAD" "$TARGET_SPEC" \
     "$WORK_SIZE" "$TESTSET" "$BUILD_REPEATS" "$RUN_REPEATS" "$JOBS_ARMS" <<'PY'
 import json, os, re, subprocess, sys
-(manifest_p, plan_p, outdir, dss, cc, cc_version, sqlite_dir, sqlite_head,
+# ★ THE UNPACK IS THE ARITY CHECK. A tuple assignment over `sys.argv[1:]` raises
+# on a count mismatch, so a caller that adds or drops an argument fails HERE and
+# by name rather than shifting every value one place to the left — which is the
+# shape the deleted `cc`/`cc_version` pair would have produced silently.
+(manifest_p, plan_p, outdir, dss, sqlite_dir, sqlite_head,
  target, size, testset, brep, rrep, jobs) = sys.argv[1:]
 
-# The reference's version, for the report. ⚠ NOT `split()[2]`: the three shipped
-# spellings put the number in three different places —
-#   gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
-#   gcc.exe (MinGW-W64 x86_64-ucrt-posix-seh, built by …, r3) 13.2.0
-#   clang version 18.1.3 (…)
-# and a positional pick reported "x86_64-ucrt-posix-seh," as the compiler version.
-# The first dotted number is right for all three.
-_m = re.search(r"\d+\.\d+(?:\.\d+)?", cc_version)
-cc_version_short = _m.group(0) if _m else ""
 style = os.environ.get("STYLE", "posix")
 
 def conv(p):
@@ -587,6 +1056,41 @@ if style == "windows":
         json.dump(m, fh, indent=2)
         fh.write("\n")
 
+# ── THE REFERENCE RECORDS, one per compiler the shell found ──────────────────
+# TSV and not JSON-in-an-env-var on purpose: a version string is arbitrary vendor
+# text and quoting it through a shell into JSON is exactly the class of trap this
+# repository keeps paying for. A tab-separated line cannot be broken by a quote,
+# a backslash or a `$`, and `head -1` already guaranteed there is no newline.
+reference_compilers = []
+with open(os.environ["REF_CCS_FILE"], encoding="utf-8") as _fh:
+    for _line in _fh:
+        _line = _line.rstrip("\n")
+        if not _line:
+            continue
+        _id, _bin, _label, _ver = _line.split("\t", 3)
+        reference_compilers.append({"id": _id, "bin": _bin, "label": _label,
+                                    "version": _ver})
+if not reference_compilers:
+    sys.exit("R7 the reference-compiler record file is empty")
+
+
+def short_version(text):
+    """The vendor's version line, trimmed to the part a table cell can carry.
+
+    ⚠ NOT `split()[2]`: the three shipped spellings put the number in three
+    different places —
+        gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+        gcc.exe (MinGW-W64 x86_64-ucrt-posix-seh, built by …, r3) 13.2.0
+        clang version 18.1.3 (…)
+    and a positional pick once reported "x86_64-ucrt-posix-seh," as the compiler
+    version. The FIRST dotted number is right for all three. This is now the only
+    implementation of that rule in this file; there used to be a second, applied
+    to a value no arm read.
+    """
+    m = re.search(r"(\d+\.\d+(?:\.\d+)?)", text or "")
+    return m.group(1) if m else ""
+
+
 plan = {
   "subject": {
     "tus":      sources,
@@ -600,20 +1104,26 @@ plan = {
      "bin": conv(dss), "manifest": conv(manifest_p), "config": "release",
      "configRoot": conv(os.environ["CFG_ROOT"]),
      # The TARGET SPEC is on the arm because the artifact path is read back out
-     # of the build's own `dss-code-prime: artifact <spec> <path>` line, and that
+     # of the build's own `dsscp: artifact <spec> <path>` line, and that
      # line is keyed on the spec.
      "target": target,
      "artifactName": "speedtest1", "optimizationLabel": "--config=release"},
-    {"id": "cc", "kind": "unix-cc",
-     "label": os.path.splitext(os.path.basename(cc))[0],
-     "version": cc_version_short,
-     # ⚠ conv(), LIKE EVERY OTHER PATH. ✔MEASURED 2026-08-21: without it a
-     # Windows plan derived inside WSL carried `bin: "/usr/bin/gcc"`, and the
-     # native measurement could not launch it. The reference compiler is a PATH
-     # like the sources and the manifest, and it crosses the same boundary.
-     "bin": conv(cc), "optFlags": ["-O2"],
-     "linkFlags": json.loads(os.environ["REF_LINK_FLAGS"]),
-     "optimizationLabel": "-O2"},
+    # ── ONE unix-cc ARM PER REFERENCE FOUND ─────────────────────────────────
+    # ★ Spliced from a file rather than taken from the `cc` positional, because
+    # this benchmark used to measure only the first compiler it found and give
+    # no sign a second existed. `REF_LINK_FLAGS` is shared deliberately: it is
+    # keyed on the TARGET (elf64/macho/pe64), not on the compiler, so gcc and
+    # clang linking the same target correctly link it the same way.
+    # ⚠ conv(), LIKE EVERY OTHER PATH. ✔MEASURED 2026-08-21: without it a
+    # Windows plan derived inside WSL carried `bin: "/usr/bin/gcc"`, and the
+    # native measurement could not launch it. A reference compiler is a PATH
+    # like the sources and the manifest, and it crosses the same boundary.
+    *[{"id": r["id"], "kind": "unix-cc",
+       "label": r["label"],
+       "version": short_version(r["version"]),
+       "bin": conv(r["bin"]), "optFlags": ["-O2"],
+       "linkFlags": json.loads(os.environ["REF_LINK_FLAGS"]),
+       "optimizationLabel": "-O2"} for r in reference_compilers],
     {"id": "msvc", "kind": "msvc", "label": "MSVC cl.exe",
      "bin": "cl.exe", "optFlags": ["/O2"], "optimizationLabel": "/O2"},
   ],

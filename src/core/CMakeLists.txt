@@ -2,10 +2,14 @@ add_library(core OBJECT
     compiler.cpp
 
     # ── substrate/ — host/OS utilities (the first non-header-only one) ──
+    # The ONE checked whole-file read
+    # (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    substrate/checked_file_read.cpp
     substrate/large_stack_call.cpp
     substrate/path_identity.cpp
     substrate/phase_timers.cpp
     substrate/process_spawn.cpp
+    substrate/stack_sized_thread.cpp
     substrate/thread_pool.cpp
 
     # ── types/ — universal in-memory model ──
@@ -20,6 +24,9 @@ add_library(core OBJECT
     types/header_case_diagnostic.cpp
     types/include_path_resolve.cpp
     types/glob_match.cpp
+    # The content-addressed memo every schema family loads through
+    # (D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS).
+    types/config_document_memo.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
     types/predefined_macro_json.cpp
@@ -32,6 +39,7 @@ add_library(core OBJECT
     # both readers already depend on, so the dependency runs one way again.
     types/project_config.cpp
     types/target_schema.cpp
+    types/target_spec.cpp
     types/target_schema_json.cpp
     types/lexer_mode.cpp
     types/schema_walker.cpp
@@ -51,7 +59,7 @@ add_library(core OBJECT
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 # These OBJECT-lib sources are the actual compilation units that get folded
-# into dss-code-prime-lib (SHARED) via $<TARGET_OBJECTS:core>. Setting the
+# into dsscp-lib (SHARED) via $<TARGET_OBJECTS:core>. Setting the
 # defines on the SHARED target would not reach them — $<TARGET_OBJECTS> only
 # copies finished .o files, not usage requirements — so DSS_BUILDING_DLL has
 # to live here for __declspec(dllexport) in core/export.hpp to fire on MSVC.

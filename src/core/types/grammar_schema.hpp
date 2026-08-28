@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/compiled_shape.hpp"
+#include "core/types/config_document_memo.hpp"  // ConfigDocumentDependency — the referenced-document ledger
 #include "core/types/import_config.hpp"
 #include "core/types/preprocess_config.hpp"
 #include "core/types/lexer_mode.hpp"
@@ -9,6 +10,7 @@
 #include "core/types/number_style.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/enum_name_table.hpp"  // EnumNameTable (kReservedWordPolicyTable)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/assembly_config.hpp"
@@ -22,9 +24,11 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree_node.hpp"
 
+#include <array>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -243,6 +247,27 @@ enum class ReservedWordPolicy : std::uint8_t {
     Contextual,
 };
 
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// The document-level `reservedWordPolicy` key, previously owned by an inline
+// `v == "strict" / "contextual"` chain in the grammar loader with two sentences
+// beside it restating the pair. `Strict` is row 0, matching the default a
+// document without the key gets.
+inline constexpr EnumNameTable<ReservedWordPolicy, 2> kReservedWordPolicyTable{{{
+    { ReservedWordPolicy::Strict,     "strict"     },
+    { ReservedWordPolicy::Contextual, "contextual" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kReservedWordPolicyTable);
+
+[[nodiscard]] constexpr std::string_view
+reservedWordPolicyName(ReservedWordPolicy p) noexcept {
+    return kReservedWordPolicyTable.name(p);
+}
+[[nodiscard]] constexpr std::optional<ReservedWordPolicy>
+reservedWordPolicyFromName(std::string_view s) noexcept {
+    return kReservedWordPolicyTable.fromName(s);
+}
+
 // Standard C++23 fallible result. Error channel is the full list of
 // diagnostics collected before bailing — the loader keeps walking to
 // surface as many problems as possible per run.
@@ -250,6 +275,104 @@ template <typename T>
 using LoadResult = std::expected<T, std::vector<ConfigDiagnostic>>;
 
 namespace detail {
+
+// ── lexeme tables ─────────────────────────────────────────────────────────
+//
+// D-PERF-TOK-LONGEST-MATCH-PROBES-EVERY-DECLARED-LENGTH-AT-EVERY-POSITION,
+// half one of two. The tokenizer probes a lexeme table with the first `len`
+// bytes of the remaining input; before this hasher those tables were keyed
+// by `std::string`, so `lookupLexeme` had to MATERIALISE a `std::string`
+// from the probe bytes for every single probe — a copy always, and a
+// malloc/free pair once the probe passed libstdc++'s 15-byte small-string
+// threshold. C++20 heterogeneous lookup removes both: with a transparent
+// hash and a transparent equality, `find` accepts the `std::string_view`
+// the tokenizer already holds and allocates nothing.
+//
+// ★ THE HASH VALUE IS DELIBERATELY UNCHANGED, and that is a correctness
+// property, not a nicety. [basic.string.hash] REQUIRES
+// `hash<string>()(s) == hash<string_view>()(string_view(s))`, so every key
+// lands in the bucket it landed in before, the table's iteration order is
+// byte-identical, and the handful of loader passes that walk `lexemeTable`
+// unordered keep seeing it in exactly the former order. (One of them —
+// the `hirLowering.stringDoubledDelimiter` derivation — is last-write-wins
+// over that walk, so a reordering there would silently change a shipped
+// grammar's string delimiter.)
+struct LexemeHash {
+    using is_transparent = void;
+    [[nodiscard]] std::size_t operator()(std::string_view s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+};
+
+// lexeme → declared meanings, in priority-ascending order (stable —
+// declaration order wins on ties).
+using LexemeTable =
+    std::unordered_map<std::string, std::vector<LexemeMeaning>,
+                       LexemeHash, std::equal_to<>>;
+
+// ── per-lead-byte declared-length index ───────────────────────────────────
+//
+// D-PERF-TOK-LONGEST-MATCH-PROBES-EVERY-DECLARED-LENGTH-AT-EVERY-POSITION,
+// half two of two. A longest-match scan used to ask a lexeme table about
+// EVERY length from `maxLexemeLength` down to 1 at EVERY token position.
+// For the shipped `c` grammar `maxLexemeLength` is 28 — keywords share the
+// table with punctuation and `__builtin_types_compatible_p` is 28 bytes —
+// so a `+` paid 28 hash lookups to discover that exactly two lengths have
+// any key starting with `+` at all.
+//
+// This is the derived index that removes the guaranteed misses: for each
+// lead byte, the LENGTHS at which some key in this table starts with that
+// byte, descending. A probe iterates only those; a lead byte no key starts
+// with (206 of 256 for `c`) skips the scan entirely. It is EXACT, not
+// heuristic — a length absent from a lead byte's row cannot match, because
+// every candidate substring starts with that byte — so the winning length
+// is unchanged at every position and the token stream is byte-identical.
+//
+// ⚠ NOT A CACHE. Nothing here remembers a past answer; it is a projection
+// of the table's own declared keys, computed once when the schema is
+// sealed and immutable thereafter. It is 100% config-derived and names no
+// language, target, or byte class — every length in it came out of a key the
+// config declared, so a grammar whose longest key is 3 bytes gets rows that
+// stop at 3, and one with a 400-byte key gets a row containing 400.
+//
+// ★ CSR, NOT A 64-BIT MASK. The obvious encoding is one `std::uint64_t`
+// per lead byte with bit L set for length L, and it was rejected: it
+// cannot represent a key longer than 63 bytes, so it needs a
+// "`maxLexemeLength > 63` ⇒ silently probe everything" fallback — a
+// perf cliff no test can see and no diagnostic reports. Offsets + a flat
+// descending length array has no representable-length limit at all, so
+// there is no fallback arm to get wrong, and the hot loop is a plain
+// forward walk over 1-3 contiguous `std::uint32_t`s instead of a
+// bit-scan.
+class DSS_EXPORT LexemeLengthIndex {
+public:
+    // Derive the index from `table`. Idempotent; safe to call on a
+    // default-constructed index (which answers "no key starts with any
+    // byte" — correct for an ABSENT table, e.g. a lexer mode that
+    // declares no `tokens` override, whose lookups all miss anyway).
+    void build(LexemeTable const& table);
+
+    // Lengths, DESCENDING, at which some key in this table starts with
+    // `lead`. Empty when none does.
+    [[nodiscard]] std::span<std::uint32_t const>
+    lengthsFor(unsigned char lead) const noexcept {
+        return std::span<std::uint32_t const>(lengths_)
+            .subspan(rowStart_[lead],
+                     rowStart_[std::size_t{lead} + 1] - rowStart_[lead]);
+    }
+
+    // Total number of (lead byte, length) pairs — i.e. the number of table
+    // lookups a longest-match scan performs summed over every possible lead
+    // byte. THE algorithmic figure this index exists to shrink, exposed so a
+    // test can pin it without timing anything.
+    [[nodiscard]] std::size_t probeCount() const noexcept { return lengths_.size(); }
+
+private:
+    // `rowStart_[b] .. rowStart_[b+1]` slices `lengths_`. All-zero when
+    // unbuilt, which yields an empty row for every byte.
+    std::array<std::uint32_t, 257> rowStart_{};
+    std::vector<std::uint32_t>     lengths_;
+};
 
 // Movable POD the JSON loader hands to the GrammarSchema constructor.
 // Mirrors the Tree/TreeData split: keeps the schema's read API stable
@@ -263,8 +386,9 @@ struct DSS_EXPORT GrammarSchemaData {
     std::shared_ptr<SchemaTokenInterner>              schemaTokens;
 
     // lexeme → declared meanings, in priority-ascending order (stable —
-    // declaration order wins on ties).
-    std::unordered_map<std::string, std::vector<LexemeMeaning>> lexemeTable;
+    // declaration order wins on ties). See `LexemeTable` for why the
+    // hasher is transparent.
+    LexemeTable                                       lexemeTable;
 
     // Backing storage for ScopeMatch.anyOf / .forbid spans. Reserved up
     // front by the loader so no reallocation occurs — the spans inside
@@ -296,6 +420,24 @@ struct DSS_EXPORT GrammarSchemaData {
     // demoted token would match. Token-id-keyed (the `contextual` flag is
     // per-lexeme-string in `lexemeTable`; this is the parser-side query).
     std::unordered_set<std::uint32_t>                 contextualKinds;
+
+    // D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED:
+    // the document's declared TOKEN CLASSES — `tokenClasses.<name>` maps a name
+    // to a SET of token kinds, and that ONE declaration is what both the GRAMMAR
+    // (`{"tokenClass": "<name>"}` as a shape element) and the SEMANTIC tier
+    // (`semantics.attributeSemantics.clauseNameTokenClass`) resolve against.
+    //
+    // ★ THE SHARED DECLARATION IS THE POINT, not a convenience. The row this
+    // closes exists because a grammar position and a semantic reader BOTH decided
+    // "is this token a name?" and decided it separately — widen one and the other
+    // silently drops what the first now admits. Two lists cannot drift when there
+    // is one list; a per-side spelling could, and did.
+    //
+    // Values are SORTED + deduplicated by the loader (the shape builder hands
+    // them straight to `Position::makeTokenClassLeaf`, whose `expectedSet`
+    // contract is a sorted set). A class that resolves to the EMPTY set is a load
+    // error, never a silently-never-matching slot.
+    std::unordered_map<std::string, std::vector<SchemaTokenId>> tokenClasses;
 
     // Per-scope forbidden-token sets — keyed by ScopeKind's underlying
     // value, value = set of SchemaTokenId values.
@@ -338,10 +480,7 @@ struct DSS_EXPORT GrammarSchemaData {
     // `lookupLexemeInMode`) — context-sensitive lexing.
     std::vector<LexerMode>                            lexerModes;
     std::unordered_map<std::string, LexerModeId>      lexerModeIds;
-    std::unordered_map<std::uint32_t,
-                       std::unordered_map<std::string,
-                                          std::vector<LexemeMeaning>>>
-                                                      lexerModeTokens;
+    std::unordered_map<std::uint32_t, LexemeTable>    lexerModeTokens;
 
     // Off-grammar body-token kinds — see
     // `GrammarSchema::bodyDefaultTokenKinds()` for the contract.
@@ -556,6 +695,19 @@ struct DSS_EXPORT GrammarSchemaData {
     // second, silently diverging definition of "what counts as fatal", which
     // `DiagnosticCollector::hasErrors()` already owns.
     std::vector<ConfigDiagnostic>                     loadDiagnostics;
+
+    // ── Documents OTHER than this one that were folded into this build ──
+    // Today that is every `languageReferences` target: the loader resolves
+    // `<ref>.lang.json`, reads it, and merges its shapes, so the resulting
+    // schema is a function of BOTH documents' bytes while `contentDigest()`
+    // covers only the host's. Recording the resolved path and the referenced
+    // bytes' digest is what lets a content-addressed consumer
+    // (`ConfigDocumentMemo`) tell "the same host document" from "the same host
+    // document over a DIFFERENT fragment" — a distinction the host digest
+    // cannot make and whose failure mode is a silently wrong grammar.
+    // EMPTY for a document that folds nothing in, and for the direct
+    // `GrammarSchemaData` construction route that never touched a file.
+    std::vector<ConfigDocumentDependency>             referencedDocuments;
 };
 
 } // namespace detail
@@ -599,6 +751,64 @@ public:
     // fabricated or stale one is a silent wrong key. Every file route
     // (`loadShipped` → `loadFromFile` → `loadFromText`) is digested.
     [[nodiscard]] std::string_view             contentDigest()  const noexcept { return contentDigest_; }
+
+    // ★★★ THE NAME THE CONFIG TREE IS INDEXED BY — the `.lang.json` stem —
+    // WHICH IS NOT `name()`. `name()` is what the document DECLARES; only this
+    // one is a valid `--language` argument or a valid path component.
+    //
+    // ⚠⚠ THE TWO DO NOT MERELY DIFFER IN CASE, AND READING THE DEFECT AS A
+    // CASE PROBLEM UNDERSTATES IT BY HALF. ✔MEASURED over the shipped corpus
+    // 2026-08-25 (`ShippedCorpusStemsAndDeclaredNames*` in
+    // `tests/core/test_grammar_schema.cpp`, which re-measures it on every run):
+    // of the SIX shipped language documents, five load as a root and are
+    // nameable — the sixth, `asm.lang.json`, is the shared assembly line
+    // grammar and is reachable only through another document's
+    // `languageReferences`. Of the five nameable ones:
+    //   * TWO differ only in case (`c` → "C", `toy` → "Toy");
+    //   * THREE differ STRUCTURALLY — the stem's hyphens are gone from the
+    //     declared name (`asm-arm64-gas` → "AsmArm64Gas", `asm-x86_64-att` →
+    //     "AsmX86_64Att", `tsql-subset` → "TsqlSubset");
+    //   * NONE agrees exactly.
+    // For those three, `name()` used where a path or a `--language` argument
+    // was meant fails on EVERY host — there is no `sources/AsmArm64Gas.lang.json`
+    // on NTFS either. The class is NOT Linux-only.
+    //
+    // ⚠ WHAT *IS* HOST-DEPENDENT is the CASE-ONLY pair, and that is the half
+    // that shipped: NTFS and APFS resolve `sources/C.lang.json` to the same
+    // file, ext4 resolves it to nothing. ✔MEASURED 2026-08-25 — a caller that
+    // used `name()` to build a `--language` argument gated 1656/1656 green on
+    // Windows and took 527 tests down on the WSL leg. So a green Windows gate
+    // is evidence about the case-only pair and about nothing else, and this
+    // accessor exists so the correct name is the one that is easy to reach.
+    //
+    // ⓘ EMPTY for a grammar built from text with no document behind it
+    // (`loadFromText(..., "<inline>")`). A caller that needs a path must not
+    // fall back to `name()`, which is the very substitution this accessor
+    // exists to stop — call `configDocumentPath()` below, which answers for
+    // both cases and cannot be made to name a document that does not exist.
+    [[nodiscard]] std::string_view             configName()     const noexcept { return configName_; }
+
+    // ★★ THE DOCUMENT'S CONFIG-ROOT-RELATIVE PATH — `sources/<stem>.lang.json`,
+    // composed HERE because this is where the stem, the subdirectory and the
+    // suffix already live (`loadShipped` walks for exactly this shape). The
+    // driver used to compose it at each use; two copies of a composition are
+    // free to drift, and a drifted one is a runtime-cache key naming a document
+    // nobody loaded.
+    //
+    // ⓘ TOTAL — there is no empty return and no failure arm to forget. A schema
+    // with no document answers with a SELF-DESCRIBING NON-PATH
+    // (`<inline language: NAME>`) rather than `sources/.lang.json`: the term is
+    // a cache-key LABEL that sits beside the document's DIGEST, and naming a
+    // plausible-looking file that was never read is how an auditor reading a key
+    // document is misled. The digest is what identifies the input, and
+    // `computeRuntimeObjectKey` already refuses an empty one outright.
+    [[nodiscard]] std::string                  configDocumentPath() const;
+
+    // Every OTHER document folded into this schema's build, with the digest
+    // its bytes had at that moment — see `GrammarSchemaData::referencedDocuments`
+    // for why `contentDigest()` alone cannot identify this schema's inputs.
+    [[nodiscard]] std::span<detail::ConfigDocumentDependency const>
+    referencedDocuments() const noexcept { return d_.referencedDocuments; }
     [[nodiscard]] std::string_view             name()           const noexcept { return d_.name; }
     [[nodiscard]] std::string_view             version()        const noexcept { return d_.version; }
     [[nodiscard]] std::uint32_t                schemaVersion()  const noexcept { return d_.schemaVersion; }
@@ -620,6 +830,41 @@ public:
     // silently truncate. Computed at load time; zero only for an
     // empty lexemeTable.
     [[nodiscard]] std::size_t maxLexemeLength() const noexcept { return d_.maxLexemeLength; }
+
+    // ── Longest-match probe planning ──
+    //
+    // The LENGTHS, DESCENDING, at which some declared key starts with
+    // `lead` — the exact set of substring lengths a longest-match scan at a
+    // position beginning with that byte can possibly match. Empty when no
+    // declared key starts with `lead`, in which case the scan has no work to
+    // do at all. See `detail::LexemeLengthIndex` for why this is exact
+    // rather than an approximation, and why it is a derived index rather
+    // than a cache.
+    //
+    // ⚠ A CALLER MUST STILL CALL `lookupLexeme` FOR EACH LENGTH IT KEEPS.
+    // This answers "which lengths are worth asking about", never "does this
+    // lexeme exist" — a length in the row means SOME key of that length
+    // starts with that byte, not that THIS substring is one of them.
+    [[nodiscard]] std::span<std::uint32_t const>
+    lexemeLengthsForLeadByte(unsigned char lead) const noexcept {
+        return lexemeLengths_.lengthsFor(lead);
+    }
+
+    // Same, for a lexer mode's `tokens` override table. Empty for every byte
+    // when the mode declares no override (its `lookupLexemeInMode` probes all
+    // miss, so skipping them is behaviour-preserving). Aborts on an invalid
+    // mode id — the same strong-id contract `lookupLexemeInMode` holds, so a
+    // caller can never confuse "wrong id" with "nothing declared".
+    [[nodiscard]] std::span<std::uint32_t const>
+    lexemeLengthsForLeadByteInMode(LexerModeId mode, unsigned char lead) const noexcept;
+
+    // The number of table lookups a longest-match scan performs summed over
+    // all 256 possible lead bytes, for the global table. Before the index
+    // this was unconditionally `256 * maxLexemeLength`. Exposed so the
+    // algorithmic property can be pinned by a test with no wall clock in it.
+    [[nodiscard]] std::size_t lexemeProbeCount() const noexcept {
+        return lexemeLengths_.probeCount();
+    }
 
     // Config-driven parser expression-nesting cap (`parser.maxExpressionDepth`).
     // `nullopt` when the config omits the field — the CU build then keeps the
@@ -1019,12 +1264,32 @@ private:
     // grammar query indexes this table — no hash, no probe.
     std::vector<detail::CompiledRule> compiledDense_;
 
+    // Per-lead-byte declared-length indexes for the global lexeme table and
+    // for each lexer mode's override table, derived by the ctor's sealing
+    // pass from the very tables `lookupLexeme` / `lookupLexemeInMode` query.
+    // ★ THE MODE INDEXES ARE PER MODE, NOT A GLOBAL UNION. A union would be
+    // conservative-correct but would filter far less: the shipped `c`
+    // grammar's `directive` mode overrides ONE key, `include`, so its own row
+    // for `i` is a single length — while the GLOBAL row for `i` is four
+    // (`include`, `inline`, `int`, `if`), three of them guaranteed misses in a
+    // one-entry override table. `tests/core/test_grammar_schema.cpp`
+    // (`GrammarSchemaProbeIndex.ModeRowsComeFromThatModesOwnTableNotAGlobalUnion`)
+    // is what goes red if these are ever collapsed into one.
+    // Indexed by `LexerModeId::v`; ids are dense 1..N with slot 0 the
+    // InvalidLexerMode sentinel, so this parallels `d_.lexerModes`.
+    detail::LexemeLengthIndex              lexemeLengths_;
+    std::vector<detail::LexemeLengthIndex> modeLexemeLengths_;
+
     // O(1) presence-tolerant row access: nullptr only for out-of-range ids
     // (an in-range id with no compiled body returns the default row, whose
     // empty fields answer every query the way the old map-miss did).
     [[nodiscard]] detail::CompiledRule const* ruleRow(std::uint32_t v) const noexcept {
         return v < compiledDense_.size() ? &compiledDense_[v] : nullptr;
     }
+
+    // The `.lang.json` stem this schema was loaded from — see `configName()`.
+    // EMPTY when there was no document.
+    std::string configName_;
 
     // Lowercase 64-hex SHA-256 of the document bytes — see `contentDigest()`.
     // Written ONLY by `loadFromText` (a static member, so no friend is

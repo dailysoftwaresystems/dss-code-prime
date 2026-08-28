@@ -144,12 +144,12 @@ constexpr std::string_view kOmissionRationaleKey = "$sehPersonalityOmittedCommen
 // what is shipped.
 [[nodiscard]] std::set<std::string> peFormatStemsOnDisk() {
     std::set<std::string> out;
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return out;
     }
-    auto const dir = *root / "src" / "dss-config" / "object-formats";
+    auto const dir = *root / "object-formats";
     constexpr std::string_view kSuffix = ".format.json";
     std::error_code ec;
     for (auto const& entry : fs::directory_iterator{dir, ec}) {

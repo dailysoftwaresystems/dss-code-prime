@@ -31,7 +31,7 @@ when-unsure-don't discipline, applied to that skill's standing test-discipline p
 | Delta since baseline | `git log --oneline <baseline>..HEAD` |
 | CI legs (unverifiable locally) | `gh run list` — flag, don't claim |
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0 / §0.1 |
-| Deferral registry + triggers | `.plans/_deferred-anchor-registry.md` |
+| Deferral registry + triggers | `.plans/_deferred-anchor-registry*.md` |
 | The implementer it checks | the `dss-cycle` skill |
 | Pre-build plan review (design GO) | apply the bar to the plan, not code — `dss-cycle` Step 3.5 (§C) |
 | Ratchet a recurring weak-test class | strengthen `dss-cycle` test-discipline prose · separate tagged commit (§J) |

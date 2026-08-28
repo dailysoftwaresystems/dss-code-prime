@@ -93,6 +93,27 @@ struct DSS_EXPORT JumpTableDescriptor {
     std::unordered_map<std::uint32_t, SymbolId> blockSymbols;
 };
 
+// D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: one entry per block whose
+// address a STATIC-STORAGE initializer took and that NOTHING in the code names —
+// `static void *tbl[] = {&&L0, &&L1}; goto *tbl[i];` reads the addresses out of
+// the table, so no block-address `lea` is emitted and the assembler's
+// encoder-driven `BlockSymPatch` → `blockSymbols` binding never fires. Exactly the
+// gap `JumpTableDescriptor` and `AsmBlockSymbolBinding` already describe from the
+// dense-switch and hand-written-`.s` sides; carried here as the third producer, and
+// resolved by the SAME `bindBlockSymbol` helper in `program/compile_pipeline.cpp`
+// so "symbol S is block B of function F" has ONE implementation.
+//
+// It carries ONLY the binding — no bytes. The table's bytes are the C object's own
+// initializer, emitted by `lowerMirGlobalsToDataItems` from the global's literal
+// (an abs64 relocation per `MirSymbolAddrValue` slot, which is what makes the label
+// address indistinguishable from any other address constant downstream). Populating
+// a `JumpTableDescriptor` instead would emit those bytes a SECOND time.
+struct DSS_EXPORT LirBlockSymbolBinding {
+    std::size_t   funcIndex = 0;   // index into lir.funcAt(i) of the owning function
+    std::uint32_t lirBlockV = 0;   // LirBlockId.v of the exported block
+    SymbolId      symbol{};        // the block's synthetic symbol (minted at HIR→MIR)
+};
+
 // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): one descriptor per x86-style float-negate
 // site the LIR lowerer realized as `xorpd/xorps xmm, [rip+mask]` (a target
 // WITHOUT a native `fneg` opcode). Like a JumpTableDescriptor it carries only
@@ -174,6 +195,12 @@ struct DSS_EXPORT MirToLirResult {
     // `compile_pipeline.cpp` to emit each mask's 16-byte, 16-byte-aligned
     // `.rodata` `AssembledData`. Empty on a native-fneg target (arm64).
     std::vector<SignMaskConstant> signMaskConstants;
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: one entry per block whose
+    // address reaches static data with no `lea` naming it. Consumed by
+    // `compile_pipeline.cpp` AFTER `assemble()` to append a `SyntheticBlockSymbol`
+    // to the owning function. Empty for every module with no `&&label` in a
+    // static-storage initializer.
+    std::vector<LirBlockSymbolBinding> blockSymbolBindings;
     // c116 (D-WIN64-SEH-FUNCLETS): one descriptor per `__try` region. Consumed by
     // `compile_pipeline.cpp` AFTER `assemble()` to attach a `SehScopeEntry` to the
     // owning function's `FrameUnwindInfo.sehScopes` (byte offsets from that

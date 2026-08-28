@@ -54,7 +54,7 @@ dss_add_test(NAME core/test_decl_prefix_strip   SOURCES test_decl_prefix_strip.c
 dss_add_test(NAME core/test_tree_visitor        SOURCES test_tree_visitor.cpp)
 dss_add_test(NAME core/test_tree_attrs          SOURCES test_tree_attrs.cpp)
 dss_add_test(NAME core/test_tree_end_to_end     SOURCES test_tree_end_to_end.cpp)
-dss_add_test(NAME core/test_c_subset            SOURCES test_c_subset.cpp)
+dss_add_test(NAME core/test_c            SOURCES test_c.cpp)
 dss_add_test(NAME core/test_operator_table      SOURCES test_operator_table.cpp)
 dss_add_test(NAME core/test_schema_cursor       SOURCES test_schema_cursor.cpp)
 dss_add_test(NAME core/test_schema_walker       SOURCES test_schema_walker.cpp)
@@ -70,7 +70,7 @@ dss_add_test(NAME core/test_sha256              SOURCES test_sha256.cpp)
 # host schema built inside the test and reaches the shipped
 # `sources/asm.lang.json` through it, so the "asm language is REUSED, zero new
 # grammar rules" property has a standing guard that does not depend on
-# c-subset — its only real consumer today. Links nlohmann_json because the test
+# c — its only real consumer today. Links nlohmann_json because the test
 # reads its OWN host document back to prove the host declares none of the rules
 # it inherits (a hand-copied list would rot into a tautology).
 dss_add_test(NAME core/test_language_references  SOURCES test_language_references.cpp)
@@ -140,6 +140,7 @@ dss_add_test(NAME core/substrate/test_arena_attribute SOURCES substrate/test_are
 dss_add_test(NAME core/substrate/test_arena_concepts  SOURCES substrate/test_arena_concepts.cpp)
 dss_add_test(NAME core/substrate/test_mint_monotonic_id SOURCES substrate/test_mint_monotonic_id.cpp)
 dss_add_test(NAME core/substrate/test_large_stack_call  SOURCES substrate/test_large_stack_call.cpp)
+dss_add_test(NAME core/substrate/test_stack_sized_thread SOURCES substrate/test_stack_sized_thread.cpp)
 dss_add_test(NAME core/substrate/test_relocation_table  SOURCES substrate/test_relocation_table.cpp)
 target_link_libraries(dss_core_substrate_test_relocation_table PRIVATE nlohmann_json::nlohmann_json)
 # The process-spawn substrate (src/core/substrate/process_spawn.{hpp,cpp}) — the
@@ -247,3 +248,99 @@ dss_add_test(NAME core/test_composite_kind_vocabulary_projection
 # stale pointer THROWS rather than passing vacuously.
 target_link_libraries(dss_core_test_composite_kind_vocabulary_projection
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN — the SWEEP of the
+# owner shape the retyped-set census could not see, in the one file that held
+# all of it: every inline `==` chain in `grammar_schema_json.cpp`. Thirteen
+# vocabularies plus the `synthesizedTypes` ROLE ROUTER.
+# ★★ THE EXPECTATIONS ARE HAND-WRITTEN, NOT PROJECTED. A pin whose expected set
+#    comes off the same table the code renders moves BOTH HALVES TOGETHER: a
+#    renamed row re-spells a config key across the tree and every
+#    "the-message-names-the-table" assertion stays green through it. This file
+#    states each accepted set, and its COUNT, as literals.
+# ⚠ MUST run through ctest, never a bare .exe: `findShippedConfig` walks the cwd
+# unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME core/test_grammar_loader_chain_vocabulary_projection
+             SOURCES test_grammar_loader_chain_vocabulary_projection.cpp)
+# Mutates the SHIPPED language JSON in memory at pointers found by SEARCHING for
+# the objects that carry each key (nlohmann consumer) — never by index, and a
+# locator that finds nothing fails the arm rather than passing vacuously.
+target_link_libraries(dss_core_test_grammar_loader_chain_vocabulary_projection
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-TYPEKIND-PASCALCASE-SPELLINGS-HAVE-TWO-OWNERS — `TypeKind`'s forty PascalCase
+# spellings had THREE hand-written owners (`lir/lir_text.cpp`'s `.dsslir` `core`
+# tag, `type_lattice/type_reintern.cpp`'s abort name, `grammar_schema_json.cpp`'s
+# twenty-row config table) and the PRIMITIVE subset had TWO. The first pair had
+# already drifted, on `Count_`.
+# ★★ THE EXPECTATIONS ARE HAND-WRITTEN, NOT PROJECTED — a set read off the same
+#    table the code renders moves BOTH HALVES TOGETHER. Every list and every
+#    count in this file is a literal.
+# ⚠ MUST run through ctest, never a bare .exe: `findShippedConfig` and
+# `TargetSchema::loadShipped` walk the cwd unless `DSS_CONFIG_ROOT` is set, and
+# only `dss_add_test` sets it.
+dss_add_test(NAME core/test_type_kind_vocabulary_projection
+             SOURCES test_type_kind_vocabulary_projection.cpp)
+# Mutates the SHIPPED language JSON in memory at a pointer guarded by `at()`,
+# which THROWS rather than passing vacuously when it stops resolving (nlohmann
+# consumer). The `.dsslir` half needs no JSON — it rewrites the tag in a module
+# the emitter produced.
+target_link_libraries(dss_core_test_type_kind_vocabulary_projection
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LATTICE-PRIMITIVE-BUILDER-ACCEPTS-A-NON-PRIMITIVE-KIND — `TypeInterner::
+# primitive` interned WHATEVER kind it was handed (a fieldless "struct", an
+# element-less "complex"), and the only gate on that argument, the config
+# loader's `isPrimitiveTypeKind`, guarded ONE of the builder's callers.
+# ★ THE FIRING IS THE DELIVERABLE. The gap was ✔MEASURED as not a live defect,
+#   so a guard that could not be shown to fire would be strictly worse than
+#   none. Twenty per-kind death arms (a loop inside one expectation ends at the
+#   FIRST abort and would assert nothing about the other nineteen), plus the
+#   INVERSE arm proving all twenty LEAF kinds still intern, plus a partition arm
+#   so a new enumerator cannot land in neither list and leave both quiet.
+# ★★ EVERY SET AND EVERY COUNT IS A LITERAL — a list read off the same table or
+#    the same predicate the code consults moves BOTH HALVES TOGETHER.
+# No config, no shipped JSON: the subject is the interner itself.
+dss_add_test(NAME core/test_primitive_builder_leaf_kind_gate
+             SOURCES test_primitive_builder_leaf_kind_gate.cpp)
+
+# D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT — the ONE
+# checked whole-file read, its per-site ROUTING pins, and the source scan that
+# stops a new loader reintroducing a hand-written `<< …rdbuf()` drain.
+# ★ The input-error arm drives a streambuf that really FAILS mid-read: an
+#   `ifstream` badbit cannot be forced by truncating a file (a short file reads
+#   cleanly to EOF and sets no bit), which is why the hole was invisible to a
+#   truncate hammer and why the failure had to be constructed instead.
+dss_add_test(NAME core/test_checked_file_read
+             SOURCES test_checked_file_read.cpp)
+
+# D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS -- the
+# content-addressed memo every schema load goes through, and the two failure
+# directions it has to hold apart: an over-eager memo serving a schema built
+# from superseded bytes (a SILENT MISCOMPILE -- the grammar drives every
+# front-end decision and nothing downstream would red), and an under-eager one
+# that never hits and is a no-op wearing a green suit.
+# * The referenced-document arm is the one the mechanism exists for: the host's
+#   own bytes are byte-identical across both loads, so its digest cannot see the
+#   edit, and only the per-entry dependency ledger separates the two.
+# ** It never touches a shipped config -- it COPIES the one fragment it needs
+#    into a scratch tree and points $DSS_CONFIG_ROOT at the copy, so a suite
+#    reading the live tree concurrently cannot observe it.
+dss_add_test(NAME core/test_config_document_memo
+             SOURCES test_config_document_memo.cpp)
+
+# D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS, the
+# other two families -- the memo above is driven through the GRAMMAR loader; this
+# is the guard for `TargetSchema` and `ObjectFormatSchema`, plus the three
+# `--time` phases (locate-config / load-config / build-config) that report what a
+# config load costs.
+# * The rewrite arms are the reason it exists: for a target document a stale hit
+#   is a silently wrong register file and calling convention, and for a format
+#   document a silently wrong on-disk artifact layout -- neither reds anything
+#   downstream, so only a differential over the document's BYTES catches it.
+# * `build-config`'s run count is the memo's MISS count, so the phase arm fails
+#   both when a Scope is missing and when the memo stops hitting.
+# ** Every document under test is a COPY in a per-test scratch dir, rewritten by
+#    an ATOMIC replace; the shipped tree is only ever READ.
+dss_add_test(NAME core/test_config_memo_all_families
+             SOURCES test_config_memo_all_families.cpp)

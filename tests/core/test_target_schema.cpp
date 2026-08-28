@@ -49,6 +49,11 @@ using ::dss::encodingSlotKindName;
 using ::dss::encodingSlotKindFromName;
 using ::dss::isSymbolBearingSlot;
 using ::dss::slotShapeFor;
+// D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the encoding-field
+// register-bank resolvers + the va_list strategy the AAPCS64 VR-save pin reads.
+using ::dss::encodingResultRegClass;
+using ::dss::encodingWireRegClass;
+using ::dss::VaListStrategy;
 
 bool anyHasCode(auto const& diags, DiagnosticCode code) {
     return std::ranges::any_of(diags, [code](auto const& d) {
@@ -180,15 +185,39 @@ TEST(TargetSchema, LoadShippedReportsNotFoundForUnknownName) {
     EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_InvalidTargetName));
 }
 
-TEST(TargetSchema, EachLoadMintsDistinctSchemaId) {
-    auto a = TargetSchema::loadShipped("x86_64");
-    auto b = TargetSchema::loadShipped("x86_64");
-    ASSERT_TRUE(a.has_value()) << "x86_64 must be a shipped target";
-    ASSERT_TRUE(b.has_value());
-    EXPECT_NE((*a)->id(), (*b)->id())
-        << "two independent loads must produce distinct TargetSchemaIds — "
-           "otherwise the substrate cross-check between Lir::targetId and "
-           "the schema reference would silently alias unrelated builders";
+// ⚠ RE-AIMED 2026-08-25 (cycle P35, lane A). It was
+// `EachLoadMintsDistinctSchemaId`, and it loaded `x86_64` TWICE. The
+// content-addressed memo
+// (D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS)
+// makes two loads of ONE document one build and therefore ONE id, so the old
+// subject is now false BY DESIGN.
+//
+// ★ THIS IS A STRENGTHENING, NOT A WEAKENING, AND THE OLD TEST'S OWN COMMENT
+// SAYS SO. Its stated stake was that colliding ids would "silently alias
+// UNRELATED builders" through the `Lir::targetId` cross-check — but two loads of
+// `x86_64` are not unrelated, they are the same description byte for byte, so
+// the old arm never once exercised that hazard. Two DIFFERENT target documents
+// do, and that is what it now loads: had `x86_64` and `arm64` collided on one
+// id, the previous form would have stayed green.
+// ★★ The second half states the memo's own property in the same place, so a
+// future reader does not re-derive the deleted expectation from the name.
+TEST(TargetSchema, DistinctTargetDocumentsMintDistinctSchemaIds) {
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(x86.has_value()) << "x86_64 must be a shipped target";
+    ASSERT_TRUE(arm.has_value()) << "arm64 must be a shipped target";
+    EXPECT_NE((*x86)->id(), (*arm)->id())
+        << "two DIFFERENT target descriptions share one TargetSchemaId — the "
+           "substrate cross-check between Lir::targetId and the schema "
+           "reference would silently alias unrelated builders";
+
+    auto again = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(x86->get(), again->get())
+        << "two loads of ONE unchanged document must share the memoized schema";
+    EXPECT_EQ((*x86)->id(), (*again)->id())
+        << "one build means one id — a second id here would mean the document "
+           "was rebuilt";
 }
 
 TEST(TargetSchema, LoadFromTextDefaultsSourceLabel) {
@@ -1645,7 +1674,7 @@ TEST(TargetSchema, LinkRegisterMustBeString) {
 
 TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     // 16 GPRs + 16 FPRs + rflags + the 16 32-bit GPR views (eax..r15d)
-    // + the 16 8-bit views (al..r15b) = 65.
+    // + the 16 16-bit views (ax..r15w) + the 16 8-bit views (al..r15b) = 81.
     // EXPECT_EQ (not EXPECT_GE) so a future accidental duplicate / addition
     // trips the test rather than silently passing.
     //
@@ -1659,7 +1688,7 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     // grew one, all trip it now and none of them tripped the total.
     auto r = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ((*r)->registerCount(), 65u);
+    EXPECT_EQ((*r)->registerCount(), 81u);
 
     // ★★ THE COMPOSITION IS KEYED ON (class, sub-ness, WIDTH), NOT JUST
     // (class, sub-ness) — extended when the 8-bit views landed
@@ -1671,7 +1700,18 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     // view that forgot its `subOf`, a 32-bit view that grew a byte width, and a
     // duplicated file at either width each trip a DIFFERENT expectation than
     // the bare total does.
-    std::size_t fullGpr = 0, subGpr32 = 0, subGpr8 = 0, subGprOther = 0;
+    // ★★★ THE 16-BIT BUCKET IS A NEW EXPECTATION, NOT A RE-CUT TOTAL
+    // (D-ASM-SUB-NATIVE-OPERAND-UNUSABLE-IN-INLINE-ASM, 2026-08-23). The
+    // `subGprOther == 0` line below used to carry the sentence *"no 16-bit
+    // (ax..r15w) file is declared — no consumer writes one yet"*; that trigger
+    // fired when the AT&T dialect grew `movw`, so the word views landed under
+    // the same first-consumer rule the other two blocks did. ⚠ THE PIN IS
+    // STRENGTHENED RATHER THAN RELAXED: `subGprOther` stays and still expects
+    // ZERO, so it now means "no sub-register of a width this file does not
+    // enumerate", which is a claim the old form could not make about a 2-byte
+    // row. A total re-cut to 81 alone would have said strictly less.
+    std::size_t fullGpr = 0, subGpr32 = 0, subGpr16 = 0, subGpr8 = 0;
+    std::size_t subGprOther = 0;
     std::size_t fpr = 0, flags = 0, other = 0;
     for (auto const& info : (*r)->registers()) {
         bool const sub = !info.subOf.empty();
@@ -1679,6 +1719,7 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
             case TargetRegClass::GPR:
                 if (!sub) { ++fullGpr; break; }
                 if (info.widthBytes == 4)      ++subGpr32;
+                else if (info.widthBytes == 2) ++subGpr16;
                 else if (info.widthBytes == 1) ++subGpr8;
                 else                           ++subGprOther;
                 break;
@@ -1690,12 +1731,16 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     EXPECT_EQ(fullGpr,  16u) << "rax..r15";
     EXPECT_EQ(subGpr32, 16u) << "eax..r15d — the 32-bit views, `subOf` their "
                                 "64-bit parent";
+    EXPECT_EQ(subGpr16, 16u) << "ax..r15w — the 16-bit views; without them a "
+                                "hand-written `movw %ax, %cx` (which gas "
+                                "accepts) cannot name a register";
     EXPECT_EQ(subGpr8,  16u) << "al..r15b — the 8-bit views; without them "
                                 "gas's `sete %al` is unspellable and the only "
                                 "form DSS could spell (`sete %rax`) is one gas "
                                 "rejects";
-    EXPECT_EQ(subGprOther, 0u) << "no 16-bit (ax..r15w) file is declared — no "
-                                  "consumer writes one yet";
+    EXPECT_EQ(subGprOther, 0u) << "every declared sub-register is 4, 2 or 1 "
+                                  "bytes wide — a row at any other width is "
+                                  "one this composition does not describe";
     EXPECT_EQ(fpr,      16u) << "xmm0..xmm15";
     EXPECT_EQ(flags,     1u) << "rflags";
     EXPECT_EQ(other,     0u);
@@ -1816,7 +1861,7 @@ TEST(TargetSchema, ArgVrsReturnVrsParseResolveAndValidateVrClass) {
 // The macros that tell the preprocessor which CPU it is compiling for live on
 // the TARGET, next to the other per-target language-affecting semantics
 // (`charIsUnsigned`, `aggregateLayout`, `tls`, `callingConventions`) — putting
-// them on the language would force `c-subset.lang.json` to enumerate CPU
+// them on the language would force `c.lang.json` to enumerate CPU
 // architectures. Entry grammar is the SHARED parser the language loader uses.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1886,7 +1931,7 @@ TEST(TargetSchema, TFC74Arm64PredefinedMacrosExactSet) {
                   // across every triple including the big-endian control.
                   // ★ __BIG_ENDIAN__ MUST NOT APPEAR IN THIS LIST — MEASURED, it
                   // is defined only on a big-endian triple (aarch64_be-linux-gnu),
-                  // and Apple's libkern/OSByteOrder.h:165 tests it BEFORE the
+                  // and Apple's libkern/OSByteOrder.h tests it BEFORE the
                   // little-endian arm, so a stray row silently selects
                   // byte-swapping macros. This exact-set comparison is what keeps
                   // it out.
@@ -1951,7 +1996,7 @@ TEST(TargetSchema, TFC74PredefinedMacroUnknownKindRejected) {
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
-            "predefinedMacros":[{"name":"__X__","kind":"consant","value":"1","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+            "predefinedMacros":[{"name":"__X__","kind":"consant","value":"1","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "the `kind` verb set is CLOSED — a typo must never load as some "
@@ -1963,7 +2008,7 @@ TEST(TargetSchema, TFC74PredefinedMacroConstantRequiresValue) {
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
-            "predefinedMacros":[{"name":"__X__","kind":"constant","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+            "predefinedMacros":[{"name":"__X__","kind":"constant","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "a constant predefine with no `value` would expand to nothing — "
@@ -1976,7 +2021,7 @@ TEST(TargetSchema, TFC74PredefinedMacroBadObjectFormatRejected) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                 "availableObjectFormats":["machoo"],"impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+                                 "availableObjectFormats":["machoo"],"programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "an unknown object-format name is a typo that would make the macro "
@@ -1991,8 +2036,8 @@ TEST(TargetSchema, TFC74PredefinedMacroDuplicateNameRejected) {
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
-            "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}},
-                                {"name":"__X__","kind":"constant","value":"2","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+            "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}},
+                                {"name":"__X__","kind":"constant","value":"2","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "two entries for one name would make the effective value depend on "
@@ -2021,7 +2066,7 @@ TEST(TargetSchema, PredefinedMacroEntryUnknownKeyRejectedAndNamed) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                 "availabelObjectFormats":["elf"],"impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+                                 "availabelObjectFormats":["elf"],"programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "a misspelled entry key must be REFUSED — silently ignoring this "
@@ -2038,7 +2083,7 @@ TEST(TargetSchema, PredefinedMacroEntryUnknownKeyRejectedAndNamed) {
 }
 
 // The `$`-prefix carve-out inside an ENTRY (the root-key carve-out is pinned
-// separately). Both shipped targets and the shipped c-subset language put prose
+// separately). Both shipped targets and the shipped c language put prose
 // inside these rows, so without this the gate would reject them at load — the
 // inverse failure, and the one that actually fires.
 TEST(TargetSchema, PredefinedMacroEntryDollarPrefixedKeyStillAccepted) {
@@ -2046,7 +2091,7 @@ TEST(TargetSchema, PredefinedMacroEntryDollarPrefixedKeyStillAccepted) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                 "$valueComment":"why this spelling","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+                                 "$valueComment":"why this spelling","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_TRUE(r.has_value())
         << "`$`-prefixed keys are prose, not knobs — and the carve-out must be "
@@ -2681,7 +2726,7 @@ TEST(TargetSchema, TFC76PredefinedMacroSentinelObjectFormatRejected) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                 "availableObjectFormats":["unknown"],"impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+                                 "availableObjectFormats":["unknown"],"programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "'unknown' spells correctly, so only an explicit selectability check "
@@ -2726,7 +2771,7 @@ namespace {
               {"mnemonic":"invalid","result":"none"},
               {"mnemonic":"mov","result":"value",
                "minOperands":1,"maxOperands":1,
-               "encoding":{"format":"fixed32","variants":[
+               "encoding":{"format":"fixed32","registerClass":"gpr","variants":[
                  {"guard":{)"} + std::string{guardBody} + R"(},
                   "template":{"fixedWord":2457862144},
                   "resultSlot":"rd",
@@ -3158,6 +3203,26 @@ std::set<std::string> registersInClass(TargetSchema const& s,
     return out;
 }
 
+// The FULL-WIDTH members of `cls` — the register FILE, with the narrow VIEWS
+// (`subOf` rows: `eax`, `ax`, `al`, `w0`) left out.
+// ★★★ THIS EXISTS BECAUSE A VIEW SPELLING CAN LEGITIMATELY COINCIDE ACROSS
+// TARGETS AND A FILE MEMBER CANNOT — see
+// D-ASM-SUB-NATIVE-OPERAND-UNUSABLE-IN-INLINE-ASM
+// (2026-08-23). x86_64's 16-bit views landed with `movw`, and gas spells the
+// word view of `rsp` as `%sp` — which is ALSO the name of AArch64's full 8-byte
+// stack pointer. One spelling, two targets, two different things: exactly the
+// per-target resolution the constraint-letter test is about, so the disjointness
+// claim below is made about the FILES and the coincidence is asserted
+// separately rather than papered over by dropping the claim.
+std::set<std::string> registerFileOfClass(TargetSchema const& s,
+                                          TargetRegClass cls) {
+    std::set<std::string> out;
+    for (auto const& r : s.registers()) {
+        if (r.regClass == cls && r.subOf.empty()) out.insert(r.name);
+    }
+    return out;
+}
+
 }  // namespace
 
 TEST(TargetSchema, AsmConstraintsAbsentIsEmptyNotAnError) {
@@ -3541,12 +3606,41 @@ TEST(TargetSchema, SameAsmConstraintLetterResolvesDifferentlyPerTarget) {
     EXPECT_TRUE(aRegs.contains("x0"));
     EXPECT_FALSE(aRegs.contains("rax"));
 
+    // ★★★ THE DISJOINTNESS CLAIM IS ABOUT THE REGISTER **FILES**, AND IT WAS
+    // NARROWED FROM "every name in the class" ON 2026-08-23 BECAUSE THE OLD
+    // FORM BECAME FALSE FOR A REASON THAT IS ITSELF EVIDENCE FOR THIS TEST.
+    // x86_64's 16-bit views landed with the AT&T `movw` spelling, and gas names
+    // the word view of `rsp` `%sp` — which is also AArch64's full 8-byte stack
+    // pointer. ✔MEASURED, the intersection of the two GPR classes is EXACTLY
+    // {"sp"}: one spelling, two targets, a 2-byte VIEW of `rsp` on one and an
+    // 8-byte FILE MEMBER on the other. Widening the claim to tolerate any
+    // overlap would have been the guard-weakened-by-its-own-subject shape; the
+    // claim instead moves to the files, where an overlap really would mean one
+    // target is describing the other's registers, and the coincidence is
+    // asserted BELOW as the sharper fact it is.
+    auto const xFile = registerFileOfClass(**x86, *rx->registerClass);
+    auto const aFile = registerFileOfClass(**arm, *ra->registerClass);
     std::vector<std::string> shared;
-    std::ranges::set_intersection(xRegs, aRegs, std::back_inserter(shared));
+    std::ranges::set_intersection(xFile, aFile, std::back_inserter(shared));
     EXPECT_TRUE(shared.empty())
-        << "letter 'r' must resolve to two disjoint register sets; "
+        << "letter 'r' must resolve to two disjoint register FILES; "
            << shared.size() << " name(s) appear in both, which would mean "
               "one of the targets is describing the other's register file";
+
+    // ★★ THE COINCIDING SPELLING, PINNED RATHER THAN EXCUSED. `sp` denotes a
+    // 2-byte view of `rsp` under x86_64 and the 8-byte stack pointer under
+    // arm64. If a lookup ever folded register names across targets, THIS is the
+    // name it would get wrong, and it would do so silently.
+    auto const* xSp = (*x86)->registerInfo(
+        (*x86)->registerByName("sp").value_or(0));
+    auto const* aSp = (*arm)->registerInfo(
+        (*arm)->registerByName("sp").value_or(0));
+    ASSERT_NE(xSp, nullptr);
+    ASSERT_NE(aSp, nullptr);
+    EXPECT_EQ(xSp->widthBytes, 2u) << "x86_64 `sp` is the WORD view of rsp";
+    EXPECT_EQ(xSp->subOf, "rsp");
+    EXPECT_EQ(aSp->widthBytes, 8u) << "arm64 `sp` is a full-width register";
+    EXPECT_TRUE(aSp->subOf.empty());
 
     // ── half two: `a` is declared by ONE of them, and the other REFUSES ──
     // ✔MEASURED: aarch64-linux-gnu-gcc rejects `"=a"` with `error:
@@ -4039,4 +4133,352 @@ TEST(TargetSchemaContentDigest, ConstructionBypassingLoadFromTextLeavesItEmpty) 
     EXPECT_TRUE(schema.contentDigest().empty())
         << "a schema with no document bytes reported a digest: "
         << schema.contentDigest();
+}
+
+// ══ THE THREE NEW GUARD/VARIANT COHERENCE RULES (cycle P29) ════════════════
+//
+// D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE added the
+// memory-DIRECTION axis (`guard.memoryDestination`) and
+// D-TARGET-PRODUCER-VARIANT-WITHOUT-A-RESULT-SLOT-ENCODES-REGISTER-ZERO added
+// the missing mirror of an already-enforced rule. Both are LOAD-TIME refusals
+// whose absence is silent, so each gets a pin that mutates the SHIPPED document
+// and asserts the refusal.
+
+namespace {
+
+// One opcode's variant array in a parsed target document, or nullptr.
+[[nodiscard]] nlohmann::json*
+variantsOfOpcode(nlohmann::json& doc, std::string_view mnemonic) {
+    for (auto& op : doc.at("opcodes")) {
+        if (op.value("mnemonic", std::string{}) == mnemonic) {
+            return &op.at("encoding").at("variants");
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
+TEST(TargetSchema, MemoryDirectionAxisNeedsAMemoryOperandToRouteOn) {
+    // The coherence rule, in the same family as `negValue` and immMin/immMax: a
+    // guard with no `membase` names no memory reference, so an axis about that
+    // reference's ROLE would key on a fact the instruction cannot have — and
+    // the variant would silently match nothing for one of the axis's two
+    // values.
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            auto* vs = variantsOfOpcode(doc, "cmp");
+            ASSERT_NE(vs, nullptr) << "x86_64 declares no `cmp`";
+            for (auto& v : *vs) {
+                auto& g = v.at("guard");
+                if (g.at("operandKinds")
+                    != nlohmann::json::array({"reg", "reg"})) continue;
+                if (g.value("width", 0) != 64) continue;
+                g["memoryDestination"] = true;
+            }
+        });
+    EXPECT_FALSE(mutated.has_value())
+        << "`memoryDestination` on a guard with no `membase` operand must be a "
+           "load-time refusal";
+}
+
+TEST(TargetSchema, OppositeMemoryDirectionsAreNotShadowingSiblings) {
+    // ★ THE POSITIVE HALF, and it is what makes the pin above meaningful: the
+    // SHIPPED document declares two `cmp` variants with identical
+    // `operandKinds`, identical `width` and identical immediate domain,
+    // separated ONLY by `memoryDestination` — and it loads. If the shadowing
+    // check did not treat the axis as a disambiguator, the shipped target
+    // itself would be refused.
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto const ordinal = (*shipped)->opcodeByMnemonic("cmp");
+    ASSERT_TRUE(ordinal.has_value());
+    auto const* info = (*shipped)->opcodeInfo(*ordinal);
+    ASSERT_NE(info, nullptr);
+    std::size_t trues = 0;
+    std::size_t falses = 0;
+    for (auto const& v : info->encoding.variants) {
+        if (!v.memoryDestination.has_value()) continue;
+        (*v.memoryDestination ? trues : falses) += 1;
+    }
+    EXPECT_GT(trues, 0u) << "no memory-destination `cmp` variant is declared";
+    EXPECT_EQ(trues, falses)
+        << "the direction axis is declared in PAIRS by construction — a lone "
+           "half leaves the opposite spelling matching nothing, which is a "
+           "loud refusal but almost never what the author meant";
+}
+
+TEST(TargetSchema, ProducingX86VariantWithoutAResultSlotIsRefused) {
+    // ★★★ THE MIRROR OF A RULE THAT HAS BEEN ENFORCED SINCE THE SCHEMA EXISTED
+    // (`result: none` + a `resultSlot` is rejected), and the mirror is the
+    // DANGEROUS half. ✔MEASURED 2026-08-23 on a variant authored in this cycle:
+    // without the rule the document LOADED CLEAN and the walker emitted
+    // register field 0 for the result, so `movw $42, %cx`, `%dx` and `%r15w`
+    // all produced the SAME bytes — `%ax` — with rc=0 and no diagnostic. The
+    // enforced direction fails loud at encode time; this one shipped a wrong
+    // register (D-TARGET-PRODUCER-VARIANT-WITHOUT-A-RESULT-SLOT-ENCODES-REGISTER-ZERO).
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            auto* vs = variantsOfOpcode(doc, "zext32");
+            ASSERT_NE(vs, nullptr) << "x86_64 declares no `zext32`";
+            for (auto& v : *vs) v.erase("resultSlot");
+        });
+    EXPECT_FALSE(mutated.has_value())
+        << "a value-producing x86-variable variant with no `resultSlot` must be "
+           "a load-time refusal — it encodes register 0 otherwise";
+}
+
+TEST(TargetSchema, TheResultSlotRuleExemptsTheShapesThatLegitimatelyHaveNone) {
+    // ⚠ THE EXEMPTIONS ARE PINNED, NOT ASSUMED, because a rule that false-fires
+    // gets weakened rather than fixed. Both shipped targets LOAD, and each
+    // carries at least one producing variant with no resultSlot that the rule
+    // must NOT reject: x86_64's `call` (a call's result is the ABI return
+    // register, never an encoded field) and arm64's 3-word `sub sp, sp, #imm`
+    // (a fixed32 template with the destination BAKED into its fixed word).
+    for (auto const* name : {"x86_64", "arm64"}) {
+        auto shipped = TargetSchema::loadShipped(name);
+        EXPECT_TRUE(shipped.has_value())
+            << name << " must still load with the result-slot rule in force";
+    }
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value());
+    auto const callOrd = (*x86)->opcodeByMnemonic("call");
+    ASSERT_TRUE(callOrd.has_value());
+    auto const* call = (*x86)->opcodeInfo(*callOrd);
+    ASSERT_NE(call, nullptr);
+    EXPECT_TRUE(call->isCall)
+        << "the exemption is keyed on `isCall`; if `call` stopped declaring it "
+           "the shipped target would stop loading";
+    bool anyWithoutSlot = false;
+    for (auto const& v : call->encoding.variants) {
+        anyWithoutSlot = anyWithoutSlot || !v.resultSlot.has_value();
+    }
+    EXPECT_TRUE(anyWithoutSlot)
+        << "`call` no longer exercises the exemption — re-aim this pin at "
+           "whatever shape does, or the rule's exemption is untested";
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// THE REGISTER-BANK DECLARATION ON AN ENCODING FIELD
+// D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD.
+//
+// The encoder can only compare an operand's class against a class it was
+// GIVEN. So the loader's job is TOTALITY: every field that will ever receive a
+// register resolves to exactly one declared, operable bank — from the field's
+// own `regClass`/`resultRegClass` or the opcode's `encoding.registerClass` —
+// or the document does not load. These pins cover the totality rule, both
+// override levels, and the four coherence rules that keep a declaration from
+// reading as a guarantee it does not make.
+// ─────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// One fixed32 opcode with a result field and one register operand, plus a
+// register table so the bank a field names can be checked against real rows.
+// `encBody` is spliced into the `encoding` object before `variants`.
+[[nodiscard]] std::string bankDoc(std::string_view encBody,
+                                  std::string_view resultBody,
+                                  std::string_view wireBody) {
+    return std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "registers":[
+          {"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0},
+          {"name":"d0","class":"fpr","widthBytes":8,"hwEncoding":0}
+        ],
+        "opcodes":[
+          {"mnemonic":"invalid","result":"none"},
+          {"mnemonic":"mov","result":"value",
+           "minOperands":1,"maxOperands":1,
+           "encoding":{"format":"fixed32",)"} + std::string{encBody} +
+        R"("variants":[
+             {"guard":{"operandKinds":["reg"]},
+              "template":{"fixedWord":2457862144},)" +
+        std::string{resultBody} + R"("resultSlot":"rd",
+              "wires":[{"index":0,"slotKind":"rn")" + std::string{wireBody} +
+        R"(}]}
+           ]}}
+        ]})";
+}
+
+} // namespace
+
+TEST(TargetSchema, RegisterFieldWithNoDeclaredBankIsRefused) {
+    // THE TOTALITY RULE. Without a bank the encoder has nothing to compare an
+    // operand against, which is the state that let a GPR ordinal into an XMM
+    // field and emit `cvttss2si %xmm15` with no diagnostic.
+    auto r = TargetSchema::loadFromText(bankDoc("", "", ""), "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "a register-bearing field with no declared bank must be refused";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    bool named = false;
+    for (auto const& d : r.error()) {
+        named = named || d.message.find("no register bank is declared")
+                             != std::string::npos;
+    }
+    EXPECT_TRUE(named) << "the refusal must say what is missing";
+}
+
+TEST(TargetSchema, OpcodeWideBankCoversEveryFieldOfTheOpcode) {
+    auto r = TargetSchema::loadFromText(
+        bankDoc(R"("registerClass":"gpr",)", "", ""), "<inline>");
+    ASSERT_TRUE(r.has_value());
+    auto const* info = (*r)->opcodeInfo(*(*r)->opcodeByMnemonic("mov"));
+    ASSERT_NE(info, nullptr);
+    ASSERT_FALSE(info->encoding.variants.empty());
+    auto const& v = info->encoding.variants[0];
+    EXPECT_EQ(encodingResultRegClass(info->encoding, v), TargetRegClass::GPR);
+    ASSERT_FALSE(v.wires.empty());
+    EXPECT_EQ(encodingWireRegClass(info->encoding, v.wires[0]),
+              TargetRegClass::GPR);
+}
+
+TEST(TargetSchema, PerFieldBankOverridesTheOpcodeWideOne) {
+    // The mixed-class shape every convert instruction has: one field from each
+    // bank. The result override must beat the opcode-wide declaration while
+    // the wire keeps it, INDEPENDENTLY of each other.
+    auto r = TargetSchema::loadFromText(
+        bankDoc(R"("registerClass":"gpr",)", R"("resultRegClass":"fpr",)",
+                R"(,"regClass":"gpr")"),
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    auto const* info = (*r)->opcodeInfo(*(*r)->opcodeByMnemonic("mov"));
+    ASSERT_NE(info, nullptr);
+    auto const& v = info->encoding.variants[0];
+    EXPECT_EQ(encodingResultRegClass(info->encoding, v), TargetRegClass::FPR)
+        << "the variant's own `resultRegClass` must win";
+    EXPECT_EQ(encodingWireRegClass(info->encoding, v.wires[0]),
+              TargetRegClass::GPR)
+        << "and the wire keeps the opcode-wide bank it re-states";
+}
+
+TEST(TargetSchema, PerFieldBankAloneSatisfiesTotality) {
+    // No opcode-wide declaration at all — every field declares its own. The
+    // totality rule is about RESOLUTION, not about which level supplied it.
+    auto r = TargetSchema::loadFromText(
+        bankDoc("", R"("resultRegClass":"fpr",)", R"(,"regClass":"gpr")"),
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    auto const* info = (*r)->opcodeInfo(*(*r)->opcodeByMnemonic("mov"));
+    ASSERT_NE(info, nullptr);
+    EXPECT_EQ(encodingWireRegClass(info->encoding,
+                                   info->encoding.variants[0].wires[0]),
+              TargetRegClass::GPR);
+}
+
+TEST(TargetSchema, NoneIsNotAnOperableBankForAField) {
+    // `none` is a legitimate `TargetRegClass` VALUE (a register can have no
+    // class) and an illegitimate SUBJECT here — the same split
+    // `registerClassOps` already draws. It must be refused by the coherence
+    // rule, not silently taken as row 0.
+    auto r = TargetSchema::loadFromText(
+        bankDoc(R"("registerClass":"none",)", "", ""), "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, UnknownBankSpellingIsRefusedNotIgnored) {
+    auto r = TargetSchema::loadFromText(
+        bankDoc(R"("registerClass":"xmm",)", "", ""), "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "an unknown bank name must be refused — silently ignoring it would "
+           "leave the field with no bank and no message";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, BankWithNoRegistersOfThatClassIsRefused) {
+    // The target's table has gpr + fpr rows and no vector ones, so a `vr`
+    // field could never be filled: every instruction using it would be refused
+    // at ENCODE time, which is a loud refusal of correct input rather than a
+    // caught defect. Refuse the document instead.
+    auto r = TargetSchema::loadFromText(
+        bankDoc(R"("registerClass":"vr",)", "", ""), "<inline>");
+    ASSERT_FALSE(r.has_value());
+    bool named = false;
+    for (auto const& d : r.error()) {
+        named = named || d.message.find("no register of that class")
+                             != std::string::npos;
+    }
+    EXPECT_TRUE(named) << "the refusal must say the table has no such register";
+}
+
+TEST(TargetSchema, ResultRegClassWithoutAResultSlotIsRefused) {
+    // A bank for a field the variant does not have. Same coherence family as
+    // `negValue` on a guard with no value operand: a declaration that reads as
+    // a guarantee and governs nothing is worse than its absence.
+    auto const doc = std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "registers":[{"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0}],
+        "opcodes":[
+          {"mnemonic":"invalid","result":"none"},
+          {"mnemonic":"nop2","result":"none","terminatorKind":"unreachable",
+           "encoding":{"format":"fixed32","variants":[
+             {"guard":{"operandKinds":[]},"template":{"fixedWord":1},
+              "resultRegClass":"gpr"}
+           ]}}
+        ]})"};
+    auto r = TargetSchema::loadFromText(doc, "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, RegClassOnANonRegisterWireIsRefused) {
+    // The wired operand is an IMMEDIATE, so the field never receives a
+    // register and the bank governs nothing.
+    auto const doc = std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "registers":[{"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0}],
+        "opcodes":[
+          {"mnemonic":"invalid","result":"none"},
+          {"mnemonic":"movi","result":"value","minOperands":1,"maxOperands":1,
+           "encoding":{"format":"fixed32","registerClass":"gpr","variants":[
+             {"guard":{"operandKinds":["imm32"]},"template":{"fixedWord":1},
+              "resultSlot":"rd",
+              "wires":[{"index":0,"slotKind":"imm16","regClass":"gpr"}]}
+           ]}}
+        ]})"};
+    auto r = TargetSchema::loadFromText(doc, "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, OpcodeWideBankGoverningNoFieldIsRefused) {
+    // `nop2` has neither a result slot nor a register operand.
+    auto const doc = std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "registers":[{"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0}],
+        "opcodes":[
+          {"mnemonic":"invalid","result":"none"},
+          {"mnemonic":"nop2","result":"none","terminatorKind":"unreachable",
+           "encoding":{"format":"fixed32","registerClass":"gpr","variants":[
+             {"guard":{"operandKinds":[]},"template":{"fixedWord":1}}
+           ]}}
+        ]})"};
+    auto r = TargetSchema::loadFromText(doc, "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, ShippedTargetsStillLoadWithTheBankRuleInForce) {
+    for (char const* name : {"x86_64", "arm64"}) {
+        auto shipped = TargetSchema::loadShipped(name);
+        EXPECT_TRUE(shipped.has_value())
+            << name << " must still load with the register-bank rule in force";
+    }
+}
+
+// ── the AAPCS64 variadic VR save block's register source ─────────────────
+//
+// The prologue spills `fpSaveCount` FULL-WIDTH vector registers, and it takes
+// them from `argVrs`. It used to take them from `argFprs` — the 64-bit `d`
+// views of the same file — so a 16-byte `STUR Qt` named an 8-byte register and
+// emitted the right bytes only because `d0` and `v0` share hardware encoding 0.
+// A short `argVrs` would spill fewer registers than the save area reserves
+// slots for, leaving `va_arg` reading uninitialised stack for the tail.
+TEST(TargetSchema, Aapcs64VariadicSaveNeedsArgVrsToCoverFpSaveCount) {
+    auto shipped = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(shipped.has_value());
+    auto const* cc = (*shipped)->callingConventionByName("aapcs64");
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->vaListLayout.has_value());
+    EXPECT_EQ(cc->vaListLayout->strategy, VaListStrategy::Aapcs64DualCursor);
+    EXPECT_GE(cc->argVrs.size(), cc->vaListLayout->fpSaveCount)
+        << "the prologue spills argVrs[0..fpSaveCount)";
+    EXPECT_GT(cc->vaListLayout->fpSaveCount, 0u)
+        << "a zero count would make this pin vacuous";
 }

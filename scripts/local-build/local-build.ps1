@@ -1,5 +1,5 @@
-# PURPOSE: build dss-code-prime incrementally on this host, and optionally run ctest.
-# Local incremental build + test harness for dss-code-prime.
+# PURPOSE: build dsscp incrementally on this host, and optionally run ctest.
+# Local incremental build + test harness for dsscp.
 #
 # Usage:
 #   scripts\local-build\local-build.ps1                     # build build\dbg
@@ -46,8 +46,9 @@ $ErrorActionPreference = 'Stop'
 # a property a script can decide, which is why the pairing rule is a review
 # obligation in the first place.
 #
-# MEASURED 2026-08-20 (cycle P23, D-BUILD-CONCURRENT-LANES-TRIP-A-TOOLCHAIN-
-# HEADER-READ-FAILURE): under several concurrent lane builds g++ failed to READ
+# MEASURED 2026-08-20 (cycle P23,
+# D-BUILD-CONCURRENT-LANES-TRIP-A-TOOLCHAIN-HEADER-READ-FAILURE):
+# under several concurrent lane builds g++ failed to READ
 # a standard-library header and printed a bare path plus an errno string,
 # followed by ~6 CASCADED diagnostics that look exactly like source defects.
 #
@@ -239,7 +240,10 @@ if ($Configure -or -not (Test-Path (Join-Path $buildDir 'build.ninja'))) {
 # Tee so the console still streams while a copy stays scannable. $LASTEXITCODE
 # after a native command piped to Tee-Object is the NATIVE command's.
 $buildLog = Join-Path $buildDir '.local-build-last.log'
-cmake --build $buildDir 2>&1 | Tee-Object -FilePath $buildLog
+# ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".
+# A bare `cmake --build` hands off to ninja, whose default is ALL CORES.
+$dssJobs = if ($env:DSS_JOBS) { $env:DSS_JOBS } else { '6' }
+cmake --build $buildDir --parallel $dssJobs 2>&1 | Tee-Object -FilePath $buildLog
 $buildRc = $LASTEXITCODE
 if ($buildRc -ne 0 -and (Test-LocalBuildToolchainIoFailure $buildLog)) {
     Write-LocalBuildIoFailure $buildLog
@@ -258,7 +262,8 @@ if ($Test) {
         $__cplPrev = $env:CTEST_PARALLEL_LEVEL
         $__cplSet  = $false
         if (-not $env:CTEST_PARALLEL_LEVEL) {
-            $env:CTEST_PARALLEL_LEVEL = '8'
+            # ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".
+            $env:CTEST_PARALLEL_LEVEL = '6'
             $__cplSet = $true
         }
         try {

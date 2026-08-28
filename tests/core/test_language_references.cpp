@@ -10,7 +10,7 @@
 // this file existed it was measured once by hand and then reverted, leaving the
 // headline claim asserted rather than guarded.
 //
-// ★★ WHY THE HOST IS SYNTHETIC AND LIVES INSIDE THIS FILE. `c-subset` is the
+// ★★ WHY THE HOST IS SYNTHETIC AND LIVES INSIDE THIS FILE. `c` is the
 // mechanism's FIRST consumer; the second one does not exist yet. Testing the
 // substrate through its only consumer proves that consumer works, not that the
 // substrate is reusable — the two are different claims, and this project's
@@ -22,7 +22,7 @@
 // experimental ships, and no shipped `.lang.json` is touched.
 //
 // ★★ THE HOST IS DELIBERATELY NOT C-SHAPED. Every token kind, every keyword
-// spelling and every rule name below is alien to `c-subset` (`EMIT` not `asm`,
+// spelling and every rule name below is alien to `c` (`EMIT` not `asm`,
 // `|`/`||` not `:`/`::`, `<<`/`>>` not `(`/`)`, `hostValue` not `expression`).
 // `AsmHostProbeIsNotCShaped` pins that: a mechanism that only works for a host
 // that happens to look like C is a file split, not a reuse mechanism, and this
@@ -140,7 +140,7 @@ constexpr std::string_view kAsmReferenceBlock = R"(
   },
 )";
 
-// Not one lexeme, keyword or kind here is spelled the way `c-subset` spells it.
+// Not one lexeme, keyword or kind here is spelled the way `c` spells it.
 constexpr std::string_view kTokensAndKeywords = R"(
   "tokens": {
     " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
@@ -378,7 +378,7 @@ TEST(LanguageReferences, HostSpelledAsmBarrierWalksTheMergedRuleToCompletion) {
     // here re-implements the grammar; it only supplies tokens and checks that
     // each one is accepted. Subject: the empty-template barrier, host-spelled
     //     EMIT << ` >> !
-    // which is `__asm__ ("");` in c-subset's vocabulary and shares not one
+    // which is `__asm__ ("");` in c's vocabulary and shares not one
     // token kind with it.
     auto schema = loadOk(makeHostDoc(HostVariant::WithReference));
     ASSERT_NE(schema, nullptr);
@@ -523,7 +523,7 @@ TEST(LanguageReferences, HostInheritsAsmSemanticInlineAsmFacet) {
 // was compiled (`computeFirstAndNullable` produces nothing otherwise); and the
 // KINDS in it are asserted to be THIS host's — `BraceOpen` for the optional
 // `[name]` prefix and `TickText` for the constraint string, neither of which
-// `c-subset` spells. A facet that merged as text rather than as grammar would
+// `c` spells. A facet that merged as text rather than as grammar would
 // pass a name check and fail both of these.
 TEST(LanguageReferences, InheritedOperandRuleIsCompiledAndReboundToTheHostsKinds) {
     auto schema = loadOk(makeHostDoc(HostVariant::WithReference));
@@ -690,14 +690,14 @@ TEST(LanguageReferences, ReachingAsmWithoutTheReferenceFailsLoud) {
 
 TEST(LanguageReferences, AsmHostProbeIsNotCShaped) {
     // Guards against the whole suite passing merely because the synthetic host
-    // happened to reuse `c-subset`'s vocabulary — in which case it would be
+    // happened to reuse `c`'s vocabulary — in which case it would be
     // testing one consumer twice rather than the substrate once.
     auto schema = loadOk(makeHostDoc(HostVariant::WithReference));
     ASSERT_NE(schema, nullptr);
     EXPECT_EQ(schema->name(), "AsmHostProbe");
 
     // ⚠ THE CLAIM IS A CONJUNCTION AND BOTH HALVES BELONG IN ONE TEST: this
-    // host has NONE of c-subset's vocabulary AND has all twelve asm rules
+    // host has NONE of c's vocabulary AND has all twelve asm rules
     // anyway. Asserting only the first half leaves the test green when the
     // merge stops entirely — MEASURED: pointed at the reference-less host it
     // was one of two arms that did not go red.
@@ -706,7 +706,7 @@ TEST(LanguageReferences, AsmHostProbeIsNotCShaped) {
             << "a non-C-shaped host did NOT inherit '" << asmRule << "'";
     }
 
-    // c-subset's bindings for TWELVE of the thirteen token roles: none of them
+    // c's bindings for TWELVE of the thirteen token roles: none of them
     // exist here, yet all twelve asm rules do. The thirteenth binding —
     // `symbolName` -> `Identifier` — is deliberately NOT asserted absent: a
     // spelling that generic proves nothing about independence, since a host may
@@ -719,11 +719,11 @@ TEST(LanguageReferences, AsmHostProbeIsNotCShaped) {
                               "ParenOpen", "ParenClose", "BracketOpen",
                               "BracketClose", "EndStatement"}) {
         EXPECT_FALSE(schema->schemaTokens().contains(cKind))
-            << "the synthetic host declares c-subset's token kind '" << cKind
+            << "the synthetic host declares c's token kind '" << cKind
             << "' — it is no longer an independent second consumer";
     }
-    // c-subset's TWO rule-role bindings (`expression` <- operandExpr,
-    // `stringLiteralExpr` <- templateText), plus two further c-subset rules that
+    // c's TWO rule-role bindings (`expression` <- operandExpr,
+    // `stringLiteralExpr` <- templateText), plus two further c rules that
     // are NOT role bindings at all (`statement`, `assignmentExpr`) — four names,
     // asserted absent for the same independence reason. (Spelled out because the
     // count differs from `kAsmRuleHoles.size()`; an earlier revision said "the two
@@ -731,7 +731,7 @@ TEST(LanguageReferences, AsmHostProbeIsNotCShaped) {
     for (auto const& cRule : {"expression", "stringLiteralExpr", "statement",
                               "assignmentExpr"}) {
         EXPECT_FALSE(schema->rules().contains(cRule))
-            << "the synthetic host declares c-subset's rule '" << cRule << "'";
+            << "the synthetic host declares c's rule '" << cRule << "'";
     }
     // The host's own alien vocabulary IS there.
     for (auto const& hostKind : {"EmitWord", "LoudWord", "TightWord",
@@ -1332,7 +1332,7 @@ TEST(LanguageReferenceRefusals, InlineAsmFacetWithNoLoweringRowFailsLoud) {
 
 TEST(LanguageReferenceRefusals, InlineAsmFacetWithASkipLoweringRowFailsLoud) {
     // ★ THIS IS THE EXACT CONFIGURATION THE OLD RED-ON-DISABLE RECIPE IN
-    // `tests/mir/test_mir_lowering_c_subset.cpp` PRESCRIBED ("flip the asmStmt
+    // `tests/mir/test_mir_lowering_c.cpp` PRESCRIBED ("flip the asmStmt
     // row to Skip; the schema still loads"). Clause (c) closed that path, which
     // is why the recipe there had to be rewritten — and this arm is the standing
     // record of WHY, so the two facts cannot drift apart.
@@ -1517,6 +1517,7 @@ constexpr std::string_view kLineHostDoc = R"JSON({
         "symbolName":               "Identifier",
         "templatePlaceholder":      "SlotMark",
         "templateLabelPlaceholder": "SlotLabelMark",
+        "templateModifierPlaceholder": "SlotWidthMark",
         "templateOperandIndex":     "IntLiteral",
         "symbolicNameOpen":         "HugOpen",
         "symbolicNameClose":        "HugClose"
@@ -1530,6 +1531,7 @@ constexpr std::string_view kLineHostDoc = R"JSON({
     "~":  [{ "kind": "LeadMark" }],
     "&":  [{ "kind": "SplitMark" }],
     "?^": [{ "kind": "SlotLabelMark" }],
+    "?#": [{ "kind": "SlotWidthMark" }],
     "?":  [{ "kind": "SlotMark" }],
     "(":  [{ "kind": "HugOpen" }],
     ")":  [{ "kind": "HugClose" }],
@@ -1545,15 +1547,23 @@ constexpr std::string_view kLineHostDoc = R"JSON({
   }
 })JSON";
 
-// The FIVE rules the placeholder surface adds, spelled out rather than counted
+// The SIX rules the placeholder surface adds, spelled out rather than counted
 // — the discipline `kAsmRules` states: a count stays green if the mechanism
-// imports five of the WRONG shapes.
-constexpr std::array<std::string_view, 5> kAsmTemplateRules{
+// imports six of the WRONG shapes.
+// ⚠ THE SIXTH ARRIVED WITH THE WIDTH-VIEW SURFACE (P30) AND IT BROUGHT A SIXTH
+// HOLE WITH IT (`templateModifierPlaceholder`), which is why this alien host
+// grew a `?#` lexeme and a binding for it. That is the documented consequence
+// of the shared standalone closure spelling the placeholder shapes: a host
+// naming `asmLine` owes every hole that closure spells, and a new arm in the
+// alternation is a LOAD-BREAKING change for out-of-tree hosts rather than a
+// silent no-op. This fixture is where that gets felt first, deliberately.
+constexpr std::array<std::string_view, 6> kAsmTemplateRules{
     "asmTemplateOperand",
     "asmTemplateOperandRef",
     "asmTemplateSelector",
     "asmTemplateSymbolicName",
     "asmTemplateLabelRef",
+    "asmTemplateModifiedRef",
 };
 
 // The line-structure rules the STANDALONE entry pulls in, including the alt
@@ -1617,11 +1627,12 @@ TEST(LanguageReferences, ThePlaceholderRulesArriveCompiledOnTheHostsOwnKinds) {
 
     const auto slot      = kind("SlotMark");
     const auto slotLabel = kind("SlotLabelMark");
+    const auto slotWidth = kind("SlotWidthMark");
     const auto hugOpen   = kind("HugOpen");
     const auto coin      = kind("CoinMark");
     const auto intLit    = kind("IntLiteral");
 
-    // Every one of the five has a NON-EMPTY FIRST set — the interned-but-dead
+    // Every one of the six has a NON-EMPTY FIRST set — the interned-but-dead
     // failure mode's exact signature is an empty one.
     for (auto const& r : kAsmTemplateRules) {
         EXPECT_FALSE(schema->firstSetOf(rule(r)).empty())
@@ -1633,16 +1644,23 @@ TEST(LanguageReferences, ThePlaceholderRulesArriveCompiledOnTheHostsOwnKinds) {
     // proved rather than assumed.
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateOperandRef"), slot));
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateLabelRef"), slotLabel));
+    EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateModifiedRef"), slotWidth));
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateSymbolicName"), hugOpen));
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateSelector"), intLit));
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateSelector"), hugOpen));
 
+    // ★★ THREE, NOT TWO, SINCE THE WIDTH-VIEW ARM LANDED — and the EXACT count
+    // is what keeps this from being a containment check that a fourth silent
+    // arm could pass. It is also the assertion that proves the three arms stay
+    // FIRST-DISJOINT BY KIND: three alternatives whose union has three members
+    // cannot share an opening token.
     auto const anyFirst = schema->firstSetOf(rule("asmTemplateOperand"));
-    ASSERT_EQ(anyFirst.size(), 2u)
-        << "`asmTemplateOperand` must predict on exactly the two placeholder "
+    ASSERT_EQ(anyFirst.size(), 3u)
+        << "`asmTemplateOperand` must predict on exactly the three placeholder "
            "sigils";
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateOperand"), slot));
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateOperand"), slotLabel));
+    EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateOperand"), slotWidth));
 
     // ★★ THE REACHABILITY CLAIM, WHICH IS SEPARATE FROM THE COMPILATION ONE. A
     // placeholder rule that compiled perfectly and hung off nothing would be
@@ -1784,12 +1802,41 @@ TEST(LanguageReferences, HostSpelledPlaceholdersWalkTheMergedRulesToCompletion) 
             << "`?^ <selector>` walked the rule but did not COMPLETE it";
     }
 
-    // ⚠ AND THE SIGILS ARE NOT INTERCHANGEABLE. If the merge had bound both
+    // `?# 0` — an operand through a WIDTH VIEW, the third family. ★ IT REACHES
+    // THE **SAME** SELECTOR, which is the whole reason P30 added one rule and
+    // nothing below it: a width view by index and by name are the two forms the
+    // selector already had, so neither can drift from the other two families'.
+    {
+        auto cur = schema->advance(schema->enterRule(rule("asmTemplateModifiedRef")),
+                                   kind("SlotWidthMark"));
+        ASSERT_TRUE(cur.valid())
+            << "asmTemplateModifiedRef rejected the host's WIDTH-VIEW sigil";
+        EXPECT_FALSE(schema->isAtEndOfRule(cur))
+            << "a bare width-view sigil COMPLETED the rule — it would name no "
+               "operand at all";
+        ASSERT_EQ(schema->slotKind(cur), SlotKind::RuleLeaf);
+        EXPECT_EQ(schema->slotRuleRef(cur).v, selector.v)
+            << "a width view does not descend into the SELECTOR — the three "
+               "placeholder families are no longer sharing one selector rule";
+        cur = schema->leaveRule(cur);
+        ASSERT_TRUE(cur.valid());
+        EXPECT_TRUE(schema->isAtEndOfRule(cur))
+            << "`?# <selector>` walked the rule but did not COMPLETE it";
+    }
+
+    // ⚠ AND THE SIGILS ARE NOT INTERCHANGEABLE. If the merge had bound two
     // roles to one kind — the easy way to get this wrong — every assertion
-    // above would still pass and `%0` would parse as a label.
+    // above would still pass and `%0` would parse as a label, or `%w0` as a
+    // plain reference at the operand's own width.
     EXPECT_FALSE(schema->advance(schema->enterRule(indexRef),
                                  kind("SlotLabelMark")).valid())
         << "the OPERAND rule accepted the LABEL sigil";
+    EXPECT_FALSE(schema->advance(schema->enterRule(indexRef),
+                                 kind("SlotWidthMark")).valid())
+        << "the OPERAND rule accepted the WIDTH-VIEW sigil";
+    EXPECT_FALSE(schema->advance(schema->enterRule(labelRef),
+                                 kind("SlotWidthMark")).valid())
+        << "the LABEL rule accepted the WIDTH-VIEW sigil";
     EXPECT_FALSE(schema->advance(schema->enterRule(labelRef),
                                  kind("SlotMark")).valid())
         << "the LABEL rule accepted the OPERAND sigil";
@@ -1808,6 +1855,7 @@ TEST(LanguageReferences, HostSpelledPlaceholdersWalkTheMergedRulesToCompletion) 
 // exactly the failure this arm is shaped to catch.
 TEST(LanguageReferenceRefusals, AnUnboundPlaceholderHoleFailsLoud) {
     for (auto const* hole : {"templatePlaceholder", "templateLabelPlaceholder",
+                             "templateModifierPlaceholder",
                              "templateOperandIndex", "symbolicNameOpen",
                              "symbolicNameClose"}) {
         auto doc = lineHostJson();

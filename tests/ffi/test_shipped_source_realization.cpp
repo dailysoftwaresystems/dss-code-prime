@@ -17,7 +17,7 @@
 // target.
 //
 // ★★ WHAT THIS FILE GUARDS THAT NOTHING ELSE CAN. The end-to-end proof lives in
-// `examples/c-subset/shipped_dirent_readdir` — it compiles and RUNS the pe64 arm,
+// `examples/c/shipped_dirent_readdir` — it compiles and RUNS the pe64 arm,
 // and it is the strongest evidence the mechanism works. But an example can only
 // witness the configuration that EXISTS. The refusals here are about
 // configurations that must never be accepted, and three of them are invisible to
@@ -84,12 +84,12 @@ namespace {
 // ancestor walk). A private cwd-walk here would find nothing in an out-of-tree
 // build, and an invariant with no tree to read is a hole, not a pass.
 [[nodiscard]] fs::path configRoot() {
-    auto const root = dss::test::findRepoRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config";
+    return *cfg;
 }
 
 [[nodiscard]] fs::path descriptorDir() { return configRoot() / "shippedLibs"; }

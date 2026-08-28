@@ -21,10 +21,20 @@ dss_add_test(NAME test_support/test_scoped_env SOURCES test_scoped_env.cpp)
 dss_add_test(NAME test_support/test_repo_root SOURCES test_repo_root.cpp)
 set_property(TEST test_support/test_repo_root APPEND PROPERTY
              ENVIRONMENT "GTEST_FILTER=-BakedRootOnly.*")
+# D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED — the
+# guard on the per-run shipped-config snapshot that `dss_add_test` now points
+# every entry at. It asserts the override was READ and not merely SET (a
+# set-but-miss falls THROUGH to the live tree and every test still passes), that
+# the COMPILER-side resolver landed in the same tree as the test-side one, and —
+# the clause that keeps the whole mechanism honest — that the snapshot still
+# matches the live tree file for file, which is what reds if the copy ever stops
+# being taken at ctest RUN time.
+dss_add_test(NAME test_support/test_config_snapshot
+             SOURCES test_config_snapshot.cpp)
 dss_add_test(NAME test_support/test_host_native_target
              SOURCES test_host_native_target.cpp)
-# D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT + D-TEST-MANIFEST-ARM64-ARM-WITHOUT-
-# EMULATOR. On a windows/x86_64 host the corpus produces ZERO environmental
+# D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT + D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR.
+# On a windows/x86_64 host the corpus produces ZERO environmental
 # skips (every non-Windows arm is excluded by `runOn` first), so without these
 # the strict-mode guard would have no witness on that leg at all.
 dss_add_test(NAME test_support/test_arm_verdict_ledger
@@ -63,3 +73,13 @@ target_link_libraries(dss_test_support_test_mutate_target_schema
 # sibling above — it must stay a SEPARATE target.
 dss_add_test(NAME test_support/test_run_binary_deadline_clock
              SOURCES test_run_binary_deadline_clock.cpp)
+# D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+# `coverage_boundary.hpp` is the ONE grammar in which the two corpus harnesses
+# state what they actually BUILT, and the `integrated_tests/coverage-boundary`
+# entry judges the real thing with it. Most of its REFUSALS are unreachable from
+# there — a torn line, an unknown field, a spec claimed but never declared are
+# states a working pair of runners never produces — so a refusal nothing
+# exercises would be a refusal nobody knows fires. Every one of them is
+# exercised here, and every case asserts on message CONTENT.
+dss_add_test(NAME test_support/test_coverage_boundary
+             SOURCES test_coverage_boundary.cpp)

@@ -1,7 +1,7 @@
 // Driver pipeline tests — plan 14 LK10 cycle 2.
 //
 // Pins:
-//   * `Program::compileFiles` runs c-subset source through
+//   * `Program::compileFiles` runs c source through
 //     HIR→MIR→LIR→regalloc→callconv→ASM→link→writeImage and
 //     commits valid ELF bytes to `<cwd>/target/<formatName>/<stem>.o`.
 //   * Fail-loud surfaces emit the right D_* code on:
@@ -75,7 +75,7 @@ using dss::test_support::Location;
 using dss::test_support::ScratchDir;
 
 // Not nodiscard — some call sites only care about the side effect.
-fs::path writeCSubsetSource(fs::path const& dir,
+fs::path writeCSource(fs::path const& dir,
                              std::string_view name,
                              std::string_view text) {
     auto const p = dir / std::string{name};
@@ -133,7 +133,7 @@ std::size_t countOpInModule(Mir const& mir, MirOpcode op) {
 
 TEST(Program_CompileFiles, ZeroArgFunctionWiresThroughPipeline) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "forty_two.c",
         "int forty_two() { return 42; }\n");
     scratch.useAsCwd();
@@ -141,19 +141,19 @@ TEST(Program_CompileFiles, ZeroArgFunctionWiresThroughPipeline) {
     Program prog;
     int const rc = prog.compileFiles(
         {src.generic_string()},
-        "c-subset",
+        "c",
         {"x86_64:elf64-x86_64-linux"});
 
     // D-LK10-2 closed 2026-06-01 (commit `a22286f`). The full driver
     // pipeline now produces a real ELF .o file with `\x7fELF` magic
-    // for a zero-arg c-subset function. Plan 12 ML7 cycle 2 closed
+    // for a zero-arg c function. Plan 12 ML7 cycle 2 closed
     // the IR-tier half (arg + call + ret virtual-op materialization);
     // plan 13 AS cycle (D-AS4-1 partial close — `[base+disp32]` form)
     // closed the encoder half (load/store with `[base+disp32]`
     // addressing + add/sub reg+imm32 for prologue/epilogue SP
     // adjustment). The remaining D-AS4-1 sub-items (`lea` encoding,
     // indexed/scaled addressing — D-AS4-5, Disp8 form) are unrelated
-    // to the c-subset zero-arg corpus and stay deferred.
+    // to the c zero-arg corpus and stay deferred.
     auto const outDir = scratch.path() / "target" / "elf64-x86_64-linux";
     ASSERT_TRUE(fs::is_directory(outDir));
     ASSERT_EQ(rc, 0)
@@ -192,7 +192,7 @@ TEST(Program_CompileFiles, EmptyDeclOnlyTuEmitsValidEmptyObject) {
     ScratchDir scratch{Location::InsideRepo, "program"};
     // A declaration-only TU: an extern DATA declaration (not a definition)
     // plus an all-`#if 0`'d-out block. NOTHING is defined ⇒ 0 functions.
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "decl_only.c",
         "extern int shared_counter;   /* a declaration, not a definition */\n"
         "#if 0\n"
@@ -203,7 +203,7 @@ TEST(Program_CompileFiles, EmptyDeclOnlyTuEmitsValidEmptyObject) {
     Program prog;
     int const rc = prog.compileFiles(
         {src.generic_string()},
-        "c-subset",
+        "c",
         {"x86_64:elf64-x86_64-linux"});
 
     ASSERT_EQ(rc, 0)
@@ -237,7 +237,7 @@ TEST(Program_CompileFiles, EmptyDeclOnlyTuEmitsValidEmptyObject) {
 // instrumented Scope zeroes that phase's run count and the matching
 // EXPECT fails — including the three preprocess sub-phases (splice /
 // tokenize / expand, D-PERF-1), which run for ANY C compile. (Phases a
-// trivial source legitimately skips — the STANDALONE tokenize [c-subset
+// trivial source legitimately skips — the STANDALONE tokenize [c
 // preprocesses, so its tokenize is the preprocess-tokenize sub-phase],
 // reparse [no ambiguous cast], synthesize-ffi [no externs] — are
 // deliberately un-asserted.)
@@ -248,7 +248,7 @@ TEST(Program_CompileFiles, PhaseTimersRecordEveryPipelinePhase) {
     using dss::substrate::kCompilePhaseCount;
 
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "timed.c",
         "int timed() { return 9; }\n");
     scratch.useAsCwd();
@@ -256,7 +256,7 @@ TEST(Program_CompileFiles, PhaseTimersRecordEveryPipelinePhase) {
     PhaseTimers::reset();
     Program prog;
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux"});
+        {src.generic_string()}, "c", {"x86_64:elf64-x86_64-linux"});
     ASSERT_EQ(rc, 0);
 
     // (a) every phase name is a distinct, non-empty pipeline verb.
@@ -338,14 +338,14 @@ TEST(Program_CompileFiles, MultiTargetWiresDistinctArtifactDirs) {
     // production, the driver's per-target loop must create one
     // output dir per target.
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "small.c",
         "int small() { return 7; }\n");
     scratch.useAsCwd();
 
     Program prog;
     prog.compileFiles({src.generic_string()},
-                       "c-subset",
+                       "c",
                        {"x86_64:elf64-x86_64-linux",
                         "x86_64:pe64-x86_64-windows"});
     EXPECT_TRUE(fs::is_directory(
@@ -369,7 +369,7 @@ TEST(Program_CompileFiles, MultiTargetWiresDistinctArtifactDirs) {
 
 TEST(Program_CompileFiles, OutputFlagSingleTargetPlacesArtifactFlat) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "forty_two.c",
         "int forty_two() { return 42; }\n");
     scratch.useAsCwd();
@@ -379,7 +379,7 @@ TEST(Program_CompileFiles, OutputFlagSingleTargetPlacesArtifactFlat) {
     prog.setOutputDir(outDir);
     int const rc = prog.compileFiles(
         {src.generic_string()},
-        "c-subset",
+        "c",
         {"x86_64:elf64-x86_64-linux"});
     ASSERT_EQ(rc, 0);
     // Single-target with --output: artifact lands DIRECTLY under
@@ -408,7 +408,7 @@ TEST(Program_CompileFiles, OutputFlagSingleTargetPlacesArtifactFlat) {
 // appears in the .o.
 TEST(Program_CompileFiles, SingleCuMachOObjectSymbolCarriesLeadingUnderscore) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "forty_two.c",
         "int forty_two() { return 42; }\n");
     scratch.useAsCwd();
@@ -417,7 +417,7 @@ TEST(Program_CompileFiles, SingleCuMachOObjectSymbolCarriesLeadingUnderscore) {
     Program prog;
     prog.setOutputDir(outDir);
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset", {"x86_64:macho64-x86_64-darwin"});
+        {src.generic_string()}, "c", {"x86_64:macho64-x86_64-darwin"});
     ASSERT_EQ(rc, 0);
     auto const obj = outDir / "forty_two.o";
     ASSERT_TRUE(fs::exists(obj));
@@ -605,14 +605,14 @@ TEST(Program_CompileFiles, MachORelocatableTiersPlaceEveryDeclaredDataSection) {
 
     for (int i = 0; i < kArms; ++i) {
         ScratchDir scratch{Location::InsideRepo, "program"};
-        auto const src = writeCSubsetSource(scratch.path(), "datasections.c",
+        auto const src = writeCSource(scratch.path(), "datasections.c",
                                             kEveryDataSectionSource);
         scratch.useAsCwd();
         auto const outDir = scratch.path() / "out";
 
         Program prog;
         prog.setOutputDir(outDir);
-        int const rc = prog.compileFiles({src.generic_string()}, "c-subset",
+        int const rc = prog.compileFiles({src.generic_string()}, "c",
                                          {arms[i].spec});
         ASSERT_EQ(rc, 0)
             << arms[i].spec
@@ -702,7 +702,7 @@ TEST(Program_CompileFiles, MachORelocatableTiersPlaceEveryDeclaredDataSection) {
 // ── TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the SINGLE-CU definition rail ──
 //
 // ★ THIS TEST EXISTS BECAUSE THE CORPUS EXAMPLE CANNOT REACH THIS CODE PATH, AND
-// THE RED-ON-DISABLE BATTERY IS WHAT PROVED IT. `examples/c-subset/asm_label` is
+// THE RED-ON-DISABLE BATTERY IS WHAT PROVED IT. `examples/c/asm_label` is
 // a TWO-CU program, so its definitions are named by `program.cpp`'s cross-CU
 // merge-key lambda and `compile_pipeline`'s MERGED arm (which reads
 // `merged.symbolNames`); the SINGLE-CU `nameOf` at compile_pipeline.cpp is never
@@ -722,7 +722,7 @@ TEST(Program_CompileFiles, MachORelocatableTiersPlaceEveryDeclaredDataSection) {
 // the single-CU `nameOf` and the .o carries `_labelled_fn` instead.
 TEST(Program_CompileFiles, SingleCuAsmLabelReplacesTheMachOMangling) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "labelled.c",
         "int labelled_fn(void) __asm(\"dss_c88_single\");\n"
         "int labelled_fn(void) { return 42; }\n");
@@ -732,7 +732,7 @@ TEST(Program_CompileFiles, SingleCuAsmLabelReplacesTheMachOMangling) {
     Program prog;
     prog.setOutputDir(outDir);
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset", {"arm64:macho64-arm64-darwin"});
+        {src.generic_string()}, "c", {"arm64:macho64-arm64-darwin"});
     ASSERT_EQ(rc, 0);
     auto const obj = outDir / "labelled.o";
     ASSERT_TRUE(fs::exists(obj));
@@ -798,13 +798,13 @@ compileAndReadArtifact(char const* scratchTag, char const* fileName,
                        std::string const& source, char const* spec,
                        char const* artifact) {
     ScratchDir scratch{Location::InsideRepo, scratchTag};
-    auto const src = writeCSubsetSource(scratch.path(), fileName, source);
+    auto const src = writeCSource(scratch.path(), fileName, source);
     scratch.useAsCwd();
     auto const outDir = scratch.path() / "out";
     Program prog;
     prog.setOutputDir(outDir);
     int const rc =
-        prog.compileFiles({src.generic_string()}, "c-subset", {spec});
+        prog.compileFiles({src.generic_string()}, "c", {spec});
     EXPECT_EQ(rc, 0) << "compile failed for " << spec;
     auto const obj = outDir / artifact;
     EXPECT_TRUE(fs::exists(obj)) << "no artifact at " << obj.generic_string();
@@ -906,7 +906,7 @@ TEST(Program_CompileFiles, ElfShippedLinkNameDefaultsToTheBareIdentifier) {
 // format file → the compile fails (format not found) and the .o is never produced.
 TEST(Program_CompileFiles, SingleCuArm64MachOObjectEmitsMangledSymbol) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "forty_two.c",
         "int forty_two() { return 42; }\n");
     scratch.useAsCwd();
@@ -915,7 +915,7 @@ TEST(Program_CompileFiles, SingleCuArm64MachOObjectEmitsMangledSymbol) {
     Program prog;
     prog.setOutputDir(outDir);
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset", {"arm64:macho64-arm64-darwin"});
+        {src.generic_string()}, "c", {"arm64:macho64-arm64-darwin"});
     ASSERT_EQ(rc, 0);
     auto const obj = outDir / "forty_two.o";
     ASSERT_TRUE(fs::exists(obj));
@@ -940,7 +940,7 @@ TEST(Program_CompileFiles, SingleCuArm64MachOObjectEmitsMangledSymbol) {
 //
 // C99 §5.1.2.2.3: a `main` function that reaches the closing `}`
 // without an explicit `return` has the semantics of an implicit
-// `return 0`. Source-agnostically expressed via the c-subset's
+// `return 0`. Source-agnostically expressed via the c's
 // semantic config (`declarations[topLevelDecl].
 // implicitReturnZeroForFunctionNames: ["main"]`); the HIR lowering
 // at `cst_to_hir.cpp::lowerFunctionDecl` reads the list and
@@ -960,7 +960,7 @@ TEST(Program_CompileFiles, MainWithoutExplicitReturnGetsImplicitReturnZero) {
     ScratchDir scratch{Location::InsideRepo, "program"};
     // `int main() { }` — no explicit return. Pre-fix this would
     // have failed verification; post-fix it lowers cleanly.
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "implicit_main.c",
         "int main() { }\n");
     scratch.useAsCwd();
@@ -968,12 +968,12 @@ TEST(Program_CompileFiles, MainWithoutExplicitReturnGetsImplicitReturnZero) {
     Program prog;
     int const rc = prog.compileFiles(
         {src.generic_string()},
-        "c-subset",
+        "c",
         {"x86_64:elf64-x86_64-linux"});
     EXPECT_EQ(rc, 0)
         << "main without explicit return must compile cleanly — "
            "the HIR lowering inserts synthetic `return 0` per C99 "
-           "§5.1.2.2.3 via c-subset's "
+           "§5.1.2.2.3 via c's "
            "implicitReturnZeroForFunctionNames config";
     auto const outDir =
         scratch.path() / "target" / "elf64-x86_64-linux";
@@ -991,7 +991,7 @@ TEST(Program_CompileFiles, MainWithExplicitReturnCompilesCleanly) {
     // returns, the second one unreachable → loud verifier error
     // → rc != 0. This test pins rc==0 for the explicit-return path.
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "explicit_return.c",
         "int main() { return 42; }\n");
     scratch.useAsCwd();
@@ -999,7 +999,7 @@ TEST(Program_CompileFiles, MainWithExplicitReturnCompilesCleanly) {
     Program prog;
     int const rc = prog.compileFiles(
         {src.generic_string()},
-        "c-subset",
+        "c",
         {"x86_64:elf64-x86_64-linux"});
     EXPECT_EQ(rc, 0)
         << "main with explicit return must compile cleanly — the "
@@ -1013,9 +1013,9 @@ TEST(Program_CompileFiles, NonMainWithoutExplicitReturnStillFailsLoud) {
     // A non-main function lacking a return must STILL be rejected.
     // The implicit-return-0 rule is scoped to names in the
     // language config's `implicitReturnZeroForFunctionNames` list
-    // (c-subset declares only `main`); every other non-void
+    // (c declares only `main`); every other non-void
     // unreturning fn falls through to verifier's loud-fail.
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "bad_helper.c",
         "int helper() { }\n"
         "int main() { return helper(); }\n");
@@ -1025,14 +1025,14 @@ TEST(Program_CompileFiles, NonMainWithoutExplicitReturnStillFailsLoud) {
     DiagnosticReporter rep;
     int const rc = prog.compileFiles(
         {src.generic_string()},
-        "c-subset",
+        "c",
         {"x86_64:elf64-x86_64-linux"},
         rep);
     EXPECT_NE(rc, 0)
         << "non-main non-void function without explicit return "
            "must STILL fail the verifier — the implicit-return "
            "rule is scoped to the names the language declares "
-           "(only `main` for c-subset)";
+           "(only `main` for c)";
     // test-analyzer C-3 fold (3rd-order audit on 39897eb): pin the
     // EXACT diagnostic code so a regression that fails this corpus
     // via a different code path (e.g., bailing in MIR-lowering
@@ -1052,7 +1052,7 @@ TEST(Program_CompileFiles, NonMainWithoutExplicitReturnStillFailsLoud) {
 
 TEST(Program_CompileFiles, OutputFlagMultiTargetPlacesArtifactsInFormatSubdirs) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "small.c",
         "int small() { return 7; }\n");
     scratch.useAsCwd();
@@ -1061,7 +1061,7 @@ TEST(Program_CompileFiles, OutputFlagMultiTargetPlacesArtifactsInFormatSubdirs) 
     Program prog;
     prog.setOutputDir(outDir);
     prog.compileFiles({src.generic_string()},
-                       "c-subset",
+                       "c",
                        {"x86_64:elf64-x86_64-linux",
                         "x86_64:pe64-x86_64-windows"});
     // Multi-target with --output: each target gets its own
@@ -1085,43 +1085,43 @@ TEST(Program_CompileFiles, OutputFlagMultiTargetPlacesArtifactsInFormatSubdirs) 
 
 TEST(Program_CompileFiles, EmptySourceListReturnsNonZero) {
     Program prog;
-    EXPECT_EQ(prog.compileFiles({}, "c-subset",
+    EXPECT_EQ(prog.compileFiles({}, "c",
                                 {"x86_64:elf64-x86_64-linux"}),
               1);
 }
 
 TEST(Program_CompileFiles, EmptyTargetListReturnsNonZero) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "f.c", "int f() { return 0; }\n");
     Program prog;
     EXPECT_EQ(prog.compileFiles({src.generic_string()},
-                                "c-subset", {}),
+                                "c", {}),
               1);
 }
 
 TEST(Program_CompileFiles, MalformedTargetSpecReturnsNonZero) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "f.c", "int f() { return 0; }\n");
     scratch.useAsCwd();
 
     Program prog;
     // No colon → unparseable.
     EXPECT_EQ(prog.compileFiles({src.generic_string()},
-                                "c-subset",
+                                "c",
                                 {"badspec"}),
               1);
     // Empty half → unparseable.
     EXPECT_EQ(prog.compileFiles({src.generic_string()},
-                                "c-subset",
+                                "c",
                                 {":elf64-x86_64-linux"}),
               1);
 }
 
 TEST(Program_CompileFiles, UnknownLanguageReturnsNonZero) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "f.txt", "ignored\n");
     Program prog;
     EXPECT_EQ(prog.compileFiles({src.generic_string()},
@@ -1132,24 +1132,24 @@ TEST(Program_CompileFiles, UnknownLanguageReturnsNonZero) {
 
 TEST(Program_CompileFiles, UnknownTargetNameReturnsNonZero) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "f.c", "int f() { return 0; }\n");
     scratch.useAsCwd();
     Program prog;
     EXPECT_EQ(prog.compileFiles({src.generic_string()},
-                                "c-subset",
+                                "c",
                                 {"noarch:elf64-x86_64-linux"}),
               1);
 }
 
 TEST(Program_CompileFiles, UnknownFormatNameReturnsNonZero) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "f.c", "int f() { return 0; }\n");
     scratch.useAsCwd();
     Program prog;
     EXPECT_EQ(prog.compileFiles({src.generic_string()},
-                                "c-subset",
+                                "c",
                                 {"x86_64:no-such-format"}),
               1);
 }
@@ -1165,7 +1165,7 @@ TEST(Program_CompileFiles, NonExistentSourceFileReturnsNonZero) {
     scratch.useAsCwd();
     Program prog;
     EXPECT_EQ(prog.compileFiles({"/no/such/ghost-source-file.c"},
-                                "c-subset",
+                                "c",
                                 {"x86_64:elf64-x86_64-linux"}),
               1);
 }
@@ -1193,7 +1193,7 @@ TEST(Program_CompileFiles, MultiTargetMismatchAggregatesToNonZeroExit) {
     Program prog;
     int const rc = prog.compileFiles(
         {src.string()},
-        "c-subset",
+        "c",
         {"x86_64:elf64-aarch64-linux",
          "x86_64:elf64-aarch64-linux"});  // duplicate intentional
     EXPECT_EQ(rc, 1) << "multi-target compile with errors must exit 1";
@@ -1219,7 +1219,7 @@ TEST(Program_CompileFiles, CrossValidateRejectsMachineMismatch) {
     }
     Program prog;
     EXPECT_EQ(prog.compileFiles({src.string()},
-                                "c-subset",
+                                "c",
                                 {"x86_64:elf64-aarch64-linux"}),
               1);
 }
@@ -1238,14 +1238,14 @@ TEST(Program_CompileFiles, CrossValidateRejectsMachineMismatch) {
 // fires in the per-target loop and IS prefixed.
 TEST(Program_CompileFiles, StderrIncludesTargetContextPrefixOnPerTargetError) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "ext_init.c", "extern int x = 5;\n");
     scratch.useAsCwd();
     Program prog;
     testing::internal::CaptureStderr();
     int const rc = prog.compileFiles(
         {src.generic_string()},
-        "c-subset",
+        "c",
         {"x86_64:elf64-x86_64-linux"});
     auto const stderrOut = testing::internal::GetCapturedStderr();
     EXPECT_EQ(rc, 1);
@@ -1268,25 +1268,33 @@ TEST(Program_CompileFiles, StderrIncludesTargetContextPrefixOnPerTargetError) {
 // A malformed-source compile prints the positioned context + caret at
 // the exact offending column. RED-on-disable: revert
 // `drainDiagnosticsToStderr` to the old code-only loop (drop the
-// `format()` branch) and the `-->` / `bad.c:2:12` / `^` assertions all
+// `format()` branch) and the `-->` / positioned-header / `^` assertions all
 // go red — this is the cycle's effectiveness lever.
 TEST(Program_CompileFiles, MalformedSourceRendersPositionedCaret) {
     ScratchDir scratch{Location::InsideRepo, "program"};
     // Illegal character '@' at line 2, column 12 (after `return `).
-    auto const src = writeCSubsetSource(
+    // ★ NAMED, NOT SPELLED: a bare `"<file>:<line>:<col>"` expectation is
+    // indistinguishable from a positional CITATION — to a reader and to
+    // `check-plan-citations` alike — and it restates a magic number instead of
+    // saying where the number comes from. These constants ARE the fixture.
+    constexpr int kAtLine   = 2;
+    constexpr int kAtColumn = 12;
+    auto const src = writeCSource(
         scratch.path(), "bad.c", "int main() {\n    return @;\n}\n");
     scratch.useAsCwd();
     Program prog;
     testing::internal::CaptureStderr();
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+        {src.generic_string()}, "c", {"x86_64:elf64-x86_64-linux-exec"});
     auto const err = testing::internal::GetCapturedStderr();
 
     EXPECT_NE(rc, 0) << "malformed source must fail the build";
     // `--> <file>:<line>:<col>` header at the exact position of '@'. The
     // parser stamps the span; format() resolves it via the registry.
-    EXPECT_NE(err.find("bad.c:2:12"), std::string::npos)
-        << "expected positioned header '<file>:2:12'; got:\n" << err;
+    std::string const positioned =
+        "bad.c:" + std::to_string(kAtLine) + ":" + std::to_string(kAtColumn);
+    EXPECT_NE(err.find(positioned), std::string::npos)
+        << "expected positioned header '" << positioned << "'; got:\n" << err;
     EXPECT_NE(err.find("-->"), std::string::npos)
         << "expected a '-->' source-location header; got:\n" << err;
     EXPECT_NE(err.find('^'), std::string::npos)
@@ -1304,7 +1312,7 @@ TEST(Program_CompileFiles, MalformedSourceRendersPositionedCaret) {
 TEST(Program_CompileFiles, BufferlessDriverDiagnosticStaysCodeOnly) {
     Program prog;
     testing::internal::CaptureStderr();
-    int const rc = prog.compileFiles({"unused.c"}, "c-subset", /*targets*/ {});
+    int const rc = prog.compileFiles({"unused.c"}, "c", /*targets*/ {});
     auto const err = testing::internal::GetCapturedStderr();
 
     EXPECT_EQ(rc, 1);
@@ -1362,14 +1370,14 @@ TEST(Program_CompileFiles, MalformedAsmTemplateRendersTheOffendingTemplateLine) 
     // ARM 1 — the FAILURE path: the template does not PARSE, so there is no
     // `Tree` and the buffer only survives because it is registered at its mint.
     // `@` is not in the dialect's vocabulary; column 14 is its first byte.
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "bad_template.c",
         "int main(void) {\n"
         "    int r = 0;\n"
         "    __asm__(\"movl $42, %0 @@@\" : \"=r\"(r));\n"
         "    return r;\n"
         "}\n");
-    auto const src2 = writeCSubsetSource(
+    auto const src2 = writeCSource(
         scratch.path(), "unlowerable_template.c",
         "int main(void) {\n"
         "    int r = 0;\n"
@@ -1380,7 +1388,7 @@ TEST(Program_CompileFiles, MalformedAsmTemplateRendersTheOffendingTemplateLine) 
     Program prog;
     testing::internal::CaptureStderr();
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+        {src.generic_string()}, "c", {"x86_64:elf64-x86_64-linux-exec"});
     auto const err = testing::internal::GetCapturedStderr();
 
     EXPECT_NE(rc, 0) << "a template that does not parse must fail the build";
@@ -1402,7 +1410,7 @@ TEST(Program_CompileFiles, MalformedAsmTemplateRendersTheOffendingTemplateLine) 
     Program prog2;
     testing::internal::CaptureStderr();
     int const rc2 = prog2.compileFiles(
-        {src2.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+        {src2.generic_string()}, "c", {"x86_64:elf64-x86_64-linux-exec"});
     auto const err2 = testing::internal::GetCapturedStderr();
 
     EXPECT_NE(rc2, 0) << "an unlowerable template must fail the build";
@@ -1425,8 +1433,10 @@ TEST(Program_CompileFiles, MalformedAsmTemplateRendersTheOffendingTemplateLine) 
 // STATEMENT that embedded the template — and names it as the PRIMARY locus.
 //
 // ✔MEASURED, both references, before the form was chosen (the row demanded it):
-//   gcc 13.3   `gt.c:3: Error: no such instruction: 'frobnicate %eax'`
-//   clang 18   `gt.c:3:13: error: invalid instruction mnemonic 'frobnicate'` with
+//   gcc 13.3   the C statement's `<file>:<line>: Error: no such instruction:
+//              'frobnicate %eax'`
+//   clang 18   the C statement's `<file>:<line>:<col>: error: invalid
+//              instruction mnemonic 'frobnicate'`, then
 //              `<inline asm>:1:2: note: instantiated into assembly here`
 // BOTH make the C statement primary and NEITHER has template-primary, so the
 // reference-conforming shape is: C statement primary, template locus DEMOTED to
@@ -1445,14 +1455,26 @@ TEST(Program_CompileFiles, MalformedAsmTemplateRendersTheOffendingTemplateLine) 
 //
 // ⚠ RED-ON-DISABLE, demonstrated at authoring time: deleting the
 // `AsmStatementLocusGuard` instantiation in `expandInlineAsm` (or emptying
-// `reanchorFrom`) leaves every assertion on `bad_template.c:3:5` unsatisfied
+// `reanchorFrom`) leaves every assertion on the C statement's locus unsatisfied
 // while the parent test above stays green — the two tests pin orthogonal
 // halves of one render, which is why neither subsumes the other.
 TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
     ScratchDir scratch{Location::InsideRepo, "program"};
+    // ★ THE EXPECTED LOCUS IS DERIVED FROM THE FIXTURE, NOT SPELLED. All three
+    // arms below write the SAME shape — two prologue lines, then the `__asm__`
+    // statement indented four spaces — so the C statement's locus is a property
+    // of that shape, and a bare `"<file>:<line>:<col>"` literal would read as a
+    // positional CITATION to a reader and to `check-plan-citations` alike.
+    constexpr int kPrologueLines = 2;   // `int main(void) {` + the local decl
+    constexpr int kAsmLine       = kPrologueLines + 1;
+    constexpr int kAsmColumn     = 5;   // four spaces of indent, 1-based column
+    auto const    locusOf        = [](char const* file, int line, int col) {
+        return std::string{file} + ":" + std::to_string(line) + ":"
+               + std::to_string(col);
+    };
     // ARM 1 — template does not PARSE: the forwarded dialect diagnostic must
     // carry the C statement as primary and the template as a related note.
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "bad_template.c",
         "int main(void) {\n"
         "    int r = 0;\n"
@@ -1462,7 +1484,7 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
     // ARM 2 — template PARSES, the LOWERING refuses it (`frobnicate` is not in
     // the instruction table): the engine's own refusal must render the same
     // two-locus shape.
-    auto const src2 = writeCSubsetSource(
+    auto const src2 = writeCSource(
         scratch.path(), "unlowerable_template.c",
         "int main(void) {\n"
         "    int r = 0;\n"
@@ -1473,11 +1495,12 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
     Program prog;
     testing::internal::CaptureStderr();
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+        {src.generic_string()}, "c", {"x86_64:elf64-x86_64-linux-exec"});
     auto const err = testing::internal::GetCapturedStderr();
 
     EXPECT_NE(rc, 0) << "a template that does not parse must fail the build";
-    EXPECT_NE(err.find("bad_template.c:3:5"), std::string::npos)
+    EXPECT_NE(err.find(locusOf("bad_template.c", kAsmLine, kAsmColumn)),
+              std::string::npos)
         << "expected the C statement as the PRIMARY locus (both reference "
            "compilers lead with it); got:\n" << err;
     EXPECT_NE(err.find(" 3 |     __asm__(\"movl $42, %0 @@@\" : \"=r\"(r));"),
@@ -1498,11 +1521,12 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
     Program prog2;
     testing::internal::CaptureStderr();
     int const rc2 = prog2.compileFiles(
-        {src2.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+        {src2.generic_string()}, "c", {"x86_64:elf64-x86_64-linux-exec"});
     auto const err2 = testing::internal::GetCapturedStderr();
 
     EXPECT_NE(rc2, 0) << "an unlowerable template must fail the build";
-    EXPECT_NE(err2.find("unlowerable_template.c:3:5"), std::string::npos)
+    EXPECT_NE(err2.find(locusOf("unlowerable_template.c", kAsmLine, kAsmColumn)),
+              std::string::npos)
         << "expected the C statement as primary on the LOWERING refusal too; "
            "got:\n" << err2;
     EXPECT_NE(err2.find(" 3 |     __asm__(\"frobnicate %0\" : \"=r\"(r));"),
@@ -1529,7 +1553,7 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
     // shape and gains ONE unlowerable mnemonic — the same lever ARM 2 uses —
     // and the positive half (the very program this arm used to reject) is
     // asserted directly below as ARM 4.
-    auto const src3 = writeCSubsetSource(
+    auto const src3 = writeCSource(
         scratch.path(), "goto_template.c",
         "int main(void) {\n"
         "    int x = 1;\n"
@@ -1541,12 +1565,13 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
     Program prog3;
     testing::internal::CaptureStderr();
     int const rc3 = prog3.compileFiles(
-        {src3.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+        {src3.generic_string()}, "c", {"x86_64:elf64-x86_64-linux-exec"});
     auto const err3 = testing::internal::GetCapturedStderr();
 
     EXPECT_NE(rc3, 0) << "an `asm goto` whose template names no instruction the "
                          "target declares must fail the build";
-    EXPECT_NE(err3.find("goto_template.c:3:5"), std::string::npos)
+    EXPECT_NE(err3.find(locusOf("goto_template.c", kAsmLine, kAsmColumn)),
+              std::string::npos)
         << "expected the C statement as primary on the asm-goto refusal too; "
            "got:\n" << err3;
     EXPECT_NE(err3.find(
@@ -1563,9 +1588,9 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
     // builder states `sealAsmGotoEdges` answers by emitting NOTHING — get it
     // wrong in either direction and `LirBuilder` aborts the process rather than
     // reporting, so a green `rc == 0` here is load-bearing beyond "it compiled".
-    // (The RUNTIME witness is `examples/c-subset/asm_goto_labels`; this arm is
+    // (The RUNTIME witness is `examples/c/asm_goto_labels`; this arm is
     // the one that pins the CLI path and the abort-free build.)
-    auto const src4 = writeCSubsetSource(
+    auto const src4 = writeCSource(
         scratch.path(), "goto_lowers.c",
         "int main(void) {\n"
         "    int x = 1;\n"
@@ -1577,7 +1602,7 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
     Program prog4;
     testing::internal::CaptureStderr();
     int const rc4 = prog4.compileFiles(
-        {src4.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+        {src4.generic_string()}, "c", {"x86_64:elf64-x86_64-linux-exec"});
     auto const err4 = testing::internal::GetCapturedStderr();
     EXPECT_EQ(rc4, 0)
         << "an `asm goto` whose template branches to its own label must LOWER; "
@@ -1599,7 +1624,7 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
 // merge but rep is capped and `report()` no-ops.
 TEST(Program_CompileFiles, CapMarkerAppearsExactlyOnceAfterMultiTargetSaturation) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "ok.c", "int f() { return 0; }\n");
     scratch.useAsCwd();
     Program prog;
@@ -1608,7 +1633,7 @@ TEST(Program_CompileFiles, CapMarkerAppearsExactlyOnceAfterMultiTargetSaturation
     DiagnosticReporter rep{cfg};
     int const rc = prog.compileFiles(
         {src.generic_string()},
-        "c-subset",
+        "c",
         {"x86_64:no-such-format-A",
          "x86_64:no-such-format-B"},
         rep);
@@ -1628,10 +1653,19 @@ TEST(Program_CompileFiles, CapMarkerAppearsExactlyOnceAfterMultiTargetSaturation
         << "single-chokepoint contract: cap fires EXACTLY ONCE at "
            "rep during merge, regardless of how many targets exceed "
            "their per-target diagnostic count.";
-    EXPECT_EQ(rep.all().size(), 2u)
+    // ★ THREE, NOT TWO, SINCE D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS.
+    // The third entry is `D_LaterPhasesNotRun`, and it is here for the same
+    // reason the cap marker is: it carries `DiagnosticDelivery::Guaranteed`, so
+    // `rep`'s volume gates cannot drop it. That is not an accident of ordering
+    // — a run that hit a cap is exactly the run whose completeness is most in
+    // doubt, so the ONE notice saying "phases did not run" must not be what the
+    // cap swallows. This run is doubly truncated (a cap elision AND a phase
+    // elision) and now says both.
+    EXPECT_EQ(rep.all().size(), 3u)
         << "rep contents must be exactly {first cap-filling diagnostic, "
-           "P_TooManyDiagnostics marker}; any other diagnostics signal "
-           "a regression in the per-target loop or merge path.";
+           "P_TooManyDiagnostics marker, D_LaterPhasesNotRun scope notice}; "
+           "any other diagnostics signal a regression in the per-target loop "
+           "or merge path.";
     // 9945457 audit fold (3-agent convergence: silent-failure H2 +
     // code-architect Q5 + test-analyzer-dim-2 #6): pin the IDENTITY
     // of the cap-filling diagnostic. A regression in
@@ -1663,14 +1697,14 @@ TEST(Program_CompileFiles, CapMarkerAppearsExactlyOnceAfterMultiTargetSaturation
 // unconditionally on multi-target runs.
 TEST(Program_CompileFiles, NoCapMarkerWhenDiagnosticsBudgetExceedsErrorCount) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "ok.c", "int f() { return 0; }\n");
     scratch.useAsCwd();
     Program prog;
     DiagnosticReporter rep;  // default config — large cap
     int const rc = prog.compileFiles(
         {src.generic_string()},
-        "c-subset",
+        "c",
         {"x86_64:no-such-format-A",
          "x86_64:no-such-format-B"},
         rep);
@@ -1721,7 +1755,7 @@ TEST(Program_CompileProject, SuppressedFailLoudStillReturnsNonZero) {
 TEST(Program_Transpile, FailsLoudPlanNotLanded) {
     Program prog;
     EXPECT_EQ(
-        prog.transpile({"in.c"}, "c-subset", {"x86_64-v1-link-elf"}),
+        prog.transpile({"in.c"}, "c", {"x86_64-v1-link-elf"}),
         1);
 }
 
@@ -1730,7 +1764,7 @@ TEST(Program_Transpile, SuppressedPlanNotLandedStillReturnsNonZero) {
     DiagnosticReporter::Config cfg;
     cfg.policy.suppress.insert(DiagnosticCode::D_PlanNotLanded);
     EXPECT_EQ(
-        prog.transpile({"in.c"}, "c-subset", {"x86_64-v1-link-elf"}, cfg),
+        prog.transpile({"in.c"}, "c", {"x86_64-v1-link-elf"}, cfg),
         1);
 }
 
@@ -1748,19 +1782,19 @@ TEST(Program_Transpile, SuppressedPlanNotLandedStillReturnsNonZero) {
 // diagnostic. Reverting the H1 fix would NOT cause this test to
 // fail. The H1 fix's load-bearing path is suppressible per-target
 // diagnostics; pinning it requires a suppressible per-target
-// emitter, which doesn't exist in the c-subset path today.
+// emitter, which doesn't exist in the c path today.
 // Anchored as D-H1-SUPPRESSIBLE-PER-TARGET-PIN (trigger: first
 // suppressible code that fires reliably on the per-target path).
 TEST(Program_CompileFiles, SuppressedHExternHasInitializerStillReturnsNonZero) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "ext_init.c", "extern int x = 5;\n");
     scratch.useAsCwd();
     Program prog;
     DiagnosticReporter::Config cfg;
     cfg.policy.suppress.insert(DiagnosticCode::H_ExternHasInitializer);
     EXPECT_EQ(prog.compileFiles({src.generic_string()},
-                                "c-subset",
+                                "c",
                                 {"x86_64:elf64-x86_64-linux"},
                                 cfg),
               1);
@@ -1775,20 +1809,20 @@ TEST(Program_CompileDirectory, WiresThroughForMatchingFiles) {
     // test — byte assertion is gated on plan 12 ML7 cycle 2 +
     // plan 13 AS cycle gaps (anchored D-LK10-2).
     ScratchDir scratch{Location::InsideRepo, "program"};
-    writeCSubsetSource(scratch.path(), "a.c",
+    writeCSource(scratch.path(), "a.c",
                         "int aaa() { return 1; }\n");
-    writeCSubsetSource(scratch.path(), "b.c",
+    writeCSource(scratch.path(), "b.c",
                         "int bbb() { return 2; }\n");
-    // Distractor: extension not in c-subset's fileExtensions
+    // Distractor: extension not in c's fileExtensions
     // (".c"/".h") — must be ignored.
-    writeCSubsetSource(scratch.path(), "ignored.txt",
+    writeCSource(scratch.path(), "ignored.txt",
                         "this is not c\n");
     scratch.useAsCwd();
 
     Program prog;
     prog.compileDirectory(
         scratch.path().generic_string(),
-        "c-subset",
+        "c",
         {"x86_64:elf64-x86_64-linux"});
 
     // Wiring proof: the target directory exists, which means the
@@ -1804,18 +1838,18 @@ TEST(Program_CompileDirectory, RejectsMissingDirectory) {
     auto const ghost = scratch.path() / "does-not-exist";
     Program prog;
     EXPECT_EQ(prog.compileDirectory(ghost.generic_string(),
-                                    "c-subset",
+                                    "c",
                                     {"x86_64:elf64-x86_64-linux"}),
               1);
 }
 
 TEST(Program_CompileDirectory, RejectsNoMatchingFiles) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    // Directory exists but contains nothing matching c-subset.
-    writeCSubsetSource(scratch.path(), "only.txt", "nothing\n");
+    // Directory exists but contains nothing matching c.
+    writeCSource(scratch.path(), "only.txt", "nothing\n");
     Program prog;
     EXPECT_EQ(prog.compileDirectory(scratch.path().generic_string(),
-                                    "c-subset",
+                                    "c",
                                     {"x86_64:elf64-x86_64-linux"}),
               1);
 }
@@ -1837,7 +1871,7 @@ TEST(Program_CompileDirectory, RejectsNoMatchingFiles) {
 // A regression that routed the N>1 build back through the per-CU-then-link-merge path
 // would leave `add5` as a surviving cross-CU reference → a thunk slot → this fails.
 TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
-    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    auto grammarR = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(grammarR.has_value());
     auto grammar = *grammarR;
     auto targetR = TargetSchema::loadShipped("x86_64");
@@ -1986,7 +2020,7 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
 // runs no ConstFold, so `37 + 5` is NOT folded — the only way main's Call vanishes is the
 // callee body being spliced in. A surviving Call ⇒ no inline happened.
 TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
-    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    auto grammarR = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(grammarR.has_value());
     auto grammar = *grammarR;
     auto targetR = TargetSchema::loadShipped("x86_64");
@@ -2120,7 +2154,7 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
 //   • PROGRAM stage: the full release document over the merged module kills
 //     it (the merge made the call intra-module direct).
 TEST(Program_WholeProgramMerge, ShippedStageRoutingInlinesCrossCuAtProgramStage) {
-    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    auto grammarR = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(grammarR.has_value());
     auto grammar = *grammarR;
     auto targetR = TargetSchema::loadShipped("x86_64");
@@ -2218,7 +2252,7 @@ TEST(Program_WholeProgramMerge, ShippedStageRoutingInlinesCrossCuAtProgramStage)
 // and reds. This is the pin the routing audit demanded: every other witness
 // of the two-stage topology stays green over a deleted router.
 TEST(Program_WholeProgramMerge, UnitStageRunsTheUnitDocumentNotTheConfigDoc) {
-    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    auto grammarR = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(grammarR.has_value());
     auto grammar = *grammarR;
     auto targetR = TargetSchema::loadShipped("x86_64");
@@ -2274,7 +2308,7 @@ namespace {
 // for the given target/format. Empty string ⇒ no `puts` import was produced.
 [[nodiscard]] std::string resolvedPutsLibraryFor(
         std::string const& descJson, char const* targetName, char const* formatName) {
-    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    auto grammarR = GrammarSchema::loadShipped("c");
     EXPECT_TRUE(grammarR.has_value());
     if (!grammarR) return {};
     auto grammar = *grammarR;
@@ -2315,7 +2349,7 @@ namespace {
 // Deliberately EXPECT-free so a refusal is data here, not a failure.
 [[nodiscard]] bool putsBuildIsRefusedFor(
         std::string const& descJson, char const* targetName, char const* formatName) {
-    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    auto grammarR = GrammarSchema::loadShipped("c");
     auto targetR  = TargetSchema::loadShipped(targetName);
     auto formatR  = ObjectFormatSchema::loadShipped(formatName);
     if (!grammarR || !targetR || !formatR) return false;
@@ -2404,7 +2438,7 @@ TEST(Program_ShippedLibModel3, MissingFormatKeyBindsNothingRatherThanADefault) {
 // RED-on-disable for the knob-that-lies: the descriptor's `library.elf` value is
 // AUTHORITATIVE — the fold MUST read the map, not silently fall through to the
 // language default. PerFormatLibraryResolvesFromNeutralDescriptor uses real-world
-// images (libc.so.6 …) that are byte-IDENTICAL to c-subset's externLibraryByFormat
+// images (libc.so.6 …) that are byte-IDENTICAL to c's externLibraryByFormat
 // fallback, so it passes whether the map is read OR ignored — it cannot disprove
 // the knob-that-lies. Here the map's `elf` image is a DISCRIMINATING value that is
 // NOT the format default, so the ELF assertion goes RED iff the compile_pipeline
@@ -2415,7 +2449,7 @@ TEST(Program_ShippedLibModel3, MapValueIsAuthoritativeOverFormatDefault) {
         "library": { "elf": "libcustom.so.9", "pe": "msvcrt.dll", "macho": "/usr/lib/libSystem.B.dylib" },
         "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
     })";
-    // The map's "elf"="libcustom.so.9" MUST win over c-subset's
+    // The map's "elf"="libcustom.so.9" MUST win over c's
     // externLibraryByFormat.elf default ("libc.so.6"). This can ONLY pass if the
     // fold genuinely reads the descriptor's per-format library map.
     EXPECT_EQ(resolvedPutsLibraryFor(descCustom, "x86_64", "elf64-x86_64-linux-exec"),
@@ -2424,7 +2458,7 @@ TEST(Program_ShippedLibModel3, MapValueIsAuthoritativeOverFormatDefault) {
 
 // ═════════════════════════════════════════════════════════════════
 // D-CSUBSET-THREAD-LOCAL (TLS C1): end-to-end pipeline pins — real
-// c-subset source through the FULL driver (grammar -> semantics ->
+// c source through the FULL driver (grammar -> semantics ->
 // HIR/MIR flags -> asm section-select -> the ELF dynamic walker).
 //
 // ★ RED-ON-DISABLE POSTURE: single-thread RUNTIME cannot distinguish
@@ -2433,7 +2467,7 @@ TEST(Program_ShippedLibModel3, MapValueIsAuthoritativeOverFormatDefault) {
 // phdr-count delta vs the control TU) are the discriminator: routing
 // thread_local through Data/Bss keeps the runtime witnesses green
 // while every assertion below flips red. The runnable per-thread
-// discriminator is examples/c-subset/thread_local_pthread.
+// discriminator is examples/c/thread_local_pthread.
 // ═════════════════════════════════════════════════════════════════
 
 namespace {
@@ -2503,7 +2537,7 @@ inline constexpr std::uint32_t kPtGnuEhFrame = 0x6474e550u;
 
 TEST(Program_CompileFiles, ThreadLocalEmitsPtTlsAndFsAccessSequence) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "tls_e2e.c",
         "thread_local int g = 7;\n"
         "int main(void) { g = g + 35; return g; }\n");
@@ -2511,7 +2545,7 @@ TEST(Program_CompileFiles, ThreadLocalEmitsPtTlsAndFsAccessSequence) {
 
     Program prog;
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset",
+        {src.generic_string()}, "c",
         {"x86_64:elf64-x86_64-linux-exec"});
     ASSERT_EQ(rc, 0) << "thread_local must compile clean end-to-end "
                         "(D-CSUBSET-THREAD-LOCAL)";
@@ -2563,7 +2597,7 @@ TEST(Program_CompileFiles, Arm64ThreadLocalEmitsPtTlsAndMrsAccessSequence) {
     // Data/Bss keeps single-thread runtime green while every
     // assertion here flips.
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "tls_e2e_a64.c",
         "thread_local int g = 7;\n"
         "int main(void) { g = g + 35; return g; }\n");
@@ -2571,7 +2605,7 @@ TEST(Program_CompileFiles, Arm64ThreadLocalEmitsPtTlsAndMrsAccessSequence) {
 
     Program prog;
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset",
+        {src.generic_string()}, "c",
         {"arm64:elf64-aarch64-linux-exec"});
     ASSERT_EQ(rc, 0) << "thread_local must compile clean end-to-end on "
                         "arm64 (D-CSUBSET-THREAD-LOCAL, TLS C2)";
@@ -2652,7 +2686,7 @@ TEST(Program_CompileFiles, Arm64ThreadLocalHi12NonZeroPairPatchedE2E) {
     //   → hi12 = 5016 >> 12 = 1, lo12 = 5016 & 0xFFF = 0x398 (920).
     // Pure image-byte assertions — no emulator required.
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "tls_hi12_a64.c",
         "thread_local char pad[5000] = {1};\n"
         "thread_local int v = 7;\n"
@@ -2665,7 +2699,7 @@ TEST(Program_CompileFiles, Arm64ThreadLocalHi12NonZeroPairPatchedE2E) {
 
     Program prog;
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset",
+        {src.generic_string()}, "c",
         {"arm64:elf64-aarch64-linux-exec"});
     ASSERT_EQ(rc, 0) << "the >4096-byte TLS layout must compile clean "
                         "(D-CSUBSET-THREAD-LOCAL, TLS C2)";
@@ -2725,7 +2759,7 @@ TEST(Program_CompileFiles, NoThreadLocalControlHasNoTlsTrace) {
     // fs-read sequence. (The sqlite-dormant guarantee rides this:
     // every TLS emission is hasTls-gated.)
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "tls_ctl.c",
         "int g = 7;\n"
         "int main(void) { g = g + 35; return g; }\n");
@@ -2733,7 +2767,7 @@ TEST(Program_CompileFiles, NoThreadLocalControlHasNoTlsTrace) {
 
     Program prog;
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset",
+        {src.generic_string()}, "c",
         {"x86_64:elf64-x86_64-linux-exec"});
     ASSERT_EQ(rc, 0);
 
@@ -2763,7 +2797,7 @@ TEST(Program_CompileFiles, ConstThreadLocalLandsInsidePtTlsSpan) {
     // it; an isConst-first regression parks k in .rodata and empties
     // the PT_TLS span, flipping this red.
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "tls_const.c",
         "thread_local const int k = 3;\n"
         "int main(void) { return k + 39; }\n");
@@ -2771,7 +2805,7 @@ TEST(Program_CompileFiles, ConstThreadLocalLandsInsidePtTlsSpan) {
 
     Program prog;
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset",
+        {src.generic_string()}, "c",
         {"x86_64:elf64-x86_64-linux-exec"});
     ASSERT_EQ(rc, 0);
 
@@ -2808,7 +2842,7 @@ TEST(Program_CompileFiles, ThreadLocalPointerTemplateSlotDereferencesE2E) {
     // unpatched slot holds 0; a tpoff-poisoned patch (the CRIT-1
     // class) holds a huge bit-cast negative — all three flip this red.
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "tls_ptr.c",
         "thread_local char *msg = \"hi\";\n"
         "int main(void) {\n"
@@ -2819,7 +2853,7 @@ TEST(Program_CompileFiles, ThreadLocalPointerTemplateSlotDereferencesE2E) {
 
     Program prog;
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset",
+        {src.generic_string()}, "c",
         {"x86_64:elf64-x86_64-linux-exec"});
     ASSERT_EQ(rc, 0);
 
@@ -2889,11 +2923,11 @@ TEST(Program_CompileFiles, CrossCuExternThreadLocalMergesAndAccessesTpRelativeE2
     // then correctly rejects loud (observed while writing this pin;
     // flagged to the plan tier — not this test's subject).
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src1 = writeCSubsetSource(
+    auto const src1 = writeCSource(
         scratch.path(), "tls_cu1.c",
         "thread_local int g = 5;\n"
         "int bump(void) { g = g + 1; return g; }\n");
-    auto const src2 = writeCSubsetSource(
+    auto const src2 = writeCSource(
         scratch.path(), "tls_cu2.c",
         "extern int bump(void);\n"
         "extern thread_local int g;\n"
@@ -2908,7 +2942,7 @@ TEST(Program_CompileFiles, CrossCuExternThreadLocalMergesAndAccessesTpRelativeE2
 
     Program prog;
     int const rc = prog.compileUnits(
-        {src1.generic_string(), src2.generic_string()}, "c-subset",
+        {src1.generic_string(), src2.generic_string()}, "c",
         {"x86_64:elf64-x86_64-linux-exec"});
     ASSERT_EQ(rc, 0) << "extern thread_local must resolve across the "
                         "cross-CU merge (never survive to the "
@@ -2939,7 +2973,7 @@ TEST(Program_CompileFiles, Alignas32ThreadLocalPAlignAndLayoutE2E) {
     //   small=-28 — byte-pinned at the walker tier; here the phdr
     //   fields pin the same formula's inputs end-to-end.)
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "tls_align.c",
         "_Alignas(32) thread_local int big = 9;\n"
         "thread_local int small = 7;\n"
@@ -2948,7 +2982,7 @@ TEST(Program_CompileFiles, Alignas32ThreadLocalPAlignAndLayoutE2E) {
 
     Program prog;
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset",
+        {src.generic_string()}, "c",
         {"x86_64:elf64-x86_64-linux-exec"});
     ASSERT_EQ(rc, 0);
 
@@ -2999,7 +3033,7 @@ TEST(Program_CuParallelism, MultiTuDiagnosticsAreCuOrderedPoolVsSynchronous) {
     for (int i = 0; i < 4; ++i) {
         auto const body = "int f" + std::to_string(i)
                         + "(void) { return zzundef_cu" + std::to_string(i) + "; }\n";
-        files.push_back(writeCSubsetSource(
+        files.push_back(writeCSource(
             scratch.path(), "cu" + std::to_string(i) + ".c", body).generic_string());
     }
     scratch.useAsCwd();
@@ -3009,7 +3043,7 @@ TEST(Program_CuParallelism, MultiTuDiagnosticsAreCuOrderedPoolVsSynchronous) {
         prog.setExecutor(exec);
         DiagnosticReporter rep;
         int const rc = prog.compileUnits(
-            files, "c-subset", {"x86_64:elf64-x86_64-linux"}, rep);
+            files, "c", {"x86_64:elf64-x86_64-linux"}, rep);
         EXPECT_NE(rc, 0) << "every CU has an undeclared identifier — must fail loud";
         std::vector<std::pair<DiagnosticCode, std::string>> out;
         for (auto const& d : rep.all()) out.emplace_back(d.code, d.actual);
@@ -3053,11 +3087,11 @@ TEST(Program_CuParallelism, MultiTuDiagnosticsAreCuOrderedPoolVsSynchronous) {
 // scheduling cannot perturb the image.
 TEST(Program_CuParallelism, MultiTuArtifactBytesIdenticalPoolVsSynchronous) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const m = writeCSubsetSource(scratch.path(), "main.c",
+    auto const m = writeCSource(scratch.path(), "main.c",
         "int a(void); int b(void);\nint main(void) { return a() + b(); }\n");
-    auto const fa = writeCSubsetSource(scratch.path(), "a.c",
+    auto const fa = writeCSource(scratch.path(), "a.c",
         "int a(void) { return 20; }\n");
-    auto const fb = writeCSubsetSource(scratch.path(), "b.c",
+    auto const fb = writeCSource(scratch.path(), "b.c",
         "int b(void) { return 22; }\n");
     scratch.useAsCwd();
     std::vector<std::string> const files{
@@ -3068,7 +3102,7 @@ TEST(Program_CuParallelism, MultiTuArtifactBytesIdenticalPoolVsSynchronous) {
         prog.setExecutor(exec);
         prog.setOutputDir(outDir);
         int const rc = prog.compileUnits(
-            files, "c-subset", {"x86_64:elf64-x86_64-linux"});
+            files, "c", {"x86_64:elf64-x86_64-linux"});
         EXPECT_EQ(rc, 0) << "the 3-TU program must link + emit an artifact";
         return readAllBytes(outDir / "main.o");
     };
@@ -3126,7 +3160,7 @@ TEST(Program_CuParallelism, FrontHalfMultiTuDiagnosticsAndBytesPoolVsSynchronous
         auto const body = "#warning zzfront_cu" + std::to_string(i) + "\n"
                         + "int frontf" + std::to_string(i)
                         + "(void) { return " + std::to_string(i) + "; }\n";
-        files.push_back(writeCSubsetSource(
+        files.push_back(writeCSource(
             scratch.path(), "front" + std::to_string(i) + ".c", body)
                             .generic_string());
     }
@@ -3143,7 +3177,7 @@ TEST(Program_CuParallelism, FrontHalfMultiTuDiagnosticsAndBytesPoolVsSynchronous
         prog.setOutputDir(outDir);
         DiagnosticReporter rep;
         int const rc = prog.compileUnits(
-            files, "c-subset", {"x86_64:elf64-x86_64-linux"}, rep);
+            files, "c", {"x86_64:elf64-x86_64-linux"}, rep);
         EXPECT_EQ(rc, 0) << "#warning must not fail the build";
         RunResult out;
         for (auto const& d : rep.all()) out.diags.emplace_back(d.code, d.actual);
@@ -3217,7 +3251,7 @@ TEST(Program_CuParallelism, FrontHalfActuallyRunsConcurrently) {
         auto const body = "#warning zzconc_cu" + std::to_string(i) + "\n"
                         + "int concf" + std::to_string(i)
                         + "(void) { return " + std::to_string(i) + "; }\n";
-        files.push_back(writeCSubsetSource(
+        files.push_back(writeCSource(
             scratch.path(), "conc" + std::to_string(i) + ".c", body)
                             .generic_string());
     }
@@ -3229,7 +3263,7 @@ TEST(Program_CuParallelism, FrontHalfActuallyRunsConcurrently) {
     prog.setExecutor(&pool);
     prog.setOutputDir(scratch.path() / "conc_out");
     DiagnosticReporter rep;
-    ASSERT_EQ(prog.compileUnits(files, "c-subset",
+    ASSERT_EQ(prog.compileUnits(files, "c",
                                 {"x86_64:elf64-x86_64-linux"}, rep),
               0);
 
@@ -3273,7 +3307,7 @@ TEST(Program_CuParallelism, FrontHalfMultiTuPoolIsRepeatStable) {
         auto const body = "#warning zzrepeat_cu" + std::to_string(i) + "\n"
                         + "int repeatf" + std::to_string(i)
                         + "(void) { return " + std::to_string(i) + "; }\n";
-        files.push_back(writeCSubsetSource(
+        files.push_back(writeCSource(
             scratch.path(), "repeat" + std::to_string(i) + ".c", body)
                             .generic_string());
     }
@@ -3290,7 +3324,7 @@ TEST(Program_CuParallelism, FrontHalfMultiTuPoolIsRepeatStable) {
         prog.setOutputDir(outDir);
         DiagnosticReporter rep;
         int const rc = prog.compileUnits(
-            files, "c-subset", {"x86_64:elf64-x86_64-linux"}, rep);
+            files, "c", {"x86_64:elf64-x86_64-linux"}, rep);
         ASSERT_EQ(rc, 0) << "run " << k << " must succeed";
         std::vector<std::pair<DiagnosticCode, std::string>> diags;
         for (auto const& d : rep.all()) diags.emplace_back(d.code, d.actual);
@@ -3321,12 +3355,12 @@ TEST(Program_CuParallelism, FrontHalfMultiTuPoolIsRepeatStable) {
 // build would eventually perturb one of the K runs.
 TEST(Program_CuParallelism, MultiTuPoolCompileIsRepeatStable) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const m = writeCSubsetSource(scratch.path(), "main.c",
+    auto const m = writeCSource(scratch.path(), "main.c",
         "int a(void); int b(void); int c(void);\n"
         "int main(void) { return a() + b() + c(); }\n");
-    auto const fa = writeCSubsetSource(scratch.path(), "a.c", "int a(void) { return 10; }\n");
-    auto const fb = writeCSubsetSource(scratch.path(), "b.c", "int b(void) { return 14; }\n");
-    auto const fc = writeCSubsetSource(scratch.path(), "c.c", "int c(void) { return 18; }\n");
+    auto const fa = writeCSource(scratch.path(), "a.c", "int a(void) { return 10; }\n");
+    auto const fb = writeCSource(scratch.path(), "b.c", "int b(void) { return 14; }\n");
+    auto const fc = writeCSource(scratch.path(), "c.c", "int c(void) { return 18; }\n");
     scratch.useAsCwd();
     std::vector<std::string> const files{
         m.generic_string(), fa.generic_string(),
@@ -3342,7 +3376,7 @@ TEST(Program_CuParallelism, MultiTuPoolCompileIsRepeatStable) {
         prog.setOutputDir(outDir);
         DiagnosticReporter rep;
         int const rc = prog.compileUnits(
-            files, "c-subset", {"x86_64:elf64-x86_64-linux"}, rep);
+            files, "c", {"x86_64:elf64-x86_64-linux"}, rep);
         ASSERT_EQ(rc, 0) << "run " << k << " must succeed";
         EXPECT_EQ(rep.errorCount(), 0u) << "run " << k << " must be diagnostic-clean";
         auto const bytes = readAllBytes(outDir / "main.o");
@@ -3478,13 +3512,13 @@ namespace {
 //       yields the SAME exit code. Measured: patching `arm64.target.json`'s
 //       predefines to x86_64's rows leaves every `#if` guard in the source
 //       silent and the program still exits 42 — green, and wrong. The
-//       `examples/c-subset/arch_identity_predefines` example works around (2)
+//       `examples/c/arch_identity_predefines` example works around (2)
 //       by making the architecture OBSERVABLE in program OUTPUT (per-target
 //       `expectedStdout` arch tags) rather than in the exit code. Nothing an
 //       example can do works around (1).
 TEST(Program_CompileFiles, TFC74CuCacheKeyIsPerTargetNotPerObjectFormat) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(
+    auto const src = writeCSource(
         scratch.path(), "archprobe.c",
         "#ifdef __aarch64__\n"
         "int probe_is_aarch64(void) { return 1; }\n"
@@ -3496,7 +3530,7 @@ TEST(Program_CompileFiles, TFC74CuCacheKeyIsPerTargetNotPerObjectFormat) {
 
     Program prog;
     int const rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset",
+        {src.generic_string()}, "c",
         {"arm64:elf64-aarch64-linux", "x86_64:elf64-x86_64-linux"});
     ASSERT_EQ(rc, 0);
 
@@ -3550,7 +3584,7 @@ TEST(Program_CompileFiles, TFC74CuCacheKeyIsPerTargetNotPerObjectFormat) {
         // A FRESH `Program` — a solo build is a separate driver invocation,
         // and reusing `prog` would carry the multi-target run's state into it.
         Program solo;
-        ASSERT_EQ(solo.compileFiles({src.generic_string()}, "c-subset",
+        ASSERT_EQ(solo.compileFiles({src.generic_string()}, "c",
                                     {c.spec}),
                   0)
             << "the solo build of " << c.spec << " must succeed";
@@ -3578,12 +3612,12 @@ TEST(Program_CompileFiles, TFC74CuCacheKeyIsPerTargetNotPerObjectFormat) {
 // large enough one to matter, so it is pinned.)
 TEST(Program_CompileFiles, TFC74SingleTargetStillBuildsOnce) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    auto const src = writeCSubsetSource(scratch.path(), "onekey.c",
+    auto const src = writeCSource(scratch.path(), "onekey.c",
                                         "int forty_two() { return 42; }\n");
     scratch.useAsCwd();
 
     Program prog;
-    int const rc = prog.compileFiles({src.generic_string()}, "c-subset",
+    int const rc = prog.compileFiles({src.generic_string()}, "c",
                                      {"x86_64:elf64-x86_64-linux"});
     ASSERT_EQ(rc, 0);
     EXPECT_TRUE(fs::exists(scratch.path() / "target" / "elf64-x86_64-linux"
@@ -3662,7 +3696,7 @@ TEST(Program_CompileFiles, TFC74BadTargetDiagnosedWithoutHeaderErrorCascade) {
     // An architecture ladder in a HEADER — the real cascade came from headers,
     // and a quote-`#include` is what puts the `#error` behind the front-end
     // rather than in the driver's own hands.
-    writeCSubsetSource(scratch.path(), "archgate.h",
+    writeCSource(scratch.path(), "archgate.h",
                        "#if defined(__aarch64__)\n"
                        "#define ARCH_GATE_OK 1\n"
                        "#elif defined(__x86_64__)\n"
@@ -3675,7 +3709,7 @@ TEST(Program_CompileFiles, TFC74BadTargetDiagnosedWithoutHeaderErrorCascade) {
     // arm. That makes the control below a live test of the ladder rather than
     // a test that trivially passes on a header nobody read.
     auto const src =
-        writeCSubsetSource(scratch.path(), "cascade.c",
+        writeCSource(scratch.path(), "cascade.c",
                            "#include \"archgate.h\"\n"
                            "int forty_two(void) { return ARCH_GATE_OK + 41; }\n");
     scratch.useAsCwd();
@@ -3687,7 +3721,7 @@ TEST(Program_CompileFiles, TFC74BadTargetDiagnosedWithoutHeaderErrorCascade) {
     {
         DiagnosticReporter ok{DiagnosticReporter::Config{}};
         Program            prog;
-        ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+        ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c",
                                     {"x86_64:elf64-x86_64-linux"}, ok), 0)
             << "the arch ladder must be SATISFIABLE by a good target, else the "
                "cascade assertion below proves nothing" << diagnosticDump(ok);
@@ -3698,7 +3732,7 @@ TEST(Program_CompileFiles, TFC74BadTargetDiagnosedWithoutHeaderErrorCascade) {
     DiagnosticReporter rep{DiagnosticReporter::Config{}};
     Program            prog;
     int const          rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset", {"no_such_arch:elf64-x86_64-linux"},
+        {src.generic_string()}, "c", {"no_such_arch:elf64-x86_64-linux"},
         rep);
     EXPECT_EQ(rc, 1) << diagnosticDump(rep);
 
@@ -3712,14 +3746,23 @@ TEST(Program_CompileFiles, TFC74BadTargetDiagnosedWithoutHeaderErrorCascade) {
 
     // (b) ★ …and NOTHING ELSE accompanies it. The SET, not a count on one code.
     //
-    // MEASURED, not guessed: exactly two codes, and BOTH name the target. The
-    // config tier says WHAT it could not find (`C_InvalidTargetName`, forwarded
-    // verbatim by `forwardConfigDiagnostics` so the loader's own reason is not
-    // swallowed); the driver says what that MEANS for this build
-    // (`D_SchemaLoadFailed`). There is no third code, and in particular no
+    // MEASURED, not guessed: two codes NAME THE TARGET. The config tier says
+    // WHAT it could not find (`C_InvalidTargetName`, forwarded verbatim by
+    // `forwardConfigDiagnostics` so the loader's own reason is not swallowed);
+    // the driver says what that MEANS for this build (`D_SchemaLoadFailed`).
+    // There is no front-end code, and in particular no
     // `P_PreprocessorErrorDirective` — the front-end never ran.
+    //
+    // ★ AND A THIRD CODE SAYS EXACTLY THAT, IN THE STREAM RATHER THAN IN THIS
+    // COMMENT (D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS). "The front-end
+    // never ran" was a fact only a reader of this test knew; `D_LaterPhasesNotRun`
+    // is the run telling its operator the same thing, naming the altitude it
+    // stopped at and every phase that therefore produced nothing. Its ABSENCE
+    // from this set would mean the run had gone silent about its own scope
+    // again, so it is asserted here rather than tolerated.
     EXPECT_EQ(diagnosticCodeSet(rep),
               (std::set<std::string_view>{"C_InvalidTargetName",
+                                          "D_LaterPhasesNotRun",
                                           "D_SchemaLoadFailed"}))
         << "a bad `--target` must produce TARGET diagnostics alone — any "
            "front-end diagnostic here means the CU build ran before the target "
@@ -3779,7 +3822,7 @@ TEST(Program_CompileFiles, TFC74UnknownObjectFormatDiagnosedWithoutHeaderErrorCa
     // macro is defined and the ladder passes; under any other resolved format,
     // and under NO resolved format, it fires. This is the header-ladder shape
     // that produced the original 114-error cascade.
-    writeCSubsetSource(scratch.path(), "fmtgate.h",
+    writeCSource(scratch.path(), "fmtgate.h",
                        "#if defined(__arm64__)\n"
                        "#define FMT_GATE_OK 1\n"
                        "#else\n"
@@ -3788,7 +3831,7 @@ TEST(Program_CompileFiles, TFC74UnknownObjectFormatDiagnosedWithoutHeaderErrorCa
     // `FMT_GATE_OK` is load-bearing: the body does not PARSE unless the header
     // was really included AND really took the gated arm.
     auto const src =
-        writeCSubsetSource(scratch.path(), "fmtcascade.c",
+        writeCSource(scratch.path(), "fmtcascade.c",
                            "#include \"fmtgate.h\"\n"
                            "int forty_two(void) { return FMT_GATE_OK + 41; }\n");
     scratch.useAsCwd();
@@ -3800,7 +3843,7 @@ TEST(Program_CompileFiles, TFC74UnknownObjectFormatDiagnosedWithoutHeaderErrorCa
     {
         DiagnosticReporter ok{DiagnosticReporter::Config{}};
         Program            prog;
-        ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+        ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c",
                                     {"arm64:macho64-arm64-darwin"}, ok), 0)
             << "the format ladder must be SATISFIABLE by a good target spec, "
                "else the cascade assertion below proves nothing"
@@ -3820,11 +3863,18 @@ TEST(Program_CompileFiles, TFC74UnknownObjectFormatDiagnosedWithoutHeaderErrorCa
     {
         DiagnosticReporter live{DiagnosticReporter::Config{}};
         Program            prog;
-        EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+        EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c",
                                     {"arm64:elf64-aarch64-linux-exec"}, live), 1)
             << diagnosticDump(live);
+        // `D_LaterPhasesNotRun` joins the set because the unit failed at the
+        // PREPROCESSOR, so the cross-unit tiers ran for nothing — which is
+        // precisely what the notice states
+        // (D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS). The property this
+        // control asserts is unchanged: the `#error` is still the ONLY
+        // complaint about the SOURCE.
         EXPECT_EQ(diagnosticCodeSet(live),
-                  (std::set<std::string_view>{"P_PreprocessorErrorDirective"}))
+                  (std::set<std::string_view>{"D_LaterPhasesNotRun",
+                                              "P_PreprocessorErrorDirective"}))
             << "the ladder must still be gated on the OBJECT FORMAT — if this "
                "compiles clean, the gated macro is no longer format-restricted "
                "and this witness can no longer detect the cascade it exists to "
@@ -3836,7 +3886,7 @@ TEST(Program_CompileFiles, TFC74UnknownObjectFormatDiagnosedWithoutHeaderErrorCa
     DiagnosticReporter rep{DiagnosticReporter::Config{}};
     Program            prog;
     int const          rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset", {"arm64:macho64-arm64-darwn"}, rep);
+        {src.generic_string()}, "c", {"arm64:macho64-arm64-darwn"}, rep);
     EXPECT_EQ(rc, 1) << diagnosticDump(rep);
 
     // (a) the authoritative diagnostic fires, EXACTLY once — one bad format,
@@ -3850,6 +3900,7 @@ TEST(Program_CompileFiles, TFC74UnknownObjectFormatDiagnosedWithoutHeaderErrorCa
     // (b) ★ …and NOTHING ELSE accompanies it. The SET, not a count on one code.
     EXPECT_EQ(diagnosticCodeSet(rep),
               (std::set<std::string_view>{"C_InvalidFormatName",
+                                          "D_LaterPhasesNotRun",
                                           "D_SchemaLoadFailed"}))
         << "a bad `--target` FORMAT must produce FORMAT diagnostics alone — a "
            "front-end diagnostic here means the CU build ran before the format "
@@ -3929,7 +3980,7 @@ TEST(Program_CompileFiles, TFC74InvalidTargetFormatPairDiagnosedWithoutCascade) 
     // An x86_64-ONLY architecture ladder in a HEADER. A quote-`#include` is
     // what puts the `#error` genuinely behind the front-end rather than in the
     // driver's own hands — without that, half (b) is vacuous.
-    writeCSubsetSource(scratch.path(), "pairgate.h",
+    writeCSource(scratch.path(), "pairgate.h",
                        "#if defined(__x86_64__)\n"
                        "#define PAIR_GATE_OK 1\n"
                        "#else\n"
@@ -3948,7 +3999,7 @@ TEST(Program_CompileFiles, TFC74InvalidTargetFormatPairDiagnosedWithoutCascade) 
     // is untouched — `forty_two` still carries `PAIR_GATE_OK`, so the body still does
     // not parse unless the header was really included and really took the x86_64 arm.
     auto const src =
-        writeCSubsetSource(scratch.path(), "paircascade.c",
+        writeCSource(scratch.path(), "paircascade.c",
                            "#include \"pairgate.h\"\n"
                            "int forty_two(void) { return PAIR_GATE_OK + 41; }\n"
                            "int main(void) { return forty_two() - 42; }\n");
@@ -3961,7 +4012,7 @@ TEST(Program_CompileFiles, TFC74InvalidTargetFormatPairDiagnosedWithoutCascade) 
     {
         DiagnosticReporter ok{DiagnosticReporter::Config{}};
         Program            prog;
-        ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+        ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c",
                                     {"x86_64:elf64-x86_64-linux-exec"}, ok), 0)
             << "the arch ladder must be SATISFIABLE by a good (target, format) "
                "pair, else the cascade assertion below proves nothing"
@@ -3982,11 +4033,18 @@ TEST(Program_CompileFiles, TFC74InvalidTargetFormatPairDiagnosedWithoutCascade) 
     {
         DiagnosticReporter live{DiagnosticReporter::Config{}};
         Program            prog;
-        EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+        EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c",
                                     {"arm64:elf64-aarch64-linux-exec"}, live), 1)
             << diagnosticDump(live);
+        // `D_LaterPhasesNotRun` joins the set because the unit failed at the
+        // PREPROCESSOR, so the cross-unit tiers ran for nothing — which is
+        // precisely what the notice states
+        // (D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS). The property this
+        // control asserts is unchanged: the `#error` is still the ONLY
+        // complaint about the SOURCE.
         EXPECT_EQ(diagnosticCodeSet(live),
-                  (std::set<std::string_view>{"P_PreprocessorErrorDirective"}))
+                  (std::set<std::string_view>{"D_LaterPhasesNotRun",
+                                              "P_PreprocessorErrorDirective"}))
             << "the ladder must still be gated on the ARCHITECTURE and the "
                "cascade must still be reachable — if this compiles clean, this "
                "witness can no longer detect the cascade it exists to forbid"
@@ -3999,7 +4057,7 @@ TEST(Program_CompileFiles, TFC74InvalidTargetFormatPairDiagnosedWithoutCascade) 
     DiagnosticReporter rep{DiagnosticReporter::Config{}};
     Program            prog;
     int const          rc = prog.compileFiles(
-        {src.generic_string()}, "c-subset",
+        {src.generic_string()}, "c",
         {"arm64:elf64-x86_64-linux-exec"}, rep);
     EXPECT_EQ(rc, 1) << diagnosticDump(rep);
 
@@ -4015,7 +4073,8 @@ TEST(Program_CompileFiles, TFC74InvalidTargetFormatPairDiagnosedWithoutCascade) 
 
     // (b) ★ …and NOTHING ELSE accompanies it. The SET, not a count on one code.
     EXPECT_EQ(diagnosticCodeSet(rep),
-              (std::set<std::string_view>{"D_TargetMachineCodeMismatch"}))
+              (std::set<std::string_view>{"D_LaterPhasesNotRun",
+                                          "D_TargetMachineCodeMismatch"}))
         << "a mutually-invalid pair must produce PAIR diagnostics alone — a "
            "front-end diagnostic here means the CU build ran before the pair "
            "was cross-validated, which is the ordering defect this anchor "
@@ -4066,14 +4125,14 @@ TEST(Program_CompileFiles, TFC74InvalidTargetFormatPairDiagnosedWithoutCascade) 
 // targets it, which is what makes this a measurement rather than a ritual.
 TEST(Program_CompileFiles, TFC74PairCheckDedupeKeyIsTheOrderedPair) {
     ScratchDir scratch{Location::InsideRepo, "program"};
-    writeCSubsetSource(scratch.path(), "pairgate.h",
+    writeCSource(scratch.path(), "pairgate.h",
                        "#if defined(__x86_64__)\n"
                        "#define PAIR_GATE_OK 1\n"
                        "#else\n"
                        "#error architecture not supported\n"
                        "#endif\n");
     auto const src =
-        writeCSubsetSource(scratch.path(), "paircascade.c",
+        writeCSource(scratch.path(), "paircascade.c",
                            "#include \"pairgate.h\"\n"
                            "int forty_two(void) { return PAIR_GATE_OK + 41; }\n");
     scratch.useAsCwd();
@@ -4082,12 +4141,13 @@ TEST(Program_CompileFiles, TFC74PairCheckDedupeKeyIsTheOrderedPair) {
     {
         DiagnosticReporter rep{DiagnosticReporter::Config{}};
         Program            prog;
-        EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+        EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c",
                                     {"arm64:elf64-aarch64-linux-exec",
                                      "arm64:elf64-x86_64-linux-exec"}, rep), 1)
             << diagnosticDump(rep);
         EXPECT_EQ(diagnosticCodeSet(rep),
-                  (std::set<std::string_view>{"D_TargetMachineCodeMismatch"}))
+                  (std::set<std::string_view>{"D_LaterPhasesNotRun",
+                                              "D_TargetMachineCodeMismatch"}))
             << "a dedupe keyed on the TARGET would have skipped the second "
                "spec — its target was already resolved by the first — and the "
                "front-end would have run and cascaded"
@@ -4113,12 +4173,13 @@ TEST(Program_CompileFiles, TFC74PairCheckDedupeKeyIsTheOrderedPair) {
     {
         DiagnosticReporter rep{DiagnosticReporter::Config{}};
         Program            prog;
-        EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+        EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c",
                                     {"arm64:elf64-aarch64-linux-exec",
                                      "x86_64:elf64-aarch64-linux-exec"}, rep), 1)
             << diagnosticDump(rep);
         EXPECT_EQ(diagnosticCodeSet(rep),
-                  (std::set<std::string_view>{"D_TargetMachineCodeMismatch"}))
+                  (std::set<std::string_view>{"D_LaterPhasesNotRun",
+                                              "D_TargetMachineCodeMismatch"}))
             << "a dedupe keyed on the FORMAT would have skipped the second "
                "spec — its format was already checked by the first — and the "
                "front-end would have run and cascaded"

@@ -1,10 +1,10 @@
 // ML5 cycle 3a — MIR→LIR isel vertical slice tests.
-// Drives the full c-subset → CST → HIR → MIR → LIR pipeline on minimal
+// Drives the full c → CST → HIR → MIR → LIR pipeline on minimal
 // straight-line functions (Arg/Const/Add/Sub/Return) and pins the
 // per-opcode lowering shape against the shipped x86_64 target schema.
 //
-// Same harness style as `tests/mir/test_mir_lowering_c_subset.cpp`: one
-// `lowerCSubsetToLir(src)` helper threads each phase's diagnostics so
+// Same harness style as `tests/mir/test_mir_lowering_c.cpp`: one
+// `lowerCToLir(src)` helper threads each phase's diagnostics so
 // assertions can disambiguate which layer flagged a failure.
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
@@ -61,11 +61,11 @@ struct Lowered {
     MirToLirResult                   lir;
 };
 
-[[nodiscard]] Lowered lowerCSubsetToLir(
+[[nodiscard]] Lowered lowerCToLir(
         std::string src,
         std::shared_ptr<TargetSchema> customTarget = nullptr) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    auto loaded = GrammarSchema::loadShipped("c");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
     UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
@@ -97,7 +97,19 @@ struct Lowered {
                                     /*volatileMap=*/nullptr,
                                     &hir->alignmentMap,    // VLA C1b over-align gate
                                     /*threadLocalMap=*/nullptr,
-                                    &hir->vlaSizeExprBySymbol);   // VLA C1a
+                                    &hir->vlaSizeExprBySymbol,   // VLA C1a
+                                    /*sizeofVlaSymMap=*/nullptr,
+                                    /*typedefVlaOriginMap=*/nullptr,
+                                    /*synthRecipeMap=*/nullptr,
+                                    /*returnsTwiceMap=*/nullptr,
+                                    /*noInlineMap=*/nullptr,
+                                    /*alwaysInlineMap=*/nullptr,
+                                    /*noOptimizeMap=*/nullptr,
+                                    /*noSanitizeThreadMap=*/nullptr,
+                                    /*inlineAsmPool=*/nullptr,
+                                    /*inlineDefinitionMap=*/nullptr,
+                                    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED
+                                    &hir->enclosingFunctionMap);
     DiagnosticReporter lirReporter;
     auto lir = lowerToLir(mir.mir, *tgt, model.lattice().interner(), lirReporter);
     return Lowered{
@@ -132,7 +144,7 @@ TEST(MirToLir, StraightLineAddLowersToLirAddSequence) {
     // The reference vertical slice. `int add(int a, int b) { return a+b; }`
     // → MIR { Arg(0), Arg(1), Add(%0,%1), Return(%2) }
     // → LIR { arg(payload=0), arg(payload=1), add(%0,%1), ret(%2) }.
-    auto L = lowerCSubsetToLir("int add(int a, int b) { return a + b; }");
+    auto L = lowerCToLir("int add(int a, int b) { return a + b; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok)
         << "LIR lowering: " << (L.lirReporter.all().empty()
@@ -168,7 +180,7 @@ TEST(MirToLir, ConstReturnLowersToMovRet) {
     // `int forty_two() { return 42; }`
     // → MIR { Const(42), Return(%0) }
     // → LIR { mov vN, 42 ; ret vN }.
-    auto L = lowerCSubsetToLir("int forty_two() { return 42; }");
+    auto L = lowerCToLir("int forty_two() { return 42; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok);
 
@@ -198,7 +210,7 @@ TEST(MirToLir, ConstReturnLowersToMovRet) {
 
 TEST(MirToLir, SubReturnLowersThreeInstructions) {
     // `int s(int a, int b) { return a - b; }` → 4 LIR insts: arg, arg, sub, ret.
-    auto L = lowerCSubsetToLir("int s(int a, int b) { return a - b; }");
+    auto L = lowerCToLir("int s(int a, int b) { return a - b; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok);
 
@@ -212,7 +224,7 @@ TEST(MirToLir, SubReturnLowersThreeInstructions) {
 }
 
 TEST(MirToLir, ReturnVoidLowersToBareRet) {
-    auto L = lowerCSubsetToLir("void noop() { return; }");
+    auto L = lowerCToLir("void noop() { return; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok);
 
@@ -228,7 +240,7 @@ TEST(MirToLir, ReturnVoidLowersToBareRet) {
 TEST(MirToLir, MultipleFunctionsEachIsolatedVRegSpace) {
     // Two functions must each restart at vreg 1; the per-function reset of
     // `valueToReg` + the builder's nextVReg counter prevents cross-pollution.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int a(int x) { return x; }\n"
         "int b(int y) { return y; }\n");
     assertUpstreamClean(L);
@@ -247,7 +259,7 @@ TEST(MirToLir, MultipleFunctionsEachIsolatedVRegSpace) {
 }
 
 TEST(MirToLir, MulReturnLowersThreeInstructions) {
-    auto L = lowerCSubsetToLir("int m(int a, int b) { return a * b; }");
+    auto L = lowerCToLir("int m(int a, int b) { return a * b; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok);
 
@@ -259,7 +271,7 @@ TEST(MirToLir, MulReturnLowersThreeInstructions) {
 }
 
 // D-CSUBSET-DIVISION-OP-CODEGEN (cycle 10r split, 2026-06-04): signed
-// divide. c-subset has only signed int/long → `/` lowers via
+// divide. c has only signed int/long → `/` lowers via
 // HirOpKind::Div → MirOpcode::SDiv → LIR MnemonicSlot::{SDivPre,
 // SDivCore} → the x86 `cqo` + `idiv_op` opcodes (REX.W 0x99 CQO
 // sign-extends RAX into RDX:RAX; REX.W 0xF7 /7 IDIV divides
@@ -274,7 +286,7 @@ TEST(MirToLir, MulReturnLowersThreeInstructions) {
 // overridden by the embedded second 0x48, losing REX.B for
 // high-reg divisors → silent miscompile + STATUS_INTEGER_DIVIDE_BY_ZERO.
 TEST(MirToLir, SignedDivisionLowersToCqoPlusIDiv) {
-    auto L = lowerCSubsetToLir("int q(int a, int b) { return a / b; }");
+    auto L = lowerCToLir("int q(int a, int b) { return a / b; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok);
 
@@ -334,7 +346,7 @@ TEST(MirToLir, SignedDivisionLowersToCqoPlusIDiv) {
 // with a UDiv inst MUST lower to the udiv pre+core slots
 // (xor_rdx_zero + div_op = XOR EDX,EDX zero-extend + DIV /6) and
 // NOT to the sdiv pre+core slots (cqo + idiv_op = CQO sign-extend
-// + IDIV /7). c-subset has no unsigned source today, so this test
+// + IDIV /7). c has no unsigned source today, so this test
 // uses a hand-built MIR fixture to exercise the UDiv arm directly.
 // Routing UDiv through SDivCore would pass any high-bit-set
 // dividend with the wrong sign interpretation (silent miscompile).
@@ -484,7 +496,7 @@ TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
 // (runtime witness = the qemu-arm64 default-PIE gcc link of the abs .o).
 TEST(MirToLir, GotExternAddrValueEmitsGotMacroNotAbsoluteLea) {
     TypeInterner interner{CompilationUnitId{1}};
-    TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+    TypeId const ptrT = interner.pointer(interner.primitive(TypeKind::Void));
     // `void* f(void) { return &abs; }` — GlobalAddr(abs) used as a VALUE
     // (its sole use is the Return, so neither the direct-call fold nor the
     // riprel-load fold fires; the value-form GOT arm is reached).
@@ -564,7 +576,7 @@ TEST(MirToLir, GotExternAddrValueEmitsGotMacroNotAbsoluteLea) {
 // regression that fired the GOT arm unconditionally would flip this red.
 TEST(MirToLir, NoExternAddrBindingKeepsAbsoluteLeaForExternValue) {
     TypeInterner interner{CompilationUnitId{1}};
-    TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+    TypeId const ptrT = interner.pointer(interner.primitive(TypeKind::Void));
     TypeId const callerSig =
         interner.fnSig(std::span<TypeId const>{}, ptrT, CallConv::CcSysV);
     MirBuilder mb;
@@ -628,8 +640,8 @@ TEST(MirToLir, NoExternAddrBindingKeepsAbsoluteLeaForExternValue) {
 namespace {
 
 // Hand-built single-function MIR `fn(i32, i32) -> i32 { return OP(a, b); }`
-// — the UDiv-test pattern (c-subset has no unsigned / the arm64 target has
-// no c-subset front-end dependency here, so hand-built MIR exercises the
+// — the UDiv-test pattern (c has no unsigned / the arm64 target has
+// no c front-end dependency here, so hand-built MIR exercises the
 // lowering arm directly on any target schema).
 [[nodiscard]] Mir buildBinFnMir(MirOpcode op, TypeInterner& interner) {
     TypeId const i32 = interner.primitive(TypeKind::I32);
@@ -668,7 +680,7 @@ singlePhysRegOperand(Lir const& lir, LirInstId inst) {
 // quotient/remainder flip (the silent-miscompile class the role map
 // kills) makes this test red.
 TEST(MirToLir, SignedModuloLowersToCqoIdivWithRemainderCapture) {
-    auto L = lowerCSubsetToLir("int m(int a, int b) { return a % b; }");
+    auto L = lowerCToLir("int m(int a, int b) { return a % b; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok)
         << "LIR lowering: " << (L.lirReporter.all().empty()
@@ -1369,7 +1381,7 @@ TEST(MirToLir, MissingInputRolesFailsLoudOnDivLowering) {
 namespace {
 
 // fn(int* p) -> int { return AtomicLoad(p, order); }  — a hand-built MIR that
-// exercises the AtomicLoad lowering arm directly (the c-subset front-end emits
+// exercises the AtomicLoad lowering arm directly (the c front-end emits
 // only seq_cst plain-access atomics; explicit per-order builtins are Phase D).
 [[nodiscard]] Mir buildAtomicLoadFnMir(std::uint32_t order, TypeInterner& interner) {
     TypeId const i32  = interner.primitive(TypeKind::I32);
@@ -1912,7 +1924,7 @@ TEST(MirToLir, MissingCountRoleFailsLoudOnShiftLowering) {
 }
 
 // Cycle 3a wide-literal coverage (>INT32_MAX) is deferred to cycle 3b's
-// synthetic-MIR helper — the c-subset semantic phase rejects out-of-range
+// synthetic-MIR helper — the c semantic phase rejects out-of-range
 // literals before they reach the LIR lowerer, so we can't exercise the
 // `fits == false` branch via an end-to-end pipeline yet. The branch
 // itself is live code; cycle 3b will land literal-pool wiring + a
@@ -1941,7 +1953,7 @@ TEST(MirToLir, RequiredLirOpcodeMissingFailsLoud) {
 
     // Drive MIR for `int f() { return 1; }`. The Const → mov path will hit
     // the missing-opcode branch.
-    auto L = lowerCSubsetToLir("int f() { return 1; }");
+    auto L = lowerCToLir("int f() { return 1; }");
     assertUpstreamClean(L);
 
     DiagnosticReporter rep;
@@ -2082,7 +2094,7 @@ TEST(MirToLir, IfElseLowersToCondBrChain) {
     // join. Cycle 3b's "lower each MIR op naively" approach (no
     // ICmp+CondBr peephole) is asserted here so the optimizer can later
     // delete the redundant cmp/setcc.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int sign(int x) { if (x > 0) return 1; return 0; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok)
@@ -2138,7 +2150,7 @@ TEST(MirToLir, SignedICmpVariantsLowerWithCorrectSetccPayload) {
     for (auto const& [op, expectedCond] : cases) {
         std::string src = std::string{"int f(int a, int b) { if (a "} +
                           op + " b) return 1; return 0; }";
-        auto L = lowerCSubsetToLir(src);
+        auto L = lowerCToLir(src);
         assertUpstreamClean(L);
         ASSERT_TRUE(L.lir.ok) << "ICmp `" << op << "` must lower cleanly";
         // Find the entry-block setcc and read its payload — pins the
@@ -2174,7 +2186,7 @@ TEST(MirToLir, CondBrFusesIcmpConditionIntoJccPayload) {
     // The non-fusable arm (cond from a non-ICmp source) keeps the
     // existing cmp-against-0 + jcc-Ne path; covered by the
     // CondBrJccPayloadIsNeForNonIcmpCond test below.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int sign(int x) { if (x > 0) return 1; return 0; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok);
@@ -2191,7 +2203,7 @@ TEST(MirToLir, CondBrFusesIcmpConditionIntoJccPayload) {
 }
 
 TEST(MirToLir, TernaryProducesPhiResolutionMoves) {
-    // c-subset's `?:` lowers to a MIR Phi at the join block (per
+    // c's `?:` lowers to a MIR Phi at the join block (per
     // hir_to_mir.cpp). The cycle-3b phi resolution must emit `mov` at
     // each predecessor BEFORE its terminator, writing the per-arm value
     // into the phi's pre-allocated vreg.
@@ -2200,7 +2212,7 @@ TEST(MirToLir, TernaryProducesPhiResolutionMoves) {
     // (cst_to_hir's coerceCondition — it used to be a Cast the LIR tier
     // could not lower), which the CondBr fusion machinery handles — so
     // the WHOLE function now lowers cleanly and `L.lir.ok` is required.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int c) { return c ? 1 : 2; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok)
@@ -2241,7 +2253,7 @@ TEST(MirToLir, TernaryProducesPhiResolutionMoves) {
 }
 
 TEST(MirToLir, SwitchLowersToCascadingCompares) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int x) {\n"
         "  switch (x) {\n"
         "    case 1: return 10;\n"
@@ -2251,7 +2263,7 @@ TEST(MirToLir, SwitchLowersToCascadingCompares) {
         "}\n");
     assertUpstreamClean(L);
     // Switch lowering uses Alloca/Load/Store for the discriminant only
-    // when c-subset's semantic phase actually materializes one; for a
+    // when c's semantic phase actually materializes one; for a
     // raw `switch (x)` over a param the MIR may or may not have a
     // store-then-load. Either way the cycle 3b lowerer must produce the
     // cascading compares. `ok` may be false if the discriminant path
@@ -2290,7 +2302,7 @@ TEST(MirToLir, LocalVariableLowersAllocaLoadStore) {
     // memory triad: Alloca + Store + Load + Return. The function uses
     // ALL three new memory opcodes plus the existing cycle-3a/3b
     // mov/ret. After cycle 3c this fully lowers.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f() { int x = 42; return x; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok)
@@ -2321,7 +2333,7 @@ TEST(MirToLir, StoreEmitsCorrectOperandShape) {
     // MemOffset]. A regression dropping the MemBase/MemOffset operands
     // or swapping value/base order would silently produce broken
     // addressing-mode encoding downstream.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f() { int x = 7; return x; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok);
@@ -2363,7 +2375,7 @@ TEST(MirToLir, EnumPackedFieldMemoryAccessIsWidthExactToUnderlying) {
     // is I32-underlying (4 bytes) — a packed memory access whose width MUST be
     // exact (a scalar enum LOCAL would sit in its own >=8-byte slot and mask a
     // regression, so the through-pointer access is the load-bearing form).
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "enum E { Z, A }; "
         "int f(enum E* p) { *p = A; return (int)*p; }");
     assertUpstreamClean(L);
@@ -2409,7 +2421,7 @@ TEST(MirToLir, AllocaResultIsAddressableViaStore) {
     // `lea_frame_slot` re-reference of the local's slot, index 0 for the sole
     // local); a regression that reverted to caching one entry-spanning alloca
     // address vreg, or threaded the wrong slot index, surfaces here.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f() { int x; x = 1; return x; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok);
@@ -2462,7 +2474,7 @@ TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
     // route through the LirLiteralPool. The mov inst's operand carries
     // kind=LiteralIndex pointing at the pool entry.
     //
-    // c-subset doesn't naturally produce wide MIR Const (semantics
+    // c doesn't naturally produce wide MIR Const (semantics
     // rejects int literals > INT32_MAX), so we build MIR directly via
     // the synthetic-MIR helper. This pins the wide-literal cycle-3c
     // gap the cycle-3a/3b tests couldn't reach end-to-end.
@@ -2780,8 +2792,11 @@ TEST_P(MirToLirCastMapping, EmitsExpectedMnemonicAndRegClass) {
 
     // Synthetic MIR: single src-typed arg → cast → return dst-typed value.
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const srcT = interner.primitive(param.srcKind);
-    auto const dstT = interner.primitive(param.dstKind);
+    // D-TEST-LIR-AND-LINK-SUITES-MINT-AN-OPERAND-LESS-PTR: the IntToPtr /
+    // PtrToInt / Bitcast rows name `Ptr`, which is structural — the ONE resolver
+    // in `synthetic_fn.hpp` builds the opaque `void*` the row means.
+    auto const srcT = ::dss::test_support::probeTypeOfKind(interner, param.srcKind);
+    auto const dstT = ::dss::test_support::probeTypeOfKind(interner, param.dstKind);
     std::array<::dss::TypeId, 1> params{srcT};
     auto const fnSig = interner.fnSig(params, dstT, ::dss::CallConv::CcSysV);
 
@@ -2846,10 +2861,165 @@ INSTANTIATE_TEST_SUITE_P(
         CastCase{::dss::MirOpcode::FPTrunc,  "fpcvt",    ::dss::TypeKind::F64, ::dss::TypeKind::F32, LirRegClass::FPR},
         CastCase{::dss::MirOpcode::FPExt,    "fpcvt",    ::dss::TypeKind::F32, ::dss::TypeKind::F64, LirRegClass::FPR},
         CastCase{::dss::MirOpcode::FPToSI,   "fp_to_si", ::dss::TypeKind::F64, ::dss::TypeKind::I64, LirRegClass::GPR},
-        CastCase{::dss::MirOpcode::FPToUI,   "fp_to_ui", ::dss::TypeKind::F64, ::dss::TypeKind::I64, LirRegClass::GPR},
-        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp", ::dss::TypeKind::I64, ::dss::TypeKind::F64, LirRegClass::FPR},
-        CastCase{::dss::MirOpcode::UIToFP,   "ui_to_fp", ::dss::TypeKind::I64, ::dss::TypeKind::F64, LirRegClass::FPR}
+        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp", ::dss::TypeKind::I64, ::dss::TypeKind::F64, LirRegClass::FPR}
+        // ⚠ FPToUI and UIToFP USED TO SIT HERE, asserting that each emits ONE
+        // LIR instruction of the same-named opcode. On x86_64 that assertion
+        // was TRUE AND THE BUG: the same-named opcode carried the SIGNED
+        // converter's bytes, so the row pinned the miscompile in place. They
+        // move to `UnsignedFloatConversionsEmitTheDeclaredSequence` below,
+        // which states MORE than these rows did — see its docblock
+        // (D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE).
     ));
+
+// ─── D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE ────
+//
+// The two unsigned int↔float conversions no longer map 1:1 to a single LIR
+// opcode on every target, because on x86-64 there IS no single instruction:
+// SSE2 has only the SIGNED converters. What replaced the two `AllCastVariants`
+// rows is deliberately NOT "whatever the config says", which would be a guard
+// reading the file it guards and would pass under every mutation of it. These
+// expectations are an INDEPENDENT restatement of the intended lowering:
+//
+//   * arm64 must emit the UNSIGNED converter and exactly one of it. Pointing
+//     the declared step at `si_to_fp`/`fp_to_si` — the precise shape of the
+//     x86 defect — turns this red.
+//   * x86_64 must emit NEITHER `ui_to_fp` NOR `fp_to_ui` (they have no
+//     encoding any more, and emitting one would be the old lie), must produce
+//     its result from the final combining instruction, and must contain the
+//     specific working parts of the branchless expansion. Restoring either
+//     single-instruction encoding block turns this red.
+//
+// The VALUE-level proof lives in
+// examples/c/unsigned_float_conversion_full_range, which runs on both
+// targets and compares against gcc-13/clang-19-agreed constants; this test's
+// job is to make a lowering regression surface at unit level too.
+namespace {
+
+// Every LIR opcode emitted into the function's entry block, in order.
+[[nodiscard]] std::vector<std::uint16_t>
+entryBlockOpcodes(::dss::Lir const& lir) {
+    std::vector<std::uint16_t> out;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        out.push_back(lir.instOpcode(lir.blockInstAt(entry, i)));
+    }
+    return out;
+}
+
+[[nodiscard]] std::size_t
+countOf(std::vector<std::uint16_t> const& ops, std::uint16_t op) {
+    std::size_t n = 0;
+    for (auto const o : ops) if (o == op) ++n;
+    return n;
+}
+
+// Lower `argKind -> mirOp -> resultKind` on the named shipped target.
+struct LoweredCast {
+    ::dss::Lir                 lir;
+    std::vector<std::uint16_t> ops;
+};
+[[nodiscard]] LoweredCast
+lowerOneCast(::dss::TargetSchema const& sch, ::dss::MirOpcode mirOp,
+             ::dss::TypeKind srcKind, ::dss::TypeKind dstKind) {
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const srcT = ::dss::test_support::probeTypeOfKind(interner, srcKind);
+    auto const dstT = ::dss::test_support::probeTypeOfKind(interner, dstKind);
+    std::array<::dss::TypeId, 1> params{srcT};
+    auto const fnSig = interner.fnSig(params, dstT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const argInst = mb.addArg(0, srcT);
+    std::array<::dss::MirInstId, 1> castOps{argInst};
+    mb.addReturn(mb.addInst(mirOp, castOps, dstT));
+    ::dss::Mir m = std::move(mb).finish();
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, sch, interner, rep);
+    EXPECT_TRUE(result.ok);
+    LoweredCast out{std::move(result.lir), {}};
+    out.ops = entryBlockOpcodes(out.lir);
+    return out;
+}
+
+} // namespace
+
+TEST(MirToLir, UnsignedFloatConversionsEmitTheDeclaredSequence) {
+    // ── arm64: the ONE-STEP declaration, and it must name the UNSIGNED form.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("arm64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        auto const uiToFp = *sch.opcodeByMnemonic("ui_to_fp");
+        auto const siToFp = *sch.opcodeByMnemonic("si_to_fp");
+        auto const fpToUi = *sch.opcodeByMnemonic("fp_to_ui");
+        auto const fpToSi = *sch.opcodeByMnemonic("fp_to_si");
+
+        auto const u2f = lowerOneCast(sch, ::dss::MirOpcode::UIToFP,
+                                      ::dss::TypeKind::U64, ::dss::TypeKind::F64);
+        EXPECT_EQ(countOf(u2f.ops, uiToFp), 1u)
+            << "arm64 UIToFP must emit exactly one UCVTF (`ui_to_fp`)";
+        EXPECT_EQ(countOf(u2f.ops, siToFp), 0u)
+            << "arm64 UIToFP must NOT reach for the SIGNED SCVTF — that "
+               "substitution is precisely the x86 defect this cycle removed";
+
+        auto const f2u = lowerOneCast(sch, ::dss::MirOpcode::FPToUI,
+                                      ::dss::TypeKind::F64, ::dss::TypeKind::U64);
+        EXPECT_EQ(countOf(f2u.ops, fpToUi), 1u)
+            << "arm64 FPToUI must emit exactly one FCVTZU (`fp_to_ui`)";
+        EXPECT_EQ(countOf(f2u.ops, fpToSi), 0u)
+            << "arm64 FPToUI must NOT reach for the SIGNED FCVTZS";
+    }
+
+    // ── x86_64: the branchless expansion, and NO unsigned-converter lie.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        auto const uiToFp = *sch.opcodeByMnemonic("ui_to_fp");
+        auto const fpToUi = *sch.opcodeByMnemonic("fp_to_ui");
+
+        // Neither pseudo-opcode may carry an encoding any more: an encoding on
+        // either one IS the claim that x86-64 has an unsigned converter.
+        EXPECT_TRUE(sch.opcodeInfo(uiToFp)->encoding.variants.empty())
+            << "x86_64 `ui_to_fp` must declare NO encoding — SSE2 has no "
+               "unsigned int->float instruction to encode";
+        EXPECT_TRUE(sch.opcodeInfo(fpToUi)->encoding.variants.empty())
+            << "x86_64 `fp_to_ui` must declare NO encoding — SSE2 has no "
+               "float->unsigned instruction to encode";
+
+        auto const u2f = lowerOneCast(sch, ::dss::MirOpcode::UIToFP,
+                                      ::dss::TypeKind::U64, ::dss::TypeKind::F64);
+        EXPECT_EQ(countOf(u2f.ops, uiToFp), 0u)
+            << "x86_64 UIToFP must not emit the encodingless `ui_to_fp`";
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("si_to_fp")), 2u)
+            << "the u64->double expansion converts the low and high halves "
+               "SEPARATELY — each fits the signed window exactly";
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("zext")), 1u);
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("shr_l")), 1u);
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("movq_gpr_to_xmm")), 1u);
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("fmul")), 1u);
+        ASSERT_GE(u2f.ops.size(), 2u);
+        EXPECT_EQ(u2f.ops[u2f.ops.size() - 2],
+                  *sch.opcodeByMnemonic("fadd"))
+            << "the value is produced by the single correctly-rounded add of "
+               "two exactly-representable halves";
+
+        auto const f2u = lowerOneCast(sch, ::dss::MirOpcode::FPToUI,
+                                      ::dss::TypeKind::F64, ::dss::TypeKind::U64);
+        EXPECT_EQ(countOf(f2u.ops, fpToUi), 0u)
+            << "x86_64 FPToUI must not emit the encodingless `fp_to_ui`";
+        EXPECT_EQ(countOf(f2u.ops, *sch.opcodeByMnemonic("fp_to_si")), 2u)
+            << "the double->u64 expansion truncates x AND x-2^63, then selects";
+        EXPECT_EQ(countOf(f2u.ops, *sch.opcodeByMnemonic("fsub")), 1u);
+        EXPECT_EQ(countOf(f2u.ops, *sch.opcodeByMnemonic("shr_a")), 1u)
+            << "the selection mask is an ARITHMETIC shift of the signed "
+               "truncation — no compare and no condition code";
+        EXPECT_EQ(countOf(f2u.ops, *sch.opcodeByMnemonic("and")), 1u);
+        ASSERT_GE(f2u.ops.size(), 2u);
+        EXPECT_EQ(f2u.ops[f2u.ops.size() - 2], *sch.opcodeByMnemonic("or"));
+    }
+}
 
 TEST(MirToLir, GepDynamicIndexEmitsFourOperandLea) {
     // Cycle 3d added a 2-operand Gep case emitting
@@ -2862,7 +3032,7 @@ TEST(MirToLir, GepDynamicIndexEmitsFourOperandLea) {
     auto const& sch = **target;
 
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const i64  = interner.primitive(::dss::TypeKind::I64);
     std::array<::dss::TypeId, 2> params{ptrT, i64};
     auto const fnSig = interner.fnSig(params, ptrT, ::dss::CallConv::CcSysV);
@@ -3001,7 +3171,7 @@ TEST(MirToLir, PhiResolutionUsesFprClassForFloatPhi) {
 //
 // returned n (5) instead of n-1 (4), because the back edge's `phi = i+1` copies
 // ran on the way OUT of the loop, where the exit block still reads the phi.
-// `examples/c-subset/dowhile_lagging_capture` is the runtime witness (exit 11
+// `examples/c/dowhile_lagging_capture` is the runtime witness (exit 11
 // instead of 42); this is the LIR-shape pin for the same defect, built directly
 // on MIR so no optimizer pass has to cooperate to produce the phi.
 //
@@ -3115,7 +3285,7 @@ TEST(MirToLir, WideLiteralStringRoutesThroughLiteralPool) {
     auto const& sch = **target;
 
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const ptrT  = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT  = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const fnSig = interner.fnSig(std::span<::dss::TypeId const>{}, ptrT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
     ::dss::MirLiteralValue lv;
@@ -3500,9 +3670,9 @@ TEST(MirToLir, F64FpToSiWithI32ResultKeepsSourceWidth64) {
 
 TEST(MirToLir, DirectCallEmitsCallOpcode) {
     // Cycle-3e Call lowering: GlobalAddr → mov(symbolRef); Call(callee,
-    // args...) → call(callee_reg, arg_regs...). c-subset's `g() { f(); }`
+    // args...) → call(callee_reg, arg_regs...). c's `g() { f(); }`
     // emits this MIR shape.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int x) { return x; }\n"
         "int g(int y) { return f(y); }\n");
     assertUpstreamClean(L);
@@ -3576,7 +3746,7 @@ TEST(MirToLir, ExternCallEmitsCallIndirectViaExternOpcode) {
 
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
     auto const i32   = interner.primitive(::dss::TypeKind::I32);
-    auto const ptrT  = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT  = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const externSig = interner.fnSig(
         std::array<::dss::TypeId const, 1>{ptrT}, i32,
         ::dss::CallConv::CcMS64);
@@ -3709,7 +3879,7 @@ lowerStdExternFixture(::dss::TargetSchema const& sch,
                       ::dss::CallConv cc = ::dss::CallConv::CcMS64) {
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
     auto const i32  = interner.primitive(::dss::TypeKind::I32);
-    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const internalSig = interner.fnSig(
         std::span<::dss::TypeId const>{}, i32, cc);
 
@@ -3853,7 +4023,7 @@ TEST(MirToLir, NoExternImportsAllCallsLowerAsDirectCall) {
     // Inverse of the above: with `externImports={}` the lowerer must
     // NOT mis-classify ANY call as extern. Every call lowers as the
     // direct `call` opcode.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int g(int a) { return a; }\n"
         "int f(int x) { return g(x); }\n");
     assertUpstreamClean(L);
@@ -3889,7 +4059,7 @@ TEST(MirToLir, NoExternImportsAllCallsLowerAsDirectCall) {
 TEST(MirToLir, VoidCallProducesNoResultReg) {
     // A call to a void-returning function has no result vreg. Pin that
     // the LIR `call` inst's result is InvalidLirReg.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "void noop() {}\n"
         "void main_() { noop(); }\n");
     assertUpstreamClean(L);
@@ -3908,15 +4078,15 @@ TEST(MirToLir, VoidCallProducesNoResultReg) {
     ADD_FAILURE() << "no call inst found";
 }
 
-TEST(LirVerifier, AcceptsCleanCSubsetPipelines) {
-    // Smoke test: every c-subset corpus example that lowers cleanly
+TEST(LirVerifier, AcceptsCleanCPipelines) {
+    // Smoke test: every c corpus example that lowers cleanly
     // through cycles 3a-3e must also pass the LirVerifier without
     // any new diagnostics. This is the regression-lock for the
     // "vreg-class-vs-MIR-type consistency" rule the cycle-3d review
     // surfaced — a future regression to the cycle-3d FPR-class
     // plumbing fixes would now fail the verifier even if the unit
     // tests didn't catch it.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int add(int a, int b) { return a + b; }\n"
         "int sign(int x) { if (x > 0) return 1; return 0; }\n");
     assertUpstreamClean(L);
@@ -3927,7 +4097,7 @@ TEST(LirVerifier, AcceptsCleanCSubsetPipelines) {
                                     L.model.lattice().interner(),
                                     *L.target, L.lir.lirToMir, rep);
     EXPECT_TRUE(r.ok)
-        << "LirVerifier must accept a clean cycle-3a-3d c-subset pipeline";
+        << "LirVerifier must accept a clean cycle-3a-3d c pipeline";
 }
 
 // ─── cycle 3e fix-up: aggregate ops + IntrinsicCall + verifier negatives ──
@@ -3938,7 +4108,7 @@ TEST(MirToLir, ExtractValueZeroIndexLowersToLoad) {
     auto const& sch = **target;
 
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const i32  = interner.primitive(::dss::TypeKind::I32);
     std::array<::dss::TypeId, 1> params{ptrT};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
@@ -3979,7 +4149,7 @@ TEST(MirToLir, ExtractValueNonZeroIndexDefersWithDiagnostic) {
     auto const& sch = **target;
 
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const i32  = interner.primitive(::dss::TypeKind::I32);
     std::array<::dss::TypeId, 1> params{ptrT};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
@@ -4020,7 +4190,7 @@ TEST(MirToLir, ExtractValueZeroIndexAcceptsUintLiteralVariant) {
     ASSERT_TRUE(target.has_value());
     auto const& sch = **target;
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const i32  = interner.primitive(::dss::TypeKind::I32);
     std::array<::dss::TypeId, 1> params{ptrT};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
@@ -4091,9 +4261,9 @@ TEST(LirVerifier, FiresOnSwitchBearingFunctionsAfterMapPlumbing) {
     //
     // The fix-up plumbs a `lirToMir` mapping through MirToLirResult;
     // the verifier walks LIR insts and uses the mapping per-inst.
-    // This test pins: even a switch-bearing c-subset function passes
+    // This test pins: even a switch-bearing c function passes
     // the verifier WITHOUT being silently skipped.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int x) {\n"
         "  switch (x) {\n"
         "    case 1: return 10;\n"
@@ -4140,14 +4310,14 @@ TEST(MirToLir, WhileLoopLowersWithBackEdge) {
     // value when used) + a back-edge from the latch. Phi resolution must
     // insert a `mov` at the latch BEFORE its jmp back to the header.
     //
-    // c-subset model: `while (i < n) { i = i + 1; }` lowers (via ML2's
+    // c model: `while (i < n) { i = i + 1; }` lowers (via ML2's
     // alloca-backed locals model) to header-cmp + body-add + back-edge.
     // The latch's terminator is a jmp; Phi resolution emits `mov` before
     // it. Cycle 3a's alloca-backed model means there may not be a literal
     // MIR Phi here (the loop carries via Load/Store), but the CFG with
     // back-edge must still produce a valid LIR with a jmp terminator on
     // the latch.
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int sum(int n) {\n"
         "  int s = 0;\n"
         "  while (s < n) s = s + 1;\n"
@@ -4348,7 +4518,7 @@ TEST(MirToLir, U32CompareLowersWithThirtyTwoBitCmpWidth) {
 // `int x = a - b; if (x < 0)` (a cmp64 reads 0x00000000FFFFFFxx as
 // POSITIVE) while the value-path width pins stay green — the highest-
 // traffic compare shape in C. Runtime witness:
-// examples/c-subset/fused_negative_compare (42 ↔ 7 exit divergence).
+// examples/c/fused_negative_compare (42 ↔ 7 exit divergence).
 // The shape below makes the CondBr the ICmpSlt's ONLY consumer, so the
 // fusion precondition holds; the jcc payload carrying Slt (not the
 // non-fused arm's Ne) PROVES the fusion arm actually fired.
@@ -4484,8 +4654,12 @@ namespace {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     EXPECT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const srcTy = interner.primitive(src);
-    auto const dstTy = interner.primitive(dst);
+    // D-TEST-LIR-AND-LINK-SUITES-MINT-AN-OPERAND-LESS-PTR: three `CastCase` rows
+    // below name `Ptr` as a src or dst kind (IntToPtr / PtrToInt / Bitcast), and
+    // `primitive(TypeKind::Ptr)` would mint a pointer with NO pointee. The ONE
+    // resolver in `synthetic_fn.hpp` builds what the row means.
+    auto const srcTy = ::dss::test_support::probeTypeOfKind(interner, src);
+    auto const dstTy = ::dss::test_support::probeTypeOfKind(interner, dst);
     std::array<::dss::TypeId, 1> params{srcTy};
     auto const fnSig = interner.fnSig(params, dstTy, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
@@ -4616,7 +4790,7 @@ TEST(MirToLir, SExtFromI16AndI32SourcesBothRealized) {
 // ─── D-CSUBSET-CHAR-STRING-VALUE-CODEGEN + D-CSUBSET-CHAR-INT-WIDENING ───
 // The width-flag pins for `char` value codegen. Each is RED-ON-DISABLE on a
 // specific derivation in mir_to_lir.cpp; together with the byte-encoding
-// (tests/asm) and the runtime corpus (examples/c-subset/char_value), they
+// (tests/asm) and the runtime corpus (examples/c/char_value), they
 // cover the char byte forms flag → bytes → exit end-to-end. Width flags are
 // target-blind (set in MIR→LIR), so x86_64 is a sufficient witness here.
 
@@ -4753,15 +4927,15 @@ TEST(MirToLir, CharConstMaterializesAtPromotedWidthNotByte) {
     }
 }
 
-TEST(MirToLir, CSubsetSourceTypesThreadWidthToLirFlags) {
-    // SOURCE-tier width-threading pin: the c-subset front end's
+TEST(MirToLir, CSourceTypesThreadWidthToLirFlags) {
+    // SOURCE-tier width-threading pin: the c front end's
     // `unsigned int`/`int` (32-bit) vs `long long` (64-bit) typing
     // must arrive at the LIR width flag — composing with the byte
     // pins (tests/asm/test_asm_width_axis.cpp: flag → bytes) and the
     // runtime corpus (u32_wraparound: program → exit), this covers
     // source → bytes end-to-end.
     {
-        auto L = lowerCSubsetToLir(
+        auto L = lowerCToLir(
             "unsigned int f(unsigned int a, unsigned int b) "
             "{ return a + b; }");
         assertUpstreamClean(L);
@@ -4773,7 +4947,7 @@ TEST(MirToLir, CSubsetSourceTypesThreadWidthToLirFlags) {
         // Plain `int` now ALSO computes at 32 bits — true C int
         // semantics (the c1 64-wide exemption was conforming via
         // signed-overflow UB; the 32-bit forms are exact).
-        auto L = lowerCSubsetToLir(
+        auto L = lowerCToLir(
             "int g(int a, int b) { return a + b; }");
         assertUpstreamClean(L);
         auto const w = widthsOfMnemonic(L.lir.lir, *L.target, "add");
@@ -4781,7 +4955,7 @@ TEST(MirToLir, CSubsetSourceTypesThreadWidthToLirFlags) {
         EXPECT_EQ(w[0], 32u);
     }
     {
-        auto L = lowerCSubsetToLir(
+        auto L = lowerCToLir(
             "long long h(long long a, long long b) { return a + b; }");
         assertUpstreamClean(L);
         auto const w = widthsOfMnemonic(L.lir.lir, *L.target, "add");
@@ -4793,7 +4967,7 @@ TEST(MirToLir, CSubsetSourceTypesThreadWidthToLirFlags) {
         // conversion `unsigned int` → `unsigned long long` mints a
         // ZExt whose LIR width is the SOURCE's 32 — the front-end
         // composition of ZExtFromU32SourceLowersCarryingSourceWidth.
-        auto L = lowerCSubsetToLir(
+        auto L = lowerCToLir(
             "unsigned long long w(unsigned int a) "
             "{ return (unsigned long long)a; }");
         assertUpstreamClean(L);
@@ -6227,8 +6401,8 @@ TEST(MirToLir, F128SoftcallDoesNotClobberDoubleLiveAcrossCall) {
 //
 // `long double _Complex` on elf-x86_64 (x87-80 axis) has an F80 ELEMENT.
 // `materializeComplexBinaryOp` emits its addition COMPONENTWISE — plain F80
-// Load/FAdd/Store over the element type — so with D-CSUBSET-LONG-DOUBLE-X87-
-// ARITH (LD-1) landing the scalar x87 memory sequence, the complex LOCAL
+// Load/FAdd/Store over the element type — so with D-CSUBSET-LONG-DOUBLE-X87-ARITH
+// (LD-1) landing the scalar x87 memory sequence, the complex LOCAL
 // arithmetic RIDES it for free and now LOWERS (an fld/fld/faddp/fstp per
 // component). This is a REALIZED path, not a walled one — the componentwise
 // scalar ops are individually correct, so the complex result is correct.
@@ -6242,7 +6416,7 @@ TEST(MirToLir, F128SoftcallDoesNotClobberDoubleLiveAcrossCall) {
 // HIR → MIR → LIR); red-on-disable: revert the F80 FAdd interception and the
 // componentwise adds wall again → lir.ok flips false.
 TEST(MirToLir, LongDoubleComplexArithmeticLowersOnX87Axis) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
     UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(
@@ -6902,10 +7076,10 @@ TEST(MirToLirTls, PeIndexedWithoutTlsIndexSlotNameFailsLoud) {
 // alignUp(size) (`add` + `and`) -> `sub_sp_reg SP, size` -> `base = sp_copy SP`.
 // RED-ON-DISABLE: revert lowerVlaAlloca to the fail-loud boundary (or the fixed-slot
 // path) -> `sub_sp_reg`/`sp_copy` vanish + L.lir.ok flips -> this pin goes red. The
-// runtime witnesses (examples/c-subset/c99_vla{,_spill}) prove the sequence RUNS;
+// runtime witnesses (examples/c/c99_vla{,_spill}) prove the sequence RUNS;
 // this pin proves the OPS are emitted (the boundary is closed, not a silent stub).
 TEST(MirToLir, VlaRuntimeOperandAllocaLowersToDynamicStackSequence) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int n) {\n"
         "  int a[n];\n"
         "  return a[0];\n"
@@ -6960,7 +7134,7 @@ TEST(MirToLir, VlaRuntimeOperandAllocaLowersToDynamicStackSequence) {
 // at the body's fall-through exit. RED-ON-DISABLE: revert lowerStackRestore and
 // `sp_restore` vanishes (the SP leak the c99_vla_loop runtime witness crashes on).
 TEST(MirToLir, VlaBlockScopeStackRestoreLowersToSpRestore) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int n) {\n"
         "  int i; int total; total = 0;\n"
         "  for (i = 0; i < 2; i = i + 1) {\n"
@@ -7008,7 +7182,7 @@ TEST(MirToLir, VlaBlockScopeStackRestoreLowersToSpRestore) {
 // element would land under-aligned. RED-ON-DISABLE: drop the elemAlign gate in
 // lowerVlaAlloca -> the VLA would silently under-align its elements.
 TEST(MirToLir, VlaOverAlignedElementFailsLoud) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int n) {\n"
         "  _Alignas(32) int a[n];\n"
         "  return a[0];\n"
@@ -7050,7 +7224,7 @@ namespace {
 // On x86_64 the 3 primitives lower to their NATIVE hardware instructions (the
 // popcount/clz/ctz mnemonics are declared) — one op each, no SWAR multiply.
 TEST(MirToLir, BitCountLowersToNativeOnX86) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "typedef unsigned int u32;\n"
         "int pc(u32 x){return __builtin_popcount(x);}\n"
         "int lz(u32 x){return __builtin_clz(x);}\n"
@@ -7068,17 +7242,167 @@ TEST(MirToLir, BitCountLowersToNativeOnX86) {
         << "the native path emits no SWAR multiply";
 }
 
+// ── D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: the DECLARED-SEQUENCE realization ─────
+//
+// AArch64 has no scalar-GPR population count, so its `popcount` row carries no
+// `encoding` at all and a four-step `lowering` sequence instead (GPR→SIMD move,
+// per-byte lane count, lane reduction, SIMD→GPR move). These pins hold the two
+// halves apart: the SHIPPED document is the POSITIVE case, and the negative is
+// synthesized by REMOVING the row — never by adding one, because an addition
+// always changes the document while a removal that finds nothing to remove
+// THROWS, and that difference is what keeps the pins honest if the shipped
+// config ever loses the feature.
+
+namespace {
+// The ONE question both pins ask, asked of the SCHEMA rather than of the file:
+// does this target realize `popcount` as a declared instruction SEQUENCE?
+// `lowerPopcount` reads exactly this (via `lowerViaDeclaredSequence`), so a
+// reverted or mis-merged config edit fails loudly HERE instead of becoming a
+// silent nothing-to-expand everywhere downstream.
+[[nodiscard]] bool declaresPopcountSequence(TargetSchema const& sch) {
+    auto const op = sch.opcodeByMnemonic("popcount");
+    if (!op.has_value()) return false;
+    auto const* info = sch.opcodeInfo(*op);
+    return info != nullptr && !info->lowering.sequences.empty();
+}
+} // namespace
+
+// The shipped arm64 target lowers MIR Popcount to its declared FOUR-STEP vector
+// sequence at BOTH promotion widths — and to NONE of the SWAR's arithmetic.
+TEST(MirToLir, PopcountLowersToDeclaredVectorSequenceOnArm64) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value()) << "loadShipped(arm64) failed";
+    // The POSITIVE case is the shipped document itself — but only as long as it
+    // really carries the sequence, which is a property of a `.target.json` file
+    // and therefore a property that can be edited away.
+    ASSERT_TRUE(declaresPopcountSequence(**target))
+        << "the SHIPPED arm64 target no longer declares a `lowering` sequence "
+           "on `popcount`. Without it MIR Popcount falls back to the SWAR and "
+           "this pin would be testing the schema against itself "
+           "(D-FULLC-STDBIT-ARM64-CNT-POPCOUNT).";
+    auto L = lowerCToLir(
+        "int pc32(unsigned int x){return __builtin_popcount(x);}\n"
+        "int pc64(unsigned long long x){return __builtin_popcountll(x);}\n",
+        *target);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "the declared sequence must lower cleanly: "
+        << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    // Two popcounts → one whole sequence each. Counting EVERY step (not just
+    // the recognisable `cnt`) is what catches a truncated expansion: a sequence
+    // missing its lane reduction would still show a lane count.
+    EXPECT_EQ(countLirOp(lir, sch, "movq_gpr_to_xmm"), 2)
+        << "the GPR->SIMD entry move, once per popcount";
+    EXPECT_EQ(countLirOp(lir, sch, "popcount_bytes"), 2)
+        << "the per-byte lane count, once per popcount";
+    EXPECT_EQ(countLirOp(lir, sch, "addlanes_bytes"), 2)
+        << "the lane REDUCTION — without it the result is eight separate "
+           "per-byte counts, not a population count";
+    EXPECT_EQ(countLirOp(lir, sch, "movq_xmm_to_gpr"), 2)
+        << "the SIMD->GPR exit move, once per popcount";
+    // And none of the SWAR's arithmetic: the 0x0101.. multiply is its signature.
+    EXPECT_EQ(countLirOp(lir, sch, "mul"), 0)
+        << "the declared sequence emits no SWAR multiply";
+}
+
+// RED-ON-DISABLE, the REMOVAL direction: take the `popcount` row away from the
+// SHIPPED arm64 document and MIR Popcount must fall back to the SWAR bit-trick —
+// not fail loud, not emit a lane count. This is what keeps the SWAR path
+// REACHABLE and TESTED for every target that declares no realization, now that
+// both shipped targets declare one. `mutateShippedTargetSchemaJson` THROWS if the
+// row it was asked to remove is not there, so this pin cannot go vacuously green.
+TEST(MirToLir, PopcountFallsBackToSwarWhenArm64DeclaresNoPopcountRow) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaJson(
+        "arm64", {"popcount"});
+    ASSERT_TRUE(mutated.has_value())
+        << "mutateShippedTargetSchemaJson(arm64, -popcount) failed";
+    // The mutant must actually DIFFER in the property under test — asserting
+    // only "it loaded" is the vacuous arm this suite has been bitten by.
+    ASSERT_FALSE(declaresPopcountSequence(**mutated))
+        << "the mutant still declares a popcount sequence — it asserts nothing";
+    auto L = lowerCToLir(
+        "int pc(unsigned long long x){return __builtin_popcountll(x);}\n",
+        *mutated);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "the SWAR fallback must lower cleanly, NOT fail loud: "
+        << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    EXPECT_EQ(countLirOp(lir, sch, "popcount_bytes"), 0)
+        << "no lane count when the target declares no popcount row";
+    EXPECT_EQ(countLirOp(lir, sch, "addlanes_bytes"), 0);
+    EXPECT_EQ(countLirOp(lir, sch, "movq_gpr_to_xmm"), 0);
+    EXPECT_GE(countLirOp(lir, sch, "mul"), 1)
+        << "the SWAR popcount's distinctive 0x0101.. multiply";
+    EXPECT_GE(countLirOp(lir, sch, "and"), 3)
+        << "the SWAR popcount masks with 0x55/0x33/0x0F";
+    EXPECT_GE(countLirOp(lir, sch, "sub"), 1)
+        << "the SWAR popcount's x -= (x>>1)&m1 step";
+}
+
+// The sequence's TEMPORARIES must live in the SIMD/FP bank and its RESULT in the
+// integer bank. A class mistake here is exactly the silent miscompile the
+// encoder's register-bank vocabulary exists to prevent
+// (D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD): a GPR ordinal written into
+// an FP register field is VALID bytes naming the WRONG register, and nothing
+// downstream can tell. Asserted on the vregs, before regalloc, because that is
+// where the lowering decides it.
+TEST(MirToLir, Arm64PopcountSequenceKeepsItsTemporariesInTheFpBank) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ASSERT_TRUE(declaresPopcountSequence(**target));
+    auto L = lowerCToLir(
+        "int pc(unsigned long long x){return __builtin_popcountll(x);}\n",
+        *target);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    auto opOf = [&](char const* m) { return sch.opcodeByMnemonic(m); };
+    auto const toFp   = opOf("movq_gpr_to_xmm");
+    auto const lanes  = opOf("popcount_bytes");
+    auto const reduce = opOf("addlanes_bytes");
+    auto const toGpr  = opOf("movq_xmm_to_gpr");
+    ASSERT_TRUE(toFp && lanes && reduce && toGpr);
+    int checked = 0;
+    for (std::size_t f = 0; f < lir.moduleFuncCount(); ++f) {
+        LirFuncId const fn = lir.funcAt(static_cast<std::uint32_t>(f));
+        for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
+            LirBlockId const bb = lir.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+                LirInstId const id = lir.blockInstAt(bb, i);
+                std::uint16_t const op = lir.instOpcode(id);
+                if (op == *toFp || op == *lanes || op == *reduce) {
+                    EXPECT_EQ(lir.instResult(id).regClass(), LirRegClass::FPR)
+                        << "a sequence temporary must be FP-bank";
+                    ++checked;
+                } else if (op == *toGpr) {
+                    EXPECT_EQ(lir.instResult(id).regClass(), LirRegClass::GPR)
+                        << "the sequence's RESULT must match the MIR result's "
+                           "integer class";
+                    ++checked;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(checked, 4) << "all four steps must have been inspected";
+}
+
 // RED-ON-DISABLE: drop the `popcount` mnemonic from x86_64 and MIR Popcount MUST
 // lower to the SWAR bit-trick sequence (a `mul` by the 0x0101.. magic + the
-// 0x55/0x33/0x0F masks) — NOT fail loud, NOT a `popcount` op. This proves the
-// fallback is REAL (arm64 declares no popcount, so it lands here at runtime — the
-// runnable example `builtin_bitcount` witnesses the SWAR result on qemu-arm64).
+// 0x55/0x33/0x0F masks) — NOT fail loud, NOT a `popcount` op. The x86 half of the
+// same falsifiability arm as the arm64 pin above: with BOTH shipped targets now
+// declaring a realization, a removal mutant is the only way the SWAR is reached
+// at all, so it is pinned from both sides.
 TEST(MirToLir, PopcountFallsBackToSwarWhenNoNativeMnemonic) {
     auto mutated = dss::test_support::mutateShippedTargetSchemaJson(
         "x86_64", {"popcount"});
     ASSERT_TRUE(mutated.has_value())
         << "mutateShippedTargetSchemaJson(x86_64, -popcount) failed";
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int pc(unsigned int x){return __builtin_popcount(x);}\n", *mutated);
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok)
@@ -7146,7 +7470,7 @@ void expectBswapExpansionShape(Lir const& lir, TargetSchema const& sch,
 } // namespace
 
 TEST(MirToLir, BswapSelectsNativeOnX86AtWidth32) {
-    auto L = lowerCSubsetToLir(kBswapSrc32);
+    auto L = lowerCToLir(kBswapSrc32);
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok)
         << "LIR lowering: " << (L.lirReporter.all().empty()
@@ -7162,7 +7486,7 @@ TEST(MirToLir, BswapSelectsNativeOnX86AtWidth32) {
 }
 
 TEST(MirToLir, BswapSelectsNativeOnX86AtWidth64) {
-    auto L = lowerCSubsetToLir(kBswapSrc64);
+    auto L = lowerCToLir(kBswapSrc64);
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok)
         << "LIR lowering: " << (L.lirReporter.all().empty()
@@ -7182,7 +7506,7 @@ TEST(MirToLir, BswapSelectsNativeOnX86AtWidth64) {
 // with A_NoMatchingEncodingVariant; `_byteswap_ushort` (sqlite's `get2byteAligned`)
 // would simply never compile on x86.
 TEST(MirToLir, BswapWidth16TakesTheSoftwareExpansionOnX86) {
-    auto L = lowerCSubsetToLir(kBswapSrc16);
+    auto L = lowerCToLir(kBswapSrc16);
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok)
         << "the width-16 expansion must lower cleanly, NOT fail loud: "
@@ -7208,7 +7532,7 @@ TEST(MirToLir, BswapSelectsNativeAtAllThreeWidthsOnArm64) {
     for (Case const c : {Case{kBswapSrc16, "arm64 width 16 (REV16 Wd,Wn)"},
                          Case{kBswapSrc32, "arm64 width 32 (REV Wd,Wn)"},
                          Case{kBswapSrc64, "arm64 width 64 (REV Xd,Xn)"}}) {
-        auto L = lowerCSubsetToLir(c.src, *arm);
+        auto L = lowerCToLir(c.src, *arm);
         assertUpstreamClean(L);
         ASSERT_TRUE(L.lir.ok)
             << c.what << ": " << (L.lirReporter.all().empty()
@@ -7240,7 +7564,7 @@ TEST(MirToLir, BswapFallsBackToExpansionAtEveryWidthWhenMnemonicAbsent) {
     for (Case const c : {Case{kBswapSrc16, 2, "width 16, no native bswap"},
                          Case{kBswapSrc32, 4, "width 32, no native bswap"},
                          Case{kBswapSrc64, 8, "width 64, no native bswap"}}) {
-        auto L = lowerCSubsetToLir(c.src, *mutated);
+        auto L = lowerCToLir(c.src, *mutated);
         assertUpstreamClean(L);
         ASSERT_TRUE(L.lir.ok)
             << c.what << " must lower cleanly, NOT fail loud: "
@@ -7292,7 +7616,7 @@ TEST(MirToLir, BswapPerWidthProbeFallsBackOnlyForTheDeletedWidthOnArm64) {
 
     // Width 16 — the removed variant — now expands.
     {
-        auto L = lowerCSubsetToLir(kBswapSrc16, *mutated);
+        auto L = lowerCToLir(kBswapSrc16, *mutated);
         assertUpstreamClean(L);
         ASSERT_TRUE(L.lir.ok)
             << "the deleted width must EXPAND, not fail loud: "
@@ -7306,7 +7630,7 @@ TEST(MirToLir, BswapPerWidthProbeFallsBackOnlyForTheDeletedWidthOnArm64) {
     }
     // Widths 32 and 64 — untouched variants — stay NATIVE.
     for (char const* src : {kBswapSrc32, kBswapSrc64}) {
-        auto L = lowerCSubsetToLir(src, *mutated);
+        auto L = lowerCToLir(src, *mutated);
         assertUpstreamClean(L);
         ASSERT_TRUE(L.lir.ok);
         auto const& sch = *L.target;

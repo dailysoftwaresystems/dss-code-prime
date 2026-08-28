@@ -1,0 +1,35 @@
+{
+  "$comment": "D-MIR-OVERLAP-STRUCT-ZERO-INIT: `{0}` / `{}` into a struct whose members SHARE BYTES (a c107 explicit-offset overlay) lowers to a WHOLE-OBJECT zero-fill of the struct's full size instead of being refused. An overlapping struct cannot be spelled in C — the offsets come only from a shipped descriptor — and exactly two shipped overlays exist (MEASURED 2026-08-04), neither reachable from elf: windows.json's ULARGE_INTEGER {QuadPart u64@0, LowPart u32@0, HighPart u32@4} (pe) and sys/stat.json's macho `struct stat` (st_mtimespec@48 overlaying st_mtim_sec@48 + st_mtim_nsec@56 — the shape that BLOCKED sqlite's CLI at shell.c:25283 `struct stat x = {0};`). ★ TWO TIERS, DIFFERENT CODE: blocks (1)–(4) declare LOCALS and exercise the MIR brace-init lowering (runtime stores); block (5) declares a FILE-SCOPE STATIC and exercises the STATIC-DATA encoder (src/asm/asm.cpp encodeAggregateValue), whose bytes are produced at COMPILE time into the data section and which carries its own separate copy of the refusal — no local declaration reaches it, so before block (5) the static-data half had no end-to-end witness. The pe arm RUNS on the Windows leg and DERIVES all 42 points from live reads (8 declaration-form + 8 C23 `{}` + 10 size-witness + 8 live-overlay + 8 static-data); the macho arm is the same program against the real `struct stat` and runs on the macos leg. THE SCORE IS A CHECKSUM, NOT A TALLY: 8+8+10+8+8 = 42, so dropping or short-circuiting any ONE block changes the exit code even when every check that ran passed. THE SIZE WITNESS: each arm DIRTIES every byte and then re-zeroes through the brace-init path (a compound literal), so a fill that stops short of the layout size leaves dirty bytes visible through the ALIASING member and the exit code changes — this is a measured size assertion, not `something was emitted`. ★ THE ELF ARMS RETURN 99, NOT 42, via the per-target `exitCode` overrides below: the `#else` arm has nothing to exercise (no elf-reachable overlay exists), and were it to return the same 42 the real arms compute, a pe or darwin build that silently fell through to `#else` — a lost `_WIN32`/`__APPLE__` predefine, or a descriptor that stopped being reachable — would still exit 42 and this example would report GREEN while compiling none of the code it exists to test. With 99 there, exactly one arm can produce each target's expected code. RED-ON-DISABLE: restore the guard to refuse every overlapping brace-init and the pe + macho compiles fail — blocks (1)–(4) with error[H_UnsupportedLoweringForKind] `brace-initialization of an overlapping explicit-offset struct`, block (5) with error[K_NoMatchingObjectFormat] `static initialization of an overlapping explicit-offset struct`. Release arm re-runs the whole program through the optimizer (the zero-fill chunks are prime DCE/CSE bait — they must survive as real stores).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "exitCode": 99
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "exitCode": 99
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: arm64:elf64-aarch64-linux-exec, x86_64:elf64-x86_64-linux-exec. It DIFFERED on: x86_64:pe64-x86_64-windows-exec, so identity here is target-dependent and an arm-level opt-in (which applies to every target at once) would red the spec where it is identical. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST, AND FORMAT-DEPENDENT: this example's source is platform-conditional, and identity was MEASURED to disagree between legs for exactly that reason. The key is per-ARM and applies to EVERY target at once, so arming it on the strength of the leg where it differs would red the leg where it does not. The pe / darwin / else arms are three different programs behind `_WIN32` and `__APPLE__`. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in." }
+  ]
+}

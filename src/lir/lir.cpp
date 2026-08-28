@@ -177,9 +177,16 @@ LirBlockId LirBuilder::createBlock() {
     return id;
 }
 
+void LirBuilder::poison() noexcept { poisoned_ = true; }
+
 void LirBuilder::beginBlock(LirBlockId block) {
     if (!openFunc_.valid()) lirFatal("LirBuilder::beginBlock: no open function");
-    if (openBlock_.valid() && !openBlockHasTerminator_) {
+    // D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE: an unterminated open block
+    // is the EXPECTED state after a diagnosed refusal, so it is not a contract
+    // violation once poisoned — the diagnostic was already emitted and the
+    // module is on its way to being discarded. Every OTHER invariant below
+    // still holds: poison excuses the missing terminator, nothing else.
+    if (openBlock_.valid() && !openBlockHasTerminator_ && !poisoned_) {
         lirFatal("LirBuilder::beginBlock: current block has no terminator");
     }
     if (block.arenaTag != moduleId_.v) {
@@ -337,6 +344,16 @@ LirInstId LirBuilder::addUnreachable(std::uint16_t opcode,
 
 void LirBuilder::closeFunction_() {
     if (!openFunc_.valid()) return;
+    // D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE: the three validations below
+    // are exactly the process kills a refused terminator used to reach — the
+    // half-open function is the diagnosed state, not an undetected one. Drop
+    // the open-function bookkeeping and return; `finish()` discards the arenas
+    // wholesale, so nothing downstream can read the partial function.
+    if (poisoned_) {
+        openFunc_  = {};
+        openBlock_ = {};
+        return;
+    }
     // Validate every created block is opened + terminated.
     for (LirBlockId const b : openFuncBlocks_) {
         auto const& blk = blockArena_.at(b);
@@ -507,10 +524,18 @@ LirReg LirBuilder::instResult(LirInstId inst) const {
     return instArena_.at(inst).result;
 }
 
-LirInstId LirBuilder::lastInst() const {
+bool LirBuilder::hasAnyInst() const noexcept {
     // Slot 0 is the arena's reserved sentinel, so `size() <= 1` means
     // "nothing appended".
-    if (instArena_.size() <= 1) {
+    return instArena_.size() > 1;
+}
+
+LirInstId LirBuilder::lastInst() const {
+    // ★ THE SAME PREDICATE `hasAnyInst()` PUBLISHES -- deliberately not a
+    // second copy of `size() <= 1`, so a caller that guards with
+    // `hasAnyInst()` is guarded by exactly this refusal and not by a lookalike
+    // that could be edited apart from it.
+    if (!hasAnyInst()) {
         lirFatal("LirBuilder::lastInst: no instruction has been appended");
     }
     return LirInstId{static_cast<std::uint32_t>(instArena_.size() - 1),
@@ -518,6 +543,13 @@ LirInstId LirBuilder::lastInst() const {
 }
 
 Lir LirBuilder::finish() && {
+    // D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE: a poisoned builder hands
+    // back an EMPTY module, never the half-built one it is holding. This is
+    // the same empty `Lir{}` every rebuild pass already returns on its own
+    // unwind path, so a pass that DID check the dispatch and a pass that
+    // forgot BOTH produce the identical, already-diagnosed failure — which
+    // is what makes the omission survivable instead of fatal.
+    if (poisoned_) return Lir{};
     if (openFunc_.valid()) closeFunction_();
     return Lir{
         target_.id(),

@@ -44,9 +44,9 @@ readImm64LE(std::span<std::uint8_t const> bytes, std::size_t offset) noexcept {
 //
 // D-CSUBSET-INTRINSIC-BSWAP: the slot reaches this form from TWO
 // sources, and the ENCODER treats them identically — `wireSlot`
-// (x86_variable.cpp:211-244) fills `opcodePlusReg3` from either, and
-// the emit at :1122-1130 ORs it into the last opcode byte without
-// asking which one wrote it. Only THIS predicate was asymmetric:
+// (its `OpcodePlusReg` case in x86_variable.cpp) fills `opcodePlusReg3`
+// from either, and the `B8+rd` emit arm ORs it into the last opcode
+// byte without asking which one wrote it. Only THIS predicate was asymmetric:
 //   * a `resultSlot` of `opcode.reg`  — `mov r64, imm64` (B8+rd io);
 //   * a WIRE on operand 0 of `opcode.reg` — the 2-address `+rd` shape
 //     (`bswap`, 0F C8+rd), where `requires2Address` makes operand 0 BE
@@ -82,6 +82,13 @@ struct DisasmState {
     // FC3.5 sweep-c1: the 1-byte immediate (shift-count ib).
     std::uint8_t imm8      = 0;
     bool         hasImm8   = false;
+    // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: the 2-byte immediate (`iw`).
+    // ⚠ HELD AS THE RAW UNSIGNED FIELD, and the round-trip arm below
+    // re-SIGN-EXTENDS it: the LIR operand carries `$-1` as int32 -1 while
+    // the encoded halfword is 0xFFFF, and comparing the raw field against
+    // the operand would report a mismatch on every negative immediate.
+    std::uint16_t imm16     = 0;
+    bool          hasImm16  = false;
     bool         hasDisp32 = false;
     // D-CSUBSET-BITFIELD-WIDE-UNIT: the 8-byte immediate (mov r64,imm64
     // io) + the opcode-plus-register destination (B8+rd). `opcodeReg3`
@@ -261,6 +268,21 @@ disassemble(TargetSchema const&            schema,
                 state->imm8 = bytes[cursor];
                 state->hasImm8 = true;
                 cursor += 1;
+            } else if (w.slotKind == EncodingSlotKind::Imm16Bytes) {
+                // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: the 2-byte `iw`
+                // immediate — emitted by the encoder AFTER any imm8 and
+                // BEFORE any imm32, which is the order this loop walks
+                // (wire-declaration order, one immediate per shipped
+                // variant).
+                if (cursor + 2 > bytes.size()) {
+                    state = std::nullopt;
+                    break;
+                }
+                state->imm16 = static_cast<std::uint16_t>(
+                    static_cast<std::uint32_t>(bytes[cursor])
+                    | (static_cast<std::uint32_t>(bytes[cursor + 1]) << 8));
+                state->hasImm16 = true;
+                cursor += 2;
             } else if (w.slotKind == EncodingSlotKind::Imm64) {
                 // D-CSUBSET-BITFIELD-WIDE-UNIT: the 8-byte `io` immediate
                 // of `mov r64, imm64` — emitted after any imm8/imm32
@@ -325,6 +347,20 @@ disassemble(TargetSchema const&            schema,
                 case EncodingSlotKind::Imm8:
                     return state->hasImm8
                         ? std::optional<std::int64_t>{state->imm8}
+                        : std::nullopt;
+                // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: the RAW UNSIGNED
+                // halfword. ⚠ THE 2-BYTE FIELD IS GENUINELY AMBIGUOUS AND
+                // SAYING SO HERE IS THE POINT: `movw $-1, %cx` and
+                // `movw $65535, %cx` are the SAME four bytes (✔MEASURED,
+                // GNU as 2.42 — both `66 b9 ff ff`), so no decoder can
+                // recover which one was written. The oracle therefore
+                // compares the LOW 16 BITS of the LIR operand against this
+                // field (`roundTripVerify`), which is exact for both
+                // spellings; sign-extending here instead would have made
+                // every unsigned halfword above 0x7FFF a false mismatch.
+                case EncodingSlotKind::Imm16Bytes:
+                    return state->hasImm16
+                        ? std::optional<std::int64_t>{state->imm16}
                         : std::nullopt;
                 // D-CSUBSET-BITFIELD-WIDE-UNIT: the opcode-plus-register
                 // destination (B8+rd) and the 8-byte immediate (io).
@@ -404,8 +440,8 @@ disassemble(TargetSchema const&            schema,
                 // disassemble to nullopt — these ARE valid x86 slots, just
                 // not consumed by the shipped round-trip oracle yet, so
                 // nullopt means "value undefined here", NOT a cross-shape
-                // violation (the disasm-completeness gap D-AS5-MULTIWORD-
-                // DISASM). The fixed32/ARM64 slots that used to share this
+                // violation (the disasm-completeness gap D-AS5-MULTIWORD-DISASM).
+                // The fixed32/ARM64 slots that used to share this
                 // fallback now fail loud on the arm above
                 // (D-AS-DISASM-FIXED32-SLOT-FAILLOUD). Listed EXHAUSTIVELY
                 // (no `default:`) so a new enumerator re-triggers the
@@ -421,8 +457,8 @@ disassemble(TargetSchema const&            schema,
                 // literal disp32 + the relocated memory displacement
                 // are valid x86 slots the round-trip oracle does not
                 // decode yet (the same disasm-completeness gap as the
-                // memory-addressing group above — D-AS5-MULTIWORD-
-                // DISASM); nullopt means "value undefined here", not
+                // memory-addressing group above — D-AS5-MULTIWORD-DISASM);
+                // nullopt means "value undefined here", not
                 // a cross-shape violation.
                 case EncodingSlotKind::AbsoluteDisp32Mem:
                 case EncodingSlotKind::MemRelocDisp32:

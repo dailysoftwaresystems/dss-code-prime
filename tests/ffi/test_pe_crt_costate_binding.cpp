@@ -40,7 +40,7 @@
 // measured over the descriptor ROOT `library.pe` and nothing else. But a
 // descriptor's binding is not one value: ANY SYMBOL may carry its own `library`
 // map, and the semantic injector MERGES it OVER the descriptor's
-// (src/analysis/semantic/semantic_analyzer.cpp:13318-13321 — symbol keys WIN, a
+// (src/analysis/semantic/semantic_analyzer.cpp — symbol keys WIN, a
 // format the symbol omits inherits the root's entry). So a single JSON line
 // inside a symbol object rebinds THAT SYMBOL to a different DLL while the root
 // still reads as the group's runtime — and the guard reported agreement. That
@@ -90,12 +90,12 @@ namespace {
 // unchanged: empty on a miss, both callers ASSERT on it; the ADD_FAILURE names
 // which of the three lookups came up short.
 [[nodiscard]] fs::path configRoot() {
-    auto const root = dss::test::findRepoRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config";
+    return *cfg;
 }
 
 // The STATEFUL co-state group: every descriptor whose pe surface mints or
@@ -155,7 +155,7 @@ constexpr char const* kCoStateGroup[] = {
 // `availableObjectFormats` gates in TWO INDEPENDENT PLACES, and knowing which
 // is why this guard may skip some overrides without opening a hole. Both read
 // through the SAME predicate, `ffi::objectFormatInAvailabilitySet`
-// (src/ffi/shipped_lib_descriptor.cpp:2339-2345), whose rule is "an EMPTY set
+// (src/ffi/shipped_lib_descriptor.cpp), whose rule is "an EMPTY set
 // means available on EVERY format":
 //
 //   * the DESCRIPTOR-level set — decoded at src/ffi/shipped_lib_descriptor.cpp
@@ -164,7 +164,7 @@ constexpr char const* kCoStateGroup[] = {
 //     that target: the `#include` is a hard error and NOTHING is injected.
 //   * the per-SYMBOL set — decoded at src/ffi/shipped_lib_descriptor.cpp
 //     :1505-1506 (the SAME `decodeShippedAvailability` chokepoint), enforced at
-//     src/analysis/semantic/semantic_analyzer.cpp:13359-13362. A symbol that
+//     src/analysis/semantic/semantic_analyzer.cpp. A symbol that
 //     excludes the active format is simply not injected, hence never imported.
 //
 // The two sets are INDEPENDENT — a per-symbol set does NOT inherit, narrow or
@@ -213,11 +213,11 @@ struct PeBinding {
 // one symbol of a stateful surface to the other runtime was structurally
 // invisible to every test in this file. The override is not hypothetical
 // plumbing: `decodeLibraryMap` validates the per-symbol map through the SAME
-// chokepoint as the root's (src/ffi/shipped_lib_descriptor.cpp:1519-1522), it is
+// chokepoint as the root's (src/ffi/shipped_lib_descriptor.cpp), it is
 // stored raw on `ShippedLibSymbol::library`
-// (src/ffi/shipped_lib_descriptor.hpp:193-209), and the semantic injector merges
+// (src/ffi/shipped_lib_descriptor.hpp), and the semantic injector merges
 // it over the descriptor map at
-// src/analysis/semantic/semantic_analyzer.cpp:13318-13321. One line inside a
+// src/analysis/semantic/semantic_analyzer.cpp. One line inside a
 // symbol object rebinds that symbol to a different DLL with no other visible
 // change anywhere.
 [[nodiscard]] std::vector<PeBinding> peBindingsOf(fs::path const& p) {
@@ -311,7 +311,7 @@ struct PeBinding {
 // Note what a grant does NOT excuse: naming an image that the runtime does not
 // actually export. That failure is loud by construction — DSS eagerly imports
 // every declared symbol (D-FFI-DESCRIPTOR-EAGER-IMPORT), so the LOADER rejects
-// the binary (0xC0000139) and the runtime witnesses in examples/c-subset fail to
+// the binary (0xC0000139) and the runtime witnesses in examples/c fail to
 // start. This table is about the SILENT hazard only.
 struct DeclaredCrossRuntimeSymbol {
     char const* stem;
@@ -549,7 +549,7 @@ TEST(PeCrtCoStateBinding, PerSymbolOverrideSplitIsCaught) {
     EXPECT_EQ(declared[2].symbol, "__posix_only_helper");
     EXPECT_FALSE(declared[2].reachable)
         << "a symbol whose availableObjectFormats excludes pe can never bind on "
-           "pe (semantic_analyzer.cpp:13359-13362), so its pe override is dead "
+           "pe (semantic_analyzer.cpp), so its pe override is dead "
            "config rather than a live hazard";
 
     // 3. THE SHARED PREDICATE REJECTS IT. Note the group has exactly TWO live

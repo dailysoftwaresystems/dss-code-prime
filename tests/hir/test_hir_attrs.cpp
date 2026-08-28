@@ -146,7 +146,7 @@ TEST(HirAttrs, FfiMapAliasBindsToExternNodes) {
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const ef = b.makeExternFunction(fnTy, /*symbol=*/6, {});
     Hir h = std::move(b).finish(ef);
 

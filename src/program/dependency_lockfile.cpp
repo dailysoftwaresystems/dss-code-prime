@@ -207,7 +207,7 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
 
     json doc;
     doc["$comment"] =
-        "Managed by dss-code-prime. Records the commit each git dependency was "
+        "Managed by dsscp. Records the commit each git dependency was "
         "resolved to so a rebuild is reproducible and offline. Do not edit; "
         "delete it to force a full re-resolve.";
     // Always present, even with zero entries — `load` requires the member, and

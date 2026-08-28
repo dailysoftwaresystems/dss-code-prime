@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <format>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -48,6 +49,70 @@ namespace dss::link::format {
 namespace {
 
 char const* const kMachOBlocks[] = { "macho", "image" };
+
+// D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS. The weak-
+// definition spellings THIS backend's walker writes. One row: `macho.cpp`
+// spells a weak definition as the N_WEAK_DEF (0x0080) flag bit in `n_desc`,
+// alongside an ordinary N_SECT|N_EXT binding — never as a binding value of its
+// own, which is what separates `symbol-flag` from ELF's `symbol-binding`.
+//
+// ⚠ THIS IS THE WALKER'S CAPABILITY, NOT EVERY MACH-O DOCUMENT'S. Only the
+// MH_OBJECT arm encodes one; the image arms REFUSE a weak definition outright
+// (`refuseWeakImageAlias` — N_WEAK_DEF on an image needs MH_WEAK_DEFINES in
+// the mach header, D-LK3-DYLIB-WEAK-EXPORT), which is why the exec/dylib
+// documents declare no dialect at all. Per-format declaration is the schema's
+// question; this answers only "can this walker spell it".
+constexpr WeakDefinitionDialect kMachOWeakDialects[] = {
+    WeakDefinitionDialect::SymbolFlag,
+};
+
+// ── `mach_header` geometry the BYTE PROBE reads (Apple `<mach-o/loader.h>`) ─
+//
+// `filetype` is the fourth word of BOTH `mach_header` and `mach_header_64` —
+// the 64-bit header only appends `reserved` at the END — so one offset serves
+// both widths, which is what lets the probe decide a file whose width it has
+// not branched on.
+constexpr std::size_t kMachOFiletypeOff = 12;  // u32 filetype
+
+// The two THIN magics, and MH_OBJECT projected off `MachOObjectType`, whose
+// enumerators ARE the `MH_*` wire values (`readIdentity` below leans on the
+// same identity when it accepts the integer spelling of `filetype`). Spelling
+// `1` here would make this file a second owner of that fact.
+constexpr std::uint32_t kMachOThinMagic64 = 0xFEEDFACFu;  // MH_MAGIC_64
+constexpr std::uint32_t kMachOThinMagic32 = 0xFEEDFACEu;  // MH_MAGIC
+constexpr std::uint32_t kMachOMhObject =
+    static_cast<std::uint32_t>(MachOObjectType::Object);
+
+// CPU_ARCH_ABI64 -- the bit a `cpu_type_t` sets to say "64-bit variant of this
+// architecture" (CPU_TYPE_X86_64 = CPU_TYPE_X86 | this; CPU_TYPE_ARM64 =
+// CPU_TYPE_ARM | this). It is the ONLY width statement a Mach-O identity block
+// makes, which is why the probe reads the schema's declared WIDTH out of
+// `cputype` while still refusing to compare the architecture itself.
+constexpr std::uint32_t kMachOCpuArchAbi64 = 0x01000000u;
+
+// Bounds-checked word read in a CHOSEN byte order.
+//
+// ★ LOCAL, NOT `ffi/binary_readers/reader_common.hpp`'s `readU32`/`readU32BE`:
+// `ffi` depends UP on `link` (`ffi/ingest.hpp`, `ffi/abi/abi_catalog.hpp` and
+// `ffi/mangling/c_mangle.hpp` all include `link/object_format_schema.hpp`), so
+// a `link` -> `ffi` include closes a dependency CYCLE — the call
+// `macho_object_reader.cpp` and `elf_object_reader.cpp` already record at
+// their own constant blocks. And those helpers index `b[off]` UNCHECKED,
+// which is correct for a reader that has validated its buffer and wrong for a
+// `noexcept` predicate handed an arbitrary file.
+[[nodiscard]] constexpr std::optional<std::uint32_t>
+machoProbeReadU32(std::span<std::uint8_t const> b, std::size_t off,
+                  bool bigEndian) noexcept {
+    // A SUBTRACTION on the size, never `off + 4 > b.size()`, so it stays
+    // correct for an `off` near `SIZE_MAX` that a future caller could compute.
+    if (b.size() < 4u || off > b.size() - 4u) return std::nullopt;
+    std::uint32_t v = 0;
+    for (std::size_t i = 0; i < 4u; ++i) {
+        std::size_t const shift = bigEndian ? (3u - i) : i;
+        v |= static_cast<std::uint32_t>(b[off + i]) << (shift * 8u);
+    }
+    return v;
+}
 
 class MachOBackend final : public ObjectFormatBackend {
 public:
@@ -70,6 +135,10 @@ public:
         // it lands WITH its walker arm, never before it, or a Mach-O schema
         // could declare a reserve that is silently dropped at emit.
         return {};
+    }
+    [[nodiscard]] std::span<WeakDefinitionDialect const>
+    weakDefinitionDialects() const noexcept override {
+        return kMachOWeakDialects;
     }
 
     [[nodiscard]] bool
@@ -95,6 +164,110 @@ public:
     [[nodiscard]] bool isRelocatableMember(
             detail::ObjectFormatData const& d) const noexcept override {
         return d.macho.filetype == MachOObjectType::Object;
+    }
+
+    // ★★ THE BYTE PROBE. A THIN Mach-O magic, then `filetype == MH_OBJECT`
+    // read through the byte order that magic just established.
+    //
+    // ★ THE MAGIC IS THE BYTE-ORDER DECLARATION, WHICH IS WHY IT IS TRIED
+    // BOTH WAYS. A thin header stores its magic in the SLICE's own order, so
+    // `0xFEEDFACF` lands as `CF FA ED FE` in a little-endian object and as
+    // `FE ED FA CF` in a big-endian one. Whichever lens produces a known
+    // magic is the file's lens, and `filetype` is then read through the SAME
+    // one — the alternative, reading it in host order, is correct on every
+    // host DSS is usually built on and silently inverted on the s390x leg.
+    // (`MH_CIGAM` is not a third magic to match: it is `MH_MAGIC` seen
+    // through the wrong lens, which is precisely what trying both lenses
+    // covers.)
+    //
+    // ★ A FAT / UNIVERSAL FILE IS NOT A RELOCATABLE OBJECT, and it is
+    // refused without an arm of its own. `fat_header` is BIG-ENDIAN ON DISK
+    // by definition, so `0xCAFEBABE` / `0xCAFEBABF` land as `CA FE BA BE` /
+    // `CA FE BA BF` — neither reads as a thin magic under either lens, so
+    // both fall out of the gate below. This is the shape
+    // `macho_object_reader.cpp` states at its own magic check ("All three
+    // fall out of the single `!= 0xFEEDFACF` gate above; none needs its own
+    // arm"), and `tests/link/test_relocatable_object_probe.cpp` pins the
+    // universal case explicitly so the claim is measured rather than
+    // asserted. A universal file that CONTAINS an MH_OBJECT slice is still
+    // not one: extracting the slice is `lipo`'s job, and answering true here
+    // would hand the linker an archive header to parse as a mach header.
+    //
+    // ── THE TWO AXES, RULED 2026-08-26 (P36 lane L) SO THE ARMS AGREE ──────
+    //
+    // ⚠ `cputype` IS DELIBERATELY NOT CHECKED, and that is SYMMETRIC with the
+    // other two arms rather than a divergence from them. The ELF arm states
+    // the identical rule for `e_machine` in its own words, and PE keys on
+    // `pe.machine` only because a COFF object carries NO magic and the
+    // question would otherwise have no answer at all. So on the MACHINE axis
+    // all three already say the same thing: a wrong-arch relocatable object is
+    // still a relocatable object, and routing it to the linker gets the
+    // operator an arch-mismatch diagnostic naming both machines, where the
+    // tokenizer would report `illegal character 0xcf`.
+    //
+    // ★★★ THE MAGIC'S WIDTH IS A DIFFERENT AXIS AND IT IS NOW CHECKED. Until
+    // this ruling this arm accepted the 32-bit thin magic (`MH_MAGIC`,
+    // 0xFEEDFACE) against a `macho64` schema and justified it with the
+    // cputype argument above. That argument does not carry here, by the ELF
+    // arm's OWN stated rule: class and encoding are checked "because those
+    // decide how the file is SPELLED and a reader cannot decode the header
+    // without them". Width is exactly such a fact — a 32-bit `mach_header`
+    // has no trailing `reserved` word and its load commands spell `section`
+    // rather than `section_64`, so every table offset in the file moves. It
+    // decides SPELLING, not merely whether a link would succeed, which is the
+    // ELF arm's dividing line.
+    //
+    // ★ AND THE INTERFACE ALREADY SAID SO. The question this predicate answers
+    // is "is this a relocatable object THIS FORMAT COULD ITSELF HAVE WRITTEN"
+    // — a `macho64` document could not have written a 32-bit object, so the
+    // loose answer was answering a different question than the one declared.
+    //
+    // ⓘ WHAT THE TIGHTENING DOES NOT COST, which is why it is the right
+    // direction rather than the strict-for-its-own-sake one. The argument for
+    // the loose form was that a mismatched object should be classified and
+    // then refused BY THE READER (a precise message) rather than dropped to
+    // the dynamic arm (which reproduces the misleading "no `.dynsym`" error).
+    // That argument survives intact for the case it was made about: ARCH.
+    // `macho64-arm64` and `macho64-x86_64` are both 64-bit, so a wrong-arch
+    // object still passes this probe and still reaches the reader's
+    // cputype-naming refusal. Only a 32-bit object — which no 64-bit reader
+    // can decode a single table of — falls out, exactly as a 32-bit ELF
+    // object already falls out of the ELF arm.
+    //
+    // ⚠ FAIL-CLOSED ON A SCHEMA THAT DECLARED NO CPUTYPE, EXPLICITLY, and it
+    // needs its own arm here where the ELF arm got the property for free: a
+    // zero `elf.fileClass` matches no real file, but a zero `macho.cputype`
+    // has ABI64 CLEAR, which would silently turn "declared nothing" into
+    // "declares 32-bit" and recognize 32-bit objects for a document that
+    // stated nothing at all. The validation-bypassing
+    // `ObjectFormatSchema{ObjectFormatData}` constructor makes that schema
+    // reachable, so the guard is the same one the PE arm carries for
+    // `IMAGE_FILE_MACHINE_UNKNOWN` — not defensive decoration.
+    [[nodiscard]] bool looksLikeRelocatableObject(
+            detail::ObjectFormatData const& d,
+            std::span<std::uint8_t const>   bytes) const noexcept override {
+        if (d.macho.cputype == 0u) return false;   // declared nothing → matches nothing
+        std::uint32_t const wantMagic =
+            (d.macho.cputype & kMachOCpuArchAbi64) != 0u ? kMachOThinMagic64
+                                                         : kMachOThinMagic32;
+        // Whichever lens yields THIS SCHEMA'S thin magic IS the file's lens.
+        // The `else` covers every remaining input in one arm — too short, a
+        // fat header, the other width, or not Mach-O at all — so there is no
+        // branch here that cannot fire.
+        bool bigEndian = false;
+        if (auto const le = machoProbeReadU32(bytes, 0, /*bigEndian=*/false);
+            le && *le == wantMagic) {
+            bigEndian = false;
+        } else if (auto const be = machoProbeReadU32(bytes, 0, /*bigEndian=*/true);
+                   be && *be == wantMagic) {
+            bigEndian = true;
+        } else {
+            return false;
+        }
+
+        auto const filetype =
+            machoProbeReadU32(bytes, kMachOFiletypeOff, bigEndian);
+        return filetype.has_value() && *filetype == kMachOMhObject;
     }
 
     // ★ THE ONE BACKEND THAT ANSWERS TRUE. Mach-O is the only shipped format
@@ -159,8 +332,8 @@ public:
                                               " / ")));
                         }
                     } else if (ft.is_number_integer()) {
-                        // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-
-                        // CLOSED-SET, on the WIRE half. `MachOObjectType`'s
+                        // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET,
+                        // on the WIRE half. `MachOObjectType`'s
                         // enumerators ARE the MH_* wire values, so the accepted
                         // integers are a projection of the same table the string
                         // arm resolves through — this used to be a 1/2/6
@@ -467,8 +640,8 @@ public:
                                 // nCodeSlots*hashSize layout math safely within
                                 // u32 for any in-range codeLimit (a sub-page
                                 // pageSize like 1 would overflow the slot table
-                                // on a multi-GiB binary — D-LK7-CODESIGN-
-                                // PAGESIZE-OVERFLOW-HARDENING for the residual
+                                // on a multi-GiB binary —
+                                // D-LK7-CODESIGN-PAGESIZE-OVERFLOW-HARDENING for the residual
                                 // ~4 GiB-codeLimit case).
                                 if (v < 4096
                                  || v > 65536
@@ -519,8 +692,8 @@ public:
                         }
                     }
                 }
-                // LC_BUILD_VERSION platform / min-OS / SDK (D-LK10-ENTRY-
-                // MACHO-EXIT). Optional nested object; absent → no
+                // LC_BUILD_VERSION platform / min-OS / SDK
+                // (D-LK10-ENTRY-MACHO-EXIT). Optional nested object; absent → no
                 // LC_BUILD_VERSION emitted. `platform` is a CLOSED enum (a
                 // typo fails loud, mirroring codeSignature). `minOs`/`sdk`
                 // are dotted "X.Y[.Z]" version strings encoded to the on-wire
@@ -749,8 +922,8 @@ public:
                 // them (`machoObjectTypeName`), not retyped: a remedy that
                 // names a spelling by hand goes stale on a rename exactly as a
                 // retyped accepted-set does, and a remedy nobody can follow is
-                // worse than none (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-
-                // THEIR-CLOSED-SET, at single-value scale).
+                // worse than none (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET,
+                // at single-value scale).
                 fail("/image/useChainedFixups",
                      std::format(
                          "'useChainedFixups' = true is invalid for "

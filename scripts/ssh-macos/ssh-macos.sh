@@ -41,6 +41,17 @@ set -uo pipefail
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 CONF=$REPO/.secrets/macos.env
 
+# ★ RESOLVED BY EXECUTION, NOT BY `command -v` -- which LIES on these hosts, and a
+# `WindowsApps` stub answers yes and then does nothing. `python` is the name a
+# Windows install puts on PATH, `python3` the one WSL and macOS use; a carriage that
+# hardcodes either fails elsewhere with a message that reads as a missing dependency
+# rather than as a missing name. ⓘ Only the `--push` path needs it, so a host with no
+# python can still use every other subcommand: the refusal is at the use, not here.
+PY=""
+for _c in python3 python; do
+    if "$_c" -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then PY="$_c"; break; fi
+done
+
 # ★ ENV MUST WIN OVER THE CONFIG FILE, AND THAT TAKES DELIBERATE CODE. `.` sources
 # the file INTO THIS SHELL, so a bare `. "$CONF"` OVERWRITES whatever the caller put
 # in the environment — the exact reverse of the precedence stated at the top of this
@@ -95,12 +106,32 @@ fi
 # diagnostic names the override rather than leaving it to be discovered.
 target=$DSS_MACOS_HOST
 if ! printf '%s' "$DSS_MACOS_HOST" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
-    resolved=$(getent hosts "$DSS_MACOS_HOST" 2>/dev/null | awk '{print $1; exit}')
-    [ -z "$resolved" ] && resolved=$(ping -c1 -W1 "$DSS_MACOS_HOST" 2>/dev/null \
+    # ★★★ EVERY RESOLVER BELOW READS FROM /dev/null, AND THAT REDIRECT IS THE WHOLE
+    # POINT OF THIS BLOCK RATHER THAN AN AFTERTHOUGHT.
+    #
+    # ⚠ D-SCRIPT-SSH-MACOS-RESOLVER-DRAINS-THE-CALLER-S-STDIN: a command substitution
+    # INHERITS this script's stdin. `macos-leg.sh` pipes its entire remote body into
+    # `ssh-macos.sh ... bash -s`, so a resolver that reads stdin CONSUMES THE SCRIPT
+    # IT WAS SUPPOSED TO SEND, and `bash -s` on the far side receives ZERO BYTES.
+    # ✔MEASURED 2026-08-25 (cycle P36, lane B), same host and payload, only the
+    # resolution path changing:
+    #     hostname form : printf '12345678\n' | ssh-macos.sh "wc -c"  ->  0
+    #     IP form       : DSS_MACOS_HOST=<ip> ...                     ->  9
+    # ⇒ EVERY macOS leg taken through the `.local` name ended in "no witness came
+    # back ... UNKNOWN". `--push` was immune only because it builds its own pipe.
+    #
+    # ★ IT IS FAIL-CLOSED — no false green was ever produced — and the witness
+    # discipline is what surfaced it. But a leg that cannot run is not a leg that
+    # passed, and this file's header previously asserted the OPPOSITE ("stdin
+    # survives byte-exact ... the 2026-08-18 note claiming the login profile eats
+    # stdin is expired"). That note was RIGHT; the measurement which overturned it
+    # tested DATA over stdin, not a shell READING A SCRIPT from it.
+    resolved=$(getent hosts "$DSS_MACOS_HOST" 2>/dev/null </dev/null | awk '{print $1; exit}')
+    [ -z "$resolved" ] && resolved=$(ping -c1 -W1 "$DSS_MACOS_HOST" 2>/dev/null </dev/null \
         | sed -n 's/.*(\([0-9.]\{7,15\}\)).*/\1/p' | head -1)
     # ★ avahi, when this is a Linux box that actually has an mDNS responder.
     if [ -z "$resolved" ] && command -v avahi-resolve-host-name >/dev/null 2>&1; then
-        resolved=$(avahi-resolve-host-name -4 "$DSS_MACOS_HOST" 2>/dev/null | awk '{print $2; exit}')
+        resolved=$(avahi-resolve-host-name -4 "$DSS_MACOS_HOST" 2>/dev/null </dev/null | awk '{print $2; exit}')
     fi
     # ★★★ DELEGATE TO THE WINDOWS RESOLVER — THE ONE THAT ACTUALLY SPEAKS mDNS HERE.
     # ✔MEASURED 2026-08-17: from Git Bash and WSL, `getent` and `ping` both fail on a
@@ -118,7 +149,7 @@ if ! printf '%s' "$DSS_MACOS_HOST" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; t
             command -v "$_psh" >/dev/null 2>&1 || continue
             resolved=$("$_psh" -NoProfile -NonInteractive -Command \
                 "try { [System.Net.Dns]::GetHostAddresses('$DSS_MACOS_HOST') | Where-Object { \$_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1 -ExpandProperty IPAddressToString } catch { }" \
-                2>/dev/null | tr -d '\r' | grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -1)
+                2>/dev/null </dev/null | tr -d '\r' | grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -1)
             [ -n "$resolved" ] && break
         done
         unset _psh
@@ -150,6 +181,30 @@ if ! printf '%s' "$DSS_MACOS_HOST" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; t
         exit 3
     fi
     target=$resolved
+fi
+
+# ★★★ `--resolve` — PRINT THE ADDRESS AND EXIT, SO A CALLER CAN ASK THE QUESTION
+# ONCE INSTEAD OF ONCE PER CARRIAGE CALL.
+#
+# ⚠ D-SCRIPT-MACOS-LEG-RERESOLVES-THE-HOST-AT-EVERY-CARRIAGE-CALL. A leg invokes
+# this script several times — `leg-tree prepare`, the rsync, the build, the
+# ctest — and each invocation re-runs the whole resolver above. Under WSL that
+# resolver's only working arm is a hop out to the Windows mDNS resolver, so any
+# ONE transient miss kills a leg that has already done minutes of work.
+# ✔MEASURED 2026-08-28: `remote-leg --carriage macos` resolved for
+# `leg-tree prepare` (reaching 192.168.0.71 and moving the clone from `301e2a63`
+# + 2854 dirty paths to a pristine `73f74972`) and then FAILED to resolve for the
+# rsync seconds later. ★ This file's own header already recorded the same shape
+# from the other side — *"mDNS then answered for the rsync and failed for the
+# build minutes later"* — as a symptom of a different defect; it is a property of
+# ASKING REPEATEDLY, and that is what this mode removes.
+#
+# ⛔ IT DOES NOT PUT AN IP IN THE CONFIG, and that distinction is the whole design:
+# the Mac is on DHCP, so a pinned address is wrong the moment the lease changes.
+# The config keeps the NAME; the RUN gets one resolution, valid for its lifetime.
+if [ "${1:-}" = "--resolve" ]; then
+    printf '%s\n' "$target"
+    exit 0
 fi
 
 args=(-o ConnectTimeout=10 -o BatchMode=yes)
@@ -200,6 +255,211 @@ fi
 #
 # `-a` preserves mtimes DELIBERATELY (ninja keys on them); a caller that needs a
 # rebuild touches what moved, which every leg driver here already does.
+# ★★★ `--push <local-dir> <remote-dir>` — THE TRANSPORT FOR A SHELL WITH NO LOCAL
+# rsync, WHICH IS THE PRIMARY WINDOWS SHELL THIS PROJECT USES.
+#
+# ⚠ `--rsync` above `exec`s the LOCAL rsync, and ✔MEASURED 2026-08-25 there is no
+# rsync in Git Bash (`tar`, `ssh` and `scp` are all present; `rsync` is not). So the
+# macOS carriage was unreachable for a tree push from the one shell the Windows leg
+# actually runs in, and the four-leg gate had no way to reach the Mac at all.
+#
+# ★★ THIS REVIVES THE TAR TRANSPORT THE `--rsync` BLOCK RETIRED, BECAUSE THE FACT
+# THAT RETIRED IT IS NO LONGER TRUE. That block records: ✔MEASURED 2026-08-18, a
+# `tar | ssh 'tar -x'` push DIED with "Unrecognized archive format" because the
+# host's login profile CONSUMED STDIN, and `printf 'X' | ssh-macos.sh cat` returned
+# NOTHING. ✔RE-MEASURED 2026-08-25 on the same host: `printf 'XSTDINX' | ssh-macos.sh
+# cat` returns `XSTDINX`, and 1000 bytes of /dev/urandom arrive with an IDENTICAL
+# md5 (`cc0d71470a8dbc8463d30278692af1d6` both ends). Stdin survives byte-exact.
+# ⇒ the premise expired; the mode it justified did not. `--rsync` KEEPS its place
+# for callers that have rsync, and this is the sibling for callers that do not.
+#
+# ★★ AND IT DOES NOT REINTRODUCE THE SILENT HALF, which is the real reason the old
+# tar transport deserved retiring. That header's second complaint stands on its own:
+# when the old push failed, the caller could not distinguish success from a
+# TRUNCATED archive — the remote tar reported the error, the local tar reported
+# SIGPIPE, and the driver printed "FAIL push" carrying neither. Two defences here:
+#   * BOTH ends are checked via PIPESTATUS, not just the pipeline's last stage;
+#   * the remote side emits a WITNESS token only after tar exits 0, and this refuses
+#     unless that token comes back — the same tool-emitted-witness discipline
+#     `scripts/run-gate` uses, for the same reason: an exit status can be produced by
+#     the wrong process, a witness cannot.
+#
+# ⚠ EXCLUDES ARE ANCHORED (`./build`, never `build`). ✔MEASURED and recorded in
+# `scripts/wsl-leg`: an UNANCHORED exclude once silently skipped
+# `src/program/build_scripts.cpp`, and a gate leg was configured against a tree
+# missing a changed `.cpp`. An exclude that over-matches does not fail — it produces
+# a green run over the wrong source, which is the failure this project cares most about.
+#
+# ⚠ tar PRESERVES MTIMES, exactly as `rsync -a` does, so a pushed source whose mtime
+# lands behind an existing build output makes ninja skip it. A caller that needs a
+# rebuild builds CLEAN; do not "fix" that here by discarding times.
+if [ "${1:-}" = "--push" ]; then
+    shift
+    # ★★★ `--prune` MAKES THE PUSH A SYNC. Without it this mode is an ACCUMULATION: tar
+    # extraction never deletes, so a file removed locally lives forever on the remote and
+    # the gate tests a tree that exists nowhere. ✔MEASURED 2026-08-25 -- see the header.
+    # ⚠ It is OPT-IN and named, for the same reason `--reset-to` is: this deletes files on
+    # somebody's machine, and a transport that does that as a silent default is a transport
+    # that eventually deletes the wrong tree. A gate LEG passes it, because a leg's whole
+    # contract is "test THIS tree"; an ad-hoc push should not have to.
+    _prune=0
+    if [ "${1:-}" = "--prune" ]; then _prune=1; shift; fi
+    if [ $# -ne 2 ]; then
+        echo "ssh-macos: --push needs exactly <local-dir> <remote-dir> (optionally after --prune)" >&2
+        exit 2
+    fi
+    _src=$1
+    _dst=$2
+    if [ ! -d "$_src" ]; then
+        echo "ssh-macos: --push source '$_src' is not a directory" >&2
+        exit 2
+    fi
+    case "$_dst" in
+        ""|"/"|"~"|"~/"|"\$HOME") echo "ssh-macos: --push refuses destination '$_dst'" >&2; exit 2 ;;
+    esac
+    # ⚠⚠ THE DESTINATION GOES TO THE REMOTE SHELL **UNQUOTED**, AND THAT IS DELIBERATE —
+    # A TILDE ONLY EXPANDS UNQUOTED. ✔MEASURED 2026-08-25, and it is the exact
+    # silent-success this mode exists to prevent: with the destination single-quoted,
+    # `--push <src> '~/dss-pushtest'` reported OK, the witness fired, and the files
+    # landed in a directory literally NAMED `~` — tar genuinely succeeded, just not
+    # where the caller asked. An exit status and a success token both said yes.
+    # ⇒ unquoted, and therefore a destination carrying whitespace or a shell
+    # metacharacter is REFUSED rather than mangled. A remote path is the remote
+    # shell's to resolve; the caller's job is to hand it something unambiguous.
+    case "$_dst" in
+        *[[:space:]]*|*';'*|*'&'*|*'|'*|*'`'*|*'$('*|*'>'*|*'<'*)
+            echo "ssh-macos: --push refuses a destination with whitespace or shell metacharacters: '$_dst'" >&2
+            exit 2 ;;
+    esac
+    _witness="DSS_PUSH_OK_$$"
+    args+=("$DSS_MACOS_USER@$target")
+    # ★ THE WITNESS CARRIES THE RESOLVED PATH, so "it worked" and "it worked in the
+    # place you asked for" are ONE check rather than two. The measurement above is
+    # why: a witness that only proves success is satisfied by success elsewhere.
+    # ⚠ `./.claude/worktrees` IS EXCLUDED, AND IT IS THE LARGEST EXCLUDE HERE.
+    # ✔MEASURED 2026-08-25: the Mac held 16,312 files against a local 6,660, and 9,638 of
+    # the difference was `.claude/worktrees/**` -- a FULL COPY OF THE REPO PER LIVE AGENT,
+    # shipped to the gate host on every push and left there. That is not merely transport
+    # waste: the examples runner GLOBS `examples/<lang>/*`, and a worktree carries its own
+    # `examples/` tree, so a gate host that holds one can run a corpus that belongs to
+    # somebody's uncommitted lane.
+    #
+    # ★ `-m` ON EXTRACT (do not extract modification time), for TWO reasons.
+    # (1) It retires D-SYNC-RSYNC-PRESERVED-MTIME-DEFEATS-THE-REBUILD at the source: a
+    #     pushed file can no longer land BEHIND an existing build output, so ninja can no
+    #     longer silently skip it. The mtime hazard was the whole reason the macOS leg
+    #     builds clean.
+    # (2) It is what makes `--prune` below SAFE -- "was this file in the archive" becomes
+    #     "is it newer than the stamp", which is a question the remote can answer without
+    #     trusting a manifest that could itself have arrived truncated.
+    # ★★★ AND THE EXCLUDE LIST IS DERIVED, NOT TYPED. This enumeration was one of
+    # four, and every one of them spelled `node_modules` ANCHORED at the top level,
+    # which `.kilo/node_modules` is not. ✔MEASURED 2026-08-26 by running THIS list
+    # against the live tree: it ships **9,284 members where the derivation ships
+    # 3,583** -- 3,938 of `.kilo/node_modules`, 1,431 of `test-scratch/`, 268 of
+    # `.temp/`, 49 `__pycache__` entries, `.claude/settings.local.json`, and FIVE
+    # FILES OF `.secrets/` -- connection data and key PATHS for real machines, in a
+    # repository slated to go public. This list named none of them.
+    # ⚠ The Mac itself holds only 4 `.kilo` files, because the pushes that built it
+    # ran through the `.ps1`/bsdtar path; the leak here is latent, not historical.
+    # A host is not interchangeable with the list that feeds it.
+    # D-SCRIPT-CARRIAGE-EXCLUDES-ARE-A-HAND-LIST-AND-MISS-NESTED-IGNORED-TREES
+    # ⓘ `.git` stays a POLICY withhold (`--also`): this carriage syncs no history,
+    # and the remote `.git` would otherwise name an unrelated commit.
+    _excl="${TMPDIR:-/tmp}/ssh-macos-excludes.$$"
+    if [ -z "$PY" ]; then
+        echo "ssh-macos: --push needs python3/python on PATH to derive the exclude list" >&2
+        exit 1
+    fi
+    if ! "$PY" "$REPO/scripts/carriage-excludes/carriage-excludes.py" \
+            --format tar --repo "$_src" --also .git --out "$_excl"; then
+        echo "ssh-macos: carriage-excludes refused -- refusing to push a list it would not vouch for" >&2
+        rm -f "$_excl"; exit 1
+    fi
+    tar -c -C "$_src" -X "$_excl" \
+        -f - . \
+      | ssh "${args[@]}" "mkdir -p $_dst && cd $_dst && mkdir -p build && touch build/.dss-push-stamp && sleep 1 && tar -x -m -f - && echo $_witness:\$(pwd -P)" \
+      > "${TMPDIR:-/tmp}/ssh-macos-push.$$" 2>&1
+    _st=("${PIPESTATUS[@]}")
+    _out=$(cat "${TMPDIR:-/tmp}/ssh-macos-push.$$" 2>/dev/null)
+    rm -f "${TMPDIR:-/tmp}/ssh-macos-push.$$" "$_excl"
+    if [ "${_st[0]}" != "0" ] || [ "${_st[1]}" != "0" ]; then
+        echo "ssh-macos: --push FAILED (local tar rc=${_st[0]}, remote rc=${_st[1]})" >&2
+        echo "$_out" >&2
+        exit 1
+    fi
+    _landed=$(printf '%s\n' "$_out" | sed -n "s/^.*$_witness://p" | tail -1)
+    if [ -z "$_landed" ]; then
+        echo "ssh-macos: --push produced no witness — the archive may have arrived TRUNCATED" >&2
+        echo "$_out" >&2
+        exit 1
+    fi
+    case "$_landed" in
+        /*) ;;
+        *) echo "ssh-macos: --push witness carried a non-absolute path '$_landed'" >&2; exit 1 ;;
+    esac
+    echo "ssh-macos: --push OK -> $_landed"
+
+    if [ "$_prune" = "1" ]; then
+        # The stamp was created BEFORE the archive was extracted and every extracted file
+        # carries a fresh mtime (`-m` above), so "older than the stamp" is exactly "was not
+        # in the archive". The script goes over STDIN as a FILE, never quoted into a `-c`
+        # string -- that is the trap that once turned a variable into `rsync -a --delete / /`.
+        _prune_body=$(cat <<'PRUNE_EOF'
+set -uo pipefail
+cd "$D" || { echo "[X] prune: $D missing"; exit 1; }
+S=build/.dss-push-stamp
+[ -f "$S" ] || { echo "[X] prune: no push stamp -- REFUSING (cannot tell fresh from stale)"; exit 1; }
+
+# ⚠ THE RAIL THAT MATTERS. If the archive arrived truncated, almost nothing is fresh and
+# a prune would delete the tree it was supposed to update. Refuse loudly instead.
+_fresh=$(find . -type f -newer "$S" \
+    -not -path './build/*' -not -path './.git/*' -not -path './scratchpad/*' \
+    -not -path './target/*' -not -path './.venv/*' -not -path './node_modules/*' \
+    | wc -l | tr -d ' ')
+if [ "${_fresh:-0}" -lt 100 ]; then
+    echo "[X] prune: only ${_fresh:-0} file(s) look freshly extracted -- REFUSING."
+    echo "    A truncated archive here would delete the tree this push was updating."
+    exit 1
+fi
+
+find . -type f ! -newer "$S" \
+    -not -path './build/*' -not -path './.git/*' -not -path './scratchpad/*' \
+    -not -path './target/*' -not -path './.venv/*' -not -path './node_modules/*' \
+    -print -delete > "$S.pruned" 2>/dev/null
+echo "PRUNED=$(wc -l < "$S.pruned" | tr -d ' ') FRESH=$_fresh"
+head -25 "$S.pruned"
+rm -f "$S" "$S.pruned"
+
+# The files are gone; the directories that held them are not. A hollow
+# `.claude/worktrees/agent-*` still reads as "this host holds worktrees" to the next
+# person who looks. `-delete` implies `-depth` on BSD find, so nested empties collapse
+# in one pass. Every empty directory here is a leftover: git tracks no empty directory,
+# so anything the repo genuinely wants arrives holding a file.
+_dirs=$(find . -type d -empty \
+    -not -path './build' -not -path './build/*' -not -path './.git' -not -path './.git/*' \
+    -not -path './scratchpad' -not -path './scratchpad/*' -not -path './target/*' \
+    -not -path './.venv/*' -not -path './node_modules/*' -not -path '.' \
+    -print -delete | wc -l | tr -d ' ')
+echo "PRUNED_DIRS=$_dirs"
+PRUNE_EOF
+)
+        printf 'D=%s\n%s\n' "$_dst" "$_prune_body" \
+          | ssh "${args[@]}" 'bash -s' > "${TMPDIR:-/tmp}/ssh-macos-prune.$$" 2>&1
+        _pout=$(cat "${TMPDIR:-/tmp}/ssh-macos-prune.$$" 2>/dev/null)
+        rm -f "${TMPDIR:-/tmp}/ssh-macos-prune.$$"
+        # A witness, not an exit code: the status of a pipeline is the last stage's, and
+        # this project has been bitten by that exact substitution before.
+        case "$_pout" in
+            *PRUNED=*) printf '%s\n' "$_pout" | sed -n '1,26p' ;;
+            *) echo "ssh-macos: --prune produced no PRUNED= witness -- the remote tree may still hold stale files" >&2
+               printf '%s\n' "$_pout" >&2
+               exit 1 ;;
+        esac
+    fi
+    exit 0
+fi
+
 if [ "${1:-}" = "--rsync" ]; then
     shift
     if [ $# -lt 2 ]; then

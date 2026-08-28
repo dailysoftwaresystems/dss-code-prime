@@ -225,6 +225,35 @@ struct DSS_EXPORT HirInlineAsmOperand {
     // Non-empty ⇔ the letter PINS one physical register (`"=a"` → `rax`). The
     // NAME as the target declares it, so no consumer re-resolves an ordinal.
     std::string   fixedRegister;
+
+    // ── the OPERAND-FORM half of the SAME resolution ──
+    //
+    // ★★★ A CONSTRAINT LETTER BINDS ONE OF **THREE** THINGS AND THE TWO FIELDS
+    // ABOVE CARRY ONLY TWO OF THEM. `TargetAsmConstraint::binds` is a
+    // three-armed discriminator (`registerClass`, `register`, `operandKind`);
+    // a letter on the THIRD arm — `"m"` → `membase`, `"i"` → `imm32` — selects
+    // an operand FORM and correctly has no register class at all. Until this
+    // pair existed the third arm resolved to NOTHING, which is byte-identical
+    // to "no target was in scope", so the consumer refused a letter the target
+    // DOES declare with a message asserting it "was never bound to a
+    // processor" — a refusal whose stated reason is false, which sends the
+    // next reader to fix a config that is already correct
+    // (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED).
+    //
+    // ⚠ THE PAIR IS THE `regClassResolved` IDIOM, NOT A NEW ONE, and it is a
+    // pair for that field's reason: `OperandKindFilter::Reg` is 0, so a
+    // zero-initialized `operandKind` reads back as a PLAUSIBLE answer to a
+    // consumer that forgot to ask whether anything resolved at all. The bool is
+    // the only value that cannot be mistaken for a measurement — the argument
+    // `TargetAsmConstraint`'s three `optional` payloads make one tier up.
+    //
+    // ⇒ THE HONEST REFUSAL CONDITION AT EVERY CONSUMER IS
+    // `!regClassResolved && !operandKindResolved` — "the letter resolved to
+    // nothing" — never `!regClassResolved` alone. The two are mutually
+    // exclusive by construction: `binds` names exactly one arm.
+    // Raw enum value for the reason `regClass` is one.
+    bool          operandKindResolved = false;
+    std::uint8_t  operandKind         = 0;
 };
 
 // Everything an `__asm__` statement carries, decoded once at the front end.

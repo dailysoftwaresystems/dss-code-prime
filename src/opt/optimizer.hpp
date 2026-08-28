@@ -109,7 +109,7 @@ optPassIdName(PassId id) noexcept {
 // inlineThreshold` defaults to this when the pipeline JSON omits the
 // key (and a programmatic `OptPipeline{}` construction inherits it).
 // 50 MIR instructions is a conservative size cap — large enough to
-// inline the small leaf/helper callees the c-subset frontend emits,
+// inline the small leaf/helper callees the c frontend emits,
 // small enough that shipping `Inlining` in `release.pipeline.json`
 // cannot blow up code size on a big callee. A size-based bloat bound;
 // the SOPHISTICATED cost model (call-site hotness, growth-vs-benefit)
@@ -123,6 +123,56 @@ inline constexpr std::uint32_t kDefaultInlineThreshold = 50;
 // is uint32 (a callee's instruction-count can exceed a uint8/uint16
 // range; `<cstdint>` keeps it GCC-portable).
 inline constexpr std::uint32_t kMaxInlineThreshold = 100000;
+
+// ★★★ THE PER-CALLER CUMULATIVE GROWTH BUDGET (P36 Lane R) — the bound
+// `inlineThreshold` was never able to be.
+//
+// `inlineThreshold` is a PER-CALLEE size bound: it refuses ONE callee that
+// is too big. NOTHING bounded CUMULATIVE growth — twenty callees of 49
+// instructions each are twenty legal inlines under a threshold of 50 — so
+// the only thing standing between the release pipeline and unbounded code
+// growth was the fixpoint's iteration cap. ✔MEASURED (P36, 103-TU sqlite):
+// with the cap raised the per-iteration splice count converges on EXACTLY
+// 2x per iteration; the inlining fixpoint DIVERGES. `{"fixpoint": {"max"}}`
+// was a growth bound wearing an iteration-count costume, which is why
+// raising it traded a working compiler for an out-of-memory kill.
+//
+// `inlineCallerGrowthPercent` is that missing bound, stated where it
+// belongs: a caller may grow, ACROSS THE WHOLE `optimize()` CALL (every
+// fixpoint iteration together, via `passes::InlineGrowthLedger`), by at
+// most this percentage of its OWN ORIGINAL instruction count — the size it
+// had when the Inlining pass first saw it in this call.
+//
+// ★ WHY PER-CALLER AND NOT PER-MODULE, which is the design point that is
+// easy to get subtly wrong: a MODULE-WIDE budget makes the emitted program
+// depend on TRAVERSAL ORDER — on which caller happens to spend the shared
+// budget first. The operator has already ruled on the neighbouring OPT11
+// work that optimized output must be byte-identical for any prefetch depth,
+// and the UNIT stage optimizes CUs CONCURRENTLY (`--jobs`), so a shared
+// counter would not merely be order-sensitive, it would be racy. A
+// per-caller budget is order-independent BY CONSTRUCTION: each caller's
+// ceiling is a function of its own original size and nothing else, so no
+// caller can consume another's. (GCC draws exactly this line: its
+// `large-function-growth` is the per-function half we implement; its
+// `inline-unit-growth` is the module-wide half we must not.)
+//
+// TERMINATION, which is the property the fixpoint never had: every caller
+// has a FIXED ceiling that does not move as it grows, so total module size
+// is bounded by SUM over f of (original(f) + allowance(f)) regardless of how
+// many iterations run. Raising `max` can then only improve CONVERGENCE; it
+// can no longer change how big the program gets.
+inline constexpr std::uint32_t kDefaultInlineCallerGrowthPercent = 30;
+// Substrate UPPER bound on `OptPipeline::inlineCallerGrowthPercent` — the
+// loader rejects values outside [0, kMaxInlineCallerGrowthPercent].
+//
+// ⚠ 0 IS LEGAL HERE AND IS *NOT* A SILENT REFUSE-ALL (the reason
+// `inlineThreshold` rejects 0 does not carry over): the allowance has a
+// FLOOR of `inlineThreshold` instructions — see `inlineCallerGrowthPercent`
+// — so growth 0 still admits one maximal legal callee per caller. It means
+// "inline only what fits in the floor", a real and useful posture.
+// The cap is a large sanity bound; at 100000% the budget is effectively
+// unbounded, which is what a hand-built test fixture wants.
+inline constexpr std::uint32_t kMaxInlineCallerGrowthPercent = 100000;
 
 // ── The pipeline schedule tree (P10 operator ruling, 2026-08-18) ──────
 //
@@ -305,6 +355,19 @@ struct OptPipeline {
     // only a 1-instruction callee. The loader rejects 0 (a silent
     // refuse-all trap) and caps at `kMaxInlineThreshold`.
     std::uint32_t       inlineThreshold = kDefaultInlineThreshold;
+    // The PER-CALLER CUMULATIVE growth budget (see
+    // `kDefaultInlineCallerGrowthPercent` for the whole argument). A caller
+    // may grow across the WHOLE optimize() call by at most
+    //     max(original * inlineCallerGrowthPercent / 100, inlineThreshold)
+    // instructions, where `original` is its size the first time the Inlining
+    // pass saw it in this call. The `inlineThreshold` FLOOR is not a fudge
+    // factor: without it the per-callee threshold would be a lie for small
+    // callers (a 4-instruction wrapper could never absorb the 30-instruction
+    // helper the threshold says is inlinable), and wrappers are precisely
+    // where inlining pays. Config-driven (the pipeline JSON's optional
+    // `inlineCallerGrowthPercent`) — NOT a language / target / format branch.
+    std::uint32_t       inlineCallerGrowthPercent =
+        kDefaultInlineCallerGrowthPercent;
     // Verify frequency (D-OPT1-VERIFY-FREQUENCY-CONFIG). `true` (the safe
     // default) runs `MirVerifier` after EVERY successful pass — the developer
     // posture (LLVM `opt -verify-each` / GCC `--enable-checking=yes`): it

@@ -5,6 +5,7 @@
 #include "core/types/token.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_builder.hpp"
+#include "shipped_schema_or_throw.hpp"   // the ONE load-or-fail-this-test helper
 #include "tokenizer/tokenizer.hpp"
 
 #include <gtest/gtest.h>
@@ -24,20 +25,32 @@ struct H {
 };
 
 [[nodiscard]] H loadToy(std::string text) {
-    auto loaded = GrammarSchema::loadShipped("toy");
-    EXPECT_TRUE(loaded.has_value()) << "toy.lang.json load failed";
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT.
+    // This used to be a NON-FATAL `EXPECT_TRUE` followed by
+    // `.schema = loaded.has_value() ? *loaded : nullptr` -- so on a torn
+    // shipped config the fixture recorded a failure and then handed a NULL
+    // schema to `Tokenizer`, whose `tokenizerFatal("schema is null")`
+    // correctly refuses and aborts. ✔MEASURED: the whole binary exited
+    // 0xC0000409 with no `[  FAILED  ]` line and no case name. The product
+    // guard was right; the fixture drove it there.
     return H{
         .src    = SourceBuffer::fromString(std::move(text), "<test>"),
-        .schema = loaded.has_value() ? *loaded : nullptr,
+        .schema = dss::test_support::shippedSchemaOrThrow("toy"),
     };
 }
 
-[[nodiscard]] H loadCSubset(std::string text) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
-    EXPECT_TRUE(loaded.has_value()) << "c-subset.lang.json load failed";
+[[nodiscard]] H loadC(std::string text) {
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT.
+    // This used to be a NON-FATAL `EXPECT_TRUE` followed by
+    // `.schema = loaded.has_value() ? *loaded : nullptr` -- so on a torn
+    // shipped config the fixture recorded a failure and then handed a NULL
+    // schema to `Tokenizer`, whose `tokenizerFatal("schema is null")`
+    // correctly refuses and aborts. ✔MEASURED: the whole binary exited
+    // 0xC0000409 with no `[  FAILED  ]` line and no case name. The product
+    // guard was right; the fixture drove it there.
     return H{
         .src    = SourceBuffer::fromString(std::move(text), "<test>"),
-        .schema = loaded.has_value() ? *loaded : nullptr,
+        .schema = dss::test_support::shippedSchemaOrThrow("c"),
     };
 }
 
@@ -216,8 +229,8 @@ TEST(Tokenizer, IdentifiersAcceptUnderscoreAndDigits) {
 
 TEST(Tokenizer, IntegerLiteral) {
     // 08.55: numeric scanning is config-driven; toy has no `numberStyle`
-    // so we use c-subset which declares the full C-style block.
-    auto h      = loadCSubset("12345");
+    // so we use c which declares the full C-style block.
+    auto h      = loadC("12345");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -227,7 +240,7 @@ TEST(Tokenizer, IntegerLiteral) {
 }
 
 TEST(Tokenizer, FloatLiteralWithFractionalPart) {
-    auto h      = loadCSubset("3.14");
+    auto h      = loadC("3.14");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -235,7 +248,7 @@ TEST(Tokenizer, FloatLiteralWithFractionalPart) {
 }
 
 TEST(Tokenizer, FloatLiteralWithExponent) {
-    auto h      = loadCSubset("1e10");
+    auto h      = loadC("1e10");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -243,7 +256,7 @@ TEST(Tokenizer, FloatLiteralWithExponent) {
 }
 
 TEST(Tokenizer, FloatLiteralWithSignedExponent) {
-    auto h      = loadCSubset("1.5e-3");
+    auto h      = loadC("1.5e-3");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -251,7 +264,7 @@ TEST(Tokenizer, FloatLiteralWithSignedExponent) {
 }
 
 TEST(Tokenizer, FloatLiteralWithFSuffixPromotesIntToFloat) {
-    auto h      = loadCSubset("0f");
+    auto h      = loadC("0f");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -260,7 +273,7 @@ TEST(Tokenizer, FloatLiteralWithFSuffixPromotesIntToFloat) {
 TEST(Tokenizer, BareENotConsumedAsExponentWhenNoDigitFollows) {
     // `1e+` is NOT a float — no digit after the sign. Tokenizer emits
     // exactly three tokens: IntLiteral("1"), Word("e"), Operator("+").
-    auto h      = loadCSubset("1e+");
+    auto h      = loadC("1e+");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 3u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -275,9 +288,9 @@ TEST(Tokenizer, MemberAccessDotIsNotPartOfFloat) {
     // `a.foo` member access: the dot after a WORD never enters the
     // numeric scanner — three tokens. (FC1 cycle 2 rewrote this
     // test's input: it previously pinned `3.foo` → `3`+`.`+`foo`,
-    // the pre-C23 digit-after-dot-only rule that c-subset's new
+    // the pre-C23 digit-after-dot-only rule that c's new
     // `trailingFraction` opt-in replaces.)
-    auto h      = loadCSubset("a.foo");
+    auto h      = loadC("a.foo");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 3u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word);
@@ -287,13 +300,13 @@ TEST(Tokenizer, MemberAccessDotIsNotPartOfFloat) {
 }
 
 TEST(Tokenizer, TrailingFractionMakesDigitsDotOneFloat) {
-    // FC1 cycle 2 (`trailingFraction: true` in c-subset — C23
+    // FC1 cycle 2 (`trailingFraction: true` in c — C23
     // 6.4.4.2 fractional-constant `digit-sequence .`): `3.` is ONE
     // float — and the float-suffix maximal-munch then takes the `f`,
     // so `3.foo` lexes as the float `3.f` + the word `oo`. (Real C
     // absorbs `3.foo` into one ill-formed pp-number; either way the
     // downstream parse diagnoses the adjacency loudly.)
-    auto h      = loadCSubset("3.foo");
+    auto h      = loadC("3.foo");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 2u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -302,7 +315,7 @@ TEST(Tokenizer, TrailingFractionMakesDigitsDotOneFloat) {
 
     // The pure trailing-dot form (whitespace-delimited, no suffix
     // ambiguity): exactly `3.`.
-    auto h2      = loadCSubset("3. ;");
+    auto h2      = loadC("3. ;");
     auto result2 = lex(h2);
     ASSERT_GE(result2.tokens.size(), 1u);
     EXPECT_EQ(result2.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -317,7 +330,7 @@ TEST(Tokenizer, TrailingFractionMakesDigitsDotOneFloat) {
 // exists for); a float-shaped token takes only float suffixes.
 
 TEST(Tokenizer, IntegerShapedLSuffixStaysIntLiteral) {
-    auto h      = loadCSubset("20L");
+    auto h      = loadC("20L");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral)
@@ -328,7 +341,7 @@ TEST(Tokenizer, IntegerShapedLSuffixStaysIntLiteral) {
 
 TEST(Tokenizer, IntegerShapedCompoundSuffixesStayIntLiteral) {
     for (auto const* text : {"20UL", "20ul", "20LL", "7ull"}) {
-        auto h      = loadCSubset(text);
+        auto h      = loadC(text);
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 1u) << text;
         EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral) << text;
@@ -338,7 +351,7 @@ TEST(Tokenizer, IntegerShapedCompoundSuffixesStayIntLiteral) {
 
 TEST(Tokenizer, FloatShapedLSuffixLexesAsFloatLiteral) {
     for (auto const* text : {"20.0L", "20.0l", "2e1L", "3.L"}) {
-        auto h      = loadCSubset(text);
+        auto h      = loadC(text);
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 1u) << text;
         EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral) << text;
@@ -351,7 +364,7 @@ TEST(Tokenizer, FloatOnlySuffixStillPromotesIntegerShape) {
     // not an integer suffix, so the integer probe misses and the float
     // promotion still fires (the FloatLiteralWithFSuffixPromotesIntToFloat
     // behavior, re-pinned here against the reordered suffix step).
-    auto h      = loadCSubset("42f");
+    auto h      = loadC("42f");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -365,7 +378,7 @@ TEST(Tokenizer, FloatOnlySuffixStillPromotesIntegerShape) {
 namespace {
 // One-FloatLiteral-token assertion helper for the valid hex-float forms.
 void expectOneFloat(std::string_view src) {
-    auto h      = loadCSubset(std::string{src});
+    auto h      = loadC(std::string{src});
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u) << "input: " << src;
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral)
@@ -376,7 +389,7 @@ void expectOneFloat(std::string_view src) {
 // One-malformed-token assertion helper: tokens[0] spans `expectedSpan`,
 // exactly one P_MalformedNumber (the tail may re-lex into more tokens).
 void expectMalformedHead(std::string_view src, std::string_view expectedSpan) {
-    auto h      = loadCSubset(std::string{src});
+    auto h      = loadC(std::string{src});
     auto result = lex(h);
     ASSERT_GE(result.tokens.size(), 1u) << "input: " << src;
     EXPECT_EQ(textOf(*h.src, result.tokens[0]), expectedSpan)
@@ -449,7 +462,7 @@ TEST(Tokenizer, HexPrefixDotWithoutDigitsIsMalformedPrefix) {
 TEST(Tokenizer, HexIntegerWithTrailingFDigitStaysInteger) {
     // No fraction, no exponent letter → the float continuation never
     // engages; `f` is just a hex digit.
-    auto h      = loadCSubset("0x1f");
+    auto h      = loadC("0x1f");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -463,7 +476,7 @@ TEST(Tokenizer, BinaryPrefixTrailingFIsIntegerPlusWord) {
     // suffix letters can BE digits, so `0b1f` is the integer `0b1`
     // followed by the word `f` — never a float (strtod would parse
     // "0b1" as 0 and silently zero the value).
-    auto h      = loadCSubset("0b1f");
+    auto h      = loadC("0b1f");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 2u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -473,7 +486,7 @@ TEST(Tokenizer, BinaryPrefixTrailingFIsIntegerPlusWord) {
 }
 
 // ─── FC1 cycle 2: C23 decimal fractional-constant edge forms ───────────────
-// (`trailingFraction` + `leadingFraction`, both opt-in, c-subset = true.)
+// (`trailingFraction` + `leadingFraction`, both opt-in, c = true.)
 
 TEST(Tokenizer, TrailingFractionWithExponentAndSuffixLex) {
     expectOneFloat("1.");
@@ -529,7 +542,7 @@ TEST(Tokenizer, LoneDotIsNotANumber) {
     // The leading-fraction dispatch admits `.` ONLY when a decimal
     // digit follows — a bare dot (or `.foo`) stays the language's
     // member-access dot.
-    auto h      = loadCSubset(".foo");
+    auto h      = loadC(".foo");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 2u);
     EXPECT_NE(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -539,7 +552,7 @@ TEST(Tokenizer, LoneDotIsNotANumber) {
 
 TEST(Tokenizer, HexLiteralLexedAsOneIntToken) {
     // `0xff` MUST become one IntLiteral, not `0` + identifier `xff`.
-    auto h      = loadCSubset("0xff");
+    auto h      = loadC("0xff");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -547,9 +560,9 @@ TEST(Tokenizer, HexLiteralLexedAsOneIntToken) {
 }
 
 TEST(Tokenizer, HexLiteralWithApostropheSeparators) {
-    // FC1 (2026-06-10): c-subset's digitSeparator flipped `_` → `'`
+    // FC1 (2026-06-10): c's digitSeparator flipped `_` → `'`
     // (the C23 separator — `_` was never C).
-    auto h      = loadCSubset("0xDEAD'BEEF");
+    auto h      = loadC("0xDEAD'BEEF");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -557,7 +570,7 @@ TEST(Tokenizer, HexLiteralWithApostropheSeparators) {
 }
 
 TEST(Tokenizer, BinaryLiteralLexedAsOneIntToken) {
-    auto h      = loadCSubset("0b1010'0101");
+    auto h      = loadC("0b1010'0101");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -565,7 +578,7 @@ TEST(Tokenizer, BinaryLiteralLexedAsOneIntToken) {
 }
 
 TEST(Tokenizer, OctalLiteralLexedAsOneIntToken) {
-    auto h      = loadCSubset("0o755");
+    auto h      = loadC("0o755");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -575,7 +588,7 @@ TEST(Tokenizer, OctalLiteralLexedAsOneIntToken) {
 TEST(Tokenizer, ZeroFollowedByLetterIsNotHexUnlessLetterIsValidDigit) {
     // `0xy` is NOT a hex literal because `y` isn't a hex digit. The
     // tokenizer falls back to plain decimal `0`, then `xy` as a word.
-    auto h      = loadCSubset("0xy");
+    auto h      = loadC("0xy");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 2u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -588,7 +601,7 @@ TEST(Tokenizer, NumericSuffixRestrictedToTypeLetters) {
     // `123abc` was a single-token regression risk pre-review-fix. The
     // suffix scanner now only accepts u/U/l/L/f/F/d/D, so `123abc`
     // becomes `123` (Int) + `abc` (Word).
-    auto h      = loadCSubset("123abc");
+    auto h      = loadC("123abc");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 2u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -599,7 +612,7 @@ TEST(Tokenizer, NumericSuffixRestrictedToTypeLetters) {
 
 TEST(Tokenizer, IntegerWithULSuffixStillIntegerKind) {
     // `42ull` — recognised C unsigned-long-long suffix. Stays IntLiteral.
-    auto h      = loadCSubset("42ull");
+    auto h      = loadC("42ull");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -629,7 +642,7 @@ TEST(Tokenizer, PunctuationVsOperatorCoreKindSplit) {
 }
 
 TEST(Tokenizer, LongestMatchPicks2CharOperatorOverPrefix) {
-    auto h      = loadCSubset("==");
+    auto h      = loadC("==");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Operator);
@@ -639,9 +652,9 @@ TEST(Tokenizer, LongestMatchPicks2CharOperatorOverPrefix) {
 }
 
 TEST(Tokenizer, LongestMatchDistinguishesAdjacentLexemes) {
-    // `===` is `==` followed by `=` in c-subset (no `===` lexeme
+    // `===` is `==` followed by `=` in c (no `===` lexeme
     // declared). Longest-match consumes `==` greedily.
-    auto h      = loadCSubset("===");
+    auto h      = loadC("===");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 2u);
     EXPECT_EQ(textOf(*h.src, result.tokens[0]), "==");
@@ -684,7 +697,7 @@ TEST(Tokenizer, BareHexPrefixAtEofIsMalformed) {
     // consume the prefix as a malformed IntLiteral. The previous
     // behavior silently split `0x` into `0` (IntLiteral) + `x`
     // (Word), masking the user's typo.
-    auto h      = loadCSubset("0x");
+    auto h      = loadC("0x");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -694,7 +707,7 @@ TEST(Tokenizer, BareHexPrefixAtEofIsMalformed) {
 }
 
 TEST(Tokenizer, BareBinaryPrefixAtEofIsMalformed) {
-    auto h      = loadCSubset("0b");
+    auto h      = loadC("0b");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -704,7 +717,7 @@ TEST(Tokenizer, BareBinaryPrefixAtEofIsMalformed) {
 }
 
 TEST(Tokenizer, BareOctalPrefixAtEofIsMalformed) {
-    auto h      = loadCSubset("0o");
+    auto h      = loadC("0o");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -715,7 +728,7 @@ TEST(Tokenizer, BareOctalPrefixAtEofIsMalformed) {
 
 TEST(Tokenizer, HexPrefixFollowedBySeparatorOnlyEmitsMalformedDiagnostic) {
     // FC1 rewrite (2026-06-10): the pre-FC1 form used `0x_` (the old
-    // `_` separator). With c-subset's separator now `'` (C23) and the
+    // `_` separator). With c's separator now `'` (C23) and the
     // flanked-by-digits rule, `0x'` enters the hex-prefix arm (the
     // entry check admits a separator after the prefix so the typo is
     // DIAGNOSED rather than split into `0` + identifier), finds no
@@ -723,7 +736,7 @@ TEST(Tokenizer, HexPrefixFollowedBySeparatorOnlyEmitsMalformedDiagnostic) {
     // `'` re-enters the dispatch as a char-literal start, so only the
     // first token + the malformed count are pinned. (`0x_` itself now
     // lexes as `0` + identifier `x_` — `_` is no longer special.)
-    auto h      = loadCSubset("0x'");
+    auto h      = loadC("0x'");
     auto result = lex(h);
     ASSERT_GE(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -742,7 +755,7 @@ TEST(Tokenizer, BinaryPrefixWithoutDigitsIsMalformed) {
     // separator-only body no longer extends the token. The intent —
     // a multi-char prefix with no digit body is ONE malformed
     // IntLiteral — is pinned via the EOF-after-prefix form.
-    auto h      = loadCSubset("0b");
+    auto h      = loadC("0b");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b");
@@ -760,7 +773,7 @@ TEST(Tokenizer, HexPrefixFollowedBySeparatorIsMalformedPerC23) {
     // dispatch as a char-literal start, so only the FIRST token +
     // the malformed-count are pinned here (the tail's char-literal
     // diagnostics are its own feature's concern).
-    auto h      = loadCSubset("0x'ff");
+    auto h      = loadC("0x'ff");
     auto result = lex(h);
     ASSERT_GE(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -776,7 +789,7 @@ TEST(Tokenizer, ZeroFollowedByLetterPinsSchemaKindAsIntLiteral) {
     // Tightens the previous `ZeroFollowedByLetter...` test: also pin
     // the `0` token's schemaKind to the IntLiteral built-in. Catches
     // a regression where decimal `0` is mis-tagged.
-    auto h      = loadCSubset("0xy");
+    auto h      = loadC("0xy");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 2u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -1013,30 +1026,36 @@ TEST(TokenizerDeath, NullSchemaAborts) {
 // TZ2 wires the LexerModeStack into Tokenizer. The body-mode branch
 // honors `stringStyle.endsAt` / `escapeKind` / `endsAtLongestMatch`
 // and the new `defaultToken.flags` field on `LexerMode`. Comment
-// modes in c-subset (line-comment + block-comment) close
+// modes in c (line-comment + block-comment) close
 // v2-gap-catalog row 3's authoring task.
 
 namespace {
 
 [[nodiscard]] H loadTsql(std::string text) {
-    auto loaded = GrammarSchema::loadShipped("tsql-subset");
-    EXPECT_TRUE(loaded.has_value()) << "tsql-subset.lang.json load failed";
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT.
+    // This used to be a NON-FATAL `EXPECT_TRUE` followed by
+    // `.schema = loaded.has_value() ? *loaded : nullptr` -- so on a torn
+    // shipped config the fixture recorded a failure and then handed a NULL
+    // schema to `Tokenizer`, whose `tokenizerFatal("schema is null")`
+    // correctly refuses and aborts. ✔MEASURED: the whole binary exited
+    // 0xC0000409 with no `[  FAILED  ]` line and no case name. The product
+    // guard was right; the fixture drove it there.
     return H{
         .src    = SourceBuffer::fromString(std::move(text), "<test>"),
-        .schema = loaded.has_value() ? *loaded : nullptr,
+        .schema = dss::test_support::shippedSchemaOrThrow("tsql-subset"),
     };
 }
 
 } // namespace
 
 TEST(Tokenizer, LineCommentEmitsOpenerThenCommentCharsToNewline) {
-    // c-subset line-comment mode: `//` pushes mode; everything up to but
+    // c line-comment mode: `//` pushes mode; everything up to but
     // EXCLUDING the next `\n` becomes a CommentChar. c22
     // (D-PP-LINE-COMMENT-BEFORE-DIRECTIVE): the `\n` is NOT consumed into the
     // comment — the `//` mode is `endsAtExclusive`, so the terminating newline
     // survives as its OWN Newline token (so a following `#` directive keeps its
     // line boundary). The tokenizer is then back in main mode for the rest.
-    auto h      = loadCSubset("// hi\nvar x;");
+    auto h      = loadC("// hi\nvar x;");
     auto result = lex(h);
     // Tokens: LineCommentStart, ' ', 'h', 'i', Newline('\n'), Word("var"),
     // ' ', Word("x"), Punctuation(';')  ⇒ 9 (the `\n` is now a Newline, not a
@@ -1061,7 +1080,7 @@ TEST(Tokenizer, LineCommentEmitsOpenerThenCommentCharsToNewline) {
 }
 
 TEST(Tokenizer, BlockCommentEmitsOpenerCharsAndClosing) {
-    auto h      = loadCSubset("/* hi */var");
+    auto h      = loadC("/* hi */var");
     auto result = lex(h);
     // BlockCommentStart, ' ', 'h', 'i', ' ', '*/' (closer chunked
     // as one defaultToken because endsAt is 2 bytes), Word("var")
@@ -1090,7 +1109,7 @@ TEST(Tokenizer, UnterminatedLineCommentEmitsDiagnostic) {
     // emits the opener + 11 body chars (` no newline` = 11 bytes) +
     // a P_UnterminatedComment when EOF is reached with the frame
     // stack still open.
-    auto h      = loadCSubset("// no newline");
+    auto h      = loadC("// no newline");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 12u);
     EXPECT_EQ(result.tokens[0].schemaKind,
@@ -1105,7 +1124,7 @@ TEST(Tokenizer, UnterminatedLineCommentEmitsDiagnostic) {
 }
 
 TEST(Tokenizer, UnterminatedBlockCommentEmitsDiagnostic) {
-    auto h      = loadCSubset("/* nope");
+    auto h      = loadC("/* nope");
     auto result = lex(h);
     ASSERT_EQ(result.diags.size(), 1u);
     EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_UnterminatedComment);
@@ -1337,7 +1356,7 @@ TEST(Tokenizer, UnterminatedCoalescedStringEmitsDiagnostic) {
     // the body to EOF, emits ONE StringLiteral token, leaves the mode open, and
     // the post-loop handler reports P_UnterminatedString. (New coalesce-path
     // EOF branch — must not be silently swallowed.)
-    auto h      = loadCSubset("\"abc");
+    auto h      = loadC("\"abc");
     auto result = lex(h);
     bool sawUnterminated = false;
     for (auto const& d : result.diags)
@@ -1381,7 +1400,7 @@ TEST(Tokenizer, ClosingDelimiterIsItsOwnTokenWithExactSpans) {
     //   StringStart   [0,1)  `"`
     //   StringLiteral [1,4)  `abc`   ← body span UNCHANGED by this cycle
     //   StringEnd     [4,5)  `"`     ← previously no token at all
-    auto h      = loadCSubset("\"abc\"");
+    auto h      = loadC("\"abc\"");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 3u)
         << "a closed string is opener + body + closer";
@@ -1423,7 +1442,7 @@ TEST(Tokenizer, EmptyStringLiteralStillEmitsBodyAndCloser) {
     // If an implementation skipped the empty body it would still "work" for the
     // decode (empty is empty) but the closer would land at child index 1 and
     // every index-based consumer would read the closer as the body.
-    auto h      = loadCSubset("\"\"");
+    auto h      = loadC("\"\"");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 3u)
         << "an empty string still has all three tokens — the body is "
@@ -1453,7 +1472,7 @@ TEST(Tokenizer, CharLiteralClosingDelimiterIsItsOwnToken) {
     //   CharStart   [0,1)  `'`
     //   CharLiteral [1,2)  `c`
     //   CharEnd     [2,3)  `'`
-    auto h      = loadCSubset("'c'");
+    auto h      = loadC("'c'");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 3u);
     EXPECT_TRUE(result.diags.empty());
@@ -1483,7 +1502,7 @@ TEST(Tokenizer, AngleHeaderClosingDelimiterIsItsOwnToken) {
     //   HeaderStart [9,10)  `<`
     //   HeaderPath  [10,17) `stdio.h`
     //   HeaderEnd   [17,18) `>`
-    auto h      = loadCSubset("#include <stdio.h>\n");
+    auto h      = loadC("#include <stdio.h>\n");
     auto result = lex(h);
     EXPECT_TRUE(result.diags.empty());
 
@@ -1537,7 +1556,7 @@ TEST(Tokenizer, WideStringOpenersTokenizeViaLongestMatch) {
                           Case{"u\"AB\"", "Utf16StringStart"},
                           Case{"U\"AB\"", "Utf32StringStart"},
                           Case{"u8\"AB\"", "Utf8StringStart"}}) {
-        auto h      = loadCSubset(c.src);
+        auto h      = loadC(c.src);
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 3u) << "opener=" << c.opener;
         EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find(c.opener))
@@ -1560,7 +1579,7 @@ TEST(Tokenizer, U8StringOpenerBeatsUOpenerAndIdentifier) {
     // ★ 2 → 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): opener + body + StringEnd.
     // The longest-match property under test is untouched; only the trailing
     // closer token is new.
-    auto h      = loadCSubset("u8\"x\"");
+    auto h      = loadC("u8\"x\"");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 3u);
     EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find("Utf8StringStart"))
@@ -1574,7 +1593,7 @@ TEST(Tokenizer, IdentifierStartingWithUIsNotAStringOpener) {
     // (`user`, `L_var`) must stay ONE Identifier — the opener only wins when the
     // quote immediately follows (longestMatch covers the whole `u"` lexeme, but
     // `user` has no quote so the id-run wins).
-    auto h      = loadCSubset("user");
+    auto h      = loadC("user");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u) << "`user` must stay ONE identifier, not split at u\"";
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word);
@@ -1598,7 +1617,7 @@ TEST(Tokenizer, WideCharOpenersTokenizeViaLongestMatch) {
                           Case{"u'A'", "Utf16CharStart"},
                           Case{"U'A'", "Utf32CharStart"},
                           Case{"u8'A'", "Utf8CharStart"}}) {
-        auto h      = loadCSubset(c.src);
+        auto h      = loadC(c.src);
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 3u) << "opener=" << c.opener;
         EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find(c.opener))
@@ -1616,7 +1635,7 @@ TEST(Tokenizer, U8CharOpenerBeatsUCharOpenerAndIdentifier) {
     // `u8` identifier run. A regression to `u'` would split `u8'x'` as
     // [Utf16CharStart, "8x"] (wrong). Mirrors the wide-STRING u8" longest-match pin.
     // ★ 2 → 3 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): opener + body + CharEnd.
-    auto h      = loadCSubset("u8'x'");
+    auto h      = loadC("u8'x'");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 3u);
     EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find("Utf8CharStart"))
@@ -1636,14 +1655,14 @@ TEST(Tokenizer, CharAndStringOpenersCoexistOnSamePrefixByte) {
     // kind-filtering consumer confuse the end of a char constant with the end of
     // a string.
     {
-        auto h = loadCSubset("u'x'");
+        auto h = loadC("u'x'");
         auto r = lex(h);
         ASSERT_EQ(r.tokens.size(), 3u);
         EXPECT_EQ(r.tokens[0].schemaKind, h.schema->schemaTokens().find("Utf16CharStart"));
         EXPECT_EQ(r.tokens[2].schemaKind, h.schema->schemaTokens().find("CharEnd"));
     }
     {
-        auto h = loadCSubset("u\"x\"");
+        auto h = loadC("u\"x\"");
         auto r = lex(h);
         ASSERT_EQ(r.tokens.size(), 3u);
         EXPECT_EQ(r.tokens[0].schemaKind, h.schema->schemaTokens().find("Utf16StringStart"));
@@ -1752,7 +1771,7 @@ TEST(Tokenizer, NestedBlockCommentsDoNotNestPerCStandard) {
     //   [6] ` `   (8)    Whitespace          back in main mode
     //   [7] `*`   (9)    StarOp              stray main-mode operator
     //   [8] `/`   (10)   SlashOp             stray main-mode operator
-    auto h      = loadCSubset("/* /* */ */");
+    auto h      = loadC("/* /* */ */");
     auto result = lex(h);
     EXPECT_TRUE(result.diags.empty());
     ASSERT_EQ(result.tokens.size(), 9u);
@@ -1783,7 +1802,7 @@ TEST(Tokenizer, ModeStackResetsBetweenTopLevelStatements) {
     // Total = 22 tokens (Eof is not pushed into the test vector). c22: the
     // line-comment `\n` is now a separate Newline token (endsAtExclusive), not a
     // consumed body char — same per-comment token COUNT, so the total stays 22.
-    auto h      = loadCSubset("// one\n/* two */// three\nvar");
+    auto h      = loadC("// one\n/* two */// three\nvar");
     auto result = lex(h);
     EXPECT_TRUE(result.diags.empty());
     ASSERT_EQ(result.tokens.size(), 22u);
@@ -1812,9 +1831,9 @@ TEST(Tokenizer, CommentDefaultTokenFlagsAreEmptySpaceForAstCursorSkip) {
     // time via `meaning.flagsApplied`). The relevant assertion is
     // that the schema's CommentChar registration carries the flag,
     // which the builder applies on pushToken. Pin the schema-side
-    // half here; the builder-side half is exercised by the c-subset
+    // half here; the builder-side half is exercised by the c
     // E2E test in TZ3.
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
     const auto lineCommentModeId = schema->findLexerMode("line-comment");
@@ -2407,7 +2426,7 @@ TEST(Tokenizer, GenericSeparatorTrailingIsNotConsumed) {
     // final quote (red-on-disable lever: revert the flanked-by-
     // digits guard and tokens[0] becomes "1'000'"). The synthetic
     // non-C schema proves the rule is engine-universal, not a
-    // c-subset special case.
+    // c special case.
     auto loaded = GrammarSchema::loadFromText(kGenericNumSchema);
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
@@ -2524,35 +2543,35 @@ TEST(Tokenizer, GenericNumberStyleFloatSuffixPromotesKind) {
 }
 
 // F1: `l`/`L` are integer suffixes (long / long long), NOT float
-// suffixes. An earlier 08.55 c-subset config listed `l`/`L` under
+// suffixes. An earlier 08.55 c config listed `l`/`L` under
 // `floatSuffixes`, which silently promoted long integers to the
 // floating-literal kind — a regression vs. the hand-coded scanner.
 // The fix removes them from `floatSuffixes`; pin the corrected
 // behavior here (every L-suffixed integer stays an IntLiteral).
-TEST(Tokenizer, CSubsetLongIntegerSuffixesStayInteger) {
+TEST(Tokenizer, CLongIntegerSuffixesStayInteger) {
     {
-        auto h      = loadCSubset("42L");
+        auto h      = loadC("42L");
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 1u);
         EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
         EXPECT_EQ(textOf(*h.src, result.tokens[0]), "42L");
     }
     {
-        auto h      = loadCSubset("42l");
+        auto h      = loadC("42l");
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 1u);
         EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
         EXPECT_EQ(textOf(*h.src, result.tokens[0]), "42l");
     }
     {
-        auto h      = loadCSubset("42LL");
+        auto h      = loadC("42LL");
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 1u);
         EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
         EXPECT_EQ(textOf(*h.src, result.tokens[0]), "42LL");
     }
     {
-        auto h      = loadCSubset("42ll");
+        auto h      = loadC("42ll");
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 1u);
         EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -2560,30 +2579,30 @@ TEST(Tokenizer, CSubsetLongIntegerSuffixesStayInteger) {
     }
 }
 
-TEST(Tokenizer, CSubsetFloatSuffixesPromoteToFloat) {
+TEST(Tokenizer, CFloatSuffixesPromoteToFloat) {
     {
-        auto h      = loadCSubset("1.5f");
+        auto h      = loadC("1.5f");
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 1u);
         EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
         EXPECT_EQ(textOf(*h.src, result.tokens[0]), "1.5f");
     }
     {
-        auto h      = loadCSubset("1.5F");
+        auto h      = loadC("1.5F");
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 1u);
         EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
         EXPECT_EQ(textOf(*h.src, result.tokens[0]), "1.5F");
     }
     {
-        auto h      = loadCSubset("1.5e3");
+        auto h      = loadC("1.5e3");
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 1u);
         EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
         EXPECT_EQ(textOf(*h.src, result.tokens[0]), "1.5e3");
     }
     {
-        auto h      = loadCSubset("1.5e3f");
+        auto h      = loadC("1.5e3f");
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 1u);
         EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -2591,15 +2610,15 @@ TEST(Tokenizer, CSubsetFloatSuffixesPromoteToFloat) {
     }
 }
 
-// F8: c-subset declares `0` (octal) prefix so `017` tokenizes as an
+// F8: c declares `0` (octal) prefix so `017` tokenizes as an
 // IntLiteral (octal 15), not decimal 17 + nothing. `0x17` continues
 // to tokenize as a single hex literal because the longer prefix wins
 // the declaration-order loop. `09` is malformed (8 is not a valid
 // octal digit, so the prefix arm sees no body digit and surfaces
 // P_MalformedNumber).
-TEST(Tokenizer, CSubsetBareZeroOctalPrefixWorks) {
+TEST(Tokenizer, CBareZeroOctalPrefixWorks) {
     {
-        auto h      = loadCSubset("017");
+        auto h      = loadC("017");
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 1u);
         EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -2607,7 +2626,7 @@ TEST(Tokenizer, CSubsetBareZeroOctalPrefixWorks) {
         EXPECT_TRUE(result.diags.empty());
     }
     {
-        auto h      = loadCSubset("0x17");
+        auto h      = loadC("0x17");
         auto result = lex(h);
         ASSERT_EQ(result.tokens.size(), 1u);
         EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -2618,7 +2637,7 @@ TEST(Tokenizer, CSubsetBareZeroOctalPrefixWorks) {
 
 // F18: `signOptional: false` rejects a sign between the exponent
 // letter and digits. `2^+3` tokenizes as three tokens: IntLiteral `2`,
-// the schema-mapped `^` (XorOp in c-subset), IntLiteral `3`. Pin via
+// the schema-mapped `^` (XorOp in c), IntLiteral `3`. Pin via
 // an inline schema since none of the shipped configs use the
 // non-default value.
 TEST(Tokenizer, NumberStyleSignOptionalFalseRejectsSign) {
@@ -2717,7 +2736,7 @@ namespace {
 } // namespace
 
 TEST(Tokenizer, FF11AngleIncludeLexesAsOpenerPathCloser) {
-    auto h = loadCSubset("#include <stdio.h>\n");
+    auto h = loadC("#include <stdio.h>\n");
     auto schema = h.schema;
     ASSERT_TRUE(schema != nullptr);
     auto srcBuf = h.src;   // keep the buffer alive past lex()'s by-value consume
@@ -2773,7 +2792,7 @@ TEST(Tokenizer, FF11AngleIncludeLexesAsOpenerPathCloser) {
 TEST(Tokenizer, FF11AngleBracketIsLtOpOutsideDirective) {
     // The SAME `<` byte outside a directive stays the LtOp operator —
     // the mode override is scoped to the directive, not global.
-    auto h = loadCSubset("a < b;\n");
+    auto h = loadC("a < b;\n");
     auto schema = h.schema;
     auto result = lex(std::move(h));
     const auto ltOp = schema->schemaTokens().find("LtOp");
@@ -2787,7 +2806,7 @@ TEST(Tokenizer, FF11QuoteIncludeStillProducesStringStart) {
     // ADDITIVE: the quote form is unchanged — `#` enters the directive
     // mode (popAtNewline), but `"` still uses the GLOBAL StringStart →
     // string body, so `imports.pathToken: StringStart` keeps matching.
-    auto h = loadCSubset("#include \"local.h\"\n");
+    auto h = loadC("#include \"local.h\"\n");
     auto schema = h.schema;
     auto result = lex(std::move(h));
     EXPECT_TRUE(result.diags.empty());
@@ -2804,7 +2823,7 @@ TEST(Tokenizer, FF11DirectiveModeDoesNotLeakToNextLine) {
     // carry `<`-as-header-opener past the newline. A malformed `#include`
     // (no header) on line 1, then `a < b` on line 2: the line-2 `<` must
     // be LtOp, proving the directive frame popped at the newline.
-    auto h = loadCSubset("#include\na < b;\n");
+    auto h = loadC("#include\na < b;\n");
     auto schema = h.schema;
     auto result = lex(std::move(h));
     const auto ltOp        = schema->schemaTokens().find("LtOp");
@@ -2833,7 +2852,7 @@ TEST(Tokenizer, FF11DirectiveModeDoesNotLeakToNextLine) {
 // file is not consumed — is deferred: anchor
 // D-FFI-ANGLE-INCLUDE-LINE-SCOPED-HEADER. This test only pins fail-loud.)
 TEST(Tokenizer, FF11MalformedAngleIncludeNoCloserFailsLoud) {
-    auto h      = loadCSubset("#include <foo\n");
+    auto h      = loadC("#include <foo\n");
     auto result = lex(std::move(h));
     EXPECT_FALSE(result.diags.empty())
         << "a malformed `#include <foo` (no closing `>`) must fail loud — "
@@ -2850,7 +2869,7 @@ TEST(Tokenizer, FF11MalformedAngleIncludeNoCloserFailsLoud) {
            "(string-body flavor) today";
 }
 
-// ─── General `popAtNewline` capability (NOT c-subset-specific) ────────────
+// ─── General `popAtNewline` capability (NOT c-specific) ────────────
 //
 // A line-scoped mode that auto-pops at the next newline. Synthetic schema
 // so the capability is pinned independently of FF11's grammar. C
@@ -2928,3 +2947,69 @@ TEST(Tokenizer, PopAtNewlineModeAutoPopsAtEofWithoutNewline) {
     EXPECT_TRUE(result.diags.empty())
         << "a popAtNewline mode at EOF closes silently — not unterminated";
 }
+// ═══ Longest-match probe index ════════════════════════════════════════════
+//
+// D-PERF-TOK-LONGEST-MATCH-PROBES-EVERY-DECLARED-LENGTH-AT-EVERY-POSITION.
+// The scan no longer walks every length from `maxLexemeLength` down to 1; it
+// walks only the lengths `GrammarSchema::lexemeLengthsForLeadByte` declares
+// for the byte under the cursor. These pin the two ends of that row on the
+// SHIPPED `c` grammar, because the row's ends are where a filter goes wrong:
+// the longest entry is what a truncating index drops, and a byte with no
+// entries at all is the case that used to cost a full sweep of misses.
+// The index itself is pinned exhaustively in
+// `tests/core/test_grammar_schema.cpp` (`GrammarSchemaProbeIndex.*`).
+
+TEST(Tokenizer, ProbeIndexStillReachesTheLongestDeclaredLexeme) {
+    // `__builtin_types_compatible_p` IS `maxLexemeLength` for the shipped `c`
+    // grammar — 28 bytes, and the reason the unindexed scan probed 28 lengths
+    // at every single token position. It is also the only key in the `_` row
+    // at that length, so an index that truncated the row (or that stopped at
+    // the 15-byte small-string boundary the old per-probe `std::string`
+    // crossed) would lex it as a plain identifier: a WRONG PARSE, not a parse
+    // error, which is exactly the failure this pin exists to catch.
+    auto h      = loadC("__builtin_types_compatible_p");
+    auto result = lex(h);
+    ASSERT_GE(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].span.length(), 28u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word);
+    EXPECT_TRUE(result.tokens[0].schemaKind.valid())
+        << "the longest declared lexeme resolved to no schema kind — the "
+           "probe index is not reaching the end of its row";
+    EXPECT_EQ(h.schema->maxLexemeLength(), result.tokens[0].span.length())
+        << "this pin is only meaningful while this lexeme IS the longest one";
+}
+
+TEST(Tokenizer, ProbeIndexLeavesAnUndeclaredLeadByteToTheIllegalCharPath) {
+    // `@` starts no declared key, so its row is empty and the scan does zero
+    // lookups — where it used to do `maxLexemeLength` guaranteed misses. The
+    // OUTCOME must be unchanged: one Error token, one P_IllegalChar, and
+    // tokenization continues.
+    ASSERT_TRUE(dss::test_support::shippedSchemaOrThrow("c")
+                    ->lexemeLengthsForLeadByte('@').empty())
+        << "this pin assumes `@` is outside C's lexical alphabet";
+
+    auto h      = loadC("a@b");
+    auto result = lex(h);
+    ASSERT_EQ(result.diags.size(), 1u);
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_IllegalChar);
+    ASSERT_GE(result.tokens.size(), 3u);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "a");
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "@");
+    EXPECT_EQ(textOf(*h.src, result.tokens[2]), "b");
+}
+
+// ★ THE OTHER HALF OF THE FIX, PINNED AT COMPILE TIME. The lexeme tables are
+// queried with the probe's `std::string_view` rather than a `std::string`
+// built from it, which is what stops a probe past the 15-byte small-string
+// threshold calling malloc. That property has NO runtime behaviour to assert
+// — the output is byte-identical either way, deliberately — so the pin is the
+// transparency itself: revert either the hasher or the comparator and this
+// stops compiling. A `find(string_view)` call would NOT catch it, because a
+// non-transparent map accepts one too, by silently constructing the
+// `std::string` this exists to remove.
+static_assert(requires { typename dss::detail::LexemeTable::hasher::is_transparent; },
+              "the lexeme table's hasher must stay transparent, or every "
+              "longest-match probe materialises a std::string again");
+static_assert(requires { typename dss::detail::LexemeTable::key_equal::is_transparent; },
+              "the lexeme table's comparator must stay transparent, or "
+              "heterogeneous find() silently converts to std::string again");

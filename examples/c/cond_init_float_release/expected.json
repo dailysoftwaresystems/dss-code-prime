@@ -1,0 +1,15 @@
+{
+  "$comment": "D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF FPR sibling — a conditionally-initialized double (`double x; if(c) x=1.0; return x;`). ★ AS OF 2026-08-26 (cycle P38) THIS SHAPE PROMOTES: its undef edge takes an anonymous rodata zero (GlobalAddr+Load in the entry block) rather than an unlowerable float Const 0 — D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO, now CLOSED. ⚠ THIS ARM'S JOB IS UNCHANGED, which is why it survived rather than being rewritten: it pins that the SHAPE COMPILES AND RUNS under release, and it stayed GREEN across the change (exit 1 either way) because a de-promoted and a promoted lowering are BOTH correct here. ★ Its prose therefore went on describing de-promotion long after de-promotion stopped happening — an arm that cannot distinguish the two lowerings cannot notice which one shipped. That is exactly why the PROMOTION is pinned elsewhere rather than here: tests/opt/test_mem2reg.cpp::ConditionallyInitializedFloatAllocaPromotesViaRodataZero, plus the sibling corpus example examples/c/cond_init_float_promoted_release. The old RED-on-disable clause is deleted rather than reworded: it named a failure arm (float Const 0 hitting the non-zeroable assert) that is now UNREACHABLE, and an unreachable red-on-disable note claims a proof nobody can run. exit 1 via a mutable global (anti-fold); g_c=1 so the then-branch defines x.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 1,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

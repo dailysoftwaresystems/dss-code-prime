@@ -1,0 +1,43 @@
+{
+  "$comment": "D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED (P42, lane K): the RUNTIME witness for the HAND-DECLARED half of CROSS-DESCRIPTOR REALIZATION AGREEMENT, and the twin of shipped_duplicate_symbol_agreement (the #include half). There is NOT ONE #include in main.c: every name is declared by the TU itself (C23 7.1.4p2), so none reaches the corpus through the include closure -- they arrive through the platform realization oracle (ffi::realizeShippedExternSymbols), which resolves by the corpus index's relPath sort, a DIFFERENT order from the include closure. That divergence is the row: MEASURED on pe64 with objdump -p over a DSS_CONFIG_ROOT copy whose memory.json named msvcrt.dll where string.json named ucrtbase.dll, the two #include orders REFUSED with F_ShippedCorpusInvariantBroken while this spelling built rc=0 with ZERO diagnostics and imported memcpy from MSVCRT.DLL -- one program, two spellings, two C runtimes, no diagnostic. The six names are the math+tgmath overlap, which is the LARGEST co-live duplicate set in the shipped corpus (34 names on elf/macho, 32 on pe: <tgmath.h> mirrors <math.h> exactly as <memory.h> mirrors <string.h>), so every call is a name for which TWO descriptors are read, compared and required to agree before anything binds. WHAT IT PINS THAT A UNIT TEST CANNOT: that the rule now runs on the hand-declared path WITHOUT refusing the shipped configuration, and that the surviving import still WORKS at runtime on every leg. A check that degenerated into 'duplicates are forbidden' fails this at BUILD time on all four targets; a check wired to the wrong side of the availability gate fails it on exactly one format. Inputs are volatile so ConstFold cannot fold a call away; results are IEEE-754-exact (pow(2,10)==1024, fmod(10,4)==2, ldexp(1,10)==1024, floor(2.5)==2, ceil(2.5)==3) except atan2, within 1e-15. exit = 42. UNGATED, all 4 targets: math.json and tgmath.json both serve elf, macho and pe.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"],
+      "mustDifferFromBaseline": true
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

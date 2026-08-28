@@ -208,12 +208,12 @@ loadPeExecWithEntryPoint(std::string const& entryName) {
     // is indistinguishable from the two config-drift causes the
     // caller's message names, so the miss must say so itself.
     namespace fs = std::filesystem;
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return nullptr;
     }
-    fs::path const shipped = *root / "src" / "dss-config"
+    fs::path const shipped = *root
         / "object-formats" / "pe64-x86_64-windows-exec.format.json";
     if (!fs::exists(shipped)) {
         ADD_FAILURE() << shipped.generic_string() << " does not exist";
@@ -1002,7 +1002,7 @@ TEST(LK10EntrySliceC, RunnableBinaryExitFortyTwo) {
     ASSERT_TRUE(linker::writeImage(image, exePath, rep))
         << "writeImage must succeed";
 
-    auto const result = runBinary(exePath, std::chrono::milliseconds{5000});
+    auto const result = runBinary(exePath);
     ASSERT_TRUE(result.spawned)
         << "CreateProcess must succeed for the emitted .exe — if "
            "this fails, the binary is structurally invalid at the "
@@ -1032,8 +1032,8 @@ TEST(LK10EntrySliceC, RunnableBinaryExitFortyTwo) {
 //   * linker.cpp gated trampoline injection on
 //     `processExit().has_value()` — the SAME predicate the trampoline
 //     emitter's own fail-loud tests (`injectEntryTrampoline`'s opening
-//     `!peOpt.has_value()` refusal, entry_trampoline.cpp:219-229 today;
-//     grep the predicate, not the line) — so the emitter's check was
+//     `!peOpt.has_value()` refusal in entry_trampoline.cpp, cited by
+//     PREDICATE and never by line) — so the emitter's check was
 //     DEAD CODE BY CONSTRUCTION and a `false` simply skipped the whole
 //     block in silence;
 //   * exec_reloc_apply.hpp's `resolveEntryFnIdx` answered
@@ -1154,9 +1154,15 @@ makeElfExecFormatData(bool withProcessExit) {
         s.addrAlign      = addrAlign;
         s.entrySize      = entrySize;
         s.virtualAddress = va;
-        data.sectionKindIndex[kind] =
-            static_cast<std::uint16_t>(data.sections.size());
-        data.sections.push_back(std::move(s));
+        // ⚠ THROUGH THE SCHEMA'S OWN REGISTRAR, never by writing the index.
+        // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE made
+        // the row identity the (kind, encoding) PAIR and added a second derived
+        // index; a fixture that maintained one of them by hand would build a
+        // schema the shipped loader could never produce, and pass.
+        std::uint16_t duplicateOf = 0;
+        ASSERT_TRUE(data.addSectionRow(std::move(s), duplicateOf))
+            << "fixture declares two rows of section kind "
+            << sectionKindName(kind);
     };
     // SHT_PROGBITS(1), SHF_ALLOC|SHF_EXECINSTR(6)
     addSection(SectionKind::Text,     ".text",     1, 6, 16,  0, 0x401000);
@@ -1616,7 +1622,7 @@ TEST(EntryGateFold, ControlSameFormatWithProcessExitLinksAndTrampolines) {
         injected, **target, format, rep2));
     EXPECT_EQ(rep2.errorCount(), 0u);
     ASSERT_TRUE(injected.imageEntryOverride.has_value())
-        << "THE witness the walker gate keys on (entry_trampoline.cpp:732 "
+        << "THE witness the walker gate keys on (`injectEntryTrampoline` "
            "sets it on EVERY injection)";
     EXPECT_EQ(*injected.imageEntryOverride, 0u)
         << "the trampoline sits at functions[0] — value 0, PRESENT, which "

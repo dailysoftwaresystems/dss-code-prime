@@ -38,7 +38,7 @@
 //     unreachable while still costing a load-time binding).
 // The RUNTIME object-identity property itself is witnessed where it can only be
 // witnessed — across an image boundary, by
-// `examples/c-subset/environ_alias_object_identity`, which loads a gcc-built
+// `examples/c/environ_alias_object_identity`, which loads a gcc-built
 // `.so` that reads the UN-PREFIXED name. A descriptor-shape test like this one
 // cannot see identity at all, and must not claim to.
 //
@@ -112,12 +112,12 @@ using json = nlohmann::json;
 namespace {
 
 [[nodiscard]] fs::path shippedLibsRoot() {
-    auto const root = dss::test::findRepoRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config" / "shippedLibs";
+    return *cfg / "shippedLibs";
 }
 
 // Load one descriptor, FAIL-CLOSED: the file must exist and parse.

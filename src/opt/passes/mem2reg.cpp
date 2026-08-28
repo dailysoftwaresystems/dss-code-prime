@@ -6,13 +6,18 @@
 #include "mir/mir_literal_pool.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "opt/passes/mir_id_remap.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -25,15 +30,29 @@ namespace {
 
 // A reaching value at a program point is one of:
 //   OldInst   — an OLD-module instruction id (the rebuild maps it via `rewrite`).
+//               ⚠ For a store whose value type needed a POINTEE RETAG this is the
+//               STORE's OWN old id, not the stored value's: `tryRewrite(Store)`
+//               emits the `Bitcast` and the rebuilder records
+//               (old store id → new Bitcast id), so resolving through `rewrite`
+//               lands on the retagged value (D-OPT-MEM2REG-ERASES-CALL-OPERAND-POINTEE).
 //   Phi       — a Mem2Reg-inserted Phi (a NEW SSA def with no source; keyed by a
 //               synthetic marker).
 //   ZeroConst — undef-as-zero for a promoted alloca with NO reaching store on this
 //               path — a benign conditional-init (`int x; if(c) x=1; use(x);`) or a
 //               dead-path uninitialized read. Both are VALID C (gcc/LLVM materialize
 //               `undef`); DSS MIR has no Undef opcode, so we use a zero of the element
-//               type. `value` = the element TypeId.v; the rebuild emits ONE `Const 0`
+//               type. `value` = the element TypeId.v; the rebuild materializes ONE zero
 //               per element type in the ENTRY block (which dominates every edge → a
-//               valid incoming/value everywhere). D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF.
+//               valid incoming/value everywhere) — a `Const 0` for a GPR-class type, an
+//               anonymous rodata `GlobalAddr`+`Load` for an FPR one.
+//               D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF /
+//               D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO.
+//
+// ★★ EVERY reaching value carries the SLOT'S ELEMENT TYPE. `Phi` is built with it,
+// `ZeroConst` is materialized at it, and an `OldInst` store value that did not
+// already have it was retagged at the store site. That homogeneity is what makes
+// each inserted Phi's incomings type-exact and each replaced Load's substitute
+// type-exact, with at most one retag per store rather than one per use.
 struct ReachingValue {
     enum class Kind : std::uint8_t { OldInst, Phi, ZeroConst };
     Kind          kind  = Kind::OldInst;
@@ -58,14 +77,54 @@ struct PendingIncoming {
     MirBlockId    predOld{};
 };
 
-// A TypeKind whose zero value lowers as a direct integer `Const 0` (GPR class).
-// Used for undef-as-zero materialization at a missing reaching value. A FLOAT (FPR)
-// zero needs a rodata `GlobalAddr+Load` (DSS has no float-immediate Const form) and
-// aggregates/vectors have no scalar zero — an alloca with a non-zeroable element type
-// that would need an undef incoming is DE-PROMOTED (left as memory) rather than
-// Const-zeroed. Promoting those via a rodata-zero is a deferred perf refinement
-// (D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO).
-[[nodiscard]] inline bool isConstZeroable(TypeKind tk) noexcept {
+// HOW a zero of an element type is MATERIALIZED for an undef-as-zero reaching value
+// (D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF). Three forms, CLOSED — and the choice is a
+// property of the IR's own TYPE VOCABULARY, never of an arch/format/language name.
+//
+//   IntConst   — a direct integer `Const 0` (GPR class): the machine has an
+//                immediate form, so one instruction in the entry block suffices.
+//   RodataLoad — an anonymous read-only `MirGlobal` holding the zero bit pattern,
+//                reached by `GlobalAddr` + `Load` (FPR class). Register machines
+//                have NO float-immediate form and the LirLiteralPool has no float
+//                encoder path, so a bare float `Const` dead-ends at MIR→LIR; DSS
+//                routes EVERY float constant through rodata, and this is that same
+//                producer (D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO).
+//   None       — no materialization exists ⇒ the alloca is DE-PROMOTED (left in
+//                memory, exactly what the debug pipeline does — always correct).
+//
+// ★★ THE FLOAT SET IS F32 + F64, AND THE TWO KINDS LEFT OUT WERE EACH LEFT OUT FOR
+// A MEASURED REASON — the set is NOT simply "the kinds `hir_to_mir`'s float-literal
+// promoter mints a rodata global for", which was the first answer tried and is a
+// LARGER set (it also admits F80/F128 via LD-1/LD-2). The question that promoter
+// answers is "can this kind's CONSTANT be reached through rodata"; the question here
+// is strictly stronger, because promoting an alloca also creates a PHI:
+//
+//   F16   — no encodings at ANY width (D-TARGET-ENCODING-WIDTH-GUARD). The literal
+//           promoter excludes it for the same reason: pairing it with a wrong-width
+//           load or arithmetic encoding would be silent.
+//   F80 / — the CONSTANT would materialize fine, but the PHI would not.
+//   F128    ✔MEASURED 2026-08-26 at the CLI: with these two admitted,
+//           `long double x; if(c) x=p; return x+q;` at `--config=release` REFUSES
+//           with `L_UnsupportedLoweringForOpcode` — "long double (F80/F128)
+//           control-flow merge (phi) is not yet lowered … needs the memory-home
+//           merge (D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE)" — on BOTH
+//           x86_64:elf64-x86_64-linux-exec (long double = F80) and
+//           arm64:elf64-aarch64-linux-exec (long double = F128), while the same
+//           program builds clean at `--config=debug`. Admitting them would turn a
+//           program that compiles today into a refusal, which a PERF refinement is
+//           never allowed to do. They stay DE-PROMOTED (memory — exactly what debug
+//           does) until that merge lands, at which point they simply move here.
+//
+// ⚠ These, plus I128/U128 and every aggregate/vector, reach `None` and are therefore
+// DE-PROMOTED. The fail-loud-in-place half of this rule lives in `onBlockBegin`,
+// which aborts if it is ever asked to materialize a `None` zero. That abort is
+// unreachable BY CONSTRUCTION (the de-promotion below removes exactly those
+// allocas); it is the invariant assert that keeps the two halves in agreement, and
+// de-promotion — not a refusal — is the correct answer for a kind with no zero,
+// since refusing would reject a program that compiles today.
+enum class ZeroForm : std::uint8_t { None, IntConst, RodataLoad };
+
+[[nodiscard]] inline ZeroForm zeroFormFor(TypeKind tk) noexcept {
     switch (tk) {
         case TypeKind::Bool:
         case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32: case TypeKind::I64:
@@ -73,11 +132,51 @@ struct PendingIncoming {
         case TypeKind::Char: case TypeKind::Byte:
         case TypeKind::Enum:
         case TypeKind::Ptr: case TypeKind::Ref: case TypeKind::FnPtr:
-            return true;
+            return ZeroForm::IntConst;
+        case TypeKind::F32: case TypeKind::F64:
+            return ZeroForm::RodataLoad;
         default:
-            return false;  // F16/F32/F64/F80/F128 (rodata), I128/U128, Struct/Union/Tuple/
-                           // Array/Slice/Vector/Matrix/Nullable/Optional/Void (no scalar zero)
+            return ZeroForm::None;  // F16 (no encodings), F80/F128 (no phi lowering),
+                                    // I128/U128 (wide-int wall), Struct/Union/Tuple/
+                                    // Array/Slice/Vector/Matrix/Nullable/Optional/Void
+                                    // (no scalar zero at all)
     }
+}
+
+// ── THE RETAG PREDICATE (D-OPT-MEM2REG-ERASES-CALL-OPERAND-POINTEE) ─────────────
+//
+// Promotion replaces a memory round-trip with the STORED VALUE, and the stored
+// value's TypeId need not be the slot's. ✔MEASURED at TF-C112 on
+// `examples/c/va_list_param_forward`: `hir_to_mir` types the `VaHomeArgAreaAddr`
+// leaf `ptr<void>` and stores it into a `va_list ap` slot whose element type is the
+// declared `ptr<i8>`; Mem2Reg forwarded that definition straight into a call operand
+// declared `ptr<i8>`, ERASING the pointee. Not a miscompile (the two are the same
+// machine address) — but it made "pointee identity at a call operand" un-assertable
+// after optimization, which is why `MirVerifier::sameSlotType` had to grow a
+// `void*`-on-either-side arm.
+//
+// ★ THIS RESTORES THE IDENTITY RATHER THAN CONCEDING IT: where the two types are the
+// SAME MACHINE VALUE differing only in a tag that carries no representation, Mem2Reg
+// emits a bit-preserving `Bitcast` so the promoted value arrives carrying the type
+// the memory slot / the replaced Load declared.
+//
+// ⚠ SCOPED TO POINTER-TO-POINTER, and the narrowness is the correctness argument,
+// not a shortcut. A `Bitcast` is a REINTERPRETATION: emitting one across types that
+// are not the same machine value would turn a diagnosable ill-typed store into a
+// SILENT wrong-width move. Every pointer is one machine representation (an address),
+// so a pointer retag is always bit-exact. Everything else is left EXACTLY as before:
+//   * an identity-equal pair needs nothing;
+//   * a `sameRepresentation` pair (`long` vs `long long`, an enum vs its container)
+//     is a representation identity the interner already declares — the tree RETAGS
+//     rather than Casts it at every other seam, so inventing an instruction here
+//     would contradict the lowering AND cost an instruction for no information;
+//   * anything else is genuinely ill-typed and belongs to `MirVerifier`'s
+//     store/call rules — masking it with a cast would delete the diagnostic.
+[[nodiscard]] inline bool isPointerRetag(TypeInterner const& in,
+                                         TypeId from, TypeId to) noexcept {
+    if (!from.valid() || !to.valid()) return false;
+    if (from.v == to.v)               return false;   // already identical
+    return in.kind(from) == TypeKind::Ptr && in.kind(to) == TypeKind::Ptr;
 }
 
 // ONE spelling of this pass's name for EVERY diagnostic it can emit — the
@@ -99,6 +198,8 @@ public:
     [[nodiscard]] std::size_t phisInserted()      const noexcept { return phisInserted_; }
     [[nodiscard]] std::size_t loadsReplaced()     const noexcept { return loadsReplaced_; }
     [[nodiscard]] std::size_t storesEliminated()  const noexcept { return storesEliminated_; }
+    [[nodiscard]] std::size_t retagsInserted()    const noexcept { return retagsInserted_; }
+    [[nodiscard]] std::size_t rodataZerosMinted() const noexcept { return rodataZerosMinted_; }
     [[nodiscard]] std::uint64_t lastLivenessNs()  const noexcept { return lastLivenessNs_; }
 
     // Run the analysis + rename DFS for one function. Records all
@@ -124,29 +225,53 @@ public:
     // MirRebuildPolicy::onBlockBegin (D-OPT-MIR-REBUILDER-ONBLOCKBEGIN-HOOK).
     void onBlockBegin(MirBlockId oldB, MirBlockId /*newB*/,
                       MirBuilder& dst,
-                      std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
-                      std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) override {
-        // Materialize one zero `Const` per element type the rename walk found needs
-        // an undef-as-zero incoming (D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF). Emitted
-        // in the ENTRY block, which dominates every edge → the Const is a valid
+                      MirInstRemap& /*rewrite*/,
+                      MirBlockRemap const& /*blockMap*/) override {
+        // Materialize ONE zero per element type the rename walk found needs an
+        // undef-as-zero incoming (D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF). Emitted in
+        // the ENTRY block, which dominates every edge → the value is a valid
         // incoming/value everywhere; the entry is selectBlocks' first block
         // (funcEntry == block 0), so this runs before any Load resolves against it.
         if (oldB == entryBlock_) {
-            for (auto const& [typeV, ty] : zeroConstTypeById_) {
+            // Deterministic order: `zeroTypeById_` is an unordered_map, and this loop
+            // MINTS SYMBOL IDS. Ranging over it directly would make the emitted
+            // symbol numbering a function of the standard library's hash-table
+            // layout rather than of the input — the same hazard `mergeCuMirs`
+            // sorts its winner names for. Sort by element TypeId.v (a pure function
+            // of the module) so two hosts agree on the artifact byte-for-byte.
+            std::vector<std::uint32_t> zeroTypes;
+            zeroTypes.reserve(zeroTypeById_.size());
+            for (auto const& [typeV, ty] : zeroTypeById_) { (void)ty; zeroTypes.push_back(typeV); }
+            std::sort(zeroTypes.begin(), zeroTypes.end());
+            for (std::uint32_t const typeV : zeroTypes) {
+                TypeId const   ty = zeroTypeById_.at(typeV);
                 TypeKind const tk = interner_.kind(ty);
-                // Only GPR-class zeroable types reach here — an FPR/aggregate alloca
-                // that would need an undef incoming was de-promoted in analyze().
-                if (!isConstZeroable(tk)) {
-                    std::fprintf(stderr,
-                        "dss::opt::passes::Mem2Reg fatal: zero-Const requested for a "
-                        "non-zeroable element TypeKind — analyze() de-promotion should "
-                        "have removed this alloca.\n");
-                    std::abort();
+                switch (zeroFormFor(tk)) {
+                    case ZeroForm::IntConst: {
+                        MirLiteralValue zero;
+                        zero.value = std::int64_t{0};
+                        zero.core  = tk;
+                        zeroNewIdByType_[typeV] = dst.addConst(std::move(zero), ty);
+                        break;
+                    }
+                    case ZeroForm::RodataLoad:
+                        zeroNewIdByType_[typeV] = materializeRodataZero(dst, ty, tk);
+                        break;
+                    case ZeroForm::None:
+                        // FAIL LOUD IN PLACE. Unreachable by construction — analyze()
+                        // de-promotes exactly the allocas whose element type has no
+                        // zero form — so reaching here means the classification and
+                        // the de-promotion have drifted apart, which would otherwise
+                        // surface downstream as an unlowerable Const or a wrong-width
+                        // load. D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO.
+                        std::fprintf(stderr,
+                            "dss::opt::passes::Mem2Reg fatal: undef-as-zero requested "
+                            "for element TypeKind ordinal %u, which has NO zero form "
+                            "(no integer immediate and no rodata constant) — "
+                            "analyze()'s de-promotion should have removed this alloca.\n",
+                            static_cast<unsigned>(tk));
+                        std::abort();
                 }
-                MirLiteralValue zero;
-                zero.value = std::int64_t{0};
-                zero.core  = tk;
-                zeroConstNewIdByType_[typeV] = dst.addConst(std::move(zero), ty);
             }
         }
         auto it = phisByBlock_.find(oldB.v);
@@ -168,15 +293,30 @@ public:
             auto const ops = src_.instOperands(oldId);
             if (ops.size() == 2 && promoted_.count(ops[1].v)) {
                 ++storesEliminated_;
-                return false;  // store to a promoted slot vanishes
+                // A store whose value needs a POINTEE RETAG still "vanishes" as a
+                // memory write, but the rebuild must EMIT something in its place:
+                // the Bitcast that carries the slot's declared pointee. Answering
+                // `true` routes it to `tryRewrite`, which emits exactly that and
+                // nothing else (D-OPT-MEM2REG-ERASES-CALL-OPERAND-POINTEE).
+                return storeNeedsRetag(oldId, ops);
             }
         }
         return true;
     }
 
     [[nodiscard]] std::optional<MirInstId>
-    tryRewrite(MirOpcode op, MirInstId oldId, MirBuilder& /*dst*/,
-               std::unordered_map<std::uint32_t, MirInstId> const& rewrite) override {
+    tryRewrite(MirOpcode op, MirInstId oldId, MirBuilder& dst,
+               MirInstRemap const& rewrite) override {
+        if (op == MirOpcode::Store) {
+            auto const ops = src_.instOperands(oldId);
+            if (ops.size() != 2 || !promoted_.count(ops[1].v)) return std::nullopt;
+            if (!storeNeedsRetag(oldId, ops)) return std::nullopt;
+            // The retagged definition, emitted AT THE STORE'S POSITION — which
+            // dominates every point the store's value reached, so it is a legal
+            // incoming at every phi edge and a legal substitute at every Load.
+            return emitRetag(dst, resolveOldOperand(ops[0], rewrite),
+                             allocaElementType_.at(ops[1].v));
+        }
         if (op != MirOpcode::Load) return std::nullopt;
         auto const ops = src_.instOperands(oldId);
         if (ops.size() != 1 || !promoted_.count(ops[0].v)) return std::nullopt;
@@ -190,7 +330,17 @@ public:
             std::abort();
         }
         ++loadsReplaced_;
-        return resolveToNewId(it->second, rewrite);
+        MirInstId const value = resolveToNewId(it->second, rewrite);
+        // Every reaching value carries the slot's ELEMENT type (see ReachingValue).
+        // A Load declaring a DIFFERENT pointer type is the mirror of the store-side
+        // erasure — retag so the substitute has EXACTLY the type of the instruction
+        // it replaces, and every consumer of the old Load sees what it declared.
+        TypeId const elem     = allocaElementType_.at(ops[0].v);
+        TypeId const loadType = src_.instType(oldId);
+        if (isPointerRetag(interner_, elem, loadType)) {
+            return emitRetag(dst, value, loadType);
+        }
+        return value;
     }
 
     // Called by the pass driver AFTER `MirFunctionRebuilder::rebuildFunction`
@@ -198,8 +348,8 @@ public:
     // and emits `dst.addPhiIncoming(newPhi, {newValue, newPred})`.
     void finalizePhiIncomings(
         MirBuilder& dst,
-        std::unordered_map<std::uint32_t, MirBlockId> const& blockMap,
-        std::unordered_map<std::uint32_t, MirInstId> const& rewrite) {
+        MirBlockRemap const& blockMap,
+        MirInstRemap const& rewrite) {
         for (auto const& [markerV, incomings] : phiIncomings_) {
             auto const phiIt = phiNewIdByMarker_.find(markerV);
             if (phiIt == phiNewIdByMarker_.end()) {
@@ -211,8 +361,8 @@ public:
             }
             MirInstId const newPhi = phiIt->second;
             for (PendingIncoming const& inc : incomings) {
-                auto const blkIt = blockMap.find(inc.predOld.v);
-                if (blkIt == blockMap.end()) {
+                MirBlockId const* const predNew = blockMap.find(inc.predOld.v);
+                if (predNew == nullptr) {
                     std::fprintf(stderr,
                         "dss::opt::passes::Mem2Reg fatal: phi incoming "
                         "predOld v=%u not in rebuild blockMap.\n",
@@ -220,12 +370,15 @@ public:
                     std::abort();
                 }
                 MirInstId const newVal = resolveToNewId(inc.value, rewrite);
-                dst.addPhiIncoming(newPhi, MirPhiIncoming{newVal, blkIt->second});
+                dst.addPhiIncoming(newPhi, MirPhiIncoming{newVal, *predNew});
             }
         }
     }
 
     // Reset per-function state between functions in the same module.
+    // ⚠ `nextSyntheticSymbol_` is NOT reset — a minted global symbol is
+    // MODULE-scoped, so re-seeding it per function would hand two functions the
+    // same id and collapse their zero globals onto one arena slot.
     void resetPerFunction() {
         promoted_.clear();
         allocaElementType_.clear();
@@ -233,8 +386,9 @@ public:
         phiIncomings_.clear();
         phiNewIdByMarker_.clear();
         loadReplacement_.clear();
-        zeroConstTypeById_.clear();
-        zeroConstNewIdByType_.clear();
+        zeroTypeById_.clear();
+        zeroPtrTypeByElem_.clear();
+        zeroNewIdByType_.clear();
         entryBlock_ = MirBlockId{};
         nextMarker_ = 1;
         lastLivenessNs_ = 0;
@@ -252,9 +406,129 @@ public:
     void onFunctionNeutered(MirFuncId /*oldFn*/) override { resetPerFunction(); }
 
 private:
+    // Does this store to a promoted slot write a pointer whose POINTEE differs from
+    // the slot's declared element type? (D-OPT-MEM2REG-ERASES-CALL-OPERAND-POINTEE)
+    [[nodiscard]] bool storeNeedsRetag(MirInstId /*oldId*/,
+                                       std::span<MirInstId const> ops) const {
+        auto const it = allocaElementType_.find(ops[1].v);
+        if (it == allocaElementType_.end()) return false;
+        return isPointerRetag(interner_, src_.instType(ops[0]), it->second);
+    }
+
+    // Emit the bit-preserving retag. `Bitcast` is the tree's OWN spelling for a
+    // pointer-to-pointer reinterpretation — `hir_to_mir::mapCast` returns it for
+    // `Ptr → Ptr`, and `synth_threads_shim` uses it for `ptr<i32> → ptr<u32>` — so
+    // this adds no new vocabulary and lowers through the existing same-class move.
+    [[nodiscard]] MirInstId emitRetag(MirBuilder& dst, MirInstId value, TypeId to) {
+        std::array<MirInstId, 1> const ops{value};
+        ++retagsInserted_;
+        return dst.addInst(MirOpcode::Bitcast, ops, to);
+    }
+
+    // OLD → NEW operand resolution with the same fail-loud posture as
+    // `resolveToNewId`'s OldInst arm (Mem2Reg overrides neither substitution hook,
+    // so the rewrite map IS the whole mapping).
+    [[nodiscard]] MirInstId resolveOldOperand(MirInstId oldOp,
+                                              MirInstRemap const& rewrite) const {
+        MirInstId const* const mapped = rewrite.find(oldOp.v);
+        if (mapped == nullptr) {
+            std::fprintf(stderr,
+                "dss::opt::passes::Mem2Reg fatal: retag source old MirInstId "
+                "v=%u has no rewrite entry — scan-order violation (a store's "
+                "value must have been emitted before the store).\n", oldOp.v);
+            std::abort();
+        }
+        return *mapped;
+    }
+
+    // ── THE FPR UNDEF-AS-ZERO (D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO) ──
+    //
+    // Mint an anonymous read-only `MirGlobal` holding the zero bit pattern of `ty`,
+    // then `GlobalAddr` + `Load` it — the SAME producer `hir_to_mir`'s float-literal
+    // promotion uses, for the same reason: register machines have no float-immediate
+    // form, so a bare float `Const` has no encoding at MIR→LIR.
+    //
+    // ★ THE VALUE IS A `double` 0.0 AT EVERY FLOAT WIDTH, AND THAT IS EXACT RATHER
+    // THAN APPROXIMATE. `lowerMirGlobalsToDataItems` narrows double→float for an F32
+    // item and widens double→80-bit / binary128 for F80/F128; zero is exactly
+    // representable in every one of those formats, so no rounding step exists to be
+    // wrong. (The double-rounding caveat the literal promoter carries for decimal
+    // source text cannot apply to a value the compiler itself produced.)
+    //
+    // ★★ `SymbolBinding::Local` IS LOAD-BEARING, NOT TIDINESS, and it is what makes
+    // minting a symbol SAFE from the optimizer tier at all. The MIR-tier optimizer
+    // has no `syntheticSymbolFloor` (that config reaches `hir_to_mir` only), so the
+    // only seed available here is "one past the highest symbol this module already
+    // carries" — which is NOT provably clear of the semantic symbol table, and
+    // `mergeCuMirs` maps a MIR symbol to a NAME through `model.recordFor`. A
+    // GLOBAL-bound global whose id aliased a semantic record would enter the merge
+    // as a NAMED strong definition: it could collapse onto a same-named definition
+    // in another CU, or land in `plan.definedNames` and cause a real FFI import to
+    // be stripped and rewired onto this constant — the c86
+    // D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS class. `mergeCuMirs` filters
+    // `SymbolBinding::Local` out of BOTH `definedNames` and the cross-CU resolver,
+    // and `assignSymbol` gives every Local def a FRESH module-private merged id, so
+    // a Local zero-constant is structurally incapable of unifying with anything.
+    // Local is also simply CORRECT for an anonymous constant nothing outside this
+    // module can name.
+    //
+    // `isConst=true` routes it to `.rodata` (`asm.cpp` treats `isConst` as the
+    // single section authority) — a zero constant is never written, and read-only
+    // is where the row that opened this work said it belongs.
+    [[nodiscard]] MirInstId materializeRodataZero(MirBuilder& dst, TypeId ty,
+                                                  TypeKind tk) {
+        SymbolId const sym = mintSyntheticSymbol();
+        MirLiteralValue zero;
+        zero.value = 0.0;   // +0.0 — all-zero bits in every IEEE format
+        zero.core  = tk;
+        std::uint32_t const litIdx = dst.literalPoolAdd(std::move(zero));
+        (void)dst.addGlobal(ty, sym, litIdx, MirFuncId{},
+                            SymbolBinding::Local, SymbolVisibility::Hidden,
+                            /*isConst=*/true, MirThreadStorage::Shared);
+        // The POINTER type comes from the promoted alloca itself (`ptr<elem>` is
+        // already interned — the alloca's own result type), because the optimizer
+        // holds the interner CONST and cannot mint a new TypeId.
+        TypeId const ptrTy = zeroPtrTypeByElem_.at(ty.v);
+        MirInstId const addr = dst.addGlobalAddr(sym, ptrTy);
+        std::array<MirInstId, 1> const ops{addr};
+        ++rodataZerosMinted_;
+        return dst.addInst(MirOpcode::Load, ops, ty);
+    }
+
+    // A module-fresh SymbolId: one past the highest symbol the SOURCE module
+    // carries (functions + globals), then monotonically increasing for the rest of
+    // this `runMem2Reg` call. Seeded LAZILY so a module that never needs an FPR
+    // zero pays nothing. See `materializeRodataZero` for why the binding — not the
+    // seed — is what makes this safe.
+    [[nodiscard]] SymbolId mintSyntheticSymbol() {
+        if (nextSyntheticSymbol_ == 0) {
+            std::uint32_t maxV = 0;
+            std::size_t const nf = src_.moduleFuncCount();
+            for (std::uint32_t i = 0; i < nf; ++i) {
+                maxV = std::max(maxV, src_.funcSymbol(src_.funcAt(i)).v);
+            }
+            std::size_t const ng = src_.moduleGlobalCount();
+            for (std::uint32_t i = 0; i < ng; ++i) {
+                maxV = std::max(maxV, src_.globalSymbol(src_.globalAt(i)).v);
+            }
+            if (maxV >= std::numeric_limits<std::uint32_t>::max() - 1u) {
+                // The same saturated-edge refusal `mintSyntheticGlobalSymbol` makes:
+                // advancing would wrap onto 0, the invalid sentinel, and alias a
+                // real symbol. Nothing downstream could detect that, so abort.
+                std::fprintf(stderr,
+                    "dss::opt::passes::Mem2Reg fatal: synthetic SymbolId space "
+                    "exhausted (module max symbol v=%u) — cannot mint the "
+                    "anonymous rodata zero constant.\n", maxV);
+                std::abort();
+            }
+            nextSyntheticSymbol_ = maxV + 1u;
+        }
+        return SymbolId{nextSyntheticSymbol_++};
+    }
+
     [[nodiscard]] MirInstId resolveToNewId(
         ReachingValue rv,
-        std::unordered_map<std::uint32_t, MirInstId> const& rewrite) const {
+        MirInstRemap const& rewrite) const {
         if (rv.kind == ReachingValue::Kind::Phi) {
             auto const it = phiNewIdByMarker_.find(rv.value);
             if (it == phiNewIdByMarker_.end()) {
@@ -267,11 +541,11 @@ private:
             return it->second;
         }
         if (rv.kind == ReachingValue::Kind::ZeroConst) {
-            // The undef-as-zero Const was materialized in the entry block's
+            // The undef-as-zero was materialized in the entry block's
             // onBlockBegin (D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF); a miss means the
             // rename walk requested a zero for a type onBlockBegin never emitted.
-            auto const it = zeroConstNewIdByType_.find(rv.value);
-            if (it == zeroConstNewIdByType_.end()) {
+            auto const it = zeroNewIdByType_.find(rv.value);
+            if (it == zeroNewIdByType_.end()) {
                 std::fprintf(stderr,
                     "dss::opt::passes::Mem2Reg fatal: ZeroConst element type v=%u "
                     "has no materialized Const — onBlockBegin(entry) invariant "
@@ -282,15 +556,15 @@ private:
         }
         // OldInst — must be in the rebuild's rewrite map by now (the
         // value-producer was emitted earlier in scan order).
-        auto const it = rewrite.find(rv.value);
-        if (it == rewrite.end()) {
+        MirInstId const* const mapped = rewrite.find(rv.value);
+        if (mapped == nullptr) {
             std::fprintf(stderr,
                 "dss::opt::passes::Mem2Reg fatal: ReachingValue::OldInst "
                 "v=%u has no rewrite entry — scan-order violation.\n",
                 rv.value);
             std::abort();
         }
-        return it->second;
+        return *mapped;
     }
 
     void renameWalkIterative(
@@ -310,20 +584,29 @@ private:
 
     // Undef-as-zero materialization (D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF): element
     // types for which the rename walk hit a missing reaching value (benign
-    // conditional-init). One `Const 0` per distinct type is emitted in the entry block.
-    std::unordered_map<std::uint32_t, TypeId>     zeroConstTypeById_;  // element TypeId.v → the TypeId
+    // conditional-init). ONE zero per distinct type is emitted in the entry block.
+    std::unordered_map<std::uint32_t, TypeId>     zeroTypeById_;       // element TypeId.v → the TypeId
+    // element TypeId.v → `ptr<element>`, taken from the promoted ALLOCA's own result
+    // type. The FPR arm needs a pointer type for its `GlobalAddr` and the optimizer
+    // holds the interner CONST, so the type is READ off the IR rather than minted.
+    std::unordered_map<std::uint32_t, TypeId>     zeroPtrTypeByElem_;
 
     // ── rebuild-time state ──
     std::unordered_map<std::uint32_t, MirInstId>  phiNewIdByMarker_;   // marker → new phi id
-    std::unordered_map<std::uint32_t, MirInstId>  zeroConstNewIdByType_;  // element TypeId.v → materialized Const
-    MirBlockId                                    entryBlock_{};        // function entry (zero-consts land here)
+    std::unordered_map<std::uint32_t, MirInstId>  zeroNewIdByType_;    // element TypeId.v → materialized zero
+    MirBlockId                                    entryBlock_{};        // function entry (zeros land here)
 
     // ── counters (accumulated across all functions in the module) ──
     std::size_t allocasPromoted_  = 0;
     std::size_t phisInserted_     = 0;
     std::size_t loadsReplaced_    = 0;
     std::size_t storesEliminated_ = 0;
+    std::size_t retagsInserted_   = 0;
+    std::size_t rodataZerosMinted_ = 0;
     std::uint32_t nextMarker_     = 1;
+    // 0 = "not yet seeded" (a real SymbolId is never 0 — that value is the invalid
+    // sentinel). MODULE-scoped: never cleared by resetPerFunction.
+    std::uint32_t nextSyntheticSymbol_ = 0;
     std::uint64_t lastLivenessNs_ = 0;  // env-gated timing of the Step-4b liveness fixpoint
 };
 
@@ -410,6 +693,15 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
             auto const ptrOps  = interner_.operands(ptrTy);
             if (ptrOps.empty()) continue;  // malformed Ptr — leave alone
             allocaType[id.v] = ptrOps[0];
+            // Remember `ptr<element>` while it is in hand: the FPR zero's
+            // `GlobalAddr` needs a pointer TypeId and the optimizer cannot mint one
+            // (the interner is const here). The ALLOCA's own result type IS that
+            // pointer, already interned by the tier that owns interning.
+            // FIRST writer wins (`try_emplace`, over an RPO walk) so two allocas of
+            // the same element type give a DETERMINISTIC answer — they can differ
+            // only by a transparent qualifier skin on the POINTER (`T* volatile`),
+            // which `operands()` sees through, and which changes no representation.
+            zeroPtrTypeByElem_.try_emplace(ptrOps[0].v, ptrTy);
         }
     }
     if (allocaType.empty()) return;
@@ -590,21 +882,27 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
             std::chrono::steady_clock::now() - livenessT0).count());
 
     // De-promote allocas that WOULD need an undef-as-zero incoming — they are
-    // live-in at the ENTRY block (read-before-write on some path) — but whose
-    // element type has no directly-lowerable zero `Const`: a FLOAT (FPR) zero needs
-    // a rodata `GlobalAddr+Load`, and aggregates/vectors have no scalar zero. Leaving
-    // them as MEMORY is always correct — exactly what the debug pipeline does — so
-    // this costs no correctness, only the SSA promotion of a conditionally-initialized
-    // float (rare). Promoting those via a rodata-zero is a deferred perf refinement
-    // (D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO). GPR-class conditional-init
-    // allocas stay promoted and get a `Const 0` incoming (the common case).
+    // live-in at the ENTRY block (read-before-write on some path) — but whose element
+    // type has NO zero form at all (`ZeroForm::None`): F16 (no encodings), I128/U128
+    // (the wide-int wall), and every aggregate/vector (no scalar zero — an aggregate
+    // is memory-resident by construction at this tier, so there is no register value
+    // to promote INTO). Leaving them as MEMORY is always correct — exactly what the
+    // debug pipeline does.
+    //
+    // ★ FPR element types are NO LONGER in this set — the anchor closed by this work
+    // is D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO:
+    // a conditionally-initialized F32/F64/F80/F128 local now stays
+    // PROMOTED and takes an anonymous rodata `GlobalAddr`+`Load` zero, exactly as
+    // every other float constant in the tree is materialized. GPR-class conditional-
+    // init allocas keep their direct `Const 0` (the common case, one instruction).
     {
         auto const liveEntryIt = liveIn.find(entryBlock_.v);
         if (liveEntryIt != liveIn.end()) {
             std::vector<std::uint32_t> depromote;
             for (std::uint32_t aid : promoted_) {
                 if (!liveEntryIt->second.count(aid)) continue;  // fully init before use
-                if (!isConstZeroable(interner_.kind(allocaElementType_.at(aid)))) {
+                if (zeroFormFor(interner_.kind(allocaElementType_.at(aid)))
+                    == ZeroForm::None) {
                     depromote.push_back(aid);
                 }
             }
@@ -754,7 +1052,13 @@ void Mem2RegPolicy::renameWalkIterative(
             if (op == MirOpcode::Store) {
                 auto const ops = src_.instOperands(id);
                 if (ops.size() == 2 && promoted_.count(ops[1].v)) {
-                    ReachingValue rv{ReachingValue::Kind::OldInst, ops[0].v};
+                    // The reaching value is the STORED VALUE — unless its pointee
+                    // differs from the slot's, in which case the rebuild emits a
+                    // retagging Bitcast in the store's place and the reaching value
+                    // is the STORE's own old id, whose rewrite entry IS that Bitcast
+                    // (D-OPT-MEM2REG-ERASES-CALL-OPERAND-POINTEE).
+                    ReachingValue rv{ReachingValue::Kind::OldInst,
+                                     storeNeedsRetag(id, ops) ? id.v : ops[0].v};
                     recordPush(ops[1].v, rv);
                 }
                 continue;
@@ -771,7 +1075,7 @@ void Mem2RegPolicy::renameWalkIterative(
                         // element type is GPR-Const-zeroable here.
                         // D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF.
                         TypeId const elem = allocaElementType_.at(ops[0].v);
-                        zeroConstTypeById_[elem.v] = elem;
+                        zeroTypeById_[elem.v] = elem;
                         loadReplacement_[id.v] =
                             ReachingValue{ReachingValue::Kind::ZeroConst, elem.v};
                     } else {
@@ -803,7 +1107,7 @@ void Mem2RegPolicy::renameWalkIterative(
                     // De-promotion in analyze() guarantees a GPR-Const-zeroable type.
                     // D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF.
                     TypeId const elem = allocaElementType_.at(pp.allocaOldIdV);
-                    zeroConstTypeById_[elem.v] = elem;
+                    zeroTypeById_[elem.v] = elem;
                     inc.value = ReachingValue{ReachingValue::Kind::ZeroConst, elem.v};
                 } else {
                     inc.value = stIt->second.back();
@@ -873,6 +1177,8 @@ Mem2RegResult runMem2Reg(Mir& mir, TypeInterner const& interner,
     result.phisInserted      = policy.phisInserted();
     result.loadsReplaced     = policy.loadsReplaced();
     result.storesEliminated  = policy.storesEliminated();
+    result.retagsInserted    = policy.retagsInserted();
+    result.rodataZerosMinted = policy.rodataZerosMinted();
 
     mir = std::move(builder).finish();
     result.ok = true;

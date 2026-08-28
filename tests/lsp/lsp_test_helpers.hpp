@@ -1,10 +1,12 @@
 #pragma once
 
+#include "core/substrate/stack_sized_thread.hpp"
 #include "core/substrate/thread_pool.hpp"
 #include "lsp/json_rpc.hpp"
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
 #include "lsp/transport.hpp"
+#include "lsp/workspace_project.hpp"   // fileUriFromPath - the ONE owner this helper forwards to
 #include "test_wait_budget.hpp"
 
 #include <gtest/gtest.h>
@@ -100,6 +102,13 @@ private:
 // client messages, then calls `runUntilExit()` to await server
 // teardown and return the exit code. Move-only; one harness per
 // test.
+// The stack the harness gives the server loop. 8 MiB is the DOCUMENTED main-
+// thread default on both POSIX hosts this project gates on, and production runs
+// `server.run()` on main -- so this is not a generous number, it is the number
+// the emulated thread already had. Reserved, not committed: a shallow run
+// touches about one page of it.
+inline constexpr std::size_t kServerLoopStackBytes = 8u * 1024u * 1024u;
+
 class LspTestHarness {
 public:
     LspTestHarness()
@@ -107,14 +116,32 @@ public:
         , server_(std::unique_ptr<LspTransport>{transport_},
                   std::make_unique<substrate::SynchronousExecutor>(),
                   cache_)
-        , exitFuture_(std::async(std::launch::async, [this] {
-              return server_.run();
-          })) {}
+        , exitFuture_(exitPromise_.get_future())
+        // ★★ A STATED STACK, NOT THE HOST'S DEFAULT. This thread stands in for
+        // production's MAIN thread -- `runLspMode` calls `server.run()` on it, and
+        // the schema resolve that `didOpen` triggers happens THERE, before any job
+        // reaches the executor. `std::async` gave it the host's secondary-thread
+        // default instead: 8 MiB on Linux, 512 KiB on macOS. ✔MEASURED 2026-08-25
+        // (cycle P34): `buildSchemaFromJsonText` compiles to a **415,360-byte**
+        // frame under clang -O0, so all four LSP binaries died `Bus error` on macOS
+        // and passed everywhere else. The harness was emulating an 8 MiB thread
+        // with 1/16th of its stack.
+        // D-TEST-LSP-HARNESS-RAN-THE-SERVER-LOOP-ON-A-HOST-DEFAULT-STACK
+        , serverThread_(kServerLoopStackBytes, [this] {
+              // Nothing may escape a thread entry, and a `run()` that threw would
+              // otherwise leave the promise unsatisfied -- which `runUntilExit`
+              // would report as a TIMEOUT, sending the reader to the wrong
+              // instrument entirely.
+              try {
+                  exitPromise_.set_value(server_.run());
+              } catch (...) {
+                  exitPromise_.set_exception(std::current_exception());
+              }
+          }) {}
 
     // ★★ THE HARNESS MUST SURVIVE A FAILING TEST, NOT HANG IT.
-    // Members destruct in REVERSE declaration order, so `exitFuture_` — an
-    // `std::async` future, whose destructor BLOCKS until the task finishes —
-    // goes first, while the server thread is still parked in
+    // The server thread is joined HERE, in the destructor body, while the
+    // server thread may still be parked in
     // `InMemoryTransport::readMessage()` waiting for a message that will never
     // come. Any test that returns early (a failed `ASSERT_*` before it could
     // push `shutdown`/`exit`, or a `runUntilExit` timeout) therefore used to
@@ -128,8 +155,24 @@ public:
     // return, and the future become ready. `close()` is idempotent, so the
     // normal shutdown+exit path is unaffected. `transport_` is owned by
     // `server_`'s `unique_ptr`, which is still alive at this point.
+    //
+    // ★ THE JOIN IS EXPLICIT NOW. It used to be implicit in `std::async`'s
+    // future destructor; a `StackSizedThread` aborts rather than detaching if it
+    // is destroyed while running, so the wait has to be stated. Same ordering as
+    // before -- close first, THEN wait -- because waiting on a loop that is still
+    // blocked in `readMessage()` is the deadlock this comment exists to prevent.
     ~LspTestHarness() {
         if (transport_) transport_->close();
+        if (serverThread_.joinable()) {
+            // The lambda already funnels every exception into the promise, so
+            // this join does not throw; the catch is here so that a future
+            // change to that lambda cannot turn a test failure into a
+            // `std::terminate` out of a destructor.
+            try {
+                serverThread_.join();
+            } catch (...) {   // NOLINT(bugprone-empty-catch)
+            }
+        }
     }
 
     LspTestHarness(LspTestHarness const&)            = delete;
@@ -177,10 +220,17 @@ public:
     [[nodiscard]] SchemaCache&       schemaCache()    noexcept { return cache_; }
 
 private:
+    // ⚠ DECLARATION ORDER IS THE CONSTRUCTION ORDER, and it is load-bearing:
+    // `serverThread_` is LAST because its callable touches `server_` and
+    // `exitPromise_`, which must both be fully built before a worker can read
+    // them. It is destroyed FIRST for the same reason -- though the destructor
+    // body above has already joined it by then.
     InMemoryTransport* transport_; // owned by server_'s unique_ptr<LspTransport>
     SchemaCache        cache_;
     LspServer          server_;
+    std::promise<int>  exitPromise_;
     std::future<int>   exitFuture_;
+    substrate::StackSizedThread serverThread_;
 };
 
 // Canonical wire-message builders. These are used so heavily across
@@ -191,15 +241,26 @@ private:
 }
 
 // `file:///…` URI for a local path — the spelling every LSP client uses for a
-// workspace folder. Backslashes become forward slashes and a Windows drive path
-// gains the extra leading slash the URI grammar requires (`C:\d` →
-// `file:///C:/d`), so a fixture built here round-trips through
-// `dss::lsp::pathFromFileUri`.
+// workspace folder.
+//
+// ⚠ IT FORWARDS TO PRODUCTION NOW, AND THAT IS THE POINT
+// (D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES). This used
+// to be a SECOND implementation, and it was the ONLY one that existed anywhere:
+// `src/` had `pathFromFileUri` but no inverse, so production could not name a
+// file at all and `locationJson` stamped the request's uri onto every result —
+// which is how a definition inside a header was reported as living in the open
+// document. A helper that exists only in the test tree is a helper the product
+// cannot use, and the tests then measure their own copy rather than the
+// shipping one.
+//
+// The old body also did LESS than it claimed: no percent-encoding at all, so a
+// fixture path containing a space produced a uri that `pathFromFileUri` decoded
+// back to a DIFFERENT path — the round-trip this comment asserted was never
+// actually closed. `dss::lsp::fileUriFromPath` does encode, and
+// `WorkspaceProject.FileUriRoundTrip` pins the three shapes.
 [[nodiscard]] inline std::string fileUriFromPath(
     std::filesystem::path const& p) {
-    auto s = p.generic_string();
-    return (!s.empty() && s.front() == '/') ? "file://" + s
-                                            : "file:///" + s;
+    return dss::lsp::fileUriFromPath(p);
 }
 
 // `initialize` naming workspace folders — the ONLY message that carries them,

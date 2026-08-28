@@ -12,7 +12,7 @@
 //     quoted literal is resolved against the including file's directory +
 //     declared include dirs; missing files are LOADED into the CU (recursively),
 //     and each directive becomes a CrossTreeRef (path token -> included tree
-//     root, importSpan = directive). (c-subset uses this.)
+//     root, importSpan = directive). (c uses this.)
 //   - name-matching. A `nameRule` in a `referenceParents` position is matched
 //     to a `nameRule` under a `definitionRule` of the same name in ANOTHER tree
 //     (importSpan = nullopt), keyed on the last `nameToken` text (case-folded
@@ -31,7 +31,7 @@
 //
 // Known v1 limitations (documented, not bugs):
 //   - include-following: a directive whose path lexeme is a single token (e.g.
-//     c-subset's `"#include"`) won't recognize a split spelling (`# include`).
+//     c's `"#include"`) won't recognize a split spelling (`# include`).
 //   - `addInMemory` sources are never deduplicated against include targets;
 //     if an in-memory `label` happens to equal a real on-disk path that
 //     another file follows, the file is loaded a second time from disk.
@@ -119,7 +119,7 @@ struct DSS_EXPORT ResolutionContext {
     std::optional<ObjectFormatKind> activeFormat;
 
     // Load + tokenize + parse `path` UNDER `schema` (the including tree's
-    // language — an `#include` in a c-subset file loads another c-subset file),
+    // language — an `#include` in a c file loads another c file),
     // append its Tree to `trees` (deduplicating by weakly-canonical path), and
     // return the resulting tree's TreeId. Sets `ok` false (and returns
     // InvalidTree) when the file can't be read. MUST NOT be called while holding

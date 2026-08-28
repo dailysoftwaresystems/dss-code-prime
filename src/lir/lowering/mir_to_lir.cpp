@@ -244,8 +244,8 @@ enum class MnemonicSlot : std::uint8_t {
     // Switch mid-lowering precedent). A target declaring neither fails loud;
     // a HALF-declared ldaxr/stlxr pair is a misdeclaration → fail loud.
     LockCmpxchg, Ldaxr, Stlxr,
-    // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-
-    // FCMP): float compare writing FLAGS, no register result — the
+    // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-FCMP):
+    // float compare writing FLAGS, no register result — the
     // float sibling of `cmp`. x86_64 binds UCOMISD (66 0F 2E, width
     // 64) / UCOMISS (0F 2E, width 32); arm64 binds FCMP D/S forms.
     // The width axis on the variants discriminates F64/F32 exactly
@@ -355,8 +355,15 @@ enum class MnemonicSlot : std::uint8_t {
     SpRestore,
     // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the NATIVE hardware bit-count
     // realizations, probed by mnemonic presence (the umulh/div capability split).
-    // `PopcountNative` = x86 POPCNT (arm64 declares none → SWAR, the fallback the
-    // arm64-elf example arm witnesses). `ClzNative` = x86 LZCNT / arm64 CLZ (BOTH
+    // ⚠ "NATIVE" MEANS "THE TARGET NAMES A REALIZATION", NOT "ONE INSTRUCTION" —
+    // D-FULLC-STDBIT-ARM64-CNT-POPCOUNT, 2026-08-26. `PopcountNative` = x86
+    // POPCNT, ONE instruction; on arm64 the same slot resolves a `popcount` row
+    // that carries NO encoding and a FOUR-STEP `lowering` sequence instead,
+    // because AArch64 has no scalar-GPR population count and reaches the
+    // operation through the SIMD bank. `lowerBitCountViaDeclaredRealization` is
+    // where that second level is read; see its docblock for why a
+    // one-instruction emit of a sequence-declaring mnemonic would be a silent
+    // miscompile. `ClzNative` = x86 LZCNT / arm64 CLZ (BOTH
     // targets declare "clz" — same 1-source result:value shape, defined =width at
     // 0). `CtzNative` = x86 TZCNT (arm64 declares none — it composes `Rbit`+CLZ).
     // `Rbit` = arm64 bit-reverse (RBIT), which turns leading-zeros (CLZ) into
@@ -928,12 +935,19 @@ struct Lowerer {
     // (unreachable for a TLS symbol by construction).
     std::optional<std::uint32_t>                  nextBlockSym_;
     std::unordered_map<std::uint32_t, SymbolId>   blockToSym_;
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the highest block symbol
+    // PRE-MINTED at HIR→MIR (a label whose address a static initializer took). Such
+    // a symbol is neither a function, a global, nor an extern, so the high-water
+    // scan below would step right over it and this minter would hand the SAME id to
+    // a different block — two definitions of one symbol, which the linker reports
+    // as "declared more than once". Folded into the seed of BOTH minters.
+    std::uint32_t preMintedBlockSymCeiling_ = 0;
     [[nodiscard]] SymbolId mintBlockSymbol(MirBlockId block) {
         if (auto it = blockToSym_.find(block.v); it != blockToSym_.end()) {
             return it->second;
         }
         if (!nextBlockSym_.has_value()) {
-            std::uint32_t maxV = 0;
+            std::uint32_t maxV = preMintedBlockSymCeiling_;
             for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
                 if (std::uint32_t const v = mir.funcSymbol(mir.funcAt(fi)).v; v > maxV) {
                     maxV = v;
@@ -957,6 +971,30 @@ struct Lowerer {
         blockToSym_.emplace(block.v, sym);
         return sym;
     }
+
+    // ── D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED ──────────────────────
+    // The static-data half of `&&label`. A `BlockAddressExport` names a block (via
+    // its `BlockAddress` operand) and the SymbolId a data relocation targets. Two
+    // things follow, both handled by `bindPreMintedBlockSymbols` before ANY function
+    // is lowered so neither depends on lowering order:
+    //   * `blockToSym_` is PRIMED with the pre-minted symbol, so a later `&&label`
+    //     `lea` for the same block resolves to the SAME symbol — the one-symbol-per-
+    //     block invariant `asm.cpp` records as a live bug when it was broken;
+    //   * the block's byte offset must be published as a `SyntheticBlockSymbol`.
+    //     When the exported address is ALSO materialized in the body, the `lea`'s
+    //     trailing `BlockRef` already does that at assemble time. When it is NOT
+    //     (`static void *tbl[] = {&&L0}; goto *tbl[i];` — gcc emits no `lea` here
+    //     either), nothing names the block from code, so the binding rides a
+    //     descriptor the pipeline resolves from `blockByteOffsets`. That is the
+    //     SAME two lines the dense-switch jump table and a hand-written `.s` table
+    //     already share (`bindBlockSymbol`), reached by a third producer.
+    std::vector<LirBlockSymbolBinding> blockSymbolBindings_;
+    // BlockAddress insts whose ONLY use is a `BlockAddressExport` — no register is
+    // ever read from them, so materializing one would be a dead `lea` in the
+    // function's entry block. The `foldedGlobalAddrs_` / `foldedConstDisps_`
+    // fold-skip precedent: any OTHER consumer reaching such a value via
+    // `regForValue` fails loud on the undefined vreg, never silently mis-encodes.
+    std::unordered_set<std::uint32_t> exportOnlyBlockAddrs_;
 
     // D-OPT-SWITCH-JUMP-TABLE (c70): the jump-table lowerer's state.
     //   * `jumpTableDescriptors_` accumulates one descriptor per dense switch;
@@ -992,7 +1030,9 @@ struct Lowerer {
     // Not deduped (each dense switch gets its own table).
     [[nodiscard]] SymbolId mintJumpTableSymbol() {
         if (!nextBlockSym_.has_value()) {
-            std::uint32_t maxV = 0;
+            // Same pre-minted-symbol ceiling as `mintBlockSymbol` — the two draw
+            // from ONE monotone sequence, so a gap in either seed is a gap in both.
+            std::uint32_t maxV = preMintedBlockSymCeiling_;
             for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
                 if (std::uint32_t const v = mir.funcSymbol(mir.funcAt(fi)).v; v > maxV) {
                     maxV = v;
@@ -1128,8 +1168,8 @@ struct Lowerer {
             }
         }
 
-        // D-FFI-EXTERN-CALL-DISPATCH (was D-LK10-ENTRY-ML7-FRAME-BIAS-
-        // UNIFY 2nd-order audit fold): fail loud UPFRONT at construction
+        // D-FFI-EXTERN-CALL-DISPATCH (was D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY
+        // 2nd-order audit fold): fail loud UPFRONT at construction
         // if the module declares extern imports but the active object
         // FORMAT cannot dispatch an extern call — before any lowering
         // work. The extern-call shape is a property of the FORMAT (its
@@ -1336,6 +1376,54 @@ struct Lowerer {
                 context));
     }
 
+    // ── D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND ───────────────────────────────
+    //
+    // The copy that materialises ONE inline-asm operand into (or out of) its
+    // bound register. Placed beside `classOp`/`reportMissingClassOp` on
+    // purpose: those two exist to kill "the silent class-blind miscompile", and
+    // the inline-asm lowering was the site that bypassed them — resolving one
+    // module-wide `MnemonicSlot::Mov` per BLOCK and using it for every operand
+    // whatever class it bound. See the call site in `expandInlineAsm` for the
+    // two measured disassemblies.
+    [[nodiscard]] std::optional<LirInstId>
+    emitAsmOperandMove(MirInstId at, LirReg dest, LirReg src,
+                       std::string_view role, std::size_t gnuIndex,
+                       std::string_view constraint) {
+        // ⚠ A CROSS-FILE MOVE IS A DIFFERENT MACHINE OPERATION FROM A COPY
+        // WITHIN A FILE, and `registerClassOps` binds one move PER class. There
+        // is no slot to ask, so this refuses rather than picking one of the two
+        // classes and encoding the register NUMBER into the wrong file.
+        if (dest.regClass() != src.regClass()) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "inline asm (MIR inst {}): {} {} (constraint \"{}\") binds "
+                    "register class '{}', but the value it carries lives in "
+                    "class '{}'. Moving between two register FILES is a "
+                    "distinct machine operation from a copy within one (arm64 "
+                    "spells it `fmov x0, d0`, x86_64 `movq %xmm0, %rax`), and "
+                    "no target declares it — `registerClassOps` binds one move "
+                    "PER class. Emitting that class's move would encode the "
+                    "register NUMBER in the wrong file and read an unrelated "
+                    "register, which is a silent wrong answer rather than a "
+                    "diagnostic. Bind this operand with a constraint whose "
+                    "class matches the value, or route the value through "
+                    "memory (D-TARGET-NO-CROSS-CLASS-MOVE-VERB)",
+                    at.v, role, gnuIndex, constraint,
+                    lirRegClassName(dest.regClass()),
+                    lirRegClassName(src.regClass())));
+            return std::nullopt;
+        }
+        auto const op = classOp(dest.regClass(), RegClassOp::Move);
+        if (!op.has_value()) {
+            reportMissingClassOp(dest.regClass(), RegClassOp::Move,
+                                 "inline asm operand materialisation");
+            return std::nullopt;
+        }
+        std::array<LirOperand, 1> const pin{LirOperand::makeReg(src)};
+        return emitInst(*op, dest, pin);
+    }
+
     // Map a MIR `TypeId` to the LIR register class that holds its
     // values. F16/F32/F64/F80/F128 → FPR; Vector/Matrix → VR (SIMD);
     // integer/bool/pointer → GPR; default for aggregates (Struct/
@@ -1459,7 +1547,7 @@ struct Lowerer {
     // widths 64+32 since FC3.5 sweep-c2 — added for the composed-FCmp
     // materialization, which also un-walled source-level `&`/`|`;
     // arm64 AND/ORR X-form, width-absent variants) — witnessed by
-    // examples/c-subset/bitwise_and_or. The REMAINING walls, per
+    // examples/c/bitwise_and_or. The REMAINING walls, per
     // target: x86 declares xor/not WITHOUT encodings (they pass this
     // gate, lower, and fail loud at the assembler —
     // A_NoEncodingDeclared); arm64 ENCODES xor (EOR) but declares no
@@ -1698,7 +1786,7 @@ struct Lowerer {
             // that "proves" them by asserting a user program is refused would be
             // asserting the opposite of the measurement — the MIR-tier unit test
             // (tests/lir/test_mir_to_lir.cpp) drives them directly instead.
-            // Verified end-to-end on the pe leg by examples/c-subset/setjmp_longjmp,
+            // Verified end-to-end on the pe leg by examples/c/setjmp_longjmp,
             // which still builds and runs.
             case MirOpcode::Load: case MirOpcode::Const:
             case MirOpcode::Bitcast: {
@@ -2387,18 +2475,20 @@ struct Lowerer {
                                  fpsiSrcWidth);
             }
             case MirOpcode::FPToUI: {
-                // c78 (D-CSUBSET-FP-TO-UI-CODEGEN): fp_to_ui carries the
-                // SAME CVTTSD2SI/CVTTSS2SI encodings as fp_to_si, keyed on
-                // the SOURCE float width. A double→U32 conversion (sqlite's
-                // occurrence) truncates via CVTTSD2SI r64 and the U32 result
-                // reads its low 32 bits — VALUE-CORRECT because any double in
-                // the U32 range [0, 2^32) fits the signed-64 CVTTSD2SI result
-                // exactly (gcc emits the identical `cvttsd2si rax, xmm0`). The
-                // full-range unsigned-i64 case (a double ≥ 2^63) needs the
-                // conditional-subtract sequence — deferred
-                // (D-CSUBSET-UI-FROM-FP-UNSIGNED-I64; sqlite stays in range).
-                // Threads the source width like FPToSI (the result-width
-                // default would mis-key the SOURCE axis).
+                // D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE
+                // (closes D-CSUBSET-UI-FROM-FP-UNSIGNED-I64, 2026-08-24).
+                // `fp_to_ui` is realized by the TARGET-DECLARED instruction
+                // SEQUENCE — one step on arm64 (FCVTZU, natively full-range
+                // from both a D and an S source), seven on x86-64, which has
+                // no float→unsigned instruction at all and expands to clang's
+                // branchless truncate-both-and-select form. From c78 until
+                // this cycle the x86 row instead declared the SIGNED
+                // CVTTSD2SI/CVTTSS2SI, which was exact below 2^63 and
+                // silently returned 0x8000000000000000 above it, at BOTH
+                // source float widths. Nothing arch-specific happens here:
+                // this arm threads the SOURCE float width (the result-width
+                // default would mis-key the axis, exactly as for FPToSI) and
+                // `lowerNAryOp` emits whatever the target declared.
                 auto const fuOps = mir.instOperands(id);
                 if (fuOps.size() == 1
                     && !requireEncodedFloatWidth(id, mir.instType(fuOps[0]),
@@ -2414,7 +2504,17 @@ struct Lowerer {
             case MirOpcode::SIToFP:
             case MirOpcode::UIToFP: {
                 // D-CSUBSET-INT-FLOAT-CONVERSION (int→float codegen): cvtsi2sd /
-                // SCVTF. Like FPToSI's MIRROR, the encoded form keys on the SOURCE
+                // SCVTF for the SIGNED arm. ⚠ THE UNSIGNED ARM IS NO LONGER THE
+                // SAME INSTRUCTION — see
+                // D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE
+                // (closes D-CSUBSET-UI-TO-FP-UNSIGNED-I64,
+                // 2026-08-24): `ui_to_fp` is realized by the target-declared
+                // SEQUENCE (arm64: one UCVTF; x86-64: split the source into two
+                // sub-2^32 halves, convert each exactly, and recombine with ONE
+                // correctly-rounded add). Sharing cvtsi2sd between the two arms
+                // was wrong not only above 2^63 but above 2^31, because the
+                // width-32 variant is a SIGNED THIRTY-TWO-BIT read.
+                // Like FPToSI's MIRROR, the encoded form keys on the SOURCE
                 // INTEGER width, NOT the (float) result width — a 64-bit source
                 // selects the REX.W cvtsi2sd xmm,r64 / SCVTF Dd,Xn form, a 32-bit
                 // source the no-REX.W cvtsi2sd xmm,r32 / SCVTF Dd,Wn form. The
@@ -2476,6 +2576,11 @@ struct Lowerer {
             case MirOpcode::GlobalAddr:    return lowerGlobalAddr(id);
             // D-CSUBSET-COMPUTED-GOTO: `&&label` block address materialization.
             case MirOpcode::BlockAddress:  return lowerBlockAddress(id);
+            // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: pure metadata —
+            // the symbol was installed by `bindPreMintedBlockSymbols` and the byte
+            // offset is published by `lowerBlockAddress`. Emitting nothing IS the
+            // lowering, the way a SEH marker lowers to no runtime instruction.
+            case MirOpcode::BlockAddressExport: return;
             case MirOpcode::ByValueStackArg: return lowerByValueStackArg(id);
             case MirOpcode::Call:          return lowerCall(id);
             case MirOpcode::IntrinsicCall: return lowerIntrinsicCall(id);
@@ -2513,8 +2618,19 @@ struct Lowerer {
         // reads the result class to pick the right arg-passing
         // register per the cycle-2b TargetCallingConvention.
         LirReg const result = lir.newVReg(regClassFor(id));
+        // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: state this
+        // parameter's NATURAL WIDTH on the `arg` instruction. It is inert for a
+        // register-resident param (callconv emits the class MOVE, which carries
+        // its own plumbing width) and inert for every `Slot`-packing CC (the
+        // stacked read stays the 8-byte slot load) — but a CC that declares
+        // NATURAL packing needs the callee's incoming-stack read to be
+        // width-EXACT, because the neighbouring argument starts inside what an
+        // 8-byte load would consume. `memAccessWidthFlags` is the SAME function
+        // the caller side uses to state the outgoing size, so the two sides agree
+        // by construction rather than by two hand-kept tables.
         emitInst(*opcode(MnemonicSlot::Arg), result, std::span<LirOperand const>{},
-                    /*payload=*/mir.argIndex(id));
+                    /*payload=*/mir.argIndex(id), /*flags=*/
+                    memAccessWidthFlags(mir.instType(id), regClassFor(id)));
         defineValue(id, result);
     }
 
@@ -2738,6 +2854,30 @@ struct Lowerer {
         // this vreg), not on the whole expansion.
         bool          earlyClobber = false;
         std::string   constraint;      // verbatim, for diagnostics
+        // What the template WRITES around `reg`. `Reg` — the default and the
+        // only value a class-bound or register-bound letter ever takes — means
+        // the register itself; `MemBase` means the dialect's memory form with
+        // `reg` as the base (`(%rdi)` / `[x0]`), because `reg` then holds the
+        // operand's ADDRESS rather than its value. Carried rather than derived
+        // from the constraint TEXT: the letter is `.target.json` vocabulary and
+        // a `constraint == "m"` test here would be a target check spelled as a
+        // string compare.
+        OperandKindFilter operandKind = OperandKindFilter::Reg;
+        // ★★★ THE `ImmInt` FORM'S PAYLOAD, AND IT IS A **VALUE** WHERE EVERY
+        // OTHER FORM CARRIES A REGISTER (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED).
+        // `"i"` binds no register at all — the number is written INTO the
+        // instruction — so on such a binding `reg` is deliberately
+        // `InvalidLirReg` and `cls` is `None`, and this pair is what the
+        // template actually denotes.
+        // ⚠ THE BOOL IS LOAD-BEARING FOR THE `operandKindResolved` REASON: `0`
+        // is a perfectly ordinary immediate, so a zero-initialized `immediate`
+        // reads back as a plausible measurement. `hasImmediate` is the only
+        // field that cannot be mistaken for one — and the two together are what
+        // let the engine's own refusal say "the caller bound this to the
+        // immediate form and then handed it no value" rather than encoding a
+        // silent zero.
+        bool          hasImmediate = false;
+        std::int64_t  immediate    = 0;
     };
 
     // A spelling list as a diagnostic reads it: `'%0', '%[out]'`. An operand
@@ -2777,9 +2917,15 @@ struct Lowerer {
         return lirInstWidthBits(widthFlagsForType(ty));
     }
 
+    // `valueInst` is the MIR value bound to this operand, and it is INVALID on
+    // an output by construction: an output is read back through a `ReturnPiece`,
+    // not through an operand. Only the `ImmInt` arm consults it — it is the one
+    // form whose payload is a VALUE rather than a register, and the value is
+    // exactly the `Const` `hir_to_mir` emitted for it.
     [[nodiscard]] bool
     bindAsmOperand(MirAsmOperand const& o, MirInstId at, std::size_t gnuIndex,
-                   std::string_view role, TypeId valueType, AsmBound& out) {
+                   std::string_view role, TypeId valueType, MirInstId valueInst,
+                   AsmBound& out) {
         out.spellings  = o.spellings;
         out.widthBits  = asmWidthBitsForType(valueType);
         out.constraint = o.constraint;
@@ -2792,6 +2938,165 @@ struct Lowerer {
         // the whole-descriptor pass below is where that relation is checked and
         // realised — before ANYTHING is emitted, so an unrepresentable shape
         // still refuses rather than reaching a template.
+        // ★★★ A MEMORY-FORM OPERAND HAS NO REGISTER CLASS AND MUST NOT BE ASKED
+        // FOR ONE — THE **ADDRESS** IS WHAT GETS A REGISTER
+        // (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED). `"m"` binds
+        // an operand FORM, so `o.regClass` is meaningless on this entry and the
+        // `None` refusal below would fire on a letter both shipped targets
+        // declare. The value `hir_to_mir` handed us is the operand's ADDRESS, so
+        // the class comes from the SAME `regClassForType` map every other
+        // pointer-valued LIR operand uses — config-driven, no letter and no
+        // architecture named here.
+        // ⇒ ★★ AND THIS ONE ARM SERVES **BOTH SECTIONS**
+        // (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED). `hir_to_mir` files
+        // a memory-form OUTPUT (`"=m"`, `"+m"`) in `desc.inputs` as well,
+        // because such an operand produces no result piece — the template writes
+        // the object itself — and its one MIR operand IS its address. The
+        // machine carriage is therefore identical in both directions and the
+        // DIRECTION lives entirely in the template's own instruction, which is
+        // why realizing the output form needed no arm here at all.
+        // ⚠ THE KIND TRAVELS TO THE ENGINE (`AsmBound::operandKind` →
+        // `AsmOperandBinding::operandKind`), because "which register" and "what
+        // does the template WRITE around it" are two facts: the engine turns a
+        // memory binding into the dialect's own addressing form, which is why
+        // `(%rdi)` and `[x0]` need no arm here.
+        if (o.operandKindResolved) {
+            out.operandKind =
+                static_cast<OperandKindFilter>(o.operandKind);
+            if (out.operandKind != OperandKindFilter::MemBase
+                && out.operandKind != OperandKindFilter::ImmInt) {
+                // Unreachable from C today — `hir_to_mir` refuses every other
+                // form by name — but this tier has direct-API producers that
+                // never run it (the LSP, the FFI header parser, hand-built
+                // descriptors in the test suite), so it refuses rather than
+                // falling through to a register binding it was never given.
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format("inline asm (MIR inst {}): {} {} (constraint "
+                                "\"{}\") binds the operand form '{}', which this "
+                                "tier realizes only for '{}' and '{}'",
+                                at.v, role, gnuIndex, o.constraint,
+                                operandKindFilterName(out.operandKind),
+                                operandKindFilterName(
+                                    OperandKindFilter::MemBase),
+                                operandKindFilterName(
+                                    OperandKindFilter::ImmInt)));
+                return false;
+            }
+            // ★★★ THE IMMEDIATE FORM BINDS **NO REGISTER**, SO IT TAKES NO
+            // REGISTER CLASS, NO VREG AND NO MATERIALISING `mov`
+            // (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED). The value is
+            // written into the instruction the template names, so `reg` stays
+            // `InvalidLirReg` on purpose: anything else would hand the engine a
+            // register that is not what `%N` denotes, and the engine would
+            // faithfully emit it.
+            // ★ THE VALUE COMES OUT OF THE MIR `Const` `hir_to_mir` EMITTED,
+            // through `constIntegerValue` — the SAME reader a const-disp `Gep`
+            // already uses for exactly this question. No private payload rides
+            // the descriptor, so there is nothing for a rebuild to drop.
+            if (out.operandKind == OperandKindFilter::ImmInt) {
+                if (!o.fixedRegister.empty() || o.tiedOutput.has_value()) {
+                    // A constant cannot also be a pinned register, and it cannot
+                    // be the read half of a read-write operand (there is nothing
+                    // to write back INTO a constant). Either combination came
+                    // from a hand-built descriptor, and honouring half of it
+                    // would be a guess.
+                    dss::report(reporter,
+                        DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                        DiagnosticSeverity::Error,
+                        std::format("inline asm (MIR inst {}): {} {} (constraint "
+                                    "\"{}\") binds the '{}' form and also {} — a "
+                                    "compile-time constant occupies no register "
+                                    "and is no operand's write-back partner",
+                                    at.v, role, gnuIndex, o.constraint,
+                                    operandKindFilterName(
+                                        OperandKindFilter::ImmInt),
+                                    o.fixedRegister.empty()
+                                        ? std::string{"ties an output"}
+                                        : std::format("pins register '{}'",
+                                                      o.fixedRegister)));
+                    return false;
+                }
+                // ⚠ VALIDITY IS ASKED FIRST, AND IT IS NOT DEFENSIVE NOISE: an
+                // OUTPUT has no operand at all (`InvalidMirInst` by
+                // construction), and `mir.instOpcode` on an invalid id ABORTS
+                // the process. `hir_to_mir` refuses an immediate-form output
+                // with gcc's own diagnosis, so a descriptor carrying one came
+                // from a producer that never ran it — which owes a diagnostic,
+                // never a process kill.
+                auto const value = valueInst.valid()
+                                       ? constIntegerValue(valueInst)
+                                       : std::nullopt;
+                if (!value.has_value()) {
+                    // ⚠ THE REFUSAL NAMES WHAT IS ACTUALLY WRONG. A C source
+                    // reaching here is already refused by `hir_to_mir`
+                    // ("requires an INTEGER CONSTANT EXPRESSION"), which is the
+                    // tier that can still see the expression; what lands here
+                    // is a descriptor whose immediate operand was wired to a
+                    // value that is not a `Const` at all — a producer defect,
+                    // and one that would otherwise encode whatever
+                    // `constIntegerValue`'s failure default happened to be.
+                    dss::report(reporter,
+                        DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                        DiagnosticSeverity::Error,
+                        std::format("inline asm (MIR inst {}): {} {} (constraint "
+                                    "\"{}\") binds the '{}' form, but the MIR "
+                                    "value wired to it is not an integer `Const` "
+                                    "— an immediate operand IS its value, so "
+                                    "there is nothing to encode",
+                                    at.v, role, gnuIndex, o.constraint,
+                                    operandKindFilterName(
+                                        OperandKindFilter::ImmInt)));
+                    return false;
+                }
+                out.cls          = LirRegClass::None;
+                out.reg          = InvalidLirReg;
+                out.pinned       = false;
+                out.earlyClobber = false;
+                out.hasImmediate = true;
+                out.immediate    = *value;
+                return true;
+            }
+            if (!o.fixedRegister.empty()) {
+                // A letter cannot bind a form AND pin a register: `binds` names
+                // one arm. A descriptor carrying both came from a producer that
+                // built it by hand, and honouring either half would be a guess.
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format("inline asm (MIR inst {}): {} {} (constraint "
+                                "\"{}\") binds an operand form AND pins register "
+                                "'{}' — a constraint letter binds exactly one of "
+                                "the three arms",
+                                at.v, role, gnuIndex, o.constraint,
+                                o.fixedRegister));
+                return false;
+            }
+            out.cls    = regClassForType(valueType);
+            out.reg    = lir.newVReg(out.cls);
+            out.pinned = false;
+            // ★★ `&` ON A MEMORY-FORM OPERAND ASKS FOR A PROPERTY THIS BINDING
+            // ALREADY HAS, WHICH IS WHY THERE IS NOTHING TO STAMP
+            // (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED). `&` promises
+            // the output is written BEFORE the inputs are read, so it must not
+            // share a register with any of them, and `stampEarlyClobberOutputs`
+            // realizes that by flagging the instruction that DEFINES a bound
+            // output's vreg. A memory-form operand binds no output register at
+            // all: the register it binds holds the object's ADDRESS, is
+            // materialised by the input loop BEFORE the template and is READ by
+            // the template, so its live range covers the template and overlaps
+            // every other operand's — and two overlapping ranges cannot receive
+            // one physical register. ✔MEASURED through the CLI on
+            // `"=&m"(a) : "r"(y)`: the address register and the input register
+            // come out distinct on both shipped targets, at debug and release.
+            // ⓘ `hir_to_mir` files a memory-form OUTPUT in `desc.inputs` (it
+            // produces no result piece), so `stampEarlyClobberOutputs` — which
+            // walks the bound OUTPUTS — never sees one either way. This line
+            // states the machine fact; the placement is what makes it moot.
+            out.earlyClobber = false;
+            return true;
+        }
         LirRegClass const cls = static_cast<LirRegClass>(o.regClass);
         if (cls == LirRegClass::None) {
             dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
@@ -2884,6 +3189,15 @@ struct Lowerer {
     //     is conformance, not a gap. ⚠ clang is NOT installed on this machine,
     //     so it is deliberately not cited: the reference figure names the
     //     compiler the probe was actually run against.
+    //     ⓘ THE SAME VERDICT COVERS `"+m"` IN THE INPUT SECTION and reaches it
+    //     through this same arm: ✔MEASURED 2026-08-23 on gcc 13.3.0, BOTH
+    //     shipped targets, `"+m"` in the input section is the byte-identical
+    //     `error: input operand constraint contains '+'`. A `"+m"` written in
+    //     the OUTPUT section is a different statement and is REALIZED — it
+    //     carries no `isReadWrite` here at all, because a memory operand's read
+    //     and write halves are the same memory named by one address register,
+    //     so there is no second machine fact to tie
+    //     (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED).
     //   * a read-write OUTPUT that NO input entry claims — the front end owes one
     //     per `+` output; without it the template would read a register only the
     //     template itself writes. ★ This is the original refusal's protective
@@ -3085,14 +3399,16 @@ struct Lowerer {
     }
 
     // ★★★ EVERY DIAGNOSTIC AN ASM EXPANSION RAISES NAMES THE EMBEDDING
-    // STATEMENT AS ITS PRIMARY LOCUS (D-ASM-TEMPLATE-DIAGNOSTIC-DOES-NOT-NAME-
-    // THE-C-STATEMENT). The template's own diagnostics point into the
+    // STATEMENT AS ITS PRIMARY LOCUS (D-ASM-TEMPLATE-DIAGNOSTIC-DOES-NOT-NAME-THE-C-STATEMENT).
+    // The template's own diagnostics point into the
     // mid-compile-minted `<inline asm>` buffer — they name the BYTE inside the
     // template but never the source statement, so a file with three `__asm__`
     // blocks cannot tell which one is being refused. ✔MEASURED, gcc 13.3 and
-    // clang 18: BOTH references make the C statement primary (clang: `gt.c:3:13:
-    // error: …` then `<inline asm>:1:2: note: instantiated into assembly here`;
-    // gcc: `gt.c:3: Error: …` with the text echoed) — neither has
+    // clang 18, on a 3-line C file whose `__asm__` names a bogus mnemonic: BOTH
+    // references make the C statement primary (clang prints the C statement's
+    // `<file>:<line>:<col>: error: …` then an `<inline asm>` `note: instantiated
+    // into assembly here`; gcc prints the C statement's `<file>:<line>: Error: …`
+    // with the text echoed) — neither has
     // template-primary. The fragment locus is DEMOTED to a related note, never
     // dropped; text-only refusals (no locus at all today) gain the primary.
     //
@@ -3225,13 +3541,16 @@ struct Lowerer {
                         id.v, k, desc.outputs[k].constraint));
                 return false;
             }
-            if (!bindAsmOperand(desc.outputs[k], id, k, "output", ty, outs[k]))
+            // An OUTPUT is read back through its `ReturnPiece`, so it has no MIR
+            // operand — `InvalidMirInst` is the honest answer, not a placeholder.
+            if (!bindAsmOperand(desc.outputs[k], id, k, "output", ty,
+                                InvalidMirInst, outs[k]))
                 return false;
         }
         for (std::size_t j = 0; j < desc.inputs.size(); ++j) {
             if (!bindAsmOperand(desc.inputs[j], id, desc.outputs.size() + j,
                                 "input", mir.instType(operands[j]),
-                                ins[j])) {
+                                operands[j], ins[j])) {
                 return false;
             }
         }
@@ -3243,9 +3562,25 @@ struct Lowerer {
         if (!tieAsmReadWriteOperands(desc, id, outs, ins)) return false;
 
         // ── 2. the ONE per-instruction constraint ──
+        // ⚠ THE ORDINAL ARRAYS FILLED BELOW ARE SCRATCH FOR THE INVARIANT
+        // QUERY, NOT A HALF-RESOLUTION THE POOL COULD INHERIT.
+        // `regConstraintPoolAdd` RE-DERIVES all five arrays from the names
+        // ("names are the authored source of truth"), so nothing written here
+        // survives into the pool. `lir_text.cpp`'s `constraintSubsetHolds` is
+        // the precedent for the shape, and for the same reason: the rule is
+        // stated over ORDINALS, so a caller that wants to ask it must hold
+        // them. This tier is not resolving anything EARLY to do it — every
+        // ordinal below is already in hand (`AsmBound::ordinal`,
+        // `canonicalAsmRegister`'s out-parameter) and used to be discarded.
         ImplicitRegisterConstraint c;
-        for (auto const& b : ins)  if (b.pinned) c.inputNames.push_back(b.name);
-        for (auto const& b : outs) if (b.pinned) c.outputNames.push_back(b.name);
+        for (auto const& b : ins) {
+            if (b.pinned) c.inputNames.push_back(b.name);
+        }
+        for (auto const& b : outs) {
+            if (!b.pinned) continue;
+            c.outputNames.push_back(b.name);
+            c.outputOrdinals.push_back(b.ordinal);
+        }
         // The SOURCE's clobber list, resolved through the target's table. (The
         // `"memory"` and `"cc"` spellings never reach here — the front end
         // hoists them into `clobbersMemory` / `clobbersConditionCodes`, so this
@@ -3259,83 +3594,108 @@ struct Lowerer {
                 return false;
             }
             c.clobberedNames.push_back(std::move(name));
+            c.clobberedOrdinals.push_back(ord);
         }
-        // ★★★ `outputs ⊆ clobbered`, REPLICATED HERE BECAUSE NO LOADER RUNS ON
-        // THIS PATH. ✔MEASURED: the target JSON loader enforces the invariant for
-        // the per-OPCODE carrier (`target_schema_json.cpp`), and
-        // `effectiveForbiddenOrdinals` deliberately omits OUTPUTS from the
-        // forbidden set — *"the instruction reads its operands BEFORE writing its
-        // outputs"*. The second is safe ONLY because of the first. The
-        // per-INSTRUCTION carrier is lowering-built and meets no loader, so
-        // without this loop a value live in the output's register ACROSS the
-        // block keeps its allocation and dies with no diagnostic.
+        // ★★★ GNU SEMANTICS → THE CARRIER'S CONTRACT, AND THIS IS **NOT** THE
+        // INVARIANT CHECK — it is the translation that makes the invariant
+        // TRUE, which is a different operation and stays a separate loop.
+        // A `"=a"` output is a register the block WRITES, and GNU C forbids the
+        // SOURCE from naming an output register in the clobber list (gcc and
+        // clang both reject it), so the user CANNOT declare what the allocator
+        // needs to read. This tier is the only place that knows both halves.
+        // Without it a value live in the output's register ACROSS the block
+        // keeps its allocation and dies with no diagnostic.
         // (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED)
-        for (auto const& outName : c.outputNames) {
-            bool present = false;
-            for (auto const& cl : c.clobberedNames) {
-                if (cl == outName) { present = true; break; }
-            }
-            if (!present) c.clobberedNames.push_back(outName);
+        //
+        // ⚠ KEYED BY ORDINAL, NOT BY NAME, SO IT AGREES WITH THE RULE IT IS
+        // SATISFYING. The name compare it replaced would have re-added a
+        // register already clobbered under a different spelling; the check
+        // below reads ordinals, so a name-keyed normalization could hand it a
+        // pair it then refused. Both arrays grow together — the names are the
+        // authored source of truth the builder re-resolves, the ordinals are
+        // scratch for the query.
+        for (std::size_t k = 0; k < c.outputOrdinals.size(); ++k) {
+            if (c.outputIsClobbered(k)) continue;
+            c.clobberedNames.push_back(c.outputNames[k]);
+            c.clobberedOrdinals.push_back(c.outputOrdinals[k]);
         }
-        // The fail-loud half. The loop above cannot leave a violation behind, so
-        // reaching this is a defect in THIS function rather than in its input —
-        // which is exactly when a silent pass is most expensive, because the
-        // invariant it guards is invisible to every downstream test.
-        // ⓘ `regConstraintPoolAdd` now ABORTS on the same violation
-        // (`ImplicitRegisterConstraint::firstOutputNotClobbered`), so this loop
-        // is no longer the only guard — but it stays, and it stays FIRST: this
-        // tier is fed by USER text and owes a diagnostic, never a process kill.
-        // The builder's abort is the backstop for producers that forget; the
-        // ordinal-based query cannot be used here because the ordinals are
-        // derived by the builder, so the canonical NAMES are what this tier has.
-        for (auto const& outName : c.outputNames) {
-            bool present = false;
-            for (auto const& cl : c.clobberedNames) {
-                if (cl == outName) { present = true; break; }
-            }
-            if (!present) {
-                dss::report(reporter,
-                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
-                    DiagnosticSeverity::Error,
-                    std::format(
-                        "inline asm (MIR inst {}): internal invariant violated — "
-                        "output register '{}' is not in the instruction's clobber "
-                        "set. Register allocation omits outputs from the "
-                        "forbidden set on the strength of `outputs ⊆ clobbered`, "
-                        "so shipping this entry would let a value live across the "
-                        "block keep a register the block overwrites "
-                        "(D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-"
-                        "CLOBBERED)", id.v, outName));
-                return false;
-            }
+        // The fail-loud half, ASKED WITH THE TYPE'S OWN QUERY — one rule, one
+        // implementation, shared with the `.target.json` loader, the `.dsslir`
+        // reader and `regConstraintPoolAdd`. The loop above cannot leave a
+        // violation behind, so reaching this is a defect in THIS function
+        // rather than in its input — which is exactly when a silent pass is
+        // most expensive, because the invariant it guards is invisible to every
+        // downstream test.
+        // ⓘ `regConstraintPoolAdd` ABORTS on the same violation, so this is no
+        // longer the only guard — but it stays, and it stays FIRST: this tier
+        // is fed by USER text and owes a diagnostic, never a process kill. The
+        // builder's abort is the backstop for producers that forget.
+        if (auto const bad = c.firstOutputNotClobbered(); bad.has_value()) {
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "inline asm (MIR inst {}): internal invariant violated — "
+                    "output register '{}' is not in the instruction's clobber "
+                    "set. Register allocation omits outputs from the "
+                    "forbidden set on the strength of `outputs ⊆ clobbered`, "
+                    "so shipping this entry would let a value live across the "
+                    "block keep a register the block overwrites ("
+                    // Break BEFORE the id and AFTER it, never inside it: a
+                    // split id still READS as a citation but no grep for the
+                    // whole id returns it, so it does not fail — it vanishes.
+                    "D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED"
+                    ")", id.v, c.outputNames[*bad]));
+            return false;
         }
         bool const anyConstraint = !c.inputNames.empty()
                                 || !c.outputNames.empty()
                                 || !c.clobberedNames.empty();
 
-        // The move used for the input materialisation and the output captures.
-        // Resolved only when the block actually needs one, so a target that
-        // declares no `mov` still compiles an asm block that needs none — an
-        // operand-less `__asm__("nop")` asks nothing of the target's move.
-        // ⚠ THE INPUT HALF IS "ANY INPUT AT ALL", NOT "ANY PINNED INPUT".
-        // EVERY input is materialised into its bound register (see the loop in
-        // step 4), so gating on `pinned` here left `movOp` DISENGAGED on the
-        // path that dereferences it: the plain `"r"` input crashed the builder
-        // with `LirBuilder::addInst: Invalid opcode` out of a `*movOp` on an
-        // empty optional. It stayed invisible while unpinned inputs were being
-        // skipped entirely — the same omission hid both halves.
-        bool const needMoves =
-            !ins.empty()
-            || std::any_of(outs.begin(), outs.end(),
-                           [](AsmBound const& b) { return b.pinned; });
-        std::optional<std::uint16_t> movOp;
-        if (needMoves) {
-            movOp = opcode(MnemonicSlot::Mov);
-            if (!movOp.has_value()) {
-                reportMissingOpcode(MnemonicSlot::Mov, "inline asm register pin");
-                return false;
-            }
-        }
+        // ── D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND ──────────────────────────
+        //
+        // ★★★ THE COPY THAT MATERIALISES AN OPERAND IS PER-REGISTER-CLASS, AND
+        // IT USED TO BE ONE MODULE-WIDE `MnemonicSlot::Mov` FOR THE WHOLE
+        // BLOCK. That was a LIVE SILENT MISCOMPILE on BOTH shipped targets, and
+        // the comment on `classOp` — "falling back to the GPR handle (the
+        // silent class-blind miscompile this table kills)" — described exactly
+        // what this site was doing while the table sat unused two hundred lines
+        // away.
+        //
+        // ✔MEASURED 2026-08-23 (cycle P28) at the CLI, `--config=release`,
+        // rc=0 and no diagnostic in every arm:
+        //   arm64, `double y = x; __asm__("nop" : "+r"(y));`
+        //     DSS:  fmov d15, d0  /  mov x29, x15  /  nop  /  mov x0, x29
+        //     gcc:  fmov x0,  d0  /  nop           /  fmov d0, x0
+        //     `mov x29, x15` reads the INTEGER register 15 while the value is
+        //     in d15 — a different physical register. The function returns
+        //     whatever x15 held.
+        //   x86_64, `double y = v; __asm__("nop" : "+x"(y));`
+        //     DSS:  movaps %xmm0,%xmm13 / mov %r13,%r13 / nop / movaps %xmm13,%xmm0
+        //     The operand's own register is xmm13 and the copy into it is the
+        //     INTEGER mov on register number 13 — a no-op on r13. The template
+        //     reads a register nothing ever wrote.
+        //
+        // ★ THE FIX REUSES THE VERB THAT ALREADY EXISTS: `classOp(cls,
+        // RegClassOp::Move)`, the same lookup every ordinary copy in this file
+        // makes. Resolved PER COPY rather than once per block, because one asm
+        // block may bind operands of several classes and a single handle cannot
+        // be right for all of them.
+        //
+        // ⚠ AND A CROSS-CLASS COPY IS REFUSED RATHER THAN APPROXIMATED. When
+        // the constraint's class differs from the VALUE's class the machine
+        // needs a cross-FILE move (`fmov x0, d0` / `movq %xmm0, %rax`), which is
+        // neither class's `move` and which no target declares. gcc compiles that
+        // template, so this is a CONFORMANCE GAP with a working reference — it
+        // is anchored at D-TARGET-NO-CROSS-CLASS-MOVE-VERB, whose trigger is
+        // this very template. Refusing is what the bar requires in the
+        // meantime: the alternative measured above is a wrong register, quietly.
+        auto emitOperandMove =
+            [this, id](LirReg dest, LirReg src, std::string_view role,
+                       std::size_t gnuIndex,
+                       std::string_view constraint) -> std::optional<LirInstId> {
+            return emitAsmOperandMove(id, dest, src, role, gnuIndex, constraint);
+        };
 
         // ── 3. parse the template on the RIGHT SURFACE ──
         //
@@ -3395,10 +3755,30 @@ struct Lowerer {
         // hold a different class than the constraint asks for, and a direct
         // bind would silently hand the template the wrong register file.
         for (std::size_t j = 0; j < ins.size(); ++j) {
+            // ★★★ AN IMMEDIATE-BOUND INPUT IS **NOT** MATERIALISED, AND THE SKIP
+            // IS THE MECHANISM RATHER THAN AN OPTIMIZATION
+            // (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED). It has no bound
+            // register to move a value into (`reg` is `InvalidLirReg` by
+            // construction — see `bindAsmOperand`'s `ImmInt` arm), so
+            // `emitOperandMove` would be asked to define an invalid vreg. The
+            // value reaches the template through the BINDING below, which is
+            // where an immediate has always lived in this pipeline: the
+            // `[Reg, ImmInt]` encoding variants both shipped targets declare are
+            // the same ones a `.s`-written `add x0, x0, #5` elects.
+            // ⚠ `regForValue` IS DELIBERATELY NOT CALLED EITHER. `lowerConst`
+            // skips materialising a constant whose sole use is this operand
+            // (`constFoldsIntoAsmImmediate`), so asking for a register here
+            // would fail loud on the undefined vreg — which is exactly the
+            // fold-site-disagreement alarm that mechanism exists to raise.
+            if (ins[j].hasImmediate) continue;
             std::optional<LirReg> const src = regForValue(operands[j]);
             if (!src.has_value()) return false;
-            std::array<LirOperand, 1> const pin{LirOperand::makeReg(*src)};
-            emitInst(*movOp, ins[j].reg, pin);
+            // Same early-out shape as the `regForValue` line above: this runs
+            // BEFORE any capture block is opened, so there is none to seal.
+            if (!emitOperandMove(ins[j].reg, *src, "input", j,
+                                 ins[j].constraint).has_value()) {
+                return false;
+            }
         }
 
         // ★★★ ONE BINDING ROW PER **SPELLING**, ALL ROWS OF ONE OPERAND POINTING
@@ -3414,7 +3794,9 @@ struct Lowerer {
         bindings.reserve(outs.size() + ins.size());
         auto bindOperand = [&bindings](AsmBound const& b) {
             for (auto const& s : b.spellings) {
-                bindings.push_back({s, b.reg, b.cls, b.widthBits});
+                bindings.push_back({s, b.reg, b.cls, b.widthBits,
+                                    b.operandKind, b.hasImmediate,
+                                    b.immediate});
             }
         };
         for (auto const& b : outs) bindOperand(b);
@@ -3517,18 +3899,24 @@ struct Lowerer {
             sealOrphanedAsmCaptureBlocks(captureBlocks);
             return false;
         }
-        // ★ THE ENGINE EMITS DIRECTLY INTO THE BUILDER, so `recordSource` never
-        // saw its instructions and `lirInstEverEmitted_` may still be false —
-        // in which case `nextLirInstIdValue()` below would report an empty
-        // module and the handle would never be attached. A template that
-        // carried at least one non-blank line and lowered without a refusal
-        // emitted at least one instruction, which is exactly the condition
-        // under which `lastInst()` becomes safe. Counting the lines here (with
-        // the dialect's OWN `lineRule`, never by scanning the text) is what
-        // makes the accounting exact instead of optimistic.
-        if (templateLineCount(*tree, dialect->assembly()) > 0) {
-            lirInstEverEmitted_ = true;
-        }
+        // ★★★ NOTHING IS ACCOUNTED FOR HERE ANY MORE, AND THAT IS THE FIX.
+        // The engine emits DIRECTLY into the builder, so `recordSource` never
+        // sees its instructions. This site used to compensate by setting a
+        // `lirInstEverEmitted_` mirror from the SHAPE OF THE INPUT — "did the
+        // template carry at least one non-blank line?" — on the argument that
+        // a line with content always lowers to at least one instruction. That
+        // argument ENUMERATED the exceptions it knew (a directive, a label,
+        // both already refusals), and a template can carry a line that emits
+        // nothing in ways the enumeration did not list: a comment, a bare
+        // newline, whitespace. Each set the mirror over an EMPTY arena, and
+        // `nextLirInstIdValue()` below then called `lastInst()` on it —
+        // ✔MEASURED rc=127, `dss::Lir fatal: LirBuilder::lastInst: no
+        // instruction has been appended`, no code and no source position, on
+        // five template shapes gcc 13.3.0 compiles and runs. Anchored at
+        // D-LIR-ASM-TEMPLATE-EMITTING-NO-INSTRUCTION-ABORTS-WITH-NO-DIAGNOSTIC
+        // ⇒ `nextLirInstIdValue()` now PROBES the arena (`hasAnyInst()`)
+        // instead of consulting a mirror, so the engine's emissions need no
+        // separate accounting and no proxy can be wrong about them.
         if (!stampEarlyClobberOutputs(id, outs, firstEmitted)) {
             sealOrphanedAsmCaptureBlocks(captureBlocks);
             return false;
@@ -3546,9 +3934,15 @@ struct Lowerer {
             for (std::size_t k = 0; k < outs.size(); ++k) {
                 if (!outs[k].pinned) continue;
                 LirReg const dest = lir.newVReg(outs[k].cls);
-                std::array<LirOperand, 1> const cap{
-                    LirOperand::makeReg(outs[k].reg)};
-                emitInst(*movOp, dest, cap);
+                // Same class on both sides by construction (`bindAsmOperand`
+                // takes `out.cls` from the pinned register itself), so this
+                // copy can only ever fail on a target that declares no `move`
+                // for that class — which `emitOperandMove` names.
+                if (!emitOperandMove(dest, outs[k].reg, "output", k,
+                                     outs[k].constraint).has_value()) {
+                    sealOrphanedAsmCaptureBlocks(captureBlocks);
+                    return false;
+                }
                 outs[k].reg = dest;  // the VALUE now lives in the vreg, not the pin
             }
         }
@@ -3570,7 +3964,7 @@ struct Lowerer {
 
         // ── 5b. `asm goto` only: seal the block and place the edge captures ──
         if (isGoto
-            && !sealAsmGotoEdges(succs, outs, captureBlocks, movOp,
+            && !sealAsmGotoEdges(id, succs, outs, captureBlocks,
                                  constraintHandle)) {
             sealOrphanedAsmCaptureBlocks(captureBlocks);
             return false;
@@ -3591,7 +3985,7 @@ struct Lowerer {
         // return-register read rather than the register the `"=r"` constraint
         // named.
         // ✔MEASURED 2026-08-19 by publishing from 1 and rebuilding
-        // `examples/c-subset/asm_goto_labels`: it does NOT reach a wrong answer
+        // `examples/c/asm_goto_labels`: it does NOT reach a wrong answer
         // — `lir_callconv`'s *"ret_piece … is not adjacent to its
         // struct-returning call"* refusal fires first, at both configs, because
         // an `asm goto`'s pieces LEAD a landing block and nothing calls
@@ -3727,10 +4121,10 @@ struct Lowerer {
     // hence `LirBuilder::openBlockIsTerminated`, whose docblock records the same
     // reasoning from the builder's side.
     [[nodiscard]] bool
-    sealAsmGotoEdges(std::span<MirBlockId const> succs,
+    sealAsmGotoEdges(MirInstId at,
+                     std::span<MirBlockId const> succs,
                      std::vector<AsmBound>& outs,
                      std::vector<LirBlockId> const& captureBlocks,
-                     std::optional<std::uint16_t> movOp,
                      std::optional<std::uint32_t> constraintHandle) {
         // The `lowerSehTryBegin` pattern: the opcode this edge needs, asked for
         // by slot and refused by name. Checked BEFORE anything is emitted, so a
@@ -3747,27 +4141,26 @@ struct Lowerer {
         // linear scan over live ranges already handles (`firstDef` takes the
         // minimum — the same widening a `"+r"` operand's two defs produce).
         std::vector<LirReg> captureDest(outs.size(), InvalidLirReg);
-        bool anyPinned = false;
         for (std::size_t k = 0; k < outs.size(); ++k) {
             if (!outs[k].pinned) continue;
             captureDest[k] = lir.newVReg(outs[k].cls);
-            anyPinned      = true;
         }
-        if (anyPinned && !movOp.has_value()) {
-            // Unreachable from `expandInlineAsm` (`needMoves` is true whenever an
-            // output is pinned), so reaching it is a defect in THIS file rather
-            // than in the target — which is exactly when a silent pass costs most.
-            reportMissingOpcode(MnemonicSlot::Mov, "MIR InlineAsmGoto edge capture");
-            return false;
-        }
+        // D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND: the edge captures are the SAME
+        // copy the in-block capture loop emits, so they go through the SAME
+        // per-class lookup. The old `movOp.has_value()` pre-check is gone with
+        // the module-wide handle it guarded: a target that declares no move for
+        // this operand's class is now named by `emitAsmOperandMove`, per
+        // operand, instead of being reported as a missing universal `Mov`.
+        bool captureOk = true;
         auto emitCaptures = [&] {
             for (std::size_t k = 0; k < outs.size(); ++k) {
                 if (!outs[k].pinned) continue;
-                std::array<LirOperand, 1> const cap{
-                    LirOperand::makeReg(outs[k].reg)};
-                LirInstId const li = emitInst(*movOp, captureDest[k], cap);
+                auto const li = emitAsmOperandMove(at, captureDest[k],
+                                                   outs[k].reg, "output", k,
+                                                   outs[k].constraint);
+                if (!li.has_value()) { captureOk = false; return; }
                 if (constraintHandle.has_value()) {
-                    lir.setInstRegConstraints(li, *constraintHandle);
+                    lir.setInstRegConstraints(*li, *constraintHandle);
                 }
             }
         };
@@ -3775,12 +4168,14 @@ struct Lowerer {
         // ── the fall-through edge ──
         if (!lir.openBlockIsTerminated()) {
             emitCaptures();
+            if (!captureOk) return false;
             emitBr(*jmpOp, lirSucc(succs.back()));
         }
         // ── each label edge's capture block ──
         for (std::size_t j = 0; j < captureBlocks.size(); ++j) {
             lir.beginBlock(captureBlocks[j]);
             emitCaptures();
+            if (!captureOk) return false;
             emitBr(*jmpOp, lirSucc(succs[j]));
         }
         // The VALUE now lives in the vreg rather than in the pin, on every path.
@@ -3853,22 +4248,6 @@ struct Lowerer {
             }
         }
         return true;
-    }
-
-    // How many NON-BLANK lines the template holds, read through the dialect's
-    // own `lineRule` rather than by looking at the text. A blank line has no
-    // visible children and contributes nothing; a line with any content lowered
-    // to at least one instruction, because the two shapes a template cannot
-    // carry (a directive, a label) are REFUSALS the engine already reported.
-    [[nodiscard]] static std::uint32_t
-    templateLineCount(Tree const& tree, AssemblyConfig const& cfg) {
-        std::uint32_t n = 0;
-        for (NodeId const line : asm_walk::visibleChildren(tree, tree.root())) {
-            if (tree.kind(line) != NodeKind::Internal) continue;
-            if (tree.rule(line).v != cfg.lineRule.v) continue;
-            if (!asm_walk::visibleChildren(tree, line).empty()) ++n;
-        }
-        return n;
     }
 
     // ★★★ OUTPUT k's MIR VALUE TYPE — THE ONE QUESTION WHOSE ANSWER LIVES IN A
@@ -3952,8 +4331,8 @@ struct Lowerer {
     // `asm goto` — the TERMINATOR form. Returns true iff the block was sealed.
     //
     // ★★★ THE REFUSAL THAT USED TO LIVE HERE IS GONE, AND WHAT RETIRED IT IS
-    // EXACTLY WHAT IT NAMED (D-LIR-ASM-GOTO-REFUSAL-NAMES-A-CONFIG-GAP-THAT-NO-
-    // LONGER-EXISTS). ✔MEASURED, and worth keeping because it is the shape of a
+    // EXACTLY WHAT IT NAMED (D-LIR-ASM-GOTO-REFUSAL-NAMES-A-CONFIG-GAP-THAT-NO-LONGER-EXISTS).
+    // ✔MEASURED, and worth keeping because it is the shape of a
     // correctly-scoped refusal: the message said a label target must resolve to
     // a BLOCK of the embedding function while `AsmOperandBinding` carried a
     // `LirReg` and no block, *"so no caller can bind one"* — and that it would
@@ -4144,6 +4523,39 @@ struct Lowerer {
         // magnitudes.
         LirReg const result = lir.newVReg(LirRegClass::GPR);
         if (!needsChain || !targetHasMovkLadder()) {
+            // ⚠ D-LIR-BARE-CONST-TRUNCATES-BEYOND-IMM32. The inline
+            // `mov reg, imm32` operand is a THIRTY-TWO-BIT slot, so a value
+            // outside int32 must NOT ride it — `static_cast<int32_t>` would
+            // silently drop the high half (0x41F0000000000000 → 0). Every
+            // pre-existing caller passed a bounded value, which is why this
+            // never fired; the lowering-sequence `const` operand kind is the
+            // first caller that can pass a full 64-bit bit pattern. Route it
+            // through the SAME `mov r64, imm64` LiteralPool carrier
+            // `lowerConst`'s wide-integer arm uses, capability-probed exactly
+            // as there — never an arch identity.
+            if (value < std::numeric_limits<std::int32_t>::min()
+                || value > std::numeric_limits<std::int32_t>::max()) {
+                if (!targetHasMovImm64()) {
+                    dss::report(reporter,
+                        DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                        DiagnosticSeverity::Error,
+                        std::format(
+                            "a synthetic 64-bit constant (0x{:016X}) is wider "
+                            "than imm32, but target '{}' declares neither a "
+                            "`mov r64, imm64` variant nor the MOVZ/MOVK wide-"
+                            "immediate ladder — it has no way to materialize "
+                            "one (D-CSUBSET-BITFIELD-WIDE-UNIT)",
+                            static_cast<std::uint64_t>(value), target.name()));
+                    return std::nullopt;
+                }
+                LirLiteralValue lirLit;
+                lirLit.core  = TypeKind::U64;
+                lirLit.value = static_cast<std::uint64_t>(value);
+                std::array<LirOperand, 1> ops{LirOperand::makeLiteralIndex(
+                    lir.literalPoolAdd(std::move(lirLit)))};
+                emitInst(*movOp, result, ops);   // 64-bit (default width)
+                return result;
+            }
             std::array<LirOperand, 1> ops{
                 LirOperand::makeImmInt32(static_cast<std::int32_t>(value))};
             emitInst(*movOp, result, ops);   // 64-bit (default width)
@@ -4311,6 +4723,16 @@ struct Lowerer {
         // dead const on BOTH the positive member-offset `ADD` and the negative
         // `p[-N]` `SUB`. Mirrors the `foldedGlobalAddrs_` skip in `lowerGlobalAddr`.
         if (constDispFoldsIntoGep(id)) {
+            foldedConstDisps_.insert(id.v);
+            return;
+        }
+        // D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED: the same skip for a
+        // constant whose sole use is an inline-asm operand bound to the `ImmInt`
+        // form. `expandInlineAsm` reads it with `constIntegerValue` and writes it
+        // into the template's instruction, so the register would be a dead
+        // write; the same `foldedConstDisps_` record keeps a stray `regForValue`
+        // loud rather than silent.
+        if (constFoldsIntoAsmImmediate(id)) {
             foldedConstDisps_.insert(id.v);
             return;
         }
@@ -5373,8 +5795,8 @@ struct Lowerer {
                 poisonValue(id);
                 return;
             }
-            // Byte-EXACT for a Char load (D-CSUBSET-CHAR-STRING-VALUE-
-            // CODEGEN) exactly as the generic path below — a folded
+            // Byte-EXACT for a Char load (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN)
+            // exactly as the generic path below — a folded
             // [rip+sym] load of a 1-byte item must read 1 byte, not 8.
             // memAccessWidthFlags == the old FPR-width / GPR-0 ternary for
             // every non-Char type, so this is byte-identical pre-char.
@@ -5729,8 +6151,8 @@ struct Lowerer {
 
     // ── cycle 3e: Calls + GlobalAddr ─────────────────────────────────
 
-    // MIR GlobalAddr → LIR `lea result, [rip + sym]` (D-LK4-RODATA-
-    // PRODUCER 2026-06-02 — closes the prior `mov SymbolRef` gap).
+    // MIR GlobalAddr → LIR `lea result, [rip + sym]` (D-LK4-RODATA-PRODUCER
+    // 2026-06-02 — closes the prior `mov SymbolRef` gap).
     // The address materialization is a pure 7-byte RIP-relative
     // load-effective-address that emits a `rel32` Relocation
     // against the symbol. Cross-target shape: ARM64 will declare
@@ -6394,6 +6816,16 @@ struct Lowerer {
         }
         LirBlockId const lirTarget = mirBlockToLirBlock.get(mirTarget);
         SymbolId const sym = mintBlockSymbol(mirTarget);
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: an address that only
+        // ever reaches STATIC DATA needs the block's SYMBOL, not a register holding
+        // it. Emit no `lea` (gcc emits none for `static void *tbl[]={&&L0,&&L1};`
+        // either — ✔measured) and publish the binding for the pipeline to resolve
+        // from the assembled function's byte offsets instead.
+        if (exportOnlyBlockAddrs_.count(id.v) != 0) {
+            blockSymbolBindings_.push_back(
+                LirBlockSymbolBinding{currentFuncIndex_, lirTarget.v, sym});
+            return;
+        }
         LirReg const result = lir.newVReg(regClassFor(id));
         std::array<LirOperand, 2> ops{
             LirOperand::makeSymbolRef(sym.v),
@@ -6692,7 +7124,25 @@ struct Lowerer {
             }
             std::optional<LirReg> const r = regForValue(operandMir);
             if (!r.has_value()) return;
-            ops.push_back(LirOperand::makeReg(*r));
+            // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: state each
+            // argument's NATURAL BYTE SIZE on its operand. This is the ONE point
+            // in the pipeline where an argument's TYPE and its operand exist
+            // together — the LIR `Reg` below is 4 bytes of class + ordinal and
+            // carries no size, which is exactly why the overflow cursor has always
+            // padded every stacked scalar to a pointer-width slot. `lowerWideCall
+            // Args` reads it back; a `Slot`-packing CC ignores it entirely.
+            // The width comes from `memAccessWidthFlags`, the same function
+            // `lowerArg` uses for the CALLEE's read, so caller and callee cannot
+            // disagree about how many bytes the datum occupies. A by-value
+            // aggregate carrier (below) states its span on its own marker instead,
+            // so it stays 0 here.
+            std::uint8_t const argNaturalBytes =
+                mir.instOpcode(operandMir) == MirOpcode::ByValueStackArg
+                    ? std::uint8_t{0}   // the carrier's marker states the span
+                    : static_cast<std::uint8_t>(
+                          lirInstWidthBits(memAccessWidthFlags(
+                              mir.instType(operandMir), r->regClass())) / 8u);
+            ops.push_back(LirOperand::makeArgReg(*r, argNaturalBytes));
             if (mir.instOpcode(operandMir) == MirOpcode::ByValueStackArg) {
                 // The preceding Reg is the aggregate/F80 temp address; this marker
                 // carries the byte size + exhaust class (the MIR op's payload, per
@@ -6915,6 +7365,57 @@ struct Lowerer {
         return userOps.size() == 2 && userOps[1].v == constId.v;
     }
 
+    // ★★★ THE SAME QUESTION FOR AN INLINE-ASM IMMEDIATE OPERAND
+    // (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED): would this `Const`'s value
+    // be written straight INTO the instruction the template names, making its
+    // register materialization dead? True iff it is single-use and its sole user
+    // is an asm block whose descriptor binds the input at that operand index to
+    // the `ImmInt` form.
+    //
+    // ★★ IT IS THE `constDispFoldsIntoGep` MECHANISM, NOT A NEW ONE, and the
+    // parallel is exact: a value the consumer reads with `constIntegerValue`
+    // rather than `regForValue` has no register, so materialising one emits a
+    // `mov` nothing reads. Recording the skip in `foldedConstDisps_` keeps the
+    // alarm too — a stray `regForValue` on a folded value fails LOUD on the
+    // undefined vreg instead of silently handing the template a register.
+    //
+    // ⚠ THE FORM IS READ FROM THE DESCRIPTOR, NEVER GUESSED FROM THE OPERAND'S
+    // SHAPE. "It is a Const used by an asm block" is NOT the predicate: an
+    // ordinary `"r"(7)` input is exactly that, and it genuinely needs its
+    // register. Only the descriptor knows which arm the constraint letter bound.
+    // ⚠ NO RANGE GATE HERE, and that is deliberate: `hir_to_mir` already refuses
+    // an out-of-`imm32` immediate by name, and `bindAsmOperand` refuses a
+    // non-`Const` operand — so a value reaching this predicate is one the asm
+    // path has already committed to encoding. A second range test would be a
+    // second owner of the form's width.
+    [[nodiscard]] bool constFoldsIntoAsmImmediate(MirInstId constId) const {
+        if (mir.instOpcode(constId) != MirOpcode::Const) return false;
+        auto const it = mirValueUses_.find(constId.v);
+        if (it == mirValueUses_.end() || it->second.count != 1) return false;
+        MirInstId const user = it->second.user;
+        if (mir.instOpcode(user) != MirOpcode::InlineAsm
+            && mir.instOpcode(user) != MirOpcode::InlineAsmGoto) {
+            return false;
+        }
+        MirAsmDescriptor const& desc = mir.asmDescriptor(user);
+        auto const userOps = mir.instOperands(user);
+        // `MirAsmDescriptor::inputs` is aligned 1:1 with the instruction's MIR
+        // operands (the descriptor's own contract), so the operand's POSITION is
+        // the descriptor entry to ask. A descriptor and an operand list that
+        // disagree about their length is a producer defect `expandInlineAsm`
+        // diagnoses; here it simply means "not proven folded", so the constant
+        // materializes normally and nothing is lost.
+        for (std::size_t j = 0; j < userOps.size(); ++j) {
+            if (userOps[j].v != constId.v) continue;
+            if (j >= desc.inputs.size()) return false;
+            MirAsmOperand const& o = desc.inputs[j];
+            return o.operandKindResolved
+                   && static_cast<OperandKindFilter>(o.operandKind)
+                          == OperandKindFilter::ImmInt;
+        }
+        return false;
+    }
+
     // ── cycle 3e: aggregate ops (memory-flattening lowering) ─────────
     //
     // MIR ExtractValue/InsertValue operate on aggregate values directly
@@ -6966,8 +7467,8 @@ struct Lowerer {
             return;
         }
         // FC3.5 c2: FPR width-exact like lowerLoad.
-        // Byte-EXACT for a Char first-field (D-CSUBSET-CHAR-STRING-VALUE-
-        // CODEGEN) exactly as lowerLoad — extracting a 1-byte field must
+        // Byte-EXACT for a Char first-field (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN)
+        // exactly as lowerLoad — extracting a 1-byte field must
         // read 1 byte. memAccessWidthFlags == the old FPR-width / GPR-0
         // ternary for every non-Char type (byte-identical pre-char).
         std::uint8_t const extWidthFlags =
@@ -7011,8 +7512,8 @@ struct Lowerer {
             reportMissingClassOp(cls, RegClassOp::Store, "MIR InsertValue");
             return;
         }
-        // Byte-EXACT for a Char first-field store (D-CSUBSET-CHAR-STRING-
-        // VALUE-CODEGEN) exactly as lowerStore — inserting a 1-byte field
+        // Byte-EXACT for a Char first-field store (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN)
+        // exactly as lowerStore — inserting a 1-byte field
         // must write 1 byte, not clobber 7 neighbours. memAccessWidthFlags
         // == the old FPR-width / GPR-0 ternary for non-Char (byte-identical
         // pre-char).
@@ -7051,11 +7552,28 @@ struct Lowerer {
             reportUnsupported(mir.instOpcode(id), id);
             return;
         }
+        std::array<LirReg, Arity>     srcRegs{};
         std::array<LirOperand, Arity> ops;
         for (std::size_t k = 0; k < Arity; ++k) {
             std::optional<LirReg> const r = regForValue(operands[k]);
             if (!r.has_value()) return;
-            ops[k] = LirOperand::makeReg(*r);
+            srcRegs[k] = *r;
+            ops[k]     = LirOperand::makeReg(*r);
+        }
+        // D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE:
+        // if the target declares an instruction SEQUENCE for this opcode,
+        // emit that instead of one instruction of the opcode. The check is
+        // here (rather than at the two conversion arms that needed it first)
+        // because the fact "this operation is realized by these machine
+        // instructions" is not special to those two: any opcode on any
+        // target may state it, and the 1:1 rows below are the same statement
+        // with one entry.
+        std::uint8_t const opWidthFlags =
+            widthOverride.has_value() ? *widthOverride
+                                      : widthFlagsForType(mir.instType(id));
+        if (lowerViaDeclaredSequence(id, *op, std::span<LirReg const>{srcRegs},
+                                     opWidthFlags)) {
+            return;
         }
         // Result reg class follows the MIR result type — FPR for float
         // ops, VR for vector ops, GPR otherwise.
@@ -7069,15 +7587,171 @@ struct Lowerer {
         // whose encoded form keys on a NON-result width — ZExt's
         // source (D-CSUBSET-ZEXT-32-TO-64). Every other caller leaves
         // it unset and keeps the result-type rule byte-identically.
-        emitInst(*op, result, ops, /*payload=*/0,
-                 widthOverride.has_value()
-                     ? *widthOverride
-                     : widthFlagsForType(mir.instType(id)));
+        emitInst(*op, result, ops, /*payload=*/0, opWidthFlags);
         defineValue(id, result);
     }
 
     void lowerBinaryOp(MirInstId id, MnemonicSlot slot) { lowerNAryOp<2>(id, slot); }
     void lowerUnaryOp (MirInstId id, MnemonicSlot slot) { lowerNAryOp<1>(id, slot); }
+
+    // ── D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE ──
+    //
+    // Emit the SEQUENCE of machine instructions the target declares for this
+    // opcode, instead of one instruction of the opcode itself. The shared
+    // substrate understands exactly one thing here — EMIT WHAT YOU WERE TOLD —
+    // and every ISA-shaped decision (which instructions, in what order, with
+    // which constants) lives in `<target>.target.json`. There is no strategy
+    // enum, no capability fork and no arch identity: a target whose hardware
+    // does the job in ONE instruction declares a ONE-STEP sequence, and this
+    // function cannot tell that case from the seven-step one.
+    //
+    // Temporaries are FRESH VIRTUAL REGISTERS, which is the whole reason the
+    // expansion belongs at MIR→LIR and not in the byte encoder: regalloc
+    // assigns them like any other value, so a sequence needing four scratch
+    // registers costs nothing architecturally and nothing is reserved.
+    //
+    // Returns FALSE when the opcode declares no sequence (the caller then
+    // emits its single instruction exactly as before — every pre-existing
+    // opcode keeps its behaviour). Returns TRUE when it owned the lowering,
+    // INCLUDING the failure paths, all of which poison the value and report.
+    [[nodiscard]] bool
+    lowerViaDeclaredSequence(MirInstId id, std::uint16_t opIdx,
+                             std::span<LirReg const> sourceRegs,
+                             std::uint8_t widthFlags) {
+        auto const* info = target.opcodeInfo(opIdx);
+        if (info == nullptr || info->lowering.sequences.empty()) return false;
+        // Sequence election mirrors the encoding-variant matcher's rule
+        // exactly: an exact width match first, then a width-ABSENT sequence
+        // (which the loader guarantees is the only one if present).
+        std::uint8_t const wantBits = lirInstWidthBits(widthFlags);
+        TargetLoweringSequence const* seq = nullptr;
+        for (auto const& cand : info->lowering.sequences) {
+            if (cand.guardWidthBits == wantBits) { seq = &cand; break; }
+        }
+        if (seq == nullptr) {
+            for (auto const& cand : info->lowering.sequences) {
+                if (cand.guardWidthBits == 0) { seq = &cand; break; }
+            }
+        }
+        if (seq == nullptr) {
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "MIR {}: target '{}' declares an instruction sequence for "
+                    "'{}' but none at operation width {} — the operation has no "
+                    "realization at this width, and emitting a different "
+                    "width's sequence would be a silent miscompile",
+                    mirOpcodeName(mir.instOpcode(id)), target.name(),
+                    info->mnemonic, wantBits));
+            poisonValue(id);
+            return true;
+        }
+        std::vector<LirReg> temps(seq->tempNames.size());
+        LirReg              produced{};
+        for (auto const& step : seq->steps) {
+            std::vector<LirOperand> ops;
+            ops.reserve(step.operands.size());
+            for (auto const& sop : step.operands) {
+                switch (sop.kind) {
+                    case TargetLoweringOperandKind::Source: {
+                        if (sop.sourceIndex >= sourceRegs.size()) {
+                            // The loader bounds `source` against maxOperands;
+                            // this catches an instruction that reached here
+                            // with FEWER operands than the row allows.
+                            dss::report(reporter,
+                                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                                DiagnosticSeverity::Error,
+                                std::format(
+                                    "MIR {}: the '{}' lowering sequence reads "
+                                    "source operand {}, but the instruction has "
+                                    "{}", mirOpcodeName(mir.instOpcode(id)),
+                                    info->mnemonic, sop.sourceIndex,
+                                    sourceRegs.size()));
+                            poisonValue(id);
+                            return true;
+                        }
+                        ops.push_back(
+                            LirOperand::makeReg(sourceRegs[sop.sourceIndex]));
+                        break;
+                    }
+                    case TargetLoweringOperandKind::Temp:
+                        ops.push_back(LirOperand::makeReg(temps[sop.tempSlot]));
+                        break;
+                    case TargetLoweringOperandKind::Immediate:
+                        ops.push_back(LirOperand::makeImmInt32(sop.immediate));
+                        break;
+                    case TargetLoweringOperandKind::Constant: {
+                        // Materialized by the TARGET's own declared wide-
+                        // constant capability (mov r64,imm64 / MOVZ+MOVK) —
+                        // the encoding table cannot name a constant-pool
+                        // entry, so a float constant travels as a GPR bit
+                        // pattern plus a declared cross-class move step.
+                        auto const k = emitBareConstToFresh(
+                            static_cast<std::int64_t>(sop.constant));
+                        if (!k.has_value()) { poisonValue(id); return true; }
+                        ops.push_back(LirOperand::makeReg(*k));
+                        break;
+                    }
+                }
+            }
+            std::uint8_t stepFlags = 0;
+            switch (step.widthBits) {
+                case 8:  stepFlags = kLirInstFlagWidth8;  break;
+                case 16: stepFlags = kLirInstFlagWidth16; break;
+                case 32: stepFlags = kLirInstFlagWidth32; break;
+                default: stepFlags = 0;                   break;  // 0/64
+            }
+            if (!step.hasResult) {
+                emitInst(step.opcodeIndex, LirReg{}, ops, /*payload=*/0,
+                         stepFlags);
+                continue;
+            }
+            auto const cls = static_cast<LirRegClass>(step.resultClass);
+            if (step.definesResult && cls != regClassFor(id)) {
+                // The declared class of the sequence's own result must agree
+                // with the class the MIR result type demands. A disagreement
+                // is a config bug that would hand the assembler an XMM
+                // ordinal in a GPR slot (or the reverse) — bytes that look
+                // valid and mean something else.
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format(
+                        "MIR {}: the '{}' lowering sequence declares its result "
+                        "in register class '{}', but this instruction's result "
+                        "type is class '{}' on target '{}'",
+                        mirOpcodeName(mir.instOpcode(id)), info->mnemonic,
+                        lirRegClassName(cls), lirRegClassName(regClassFor(id)),
+                        target.name()));
+                poisonValue(id);
+                return true;
+            }
+            LirReg const dst = lir.newVReg(cls);
+            emitInst(step.opcodeIndex, dst, ops, /*payload=*/0, stepFlags);
+            if (step.definesResult) produced = dst;
+            else                    temps[step.resultTempSlot] = dst;
+        }
+        // The loader enforces "exactly one step names the reserved result, and
+        // it is the last" — so this cannot fire from a loadable config. It
+        // exists because the alternative on a violated invariant is binding the
+        // MIR value to a DEFAULT-CONSTRUCTED register, which is a silent wrong
+        // def rather than a diagnostic.
+        if (!produced.valid()) {
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "MIR {}: the '{}' lowering sequence on target '{}' ran to "
+                    "completion without any step yielding the operation's "
+                    "value", mirOpcodeName(mir.instOpcode(id)), info->mnemonic,
+                    target.name()));
+            poisonValue(id);
+            return true;
+        }
+        defineValue(id, produced);
+        return true;
+    }
 
     // ── c78 (D-CSUBSET-FLOAT-NEG-ENCODING): capability-driven MIR FNeg ──
     //
@@ -7367,8 +8041,8 @@ struct Lowerer {
     //     the SSA result is captured from the implicit output
     //     selected BY ROLE ("quotient" for div, "remainder" for mod)
     //     via the core op's `outputRoles` declaration — never by
-    //     positional index (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-
-    //     CONTRACT: a JSON reorder of `outputs` can no longer
+    //     positional index (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT:
+    //     a JSON reorder of `outputs` can no longer
     //     silently flip a quotient capture into a remainder capture).
     //     The dividend pin likewise resolves via `inputRoles` role
     //     "dividend". A HALF-declared pair (pre without core or vice
@@ -7581,8 +8255,8 @@ struct Lowerer {
             reportUnsupported(mir.instOpcode(id), id);
             return std::nullopt;
         }
-        // Role-based register resolution (D-CSUBSET-MOD-OP-CODEGEN-
-        // OUTPUT-INDEX-CONTRACT): the dividend pin and the captured
+        // Role-based register resolution (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT):
+        // the dividend pin and the captured
         // output are looked up BY ROLE from the core op's
         // inputRoles/outputRoles declarations — positional indexing
         // is gone from this projection path. An op missing the
@@ -8003,6 +8677,55 @@ struct Lowerer {
     // Shared preamble: validate the single operand + return (operandReg, pWidth,
     // is64). pWidth keys on the OPERAND type (P), not the I32 result. nullopt ⇒
     // a diagnostic already fired (bad arity / poisoned operand).
+    // ── D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: the ONE place a bit-count op asks
+    // the target what its declared realization IS ────────────────────────────
+    //
+    // The capability split above ("probe the mnemonic; absent ⇒ SWAR") answers
+    // only HALF the question, because it silently assumes the realization is
+    // ONE INSTRUCTION. It is not, on any machine that reaches the operation
+    // through a different register bank: AArch64 has no scalar-GPR population
+    // count at all, and its realization is a GPR→SIMD move, a per-byte lane
+    // count, a lane reduction and a SIMD→GPR move. That is precisely the fact
+    // `TargetOpcodeInfo::lowering` exists to state
+    // (D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE), and a
+    // one-instruction emit of a mnemonic whose row declares a SEQUENCE would be
+    // a silent miscompile — on arm64 specifically it would emit CNT alone,
+    // which answers EIGHT PER-BYTE COUNTS IN EIGHT LANES, not a population
+    // count, into the wrong register bank.
+    //
+    // ★ SO THE PROBE IS TWO-LEVELED AND BOTH LEVELS ARE THE TARGET'S ANSWER:
+    // does the target name a realization at all (the mnemonic), and does it
+    // spell that realization as one instruction or as several (the `lowering`
+    // block). NOTHING here names a CPU, a mnemonic or a lane arrangement; a
+    // target whose hardware does the job in one instruction simply declares no
+    // sequence and takes the second arm, byte-identically to before.
+    //
+    // ⚠ ONE OWNER, DELIBERATELY. Popcount, Clz and Ctz asked this question in
+    // three copies that differed only in the slot; a fourth bit-count verb, or
+    // a target that grows a sequence for `clz`, would have needed all of them
+    // edited in step and the miss would have been a wrong instruction rather
+    // than a build error.
+    //
+    // Returns TRUE when the target's declared realization owned the lowering
+    // (including its failure paths, which report and poison). FALSE only when
+    // `slot` resolves to no opcode at all — the caller then emits its SWAR
+    // fallback, which is what keeps the fallback reachable for every target
+    // that declares no realization.
+    [[nodiscard]] bool lowerBitCountViaDeclaredRealization(
+            MirInstId id, MnemonicSlot slot, LirReg src, std::uint8_t pWidth) {
+        auto const nativeOp = opcode(slot);
+        if (!nativeOp.has_value()) return false;
+        std::array<LirReg, 1> const srcRegs{src};
+        if (lowerViaDeclaredSequence(id, *nativeOp, srcRegs, pWidth)) return true;
+        auto const r = emitNativeUnary(*nativeOp, src, pWidth, regClassFor(id));
+        if (!r.has_value()) { poisonValue(id); return true; }
+        defineValue(id, *r);
+        return true;
+    }
+
+    // Shared preamble: validate the single operand + return (operandReg, pWidth,
+    // is64). pWidth keys on the OPERAND type (P), not the I32 result. nullopt ⇒
+    // a diagnostic already fired (bad arity / poisoned operand).
     struct BitCountOperand { LirReg reg; std::uint8_t pWidth; bool is64; };
     [[nodiscard]] std::optional<BitCountOperand> bitCountOperand(MirInstId id) {
         auto const operands = mir.instOperands(id);
@@ -8019,15 +8742,14 @@ struct Lowerer {
     void lowerPopcount(MirInstId id) {
         auto const in = bitCountOperand(id);
         if (!in.has_value()) return;
-        if (auto const nativeOp = opcode(MnemonicSlot::PopcountNative);
-            nativeOp.has_value()) {  // x86 POPCNT
-            auto const r = emitNativeUnary(*nativeOp, in->reg, in->pWidth, regClassFor(id));
-            if (!r.has_value()) { poisonValue(id); return; }
-            defineValue(id, *r);
+        // x86 POPCNT (one instruction); arm64 the declared four-step SIMD
+        // sequence (D-FULLC-STDBIT-ARM64-CNT-POPCOUNT). Which one is entirely
+        // the target document's answer — see the helper.
+        if (lowerBitCountViaDeclaredRealization(
+                id, MnemonicSlot::PopcountNative, in->reg, in->pWidth)) {
             return;
         }
-        // SWAR fallback (arm64 + any ISA without a scalar popcount;
-        // D-FULLC-STDBIT-ARM64-CNT-POPCOUNT trigger-gates a future arm64 NEON CNT).
+        // SWAR fallback — any ISA declaring NO popcount realization at all.
         auto const r = emitSwarPopcount(in->reg, in->is64, in->pWidth);
         if (!r.has_value()) { poisonValue(id); return; }
         defineValue(id, *r);
@@ -8036,11 +8758,9 @@ struct Lowerer {
     void lowerClz(MirInstId id) {
         auto const in = bitCountOperand(id);
         if (!in.has_value()) return;
-        if (auto const nativeOp = opcode(MnemonicSlot::ClzNative);
-            nativeOp.has_value()) {  // x86 LZCNT / arm64 CLZ (defined =width at 0)
-            auto const r = emitNativeUnary(*nativeOp, in->reg, in->pWidth, regClassFor(id));
-            if (!r.has_value()) { poisonValue(id); return; }
-            defineValue(id, *r);
+        // x86 LZCNT / arm64 CLZ (both defined = width at 0).
+        if (lowerBitCountViaDeclaredRealization(
+                id, MnemonicSlot::ClzNative, in->reg, in->pWidth)) {
             return;
         }
         // SWAR fallback.
@@ -8053,11 +8773,8 @@ struct Lowerer {
         auto const in = bitCountOperand(id);
         if (!in.has_value()) return;
         // Rule 1 — native ctz (x86 TZCNT, defined =width at 0).
-        if (auto const nativeOp = opcode(MnemonicSlot::CtzNative);
-            nativeOp.has_value()) {
-            auto const r = emitNativeUnary(*nativeOp, in->reg, in->pWidth, regClassFor(id));
-            if (!r.has_value()) { poisonValue(id); return; }
-            defineValue(id, *r);
+        if (lowerBitCountViaDeclaredRealization(
+                id, MnemonicSlot::CtzNative, in->reg, in->pWidth)) {
             return;
         }
         // Rule 2 — RBIT then CLZ (arm64: reverse the bits, then leading-zeros of
@@ -8065,13 +8782,24 @@ struct Lowerer {
         // ctz(0): RBIT(0)=0, CLZ(0)=P. Requires BOTH — a target with rbit but no
         // clz falls through to the SWAR (a legitimate realization, not fail-loud).
         if (auto const rbitOp = opcode(MnemonicSlot::Rbit); rbitOp.has_value()) {
-            if (auto const clzOp = opcode(MnemonicSlot::ClzNative); clzOp.has_value()) {
-                auto const rev = emitNativeUnary(*rbitOp, in->reg, in->pWidth, regClassFor(id));
+            if (opcode(MnemonicSlot::ClzNative).has_value()) {
+                // ⚠ The REVERSE step stays a direct single-instruction emit and
+                // does NOT consult `lowering`, because it is an INTERMEDIATE:
+                // `lowerViaDeclaredSequence` binds the sequence's result to THIS
+                // MIR id via `defineValue`, and there is only one MIR id here.
+                // A target that realized `rbit` as a sequence would need a seam
+                // that yields a register instead of defining a value; none does
+                // (✔MEASURED 2026-08-26: no shipped target declares a `lowering`
+                // block on `rbit`), and inventing that seam for no consumer is
+                // the speculative build the bar forbids. The CLZ half IS the
+                // sequence's result, so it goes through the shared helper.
+                auto const rev = emitNativeUnary(*rbitOp, in->reg, in->pWidth,
+                                                 regClassFor(id));
                 if (!rev.has_value()) { poisonValue(id); return; }
-                auto const r = emitNativeUnary(*clzOp, *rev, in->pWidth, regClassFor(id));
-                if (!r.has_value()) { poisonValue(id); return; }
-                defineValue(id, *r);
-                return;
+                if (lowerBitCountViaDeclaredRealization(
+                        id, MnemonicSlot::ClzNative, *rev, in->pWidth)) {
+                    return;
+                }
             }
         }
         // Rule 3 — SWAR fallback (neither TZCNT nor RBIT+CLZ).
@@ -8721,8 +9449,8 @@ struct Lowerer {
         // so the result is always a CLEAN 0/1 r64 — `cmp r64, 0`
         // / `cmp r64, r64` consumers downstream cannot read garbage.
         // The ICmp+CondBr fusion at `lowerCondBr` still elides the
-        // cmp-against-0 (the setcc + zext become "dead" via D-LIR-
-        // SETCC-DEAD-AFTER-FUSION DCE in 13.6), but non-adjacent
+        // cmp-against-0 (the setcc + zext become "dead" via
+        // D-LIR-SETCC-DEAD-AFTER-FUSION DCE in 13.6), but non-adjacent
         // ICmp uses (bool stored, bool returned, bool ternary) now
         // get correct width semantics for free. Clean SSA: setcc
         // defines `b8`; zext consumes `b8` AND defines `result`.
@@ -9522,7 +10250,7 @@ struct Lowerer {
             // (D-CSUBSET-32BIT-ALU-FORMS). Pinned (audit-residue sweep
             // c1, D-AUDIT-FUSED-CMP-WIDTH-PIN): the Fused{I32,I64}…
             // width pins in tests/lir/test_mir_to_lir.cpp + the
-            // examples/c-subset/fused_negative_compare runtime witness
+            // examples/c/fused_negative_compare runtime witness
             // (width-64 here flips its exit 42 → 7: a zero-extended
             // negative I32 reads as positive).
             emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps,
@@ -9548,9 +10276,19 @@ struct Lowerer {
         // for the BlockRel32 displacement AND emits a trailing
         // unconditional `jmp` to operand[1] (fallthrough) so the
         // LIR block layout doesn't need to guarantee fallthrough
-        // order. A future optimizer pass elides the redundant
-        // trailing jmp when ifFalse IS the next-laid-out block
-        // (anchored D-OPT-JCC-FALLTHROUGH).
+        // order.
+        //
+        // ★ D-OPT-JCC-FALLTHROUGH: THE LOWERING STILL EMITS BOTH,
+        // AND THAT IS THE RIGHT PLACE FOR IT. Block layout is not
+        // settled here — regalloc, two-address legalization and the
+        // callconv rebuild all sit between this point and the bytes
+        // — so a lowering that guessed at fallthrough order would be
+        // guessing. The elision is a LAYOUT-AWARE peephole instead:
+        // `lir_peephole`'s rule R2 drops the trailing operand once
+        // the layout is final and the target declares the shorter
+        // encoding form, and `lir_verifier`'s Rule 1b refuses the
+        // shortened list on any module where the unnamed successor
+        // is not the next-laid-out block.
         std::array<LirOperand, 2> jccOps{
             LirOperand::makeBlockRef(lirIfTrue.v),
             LirOperand::makeBlockRef(lirIfFalse.v)};
@@ -10264,6 +11002,19 @@ struct Lowerer {
         allocaSlotIndex_.clear();
         allocaLirCount_ = 0;
         computeValueUses(mf);
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: which of this
+        // function's `BlockAddress` values exist ONLY to be exported to static
+        // data. Read off the use census `computeValueUses` just built, so it needs
+        // no second walk. HIR→MIR emits ONE `BlockAddress` per exported label (the
+        // export symbol is memoized per label), so an export-only value has exactly
+        // one use; a label whose address the BODY also takes gets its own separate
+        // `BlockAddress`, which is materialized normally.
+        exportOnlyBlockAddrs_.clear();
+        for (auto const& [valueV, use] : mirValueUses_) {
+            if (use.count != 1 || !use.user.valid()) continue;
+            if (mir.instOpcode(use.user) != MirOpcode::BlockAddressExport) continue;
+            exportOnlyBlockAddrs_.insert(valueV);
+        }
         lir.addFunction(mir.funcSymbol(mf));
 
         // Pre-pass 1: pre-allocate LIR blocks (1:1 with MIR blocks).
@@ -10297,7 +11048,6 @@ struct Lowerer {
     // `lirToMir` vector so `lirToMir[li.v]` is always the producer.
     void recordSource(LirInstId li) {
         if (!li.valid()) return;
-        lirInstEverEmitted_ = true;
         if (li.v >= lirToMir.size()) lirToMir.resize(li.v + 1);
         lirToMir[li.v] = currentMir;
     }
@@ -10309,15 +11059,18 @@ struct Lowerer {
     // inline-asm expansion reaches instructions the shared assembly ENGINE
     // emitted directly into the builder, bypassing the wrappers above.
     //
-    // ⚠ `lastInst()` ABORTS on a module with no instructions and `LirBuilder`
-    // exposes no count, so the empty case is TRACKED rather than probed.
-    // `lirInstEverEmitted_` is set by `recordSource`, i.e. by every emission
-    // this lowering makes; the engine's emissions are accounted for separately
-    // at the one site that needs it.
+    // ⚠ `lastInst()` ABORTS on a module with no instructions, so the empty
+    // case must be settled before asking. It is PROBED, not tracked: the
+    // sentence that used to stand here — "`LirBuilder` exposes no count, so
+    // the empty case is TRACKED rather than probed" — named the real cause
+    // of a crash, because the tracking `bool` was a MIRROR of the arena and
+    // the assembly engine emits without passing the site that set it. The
+    // missing count is now `LirBuilder::hasAnyInst()`, sharing its predicate
+    // with `lastInst()`'s own refusal, and the mirror is GONE rather than
+    // repaired.
     [[nodiscard]] std::uint32_t nextLirInstIdValue() {
-        return lirInstEverEmitted_ ? (lir.lastInst().v + 1u) : 1u;
+        return lir.hasAnyInst() ? (lir.lastInst().v + 1u) : 1u;
     }
-    bool lirInstEverEmitted_ = false;
 
     // Forwarding wrappers around `LirBuilder` emitters that AUTO-RECORD
     // the source MIR inst (via `currentMir`). Cycle 3e fix-up: every
@@ -10363,7 +11116,64 @@ struct Lowerer {
         return li;
     }
 
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: install every pre-minted
+    // block symbol BEFORE the first function is lowered.
+    //
+    // ★ WHY A MODULE-WIDE PRE-PASS AND NOT A PER-FUNCTION ONE. Both facts it
+    // installs are order-sensitive in opposite directions: the symbol-space CEILING
+    // must be known before the FIRST call to either minter (the seed is computed
+    // once, lazily), and the `blockToSym_` priming must be in place before ANY
+    // `lea` of an exported block anywhere in the module. Deriving either while
+    // walking a function would make the answer depend on which function happened to
+    // be lowered first — the class of bug that stays invisible in a one-function
+    // test and appears in a corpus.
+    void bindPreMintedBlockSymbols() {
+        std::size_t const fnCount = mir.moduleFuncCount();
+        for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
+            MirFuncId const mf = mir.funcAt(fi);
+            std::uint32_t const nb = mir.funcBlockCount(mf);
+            for (std::uint32_t bi = 0; bi < nb; ++bi) {
+                MirBlockId const b  = mir.funcBlockAt(mf, bi);
+                std::uint32_t const ni = mir.blockInstCount(b);
+                for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                    MirInstId const inst = mir.blockInstAt(b, ii);
+                    if (mir.instOpcode(inst) != MirOpcode::BlockAddressExport) continue;
+                    auto const ops = mir.instOperands(inst);
+                    // ⚠ `blockAddressTarget` ABORTS on a wrong-opcode id, so a
+                    // malformed module would kill the process HERE rather than be
+                    // reported. The MirBuilder and the MIR verifier both refuse a
+                    // non-`BlockAddress` operand, but neither runs on a hand-built
+                    // LIR fixture that calls `lowerToLir` directly — and a refusal
+                    // that crashes is not a refusal.
+                    if (ops.empty()
+                        || mir.instOpcode(ops[0]) != MirOpcode::BlockAddress) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.actual   = std::format(
+                            "MIR blockaddress_export (SymbolId={{ {} }}) does not "
+                            "carry a blockaddress operand — it names no block "
+                            "(D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)",
+                            mir.instPayload(inst));
+                        reporter.report(std::move(d));
+                        continue;
+                    }
+                    SymbolId const sym = mir.blockAddressExportSymbol(inst);
+                    MirBlockId const target = mir.blockAddressTarget(ops[0]);
+                    blockToSym_[target.v] = sym;
+                    if (sym.v > preMintedBlockSymCeiling_)
+                        preMintedBlockSymCeiling_ = sym.v;
+                    // The census `lowerFunction` builds is per-function and is not
+                    // available yet; the export-only decision is made there.
+                }
+            }
+        }
+    }
+
     [[nodiscard]] MirToLirResult run() {
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED — must precede every
+        // symbol mint and every block-address lowering. See the function's docblock.
+        bindPreMintedBlockSymbols();
         std::size_t const fnCount = mir.moduleFuncCount();
         for (std::uint32_t i = 0; i < fnCount; ++i) {
             // D-OPT-SWITCH-JUMP-TABLE (c70): `lir.addFunction` runs in this same
@@ -10447,6 +11257,8 @@ struct Lowerer {
             .lirToMir             = std::move(lirToMir),
             .jumpTableDescriptors = std::move(jumpTableDescriptors_),
             .signMaskConstants    = std::move(signMaskConstants_),
+            // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED
+            .blockSymbolBindings  = std::move(blockSymbolBindings_),
             .sehScopeDescriptors  = std::move(sehScopeDescriptors_),
             // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the extern imports the
             // F128 softcall verb MINTED during this lowering walk (empty for

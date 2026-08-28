@@ -118,12 +118,10 @@ movRegReg(TargetSchema const& schema, std::string_view dstName,
     auto const srcOrd = schema.registerByName(srcName);
     EXPECT_TRUE(dstOrd.has_value());
     EXPECT_TRUE(srcOrd.has_value());
-    f.result = LirReg{static_cast<std::uint32_t>(*dstOrd),
-                       /*isPhysical=*/1,
-                       /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
-    f.src    = LirReg{static_cast<std::uint32_t>(*srcOrd),
-                       /*isPhysical=*/1,
-                       /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    f.result = makePhysicalReg(static_cast<std::uint32_t>(*dstOrd),
+                               LirRegClass::GPR);
+    f.src    = makePhysicalReg(static_cast<std::uint32_t>(*srcOrd),
+                               LirRegClass::GPR);
     return f;
 }
 
@@ -166,9 +164,8 @@ TEST(X86VariableEncoder, SubSpRegRspRcxEmits48_29_CC) {
     auto const rsp = (*schema)->registerByName("rsp");
     auto const rcx = (*schema)->registerByName("rcx");
     ASSERT_TRUE(rsp.has_value() && rcx.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const r_rsp{static_cast<std::uint32_t>(*rsp), 1, cls};
-    LirReg const r_rcx{static_cast<std::uint32_t>(*rcx), 1, cls};
+    LirReg const r_rsp = makePhysicalReg(static_cast<std::uint32_t>(*rsp), LirRegClass::GPR);
+    LirReg const r_rcx = makePhysicalReg(static_cast<std::uint32_t>(*rcx), LirRegClass::GPR);
 
     Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
         LirOperand const ops[] = { LirOperand::makeReg(r_rsp),
@@ -196,9 +193,8 @@ TEST(X86VariableEncoder, SpCopyRbpRspEmits48_8B_EC) {
     auto const rbp = (*schema)->registerByName("rbp");
     auto const rsp = (*schema)->registerByName("rsp");
     ASSERT_TRUE(rbp.has_value() && rsp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const r_rbp{static_cast<std::uint32_t>(*rbp), 1, cls};
-    LirReg const r_rsp{static_cast<std::uint32_t>(*rsp), 1, cls};
+    LirReg const r_rbp = makePhysicalReg(static_cast<std::uint32_t>(*rbp), LirRegClass::GPR);
+    LirReg const r_rsp = makePhysicalReg(static_cast<std::uint32_t>(*rsp), LirRegClass::GPR);
 
     Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
         LirOperand const ops[] = { LirOperand::makeReg(r_rsp) };
@@ -291,8 +287,7 @@ TEST(X86VariableEncoder, MovRaxImm32EmitsCorrectLittleEndianBytes) {
     ASSERT_TRUE(movOp.has_value());
     auto const raxOrd = (*schema)->registerByName("rax");
     ASSERT_TRUE(raxOrd.has_value());
-    LirReg const result{static_cast<std::uint32_t>(*raxOrd), 1,
-                        static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const result = makePhysicalReg(static_cast<std::uint32_t>(*raxOrd), LirRegClass::GPR);
 
     Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
         LirOperand const ops[] = {
@@ -327,8 +322,7 @@ TEST(X86VariableEncoder, MovR12Imm32AlsoDerivesRexB) {
     ASSERT_TRUE(movOp.has_value());
     auto const r12Ord = (*schema)->registerByName("r12");
     ASSERT_TRUE(r12Ord.has_value());
-    LirReg const result{static_cast<std::uint32_t>(*r12Ord), 1,
-                        static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const result = makePhysicalReg(static_cast<std::uint32_t>(*r12Ord), LirRegClass::GPR);
 
     Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
         LirOperand const ops[] = { LirOperand::makeImmInt32(0) };
@@ -370,8 +364,7 @@ movRegImm64Bytes(TargetSchema const& schema, std::string_view dstName,
     auto const dstOrd = schema.registerByName(dstName);
     EXPECT_TRUE(movOp.has_value());
     EXPECT_TRUE(dstOrd.has_value());
-    LirReg const dst{static_cast<std::uint32_t>(*dstOrd), 1,
-                     static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const dst = makePhysicalReg(static_cast<std::uint32_t>(*dstOrd), LirRegClass::GPR);
     Lir lir = buildSingleFnLirWithRet(schema, [&](LirBuilder& b) {
         LirLiteralValue lit;
         lit.value = value;
@@ -471,8 +464,7 @@ TEST(X86VariableEncoder, MovImm64RoundTripsThroughDisasm) {
     auto const movOp  = (*schema)->opcodeByMnemonic("mov");
     auto const r14Ord = (*schema)->registerByName("r14");
     ASSERT_TRUE(movOp.has_value() && r14Ord.has_value());
-    LirReg const r14{static_cast<std::uint32_t>(*r14Ord), 1,
-                     static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const r14 = makePhysicalReg(static_cast<std::uint32_t>(*r14Ord), LirRegClass::GPR);
     LirLiteralValue lit; lit.value = value;
     std::uint32_t const idx = b.literalPoolAdd(std::move(lit));
     LirOperand const ops[] = { LirOperand::makeLiteralIndex(idx) };
@@ -517,15 +509,13 @@ TEST(X86VariableEncoder, SextRaxRaxEmits48_63_C0) {
     auto const raxOrd = (*schema)->registerByName("rax");
     ASSERT_TRUE(raxOrd.has_value());
 
-    LirReg const rax{static_cast<std::uint32_t>(*raxOrd),
-                     /*isPhysical=*/1,
-                     /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const rax = makePhysicalReg(static_cast<std::uint32_t>(*raxOrd), LirRegClass::GPR);
 
     Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
         LirOperand const ops[] = { LirOperand::makeReg(rax) };
         // The I32-source sext is width-32-keyed (movsxd r64, r/m32) since
-        // the byte form (movsx r/m8) was added — D-CSUBSET-CHAR-STRING-
-        // VALUE-CODEGEN. Thread width-32 exactly as MIR→LIR does
+        // the byte form (movsx r/m8) was added — D-CSUBSET-CHAR-STRING-VALUE-CODEGEN.
+        // Thread width-32 exactly as MIR→LIR does
         // (widthFlagsForType(I32)); flags=0 (width-64) now matches no sext
         // variant (fail-loud), which is the convergence-fix-D contract.
         (void)b.addInst(*sextOp, rax, ops, /*payload=*/0,
@@ -558,9 +548,7 @@ TEST(X86VariableEncoder, ZextRaxRaxEmits48_0F_B6_C0) {
     auto const raxOrd = (*schema)->registerByName("rax");
     ASSERT_TRUE(raxOrd.has_value());
 
-    LirReg const rax{static_cast<std::uint32_t>(*raxOrd),
-                     /*isPhysical=*/1,
-                     /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const rax = makePhysicalReg(static_cast<std::uint32_t>(*raxOrd), LirRegClass::GPR);
 
     Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
         LirOperand const ops[] = { LirOperand::makeReg(rax) };
@@ -601,9 +589,7 @@ assembleUnaryRaxRax(char const* mnemonic, bool width32) {
     EXPECT_TRUE(op.has_value());
     auto const raxOrd = (*schema)->registerByName("rax");
     EXPECT_TRUE(raxOrd.has_value());
-    LirReg const rax{static_cast<std::uint32_t>(*raxOrd),
-                     /*isPhysical=*/1,
-                     /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const rax = makePhysicalReg(static_cast<std::uint32_t>(*raxOrd), LirRegClass::GPR);
     Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
         LirOperand const ops[] = { LirOperand::makeReg(rax) };
         (void)b.addInst(*op, rax, ops, /*payload=*/0,
@@ -712,9 +698,7 @@ assembleUnarySelfReg(char const* mnemonic, std::string_view regName,
     auto const regOrd = (*schema)->registerByName(regName);
     EXPECT_TRUE(op.has_value());
     EXPECT_TRUE(regOrd.has_value());
-    LirReg const r{static_cast<std::uint32_t>(*regOrd),
-                   /*isPhysical=*/1,
-                   /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const r = makePhysicalReg(static_cast<std::uint32_t>(*regOrd), LirRegClass::GPR);
     Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
         LirOperand const ops[] = { LirOperand::makeReg(r) };
         (void)b.addInst(*op, r, ops, /*payload=*/0,
@@ -775,8 +759,7 @@ TEST(X86VariableEncoder, BswapRoundTripsThroughDisasm) {
     auto const r15Ord  = (*schema)->registerByName("r15");
     auto const retOp   = (*schema)->opcodeByMnemonic("ret");
     ASSERT_TRUE(bswapOp.has_value() && r15Ord.has_value() && retOp.has_value());
-    LirReg const r15{static_cast<std::uint32_t>(*r15Ord), 1,
-                     static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const r15 = makePhysicalReg(static_cast<std::uint32_t>(*r15Ord), LirRegClass::GPR);
 
     LirBuilder b{**schema};
     (void)b.addFunction(SymbolId{1});
@@ -843,9 +826,7 @@ void expectDivBytes(char const* mnemonic,
             auto const ord = (*schema)->registerByName(*divisorRegName);
             ASSERT_TRUE(ord.has_value())
                 << "missing register: " << *divisorRegName;
-            LirReg const divisor{static_cast<std::uint32_t>(*ord),
-                                 /*isPhysical=*/1,
-                                 /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+            LirReg const divisor = makePhysicalReg(static_cast<std::uint32_t>(*ord), LirRegClass::GPR);
             LirOperand const ops[] = { LirOperand::makeReg(divisor) };
             (void)b.addInst(*op, InvalidLirReg, ops);
         } else {
@@ -1011,7 +992,7 @@ TEST(X86VariableEncoder, NoMatchingVariantFiresLoudDiagnostic_KindMismatch) {
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -1052,7 +1033,7 @@ TEST(X86VariableEncoder, NoMatchingVariantFiresLoudDiagnostic_KindMismatch) {
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -1083,8 +1064,7 @@ TEST(X86VariableEncoder, NoMatchingVariantFiresLoudDiagnostic_KindMismatch) {
     ASSERT_TRUE(op2.has_value());
     ASSERT_TRUE(trap2.has_value());
     ASSERT_TRUE(raxOrd2.has_value());
-    LirReg const rax{static_cast<std::uint32_t>(*raxOrd2), 1,
-                     static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const rax = makePhysicalReg(static_cast<std::uint32_t>(*raxOrd2), LirRegClass::GPR);
 
     Lir lir = buildSingleFnLir(**schema2, [&](LirBuilder& b) {
         // KIND mismatch: `op` declares `[reg]` guard but we wire an
@@ -1115,7 +1095,7 @@ TEST(X86VariableEncoder, NoMatchingVariantFiresOnArityMismatch) {
             { "mnemonic": "wrong", "result": "none",
               "terminatorKind": "unreachable",
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "opcode": [144] },
@@ -1236,7 +1216,7 @@ TEST(TargetEncodingValidate, RejectsModrmRegExtOverflow) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "opcode": [199], "modrmRegExt": 8 },
@@ -1258,7 +1238,7 @@ TEST(TargetEncodingValidate, RejectsWireIndexOutOfRange) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -1281,7 +1261,7 @@ TEST(TargetEncodingValidate, RejectsModrmRegExtWithModRmRegWire) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "opcode": [199], "modrmRegExt": 0 },
@@ -1304,7 +1284,7 @@ TEST(TargetEncodingValidate, RejectsUncoveredGuardPosition) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "none",
               "terminatorKind": "unreachable",
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg", "reg"] },
                     "template": { "opcode": [144] },
@@ -1326,7 +1306,7 @@ TEST(TargetEncodingValidate, RejectsDuplicateModRmRegWires) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 2, "maxOperands": 2,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg", "reg"] },
                     "template": { "rexW": true, "opcode": [1] },
@@ -1352,7 +1332,7 @@ TEST(TargetEncodingValidate, RejectsOverlappingVariantGuards) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -1378,7 +1358,7 @@ TEST(TargetEncodingValidate, RejectsValueResultWithoutDestSlot) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "opcode": [144] },
@@ -1403,7 +1383,7 @@ TEST(X86VariableEncoder, RexNotEmittedWhenAllBitsZero) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op32", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": false, "opcode": [139] },
@@ -1432,8 +1412,7 @@ TEST(X86VariableEncoder, RexNotEmittedWhenAllBitsZero) {
     auto const trap = (*schema)->opcodeByMnemonic("trap");
     auto const raxOrd = (*schema)->registerByName("rax");
     ASSERT_TRUE(op.has_value() && trap.has_value() && raxOrd.has_value());
-    LirReg const rax{static_cast<std::uint32_t>(*raxOrd), 1,
-                     static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const rax = makePhysicalReg(static_cast<std::uint32_t>(*raxOrd), LirRegClass::GPR);
 
     Lir lir = buildSingleFnLir(**schema, [&](LirBuilder& b) {
         LirOperand const ops[] = { LirOperand::makeReg(rax) };
@@ -1464,7 +1443,7 @@ TEST(X86VariableEncoder, MultiByteOpcodeEmitsBytesInDeclaredOrder) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "two", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [15, 175] },
@@ -1492,8 +1471,7 @@ TEST(X86VariableEncoder, MultiByteOpcodeEmitsBytesInDeclaredOrder) {
     auto const op = (*schema)->opcodeByMnemonic("two");
     auto const trap = (*schema)->opcodeByMnemonic("trap");
     auto const raxOrd = (*schema)->registerByName("rax");
-    LirReg const rax{static_cast<std::uint32_t>(*raxOrd), 1,
-                     static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const rax = makePhysicalReg(static_cast<std::uint32_t>(*raxOrd), LirRegClass::GPR);
 
     Lir lir = buildSingleFnLir(**schema, [&](LirBuilder& b) {
         LirOperand const ops[] = { LirOperand::makeReg(rax) };
@@ -1523,7 +1501,7 @@ TEST(X86VariableEncoder, ModrmRegExtNonZeroFillsRegField) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["imm32"] },
                     "template": { "rexW": true, "opcode": [199], "modrmRegExt": 7 },
@@ -1551,8 +1529,7 @@ TEST(X86VariableEncoder, ModrmRegExtNonZeroFillsRegField) {
     auto const op   = (*schema)->opcodeByMnemonic("op");
     auto const trap = (*schema)->opcodeByMnemonic("trap");
     auto const raxOrd = (*schema)->registerByName("rax");
-    LirReg const rax{static_cast<std::uint32_t>(*raxOrd), 1,
-                     static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const rax = makePhysicalReg(static_cast<std::uint32_t>(*raxOrd), LirRegClass::GPR);
 
     Lir lir = buildSingleFnLir(**schema, [&](LirBuilder& b) {
         LirOperand const ops[] = { LirOperand::makeImmInt32(0) };
@@ -1624,8 +1601,7 @@ namespace {
                                     std::string_view name) {
     auto const ord = schema.registerByName(name);
     EXPECT_TRUE(ord.has_value());
-    return LirReg{static_cast<std::uint32_t>(*ord), /*isPhysical=*/1,
-                  /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    return makePhysicalReg(static_cast<std::uint32_t>(*ord), LirRegClass::GPR);
 }
 
 } // namespace

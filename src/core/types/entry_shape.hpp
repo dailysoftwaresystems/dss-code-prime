@@ -127,12 +127,33 @@ entryParamShapeFromName(std::string_view s) noexcept {
 // retyped one advertises whatever the enum looked like on the day it was
 // typed (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET). The
 // `3` is checked by `namesWhere` at compile time.
+//
+// ★ AND THE `+ 1` BELOW IS THE OTHER HALF OF THAT CHECK, NOT DECORATION.
+// D-CORE-NAMESWHERE-LITERAL-COUNT-IS-BLIND-TO-A-SECOND-SENTINEL:
+// `namesWhere<M>` only ever compares `M` against the rows the predicate
+// ACCEPTS, so a SECOND undeclarable shape moves nothing it can see. ✔MEASURED
+// 2026-08-23 in a worktree with `g++ -std=c++23 -fsyntax-only -I src`: a fifth
+// row plus the widened `isDeclarableEntryParamShape` that rejects it COMPILED
+// CLEAN before this assert existed — the projection stayed a correct list of
+// three while the SENTENCE this header tells about itself ("the table minus
+// THE sentinel") had quietly become false, and a loader refusing the second
+// undeclarable spelling would have had no set to name it against. The assert
+// relates the table's own row total to this projection's literal — two numbers
+// with DIFFERENT OWNERS, so it is not the tautology a `rows.size() - 1`
+// spelling would have been
+// (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
 [[nodiscard]] constexpr bool
 isDeclarableEntryParamShape(EntryParamShape p) noexcept {
     return p != EntryParamShape::None;
 }
 inline constexpr auto kDeclarableEntryParamShapeNames =
     namesWhere<3>(kEntryParamShapeTable, isDeclarableEntryParamShape);
+static_assert(kEntryParamShapeTable.rows.size()
+                  == kDeclarableEntryParamShapeNames.size() + 1,
+              "kEntryParamShapeTable must have exactly ONE undeclarable row "
+              "(the 'none' sentinel) — a second one leaves `namesWhere`'s "
+              "literal count matching while every language-file 'accepted: …' "
+              "message silently stops naming the set the loader enforces");
 
 // The entry's RETURN shape. Only `i32` is declared, and the omission of `void`
 // is the point: C23 5.1.2.2.1 says main's return type "shall be int", so

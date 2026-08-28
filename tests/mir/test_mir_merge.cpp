@@ -984,7 +984,7 @@ TEST(MirMerge, ConflictingExternImportAttributesFailLoudAtTheMirTier) {
 
 // ── CONTROL + fold: a ZERO size/align is an INCOMPLETE TYPE, not a conflict ──
 // `extern const char v[];` in one TU beside a sized declaration in another is
-// legal C (extern_import.hpp:76-81 — both fields stay 0 for an incomplete type),
+// legal C (extern_import.hpp — both fields stay 0 for an incomplete type),
 // so the merge takes the NON-ZERO shape and reports nothing. Both orders are
 // checked: the INCOMPLETE-FIRST order is the discriminating one — the pre-fix
 // first-wins merge kept CU0's 0/0, which the walker then rejected as an unsized
@@ -1636,11 +1636,11 @@ TEST(MirMerge, MergeKeepsLocalStaticGlobalDistinctFromSameNamedExtern) {
 
 // const-ness preservation across the cross-CU merge global-clone site
 // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL). `mergeCuMirs` rebuilds every CU's globals
-// into the merged module (mir_merge.cpp:625); it MUST carry `MirGlobal.isConst`,
+// into the merged module (mir_merge.cpp); it MUST carry `MirGlobal.isConst`,
 // or a const global silently degrades to a writable `.data` section after a
 // cross-CU link (loss of read-only-memory protection). Order-independent counts
 // keep this robust to any merge reordering. RED-ON-DISABLE: drop the
-// `m.globalIsConst(g)` argument at mir_merge.cpp:625 → both globals come back
+// `m.globalIsConst(g)` argument at mir_merge.cpp → both globals come back
 // mutable and the `constCount == 1` expectation fails.
 // ★★ TF-C85: the CROSS-CU merge is the THIRD `MirFunc` copy hop (the other two
 // are `mir_rebuild_helper` and the inliner's own rebuild). The merged module is
@@ -1970,7 +1970,7 @@ inline void expectDiagContains(DiagnosticReporter const& rep, std::string_view n
 //
 // OWNER OF THE COVERAGE, VERIFIED PRESENT RATHER THAN ASSUMED:
 // `S_EntryShapeNotDeclared`, emitted from src/analysis/semantic/semantic_analyzer.cpp
-// and pinned END-TO-END by examples/c-subset/entry_main_envp_refused_positioned --
+// and pinned END-TO-END by examples/c/entry_main_envp_refused_positioned --
 // this same 3-parameter source, expecting that code with `positioned: true` at an
 // EXACT line:col. That example asserts strictly MORE than the test deleted here
 // could: the span it demands is exactly what the MIR tier cannot supply, so if the
@@ -2446,7 +2446,7 @@ TEST(RealizeEntryShape, CrtImportNamesAreCMangledForTheFormat) {
 // ms_x64 funclet, reduces the parent's filter block to a `[Const; SehFilterReturn]`
 // stub, and records the scope range. These pins assert that shape HOST-
 // INDEPENDENTLY (every leg), complementing the Windows-only AV→42 runtime witness
-// (examples/c-subset/seh_catch_av):
+// (examples/c/seh_catch_av):
 //   * ExtractsFilterFuncletAndStubsParent — a single-`__try` parent gains ONE
 //     appended funclet fn, the __C_specific_handler personality import, one scope
 //     record; the funclet READS arg0 + RETURNS; the parent keeps NO SehException*
@@ -3763,7 +3763,7 @@ TEST(MirMerge, MergePreservesVocabularyIdentityAcrossCus) {
 //     signal, and (c) the ONLY thing making the inliner refuse to splice the shim into a
 //     caller (src/opt/passes/inlining.cpp). Under the MULTI-CU driver the shim is
 //     synthesized PRE-optimize, so the release pipeline's Inlining pass really is offered
-//     this body — see examples/c-subset/shipped_sprintf_ucrt_crosscu for the end-to-end
+//     this body — see examples/c/shipped_sprintf_ucrt_crosscu for the end-to-end
 //     runtime witness of that seam.
 
 namespace {
@@ -3965,8 +3965,8 @@ TEST(SynthStdioShim, MissingUcrtCoreImportFailsLoud) {
     EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
 }
 
-// FAIL-LOUD (3/3): NO va-list model resolved. `CuMirModule::vaListLayout` (D-FFI-PE-CRT-
-// UCRT-MIGRATION Phase 3 widened it from `optional<VaListStrategy>` to
+// FAIL-LOUD (3/3): NO va-list model resolved. `CuMirModule::vaListLayout`
+// (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3 widened it from `optional<VaListStrategy>` to
 // `optional<VaListLayout>`) is `std::optional` precisely so UNRESOLVED is distinguishable
 // from resolved — and widening it did NOT weaken that, because a default-constructed
 // `VaListLayout` is a REAL one: its `strategy` defaults to SysVRegisterSave, so a
@@ -4100,7 +4100,7 @@ constexpr std::int64_t kOptLegacyVsprintfNullTerm = 1;
 // the pool's signed arm, so the stored literal is -1.
 constexpr std::int64_t kBufferCountUnbounded = -1;
 // TF-C119: `snprintf`'s bit — STANDARD_SNPRINTF_BEHAVIOR (bit 1,
-// corecrt_stdio_config.h:116). WITHOUT it the core is the pre-C99 `_snprintf`,
+// corecrt_stdio_config.h). WITHOUT it the core is the pre-C99 `_snprintf`,
 // which returns -1 on truncation where C99 requires the would-be length. It is the
 // first shipped recipe to pass a nonzero bit that is NOT sprintf's legacy bit 0,
 // which is precisely why a value hoisted out of the sprintf arm must red here.
@@ -4603,7 +4603,7 @@ TEST(SynthStdioShim, SscanfArmUsesTheScanfCoreWithZeroOptions) {
 // ★ TF-C119 — `snprintf` MAKES THIS FIXTURE COVER SOMETHING NO SINGLE-RECIPE ONE CAN,
 // and that is why it was extended rather than left at five. `snprintf` is the ONLY arm
 // whose body is more than one block (the `r < 0 ? -1 : r` clamp:
-// synth_stdio_shim.cpp:489-506) and therefore the only one that leaves the builder
+// synth_stdio_shim.cpp) and therefore the only one that leaves the builder
 // sitting in a NON-ENTRY block when the emission loop moves on to the next recipe. The
 // pass stamps structural markers module-wide with ONE `rederiveStructCfMarkers` after
 // `finish()` — so the MIXED single-/multi-block module is the shape it must survive,

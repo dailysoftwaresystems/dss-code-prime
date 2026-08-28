@@ -1,0 +1,43 @@
+{
+  "$comment": "D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED (P42): the RUNTIME witness for the LEGITIMATE half of CROSS-DESCRIPTOR REALIZATION AGREEMENT. <memory.h> mirrors <string.h>'s mem* surface by design, so a TU including BOTH resolves two descriptors declaring memcpy/memmove/memset/memcmp/memchr for the SAME object format -- the exact shape the agreement check compares, and the shape sqlite's shell.c really has (<string.h> at :166, <memory.h> at :7121). The sibling example shipped_memory_h includes ONLY the alias and therefore resolves ONE descriptor, so nothing in the corpus put the two side by side before this. WHAT IT PINS THAT A UNIT TEST CANNOT: that the check does not REFUSE the shipped configuration, and that the surviving import still WORKS, on every leg, at runtime. A checker that degenerated into 'duplicates are forbidden' fails this at BUILD time on all four targets. Both surfaces are used so a wrong winner is visible in the EXIT CODE, not only in the import table: the mem* five come from both descriptors, strlen/strcmp/strchr from string.json alone. exit = strlen(\"dss-p42\") + 35 = 7 + 35 = 42. UNGATED, all 4 targets -- both headers exist on every platform (glibc/Darwin forwarders, the MSVC CRT alias), and pe must resolve them too since shell.c's include is unconditional.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"],
+      "$commentByteIdentical": "Deliberately NOT given \"mustDifferFromBaseline\", for the SAME measured reason as the sibling shipped_memory_h: every step this example pins happens behind an EXTERN call the pipeline cannot see through (memcpy/memcmp/memchr/memset/memmove/strcmp/strchr/strlen are all imports), so no pass has a body to transform on this side of the call and the optimized image is byte-identical to the baseline. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail -- an honest no-op, not a missed opt-in. The arm still earns its place: it proves the AGREEMENT CHECK runs and passes on the optimized build path too, which is a different compile of the same descriptors."
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "$commentByteIdentical": "Same reasoning as the arm above -- the whole body is extern calls, so the release pipeline has nothing to transform here and the image matches the baseline. Kept because the bar requires a release arm and because it re-runs descriptor resolution, which is what this example exists to exercise."
+    }
+  ]
+}

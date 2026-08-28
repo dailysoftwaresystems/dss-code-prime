@@ -4,6 +4,7 @@
 // the matching `*.out.jsonl` golden. `DSS_REFRESH_GOLDENS=1`
 // writes goldens; otherwise a missing golden fails loudly.
 
+#include "core/substrate/stack_sized_thread.hpp"
 #include "core/substrate/thread_pool.hpp"
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
@@ -110,9 +111,42 @@ void runOneSession(fs::path const& inputPath) {
     auto executor = std::make_unique<SynchronousExecutor>();
     LspServer server{std::move(transport), std::move(executor), cache};
 
-    std::future<int> exitCode = std::async(std::launch::async, [&] {
-        return server.run();
-    });
+    // ★★ A STATED STACK, NOT THE HOST'S DEFAULT -- the same fix, and the same
+    // reason, as `LspTestHarness`: this thread stands in for production's MAIN
+    // thread, and `std::async` handed it macOS's 512 KiB secondary-thread
+    // default instead of main's 8 MiB. ✔MEASURED 2026-08-25 (cycle P34): this
+    // binary died `Bus error` on macOS, in a 415,360-byte frame.
+    // D-TEST-LSP-HARNESS-RAN-THE-SERVER-LOOP-ON-A-HOST-DEFAULT-STACK
+    std::promise<int> exitPromise;
+    std::future<int>  exitCode = exitPromise.get_future();
+    dss::substrate::StackSizedThread serverThread{
+        dss::lsp::testing::kServerLoopStackBytes, [&] {
+            try {
+                exitPromise.set_value(server.run());
+            } catch (...) {
+                exitPromise.set_exception(std::current_exception());
+            }
+        }};
+
+    // ★ EVERY EXIT PATH JOINS, not just the happy one. An `ASSERT_*` below
+    // RETURNS from this function, and a `StackSizedThread` aborts rather than
+    // detaching if it is destroyed while still running -- so an early failing
+    // assertion would turn a readable test failure into a process abort. Close
+    // first and THEN join, in that order: joining a loop still parked in
+    // `readMessage()` is a deadlock.
+    struct ServerReaper {
+        InMemoryTransport*                 transport;
+        dss::substrate::StackSizedThread*  thread;
+        ~ServerReaper() {
+            if (transport) transport->close();
+            if (thread->joinable()) {
+                try {
+                    thread->join();
+                } catch (...) {   // NOLINT(bugprone-empty-catch)
+                }
+            }
+        }
+    } reaper{tPtr, &serverThread};
 
     for (auto const& l : lines) {
         tPtr->pushClientMessage(l);

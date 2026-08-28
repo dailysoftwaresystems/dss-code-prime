@@ -159,7 +159,7 @@ void writeText(fs::path const& p, std::string_view text) {
 // ABSENT key and a present `[]` are two distinct inputs to the loader, and this
 // file exercises both.
 struct ManifestSpec {
-    std::string              language = "c-subset";
+    std::string              language = "c";
     std::string              profile  = "cli";
     std::vector<std::string> targets;
     std::vector<std::string> sources;
@@ -1062,7 +1062,7 @@ TEST(DependencyResolverComposition, SourceMergeAcrossLanguagesRejectsAtResolveTi
     // dependency-side AP2 language gate — see the dedicated pin below. Here the
     // profile is one `toy` does declare, so the language mismatch is what fires.
     writeText(fs::path{manifestPathIn(dep)},
-              renderManifest({.language = "c-subset",
+              renderManifest({.language = "c",
                               .profile  = "module",
                               .targets  = {std::string{kElfX64Exec}},
                               .sources  = {"m.toy"}}));

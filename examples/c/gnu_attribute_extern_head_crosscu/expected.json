@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-ATTRIBUTE-LEADING-WITH-STORAGE-CLASS (TF-C77), MODE 1: a GNU attribute written AFTER the `extern` keyword and BEFORE the type — `extern __attribute__((__noreturn__)) void die(int);`, the Tcl/glibc after-keyword spelling. MEASURED at the pre-change HEAD this did not compile at all: `error[P0009] expected 'Identifier', 'VoidKeyword', … — got '__attribute__'`. The grammar puts the run INSIDE `externSpecifiers` (which owns the keyword) so FIRST(externDecl) stays {ExternKeyword}; putting it BEFORE `extern` is refused at LOAD time — MEASURED against a throwaway patched config tree, `error[C_AmbiguousAlternatives] at /shapes/topLevel: alt branches share FIRST token 'ExternKeyword'` + `D_SchemaLoadFailed`, exit 1 — so the fully-leading order is its own anchor, not a variation of this one. ★ EVERY CHECK IS AN APPLIED FACT AND IS PROVEN NON-VACUOUS per check, isolated into its own program and built three ways (as written / that attribute deleted / the config row it rides removed from a patched DSS_CONFIG_ROOT tree, live checkout untouched); the full matrix is in cu_a.c's header. ★ THE ROW THIS EXAMPLE EXISTS FOR IS `noreturn`, AND IT IS A COMPILE GATE ON PURPOSE — that is where noreturn is observable at all. `pick` is non-void and its last path ends in `die(...)` with no return, so the program BUILDS only if the after-keyword `__noreturn__` reached the semantic scan; with the attribute removed it is `error[H0003] non-void function may fall through without returning a value` and there is no binary (MEASURED, both directions, on this exact program). A runtime check cannot witness that: the failure mode is a REFUSAL, not a wrong number. ★ The `weak` row IS exit-code discriminating in the strongest available sense: cu_b.c defines `wfun` STRONGLY, so a `weak` that parses but never reaches the symbol resolves to cu_a.c's own body and the program exits 1 instead of 42; a `weak` deleted outright is a duplicate-symbol failure in DSS (`K_SymbolRedefinedAcrossUnits`) and in clang (`ld: duplicate symbol`) alike — real strong-over-weak resolution being witnessed, not a parse. The `visibility(\"hidden\")` and `__nothrow__,__leaf__` rows are COMPILE-GATE witnesses and cu_a.c says so rather than pretending otherwise — both are ABI-neutral to a statically linked read, so deleting them cannot move an exit code; their honest disable is disconnecting the config row they ride, which turns each into a loud H000C, and the regression they guard IS a compile failure (that is exactly how the P0009 presented). `_Thread_local` × attribute is read in BOTH orders because the slot is a REPEAT over an alt and the linkage merge is last-wins, so an order-sensitive fold is a real hazard. RED-ON-DISABLE (OBSERVED, via patched config trees under `DSS_CONFIG_ROOT`, live checkout untouched): remove `attrSpec` from `externSpecifiers`'s repeat alt → every declaration in cu_a.c fails P0009; drop the `weak` key from the externDecl row's `linkageSpecifiers` → H000C; move `weak` into that row's ignored NAMES instead → the errors vanish and the program exits 1, which is the wrong-way 'fix' the exit code catches. The `release` arm is MANDATORY, not decoration: the point is witnessing that the real SHIPPED optimizer PRESERVES weak binding rather than inlining through it. The whole example is VERIFIED clang-clean over BOTH CUs (`-fsyntax-only -Wall -Wextra -isysroot $(xcrun --show-sdk-path)`, zero errors, zero warnings) and the clang-linked two-CU binary independently exits 42, so the expected exit code is ground truth from a real toolchain — a corpus example must witness REAL C, not merely C that DSS happens to accept.",
+  "language": "c",
+  "sources": ["cu_a.c", "cu_b.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "cu_a.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "cu_a",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "cu_a",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "cu_a",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

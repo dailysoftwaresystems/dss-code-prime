@@ -63,7 +63,18 @@ struct DSS_EXPORT VRegBitset {
     void insert(std::uint32_t vregId);
     void erase(std::uint32_t vregId) noexcept;
     // Set-union `other` into `*this`. Returns true iff `*this` grew.
-    bool unionInPlace(VRegBitset const& other);
+    //
+    // ⚠ `[[nodiscard]]` because the "grew" answer is the DATAFLOW FIXPOINT'S
+    // TERMINATION CONDITION, not a courtesy: `analyzeFuncLiveness`'s `while
+    // (changed)` loop is driven by it, and a site that drops it silently
+    // under-propagates liveness — a wrong live range, i.e. a register
+    // allocated over a still-live value, which is a silent miscompile rather
+    // than a crash. The one site that legitimately ignores it (`liveIn` is
+    // rebuilt from scratch and compared word-wise afterwards) now says so with
+    // an explicit `(void)`, so "ignored on purpose" and "forgotten" stop
+    // looking identical. Sibling of the same class as
+    // D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE, found while closing it.
+    [[nodiscard]] bool unionInPlace(VRegBitset const& other);
     // Set-difference: clear bits also set in `mask` from `*this`.
     void subtractInPlace(VRegBitset const& mask);
     // Reset all bits without releasing storage.
@@ -84,6 +95,44 @@ struct DSS_EXPORT LirLiveRange {
                                            std::uint32_t start,
                                            std::uint32_t end);
 };
+
+// ── THE ONE INTERFERENCE PREDICATE (plan 22 OPT8 — register coalescing) ──────
+//
+// ★★★ TWO RANGES INTERFERE IFF THEIR HALF-OPEN POSITION INTERVALS OVERLAP, AND
+// THIS FUNCTION IS THE ONLY PLACE THAT SENTENCE IS SPELLED. Three consumers ask
+// it, and the whole safety argument for coalescing is that they ask the SAME
+// one:
+//
+//   * the COALESCER (`lir_regalloc.cpp`) — may merge two live ranges into one
+//     register only when this returns false;
+//   * the ALLOCATOR's own register reuse — `expireActive` returns a register to
+//     the free list when `active.range.end <= currentStart`, and because
+//     `LirFuncLiveness::ranges` is sorted ascending by `start`, that condition
+//     is exactly `!lirRangesInterfere(active.range, current)`. The linear scan
+//     was ALREADY permitted to hand two ranges one register on precisely this
+//     test; coalescing only makes it do so deliberately. **That is why
+//     coalescing introduces no new class of hazard: every assignment it
+//     produces is one the allocator could already have produced by luck.**
+//   * the AUDITOR (`findAllocationConflict`, `lir_regalloc.hpp`) — re-derives
+//     the question on the FINISHED assignment table, from liveness alone,
+//     without consulting the coalescer's union-find. A coalescer that merged
+//     two interfering ranges is a SILENT MISCOMPILE (two live values, one
+//     register), so the check that catches it must not be able to inherit the
+//     transform's own belief. That independence is the whole point, and it is
+//     the `D-OPT-JCC-FALLTHROUGH` shape: one shared predicate, consulted by the
+//     transform AND by a verifier that re-derives rather than re-reads.
+//
+// ⚠ THE PREDICATE IS AN OVER-APPROXIMATION OF LIVENESS, AND THAT DIRECTION IS
+// THE SAFE ONE. `LirFuncLiveness` ships FLAT single-interval ranges (see the
+// header note above), so a value dead in a hole is still reported live across
+// it. Over-approximating liveness makes this return `true` where a
+// split-interval analysis would return `false` — a MISSED coalesce, never an
+// unsound one. When split-aware sub-intervals land (D-ML6-1.1) this predicate
+// gains precision and every consumer gains it at once.
+[[nodiscard]] constexpr bool
+lirRangesInterfere(LirLiveRange const& a, LirLiveRange const& b) noexcept {
+    return a.start < b.end && b.start < a.end;
+}
 
 // Per-function liveness result. Owned by the module-level wrapper.
 //

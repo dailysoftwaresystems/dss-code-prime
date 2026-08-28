@@ -377,19 +377,68 @@ TEST(ConstEval, CastFromI64MinToI32WrapsToZero) {
     EXPECT_EQ(std::get<std::int64_t>(res.value->value), 0);
 }
 
-// CE3 silent-failure-hunter F1: Cast to U64 with a negative source refuses
-// regardless of the `refuseOnOverflow` knob. The int64 storage arm can't
-// reconcile signedness with downstream signed arithmetic; the engine
-// refuses loudly rather than producing a wrong-typed fold.
-TEST(ConstEval, CastNegativeToUnsigned64RefusesEvenWithOverflowAllowed) {
+// ── D-CE-NEGATIVE-WIDENED-TO-U64-NOT-CONSTFOLDABLE ────────────────────────
+// ★ THIS PIN WAS INVERTED, DELIBERATELY, AND THE OLD ARM IS QUOTED SO THE
+// CHANGE CANNOT READ AS A TEST QUIETLY WEAKENED TO GO GREEN.
+// It used to assert that `(unsigned long)(-1)` REFUSES with `Overflow` "even
+// with overflow allowed", justified as: "the int64 storage arm can't reconcile
+// signedness with downstream signed arithmetic". That was a pin on a WORKAROUND,
+// not on a language rule -- and the guard it pinned said so itself, ending
+// "(When CE5 opens the uint64 arm for arithmetic, this restriction can lift.)"
+//
+// C 6.3.1.3p2 makes integer -> unsigned conversion ALWAYS DEFINED: reduce
+// modulo 2^N. There is no overflow to report, so refusing rejected a legal
+// constant expression -- clang and gcc both fold it, and DSS folded the very
+// same conversion at 32 bits (`(unsigned int)(-1)`) the whole time. The stated
+// lift-condition is now met: `applyBinaryInt` evaluates in the operation's own
+// (width, signedness) domain, so the int64 payload is an unambiguous BIT
+// PATTERN that nothing downstream re-reads as a signed -1.
+TEST(ConstEval, CastNegativeToUnsigned64IsModularNotAnOverflow) {
     Rig r;
     HirNodeId const lit = r.litInt(-1, r.i64T());
     HirNodeId const c   = r.cast(lit, r.interner.primitive(TypeKind::U64));
     EvalOptions opts;
-    opts.refuseOnOverflow = false;   // even permissive policy refuses here
+    // The STRICT policy, deliberately: this is not an overflow under any
+    // policy, so the strict knob must not turn a defined conversion into one.
+    opts.refuseOnOverflow = true;
     Hir hir = r.finishWith(c);
     auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
-    EXPECT_FALSE(res.value.has_value());
+    ASSERT_TRUE(res.value.has_value())
+        << "C 6.3.1.3p2: conversion to unsigned is modular, never an overflow";
+    EXPECT_EQ(res.value->core, TypeKind::U64);
+    // -1 reduces to 2^64-1, whose two's-complement bit pattern IS int64 -1.
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), -1);
+    // And it now compares as the large unsigned value it denotes.
+    HirLiteralValue folded;
+    folded.core  = TypeKind::U64;
+    folded.value = std::int64_t{-1};
+    HirLiteralValue zero;
+    zero.core  = TypeKind::U64;
+    zero.value = std::int64_t{0};
+    ConstEvalFailure why = ConstEvalFailure::None;
+    auto gt = detail::applyBinaryInt(HirOpKind::Gt, folded, zero, opts, why);
+    ASSERT_TRUE(gt.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(gt->value), 1);
+}
+
+// ⚠ THE FLOAT -> UNSIGNED REFUSAL OF THE SAME SHAPE STAYS, AND THAT IS THE
+// POINT OF KEEPING BOTH PINS SIDE BY SIDE. C 6.3.1.4p1 makes a floating ->
+// integer conversion UNDEFINED when the integral part is unrepresentable, so a
+// negative double to an unsigned type has no defined value to fold. Deleting
+// this guard alongside the integer one would have invented an answer the
+// standard does not give -- the two look identical in the source and are
+// governed by different paragraphs.
+TEST(ConstEval, CastNegativeFloatToUnsigned64StillRefuses) {
+    Rig r;
+    HirNodeId const lit = r.litFloat(-1.0, r.interner.primitive(TypeKind::F64));
+    HirNodeId const c   = r.cast(lit, r.interner.primitive(TypeKind::U64));
+    EvalOptions opts;
+    opts.allowFloat       = true;
+    opts.refuseOnOverflow = false;   // even the permissive knob must refuse
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+    EXPECT_FALSE(res.value.has_value())
+        << "C 6.3.1.4p1: negative float -> unsigned is UB, not a modular wrap";
     EXPECT_EQ(res.failure, ConstEvalFailure::Overflow);
 }
 
@@ -1793,4 +1842,321 @@ TEST(ConstEval, Int128ChainedFoldKeepsItsStandardCore) {
     EXPECT_EQ(bv->low64(), 1ull) << "the +1 lands in the low limb";
     ASSERT_GE(bv->limbs().size(), 2u);
     EXPECT_EQ(bv->limbs()[1], (1ull << 36)) << "2^100 = 2^36 in the high limb";
+}
+
+// ── D-HIR-CONSTEVAL-UNSIGNED-WRAPAROUND-NOT-MODULAR ────────────────────────
+// C 6.2.5p9 (unsigned arithmetic is modular), C 6.3.1.3p2 (integer conversion
+// to unsigned is modular and ALWAYS defined), C 6.5.7p5 (`>>` on an unsigned
+// left operand is a LOGICAL shift), C 6.3.1.8 (usual arithmetic conversions).
+//
+// Every expectation below was cross-checked against host clang AND host gcc,
+// probed SEPARATELY, over a 103-cell matrix; both accept all 103 and DSS
+// failed 46 of them before this fix.
+//
+// ★ THE NEGATIVE FORMS ARE THE POINT. An assertion written in the positive
+// fails loudly when the fold is wrong; the same fact written with `!=` or `>`
+// SILENTLY PASSES. Each arm below therefore pins the VALUE, not merely that
+// the fold succeeded.
+namespace {
+
+// A standard-integer literal operand at a declared core kind. The int64 arm
+// carries the two's-complement BIT PATTERN; `core` says how to read it.
+[[nodiscard]] HirLiteralValue lit(TypeKind core, std::int64_t bits) {
+    HirLiteralValue v;
+    v.core  = core;
+    v.value = bits;
+    return v;
+}
+
+[[nodiscard]] std::int64_t foldInt(HirOpKind op, HirLiteralValue const& a,
+                                   HirLiteralValue const& b) {
+    EvalOptions opts;
+    ConstEvalFailure why = ConstEvalFailure::None;
+    auto r = detail::applyBinaryInt(op, a, b, opts, why);
+    EXPECT_TRUE(r.has_value()) << "fold refused; failure=" << static_cast<int>(why);
+    if (!r.has_value()) return 0;
+    return std::get<std::int64_t>(r->value);
+}
+
+}  // namespace
+
+TEST(ConstEvalUnsignedModular, OperationDomainIsTheUsualArithmeticConversions) {
+    // Two u32 operands -> u32. This is `bitIntUac`'s "both standard" arm, which
+    // carried the comment "dead in practice" until this row made it live.
+    auto d = detail::intOpDomain(HirOpKind::Sub, lit(TypeKind::U32, 0),
+                                 lit(TypeKind::U32, 1));
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->bits, 32);
+    EXPECT_FALSE(d->isSigned);
+    // Mixed sign at equal rank -> UNSIGNED wins (C 6.3.1.8). This is what makes
+    // `-1 == 0xffffffffu` true.
+    d = detail::intOpDomain(HirOpKind::Eq, lit(TypeKind::I32, -1),
+                            lit(TypeKind::U32, 0xffffffff));
+    ASSERT_TRUE(d.has_value());
+    EXPECT_FALSE(d->isSigned) << "mixed sign at equal rank must convert to unsigned";
+    // C 6.3.1.1 promotion: a sub-int operand promotes to signed int, so an
+    // unsigned char pair yields a SIGNED domain -- clang and gcc agree, and a
+    // fix that made this unsigned would be wrong in the other direction.
+    d = detail::intOpDomain(HirOpKind::Sub, lit(TypeKind::U8, 0),
+                            lit(TypeKind::U8, 1));
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->bits, 32);
+    EXPECT_TRUE(d->isSigned) << "u8 promotes to int; the result is signed";
+    // C 6.5.7p3: a shift's type is the PROMOTED LEFT operand, never the UAC of
+    // both -- so a u64 count must not drag a u32 left operand to 64 bits.
+    d = detail::intOpDomain(HirOpKind::Shl, lit(TypeKind::U32, 1),
+                            lit(TypeKind::U64, 1));
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->bits, 32);
+    EXPECT_FALSE(d->isSigned);
+}
+
+TEST(ConstEvalUnsignedModular, UnsignedArithmeticWrapsAtTheResultWidth) {
+    // `0u - 1u` -- the row's own first form. Was -1; must be 0xffffffff.
+    EXPECT_EQ(foldInt(HirOpKind::Sub, lit(TypeKind::U32, 0), lit(TypeKind::U32, 1)),
+              0xffffffffLL);
+    EXPECT_EQ(foldInt(HirOpKind::Sub, lit(TypeKind::U32, 1), lit(TypeKind::U32, 2)),
+              0xffffffffLL);
+    // Wrap ABOVE the maximum, the other direction.
+    EXPECT_EQ(foldInt(HirOpKind::Add, lit(TypeKind::U32, 0xffffffff),
+                      lit(TypeKind::U32, 1)), 0LL);
+    EXPECT_EQ(foldInt(HirOpKind::Mul, lit(TypeKind::U32, 0xffffffff),
+                      lit(TypeKind::U32, 2)), 0xfffffffeLL);
+    // A SIGNED domain must NOT be reduced as unsigned -- the control that
+    // catches a fix applied too broadly.
+    EXPECT_EQ(foldInt(HirOpKind::Sub, lit(TypeKind::I32, 0), lit(TypeKind::I32, 1)),
+              -1LL);
+}
+
+TEST(ConstEvalUnsignedModular, ComparisonsUseTheOperationsSignedness) {
+    // ★ THE SILENT-PASS ARM. `(0u - 1u) > 0u` folded false because -1 > 0 is
+    // false in the host's signed domain. A `_Static_assert` written as
+    // `!((0u-1u) > 0u)` therefore PASSED, asserting the opposite of the truth.
+    auto const wrapped = lit(TypeKind::U32, 0xffffffff);
+    EXPECT_EQ(foldInt(HirOpKind::Gt, wrapped, lit(TypeKind::U32, 0)), 1LL);
+    EXPECT_EQ(foldInt(HirOpKind::Lt, wrapped, lit(TypeKind::U32, 0)), 0LL);
+    // The same bit pattern at 64 bits, where the int64 payload IS negative.
+    auto const u64max = lit(TypeKind::U64, -1);
+    EXPECT_EQ(foldInt(HirOpKind::Gt, u64max, lit(TypeKind::U64, 0)), 1LL);
+    EXPECT_EQ(foldInt(HirOpKind::Le, u64max, lit(TypeKind::U64, 0)), 0LL);
+    // Signed comparison must be untouched.
+    EXPECT_EQ(foldInt(HirOpKind::Lt, lit(TypeKind::I32, -1), lit(TypeKind::I32, 0)),
+              1LL);
+    // Mixed sign converts to unsigned FIRST, so -1 equals UINT_MAX.
+    EXPECT_EQ(foldInt(HirOpKind::Eq, lit(TypeKind::I32, -1),
+                      lit(TypeKind::U32, 0xffffffff)), 1LL);
+}
+
+TEST(ConstEvalUnsignedModular, DivRemAndShrAreUnsignedOperations) {
+    auto const u64max = lit(TypeKind::U64, -1);   // 0xffffffffffffffff
+    // Signed `-1 / 2` is 0; the unsigned quotient is 2^63-1.
+    EXPECT_EQ(foldInt(HirOpKind::Div, u64max, lit(TypeKind::U64, 2)),
+              static_cast<std::int64_t>(0x7fffffffffffffffULL));
+    EXPECT_EQ(foldInt(HirOpKind::Rem, u64max, lit(TypeKind::U64, 2)), 1LL);
+    // C 6.5.7p5: logical, not arithmetic. The signed `>>` would keep -1.
+    EXPECT_EQ(foldInt(HirOpKind::Shr, u64max, lit(TypeKind::U64, 1)),
+              static_cast<std::int64_t>(0x7fffffffffffffffULL));
+    // Signed `>>` stays ARITHMETIC -- the sign-propagating control.
+    EXPECT_EQ(foldInt(HirOpKind::Shr, lit(TypeKind::I64, -1), lit(TypeKind::I64, 1)),
+              -1LL);
+    // INT64_MIN / -1 stays REFUSED in the signed domain (target-divergent trap),
+    // and the new unsigned arm must not have stolen that guard.
+    EvalOptions opts;
+    ConstEvalFailure why = ConstEvalFailure::None;
+    auto const r = detail::applyBinaryInt(
+        HirOpKind::Div, lit(TypeKind::I64, std::numeric_limits<std::int64_t>::min()),
+        lit(TypeKind::I64, -1), opts, why);
+    EXPECT_FALSE(r.has_value());
+    EXPECT_EQ(why, ConstEvalFailure::Overflow);
+}
+
+TEST(ConstEvalUnsignedModular, AsIntBitsCarriesAnUnsignedPayloadAsItsBitPattern) {
+    // `asInt64` answers "is this value representable as signed" and must keep
+    // saying no -- array dimensions and enum bounds depend on that refusal.
+    HirLiteralValue v;
+    v.core  = TypeKind::U64;
+    v.value = std::uint64_t{0xffffffffffffffffULL};
+    EXPECT_FALSE(detail::asInt64(v).has_value())
+        << "asInt64 keeps its value-representability contract";
+    // `asIntBits` answers "what are the bits", which is the question an
+    // arithmetic operand asks once the domain is known.
+    auto const bits = detail::asIntBits(v);
+    ASSERT_TRUE(bits.has_value());
+    EXPECT_EQ(*bits, -1LL);
+    // And the pair then compares as the large unsigned value it is.
+    EXPECT_EQ(foldInt(HirOpKind::Gt, v, lit(TypeKind::U64, 0)), 1LL);
+}
+
+// ── D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE / D-CSUBSET-INT128-ICE-CONTEXT-REFUSED ──
+//
+// `asInt64` answers ONE question — "is this value representable as a signed
+// int64?" — and every 64-bit integer-constant-expression slot (array dimension,
+// enumerator, bit-field width, `asInt64Bridge`) depends on the answer. Its
+// `uint64_t` arm has always answered it by MAGNITUDE; its `BitIntValue` arm used
+// to answer a DIFFERENT question, "is the declared width ≤ 64?", and so refused
+// `(__int128)2 + 1` as an array bound while gcc 13.3.0 (`-std=c2x`) and clang
+// 18.1.3 (`-std=c23`), probed SEPARATELY, both accept it.
+//
+// The three tests below pin the three things that must all hold at once: the fix
+// is EQUIVALENT to its own stated definition, it ADMITS the values that fit, and
+// it still REFUSES the ones that do not.
+namespace {
+
+// Build a `BitIntValue`-armed literal from raw little-endian limbs.
+[[nodiscard]] HirLiteralValue wideLit(std::vector<std::uint64_t> limbs,
+                                      std::uint32_t width, bool isSigned,
+                                      TypeKind core) {
+    HirLiteralValue v;
+    v.core  = core;
+    v.value = BitIntValue(std::move(limbs), width, isSigned);
+    return v;
+}
+
+}  // namespace
+
+TEST(ConstEvalAsInt64Magnitude, MatchesTheConvertToRoundTrip) {
+    // THE DEFINITION: a value fits an int64 iff `INT64_MIN <= value <= INT64_MAX`,
+    // spelled here with the bignum's OWN `compare` against both bounds at a width
+    // that can hold every operand at once -- one bit wider than either needs, and
+    // SIGNED, so an unsigned source stays non-negative and both bounds are exact.
+    // `asInt64` implements the same predicate as a limb scan so it can stay
+    // `noexcept` and allocation-free; this test is what keeps the fast form and the
+    // definition from drifting apart.
+    //
+    // ★ IT HAS ALREADY EARNED ITS KEEP TWICE, WHICH IS WHY THE MATRIX IS SHAPED AS
+    // IT IS. It first rejected a WRONG definition -- "convert to int64 and back is
+    // value-preserving" -- which is a REPRESENTATION test, not a value test, and
+    // wrongly calls 2^65-1 at `unsigned _BitInt(65)` a fit because the sign
+    // extension lands exactly on the one bit above 64. It then caught a real bug in
+    // the implementation: an all-ones UNSIGNED value (`(__uint128_t)-1`) whose upper
+    // limbs do repeat bit 63 and which must still NOT bridge, as -1 or as anything
+    // else. Both cells are in the matrix below and must stay there.
+    std::array<std::uint32_t, 9> const widths{1, 7, 8, 63, 64, 65, 100, 128, 200};
+    std::array<std::vector<std::uint64_t>, 10> const seeds{{
+        {0},                                    // zero
+        {1},                                    // small positive
+        {0xFFFFFFFFFFFFFFFFULL},                // all ones in limb 0 (-1, or 2^64-1)
+        {0x8000000000000000ULL},                // exactly INT64_MAX+1 as a magnitude
+        {0x7FFFFFFFFFFFFFFFULL},                // exactly INT64_MAX
+        {3, 1},                                 // 2^64 + 3 -- low limb FITS, value does not
+        {3, std::uint64_t{1} << 36},            // 2^100 + 3 -- THE truncation trap
+        {0xFFFFFFFFFFFFFFFFULL, 0x0FULL},       // a mid-magnitude 2-limb value
+        {0xFFFFFFFFFFFFFFFFULL,
+         0xFFFFFFFFFFFFFFFFULL},                // all ones in BOTH limbs: -1 when signed,
+                                                // 2^N-1 when unsigned -- the two must part
+        {0x8000000000000000ULL,
+         0xFFFFFFFFFFFFFFFFULL},                // INT64_MIN sign-extended: fits iff signed
+    }};
+    for (std::uint32_t const w : widths) {
+        for (bool const sgn : {false, true}) {
+            for (auto const& seed : seeds) {
+                HirLiteralValue const v = wideLit(seed, w, sgn, TypeKind::BitInt);
+                auto const& bv = std::get<BitIntValue>(v.value);
+                std::uint32_t const cw = std::max(bv.width(), 64u) + 1u;
+                BitIntValue const val = bv.withType(cw, /*newSigned=*/true);
+                BitIntValue const lo  = BitIntValue::fromI64(
+                    std::numeric_limits<std::int64_t>::min(), cw, /*isSigned=*/true);
+                BitIntValue const hi  = BitIntValue::fromI64(
+                    std::numeric_limits<std::int64_t>::max(), cw, /*isSigned=*/true);
+                bool const definitionSaysFits =
+                    BitIntValue::compare(val, lo, cw, true) >= 0
+                 && BitIntValue::compare(val, hi, cw, true) <= 0;
+                auto const got = detail::asInt64(v);
+                EXPECT_EQ(got.has_value(), definitionSaysFits)
+                    << "width=" << w << " signed=" << sgn
+                    << " limb0=" << seed[0] << " limbCount=" << seed.size();
+                if (got.has_value() && definitionSaysFits) {
+                    EXPECT_EQ(*got, val.withType(64u, /*newSigned=*/true).asI64())
+                        << "width=" << w << " signed=" << sgn;
+                }
+            }
+        }
+    }
+}
+
+TEST(ConstEvalAsInt64Magnitude, AWideValueWhoseMagnitudeFitsBridges) {
+    // The row's own repros, at the unit tier. Each is a value living in a 128-bit
+    // (or 200-bit) container whose MAGNITUDE is small -- exactly the shape the
+    // width test refused and both reference compilers accept.
+    EXPECT_EQ(detail::asInt64(wideLit({3}, 128, true, TypeKind::I128)), 3LL);
+    EXPECT_EQ(detail::asInt64(wideLit({3}, 128, false, TypeKind::U128)), 3LL);
+    EXPECT_EQ(detail::asInt64(wideLit({5}, 200, false, TypeKind::BitInt)), 5LL);
+    // A NEGATIVE wide value: every limb above 0 is the sign fill, so it fits.
+    EXPECT_EQ(detail::asInt64(wideLit({0xFFFFFFFFFFFFFFFDULL,
+                                       0xFFFFFFFFFFFFFFFFULL}, 128, true,
+                                      TypeKind::I128)),
+              -3LL);
+    // The two exact edges of the int64 range, at a 128-bit width.
+    EXPECT_EQ(detail::asInt64(wideLit({0x7FFFFFFFFFFFFFFFULL}, 128, false,
+                                      TypeKind::U128)),
+              std::numeric_limits<std::int64_t>::max());
+    EXPECT_EQ(detail::asInt64(wideLit({0x8000000000000000ULL,
+                                       0xFFFFFFFFFFFFFFFFULL}, 128, true,
+                                      TypeKind::I128)),
+              std::numeric_limits<std::int64_t>::min());
+}
+
+TEST(ConstEvalAsInt64Magnitude, AWideValueThatDoesNotFitStillRefuses) {
+    // ★★ THE INVARIANT THE ROW EXISTS TO PROTECT. A value that exceeds int64 must
+    // nullopt so the ICE slot fails LOUD; it must never contribute its low 64 bits.
+    // The trap value is 2^100 + 3, whose low 64 bits are EXACTLY 3 -- so a
+    // `low64()` narrowing and a correct refusal give DIFFERENT answers here, which
+    // a rounder 2^100 could not distinguish (its low 64 bits are zero, and a
+    // zero-length array is also a refusal).
+    EXPECT_FALSE(detail::asInt64(wideLit({3, std::uint64_t{1} << 36}, 128, true,
+                                         TypeKind::I128)).has_value())
+        << "2^100+3 must never bridge as 3";
+    // Just one bit past the int64 range in each direction.
+    EXPECT_FALSE(detail::asInt64(wideLit({0x8000000000000000ULL}, 128, false,
+                                         TypeKind::U128)).has_value())
+        << "INT64_MAX+1 as an unsigned 128-bit value does not fit a signed int64";
+    EXPECT_FALSE(detail::asInt64(wideLit({0x7FFFFFFFFFFFFFFFULL,
+                                          0xFFFFFFFFFFFFFFFFULL}, 128, true,
+                                         TypeKind::I128)).has_value())
+        << "INT64_MIN-1 does not fit";
+    // 2^64 exactly: limb 0 is ZERO, so a bridge that only looked at limb 0 would
+    // hand back a legal-looking 0 and silently produce a zero-length array.
+    EXPECT_FALSE(detail::asInt64(wideLit({0, 1}, 128, false,
+                                         TypeKind::U128)).has_value())
+        << "2^64 must never bridge as 0";
+}
+
+TEST(ConstEvalAsInt64Magnitude, NarrowBitIntBehaviourIsBitIdentical) {
+    // A `_BitInt(N≤64)` value has exactly one limb, so the magnitude scan's loop
+    // body never runs and the answer is `asI64()` -- byte-for-byte what shipped
+    // before. This pins that the change is confined to N>64 and cannot have moved
+    // any of the shipped `c23_bitint_*` behaviour.
+    EXPECT_EQ(detail::asInt64(wideLit({30}, 8, true, TypeKind::BitInt)), 30LL);
+    EXPECT_EQ(detail::asInt64(wideLit({0xFFFFFFFFFFFFFFFDULL}, 8, true,
+                                      TypeKind::BitInt)),
+              -3LL);
+    EXPECT_EQ(detail::asInt64(wideLit({0x7FFFFFFFFFFFFFFFULL}, 64, true,
+                                      TypeKind::BitInt)),
+              std::numeric_limits<std::int64_t>::max());
+}
+
+TEST(ConstEvalAsInt64Magnitude, AnUnsignedWideValueNeverBridgesToANegative) {
+    // ★★ THE BUG THE CROSS-CHECK FOUND, kept as its own named pin because it is the
+    // one shape where "the upper limbs repeat bit 63" is TRUE and the answer is
+    // still NO. `(__uint128_t)-1` is 2^128-1: every limb is ones, so a scan that
+    // only compared the upper limbs against the sign extension of bit 63 accepted
+    // it and handed back -1 -- turning `enum { EA = (__uint128_t)-1 };` into a
+    // negative enumerator with no diagnostic. An unsigned value is never negative
+    // however its bits read.
+    EXPECT_FALSE(detail::asInt64(wideLit({0xFFFFFFFFFFFFFFFFULL,
+                                          0xFFFFFFFFFFFFFFFFULL}, 128, false,
+                                         TypeKind::U128)).has_value())
+        << "(__uint128_t)-1 must never bridge, least of all as -1";
+    // The SIGNED twin of the identical bit pattern IS -1 and must still bridge --
+    // otherwise the pin above could be satisfied by refusing all-ones outright.
+    EXPECT_EQ(detail::asInt64(wideLit({0xFFFFFFFFFFFFFFFFULL,
+                                       0xFFFFFFFFFFFFFFFFULL}, 128, true,
+                                      TypeKind::I128)),
+              -1LL);
+    // Same rule at a width that fits in ONE limb: this is the `uint64_t` arm's
+    // own contract ("nullopt above INT64_MAX") finally applied to the arm that
+    // used to contradict it.
+    EXPECT_FALSE(detail::asInt64(wideLit({0x8000000000000000ULL}, 64, false,
+                                         TypeKind::BitInt)).has_value())
+        << "an unsigned _BitInt(64) above INT64_MAX must not bridge to INT64_MIN";
 }

@@ -534,7 +534,7 @@ struct StrictArmVerdictsSetting {
 // ── The ledger ─────────────────────────────────────────────────────────────
 
 struct ArmVerdictRecord {
-    std::string example;  // "c-subset/<name>" — stable across both harnesses
+    std::string example;  // "c/<name>" — stable across both harnesses
     std::string spec;     // the manifest's declared target spec
     std::string arm;      // "baseline" or an optimizedPipelines label
     ArmVerdict  verdict = ArmVerdict::Poisoned;
@@ -692,7 +692,7 @@ private:
 
 // One declared (target arm × runOn OS) pair, flattened out of a manifest.
 struct DeclaredArm {
-    std::string manifest;  // stable id for the message, e.g. "c-subset/<name>"
+    std::string manifest;  // stable id for the message, e.g. "c/<name>"
     std::string spec;
     std::string runOnOs;   // ONE OS name from the target's `runOn`
     std::string emulator;  // "" ⇒ none declared

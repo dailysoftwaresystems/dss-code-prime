@@ -6,8 +6,24 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 - **★★★ THE BUILD IS VERIFIABLE — run this BEFORE trusting any ctest result:**
 
   ```bash
-  python scripts/check-ninja-deps/check-ninja-deps.py build-dbg
+  python scripts/check-ninja-deps/check-ninja-deps.py            # no argument: it finds the tree
+  python scripts/check-ninja-deps/check-ninja-deps.py build/p29-x  # or name YOUR lane's tree
   ```
+
+  ⚠⚠ **THIS LINE USED TO READ `… check-ninja-deps.py build-dbg`, AND THAT PATH HAS NOT EXISTED SINCE
+  THE ONE-ROOT `build/` MIGRATION.** ✔MEASURED 2026-08-23 at `6dc63be0`: the tool printed
+  `SKIP build-dbg -- no build.ninja` and exited **0**, so a cycle following this reference verbatim
+  ran the build-verifiability check against a nonexistent directory and read `rc=0` as a pass.
+  Both halves are fixed: the invocation above, and the tool — a named directory that does not exist
+  is now **exit 2**, never a skip (`D-GATE-NINJA-DEPS-EXITS-ZERO-ON-A-DIRECTORY-THAT-DOES-NOT-EXIST`).
+  A directory that exists but is not a ninja tree is also exit 2 unless you pass `--allow-non-ninja`,
+  which prints a SKIP naming the flag — an unasked-for skip is indistinguishable from a pass.
+  ⓘ The no-argument form auto-picks `build/dbg`, else the pre-migration `build-dbg`, else fails loud
+  on `build/dbg`. **Name your own tree when you are a lane** — the whole point is to verify the tree
+  the ctest result came from.
+  ⓘ Its `--self-test` (7 parser cases + 5 target-verdict cases) now rides ctest as
+  `ninja_deps_selftest_guard`. The PROBE form still cannot be a ctest entry: it needs a build
+  directory, and a source checkout has none.
 
   A green ctest proves nothing about the current source if the objects it linked were never
   rebuilt, and that is not hypothetical here: `ninja -t deps` has twice reported `#deps 0` on
@@ -46,6 +62,54 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   (there were two unrelated `ctest.exe` processes running from `C:\Program Files\CMake\bin`). (2) Do
   NOT edit a poisoned log to annotate it; drop a `*.POISONED.README.txt` marker beside it. Editing the
   evidence is how a suspect log later gets read as a clean one.
+- ★★★ **AND IT IS NOT ABOUT BUILDS — IT IS ABOUT ANY SHARED INPUT MOVING UNDER A
+  RUN. ✔MEASURED 2026-08-24 (cycle P31, lane G): a gate reported 1102 passed / 501 FAILED
+  WITH NOTHING BUILDING AT ANY POINT.** `src/dss-config/sources/c.lang.json` was rewritten in
+  place while that lane's own gate was reading it, and every example after that instant died
+  with `[arm-ledger] … 4 poisoned (of 4 declared arms)`, `compiled=- spawned=- ran=-` —
+  not compiled, not attempted; 4857 `C_MalformedJson` / `D_SchemaLoadFailed`. The re-run on a
+  quiesced tree: **1602 of 1603**, the one failure an unrelated anchor-registry debt.
+  ★★ **AND THE WRITER WAS A PAIR OF HANDS, NOT A SCRIPT — WHICH IS THE WHOLE
+  DIFFERENCE BETWEEN "FIX THE PROBES" AND "FIX EVERY WRITER".** The orchestrator inferred a
+  cut-probe from the probes sitting in that lane's scratchpad; the lane MEASURED it and
+  refuted the attribution: every cut probe's last write was 15:48:45, the gate started at
+  15:59, and the 16:06:02 mtime was a DIRECT, hand-run config restructure done with a plain
+  `open(path,"wb")` mid-gate. ⇒ the repair is a single atomic-write helper that EVERY
+  writer goes through, hand-run edits included. ⚠ And atomicity removes the torn READ; it
+  does not license writing a shipped document during a gate at all.
+  ⇒ the build output is only ONE of the shared inputs a run depends on. The shipped
+  config tree is another, and `.plans/**` is a third for every guard that takes it as a
+  subject.
+  ★★ **THE TELL IS A CLIFF, AND IT IS WORTH KNOWING BEFORE YOU SPEND AN HOUR.** A
+  mid-run tear produces a CONTIGUOUS run of failures that starts at one point in the sequence
+  and NEVER RECOVERS — here `examples/c/concat_wchar_widen_width` passed at sequence 1101
+  and `examples/c/cond_init_release` failed at 1102, with every entry after it red. A genuine
+  regression scatters across the entries that exercise it, wherever they happen to fall in the
+  order. Extract the sequence before reading any single failure:
+      grep -oE "^ *[0-9]+/[0-9]+ Test +#[0-9]+: [^ ]+ .*" <log> \
+        | awk '{n=$1; sub(/\/[0-9]+/,"",n); print n, (/Failed/?"F":"P"), $3, $4}'
+  ★ **THEN TAKE THE CONTROL, WHICH IS CHEAPER THAN DIAGNOSING ONE RED.** Run the
+  suspect's own binary against the live tree NOW: if a trivial input compiles to exit 0, there
+  is no standing regression and the log is void — ✔that is exactly what settled the case
+  above, in one command, against 501 failures.
+- ★★★ **A WRAPPER CANNOT REPORT ITS VERDICT IF YOU APPEND A COMMAND AFTER IT — AND THE
+  FAILURE IS SILENT AND FLATTERING.** ✔MEASURED 2026-08-24 (cycle P31,
+  `D-CYCLE-A-TRAILING-ECHO-REPLACED-A-FAILED-GATE-S-EXIT-CODE-WITH-ZERO`): the fold gate
+  exited **8** with `stale_refusal_citations_guard` RED, and the background-task notification
+  said **`completed (exit code 0)`**. The invocation ended `…; echo "RUNGATE_EXIT=$?"`. The
+  echo read the code CORRECTLY and printed `RUNGATE_EXIT=8` — and then, being the last
+  command in the compound, **became the terminal state**, which is the one thing the
+  notification channel carries. ★ **The instinct was right and the placement destroyed the
+  signal it existed to make visible.**
+  ⇒ **Never append a command after `run-gate.sh`.** Its last line is already the verdict.
+  Where a witness line is genuinely wanted, PRESERVE the code across it:
+  `…; rc=$?; echo "RUNGATE_EXIT=$rc"; exit "$rc"`.
+  ⚠ **This is the standing watcher rule one hop further out.** *"A watcher must observe every
+  terminal state on the channel it polls"* is usually read as "watch the right channel"; this
+  case is the other half — **do not move the terminal state OFF that channel at the last
+  hop.** ⓘ It was caught only because the log was read before the notification was believed.
+  Nothing enforced that, which is exactly why it is written down here.
+
 - **no NEW `abort()` in test code:**
 
   ```bash
@@ -235,7 +299,7 @@ Keep the plans honest in the **same commit** as the code:
 - Update plan 00 §0 status table + §0.1 stepper row (flip status, update ctest count).
 - Update the owning sub-plan: flip the §0 status row AND stamp the §3.1 deferred-items row
   (status flip in §0; `✅ CLOSED` stamp in §3.1 — update both, not one).
-- In `_deferred-anchor-registry.md`: mark closed anchors `✅ CLOSED <date>` with the commit;
+- In `_deferred-anchor-registry*.md`: mark closed anchors `✅ CLOSED <date>` with the commit;
   **never delete a row** (the audit trail is load-bearing); add new anchors.
 - Record the cycle in the running cycle-log (memory entry per the established convention).
 - Update the `dss-code-prime` skill if a convention changed.
@@ -248,6 +312,36 @@ get, along with our defined priorities."*
 
 **Path: `.plans/_handoff.md`.** One file, rewritten in place each cycle — never a per-cycle copy,
 never a dated sibling. If it does not exist, **create it this cycle**.
+
+##### ⛔ REWRITE IT ENCODE-FIRST AND REPLACE ATOMICALLY — never open the real file for writing
+
+✔MEASURED 2026-08-24 (cycle P29, `D-CYCLE-HANDOFF-PATCHER-TRUNCATES-ITS-TARGET-BEFORE-IT-CAN-FAIL`):
+an orchestrator patch script did `io.open(path, "w", …)` and then `fh.write(...)`. The write raised
+on a lone surrogate pair in one of its own literals — **and `"w"` had already TRUNCATED the file**, so
+a **377 KB handoff became 0 bytes**. It was recovered with `git checkout --` only because the handoff
+had not yet been edited that cycle; ten minutes later that recovery would have destroyed real work.
+
+⇒ **Build the bytes first, then touch the target:**
+
+```python
+data = "\n".join(lines).encode("utf-8")   # any failure lands HERE, target untouched
+tmp = path + ".tmp"
+with io.open(tmp, "wb") as fh:
+    fh.write(data)
+os.replace(tmp, path)                     # atomic
+```
+
+★ **The repository's own scripts already do this** — `check-plan-citations` and
+`check-wrapped-anchor-ids` both write `path + ".tmp"` and `os.replace`, and `check-scripts-index`
+does the same. ⚠ **The gap was in the ORCHESTRATOR's own fold tooling, which no guard covers**, and
+that is the general shape: the cycle's throwaway scripts hold the same power over the tree as the
+registered ones and none of the discipline. A scratch script that rewrites a tracked file is subject
+to every rule a shipped one is.
+
+⚠ **And a lone surrogate pair is a real hazard here, not a curiosity.** `"🔵"` written as
+two `\u` escapes is not a character — it is two unpaired surrogates, and it encodes to nothing. The
+status glyphs this project uses are astral (🔵 is `U+1F535`), so **write them as the literal glyph or
+as a single `\U0001F535`**, never as a surrogate pair.
 
 It answers exactly five questions, in this order, and nothing else:
 
@@ -275,10 +369,10 @@ The handoff is the only channel between them, so it carries — **measured, not 
   one is THIS branch**; a reader who cannot tell ours from theirs will rebase the wrong way.
 - For each *other* active PR: `gh pr view <n> --json files` → the **overlap set** with what this
   cycle touched. Name the individual files, not a count — "59 files" tells a rebaser nothing;
-  `.plans/_deferred-anchor-registry.md`, `src/link/format/macho.cpp` tells them everything.
+  `.plans/_deferred-anchor-registry*.md`, `src/link/format/macho.cpp` tells them everything.
 - **What that branch is DOING** — its goal in one line, so its edits are interpretable rather than
   merely conflicting. A conflict you understand is a merge; one you do not is a coin flip.
-- ⚠ **Call out the known-hot files explicitly.** `_deferred-anchor-registry.md` is edited by every
+- ⚠ **Call out the known-hot files explicitly.** `_deferred-anchor-registry*.md` is edited by every
   session every cycle and is the most likely conflict in the repo. Plan 00 and the shared
   `CMakeLists.txt`/`parse_diagnostic.hpp` slot tables are next.
 - 📄 **Restate the staging rule**, because it is the mitigation: **stage by explicit path, never
@@ -313,7 +407,7 @@ what makes "two cycles running shipped on one leg" visible as a pattern instead 
   someone with no context, which is precisely when an unlabelled inference does the most damage.
 - **Name what is NOT known and NOT run.** "WSL and native-arm64 legs not run" belongs in the
   handoff louder than anything that passed. The reader's first question is what to trust.
-- **It does not duplicate the registry.** Anchors live in `_deferred-anchor-registry.md`; the
+- **It does not duplicate the registry.** Anchors live in `_deferred-anchor-registry*.md`; the
   handoff carries only the *few* that gate the next cycle, by name, with a link.
 - **Keep it short enough to be read in full** — target one screen per section. If a section
   cannot be compressed, that is a signal the project has more open fronts than priorities, and

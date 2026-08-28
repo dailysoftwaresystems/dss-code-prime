@@ -34,7 +34,7 @@ TypeInterner makeInterner() { return TypeInterner{dss::CompilationUnitId{1}}; }
 } // namespace
 
 TEST(HirDecl, FunctionCarriesSigParamsAndBody) {
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);  // int f(int)
@@ -57,7 +57,7 @@ TEST(HirDecl, FunctionCarriesSigParamsAndBody) {
 }
 
 TEST(HirDecl, MultiParamFunctionParamsAreOrderedAndExcludeBody) {
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32, i32, i32}, i32, CallConv::CcSysV);
@@ -86,7 +86,7 @@ TEST(HirDecl, EmptyModuleHasNoDecls) {
 }
 
 TEST(HirDecl, ZeroParamFunctionIsBodyOnly) {
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     TypeInterner ti = makeInterner();
     TypeId const voidT = ti.primitive(TypeKind::Void);
     TypeId const fnTy  = ti.fnSig({}, voidT, CallConv::CcSysV);   // void f(void)
@@ -100,7 +100,7 @@ TEST(HirDecl, ZeroParamFunctionIsBodyOnly) {
 }
 
 TEST(HirDecl, GlobalWithAndWithoutInit) {
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
     HirNodeId const init = b.makeLiteral(i32);
@@ -117,7 +117,7 @@ TEST(HirDecl, GlobalWithAndWithoutInit) {
 }
 
 TEST(HirDecl, TypeDeclIsLeafCarryingType) {
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
     HirNodeId const td = b.makeTypeDecl(i32, /*symbol=*/4);   // typedef int MyInt;
@@ -130,7 +130,7 @@ TEST(HirDecl, TypeDeclIsLeafCarryingType) {
 }
 
 TEST(HirDecl, ExternFunctionHasParamsNoBody) {
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
@@ -147,7 +147,7 @@ TEST(HirDecl, ExternFunctionHasParamsNoBody) {
 
 TEST(HirDecl, ExternMayBeUntyped) {
     // 11-ffi-plan binary-only ingestion can yield an extern with no resolved type.
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const ef = b.makeExternFunction(dss::InvalidType, /*symbol=*/7, {});
     HirNodeId const eg = b.makeExternGlobal(dss::InvalidType, /*symbol=*/8);
     HirNodeId const mod = b.makeModule(std::array{ef, eg});
@@ -159,7 +159,7 @@ TEST(HirDecl, ExternMayBeUntyped) {
 }
 
 TEST(HirDecl, ImportGroupGroupsMembers) {
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     TypeInterner ti = makeInterner();
     TypeId const fnTy = ti.fnSig({}, ti.primitive(TypeKind::Void), CallConv::CcSysV);
     HirNodeId const ef = b.makeExternFunction(fnTy, /*symbol=*/9, {});
@@ -174,7 +174,7 @@ TEST(HirDecl, ImportGroupGroupsMembers) {
 }
 
 TEST(HirDecl, FfiMetadataBindsToExternNodes) {
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
@@ -206,7 +206,7 @@ TEST(HirDeclDeathTest, FunctionBodyOnBodylessFunctionAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     // A 0-child Function is malformed (arity {1,∞}); functionBody must abort loud
     // rather than read past the (empty) child span.
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const fn = b.addParent(HirKind::Function, {}, dss::InvalidType, /*payload=*/1);
     Hir h = std::move(b).finish(fn);
     EXPECT_DEATH({ (void)h.functionBody(fn); }, "has no body child");
@@ -214,7 +214,7 @@ TEST(HirDeclDeathTest, FunctionBodyOnBodylessFunctionAborts) {
 
 // Cross-check: declaration helpers honor the childArity single-source-of-truth.
 TEST(HirDecl, HelpersSatisfyChildAritySpec) {
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig({}, i32, CallConv::CcSysV);

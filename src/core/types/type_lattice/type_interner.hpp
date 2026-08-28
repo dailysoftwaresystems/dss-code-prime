@@ -127,7 +127,19 @@ public:
     [[nodiscard]] std::size_t  nodeCount() const noexcept { return arena_.size(); }
 
     // ── canonicalizing builders ──
-    // primitive: a leaf kind (Bool/I*/U*/F*/Char/Byte/Void) — no operands/scalars.
+    // primitive: a LEAF kind — no operands, no scalars, no name. `kind` MUST
+    // satisfy `isPrimitiveTypeKind` (core_type.hpp), and the builder REFUSES
+    // anything else loudly rather than interning a malformed record — a
+    // fieldless "struct", an element-less "complex" — that would fail at some
+    // later consumer instead of at the call that made it
+    // (D-LATTICE-PRIMITIVE-BUILDER-ACCEPTS-A-NON-PRIMITIVE-KIND).
+    //
+    // ⚠ THE SET IS CITED, NOT LISTED. This comment used to read "a leaf kind
+    // (Bool/I*/U*/F*/Char/Byte/Void)" — a prose retype of the predicate's
+    // membership, and it was already a name SHORT (`NullptrT` is a leaf kind
+    // and `primitive` builds it). A second owner of a closed set drifts, and a
+    // reader who takes the prose instead of the predicate reaches for the wrong
+    // builder. One owner: `isPrimitiveTypeKind`.
     TypeId primitive(TypeKind kind);
     // D-LANG-TYPE-IDENTITY-VOCABULARY: a NAMED primitive — the same leaf kind
     // carrying a language-declared VOCABULARY tag. Identity comes from the
@@ -550,6 +562,38 @@ public:
     // encode scalars=[(int)cc] only — `fnIsVariadic` returns false
     // for them (scalar count < 2 → no variadic encoding present).
     [[nodiscard]] bool                     fnIsVariadic(TypeId id) const;
+
+    // ── THE OBJECT-REPRESENTATION PROJECTION (D-CSUBSET-NULLPTR-T-DECLARABLE) ──
+    //
+    // "What does an OBJECT of `id` look like in storage and in a register?" — the
+    // type the REALIZATION tiers (HIR → MIR → LIR → codegen) must see, as distinct
+    // from the type the SEMANTIC tier reasons about. For all but one kind the two
+    // coincide and this query is IDENTITY, returning the very TypeId it was given;
+    // C23 `nullptr_t` is the exception, and that exception is the entire reason the
+    // kind exists — it must stay a DISTINCT type for `_Generic` and for the one-way
+    // conversion rules, while being a plain pointer everywhere below.
+    //
+    // ★★ THIS IS THE SAME MOVE `reprKind` (Enum → underlying integer) AND
+    // `bitIntContainerKind` (`_BitInt(N≤64)` → its native container) ALREADY MAKE,
+    // one tier higher. Enum and `_BitInt` may reach MIR and are projected at the LIR
+    // width tier; NullptrT may NOT — `I_NullptrTypeInMir` refuses it and `mir_text`
+    // omits its spelling as a stated contract — so its projection has to land at the
+    // semantic→realization boundary instead. Clang draws the line in exactly the
+    // same place (`ConvertType(BuiltinType::NullPtr)` yields an LLVM pointer), which
+    // is what lets a type with ONE value need no register class, no ABI class and no
+    // width row of its own.
+    //
+    // ⚠ THIS IS A PROJECTION, NOT A MERGE. `nullptr_t` and `void *` remain two
+    // TypeIds; nothing here makes them compare equal, and the semantic tier must
+    // keep asking `kind(id) == NullptrT` on the UNPROJECTED type.
+    //
+    // ⚠ IT STOPS AT NOMINAL TYPES (Struct/Union/Enum): rebuilding one would mint a
+    // different type. A `nullptr_t` MEMBER keeps its declared type on the composite
+    // and is projected where the member is ACCESSED; the layout tier needs nothing,
+    // because `scalarByteSize`'s NullptrT arm already returns the pointer width.
+    //
+    // Not `const`: a projected composite is interned on the way out.
+    [[nodiscard]] TypeId representationType(TypeId id);
 
     // ── promotion / coercion (C99 "usual arithmetic conversions") ──
     // The common arithmetic type two operands are coerced to before a binary

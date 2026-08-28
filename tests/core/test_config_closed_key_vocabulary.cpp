@@ -137,51 +137,51 @@ struct Block {
 // re-validated on every run by `injectAt`.
 constexpr Block kBlocks[] = {
     // ── document / reference surface ──
-    {"c-subset", "/language",                        "the 'language' block"},
+    {"c", "/language",                        "the 'language' block"},
     {"asm-arm64-gas", "/languageReferences/asm",     "a 'languageReferences' entry"},
     // ── lexical surface ──
-    {"c-subset", "/keywords/0",                      "a 'keywords' entry"},
+    {"c", "/keywords/0",                      "a 'keywords' entry"},
     {"asm-arm64-gas", "/lexerModes/line-comment/defaultToken",
                                                      "a 'defaultToken' object"},
     {"asm-arm64-gas", "/identifierClass",            "the 'identifierClass' block"},
     {"asm-arm64-gas", "/numberStyle",                "the 'numberStyle' block"},
-    {"c-subset", "/numberStyle/exponent",            "an 'exponent' block"},
+    {"c", "/numberStyle/exponent",            "an 'exponent' block"},
     {"asm-arm64-gas", "/numberStyle/integerPrefixes/0",
                                                      "an 'integerPrefixes' entry"},
-    {"c-subset", "/numberStyle/integerPrefixes/0/float",
+    {"c", "/numberStyle/integerPrefixes/0/float",
                                                      "a prefix's 'float' block"},
     {"asm-arm64-gas", "/numberStyle/emitKind",       "the 'emitKind' block"},
     // ── grammar surface ──
-    {"c-subset", "/shapes/expression/expr",          "an 'expr' body"},
-    {"c-subset", "/shapes/expression/expr/wrapperRules",
+    {"c", "/shapes/expression/expr",          "an 'expr' body"},
+    {"c", "/shapes/expression/expr/wrapperRules",
                                                      "a 'wrapperRules' object"},
-    {"c-subset", "/shapes/enumTypeSpecifier/commitRequiresTypeName",
+    {"c", "/shapes/enumTypeSpecifier/commitRequiresTypeName",
                                                      "a 'commitRequiresTypeName' guard"},
     // ── preprocess ──
-    {"c-subset", "/preprocess/pragmaEffects/0",      "a 'pragmaEffects' row"},
+    {"c", "/preprocess/pragmaEffects/0",      "a 'pragmaEffects' row"},
     // ── semantics ──
-    {"c-subset", "/semantics",                       "the 'semantics' block"},
-    {"c-subset", "/semantics/declarators",           "the 'declarators' block"},
-    {"c-subset", "/semantics/declarations/0",        "'declarations[0]'"},
-    {"c-subset", "/semantics/declarations/2/gatedMarkers/0",
+    {"c", "/semantics",                       "the 'semantics' block"},
+    {"c", "/semantics/declarators",           "the 'declarators' block"},
+    {"c", "/semantics/declarations/0",        "'declarations[0]'"},
+    {"c", "/semantics/declarations/2/gatedMarkers/0",
                                                      "a 'gatedMarkers' entry"},
-    {"c-subset", "/semantics/declarations/7/entryFunctions/main/0",
+    {"c", "/semantics/declarations/7/entryFunctions/main/0",
                                                      "an 'entryFunctions' shape"},
-    {"c-subset", "/semantics/attributeSemantics",    "the 'attributeSemantics' block"},
-    {"c-subset", "/semantics/attributeSemantics/effects/0",
+    {"c", "/semantics/attributeSemantics",    "the 'attributeSemantics' block"},
+    {"c", "/semantics/attributeSemantics/effects/0",
                                                      "an 'effects' row"},
-    {"c-subset", "/semantics/typeSpecifiers/0",      "a 'typeSpecifiers' entry"},
-    {"c-subset", "/semantics/integerLiteralTyping/0",
+    {"c", "/semantics/typeSpecifiers/0",      "a 'typeSpecifiers' entry"},
+    {"c", "/semantics/integerLiteralTyping/0",
                                                      "an 'integerLiteralTyping' entry"},
-    {"c-subset", "/semantics/floatLiteralTyping/0",  "a 'floatLiteralTyping' entry"},
-    {"c-subset", "/semantics/parameters",            "the 'parameters' block"},
-    {"c-subset", "/semantics/arithmeticConversions", "the 'arithmeticConversions' block"},
-    {"c-subset", "/semantics/arithmeticConversions/integerPromotion",
+    {"c", "/semantics/floatLiteralTyping/0",  "a 'floatLiteralTyping' entry"},
+    {"c", "/semantics/parameters",            "the 'parameters' block"},
+    {"c", "/semantics/arithmeticConversions", "the 'arithmeticConversions' block"},
+    {"c", "/semantics/arithmeticConversions/integerPromotion",
                                                      "the 'integerPromotion' block"},
-    {"c-subset", "/semantics/synthesizedTypes",      "the 'synthesizedTypes' block"},
-    {"c-subset", "/semantics/pointerConversions",    "the 'pointerConversions' block"},
-    {"c-subset", "/semantics/pointerAliasing",       "the 'pointerAliasing' block"},
-    {"c-subset", "/semantics/builtinFunctions/0",    "a 'builtinFunctions' entry"},
+    {"c", "/semantics/synthesizedTypes",      "the 'synthesizedTypes' block"},
+    {"c", "/semantics/pointerConversions",    "the 'pointerConversions' block"},
+    {"c", "/semantics/pointerAliasing",       "the 'pointerAliasing' block"},
+    {"c", "/semantics/builtinFunctions/0",    "a 'builtinFunctions' entry"},
     // ── pipeline entry + assembly dialect surface ──
     {"asm-arm64-gas", "/pipelineEntry",              "the 'pipelineEntry' block"},
     {"asm-arm64-gas", "/pipelineEntry/byRule/0",     "a 'byRule' row"},
@@ -192,11 +192,11 @@ constexpr Block kBlocks[] = {
                                                      "an 'operandSelectors' entry"},
     {"asm-arm64-gas", "/assembly/directives/0",      "a 'directives' row"},
     // ── the predefined-macro loader, reached through a language document ──
-    {"c-subset", "/preprocess/predefinedMacros/0",   "a 'predefinedMacros' entry"},
+    {"c", "/preprocess/predefinedMacros/0",   "a 'predefinedMacros' entry"},
 };
 
 // Every language document a row above names, once.
-constexpr char const* kLanguages[] = {"c-subset", "asm-arm64-gas"};
+constexpr char const* kLanguages[] = {"c", "asm-arm64-gas"};
 
 } // namespace
 
@@ -349,14 +349,14 @@ TEST(ClosedKeyVocabulary, DocumentationKeyStaysExemptInEveryObjectOfEveryDocumen
 // pinned rather than merely commented: a `$`-led key in the `tokens` map is a
 // LEXEME, and it loads.
 TEST(ClosedKeyVocabulary, ADollarLedKeyInTheTokensMapIsALexemeNotProse) {
-    auto doc = shippedLanguageDoc("c-subset");
+    auto doc = shippedLanguageDoc("c");
     ASSERT_FALSE(doc["tokens"].contains("$$"))
         << "the probe lexeme must not already be declared, or this asserts "
            "nothing";
     doc["tokens"]["$$"] = nlohmann::json::parse(
         R"([{ "kind": "DollarDollarProbe" }])");
     auto const text = doc.dump();
-    auto       r    = GrammarSchema::loadFromText(text, "c-subset");
+    auto       r    = GrammarSchema::loadFromText(text, "c");
     EXPECT_TRUE(r.has_value())
         << "`$` is an ordinary operator character in a configured language; "
            "reserving it in the lexeme key space would DELETE a legal spelling:"
@@ -395,12 +395,12 @@ TEST(ClosedKeyVocabulary, ImpliedSurfaceRefusesASiblingArmsKeyByNamingThatArm) {
     // `reason` is a REAL key — of the `claims-nothing` arm. Under `surface` the
     // parse code never reads it, so accepting it would ship a claim nobody
     // checks.
-    auto        doc = shippedLanguageDoc("c-subset");
+    auto        doc = shippedLanguageDoc("c");
     auto const  i   = firstMacroWithKind(doc, "surface");
     doc["preprocess"]["predefinedMacros"][i]["impliedSurface"]["reason"] =
         "arch-property";
     auto const text = doc.dump();
-    auto       r    = GrammarSchema::loadFromText(text, "c-subset");
+    auto       r    = GrammarSchema::loadFromText(text, "c");
     ASSERT_FALSE(r.has_value())
         << "a 'claims-nothing' key on a 'surface' impliedSurface is UNREACHABLE "
            "and must be refused, not ignored";
@@ -414,12 +414,12 @@ TEST(ClosedKeyVocabulary, ImpliedSurfaceRefusesASiblingArmsKeyByNamingThatArm) {
 TEST(ClosedKeyVocabulary, ImpliedSurfaceRefusesTheOtherDirectionToo) {
     // The mirror, so the pin asserts the PER-ARM RULE rather than one
     // special-cased key: `headers` belongs to `surface`.
-    auto        doc = shippedLanguageDoc("c-subset");
+    auto        doc = shippedLanguageDoc("c");
     auto const  i   = firstMacroWithKind(doc, "claims-nothing");
     doc["preprocess"]["predefinedMacros"][i]["impliedSurface"]["headers"] =
         nlohmann::json::array();
     auto const text = doc.dump();
-    auto       r    = GrammarSchema::loadFromText(text, "c-subset");
+    auto       r    = GrammarSchema::loadFromText(text, "c");
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(says(r.error(), "unknown key 'headers'")) << summarize(r.error());
     EXPECT_TRUE(says(r.error(), "of the 'surface' arm")) << summarize(r.error());
@@ -429,11 +429,11 @@ TEST(ClosedKeyVocabulary, ImpliedSurfaceStillRefusesAPlainTypoWithItsOwnArmsList
     // A key belonging to NO arm gets the ordinary refusal — the cross-arm
     // sentence must not be the only way to fail, and the allowed list rendered
     // must be the DECLARED arm's, never the union.
-    auto        doc = shippedLanguageDoc("c-subset");
+    auto        doc = shippedLanguageDoc("c");
     auto const  i   = firstMacroWithKind(doc, "claims-nothing");
     doc["preprocess"]["predefinedMacros"][i]["impliedSurface"]["raeson"] = "x";
     auto const text = doc.dump();
-    auto       r    = GrammarSchema::loadFromText(text, "c-subset");
+    auto       r    = GrammarSchema::loadFromText(text, "c");
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(says(r.error(), "unknown key 'raeson'")) << summarize(r.error());
     EXPECT_FALSE(says(r.error(), "'headers'"))

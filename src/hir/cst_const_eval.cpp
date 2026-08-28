@@ -174,7 +174,11 @@ combineBinaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& opti
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
     }
-    if (!asInt64(*a.value).has_value() || !asInt64(*b.value).has_value()) {
+    // `asIntBits` -- see the twin guard in const_eval.cpp
+    // (D-HIR-CONSTEVAL-UNSIGNED-WRAPAROUND-NOT-MODULAR). "Is this an integer
+    // operand" is the question here; "does it fit in a signed int64" is not.
+    if (!detail::asIntBits(*a.value).has_value()
+        || !detail::asIntBits(*b.value).has_value()) {
         return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
     }
     ConstEvalFailure why = ConstEvalFailure::None;
@@ -289,6 +293,19 @@ unaryPlan(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
     return CstUnaryPlan{operandN, e};
 }
 
+// P31: is this rule one the config declares as folding to a compile-time value
+// the SEMANTIC tier computed? A linear scan of a list that is 2 entries long in
+// the shipped C document and empty in every other language — the same shape and
+// the same cost as the rule-id comparisons around it, and a set would buy
+// nothing but a second representation of a two-element list.
+[[nodiscard]] bool
+isFoldedConstantRule(HirLoweringConfig const& cfg, RuleId rule) {
+    for (RuleId r : cfg.foldedConstantRules) {
+        if (r.valid() && r.v == rule.v) return true;
+    }
+    return false;
+}
+
 // Resolve a transparent WRAPPER node to its single child to descend into (the
 // deep-parens axis `((((expr))))`), IFF it is NOT one of the rule-dispatched
 // arms (sizeof / binary / unary / ternary) — those are matched first in
@@ -314,7 +331,16 @@ wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
         // a type-ref or follower child the peel would mishandle — keep them for
         // evalNode's address arms (mirror sizeof).
         (cfg.castRule.valid()        && rule.v == cfg.castRule.v)        ||
-        (cfg.postfixExprRule.valid() && rule.v == cfg.postfixExprRule.v);
+        (cfg.postfixExprRule.valid() && rule.v == cfg.postfixExprRule.v)  ||
+        // P31: `__builtin_choose_expr` has THREE meaningful Internal children, so
+        // the peel declines it anyway — but naming it here states the reason
+        // (evalNode owns it) instead of relying on a child count that a future
+        // grammar edit could change underneath.
+        (cfg.chooseExprRule.valid()  && rule.v == cfg.chooseExprRule.v)
+        // P31: `__builtin_offsetof` / `__builtin_types_compatible_p` — each has a
+        // castTypeRef child the peel would descend into and then reject as
+        // non-constant, exactly the sizeof hazard one row up.
+        || isFoldedConstantRule(cfg, rule);
     if (isDispatched) return NodeId{};
     NodeId onlyInternal{};
     int    internalCount = 0;
@@ -582,6 +608,46 @@ evalNode(NodeId                              expr,
         return ok(std::move(v));
     }
 
+    // P31 ([[D-FFI-OFFSETOF-MACRO]] + `__builtin_types_compatible_p`): the
+    // compile-time-answer operators in a const-expr context — the canonical use,
+    // since `_Static_assert(offsetof(struct S, b) == 4, "")` is what a real
+    // header writes. Dispatched by rule-id ahead of the wrapper-peel for the SAME
+    // reason sizeof is: their one meaningful Internal child is a castTypeRef the
+    // peel would descend into and reject. The VALUE comes from the caller's
+    // `resolveFoldedConstant` closure, which owns the type resolver and the
+    // target's layout params this engine must not depend on. Absent closure or a
+    // failed fold ⇒ NotAConstantExpression (fail loud) — never a zero.
+    if (isFoldedConstantRule(cfg, rule)) {
+        if (!env.resolveFoldedConstant) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        auto const v = env.resolveFoldedConstant(expr);
+        if (!v.has_value()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        HirLiteralValue lit;
+        lit.core  = TypeKind::U64;
+        lit.value = *v;
+        return ok(std::move(lit));
+    }
+
+    // P31: `__builtin_choose_expr` in a const-expr context. The closure hands
+    // back the SELECTED arm and this engine then evaluates ONLY that node, so the
+    // discarded arm is never visited at all — which is why
+    // `__builtin_choose_expr(1, 4, 1/0)` folds to 4 here instead of tripping the
+    // divide-by-zero wall, matching gcc.
+    if (cfg.chooseExprRule.valid() && rule.v == cfg.chooseExprRule.v) {
+        if (!env.resolveChosenExpr) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        auto const arm = env.resolveChosenExpr(expr);
+        if (!arm.has_value() || !arm->valid()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        return evalImpl(*arm, ctx, env, options, currentScopeOpaque,
+                        visitedInitNodes);
+    }
+
     // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): a CAST in a const-expr.
     // Dispatched by rule-id ahead of the wrapper-peel (a cast has a type-ref AND an
     // operand). Folds the offsetof spine's casts: `(T*)0` (int 0 → a NULL address),
@@ -655,11 +721,20 @@ evalNode(NodeId                              expr,
         //
         // ★ WHY THE WIDE RESULT CANNOT TRUNCATE DOWNSTREAM (measured, and the reason
         // reviving this arm is safe): the value it produces rides a 128-bit
-        // `BitIntValue`, and `asInt64` nullopts for `width() > 64`. So the two
-        // 64-bit ICE slots — `asInt64Bridge` (array dimension / static-assert /
-        // enumerator) and the `isInteger` narrowing arm just below — REFUSE a wide
-        // value instead of narrowing it. `int a[(__uint128_t)1 << 100];` fails loud
-        // with S_NonConstantArrayLength; it never becomes a truncated bound.
+        // `BitIntValue`, and `asInt64` admits one only when its VALUE is
+        // representable in an int64 — never merely because the low limb looks
+        // small (D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE). So the two 64-bit ICE
+        // slots — `asInt64Bridge` (array dimension / static-assert / enumerator) and
+        // the `isInteger` narrowing arm just below — REFUSE a value that does not
+        // fit instead of narrowing it. `int a[(__uint128_t)1 << 100];` fails loud
+        // with S_NonConstantArrayLength, and so does the sharper
+        // `int a[((__int128)1 << 100) + 3];`, whose low 64 bits are exactly 3;
+        // neither ever becomes a truncated bound.
+        //   ⓘ WHAT CHANGED, AND WHAT DID NOT: the rule used to be the declared
+        // WIDTH (`width() > 64` ⇒ always nullopt), which ALSO refused
+        // `int a[(__int128)2 + 1];` — a value both gcc 13.3.0 (`-std=c2x`) and
+        // clang 18.1.3 (`-std=c23`) accept. Those now fold. The refusal of values
+        // that genuinely exceed int64 is unchanged, and is what this note is about.
         if (tgt->isInteger && tgt->intBits == 128) {
             auto bv = detail::asBitIntValue(*inner.value);
             if (!bv.has_value()) {
@@ -672,6 +747,27 @@ evalNode(NodeId                              expr,
             return ok(std::move(v));
         }
         if (tgt->isInteger) {
+            // ── THE CAST'S CORE IS ITS DECLARED WIDTH, NOT A GENERIC 64 ─────
+            // D-HIR-CONSTEVAL-UNSIGNED-WRAPAROUND-NOT-MODULAR. Both arms below
+            // used to stamp `I64`/`U64` on EVERY integer cast result whatever
+            // `intBits` said, while `narrowIntToBits` correctly reduced the
+            // VALUE to the declared width. Value and label disagreed, and once
+            // the usual arithmetic conversions started reading the label, the
+            // disagreement became a wrong answer: `(unsigned int)0 - 1u` would
+            // compute its common type as 64-bit and wrap to
+            // 0xffffffffffffffff instead of 0xffffffff.
+            //
+            // ★ THIS IS ROW D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE'S
+            // DEFECT CLASS EXACTLY, one tier up: a result typed from a generic
+            // KIND instead of from the DECLARED type. It stayed invisible for
+            // the same reason -- the widths whose kind and declared type
+            // coincide (I64/U64) worked, so every 64-bit probe passed.
+            // `intKindFromWidth` is the interner-free spelling of the declared
+            // width, and is the same verb `packBitIntResult` already uses.
+            auto const castCore = [&] {
+                return detail::intKindFromWidth(
+                    static_cast<std::uint32_t>(tgt->intBits), tgt->intSigned);
+            };
             if (auto const* a = asAddress(*inner.value)) {
                 // address → integer: legal ONLY for a NULL-base address (a pure
                 // compile-time offset). A symbol-based address is a relocation,
@@ -680,19 +776,69 @@ evalNode(NodeId                              expr,
                     return fail(ConstEvalFailure::NotAConstantExpression, expr);
                 }
                 HirLiteralValue v;
-                v.core  = tgt->intSigned ? TypeKind::I64 : TypeKind::U64;
+                v.core  = castCore();
                 std::int64_t const nv = narrowIntToBits(a->byteOffset, tgt->intBits,
                                                         tgt->intSigned);
                 if (tgt->intSigned) v.value = nv;
                 else                v.value = static_cast<std::uint64_t>(nv);
                 return ok(std::move(v));
             }
-            auto const iv = asInt64(*inner.value);
+            // `asIntBits`: a cast READS its operand's bits and re-labels
+            // them at the declared width -- `(unsigned long long)-1` and
+            // `(long long)0xffffffffffffffffull` are both well-defined C
+            // (6.3.1.3p2), so refusing the operand for not fitting a SIGNED
+            // int64 refused legal conversions.
+            auto iv = detail::asIntBits(*inner.value);
             if (!iv.has_value()) {
-                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+                // ── A WIDE OPERAND NARROWED BY AN EXPLICIT CAST IS NOT A REFUSAL ──
+                // D-CSUBSET-INT128-ICE-CONTEXT-REFUSED / D-CSUBSET-INT128-CONSTFOLD-WIDE.
+                //
+                // `asIntBits` nullopts for a `BitIntValue` wider than 64 bits — the
+                // right answer to ITS question ("what is this value as an int64?").
+                // It is the wrong answer HERE, because the programmer WROTE a
+                // narrowing cast, and C 6.3.1.3p2 defines exactly what that yields:
+                // the value reduced modulo 2^N for an unsigned target, and the
+                // implementation-defined two's-complement answer for a signed one —
+                // which is the very rule `narrowIntToBits` below already implements
+                // for a 64-bit source.
+                //
+                // ✔MEASURED at `301e2a63`, DSS vs clang 18.1.3 (`-std=c23`) and gcc
+                // 13.3.0 (`-std=c2x`), probed SEPARATELY — both references fold all
+                // four, DSS refused all four:
+                //     _Static_assert((int)((__uint128_t)5) == 5, "");        S0029
+                //     _Static_assert((unsigned long long)((__uint128_t)5) == 5, "");
+                //     enum Q { QA = (int)(__int128)7 };                      S0029
+                //     int b[(int)(__uint128_t)4];                            S000B
+                // ★ THE ARM DIRECTLY ABOVE ALREADY DID THIS. A `(_BitInt(8))` target
+                // routes a wide operand through the bignum's own wrap-aware
+                // `convertTo`, so `_Static_assert((_BitInt(8))((__uint128_t)5) == 5)`
+                // was CLEAN while the `int` twin was refused — one law, two arms, and
+                // only one of them knew it. This reuses the SAME verb rather than
+                // adding a second narrowing rule.
+                //
+                // ⚠ THE ROW'S INVARIANT IS UNTOUCHED: "a value exceeding int64 can
+                // never SILENTLY truncate into an ICE". Nothing here is silent — this
+                // path is reached only through a cast the programmer wrote, whose
+                // whole meaning is the narrowing. A BARE wide value used as an array
+                // bound or enumerator still goes through `asInt64`, which admits it
+                // only when its VALUE fits an int64
+                // (D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE), so
+                // `int a[(__uint128_t)1 << 100];` keeps failing loud rather than
+                // becoming a truncated bound.
+                auto wide = detail::asBitIntValue(*inner.value);
+                if (!wide.has_value()) {
+                    return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+                }
+                // Reduce to the low 64 bits FIRST (mod 2^64, exact and total), then
+                // let `narrowIntToBits` apply the declared width exactly as it does
+                // for every other source. Composing the two is the same modular
+                // reduction as converting straight to `intBits`, because `intBits`
+                // here is ≤ 64 (the 128-bit target was handled above).
+                wide->convertTo(64u, /*isSigned=*/false);
+                iv = static_cast<std::int64_t>(wide->low64());
             }
             HirLiteralValue v;
-            v.core  = tgt->intSigned ? TypeKind::I64 : TypeKind::U64;
+            v.core  = castCore();
             std::int64_t const nv = narrowIntToBits(*iv, tgt->intBits, tgt->intSigned);
             if (tgt->intSigned) v.value = nv;
             else                v.value = static_cast<std::uint64_t>(nv);

@@ -1,0 +1,33 @@
+{
+  "$comment": "D-CSUBSET-TYPEOF-VALUE-FORM-RESOLVES-ONLY-FOR-AN-OBJECT-OPERAND (C23 6.7.2.5): `typeof(<expression>)` whose operand is NOT a named object. `examples/c/typeof_basic` — the witness D-CSUBSET-TYPEOF was recorded LANDED on — uses `typeof(base)` with `base` an OBJECT everywhere, so it (and every Typeof* unit test) sat on the WORKING side of a split it could not see. This example takes the LITERAL operand deliberately. Before the fix, MEASURED at 301e2a63 on x86_64:pe64-x86_64-windows-exec: `typeof(1) x = 3.9;` was silently a DOUBLE (sizeof 8 not 4, x*2 == 7 not 6) because the head resolved to nothing and the Pass-2 initializer backfill typed the object from its INITIALIZER; `typeof(uc + 1)` was silently `unsigned char` (1 byte where C 6.3.1.1 promotion says 4); and the parameter / global / array / pointer / typedef / return-type / struct-member positions all REFUSED. gcc 13.3.0 (-std=c2x) and clang 18.1.3 (-std=c23), probed SEPARATELY, both compile and run every line and agree on exit 42. THE EXIT CODE DISCRIMINATES THE OPERAND'S TYPE FROM THE INITIALIZER'S: every value is initialized from a double whose fraction the integer store discards, so a head that adopted the initializer's type keeps the fraction and a head of the wrong integer width wraps — either way a different number. `z` is `argc - 1`, so nothing const-folds away in the release pipeline. exit = v(6) + w(4) + g(6) + t(2) + ap(4) + s.m(9) + c(8) + mm(3) = 42. Data-model-independent (int is 4 bytes under LP64 and LLP64), so one exit code holds on all four targets.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

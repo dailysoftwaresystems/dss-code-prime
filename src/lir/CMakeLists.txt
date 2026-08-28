@@ -5,6 +5,7 @@ add_library(lir OBJECT
     lir_literal_pool.cpp
     lir_liveness.cpp
     lir_pass_util.cpp
+    lir_peephole.cpp
     lir_reg_constraints.cpp
     lir_regalloc.cpp
     lir_rewrite.cpp
@@ -15,7 +16,7 @@ add_library(lir OBJECT
 
 target_include_directories(lir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
-# Aggregated into dss-code-prime-lib via $<TARGET_OBJECTS:lir>. DSS_BUILDING_DLL
+# Aggregated into dsscp-lib via $<TARGET_OBJECTS:lir>. DSS_BUILDING_DLL
 # must live here so DSS_EXPORT decorates with dllexport on MSVC for the .obj
 # files produced here.
 target_compile_definitions(lir PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)

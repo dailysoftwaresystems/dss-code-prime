@@ -3,12 +3,13 @@
 // compiler by driving the real CLI, and derives every % axis live:
 //
 //   1. C-feature battery (probes.mjs) compiled + RUN through the actual
-//      `dss-code-prime` binary on the host target → empirical coverage %,
+//      `dsscp` binary on the host target → empirical coverage %,
 //      a parse→semantic→codegen→runtime funnel, and a miscompile alarm.
 //   2. Cross-target emit/run matrix (5 exec specs) with a canonical program.
 //   3. Plan axis: `.plans/23-full-c-plan - tbd.md` FC-phase ✅/⏳ markers,
 //      cycle-weighted via the calibration table below.
-//   4. Anchor axis: `.plans/_deferred-anchor-registry.md` open vs ✅ rows.
+//   4. Anchor axis: `.plans/_deferred-anchor-registry*.md` open vs ✅ rows
+//      (TWO documents since 2026-08-25: production + tools-harness).
 //   5. Test axis: ctest LastTest.log (or `--ctest` for a live run).
 //   6. Velocity: git commits matching /^v0.0.2/ (one commit per dev cycle
 //      by repo convention) → cycles/day → ETA extrapolation for the
@@ -135,8 +136,31 @@ function findCli() {
     if (!existsSync(explicit)) { console.error(`fatal: --cli path not found: ${explicit}`); process.exit(2); }
     return explicit;
   }
-  const exe = process.platform === 'win32' ? 'dss-code-prime.exe' : 'dss-code-prime';
+  const exe = process.platform === 'win32' ? 'dsscp.exe' : 'dsscp';
+  // ⚠ THIS LIST MATCHED NOTHING IN THIS REPOSITORY, so `dss-state` could not
+  // find a CLI at all and exited 2 before running a single probe. MEASURED
+  // 2026-08-24: the five paths below name `build/bin/dss/`, `build-rel/` and
+  // `build-dbg/`, while the repository's ONE-ROOT build layout puts trees at
+  // `build/<name>/bin/dss/` — `build/dbg`, `build/rel`, `build/lane-a`. The
+  // list predates that layout and nothing re-checked it.
+  //
+  // ★ THE FIX IS TO ENUMERATE THE ROOT RATHER THAN GUESS ITS CHILDREN. Any
+  // directory under `build/` may be a build tree (lane trees are created and
+  // deleted every cycle), so listing names can only ever be right until the
+  // next one appears. The legacy spellings stay, so a checkout still carrying
+  // an old tree keeps working.
+  const buildRoot = join(repoRoot, 'build');
+  const treeCandidates = existsSync(buildRoot)
+    ? readdirSync(buildRoot, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .flatMap((e) => [
+          join(buildRoot, e.name, 'bin', 'dss', exe),
+          join(buildRoot, e.name, 'bin', 'dss', 'Debug', exe),
+          join(buildRoot, e.name, 'bin', 'dss', 'Release', exe),
+        ])
+    : [];
   const candidates = [
+    ...treeCandidates,
     join(repoRoot, 'build', 'bin', 'dss', 'Debug', exe),
     join(repoRoot, 'build', 'bin', 'dss', 'Release', exe),
     join(repoRoot, 'build', 'bin', 'dss', exe),
@@ -144,7 +168,7 @@ function findCli() {
     join(repoRoot, 'build-dbg', 'bin', 'dss', exe),
   ].filter(existsSync);
   if (!candidates.length) {
-    console.error('fatal: no dss-code-prime binary found. Build one, e.g.:\n  cmake --build build --config Debug --target dss-code-prime');
+    console.error('fatal: no dsscp binary found. Build one, e.g.:\n  cmake --build build --config Debug --target dsscp');
     process.exit(2);
   }
   candidates.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
@@ -193,7 +217,7 @@ async function runProbe(cli, host, tmpRoot, p) {
   for (const [name, content] of Object.entries(p.aux ?? {})) {
     writeFileSync(join(dir, name), content);
   }
-  const c = await run(cli, ['--compile', ...srcPaths, '--language', 'c-subset', '--target', host.spec, '--output', outDir], { timeoutMs: 60000 });
+  const c = await run(cli, ['--compile', ...srcPaths, '--language', 'c', '--target', host.spec, '--output', outDir], { timeoutMs: 60000 });
   if (c.timedOut) return { ...p, status: 'toolfail', detail: 'compiler timeout' };
   if (c.spawnError) return { ...p, status: 'toolfail', detail: 'compiler spawn failed' };
   if (c.rc !== 0) {
@@ -231,7 +255,7 @@ async function runMatrix(cli, tmpRoot, wsl) {
   return pool(rows, 3, async (row) => {
     const outDir = join(tmpRoot, 'matrix', row.spec.replace(/[:*]/g, '_'));
     mkdirSync(outDir, { recursive: true });
-    const c = await run(cli, ['--compile', src, '--language', 'c-subset', '--target', row.spec, '--output', outDir], { timeoutMs: 60000 });
+    const c = await run(cli, ['--compile', src, '--language', 'c', '--target', row.spec, '--output', outDir], { timeoutMs: 60000 });
     if (c.rc !== 0) return { ...row, emit: false, run: 'n/a' };
     const art = join(outDir, row.art);
     if (!existsSync(art)) return { ...row, emit: false, run: 'n/a' };
@@ -275,15 +299,40 @@ function parsePlan23() {
 }
 
 function parseRegistry() {
-  const p = join(repoRoot, '.plans', '_deferred-anchor-registry.md');
-  if (!existsSync(p)) return null;
-  let total = 0, closed = 0;
-  for (const line of readFileSync(p, 'utf8').split('\n')) {
-    if (!/^\|\s*`D-/.test(line)) continue;
-    total++;
-    if (line.includes('✅')) closed++;
+  // ★ THE REGISTRY IS TWO DOCUMENTS since 2026-08-25 (production / tools-harness)
+  // and may become more, so this globs the directory rather than naming a file.
+  // Reading one document by name reports a confident HALF, which is worse than no
+  // number at all -- a half looks exactly like a whole.
+  const dir = join(repoRoot, '.plans');
+  if (!existsSync(dir)) return null;
+  const docs = readdirSync(dir)
+    .filter((f) => /^_deferred-anchor-registry.*\.md$/.test(f))
+    .sort();
+  // ⚠ A `.plans/` that carries NO registry document is DRIFT, not an absence to
+  // shrug at. The old `return null` rendered as `n/a`, which reads as "not
+  // applicable" rather than "this axis is blind" -- and that is precisely how this
+  // driver stayed broken through an entire rename once before. Same fatal shape as
+  // parsePlan23()'s format-drift exit.
+  if (docs.length === 0) {
+    console.error('fatal: .plans/ carries no _deferred-anchor-registry*.md — the anchor axis has no subject, fix parseRegistry()');
+    process.exit(2);
   }
-  return { total, closed };
+  let total = 0, closed = 0;
+  for (const f of docs) {
+    for (const line of readFileSync(join(dir, f), 'utf8').split('\n')) {
+      if (!/^\|\s*`D-/.test(line)) continue;
+      const cells = line.split('|');
+      if (cells.length < 3) continue;
+      total++;
+      // ★ A row is CLOSED iff its STATUS CELL begins with ✅ -- not if a ✅
+      // appears anywhere on the line. The closing-work and cross-ref cells
+      // routinely cite ANOTHER anchor's closure, and counting those
+      // over-reported this axis by 99 rows (1338 against a true 1239): about
+      // five percentage points, always in the flattering direction.
+      if (/^✅/.test(cells[2].replace(/^[\s*_]+/, ''))) closed++;
+    }
+  }
+  return { total, closed, docs: docs.length };
 }
 
 // The ctest axes MUST target the SAME build dir the chosen CLI came from —
@@ -291,7 +340,7 @@ function parseRegistry() {
 // `build/` is often a STALE/broken config that can't compile current src,
 // while the live work happens in a Ninja `build-dbg/`). Deriving the build
 // root from `cli` keeps the test count honest: the CLI lives at
-// `<buildRoot>/bin/dss/[Debug|Release/]dss-code-prime[.exe]`, so the build
+// `<buildRoot>/bin/dss/[Debug|Release/]dsscp[.exe]`, so the build
 // root is the path component just above `bin/dss`, and a `Debug`/`Release`
 // segment after it (if present) means a multi-config generator needing `-C`.
 function buildInfoOf(cliPath) {
@@ -352,7 +401,7 @@ const cliMtime = statSync(cli).mtime;
 // Stale = the built ENGINE is older than the newest C++ source ON DISK
 // (worktree truth, not commit timestamps — those skew by minutes when the
 // binary is built during the cycle and committed right after). Two quirks:
-//  * the exe is a thin main over dss-code-prime.dll/.so — compare the
+//  * the exe is a thin main over dsscp.dll/.so — compare the
 //    newest of the exe + its engine sibling, not the exe alone;
 //  * .json configs are loaded at RUNTIME, so they never stale the binary.
 function newestCodeMtimeUnder(dir) {
@@ -364,8 +413,32 @@ function newestCodeMtimeUnder(dir) {
   }
   return newest;
 }
-const engineSiblings = ['dss-code-prime.dll', 'libdss-code-prime.so', 'libdss-code-prime.dylib']
+// ⚠ THIS LIST WAS VACUOUS ON WINDOWS FOR AS LONG AS IT HAS EXISTED, and the
+// comment three lines up is what convicts it: it says compare the exe AND its
+// engine sibling, "not the exe alone". MEASURED — the list read `dsscp.dll`
+// (before 2026-08-24, `dss-code-prime.dll`) while the build produces
+// `libdsscp.dll`, WITH the `lib` prefix. `.filter(existsSync)` then yielded the
+// EMPTY list and `binMtime` collapsed to `cliMtime`, i.e. exactly what the
+// comment forbids. A filter that silently empties is indistinguishable from one
+// that found everything, which is why nothing ever reported it — and it matters
+// because the exe is ~1 MB of thin main while the engine is ~460 MB: an
+// incremental build moves one without the other in both directions.
+//
+// ★ THE REFUSAL BELOW IS THE ACTUAL FIX. Adding the missing spelling repairs
+// today; refusing on an empty list makes the NEXT spelling change loud instead
+// of silent. Do NOT derive these names from the CLI's basename — the `lib`
+// prefix is a property of the LINKER, not of the command, so deriving it would
+// re-introduce the same guess wearing a principled face.
+const engineSiblingNames = ['libdsscp.dll', 'dsscp.dll', 'libdsscp.so', 'libdsscp.dylib'];
+const engineSiblings = engineSiblingNames
   .map((n) => join(dirname(cli), n)).filter(existsSync);
+if (engineSiblings.length === 0) {
+  console.error(`fatal: no engine sibling beside ${cli}.\n` +
+    `  searched ${dirname(cli)} for: ${engineSiblingNames.join(', ')}\n` +
+    `  The CLI is a thin main over the engine shared library, so a staleness\n` +
+    `  verdict taken from the exe alone is wrong. Add this platform's spelling.`);
+  process.exit(1);
+}
 const binMtime = Math.max(cliMtime.getTime(), ...engineSiblings.map((p) => statSync(p).mtimeMs));
 const cliStale = binMtime < newestCodeMtimeUnder(join(repoRoot, 'src'));
 const wsl = wslAvailable();

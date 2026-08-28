@@ -27,7 +27,7 @@
 // Caller writes the bytes to disk first via
 // `dss::linker::writeImage`. Caller-side responsibility for
 // permissions on POSIX + .exe extension on Windows (the parent-
-// directory contract is documented at `writer.hpp:30-34`). The
+// directory contract is documented at `writer.hpp`). The
 // POSIX arm also chmod+x the spawned binary so `posix_spawn`
 // can exec it (the linker writes 0644 by default; a caller that
 // already applied 0755 sees the redundant chmod as a no-op).
@@ -65,11 +65,18 @@
 // own directory first, so this one spelling works everywhere with no build-graph
 // change. The target it protects is why the quoter is header-only and
 // dependency-free in the first place (see that header's opening note); linking
-// `dss-code-prime-lib` into `integrated_tests` to borrow a string helper would
+// `dsscp-lib` into `integrated_tests` to borrow a string helper would
 // break the very boundary that target exists to hold. Included UNCONDITIONALLY,
 // not under `#if defined(_WIN32)`, so the pure transform is compile-checked on
 // every leg of the matrix rather than only where its output is used.
 #include "../../src/core/substrate/windows_command_line.hpp"
+
+// The suite's wall-clock budget vocabulary — `kRunBudget` (this header's default
+// timeout) and `kAdmissionBudget` are DEFINED there, with the measurements that
+// sized them. Reachable by this bare spelling from every consumer, including
+// `integrated_tests`, whose target carries only `tests/test_support` on its
+// include path (see the note on the relative include above).
+#include "test_wait_budget.hpp"
 
 #include <algorithm>  // std::min in the POSIX poll-loop arm; std::sort of sysroot candidates
 #include <chrono>
@@ -486,60 +493,15 @@ ensureQemuGuestSysroot(std::vector<std::string> const& launcherPrefix,
 }
 
 // ─── Timeout budgets (TF-C84) ──────────────────────────────────────────
-// TWO different things need bounding here, and conflating them into one
-// bare `5000` literal is what made the examples suite flaky:
-//
-//   kRunBudget       — how long the COMPILED PROGRAM may take to
-//                      terminate. This is the hang detector: an infinite
-//                      loop in emitted code must trip it.
-//   kAdmissionBudget — how long the OPERATING SYSTEM may take to ADMIT a
-//                      freshly written binary for execution, before a
-//                      single instruction of the program has run. This is
-//                      not the program's cost and must not be charged to
-//                      the program's budget.
-//
-// Why the split exists — MEASURED 2026-07-29 on macOS 26.5.2 / arm64
-// T8132 (10 cpu, 4 P-cores), replicating a real emitted example binary:
-//
-//   per-exec latency (ms)      1st exec of a NEW file      re-exec, same file
-//   serial                            265 – 303                   ~15
-//   8-way concurrent            2607 med / 4899 max         394 med / 776 max
-//   16-way concurrent           5095 med / 6841 max        1168 med / 2263 max
-//
-// The program itself runs in ~15 ms. Everything above that is the OS
-// admitting the binary, and macOS's unified log names the mechanism: the
-// first exec of a freshly written, ad-hoc-signed Mach-O makes syspolicyd
-// run a Gatekeeper scan that issues a NETWORK REQUEST to Apple's
-// notarization service before the child's main() is entered —
-//   syspolicyd [syspolicy.exec] GK performScan: PST: (path: …)
-//   syspolicyd [CFNetwork:Summary] transaction_duration_ms=1527, status=200
-//   syspolicyd [syspolicy.exec] GatekeeperPolicyScanError Code=-67018
-//                               "Code did not match any currently allowed policy"
-// The scan always FAILS (our output is ad-hoc signed, never notarized) and
-// the exec is then allowed anyway (no com.apple.quarantine xattr) — but the
-// round trip is paid in full, every time, per NEW code-signature. Measured
-// 103 such scans in 3 minutes across only 3 TLS connections: they multiplex
-// over one HTTP/3 connection inside the single syspolicyd process, so they
-// SERIALIZE. That is why the cost explodes with ctest -j parallelism while
-// a serial rerun of the very same tests always passes.
-//
-// Hence the fix is NOT a bigger number: the cost being absorbed is somebody
-// else's network and is therefore unbounded, whereas the thing the timeout
-// exists to catch — a program that never terminates — is bounded and small.
-// `runBinary` instead performs an UNTIMED warm-up exec (below) so the timed
-// window measures program runtime only, and kRunBudget can stay tight.
-//
-// kRunBudget = 5000 ms: >2x the worst WARM latency ever measured here
-// (2263 ms at 16-way concurrency, which is pure CPU contention on 4
-// P-cores), and ~300x the ~15 ms a real example actually needs.
-inline constexpr std::chrono::milliseconds kRunBudget{5000};
-
-// kAdmissionBudget = 30000 ms: >4x the worst ADMISSION latency measured
-// (6841 ms at 16-way concurrency). Generous on purpose — it is charged only
-// when a program genuinely never terminates, and it must dominate an
-// external, network-dependent cost that a slow or offline link can inflate
-// (CFNetwork's own per-request timeout is 3 s, and requests queue).
-inline constexpr std::chrono::milliseconds kAdmissionBudget{30000};
+// `kRunBudget` (how long the COMPILED PROGRAM may take to terminate — the
+// hang detector) and `kAdmissionBudget` (how long the OPERATING SYSTEM may
+// take to ADMIT a freshly written binary, before a single instruction of the
+// program has run) are DEFINED in `test_wait_budget.hpp`, included at the top
+// of this file, together with the macOS admission-latency table that sized
+// them and the syspolicyd/Gatekeeper mechanism that explains the split. They
+// live there because that header is the suite's ONE budget vocabulary; the
+// SHAPE they produce — the two-phase warm-up-then-time spawn — is documented
+// at `runBinary` below, which is the code that implements it.
 
 // ─── D-TEST-RUN-HARNESS-DEADLINE-COUNTS-HOST-SUSPEND ───────────────────────
 //
@@ -1198,9 +1160,18 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
         auto const remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 deadline - now);
-        auto const slice = std::min(
-            remaining, std::chrono::milliseconds{10});
-        std::this_thread::sleep_for(slice);
+        // ★ THE 10 ms IS A SLEEP, NOT A DEADLINE, AND IS SPELLED INSIDE THE
+        // SLEEP SO THAT STAYS TRUE BY CONSTRUCTION. It is the POLL GRANULARITY
+        // of the loop above: it bounds how long this parent naps between two
+        // `waitpid(WNOHANG)` probes, and `remaining` — derived from `timeout` —
+        // is what bounds the wait. Nothing can red because this number is too
+        // small on a slow host; a smaller value only burns more CPU polling and
+        // a larger one only delays noticing an exit by that much. Hoisting it
+        // to a named local would move the number OUT of the sleep and make it
+        // indistinguishable, to a reader and to `check-wall-clock-in-tests`,
+        // from a budget sized on the machine that wrote it.
+        std::this_thread::sleep_for(
+            std::min(remaining, std::chrono::milliseconds{10}));
     }
 
     // The child has exited, so every write end is closed and the drain thread

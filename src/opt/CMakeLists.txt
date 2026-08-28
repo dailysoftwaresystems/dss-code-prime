@@ -17,7 +17,7 @@ add_library(opt OBJECT
 target_include_directories(opt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 # Same DLL-export discipline as mir/lir/asm. Aggregated into
-# dss-code-prime-lib via $<TARGET_OBJECTS:opt> at src/CMakeLists.txt.
+# dsscp-lib via $<TARGET_OBJECTS:opt> at src/CMakeLists.txt.
 target_compile_definitions(opt PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 
 # OPT1 cycle 1 substrate: the optimizer reads + rewrites MIR, so it

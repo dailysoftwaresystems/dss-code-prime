@@ -14,7 +14,7 @@ add_library(hir OBJECT
 
 target_include_directories(hir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
-# Aggregated into dss-code-prime-lib via $<TARGET_OBJECTS:hir> at
+# Aggregated into dsscp-lib via $<TARGET_OBJECTS:hir> at
 # src/CMakeLists.txt — same pattern as core/, analysis_semantic/, etc.
 # DSS_BUILDING_DLL must live here (not on the SHARED target) so DSS_EXPORT
 # decorations resolve to dllexport when these .obj files are produced on MSVC.

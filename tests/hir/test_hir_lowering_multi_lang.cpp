@@ -1,5 +1,5 @@
 // HR11 multi-language CompilationUnit lowering: a single CU containing a
-// c-subset (.c) file AND a tsql-subset (.sql) file lowers — through the SAME
+// c (.c) file AND a tsql-subset (.sql) file lowers — through the SAME
 // language-agnostic engine, with NO schema.name() branch — to ONE verified HIR
 // module (a c `Function` decl + a `TSQL::Select` extension decl). Exercises the
 // full vertical slice: CU5 per-file schema (registry + extension routing +
@@ -22,10 +22,13 @@
 #include "hir/lowering/cst_to_hir.hpp"
 #include "scratch_dir.hpp"
 
+#include "shipped_schema_or_throw.hpp"   // the ONE load-or-fail-this-test helper
+
 #include <gtest/gtest.h>
 
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -44,9 +47,13 @@ using dss::test_support::Location;
 using dss::test_support::ScratchDir;
 
 [[nodiscard]] std::shared_ptr<GrammarSchema const> shipped(std::string_view name) {
-    auto loaded = GrammarSchema::loadShipped(name);
-    if (!loaded) { ADD_FAILURE() << "loadShipped(" << name << ") failed"; std::abort(); }
-    return *loaded;
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
+    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // ✔MEASURED against an emptied shipped config, the abort took the whole
+    // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
+    // no summary -- every sibling test in this executable lost its verdict.
+    auto const loaded = dss::test_support::shippedSchemaOrThrow(name);
+    return loaded;
 }
 
 [[nodiscard]] std::string extName(Hir const& hir, HirNodeId id) {
@@ -62,10 +69,10 @@ constexpr std::string_view kSqlProgram =
 } // namespace
 
 TEST(HirLoweringMultiLang, MixedCuLowersToOneModule) {
-    auto c   = shipped("c-subset");
+    auto c   = shipped("c");
     auto sql = shipped("tsql-subset");
 
-    // c-subset is the primary; tsql is registered as a second language.
+    // c is the primary; tsql is registered as a second language.
     UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};
     ub.registerSchema(sql);
     ub.addInMemory(std::string(kCProgram),   "add.c",   c);
@@ -73,7 +80,7 @@ TEST(HirLoweringMultiLang, MixedCuLowersToOneModule) {
     auto cu = std::make_shared<CompilationUnit>(std::move(ub).finish());
 
     ASSERT_EQ(cu->trees().size(), 2u);
-    EXPECT_EQ(cu->trees()[0].schema().name(), "CSubset");
+    EXPECT_EQ(cu->trees()[0].schema().name(), "C");
     EXPECT_EQ(cu->trees()[1].schema().name(), "TsqlSubset");
 
     // Multi-schema semantic analysis: each tree analyzed with its OWN config.
@@ -96,12 +103,12 @@ TEST(HirLoweringMultiLang, MixedCuLowersToOneModule) {
 
     // The module's source-language label is the composite of both languages.
     std::string const lang{res->hir.sourceLanguage()};
-    EXPECT_NE(lang.find("CSubset"), std::string::npos) << lang;
+    EXPECT_NE(lang.find("C"), std::string::npos) << lang;
     EXPECT_NE(lang.find("TsqlSubset"), std::string::npos) << lang;
 }
 
 TEST(HirLoweringMultiLang, AddFileRoutesByExtension) {
-    auto c   = shipped("c-subset");
+    auto c   = shipped("c");
     auto sql = shipped("tsql-subset");
 
     // Write a .c and a .sql temp file; addFile must route each to the language
@@ -119,7 +126,7 @@ TEST(HirLoweringMultiLang, AddFileRoutesByExtension) {
     auto cu = std::make_shared<CompilationUnit>(std::move(ub).finish());
 
     ASSERT_EQ(cu->trees().size(), 2u);
-    EXPECT_EQ(cu->trees()[0].schema().name(), "CSubset")   << ".c must route to c-subset";
+    EXPECT_EQ(cu->trees()[0].schema().name(), "C")   << ".c must route to c";
     EXPECT_EQ(cu->trees()[1].schema().name(), "TsqlSubset") << ".sql must route to tsql-subset";
 
     SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
@@ -132,7 +139,7 @@ TEST(HirLoweringMultiLang, AddFileRoutesByExtension) {
 }
 
 TEST(HirLoweringMultiLang, MultiSchemaCtorAndDeclOrderFollowsTreeOrder) {
-    auto c   = shipped("c-subset");
+    auto c   = shipped("c");
     auto sql = shipped("tsql-subset");
 
     // Multi-schema ctor with sql FIRST (primary); add sql then c. Decl order in
@@ -160,7 +167,7 @@ TEST(HirLoweringMultiLang, UnknownExtensionIsLoudInMultiLanguageCu) {
     // In a multi-language CU, an addFile whose extension matches NO registered
     // language fails loud (D_UnknownFileExtension) and adds no tree — never
     // silently parses under the primary grammar.
-    auto c   = shipped("c-subset");
+    auto c   = shipped("c");
     auto sql = shipped("tsql-subset");
     ScratchDir scratch{Location::Temp, "hr11-unknown-ext"};
     fs::path const py = scratch.path() / "script.py";
@@ -185,7 +192,7 @@ TEST(HirLoweringMultiLang, ExplicitInMemorySchemaNeedNotBePreRegistered) {
     // language's semantic analysis + import resolution + lowering (no silent
     // skip). Proves the resolver loop covers every tree's schema, not just the
     // pre-registered set.
-    auto c   = shipped("c-subset");
+    auto c   = shipped("c");
     auto sql = shipped("tsql-subset");
     UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};  // only c registered
     ub.addInMemory(std::string(kCProgram), "a.c", c);
@@ -207,7 +214,7 @@ TEST(HirLoweringMultiLang, BothLanguagesBuiltinsAndExtensionsCoexist) {
     // each tree sees its own language's builtins, and tsql's TSQL::* extension
     // kinds coexist with c's core kinds in the one HIR kind registry —
     // verify-on-load (res->ok) is the proof.
-    auto c   = shipped("c-subset");
+    auto c   = shipped("c");
     auto sql = shipped("tsql-subset");
     UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};
     ub.registerSchema(sql);
@@ -237,7 +244,7 @@ TEST(HirLoweringMultiLang, SameLanguageCrossTreeResolvesAroundInterleavedOtherLa
     // ACROSS its two trees (producing exactly one cross-ref edge B→A) while
     // correctly SKIPPING the c tree (owns() gating) — and the c include-following
     // resolver must produce no spurious edge.
-    auto c   = shipped("c-subset");
+    auto c   = shipped("c");
     auto sql = shipped("tsql-subset");
     UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};
     ub.registerSchema(sql);
@@ -265,7 +272,7 @@ TEST(HirLoweringMultiLang, SameLanguageCrossTreeResolvesAroundInterleavedOtherLa
 TEST(HirLoweringMultiLang, DuplicateRegisterSchemaDoesNotDoubleResolve) {
     // registerSchema does not dedup, but finish() runs ONE resolver per distinct
     // SchemaId — so registering tsql twice must NOT double-append the cross-ref.
-    auto c   = shipped("c-subset");
+    auto c   = shipped("c");
     auto sql = shipped("tsql-subset");
     UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};
     ub.registerSchema(sql);
@@ -278,11 +285,11 @@ TEST(HirLoweringMultiLang, DuplicateRegisterSchemaDoesNotDoubleResolve) {
 }
 
 TEST(HirLoweringMultiLang, BuiltinsDoNotLeakAcrossLanguages) {
-    // COALESCE is a tsql builtin; c-subset declares none. In a mixed CU a c file
+    // COALESCE is a tsql builtin; c declares none. In a mixed CU a c file
     // calling COALESCE must NOT silently resolve it (that would be a cross-language
     // reference, which is the FFI plan's job — not a builtin hit). Per-language
     // builtin scopes enforce this: the c tree only sees c's (empty) builtins.
-    auto c   = shipped("c-subset");
+    auto c   = shipped("c");
     auto sql = shipped("tsql-subset");
     UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};
     ub.registerSchema(sql);
@@ -292,5 +299,5 @@ TEST(HirLoweringMultiLang, BuiltinsDoNotLeakAcrossLanguages) {
 
     SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_GT(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
-        << "a c-subset tree must NOT resolve tsql's COALESCE builtin";
+        << "a c tree must NOT resolve tsql's COALESCE builtin";
 }

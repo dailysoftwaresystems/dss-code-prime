@@ -1,0 +1,18 @@
+{
+  "$comment": "TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): a C99 6.7.4p7 inline definition that is CALLED but whose external definition exists in no linked TU must fail LOUD at the link tier, naming the symbol. The negative half of `inline_c99_inline_definition_crosscu` -- same source shape, sibling CU removed. \u2605 'Emits nothing' is only a safe decision if the omission is DETECTABLE: encoding the state as a weak binding, or as a silently dropped declaration, would turn this program into a wrong-body call or a mysterious crash instead of a diagnostic. Fail-loud here is the contract that makes the no-emit decision safe everywhere else, and it is the same contract a bare prototype with no definition already has. MEASURED: `/usr/bin/clang -std=c99 -O0` on this exact file also fails to link, with `Undefined symbols: _missing_body`. \u2605\u2605\u2605 AND AT RELEASE THIS EXACT PROGRAM NOW LINKS AND RUNS (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED, 2026-08-15) -- which is not a contradiction of the pin above but the OTHER half of 6.7.4p7: the inline definition is 'an alternative to an external definition, which a translator may use to implement any call to the function in the same translation unit', so once the inliner takes the call there is no reference left to be undefined. \u2714MEASURED, gcc 13.3.0 / clang 18.1.3 / clang 19 all behave identically on this shape: link failure at -O0, success at -O1 and above. \u26a0 THIS EXAMPLE THEREFORE DECLARES NO OPTIMIZED ARM, AND THAT IS DELIBERATE RATHER THAN AN OVERSIGHT -- the runner requires an example's BASELINE arm to build and run before it will compare an optimized one, so a shape whose two arms differ in KIND (diagnostic vs running binary) cannot be expressed here at all. The release half is witnessed instead by inline_c99_inline_definition_crosscu, whose release arm exits 7 because the inline definition was used, and by the sqlite hwtime.h construct measured through the CLI.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "K_SymbolUndefined",
+      "line": 1,
+      "col": 1,
+      "positioned": false
+    }
+  ]
+}

@@ -4,8 +4,7 @@ dss_add_test(NAME lir/test_lir           SOURCES test_lir.cpp)
 dss_add_test(NAME lir/test_lir_liveness  SOURCES test_lir_liveness.cpp)
 dss_add_test(NAME lir/test_lir_callconv  SOURCES test_lir_callconv.cpp)
 # Cycle 10k: mutate_target_schema.hpp consumes nlohmann_json for the
-# in-memory JSON-strip negative pin (D-CSUBSET-LOCAL-INT-CODEGEN-
-# NEGATIVE-PIN).
+# in-memory JSON-strip negative pin (D-CSUBSET-LOCAL-INT-CODEGEN-NEGATIVE-PIN).
 target_link_libraries(dss_lir_test_lir_callconv PRIVATE nlohmann_json::nlohmann_json)
 dss_add_test(NAME lir/test_lir_regalloc  SOURCES test_lir_regalloc.cpp)
 # D-OPT-REGALLOC-EXCLUSION-BUFFER closure (2026-06-11): the >8-ordinal
@@ -29,13 +28,13 @@ dss_add_test(NAME lir/test_lir_earlyclobber SOURCES test_lir_earlyclobber.cpp)
 dss_add_test(NAME lir/test_lir_two_address_tie SOURCES test_lir_two_address_tie.cpp)
 target_link_libraries(dss_lir_test_lir_two_address_tie PRIVATE nlohmann_json::nlohmann_json)
 # D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE (the asm half): a `"+r"` operand's two
-# halves bind to ONE register. Drives the REAL c-subset → HIR → MIR → LIR
+# halves bind to ONE register. Drives the REAL c → HIR → MIR → LIR
 # lowering for the positive claim and its untied control, and hand-builds the
 # two descriptor shapes that must still REFUSE.
 dss_add_test(NAME lir/test_lir_asm_tied_operand SOURCES test_lir_asm_tied_operand.cpp)
 # D-LIR-ASM-GOTO-REFUSAL-NAMES-A-CONFIG-GAP-THAT-NO-LONGER-EXISTS (P20): the
 # `asm goto` label edge, the fall-through edge, result piece 0 and the two
-# refusals that must NOT become acceptance. Drives the REAL c-subset → HIR →
+# refusals that must NOT become acceptance. Drives the REAL c → HIR →
 # MIR → LIR lowering, because the property is a relation between what the front
 # end minted (the spellings) and what this tier bound (the blocks).
 dss_add_test(NAME lir/test_lir_asm_goto_labels SOURCES test_lir_asm_goto_labels.cpp)
@@ -45,7 +44,21 @@ dss_add_test(NAME lir/test_lir_asm_goto_labels SOURCES test_lir_asm_goto_labels.
 # shape and this guard exists for the producers that never run that pass.
 dss_add_test(NAME lir/test_lir_asm_binding_collision
              SOURCES test_lir_asm_binding_collision.cpp)
+# D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED: a
+# register-pinned `"=a"` output must enter the per-instruction constraint's
+# CLOBBER set and so reach `effectiveForbiddenOrdinals`, because the allocator
+# omits outputs from its forbidden set on exactly that invariant. Drives the
+# REAL c → HIR → MIR → LIR lowering — a hand-built constraint would satisfy
+# the invariant because the test wrote it that way.
+dss_add_test(NAME lir/test_lir_asm_pinned_output_clobber
+             SOURCES test_lir_asm_pinned_output_clobber.cpp)
 dss_add_test(NAME lir/test_lir_text      SOURCES test_lir_text.cpp)
+# D-OPT-JCC-FALLTHROUGH: Rule 1b's ONE legal asymmetry — a branch whose
+# trailing fallthrough operand `lir_peephole` elided, verified against the
+# module's own block LAYOUT. Its fixture (`fallthrough_form_schema.hpp`) builds
+# a target that SPELLS the shorter encoding form by mutating the shipped
+# document in memory, which needs nlohmann_json.
+target_link_libraries(dss_lir_test_lir_text PRIVATE nlohmann_json::nlohmann_json)
 dss_add_test(NAME lir/test_mir_to_lir    SOURCES test_mir_to_lir.cpp)
 # FC1 (V2-4.X): the role-contract red-on-disable levers strip
 # inputRoles/outputRoles off idiv_op via mutate_target_schema.hpp.
@@ -69,3 +82,86 @@ dss_add_test(NAME lir/test_lir_return_pool_projection
 # was measured not to cover.
 dss_add_test(NAME lir/test_lir_arg_cursor_projection
              SOURCES test_lir_arg_cursor_projection.cpp)
+
+# D-TARGET-ALIASED-VIEWS-BOTH-ALLOCATABLE-DOUBLE-COUNT-ONE-FILE +
+# D-TARGET-ALLOCATABLE-POOL-LIST-SET-HAS-NO-OWNER: the TRIPWIRE for
+# D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS. Asserts the trigger is
+# still false, states the d/v aliasing as an ABI fact rather than deriving it,
+# and drives the load-time refusal through mutate_target_schema.hpp.
+dss_add_test(NAME lir/test_lir_aliased_view_allocability
+             SOURCES test_lir_aliased_view_allocability.cpp)
+target_link_libraries(dss_lir_test_lir_aliased_view_allocability
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LIR-FRAME-SLOT-STRIDE-ENUMERATES-CLASSES-INSTEAD-OF-DERIVING: the frame's
+# uniform slot stride must cover the widest class that OCCUPIES a slot, not the
+# two classes an inline `max(GPR, FPR)` happened to name.
+dss_add_test(NAME lir/test_lir_frame_slot_stride
+             SOURCES test_lir_frame_slot_stride.cpp)
+
+# D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND + D-TARGET-NO-CROSS-CLASS-MOVE-VERB: the
+# inline-asm operand materialisation used ONE module-wide integer `mov` for
+# every operand whatever class it bound — a live silent miscompile on both
+# shipped targets. Drives the REAL c -> HIR -> MIR -> LIR lowering.
+dss_add_test(NAME lir/test_lir_asm_operand_move_class
+             SOURCES test_lir_asm_operand_move_class.cpp)
+
+# D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED: a memory-form constraint in
+# the OUTPUT section (`"=m"`, `"+m"`, `"=&m"`) is carried as the object's
+# ADDRESS and mints no result piece. Drives the REAL c -> HIR -> MIR ->
+# LIR lowering on BOTH shipped targets, because the property is a relation
+# between the source's output SECTION and the descriptor's result-piece list.
+dss_add_test(NAME lir/test_lir_asm_memory_output
+             SOURCES test_lir_asm_memory_output.cpp)
+
+# D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: Apple's arm64 ABI packs
+# NAMED stacked scalars at their own alignment and size, while keeping 8-byte
+# slots for named aggregates and for varargs — three axes that were MEASURED to
+# differ, which is why the CC declares an object rather than a boolean. The pins
+# type the measured offsets out as literals and fetch the CC by name from the
+# shipped target, so deleting the declaration reddens the Apple arms and leaves
+# the AAPCS64 control green.
+dss_add_test(NAME lir/test_lir_apple_stack_arg_packing
+             SOURCES test_lir_apple_stack_arg_packing.cpp)
+
+# D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: ONE pass owns
+# every outgoing-argument byte offset. `lowerWideCallArgs` states each stacked
+# aggregate's offset on its carrier and stamps the Call; callconv reads those
+# offsets and refuses to place anything of its own. The pins drive the REAL
+# pipeline (lowerWideCallArgs included -- the defect lives between that pass and
+# callconv, so a fixture that skips it cannot see this row) and assert that no
+# outgoing-argument byte is written twice.
+dss_add_test(NAME lir/test_lir_outgoing_arg_cursor
+             SOURCES test_lir_outgoing_arg_cursor.cpp)
+
+# OPT8 (plan 22) — the LIR peephole's redundant-copy rule. The load-bearing
+# pins are the NEGATIVES: `zext`/`sext`/`trunc`/`not`/`neg` whose result
+# register equals their only operand register are live computation, and on
+# x86-64 the first three encode to bytes a disassembler prints as `mov`. The
+# rule tests OPCODE IDENTITY against `registerClassOps[].move`, never a
+# mnemonic or a byte pattern; deleting the wrong one is a wrong answer that
+# every structural check in the pipeline still accepts.
+# Its 128-bit-width pins mutate the shipped x86_64 document in memory via
+# mutate_target_schema.hpp, which needs nlohmann_json.
+dss_add_test(NAME lir/test_lir_peephole
+             SOURCES test_lir_peephole.cpp)
+target_link_libraries(dss_lir_test_lir_peephole PRIVATE nlohmann_json::nlohmann_json)
+
+# D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: `&&label` as a LINK-TIME
+# address constant. Pins what this tier owes the static-data path — the block
+# symbol published with a byte offset for a block NO instruction names, one symbol
+# per block when the body addresses it too, and no register materialized for an
+# address that only ever reaches data. Drives the REAL c -> HIR -> MIR -> LIR
+# lowering, because the property is a relation between what HIR->MIR minted and
+# what this tier bound.
+dss_add_test(NAME lir/test_lir_label_address_static_table
+             SOURCES test_lir_label_address_static_table.cpp)
+
+# D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE: a refusal that crashes is not a
+# refusal. FIVE passes rebuild a module through the one shared terminator
+# dispatch, and a refusal from it leaves the open block unterminated — which
+# `LirBuilder` used to answer with `std::abort()`. Pins all five callers'
+# unwind AND the builder poison that makes the sixth caller's omission
+# survivable, so the guarantee does not rest on five independent `return`s.
+dss_add_test(NAME lir/test_lir_rebuild_unwind
+             SOURCES test_lir_rebuild_unwind.cpp)

@@ -18,25 +18,37 @@
 #     `--rsync <args...> <dest>`, which `exec`s rsync directly so `$?` is rsync's own
 #     status. This script uses that and never stdin.
 #
-# ★★ WHAT THIS DOES NOT SYNC, AND THE TRAP IT LEAVES BEHIND.
-# `.git` is EXCLUDED: ✔MEASURED 2026-08-21 it is **1.4 GB** against a **122 MB**
-# working tree, which is not a sane payload for a gate leg over ssh. The consequence
-# is NOT cosmetic and is stated loudly rather than hidden: rsync does not delete
-# excluded paths, so the remote keeps ITS OWN `.git` -- and on both hosts that
-# checkout sits at an old commit (✔2026-08-21: `b52784a`, Cycle P5c, 2,501 dirty
-# files, the SAME on each). **After a push, `git log` on the remote describes a
-# commit that has nothing to do with the files beside it.** So this script writes
-# `.dss-leg-stamp` at the remote root naming the LOCAL head, dirty count and mode,
-# and prints the divergence. Read the stamp, never the remote `git log`.
+# ★★★ THE LEG HOST KEEPS A CLONE. Operator ruling 2026-08-26, and it REPLACES the
+# arrangement this header used to describe rather than extending it.
+# `.git` is still not SYNCED -- ✔MEASURED 2026-08-21 it is **1.4 GB** against a
+# **122 MB** working tree, not a sane payload over ssh -- but the remote no longer
+# has to live with whatever `.git` it happens to hold. Before the push,
+# `leg_tree_prepare` fetches on the host, puts its clone on the DRIVER's branch at
+# the DRIVER's commit, and cleans it; after the leg, `leg_tree_restore` returns it
+# to pristine. So the remote `git log` now describes the tree under test, and
+# `git status` there shows what `git status` shows here.
+# ⚠ WHAT THIS RETIRES, stated because the old sentence is still quoted elsewhere:
+# *"read the stamp, never the remote `git log`"* was correct when the remote sat at
+# `b52784a` / Cycle P5c with 2,501 dirty files. It is no longer the arrangement.
+# `.dss-leg-stamp` is still written -- it names the mode and the run, which git
+# cannot -- but it is a RECORD now, not a workaround for a lying history.
 # See D-HARNESS-ARM64-VPS-CHECKOUT-IS-STALE-AND-ITS-PREBUILT-COMPILER-REFUSES-ITS-OWN-CONFIG.
 #
-# ★ `.secrets/` IS EXCLUDED DELIBERATELY AND THAT IS A SECURITY PROPERTY, NOT TIDINESS.
-# It holds the private keys for these very carriages; pushing it would copy the macOS
-# key onto the VPS and vice versa. An exclude here is the only thing preventing that.
+# ★★ AND THE LEG CLEANS UP AFTER ITSELF, which is the other half of the ruling. A
+# sync leaves the clone dirty by construction; left that way the next leg starts from
+# a tree nobody described. Restore runs on EVERY exit path, `die` included, and
+# `git worktree prune` goes with it -- ✔MEASURED 2026-08-26, both remote hosts carried
+# a registered, `prunable` `dss-probe-6f4aab73` worktree from a cycle that never
+# cleaned up, and it survived a MANUAL cleanup because a stale worktree registration
+# lives in `.git/worktrees/` and never appears in `git status`.
 #
-# ⚠ EVERY EXCLUDE IS ANCHORED (`/build`, not `build`). An unanchored `build*` once
-# silently skipped `src/program/build_scripts.cpp` and a leg was configured against a
-# tree missing a changed `.cpp`.
+# ★ WHAT IS WITHHELD IS DERIVED, NOT TYPED (`scripts/carriage-excludes/`). `.secrets/`,
+# `/.claude/worktrees` and every build tree are withheld because GIT IGNORES THEM, at
+# any depth -- which is the fix for the four hand-written lists that each missed
+# something different. `.git` is the one remaining POLICY withhold and is passed with
+# `--also`. ⚠ The security property the old list asserted by hand still holds and is
+# now structural: `.secrets/` holds the private keys for these very carriages, and
+# ✔MEASURED 2026-08-26 both hosts were holding BOTH keys before the derivation landed.
 #
 # ★★ RUN THIS FROM WSL, FOR EITHER CARRIAGE. ✔MEASURED 2026-08-21, and it corrected
 # this header's own first draft: **Git Bash on Windows has no `rsync`**, so the macOS
@@ -96,6 +108,16 @@ FORCE_LOCK=0
 die() { printf '\n[X] remote-leg: %s\n' "$*" >&2; exit 1; }
 say() { printf '\n=== %s ===\n' "$*"; }
 
+# ★ RESOLVED BY EXECUTION, NOT BY `command -v`, which has answered yes for a stub
+# on these hosts. `python3` is the name in WSL and on macOS, `python` the one a
+# Windows install provides; a carriage that hardcodes one fails on the other with
+# a message that reads as a missing dependency rather than as a missing name.
+PY=""
+for _c in python3 python; do
+    if "$_c" -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then PY="$_c"; break; fi
+done
+[[ -n "$PY" ]] || die "no working python3/python on PATH -- carriage-excludes cannot run"
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --carriage) CARRIAGE="${2:?--carriage needs a value}"; shift 2 ;;
@@ -144,6 +166,76 @@ esac
 
 carriage() { bash "$CARRIAGE_SH" "$@"; }
 
+# ── RESOLVE THE HOST ONCE, FOR THE WHOLE LEG ────────────────────────────────
+# D-SCRIPT-MACOS-LEG-RERESOLVES-THE-HOST-AT-EVERY-CARRIAGE-CALL.
+#
+# ⚠ A leg calls `carriage` many times — reachability, the lock, `leg-tree
+# prepare`, the rsync, the configure, the build, the ctest, `leg-tree restore` —
+# and `ssh-macos.sh` re-runs its whole resolver on EVERY one. The Mac is named by
+# a `.local` mDNS name, and under WSL the only arm of that resolver which answers
+# is a hop out to the Windows resolver. So the leg's success depends on N
+# independent lookups all succeeding, and any ONE transient miss kills a run that
+# has already done minutes of work.
+# ✔MEASURED 2026-08-28, cycle P43: this script resolved for `leg-tree prepare`
+# (reaching the host and moving its clone from `301e2a63` + 2854 dirty paths to a
+# pristine `73f74972`) and then FAILED to resolve for the rsync seconds later.
+# ★ `ssh-macos.sh`'s own header already recorded the same shape from the other
+# side — "mDNS then answered for the rsync and failed for the build minutes
+# later" — attributing it to a WSLENV problem. It is a property of ASKING
+# REPEATEDLY, and it survives every fix aimed at any single lookup.
+#
+# ⛔ THIS DOES NOT PIN AN ADDRESS ANYWHERE PERSISTENT. The Mac is on DHCP, so a
+# config holding an IP is wrong the moment the lease changes. The config keeps
+# the NAME; only THIS PROCESS gets an address, and only for its own lifetime.
+# ⓘ A caller that already exported `DSS_MACOS_HOST` is left alone — an explicit
+# override outranks anything derived here.
+# ⓘ arm64-vps needs none of this: it is reached by a literal host entry, not mDNS.
+if [[ "$CARRIAGE" == "macos" && -z "${DSS_MACOS_HOST:-}" ]]; then
+    # ⚠ IT RETRIES, BECAUSE ONE LOOKUP IS THE VERY THING THIS BLOCK EXISTS TO
+    # STOP RELYING ON. ✔MEASURED 2026-08-28, minutes after the resolve-once fix
+    # landed: a single pre-resolve returned empty — moments after an identical
+    # manual probe had answered — the leg fell through to per-call resolution,
+    # and the reachability probe then reported the RESOLVER'S ERROR TEXT where a
+    # `uname -sm` belonged. ★ Resolving once was the right shape and still asked
+    # the flaky question exactly once; the fix is to make THAT one answer
+    # reliable, not to add another single-shot caller.
+    _resolved_host=""
+    for _try in 1 2 3 4 5; do
+        _resolved_host=$(bash "$CARRIAGE_SH" --resolve 2>/dev/null | tail -1)
+        [[ -n "$_resolved_host" ]] && break
+        sleep 2
+    done
+    if [[ -n "$_resolved_host" ]]; then
+        export DSS_MACOS_HOST="$_resolved_host"
+        printf 'host   : %s (resolved ONCE for this leg, attempt %s)\n' \
+               "$DSS_MACOS_HOST" "$_try"
+    else
+        # Still not fatal: the reachability probe below is the honest place to
+        # fail, and it prints the carriage's own full diagnostic when it does.
+        printf 'host   : could not pre-resolve after 5 attempts; each call will resolve on its own\n'
+    fi
+    unset _try
+fi
+
+# ── the leg repository is a CLONE (operator ruling 2026-08-26) ───────────────
+# Run one `leg-tree` verb on the carriage. The script text is INLINED rather than
+# assumed present on the far side: the host's checkout can predate this file, and a
+# bootstrap that needs the thing it bootstraps is not a bootstrap.
+# ★ `"$(cat …)"` IS WHAT MAKES THIS SAFE, and the distinction is the one this project
+# keeps paying for: command-substitution output is NOT re-expanded, so the script's own
+# `$`, backticks and quotes reach the remote verbatim, while the few values written
+# explicitly below expand locally, once, under this shell's control. Writing the body
+# inside the same double quotes would have expanded the SCRIPT's variables here.
+# ⓘ The inlined text ends in a dispatch guarded by `${1:-}`; with no argument it takes
+# the no-op arm and only the verb appended below runs.
+leg_tree_remote() {
+    _ltr_verb="$1"; shift
+    _ltr_args=""
+    for _a in "$@"; do _ltr_args="$_ltr_args '$_a'"; done
+    carriage "$(cat "$REPO_ROOT/scripts/leg-tree/leg-tree.sh")
+leg_tree_${_ltr_verb}${_ltr_args}"
+}
+
 # ── reachability, BEFORE anything expensive ─────────────────────────────────
 say "carriage $CARRIAGE ($CARRIAGE_SH)"
 remote_uname=$(carriage "uname -sm" 2>&1 | tail -1)
@@ -170,21 +262,25 @@ printf 'remote : %s\n' "$remote_uname"
 # `sysctl -n hw.ncpu` (BSD-only): ✔MEASURED to answer on BOTH carriages, which
 # is the whole reason a carriage table can stay one row per host.
 if [[ -z "$JOBS" ]]; then
-    JOBS=$(carriage "getconf _NPROCESSORS_ONLN" 2>&1 | tail -1 | tr -dc '0-9')
-    # A probe that cannot answer is NOT silently treated as "run serially" --
-    # that is the exact failure this block exists to end. Fall back to a level
-    # every host can sustain and SAY that the probe failed.
-    if [[ -z "$JOBS" || "$JOBS" -lt 1 ]]; then
-        printf '⚠ could not read the remote core count; falling back to -j 4\n'
-        JOBS=4
-    fi
+    # ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".
+    # ⚠ THE CORE-COUNT PROBE IS GONE, DELIBERATELY. It answered "how many cores exist",
+    # which is the wrong question -- the right one is "how many may this process take",
+    # and the operator has answered it. Probing also made the level DIFFER per host
+    # (macOS 10, VPS 4), so a leg was never comparable to another leg.
+    JOBS="${DSS_JOBS:-6}"
 fi
 printf 'jobs   : %s (ctest -j)\n' "$JOBS"
 
 LOCAL_HEAD=$(git log --oneline -1 2>/dev/null || echo '(no git)')
 LOCAL_DIRTY=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+# ★ `LOCAL_HEAD` is a LOG LINE and cannot be handed to git as a revision. The clone
+# handling below needs a bare sha and a branch NAME, so they are read as themselves
+# rather than sliced out of a human-facing string.
+LOCAL_SHA=$(git rev-parse HEAD 2>/dev/null || echo '')
+LOCAL_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')
 printf 'local  : %s\n' "$LOCAL_HEAD"
 printf 'dirty  : %s path(s)\n' "$LOCAL_DIRTY"
+[ -n "$LOCAL_BRANCH" ] || die "cannot read this checkout's branch -- the leg host's clone is put on the DRIVER's branch, so a driver that cannot name its own has nothing to ask for"
 
 # ── the interlock, BEFORE the first byte is written to the remote ───────────
 #
@@ -227,18 +323,70 @@ case "$lock_out" in
 esac
 # Released on EVERY exit path, `die` included -- a lock that outlives its holder
 # is a lock that reds the next honest run.
-trap 'bash "$CARRIAGE_SH" "rm -f $LOCK" >/dev/null 2>&1 || true' EXIT
+# ★★ WHICH MODES TOUCH THE CLONE, AND WHY IT IS NOT "ALL OF THEM".
+# The operator ruling is that a leg cleans up after itself -- but two of this script's
+# three modes exist precisely to LEAVE something behind, and a restore that ignored
+# that would silently destroy the thing the caller asked for:
+#   full       prepare + restore. The ordinary gate: stage, measure, leave pristine.
+#   sync-only  prepare, NO restore. Its whole contract is "stage this host so I can
+#              probe it by hand" -- restoring on exit would delete the staging as the
+#              command returned, and the caller would find a clean tree and no
+#              explanation.
+#   test-only  NEITHER. It runs ctest over whatever is already there, usually what a
+#              previous `sync-only` staged. `prepare` resets the working tree, so
+#              running it here would test HEAD while reporting on the staged tree --
+#              a wrong answer rather than a missing one.
+# ★ The general shape: cleanup belongs to the mode that CREATED the mess, never to
+# every mode that happens to run afterwards.
+case "$MODE" in
+    full)      LEG_TREE_PREPARE=1; LEG_TREE_RESTORE=1 ;;
+    sync-only) LEG_TREE_PREPARE=1; LEG_TREE_RESTORE=0 ;;
+    *)         LEG_TREE_PREPARE=0; LEG_TREE_RESTORE=0 ;;
+esac
+
+# ★ RESTORE RUNS ON EVERY EXIT PATH, `die` included, and BEFORE the lock is dropped:
+# a leg that dies half way leaves the dirtiest tree of all, and the next leg to take
+# this lock must find the clone pristine rather than carrying the wreckage.
+trap '[[ "$LEG_TREE_RESTORE" == "1" ]] && { leg_tree_remote restore "$REMOTE_DIR" "$LOCAL_SHA" 2>&1 | tail -2 || true; };
+      bash "$CARRIAGE_SH" "rm -f $LOCK" >/dev/null 2>&1 || true' EXIT
+
+# ── put the host's own clone on the tree under test ─────────────────────────
+# Operator ruling 2026-08-26: the leg host keeps a CLONE, the leg checks its branch
+# before working in it, and the leg cleans up after itself.
+if [[ "$LEG_TREE_PREPARE" == "1" ]]; then
+    say "leg-tree prepare $CARRIAGE:$REMOTE_DIR -> $LOCAL_BRANCH @ ${LOCAL_SHA}"
+    leg_tree_remote prepare "$REMOTE_DIR" "$LOCAL_BRANCH" "$LOCAL_SHA" \
+        || die "leg-tree could not prepare $CARRIAGE:$REMOTE_DIR"
+else
+    printf '\nleg-tree: SKIPPED for --mode %s -- this mode runs over whatever is already\n' "$MODE"
+    printf '  on the host, so preparing would test HEAD while reporting on the staged tree.\n'
+fi
 
 # ── push ────────────────────────────────────────────────────────────────────
 if [[ "$MODE" != "test-only" ]]; then
-    say "rsync -> $CARRIAGE:$REMOTE_DIR (excludes ANCHORED; .git and .secrets withheld)"
-    carriage --rsync \
-        --exclude='/.git' --exclude='/.secrets' \
-        --exclude='/build' --exclude='/build-*' --exclude='/target' \
-        --exclude='/.dss-deps' --exclude='/scratchpad' --exclude='/Testing' \
-        --exclude='/test-scratch' \
+    say "rsync -> $CARRIAGE:$REMOTE_DIR (excludes DERIVED from git; .git withheld)"
+    # ★★★ THE LIST IS DERIVED, NOT TYPED -- see `scripts/carriage-excludes/`. Four
+    # carriages each carried their own enumeration until 2026-08-26, and all four
+    # spelled `node_modules` ANCHORED at the top level, so a nested one was
+    # invisible to every last of them. ✔MEASURED the same day, ON THE HOST THIS
+    # CARRIAGE FEEDS: the VPS held `.kilo/` -- **3,671 files, 61 MB, 3,667 of them
+    # `node_modules`** -- out of 25,198 files. ⚠ rsync does NOT delete an EXCLUDED
+    # path, so the derivation alone would not have cleaned it; that took one
+    # explicit removal, and the same is true of the next tree to leak.
+    # D-SCRIPT-CARRIAGE-EXCLUDES-ARE-A-HAND-LIST-AND-MISS-NESTED-IGNORED-TREES
+    # ⓘ `.secrets` no longer needs naming here -- it is git-ignored, so the
+    # derivation withholds it. `.git` stays withheld, but since 2026-08-26 that is
+    # no longer a gap being papered over by the leg stamp: `leg_tree_prepare` above
+    # has put the host's OWN clone on the driver's branch at the driver's commit, so
+    # the remote git now describes the tree under test rather than an old checkout.
+    EXCLUDES="$(mktemp)" || die "cannot create the exclude list"
+    "$PY" "$REPO_ROOT/scripts/carriage-excludes/carriage-excludes.py" \
+        --format rsync --repo "$REPO_ROOT" --also .git --out "$EXCLUDES" \
+        || die "carriage-excludes refused (rc=$?) -- refusing to rsync with a list it would not vouch for"
+    carriage --rsync --exclude-from="$EXCLUDES" \
         "$REPO_ROOT/" "$REMOTE_DIR" \
-        || die "rsync failed (rc=$?)"
+        || { rm -f "$EXCLUDES"; die "rsync failed (rc=$?)"; }
+    rm -f "$EXCLUDES"
 
     # The stamp is the ONLY honest description of what is on that host: the remote
     # `.git` was deliberately not synced and still names an unrelated commit.
@@ -247,8 +395,20 @@ if [[ "$MODE" != "test-only" ]]; then
     carriage "cd $REMOTE_DIR && printf '%s\n' \"$stamp\" > .dss-leg-stamp && cat .dss-leg-stamp" \
         || die "could not write the leg stamp"
     remote_head=$(carriage "cd $REMOTE_DIR && git log --oneline -1 2>/dev/null || echo '(no git)'" 2>&1 | tail -1)
-    printf '\n⚠ remote .git still says: %s\n' "$remote_head"
-    printf '⚠ that describes the OLD checkout, NOT the files just pushed. Read .dss-leg-stamp.\n'
+    # ★ THIS LINE USED TO WARN THAT THE REMOTE `.git` DESCRIBED THE OLD CHECKOUT.
+    # Under the 2026-08-26 clone standard it no longer does -- `leg_tree_prepare` put
+    # that clone on this branch at this commit before the sync -- so the warning was
+    # not merely redundant, it was FALSE, and a false warning is worse than none: it
+    # trains a reader to disregard the one place the host says what it is. ⓘ The
+    # remaining honest note is the DIRTY delta, which git on the host reports itself.
+    printf '\nremote HEAD : %s\n' "$remote_head"
+    if [[ "$remote_head" == "$(printf '%.7s' "$LOCAL_SHA")"* ]]; then
+        printf 'remote HEAD matches this driver. The working tree above it is the synced one;\n'
+        printf '`git status` there shows the same paths `git status` shows here.\n'
+    else
+        printf '⚠ remote HEAD does NOT match this driver (%s). leg-tree could not place it --\n' "$LOCAL_SHA"
+        printf '  read .dss-leg-stamp, which names what was actually pushed.\n'
+    fi
 fi
 
 [[ "$MODE" == "sync-only" ]] && { say "sync-only: done"; exit 0; }
@@ -258,12 +418,41 @@ fi
 # MTIMES, so an incremental build over a pushed tree can silently skip the very
 # file the leg exists to exercise.
 BUILD="build/dbg"
+
+# ★★ ccache — THE CLEAN BUILD IS CORRECT AND ONLY ITS COST WAS EVER THE PROBLEM.
+# `rm -rf $BUILD` above stays: a synced tree carries the SOURCE's mtimes, so an
+# incremental ninja can silently skip the very file the leg exists to exercise
+# (D-SYNC-RSYNC-PRESERVED-MTIME-DEFEATS-THE-REBUILD). ccache removes the cost
+# WITHOUT trusting an mtime, because it keys on CONTENT — the object cache
+# survives `rm -rf $BUILD`, so an unchanged TU is a cache hit rather than a
+# recompile, and correctness is unchanged.
+#
+# ⚠ ✔MEASURED 2026-08-25 (cycle P34): ccache was ALREADY INSTALLED on the arm64
+# VPS at /usr/bin/ccache and this script contained ZERO references to it, so
+# every leg run rebuilt ~504 translation units on 4 Neoverse-N1 cores from
+# scratch. The cache was sitting there unused.
+# D-SCRIPT-REMOTE-LEG-REBUILT-FROM-SCRATCH-WITH-AN-INSTALLED-CCACHE-UNUSED
+#
+# ★ PROBED IN ITS OWN ROUND TRIP rather than inline in the configure command:
+# the configure line is already ONE ssh argument with its own quoting rules, and
+# a `$(command -v ...)` folded into it would be expanded on the WRONG side. The
+# `grep -E "^/"` keeps a login banner from being mistaken for a path.
+CACHE_ARGS=""
+REMOTE_CCACHE=$(carriage "command -v ccache 2>/dev/null || true" 2>/dev/null | tr -d '\r' | grep -E '^/' | tail -1)
+if [[ -n "$REMOTE_CCACHE" ]]; then
+    printf 'ccache : %s (on %s)\n' "$REMOTE_CCACHE" "$CARRIAGE"
+    CACHE_ARGS=" -DCMAKE_C_COMPILER_LAUNCHER=$REMOTE_CCACHE"
+    CACHE_ARGS="$CACHE_ARGS -DCMAKE_CXX_COMPILER_LAUNCHER=$REMOTE_CCACHE"
+else
+    printf 'ccache : ABSENT on %s -- this leg recompiles every TU from scratch.\n' "$CARRIAGE"
+    printf '         One line on that host:  sudo apt-get install -y ccache\n'
+fi
 if [[ "$MODE" == "full" ]]; then
     say "clean configure + build ($BUILD) on $CARRIAGE"
     # ONE argument: see the ssh-quoting note in the header.
-    carriage "${REMOTE_ENV}cd $REMOTE_DIR && rm -rf $BUILD && cmake -S . -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Debug -DDSS_BUILD_TESTS=ON > /tmp/remote-leg-configure.log 2>&1 || { tail -25 /tmp/remote-leg-configure.log; exit 20; }" \
+    carriage "${REMOTE_ENV}cd $REMOTE_DIR && rm -rf $BUILD && cmake -S . -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Debug -DDSS_BUILD_TESTS=ON$CACHE_ARGS > /tmp/remote-leg-configure.log 2>&1 || { tail -25 /tmp/remote-leg-configure.log; exit 20; }" \
         || die "configure failed on $CARRIAGE (rc=$?)"
-    carriage "${REMOTE_ENV}cd $REMOTE_DIR && cmake --build $BUILD > /tmp/remote-leg-build.log 2>&1 || { tail -30 /tmp/remote-leg-build.log; exit 21; }; tail -1 /tmp/remote-leg-build.log" \
+    carriage "${REMOTE_ENV}cd $REMOTE_DIR && cmake --build $BUILD --parallel ${DSS_JOBS:-6} > /tmp/remote-leg-build.log 2>&1 || { tail -30 /tmp/remote-leg-build.log; exit 21; }; tail -1 /tmp/remote-leg-build.log" \
         || die "build failed on $CARRIAGE (rc=$?)"
 fi
 
@@ -273,6 +462,10 @@ LOG="build/remote-leg-$CARRIAGE.log"
 ctest_cmd="${REMOTE_ENV}cd $REMOTE_DIR && ctest --test-dir $BUILD --output-on-failure"
 [[ -n "$JOBS"   ]] && ctest_cmd="$ctest_cmd -j $JOBS"
 [[ -n "$FILTER" ]] && ctest_cmd="$ctest_cmd -R '$FILTER'"
+# ★★ THE REPO GUARDS ARE SKIPPED, by operator ruling 2026-08-25: every carriage this script
+# drives is an INDIRECT leg. A guard checks the SOURCE TREE, and the tree was pushed FROM the
+# root host, which already checked it. `DSS_LEG_GUARDS=1` restores them.
+[[ "${DSS_LEG_GUARDS:-0}" == "1" ]] || ctest_cmd="$ctest_cmd -LE repo-guard"
 
 # ★ The witness is TOOL-EMITTED (ctest's own summary line), never a string this
 # script writes -- run-gate REFUSES a caller-authored witness for that reason.

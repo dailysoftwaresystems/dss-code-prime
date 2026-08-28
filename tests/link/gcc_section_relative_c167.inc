@@ -1,8 +1,8 @@
 #pragma once
 
 // Golden fixtures: REAL gcc-produced ELF64 relocatable objects carrying
-// SECTION-RELATIVE relocations -- c167, D-LK-STATIC-LINK-SECTION-RELATIVE-
-// RELOC. Embedded byte-for-byte so the reader's section-relative resolution
+// SECTION-RELATIVE relocations -- c167, D-LK-STATIC-LINK-SECTION-RELATIVE-RELOC.
+// Embedded byte-for-byte so the reader's section-relative resolution
 // is deterministic + CI-portable (no gcc at test time). gcc 13, x86_64, -O0.
 //
 //   gccStrlitObject()   -- `const char *dss_greet(void){ return "hello world"; }`

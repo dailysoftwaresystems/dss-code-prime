@@ -1,0 +1,17 @@
+{
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 100,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "dce-only", "passes": ["Dce"], "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: x86_64:pe64-x86_64-windows-exec. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST, AND INVERTED: this arm is a NEGATIVE pin — its whole purpose is that the pass must NOT change the program. A byte-identical image is the CORRECT outcome here, and arming it would invert the example's meaning. `x = 100` dominates the join and must survive; `x = 7` is live from the pass's view. Dce correctly removes nothing. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in."}
+  ]
+}

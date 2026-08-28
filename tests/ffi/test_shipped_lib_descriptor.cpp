@@ -361,25 +361,31 @@ TEST(ShippedLibDescriptor, SymbolLibraryOverrideSentinelFormatFailsLoud) {
            "the table";
 }
 
-// ══ A MACRO THAT SHADOWS A SYMBOL WITHOUT REFERENCING IT (UCRT-P4) ═══════════
+// ══ AN OBJECT-LIKE MACRO THAT SHADOWS A SYMBOL WITHOUT REFERENCING IT ════════
+// ══ (UCRT-P4, narrowed by P41) ═══════════════════════════════════════════════
 //
 // Before this guard the shape below compiled rc=0 with NO diagnostic: the macro
 // silently won at preprocess time, nothing could ever call the symbol, and the
 // symbol was STILL eagerly imported (D-FFI-DESCRIPTOR-EAGER-IMPORT) — a dead import
 // in every binary that included the header.
 //
-// ★ THE THREE TESTS BELOW ARE ONE ARGUMENT AND MUST BE READ TOGETHER. The naive
-// rule "same name + overlapping format = error" is FALSE and would red 17 in-tree,
-// standard-mandated rows; the two BENIGN pins are what stop this guard from being
-// re-cut into that false rule the first time someone "simplifies" it.
+// ★ THE TESTS BELOW ARE ONE ARGUMENT AND MUST BE READ TOGETHER. The naive rule
+// "same name + overlapping format = error" is FALSE and would red 21 in-tree,
+// standard-mandated rows; the BENIGN pins are what stop this guard from being
+// re-cut into that false rule the first time someone "simplifies" it. The
+// FUNCTION-LIKE pin is the SECOND false rule, the one this guard actually shipped:
+// see D-FFI-MACRO-SHADOWING-GUARD-IGNORES-C-7-1-4-FUNCTION-ADDRESSABILITY.
 //
 // RED-ON-DISABLE (for the defect pin): delete the `checkMacroSymbolShadowing` call
-// at step (7.5) of `readShippedLibDescriptor` and the read SUCCEEDS. Neither benign
-// pin changes, so removing the guard is distinguishable from loosening it.
-TEST(ShippedLibDescriptor, MacroShadowingSymbolWithoutReferenceFailsLoud) {
+// at step (7.5) of `readShippedLibDescriptor` and the read SUCCEEDS. No benign pin
+// changes, so removing the guard is distinguishable from loosening it.
+TEST(ShippedLibDescriptor, ObjectLikeMacroShadowingSymbolWithoutReferenceFailsLoud) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
-    // `g` is declared as a symbol AND defined as a macro expanding to something
-    // ELSE, on the same (unrestricted) formats. Nothing can ever reach the symbol.
+    // `g` is declared as a symbol AND defined as an OBJECT-LIKE macro expanding to
+    // something ELSE, on the same (unrestricted) formats. An object-like macro is
+    // replaced at EVERY occurrence of the name — `&g` and `(g)(1)` are eaten along
+    // with the plain call — so nothing short of `#undef` can reach the symbol, and
+    // `#undef` frees a function-like macro just as well and so decides nothing.
     auto const path = writeTemp(dir, "shadow_defect.json", R"JSON({
         "header": "x.h",
         "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
@@ -388,7 +394,7 @@ TEST(ShippedLibDescriptor, MacroShadowingSymbolWithoutReferenceFailsLoud) {
             { "name": "h", "signature": "fn(i32) -> i32" }
         ],
         "macros": [
-            { "name": "g", "params": ["x"], "replacement": "h((x))" }
+            { "name": "g", "replacement": "h" }
         ]
     })JSON");
     TypeInterner interner{CompilationUnitId{1}};
@@ -403,6 +409,79 @@ TEST(ShippedLibDescriptor, MacroShadowingSymbolWithoutReferenceFailsLoud) {
     EXPECT_TRUE(anyDiagMentions(rep, "does not reference"))
         << "and it must state the DISCRIMINATOR, or the reader will conclude that "
            "a same-name macro is itself illegal (it is not — see the tgmath pin)";
+    EXPECT_TRUE(anyDiagMentions(rep, "OBJECT-LIKE"))
+        << "and it must name the FORM, because that is the half the guard shipped "
+           "WRONG: the old wording said 'nothing can ever call the symbol' of a "
+           "FUNCTION-LIKE macro too, which C 7.1.4p2 flatly contradicts";
+    EXPECT_TRUE(anyDiagMentions(rep, "params"))
+        << "and it must offer the remedy that the true rule creates — declaring "
+           "'params' makes the macro function-like and the symbol addressable — or "
+           "an author facing a genuinely addressable function has no way out";
+}
+
+// ── THE SHAPE THIS GUARD USED TO REFUSE, AND MUST NOT ────────────────────────
+// D-FFI-MACRO-SHADOWING-GUARD-IGNORES-C-7-1-4-FUNCTION-ADDRESSABILITY
+//
+// ★ IDENTICAL TO THE DEFECT PIN ABOVE IN EVERY RESPECT BUT ONE: `params`. That one
+// key is the whole difference between "nothing can ever reach the symbol" and "the
+// standard GUARANTEES the symbol is reachable", because a function-like macro is
+// expanded only where its name is followed by `(` (C 6.10.3p10) — so `&g` and
+// `(g)(1)` bind to the SYMBOL, which C 7.1.4p2 states outright ("it is permitted to
+// take the address of a library function even if it is also defined as a macro").
+// ✔MEASURED in gcc 13.3.0 and clang 18.1.3 separately, and in DSS itself.
+//
+// RED-ON-DISABLE: drop the `body.functionLike` test in `checkMacroSymbolShadowing`
+// and this read starts failing again, while the defect pin above stays red — so
+// re-widening the guard is distinguishable from deleting it.
+TEST(ShippedLibDescriptor, FunctionLikeMacroShadowingSymbolWithoutReferenceIsAccepted) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "shadow_fnlike_ok.json", R"JSON({
+        "header": "x.h",
+        "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "g", "signature": "fn(i32) -> i32" },
+            { "name": "h", "signature": "fn(i32) -> i32" }
+        ],
+        "macros": [
+            { "name": "g", "params": ["x"], "replacement": "h((x))" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_TRUE(desc.has_value())
+        << "C 7.1.4p2 guarantees '&g' and '(g)(1)' reach the SYMBOL, so the eager "
+           "import is LIVE — refusing this makes a standard-mandated shape "
+           "undeclarable (it is exactly C23 <stdbit.h>'s stdc_* shape)";
+    EXPECT_FALSE(rep.hasErrors());
+}
+
+// A ZERO-PARAMETER function-like macro is still function-like: `M()` expands, `&M`
+// does not. `decodeShippedMacros` already spells this rule "params ABSENT =
+// object-like; PRESENT (even []) = function-like", and the guard MUST read the form
+// from that same key or the two drift.
+TEST(ShippedLibDescriptor, ZeroParamFunctionLikeMacroShadowingSymbolIsAccepted) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "shadow_zeroparam_ok.json", R"JSON({
+        "header": "x.h",
+        "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "g", "signature": "fn() -> i32" },
+            { "name": "h", "signature": "fn() -> i32" }
+        ],
+        "macros": [
+            { "name": "g", "params": [], "replacement": "h()" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_TRUE(desc.has_value())
+        << "an EMPTY 'params' array is still 'params' — the guard must agree with "
+           "decodeShippedMacros about what makes a macro function-like";
+    EXPECT_FALSE(rep.hasErrors());
 }
 
 TEST(ShippedLibDescriptor, MacroShadowingSymbolItReferencesIsAccepted) {
@@ -475,11 +554,15 @@ TEST(ShippedLibDescriptor, MacroShadowingSymbolOnDisjointFormatsIsAccepted) {
 TEST(ShippedLibDescriptor, MacroVariantWhoseOtherFormatBodyDropsTheNameFailsLoud) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     // ★ EVERY VARIANT BODY IS CHECKED INDEPENDENTLY, NOT "ANY BODY REFERENCES IT".
-    // The pe body REFERENCES `q` (legitimate — the tgmath `fabs`/`ldexp` shape), the
-    // elf body does NOT, and the symbol is available on BOTH formats. So this is a
-    // real defect ON ELF that its own pe sibling must not excuse.
+    // The pe body REFERENCES `q` (legitimate — the glibc `#define stdin stdin`
+    // shape), the elf body does NOT, and the symbol is available on BOTH formats.
+    // So this is a real defect ON ELF that its own pe sibling must not excuse.
+    // ⚠ BOTH BODIES ARE OBJECT-LIKE ON PURPOSE. Written function-like, this pin
+    // would prove nothing after P41 — a function-like body is excused by C 7.1.4p2
+    // regardless of what it references, so the reference axis has to be tested on
+    // the form where the reference is what decides.
     // RED-ON-DISABLE: change the predicate to "any body references the name" and
-    // this read starts succeeding, while all three pins above stay green — so the
+    // this read starts succeeding, while every pin above stays put — so the
     // weakening is distinguishable from removing the guard outright.
     auto const path = writeTemp(dir, "shadow_variant_mixed.json", R"JSON({
         "header": "x.h",
@@ -491,8 +574,8 @@ TEST(ShippedLibDescriptor, MacroVariantWhoseOtherFormatBodyDropsTheNameFailsLoud
         "macros": [
             { "name": "q",
               "variants": [
-                { "when": { "format": "pe" },  "params": ["x"], "replacement": "q((x))" },
-                { "when": { "format": "elf" }, "params": ["x"], "replacement": "r((x))" }
+                { "when": { "format": "pe" },  "replacement": "q" },
+                { "when": { "format": "elf" }, "replacement": "r" }
               ] }
         ]
     })JSON");
@@ -502,6 +585,74 @@ TEST(ShippedLibDescriptor, MacroVariantWhoseOtherFormatBodyDropsTheNameFailsLoud
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     EXPECT_FALSE(desc.has_value());
     EXPECT_TRUE(anyDiagMentions(rep, "SHADOWS"));
+}
+
+// ★ THE **FORM** IS PER BODY TOO, EXACTLY AS THE REFERENCE IS. The pe arm is
+// FUNCTION-LIKE and non-referencing (benign — C 7.1.4p2 keeps `&q` bound to the
+// symbol there); the elf arm is OBJECT-LIKE and non-referencing (a real dead import
+// ON ELF). Its function-like pe sibling must not excuse it.
+// ⚠ THIS IS THE MIRROR OF THE PIN ABOVE, and it is what makes the P41 narrowing a
+// NARROWING rather than a per-entry escape hatch: read `params` off the macro ENTRY
+// (or off the first body) instead of off each BODY and this read starts succeeding.
+// `decodeShippedMacros` refuses an entry that carries both a body key and
+// `variants`, so a variants macro's `params` can ONLY live on the variant — an
+// entry-level read would find none and call every arm object-like, or find one and
+// call every arm function-like; either way one of the two pins here goes red.
+TEST(ShippedLibDescriptor, MacroVariantObjectLikeArmNotExcusedByFunctionLikeSibling) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "shadow_variant_form_mixed.json", R"JSON({
+        "header": "x.h",
+        "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "q", "signature": "fn(i32) -> i32" },
+            { "name": "r", "signature": "fn(i32) -> i32" }
+        ],
+        "macros": [
+            { "name": "q",
+              "variants": [
+                { "when": { "format": "pe" },  "params": ["x"], "replacement": "r((x))" },
+                { "when": { "format": "elf" }, "replacement": "r" }
+              ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value())
+        << "the elf arm is an object-like non-referencing shadow — a dead import on "
+           "elf — and its function-like pe sibling says nothing about elf";
+    EXPECT_TRUE(anyDiagMentions(rep, "OBJECT-LIKE"));
+}
+
+// The same entry with the elf arm ALSO function-like must LOAD. Without this the
+// test above is satisfied by a guard that simply refuses every `variants` macro.
+TEST(ShippedLibDescriptor, MacroVariantEveryArmFunctionLikeIsAccepted) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "shadow_variant_form_ok.json", R"JSON({
+        "header": "x.h",
+        "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "q", "signature": "fn(i32) -> i32" },
+            { "name": "r", "signature": "fn(i32) -> i32" }
+        ],
+        "macros": [
+            { "name": "q",
+              "variants": [
+                { "when": { "format": "pe" },  "params": ["x"], "replacement": "r((x))" },
+                { "when": { "format": "elf" }, "params": ["x"], "replacement": "r((x))" }
+              ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    // activeFormat deliberately NOT supplied — the nullopt path, where `out.macros`
+    // is EMPTY for a variants-only macro and only the raw-JSON read can see either
+    // arm at all.
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
 }
 
 // A per-symbol `library` VALUE that is not a string fails loud (mirrors the
@@ -933,15 +1084,15 @@ TEST(ShippedLibDescriptor, RealDescriptorsCarryTheirDarwinLinkNames) {
         {"stdlib.json",   "realpath", "realpath$DARWIN_EXTSN",
                                       "realpath$DARWIN_EXTSN"},
     }};
-    auto const shippedRoot = dss::test::findRepoRoot();
-    ASSERT_TRUE(shippedRoot.has_value()) << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
     // Reads the REAL descriptor for one (arch, macho) and returns `symbol`'s
     // resolved `linkName` — "<missing>" if the row is gone, so deleting a row
     // REDS here instead of silently satisfying an empty expectation.
     auto linkNameOf = [&](char const* descriptor, char const* symbol,
                           std::string_view arch) -> std::string {
         fs::path const p =
-            *shippedRoot / "src" / "dss-config" / "shippedLibs" / descriptor;
+            *cfg / "shippedLibs" / descriptor;
         TypeInterner       interner{CompilationUnitId{1}};
         TypeRegistry       typeReg;
         DiagnosticReporter rep;
@@ -1104,7 +1255,7 @@ TEST(ShippedLibDescriptor, ReadShippedLibMacrosEmptyForTypedOnly) {
 // macros-only read's) reads its macros WITHOUT a new error. RED-ON-DISABLE: a
 // `header` gate here re-breaks the angle-include preprocess path for any
 // symbols-only descriptor — exactly the ImportResolver regression this guards
-// (CSubsetAngleIncludeResolvesToDescriptorOnSystemDir uses a header-less api.json
+// (CAngleIncludeResolvesToDescriptorOnSystemDir uses a header-less api.json
 // that the preprocessor now reads for macros while splicing).
 TEST(ShippedLibDescriptor, ReadShippedLibMacrosHeaderlessIsLenient) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
@@ -2004,7 +2155,7 @@ TEST(ShippedLibDescriptor, StructVariantEagerDecodeMalformedInactiveFailsLoud) {
 
 // NO-MATCH → NOT INJECTED (gate 7; closure gate 7). Variants present but NONE match
 // the active target → the struct is simply not injected (no `S` in `desc->structs`).
-// A c-subset program referencing `struct S` would then emit S_UnknownType (the same
+// A c program referencing `struct S` would then emit S_UnknownType (the same
 // behavior as any undeclared struct) — never a silent wrong layout. The read itself
 // SUCCEEDS (no error): a header that doesn't define a struct for this target is not
 // an error here; the absence becomes loud at the USE site.
@@ -2650,12 +2801,12 @@ sysvVaListBinding(TypeInterner& interner) {
 // diagnostic so the log names WHICH of the three lookups came up short, not
 // just the call site that noticed.
 [[nodiscard]] fs::path shippedLibsRoot() {
-    auto const root = dss::test::findRepoRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config" / "shippedLibs";
+    return *cfg / "shippedLibs";
 }
 
 // ── Item 1: constants + typedefs decode (neutral shipped-header content) ─────
@@ -4043,9 +4194,9 @@ TEST(ShippedLibDescriptor, MacroVariantNoMatchNotInjected) {
 // ⇒ `selected == false` ⇒ the typedef is not injected — the `off64_t` mechanism).
 //
 // ✔MEASURED availability, per name, against three reference header sets rather
-// than asserted: musl (emsdk sysroot sys/types.h:63-69) and bionic (Android NDK
-// sysroot sys/types.h:54,136-139) declare the first seven; mingw-w64 x86_64
-// sys/types.h declares NONE of the nine; the macOS SDK sys/types.h:84-128
+// than asserted: musl (emsdk sysroot sys/types.h) and bionic (Android NDK
+// sysroot sys/types.h) declare the first seven; mingw-w64 x86_64
+// sys/types.h declares NONE of the nine; the macOS SDK sys/types.h
 // declares all nine. So the split pinned here is elf+macho for the seven,
 // macho-ONLY for `fixpt_t`/`segsz_t` (absent from BOTH linux libcs), and NONE on
 // pe.
@@ -4312,7 +4463,7 @@ TEST(ShippedLibDescriptor, RealSysTimeItimervalByNameComposite) {
 }
 
 // REAL <sys/stat.h> macho `st_mtimespec` — the second by-name consumer
-// (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME). sqlite os_unix.c:7731 assigns the WHOLE
+// (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME). sqlite os_unix.c assigns the WHOLE
 // member (`conchModTime = buf.st_mtimespec;`), so it must be a by-value composite,
 // and it OVERLAYS the flat st_mtim_sec/st_mtim_nsec pair the st_mtime macro still
 // maps onto — hence the c107 explicit-offset channel for this variant.
@@ -4653,7 +4804,7 @@ TEST(ShippedLibDescriptor, RealStddefWcharPerFormatWidth) {
 //       draft declaring _byteswap_* as symbols crashed the loader with
 //       STATUS_ENTRYPOINT_NOT_FOUND 0xC0000139 — the windows.json
 //       InterlockedCompareExchange trap, twice-proven). The intrinsics are
-//       always-on BUILTINS (c-subset.lang.json), never descriptor symbols.
+//       always-on BUILTINS (c.lang.json), never descriptor symbols.
 //   (3) the honest non-empty payload = the size_t→u64 typedef (MSVC's real
 //       intrin.h makes size_t visible; the string/stdio.json convention).
 // RED-on-disable: widen the gate / re-add a symbol / drop the typedef.
@@ -5541,7 +5692,7 @@ TEST(ShippedLibDescriptor, SetjmpPeMacroExpandsToUnderscoreSetjmp) {
 // `_crt_atexit` registers handlers that only the ucrtbase `exit` path drains, so
 // pe64-x86_64-windows-exec.format.json's `processExit` had to be repointed off kernel32
 // `ExitProcess` in the SAME commit (tests/link/test_object_format_schema.cpp pins that
-// row; examples/c-subset/shipped_atexit is the byte-exact runtime witness).
+// row; examples/c/shipped_atexit is the byte-exact runtime witness).
 //
 // RED-ON-DISABLE: adding "elf" to atexit's set (the naive "fix" for an elf atexit user),
 // re-widening it back to include "pe" (the naive "fix" for a pe atexit user, which would
@@ -5729,12 +5880,12 @@ TEST(ShippedLibDescriptor, TypedefDataModelVariantSelectsAndFailsLoud) {
 // ── TF-C92: the real <sys/ioctl.h> request-ENCODING macros, per format ────────
 //
 // sqlite/src/os_unix.c uses this header's macros at TWO measured sites — macho
-// os_unix.c:2986 `_IOWR('z', 23, struct ByteRangeLockPB2)` (consumed at :3013 by
-// `fsctl`), and elf os_unix.c:392-396 `_IO` x4 + `_IOR` x1 under `#ifdef
+// os_unix.c `_IOWR('z', 23, struct ByteRangeLockPB2)` (consumed by
+// `fsctl`), and elf os_unix.c `_IO` x4 + `_IOR` x1 under `#ifdef
 // __linux__`. Because an angle include resolves to DESCRIPTORS ONLY (the real
 // <sys/ioccom.h> text is never read), a missing row let `_IOWR` reach the parser
 // as a call whose 3rd argument is a TYPE-NAME: `error[P0009] … got 'struct'` at
-// os_unix.c:2986:56 — MEASURED as the sole diagnostic in that TU, and MEASURED to
+// that `_IOWR` use — MEASURED as the sole diagnostic in that TU, and MEASURED to
 // come back the instant the `_IOWR` row (or just its macho variant) is removed.
 //
 // The two OSes disagree on the DIRECTION FIELD ENTIRELY — Darwin gives each
@@ -5751,7 +5902,7 @@ TEST(ShippedLibDescriptor, TypedefDataModelVariantSelectsAndFailsLoud) {
 // IOC_*/_IOC_* direction vocabulary → the deliberate-omission EXPECTs fail (that
 // line is a decision recorded in the descriptor's `$comment`, not an oversight,
 // so re-crossing it must be a conscious edit). The VALUE side is pinned
-// end-to-end by `examples/c-subset/shipped_ioctl_iowr_macho/`, which
+// end-to-end by `examples/c/shipped_ioctl_iowr_macho/`, which
 // `_Static_assert`s the encoded numbers (0xc0207a17 &c.) that were measured
 // against the real SDK sys/ioccom.h.
 TEST(ShippedLibDescriptor, RealIoctlRequestEncodingMacrosPerFormat) {
@@ -6121,7 +6272,7 @@ TEST(ShippedLibDescriptor, RealStdlibJsonMallocZoneMachoOnly) {
         DarwinBsdClusterRead m;
         ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
                                                      ObjectFormatKind::MachO, m));
-        // malloc/malloc.h:390 `malloc_zone_t *malloc_default_zone(void)`
+        // malloc/malloc.h `malloc_zone_t *malloc_default_zone(void)`
         expectMachoOnlyFn(m, "malloc_default_zone", K::Ptr, {}, {}, K::Void);
         // :394 `malloc_zone_t *malloc_create_zone(vm_size_t, unsigned)` —
         // vm_size_t is 8-byte unsigned, `unsigned flags` is u32.
@@ -6173,7 +6324,7 @@ TEST(ShippedLibDescriptor, RealStdlibJsonMallocZoneMachoOnly) {
 // The language schema no longer guesses a per-name import library
 // (`externLibraryByFormat` is gone), so the shipped-descriptor corpus is the SINGLE
 // owner of realization and a bare `extern char *setlocale(int, const char *)` binds
-// ONLY through a row like this one. examples/c-subset/setlocale_c is the consumer and
+// ONLY through a row like this one. examples/c/setlocale_c is the consumer and
 // it spans pe AND elf AND macho across five targets, which is exactly why a SOURCE-side
 // per-symbol library override cannot serve it: that syntax carries ONE library string
 // and would project one image under every format key.
@@ -6321,10 +6472,10 @@ TEST(ShippedLibDescriptor, RealUnistdJsonFsctlMachoOnly) {
         DarwinBsdClusterRead m;
         ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
                                                      ObjectFormatKind::MachO, m));
-        // SDK unistd.h:785 `int fsctl(const char *, unsigned long, void *,
+        // SDK unistd.h `int fsctl(const char *, unsigned long, void *,
         // unsigned int)` — the FULL 4-param shape must decode: the u64 request
         // param is the one the sys/ioctl.json _IOWR encoding widens into at
-        // sqlite os_unix.c:3013, so a truncated/reordered decode here would
+        // sqlite os_unix.c, so a truncated/reordered decode here would
         // corrupt that call's request value silently.
         expectMachoOnlyFn(m, "fsctl", K::I32,
                           {K::Ptr, K::U64, K::Ptr, K::U32},
@@ -6384,19 +6535,19 @@ TEST(ShippedLibDescriptor, RealUnistdJsonDarwinFsSysctlMachoOnly) {
         DarwinBsdClusterRead m;
         ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
                                                      ObjectFormatKind::MachO, m));
-        // SDK sys/fcntl.h:616 `int flock(int, int)` — NOT sys/file.h, whose
+        // SDK sys/fcntl.h `int flock(int, int)` — NOT sys/file.h, whose
         // __BEGIN_DECLS block is EMPTY (it only re-includes sys/fcntl.h).
         expectMachoOnlyFn(m, "flock", K::I32, {K::I32, K::I32},
                           {std::nullopt, std::nullopt});
-        // SDK sys/mount.h:460/:442. `struct statfs *` keeps the fsctl/futimes
+        // SDK sys/mount.h. `struct statfs *` keeps the fsctl/futimes
         // opaque ptr<void> spelling — no consumer needs its layout, and the
         // real type still reaches mem1.c/os_unix.c through the SDK header.
         expectMachoOnlyFn(m, "statfs", K::I32, {K::Ptr, K::Ptr},
                           {K::Char, K::Void});
         expectMachoOnlyFn(m, "fstatfs", K::I32, {K::I32, K::Ptr},
                           {std::nullopt, K::Void});
-        // SDK sys/sysctl.h:800 `int sysctl(int *, u_int, void *, size_t *,
-        // void *, size_t)` — u_int is 4-byte unsigned (sys/_types/_u_int.h:30),
+        // SDK sys/sysctl.h `int sysctl(int *, u_int, void *, size_t *,
+        // void *, size_t)` — u_int is 4-byte unsigned (sys/_types/_u_int.h),
         // size_t/size_t* are 8-byte unsigned on every macho64 format (all eight
         // declare dataModel LP64), which is exactly why the row may ship a FLAT
         // signature with no signatureByDataModel.
@@ -6404,7 +6555,7 @@ TEST(ShippedLibDescriptor, RealUnistdJsonDarwinFsSysctlMachoOnly) {
                           {K::Ptr, K::U32, K::Ptr, K::Ptr, K::Ptr, K::U64},
                           {K::I32, std::nullopt, K::Void, K::U64, K::Void,
                            std::nullopt});
-        // SDK sys/sysctl.h:802 — same tail, name-keyed head.
+        // SDK sys/sysctl.h — same tail, name-keyed head.
         expectMachoOnlyFn(m, "sysctlbyname", K::I32,
                           {K::Ptr, K::Ptr, K::Ptr, K::Ptr, K::U64},
                           {K::Char, K::Void, K::U64, K::Void, std::nullopt});
@@ -6457,8 +6608,8 @@ TEST(ShippedLibDescriptor, RealUnistdJsonUuidTMachoOnlyTypedef) {
     };
 
     // ── macho (both arches): uuid_t PRESENT as Array of U8, length 16 ──
-    // `typedef unsigned char __darwin_uuid_t[16]` (SDK sys/_types.h:89) — the
-    // 16 is load-bearing: sqlite os_unix.c:7607 asserts PROXY_HOSTIDLEN ==
+    // `typedef unsigned char __darwin_uuid_t[16]` (SDK sys/_types.h) — the
+    // 16 is load-bearing: sqlite os_unix.c asserts PROXY_HOSTIDLEN ==
     // sizeof(uuid_t), and the shipped_bsd_random_futimes_uuid_macho corpus
     // exit arithmetic IS sizeof(uuid_t).
     for (std::string_view arch : {"x86_64", "arm64"}) {
@@ -6501,7 +6652,7 @@ TEST(ShippedLibDescriptor, RealUnistdJsonUuidTMachoOnlyTypedef) {
 // D-FFI-DARWIN-SYSCTL-CONSTANTS-EMPTY — the DECLARED numbers of the Darwin
 // sysctl MIB constants, and the COMPLETENESS of the two domains they form.
 //
-// sqlite src/test1.c:9100-9104 addresses hw.availcpu / hw.ncpu by MIB ARRAY
+// sqlite src/test1.c addresses hw.availcpu / hw.ncpu by MIB ARRAY
 // (`nm[0] = CTL_HW; nm[1] = HW_AVAILCPU;`), which is why CTL_HW / HW_NCPU /
 // HW_AVAILCPU had to ship at all; the other 36 rows are here because a PARTIAL
 // constant domain is the trap sys/file.json's LOCK_* comment names — a name
@@ -6526,7 +6677,7 @@ TEST(ShippedLibDescriptor, RealUnistdJsonUuidTMachoOnlyTypedef) {
 // number that is internally consistent but points at the WRONG kernel node is
 // invisible here — asserting CTL_HW == 6 beside a row that says 6 proves only
 // that both were typed the same way. That check requires the kernel and lives
-// in examples/c-subset/shipped_sysctl_mib_hw_macho, which cross-checks each MIB
+// in examples/c/shipped_sysctl_mib_hw_macho, which cross-checks each MIB
 // against the sysctlbyname NAME form of the same node on a real Mac.
 // MEASURED by demonstration: perturbing HW_MEMSIZE 24 -> 3 still BUILDS
 // (rc 0) and the example then exits 15 instead of 42.
@@ -6572,7 +6723,7 @@ TEST(ShippedLibDescriptor, RealSysSysctlJsonMibConstantDomains) {
         // failure says WHY the row exists rather than only that a number moved.
         for (auto const* n : {"CTL_HW", "HW_NCPU", "HW_AVAILCPU"})
             ASSERT_NE(find(n), nullptr)
-                << n << " is referenced by sqlite src/test1.c:9100-9104 — "
+                << n << " is referenced by sqlite src/test1.c — "
                         "without it the macho testfixture does not compile "
                         "(error[S0001], MEASURED)";
 
@@ -6657,7 +6808,7 @@ TEST(ShippedLibDescriptor, RealSysSysctlJsonMibConstantDomains) {
 // unexplained assignment error. The cross-ORIGIN half of the anchor (a SOURCE
 // declaration of the same tag shadowing the injected one) is not visible at this
 // tier at all; it is pinned in
-// tests/analysis/semantic/test_semantic_analyzer_c_subset.cpp.
+// tests/analysis/semantic/test_semantic_analyzer_c.cpp.
 //
 // RED-ON-DISABLE (MEASURED by demonstration): change either descriptor's
 // `tv_sec` to `i64 "long"` and both the tag EQ and the member EQ go red.
@@ -6711,7 +6862,7 @@ TEST(ShippedLibDescriptor, RealTimeAndSysStatShareOneTimespecTypeId) {
     ASSERT_NE(mtimespec, nullptr) << "the macho variant must carry st_mtimespec";
     EXPECT_EQ(mtimespec->type, fromTime->typeId)
         << "`stat.st_mtimespec` must denote the SAME timespec `struct timespec "
-           "x;` resolves to — this is the assignment sqlite os_unix.c:7731 makes";
+           "x;` resolves to — this is the assignment sqlite os_unix.c makes";
 
     // Positive control: the shared type is the real 16-byte {i64,i64}, so the
     // EQ above cannot pass vacuously on two invalid/empty ids.
@@ -6721,6 +6872,370 @@ TEST(ShippedLibDescriptor, RealTimeAndSysStatShareOneTimespecTypeId) {
     ASSERT_TRUE(layout.has_value());
     EXPECT_EQ(layout->size, 16u);
     EXPECT_EQ(interner.kind(fromTime->typeId), TypeKind::Struct);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-FFI-DESCRIPTOR-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR — the interner-free
+// `constants` read, the second seam of the ONE owner `preprocessorVisible`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The projection: value BIT PATTERN, declared signedness, declared width. All
+// three matter — the preprocessor spells the literal from them, and dropping
+// the signedness is exactly the wrong-arm defect this row closed.
+TEST(ShippedLibDescriptor, ReadShippedLibConstantsInternerFree) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "limits.json", R"JSON({
+        "header": "limits.h",
+        "constants": [
+          { "name": "UINT_MAX", "value": 4294967295, "type": "u32" },
+          { "name": "INT_MIN",  "value": -2147483648, "type": "i32" },
+          { "name": "BIGU",     "value": 18446744073709551615, "type": "u64" }
+        ]
+    })JSON");
+    DiagnosticReporter rep;
+    auto ks = readShippedLibConstants(path, rep);   // NO interner / typeReg
+    ASSERT_TRUE(ks.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(ks->size(), 3u);
+
+    EXPECT_EQ(ks->at(0).name, "UINT_MAX");
+    EXPECT_TRUE(ks->at(0).isUnsigned);
+    EXPECT_EQ(ks->at(0).width, 32u);
+    EXPECT_EQ(static_cast<std::uint64_t>(ks->at(0).value), 4294967295ULL);
+
+    EXPECT_EQ(ks->at(1).name, "INT_MIN");
+    EXPECT_FALSE(ks->at(1).isUnsigned);
+    EXPECT_EQ(ks->at(1).width, 32u);
+    EXPECT_EQ(ks->at(1).value, INT64_C(-2147483648));
+
+    // The full unsigned range round-trips through the int64 carrier — the
+    // property `decodeConstantValue` documents and the spelling depends on.
+    EXPECT_TRUE(ks->at(2).isUnsigned);
+    EXPECT_EQ(ks->at(2).width, 64u);
+    EXPECT_EQ(static_cast<std::uint64_t>(ks->at(2).value),
+              18446744073709551615ULL);
+}
+
+// `preprocessorVisible: false` is EXCLUDED from this read and PRESENT in the
+// semantic one — the whole point of the field being ONE fact with two readers.
+// Asserting only the exclusion would leave a "drop the row entirely" bug green.
+TEST(ShippedLibDescriptor, PreprocessorVisibleFalseIsSemanticOnly) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "threadsx.json", R"JSON({
+        "header": "threadsx.h",
+        "constants": [
+          { "name": "VISIBLE",    "value": 1, "type": "i32" },
+          { "name": "ENUMERATOR", "value": 2, "type": "i32",
+            "preprocessorVisible": false }
+        ]
+    })JSON");
+    {
+        DiagnosticReporter rep;
+        auto ks = readShippedLibConstants(path, rep);
+        ASSERT_TRUE(ks.has_value());
+        ASSERT_EQ(ks->size(), 1u);
+        EXPECT_EQ(ks->at(0).name, "VISIBLE")
+            << "the enumerator row must not reach the preprocessor -- making it "
+               "a macro would be an extension neither reference has";
+    }
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+        ASSERT_TRUE(desc.has_value());
+        ASSERT_EQ(desc->constants.size(), 2u)
+            << "and it must STILL be injected semantically -- this row ADDS a "
+               "preprocessor surface, it does not relocate the semantic one";
+        EXPECT_TRUE(desc->constants.at(0).preprocessorVisible);
+        EXPECT_FALSE(desc->constants.at(1).preprocessorVisible);
+    }
+}
+
+// A non-boolean `preprocessorVisible` FAILS LOUD rather than being coerced —
+// a truthy string would otherwise silently make an enumerator a macro.
+TEST(ShippedLibDescriptor, PreprocessorVisibleMustBeBoolean) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "badvis.json", R"JSON({
+        "header": "badvis.h",
+        "constants": [
+          { "name": "X", "value": 1, "type": "i32",
+            "preprocessorVisible": "yes" }
+        ]
+    })JSON");
+    DiagnosticReporter rep;
+    EXPECT_FALSE(readShippedLibConstants(path, rep).has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// ★ THE AXIS REFUSAL, and it is what makes the preprocessor's `activeTarget =
+// nullopt` SAFE rather than merely lucky. The splice threads the object-format
+// and no arch, so an arch-keyed VISIBLE constant would select in the semantic
+// tier and be absent from `#if` on every target — this row's defect, one axis
+// over. Refused at LOAD, on every target.
+TEST(ShippedLibDescriptor, APreprocessorVisibleConstantMaySelectOnFormatOnly) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // NEGATIVE: an arch axis on a visible constant.
+    {
+        auto const path = writeTemp(dir, "archy.json", R"JSON({
+            "header": "archy.h",
+            "constants": [
+              { "name": "K", "variants": [
+                { "when": { "arch": "x86_64" }, "value": 1, "type": "i32" },
+                { "when": { "arch": "arm64" },  "value": 2, "type": "i32" }
+              ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        EXPECT_FALSE(readShippedLibConstants(path, rep).has_value());
+        EXPECT_TRUE(rep.hasErrors());
+    }
+    // POSITIVE CONTROL 1: the same shape on `format` loads clean, so the
+    // refusal is about the AXIS and not about variants as such.
+    {
+        auto const path = writeTemp(dir, "fmtk.json", R"JSON({
+            "header": "fmtk.h",
+            "constants": [
+              { "name": "K", "variants": [
+                { "when": { "format": "elf" }, "value": 1, "type": "i32" },
+                { "when": { "format": "pe" },  "value": 2, "type": "i32" }
+              ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        auto ks = readShippedLibConstants(path, rep, std::nullopt,
+                                          ObjectFormatKind::Elf);
+        ASSERT_TRUE(ks.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(ks->size(), 1u);
+        EXPECT_EQ(ks->at(0).value, 1);
+    }
+    // POSITIVE CONTROL 2: a SEMANTIC-ONLY constant may still use any axis — the
+    // refusal is scoped to the rows that must reach the preprocessor.
+    {
+        auto const path = writeTemp(dir, "archyok.json", R"JSON({
+            "header": "archyok.h",
+            "constants": [
+              { "name": "K", "preprocessorVisible": false, "variants": [
+                { "when": { "arch": "x86_64" }, "value": 1, "type": "i32" },
+                { "when": { "arch": "arm64" },  "value": 2, "type": "i32" }
+              ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        auto ks = readShippedLibConstants(path, rep, std::string_view{"x86_64"});
+        ASSERT_TRUE(ks.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_TRUE(ks->empty()) << "semantic-only, so nothing for the splice";
+    }
+}
+
+// EMPTY (not nullopt) for a descriptor with no `constants` — the same
+// no-surface contract `readShippedLibMacros` keeps for a typed-only header.
+TEST(ShippedLibDescriptor, ReadShippedLibConstantsEmptyWhenNoSurface) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "assert2.json", R"JSON({
+        "header": "assert2.h",
+        "macros": [ { "name": "assert", "params": ["e"], "replacement": "((void)0)" } ]
+    })JSON");
+    DiagnosticReporter rep;
+    auto ks = readShippedLibConstants(path, rep);
+    ASSERT_TRUE(ks.has_value());
+    EXPECT_TRUE(ks->empty());
+    EXPECT_FALSE(rep.hasErrors());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-FFI-DESCRIPTOR-MACRO-VARIANT-COVERAGE-AND-ARITY-UNCHECKED — three loader
+// guards. ★★ TWO OF THE THREE ARE DELIBERATELY NOT WHAT THE ROW PRESCRIBED,
+// because the row's prescriptions were MEASURED to reject correct shipped
+// config; the tests below pin BOTH what is refused and what must keep loading,
+// and the second half is the one that matters.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// limb (a): a macro's variants must cover the formats THE MACRO claims.
+TEST(ShippedLibDescriptor, MacroVariantsMustCoverTheMacrosOwnAvailability) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // NEGATIVE: claims elf+pe, ships only elf. Without this guard the pe build
+    // simply would not inject it and `#if defined(M)` would take the other arm
+    // with no diagnostic at all.
+    {
+        auto const path = writeTemp(dir, "gap.json", R"JSON({
+            "header": "gap.h",
+            "macros": [
+              { "name": "M", "availableObjectFormats": ["elf", "pe"],
+                "variants": [
+                  { "when": { "format": "elf" }, "replacement": "1" }
+                ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        EXPECT_FALSE(readShippedLibMacros(path, rep, ObjectFormatKind::Elf)
+                         .has_value());
+        EXPECT_TRUE(rep.hasErrors())
+            << "and it must fail on EVERY target, including the one whose arm "
+               "IS present -- an inactive gap that only reds on the format it "
+               "affects is a gap nobody's leg finds";
+    }
+    // POSITIVE 1: claims exactly what it ships.
+    {
+        auto const path = writeTemp(dir, "covered.json", R"JSON({
+            "header": "covered.h",
+            "macros": [
+              { "name": "M", "availableObjectFormats": ["elf"],
+                "variants": [
+                  { "when": { "format": "elf" }, "replacement": "1" }
+                ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        auto ms = readShippedLibMacros(path, rep, ObjectFormatKind::Elf);
+        ASSERT_TRUE(ms.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(ms->size(), 1u);
+    }
+    // ★★ POSITIVE 2 — THE ONE THE ROW'S OWN PRESCRIPTION WOULD HAVE FAILED. The
+    // row said to check the variants against the DESCRIPTOR's
+    // `availableObjectFormats`. ✔MEASURED by applying exactly that rule to the
+    // tree: it rejects 14 of the 44 variant-bearing shipped macros, nearly all
+    // correct platform facts (`S_ISSOCK` has no pe arm because Windows has no
+    // socket mode bit; `_stati64` is MSVC-only). A macro claims its OWN reach;
+    // the descriptor's is the union over all its surfaces and is wider.
+    {
+        auto const path = writeTemp(dir, "narrow.json", R"JSON({
+            "header": "narrow.h",
+            "availableObjectFormats": ["elf", "macho", "pe"],
+            "macros": [
+              { "name": "S_ISSOCK", "variants": [
+                  { "when": { "format": "elf" },   "replacement": "1" },
+                  { "when": { "format": "macho" }, "replacement": "1" }
+              ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        auto ms = readShippedLibMacros(path, rep, ObjectFormatKind::Pe);
+        ASSERT_TRUE(ms.has_value())
+            << "a macro narrower than its descriptor is CORRECT and must load";
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_TRUE(ms->empty()) << "and it is simply not injected on pe";
+    }
+}
+
+// limb (b): two FUNCTION-LIKE arms may not disagree on arity.
+TEST(ShippedLibDescriptor, MacroFunctionLikeVariantsMustAgreeOnArity) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // NEGATIVE: F(a) on elf and F(a,b) on pe. A source file writes ONE
+    // invocation, so no call site can satisfy both.
+    {
+        auto const path = writeTemp(dir, "arity.json", R"JSON({
+            "header": "arity.h",
+            "macros": [
+              { "name": "F", "variants": [
+                  { "when": { "format": "elf" }, "params": ["a"], "replacement": "(a)" },
+                  { "when": { "format": "pe" },  "params": ["a","b"], "replacement": "(a)" }
+              ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        EXPECT_FALSE(readShippedLibMacros(path, rep, ObjectFormatKind::Elf)
+                         .has_value());
+        EXPECT_TRUE(rep.hasErrors());
+    }
+    // NEGATIVE: same arity but one arm variadic — also a different call shape.
+    {
+        auto const path = writeTemp(dir, "variadic.json", R"JSON({
+            "header": "variadic.h",
+            "macros": [
+              { "name": "F", "variants": [
+                  { "when": { "format": "elf" }, "params": ["a"], "replacement": "(a)" },
+                  { "when": { "format": "pe" },  "params": ["a"], "variadic": true,
+                    "replacement": "(a)" }
+              ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        EXPECT_FALSE(readShippedLibMacros(path, rep, ObjectFormatKind::Elf)
+                         .has_value());
+        EXPECT_TRUE(rep.hasErrors());
+    }
+    // ★★ POSITIVE — THE ROW'S PRESCRIPTION WOULD HAVE FAILED THIS TOO, and it is
+    // shipped config, not a hypothetical. The row said every variant must agree
+    // on `params.has_value()`. `stdlib.json`'s `atexit` is FUNCTION-like on elf
+    // (`atexit(f) -> __cxa_atexit(...)`) and OBJECT-like on pe (`atexit ->
+    // _crt_atexit`), and BOTH expand `atexit(g)` correctly: an object-like
+    // rename substitutes the NAME and leaves the argument list standing. So an
+    // object-like arm is compatible with any function-like arity.
+    {
+        auto const path = writeTemp(dir, "rename.json", R"JSON({
+            "header": "rename.h",
+            "macros": [
+              { "name": "atexit", "variants": [
+                  { "when": { "format": "elf" }, "params": ["f"],
+                    "replacement": "__cxa_atexit((void (*)(void *))(f), 0, 0)" },
+                  { "when": { "format": "pe" }, "replacement": "_crt_atexit" }
+              ] }
+            ]
+        })JSON");
+        for (auto fmt : {ObjectFormatKind::Elf, ObjectFormatKind::Pe}) {
+            DiagnosticReporter rep;
+            auto ms = readShippedLibMacros(path, rep, fmt);
+            ASSERT_TRUE(ms.has_value())
+                << "the object-like/function-like split is a real, correct "
+                   "shipped shape and must keep loading on every format";
+            EXPECT_FALSE(rep.hasErrors());
+        }
+    }
+}
+
+// limb (c): an EMPTY `when` was an unconditional catch-all by accident — no key
+// present meant no branch ran and `matches` kept its initial true, so the arm
+// selected on every target INCLUDING one with no active format, contradicting
+// this evaluator's own documented contract.
+TEST(ShippedLibDescriptor, AnEmptyWhenSelectorIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    {
+        auto const path = writeTemp(dir, "emptywhen.json", R"JSON({
+            "header": "emptywhen.h",
+            "macros": [
+              { "name": "M", "variants": [ { "when": {}, "replacement": "1" } ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        EXPECT_FALSE(readShippedLibMacros(path, rep, ObjectFormatKind::Elf)
+                         .has_value());
+        EXPECT_TRUE(rep.hasErrors());
+    }
+    // ★ AND IT MUST BE REFUSED WITH NO ACTIVE FORMAT TOO — the caller for whom
+    // the old behaviour was most obviously wrong, since the contract says
+    // nullopt can select nothing and the empty selector selected anyway.
+    {
+        auto const path = writeTemp(dir, "emptywhen2.json", R"JSON({
+            "header": "emptywhen2.h",
+            "constants": [
+              { "name": "K", "variants": [
+                  { "when": {}, "value": 1, "type": "i32" } ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        EXPECT_FALSE(readShippedLibConstants(path, rep).has_value());
+        EXPECT_TRUE(rep.hasErrors());
+    }
+    // POSITIVE CONTROL: a one-key `when` is unaffected, so the refusal is about
+    // EMPTINESS and not about `when` objects as such.
+    {
+        auto const path = writeTemp(dir, "onekey.json", R"JSON({
+            "header": "onekey.h",
+            "macros": [
+              { "name": "M", "variants": [
+                  { "when": { "format": "elf" }, "replacement": "1" } ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        auto ms = readShippedLibMacros(path, rep, ObjectFormatKind::Elf);
+        ASSERT_TRUE(ms.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(ms->size(), 1u);
+    }
 }
 
 } // namespace

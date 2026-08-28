@@ -71,8 +71,10 @@ void expectMentions(std::string_view haystack, std::string_view needle,
         << haystack;
 }
 
-// Mnemonics MEASURED in the shipped targets (2026-08-14): `lea` and `bswap`
-// are declared by x86_64; `msub` by arm64 only; `popcount` by x86_64 only.
+// Mnemonics MEASURED in the shipped targets (re-measured 2026-08-26): `lea`
+// and `bswap` are declared by x86_64; `msub` by arm64 only; `ctz` by x86_64
+// only. ⚠ `popcount` used to be the x86_64-only one and is now declared by
+// BOTH (D-FULLC-STDBIT-ARM64-CNT-POPCOUNT) — see the note on the central pin.
 // The two one-sided ones are the load-bearing fixtures below — they let one
 // spelling be simultaneously valid and invalid depending only on the document,
 // which is what proves the check reads the DOCUMENT and not a static list.
@@ -136,9 +138,21 @@ TEST(MutateTargetSchema, TheVerdictFollowsTheDOCUMENTNotTheSpelling) {
     // ★ THE CENTRAL PIN. `msub` is a real, correctly-spelled mnemonic — arm64
     // declares it and x86_64 does not. One spelling, two targets, opposite
     // verdicts: a check keyed on a static allowlist, or one that merely looked
-    // plausible, cannot produce this pair. `popcount` runs the same experiment
-    // with the targets swapped, so neither direction is a fluke of which
-    // target happens to be richer.
+    // plausible, cannot produce this pair. `ctz` runs the same experiment with
+    // the targets swapped, so neither direction is a fluke of which target
+    // happens to be richer.
+    //
+    // ⚠ THE SWAPPED-DIRECTION MNEMONIC WAS `popcount` UNTIL 2026-08-26, AND THE
+    // PRODUCT MOVED OUT FROM UNDER IT. D-FULLC-STDBIT-ARM64-CNT-POPCOUNT made
+    // arm64 declare a `popcount` row (realized as a four-step SIMD sequence), so
+    // "arm64 does not declare `popcount`" stopped being true and this test went
+    // red — correctly. **A test that asserts an absence is a claim about the
+    // product, and the product is allowed to change.** `ctz` replaces it because
+    // it is the same KIND of fact: x86_64 declares it (TZCNT) and arm64 does not,
+    // composing trailing-zeros from RBIT + CLZ instead. ✔MEASURED 2026-08-26 —
+    // of {ctz, popcount, clz, bswap}, `ctz` is now the only x86-only member.
+    // ⚠ If a future cycle gives arm64 a `ctz` row, this test goes red again and
+    // the fix is another mnemonic, never a loosened assertion.
     auto armOk = mutateShippedTargetSchemaJson(kArm, {"msub"});
     EXPECT_TRUE(armOk.has_value())
         << "arm64 declares `msub`; removing it must succeed";
@@ -152,18 +166,18 @@ TEST(MutateTargetSchema, TheVerdictFollowsTheDOCUMENTNotTheSpelling) {
            "nothing and must throw";
     expectMentions(x86Msg, "msub", "the mnemonic that missed");
 
-    auto x86Ok = mutateShippedTargetSchemaJson(kX86, {"popcount"});
+    auto x86Ok = mutateShippedTargetSchemaJson(kX86, {"ctz"});
     EXPECT_TRUE(x86Ok.has_value())
-        << "x86_64 declares `popcount`; removing it must succeed";
+        << "x86_64 declares `ctz` (TZCNT); removing it must succeed";
 
     std::string const armMsg = contractErrorFrom([] {
-        auto r = mutateShippedTargetSchemaJson(kArm, {"popcount"});
+        auto r = mutateShippedTargetSchemaJson(kArm, {"ctz"});
         (void)r;
     });
     ASSERT_FALSE(armMsg.empty())
-        << "arm64 does not declare `popcount` — removing it there mutates "
-           "nothing and must throw";
-    expectMentions(armMsg, "popcount", "the mnemonic that missed");
+        << "arm64 does not declare `ctz` (it composes RBIT + CLZ) — removing "
+           "it there mutates nothing and must throw";
+    expectMentions(armMsg, "ctz", "the mnemonic that missed");
 }
 
 TEST(MutateTargetSchema, EveryMissIsReportedInOneMessage) {

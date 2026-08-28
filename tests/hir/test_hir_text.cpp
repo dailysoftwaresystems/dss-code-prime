@@ -5,6 +5,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_span.hpp"
+#include "core/types/target_schema.hpp"  // OperandKindFilter — the operand-form half of a constraint binding
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -21,12 +22,15 @@
 #include "hir/hir_text.hpp"
 #include "repo_root.hpp"
 
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
+
 #include <gtest/gtest.h>
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -337,7 +341,7 @@ TEST(HirText, RoundTripExternWithFfi) {
     TypeId byteP = in.pointer(in.primitive(TypeKind::Byte));
     TypeId sig = in.fnSig(std::vector<TypeId>{u64}, byteP, CallConv::CcSysV);
 
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId param = b.makeVarDecl(u64, 2);
     HirNodeId ext = b.makeExternFunction(sig, 1, std::vector<HirNodeId>{param});
     HirNodeId root = b.makeModule(std::vector<HirNodeId>{ext});
@@ -366,7 +370,7 @@ TEST(HirText, RoundTripVariadicFnSig) {
     TypeId sig = in.fnSig(std::vector<TypeId>{byteP, i32}, i32, CallConv::CcSysV, /*isVariadic=*/true);
     ASSERT_TRUE(in.fnIsVariadic(sig));
 
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId p0 = b.makeVarDecl(byteP, 2);
     HirNodeId p1 = b.makeVarDecl(i32, 3);
     HirNodeId ext = b.makeExternFunction(sig, 1, std::vector<HirNodeId>{p0, p1});
@@ -541,10 +545,17 @@ namespace {
 }
 
 [[nodiscard]] std::string readFile(fs::path const& p) {
-    std::ifstream in{p, std::ios::binary};
-    if (!in) { ADD_FAILURE() << "cannot open " << p.string(); std::abort(); }
-    std::ostringstream buf; buf << in.rdbuf();
-    std::string s = std::move(buf).str();
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
+    // `std::abort()` here killed the whole binary, so one unreadable golden
+    // cost every sibling test its verdict. THROW -- GoogleTest reports an
+    // escaping exception as a failure of the ONE running test. The read itself
+    // goes through the ONE checked read, so a golden that reads SHORT is named
+    // as a torn read instead of surfacing as a golden mismatch.
+    auto text = dss::core::readFileChecked(p);
+    if (!text) {
+        throw std::runtime_error("golden: " + std::move(text).error().message);
+    }
+    std::string s = *std::move(text);
     // Normalize CRLF→LF: `emitHir` always writes LF, and `.dsshir` carries no
     // legitimate `\r`. A Windows checkout with core.autocrlf=true can rewrite the
     // LF-in-repo golden to CRLF on disk despite the `.gitattributes eol=lf`, so
@@ -1100,7 +1111,7 @@ TEST(HirText, InlineAsmBareBarrierStillRendersAsALoneKeyword) {
     TypeId const i64 = in.primitive(TypeKind::I64);
     TypeId const sig = in.fnSig({}, i64, CallConv::CcSysV);
 
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm);
     HirNodeId const ret  = b.makeReturn(b.makeLiteral(i64, 0));
     HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN, ret});
@@ -1174,14 +1185,36 @@ TEST(HirText, InlineAsmDescriptorRoundTripsWithEveryField) {
         inp.constraint    = parseAsmConstraint("a").value;
         inp.fixedRegister = "rax";
         d.operands.push_back(std::move(inp));
+
+        // ★★★ THE THIRD BINDING ARM, AND THE FIELD THIS CASE'S OWN COMMENT
+        // PROMISED TO CATCH AND DID NOT. `TargetAsmConstraint::binds` is
+        // three-armed; the two operands above exercise `registerClass` and
+        // `register`, and until this one existed NOTHING here set
+        // `operandKind*` — so the writer could (and did) drop the pair with
+        // every assertion in this case still green, because a smaller
+        // descriptor still round-trips byte-identically.
+        // ⚠ The consequence is not a cosmetic loss: `!regClassResolved &&
+        // !operandKindResolved` is byte-identical to "no target was in scope",
+        // and `hir_to_mir` refuses that operand saying the letter was never
+        // bound to a processor — a FALSE reason for a letter both shipped
+        // targets declare (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED,
+        // reproduced one tier over).
+        HirInlineAsmOperand mem;
+        mem.spellings           = {"%2"};
+        mem.constraint          = parseAsmConstraint("m").value;
+        mem.operandKindResolved = true;
+        mem.operandKind =
+            static_cast<std::uint8_t>(OperandKindFilter::MemBase);
+        d.operands.push_back(std::move(mem));
     }
     std::uint32_t const handle = asmPool.add(std::move(d));
     EXPECT_EQ(handle, 1u) << "handles are 1-BASED so 0 stays the no-descriptor "
                              "sentinel and cannot be produced by add()";
 
     HirLiteralPool lits;
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     std::vector<HirNodeId> const kids{b.makeRef(i64, /*symbol=*/2),
+                                      b.makeRef(i64, /*symbol=*/3),
                                       b.makeRef(i64, /*symbol=*/3)};
     HirNodeId const asmN = b.addParent(HirKind::InlineAsm, kids, InvalidType, handle);
     HirNodeId const ret  = b.makeReturn(b.makeLiteral(i64, lits.add(
@@ -1208,6 +1241,12 @@ TEST(HirText, InlineAsmDescriptorRoundTripsWithEveryField) {
               std::string::npos) << text;
     EXPECT_NE(text.find(R"("a" spells ( "%1" ) pin "rax" -> )"),
               std::string::npos) << text;
+    // Spelled by NAME, not by ordinal — `OperandKindFilter` is open-ended
+    // (`imm32` is 1, `membase` 3, and future width filters insert between), so
+    // a stored `.dsshir` written with an ordinal would silently mean something
+    // else after the next enumerator lands.
+    EXPECT_NE(text.find(R"("m" spells ( "%2" ) operand_kind membase -> )"),
+              std::string::npos) << text;
     EXPECT_NE(text.find(R"(clobbers ( "rax", "rbx" ))"), std::string::npos) << text;
     EXPECT_NE(
         text.find(
@@ -1227,7 +1266,7 @@ TEST(HirText, InlineAsmDescriptorRoundTripsWithEveryField) {
     EXPECT_TRUE(back.clobbersMemory);
     EXPECT_TRUE(back.clobbersConditionCodes);
     EXPECT_TRUE(back.protectsRegisters());
-    ASSERT_EQ(back.operands.size(), 2u);
+    ASSERT_EQ(back.operands.size(), 3u);
     EXPECT_EQ(back.operands[0].symbolicName, "dst");
     EXPECT_EQ(back.operands[0].constraint.raw, "=&r");
     EXPECT_TRUE(back.operands[0].constraint.isOutput);
@@ -1245,6 +1284,21 @@ TEST(HirText, InlineAsmDescriptorRoundTripsWithEveryField) {
     EXPECT_EQ(back.operands[0].spellings,
               (std::vector<std::string>{"%0", "%[dst]"}));
     EXPECT_EQ(back.operands[1].spellings, (std::vector<std::string>{"%1"}));
+    // ★★ THE VALUE, NOT MERELY "PARSED WITHOUT COMPLAINT". The field this pin
+    // exists for drops SILENTLY — a reader that never sets it produces a clean
+    // parse of a descriptor that now says something different — so a check for
+    // "no diagnostic" would have been green on exactly the defect.
+    EXPECT_FALSE(back.operands[0].operandKindResolved)
+        << "a class-bound letter resolves NO operand form; `binds` names one arm";
+    EXPECT_FALSE(back.operands[1].operandKindResolved);
+    EXPECT_TRUE(back.operands[2].operandKindResolved)
+        << "the form-bound operand came back as if no target had been in scope — "
+           "which is the state that makes hir_to_mir refuse a declared letter "
+           "with a false reason";
+    EXPECT_EQ(back.operands[2].operandKind,
+              static_cast<std::uint8_t>(OperandKindFilter::MemBase));
+    EXPECT_FALSE(back.operands[2].regClassResolved);
+    EXPECT_TRUE(back.operands[2].fixedRegister.empty());
     EXPECT_EQ(back.labelSpellings,
               (std::vector<std::vector<std::string>>{{"%l[done]", "%l2"},
                                                      {"%l[again]", "%l3"}}));
@@ -1271,7 +1325,7 @@ TEST(HirText, InlineAsmLabelsWithNoSpellingsStillRoundTripOneGroupPerOrdinal) {
     d.labelSpellings = {{}, {}};
     std::uint32_t const handle = asmPool.add(std::move(d));
 
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm, InvalidType, handle);
     HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN});
     HirNodeId const root = b.makeModule(std::vector<HirNodeId>{body});
@@ -1301,7 +1355,7 @@ TEST(HirText, InlineAsmLabelsWithNoSpellingsStillRoundTripOneGroupPerOrdinal) {
 // BARRIER -- a different program. So the writer emits an explicit handle form
 // AND reports.
 TEST(HirText, InlineAsmWithNoPoolReportsRatherThanRenderingABarrier) {
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm, InvalidType, /*payload=*/4);
     HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN});
     HirNodeId const root = b.makeModule(std::vector<HirNodeId>{body});
@@ -1338,7 +1392,7 @@ TEST(HirText, InlineAsmDoesNotSwallowAFollowingGotoStatement) {
     d.templateText = "nop";          // NO flags and NO sections: the bare tail
     std::uint32_t const handle = asmPool.add(std::move(d));
 
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const asmN  = b.addLeaf(HirKind::InlineAsm, InvalidType, handle);
     HirNodeId const gotoN = b.makeGotoStmt(1);
     HirNodeId const lbl   = b.makeLabelStmt(1, b.makeReturn(std::nullopt));
@@ -1378,7 +1432,7 @@ TEST(HirText, InlineAsmTemplateWithANewlineStillRoundTripsByteIdentically) {
     d.templateText = "nop\n\tnop";
     std::uint32_t const handle = asmPool.add(std::move(d));
 
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm, InvalidType, handle);
     HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN});
     HirNodeId const root = b.makeModule(std::vector<HirNodeId>{body});
@@ -1397,4 +1451,106 @@ TEST(HirText, InlineAsmTemplateWithANewlineStillRoundTripsByteIdentically) {
     ASSERT_EQ(res->inlineAsmPool.size(), 1u);
     EXPECT_EQ(res->inlineAsmPool.at(1).templateText, "nop\n\tnop")
         << "the template must survive the round trip byte for byte";
+}
+
+// ── D-HIR-TEXT-INLINE-ASM-OPERAND-KIND-DROPPED-IN-TRANSIT ───────────────────
+//
+// The REFUSAL half of the operand-form clause. A name has a failure arm and an
+// ordinal does not, which is the whole reason this field is spelled rather than
+// numbered; this asserts the arm exists and names what it accepts, so a
+// hand-edited `.dsshir` cannot mint an operand form no build defines.
+//
+// ⚠ THE POSITIVE ARM ALONE WOULD NOT SAY THIS. A reader that silently ignored an
+// unrecognized spelling would still pass every assertion in
+// `InlineAsmDescriptorRoundTripsWithEveryField`, and would drop the binding for
+// exactly the reason that row exists.
+TEST(HirText, InlineAsmOperandKindThatNamesNoFormIsRefusedWithTheAcceptedSet) {
+    std::string const text =
+        "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "  function %1 : fn() -> void {\n    block {\n"
+        "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"m\" "
+        "operand_kind not_a_form -> lit int 0 : i32 ) }\n"
+        "      return\n    }\n  }\n}\n";
+    DiagnosticReporter r;
+    auto res = parseHir(text, CompilationUnitId{31}, r);
+    EXPECT_FALSE(res->ok);
+    std::string all;
+    for (auto const& d : r.all()) { all += d.actual; all += '\n'; }
+    EXPECT_NE(all.find("unknown inline-asm operand kind 'not_a_form'"),
+              std::string::npos) << all;
+    EXPECT_NE(all.find("'membase'"), std::string::npos)
+        << "the refusal must name the accepted set:\n" << all;
+    EXPECT_NE(all.find("'imm32'"), std::string::npos) << all;
+}
+
+// The form a real target actually produces, driven as TEXT rather than as a
+// hand-built descriptor: both shipped targets declare `"i"` → `imm32`, and the
+// front end resolves it to `operandKindResolved` with no register class at all.
+// A writer/reader pair that dropped the field would hand `hir_to_mir` an operand
+// indistinguishable from one analyzed with no target in scope.
+TEST(HirText, InlineAsmImmediateFormOperandSurvivesTheTextTier) {
+    std::string const text =
+        "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "  function %1 : fn() -> void {\n    block {\n"
+        "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"i\" "
+        "operand_kind imm32 -> lit int 7 : i32 ) }\n"
+        "      return\n    }\n  }\n}\n";
+    DiagnosticReporter r;
+    auto res = parseHir(text, CompilationUnitId{32}, r);
+    ASSERT_TRUE(res->ok);
+    ASSERT_EQ(res->inlineAsmPool.size(), 1u);
+    auto const& d = res->inlineAsmPool.at(1);
+    ASSERT_EQ(d.operands.size(), 1u);
+    EXPECT_TRUE(d.operands[0].operandKindResolved);
+    EXPECT_EQ(d.operands[0].operandKind,
+              static_cast<std::uint8_t>(OperandKindFilter::ImmInt));
+    EXPECT_FALSE(d.operands[0].regClassResolved)
+        << "a form-bound letter resolves no register class — and the pair of "
+           "flags is what tells that apart from 'no target was in scope'";
+}
+
+// D-HIR-TEXT-INLINE-ASM-REGISTER-CLASS-ORDINAL-IS-UNVALIDATED
+// The `class <N>` sibling of the operand-form clause. Found while adding that
+// clause: this position read an arbitrary integer straight onto the wire, so a
+// hand-written `.dsshir` could mint a `TargetRegClass` no build defines and load
+// CLEAN — `bindAsmOperand`'s only guard is `cls == None`, which a garbage ordinal
+// passes on its way to a register file that does not exist.
+//
+// ⓘ THE WIRE FORM IS STILL AN ORDINAL and deliberately so: it is what the writer
+// emits and what stored goldens carry. Only the acceptance changed.
+TEST(HirText, InlineAsmRegisterClassOrdinalOutsideTheEnumIsRefused) {
+    std::string const text =
+        "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "  function %1 : fn() -> void {\n    block {\n"
+        "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"r\" "
+        "class 200 -> lit int 0 : i32 ) }\n"
+        "      return\n    }\n  }\n}\n";
+    DiagnosticReporter r;
+    auto res = parseHir(text, CompilationUnitId{33}, r);
+    EXPECT_FALSE(res->ok);
+    std::string all;
+    for (auto const& d : r.all()) { all += d.actual; all += '\n'; }
+    EXPECT_NE(all.find("names no TargetRegClass"), std::string::npos) << all;
+    EXPECT_NE(all.find("'gpr'"), std::string::npos)
+        << "the refusal must name the accepted set:\n" << all;
+}
+
+// The matched positive, so the arm above cannot be green because the position
+// stopped accepting anything at all. A class the enum DOES define still loads
+// and still round-trips its value.
+TEST(HirText, InlineAsmRegisterClassOrdinalInsideTheEnumStillLoads) {
+    std::string const text =
+        "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "  function %1 : fn() -> void {\n    block {\n"
+        "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"r\" "
+        "class 1 -> lit int 0 : i32 ) }\n"
+        "      return\n    }\n  }\n}\n";
+    DiagnosticReporter r;
+    auto res = parseHir(text, CompilationUnitId{34}, r);
+    ASSERT_TRUE(res->ok);
+    ASSERT_EQ(res->inlineAsmPool.size(), 1u);
+    ASSERT_EQ(res->inlineAsmPool.at(1).operands.size(), 1u);
+    EXPECT_TRUE(res->inlineAsmPool.at(1).operands[0].regClassResolved);
+    EXPECT_EQ(res->inlineAsmPool.at(1).operands[0].regClass,
+              static_cast<std::uint8_t>(TargetRegClass::GPR));
 }

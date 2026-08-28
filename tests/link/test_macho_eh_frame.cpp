@@ -828,3 +828,127 @@ TEST(MachOTextSectionAlign, NonPowerOfTwoTextAlignFailsLoud) {
     EXPECT_TRUE(named)
         << "the refusal must name the log2 field, not merely fail";
 }
+
+// ── THE TWO ARMS THE ALIGN PIN ABOVE DOES NOT ACTUALLY READ ────────────────
+//    D-FORMAT-MACHO-SECTION-ALIGN-EMITTED-RAW-NOT-LOG2 (the residual half)
+//
+// ✔MEASURED 2026-08-26, byte-level, on images emitted by the SHIPPED writer:
+// `__text`'s `section_64.align` is 4 (= 2^4 = 16 bytes) on BOTH
+// `macho64-arm64-darwin-exec` and `macho64-x86_64-darwin-exec`. The raw-16
+// defect is GONE, closed by
+//   D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD
+// and `EveryArmWritesLog2OfTheSchemasByteCount` above pins it.
+//
+// ★ WHAT THAT SUITE STILL COULD NOT SEE, and why these two exist:
+//
+//   (1) THE DYLIB ARM WAS PINNED BY READING THE SCHEMA, NOT THE IMAGE.
+//       `DylibSchemasDeclareTheSameRawByteCount` loads the two dylib documents
+//       and asserts `addrAlign == 16` — a fact about the JSON. It emits
+//       nothing and reads no byte. Its own comment argues the dylib arm "rides
+//       encodeExecDynamic — the SAME textAlignLog2", which is true of today's
+//       code and is exactly the kind of claim an instrument is supposed to
+//       stop depending on: it is a statement about the WRITER, offered in
+//       place of a statement about the OUTPUT.
+//
+//   (2) NEITHER EXEC CASE ABOVE REACHES `encodeExec`. `makeModule` carries an
+//       extern import, and `macho::encode` routes a module with a non-empty
+//       `externImports` to `encodeExecDynamic`. So the two shipped exec rows
+//       exercise the DYNAMIC arm twice; the static arm's own
+//       `sectionAlignLog2` call site is never driven. Three arms were claimed,
+//       two were measured.
+//
+// Both gaps are the same shape as the defect the parent anchor closed — a
+// second site quietly reaching its own conclusion about one field — so they are
+// closed by MEASUREMENT here rather than by an argument about code shape.
+
+TEST(MachOTextSectionAlign, DylibIMAGESWriteLog2NotJustTheirSchemas) {
+    struct Case { std::string_view target, format; };
+    std::vector<Case> const cases{
+        {"arm64",  "macho64-arm64-darwin-dylib"},
+        {"x86_64", "macho64-x86_64-darwin-dylib"},
+    };
+    for (auto const& c : cases) {
+        SCOPED_TRACE(std::string{c.format});
+        auto target = TargetSchema::loadShipped(c.target);
+        ASSERT_TRUE(target.has_value());
+        auto fmt = ObjectFormatSchema::loadShipped(c.format);
+        ASSERT_TRUE(fmt.has_value());
+        auto const* row = (*fmt)->sectionByKind(SectionKind::Text);
+        ASSERT_NE(row, nullptr);
+
+        // ⚠ NOT `makeModule`: that one is EXEC-shaped -- it carries an extern
+        // import and an `imageEntryOverride`, and a dylib has neither a LC_MAIN
+        // to override nor (in the zero-import witness shape this mirrors) any
+        // imports. ✔MEASURED: handing the exec module to a dylib schema is
+        // refused with one diagnostic, so the first cut of this test failed
+        // before it ever read a byte. The shape below is the c150/c152
+        // zero-import dylib witness `test_macho_dylib_writer.cpp` uses.
+        AssembledModule mod;
+        mod.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes.assign(16, 0x90);
+        mod.functions.push_back(std::move(fn));
+        mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_dss_a",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+
+        DiagnosticReporter rep;
+        auto const bytes = macho::encode(mod, **target, **fmt, rep);
+        // The diagnostics are SPELLED OUT on failure: an encode that refuses
+        // for an unrelated reason would otherwise read as an align defect.
+        std::string why;
+        for (auto const& d : rep.all()) { why += d.actual; why += '\n'; }
+        ASSERT_EQ(rep.errorCount(), 0u) << why;
+        ASSERT_FALSE(bytes.empty()) << why;
+
+        auto const align = textSectionAlignField(bytes, "__TEXT");
+        ASSERT_TRUE(align.has_value()) << "no __text section_64 record";
+        ASSERT_TRUE(std::has_single_bit(row->addrAlign));
+        EXPECT_EQ(*align,
+                  static_cast<std::uint32_t>(std::countr_zero(row->addrAlign)))
+            << "section_64.align must be log2(addrAlign) in the EMITTED dylib, "
+               "not merely in the schema the dylib was emitted from";
+        EXPECT_EQ(*align, 4u) << "log2(16) = 4 — 16-byte code alignment";
+        EXPECT_NE(*align, 16u)
+            << "16 in this field means 2^16 = 65536-byte alignment, the exact "
+               "value the exec and dylib arms used to ship";
+    }
+}
+
+TEST(MachOTextSectionAlign, TheSTATICExecArmWritesLog2Too) {
+    // ★ THE MODULE CARRIES NO EXTERN IMPORTS, AND THAT IS THE WHOLE POINT:
+    // `macho::encode` routes on `externImports.empty()`, so this is the only
+    // shape that reaches `encodeExec`. The synthetic schema is used rather than
+    // a shipped one because every shipped Darwin exec document declares a
+    // non-zero `image.codeSignatureSize`, and `macho::encode` REFUSES that
+    // combination outright (the static arm emits no __LINKEDIT to host the
+    // signature) — so the static arm is unreachable from a shipped exec schema
+    // by construction, and saying so here is cheaper than the next reader
+    // re-deriving it.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(execSchemaJson());
+    ASSERT_TRUE(fmt.has_value());
+    auto const* row = (*fmt)->sectionByKind(SectionKind::Text);
+    ASSERT_NE(row, nullptr);
+    ASSERT_EQ(row->addrAlign, 16u)
+        << "the synthetic schema no longer declares __text's addrAlign as 16 "
+           "raw bytes; this test would otherwise assert the wrong constant";
+
+    AssembledModule mod = makeModule(**target, /*withCfi=*/false);
+    mod.externImports.clear();   // force the STATIC arm
+    ASSERT_TRUE(mod.externImports.empty());
+
+    DiagnosticReporter rep;
+    auto const bytes = macho::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    auto const align = textSectionAlignField(bytes, "__TEXT");
+    ASSERT_TRUE(align.has_value());
+    EXPECT_EQ(*align,
+              static_cast<std::uint32_t>(std::countr_zero(row->addrAlign)));
+    EXPECT_EQ(*align, 4u);
+    EXPECT_NE(*align, 16u);
+}

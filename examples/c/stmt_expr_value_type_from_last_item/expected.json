@@ -1,0 +1,46 @@
+{
+  "$comment": "D-C-SUBTREE-TYPE-WALKS-INTO-A-STATEMENT-EXPRESSION-BODY (P32 lane A): a GNU statement expression whose BODY DECLARES something of a different type than the body YIELDS. `subtreeType` walked INTO the body, met a declaration, and took the DECLARATOR's type, so the construct was judged as the wrong operand. MEASURED at the pre-change HEAD through the shipped CLI, bisected: `*({ *q; })` OK, `*({ int *r = p; r; })` OK, `int x = *({ int **q = &p; *q; });` FALSE S0003. It was a REFUSAL of valid C, never a miscompile -- which is why it needs a RUNNABLE witness: the failure mode is 'correct code does not build'. The fix takes the body's type from the same place the lowering takes its value (the last item's expression, recognised by HIR kind `ExprStmt` exactly as `stmtExprItems` does), so the two tiers cannot disagree about what a body yields. 20+12+10 = 42. RED-ON-DISABLE: remove the statement-expression arm from `subtreeType` (the one keyed on hirLowering.stmtExprRule) -> the first initializer fails S0003 -> compile failure, not exit 42. * The `void` statement expression stays a REFUSAL in value position (matching gcc and clang) and is pinned in tests/analysis/semantic/test_stmt_expr_value_type.cpp, because a corpus example cannot carry a program that must fail to build. * VERIFIED clean against BOTH references (-std=c2x -Wall -Wextra): gcc 13.3.0 and clang 19.1.7, zero errors and zero warnings, both exit 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

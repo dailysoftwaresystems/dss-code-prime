@@ -421,7 +421,7 @@ TEST(Optimizer, EffectivenessConstFoldRerunPostMem2Reg) {
 
 // ── D-OPT-ALIAS-ARC-CORPUS-CAPSTONE-STRICT effectiveness pin ────────
 //
-// Hand-built mirror of `examples/c-subset/strict_alias_cse_capstone/
+// Hand-built mirror of `examples/c/strict_alias_cse_capstone/
 // main.c`'s `compute(int* pI, long* pL){int a=*pI; *pL=7; return
 // a+*pI;}` shape — but the alloca on `a` is elided because the
 // effectiveness arc closes at MIR level on the Args directly (the
@@ -433,7 +433,7 @@ TEST(Optimizer, EffectivenessConstFoldRerunPostMem2Reg) {
 // alias substrate (mirMayAlias Rule 6 distinct non-char primitives;
 // strict-TBAA opt-in via `MirAliasingMode::StrictTBAA`); cycle 10h
 // added the `long`→I64 primitive so `Ptr<I32>` vs `Ptr<I64>` is
-// expressible in c-subset source. This pin proves the FULL release
+// expressible in c source. This pin proves the FULL release
 // pipeline observes the effectiveness — the second Load(pI) is
 // eliminated AND `passMutationCount[Cse] >= 1`. Without it, the
 // corpus row's runtime exit code agreement between baseline + Cse
@@ -450,11 +450,11 @@ Mir buildAliasArcStrictCapstoneMir(TypeInterner& interner) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder b;
-    // Match the c-subset config: strictAliasingOnDistinctTypes=true
+    // Match the c config: strictAliasingOnDistinctTypes=true
     // + charTypesAliasAll=true. The capstone exercises Rule 6 (not
     // Rule 5), so charTypesAliasAll's value doesn't gate the
     // outcome — but setting both flags here keeps the fixture
-    // faithful to what the c-subset HIR→MIR lowering would stamp.
+    // faithful to what the c HIR→MIR lowering would stamp.
     b.setAliasingMode(MirAliasingMode::StrictTBAA);
     b.setCharTypesAliasAll(true);
     b.addFunction(fnSig, SymbolId{100},
@@ -907,7 +907,7 @@ TEST(Optimizer, FlatZeroIterationsClampsToOneTraversal) {
 }
 
 // D-CSUBSET-DIVISION-OP-CODEGEN closure-gate item (b) (cycle 10r,
-// 2026-06-04). The corpus example (`examples/c-subset/division/`)
+// 2026-06-04). The corpus example (`examples/c/division/`)
 // exercises the full source→optimized→binary pipeline, but a
 // hypothetical regression that silently CONST-FOLDS the divide away
 // (e.g. a future inlining pass that propagates the literal 100, 7
@@ -993,9 +993,9 @@ TEST(Optimizer, EffectivenessSDivSurvivesShippedReleasePipeline) {
 // D-CSUBSET-DIVISION-OP-CODEGEN closure-gate item (b) — UDiv analog
 // (cycle 10r 7-agent review fold pr-test #3 7/10, 2026-06-04). The
 // SDiv test above pins that the signed divide survives the shipped
-// release pipeline. UDiv has NO source-language entry in c-subset
-// today (no unsigned types yet — anchored D-CSUBSET-UDIV-RUNTIME-
-// HIGH-BIT-PIN), so the only way UDiv reaches codegen is via hand-
+// release pipeline. UDiv has NO source-language entry in c
+// today (no unsigned types yet — anchored D-CSUBSET-UDIV-RUNTIME-HIGH-BIT-PIN),
+// so the only way UDiv reaches codegen is via hand-
 // built MIR — exactly the path this test pins. Without this analog,
 // a future opt-pass regression that folded MirOpcode::UDiv with
 // opaque args would silently disappear the entire `xor_rdx_zero +
@@ -1035,7 +1035,7 @@ TEST(Optimizer, EffectivenessUDivSurvivesShippedReleasePipeline) {
     ASSERT_EQ(countOpInModule(mir, MirOpcode::UDiv), 1u)
         << "MIR UDiv with runtime-opaque operands MUST survive the "
            "shipped release pipeline exactly once — same invariant as "
-           "SDiv's analog. No c-subset corpus row exercises UDiv today "
+           "SDiv's analog. No c corpus row exercises UDiv today "
            "(anchored D-CSUBSET-UDIV-RUNTIME-HIGH-BIT-PIN); this MIR-"
            "level pin is the sole codegen-tier-survives guard for the "
            "`xor_rdx_zero + div_op` shape until unsigned types land.";
@@ -1374,4 +1374,132 @@ TEST(Optimizer, ShippedReleasePipelineCompilesBothProbeShapes) {
         EXPECT_TRUE(verifier.verify(rep))
             << "post-release-pipeline loop module must be verifier-clean";
     }
+}
+
+// ═══ D-OPT-MEM2REG-ERASES-CALL-OPERAND-POINTEE — the WHOLE-PIPELINE pin ════════
+//
+// The unit half lives in tests/opt/test_mem2reg.cpp; this is the half that answers
+// "does the property SURVIVE the passes that run after Mem2Reg?" — CopyProp, Cse,
+// Licm, SimplifyCfg and Dce all rebuild the module and remap operands, and any of
+// them could re-introduce the erasure by substituting a differently-typed value.
+//
+// ★ THE ASSERTION IS DELIBERATELY STRICTER THAN THE VERIFIER. `MirVerifier`'s
+// `sameSlotType` admits a `void*` on EITHER side of a call operand — a relaxation
+// Mem2Reg's pointee erasure FORCED (see the anchor). This checks EXACT TypeId
+// identity at every call operand instead, so it fails on precisely the shape the
+// verifier had to stop rejecting. It is the measurement behind any future decision
+// to tighten that arm: with this green, `void*` at a call operand is no longer
+// something the optimizer PRODUCES, only something a `void*`-declared signature
+// legitimately carries.
+//
+// ⚠ THE PIPELINE IS `full-release-like` (the pass list `examples/c/
+// va_list_param_forward`'s manifest declares), NOT the shipped `release` — and the
+// difference is load-bearing, not incidental: `release` includes `Inlining`, which
+// DELETES the call entirely, so a `release` arm would pass VACUOUSLY whether the
+// retag exists or not. The `mustHaveCall` assertion below is the guard that keeps
+// this test honest if the pipeline is ever changed.
+//
+// RED-on-disable: make `isPointerRetag` in src/opt/passes/mem2reg.cpp return false
+// unconditionally → the operand at position 1 is `ptr<void>` and this reds.
+TEST(Optimizer, PromotedVaListArrivesAtTheCallOperandWithItsDeclaredPointee) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const i8T    = interner.primitive(TypeKind::I8);
+    TypeId const voidT  = interner.primitive(TypeKind::Void);
+    TypeId const vaList = interner.pointer(i8T);     // the DECLARED va_list (Win64)
+    TypeId const voidP  = interner.pointer(voidT);   // what the Va* frame leaf carries
+    TypeId const slotTy = interner.pointer(vaList);  // the `ap` alloca
+    TypeId const calleeParams[] = {i32, vaList};
+    TypeId const calleeSig = interner.fnSig(calleeParams, i32, CallConv::CcSysV);
+    TypeId const callerParams[] = {i32};
+    TypeId const callerSig = interner.fnSig(callerParams, i32, CallConv::CcSysV);
+
+    MirBuilder b;
+    // The callee is EXTERNALLY VISIBLE and its body is deliberately non-trivial-
+    // looking; what actually keeps the call alive under this pipeline is that
+    // `full-release-like` runs no Inlining at all.
+    b.addFunction(calleeSig, SymbolId{50},
+                  SymbolBinding::Global, SymbolVisibility::Default);
+    MirBlockId const cEntry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(cEntry);
+    b.addReturn(b.addArg(0, i32));
+
+    b.addFunction(callerSig, SymbolId{100},
+                  SymbolBinding::Global, SymbolVisibility::Default);
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const n    = b.addArg(0, i32);
+    MirInstId const ap   = b.addInst(MirOpcode::Alloca, {}, slotTy);
+    MirInstId const home = b.addInst(MirOpcode::VaHomeArgAreaAddr, {}, voidP);
+    MirInstId const st[] = {home, ap};
+    (void)b.addInst(MirOpcode::Store, st, InvalidType);
+    MirInstId const ld[] = {ap};
+    MirInstId const apVal = b.addInst(MirOpcode::Load, ld, vaList);
+    MirInstId const calleeAddr = b.addGlobalAddr(SymbolId{50}, calleeSig);
+    MirInstId const callOps[] = {calleeAddr, n, apVal};
+    b.addReturn(b.addInst(MirOpcode::Call, callOps, i32));
+    Mir mir = std::move(b).finish();
+
+    // Resolved BY NAME from the manifest's own spelling, so the two stay in step:
+    // if a pass is ever renamed, this fails at resolution rather than silently
+    // running a shorter pipeline than the corpus arm it mirrors.
+    std::vector<opt::PassId> ids;
+    for (char const* name : {"ConstFold", "Mem2Reg", "CopyProp", "Cse",
+                             "Licm", "SimplifyCfg", "Dce"}) {
+        auto const id = opt::optPassIdFromName(name);
+        ASSERT_TRUE(id.has_value()) << name;
+        ids.push_back(*id);
+    }
+    opt::OptPipeline const pipeline =
+        opt::OptPipeline::flat("full-release-like", ids);
+
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(mir, target, interner, pipeline, rep);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_GE(result.mutationCount(opt::PassId::Mem2Reg), 1u)
+        << "Mem2Reg must actually have promoted the `ap` slot — otherwise this "
+           "test asserts nothing about the erasure it exists to pin";
+
+    // Walk EVERY call operand and demand exact TypeId identity with the declared
+    // parameter. `mustHaveCall` keeps a vacuously-green run (a pipeline that
+    // deleted the call) from reading as a pass.
+    bool mustHaveCall = false;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf; ++fi) {
+        MirFuncId const f = mir.funcAt(fi);
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const blk = mir.funcBlockAt(f, bi);
+            std::uint32_t const ni = mir.blockInstCount(blk);
+            for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                MirInstId const id = mir.blockInstAt(blk, ii);
+                if (mir.instOpcode(id) != MirOpcode::Call) continue;
+                mustHaveCall = true;
+                auto const ops = mir.instOperands(id);
+                ASSERT_GE(ops.size(), 1u);
+                TypeId const sig = mir.instType(ops[0]);
+                auto const params = interner.fnParams(sig);
+                ASSERT_EQ(ops.size(), params.size() + 1u);
+                for (std::size_t p = 0; p < params.size(); ++p) {
+                    EXPECT_EQ(mir.instType(ops[p + 1]).v, params[p].v)
+                        << "call operand at POSITION " << p << " must carry the "
+                           "signature's EXACT declared type after optimization — "
+                           "not merely a `sameSlotType`-compatible one "
+                           "(D-OPT-MEM2REG-ERASES-CALL-OPERAND-POINTEE)";
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(mustHaveCall)
+        << "the pipeline must NOT delete the call — this arm uses "
+           "`full-release-like` (no Inlining) precisely so the operand exists "
+           "to be checked; a `release` pipeline would pass vacuously";
+
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep));
 }

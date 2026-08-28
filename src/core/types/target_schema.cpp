@@ -1,7 +1,12 @@
 #include "core/types/target_schema.hpp"
 
+#include "core/crypto/sha256.hpp"                 // crypto::sha256Hex — the memo key
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
+#include "core/substrate/phase_timers.hpp"        // the load-config / build-config phases
 #include "core/substrate/relocation_table.hpp"
 #include "core/types/ascii_case.hpp"
+#include "core/types/config_document_memo.hpp"    // the ONE content-addressed schema memo
+#include "core/types/config_key_vocabulary.hpp"   // renderAllowedList (JSON-free)
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
@@ -64,15 +69,71 @@ std::string acceptedRelocFormulaList() {
 
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromFile(
     std::filesystem::path const& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    // `load-config` — see `core/substrate/phase_timers.hpp`. Spans the read,
+    // the digest, the memo lookup and (miss only) the nested `build-config`.
+    substrate::PhaseTimers::Scope const loadScope{
+        substrate::CompilePhase::LoadConfig};
+
+    // THE ONE CHECKED READ (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    // A failed read never reaches `loadFromText`: a truncated document reported
+    // as a parse error points the reader at the config's CONTENTS when the fault
+    // was the read.
+    auto text = core::readFileChecked(path);
+    if (!text) {
         return std::unexpected(std::vector<ConfigDiagnostic>{
             {DiagnosticCode::C_MissingField, DiagnosticSeverity::Error,
-             path.string(), "cannot open file"}});
+             path.string(), std::move(text).error().message}});
     }
-    std::ostringstream buf;
-    buf << in.rdbuf();
-    return loadFromText(std::move(buf).str(), path.string());
+
+    // ── THE CONTENT-ADDRESSED MEMO, SECOND FAMILY ─────────────────────────
+    // D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS.
+    // ✔MEASURED 2026-08-25 (cycle P35), Windows Debug, `int main(void){return
+    // 0;}`: TWO loads of the 345 KB `x86_64.target.json` cost 60 ms — 11% of a
+    // 571 ms process, for a document that had already been built once. The
+    // key is the SHA-256 of the bytes just read, so a stale hit is not a policy
+    // question but a structural impossibility: an entry is reachable only from
+    // the bytes that produced it. See `config_document_memo.hpp`.
+    //
+    // ★ THE DEPENDENCY LEDGER IS EMPTY HERE, AND THAT IS A MEASURED FACT RATHER
+    // THAN AN OMISSION. A `.lang.json` may fold another document into its build
+    // (`languageReferences`), which is why the grammar family records one. ✔The
+    // target loader reads NO file at all: `target_schema_json.cpp` contains no
+    // `readFileChecked`, no `ifstream`, and does not include `<filesystem>`, so
+    // a built `TargetSchema` is a pure function of this document's own bytes and
+    // its digest identifies it completely. Should that loader ever resolve a
+    // referenced document, this ledger MUST grow the same entries the grammar
+    // loader records, or the memo would serve a schema built over a superseded
+    // fragment.
+    //
+    // ⓘ `loadFromText` digests these same bytes AGAIN on the MISS path, because
+    // the digest it retains for `contentDigest()` is computed inside
+    // `target_schema_json.cpp`. 🧠DERIVED from the ✔MEASURED Debug digest rate
+    // (30 ms for 2,068,338 bytes = 14.5 ns/byte, cycle P35): ~5 ms for the
+    // 345 KB `x86_64.target.json`, paid ONCE per distinct target document per
+    // process, against the 60 ms the memo removes. It is a real cost and it is
+    // bounded to the cold path; folding the memo INTO that loader (as the
+    // grammar family does) would remove it and would also cover the
+    // inline-text route this file cannot reach.
+    std::string const label  = path.string();
+    std::string       digest = crypto::sha256Hex(*text);
+    if (auto hit = detail::ConfigDocumentMemo<TargetSchema>::lookup(label, digest)) {
+        return hit;
+    }
+
+    // `build-config` — DEFINED as the work a memo hit skips.
+    auto schema = [&] {
+        substrate::PhaseTimers::Scope const buildScope{
+            substrate::CompilePhase::BuildConfig};
+        return loadFromText(*text, label);
+    }();
+    // ⚠ Stored only on the SUCCESS path — a failed load produced diagnostics and
+    // no schema, and the loader's own refusal already reports it every time.
+    if (schema) {
+        detail::ConfigDocumentMemo<TargetSchema>::store(
+            label, std::move(digest),
+            std::vector<detail::ConfigDocumentDependency>{}, *schema);
+    }
+    return schema;
 }
 
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadShipped(
@@ -122,6 +183,30 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         problems.push_back(makeProblem(std::move(path), std::move(msg)));
     };
 
+    // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: which register banks
+    // this target actually HAS. An encoding field declared to draw from a bank
+    // with no rows in `registers[]` can never be legally filled — naming `vr`
+    // on a target whose table has no vector registers is an authoring error
+    // that would otherwise surface as a refusal of CORRECT input at encode
+    // time. Derived from the register table (never a literal list of classes)
+    // so a target that adds a bank needs no edit here.
+    //
+    // ⚠ SCOPED TO A TARGET THAT HAS A REGISTER TABLE AT ALL, and that is a
+    // boundary rather than an exemption: with `registers[]` EMPTY the document
+    // declares no register vocabulary, so "the bank you named is not in your
+    // table" says nothing an author can act on — EVERY bank would be wrong.
+    // Such a document is already fail-loud at the encoder (`registerInfo`
+    // returns null for every ordinal, and `hwEncodingOf` refuses), so nothing
+    // silent survives the narrowing; what it buys is that a minimal
+    // schema-shape document — the loader's own unit fixtures — is not made to
+    // carry a register file it never encodes against.
+    std::array<bool, kTargetRegClassTable.rows.size()> bankPopulated{};
+    bool const hasRegisterTable = !registers.empty();
+    for (auto const& r : registers) {
+        auto const bi = static_cast<std::size_t>(r.regClass);
+        if (bi < bankPopulated.size()) bankPopulated[bi] = true;
+    }
+
     // ── Encoding facet (per-opcode variants) ──────────────────────
     //
     // Substrate-tier rules the per-row JSON parse cannot express:
@@ -162,6 +247,35 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                              "A_NoMatchingEncodingVariant)",
                              o.mnemonic,
                              targetEncodingShapeName(o.encoding.shape)));
+        }
+        // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: an
+        // `encoding.registerClass` on an opcode NO field of which ever takes a
+        // register (`nop`, `ret`, x87's stack-implicit `faddp`) governs
+        // nothing. Same coherence family as `negValue` on a guard with no
+        // value operand: a declaration that reads as a guarantee and enforces
+        // nothing is worse than its absence, because the next author trusts it.
+        if (o.encoding.registerClass.has_value()) {
+            bool anyRegisterField = false;
+            for (auto const& v : o.encoding.variants) {
+                if (v.resultSlot.has_value()) { anyRegisterField = true; break; }
+                for (auto const& w : v.wires) {
+                    if (w.index < v.operandKinds.size()
+                        && v.operandKinds[w.index] == OperandKindFilter::Reg) {
+                        anyRegisterField = true;
+                        break;
+                    }
+                }
+                if (anyRegisterField) break;
+            }
+            if (!anyRegisterField) {
+                fail(std::format("/opcodes/{}/encoding/registerClass", i),
+                     std::format("opcode '{}': declares "
+                                 "`encoding.registerClass` = '{}' but no "
+                                 "variant has a result slot or a register "
+                                 "operand — the bank governs no field",
+                                 o.mnemonic,
+                                 targetRegClassName(*o.encoding.registerClass)));
+            }
         }
         for (std::size_t vi = 0; vi < o.encoding.variants.size(); ++vi) {
             auto const& v = o.encoding.variants[vi];
@@ -218,6 +332,214 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "no value to sign-route on",
                                  o.mnemonic, vi));
             }
+            // ── D-TARGET-PRODUCER-VARIANT-WITHOUT-A-RESULT-SLOT-ENCODES-REGISTER-ZERO ──
+            // A VALUE-PRODUCING x86-variable variant that names no home for its
+            // result SILENTLY ENCODES REGISTER 0.
+            //
+            // ✔MEASURED 2026-08-23, on a variant written in this very cycle: a
+            // `mov` immediate row was authored without `resultSlot`, loaded clean,
+            // and every `movw $42, %cx` / `%dx` / `%r15w` emitted the SAME bytes
+            // `66 C7 C0 …` — ModR/M.rm = 0, i.e. `%ax` — because the walker's
+            // result wiring is guarded by `resultSlot.has_value()` and simply did
+            // not run. rc=0, no diagnostic, wrong register. The inverse rule
+            // (`result: none` + a resultSlot) has been enforced since the schema
+            // existed; this is its missing mirror, and the mirror is the DANGEROUS
+            // half — the enforced direction fails loud at encode time, this one
+            // ships a wrong register.
+            //
+            // ★ SCOPED TO THE `x86-variable` SHAPE, and that is an ENCODING-SHAPE
+            // fact rather than a target one (the same distinction `opcodeBytes`
+            // and `fixedWord` already carry in this function). On a variable-length
+            // shape EVERY register field comes from a slot — ModR/M, SIB, or the
+            // opcode byte — so a producer with no result slot has nowhere for its
+            // result to go. A `fixed32` template CAN bake a destination into its
+            // fixed word (arm64's 3-word `sub sp, sp, #imm` bakes sp=31), which is
+            // why that shape keeps its exemption.
+            //
+            // ⚠ EXACTLY TWO EXEMPTIONS, BOTH MEASURED AGAINST THE SHIPPED TABLES
+            // RATHER THAN ASSUMED: a CALL's result is the ABI return register and
+            // never an encoded field (x86_64 `call`, `call_indirect_via_extern`),
+            // and a `requires2Address` opcode's result IS its operand 0, already
+            // wired (99 of the 101 exempted producer variants).
+            //
+            // ⛔ A THIRD EXEMPTION WAS WRITTEN HERE AND REMOVED — DO NOT RE-ADD IT.
+            // It exempted an opcode declaring implicit OUTPUT registers, "for the
+            // call reason". ✔MEASURED 2026-08-24 by the independent step-10 audit,
+            // enumerating `x86_64.target.json`: all 7 opcodes that declare implicit
+            // outputs (`cqo`, `rdtsc`, `idiv_op`, `xor_rdx_zero`, `div_op`,
+            // `umul_op`, `lock_cmpxchg`) are `result: none`, so the SECOND conjunct
+            // above already excludes every one of them and the exemption was reached
+            // by NOTHING. ★★ It was not merely inert, it was inert and DANGEROUS:
+            // the one shape it could ever admit is a future `result: value` opcode
+            // that declares an implicit output AND encodes its result in a ModR/M
+            // field — which is precisely the register-field-0 miscompile this guard
+            // exists to stop. An exemption reached by nothing today, whose only
+            // future reach is the defect, is strictly worse than no exemption: drop
+            // it and let such an opcode red until its author declares the slot.
+            if (o.encoding.shape == TargetEncodingShape::X86Variable
+                && o.result != TargetResultRule::None
+                && !o.isCall
+                && !o.requires2Address.has_value()
+                && !v.resultSlot.has_value()
+                && v.extraResultSlots.empty()) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}", i, vi),
+                     std::format("opcode '{}' variant {}: the opcode produces a "
+                                 "value but this x86-variable variant declares no "
+                                 "`resultSlot` — the walker would emit register "
+                                 "field 0 for the result, silently encoding a "
+                                 "different register. Declare the slot the result "
+                                 "belongs in (`modrm.reg`, `modrm.rm` or "
+                                 "`opcode.reg`)",
+                                 o.mnemonic, vi));
+            }
+            // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE: the
+            // memory-DIRECTION axis requires a MEMORY operand to route on —
+            // the same coherence family as immMin/immMax and negValue. A
+            // variant with no `membase` in its operandKinds names no memory
+            // reference, so `memoryDestination` there would key on a fact the
+            // instruction cannot have and the variant would match nothing on
+            // one of its two values — silently, which is the whole hazard.
+            bool const hasMemoryOperand = std::any_of(
+                v.operandKinds.begin(), v.operandKinds.end(),
+                [](OperandKindFilter f) {
+                    return f == OperandKindFilter::MemBase;
+                });
+            if (v.memoryDestination.has_value() && !hasMemoryOperand) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
+                     std::format("opcode '{}' variant {}: declares "
+                                 "memoryDestination but its operandKinds carry "
+                                 "no 'membase' operand — there is no memory "
+                                 "reference whose direction could be routed",
+                                 o.mnemonic, vi));
+            }
+            // ── D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD ───────
+            // TOTALITY of the register-bank declaration. Every field this
+            // variant will hand a REGISTER to must resolve to exactly one
+            // declared, operable, POPULATED bank — either the field's own
+            // `regClass`/`resultRegClass` or the opcode's
+            // `encoding.registerClass`. An unresolved field is refused HERE,
+            // at load, naming the opcode/variant/field: the encoder's class
+            // gate can only compare against a class it was given, so a field
+            // with no declared bank would be a hole in the gate, and a hole in
+            // this particular gate is a silent wrong-register miscompile (the
+            // `cvttss2si %xmm15` shape this anchor is named for).
+            //
+            // ⚠ "REGISTER-BEARING" IS READ OFF THE GUARD, NOT OFF THE SLOT
+            // KIND. The wired operand's KIND decides whether a register ever
+            // reaches the field: `modrm.rm.mem` takes a `reg` operand (a memory
+            // BASE register) while `membase.scale` takes a `membase` marker and
+            // `disp32.mem` a `memoffset` — same instruction, three slots, one
+            // register. The guard filter is the only thing that says which.
+            auto const bankName = [](std::optional<TargetRegClass> c) {
+                return c.has_value() ? targetRegClassName(*c)
+                                     : std::string_view{"<none>"};
+            };
+            auto const checkFieldBank =
+                [&](std::string path, std::string_view fieldDesc,
+                    std::optional<TargetRegClass> declared,
+                    bool overridden) {
+                    if (!declared.has_value()) {
+                        fail(std::move(path),
+                             std::format(
+                                 "opcode '{}' variant {}: {} takes a register "
+                                 "but no register bank is declared for it — "
+                                 "add `encoding.registerClass` to the opcode, "
+                                 "or `regClass`/`resultRegClass` to this field "
+                                 "(one of {}). Without it the encoder cannot "
+                                 "tell a GPR ordinal placed in an FPR field "
+                                 "from a correct encoding, and writes the "
+                                 "wrong register silently",
+                                 o.mnemonic, vi, fieldDesc,
+                                 detail::renderAllowedList(
+                                     kOperableTargetRegClassNames, " / ")));
+                        return;
+                    }
+                    if (!isOperableTargetRegClass(*declared)) {
+                        fail(std::move(path),
+                             std::format(
+                                 "opcode '{}' variant {}: {} declares register "
+                                 "bank '{}', which is the no-class sentinel — "
+                                 "a field that takes a register draws from a "
+                                 "real bank (one of {})",
+                                 o.mnemonic, vi, fieldDesc,
+                                 bankName(declared),
+                                 detail::renderAllowedList(
+                                     kOperableTargetRegClassNames, " / ")));
+                        return;
+                    }
+                    if (!hasRegisterTable) return;
+                    auto const bi = static_cast<std::size_t>(*declared);
+                    if (bi >= bankPopulated.size() || !bankPopulated[bi]) {
+                        fail(std::move(path),
+                             std::format(
+                                 "opcode '{}' variant {}: {} declares register "
+                                 "bank '{}' but this target's `registers[]` "
+                                 "table has no register of that class — no "
+                                 "operand could ever satisfy the field, so "
+                                 "every instruction using it would be refused "
+                                 "at encode time{}",
+                                 o.mnemonic, vi, fieldDesc,
+                                 bankName(declared),
+                                 overridden
+                                     ? " (the bank came from this field's own "
+                                       "override)"
+                                     : " (the bank came from the opcode's "
+                                       "`encoding.registerClass`)"));
+                    }
+                };
+            if (v.resultSlot.has_value()) {
+                checkFieldBank(
+                    std::format("/opcodes/{}/encoding/variants/{}/resultSlot",
+                                i, vi),
+                    std::format("the result field '{}'",
+                                encodingSlotKindName(*v.resultSlot)),
+                    encodingResultRegClass(o.encoding, v),
+                    v.resultRegClass.has_value());
+            } else if (v.resultRegClass.has_value()) {
+                // A bank for a field the variant does not have. Same coherence
+                // family as `negValue` without a value operand: a declaration
+                // that governs nothing reads as a guarantee and is none.
+                fail(std::format(
+                         "/opcodes/{}/encoding/variants/{}/resultRegClass",
+                         i, vi),
+                     std::format("opcode '{}' variant {}: declares "
+                                 "`resultRegClass` but has no `resultSlot` — "
+                                 "there is no result field for the bank to "
+                                 "govern",
+                                 o.mnemonic, vi));
+            }
+            for (std::size_t wi = 0; wi < v.wires.size(); ++wi) {
+                auto const& w = v.wires[wi];
+                // Out-of-range indexes are reported by their own rule below;
+                // skip them here rather than reporting the same author error
+                // twice in two vocabularies.
+                if (w.index >= v.operandKinds.size()) continue;
+                bool const carriesRegister =
+                    v.operandKinds[w.index] == OperandKindFilter::Reg;
+                if (carriesRegister) {
+                    checkFieldBank(
+                        std::format(
+                            "/opcodes/{}/encoding/variants/{}/wires/{}", i, vi,
+                            wi),
+                        std::format("operand {} → field '{}'", w.index,
+                                    encodingSlotKindName(w.slotKind)),
+                        encodingWireRegClass(o.encoding, w),
+                        w.regClass.has_value());
+                } else if (w.regClass.has_value()) {
+                    fail(std::format(
+                             "/opcodes/{}/encoding/variants/{}/wires/{}/regClass",
+                             i, vi, wi),
+                         std::format("opcode '{}' variant {}: wire {} declares "
+                                     "a `regClass` but its guard operand {} is "
+                                     "'{}', not a register — the field never "
+                                     "receives a register, so the bank governs "
+                                     "nothing",
+                                     o.mnemonic, vi, wi, w.index,
+                                     operandKindFilterName(
+                                         v.operandKinds[w.index])));
+                }
+            }
+
             // `opcodeBytes` is meaningful only for the x86-variable
             // shape. fixed32 carries the analog as `fixedWord` (a
             // 32-bit base bit pattern). The "non-empty" rule
@@ -310,8 +632,8 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
 
             // ── Silent-failure M-1: fixed32 supported-operand guard ──
             // The fixed32 walker handles Reg (register slots), SymbolRef
-            // (the symbol-bearing Imm26 slot), and — since D-LK10-ENTRY-
-            // ARM64 (v0.0.2 V2-1) — ImmInt (the Imm16 immediate slot,
+            // (the symbol-bearing Imm26 slot), and — since D-LK10-ENTRY-ARM64
+            // (v0.0.2 V2-1) — ImmInt (the Imm16 immediate slot,
             // AArch64 MOVZ) plus MemBase + MemOffset (the unscaled
             // LDUR/STUR memory form: base reg → Rn, MemOffset → the
             // signed Imm9 slot, MemBase's scale validated == 1). Since
@@ -890,6 +1212,22 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 // them ACROSS the sign boundary is meaningless, so skip the
                 // overlap check when the sign axis already separates them.
                 if (va.negValue != vb.negValue) continue;
+                // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE: the
+                // MEMORY-DIRECTION axis is a FOURTH disambiguator, and it is
+                // the ONLY one that separates the two `cmp` register-form
+                // memory variants — their operandKinds, width and immediate
+                // domain are all identical, because the two spellings build
+                // the byte-identical operand list. Two variants that declare
+                // OPPOSITE directions route on disjoint instructions, so
+                // neither shadows the other. ⚠ One declaring the axis and one
+                // omitting it is NOT disjoint (the omitting one matches both
+                // directions) and correctly falls through to the width check
+                // below.
+                if (va.memoryDestination.has_value()
+                    && vb.memoryDestination.has_value()
+                    && *va.memoryDestination != *vb.memoryDestination) {
+                    continue;
+                }
                 // Disjoint imm-ranges ⇒ value-distinguishable, never a
                 // shadow. `[loA,hiA]` and `[loB,hiB]` are disjoint iff
                 // hiA < loB or hiB < loA.
@@ -1222,6 +1560,16 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     //       `widthBytes` bytes. A bias that overflows the patch
     //       slot would silently corrupt every patched site
     //       (silent-failure M1 convergence).
+    //   (f) `imageRelative` ⇒ NOT `pcRelative` and NOT `tls`, and
+    //       `widthBytes != 0` — D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO.
+    //       An RVA is measured from the IMAGE BASE. "Relative to the
+    //       patch site" and "relative to the thread pointer" are two
+    //       other origins, and a row claiming two origins does not say
+    //       which value a walker should write — it says the author
+    //       copied a neighbouring row. Enforced HERE as well as in the
+    //       loader for the same reason rule (e) is: a schema built
+    //       programmatically (test fixture, fuzz harness) never sees
+    //       the loader.
     //
     // Rule (a) — `widthBytes ∈ {4, 8}` — is enforced by the JSON
     // loader before this code runs.
@@ -1266,6 +1614,49 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "patched site.",
                                  r.name, r.addendBias,
                                  r.widthBytes, sMin, sMax));
+            }
+        }
+        // Rule (f) — the RVA row's origin must be unambiguous.
+        if (r.imageRelative) {
+            if (r.pcRelative) {
+                fail(std::format("/relocations/{}/imageRelative", i),
+                     std::format("relocation '{}': 'imageRelative' and "
+                                 "'pcRelative' are both true, but an "
+                                 "image-relative value is measured from the "
+                                 "IMAGE BASE and a pc-relative one from the "
+                                 "PATCH SITE. A row cannot declare two "
+                                 "origins — a walker following either "
+                                 "reading writes a number the other side "
+                                 "will resolve to the wrong address.",
+                                 r.name));
+            }
+            if (r.tls) {
+                fail(std::format("/relocations/{}/imageRelative", i),
+                     std::format("relocation '{}': 'imageRelative' and 'tls' "
+                                 "are both true, but a thread-pointer offset "
+                                 "lives in a PER-THREAD coordinate space that "
+                                 "has no image base. An RVA computed from one "
+                                 "would name a byte of the image chosen by "
+                                 "whichever thread happened to ask.",
+                                 r.name));
+            }
+            if (r.widthBytes == 0) {
+                fail(std::format("/relocations/{}/widthBytes", i),
+                     std::format("relocation '{}': 'imageRelative' is true "
+                                 "but 'widthBytes' is 0 — an RVA is a "
+                                 "concrete-width field (PE uses 4) and a "
+                                 "zero-width row states no patch to make.",
+                                 r.name));
+            }
+            if (r.formulaKind != RelocFormulaKind::Linear) {
+                fail(std::format("/relocations/{}/imageRelative", i),
+                     std::format("relocation '{}': 'imageRelative' is a "
+                                 "Linear-only property, but this row declares "
+                                 "formula '{}', which encodes its own operand "
+                                 "placement into an instruction word. An RVA "
+                                 "is a DATA field.",
+                                 r.name,
+                                 relocFormulaName(r.formulaKind)));
             }
         }
         // Rule (e) — D-LK6-1 closure coherence: non-Linear formulas
@@ -1512,6 +1903,42 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         checkRefs(i, "callerSaved", cc.callerSaved, TargetRegClass::None);
         checkRefs(i, "calleeSaved", cc.calleeSaved, TargetRegClass::None);
 
+        // ── D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD ───────────────
+        // An `aapcs64_dual_cursor` variadic prologue spills `fpSaveCount`
+        // VECTOR argument registers at `fpSlotBytes` each, through the vector
+        // class's own store opcode. The registers it spills come from
+        // `argVrs` — the list `checkRefs` above has already proved is
+        // VR-class — so the list must COVER the count.
+        //
+        // ⚠ THE RULE EXISTS BECAUSE THE PROLOGUE USED TO READ `argFprs`, and
+        // that is a different register file's NARROW VIEW of the same file.
+        // ✔MEASURED: `d0..d7` (8 bytes, class `fpr`) were emitted as the data
+        // operand of a 16-byte `STUR Qt`, and the bytes came out right only
+        // because `d0` and `v0` share hardware encoding 0 — the wrong-class
+        // operand that produces a correct-looking instruction, which is this
+        // anchor's entire subject. Its two symptoms were an operand claiming
+        // half the width the instruction moves, and two producers of one
+        // opcode disagreeing about its operand's register file.
+        //
+        // A short `argVrs` would silently spill FEWER registers than the
+        // save-area geometry reserves slots for, so `va_arg` would read
+        // uninitialised stack for the tail — refuse it here, where the ABI is
+        // declared, rather than emit a prologue that does not fill its area.
+        if (cc.vaListLayout.has_value()
+            && cc.vaListLayout->strategy == VaListStrategy::Aapcs64DualCursor
+            && cc.vaListLayout->fpSaveCount > cc.argVrs.size()) {
+            fail(std::format("/callingConventions/{}/argVrs", i),
+                 std::format("calling convention '{}': its "
+                             "`aapcs64_dual_cursor` vaListLayout reserves {} "
+                             "vector save slots but `argVrs` names only {} "
+                             "vector register(s) — the variadic prologue "
+                             "spills the FULL-WIDTH vector arg registers from "
+                             "this list, and a short list leaves the tail of "
+                             "the save area unwritten",
+                             cc.name, cc.vaListLayout->fpSaveCount,
+                             cc.argVrs.size()));
+        }
+
         // ── D-TARGET-ARG-POOLS-WITHOUT-DWARF-NUMBERS-CANNOT-BE-RELATED ──
         //
         // Whether two arg pools share ONE cursor is DERIVED rather than
@@ -1575,6 +2002,97 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                              "numbers, and an absent number makes that answer a "
                              "default rather than a declaration",
                              cc.name, pool->front(), declared - 1));
+                }
+            }
+        }
+
+        // ── D-TARGET-ALIASED-VIEWS-BOTH-ALLOCATABLE-DOUBLE-COUNT-ONE-FILE ──
+        //
+        // ★★★ THE OTHER WAY A CONFIG DESCRIBES ONE PHYSICAL REGISTER TWICE,
+        // AND `subOf` DOES NOT COVER IT. The rule above
+        // (D-TARGET-CC-NAMES-SUB-REGISTER) refuses a cc that names a register
+        // DECLARED as a narrower view of another. But a target may equally
+        // declare TWO INDEPENDENT ROWS — neither `subOf` the other — that are
+        // two WIDTHS of one physical register file. ✔MEASURED on arm64: `d0`
+        // (class fpr, widthBytes 8) and `v0` (class vr, widthBytes 16) share
+        // `dwarfNumber` 64, and so do all 32 pairs; ✔x86_64 has none.
+        //
+        // ★ `dwarfNumber` IS THE FIELD, AND `hwEncoding` IS NOT — the same
+        // determination `lir_callconv::argPoolsShareACursor` rests on
+        // ([[D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR]]).
+        // ✔MEASURED over both shipped targets: `hwEncoding` is a per-file
+        // register NUMBER, so arm64 `gpr × vr` share all 32 values and x86_64
+        // `fpr × gpr` share 16 — a rule reading it would refuse the integer
+        // and vector files on both targets, which is a different wrong answer
+        // reached from the same direction. DWARF numbers the PHYSICAL
+        // register, which is precisely the question being asked.
+        //
+        // ⚠⚠ WHY THIS IS A LOAD-TIME REFUSAL AND NOT A CAPABILITY. The
+        // allocator does not model aliased views: `lir_regalloc::buildFreeLists`
+        // partitions the allocatable set BY CLASS, so two rows of different
+        // classes over one physical register become two independently
+        // handed-out registers. ✔MEASURED 2026-08-23 (cycle P28) by building
+        // the naive fix as a mutant — `absorb(cc.argVrs)` added to
+        // `buildFreeLists` and `lir_rewrite::collectAllocatable` — and reading
+        // the arm64 release disassembly of a function with 30 live `double`s
+        // and one `"w"` (VR-class) inline-asm output: `d7` carries BOTH the
+        // VR value and the ordinary `double` `a24`, at rc=0 with no
+        // diagnostic. One physical register, two live values, silently.
+        //
+        // ★★★ WHAT LIFTS THIS RULE — and it is a cycle, not a config edit:
+        // [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]], the
+        // sub-register-aware allocator arc. Until that lands, a config that
+        // would require it is refused HERE, where the config is judged,
+        // rather than compiling into a wrong register. This block is also the
+        // TRIPWIRE for that arc: it names the anchor in its own message, and
+        // it fires on BOTH shapes of the naive fix — naming `v0..v31` in
+        // `callerSaved` (a JSON edit) and adding `argVrs` to
+        // `kAllocatablePoolLists` (an engine edit), because the set it judges
+        // IS the set the engine absorbs.
+        {
+            // dwarfNumber → (register index, the list it was found in). Only
+            // registers reachable through `kAllocatablePoolLists` are entered,
+            // because only those become allocatable; a pair that is merely
+            // DECLARED (arm64's `argVrs` v0..v7 against `argFprs` d0..d7) is
+            // an ABI-placement statement and stays legal — that aliasing is
+            // modelled, deliberately, by the shared arg cursor.
+            std::unordered_map<std::uint16_t, std::pair<std::size_t, std::size_t>>
+                byDwarf;
+            for (std::size_t li = 0; li < kAllocatablePoolLists.size(); ++li) {
+                for (auto const& ref : cc.*(kAllocatablePoolLists[li])) {
+                    auto const it = registerIndex.find(ref);
+                    if (it == registerIndex.end()) continue;  // checkRefs owns this
+                    auto const& reg = registers[it->second];
+                    if (!reg.dwarfNumber.has_value()) continue;
+                    auto const [slot, inserted] =
+                        byDwarf.try_emplace(*reg.dwarfNumber,
+                                            std::pair{it->second, li});
+                    if (inserted) continue;
+                    auto const& first = registers[slot->second.first];
+                    if (first.regClass == reg.regClass) continue;  // same view twice
+                    fail(std::format("/callingConventions/{}/{}", i,
+                                     kAllocatablePoolListNames[li]),
+                         std::format(
+                             "callingConvention '{}': registers '{}' (class "
+                             "'{}', in {}) and '{}' (class '{}', in {}) both "
+                             "carry dwarfNumber {}, so they are two WIDTHS of "
+                             "one physical register — and both are reachable "
+                             "as allocatable. The register allocator "
+                             "partitions the allocatable set BY CLASS and does "
+                             "not model aliased views, so it would hand that "
+                             "one machine register to two live values at once "
+                             "(a silent wrong-register answer, not a "
+                             "diagnostic). Declare only ONE view of a physical "
+                             "register in a convention's allocatable lists; "
+                             "making both allocatable needs a sub-register-"
+                             "aware allocator, which is "
+                             "D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS "
+                             "and is a cycle rather than a config edit",
+                             cc.name, first.name,
+                             targetRegClassName(first.regClass),
+                             kAllocatablePoolListNames[slot->second.second],
+                             reg.name, targetRegClassName(reg.regClass),
+                             kAllocatablePoolListNames[li], *reg.dwarfNumber));
                 }
             }
         }

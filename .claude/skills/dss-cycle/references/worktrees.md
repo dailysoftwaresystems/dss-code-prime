@@ -13,6 +13,84 @@ underneath it is not consent.
 
 Nobody did anything wrong; the shared tree was the wrong venue. So:
 
+### ★★ H.0a — AND IT GOES AT A **SHORT** ABSOLUTE PATH, NEVER UNDER THE SESSION SCRATCH DIRECTORY
+
+✔MEASURED 2026-08-23 (cycle P29, `D-CYCLE-WORKTREE-UNDER-THE-SESSION-SCRATCH-PATH-CANNOT-BE-BUILT-ON-WINDOWS`).
+Two cycle rules — *mutate in a worktree* and *every temporary file lives under the session scratch
+directory* — compose into a path that **cannot be built on Windows**:
+`…/AppData/Local/Temp/claude/C--Source-DailySoftware-dss-code-prime/<uuid>/scratchpad/<cycle>/lane-<x>/wt`
+is **~150 characters before any build path is appended**, and the generated `.obj.d` paths then
+exceed MAX_PATH.
+
+⚠⚠ **THE FAILURE MODE IS THE DANGEROUS PART.** It is not a link error at the end — it is a **per-TU
+compile error in files the lane never touched** (`fatal error: opening dependency file
+tests\core\CMakeFiles\…\<name>.cpp.obj.d: No such file or directory`, repeated across `tests/core`),
+so it reads as **somebody else's breakage** and sends the lane to investigate an unrelated subsystem.
+✔The control that settles it: the same commit, same patch, same generator, re-created at
+`C:/dss-<cycle><lane>-rod` builds clean.
+
+⇒ **A worktree is NEVER placed under the session scratch directory.** The scratch-directory rule
+governs a lane's *files*; it was never meant to govern a *build root*, and on this host the two
+cannot both be satisfied.
+
+### ★★★ H.0b — AND IT GOES INSIDE THE REPO, AT `<repo>/.worktrees/<short-name>` — operator ruling 2026-08-26
+
+> *"I want the worktrees implementation to be inside the project root, .worktrees directory (where
+> 100% of it's internal content ignored by .gitignore). This way we stop contaminating builds
+> outside repository bounds."* … and, the same day, as an absolute: *"worktrees MUST be ignored by
+> ALL host copies to run legs"*.
+
+**This SUPERSEDES the short-absolute-root convention** (`C:/dssp40k`, `C:/dss-<cycle><lane>-rod`).
+Those roots kept the tree clean but scattered full checkouts — each with its own `build/` — across
+the filesystem, where nothing owned them, no guard could see them, and `git worktree list` was the
+only record they existed. ✔MEASURED 2026-08-26, and it is why the ruling is right: the repository
+was ALREADY carrying **9,661 files / 410 MB** of orphaned checkouts under `.claude/worktrees/`
+(three full copies, one 287 MB with its own `build/perf-lane/`), and **`git worktree list` knew
+about none of them**.
+
+**★ ONE OWNER: `scripts/lane-worktree/lane-worktree.sh`** — `add <name> [committish]`,
+`remove <name>`, `list`. The same shape as `scripts/leg-tree/`, and for the same reason:
+**never hand-roll `git worktree add` in a lane.** A location rule is only as good as the last
+person who remembered it, and this skill already records what happens to a rule that lives only in
+a document.
+
+```bash
+bash scripts/lane-worktree/lane-worktree.sh add k        # -> <repo>/.worktrees/k
+bash scripts/lane-worktree/lane-worktree.sh remove k     # removes AND prunes
+```
+
+⚠ **THE MAX_PATH BUDGET IS NOW SPENT, NOT SLACK — AND THIS IS THE ONE THING TO CARRY FROM H.0a.**
+Moving from a 10-char root into the repository root costs **46 characters** of the MAX_PATH budget
+on every build path. ✔MEASURED 2026-08-26 in a live lane worktree: the longest build-relative
+suffix is **163 chars**, so `C:/dssp40k` totalled 173 (**87 spare**) and `<repo>/.worktrees/k`
+totals 214 (**46 spare**). It fits — but the margin more than halved, and this repository's test
+names are what dominate that suffix and keep growing.
+⇒ `lane-worktree.sh` **refuses by arithmetic** any root leaving under 20 chars of margin, naming
+`D-CYCLE-WORKTREE-UNDER-THE-SESSION-SCRATCH-PATH-CANNOT-BE-BUILT-ON-WINDOWS` in the refusal. ✔The
+refusal arm is exercised: a 44-char lane name is refused at rc=3 with 3 chars spare.
+⇒ **Keep lane names SHORT** — `k`, `l`, `rod`. A descriptive name spends the margin that protects
+the next long test name.
+
+⚠ **`.gitignore`'s `/.worktrees/` rule is what keeps lane checkouts off every gate host**, and it
+is a REQUIREMENT, not tidiness. Since 2026-08-26 the carriages derive their exclude list from git
+(`scripts/carriage-excludes/`), so that one line is what stops four full repo copies riding to
+macOS and the arm64 VPS on every push — and a gate host holding one runs somebody's uncommitted
+`examples/` corpus and reports it as the cycle's. It is therefore ALSO pinned in that script's
+`MUST_NEVER_TRAVEL` floor, which re-asks git and **refuses the carriage** if the rule is edited
+away. ✔The floor's refusal arm is exercised: removing the one line makes it exit 3, naming
+`.worktrees/`.
+⚠ The anchoring (`/.worktrees/`, not `worktrees/`) is deliberate — a bare glob would match a
+future `examples/**/worktrees/` fixture, and this repo has already paid for an unanchored rule.
+
+✔**MEASURED, so the move is not a hope:** a real 2,792-file worktree at `.worktrees/probe` moved
+**zero** of the 16 runnable registered guards — identical verdict and output volume before and
+after — and `git status` reported **0 lines** for it.
+
+⚠ **And read a build's exit code from the PROCESS, not from the tail of a pipeline.** The same run
+reported `EXIT=0` over that failure because `$LASTEXITCODE` after a PowerShell pipeline is the LAST
+command's — `Select-String`'s — not `cmake`'s. An instrument that reports success over a failed build
+is the same class as a red-on-disable whose mutant never compiled in.
+
 - **Any experiment whose whole point is that bytes change** — byte-neutrality probes, red-on-disable
   mutants, "what does the corpus look like if…" — runs in a `git worktree`, never in the shared tree.
   The lane hands back a `git apply --check`-verified **patch**; the main loop decides whether it lands.

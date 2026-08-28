@@ -56,11 +56,17 @@ the other in the same commit.
 <!-- BEGIN GENERATED SCRIPT INDEX -->
 | Script | Runs as | Purpose |
 | --- | --- | --- |
+| **`burndown-queue`** | `burndown-queue.py` | re-derive the prioritized burndown queue from the registry, production errors first. |
+| **`carriage-excludes`** | `carriage-excludes.py` | emit the transport exclude list for a gate carriage, derived from what git ignores rather than re-typed once per carriage. |
 | **`check-anchor-balance`** | `check-anchor-balance.py` | refuse a cycle that ends with more OPEN deferral-registry rows than it began. |
 | **`check-anchor-registry`** | `check-anchor-registry.ps1`, `check-anchor-registry.sh` | refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells. |
+| **`check-carriage-paths`** | `check-carriage-paths.py` | refuse a carriage script whose repository path disagrees with the project's own declared name. |
 | **`check-diagnostic-codes`** | `check-diagnostic-codes.py` | refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal. |
 | **`check-enum-name-table-guards`** | `check-enum-name-table-guards.py` | refuse an `EnumNameTable` vocabulary declared in `src/` without a `DSS_CHECK_ENUM_NAME_TABLE` well-formedness assert. |
-| **`check-line-endings`** | `check-line-endings.ps1`, `check-line-endings.sh` | refuse a tracked text blob that carries a CR. |
+| **`check-export-macro-placement`** | `check-export-macro-placement.py` | refuse DSS_EXPORT on a member of an already-exported class, which is MSVC error C2487. |
+| **`check-guard-output-encoding`** | `check-guard-output-encoding.py` | refuse a Python script whose report cannot carry a non-cp1252 character through a pipe. |
+| **`check-line-endings`** | `check-line-endings.ps1`, `check-line-endings.sh` | refuse a tracked text blob that carries a CR, and a CR instrument that cannot see one. |
+| **`check-lsp-coordinates`** | `check-lsp-coordinates.py` | refuse a raw coordinate conversion in src/lsp/ outside lsp_coordinates.cpp — the anti-regression device for D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES. |
 | **`check-ninja-deps`** | `check-ninja-deps.py` | refuse a gate over a build directory whose objects recorded no header dependencies. |
 | **`check-no-abort-in-tests`** | `check-no-abort-in-tests.py` | refuse a new live `abort()` call site in test or test-support code. |
 | **`check-orphan-tests`** | `check-orphan-tests.ps1`, `check-orphan-tests.sh` | refuse a test source that no CMake target compiles and no ctest entry runs. |
@@ -69,12 +75,20 @@ the other in the same commit.
 | **`check-retyped-closed-sets`** | `check-retyped-closed-sets.py` | census the diagnostics that RETYPE a closed vocabulary instead of projecting it. |
 | **`check-scripts-index`** | `check-scripts-index.py` | refuse a script that no index documents, and an index entry that no script backs. |
 | **`check-shell-portability`** | `check-shell-portability.py` | refuse a tracked shell script that cannot run on bash 3.2 without declaring it. |
+| **`check-stale-refusal-citations`** | `check-stale-refusal-citations.py` | refuse a new present-tense refusal sentence that cites an anchor row already marked CLOSED. |
+| **`check-wall-clock-in-tests`** | `check-wall-clock-in-tests.py` | refuse a new wall-clock duration literal in test code outside the shared measured budget. |
+| **`check-wrapped-anchor-ids`** | `check-wrapped-anchor-ids.py` | refuse a NEW anchor id split across a line break, which no grep can ever return. |
 | **`cmake-import`** | `cmake-import.ps1`, `cmake-import.py`, `cmake-import.sh` | convert a CMake project into a DSS `.dss-project.json` manifest. |
+| **`compile-bench`** | `compile-bench.py`, `compile-bench.sh` | time dsscp against gcc/clang/MSVC/tcc on ONE host over a subject size ladder, naming every reference it could not find. |
 | **`corpus-census`** | `corpus-census.ps1`, `corpus-census.py`, `corpus-census.sh` | census the real-example corpus into a run-identified report instead of one overwritten log. |
-| **`local-build`** | `local-build.ps1`, `local-build.sh` | build dss-code-prime incrementally on this host, and optionally run ctest. |
+| **`examples-census`** | `examples-census.py` | re-derive every corpus-manifest figure examples/README.md states, by parsing the manifests. |
+| **`lane-worktree`** | `lane-worktree.ps1`, `lane-worktree.sh` | create and remove lane worktrees inside the ignored .worktrees/, refusing any root that would exceed Windows MAX_PATH. |
+| **`leg-tree`** | `leg-tree.sh` | put a gate host's own clone on the tree under test before a leg, and restore it to pristine afterwards. |
+| **`local-build`** | `local-build.ps1`, `local-build.sh` | build dsscp incrementally on this host, and optionally run ctest. |
 | **`macho-alias-ld64-matrix`** | `macho-alias-ld64-matrix.remote.sh`, `macho-alias-ld64-matrix.sh` | measure what Apple's ld64 does with a SECOND defined symbol at the same address as a canonical one, with and without -dead_strip. |
+| **`macos-leg`** | `macos-leg.ps1`, `macos-leg.sh` | run a DSS gate leg on the operator's macOS host -- push the tree, build clean, run ctest. |
 | **`pragma-profile-census`** | `pragma-profile-census.ps1`, `pragma-profile-census.py`, `pragma-profile-census.sh` | census `#pragma` usage across the corpus and hold the profile to its expected shape. |
-| **`profile-compile`** | `profile-compile-dispatch.sh`, `profile-compile-support.py`, `profile-compile.sh` | compile one fixed subject with a RELEASE dss-code-prime on this host and report where the time went, so the HOST is the only variable across legs. |
+| **`profile-compile`** | `profile-compile-dispatch.sh`, `profile-compile-support.py`, `profile-compile.sh` | compile one fixed subject with a RELEASE dsscp on this host and report where the time went, so the HOST is the only variable across legs. |
 | **`refresh_landing_log`** | `refresh_landing_log.py`, `test_refresh_landing_log.py` | regenerate the PR landing-log hash anchors in the plans from git log. |
 | **`remote-leg`** | `remote-leg.sh` | run a DSS gate leg on a physical remote host -- push the working tree over a carriage, build clean, and run ctest through run-gate. |
 | **`run-gate`** | `run-gate.ps1`, `run-gate.sh` | run a gate command and REFUSE to report success without evidence that it ran. |
@@ -101,6 +115,57 @@ the other in the same commit.
   resolves nowhere else), and the macOS carriage needs absolute paths because a
   non-interactive shell drops `/opt/homebrew/bin`.
 - **`local-build`** — incremental build plus optional ctest, for this host.
+
+<!-- CR-INSTRUMENT-QUOTED:BEGIN — this section QUOTES the blind idioms in order
+     to warn about them; it does not run one as a measurement. -->
+
+## ★★★ NEVER HAND-ROLL A LINE-ENDING CHECK — the idiom lies on this host
+
+**Asking "are THESE files clean?" has an entry point. Use it:**
+
+```
+scripts/check-line-endings/check-line-endings.sh  --files PATH...   # or --files-from -
+scripts/check-line-endings/check-line-endings.ps1 --files PATH...
+```
+
+Exit **0** all clean · **1** a CR was found · **2** a path could not be measured
+(missing, unreadable, a directory) — never a silent skip. It works on tracked,
+untracked and outside-the-repo paths, so a lane's scratchpad is fair game.
+
+⚠⚠ **DO NOT write your own.** ✔MEASURED 2026-08-27 (P42) on Git Bash against a
+`printf 'a\r\nb\n'` control verified by `od -c` to hold exactly one CR, beside a
+pure-LF twin — **the obvious instruments are wrong in BOTH directions:**
+
+| what you would type | CRLF file | pure-LF file | correct |
+|---|---|---|---|
+| `grep -c $'\r'` (captured in `$(...)`) | **2** | **2** | 1 / 0 — false POSITIVE, always |
+| `awk '/\r$/'` | **0** | **0** | 1 / 0 — **false NEGATIVE, always** |
+| `sed -n '/\r/p'` | **0** | **0** | 1 / 0 — false NEGATIVE |
+| `tr -dc '\r' < f \| wc -c` | **1** | **0** | ✅ correct |
+
+- **The false positive:** the literal `$'\r'` written *inside* a command
+  substitution expands to the **empty string**, so `n=$(grep -c $'\r' f)` runs
+  `grep -c ''` and returns the file's **line count** — on a clean file too.
+  (A CR held in a *variable* is fine; `$'\t'` in the same spot is fine. It is
+  this spelling, in this position.)
+- **The false negative, the dangerous one:** Git Bash `grep` and `sed` read in
+  **text mode** and strip the trailing CR *before matching*, so they report a
+  clean tree over a file that is entirely CRLF. `grep -U` sees it; `-a` does not.
+  A *mid-line* CR is found by everything — the blindness is aimed precisely at
+  the only CR anyone hunts.
+- ★★ **This is why it survived: under WSL/Linux all three are CORRECT.** An
+  idiom sanity-checked on Linux, or read out of the GNU manual, looks sound and
+  then lies only on Windows — the primary dev host. **An instrument verified on
+  the wrong leg is verified nowhere.**
+
+A lane in P42 certified thirteen files "pure LF" with `awk '/\r$/'` and was
+measuring nothing. `line_endings_guard`'s **Check F** now refuses these
+spellings repo-wide, so they cannot be committed. If a line *quotes* the idiom
+as documentation, put `CR-INSTRUMENT-QUOTED` on it, or wrap the block in
+`CR-INSTRUMENT-QUOTED:BEGIN` / `:END` — the guard uses that same marker for its
+own warnings rather than exempting itself by path.
+
+<!-- CR-INSTRUMENT-QUOTED:END -->
 
 ## Where the rest of the gate battery is documented
 

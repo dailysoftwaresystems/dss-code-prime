@@ -1213,7 +1213,7 @@ TEST(HirVerifier, MemberAccessOutOfBoundsFieldIndexFires) {
     // struct Point { I32 x; I32 y; }  ⇒ 2 fields.
     std::array<TypeId, 2> fields{i32, i32};
     TypeId const point = ti.structType("Point", fields);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     // Hand-build `MemberAccess(Ref<Point>, payload=5)` — clearly out of bounds.
     HirNodeId const base = b.makeRef(point, /*symbol=*/1);
     HirNodeId const access = b.makeMemberAccess(base, /*fieldIndex=*/5, i32);
@@ -1229,7 +1229,7 @@ TEST(HirVerifier, MemberAccessOutOfBoundsFieldIndexFires) {
 TEST(HirVerifier, MemberAccessOnNonCompositeFires) {
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const base = b.makeRef(i32, /*symbol=*/1);  // base is I32, not struct
     HirNodeId const access = b.makeMemberAccess(base, /*fieldIndex=*/0, i32);
     Hir h = std::move(b).finish(access);
@@ -1287,7 +1287,7 @@ namespace {
 [[nodiscard]] Hir asmModule(std::uint32_t payload, std::size_t childCount,
                             TypeInterner& in) {
     TypeId const i64 = in.primitive(TypeKind::I64);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     std::vector<HirNodeId> kids;
     for (std::size_t i = 0; i < childCount; ++i)
         kids.push_back(b.makeRef(i64, static_cast<std::uint32_t>(i + 2)));

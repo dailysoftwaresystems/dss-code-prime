@@ -1,0 +1,16 @@
+{
+  "$comment": "D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO — a conditionally-initialized `double` local now PROMOTES instead of being de-promoted to memory. The missing incoming becomes undef-as-zero, and a float has no lowerable zero Const (no float-immediate form on a register machine), so the zero is an anonymous read-only MirGlobal reached by GlobalAddr+Load in the ENTRY block — the SAME producer hir_to_mir's float-literal promotion uses. This arm proves the promoted shape BUILDS and RUNS on every target: the entry-block rodata Load is emitted BEFORE the Arg receives (p and q arrive in FPRs), the join is a double-typed Phi, and the result feeds a real FAdd. It does NOT observe the zero's VALUE — g_c is 1 so the undef edge never executes at runtime (executing it would read an uninitialized object under the baseline pipeline, which the runner diff-asserts against). The value/binding/section/literal are pinned at the MIR tier by Mem2Reg.ConditionallyInitializedFloatAllocaPromotesViaRodataZero. ANTI-FOLD: all three inputs are mutable globals. 10.0 + 32.0 = 42.0 -> 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true },
+    { "label": "mem2reg-only", "passes": ["Mem2Reg"], "mustDifferFromBaseline": true }
+  ]
+}

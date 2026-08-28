@@ -8,7 +8,7 @@
 #
 # Tier (a) — `Preprocessor.TfC85NoUnclaimedPragmaUnderAnyPredefineClass` plus
 # its non-vacuity twin — is ALWAYS ON in ctest, over the in-repo fixture
-# `tests/corpus/c-subset/pragma_profile_census.c`. It is the guard that cannot
+# `tests/corpus/c/pragma_profile_census.c`. It is the guard that cannot
 # rot.
 #
 # Tier (b) is THIS: the same census over the REAL 189-TU sqlite corpus. It is
@@ -67,7 +67,7 @@
 #   --update   rewrite the expected file from this run (review the diff first!)
 #
 # Environment:
-#   DSS_BIN          the compiler (default: the newest build/**/dss-code-prime)
+#   DSS_BIN          the compiler (default: the newest build/**/dsscp)
 #   SQLITE_MANIFEST  a .dss-project.json to census (default: the host manifest
 #                    the sqlite harness generates under build/real-examples/)
 #
@@ -144,16 +144,16 @@ def find_dss_bin(explicit: str | None) -> Path:
     elif os.environ.get("DSS_BIN"):
         candidate = Path(os.environ["DSS_BIN"])
     else:
-        default = REPO_ROOT / "build" / "bin" / "dss" / "dss-code-prime"
+        default = REPO_ROOT / "build" / "bin" / "dss" / "dsscp"
         if default.is_file():
             candidate = default
         else:
-            found = sorted(REPO_ROOT.glob("build/**/dss-code-prime"))
+            found = sorted(REPO_ROOT.glob("build/**/dsscp"))
             if not found:
-                die("dss-code-prime not found; build the project or set DSS_BIN.")
+                die("dsscp not found; build the project or set DSS_BIN.")
             candidate = found[0]
     if not candidate.is_file() or not os.access(candidate, os.X_OK):
-        die(f"dss-code-prime not executable at {candidate}; "
+        die(f"dsscp not executable at {candidate}; "
             f"build the project or set DSS_BIN.")
     return candidate
 
@@ -165,13 +165,13 @@ def disarm_config(scratch: Path) -> Path:
     itself. The repo's own config is never modified."""
     dst = scratch / "src"
     shutil.copytree(REPO_ROOT / "src", dst)
-    lang = dst / "dss-config" / "sources" / "c-subset.lang.json"
+    lang = dst / "dss-config" / "sources" / "c.lang.json"
     if not lang.is_file():
-        die("no c-subset.lang.json in the scratch copy")
+        die("no c.lang.json in the scratch copy")
     doc = json.loads(lang.read_text())
     pp = doc.get("preprocess")
     if pp is None or "pragmaEffects" not in pp:
-        die("c-subset.lang.json no longer has preprocess.pragmaEffects")
+        die("c.lang.json no longer has preprocess.pragmaEffects")
     pp["pragmaEffects"] = []             # claim NOTHING
     pp["unknownPragmaIsError"] = True    # so every reached pragma names itself
     lang.write_text(json.dumps(doc, indent=2, ensure_ascii=False))

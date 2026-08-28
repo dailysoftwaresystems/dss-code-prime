@@ -1,0 +1,36 @@
+{
+  "$comment": "PROJECT MODE + `dependsOn` ArtifactLink, used as the RUNTIME WITNESS that a declared section alignment survives an OBJECT READER. D-FORMAT-MACHO-SECTION-ALIGN-EMITTED-RAW-NOT-LOG2 (the read-side half). `alignlib` declares `_Alignas(64)` objects, so the writer stamps the section's alignment into the archive member it emits (IMAGE_SCN_ALIGN_64BYTES on PE, sh_addralign=64 on ELF, section_64.align=6 on Mach-O). The consumer static-links that archive, so the merge lays out whatever the reader reconstructed — the round trip is the only thing standing between the declaration and the address the program observes. Exit 42: with argc == 1 the consumer's inlinable helper yields acc == 10 and the archive's probe returns 10 + 1 == 11, so 11*4 - 10 + 8 == 42. An UNDER-aligned `dss_align_tail` makes the probe return 0 and the program exit -2. Neither source file contains the literal 42, and both the address and argc are runtime values.",
+  "$commentWhyTheConsumerPad": "★★ THE CONSUMER'S OWN FIVE BYTES OF RODATA ARE WHAT MAKE THIS EXAMPLE MEASURE ANYTHING, AND THAT IS A MEASUREMENT RATHER THAN A DESIGN INSTINCT. ✔MEASURED 2026-08-27: THREE earlier shapes of this example — a single _Alignas(32) object behind a 5-byte pad, the same at _Alignas(128), and two same-alignment objects with the first sized to a non-multiple — were each built with the fix and with it DELETED and exited IDENTICALLY. The reader slices atoms by their VALUE in the section, so the producer's inter-item padding is absorbed into the preceding atom's extent: relative offsets inside ONE module come back correct whether or not the alignment field survived, and an over-aligned object that is FIRST in its section is aligned by construction. What the field actually decides is where the MEMBER'S WHOLE BLOCK lands when something else already occupies the section (exec_data_section.hpp places `src` at alignUp(into.spanSize, src.maxAlign)). Five bytes of consumer rodata is what creates that 'something else'. ⓘ A REACHABILITY PROBE settled that the reader is genuinely on this path before any of this was concluded: forcing alignFromCharacteristics to return 256 unconditionally moved the observed address, so the identical REMOVE-direction results were never 'the code is not reached'.",
+  "$commentRedOnDisable": "✔MEASURED 2026-08-27, executed: rebuild dsscp with `di.alignment = alignFromCharacteristics(sec.chars)` deleted from the named-atom site in src/link/format/coff_object_reader.cpp (build rc=0, no `ninja: build stopped`, object md5 4fea264f… -> 04c82e09…, and back on restore), then rebuild THIS project with the mutant compiler: the PE artifact exits 4294967294 (-2, the probe's under-aligned answer) instead of 42. The raw address moves from `mod 256 == 128` to `mod 256 == 69` — misaligned by exactly the consumer's five bytes. ⚠ THE PE LEG IS THE ONLY ONE THAT MOVES, and that is the honest scope: this is a regression net for all three readers but a repair witness only for COFF, because the ELF and Mach-O readers already carried the field.",
+  "$commentOptimizedArm": "The release arm rides the same plumbing as project_dependson_module_source_merge / project_dependson_staticlib_artifact_link. main.c carries an inlinable `static` helper, an accumulator and a short loop for the reason that sibling MEASURED and wrote down: with only an external call to optimize, `--config=release` and `--config=debug` emit a byte-identical image and the arm asserts that a no-op stayed a no-op. `dss_consumer_pad` is indexed by `argc - 1` rather than by a constant so the optimizer cannot fold the read and drop the object — dropping it would silently remove the five bytes this witness depends on. ★ The alignment fact under test is NOT optimizer-visible: the address the probe reads is assigned by the linker after the optimizer has run, so a release arm cannot fold the check into a constant derived from the same metadata the test is about.",
+  "$commentExpectedWarning": "ⓘ The release arm emits one X_OptFixpointTruncated (0x2009) warning on the pe64 target — the LTO pass-schedule fixpoint reporting that it stopped on its iteration cap rather than on convergence. That is a DESIGNED honesty report, suppressable and Capped, not a defect this example introduces, and it fires precisely because the inlinable helper and loop give the optimizer real work (which is the point of the release arm). The example is green with it; noted here so the next reader does not go hunting.",
+  "language": "c",
+  "project": ".dss-project.json",
+  "exitCode": 42,
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "align_carry.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "align_carry",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "align_carry",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "align_carry",
+      "runOn": ["darwin"]
+    }
+  ]
+}

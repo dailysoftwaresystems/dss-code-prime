@@ -568,7 +568,7 @@ TEST(MachoDylibFormatPolicy, OutputExtensionIsDylib) {
     auto loaded = loadShippedDylib();
     ASSERT_TRUE(loaded.format);
     TargetSpec const spec{"arm64", "macho64-arm64-darwin-dylib"};
-    EXPECT_EQ(spec.outputExtension(*loaded.format), ".dylib");
+    EXPECT_EQ(outputExtensionFor(*loaded.format), ".dylib");
 }
 
 // ── (1) Header pins: the MH_DYLIB shape ──────────────────────────
@@ -913,7 +913,7 @@ TEST(MachoExecSourceExternSlot,
     Program            prog;
     DiagnosticReporter rep;
     prog.setOutputDir(outDir);
-    int const rc = prog.compileFiles({src.generic_string()}, "c-subset",
+    int const rc = prog.compileFiles({src.generic_string()}, "c",
                                      {"arm64:macho64-arm64-darwin-exec"}, rep);
     std::ostringstream diag;
     for (auto const& d : rep.all()) diag << "\n  " << d.actual;
@@ -1508,8 +1508,8 @@ TEST(MachoImageSymbolNames,
         // THE discriminating case: a final image wants this name (it is the
         // frame a debugger and a crash reporter print), while a relocatable
         // `.o` must NOT expose it (a foreign linker keys by name, and two TUs'
-        // `helper`s would collide -- D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-
-        // FOREIGN-COLLISION). Pre-fix, every arm spelled it `_sym_7`.
+        // `helper`s would collide -- D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION).
+        // Pre-fix, every arm spelled it `_sym_7`.
         AssembledFunction f7;
         f7.symbol = SymbolId{7};
         f7.bytes  = port.retBytes;
@@ -2479,6 +2479,14 @@ TEST(MachoExternCallDispatch, RefusalNamesTheDeclaredSpellingAndTheAcceptedSet) 
         << diags;
 
     // ...and every spelling the guard accepts, by the SAME predicate.
+    // ⚠ The `1` alone is blind to a SECOND rejected row — the walker could stop
+    // accepting a spelling and this expectation would still hold at `1`, which
+    // is D-CORE-NAMESWHERE-LITERAL-COUNT-IS-BLIND-TO-A-SECOND-SENTINEL. The
+    // assert relates the table's own row total to this literal.
+    static_assert(kExternCallDispatchTable.rows.size() == 1u + 1u,
+                  "kExternCallDispatchTable must be exactly one accepted and "
+                  "one indirect-shaped spelling; if that moved, this arm's 1 "
+                  "silently checks a subset");
     auto const accepted = dss::namesWhere<1>(
         kExternCallDispatchTable,
         [](ExternCallDispatch d) { return !externCallUsesIndirectShape(d); });

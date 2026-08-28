@@ -62,14 +62,14 @@ void emitErr(DiagnosticReporter& rep, std::string msg) {
 // LEGACY_VSPRINTF_NULL_TERMINATION (bit 0) paired with `_BufferCount = (size_t)-1`.
 constexpr std::uint64_t kOptLegacyVsprintfNullTermination = 1ull << 0;
 
-// Bit 1, `_CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR` (corecrt_stdio_config.h:116) —
+// Bit 1, `_CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR` (corecrt_stdio_config.h) —
 // what `snprintf` ALONE passes, and the first shipped recipe to pass a nonzero `_Options`
 // other than sprintf's legacy bit 0.
 //
 // ★ THIS BIT IS THE WHOLE C99 CONTRACT OF `snprintf`, not a tuning knob, and the two
 // behaviours it selects between are BOTH silent — neither errors, neither fails to link,
 // so the only way to tell them apart is to observe a TRUNCATING call at runtime. That is
-// what `examples/c-subset/shipped_snprintf_ucrt` exists to do, and it is also why the older
+// what `examples/c/shipped_snprintf_ucrt` exists to do, and it is also why the older
 // `sprintf`-only witness could not pin `_Options` at all: with `_BufferCount = (size_t)-1`
 // no truncation is reachable, so bits 0/1/2 are observationally identical there.
 //
@@ -248,8 +248,9 @@ bool synthesizeStdioShim(
     // two-block tail and makes this shim byte-for-byte the header inline it stands in for.
     // STATED WITHOUT OVERCLAIM so nobody mistakes it for a bug fix: on every return value
     // measured to date the clamp is an IDENTITY, so no test can distinguish its presence
-    // from its absence. It is DEFENSIVE FIDELITY to `ucrt/stdio.h:1443`, not an observed
-    // repair, and it is the one part of this recipe with no red-on-disable witness.
+    // from its absence. It is DEFENSIVE FIDELITY to `ucrt/stdio.h`'s `vsnprintf`
+    // inline, not an observed repair, and it is the one part of this recipe
+    // with no red-on-disable witness.
     //
     // ★ REPRODUCING THE MEASUREMENT (it is an empirical claim, so it must be re-runnable —
     // a claim nobody can re-check is a claim that silently rots). In a scratch C program:
@@ -471,7 +472,8 @@ bool synthesizeStdioShim(
             // ★ THE SAME CORE AS `sprintf`, differing in exactly the two arguments that
             // carry snprintf's semantics — and that is forced, not chosen: ucrtbase exports
             // no `__stdio_common_vsnprintf` at all (see the header). This mirrors
-            // `ucrt/stdio.h:1439-1444`, which is literally how a real MSVC build spells
+            // `ucrt/stdio.h`'s own `vsnprintf` inline, which is literally how a
+            // real MSVC build spells
             // `snprintf`.
             //   * `_Options` = STANDARD_SNPRINTF_BEHAVIOR — WITHOUT this bit the core is
             //     the pre-C99 `_snprintf`, which returns -1 on truncation where C99 wants

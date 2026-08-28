@@ -41,7 +41,7 @@ namespace {
     return *loaded;
 }
 
-// Analyze one c-subset source WITH a target in scope, so the target-dependent
+// Analyze one c source WITH a target in scope, so the target-dependent
 // constraint and clobber checks actually run.
 //
 // ⚠ THE TARGET MUST OUTLIVE THE MODEL — the model holds a NON-OWNING pointer —
@@ -57,7 +57,7 @@ struct Analyzed {
 [[nodiscard]] Analyzed analyzeFor(std::string_view arch, std::string src) {
     Analyzed a;
     a.target = shippedTarget(arch);
-    a.cu     = buildShippedUnit("c-subset", {std::move(src)});
+    a.cu     = buildShippedUnit("c", {std::move(src)});
     a.model.emplace(analyze(a.cu, DiagnosticBudget::libraryDefault(),
                             DataModel::Lp64, std::nullopt, std::nullopt,
                             std::nullopt, arch, LongDoubleFormat::None,
@@ -110,7 +110,7 @@ struct Analyzed {
 // `{optional [ '[' name ']' ]} templateText '(' operandExpr ')'`, and whether
 // the OPTIONAL group mints a node decides whether "the first Internal child is
 // the constraint" is true or is an off-by-one. ✔MEASURED 2026-08-15 on the
-// shipped c-subset + asm grammars: it does NOT — the prefix is three bare
+// shipped c + asm grammars: it does NOT — the prefix is three bare
 // tokens, and the operand has EXACTLY TWO Internal children, constraint first
 // and value expression last.
 //
@@ -119,7 +119,7 @@ struct Analyzed {
 // a constraint.
 TEST(InlineAsmCapture, AnOperandHasExactlyTwoCompositeChildrenConstraintThenValue) {
     auto cu = buildShippedUnit(
-        "c-subset", {wrap("__asm__ (\"m %0,%1\" : [o] \"=r\"(lo) : \"r\"(hi));")});
+        "c", {wrap("__asm__ (\"m %0,%1\" : [o] \"=r\"(lo) : \"r\"(hi));")});
     assertNoBuilderErrors(*cu);
     auto const& schema   = cu->schema();
     auto const& ia       = schema.semantics().inlineAsm;
@@ -161,7 +161,7 @@ TEST(InlineAsmCapture, AnOperandHasExactlyTwoCompositeChildrenConstraintThenValu
 // and zero expression nodes, so nothing downstream could bind anything.
 TEST(InlineAsmCapture, EveryOperandYieldsAConstraintAndAValueExpressionNodeId) {
     auto cu = buildShippedUnit(
-        "c-subset", {wrap("__asm__ (\"m %0,%1\" : [out] \"=r\"(lo) : \"r\"(hi));")});
+        "c", {wrap("__asm__ (\"m %0,%1\" : [out] \"=r\"(lo) : \"r\"(hi));")});
     assertNoBuilderErrors(*cu);
     auto const& schema = cu->schema();
     auto const& ia     = schema.semantics().inlineAsm;
@@ -216,11 +216,11 @@ TEST(InlineAsmCapture, EveryOperandYieldsAConstraintAndAValueExpressionNodeId) {
 // proves nothing — hence the `"+"`.
 //
 // ⓘ The lexeme guards below are not decoration: the expectations are literal
-// bytes, so if the c-subset ever re-spelled a sigil this would fail with a
+// bytes, so if the c ever re-spelled a sigil this would fail with a
 // confusing string diff instead of naming the config change that caused it.
 TEST(InlineAsmCapture, EverySpellingIsMintedFromTheDeclaredLexemesAndAPlusOperandCountsOnce) {
     auto cu = buildShippedUnit(
-        "c-subset",
+        "c",
         {wrap("__asm__ goto (\"jmp %l2\" : [o] \"+r\"(lo) : \"r\"(hi) : : lbl);")});
     assertNoBuilderErrors(*cu);
     auto const& schema = cu->schema();
@@ -365,15 +365,15 @@ onlyAsmFacts(CompilationUnit const& cu) {
 // no GNU byte is written in the assertions.
 TEST(InlineAsmCapture, TheTemplateScanFollowsTheMintedSpellingsRatherThanRecomputingTheBase) {
     auto cu = buildShippedUnit(
-        "c-subset",
+        "c",
         {wrap("__asm__ goto (\"jmp\" : [o] \"+r\"(lo) : \"r\"(hi) : : lbl);")});
     assertNoBuilderErrors(*cu);
     auto const& lex = cu->schema().semantics().inlineAsmTemplateLexemes;
     ASSERT_FALSE(lex.placeholder.empty())
-        << "c-subset declares no operand placeholder — the scan returns without "
+        << "c declares no operand placeholder — the scan returns without "
            "scanning and this arm would assert nothing";
     ASSERT_FALSE(lex.labelPlaceholder.empty())
-        << "c-subset declares no label placeholder — there would be no label "
+        << "c declares no label placeholder — there would be no label "
            "numbering to move";
 
     auto const shipped = onlyAsmFacts(*cu);
@@ -621,17 +621,77 @@ TEST(InlineAsmRefusals, AnUnsupportedConstraintFormIsRefusedNamingWhichShapeFire
     EXPECT_FALSE(good.model->hasErrors()) << errorInventory(*good.model);
 }
 
-// S0067 — the width-view modifier, with the plain placeholder as its control.
-TEST(InlineAsmRefusals, AnOperandWidthModifierIsRefusedRatherThanWidened) {
-    auto bad = analyzeFor("arm64", wrap("__asm__ (\"mov %w0, %w1\" : \"=r\"(lo) : \"r\"(hi));"));
-    ASSERT_TRUE(bad.model.has_value());
-    EXPECT_TRUE(has(*bad.model, DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
-        << errorInventory(*bad.model);
-
-    // POSITIVE CONTROL — the same template WITHOUT the modifier letters.
-    auto good = analyzeFor("arm64", wrap("__asm__ (\"mov %0, %1\" : \"=r\"(lo) : \"r\"(hi));"));
+// ★★★ THE WIDTH-VIEW MODIFIER IS A CAPABILITY, AND THIS TEST IS THE INVERSION
+// OF THE PIN THAT USED TO ASSERT THE OPPOSITE.
+//
+// It read `AnOperandWidthModifierIsRefusedRatherThanWidened` and demanded
+// `S_InlineAsmOperandModifierUnsupported` on `%w0`. That was the CORRECT
+// assertion while no document declared a width-view vocabulary — falling back
+// to the full register runs a 32-bit operation 64-bit with a clean build log.
+// The dialects now declare `assembly.templateModifiers`, so the refusal became
+// the divergence: ✔MEASURED 2026-08-24 by execution on gcc 13.3.0, both ports,
+// `-O0` and `-O2`, `%w0` renders `w0` on aarch64 and `%ax` on x86-64, and under
+// §A.3b of the bar one working reference makes the behaviour REQUIRED.
+//
+// ★★ WHAT THE TEST ASSERTS NOW IS THE PROPERTY THE REFUSAL WAS PROTECTING,
+// STATED POSITIVELY: a width view is ACCEPTED, and the thing that made
+// accepting it dangerous — a reference to an operand that does not exist, which
+// under the old code would have been swallowed by the same blanket refusal —
+// is still refused, by the code that owns index questions.
+TEST(InlineAsmRefusals, AWidthViewModifierIsAcceptedAndItsSelectorIsStillChecked) {
+    // The exact template the old pin required to be REFUSED.
+    auto good = analyzeFor(
+        "arm64", wrap("__asm__ (\"mov %w0, %w1\" : \"=r\"(lo) : \"r\"(hi));"));
     ASSERT_TRUE(good.model.has_value());
     EXPECT_FALSE(good.model->hasErrors()) << errorInventory(*good.model);
+
+    // ★ THE OTHER DIALECT'S OWN LETTERS, on the target that declares them —
+    // which is the half that proves the letters are CONFIG rather than a shared
+    // table: `k` is spelled by x86-64 and not by aarch64.
+    auto att = analyzeFor(
+        "x86_64", wrap("__asm__ (\"movl %k1, %k0\" : \"=r\"(lo) : \"r\"(hi));"));
+    ASSERT_TRUE(att.model.has_value());
+    EXPECT_FALSE(att.model->hasErrors()) << errorInventory(*att.model);
+
+    // The SYMBOLIC selector through a view — one shape, both selectors, because
+    // the width-view rule takes the SAME `asmTemplateSelector` the plain and
+    // label forms take.
+    auto named = analyzeFor(
+        "arm64",
+        wrap("__asm__ (\"mov %w[o], %w[i]\" : [o] \"=r\"(lo) : [i] \"r\"(hi));"));
+    ASSERT_TRUE(named.model.has_value());
+    EXPECT_FALSE(named.model->hasErrors()) << errorInventory(*named.model);
+
+    // ⚠ THE SELECTOR IS STILL CHECKED, and this is the assertion that keeps the
+    // acceptance from being a blanket one: `%w2` on a two-operand statement
+    // names nothing, and the code that says so is the one that owns index
+    // questions — never the modifier code, which no longer refuses anything.
+    auto outOfRange = analyzeFor(
+        "arm64", wrap("__asm__ (\"mov %w0, %w2\" : \"=r\"(lo) : \"r\"(hi));"));
+    ASSERT_TRUE(outOfRange.model.has_value());
+    EXPECT_TRUE(has(*outOfRange.model,
+                    DiagnosticCode::S_InlineAsmPlaceholderOutOfRange))
+        << errorInventory(*outOfRange.model);
+    // The message must name BOTH forms — the one written and the one that has
+    // to be bound. An author told only about `%2` cannot see which half of
+    // `%w2` was wrong.
+    bool namesBoth = false;
+    for (auto const& d : outOfRange.model->diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_InlineAsmPlaceholderOutOfRange) continue;
+        namesBoth = namesBoth || (d.actual.find("%w2") != std::string::npos
+                                  && d.actual.find("`%2`") != std::string::npos);
+    }
+    EXPECT_TRUE(namesBoth) << errorInventory(*outOfRange.model);
+
+    // ⚠ AND THE FORM WITH NO SELECTOR AT ALL IS STILL REFUSED BY S0067 — the
+    // un-escaped register (`%eax` where `%%eax` was meant) is the live case, and
+    // it is what stops "accept any letter run" from accepting everything.
+    auto bare = analyzeFor(
+        "x86_64", wrap("__asm__ (\"xorl %eax, %eax\" ::: \"eax\");"));
+    ASSERT_TRUE(bare.model.has_value());
+    EXPECT_TRUE(has(*bare.model,
+                    DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
+        << errorInventory(*bare.model);
 }
 
 // S0068 — with THREE controls, because "resolves" has three sources here.
@@ -873,23 +933,23 @@ TEST(InlineAsmAcceptance, TheTwoConstraintViolationsStayRefused) {
 // that stops this from being "skip the checks".
 TEST(InlineAsmAcceptance, WithNoTargetTheMachineQuestionsAreUnaskedAndTheGrammarOnesAreNot) {
     // No target ⇒ no letter table ⇒ `=w` cannot be judged, and is not.
-    auto m1 = analyzeShipped("c-subset", {wrap("__asm__ (\"\" : \"=w\"(lo));")});
+    auto m1 = analyzeShipped("c", {wrap("__asm__ (\"\" : \"=w\"(lo));")});
     EXPECT_FALSE(has(m1, DiagnosticCode::S_InlineAsmConstraintLetterUndeclared));
     EXPECT_FALSE(m1.hasErrors()) << errorInventory(m1);
 
     // Nor can a clobber be resolved against a register file that is not there.
-    auto m2 = analyzeShipped("c-subset", {wrap("__asm__ (\"\" ::: \"nosuchregister\");")});
+    auto m2 = analyzeShipped("c", {wrap("__asm__ (\"\" ::: \"nosuchregister\");")});
     EXPECT_FALSE(has(m2, DiagnosticCode::S_InlineAsmClobberUnknown));
     EXPECT_FALSE(m2.hasErrors()) << errorInventory(m2);
 
     // But the GRAMMAR half needs no processor and still fires.
-    auto m3 = analyzeShipped("c-subset", {wrap("__asm__ (\"\" : \"=r,m\"(lo));")});
+    auto m3 = analyzeShipped("c", {wrap("__asm__ (\"\" : \"=r,m\"(lo));")});
     EXPECT_TRUE(has(m3, DiagnosticCode::S_InlineAsmConstraintUnsupportedForm))
         << errorInventory(m3);
-    auto m4 = analyzeShipped("c-subset", {wrap("__asm__ (\"m %9\" : \"=r\"(lo));")});
+    auto m4 = analyzeShipped("c", {wrap("__asm__ (\"m %9\" : \"=r\"(lo));")});
     EXPECT_TRUE(has(m4, DiagnosticCode::S_InlineAsmPlaceholderOutOfRange))
         << errorInventory(m4);
-    auto m5 = analyzeShipped("c-subset", {wrap("__asm__ (\"m %0\");")});
+    auto m5 = analyzeShipped("c", {wrap("__asm__ (\"m %0\");")});
     EXPECT_TRUE(has(m5, DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate))
         << errorInventory(m5);
 }
@@ -914,13 +974,13 @@ TEST(InlineAsmAcceptance, WithNoTargetTheMachineQuestionsAreUnaskedAndTheGrammar
 // the spelling that WOULD have named the author's target.
 //
 // ⓘ THE EXPECTATIONS BELOW ARE LITERAL BYTES, GUARDED. Every quoted form is one
-// the c-subset currently declares, so the guard at the top names the config
+// the c currently declares, so the guard at the top names the config
 // change if a sigil is ever re-spelled — the same reason the minting pin carries
 // one. The forms themselves are not owned here: they are what
 // `mintTemplateSpellings` produced, read back out of a diagnostic.
 TEST(InlineAsmRefusals, APositionalAsmGotoLabelReferenceIsAcceptedAndItsIndexIsCheckedAgainstTheLabelRange) {
     {
-        auto probe = buildShippedUnit("c-subset", {wrap("__asm__ (\"\");")});
+        auto probe = buildShippedUnit("c", {wrap("__asm__ (\"\");")});
         auto const& lex = probe->schema().semantics().inlineAsmTemplateLexemes;
         ASSERT_EQ(lex.placeholder,       "%");
         ASSERT_EQ(lex.labelPlaceholder,  "%l");
@@ -1116,7 +1176,7 @@ TEST(InlineAsmRefusals, APositionalAsmGotoLabelReferenceIsAcceptedAndItsIndexIsC
 // KIND: a WRONG ANSWER out of the shipped CLI, not a reasoned hazard.
 // ✔MEASURED 2026-08-19, `__asm__("movl %[v], %[out]" : [out] "=r"(r),
 // [v] "=r"(d) : [v] "r"(a))` with `a == 20`, compiled by the shipped
-// `dss-code-prime` for `x86_64:pe64-x86_64-windows-exec` at `--config=debug`
+// `dsscp` for `x86_64:pe64-x86_64-windows-exec` at `--config=debug`
 // AND `--config=release`: rc=0 both times, and the program exited **0** where
 // 20 was written. `%[v]` bound the OUTPUT, because `mintTemplateSpellings` gives
 // both occurrences the same form and every spelling lookup below this tier is a
@@ -1159,7 +1219,7 @@ TEST(InlineAsmRefusals, ASymbolicNameUsedTwiceIsRefusedInAllThreeCollisions) {
 
     // ── (b) TWO `asm goto` LABELS. Both rows mint the same bracketed form. ──
     auto twoLabels = analyzeShipped(
-        "c-subset",
+        "c",
         {"int main(void){ unsigned a = 0; "
          "__asm__ goto (\"jmp %l[hit]\" : : \"r\"(a) : : hit, hit); "
          "return 0; hit: return 1; }\n"});
@@ -1172,7 +1232,7 @@ TEST(InlineAsmRefusals, ASymbolicNameUsedTwiceIsRefusedInAllThreeCollisions) {
     // because GNU 6.47.2.3/6.47.2.7 keeps ONE name space and both references
     // reject the pair — measured, not inferred. ──
     auto crossKind = analyzeShipped(
-        "c-subset",
+        "c",
         {"int main(void){ unsigned a = 0; "
          "__asm__ goto (\"jmp %l[v]\" : : [v] \"r\"(a) : : v); "
          "return 0; v: return 1; }\n"});
@@ -1248,7 +1308,7 @@ TEST(InlineAsmRefusals, ASymbolicNameUsedTwiceIsRefusedInAllThreeCollisions) {
 
     // A NAMED operand beside a DIFFERENTLY-named label on the same statement.
     auto namedBoth = analyzeShipped(
-        "c-subset",
+        "c",
         {"int main(void){ unsigned a = 0; "
          "__asm__ goto (\"jmp %l[hit]\" : : [v] \"r\"(a) : : hit); "
          "return 0; hit: return 1; }\n"});
@@ -1266,7 +1326,7 @@ TEST(InlineAsmRefusals, ASymbolicNameUsedTwiceIsRefusedInAllThreeCollisions) {
     EXPECT_TRUE(has(*arm.model, DiagnosticCode::S_InlineAsmDuplicateSymbolicName))
         << errorInventory(*arm.model);
     auto noTarget = analyzeShipped(
-        "c-subset",
+        "c",
         {wrap("__asm__ (\"m %[v], %[o]\" : [o] \"=r\"(lo), [v] \"=r\"(hi) "
               ": [v] \"r\"(lo));")});
     EXPECT_TRUE(has(noTarget, DiagnosticCode::S_InlineAsmDuplicateSymbolicName))

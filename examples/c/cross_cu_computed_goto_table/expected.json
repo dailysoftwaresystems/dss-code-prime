@@ -1,0 +1,33 @@
+{
+  "$comment": "D-LINK-MERGE-DOES-NOT-REMAP-BLOCK-SYMBOLS (cycle P37). A function-static computed-goto jump table in a SEPARATE translation unit from its caller. The table is a DATA item whose relocations name SYNTHETIC BLOCK SYMBOLS; the whole-program merge remapped the owning function's symbol and every relocation target but copied `blockSymbols` verbatim, so the declaration kept its per-CU id while the reference got a freshly minted merged one and the link failed with 1313 K_SymbolUndefined on the sqlite3 CLI for pe64. TWO CUs are the precondition, not decoration: in a single-CU build the id mint is the identity, the two ids coincide, and the defect cannot fire -- which is why a 103-TU program found it and no single-CU pin did. The exit code witnesses the RELOCATION VALUES, not merely that the link succeeded: 10+20+30+40-58 = 42, so a slot bound to the wrong block changes it.",
+  "language": "c",
+  "sources": ["main.c", "dispatch.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "passes": ["ConstFold", "CopyProp", "Inlining"], "mustDifferFromBaseline": false}
+  ]
+}

@@ -202,7 +202,7 @@ parseNative(std::vector<PackedProbe> const& bs,
 // SDK's `mach/message.h` `pack(4)` descriptors are 16 bytes with the cap and 16
 // without — identical `sizeof`, `_Alignof` 4 vs 8 — so a size-only witness passes
 // them while the ABI is still wrong. `struct C` in
-// examples/c-subset/packed_bitfield_align makes the same point end to end.
+// examples/c/packed_bitfield_align makes the same point end to end.
 struct PackBitProbe {
     std::string               name;
     std::string               cDecl;       // declared inside a #pragma pack(N) region

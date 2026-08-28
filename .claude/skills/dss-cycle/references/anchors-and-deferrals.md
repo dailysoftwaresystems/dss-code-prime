@@ -32,7 +32,17 @@ deferral is the rare exception that must earn its place, not the convenient way 
    missing trigger) — the *why* is the admissible reason from step 0, restated.
 2. **Pin it in the best home.** A feature-area `D-*` anchor → that plan's §3.1 anchor row.
    A project-level known-open item that is not a feature anchor → plan-00 **§0.2** (Deferred &
-   Known-Open Items registry). An orphan / cross-cutting anchor → `_deferred-anchor-registry.md`.
+   Known-Open Items registry). An orphan / cross-cutting anchor → the deferred-anchor registry,
+   which is **two documents** since 2026-08-25 and the choice is not cosmetic:
+   - `.plans/_deferred-anchor-registry-production.md` — a defect **a user of the compiler could
+     hit**, in the shipped binary or in the config it reads. ★ This is the file the burndown
+     works from, ALWAYS (operator, 2026-08-25).
+   - `.plans/_deferred-anchor-registry-harness.md` — a defect **only we can hit**: tests, gates,
+     guards, cycle machinery, plans, scripts, carriages, CI. ⚠ Fix a harness defect the moment
+     you FACE it, in that cycle; this file is a RECORD, not a backlog to schedule from.
+   ⚠ A row's bucket follows the **DEFECT**, never the instrument that found it. `D-CONFIG-*` and
+   `D-DIAG-*` are PRODUCTION deliberately — a config document IS the compiler's behaviour here,
+   and a diagnostic IS its output to a user.
    Use the registry schema: `| Anchor | Trigger | Closing work | Cross-refs |`.
 3. **State its priority explicitly** in the row — one of: **blocker-now** (must close inside
    this cycle, Step 2 or before push), **high** (run at end of this cycle, or earlier if it
@@ -53,7 +63,7 @@ deferral is the rare exception that must earn its place, not the convenient way 
 | **Handoff — read at Step 0, rewritten at Step 8.1** | `.plans/_handoff.md` — ①where we are ②where we need to get ③priorities ④concurrent branches/PRs (rebase surface) ⑤timeline (accumulates) |
 | Open PRs / rebase surface | `gh pr list --state open` · `gh pr view <n> --json files` (Step 8.2) |
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0.1 |
-| Deferral registry | `.plans/_deferred-anchor-registry.md` |
+| Deferral registry | `.plans/_deferred-anchor-registry*.md` |
 | Anchor balance gate | `python scripts/check-anchor-balance/check-anchor-balance.py` |
 | Per-cycle plan | `/feature-dev:feature-dev` (Step 3) |
 | Plan-lock design audit | independent `dss-audit` lens on the plan, pre-build (Step 3.5) |

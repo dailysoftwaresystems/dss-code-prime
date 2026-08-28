@@ -1,5 +1,5 @@
 // CU4 tests for per-language import resolution — the ImportResolver populating
-// CompilationUnit::crossRefs. Covers toy (identity), c-subset (#include
+// CompilationUnit::crossRefs. Covers toy (identity), c (#include
 // following, recursion, cycles, unresolved), and tsql-subset (cross-statement
 // table-name matching, table-vs-column position, unresolved).
 
@@ -33,7 +33,7 @@ using dss::cu_test::countCode;
 using dss::cu_test::hasCode;
 using dss::cu_test::loadShippedSchema;
 
-// RAII temp directory for the c-subset include tests: files must share a
+// RAII temp directory for the c include tests: files must share a
 // directory so same-directory `#include` resolution finds them. The facade —
 // and the reason its unique-path scheme is NOT reimplemented locally, defect
 // D-TEST-FIXED-SCRATCH-PATH-POPULATION — lives in `toy_cu_fixture.hpp`; it was
@@ -75,9 +75,9 @@ TEST(ImportResolver, ToyProducesNoCrossRefs) {
     EXPECT_TRUE(cu.crossRefs().empty());
 }
 
-// ── c-subset: #include following ─────────────────────────────────────────────
+// ── c: #include following ─────────────────────────────────────────────
 
-TEST(ImportResolver, CSubsetQuoteIncludeIsInlinedByPreprocessor) {
+TEST(ImportResolver, CQuoteIncludeIsInlinedByPreprocessor) {
     // FC13: a QUOTE `#include "h"` is now owned by the config-selected C
     // preprocessor, which splices the header TEXT into ONE synthesized buffer
     // BEFORE parsing (so a header `#define` could reach the includer). The
@@ -93,7 +93,7 @@ TEST(ImportResolver, CSubsetQuoteIncludeIsInlinedByPreprocessor) {
     auto main = dir.write("main.c", "#include \"helper.h\"\nint main() { return helper(); }\n");
     dir.write("helper.h", "int helper() { return 1; }\n");
 
-    UnitBuilder b{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder b{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     b.addFile(main);
     auto cu = std::move(b).finish();
 
@@ -108,7 +108,7 @@ TEST(ImportResolver, CSubsetQuoteIncludeIsInlinedByPreprocessor) {
         << "preprocessor must splice the quote-included header text inline";
 }
 
-TEST(ImportResolver, CSubsetTransitiveQuoteIncludeInlinesChain) {
+TEST(ImportResolver, CTransitiveQuoteIncludeInlinesChain) {
     // FC13: a quote include WITHIN a quote-included header is inlined
     // recursively into the SAME synthesized buffer -> still one tree, zero
     // cross-refs, and every transitively-included symbol present.
@@ -117,7 +117,7 @@ TEST(ImportResolver, CSubsetTransitiveQuoteIncludeInlinesChain) {
     dir.write("b.h", "#include \"c.h\"\nint b() { return 0; }\n");
     dir.write("c.h", "int c() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addFile(a);
     auto cu = std::move(builder).finish();
 
@@ -131,7 +131,7 @@ TEST(ImportResolver, CSubsetTransitiveQuoteIncludeInlinesChain) {
 }
 
 // ★ TF-C87 (D-PP-INCLUDE-REENTRY-GUARD-AWARE) REWROTE THIS TEST, and the old
-// version WAS THE BUG. As `CSubsetQuoteIncludeCycleTerminates` it built an
+// version WAS THE BUG. As `CQuoteIncludeCycleTerminates` it built an
 // UNGUARDED a.h <-> b.h pair, asserted `P_PreprocessorIncludeError`, and called
 // that the whole contract — so it read as if EVERY include back-edge were an
 // error. It is not. A back-edge into a GUARDED header is legal, conforming C
@@ -142,7 +142,7 @@ TEST(ImportResolver, CSubsetTransitiveQuoteIncludeInlinesChain) {
 // the CONTRAST — either test alone can be satisfied by a compiler that gets the
 // other one wrong.
 
-TEST(ImportResolver, CSubsetUnguardedQuoteIncludeCycleTerminatesAndIsRefused) {
+TEST(ImportResolver, CUnguardedQuoteIncludeCycleTerminatesAndIsRefused) {
     // No include guard anywhere, so the back-edge really is an infinite cycle:
     // refused on sight, LOUDLY, and the parse still produces one tree.
     //
@@ -153,7 +153,7 @@ TEST(ImportResolver, CSubsetUnguardedQuoteIncludeCycleTerminatesAndIsRefused) {
     auto a = dir.write("a.h", "#include \"b.h\"\nint a() { return 0; }\n");
     dir.write("b.h", "#include \"a.h\"\nint b() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addFile(a);
     auto cu = std::move(builder).finish();
 
@@ -176,7 +176,7 @@ TEST(ImportResolver, CSubsetUnguardedQuoteIncludeCycleTerminatesAndIsRefused) {
            "one diagnostic";
 }
 
-TEST(ImportResolver, CSubsetGuardedQuoteIncludeCycleIsNotAnError) {
+TEST(ImportResolver, CGuardedQuoteIncludeCycleIsNotAnError) {
     // ★ THE HALF THAT WAS BROKEN. The same a.h <-> b.h shape, with ordinary
     // include guards. A real cpp terminates this via the guard and reports
     // NOTHING; so must DSS. Both bodies must land exactly once — 0 means a
@@ -189,7 +189,7 @@ TEST(ImportResolver, CSubsetGuardedQuoteIncludeCycleIsNotAnError) {
               "#ifndef B_H\n#define B_H\n#include \"a.h\"\n"
               "int b() { return 0; }\n#endif\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addFile(a);
     auto cu = std::move(builder).finish();
 
@@ -213,14 +213,14 @@ TEST(ImportResolver, CSubsetGuardedQuoteIncludeCycleIsNotAnError) {
     // emitted LEXEMES.
 }
 
-TEST(ImportResolver, CSubsetMissingQuoteIncludeEmitsDiagnosticAndContinues) {
+TEST(ImportResolver, CMissingQuoteIncludeEmitsDiagnosticAndContinues) {
     // FC13: a missing quote-`#include` target is reported by the preprocessor
     // (P_PreprocessorIncludeError) and the rest of the file still parses (the
     // directive's bytes are left verbatim). Still one tree, no cross-refs.
     TempDir dir;
     auto main = dir.write("main.c", "#include \"ghost.h\"\nint main() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addFile(main);
     auto cu = std::move(builder).finish();
 
@@ -243,7 +243,7 @@ TEST(ImportResolver, CSubsetMissingQuoteIncludeEmitsDiagnosticAndContinues) {
         << "the resolver must not double-report a PP-owned failed quote include";
 }
 
-TEST(ImportResolver, CSubsetQuoteIncludeResolvesAcrossDirectories) {
+TEST(ImportResolver, CQuoteIncludeResolvesAcrossDirectories) {
     // FC13: the preprocessor's quote-include search honors declared include
     // dirs (addIncludeDir), mirroring the import resolver's resolveIncludePath.
     TempDir srcDir;
@@ -251,7 +251,7 @@ TEST(ImportResolver, CSubsetQuoteIncludeResolvesAcrossDirectories) {
     auto main = srcDir.write("main.c", "#include \"shared.h\"\nint main() { return shared(); }\n");
     incDir.write("shared.h", "int shared() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addIncludeDir(incDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -267,26 +267,26 @@ TEST(ImportResolver, CSubsetQuoteIncludeResolvesAcrossDirectories) {
 // ── FF11: angle-form `#include <h>` system-path resolution ───────────────────
 
 // `#include <X.h>` resolves to a LANGUAGE-NEUTRAL JSON DESCRIPTOR on the SYSTEM
-// search path (addSystemDir, the shippedLibDirs analogue) — NOT a c-subset
+// search path (addSystemDir, the shippedLibDirs analogue) — NOT a c
 // source header (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC, the descriptor model
 // that REPLACED cycle-21's source-`.h` load). The requested `<api.h>` maps to
 // `api.json`; on a hit the resolver records its ABSOLUTE PATH on
 // `cu.shippedLibDescriptors()` and loads NO extra Tree (a descriptor is a
 // neutral symbol table, not parsed source, so it yields no CrossTreeRef). The
 // semantic phase reads that path + mints the descriptor's externs (proven
-// end-to-end by examples/c-subset/shipped_include_puts and by
-// SemanticAnalyzerCSubset.FF11* below).
-TEST(ImportResolver, CSubsetAngleIncludeResolvesToDescriptorOnSystemDir) {
+// end-to-end by examples/c/shipped_include_puts and by
+// SemanticAnalyzerC.FF11* below).
+TEST(ImportResolver, CAngleIncludeResolvesToDescriptorOnSystemDir) {
     TempDir srcDir;
     TempDir sysDir;
     auto main = srcDir.write("main.c",
         "#include <api.h>\nint main() { return 0; }\n");
-    // The shipped artifact is a NEUTRAL JSON descriptor, NOT a c-subset `.h`.
+    // The shipped artifact is a NEUTRAL JSON descriptor, NOT a c `.h`.
     auto descPath = sysDir.write("api.json",
         R"({ "library": { "pe": "lib.dll" },
              "symbols": [ { "name": "use", "signature": "fn() -> i32" } ] })");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());       // the system (shippedLibDirs) path
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -316,7 +316,7 @@ TEST(ImportResolver, CSubsetAngleIncludeResolvesToDescriptorOnSystemDir) {
 // mapping (`fs::path(filename).stem()`) sends `<sys/time.h>` to `time.json`,
 // silently resolving the WRONG descriptor — exactly the collision this guards for
 // the POSIX `sys/*` headers (SQLite-readiness Cluster G; <sys/time.h> vs <time.h>).
-TEST(ImportResolver, CSubsetSubdirAngleIncludeResolvesDistinctFromTopLevel) {
+TEST(ImportResolver, CSubdirAngleIncludeResolvesDistinctFromTopLevel) {
     TempDir srcDir;
     TempDir sysDir;
     auto main = srcDir.write("main.c",
@@ -329,7 +329,7 @@ TEST(ImportResolver, CSubsetSubdirAngleIncludeResolvesDistinctFromTopLevel) {
     auto const want = sysDir.write("sys/time.json",
         R"({ "header": "sys/time.h", "typedefs": [ { "name": "suseconds_t", "type": "i64" } ] })");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -346,13 +346,13 @@ TEST(ImportResolver, CSubsetSubdirAngleIncludeResolvesDistinctFromTopLevel) {
 
 // A SYSTEM-header miss is a HARD error (F_ShippedHeaderNotFound), NOT the
 // soft D_UnresolvedImport the quote form uses. (FF11 fail-loud contract.)
-TEST(ImportResolver, CSubsetAngleIncludeMissIsHardError) {
+TEST(ImportResolver, CAngleIncludeMissIsHardError) {
     TempDir srcDir;
     TempDir sysDir;   // empty — the header is absent
     auto main = srcDir.write("main.c",
         "#include <nope.h>\nint main() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -373,7 +373,7 @@ TEST(ImportResolver, CSubsetAngleIncludeMissIsHardError) {
 // host-portably (no libtcl/elf; just the recorded refs). RED-ON-DISABLE: revert the
 // closure walk to a single-ref push → only parent.json is recorded → the child's
 // symbols never inject (test_md5's FILE class stays S0001).
-TEST(ImportResolver, CSubsetAngleIncludeRecordsTransitiveDescriptorRefs) {
+TEST(ImportResolver, CAngleIncludeRecordsTransitiveDescriptorRefs) {
     TempDir srcDir;
     TempDir sysDir;
     auto main = srcDir.write("main.c",
@@ -385,7 +385,7 @@ TEST(ImportResolver, CSubsetAngleIncludeRecordsTransitiveDescriptorRefs) {
         R"({ "header": "child.h",
              "symbols": [ { "name": "cfn", "signature": "fn() -> i32" } ] })");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -411,7 +411,7 @@ TEST(ImportResolver, CSubsetAngleIncludeRecordsTransitiveDescriptorRefs) {
 // on the parent `#include` line (the import resolver is the ONLY tier with
 // systemDirs to catch it). RED-ON-DISABLE: drop the onUnresolvedInclude arm → a
 // typo'd transitive include is silently swallowed.
-TEST(ImportResolver, CSubsetAngleIncludeUnresolvedTransitiveIsHardError) {
+TEST(ImportResolver, CAngleIncludeUnresolvedTransitiveIsHardError) {
     TempDir srcDir;
     TempDir sysDir;
     auto main = srcDir.write("main.c",
@@ -421,7 +421,7 @@ TEST(ImportResolver, CSubsetAngleIncludeUnresolvedTransitiveIsHardError) {
         R"({ "header": "parent.h", "includes": ["stdioo.h"],
              "symbols": [ { "name": "pfn", "signature": "fn() -> i32" } ] })");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -438,7 +438,7 @@ TEST(ImportResolver, CSubsetAngleIncludeUnresolvedTransitiveIsHardError) {
 // D-FFI-DESCRIPTOR-INCLUDES cycle-safety at the CU level: parent<->child mutual
 // `includes` records each descriptor EXACTLY ONCE and TERMINATES (the CU-wide
 // visited-set). RED-ON-DISABLE: drop the visited-set guard → infinite recursion.
-TEST(ImportResolver, CSubsetAngleIncludeCyclicTransitiveTerminates) {
+TEST(ImportResolver, CAngleIncludeCyclicTransitiveTerminates) {
     TempDir srcDir;
     TempDir sysDir;
     auto main = srcDir.write("main.c",
@@ -450,7 +450,7 @@ TEST(ImportResolver, CSubsetAngleIncludeCyclicTransitiveTerminates) {
         R"({ "header": "pb.h", "includes": ["pa.h"],
              "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ] })");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -464,7 +464,7 @@ TEST(ImportResolver, CSubsetAngleIncludeCyclicTransitiveTerminates) {
 // The quote form does NOT search the system dir, and the angle form does
 // NOT search includeDirs — the two paths are distinct (config-driven by
 // pathToken vs systemPathToken, no language branch).
-TEST(ImportResolver, CSubsetAngleAndQuotePathsAreDistinct) {
+TEST(ImportResolver, CAngleAndQuotePathsAreDistinct) {
     TempDir srcDir;
     TempDir sysDir;
     // The header lives ONLY on the system dir. A QUOTE include of the same
@@ -477,7 +477,7 @@ TEST(ImportResolver, CSubsetAngleAndQuotePathsAreDistinct) {
         "#include \"sysonly.h\"\nint main() { return 0; }\n");
     sysDir.write("sysonly.h", "extern int s();\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());   // declared as SYSTEM, not include
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -511,14 +511,14 @@ TEST(ImportResolver, CSubsetAngleAndQuotePathsAreDistinct) {
 // present, NO F_ShippedHeaderNotFound, NO descriptor recorded. RED-ON-DISABLE:
 // revert the fallback -> the PP leaves the angle include verbatim -> the
 // post-parse resolver's descriptor lookup misses -> F_ShippedHeaderNotFound.
-TEST(ImportResolver, CSubsetAngleSourceFallbackResolves) {
+TEST(ImportResolver, CAngleSourceFallbackResolves) {
     TempDir srcDir;
     TempDir incDir;   // the -I path (NOT the including file's own dir)
     auto main = srcDir.write("main.c",
         "#include <foo.h>\nint main() { return foo(); }\n");
     incDir.write("foo.h", "int foo(void) { return 7; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addIncludeDir(incDir.path());   // -I: the angle source-fallback path
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -543,7 +543,7 @@ TEST(ImportResolver, CSubsetAngleSourceFallbackResolves) {
 // is recorded; the source decoy is NEVER inlined. RED-ON-DISABLE: flip the funnel
 // to source-first -> no descriptor recorded + the invalid decoy is spliced (tree
 // errors).
-TEST(ImportResolver, CSubsetAngleSourceFallbackDescriptorFirst) {
+TEST(ImportResolver, CAngleSourceFallbackDescriptorFirst) {
     TempDir srcDir;
     TempDir sysDir;
     TempDir incDir;
@@ -556,7 +556,7 @@ TEST(ImportResolver, CSubsetAngleSourceFallbackDescriptorFirst) {
     // so a wrong source-first splice would surface loudly as a tree error.
     incDir.write("baz.h", "@@@ this is not valid c and must never be inlined @@@\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addIncludeDir(incDir.path());
     builder.addFile(main);
@@ -582,7 +582,7 @@ TEST(ImportResolver, CSubsetAngleSourceFallbackDescriptorFirst) {
 // F_ShippedHeaderNotFound; the SAME header via a QUOTE `#include "qux.h"` DOES
 // resolve. RED-ON-DISABLE: if the fallback wrongly searched the including dir the
 // angle form would resolve and the hard error would vanish.
-TEST(ImportResolver, CSubsetAngleSourceFallbackDoesNotSearchIncludingDir) {
+TEST(ImportResolver, CAngleSourceFallbackDoesNotSearchIncludingDir) {
     // Angle: qux.h only in the including file's own dir -> NOT found.
     {
         TempDir srcDir;
@@ -590,7 +590,7 @@ TEST(ImportResolver, CSubsetAngleSourceFallbackDoesNotSearchIncludingDir) {
             "#include <qux.h>\nint main() { return qux(); }\n");
         srcDir.write("qux.h", "int qux(void) { return 1; }\n");  // self-dir ONLY
 
-        UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+        UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
         // NO addIncludeDir -> the angle form has no -I on which to find qux.h.
         builder.addFile(main);
         auto cu = std::move(builder).finish();
@@ -606,7 +606,7 @@ TEST(ImportResolver, CSubsetAngleSourceFallbackDoesNotSearchIncludingDir) {
             "#include \"qux.h\"\nint main() { return qux(); }\n");
         srcDir.write("qux.h", "int qux(void) { return 1; }\n");
 
-        UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+        UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
         builder.addFile(main);
         auto cu = std::move(builder).finish();
 
@@ -622,14 +622,14 @@ TEST(ImportResolver, CSubsetAngleSourceFallbackDoesNotSearchIncludingDir) {
 // P4: an angle `<none.h>` absent on the systemDir AND every -I includeDir is a
 // hard, unsuppressable F_ShippedHeaderNotFound (fail-loud — never silently
 // accepted). An -I dir IS present but does not contain the header.
-TEST(ImportResolver, CSubsetAngleSourceFallbackTotalMissHardError) {
+TEST(ImportResolver, CAngleSourceFallbackTotalMissHardError) {
     TempDir srcDir;
     TempDir incDir;   // present but does NOT contain none.h
     auto main = srcDir.write("main.c",
         "#include <none.h>\nint main() { return 0; }\n");
     incDir.write("other.h", "int other(void);\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addIncludeDir(incDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -710,9 +710,9 @@ TEST(ImportResolver, TsqlInsertAndUpdateAreTablePositions) {
     EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedReference));
 }
 
-// ── c-subset: dedup / edge cases ─────────────────────────────────────────────
+// ── c: dedup / edge cases ─────────────────────────────────────────────
 
-TEST(ImportResolver, CSubsetEmptyIncludePathIsReported) {
+TEST(ImportResolver, CEmptyIncludePathIsReported) {
     TempDir dir;
     // FC13: `#include ""` is a well-formed directive with an EMPTY filename.
     // The preprocessor resolves it to nothing and reports
@@ -722,7 +722,7 @@ TEST(ImportResolver, CSubsetEmptyIncludePathIsReported) {
     // one tree results.
     auto main = dir.write("main.c", "#include \"\"\nint main() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addFile(main);
     auto cu = std::move(builder).finish();
 
@@ -735,12 +735,12 @@ TEST(ImportResolver, CSubsetEmptyIncludePathIsReported) {
         << "an empty quote include must be reported, never a silent skip";
 }
 
-TEST(ImportResolver, CSubsetExplicitlyAddedIncludeTargetIsNotReloaded) {
+TEST(ImportResolver, CExplicitlyAddedIncludeTargetIsNotReloaded) {
     TempDir dir;
     auto main   = dir.write("main.c", "#include \"helper.h\"\nint main() { return 0; }\n");
     auto helper = dir.write("helper.h", "int helper() { return 1; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addFile(main);
     builder.addFile(helper);   // also added explicitly
     auto cu = std::move(builder).finish();
@@ -755,13 +755,13 @@ TEST(ImportResolver, CSubsetExplicitlyAddedIncludeTargetIsNotReloaded) {
               std::string::npos);
 }
 
-TEST(ImportResolver, CSubsetSharedHeaderIsInlinedIntoEachIncluder) {
+TEST(ImportResolver, CSharedHeaderIsInlinedIntoEachIncluder) {
     TempDir dir;
     auto a = dir.write("a.c", "#include \"common.h\"\nint a() { return 0; }\n");
     auto b = dir.write("b.c", "#include \"common.h\"\nint b() { return 0; }\n");
     dir.write("common.h", "int common() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addFile(a);
     builder.addFile(b);
     auto cu = std::move(builder).finish();
@@ -777,14 +777,14 @@ TEST(ImportResolver, CSubsetSharedHeaderIsInlinedIntoEachIncluder) {
               std::string::npos);
 }
 
-TEST(ImportResolver, CSubsetInMemoryIncludeResolvesViaIncludeDir) {
+TEST(ImportResolver, CInMemoryIncludeResolvesViaIncludeDir) {
     TempDir incDir;
     incDir.write("dep.h", "int dep() { return 0; }\n");
 
     // FC13: an in-memory source's quote include is resolved by the
     // preprocessor against declared include dirs and INLINED -> one tree,
     // zero cross-refs, header text present.
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addIncludeDir(incDir.path());
     builder.addInMemory("#include \"dep.h\"\nint main() { return dep(); }\n", "main.c");
     auto cu = std::move(builder).finish();
@@ -796,8 +796,8 @@ TEST(ImportResolver, CSubsetInMemoryIncludeResolvesViaIncludeDir) {
               std::string::npos);
 }
 
-TEST(ImportResolver, CSubsetInMemoryIncludeWithoutIncludeDirIsUnresolved) {
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+TEST(ImportResolver, CInMemoryIncludeWithoutIncludeDirIsUnresolved) {
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addInMemory("#include \"dep.h\"\nint main() { return 0; }\n", "main.c");
     auto cu = std::move(builder).finish();
 
@@ -826,13 +826,13 @@ TEST(ImportResolver, CSubsetInMemoryIncludeWithoutIncludeDirIsUnresolved) {
 // trees, zero cross-refs; main.c's inlined text is the ON-DISK content.
 // (The pre-FC13 post-parse dedup-by-label applied only to the cross-tree
 // include-following arm, which is retired for C quote includes.)
-TEST(ImportResolver, CSubsetInMemoryLabelDoesNotDedupAgainstTextualInclude) {
+TEST(ImportResolver, CInMemoryLabelDoesNotDedupAgainstTextualInclude) {
     TempDir dir;
     auto helperPath = dir.write("helper.h", "int disk_helper() { return 9; }\n");
     auto mainPath   = dir.write("main.c",
         "#include \"helper.h\"\nint main() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addInMemory("int mem_helper() { return 1; }\n", helperPath.string());
     builder.addFile(mainPath);
     auto cu = std::move(builder).finish();
@@ -851,26 +851,26 @@ TEST(ImportResolver, CSubsetInMemoryLabelDoesNotDedupAgainstTextualInclude) {
 
 // ── genericity: resolution is driven by the `imports` block, not the name ─────
 
-// Load the shipped c-subset schema TEXT, rename the language to something the
+// Load the shipped c schema TEXT, rename the language to something the
 // engine has never heard of, and confirm `#include` following STILL happens.
 // If any resolver code branched on the language name, the include would be
 // silently dropped under the made-up name; instead the schema's `imports` block
-// drives resolution, so the cross-ref appears exactly as for "CSubset".
-// Load the shipped c-subset schema TEXT, rename the language to something the
+// drives resolution, so the cross-ref appears exactly as for "C".
+// Load the shipped c schema TEXT, rename the language to something the
 // engine has never heard of, and confirm the config-SELECTED preprocessor
 // STILL inlines the quote `#include`. If any pass branched on the language
 // name, the include would not be inlined under the made-up name; instead the
 // schema's `preprocess` block drives it, so the header text appears inline
-// exactly as for "CSubset". (Pre-FC13 this asserted the post-parse
+// exactly as for "C". (Pre-FC13 this asserted the post-parse
 // include-following arm; FC13 retired that arm for C quote includes in favor
 // of the equally config-driven preprocessor splice.)
 TEST(ImportResolver, QuoteIncludeInliningIsDrivenByConfigNotLanguageName) {
-    std::string text = readShippedConfigText("c-subset");
-    auto const pos = text.find("\"CSubset\"");
-    ASSERT_NE(pos, std::string::npos) << "shipped c-subset config no longer names CSubset";
-    text.replace(pos, std::string_view{"\"CSubset\""}.size(), "\"MadeUpLang\"");
+    std::string text = readShippedConfigText("c");
+    auto const pos = text.find("\"C\"");
+    ASSERT_NE(pos, std::string::npos) << "shipped c config no longer names C";
+    text.replace(pos, std::string_view{"\"C\""}.size(), "\"MadeUpLang\"");
 
-    auto loaded = GrammarSchema::loadFromText(text, "<renamed-c-subset>");
+    auto loaded = GrammarSchema::loadFromText(text, "<renamed-c>");
     ASSERT_TRUE(loaded.has_value())
         << "renamed schema should still load: "
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
@@ -947,7 +947,7 @@ TEST(ImportResolver, AngleIncludeCaseFollowsFormatPolicyNotHostFilesystem) {
             R"({ "library": { "pe": "kernel32.dll" },
                  "symbols": [ { "name": "Sleep", "signature": "fn(i32) -> void" } ] })");
 
-        UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+        UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
         builder.addSystemDir(sysDir.path());
         builder.setHeaderNameMatching(insensitive
                                           ? HeaderNameMatching::CaseInsensitive
@@ -990,7 +990,7 @@ TEST(ImportResolver, AngleIncludeExactSpellingResolvesUnderBothCasePolicies) {
             R"({ "library": { "pe": "kernel32.dll" },
                  "symbols": [ { "name": "Sleep", "signature": "fn(i32) -> void" } ] })");
 
-        UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+        UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
         builder.addSystemDir(sysDir.path());
         builder.setHeaderNameMatching(m);
         builder.addFile(main);
@@ -1073,7 +1073,7 @@ TEST(ImportResolver, AngleDescriptorFoldCollisionFailsLoudAndNamesCandidates) {
                         "case-sensitive leg";
     }
 
-    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.setHeaderNameMatching(HeaderNameMatching::CaseInsensitive);
     builder.addFile(main);

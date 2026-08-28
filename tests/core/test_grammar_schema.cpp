@@ -9,6 +9,8 @@
 // is pinned against (the tests hex-render it themselves; see `hexOracle`).
 #include "core/crypto/sha256.hpp"
 #include "repo_root.hpp"
+// The ONE load-or-fail-this-test helper for a shipped grammar.
+#include "shipped_schema_or_throw.hpp"
 
 #include <gtest/gtest.h>
 
@@ -25,6 +27,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace dss;
 
@@ -316,20 +319,20 @@ TEST(GrammarSchema, LoadShippedToy) {
 // name to that list by hand — deliberately.
 
 
-// The shipped c-subset config must load cleanly and round-trip every rule
+// The shipped c config must load cleanly and round-trip every rule
 // the JSON declares. Pins three layers: (a) loader accepts the file, (b)
 // each named shape resolves via `rules().find(...)` so a typo in any
 // shape key wouldn't slip through as "loaded but unusable at first call",
 // (c) representative tokens and keywords carry the right meanings.
-TEST(GrammarSchema, LoadShippedCSubset) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+TEST(GrammarSchema, LoadShippedC) {
+    auto result = GrammarSchema::loadShipped("c");
     if (!result.has_value()) {
-        FAIL() << "loadShipped c-subset failed: " << result.error()[0].message
+        FAIL() << "loadShipped c failed: " << result.error()[0].message
                << " (cwd=" << std::filesystem::current_path().string() << ")";
     }
     auto const& schema = **result;
 
-    EXPECT_EQ(schema.name(), "CSubset");
+    EXPECT_EQ(schema.name(), "C");
     EXPECT_EQ(schema.schemaVersion(), 4u);
 
     // Every shape name declared in the JSON must resolve. A typo would
@@ -369,7 +372,7 @@ TEST(GrammarSchema, LoadShippedCSubset) {
                                   "operand",
                                   // Pratt-walker wrapper rules auto-interned
                                   // by the loader when the schema declares
-                                  // any `expr` shape. c-subset's `expression`
+                                  // any `expr` shape. c's `expression`
                                   // rule is `expr`-kind, so these must be
                                   // present in the rule interner.
                                   "binaryExpr", "unaryExpr", "postfixExpr"}) {
@@ -410,13 +413,13 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     EXPECT_EQ(schema.schemaTokens().name(typedefKw[0].id), "TypedefKeyword");
 }
 
-// Pin the `expr`-shape accessors on c-subset. `expression` is the
+// Pin the `expr`-shape accessors on c. `expression` is the
 // only `expr`-kind rule in the shipped grammar; `operand` is its atom.
 // Other rules return false / Invalid / 0.
-TEST(GrammarSchema, ExprShapeAccessorsOnCSubset) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+TEST(GrammarSchema, ExprShapeAccessorsOnC) {
+    auto result = GrammarSchema::loadShipped("c");
     if (!result.has_value()) {
-        FAIL() << "loadShipped c-subset failed: " << result.error()[0].message;
+        FAIL() << "loadShipped c failed: " << result.error()[0].message;
     }
     auto const& schema = **result;
 
@@ -515,14 +518,14 @@ TEST(GrammarSchema, LoaderRejectsReservedWrapperShapeName) {
 // would silently never fire at runtime (the cursor-advance gate
 // skips body-default kinds), so surface the misuse at load time.
 // PA3: `followSetOf(rule)` walks the position graph at load time.
-// Verify the textbook FOLLOW computation: for c-subset's `expression`
+// Verify the textbook FOLLOW computation: for c's `expression`
 // rule, FOLLOW must include the tokens that can legitimately appear
 // AFTER an expression — `;` (EndStatement) at statement boundary, `)`
 // (ParenClose) at paren-wrapped sub-expression boundary, `,` (Comma)
 // in argument-list-like positions if any. These are the resync points
 // the parser's panic-mode uses for `expr`-kind rules.
 TEST(GrammarSchema, FollowSetOfExpressionIncludesStatementEnders) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+    auto result = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(result.has_value());
     auto const& schema = **result;
 
@@ -629,7 +632,7 @@ TEST(GrammarSchema, FollowSetConvergesOnSelfRecursiveRule) {
 // parser's `canEndSource` check is what authorizes EOF — no implicit
 // EOF in FOLLOW(root).
 TEST(GrammarSchema, FollowSetOfRootIsEmpty) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+    auto result = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(result.has_value());
     auto const& schema = **result;
     const auto root = schema.rules().find("root");
@@ -640,7 +643,7 @@ TEST(GrammarSchema, FollowSetOfRootIsEmpty) {
 // PA3: `syncTokens` field round-trips. Loader rejects unknown kind
 // names, Eof, and Error (each with its own loader diagnostic shape).
 TEST(GrammarSchema, SyncTokensRoundTrip) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+    auto result = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(result.has_value());
     auto const& schema = **result;
     const auto sync = schema.syncTokens();
@@ -830,12 +833,12 @@ TEST(GrammarSchema, ExprRuleFirstSetIncludesPrefixOperators) {
 // prefix, trailing const via the `{opt ConstKeyword}` east-const) AND `volatile`
 // in the head — a strict superset of the retired typeRef's const-only leading
 // qualifier. Real C allows double-const only with intervening type modifiers; the
-// c-subset is deliberately more permissive. Pinned so a future PR doesn't tighten
+// c is deliberately more permissive. Pinned so a future PR doesn't tighten
 // this without intent.
-TEST(GrammarSchema, CSubsetExternHeadAllowsDoubleConst) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+TEST(GrammarSchema, CExternHeadAllowsDoubleConst) {
+    auto result = GrammarSchema::loadShipped("c");
     if (!result.has_value()) {
-        FAIL() << "loadShipped c-subset failed: " << result.error()[0].message;
+        FAIL() << "loadShipped c failed: " << result.error()[0].message;
     }
     EXPECT_TRUE((*result)->rules().find("typeRefAllowingStruct").valid());
     EXPECT_FALSE((*result)->rules().find("typeRef").valid())
@@ -905,7 +908,7 @@ namespace {
 
 // Every ERROR-severity diagnostic, one per line. ★ Use this instead of
 // `diags[0].message` when reporting why a load failed: the list is in emission
-// order and its FIRST entry is routinely a WARNING (the shipped c-subset opens
+// order and its FIRST entry is routinely a WARNING (the shipped c opens
 // with a `defaultToken`-without-`tokens` mode warning), so `[0]` regularly
 // names something entirely unrelated to the failure and sends the reader
 // chasing it.
@@ -1021,7 +1024,7 @@ TEST(GrammarSchema, TypeExtensionParametersNotArrayReportsMismatch) {
 TEST(GrammarSchema, ImportsIncludeFollowingLoadsAndPopulates) {
     auto result = GrammarSchema::loadFromText(R"JSON({
         "dssSchemaVersion": 4,
-        "language": { "name": "CSubset", "version": "0.1.0" },
+        "language": { "name": "C", "version": "0.1.0" },
         "tokens": { "#": [ { "kind": "IncludeKeyword" } ],
                     "\"": [ { "kind": "StringStart" } ] },
         "shapes": {
@@ -1039,7 +1042,7 @@ TEST(GrammarSchema, ImportsIncludeFollowingLoadsAndPopulates) {
 TEST(GrammarSchema, ImportsIncludeFollowingFieldsParse) {
     auto result = GrammarSchema::loadFromText(R"JSON({
         "dssSchemaVersion": 4,
-        "language": { "name": "CSubset", "version": "0.1.0" },
+        "language": { "name": "C", "version": "0.1.0" },
         "imports": { "strategy": "include-following",
                      "directiveRule": "includeDirective", "pathToken": "StringStart" },
         "tokens": { "#": [ { "kind": "IncludeKeyword" } ],
@@ -1322,7 +1325,7 @@ TEST(GrammarSchema, ExprShapeWithPartialWrapperRulesIsRejected) {
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingWrapperRules));
 }
 
-// Happy-path: distinct (non-c-subset) wrapper-rule names load cleanly,
+// Happy-path: distinct (non-c) wrapper-rule names load cleanly,
 // the parser-side schema lookup returns the right RuleIds. Genericity
 // pin: the engine has NO hardcoded `binaryExpr`/`unaryExpr`/`postfixExpr`
 // names — any names work.
@@ -1574,7 +1577,7 @@ TEST(GrammarSchema, IdentifierClassExtraContinueLoads) {
 // ★ A LANGUAGE THAT DECLARES NOTHING GETS THE UNIVERSAL RULE — and the accessor
 // answers rather than returning a null the hot path must branch on.
 TEST(GrammarSchema, IdentifierClassAbsentMeansTheUniversalRule) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+    auto result = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
     EXPECT_TRUE((*result)->identifierClass().extraContinue.empty());
     EXPECT_FALSE((*result)->identifierClass().continuesIdentifier('.'))
@@ -2276,7 +2279,7 @@ TEST(GrammarSchema, AttributeArgRuleUnknownShapeReportsInvalid) {
 }
 
 // (The shipped-config regression wall for this vocabulary lives at the end
-// of the file, next to the helper that locates c-subset.lang.json.)
+// of the file, next to the helper that locates c.lang.json.)
 
 // ── TF-C73: the attribute NAME vocabulary — `effect: "align"`, and the
 //    loader's ABI-neutral-hint DRIFT cross-check ─────────────────────────────
@@ -2289,9 +2292,15 @@ namespace {
 // %EFFECTS%    the `attributeSemantics.effects` array;
 // %ROWEXTRA%   extra keys on the single declaration row (trailing comma);
 // %BLOCKS%     extra `semantics` sub-blocks (trailing comma).
+// P42: `linkageExtra` splices EXTRA entries into the row's `linkageSpecifiers`
+// object (it must therefore end in a comma). It defaults to empty so every
+// pre-existing 3-argument call site is untouched — the one test that needs it
+// asks about a COMPOSITE key (`visibility:hidden`), which is a shape the fixed
+// `st` entry cannot express and which no other test needs.
 [[nodiscard]] std::string attrVocabSchema(std::string_view effects,
                                           std::string_view rowExtra,
-                                          std::string_view blocks) {
+                                          std::string_view blocks,
+                                          std::string_view linkageExtra = "") {
     std::string cfg = R"JSON({
       "dssSchemaVersion": 4,
       "language": { "name": "AttrVocab", "version": "0.1.0" },
@@ -2318,7 +2327,7 @@ namespace {
           { "rule": "vdecl", "name": 0, "kind": "variable",
             "specifierPrefix": "vprefix",
             %ROWEXTRA%
-            "linkageSpecifiers": { "st": { "binding": "local" } } }
+            "linkageSpecifiers": { %LINKEXTRA%"st": { "binding": "local" } } }
         ],
         %BLOCKS%
         "attributeSemantics": {
@@ -2329,9 +2338,10 @@ namespace {
         }
       }
     })JSON";
-    cfg.replace(cfg.find("%ROWEXTRA%"), 10, rowExtra);
-    cfg.replace(cfg.find("%BLOCKS%"),    8, blocks);
-    cfg.replace(cfg.find("%EFFECTS%"),   9, effects);
+    cfg.replace(cfg.find("%ROWEXTRA%"),  10, rowExtra);
+    cfg.replace(cfg.find("%LINKEXTRA%"), 11, linkageExtra);
+    cfg.replace(cfg.find("%BLOCKS%"),     8, blocks);
+    cfg.replace(cfg.find("%EFFECTS%"),    9, effects);
     return cfg;
 }
 
@@ -2588,7 +2598,7 @@ TEST(GrammarSchema, AttributeEffectEmptyNameStringReportsInvalid) {
 // `appliesTo` names the entity kinds an attribute may appertain to, and the
 // semantic tier's ONE shared decl-kind gate walks it. Its VALUE therefore needs
 // real validation — `DSS_CHECK_KEY_VOCABULARY` does NOT provide any: MEASURED at
-// `config_key_vocabulary.hpp:92-97`, it is a `static_assert` on array
+// `isWellFormedKeyVocabulary`, it is a `static_assert` on array
 // WELL-FORMEDNESS only (no empty/duplicate KEY NAMES) and says nothing about a
 // key's contents. Growing `kEffectRowKeys` 2 → 3 correctly extends the
 // unknown-KEY loop; everything below is about the VALUE.
@@ -2628,10 +2638,14 @@ TEST(GrammarSchema, AttributeEffectAppliesToMissingOnDeclAttachedRowReportsInval
         << errorDiags(r.error());
 }
 
-// THE EXEMPTION, asserted in the same file as the requirement so neither can
-// drift. A `none`-verb row bundles function-only, type-only, statement-only and
-// elsewhere-consumed names in ONE list, so no single kind set is correct for it
-// — and the loader must not demand one.
+// THE EXEMPTION FROM THE **REQUIREMENT**, asserted in the same file as the
+// requirement so neither can drift. Some inert names have no expressible kind
+// set at all — statement attributes; attributes of aggregate type DEFINITIONS —
+// so the loader must not demand one, and an omitted key must still reach
+// `SemanticConfig` as the empty set the gate reads as "no axis declared".
+// ⚠ P42: exempt from the REQUIREMENT is no longer the same as FORBIDDEN the key
+// — see `AttributeEffectAppliesToOnANoneVerbRowIsPermitted` below, which is the
+// flipped form of the pin that used to assert the refusal.
 TEST(GrammarSchema, AttributeEffectAppliesToIsExemptOnANoneVerbRow) {
     auto const cfg = attrVocabSchema(
         R"([ { "names": ["fallthrough", "likely"], "effect": "none" } ])",
@@ -2649,20 +2663,38 @@ TEST(GrammarSchema, AttributeEffectAppliesToIsExemptOnANoneVerbRow) {
            "the verb)";
 }
 
-// …and the key is REFUSED on a `none` row, not silently accepted. The gate can
-// never read it there (an empty set is what marks the exemption), so accepting
-// it would be a knob that lies — the same defect class as every unknown-key
-// check in this loader.
-TEST(GrammarSchema, AttributeEffectAppliesToOnANoneVerbRowReportsInvalid) {
+// …and the key is PERMITTED on a `none` row — reaching `SemanticConfig`, where
+// the gate reads it exactly as it reads any other row's.
+//
+// ★★ P42 — THIS PIN IS **FLIPPED**, NOT DELETED, AND THE FLIP IS THE FIX. It
+// used to assert the loader REFUSED the key here, on the reasoning that the gate
+// "could never read it there". That reasoning was circular: the gate could not
+// read it only because the shipped `none` row bundled names of different kinds,
+// and the only cure for that bundling is a ROW SPLIT — which a refusal of the
+// key makes pointless. So the refusal did not protect an invariant, it PRESERVED
+// the defect ([[D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT]]'s decl-kind
+// leak, and [[D-CSUBSET-STRICT-ATTRIBUTE-GATE-BLIND-TO-LINKAGE-VOCABULARY]]'s
+// silent typedef, which needs an inert row to carry a kind axis at all).
+// RED-ON-DISABLE: restore the refusal and this load fails.
+TEST(GrammarSchema, AttributeEffectAppliesToOnANoneVerbRowIsPermitted) {
     auto const cfg = attrVocabSchema(
         R"([ { "names": ["fallthrough"], "appliesTo": ["variable"],
                "effect": "none" } ])",
-        kIgnoresDeprecated, "");
+        R"("linkageSpecifierIgnoredNames": ["deprecated", "fallthrough"],)", "");
     auto r = GrammarSchema::loadFromText(cfg);
-    ASSERT_FALSE(r.has_value())
-        << "'appliesTo' on a 'none' row could never be read — accepting it would "
-           "let an author believe a kind restriction is in force when none is";
-    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    ASSERT_TRUE(r.has_value())
+        << "an inert row must be able to declare which kinds its names appertain "
+           "to — without that the decl-kind gate is blind to every name the "
+           "language models but does not act on: "
+        << errorDiags(r.error());
+    ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
+    EXPECT_EQ((*r)->semantics().attributeEffects[0].effect,
+              AttributeEffect::None);
+    ASSERT_EQ((*r)->semantics().attributeEffects[0].appliesTo.size(), 1u);
+    EXPECT_EQ((*r)->semantics().attributeEffects[0].appliesTo[0],
+              AttributeAppliesKind::Variable)
+        << "and it must REACH SemanticConfig — accepted-then-dropped would be "
+           "the knob-that-lies the old refusal was written to prevent";
 }
 
 // An UNKNOWN kind string. The rejection must ENUMERATE the closed set, and the
@@ -2791,9 +2823,57 @@ TEST(GrammarSchema, AttributeEffectAppliesToMultiKindSetReachesConfig) {
     ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
     auto const& applies = (*r)->semantics().attributeEffects[0].appliesTo;
     ASSERT_EQ(applies.size(), 3u);
-    EXPECT_EQ(applies[0], DeclarationKind::Variable);
-    EXPECT_EQ(applies[1], DeclarationKind::Function);
-    EXPECT_EQ(applies[2], DeclarationKind::Type);
+    EXPECT_EQ(applies[0], AttributeAppliesKind::Variable);
+    EXPECT_EQ(applies[1], AttributeAppliesKind::Function);
+    EXPECT_EQ(applies[2], AttributeAppliesKind::Type);
+}
+
+// P42 (D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT): the FIFTH
+// spelling reaches `SemanticConfig`, and it is a value `declarations[].kind`
+// does NOT accept. Both halves are the pin: the first says the vocabulary grew,
+// the second says it grew ONLY on the axis that needed it — a `functionPointer`
+// declaration ROW would be dead config, since no declaration IS a function
+// pointer, it merely declares an object whose type is one.
+TEST(GrammarSchema, AttributeEffectAppliesToAdmitsFunctionPointerSpelling) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["aligned"], "appliesTo": ["function", "functionPointer"],
+               "effect": "align" } ])",
+        R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
+    auto const& applies = (*r)->semantics().attributeEffects[0].appliesTo;
+    ASSERT_EQ(applies.size(), 2u);
+    EXPECT_EQ(applies[0], AttributeAppliesKind::Function);
+    EXPECT_EQ(applies[1], AttributeAppliesKind::FunctionPointer);
+    // …and the DECLARATION-kind vocabulary is deliberately unchanged.
+    EXPECT_FALSE(declarationKindFromName("functionPointer").has_value());
+    EXPECT_TRUE(attributeAppliesKindFromName("functionPointer").has_value());
+}
+
+// P42: a COMPOSITE linkage-specifier key covers its own IDENTIFIER half. A key
+// may be `<identifier><sep><string body>` (`visibility:hidden`), and the thing a
+// programmer can WRITE as a clause name is the identifier half — so a row named
+// `visibility` is reachable and the drift check must not fire on it.
+//
+// ⚠ WITHOUT THIS THE CHECK DEMANDS SOMETHING ACTIVELY WRONG, not merely
+// redundant: adding `visibility` to `linkageSpecifierIgnoredNames` would make
+// `visibility("hidden")` be skipped BY NAME, because the HIR lowerer consults
+// that list before it assembles the composite key — the visibility fact would be
+// SILENTLY DROPPED and a hidden symbol would link as default-visible.
+//
+// The verb here is a FIRING one deliberately: the check exempts inert rows (see
+// the exemption pin above), so an inert row would make this test vacuous — it
+// would pass with the base-name insert deleted. RED-ON-DISABLE: drop the
+// `linkageSpecifierBaseName` insert and this load FAILS.
+TEST(GrammarSchema, AttributeVocabularyDriftCheckCoversCompositeSpecifierBaseName) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["visibility"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" } ])",
+        R"("linkageSpecifierIgnoredNames": ["somethingElse"],)", "",
+        R"("visibility:hidden": { "visibility": "hidden" }, )");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
 }
 
 // ★ THE SHIPPED CONFIG ITSELF loads with every non-`none` row carrying a
@@ -2803,23 +2883,30 @@ TEST(GrammarSchema, AttributeEffectAppliesToMultiKindSetReachesConfig) {
 // naming the eight rows individually, so it keeps holding as the table grows.
 //
 // ⚠ ROWS ≠ VERBS, and the distinction is why the count below is a `_GE` on ROWS.
-// c-subset ships EIGHT declaration-attached rows carrying SEVEN distinct effect
+// c ships EIGHT declaration-attached rows carrying SEVEN distinct effect
 // verbs: `warnOnDiscard` is spelled by TWO rows (`nodiscard` and its GNU twin
 // `warn_unused_result`), because the two names share one effect but have DIFFERENT
 // applicability sets — `nodiscard` is function-only per C23 6.7.13.3 while clang
 // enumerates typedefs among the valid positions for the GNU spelling. That split
 // is the whole reason a row-count and a verb-count diverge here, so counting verbs
 // would under-count the table by one and hide a lost row.
-TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedCSubset) {
-    auto r = GrammarSchema::loadShipped("c-subset");
+TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedC) {
+    auto r = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(r.has_value())
-        << "the shipped c-subset config must satisfy its own `appliesTo` rule";
+        << "the shipped c config must satisfy its own `appliesTo` rule";
     std::size_t declAttached = 0;
+    std::size_t inertWithKinds = 0;
     for (auto const& row : (*r)->semantics().attributeEffects) {
         if (row.effect == AttributeEffect::None) {
-            EXPECT_TRUE(row.appliesTo.empty())
-                << "a 'none' row must carry NO kind set — an empty set is what "
-                   "marks the exemption the engine's gate reads";
+            // ★★ P42 — THE ASSERTION HERE IS **FLIPPED**, NOT DROPPED. It used
+            // to demand that an inert row carry NO kind set, on the reading that
+            // "an empty set marks the exemption the engine's gate reads". The
+            // gate's reading is unchanged — empty still means "no axis declared"
+            // — but the loader no longer FORBIDS the key, and the shipped config
+            // now splits its inert vocabulary so that the names whose applicable
+            // kind IS expressible say so. Demanding emptiness would re-freeze
+            // exactly the bundling that made the decl-kind silence structural.
+            if (!row.appliesTo.empty()) ++inertWithKinds;
             continue;
         }
         ++declAttached;
@@ -2829,22 +2916,42 @@ TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedCSubset) {
             << (row.names.empty() ? "<none>" : row.names[0]) << "' does not";
     }
     EXPECT_GE(declAttached, 8u)
-        << "c-subset ships EIGHT declaration-attached effect ROWS carrying SEVEN "
+        << "c ships EIGHT declaration-attached effect ROWS carrying SEVEN "
            "distinct effect VERBS — suppressUnused / warnOnUse / warnOnDiscard "
            "(TWO rows: `nodiscard` and the GNU `warn_unused_result`, one verb but "
            "two applicability sets) / align / noInline / alwaysInline / "
            "noSanitizeThread. A lower count means a row was lost, demoted to "
            "'none', or merged back into a sibling — each of which is how a sink "
            "goes silent, and the middle two are invisible to a verb-count";
+    // ★ P42: and the inert half is asserted POSITIVELY rather than merely
+    // permitted — the shipped `none` vocabulary is SPLIT, so at least two of its
+    // rows declare a kind axis (function-only, and function-or-function-pointer,
+    // plus the linkage row). A count of zero here would mean the split was
+    // reverted or merged back, which is precisely how
+    // D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT's decl-kind leak returns:
+    // silently, with every other assertion in this file still green.
+    EXPECT_GE(inertWithKinds, 3u)
+        << "the shipped inert vocabulary must stay SPLIT by applicable kind — a "
+           "single bundled 'none' row cannot carry a correct kind set, which is "
+           "what made the decl-kind silence structural rather than chosen";
 }
 
 // ── the drift cross-check ─────────────────────────────────────────────────
 
 // BASELINE. A consistent vocabulary loads clean, so every negative below
-// cannot pass for the wrong reason. Note what this pins POSITIVELY: the inert
-// `fallthrough` is NOT linkage-ignored and that is FINE — a statement-attached
-// attribute never reaches a declaration's specifier scan, and a cross-check
-// that demanded it would reject correct config.
+// cannot pass for the wrong reason.
+//
+// ★★ P42 — THAT POSITIVE PIN WAS ATTACKED THIS CYCLE AND **SURVIVED BY
+// MEASUREMENT**; it is stronger than its own wording suggests, so read the
+// engine comment beside the `AttributeEffect::None` skip before touching it.
+// Deleting the skip looks right — nothing else forces an inert name into the
+// roster, which is exactly how three of the shipped c's inert names drifted out
+// of it unnoticed. But the roster entry the check then demands ✔MEASURED turns
+// `__attribute__((packed)) struct S { char c; int v; } gv;` from a loud refusal
+// into rc=0 with `sizeof == 8`, byte-identical to the UNPACKED control: the
+// ignored-name list is consulted BEFORE anything can honor the attribute, so
+// the entry discards a LAYOUT FACT rather than a diagnostic. The exemption is
+// load-bearing, not unfinished.
 TEST(GrammarSchema, AttributeVocabularyConsistentPairLoadsCleanly) {
     auto const cfg =
         attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, "");
@@ -2885,8 +2992,31 @@ TEST(GrammarSchema, AttributeVocabularyDriftedIgnoreListReportsInvalid) {
 // CLAUSE B, INERT NAMES STAY EXEMPT. The same drifted shape but with the name
 // carrying `effect: "none"` must still load. This is the pin that keeps the
 // cross-check from becoming the over-broad "every effects name must be
-// ignored everywhere" rule, which would reject the shipped c-subset (whose
+// ignored everywhere" rule, which would reject the shipped c (whose
 // `fallthrough`/`likely`/`packed` rows are deliberately not ignore-listed).
+//
+// ★★★ P42 — THIS PIN IS **STRONGER THAN IT LOOKS, AND IT WAS EARNED**. The
+// exemption reads like an unfinished carve-out, and this cycle tried to delete
+// it: nothing else forces an inert name into `linkageSpecifierIgnoredNames`,
+// which is exactly how `packed`, `may_alias` and `transparent_union` drifted out
+// of the shipped roster unnoticed, leaving `__attribute__((packed)) int gv = 1;`
+// a loud `error[H000C]` where clang 18.1.3 and gcc 13.3.0 both compile at rc=0.
+//
+// ⛔ THE REMEDY THE CHECK PRESCRIBES IS A SILENT MISCOMPILE FOR THOSE THREE.
+// ✔MEASURED end-to-end with the shipped CLI, the skip deleted and `packed` duly
+// added to the roster: `__attribute__((packed)) struct S { char c; int v; } gv;`
+// went from a loud refusal to **rc=0 with `sizeof(struct S) == 8`** — identical
+// to the UNPACKED control, while the trailing spelling still yields 5. The
+// linkage scan consults the ignored-name list BEFORE anything can honor the
+// attribute, so the entry discards a LAYOUT FACT, not a diagnostic.
+//
+// ★ The general reading, which is the part worth carrying: the check infers
+// "this effects row is UNREACHABLE" from "this declaration form refuses the
+// name". For a FIRING verb that holds. For an INERT name it does not — c's
+// `packed` row is reached from `typedefDecl`/`structSpec`/the member rows, none
+// of which runs the strict scan, and the file-scope refusal is a DELIBERATE
+// statement that DSS cannot honor `packed` there. Do not delete this exemption
+// without a way to tell those two apart.
 TEST(GrammarSchema, AttributeVocabularyInertEffectNeedsNoIgnoreEntry) {
     auto const cfg = attrVocabSchema(
         R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
@@ -2952,7 +3082,7 @@ TEST(GrammarSchema, AttributeVocabularyWholeIgnoredNamesKeyDeletedReportsInvalid
 // `effect != None` shape.
 //
 // ★ WHY A DEDICATED CASE FOR THIS VERB RATHER THAN TRUSTING THE GENERIC GATE. The
-// shipped c-subset config needed THREE coordinated edits for this attribute (the
+// shipped c config needed THREE coordinated edits for this attribute (the
 // `effects` row plus BOTH declaration rows' `linkageSpecifierIgnoredNames`), and the
 // only thing that makes forgetting one of them impossible is this cross-check. Its
 // generality is a property of the current implementation, not of the contract — a
@@ -2996,7 +3126,7 @@ TEST(GrammarSchema, NoSanitizeThreadEffectRequiresTheIgnoredNameToo) {
         << errorDiags(rBad.error());
 
     // (b) both halves present — must load clean. This is the shape the shipped
-    // c-subset config uses on BOTH its topLevelDecl and externDecl rows.
+    // c config uses on BOTH its topLevelDecl and externDecl rows.
     auto const consistent = attrVocabSchema(
         kEffects, R"("linkageSpecifierIgnoredNames": ["no_sanitize_thread"],)", "");
     auto rGood = GrammarSchema::loadFromText(consistent);
@@ -3009,13 +3139,13 @@ TEST(GrammarSchema, NoSanitizeThreadEffectRequiresTheIgnoredNameToo) {
 // (i-b) TIER 3 — a row that mentions NO attribute rule at all and ignores
 // nothing by name stays EXEMPT, and that limit is DELIBERATE, not an oversight.
 // The loader holds only a name↔id rule table; it cannot see whether such a
-// row's prefix grammar admits an attribute clause at all, and c-subset's
+// row's prefix grammar admits an attribute clause at all, and c's
 // `externDecl` is exactly this shape (its specifier prefix is `extern` plus the
 // thread-local twins, so no attribute identifier can occur there).
 //
 // ★ Pinning the limit is the honest alternative to pretending it is closed. It
 // is also the reason (i) uses the RULES signal rather than simply dropping the
-// old gate: dropping it outright was MEASURED to reject the shipped c-subset on
+// old gate: dropping it outright was MEASURED to reject the shipped c on
 // this very row.
 TEST(GrammarSchema, AttributeVocabularyRowClaimingNothingAboutAttrsIsExempt) {
     auto const cfg = attrVocabSchema(kConsistentEffects, "", "");
@@ -3034,7 +3164,7 @@ TEST(GrammarSchema, AttributeVocabularyRowClaimingNothingAboutAttrsIsExempt) {
 // change its behavior.
 //
 // ★ Without this, the check is wrong in the OTHER direction, and wrong in a way
-// that pushes config the wrong way. MEASURED on the shipped c-subset: adding
+// that pushes config the wrong way. MEASURED on the shipped c: adding
 // ONE unrelated name to `varDecl` — a row that already ignores `attrSpec` and
 // `stdAttr` wholesale — flipped the old gate on and demanded six more names be
 // added to a silence list that could never be consulted. A guard whose remedy
@@ -3377,7 +3507,7 @@ TEST(GrammarSchema, SemanticsDefinesWhenChildUnknownChildRuleReportsUnknownShape
 // no-head-no-infer C_MissingField gate staying intact (the relaxation must
 // not have widened it). Each uses the minimal synthetic declarator language
 // (the test_declarator_engine shapes, trimmed) so the pins are independent
-// of the shipped c-subset config.
+// of the shipped c config.
 
 namespace {
 // The shared skeleton: tokens + declarator shapes + the `declarators` role
@@ -4137,7 +4267,7 @@ TEST(GrammarSchema, PerModeTokensMapDollarLexemeIsHonored) {
 // matched against `tree().text(token)`), so it gets the same treatment — the
 // audit listed it as a missing carve-out, and it is deliberately absent.
 // Documentation for that map goes on a `$`-prefixed sibling of the declaration
-// ROW's keys, which IS the loader's own vocabulary; the shipped c-subset's
+// ROW's keys, which IS the loader's own vocabulary; the shipped c's
 // `$linkageSpecifiersComment` already does exactly that.
 TEST(GrammarSchema, LinkageSpecifiersMapDollarKeyIsASpecifierNotAComment) {
     auto cfg = attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, "");
@@ -4314,7 +4444,7 @@ TEST(GrammarSchema, TypeNameCommitGuardDollarPrefixedKeyIsExempt) {
 // inside an individual shape BODY — but NOT as a sibling of the rule names in
 // the `shapes` map, where the key was read as a SHAPE DEFINITION and its prose
 // value as a rule REFERENCE. The whole load failed with the paragraph printed
-// back as if it were a rule name. Hit for real while authoring c-subset.
+// back as if it were a rule name. Hit for real while authoring c.
 
 namespace {
 // One extra entry spliced into the `shapes` map at %X%, ahead of `root`.
@@ -4546,7 +4676,7 @@ TEST(GrammarSchema, SemanticsImplicitReturnZeroNonStringElementReportsInvalid) {
 // cycle 10g). A typo'd sub-key (e.g. `strictAliasng` missing 'i' or
 // `charTypeAliasAll` missing 's') would otherwise silently fall back
 // to the default and flip the language's optimization polarity —
-// strict-aliasing silently disabled for c-subset / char-exception
+// strict-aliasing silently disabled for c / char-exception
 // silently disabled for a hypothetical Rust frontend.
 TEST(GrammarSchema, SemanticsPointerAliasingUnknownKeyReportsInvalid) {
     constexpr std::string_view kCfg = R"JSON({
@@ -4662,10 +4792,10 @@ TEST(GrammarSchema, SemanticsImplicitReturnZeroEmptyStringElementReportsInvalid)
 
 // Positive pin: multi-name lists load cleanly and preserve order +
 // identity. The substrate accepts an arbitrary-length vector, but
-// c-subset's shipped config declares only `["main"]`, so the
+// c's shipped config declares only `["main"]`, so the
 // multi-element path has zero in-shipped-config coverage. A
 // regression that silently truncated the list to the first element
-// would pass every negative test + every e2e test (c-subset's single
+// would pass every negative test + every e2e test (c's single
 // "main" entry still works). Code-architect Q10-A4 FOLD-NOW on
 // 39897eb's 3rd-order audit.
 TEST(GrammarSchema, SemanticsImplicitReturnZeroMultiNameListLoadsCleanly) {
@@ -6070,9 +6200,9 @@ TEST(GrammarSchema, ShippedConfigsDeclareArtifactProfiles) {
         EXPECT_EQ(p[0], "cli");
     }
 
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     if (!c.has_value()) {
-        FAIL() << "loadShipped c-subset failed: " << c.error()[0].message;
+        FAIL() << "loadShipped c failed: " << c.error()[0].message;
     }
     {
         auto p = (*c)->artifactProfiles();
@@ -6080,7 +6210,7 @@ TEST(GrammarSchema, ShippedConfigsDeclareArtifactProfiles) {
         EXPECT_EQ(p[0], "cli");
         EXPECT_EQ(p[1], "lib");
         EXPECT_EQ(p[2], "staticlib");
-        // `module` (SourceMerge) — c-subset is the only shipped language that
+        // `module` (SourceMerge) — c is the only shipped language that
         // declares it; toy and tsql-subset deliberately do NOT, which is what
         // the two sibling blocks in this test pin.
         EXPECT_EQ(p[3], "module");
@@ -6381,7 +6511,7 @@ TEST(GrammarSchema, ParserMaxExpressionDepthWrongTypeReportsCode) {
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_ConflictingField));
 }
 
-// C11/C23 6.4.5: the shipped c-subset text with `stringLiteralPrefixes`, for
+// C11/C23 6.4.5: the shipped c text with `stringLiteralPrefixes`, for
 // mutation-based validation of the `elementCoreByFormat` per-format core map.
 namespace {
 // Located through the ONE test-side resolver (`repo_root.hpp`:
@@ -6392,13 +6522,13 @@ namespace {
 // unresolvable root — GoogleTest reports that as a failure of the one running
 // test, never an `abort()` that would cost this binary's other tests their
 // verdicts.
-[[nodiscard]] std::string shippedCSubsetTextForPrefixTest() {
+[[nodiscard]] std::string shippedCTextForPrefixTest() {
     namespace fs = std::filesystem;
     fs::path const cand =
-        dss::test::configRoot() / "sources" / "c-subset.lang.json";
+        dss::test::configRoot() / "sources" / "c.lang.json";
     std::ifstream in{cand, std::ios::binary};
     if (!in) {
-        ADD_FAILURE() << "cannot open shipped c-subset.lang.json at "
+        ADD_FAILURE() << "cannot open shipped c.lang.json at "
                       << cand.string();
         return {};
     }
@@ -6410,11 +6540,11 @@ namespace {
 TEST(GrammarSchema, StringPrefixUnknownFormatKeyReportsCode) {
     // An unknown object-format key in `elementCoreByFormat` must FAIL LOUD (a typo'd
     // format would otherwise silently never override, baking the wrong wchar width).
-    std::string text = shippedCSubsetTextForPrefixTest();
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     // Baseline: the unmutated shipped config loads clean.
     ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c-subset must load clean before mutation";
+        << "shipped c must load clean before mutation";
     // Swap the WideStringStart row's valid `"pe"` key for a bogus format name.
     std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
     auto const pos = text.find(needle);
@@ -6437,10 +6567,10 @@ TEST(GrammarSchema, StringPrefixUnknownFormatKeyReportsCode) {
 // RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in the
 // `elementCoreByFormat` loop and the mutated config loads clean.
 TEST(GrammarSchema, StringPrefixSentinelFormatKeyReportsCode) {
-    std::string text = shippedCSubsetTextForPrefixTest();
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c-subset must load clean before mutation";
+        << "shipped c must load clean before mutation";
     std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
     auto const pos = text.find(needle);
     ASSERT_NE(pos, std::string::npos)
@@ -6460,7 +6590,7 @@ TEST(GrammarSchema, StringPrefixSentinelFormatKeyReportsCode) {
 
 TEST(GrammarSchema, StringPrefixUnknownElementCoreReportsCode) {
     // A per-format value that is not a known TypeKind must FAIL LOUD.
-    std::string text = shippedCSubsetTextForPrefixTest();
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
     auto const pos = text.find(needle);
@@ -6477,10 +6607,10 @@ TEST(GrammarSchema, StringPrefixUnknownElementCoreReportsCode) {
 // format key to prove the char table is parsed + closed-key-validated too (a typo'd
 // char wchar format would otherwise silently bake the wrong char width).
 TEST(GrammarSchema, CharPrefixUnknownFormatKeyReportsCode) {
-    std::string text = shippedCSubsetTextForPrefixTest();
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c-subset must load clean before mutation";
+        << "shipped c must load clean before mutation";
     // The WideCharStart row's `elementCoreByFormat` (the SECOND such snippet — the
     // first belongs to WideStringStart).
     std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
@@ -6496,15 +6626,15 @@ TEST(GrammarSchema, CharPrefixUnknownFormatKeyReportsCode) {
 }
 
 // The regression wall for the CLOSED `semantics` key vocabulary: every key
-// the shipped c-subset config actually uses must survive it. An over-narrow
+// the shipped c config actually uses must survive it. An over-narrow
 // allowed-key list would reject the real config — and the fix is always the
 // list, never the config.
-TEST(GrammarSchema, SemanticsClosedKeysAcceptShippedCSubset) {
-    std::string const text = shippedCSubsetTextForPrefixTest();
+TEST(GrammarSchema, SemanticsClosedKeysAcceptShippedC) {
+    std::string const text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     auto result = GrammarSchema::loadFromText(text);
     ASSERT_TRUE(result.has_value())
-        << "the shipped c-subset config must still load under the closed "
+        << "the shipped c config must still load under the closed "
            "'semantics' key vocabulary: "
         << (result.error().empty() ? "<no diagnostics>"
                                    : result.error()[0].message);
@@ -6514,18 +6644,18 @@ TEST(GrammarSchema, SemanticsClosedKeysAcceptShippedCSubset) {
 //
 // Two halves, and both are needed.
 //
-// (1) THE WALL. The shipped c-subset's three ABI-neutral name lists are 18 /
+// (1) THE WALL. The shipped c's three ABI-neutral name lists are 18 /
 //     12 / 2 entries with a pairwise overlap of only 6 — they answer different
 //     questions and must NOT be merged. A cross-check that mistook them for
 //     three copies of one set would reject the real config, and the fix would
 //     always be the check, never the config. This is the pin that keeps the
 //     rule honest about that.
-TEST(GrammarSchema, AttributeVocabularyCrossCheckAcceptsShippedCSubset) {
-    std::string const text = shippedCSubsetTextForPrefixTest();
+TEST(GrammarSchema, AttributeVocabularyCrossCheckAcceptsShippedC) {
+    std::string const text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     auto result = GrammarSchema::loadFromText(text);
     ASSERT_TRUE(result.has_value())
-        << "the shipped c-subset config must still load under the attribute-"
+        << "the shipped c config must still load under the attribute-"
            "vocabulary drift cross-check — the three lists are deliberately "
            "different and a check that demanded they agree would be wrong: "
         << errorDiags(result.error());
@@ -6536,11 +6666,11 @@ TEST(GrammarSchema, AttributeVocabularyCrossCheckAcceptsShippedCSubset) {
 //     `topLevelDecl`'s ignore list while its `warnOnUse` effects row stays —
 //     and the load must FAIL. Without this, a cross-check that silently
 //     no-ops on the shipped config would look identical to one that works.
-TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnDriftedShippedCSubset) {
-    std::string text = shippedCSubsetTextForPrefixTest();
+TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnDriftedShippedC) {
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c-subset must load clean before mutation";
+        << "shipped c must load clean before mutation";
     std::string const needle = R"("linkageSpecifierIgnoredNames": ["noreturn", "deprecated",)";
     auto const pos = text.find(needle);
     ASSERT_NE(pos, std::string::npos)
@@ -6562,11 +6692,11 @@ TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnDriftedShippedCSubset) {
 //     large one, and it used to be the one that escaped — the gate exempted any
 //     row whose list was empty, so emptying the list disarmed the check for that
 //     row. Same config, same drift, one keystroke further.
-TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnWholeKeyDeletedFromShippedCSubset) {
-    std::string text = shippedCSubsetTextForPrefixTest();
+TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnWholeKeyDeletedFromShippedC) {
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c-subset must load clean before mutation";
+        << "shipped c must load clean before mutation";
     // `topLevelDecl`'s list — the row that does NOT ignore `attrSpec`
     // wholesale, so its per-name opt-in is the only thing keeping a leading
     // `__attribute__((deprecated))` from failing H_UnknownLinkageSpecifier.
@@ -6597,7 +6727,7 @@ TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnWholeKeyDeletedFromShipp
 //     names to the silence list" pushes config in the wrong direction, and it
 //     does so most convincingly when the guard is otherwise correct.
 TEST(GrammarSchema, AttributeVocabularyCrossCheckStaysQuietOnWholesaleIgnoringShippedRow) {
-    std::string text = shippedCSubsetTextForPrefixTest();
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     std::string const needle =
         R"("linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr", "alignasSpec"] },
@@ -6700,9 +6830,18 @@ TEST(GrammarSchemaContentDigest, IsSixtyFourLowercaseHexDigits) {
         << "not lowercase hex: " << digest;
 }
 
+// ⚠ THE TWO LABELS ARE LOAD-BEARING AS OF 2026-08-25 (cycle P35). The
+// content-addressed memo
+// (D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS)
+// keys on (schema family, sourceLabel, digest), so two loads of these bytes
+// under the DEFAULT label would be one build and one object — and the
+// `ASSERT_NE` below would fire, correctly, saying the equality had become a
+// tautology. Distinct labels force two INDEPENDENT builds, which is the only
+// shape under which "the digest is a deterministic function of the bytes"
+// means anything. The subject is unchanged and the guard below still guards.
 TEST(GrammarSchemaContentDigest, SameTextTwiceYieldsTheSameDigest) {
-    auto a = GrammarSchema::loadFromText(kHappyConfig);
-    auto b = GrammarSchema::loadFromText(kHappyConfig);
+    auto a = GrammarSchema::loadFromText(kHappyConfig, "digest-determinism-a");
+    auto b = GrammarSchema::loadFromText(kHappyConfig, "digest-determinism-b");
     ASSERT_TRUE(a.has_value()) << errorDiags(a.error());
     ASSERT_TRUE(b.has_value()) << errorDiags(b.error());
     ASSERT_NE(a->get(), b->get())
@@ -6747,4 +6886,737 @@ TEST(GrammarSchemaContentDigest, ConstructionBypassingLoadFromTextLeavesItEmpty)
     EXPECT_TRUE(schema.contentDigest().empty())
         << "a schema with no document bytes reported a digest: "
         << schema.contentDigest();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `configName()` / `configDocumentPath()` — the name the CONFIG TREE is
+// indexed by, and the document path composed from it
+// ─────────────────────────────────────────────────────────────────────────
+//
+// ★★★ WHY THIS SECTION EXISTS. A language has TWO names. `name()` is what the
+// document DECLARES (`language.name`); `configName()` is the `.lang.json` STEM,
+// and only the stem is a valid `--language` argument or a valid path component.
+// A caller that reached for `name()` where a path was meant shipped a defect
+// that gated 1656/1656 GREEN on Windows and took 527 tests down on the WSL leg
+// (✔MEASURED 2026-08-25).
+//
+// ⚠⚠ AND THE DEFECT IS NOT A CASE PROBLEM — calling it one understates the
+// class by half. `ShippedCorpusStemAndDeclaredNameDivergeByMoreThanCase` below
+// MEASURES the corpus rather than restating a belief about it: THREE of the
+// FIVE nameable shipped languages have HYPHENS their declared names do not
+// (`asm-arm64-gas` → "AsmArm64Gas", `asm-x86_64-att` → "AsmX86_64Att",
+// `tsql-subset` → "TsqlSubset"), so for those the substitution resolves to
+// nothing on NTFS and APFS too. Only the case-only pairs (`c` → "C",
+// `toy` → "Toy") are host-dependent, which is precisely why a case-only pair is
+// the one that reached production.
+//
+// ⚠ NO SPELLING BELOW IS JUDGED BY THE FILESYSTEM. `fs::exists` on the
+// upper-case spelling is TRUE on two of the three hosts this repository gates
+// on, so a check built from it would reproduce the exact blindness that let the
+// defect ship. Every spelling claim here is a `std::string` comparison, which is
+// case-sensitive on every host.
+//   * `TheStemComesFromTheLabelVerbatim` is the one case where case-sensitivity
+//     is itself the property under test rather than the tool.
+//   * `EveryShippedLanguageNamesAFileThatExists` is the one case that DOES call
+//     the filesystem, and deliberately: its claim is EXISTENCE, not spelling —
+//     a cache key naming a document nobody can open is a key over a fiction. It
+//     asserts the exact string FIRST and existence second, so a case-insensitive
+//     host cannot let a wrong spelling through on the existence check alone.
+
+namespace {
+
+// One shipped language document, as the pair this section is about.
+struct ShippedLanguageRow {
+    std::string stem;      // the filename stem — what `--language` takes
+    std::string declared;  // `language.name` — what the document says
+};
+
+// ★★ THE CORPUS SPLITS IN TWO, AND THE SPLIT IS NOT A CONVENIENCE — ✔MEASURED
+// 2026-08-25, cycle P36, when the first cut of this helper called `loadShipped`
+// on every `sources/*.lang.json` and went red on `asm.lang.json`:
+//
+//     language 'asm' cannot be loaded standalone: 24 of its 'requires' names
+//     are UNSATISFIED … It also declares no 'root' shape …
+//
+// `asm.lang.json` is the SHARED assembly line grammar, designed to be reached
+// only through another document's `languageReferences` (`c.lang.json`,
+// `asm-arm64-gas.lang.json` and `asm-x86_64-att.lang.json` all bind its holes).
+// It is not a language a caller can name: `--language asm` is refused by the
+// same loader, so it can never be a `--language` argument, a `configName()` or
+// a `CuBuildKey::languageName`. Restricting the measurements below to the
+// STANDALONE set is therefore not a narrowing — it is exactly the set the
+// claims are about.
+//
+// ⚠ AND THE EXCLUSION IS ACCOUNTED FOR, NEVER SWALLOWED. A refusal is admitted
+// as "embedded-only" ONLY when some standalone document actually folds this
+// document in — asked of `referencedDocuments()`, the loader's own report, so a
+// document that stops loading for a DIFFERENT reason is UNACCOUNTED and fails
+// loudly. A helper that simply skipped what would not load is the vacuous-skip
+// shape: it would keep measuring a corpus that had silently shrunk to one row.
+struct ShippedLanguageCensus {
+    std::vector<ShippedLanguageRow> standalone;    // `loadShipped` succeeded
+    std::vector<std::string>        embeddedOnly;  // refused, and referenced
+    std::size_t                     documents = 0; // every `*.lang.json` on disk
+};
+
+// Every `sources/*.lang.json`, read THROUGH THE PRODUCTION LOADER. Sorted by
+// stem so the row order is a property of the CORPUS and not of the host
+// filesystem's iteration order (sorted on NTFS, hash-ordered on ext4).
+//
+// ⚠ The stem is taken from the FILENAME and the declared name from the LOADED
+// SCHEMA — two independent readings. Taking both off the schema would make
+// every assertion below a comparison of one value with itself.
+[[nodiscard]] ShippedLanguageCensus shippedLanguageCorpus() {
+    ShippedLanguageCensus census;
+    auto const            cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
+        return census;
+    }
+    constexpr std::string_view kSuffix{".lang.json"};
+
+    std::vector<std::string> stems;
+    std::error_code          ec;
+    for (std::filesystem::directory_iterator it{*cfg / "sources", ec}, end;
+         it != end; it.increment(ec)) {
+        if (ec) break;
+        std::error_code typeEc;
+        if (!it->is_regular_file(typeEc) || typeEc) continue;
+        std::string const leaf = it->path().filename().generic_string();
+        if (leaf.size() <= kSuffix.size() || !leaf.ends_with(kSuffix)) continue;
+        stems.push_back(leaf.substr(0, leaf.size() - kSuffix.size()));
+    }
+    std::sort(stems.begin(), stems.end());
+    census.documents = stems.size();
+
+    // Pass 1: the documents that load as a ROOT, and every document each of
+    // them folded in (the loader's own report — never a re-read of the JSON,
+    // which would be a second reading of `languageReferences` free to drift).
+    std::vector<std::string> refusedStems;
+    std::vector<std::string> referencedLeaves;
+    for (auto const& stem : stems) {
+        auto loaded = GrammarSchema::loadShipped(stem);
+        if (!loaded.has_value()) {
+            refusedStems.push_back(stem);
+            continue;
+        }
+        census.standalone.push_back(
+            ShippedLanguageRow{stem, std::string{(*loaded)->name()}});
+        for (auto const& dep : (*loaded)->referencedDocuments()) {
+            referencedLeaves.push_back(
+                std::filesystem::path{dep.path}.filename().generic_string());
+        }
+    }
+    std::sort(referencedLeaves.begin(), referencedLeaves.end());
+
+    // Pass 2: classify each refusal. Matching on the LEAF is exact enough here
+    // and stated rather than assumed — every referenced document lives in this
+    // one `sources/` directory, so two leaves cannot collide.
+    for (auto const& stem : refusedStems) {
+        std::string const leaf = stem + std::string{kSuffix};
+        if (std::binary_search(referencedLeaves.begin(), referencedLeaves.end(),
+                               leaf)) {
+            census.embeddedOnly.push_back(stem);
+            continue;
+        }
+        auto reason = GrammarSchema::loadShipped(stem);
+        ADD_FAILURE()
+            << "shipped language document '" << leaf
+            << "' cannot be loaded as a root AND is referenced by no shipped "
+               "document that can. It is therefore reachable by nothing — not "
+               "by `--language`, not through `languageReferences` — so the "
+               "corpus measurements in this file are being taken over a "
+               "SMALLER set than the tree ships, which is how a census stays "
+               "green while the thing it counts disappears. The loader's "
+               "reason:"
+            << (reason.has_value() ? std::string{" <it loaded on retry>"}
+                                   : errorDiags(reason.error()));
+    }
+    return census;
+}
+
+[[nodiscard]] std::string asciiLower(std::string_view s) {
+    std::string out{s};
+    for (char& ch : out) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    return out;
+}
+
+// The first value that occurs twice in `values`, or empty if all are distinct.
+[[nodiscard]] std::string firstDuplicate(std::vector<std::string> values) {
+    std::sort(values.begin(), values.end());
+    auto const dup = std::adjacent_find(values.begin(), values.end());
+    return dup == values.end() ? std::string{} : *dup;
+}
+
+} // namespace
+
+// ── The derivation, arm by arm ──────────────────────────────────────────────
+
+TEST(GrammarSchemaConfigName, AForwardSlashPathYieldsTheStem) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig,
+                                              "some/tree/sources/mini.lang.json");
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->configName(), "mini");
+}
+
+// Windows hands `loadFromText` a `path.string()`, which is backslashed. A
+// separator scan that knew only `/` would return the WHOLE path as the "stem"
+// on the host this repository is developed on — a value that is not empty, so
+// no emptiness check anywhere would notice it.
+TEST(GrammarSchemaConfigName, ABackslashPathYieldsTheStem) {
+    auto result = GrammarSchema::loadFromText(
+        kHappyConfig, R"(C:\tree\src\dss-config\sources\mini.lang.json)");
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->configName(), "mini");
+}
+
+// `fs::path::string()` on Windows mixes separators freely when a path was
+// composed from a forward-slashed root. The LAST separator of EITHER kind wins.
+TEST(GrammarSchemaConfigName, MixedSeparatorsTakeTheLastOneOfEitherKind) {
+    auto a = GrammarSchema::loadFromText(
+        kHappyConfig, R"(C:/tree/src\dss-config\sources\mini.lang.json)");
+    ASSERT_TRUE(a.has_value()) << errorDiags(a.error());
+    EXPECT_EQ((*a)->configName(), "mini");
+
+    auto b = GrammarSchema::loadFromText(
+        kHappyConfig, R"(C:\tree\src/dss-config/sources/mini2.lang.json)");
+    ASSERT_TRUE(b.has_value()) << errorDiags(b.error());
+    EXPECT_EQ((*b)->configName(), "mini2");
+}
+
+TEST(GrammarSchemaConfigName, ABareFilenameWithNoSeparatorYieldsTheStem) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig, "mini.lang.json");
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->configName(), "mini");
+}
+
+// ★ A LEAF THAT IS EXACTLY THE SUFFIX NAMES NOTHING. Its stem is empty, and an
+// empty stem is not a name any walk could have resolved — `--language ""` names
+// nothing — so the honest answer is the documented "no document" state.
+//
+// ⚠ THIS DOES NOT PIN THE `>` IN `label.size() > kSuffix.size()`, and saying it
+// did would be a false claim about a real measurement. ✔MEASURED 2026-08-25 by
+// mutation: `>=` leaves this case GREEN, because at equality the stem is
+// `substr(0, 0)` — empty either way. What the length test actually decides is
+// an UNDERFLOW, pinned by `TheDefaultInlineLabelLeavesItEmpty` below: removing
+// the test entirely wraps `label.size() - kSuffix.size()` to
+// 18446744073709551614 for the 8-byte `<inline>` label and `compare` throws,
+// which took 106 cases of this file down.
+TEST(GrammarSchemaConfigName, ALeafThatIsExactlyTheSuffixLeavesItEmpty) {
+    auto bare = GrammarSchema::loadFromText(kHappyConfig, ".lang.json");
+    ASSERT_TRUE(bare.has_value()) << errorDiags(bare.error());
+    EXPECT_TRUE((*bare)->configName().empty())
+        << "a leaf that is exactly the suffix minted the stem '"
+        << (*bare)->configName() << "'";
+
+    auto pathed = GrammarSchema::loadFromText(kHappyConfig,
+                                              "some/tree/sources/.lang.json");
+    ASSERT_TRUE(pathed.has_value()) << errorDiags(pathed.error());
+    EXPECT_TRUE((*pathed)->configName().empty())
+        << "a PATH whose leaf is exactly the suffix minted the stem '"
+        << (*pathed)->configName() << "'";
+}
+
+// The other side of the same boundary, and this one IS observable: one
+// character more than the suffix is a one-character stem, and it must survive.
+// A length test that had drifted to `> kSuffix.size() + 1` would fail here and
+// nowhere else.
+TEST(GrammarSchemaConfigName, ALeafOneCharacterLongerThanTheSuffixYieldsThatCharacter) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig, "x.lang.json");
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->configName(), "x");
+}
+
+// The compare is anchored at the END. A label that merely CONTAINS the suffix
+// is not a language document, and treating it as one would name a stem
+// (`c.lang.json.bak` -> `c`) for a file the loader never read.
+TEST(GrammarSchemaConfigName, TheSuffixMustBeAtTheEndAndNotMerelyPresent) {
+    for (std::string_view const label :
+         {"c.lang.json.bak", "sources/c.lang.json/inner", ".lang.jsonx",
+          "c.lang.jso", "c.lang.JSON"}) {
+        auto result = GrammarSchema::loadFromText(kHappyConfig, label);
+        ASSERT_TRUE(result.has_value()) << label << errorDiags(result.error());
+        EXPECT_TRUE((*result)->configName().empty())
+            << "label '" << label << "' was treated as a language document and "
+               "yielded the stem '" << (*result)->configName() << "'";
+    }
+}
+
+// ★★ THE STEM IS THE LABEL'S BYTES, NEVER A NORMALIZED FORM OF THEM. This is
+// the ONE assertion in this section that is deliberately case-SENSITIVE about
+// its subject rather than its comparison: `configName()` reports what the
+// document was loaded AS. A loader that lower-cased here would make
+// `--language C` resolve on Linux by accident, hiding the defect instead of
+// exposing it, and would make the value disagree with the path the walk used.
+TEST(GrammarSchemaConfigName, TheStemComesFromTheLabelVerbatim) {
+    auto upper = GrammarSchema::loadFromText(kHappyConfig,
+                                             "some/sources/C.lang.json");
+    ASSERT_TRUE(upper.has_value()) << errorDiags(upper.error());
+    EXPECT_EQ((*upper)->configName(), "C");
+
+    auto hyphenated = GrammarSchema::loadFromText(
+        kHappyConfig, "some/sources/asm-x86_64-att.lang.json");
+    ASSERT_TRUE(hyphenated.has_value()) << errorDiags(hyphenated.error());
+    EXPECT_EQ((*hyphenated)->configName(), "asm-x86_64-att");
+}
+
+// ── The "no document" contract ──────────────────────────────────────────────
+
+// ★★ THE DEFAULT LABEL — every `loadFromText` caller that names nothing, and
+// the case that catches the derivation's one real crash. `<inline>` is EIGHT
+// bytes, two fewer than `.lang.json`, so it is also the shortest label the
+// production API can produce: ✔MEASURED, dropping the length guard makes this
+// case throw `basic_string_view::substr: __pos (which is 18446744073709551614)`
+// rather than merely report a wrong name.
+TEST(GrammarSchemaConfigName, TheDefaultInlineLabelLeavesItEmpty) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig);
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_TRUE((*result)->configName().empty())
+        << "a grammar with no document behind it reported the config name '"
+        << (*result)->configName()
+        << "'. Empty is the documented 'no document' state, and a caller that "
+           "needs a path relies on it.";
+}
+
+// The public `GrammarSchemaData` ctor — the documented JSON bypass tests use.
+TEST(GrammarSchemaConfigName, ConstructionBypassingLoadFromTextLeavesItEmpty) {
+    GrammarSchema const schema{detail::GrammarSchemaData{}};
+    EXPECT_TRUE(schema.configName().empty())
+        << "a schema built with no document reported the config name '"
+        << schema.configName() << "'";
+}
+
+// ★★★ A MEMO HIT CANNOT HAND BACK A SCHEMA WITH AN UNSET CONFIG NAME.
+// `configName_` is assigned BEFORE `ConfigDocumentMemo<GrammarSchema>::store`,
+// and the memo key is (sourceLabel, digest) — the SAME label the name derives
+// from — so the hit and the miss agree by construction. This pins the property
+// rather than the reasoning: an edit that moved the assignment after the store,
+// or that keyed the memo on the digest ALONE, lands here.
+//
+// ⚠ THE HIT IS PROVEN TO BE A HIT, not assumed. Two loads of identical bytes
+// under identical labels return the SAME OBJECT on a hit and two objects on a
+// miss, so `ASSERT_EQ` on the pointers is what makes the rest of the case mean
+// anything — without it a cache that never hits would pass.
+TEST(GrammarSchemaConfigName, AMemoHitCarriesTheSameConfigNameAsTheMiss) {
+    constexpr std::string_view kLabel = "memo/sources/memo-probe.lang.json";
+    auto miss = GrammarSchema::loadFromText(kHappyConfig, kLabel);
+    ASSERT_TRUE(miss.has_value()) << errorDiags(miss.error());
+    ASSERT_EQ((*miss)->configName(), "memo-probe");
+
+    auto hit = GrammarSchema::loadFromText(kHappyConfig, kLabel);
+    ASSERT_TRUE(hit.has_value()) << errorDiags(hit.error());
+    ASSERT_EQ(miss->get(), hit->get())
+        << "the second load of identical bytes under an identical label built a "
+           "SECOND object, so the memo did not hit and this case asserts "
+           "nothing about a hit";
+    EXPECT_EQ((*hit)->configName(), "memo-probe");
+    EXPECT_EQ((*hit)->configDocumentPath(), (*miss)->configDocumentPath());
+}
+
+// A memo keyed on (label, digest) must NOT let one label's schema answer for
+// another's — that would be a hit returning the wrong config name, which is the
+// same wrong-path defect arriving through the cache instead of the derivation.
+TEST(GrammarSchemaConfigName, TwoLabelsOverIdenticalBytesKeepTheirOwnStems) {
+    auto a = GrammarSchema::loadFromText(kHappyConfig, "sources/stem-a.lang.json");
+    auto b = GrammarSchema::loadFromText(kHappyConfig, "sources/stem-b.lang.json");
+    ASSERT_TRUE(a.has_value()) << errorDiags(a.error());
+    ASSERT_TRUE(b.has_value()) << errorDiags(b.error());
+    EXPECT_EQ((*a)->configName(), "stem-a");
+    EXPECT_EQ((*b)->configName(), "stem-b");
+    EXPECT_EQ((*a)->contentDigest(), (*b)->contentDigest())
+        << "the two loads were given the same bytes, so a differing digest "
+           "means this case is no longer testing the label half of the key";
+}
+
+// ── `configDocumentPath()` — both arms, both reachable ──────────────────────
+
+TEST(GrammarSchemaConfigDocumentPath, ADocumentAnswersWithItsConfigRootRelativePath) {
+    auto result = GrammarSchema::loadFromText(
+        kHappyConfig, R"(C:\tree\src\dss-config\sources\mini.lang.json)");
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->configDocumentPath(), "sources/mini.lang.json");
+}
+
+// ★★ THE ARM THE DRIVER'S DELETED REFUSAL COULD NOT REACH.
+// `resolveShippedRuntimeArchives` carried an `if (configName().empty())` branch
+// that no driver route could exercise (every route is `loadShipped` ->
+// `loadFromFile`), so it was deleted in cycle P36 and the behaviour moved HERE,
+// where the case is one call away and is exercised on every run.
+//
+// ⚠ THE ANSWER MUST NOT LOOK LIKE A PATH. `sources/.lang.json` is a real path
+// SHAPE — an auditor reading a cache key document would take it for a document
+// that was loaded, and a file literally named `.lang.json` would collide with
+// it. Both halves are asserted: the declared name is present (so the term
+// identifies WHICH grammar), and no `.lang.json` appears anywhere in it.
+TEST(GrammarSchemaConfigDocumentPath, AGrammarWithNoDocumentAnswersWithANonPath) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig);
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    std::string const term = (*result)->configDocumentPath();
+
+    EXPECT_FALSE(term.empty())
+        << "an empty term would put `doc=language::<digest>` in the cache key "
+           "line, which reads as a document with no path rather than as a "
+           "grammar with no document";
+    EXPECT_EQ(term.find(".lang.json"), std::string::npos)
+        << "a grammar with no document named one: '" << term << "'";
+    EXPECT_EQ(term.find("sources/"), std::string::npos)
+        << "a grammar with no document named a config subdirectory: '" << term
+        << "'";
+    EXPECT_NE(term.find((*result)->name()), std::string::npos)
+        << "the term does not identify WHICH grammar it stands for (declared "
+           "name '" << (*result)->name() << "'): '" << term << "'";
+}
+
+TEST(GrammarSchemaConfigDocumentPath, TheDataConstructorBypassAlsoAnswersWithANonPath) {
+    GrammarSchema const schema{detail::GrammarSchemaData{}};
+    std::string const   term = schema.configDocumentPath();
+    EXPECT_FALSE(term.empty());
+    EXPECT_EQ(term.find(".lang.json"), std::string::npos)
+        << "a schema built with no document named one: '" << term << "'";
+}
+
+// ── The shipped corpus: the measurements the docblocks cite ─────────────────
+
+// ★ THE COMPOSED PATH NAMES A FILE THAT EXISTS. This is the one place the
+// filesystem IS the right oracle, because the claim is about existence and not
+// about spelling: `configDocumentPath()` is what the runtime-cache key records,
+// and a key naming a document nobody can open is a key covering a fiction.
+TEST(GrammarSchemaConfigDocumentPath, EveryShippedLanguageNamesAFileThatExists) {
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    auto const census = shippedLanguageCorpus();
+    auto const& rows  = census.standalone;
+    ASSERT_FALSE(rows.empty()) << "no shipped language documents were found";
+    // Every document on disk is either a root or an embedded reference; the
+    // helper fails loudly for anything else, and this restates the accounting
+    // where a reader of the failure will see it.
+    EXPECT_EQ(rows.size() + census.embeddedOnly.size(), census.documents);
+
+    for (auto const& row : rows) {
+        auto loaded = GrammarSchema::loadShipped(row.stem);
+        ASSERT_TRUE(loaded.has_value()) << row.stem << errorDiags(loaded.error());
+        EXPECT_EQ((*loaded)->configName(), row.stem)
+            << "shipped language '" << row.stem
+            << "' reports a config name that is not its filename stem";
+        std::string const rel = (*loaded)->configDocumentPath();
+        EXPECT_EQ(rel, "sources/" + row.stem + ".lang.json");
+        EXPECT_TRUE(std::filesystem::is_regular_file(*cfg / rel))
+            << "the document path composed for shipped language '" << row.stem
+            << "' is '" << rel << "', which is not a file under the config root "
+            << cfg->generic_string();
+    }
+}
+
+// ★★★ THE C4 MEASUREMENT, TAKEN RATHER THAN RESTATED. Three docblocks used to
+// describe this divergence as a CASE difference. It is not, for half the
+// corpus, and a reader who takes the case framing literally concludes the class
+// is Linux-only — a conclusion that would have let the same substitution ship
+// again in a hyphenated language, failing on every host.
+//
+// This case asserts the SHAPE of the corpus, not a row list: that at least one
+// stem differs from its declared name by MORE than case, and that at least one
+// differs by case ALONE. Either going red is the day the docblocks change.
+TEST(GrammarSchemaConfigName, ShippedCorpusStemAndDeclaredNameDivergeByMoreThanCase) {
+    auto const  census = shippedLanguageCorpus();
+    auto const& rows   = census.standalone;
+    ASSERT_FALSE(rows.empty()) << "no shipped language documents were found";
+
+    std::vector<std::string> identical;
+    std::vector<std::string> caseOnly;
+    std::vector<std::string> structural;
+    for (auto const& row : rows) {
+        if (row.stem == row.declared) {
+            identical.push_back(row.stem);
+        } else if (asciiLower(row.stem) == asciiLower(row.declared)) {
+            caseOnly.push_back(row.stem);
+        } else {
+            structural.push_back(row.stem);
+        }
+    }
+
+    std::string censusText;
+    for (auto const& row : rows) {
+        censusText += "\n  " + row.stem + " -> \"" + row.declared + "\"";
+    }
+    for (auto const& stem : census.embeddedOnly) {
+        censusText += "\n  " + stem + "  (embedded-only: not nameable)";
+    }
+
+    EXPECT_FALSE(structural.empty())
+        << "EVERY shipped stem now agrees with its declared name up to case. "
+           "The 'differ in CASE' framing in `GrammarSchema::configName`, "
+           "`ShippedSourceLanguage` and this file would then be accurate — "
+           "update them, and this expectation, together." << censusText;
+
+    // A structural divergence is host-BLIND: `sources/AsmArm64Gas.lang.json`
+    // exists on no filesystem. A case-only divergence is host-DEPENDENT, and is
+    // the reason a green Windows gate proved nothing. Both must be present for
+    // the docblocks' two-part explanation to be the corpus's actual shape.
+    EXPECT_FALSE(caseOnly.empty())
+        << "no shipped stem differs from its declared name by case ALONE, so "
+           "the host-dependent half of the defect no longer has an example in "
+           "the corpus and the docblocks that cite one are stale." << censusText;
+}
+
+// ★★★ THE PROOF THAT `CuBuildKey::languageName` MAY KEY ON THE STEM: swapping
+// it from `name()` to `configName()` changes NO CU-build grouping on this
+// corpus.
+//
+// `CuBuildKey::languageName` decides whether two targets SHARE one parsed CU.
+// The swap is behaviour-preserving exactly when the two columns induce the SAME
+// partition of the corpus — which they do when both are injective, since each
+// then puts every document in its own class. The STEM is injective by
+// construction (two files in one directory cannot share a name); the DECLARED
+// name is injective only as long as nobody declares a duplicate, and this case
+// is the guard on that.
+//
+// ⚠ IT IS ALSO THE REASON FOR THE SWAP. A corpus that grew a duplicate
+// `language.name` would, under `name()`, silently MERGE two CU builds — a `.s`
+// parsed under one dialect and compiled for the other CPU. Under `configName()`
+// it cannot. So this case going red is informative either way: before the swap
+// it announced a live miscompile; after it, a stale docblock.
+TEST(GrammarSchemaConfigName, ShippedCorpusStemsAndDeclaredNamesAreBothInjective) {
+    // ⓘ THE STANDALONE SET IS THE RIGHT DOMAIN, not a convenient one. Only a
+    // document that loads as a ROOT can reach `resolveGrammarForTarget`, so
+    // only those can ever be compared inside a `CuBuildKey` — an embedded-only
+    // grammar such as `asm.lang.json` is folded into its host and never keyed.
+    auto const  census = shippedLanguageCorpus();
+    auto const& rows   = census.standalone;
+    ASSERT_FALSE(rows.empty()) << "no shipped language documents were found";
+
+    std::vector<std::string> stems;
+    std::vector<std::string> declared;
+    for (auto const& row : rows) {
+        stems.push_back(row.stem);
+        declared.push_back(row.declared);
+        EXPECT_FALSE(row.stem.empty());
+        EXPECT_FALSE(row.declared.empty())
+            << "shipped language '" << row.stem << "' declares no name";
+    }
+
+    EXPECT_TRUE(firstDuplicate(stems).empty())
+        << "two shipped documents share the filename stem '"
+        << firstDuplicate(stems)
+        << "', which the filesystem should have made impossible";
+    EXPECT_TRUE(firstDuplicate(declared).empty())
+        << "two shipped language documents declare the same `language.name` ('"
+        << firstDuplicate(declared)
+        << "'). `CuBuildKey::languageName` keys on the STEM precisely so this "
+           "cannot merge two CU builds — but every OTHER site that still "
+           "identifies a language by its declared name now has an ambiguity, "
+           "so audit them before accepting the duplicate.";
+}
+// ═══ Longest-match probe index ════════════════════════════════════════════
+//
+// D-PERF-TOK-LONGEST-MATCH-PROBES-EVERY-DECLARED-LENGTH-AT-EVERY-POSITION.
+// The tokenizer's longest-match scan used to ask the lexeme table about EVERY
+// length from `maxLexemeLength` down to 1 at EVERY token position;
+// `lexemeLengthsForLeadByte` now hands it only the lengths that can possibly
+// match. These pin the ALGORITHMIC property — the number of table lookups —
+// and deliberately time nothing: a wall-clock threshold in a test measures the
+// host's mood, and this box has been measured moving 1.33x on a phase nothing
+// touched.
+
+namespace {
+
+// Declares, on purpose:
+//   * three keys under one lead byte at TWO distinct lengths (`+` `++` `+=`)
+//     — the row must dedup to two probes, not three;
+//   * a GAP under one lead byte (`<` and `<<=`, no 2-byte key) — the row must
+//     not invent length 2;
+//   * two keywords of the SAME length under one lead byte (`if`, `in`) plus a
+//     longer one (`int`) — dedup again, and descending order;
+//   * a key past the 15-byte small-string threshold, the boundary at which the
+//     old per-probe `std::string` started calling malloc.
+constexpr std::string_view kProbeIndexConfig = R"({
+  "dssSchemaVersion": 1,
+  "language": {
+    "name": "ProbeIndexLang",
+    "version": "1.0.0",
+    "fileExtensions": [".pil"]
+  },
+  "tokens": {
+    " ":   [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "+":   [{ "kind": "Plus" }],
+    "++":  [{ "kind": "PlusPlus" }],
+    "+=":  [{ "kind": "PlusEq" }],
+    "<":   [{ "kind": "Lt" }],
+    "<<=": [{ "kind": "ShlEq" }],
+    ";":   [{ "kind": "EndCommand" }],
+    "=":   [{ "kind": "AssignmentOperator" }]
+  },
+  "keywords": [
+    { "word": "if",  "kind": "IfKeyword" },
+    { "word": "in",  "kind": "InKeyword" },
+    { "word": "int", "kind": "IntKeyword" },
+    { "word": "__builtin_very_long_name", "kind": "LongKeyword" }
+  ],
+  "shapes": {
+    "root":       { "sequence": [{ "repeat": "statement" }] },
+    "statement":  { "sequence": ["expression", "EndCommand"] },
+    "expression": { "sequence": ["Identifier"] }
+  }
+})";
+
+// Every (lead byte, length) pair `kProbeIndexConfig` declares — the GROUND
+// TRUTH the index is compared against, written out by hand rather than derived
+// from the same table the index was, so the two cannot agree by sharing a bug.
+[[nodiscard]] std::vector<std::uint32_t> expectedProbeRow(unsigned char lead) {
+    switch (lead) {
+        case ' ':  return {1};
+        case '+':  return {2, 1};        // "+", "++", "+=" -> two lengths
+        case '<':  return {3, 1};        // "<", "<<="      -> NO length 2
+        case ';':  return {1};
+        case '=':  return {1};
+        case 'i':  return {3, 2};        // "int", "if"/"in" -> deduped
+        case '_':  return {24};          // "__builtin_very_long_name"
+        default:   return {};
+    }
+}
+
+} // namespace
+
+TEST(GrammarSchemaProbeIndex, RowsAreExactForEveryLeadByteAndEveryLength) {
+    auto result = GrammarSchema::loadFromText(kProbeIndexConfig);
+    ASSERT_TRUE(result.has_value()) << "loadFromText failed: "
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto schema = *result;
+
+    // ★ ALL 256 ROWS, not the seven interesting ones. A row that INVENTS a
+    // length only costs time, but a row that OMITS one silently stops the
+    // tokenizer matching that lexeme — a wrong parse, not a parse error — so
+    // the check has to be total.
+    std::size_t total = 0;
+    for (int b = 0; b < 256; ++b) {
+        auto const lead = static_cast<unsigned char>(b);
+        auto const want = expectedProbeRow(lead);
+        auto const got  = schema->lexemeLengthsForLeadByte(lead);
+        ASSERT_EQ(got.size(), want.size())
+            << "row for byte 0x" << std::hex << b << std::dec
+            << " has the wrong number of probe lengths";
+        for (std::size_t i = 0; i < want.size(); ++i) {
+            EXPECT_EQ(got[i], want[i])
+                << "row for byte 0x" << std::hex << b << std::dec
+                << " entry " << i << " (rows are longest-first)";
+        }
+        total += want.size();
+    }
+    EXPECT_EQ(schema->lexemeProbeCount(), total);
+    EXPECT_EQ(schema->maxLexemeLength(), 24u);
+
+    // The whole point, stated as a number: the unindexed scan asked about
+    // every length at every lead byte.
+    EXPECT_LT(schema->lexemeProbeCount(), 256u * schema->maxLexemeLength());
+}
+
+TEST(GrammarSchemaProbeIndex, RowsAreLongestFirstAndWithinTheDeclaredBound) {
+    auto schema = dss::test_support::shippedSchemaOrThrow("c");
+    ASSERT_GT(schema->maxLexemeLength(), 0u);
+
+    std::size_t counted = 0;
+    for (int b = 0; b < 256; ++b) {
+        auto const row = schema->lexemeLengthsForLeadByte(static_cast<unsigned char>(b));
+        counted += row.size();
+        for (std::size_t i = 0; i < row.size(); ++i) {
+            EXPECT_GE(row[i], 1u) << "byte 0x" << std::hex << b;
+            EXPECT_LE(row[i], schema->maxLexemeLength())
+                << "byte 0x" << std::hex << b << std::dec
+                << ": a probe length above `maxLexemeLength` would be a length "
+                   "the tokenizer's own window can never reach";
+            // STRICTLY descending — the scan returns the FIRST hit, so an
+            // out-of-order row would return a SHORTER match than the longest
+            // one, which is the classic `<` beating `<<=` miscompile.
+            if (i > 0) EXPECT_GT(row[i - 1], row[i]) << "byte 0x" << std::hex << b;
+        }
+    }
+    EXPECT_EQ(counted, schema->lexemeProbeCount());
+}
+
+TEST(GrammarSchemaProbeIndex, ShippedCScanIsAnOrderOfMagnitudeShorterThanUnindexed) {
+    auto schema = dss::test_support::shippedSchemaOrThrow("c");
+
+    // ★ THE LOOKUP-COUNT PIN, and deliberately not a timing one. Before the
+    // index, a longest-match scan asked the table about EVERY length at EVERY
+    // lead byte: `256 * maxLexemeLength` lookups, which for the shipped `c`
+    // grammar is 256 * 28 = 7168 (28 because KEYWORDS share the lexeme table
+    // with punctuation and `__builtin_types_compatible_p` is 28 bytes).
+    // `lexemeProbeCount()` is what the same scan asks now: ✔MEASURED 105.
+    //
+    // The bound is stated with slack rather than as `== 105` on purpose — a
+    // lane adding one keyword with a new (lead, length) pair moves 105 and
+    // must not redden this.
+    //
+    // ⚠ THIS BOUND CATCHES EXACTLY ONE DEGRADATION: an index that stopped
+    // filtering by lead byte, which scores the full 7168. It does NOT catch a
+    // WEAKER-BUT-STILL-FILTERING index — one giving every length from 1 to
+    // that byte's longest key scores ✔MEASURED 197, comfortably inside the
+    // bound. That design is caught by
+    // `RowsAreExactForEveryLeadByteAndEveryLength` instead, which asserts the
+    // `<` row is {3, 1} with NO length 2, and no bound on a total can do that
+    // job. Two tests, two failure modes, deliberately not one.
+    const std::size_t unindexed = 256u * schema->maxLexemeLength();
+    EXPECT_GT(unindexed, 0u);
+    EXPECT_LT(schema->lexemeProbeCount() * 10u, unindexed)
+        << "the probe index stopped filtering: " << schema->lexemeProbeCount()
+        << " lookups per lead-byte sweep against an unindexed " << unindexed;
+}
+
+TEST(GrammarSchemaProbeIndex, ModeRowsComeFromThatModesOwnTableNotAGlobalUnion) {
+    auto schema = dss::test_support::shippedSchemaOrThrow("c");
+
+    // `directive` overrides exactly ONE lexeme, `include` (7 bytes). A GLOBAL
+    // UNION index would have been conservative-correct and nearly useless
+    // here: the union row for `i` carries every length the global table
+    // declares under `i`, and all but one of them are guaranteed misses in a
+    // one-entry override table. This is the test that would go red if the
+    // per-mode index were ever collapsed into a union.
+    auto const directive = schema->findLexerMode("directive");
+    ASSERT_TRUE(directive.valid()) << "the shipped `c` grammar lost its "
+                                     "`directive` lexer mode";
+    auto const iRow = schema->lexemeLengthsForLeadByteInMode(directive, 'i');
+    ASSERT_EQ(iRow.size(), 1u) << "the `directive` override table declares one "
+                                  "key; its row must have one length";
+    EXPECT_EQ(iRow[0], 7u);
+    EXPECT_LT(iRow.size(), schema->lexemeLengthsForLeadByte('i').size())
+        << "the mode row is no shorter than the global row, which is what a "
+           "union index would produce";
+
+    // Every OTHER lead byte in that mode declares nothing at all, so a scan
+    // there does no work before falling back to the global table.
+    for (int b = 0; b < 256; ++b) {
+        if (b == 'i') continue;
+        EXPECT_TRUE(schema->lexemeLengthsForLeadByteInMode(
+                        directive, static_cast<unsigned char>(b)).empty())
+            << "byte 0x" << std::hex << b;
+    }
+
+    // `header-context` overrides `<` only — a 1-byte key whose GLOBAL row
+    // carries three lengths (`<`, `<<`/`<=`, `<<=`).
+    auto const headerCtx = schema->findLexerMode("header-context");
+    ASSERT_TRUE(headerCtx.valid());
+    auto const ltRow = schema->lexemeLengthsForLeadByteInMode(headerCtx, '<');
+    ASSERT_EQ(ltRow.size(), 1u);
+    EXPECT_EQ(ltRow[0], 1u);
+    EXPECT_GT(schema->lexemeLengthsForLeadByte('<').size(), ltRow.size());
+}
+
+TEST(GrammarSchemaProbeIndex, AByteNoDeclaredKeyStartsWithHasAnEmptyRow) {
+    auto schema = dss::test_support::shippedSchemaOrThrow("c");
+
+    // The scan's cheapest possible outcome, and the one that used to cost a
+    // full `maxLexemeLength` sweep of guaranteed misses. `@` and `` ` `` are
+    // not in C's lexical alphabet at all; the tokenizer's illegal-character
+    // path is what picks them up, and it must keep doing so — see
+    // `Tokenizer.IllegalCharEmitsErrorTokenAndContinues`.
+    EXPECT_TRUE(schema->lexemeLengthsForLeadByte('@').empty());
+    EXPECT_TRUE(schema->lexemeLengthsForLeadByte('`').empty());
+
+    // A UTF-8 continuation byte starts no declared key either — the row must
+    // be empty rather than out of range, because `lengthsFor` is indexed by
+    // the raw byte and a signed-char sign extension here would read off the
+    // front of the table.
+    EXPECT_TRUE(schema->lexemeLengthsForLeadByte(0x80).empty());
+    EXPECT_TRUE(schema->lexemeLengthsForLeadByte(0xFF).empty());
 }

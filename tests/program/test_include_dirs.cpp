@@ -62,7 +62,7 @@ TEST(IncludeDirs, QuoteIncludeResolvesOnlyViaIncludeDir) {
         p.setOutputDir(dir / "out_no");
         DiagnosticReporter rep;
         int const rc = p.compileFiles(
-            std::vector<std::string>{mainSrc.string()}, "c-subset",
+            std::vector<std::string>{mainSrc.string()}, "c",
             std::vector<std::string>{target}, rep);
         EXPECT_NE(rc, 0) << "a quote-include unreachable without -I must fail";
         EXPECT_GT(countCode(rep, DiagnosticCode::P_PreprocessorIncludeError), 0u)
@@ -78,7 +78,7 @@ TEST(IncludeDirs, QuoteIncludeResolvesOnlyViaIncludeDir) {
         p.setIncludeDirs(std::vector<std::string>{(dir / "inc").string()});
         DiagnosticReporter rep;
         int const rc = p.compileFiles(
-            std::vector<std::string>{mainSrc.string()}, "c-subset",
+            std::vector<std::string>{mainSrc.string()}, "c",
             std::vector<std::string>{target}, rep);
         ASSERT_EQ(rc, 0) << "the -I include dir must resolve the quote-include";
         EXPECT_EQ(countCode(rep, DiagnosticCode::P_PreprocessorIncludeError), 0u);

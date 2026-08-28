@@ -63,12 +63,12 @@ using dss::link_format::test::rejectSummary;
 namespace {
 
 [[nodiscard]] fs::path objectFormatsDir() {
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config" / "object-formats";
+    return *root / "object-formats";
 }
 
 struct ShippedFormat {

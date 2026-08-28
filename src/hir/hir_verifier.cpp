@@ -902,8 +902,8 @@ void HirVerifier::checkCallArguments(DiagnosticReporter& reporter) const {
                 // would have produced `S_TypeMismatch` before HIR
                 // lowering, so reaching the verifier with arg=IntLit
                 // in a Ptr<*> slot implies value==0. This is the
-                // structural-invariant guarantee D-HIR-VERIFIER-
-                // POINTER-CONVERT-CONTRACT documents as the
+                // structural-invariant guarantee
+                // D-HIR-VERIFIER-POINTER-CONVERT-CONTRACT documents as the
                 // post-coerce invariant — extended here to the
                 // null-pointer-constant case which is admitted at
                 // value-tier (semantic) rather than type-tier
@@ -1093,6 +1093,31 @@ void HirVerifier::checkConstructAggregate(DiagnosticReporter& reporter) const {
                                      "malformed Array type (missing element "
                                      "type or length scalar)", id.v),
                          sourceMap_);
+                continue;
+            }
+            // ★★ D-HIR-SENTINEL-ARRAY-LENGTH-EXPANDED-AS-A-COUNT: `scalars()[0]` is
+            // a SIGNED length carrying the interner's two negative sentinels —
+            // `kIncompleteArrayLength` (-1) and `kVlaLength` (-2). Cast blind to
+            // `std::size_t` the rule demanded 18,446,744,073,709,551,615 children
+            // and reported that number at the user — ✔MEASURED on
+            // `struct S { int n; char c[]; }; struct S s = {};`, a program gcc and
+            // clang both compile. A runtime-sized array has no static element
+            // count, so the rule that DOES hold is the one the lowering
+            // guarantees: exactly ZERO children — the empty typed
+            // `ConstructAggregate` that means "zero this whole object", which the
+            // MIR tier expands (a VLA) or which occupies no bytes at all (a
+            // flexible array member). Still a REAL check: a non-empty aggregate on
+            // a runtime-sized array is a lowering bug and still fails here.
+            if (scals[0] < 0) {
+                if (!kids.empty()) {
+                    reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                             std::format("ConstructAggregate #{} (Array) on a "
+                                         "runtime-sized array type: expected 0 "
+                                         "children (the whole-object zero marker), "
+                                         "got {}",
+                                         id.v, kids.size()),
+                             sourceMap_);
+                }
                 continue;
             }
             std::size_t const len = static_cast<std::size_t>(scals[0]);

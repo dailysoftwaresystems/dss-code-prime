@@ -22,14 +22,14 @@ std::atomic<std::uint64_t> LexerModeStack::nextInstanceId_{1};
 LexerModeStack::LexerModeStack() noexcept
     : instanceId_(nextInstanceId_.fetch_add(1, std::memory_order_relaxed)) {}
 
+// PROJECTS `kModeOpTable` (lexer_mode.hpp, beside the enum) rather than
+// retyping the spellings a second time. The switch this replaced was a WRITER
+// owning the same four names the grammar loader's inline `==` chain owned as a
+// READER — D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN. The
+// out-of-range fall-back is unchanged: `name()` returns row 0, which is
+// `ModeOp::None` -> "none", exactly what the old unreachable arm returned.
 std::string_view modeOpName(ModeOp op) noexcept {
-    switch (op) {
-        case ModeOp::None:        return "none";
-        case ModeOp::PushMode:    return "pushMode";
-        case ModeOp::PopMode:     return "popMode";
-        case ModeOp::ReplaceMode: return "replaceMode";
-    }
-    return "none";   // unreachable; satisfies non-exhaustive compilers
+    return kModeOpTable.name(op);
 }
 
 void LexerModeStack::push(LexerModeId mode) {

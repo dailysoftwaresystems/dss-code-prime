@@ -3,6 +3,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "mir/mir_opcode.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,34 @@
 namespace dss::opt::passes {
 
 namespace {
+
+// ── The shared REBUILD-TIME accumulator (header contract) ─────────────
+// `thread_local` so the driver's per-CU pool cannot interleave four CUs'
+// unit-stage rebuilds into one meaningless total.
+thread_local std::uint64_t gRebuildNs = 0;
+// Companion COUNT: instructions the rebuild half emitted. `rebuild ns /
+// this` is the per-instruction cost of the copy, which is what decides
+// whether the rebuild half is dominated by its hash maps or by the
+// arena append itself.
+thread_local std::uint64_t gRebuildInsts = 0;
+
+// RAII so every `rebuildFunction` exit — including a fail-loud abort's
+// stack — accounts its own time.
+struct RebuildTimerScope {
+    bool const on = optRebuildTraceEnabled();
+    std::chrono::steady_clock::time_point const t0 =
+        on ? std::chrono::steady_clock::now()
+           : std::chrono::steady_clock::time_point{};
+    ~RebuildTimerScope() {
+        if (!on) return;
+        gRebuildNs += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+    }
+    RebuildTimerScope() = default;
+    RebuildTimerScope(RebuildTimerScope const&)            = delete;
+    RebuildTimerScope& operator=(RebuildTimerScope const&) = delete;
+};
 
 // ★★★ THE ONE PLACE THIS FILE COMPOSES A FATAL, and the pass attribution is a
 // MANDATORY PARAMETER rather than an optional decoration
@@ -48,6 +77,53 @@ namespace {
 constexpr std::string_view kRebuilderSubject = "MirFunctionRebuilder";
 
 } // namespace
+
+void mirIdRemapOutOfRange(std::string_view which, std::uint32_t oldV,
+                          std::uint32_t base, std::uint32_t extent) {
+    std::fputs(std::format(
+        "dss::opt::passes::MirIdRemap fatal [map={}]: WRITE of old slot v={} "
+        "outside this function's range [{}, {}) — the rebuild believes a "
+        "foreign id belongs to the function it is emitting "
+        "(D-PERF-OPT-REBUILD-REMAP-IS-A-HASH-MAP).\n",
+        which, oldV, base, base + extent).c_str(), stderr);
+    std::fflush(stderr);
+    std::abort();
+}
+
+void mirIdRemapAbsent(std::string_view which, std::uint32_t oldV) {
+    std::fputs(std::format(
+        "dss::opt::passes::MirIdRemap fatal [map={}]: checked read of old slot "
+        "v={} which has no translation — a consumer read a rewrite entry the "
+        "rebuild never recorded (D-OPT2-REWRITE-MAP-COMPLETENESS).\n",
+        which, oldV).c_str(), stderr);
+    std::fflush(stderr);
+    std::abort();
+}
+
+bool optRebuildTraceEnabled() noexcept {
+    static bool const on = std::getenv("DSS_OPT_TRACE") != nullptr;
+    return on;
+}
+
+std::uint64_t optRebuildNsTake() noexcept {
+    std::uint64_t const v = gRebuildNs;
+    gRebuildNs = 0;
+    return v;
+}
+
+std::uint64_t optRebuildInstsTake() noexcept {
+    std::uint64_t const v = gRebuildInsts;
+    gRebuildInsts = 0;
+    return v;
+}
+
+void optRebuildInstsAdd(std::uint64_t n) noexcept { gRebuildInsts += n; }
+
+void optRebuildNsAdd(std::chrono::steady_clock::time_point t0) noexcept {
+    gRebuildNs += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+}
 
 GlobalClonePrelude
 cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
@@ -216,8 +292,8 @@ void MirRebuildPolicy::onZeroPhiIncomings(MirInstId oldPhi, MirBlockId oldBlock,
 }
 
 MirInstId MirFunctionRebuilder::rewriteOperand(MirInstId oldOp) const {
-    auto const it = rewrite_.find(oldOp.v);
-    if (it == rewrite_.end()) {
+    MirInstId const* const mapped = rewrite_.find(oldOp.v);
+    if (mapped == nullptr) {
         // ★ THE FATAL THAT MOTIVATED THE ROW. This text is identical for all
         // ~9 policies; `[pass=…]` is the only thing in it that says WHOSE
         // rebuild died, and last cycle its absence cost a whole `DSS_OPT_TRACE`
@@ -228,10 +304,13 @@ MirInstId MirFunctionRebuilder::rewriteOperand(MirInstId oldOp) const {
                         "skipped instruction "
                         "(D-OPT2-REWRITE-MAP-COMPLETENESS).", oldOp.v));
     }
-    return it->second;
+    return *mapped;
 }
 
 void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
+    // The shared rebuild-time accumulator (see the header). RAII so every
+    // return path — including the fail-loud ones — still accounts its time.
+    RebuildTimerScope const rebuildTimer_;
     // TF-C78 (D-CSUBSET-NOINLINE): `funcNoInline` rides along with
     // binding/visibility. ★ THIS IS THE LOAD-BEARING PROPAGATION SITE — this
     // rebuilder is the shared substrate under EVERY optimizer pass, so a flag
@@ -251,7 +330,7 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     // the time a cleared flag could matter.
     //
     // MEASURED CONSEQUENCE: dropping this argument leaves
-    // `MirLoweringCSubsetLinkage.AlwaysInlineBypassesThresholdInShippedRelease`
+    // `MirLoweringCLinkage.AlwaysInlineBypassesThresholdInShippedRelease`
     // GREEN — the end-to-end pin CANNOT detect this hop. Only the dedicated
     // flag-survival assertions catch it
     // (`MirRebuildHelper.RebuildFunctionPreservesAlwaysInline` and the
@@ -310,11 +389,18 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     // Phase 1: select + pre-create blocks. The policy decides which
     // blocks to walk (all blocks vs RPO-reachable subset etc.).
     auto const blocks = active_->selectBlocks(src_, oldFn);
-    blockMap_.clear();
-    blockMap_.reserve(blocks.size());
+    // ★★ SIZED TO THE WHOLE FUNCTION, NOT TO `blocks`. `blocks` is the
+    // POLICY-SELECTED subset, and a policy legitimately writes entries for
+    // blocks outside it (`absorbSuccessor` continues into a block that is NOT in
+    // `blocks` by contract). The remap's slot range is a WRITE BOUND that fails
+    // loud, so it must cover every OLD block id the rebuild can name — which is
+    // the function's whole (contiguous, ascending) block range.
+    std::uint32_t const fnBlockCount = src_.funcBlockCount(oldFn);
+    blockMap_.reset(fnBlockCount == 0 ? 0U : src_.funcBlockAt(oldFn, 0).v,
+                    fnBlockCount, "blockMap");
     for (MirBlockId const oldB : blocks) {
         MirBlockId const newB = dst_.createBlock(src_.blockMarker(oldB));
-        blockMap_.emplace(oldB.v, newB);
+        blockMap_.put(oldB.v, newB);
     }
 
     // Phase 2: fill blocks; defer Phi incomings to Phase 3. Capture
@@ -327,13 +413,13 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
         MirBlockId oldBlock;
     };
     std::vector<DeferredPhi> deferredPhis;
-    rewrite_.clear();
-    // ★★★ THE RESERVE IS SIZED TO THIS FUNCTION, NOT TO THE MODULE, AND THE
+    // ★★★ THE SIZING IS TO THIS FUNCTION, NOT TO THE MODULE, AND THE
     // DIFFERENCE WAS THE SINGLE LARGEST COST IN THE WHOLE OPTIMIZER
     // (D-OPT-REBUILD-REWRITE-MAP-RESERVES-THE-WHOLE-MODULE).
     //
-    // This line used to read `rewrite_.reserve(src_.instCount())`. `instCount()`
-    // is the MODULE's instruction arena size — every function's instructions,
+    // This site used to read `rewrite_.reserve(src_.instCount())`, back when
+    // `rewrite_` was a `std::unordered_map`. `instCount()` is the MODULE's
+    // instruction arena size — every function's instructions,
     // not this one's — while `rewrite_` only ever holds entries for the function
     // being rebuilt. On the merged whole-program module (3992 functions) every
     // pass therefore asked, 3992 times per pass per iteration, for a hash table
@@ -360,24 +446,57 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     // 4.4× across host operating systems while every other phase varied under 3×
     // — mapping and fault costs are the most OS-divergent thing a compiler can do.
     //
-    // ★ THE COUNT IS A SUM OVER THE SELECTED BLOCKS, AND IT IS A HINT RATHER THAN
-    // A BOUND. Policies legitimately add entries the source blocks do not account
-    // for — Mem2Reg's inserted phis, LICM's hoisted instructions, and the
-    // instructions of any block reached through `absorbSuccessor` (which is NOT
-    // in `blocks` by contract). All of those simply rehash, which is correct and
-    // cheap at this size. Undershooting a few hundred entries costs one rehash;
-    // overshooting by the whole module cost the seconds described above.
+    // ★ THE EXTENT IS A SPAN OVER ALL OF THE FUNCTION'S BLOCKS, AND IT IS A
+    // BOUND RATHER THAN A HINT. `MirIdRemap::put` fails loud outside its slot
+    // range, so the range must admit every OLD instruction id this rebuild can
+    // name. Policies legitimately record entries the SELECTED blocks do not
+    // account for — LICM's hoisted instructions, and the instructions of any
+    // block reached through `absorbSuccessor` (which is NOT in `blocks` by
+    // contract). Every one of those ids still belongs to THIS function, so the
+    // function's own [first inst, last inst] span admits them all while staying
+    // the same order of magnitude as the old per-function hint. (Mem2Reg's
+    // inserted phis are NOT in this map — they are keyed by marker in the
+    // policy's own table.) Sizing to `blocks` would turn an absorbed block's
+    // first `put` into a fatal; sizing to the whole module would re-introduce
+    // the row above in a shape no allocator profile would name.
+    std::uint32_t instBase   = 0;
+    std::uint32_t instExtent = 0;
+    {
+        std::uint32_t lo = UINT32_MAX;
+        std::uint32_t hi = 0;
+        for (std::uint32_t i = 0; i < fnBlockCount; ++i) {
+            MirBlockId const b   = src_.funcBlockAt(oldFn, i);
+            std::uint32_t const n = src_.blockInstCount(b);
+            if (n == 0) continue;
+            std::uint32_t const first = src_.blockInstAt(b, 0).v;
+            std::uint32_t const last  = src_.blockInstAt(b, n - 1).v;
+            if (first < lo) lo = first;
+            if (last  > hi) hi = last;
+        }
+        if (lo != UINT32_MAX) {
+            instBase   = lo;
+            instExtent = hi - lo + 1;
+        }
+    }
+    rewrite_.reset(instBase, instExtent, "rewrite");
+    // ★ `reserveHint` IS NOW PURELY THE TRACE INSTRUMENT — it is the count of
+    // instructions the rebuild half is about to walk (a sum over the SELECTED
+    // blocks), which is the denominator of the per-instruction rebuild cost the
+    // `DSS_OPT_TRACE` line reports. It is deliberately NOT the remap's sizing
+    // input: that one has to cover blocks this sum does not, per the note above.
     std::size_t reserveHint = 0;
     for (MirBlockId const oldB : blocks) {
         reserveHint += src_.blockInstCount(oldB);
     }
-    rewrite_.reserve(reserveHint);
+    if (optRebuildTraceEnabled()) {
+        optRebuildInstsAdd(static_cast<std::uint64_t>(reserveHint));
+    }
 
     for (MirBlockId const oldB : blocks) {
         MirBlockId const newB = blockMap_.at(oldB.v);
         dst_.beginBlock(newB);
-        // Mem2Reg's IDF-phi-insertion site (D-OPT-MIR-REBUILDER-
-        // ONBLOCKBEGIN-HOOK). Default no-op for every other pass.
+        // Mem2Reg's IDF-phi-insertion site (D-OPT-MIR-REBUILDER-ONBLOCKBEGIN-HOOK).
+        // Default no-op for every other pass.
         active_->onBlockBegin(oldB, newB, dst_, rewrite_, blockMap_);
 
         // Walk source-block insts. If a block-merge policy chooses to
@@ -416,7 +535,7 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
                 if (!active_->shouldEmit(oldId)) continue;
                 if (op == MirOpcode::Phi) {
                     MirInstId const newPhi = dst_.addPhi(src_.instType(oldId));
-                    rewrite_.emplace(oldId.v, newPhi);
+                    rewrite_.put(oldId.v, newPhi);
                     deferredPhis.push_back({oldId, newPhi, oldB});
                     continue;
                 }
@@ -444,8 +563,8 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
             if (!active_->acceptPhiIncoming(inc, dp.oldBlock, blockMap_)) continue;
             MirBlockId const redirectedPred =
                 active_->redirectBlockTarget(inc.pred);
-            auto const predIt = blockMap_.find(redirectedPred.v);
-            if (predIt == blockMap_.end()) {
+            MirBlockId const* const predNew = blockMap_.find(redirectedPred.v);
+            if (predNew == nullptr) {
                 // After `acceptPhiIncoming` admitted this incoming AND
                 // `redirectBlockTarget` resolved its pred, the result
                 // must be in the surviving blockMap. Reaching here
@@ -467,7 +586,7 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
             }
             MirInstId const newVal = mapOperand(inc.value);
             dst_.addPhiIncoming(dp.newPhi,
-                                MirPhiIncoming{newVal, predIt->second});
+                                MirPhiIncoming{newVal, *predNew});
             ++kept;
         }
         if (kept == 0) {
@@ -500,7 +619,7 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
         MirInstId const newId = dst_.addConst(
             src_.literalValue(src_.constLiteralIndex(oldId)),
             src_.instType(oldId));
-        rewrite_.emplace(oldId.v, newId);
+        rewrite_.put(oldId.v, newId);
         return;
     }
     if (op == MirOpcode::Arg) {
@@ -509,18 +628,17 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
         // must thread the position or it silently defaults to the ordinal and
         // the inliner mis-maps mixed-class actuals. Every pass drives this
         // rebuilder (Identity is the FIRST release pass), so a wipe here kills
-        // the position before Inlining runs (D-OPT-RELEASE-SYSV-MIXED-CLASS-
-        // REG-ARG-DROP).
+        // the position before Inlining runs (D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP).
         MirInstId const newId = dst_.addArg(src_.argIndex(oldId),
                                             src_.instType(oldId),
                                             src_.argPosition(oldId));
-        rewrite_.emplace(oldId.v, newId);
+        rewrite_.put(oldId.v, newId);
         return;
     }
     if (op == MirOpcode::GlobalAddr) {
         MirInstId const newId = dst_.addGlobalAddr(
             src_.globalAddrSymbol(oldId), src_.instType(oldId));
-        rewrite_.emplace(oldId.v, newId);
+        rewrite_.put(oldId.v, newId);
         return;
     }
     if (op == MirOpcode::BlockAddress) {
@@ -533,8 +651,8 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
         // the map; abort loud if not (a policy bug) rather than miscompile.
         MirBlockId const oldTarget = src_.blockAddressTarget(oldId);
         MirBlockId const redirected = active_->redirectBlockTarget(oldTarget);
-        auto const it = blockMap_.find(redirected.v);
-        if (it == blockMap_.end()) {
+        MirBlockId const* const targetNew = blockMap_.find(redirected.v);
+        if (targetNew == nullptr) {
             rebuildFatal(kRebuilderSubject, policy_.passName(),
                 std::format("BlockAddress target old v={} (redirected v={}) not "
                             "in blockMap_ — an address-taken block was "
@@ -542,9 +660,9 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
                             "Originating BlockAddress: old MirInstId v={}.",
                             oldTarget.v, redirected.v, oldId.v));
         }
-        MirInstId const newId = dst_.addBlockAddress(it->second, src_.instType(oldId),
+        MirInstId const newId = dst_.addBlockAddress(*targetNew, src_.instType(oldId),
                                                      src_.instFlags(oldId));
-        rewrite_.emplace(oldId.v, newId);
+        rewrite_.put(oldId.v, newId);
         return;
     }
 
@@ -553,7 +671,7 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
     // uses substituteOldOperand instead so the dead Phi stays for DCE.
     if (auto rewritten = active_->tryRewrite(op, oldId, dst_, rewrite_);
         rewritten.has_value()) {
-        rewrite_.emplace(oldId.v, *rewritten);
+        rewrite_.put(oldId.v, *rewritten);
         return;
     }
 
@@ -577,7 +695,7 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
         MirInstId const newId = dst_.addInlineAsm(src_.asmDescriptor(oldId), newAsmOps,
                                                   src_.instType(oldId),
                                                   src_.instFlags(oldId));
-        rewrite_.emplace(oldId.v, newId);
+        rewrite_.put(oldId.v, newId);
         return;
     }
 
@@ -597,7 +715,7 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
                                          // rebuild (else a release pipeline drops
                                          // the over-alignment → silent under-align).
                                          src_.instPayload2(oldId));
-    rewrite_.emplace(oldId.v, newId);
+    rewrite_.put(oldId.v, newId);
 }
 
 void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
@@ -613,7 +731,7 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
     // full reasoning (and why neither `false` answer survived measurement) is in
     // the header where the hook used to be declared.
     auto remember = [&](MirInstId newId) {
-        rewrite_.emplace(oldId.v, newId);
+        rewrite_.put(oldId.v, newId);
     };
     // Per-terminator full-replacement hook (branch-folding etc.).
     // Returning a value short-circuits the standard emit arms.
@@ -624,8 +742,8 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
     }
     auto mapSucc = [&](MirBlockId oldS) -> MirBlockId {
         MirBlockId const redirected = active_->redirectBlockTarget(oldS);
-        auto const it = blockMap_.find(redirected.v);
-        if (it == blockMap_.end()) {
+        MirBlockId const* const succNew = blockMap_.find(redirected.v);
+        if (succNew == nullptr) {
             rebuildFatal(kRebuilderSubject, policy_.passName(),
                 std::format("emitTerminator successor old v={} (redirected to "
                             "v={}) not in blockMap_ — either `selectBlocks` "
@@ -634,7 +752,7 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
                             "Originating terminator: old MirInstId v={}.",
                             oldS.v, redirected.v, oldId.v));
         }
-        return it->second;
+        return *succNew;
     };
     switch (op) {
         case MirOpcode::Br: {

@@ -1,6 +1,6 @@
 // DSS Code Prime — integration tests.
 //
-// Drives the compiled `dss-code-prime` executable as a SUBPROCESS
+// Drives the compiled `dsscp` executable as a SUBPROCESS
 // (vs the in-process `Program::compileFiles` path exercised by
 // `tests/examples/examples_runner`). The two paths share the
 // curated `examples/` corpus but exercise different surfaces:
@@ -11,6 +11,25 @@
 //     codes, filesystem layout, output routing). Slower per
 //     example but catches CLI-level regressions the in-process
 //     path misses.
+//
+// ★★★ THE COVERAGE BOUNDARY, AND ITS COMPLEMENT — the half that was missing.
+// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+//
+//   BOTH runners compile the target this host can execute, and both run it.
+//   Only the IN-PROCESS runner compiles a target whose `runOn` excludes this
+//   host. NEITHER spawns a binary the host cannot execute.
+//
+// The FIRST sentence of that rule — this runner's own half — has been stated
+// here and in `integrated_tests/CMakeLists.txt` since 2026-06-02. The SECOND
+// was stated for corpus authors in `examples/README.md` and NOWHERE ELSE, and
+// nothing checked it: a change that stopped the sibling compiling cross-host
+// targets would leave every cross-target capability without a witness, with
+// both corpus suites still green. ⚠ The shared arm-verdict vocabulary cannot
+// carry the distinction either — `SkippedByRunOn` means *compiled, not spawned*
+// in the sibling and *never compiled* here. The `integrated_tests/coverage-
+// boundary` entry (`runCoverageBoundaryJudge` below) now RUNS both harnesses on
+// one corpus example and judges the two coverage reports; the vocabulary and
+// the five clauses live in `tests/test_support/coverage_boundary.hpp`.
 //
 // **Always against current host platform** (user invariant
 // 2026-06-02): each example's manifest declares a per-target
@@ -24,8 +43,7 @@
 // run somewhere). ⚠ `runOn` names an OS, NOT a machine: two arms
 // can both say `linux` while only one of them can execute here,
 // which is exactly how a native aarch64 host came to verify
-// nothing at all (D-TEST-INTEGRATED-TESTS-CANNOT-PASS-ON-A-NATIVE-
-// ARM64-LINUX-HOST).
+// nothing at all (D-TEST-INTEGRATED-TESTS-CANNOT-PASS-ON-A-NATIVE-ARM64-LINUX-HOST).
 //
 // A SKIP IS NOT A PASS (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT). Every
 // DECLARED target arm of every manifest — including the ones this runner's
@@ -64,7 +82,7 @@
 //
 // PROJECT MODE (D-EXAMPLES-RUNNER-PROJECT-MANIFEST): a manifest may name a
 // `.dss-project.json` via the top-level `"project"` key INSTEAD of
-// `source`/`sources`, and this runner then drives `dss-code-prime --project`
+// `source`/`sources`, and this runner then drives `dsscp --project`
 // instead of `--compile`. That is the only CLI mode which expands the
 // manifest's source GLOBS and runs its `preBuildScripts`/`postBuildScripts`
 // hooks, so it is the only way the corpus can witness a build script that
@@ -76,6 +94,16 @@
 // implemented identically in the in-process sibling.
 
 #include "arm_verdict_ledger.hpp"
+// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+// The COVERAGE BOUNDARY vocabulary — one grammar, emitted by both runners and
+// parsed by the boundary guard. Its header states the boundary as a sentence;
+// this runner's own statement of its half is in the block above `runExampleViaCli`.
+#include "coverage_boundary.hpp"
+#include "host_native_target.hpp"  // hostNativeTarget / hostExeArtifact — the
+                                   // source-argument-shape pin BUILDS AND SPAWNS
+                                   // its own output, so it must build for this
+                                   // machine (do not rely on the transitive
+                                   // include through arm_verdict_ledger.hpp)
 #include "repo_root.hpp"
 #include "run_binary.hpp"
 #include "stage_tree.hpp"  // recursive corpus staging — ONE copy, shared with
@@ -126,6 +154,12 @@ namespace {
 using ::dss::test_support::ArmVerdict;
 using ::dss::test_support::ArmVerdictLedger;
 using ::dss::test_support::armVerdictName;
+using ::dss::test_support::CoverageReport;
+using ::dss::test_support::findCoverageReport;
+using ::dss::test_support::judgeCoverageBoundary;
+using ::dss::test_support::kCoverageRunnerCli;
+using ::dss::test_support::kCoverageRunnerInProcess;
+using ::dss::test_support::renderCoverageLine;
 using ::dss::test_support::currentHostArch;
 using ::dss::test_support::currentHostOs;
 using ::dss::test_support::DeclaredArm;
@@ -182,6 +216,12 @@ enum class OnlyKind {
     // exactly one check — two entries for one scope, so a reader triaging "a
     // corpus-wide thing is red" had to know which to open.
     Adjudicate,
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // ★ SELECTS its own subject from the corpus, then DEGRADES ITSELF INTO
+    // `OneExample` so the CLI half of the measurement goes through the very code
+    // path a per-example entry uses — a boundary guard that measured a private
+    // code path would be measuring something no ctest entry runs.
+    CoverageBoundary,
 };
 
 struct Selector {
@@ -215,10 +255,36 @@ std::vector<DeclaredArm> declaredArms;
 // SEPARATE from `declaredArms.size()` so [Test 4]'s non-vacuity guard can tell
 // "the corpus root produced no manifest" apart from "manifests were read but
 // not one of them declared a runOn host" — the two distinct diagnostics the
-// in-process twin gives at tests/examples/examples_runner.cpp:1227 and :1230.
+// in-process twin gives in `ExamplesCorpusLint.EveryArmAgreesWithItsSiblingsOnTheEmulator`
+// (`ASSERT_GT(manifestCount, 0u)` and `ASSERT_FALSE(arms.empty())`).
 // Either state makes the lint vacuous; they have different causes and
 // different fixes, so collapsing them would cost the reader the fix.
 std::size_t manifestsWalked = 0;
+
+// ── D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY ──
+//
+// The SIBLING runner's executable, supplied by the ctest registration of the
+// coverage-boundary entry. EMPTY on every other invocation: no other entry
+// spawns the in-process harness, and a default path that quietly went looking
+// for one would be a second way to fail.
+fs::path g_siblingRunner;
+
+// This runner's OWN coverage observation for the example it just walked. Global
+// for exactly the reason `passes` / `failures` / `armLedger` are: one process,
+// one corpus walk, one summary. ★ `std::optional` and not a default-constructed
+// report, because "the walk executed no example" and "the walk executed an
+// example that compiled nothing" are different facts and the boundary guard
+// must be able to refuse the first rather than judge it as the second.
+std::optional<CoverageReport> g_cliCoverage;
+
+// Print a coverage line AND publish it. ONE function, so no exit path can do
+// half of it — a printed-but-unpublished report would leave the guard reading a
+// stale observation, and a published-but-unprinted one would vanish from the
+// log a human triages with.
+void emitCoverage(CoverageReport const& r) {
+    std::cout << renderCoverageLine(r) << "\n";
+    g_cliCoverage = r;
+}
 
 void check(std::string const& description, bool condition,
            std::string const& detail = "") {
@@ -373,6 +439,24 @@ struct DependsOnArtifact {
     bool                     mustDifferFromBaseline = false;
 };
 
+// D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+// one library input the corpus CONSUMES WITHOUT BUILDING IT. Mirrors the
+// in-process examples_runner's `PrebuiltLibrary` field-for-field so BOTH corpus
+// harnesses accept — and REFUSE — the same manifests.
+//
+// ★ WHY THE CORPUS NEEDED A SECOND SHAPE AT ALL: every `dependsOn` entry names
+// `sources` and the runner COMPILES them with DSS, so every library the corpus
+// links is one DSS produced in this same run. An archive somebody ELSE built was
+// therefore inexpressible — and the BSD `ar` container is exactly that class,
+// since DSS's own `ar` writer emits the GNU/SysV container only. See the
+// in-process sibling's struct for the full rationale, including why the path is
+// repo-root-relative and why `containerWitness` is required rather than
+// optional.
+struct PrebuiltLibrary {
+    std::string path;              // REPO-ROOT-RELATIVE; prebuiltLibraryPathRefusal owns the rule
+    std::string containerWitness;  // ASCII token that MUST appear in the bytes
+};
+
 // The IDENTITY of one prerequisite within an arm's build — the SAME spelling
 // the in-process sibling's `dependencyImageKey` produces, so a failure line
 // from either harness names a dependency the same way.
@@ -473,6 +557,13 @@ struct ExampleTarget {
     // Empty (the default) ⇒ a plain single-artifact build. Mirrors the
     // in-process examples_runner.
     std::vector<DependsOnArtifact> dependsOn;
+    // D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+    // library inputs this target links WITHOUT BUILDING — resolved against the
+    // repo root, verified, and threaded into the SAME `--resolve-library` set
+    // the `dependsOn` artifacts go into. Empty (the default) ⇒ every pre-P32
+    // example's CLI invocation is byte-identical to what it was. Mirrors the
+    // in-process examples_runner.
+    std::vector<PrebuiltLibrary> prebuiltLibraries;
 };
 
 // V2-4 Part C (D-DIAG-CLI-POSITION-RENDER-AND-ASSERT): one declared
@@ -496,7 +587,7 @@ struct ExpectedDiagnostic {
 struct ExampleManifest {
     std::string                language;
     // D-EXAMPLES-RUNNER-PROJECT-MANIFEST: PROJECT MODE. Present ⇒ this example is
-    // built by `dss-code-prime --project <file>` from the named
+    // built by `dsscp --project <file>` from the named
     // `.dss-project.json` (relative to the example dir) instead of by
     // `--compile <sources>`. MUTUALLY EXCLUSIVE with `source`/`sources`; see the
     // in-process examples_runner's copy of this field for the full rationale,
@@ -620,6 +711,87 @@ struct ExampleManifest {
             if (!parseDependsOnEntry(nested, path, nestedDep)) return false;
             out.dependsOn.push_back(std::move(nestedDep));
         }
+    }
+    return true;
+}
+
+// D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+// parse ONE `prebuiltLibraries` entry. A behavioural mirror of the in-process
+// examples_runner's `parsePrebuiltLibraryEntry`, spelled with this runner's
+// `std::cerr` + `return false` convention instead of gtest's `ADD_FAILURE`.
+//
+// ⚠ THE MIRROR IS THE POINT, not a convenience: a manifest one runner accepts
+// and the other rejects is the silent harness bug
+// [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] exists to catch. BOTH fields are
+// required in both runners — a missing `path` has nothing to link, and a
+// missing `containerWitness` is an input nobody stated a property of.
+// ★★★ THE PATH RULE JUDGES THE STRING, NEVER `std::filesystem`, and that is a
+// MEASURED correction: `fs::path{"/abs/x"}.is_absolute()` is TRUE on Linux and
+// FALSE on Windows (a Windows absolute path needs a root NAME too), so a rule
+// built on it would refuse a manifest on one leg and accept the same bytes on
+// another. Mirrors the in-process sibling's helper of the same name, clause for
+// clause. Returns the refusal, or an empty string when the path is acceptable.
+[[nodiscard]] std::string prebuiltLibraryPathRefusal(std::string const& p) {
+    // Guarded rather than left to the caller's discipline: `front()` on an
+    // empty string is undefined, and a helper safe only by its caller's habits
+    // is a defect waiting for its second caller.
+    if (p.empty()) return "must not be empty";
+    if (p.front() == '/' || p.front() == '\\') {
+        return "must be RELATIVE to the repository root, and this one begins at"
+               " a root directory";
+    }
+    if (p.find(':') != std::string::npos) {
+        return "must be RELATIVE to the repository root, and ':' can only"
+               " introduce a drive or device";
+    }
+    if (p.find('\\') != std::string::npos) {
+        return "must be spelled with '/' separators — a '\\' opens on Windows"
+               " and not on POSIX, so the manifest would mean two things";
+    }
+    if (p.find("..") != std::string::npos) {
+        return "must not contain '..' — a corpus example must not reach outside"
+               " the repository";
+    }
+    return {};
+}
+
+[[nodiscard]] bool parsePrebuiltLibraryEntry(nlohmann::json const& p,
+                                             fs::path const&       path,
+                                             PrebuiltLibrary&      out) {
+    if (!p.is_object()) {
+        std::cerr << "  'prebuiltLibraries' entries must be objects in "
+                  << path.generic_string() << "\n";
+        return false;
+    }
+    // ★ THE CLOSED PER-ENTRY KEY SET RUNS FIRST, and the order is a MEASURED
+    // correction rather than a style choice: `containerWitnesss` blanks the very
+    // field it typo'd, so with the required-field check first the author was
+    // told a field was MISSING while the typo that made it missing went
+    // unnamed. Mirrors the in-process sibling, which carries the full note.
+    for (auto const& [k, unusedV] : p.items()) {
+        (void)unusedV;
+        if (k == "path" || k == "containerWitness" || k.starts_with("$")) continue;
+        std::cerr << "  'prebuiltLibraries' entry declares unknown key '" << k
+                  << "' — the runner reads path / containerWitness (plus"
+                     " $comment keys). An expectation the runner does not read"
+                     " is an assertion that never fires: "
+                  << path.generic_string() << "\n";
+        return false;
+    }
+    out.path             = p.value("path", "");
+    out.containerWitness = p.value("containerWitness", "");
+    if (out.path.empty() || out.containerWitness.empty()) {
+        std::cerr << "  'prebuiltLibraries' entry needs non-empty 'path'"
+                     " (repo-root-relative) and 'containerWitness' (an ASCII"
+                     " token that must appear in the file's bytes) in "
+                  << path.generic_string() << "\n";
+        return false;
+    }
+    if (std::string const why = prebuiltLibraryPathRefusal(out.path);
+        !why.empty()) {
+        std::cerr << "  'prebuiltLibraries' 'path' " << why << " (got '"
+                  << out.path << "') in " << path.generic_string() << "\n";
+        return false;
     }
     return true;
 }
@@ -894,14 +1066,16 @@ struct ExampleManifest {
             (void)unusedV;
             if (k == "spec" || k == "artifact" || k == "runOn"
                 || k == "emulator" || k == "expectedStdout" || k == "exitCode"
-                || k == "dependsOn" || k.starts_with("$")) {
+                || k == "dependsOn" || k == "prebuiltLibraries"
+                || k.starts_with("$")) {
                 continue;
             }
             std::cerr << "  target '" << et.spec << "' declares unknown key '"
                       << k << "' — the runner reads spec / artifact / runOn /"
-                         " emulator / expectedStdout / exitCode / dependsOn"
-                         " (plus $comment keys). An expectation the runner does"
-                         " not read is an assertion that never fires: "
+                         " emulator / expectedStdout / exitCode / dependsOn /"
+                         " prebuiltLibraries (plus $comment keys). An"
+                         " expectation the runner does not read is an assertion"
+                         " that never fires: "
                       << path.generic_string() << "\n";
             return false;
         }
@@ -941,6 +1115,25 @@ struct ExampleManifest {
                 DependsOnArtifact dep;
                 if (!parseDependsOnEntry(d, path, dep)) return false;
                 et.dependsOn.push_back(std::move(dep));
+            }
+        }
+        // D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+        // optional library inputs this target links WITHOUT building — an
+        // archive this repository did not produce. Mirrors the in-process
+        // examples_runner, refusal for refusal.
+        if (t.contains("prebuiltLibraries")) {
+            if (!t.at("prebuiltLibraries").is_array()
+                || t.at("prebuiltLibraries").empty()) {
+                std::cerr << "  target 'prebuiltLibraries' must be a NON-EMPTY"
+                             " array — an empty one declares a capability the"
+                             " build then never exercises: "
+                          << path.generic_string() << "\n";
+                return false;
+            }
+            for (auto const& p : t.at("prebuiltLibraries")) {
+                PrebuiltLibrary lib;
+                if (!parsePrebuiltLibraryEntry(p, path, lib)) return false;
+                et.prebuiltLibraries.push_back(std::move(lib));
             }
         }
         out.targets.push_back(std::move(et));
@@ -1117,7 +1310,7 @@ struct ExampleManifest {
 // The FORMAT half of a manifest spec ("x86_64:pe64-x86_64-windows-exec" →
 // "pe64-x86_64-windows-exec") — the subdirectory a PROJECT build routes its
 // artifact into, because `Program::compileProject` forces
-// `setPerFormatOutputSubdir(true)` (src/program/program.cpp:1760) even for a
+// `setPerFormatOutputSubdir(true)` (`Program::compileProject`) even for a
 // single-target build. Empty ⇒ the spec has no ':' and the caller fails loud
 // rather than composing a wrong path.
 //
@@ -1272,7 +1465,7 @@ struct CwdGuard {
 
 // D-EXAMPLES-RUNNER-MULTI-ARTIFACT + nested extension (CLI-subprocess mirror of
 // the in-process examples_runner's buildDependencyArtifact): build ONE
-// prerequisite LIBRARY via a `dss-code-prime` SUBPROCESS, RECURSIVELY building
+// prerequisite LIBRARY via a `dsscp` SUBPROCESS, RECURSIVELY building
 // its own nested `dependsOn` FIRST (into the same out dir) and threading their
 // paths into THIS dep's `--resolve-library`. So a fat `-staticlib` dep that
 // nests an input `-staticlib` MERGES it (D-FF1-STATICLIB-FAT-ARCHIVE): the
@@ -1301,6 +1494,83 @@ struct CwdGuard {
 // threading the arm while its sibling shrugs is a SILENT harness bug, and here
 // it would have been invisible, because a half-optimized program still builds,
 // still runs, and still returns the baseline's exit code.
+// D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+// resolve ONE declared prebuilt library against the repository root and PROVE
+// it is the file the manifest says it is. A behavioural mirror of the
+// in-process examples_runner's `resolvePrebuiltLibrary` — same resolution rule,
+// same three checks, same order — spelled with this runner's `check` idiom.
+//
+// ★★★ EVERY FAILURE HERE IS A HARD [FAIL], NEVER A SKIP. An input the manifest
+// ASKED FOR and the tree could not supply is a defect in the tree, and the
+// corpus already paid for this lesson once: `environ_alias_object_identity`
+// spends a whole exit code (10) on *the witness is absent* so that a deleted
+// prebuilt file cannot read as a pass.
+//
+// ONE `check` for the whole resolution, with the three causes kept
+// DISTINGUISHABLE in its detail — they send a reader to three different places:
+// the path is wrong / the file is unreadable or truncated / the file is no
+// longer the container the manifest claims.
+[[nodiscard]] std::optional<fs::path>
+resolvePrebuiltLibraryCli(PrebuiltLibrary const& lib,
+                          std::string const&     exampleName) {
+    fs::path root;
+    try {
+        root = ::dss::test::repoRoot();
+    } catch (std::exception const& e) {
+        check(exampleName + ": prebuiltLibraries '" + lib.path
+                  + "' resolves against the repository root",
+              false, std::string{"cannot resolve the repo root: "} + e.what());
+        return std::nullopt;
+    }
+    auto const     resolved = root / lib.path;
+    std::string    why;
+    std::string    bytes;
+    std::error_code ec;
+    if (bool const regular = fs::is_regular_file(resolved, ec); !regular || ec) {
+        // ⚠ The "never a skip" clause is on BOTH sub-branches, not just the
+        // clean-absence one: ✔MEASURED, `is_regular_file` reports a missing
+        // path through `ec` on this host, so putting the sentence on the other
+        // branch alone would have hidden it in exactly the commonest case.
+        why = "not a regular file at " + resolved.generic_string()
+            + (ec ? " (" + ec.message() + ")" : "")
+            + " — a library input the manifest asked for and the tree could not"
+              " supply is a FAILURE, never a skip";
+    } else {
+        auto const declaredSize = fs::file_size(resolved, ec);
+        std::ifstream in(resolved.string(), std::ios::binary);
+        if (in) {
+            bytes.assign(std::istreambuf_iterator<char>(in),
+                         std::istreambuf_iterator<char>{});
+        }
+        // Cross-checked against `file_size` and required non-empty, for the same
+        // reason the in-process sibling does it: a short read reaches the
+        // witness search as a PREFIX, and a prefix that stops before the witness
+        // reports "this is not the declared container" about a file that is.
+        if (ec || bytes.empty()
+            || static_cast<std::uintmax_t>(bytes.size()) != declaredSize) {
+            why = "could not read " + resolved.generic_string()
+                + " whole (file_size "
+                + (ec ? std::string{"<unreadable>"} : std::to_string(declaredSize))
+                + " bytes, read " + std::to_string(bytes.size()) + ")";
+        } else if (bytes.find(lib.containerWitness) == std::string::npos) {
+            why = resolved.generic_string() + " (" + std::to_string(bytes.size())
+                + " bytes) does not contain the declared containerWitness '"
+                + lib.containerWitness
+                + "'. The manifest links this file for the sake of the container"
+                  " it is in; a regenerated fixture in a DIFFERENT container"
+                  " would still resolve the same symbols and this example would"
+                  " go on passing with the property it exists to witness no"
+                  " longer present";
+        }
+    }
+    check(exampleName + ": prebuilt library " + lib.path
+              + " is present and carries its declared containerWitness '"
+              + lib.containerWitness + "'",
+          why.empty(), why);
+    if (!why.empty()) return std::nullopt;
+    return resolved;
+}
+
 [[nodiscard]] std::optional<fs::path>
 buildDependsOnArtifactCli(std::string const&       compiler,
                           DependsOnArtifact const& dep,
@@ -1405,6 +1675,12 @@ struct CliArmOutcome {
     // arm's image with the baseline's, and that comparison is host-independent.
     fs::path    artifactPath;
     bool        compiled = false;
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // The ATTEMPT to exec, not its outcome. `verdict == Ran` cannot stand in for
+    // it: a spawn that FAILED is `Poisoned`, and the coverage-boundary clause
+    // that forbids exec'ing a foreign-host artifact must catch the attempt
+    // whether or not this machine let it succeed.
+    bool        spawnAttempted = false;
     // Every PREREQUISITE image this arm produced, keyed by
     // `dependencyImageKey`. PATHS rather than bytes — unlike the in-process
     // sibling, whose arms build inside an RAII scratch dir that is gone before
@@ -1431,7 +1707,7 @@ struct CliArmOutcome {
 // be satisfied by a build that never received the flag.
 //
 // ✔MEASURED 2026-08-17 (the control experiment that makes this sound, run before
-// the instrument was written): compiling `examples/c-subset/array_decay/main.c`
+// the instrument was written): compiling `examples/c/array_decay/main.c`
 // for `x86_64:pe64-x86_64-windows-exec` TWICE into two DIFFERENT output
 // directories produced BYTE-IDENTICAL images, and the same source at
 // `--config=release` produced a DIFFERENT one (first difference at byte 401).
@@ -1498,7 +1774,7 @@ std::size_t dependencyImagesDiffered  = 0;
 }
 
 // Drive ONE ARM of one example's SELECTED target through the CLI subprocess path:
-//   1. spawn `dss-code-prime --compile <src> --language <l> --target <spec> --output <outdir> [--config=<name>]`
+//   1. spawn `dsscp --compile <src> --language <l> --target <spec> --output <outdir> [--config=<name>]`
 //   2. check rc == 0
 //   3. check artifact file exists at outdir/<artifact>
 //   4. spawn artifact, capture exit code (and, when pinned, stdout) via run_binary.hpp
@@ -1544,7 +1820,7 @@ std::size_t dependencyImagesDiffered  = 0;
     // mirrors every regular file except the manifest into its scratch dir and
     // then makes that dir the CWD; this runner did neither, so an example that
     // needs a file AT RUN TIME passed in-process and failed here. Measured on
-    // exactly that: `examples/c-subset/environ_alias_object_identity` ships a
+    // exactly that: `examples/c/environ_alias_object_identity` ships a
     // prebuilt gcc-built `.so` it dlopens as `./libdss_env_probe_<arch>.so`
     // (an OBJECT-IDENTITY property cannot be witnessed by one image, so the
     // example needs a second image DSS did not build) — green in-process,
@@ -1588,6 +1864,18 @@ std::size_t dependencyImagesDiffered  = 0;
     // leave the arm witnessing the pipeline over only part of its own program.
     // See the ★ note on buildDependsOnArtifactCli.
     std::string resolveArgs;
+    // D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+    // the PREBUILT inputs first, then the ones this arm built. Order is fixed
+    // (and identical in the in-process sibling) so the `--resolve-library`
+    // sequence a manifest produces is a property of the manifest alone.
+    for (auto const& lib : target->prebuiltLibraries) {
+        auto resolved = resolvePrebuiltLibraryCli(lib, armName);
+        if (!resolved.has_value()) {  // check already fired
+            return {ArmVerdict::Poisoned,
+                    "prebuilt library " + lib.path + " did not resolve"};
+        }
+        resolveArgs += " --resolve-library " + quote(resolved->string());
+    }
     std::map<std::string, fs::path> builtDependencyImages;
     for (auto const& dep : target->dependsOn) {
         auto depArtifact = buildDependsOnArtifactCli(
@@ -1628,8 +1916,23 @@ std::size_t dependencyImagesDiffered  = 0;
     //
     // Scoped to PROJECT MODE deliberately. A `--compile` invocation is handed
     // ABSOLUTE source paths, so its behaviour does not depend on the cwd, and
-    // moving 580 existing examples' compiles onto a different working directory
+    // moving every existing example's compile onto a different working directory
     // would be an unmeasured change riding along with this one.
+    //
+    // ★★ AND THAT SCOPING IS EXACTLY WHY THE CORPUS COULD NOT SEE
+    // `D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH`
+    // (`D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH`). The
+    // absolute path is the one shape of the four a user can type, and until
+    // `runSourceArgumentShapePin` landed, the other three — `main.c`,
+    // `sub/main.c`, `./main.c` — were exercised by nothing in this repository at
+    // the CLI tier. ⇒ THE GAP IS CLOSED BY THAT PIN, NOT BY THIS CALL SITE, and
+    // deliberately so: the argument SHAPE is a property of the invocation, not
+    // of an example, so it is ONE existence claim on the `cli-surface` entry
+    // rather than a manifest key minted to serve ONE manifest out of the whole
+    // corpus. Its
+    // in-process twin is `tests/program/test_source_argument_shape.cpp`. Do NOT
+    // "close the gap properly" by moving this scope: that changes the compile
+    // input for the whole corpus and still leaves exactly one shape covered.
     bool const projectMode = m.project.has_value();
     std::string projectArg;
     if (projectMode) {
@@ -1787,7 +2090,7 @@ std::size_t dependencyImagesDiffered  = 0;
 
     // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT: THE case this defect is about — these two are the checks a RED run reaches, and in their throwing form a failing example killed the runner rather than naming itself.
     // D-AP2-OUTPUT-ROUTING: a PROJECT build forces `setPerFormatOutputSubdir(true)`
-    // (src/program/program.cpp:1760), so its artifact is at
+    // (in `Program::compileProject`), so its artifact is at
     // `<outDir>/<formatName>/<name><ext>`, NOT at `<outDir>/<artifact>`.
     // COMPUTED EXPLICITLY rather than folded into the manifest string: spelling
     // the target's `artifact` as `"pe64-x86_64-windows-exec/main.exe"` composes
@@ -1815,12 +2118,19 @@ std::size_t dependencyImagesDiffered  = 0;
     // exit carries it, because the arm-vs-baseline artifact comparison is
     // host-independent and must survive a run this MACHINE cannot perform: a box
     // with no emulator still proves the two pipelines produced different code.
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // Set at the exec site below and read by EVERY outcome built after it, so
+    // no exit path can report a spawn attempt as not having happened — the
+    // failing paths (`spawn failed`, `spawn timed out`) are precisely the ones a
+    // clause about foreign-host execs must still see.
+    bool spawnAttempted = false;
     auto const compiledOutcome = [&](ArmVerdict v, std::string why) {
         CliArmOutcome o;
         o.verdict      = v;
         o.detail       = std::move(why);
         o.artifactPath = artifactPath;
         o.compiled     = true;
+        o.spawnAttempted = spawnAttempted;
         // Carried on the SAME reasoning as `artifactPath` directly above: the
         // prerequisite images are a fact about the COMPILE, so a box that
         // cannot spawn the binary can still answer whether the arm's pipeline
@@ -1892,8 +2202,28 @@ std::size_t dependencyImagesDiffered  = 0;
         // Capturing unconditionally would swap every example's inherited stdio
         // for a pipe — a behavioural change to 597 examples riding along with a
         // harness fix, and one that examples never pinned would never notice.
+        // D-TEST-WALL-CLOCK-LITERAL-INVENTORY-IS-DEBT: the deadline was a bare
+        // `chrono::milliseconds{5000}` here — a wall-clock number sized by
+        // nobody, in the one call this harness makes ~618 times.
+        //
+        // ★ `kRunBudget` AND NOT `kWaitBudget`, AND THE DISTINCTION IS THE WHOLE
+        // POINT OF A NAMED BUDGET. ✔MEASURED in `tests/test_support/`:
+        // `kRunBudget` is 5000 ms and its docblock sizes it as ">2x the worst
+        // WARM latency ever measured" for a COMPILED PROGRAM — which is exactly
+        // what this call spawns — while `kWaitBudget` is 60 s and is sized for a
+        // test WAITING on something that should already have happened. Routing
+        // this site through the wait budget would have multiplied every
+        // example's hang ceiling by twelve and mis-described a run as a wait;
+        // `kRunBudget` carries the measurement that actually sized THIS number
+        // and is byte-identical in value, so the change is a naming of intent
+        // and not a behaviour change.
+        //
+        // ⚠ It is `runBinary`'s own DEFAULT for this parameter, and it is passed
+        // explicitly anyway: `captureStdout` and `launcherPrefix` follow it
+        // positionally, so the default cannot be reached by omission here.
+        spawnAttempted = true;  // the ATTEMPT, recorded BEFORE the outcome
         result = dss::test_support::runBinary(
-            absArtifact, std::chrono::milliseconds{5000}, captureStdout,
+            absArtifact, dss::test_support::kRunBudget, captureStdout,
             launcherPrefix);
     }
     check(armName + ": spawn succeeded (diag='"
@@ -1958,7 +2288,7 @@ std::size_t dependencyImagesDiffered  = 0;
 // but it reaches it through the CLI, where the arm is selected by a FLAG the
 // user actually types (`--config=release`) rather than by an in-process
 // `pipelineOverride` that BYPASSES the shipped pipeline registry entirely
-// (src/program/compile_pipeline.hpp:172). So the two runners witness genuinely
+// (`CompileOptions::pipelineOverride`). So the two runners witness genuinely
 // different halves of the same promise: the sibling proves the release PIPELINE
 // preserves behaviour, and this one proves that asking the shipped BINARY for it
 // on the command line actually delivers that pipeline. Neither substitutes for
@@ -1969,7 +2299,8 @@ void runSelectedTargetViaCli(std::string const& compiler,
                       ExampleManifest const& m,
                       ExampleTarget const*   target,
                       std::string const&     exampleName,
-                      std::string const&     exampleId) {
+                      std::string const&     exampleId,
+                      CoverageReport&        coverage) {
     // Target spec format is `<cpu>:<format>`; the `:` is illegal in Windows path
     // components. Substitute `_` to derive a filesystem-safe sub-directory name.
     // The substitution is local to disk layout and never leaks back into the
@@ -2004,6 +2335,15 @@ void runSelectedTargetViaCli(std::string const& compiler,
     // every pre-existing skip line greps exactly as it did.
     armLedger.record(exampleId, target->spec, "cli", baseline.verdict,
                      baseline.detail);
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // ★ THE FACT THE ARM VERDICT CANNOT CARRY. `SkippedByRunOn` means *compiled,
+    // not spawned* in the in-process sibling and *never compiled* here, so the
+    // shared ledger cannot tell a witnessed spec from an unwitnessed one. These
+    // two lines are the missing observation, taken from the BUILD's own outcome
+    // rather than re-derived from the verdict.
+    if (baseline.compiled) coverage.compiled.push_back(target->spec);
+    if (baseline.spawnAttempted) coverage.spawned.push_back(target->spec);
+    if (baseline.verdict == ArmVerdict::Ran) coverage.ran.push_back(target->spec);
     if (baseline.verdict == ArmVerdict::Ran) {
         bool const exitMatches =
             static_cast<std::int64_t>(baseline.exitCode) == expectedExit;
@@ -2269,8 +2609,8 @@ void runSelectedTargetViaCli(std::string const& compiler,
 // Bind the target this runner will drive, ledger EVERY declared arm of the
 // manifest, and run the bound one.
 //
-// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT + D-TEST-CLI-HARNESS-BINDS-FIRST-
-// MATCHING-TARGET: this runner drives ONE target per manifest and never
+// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT + D-TEST-CLI-HARNESS-BINDS-FIRST-MATCHING-TARGET:
+// this runner drives ONE target per manifest and never
 // considers the rest — a known harness limitation with its own anchor,
 // deliberately NOT fixed here. What IS fixed here is the accounting: an arm this
 // runner never reaches is ledgered as `NotSelectedByRunner` rather than being
@@ -2322,8 +2662,8 @@ void runExampleViaCli(std::string const& compiler,
     // work is (target × arm), not target alone. Before the optimized arms
     // landed, a 4-target 2-arm manifest declared 4 rows here and the Results
     // line's `T declared target arms` understated the corpus by the whole
-    // optimizer axis — the same undercount D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-
-    // VERDICT closed one level up. An unreached target's arms carry THAT
+    // optimizer axis — the same undercount D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT
+    // closed one level up. An unreached target's arms carry THAT
     // target's reason, because that is genuinely why they did not run.
     for (std::size_t i = 0; i < m.targets.size(); ++i) {
         if (i == boundIndex) continue;
@@ -2360,16 +2700,29 @@ void runExampleViaCli(std::string const& compiler,
         }
     }
 
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // ★★★ THIS RUNNER'S HALF OF THE COVERAGE BOUNDARY, EMITTED RATHER THAN
+    // IMPLIED. `declared` is filled BEFORE either exit path below, so the
+    // no-bound-target case reports its (empty) coverage against the full
+    // declared set instead of vanishing from the accounting — the same reason
+    // the arm ledger records an arm this runner never reaches.
+    CoverageReport coverage;
+    coverage.runner    = std::string{kCoverageRunnerCli};
+    coverage.exampleId = exampleId;
+    for (auto const& t : m.targets) coverage.declared.push_back(t.spec);
+
     if (target == nullptr) {
         std::cout << "  [SKIP] " << exampleName
                   << " — no target's runOn includes host=" << host
                   << " (cross-host compile-only is exercised by"
                   << " tests/examples/ in-process runner)\n";
+        emitCoverage(coverage);
         return;
     }
 
     runSelectedTargetViaCli(compiler, exampleDir, outputBase, m, target,
-                            exampleName, exampleId);
+                            exampleName, exampleId, coverage);
+    emitCoverage(coverage);
 }
 
 // V2-4 Part C: drive an EXPECT-ERROR example through the CLI SUBPROCESS.
@@ -2390,6 +2743,22 @@ void runErrorExampleViaCli(std::string const& compiler,
         return;
     }
     auto const& spec = m.targets.front().spec;
+
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // ⚠ AN EXPECT-ERROR EXAMPLE REPORTS AN EMPTY `compiled` SET, AND THAT IS THE
+    // TRUTH, NOT A HOLE: its whole assertion is that the compile FAILS, so no
+    // runner can produce an artifact for it and the union-completeness clause
+    // would red for a reason that is not a defect. The boundary guard therefore
+    // selects its subject from the manifests that expect a build; the line is
+    // emitted here anyway so a reader diffing the two runners' coverage over the
+    // corpus never meets an example that simply said nothing.
+    {
+        CoverageReport coverage;
+        coverage.runner    = std::string{kCoverageRunnerCli};
+        coverage.exampleId = exampleId;
+        for (auto const& t : m.targets) coverage.declared.push_back(t.spec);
+        emitCoverage(coverage);
+    }
 
     // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: an expect-error arm is VERIFIED
     // without being spawned — the assertion is the rejected compile plus the
@@ -2596,7 +2965,8 @@ void runAllExamples(std::string const& compiler,
         return;
     }
     // Published for [Test 4]'s non-vacuity guard. Counts manifests FOUND (the
-    // same thing the in-process twin counts at examples_runner.cpp:1213), not
+    // same thing the in-process twin's `manifestCount` counts in
+    // `ExamplesCorpusLint.EveryArmAgreesWithItsSiblingsOnTheEmulator`), not
     // manifests parsed: a manifest that fails to parse is already a `[FAIL]`
     // below, and folding it out of this count would let a corpus-wide parse
     // break re-open the vacuous-lint hole from the other side.
@@ -2691,11 +3061,12 @@ void runManifestEmulatorLint() {
     // empty: [Test 4] printed the single line `[PASS] every declared target arm
     // agrees ... (0 declarations)` and the process exited 0. With the checks
     // present the same injection reds twice and exits 1 (2 failed). The
-    // in-process twin already guards this exact pair — examples_runner.cpp:1227
-    // (`ASSERT_GT(manifestCount, 0u)`) and :1230 (`ASSERT_FALSE(arms.empty())`)
-    // — and one runner enforcing a guard while its sibling shrugs is the silent
-    // harness bug this whole change exists to close (integrated_tests/
-    // CMakeLists.txt:42-46 states the pairing rule).
+    // in-process twin already guards this exact pair — in
+    // `ExamplesCorpusLint.EveryArmAgreesWithItsSiblingsOnTheEmulator`,
+    // `ASSERT_GT(manifestCount, 0u)` and `ASSERT_FALSE(arms.empty())` — and one
+    // runner enforcing a guard while its sibling shrugs is the silent harness
+    // bug this whole change exists to close (the per-example entry discovery
+    // note in `integrated_tests/CMakeLists.txt` states the pairing rule).
     //
     // The floor is `> 0`, deliberately NOT a pinned corpus size: 558 manifests
     // today, 557 last cycle. A hardcoded expected count is the same inert pin in
@@ -2982,12 +3353,52 @@ void corpusWideFloors(std::size_t declared, std::size_t built,
         return 1;
     }
     if (cells.size() < population) {
-        // Not a failure and NOT a pass. The operator asked for a subset; say so
-        // in ctest's own vocabulary and assert nothing.
+        // Not a failure and NOT a pass: a corpus-wide existence floor cannot be
+        // judged from part of the corpus. Say so in ctest's own vocabulary and
+        // assert nothing.
+        //
+        // ⚠ TWO CAUSES, AND THIS MESSAGE USED TO NAME ONLY ONE. It said "the
+        // operator asked for a subset", which is an ASSUMED cause — ✔MEASURED
+        // 2026-08-23 during cycle P29 on a `-R` that selected the WHOLE
+        // `^integrated_tests/` unit and still landed here, at 615 cells against a
+        // population of 616. The second cause is a STALE BUILD TREE: the
+        // per-example entries come from a `GLOB_RECURSE` in the root
+        // `CMakeLists.txt`, which is a CONFIGURE-time snapshot. It carries
+        // `CONFIGURE_DEPENDS`, so a `cmake --build` re-globs — but `ctest` alone
+        // does not, so an example added since the last BUILD exists on disk,
+        // is counted in `population`, and has no entry to emit its cell.
+        // ⇒ A reader sent to their `-R` by the old wording would have found
+        // nothing wrong with it. Naming both causes costs one sentence; naming
+        // the wrong one costs a search.
+        //
+        // ★ A THIRD CAUSE, ✔MEASURED 2026-08-27 (cycle P42, lane L) and it is a
+        // SPECIAL CASE of the second one rather than a new mechanism — worth
+        // naming anyway, because the remedy reads as absurd when you know your
+        // tree was freshly built. `population` is counted from the LIVE
+        // `examples/` tree AT RUN TIME, and several workstreams share one
+        // checkout: a neighbour lane that lands a new example WHILE a gate is
+        // running raises the population under a run whose entries were fixed at
+        // configure time. Observed exactly once in 12 full-corpus runs, in the
+        // one run whose before/after fingerprint of `examples/` DIFFERED.
+        // ⚠ The consequence is the one worth reading twice: the run still
+        // reports `100% tests passed`, and every corpus-wide floor asserted
+        // NOTHING in it. A gate number taken while a neighbour was landing a
+        // corpus example is therefore not the same measurement as one taken on a
+        // quiet tree, and only this line says so.
         std::cout << "  [SKIP] " << cells.size() << " of " << population
-                  << " example(s) reported a cell — this is a SUBSET run, and a"
-                     " corpus-wide existence floor cannot be judged from part of"
-                     " the corpus. Classified skip, never a pass.\n";
+                  << " example(s) reported a cell — a corpus-wide existence"
+                     " floor cannot be judged from part of the corpus."
+                     " Classified skip, never a pass. THREE causes reach here:"
+                     " a deliberate SUBSET run (`-R`/`--only`); a BUILD TREE"
+                     " whose per-example entries predate an example that now"
+                     " exists on disk — re-run `cmake --build` (the manifest"
+                     " glob is CONFIGURE_DEPENDS, so building re-globs; ctest"
+                     " alone does not) and compare `ctest -N -R"
+                     " '^integrated_tests/'` against the population above; or a"
+                     " CONCURRENT WORKSTREAM that added an example to this"
+                     " shared checkout while the run was in flight, which is the"
+                     " same shape and needs no fix beyond re-running on a quiet"
+                     " tree.\n";
         return kAdjudicatorSkipRc;
     }
 
@@ -3472,6 +3883,138 @@ void runDependsOnParserPin(fs::path const& scratch) {
     std::cout << "\n";
 }
 
+// ── Harness self-test: the prebuilt-library entry's own refusals ───────────
+//
+// D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS
+//
+// ★★ A corpus example proves the HAPPY path — an archive resolved, a program
+// linked, an exit code. It cannot prove a REFUSAL, and each refusal here exists
+// because its absence produces a green that means nothing: an entry with no
+// `containerWitness` is a prebuilt input nobody stated a property of (regenerate
+// the fixture in the GNU container and the example passes with the BSD arms
+// unwitnessed); a `..` or absolute path makes the result depend on one machine's
+// filesystem; an unknown key is the `containerWitnesss` typo that parses clean
+// and arms nothing.
+//
+// A behavioural mirror of the in-process sibling's
+// `ExamplesCorpusLint.PrebuiltLibraryEntryIsRefusedUnlessItIsWitnessed`,
+// refusal for refusal — a manifest one runner accepts and the other rejects is
+// [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]].
+void runPrebuiltLibraryParserPin(fs::path const& scratch) {
+    std::cout << "[Harness self-test] prebuiltLibraries parser: an UNWITNESSED"
+                 " or OUT-OF-TREE prebuilt input is REFUSED\n";
+    std::error_code ec;
+    fs::create_directories(scratch, ec);
+    if (ec) {
+        check("create the prebuiltLibraries parser sandbox", false,
+              "cannot create '" + scratch.generic_string() + "': " + ec.message());
+        std::cout << "\n";
+        return;
+    }
+    // AGNOSTIC BY CONSTRUCTION: every language/arch/format/path spelling is a
+    // placeholder, because these directions are refused at PARSE time, before
+    // any file is opened.
+    auto const planted = [&scratch](char const* body) {
+        auto const p = scratch / "prebuilt-keys.json";
+        std::ofstream f(p.string(), std::ios::binary);
+        f << R"({
+  "language": "<fixture-language>",
+  "source": "<fixture-source>",
+  "exitCode": 0,
+  "targets": [{"spec": "<fixture-arch>:<fixture-format>",
+               "artifact": "<fixture-artifact>", "runOn": ["<fixture-host>"],
+               "prebuiltLibraries": [)" << body << R"(]}]
+})";
+        f.close();
+        return p;
+    };
+    // {parsed-ok, whatever the parser wrote to stderr}, with the parsed manifest
+    // handed back through `mm` — the SAME shape the `dependsOn` pin above uses.
+    // The rdbuf is restored on the straight-line path: no early return inside
+    // the capture window, or a stolen `std::cerr` would silence every later
+    // diagnostic in this process.
+    auto const parseCapturingStderr = [](fs::path const& p, ExampleManifest& mm) {
+        std::ostringstream captured;
+        auto* const        saved = std::cerr.rdbuf(captured.rdbuf());
+        bool const         ok    = readManifest(p, mm);
+        std::cerr.rdbuf(saved);
+        return std::pair<bool, std::string>{ok, captured.str()};
+    };
+
+    // DIRECTION 1 — no declared witness. The load-bearing refusal.
+    {
+        ExampleManifest mm;
+        auto const [ok, msg] = parseCapturingStderr(
+            planted(R"({"path": "<fixture-dir>/<fixture-lib>"})"), mm);
+        check("a prebuiltLibraries entry with NO containerWitness is REFUSED",
+              !ok,
+              "the manifest parsed clean — an unwitnessed prebuilt input would"
+              " keep passing after its fixture was regenerated in a different"
+              " container, with the capability it exists to witness gone");
+        check("that refusal NAMES containerWitness",
+              msg.find("containerWitness") != std::string::npos,
+              "stderr did not name the missing field. Got: " + msg);
+    }
+    // DIRECTION 2 — a path that leaves the repository, or that only opens on
+    // one host, is REFUSED. FOUR spellings because they are four different
+    // mistakes, and a check catching one would look like it caught all four.
+    // ★ The root-directory case is why this pin was worth writing: it caught
+    // `fs::path::is_absolute()` answering DIFFERENTLY on Windows and Linux for
+    // the same manifest bytes.
+    for (char const* badPath : {"../outside/<fixture-lib>",
+                                "/absolute/<fixture-lib>",
+                                "X:/drive/<fixture-lib>",
+                                "tests\\\\<fixture-lib>"}) {
+        auto const body = std::string{R"({"path": ")"} + badPath
+                        + R"(", "containerWitness": "<fixture-witness>"})";
+        ExampleManifest mm;
+        auto const [ok, msg] = parseCapturingStderr(planted(body.c_str()), mm);
+        check(std::string{"a prebuiltLibraries 'path' of '"} + badPath
+                  + "' is REFUSED",
+              !ok,
+              "a corpus example must not depend on a file outside the"
+              " repository — its result would be a property of one machine's"
+              " filesystem. stderr: " + msg);
+    }
+    // DIRECTION 3 — an unknown key is REFUSED and NAMED. The realistic typo.
+    {
+        ExampleManifest mm;
+        auto const [ok, msg] = parseCapturingStderr(planted(
+            R"({"path": "<fixture-dir>/<fixture-lib>",
+                "containerWitnesss": "<fixture-witness>"})"), mm);
+        check("a prebuiltLibraries entry declaring an UNKNOWN key is REFUSED",
+              !ok,
+              "an unreadable key was ignored in silence — the same typo class"
+              " the dependsOn pin above closes");
+        check("that refusal NAMES the offending key",
+              msg.find("containerWitnesss") != std::string::npos,
+              "stderr did not name 'containerWitnesss'. Got: " + msg);
+    }
+    // DIRECTION 4 — a well-formed entry PARSES, keeps its `$` documentation key,
+    // and BOTH values arrive. Without this the three refusals above would be
+    // satisfied by a parser that refused everything.
+    {
+        ExampleManifest mm;
+        auto const [ok, msg] = parseCapturingStderr(planted(
+            R"({"$comment": "why this archive and not another",
+                "path": "<fixture-dir>/<fixture-lib>",
+                "containerWitness": "<fixture-witness>"})"), mm);
+        bool const carried = ok && mm.targets.size() == 1u
+                          && mm.targets[0].prebuiltLibraries.size() == 1u
+                          && mm.targets[0].prebuiltLibraries[0].path
+                                 == "<fixture-dir>/<fixture-lib>"
+                          && mm.targets[0].prebuiltLibraries[0].containerWitness
+                                 == "<fixture-witness>";
+        check("a well-formed prebuiltLibraries entry PARSES and carries BOTH"
+              " fields (a `$` documentation key costs it nothing)",
+              carried,
+              "the entry did not survive the parse with both values — a field"
+              " the runner drops here is a check that never runs later."
+              " stderr: " + msg);
+    }
+    std::cout << "\n";
+}
+
 // ── Harness self-test: the manifest's OUTER closed key sets ────────────────
 //
 // ★★ The `dependsOn` pin above closes the innermost of this runner's three
@@ -3572,6 +4115,219 @@ void runManifestClosedKeySetPin(fs::path const& scratch) {
               ok,
               "the parser refused a `$` documentation key — the corpus"
               " documents itself with these at every level. stderr: " + msg);
+    }
+    std::cout << "\n";
+}
+
+// ── THE FOUR SOURCE-ARGUMENT SHAPES, AT THE ARGV TIER ──────────────────────
+//
+// ★★★ THE CORPUS WALK BELOW CAN ONLY SPELL ONE OF THEM, AND THIS PIN IS WHY
+// THAT IS NO LONGER THE WHOLE STORY
+// (D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH).
+// A user hands `--compile` a path in one of exactly four shapes: ABSOLUTE,
+// BARE-RELATIVE (`main.c`, no directory component at all), DIRECTORY-RELATIVE
+// (`sub/main.c`) and DOT-RELATIVE (`./main.c`). This runner builds
+// `(exampleDir / s).string()` for every example and the in-process sibling
+// builds `scratch.path() / s`, so EVERY manifest in the corpus exercises the
+// absolute form and the other three are exercised by nothing. (No count is
+// quoted: a raw count of a growing corpus rots in place, and this one grew by
+// one DURING the cycle that added this pin.)
+//
+// ★★ THAT HOLE SHIPPED A HIGH, USER-FACING DEFECT.
+// `D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH`:
+// `dss --compile main.c` refused a header sitting beside `main.c` while the
+// other three shapes resolved it, because an EMPTY parent path was read as "no
+// directory" when it means THE PROCESS WORKING DIRECTORY. Nothing in the corpus
+// could see it.
+//
+// ⇒ ONE ENTRY, NOT SIX HUNDRED. The claim "some invocation exercises the
+// bare-relative form" is EXISTENTIAL, and the P24 ruling keeps an existence
+// claim at one entry; the claim "EVERY shape resolves the includer's header" is
+// universal over a FOUR-element set, so each shape is its own case below and a
+// failure names the shape. Neither reading wants a manifest key: the shape is a
+// property of the INVOCATION, and the manifest vocabulary is a closed key set
+// whose two parsers a source-level pin holds equal.
+//
+// ⇒ ITS IN-PROCESS COUNTERPART is `tests/program/test_source_argument_shape.cpp`
+// (suite `SourceArgumentShape`), which drives the same four shapes through
+// `Program::compileFiles`/`compileUnits`. Deliberately the SAME experiment at
+// both tiers — same header name, same two answers — because a capability
+// enforced on one tier while the other shrugs is the silent harness bug
+// [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] names. What only THIS side can
+// see is argv: the token the shell hands the driver, unnormalised by any
+// `fs::path` this harness built.
+//
+// ★ THE DECOY IS WHAT MAKES THE EXIT CODE DISCRIMINATING. For the two shapes
+// whose includer directory is NOT the working directory, a second header of the
+// SAME NAME carrying a DIFFERENT value sits in the working directory. Resolving
+// against the cwd then yields a binary that builds clean, runs, and answers
+// wrong — with no diagnostic. For the other two the includer's directory IS the
+// working directory, so no decoy is possible and none is planted.
+void runSourceArgumentShapePin(std::string const& compiler,
+                               fs::path const&    scratch) {
+    std::cout << "[Harness self-test] `--compile` accepts all FOUR"
+                 " source-argument shapes\n";
+
+    // The value the header BESIDE the source defines, and the value the decoy in
+    // the working directory defines. Neither is 0 (which a do-nothing binary
+    // also returns) and neither is 42 (the corpus's house exit code), so a
+    // copy-paste could not have produced either by accident.
+    constexpr unsigned kSiblingAnswer = 73;
+    constexpr unsigned kDecoyAnswer   = 11;
+    char const* const  kHeaderName    = "sibling.h";
+    char const* const  kAnswerMacro   = "DSS_SOURCE_ARG_SHAPE_ANSWER";
+    char const* const  kSubdir        = "sub";
+    char const* const  kMainName      = "main.c";
+    // DERIVED from the directory name, never re-typed: a hand-written "sub/" in
+    // the table below could drift from the directory the fixture actually
+    // creates, and the case would then be testing a path that does not exist —
+    // which fails, but for the wrong reason and with a misleading message.
+    std::string const  kSubdirPrefix  = std::string{kSubdir} + "/";
+
+    auto const headerText = [&](unsigned answer) {
+        return std::string{"#define "} + kAnswerMacro + " "
+             + std::to_string(answer) + "\n";
+    };
+    auto const writeText = [](fs::path const& p, std::string const& text) {
+        std::error_code ec;
+        fs::create_directories(p.parent_path(), ec);
+        std::ofstream f(p.string(), std::ios::binary);
+        f << text;
+    };
+
+    struct Shape {
+        char const* label;
+        bool        subdirectory;  // sources one level below the working dir
+        char const* prefix;        // "" for absolute — computed at run time
+        bool        absolute;
+    };
+    // ⚠ THE LIST IS THE CLAIM. Four shapes, spelled out, so a reader can check
+    // the enumeration is complete rather than trust that it is.
+    Shape const shapes[] = {
+        {"absolute",           true,  "",                     true},
+        {"bare-relative",      false, "",                     false},
+        {"directory-relative", true,  kSubdirPrefix.c_str(),  false},
+        {"dot-relative",       false, "./",                   false},
+    };
+
+    std::string const spec{::dss::test_support::hostNativeTarget().execTarget};
+    // DERIVED from the source's name, never re-typed: the driver names the
+    // artifact for the source's STEM, so a hand-written "main" here would keep
+    // passing if either the fixture's file name or that rule changed.
+    std::string const artifactName = ::dss::test_support::hostExeArtifact(
+        fs::path{kMainName}.stem().string());
+
+    for (auto const& sh : shapes) {
+        std::string const name = std::string{"--compile <"} + sh.label + ">";
+        auto const  workDir  = scratch / sh.label;
+        auto const  srcDir   = sh.subdirectory ? workDir / kSubdir : workDir;
+        auto const  outDir   = workDir / "out";
+        std::error_code ec;
+        fs::create_directories(outDir, ec);
+        if (ec) {
+            check(name + ": scratch tree created", false, ec.message());
+            continue;
+        }
+        writeText(srcDir / kHeaderName, headerText(kSiblingAnswer));
+        if (sh.subdirectory) {
+            writeText(workDir / kHeaderName, headerText(kDecoyAnswer));
+            // THE PREMISE OF THIS SHAPE'S EXIT-CODE ASSERTION. Without a decoy
+            // that really differs, "it returned the sibling's value" holds
+            // whichever header was resolved, and the case asserts nothing.
+            auto const decoy = fileExists(workDir / kHeaderName);
+            check(name + ": a DIFFERENT header of the same name sits in the"
+                         " working directory",
+                  decoy.ok, decoy.why);
+        }
+        writeText(srcDir / kMainName,
+                  std::string{"#include \""} + kHeaderName + "\"\n"
+                  + "int main(void) { return " + kAnswerMacro + "; }\n");
+
+        // The single variable across the four cases: the token in front of
+        // `main.c`. Everything else — the tree, the language, the target, the
+        // output directory — is identical.
+        std::string const argument =
+            sh.absolute ? (srcDir / kMainName).string()
+                        : (std::string{sh.prefix} + kMainName);
+
+        auto const cliLog = outDir / "cli.log";
+        std::string const cmd = quote(compiler)
+            + " --compile "  + quote(argument)
+            + " --language c"
+            + " --target "   + spec
+            + " --output "   + quote(outDir.string())
+            + " > " + quote(cliLog.string()) + " 2>&1";
+
+        // THE WORKING DIRECTORY IS THE OTHER HALF OF A RELATIVE ARGUMENT. Scoped
+        // and restored by the same `CwdGuard` the project-mode compile uses, and
+        // FAIL-CLOSED: a chdir that did not take would resolve the argument
+        // against the build tree and the failure would read as a DSS defect.
+        bool cwdOk = true;
+        int const sysRc = [&]() {
+            CwdGuard cwd{workDir};
+            check(name + ": compile cwd set to " + workDir.generic_string(),
+                  cwd.ok,
+                  cwd.ok ? "" : "chdir failed; a relative source argument would"
+                                " resolve against the build tree instead");
+            cwdOk = cwd.ok;
+            if (!cwd.ok) return -1;
+            return std::system(shellWrap(cmd).c_str());
+        }();
+        if (!cwdOk) continue;
+
+        if (sysRc != 0) {
+            std::string body;
+            {
+                std::ifstream in(cliLog.string(), std::ios::binary);
+                body.assign(std::istreambuf_iterator<char>(in),
+                            std::istreambuf_iterator<char>());
+            }
+            check(name + ": compile exits 0 (rc=" + std::to_string(sysRc) + ")",
+                  false,
+                  "a refusal naming a quote include is the includer-directory"
+                  " derivation reading an EMPTY parent path as 'no directory'"
+                  " when it means the process working directory. cli output: "
+                      + body);
+            continue;
+        }
+        check(name + ": compile exits 0", true);
+
+        // The artifact must land at the SAME place for every shape — the driver
+        // derives the stem from the source's stem, not from the spelling it was
+        // handed. A `sub/`-prefixed argument that routed its output under `sub/`
+        // would put a user's binary somewhere they never asked for.
+        auto const artifact = outDir / artifactName;
+        auto const present  = fileExists(artifact);
+        check(name + ": artifact at " + artifact.generic_string(),
+              present.ok, present.why);
+        if (!present.ok) continue;
+
+        // `runBinary`'s own default deadline (`kRunBudget`, sized and documented
+        // beside it) rather than a literal repeated here.
+        //
+        // ⚠ NO `fs::absolute` CALL, deliberately: `artifact` descends from the
+        // run root, which is already absolute, and the no-argument
+        // `fs::absolute` THROWS — this function sits outside every `try` in
+        // `main`, which is precisely
+        // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT (`libc++abi:
+        // terminating` as the whole output, no [FAIL] line, no name for what
+        // died).
+        auto const r = ::dss::test_support::runBinary(artifact);
+        check(name + ": spawn succeeded (diag='" + r.diagnostic + "')",
+              r.spawned);
+        if (!r.spawned) continue;
+        check(name + ": no timeout", !r.timedOut, r.diagnostic);
+        if (r.timedOut) continue;
+        check(name + ": exits " + std::to_string(kSiblingAnswer)
+                  + " — the value the header BESIDE the source defines",
+              r.exitCode == kSiblingAnswer,
+              "got " + std::to_string(r.exitCode)
+                  + (r.exitCode == kDecoyAnswer
+                         ? " — the quote include resolved against the PROCESS"
+                           " WORKING DIRECTORY instead of the includer's own"
+                           " directory: a build that succeeds, runs, and"
+                           " answers wrong with no diagnostic anywhere"
+                         : ""));
     }
     std::cout << "\n";
 }
@@ -3771,6 +4527,339 @@ void runRunnerVocabularyPin() {
     std::cout << "\n";
 }
 
+// ═══ THE COVERAGE BOUNDARY GUARD ════════════════════════════════════════════
+//
+// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+//
+// ★★★ WHAT THIS ENTRY IS FOR, IN ONE SENTENCE: it RUNS both corpus harnesses
+// over the same example and compares what each of them actually built, so the
+// division of labour between them is a CHECKED FACT rather than a habit.
+//
+// ✔THE MEASUREMENT THAT MADE IT NECESSARY (windows/x86_64, this tree): over the
+// corpus the in-process runner compiles EVERY declared target of every manifest
+// — all four of a typical example's specs, arm64 included — while this runner
+// binds ONE and compiles only that one. Both harnesses record the difference as
+// the SAME `ArmVerdict::SkippedByRunOn` token, which in the sibling means
+// *compiled, not spawned* and here means *never compiled*. So the one instrument
+// that spans both harnesses could not distinguish a spec that has a witness from
+// a spec that has none, and a red-on-disable mutant confined to a cross-host
+// spec is caught by exactly one of the two suites with nothing saying which.
+//
+// ⚠ THE ASYMMETRY IS NOT THE DEFECT AND THIS GUARD DOES NOT TRY TO REMOVE IT.
+// This runner's contract is stated in its own header block and in
+// `integrated_tests/CMakeLists.txt` — *always against the current host platform*,
+// a user invariant of 2026-06-02 — and a CLI-subprocess harness that pretended
+// to spawn a foreign-arch binary would be worse than one that declines. What was
+// missing is the COMPLEMENT of that contract: nothing said who covers the rest,
+// and nothing checked that anybody does.
+//
+// ⇒ the five clauses in `judgeCoverageBoundary` (tests/test_support/
+// coverage_boundary.hpp) forbid a LOSS of coverage, never a gain. Teaching this
+// runner to compile every declared spec would leave every clause green.
+[[nodiscard]] bool selectCoverageBoundarySubject(fs::path const& examplesRoot,
+                                                 fs::path&    subjectDir,
+                                                 std::string& subjectId,
+                                                 ExampleManifest& subject) {
+    // The subject is DERIVED FROM THE CORPUS, never named in CMake or here. An
+    // example renamed or retired moves the selection automatically, which is the
+    // one property a hand-picked id cannot have — and the property that stops
+    // this entry from silently becoming a pin on a file that no longer exists.
+    std::vector<fs::path> manifests;
+    std::error_code       ec;
+    for (fs::recursive_directory_iterator it(examplesRoot, ec), end;
+         it != end && !ec; it.increment(ec)) {
+        if (it->path().filename() == "expected.json") manifests.push_back(it->path());
+    }
+    if (ec) {
+        check("walk the corpus for a coverage-boundary subject", false,
+              "scan of " + examplesRoot.generic_string() + " failed: "
+                  + ec.message());
+        return false;
+    }
+    std::sort(manifests.begin(), manifests.end());  // deterministic subject
+
+    auto const host = currentHostOs();
+    std::size_t consideredParsed = 0;
+    for (auto const& mp : manifests) {
+        ExampleManifest m;
+        // A manifest this walk cannot parse is ALREADY a [FAIL] on its own
+        // per-example entry. Skipping it here rather than reporting it twice
+        // keeps a corpus-wide parse break from arriving as a boundary finding,
+        // which would send the reader to the wrong instrument.
+        std::ostringstream sink;
+        auto* const        saved = std::cerr.rdbuf(sink.rdbuf());
+        bool const         ok    = readManifest(mp, m);
+        std::cerr.rdbuf(saved);
+        if (!ok) continue;
+        ++consideredParsed;
+        // ── the four properties a usable subject must have, each with its
+        //    reason, because every one of them silently weakens the judgement:
+        // (1) it must expect a BUILD. An `expectDiagnostics` example asserts a
+        //     FAILED compile, so no runner can produce an artifact for it and
+        //     union-completeness would red for a reason that is not a defect.
+        if (!m.expectDiagnostics.empty()) continue;
+        // (2) NOT project mode and NO `dependsOn`: both multiply the builds this
+        //     entry performs without touching the property under test, and this
+        //     entry pays for its subject twice (once per harness).
+        if (m.project.has_value()) continue;
+        bool hasDeps = false;
+        for (auto const& t : m.targets) hasDeps = hasDeps || !t.dependsOn.empty();
+        if (hasDeps) continue;
+        // (3) at least one target this host can actually RUN — otherwise the
+        //     two harnesses share no executed spec and clause C5 is judging
+        //     nothing.
+        //     ★★ RUNNABLE MEANS OS *AND* ARCH, AND IT SAID ONLY "OS" UNTIL
+        //     2026-08-25 (cycle P34). `runOn` names operating systems, so a
+        //     spec was called bindable the moment its `runOn` listed this
+        //     host's OS — no matter what processor the spec targets.
+        //     ⚠ ✔MEASURED on the aarch64 Linux leg: this selected
+        //     `asm/asm_arith_return42`, whose two specs are BOTH x86_64, one of
+        //     them `runOn: [linux]`. Neither could execute on an arm64 host, so
+        //     both runners reported `ran=-`, and C5 refused over the empty
+        //     overlap — the guard working exactly as designed, on a subject the
+        //     selector should never have handed it.
+        //     ★ The bug is invisible on x86_64 hosts because there the OS test
+        //     and the arch test agree by accident. ✔MEASURED across the corpus:
+        //     making this arch-aware changes the chosen subject on EXACTLY the
+        //     two hosts where the old answer was vacuous (linux/arm64 and
+        //     darwin/x86_64) and on no other.
+        //     D-TEST-COVERAGE-BOUNDARY-SELECTOR-READ-THE-HOST-OS-BUT-NOT-THE-HOST-ARCH
+        // (4) at least one target `runOn` EXCLUDES from this host, AND OF A
+        //     FOREIGN ARCH. The cross-OS half alone would qualify a subject
+        //     whose every spec targets this machine's own processor — and the
+        //     defect that opened this row was a CODEGEN mutant confined to the
+        //     other arch, caught by one runner and not the other. A subject
+        //     without a foreign-arch spec would leave that exact class outside
+        //     what this entry measures while still reporting a boundary.
+        bool bindable = false, excludedForeignArch = false;
+        for (auto const& t : m.targets) {
+            bool const admits =
+                std::find(t.runOn.begin(), t.runOn.end(), host) != t.runOn.end()
+                && specTargetArch(t.spec) == currentHostArch();
+            bindable = bindable || admits;
+            if (!admits && specTargetArch(t.spec) != currentHostArch()) {
+                excludedForeignArch = true;
+            }
+        }
+        if (!bindable || !excludedForeignArch) continue;
+
+        subjectDir = mp.parent_path();
+        subjectId  = subjectDir.parent_path().filename().generic_string() + "/"
+                   + subjectDir.filename().generic_string();
+        subject    = std::move(m);
+        return true;
+    }
+
+    // ★★★ NO SUBJECT IS A RED, NOT A SKIP, AND THAT IS THE WHOLE POINT OF
+    // SAYING SO HERE. A guard whose subject vanished asserts nothing, and a
+    // guard that asserts nothing while exiting 0 is worse than no guard: it
+    // reads as coverage. The two ways to arrive here have DIFFERENT fixes, so
+    // the message names both rather than guessing.
+    check("the corpus offers an example with BOTH a host-bindable target and a"
+          " runOn-excluded FOREIGN-ARCH one (the coverage boundary's two halves)",
+          false,
+          "walked " + std::to_string(manifests.size()) + " manifest(s), parsed "
+              + std::to_string(consideredParsed) + ", and none qualified on host="
+              + currentHostOs() + "/" + currentHostArch()
+              + ". Either the corpus stopped declaring cross-host foreign-arch"
+                " targets — in which case this boundary no longer exists and"
+                " this entry must be retired deliberately — or the selection's"
+                " own predicates stopped matching the manifest vocabulary."
+                " Refusing to report a pass over an empty subject.");
+    return false;
+}
+
+void runCoverageBoundaryJudge(fs::path const& subjectDir,
+                              std::string const& subjectId,
+                              ExampleManifest const& subject,
+                              fs::path const& outputBase) {
+    std::cout << "[Coverage boundary] the two corpus runners' division of"
+                 " labour, MEASURED on " << subjectId << "\n";
+
+    // ── THE INSTRUMENT'S OWN PRECONDITIONS, ASSERTED BEFORE ANY CLAUSE ──────
+    // Each of these, unchecked, converts the judgement below into a comparison
+    // between an observation and a default-constructed struct.
+    if (g_siblingRunner.empty()) {
+        check("--sibling-runner=<path> was supplied", false,
+              "the coverage boundary is a claim about TWO harnesses; with only"
+              " one of them reachable this entry could compare nothing and must"
+              " not exit 0");
+        return;
+    }
+    if (!fileExists(g_siblingRunner).ok) {
+        check("the sibling runner exists at "
+                  + g_siblingRunner.generic_string(), false,
+              "the in-process corpus harness (dss_examples_runner) is not there."
+              " Build it before running this entry — an unreachable sibling"
+              " produces an empty coverage report, and an empty report compares"
+              " EQUAL to another empty one");
+        return;
+    }
+    if (!g_cliCoverage.has_value()) {
+        check("this runner produced a coverage report for " + subjectId, false,
+              "the corpus walk executed no example, so there is nothing of this"
+              " harness's to compare. An instrument that observed nothing must"
+              " never be read as one that observed a small coverage");
+        return;
+    }
+    CoverageReport const& cli = *g_cliCoverage;
+    check("this runner's coverage report names the selected example"
+          " (got '" + cli.exampleId + "')",
+          cli.exampleId == subjectId,
+          "the walk executed a different example than the one selected — the"
+          " comparison below would pit two different manifests against each"
+          " other");
+    if (cli.exampleId != subjectId) return;
+    check("this runner's coverage report is authored by '"
+              + std::string{kCoverageRunnerCli} + "' (got '" + cli.runner + "')",
+          cli.runner == kCoverageRunnerCli,
+          "a report whose author is not this harness cannot be this harness's"
+          " half of the boundary");
+
+    // ── RUN THE SIBLING, on the SAME example directory its own ctest entry
+    //    hands it, so what this entry measures is what that entry measures ────
+    //
+    // ⚠ `--gtest_filter` NAMES THE ONE TEST, not a negated suite. A filter that
+    // matches nothing makes gtest print `[  PASSED  ] 0 tests.` and exit 0 — the
+    // silence this repository has already paid for once (see
+    // `dss_refuse_a_vacuous_gtest_selection`). Naming the test positively means
+    // a rename produces NO coverage line, and no coverage line is a hard refusal
+    // below rather than a small one.
+    auto const siblingLog = outputBase / "coverage-boundary-sibling.log";
+    std::string const cmd = quote(g_siblingRunner.string()) + " "
+        + quote(subjectDir.string())
+        + " --gtest_filter=Examples.RunFromManifest > "
+        + quote(siblingLog.string()) + " 2>&1";
+    // ── WHERE THE SIBLING IS RUN FROM ───────────────────────────────────────
+    //   D-TEST-EXAMPLES-CORPUS-SCRATCH-IS-SHARED-BY-EVERY-BUILD-TREE
+    //
+    // ★★★ THIS USED TO chdir TO THE REPO ROOT, and its reason was a QUOTE of the
+    // sibling's ctest registration: "the sibling resolves its scratch + config
+    // relative to the repo root, which is what its own ctest registration gives
+    // it (`WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}`)". That registration changed —
+    // the corpus entries now get a per-build-tree working directory, because the
+    // checkout root is one directory every build tree, lane and worktree writes
+    // into, and 684 leaked scratch directories had accumulated in it. So this
+    // line stopped mirroring the sibling the moment the sibling moved, which is
+    // precisely the two-runner drift `integrated_tests/coverage-boundary` exists
+    // to catch — and it caught it: ✔MEASURED, the sibling refused with rc=1 and
+    // this entry reported "no coverage line", loudly, on the first run after the
+    // registration changed.
+    //
+    // ⇒ RUN IT FROM THIS RUN'S OWN SCRATCH ROOT. The property the sibling needs
+    // is not "the repo root" — it never was. It is a cwd that is NOT a checkout
+    // root, so that `ScratchDir{Location::InsideRepo}` lands somewhere private
+    // to this run instead of in the shared source tree. `outputBase` is claimed
+    // per run under the system temp directory, so it satisfies that BY
+    // CONSTRUCTION and cannot drift with anybody's CMake variable. Everything
+    // the sibling actually resolves comes from elsewhere: the corpus root from
+    // the `DSS_TEST_REPO_ROOT` baked into that binary, and shipped config from
+    // the `$DSS_CONFIG_ROOT` this entry carries (`dss_use_config_snapshot`) and
+    // the child inherits.
+    //
+    // Restored by the guard, because this runner resolves relative paths of its
+    // own afterwards.
+    int siblingRc = -1;
+    bool cwdOk = false;
+    {
+        CwdGuard cwd{outputBase};
+        cwdOk = cwd.ok;
+        if (cwd.ok) siblingRc = std::system(shellWrap(cmd).c_str());
+    }
+    if (!cwdOk) {
+        check("chdir to this run's scratch root to run the sibling", false,
+              "the sibling roots its ScratchDir at the process working"
+              " directory, so it must be started somewhere private to this run"
+              " — never a checkout root, which every build tree shares");
+        return;
+    }
+
+    std::string body;
+    {
+        std::ifstream in(siblingLog.string(), std::ios::binary);
+        body.assign(std::istreambuf_iterator<char>(in),
+                    std::istreambuf_iterator<char>());
+    }
+    // ⚠ THE SIBLING'S EXIT CODE IS REPORTED, NOT ASSERTED, and that is a
+    // deliberate trade. Its correctness is its own ctest entry's business; what
+    // this entry needs is its COVERAGE, and a change that makes it spawn a
+    // foreign-arch binary reds it — so asserting rc==0 here would swallow clause
+    // C4 behind a generic "the sibling failed" and lose the finding.
+    std::cout << "  sibling rc=" << siblingRc << " ("
+              << body.size() << " bytes of output at "
+              << siblingLog.generic_string() << ")\n";
+
+    CoverageReport inproc;
+    std::string    why;
+    if (!findCoverageReport(body, subjectId, inproc, why)) {
+        check("the sibling emitted exactly one parseable coverage line for "
+                  + subjectId, false,
+              why + ". Sibling rc=" + std::to_string(siblingRc)
+                  + "; its output is kept at " + siblingLog.generic_string());
+        return;
+    }
+    check("the sibling emitted exactly one parseable coverage line for "
+              + subjectId, true);
+    check("the sibling's coverage report is authored by '"
+              + std::string{kCoverageRunnerInProcess} + "' (got '"
+              + inproc.runner + "')",
+          inproc.runner == kCoverageRunnerInProcess,
+          "this entry compares TWO harnesses; two reports from the same author"
+          " would compare a run with itself");
+    if (inproc.runner != kCoverageRunnerInProcess) return;
+
+    // The manifest fact clause C4 needs, computed from the manifest's own
+    // `runOn` lists and never inferred from either runner's behaviour — a guard
+    // that derived its expectation from the thing it is guarding would agree
+    // with any change at all.
+    auto const host = currentHostOs();
+    std::vector<std::string> hostExcluded;
+    for (auto const& t : subject.targets) {
+        if (std::find(t.runOn.begin(), t.runOn.end(), host) == t.runOn.end()) {
+            hostExcluded.push_back(t.spec);
+        }
+    }
+
+    std::cout << "  in-process: " << renderCoverageLine(inproc) << "\n"
+              << "  cli:        " << renderCoverageLine(cli) << "\n";
+
+    // ⚠ THE DETAIL IS IN THE DESCRIPTION, NOT IN `check`'s detail slot. Each
+    // clause's message is the whole finding, and `check` prints
+    // `<description> — <detail>` on a failure: passing it twice printed the
+    // finding twice, which is how a reader learns to skim the thing they most
+    // need to read. A PASS keeps the same text, so a green clause still SAYS
+    // what it saw.
+    for (auto const& v : judgeCoverageBoundary(inproc, cli, hostExcluded)) {
+        check("[boundary] " + v.clause + " — " + v.detail, v.ok);
+    }
+
+    // ── THE BOUNDARY'S OWN SIZE, STATED RATHER THAN LEFT TO BE INFERRED ─────
+    //
+    // ★ A ZERO HERE IS NOT A FAILURE — it would mean this runner had grown to
+    // compile every declared spec, which is an improvement — but it IS a state
+    // in which the clause that names the in-process runner as the sole witness
+    // has nothing to witness. `D-TEST-STRICT-ARM-VERDICTS-INERT-ON-WINDOWS` is
+    // the row that made this rule: a leg whose input cannot reach a guard must
+    // SAY SO, or the first green run is quoted as evidence of something it never
+    // measured.
+    std::size_t inprocOnly = 0;
+    for (auto const& s : inproc.compiled) {
+        if (std::find(cli.compiled.begin(), cli.compiled.end(), s)
+            == cli.compiled.end()) {
+            ++inprocOnly;
+        }
+    }
+    std::cout << "  BOUNDARY WIDTH on host=" << host << "/" << currentHostArch()
+              << ": " << inprocOnly << " of " << inproc.declared.size()
+              << " declared spec(s) are compiled by the IN-PROCESS runner ALONE"
+              << (inprocOnly == 0
+                      ? " — the boundary is EMPTY on this host, so the"
+                        " sole-witness clause above asserted nothing about it"
+                      : " — a capability's behaviour on those specs has exactly"
+                        " ONE witness in this suite")
+              << "\n\n";
+}
+
 // ── D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the ledger summary ───────────
 //
 // Printed beside the pass/fail counts so `N passed` can never again be read as
@@ -3801,13 +4890,13 @@ void reportArmVerdicts() {
     //
     // NOT gated on strict mode, by design: an empty ledger is a broken
     // instrument on every host, not a property of the machine — the same reason
-    // the twin's guard at examples_runner.cpp:1109 is a plain
+    // the twin's guard in `Examples.RunFromManifest` is a plain
     // `ASSERT_GT(ledger.total(), 0u)` and not part of its strict block. `> 0` is
     // the honest floor for "this instrument ran at all"; a pinned count would
     // red every time the corpus grows and would be edited back into a stamp.
     // ★★ THE FLOOR IS PER-MODE, AND THAT IS A STRENGTHENING RATHER THAN THE
-    // WEAKENING IT LOOKS LIKE. D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-
-    // ONE-THREAD split this runner into entries, and `--only=cli` deliberately
+    // WEAKENING IT LOOKS LIKE. D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD
+    // split this runner into entries, and `--only=cli` deliberately
     // performs no corpus walk — so its ledger is legitimately empty, and the
     // unconditional `> 0` reported that as a defect (✔MEASURED: `--only=cli`
     // exited 1 on this very check before the split was taught about).
@@ -4165,7 +5254,7 @@ void reportLegacyDebris(fs::path const& base) {
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Usage: integrated_tests <path-to-dss-code-prime> "
+        std::cerr << "Usage: integrated_tests <path-to-dsscp> "
                   << "<path-to-examples-root> [--only=<selector>]\n"
                   << "  --only=cli           the host-independent CLI surface "
                      "and the self-test pins; no corpus walk\n"
@@ -4173,8 +5262,14 @@ int main(int argc, char* argv[]) {
                   << "  --only=<lang>/<name> execute exactly one example\n"
                   << "  --only=adjudicate    parse every manifest, execute"
                      " none; the corpus-wide lints AND floors\n"
+                  << "  --only=coverage-boundary  run ONE corpus example through"
+                     " BOTH harnesses and judge the division of labour between"
+                     " them (needs --sibling-runner)\n"
                   << "  --cells=<dir>        where a per-example entry writes"
                      " its cell, and where the adjudicator reads them\n"
+                  << "  --sibling-runner=<exe>  the in-process corpus harness"
+                     " (dss_examples_runner), spawned by the coverage-boundary"
+                     " entry and by nothing else\n"
                   << "  (omitted)            everything, exactly as before\n";
         return 1;
     }
@@ -4192,10 +5287,16 @@ int main(int argc, char* argv[]) {
             g_cellDir = fs::path{a.substr(kCells.size())};
             continue;
         }
+        constexpr std::string_view kSibling = "--sibling-runner=";
+        if (a.rfind(kSibling, 0) == 0) {
+            g_siblingRunner = fs::path{a.substr(kSibling.size())};
+            continue;
+        }
         constexpr std::string_view kOnly = "--only=";
         if (a.rfind(kOnly, 0) != 0) {
             std::cerr << "[ERROR] unknown argument '" << a
-                      << "' (expected --only=<cli|corpus-lints|<lang>/<name>>)\n";
+                      << "' (expected --only=<cli|adjudicate|coverage-boundary"
+                         "|<lang>/<name>>, --cells= or --sibling-runner=)\n";
             return 1;
         }
         std::string const sel = a.substr(kOnly.size());
@@ -4203,13 +5304,15 @@ int main(int argc, char* argv[]) {
             g_only.kind = OnlyKind::CliSurface;
         } else if (sel == "adjudicate") {
             g_only.kind = OnlyKind::Adjudicate;
+        } else if (sel == "coverage-boundary") {
+            g_only.kind = OnlyKind::CoverageBoundary;
         } else if (sel.find('/') != std::string::npos) {
             g_only.kind      = OnlyKind::OneExample;
             g_only.exampleId = sel;
         } else {
             std::cerr << "[ERROR] --only='" << sel << "' is not a selector."
-                      << " Expected `cli`, `adjudicate`, or an example id of"
-                         " the form `<lang>/<name>`.\n";
+                      << " Expected `cli`, `adjudicate`, `coverage-boundary`,"
+                         " or an example id of the form `<lang>/<name>`.\n";
             return 1;
         }
     }
@@ -4266,6 +5369,34 @@ int main(int argc, char* argv[]) {
               << "Output:        " << outputBase.string()
               << "  (per-run, unique to THIS process)\n"
               << "Host OS:       " << currentHostOs() << "\n\n";
+
+    // ── the coverage-boundary entry picks its subject, then becomes an
+    //    ordinary per-example run ──────────────────────────────────────────
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // ★ THE DEGRADE IS THE DESIGN, not a shortcut. Rewriting the selector into
+    // `OneExample` means this entry's CLI-side measurement goes through the
+    // SAME `runAllExamples` -> `runExampleViaCli` path every per-example entry
+    // uses. A boundary guard that drove a private path would be comparing the
+    // sibling against code no ctest entry executes, and could report a boundary
+    // the suite does not actually have.
+    bool const wantCoverageBoundary = g_only.kind == OnlyKind::CoverageBoundary;
+    fs::path        boundarySubjectDir;
+    std::string     boundarySubjectId;
+    ExampleManifest boundarySubject;
+    if (wantCoverageBoundary) {
+        if (!selectCoverageBoundarySubject(examplesRoot, boundarySubjectDir,
+                                           boundarySubjectId, boundarySubject)) {
+            // The refusal already fired a [FAIL] naming both causes.
+            std::cout << "===========================================\n"
+                      << "Results: " << passes << " passed, " << failures
+                      << " failed (coverage boundary: no subject)\n";
+            return 1;
+        }
+        std::cout << "[Coverage boundary] subject selected from the corpus: "
+                  << boundarySubjectId << "\n\n";
+        g_only.kind      = OnlyKind::OneExample;
+        g_only.exampleId = boundarySubjectId;
+    }
 
     // ── which phases this invocation owns ───────────────────────────────────
     // D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD. Spelled as two
@@ -4329,7 +5460,7 @@ int main(int argc, char* argv[]) {
     // ── Harness self-test: recursive neighbour staging ──
     //
     // Deliberately UNNUMBERED. The `[Test N]` labels in this file are cited
-    // from outside it — `.plans/_deferred-anchor-registry.md` names `[Test 4]`
+    // from outside it — `.plans/_deferred-anchor-registry*.md` names `[Test 4]`
     // as where the manifest emulator lint lives — so slotting a new number in
     // before the corpus would silently invalidate a registry citation, and
     // appending it at the end would put a HARNESS check after the 581 examples
@@ -4359,12 +5490,29 @@ int main(int argc, char* argv[]) {
     // ── Harness self-test: the per-dependency opt-in parses here too ──
     //
     // UNNUMBERED for the same reason the staging self-test above is: the
-    // `[Test N]` labels are cited from `.plans/_deferred-anchor-registry.md`,
+    // `[Test N]` labels are cited from `.plans/_deferred-anchor-registry*.md`,
     // so inserting a number would silently invalidate a registry citation. Runs
     // BEFORE the corpus so a parser that stopped honouring the key announces
     // itself rather than letting every dependency comparison go quietly inert.
     runDependsOnParserPin(outputBase / "harness-dependson-parser");
+    // D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+    // the prebuilt-input entry's refusals. UNNUMBERED for the same reason its
+    // neighbours are — the `[Test N]` labels are cited from
+    // `.plans/_deferred-anchor-registry*.md`, so inserting a number would
+    // silently invalidate a registry citation. It runs on EVERY host, which is
+    // what makes it the CLI half's witness where no target of the corpus
+    // example binds (a Windows host binds neither the ELF nor the Mach-O one).
+    runPrebuiltLibraryParserPin(outputBase / "harness-prebuilt-library-parser");
     runManifestClosedKeySetPin(outputBase / "harness-manifest-keys");
+    // UNNUMBERED for the same reason its two neighbours are: the `[Test N]`
+    // labels are cited from `.plans/_deferred-anchor-registry*.md`, so inserting
+    // a number would silently invalidate a registry citation. It runs with the
+    // CLI surface rather than in the walk because it is ONE existence claim
+    // about the driver's argv handling, not a property of any example — and
+    // because the walk cannot express it at all: every example the walk compiles
+    // is handed an absolute path by construction, which is the gap this closes.
+    runSourceArgumentShapePin(compiler,
+                              outputBase / "harness-source-arg-shapes");
 
     }  // wantCliSurface
 
@@ -4380,6 +5528,13 @@ int main(int argc, char* argv[]) {
     if (wantWalk) {
         runOptimizedArmInstrument(
             /*executed=*/g_only.kind != OnlyKind::Adjudicate);
+    }
+
+    // ── the coverage boundary, judged over what the walk above ACTUALLY did ──
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    if (wantCoverageBoundary) {
+        runCoverageBoundaryJudge(boundarySubjectDir, boundarySubjectId,
+                                 boundarySubject, outputBase);
     }
 
     // ★ The cell is written whatever this entry's verdict, so a RED example still

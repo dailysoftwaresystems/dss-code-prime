@@ -12,7 +12,7 @@
 // they had ALREADY DRIFTED when they were merged here:
 //
 //   * `shippedLanguageDoc` existed in TWO of the three, with DIFFERENT
-//     signatures — one hard-wired `"c-subset"` and took no argument, the other
+//     signatures — one hard-wired `"c"` and took no argument, the other
 //     took the language name. The parameterised one is kept: a probe that can
 //     only ever read one document cannot state which document it read.
 //   * `at()` existed in the same TWO, also with different signatures, and only
@@ -30,24 +30,46 @@
 // QUOTED TOKEN, had to be made in three places or the three files would
 // silently measure different things. This header is the one place.
 //
-// ⚠ NOT YET UNIVERSAL: `tests/core/test_vocabulary_projection_ffi_and_lir.cpp`
-// carries a FOURTH copy of `quotedTokens` and does not include this header —
-// reported, not silently left (see the anchor above). It was outside the lane
-// that wrote this file.
+// ✔ THE FOURTH COPY IS ROUTED (2026-08-23, cycle P28,
+// D-TEST-VOCABULARY-PROBE-HELPER-FOURTH-COPY-OUTSIDE-THE-EXTRACTED-HEADER).
+// `tests/core/test_vocabulary_projection_ffi_and_lir.cpp` carried a `quotedTokens`
+// that was BYTE-IDENTICAL to this one, so the mutant that closed the parent row
+// reddened 3 of 4 and that file stayed green over a helper that no longer worked.
+// It includes this header now and the same mutant reds 4 of 4.
+//
+// ✔ AND THE CLASS IS NOW UNIVERSAL (2026-08-23, cycle P28,
+// D-TEST-VOCABULARY-PROBE-MESSAGE-HALF-IS-UNREACHABLE-AND-JSON-COUPLED), by
+// SPLITTING rather than by relocating. This file kept two unrelated jobs — it
+// LOCATES a shipped config document, and it READS A DIAGNOSTIC BACK — and only
+// the first needs `nlohmann/json.hpp`. Two measured obstacles, neither of them
+// reluctance, kept four further copies of `quotedTokens` alive outside it:
+//   * REACHABILITY. This header is found only by a same-directory quoted
+//     include; `tests/core` is on NO other test target's `-I` path, which
+//     `tests/lir/test_lir_return_pool_projection.cpp` had written down in its own
+//     prose as the reason it kept a private predicate.
+//   * DEPENDENCY SHAPE. `shippedLanguageDoc` and `at()` need `nlohmann/json.hpp`,
+//     so including this header dragged that dependency into TUs that never touch
+//     a JSON document — ✔MEASURED on the FFI/LIR consumer: +0.35 s of compile
+//     time and +245 KB of object, plus a `target_link_libraries` line the target
+//     did not otherwise need.
+// ⇒ the message-reading half now lives in `tests/test_support/vocabulary_message_probe.hpp`,
+// which is json-free and sits in the ONE directory `dss_add_test` puts on every
+// test target's include path. This header includes it, so a consumer that needs
+// both halves still writes one include and every name stays in
+// `dss::test_support` — no call site changed spelling.
+
+#include "vocabulary_message_probe.hpp"
 
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
 #include <nlohmann/json.hpp>
 
-#include <cstddef>
 #include <fstream>
-#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace dss::test_support {
 
@@ -100,73 +122,11 @@ at(nlohmann::json& doc, std::string_view pointer, std::string_view where) {
     }
 }
 
-// Every diagnostic, one per line, for a failure message. The pins print this
-// when an expected refusal is absent, so the reader sees what WAS reported.
-[[nodiscard]] inline std::string summarize(auto const& diags) {
-    std::string s;
-    for (auto const& d : diags) s += "\n  " + d.path + ": " + d.message;
-    return s.empty() ? std::string{"<no diagnostics>"} : s;
-}
-
-// Every `'…'`-quoted token in a message. `renderAllowedList` quotes each
-// spelling, so this is how a pin reads back WHAT THE MESSAGE CLAIMS — as
-// opposed to re-deriving it from the table, which would make the comparison
-// circular and green by construction.
-[[nodiscard]] inline std::vector<std::string>
-quotedTokens(std::string const& msg) {
-    std::vector<std::string> out;
-    std::size_t              i = 0;
-    while (true) {
-        auto const open = msg.find('\'', i);
-        if (open == std::string::npos) break;
-        auto const close = msg.find('\'', open + 1);
-        if (close == std::string::npos) break;
-        out.push_back(msg.substr(open + 1, close - open - 1));
-        i = close + 1;
-    }
-    return out;
-}
-
-// Membership over a projected name set — the half of the honesty check that
-// asks "is this quoted token one the vocabulary owns?".
-[[nodiscard]] inline bool
-namesContain(std::span<std::string_view const> names, std::string_view needle) {
-    for (auto const& n : names) {
-        if (n == needle) return true;
-    }
-    return false;
-}
-
-// (B) COMPLETENESS — SOME diagnostic in the failed load names every spelling
-// the table owns, and that diagnostic is the one the honesty check then reads.
-//
-// ⚠ THE SEARCH IS THE ASSERTION, and it has to be, because a refused load emits
-// MORE than the vocabulary refusal: a bad `encoding.format` also produces
-// eleven cascade diagnostics about slots belonging to a different shape, each
-// quoting real slot spellings; a bad `aggregateLayout` produces the block's own
-// "required field missing" cascade. Running the honesty check over the UNION of
-// every message reports those cascades as "advertised tokens" — measured on the
-// first run of both callers, and it is the pin lying, not the loader. The
-// vocabulary sentence is the one that names the WHOLE set.
-//
-// Returns a pointer INTO `diags` (never a copy — the caller's diagnostics
-// outlive every use), or nullptr when no message names the whole set.
-[[nodiscard]] inline std::string const*
-findVocabularyMessage(auto const&                       diags,
-                      std::span<std::string_view const> names) {
-    for (auto const& d : diags) {
-        auto const quoted = quotedTokens(d.message);
-        bool       all    = true;
-        for (std::string_view const n : names) {
-            bool found = false;
-            for (auto const& q : quoted) {
-                if (q == n) { found = true; break; }
-            }
-            if (!found) { all = false; break; }
-        }
-        if (all) return &d.message;
-    }
-    return nullptr;
-}
+// ★ `summarize`, `quotedTokens`, `namesContain` and `findVocabularyMessage` are
+// NOT missing — they moved to `tests/test_support/vocabulary_message_probe.hpp`,
+// included above, and are still `dss::test_support::…`. They read a diagnostic
+// back and need no JSON; keeping them here made every such pin an nlohmann
+// consumer, which is what kept four private copies of `quotedTokens` alive in
+// suites this directory is not on the include path of.
 
 } // namespace dss::test_support

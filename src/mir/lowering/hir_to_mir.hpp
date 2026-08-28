@@ -7,6 +7,7 @@
 #include "core/types/extern_import.hpp"
 #include "core/types/target_schema.hpp"   // VaListLayout
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_layout.hpp"  // NonObjectTypeSizes (operand sizes)
 #include "hir/hir.hpp"
 #include "hir/hir_attrs.hpp"
 #include "hir/hir_inline_asm.hpp"   // HirInlineAsmPool (inline-asm P5 descriptors)
@@ -93,8 +94,18 @@ struct DSS_EXPORT MirLoweringConfig {
     bool                  aggregateLayoutLoaded = false;
     DataModel             dataModel = DataModel::Lp64;
 
-    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75 (D-TARGET-
-    // CHAR-SIGNEDNESS-PER-PLATFORM): whether bare `char` (`TypeKind::Char`, NOT
+    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the source language's declared
+    // sizes for types with NO object representation (`void`, a function type),
+    // threaded from `semantics.nonObjectTypeSizes` exactly as `charTypesAliasAll`
+    // is threaded from `semantics.pointerAliasing`. Consumed ONLY through
+    // `operandLayout` — the sizeof/alignof/element-stride query — which is what
+    // keeps `elementStride` a SINGLE rule instead of growing a second one beside
+    // it. Both-absent by default, so a schema that declares nothing keeps the
+    // strict-ISO refusal and every pre-P42 lowering is byte-identical.
+    NonObjectTypeSizes    nonObjectTypeSizes{};
+
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75
+    // (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM): whether bare `char` (`TypeKind::Char`, NOT
     // `signed char`/`unsigned char`) is UNSIGNED for this compilation. ALREADY
     // RESOLVED when it arrives here — the driver threads in
     // `TargetSchema::charIsUnsigned(format.kind())`, which folds the target's
@@ -147,6 +158,21 @@ struct DSS_EXPORT MirLoweringConfig {
     std::uint32_t      argGprCount                = 0;
     std::uint32_t      argFprCount                = 0;
     bool               aggregateStackExhaustsRegisters = false;
+
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the active CC's
+    // stacked-argument packing rules, threaded from the resolved
+    // `TargetCallingConvention` exactly as the fields above are.
+    //
+    // ★ WHY HIR→MIR NEEDS THEM AT ALL, given that PLACEMENT is a LIR-tier job:
+    // `va_start`'s overflow base is the byte span of the NAMED parameters that
+    // overflowed onto the incoming stack, and HIR→MIR is the only tier that walks
+    // the parameter list with its TYPES in hand. Under `Slot` packing that span is
+    // "one slot per stacked named scalar", which is what `currentFnFixedStackBytes_`
+    // has always accumulated; under `Natural` it is the naturally-packed cursor,
+    // rounded up to a whole slot. Getting it wrong is invisible to a non-variadic
+    // witness and makes every `va_arg` read the wrong object.
+    // Default (all `Slot`) reproduces the previous arithmetic byte-for-byte.
+    StackArgPackingRules stackArgPacking{};
 
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the active CC's `__va_list_tag` layout +
     // register-save-area geometry, threaded from the resolved `TargetCallingConvention`
@@ -364,6 +390,18 @@ lowerToMir(Hir const&               hir,
            // it should not: the cross-table guard simply rejects the extern and
            // says so. The failure is loud and localized, so a pool-free test
            // fixture stays correct rather than becoming subtly wrong.
-           HirInlineDefinitionMap const* inlineDefinitionMap = nullptr);
+           HirInlineDefinitionMap const* inlineDefinitionMap = nullptr,
+           // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: per-promoted-GLOBAL
+           // provenance for a block-scope `static` — which function's body it was
+           // written in. Supplied by the driver as
+           // `&CstToHirResult::enclosingFunctionMap`.
+           //
+           // ⚠ `nullptr` IS SAFE AND LOUD, never silently wrong. It is consulted
+           // ONLY when a static-storage initializer contains a `&&label`; with no
+           // map (or no entry) that initializer is REFUSED with a diagnostic naming
+           // this row, because a per-function label ordinal cannot be resolved
+           // without knowing its function. Every OTHER initializer is unaffected, so
+           // a map-free test fixture keeps working exactly as before.
+           HirEnclosingFunctionMap const* enclosingFunctionMap = nullptr);
 
 } // namespace dss

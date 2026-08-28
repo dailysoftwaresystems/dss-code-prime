@@ -1,0 +1,16 @@
+{
+  "$comment": "TF-C66 (D-FFI-SHIPPED-LIBS-OS-ONLY): the C99 <inttypes.h> PRI* format-length macros ship as an OS descriptor (inttypes.json), added need-driven because the sqlite full-source testfixture uses PRIi64/PRIu32/PRIi32/PRIu64. Each expands to a quoted string fragment; a 64-bit specifier carries the `l` length modifier (glibc `l`, Apple/Windows `ll` -- both begin `l`), a 32-bit one does not. The program checks that width-class property (portable across formats) -> exit 42. RED-ON-DISABLE: delete inttypes.json -> `#include <inttypes.h>` fails F001A (no binary); or blank a macro replacement -> the specifier loses its `l` and returns 1/5. The release arm proves the preprocessor-materialized macro text survives the optimizer end-to-end.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

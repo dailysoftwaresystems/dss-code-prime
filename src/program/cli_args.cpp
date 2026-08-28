@@ -124,6 +124,23 @@ std::string_view compileConfigName(CompileConfig c) noexcept {
     return "unknown";
 }
 
+// D-OPT11-LAZY-IMPORT-EDGE. Case-insensitive on the same terms `--config` is,
+// and CLOSED: an unrecognized mode is a REFUSAL, never a fallback to `full`.
+std::string_view ltoModeArgName(LtoModeArg m) noexcept {
+    switch (m) {
+        case LtoModeArg::Full: return "full";
+        case LtoModeArg::Thin: return "thin";
+    }
+    return "unknown";
+}
+
+std::optional<LtoModeArg> parseLtoModeArg(std::string_view v) noexcept {
+    auto const lowered = asciiToLower(v);
+    if (lowered == "full") return LtoModeArg::Full;
+    if (lowered == "thin") return LtoModeArg::Thin;
+    return std::nullopt;
+}
+
 std::string_view cliArgsErrorName(CliArgsError e) noexcept {
     switch (e) {
         case CliArgsError::UnknownFlag:         return "UnknownFlag";
@@ -142,6 +159,8 @@ std::string_view cliArgsErrorName(CliArgsError e) noexcept {
         case CliArgsError::InvalidStackReserve:  return "InvalidStackReserve";
         case CliArgsError::InvalidResolveLibrary: return "InvalidResolveLibrary";
         case CliArgsError::InvalidMaxDiagnostics: return "InvalidMaxDiagnostics";
+        case CliArgsError::InvalidMaxPerCode:     return "InvalidMaxPerCode";
+        case CliArgsError::InvalidLto:           return "InvalidLto";
     }
     return "Unknown";
 }
@@ -152,20 +171,20 @@ std::string cliHelpText() {
     // — pin it stable across CLI extensions via the unit tests in
     // tests/program/test_cli_args.cpp.
     static std::string const text =
-        "dss-code-prime — universal config-driven compiler\n"
+        "dsscp — universal config-driven compiler\n"
         "\n"
         "Usage:\n"
-        "  dss-code-prime --compile <file>... [--language <name>] "
+        "  dsscp --compile <file>... [--language <name>] "
             "--target <spec> [options]\n"
-        "  dss-code-prime --transpile <file>... --language <name> "
+        "  dsscp --transpile <file>... --language <name> "
             "--target <spec> [options]\n"
-        "  dss-code-prime --directory <path> [--language <name>] "
+        "  dsscp --directory <path> [--language <name>] "
             "--target <spec> [options]\n"
-        "  dss-code-prime --project <file.dss-project.json>\n"
-        "  dss-code-prime --dump-predefined-macros --language <name> "
+        "  dsscp --project <file.dss-project.json>\n"
+        "  dsscp --dump-predefined-macros --language <name> "
             "--target <spec>\n"
-        "  dss-code-prime --lsp [--schema-dir=<path>]\n"
-        "  dss-code-prime --help\n"
+        "  dsscp --lsp [--schema-dir=<path>]\n"
+        "  dsscp --help\n"
         "\n"
         "Modes (exactly one required):\n"
         "  --compile <file>...    explicit source-file list "
@@ -194,7 +213,7 @@ std::string cliHelpText() {
         "\n"
         "Common compile / transpile options:\n"
         "  --language <name>      source-language schema name "
-            "(e.g. c-subset). REQUIRED for --transpile and "
+            "(e.g. c). REQUIRED for --transpile and "
             "--dump-predefined-macros. OPTIONAL for --compile / --directory: "
             "omitted, each --target supplies the language it declares as its "
             "own assembly dialect ('defaultAssemblyLanguage'), which is how "
@@ -212,6 +231,14 @@ std::string cliHelpText() {
         "  --config=<debug|release>  build config "
             "(default: debug; release applies the full optimizer "
             "pipeline — plan 22)\n"
+        // D-OPT11-LAZY-IMPORT-EDGE. Documented HERE and not only in the header,
+        // for the reason D-CLI-HELP-OMITS-DEFINE-FLAG records: a flag that is
+        // parsed but not listed has the source as its only discoverable
+        // spelling.
+        "  --lto=<full|thin>      link-time-optimization topology "
+            "(default: full = one merged module, one whole-program optimize; "
+            "thin = a parallel per-TU optimize with on-demand cross-TU body "
+            "imports first, then the same merge)\n"
         "  --jobs <N>             per-CU build parallelism "
             "(default: auto = min(cores, TUs, 16); --jobs 1 = serial). "
             "Only the multi-source build parallelizes; the `=`-form is "
@@ -305,13 +332,13 @@ std::string cliHelpText() {
         "  --schema-dir=<path>    path to additional shipped configs\n"
         "\n"
         "Examples:\n"
-        "  dss-code-prime --compile hello.c --language c-subset "
+        "  dsscp --compile hello.c --language c "
             "--target x86_64:elf64-x86_64-linux\n"
-        "  dss-code-prime --directory src/ --language c-subset "
+        "  dsscp --directory src/ --language c "
             "--target x86_64:elf64-x86_64-linux --config=release\n"
-        "  dss-code-prime --dump-predefined-macros --language c-subset "
+        "  dsscp --dump-predefined-macros --language c "
             "--target x86_64:pe64-x86_64-windows-exec --define SQLITE_TEST\n"
-        "  dss-code-prime --compile boot.s "
+        "  dsscp --compile boot.s "
             "--target x86_64:elf64-x86_64-linux "
             "--target arm64:elf64-aarch64-linux   (no --language: each "
             "target picks its own assembly dialect)\n";
@@ -752,6 +779,27 @@ parseCliArgs(int argc, char* argv[]) {
             continue;
         }
         {
+            // D-OPT11-LAZY-IMPORT-EDGE: `--lto <mode>` / `--lto=<mode>` — the
+            // link-time-optimization TOPOLOGY. A CLOSED vocabulary; an
+            // unrecognized mode is refused rather than falling back to `full`,
+            // because a silent fallback reports the same green as a build that
+            // honoured the flag.
+            auto m = valueFlag(a, i, "--lto");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                auto const mode = parseLtoModeArg(**m);
+                if (!mode.has_value()) {
+                    return std::unexpected(make_error(
+                        CliArgsError::InvalidLto,
+                        std::string{"--lto: '"} + **m
+                        + "' is not a recognized link-time-optimization mode "
+                          "(accepted: full, thin)"));
+                }
+                out.lto = *mode;
+                continue;
+            }
+        }
+        {
             // D-PERF-4-CU-PARALLELISM: `--jobs N` / `--jobs=N` — worker count for
             // the per-CU build pool. Must be a positive integer (>= 1); a non-
             // numeric value, trailing junk, or 0 fails loud (InvalidJobs) rather
@@ -857,6 +905,38 @@ parseCliArgs(int argc, char* argv[]) {
                           "show none, just count them)"));
                 }
                 out.maxDiagnostics = n;
+                continue;
+            }
+        }
+        {
+            // `--max-per-code <count>` / `--max-per-code=<count>` — the
+            // PER-CODE cap (`DiagnosticReporter::Config::maxPerCode`).
+            // D-DIAG-MAXPERCODE-SILENT-COALESCE.
+            //
+            // Shape is the `--max-diagnostics` arm above, verbatim and
+            // deliberately: one `valueFlag` covering both spellings,
+            // `from_chars` on an UNSIGNED type so a leading '-' is rejected as
+            // invalid_argument with no separate branch, `ec` covering
+            // non-numeric AND result_out_of_range (a count above SIZE_MAX must
+            // not wrap into a small cap), and `p != end` covering trailing junk
+            // so `100x` cannot silently become 100. Zero is accepted here too
+            // — see the `CliArgs::maxPerCode` docblock.
+            auto m = valueFlag(a, i, "--max-per-code");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                std::string const& v = **m;
+                std::size_t n = 0;
+                auto const [p, ec] = std::from_chars(
+                    v.data(), v.data() + v.size(), n);
+                if (ec != std::errc{} || p != v.data() + v.size()) {
+                    return std::unexpected(make_error(
+                        CliArgsError::InvalidMaxPerCode,
+                        std::string{"--max-per-code: '"} + v
+                        + "' is not a non-negative integer diagnostic count "
+                          "(e.g. --max-per-code 500; 0 is legal and means "
+                          "elide every one, just count them per code)"));
+                }
+                out.maxPerCode = n;
                 continue;
             }
         }
@@ -1005,6 +1085,7 @@ parseCliArgs(int argc, char* argv[]) {
             offenders += flag;
         };
         if (out.maxDiagnostics.has_value()) note("--max-diagnostics");
+        if (out.maxPerCode.has_value())     note("--max-per-code");
         if (!out.suppress.empty())          note("--suppress");
         if (out.warningsAsErrors)           note("--warnings-as-errors");
         if (!offenders.empty()) {
@@ -1047,6 +1128,9 @@ parseCliArgs(int argc, char* argv[]) {
          // --max-diagnostics without a mode flag would silently discard the
          // requested cap (no compile, so no reporter is ever built from it).
          || out.maxDiagnostics.has_value()
+         // --max-per-code without a mode flag would silently discard the
+         // requested cap for exactly the same reason.
+         || out.maxPerCode.has_value()
          || out.config != CompileConfig::Debug
          || out.directoryMode != InputResolver::Mode::Recursive;
         if (hasOptions) {
@@ -1143,6 +1227,11 @@ DiagnosticReporter::Config buildReporterConfig(CliArgs const& args) {
     // source of truth this flag was added to eliminate.
     if (args.maxDiagnostics.has_value()) {
         cfg.maxDiagnostics = *args.maxDiagnostics;
+    }
+    // Same write-only-when-asked discipline, same reason
+    // (D-DIAG-MAXPERCODE-SILENT-COALESCE).
+    if (args.maxPerCode.has_value()) {
+        cfg.maxPerCode = *args.maxPerCode;
     }
     return cfg;
 }

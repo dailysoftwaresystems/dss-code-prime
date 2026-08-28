@@ -1,6 +1,6 @@
 #pragma once
 
-// Shared test fixture: lower a snippet of c-subset source all the way
+// Shared test fixture: lower a snippet of c source all the way
 // to LIR, threading each phase's diagnostics. Used by liveness +
 // regalloc tests to exercise the substrate end-to-end without
 // re-rolling the pipeline boilerplate in each TU.
@@ -41,19 +41,19 @@ struct LoweredLir {
 // Schema-injected overload (D-OPT-REGALLOC-EXCLUSION-BUFFER closure,
 // 2026-06-11): a test exercising substrate behavior against a
 // MUTATED target schema (the tests/test_support/mutate_target_schema
-// substrate) hands the pre-built schema in directly; the c-subset →
+// substrate) hands the pre-built schema in directly; the c →
 // HIR → MIR half of the pipeline is target-independent, so only the
 // MIR→LIR step consumes it.
 [[nodiscard]] inline LoweredLir
-lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target,
+lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
                   std::uint16_t mirCcIndex = 0) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    auto loaded = GrammarSchema::loadShipped("c");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
     UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
     if (target == nullptr) {
-        ADD_FAILURE() << "lowerCSubsetToLir: null target schema";
+        ADD_FAILURE() << "lowerCToLir: null target schema";
         std::abort();
     }
     // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): thread the SELECTED CC's va_list
@@ -72,7 +72,7 @@ lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target,
     // so with no target in scope `HirInlineAsmOperand::regClassResolved` stays
     // false and `lowerInlineAsm` REFUSES rather than guessing a register bank
     // (`… has no resolved register class`, D-CSUBSET-INLINE-ASM-OPERANDS).
-    // ⚠ THIS IS THE SAME OMISSION `test_mir_lowering_c_subset.cpp`'s harness had
+    // ⚠ THIS IS THE SAME OMISSION `test_mir_lowering_c.cpp`'s harness had
     // one tier up, and it hides the FEATURE, not just the fixture: every asm
     // source lowered here failed at MIR, so nothing downstream was ever reached.
     // `compile_pipeline.cpp` passes it; a harness that does not cannot test asm.
@@ -104,6 +104,14 @@ lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target,
             static_cast<std::uint32_t>(cc->argFprs.size());
         mirCfg.aggregateStackExhaustsRegisters =
             cc->aggregateStackExhaustsRegisters;
+        // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the stacked-arg
+        // packing rules decide `va_start`'s overflow base for a callee whose named
+        // params overflow the arg registers. ⚠ THREADED HERE AS PART OF ADDING THE
+        // FIELD, not as a follow-up — the docblock below records this fixture
+        // silently reading a default THREE times (TF-C78 / TF-C81 / TF-C92) and
+        // every test concluding the feature was absent. A default here would make
+        // the Apple `va_start` pin PASS against slot packing.
+        mirCfg.stackArgPacking           = cc->stackArgPacking;
         mirCfg.vaListLayout              = cc->vaListLayout;
     }
     // D-CSUBSET-VLA (C1b): thread the captured VLA size-expr map so a `int a[n]`
@@ -118,7 +126,7 @@ lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target,
     // operand-less, clobber-less descriptor) is the silent miscompile the P5 arc
     // exists to prevent. So every source with an asm statement failed at MIR here
     // and never reached the tier this directory tests.
-    // ⚠ THIS IS THE SAME MISS `test_mir_lowering_c_subset.cpp` RECORDS HITTING
+    // ⚠ THIS IS THE SAME MISS `test_mir_lowering_c.cpp` RECORDS HITTING
     // THREE TIMES ONE TIER UP (TF-C78 / TF-C81 / TF-C92: a map threaded through
     // the product and through `compile_pipeline.cpp` while every unit test read a
     // nullptr and saw the feature as absent). Treat updating this call as PART OF
@@ -138,7 +146,14 @@ lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target,
                                     /*alwaysInlineMap=*/nullptr,
                                     /*noOptimizeMap=*/nullptr,
                                     /*noSanitizeThreadMap=*/nullptr,
-                                    &hir->inlineAsmPool);
+                                    &hir->inlineAsmPool,
+                                    /*inlineDefinitionMap=*/nullptr,
+                                    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED:
+                                    // without it a `&&label` in a static initializer is
+                                    // REFUSED at MIR and never reaches this tier at all
+                                    // — the exact shape of the miss the block above
+                                    // records hitting three times.
+                                    &hir->enclosingFunctionMap);
     DiagnosticReporter lirReporter;
     MirToLirResult lir = lowerToLir(mir.mir, *target,
                                     model.lattice().interner(),
@@ -154,14 +169,14 @@ lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target,
 // AAPCS64 link-register frame discipline) passes the target name
 // explicitly; the whole lower->LIR pipeline is target-parameterized.
 [[nodiscard]] inline LoweredLir
-lowerCSubsetToLir(std::string src, std::string targetName = "x86_64",
+lowerCToLir(std::string src, std::string targetName = "x86_64",
                   std::uint16_t mirCcIndex = 0) {
     auto target = TargetSchema::loadShipped(targetName);
     if (!target) {
         ADD_FAILURE() << "loadShipped(" << targetName << ") failed";
         std::abort();
     }
-    return lowerCSubsetToLir(std::move(src), std::move(*target), mirCcIndex);
+    return lowerCToLir(std::move(src), std::move(*target), mirCcIndex);
 }
 
 } // namespace dss::test_support

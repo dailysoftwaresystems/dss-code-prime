@@ -40,7 +40,7 @@
 #include <vector>
 
 using namespace dss;
-using dss::test_support::lowerCSubsetToLir;
+using dss::test_support::lowerCToLir;
 
 namespace {
 
@@ -135,7 +135,7 @@ TEST(LirRegAlloc, CcIndex1RecordsThroughToFuncAllocation) {
     // on every LirFuncAllocation. Without this pin a regression
     // that drops the threaded index back to 0 would silently
     // re-emit SysV register assignments on PE+x86_64 targets.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x) { return x + x; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -153,7 +153,7 @@ TEST(LirRegAlloc, CcIndexOutOfRangeFailsLoud) {
     // x86_64 ships 2 cc rows; ccIndex=99 must trip
     // R_CallingConventionLookupFailed per allocateOneFunc's
     // defensive arm.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x) { return x + x; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -171,7 +171,7 @@ TEST(LirRegAlloc, CcIndexOutOfRangeFailsLoud) {
 }
 
 TEST(LirRegAlloc, StraightLineFunctionAssignsAllPhys) {
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x) { return x + x; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -217,7 +217,7 @@ TEST(LirRegAlloc, FactoryRejectsSpillInvalidSlot) {
 }
 
 TEST(LirRegAlloc, ForVRegFindsAssignment) {
-    auto lowered = lowerCSubsetToLir("int f(int x) { return x; }");
+    auto lowered = lowerCToLir("int f(int x) { return x; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
@@ -239,7 +239,7 @@ TEST(LirRegAlloc, ForVRegFindsAssignment) {
 }
 
 TEST(LirRegAlloc, ForFuncResolvesByFuncId) {
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int g(int a) { return a + 1; }\n"
         "int f(int x) { int y = g(x); return y; }\n");
     ASSERT_TRUE(lowered.lir.ok);
@@ -258,7 +258,7 @@ TEST(LirRegAlloc, ForFuncResolvesByFuncId) {
 TEST(LirRegAlloc, Requires2AddressResultExcludesOpsOneThroughN) {
     // D-CSUBSET-BINOP-RIGHT-CLOBBER mechanism pin (2026-06-02).
     //
-    // The end-to-end example pins (examples/c-subset/arithmetic +
+    // The end-to-end example pins (examples/c/arithmetic +
     // subtraction + register_pressure) prove the bug-class is
     // closed AT THE EXIT-CODE LEVEL, but a refactor that "got
     // lucky" with the chosen inputs would pass those examples
@@ -278,7 +278,7 @@ TEST(LirRegAlloc, Requires2AddressResultExcludesOpsOneThroughN) {
     // exclusion-blind again (silent-failure HIGH-1 fold), would
     // re-introduce result==ops[k] aliasing — and THIS test would
     // catch it independently of the end-to-end examples.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x, int y) {\n"
         "    return x * y;\n"
         "}\n");
@@ -354,7 +354,7 @@ TEST(LirRegAlloc, AllPhysicalAssignmentsAreDistinctAtAnyPoint) {
     // simultaneously-live vregs cannot share a physical register.
     // Probe: across all live ranges, no two overlapping ranges of the
     // same class share a physical reg ordinal.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x, int y, int z) {\n"
         "    int a = x + y;\n"
         "    int b = a * z;\n"
@@ -458,7 +458,7 @@ TEST(LirRegAlloc, DivisorVregExcludesImplicitClobberSet) {
     // the use site we want to verify NEVER lands in RAX (ord 0)
     // or RDX (ord 2) — the compound-div implicit-input + clobber
     // set. Returns the quotient.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int q(int a, int b) { return a / b; }\n");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -572,7 +572,7 @@ TEST(LirRegAlloc, PressuredShiftResultExcludesImplicitInputAndClobberSet) {
         }
         src += ";\n}\n";
 
-        auto lowered = lowerCSubsetToLir(src);
+        auto lowered = lowerCToLir(src);
         ASSERT_TRUE(lowered.lir.ok) << "nLive=" << nLive;
         LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
         DiagnosticReporter regallocRep;
@@ -678,7 +678,7 @@ TEST(LirRegAlloc, PressuredShiftResultExcludesImplicitInputAndClobberSet) {
 // excludedScratch)` consultation in lir_regalloc.cpp's
 // allocateOneFunc → covering ranges land on rdx/rax at the drained
 // sweep points → this pin goes RED (and the pressured corpus arm
-// `examples/c-subset/division/` exits wrong). Agnostic: discovery
+// `examples/c/division/` exits wrong). Agnostic: discovery
 // probes the schema's declared implicitRegisters; no mnemonic list,
 // no register names in the assertion.
 TEST(LirRegAlloc, PressuredDivCoveringVregsExcludeImplicitInputAndClobberSet) {
@@ -702,7 +702,7 @@ TEST(LirRegAlloc, PressuredDivCoveringVregsExcludeImplicitInputAndClobberSet) {
         }
         src += ";\n}\n";
 
-        auto lowered = lowerCSubsetToLir(src);
+        auto lowered = lowerCToLir(src);
         ASSERT_TRUE(lowered.lir.ok) << "nLive=" << nLive;
         LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
         DiagnosticReporter regallocRep;
@@ -774,8 +774,8 @@ TEST(LirRegAlloc, PressuredDivCoveringVregsExcludeImplicitInputAndClobberSet) {
 // argGprs ∪ argFprs from any range of the callee vreg covering the
 // call (lir_regalloc.cpp's indirect-callee consumer).
 //
-// THE PIN MUST BE PRESSURED (the D-LIR-REGALLOC-PRESSURED-IMPLICIT-
-// CLOBBER-PIN lesson): unpressured, the linear scan picks a non-arg
+// THE PIN MUST BE PRESSURED (the D-LIR-REGALLOC-PRESSURED-IMPLICIT-CLOBBER-PIN
+// lesson): unpressured, the linear scan picks a non-arg
 // caller-saved register (r11/r10 first on SysV's LIFO) and the pin
 // passes even with the exclusion disabled. The shape below drains the
 // pools at the callee's allocation point:
@@ -850,7 +850,7 @@ TEST(LirRegAlloc, PressuredIndirectCalleeExcludesArgRegs) {
         for (int i = 0; i < 8; ++i) src += " + c" + std::to_string(i);
         src += ";\n}\n";
 
-        auto lowered = lowerCSubsetToLir(src);
+        auto lowered = lowerCToLir(src);
         ASSERT_FALSE(lowered.model.hasErrors()) << "k=" << k;
         ASSERT_TRUE(lowered.lir.ok) << "k=" << k;
         Lir const& lir = lowered.lir.lir;
@@ -988,7 +988,7 @@ TEST(LirRegAlloc, ExclusionUnionBeyondFixedBufferAllocatesAndExcludesAll) {
     ASSERT_TRUE(mutated.has_value())
         << "mutated x86_64 schema failed to load";
 
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int q(int a, int b) { return a / b; }\n", *mutated);
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -1066,7 +1066,7 @@ TEST(LirRegAlloc, ResultDefExclusionUnionBeyondFixedBufferAllocatesAndExcludesAl
     ASSERT_TRUE(mutated.has_value())
         << "mutated x86_64 schema failed to load";
 
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x, int n) { return x << n; }\n", *mutated);
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -1156,7 +1156,7 @@ TEST(LirRegAlloc, CrossCallRangesLandInCalleeSavedOrSpill) {
     // local no longer produces a cross-call range. The params `a..h` below are each
     // used as a call argument (before the call) AND in the post-call sum, so each
     // genuinely spans the call — remat-independent pressure.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int g(int v) { return v + 1; }\n"
         "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
         "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
@@ -1382,7 +1382,7 @@ TEST(LirRegAlloc, ReservedStackPointerNeverAllocated) {
 // `if (reservedFramePointer.has_value() && i == *reservedFramePointer)
 // continue;` from buildFreeLists left regalloc 29/29 AND callconv 85/85
 // green — the only thing that noticed was the runtime example
-// `examples/c-subset/c99_vla_spill` segfaulting instead of exiting 42.
+// `examples/c/c99_vla_spill` segfaulting instead of exiting 42.
 // That example STAYS as the end-to-end witness; this is the unit pin, and
 // the two are kept separately on purpose.
 //
@@ -1407,7 +1407,7 @@ TEST(LirRegAlloc, FramePointerReservedOnlyForFunctionsWithAVla) {
     src += "a[0];\n}\n"
            "int noVla(int n) { return n + 1; }\n";
 
-    auto lowered = lowerCSubsetToLir(src);
+    auto lowered = lowerCToLir(src);
     ASSERT_TRUE(lowered.lir.ok) << "VLA fixture failed to lower";
     auto const& sch = *lowered.target;
     Lir const&  lir = lowered.lir.lir;
@@ -1520,7 +1520,7 @@ TEST(LirRegAlloc, FprClassRangesGetFprRegisters) {
 }
 
 TEST(LirRegAlloc, LoopFunctionAllocatesWithoutCrash) {
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int n) {\n"
         "    int i = 0; int acc = 0;\n"
         "    while (i < n) { acc = acc + i; i = i + 1; }\n"
@@ -1536,7 +1536,7 @@ TEST(LirRegAlloc, LoopFunctionAllocatesWithoutCrash) {
 }
 
 TEST(LirRegAlloc, SwitchFunctionAllocatesWithoutCrash) {
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x) {\n"
         "    switch (x) {\n"
         "        case 1: return 10;\n"
@@ -1644,7 +1644,7 @@ TEST(LirRegAlloc, OkPropagationOnCleanRun) {
     // Pin the contract: on a clean run, ok() returns true and every
     // per-function ok flag is true. Info-severity diagnostics
     // (R_Spilled* summaries) do NOT flip ok.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x) { return x + x; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -1660,7 +1660,7 @@ TEST(LirRegAlloc, AssignmentVRegMatchesIndexId) {
     // The substrate contract: assignments[i].vreg.id == i for every
     // non-sentinel slot. Regression pin against future refactors that
     // might desync the indexing.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x, int y) { return x + y; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -1689,7 +1689,7 @@ TEST(LirRegAlloc, AssignmentVRegMatchesIndexId) {
 // crossing locals drain the callee-saved pool, the k arg locals drain the
 // caller-saved LIFO toward x8; the post-call re-read keeps fp's vreg live across
 // the call. Host-independent structural pin (the end-to-end qemu witness is
-// examples/c-subset/struct_byval_indirect_aapcs64). RED-ON-DISABLE (demonstrated
+// examples/c/struct_byval_indirect_aapcs64). RED-ON-DISABLE (demonstrated
 // 2026-06-23 + restored): comment out the indirect-result block in
 // allocateOneFunc's indirect-callee consumer -> the callee lands on x8 at a
 // drained sweep point -> this pin goes RED. Agnostic: the forbidden ordinal is
@@ -1736,7 +1736,7 @@ TEST(LirRegAlloc, Aapcs64PressuredIndirectStructReturnCalleeExcludesX8) {
         for (int i = 0; i < 16; ++i) src += " + c" + std::to_string(i);
         src += ";\n}\n";
 
-        auto lowered = lowerCSubsetToLir(src, "arm64", /*mirCcIndex=*/0);
+        auto lowered = lowerCToLir(src, "arm64", /*mirCcIndex=*/0);
         ASSERT_FALSE(lowered.model.hasErrors()) << "k=" << k;
         ASSERT_TRUE(lowered.lir.ok) << "k=" << k << ": "
             << (lowered.lirReporter.all().empty()
@@ -2356,4 +2356,543 @@ TEST(LirRegAlloc, EarlyClobberTwoAddressResultAvoidsOperandZeroToo) {
            "operand[0] has finished being read.";
     EXPECT_NE(*eR, *eB)
         << "an EARLY-CLOBBER 2-address result aliases operand[1]";
+}
+
+// ── OPT8 (plan 22): THE PARTITION PREFERENCE ────────────────────────────
+//
+// A range that does NOT cross a call prefers a CALLER-saved register. Both
+// partitions were always legal for such a range; the order is what changed,
+// and it changed because a callee-saved register obliges the function to
+// save and restore it (✔MEASURED 3352 prologue saves = 5.1% of the emitted
+// `examples/c/**` instruction stream before the change, 735 after).
+//
+// ★★★ THE ENVELOPE PIN IS THE SIBLING TEST, NOT THIS ONE.
+// `CrossCallRangesLandInCalleeSavedOrSpill` above is what makes this change
+// safe: it asserts the rule this preference must never bend — a range that
+// DOES cross a call is still callee-saved-or-spilled. Read the two together;
+// this one alone could be satisfied by an allocator that had simply stopped
+// honouring the ABI.
+TEST(LirRegAlloc, NonCrossCallRangesPreferCallerSavedRegisters) {
+    // A LEAF function: no call anywhere, so no range can cross one, so every
+    // assigned range is free to take the cheap partition.
+    auto lowered = lowerCToLir(
+        "int f(int a, int b, int c) {\n"
+        "    int x = a * b;\n"
+        "    int y = x + c;\n"
+        "    return y ^ (x - c);\n"
+        "}\n");
+    ASSERT_TRUE(lowered.lir.ok);
+    LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+    DiagnosticReporter rep;
+    LirAllocation const out =
+        allocateRegisters(lowered.lir.lir, *lowered.target, lv,
+                          /*ccIndex=*/0, rep);
+    ASSERT_TRUE(out.ok());
+    ASSERT_FALSE(out.perFunc.empty());
+
+    auto const& sch = *lowered.target;
+    auto const* cc  = sch.callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    std::unordered_set<std::uint16_t> callerSaved, calleeSaved;
+    for (auto const& n : cc->callerSaved)
+        if (auto o = sch.registerByName(n); o.has_value()) callerSaved.insert(*o);
+    for (auto const& n : cc->calleeSaved)
+        if (auto o = sch.registerByName(n); o.has_value()) calleeSaved.insert(*o);
+    ASSERT_FALSE(callerSaved.empty());
+    ASSERT_FALSE(calleeSaved.empty());
+
+    // The leaf function is the one with no `call`.
+    auto const callOp = sch.opcodeByMnemonic("call");
+    ASSERT_TRUE(callOp.has_value());
+    Lir const& lir = lowered.lir.lir;
+    std::size_t inCaller = 0, inCallee = 0;
+    for (std::uint32_t i = 0; i < out.perFunc.size(); ++i) {
+        LirFuncId const fn = lir.funcAt(i);
+        bool hasCall = false;
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn) && !hasCall; ++bi) {
+            LirBlockId const b = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t k = 0; k < lir.blockInstCount(b); ++k)
+                if (lir.instOpcode(lir.blockInstAt(b, k)) == *callOp) {
+                    hasCall = true; break;
+                }
+        }
+        if (hasCall) continue;
+        for (auto const& a : out.perFunc[i].assignments) {
+            if (!a.vreg.valid() || a.isSpilled()) continue;
+            auto const ord = static_cast<std::uint16_t>(a.physReg().id);
+            if (callerSaved.count(ord) != 0)      ++inCaller;
+            else if (calleeSaved.count(ord) != 0) ++inCallee;
+        }
+    }
+    EXPECT_GT(inCaller, 0u)
+        << "a leaf function's ranges never reached the caller-saved partition "
+           "— the OPT8 preference is not being applied";
+    EXPECT_EQ(inCallee, 0u)
+        << "a leaf function took " << inCallee << " CALLEE-saved register(s) "
+           "while caller-saved ones were free. Each one costs a prologue save "
+           "and an epilogue restore that the function does not need.";
+}
+
+// ── plan 22 OPT8 — REGISTER COALESCING ──────────────────────────────
+//
+// The transform and its INDEPENDENT auditor are pinned separately, on
+// purpose. A test that only checks "the allocator produced no conflict"
+// proves nothing about the auditor: a broken auditor reports no conflict
+// too. So the auditor is exercised on HAND-BUILT allocations that are
+// deliberately wrong, each with a matched control differing by ONE number —
+// the only shape in which a green result means the arm actually ran.
+
+namespace {
+
+// The physical ordinal `vregId` landed on, or nullopt when it spilled or was
+// never assigned.
+[[nodiscard]] std::optional<std::uint16_t>
+ordinalOf(LirFuncAllocation const& alloc, std::uint32_t vregId) {
+    auto const* a = alloc.forVReg(vregId);
+    if (a == nullptr || a->isSpilled()) return std::nullopt;
+    return static_cast<std::uint16_t>(a->physReg().id);
+}
+
+}  // namespace
+
+TEST(LirRegAllocCoalesce, InterferencePredicateIsTheAllocatorsExpiryRule) {
+    LirReg const v = makeVirtualReg(1, LirRegClass::GPR);
+    // ABUTTING is the coalescable case and MUST read as no-interference: a
+    // copy is a USE of its source, so a coalescable source ends exactly where
+    // its destination begins. If this ever returned true, every copy would be
+    // vetoed and the whole pass would silently do nothing.
+    EXPECT_FALSE(lirRangesInterfere(LirLiveRange::make(v, 0, 10),
+                                    LirLiveRange::make(v, 10, 20)));
+    // ONE position of overlap is interference, in both directions.
+    EXPECT_TRUE(lirRangesInterfere(LirLiveRange::make(v, 0, 11),
+                                   LirLiveRange::make(v, 10, 20)));
+    EXPECT_TRUE(lirRangesInterfere(LirLiveRange::make(v, 10, 20),
+                                   LirLiveRange::make(v, 0, 11)));
+    EXPECT_TRUE(lirRangesInterfere(LirLiveRange::make(v, 0, 100),
+                                   LirLiveRange::make(v, 40, 50)));
+    EXPECT_FALSE(lirRangesInterfere(LirLiveRange::make(v, 0, 10),
+                                    LirLiveRange::make(v, 40, 50)));
+}
+
+TEST(LirRegAllocCoalesce, AuditorCatchesAnInterferingSharedRegister) {
+    LirReg const v1 = makeVirtualReg(1, LirRegClass::GPR);
+    LirReg const v2 = makeVirtualReg(2, LirRegClass::GPR);
+    LirReg const p0 = makePhysicalReg(0, LirRegClass::GPR);
+
+    LirFuncLiveness flow;
+    flow.ranges.push_back(LirLiveRange::make(v1, 0, 10));
+    flow.ranges.push_back(LirLiveRange::make(v2, 4, 12));   // OVERLAPS v1
+    LirFuncAllocation alloc;
+    alloc.assignments.assign(3, LirRegAssignment{});
+    alloc.assignments[1] = LirRegAssignment::makePhys(v1, p0);
+    alloc.assignments[2] = LirRegAssignment::makePhys(v2, p0);  // same register
+
+    auto const conflict = findAllocationConflict(flow, alloc);
+    ASSERT_TRUE(conflict.has_value())
+        << "two vregs with overlapping ranges were given one register and the "
+           "auditor said nothing — that is the exact silent miscompile it "
+           "exists to refuse";
+    EXPECT_FALSE(conflict->isSpillSlot);
+    EXPECT_EQ(conflict->sharedResource, 0u);
+    EXPECT_TRUE((conflict->a.id == 1u && conflict->b.id == 2u)
+                || (conflict->a.id == 2u && conflict->b.id == 1u));
+
+    // ★ THE CONTROL, DIFFERING BY ONE NUMBER. Move v2's start to exactly where
+    // v1 ends — the coalescable shape — and the SAME allocation is correct.
+    // Without this arm, an auditor that returned a conflict unconditionally
+    // would pass the assertion above.
+    LirFuncLiveness ok;
+    ok.ranges.push_back(LirLiveRange::make(v1, 0, 10));
+    ok.ranges.push_back(LirLiveRange::make(v2, 10, 12));
+    EXPECT_FALSE(findAllocationConflict(ok, alloc).has_value());
+}
+
+TEST(LirRegAllocCoalesce, AuditorCatchesAnInterferingSharedSpillSlot) {
+    LirReg const v1 = makeVirtualReg(1, LirRegClass::GPR);
+    LirReg const v2 = makeVirtualReg(2, LirRegClass::GPR);
+    LirSpillSlot const s1{1};
+
+    LirFuncLiveness flow;
+    flow.ranges.push_back(LirLiveRange::make(v1, 0, 10));
+    flow.ranges.push_back(LirLiveRange::make(v2, 4, 12));
+    LirFuncAllocation alloc;
+    alloc.assignments.assign(3, LirRegAssignment{});
+    alloc.assignments[1] = LirRegAssignment::makeSpill(v1, s1);
+    alloc.assignments[2] = LirRegAssignment::makeSpill(v2, s1);
+
+    auto const conflict = findAllocationConflict(flow, alloc);
+    ASSERT_TRUE(conflict.has_value())
+        << "spill-slot coalescing handed one stack slot to two values that are "
+           "live at the same time";
+    EXPECT_TRUE(conflict->isSpillSlot);
+    EXPECT_EQ(conflict->sharedResource, 1u);
+
+    LirFuncLiveness ok;
+    ok.ranges.push_back(LirLiveRange::make(v1, 0, 10));
+    ok.ranges.push_back(LirLiveRange::make(v2, 10, 12));
+    EXPECT_FALSE(findAllocationConflict(ok, alloc).has_value());
+}
+
+TEST(LirRegAllocCoalesce, AuditorDoesNotConfuseOrdinalsAcrossRegisterClasses) {
+    // GPR ordinal 0 and FPR ordinal 0 are DIFFERENT registers. An auditor
+    // keyed on the bare ordinal would manufacture a conflict here and turn
+    // every float-bearing function into a compile abort.
+    LirReg const g = makeVirtualReg(1, LirRegClass::GPR);
+    LirReg const f = makeVirtualReg(2, LirRegClass::FPR);
+    LirFuncLiveness flow;
+    flow.ranges.push_back(LirLiveRange::make(g, 0, 10));
+    flow.ranges.push_back(LirLiveRange::make(f, 0, 10));   // fully overlapping
+    LirFuncAllocation alloc;
+    alloc.assignments.assign(3, LirRegAssignment{});
+    alloc.assignments[1] =
+        LirRegAssignment::makePhys(g, makePhysicalReg(0, LirRegClass::GPR));
+    alloc.assignments[2] =
+        LirRegAssignment::makePhys(f, makePhysicalReg(0, LirRegClass::FPR));
+    EXPECT_FALSE(findAllocationConflict(flow, alloc).has_value());
+}
+
+TEST(LirRegAllocCoalesce, TiedOperandPairSharesOneRegister) {
+    // `x + x` lowers to a two-address `add` whose result is tied to operand 0.
+    // Coalescing the pair is what makes `legalizeTwoAddress` emit no copy.
+    auto lowered = lowerCToLir("int f(int x) { return x + x; }");
+    ASSERT_TRUE(lowered.lir.ok);
+    Lir const& lir = lowered.lir.lir;
+    LirLiveness const lv = analyzeLiveness(lir);
+    DiagnosticReporter rep;
+    LirAllocation const out =
+        allocateRegisters(lir, *lowered.target, lv, /*ccIndex=*/0, rep);
+    ASSERT_TRUE(out.ok());
+
+    bool sawTiedOp = false;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        auto const* alloc = out.forFunc(fn);
+        ASSERT_NE(alloc, nullptr);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const b = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(b); ++i) {
+                LirInstId const inst = lir.blockInstAt(b, i);
+                auto const* info = lowered.target->opcodeInfo(lir.instOpcode(inst));
+                if (info == nullptr || !info->requires2Address.has_value()) continue;
+                LirReg const res = lir.instResult(inst);
+                auto const ops = lir.instOperands(inst);
+                std::size_t const tied = *info->requires2Address;
+                if (!res.valid() || res.isPhysical != 0) continue;
+                if (ops.size() <= tied || ops[tied].kind != LirOperandKind::Reg) continue;
+                LirReg const t = ops[tied].reg;
+                if (!t.valid() || t.isPhysical != 0) continue;
+                auto const ro = ordinalOf(*alloc, res.id);
+                auto const to = ordinalOf(*alloc, t.id);
+                if (!ro.has_value() || !to.has_value()) continue;  // spilled
+                sawTiedOp = true;
+                EXPECT_EQ(*ro, *to)
+                    << "the two-address result (vreg " << res.id
+                    << ") and its tied operand (vreg " << t.id
+                    << ") were given different registers, so legalize must mint "
+                       "a copy that coalescing exists to remove";
+            }
+        }
+    }
+    EXPECT_TRUE(sawTiedOp) << "the fixture lowered no two-address instruction "
+                              "— this test would be vacuous";
+}
+
+TEST(LirRegAllocCoalesce, ParameterIsPreColoredIntoItsIncomingArgRegister) {
+    // D-ML7-2.5. With the parameter homed in its own incoming argument
+    // register, `materializeCallingConvention`'s `maybeMov` emits nothing.
+    auto lowered = lowerCToLir("int f(int x) { return x; }");
+    ASSERT_TRUE(lowered.lir.ok);
+    auto const* cc = lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_FALSE(cc->argGprs.empty());
+    auto const arg0 = lowered.target->registerByName(cc->argGprs[0]);
+    ASSERT_TRUE(arg0.has_value());
+    auto const argOp = lowered.target->opcodeByMnemonic("arg");
+    ASSERT_TRUE(argOp.has_value());
+
+    Lir const& lir = lowered.lir.lir;
+    LirLiveness const lv = analyzeLiveness(lir);
+    DiagnosticReporter rep;
+    LirAllocation const out =
+        allocateRegisters(lir, *lowered.target, lv, /*ccIndex=*/0, rep);
+    ASSERT_TRUE(out.ok());
+
+    bool sawArg = false;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        auto const* alloc = out.forFunc(fn);
+        ASSERT_NE(alloc, nullptr);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const b = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(b); ++i) {
+                LirInstId const inst = lir.blockInstAt(b, i);
+                if (lir.instOpcode(inst) != *argOp) continue;
+                if (lir.instPayload(inst) != 0) continue;
+                LirReg const res = lir.instResult(inst);
+                if (!res.valid() || res.isPhysical != 0) continue;
+                auto const ord = ordinalOf(*alloc, res.id);
+                if (!ord.has_value()) continue;
+                sawArg = true;
+                EXPECT_EQ(*ord, *arg0)
+                    << "parameter 0 was not homed in " << cc->argGprs[0]
+                    << ", so callconv still mints `mov <home>, " << cc->argGprs[0]
+                    << "` for every register-resident parameter";
+            }
+        }
+    }
+    EXPECT_TRUE(sawArg) << "the fixture lowered no `arg` op — vacuous";
+}
+
+TEST(LirRegAllocCoalesce, ComputedOutgoingArgumentIsPreColoredIntoItsArgRegister) {
+    // D-ML7-2.5, the USE side — the mirror of
+    // `ParameterIsPreColoredIntoItsIncomingArgRegister`, and the half that had
+    // been withheld.
+    //
+    // A COMPUTED value passed as an argument has no ABI birthplace, so no
+    // DEF-side hint can reach it: the incoming-parameter hint has no parameter
+    // to speak of and the return-register hint names the wrong register. Until
+    // the outgoing-argument hint existed, `materializeCallingConvention` minted
+    // `mov <argreg_k>, <wherever regalloc put it>` for every one of them, AFTER
+    // `lir_peephole` had already run — so nothing ever deleted them.
+    //
+    // `x * 3` and `y + 1` are two such values. Both must land in the argument
+    // registers the call will read them from.
+    // ⚠ THE ARGUMENTS ARE PASSED IN THE OPPOSITE ORDER TO THE ONE THEY ARE
+    // COMPUTED IN, AND THAT IS WHAT MAKES THIS PIN NON-VACUOUS. ✔MEASURED:
+    // with `g(x * 3, y + 1)` — computed and passed in the SAME order — this
+    // test passes with the hint REMOVED, because the free list hands out the
+    // argument registers in declaration order and coincidentally gets it
+    // right. That is the identical trap Lane I recorded for the tied-operand
+    // "coalesce" that only ever happened when the LIFO order agreed. Reversing
+    // the two forces a real choice: with no hint `p` takes argument register 0
+    // and `q` takes 1, so the call needs a 2-cycle broken through a scratch —
+    // THREE moves; with the hint each value is born where the call reads it
+    // and NO move is emitted.
+    auto lowered = lowerCToLir(
+        "int g(int a, int b) { return a + b; }\n"
+        "int f(int x, int y) { int p = x * 3; int q = y + 1; return g(q, p); }\n");
+    ASSERT_TRUE(lowered.lir.ok);
+    auto const* cc = lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_GE(cc->argGprs.size(), 2u);
+    auto const arg0 = lowered.target->registerByName(cc->argGprs[0]);
+    auto const arg1 = lowered.target->registerByName(cc->argGprs[1]);
+    ASSERT_TRUE(arg0.has_value() && arg1.has_value());
+
+    Lir const& lir = lowered.lir.lir;
+    LirLiveness const lv = analyzeLiveness(lir);
+    DiagnosticReporter rep;
+    LirAllocation const out =
+        allocateRegisters(lir, *lowered.target, lv, /*ccIndex=*/0, rep);
+    ASSERT_TRUE(out.ok());
+
+    // Find the call and read where its two argument operands were homed. The
+    // call is located by the DECLARED `isCall` flag, never by mnemonic — the
+    // same vocabulary the hint itself keys on.
+    bool sawCall = false;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        auto const* alloc = out.forFunc(fn);
+        ASSERT_NE(alloc, nullptr);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const b = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(b); ++i) {
+                LirInstId const inst = lir.blockInstAt(b, i);
+                auto const* info = lowered.target->opcodeInfo(lir.instOpcode(inst));
+                if (info == nullptr || !info->isCall) continue;
+                auto const ops = lir.instOperands(inst);
+                if (ops.size() < 3) continue;
+                std::vector<std::uint16_t> homes;
+                for (std::size_t k = 1; k < ops.size() && homes.size() < 2; ++k) {
+                    if (ops[k].kind != LirOperandKind::Reg) continue;
+                    if (!ops[k].reg.valid() || ops[k].reg.isPhysical != 0) continue;
+                    auto const ord = ordinalOf(*alloc, ops[k].reg.id);
+                    if (!ord.has_value()) continue;
+                    homes.push_back(*ord);
+                }
+                if (homes.size() < 2) continue;
+                sawCall = true;
+                EXPECT_EQ(homes[0], *arg0)
+                    << "outgoing argument 0 was not homed in " << cc->argGprs[0]
+                    << ", so callconv still mints a `mov` for it after the "
+                       "peephole has run";
+                EXPECT_EQ(homes[1], *arg1)
+                    << "outgoing argument 1 was not homed in " << cc->argGprs[1]
+                    << ", so callconv still mints a `mov` for it after the "
+                       "peephole has run";
+            }
+        }
+    }
+    EXPECT_TRUE(sawCall)
+        << "the fixture lowered no call with two virtual register arguments — "
+           "this pin would be vacuous";
+}
+
+TEST(LirRegAllocCoalesce, ACrossBankMoveIsNeverACoalescingCandidate) {
+    // Lane J's P40 handover, constraint 1, pinned here at its request. A
+    // GPR→SIMD→GPR sequence (arm64's `cnt`/`addv` popcount, x86-64's
+    // `movq_gpr_to_xmm` / `movq_xmm_to_gpr`) contains register-to-register
+    // moves whose SOURCE and DESTINATION are in DIFFERENT banks. A coalescer
+    // that admitted "both ends are registers" as a candidate would fuse a GPR
+    // vreg with an FPR one and delete the move, putting a GPR ordinal into an
+    // FP register field. The encoder's bank vocabulary would refuse it, but
+    // that refusal is the safety net and not the design.
+    //
+    // ★ TWO INDEPENDENT GUARDS STAND BETWEEN THE COALESCER AND THAT, AND BOTH
+    // ARE ASSERTED HERE, because either one alone would leave the property
+    // resting on a single line.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+
+    // GUARD 1 — THE OPCODE IDENTITY TEST. A cross-bank move is not the
+    // DECLARED class move of either class, so it is not a copy at all as far
+    // as `collectCoalesceInput` is concerned. This is the same argument
+    // `lir_peephole`'s R1 makes about `trunc`/`zext` printing as `mov`.
+    auto const gprMove = sch.regClassOpOpcode(TargetRegClass::GPR,
+                                              RegClassOp::Move);
+    auto const fprMove = sch.regClassOpOpcode(TargetRegClass::FPR,
+                                              RegClassOp::Move);
+    ASSERT_TRUE(gprMove.has_value());
+    ASSERT_TRUE(fprMove.has_value());
+    for (char const* crossBank : {"movq_gpr_to_xmm", "movq_xmm_to_gpr",
+                                  "movq_xclass"}) {
+        auto const op = sch.opcodeByMnemonic(crossBank);
+        ASSERT_TRUE(op.has_value())
+            << crossBank << " is gone from the shipped target — this pin has "
+               "lost its subject and would pass vacuously";
+        EXPECT_NE(*op, *gprMove) << crossBank << " resolves as the GPR class "
+                                    "move; a cross-bank copy would be coalesced";
+        EXPECT_NE(*op, *fprMove) << crossBank << " resolves as the FPR class "
+                                    "move; a cross-bank copy would be coalesced";
+    }
+
+    // GUARD 2 — THE CLASS CHECK, asserted through the ALLOCATOR rather than by
+    // reading it: two vregs of different classes can never be handed the same
+    // resource, because the auditor's resource key folds the class in. A
+    // coalescer that merged across banks would have to produce exactly this
+    // shape, and the auditor treats the two ordinals as different registers —
+    // which is why the class check must be in the COALESCER and is not
+    // something the auditor can catch. Asserting the auditor's polarity here
+    // records WHY the veto cannot be delegated to it.
+    LirReg const g = makeVirtualReg(1, LirRegClass::GPR);
+    LirReg const f = makeVirtualReg(2, LirRegClass::FPR);
+    LirFuncLiveness flow;
+    flow.ranges.push_back(LirLiveRange::make(g, 0, 10));
+    flow.ranges.push_back(LirLiveRange::make(f, 0, 10));
+    LirFuncAllocation alloc;
+    alloc.assignments.assign(3, LirRegAssignment{});
+    alloc.assignments[1] =
+        LirRegAssignment::makePhys(g, makePhysicalReg(3, LirRegClass::GPR));
+    alloc.assignments[2] =
+        LirRegAssignment::makePhys(f, makePhysicalReg(3, LirRegClass::FPR));
+    EXPECT_FALSE(findAllocationConflict(flow, alloc).has_value())
+        << "GPR 3 and FPR 3 are different registers; the auditor must not "
+           "manufacture a conflict, and therefore cannot be the thing that "
+           "stops a cross-bank merge — the coalescer's own class veto is";
+}
+
+TEST(LirRegAllocCoalesce, SpillSlotsAreReusedOnceTheirOccupantHasDied) {
+    // TWO SEQUENTIAL high-pressure regions. Each overflows the GPR pool, so
+    // each spills — but the first region's values are all DEAD before the
+    // second begins, so the second region's spills must land in the FIRST
+    // region's stack slots. Without slot coalescing the frame carries one slot
+    // per spilled value and is roughly twice as large.
+    //
+    // ⚠ The two-region shape is load-bearing. ✔MEASURED on
+    // `examples/c/c23_bitint_wide_muldiv` (189 spilled values): the emitted
+    // frame is BYTE-IDENTICAL with and without slot coalescing, because under
+    // sustained pressure the spilled ranges all overlap and none may share.
+    // A single-region fixture would therefore pass whether the feature exists
+    // or not — a vacuous pin.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    std::array<TypeKind, 1> const paramKinds{TypeKind::I32};
+    auto syn = test_support::buildSyntheticFn(
+        paramKinds, TypeKind::I32,
+        [&](MirBuilder& mb, TypeInterner&,
+            std::vector<TypeId> const& params, TypeId retT) {
+            MirInstId const a = mb.addArg(0, params[0]);
+            auto const region = [&](MirInstId seed) {
+                std::vector<MirInstId> vals;
+                vals.reserve(20);
+                for (int i = 0; i < 20; ++i) {
+                    std::array<MirInstId, 2> ops{seed, a};
+                    vals.push_back(mb.addInst(MirOpcode::Add, ops, retT));
+                }
+                MirInstId acc = vals[0];
+                for (std::size_t i = 1; i < vals.size(); ++i) {
+                    std::array<MirInstId, 2> ops{acc, vals[i]};
+                    acc = mb.addInst(MirOpcode::Add, ops, retT);
+                }
+                return acc;   // every `vals[i]` is dead from here on
+            };
+            MirInstId const first  = region(a);
+            MirInstId const second = region(first);
+            mb.addReturn(second);
+        });
+    DiagnosticReporter rep;
+    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, rep);
+    ASSERT_TRUE(lirResult.ok);
+    LirLiveness const lv = analyzeLiveness(lirResult.lir);
+    DiagnosticReporter regallocRep;
+    LirAllocation const out =
+        allocateRegisters(lirResult.lir, **target, lv, /*ccIndex=*/0, regallocRep);
+    ASSERT_TRUE(out.ok());
+    ASSERT_EQ(out.perFunc.size(), 1u);
+    auto const& alloc = out.perFunc[0];
+    expectAllocationInvariants(alloc);
+
+    std::uint32_t spilledValues = 0;
+    for (auto const& a : alloc.assignments) {
+        if (a.vreg.id == 0) continue;
+        if (a.isSpilled()) ++spilledValues;
+    }
+    ASSERT_GT(spilledValues, 0u) << "the fixture did not spill — vacuous";
+    EXPECT_GT(alloc.coalescedSpillSlots, 0u)
+        << "no spill slot was reused across two disjoint pressure regions";
+    EXPECT_LT(alloc.numSpillSlots, spilledValues)
+        << "the frame reserves one slot per spilled value (" << spilledValues
+        << " values, " << alloc.numSpillSlots
+        << " slots) — slot coalescing is not reaching the frame";
+    // And the auditor agrees the sharing is legal.
+    auto const* flow = lv.forFunc(alloc.fn);
+    ASSERT_NE(flow, nullptr);
+    EXPECT_FALSE(findAllocationConflict(*flow, alloc).has_value());
+}
+
+TEST(LirRegAllocCoalesce, RealAllocationsCarryNoInterferenceConflict) {
+    // The positive control for the auditor, over shapes the fixture can lower:
+    // straight line, branch, loop, call, float. It cannot prove the auditor
+    // WORKS (see the hand-built arms above for that) but it proves the
+    // ALLOCATOR is clean under the auditor's own definition, which is the
+    // property the in-process abort enforces on every real compile.
+    char const* const sources[] = {
+        "int f(int x) { return x + x; }",
+        "int f(int c) { return c ? 3 : 4; }",
+        "int f(int n) { int s = 0; for (int i = 0; i < n; ++i) s += i; return s; }",
+        "int g(int a); int f(int x) { int k = x; return k + g(x); }",
+        "double f(double d) { double e = d; return e + 1.0; }",
+    };
+    for (char const* src : sources) {
+        auto lowered = lowerCToLir(src);
+        ASSERT_TRUE(lowered.lir.ok) << src;
+        Lir const& lir = lowered.lir.lir;
+        LirLiveness const lv = analyzeLiveness(lir);
+        DiagnosticReporter rep;
+        LirAllocation const out =
+            allocateRegisters(lir, *lowered.target, lv, /*ccIndex=*/0, rep);
+        ASSERT_TRUE(out.ok()) << src;
+        for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+            LirFuncId const fn = lir.funcAt(fi);
+            auto const* flow = lv.forFunc(fn);
+            auto const* alloc = out.forFunc(fn);
+            ASSERT_NE(flow, nullptr);
+            ASSERT_NE(alloc, nullptr);
+            auto const c = findAllocationConflict(*flow, *alloc);
+            EXPECT_FALSE(c.has_value())
+                << src << " — vregs " << (c ? c->a.id : 0) << " and "
+                << (c ? c->b.id : 0) << " share a resource while both live";
+        }
+    }
 }

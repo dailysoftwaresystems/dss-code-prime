@@ -13,6 +13,7 @@ add_subdirectory(lir)
 add_subdirectory(asm)
 add_subdirectory(link)
 add_subdirectory(mir/merge)
+add_subdirectory(mir/summary)
 add_subdirectory(ffi)
 add_subdirectory(lsp)
 add_subdirectory(program)
@@ -55,7 +56,7 @@ endforeach()
 
 # ── Shared library (DLL / .so / .dylib) ──
 # All compiler functionality in a single shared library for embedding in other projects.
-add_library(dss-code-prime-lib SHARED
+add_library(dsscp-lib SHARED
     $<TARGET_OBJECTS:core>
     $<TARGET_OBJECTS:tokenizer>
     $<TARGET_OBJECTS:analysis_syntactic>
@@ -67,6 +68,7 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:mir>
     $<TARGET_OBJECTS:mir_lowering>
     $<TARGET_OBJECTS:mir_merge>
+    $<TARGET_OBJECTS:mir_summary>
     $<TARGET_OBJECTS:opt>
     $<TARGET_OBJECTS:lir>
     $<TARGET_OBJECTS:lir_lowering>
@@ -78,22 +80,22 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:ffi_mangling>
     $<TARGET_OBJECTS:lsp>
     $<TARGET_OBJECTS:program>)
-target_include_directories(dss-code-prime-lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(dsscp-lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # PUBLIC propagates to consumers (the CLI exe, tests) so they see
 # __declspec(dllimport) at compile time. The matching DSS_BUILDING_DLL lives
 # on each OBJECT lib (core / program / ...) — not here — because this target has
 # no sources of its own, only aggregated $<TARGET_OBJECTS:...>.
-target_compile_definitions(dss-code-prime-lib PUBLIC DSS_SHARED_BUILD)
+target_compile_definitions(dsscp-lib PUBLIC DSS_SHARED_BUILD)
 
-set_target_properties(dss-code-prime-lib PROPERTIES
-    OUTPUT_NAME "dss-code-prime"
+set_target_properties(dsscp-lib PROPERTIES
+    OUTPUT_NAME "dsscp"
 )
 
 # ── Executable (CLI) ──
 # Thin wrapper that delegates to Program::run().
-add_executable(dss-code-prime main.cpp)
-target_link_libraries(dss-code-prime PRIVATE dss-code-prime-lib)
+add_executable(dsscp main.cpp)
+target_link_libraries(dsscp PRIVATE dsscp-lib)
 
 # ── MinGW runtime DLLs alongside the binaries (Windows + GCC only) ──
 # Every exe (CLI + test binaries) loads libstdc++-6 / libgcc_s_seh-1 /
@@ -125,7 +127,7 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set(DSS_MINGW_RUNTIME_DLLS "${_dss_runtime_dlls}" CACHE INTERNAL
         "MinGW runtime DLLs shipped beside the DSS binaries")
     if(_dss_runtime_dlls)
-        add_custom_command(TARGET dss-code-prime-lib POST_BUILD
+        add_custom_command(TARGET dsscp-lib POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     ${_dss_runtime_dlls} "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
             COMMAND_EXPAND_LISTS

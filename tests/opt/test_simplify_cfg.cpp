@@ -30,6 +30,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -1629,5 +1630,235 @@ TEST(SimplifyCfg, TwoDisjointTrampolineCyclesEachKeepExactlyOneAnchor) {
     MirVerifier verifier{mir, &interner};
     EXPECT_TRUE(verifier.verify(rep))
         << "two independently collapsed self-loops still form a well-formed CFG";
+    EXPECT_EQ(rep.errorCount(), 0u) << "zero error-severity diagnostics";
+}
+
+// ─── D-PERF-SIMPLIFYCFG-ADDRESS-TAKEN-QUERY-RESCANS-THE-WHOLE-FUNCTION ──────
+//
+// THE DEFECT. SimplifyCfg asked two purely STRUCTURAL questions about every
+// block of the source function — "is it address-taken?" and "does it hold a
+// Phi?" — and answered the first with `Mir::isBlockAddressTaken`, which is
+// DERIVED: it scans every instruction of the owning function on every call.
+// One call per block made the analysis Theta(blocks x instructions).
+//
+// WHAT THAT COST, MEASURED RATHER THAN ESTIMATED. On
+// `examples/c/switch_wide_bound` (one function, 4201 dense switch arms), the
+// release pipeline ran SimplifyCfg four times at 56/57/55/56 ms, EVERY ONE OF
+// THEM REPORTING `mutated=0` — 224 ms of a 282 ms `optimize` phase spent
+// proving there was nothing to do. Sub-phase timing attributed 66 ms of a
+// 70 ms run to 4214 `isBlockAddressTaken` calls. The exponent was confirmed by
+// SCALING the same shape rather than by reading the code: 600/1200/2400/4201
+// arms cost 1/5/19/56 ms per run, ~4x per doubling. After the fix the same
+// four runs are 3/3/2/2 ms and the same scaling series is 0/0/1/2 ms.
+//
+// THE PINS BELOW, and why they are counters rather than a stopwatch. A wall-
+// clock assertion is fragile and this repository's `wall_clock_in_tests_guard`
+// refuses one, so the algorithmic property is asserted directly:
+// `SimplifyCfgResult::analysisInstScans` counts the instructions the pass's
+// OWN structural sweep reads. One sweep per function means that number equals
+// the analyzed functions' instruction count EXACTLY, whatever the block count.
+//
+// RED-ON-DISABLE for this group: restore the per-block
+// `src_.isBlockAddressTaken(...)` calls and the open-coded `hasAnyPhi` lambda
+// in `simplify_cfg.cpp` and drop the `gatherStructuralFacts(fn)` call. The
+// sweep is then gone, `analysisInstScans` reads 0, and both counter pins fail
+// on their LOWER bound — which is exactly why a lower bound is asserted and
+// not only a ceiling: a ceiling alone is satisfied by doing no work at all.
+
+namespace {
+
+std::uint64_t totalFuncInstCount(Mir const& mir) {
+    std::uint64_t n = 0;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf; ++fi) {
+        MirFuncId const fn = mir.funcAt(fi);
+        std::uint32_t const nb = mir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            n += mir.blockInstCount(mir.funcBlockAt(fn, bi));
+        }
+    }
+    return n;
+}
+
+// A single function shaped as a chain of `k` one-instruction `Br` trampolines
+// between the entry and a returning exit block. Deliberately the shape whose
+// per-block address-taken query was quadratic: every one of the k blocks is a
+// jump-thread candidate, so every one of them was a rescan of the whole
+// function. Instruction total is k + 3 (entry Br, k trampoline Brs, exit
+// Const + Return), so the expected scan count is known in closed form.
+Mir buildTrampolineChain(TypeInterner& interner, std::uint32_t k) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    std::vector<MirBlockId> chain;
+    chain.reserve(k);
+    for (std::uint32_t i = 0; i < k; ++i) {
+        chain.push_back(mb.createBlock(StructCfMarker::Linear));
+    }
+    MirBlockId const exit = mb.createBlock(StructCfMarker::Linear);
+
+    mb.beginBlock(entry);
+    mb.addBr(k == 0 ? exit : chain[0]);
+    for (std::uint32_t i = 0; i < k; ++i) {
+        mb.beginBlock(chain[i]);
+        mb.addBr(i + 1 < k ? chain[i + 1] : exit);
+    }
+    mb.beginBlock(exit);
+    MirLiteralValue v; v.value = std::int64_t{42}; v.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v, i32));
+    return std::move(mb).finish();
+}
+
+} // namespace
+
+// The counter pin, stated as an EQUALITY because one sweep per function admits
+// exactly one value. A module with TWO functions is used so a sweep that
+// accidentally ran per MODULE (or that forgot to accumulate across functions)
+// is distinguishable from one that runs per function.
+TEST(SimplifyCfg, AnalysisSweepsEachFunctionInstructionExactlyOnce) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    // fn0: entry -> tramp -> dst (3 blocks, 4 instructions).
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const e0 = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const t0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const d0 = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(e0); mb.addBr(t0);
+    mb.beginBlock(t0); mb.addBr(d0);
+    mb.beginBlock(d0);
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v1, i32));
+    // fn1: a single returning block (2 instructions).
+    mb.addFunction(fnSig, SymbolId{101});
+    MirBlockId const e1 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e1);
+    MirLiteralValue v2; v2.value = std::int64_t{2}; v2.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v2, i32));
+    Mir mir = std::move(mb).finish();
+
+    std::uint64_t const insts = totalFuncInstCount(mir);
+    ASSERT_EQ(insts, 6u) << "fixture drifted — the closed-form expectation below "
+                            "is stated against this exact shape";
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    // ★ THE PIN. Every instruction of every analyzed function is read ONCE by
+    // the structural sweep. The pre-fix implementation had no sweep at all and
+    // reads this as 0; an implementation that re-swept per block would read it
+    // as blocks x instructions.
+    EXPECT_EQ(r.analysisInstScans, insts)
+        << "SimplifyCfg's structural analysis must read each function "
+           "instruction exactly once — 0 means the single sweep is gone and "
+           "the per-block Mir::isBlockAddressTaken rescan is back";
+}
+
+// The SHAPE pin: quadrupling the block count quadruples the analysis's own
+// instruction reads. It must not sixteen-fold them.
+TEST(SimplifyCfg, AnalysisScanCostStaysLinearAsTheBlockCountGrows) {
+    constexpr std::uint32_t kSmall = 64;
+    constexpr std::uint32_t kLarge = 4 * kSmall;
+
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir small = buildTrampolineChain(interner, kSmall);
+    Mir large = buildTrampolineChain(interner, kLarge);
+    std::uint64_t const smallInsts = totalFuncInstCount(small);
+    std::uint64_t const largeInsts = totalFuncInstCount(large);
+    ASSERT_EQ(smallInsts, kSmall + 3u);
+    ASSERT_EQ(largeInsts, kLarge + 3u);
+
+    DiagnosticReporter repS;
+    auto const rS = opt::passes::runSimplifyCfg(small, interner, repS);
+    DiagnosticReporter repL;
+    auto const rL = opt::passes::runSimplifyCfg(large, interner, repL);
+    ASSERT_TRUE(rS.ok);
+    ASSERT_TRUE(rL.ok);
+
+    // The transform still fires at both sizes — a pass that stopped doing the
+    // work would also be "linear", and that green would be vacuous.
+    EXPECT_EQ(rS.blocksJumpThreaded, kSmall);
+    EXPECT_EQ(rL.blocksJumpThreaded, kLarge);
+
+    // LOWER bound: the sweep exists at all (0 = the memo was deleted and the
+    // per-block whole-function rescan is back, invisible to this counter).
+    EXPECT_GE(rS.analysisInstScans, smallInsts);
+    EXPECT_GE(rL.analysisInstScans, largeInsts);
+    // UPPER bound: the analysis is LINEAR in the function. Quadratic scanning
+    // at kLarge = 256 blocks would be ~259 x 259 = 67081 reads against the
+    // 259 asserted here.
+    EXPECT_LE(rS.analysisInstScans, 2u * smallInsts)
+        << "SimplifyCfg's analysis must be linear in the function's "
+           "instruction count, not in blocks x instructions";
+    EXPECT_LE(rL.analysisInstScans, 2u * largeInsts)
+        << "SimplifyCfg's analysis must be linear in the function's "
+           "instruction count, not in blocks x instructions";
+    // And the growth is 4x for a 4x function, not 16x.
+    EXPECT_LT(rL.analysisInstScans, 5u * rS.analysisInstScans)
+        << "4x the blocks must cost ~4x the analysis, not ~16x";
+}
+
+// PRECISION of the address-taken memo, in both directions at once. Two
+// trampolines sit back to back; the FIRST is the target of a BlockAddress and
+// must survive, the SECOND is ordinary and must be threaded away. A memo that
+// OVER-approximates (marking any block address-taken) would refuse both; one
+// that UNDER-approximates would elide the &&label target and leave its
+// synthetic block symbol pointing at moved code. Only the exact set passes.
+TEST(SimplifyCfg, MemoRefusesOnlyTheAddressTakenTrampolineNotItsNeighbour) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const vptr  = interner.pointer(interner.primitive(TypeKind::Void));
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const disp   = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const trampA = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const trampB = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const dst    = mb.createBlock(StructCfMarker::Linear);
+
+    mb.beginBlock(entry);
+    MirInstId const ba = mb.addBlockAddress(trampA, vptr);
+    mb.addBr(disp);
+    mb.beginBlock(disp);
+    std::array<MirBlockId, 1> succs{trampA};
+    mb.addIndirectBr(ba, succs);
+    mb.beginBlock(trampA); mb.addBr(trampB);   // address-taken trampoline
+    mb.beginBlock(trampB); mb.addBr(dst);      // ordinary trampoline
+    mb.beginBlock(dst);
+    MirLiteralValue v; v.value = std::int64_t{42}; v.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.blocksJumpThreaded, 1u)
+        << "exactly ONE of the two back-to-back trampolines is elided: the "
+           "ordinary one. Refusing both means the memo over-approximates; "
+           "eliding both means it under-approximates and an &&label target "
+           "was removed";
+
+    // The BlockAddress target still exists in the rebuilt module.
+    bool anyAddressTaken = false;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf; ++fi) {
+        MirFuncId const fn = mir.funcAt(fi);
+        std::uint32_t const nb = mir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            if (mir.isBlockAddressTaken(mir.funcBlockAt(fn, bi))) anyAddressTaken = true;
+        }
+    }
+    EXPECT_TRUE(anyAddressTaken)
+        << "the &&label target block survives SimplifyCfg (MF-B guard held)";
+
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep));
     EXPECT_EQ(rep.errorCount(), 0u) << "zero error-severity diagnostics";
 }

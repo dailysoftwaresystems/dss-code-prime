@@ -1,0 +1,33 @@
+{
+  "$comment": "P33 D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE + D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL (C23 6.7.1): a `constexpr` object of ARRAY / STRUCT / UNION type, and the CAST-form null pointer constant as a constexpr pointer initializer. Covers all five aggregate shapes the row names -- `constexpr int TABLE[4]`, `constexpr struct Point ORIGIN`, `constexpr char NAME[] = \"dss\"` (the string-literal char-array form the row calls part of a UNIFORM boundary, deliberately NOT carved out), the nested `constexpr int GRID[2][2]`, a `constexpr union Box`, and a BLOCK-SCOPE `constexpr int LOCAL[2]` -- plus `(int*)0`, `(int*)(2-2)`, and a cast-null one brace deep inside `constexpr struct Handle HANDLE = {(int*)0, 3}`. exit = 17+10+4+4+1+1+9+1+4+10+3+2 = 66 for argc==1; every term is data-model independent (sizeof(NAME)==4 chars, sizeof(TABLE)/sizeof(TABLE[0])==4) so the one exit code holds on all four targets and through the release pipeline. The tail is ARGC-SEEDED (`n = argc`, capped at 4) so the release optimizer cannot fold the program to its answer. REFERENCE CROSS-CHECK: gcc 13.3.0 and clang 19.1.1 both compile THIS FILE with -std=c2x -Wall clean and also exit 66. RED-on-revert: with the aggregate arm reverted every one of the six aggregate objects is S_ConstexprUnsupportedType and the example does not compile; with only the pointer-cast arm reverted NULLP/NULLQ/HANDLE are S_ConstexprNonConstantInitializer.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 66,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

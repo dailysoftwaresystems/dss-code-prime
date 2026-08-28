@@ -110,8 +110,8 @@ struct DSS_EXPORT Relocation {
     std::int64_t   addend = 0;    // ABI-specific (e.g. PC-relative bias)
 };
 
-// One synthetic SYMBOL ↔ interior-block byte-offset binding (D-CSUBSET-
-// COMPUTED-GOTO `&&label`). The block-address `lea` materializes a
+// One synthetic SYMBOL ↔ interior-block byte-offset binding
+// (D-CSUBSET-COMPUTED-GOTO `&&label`). The block-address `lea` materializes a
 // SYNTHETIC per-block local symbol's runtime address; that symbol is
 // not a function or a data item, so it gets no VA from the usual
 // function/data symbolVa population. Instead the encoder records this
@@ -173,12 +173,66 @@ struct DSS_EXPORT AssembledFunction {
     // machine every format's unwind table is encoded from (`.eh_frame` CIE/FDE
     // on ELF and Mach-O, `.pdata`/`.xdata` UNWIND_INFO on PE).
     //
-    // nullopt when no producer attached one: the object-file `.obj` path, the
-    // linker-synthesized entry trampoline, and -- today -- every function that
-    // came from assembly source, whose `.cfi_*` directives are still parsed and
-    // dropped (D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED). A format writer that
-    // cannot describe such a function must SAY SO rather than emit a table that
-    // silently covers a subset of the image.
+    // nullopt when no producer attached one -- which today means the
+    // linker-synthesized entry trampoline, and an assembly-source function
+    // whose author wrote no `.cfi_*` directives at all. `nullopt` is
+    // UNDESCRIBED, and it is not the same as an engaged entry with an empty op
+    // list: gas lets a file describe some functions and not others, and an
+    // undescribed one must get no FDE (see `asm_text_to_lir.hpp`'s
+    // `perFuncCfi`). A format writer that cannot describe a function that IS
+    // described must SAY SO rather than emit a table that silently covers a
+    // subset of the image.
+    //
+    // ⚠⚠ TWO CLAIMS THAT USED TO STAND HERE ARE BOTH MEASURABLY FALSE, AND
+    // THEY ARE CORRECTED RATHER THAN DELETED BECAUSE EACH IS LOAD-BEARING
+    // SOMEWHERE ELSE.
+    //
+    // (1) "every function that came from assembly source, whose `.cfi_*`
+    // directives are still parsed and dropped". The row it cited,
+    // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED, has been CLOSED since
+    // 2026-08-17 -- the assembly producer landed on both ports -- and the
+    // comment outlived it. ✔MEASURED 2026-08-27: a `.s` carrying
+    // `.cfi_startproc` / `.cfi_def_cfa_offset` / `.cfi_offset` /
+    // `.cfi_endproc`, compiled `--language asm-x86_64-att --target
+    // x86_64:elf64-x86_64-linux`, emits `.eh_frame` 60 B + `.rela.eh_frame`
+    // 24 B. Assembly-sourced frames ARE described.
+    //
+    // (2) "the object-file `.obj` path" as a source of nullopt. It is
+    // quoted verbatim -- as "AssembledFunction::unwind is nullopt on the object
+    // path by construction" -- inside the `$sehPersonalityOmittedComment` of
+    // BOTH `pe64-x86_64-windows.format.json` and
+    // `pe64-x86_64-windows-staticlib.format.json`, where it is the stated
+    // reason those two formats decline `sehPersonality`, and again in
+    // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO's evidence chain. A reader who
+    // believes it concludes the unwind data does not EXIST on the object path
+    // and looks upstream for a producer to fix. It does exist.
+    //
+    // ✔MEASURED 2026-08-27, one source (a non-leaf frame, NO `__try`), three
+    // artifacts off the SAME front end:
+    //   * `--target x86_64:elf64-x86_64-linux`      (ET_REL, an OBJECT)
+    //         -> `.eh_frame` 68 B + `.rela.eh_frame` 24 B
+    //   * `--target x86_64:pe64-x86_64-windows-exec` (an IMAGE)
+    //         -> `.xdata` 32 B + `.pdata` 36 B
+    //   * `--target x86_64:pe64-x86_64-windows`      (an OBJECT)
+    //         -> `.text` ONLY, rc=0, not one diagnostic
+    // The ELF arm is the one that settles it: it reads THIS field on the object
+    // path and writes a table out of it. `cfi` is attached by the compile
+    // pipeline from the LIR frame, which knows nothing about the output kind,
+    // so it arrives populated for every target/format pair alike.
+    //
+    // ⇒ The PE `.obj` arm's emptiness was a WRITER gap, not an input gap, and
+    // it is CLOSED (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO, 2026-08-27).
+    // `pe::encode`'s Obj arm now reads this field and emits `.pdata` +
+    // `.xdata`, relocated with the target's image-relative 32-bit row
+    // (`imagerel32` -> `IMAGE_REL_AMD64_ADDR32NB`), three per
+    // RUNTIME_FUNCTION. ✔RE-MEASURED at that commit on the same source:
+    // `--target x86_64:pe64-x86_64-windows` -> `.text` + `.xdata` 24 B +
+    // `.pdata` 36 B with 9 relocations, and the object linked by MinGW ld
+    // produced an image whose EXCEPTION directory grew by exactly the three
+    // 12-byte entries covering `sink`, `nonleaf` and `main`. The paragraph
+    // above is kept because it is the MEASUREMENT that found the gap, and a
+    // reader who meets the old claim in a stale copy needs to be able to see
+    // why it was wrong.
     std::optional<CfiFunction> cfi;
     // c116 (D-WIN64-SEH-FUNCLETS): the SEH scopes this function guards. Empty
     // for every function without a `__try` (the overwhelming majority).
@@ -413,6 +467,14 @@ struct DSS_EXPORT ModuleSymbol {
     std::string      name;                               // declared identifier — the cross-CU match key
     SymbolBinding    binding    = SymbolBinding::Global; // Local: module-private; Global/Weak: enter the global table
     SymbolVisibility visibility = SymbolVisibility::Default;
+    // D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED: what this WEAK
+    // definition promises about the copies it will be folded against. Read ONLY
+    // when `binding == Weak` and only by the cross-CU fold; `Any` (the default)
+    // is the pre-existing behaviour verbatim, so every producer that does not
+    // set it is unchanged. Producers that DO know: the COFF object reader, from
+    // the COMDAT Selection byte. See `core/types/symbol_attrs.hpp` for why this
+    // is a second axis rather than two more `SymbolBinding` enumerators.
+    DuplicateMatch   duplicateMatch = DuplicateMatch::Any;
 };
 
 struct DSS_EXPORT AssembledModule {
@@ -483,7 +545,7 @@ struct DSS_EXPORT AssembledModule {
     // D-CSUBSET-MULTI-FN-WIN64-CC (step 13.5 cycle 2 post-fold,
     // 2026-06-03): explicit USER entry-function symbol — set by the
     // compile pipeline based on the source language's entry-function
-    // name config (e.g. c-subset's "main"). Distinct from
+    // name config (e.g. c's "main"). Distinct from
     // `imageEntryOverride` which names the IMAGE entry (= the
     // injected trampoline at functions[0]); this field names the
     // FUNCTION the trampoline calls.

@@ -123,6 +123,29 @@ namespace {
 // lexeme later doesn't silently see it truncated — the tokenizer
 // expands its window automatically. Floor of 1 keeps the loop sane on
 // schemas with no `tokens` declarations.
+//
+// ★★ CLOSED: D-PERF-TOK-LONGEST-MATCH-PROBES-EVERY-DECLARED-LENGTH-AT-EVERY-POSITION.
+// This scan used to walk EVERY length from `maxLexemeLength` down to 1 and ask
+// the table about each one. For the shipped `c` grammar `maxLexemeLength` is 28
+// (`__builtin_types_compatible_p`, since KEYWORDS share the lexeme table with
+// punctuation), so a `+` paid 28 hash lookups — and 13 mallocs, because
+// `lookupLexeme` materialised a `std::string` per probe — to learn that exactly
+// two lengths have any key starting with `+` at all. ✔MEASURED 2026-08-26
+// (cycle P36) on the 103-TU sqlite full-source corpus, Release, Windows/MinGW
+// GCC 13.2: 6,937,679 `longestMatchInMode` calls issued 272,783,382 table
+// lookups, an average of 39.3 per token position.
+//
+// Two independent removals, both in `core/types/grammar_schema`:
+//   • `detail::LexemeHash` makes the tables heterogeneously searchable, so a
+//     probe is a `string_view` lookup that allocates nothing;
+//   • `detail::LexemeLengthIndex` gives, per LEAD BYTE, the lengths at which
+//     some declared key starts with that byte — so the scan iterates only
+//     lengths that CAN match, and a lead byte no key starts with (206 of 256
+//     for `c`) does no work at all.
+// The index is EXACT: every candidate substring starts with the same lead byte,
+// so a length absent from that byte's row is a guaranteed miss. Skipping it
+// cannot change which length wins, which is why this is a cost-only change and
+// the token stream is byte-identical.
 
 struct LookupHit {
     std::size_t      length = 0;       // bytes consumed; 0 = no match
@@ -132,9 +155,15 @@ struct LookupHit {
 [[nodiscard]] LookupHit longestMatch(GrammarSchema const& schema,
                                      std::string_view remaining,
                                      std::size_t maxLength) noexcept {
-    if (maxLength == 0) return {};
+    if (maxLength == 0 || remaining.empty()) return {};
     const std::size_t maxN = std::min(maxLength, remaining.size());
-    for (std::size_t len = maxN; len >= 1; --len) {
+    // Descending by construction, so the FIRST hit is still the longest one.
+    for (const std::uint32_t len :
+             schema.lexemeLengthsForLeadByte(
+                 static_cast<unsigned char>(remaining.front()))) {
+        // A declared key longer than what is left in the buffer (or than the
+        // caller's window) — the row is descending, so this is a prefix of it.
+        if (len > maxN) continue;
         const auto cands = schema.lookupLexeme(remaining.substr(0, len));
         if (cands.empty()) continue;
         // `lookupLexeme` returns candidates pre-sorted by priority
@@ -170,10 +199,19 @@ struct LookupHit {
                                            LexerModeId mode,
                                            std::string_view remaining,
                                            std::size_t maxLength) noexcept {
-    if (maxLength == 0) return {};
+    if (maxLength == 0 || remaining.empty()) return {};
     const std::size_t maxN = std::min(maxLength, remaining.size());
     // 1. Override table first — longest declared override key wins.
-    for (std::size_t len = maxN; len >= 1; --len) {
+    //    ★ THE ROW IS THIS MODE'S OWN, NOT A GLOBAL UNION. A union index would
+    //    be conservative-correct but would filter far less: the shipped `c`
+    //    grammar's `directive` mode overrides ONE key, `include` — so its own
+    //    row for `i` is a single length, while the GLOBAL row for `i` is four
+    //    (`include`, `inline`, `int`, `if`) — three of them guaranteed misses
+    //    in a one-entry override table, at every position in the mode.
+    for (const std::uint32_t len :
+             schema.lexemeLengthsForLeadByteInMode(
+                 mode, static_cast<unsigned char>(remaining.front()))) {
+        if (len > maxN) continue;
         const auto cands = schema.lookupLexemeInMode(mode, remaining.substr(0, len));
         if (cands.empty()) continue;
         return LookupHit{ .length = len, .meaning = cands[0] };
@@ -1149,6 +1187,26 @@ TokenizeResult Tokenizer::tokenize() && {
         // longestMatch to win — probe id-run length non-destructively
         // first so we keep the original reader position when the
         // global lookup loses (`if`, `if_foo`, `Nxyz`).
+        //
+        // ★★ ONE LOOKUP, NOT TWO, AND THE SECOND ONE WAS PROVABLY REDUNDANT
+        // (D-PERF-TOK-IDENTIFIER-RUNS-THE-LONGEST-MATCH-PROBE-TWICE). This branch
+        // used to call `longestMatchInMode` a SECOND time on the id run alone and
+        // read `hit` out of that. The two calls cannot disagree, for a reason that
+        // is structural rather than empirical:
+        //   • both scan lengths DESCENDING over the same schema + same mode, and
+        //     return the FIRST length that hits;
+        //   • for every length L <= identLen the two inputs are the SAME BYTES
+        //     (`lexeme` IS `remaining`'s first `identLen` bytes), so every
+        //     per-length verdict agrees;
+        //   • the second call was reached only when `globalHit.length <= identLen`
+        //     — i.e. the first call already found NOTHING above `identLen` — so
+        //     the first call's winning length (or its no-match) is exactly the one
+        //     a scan restricted to `[1, identLen]` finds.
+        // Hence `hit == globalHit` at every reachable second call, and reading
+        // `globalHit` is byte-identical. ✔MEASURED on the 103-TU sqlite corpus:
+        // 4.87M identifiers each paid that second scan, and the FIRST probe's
+        // extends-past-the-run arm — the only thing the split bought — fired
+        // exactly 10 times in the whole corpus.
         if (isIdStart(c)) {
             std::size_t identLen = 1;
             while (identClass.continuesIdentifier(r.peek(identLen))) ++identLen;
@@ -1167,17 +1225,14 @@ TokenizeResult Tokenizer::tokenize() && {
             }
 
             r.advance(identLen);
-            const auto lexeme = r.slice(start, r.position());
-            const auto hit = longestMatchInMode(*schema_, activeMode,
-                                                lexeme, lexemeProbeMax);
             // Only honor the lookup when it covers the entire run; a
             // schema entry like `int` shouldn't claim part of `integer`.
-            const bool fullMatch = (hit.length == lexeme.size());
-            const auto sk = fullMatch ? hit.meaning.id : InvalidSchemaToken;
-            const auto wordFlags = fullMatch ? hit.meaning.flagsApplied
+            const bool fullMatch = (globalHit.length == identLen);
+            const auto sk = fullMatch ? globalHit.meaning.id : InvalidSchemaToken;
+            const auto wordFlags = fullMatch ? globalHit.meaning.flagsApplied
                                              : NodeFlags::None;
             emit(CoreTokenKind::Word, sk, wordFlags);
-            if (fullMatch) applyMeaningSideEffects(hit.meaning);
+            if (fullMatch) applyMeaningSideEffects(globalHit.meaning);
             continue;
         }
 

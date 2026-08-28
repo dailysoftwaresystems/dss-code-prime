@@ -11,7 +11,7 @@ function(dss_add_test)
 
     string(REPLACE "/" "_" target "dss_${DSS_NAME}")
     add_executable(${target} ${DSS_SOURCES})
-    target_link_libraries(${target} PRIVATE dss-code-prime-lib GTest::gtest GTest::gtest_main)
+    target_link_libraries(${target} PRIVATE dsscp-lib GTest::gtest GTest::gtest_main)
     target_include_directories(${target}
         PRIVATE
             ${CMAKE_SOURCE_DIR}/src
@@ -61,7 +61,7 @@ function(dss_add_test)
     # Shipped-config discovery: findShippedConfig() — and, since TF-C118, the
     # test-side resolver in tests/test_support/repo_root.hpp — prefers
     # $DSS_CONFIG_ROOT (a directory containing src/dss-config/) over its
-    # cwd-walk. Point it at the repo root so every test resolves shipped config
+    # cwd-walk. Setting it is what makes every test resolve shipped config
     # regardless of build location — an OUT-OF-TREE build's ctest cwd is a build
     # subdirectory with no src/dss-config/ in its ancestry, which would
     # otherwise null the loader (loadShipped → nullptr → downstream null-deref).
@@ -71,23 +71,36 @@ function(dss_add_test)
     # out-of-tree gap was first noticed, and an out-of-tree ctest still failed
     # 28 entries, because seventeen test-side helpers carried private cwd-walks
     # that never READ the variable. The fix was the shared resolver; this line
-    # is one of the three candidates it consults, not the mechanism.
+    # is one of the candidates it consults, not the mechanism.
+    #
+    # ★★★ AND IT NO LONGER NAMES THE LIVE SOURCE TREE.
+    # D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED:
+    # pointing it at ${CMAKE_SOURCE_DIR} made every one of these ~219 entries —
+    # and the ~1200 `loadShipped()` call sites they reach, none of which caches —
+    # a live reader of a tree several workstreams write to, so a neighbour
+    # rewriting a shipped document IN PLACE reddened whichever suite happened to
+    # open it inside that window, with nothing in the red naming the cause.
+    # `dss_use_config_snapshot` points it at a copy taken ONCE per ctest run
+    # instead (cmake/DssConfigSnapshot.cmake), which is the same wiring for the
+    # out-of-tree case and a single sample of the mutable tree for this one.
+    # ✔MEASURED by deprivation on this tree: move `sources/c.lang.json` out of
+    # the live tree 5 s into a run and 5 of the 6 census suites red; with the
+    # snapshot they do not notice.
     # (CTest ENVIRONMENT is a ';'-separated list; a repo path containing a
     # literal ';' would mis-split — impossible on normal Windows/WSL paths.)
-    set_tests_properties(${DSS_NAME} PROPERTIES
-        ENVIRONMENT "DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}")
+    dss_use_config_snapshot(${DSS_NAME})
 endfunction()
 
 # Shared PCH producer for the test executables (see DSS_PCH_HEADERS in the
 # top-level CMakeLists). The ~166 test TUs are the larger half of the cold
 # compile and every one of them includes <gtest/gtest.h> + the heavy STL set;
 # precompiling them ONCE here and reusing across all test targets removes that
-# reparse. It links dss-code-prime-lib + GTest::gtest purely to inherit their
+# reparse. It links dsscp-lib + GTest::gtest purely to inherit their
 # usage-requirement flags (the PUBLIC DSS_SHARED_BUILD define, the gtest include
 # dir) so the precompiled header matches every consumer's compile line exactly.
 # `dss_test_pch` is never linked anywhere; REUSE_FROM wires the build dependency.
 add_library(dss_test_pch STATIC ${CMAKE_CURRENT_SOURCE_DIR}/test_support/pch_stub.cpp)
-target_link_libraries(dss_test_pch PRIVATE dss-code-prime-lib GTest::gtest)
+target_link_libraries(dss_test_pch PRIVATE dsscp-lib GTest::gtest)
 target_include_directories(dss_test_pch
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -153,7 +166,7 @@ add_subdirectory(conformance)
 # already exists — the `linux-clang-asan` leg of pipeline-pr.yml (Debug,
 # `-fsanitize=address,undefined`, full ctest under `ASAN_OPTIONS=abort_on_error=1`)
 # and MEASURED at 5/5 red on the broken tree. That leg is gated on the PR
-# carrying the `Run Pipes` label (pipeline-pr.yml:89), which is why the gate
+# carrying the `Run Pipes` label (pipeline-pr.yml), which is why the gate
 # never saw this. This arm narrows the hole; it does not close it.
 #
 # ON FAILURE: the arm prints `Note: Randomizing tests' orders with a seed of
@@ -174,7 +187,7 @@ add_subdirectory(conformance)
 # executable's real path (with `.exe` on Windows), so this runs as-is on macOS,
 # Linux and Windows CI. Note it names NO interpreter, and that is the
 # surrounding convention followed rather than broken: the sibling script-backed
-# entries at ../CMakeLists.txt:228-241 must dispatch `bash` vs
+# entries in ../CMakeLists.txt must dispatch `bash` vs
 # `powershell -File` precisely because their command is a SCRIPT. This command is
 # a binary; there is nothing to interpret.
 #
@@ -193,8 +206,8 @@ add_subdirectory(conformance)
 # tests/test_support/scratch_dir.hpp). MEASURED before that root existed: the two
 # entries clobbered each other's fixture files and `ctest -j 8` over just this
 # pair went red 1 run in 3. Any suite added to this arm inherits the obligation.
-# ── THE COST IS PER-LEG, SO THE REPEAT COUNT HAS TO BE TOO (D-TEST-SHUFFLE-ARM-
-# ── REPEAT-BUDGET-IS-PER-LEG) ──
+# ── THE COST IS PER-LEG, SO THE REPEAT COUNT HAS TO BE TOO
+# ── (D-TEST-SHUFFLE-ARM-REPEAT-BUDGET-IS-PER-LEG) ──
 #
 # Every N below was chosen against a cost that differs by ~28x between the legs
 # that run it, so no single global constant can be right on all of them. MEASURED,
@@ -211,7 +224,7 @@ add_subdirectory(conformance)
 # Apple clang). The sanitizer column is what the SAME arms actually cost on the leg
 # this file calls the stronger instrument. That leg's Test step is budgeted 30 min
 # (pipeline-pr.yml), needed ~31.5 min, and so was KILLED at 687/773 — every test it
-# reached PASSED. The 86 it never reached were all examples/c-subset, t* through z*,
+# reached PASSED. The 86 it never reached were all examples/c, t* through z*,
 # so they took ZERO sanitizer coverage, every run, always the same tail.
 #
 # WHY TRIMMING HERE RAISES TOTAL DETECTION INSTEAD OF LOWERING IT. These arms are
@@ -287,11 +300,13 @@ function(dss_add_shuffle_arm)
 
     add_test(NAME ${DSS_NAME}_shuffled
              COMMAND ${target} --gtest_shuffle --gtest_repeat=${repeat})
-    # Mirrors dss_add_test's ENVIRONMENT (see the note at its set_tests_properties
-    # above): findShippedConfig() prefers $DSS_CONFIG_ROOT over its cwd-walk, so
-    # an out-of-tree build resolves shipped config identically.
-    set_tests_properties(${DSS_NAME}_shuffled PROPERTIES
-        ENVIRONMENT "DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}")
+    # Mirrors dss_add_test's wiring (see the note at its dss_use_config_snapshot
+    # call above): findShippedConfig() prefers $DSS_CONFIG_ROOT over its cwd-walk,
+    # so an out-of-tree build resolves shipped config identically — and it must
+    # read the SAME per-run snapshot as its plain sibling, because this arm is a
+    # SECOND concurrent process on the same binary and two processes of one suite
+    # reading two different config trees is a divergence nothing would report.
+    dss_use_config_snapshot(${DSS_NAME}_shuffled)
 endfunction()
 
 dss_add_shuffle_arm(NAME analysis/preprocess/test_preprocessor REPEAT 20)
@@ -303,11 +318,11 @@ dss_add_shuffle_arm(NAME analysis/preprocess/test_preprocessor REPEAT 20)
 # on the same binary is, because reverting to a constant path reddens the gate here
 # instead of passing quietly. MEASURED pre-fix under exactly this overlap: import
 # resolver 6/6 rounds red plus 4 SIGSEGVs, type-name oracle 6/6 red, hir / schema
-# cache / c-subset red with DIVERGENT per-instance failure counts. Post-fix all
+# cache / c red with DIVERGENT per-instance failure counts. Post-fix all
 # green with counts identical between the two instances.
 #
 # REPEAT is measured, not guessed — single-run wall time on this host was 0.06-0.17 s
-# for the five small binaries and 4.13 s for the c-subset one, so 20x and 3x keep the
+# for the five small binaries and 4.13 s for the c one, so 20x and 3x keep the
 # whole set near ~23 s of added work spread over six entries that ctest -j overlaps.
 # ⚠ THAT ~23 s IS AN UNINSTRUMENTED PRICE. The same eight arms measured 3311.5 s on
 # the Debug+ASan+UBSan leg — 44% of that leg's entire budget, and enough to run it
@@ -341,7 +356,7 @@ dss_add_shuffle_arm(NAME analysis/compilation_unit/test_import_resolver REPEAT 2
 dss_add_shuffle_arm(NAME analysis/compilation_unit/test_compilation_unit REPEAT 20)
 dss_add_shuffle_arm(NAME hir/test_hir_lowering_multi_lang REPEAT 20)
 dss_add_shuffle_arm(NAME lsp/test_schema_cache REPEAT 20)
-dss_add_shuffle_arm(NAME analysis/semantic/test_semantic_analyzer_c_subset REPEAT 3)
+dss_add_shuffle_arm(NAME analysis/semantic/test_semantic_analyzer_c REPEAT 3)
 dss_add_shuffle_arm(NAME analysis/semantic/test_fc3_width_semantics REPEAT 20)
 
 # ── TF-C118 — THE OUT-OF-TREE REGRESSION GUARD ──────────────────────────────
@@ -369,43 +384,94 @@ dss_add_shuffle_arm(NAME analysis/semantic/test_fc3_width_semantics REPEAT 20)
 # vacuous. `unset:` (CMake 3.22+) is what actually removes it.
 #
 # ★ THE WORKING DIRECTORY MUST HAVE NO REPO ANCESTRY, and "the build dir" is
-# NOT sufficient — for an in-tree build (build-dbg/) the repo root is an
-# ancestor, candidate (3) resolves, and the arm proves nothing again. So the
-# location is chosen per build layout and then VERIFIED below.
-cmake_path(IS_PREFIX CMAKE_SOURCE_DIR "${CMAKE_BINARY_DIR}" NORMALIZE
-           _dss_binary_inside_source)
-if (_dss_binary_inside_source)
-    # In-tree build: anything under the build dir inherits the repo as an
-    # ancestor, so step OUT of the repo entirely.
-    set(_dss_norepo_cwd "${CMAKE_SOURCE_DIR}/../dss-no-repo-ancestry-cwd")
-else()
-    set(_dss_norepo_cwd "${CMAKE_BINARY_DIR}/no-repo-ancestry-cwd")
+# NOT sufficient — for an in-tree build (build/dbg/) the repo root is an
+# ancestor, candidate (3) resolves, and the arm proves nothing again.
+#
+# ⚠ D-CYCLE-A-WORKTREE-INSIDE-THE-REPO-ROOT-CANNOT-BE-CONFIGURED.
+# THIS USED TO **GUESS** THE LOCATION FROM THE BUILD LAYOUT — "in-tree ⇒
+# CMAKE_SOURCE_DIR/.." — and then verify the guess. The guess is wrong for a
+# lane worktree: since the 2026-08-26 ruling those live at
+# <repo>/.worktrees/<name>, so CMAKE_SOURCE_DIR/.. is <repo>/.worktrees, which
+# is STILL INSIDE <repo>, and <repo> holds src/dss-config. A guess-then-verify
+# shape can only ever REPORT that mismatch, so configure died here and EVERY
+# sanctioned lane worktree was unconfigurable — not merely awkward.
+# ✔MEASURED 2026-08-27: <repo>/.worktrees/n carried a CMakeCache.txt with no
+# build.ninja and no CTestTestfile.cmake, and the empty cwd directory this
+# block creates sat one line above the fatal.
+#
+# ⇒ THE LOCATION IS NOW **DERIVED** FROM THE SAME PREDICATE THE CHECK ASSERTS,
+# so choice and check cannot disagree: climb to the OUTERMOST ancestor holding
+# src/dss-config and step above it. Stepping out of CMAKE_SOURCE_DIR is not
+# stepping out of the REPOSITORY — for a worktree the outermost holder is
+# <repo>, not the worktree, which holds one of its own. That distinction is
+# the entire defect, and deriving rather than guessing is what removes it.
+#
+# ⚠ AND IT MUST STAY OUTSIDE THE REPOSITORY. This is the one directory the
+# "keep it inside repo bounds" ruling cannot reach: "no ancestor holds
+# src/dss-config" IS the condition under test, so moving it inside makes the
+# arm silently vacuous — the exact rot the paragraph above describes. It is an
+# EMPTY cwd and never a build tree, so it contaminates nothing; the ruling is
+# about worktrees and build output. The main tree and every worktree share the
+# one directory, which is strictly less clutter than a per-tree sibling.
+
+# The predicate, defined ONCE and used by both the choice and the check.
+# Returns the OUTERMOST ancestor of _dir (inclusive) that holds src/dss-config,
+# or "" when none does — so an empty result IS "no repo ancestry". The walk
+# must not stop at the first non-holder: for <repo>/.worktrees/<name> the gap
+# at <repo>/.worktrees sits BETWEEN two holders.
+function(_dss_outermost_repo_ancestor _dir _out)
+    cmake_path(SET _probe NORMALIZE "${_dir}")
+    set(_found "")
+    foreach(_hop RANGE 32)
+        if (IS_DIRECTORY "${_probe}/src/dss-config")
+            set(_found "${_probe}")   # keep climbing; remember the HIGHEST hit
+        endif()
+        cmake_path(GET _probe PARENT_PATH _parent)
+        if (_parent STREQUAL _probe)
+            break()
+        endif()
+        set(_probe "${_parent}")
+    endforeach()
+    set(${_out} "${_found}" PARENT_SCOPE)
+endfunction()
+
+# Prefer the build directory when it genuinely has no repo ancestry (a true
+# out-of-tree build): the directory is then tidy and dies with the build. That
+# is a PREFERENCE, not a guess — it is taken only when the predicate says so.
+set(_dss_norepo_cwd "${CMAKE_BINARY_DIR}/no-repo-ancestry-cwd")
+_dss_outermost_repo_ancestor("${_dss_norepo_cwd}" _dss_cwd_repo)
+if (NOT _dss_cwd_repo STREQUAL "")
+    _dss_outermost_repo_ancestor("${CMAKE_SOURCE_DIR}" _dss_outer_repo)
+    if (_dss_outer_repo STREQUAL "")
+        message(FATAL_ERROR
+            "dss: cannot place the out-of-tree regression arm's working "
+            "directory. '${_dss_norepo_cwd}' has repo ancestry at "
+            "'${_dss_cwd_repo}', yet no ancestor of the source directory "
+            "'${CMAKE_SOURCE_DIR}' holds src/dss-config, so there is nothing "
+            "to step above.")
+    endif()
+    cmake_path(GET _dss_outer_repo PARENT_PATH _dss_above_repo)
+    set(_dss_norepo_cwd "${_dss_above_repo}/dss-no-repo-ancestry-cwd")
 endif()
 cmake_path(SET _dss_norepo_cwd NORMALIZE "${_dss_norepo_cwd}")
 file(MAKE_DIRECTORY "${_dss_norepo_cwd}")
 
-# VERIFY the property rather than trusting the branch above. A guard whose own
-# precondition can rot silently is not a guard; if someone nests a checkout such
-# that this directory gains a src/dss-config ancestor, that is a CONFIGURE-time
-# error here, not a quietly-vacuous green arm later. (The runtime half of the
-# same check lives in BakedRootOnly.PreconditionsHold, which re-verifies from
-# inside the running process where ctest's cwd actually applies.)
-set(_dss_probe "${_dss_norepo_cwd}")
-foreach(_dss_hop RANGE 12)
-    if (IS_DIRECTORY "${_dss_probe}/src/dss-config")
-        message(FATAL_ERROR
-            "dss: the out-of-tree regression arm's working directory "
-            "'${_dss_norepo_cwd}' has repo ancestry at '${_dss_probe}' "
-            "(it contains src/dss-config). The arm would then resolve via the "
-            "cwd ancestor walk and silently stop testing the CMake-baked "
-            "DSS_TEST_REPO_ROOT, which is the only thing it exists to test.")
-    endif()
-    cmake_path(GET _dss_probe PARENT_PATH _dss_parent)
-    if (_dss_parent STREQUAL _dss_probe)
-        break()
-    endif()
-    set(_dss_probe "${_dss_parent}")
-endforeach()
+# VERIFY the property rather than trusting the derivation. The derivation above
+# is built from this same predicate, so this cannot fire today — that is the
+# point: it is what CATCHES a future edit that reintroduces a guess, which is
+# precisely how this block broke. A guard whose own precondition can rot
+# silently is not a guard. (The runtime half lives in
+# BakedRootOnly.PreconditionsHold, which re-verifies from inside the running
+# process where ctest's cwd actually applies, and is the non-vacuity proof.)
+_dss_outermost_repo_ancestor("${_dss_norepo_cwd}" _dss_leftover_repo)
+if (NOT _dss_leftover_repo STREQUAL "")
+    message(FATAL_ERROR
+        "dss: the out-of-tree regression arm's working directory "
+        "'${_dss_norepo_cwd}' has repo ancestry at '${_dss_leftover_repo}' "
+        "(it contains src/dss-config). The arm would then resolve via the "
+        "cwd ancestor walk and silently stop testing the CMake-baked "
+        "DSS_TEST_REPO_ROOT, which is the only thing it exists to test.")
+endif()
 
 # ★ ONE entry, not three — and the reason is a MEASURED constraint, not a
 # preference. The obvious design is to point this condition at real consumers
@@ -419,7 +485,7 @@ endforeach()
 # to do with the test-side resolver, and the arm would be red forever.
 # MEASURED, from the no-repo cwd with the variable unset:
 # `dss_analysis_syntactic_test_corpus` fails at golden_file.hpp — and would go
-# on to fail `loadShipped("c-subset")` even with the corpus root resolved.
+# on to fail `loadShipped("c")` even with the corpus root resolved.
 # So the guard suite is itself the representative consumer: BakedRootOnly drives
 # `dss::test_support::findCorpusRoot()` — the exact entry point the twelve
 # suites that used to abort() go through — and resolves a real file under both

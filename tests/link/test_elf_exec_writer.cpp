@@ -2393,7 +2393,7 @@ TEST(ElfRelWriter, ExternDataImportNoLongerFailsLoudOnEtRel) {
 // .rodata section content/placement IS the deliverable, fully
 // decidable from the wire image; not a runtime claim). Runtime
 // behavior (`int g=42; return g;` → exit 42) is the corpus
-// `examples/c-subset/global_int`'s ELF arms on the Linux + native-
+// `examples/c/global_int`'s ELF arms on the Linux + native-
 // arm64 CI legs.
 namespace {
 
@@ -2448,7 +2448,7 @@ constexpr std::size_t kShdrSize = 64;
 // exec holds a GOT slot ld.so fills), so the slot gets a SYMBOL-BASED absolute
 // dynamic relocation and ld.so writes the real address at load. ✔MEASURED: the
 // first cut of the deletion baked `symbolVa[extern]` — the GOT SLOT — and
-// `examples/c-subset/extern_data_addr_static_init` went red at exit 1, a
+// `examples/c/extern_data_addr_static_init` went red at exit 1, a
 // pointer one indirection off with no diagnostic.
 //
 // A load-time write cannot reach a READ-ONLY page. The normal C shapes never
@@ -2826,8 +2826,7 @@ TEST(ElfExecWriter, BssSectionEmittedNobitsWritable) {
 TEST(ElfExecWriter, RodataDataItemWithRelocationFailsLoud) {
     // Fail-loud: a rodata item carrying its OWN relocations (data->data
     // reference) is deferred this cycle — the ELF writer patches
-    // FUNCTION relocations only. Cited anchor: D-LK1-ELF-RODATA-
-    // DATAITEM-RELOC.
+    // FUNCTION relocations only. Cited anchor: D-LK1-ELF-RODATA-DATAITEM-RELOC.
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     AssembledData d;
@@ -2901,13 +2900,13 @@ TEST(ElfExecWriter, RelRoConstItemFoldsIntoDataAndPatchesInPlace) {
 
 TEST(ElfExecWriter, ElfRelAcceptsRodataDataItem) {
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: a relocatable object now EMITS a
-    // plain (no-reloc) rodata item — the former "(ET_REL) … D-LK1-ELF-EXEC-
-    // DATA-SECTIONS exec-only" reject is LIFTED. The item lands in `.rodata`
+    // plain (no-reloc) rodata item — the former "(ET_REL) … D-LK1-ELF-EXEC-DATA-SECTIONS
+    // exec-only" reject is LIFTED. The item lands in `.rodata`
     // (sh_addr=0) with a section-relative `.symtab` symbol the final linker
     // binds. (The section-relative data-symbol shape is pinned by
     // ElfWriter.ObjectEmitsDataSectionAndSectionRelativeDataSymbol; a data item
-    // WITH its own relocation still fails loud — the D-LK1-ELF-RODATA-DATAITEM-
-    // RELOC test above.) RED if the ELF writer reverts to rejecting ET_REL data.
+    // WITH its own relocation still fails loud — the D-LK1-ELF-RODATA-DATAITEM-RELOC
+    // test above.) RED if the ELF writer reverts to rejecting ET_REL data.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
@@ -3062,7 +3061,7 @@ TEST(ElfExecWriter, ElfExecAnonymousRodataItemsDoNotCollide) {
 // the single-thread examples green while PT_TLS disappears, the
 // SHF_TLS headers vanish, and the patched disp32s become VAs instead
 // of the hand-derived tpoffs — turning every EXPECT below red. The
-// runnable 2-thread discriminator is examples/c-subset/
+// runnable 2-thread discriminator is examples/c/
 // thread_local_pthread (each worker must observe the TEMPLATE value).
 // ═════════════════════════════════════════════════════════════════
 
@@ -3808,8 +3807,8 @@ TEST(ElfImageSymbolNames,
         // fn #7 — a `static` (Local binding) function WITH a declared name. THE
         // discriminating case: an image wants this name (it is a backtrace
         // frame), while a relocatable `.o` must NOT expose it (a foreign linker
-        // keys by name, and two TUs' `helper`s would collide — D-LK-INTERNAL-
-        // LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION). Pre-fix: `sym_7`.
+        // keys by name, and two TUs' `helper`s would collide —
+        // D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION). Pre-fix: `sym_7`.
         AssembledFunction f7;
         f7.symbol = SymbolId{7};
         f7.bytes  = dynamicArm ? port.callBytes : port.retBytes;

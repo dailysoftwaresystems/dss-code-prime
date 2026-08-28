@@ -181,7 +181,7 @@ public:
 
 private:
     // True iff `tree` was built from THIS resolver's schema. In a multi-language
-    // CU each resolver processes only its own language's trees (a c-subset
+    // CU each resolver processes only its own language's trees (a c
     // resolver's `directiveRule` RuleId means nothing in a tsql tree), so every
     // tree-iterating pass below gates on this. Homogeneous CU: always true.
     [[nodiscard]] bool owns(Tree const& tree) const {
@@ -251,7 +251,11 @@ private:
                 if (!owns(tree)) { ++index; continue; }   // another language's tree
                 sourceTree   = tree.id();
                 sourceBuffer = tree.source().id();
-                includingDir = fs::path(std::string(tree.source().name())).parent_path();
+                // The SHARED derivation
+                // (D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH):
+                // a tree whose source was named without a directory component
+                // resolves its quote includes against the working directory.
+                includingDir = includingDirectoryOf(tree.source().name());
                 walkPreOrder(tree, [&](TreeCursor const& cursor) {
                     NodeId const node = cursor.current();
                     if (tree.kind(node) != NodeKind::Internal) return;

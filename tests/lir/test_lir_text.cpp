@@ -22,6 +22,8 @@
 #include "lir/lir_text.hpp"
 #include "lir/lir_verifier.hpp"
 
+#include "fallthrough_form_schema.hpp"
+
 #include <gtest/gtest.h>
 
 #include <array>
@@ -1522,8 +1524,8 @@ namespace {
     c.inputNames      = {"rax", "rdx"};
     c.outputNames     = {"rax"};
     // ⚠ `rax` is an output, so it MUST also be clobbered — `LirBuilder::
-    // regConstraintPoolAdd` enforces `outputs ⊆ clobbered` (D-LIR-PER-
-    // INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED) and this
+    // regConstraintPoolAdd` enforces `outputs ⊆ clobbered`
+    // (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED) and this
     // fixture goes through the real builder. `rcx` stays a clobber that
     // is NOT an output, so the round trip still carries a set where the
     // three arrays genuinely differ.
@@ -1802,3 +1804,226 @@ TEST(LirTextParser, VerifyOnLoadCatchesAnUnreferencedConstraintEntry) {
     EXPECT_TRUE(sawLost);
 }
 
+
+// ★★★ THE MEMORY-DIRECTION FLAG MUST SURVIVE THE TEXT ROUND TRIP, AND THIS PIN
+// EXISTS BECAUSE ITS WHOLE SOUNDNESS ARGUMENT IS THAT `flags` SURVIVES BY
+// CONSTRUCTION. `kLirInstFlagMemoryIsDestination` is what tells the ENCODER
+// which of two byte-identical `cmp` operand lists it is holding
+// (D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE). A rebuild that
+// dropped the bit would silently elect the OPPOSITE direction's variant — the
+// instruction would still assemble, still link, and compare its operands the
+// wrong way round.
+//
+// ⚠ THE ASSERTION IS ON THE PARSED FLAGS, NOT ON THE TEXT. `flags=17` appearing
+// in a string proves the emitter wrote a number; reading the bit back through
+// `lirInstMemoryIsDestination` proves the value the ENCODER will consult is the
+// value the builder set. And the flag is combined with a WIDTH bit on purpose:
+// the two share one byte, so a mask that clobbered either would show here.
+TEST(LirTextRoundTrip, MemoryDestinationFlagSurvivesWithItsWidthSibling) {
+    auto sch = shippedX86();
+    auto const cmpOp = sch->opcodeByMnemonic("cmp");
+    ASSERT_TRUE(cmpOp.has_value());
+    auto const retOp = sch->opcodeByMnemonic("ret");
+    LirBuilder b{*sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const rax = makePhysicalReg(0, LirRegClass::GPR);
+    LirReg const rcx = makePhysicalReg(1, LirRegClass::GPR);
+    std::array<LirOperand, 4> const ops{
+        LirOperand::makeReg(rax), LirOperand::makeReg(rcx),
+        LirOperand::makeMemBase(1), LirOperand::makeMemOffset(4096)};
+    std::uint8_t const flags = static_cast<std::uint8_t>(
+        kLirInstFlagMemoryIsDestination | kLirInstFlagWidth32);
+    b.addInst(*cmpOp, InvalidLirReg, ops, /*payload=*/0, flags);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+    ASSERT_TRUE(lirInstMemoryIsDestination(
+        lir.instFlags(lir.blockInstAt(entry, 0))))
+        << "the builder did not carry the flag onto the instruction";
+
+    LirTextContext ctx;
+    DiagnosticReporter rep1, rep2;
+    std::string const text = emitLir(lir, *sch, ctx, rep1);
+    auto parsed = parseLir(text, *sch, rep2);
+    ASSERT_TRUE(parsed->ok) << text;
+    // ⚠ THE PARSED MODULE IS ITS OWN ARENA — a block id from the BUILDER's
+    // module is refused there (`LirBlockId from LirModuleId=1 used on
+    // LirModuleId=2`), which is the substrate doing exactly its job. Walk the
+    // parsed module to ITS entry block.
+    auto const reEntry =
+        parsed->lir.funcBlockAt(parsed->lir.funcAt(0), 0);
+    auto const reFlags =
+        parsed->lir.instFlags(parsed->lir.blockInstAt(reEntry, 0));
+    EXPECT_TRUE(lirInstMemoryIsDestination(reFlags))
+        << "the memory-direction bit did not survive the text round trip — the "
+           "encoder would elect the opposite direction's variant:\n" << text;
+    EXPECT_EQ(lirInstWidthBits(reFlags), 32u)
+        << "the width sibling in the same byte was disturbed";
+}
+
+// ── D-OPT-JCC-FALLTHROUGH — RULE 1b's ONE LEGAL ASYMMETRY, AND ITS FENCES ──
+//
+// `lir_peephole`'s R2 drops a branch's trailing BlockRef operand when the
+// successor it named is already the NEXT-LAID-OUT block, so the encoder stops
+// emitting a jump to +0. That makes the operand list one shorter than the
+// successor list — the ONLY shape in which Rule 1b's two channels may
+// legitimately differ.
+//
+// ★★★ AND IT IS THE PROJECT'S WORST FAILURE MODE IF ADMITTED TOO WIDELY: an
+// elided jump whose successor is NOT the next block falls into the WRONG
+// BLOCK, and every byte in the image is individually correct. There is
+// nothing for a disassembler, a linker or a crash to point at. So the four
+// tests below exercise the fence from all four sides — accepted when legal,
+// refused when the layout claim is false, refused when the target cannot
+// spell the shorter form at all, refused in the last block where there is
+// nothing to fall through to.
+
+namespace {
+
+// `^0: jcc ^a, ^b ; ^1: ret ; ^2: ret`, with the jcc's operand list EXPLICIT
+// so a test can hand it one operand while the block keeps two successors —
+// exactly the module R2 produces.
+[[nodiscard]] Lir
+elidedCondBrModule(TargetSchema const& sch, bool falseEdgeIsNextBlock,
+                   bool elide) {
+    auto const jccOp = sch.opcodeByMnemonic("jcc");
+    auto const retOp = sch.opcodeByMnemonic("ret");
+    if (!jccOp.has_value() || !retOp.has_value()) {
+        throw std::runtime_error("fixture: target declares no jcc/ret");
+    }
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    LirBlockId const next  = b.createBlock();
+    LirBlockId const far   = b.createBlock();
+    LirBlockId const t = falseEdgeIsNextBlock ? far  : next;
+    LirBlockId const f = falseEdgeIsNextBlock ? next : far;
+    b.beginBlock(entry);
+    std::vector<LirOperand> ops{LirOperand::makeBlockRef(t.v)};
+    if (!elide) ops.push_back(LirOperand::makeBlockRef(f.v));
+    b.addCondBr(*jccOp, ops, t, f,
+                static_cast<std::uint32_t>(TargetCondCode::Ne));
+    b.beginBlock(next);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    b.beginBlock(far);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    return std::move(b).finish();
+}
+
+[[nodiscard]] bool sawMismatch(DiagnosticReporter const& rep) {
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_TerminatorSuccessorMismatch) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST(LirVerifier, ElidedFallthroughIsAcceptedWhenTheEdgeIsTheNextBlock) {
+    auto const sch = test_support::schemaWithFallthroughForm("x86_64");
+    Lir const lir = elidedCondBrModule(*sch, /*falseEdgeIsNextBlock=*/true,
+                                       /*elide=*/true);
+    DiagnosticReporter rep;
+    EXPECT_TRUE(verifyLirText(lir, *sch, rep))
+        << "a legal D-OPT-JCC-FALLTHROUGH elision must VERIFY — a pin that "
+           "refuses the optimization it exists to guard is not a pin";
+    EXPECT_FALSE(sawMismatch(rep));
+    // And the same module through the post-regalloc entry point, which is the
+    // one that runs downstream of the peephole in the real pipeline.
+    DiagnosticReporter prep;
+    EXPECT_TRUE(verifyLirPostRegalloc(lir, *sch, prep));
+}
+
+TEST(LirVerifier, ElidedFallthroughToTheWRONGBlockIsRefused) {
+    // ★ THE ONE THAT MATTERS. Same shortened operand list, but the unnamed
+    // successor is the FAR block while the next-laid-out one is `next`.
+    // Encoded, this program falls into a block it never branched to.
+    auto const sch = test_support::schemaWithFallthroughForm("x86_64");
+    Lir const lir = elidedCondBrModule(*sch, /*falseEdgeIsNextBlock=*/false,
+                                       /*elide=*/true);
+    DiagnosticReporter rep;
+    EXPECT_FALSE(verifyLirText(lir, *sch, rep))
+        << "an elided fallthrough whose successor is NOT the next-laid-out "
+           "block must be refused — nothing downstream can detect it";
+    EXPECT_TRUE(sawMismatch(rep));
+    DiagnosticReporter prep;
+    EXPECT_FALSE(verifyLirPostRegalloc(lir, *sch, prep))
+        << "verifyLirPostRegalloc is the checkpoint that runs AFTER the "
+           "peephole and after callconv; if it accepts this, the pin runs "
+           "only where the bug cannot occur";
+    EXPECT_TRUE(sawMismatch(prep));
+}
+
+TEST(LirVerifier, ElidedFallthroughIsRefusedWhenTheTargetCannotSpellIt) {
+    // A target whose `jcc` declares only the two-blockref form, so a
+    // one-operand `jcc` is not a smaller encoding — it is an instruction the
+    // walker cannot match at all. Rule 1b refuses it here rather than letting
+    // it reach the encoder as `A_NoMatchingEncodingVariant`.
+    //
+    // ⚠ SYNTHESIZED, not shipped: both shipped documents now declare the
+    // fallthrough form, so `shippedX86()` is the POSITIVE case above.
+    auto sch = test_support::schemaWithoutFallthroughForm("x86_64");
+    Lir const lir = elidedCondBrModule(*sch, /*falseEdgeIsNextBlock=*/true,
+                                       /*elide=*/true);
+    DiagnosticReporter rep;
+    EXPECT_FALSE(verifyLirText(lir, *sch, rep));
+    EXPECT_TRUE(sawMismatch(rep));
+}
+
+TEST(LirVerifier, ElidedFallthroughInTheLastLaidOutBlockIsRefused) {
+    // `^0: ret ; ^1: jcc ^0` with successors [^0, ^0]. ^1 is the last block
+    // laid out, so the unnamed edge would fall out of the function's bytes.
+    auto const sch = test_support::schemaWithFallthroughForm("x86_64");
+    auto const jccOp = sch->opcodeByMnemonic("jcc");
+    auto const retOp = sch->opcodeByMnemonic("ret");
+    ASSERT_TRUE(jccOp.has_value() && retOp.has_value());
+    LirBuilder b{*sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const first = b.createBlock();
+    LirBlockId const last  = b.createBlock();
+    b.beginBlock(first);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    b.beginBlock(last);
+    std::array<LirOperand, 1> const ops{LirOperand::makeBlockRef(first.v)};
+    b.addCondBr(*jccOp, ops, first, first,
+                static_cast<std::uint32_t>(TargetCondCode::Ne));
+    Lir const lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    EXPECT_FALSE(verifyLirText(lir, *sch, rep));
+    EXPECT_TRUE(sawMismatch(rep));
+}
+
+TEST(LirText, AnElidedFallthroughSurvivesTheTextRoundTrip) {
+    // ★ THE CHANNEL THAT MAKES THE SHORTENED FORM SAYABLE. `.dsslir` writes a
+    // terminator's CFG edges in the block header's `-> [...]` list and its
+    // ENCODER operands on the instruction, and the parser's terminator fork
+    // keys on the HEADER. That is exactly why an elided `cond-br` — one
+    // operand, two successors — can round-trip at all: an operand-derived fork
+    // would read one BlockRef, dispatch it as a `Br`, and silently delete the
+    // taken edge.
+    auto const sch = test_support::schemaWithFallthroughForm("x86_64");
+    Lir const lir = elidedCondBrModule(*sch, /*falseEdgeIsNextBlock=*/true,
+                                       /*elide=*/true);
+    DiagnosticReporter rep;
+    LirTextContext ctx;
+    std::string const text = emitLir(lir, *sch, ctx, rep);
+    auto parsed = parseLir(text, *sch, rep);
+    ASSERT_NE(parsed, nullptr);
+    ASSERT_TRUE(parsed->ok) << text;
+
+    LirFuncId const fn = parsed->lir.funcAt(0);
+    LirBlockId const bb = parsed->lir.funcBlockAt(fn, 0);
+    LirInstId const term =
+        parsed->lir.blockInstAt(bb, parsed->lir.blockInstCount(bb) - 1);
+    EXPECT_EQ(parsed->lir.instOperands(term).size(), 1u)
+        << "the elision must survive the round trip — a re-materialized second "
+           "operand would silently undo it";
+    EXPECT_EQ(parsed->lir.blockSuccessors(bb).size(), 2u)
+        << "and BOTH CFG edges must come back";
+    EXPECT_EQ(emitLir(parsed->lir, *sch, ctx, rep), text)
+        << "byte-identical re-emit is this format's round-trip contract";
+    DiagnosticReporter vrep;
+    EXPECT_TRUE(verifyLirText(parsed->lir, *sch, vrep));
+}

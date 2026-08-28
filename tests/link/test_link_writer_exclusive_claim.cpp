@@ -785,3 +785,145 @@ TEST(LinkWriterExclusiveClaim, WriteBytesStepsOverStaleTempsAndNeverAdoptsOne) {
         nextSlot += kStaleAhead + 1;
     }
 }
+
+// ── A DANGLING SYMLINK AT A CANDIDATE NAME IS AN OCCUPIED SLOT ─────────────
+//    D-LINK-WRITER-DANGLING-SYMLINK-CLAIM-MISROUTE
+//
+// The claim loop disambiguates a null return from `createExclusiveBinary` by
+// asking the filesystem whether the candidate is occupied, and it must get the
+// SAME answer the exclusive create itself acted on. `O_CREAT|O_EXCL` refuses a
+// directory ENTRY; `std::filesystem::exists` resolves the entry and answers
+// about its TARGET. A DANGLING symlink is exactly the shape on which those two
+// questions have different answers, and before the repair the loop took the
+// "this is a real error" arm and refused to emit the artifact at all.
+//
+// ⚠ POSIX LEG ONLY, AND THE REASON IS THE LIBRARY, NOT THE PRIVILEGE. The
+// anchor predicted a Windows skip because creating a symlink there needs
+// Developer Mode or elevation. ✔MEASURED 2026-08-26 on the shipping Windows
+// toolchain (MinGW-W64 UCRT g++ 13.2.0): `std::filesystem::create_symlink`
+// fails with `ENOSYS` — "Function not implemented" (40) — in a directory where
+// `mklink` succeeds in the same session, so libstdc++ never even attempts the
+// call and no privilege can change that. The tests below therefore SAY they
+// skipped and WHY rather than silently passing — see
+// D-GATE-INSTRUMENT-SCOPE-UNSTATED.
+// ⚠ THEY MUST SKIP BEFORE CONSUMING A SLOT: the ledger above is
+// audited by the integration test, so a skip that had already called
+// `writeBytes` would desynchronise it.
+namespace {
+
+// Plant a dangling symlink at `p`. Returns false having ALREADY issued the
+// skip reason when the platform cannot make one.
+[[nodiscard]] bool plantDanglingSymlink(fs::path const& p, std::string& why) {
+    std::error_code ec;
+    fs::create_symlink(p.parent_path() / "no-such-target-dss", p, ec);
+    if (ec) {
+        why = "std::filesystem::create_symlink failed: " + ec.message() + " ("
+            + std::to_string(ec.value())
+            + "). This leg cannot construct the input this test is about, so "
+              "nothing was asserted. On MinGW/libstdc++ the value is ENOSYS "
+              "and no privilege changes it.";
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+// (a) THE PRIMITIVE-LEVEL MEASUREMENT — the anti-vacuity proof for (b).
+//
+// (b) below asserts that the writer steps over a dangling symlink. That claim
+// is only meaningful if the claim primitive actually REFUSES such a name: on a
+// platform where the exclusive create simply succeeded through the link, (b)
+// would pass while proving nothing at all. So the divergence itself is pinned
+// here, on the same primitive and in the same process.
+TEST(LinkWriterExclusiveClaim, ADanglingSymlinkRefusesTheClaimButExistsSaysNo) {
+    ScratchDir scratch{Location::Temp, "link-writer-dangling-primitive"};
+    auto const p = scratch.path() / "candidate.dsstmp-probe";
+
+    std::string why;
+    if (!plantDanglingSymlink(p, why)) { GTEST_SKIP() << why; }
+
+    // The claim refuses it — the entry exists, so exclusive create cannot win.
+    EXPECT_FALSE(static_cast<bool>(claim(p)))
+        << "the exclusive create SUCCEEDED on a name occupied by a dangling "
+           "symlink. If that is genuinely this platform's behaviour, the "
+           "disambiguation below is moot and this file must be re-measured "
+           "rather than the assertion relaxed.";
+
+    // ...and the two probes disagree. This is the defect in one line.
+    std::error_code ecFollow;
+    std::error_code ecEntry;
+    EXPECT_FALSE(fs::exists(p, ecFollow))
+        << "`exists()` was expected to FOLLOW the link and report the missing "
+           "TARGET; it did not, so this platform cannot exhibit the misroute";
+    EXPECT_TRUE(fs::exists(fs::symlink_status(p, ecEntry)))
+        << "`symlink_status()` must see the ENTRY — this is the probe the "
+           "claim loop relies on";
+    EXPECT_FALSE(static_cast<bool>(ecEntry))
+        << "symlink_status reported an error: " << ecEntry.message();
+}
+
+// (b) THE ROUTING ITSELF, through `writeBytes`.
+//
+// RED ON DISABLE: restore `std::filesystem::exists(candidate, eec)` in
+// `writer.cpp`'s claim loop in place of the `symlink_status` probe. The first
+// candidate's dangling link then reads back as "not occupied", the loop takes
+// the real-error arm, and `writeBytes` returns FALSE with
+// `K_ImageWriteOpenFailed` — the ASSERT_TRUE below fires and no artifact
+// appears.
+TEST(LinkWriterExclusiveClaim, WriteBytesStepsOverDanglingSymlinkCandidates) {
+    // Small — the point is that the ENTRY-level probe routes to the retry arm,
+    // not how far the retry can run (the integration test above owns that).
+    constexpr std::uint64_t kDanglingAhead = 3;
+
+    ScratchDir scratch{Location::Temp, "link-writer-dangling-stepover"};
+    auto const out     = scratch.path() / "artifact.bin";
+    auto const payload = bytesOf("the artifact that must still land");
+
+    // Plant BEFORE any `writeBytes` call, so a platform that cannot make a
+    // symlink skips without touching the staging-slot ledger.
+    std::vector<fs::path> links;
+    links.reserve(kDanglingAhead);
+    for (std::uint64_t i = 0; i < kDanglingAhead; ++i) {
+        auto const p = stagingCandidate(out, nextSlot + i);
+        std::string why;
+        if (!plantDanglingSymlink(p, why)) {
+            for (auto const& done : links) { fs::remove(done); }
+            GTEST_SKIP() << why;
+        }
+        links.push_back(p);
+    }
+
+    DiagnosticReporter rep;
+    ASSERT_TRUE(linker::writeBytes(payload, out, rep))
+        << "a dangling symlink sitting on the writer's first "
+        << kDanglingAhead
+        << " candidate name(s) stopped the artifact from being written. The "
+           "claim loop asked `exists()` — which follows the link to a target "
+           "that is not there — instead of asking about the directory ENTRY "
+           "the exclusive create actually refused "
+           "(D-LINK-WRITER-DANGLING-SYMLINK-CLAIM-MISROUTE): "
+        << allMessages(rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(readAll(out), payload)
+        << "the artifact does not hold the requested bytes";
+
+    // Every planted link is untouched: still a symlink, still dangling. A
+    // writer that "resolved" the situation by unlinking or by writing through
+    // would pass the assertion above and fail here.
+    for (std::uint64_t i = 0; i < kDanglingAhead; ++i) {
+        auto const& p = links[static_cast<std::size_t>(i)];
+        std::error_code ec;
+        EXPECT_TRUE(fs::is_symlink(fs::symlink_status(p, ec)))
+            << "candidate #" << (nextSlot + i)
+            << " is no longer a symlink — the writer consumed a slot it did "
+               "not create";
+        EXPECT_FALSE(fs::exists(p))
+            << "candidate #" << (nextSlot + i)
+            << " now resolves — the writer wrote THROUGH the link and created "
+               "its target, which is the other way this misroute can go wrong";
+    }
+
+    // `kDanglingAhead` slots stepped over plus the one actually claimed.
+    nextSlot += kDanglingAhead + 1;
+}

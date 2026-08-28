@@ -8,8 +8,8 @@
 #include <string>
 #include <vector>
 
-// GNU / System V `ar` static-archive WRITER -- c163, the D-LK-STATIC-ARCHIVE-
-// WRITER anchor (roadmap "write STATIC libs for all platforms"; the writer
+// GNU / System V `ar` static-archive WRITER -- c163, the D-LK-STATIC-ARCHIVE-WRITER
+// anchor (roadmap "write STATIC libs for all platforms"; the writer
 // half of D-FF1-AR-WRITER-STATIC-LINK).
 //
 // The EXACT INVERSE of the c161 `ar` READER (src/ffi/binary_readers/

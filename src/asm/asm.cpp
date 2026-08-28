@@ -4,6 +4,7 @@
 #include "asm/format/fixed32.hpp"
 #include "asm/format/walker_util.hpp"
 #include "asm/format/x86_variable.hpp"
+#include "core/types/bit_int_value.hpp"   // the ONE `_BitInt` padding policy (BitIntValue::paddingByte)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_layout.hpp"   // computeLayout, scalarByteSize
 #include "lir/lir_pass_util.hpp"
@@ -560,11 +561,92 @@ bool validateAssembledData(std::span<AssembledData const> items,
 
 namespace {
 
+// ── D-CSUBSET-ENUM-GLOBAL-CODEGEN: the MATERIAL kind a type ENCODES as ──
+//
+// C 6.7.2.2 / C23 6.7.2.2: an enumerated type has an implementation-defined
+// COMPATIBLE integer type, and its OBJECT REPRESENTATION *is* that integer's.
+// `TypeKind::Enum` is a NOMINAL-IDENTITY marker with no representation of its
+// own — which is exactly why `scalarByteSize(Enum)` is nullopt BY CONSTRUCTION
+// (the kind alone cannot know the width; only `scalars[0]` does). So every
+// KIND-KEYED data-emission decision in this file — the width, the value decode,
+// the natural alignment — must ask about the UNDERLYING integer, never about
+// the Enum marker.
+//
+// ⚠ WHY THIS EXISTS AT ALL: it did not, and an utterly ordinary `enum E g = B;`
+// at file scope therefore reached the "non-primitive global types" refusal
+// (K_NoMatchingObjectFormat) instead of emitting four bytes — while gcc and
+// clang both compile and run it. This tier was the ONE kind-keyed tier in the
+// pipeline that never performed the projection; every other one already does:
+//   * `enumUnderlyingOrSelf`   (analysis/semantic/type_rules.hpp) — arithmetic
+//   * `resolveScalarIntKind`   (mir/lowering/hir_to_mir.cpp)      — MIR scalars
+//   * `classifyKind`/`reprKind`(lir/lowering/mir_to_lir.cpp)      — LIR widths
+//   * `computeLayout`'s Enum arm (core/types/…/type_layout.cpp)   — size/align
+// This is therefore NOT a new verb: it reads the SAME `scalars[0]` slot
+// `TypeInterner::enumType` writes and all four sites above read.
+//
+// ★ IT PROJECTS THE KIND ONLY — `ty` itself is NEVER rewritten, so the
+// structural readers (`operands`/`scalars`/`computeLayout`) keep seeing the
+// DECLARED type and an aggregate's layout is untouched. `interner.kind()`
+// already sees THROUGH a `VolatileQual` skin (c27), so `volatile enum E`
+// projects too, and a typedef is not a type at all here (it interns to the same
+// Enum id). Any non-enum passes through unchanged.
+//
+// ★ FAIL-LOUD ON A MALFORMED RECORD, never a guessed width: an Enum interned
+// without its underlying scalar, or with one outside the core kind range,
+// returns `Enum` UNCHANGED so the callers' existing refusals fire.
+// ⓘ ✔MEASURED, and it corrects the obvious reading of that bound check: it is
+// NOT there to make the cast well-defined. `TypeKind`'s underlying type is FIXED
+// (`std::uint16_t`), so converting an out-of-range integer to it is already
+// defined (it wraps). What the check buys is that a wrapped scalar cannot ALIAS
+// a VALID kind and hand a malformed record a plausible width — the choice
+// between REFUSING and GUESSING. The `AsmEnumGlobal` malformed-record pin is red
+// exactly under the GUESSING mutant and green under both mutations that merely
+// remove machinery; that pin's own comment names it and records why.
+//
+// ⛔ IT DELIBERATELY DOES **NOT** PROJECT `BitInt` → its container kind, even
+// though the MIR/LIR twins of this projection do — and the REASON CHANGED when
+// the multi-limb emitter landed, so read it fresh rather than by analogy.
+// It USED to be that `decodeScalarLiteralBits` returns a `std::uint64_t` with no
+// `_BitInt` gate, so a projected WIDE `_BitInt(N>64)` leaf would quietly encode
+// its low 8 bytes as the whole value. That hazard is gone: both encode sites now
+// route a `BitInt` kind to `encodeBitIntImage` BEFORE any `scalarByteSize` /
+// `decodeScalarLiteralBits` pair is reached (D-CSUBSET-BITINT-DATA-GLOBAL).
+// ★ THE PROJECTION IS STILL FORBIDDEN, FOR A SHARPER REASON: a `_BitInt(N)`'s
+// image is not its container kind's image. The container carries N *value* bits
+// plus padding, and this file emits the padding as the value's SIGN EXTENSION
+// (matching DSS's `bitIntMask`/`maskTopLimb` runtime invariant). Projecting
+// `_BitInt(17)` → `I32` would throw away N — the only thing that says where the
+// value bits stop — and hand the image to an encoder that cannot ask. An enum
+// projects soundly precisely because its underlying IS a whole core integer kind
+// with no residual width parameter; `_BitInt` has one, so it keeps its own arm.
+// The enum projection is sound because an enum's underlying is
+// a core INTEGER kind (the semantic tier rejects anything else), and every arm
+// below already handles those correctly INCLUDING their walls. ✔MEASURED on the
+// widest case: `enum E : __int128 g = B;` reaches the dedicated 16-byte arm and
+// EMITS, while the same enum as a struct MEMBER hits the pre-existing aggregate
+// refusal LOUD — byte-for-byte the behaviour a plain `__int128` already gets.
+//
+// ★ THE FILE-WIDE INVARIANT THIS ESTABLISHES, and it is the greppable form of
+// the multi-site contract: in this file, EVERY `scalarByteSize(...)` and
+// `decodeScalarLiteralBits(...)` argument that comes from an interner lookup
+// goes through here first. A new kind-keyed encode site that reaches for
+// `in.kind(x)` directly is the regression to look for.
+[[nodiscard]] TypeKind
+materialScalarKind(TypeInterner const& in, TypeId ty) noexcept {
+    TypeKind const k = in.kind(ty);
+    if (k != TypeKind::Enum) return k;
+    auto const sc = in.scalars(ty);
+    if (sc.empty() || sc[0] < 0
+        || sc[0] >= static_cast<std::int64_t>(TypeKind::Count_))
+        return k;
+    return static_cast<TypeKind>(sc[0]);
+}
+
 // Byte-width of a primitive TypeKind. Returns nullopt for non-primitive
 // kinds (Array / Struct / Ptr / FnSig / ...). Aggregate globals do NOT pass
 // through here — they take the `MirAggregateValue` arm + `encodeAggregateValue`
-// (the interner-side recursive layout walk, D-LK4-RODATA-PRODUCER-AGGREGATE-
-// GLOBAL); this gate only widths the SCALAR-global fast path.
+// (the interner-side recursive layout walk, D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL);
+// this gate only widths the SCALAR-global fast path.
 [[nodiscard]] std::optional<std::size_t>
 primitiveByteSize(TypeKind k) noexcept {
     switch (k) {
@@ -841,17 +923,209 @@ decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
     return std::nullopt;   // monostate / string / MirAggregateValue
 }
 
+// ── D-CSUBSET-BITINT-DATA-GLOBAL: the SOLE `_BitInt(N)` STATIC-IMAGE producer ──
+//
+// A `_BitInt(N)` object occupies `sizeOfScalarOrBitInt` bytes and carries only N
+// value bits (C23 6.2.6.2). Its image is therefore WIDER than the `std::uint64_t`
+// `decodeScalarLiteralBits` returns whenever N > 64, which is why that chokepoint
+// cannot carry one and why this producer exists beside it rather than inside it.
+// ★ ONE producer, TWO call sites — the SCALAR-global arm of
+// `lowerMirGlobalsToDataItems` and the aggregate-LEAF recursion in
+// `encodeAggregateValue`. That is deliberate and it is the whole shape of this
+// deferral's close: a scalar-only emitter would leave the leaf refusing a width
+// the compiler demonstrably knows how to encode, i.e. the half-shipped multi-site
+// contract. Both sites ask HERE; neither owns a second copy of the rule.
+//
+// ★★ PADDING BITS — THE DECISION, AND WHAT IT WAS MEASURED AGAINST.
+// C23 6.2.6.1p6 leaves the values of padding bits UNSPECIFIED, so more than one
+// image conforms and the choice must be made on evidence rather than defaulted
+// into. ✔MEASURED (2026-08-27, clang 18.1.3 `-std=c23 -c`, ELF x86_64): clang
+// ZERO-fills — `_BitInt(17) p = -3wb;` emits `fd ff 01 00`, `_BitInt(65) w = -1wb;`
+// emits eight `ff` then `01` and seven `00`. ✔MEASURED on the same clang at -O0, a
+// RUNTIME-computed `_BitInt(17) = -3` read back `fd ff 01 a1` — GARBAGE in the
+// padding — so "clang's padding" is not even a stable target to copy; only its
+// STATIC image is deterministic.
+// ✔MEASURED on DSS, by execution, through a `unsigned char *` read of the object:
+// a runtime `_BitInt(17) = -3` has byte 2 == 0xff and a runtime `_BitInt(65) = -1`
+// has byte 8 == 0xff — DSS SIGN-EXTENDS the padding of a negative signed value,
+// at BOTH the narrow and the wide width. That is not incidental: it is the
+// `bitIntMask` (Shl/AShr) and `maskTopLimb` invariant, the one wrap chokepoint the
+// whole `_BitInt` tier is built on, and `BitIntValue`'s host `wrapTo` mirrors it.
+// ⇒ THIS PRODUCER SIGN-EXTENDS, because the static image is READ BY DSS's OWN
+// RUNTIME. Zero-filling would match clang's bytes and then make
+// `_BitInt(17) g = -3wb; g < 0` answer FALSE — the loaded container would hold
+// +131069 — a silent miscompile of the compiler's own initializer. Agreement with
+// the runtime is a correctness constraint; agreement with clang's padding is a
+// preference the standard does not impose and clang itself does not keep.
+// ⚠ The divergence from clang IS observable (a `union { _BitInt(17) b; unsigned u; }`
+// reads 0x0001fffd there and 0xfffffffd here) and is recorded on the anchor row —
+// it is a property of DSS's chosen `_BitInt` REPRESENTATION, decided in
+// `hir_to_mir`'s wrap chokepoint, not of this emitter.
+//
+// ★ LIMB ORDER. The limbs are appended through `appendLittleEndianBytes`, the file's
+// ONE byte-order chokepoint (`appendLE`'s loop, shared with the assembly-text data
+// directives). This file has NO target-keyed byte order anywhere — every scalar,
+// F80, F128 and the 128-bit arm are little-endian by construction — so giving
+// `_BitInt` a private limb order would MINT the file's second byte-order mechanism,
+// exactly what `appendLE`'s own comment forbids ("what must not exist is a SECOND
+// byte-order loop"). Routing here means the day that chokepoint becomes byte-order
+// aware from `.target.json`, `_BitInt` follows for free, with every other kind, at
+// one site. The arithmetic is host-endian-independent (shifts of a `std::uint64_t`),
+// so nothing here is host-keyed.
+//
+// ★ FAIL LOUD, NEVER TRUNCATE. Every refusal writes `why`. The load-bearing one is
+// the extension check: the bytes ABOVE the container are re-derived and must equal
+// the value's extension byte, so a value that genuinely does not fit its declared
+// container is REFUSED rather than silently narrowed. On a well-formed record it
+// cannot fire (the container is sized FROM N); it is the guard that makes "a width
+// we cannot emit correctly walls" true by construction rather than by argument.
+// ── The `_BitInt` VALUE normalizer — step one of the producer, and its own function
+// because the BIT-FIELD packer needs the same step and must not grow a second copy.
+// Reads any integer literal arm and returns the value WRAPPED to the type's declared
+// (N, signedness); nullopt (with `why`) for a non-`_BitInt` type, a malformed width,
+// or a literal in no integer arm.
+[[nodiscard]] std::optional<BitIntValue>
+bitIntLiteralValue(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
+                   std::string& why) {
+    // `bitIntWidth`/`bitIntIsSigned` ABORT on a non-BitInt (deliberately — that
+    // abort is the backstop for a missed gate), so the kind check is the contract,
+    // not a defensive nicety.
+    if (!ty.valid() || in.kind(ty) != TypeKind::BitInt) {
+        why = "the `_BitInt` value normalizer was reached with a non-`_BitInt` "
+              "type (D-CSUBSET-BITINT-DATA-GLOBAL)";
+        return std::nullopt;
+    }
+    std::int64_t const n     = in.bitIntWidth(ty);
+    bool const         signd = in.bitIntIsSigned(ty);
+    if (n <= 0 || n > static_cast<std::int64_t>(kBitIntMaxWidth)) {
+        why = std::format("`_BitInt({})` has a width outside [1,{}] — a malformed "
+                          "interned record; refusing rather than guessing a "
+                          "container (D-CSUBSET-BITINT-DATA-GLOBAL)",
+                          n, kBitIntMaxWidth);
+        return std::nullopt;
+    }
+    // ⓘ THE FOUR INTEGER LITERAL ARMS ARE ALL REAL AND NONE IMPLIES ANOTHER — the
+    // lesson [[D-CSUBSET-INT128-DATA-GLOBAL]] paid for. A `_BitInt` initializer can
+    // fold into the `BitIntValue` pool arm, but an ordinary `std::int64_t` /
+    // `std::uint64_t` / `bool` arm reaches here too (the narrowest arm that holds the
+    // value wins). Keying on the declared KIND and then accepting every integer arm
+    // catches all four; keying on the VARIANT would miss three of them.
+    std::optional<BitIntValue> src;
+    if (auto const* bv = std::get_if<BitIntValue>(&v.value))            src = *bv;
+    else if (auto const* u = std::get_if<std::uint64_t>(&v.value))
+        src = BitIntValue::fromU64(*u, 64u, /*isSigned=*/false);
+    else if (auto const* i = std::get_if<std::int64_t>(&v.value))
+        src = BitIntValue::fromI64(*i, 64u, /*isSigned=*/true);
+    else if (auto const* b = std::get_if<bool>(&v.value))
+        src = BitIntValue::fromU64(*b ? 1u : 0u, 1u, /*isSigned=*/false);
+    if (!src.has_value()) {
+        why = std::format("`_BitInt({})` has an initializer in no integer literal "
+                          "arm — refusing rather than emitting a fabricated image "
+                          "(D-CSUBSET-BITINT-DATA-GLOBAL)", n);
+        return std::nullopt;
+    }
+    // C 6.3.1.3 conversion of the folded value to the DECLARED (N, signedness).
+    // Routed through `BitIntValue`'s own conversion rule rather than re-implemented:
+    // every binary op converts BOTH operands to the result type FIRST, so an ADD OF
+    // ZERO at (N, signd) IS that conversion — identity when the value already
+    // carries the declared type, and the correct sign/zero extension when a narrower
+    // literal type (`-1wb` is `_BitInt(2)`) is initializing a wider object.
+    return BitIntValue::add(*src, BitIntValue{}, static_cast<std::uint32_t>(n), signd);
+}
+
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
+encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
+                  DataModel dm, std::string& why) {
+    auto const valOpt = bitIntLiteralValue(v, in, ty, why);
+    if (!valOpt.has_value()) return std::nullopt;   // `why` already written
+    BitIntValue const& val   = *valOpt;
+    std::int64_t const n     = in.bitIntWidth(ty);
+    // ⓘ THE DECLARED SIGNEDNESS IS NO LONGER READ HERE, and its absence is the
+    // point (D-CSUBSET-BITINT-PADDING-POLICY-HAS-THREE-OWNERS): `bitIntLiteralValue`
+    // already normalized the value to THIS type's (N, signedness), so `val` carries
+    // it, and asking the interner a second time is how a producer grows a second
+    // opinion about a value it was handed. `val.paddingByte()` below is the only
+    // consumer that ever needed it.
+    // The width comes from `sizeOfScalarOrBitInt` — the TypeId-aware companion to
+    // `scalarByteSize`, which is the layout authority's OWN size ladder and the one
+    // this file's callers are documented to use for a data-global leaf. Not
+    // re-derived here: a second ladder is a second ABI.
+    auto const wOpt = sizeOfScalarOrBitInt(in, ty, dm);
+    if (!wOpt.has_value() || *wOpt == 0) {
+        why = std::format("`_BitInt({})` has no computable container size "
+                          "(D-CSUBSET-BITINT-DATA-GLOBAL)", n);
+        return std::nullopt;
+    }
+    std::size_t const width     = static_cast<std::size_t>(*wOpt);
+    auto const&       limbs     = val.limbs();
+    std::size_t const limbBytes = limbs.size() * 8u;
+    if (limbs.empty() || width > limbBytes) {
+        why = std::format("`_BitInt({})` reserves {} container bytes but its wrapped "
+                          "value carries only {} — refusing rather than emitting a "
+                          "SHORT image (D-CSUBSET-BITINT-DATA-GLOBAL)",
+                          n, width, limbBytes);
+        return std::nullopt;
+    }
+    // ★ WALL, NEVER TRUNCATE. Bits at and above `width*8` are outside the container
+    // and must therefore be pure extension of the value at width N. Re-derive them
+    // and compare; a mismatch means emitting the container would DROP VALUE BITS, so
+    // the image is refused.
+    // D-CSUBSET-BITINT-PADDING-POLICY-HAS-THREE-OWNERS: this byte used to be spelled
+    // `(signd && val.signBitSet()) ? 0xFFu : 0x00u` HERE — the THIRD independent
+    // statement of a rule whose owner is `bitIntPadding` in `bit_int_value.hpp`, and
+    // the one tier where a divergence from the other two is a SILENT MISCOMPILE
+    // rather than a refusal (this image is read back by DSS's own runtime). It now
+    // ASKS the value what its padding is.
+    std::uint8_t const ext = val.paddingByte();
+    for (std::size_t j = width; j < limbBytes; ++j) {
+        auto const byte =
+            static_cast<std::uint8_t>((limbs[j / 8u] >> ((j % 8u) * 8u)) & 0xFFu);
+        if (byte != ext) {
+            why = std::format("`_BitInt({})` value byte {} lies above its {}-byte "
+                              "container and is 0x{:02x}, not the 0x{:02x} "
+                              "extension — emitting the container would DROP value "
+                              "bits, so the image is refused rather than truncated "
+                              "(D-CSUBSET-BITINT-DATA-GLOBAL)",
+                              n, j, width, byte, ext);
+            return std::nullopt;
+        }
+    }
+    std::vector<std::uint8_t> out;
+    out.reserve(width);
+    std::size_t remaining = width;
+    for (std::uint64_t limb : limbs) {
+        if (remaining == 0u) break;
+        std::size_t const take = remaining < 8u ? remaining : 8u;
+        appendLittleEndianBytes(out, limb, take);   // ★ the ONE byte-order chokepoint
+        remaining -= take;
+    }
+    if (out.size() != width) {
+        why = std::format("`_BitInt({})` encoded to {} bytes but its container "
+                          "reserves {} — the encoder and the layout disagree "
+                          "(D-CSUBSET-BITINT-DATA-GLOBAL)", n, out.size(), width);
+        return std::nullopt;
+    }
+    return out;
+}
+
 // D-MIR-OVERLAP-STRUCT-ZERO-INIT: is every leaf of this static initializer a ZERO
 // whose object representation is all-zero BYTES? The static-data twin of the MIR
 // lowering's `isAllZeroAggregateInit`, and deliberately the same admissions and the
 // same CONSERVATIVE default — an unrecognized arm answers FALSE so the caller keeps
 // its refusal. `-0.0` is rejected: numerically zero, but its sign bit is SET, so a
-// pre-zeroed buffer does NOT carry its bytes. Symbol addresses / `_BitInt` / wide
-// floats / strings each need their own representation proof and get none here.
+// pre-zeroed buffer does NOT carry its bytes. Symbol addresses / wide floats /
+// strings each need their own representation proof and get none here.
+// D-CSUBSET-BITINT-DATA-GLOBAL: `_BitInt` NOW HAS ONE, and this is the whole proof.
+// `BitIntValue`'s post-`wrapTo` invariant is that the limbs are "clean" — bits above
+// N are the sign extension or zero — so `isZero()` (every limb 0) holds exactly when
+// the extension is zero too, i.e. when `encodeBitIntImage` would emit all-zero bytes
+// at any container width. A NEGATIVE value can never report zero, so the sign-extended
+// padding this file emits cannot be mistaken for a zero image.
 [[nodiscard]] bool isAllZeroMirLiteral(MirLiteralValue const& v) {
     if (auto const* b = std::get_if<bool>(&v.value))          return !*b;
     if (auto const* i = std::get_if<std::int64_t>(&v.value))  return *i == 0;
     if (auto const* u = std::get_if<std::uint64_t>(&v.value)) return *u == 0;
+    if (auto const* w = std::get_if<BitIntValue>(&v.value))   return w->isZero();
     if (auto const* d = std::get_if<double>(&v.value))
         return *d == 0.0 && !std::signbit(*d);
     if (auto const* a = std::get_if<MirAggregateValue>(&v.value)) {
@@ -912,7 +1186,16 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
                      std::uint64_t base, std::vector<Relocation>& relocs,
                      std::optional<RelocationKind> absPtrRelocKind,
                      std::string& why) {
-    TypeKind const k = in.kind(ty);
+    // D-CSUBSET-ENUM-GLOBAL-CODEGEN: an ENUM-typed member/element is a scalar
+    // leaf whose representation is its UNDERLYING integer's — the member of a
+    // `struct S { enum E e; }`, an element of `enum E a[2] = {A,B}`, the first
+    // member of a `union U { enum E e; }`. Projecting HERE (rather than at the
+    // leaf) keeps the Struct/Union/Array dispatch below untouched (those
+    // kinds project to themselves) while the leaf's `scalarByteSize` /
+    // `decodeScalarLiteralBits` see a sized integer instead of the un-sized Enum
+    // marker they used to reject. `ty` is unchanged, so `computeLayout` still
+    // lays the aggregate out from the DECLARED types.
+    TypeKind const k = materialScalarKind(in, ty);
 
     if (k == TypeKind::Struct || k == TypeKind::Union) {
         if (!std::holds_alternative<MirAggregateValue>(v.value)) return false;
@@ -988,7 +1271,51 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
             // load/store width is `unitBytes` (little-endian, matching the MIR
             // read-modify-write codegen + the layout's LSB-first packing).
             BitFieldPlacement const& p = lay->bitFields[i];
-            auto const bitsOpt = decodeScalarLiteralBits(agg.fields[i], in.kind(ops[i]));
+            // ⚠ THE u64 PACKING BELOW IS ONLY VALID UP TO 64 BITS AND 8 UNIT BYTES,
+            // and past those bounds it is not merely approximate — it is the SAME
+            // `>> (j*8)` UB the 128-bit arm was walled for: `placed` is a
+            // `std::uint64_t`, so a `unitBytes > 8` unit shifts by 64..120 and, on
+            // both shipped host arches, REPEATS the low 8 bytes into the high ones;
+            // and `bitWidth > 64` saturates the mask to `~0ull`, silently keeping
+            // bits the field cannot hold. Reachable through a wide-`_BitInt`-backed
+            // bit-field, whose allocation unit is its 16-byte-or-wider container.
+            // A width this packer cannot encode WALLS; it never emits.
+            if (p.bitWidth > 64u || p.unitBytes > 8u) {
+                why = "a bit-field wider than 64 bits (or in an allocation unit "
+                      "wider than 8 bytes) cannot be packed by the u64 static "
+                      "initializer packer — refusing rather than emitting bits it "
+                      "would silently drop or repeat "
+                      "(D-CSUBSET-BITINT-DATA-GLOBAL)";
+                return false;
+            }
+            // D-CSUBSET-ENUM-BITFIELD: an enum-typed bit-field decodes at its
+            // UNDERLYING integer — the same projection the MIR bit-field
+            // extract/insert already performs. (An `int`-backed enum decoded
+            // identically before, because this chokepoint's integer arms ignore
+            // the kind; a 128-bit-backed one did NOT, and silently yielded its
+            // low 8 bytes instead of the nullopt that fails loud.)
+            //
+            // D-CSUBSET-BITINT-DATA-GLOBAL: a `_BitInt`-typed bit-field —
+            // `struct B { unsigned _BitInt(17) a : 5; }` with a STATIC initializer —
+            // takes the normalizer, not the u64 chokepoint. ✔MEASURED before this
+            // arm existed: it refused with the generic aggregate text, because
+            // `decodeScalarLiteralBits` has no `BitIntValue` arm at all, so the
+            // const-folded `_BitInt` bit-field value returned nullopt. The RUNTIME
+            // twin (`c23_bitint_bitfield`) has always worked; only the static
+            // initializer was walled, and nothing named it. `low64()` is the whole
+            // value here because the guard above bounds the field at 64 bits, and
+            // the mask below takes the low `bitWidth` of it — the same low-bits rule
+            // the MIR bit-field insert applies, so a signed negative field packs
+            // identically whichever tier writes it.
+            std::optional<std::uint64_t> bitsOpt;
+            if (materialScalarKind(in, ops[i]) == TypeKind::BitInt) {
+                auto const bv = bitIntLiteralValue(agg.fields[i], in, ops[i], why);
+                if (!bv.has_value()) return false;    // `why` already written
+                bitsOpt = bv->low64();
+            } else {
+                bitsOpt = decodeScalarLiteralBits(agg.fields[i],
+                                                  materialScalarKind(in, ops[i]));
+            }
             if (!bitsOpt.has_value()) return false;   // non-int bit-field leaf → fail loud
             std::uint64_t const mask =
                 p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
@@ -998,6 +1325,62 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
             for (std::uint32_t j = 0; j < p.unitBytes; ++j)
                 buf[unitBase + j] |= static_cast<std::uint8_t>((placed >> (j * 8)) & 0xFFu);
         }
+        return true;
+    }
+
+    // ── D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE ──
+    // A C99 `_Complex` leaf — the whole of `double _Complex g = 1.0;` at file
+    // scope, a `static _Complex` LOCAL (lowered as a global, which is why this is
+    // not a file-scope-only shape), and equally a complex MEMBER of a struct or
+    // ELEMENT of an array. C 6.2.5p13: a complex lays out EXACTLY like an array of
+    // TWO element-float components, real first — so this arm is the Array arm with
+    // the count FIXED at 2 and the component type taken from the interner.
+    //
+    // ★ THE OFFSETS ARE `elemLay->size`, NOT THE ALIGNED STRIDE, and the difference
+    // is deliberate: `computeLayout`'s own Complex arm returns `StructLayout{es * 2,
+    // elem->align, …}` — it lays the imaginary component at exactly `es`, where the
+    // Array arm rounds `es` UP to the element's alignment first. They coincide for
+    // F32 and F64 (size == align), and they DIVERGE for an x87 F80 element (10 bytes,
+    // align 16), so copying the Array arm's stride would silently place `im` six
+    // bytes past where every reader — `complexParts`/`loadComplex` in hir_to_mir,
+    // `collectLeaves` in aggregate_abi — expects it. This arm matches the LAYOUT
+    // AUTHORITY's formula, exactly as the Array arm matches its own.
+    // ⓘ F80/F128 elements still cannot REACH here with a value: the MIR classifier
+    // that mints this literal folds only F32/F64 components and refuses the rest
+    // loud, matching the wall complex ARITHMETIC already hits at those widths. The
+    // formula is written correctly anyway, because a layout rule copied wrong is
+    // the kind of defect that surfaces one cycle after the gate it would have passed.
+    //
+    // ⚠ A SHORT VALUE IS NOT A ZERO IMAGINARY PART BY ACCIDENT — it is one BY
+    // CONSTRUCTION: `buf` is pre-zeroed to the layout size by the caller, so a
+    // 1-field value writes `re` and leaves `im` as the zero C 6.3.1.7 requires for a
+    // real→complex conversion. More than 2 fields is a shape the type cannot hold,
+    // and it FAILS LOUD rather than writing the first two and dropping the rest.
+    if (k == TypeKind::Complex) {
+        if (!std::holds_alternative<MirAggregateValue>(v.value)) {
+            why = "a `_Complex` static initializer must arrive as a two-component "
+                  "aggregate value (real, imaginary) — a scalar leaf cannot carry "
+                  "both components "
+                  "(D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE)";
+            return false;
+        }
+        auto const& agg = std::get<MirAggregateValue>(v.value);
+        auto const  ops = in.operands(ty);
+        if (ops.empty()) return false;                  // malformed interned record
+        TypeId const elem    = ops[0];
+        auto const   elemLay = computeLayout(elem, in, lp, dm);
+        if (!elemLay.has_value()) return false;
+        if (agg.fields.size() > 2) {
+            why = "a `_Complex` static initializer carries more than two components "
+                  "— refusing rather than dropping the extras "
+                  "(D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE)";
+            return false;
+        }
+        for (std::size_t i = 0; i < agg.fields.size(); ++i)
+            if (!encodeAggregateValue(elem, agg.fields[i], in, lp, dm, buf,
+                                      base + i * elemLay->size, relocs,
+                                      absPtrRelocKind, why))
+                return false;
         return true;
     }
 
@@ -1017,6 +1400,16 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         // NUL+bytes must fit the array's byte extent (a layout↔value disagreement
         // fails loud). A non-character array with a string value, or an over-long
         // string, falls through to the shape-mismatch `false` below.
+        //
+        // ⚠ D-CSUBSET-ENUM-GLOBAL-CODEGEN — THE ONE INTERNER-DERIVED KIND IN THIS
+        // FILE DELIBERATELY *NOT* PROJECTED THROUGH `materialScalarKind`, and the
+        // reason is the distinction the projection exists to respect. This asks
+        // "is the element a CHARACTER TYPE?" — a C 6.2.5p15 TYPE-IDENTITY question,
+        // not a representation-width one. `enum E : unsigned char` REPRESENTS as U8
+        // but is NOT a character type, and C 6.7.9 does not admit a string literal
+        // as its initializer; projecting here would silently accept
+        // `enum E : unsigned char a[3] = "ab";`. Identity questions read the
+        // DECLARED kind; representation questions read the material one.
         if (std::holds_alternative<std::string>(v.value)
             && !in.operands(ty).empty()
             && (in.kind(in.operands(ty)[0]) == TypeKind::Char
@@ -1075,6 +1468,32 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         relocs.push_back(Relocation{static_cast<std::uint32_t>(base),
                                     SymbolId{sa.symbol}, *absPtrRelocKind,
                                     sa.addend});
+        return true;
+    }
+
+    // D-CSUBSET-BITINT-DATA-GLOBAL: a `_BitInt(N)` MEMBER / ELEMENT / union-first-
+    // member leaf — the member of `struct S { _BitInt(17) a; }`, an element of
+    // `_BitInt(65) a[2]`, the first member of `union U { _BitInt(100) w; }`. Routed
+    // to the SAME image producer the SCALAR-global arm uses, so the two encoders
+    // cannot drift: one `_BitInt` representation, asked in one place.
+    // ★ MUST PRECEDE the `scalarByteSize` / `decodeScalarLiteralBits` pair below,
+    // and neither of them could serve this leaf anyway — `scalarByteSize` takes a
+    // KIND and a `_BitInt`'s size lives in its interned WIDTH (hence
+    // `sizeOfScalarOrBitInt` inside the producer), and the decode chokepoint returns
+    // a `std::uint64_t` that structurally cannot carry an N>64 image. Before this
+    // arm existed the leaf fell to `scalarByteSize(BitInt) == nullopt` and refused —
+    // LOUD, but with the generic aggregate text that names f16/f80/f128 and not
+    // `_BitInt`; the producer's `why` now reaches the caller with the real cause.
+    if (k == TypeKind::BitInt) {
+        auto const img = encodeBitIntImage(v, in, ty, dm, why);
+        if (!img.has_value()) return false;              // `why` already written
+        if (base + img->size() > buf.size()) {
+            why = "a `_BitInt` member's image overruns the aggregate's laid-out "
+                  "extent — the encoder and the layout disagree "
+                  "(D-CSUBSET-BITINT-DATA-GLOBAL)";
+            return false;
+        }
+        for (std::size_t j = 0; j < img->size(); ++j) buf[base + j] = (*img)[j];
         return true;
     }
 
@@ -1184,7 +1603,14 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // is unconditionally writable; the const bit is not consulted here.
         // Closes D-LK4-RODATA-PRODUCER-BSS-EMIT (the former fail-loud anchor).
         if (litIdx == UINT32_MAX) {
-            TypeKind const zk = interner.kind(ty);
+            // D-CSUBSET-ENUM-GLOBAL-CODEGEN: project enum → its underlying
+            // integer so a tentative `enum E g;` reserves its .bss span on the
+            // PRIMITIVE fast path. It reserved the right size before, but only
+            // via the `computeLayout` fallback — which needs the target to have
+            // declared an `aggregateLayout` block, a dependency an integer-sized
+            // object has no business having. Now the two arms of this function
+            // agree on what an enum IS instead of arriving there by two routes.
+            TypeKind const zk = materialScalarKind(interner, ty);
             // Type byte size: the scalar fast path widths primitives; an
             // aggregate routes through the target's layout engine (same
             // `computeLayout` the initialized aggregate arm uses). Absent a
@@ -1242,18 +1668,24 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         }
 
         MirLiteralValue const& v = mir.literalValue(litIdx);
-        TypeKind const k = interner.kind(ty);
+        // D-CSUBSET-ENUM-GLOBAL-CODEGEN: the kind every arm below dispatches on
+        // is the MATERIAL one — an `enum E g = B;` widths and decodes as its
+        // underlying integer. Before this projection it reached the scalar arm's
+        // "non-primitive global types" refusal, because `scalarByteSize(Enum)` is
+        // nullopt by construction. `ty` stays the DECLARED type for every
+        // structural reader below (`operands`/`scalars`/`computeLayout`).
+        TypeKind const k = materialScalarKind(interner, ty);
 
         AssembledData d;
         d.symbol  = sym;
-        // Section selection for an INITIALIZED global (D-LK4-DATA-PRODUCER-
-        // MUTABLE-GLOBAL): a `const` global is genuinely read-only → `.rodata`;
+        // Section selection for an INITIALIZED global (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL):
+        // a `const` global is genuinely read-only → `.rodata`;
         // a mutable one is written at runtime → writable `.data` (a store into
         // `.rodata` faults — the bug this cycle fixes). Keyed on the config-
         // driven `MirGlobal.isConst` PROPERTY threaded from the source's
         // const-qualifier, NOT on any target/format identity. A string-literal
-        // global's isConst is set at its MINT site (D-CSUBSET-MUTABLE-CHAR-ARRAY-
-        // RODATA): a SYNTHETIC string-pool global — the immutable bytes a
+        // global's isConst is set at its MINT site (D-CSUBSET-MUTABLE-CHAR-ARRAY-RODATA):
+        // a SYNTHETIC string-pool global — the immutable bytes a
         // `char *p = "hi"` / a function-body literal points to — is minted const
         // → `.rodata`; a NAMED `char arr[N] = "str"` honors its declared
         // const-ness. So the string-literal arm below no longer overrides the
@@ -1295,8 +1727,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // HIR string-literal's `Array<Char,N+1>` type), which
         // `primitiveByteSize` does NOT handle (returns nullopt →
         // K_NoMatchingObjectFormat with a misleading "non-primitive
-        // global types are anchored under D-LK4-RODATA-PRODUCER-
-        // AGGREGATE-GLOBAL" message). The dispatch on the LITERAL-
+        // global types are anchored under D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL"
+        // message). The dispatch on the LITERAL-
         // POOL VARIANT (not the TypeKind) is the correct
         // discriminator for the string case. A future refactor
         // that reorders to "TypeKind check first" would silently
@@ -1335,7 +1767,14 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             if (interner.kind(ty) == TypeKind::Array) {
                 if (auto const ops = interner.operands(ty);
                     !ops.empty() && ops[0].valid()) {
-                    if (auto const eb = scalarByteSize(interner.kind(ops[0]), dataModel);
+                    // D-CSUBSET-ENUM-GLOBAL-CODEGEN: the file-wide invariant —
+                    // an interner-derived kind reaching `scalarByteSize` is the
+                    // MATERIAL one. No shipped source can give a string literal an
+                    // enum element type, so this site changes nothing today; it is
+                    // here so the invariant holds by inspection at EVERY site
+                    // rather than at the two that happen to be reachable.
+                    auto const elemKind = materialScalarKind(interner, ops[0]);
+                    if (auto const eb = scalarByteSize(elemKind, dataModel);
                         eb.has_value() && *eb > 0) {
                         elemBytes = *eb;
                     }
@@ -1542,33 +1981,149 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // `decodeScalarLiteralBits` returns nullopt for
         // these kinds too, so a `struct { __uint128_t x; }` global walls at the
         // aggregate-leaf recursion rather than slipping through this scalar path.
+        // ★ THE 16 BYTES ARE NOW EMITTED. This arm used to be a fail-loud
+        // DEFERRAL wall; it is a producer. What made the wall necessary was that
+        // `appendLE` takes a `std::uint64_t`, so a width-16 append computed
+        // `(value >> (j*8))` for j in [0,16) -- a shift of 64..120 bits, UB,
+        // which on both shipped host arches masks the count to 6 bits and
+        // REPEATS the low 8 bytes into the high 8. The fix is not a wider shift
+        // but a wider SOURCE: read the value as two little-endian 64-bit limbs
+        // and append each at its own width, so no shift ever exceeds 56.
+        //
+        // ⓘ THE TWO PAYLOAD ARMS ARE BOTH REAL AND NEITHER IMPLIES THE OTHER --
+        // this is the distinction the row recorded as the one a naive gate
+        // misses. `__uint128_t g = 5;` folds into a PLAIN `std::uint64_t` (the
+        // narrowest arm that holds it), while a value needing more than 64 bits
+        // folds into the `BitIntValue` pool arm carrying an I128/U128 core. A
+        // dispatch keyed on the VARIANT would silently miss the first; keying on
+        // the declared KIND `k`, as this arm does, catches both.
+        //
+        // ⓘ SIGN MATTERS FOR THE HIGH LIMB. A negative `__int128` folded into
+        // the int64 arm must fill its high limb with 1s, not zeros -- so the
+        // extension is taken from the VALUE's signedness, not assumed.
+        //
+        // ⚠ THE AGGREGATE LEAF STAYS WALLED, DELIBERATELY. `decodeScalarLiteralBits`
+        // still returns nullopt for these kinds, so `struct { __uint128_t x; }`
+        // fails LOUD at the aggregate-leaf recursion rather than slipping
+        // through: that chokepoint returns a `std::uint64_t` and structurally
+        // cannot carry 16 bytes. This mirrors the shipped F80 arm exactly (the
+        // sole F80 scalar-global producer, with F80 struct members walled the
+        // same way). A remaining site that is LOUD is a deferral; a remaining
+        // site that is SILENT would be the half-shipped multi-site contract this
+        // cycle exists to stop.
         if (k == TypeKind::I128 || k == TypeKind::U128) {
-            emit(DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} has "
-                             "a 128-bit integer initializer (TypeKind={}) — 128-bit "
-                             "integer DATA-globals are not yet emitted "
-                             "(D-CSUBSET-INT128-DATA-GLOBAL); the u64 literal-pool "
-                             "arm carries only the low 8 bytes, so emitting would "
-                             "write a wrong 16-byte image.",
-                             sym.v, static_cast<int>(k)));
+            std::uint64_t lo = 0;
+            std::uint64_t hi = 0;
+            if (auto const* bv = std::get_if<BitIntValue>(&v.value)) {
+                auto const& limbs = bv->limbs();
+                lo = limbs.size() > 0 ? limbs[0] : 0ull;
+                hi = limbs.size() > 1 ? limbs[1] : 0ull;
+                // A 1-limb payload declared 128 bits wide still needs its high
+                // limb materialized; `BitIntValue` keeps its limbs sign-clean, so
+                // the extension is the sign of the declared value.
+                if (limbs.size() < 2 && bv->isSigned()
+                    && (lo >> 63) != 0) hi = ~0ull;
+            } else if (auto const* uv = std::get_if<std::uint64_t>(&v.value)) {
+                lo = *uv;                       // zero-extends
+            } else if (auto const* iv = std::get_if<std::int64_t>(&v.value)) {
+                lo = static_cast<std::uint64_t>(*iv);
+                if (*iv < 0) hi = ~0ull;        // sign-extends
+            } else if (auto const* bo = std::get_if<bool>(&v.value)) {
+                lo = *bo ? 1ull : 0ull;
+            } else {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
+                                 "has a 128-bit integer type (TypeKind={}) but its "
+                                 "initializer is in no integer literal arm — refusing "
+                                 "rather than emitting a fabricated 16-byte image "
+                                 "(D-CSUBSET-INT128-DATA-GLOBAL).",
+                                 sym.v, static_cast<int>(k)));
+                continue;
+            }
+            std::size_t const before = d.bytes.size();
+            appendLE(d.bytes, lo, 8);
+            appendLE(d.bytes, hi, 8);
+            // The layout and the encoder must agree; a disagreement is a wrong
+            // image, so it fails loud rather than shipping a short/long record.
+            auto const w128 = scalarByteSize(k, dataModel);
+            if (!w128.has_value() || d.bytes.size() - before != *w128) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: 128-bit global "
+                                 "SymbolId={{ {} }} encoded to {} bytes but "
+                                 "scalarByteSize reserves {} — the 128-bit encoder "
+                                 "and the layout disagree.",
+                                 sym.v, d.bytes.size() - before,
+                                 w128.has_value() ? *w128 : 0));
+                continue;
+            }
+            d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
+                static_cast<std::uint32_t>(*w128)));
+            out.push_back(std::move(d));
             continue;
         }
-        // C4b (I5, D-CSUBSET-BITINT-DATA-GLOBAL): a const-folded `_BitInt` value
-        // reaching a DATA-global initializer is a DEFERRAL boundary — the on-disk
-        // byte layout of a `_BitInt` global (wide multi-limb, and a narrow one for
-        // uniformity) is not yet emitted. FAIL LOUD rather than emit wrong / zero
-        // bytes: the value folds correctly (C4b), but its GLOBAL byte-emission waits.
-        // Placed BEFORE the scalar arm (whose `scalarByteSize` would otherwise
-        // mis-handle a `_BitInt` TypeKind), the same dispatch-order discipline the
-        // string / aggregate arms follow.
-        if (std::holds_alternative<BitIntValue>(v.value)) {
-            emit(DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} has "
-                             "a const-folded `_BitInt` initializer — `_BitInt` "
-                             "DATA-globals are not yet emitted "
-                             "(D-CSUBSET-BITINT-DATA-GLOBAL); the value folds correctly "
-                             "but its global byte layout is deferred.",
-                             sym.v));
+        // ── D-CSUBSET-BITINT-DATA-GLOBAL: a `_BitInt(N)` SCALAR data-global ──
+        // ★ THIS ARM USED TO BE A DEFERRAL WALL AND IS NOW A PRODUCER. What made the
+        // wall necessary was never the value — `_BitInt` has const-folded since C4b —
+        // but the ENCODER: `appendLE` takes a `std::uint64_t`, so any width past 8
+        // shifted by 64+ bits (UB, and on both shipped host arches a repeat of the
+        // low word), and `scalarByteSize` takes a KIND, which cannot know N. Both are
+        // answered by `encodeBitIntImage`: a wider SOURCE (the wrapped limbs) and the
+        // TypeId-aware `sizeOfScalarOrBitInt` ladder. The producer is SHARED with the
+        // aggregate-leaf recursion, so closing this does not leave a member of a
+        // struct refusing a width the scalar arm emits.
+        //
+        // ⚠ IT KEYS ON THE DECLARED KIND, NOT ON THE VALUE'S VARIANT — the wall it
+        // replaces keyed on `holds_alternative<BitIntValue>` and that is exactly the
+        // dispatch [[D-CSUBSET-INT128-DATA-GLOBAL]] recorded as the one that misses:
+        // a `_BitInt` initializer can land in ANY of four integer literal arms
+        // depending on how narrow the folded value is, and only the KIND is present
+        // in all four. Placed AFTER the 128-bit arm so a value that is genuinely
+        // I128/U128 keeps its own (align-16) treatment, and BEFORE the scalar arm,
+        // whose `scalarByteSize(BitInt)` is nullopt by construction.
+        //
+        // ★ THE LAYOUT AUTHORITY OWNS SIZE **AND** ALIGNMENT, and for `_BitInt` those
+        // two do not track each other: `_BitInt(128)` is 16 bytes with align **8**
+        // (x86-64 psABI, pinned by `examples/c/c23_bitint_wide`), so the
+        // `Alignment::ofRuntimePow2(width)` rule the other scalar arms use — correct
+        // for I128, which really is 16/16 — would over-align every wide `_BitInt`.
+        // `computeLayout` is asked for both, and its size is cross-checked against
+        // the image the producer actually built: a disagreement is a wrong record, so
+        // it refuses rather than shipping a short or long item.
+        if (k == TypeKind::BitInt) {
+            std::string why;
+            auto const  img = encodeBitIntImage(v, interner, ty, dataModel, why);
+            if (!img.has_value()) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
+                                 "— {}.", sym.v, why));
+                continue;
+            }
+            if (!aggregateLayout.has_value()) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: `_BitInt` global "
+                                 "SymbolId={{ {} }} needs the target's "
+                                 "`aggregateLayout` block to resolve its alignment "
+                                 "and none is declared — refusing rather than "
+                                 "guessing an ABI alignment "
+                                 "(D-CSUBSET-BITINT-DATA-GLOBAL).",
+                                 sym.v));
+                continue;
+            }
+            auto const lay = computeLayout(ty, interner, *aggregateLayout, dataModel);
+            if (!lay.has_value() || lay->size != img->size()) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: `_BitInt` global "
+                                 "SymbolId={{ {} }} encoded to {} bytes but the "
+                                 "layout engine reserves {} — the `_BitInt` encoder "
+                                 "and the layout disagree "
+                                 "(D-CSUBSET-BITINT-DATA-GLOBAL).",
+                                 sym.v, img->size(),
+                                 lay.has_value() ? lay->size : 0));
+                continue;
+            }
+            d.bytes     = std::move(*img);
+            d.alignment = raiseToExplicit(lay->align);
+            out.push_back(std::move(d));
             continue;
         }
 

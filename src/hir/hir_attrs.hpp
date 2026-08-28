@@ -5,6 +5,7 @@
 #include "hir/attributes/alignment_attr.hpp"
 #include "hir/attributes/always_inline_attr.hpp"
 #include "hir/attributes/diagnostic_info.hpp"
+#include "hir/attributes/enclosing_function_attr.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/attributes/inline_definition_attr.hpp"
 #include "hir/attributes/linkage_attr.hpp"
@@ -120,6 +121,15 @@ using HirMutabilityMap = HirAttribute<MutabilityAttr>;
 // the thread-template sections. Keyed on the DECLARATION node (the
 // mutability-map discipline).
 using HirThreadLocalMap = HirAttribute<ThreadLocalAttr>;
+
+// D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: which function's body a
+// block-scope `static` was written in, recorded on the hidden module GLOBAL that
+// `D-CSUBSET-LOCAL-STATIC` promotes it to. Populated by CST→HIR lowering (which
+// is the only tier that still knows); read by HIR→MIR to resolve a `&&label` in
+// that global's initializer against the RIGHT function's per-function label
+// ordinals. See `EnclosingFunctionAttr` for why an ordinal alone is ambiguous.
+// Keyed on the DECLARATION node, like the mutability / thread-local maps.
+using HirEnclosingFunctionMap = HirAttribute<EnclosingFunctionAttr>;
 
 // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): explicit `alignas(N)` /
 // `alignas(T)` alignment for a Global or VarDecl that carried the specifier.

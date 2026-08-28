@@ -27,6 +27,10 @@ namespace {
 
 using opt::passes::MirRebuildPolicy;
 using opt::passes::MirFunctionRebuilder;
+// The rebuild substrate's per-function OLD→NEW remaps
+// (D-PERF-OPT-REBUILD-REMAP-IS-A-HASH-MAP) — the hook parameter types below.
+using opt::passes::MirBlockRemap;
+using opt::passes::MirInstRemap;
 
 void emitErr(DiagnosticReporter& rep, std::string msg) {
     ParseDiagnostic d;
@@ -227,8 +231,8 @@ public:
 
     void onBlockBeforeTerminator(
         MirBlockId oldB, MirBlockId /*newB*/, MirBuilder& dst,
-        std::unordered_map<std::uint32_t, MirInstId>& rewrite,
-        std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) override {
+        MirInstRemap& rewrite,
+        MirBlockRemap const& /*blockMap*/) override {
         if (!filterBlocks_.contains(oldB.v)) return;
         // Inject the stub's Const i32 0 (the SehFilterReturn operand — a pure
         // marker value, never used at runtime). Record it so tryRewriteTerminator
@@ -242,8 +246,8 @@ public:
 
     [[nodiscard]] std::optional<MirInstId>
     tryRewriteTerminator(MirOpcode op, MirInstId /*oldId*/, MirBuilder& dst,
-                         std::unordered_map<std::uint32_t, MirInstId> const& /*rewrite*/,
-                         std::unordered_map<std::uint32_t, MirBlockId> const& blockMap)
+                         MirInstRemap const& /*rewrite*/,
+                         MirBlockRemap const& blockMap)
         override {
         // Only the filterBB's terminator (a SehFilterReturn) is rewritten; every
         // other terminator takes the standard clone arm.
@@ -256,9 +260,9 @@ public:
             || rIt == regionByFilter_.end()) {
             return std::nullopt;
         }
-        auto const hbIt = blockMap.find(hIt->second.v);
-        if (hbIt == blockMap.end()) return std::nullopt;
-        return dst.addSehFilterReturn(cIt->second, hbIt->second, rIt->second);
+        MirBlockId const* const handlerNew = blockMap.find(hIt->second.v);
+        if (handlerNew == nullptr) return std::nullopt;
+        return dst.addSehFilterReturn(cIt->second, *handlerNew, rIt->second);
     }
 
     // The rebuilder walks blocks in order; before each filterBB's terminator we
@@ -267,8 +271,8 @@ public:
     // the caller pre-register each filterBB's dropped insts and set curFilterBB_
     // via the onBlockBegin hook.
     void onBlockBegin(MirBlockId oldB, MirBlockId /*newB*/, MirBuilder& /*dst*/,
-                      std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
-                      std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/)
+                      MirInstRemap& /*rewrite*/,
+                      MirBlockRemap const& /*blockMap*/)
         override {
         curFilterBB_ = filterBlocks_.contains(oldB.v) ? oldB : MirBlockId{};
     }
@@ -675,7 +679,18 @@ bool synthesizeSehFunclets(Mir&                                  mir,
             }
             MirFunctionRebuilder rb{mir, builder, policy};
             rb.rebuildFunction(f);
-            for (auto const& [oldV, newB] : rb.blockMap()) oldToNewBlock[oldV] = newB;
+            // The rebuild's block map is a dense per-function remap, not an
+            // iterable container — so enumerate the KEYS from the source
+            // function (`SehParentPolicy::selectBlocks` only ever reorders this
+            // function's own blocks, never adds a foreign one) and query each.
+            // Same pair set as the old `for (auto const& [oldV, newB] : …)`.
+            std::uint32_t const nb = mir.funcBlockCount(f);
+            for (std::uint32_t bi = 0; bi < nb; ++bi) {
+                MirBlockId const oldB = mir.funcBlockAt(f, bi);
+                if (MirBlockId const* const newB = rb.blockMap().find(oldB.v)) {
+                    oldToNewBlock[oldB.v] = *newB;
+                }
+            }
         } else {
             MirFunctionRebuilder rb{mir, builder, identity};
             rb.rebuildFunction(f);

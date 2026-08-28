@@ -91,9 +91,8 @@ assembleFirstFn(Lir const& lir, TargetSchema const& schema,
                              std::string_view name) {
     auto const ord = schema.registerByName(name);
     EXPECT_TRUE(ord.has_value()) << "register not found: " << name;
-    return LirReg{static_cast<std::uint32_t>(ord.value_or(0)),
-                  /*isPhysical=*/1,
-                  /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    return makePhysicalReg(static_cast<std::uint32_t>(ord.value_or(0)),
+                           LirRegClass::GPR);
 }
 
 // Emit ONE `tlsbase <dst>` with the given payload (segment byte) and
@@ -388,6 +387,7 @@ TEST(X86TlsSchema, MemRelocDisp32WithoutRelocationKindRejectedAtLoad) {
           "minOperands": 2, "maxOperands": 2,
           "encoding": {
             "format": "x86-variable",
+            "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["reg", "symbol"] },
                 "template": { "rexW": true, "opcode": [141] },
@@ -413,6 +413,7 @@ TEST(X86TlsSchema, MemRelocDisp32PlusLiteralDisp32MemRejectedAtLoad) {
           "minOperands": 3, "maxOperands": 3,
           "encoding": {
             "format": "x86-variable",
+            "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["reg", "memoffset", "symbol"] },
                 "template": { "rexW": true, "opcode": [141] },
@@ -441,6 +442,7 @@ TEST(X86TlsSchema, MemRelocDisp32WithoutMemBaseWireRejectedAtLoad) {
           "minOperands": 1, "maxOperands": 1,
           "encoding": {
             "format": "x86-variable",
+            "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["symbol"] },
                 "template": { "rexW": true, "opcode": [141] },
@@ -466,6 +468,7 @@ TEST(X86TlsSchema, AbsoluteDisp32MemCoWiredWithBaseRejectedAtLoad) {
           "minOperands": 2, "maxOperands": 2,
           "encoding": {
             "format": "x86-variable",
+            "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["reg", "memoffset"] },
                 "template": { "rexW": true, "opcode": [139] },
@@ -491,6 +494,7 @@ TEST(X86TlsSchema, PayloadBytePrefixOnFixed32VariantRejectedAtLoad) {
           "minOperands": 1, "maxOperands": 1,
           "encoding": {
             "format": "fixed32",
+            "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["reg"] },
                 "template": { "payloadBytePrefix": true,

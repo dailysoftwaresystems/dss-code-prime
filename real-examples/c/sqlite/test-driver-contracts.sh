@@ -904,7 +904,17 @@ pin_confound_supply_stops_the_driver() { # pin_confound_supply_stops_the_driver 
     printf '%s\n' 'printf "REACHED-NEXT-STATEMENT size=%d\n" "${#CONFOUND_PATTERNS[@]}"'
   } > "$script"
   # ── THE REFUSAL ARM: an unprobed plan must STOP the shell ────────────────
-  out="$(bash "$script" someleg unprobed 2>&1)"; rc=$?
+  # ★★ `$BASH`, NOT `bash`: THE PIN MUST SPAWN THE SHELL IT IS RUNNING UNDER.
+  # This file re-execs itself under bash 4+ at the top (macOS ships 3.2), but a bare
+  # `bash` here resolves through PATH and lands back on /bin/bash 3.2, which has no
+  # `declare -A` -- so the generated script died at its first line with rc=2 and all
+  # FIVE assertions of this pin failed for a reason that has nothing to do with the
+  # driver they test. ✔MEASURED 2026-08-26 on the macOS host: 409 passed / 5 failed
+  # via PATH, **415 / 0** with bash 5 first on PATH -- and `build-and-test.sh` REFUSED
+  # TO START on that host because of it, so the whole sqlite corpus was unreachable
+  # on macOS. ★ The re-exec above already found the right shell; `$BASH` is that
+  # shell's own path, so the child cannot disagree with the parent about what bash is.
+  out="$("$BASH" "$script" someleg unprobed 2>&1)"; rc=$?
   ck "an UNPROBED plan STOPS THE DRIVER at the real call site (rc)" "1" "$rc"
   ck_has "...having said why" "$out" "confoundGating='unprobed'"
   # ⚠ THROUGH `ck`, not a bare `bad`: `bad` bumps the GLOBAL failure count, which
@@ -914,7 +924,7 @@ pin_confound_supply_stops_the_driver() { # pin_confound_supply_stops_the_driver 
      "$(printf '%s' "$out" | grep -q 'REACHED-NEXT-STATEMENT' && echo yes || echo no)"
   # ── THE NEGATIVE CONTROL: the same script must reach the marker on a
   #    `probed` plan, or the arm above would pass for the wrong reason ──────
-  out="$(bash "$script" someleg probed 2>&1)"; rc=$?
+  out="$("$BASH" "$script" someleg probed 2>&1)"; rc=$?
   ck "a PROBED plan runs on through the call site (rc)" "0" "$rc"
   ck_has "...and reaches the next statement with the leg's pattern" "$out" "REACHED-NEXT-STATEMENT size=1"
   rm -f "$script"
@@ -1466,8 +1476,8 @@ if mutate "H7 make a failed run-dir operation look fine" "$WORK/m7.sh" 'RUN_DIR_
 fi
 
 # H8 — forward the DRIVER-PATH group by NAME instead of with its value, which is
-# the quieter half of D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-
-# BOUNDARY: the variable crosses, nothing is translated, and Tcl blames the
+# the quieter half of D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY:
+# the variable crosses, nothing is translated, and Tcl blames the
 # acquisition. The resolver refuses that spelling, so the mutant's helper `die`s
 # and the assignment the pin asserts never appears.
 if mutate "H8 forward a DRIVER PATH by name, untranslated" "$WORK/m8.sh" 'call+=("--forward-path=$n=${!n}"); carried=1' '

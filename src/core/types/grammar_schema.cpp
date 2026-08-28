@@ -1,9 +1,12 @@
 #include "core/types/grammar_schema.hpp"
 
 #include "core/crypto/sha256.hpp"   // crypto::sha256Hex — the retained content digest
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
+#include "core/substrate/phase_timers.hpp"        // the load-config / build-config phases
 #include "core/types/config_path_walk.hpp"
 #include "core/types/grammar_schema_json.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +18,15 @@
 namespace dss {
 
 namespace {
+
+// ★ WHERE A LANGUAGE DOCUMENT LIVES, SPELLED ONCE. Three sites need the same
+// two strings — `loadShipped` WALKS for `<sources>/<stem><.lang.json>`,
+// `loadFromText` RECOVERS the stem back out of the label it was handed, and
+// `configDocumentPath` NAMES the document again for the runtime cache key. Two
+// copies of that pair can drift, and a drifted pair is a cache key naming a
+// document nobody loaded — an entry keyed on a fiction. One owner, no drift.
+constexpr std::string_view kLanguageConfigSubdir = "sources";
+constexpr std::string_view kLanguageConfigSuffix = ".lang.json";
 
 // c97 sealing helper: the depth-first RuleLeaf-branch enumeration over one
 // rule's position graph — the SAME walk (same order, same first-occurrence
@@ -67,6 +79,56 @@ namespace {
 }
 
 } // namespace
+
+// ─────────────────────────────────────────────────────────────────────────
+// Per-lead-byte declared-length index (see the header for the contract)
+// ─────────────────────────────────────────────────────────────────────────
+
+void detail::LexemeLengthIndex::build(LexemeTable const& table) {
+    rowStart_.fill(0);
+    lengths_.clear();
+
+    // (lead byte, key length) for every declared key, sorted so rows come out
+    // grouped by lead byte and LONGEST-FIRST within a row — the order the
+    // scan walks them in, so the first hit is the longest match.
+    //
+    // ⓘ An empty key is skipped deliberately, and that is not a hole: a
+    // longest-match scan probes lengths 1..N and never 0, so a zero-length
+    // key was already unreachable before this index existed. Skipping it
+    // keeps the two behaviours identical rather than inventing a length the
+    // scanner cannot ask about.
+    //
+    // ★ THE SORT MAKES THE RESULT INDEPENDENT OF THE TABLE'S ITERATION ORDER,
+    // which matters because that order is a hash-bucket accident. Two schemas
+    // with the same declared keys get byte-identical indexes.
+    std::vector<std::pair<unsigned char, std::uint32_t>> pairs;
+    pairs.reserve(table.size());
+    for (auto const& [lex, meanings] : table) {
+        (void)meanings;
+        if (lex.empty()) continue;
+        pairs.emplace_back(static_cast<unsigned char>(lex.front()),
+                           static_cast<std::uint32_t>(lex.size()));
+    }
+    std::sort(pairs.begin(), pairs.end(),
+              [](auto const& a, auto const& b) noexcept {
+                  if (a.first != b.first) return a.first < b.first;
+                  return a.second > b.second;
+              });
+    // Two keys of the same length under the same lead byte are ONE probe.
+    pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+
+    lengths_.reserve(pairs.size());
+    std::size_t next = 0;   // lowest lead byte whose row start is still unwritten
+    for (auto const& [lead, len] : pairs) {
+        while (next <= lead) {
+            rowStart_[next++] = static_cast<std::uint32_t>(lengths_.size());
+        }
+        lengths_.push_back(len);
+    }
+    while (next <= 256) {
+        rowStart_[next++] = static_cast<std::uint32_t>(lengths_.size());
+    }
+}
 
 GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::move(d)) {
 #ifndef NDEBUG
@@ -135,6 +197,81 @@ GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::m
             }
         }
     }
+
+    // ── longest-match probe index ─────────────────────────────────────
+    // D-PERF-TOK-LONGEST-MATCH-PROBES-EVERY-DECLARED-LENGTH-AT-EVERY-POSITION.
+    // Derived HERE, in the same sealing pass and for the same reason as the
+    // dense rule table above: this is the single point where the loader's
+    // build-time maps stop changing, and it runs for EVERY construction path
+    // — the JSON loader and the tests that assemble a GrammarSchemaData by
+    // hand. ★ THAT PLACEMENT IS THE FAIL-LOUD ARGUMENT. Building the index
+    // in the loader would create a second source of truth that a later
+    // insertion could leave stale, and a stale probe index does not degrade
+    // — it silently stops matching a lexeme, which is a wrong parse rather
+    // than a parse error. Derived from the sealed table, there is nothing
+    // for it to be stale WITH.
+    {
+        lexemeLengths_.build(d_.lexemeTable);
+
+        // Sized by the mode table, and belt-and-braces by any override id
+        // ABOVE it — the same posture `compiledDense_` takes above, and for
+        // the same reason: a hand-assembled GrammarSchemaData is a supported
+        // construction path, and refusing one here would turn a schema that
+        // merely never queries that mode into a load-time abort.
+        std::size_t denseModes = d_.lexerModes.size();
+        for (auto const& [modeV, table] : d_.lexerModeTokens) {
+            (void)table;
+            if (std::size_t{modeV} + 1 > denseModes) denseModes = modeV + 1;
+        }
+        modeLexemeLengths_.assign(denseModes, {});
+        for (auto const& [modeV, table] : d_.lexerModeTokens) {
+            modeLexemeLengths_[modeV].build(table);
+        }
+
+        // FAIL-LOUD, ALWAYS ON: every declared key must be reachable through
+        // the row the scanner will actually walk. The global half goes through
+        // the PUBLIC accessor and the per-mode half through the very row
+        // object that accessor hands back, so this catches the refactor that
+        // indexes one table and queries another — the failure mode that would
+        // otherwise present as a lexeme which quietly stopped existing.
+        // O(keys), once per schema load, against config data that is hundreds
+        // of entries: unmeasurable next to the JSON parse it follows, and NOT
+        // debug-only, because a Release build is exactly where a silent
+        // miscompile would ship.
+        for (auto const& [lex, meanings] : d_.lexemeTable) {
+            (void)meanings;
+            if (lex.empty()) continue;
+            auto const lens =
+                lexemeLengthsForLeadByte(static_cast<unsigned char>(lex.front()));
+            if (std::find(lens.begin(), lens.end(),
+                          static_cast<std::uint32_t>(lex.size())) == lens.end()) {
+                std::fprintf(stderr,
+                    "dss::GrammarSchema: global lexeme '%s' (%zu bytes) is "
+                    "absent from the probe index for its lead byte — the "
+                    "tokenizer would never match it\n",
+                    lex.c_str(), lex.size());
+                std::abort();
+            }
+        }
+        for (auto const& [modeV, table] : d_.lexerModeTokens) {
+            for (auto const& [lex, meanings] : table) {
+                (void)meanings;
+                if (lex.empty()) continue;
+                auto const lens =
+                    modeLexemeLengths_[modeV].lengthsFor(
+                        static_cast<unsigned char>(lex.front()));
+                if (std::find(lens.begin(), lens.end(),
+                              static_cast<std::uint32_t>(lex.size())) == lens.end()) {
+                    std::fprintf(stderr,
+                        "dss::GrammarSchema: mode %u lexeme '%s' (%zu bytes) is "
+                        "absent from that mode's probe index for its lead byte "
+                        "— the tokenizer would never match it\n",
+                        modeV, lex.c_str(), lex.size());
+                    std::abort();
+                }
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -144,23 +281,62 @@ GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::m
 LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadFromFile(
     std::filesystem::path const& path) {
 
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    // `load-config` — the FILE route's own row in the `--time` report, and the
+    // outermost of the three config seams. It spans the read, the digest, the
+    // memo lookup and (on a miss only) the nested `build-config`. A memo HIT
+    // therefore costs exactly this row and nothing else, which is the whole
+    // point of measuring them separately.
+    // ⓘ Opened HERE and not in `loadFromText`: the two nest, and a scope nested
+    // inside another scope of the SAME phase would report a peak concurrency of
+    // 2 on a strictly serial load. Every file route reaches this function.
+    substrate::PhaseTimers::Scope const loadScope{
+        substrate::CompilePhase::LoadConfig};
+
+    // THE ONE CHECKED READ (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    // A failed read is reported AS a read failure and never reaches
+    // `loadFromText` -- a truncated document handed to the parser produces a
+    // syntax error about the config's CONTENTS, which sends the reader to the
+    // wrong file entirely.
+    auto text = core::readFileChecked(path);
+    if (!text) {
         return std::unexpected(std::vector<ConfigDiagnostic>{
             {DiagnosticCode::C_MissingField, DiagnosticSeverity::Error,
              path.string(),
-             "cannot open file"}});
+             std::move(text).error().message}});
     }
-    std::ostringstream buf;
-    buf << in.rdbuf();
-    return loadFromText(std::move(buf).str(), path.string());
+    return loadFromText(*std::move(text), path.string());
 }
 
 LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadShipped(std::string_view name) {
-    auto path = findShippedConfig({name, "sources", ".lang.json", "language",
+    auto path = findShippedConfig({name, kLanguageConfigSubdir,
+                                   kLanguageConfigSuffix, "language",
                                    DiagnosticCode::C_InvalidLanguageName});
     if (!path) return std::unexpected(std::move(path).error());
     return loadFromFile(*path);
+}
+
+// The config-root-relative document path — see the header for the contract.
+// TOTAL, and deliberately BRANCHLESS AT THE CALL SITE: every caller wants one
+// string for the key line `doc=<label>:<path>:<digest>`, and a caller forced to
+// test for emptiness is a caller free to substitute `name()` when the test
+// fires, which is the exact substitution `configName()` exists to prevent.
+std::string GrammarSchema::configDocumentPath() const {
+    if (configName_.empty()) {
+        // ⓘ NOT `sources/.lang.json`. A schema with no document must not name
+        // one: that spelling is a real path shape (a file literally named
+        // `.lang.json` would collide with it) and it reads, to anyone auditing
+        // a key document, as a document that was loaded. This term is not a
+        // path in any tree and says so, and the digest beside it in the key
+        // line still carries the identity — `computeRuntimeObjectKey` refuses
+        // an EMPTY digest outright, so an unidentifiable input is already a
+        // refusal there rather than a silent key term here.
+        return "<inline language: " + std::string{name()} + ">";
+    }
+    std::string out{kLanguageConfigSubdir};
+    out += '/';
+    out += configName_;
+    out += kLanguageConfigSuffix;
+    return out;
 }
 
 LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadFromText(
@@ -171,16 +347,105 @@ LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadFromText(
     // Digest the bytes AS RECEIVED, before the parser is allowed an
     // opinion about them. This is the one chokepoint where the document
     // bytes are already in memory (`loadFromFile` reads them, hands them
-    // here, and drops them), so the digest costs zero extra I/O — versus
-    // ~165 ms per invocation to re-walk and re-read `src/dss-config/`
-    // (MEASURED 2026-08-17, I/O-dominated). Computed BEFORE the parse so
-    // it is the digest of what was actually LOADED, independent of what
-    // the parse made of it. See `contentDigest()` for the full rationale
-    // and for why a non-`loadFromText` construction leaves it EMPTY.
+    // here, and drops them), so the digest costs zero extra I/O. Computed
+    // BEFORE the parse so it is the digest of what was actually LOADED,
+    // independent of what the parse made of it. See `contentDigest()` for
+    // the full rationale and for why a non-`loadFromText` construction
+    // leaves it EMPTY.
+    //
+    // ⚠ THE NUMBER THAT USED TO STAND HERE WAS FALSE AND IT POINTED THE NEXT
+    // READER AT THE WRONG HALF OF THE PROBLEM. It read "versus ~165 ms per
+    // invocation to re-walk and re-read `src/dss-config/` (MEASURED
+    // 2026-08-17, I/O-dominated)", which says the expensive part of a config
+    // load is the FILESYSTEM. ✔RE-MEASURED 2026-08-25 (cycle P35) by
+    // instrumenting the three `loadShipped` entry points and
+    // `buildSchemaFromJsonText` on a Windows Debug build of
+    // `int main(void){return 0;}` — 13 grammar loads, 2,068,338 bytes of JSON:
+    //     precedence walk           2 ms
+    //     file read                 1 ms   <- the I/O is a rounding error
+    //     sha256 of the bytes      30 ms
+    //     parse + construct       211 ms   <- 87% of the grammar cost
+    // So the load is PARSE-dominated, not I/O-dominated, and the old figure
+    // was ~55x the measured filesystem cost. What actually justifies digesting
+    // every load is not an avoided re-read at all: it is that the digest is
+    // the memo KEY immediately below, which turns those 211 ms into one build
+    // per distinct document per process. The three `--time` rows
+    // (`locate-config` / `load-config` / `build-config`) now carry this
+    // decomposition continuously, so the next reader measures instead of
+    // trusting a comment.
     std::string digest = crypto::sha256Hex(jsonText);
 
-    auto schema = detail::buildSchemaFromJsonText(jsonText, sourceLabel);
-    if (schema) (*schema)->contentDigest_ = std::move(digest);
+    // ── THE CONTENT-ADDRESSED MEMO ────────────────────────────────────
+    // The digest above is the key, so consulting the memo costs nothing that
+    // was not already spent. A hit hands back the SAME `GrammarSchema` a
+    // previous load of these exact bytes under this exact label produced —
+    // which is sound because the type has no non-const member function at all:
+    // it is sealed by its constructor and read-only from then on, so two
+    // holders of one instance cannot observe each other. See
+    // `config_document_memo.hpp` for why the key is the bytes and not the name,
+    // and for the referenced-document half the digest cannot see.
+    if (auto hit = detail::ConfigDocumentMemo<GrammarSchema>::lookup(sourceLabel,
+                                                                    digest)) {
+        return hit;
+    }
+
+    // `build-config` — DEFINED as the work a memo hit skips, which is why the
+    // scope starts after the lookup above and covers nothing else. Its `runs`
+    // IS this process's miss count for this family, so the `--time` report
+    // answers "how many documents did we actually build" without a second
+    // counter that could disagree with it.
+    auto schema = [&] {
+        substrate::PhaseTimers::Scope const buildScope{
+            substrate::CompilePhase::BuildConfig};
+        return detail::buildSchemaFromJsonText(jsonText, sourceLabel);
+    }();
+    if (schema) {
+        (*schema)->contentDigest_ = digest;
+        // ── THE CONFIG NAME, DERIVED FROM THE DOCUMENT'S OWN FILENAME ──────
+        // ★ From the PATH and not from the entry point: `loadShipped(name)`
+        // knows the stem but `loadFromFile(path)` does not go through it, and
+        // both share the memo entry below — so deriving it in `loadShipped`
+        // would make the answer depend on which call populated the memo first.
+        // The filename is the one input both have and both agree on.
+        // ⓘ Left EMPTY for `<inline>` and for any label that is not a
+        // `.lang.json`: absent is honest, and `configName()`'s contract says a
+        // caller needing a path must refuse on empty rather than substitute
+        // `name()`.
+        {
+            std::string_view           label{sourceLabel};
+            constexpr std::string_view kSuffix{kLanguageConfigSuffix};
+            auto const slash = label.find_last_of("/\\");
+            if (slash != std::string_view::npos) label.remove_prefix(slash + 1);
+            // ★ THE LENGTH TEST IS AN UNDERFLOW GUARD FIRST AND A BOUNDARY
+            // SECOND — ✔MEASURED 2026-08-25 by mutation. Dropping it entirely
+            // makes `label.size() - kSuffix.size()` wrap for any label shorter
+            // than the suffix: the DEFAULT `<inline>` label (8 bytes) computed
+            // `__pos 18446744073709551614` and `compare` threw, taking 106
+            // cases of `core/test_grammar_schema` down with it.
+            // ⓘ `>` vs `>=` is NOT observable — at equality the stem would be
+            // `substr(0, 0)`, empty either way — so `>` states the intent (a
+            // leaf that IS the suffix names nothing) rather than deciding an
+            // outcome. Do not read the pins below as pinning that choice.
+            if (label.size() > kSuffix.size()
+                && label.compare(label.size() - kSuffix.size(), kSuffix.size(),
+                                 kSuffix)
+                       == 0) {
+                (*schema)->configName_ =
+                    std::string{label.substr(0, label.size() - kSuffix.size())};
+            }
+        }
+        // ⚠ Stored only on the SUCCESS path. A failed load produced diagnostics
+        // and no schema; memoizing "these bytes are broken" would be a second,
+        // parallel definition of failure, and the loader's own refusal is
+        // already the one that reports it — every time, with the same message.
+        detail::ConfigDocumentMemo<GrammarSchema>::store(
+            std::string{sourceLabel}, std::move(digest),
+            std::vector<detail::ConfigDocumentDependency>{
+                (*schema)->referencedDocuments().begin(),
+                (*schema)->referencedDocuments().end()},
+            *schema);
+    }
+
     return schema;
 }
 
@@ -189,7 +454,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadFromText(
 // ─────────────────────────────────────────────────────────────────────────
 
 std::span<LexemeMeaning const> GrammarSchema::lookupLexeme(std::string_view lexeme) const noexcept {
-    auto it = d_.lexemeTable.find(std::string{lexeme});
+    // Heterogeneous `find` — the probe bytes are queried AS a string_view.
+    // This used to be `find(std::string{lexeme})`, which copied the probe on
+    // every lookup and malloc'd on every probe past 15 bytes; see
+    // `detail::LexemeHash`.
+    auto it = d_.lexemeTable.find(lexeme);
     if (it == d_.lexemeTable.end()) return {};
     return it->second;
 }
@@ -268,9 +537,27 @@ GrammarSchema::lookupLexemeInMode(LexerModeId mode, std::string_view lexeme) con
     }
     auto modeIt = d_.lexerModeTokens.find(mode.v);
     if (modeIt == d_.lexerModeTokens.end()) return {};
-    auto lexIt = modeIt->second.find(std::string{lexeme});
+    auto lexIt = modeIt->second.find(lexeme);   // heterogeneous — see lookupLexeme
     if (lexIt == modeIt->second.end()) return {};
     return lexIt->second;
+}
+
+// The per-mode probe row. Holds `lookupLexemeInMode`'s strong-id contract
+// verbatim — an invalid or out-of-range id ABORTS rather than answering
+// "nothing declared", so a caller can never read a mis-typed mode id as a
+// mode with no overrides and silently lose every token that mode defines.
+std::span<std::uint32_t const>
+GrammarSchema::lexemeLengthsForLeadByteInMode(LexerModeId mode,
+                                              unsigned char lead) const noexcept {
+    if (!mode.valid() || mode.v >= d_.lexerModes.size()) {
+        std::fprintf(stderr,
+            "dss::GrammarSchema::lexemeLengthsForLeadByteInMode: invalid "
+            "LexerModeId (v=%u, table_size=%zu)\n",
+            mode.v, d_.lexerModes.size());
+        std::abort();
+    }
+    if (mode.v >= modeLexemeLengths_.size()) return {};
+    return modeLexemeLengths_[mode.v].lengthsFor(lead);
 }
 
 namespace {
@@ -363,7 +650,12 @@ SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const n
     while (true) {
         auto const& p = positions[curPosId];
         if (p.slotKind() == SlotKind::TokenLeaf) {
-            if (p.tokenId().v == tok.v) {
+            // A token leaf admits the kinds in its `expectedSet` — exactly one
+            // for the ordinary single-token form, a config-declared SET for a
+            // `{"tokenClass": …}` leaf. The bitset is the same O(1) membership
+            // test the AltChoice arm below already uses, and for a single-token
+            // leaf it is `{tokenId()}`, so the two forms answer identically.
+            if (detail::tokenBitsContain(p.expectedBits(), tok.v)) {
                 return SchemaCursor{cur.rule(), p.nextPos()};
             }
             return SchemaCursor{};
@@ -496,7 +788,7 @@ bool GrammarSchema::isContextualKind(SchemaTokenId kind) const noexcept {
     // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD. O(1); the set is EMPTY for
     // every grammar with no contextual keyword (Strict policy + no per-keyword
     // `contextual: true`) — so the prune's deep-nest O(N) win is unaffected for
-    // the non-contextual case (every shipped c-subset speculative alt).
+    // the non-contextual case (every shipped c speculative alt).
     return kind.valid() && d_.contextualKinds.contains(kind.v);
 }
 

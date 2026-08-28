@@ -54,8 +54,8 @@ assembleFirstFn(Lir const& lir, TargetSchema const& schema,
 [[nodiscard]] LirReg gpr(TargetSchema const& s, std::string_view name) {
     auto const ord = s.registerByName(name);
     EXPECT_TRUE(ord.has_value()) << name;
-    return LirReg{static_cast<std::uint32_t>(ord.value_or(0)), 1,
-                  static_cast<std::uint8_t>(LirRegClass::GPR)};
+    return makePhysicalReg(static_cast<std::uint32_t>(ord.value_or(0)),
+                           LirRegClass::GPR);
 }
 
 // Build one function (body + ret), legalize (x86 2-address), assemble.
@@ -868,24 +868,72 @@ TEST(WidthAxisX86, ShiftImm8OutOfRangeFailsLoudNeverTruncates) {
     // Defense-in-depth: a value that doesn't fit one byte must fail
     // loud at the walker (the lowering routes such counts through the
     // CL form; this pins the walker's own guard).
+    //
+    // ★★★ AND SINCE CYCLE P34 THIS TEST CARRIES A SECOND, HEAVIER JOB —
+    // D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES. That row made
+    // the `imm8` slot NARROW-AND-WARN instead of refuse *where the config
+    // says the field carries the operation's whole value* (`movb $-1, %al`
+    // is `guard.width` 8 and now assembles to gas's own `b0 ff`). A shift
+    // count is the OPPOSITE case: the same 8-bit slot under a `guard.width`
+    // 32/64 variant, where the byte is a fixed PARAMETER and the reference
+    // refuses an out-of-range one outright (✔MEASURED, GNU as 2.42:
+    // `shl $256, %rax` and `shl $-1, %rax` are BOTH "Error: operand type
+    // mismatch"). ⇒ THIS IS THE ONLY END-TO-END WITNESS FOR THE PARAMETER
+    // ARM, because the shipped AT&T dialect declares no shift spelling at
+    // all (✔MEASURED: 68 mnemonics, not one a shift) — no `.s` can reach it,
+    // so it is reached here, through the LIR.
+    //
+    // ⚠ THE CODE MOVED WITH THE MECHANISM AND THE MOVE IS A CORRECTION, not
+    // a rename: this used to report `A_NoMatchingEncodingVariant`, which was
+    // always the wrong noun — a variant DID match, the immediate simply did
+    // not fit its field. It now reports `A_ImmediateOperandOutOfRange`, the
+    // code the 16-bit sibling already used for the identical condition.
     auto schema = loadX86();
     ASSERT_NE(schema, nullptr);
     auto const rax = gpr(*schema, "rax");
-    DiagnosticReporter rep;
-    (void)buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
-        LirOperand const ops[] = {LirOperand::makeReg(rax),
-                                  LirOperand::makeImmInt32(300)};
-        (void)b.addInst(*schema->opcodeByMnemonic("shl"), rax, ops);
-    });
-    EXPECT_GT(rep.errorCount(), 0u);
-    bool sawRangeReject = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::A_NoMatchingEncodingVariant
-            && d.actual.find("imm8") != std::string::npos) {
-            sawRangeReject = true;
+
+    // Both ends of the parameter window, because they fail for DIFFERENT
+    // reasons and an implementation could easily catch one and not the
+    // other: 300 overflows 8 bits, while -1 FITS 8 bits and is refused
+    // because a fixed narrow parameter of a wider operation is a MAGNITUDE
+    // (the operation's own width carries the sign). The reference refuses
+    // both, and the negative one is the case a naive "widen the window"
+    // fix would silently start encoding as a 255-bit shift.
+    for (int count : {300, -1}) {
+        DiagnosticReporter rep;
+        auto const bytes = buildLegalizeAssemble(
+            *schema, rep, [&](LirBuilder& b) {
+                LirOperand const ops[] = {LirOperand::makeReg(rax),
+                                          LirOperand::makeImmInt32(count)};
+                (void)b.addInst(*schema->opcodeByMnemonic("shl"), rax, ops);
+            });
+        EXPECT_GT(rep.errorCount(), 0u) << "shl $" << count;
+        bool sawRangeReject = false;
+        bool sawNarrowing   = false;
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange
+                && d.actual.find("imm8") != std::string::npos) {
+                sawRangeReject = true;
+            }
+            if (d.code
+                == DiagnosticCode::A_ImmediateNarrowedToOperandField) {
+                sawNarrowing = true;
+            }
         }
+        EXPECT_TRUE(sawRangeReject)
+            << "shl $" << count << " must be REFUSED by the immediate "
+               "window, naming the field — gas refuses it too";
+        EXPECT_FALSE(sawNarrowing)
+            << "★ shl $" << count << " must NOT narrow. A shift count is a "
+               "fixed parameter of a wider operation, not the operation's "
+               "value; narrowing it would encode a DIFFERENT SHIFT and "
+               "would put DSS above the reference union, which is an "
+               "invented extension";
+        EXPECT_TRUE(bytes.empty())
+            << "★ and it must emit NO BYTES — a refused instruction that "
+               "still contributes to the stream is the miscompile the "
+               "refusal exists to prevent";
     }
-    EXPECT_TRUE(sawRangeReject);
 }
 
 TEST(WidthAxisArm64, ShiftVariableWordsXAndWForms) {
@@ -1131,11 +1179,10 @@ TEST(WidthAxisX86, StrippedThirtyTwoBitVariantFailsLoudNeverFallsBack) {
 // ═══════════════════════════════════════════════════════════════════════
 
 namespace {
-// NOTE: built via makePhysicalReg — the aggregate-init shape the
-// file's `gpr()` helper uses ({ord, 1, cls}) sets LirReg's BITFIELD
-// order {id, classKind, isPhysical}, which is only accidentally
-// correct for GPR (classKind=1 == GPR, isPhysical=(GPR)1); for FPR it
-// would silently build a class-GPR NON-physical reg.
+// D-LIR-POSITIONAL-LIRREG-INIT-MISCLASSIFIES-SILENTLY: this helper was the
+// second site to discover the aggregate trap and route around it locally.
+// `gpr()` above now uses the same factory, and the aggregate form it warned
+// about no longer compiles anywhere.
 [[nodiscard]] LirReg fprReg(TargetSchema const& s, std::string_view name) {
     auto const ord = s.registerByName(name);
     EXPECT_TRUE(ord.has_value()) << name;
@@ -1651,27 +1698,82 @@ TEST(FloatWidthAxisArm64, CsetFloatCondsInvertNibbleAtBit12) {
 // half-word memory forms (D-LIR-INT-MEMORY-WIDTH-EXACT — STURH/LDURH, 0x66
 // mov / movzx r16); an OUT-of-vocabulary width (e.g. 24) is still a load-time
 // reject — never a silent match-nothing variant.
-TEST(WidthAxisLoader, GuardWidthSixteenAcceptedOutOfVocabularyRejected) {
-    auto okWidth16 = test_support::mutateShippedTargetSchemaDoc(
-        "x86_64", [](nlohmann::json& doc) {
-            for (auto& op : doc["opcodes"]) {
-                if (op.value("mnemonic", "") != "neg") continue;
-                op["encoding"]["variants"][0]["guard"]["width"] = 16;
-            }
-        });
-    EXPECT_TRUE(okWidth16.has_value())
-        << "guard width 16 is now in the closed width vocabulary "
-           "(D-LIR-INT-MEMORY-WIDTH-EXACT half-word memory forms)";
+// ⚠⚠ THE MUTATION VEHICLE IS CHOSEN BY SEARCH, NOT BY NAME, AND THAT IS A
+// REPAIR RATHER THAN A CONVENIENCE. This test used to retype `neg`'s FIRST
+// variant to width 16 — and on 2026-08-23 `neg` GAINED a real width-16 variant,
+// so the retype produced a DUPLICATE (same operandKinds, same width) and the
+// document was refused by the SHADOWING rule. The test then read that refusal as
+// "width 16 is not in the vocabulary" and failed, having silently stopped
+// testing the vocabulary at all. ⇒ pick a victim whose siblings do NOT already
+// declare width 16, and FAIL LOUD when no such victim exists rather than
+// asserting about whichever opcode happened to be first.
+namespace {
 
-    auto badWidth = test_support::mutateShippedTargetSchemaDoc(
-        "x86_64", [](nlohmann::json& doc) {
-            for (auto& op : doc["opcodes"]) {
-                if (op.value("mnemonic", "") != "neg") continue;
-                op["encoding"]["variants"][0]["guard"]["width"] = 24;
+// The (opcode, variant) index of the first x86-variable variant that can be
+// retyped to width 16 without colliding with a same-operandKinds sibling.
+// Returns false when the shipped table offers none.
+[[nodiscard]] bool findRetypableVariant(nlohmann::json const& doc,
+                                        std::string& mnemonicOut,
+                                        std::size_t& variantOut) {
+    for (auto const& op : doc.at("opcodes")) {
+        auto const& enc = op.value("encoding", nlohmann::json::object());
+        if (!enc.contains("variants")) continue;
+        auto const& vs = enc.at("variants");
+        for (std::size_t i = 0; i < vs.size(); ++i) {
+            auto const& g = vs[i].value("guard", nlohmann::json::object());
+            if (!g.contains("width") || g.at("width") == 16) continue;
+            bool collides = false;
+            for (std::size_t j = 0; j < vs.size(); ++j) {
+                if (j == i) continue;
+                auto const& gj = vs[j].value("guard", nlohmann::json::object());
+                if (gj.value("width", 0) != 16) continue;
+                if (gj.value("operandKinds", nlohmann::json::array())
+                    == g.value("operandKinds", nlohmann::json::array())) {
+                    collides = true;
+                    break;
+                }
             }
-        });
-    EXPECT_FALSE(badWidth.has_value())
-        << "an out-of-vocabulary width (24) must be a load-time reject";
+            if (collides) continue;
+            mnemonicOut = op.value("mnemonic", std::string{});
+            variantOut  = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+TEST(WidthAxisLoader, GuardWidthSixteenAcceptedOutOfVocabularyRejected) {
+    auto const pristineR =
+        test_support::detail::parseShippedTargetJson("x86_64");
+    ASSERT_TRUE(pristineR.has_value())
+        << "the shipped x86_64 target document must parse";
+    nlohmann::json const& pristine = *pristineR;
+    std::string victim;
+    std::size_t vi = 0;
+    ASSERT_TRUE(findRetypableVariant(pristine, victim, vi))
+        << "no x86_64 variant can be retyped to width 16 without colliding with "
+           "a sibling — this test can no longer say anything about the width "
+           "vocabulary and must be re-aimed rather than deleted";
+
+    auto const retype = [&](int width) {
+        return test_support::mutateShippedTargetSchemaDoc(
+            "x86_64", [&](nlohmann::json& doc) {
+                for (auto& op : doc["opcodes"]) {
+                    if (op.value("mnemonic", "") != victim) continue;
+                    op["encoding"]["variants"][vi]["guard"]["width"] = width;
+                }
+            });
+    };
+
+    EXPECT_TRUE(retype(16).has_value())
+        << "guard width 16 is in the closed width vocabulary "
+           "(D-LIR-INT-MEMORY-WIDTH-EXACT half-word memory forms); victim was '"
+        << victim << "' variant " << vi;
+    EXPECT_FALSE(retype(24).has_value())
+        << "an out-of-vocabulary width (24) must be a load-time reject; victim "
+           "was '" << victim << "' variant " << vi;
 }
 
 TEST(WidthAxisLoader, AmbiguousWidthMixIsRejected) {

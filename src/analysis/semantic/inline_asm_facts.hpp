@@ -646,10 +646,17 @@ inline void scanDuplicateSymbolicNames(InlineAsmFacts const&           f,
 // can say why — instead of clearing this gate and failing at the LIR binding,
 // which matches on the exact spelling and would never find `%01`.
 //
-// ⓘ THE MODIFIER LETTER STAYS IN C++, and that is not an exception being carved
-// out: a modifier LETTER is per-TARGET width-view vocabulary that no shipped
-// `.target.json` declares — the scan REFUSES it rather than lowering it. It is
-// not a template lexeme, so it is not a role of the set.
+// ⓘ THE WIDTH-VIEW LETTER IS NOT A ROLE OF THIS SET AND IS NOT CHECKED HERE,
+// and that is a boundary rather than an exception. A letter is per-DIALECT
+// vocabulary (`assembly.templateModifiers`) — ✔MEASURED 2026-08-24 on gcc 13.3.0
+// both ports that `%w` is 32 bits on aarch64 and 16 on x86-64 — while this tier
+// has no dialect and often no target in scope at all. So this scan validates
+// what a `%<letter><selector>` form NAMES, on the minted inventory, and leaves
+// the letter to the tier where the dialect is resolved; an undeclared letter
+// mints no lexeme and is refused by name at MIR→LIR. ⚠ The scan used to REFUSE
+// every such form (`S_InlineAsmOperandModifierUnsupported`), which was correct
+// while nothing declared the vocabulary and is a divergence now that something
+// does — see the width-view arm below.
 template <class Report>
 inline void scanInlineAsmTemplate(InlineAsmFacts const&           f,
                                   InlineAsmTemplateLexemes const& L,
@@ -1038,32 +1045,107 @@ inline void scanInlineAsmTemplate(InlineAsmFacts const&           f,
             continue;
         }
 
-        // `%<letter><index>` — an operand MODIFIER: a narrower VIEW of the
-        // register the operand was bound to (arm64 `%w0` = the 32-bit half of
-        // `x0`; x86 `%k`/`%b`/`%h`).
+        // ── `%<letter><selector>` — AN OPERAND THROUGH A **WIDTH VIEW** ──
         //
-        // ★ REFUSED, NOT LOWERED, AND THE REASON IS THE BAR. The view a modifier
-        // letter selects is per-TARGET vocabulary of exactly the kind
-        // `asmConstraints` already is, and NO shipped `.target.json` declares it.
-        // Implementing it here would put `if (letter == 'w')` — an arm64 fact —
-        // into shared substrate. Falling back to the FULL register would run a
-        // 32-bit operation 64-bit: the standalone arm64 dialect shipped exactly
-        // that miscompile once (`mov w0, w1` encoded 64-bit) and it was found by
-        // EXECUTION, not by review.
-        if (isAlpha(c) && afterSigil + 1 < text.size()
-            && (isDigit(text[afterSigil + 1])
-                || at_(afterSigil + 1, L.symbolicNameOpen))) {
-            report(DiagnosticCode::S_InlineAsmOperandModifierUnsupported, at,
-                   "the inline-asm template uses the operand modifier "
-                   + quote(L.placeholder + std::string{c}) + " at byte offset "
-                   + std::to_string(formStart)
-                   + " — a modifier asks for a narrower VIEW of the register the "
-                     "operand was bound to, and no shipped target declares its "
-                     "width-view vocabulary. Refusing: falling back to the full "
-                     "register would run the operation at the WRONG WIDTH with a "
-                     "clean build log (D-CSUBSET-INLINE-ASM-OPERANDS)");
-            i = afterSigil + 1;
-            continue;
+        // ★★★ THIS ARM VALIDATES THE **SELECTOR** AND SAYS NOTHING ABOUT THE
+        // LETTER, AND THE SPLIT IS FORCED BY WHAT THIS TIER CAN SEE. `%w0` and
+        // `%0` name the SAME operand — a letter selects which VIEW of the bound
+        // register is written (`w0` versus `x0`), never a different operand — so
+        // "does this reference name something" is answerable here, on the minted
+        // inventory, exactly as it is for the plain form. "Is `w` a letter this
+        // dialect spells" is NOT: the letters are per-DIALECT vocabulary
+        // (`assembly.templateModifiers`), ✔MEASURED 2026-08-24 on gcc 13.3.0
+        // both ports to differ between them — `%w` is 32 bits on aarch64 and 16
+        // on x86-64 — and this tier legitimately has NO dialect and often no
+        // target at all (the LSP, the FFI header parser and every direct-API
+        // caller scan templates with `target == nullptr`). A letter check
+        // written here would be a check that silently does not run.
+        //
+        // ★★ THE LETTER IS ANSWERED WHERE THE DIALECT IS RESOLVED, AND LOUDLY.
+        // An undeclared letter mints no template lexeme, so `%z0` reaches no
+        // shape and the dialect refuses the whole template by name at MIR→LIR
+        // (`S_InlineAsmTemplateUnparsable`, which carries the inner
+        // diagnostic) — the same tier and the same code that already answer "is
+        // `frobnicate` a mnemonic" and "is `%r99` a register". ⇒ one owner per
+        // question, and nothing accepts a letter that no tier ever checks.
+        //
+        // ⚠ THE LETTERS ARE READ AS A RUN RATHER THAN AS ONE CHARACTER, so a
+        // dialect declaring a multi-byte view spelling is validated by the same
+        // code. A run that is followed by no selector at all (`%eax` — the
+        // classic un-escaped register in an extended template) falls through to
+        // the generic refusal below, exactly as before.
+        if (isAlpha(c)) {
+            std::size_t afterLetters = afterSigil;
+            while (afterLetters < text.size() && isAlpha(text[afterLetters])) {
+                ++afterLetters;
+            }
+            std::string const letters{
+                text.substr(afterSigil, afterLetters - afterSigil)};
+            bool const viewOpensName =
+                hasNamed && at_(afterLetters, L.symbolicNameOpen);
+            bool const viewHasIndex =
+                afterLetters < text.size() && isDigit(text[afterLetters]);
+            if (viewHasIndex || viewOpensName) {
+                // The form the author WROTE, and the PLAIN form it is a view of.
+                // ⛔ Both are built through the language's render helpers, so no
+                // sigil is a C++ literal here either.
+                std::string written;
+                std::string plain;
+                if (viewOpensName) {
+                    i = afterLetters + L.symbolicNameOpen.size();
+                    auto const name = readBracketName(i);
+                    if (!name) {
+                        report(DiagnosticCode::S_InlineAsmTemplateUnparsable, at,
+                               "the inline-asm template has an unterminated "
+                               + quote(L.placeholder + letters
+                                       + L.symbolicNameOpen)
+                               + " operand reference at byte offset "
+                               + std::to_string(formStart)
+                               + " — no closing " + quote(L.symbolicNameClose));
+                        continue;
+                    }
+                    plain   = L.namedOperandRef(*name);
+                    written = L.placeholder + letters + L.symbolicNameOpen
+                            + *name + L.symbolicNameClose;
+                } else {
+                    i = afterLetters;
+                    std::string const digits = readIndexDigits(i);
+                    plain   = L.operandRef(digits);
+                    written = L.placeholder + letters + digits;
+                }
+                if (f.operandAnsweringTo(plain) != nullptr) continue;
+                // ★ THE MESSAGE NAMES BOTH FORMS. The author wrote the view; the
+                // thing that has to be bound is the operand the view is OF, and
+                // an author told only about `%0` when they wrote `%w0` cannot
+                // see which half of their spelling was wrong.
+                InlineAsmLabelFact const* const asLabel =
+                    viewHasIndex ? f.labelAnsweringTo(
+                                       L.labelRef(plain.substr(
+                                           L.placeholder.size())))
+                                 : nullptr;
+                report(DiagnosticCode::S_InlineAsmPlaceholderOutOfRange, at,
+                       "the inline-asm template references " + quote(written)
+                       + " at byte offset " + std::to_string(formStart)
+                       + " — a width view names the SAME operand as "
+                       + quote(plain)
+                       + " and only states how wide a view of it to write — but "
+                         "no operand of this statement answers to " + quote(plain)
+                       + ". This statement declares " + operandCountText
+                       + " operand(s)"
+                       + (operandForms.empty()
+                              ? std::string{}
+                              : " (the operand forms it declares are "
+                                    + operandInventory + ")")
+                       + (asLabel != nullptr
+                              ? ". That index names an `asm goto` LABEL, not an "
+                                "operand: GNU 6.47.2.7 numbers the labels AFTER "
+                                "every operand, and a label has no register and "
+                                "therefore no width to view — write "
+                                    + inventory(asLabel->spellings)
+                                    + " to branch to it"
+                              : std::string{}));
+                continue;
+            }
         }
 
         // Every other placeholder form in an EXTENDED template. gcc says

@@ -766,8 +766,8 @@ TEST(ScopeRequire, ToyConfigReloadsWithEmptyScopeRequire) {
     EXPECT_FALSE(var[0].scopeRequire.outermost.has_value());
 }
 
-TEST(ScopeRequire, CSubsetConfigReloadsWithEmptyScopeRequire) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+TEST(ScopeRequire, CConfigReloadsWithEmptyScopeRequire) {
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value())
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
     auto const& s = **loaded;

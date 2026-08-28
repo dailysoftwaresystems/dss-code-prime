@@ -1,0 +1,36 @@
+{
+  "$comment": "FC18a (D-PP-VA-OPT) C23 6.10.5.1 `__VA_OPT__` witness. Ten runtime checks + four stringize lines, every expectation ✔MEASURED on clang-18/clang-19/gcc-13 (and cl 19.51.36252 /Zc:preprocessor for the expansion arm), all agreeing. The load-bearing one is `ADD(42, EMPTY)`: the emptiness test is on the macro-EXPANDED variable arguments (C23 6.10.5.1p7), so an implementation keyed on the RAW argument run emits `(42 + )` and fails to PARSE — this example is a compile-time tripwire as well as a runtime one. The `release` arm re-runs the whole thing through the shipped optimizer. Exit 42; each check has a distinct failure code.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "[]\r\n[a+b]\r\n[p+p]\r\n[a + b]\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "[]\n[a+b]\n[p+p]\n[a + b]\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "[]\n[a+b]\n[p+p]\n[a + b]\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "expectedStdout": "[]\n[a+b]\n[p+p]\n[a + b]\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

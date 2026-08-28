@@ -60,62 +60,49 @@ disagree with what's in `src/` — agents and contributors read it as canonical.
 
 ---
 
-## 11. What's Done vs. What's NOT (Honest Status)
+## 11. Status — WHERE TO GET IT, NEVER WHAT IT IS
 
-### Done (T0–T12, 12/12 of the tree/node sub-plan)
+★★★ **THIS SECTION DELIBERATELY CARRIES NO STATUS FIGURES, AND THAT ABSENCE IS THE POINT.**
+A skill reference is served to a cycle as CURRENT truth. Nothing dates it, nothing re-measures it,
+and no gate reds when it diverges from the tree — so a status figure written here is a claim with
+no owner and no expiry. ✔MEASURED 2026-08-24: the T0–T12-era snapshot this section used to hold had
+gone wholesale false while still reading as present tense. It asserted *"Semantic analyzer, IR,
+optimizer, codegen, linker. **None exist.**"* and *"no real tokenizer exists"* — at a commit where
+`src/analysis/semantic`, `src/analysis/lexical`, `src/tokenizer`, `src/hir`, `src/mir`, `src/lir`,
+`src/opt`, `src/link` and `src/asm` all exist and DSS compiles and links SQLite on five target legs.
+It also called *"the tokenizer phase opens next"* the biggest near-term risk, roughly thirty cycles
+after that phase closed.
 
-- The tree/node model: `Tree`, `Node`, `NodeKind`, `NodeFlags`, strong IDs, interners.
-- Schema loader + `GrammarSchema` (loads `.lang.json` from disk or text).
-- `TreeBuilder` with RAII scopes, recovery, EOF synthesis, diagnostic emission.
-- `TreeCursor` (CST + AST modes, opaque Bookmark, cycle-capped depth/parent walks).
-- Visitor walks (`walkPreOrder`, `walkPostOrder`, `WalkAction`).
-- `NodeAttribute<T>` with sparse↔dense auto-promotion.
-- Seven typed views + `well_known_names.hpp`.
-- End-to-end integration test exercising the full stack against `toy.lang.json`.
-- Onboarding docs (`docs/tree-model.md`, `docs/language-config-spec.md`).
-- **531 ctest cases across 26 suites, 100% pass.** (v1 T0–T12 baseline + v2 PR0–PR8 + SH1–SH4.) (historical v1/v2 baseline; the current suite is 604 — see plan-00 §0.)
-- **Schema-expressiveness v2 (PR0–PR8): done.** Operator precedence + arity (`OperatorTable`),
-  contextual keywords + `reservedWordPolicy`, `scopeRequire` (anyOf/forbid/topMustBe/outermost),
-  `TreeBuilder::Checkpoint` + speculative-alt loader plumbing, `lexerModes` + `LexerModeStack` +
-  `modeOp`, `stringStyle` descriptor with `EscapeKind` + dynamic tag patterns. Two real grammars
-  ship: `toy.lang.json` and `tsql-subset.lang.json` (empirical stress proves v2 is sufficient
-  for non-trivial languages). See `.plans/02-schema-expressiveness-v2-plan - ok.md`.
-- **Substrate hardening (SH1–SH4): done.** SH2 confirmed the multi-OS CI matrix (Linux/GCC,
-  Linux/Clang+ASan, Windows/MSVC, macOS/AppleClang). SH3 closed the cross-tree `NodeId` caveat
-  (`NodeId.arenaTag` + tag validation in `NodeAttribute<T>` and `Tree::node_`). SH1 ships
-  `scripts/refresh_landing_log/refresh_landing_log.py` for plan-doc hygiene; SH4a wires its `--check` into CI. SH4b
-  adopted `switch`/`case`/`default`/`break` in c-subset via shape-based positioning. SH4c
-  pinned multi-level AltChoice routing.
-- **Three shipped `.lang.json` configs**: `toy.lang.json`, `c-subset.lang.json`,
-  `tsql-subset.lang.json`.
+⚠⚠ **AND THE OBVIOUS REMEDY IS MEASURED NOT TO WORK — THAT IS WHY THIS IS A POINTER AND NOT A
+DATE-STAMP.** A previous pass did try annotating the rotting number instead of removing it, leaving
+*"(historical v1/v2 baseline; the current suite is 604 — see plan-00 §0.)"* beside a stale 531.
+**The annotation then rotted too**: the suite is four figures now, so the reader met two wrong
+numbers where before there was one, and the caveat lent the second one credibility. A caveat beside
+a stale figure is just a second stale figure. ⇒ the repo's own standing rule is the only stable
+form: *"never re-quote a gate figure — RE-MEASURE at the commit that carries it."*
+Species: [[D-PLANS-SKILL-REFERENCE-ASSERTS-UNRECHECKED-STATUS]].
 
-### NOT done yet
+### Where status actually comes from
 
-- **The lexer.** The current code drives `TreeBuilder` from hand-constructed tokens — no real
-  tokenizer exists. Substrate hardening is done; tokenizer phase is the next-up parent-plan
-  phase.
-- **The parser.** `TreeBuilder` validates *within* a frame but the sequence/alt/repeat shape
-  walker isn't fully consumer-driven. The "is `open(varDecl)` valid here?" check is the
-  parser's job. The schema cursor walks correctly through arbitrary AltChoice nesting (SH4c
-  pin) — that mechanism is ready for a real parser.
-- **Most real-language grammars.** Only `toy`, `c-subset`, and `tsql-subset` ship. C#, Dart,
-  SQLite are promised but not authored. Float-literal styling and ternary operators are not
-  yet schema-expressible (v3 candidates).
-- **Semantic analyzer, IR, optimizer, codegen, linker.** None exist. `src/core/compiler.cpp`
-  is a placeholder.
-- **Cross-platform — partial.** CI matrix exercises Linux/GCC-13, Linux/Clang-19+ASan,
-  Windows/MSVC, and macOS/AppleClang on every PR (SH2 + SH4a). iOS / Android / WASM are stated
-  goals; untested. Local dev convention on Windows is MinGW GCC 13.2; production code paths
-  are toolchain-portable (proven by green CI on all four legs).
+| You want | Ask this | Never ask |
+|---|---|---|
+| % complete, empirical C coverage, plan-23 arc %, SQLite-readiness, the cross-target emit/run matrix, an ETA | the **`dss-state`** skill — it runs a 104-probe C-feature battery through the REAL CLI and re-derives every axis at the commit you are standing on | any figure written in a document |
+| What the last cycle did, what it owes the next one, the live operator queue | `.plans/_handoff.md` — **READ FIRST**, rewritten every cycle | a plan's §0 summary, which lags |
+| Whether one specific defect is open | that row's own status cell in `.plans/_deferred-anchor-registry*.md` | any list, queue or summary that names the row |
+| Anchor open/closed counts | `python scripts/check-anchor-balance/check-anchor-balance.py` | a count quoted in prose |
+| Suite size, pass count, timings | run the gate | this file |
 
-### The biggest near-term risk
+### What this file may state, because a reader re-derives it in one command
 
-The tokenizer phase (parent plan #5) opens next. v2 has been validated against tsql-subset
-end-to-end at the schema level (PR7) and c-subset adopted shape-based switch/case (SH4b), so
-the substrate is empirically sufficient for non-trivial languages. The first real test will
-be when an actual lexer drives `TreeBuilder::pushToken` from real source bytes — that's where
-PR5 (lexer modes) and PR6 (string styles) get exercised under non-stub-driver pressure for
-the first time. Expect a v2-fixup pass once the tokenizer surfaces gaps.
+**Structure, not status.** Which subsystems exist is `ls src/`; which languages ship is
+`ls src/dss-config/sources/*.lang.json`; which targets and formats exist is `ls src/dss-config/targets/`
+and `ls src/dss-config/object-formats/`. Those are stable facts about shape, they answer *where does
+this live*, and §1–§10 above document them. A sentence here earns its place only if a reader can
+check it against the tree faster than they can doubt it.
+
+⇒ **If you are about to write "N tests", "X% done", "not yet implemented", or "the next phase is Y"
+into this file — don't. Name the instrument instead.** Any prose that survives here despite being a
+status carries an explicit re-measure obligation naming the instrument that settles it.
 
 ---
 

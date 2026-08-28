@@ -5,7 +5,10 @@
 #include "core/types/target_schema.hpp"
 #include "lir/lir_reg.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <span>
 #include <string_view>
 #include <type_traits>
 #include <vector>
@@ -40,7 +43,7 @@ namespace dss {
 // ldrb/strb. kLirInstFlagWidth16 (D-LIR-INT-MEMORY-WIDTH-EXACT) adds the
 // half-word memory form (I16/U16): x86 0x66-prefixed mov / movzx r16,
 // arm64 STURH/LDURH. The width bits are mutually exclusive (narrowest
-// wins); the JSON loader accepts a guard width of 8, 16, 32, or 64.
+// wins); the JSON loader accepts a guard width of 8, 16, 32, 64, or 128.
 inline constexpr std::uint8_t kLirInstFlagWidth32 = 0x01;
 inline constexpr std::uint8_t kLirInstFlagWidth8  = 0x02;
 inline constexpr std::uint8_t kLirInstFlagWidth16 = 0x04;
@@ -97,11 +100,105 @@ inline constexpr std::uint8_t kLirInstFlagWidth16 = 0x04;
 // does, `&` is still parsed, carried, and dropped.
 inline constexpr std::uint8_t kLirInstFlagEarlyClobberResult = 0x08;
 
+// ── THE MEMORY REFERENCE IS THE DESTINATION-POSITION OPERAND ─────────
+// D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE.
+//
+// "The memory reference this instruction names occupies its DESTINATION
+// position." For an instruction that writes, that is the operand it
+// writes; for a flag-setter it is the left-hand side of the operation.
+// Both are the same statement — which operand the destination position
+// names — and it is the one fact an operand list cannot carry.
+//
+// ★★★ WHY A FLAG AND NOT AN OPERAND SHAPE. ✔MEASURED by reading
+// `AsmInstructionLowering::buildLirInst`: `cmpq %r14, 4096(%r15)`
+// (memory destination, shape 3) and `cmpq 4096(%r15), %r14` (register
+// destination with a memory source, shape 2) build the BYTE-IDENTICAL
+// operand list `[reg, reg, MemBase, MemOffset]` while meaning
+// `mem - reg` (0x39 /r) and `reg - mem` (0x3B /r). Every other
+// arithmetic mnemonic escapes the collision because it PRODUCES a
+// value, so its two directions live on a producer and a consumer
+// elected from disjoint candidate sets; `cmp` produces nothing in
+// either direction and has no such split. Reordering the list is not
+// available either: shape 3's `sources + address tail` is exactly the
+// order the C front end's `store` already emits, on both shipped
+// targets.
+//
+// ★★ WHY IT RIDES `flags` AND NOT THE DIALECT. Two tiers ask "can this
+// opcode encode this shape?" through ONE function (`asm_variant_elect.hpp`,
+// operator ruling) — the text lowering to pick the opcode, the encoder to
+// pick the variant it emits — and they must agree byte-for-byte. An
+// election axis the ENCODER cannot see would let the two disagree with no
+// diagnostic. The dialect is likewise the wrong home: `assembly_config.hpp`
+// records that a dialect must say which opcodes are POSSIBLE and never
+// which one wins for a shape, on pain of becoming a drifting second copy
+// of the target's guard table. `flags` is the carrier that survives every
+// rebuilding pass by construction (see the width bits above).
+//
+// ⚠ ABSENCE OF A `memoryDestination` KEY ON A GUARD MEANS "DOES NOT
+// DISCRIMINATE", so every pre-existing variant is unaffected — including
+// `store`, which is reached through shape 3 on a destination-LAST dialect
+// (AT&T `movq %rax,(%rdi)`) and through shape 2 on a destination-FIRST one
+// (arm64 `str x1,[sp,#24]`) and must stay electable from both.
+inline constexpr std::uint8_t kLirInstFlagMemoryIsDestination = 0x10;
+
+// ── THIS CALL'S OUTGOING STACK ARGUMENTS HAVE ALREADY BEEN PLACED ────────────
+//
+// D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES.
+//
+// "Every argument of this Call that goes in the outgoing-argument area has
+// already been assigned its byte offset, and no later pass may assign one."
+//
+// ★★★ WHY THE BIT EXISTS AT ALL, AND WHY ITS ABSENCE WAS A SILENT MISCOMPILE.
+// Two passes walk a Call's argument list and both know how to lay out the
+// overflow area: `lowerWideCallArgs` (pre-regalloc, which REMOVES each stacked
+// scalar into a `store_outgoing_arg` carrier) and `lir_callconv` (post-regalloc,
+// which places whatever is still on the Call). After the first pass runs, the
+// second one walks a SHORTER list — so its cursor restarts from bytes the first
+// pass already handed out, and a stacked scalar followed by a stacked aggregate
+// received the SAME bytes twice with no diagnostic. The repair is that ONE pass
+// owns the placement; this bit is how the second pass KNOWS the first one ran,
+// so "callconv places nothing here" is CHECKED rather than argued from the
+// operand list's shape.
+//
+// ⚠ IT IS CONSUMED, NOT FORWARDED. `materializeCallingConvention` re-emits the
+// call with its own flags (0), so the bit's whole lifetime is
+// `lowerWideCallArgs` → `materializeCallingConvention` — exactly the lifetime of
+// the placement it describes. It never reaches the assembler and no encoding
+// variant can match on it.
+inline constexpr std::uint8_t kLirInstFlagOutgoingArgsPlaced = 0x20;
+
+// ── THE 128-BIT OPERATION WIDTH ─────────────────────────────────────────────
+//
+// *** THIS BIT EXISTS SO THE WIDTH FIELD CAN DESCRIBE A REGISTER WIDER THAN A
+// GENERAL-PURPOSE ONE, and its absence was an LIR EXPRESSIVENESS DEFECT rather
+// than a missing optimization. Before it, `lirInstWidthBits` was a three-flag
+// field over {8, 16, 32, 64} and 128 was UNSAYABLE -- so no instruction could
+// state that it operates on a full 128-bit vector register, no target could
+// declare an encoding variant guarded on that width, and every consumer that
+// compares an operation width against a REGISTER width (x86-64 `xmm` is 16
+// bytes) was structurally unable to see a match.
+//
+// It was FOUND as a 121-instruction residue in the OPT8 peephole (a full-width
+// `movaps %xmm12,%xmm12` self-copy that the peephole could not prove was a
+// no-op), and it is fixed HERE rather than worked around there, because the
+// same limit blocks every future vector operation and not just those 121
+// copies. The flags byte had two spare bits; this takes one.
+//
+// *** IT IS DECLARED, NOT STAMPED. No shipped lowering sets it yet: the FPR
+// class moves on both shipped targets (`movaps`, `fmov`) declare encoding
+// variants with NO width guard, so they elect correctly at any width and have
+// no reason to state one. The day a real 128-bit operation needs the width to
+// elect its variant, it says so and every width-comparing consumer -- the
+// peephole included -- starts agreeing with no edit, because they all compare
+// DECLARED vocabulary rather than special-casing a class.
+inline constexpr std::uint8_t kLirInstFlagWidth128 = 0x40;
+
 // The instruction's operation width in bits, derived from its flags.
 [[nodiscard]] constexpr std::uint8_t
 lirInstWidthBits(std::uint8_t flags) noexcept {
-    if ((flags & kLirInstFlagWidth8) != 0)  return std::uint8_t{8};
-    if ((flags & kLirInstFlagWidth16) != 0) return std::uint8_t{16};
+    if ((flags & kLirInstFlagWidth8) != 0)   return std::uint8_t{8};
+    if ((flags & kLirInstFlagWidth16) != 0)  return std::uint8_t{16};
+    if ((flags & kLirInstFlagWidth128) != 0) return std::uint8_t{128};
     return (flags & kLirInstFlagWidth32) != 0 ? std::uint8_t{32}
                                               : std::uint8_t{64};
 }
@@ -112,6 +209,24 @@ lirInstWidthBits(std::uint8_t flags) noexcept {
 [[nodiscard]] constexpr bool
 lirInstResultIsEarlyClobber(std::uint8_t flags) noexcept {
     return (flags & kLirInstFlagEarlyClobberResult) != 0;
+}
+
+// True iff this instruction's memory reference occupies its
+// destination-position operand. Named rather than open-coded so the
+// producer (the assembly-text lowering's memory-destination shape) and the
+// consumer (the encoding-variant matcher) agree on the bit.
+[[nodiscard]] constexpr bool
+lirInstMemoryIsDestination(std::uint8_t flags) noexcept {
+    return (flags & kLirInstFlagMemoryIsDestination) != 0;
+}
+
+// True iff a Call's outgoing stack arguments were already placed by
+// `lowerWideCallArgs`. Named rather than open-coded so the one producer and the
+// one consumer agree on the bit
+// (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES).
+[[nodiscard]] constexpr bool
+lirCallOutgoingArgsArePlaced(std::uint8_t flags) noexcept {
+    return (flags & kLirInstFlagOutgoingArgsPlaced) != 0;
 }
 
 // Operand variant tag carried on each entry of the LIR operand pool.
@@ -159,7 +274,25 @@ enum class LirOperandKind : std::uint8_t {
     // pass that aggregate ENTIRELY in the outgoing overflow area by a
     // byte-wise copy (ceil(size / outgoingSlot) slots), never in a register
     // and never split (SysV §3.2.3/§3.5.7). CC-neutral: the size is the
-    // only datum; the overflow placement is the callconv's, config-driven.
+    // only datum.
+    //
+    // ★★ THE CARRIER IS A TRIPLE ONCE IT HAS BEEN PLACED
+    // (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES):
+    //     Reg (temp address) , ByValueStackAgg (size + exhaust) , MemOffset
+    // where the trailing `MemOffset` states the byte offset WITHIN the
+    // outgoing-argument area that this aggregate occupies. `MirToLir` emits the
+    // PAIR, because that tier has no calling convention in scope and so cannot
+    // place anything; `lowerWideCallArgs` — the one pass that walks the call's
+    // COMPLETE argument list — appends the third operand. A carrier that reaches
+    // `lir_callconv` on a Call whose `kLirInstFlagOutgoingArgsPlaced` is set and
+    // that states no offset is REFUSED, never re-placed: re-placing it from a
+    // second cursor, over a list the first pass had already shortened, is the
+    // silent miscompile this triple exists to make unrepresentable.
+    //
+    // ⚠ The trailing `MemOffset` is NOT an addressing mode. It is the same
+    // "spread a wide descriptor across uniform 8-byte pool slots" convention the
+    // memory addressing modes use (Reg + MemBase + MemOffset), and the verifier's
+    // load/store/lea address-form rule does not apply to a Call.
     ByValueStackAgg = 9,
     // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a POST-REGALLOC operand naming a
     // SPILLED value by its stack slot + register class, NOT a virtual register.
@@ -194,7 +327,29 @@ struct LirOperand {
     // class-correct load op. Repurposes one of the two padding bytes — no
     // struct-size change (still 8). Unused (0) for any other operand kind.
     std::uint8_t   spillSlotClass = 0;           // 1
-    std::uint8_t   _pad[1] = {};                 // 1
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: for a `Reg` (or
+    // `SpillSlotRef`) operand sitting in a CALL's argument region, the argument's
+    // NATURAL BYTE SIZE (1/2/4/8). 0 = "not stated", which every producer other
+    // than `MirToLir::lowerCall` leaves it at and which every `Slot`-packing CC
+    // ignores. Consumed by `lir_wide_call_args`, whose overflow cursor needs the
+    // datum's own size + alignment once a CC declares NATURAL packing.
+    //
+    // ★★ WHY THE OPERAND AND NOT THE INSTRUCTION. The width bits ride
+    // `LirInst::flags`, which is exactly right for a one-datum instruction (the
+    // callee's `arg` uses them); a CALL carries N arguments of N different sizes
+    // in ONE instruction, so its width axis is necessarily per-OPERAND. This
+    // repurposes the last padding byte — `LirOperand` stays 8 bytes (asserted
+    // below), the same trick `byValueAggExhaust` and `spillSlotClass` already use.
+    //
+    // ⚠ IT IS NOT ROUND-TRIPPED THROUGH `.dsslir` TEXT — deliberately, and it
+    // shares that property with the two side bytes above (see `lir_text.cpp`).
+    // Its whole lifetime is isel → `lowerWideCallArgs`, which run back-to-back in
+    // `compile_pipeline` with only verbatim operand copies in between. A CC that
+    // declares NATURAL packing and reaches the overflow cursor with 0 here is a
+    // DROPPED CARRIER, and `lowerWideCallArgs` REFUSES it loudly rather than
+    // silently reverting that one argument to slot packing while the callee reads
+    // it packed — which is the shape of a silent miscompile.
+    std::uint8_t   argNaturalBytes = 0;          // 1
     union {
         LirReg        reg;        // 4 — kind == Reg
         std::int32_t  immInt32;   // 4 — kind == ImmInt (truncated; full int64 lives in scalar pool)
@@ -220,6 +375,18 @@ struct LirOperand {
         LirOperand o{};
         o.kind = LirOperandKind::Reg;
         o.reg  = r;
+        return o;
+    }
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: a `Reg` operand in a
+    // CALL's argument region, carrying the argument's natural byte size so the
+    // overflow cursor can pack it. Every OTHER Reg operand keeps `makeReg`, whose
+    // `argNaturalBytes` is 0 = "not stated" — so this is additive by construction.
+    [[nodiscard]] static constexpr LirOperand
+    makeArgReg(LirReg r, std::uint8_t naturalBytes) noexcept {
+        LirOperand o{};
+        o.kind            = LirOperandKind::Reg;
+        o.argNaturalBytes = naturalBytes;
+        o.reg             = r;
         return o;
     }
     [[nodiscard]] static constexpr LirOperand makeImmInt32(std::int32_t v) noexcept {
@@ -287,6 +454,62 @@ struct LirOperand {
 };
 static_assert(sizeof(LirOperand) == 8, "LirOperand POD must stay 8 bytes");
 static_assert(std::is_trivially_copyable_v<LirOperand>);
+
+// ── THE BY-VALUE STACKED-AGGREGATE CARRIER, AS ONE SHAPE INSTEAD OF FOUR ─────
+//
+// D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES.
+//
+// FOUR walks over a Call's argument list have to agree on where a carrier
+// begins, which of its operands are DESCRIPTIVE (consumed with the carrier and
+// never an argument position of their own), and where it was placed:
+// `lir_wide_call_args::lowerOneFunc`, `lir_callconv::computeMaxOutgoingStackArgs`,
+// `lir_callconv::materializeOneFunc`'s call arm, and
+// `lir_rewrite::classifyCallRegArgs`. Each of them used to spell the lookahead
+// out by hand — the same "a promise four copies keep" shape that
+// `ArgCursors` and `StackArgCursor` were minted to end on the register and byte
+// axes. So the shape is stated ONCE, here, beside the operand kind it is about.
+
+// True iff `ops[k]` is the Reg that CARRIES a by-value stacked aggregate — i.e.
+// it is immediately followed by the `ByValueStackAgg` marker describing it.
+[[nodiscard]] constexpr bool
+lirIsByValueStackAggCarrier(std::span<LirOperand const> ops,
+                            std::size_t k) noexcept {
+    return k < ops.size() && ops[k].kind == LirOperandKind::Reg
+        && (k + 1) < ops.size()
+        && ops[k + 1].kind == LirOperandKind::ByValueStackAgg;
+}
+
+// True iff `ops[k]` DESCRIBES the carrier before it rather than being an
+// argument of its own: the `ByValueStackAgg` marker, or the `MemOffset` that
+// states where that marker's aggregate was placed. A walk skips these without
+// advancing its argument-position counter.
+[[nodiscard]] constexpr bool
+lirIsByValueStackAggDescriptor(std::span<LirOperand const> ops,
+                               std::size_t k) noexcept {
+    if (k >= ops.size()) return false;
+    if (ops[k].kind == LirOperandKind::ByValueStackAgg) return true;
+    return ops[k].kind == LirOperandKind::MemOffset && k > 0
+        && ops[k - 1].kind == LirOperandKind::ByValueStackAgg;
+}
+
+// The byte offset, within the outgoing-argument area, that the carrier at `k`
+// was placed at — or `nullopt` when it has not been placed. Precondition:
+// `lirIsByValueStackAggCarrier(ops, k)`.
+[[nodiscard]] constexpr std::optional<std::int32_t>
+lirByValueStackAggPlacedOffset(std::span<LirOperand const> ops,
+                               std::size_t k) noexcept {
+    if ((k + 2) < ops.size() && ops[k + 2].kind == LirOperandKind::MemOffset)
+        return ops[k + 2].offset;
+    return std::nullopt;
+}
+
+// How many operands the carrier at `k` occupies: 2 unplaced, 3 placed.
+// Precondition: `lirIsByValueStackAggCarrier(ops, k)`.
+[[nodiscard]] constexpr std::size_t
+lirByValueStackAggCarrierOperands(std::span<LirOperand const> ops,
+                                  std::size_t k) noexcept {
+    return lirByValueStackAggPlacedOffset(ops, k).has_value() ? 3u : 2u;
+}
 
 // ── per-INSTRUCTION register-constraint pool ─────────────────────
 //

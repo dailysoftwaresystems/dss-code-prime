@@ -137,7 +137,7 @@ int buildOne(fs::path const& outDir,
     p.setOutputDir(outDir);
     if (!resolveLibs.empty()) p.setResolveLibraries(resolveLibs);
     return p.compileFiles(std::vector<std::string>{srcPath},
-                          "c-subset", std::vector<std::string>{target}, rep);
+                          "c", std::vector<std::string>{target}, rep);
 }
 
 // Same as `buildOne`, but each `--resolve-library` entry also STATES the
@@ -153,7 +153,7 @@ int buildOneWithSpecs(fs::path const& outDir,
     p.setOutputDir(outDir);
     if (!resolveLibs.empty()) p.setResolveLibraries(resolveLibs);
     return p.compileFiles(std::vector<std::string>{srcPath},
-                          "c-subset", std::vector<std::string>{target}, rep);
+                          "c", std::vector<std::string>{target}, rep);
 }
 
 // The emitted image's bytes, for the dependency-table extractors.
@@ -405,24 +405,43 @@ TEST(FfiResolveLibraryRoundTrip, PerFormatRowsUnionKeepsSymbolKnownEverywhere) {
         // default". That per-language default is RETIRED — a hand-written
         // `extern int mtx_lock(void*);` now gets the SAME realization the
         // `#include <threads.h>` spelling gets, which is the whole invariant. On
-        // macho that realization is a SYNTHESIZED pthread shim whose vehicle the
-        // macho format file does not yet declare, so the build is REFUSED LOUD by
-        // an ALREADY-ANCHORED gap (D-CSUBSET-C11-THREADS-MACHO) — a pre-existing
-        // hole this test newly reaches, not a regression it introduced. Silently
-        // binding libSystem instead was only ever possible because the bare path
-        // consulted no descriptor at all.
+        // macho that realization is a SYNTHESIZED pthread shim, and this comment
+        // USED TO attribute the resulting refusal to *"an ALREADY-ANCHORED gap"*
+        // in *"the macho format file"*, citing D-CSUBSET-C11-THREADS-MACHO.
+        // ⚠⚠ THE REFUSAL IS REAL BUT THAT ATTRIBUTION IS FALSE, WHICH IS THE
+        // NASTIER HALF OF THE SPECIES: a true observation keeps a dead citation
+        // alive, and the citation is what the next author acts on
+        // (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+        // ✔RE-MEASURED at the CLI 2026-08-24, both halves, `extern int
+        // mtx_lock(void*);` compiled straight through the driver:
+        //   * x86_64:macho64-x86_64-darwin-exec — the leg THIS test drives —
+        //     rc=1, `error[L_UnsupportedLoweringForOpcode] … the target object
+        //     format declares no `librarySynthesis` vehicle`;
+        //   * arm64:macho64-arm64-darwin-exec — rc=0. It builds.
+        // ⇒ "the macho format file" is not ONE file. macho64-arm64-darwin-exec
+        // declares `librarySynthesis: {vehicle: pthread}`, which is how the row
+        // this comment cited CLOSED (2026-07-14, runtime-green on a Mac); the
+        // x86_64 exec format OMITS the key ON PURPOSE, and the argument is
+        // written in that file's own `$remainingDeliberateOmissionsComment` row
+        // (4) — the shim is a TLS-shaped facility, that format ships no
+        // `tlsAccess` either, and declaring a vehicle nothing exercises would
+        // advertise a capability no leg witnesses. So the refusal below is a
+        // DELIBERATE per-format omission, recorded where the omission lives,
+        // rather than an unfinished engine gap somebody should go close.
+        // Silently binding libSystem instead was only ever possible because the
+        // bare path consulted no descriptor at all.
         //
         // Kept STRICT: the build must either SUCCEED or fail with exactly that one
-        // anchored refusal. Any other diagnostic — and in particular any
-        // availability verdict, which is this test's actual subject — is red.
+        // no-synthesis-vehicle refusal. Any other diagnostic — and in particular
+        // any availability verdict, which is this test's actual subject — is red.
         if (rc != 0) {
             EXPECT_GT(::dss::test_support::countCode(
                           rep, DiagnosticCode::L_UnsupportedLoweringForOpcode),
                       0u)
-                << "the only tolerated failure here is the anchored "
-                   "no-synthesis-vehicle refusal (D-CSUBSET-C11-THREADS-MACHO); "
-                   "anything else means the union predicate or the realization is "
-                   "wrong";
+                << "the only tolerated failure here is the no-synthesis-vehicle "
+                   "refusal a format raises when it declares no "
+                   "`librarySynthesis`; anything else means the union predicate "
+                   "or the realization is wrong";
             EXPECT_EQ(::dss::test_support::countCode(
                           rep, DiagnosticCode::K_SymbolUndefined), 0u)
                 << "a union-declared platform symbol must never reach the link "
@@ -678,7 +697,7 @@ TEST(FfiResolveLibraryRoundTrip, SiblingTuDefinitionResolvesUnderResolveLibrary)
     // would fold both into ONE multi-file CU, a different link model).
     int const rc = p.compileUnits(
         std::vector<std::string>{declSrc.string(), defSrc.string()},
-        "c-subset", std::vector<std::string>{execTarget}, rep);
+        "c", std::vector<std::string>{execTarget}, rep);
     ASSERT_EQ(rc, 0)
         << "an extern DEFINED BY A SIBLING TU must not fail resolve-library "
            "validation (the TF-C66 false-positive)";
@@ -688,7 +707,7 @@ TEST(FfiResolveLibraryRoundTrip, SiblingTuDefinitionResolvesUnderResolveLibrary)
 
     auto const exePath = dir / exeArtifact;
     ASSERT_TRUE(fs::exists(exePath)) << "the multi-TU exec must be emitted";
-    auto const r = runBinary(exePath, std::chrono::milliseconds{5000});
+    auto const r = runBinary(exePath);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -706,8 +725,9 @@ TEST(FfiResolveLibraryRoundTrip, SiblingTuDefinitionResolvesUnderResolveLibrary)
 // (H0009), unlike the ExternFunction arm which exempts noLibraryBinding. That
 // asymmetry SKIPPED the unbound data extern's import row, which then broke a
 // referencing function body's lowering into an unsealed MIR block -- a
-// MirBuilder abort on the full sqlite testfixture (D-MIR-LOWER-BLOCK-CREATED-
-// NEVER-FILLED-TESTFIXTURE). TF-C67 gives ExternGlobal the SAME noLibraryBinding
+// MirBuilder abort on the full sqlite testfixture
+// (D-MIR-LOWER-BLOCK-CREATED-NEVER-FILLED-TESTFIXTURE).
+// TF-C67 gives ExternGlobal the SAME noLibraryBinding
 // exemption: an unbound data extern is sibling-resolved at link (row stripped),
 // or rejected LOUD if unresolved. RED-ON-DISABLE: revert the ExternGlobal
 // exemption and this build fails H0009 on `dss_data_answer`.
@@ -743,7 +763,7 @@ TEST(FfiResolveLibraryRoundTrip, SiblingTuDataDefinitionResolvesUnderResolveLibr
     p.setResolveLibraries({libPath});
     int const rc = p.compileUnits(
         std::vector<std::string>{declSrc.string(), defSrc.string()},
-        "c-subset", std::vector<std::string>{execTarget}, rep);
+        "c", std::vector<std::string>{execTarget}, rep);
     ASSERT_EQ(rc, 0)
         << "an unbound DATA extern DEFINED BY A SIBLING TU must lower + link "
            "(no H0009, no MirBuilder abort) -- the TF-C67 ExternGlobal exemption";
@@ -753,7 +773,7 @@ TEST(FfiResolveLibraryRoundTrip, SiblingTuDataDefinitionResolvesUnderResolveLibr
 
     auto const exePath = dir / exeArtifact;
     ASSERT_TRUE(fs::exists(exePath)) << "the multi-TU exec must be emitted";
-    auto const r = runBinary(exePath, std::chrono::milliseconds{5000});
+    auto const r = runBinary(exePath);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -962,7 +982,7 @@ TEST(FfiResolveLibraryRoundTrip, PeDynamicRoundTripExitsFortyTwo) {
 
     // 3. RUN main.exe natively -> it imports dss_lib_answer from dsslib.dll
     //    (same dir) and returns 42.
-    auto const r = runBinary(exePath, std::chrono::milliseconds{5000});
+    auto const r = runBinary(exePath);
     ASSERT_TRUE(r.spawned)
         << "main.exe must spawn -- if not, the PE import descriptor to "
            "dsslib.dll is structurally invalid. " << r.diagnostic;
@@ -1047,7 +1067,7 @@ TEST(FfiResolveLibraryRoundTrip, PeMixedBareSystemExternAndOwnLibraryExitFortyTw
     auto const exePath = dir / "mixed.exe";
     ASSERT_TRUE(fs::exists(exePath));
 
-    auto const r = runBinary(exePath, std::chrono::milliseconds{5000},
+    auto const r = runBinary(exePath, dss::test_support::kRunBudget,
                              /*captureStdout=*/true);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
@@ -1200,7 +1220,7 @@ TEST(FfiPlatformRealization, PeFourDeclarationShapesRealizePrintfIdentically) {
 
         // (d) IT RUNS, AND PRINTS. The realization has to be correct, not just
         // well-shaped — a shim wired to the wrong core would satisfy (a)-(c).
-        auto const r = runBinary(exePath, std::chrono::milliseconds{5000},
+        auto const r = runBinary(exePath, dss::test_support::kRunBudget,
                                  /*captureStdout=*/true);
         ASSERT_TRUE(r.spawned) << r.diagnostic;
         EXPECT_FALSE(r.timedOut);
@@ -1272,7 +1292,7 @@ TEST(FfiResolveLibraryRoundTrip, ElfDynamicRoundTripExitsFortyTwo) {
     // 3. RUN main -> ld.so resolves DT_NEEDED dsslib.so (LD_LIBRARY_PATH) +
     //    libc, binds dss_lib_answer, returns 42.
     ::setenv("LD_LIBRARY_PATH", dir.string().c_str(), /*overwrite=*/1);
-    auto const r = runBinary(mainPath, std::chrono::milliseconds{5000});
+    auto const r = runBinary(mainPath);
     ASSERT_TRUE(r.spawned)
         << "main must spawn under ld.so. " << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
@@ -1308,7 +1328,7 @@ TEST(FfiResolveLibraryRoundTrip, ElfMixedBareSystemExternAndOwnLibraryExitFortyT
     ASSERT_TRUE(fs::exists(mainPath));
 
     ::setenv("LD_LIBRARY_PATH", dir.string().c_str(), /*overwrite=*/1);
-    auto const r = runBinary(mainPath, std::chrono::milliseconds{5000},
+    auto const r = runBinary(mainPath, dss::test_support::kRunBudget,
                              /*captureStdout=*/true);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
@@ -1388,7 +1408,7 @@ TEST(FfiResolveLibraryPerTarget, EachTargetLinksOnlyItsOwnAddedLibraries) {
            "can only have come through the per-target channel";
 
     DiagnosticReporter rep;
-    ASSERT_EQ(prog.compileFiles({mainSrc.string()}, "c-subset",
+    ASSERT_EQ(prog.compileFiles({mainSrc.string()}, "c",
                                 {kX64Exec, kArmExec}, rep), 0)
         << (rep.all().empty() ? "" : rep.all().front().actual);
 
@@ -1447,7 +1467,7 @@ TEST(FfiResolveLibraryPerTarget, AdditionKeyedToAnUnbuiltTargetFailsLoud) {
         {kAbsentSpec, {ResolveLibrarySpec{libPath, "dsslib.so"}}},
     });
     DiagnosticReporter rep;
-    int const rc = prog.compileFiles({mainSrc.string()}, "c-subset",
+    int const rc = prog.compileFiles({mainSrc.string()}, "c",
                                      {kBuiltSpec}, rep);
     EXPECT_NE(rc, 0)
         << "additions for a target the build never compiles must abandon the "

@@ -145,8 +145,8 @@ struct DSS_EXPORT CstToHirResult {
                                   // (TF-C78, D-CSUBSET-NOINLINE); read at HIR→MIR to
                                   // stamp MirFunc.noInline (the inliner's refusal)
     HirAlwaysInlineMap alwaysInlineMap; // bound to `hir` — native-FUNCTION inliner
-                                  // cost-model BYPASS (TF-C81, D-CSUBSET-ALWAYS-
-                                  // INLINE); read at HIR→MIR to stamp
+                                  // cost-model BYPASS (TF-C81,
+                                  // D-CSUBSET-ALWAYS-INLINE); read at HIR→MIR to stamp
                                   // MirFunc.alwaysInline (suppresses rule 6's
                                   // size threshold, never a correctness rule)
     HirNoOptimizeMap noOptimizeMap; // bound to `hir` — native-FUNCTION optimizer
@@ -163,8 +163,8 @@ struct DSS_EXPORT CstToHirResult {
                                   // sanitizer (see NoSanitizeThreadAttr)
     HirInlineDefinitionMap inlineDefinitionMap; // bound to `hir` — native-FUNCTION
                                   // C99 6.7.4p7 INLINE DEFINITION
-                                  // (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-
-                                  // DEFINITION-EMITTED). Keyed on the FUNCTION node
+                                  // (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED).
+                                  // Keyed on the FUNCTION node
                                   // (not the declaration node the five maps above
                                   // use); read at HIR→MIR to sanction the one legal
                                   // function-and-extern SymbolId pair, and NOT
@@ -176,6 +176,13 @@ struct DSS_EXPORT CstToHirResult {
                                   // duration (TLS C1, D-CSUBSET-THREAD-LOCAL); read
                                   // at HIR→MIR to stamp MirGlobal.isThreadLocal /
                                   // ExternImport.isThreadLocal (→ .tdata/.tbss)
+    HirEnclosingFunctionMap enclosingFunctionMap; // bound to `hir` — which function
+                                  // body a block-scope `static` was written in, kept
+                                  // on the hidden module GLOBAL D-CSUBSET-LOCAL-STATIC
+                                  // promotes it to; read at HIR→MIR to resolve a
+                                  // `&&label` in that initializer against the right
+                                  // function's per-function label ordinals
+                                  // (D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)
     HirVolatileMap volatileMap;   // bound to `hir` — per-ACCESS volatility (c21,
                                   // D-CSUBSET-VOLATILE-QUALIFIER); read at HIR→MIR
                                   // to OR MirInstFlags::Volatile onto Load/Store
@@ -255,7 +262,8 @@ struct DSS_EXPORT CstToHirResult {
         : hir(std::move(h)), sourceMap(hir), linkageMap(hir), noInlineMap(hir),
           alwaysInlineMap(hir), noOptimizeMap(hir), noSanitizeThreadMap(hir),
           inlineDefinitionMap(hir),
-          mutabilityMap(hir), threadLocalMap(hir), volatileMap(hir),
+          mutabilityMap(hir), threadLocalMap(hir), enclosingFunctionMap(hir),
+          volatileMap(hir),
           returnsTwiceMap(hir), alignmentMap(hir), literalPool(std::move(lp)),
           inlineAsmPool(std::move(ap)) {}
 

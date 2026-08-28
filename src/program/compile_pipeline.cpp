@@ -27,11 +27,16 @@
 #include "link/format/coff_object_reader.hpp"  // c170: COFF .obj member reader (static-pull dispatch)
 #include "link/format/elf_object_reader.hpp"  // c165: readRelocatableObject (static-pull member parse)
 #include "link/format/macho_object_reader.hpp"  // c168: Mach-O MH_OBJECT member reader (static-pull dispatch)
+#include "core/substrate/thread_pool.hpp"      // D-OPT11-LAZY-IMPORT-EDGE: the thin stage's pool
 #include "link/linker.hpp"
 #include "link/writer.hpp"
+#include "mir/summary/lazy_import_optimize.hpp"  // D-OPT11-LAZY-IMPORT-EDGE
+#include "mir/summary/mir_summary.hpp"
+#include "mir/summary/summary_index.hpp"
 #include "lir/lir_2addr_legalize.hpp"
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_liveness.hpp"
+#include "lir/lir_peephole.hpp"
 #include "lir/lir_regalloc.hpp"
 #include "lir/lir_rewrite.hpp"
 #include "lir/lir_verifier.hpp"           // LirVerifier — the LIR tier's own invariant checks
@@ -60,6 +65,8 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <latch>   // D-OPT11-LAZY-IMPORT-EDGE: the thin stage batch join
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -105,8 +112,8 @@ effectiveLongDoubleFormat([[maybe_unused]] TargetSchema const& target,
     return format.longDoubleFormat();
 }
 
-// ── NOT HERE: `effectiveCharIsUnsigned` (D-TARGET-CHAR-SIGNEDNESS-PER-
-// PLATFORM) ──────────────────────────────────────────────────────────────
+// ── NOT HERE: `effectiveCharIsUnsigned` (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM)
+// ──────────────────────────────────────────────────────────────
 // There is deliberately no third member of the `effective*` family for
 // bare-`char` signedness. This family exists because those axes have
 // contributions from BOTH schemas that must be RECONCILED — a genuine
@@ -276,7 +283,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
 // explicit work-stacks (O(1) host-stack per level), so their OWN recursion no
 // longer drives stack depth; the worker is RETAINED (BC-1) because the parser's
 // residual paren/postfix arm can still build a deep tree (bounded by the
-// config-driven cap, c-subset = 1024) and as defense-in-depth for any not-yet-
+// config-driven cap, c = 1024) and as defense-in-depth for any not-yet-
 // proven-flat recursion these stages reach. HIR/MIR run inline on the caller's
 // thread AFTER `analyze`'s own worker has joined, so the WHOLE BUILD half runs
 // on a 64 MiB worker stack (synchronous join — no concurrency). NOTE: `analyze`
@@ -425,8 +432,9 @@ static std::optional<CuMirModule> buildCuMirImpl(
     //      to it -- that needs the whole file.
     //
     //      ★ THE PROBE ALSO ANSWERS "IS THIS THE RIGHT FORMAT AT ALL", on the
-    //      SAME unconditional argument (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-
-    //      GUARD-IS-INCIDENTAL). A library whose object format is not this
+    //      SAME unconditional argument
+    //      (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL).
+    //      A library whose object format is not this
     //      target's can never bind correctly, the fact is knowable from the
     //      first 8 bytes without reading it, and the alternative is a check
     //      that only fires when this particular TU happens to reference a
@@ -821,6 +829,12 @@ static std::optional<CuMirModule> buildCuMirImpl(
         grammar.semantics().pointerAliasing.strictAliasingOnDistinctTypes;
     mirCfg.charTypesAliasAll =
         grammar.semantics().pointerAliasing.charTypesAliasAll;
+    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the SAME shape, and threaded
+    // here for the same reason — `void`/function operand sizes are a per-LANGUAGE
+    // fact (GNU C says 1, ISO C says none) read at TWO tiers, so the schema states
+    // it once and both the semantic const-fold and HIR→MIR read that one
+    // declaration. Absent ⇒ the strict-ISO refusal, unchanged.
+    mirCfg.nonObjectTypeSizes = grammar.semantics().nonObjectTypeSizes;
     // FC6: thread the active target's aggregate-layout params + the format's data
     // model so HIR→MIR can fold `sizeof(T)` to T's byte size via the type_layout
     // engine. The target supplies the alignment rule, the format the pointer width.
@@ -832,8 +846,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
     mirCfg.aggregateLayout.bitFieldStrategy = effectiveBfStrategy;
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
-    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75 (D-TARGET-
-    // CHAR-SIGNEDNESS-PER-PLATFORM): thread the RESOLVED bare-`char` signedness
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75
+    // (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM): thread the RESOLVED bare-`char` signedness
     // so HIR→MIR picks ZExt vs SExt for the char→int promotion. The axis is
     // (processor × PLATFORM), not per-processor — the same arm64 CPU is
     // UNSIGNED under GNU/Linux and SIGNED under Darwin — and the TARGET
@@ -868,6 +882,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
             static_cast<std::uint32_t>(cc->argFprs.size());
         mirCfg.aggregateStackExhaustsRegisters =
             cc->aggregateStackExhaustsRegisters;
+        // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the stacked-arg
+        // packing rules — HIR→MIR needs them for `va_start`'s overflow base, which
+        // is the byte span of the named params that overflowed onto the incoming
+        // stack and therefore depends on how those params are packed.
+        mirCfg.stackArgPacking          = cc->stackArgPacking;
         // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the active CC's va_list layout
         // so HIR→MIR can lower va_start/va_arg (or fail loud when the CC omits it).
         mirCfg.vaListLayout             = cc->vaListLayout;
@@ -902,7 +921,13 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           // function-plus-extern SymbolId pair CST→HIR now emits
                           // for such a definition — loudly, which is the safe
                           // direction, but the feature is dead.
-                          &hir->inlineDefinitionMap);
+                          &hir->inlineDefinitionMap,
+                          // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: which
+                          // function body each block-scope `static` came out of.
+                          // Without it a `&&label` in a static initializer is refused
+                          // (loudly — a per-function label ordinal is unresolvable
+                          // without its function), and nothing else changes.
+                          &hir->enclosingFunctionMap);
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
@@ -1205,6 +1230,28 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // identified by which stage first reports.
     checkLoopCarriedSpills(legal.lir, target, "post-legalize");
 
+    // 8b. LIR PEEPHOLE (plan 22 OPT8) -- delete the register-to-register
+    //     copies the allocator left redundant. See `lir_peephole.hpp` for
+    //     why it runs HERE and not after callconv: callconv mints ZERO
+    //     additional identity copies (MEASURED 5575 at both stages over
+    //     `examples/c/**`) and its `perFuncCfi` is keyed BY `LirInstId`,
+    //     so a rebuild downstream of it would renumber every CFI row's
+    //     subject -- an unwind table that loads clean and walks into the
+    //     wrong frame.
+    auto const peepEntry = reporter.errorCount();
+    auto peeped = runLirPeephole(legal.lir, target, reporter);
+    if (!peeped.ok() || !tierClean(reporter, peepEntry)) {
+        return std::nullopt;
+    }
+    // Paired rebuild check -- the same side-structure census every other
+    // rebuilding pass is held to, plus the post-regalloc rules (this pass
+    // is the only one that DELETES, so it is the only one that can orphan
+    // a pool entry).
+    if (!verifyLirRebuild(legal.lir, peeped.lir, "lir-peephole", reporter)
+        || !verifyLirPostRegalloc(peeped.lir, target, reporter)) {
+        return std::nullopt;
+    }
+
     // 9. Calling-convention materialization (prologue/epilogue,
     //    frame_load/frame_store; `arg` virtual-op rewrite is the
     //    ML7 cycle 2 gap — anchored D-LK10-2 for caller awareness).
@@ -1233,7 +1280,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             LirFuncLocalAlignment{a.funcSymbol, a.maxLocalAlignBytes,
                                   a.perAllocaAlignBytes});
     }
-    auto cc = materializeCallingConvention(legal.lir, target, alloc, reporter,
+    auto cc = materializeCallingConvention(peeped.lir, target, alloc, reporter,
                                            sehFuncletParents,
                                            funcLocalAligns);
     if (!cc.ok() || !tierClean(reporter, ccEntry)) {
@@ -1244,7 +1291,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // same reason: callconv materializes the frame ops and the arg/return
     // moves, so it is the pass with the most opportunities to mint a register
     // operand, and after `assemble()` there is no LIR left to check.
-    if (!verifyLirRebuild(legal.lir, cc.lir, "callconv", reporter)
+    if (!verifyLirRebuild(peeped.lir, cc.lir, "callconv", reporter)
         || !verifyLirPostRegalloc(cc.lir, target, reporter)) {
         return std::nullopt;
     }
@@ -1472,6 +1519,48 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         assembled.dataItems.push_back(std::move(table));
     }
 
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: bind each block whose
+    // address a STATIC-STORAGE initializer took and that no instruction names.
+    // `static void *tbl[] = {&&L0, &&L1}; goto *tbl[i];` reads the addresses out of
+    // the table rather than materializing them, so the encoder's `BlockSymPatch`
+    // channel never fires for those blocks. THE BYTES ARE NOT OURS TO EMIT — they
+    // are the C object's own initializer, already emitted by
+    // `lowerMirGlobalsToDataItems` with one abs64 relocation per slot; only the
+    // binding is missing, which is the third producer this comment block's own
+    // header (at `bindBlockSymbol`) describes.
+    for (auto const& b : lir.blockSymbolBindings) {
+        if (b.funcIndex >= assembled.functions.size()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "a label-address block binding names function index {} but the "
+                "assembled module has {} function(s) "
+                "(D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)",
+                b.funcIndex, assembled.functions.size());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        AssembledFunction& outFn = assembled.functions[b.funcIndex];
+        // Seeded per function from what `assemble()` already bound (the same block
+        // may ALSO carry a computed-goto `lea`), so one symbol never gets two VAs.
+        std::unordered_set<std::uint32_t> alreadyBound;
+        for (auto const& bs : outFn.blockSymbols) alreadyBound.insert(bs.symbol.v);
+        if (!bindBlockSymbol(outFn, b.lirBlockV, b.symbol, alreadyBound)) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "a static initializer takes the address of block {} in fn '{}', but "
+                "the assembler published no byte offset for it — the block was "
+                "elided after its address was taken "
+                "(D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)",
+                b.lirBlockV, outFn.symbol.v);
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+    }
+
     // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): materialize each x86-style float-negate
     // sign-mask the LIR lowerer recorded. Each is a 16-byte, 16-byte-aligned
     // `.rodata` item whose low bytes carry the sign bit (bit 63 for F64 / bit 31
@@ -1592,7 +1681,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     //     init thunk. Never referenced across CUs by name; resolved intra-module by id.
     //   * (single-CU) a SymbolId with no SemanticModel record at all — `nameOf`'s
     //     `recordFor(s) ? name : ""` returns "" exactly as the old `rec == nullptr`
-    //     skip did. Byte-identical: every REAL c-subset func/global has a non-empty
+    //     skip did. Byte-identical: every REAL c func/global has a non-empty
     //     declared name, so only synthesized symbols hit the "" skip in the corpus.
     // (The pre-Cycle-25 monolith ALSO had an `empty-name && non-Local` fail-loud arm;
     // it required a symbol with a record but an empty name — a state the semantic
@@ -1917,8 +2006,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // THEN `optimizeModule`, whose verify covers all three; `synthesizeSehFunclets`
     // runs after it and is uncovered there too. Placing this verify at the same
     // point makes the two seams AGREE on what is verified instead of one silently
-    // checking less than the other (`D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-
-    // ASYMMETRY`).
+    // checking less than the other (`D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY`).
     //
     // ⚠ IT DELIBERATELY PRECEDES `synthesizeSehFunclets`, AND THAT RESIDUE IS
     // STATED, NOT HIDDEN. That pass RELAYOUTS parent blocks to make each `__try`
@@ -1969,8 +2057,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // through the FORMAT'S C mangling (`applyCMangling`: identity on ELF/PE, a
     // leading `_` on Mach-O). D-LK-OBJECT-EXTERN-SYMBOL-NAMES: this makes the
     // single-CU `ModuleSymbol.name` the SAME pre-mangled on-binary form the
-    // merge path already stores (program.cpp, via D-LK-MACHO-CROSSCU-MANGLE-
-    // MERGE-KEY / c118), so the object writers emit it VERBATIM with no per-
+    // merge path already stores (program.cpp, via D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY
+    // / c118), so the object writers emit it VERBATIM with no per-
     // path divergence and no double-mangle. Identity on ELF/PE → byte-identical
     // to the pre-fix output; adds the `_` on Mach-O only. A SymbolId with no
     // record (synthesized / out-of-range) yields "" — the LK11a symbol-table
@@ -2166,12 +2254,29 @@ struct PlatformExternRealization {
 // program: the caller must then behave exactly as it did before this oracle
 // existed. `latticeOwner` / `latticeLabel` name the throwaway lattice the
 // descriptor decode needs; nothing reads the resulting TypeIds here.
+//
+// ── `reporter` — D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED
+//
+// ★★ IT IS THE REAL REPORTER, NOT A THROWAWAY, AND THE DISTINCTION IS THE FIX.
+// Every OTHER descriptor fault this path meets belongs to a descriptor the user
+// never asked for, so it is deliberately swallowed (see the skip rationale in the
+// oracle's header). A cross-descriptor realization DISAGREEMENT is the opposite
+// kind of fault: it is not "some unrelated file is malformed", it is "the corpus
+// gives TWO answers for a name THIS BUILD IS BINDING and the tie-break is a path
+// sort". Swallowing it is exactly the silence being deleted, so it travels on the
+// build's own reporter.
+//
+// ⓘ THE CALLER MUST REFUSE — the conflict is NOT in the return value. `nullopt`
+// keeps its single meaning ("the corpus directory could not be located", benign,
+// route unbound); a conflict is signalled by `reporter.errorCount()` having
+// moved, which is the `tierClean` idiom used throughout this file.
 [[nodiscard]] std::optional<std::unordered_map<std::string, PlatformExternRealization>>
 realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
                                      TargetSchema const&          target,
                                      ObjectFormatSchema const&    format,
                                      CompilationUnitId            latticeOwner,
-                                     std::string_view             latticeLabel) {
+                                     std::string_view             latticeLabel,
+                                     DiagnosticReporter&          reporter) {
     std::unordered_map<std::string, PlatformExternRealization> out;
     if (onBinaryNames.empty()) return out;
 
@@ -2272,7 +2377,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
 
     if (!forwardRequest.empty()) {
         auto const realized = ffi::realizeShippedExternSymbols(
-            forwardRequest, lattice.interner(), lattice.registry(),
+            forwardRequest, lattice.interner(), lattice.registry(), reporter,
             format.dataModel(), std::optional<std::string_view>{target.name()},
             format.kind(), namedTypes);
         if (!realized.has_value()) return std::nullopt;   // corpus not located
@@ -2314,10 +2419,18 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
         everyName.push_back(name);
     }
     if (everyName.empty()) return out;
+    // ★ THE AGREEMENT CHECK THIS CALL RUNS IS CORPUS-WIDE, BECAUSE THE QUESTION
+    // IS. Every other caller asks about a handful of names and is held to those;
+    // this arm genuinely asks "realize EVERY name", because the reverse index it
+    // is building is keyed on realized link names and cannot be narrowed before
+    // the realization exists. So a disagreement anywhere in the corpus is a
+    // disagreement about an answer this call is computing, and it is reported.
+    // ⓘ It is reached only when the FORWARD pass left a name unbound, so the
+    // ordinary build never pays for it.
     auto const wholeCorpus = ffi::realizeShippedExternSymbols(
-        everyName, lattice.interner(), lattice.registry(), format.dataModel(),
-        std::optional<std::string_view>{target.name()}, format.kind(),
-        namedTypes);
+        everyName, lattice.interner(), lattice.registry(), reporter,
+        format.dataModel(), std::optional<std::string_view>{target.name()},
+        format.kind(), namedTypes);
     if (!wholeCorpus.has_value()) return std::nullopt;   // corpus not located
 
     // on-binary name -> the row realizing to it. A SECOND row claiming one name
@@ -2448,6 +2561,27 @@ bool isArArchiveFile(std::filesystem::path const& path) {
         if (buf[i] != kArGlobalMagic[i]) return false;
     }
     return true;
+}
+
+bool isRelocatableObjectFile(std::filesystem::path const& path,
+                             ObjectFormatSchema const&    format) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;   // unreadable -> stays dynamic (eager probe fails loud)
+
+    // A HEADER PREFIX, never the file. Every field the backends inspect lives in
+    // the first few dozen bytes (the ELF `e_type` at 16, the Mach-O `filetype`
+    // at 12, the COFF `SizeOfOptionalHeader` at 16), so 64 bytes covers all
+    // three with margin -- and this predicate runs over every path the operator
+    // named, including large dynamic libraries it will answer `false` for.
+    // ⚠ A SHORT READ IS NOT AN ERROR HERE: a file smaller than the prefix is
+    // simply passed to the backend as the short span it is, and the backends'
+    // bounds checks answer `false`. Rejecting the short read instead would make
+    // a genuinely tiny object unclassifiable.
+    std::uint8_t buf[64] = {};
+    in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
+    auto const got = static_cast<std::size_t>(in.gcount());
+    return format.looksLikeRelocatableObject(
+        std::span<std::uint8_t const>{buf, got});
 }
 
 // ── D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT ────
@@ -2644,7 +2778,7 @@ readArchiveMemberModule(std::span<std::uint8_t const> memberBytes,
 }
 
 std::optional<std::vector<AssembledModule>>
-pullStaticArchiveMembers(AssembledModule const&                 clientModule,
+pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                          std::span<std::filesystem::path const> archivePaths,
                          std::span<ResolveLibrarySpec const>    dynamicLibraries,
                          TargetSchema const&                    target,
@@ -2693,21 +2827,35 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
         }
     }
 
-    // Names already satisfied by a DEFINITION (client, then each pulled member).
-    // A worklist name that is already defined is never pulled again. Only
-    // externally-visible definitions can satisfy a cross-module reference (the
-    // same filter the c163 armap writer applies), so Local defs are excluded.
+    // Names already satisfied by a DEFINITION (every client module, then each
+    // pulled member). A worklist name that is already defined is never pulled
+    // again. Only externally-visible definitions can satisfy a cross-module
+    // reference (the same filter the c163 armap writer applies), so Local defs
+    // are excluded.
+    // ⚠ EVERY module in `clientModules`, not merely the compiled one -- see the
+    // header's plural note
+    // (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION). A
+    // pre-assembled
+    // object input that DEFINES a name must suppress the pull of an archive
+    // member defining it too, or the link merges two definitions of one symbol.
     std::unordered_set<std::string> definedNames;
-    for (auto const& ms : clientModule.symbols) {
-        if (!ms.name.empty() && isExternallyVisible(ms.binding, ms.visibility)) {
-            definedNames.insert(ms.name);
+    for (auto const& clientModule : clientModules) {
+        for (auto const& ms : clientModule.symbols) {
+            if (!ms.name.empty()
+                && isExternallyVisible(ms.binding, ms.visibility)) {
+                definedNames.insert(ms.name);
+            }
         }
     }
 
-    // Worklist: the client's unresolved extern names (the references to satisfy).
+    // Worklist: every client module's unresolved extern names (the references to
+    // satisfy). An object input's externs belong here for the same reason the
+    // compiled client's do -- they are references the archives may resolve.
     std::vector<std::string> worklist;
-    for (auto const& ext : clientModule.externImports) {
-        if (!ext.mangledName.empty()) worklist.push_back(ext.mangledName);
+    for (auto const& clientModule : clientModules) {
+        for (auto const& ext : clientModule.externImports) {
+            if (!ext.mangledName.empty()) worklist.push_back(ext.mangledName);
+        }
     }
 
     // The member format, resolved at most ONCE for the whole pull (see
@@ -2900,9 +3048,20 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
             // the member's source language — an archive member has none in this
             // process. `format.name()` is the one fact that is actually true of
             // every member being bound here.
+            // D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED:
+            // the oracle reports a cross-descriptor realization disagreement on
+            // THIS reporter and still answers the name (omitting it would route
+            // it unbound and file the config's fault against the user's program).
+            // The refusal is therefore the caller's, off the errorCount snapshot
+            // — and it must be spelled here rather than left to a later tier,
+            // because the enclosing `entry` snapshot was taken before this
+            // function ran and nothing between here and the link would compare.
+            auto const corpusEntry = reporter.errorCount();
             auto const realized = realizePlatformExternsByOnBinaryName(
                 names, target, format,
-                substrate::mintMonotonicId<CompilationUnitId>(), format.name());
+                substrate::mintMonotonicId<CompilationUnitId>(), format.name(),
+                reporter);
+            if (!tierClean(reporter, corpusEntry)) return std::nullopt;
             // nullopt ⇒ the shippedLibs directory could not be located: a
             // statement about the ENVIRONMENT, never about the user's program.
             // Every name stays unbound and the link tier judges the reference,
@@ -3003,7 +3162,58 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
     return out;
 }
 
+// D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION -- the EAGER half of
+// the link's input set. See
+// the header docblock for why "eager" is the whole distinction from an archive.
+std::optional<std::vector<AssembledModule>>
+readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
+                       TargetSchema const&                    target,
+                       ObjectFormatSchema const&              linkFormat,
+                       DiagnosticReporter&                    reporter) {
+    std::vector<AssembledModule> objects;
+    if (objectPaths.empty()) return objects;   // valid no-op: no object inputs
+    objects.reserve(objectPaths.size());
+
+    // Resolved at most ONCE for the whole input set, exactly as both archive
+    // paths do it: the member format is a function of the LINK's format and
+    // target, which no input varies, so per-file resolution would re-scan the
+    // object-format tree for every object named.
+    ArchiveMemberFormat memberFormat;
+    for (auto const& objectPath : objectPaths) {
+        std::ifstream in(objectPath, std::ios::binary);
+        if (!in) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_FileOpenFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "object input: failed to open '{}' for reading. It was named as "
+                "a link input, so it cannot be skipped -- an omitted object "
+                "would link into a smaller image that may still run "
+                "(D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION).",
+                objectPath.generic_string());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
+                                        std::istreambuf_iterator<char>()};
+
+        // THE SAME CHOKEPOINT AN ARCHIVE MEMBER TAKES. A bare object file is a
+        // member of a one-member container: the bytes are the whole file rather
+        // than a subspan, and nothing else about reading it differs. Funnelling
+        // here is what makes a newly-supported object format light up for object
+        // inputs and archive members together, by construction.
+        auto object_mod = readArchiveMemberModule(
+            std::span<std::uint8_t const>{bytes.data(), bytes.size()}, target,
+            linkFormat, memberFormat, objectPath,
+            objectPath.filename().string(), reporter);
+        if (!object_mod) return std::nullopt;   // read fail-loud already reported
+        objects.push_back(std::move(*object_mod));
+    }
+    return objects;
+}
+
 bool linkAndWriteWithStaticArchives(AssembledModule                        clientModule,
+                                    std::span<std::filesystem::path const> objectInputs,
                                     std::span<std::filesystem::path const> staticArchives,
                                     std::span<ResolveLibrarySpec const>    dynamicLibraries,
                                     TargetSchema const&                    target,
@@ -3011,24 +3221,33 @@ bool linkAndWriteWithStaticArchives(AssembledModule                        clien
                                     std::filesystem::path const&           outPath,
                                     DiagnosticReporter&                    reporter,
                                     ImageRequest const&                    request) {
-    if (staticArchives.empty()) {
+    if (objectInputs.empty() && staticArchives.empty()) {
         return linkAndWrite(std::span<AssembledModule const>{&clientModule, 1},
                             target, format, outPath, reporter, request);
     }
-    auto pulled = pullStaticArchiveMembers(clientModule, staticArchives,
-                                           dynamicLibraries, target, format,
-                                           reporter);
+
+    // EAGER FIRST -- see the header's ordering note. The objects join the seed
+    // the lazy archive pull resolves against, so an archive member an object
+    // input needs is pulled rather than silently left behind.
+    auto objects = readObjectInputModules(objectInputs, target, format, reporter);
+    if (!objects) return false;   // read fail-loud already reported
+
+    std::vector<AssembledModule> combined;
+    combined.reserve(1 + objects->size());
+    combined.push_back(std::move(clientModule));
+    for (auto& object_mod : *objects) combined.push_back(std::move(object_mod));
+
+    auto pulled = pullStaticArchiveMembers(
+        std::span<AssembledModule const>{combined.data(), combined.size()},
+        staticArchives, dynamicLibraries, target, format, reporter);
     if (!pulled) return false;   // pull fail-loud already reported
 
-    // Link the COMBINED span [client, pulled...]. >1 element triggers the c154
-    // cross-CU merge in `linker::link`, whose `mergeModules` binds each archive
-    // reference to the pulled member's definition (stripping the extern import)
-    // exactly as it resolves a sibling-CU reference. When nothing was pulled
-    // (the archives defined nothing referenced) the span is the client alone --
-    // the single-CU path, unchanged.
-    std::vector<AssembledModule> combined;
-    combined.reserve(1 + pulled->size());
-    combined.push_back(std::move(clientModule));
+    // Link the COMBINED span [client, objects..., pulled...]. >1 element triggers
+    // the c154 cross-CU merge in `linker::link`, whose `mergeModules` binds each
+    // cross-module reference to its definition (stripping the extern import)
+    // exactly as it resolves a sibling-CU reference. With no objects and nothing
+    // pulled the span is the client alone -- the single-CU path, unchanged.
+    combined.reserve(combined.size() + pulled->size());
     for (auto& member_mod : *pulled) combined.push_back(std::move(member_mod));
     return linkAndWrite(std::span<AssembledModule const>{combined.data(), combined.size()},
                         target, format, outPath, reporter, request);
@@ -3252,8 +3471,16 @@ namespace {
         writtenNames.push_back(e.libraryPath.empty() ? e.mangledName
                                                      : std::string{});
     }
+    // D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED: see the
+    // archive member's twin of this snapshot. The oracle reports a
+    // cross-descriptor realization disagreement on `reporter` and still answers
+    // the name; refusing is this caller's job, and it has to happen HERE —
+    // `compileAsmUnit` takes its `asmEntry` snapshot AFTER this function returns,
+    // so an error raised inside it would be carried past the tier gate.
+    auto const corpusEntry = reporter.errorCount();
     auto const realized = realizePlatformExternsByOnBinaryName(
-        writtenNames, target, format, cu.id(), grammar.name());
+        writtenNames, target, format, cu.id(), grammar.name(), reporter);
+    if (!tierClean(reporter, corpusEntry)) return false;
     // nullopt ⇒ the shippedLibs directory could not be located. A statement
     // about the ENVIRONMENT, never about the user's program: every name stays
     // unbound and the link tier judges the reference, exactly as before this
@@ -3558,6 +3785,205 @@ bool compileSingleUnit(CompilationUnit const&        cu,
     if (!mod) return false;
     return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
                         target, format, outPath, reporter);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE THIN-LTO PER-TU IMPORT STAGE (D-OPT11-LAZY-IMPORT-EDGE, plan 22 §0.2)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ★★ STRICTLY ADDITIVE, AND THAT IS THE WHOLE SAFETY ARGUMENT. The whole-program
+// merge and its single optimize still run afterwards, unchanged. This stage can
+// therefore only move cross-CU inlining EARLIER and into PARALLEL; it cannot
+// remove a splice the merged module would have made, and a TU it has nothing to
+// offer is left byte-identical.
+//
+// Reached only from `--lto=thin`. Every build that does not ask for it takes the
+// identical path it took before this function existed — including the
+// `PhaseTimers::read(Optimize).runs` count three driver-supply tests pin.
+bool runThinLtoImportStage(std::span<CuMirModule>  cuMirs,
+                           TargetSchema const&     target,
+                           CSymbolDecorationScheme cSymDecor,
+                           std::string_view        targetIdentity,
+                           CompileOptions const&   opts,
+                           substrate::IExecutor*   executor,
+                           DiagnosticReporter&     reporter) {
+    if (cuMirs.size() < 2) return true;   // nothing crosses a boundary
+
+    // ── (1) THE POLICY, 100% FROM THE PIPELINE DOCUMENT ─────────────────────
+    // `inlineThreshold` is the SAME cost bound the gate applies, so the
+    // candidate filter cannot admit a callee the gate refuses on size; the
+    // prefetch batch size is the Inlining fixpoint's own `max`, because that is
+    // how many levels the in-module inliner collapses in one run. Nothing here
+    // is a new invented constant, and nothing branches on a language, a target
+    // or an object format.
+    ::dss::opt::OptPipeline        loaded;
+    ::dss::opt::OptPipeline const* effective = opts.pipelineOverride;
+    if (effective == nullptr) {
+        auto const name = resolvePipelineName(opts.config);
+        if (!name.has_value()) return false;   // already refused upstream
+        auto r = ::dss::opt::loadShippedPipeline(*name);
+        if (!r.has_value()) {
+            forwardConfigDiagnostics(r.error(), reporter);
+            return false;
+        }
+        loaded    = std::move(r).value();
+        effective = &loaded;
+    }
+    ::dss::mirsum::SummaryIndexPolicy policy;
+    policy.inlineThreshold = effective->inlineThreshold;
+    policy.maxImportDepth =
+        effective->schedule.count == 0 ? 1u : effective->schedule.count;
+
+    // ── (2) PER-TU SYMBOL NAME TABLES ───────────────────────────────────────
+    //
+    // ⚠ A FLAT TABLE, BUILT SERIALLY, NOT A CALLBACK INTO `SemanticModel`. N
+    // importers run at once and each reads every OTHER TU's names; a callback
+    // would put N threads inside one CU's symbol table. The KEY is the same
+    // string `MergeCuInput::nameOf` produces — `linkNameFor` for a definition,
+    // the import row's `mangledName` for a reference — because the import and
+    // the whole-program merge must agree about what one symbol is.
+    auto nameTableFor = [&](CuMirModule const& cu) {
+        auto nameOf = [&](SymbolId sym) -> std::string {
+            if (SymbolRecord const* r = cu.model.recordFor(sym)) {
+                return dss::ffi::linkNameFor(r->name, r->asmName, cSymDecor,
+                                             r->linkName);
+            }
+            for (ExternImport const& e : cu.externImports) {
+                if (e.symbol.v == sym.v) return e.mangledName;
+            }
+            return std::string{};
+        };
+        std::vector<std::uint32_t> ids;
+        Mir const&                 m = cu.mir;
+        for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+            ids.push_back(m.funcSymbol(m.funcAt(i)).v);
+        for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i)
+            ids.push_back(m.globalSymbol(m.globalAt(i)).v);
+        for (ExternImport const& e : cu.externImports) ids.push_back(e.symbol.v);
+        for (auto const& [v, recipe] : cu.libraryShimRecipes) ids.push_back(v);
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                    MirInstId const inst = m.blockInstAt(b, ii);
+                    if (m.instOpcode(inst) == MirOpcode::GlobalAddr)
+                        ids.push_back(m.globalAddrSymbol(inst).v);
+                    else if (m.instOpcode(inst) == MirOpcode::BlockAddressExport)
+                        ids.push_back(m.blockAddressExportSymbol(inst).v);
+                }
+            }
+        }
+        std::uint32_t maxV = 0;
+        for (std::uint32_t v : ids) maxV = std::max(maxV, v);
+        std::vector<std::string> table(static_cast<std::size_t>(maxV) + 1);
+        for (std::uint32_t v : ids) {
+            if (table[v].empty()) table[v] = nameOf(SymbolId{v});
+        }
+        return table;
+    };
+
+    std::vector<std::vector<std::string>>      nameTables;
+    std::vector<::dss::mirsum::ModuleSummary>  summaries;
+    nameTables.reserve(cuMirs.size());
+    summaries.reserve(cuMirs.size());
+    for (CuMirModule const& cu : cuMirs) nameTables.push_back(nameTableFor(cu));
+    for (std::size_t i = 0; i < cuMirs.size(); ++i) {
+        ::dss::mirsum::SummaryCuInput in;
+        in.mir    = &cuMirs[i].mir;
+        in.nameOf = [&tbl = nameTables[i]](SymbolId s) {
+            return s.v < tbl.size() ? tbl[s.v] : std::string{};
+        };
+        in.externImports = cuMirs[i].externImports;
+        // ⚠ NO MODULE DIGEST, AND EMPTY IS THE HONEST VALUE. The digest exists
+        // to key a CACHED post-import object, and this stage caches nothing — it
+        // runs in one process over modules that are all in memory. Filling it
+        // with something unique-LOOKING (a CU index, a source path) would be
+        // exactly the P36 `CuBuildKey::languageName` mistake: a value that is
+        // not unique BY CONSTRUCTION wearing a key's face. A Tier-2 consumer
+        // must refuse an empty digest rather than treat it as one.
+        in.moduleDigest   = std::string{};
+        in.targetIdentity = std::string{targetIdentity};
+        summaries.push_back(::dss::mirsum::buildModuleSummary(in));
+    }
+
+    std::vector<::dss::mirsum::LazyImportCu> views;
+    views.reserve(cuMirs.size());
+    for (std::size_t i = 0; i < cuMirs.size(); ++i) {
+        views.push_back(::dss::mirsum::LazyImportCu{
+            &cuMirs[i].mir, &cuMirs[i].model.lattice().interner(),
+            &nameTables[i], cuMirs[i].externImports,
+            &cuMirs[i].libraryShimRecipes});
+    }
+
+    auto index = ::dss::mirsum::buildSummaryIndex(summaries, policy, reporter);
+    if (!index.has_value()) return false;
+    if (!::dss::mirsum::summariesDescribeModules(views, summaries, reporter))
+        return false;
+
+    // ── (3) THE PER-TU STAGE, IN PARALLEL ───────────────────────────────────
+    //
+    // Every input is const, so the jobs share nothing but the index and the
+    // summaries — both read-only. Each writes its own outcome slot and its own
+    // scratch reporter, and the scratches drain in CU-index order after the
+    // join, exactly as the two existing CU batches do.
+    std::string const srcLanguage{
+        cuMirs[0].model.lattice().registry().sourceLanguage()};
+    DiagnosticReporter::Config scratchCfg = reporter.config();
+    scratchCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
+    scratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
+    scratchCfg.dedupWindow    = 0;
+    std::vector<DiagnosticReporter> scratch;
+    scratch.reserve(cuMirs.size());
+    for (std::size_t i = 0; i < cuMirs.size(); ++i)
+        scratch.emplace_back(scratchCfg);
+
+    std::vector<::dss::mirsum::LazyImportOutcome> outcomes(cuMirs.size());
+    auto runOne = [&](std::size_t i) {
+        outcomes[i] = ::dss::mirsum::lazyImportOptimize(
+            static_cast<std::uint32_t>(i), views, summaries, *index, policy,
+            srcLanguage,
+            [&](Mir& m, TypeInterner const& in,
+                std::span<ExternImport const> ex) {
+                return optimizeModule(m, target, in, opts,
+                                      PipelineStage::Program, scratch[i], ex);
+            },
+            scratch[i]);
+    };
+    if (executor == nullptr) {
+        for (std::size_t i = 0; i < cuMirs.size(); ++i) runOne(i);
+    } else {
+        std::latch done{static_cast<std::ptrdiff_t>(cuMirs.size())};
+        for (std::size_t i = 0; i < cuMirs.size(); ++i) {
+            executor->submit([&, i] {
+                struct CountDownGuard {
+                    std::latch& latch;
+                    ~CountDownGuard() { latch.count_down(); }
+                } const guard{done};
+                runOne(i);
+            });
+        }
+        done.wait();
+    }
+
+    // ── (4) INSTALL, SERIALLY, IN CU ORDER ──────────────────────────────────
+    // Nothing is installed while a job could still be reading it: a rewritten
+    // module is also a potential import SOURCE for every other importer, which
+    // is exactly why `lazyImportOptimize` returns its module instead of writing
+    // one through a reference.
+    bool ok = true;
+    for (std::size_t i = 0; i < cuMirs.size(); ++i) {
+        copyDiagnostics(scratch[i], reporter);
+        if (!outcomes[i].ok) { ok = false; continue; }
+        if (!outcomes[i].mir.has_value()) continue;   // imported nothing
+        cuMirs[i].mir                 = std::move(*outcomes[i].mir);
+        cuMirs[i].importedHost        = std::move(outcomes[i].host);
+        cuMirs[i].importedSymbolNames = std::move(outcomes[i].symbolNames);
+        cuMirs[i].externImports       = std::move(outcomes[i].externImports);
+        cuMirs[i].libraryShimRecipes  = std::move(outcomes[i].synthRecipes);
+        cuMirs[i].usesImportedLattice = true;
+    }
+    return ok;
 }
 
 } // namespace dss

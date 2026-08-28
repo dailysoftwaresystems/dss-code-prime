@@ -617,8 +617,9 @@ if [[ "${_collapsed}" -ne 0 ]]; then _final_rc=2; fi
 # ════════════════════════════════════════════════════════════════════════════
 # RED-ON-DISABLE SELF-TEST — the guard PROVES it can fail, on every ctest run.
 #
-# ★★ EXERCISE THE FAILURE ARM, DO NOT READ IT. `D-TEST-NONFATAL-GUARD-DEGRADES-
-# TO-A-VACUOUS-PASS` and `D-CENSUS-INSTRUMENT-UNGUARDED-BY-CTEST` are both in this
+# ★★ EXERCISE THE FAILURE ARM, DO NOT READ IT.
+# `D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS`
+# and `D-CENSUS-INSTRUMENT-UNGUARDED-BY-CTEST` are both in this
 # repository's registry because an instrument nobody executed was believed. So the
 # self-test lives INSIDE the guard rather than beside it: it is impossible to run
 # this check without also proving it reds, and there is exactly ONE thing to wire

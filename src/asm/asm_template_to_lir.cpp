@@ -594,8 +594,8 @@ struct AsmInstructionLowering::Impl {
         for (std::size_t i = 0; i < cfg_.instructions.size(); ++i) {
             auto const& row = cfg_.instructions[i];
             // ⚠ BOTH COMPARISONS IN THIS LOOP ARE `spellingMatches`, AND THEY
-            // HAD TO MOVE TOGETHER (D-ASM-DIALECT-MNEMONIC-MATCH-IS-CASE-
-            // SENSITIVE). Folding the MNEMONIC while the SELECTOR stayed exact
+            // HAD TO MOVE TOGETHER (D-ASM-DIALECT-MNEMONIC-MATCH-IS-CASE-SENSITIVE).
+            // Folding the MNEMONIC while the SELECTOR stayed exact
             // would make `MRS X0, CNTVCT_EL0` fail one token later instead of
             // at the mnemonic — a different diagnostic for the same refusal,
             // which reads as progress and is none. The load-time disjointness
@@ -856,6 +856,54 @@ struct AsmInstructionLowering::Impl {
         return false;
     }
 
+    // ★★★ WHICH DECLARED WIDTH VIEW THIS PLACEHOLDER STATES, OR NULLPTR — the
+    // third alternative of the placeholder family (`%w0`, `%k[out]`), asked of
+    // the CST by RuleId exactly as the label arm is.
+    //
+    // ★★ THE ROUTING IS BY RULE AND THE **WIDTH** IS BY DECLARED LEXEME, AND THE
+    // SPLIT IS DELIBERATE. Which alternative matched is a grammar fact only the
+    // dialect can name (`assembly.templateModifierRule`); WHICH view a matched
+    // letter selects is a vocabulary fact the dialect declares in
+    // `assembly.templateModifiers`, and matching the arm's own first token
+    // against that declared table is the same shape `instructions[]` already
+    // has — a written spelling compared against DECLARED bytes, never against a
+    // byte spelled in C++. So nothing here knows that `w` means 32; it knows
+    // only that this dialect said so.
+    //
+    // ⚠ THE FIRST TOKEN IS THE SIGIL BY THE SHAPE'S OWN DEFINITION
+    // (`sequence: [templateModifierPlaceholder, asmTemplateSelector]`), and an
+    // arm whose first token is NOT a declared modifier returns nullptr, which
+    // the caller turns into a loud refusal rather than into a silent full-width
+    // decode.
+    [[nodiscard]] AssemblyConfig::AsmTemplateModifier const*
+    placeholderWidthView(NodeId placeholder) const {
+        if (!cfg_.templateModifierRule.valid()) return nullptr;
+        for (NodeId const k : visibleChildren(tree_, placeholder)) {
+            if (tree_.kind(k) != NodeKind::Internal) continue;
+            if (tree_.rule(k).v != cfg_.templateModifierRule.v) continue;
+            for (NodeId const t : visibleChildren(tree_, k)) {
+                if (tree_.kind(t) != NodeKind::Token) continue;
+                return cfg_.templateModifierByLexeme(tree_.text(t));
+            }
+            return nullptr;
+        }
+        return nullptr;
+    }
+
+    // Is this placeholder the width-view alternative at all? Separated from the
+    // lookup above so "the arm matched" and "the arm's letter is declared" stay
+    // two questions: the second failing is a CONFIG defect that must be loud,
+    // and folding it into "no view" would decode `%w0` at the operand's own
+    // type width with a clean build log.
+    [[nodiscard]] bool placeholderIsAWidthView(NodeId placeholder) const {
+        if (!cfg_.templateModifierRule.valid()) return false;
+        for (NodeId const k : visibleChildren(tree_, placeholder)) {
+            if (tree_.kind(k) != NodeKind::Internal) continue;
+            if (tree_.rule(k).v == cfg_.templateModifierRule.v) return true;
+        }
+        return false;
+    }
+
     // ★★★ A TEMPLATE PLACEHOLDER — EVERY FORM THE DIALECT'S
     // `templateOperandRule` COVERS — RESOLVED THROUGH THE HOST BY ITS WRITTEN
     // SPELLING, EXACTLY AS A REGISTER SPELLING IS.
@@ -1002,8 +1050,46 @@ struct AsmInstructionLowering::Impl {
 
         out.role = AsmOperandRole::Register;
 
+        // ★★★ A WIDTH VIEW NAMES THE **SAME OPERAND** AS THE PLAIN FORM, SO IT
+        // IS ASKED FOR UNDER THE PLAIN FORM AND STATES A WIDTH ON TOP.
+        // `%w0` and `%0` are one operand written two ways — a modifier selects a
+        // VIEW of the register, never a different register — so minting a second
+        // binding row per letter would put spellings in the host's table that
+        // the front end never minted, and the tier that VALIDATES a reference
+        // would stop agreeing with the tier that BINDS it about which forms
+        // exist. Rebuilding the plain spelling instead keeps ONE key per
+        // operand: the host's table, the semantic scan's minted inventory and
+        // every refusal that quotes it all continue to describe the same set.
+        //
+        // ⚠ THE REBUILD USES THE **DECLARED** SIGIL, NEVER A BYTE SPELLED HERE.
+        // `cfg_.templatePlaceholderLexeme` is what the loader joined from the
+        // language's `semantics.inlineAsmTemplateLexemes.templatePlaceholder`,
+        // which is the same string the letters were composed with — so the
+        // prefix stripped and the prefix restored cannot disagree.
+        AssemblyConfig::AsmTemplateModifier const* view = nullptr;
+        std::string asked = written;
+        if (placeholderIsAWidthView(node)) {
+            view = placeholderWidthView(node);
+            if (view == nullptr || cfg_.templatePlaceholderLexeme.empty()
+                || written.size() < view->lexeme.size()) {
+                sink_.fail(node,
+                     std::format("'{}' matched this dialect's width-view "
+                                 "placeholder rule "
+                                 "('assembly.templateModifierRule'), but its "
+                                 "sigil is not one of the letters declared in "
+                                 "'assembly.templateModifiers' — so there is no "
+                                 "width for it to state, and decoding it at the "
+                                 "operand's own type width would run the "
+                                 "operation at a width the template did not "
+                                 "ask for{}", written, sink_.pairSuffix()));
+                return std::nullopt;
+            }
+            asked = cfg_.templatePlaceholderLexeme
+                  + written.substr(view->lexeme.size());
+        }
+
         AsmResolvedRegister resolved;
-        switch (host_.resolveRegister(written, node, resolved)) {
+        switch (host_.resolveRegister(asked, node, resolved)) {
         case AsmRegisterLookup::Reported:
             return std::nullopt;
         case AsmRegisterLookup::NotARegister:
@@ -1025,8 +1111,128 @@ struct AsmInstructionLowering::Impl {
         case AsmRegisterLookup::Resolved:
             break;
         }
+
+        // ★★★ A MEMORY-BOUND PLACEHOLDER DENOTES THE **MEMORY AT** THE
+        // REGISTER, NOT THE REGISTER — AND IT REACHES THE EXISTING MEMORY PATH
+        // RATHER THAN A NEW ONE (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED).
+        //
+        // The host bound `%1` to a register holding the operand's ADDRESS and
+        // said so with `operandKind == membase`. Filling the memory fields here
+        // — base + scale + displacement, the same triple `8(%rdi)` and
+        // `[x29, #-8]` decode to — hands the operand to `appendMemory` and the
+        // `[Reg, MemBase, MemOffset]` encoding-variant guards both shipped
+        // targets already declare. ⇒ the DIALECT decides how it is PRINTED and
+        // the TARGET decides how it is ENCODED; this function decides neither,
+        // which is why `(%rdi)` and `[x0]` need no arm anywhere.
+        //
+        // ★ SCALE 1 AND DISPLACEMENT 0 ARE THE FORM'S DEFINITION, NOT A DEFAULT
+        // TO BE REVISITED: the constraint bound ONE address and nothing else. A
+        // dialect that lets a template write an offset around a placeholder
+        // (`[%1, #8]`) is the nested-placeholder shape `decodeOperand`'s own
+        // descent comment refuses today, and it would arrive through the roled
+        // memory decode, not through here.
+        //
+        // ⚠ EVERY FORM THIS ENGINE CANNOT SHAPE FAILS LOUD RATHER THAN DECAYING
+        // TO A REGISTER, and the register arm is the plausible wrong answer
+        // precisely because it always assembles. ✔MEASURED while the immediate
+        // form was unrealized: a `"i"(7)` operand that fell through to the
+        // register arm would emit the register HOLDING 7 where the template
+        // asked for the literal — same mnemonic, different instruction, no
+        // diagnostic. The immediate arm below now shapes that case; the arms
+        // after it still refuse.
+        // ⚠⚠ A WIDTH VIEW ON A NON-REGISTER BINDING IS **CARRIED NOWHERE**, AND
+        // THAT IS THE MEASURED ANSWER RATHER THAN A SHRUG. ✔MEASURED 2026-08-24,
+        // gcc 13.3.0 both ports, `-O0` and `-O2`, each shape compiled with and
+        // without the letter and the two outputs compared: `"m"`-bound
+        // `__asm__("str %w1, %w0" : "=m"(*p) : "r"(v))` emits `str w1, [x0]` —
+        // byte-identical to the unmodified `%0` — and x86 `"i"`-bound `%k1`
+        // emits `movl $7, %eax`, likewise identical. The reference ACCEPTS the
+        // form and the letter changes nothing, because a memory operand carries
+        // an ADDRESS and an immediate IS its value: neither states an operation
+        // width. Refusing here would refuse what both references accept, and
+        // "applying" the width would invent a fact neither has. ⇒ the two arms
+        // below are reached unchanged, and the width dies with the view — which
+        // is also SAFE by construction, since `dataRegisterWidth` excludes
+        // memory and immediate operands from the width reconciliation anyway.
+        switch (resolved.operandKind) {
+            case OperandKindFilter::Reg:
+                break;
+            case OperandKindFilter::MemBase:
+                out.role     = AsmOperandRole::Memory;
+                out.isMemory = true;
+                out.baseReg  = resolved.reg;
+                out.hasIndex = false;
+                out.scale    = 1;
+                out.disp     = 0;
+                return out;
+            // ★★★ AN IMMEDIATE-BOUND PLACEHOLDER DENOTES A **NUMBER**, AND IT
+            // REACHES THE ROLE THE DECODER ALREADY HAS
+            // (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED). `AsmOperandRole::
+            // Immediate` plus `hasValue`/`value` is exactly the shape a
+            // `.s`-written `add x0, x0, #5` decodes to, so a `"i"`-bound
+            // placeholder joins the EXISTING scalar-source path — the one that
+            // range-checks against the 32-bit LIR immediate slot and emits
+            // `LirOperand::makeImmInt32` — with no new role and no new operand
+            // kind. ⇒ the DIALECT decides how it would have been PRINTED and the
+            // TARGET decides how it is ENCODED (the `[Reg, ImmInt]` variants both
+            // shipped targets declare); this function decides neither, which is
+            // why `$7` and `7` need no arm anywhere.
+            // ⚠ THE HOST OWES THE VALUE, AND ITS ABSENCE IS A REFUSAL RATHER
+            // THAN A ZERO. `hasImmediate == false` on an immediate binding means
+            // the caller named the form and handed over nothing; encoding the
+            // default `0` would be a silent wrong answer in the one place where
+            // the operand IS its value.
+            case OperandKindFilter::ImmInt:
+                if (!resolved.hasImmediate) {
+                    sink_.fail(node,
+                         std::format("'{}' is bound to the operand form '{}', "
+                                     "but the binding carries no value — an "
+                                     "immediate operand IS its value, so there "
+                                     "is nothing here to encode{}",
+                                     written,
+                                     operandKindFilterName(
+                                         OperandKindFilter::ImmInt),
+                                     sink_.pairSuffix()));
+                    return std::nullopt;
+                }
+                out.role     = AsmOperandRole::Immediate;
+                out.hasValue = true;
+                out.value    = resolved.value;
+                out.isMemory = false;
+                out.indirect = false;
+                return out;
+            case OperandKindFilter::SymbolRef:
+            case OperandKindFilter::MemOffset:
+            case OperandKindFilter::BlockRef:
+            case OperandKindFilter::LiteralIndex:
+                sink_.fail(node,
+                     std::format("'{}' is bound to the operand form '{}', which "
+                                 "this engine does not shape — only '{}' (the "
+                                 "register itself), '{}' (the memory at the "
+                                 "register) and '{}' (a compile-time constant) "
+                                 "have a template shape{}",
+                                 written,
+                                 operandKindFilterName(resolved.operandKind),
+                                 operandKindFilterName(OperandKindFilter::Reg),
+                                 operandKindFilterName(OperandKindFilter::MemBase),
+                                 operandKindFilterName(OperandKindFilter::ImmInt),
+                                 sink_.pairSuffix()));
+                return std::nullopt;
+        }
         out.regSpelling  = std::move(written);
-        out.regWidthBits = resolved.widthBits;
+        // ★★★ THE VIEW'S WIDTH REPLACES THE OPERAND'S OWN, AND THAT ONE LINE IS
+        // THE WHOLE FEATURE. `regWidthBits` is already what `dataRegisterWidth`
+        // reconciles into the instruction's operation width and what the
+        // encoders read, so a 32-bit view reaches exactly the path a
+        // `.s`-written `mov w0, w1` proves — no new concept, no `%w` anywhere
+        // below this line. ⚠ AND THE WIDTH-HONESTY GATE STILL APPLIES: a
+        // template mixing views (`add %w0, %w1, %2`) is refused by name, which
+        // is STRICTER than gcc — ✔MEASURED 2026-08-24, gcc 13.3.0 substitutes
+        // textually and happily emits `movl %ax, %ax`, which its own assembler
+        // then rejects. Refusing at the compiler is the same answer one stage
+        // earlier.
+        out.regWidthBits = view != nullptr ? view->widthBits
+                                           : resolved.widthBits;
         out.reg          = resolved.reg;
         out.regClass     = resolved.regClass;
         return out;
@@ -1209,6 +1415,78 @@ struct AsmInstructionLowering::Impl {
         return width;
     }
 
+    // ★ THE OPERAND POSITION THIS DIALECT CALLS THE DESTINATION. The SAME rule
+    // `buildLirInst` uses, named once so the width check and the operand
+    // partition cannot drift — a role-keyed width check reading a different
+    // position from the one that becomes the destination would police the
+    // wrong register, quietly.
+    [[nodiscard]] std::size_t destinationIndex(std::size_t n) const noexcept {
+        return cfg_.operandOrder == AsmOperandOrder::DestinationLast ? n - 1 : 0;
+    }
+
+    // ★★★ THE TWO-WIDTH CHECK — D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE.
+    //
+    // A width-EXTENDING move (`movzbl`, `movswq`, `movslq`, AArch64 `sxtb`)
+    // is a SOURCE width and a DESTINATION width in one instruction, which the
+    // single-width model above cannot express: `dataRegisterWidth` requires
+    // every data register to agree and refuses `movzbl %cl, %ecx` outright.
+    //
+    // ⚠ THE FIX IS NOT TO RELAX THAT CHECK, and this is the whole design.
+    // That check is what refuses `movl %rax, %ecx` — which GNU as 2.42 also
+    // refuses (✔MEASURED: `operand type mismatch`) — so deleting or widening
+    // it globally would trade one conformance gap for its mirror image, and
+    // the mirror image is the dangerous direction (accepting a spelling no
+    // reference accepts means silently encoding SOMETHING for it). Instead a
+    // row that HAS two widths SAYS SO, and the check splits by ROLE while
+    // staying exactly as strict on each side:
+    //
+    //   * the destination-position register must be exactly `destWidth`;
+    //   * every source register must be exactly `width`.
+    //
+    // ⇒ `movzbl %cl, %ecx` is accepted and `movzbl %cl, %rcx` is refused,
+    // which is gas's own answer to both. A memory operand never participates
+    // (it carries an ADDRESS, not the operation width) — the same exclusion
+    // `dataRegisterWidth` documents, which is what lets `movzbl 8(%r15), %ecx`
+    // work.
+    //
+    // TARGET-NEUTRAL BY CONSTRUCTION: nothing here reads a mnemonic, an
+    // architecture or a format. A dialect whose extending move spells its two
+    // widths in the REGISTERS rather than the mnemonic declares the same two
+    // numbers on its own row and this function is unchanged.
+    bool checkRoleKeyedWidths(AsmDecodedInstruction const& ins,
+                              AsmInstructionSpelling const& row) {
+        std::size_t const n = ins.operands.size();
+        if (n == 0) {
+            sink_.fail(ins.node,
+                 std::format("'{}' declares a destination width of {} bits but "
+                             "was written with no operands — there is no "
+                             "destination to check it against{}",
+                             ins.mnemonic, *row.destWidth, sink_.pairSuffix()));
+            return false;
+        }
+        std::size_t const di = destinationIndex(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            auto const& op = ins.operands[i];
+            if (op.role != AsmOperandRole::Register) continue;
+            if (op.isMemory || op.indirect) continue;
+            std::uint32_t const want =
+                (i == di) ? *row.destWidth : *row.width;
+            if (op.regWidthBits == want) continue;
+            sink_.fail(op.node,
+                 std::format("'{}' widens a {}-bit value into a {}-bit "
+                             "destination, but its {} register '{}' is {} bits "
+                             "— the spelling and the register disagree, and "
+                             "encoding either width would silently be a "
+                             "different instruction{}",
+                             ins.mnemonic, *row.width, *row.destWidth,
+                             i == di ? "destination" : "source",
+                             op.regSpelling, op.regWidthBits,
+                             sink_.pairSuffix()));
+            return false;
+        }
+        return true;
+    }
+
     // The width this instruction actually operates on, reconciling what the
     // dialect DECLARED (a mnemonic suffix) with what the operands SAY (register
     // widths). Either source may be absent; when both are present they must
@@ -1216,6 +1494,19 @@ struct AsmInstructionLowering::Impl {
     std::optional<std::uint32_t> effectiveWidth(AsmDecodedInstruction const& ins,
                                                 AsmInstructionSpelling const& row,
                                                 bool consultOperands) {
+        // ★ THE TWO-WIDTH ROW SHORT-CIRCUITS, because the single-width
+        // reconciliation below is FALSE about it by construction: its
+        // registers are SUPPOSED to disagree. The operation width it returns
+        // is the SOURCE width — the number the LIR instruction carries and the
+        // target's encoding guard is keyed on; the destination width is spent
+        // entirely on the check above, because an instruction that writes a
+        // different width is a different opcode on the target side.
+        if (row.destWidth.has_value()) {
+            if (consultOperands && !checkRoleKeyedWidths(ins, row)) {
+                return std::nullopt;
+            }
+            return row.width;
+        }
         std::optional<std::uint32_t> derived;
         if (consultOperands) {
             derived = dataRegisterWidth(ins);
@@ -1744,15 +2035,17 @@ struct AsmInstructionLowering::Impl {
         // the candidate and saying the shape does not fit, instead of encoding
         // a wrong register with no diagnostic.
         if (n == 0) {
-            auto const chosen = electAmong(consumers, {}, widthBits, ins);
+            // A zero-operand instruction names no memory reference, so the
+            // memory-direction axis is `false` by construction.
+            auto const chosen =
+                electAmong(consumers, {}, widthBits, false, ins);
             if (!chosen.has_value()) return;
             if (!checkElectedWidth(*chosen, *width, ins)) return;
             builder_.addInst(chosen->opcode, InvalidLirReg, {}, payload, flags);
             host_.onInstructionEmitted();
             return;
         }
-        std::size_t const destIndex =
-            cfg_.operandOrder == AsmOperandOrder::DestinationLast ? n - 1 : 0;
+        std::size_t const destIndex = destinationIndex(n);
         AsmDecodedOperand const& dest = ins.operands[destIndex];
         if (dest.indirect) {
             sink_.fail(dest.node,
@@ -1840,12 +2133,25 @@ struct AsmInstructionLowering::Impl {
         if (dest.isMemory) {
             std::vector<LirOperand> operands = sources;
             appendMemory(dest, operands);
+            // ★ THE ONE SITE THAT SETS THE MEMORY-DIRECTION AXIS
+            // (D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE). This
+            // arm ran because the DESTINATION-position operand is the memory
+            // reference; the flag records exactly that, and it is what lets a
+            // target declare `cmp mem, reg` (39 /r) apart from the
+            // byte-identical operand list of `cmp reg, mem` (3B /r).
             auto const chosen =
-                electAmong(consumers, operands, widthBits, ins);
+                electAmong(consumers, operands, widthBits, true, ins);
             if (!chosen.has_value()) return;
             if (!checkElectedWidth(*chosen, *width, ins)) return;
+            // ⚠ THE FLAG IS STAMPED ON THE INSTRUCTION, NOT MERELY USED FOR
+            // THE ELECTION, and that is the whole soundness argument: the
+            // ENCODER re-runs the same selection post-regalloc, reading the
+            // axis off these same `flags`. An election axis the encoder could
+            // not reproduce would let the two tiers pick different variants
+            // with no diagnostic anywhere.
             builder_.addInst(chosen->opcode, InvalidLirReg, operands, payload,
-                             flags);
+                             static_cast<std::uint8_t>(
+                                 flags | kLirInstFlagMemoryIsDestination));
             host_.onInstructionEmitted();
             return;
         }
@@ -1856,7 +2162,9 @@ struct AsmInstructionLowering::Impl {
         // it.
         std::optional<asm_elect::ElectedOpcode> chosen;
         std::vector<LirOperand>                 operands;
-        Election pe = electQuiet(producers, sources, widthBits);
+        // The destination here is a REGISTER; any memory reference is a
+        // SOURCE, so the memory-direction axis is `false`.
+        Election pe = electQuiet(producers, sources, widthBits, false);
         if (!pe.ambiguousWith.empty()) {
             reportAmbiguous(ins, pe, widthBits);
             return;
@@ -1867,7 +2175,7 @@ struct AsmInstructionLowering::Impl {
             twoAddr.reserve(sources.size() + 1);
             twoAddr.push_back(LirOperand::makeReg(destReg));
             twoAddr.insert(twoAddr.end(), sources.begin(), sources.end());
-            Election t = electQuiet(producers, twoAddr, widthBits);
+            Election t = electQuiet(producers, twoAddr, widthBits, false);
             if (!t.ambiguousWith.empty()) {
                 reportAmbiguous(ins, t, widthBits);
                 return;
@@ -1930,7 +2238,7 @@ struct AsmInstructionLowering::Impl {
         Election ce =
             (anyMemory && !producers.empty())
                 ? Election{}
-                : electQuiet(consumers, destFirst, widthBits);
+                : electQuiet(consumers, destFirst, widthBits, false);
         if (!ce.ambiguousWith.empty()) {
             reportAmbiguous(ins, ce, widthBits);
             return;
@@ -1965,8 +2273,8 @@ struct AsmInstructionLowering::Impl {
     }
 
     // ★★★ M2 — LOWER A SYMBOL-NAMED SOURCE OPERAND TO ITS ADDRESS.
-    // D-ASM-SYMBOL-OPERAND-NOT-LOWERED + D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-
-    // AT-AN-OFFSET, which are ONE mechanism seen from two sides: `adr x0, msg`
+    // D-ASM-SYMBOL-OPERAND-NOT-LOWERED + D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET,
+    // which are ONE mechanism seen from two sides: `adr x0, msg`
     // and `adr x0, Lcase1` differ only in WHAT the label is, and the second
     // operand is the whole difference.
     //
@@ -2057,11 +2365,13 @@ struct AsmInstructionLowering::Impl {
     [[nodiscard]] Election
     electQuiet(std::vector<std::string> const& names,
                std::span<LirOperand const> operands,
-               std::uint8_t widthBits) const {
+               std::uint8_t widthBits,
+               bool memoryIsDestination) const {
         Election e;
         if (names.empty()) return e;
         e.opcode = asm_elect::electOpcode(target_, names, operands,
-                                          widthBits, &e.rejections,
+                                          widthBits, memoryIsDestination,
+                                          &e.rejections,
                                           &e.ambiguousWith);
         if (!e.ambiguousWith.empty()) {
             // `electOpcode` returns nullopt on ambiguity; recover the FIRST
@@ -2073,8 +2383,9 @@ struct AsmInstructionLowering::Impl {
                 if (!ordinal) continue;
                 auto const* info = target_.opcodeInfo(*ordinal);
                 if (info == nullptr) continue;
-                if (asm_elect::selectEncodingVariant(*info, operands,
-                                                     widthBits) != nullptr) {
+                if (asm_elect::selectEncodingVariant(
+                        *info, operands, widthBits,
+                        memoryIsDestination) != nullptr) {
                     e.firstWinner = name;
                     break;
                 }
@@ -2126,8 +2437,10 @@ struct AsmInstructionLowering::Impl {
     std::optional<asm_elect::ElectedOpcode>
     electAmong(std::vector<std::string> const& names,
                std::span<LirOperand const> operands, std::uint8_t widthBits,
+               bool memoryIsDestination,
                AsmDecodedInstruction const& ins) {
-        Election e = electQuiet(names, operands, widthBits);
+        Election e = electQuiet(names, operands, widthBits,
+                                memoryIsDestination);
         if (e.opcode.has_value()) return e.opcode;
         if (!e.ambiguousWith.empty()) {
             reportAmbiguous(ins, e, widthBits);
@@ -2182,7 +2495,8 @@ struct AsmInstructionLowering::Impl {
             return;
         }
         auto const elected = electAmong(
-            names, std::span<LirOperand const>{}, lirInstWidthBits(flags), ins);
+            names, std::span<LirOperand const>{}, lirInstWidthBits(flags),
+            false, ins);
         if (!elected.has_value()) return;
         if (!checkElectedWidth(*elected, lirInstWidthBits(flags), ins)) {
             return;
@@ -2222,7 +2536,7 @@ struct AsmInstructionLowering::Impl {
         std::array<LirOperand, 1> const ops{
             LirOperand::makeBlockRef(target->v)};
         auto const elected =
-            electAmong(names, ops, lirInstWidthBits(flags), ins);
+            electAmong(names, ops, lirInstWidthBits(flags), false, ins);
         if (!elected.has_value()) return;
         if (!checkElectedWidth(*elected, lirInstWidthBits(flags), ins)) {
             return;
@@ -2254,7 +2568,7 @@ struct AsmInstructionLowering::Impl {
             LirOperand::makeBlockRef(taken->v),
             LirOperand::makeBlockRef(fallthrough.v)};
         auto const elected =
-            electAmong(names, ops, lirInstWidthBits(flags), ins);
+            electAmong(names, ops, lirInstWidthBits(flags), false, ins);
         if (!elected.has_value()) return;
         if (!checkElectedWidth(*elected, lirInstWidthBits(flags), ins)) {
             return;
@@ -2304,7 +2618,7 @@ struct AsmInstructionLowering::Impl {
                              ins.mnemonic, sink_.pairSuffix()));
             return;
         }
-        auto const elected = electAmong(names, ops, widthBits, ins);
+        auto const elected = electAmong(names, ops, widthBits, false, ins);
         if (!elected.has_value()) return;
         if (!checkElectedWidth(*elected, widthBits, ins)) return;
         // ★ A CALL IS NOT A TERMINATOR — plain `addInst`. And this path runs
@@ -2378,7 +2692,7 @@ struct AsmInstructionLowering::Impl {
         // names an opcode that cannot take a register is a config defect, and
         // reporting it before the successor-set refusal keeps the two failures
         // distinguishable.
-        auto const elected = electAmong(names, ops, widthBits, ins);
+        auto const elected = electAmong(names, ops, widthBits, false, ins);
         if (!elected.has_value()) return;
         if (!checkElectedWidth(*elected, widthBits, ins)) return;
         std::vector<LirBlockId> const succs = host_.addressTakenSuccessors();
@@ -2540,9 +2854,29 @@ public:
         // register, and letting the TARGET win there would silently ignore the
         // binding the caller asked for.
         if (auto const* b = bindingFor(spelling); b != nullptr) {
-            out.reg       = b->reg;
-            out.regClass  = b->regClass;
-            out.widthBits = b->widthBits;
+            out.reg         = b->reg;
+            out.regClass    = b->regClass;
+            // The form travels with the register; `decodePlaceholder` is what
+            // turns it into the dialect's memory shape. A PHYSICAL register
+            // spelling (the fallthrough below) leaves the default `Reg` — a
+            // register written in the assembly text denotes itself.
+            out.operandKind = b->operandKind;
+            // ★ AND THE IMMEDIATE PAYLOAD TRAVELS WITH IT, for the same reason:
+            // the FORM says what `%N` denotes and, for `imm32`, the value IS the
+            // operand. A physical register spelling (the fallthrough below)
+            // leaves both at their defaults — text-written registers denote
+            // themselves and no constraint letter is in play.
+            out.hasImmediate = b->hasImmediate;
+            out.value        = b->value;
+            // ★★★ AND THE WIDTH IS **DERIVED** RATHER THAN COPIED, WHICH IS THE
+            // ONE FACT ABOUT AN OPERAND REFERENCE THE CALLER CANNOT SUPPLY. The
+            // binding says how wide the OPERAND is; the target says which VIEW
+            // of its register a bare reference names, and the two are different
+            // questions on one of the two shipped processors. Last, because it
+            // reads the form and the class copied above.
+            if (!bareOperandWidth(*b, at, out.widthBits)) {
+                return AsmRegisterLookup::Reported;
+            }
             return AsmRegisterLookup::Resolved;
         }
         auto const physical =
@@ -2732,6 +3066,87 @@ private:
             if (b.spelling == spelling) return &b;
         }
         return nullptr;
+    }
+
+    // ★★★ WHICH VIEW A **BARE** OPERAND REFERENCE NAMES — THE TARGET'S ANSWER,
+    // ASKED HERE BECAUSE THIS IS THE ONE ARM THAT KNOWS THE SPELLING DENOTED AN
+    // OPERAND (D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE).
+    //
+    // A register written in the assembly TEXT denotes itself and keeps the width
+    // its own spelling states — `%eax` is 32 bits because `eax` is, and that
+    // resolution runs in `resolvePhysicalRegister`, which this function is
+    // deliberately not on the path of. Only a spelling the CALLER bound is an
+    // operand reference, and only an operand reference has a width to derive.
+    //
+    // ★★ THE WIDTH-VIEW MODIFIER COMPOSES BY CONSTRUCTION AND NEEDS NO ARM
+    // HERE. `decodePlaceholder` rebuilds `%w0` into the plain `%0` before
+    // asking, then OVERRIDES the answer with the letter's declared width — so a
+    // modified reference passes through this derivation and discards it, which
+    // is exactly the reference behaviour: ✔MEASURED 2026-08-27 on gcc 13.3.0
+    // and clang 19.1.1, `%w0`/`%x0` render `w0`/`x0` on aarch64 and
+    // `%b0`/`%w0`/`%k0`/`%q0` render `%al`/`%ax`/`%eax`/`%rax` on x86_64, each
+    // letter giving the SAME view for a `char`, an `int` and a `long long`.
+    // The letter wins on both ports; only the letter's ABSENCE differs.
+    //
+    // ⚠ ONLY THE REGISTER FORM. A `"m"` binding carries an ADDRESS and an `"i"`
+    // binding IS its value, so neither states an operation width — ✔MEASURED
+    // 2026-08-27, gcc renders a memory-bound `%0` as `[sp, 20]` / `-12(%rbp)`
+    // on the two ports, an address with no width in it at all. Those forms keep
+    // the binding's own number, which the decoder then discards; asking the
+    // target about them would refuse a shape both references accept.
+    [[nodiscard]] bool bareOperandWidth(AsmOperandBinding const& b, NodeId at,
+                                        std::uint32_t& out) const {
+        if (b.operandKind != OperandKindFilter::Reg) {
+            out = b.widthBits;
+            return true;
+        }
+        auto const cls = static_cast<TargetRegClass>(b.regClass);
+        auto const policy = target_.asmBareOperandWidth(cls);
+        // ⚠ UNDECLARED REFUSES, AND THE PLAUSIBLE WRONG ANSWER IS WHY. Both
+        // derivations always assemble, so falling back to either one ships a
+        // template that means something else with a clean build log — the
+        // 4-byte-store-against-an-8-byte-one this row was opened for.
+        if (!policy.has_value()) {
+            sink_.fail(at, std::format(
+                "'{}' is a bare operand reference — no width-view modifier — "
+                "and target '{}' does not declare which view of a '{}' register "
+                "a bare reference names ('asmBareOperandWidths'). The two "
+                "answers a processor can give BOTH assemble: substituting the "
+                "operand's own type width where the reference meant the full "
+                "register (or the reverse) runs the instruction at a width the "
+                "template did not ask for, with nothing to see in the build "
+                "log. Declare the derivation for this class{}",
+                b.spelling, target_.name(), targetRegClassName(cls),
+                sink_.pairSuffix()));
+            return false;
+        }
+        switch (*policy) {
+            case AsmBareOperandWidth::OperandType:
+                out = b.widthBits;
+                return true;
+            case AsmBareOperandWidth::RegisterNatural: {
+                auto const natural =
+                    target_.registerClassNaturalWidthBits(cls);
+                // The class declared the policy but declares no full register
+                // to take a width from — or declares several that disagree.
+                // Either way there is no natural width to substitute, and the
+                // operand's own is the answer this policy exists to reject.
+                if (!natural.has_value()) {
+                    sink_.fail(at, std::format(
+                        "'{}' is a bare operand reference, and target '{}' "
+                        "declares that such a reference names the FULL '{}' "
+                        "register — but that class declares no full register "
+                        "with a single width to take one from (a full register "
+                        "is a 'registers' row with no 'subOf'){}",
+                        b.spelling, target_.name(),
+                        targetRegClassName(cls), sink_.pairSuffix()));
+                    return false;
+                }
+                out = *natural;
+                return true;
+            }
+        }
+        return false;
     }
 
     TargetSchema const&                target_;

@@ -5,11 +5,18 @@ name: Package
 # lives in a private/internal repository, so the logic is vendored here. Keep in
 # sync with dailysoftwaresystems/DSS.DevOps. Settings baked from the former caller
 # inputs: run-macos + run-linux-arm64 ON, artifact-paths = bin, cmake-version =
-# latest, artifact-name = dsscp — the release-tarball brand and the INTENDED CLI
-# command name. The repo/project stays dss-code-prime, and the binary INSIDE the
-# tarball is still built as dss-code-prime until the CMake-target rename lands, so
-# the tarball and the executable names are briefly out of sync by design (project
-# name != command name, like Ziglang/`zig`).
+# latest, artifact-name = dsscp — the release-tarball brand AND the CLI command
+# name, which as of P32 (2026-08-24) are the same string: the CMake targets, the
+# executable, the shared library and the config tree under share/dsscp/ all carry it.
+# The repo/project deliberately stays dss-code-prime, so project name != command name
+# by design, like Ziglang/`zig`.
+#
+# The tarball name and the executable name were out of sync until that rename landed,
+# and the consequence is kept rather than deleted because it is evidence for a rule:
+# the .deb/.rpm step in publish-packages.yml already chmod'd bin/dsscp, so no Debian
+# or RPM package could be produced at all -- and nothing saw it, because that step
+# runs only on a v* tag and no tag had been pushed. A half-migration behind a green
+# suite (D-PKG-PUBLISH-PATH-NAMES-THE-POST-RENAME-BINARY).
 #
 # Flow (immutable-release-safe): create a DRAFT release, build the shippable
 # artifact on each platform leg in parallel and attach it to the draft, then
@@ -258,7 +265,9 @@ jobs:
         timeout-minutes: 15
 
       - name: Build
-        run: cmake --build "${{ 'build' }}" --parallel
+        # OPERATOR RULING 2026-08-25: build + tests + run always at 6 cpus.
+        # A BARE `--parallel` means "all cores"; the number is required.
+        run: cmake --build "${{ 'build' }}" --parallel 6
         timeout-minutes: 90
 
       # ── Stage the INSTALL SET, and tar THAT ───────────────────────────────

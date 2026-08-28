@@ -68,6 +68,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
+#include "core/types/line_map.hpp"              // LineMap / LineMapSegment (the coordinate map, shared with the CU + src/lsp/)
 #include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
@@ -95,45 +96,13 @@ namespace dss {
 // collide with a real cap.
 inline constexpr std::uint32_t kPragmaPackAmbiguous = 0xFFFFFFFFu;
 
-// One contiguous run of the synthesized buffer that came VERBATIM from a
-// single origin buffer. The synth buffer is a concatenation of such runs
-// (header text spliced in where a quote-include was), so a binary search on
-// `synthStart` resolves any synth offset to its origin.
-struct DSS_EXPORT LineMapSegment {
-    ByteOffset                    synthStart = 0;   // inclusive, synth coords
-    ByteOffset                    synthEnd   = 0;   // exclusive, synth coords
-    std::shared_ptr<SourceBuffer> origin;           // the real file this run came from
-    ByteOffset                    originStart = 0;   // origin offset of synthStart
-};
-
-// synth-offset -> (origin buffer, origin offset). Built by the synth-buffer
-// builder; consumed to remap diagnostics off the synth buffer back onto the
-// real header/main file. A run is a VERBATIM copy (offsets advance 1:1 within
-// a segment), so the origin offset of a synth offset `o` in segment `s` is
-// `s.originStart + (o - s.synthStart)`. Offsets that land in SYNTHESIZED
-// glue (e.g. an injected newline between concatenated files) map to the
-// nearest preceding segment's origin -- good enough for attribution and never
-// out of bounds.
-class DSS_EXPORT LineMap {
-public:
-    void addSegment(LineMapSegment seg) { segments_.push_back(std::move(seg)); }
-
-    // Resolve a synth offset. Returns {origin buffer (may be null if the map
-    // is empty), origin offset}. Never aborts.
-    struct Resolved {
-        SourceBuffer const* origin = nullptr;
-        ByteOffset          offset = 0;
-    };
-    [[nodiscard]] Resolved resolve(ByteOffset synthOffset) const noexcept;
-
-    [[nodiscard]] std::span<LineMapSegment const> segments() const noexcept {
-        return segments_;
-    }
-    [[nodiscard]] bool empty() const noexcept { return segments_.empty(); }
-
-private:
-    std::vector<LineMapSegment> segments_;
-};
+// D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES:
+// `LineMapSegment` and `LineMap` MOVED to `core/types/line_map.hpp` (pure
+// move, no logic change). They are the coordinate map BETWEEN tiers, so
+// they cannot live inside the surface of one of them: `CompilationUnit`
+// carries the map and `src/lsp/` reads it, and neither should have to pull
+// the whole preprocessor to speak about a byte offset. Both operations are
+// inline there, so this stayed a header-only dependency with no link edge.
 
 // The product of a preprocess run.
 struct DSS_EXPORT PreprocessResult {
@@ -431,6 +400,47 @@ struct DSS_EXPORT TranslationTimestamp {
     std::string time;   // "hh:mm:ss",    unquoted; empty iff the clock failed
 };
 [[nodiscard]] DSS_EXPORT TranslationTimestamp translationTimestamp();
+
+// How much work the per-FILE pre-scan actually did.
+//
+// ★★★ THIS EXISTS BECAUSE THE PROPERTY
+// [[D-PERF-PP-EVERY-INCLUDE-RE-READS-AND-RE-TOKENIZES-THE-SAME-HEADER]] PINS IS
+// A COUNT, AND IT WAS BEING PINNED WITH A CLOCK. The defect was that the read +
+// continuation-splice + tokenize of a header was paid per OCCURRENCE of an
+// `#include` naming it rather than once per FILE. That is a statement about HOW
+// MANY TIMES the work happened — so the honest instrument is a counter, not a
+// stopwatch. ✔MEASURED on CI run 33156833090: the ratio pin that stood in for
+// this counter read x1.048 against a bound of 0.85 on `linux-gcc-release` and
+// PASSED on `linux-arm64-gcc-release` in the same run at the same commit, which
+// is a property of the runner rather than of the compiler
+// [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]].
+//
+// ⚠ COUNTERS, NOT A CACHE POLICY SURFACE. There is nothing to configure here
+// and nothing a caller may switch off: the memo is a memo of a pure function,
+// so a hit and a miss cannot disagree. These are OBSERVATIONS of it, in the
+// shape `substrate::PhaseTimers` already established for phase accounting —
+// static accessors, process-wide, plus a `reset()` that exists for test
+// isolation and that the driver never calls.
+//
+// ⓘ `builds` counts WORK DONE, not misses: two threads racing on a cold header
+// both build it and the first to publish wins, so `builds` may exceed the
+// number of distinct files by the number of lost races. It is exact on the one
+// thread a test uses. A request whose file cannot be READ counts as neither —
+// nothing was memoized and nothing was served.
+class DSS_EXPORT PreScanMemoCounters {
+public:
+    struct Row {
+        // Files read, continuation-spliced and tokenized by the pre-scan.
+        std::uint64_t builds = 0;
+        // Pre-scan requests answered from the memo without doing that work.
+        std::uint64_t hits = 0;
+    };
+
+    [[nodiscard]] static Row read() noexcept;
+
+    // Zero both counters. Test isolation only — the driver never resets.
+    static void reset() noexcept;
+};
 
 // Run the preprocessor over `mainSource` under `schema`. Precondition:
 // `schema->preprocess().enabled` is true (the caller gates on it; calling

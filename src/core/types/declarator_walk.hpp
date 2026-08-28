@@ -281,4 +281,129 @@ inline void collectDeclarators(Tree const& tree, NodeId node,
     return n;
 }
 
+// ★★ D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED — THE UPWARD
+//    HALF OF THE DECLARATOR WALK.
+//
+// Everything above answers "what does this declarator DECLARE" by descending from a
+// carrier to the name. These two answer the complementary question — "what does this
+// declarator declare the name TO BE" — by walking back OUT from the name.
+//
+// C 6.7.6p1 builds a declared type from the identifier outward:
+//     declarator       := pointerLayer* directDeclarator
+//     directDeclarator := (name | '(' declarator ')') suffix*
+// so the derivations reach the name in a fixed order: the suffixes on the name's OWN
+// direct declarator first (left to right, so the LEFTMOST is innermost), then the
+// pointer layers of the declarator enclosing it, and only then the SAME two questions
+// one parenthesis level further out. Whatever the walk reaches FIRST is what the name
+// is — a function suffix ⇒ a function, a pointer layer ⇒ a pointer, an array suffix
+// ⇒ an array.
+//
+// ★ THE PARENTHESES ARE THE WHOLE POINT AND THEY ARE NOT DECORATION. C 6.7.6 permits
+// redundant parentheses around any declarator, and `int (foo)(int x) { … }` — the
+// standard glibc/musl idiom for DEFINING a name that is also a function-like macro —
+// is exactly that. Both consumers of this question used to look only at the name's
+// OWN direct declarator, which sees a bare `foo` with no suffix and answers "not a
+// function". ✔MEASURED at the pre-fix HEAD against gcc 13.3.0 and clang 18.1.3, which
+// both compile AND run every one of these, DSS produced FOUR symptoms from that ONE
+// assumption: the definition was refused (S0018 "must be a function declarator"); the
+// parenthesized PROTOTYPE never became one, so it bound as an object and its
+// definition collided (S0002); the definition's own PARAMETERS were scoped as a
+// function pointer's, so the body could not see them (S0001); and the CST→HIR param
+// harvest found none, so the lowered Function's arity disagreed with its own
+// signature (H0009 "Function param count 0 mismatches FnSig param count 1").
+//
+// ★ WHICH IS WHY IT LIVES HERE AND NOT IN ONE TIER. Those four sites span the
+// semantic analyzer and the HIR lowering. Written twice, they drift — and the drift
+// is not loud: three of the four symptoms above are a tier answering a shape question
+// slightly differently from its neighbour. This header already exists to stop exactly
+// that (see its opening note on the name-extraction walk).
+//
+// ⚠ Tree-ONLY, deliberately, where everything above is a template over the node-view
+// adapter. This walk ascends, and the parser's mid-parse `TreeBuilder` adapter has no
+// parent link to ascend through — a node is not yet attached to its frame. Both real
+// consumers hold a frozen `Tree`. Making it a template would mean inventing a
+// `parent()` the parser cannot honestly implement.
+
+// The INNERMOST TYPE DERIVATION applied to `nameNode` — the single grammar node that
+// decides what kind of thing the name is (a function suffix / a pointer layer / an
+// array suffix), or an invalid NodeId when the name carries NO derivation at all
+// (`int x;`, whose type IS the declaration head's) or is not a declarator name.
+[[nodiscard]] inline NodeId
+innermostNameDerivation(Tree const& tree, NodeId nameNode,
+                        DeclaratorConfig const& dc) {
+    TreeDeclaratorView const v{tree};
+    NodeId direct = tree.parent(nameNode);
+    if (!direct.valid() || v.kind(direct) != NodeKind::Internal
+        || v.rule(direct) != dc.directRule) {
+        return {};
+    }
+    // The child of `direct` the walk ASCENDED FROM — the name token at the first
+    // level, the parenthesis group at every level above it. It is the BASE of the
+    // direct declarator, never one of its suffixes.
+    NodeId base = nameNode;
+    for (std::size_t step = 0;
+         step < declarator_walk_detail::kMaxDeclaratorDepth; ++step) {
+        // (1) A SUFFIX on this direct declarator; leftmost = innermost. Declarator
+        //     DECORATIONS (attribute runs, asm labels) annotate a declarator, they
+        //     never derive a type from it, so they are skipped through the shared
+        //     predicate rather than a second local list.
+        for (NodeId c : v.children(direct)) {
+            if (!v.isVisible(c) || c.v == base.v) continue;
+            if (v.kind(c) != NodeKind::Internal) continue;
+            if (isDeclaratorDecorationRule(dc, v.rule(c))) continue;
+            return c;
+        }
+        // (2) No suffix ⇒ the enclosing declarator's POINTER LAYERS come next. This
+        //     is what keeps `int (*fp)(int)` a POINTER after the walk learned to see
+        //     through parentheses — the layer reaches the name before the suffix does.
+        NodeId const encl = tree.parent(direct);
+        if (!encl.valid() || v.kind(encl) != NodeKind::Internal
+            || v.rule(encl) != dc.declaratorRule) {
+            return {};
+        }
+        for (NodeId c : v.children(encl)) {
+            if (!v.isVisible(c) || c.v == direct.v) continue;
+            if (v.kind(c) != NodeKind::Internal) continue;
+            if (isDeclaratorDecorationRule(dc, v.rule(c))) continue;
+            return c;
+        }
+        // (3) Neither ⇒ step OUT one redundant-parenthesis level and ask the very
+        //     same two questions of the direct declarator enclosing the group.
+        //     Anything else above us (an init-declarator, the declaration row) means
+        //     the name reached the top undecorated — its type IS the head's.
+        NodeId const group = tree.parent(encl);
+        if (!group.valid() || v.kind(group) != NodeKind::Internal
+            || v.rule(group) != dc.groupRule) {
+            return {};
+        }
+        NodeId const outer = tree.parent(group);
+        if (!outer.valid() || v.kind(outer) != NodeKind::Internal
+            || v.rule(outer) != dc.directRule) {
+            return {};
+        }
+        base   = group;
+        direct = outer;
+    }
+    return {};   // depth cap — corrupted/cyclic node graph, a bounded miss
+}
+
+// The FUNCTION SUFFIX that declares `nameNode` a function — i.e. its innermost
+// derivation, when that derivation is a function suffix — or an invalid NodeId when
+// the name is not a function declarator's.
+//
+// ★ IT RETURNS THE NODE, NOT A BOOL, because the two consumers need two different
+// things from the same answer and neither can be derived from the other cheaply:
+// the semantic tier asks whether there IS one (the prototype / definition-declarator
+// constraint, and — by NODE IDENTITY against a given suffix — whether a parameter
+// list is the definition's OWN or a prototype scope's), while the CST→HIR lowering
+// needs the node itself to harvest the parameters from. A bool would force the
+// lowering to re-derive the shape, which is how the two tiers came to disagree.
+[[nodiscard]] inline NodeId
+declaratorFnSuffixNode(Tree const& tree, NodeId nameNode,
+                       DeclaratorConfig const& dc) {
+    NodeId const der = innermostNameDerivation(tree, nameNode, dc);
+    if (!der.valid() || tree.kind(der) != NodeKind::Internal) return {};
+    return isFnSuffixRule(tree.rule(der), dc) ? der : NodeId{};
+}
+
 } // namespace dss

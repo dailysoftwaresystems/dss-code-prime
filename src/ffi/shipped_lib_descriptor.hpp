@@ -10,6 +10,7 @@
 #include "core/types/preprocess_config.hpp"  // PredefinedMacroDef / ShippedSurfaceClaim (the `impliedSurface` satisfaction half)
 #include "core/types/strong_ids.hpp"   // TypeId
 
+#include <cstddef>     // std::size_t (ShippedDescriptorCacheStats)
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -17,6 +18,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -28,7 +30,7 @@
 // are NOT per-language source files; they are a NEUTRAL JSON descriptor read
 // by this UNIVERSAL reader. The user-facing UX is unchanged and C-faithful —
 // `#include <stdio.h>` still works — but the on-disk shipped artifact is a
-// language-agnostic schema, not a c-subset `.h`.
+// language-agnostic schema, not a c `.h`.
 //
 // Shape (`stdio.json`):
 //   { "header": "stdio.h", "standard": "c89",
@@ -97,6 +99,14 @@ namespace dss {
 class DiagnosticReporter;
 class TypeInterner;
 class TypeRegistry;
+// ⚠ DECLARED, NOT INCLUDED — see `diagnosticCodeForShippedSourceLookup` below.
+// `parse_diagnostic.hpp` is large and this header is widely included; a scoped enum
+// with a declared underlying type is exactly the forward-declarable case, so the
+// dependency stays in the `.cpp` where it already was.
+// ★ It belongs HERE, in `dss`, beside the other diagnostics forward declarations —
+// declaring it inside `dss::ffi` mints a SECOND, distinct type and makes every
+// existing `DiagnosticCode` reference in the ffi tree ambiguous.
+enum class DiagnosticCode : std::uint16_t;
 
 namespace ffi {
 
@@ -354,6 +364,51 @@ struct DSS_EXPORT ShippedConstant {
     std::string  name;
     std::int64_t value = 0;
     TypeId       type;     // an integer scalar kind; decoded via parseTypeFromText
+    // ── D-FFI-DESCRIPTOR-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR ────────────
+    // WHICH SURFACE OF THE TRANSLATION UNIT THIS CONSTANT APPEARS ON, and it is
+    // the ONE field both seams read: the PREPROCESSOR splice (a synthetic
+    // `#define`, so `#if`/`#ifdef`/`defined()` see the name) and the SEMANTIC
+    // injection (a named constant folded at HIR). Before this field existed the
+    // reach question had NO owner: every `constants` entry reached the semantic
+    // seam only, so `#if UINT_MAX > INT_MAX` read UINT_MAX as the C 6.10.1p4
+    // "unknown identifier = 0" and took the OPPOSITE branch from gcc AND clang,
+    // at rc=0 with no diagnostic — a different program, silently.
+    //
+    // DEFAULT `true`, and the default is the surface's OWN documented contract:
+    // `limits.json` states that each entry is "each object-like `#define` that
+    // IS a compile-time constant … expressed as a NEUTRAL typed named constant".
+    // An object-like `#define` IS preprocessor-visible; that is what makes it a
+    // `#define` rather than an enumerator.
+    //
+    // ⚠ THE `false` ROWS ARE MEASURED, NOT GUESSED. The surface was ALSO being
+    // used for names that are ENUMERATION CONSTANTS in C, for which `defined(X)`
+    // is FALSE in both references — making those visible would be an INVENTED
+    // extension (above the gcc ∪ clang ∪ ISO union), which the bar forbids just
+    // as firmly as falling below it. A `#include <h>` + `#if defined(NAME)` +
+    // `nm` sweep over all 218 shipped `constants`/`floatConstants` names split
+    // them 83 MACRO/MACRO · 36 NOT/NOT · 99 unclassifiable (the pe-only
+    // `windows.h`/`io.h` names, which neither reference has a header for). The
+    // `false` rows are exactly the ISO-mandated enumerations that sweep found —
+    // `memory_order_*`, `thrd_*`, `mtx_*`, `PTHREAD_MUTEX_RECURSIVE` — plus the
+    // Win32 `GET_FILEEX_INFO_LEVELS` enumerator `GetFileExInfoStandard`, which
+    // is INFERRED from the Win32 SDK rather than measured, and is labelled that
+    // way at its row.
+    bool preprocessorVisible = true;
+};
+
+// One `constants` row PROJECTED into the PREPROCESSOR's vocabulary — the
+// interner-free view `readShippedLibConstants` returns. `TypeId` cannot cross
+// this boundary (it is per-CompilationUnit and the preprocessor has no
+// interner), so the two facts a phase-4 spelling actually needs travel as DATA:
+// the value's bit pattern and the declared type's signedness + width. Rendering
+// them back into a source-language literal is the LANGUAGE tier's job (the
+// preprocessor splice, driven by `semantics.integerLiteralTyping`), never this
+// one — `src/ffi` stays free of any language's literal spelling.
+struct DSS_EXPORT ShippedPpConstant {
+    std::string  name;
+    std::int64_t value      = 0;      // bit pattern, exactly as ShippedConstant::value
+    bool         isUnsigned = false;  // the declared integer scalar's signedness
+    unsigned     width      = 0;      // the declared integer scalar's width, in bits
 };
 
 // One decoded named FLOAT CONSTANT — the float-valued sibling of `ShippedConstant`
@@ -439,7 +494,7 @@ struct DSS_EXPORT ShippedField {
 // One decoded STRUCT — the neutral form of a header's `struct tag { … };` with
 // NAMED fields (e.g. `struct timeval { i64 tv_sec; i64 tv_usec; }`). The semantic
 // phase interns the struct type and injects the tag into the TAG namespace plus a
-// field scope, so c-subset `struct tag v; v.field` resolves AND lays out at the
+// field scope, so c `struct tag v; v.field` resolves AND lays out at the
 // ABI offsets the layout engine DERIVES from the field sizes (the descriptor
 // declares names + types only — never explicit offsets). `typeId` is the interned
 // struct type (its identity is the name + positional field types).
@@ -569,7 +624,7 @@ struct DSS_EXPORT ShippedLibDescriptor {
 // distinction is worth keeping because it decides the next case. `pe/` organizes:
 // the realization KEY owns which format uses a body, the PATH owns which file,
 // and nothing is derived from the segment — a disagreement would be confusing,
-// not wrong. A LANGUAGE segment (`c-subset/`) would be semantic: it would compete
+// not wrong. A LANGUAGE segment (`c/`) would be semantic: it would compete
 // with the extension for HOW the file is compiled, and the moment it won, a
 // `foo.c` under `toy/` would compile as toy. It is therefore absent.
 // ⚠ The one case that would genuinely need a language axis is real and is NOT
@@ -586,11 +641,63 @@ struct DSS_EXPORT ShippedLibDescriptor {
 [[nodiscard]] DSS_EXPORT std::optional<std::filesystem::path>
 findShippedConfigRootDir();
 
-// Resolve a descriptor's config-root-relative `realization.<fmt>.source` to an
-// absolute path. nullopt ⇒ discovery failed OR no readable file is there — the
-// two are one answer to the caller, which is R1's whole question.
-[[nodiscard]] DSS_EXPORT std::optional<std::filesystem::path>
-resolveShippedSourcePath(std::string_view configRelativePath);
+// Why a shipped-source path did not resolve.
+//
+// ★★ THESE USED TO BE ONE `nullopt`, AND THE COLLAPSE WAS A MISATTRIBUTION WITH
+// TEETH. The predecessor returned `optional<path>` and its docblock called the
+// collapse deliberate — "discovery failed OR no readable file is there — the two are
+// one answer to the caller". It was really THREE answers: `is_regular_file(p, ec)`
+// reports false both when nothing is there AND when the query itself failed, and the
+// `ec` that distinguishes them was discarded unread. Every caller then stated ABSENCE
+// as fact.
+// ✔MEASURED 2026-08-25 on the Windows gate under concurrent load: two entries failed
+// naming `runtime/platform/src/unistd.c` and `dirent.c` as files that are not there,
+// while both were present, regular and readable seconds later. A user with antivirus,
+// a network share, a locked file or a concurrent writer gets sent hunting for a file
+// sitting exactly where it belongs.
+// ★ The fix is the TYPE, not the message: a caller cannot report a difference its
+// return value cannot carry.
+enum class ShippedSourceResolution : std::uint8_t {
+    Resolved,      // an absolute path to a regular file
+    NoConfigRoot,  // `src/dss-config/` was not discovered — about the ENVIRONMENT
+    NotPresent,    // the root resolved and nothing exists at that path
+    NotAFile,      // something exists there, but it is not a regular file
+    QueryFailed,   // the filesystem could not answer — carries the `error_code`
+};
+
+struct ShippedSourceLookup {
+    ShippedSourceResolution status{ShippedSourceResolution::NotPresent};
+    std::filesystem::path   path{};   // the resolved absolute path when known
+    std::error_code         error{};  // set iff `status == QueryFailed`
+
+    [[nodiscard]] bool resolved() const noexcept {
+        return status == ShippedSourceResolution::Resolved;
+    }
+};
+
+// Resolve a descriptor's config-root-relative `realization.<fmt>.source`.
+[[nodiscard]] DSS_EXPORT ShippedSourceLookup
+resolveShippedSource(std::string_view configRelativePath);
+
+// One clause naming what ACTUALLY happened, for a diagnostic to embed. Never claims
+// absence unless absence was established.
+[[nodiscard]] DSS_EXPORT std::string
+describeShippedSourceLookup(ShippedSourceLookup const& lookup,
+                            std::string_view           configRelativePath);
+
+// The diagnostic CODE this outcome deserves.
+//
+// ★ A CODE IS A CLAIM IN THE SAME WAY ITS MESSAGE IS, which is why this is a named
+// function and not a ternary at the emit site: anything that filters, counts or
+// suppresses `D_FileNotFound` was silently counting I/O failures as missing files, and
+// no amount of message rewording reaches that. Naming it also makes it PINNABLE —
+// `check-diagnostic-codes` refuses a code no compiled test names, and it is right to.
+//
+// ⚠ Forward-declared rather than including `parse_diagnostic.hpp`: that header is
+// large and this one is widely included. A scoped enum with a declared underlying type
+// is precisely the forward-declarable case, so the dependency stays in the `.cpp`.
+[[nodiscard]] DSS_EXPORT DiagnosticCode
+diagnosticCodeForShippedSourceLookup(ShippedSourceLookup const& lookup);
 
 // The interner-free FAST reader the DRIVER uses: every config-root-relative
 // shipped SOURCE path the descriptor at `path` realizes on `formatName`, from the
@@ -815,6 +922,33 @@ validateShippedSurfaceRequirements(
 // `vfprintf(..., va_list)`) while staying arch-NEUTRAL — the alias resolves
 // to the SAME TypeId a user-written prototype gets. Content-blind: the reader
 // neither knows nor cares what the names mean; empty = pre-c82 behavior.
+// ── THE DESCRIPTOR PARSE CACHE'S OWN VACUITY WITNESS ────────────────────────
+//
+// Every reader below goes through ONE thread-local parse cache
+// (`cachedDescriptorJson`). It is CONTENT-VALIDATED: the cached document is
+// served only when the file's bytes are byte-identical to the bytes it was
+// parsed from, so a descriptor rewritten IN PLACE is re-parsed rather than
+// answered from the old document — see the long note at that function for the
+// LSP session this defect was live in and for the three measurements that ruled
+// out an `mtime`/`size` stamp.
+//
+// ★ THE COUNTERS EXIST BECAUSE BOTH OF THE CACHE'S FAILURE MODES ARE SILENT AND
+// LOOK ALIKE FROM OUTSIDE. A cache that serves a stale document and a cache that
+// works are both "the read succeeded"; a cache that has been quietly reduced to
+// re-parsing every time is ALSO "the read succeeded", just slower — and no
+// assertion on a returned descriptor can tell any of the three apart. These are
+// the only observable difference, so the regression pin asserts on them: the
+// same precedent as `ShippedTypeConsistency::duplicateRealizationsCompared()`.
+//
+// THREAD-LOCAL, like the cache — the numbers are the CALLING thread's.
+struct DSS_EXPORT ShippedDescriptorCacheStats {
+    std::size_t lookups         = 0;  // calls that reached the cache
+    std::size_t parses          = 0;  // documents actually `json::parse`d
+    std::size_t revalidatedHits = 0;  // served from cache after a byte-compare
+    std::size_t staleEvictions  = 0;  // dropped because the file's bytes changed
+};
+[[nodiscard]] DSS_EXPORT ShippedDescriptorCacheStats shippedDescriptorCacheStats();
+
 [[nodiscard]] DSS_EXPORT std::optional<ShippedLibDescriptor>
 readShippedLibDescriptor(std::filesystem::path const&    path,
                          TypeInterner&                   interner,
@@ -849,6 +983,49 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
 readShippedLibMacros(std::filesystem::path const&    path,
                      DiagnosticReporter&             reporter,
                      std::optional<ObjectFormatKind> activeFormat = std::nullopt);
+
+// Read the PREPROCESSOR-VISIBLE half of the `constants` surface at `path`,
+// WITHOUT a TypeInterner — the constants sibling of `readShippedLibMacros`, and
+// the second seam of the ONE owner `ShippedConstant::preprocessorVisible`
+// names. (D-FFI-DESCRIPTOR-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR.)
+//
+// ★ IT SHARES THE `decodeShippedConstants` CHOKEPOINT WITH THE SEMANTIC READ,
+// the same way `readShippedLibMacros`/`readShippedLibAvailability`/
+// `readShippedLibIncludes` share theirs — ONE decode, so the two seams cannot
+// validate differently, cannot select a different per-target variant, and
+// cannot drift on the `preprocessorVisible` field that decides which of them a
+// row reaches. A `TypeInterner` is still needed for each row's hir-text `type`,
+// so this read owns a PRIVATE function-local `TypeLattice`; the TypeIds never
+// escape, only the projected {value, signedness, width} triple does.
+//
+// ⚠ IT IS NOT A CALL TO `readShippedLibDescriptor`, AND THE DIFFERENCE IS
+// MEASURED. The first cut did exactly that — attractive, because the decode is
+// then literally shared — and it silently dropped EVERY `stdio.json` constant:
+// the full read also decodes `symbols`, whose `FILE*`/`size_t` operands resolve
+// through cross-descriptor `namedTypes` bindings only the semantic tier holds,
+// so with an empty binding set the whole read failed and `EOF`/`SEEK_SET`/
+// `FILENAME_MAX` never reached the preprocessor. That is this row's own defect,
+// reintroduced by its own fix; the `EOF == -1` cell of
+// `examples/c/c_pp_shipped_constants` is what caught it.
+//
+// Returns the `preprocessorVisible` rows only, already variant-selected for
+// (`activeTarget`, `activeFormat`) exactly as the semantic read selects them —
+// so the two seams cannot disagree on a per-target VALUE either. EMPTY when the
+// descriptor declares no `constants` (or none that are visible). std::nullopt
+// on any read the full read would reject.
+//
+// NO STRICTER than the full read, like every sibling: no `header` provenance
+// gate and no other-surface validation, so a descriptor that the semantic tier
+// would accept always yields its constants here. The one production caller
+// (`SynthBuilder::build`) passes a THROWAWAY reporter and discards the
+// diagnostics, exactly as it already does for `readShippedLibMacros`, so a
+// malformed `constants` surface is reported ONCE — by the import-resolver /
+// semantic tier that owns the positioned message.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<ShippedPpConstant>>
+readShippedLibConstants(std::filesystem::path const&    path,
+                        DiagnosticReporter&             reporter,
+                        std::optional<std::string_view> activeTarget = std::nullopt,
+                        std::optional<ObjectFormatKind> activeFormat = std::nullopt);
 
 // Read ONLY the `availableObjectFormats` set from the descriptor at `path`,
 // WITHOUT a TypeInterner — the FRONT-END per-target availability gate (the
@@ -1212,11 +1389,38 @@ struct DSS_EXPORT ShippedSymbolRealization {
 // malformedness must not become this program's build failure. Descriptor health is
 // owned by the tier that reads it for real (the `#include` path) plus the
 // corpus-wide decode test — the `shippedHeaderAvailableForFormat` precedent.
+//
+// ── `reporter` — D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED
+//
+// ★★★ IT IS REQUIRED, NOT OPTIONAL, AND IT IS THE WHOLE REASON THIS PARAMETER
+// EXISTS. Two descriptors may declare ONE name, both LIVE on this format, with
+// DIFFERENT realizations; this function then picks the first in the corpus
+// index's relPath sort — a DIFFERENT order from the `#include` path's include
+// closure — so one program could bind two different C runtimes for one name
+// depending only on whether it wrote `#include <string.h>` or a bare prototype.
+// ✔MEASURED (P42, pe64, `objdump -p`, a `DSS_CONFIG_ROOT` copy with memory.json
+// on msvcrt and string.json on ucrtbase): rc=0 and ZERO diagnostics, msvcrt bound.
+// Before this parameter there was NOWHERE to say so from. `reporter` receives
+// `F_ShippedCorpusInvariantBroken` — the SAME code, message and rule the
+// `#include` path emits, produced by the same `ShippedTypeConsistency` — for
+// exactly the names the caller ASKED about.
+//
+// ⛔ AN AMBIGUOUS NAME IS STILL ANSWERED, NEVER OMITTED. Dropping it from the map
+// routes the reference unbound, and the link tier then reports an undefined
+// symbol AGAINST THE USER'S PROGRAM — a true failure filed against an innocent
+// subject. The map is unchanged; the DIAGNOSTIC is what changed, and it names the
+// two descriptors.
+//
+// ⓘ THE CALLER MUST REFUSE. This function does not signal the conflict in its
+// return value (nullopt is reserved for "the corpus could not be located", which
+// is benign and must route unbound). Snapshot `reporter.errorCount()` around the
+// call — the `tierClean` idiom this codebase already uses everywhere else.
 [[nodiscard]] DSS_EXPORT
 std::optional<std::unordered_map<std::string, ShippedSymbolRealization>>
 realizeShippedExternSymbols(std::span<std::string const>      names,
                             TypeInterner&                     interner,
                             TypeRegistry&                     typeReg,
+                            DiagnosticReporter&               reporter,
                             DataModel                         dataModel,
                             std::optional<std::string_view>   activeTarget,
                             std::optional<ObjectFormatKind>   activeFormat,

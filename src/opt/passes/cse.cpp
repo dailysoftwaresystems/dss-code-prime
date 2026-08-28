@@ -25,6 +25,7 @@ namespace {
 
 using dss::opt::analysis::StrictTbaa;
 using dss::opt::analysis::MirMemoryClobbers;
+using dss::opt::analysis::mirAliasProbeSubstitutionPreservesClobberVerdict;
 
 // Hash-key for a CSE-candidate instruction. Operands are stored in
 // canonical order (sorted for commutative 2-operand ops) so the two
@@ -144,6 +145,18 @@ public:
     }
 
 private:
+    // THE one place an old operand id becomes its canonical replacement.
+    // `buildKey` numbers expressions with it, and the Load-admission gate picks
+    // the pointer it hands the alias tests with it. Both MUST speak the same
+    // vocabulary: a gate that probes with a RAW id is reasoning about a value
+    // the rebuild is about to delete, and the two sites can then silently
+    // disagree about what "this pointer" denotes
+    // (`D-OPT-CSE-LOAD-PTR-KEY-UNRESOLVED`). One function, so a future change
+    // to the resolution discipline cannot reach one consumer and miss the other.
+    [[nodiscard]] MirInstId canonicalOperand(MirInstId op) const {
+        return resolveTransitive(cseMap_, op, "Cse");
+    }
+
     [[nodiscard]] CseKey buildKey(MirInstId id) const {
         CseKey k;
         k.op      = src_.instOpcode(id);
@@ -152,7 +165,7 @@ private:
         auto const ops = src_.instOperands(id);
         k.operands.reserve(ops.size());
         for (MirInstId const o : ops) {
-            k.operands.push_back(resolveTransitive(cseMap_, o, "Cse"));
+            k.operands.push_back(canonicalOperand(o));
         }
         // Canonicalize operand order for binary commutative ops.
         if (isCommutative(k.op) && k.operands.size() == 2) {
@@ -218,14 +231,23 @@ void CsePolicy::analyze(MirFuncId fn,
     std::vector<Frame> work;
     work.push_back({FrameKind::Visit, entry, 0});
 
-    // Scoped table + rollback log. Inserts are gated by a miss
-    // (`scope.find(k) == end()`) so the log records keys-to-erase
-    // only — never a prior occupant to restore. A future variant
-    // that overwrites on hit (e.g. "prefer earlier dominating def
-    // by RPO depth") would extend the log shape; today the
-    // single-pass insert-on-miss discipline keeps it minimal.
+    // Scoped table + rollback log. A block's Visit may BIND a key that was
+    // free, or REBIND one an ANCESTOR scope owns — a Load candidate the alias
+    // gate refuses becomes the new, nearer canonical
+    // (`D-OPT-CSE-STALE-CANONICAL-AFTER-REJECT`). So the log records the
+    // PREVIOUS occupant, not merely the key: Leave RESTORES it when there was
+    // one and erases only when there was not. Erasing unconditionally (the old
+    // shape) destroys the ancestor's canonical for every sibling subtree
+    // visited afterwards. Undone in REVERSE order, so repeated rebinds of one
+    // key inside a scope unwind to exactly the binding the scope was entered
+    // with.
+    struct ScopeUndo {
+        CseKey    key;
+        MirInstId previous{};
+        bool      hadPrevious = false;
+    };
     std::unordered_map<CseKey, MirInstId, CseKeyHash> scope;
-    std::vector<CseKey> log;
+    std::vector<ScopeUndo> log;
 
     while (!work.empty()) {
         Frame const f = work.back();
@@ -233,7 +255,9 @@ void CsePolicy::analyze(MirFuncId fn,
 
         if (f.kind == FrameKind::Leave) {
             while (log.size() > f.snapshotMark) {
-                scope.erase(log.back());
+                ScopeUndo const& u = log.back();
+                if (u.hadPrevious) scope[u.key] = u.previous;
+                else               scope.erase(u.key);
                 log.pop_back();
             }
             continue;
@@ -253,35 +277,23 @@ void CsePolicy::analyze(MirFuncId fn,
             auto it = scope.find(k);
             if (it != scope.end()) {
                 // Load admission gate: a Load CSE'd against a dominating
-                // canonical Load is sound only if no may-aliasing Store
-                // sits anywhere between them, ON ANY EXECUTED PATH — the
-                // back edge included. We scan FOUR slices, three owned by
-                // the caller (this site) plus the strictly-between region
-                // owned by the clobber index's `anyClobberBetween` (same
-                // fwd∩bwd region as the reference `mirRegionBetween`,
-                // memoized):
-                //   (a) canonical's block tail (after canonical, to end)
-                //   (b) strictly-between blocks (region walker)
-                //   (c) useBlock's head (start, up to current)
-                //   (d) useBlock's TAIL, when the use block sits on a cycle
-                //       that does not pass through the canonical's block
-                //       (`D-OPT-CSE-LOAD-BACKEDGE-TAIL` — omitting this was
-                //       a real release-only miscompile)
-                // ★ These four are a COVER: proving that is a hand argument
-                // re-done at each edit, not a property the API enforces. If a
-                // SECOND consumer ever needs point-to-point clobber cover,
-                // hoist the decomposition into the analysis as one chokepoint
-                // so it cannot be partially reimplemented —
-                // `D-OPT-CSE-CLOBBER-COVER-CHOKEPOINT`.
-                // The region walker EXCLUDES both endpoints to keep the
-                // two responsibilities disjoint and prevent the dead-
-                // code-masking-bug class where overlapping scans hide
-                // each other's correctness gaps. For non-Load opcodes
-                // the gate is a no-op (only Load reads memory in the
-                // v1 opcode set; if a future memory-reading opcode
-                // lands — AtomicLoad, VolatileLoad — it MUST be added
-                // to this gate explicitly, since the alias substrate
-                // doesn't know about it).
+                // canonical Load is sound only if no may-aliasing clobber sits
+                // anywhere between them, ON ANY EXECUTED PATH — the back edge
+                // included. That whole question is ONE query against the
+                // analysis (`MirMemoryClobbers::anyClobberBetweenPoints`, whose
+                // docblock carries the four-slice decomposition, the
+                // RE-EXECUTION LEMMA, and the pointer to its specification).
+                // It used to be four slices hand-assembled HERE, and that
+                // open-coding is exactly what let a missing fourth slice look
+                // complete and ship `D-OPT-CSE-LOAD-BACKEDGE-TAIL` — a
+                // release-only silent miscompile. This site now states two
+                // PROGRAM POINTS and asks; it can no longer reimplement three
+                // slices out of four (`D-OPT-CSE-CLOBBER-COVER-CHOKEPOINT`).
+                // For non-Load opcodes the gate is a no-op (only Load reads
+                // memory in the v1 opcode set; if a future memory-reading
+                // opcode lands — AtomicLoad, VolatileLoad — it MUST be added to
+                // this gate explicitly, since the alias substrate doesn't know
+                // about it).
                 bool admit = true;
                 if (op == MirOpcode::Load) {
                     MirInstId const canonical = it->second;
@@ -295,7 +307,40 @@ void CsePolicy::analyze(MirFuncId fn,
                             id.v);
                         std::abort();
                     }
-                    MirInstId const loadPtr = ops[0];
+                    // The alias probe is the pointer operand resolved through
+                    // the SAME map `buildKey` uses — the raw operand names a
+                    // value the rebuild is about to delete
+                    // (`D-OPT-CSE-LOAD-PTR-KEY-UNRESOLVED`). The substitution
+                    // is licensed by the theorem on
+                    // `mirAliasProbeSubstitutionPreservesClobberVerdict`:
+                    // equal opcode + equal TypeId + NOT an `Alloca` ⇒ every
+                    // clobber verdict is unchanged, so this can never weaken
+                    // the gate. CSE satisfies that premise by construction —
+                    // the key carries the opcode AND the result type, and
+                    // `isCseCandidateOpcode` excludes `Alloca`, so no redirect
+                    // can put an `Alloca` at either end and unlock Rule 2's
+                    // "distinct stack slots ⇒ No" for a merged pair. That third
+                    // clause is load-bearing: two DISTINCT `Alloca`s share
+                    // opcode and TypeId, and swapping them WOULD weaken a
+                    // Store's verdict from Rule 1's `Yes` to Rule 2's `No`.
+                    // It is CHECKED, not assumed, so a future key that stops
+                    // discriminating a field — or an opcode table that lets
+                    // `Alloca` into CSE — aborts here instead of silently
+                    // admitting a stale Load.
+                    MirInstId const rawPtr  = ops[0];
+                    MirInstId const loadPtr = canonicalOperand(rawPtr);
+                    if (!mirAliasProbeSubstitutionPreservesClobberVerdict(
+                            src_, rawPtr, loadPtr)) {
+                        std::fprintf(stderr,
+                            "dss::opt::passes::Cse fatal: Load pointer v=%u "
+                            "canonicalizes to v=%u with a different opcode or "
+                            "result type — a CSE redirect may only join "
+                            "same-opcode/same-type values, and the alias "
+                            "probe substitution is unsound without that "
+                            "(D-OPT-CSE-LOAD-PTR-KEY-UNRESOLVED).\n",
+                            rawPtr.v, loadPtr.v);
+                        std::abort();
+                    }
                     MirBlockId const canonicalBlock = src_.instBlock(canonical);
 
                     // Locate canonical in its block. Substrate-contract
@@ -322,116 +367,48 @@ void CsePolicy::analyze(MirFuncId fn,
                         std::abort();
                     }
 
-                    // c113 (audit-F1): every slice funnels through the SAME
-                    // per-instruction predicate (`mirInstClobbersLoadPtr` —
-                    // precise for Stores, opaque clobber for the
-                    // `opcodeClobbersMemory` ops), called at QUERY time by the
-                    // clobber index — the scan sites can never disagree on
-                    // what clobbers. The index only pre-filters the
-                    // ENUMERATION to actual clobbers (a non-clobber can never
-                    // satisfy the predicate) and memoizes the CFG reachability
-                    // (D-OPT-MEMORYSSA-CLOBBER-WALK).
-                    auto storesClobber = [&](MirBlockId blk,
-                                             std::uint32_t lo,
-                                             std::uint32_t hi) -> bool {
-                        return clobbers.anyClobberInBlockRange(
-                            interner_, loadPtr, blk, lo, hi,
-                            strictTbaa_, charTypesAliasAll_);
-                    };
-
-                    if (canonicalBlock.v == B.v) {
-                        // Same-block case: scan strictly between
-                        // canonical (at canonicalIdx) and current
-                        // (at i). Dom-tree DFS scope guarantees
-                        // canonicalIdx < i; assert it so a future
-                        // reorder doesn't silently corrupt scope.
-                        if (canonicalIdx >= i) {
-                            std::fprintf(stderr,
-                                "dss::opt::passes::Cse fatal: "
-                                "canonical idx=%u >= current idx=%u "
-                                "in same block v=%u — dom-tree DFS "
-                                "scope invariant violation.\n",
-                                canonicalIdx, i, B.v);
-                            std::abort();
-                        }
-                        if (storesClobber(B, canonicalIdx + 1, i)) {
-                            admit = false;
-                        }
-                    } else {
-                        // Different-block: scan
-                        //   (a) canonical's block tail (after canonical)
-                        //   (b) strictly-between region
-                        //   (c) useBlock's head (before current)
-                        if (storesClobber(canonicalBlock, canonicalIdx + 1, cn)) {
-                            admit = false;
-                        }
-                        if (admit
-                            && clobbers.anyClobberBetween(
-                                   interner_, loadPtr, canonicalBlock, B,
-                                   strictTbaa_, charTypesAliasAll_)) {
-                            admit = false;
-                        }
-                        if (admit && storesClobber(B, 0, i)) {
-                            admit = false;
-                        }
-                        // (d) WRAP-AROUND slice (D-OPT-CSE-LOAD-BACKEDGE-TAIL).
-                        // Slices (a)-(c) cover only an ACYCLIC canonical→use path.
-                        // If the use sits on a cycle that does NOT re-execute the
-                        // canonical, execution WRAPS: Load(iter N) → B's TAIL →
-                        // back-edge → Load(iter N+1). A may-aliasing Store in B's
-                        // tail therefore clobbers the NEXT iteration's Load, and
-                        // NOTHING above scans [i+1, ninst) — (b) drops both
-                        // endpoints and (c) stops at `i`. That gap is the sqlite
-                        // `balance_nonroot` silent miscompile: its loop body holds
-                        // both this Load and the store that advances the pointer.
-                        // Cheap index scan FIRST (usually a map miss); the
-                        // reachability walk runs only when a clobber is actually
-                        // there.
-                        //
-                        // RE-EXECUTION LEMMA (why the other two regions need no
-                        // slice) — stated over the MODELED CFG, where every edge
-                        // originates at a terminator (an `IndirectBr` lists all
-                        // address-taken blocks as successors, and the SEH region
-                        // ops are themselves terminators AND memory clobbers, so
-                        // no mid-block fault edge can smuggle a path past this):
-                        // a block is entered only at index 0, so any wrap
-                        // that re-enters canonicalBlock re-executes the canonical
-                        // and REFRESHES the value. Hence canonicalBlock's head
-                        // [0, canonicalIdx) is not a hole, and the same-block
-                        // branch above (canonicalIdx < i) is already exact.
-                        // Scanning either would only lose precision. That
-                        // admission carries one obligation — the canonical must
-                        // stay inside the cycle — which LICM discharges: its Load
-                        // hoist gate scans the WHOLE loop body (licm.cpp), so it
-                        // refuses to hoist exactly when such a clobber exists.
-                        if (admit
-                            && storesClobber(B, i + 1, ninst)
-                            && clobbers.blockReachesItselfAvoiding(B, canonicalBlock)) {
-                            admit = false;
-                        }
-                    }
+                    // ONE query, two program points. The four-slice cover, the
+                    // RE-EXECUTION LEMMA, the same-block ordering contract and
+                    // the wrap-around trigger all live inside it, next to the
+                    // specification the differential pins hold it to. Every
+                    // slice funnels through the SAME per-instruction predicate
+                    // (`mirInstClobbersLoadPtr` — precise for Stores, opaque
+                    // for the `opcodeClobbersMemory` ops) called at QUERY time,
+                    // so the scans can never disagree about what clobbers; the
+                    // index only pre-filters the ENUMERATION and memoizes CFG
+                    // reachability (`D-OPT-MEMORYSSA-CLOBBER-WALK`).
+                    admit = !clobbers.anyClobberBetweenPoints(
+                        interner_, loadPtr, canonicalBlock, canonicalIdx,
+                        B, i, strictTbaa_, charTypesAliasAll_);
                 }
                 if (admit) {
                     cseMap_[id] = it->second;
                     ++instructionsCsed_;
                     continue;
                 }
-                // Fall through. NOTE (corrected — the old comment here claimed
-                // this Load "becomes the new canonical", which is FALSE):
-                // `scope.emplace` below is a NO-OP when the key already exists,
-                // so the STALE canonical survives a rejected candidate. That is
-                // SOUND — a later identical Load re-runs the full gate against
-                // that stale canonical, and the same clobber that rejected this
-                // one rejects it too — but IMPRECISE: two Loads that both sit
-                // AFTER the clobber cannot CSE against each other, because
-                // neither ever became canonical. Replacing the canonical here
-                // is NOT a local edit: `log` records keys for scope-exit
-                // rollback (erase), so an overwrite would need save/restore of
-                // the previous binding. Precision only, never a miscompile:
-                // anchored `D-OPT-CSE-STALE-CANONICAL-AFTER-REJECT`.
+                // Fall through to the REBIND below: a refused candidate takes
+                // over the binding (`D-OPT-CSE-STALE-CANONICAL-AFTER-REJECT`).
             }
-            log.push_back(k);
-            scope.emplace(std::move(k), id);
+            // Bind — or REBIND — this instruction as the canonical for `k`.
+            //
+            // Leaving a stale, pre-clobber canonical in place (what
+            // `scope.emplace` did, since it is a NO-OP on an existing key) is
+            // SOUND but imprecise: two Loads that both sit AFTER the same
+            // clobber could never CSE against each other, because neither ever
+            // became canonical. The refused candidate is the strictly better
+            // canonical — it is nearer, so the region a later candidate must
+            // prove clean is a SUBSET of the one the stale canonical demanded,
+            // and it is this very instruction, so it dominates exactly the
+            // remaining scope the old binding did. The dom-tree DFS discipline
+            // is unchanged; only the undo record grows a "previous" field so
+            // Leave can RESTORE an ancestor's binding instead of erasing it.
+            if (it == scope.end()) {
+                log.push_back(ScopeUndo{k, MirInstId{}, false});
+                scope.emplace(std::move(k), id);
+            } else {
+                log.push_back(ScopeUndo{k, it->second, true});
+                it->second = id;
+            }
         }
 
         // Queue Leave for THIS block AFTER children are visited.

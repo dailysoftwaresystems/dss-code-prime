@@ -142,6 +142,10 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Imm8:
+        // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: the 2-byte APPENDED immediate
+        // is x86-variable (trailing bytes), unlike the fixed32 `Imm16`
+        // bit-window it shares a nominal width with.
+        case EncodingSlotKind::Imm16Bytes:
         case EncodingSlotKind::Disp32:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
@@ -212,8 +216,14 @@ bool encode(Lir const&                  lir,
     // denotes, and two copies that drifted would bind text to one opcode and
     // encode another with no diagnostic.
     std::uint8_t const instWidth = lirInstWidthBits(lir.instFlags(inst));
+    // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE: the memory-
+    // direction axis, read off the SAME flags byte as the width. No fixed32
+    // opcode declares it today; passing it unconditionally is what keeps a
+    // future declaration from being silently ignored on this walker.
+    bool const instMemDest = lirInstMemoryIsDestination(lir.instFlags(inst));
     TargetEncodingVariant const* selected =
-        asm_elect::selectEncodingVariant(*info, instOps, instWidth);
+        asm_elect::selectEncodingVariant(*info, instOps, instWidth,
+                                         instMemDest);
     if (selected == nullptr) {
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                DiagnosticSeverity::Error,
@@ -468,8 +478,15 @@ bool encode(Lir const&                  lir,
     // destination register through later words, e.g. lea's ADD reads
     // Xd as both its dest AND its source base).
     if (selected->resultSlot.has_value()) {
+        // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the declared bank of
+        // the result field. `extraResultSlots` are additional placements of
+        // the SAME register, so one class governs all of them.
         auto const hw = hwEncodingOf(result, schema, info->mnemonic,
-                                      kFixed32RegFieldBits, reporter);
+                                      kFixed32RegFieldBits,
+                                      encodingResultRegClass(info->encoding,
+                                                             *selected),
+                                      encodingSlotKindName(*selected->resultSlot),
+                                      reporter);
         if (!hw.has_value()) return false;
         if (!orInto(*selected->resultSlot, *hw, /*wordIndex=*/0)) return false;
         for (auto const& extra : selected->extraResultSlots) {
@@ -512,8 +529,14 @@ bool encode(Lir const&                  lir,
         }
         auto const& srcOp = instOps[wire.index];
         if (srcOp.kind == LirOperandKind::Reg) {
+            // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: this wire's
+            // declared bank (its own `regClass`, else the opcode's).
             auto const hw = hwEncodingOf(srcOp.reg, schema, info->mnemonic,
-                                          kFixed32RegFieldBits, reporter);
+                                          kFixed32RegFieldBits,
+                                          encodingWireRegClass(info->encoding,
+                                                               wire),
+                                          encodingSlotKindName(wire.slotKind),
+                                          reporter);
             if (!hw.has_value()) return false;
             if (!orInto(wire.slotKind, *hw, wire.wordIndex)) return false;
         } else if (srcOp.kind == LirOperandKind::SymbolRef) {

@@ -17,10 +17,20 @@
 // exclusive claim (see `detail::createExclusiveBinary`). Same include dance as
 // `tests/test_support/scratch_dir.hpp`, which established this precedent.
 #ifdef _WIN32
-#include <process.h>
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
+
+    #include <fcntl.h>
+    #include <io.h>
+    #include <process.h>
 #else
-#include <fcntl.h>
-#include <unistd.h>
+    #include <fcntl.h>
+    #include <unistd.h>
 #endif
 
 // Linker image file emission — plan 14 LK10 cycle 1 substrate
@@ -230,10 +240,76 @@ namespace detail {
 //
 // RED ON DISABLE, per arm: drop the `N` on Windows, or `O_CLOEXEC` on POSIX,
 // and `AClaimedStagingTempNeverCrossesIntoASpawnedChild` goes red on that leg.
+// ★★★ AND THE WINDOWS ARM IS NOT `_wfopen(…, L"wbxN")`, BECAUSE `CREATE_NEW`
+// IS NOT THE WINDOWS SPELLING OF `O_EXCL`.
+// [[D-LINK-WRITER-WINDOWS-EXCLUSIVE-CLAIM-FOLLOWS-A-DANGLING-SYMLINK]]
+//
+// POSIX.1 REQUIRES `O_CREAT|O_EXCL` to fail with `EEXIST` when the pathname is a
+// SYMBOLIC LINK — target existing or not. That mandate is the whole reason the
+// staging claim is safe: a planted link at a candidate name is refused, and the
+// writer steps to the next name. Windows `CREATE_NEW` carries no such rule: it
+// FOLLOWS the reparse point and creates the TARGET, so the claim succeeds and
+// the compiler's staged artifact is written wherever the link pointed.
+//
+// ✔MEASURED 2026-08-28 (cycle P43), first MSVC run of this suite:
+// `LinkWriterExclusiveClaim.ADanglingSymlinkRefusesTheClaimButExistsSaysNo`
+// reported `claim(p)` = TRUE where the case demands false, and then
+// `fs::exists(p)` = TRUE — because the claim had just created the target
+// through the link. Same defect in
+// `RuntimeObjectCacheStore.TempClaimNeverEscapesThroughADanglingSymlink`, which
+// reuses this primitive.
+//
+// ⚠⚠ IT WAS INVISIBLE FOR A REASON WORTH RECORDING, AND NOT BECAUSE NOBODY
+// LOOKED: the cases exist, and their own header states — correctly, and
+// measured — that MinGW's libstdc++ `create_symlink` returns ENOSYS, so the
+// shipping Windows toolchain CANNOT CONSTRUCT the input. They therefore SKIP on
+// the Windows leg and run only on POSIX, where the primitive was always right.
+// MSVC implements `create_symlink`, so the first build that reached this suite
+// also ran the guard. ★ A test that skips on the one platform whose primitive
+// differs is not covering that platform — it is reporting that it did not.
+//
+// ⇒ `FILE_FLAG_OPEN_REPARSE_POINT` is what restores the POSIX guarantee: the
+// create no longer traverses the link, so an existing reparse point at `p` makes
+// `CREATE_NEW` fail with `ERROR_FILE_EXISTS`, exactly as `O_EXCL` fails with
+// `EEXIST`. On a name that holds nothing the flag is inert and an ordinary file
+// is created.
+//
+// ⓘ THE TWO PROPERTIES THE OLD SPELLING CARRIED ARE BOTH PRESERVED, and neither
+// is incidental — see the `wbxN` measurement above:
+//   * `N` (no inherit) -> `bInheritHandle` is FALSE, which is what a null
+//     `SECURITY_ATTRIBUTES` means. Without it a spawned child inherits the
+//     handle and the commit's `MoveFileExW` fails with ERROR_SHARING_VIOLATION
+//     blaming a scanner for our own child.
+//   * `wb` (binary, write) -> `_O_WRONLY | _O_BINARY` on the fd, then `"wb"` on
+//     the `FILE*`. `_wfopen`'s default share mode is deny-none, so the three
+//     `FILE_SHARE_*` bits keep a reader from being newly locked out.
+// ⓘ `_close` owns the descriptor AND the underlying handle once
+// `_open_osfhandle` succeeds, so the failure paths below must not also
+// `CloseHandle` — that would be a double close.
 [[nodiscard]] std::FILE*
 createExclusiveBinary(std::filesystem::path const& p) {
 #ifdef _WIN32
-    return ::_wfopen(p.c_str(), L"wbxN");
+    HANDLE const h = ::CreateFileW(
+        p.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,                                    // bInheritHandle = FALSE
+        CREATE_NEW,                                 // the exclusive claim
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr);
+    if (h == INVALID_HANDLE_VALUE) { return nullptr; }
+    int const fd =
+        ::_open_osfhandle(reinterpret_cast<std::intptr_t>(h), _O_WRONLY | _O_BINARY);
+    if (fd < 0) {
+        ::CloseHandle(h);
+        return nullptr;
+    }
+    std::FILE* const f = ::_fdopen(fd, "wb");
+    if (!f) {
+        ::_close(fd);   // closes the handle too
+        return nullptr;
+    }
+    return f;
 #else
     // 0666 & umask — the same permissions `fopen` would have created, so
     // `writeImage`'s load-bearing re-apply (D-OUTPUT-EXEC-BIT) is unaffected.
@@ -544,14 +620,56 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
             break;
         }
         // The open failed, and the two causes need opposite responses.
-        // If the candidate EXISTS, another writer (or a stale temp) holds
-        // that slot — take the next one. Otherwise this is a real error
+        // If the candidate NAME is occupied, another writer (or a stale temp)
+        // holds that slot — take the next one. Otherwise this is a real error
         // (permission denied, parent removed post-stat, path component is
         // not a directory, invalid filename, disk full) and spinning would
         // only turn it into a slow, misleading failure. Fail loud now.
+        //
+        // ── THE PROBE MUST ASK THE QUESTION THE CLAIM ASKED ───────────────
+        //    D-LINK-WRITER-DANGLING-SYMLINK-CLAIM-MISROUTE
+        //
+        // ★★ IT IS `symlink_status`, NOT `exists`, AND THE DIFFERENCE IS THE
+        // WHOLE DEFECT. `std::filesystem::exists(p)` FOLLOWS the link and
+        // answers about the TARGET; the exclusive create refuses a directory
+        // ENTRY. On a DANGLING symlink the two disagree, the loop believes the
+        // wrong one, and an occupied slot is reported as a real error.
+        //
+        // ✔MEASURED 2026-08-26 on glibc/ext4 (WSL, g++ 13.3.0) by driving the
+        // two probes and the claim primitive over one name each — the claim
+        // spelled exactly as `createExclusiveBinary` spells it:
+        //
+        //   candidate                claim    exists()   exists(symlink_status())
+        //   fresh name               OPENED   —          —
+        //   regular-file occupant    NULL     true       true
+        //   DANGLING symlink         NULL     **false**  **true**
+        //   symlink to a live file   NULL     true       true
+        //
+        // Only the dangling row diverges, and `symlink_status` is right on all
+        // four. The live-symlink row is worth stating because it shows the
+        // repair is not "symlinks are special": POSIX makes `O_CREAT|O_EXCL`
+        // fail on ANY symlink regardless of its target, so that row was already
+        // routed correctly and stays correct — it is the ENTRY-vs-TARGET
+        // question that was being asked wrongly, not the symlink-ness.
+        //
+        // ⚠ WINDOWS CANNOT REACH THIS ROW AT ALL, and it is a LIBRARY limit
+        // rather than a privilege one — which is not what the anchor predicted.
+        // ✔MEASURED 2026-08-26 on this host with the shipping toolchain
+        // (MinGW-W64 UCRT g++ 13.2.0): `std::filesystem::create_symlink`
+        // returns `ENOSYS` ("Function not implemented", 40) even though
+        // `mklink` succeeds in the same directory, so no test on that leg can
+        // construct the input. The pin is therefore POSIX-leg only and SAYS SO
+        // (D-GATE-INSTRUMENT-SCOPE-UNSTATED); see
+        // `tests/link/test_link_writer_exclusive_claim.cpp`.
+        //
+        // `status_known` is not used as the test: `symlink_status` reports a
+        // NON-EXISTENT name as `file_type::not_found`, which IS a known status,
+        // so `status_known` would answer true for every name and route a real
+        // error into the retry loop. `exists(file_status)` is the predicate
+        // that distinguishes them.
         std::error_code eec;
-        bool const      taken = std::filesystem::exists(candidate, eec);
-        if (!eec && taken) {
+        auto const      entry = std::filesystem::symlink_status(candidate, eec);
+        if (!eec && std::filesystem::exists(entry)) {
             continue;
         }
         emit(reporter, DiagnosticCode::K_ImageWriteOpenFailed,
@@ -560,7 +678,10 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
                  + pathForDiag(candidate)
                  + "' for binary write (permission denied, a path component "
                    "is not a directory, invalid filename, or parent removed "
-                   "post-stat). The artifact '"
+                   "post-stat). The name itself was probed as a directory "
+                   "ENTRY, so an occupant of ANY kind — a regular file, a "
+                   "directory, or a dangling symlink — would have been stepped "
+                   "over rather than reported here. The artifact '"
                  + pathForDiag(path) + "' was NOT written.");
         return false;
     }

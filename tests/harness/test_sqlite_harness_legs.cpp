@@ -53,6 +53,7 @@
 #include "repo_root.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
+#include "test_wait_budget.hpp"  // kWaitBudget / kHelperScriptBudget
 
 #include <nlohmann/json.hpp>
 
@@ -197,7 +198,10 @@ struct SpawnBudget {
 };
 
 // The ONE deadline this file still owns, and the only one it can: a process
-// cannot ask a program how long it may take without first running it.
+// cannot ask a program how long it may take without first running it. It is now
+// the SHARED cap `dss::test_support::kWaitBudget` (60 s) rather than a number
+// written here — the wait is for something the child SHOULD ALREADY HAVE DONE,
+// which is exactly what that budget was derived for.
 //
 // It bounds `--print-probe-budget`, which loads one JSON document and prints two
 // floats — no sampling, no kernel entry, no dependence on the declared windows.
@@ -207,9 +211,9 @@ struct SpawnBudget {
 // ends of the matrix: 0.05 s on macOS 26.5 arm64 and a 0.154 s median (0.277 s
 // worst of five) on this Windows box, so 60 s is ~220x the worst observed cost
 // and ~9x the worst spawn-admission latency ever recorded in this repo (6841 ms
-// at 16-way concurrency, run_binary.hpp). It exists to stop a hang, not to
-// police a slow machine.
-inline constexpr std::chrono::milliseconds kBudgetQueryDeadline{60000};
+// at 16-way concurrency, `kAdmissionBudget`). It exists to stop a hang, not to
+// police a slow machine — and that measurement is why the SHARED 60 s cap is the
+// right one here rather than merely the convenient one.
 
 // Ask the script what a probe run of `catalogueCopy` may cost. `diagnostic` is
 // set (and the budget left zero) on any failure — a budget that could not be
@@ -219,7 +223,7 @@ inline constexpr std::chrono::milliseconds kBudgetQueryDeadline{60000};
                                          std::string&    diagnostic) {
     SpawnBudget out;
     auto const r = spawnResolver({"--print-probe-budget"}, catalogueCopy,
-                                 kBudgetQueryDeadline);
+                                 dss::test_support::kWaitBudget);
     if (!r.spawned) {
         diagnostic = "could not ask harness_legs.py for its spawn budget: "
                    + r.diagnostic;
@@ -680,7 +684,8 @@ TEST_F(HarnessLegs, TheCliSmokeGateSelfTestPasses) {
         "import runpy,sys;p=sys.argv[1];sys.argv=[p,'--self-test'];"
         "runpy.run_path(p,run_name='__main__')";
     auto const res = dss::test_support::runBinary(
-        staged, std::chrono::seconds{120}, /*captureStdout=*/true,
+        staged, dss::test_support::kHelperScriptBudget,
+        /*captureStdout=*/true,
         {py, "-c", kSelfTestShim});
     // THE PIN, checked BEFORE the spawn assertion on purpose: a spawn that FAILED
     // has already run the chmod, so gating this behind `res.spawned` would let the
@@ -943,7 +948,7 @@ TEST_F(HarnessLegs, TheDriversAreNotHostKeyed) {
 // Linux), and requiring the corpus to match those would be a different — and
 // much larger — change than this one.
 TEST_F(HarnessLegs, LauncherSpellingsAgreeWithTheExamplesCorpus) {
-    auto const examples = repoRoot() / "examples" / "c-subset";
+    auto const examples = repoRoot() / "examples" / "c";
     ASSERT_TRUE(fs::exists(examples)) << examples;
 
     // (targetArch, runOn-OS) -> emulator spelling, from the corpus.
@@ -1164,7 +1169,8 @@ TEST_F(HarnessLegs, StageZincWritesOneHeaderPerTargetAndEveryLegGetsItsOwn) {
         // from chmod'ing a tracked repo file on POSIX.
         "--catalogue"};
     auto const res = dss::test_support::runBinary(
-        catalogue_, std::chrono::seconds{120}, /*captureStdout=*/true, argv);
+        catalogue_, dss::test_support::kHelperScriptBudget,
+        /*captureStdout=*/true, argv);
     ASSERT_TRUE(res.spawned && !res.timedOut) << res.diagnostic;
     ASSERT_EQ(res.exitCode, 0u)
         << "stage-zinc.py could not produce every declared stage:\n"
@@ -3158,8 +3164,7 @@ TEST_F(HarnessLegs, AnAcquiredLibraryDeclaresTheIdentityItIsRecordedUnder) {
     EXPECT_NE(bad.output.find("importName"), std::string::npos) << bad.output;
 }
 
-// A LIBRARY IS NOT ALWAYS SELF-CONTAINED — D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-
-// SCRIPT-LIBRARY.
+// A LIBRARY IS NOT ALWAYS SELF-CONTAINED — D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY.
 //
 // The macho leg's testfixture BUILT (189 TUs, 0 diagnostics) and ran an
 // individual `.test` file correctly, and then the TIER driver died instantly at
@@ -4138,7 +4143,7 @@ struct Script {
 // The 1-based line number of `content` in the RAW file, or 0.
 //
 // ★ NOT the index into `liveLines`, and this is not a nicety: the first version
-// of this test reported the live index, which pointed at build-and-test.ps1:45
+// of this test reported the live index, which named line 45 of build-and-test.ps1
 // for a defect on line 373 — a diagnostic that sends the reader to an unrelated
 // line is worse than one that gives no line at all. `liveLines` hands back its
 // lines verbatim, so the raw number is recoverable by looking the text back up.
@@ -4411,11 +4416,11 @@ TEST_F(HarnessLegs, NoDeclaredWslArgvOmitsExec) {
 // marker from a driver or from program.cpp and rule 3 fails naming the file.
 TEST_F(HarnessLegs, NeitherDriverNamesTheArtefactTheCompilerDoes) {
     // The report line the compiler emits per artefact it commits:
-    //   dss-code-prime: artifact <targetSpec> <absolute path>
-    constexpr char const* kMarker = "dss-code-prime: artifact ";
+    //   dsscp: artifact <targetSpec> <absolute path>
+    constexpr char const* kMarker = "dsscp: artifact ";
 
     // DSS's artifact-extension table, as a driver would be tempted to spell one
-    // entry of it: a bare, quoted extension. `wsl.exe` / `dss-code-prime.exe` are
+    // entry of it: a bare, quoted extension. `wsl.exe` / `dsscp.exe` are
     // whole file names and never match; a `$sfx`-style row always does.
     constexpr std::string_view kSuffixes[] = {".exe", ".dll", ".so", ".dylib",
                                               ".lib"};
@@ -4542,8 +4547,9 @@ TEST_F(HarnessLegs, NeitherDriverNamesTheArtefactTheCompilerDoes) {
 // worth having:
 //
 //   1. IT IS PER-LEG AND IT LIVES IN THE SHARED RESOLVER, so it cannot exist in
-//      one driver and not the other (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-
-//      ONE-LEG-IN-ONE-DRIVER). Both drivers must actually CALL it.
+//      one driver and not the other
+//      (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER).
+//      Both drivers must actually CALL it.
 //   2. IT REFUSES, IT DOES NOT WARN. A warn ships a binary that links clean and
 //      then misbehaves — the exact class this harness exists to prevent.
 //   3. IT MEASURES THE LIBRARY'S BYTES, NOT ITS FILE NAME. `libtcl8.6.so` is

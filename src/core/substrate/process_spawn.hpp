@@ -86,7 +86,7 @@
 // They are not two implementations of one thing; they are two DIFFERENT
 // things that share a system call:
 //
-//   THIS FILE (shipped library, `dss-code-prime-lib`) has NO timeout, NO
+//   THIS FILE (shipped library, `dsscp-lib`) has NO timeout, NO
 //   kill, NO emulator/launcher prefix, NO `RLIMIT_STACK` / `QEMU_STACK_SIZE`
 //   manipulation, NO pipe drain, and NO warm-up exec. It blocks until the
 //   child exits, because a build step that hangs is the user's build step
@@ -131,7 +131,7 @@
 // includes `run_binary.hpp`, but its target (`integrated_tests/CMakeLists.txt`)
 // links ONLY `nlohmann_json` and puts only `tests/test_support` on its include
 // path. That is DELIBERATE — it drives the CLI as a black box, and linking
-// `dss-code-prime-lib` into it to borrow a string helper would break exactly the
+// `dsscp-lib` into it to borrow a string helper would break exactly the
 // boundary the target exists to enforce. So the quoter was made header-only and
 // dependency-free instead (a pure `vector<string>` → `wstring` transform has
 // nothing to link), and `run_binary.hpp` includes it by relative path. The

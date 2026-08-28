@@ -31,7 +31,7 @@
 //     attribute is VACUOUS there. The shipped `debug` pipeline is `Identity`
 //     only, so `always_inline` changes nothing under `--config=debug`. GCC and
 //     clang honour it at `-O0` because their inliner always runs; DSS's does
-//     not. This is stated in the `c-subset.lang.json` effects row too, so the
+//     not. This is stated in the `c.lang.json` effects row too, so the
 //     config the user reads makes exactly the claim the code implements.
 //
 // ★ THE DEFAULT DIRECTION IS THE **SAFE** ONE HERE — THE OPPOSITE OF

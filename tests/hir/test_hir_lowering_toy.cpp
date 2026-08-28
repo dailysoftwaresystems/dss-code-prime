@@ -1,6 +1,6 @@
 // HR9 CST→HIR lowering tests for the enriched `toy` language. The point of
 // this file is genericity-by-demonstration: the SAME generic engine that
-// lowers c-subset (test_hir_lowering_toy's sibling) lowers toy with zero
+// lowers c (test_hir_lowering_toy's sibling) lowers toy with zero
 // toy-specific C++ — only `toy.lang.json`'s `hirLowering` block differs.
 // Toy is a smaller, assignment-free language (only `var` binds), so it
 // exercises the engine on a deliberately different grammar shape:
@@ -19,6 +19,9 @@
 #include "hir/lowering/cst_to_hir.hpp"
 #include "repo_root.hpp"
 
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
+#include "shipped_schema_or_throw.hpp"   // the ONE load-or-fail-this-test helper
+
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -26,6 +29,7 @@
 #include <fstream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -38,9 +42,13 @@ namespace {
 // Drive: toy source → CompilationUnit → SemanticModel. Asserts the front end
 // (parse + semantic) is clean so a lowering test never chases a phantom.
 [[nodiscard]] SemanticModel analyzeToy(std::string src) {
-    auto loaded = GrammarSchema::loadShipped("toy");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(toy) failed"; std::abort(); }
-    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
+    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // ✔MEASURED against an emptied shipped config, the abort took the whole
+    // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
+    // no summary -- every sibling test in this executable lost its verdict.
+    auto const loaded = dss::test_support::shippedSchemaOrThrow("toy");
+    UnitBuilder builder{loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     return analyze(cu, DiagnosticBudget::libraryDefault());
@@ -208,10 +216,17 @@ namespace {
 }
 
 [[nodiscard]] std::string readFile(fs::path const& p) {
-    std::ifstream in{p, std::ios::binary};
-    if (!in) { ADD_FAILURE() << "cannot open " << p.string(); std::abort(); }
-    std::ostringstream buf; buf << in.rdbuf();
-    std::string s = std::move(buf).str();
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
+    // `std::abort()` here killed the whole binary, so one unreadable golden
+    // cost every sibling test its verdict. THROW -- GoogleTest reports an
+    // escaping exception as a failure of the ONE running test. The read itself
+    // goes through the ONE checked read, so a golden that reads SHORT is named
+    // as a torn read instead of surfacing as a golden mismatch.
+    auto text = dss::core::readFileChecked(p);
+    if (!text) {
+        throw std::runtime_error("golden: " + std::move(text).error().message);
+    }
+    std::string s = *std::move(text);
     std::erase(s, '\r');   // CRLF→LF: golden compare is line-ending agnostic (Windows autocrlf)
     return s;
 }

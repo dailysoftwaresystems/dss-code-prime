@@ -443,6 +443,219 @@ TEST(Cse, LoadCsedFromLoopHeaderIntoBodyDespiteTailStore) {
            "re-executes the canonical Load — this CSE is sound and must be kept";
 }
 
+// ── D-OPT-CSE-STALE-CANONICAL-AFTER-REJECT ───────────────────────────
+// A Load the alias gate REFUSES must become the new canonical for its key.
+// Before the fix the fall-through used `scope.emplace`, which is a NO-OP on an
+// existing key, so the STALE pre-clobber canonical survived and two Loads that
+// both sit AFTER the same clobber could never CSE against each other.
+// Shape: L1 / CLOBBER / L2 / L3 — L2 is refused against L1 (correctly), then
+// L3 must CSE against L2 because nothing separates them.
+// RED-ON-DISABLE: revert the fall-through to `scope.emplace` (or drop the
+// rebind arm) → the canonical stays L1, L3 is refused too → instructionsCsed
+// 1 → 0 and this test fails.
+TEST(Cse, RefusedLoadBecomesTheNewCanonicalSameBlock) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, i32);
+    MirInstId const s0[] = {c0, slot};
+    (void)mb.addInst(MirOpcode::Store, s0, InvalidType);
+    MirInstId const lops[] = {slot};
+    MirInstId const ld1 = mb.addInst(MirOpcode::Load, lops, i32);   // canonical
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(v1, i32);
+    MirInstId const s1[] = {c1, slot};
+    (void)mb.addInst(MirOpcode::Store, s1, InvalidType);             // CLOBBER
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, lops, i32);   // refused
+    MirInstId const ld3 = mb.addInst(MirOpcode::Load, lops, i32);   // must CSE→ld2
+    MirInstId const sum1[] = {ld1, ld2};
+    MirInstId const a1 = mb.addInst(MirOpcode::Add, sum1, i32);
+    MirInstId const sum2[] = {a1, ld3};
+    MirInstId const r = mb.addInst(MirOpcode::Add, sum2, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 1u)
+        << "the Load refused against the pre-clobber canonical must itself "
+           "become the canonical, so the next identical Load CSEs against it "
+           "(D-OPT-CSE-STALE-CANONICAL-AFTER-REJECT)";
+}
+
+// D-OPT-CSE-STALE-CANONICAL-AFTER-REJECT, the ROLLBACK half — the reason the
+// row said this is "NOT a local edit". Rebinding a key an ANCESTOR scope owns
+// means the scope-exit log can no longer just ERASE: it must RESTORE the
+// previous occupant, or the ancestor's canonical is destroyed for every sibling
+// subtree visited afterwards.
+// Shape: L1 in entry; the then-arm clobbers, refuses L2 (which rebinds the
+// key), CSEs L3 against L2, then clobbers AGAIN; the else-arm's L4 must CSE
+// against the RESTORED entry canonical L1. Expected 2 (L3→L2 and L4→L1).
+// This discriminates all THREE candidate rollback disciplines:
+//   * RESTORE (correct)                     → 2
+//   * ERASE the key (the shipped behaviour) → 0  (the ancestor binding is gone,
+//                                                 so L4 has no canonical at all)
+//   * NO rollback at all                    → 1  (L4 would see the then-arm's
+//                                                 L2, whose own block tail
+//                                                 clobbers — refused; and it
+//                                                 does not dominate the
+//                                                 else-arm, i.e. invalid SSA)
+TEST(Cse, RefusedLoadRebindIsRestoredNotErasedOnScopeExit) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fArm  = mb.createBlock(StructCfMarker::IfElse);
+    MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
+
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, i32);
+    MirInstId const s0[] = {c0, slot};
+    (void)mb.addInst(MirOpcode::Store, s0, InvalidType);
+    MirInstId const lops[] = {slot};
+    MirInstId const ld1 = mb.addInst(MirOpcode::Load, lops, i32);   // canonical
+    mb.addCondBr(cond, tArm, fArm);
+
+    mb.beginBlock(tArm);
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(v1, i32);
+    MirInstId const s1[] = {c1, slot};
+    (void)mb.addInst(MirOpcode::Store, s1, InvalidType);             // CLOBBER #1
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, lops, i32);   // refused → rebind
+    MirInstId const ld3 = mb.addInst(MirOpcode::Load, lops, i32);   // must CSE→ld2
+    MirInstId const tsum[] = {ld2, ld3};
+    MirInstId const tAcc = mb.addInst(MirOpcode::Add, tsum, i32);
+    MirInstId const s2[] = {tAcc, slot};
+    (void)mb.addInst(MirOpcode::Store, s2, InvalidType);             // CLOBBER #2
+    mb.addBr(join);
+
+    mb.beginBlock(fArm);
+    MirInstId const ld4 = mb.addInst(MirOpcode::Load, lops, i32);   // must CSE→ld1
+    MirInstId const fsum[] = {ld4, ld1};
+    MirInstId const fAcc = mb.addInst(MirOpcode::Add, fsum, i32);
+    mb.addBr(join);
+
+    mb.beginBlock(join);
+    MirPhiIncoming const incs[] = {{tAcc, tArm}, {fAcc, fArm}};
+    MirInstId const phi = mb.addPhi(i32, incs);
+    mb.addReturn(phi);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 2u)
+        << "the then-arm's rebind must be RESTORED (not erased) at scope exit, "
+           "so the else-arm still sees the entry canonical "
+           "(D-OPT-CSE-STALE-CANONICAL-AFTER-REJECT)";
+}
+
+// ── D-OPT-CSE-LOAD-PTR-KEY-UNRESOLVED ────────────────────────────────
+// The Load-admission alias probe must be the pointer operand resolved through
+// the SAME redirect map `buildKey` uses. Shape: a Gep address computation
+// emitted twice (CSE merges g2→g1), then a Load through EACH — the second
+// Load's key canonicalizes to `Load(g1)`, so the gate is handed a pointer whose
+// raw id (g2) is about to be deleted by the rebuild.
+// Expected 2 = the Gep merge plus the Load merge.
+TEST(Cse, LoadCsedThroughACsedPointerExpression) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const base = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, i32);
+    MirInstId const s0[] = {c0, base};
+    (void)mb.addInst(MirOpcode::Store, s0, InvalidType);
+    MirInstId const gops[] = {base, c0};
+    MirInstId const g1 = mb.addInst(MirOpcode::Gep, gops, ptr);
+    MirInstId const g2 = mb.addInst(MirOpcode::Gep, gops, ptr);   // CSE → g1
+    MirInstId const l1ops[] = {g1};
+    MirInstId const ld1 = mb.addInst(MirOpcode::Load, l1ops, i32);
+    MirInstId const l2ops[] = {g2};
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, l2ops, i32); // CSE → ld1
+    MirInstId const sum[] = {ld1, ld2};
+    MirInstId const r = mb.addInst(MirOpcode::Add, sum, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 2u)
+        << "the duplicate Gep merges, and the Load through the merged pointer "
+           "must merge too (D-OPT-CSE-LOAD-PTR-KEY-UNRESOLVED)";
+}
+
+// D-OPT-CSE-LOAD-PTR-KEY-UNRESOLVED — the SOUNDNESS boundary of the probe
+// substitution, and the exact case the theorem in `mir_alias.hpp`
+// (`mirAliasProbeSubstitutionPreservesClobberVerdict`) is about. The Store
+// writes through the RAW candidate pointer g2, which the substitution replaces
+// with g1: `mirMayAlias` Rule 1 (same SSA id ⇒ Yes) therefore STOPS firing and
+// the pair falls to Rule 7 (Maybe). Both verdicts are `!= No`, so the clobber
+// stands and CSE must still REFUSE. A "precision" change that made the
+// substituted probe answer `No` here would be a silent stale-Load miscompile.
+// Expected 1 = the Gep merge only; the Load must NOT merge.
+TEST(Cse, LoadNotCsedAcrossStoreThroughTheCsedPointerItself) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const base = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, i32);
+    MirInstId const gops[] = {base, c0};
+    MirInstId const g1 = mb.addInst(MirOpcode::Gep, gops, ptr);
+    MirInstId const g2 = mb.addInst(MirOpcode::Gep, gops, ptr);   // CSE → g1
+    MirInstId const l1ops[] = {g1};
+    MirInstId const ld1 = mb.addInst(MirOpcode::Load, l1ops, i32);
+    MirInstId const st[] = {c0, g2};                              // Store THROUGH g2
+    (void)mb.addInst(MirOpcode::Store, st, InvalidType);
+    MirInstId const l2ops[] = {g2};
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, l2ops, i32);
+    MirInstId const sum[] = {ld1, ld2};
+    MirInstId const r = mb.addInst(MirOpcode::Add, sum, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 1u)
+        << "only the duplicate Gep may merge — the Store through the merged "
+           "pointer clobbers the Load whichever id the alias probe carries";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Load), 2u);
+}
+
 // Negative pin: a may-aliasing Store between two identical Loads
 // blocks CSE. The Store writes through the SAME Alloca pointer the
 // Loads read — Rule 1 (same SSA) says Yes, so admission MUST refuse.

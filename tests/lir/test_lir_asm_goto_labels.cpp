@@ -9,7 +9,7 @@
 // below are invisible to a caller that only checks the exit code, and the
 // fourth (result piece 0) is invisible to EVERY tier above the exit code.
 //
-// ★★ WHY THIS FILE EXISTS BESIDE `examples/c-subset/asm_goto_labels`. The
+// ★★ WHY THIS FILE EXISTS BESIDE `examples/c/asm_goto_labels`. The
 // corpus example is the end-to-end witness and it is the one that proves the
 // program RUNS; but a runtime pin can be satisfied by luck — ✔MEASURED
 // 2026-08-17 on this very subsystem, a single-`"+r"` asm example stayed GREEN
@@ -17,7 +17,7 @@
 // right value in the register the template read. A structural assertion at the
 // tier that makes the decision cannot be satisfied that way. Keep both.
 //
-// ★ THE FIXTURE LOWERS REAL c-subset SOURCE, never a hand-built descriptor,
+// ★ THE FIXTURE LOWERS REAL c SOURCE, never a hand-built descriptor,
 // because the property under test is a RELATION between what the front end
 // minted (the spellings) and what this tier bound (the blocks). A hand-typed
 // descriptor would be testing the hand-typing —
@@ -157,7 +157,7 @@ terminatorsIn(Lir const& lir, TargetSchema const& t, LirBlockId b) {
 // branch `mir_to_lir` must emit into that open block — and if it does not, the
 // code after the statement is reached by nothing at all.
 TEST(LirAsmGotoLabels, ABranchingTemplateGetsBothTheLabelEdgeAndTheFallThrough) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int x){ int r; r = 0;\n"
         "  __asm__ goto (\"cmpl $0, %0\\n\\tjne %l[hit]\" : : \"r\"(x) : \"cc\" : hit);\n"
         "  r = 1; return r;\n"
@@ -243,7 +243,7 @@ TEST(LirAsmGotoLabels, ABranchingTemplateGetsBothTheLabelEdgeAndTheFallThrough) 
 // opposite one, and the two together are why `openBlockIsTerminated` is asked
 // rather than assumed.
 TEST(LirAsmGotoLabels, AnUnconditionalTemplateSealsItsOwnBlockAndGetsNoSecondBranch) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int x){ int r; r = 0;\n"
         "  __asm__ goto (\"jmp %l[done]\" : : \"r\"(x) : : done);\n"
         "  r = 1; return r;\n"
@@ -308,7 +308,7 @@ TEST(LirAsmGotoLabels, AnUnconditionalTemplateSealsItsOwnBlockAndGetsNoSecondBra
 // without which "no ret_piece" would also be true of a module where the asm
 // never lowered at all.
 TEST(LirAsmGotoLabels, ResultPieceZeroIsPublishedByTheExpansionNotByTheCallConvention) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int x){ int r; r = 0;\n"
         "  __asm__ goto (\"movl $7, %0\\n\\tcmpl $0, %1\\n\\tjne %l2\"\n"
         "                : \"=&r\"(r) : \"r\"(x) : \"cc\" : hit);\n"
@@ -367,7 +367,7 @@ TEST(LirAsmGotoLabels, ResultPieceZeroIsPublishedByTheExpansionNotByTheCallConve
 // operand(s) bound to this assembly template ('%0', '%1')"* — because the
 // binding table carried one row per operand rather than one per SPELLING.
 TEST(LirAsmGotoLabels, ASymbolicOperandNameIsOneMoreBindingRowForTheSameRegister) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int a){ int out; out = 0;\n"
         "  __asm__ (\"movl %[in], %[out]\" : [out] \"=r\"(out) : [in] \"r\"(a));\n"
         "  return out; }",
@@ -380,7 +380,7 @@ TEST(LirAsmGotoLabels, ASymbolicOperandNameIsOneMoreBindingRowForTheSameRegister
     // The positional form of the SAME operands must still resolve — the
     // symbolic row is an ADDITION, and a lowering that replaced the positional
     // row with it would pass the arm above and break every existing template.
-    auto P = lowerCSubsetToLir(
+    auto P = lowerCToLir(
         "int f(int a){ int out; out = 0;\n"
         "  __asm__ (\"movl %1, %0\" : [out] \"=r\"(out) : [in] \"r\"(a));\n"
         "  return out; }",
@@ -403,7 +403,7 @@ TEST(LirAsmGotoLabels, ASymbolicOperandNameIsOneMoreBindingRowForTheSameRegister
 // `rax` — the class of bug that shows up as a wrong answer three cycles later
 // in a program that merely got bigger.
 TEST(LirAsmGotoLabels, APinnedOutputIsCapturedOutOfItsRegisterOnEveryEdge) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int x){ int r; r = 0;\n"
         "  __asm__ goto (\"movl $9, %0\\n\\tcmpl $0, %1\\n\\tjne %l2\"\n"
         "                : \"=a\"(r) : \"r\"(x) : \"cc\" : hit);\n"
@@ -451,7 +451,7 @@ TEST(LirAsmGotoLabels, APinnedOutputIsCapturedOutOfItsRegisterOnEveryEdge) {
 // their diagnostics: a `.s`-style label inside a template (nothing bound it)
 // and a label placeholder used as a VALUE rather than as a branch target.
 TEST(LirAsmGotoLabels, AnUnboundBranchTargetIsRefusedNamingTheBoundLabels) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int x){ int r; r = 0;\n"
         "  __asm__ goto (\"jmp Lnowhere\" : : \"r\"(x) : : done);\n"
         "  r = 1; return r;\n"
@@ -490,7 +490,7 @@ TEST(LirAsmGotoLabels, AnUnboundBranchTargetIsRefusedNamingTheBoundLabels) {
 // `LirBuilder::closeFunction: block created but never `beginBlock`'d`, on a
 // program whose only defect was a typo'd instruction.
 TEST(LirAsmGotoLabels, ARefusalAfterTheCaptureBlocksExistIsReportedNotAborted) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "int f(int x){ int r; r = 0;\n"
         "  __asm__ goto (\"frobnicate %0\" : \"=a\"(r) : \"r\"(x) : : done);\n"
         "  return r;\n"

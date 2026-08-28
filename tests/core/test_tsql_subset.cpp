@@ -730,12 +730,49 @@ TEST(TsqlSubset, NotNullClauseInCreateTable) {
     EXPECT_TRUE(t.diagnostics().all().empty());
 }
 
-TEST(TsqlSubset, SchemaIdsAreDistinctPerLoad) {
-    auto a = GrammarSchema::loadShipped("tsql-subset");
-    auto b = GrammarSchema::loadShipped("tsql-subset");
-    ASSERT_TRUE(a.has_value());
-    ASSERT_TRUE(b.has_value());
-    EXPECT_NE((*a)->schemaId().v, (*b)->schemaId().v);
+// ⚠ RENAMED AND RE-AIMED 2026-08-25 (cycle P35, lane A). It was
+// `SchemaIdsAreDistinctPerLoad`, and it loaded `tsql-subset` TWICE.
+//
+// ★ SAY IT PLAINLY: THE OLD NAME ASSERTED A PROPERTY THE COMPILER NO LONGER
+// HAS, and the assertion was not quietly dropped — it was replaced by the one
+// the id actually has to carry. The content-addressed memo
+// (D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS)
+// builds one document's bytes ONCE per process and hands every later load the
+// same schema, so "each load mints a new id" is now false BY DESIGN. It is not
+// a regression and there is nothing left to pin under the old name: two loads
+// of one unchanged document are one schema, and one schema has one id.
+//
+// ★★ WHAT A SchemaId MUST STILL GUARANTEE, and what this now tests: two
+// DIFFERENT language documents must never share one id. That is the property
+// every consumer actually spends — `UnitBuilder`'s schema-registry dedup,
+// `SemanticAnalyzer`'s and `CstToHir`'s per-schema index maps (both keyed by
+// `schemaId().v`), and `ImportResolver::owns`, which decides whether a tree
+// belongs to THIS resolver's language. A collision between two languages
+// would route one language's trees through the other's tables; a collision
+// between two loads of ONE language cannot, because they describe the same
+// language. The old form never exercised the dangerous case at all — it would
+// have stayed green if `tsql-subset` and `toy` had collided.
+//
+// ★★★ AND THE COLLAPSE ITSELF IS PINNED, not assumed: the third load below
+// must come back as the SAME object with the SAME id, so a memo that silently
+// stopped memoizing reds here as well.
+TEST(TsqlSubset, DistinctLanguageDocumentsMintDistinctSchemaIds) {
+    auto tsql = GrammarSchema::loadShipped("tsql-subset");
+    auto toy  = GrammarSchema::loadShipped("toy");
+    ASSERT_TRUE(tsql.has_value());
+    ASSERT_TRUE(toy.has_value()) << "'toy' must be a shipped language";
+    EXPECT_NE((*tsql)->schemaId().v, (*toy)->schemaId().v)
+        << "two DIFFERENT language documents share one SchemaId — the "
+           "per-schema index maps and ImportResolver::owns would route one "
+           "language's trees through the other's tables";
+
+    auto again = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(tsql->get(), again->get())
+        << "two loads of ONE unchanged document must share the memoized schema";
+    EXPECT_EQ((*tsql)->schemaId().v, (*again)->schemaId().v)
+        << "one build means one id — a second id here would mean the document "
+           "was rebuilt";
 }
 
 // ── Body-mode E2E pins ───────────────────────────────────────────────────

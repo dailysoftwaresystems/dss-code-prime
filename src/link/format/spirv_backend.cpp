@@ -147,6 +147,15 @@ public:
     }
     [[nodiscard]] std::span<StackReserveVehicle const>
     stackReserveVehicles() const noexcept override { return {}; }
+    [[nodiscard]] std::span<WeakDefinitionDialect const>
+    weakDefinitionDialects() const noexcept override {
+        // SPIR-V has no coalescing symbol model and this walker writes no weak
+        // definition in any spelling. Claiming none is what makes a SPIR-V
+        // document declaring `weakDefinition` fail loud at LOAD, instead of
+        // carrying a key nobody reads. The row is
+        // D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS.
+        return {};
+    }
 
     // Not a native image, not a program the OS starts, and not an `ar`
     // member — SPIR-V has no such shapes. `allowsUndefinedImports` is
@@ -166,6 +175,18 @@ public:
     }
     [[nodiscard]] bool isRelocatableMember(
             detail::ObjectFormatData const&) const noexcept override {
+        return false;
+    }
+
+    // SPIR-V ships no relocatable-object READER, so there is no shape for
+    // this backend to recognize and no bytes it could hand a linker — the
+    // strict answer, exactly as above. (A SPIR-V module DOES have a magic —
+    // `0x07230203` — and the day a reader lands, THAT is the change that
+    // earns a real check here; claiming recognition first would route a file
+    // to a reader that does not exist.)
+    [[nodiscard]] bool looksLikeRelocatableObject(
+            detail::ObjectFormatData const&,
+            std::span<std::uint8_t const>) const noexcept override {
         return false;
     }
 

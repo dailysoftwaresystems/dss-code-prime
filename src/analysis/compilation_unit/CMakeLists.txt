@@ -5,7 +5,7 @@ add_library(analysis_compilation_unit OBJECT
 
 target_include_directories(analysis_compilation_unit PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
-# Aggregated into dss-code-prime-lib via $<TARGET_OBJECTS:analysis_compilation_unit>
+# Aggregated into dsscp-lib via $<TARGET_OBJECTS:analysis_compilation_unit>
 # at src/CMakeLists.txt — same pattern as core/, tokenizer/, analysis_syntactic/.
 # DSS_BUILDING_DLL must live here (not on the SHARED target) so DSS_EXPORT
 # decorations resolve to dllexport when these .obj files are produced on MSVC.

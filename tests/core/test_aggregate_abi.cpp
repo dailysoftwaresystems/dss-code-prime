@@ -1,6 +1,6 @@
 // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the by-value aggregate ABI classifier.
 // Exhaustive SysV AMD64 eightbyte truth-table — every form built directly via the
-// interner (incl. forms no shipped c-subset program reaches yet). A wrong
+// interner (incl. forms no shipped c program reaches yet). A wrong
 // classification = a SILENT MISCOMPILE (struct passed in the wrong registers), so
 // these pin the EXACT (class, offset, width) of every eightbyte. AGNOSTIC: the
 // engine switches on the AggregateClassKind strategy, never on a target name.

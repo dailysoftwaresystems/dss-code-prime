@@ -391,8 +391,7 @@ walkExportTrie(std::span<std::uint8_t const>    bytes,
             // story is `$ld$` linker-set aliases, which are distinct symbol
             // NAMES rather than a version attached to one name. The export
             // trie has no version field to read. See
-            // `ffi/import_surface.hpp` (D-FFI-BINARY-READER-SURFACES-NO-
-            // SYMBOL-VERSION).
+            // `ffi/import_surface.hpp` (D-FFI-BINARY-READER-SURFACES-NO-SYMBOL-VERSION).
 
             if ((flags & kExportReexport) != 0u) {
                 // Reexport (the PE-forwarder analog): payload is

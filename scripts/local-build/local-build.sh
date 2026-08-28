@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# PURPOSE: build dss-code-prime incrementally on this host, and optionally run ctest.
-# Local incremental build + test harness for dss-code-prime.
+# PURPOSE: build dsscp incrementally on this host, and optionally run ctest.
+# Local incremental build + test harness for dsscp.
 #
 # Usage:
 #   scripts/local-build/local-build.sh                    # build build/dbg
@@ -52,8 +52,9 @@ default_build_type_for() {
 }
 
 # ── TOOLCHAIN I/O FAILURE — a distinct outcome from a build failure ─────────
-# ✔MEASURED 2026-08-20 (cycle P23, D-BUILD-CONCURRENT-LANES-TRIP-A-TOOLCHAIN-
-# HEADER-READ-FAILURE): under several concurrent lane builds, g++ failed to READ
+# ✔MEASURED 2026-08-20 (cycle P23,
+# D-BUILD-CONCURRENT-LANES-TRIP-A-TOOLCHAIN-HEADER-READ-FAILURE):
+# under several concurrent lane builds, g++ failed to READ
 # a standard-library header and printed
 #     C:/Strawberry/c/include/c++/13.2.0/bits/locale_facets.tcc: Invalid argument
 # followed by ~6 CASCADED diagnostics that look exactly like source defects
@@ -255,7 +256,10 @@ fi
 # `pipefail` is left alone: it is set globally and the rest of the script relies on it.
 build_log="$BUILD_DIR/.local-build-last.log"
 set +e
-cmake --build "$BUILD_DIR" 2>&1 | tee "$build_log"
+# ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".
+# ⚠ A BARE `cmake --build` HANDS OFF TO NINJA, WHOSE DEFAULT IS ALL CORES. This site
+# was wide open while every discussion of parallelism was about ctest.
+cmake --build "$BUILD_DIR" --parallel "${DSS_JOBS:-6}" 2>&1 | tee "$build_log"
 build_rc=${PIPESTATUS[0]}
 set -e
 if [[ $build_rc -ne 0 ]] && local_build_toolchain_io_failure "$build_log"; then
@@ -265,9 +269,9 @@ fi
 [[ $build_rc -eq 0 ]] || exit "$build_rc"
 
 if [[ "$run_test" == 1 ]]; then
-    # See scripts/run-gate/run-gate.sh for the measurement behind the 8.
+    # ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".
     # Set CTEST_PARALLEL_LEVEL in the environment, or pass -j, to override.
-    : "${CTEST_PARALLEL_LEVEL:=8}"
+    : "${CTEST_PARALLEL_LEVEL:=6}"
     export CTEST_PARALLEL_LEVEL
     (cd "$BUILD_DIR" && ctest --output-on-failure)
 fi

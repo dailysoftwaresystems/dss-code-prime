@@ -80,6 +80,13 @@ DiagnosticReporter::Snapshot DiagnosticReporter::snapshotForRollback() const {
     s.hitCap         = hitCap_;
     s.droppedByCap   = droppedByCap_;
     s.capMarkerIndex = capMarkerIndex_;
+    // D-DIAG-MAXPERCODE-SILENT-COALESCE: the elision ledger holds indices into
+    // `all_`, which `truncateTo` shrinks — so it travels for exactly the reason
+    // `capMarkerIndex` does. Omitting it would leave a speculative parse's
+    // marker index live after the diagnostics it indexed were rolled away, and
+    // the next elision on that code would rewrite whatever now sits at that
+    // index — or run off the end.
+    s.elided         = elided_;
     return s;
 }
 
@@ -104,6 +111,7 @@ void DiagnosticReporter::truncateTo(Snapshot const& snap) {
     hitCap_         = snap.hitCap;
     droppedByCap_   = snap.droppedByCap;
     capMarkerIndex_ = snap.capMarkerIndex;
+    elided_         = snap.elided;
 }
 
 void DiagnosticReporter::reanchorFrom(std::size_t      from,
@@ -317,6 +325,97 @@ void DiagnosticReporter::noteCapDrop_() {
                    droppedByCap_ == 1 ? "it" : "them");
 }
 
+DiagnosticReporter::ElisionLedger
+DiagnosticReporter::elisionFor(DiagnosticCode code) const noexcept {
+    const auto it = elided_.find(code);
+    return it == elided_.end() ? ElisionLedger{} : it->second;
+}
+
+void DiagnosticReporter::rewriteElisionMarker_(DiagnosticCode code) {
+    ElisionLedger const& led = elided_.at(code);
+    if (led.markerIndex >= all_.size()) {
+        capMarkerFatal(led.markerIndex, all_.size());
+    }
+    // ⚠ NAMES THE CODE, THE CAP, BOTH ELISION ROUTES, AND THE REMEDY — and
+    // every one of those four is load-bearing, because the reader of this line
+    // is someone who does NOT already know the diagnostic engine has caps.
+    //   * THE CODE, in the same `X0009`-style spelling its own diagnostics
+    //     carry, so the marker can be tied back to the messages it abbreviates
+    //     without the reader mapping an enum name to a rendered prefix.
+    //   * THE CAP, because "some were hidden" without a number is the defect
+    //     this replaces: it tells an operator they are missing something but
+    //     not whether it is one diagnostic or ten thousand.
+    //   * BOTH ROUTES SEPARATELY, because they mean different things. A
+    //     coalesced diagnostic is a DISTINCT occurrence the reader has not
+    //     seen; a deduped one is a repeat of something already on screen.
+    //     Summing them would tell the reader less than either number alone.
+    //   * THE REMEDY, spelled as the flag first and the embedder field second,
+    //     for the reason `noteCapDrop_` states at length: `core/` is below the
+    //     driver and is also consumed by the LSP and by embedders, but the
+    //     overwhelming reader is an operator at a terminal, and a remedy they
+    //     cannot type is not a remedy.
+    //
+    // ⚠ PURE ASCII, deliberately — same reason as `noteCapDrop_`: this string
+    // is byte-compared by a test, no `/utf-8` is passed to MSVC anywhere in
+    // this build, and a non-ASCII literal whose encoding depends on the
+    // compiler's idea of the source charset is a cross-toolchain flake waiting
+    // for the next CI leg.
+    std::string& text = all_[led.markerIndex].actual;
+    text.clear();
+    std::format_to(std::back_inserter(text),
+                   "{} ({}) diagnostics were ELIDED and NOT shown, so any "
+                   "count you have for this code is a FLOOR and not a total: "
+                   "{} coalesced past the per-code cap of {}, {} dropped as "
+                   "recent duplicates. Raise the cap above {} to see them: "
+                   "pass --max-per-code=N on the command line, or set "
+                   "DiagnosticReporter::Config::maxPerCode when embedding.",
+                   diagnosticCodePrefix(code),
+                   diagnosticCodeName(code),
+                   led.coalesced,
+                   cfg_.maxPerCode,
+                   led.deduped,
+                   cfg_.maxPerCode);
+}
+
+void DiagnosticReporter::noteElision_(ParseDiagnostic const& d,
+                                      ElisionKind kind) {
+    const DiagnosticCode code = d.code;
+    auto [it, minted] = elided_.try_emplace(code);
+    ElisionLedger& led = it->second;
+    if (kind == ElisionKind::PerCodeCap) {
+        ++led.coalesced;
+    } else {
+        ++led.deduped;
+    }
+
+    if (minted) {
+        // FIRST elision for this code: mint the marker.
+        //
+        // ★ PUSHED DIRECTLY RATHER THAN RE-ENTERED THROUGH `report`, for the
+        // reason `P_TooManyDiagnostics` is: the notice that diagnostics were
+        // hidden must not itself be hideable, or the gate becomes silent again
+        // through the front door. Re-entering would also recurse — this marker
+        // has its own code, whose own per-code counter would eventually cap.
+        ParseDiagnostic marker{};
+        marker.code     = DiagnosticCode::P_DiagnosticsElided;
+        // ⚠ `Info`, NOT `Error` and NOT `Warning`. This states that output was
+        // abbreviated; it is not itself a fault. At Error it would flip
+        // `hasErrors()` and fail a build whose only sin was 51 warnings of one
+        // kind; at Warning `--warnings-as-errors` would do the same. The
+        // elision is a fact ABOUT the diagnostics, not one more diagnostic.
+        marker.severity = DiagnosticSeverity::Info;
+        marker.delivery = DiagnosticDelivery::Guaranteed;
+        // Inherit the elided diagnostic's locus so the marker renders
+        // positioned, next to the messages it abbreviates, rather than as a
+        // context-free line at the end of the run.
+        marker.buffer   = d.buffer;
+        marker.span     = d.span;
+        led.markerIndex = all_.size();
+        all_.push_back(std::move(marker));
+    }
+    rewriteElisionMarker_(code);
+}
+
 bool DiagnosticReporter::isRecentDuplicate(ParseDiagnostic const& d) const noexcept {
     if (cfg_.dedupWindow == 0) return false;
     const auto key = hashKey(d);
@@ -354,15 +453,37 @@ void DiagnosticReporter::report(ParseDiagnostic d) {
     }
 
     if (isRecentDuplicate(*filtered)) {
+        // ⚠ COUNTED, NOT MERELY DROPPED (D-DIAG-MAXPERCODE-SILENT-COALESCE).
+        // This gate used to return in silence. It is the SECOND unannounced
+        // dropper — identical (code, buffer, span, rule, actual) within the
+        // last `dedupWindow` reports vanished with no trace — and it would
+        // have become this row's successor the moment the per-code cap was
+        // fixed, so it is fixed in the same place by the same mechanism.
+        noteElision_(*filtered, ElisionKind::DedupWindow);
         return;
     }
 
     auto& counts = perCode_[filtered->code];
     if (counts >= cfg_.maxPerCode) {
-        // Per-code cap: silently coalesce. We don't emit a marker here
-        // because per-code coalescing is the normal mode of operation on
-        // noisy passes (e.g. P_UnknownToken on a corrupted file); the
-        // *global* cap below is what gets the visible marker.
+        // ★★★ THE PER-CODE CAP NOW ANNOUNCES ITSELF.
+        //
+        // The prose this replaces read: "Per-code cap: silently coalesce. We
+        // don't emit a marker here because per-code coalescing is the normal
+        // mode of operation on noisy passes; the *global* cap below is what
+        // gets the visible marker." ⚠ THAT REASONING WAS EXACTLY BACKWARDS,
+        // and the source admitting it in so many words is what made the defect
+        // survive an entire arc. Being the NORMAL mode of operation is what
+        // makes announcing it MANDATORY, not optional: the gate that fires
+        // constantly is the one whose silence corrupts the most numbers.
+        // ✔MEASURED: because this gate is checked BEFORE `maxDiagnostics`, an
+        // ordinary tier is bounded at (distinct codes x maxPerCode) and never
+        // reaches the global cap at all — so the cap that got the marker is
+        // the one that essentially never fires.
+        //
+        // ⛔ AND THE FIX IS NOT A BIGGER CAP. A rarer silent cap is strictly
+        // worse than a common one: it fires less often and is therefore
+        // trusted more. The defect is the SILENCE, not the value.
+        noteElision_(*filtered, ElisionKind::PerCodeCap);
         return;
     }
 
@@ -577,7 +698,14 @@ void appendExpectedActual(std::string& out, ParseDiagnostic const& d) {
         // (D-DIAG-PROSE-MESSAGE-RENDERS-WITH-A-BARE-GOT-PREFIX).
         out += d.actual;
     } else {
-        out += diagnosticCodeName(d.code);
+        // D-DIAG-TWO-CODE-RENDERINGS hazard (H2). This used to be
+        // `diagnosticCodeName(d.code)` — a SECOND copy of the code on a line
+        // whose bracket already names it, which any de-duplicating census
+        // double-counts unless it normalises first. Stating the fact instead of
+        // echoing the header removes the hazard rather than relocating it; the
+        // one owner of the wording is `kNoDiagnosticDetailRecorded`, shared with
+        // the LSP's `composeMessage` so the two surfaces cannot drift.
+        out += kNoDiagnosticDetailRecorded;
     }
 }
 
@@ -608,18 +736,34 @@ std::string DiagnosticReporter::format(ParseDiagnostic const& d,
                                        BufferRegistry const& bufs) const {
     std::string out;
 
-    // Header line: <severityName>[<codePrefix>]: <contextPrefix><expected/actual prose>
-    // The two bracket-rendered fields are distinct concepts: <codePrefix>
-    // is the single-letter band (`P`/`D`/`H`/...) from `diagnosticCodePrefix`,
-    // while <contextPrefix> is the per-target `[target=...]` stamp set by
-    // `program::mergeWithTargetContext`.
+    // Header line: <severityName>[<diagnosticCodeName>]: <contextPrefix><expected/actual prose>
+    //
+    // ★★★ D-DIAG-TWO-CODE-RENDERINGS: THE BRACKET HOLDS THE SYMBOLIC NAME, AND
+    // THIS SITE IS THE ONE THAT MOVED. It used to render `diagnosticCodePrefix`
+    // (the 4-hex-digit band form, `error[P0009]:`) while the CLI's buffer-less
+    // one-liner, both `dump_predefined_macros` emitters, the LSP `code` field
+    // and `lsp/workspace_project` all rendered `diagnosticCodeName` — so ONE
+    // concept had TWO surface spellings and which one a reader got depended on
+    // whether the diagnostic happened to carry a source buffer. The full
+    // argument for the name over the hex, and the four measurements that
+    // refuted the hex, are in `diagnostic_reporter.hpp` above
+    // `kNoDiagnosticDetailRecorded` — read them before changing this line back.
+    //
+    // ⚠ `diagnosticCodePrefix` is NOT dead: `hir_text.cpp`'s `@diag(code N)`
+    // handler still renders it, deliberately, to show an operator what an
+    // unallocated code WOULD have looked like. That is a different surface
+    // (HIR text) with a different reader, and it is not a diagnostic header.
+    //
+    // The two bracket-rendered fields remain distinct concepts: the code
+    // identifies the diagnostic, while <contextPrefix> is the per-target
+    // `[target=...]` stamp set by `program::mergeWithTargetContext`.
     // D-MERGE-DEDUP-PREFIX-COLLISION: contextPrefix is rendered here
     // (not stored in `actual`) so the dedup hash key — which includes
     // `actual` — sees the un-prefixed diagnostic.
     std::format_to(std::back_inserter(out),
                    "{}[{}]: ",
                    severityName(d.severity),
-                   diagnosticCodePrefix(d.code));
+                   diagnosticCodeName(d.code));
     out += d.contextPrefix;
     appendExpectedActual(out, d);
     out += '\n';

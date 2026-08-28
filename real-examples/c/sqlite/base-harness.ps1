@@ -71,7 +71,7 @@ $script:DssBaseHarnessVersion = 2
 # (`TargetSpec::outputExtension`, keyed on the closed object-format enum) and
 # src/program/program.cpp:216 reports every artifact it commits:
 #
-#     dss-code-prime: artifact <targetSpec> <absolute path>
+#     dsscp: artifact <targetSpec> <absolute path>
 #
 # A target spec cannot contain whitespace (DSS refuses one that does), so the
 # path is the whole REMAINDER of the line and an output dir with a space in it
@@ -81,7 +81,7 @@ $script:DssBaseHarnessVersion = 2
 # Get-DssReportedArtifacts — every DISTINCT path reported for <spec>, in order.
 function Get-DssReportedArtifacts($compileLog, $spec) {
   if (-not (Test-Path -LiteralPath $compileLog)) { return @() }
-  $marker = "dss-code-prime: artifact $spec "
+  $marker = "dsscp: artifact $spec "
   $seen = [System.Collections.Generic.List[string]]::new()
   foreach ($l in (Get-Content -LiteralPath $compileLog)) {
     if ("$l".StartsWith($marker, [System.StringComparison]::Ordinal)) {
@@ -119,7 +119,7 @@ function Get-DssReportedArtifacts($compileLog, $spec) {
 function Get-DssReportedArtifact($compileLog, $spec) {
   $all = @(Get-DssReportedArtifacts $compileLog $spec)
   if ($all.Count -eq 0) {
-    return @{ Ok = $false; Path = $null; Error = "the build reported NO artefact for $spec (expected a 'dss-code-prime: artifact $spec <path>' line in $compileLog)" }
+    return @{ Ok = $false; Path = $null; Error = "the build reported NO artefact for $spec (expected a 'dsscp: artifact $spec <path>' line in $compileLog)" }
   }
   if ($all.Count -gt 1) {
     return @{ Ok = $false; Path = $null; Error = @"
@@ -187,7 +187,7 @@ function New-DssManifest {
 
 # Invoke-DssBuild -> @{ Ok; Path; ErrCount; TimeSuffix; Error; Log }
 #
-# dss-code-prime RETURNS EXIT 0 EVEN ON FATAL ERRORS, so the verdict is taken
+# dsscp RETURNS EXIT 0 EVEN ON FATAL ERRORS, so the verdict is taken
 # from `error[` in the log PLUS the artefact the build itself reported — never
 # from the process exit status. The three failure statements are kept DISTINCT
 # because they have three different remedies: diagnostics were emitted / the
@@ -287,20 +287,20 @@ function Invoke-DssBaseHarnessSelfTest {
 
     # ── 1. the artifact reader ────────────────────────────────────────────────
     $log1 = Join-Path $T 'log1'
-    Set-Content -LiteralPath $log1 -Value @("noise", "dss-code-prime: artifact $spec /out/a", "more noise")
+    Set-Content -LiteralPath $log1 -Value @("noise", "dsscp: artifact $spec /out/a", "more noise")
     Assert-DssStEq "reported_artifact reads the path" "/out/a" (Get-DssReportedArtifact $log1 $spec).Path
     Assert-DssStEq "  … and reports Ok" "True" (Get-DssReportedArtifact $log1 $spec).Ok
 
     # A path with a SPACE: the spec is one token by construction, so the path is
     # the whole remainder of the line and must survive intact.
     $logS = Join-Path $T 'logS'
-    Set-Content -LiteralPath $logS -Value @("dss-code-prime: artifact $spec /out dir/a")
+    Set-Content -LiteralPath $logS -Value @("dsscp: artifact $spec /out dir/a")
     Assert-DssStEq "reported_artifact keeps a path containing a space" "/out dir/a" (Get-DssReportedArtifact $logS $spec).Path
 
     # THE LEGITIMATE RE-RUN CASE: the same path reported twice COLLAPSES to one
     # answer. This is what makes the refusal below safe to be strict.
     $log2 = Join-Path $T 'log2'
-    Set-Content -LiteralPath $log2 -Value @("dss-code-prime: artifact $spec /out/a", "dss-code-prime: artifact $spec /out/a")
+    Set-Content -LiteralPath $log2 -Value @("dsscp: artifact $spec /out/a", "dsscp: artifact $spec /out/a")
     Assert-DssStEq "a REPEATED identical report collapses to ONE artefact" "1" (@(Get-DssReportedArtifacts $log2 $spec)).Count
     Assert-DssStEq "  … and is still Ok" "True" (Get-DssReportedArtifact $log2 $spec).Ok
 
@@ -308,14 +308,14 @@ function Invoke-DssBaseHarnessSelfTest {
     # the LAST one — the rule this driver's private Get-ReportedArtifact still
     # implemented after the shared core had refused it. It must REFUSE.
     $log3 = Join-Path $T 'log3'
-    Set-Content -LiteralPath $log3 -Value @("dss-code-prime: artifact $spec /out/a", "dss-code-prime: artifact $spec /out/b")
+    Set-Content -LiteralPath $log3 -Value @("dsscp: artifact $spec /out/a", "dsscp: artifact $spec /out/b")
     $amb = Get-DssReportedArtifact $log3 $spec
     Assert-DssStEq "TWO DIFFERENT artefacts for one spec is REFUSED" "False" $amb.Ok
     Assert-DssStEq "  … and the refusal NAMES both paths" "True" (("$($amb.Error)" -like '*/out/a*') -and ("$($amb.Error)" -like '*/out/b*'))
 
     # A sibling spec's line must never be handed back for ours.
     $log4 = Join-Path $T 'log4'
-    Set-Content -LiteralPath $log4 -Value @("dss-code-prime: artifact arm64:elf64-aarch64-linux-exec /out/other")
+    Set-Content -LiteralPath $log4 -Value @("dsscp: artifact arm64:elf64-aarch64-linux-exec /out/other")
     Assert-DssStEq "a DIFFERENT spec's artefact is not returned" "False" (Get-DssReportedArtifact $log4 $spec).Ok
     Assert-DssStEq "an absent log is a verdict, not a crash" "False" (Get-DssReportedArtifact (Join-Path $T 'nosuch') $spec).Ok
 
@@ -331,7 +331,7 @@ function Invoke-DssBaseHarnessSelfTest {
 
     # ── 3. Invoke-DssBuild's three failure statements ─────────────────────────
     # A FAKE compiler, because the decisions under test are all about reading its
-    # OUTPUT: dss-code-prime returns 0 even on fatal errors, so the verdict comes
+    # OUTPUT: dsscp returns 0 even on fatal errors, so the verdict comes
     # from `error[` plus the artefact the build itself reported.
     $fake = Join-Path $T 'fake-dss.ps1'
     Set-Content -LiteralPath $fake -Value @'
@@ -353,12 +353,12 @@ exit 0
     Assert-DssStEq "0 error[ and NO artefact report is NOT Ok" "False" $r.Ok
     Assert-DssStEq "  … and says the build reported nothing" "True" ("$($r.Error)" -like '*NO artefact*')
 
-    Set-Content -LiteralPath $say -Value @("dss-code-prime: artifact $spec $T/not-written.bin")
+    Set-Content -LiteralPath $say -Value @("dsscp: artifact $spec $T/not-written.bin")
     $r = Invoke-DssBuild -DssBin $fake -Manifest 'm' -Config 'debug' -OutputDir $T -Log $bLog -Spec $spec
     Assert-DssStEq "an artefact REPORTED but not on disk is NOT Ok" "False" $r.Ok
     Assert-DssStEq "  … and quotes what the compiler claimed" "True" ("$($r.Error)" -like '*not-written.bin*')
 
-    Set-Content -LiteralPath $say -Value @("compile time 1.5s", "dss-code-prime: artifact $spec $real")
+    Set-Content -LiteralPath $say -Value @("compile time 1.5s", "dsscp: artifact $spec $real")
     $r = Invoke-DssBuild -DssBin $fake -Manifest 'm' -Config 'debug' -OutputDir $T -Log $bLog -Spec $spec
     Assert-DssStEq "a real artefact with 0 error[ IS Ok (the control)" "True" $r.Ok
     Assert-DssStEq "  … and carries the compile-time suffix" "  (compile time 1.5s)" $r.TimeSuffix

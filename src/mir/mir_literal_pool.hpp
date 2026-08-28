@@ -57,8 +57,8 @@ struct MirLiteralValue {
     // container value + a wide literal's limbs both flow through it; the globals
     // byte-emitter fails loud on it (wide `_BitInt` data-globals are deferred).
     // LD-3 adds the `WideFloatValue` arm (`core` ∈ {F80, F128}) — the SAME host
-    // wide-float value type the HIR pool carries (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-
-    // PRECISION): a FOLDED F80/F128 arithmetic result at TRUE 80/128-bit
+    // wide-float value type the HIR pool carries (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION):
+    // a FOLDED F80/F128 arithmetic result at TRUE 80/128-bit
     // precision. The globals byte-emitter encodes it via `appendWideFloatBits`
     // (its `get_if<WideFloatValue>` branch, checked BEFORE the `double` arm); an
     // UNFOLDED F80/F128 leaf still rides the pre-existing `double` arm's dedicated

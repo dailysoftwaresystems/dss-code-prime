@@ -63,8 +63,8 @@ std::uint16_t op(std::string_view mnemonic) {
     ImplicitRegisterConstraint c;
     // ⚠ `rax` appears in BOTH `outputs` and `clobbered`, and that is not
     // decoration: `LirBuilder::regConstraintPoolAdd` enforces
-    // `outputs ⊆ clobbered` (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-
-    // SUBSET-OF-CLOBBERED), so a set that declared `rax` an output
+    // `outputs ⊆ clobbered` (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED),
+    // so a set that declared `rax` an output
     // without clobbering it would abort the process here instead of
     // reaching the verifier rule this fixture exists to exercise.
     c.inputNames        = {"rcx"};
@@ -379,7 +379,7 @@ TEST(LirVerifierSideStructures, ARebuildThatAddsReferencesVerifiesClean) {
 // because its only subjects were modules the rule's own author had
 // hand-assembled out of arenas. A hand-built module can only ever
 // re-state its author's belief about what the compiler emits. So the
-// accept arm below lowers c-subset SOURCE through `lowerToLir` and
+// accept arm below lowers c SOURCE through `lowerToLir` and
 // asserts the verifier accepts what the compiler actually produced.
 // ⚠ If someone narrows the rule back, THIS is the test that reds.
 //
@@ -419,7 +419,7 @@ TEST(LirVerifierMemAddressing, RealLoweringOfAGlobalReadIsACCEPTED) {
     // reading a global lowers to `lea r, [@sym]` — a symbol-addressed
     // operand list with NO MemBase/MemOffset pair. Under the pre-fix rule
     // this module was rejected and `verifyLir` could not be wired at all.
-    auto lowered = test_support::lowerCSubsetToLir(
+    auto lowered = test_support::lowerCToLir(
         "int g = 7;\n"
         "int addr_of_g_is_read(void) { return g; }\n");
     ASSERT_TRUE(lowered.lir.ok) << "fixture failed to lower the source";
@@ -444,7 +444,7 @@ TEST(LirVerifierMemAddressing, RealLoweringOfComputedGotoIsACCEPTED) {
     // Membership, not position, is the property that holds. This test is
     // what stops a future "simplification" from re-introducing the bug in a
     // narrower form.
-    auto lowered = test_support::lowerCSubsetToLir(
+    auto lowered = test_support::lowerCToLir(
         "int dispatch(void) {\n"
         "  void *t = &&done;\n"
         "  goto *t;\n"
@@ -523,92 +523,4 @@ TEST(LirVerifierMemAddressing, MalformedAddressesAreSTILLREJECTED) {
         EXPECT_EQ(countDiags(rep, DiagnosticCode::L_MemOperandMalformed), 1u)
             << what;
     }
-}
-
-// ═════════════════════════════════════════════════════════════════════
-// 2-address legalize: a refused terminator must UNWIND, not abort
-// (D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE).
-//
-// ★ RED-ON-DISABLE IS UNMISSABLE HERE AND NEEDS NO ASSERTION TO READ IT.
-// Before the fix, `legalizeTwoAddress` let a refused `emitTerminator` fall
-// through, left the destination block unterminated, and drove the builder
-// onwards — so `LirBuilder::finish()` hit its own invariant and
-// `std::abort()`ed. The pre-fix behaviour KILLS THIS TEST PROCESS rather
-// than failing an EXPECT; the post-fix behaviour is a diagnostic and
-// `ok() == false`.
-//
-// ⚠ The failing module is built through the REAL `LirBuilder`, not out of
-// arenas: `addIndirectBr` accepts an empty target list, so a terminator
-// whose successor list is empty — precisely what the shared dispatch
-// refuses — is reachable without forging a module.
-// ═════════════════════════════════════════════════════════════════════
-
-namespace {
-
-[[nodiscard]] Lir moduleWithZeroSuccessorIndirectBr() {
-    LirBuilder b{*x86Schema()};
-    (void)b.addFunction(SymbolId{1});
-    LirBlockId const entry = b.createBlock();
-    b.beginBlock(entry);
-    LirReg const addr = b.newVReg(LirRegClass::GPR);
-    std::array<LirOperand, 1> const movOps{LirOperand::makeImmInt32(0)};
-    (void)b.addInst(op("mov"), addr, movOps);
-    std::array<LirOperand, 1> const brOps{LirOperand::makeReg(addr)};
-    (void)b.addIndirectBr(op("jmp_indirect"), brOps,
-                          std::span<LirBlockId const>{});
-    return std::move(b).finish();
-}
-
-} // namespace
-
-TEST(LirTwoAddrLegalizeUnwind, ARefusedTerminatorReportsInsteadOfAborting) {
-    Lir const src = moduleWithZeroSuccessorIndirectBr();
-
-    DiagnosticReporter rep;
-    // Pre-fix, control does not return from this call — the process dies
-    // inside `LirBuilder::finish()`.
-    auto const result = legalizeTwoAddress(src, *x86Schema(), rep);
-
-    EXPECT_FALSE(result.ok())
-        << "a pass that could not rebuild the module must not report success";
-    EXPECT_FALSE(result.allFunctionsLegalized)
-        << "the refusal must reach the caller's success channel, not just "
-           "the reporter";
-    EXPECT_GT(rep.errorCount(), 0u) << "a refusal must be a DIAGNOSTIC";
-
-    bool named = false;
-    for (auto const& d : rep.all()) {
-        if (d.actual.find("2-address-legalize") != std::string::npos) named = true;
-    }
-    EXPECT_TRUE(named)
-        << "the diagnostic must name the PASS that refused, so the failure is "
-           "attributable to the legalizer rather than to the builder it would "
-           "otherwise have crashed inside";
-}
-
-TEST(LirTwoAddrLegalizeUnwind, TheUnwoundResultCarriesNoHalfBuiltModule) {
-    // ★ The unwind must hand back NOTHING consumable. `ok()` is false on
-    // both of its clauses — the rebuilt function count never reached
-    // `expectedFuncCount`, AND the flag is false — so a caller that checks
-    // either one is safe. This is the property that makes the refusal a
-    // refusal rather than a half-built module with a warning attached.
-    Lir const src = moduleWithZeroSuccessorIndirectBr();
-    DiagnosticReporter rep;
-    auto const result = legalizeTwoAddress(src, *x86Schema(), rep);
-
-    EXPECT_EQ(result.lir.moduleFuncCount(), 0u);
-    EXPECT_EQ(result.expectedFuncCount, src.moduleFuncCount());
-    EXPECT_NE(result.lir.moduleFuncCount(), result.expectedFuncCount);
-}
-
-TEST(LirTwoAddrLegalizeUnwind, AWellFormedModuleStillLegalizesCleanly) {
-    // The other half: the unwind must not have made the pass pessimistic.
-    auto lowered = test_support::lowerCSubsetToLir(
-        "int add(int a, int b) { return a + b; }\n");
-    ASSERT_TRUE(lowered.lir.ok);
-
-    DiagnosticReporter rep;
-    auto const result = legalizeTwoAddress(lowered.lir.lir, *lowered.target, rep);
-    EXPECT_TRUE(result.allFunctionsLegalized);
-    EXPECT_EQ(result.lir.moduleFuncCount(), result.expectedFuncCount);
 }

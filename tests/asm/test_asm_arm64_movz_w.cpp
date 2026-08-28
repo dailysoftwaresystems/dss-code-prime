@@ -277,7 +277,7 @@ encodeConstMov(TargetSchema const& s, std::int32_t imm, std::uint8_t flags,
     if (!dst.has_value()) return 0;
 
     auto const  cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const rd{static_cast<std::uint32_t>(*dst), 1, cls};
+    LirReg const rd = makePhysicalReg(static_cast<std::uint32_t>(*dst), LirRegClass::GPR);
 
     LirBuilder b{s};
     (void)b.addFunction(SymbolId{1});

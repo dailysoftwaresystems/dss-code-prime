@@ -49,6 +49,41 @@ void emitConflict(DiagnosticReporter& reporter, std::string what) {
                 DiagnosticSeverity::Error, std::move(what));
 }
 
+// (C)'s emitter. A DIFFERENT code from (A)/(B) on purpose, and the split is the
+// same one `validateShippedIncludeClosure` already draws: this fault is not about
+// a TYPE at all, and telling an author their type identity conflicts when what
+// diverged is which DLL a name imports from sends them to the wrong line.
+void emitRealizationConflict(DiagnosticReporter& reporter, std::string what) {
+    dss::report(reporter, DiagnosticCode::F_ShippedCorpusInvariantBroken,
+                DiagnosticSeverity::Error, std::move(what));
+}
+
+// Look one format key up in a descriptor-level map with the per-SYMBOL override
+// MERGED OVER it — symbol keys win, an omitted format inherits the descriptor's.
+// The IDENTICAL merge `realizeRow` and the semantic injector perform, so the
+// three cannot answer differently about the same row; getting this wrong would
+// make the checker compare something no build ever binds.
+//
+// ABSENCE IS A VALUE. It is spelled, not skipped: a row that names an image and a
+// row that names none for this format is a real divergence (order would decide
+// between an import and an unbound reference), so the sentinel has to compare
+// unequal to every image name. It is bracketed for that reason — no config value
+// can collide with it, and it reads correctly in the diagnostic.
+[[nodiscard]] std::string mergedEntry(
+    std::unordered_map<std::string, std::string> const& docMap,
+    std::unordered_map<std::string, std::string> const& symMap,
+    std::string_view formatName) {
+    std::string const key{formatName};
+    if (auto const it = symMap.find(key); it != symMap.end()) return it->second;
+    if (auto const it = docMap.find(key); it != docMap.end()) return it->second;
+    return "<none>";
+}
+
+// The same bracketed-absence convention for a plain optional string field.
+[[nodiscard]] std::string orNone(std::string const& s) {
+    return s.empty() ? std::string{"<none>"} : s;
+}
+
 } // namespace
 
 std::string ShippedTypeConsistency::render(TypeId t, int depth) const {
@@ -140,6 +175,134 @@ void ShippedTypeConsistency::recordNamed(
     ok = false;
 }
 
+void ShippedTypeConsistency::recordRealization(
+    std::string_view origin, ShippedLibDescriptor const& desc,
+    ShippedSymbol const& sym, std::string_view formatName,
+    DiagnosticReporter& reporter, bool& ok) {
+    // EVERY non-type axis of the row, resolved for THIS format, in one canonical
+    // string. The list is the struct's own realization-bearing field set, not a
+    // sample: each of these is a fact the FIRST-WINS injection takes from the
+    // winner and throws away from the loser, so each is a fact two independently
+    // authored descriptors can silently disagree about. `availableObjectFormats`
+    // is absent by design — it is the GATE that chose these rows, never an axis
+    // they must agree on.
+    std::string traits = std::format(
+        "library={} source={} synthesize={} linkName={} version={} kind={} "
+        "linkage={} noreturn={} returnsTwice={}",
+        mergedEntry(desc.library, sym.library, formatName),
+        mergedEntry(desc.realization, sym.realization, formatName),
+        orNone(sym.synthesize), orNone(sym.linkName), orNone(sym.version),
+        sym.kind == ShippedSymbolKind::Function ? "function" : "object",
+        sym.linkage == ShippedSymbolLinkage::Weak ? "weak" : "external",
+        sym.noreturn ? 1 : 0, sym.returnsTwice ? 1 : 0);
+
+    auto const it = realizations_.find(sym.name);
+    if (it == realizations_.end()) {
+        realizations_.emplace(
+            sym.name,
+            Realization{sym.signature, std::move(traits), std::string{origin}});
+        return;   // the first declaration selected for this target
+    }
+    ++duplicatesCompared_;   // a co-live duplicate was really compared
+    Realization const& first = it->second;
+    bool const sameType   = first.signature.v == sym.signature.v;
+    bool const sameTraits = first.traits == traits;
+    if (sameType && sameTraits) return;   // a byte-identical duplicate — LEGAL
+
+    // A real divergence. Name BOTH descriptors and print BOTH realizations in
+    // full: the author's job is to reconcile two rows, so the message has to be
+    // the two rows. When the SAME descriptor declares the name twice the origins
+    // coincide — say so rather than printing one filename twice as if it were a
+    // cross-file conflict, because the fix is a different one (delete a row, not
+    // reconcile two files).
+    std::string const where =
+        first.origin == origin
+            ? std::format("'{}' declares '{}' TWICE for this target and the two "
+                          "rows disagree", origin, sym.name)
+            : std::format("shipped-lib descriptors '{}' and '{}' both declare "
+                          "'{}' for this target and disagree",
+                          first.origin, origin, sym.name);
+    std::string detail;
+    if (!sameType) {
+        detail += std::format("\n  signature: `{}` in '{}' vs `{}` in '{}'",
+                              render(first.signature), first.origin,
+                              render(sym.signature), origin);
+    }
+    if (!sameTraits) {
+        detail += std::format("\n  realization: [{}] in '{}'\n               [{}] in '{}'",
+                              first.traits, first.origin, traits, origin);
+    }
+    emitRealizationConflict(
+        reporter,
+        std::format(
+            "{} on object format '{}'.{}\n"
+            "Injection is FIRST-WINS BY NAME, so the winner's realization is the "
+            "one the whole program gets and the loser's vanishes with no "
+            "diagnostic — and the two paths that pick a winner do not even use the "
+            "same order: the `#include` path takes the TU's include closure order, "
+            "the hand-declared path (C23 7.1.4p2) takes the corpus index's path "
+            "order, so one program can bind two different images for one name "
+            "depending on how it spelled the declaration. A duplicate is LEGAL and "
+            "is relied on (<memory.h> mirrors <string.h>, <tgmath.h> mirrors "
+            "<math.h>) — a duplicate that DISAGREES is not. Either make the two "
+            "rows identical for this format, or gate them apart with "
+            "`availableObjectFormats` so they never co-exist",
+            where, formatName, detail));
+    ok = false;
+}
+
+// ⚠ THE SENTINEL SPELLS CORRECTLY (`objectFormatKindName`): `Unknown` renders as
+// "unknown", which is a perfectly good map key that no descriptor ever writes —
+// so accepting it would look up `<none>` for every row, make every pair agree
+// trivially, and turn (C) VACUOUSLY GREEN on exactly the callers that have no
+// target. `isSelectableObjectFormatKind` is the shared rejection this vocabulary
+// requires of every consumer; an empty name here means "no realization to
+// compare", the same as nullopt.
+std::string_view ShippedTypeConsistency::activeFormatName() const noexcept {
+    return activeFormat_.has_value() && isSelectableObjectFormatKind(*activeFormat_)
+               ? objectFormatKindName(*activeFormat_)
+               : std::string_view{};
+}
+
+// PER-SYMBOL availability, exactly as the analyzer gates injection: a symbol
+// absent on this format declares nothing here (threads.json ships three
+// per-format `tss_get` rows whose parameter identity differs BY DESIGN — only one
+// of them is ever a declaration on a given target). A RESTRICTED symbol under an
+// UNKNOWN format (a direct-API / LSP / unit caller) is skipped too: we cannot know
+// whether it is selected, and asserting an invariant over declarations that may
+// not apply would be a false alarm.
+bool ShippedTypeConsistency::symbolSelectedHere(
+    ShippedSymbol const& sym) const noexcept {
+    if (sym.availableObjectFormats.empty()) return true;   // every format
+    return activeFormat_.has_value()
+        && objectFormatInAvailabilitySet(sym.availableObjectFormats,
+                                         *activeFormat_);
+}
+
+// ── D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED ────────
+// The HAND-DECLARED path's slice — see the header for why it is a SLICE and not
+// `add`. Everything it does is `add`'s (C) half, verbatim: same gates, same
+// `recordRealization`, same message, same code, same vacuity witness.
+bool ShippedTypeConsistency::addRealizationsOf(
+    std::string_view origin, ShippedLibDescriptor const& desc,
+    std::span<std::string const> names, DiagnosticReporter& reporter) {
+    bool ok = true;
+    std::string_view const formatName = activeFormatName();
+    if (formatName.empty() || names.empty()) return ok;   // nothing to state
+    // O(1) per row rather than O(names): the REVERSE arm of the archive/asm
+    // binder asks about EVERY name in the corpus, so the linear form would be
+    // quadratic in the corpus for the one caller that most needs it cheap.
+    std::unordered_set<std::string_view> wanted;
+    wanted.reserve(names.size());
+    for (auto const& n : names) wanted.insert(std::string_view{n});
+    for (auto const& sym : desc.symbols) {
+        if (wanted.find(std::string_view{sym.name}) == wanted.end()) continue;
+        if (!symbolSelectedHere(sym)) continue;
+        recordRealization(origin, desc, sym, formatName, reporter, ok);
+    }
+    return ok;
+}
+
 void ShippedTypeConsistency::walk(TypeId t, std::string_view origin,
                                   DiagnosticReporter& reporter, bool& ok) {
     if (!t.valid()) return;
@@ -210,19 +373,18 @@ bool ShippedTypeConsistency::add(std::string_view            origin,
         walk(un.typeId, origin, reporter, ok);
         for (auto const& f : un.fields) walk(f.type, origin, reporter, ok);
     }
-    // PER-SYMBOL availability, exactly as the analyzer gates injection: a symbol
-    // absent on this format declares nothing here (threads.json ships three
-    // per-format `tss_get` rows whose parameter identity differs BY DESIGN —
-    // only one of them is ever a declaration on a given target). A RESTRICTED
-    // symbol under an UNKNOWN format (a direct-API / LSP / unit caller) is
-    // skipped too: we cannot know whether it is selected, and asserting an
-    // invariant over declarations that may not apply would be a false alarm.
+    std::string_view const formatName = activeFormatName();
     for (auto const& sym : desc.symbols) {
-        if (!sym.availableObjectFormats.empty()
-            && (!activeFormat_.has_value()
-                || !objectFormatInAvailabilitySet(sym.availableObjectFormats,
-                                                  *activeFormat_))) continue;
+        if (!symbolSelectedHere(sym)) continue;
         walk(sym.signature, origin, reporter, ok);
+        // (C) REALIZATION AGREEMENT — the same gated row, one axis over. Only
+        // when the format is KNOWN: `library`/`realization` are per-format maps,
+        // so without a format there is no entry to select and no realization to
+        // hold two rows to. (A direct-API / LSP / unit caller with no target is
+        // exactly the nullopt case, and it is the same posture
+        // `realizeShippedExternSymbols` takes — "no format ⇒ no realization".)
+        if (!formatName.empty())
+            recordRealization(origin, desc, sym, formatName, reporter, ok);
     }
     for (auto const& c   : desc.constants)      walk(c.type,        origin, reporter, ok);
     for (auto const& c   : desc.floatConstants) walk(c.type,        origin, reporter, ok);

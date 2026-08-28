@@ -189,7 +189,7 @@ if (-not $Python) { $Python = Get-Command python3 -ErrorAction SilentlyContinue 
 if (-not $Python) { Die 'no native python on PATH; the measurement core runs here, not in WSL.' }
 
 if (-not $DssSrc) { $DssSrc = (Resolve-Path (Join-Path $ScriptDir '..\..\..')).Path }
-# ★ THE BINARY IS `dss-code-prime.exe`, NOT `dss.exe`, AND SEARCHING FOR THE
+# ★ THE BINARY IS `dsscp.exe`, NOT `dss.exe`, AND SEARCHING FOR THE
 # WRONG NAME LOOKS EXACTLY LIKE "NOT BUILT YET" (a rename to `dsscp` is queued
 # but has not landed). Same resolution the .sh does, same rel-before-dbg
 # preference: a debug compiler's build time is not a number worth publishing.
@@ -197,7 +197,7 @@ if (-not $Dss) {
   foreach ($tree in @('rel', 'dbg')) {
     $root = Join-Path $DssSrc "build\$tree"
     if (-not (Test-Path $root)) { continue }
-    $hit = Get-ChildItem -Path $root -Filter 'dss-code-prime.exe' -Recurse -File `
+    $hit = Get-ChildItem -Path $root -Filter 'dsscp.exe' -Recurse -File `
              -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($hit) { $Dss = $hit.FullName; break }
   }
@@ -207,13 +207,13 @@ if (-not $Dss) {
 # searched" have different remedies, and one message for both sends the reader to
 # build a compiler they already have.
 if ($Dss -and -not (Test-Path $Dss)) {
-  Die "the dss-code-prime path given does not exist: $Dss`n      (the compiler is named 'dss-code-prime.exe', not 'dss.exe')"
+  Die "the dsscp path given does not exist: $Dss`n      (the compiler is named 'dsscp.exe', not 'dss.exe')"
 }
 if (-not $Dss) {
   Die @"
-no dss-code-prime binary found.
+no dsscp binary found.
       Pass -Dss <path>, or build one: scripts\local-build\local-build.ps1 -Tree rel
-      Searched for dss-code-prime.exe under $DssSrc\build\{rel,dbg}\.
+      Searched for dsscp.exe under $DssSrc\build\{rel,dbg}\.
 "@
 }
 $Dss = (Resolve-Path $Dss).Path
@@ -225,17 +225,36 @@ Info "dss       : $Dss"
 # the measured binary with whichever config tree sits above wherever it was
 # launched — and a measurement of "this binary" has to say which config it read.
 # ⚠ THIS CHECK RUNS HERE, NOT IN THE .sh, and that is not duplication: the .sh
-# derives inside WSL where a Windows `dss-code-prime.exe` is not native, so it
+# derives inside WSL where a Windows `dsscp.exe` is not native, so it
 # skips the probe BY NAME and this host runs it. Same implementation
 # (speedtest1_bench.py --preflight-dss), different host.
 # ✔MEASURED 2026-08-21: a two-day-stale build against the current config refuses
 # with `unknown key 'templateLabelRule' in 'assembly'` — correct, well-named, and
 # three minutes too late without this.
-$CfgRoot = Join-Path $DssSrc 'src\dss-config'
-if (-not (Test-Path $CfgRoot)) {
-  Die "no dss config root at $CfgRoot`n      Pass -DssSrc pointing at the checkout the compiler was built from."
+# ⚠⚠ THE PIN IS THE DIRECTORY THAT *CONTAINS* `src\dss-config`, NOT THAT
+# DIRECTORY ITSELF. [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+# `config_path_walk.hpp`: "DSS_CONFIG_ROOT (optional): a directory that CONTAINS
+# src/dss-config/" -- the resolver composes the rest. This used to be
+# `$DssSrc\src\dss-config`, so the resolver probed
+# `...\src\dss-config\src\dss-config`, missed, and -- because "a set-but-miss
+# falls through" by documented design -- landed on the CWD ancestor walk. The
+# paragraph directly above promises the opposite. Same defect, same line, in the
+# `.sh` twin; both corrected together because they are one capability.
+# ✔MEASURED 2026-08-28 on the WSL leg: cwd on the 9P mount made the SAME binary
+# on the SAME manifest take 213.50 s at 13% CPU (1,834,545 voluntary context
+# switches) against 15.16 s at 90% (429) with the cwd on ext4.
+$CfgRoot = $DssSrc
+if (-not (Test-Path (Join-Path $CfgRoot 'src\dss-config'))) {
+  Die "no dss config tree at $CfgRoot\src\dss-config`n      DSS_CONFIG_ROOT names the checkout root that CONTAINS src\dss-config, not that directory itself.`n      Pass -DssSrc pointing at the checkout the compiler was built from."
 }
-& $Python.Source $BenchCore --preflight-dss $Dss --config-root $CfgRoot
+# ★★ `-Target` IS PASSED, and its absence is what let this check pass while the
+# measurement failed. ✔MEASURED 2026-08-26: the probe compiled with no --target,
+# validating whatever dsscp defaults to, so a `build/rel` that predated the
+# `encoding.registerClass` vocabulary printed `preflight: OK` and then refused
+# `x86_64:pe64-x86_64-windows-exec` as an unknown key minutes later. macOS hit the
+# mirror image in the same run. A control must match the TARGET — the twin passes
+# the same value through `--preflight-target`, one implementation, one rule.
+& $Python.Source $BenchCore --preflight-dss $Dss --config-root $CfgRoot --preflight-target $Target
 if ($LASTEXITCODE -ne 0) {
   Die @"
 the dss pre-flight refused (its diagnostic is above). Nothing is measured against

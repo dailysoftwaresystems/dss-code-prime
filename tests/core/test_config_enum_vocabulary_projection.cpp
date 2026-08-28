@@ -39,7 +39,7 @@
 // ★★ AND THE MUTANT IS THE TABLE, NOT THE MESSAGE — that is the whole point of
 // the change these pins guard. Before it, deleting a name from a message
 // reddened nothing anywhere. Now deleting a row from `kDataModelTable` reds
-// (A) immediately, because the shipped `c-subset.lang.json` declares
+// (A) immediately, because the shipped `c.lang.json` declares
 // `coreByDataModel: {"LLP64": …}` at seven pointers and a
 // `signatureByDataModel: {"LLP64": …}` at an eighth; the message follows the
 // table automatically, so it can no longer be wrong on its own.
@@ -178,7 +178,7 @@ struct KeyedMapSite {
 
 constexpr char const* kIgnoreProbeOnly[]  = {kBadSpelling};
 
-// ✔MEASURED 2026-08-20 by walking `c-subset.lang.json` for every enum-keyed
+// ✔MEASURED 2026-08-20 by walking `c.lang.json` for every enum-keyed
 // map: `coreByDataModel` occurs at 7 pointers, `coreByLongDoubleFormat` at 2,
 // `elementCoreByFormat` at 2, `signatureByDataModel` at 1, `synthesizedTypes`
 // at 1 (three roles). One representative pointer of each is probed here, and
@@ -187,17 +187,17 @@ inline std::vector<KeyedMapSite> keyedMapSites() {
     static constexpr auto kDataModelNames  = allNames(dss::kDataModelTable);
     static constexpr auto kLongDoubleNames = allNames(dss::kLongDoubleFormatTable);
     return {
-        {"c-subset", {"/semantics/builtinTypes/1/coreByDataModel"}, "\"I32\"",
+        {"c", {"/semantics/builtinTypes/1/coreByDataModel"}, "\"I32\"",
          "coreByDataModel", kDataModelNames, kIgnoreProbeOnly},
-        {"c-subset",
+        {"c",
          {"/semantics/typeSpecifiers/36/coreByLongDoubleFormat",
           "/semantics/typeSpecifiers/39/coreByLongDoubleFormat"},
          "\"F80\"", "coreByLongDoubleFormat", kLongDoubleNames,
          kIgnoreProbeOnly},
-        {"c-subset", {"/semantics/synthesizedTypes/pointerDifference"},
+        {"c", {"/semantics/synthesizedTypes/pointerDifference"},
          "\"int\"", "synthesizedTypes/pointerDifference", kDataModelNames,
          kIgnoreProbeOnly},
-        {"c-subset",
+        {"c",
          {"/hirLowering/stringLiteralPrefixes/4/elementCoreByFormat"},
          "\"I32\"", "elementCoreByFormat",
          dss::kSelectableObjectFormatKindNames, kIgnoreProbeOnly},
@@ -212,7 +212,7 @@ inline std::vector<KeyedMapSite> keyedMapSites() {
 // reds: delete `{DataModel::Llp64, "LLP64"}` from `kDataModelTable` and this
 // fails, because the shipped document declares that key at eight pointers.
 TEST(EnumVocabularyProjection, ShippedLanguageDocumentsLoadCleanly) {
-    for (char const* lang : {"c-subset", "asm-arm64-gas"}) {
+    for (char const* lang : {"c", "asm-arm64-gas"}) {
         auto const doc = shippedLanguageDoc(lang);
         auto const text = doc.dump();
         auto       r    = GrammarSchema::loadFromText(text, lang);
@@ -335,16 +335,16 @@ inline std::vector<ScalarSite> scalarSites() {
     static constexpr auto kVisNames     = allNames(dss::kSymbolVisibilityTable);
     static constexpr auto kVerbNames    = allNames(dss::kEntryMaterializationTable);
     return {
-        {"c-subset",
+        {"c",
          "/semantics/declarations/7/linkageSpecifiers/weak/binding",
          "linkageSpecifiers binding", kBindingNames, kIgnoreBinding},
-        {"c-subset",
+        {"c",
          "/semantics/declarations/7/linkageSpecifiers/visibility:hidden/visibility",
          "linkageSpecifiers visibility", kVisNames, kIgnoreVis},
-        {"c-subset", "/semantics/declarations/7/entryFunctions/main/1/params/0",
+        {"c", "/semantics/declarations/7/entryFunctions/main/1/params/0",
          "entryFunctions param shape", dss::kDeclarableEntryParamShapeNames,
          kIgnoreProbeOnly},
-        {"c-subset", "/semantics/declarations/7/entryFunctions/main/0/verb",
+        {"c", "/semantics/declarations/7/entryFunctions/main/0/verb",
          "entryFunctions verb", kVerbNames, kIgnoreVerb},
     };
 }

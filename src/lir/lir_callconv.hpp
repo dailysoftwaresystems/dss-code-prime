@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <span>
 #include <string>
@@ -275,6 +276,36 @@ returnRegisterForClass(TargetSchema const&            schema,
 // floating-point OR SHORT VECTOR argument to `v[NSRN]` — ONE counter across
 // what this codebase calls FPR (the d-views) and VR (the v-views). Two rows,
 // one cursor. `argPoolsShareACursor` below is why that is DERIVED, not declared.
+// ── D-LIR-FRAME-SLOT-STRIDE-ENUMERATES-CLASSES-INSTEAD-OF-DERIVING ─────────
+//
+// The uniform byte stride of the frame's saved-register area and spill area.
+// `occupants` is the set of register classes that actually put a value in one
+// of those areas in the function being laid out; the answer is the widest
+// register any of them declares, never below the historic `max(GPR, FPR)`
+// floor (which the LOCAL-alloca area shares and which must stay ≥ every C
+// scalar's alignment).
+//
+// ★ PUBLISHED RATHER THAN PRIVATE, and for the reason
+// [[D-LIR-RETURN-REG-REFUSAL-IS-UNREACHABLE-FROM-THE-TEST-TIER]] recorded: a
+// derivation no tier can observe is a derivation whose mutant reddens nothing.
+// The defect this replaced — `max(widthForClass(GPR), widthForClass(FPR))`
+// written inline — was a two-member enumeration of a longer vocabulary, and it
+// produced an 8-byte stride for arm64's 16-byte `vr` class: two spill slots
+// that OVERLAPPED by 8 bytes, the second reading past the top of the frame.
+[[nodiscard]] DSS_EXPORT std::uint32_t
+frameSlotStride(TargetSchema const& schema,
+                std::span<LirRegClass const> occupants) noexcept;
+
+// Convenience for call sites (and pins) that name the occupant classes
+// literally. Same function, same floor — a second overload, never a second
+// derivation.
+[[nodiscard]] inline std::uint32_t
+frameSlotStrideForClasses(TargetSchema const& schema,
+                          std::initializer_list<LirRegClass> occupants) noexcept {
+    return frameSlotStride(schema, std::span<LirRegClass const>{
+                                       occupants.begin(), occupants.size()});
+}
+
 struct ArgPoolRow {
     LirRegClass                                        cls;
     std::vector<std::string> TargetCallingConvention::* pool;
@@ -439,6 +470,143 @@ private:
     [[nodiscard]] static std::optional<std::size_t> rowOf(LirRegClass cls);
 };
 
+// ── THE OVERFLOW-AREA CURSOR, AS ONE OBJECT FOR THE SAME REASON ─────────────
+//
+// D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED.
+//
+// `ArgCursors` answers "does this argument get a REGISTER"; this answers "and if
+// it does not, WHERE in the overflow area does it sit and HOW WIDE is the access".
+// The two questions were separated in the code but not in the hazard: the byte
+// placement of stacked arguments is walked in FOUR places that must agree
+// byte-for-byte or the caller writes where the callee does not read —
+//   * `lir_callconv::computeMaxOutgoingStackArgs` (sizes the outgoing area),
+//   * `lir_wide_call_args::lowerOneFunc` (assigns each overflow arg its offset),
+//   * `lir_callconv::materializeOneFunc`'s call arm (the residual placement),
+//   * `lir_callconv::materializeOneFunc`'s `arg` arm (the CALLEE's read),
+// and each of them used to spell the rule as its own `idx * outgoingSlotSize`.
+// That was survivable while the rule was one slot per argument. It is not
+// survivable now that a CC may declare NATURAL packing, because then the rule
+// depends on each datum's own size and alignment and a fifth spelling is a
+// silent miscompile. So the rule is spelled ONCE, here.
+//
+// ⚠⚠ ONE OBJECT IS NOT ONE CURSOR, AND THE DIFFERENCE WAS A LIVE MISCOMPILE
+// (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES). Two of those
+// walks ran over the SAME call: `lowerWideCallArgs` placed its stacked scalars
+// and REMOVED them from the operand list, and the call arm then placed the
+// by-value aggregate carriers that remained — from a fresh instance of this
+// class, which necessarily restarted at 0 because the scalars were no longer
+// there to advance it. Identical rule, identical object, overlapping bytes.
+// ⇒ For ANY ONE CALL exactly one instance places anything. `lowerWideCallArgs`
+// owns it (it is the last tier holding the complete argument list), states every
+// aggregate's offset on its carrier and stamps `kLirInstFlagOutgoingArgsPlaced`
+// on the Call; the call arm then READS those offsets and REFUSES if asked to
+// place anything at all. The pre-scan and the callee's `arg` arm walk different
+// argument lists (the caller's reservation, the callee's own incoming region) and
+// are unaffected.
+//
+// ★ THE ACCESS WIDTH IS PART OF THE PLACEMENT, NOT A SEPARATE DECISION. Under
+// `Slot` the datum owns the whole pointer-width slot — the caller stored a whole
+// register into it — so the access stays the 8-byte one every existing target
+// emits (`widthFlags == 0`), byte-for-byte. Under `Natural` the datum owns
+// EXACTLY its own bytes, and an 8-byte store would clobber the next argument
+// (Apple puts a `short` at +2 with an `int` at +4), so the access must be
+// width-exact. Returning them together is what makes "packed narrow but accessed
+// wide" unwritable.
+class DSS_EXPORT StackArgCursor {
+public:
+    // `slotBytes` is the outgoing slot quantum (the GPR/pointer width) — the
+    // same value `FrameLayout::outgoingSlotSize` carries.
+    StackArgCursor(TargetCallingConvention const& cc,
+                   std::uint32_t slotBytes) noexcept
+        : rules_(cc.stackArgPacking), slot_(slotBytes == 0 ? 1u : slotBytes) {}
+
+    struct Placement {
+        std::uint32_t byteOffset;   // offset within the overflow area
+        std::uint8_t  widthFlags;   // kLirInstFlagWidth* for the access; 0 ⇒ 64-bit
+    };
+
+    // Place ONE stacked NAMED scalar whose natural size is `naturalBytes`
+    // (1/2/4/8; 0 or >slot ⇒ treated as a whole slot, which is what every
+    // pre-`Natural` producer effectively said).
+    [[nodiscard]] Placement placeNamedScalar(std::uint32_t naturalBytes) noexcept {
+        return place(rules_.namedScalars, naturalBytes);
+    }
+
+    // Place ONE stacked VARIADIC argument. Separate axis: Apple packs named
+    // scalars naturally but keeps 8-byte slots for varargs (✔MEASURED).
+    [[nodiscard]] Placement placeVariadic(std::uint32_t naturalBytes) noexcept {
+        return place(rules_.variadic, naturalBytes);
+    }
+
+    // Place ONE stacked by-value AGGREGATE of `aggBytes`: ceil(aggBytes/slot)
+    // whole slots at slot alignment.
+    //
+    // ⚠ THIS AXIS HAS ONE BUILDABLE VALUE AND THE OTHER IS REFUSED AT LOAD, not
+    // approximated here. ✔MEASURED: BOTH shipped ABIs slot-round aggregates
+    // (Apple puts an `int` after a 3-byte struct at +8, and after a 12-byte
+    // struct at +16 — not +3 / +12), so `slot` is what the vocabulary needs
+    // today. A CC declaring `namedAggregates: "natural"` would need the
+    // aggregate's own ALIGNMENT, which the `ByValueStackAgg` carrier does not
+    // state (it carries a byte SIZE only) — so the loader REFUSES that spelling
+    // rather than letting this method guess slot alignment and call it natural.
+    // (`target_schema_json.cpp`, the `stackArgPacking` reader.)
+    [[nodiscard]] std::uint32_t placeNamedAggregate(std::uint32_t aggBytes) noexcept {
+        std::uint32_t const span = ((aggBytes + slot_ - 1u) / slot_) * slot_;
+        std::uint32_t const off  = alignUp(cursor_, slot_);
+        cursor_ = off + span;
+        return off;
+    }
+
+    // The raw cursor (bytes consumed so far, NOT slot-rounded).
+    [[nodiscard]] std::uint32_t bytes() const noexcept { return cursor_; }
+
+    // The cursor rounded up to a whole slot — the size the outgoing area must
+    // reserve, and the byte displacement a callee's `va_start` must skip.
+    [[nodiscard]] std::uint32_t slotAlignedBytes() const noexcept {
+        return alignUp(cursor_, slot_);
+    }
+
+    [[nodiscard]] std::uint32_t slotBytes() const noexcept { return slot_; }
+
+private:
+    [[nodiscard]] static constexpr std::uint32_t
+    alignUp(std::uint32_t v, std::uint32_t a) noexcept {
+        return a == 0 ? v : ((v + a - 1u) / a) * a;
+    }
+
+    [[nodiscard]] Placement place(StackArgPacking rule,
+                                  std::uint32_t naturalBytes) noexcept {
+        // ⚠ A natural size the producer did not state (0), or one larger than a
+        // slot, falls back to the SLOT rule. That is the pre-existing behaviour
+        // and is correct for every `Slot` CC; a `Natural` CC that reaches here
+        // with 0 is a DROPPED CARRIER, and the caller-side walk refuses it loudly
+        // rather than letting the two sides disagree — see
+        // `lir_wide_call_args::lowerOneFunc`.
+        bool const natural = rule == StackArgPacking::Natural
+                             && naturalBytes != 0 && naturalBytes <= slot_;
+        std::uint32_t const size  = natural ? naturalBytes : slot_;
+        std::uint32_t const align = natural ? naturalBytes : slot_;
+        std::uint32_t const off   = alignUp(cursor_, align);
+        cursor_ = off + size;
+        return Placement{off, natural ? widthFlagsForBytes(naturalBytes)
+                                      : std::uint8_t{0}};
+    }
+
+    [[nodiscard]] static constexpr std::uint8_t
+    widthFlagsForBytes(std::uint32_t bytes) noexcept {
+        switch (bytes) {
+            case 1:  return kLirInstFlagWidth8;
+            case 2:  return kLirInstFlagWidth16;
+            case 4:  return kLirInstFlagWidth32;
+            default: return 0;   // 8 (and anything else) ⇒ the 64-bit access
+        }
+    }
+
+    StackArgPackingRules rules_{};
+    std::uint32_t        slot_   = 8;
+    std::uint32_t        cursor_ = 0;
+};
+
 // Per-function frame layout computed before emission. Stored so
 // downstream passes (AS1 unwind info, debug-info DWARF .debug_frame
 // generation) can read it without re-computing.
@@ -483,7 +651,15 @@ struct DSS_EXPORT FrameLayout {
     // `vaListLayout` (size = vaListLayout.regSaveAreaBytes()). Zero everywhere else
     // — backward-compatible with every non-variadic frame.
     std::uint32_t       vaRegSaveAreaSize = 0;
-    std::uint32_t       slotSize          = 0;  // uniform per-class spill-slot width (bytes; = max(GPR width, FPR width))
+    // Uniform per-class spill-slot width in bytes. DERIVED by `frameSlotStride`
+    // from the classes that actually occupy a slot in this function, floored at
+    // the historic GPR/FPR width — never the two-member `max` it used to be.
+    // ⚠ That old spelling is the defect
+    // D-LIR-FRAME-SLOT-STRIDE-ENUMERATES-CLASSES-INSTEAD-OF-DERIVING records:
+    // arm64's `vr` is 16 bytes, so it sized two 16-byte slots 8 bytes apart and
+    // the second read past the top of the frame. This comment still described
+    // it after the fix; the P28 step-10 audit caught that.
+    std::uint32_t       slotSize          = 0;
     std::uint32_t       outgoingSlotSize  = 0;  // outgoing-arg slot width (bytes; = pointer width = GPR width)
     // c114 (D-WIN64-PDATA-XDATA-UNWIND): the cc's guard-page stack-probe
     // stride (bytes; 0 = no probing — Linux/macOS/arm64). A downstream

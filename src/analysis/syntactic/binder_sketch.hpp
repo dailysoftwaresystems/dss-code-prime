@@ -111,7 +111,7 @@ public:
     // ── scope events (driven by the parser's frame open/close) ──
     // `rule` is the scope-opening frame's rule — used to classify the new
     // scope as a DECLARATOR-DOMINATOR (a `declarations`-rule scope that is
-    // NOT a composite-type body, e.g. c-subset's topLevelDecl, which opens a
+    // NOT a composite-type body, e.g. c's topLevelDecl, which opens a
     // scope only to dominate a function's params). A composite TYPE tag minted
     // in such a scope's HEAD (a file-scope `struct P { … } v;`) floats PAST it
     // to the enclosing namespace at `record` time (C11 6.2.1) — mirrors the

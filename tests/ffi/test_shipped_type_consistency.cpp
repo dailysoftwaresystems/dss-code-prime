@@ -85,12 +85,12 @@ namespace {
 // miss, both callers ASSERT on it; the ADD_FAILURE names which of the three
 // lookups came up short.
 [[nodiscard]] fs::path configRoot() {
-    auto const root = dss::test::findRepoRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config";
+    return *cfg;
 }
 
 // EVERY descriptor under shippedLibs, recursively — never a hand-written list.
@@ -163,12 +163,12 @@ struct TargetAxis {
     return out;
 }
 
-[[nodiscard]] std::shared_ptr<GrammarSchema> loadCSubset(fs::path const& root) {
-    std::ifstream in{root / "sources" / "c-subset.lang.json", std::ios::binary};
+[[nodiscard]] std::shared_ptr<GrammarSchema> loadC(fs::path const& root) {
+    std::ifstream in{root / "sources" / "c.lang.json", std::ios::binary};
     if (!in) return nullptr;
     std::string const text{std::istreambuf_iterator<char>{in},
                            std::istreambuf_iterator<char>{}};
-    auto r = GrammarSchema::loadFromText(text, "<c-subset>");
+    auto r = GrammarSchema::loadFromText(text, "<c>");
     return r.has_value() ? *r : nullptr;
 }
 
@@ -261,8 +261,8 @@ TEST(ShippedTypeConsistency, EveryDescriptorAgreesOnEveryTagAndTypedefPerTarget)
     auto const descriptors = allDescriptors(root);
     auto const axes        = allTargetAxes(root);
     auto const arches      = allArches(root);
-    auto const schema      = loadCSubset(root);
-    ASSERT_TRUE(schema != nullptr) << "c-subset.lang.json failed to load";
+    auto const schema      = loadC(root);
+    ASSERT_TRUE(schema != nullptr) << "c.lang.json failed to load";
     // Guard the ENUMERATION itself: a glob that silently matched nothing would
     // make this whole test vacuously green — the exact failure mode it exists to
     // prevent. The floors are well under today's counts, so they never churn.

@@ -1,0 +1,33 @@
+{
+  "$comment": "D-CSUBSET-INT128-DATA-GLOBAL — a file-scope 128-bit integer global with an initializer, emitted as a real 16-byte little-endian image. This row used to be a fail-loud DEFERRAL wall in `lowerMirGlobalsToDataItems`; the wall was correct (it prevented a silent wrong-bytes emission) but it withheld legal C that clang and gcc both accept, so the close is the EMISSION, not the gate. The original defect: `appendLE` takes a `std::uint64_t`, so a width-16 append computed `(value >> (j*8))` for j in [0,16) — a shift of 64..120 bits, UNDEFINED BEHAVIOUR, which on both shipped host arches masks the count to 6 bits and REPEATS the low 8 bytes into the high 8. The fix is a wider SOURCE (two little-endian 64-bit limbs, each appended at its own width) rather than a wider shift. ★ RED-ON-DISABLE: `gWide` carries a distinct high word (0x1122334455667788) and low word (0x99aabbccddeeff00), so a repeat, a zero-fill, a swap, or a byte-order error each change the exit code; `gSmall = 5` is the case a dispatch keyed on the value's VARIANT rather than the declared TYPE silently MISSES, because it folds into a plain u64 literal arm instead of the 128-bit bignum arm, and it is also the case the UB shift corrupted by repetition (its high half must be ZERO); `gSigned = -1` pins SIGN-EXTENSION of the high limb — a zero-filled high half fails it, and it is the only arm that does; `gZero` is the all-zero control. Each of the seven checks contributes 6, so the sum is 42 only when every one holds and no single arm can mask another. ⚠ THE AGGREGATE LEAF REMAINS DELIBERATELY WALLED AND LOUD: `decodeScalarLiteralBits` returns a `std::uint64_t` and structurally cannot carry 16 bytes, so a `struct { __uint128_t x; }` global still fails loud rather than slipping through — mirroring the shipped F80 arm, whose scalar globals emit while its struct members stay walled. A remaining site that is LOUD is a deferral; a remaining site that is SILENT would be the half-shipped multi-site contract. Data-model agnostic: every expectation is written in explicit fixed-width spellings (`unsigned long long`, hex constants), so LP64 and LLP64 legs both hold. ✔MEASURED: host clang and host gcc, probed SEPARATELY, both compile and run this to exit 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

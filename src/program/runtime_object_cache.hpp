@@ -134,7 +134,7 @@
 //                real input: it is the writer that produces the bytes.
 //   config     — debug / release.
 //   unit       — the source path AND its content digest.
-//   descriptor — ★★★ THE DESCRIPTOR THAT NAMES THE UNIT, BY CONTENT. This is
+//   descriptor — ★★★ EVERY DESCRIPTOR THAT NAMES THE UNIT, BY CONTENT. This is
 //                the term the whole design exists for. The unit `#include`s the
 //                descriptor's declarations, so the descriptor IS part of the
 //                unit's source text. Edit `struct dirent`'s layout and the key
@@ -142,6 +142,17 @@
 //                OLD layout — which links clean and returns silently wrong
 //                bytes. That is the `environ` copy-relocation class, the worst
 //                failure mode this project has.
+//                ★★ PLURAL, AND THE PLURAL IS THE SAFE DIRECTION RATHER THAN A
+//                GENERALITY NOBODY ASKED FOR. `realization.<fmt>.source` is a
+//                per-DESCRIPTOR declaration and nothing in the corpus rules out
+//                two descriptors naming ONE unit — ✔MEASURED 2026-08-25 the
+//                corpus has exactly one each today, which is precisely when a
+//                singular field looks correct and silently stops being so. With
+//                one term the SECOND declaring descriptor's bytes would be
+//                outside the key: edit it and the build links an archive
+//                compiled against the old declarations, reported as a hit. The
+//                asymmetry below decides it — over-invalidation costs one
+//                recompile, under-invalidation ships wrong bytes.
 //   config     — the digest of every config document the build ALREADY LOADED.
 //   documents    ⚠ NOT a re-walk of `src/dss-config/`: ✔MEASURED 2026-08-17
 //                that costs ~165 ms per invocation (86 files, 2,078,133 bytes)
@@ -152,7 +163,7 @@
 //                costs the hash alone.
 //                ★★ AND THE SET MUST BE ASKED OF THE LOADERS, NEVER HAND-LISTED.
 //                ✔MEASURED: the first hand-written list was already WRONG — it
-//                named `c-subset.lang.json` and stopped, but that document's
+//                named `c.lang.json` and stopped, but that document's
 //                `languageReferences` block (line 18) pulls in `asm.lang.json`
 //                and its dialects, which are therefore real inputs to compiling
 //                a `.c`. A hand-enumerated set is a second owner of the loaders'
@@ -171,7 +182,7 @@
 // ═══ TWO ROOTS, READ THROUGH ═════════════════════════════════════════════════
 // The artifact was originally rooted ONLY at the shipped config root
 // (`<configRoot>/runtime/platform/dist/`). For an INSTALLED compiler that root
-// is READ-ONLY — it is `<prefix>/share/dss-code-prime/<ver>/dss-config/`, owned
+// is READ-ONLY — it is `<prefix>/share/dsscp/<ver>/dss-config/`, owned
 // by the package manager — so the first cache MISS after install could not be
 // written and the build could not proceed at all. The cache therefore resolves
 // through TWO roots:
@@ -306,11 +317,11 @@ struct DSS_EXPORT RuntimeCacheRoots {
 //      platform default. This is the explicit override for CI and hermetic
 //      builds, and it takes the directory VERBATIM: the caller already named
 //      the location, so no vendor tail is appended under it.
-//   2. `%LOCALAPPDATA%` + `dss-code-prime/runtime-cache` — the Windows per-user
+//   2. `%LOCALAPPDATA%` + `dsscp/runtime-cache` — the Windows per-user
 //      non-roaming cache location.
-//   3. `$XDG_CACHE_HOME` + `dss-code-prime/runtime-cache` — the XDG base
+//   3. `$XDG_CACHE_HOME` + `dsscp/runtime-cache` — the XDG base
 //      directory spec's cache root, when the user has set one.
-//   4. `$HOME` + `.cache/dss-code-prime/runtime-cache` — the XDG spec's own
+//   4. `$HOME` + `.cache/dsscp/runtime-cache` — the XDG spec's own
 //      documented default when `XDG_CACHE_HOME` is unset.
 //   ⇒ NONE resolves: `perUser` is EMPTY, lookup still consults the shipped
 //      root (so an installed compiler with a packaged `dist/` keeps working),
@@ -385,7 +396,13 @@ struct DSS_EXPORT LoadedConfigDocument {
 
 struct DSS_EXPORT RuntimeObjectRequest {
     std::filesystem::path     configRoot;      // absolute .../src/dss-config
-    std::string               descriptorPath;  // config-root-relative
+    // EVERY descriptor declaring this unit for this format, config-root-relative.
+    // ⚠ EMPTY IS A REFUSAL, not "no descriptor term": a realized unit exists
+    // BECAUSE some descriptor named it, so an empty set means the caller's
+    // attribution disagrees with the corpus reader that produced the unit — and
+    // a key missing the term the design exists for is exactly the entry that
+    // would be served after the declarations moved. See `computeRuntimeObjectKey`.
+    std::vector<std::string>  descriptorPaths;
     std::string               sourcePath;      // config-root-relative
     std::string               targetSpec;      // the --target string, verbatim
     std::string               buildFormatName;
@@ -503,6 +520,18 @@ lookupRuntimeObject(RuntimeObjectKey const& key);
 // nothing is worse than one that fails. The diagnostic names EVERY root
 // considered, the reason the write failed, and `DSS_RUNTIME_CACHE_DIR` as the
 // remedy — the three things a user needs to fix it without reading this file.
+//
+// ★★ WHAT THAT OBLIGES OF A CALLER, now that there is one. The forbidden thing
+// is SILENCE, not survival. `resolveShippedRuntimeArchives` (the driver's one
+// caller, in `program.cpp`) prints this refusal VERBATIM on every affected
+// build and then links the archive it already compiled out of its staging area
+// — because the bytes are right, they were produced one line earlier, and a
+// cache is an optimization that may never be load-bearing for correctness. A
+// full disk must not be a compile error. What it must not be either is
+// invisible, and a line on stderr on EVERY build until it is fixed is the loud
+// half of the same bargain. ⚠ THE ONE ARM THAT DOES STOP THE BUILD IS THE
+// OTHER ONE: `lookupRuntimeObject`'s unverifiable-entry error is propagated as
+// a hard error, because there the question is whether the bytes are RIGHT.
 //
 // ⓘ It does NOT re-check the shipped root before writing. `lookupRuntimeObject`
 // owns the read-through precedence, and a caller reaching this function has

@@ -516,7 +516,7 @@ TEST(MachOWriter, ObjectWeakDefinedFunctionEmitsNWeakDefAndNoHeaderFlag) {
     mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_strongfn",
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
-    // The `__attribute__((weak))` shape c-subset.lang.json produces;
+    // The `__attribute__((weak))` shape c.lang.json produces;
     // `definedBinding` returns Weak for it.
     mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "_weakfn",
                                        SymbolBinding::Weak,
@@ -3953,8 +3953,8 @@ TEST(MachOExecWriter, ChainedFixupsMultiPageGotFailsLoud) {
     constexpr std::uint32_t kSpillCount  = (kPageSize / kSlotSize) + 1u;
     // FIXTURE-INVARIANT (D-TEST-MULTI-PAGE-FIXTURE-INVARIANT): all
     // 513 externs share libSystem (libOrdinal=1 << 127 ceiling) and
-    // the symbols-pool stays under 8 MiB (D-LK6-14-NAME-OFFSET-
-    // OVERFLOW). The SOLE failure surface this fixture probes is
+    // the symbols-pool stays under 8 MiB (D-LK6-14-NAME-OFFSET-OVERFLOW).
+    // The SOLE failure surface this fixture probes is
     // the multi-page __DATA_CONST guard. A future refactor of the
     // fixture (multi-dylib, longer names) MUST re-verify these
     // boundaries or the test silently re-routes.

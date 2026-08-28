@@ -62,6 +62,8 @@
 #include "hir/hir_text.hpp"
 #include "mir/mir_text.hpp"
 
+#include "vocabulary_message_probe.hpp"
+
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
@@ -152,22 +154,14 @@ public:
     return node;
 }
 
-// Every `'…'`-quoted token in a message. The shared renderer quotes each
-// spelling, so this reads back WHAT THE MESSAGE CLAIMS. Never re-derived from a
-// table, which would make the comparison circular and green by construction.
-[[nodiscard]] std::vector<std::string> quotedTokens(std::string const& msg) {
-    std::vector<std::string> out;
-    std::size_t              i = 0;
-    while (true) {
-        auto const open = msg.find('\'', i);
-        if (open == std::string::npos) break;
-        auto const close = msg.find('\'', open + 1);
-        if (close == std::string::npos) break;
-        out.push_back(msg.substr(open + 1, close - open - 1));
-        i = close + 1;
-    }
-    return out;
-}
+// ★ `quotedTokens` used to be a file-local copy here, byte-identical to the one
+// `tests/core/vocabulary_projection_probe.hpp` already owned — and therefore
+// invisible to the mutant that closed
+// D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE. It has ONE
+// owner now, `tests/test_support/vocabulary_message_probe.hpp`, which is
+// json-free and on every test target's include path; see
+// D-TEST-VOCABULARY-PROBE-MESSAGE-HALF-IS-UNREACHABLE-AND-JSON-COUPLED.
+using ::dss::test_support::quotedTokens;
 
 template <typename Diags>
 [[nodiscard]] std::string summarize(Diags const& diags) {
@@ -239,10 +233,10 @@ struct KeyShapeBlock {
 // `objectAt` re-validates every one on every run, so a row that goes stale FAILS
 // rather than passing vacuously.
 constexpr KeyShapeBlock kKeyShapeBlocks[] = {
-    {"c-subset", "/shapes/expression/expr/wrapperRules",
+    {"c", "/shapes/expression/expr/wrapperRules",
      "a 'wrapperRules' object", "'wrapperRules' must be an object",
      "wrapperRules"},
-    {"c-subset", "/numberStyle/integerPrefixes/0/float",
+    {"c", "/numberStyle/integerPrefixes/0/float",
      "a prefix's 'float' block", "'float' must be an object", "float"},
     {"asm-arm64-gas", "/numberStyle/emitKind",
      "the 'emitKind' block", "'numberStyle.emitKind' is required",
@@ -250,9 +244,9 @@ constexpr KeyShapeBlock kKeyShapeBlocks[] = {
     // The linkage effect is the one block whose sentence carries NO self-quote:
     // the object is keyed by specifier SOURCE TEXT, so it has no fixed name to
     // open with. The empty string here is a measured fact, not a placeholder.
-    {"c-subset", "/semantics/declarations/0/linkageSpecifiers/static",
+    {"c", "/semantics/declarations/0/linkageSpecifiers/static",
      "a linkage effect", "linkage effect must be an object", ""},
-    {"c-subset", "/requires", "the 'requires' block",
+    {"c", "/requires", "the 'requires' block",
      "'requires' must be an object", "requires", /*created=*/true},
 };
 
@@ -276,7 +270,7 @@ constexpr KeyShapeBlock kKeyShapeBlocks[] = {
 // The positive control. Without it, a loader that refused EVERYTHING would turn
 // every probe below green.
 TEST(KeyShapeSentences, EveryProbedShippedDocumentLoadsCleanly) {
-    for (char const* lang : {"c-subset", "asm-arm64-gas"}) {
+    for (char const* lang : {"c", "asm-arm64-gas"}) {
         auto const doc = shippedLanguageDoc(lang);
         auto       r   = GrammarSchema::loadFromText(doc.dump(), lang);
         ASSERT_TRUE(r.has_value())
@@ -500,14 +494,14 @@ struct HirAttrVocabulary {
 // `Bool/I*/U*/F*/Char/Byte/Void` and omitted `NullptrT`.
 TEST(TextTierVocabulary, CoreTypeRefusalNamesEverySpellingTheLoaderAccepts) {
     expectEveryAdvertisedValueIsAccepted(
-        "c-subset", "/semantics/builtinTypes/0/core", "unknown core TypeKind",
+        "c", "/semantics/builtinTypes/0/core", "unknown core TypeKind",
         20, "semantics.builtinTypes[0].core");
 }
 
 // The `builtinFunctions[].lowering` refusal — thirty verbs, and it named none.
 TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
     expectEveryAdvertisedValueIsAccepted(
-        "c-subset", "/semantics/builtinFunctions/0/lowering",
+        "c", "/semantics/builtinFunctions/0/lowering",
         "unknown builtin lowering", 30, "semantics.builtinFunctions[0].lowering");
 }
 
@@ -1182,6 +1176,209 @@ TEST(TextTierVocabulary, TheUnspelledAggregateLiteralMarkerIsRefusedByName) {
         << "the writer's own unserializable-value marker must be refused BY NAME "
            "on the way back in. Falling into the generic 'unknown tag' arm sends "
            "the author looking for a typo that is not there.";
+}
+
+// ── PART 2c: THE `.dsshir` KEYWORD VOCABULARIES ─────────────────────────
+//
+// ★★★ D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET, and it is the WEAKER cousin of
+// everything above: those refusals advertised a set that had DRIFTED from a
+// table; these advertised NO SET AT ALL. `unknown flag 'x'`, `unknown attribute
+// '@x'`, `unknown for-clause 'x'`, `unknown expression 'x'`, `unknown statement
+// 'x'` — five closed keyword sets, five refusals that told an author their word
+// was wrong and never what this reader would have taken. There was no table to
+// project, so closing the row meant MINTING one per set from the parse arm.
+//
+// ★★ AND THE FEED-BACK HALF IS NOT CEREMONY HERE. ✔MEASURED 2026-08-23 while
+// minting the expression table: `isExprKeyword` — the ROUTER `parseNode` uses to
+// decide whether a line is an expression at all — was a hand-retyped THIRD copy
+// carrying twenty of the twenty-three keywords. The three it omitted are
+// `va_start`, `va_arg` and `va_end`, ALL of which `emitNodeLine` writes, so a
+// `.dsshir` holding a variadic-access node routed to the STATEMENT parser and
+// came back `unknown statement`. A round-trip pin could not see it (the writer's
+// output was never read back through a module that had one) and a
+// message-content pin could not see it (the message was correct about a keyword
+// the router had already misrouted). Feeding every advertised keyword back
+// through the reader is what sees it.
+
+namespace {
+
+// Every advertised spelling in `msg`, minus the bogus one the message echoes.
+[[nodiscard]] std::vector<std::string> advertisedIn(std::string const& msg) {
+    auto out = quotedTokens(msg);
+    std::erase(out, std::string{kBadSpelling});
+    return out;
+}
+
+// A `.dsshir` module whose single function body is `bodyLine`.
+[[nodiscard]] std::string hirBody(std::string_view bodyLine) {
+    return std::string{"dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+                       "  function %1 : fn() -> void {\n    block {\n      "}
+         + std::string{bodyLine} + "\n      return\n    }\n  }\n}\n";
+}
+
+}  // namespace
+
+TEST(TextTierVocabulary, EveryAdvertisedNodeFlagIsAcceptedByTheReader) {
+    auto const msg = hirRefusal(hirBody(std::string{"expr ["} + kBadSpelling
+                                        + "] lit int 1 : i32"),
+                                "unknown node flag");
+    ASSERT_FALSE(msg.empty())
+        << "the flag arm must refuse an unrecognized spelling BY NAME.";
+    auto const advertised = advertisedIn(msg);
+    EXPECT_EQ(advertised.size(), 4u)
+        << "the advertised flag set changed size — a SHRINK means a spelling the "
+           "reader takes stopped being advertised.\nmessage:\n  " << msg;
+    for (auto const& name : advertised) {
+        SCOPED_TRACE(name);
+        EXPECT_TRUE(hirTextIsClean(hirBody("expr [" + name + "] lit int 1 : i32")))
+            << "the refusal advertises '" << name
+            << "' and the reader then REJECTS it.";
+    }
+}
+
+TEST(TextTierVocabulary, EveryAdvertisedForClauseIsAcceptedByTheReader) {
+    auto const msg = hirRefusal(
+        hirBody(std::string{"for { "} + kBadSpelling
+                + ": expr lit int 1 : i32 body: block { } }"),
+        "unknown for-clause");
+    ASSERT_FALSE(msg.empty()) << "the for-clause arm must refuse by name.";
+    auto const advertised = advertisedIn(msg);
+    EXPECT_EQ(advertised.size(), 4u)
+        << "the advertised for-clause set changed size.\nmessage:\n  " << msg;
+    for (auto const& role : advertised) {
+        SCOPED_TRACE(role);
+        // `body` is mandatory, so every probe carries one; a non-`body` role
+        // gets its own clause in addition.
+        std::string const line = (role == "body")
+            ? std::string{"for { body: block { } }"}
+            : "for { " + role + ": expr lit int 1 : i32 body: block { } }";
+        EXPECT_TRUE(hirTextIsClean(hirBody(line)))
+            << "the refusal advertises '" << role
+            << "' and the reader then REJECTS it.";
+    }
+}
+
+TEST(TextTierVocabulary, EveryAdvertisedAggregateFieldCoreIsAcceptedByTheReader) {
+    // D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM: the per-field core
+    // position, whose accepted set is the union of the primitive table and the
+    // structural literal-core table — the same two-table join the `.dssir` tier
+    // makes at its own literal-core position.
+    auto const msg = hirRefusal(
+        hirBody(std::string{"expr lit agg {int 1 : "} + kBadSpelling + "} : i32"),
+        "unknown aggregate literal field core");
+    ASSERT_FALSE(msg.empty())
+        << "an unrecognized field core must be refused BY NAME — a silent default "
+           "would give every element of a folded aggregate the wrong core while "
+           "the re-emitted text still matched byte for byte.";
+    auto const advertised = advertisedIn(msg);
+    EXPECT_EQ(advertised.size(), 26u)
+        << "the advertised field-core set changed size.\nmessage:\n  " << msg;
+    for (auto const& core : advertised) {
+        SCOPED_TRACE(core);
+        EXPECT_TRUE(
+            hirRefusal(hirBody("expr lit agg {int 1 : " + core + "} : i32"),
+                       "unknown aggregate literal field core").empty())
+            << "the refusal advertises '" << core
+            << "' and the reader then REJECTS it.";
+    }
+}
+
+// ★★★ THE ARM THAT WOULD HAVE CAUGHT THE `va_*` ROUTING HOLE.
+//
+// The refusal at a node position advertises BOTH halves of the accepted set —
+// statements and expressions — because `parseNode` routes on the expression
+// table first and falls through to the statement parser. Feeding each advertised
+// keyword back and requiring that it is not refused AS A KEYWORD is exactly the
+// property that broke: `va_arg` was emitted, was a real expression keyword, and
+// the router did not know it.
+//
+// ⚠ THE ASSERTION IS DELIBERATELY NOT "PARSES CLEANLY". Almost every one of these
+// keywords needs operands, a type annotation or a body, so a bare keyword is
+// legitimately malformed for reasons that have nothing to do with the
+// vocabulary. What must NOT happen is the reader failing to RECOGNIZE it.
+TEST(TextTierVocabulary, EveryAdvertisedNodeKeywordIsRecognizedByTheReader) {
+    auto const msg = hirRefusal(hirBody(kBadSpelling), "unknown node keyword");
+    ASSERT_FALSE(msg.empty())
+        << "an unrecognized node keyword must be refused BY NAME.";
+    auto const advertised = advertisedIn(msg);
+    // 28 statement keywords + 25 expression keywords.
+    // ⓘ 23 → 25 on 2026-08-23 (cycle P28, lane Z): `builtincall` and `labeladdr`
+    // were WRITTEN by `emitExpr` and advertised by neither table — the same
+    // write-only shape as the `va_*` hole this arm was built for, two arms over
+    // (D-HIR-TEXT-WRITER-SPELLS-KEYWORDS-THE-READER-HAS-NO-ROW-FOR). This is a
+    // GROWTH, which is the legitimate direction; the loop below already proved
+    // both new spellings are recognized before this number moved.
+    EXPECT_EQ(advertised.size(), 53u)
+        << "the advertised node-keyword set changed size. A SHRINK means a "
+           "keyword the reader dispatches stopped being advertised — or, worse, "
+           "stopped being routed.\nmessage:\n  " << msg;
+    for (auto const& kw : advertised) {
+        SCOPED_TRACE(kw);
+        EXPECT_TRUE(hirRefusal(hirBody(kw), "unknown node keyword").empty())
+            << "the refusal advertises '" << kw
+            << "' and the reader then does not recognize it as a node keyword.";
+    }
+}
+
+// ★★★ THE TYPE-KEYWORD POSITION IN BOTH TIERS, AND ITS FEED-BACK PIN IS THE
+// PAIRING GUARD.
+//
+// The keyword ladders in `parseType` are NOT converted into a `switch` over
+// their table the way the flag / attribute / for-clause / node-keyword ladders
+// were: their arms are structurally unlike each other, several share a body,
+// `unsigned` is a PREFIX rather than a head keyword, and the `.dsshir` one is on
+// the SHIPPED path that decodes every FFI descriptor's type strings. So the
+// table owns the SET only — and what stops the set drifting from the ladder is
+// this arm, which drives every advertised spelling back through the reader and
+// requires that none of them comes back as `unknown type`.
+//
+// ⚠ NOT "PARSES CLEANLY". Every structural keyword needs an operand (`ptr<T>`,
+// `arr<T,N>`, `struct "N" { … }`), so a bare keyword is legitimately malformed —
+// for a reason that has nothing to do with the vocabulary. What must not happen
+// is the reader failing to RECOGNIZE it.
+TEST(TextTierVocabulary, EveryAdvertisedHirTypeKeywordIsRecognizedByTheReader) {
+    dss::TypeInterner in{dss::CompilationUnitId{1}};
+    dss::TypeRegistry reg;
+    auto refusalFor = [&](std::string_view text) {
+        DiagnosticReporter r;
+        (void)dss::parseTypeFromText(text, in, reg, r, {});
+        std::string out;
+        for (auto const& d : r.all()) {
+            if (d.actual.find("unknown type") != std::string::npos) out = d.actual;
+        }
+        return out;
+    };
+    auto const msg = refusalFor(kBadSpelling);
+    ASSERT_FALSE(msg.empty()) << "the type arm must refuse an unknown keyword BY NAME";
+    auto const advertised = advertisedIn(msg);
+    // 20 primitive spellings + 21 structural keywords.
+    EXPECT_EQ(advertised.size(), 41u)
+        << "the advertised type-keyword set changed size.\nmessage:\n  " << msg;
+    for (auto const& kw : advertised) {
+        SCOPED_TRACE(kw);
+        EXPECT_TRUE(refusalFor(kw).empty())
+            << "the refusal advertises '" << kw
+            << "' and the reader then does not recognize it as a type keyword.";
+    }
+}
+
+TEST(TextTierVocabulary, EveryAdvertisedMirTypeKeywordIsRecognizedByTheReader) {
+    auto refusalFor = [](std::string_view kw) {
+        return mirRefusal(mirGlobalModule(std::string{kw} + " = zero"),
+                          "unknown type");
+    };
+    auto const msg = refusalFor(kBadSpelling);
+    ASSERT_FALSE(msg.empty()) << "the type arm must refuse an unknown keyword BY NAME";
+    auto const advertised = advertisedIn(msg);
+    // 19 primitive spellings + 16 structural keywords.
+    EXPECT_EQ(advertised.size(), 35u)
+        << "the advertised type-keyword set changed size.\nmessage:\n  " << msg;
+    for (auto const& kw : advertised) {
+        SCOPED_TRACE(kw);
+        EXPECT_TRUE(refusalFor(kw).empty())
+            << "the refusal advertises '" << kw
+            << "' and the reader then does not recognize it as a type keyword.";
+    }
 }
 
 // ── PART 3: the REFERENCED-DOCUMENT BLOCK SURFACE ───────────────────────

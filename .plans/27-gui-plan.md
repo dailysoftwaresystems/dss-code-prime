@@ -524,14 +524,14 @@ Object formats are already data (`src/dss-config/object-formats/*.json`) consume
 
 ### 16.1 Layout
 
-`dss-config/` already hosts independent axes side by side — object formats and the language file (`sources/c-subset.lang.json`) each own half of the entry-point intersection. Packaging is a third axis and sits at the same level:
+`dss-config/` already hosts independent axes side by side — object formats and the language file (`sources/c.lang.json`) each own half of the entry-point intersection. Packaging is a third axis and sits at the same level:
 
 ```
 src/dss-config/
   object-formats/    pe64-x86_64-windows-guiexec_format.json
   package-formats/   apk-android_pack.json
                      app-ios_pack.json
-  sources/           c-subset.lang.json
+  sources/           c.lang.json
 ```
 
 ### 16.2 GUI as a separate object format

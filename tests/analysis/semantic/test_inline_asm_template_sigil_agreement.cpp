@@ -628,7 +628,7 @@ TEST(InlineAsmTemplateSigilAgreement, TheSemanticScanReadsTheDeclaredSigilTooNot
              + "9\" : \"=r\"(o)); return (int)o; }\n";
     };
     auto const outOfRange = [](std::string src) {
-        auto cu = dss::sem_test::buildShippedUnit("c-subset", {std::move(src)});
+        auto cu = dss::sem_test::buildShippedUnit("c", {std::move(src)});
         auto m  = analyze(cu, DiagnosticBudget::libraryDefault());
         for (auto const& d : m.diagnostics().all()) {
             if (d.code == DiagnosticCode::S_InlineAsmPlaceholderOutOfRange) {
@@ -965,7 +965,7 @@ TEST(InlineAsmTemplateSigilAgreement, AnOmittedRoleIsRefusedAndAnExplicitNullIsH
     // a recognized-but-unresolvable operand reference to ordinary template text,
     // while `%0` keeps being recognized — one variable, two readings.
     {
-        constexpr char const* kHost = "c-subset";
+        constexpr char const* kHost = "c";
         auto const namedRefIsRecognized = [] {
             // ONE output, so `%[nope]` names no operand: the refusal fires ONLY
             // if the scan recognized the bracketed form at all.

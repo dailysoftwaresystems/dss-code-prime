@@ -20,6 +20,7 @@
 #include "mir/mir_cfg.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "opt/passes/mir_id_remap.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <gtest/gtest.h>
@@ -317,7 +318,7 @@ TEST(MirRebuildHelper, IdentityRoundTripPreservesGlobalAddrLoadStoreReturn) {
 // substrate). The OTHER two copy sites have their own standalone loops, pinned
 // separately: DCE (`DceConst.PreservesGlobalConstness`) + merge
 // (`MirMerge.MergePreservesGlobalConstness`). RED-ON-DISABLE: drop the
-// `…globalIsConst(g)` argument at mir_rebuild_helper.cpp:54 / :96 (let it default to
+// `…globalIsConst(g)` argument at mir_rebuild_helper.cpp (let it default to
 // false) → the const global's `isConst` flips to false and the `EXPECT_TRUE` fails.
 // TF-C78 (D-CSUBSET-NOINLINE): ★ THE LOAD-BEARING PROPAGATION PIN.
 //
@@ -395,7 +396,7 @@ TEST(MirRebuildHelper, RebuildFunctionPreservesNoInline) {
 // the chain is broken but not which hop broke it. For `alwaysInline` the
 // situation is STRICTLY WORSE and it was MEASURED, not assumed: dropping
 // `src_.funcAlwaysInline(oldFn)` below leaves the end-to-end pin
-// `MirLoweringCSubsetLinkage.AlwaysInlineBypassesThresholdInShippedRelease`
+// `MirLoweringCLinkage.AlwaysInlineBypassesThresholdInShippedRelease`
 // COMPLETELY GREEN. The end-to-end test is BLIND to this hop.
 //
 // Why the asymmetry: `noInline` must keep REFUSING on every iteration, so a
@@ -523,9 +524,8 @@ public:
     }
     void onBlockBegin(MirBlockId /*oldB*/, MirBlockId /*newB*/,
                       MirBuilder& dst,
-                      std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
-                      std::unordered_map<std::uint32_t, MirBlockId> const&
-                          /*blockMap*/) override {
+                      MirInstRemap& /*rewrite*/,
+                      MirBlockRemap const& /*blockMap*/) override {
         ++onBlockBeginCalls;
         MirLiteralValue v;
         v.value = std::int64_t{999};
@@ -652,7 +652,7 @@ TEST(MirRebuildHelper, RebuildFunctionPreservesNoOptimize) {
 // `src_.funcNoSanitizeThread(oldFn)` argument at `mir_rebuild_helper.cpp`'s
 // `addFunction` (let the 8th parameter default to false) and the first EXPECT_TRUE
 // below fails, together with the post-optimize MIR-text assertions in
-// `MirLoweringCSubsetLinkage.NoSanitizeThreadSurvivesShippedReleasePipeline`.
+// `MirLoweringCLinkage.NoSanitizeThreadSurvivesShippedReleasePipeline`.
 // Nothing else in the suite moves.
 TEST(MirRebuildHelper, RebuildFunctionPreservesNoSanitizeThread) {
     TypeInterner interner{CompilationUnitId{1}};
@@ -1017,8 +1017,7 @@ public:
     }
     [[nodiscard]] bool acceptPhiIncoming(
         MirPhiIncoming const& /*inc*/, MirBlockId /*oldPhiBlock*/,
-        std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/)
-        override {
+        MirBlockRemap const& /*blockMap*/) override {
         return false;
     }
 };

@@ -675,7 +675,7 @@ inline void expectRejectedAtPath(std::string_view jsonText,
 //
 // RED-on-disable: revert pe64-x86_64-windows-exec.format.json's processExit
 // to kernel32/ExitProcess and BOTH string EXPECTs fail here — plus
-// examples/c-subset/shipped_atexit goes red end-to-end on the Windows leg,
+// examples/c/shipped_atexit goes red end-to-end on the Windows leg,
 // which is the runtime witness this unit pin stands in for.
 TEST(LK10EntrySliceB, ShippedPeExecHasByNameImportProcessExit) {
     auto r = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
@@ -2419,8 +2419,8 @@ macroRowsOf(ObjectFormatSchema const& s) {
 TEST(FormatPredefinedMacros, KeyIsPARSEDNotMerelyAccepted) {
     auto r = ObjectFormatSchema::loadFromText(withRootKey(
         R"("predefinedMacros":[
-             {"name":"__PROBE_A__","kind":"constant","value":"1","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}},
-             {"name":"__PROBE_B__","kind":"constant","value":"7","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
+             {"name":"__PROBE_A__","kind":"constant","value":"1","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}},
+             {"name":"__PROBE_B__","kind":"constant","value":"7","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(macroRowsOf(**r),
               (std::vector<std::pair<std::string, std::string>>{
@@ -2461,14 +2461,14 @@ TEST(FormatPredefinedMacros, MisspelledKeyRejectedAndNamed) {
 // reject) because a copy-pasted parser is exactly what would drift.
 TEST(FormatPredefinedMacros, SharedEntryGrammarIsInherited) {
     auto missingValue = ObjectFormatSchema::loadFromText(withRootKey(
-        R"("predefinedMacros":[{"name":"__X__","kind":"constant","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
+        R"("predefinedMacros":[{"name":"__X__","kind":"constant","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
     EXPECT_FALSE(missingValue.has_value())
         << "a 'constant' entry without `value` must be rejected, exactly as on "
            "the language and target sides";
 
     auto duplicate = ObjectFormatSchema::loadFromText(withRootKey(
-        R"("predefinedMacros":[{"name":"__X__","kind":"constant","value":"1","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}},
-                               {"name":"__X__","kind":"constant","value":"2","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
+        R"("predefinedMacros":[{"name":"__X__","kind":"constant","value":"1","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}},
+                               {"name":"__X__","kind":"constant","value":"2","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
     EXPECT_FALSE(duplicate.has_value())
         << "a duplicate name WITHIN one array must be rejected — the effective "
            "value would otherwise depend on which seed site iterated last";
@@ -2498,7 +2498,7 @@ TEST(FormatPredefinedMacros, SharedEntryGrammarIsInherited) {
 TEST(FormatPredefinedMacros, EntryUnknownKeyRejectedAndNamed) {
     auto typo = ObjectFormatSchema::loadFromText(withRootKey(
         R"("predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                "availabelObjectFormats":["elf"],"impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
+                                "availabelObjectFormats":["elf"],"programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
     ASSERT_FALSE(typo.has_value())
         << "a misspelled entry key must be REFUSED — silently ignoring this "
            "one makes a format-gated macro leak onto every format";
@@ -2513,7 +2513,7 @@ TEST(FormatPredefinedMacros, EntryUnknownKeyRejectedAndNamed) {
     // actually fires.
     auto prose = ObjectFormatSchema::loadFromText(withRootKey(
         R"("predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                "$valueComment":"why this spelling","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
+                                "$valueComment":"why this spelling","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
     EXPECT_TRUE(prose.has_value())
         << "`$`-prefixed keys are prose, not knobs — and the carve-out must be "
            "the PREFIX predicate, not a literal `$comment` compare";
@@ -2889,12 +2889,12 @@ TEST(ObjectFormatSchemaContentDigest, ConstructionBypassingLoadFromTextLeavesItE
 namespace {
 
 [[nodiscard]] std::string shippedFormatText(std::string_view stem) {
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root.has_value()) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    auto const path = *root / "src" / "dss-config" / "object-formats"
+    auto const path = *root / "object-formats"
                     / (std::string{stem} + ".format.json");
     std::ifstream in{path, std::ios::binary};
     if (!in.good()) {

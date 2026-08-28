@@ -1272,17 +1272,18 @@ TEST(Licm, VolatileBinaryOpNotHoisted) {
     EXPECT_EQ(r.instructionsHoisted, 0u);
 }
 
-// Load-specific Volatile guard (licm.cpp:326). The sibling
-// `VolatileBinaryOpNotHoisted` exercises only an `Add`, leaving the Load-
+// Load-specific Volatile guard (the `MirInstFlags::Volatile` `continue` in
+// licm.cpp). The sibling `VolatileBinaryOpNotHoisted` exercises only an
+// `Add`, leaving the Load-
 // admission path — which sits AFTER the Volatile `continue` — unpinned. This
 // fixture is byte-identical to `InvariantLoadHoisted` (a clean pointer defined
 // OUTSIDE the loop, empty body, NO aliasing Store → that test hoists the Load,
 // instructionsHoisted == 1) EXCEPT the loop-body Load carries
 // MirInstFlags::Volatile. The single-bit delta isolates the Volatile `continue`
-// at licm.cpp:326, which runs BEFORE the Load alias-admission gate: with it,
+// at licm.cpp, which runs BEFORE the Load alias-admission gate: with it,
 // instructionsHoisted == 0 and the volatile Load stays physically in the body.
 // RED-ON-DISABLE: neutralize the `if (has(...Volatile)) continue;` at
-// licm.cpp:326 → the volatile Load hoists → instructionsHoisted == 1.
+// licm.cpp → the volatile Load hoists → instructionsHoisted == 1.
 TEST(Licm, VolatileLoadInOtherwiseHoistableLoopNotHoisted) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
@@ -1326,7 +1327,7 @@ TEST(Licm, VolatileLoadInOtherwiseHoistableLoopNotHoisted) {
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.instructionsHoisted, 0u)
         << "a Volatile Load must NOT be hoisted even though its pointer is loop-"
-           "invariant and no aliasing Store sits in the body — licm.cpp:326's "
+           "invariant and no aliasing Store sits in the body — licm.cpp's "
            "Volatile `continue` runs before the Load alias-admission gate";
 
     // The volatile Load must remain PHYSICALLY in the loop (LoopHeader)
@@ -1635,4 +1636,89 @@ TEST(Licm, RuntimeInitGlobalsModuleEmitsXOptPassSkippedInfo) {
         if (d.code == DiagnosticCode::X_OptPassSkipped) ++infoCount;
     }
     EXPECT_EQ(infoCount, 1u);
+}
+
+// ══ D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN (cycle P36) ═══════════════════
+//
+// LICM asks for the natural-loop forest once per FUNCTION against a
+// ONE-FUNCTION dominator tree. It used to ask through the whole-module
+// overload, which sweeps EVERY block of the module for back-edge sources —
+// O(functions × module blocks), quadratic in module size, and ✔MEASURED at
+// 2,239 ms of each 2,552 ms LICM call on the merged 103-TU sqlite module. It
+// now asks through the SCOPED overload with `mirBackEdgeCandidates`.
+//
+// This is the pin that makes that a cost change and not a behaviour change,
+// through the SHAPES a naive candidate set gets wrong. It is deliberately NOT
+// a timing test (`wall_clock_in_tests_guard` would refuse one, and rightly):
+// the property is that the hoist still HAPPENS.
+//
+//   * the loop lives in the SECOND function, so the candidate range must be
+//     offset by `funcBlockAt(f, 0)` — a builder that enumerates `1..nb`
+//     instead of `first..first+nb` sweeps the FIRST function's blocks and
+//     finds no back edge here;
+//   * its latch is the function's — and the module's — LAST arena block, so a
+//     range END off-by-one (`s < lastEx - 1`, the mutation that left P9's
+//     whole differential suite green) drops exactly the back-edge source.
+//
+// Under either mutation the natural loop vanishes, LICM sees no loop, and
+// `instructionsHoisted` falls to 0 while the pass still reports ok.
+TEST(Licm, LatchLastLoopInSecondFunctionStillHoists) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // f0 — no loop, three blocks, so f1's blocks do not start at slot 1.
+    mb.addFunction(fnSig, SymbolId{100});
+    {
+        MirBlockId const e  = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const m1 = mb.createBlock(StructCfMarker::Linear);
+        MirBlockId const m2 = mb.createBlock(StructCfMarker::Linear);
+        mb.beginBlock(e);  mb.addBr(m1);
+        mb.beginBlock(m1); mb.addBr(m2);
+        MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+        mb.beginBlock(m2); mb.addReturn(mb.addConst(v0, i32));
+    }
+
+    // f1 — the loop. `latch` is created LAST, so it is the arena-last block of
+    // the function AND of the module, and it is the back-edge SOURCE.
+    mb.addFunction(fnSig, SymbolId{101});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+    MirBlockId const latch  = mb.createBlock(StructCfMarker::LoopLatch);
+    mb.beginBlock(entry);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirLiteralValue v4; v4.value = std::int64_t{4}; v4.core = TypeKind::I32;
+    MirInstId const a = mb.addConst(v3, i32);
+    MirInstId const b = mb.addConst(v4, i32);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, latch, exitB);
+    mb.beginBlock(exitB);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    mb.beginBlock(latch);
+    MirInstId const ops[] = {a, b};
+    (void)mb.addInst(MirOpcode::Add, ops, i32);   // invariant: both operands in entry
+    mb.addBr(header);
+    Mir mir = std::move(mb).finish();
+
+    // The fixture's own shape assertions — if these stop holding the test is
+    // green-but-vacuous, which is the failure mode this file's header warns of.
+    ASSERT_GT(latch.v, exitB.v) << "the latch must be the arena-LAST block";
+    ASSERT_EQ(latch.v, mir.blockCount() - 1u);
+    ASSERT_GT(entry.v, 1u) << "f1 must not start at slot 1, or a missing `first` "
+                              "offset in the candidate builder would go unnoticed";
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 1u)
+        << "the back edge from the arena-last block of the SECOND function must "
+           "reach LICM's scoped candidate sweep — a narrowed range makes the "
+           "loop invisible and this hoist silently disappears";
 }

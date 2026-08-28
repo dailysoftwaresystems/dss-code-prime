@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE: the runtime witness that a `_Complex` object with STATIC storage duration carries a constant IMAGE, and that the image is the value the emitted code would have computed. MEASURED at 301e2a63 every declaration in main.c refused with `error[K_NoMatchingObjectFormat] ... has a runtime initializer (__module_init__-driven)` -- a complex initializer had no constant-image path at all and fell to a load-time store-chain the producer does not emit; gcc 13.3.0 -std=c2x and clang 18.1.3 -std=c23, probed SEPARATELY, compile and run all of them. EVERY ARM IS BUILT SO THAT WRITING ONLY ONE COMPONENT CHANGES THE EXIT CODE, because a half-emitted image (real right, imaginary zero) is a SILENT MISCOMPILE rather than a refusal -- nothing recomputes the value at load: g_bc has two distinct non-zero components, g_imag has a ZERO real and a non-zero imaginary (a producer that writes only `re` yields (0,0)), and g_real has an imaginary that MUST be zero (a producer that writes `re` twice yields (7,7)). Arms 5, 6 and 8 compare the folded image against the SAME expression evaluated at RUNTIME, which is the property the const-fold actually claims and the one a hand-typed expected constant cannot check; arm 5 is the MIXED-PRECISION arm: `I` is complex<double>, so its product is evaluated at F64 and narrowed to F32 exactly once, and a fold that rounded every intermediate to the DECLARED element type instead moves the imaginary component by 1 ULP. MEASURED 2026-08-27, that component as raw f32 bits -- gcc 13.3.0 static 3e051eb9 / runtime 3e051eb8 (gcc DISAGREES WITH ITSELF), clang 18.1.3 3e051eb8 / 3e051eb8, DSS 3e051eb9 / 3e051eb9. The standard leaves this latitude and the references spend it differently, one of them inconsistently, so there is no reference byte pattern to copy; the only well-defined invariant is that a compiler static image equals what ITS OWN emitted code computes, which is why every such arm compares against the RUNTIME value and never a hand-typed constant. A consequence worth knowing before debugging it: running main.c under gcc exits 239 (255-16) because gcc fails its own arm 5 -- that is gcc inconsistency, not a defect in the example, and every other arm passes there. Arm 7 reads the object's BYTES through `unsigned char *` (C 6.2.6.1) and compares them against a runtime-built complex -- the only arm that cannot be satisfied by value-level constant propagation, so it is what pins the IMAGE rather than the literal it was made from. ANTI-FOLD: every runtime-side value derives from `volatile` seeds, so the release arm compares a genuinely computed value against the static image instead of folding both sides to one constant. exit = 1+2+4+8+16+32+64+128 = 255 iff every arm passes; each failing arm subtracts its own distinct power of two, so the exit code names which arm broke.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 255,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

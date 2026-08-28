@@ -16,7 +16,6 @@
 #include <format>
 #include <limits>
 #include <optional>
-#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -26,6 +25,14 @@ namespace dss {
 namespace {
 
 using json = nlohmann::json;
+
+// The anchor id this loader's stacked-arg-packing refusal cites, spelled ONCE
+// and on ONE line. ⚠ A `std::format` message assembled from adjacent string
+// literals is exactly where an anchor id gets WRAPPED across two lines by a
+// re-indent — which does not fail anything, it makes the id invisible to the
+// registry scan and mints a false one. Naming it here makes that unwritable.
+inline constexpr std::string_view kApplePackingAnchor =
+    "D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED";
 
 using Collector = substrate::DiagnosticCollector;
 
@@ -147,10 +154,11 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
         auto const& w = g.at("width");
         if (!w.is_number_integer()
             || (w.get<std::int64_t>() != 8 && w.get<std::int64_t>() != 16
-                && w.get<std::int64_t>() != 32 && w.get<std::int64_t>() != 64)) {
+                && w.get<std::int64_t>() != 32 && w.get<std::int64_t>() != 64
+                && w.get<std::int64_t>() != 128)) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       std::format("/opcodes/{}/encoding/variants/{}/guard/width", opIdx, vi),
-                      "'width' must be the integer 8, 16, 32, or 64 "
+                      "'width' must be the integer 8, 16, 32, 64, or 128 "
                       "(the shipped operation-width vocabulary; "
                       "D-CSUBSET-32BIT-ALU-FORMS / CHAR-STRING-VALUE-CODEGEN / "
                       "D-LIR-INT-MEMORY-WIDTH-EXACT)");
@@ -213,6 +221,26 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
             variant.negValue = nv.get<bool>();
         }
     }
+    // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE: OPTIONAL
+    // `memoryDestination` (bool). Absent ⇒ the variant does not discriminate
+    // on the memory reference's role (every pre-existing variant). Present ⇒
+    // the variant matches only an instruction whose
+    // `kLirInstFlagMemoryIsDestination` agrees. This is what separates
+    // `cmpq %r14, mem` (39 /r) from `cmpq mem, %r14` (3B /r), whose LIR
+    // operand lists are byte-identical. A non-boolean is a load-time reject,
+    // never a silently dropped axis — dropping it would collapse the two
+    // directions onto one variant and encode one spelling as the other.
+    if (g.contains("memoryDestination")) {
+        auto const& md = g.at("memoryDestination");
+        if (!md.is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/encoding/variants/{}/guard/memoryDestination",
+                                  opIdx, vi),
+                      "'memoryDestination' must be a boolean");
+        } else {
+            variant.memoryDestination = md.get<bool>();
+        }
+    }
     // `D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD` discipline: every key this
     // guard object may carry is read ABOVE (or just below, for
     // `operandKinds`) via a bare `g.contains(...)`, so a typo — or a
@@ -228,8 +256,9 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     // generalized from a memory displacement to any value-bearing operand;
     // the old spelling now lands here as an unknown key rather than being
     // read as `false`.
-    static constexpr std::array<std::string_view, 5> kGuardKeys{
-        "operandKinds", "width", "immMin", "immMax", "negValue"};
+    static constexpr std::array<std::string_view, 6> kGuardKeys{
+        "operandKinds", "width", "immMin", "immMax", "negValue",
+        "memoryDestination"};
     DSS_CHECK_KEY_VOCABULARY(kGuardKeys);
     rejectUnknownKeys(g, kGuardKeys,
                       std::format("/opcodes/{}/encoding/variants/{}/guard",
@@ -533,6 +562,45 @@ void parseVariantResultSlot(json const& v, std::size_t opIdx, std::size_t vi,
     variant.resultSlot = *r;
 }
 
+// D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the shared parse of one
+// register-bank spelling. ONE reader for all three sites that carry a bank
+// name (`encoding.registerClass`, a variant's `resultRegClass`, a wire's
+// `regClass`) so the three cannot disagree about what a bank name is or which
+// names are refused. The ALLOWED list is projected off `kTargetRegClassTable`
+// — never retyped (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+//
+// ⚠ `none` PARSES HERE and is refused by `validate()` rather than by this
+// reader, deliberately: `targetRegClassFromName` owns the spelling set and
+// `isOperableTargetRegClass` owns the "may a field draw from it" question, and
+// splitting one of those two facts across two files is how the two drift. The
+// message a `"none"` author sees names the operable set, from validate().
+std::optional<TargetRegClass>
+parseRegClassField(json const& obj, std::string_view key,
+                   std::string const& path, Collector& coll) {
+    if (!obj.contains(key)) return std::nullopt;
+    auto const& n = obj.at(key);
+    if (!n.is_string()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  std::format("'{}' must be a register-class string (one "
+                              "of {})",
+                              key,
+                              detail::renderAllowedList(
+                                  allNames(kTargetRegClassTable), " / ")));
+        return std::nullopt;
+    }
+    auto const c = targetRegClassFromName(n.get<std::string>());
+    if (!c.has_value()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  std::format("unknown register class '{}' — expected one "
+                              "of {}",
+                              n.get<std::string>(),
+                              detail::renderAllowedList(
+                                  allNames(kTargetRegClassTable), " / ")));
+        return std::nullopt;
+    }
+    return c;
+}
+
 // D-AS4-3 (multi-instruction-macro encoder): parse `extraResultSlots`
 // — additional placements of the SAME result register beyond the
 // primary `resultSlot` (word 0). Each entry is { "slotKind": <name>,
@@ -623,12 +691,17 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
         // A dropped `relocationKind` is the sharpest hazard here: the wire
         // would encode literal bits where the linker was meant to patch a
         // symbol address.
-        static constexpr std::array<std::string_view, 5> kWireKeys{
+        static constexpr std::array<std::string_view, 6> kWireKeys{
             "index", "slotKind", "relocationKind", "wordIndex",
-            "prefixOpcodeBytes"};
+            "prefixOpcodeBytes",
+            // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: this field's
+            // register-bank override.
+            "regClass"};
         DSS_CHECK_KEY_VOCABULARY(kWireKeys);
         rejectUnknownKeys(o2, kWireKeys, wirePath, "an operand wire", coll);
         TargetEncodingWire wire;
+        wire.regClass = parseRegClassField(
+            o2, "regClass", std::format("{}/regClass", wirePath), coll);
         if (!o2.contains("index") || !o2.at("index").is_number_integer()) {
             coll.emit(DiagnosticCode::C_MissingField,
                       std::format("{}/index", wirePath),
@@ -773,20 +846,309 @@ void parseEncodingVariants(json const& vs,
         // leaving an ALL-DEFAULT template (fixedWord 0, no opcode bytes) that
         // the encoder would emit as zero words. The neighbouring guard loop
         // is what made the absence invisible.
-        static constexpr std::array<std::string_view, 5> kVariantKeys{
-            "guard", "template", "resultSlot", "extraResultSlots", "wires"};
+        static constexpr std::array<std::string_view, 6> kVariantKeys{
+            "guard", "template", "resultSlot", "extraResultSlots", "wires",
+            // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the result
+            // field's register-bank override.
+            "resultRegClass"};
         DSS_CHECK_KEY_VOCABULARY(kVariantKeys);
         rejectUnknownKeys(v, kVariantKeys,
                           std::format("/opcodes/{}/encoding/variants/{}",
                                       opIdx, vi),
                           "an encoding variant", coll);
         TargetEncodingVariant variant;
+        variant.resultRegClass = parseRegClassField(
+            v, "resultRegClass",
+            std::format("/opcodes/{}/encoding/variants/{}/resultRegClass",
+                        opIdx, vi),
+            coll);
         parseVariantGuard      (v, opIdx, vi, variant, coll);
         parseVariantTemplate   (v, opIdx, vi, variant.tmpl, coll);
         parseVariantResultSlot (v, opIdx, vi, variant, coll);
         parseVariantExtraResultSlots(v, opIdx, vi, variant, coll);
         parseVariantWires      (v, opIdx, vi, variant, data, coll);
         out.push_back(std::move(variant));
+    }
+}
+
+// ── D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE ────────
+// The `lowering` block: opcode → the SEQUENCE of machine instructions that
+// realizes it on this target. Shape-only here (names stay unresolved); the
+// step→opcode resolution needs the COMPLETE mnemonic index, so it runs in the
+// post-pass beside the implicit-register resolution — the same reason that one
+// waits for the register table.
+void parseLoweringOperand(json const& o, std::string const& path,
+                          TargetLoweringOperand& out, Collector& coll) {
+    static constexpr std::array<std::string_view, 4> kOperandKeys{
+        "source", "temp", "imm", "const"};
+    DSS_CHECK_KEY_VOCABULARY(kOperandKeys);
+    rejectUnknownKeys(o, kOperandKeys, path, "a lowering-step operand", coll);
+    // EXACTLY ONE kind key. Zero would be an all-default operand silently
+    // reading MIR source 0 (the `"tempalte"` failure class this file's
+    // highest-value gate exists for); two would make the read order the
+    // meaning.
+    int present = 0;
+    for (auto const& k : kOperandKeys) if (o.contains(k)) ++present;
+    if (present != 1) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  std::format("a lowering-step operand must carry EXACTLY ONE "
+                              "of {} — found {}",
+                              detail::renderAllowedList(
+                                  allNames(kTargetLoweringOperandKindTable), " / "),
+                              present));
+        return;
+    }
+    if (o.contains("source")) {
+        auto const& v = o.at("source");
+        if (!v.is_number_unsigned() || v.get<std::uint64_t>() > 255u) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'source' must be a non-negative integer operand index");
+            return;
+        }
+        out.kind        = TargetLoweringOperandKind::Source;
+        out.sourceIndex = static_cast<std::uint8_t>(v.get<std::uint64_t>());
+        return;
+    }
+    if (o.contains("temp")) {
+        auto const& v = o.at("temp");
+        if (!v.is_string() || v.get<std::string>().empty()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'temp' must be a non-empty string naming a temporary "
+                      "an EARLIER step of this sequence defines");
+            return;
+        }
+        out.kind     = TargetLoweringOperandKind::Temp;
+        out.tempName = v.get<std::string>();
+        return;
+    }
+    if (o.contains("imm")) {
+        auto const& v = o.at("imm");
+        if (!v.is_number_integer()
+            || v.get<std::int64_t>() < std::numeric_limits<std::int32_t>::min()
+            || v.get<std::int64_t>() > std::numeric_limits<std::int32_t>::max()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'imm' must be an integer that fits int32 (the LIR "
+                      "inline-immediate operand's width)");
+            return;
+        }
+        out.kind      = TargetLoweringOperandKind::Immediate;
+        out.immediate = static_cast<std::int32_t>(v.get<std::int64_t>());
+        return;
+    }
+    // `const`: a 64-bit BIT PATTERN, spelled as a hex STRING. A JSON number
+    // cannot carry one — 0x43E0000000000000 exceeds the exactly-representable
+    // double range every JSON reader parses unsuffixed numbers into, so a
+    // numeric spelling would round and the author would never see it.
+    auto const& v = o.at("const");
+    if (!v.is_string()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  "'const' must be a STRING holding a 0x-prefixed 64-bit hex "
+                  "bit pattern (a JSON number cannot carry 64 bits exactly)");
+        return;
+    }
+    std::string const s = v.get<std::string>();
+    if (s.size() < 3 || s.size() > 18 || s[0] != '0'
+        || (s[1] != 'x' && s[1] != 'X')) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  std::format("'const' must be a 0x-prefixed hex bit pattern of "
+                              "1..16 digits — got '{}'", s));
+        return;
+    }
+    std::uint64_t pattern = 0;
+    for (std::size_t k = 2; k < s.size(); ++k) {
+        char const c = s[k];
+        int digit = -1;
+        if (c >= '0' && c <= '9')      digit = c - '0';
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+        if (digit < 0) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      std::format("'const' has a non-hex character '{}' in "
+                                  "'{}'", c, s));
+            return;
+        }
+        pattern = (pattern << 4) | static_cast<std::uint64_t>(digit);
+    }
+    out.kind     = TargetLoweringOperandKind::Constant;
+    out.constant = pattern;
+}
+
+void parseLoweringStep(json const& st, std::string const& path,
+                       TargetLoweringStep& out, Collector& coll) {
+    static constexpr std::array<std::string_view, 5> kStepKeys{
+        "op", "result", "resultClass", "width", "operands"};
+    DSS_CHECK_KEY_VOCABULARY(kStepKeys);
+    rejectUnknownKeys(st, kStepKeys, path, "a lowering step", coll);
+    if (!st.contains("op") || !st.at("op").is_string()
+        || st.at("op").get<std::string>().empty()) {
+        coll.emit(DiagnosticCode::C_MissingField, path + "/op",
+                  "missing or empty 'op' — every lowering step must name a "
+                  "mnemonic in THIS target's opcode table");
+        return;
+    }
+    out.opcodeMnemonic = st.at("op").get<std::string>();
+    if (st.contains("result")) {
+        auto const& r = st.at("result");
+        if (!r.is_string() || r.get<std::string>().empty()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path + "/result",
+                      "'result' must be a non-empty string — a temporary's "
+                      "name, or the reserved name 'result' for the value the "
+                      "lowered instruction itself produces");
+        } else {
+            out.hasResult  = true;
+            out.resultName = r.get<std::string>();
+            out.definesResult = (out.resultName == "result");
+        }
+    }
+    if (out.hasResult) {
+        if (!st.contains("resultClass") || !st.at("resultClass").is_string()) {
+            coll.emit(DiagnosticCode::C_MissingField, path + "/resultClass",
+                      std::format("a step that declares a 'result' must also "
+                                  "declare its register class (one of {}) — the "
+                                  "class is a fact about the instruction, and "
+                                  "guessing it is how a GPR mov assembles onto "
+                                  "an XMM ordinal",
+                                  detail::renderAllowedList(
+                                      allNames(kTargetRegClassTable), " / ")));
+        } else if (auto const cls = targetRegClassFromName(
+                       st.at("resultClass").get<std::string>());
+                   cls.has_value() && *cls != TargetRegClass::None) {
+            out.resultClass = *cls;
+        } else {
+            coll.emit(DiagnosticCode::C_MalformedJson, path + "/resultClass",
+                      std::format("expected {} (not 'none' — a step with a "
+                                  "result has a class)",
+                                  detail::renderAllowedList(
+                                      allNames(kTargetRegClassTable), " / ")));
+        }
+    } else if (st.contains("resultClass")) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path + "/resultClass",
+                  "'resultClass' without 'result' — the step declares a class "
+                  "for a register it never defines");
+    }
+    if (st.contains("width")) {
+        auto const& w = st.at("width");
+        if (!w.is_number_integer()
+            || (w.get<std::int64_t>() != 8  && w.get<std::int64_t>() != 16
+                && w.get<std::int64_t>() != 32 && w.get<std::int64_t>() != 64
+                && w.get<std::int64_t>() != 128)) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path + "/width",
+                      "'width' must be the integer 8, 16, 32, 64, or 128 (the same "
+                      "operation-width vocabulary the encoding-variant guards "
+                      "key on); omit it for the 64-bit LIR default");
+        } else {
+            out.widthBits = static_cast<std::uint8_t>(w.get<std::int64_t>());
+        }
+    }
+    if (!st.contains("operands")) return;
+    auto const& ops = st.at("operands");
+    if (!ops.is_array()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path + "/operands",
+                  "'operands' must be an array");
+        return;
+    }
+    out.operands.reserve(ops.size());
+    for (std::size_t k = 0; k < ops.size(); ++k) {
+        if (!ops[k].is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("{}/operands/{}", path, k),
+                      "a lowering-step operand must be an object");
+            continue;
+        }
+        TargetLoweringOperand op;
+        parseLoweringOperand(ops[k], std::format("{}/operands/{}", path, k),
+                             op, coll);
+        out.operands.push_back(std::move(op));
+    }
+}
+
+void parseLoweringBlock(json const& low, std::size_t opIdx,
+                        TargetLoweringInfo& out, Collector& coll) {
+    auto const blockPath = std::format("/opcodes/{}/lowering", opIdx);
+    if (!low.is_object()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, blockPath,
+                  "'lowering' must be an object");
+        return;
+    }
+    static constexpr std::array<std::string_view, 1> kLoweringKeys{"sequences"};
+    DSS_CHECK_KEY_VOCABULARY(kLoweringKeys);
+    rejectUnknownKeys(low, kLoweringKeys, blockPath, "a lowering block", coll);
+    if (!low.contains("sequences")) {
+        coll.emit(DiagnosticCode::C_MissingField, blockPath + "/sequences",
+                  "missing 'sequences' (required when a 'lowering' block is "
+                  "present — an empty block would silently mean 'no expansion' "
+                  "while the author's intent was to declare one)");
+        return;
+    }
+    auto const& seqs = low.at("sequences");
+    if (!seqs.is_array() || seqs.empty()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, blockPath + "/sequences",
+                  "'sequences' must be a NON-EMPTY array");
+        return;
+    }
+    out.sequences.reserve(seqs.size());
+    for (std::size_t si = 0; si < seqs.size(); ++si) {
+        auto const seqPath = std::format("{}/sequences/{}", blockPath, si);
+        auto const& s = seqs[si];
+        if (!s.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, seqPath,
+                      "sequence entry must be an object");
+            continue;
+        }
+        static constexpr std::array<std::string_view, 2> kSequenceKeys{
+            "guard", "steps"};
+        DSS_CHECK_KEY_VOCABULARY(kSequenceKeys);
+        rejectUnknownKeys(s, kSequenceKeys, seqPath, "a lowering sequence", coll);
+        TargetLoweringSequence seq;
+        if (s.contains("guard")) {
+            auto const& g = s.at("guard");
+            if (!g.is_object()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, seqPath + "/guard",
+                          "'guard' must be an object");
+            } else {
+                static constexpr std::array<std::string_view, 1> kGuardKeys{"width"};
+                DSS_CHECK_KEY_VOCABULARY(kGuardKeys);
+                rejectUnknownKeys(g, kGuardKeys, seqPath + "/guard",
+                                  "a lowering-sequence guard", coll);
+                if (g.contains("width")) {
+                    auto const& w = g.at("width");
+                    if (!w.is_number_integer()
+                        || (w.get<std::int64_t>() != 8 && w.get<std::int64_t>() != 16
+                            && w.get<std::int64_t>() != 32
+                            && w.get<std::int64_t>() != 64
+                            && w.get<std::int64_t>() != 128)) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  seqPath + "/guard/width",
+                                  "'width' must be the integer 8, 16, 32, 64, or 128");
+                    } else {
+                        seq.guardWidthBits =
+                            static_cast<std::uint8_t>(w.get<std::int64_t>());
+                    }
+                }
+            }
+        }
+        if (!s.contains("steps") || !s.at("steps").is_array()
+            || s.at("steps").empty()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, seqPath + "/steps",
+                      "missing or empty 'steps' — a sequence with no steps "
+                      "would lower the operation to NOTHING and leave its "
+                      "result undefined");
+            continue;
+        }
+        auto const& steps = s.at("steps");
+        seq.steps.reserve(steps.size());
+        for (std::size_t ti = 0; ti < steps.size(); ++ti) {
+            auto const stepPath = std::format("{}/steps/{}", seqPath, ti);
+            if (!steps[ti].is_object()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, stepPath,
+                          "step entry must be an object");
+                continue;
+            }
+            TargetLoweringStep step;
+            parseLoweringStep(steps[ti], stepPath, step, coll);
+            seq.steps.push_back(std::move(step));
+        }
+        out.sequences.push_back(std::move(seq));
     }
 }
 
@@ -838,7 +1200,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // guard would reject every shipped target on its first load.
     //
     // Every name here is a key the loader genuinely reads.
-    static constexpr std::array<std::string_view, 16> kTargetDocumentKeys{
+    static constexpr std::array<std::string_view, 17> kTargetDocumentKeys{
         // identity + loader gates
         "dssTargetVersion", "target",
         // per-target LANGUAGE-affecting semantics
@@ -862,6 +1224,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // facet, leaving a knob that lies. `ShippedTargetsDeclareAsm-
         // Constraints` pins that the key is genuinely consumed.
         "asmConstraints",
+        // Which register VIEW a BARE `%0` names, per register class — the
+        // half `asmConstraints` cannot answer, because it is about the
+        // width a reference states rather than about which register a
+        // letter binds. Undeclared is a legitimate state and every
+        // consumer refuses by name; see `AsmBareOperandWidth`.
+        "asmBareOperandWidths",
         // machine description
         "opcodes", "registers", "registerClassOps", "relocations",
         "condCodeEncoding",
@@ -1074,9 +1442,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             // belongs HERE rather than in the substrate — `ObjectFormatSchema`
             // drives the same substrate loader with a DIFFERENT extension set,
             // so a set placed there would reject the other family's keys.
-            static constexpr std::array<std::string_view, 7> kRelocationKeys{
+            static constexpr std::array<std::string_view, 8> kRelocationKeys{
                 "name", "kind", "formula", "widthBytes", "pcRelative",
-                "addendBias", "tls"};
+                "addendBias", "tls", "imageRelative"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationKeys);
             rejectUnknownKeys(r, kRelocationKeys,
                               std::format("/relocations/{}", i),
@@ -1165,6 +1533,25 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     return false;
                 }
                 info.tls = r.at("tls").get<bool>();
+            }
+            // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: `imageRelative`
+            // — the patched value is the target's address MINUS the
+            // image base (an RVA), not an absolute VA. The one
+            // property that separates PE's `IMAGE_REL_AMD64_ADDR32NB`
+            // from `IMAGE_REL_AMD64_ADDR32`; both are 32-bit Linear
+            // absolute rows with a zero bias, so without it a walker
+            // asking for "the RVA relocation" is choosing by table
+            // order. The coherence rules (imageRelative excludes
+            // pcRelative and tls) live in `TargetSchema::validate()`,
+            // which a programmatically-built schema also reaches.
+            if (r.contains("imageRelative")) {
+                if (!r.at("imageRelative").is_boolean()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/imageRelative", i),
+                           "'imageRelative' must be a boolean");
+                    return false;
+                }
+                info.imageRelative = r.at("imageRelative").get<bool>();
             }
             // Non-Linear coherence + default widthBytes=4 (ARM64
             // instruction word).
@@ -1782,11 +2169,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                       "opcode entry must be an object");
             continue;
         }
-        static constexpr std::array<std::string_view, 13> kOpcodeKeys{
+        static constexpr std::array<std::string_view, 14> kOpcodeKeys{
             "mnemonic", "result", "hasSideEffects", "requires2Address",
             "twoAddressSourceOperand",
             "isCall", "terminatorKind", "minOperands", "maxOperands",
-            "minSuccessors", "maxSuccessors", "encoding",
+            "minSuccessors", "maxSuccessors", "encoding", "lowering",
             "implicitRegisters"};
         DSS_CHECK_KEY_VOCABULARY(kOpcodeKeys);
         rejectUnknownKeys(o, kOpcodeKeys, std::format("/opcodes/{}", i),
@@ -1951,8 +2338,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // intent to declare an encoding would be silently dropped.
         if (o.contains("encoding")) {
             auto const& enc = o.at("encoding");
-            static constexpr std::array<std::string_view, 2> kEncodingKeys{
-                "format", "variants"};
+            static constexpr std::array<std::string_view, 3> kEncodingKeys{
+                "format", "variants",
+                // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the register
+                // bank this opcode's fields draw from unless a field overrides
+                // it. validate() proves every register-bearing field resolves.
+                "registerClass"};
             DSS_CHECK_KEY_VOCABULARY(kEncodingKeys);
             rejectUnknownKeys(enc, kEncodingKeys,
                               std::format("/opcodes/{}/encoding", i),
@@ -1993,6 +2384,13 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                                   " / ")));
                     }
                 }
+                // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the
+                // opcode-wide register bank. Read BEFORE the variants so a
+                // malformed spelling is reported once, at the opcode, rather
+                // than once per field that would have inherited it.
+                info.encoding.registerClass = parseRegClassField(
+                    enc, "registerClass",
+                    std::format("/opcodes/{}/encoding/registerClass", i), coll);
                 // AS2: parse the per-variant rows when present. Walker
                 // consumes via the schema accessor; validate() pins
                 // cross-field invariants (opcode bytes non-empty,
@@ -2002,6 +2400,15 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                           i, data, coll);
                 }
             }
+        }
+        // Instruction-SEQUENCE facet
+        // (D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE).
+        // Optional per-opcode block declaring the machine instructions this
+        // operation expands into. Shape-only here; step mnemonics resolve to
+        // opcode indexes in the post-pass below (the mnemonic index is not
+        // complete until every opcode row has been read).
+        if (o.contains("lowering")) {
+            parseLoweringBlock(o.at("lowering"), i, info.lowering, coll);
         }
         // Implicit-register-constraint (cycle 10p substrate,
         // 2026-06-04). Optional per-opcode block. Field-shape rejects
@@ -2082,8 +2489,8 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readRegArray("inputs",    irc.inputNames);
                 readRegArray("outputs",   irc.outputNames);
                 readRegArray("clobbered", irc.clobberedNames);
-                // Role maps (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-
-                // CONTRACT): each is an OBJECT of role → register
+                // Role maps (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT):
+                // each is an OBJECT of role → register
                 // name. Shape-only here; role-vocabulary, membership
                 // (role's register ∈ the positional array), and
                 // name→ordinal resolution happen in the post-register
@@ -2573,6 +2980,123 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         }
     }
 
+    // ── asmBareOperandWidths (which view a BARE `%0` names — optional) ──
+    //
+    // See `AsmBareOperandWidth` in the header for the measurement: gcc and
+    // clang agree with each other and DISAGREE ACROSS PORTS about how a
+    // modifier-less template operand states its width, and no width arithmetic
+    // reproduces both — so the derivation is declared, per register class.
+    //
+    // ★ PARSED AFTER `registers` ON PURPOSE, the same precedent as
+    // `asmConstraints` and the `implicitRegisters` roles: the `registerNatural`
+    // derivation reads its width off the class's own full registers, so a class
+    // that declares none must be visible as a load-time fact rather than as a
+    // lookup that fails much later at a site with no target in hand.
+    //
+    // OPTIONAL, AND UNDECLARED IS NOT A DEFAULT. A target that omits this
+    // refuses every bare operand reference BY NAME rather than substituting at
+    // a plausible width — see the field's docblock for why a default here would
+    // be a silent wrong width rather than a missing feature.
+    if (doc.contains("asmBareOperandWidths")) {
+        // Rendered FROM THE TABLES at each use, never re-typed — the same rule
+        // the `asmConstraints` block states, and for the same reason.
+        auto const renderRows = [](auto const& table) {
+            std::string out;
+            for (auto const& row : table.rows) {
+                if (!out.empty()) out += ", ";
+                out += '\'';
+                out += row.second;
+                out += '\'';
+            }
+            return out;
+        };
+        if (!doc.at("asmBareOperandWidths").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/asmBareOperandWidths",
+                      "'asmBareOperandWidths' must be an array of "
+                      "per-register-class derivation rows");
+        } else {
+            auto const& rows = doc.at("asmBareOperandWidths");
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                auto const& r = rows[i];
+                auto const path =
+                    std::format("/asmBareOperandWidths/{}", i);
+                if (!r.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "asmBareOperandWidths entry must be an object");
+                    continue;
+                }
+                static constexpr std::array<std::string_view, 2>
+                    kBareWidthKeys{"class", "derivation"};
+                DSS_CHECK_KEY_VOCABULARY(kBareWidthKeys);
+                rejectUnknownKeys(r, kBareWidthKeys, path,
+                                  "an asmBareOperandWidths row", coll);
+
+                if (!r.contains("class") || !r.at("class").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/class", path),
+                              "missing or non-string 'class' — a bare-operand "
+                              "width row must name the register class whose "
+                              "references it describes");
+                    continue;
+                }
+                auto const clsName = r.at("class").get<std::string>();
+                auto const cls = targetRegClassFromName(clsName);
+                // ★ THE SAME `isOperableTargetRegClass` GATE `registerClassOps`
+                // USES, and for the same reason: `none` resolves as a NAME but
+                // is not a legitimate SUBJECT — the no-class sentinel has no
+                // registers, so no reference can name a view of one.
+                if (!cls.has_value() || !isOperableTargetRegClass(*cls)) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/class", path),
+                              std::format("unknown register class '{}' "
+                                          "(expected one of: {})",
+                                          clsName,
+                                          renderRows(kTargetRegClassTable)));
+                    continue;
+                }
+                if (!r.contains("derivation")
+                    || !r.at("derivation").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/derivation", path),
+                              std::format("missing or non-string 'derivation' "
+                                          "— a row must say WHICH view a bare "
+                                          "operand reference names (one of: "
+                                          "{})",
+                                          renderRows(
+                                              kAsmBareOperandWidthTable)));
+                    continue;
+                }
+                auto const derivName = r.at("derivation").get<std::string>();
+                auto const deriv = asmBareOperandWidthFromName(derivName);
+                if (!deriv.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/derivation", path),
+                              std::format("unknown derivation '{}' (expected "
+                                          "one of: {})",
+                                          derivName,
+                                          renderRows(
+                                              kAsmBareOperandWidthTable)));
+                    continue;
+                }
+                auto const idx = static_cast<std::size_t>(*cls);
+                // ⚠ A DUPLICATE ROW IS REFUSED RATHER THAN LAST-WINS. Two rows
+                // for one class is a document whose author believed two
+                // different things about the same reference, and silently
+                // keeping either one ships one of those beliefs unexamined.
+                if (data.asmBareOperandWidths[idx].has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/class", path),
+                              std::format("register class '{}' already has a "
+                                          "bare-operand width derivation — one "
+                                          "row per class",
+                                          clsName));
+                    continue;
+                }
+                data.asmBareOperandWidths[idx] = *deriv;
+            }
+        }
+    }
+
     // ── registerClassOps (FC2 Part B — optional) ───────────────────
     // Per-register-class move/load/store mnemonic table. A class with
     // no row resolves to the universal defaults iff it is GPR (see
@@ -2880,7 +3404,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // instances carry the most `$...Comment` prose keys - which is
                 // exactly why the carve-out lives in `rejectUnknownKeys` as a
                 // PREFIX test rather than a literal `"$comment"` entry.
-                static constexpr std::array<std::string_view, 26> kCallConvKeys{
+                static constexpr std::array<std::string_view, 27> kCallConvKeys{
                     "name",
                     "argGprs", "argFprs", "returnGprs", "returnFprs",
                     "argVrs", "returnVrs", "callerSaved", "calleeSaved",
@@ -2890,6 +3414,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     "aggregateClassification", "slotAligned",
                     "variadicArgsAlwaysStack",
                     "aggregateStackExhaustsRegisters",
+                    "stackArgPacking",
                     "linkRegister", "stackPointer", "framePointer",
                     "variadicVectorCountReg", "indirectResultRegister",
                     "vaListLayout"};
@@ -3022,6 +3547,98 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     } else {
                         cc.aggregateStackExhaustsRegisters =
                             c.at("aggregateStackExhaustsRegisters").get<bool>();
+                    }
+                }
+                // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the
+                // three-axis stacked-argument packing declaration. OPTIONAL, and
+                // an omitted object (or an omitted key inside it) means "slot" —
+                // the classic one-pointer-width-slot rule — so every CC that says
+                // nothing is byte-unchanged. Each value is a name from the closed
+                // `StackArgPacking` vocabulary; an unknown key OR an unknown value
+                // FAILS LOUD naming the accepted set, because the failure mode of
+                // silently accepting either is an ABI divergence that compiles
+                // clean and miscompiles at the boundary
+                // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+                if (c.contains("stackArgPacking")) {
+                    std::string const sapPath =
+                        std::format("{}/stackArgPacking", ccPath);
+                    if (!c.at("stackArgPacking").is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, sapPath,
+                                  "'stackArgPacking' must be an object with the "
+                                  "optional keys 'namedScalars' / "
+                                  "'namedAggregates' / 'variadic'");
+                    } else {
+                        auto const& sap = c.at("stackArgPacking");
+                        static constexpr std::array<std::string_view, 3>
+                            kStackArgPackingKeys{"namedScalars",
+                                                 "namedAggregates", "variadic"};
+                        DSS_CHECK_KEY_VOCABULARY(kStackArgPackingKeys);
+                        rejectUnknownKeys(sap, kStackArgPackingKeys, sapPath,
+                                          "a stack-arg-packing row", coll);
+                        auto readAxis =
+                            [&](std::string_view key, StackArgPacking& out) {
+                                if (!sap.contains(std::string{key})) return;
+                                auto const& v = sap.at(std::string{key});
+                                if (!v.is_string()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_MalformedJson,
+                                        std::format("{}/{}", sapPath, key),
+                                        std::format(
+                                            "'{}' must be a packing-rule name "
+                                            "string — accepted: {}", key,
+                                            detail::renderAllowedList(
+                                                allNames(kStackArgPackingTable),
+                                                " / ")));
+                                    return;
+                                }
+                                auto const s = v.get<std::string>();
+                                if (auto const p = stackArgPackingFromName(s);
+                                    p.has_value()) {
+                                    out = *p;
+                                } else {
+                                    coll.emit(
+                                        DiagnosticCode::C_MalformedJson,
+                                        std::format("{}/{}", sapPath, key),
+                                        std::format(
+                                            "unknown stack-arg packing rule '{}' "
+                                            "— accepted: {}", s,
+                                            detail::renderAllowedList(
+                                                allNames(kStackArgPackingTable),
+                                                " / ")));
+                                }
+                            };
+                        readAxis("namedScalars",    cc.stackArgPacking.namedScalars);
+                        readAxis("namedAggregates", cc.stackArgPacking.namedAggregates);
+                        readAxis("variadic",        cc.stackArgPacking.variadic);
+                        // ⚠ ONE BUILDABLE VALUE ON THE AGGREGATE AXIS, AND THE
+                        // OTHER IS REFUSED RATHER THAN APPROXIMATED. Natural
+                        // packing needs the datum's own ALIGNMENT; a stacked
+                        // aggregate reaches the placement tier through the
+                        // `ByValueStackAgg` carrier, which states a byte SIZE and
+                        // nothing else. Accepting "natural" here would make the
+                        // cursor align aggregates to the slot while advancing by
+                        // their exact size — a THIRD rule nobody measured, shipped
+                        // under the name of one that was. ✔MEASURED: both shipped
+                        // ABIs slot-round aggregates, so nothing is lost today.
+                        if (cc.stackArgPacking.namedAggregates
+                                != StackArgPacking::Slot) {
+                            coll.emit(
+                                DiagnosticCode::C_MalformedJson,
+                                std::format("{}/namedAggregates", sapPath),
+                                std::format(
+                                    "'namedAggregates' may only be '{}' today: "
+                                    "natural aggregate packing needs the "
+                                    "aggregate's own alignment, which the "
+                                    "by-value stack-aggregate carrier does not "
+                                    "state (it carries a byte size only), so the "
+                                    "placement tier cannot honour it — refusing "
+                                    "rather than approximating it as "
+                                    "slot-aligned-but-exactly-sized ({})",
+                                    stackArgPackingName(StackArgPacking::Slot),
+                                    kApplePackingAnchor));
+                            cc.stackArgPacking.namedAggregates =
+                                StackArgPacking::Slot;
+                        }
                     }
                 }
                 if (c.contains("linkRegister")) {
@@ -3311,8 +3928,8 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                 // it names the OTHER strategy that would have
                                 // read the key, which is what distinguishes a
                                 // typo from a copy-paste off the wrong ABI
-                                // (D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-
-                                // KEY). Routing it would trade a diagnostic
+                                // (D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-KEY).
+                                // Routing it would trade a diagnostic
                                 // for a shape.
                                 if (detail::isDocumentationKey(key)) continue;
                                 if (inSet(kVaListCommonKeys, key)) continue;
@@ -3449,6 +4066,170 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         }
     }
 
+    // ── Lowering-sequence resolution + validation ─────────────────
+    // D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE.
+    // Runs here, not in the per-opcode loop, because a step may name ANY
+    // opcode of this target — including one declared LATER in the array — so
+    // the mnemonic index must be complete first (the same reason the
+    // implicit-register resolution below waits for the register table).
+    //
+    // ★ THE LOAD-BEARING RULE IS "a step names a REAL MACHINE INSTRUCTION":
+    // its opcode must declare a non-empty `encoding`. That single check is
+    // what makes the expansion ONE LEVEL and non-recursive — arm64's
+    // self-naming one-step sequence is well-founded because the opcode it
+    // names carries FCVTZU's bytes, and a step naming an opcode that only has
+    // a `lowering` of its own is refused at LOAD, not discovered as a hang.
+    for (std::size_t opIdx = 0; opIdx < data.opcodes.size(); ++opIdx) {
+        auto& info = data.opcodes[opIdx];
+        if (info.lowering.sequences.empty()) continue;
+        auto const opPath = std::format("/opcodes/{}/lowering", opIdx);
+        // Width-guard coherence: the encoding variants' rule, verbatim.
+        // Two sequences on one width, or the width-keyed/width-absent mix,
+        // make first-match dispatch silently shadow one of them.
+        for (std::size_t a = 0; a < info.lowering.sequences.size(); ++a) {
+            for (std::size_t b = a + 1; b < info.lowering.sequences.size(); ++b) {
+                auto const wa = info.lowering.sequences[a].guardWidthBits;
+                auto const wb = info.lowering.sequences[b].guardWidthBits;
+                if (wa == wb) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/sequences/{}", opPath, b),
+                              std::format(
+                                  "opcode '{}': two lowering sequences declare "
+                                  "the same guard width ({}) — first-match "
+                                  "dispatch would silently shadow one",
+                                  info.mnemonic, wa));
+                } else if (wa == 0 || wb == 0) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/sequences/{}", opPath, b),
+                              std::format(
+                                  "opcode '{}': a width-keyed lowering sequence "
+                                  "({}) sits beside a width-ABSENT sibling — the "
+                                  "absent one matches every width and would "
+                                  "shadow or be shadowed depending on order; "
+                                  "key both or neither",
+                                  info.mnemonic, wa != 0 ? wa : wb));
+                }
+            }
+        }
+        for (std::size_t si = 0; si < info.lowering.sequences.size(); ++si) {
+            auto& seq     = info.lowering.sequences[si];
+            auto const sp = std::format("{}/sequences/{}", opPath, si);
+            // Temp-slot table: built as the steps are walked, so a `temp`
+            // operand can only reference a name an EARLIER step defined.
+            // A forward reference would read an undefined register.
+            std::size_t resultDefiners = 0;
+            for (std::size_t ti = 0; ti < seq.steps.size(); ++ti) {
+                auto& step  = seq.steps[ti];
+                auto const tp = std::format("{}/steps/{}", sp, ti);
+                // (a) the step's opcode exists and is a real instruction.
+                auto const it = data.mnemonicIndex.find(step.opcodeMnemonic);
+                if (it == data.mnemonicIndex.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, tp + "/op",
+                              std::format("opcode '{}': lowering step names "
+                                          "mnemonic '{}', which this target's "
+                                          "opcode table does not declare",
+                                          info.mnemonic, step.opcodeMnemonic));
+                    continue;
+                }
+                step.opcodeIndex = it->second;
+                auto const& stepInfo = data.opcodes[step.opcodeIndex];
+                if (stepInfo.encoding.variants.empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, tp + "/op",
+                              std::format(
+                                  "opcode '{}': lowering step names '{}', which "
+                                  "declares NO encoding variants — a step must "
+                                  "name a real MACHINE instruction (this is the "
+                                  "rule that keeps the expansion one level deep "
+                                  "and non-recursive)",
+                                  info.mnemonic, step.opcodeMnemonic));
+                }
+                // (b) arity against the named opcode's declared bounds.
+                if (step.operands.size() < stepInfo.minOperands
+                    || step.operands.size() > stepInfo.maxOperands) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, tp + "/operands",
+                              std::format(
+                                  "opcode '{}': lowering step '{}' supplies {} "
+                                  "operand(s), outside that opcode's declared "
+                                  "[{}, {}]", info.mnemonic,
+                                  step.opcodeMnemonic, step.operands.size(),
+                                  stepInfo.minOperands, stepInfo.maxOperands));
+                }
+                // (c) operand references.
+                for (std::size_t k = 0; k < step.operands.size(); ++k) {
+                    auto& op = step.operands[k];
+                    auto const opp = std::format("{}/operands/{}", tp, k);
+                    if (op.kind == TargetLoweringOperandKind::Source) {
+                        if (op.sourceIndex >= info.maxOperands) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, opp,
+                                      std::format(
+                                          "opcode '{}': lowering step reads "
+                                          "source operand {}, but the opcode "
+                                          "declares at most {} operand(s)",
+                                          info.mnemonic, op.sourceIndex,
+                                          info.maxOperands));
+                        }
+                    } else if (op.kind == TargetLoweringOperandKind::Temp) {
+                        bool found = false;
+                        for (std::size_t s = 0; s < seq.tempNames.size(); ++s) {
+                            if (seq.tempNames[s] == op.tempName) {
+                                op.tempSlot = static_cast<std::uint16_t>(s);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, opp,
+                                      std::format(
+                                          "opcode '{}': lowering step reads "
+                                          "temporary '{}', which no EARLIER "
+                                          "step of this sequence defines",
+                                          info.mnemonic, op.tempName));
+                        }
+                    }
+                }
+                // (d) result naming. `result` is the reserved spelling for
+                // the value the lowered instruction itself yields; every
+                // other name mints a temp slot for later steps to read.
+                if (!step.hasResult) continue;
+                if (step.definesResult) {
+                    ++resultDefiners;
+                    continue;
+                }
+                for (auto const& existing : seq.tempNames) {
+                    if (existing == step.resultName) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  tp + "/result",
+                                  std::format(
+                                      "opcode '{}': lowering sequence defines "
+                                      "temporary '{}' twice — a redefinition "
+                                      "makes which one a later step reads "
+                                      "depend on scan order",
+                                      info.mnemonic, step.resultName));
+                        break;
+                    }
+                }
+                step.resultTempSlot =
+                    static_cast<std::uint16_t>(seq.tempNames.size());
+                seq.tempNames.push_back(step.resultName);
+            }
+            // (e) exactly one step yields the operation's value, and it is
+            // the LAST one. A sequence whose value-producing step is not
+            // last has instructions running AFTER the result is bound.
+            if (resultDefiners != 1) {
+                coll.emit(DiagnosticCode::C_MalformedJson, sp,
+                          std::format("opcode '{}': lowering sequence declares "
+                                      "{} step(s) naming the reserved result — "
+                                      "exactly one is required",
+                                      info.mnemonic, resultDefiners));
+            } else if (!seq.steps.empty() && !seq.steps.back().definesResult) {
+                coll.emit(DiagnosticCode::C_MalformedJson, sp,
+                          std::format("opcode '{}': the step naming the "
+                                      "reserved result is not the LAST step of "
+                                      "the sequence", info.mnemonic));
+            }
+        }
+    }
+
     // ── Implicit-register-constraint resolution + validation ──────
     // Cycle 10p: resolves each opcode's `implicitRegisters` names to
     // register ordinals via `data.registerIndex` (which is fully
@@ -3543,11 +4324,33 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // `outputs: ["rdx"]` is internally inconsistent + would
         // silently allow divisor vregs into RDX → zeroed by xor →
         // divide-by-zero trap. Fail loud at load time.
-        std::set<std::uint16_t> const clobberedSet(
-            ir.clobberedOrdinals.begin(),
-            ir.clobberedOrdinals.end());
-        for (std::size_t k = 0; k < ir.outputOrdinals.size(); ++k) {
-            if (clobberedSet.find(ir.outputOrdinals[k]) == clobberedSet.end()) {
+        //
+        // ★★★ ASKED WITH THE TYPE'S OWN PREDICATE (P42, 2026-08-27). This site
+        // used to hand-roll the comparison over a local `std::set`, which made
+        // it the SECOND implementation of a rule three other callers were
+        // already asking `ImplicitRegisterConstraint` for — the per-instruction
+        // builder, the `.dsslir` reader and the inline-asm lowering. Two
+        // implementations of one invariant do not stay equal; the friendlier
+        // one wins by accident, and the strict one's abort then contradicts a
+        // document this loader accepted.
+        //
+        // ★ WHY THE PER-INDEX PREDICATE AND NOT `firstOutputNotClobbered`. This
+        // caller must emit ONE diagnostic per offending output, each with that
+        // output's own JSON pointer, so a single re-run surfaces every mistake
+        // in the document. A first-failure query structurally cannot do that.
+        // One rule, two shapes — see the predicate's docblock.
+        //
+        // ⚠ A LENGTH MISMATCH BAILS RATHER THAN REPORTING. `resolveArr` SKIPS
+        // an unresolvable name (having already reported it), so `outputOrdinals`
+        // can be SHORTER than `outputNames` — and the message below subscripts
+        // the NAMES with an index taken from the ORDINALS. Reporting through a
+        // mismatch cannot make the test pass wrongly, but it CAN name the wrong
+        // register, which is the half-applied shape this repo keeps
+        // rediscovering. Nothing is silently dropped: every skipped name was
+        // already diagnosed by `resolveArr`, and the document cannot load.
+        if (ir.outputOrdinals.size() == ir.outputNames.size()) {
+            for (std::size_t k = 0; k < ir.outputOrdinals.size(); ++k) {
+                if (ir.outputIsClobbered(k)) continue;
                 coll.emit(DiagnosticCode::C_MalformedJson,
                           std::format(
                               "/opcodes/{}/implicitRegisters/outputs/{}",
@@ -3569,8 +4372,8 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             }
         }
 
-        // Role-map resolution + validation (D-CSUBSET-MOD-OP-CODEGEN-
-        // OUTPUT-INDEX-CONTRACT, 2026-06-10). Three rejects per role:
+        // Role-map resolution + validation (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT,
+        // 2026-06-10). Three rejects per role:
         //   1. unknown role name (typo discriminator — the lowering
         //      queries a registered vocabulary; "remaindr" must fail
         //      at LOAD, not surface as a missing-role at lowering);

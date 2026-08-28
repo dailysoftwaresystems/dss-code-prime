@@ -1138,3 +1138,100 @@ TEST(StructCfDerivation, ModuleWideAndPerFunctionAppliersAgree) {
             << "func index " << i;
     }
 }
+
+// ══ P36: THE TWO SUBSTRATE-REUSE PINS THE SECOND CALLER MADE NECESSARY ══════
+//
+// `mirBackEdgeCandidates` and `mirModuleSelfLoopBlocks` used to be private to
+// mir_struct_markers.cpp. They are now exported from mir_dom.hpp because the
+// SECOND caller that needed them — `opt::passes::runLicm`, which asked for the
+// loop forest once per FUNCTION through the whole-module overload — could not
+// reach them and silently kept the O(functions × module blocks) sweep
+// (D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN). Exporting the builder finally
+// makes the differential the P9 self-audit wanted possible: until now every
+// scoped-vs-whole comparison in this file fed the TEST's independent
+// `candidateSetFor`, while BOTH production appliers shared the production
+// builder — so a range bug agreed with itself and only the LATCH-LAST VALUE pin
+// could see it.
+
+// The production builder against this file's independent one, for EVERY
+// function. A range-end off-by-one (`s < lastEx - 1`), a missing `first`
+// offset, a dropped rpo-outlier or a dropped self-loop index each move exactly
+// one set and not the other.
+TEST(MirBackEdgeCandidates, ProductionBuilderMatchesTheIndependentTestSet) {
+    TypeInterner interner{CompilationUnitId{1}};
+    AdversarialModule a = buildAdversarialModule(interner);
+    std::vector<std::uint32_t> selfLoops;
+    mirModuleSelfLoopBlocks(a.m, selfLoops);
+    // The index is a MODULE property, and this module was built to have one.
+    EXPECT_FALSE(selfLoops.empty())
+        << "the fixture's self-looping blocks are what make the completeness "
+           "clause observable at all";
+    std::vector<std::uint32_t> produced;
+    for (MirFuncId const f : a.funcs) {
+        auto const rpo = mirReversePostOrder(a.m, a.m.funcEntry(f));
+        mirBackEdgeCandidates(a.m, f, rpo,
+                              std::span<std::uint32_t const>{selfLoops}, produced);
+        EXPECT_EQ(produced, candidateSetFor(a.m, f, rpo)) << "func #" << f.v;
+        // The whole point of the scoped sweep: the set is O(function), never
+        // O(module). Asserted as a COUNT, not a clock — a regression to the
+        // whole-module sweep makes this a module-sized set.
+        EXPECT_LT(produced.size(), a.m.blockCount())
+            << "func #" << f.v << " — a candidate set as large as the module "
+               "IS the quadratic sweep coming back";
+    }
+}
+
+// D-PERF-VERIFIER-REESTABLISHES-MODULE-SUBSTRATES-PER-FUNCTION. One
+// `MirStructCfScratch`, an adversarial SEQUENCE (forward, then reversed, then a
+// repeat), and a FULL module-sized marker-vector comparison against the
+// per-call overload after EVERY call. The bundle carries the self-loop index
+// AND the post-dominator scratch across functions, so a reset this file cannot
+// see would show up HERE as one function's derivation contaminating the next —
+// which is why the order deliberately runs a big function straight into a
+// one-block one.
+TEST(MirStructCfScratchReuse, MatchesPerCallOverAdversarialSequence) {
+    TypeInterner interner{CompilationUnitId{1}};
+    AdversarialModule a = buildAdversarialModule(interner);
+    auto const preds = mirBuildPredecessors(a.m);
+
+    std::vector<MirFuncId> order = a.funcs;
+    for (auto it = a.funcs.rbegin(); it != a.funcs.rend(); ++it) order.push_back(*it);
+    order.push_back(a.funcs.front());
+    order.push_back(a.funcs.front());
+
+    MirStructCfScratch scratch;
+    for (MirFuncId const f : order) {
+        MirBlockId const entry = a.m.funcEntry(f);
+        auto const rpo = mirReversePostOrder(a.m, entry);
+        MirDomTree const dom = computeMirDomTree(a.m, entry, rpo, preds);
+        auto const perCall = deriveStructCfMarkers(a.m, f, preds, rpo, dom);
+        auto const bundled =
+            deriveStructCfMarkers(a.m, f, preds, rpo, dom, scratch);
+        ASSERT_EQ(perCall.size(), bundled.size()) << "func #" << f.v;
+        EXPECT_EQ(perCall, bundled)
+            << "func #" << f.v
+            << " — the bundled derivation must be byte-identical to the "
+               "per-call one; it is a COST change, never a behaviour change";
+    }
+}
+
+// The bundle's self-loop index belongs to the module it was swept over. Serving
+// it for a different module is a WRONG loop forest, not a slow one — so the
+// reuse guard fails loud, the MirDomScratch / MirPostDomScratch pattern.
+TEST(MirStructCfScratchReuseDeathTest, StaleScratchAcrossModulesAborts) {
+    TypeInterner interner{CompilationUnitId{1}};
+    AdversarialModule a = buildAdversarialModule(interner);
+    AdversarialModule b = buildAdversarialModule(interner);
+    auto const predsA = mirBuildPredecessors(a.m);
+    auto const predsB = mirBuildPredecessors(b.m);
+    MirStructCfScratch scratch;
+    MirFuncId const fa = a.funcs.front();
+    MirFuncId const fb = b.funcs.front();
+    auto const rpoA = mirReversePostOrder(a.m, a.m.funcEntry(fa));
+    auto const rpoB = mirReversePostOrder(b.m, b.m.funcEntry(fb));
+    MirDomTree const domA = computeMirDomTree(a.m, a.m.funcEntry(fa), rpoA, predsA);
+    MirDomTree const domB = computeMirDomTree(b.m, b.m.funcEntry(fb), rpoB, predsB);
+    (void)deriveStructCfMarkers(a.m, fa, predsA, rpoA, domA, scratch);
+    EXPECT_DEATH((void)deriveStructCfMarkers(b.m, fb, predsB, rpoB, domB, scratch),
+                 "one bundle per");
+}

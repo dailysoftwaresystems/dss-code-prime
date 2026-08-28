@@ -46,6 +46,7 @@
 #include "lir/lir_reg.hpp"
 
 #include "scratch_dir.hpp"
+#include "vocabulary_message_probe.hpp"
 
 #include <gtest/gtest.h>
 
@@ -61,6 +62,17 @@ using namespace dss;
 
 namespace {
 
+using ::dss::test_support::quotedTokens;
+
+// ★ `quotedTokens` used to be a file-local FOURTH copy here — byte-identical to
+// the one three sibling files had already merged into
+// `vocabulary_projection_probe.hpp`, and therefore invisible to the mutant that
+// closed D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE: that
+// mutant reddened 3 of 4 and this file stayed GREEN over a helper that no longer
+// worked. It has ONE owner now, so a change to what counts as a QUOTED TOKEN
+// reaches every pin that reads a refusal back — see
+// D-TEST-VOCABULARY-PROBE-HELPER-FOURTH-COPY-OUTSIDE-THE-EXTRACTED-HEADER.
+
 // A spelling no vocabulary in this tree claims.
 constexpr char const* kBadSpelling = "zzNotAnyVocabularySpelling";
 
@@ -71,24 +83,6 @@ constexpr char const* kBadSpelling = "zzNotAnyVocabularySpelling";
         out += d.actual;
     }
     return out.empty() ? std::string{"\n  <no diagnostics>"} : out;
-}
-
-// Every `'…'`-quoted token in a diagnostic. The shared renderer quotes each
-// spelling, so this reads back WHAT THE MESSAGE CLAIMS — never re-derived from
-// the table, which would make the comparison circular and green by
-// construction.
-[[nodiscard]] std::vector<std::string> quotedTokens(std::string const& msg) {
-    std::vector<std::string> out;
-    std::size_t              i = 0;
-    while (true) {
-        auto const open = msg.find('\'', i);
-        if (open == std::string::npos) break;
-        auto const close = msg.find('\'', open + 1);
-        if (close == std::string::npos) break;
-        out.push_back(msg.substr(open + 1, close - open - 1));
-        i = close + 1;
-    }
-    return out;
 }
 
 // Read one descriptor written to a private scratch directory, and return the

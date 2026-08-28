@@ -99,8 +99,42 @@ MAIN_TU_BASENAME = "speedtest1.c"
 # alone left `TOTAL....    <t>` against `TOTAL....  <t>`, and the arms would have
 # been declared to have done different work purely because one was faster. The
 # whitespace runs are collapsed for that reason, not for tidiness.
-_ELAPSED = re.compile(r"\b\d+\.\d+s\b")
+#
+# ⚠⚠ AND A NEGATIVE ELAPSED TIME IS STILL AN ELAPSED TIME, WHICH THE FIRST
+# PATTERN HERE (`\b\d+\.\d+s\b`) COULD NOT MATCH.
+# [[D-TEST-SPEEDTEST1-NORMALIZER-LETS-A-BACKWARD-CLOCK-LOOK-LIKE-DIFFERENT-WORK]]
+# `"%4d.%03ds"` formats a NEGATIVE delta with a sign in BOTH fields, so a clock
+# that steps backwards mid-run prints `-29.-29s` — no leading word boundary and a
+# `-` after the dot, so the old pattern skipped it and the corrupted token
+# survived into the normalized text. R6 then compared it against the other arm's
+# `<t>` and declared *"the two binaries did not do the same work"*, which is a
+# false accusation against both compilers.
+#
+# ✔MEASURED 2026-08-28 on the WSL x86_64 leg: the gcc arm printed
+# `160 - 100 DELETEs using rowid.... -29.-29s` and the whole benchmark refused
+# with R6. ★ This host family's WSL2 `CLOCK_REALTIME` is the known cause — it
+# oscillates ±34.47 s every ~5 s, which this file's own header already warns
+# about two screens above, for the harness's OWN timing. The gap was that the
+# warning had never been extended to the SUBJECT's self-reported times.
+#
+# ⇒ Both spellings are normalized, so R6 goes back to comparing WORK (test
+# names, order, counts, the `--verify` hash). ⓘ It does NOT invalidate the run:
+# the numbers this harness reports come from `time.monotonic()` in this process,
+# never from speedtest1's internal timer — but a host whose clock runs backwards
+# is worth saying out loud, so `malformed_elapsed_times()` below lets the caller
+# report it instead of silently swallowing it.
+_ELAPSED = re.compile(r"(?<![\w.])-?\d+\.-?\d+s\b")
+_ELAPSED_BACKWARD = re.compile(r"-\d+\.-?\d+s|\d+\.-\d+s")
 _RUNS = re.compile(r"[ \t]+")
+
+
+def malformed_elapsed_times(text: str) -> int:
+    """How many elapsed times in `text` carry a negative field.
+
+    Non-zero means the HOST's clock stepped backwards during the run, not that
+    the program is wrong. Reported rather than hidden.
+    """
+    return len(_ELAPSED_BACKWARD.findall(text))
 
 
 def die(msg: str, code: int = 1) -> "NoReturn":  # type: ignore[valid-type]
@@ -287,9 +321,9 @@ def build_msvc(arm: dict, subject: dict, jobs: int, objdir: str,
 
 def build_dss(arm: dict, subject: dict, jobs: int, objdir: str,
               binpath: str) -> tuple[bool, str]:
-    """dss-code-prime: ONE `--project` invocation, in-process CU pool.
+    """dsscp: ONE `--project` invocation, in-process CU pool.
 
-    ⚠ dss-code-prime RETURNS EXIT 0 EVEN ON FATAL ERRORS, so the verdict is
+    ⚠ dsscp RETURNS EXIT 0 EVEN ON FATAL ERRORS, so the verdict is
     taken from `error[` in the log plus the artifact's existence — never from
     the process exit status. Same rule `base-harness.sh`'s
     `dss_bh_build_artifact` states; restated rather than imported because this
@@ -329,7 +363,7 @@ def build_dss(arm: dict, subject: dict, jobs: int, objdir: str,
     # sibling's binary silently is the worst outcome available here, because
     # every number downstream would then describe a file nobody meant to measure.
     spec = arm.get("target", "")
-    marker = f"dss-code-prime: artifact {spec} "
+    marker = f"dsscp: artifact {spec} "
     reported, seen = [], set()
     for line in log.splitlines():
         i = line.find(marker)
@@ -354,8 +388,10 @@ def build_dss(arm: dict, subject: dict, jobs: int, objdir: str,
                    f"benchmark option.\n" + log[-800:])
 
 
-def preflight_dss(binary: str, config_root: str) -> tuple[bool, str]:
-    """Can this compiler compile three lines against that config? (ok, why-not).
+def preflight_dss(binary: str, config_root: str,
+                  target: str = "") -> tuple[bool, str]:
+    """Can this compiler compile three lines against that config, FOR THE TARGET
+    THE MEASUREMENT WILL USE? (ok, why-not).
 
     ★ ONE IMPLEMENTATION, CALLED BY BOTH DRIVERS, ALWAYS ON THE HOST THAT WILL
     RUN THE COMPILER. The check has to happen before a configure, a 102-object
@@ -366,18 +402,68 @@ def preflight_dss(binary: str, config_root: str) -> tuple[bool, str]:
     ✔MEASURED 2026-08-21: a two-day-stale `build/rel` against the CURRENT config
     refuses with `unknown key 'templateLabelRule' in 'assembly'`. Correct and
     well-named — but it arrived three minutes in.
+
+    ★★ AND `target` IS WHY THIS CHECK EXISTS AT ALL, NOT A REFINEMENT OF IT.
+    ✔MEASURED 2026-08-26 on TWO hosts in one run
+    (D-BENCH-COMPILER-AND-CONFIG-MAY-COME-FROM-DIFFERENT-COMMITS): this preflight
+    printed `preflight: OK` and the measurement then died on a config-schema
+    error in the very document it was supposed to be vouching for — on macOS
+    `C_MalformedJson` at `/opcodes/10/encoding/variants/0/resultSlot` for
+    `arm64:macho64-arm64-darwin-exec`, on Windows `unknown key 'registerClass'`
+    for `x86_64:pe64-x86_64-windows-exec`. The probe compiled with NO `--target`,
+    so it validated whatever DSS defaults to rather than the document under
+    measurement. **A CONTROL MUST MATCH THE TARGET** — the same rule this
+    repository already learned about reference compilers, arriving a second time
+    wearing config's clothes.
+    ⚠ A check that passes on a DIFFERENT input than the one that then fails is
+    worse than no check: it converts "this might be stale" into a printed OK.
+    ⓘ `target` is optional ONLY so a caller that genuinely has no target yet can
+    still get the weaker check; every caller in this repository passes one, and a
+    caller that omits it is TOLD so rather than silently downgraded.
     """
-    if not os.path.isdir(config_root):
-        return False, f"the config root does not exist: {config_root}"
+    # ⚠ CHECK THE COMPOSED PATH, NOT THE PIN ITSELF.
+    # [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+    # `DSS_CONFIG_ROOT` names the directory that CONTAINS `src/dss-config`, and
+    # the resolver composes the rest. A pin whose own directory exists but whose
+    # config tree does not passed this check for its whole life and then fell
+    # through to the CWD ancestor walk -- silently, because a set-but-miss
+    # falling through is documented, deliberate behaviour in the resolver.
+    if not os.path.isdir(os.path.join(config_root, "src", "dss-config")):
+        return False, (f"no config tree at {config_root}/src/dss-config -- "
+                       f"DSS_CONFIG_ROOT names the checkout root that CONTAINS "
+                       f"src/dss-config, not that directory itself")
     env = dict(os.environ)
     env["DSS_CONFIG_ROOT"] = config_root
     with tempfile.TemporaryDirectory(prefix="dss-preflight-") as td:
         src = os.path.join(td, "probe.c")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("int main(void){return 0;}\n")
-        # ⚠ rc is NOT the verdict — dss-code-prime returns 0 on fatal errors, so
+        # ⚠ `--language` IS REQUIRED HERE, AND ITS ABSENCE IS THE SAME BUG THIS
+        # DOCSTRING ALREADY RECORDS ABOUT `--target`, ONE DIMENSION OVER.
+        # ✔MEASURED 2026-08-27: `dsscp --compile probe.c --target
+        # x86_64:pe64-x86_64-windows-exec` (no --language) is REFUSED with
+        #   error[D_UnknownFileExtension]: no source language for 'probe.c':
+        #   no --language was given, so target 'x86_64' selected its declared
+        #   defaultAssemblyLanguage 'asm-x86_64-att' — which claims .s
+        # That is documented, intended CLI behaviour, not a regression (the
+        # message is byte-identical at HEAD): omitting `--language` selects the
+        # TARGET'S ASSEMBLY DIALECT, which is how one invocation compiles a `.s`
+        # for two CPUs. So the preflight refused before measuring anything.
+        #
+        # ★ THE ROOT CAUSE IS THAT THIS CONTROL DOES NOT MATCH ITS MEASUREMENT.
+        # `build_dss` compiles via `--project <manifest>`, where the manifest
+        # declares the language; this probe compiles via `--compile` on a bare
+        # `.c`, where nothing does. A CONTROL MUST MATCH THE THING IT VOUCHES
+        # FOR — the docstring above learned that about `--target` on 2026-08-26
+        # and the same sentence applies to the invocation FORM.
+        # ⓘ Hardcoding `c` is not a language-dispatch decision: this function
+        # writes the probe itself, three lines above, and it is C by construction.
+        argv = [binary, "--compile", src, "--language", "c", "--output", td]
+        if target:
+            argv += ["--target", target]
+        # ⚠ rc is NOT the verdict — dsscp returns 0 on fatal errors, so
         # the log is what decides, exactly as build_dss does.
-        r = run_capture([binary, "--compile", src, "--output", td], env=env)
+        r = run_capture(argv, env=env)
         log = (r.stdout or "") + (r.stderr or "")
         if "error[" in log:
             return False, next(ln for ln in log.splitlines() if "error[" in ln)[:400]
@@ -430,7 +516,23 @@ def run_workload(binpath: str, workload: dict, repeats: int) -> tuple[dict, str,
                                 + (r.stderr or r.stdout or "")[:800])
             times.append(elapsed)
             if not normalized:
-                normalized = normalize_output(r.stdout or "")
+                raw = r.stdout or ""
+                normalized = normalize_output(raw)
+                # ⚠ SAY IT, DO NOT SWALLOW IT. The normalizer above now absorbs a
+                # NEGATIVE elapsed time so a backward clock cannot masquerade as
+                # "the arms did different work" — but absorbing it silently would
+                # trade a false refusal for a hidden fact about the host.
+                # ⓘ The numbers this harness reports are unaffected: they come
+                # from `time.monotonic()` in THIS process, never from
+                # speedtest1's own timer.
+                backward = malformed_elapsed_times(raw)
+                if backward:
+                    print(f"  !  {os.path.basename(binpath)}: {backward} elapsed "
+                          f"time(s) came back NEGATIVE — this host's clock "
+                          f"stepped backwards during the run. The comparison "
+                          f"below is unaffected (it ignores times); the "
+                          f"program's own per-test seconds on this host are not "
+                          f"trustworthy.")
     return stats(times), normalized, ""
 
 
@@ -694,6 +796,25 @@ def selftest() -> int:
     check("normalizer preserves the verification hash",
           normalize_output(h1) != normalize_output(h2))
 
+    # ★★ A BACKWARD CLOCK IS NOT A WORK DIFFERENCE, and this arm is the pin for
+    # the live refusal that produced it. `"%4d.%03ds"` signs BOTH fields, so a
+    # clock that steps backwards mid-run prints `-29.-29s`; the original pattern
+    # could not match that, the token survived into the normalized text, and R6
+    # declared two identical workloads to have "done different work".
+    # ✔MEASURED 2026-08-28 on the WSL x86_64 leg, which is a host whose
+    # CLOCK_REALTIME is known to oscillate ±34.47 s.
+    # [[D-TEST-SPEEDTEST1-NORMALIZER-LETS-A-BACKWARD-CLOCK-LOOK-LIKE-DIFFERENT-WORK]]
+    fwd = "160 - 100 DELETEs using rowid.....    1.234s\n"
+    back = "160 - 100 DELETEs using rowid.....  -29.-29s\n"
+    check("normalizer absorbs a NEGATIVE elapsed time (a backward host clock)",
+          normalize_output(fwd) == normalize_output(back))
+    check("a negative elapsed time is COUNTED, not silently swallowed",
+          malformed_elapsed_times(back) == 1 and malformed_elapsed_times(fwd) == 0)
+    # ...and the absorbing must not have eaten the identity along with the time.
+    other = "160 - 100 UPDATEs using rowid.....  -29.-29s\n"
+    check("absorbing a negative time still keeps the workload identity",
+          normalize_output(back) != normalize_output(other))
+
     import io
     import contextlib
 
@@ -776,11 +897,15 @@ def main() -> int:
                     help="print the resolved cl.exe environment as JSON, or the "
                          "reason there is none, and exit")
     ap.add_argument("--preflight-dss", metavar="BIN",
-                    help="prove this dss-code-prime can compile three lines "
+                    help="prove this dsscp can compile three lines "
                          "against --config-root, and exit; run it BEFORE paying "
                          "for a configure and a reference build")
     ap.add_argument("--config-root", metavar="DIR",
                     help="the DSS_CONFIG_ROOT to pin for --preflight-dss")
+    ap.add_argument("--preflight-target", metavar="SPEC", default="",
+                    help="the --target the MEASUREMENT will use, so the preflight "
+                         "validates the same target document rather than whatever "
+                         "dsscp defaults to (see preflight_dss)")
     args = ap.parse_args()
 
     if args.selftest:
@@ -790,17 +915,30 @@ def main() -> int:
             ap.error("--preflight-dss needs --config-root: leaving it unset lets "
                      "the working directory decide which config the measured "
                      "binary reads, which is the thing being pinned")
-        ok, why = preflight_dss(args.preflight_dss, args.config_root)
+        ok, why = preflight_dss(args.preflight_dss, args.config_root,
+                                args.preflight_target)
         if ok:
+            # ⚠ SAY WHICH TARGET WAS VOUCHED FOR, and say plainly when the answer
+            # is "the default one". An unqualified `preflight: OK` is what let a
+            # stale arm64/pe64 document reach a 3-minute measurement twice in one
+            # run on 2026-08-26 -- the reader had no way to see the check and the
+            # measurement were looking at different documents.
+            scope = (f"for target {args.preflight_target}" if args.preflight_target
+                     else "for the DEFAULT target -- NOT the one under measurement, "
+                          "so a target-specific config break will NOT be caught here")
             print(f"preflight: OK - {args.preflight_dss} compiles against "
-                  f"{args.config_root}")
+                  f"{args.config_root} {scope}")
             return 0
         print(f"speedtest1_bench: preflight FAILED\n"
               f"      binary : {args.preflight_dss}\n"
               f"      config : {args.config_root}\n"
+              f"      target : {args.preflight_target or '(default)'}\n"
               f"      says   : {why}\n"
               f"      The usual cause is a STALE binary against a CURRENT config "
-              f"tree. Rebuild it before measuring.", file=sys.stderr)
+              f"tree, or a CURRENT binary against a config tree some cleanup "
+              f"rolled back -- both were seen on 2026-08-26, in mirror image, in "
+              f"one run. Rebuild it before measuring, and check WHICH side moved.",
+              file=sys.stderr)
         return 1
     if args.resolve_msvc:
         env, why = msvc_env()

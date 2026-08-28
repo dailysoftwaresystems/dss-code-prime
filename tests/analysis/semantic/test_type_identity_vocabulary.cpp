@@ -62,10 +62,10 @@ using dss::test_support::ScratchDir;
 
 namespace {
 
-[[nodiscard]] SemanticModel analyzeCSubset(
+[[nodiscard]] SemanticModel analyzeC(
     std::string src, DataModel dm,
     LongDoubleFormat ldf = LongDoubleFormat::X87_80) {
-    auto cu = buildShippedUnit("c-subset", {std::move(src)});
+    auto cu = buildShippedUnit("c", {std::move(src)});
     assertNoBuilderErrors(*cu);
     return analyze(cu, DiagnosticBudget::libraryDefault(), dm, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                    ldf);
@@ -129,7 +129,7 @@ void expectGenericClean(SemanticModel const& m) {
     return out;
 }
 
-// The shipped c-subset config, located by the ONE test-side resolver
+// The shipped c config, located by the ONE test-side resolver
 // (`repo_root.hpp`: $DSS_CONFIG_ROOT → the repo root CMake bakes in → a cwd
 // ancestor walk). It was a private 12-hop cwd walk that read neither of the
 // first two sources, so an out-of-tree build — whose cwd has no `src/dss-config`
@@ -138,9 +138,9 @@ void expectGenericClean(SemanticModel const& m) {
 // path here used to propagate SILENTLY through `findShippedLibDir()` below.
 [[nodiscard]] std::filesystem::path findShippedSourceConfig() {
     std::filesystem::path const path =
-        dss::test::configRoot() / "sources" / "c-subset.lang.json";
+        dss::test::configRoot() / "sources" / "c.lang.json";
     if (!std::filesystem::exists(path)) {
-        throw std::runtime_error("shipped c-subset.lang.json is missing: " +
+        throw std::runtime_error("shipped c.lang.json is missing: " +
                                  path.string());
     }
     return path;
@@ -160,10 +160,10 @@ void expectGenericClean(SemanticModel const& m) {
 }
 
 // Analyze through the FULL front end with the shipped descriptors on the system
-// include path — `analyzeCSubset` above never runs `#include`.
+// include path — `analyzeC` above never runs `#include`.
 [[nodiscard]] SemanticModel analyzeWithShippedHeaders(
     std::string src, DataModel dm, ObjectFormatKind fmt, std::string_view arch) {
-    auto schema = loadShippedSchema("c-subset");
+    auto schema = loadShippedSchema("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(findShippedLibDir());
     builder.setActiveFormat(fmt);
@@ -190,7 +190,7 @@ constexpr ModelAxis kLp64{DataModel::Lp64, ObjectFormatKind::Elf, "x86_64",
 constexpr ModelAxis kLlp64{DataModel::Llp64, ObjectFormatKind::Pe, "x86_64",
                            "LLP64/pe", "unsigned long long", "long long"};
 
-[[nodiscard]] nlohmann::json loadShippedCSubsetJson() {
+[[nodiscard]] nlohmann::json loadShippedCJson() {
     std::ifstream in{findShippedSourceConfig(), std::ios::binary};
     EXPECT_TRUE(in.good());
     return nlohmann::json::parse(in);
@@ -232,8 +232,8 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
         assertNoBuilderErrors(*cu);
         return analyze(cu, DiagnosticBudget::libraryDefault(), ax.dm, std::nullopt, std::nullopt, ax.fmt, ax.arch);
     };
-    if (flagOn) return build(loadShippedSchema("c-subset"));
-    nlohmann::json doc = loadShippedCSubsetJson();
+    if (flagOn) return build(loadShippedSchema("c"));
+    nlohmann::json doc = loadShippedCJson();
     doc["semantics"]["pointerConversions"]["directCallIntPointeeCompat"] = false;
     auto schema = GrammarSchema::loadFromText(doc.dump(), "<ffi-wide-flag-off>");
     // ★ FAIL-CLOSED, TF-C135: this was `EXPECT_TRUE`, which is NON-FATAL — so when
@@ -244,7 +244,7 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
     // the dereference; `ASSERT_*` cannot be used here (non-void return), so throw.
     if (!schema.has_value()) {
         throw std::runtime_error(
-            "perturbed c-subset schema failed to load — the "
+            "perturbed c schema failed to load — the "
             "`directCallIntPointeeCompat` key was renamed or removed, so this "
             "red-on-disable axis is testing nothing");
     }
@@ -272,7 +272,7 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
 // Perturb the shipped `typeSpecifiers` rows and report whether the schema still
 // loads. Every loader pin below proves a knob CANNOT lie.
 [[nodiscard]] bool typeSpecifiersLoad(std::function<void(nlohmann::json&)> mutate) {
-    nlohmann::json doc = loadShippedCSubsetJson();
+    nlohmann::json doc = loadShippedCJson();
     mutate(doc["semantics"]["typeSpecifiers"]);
     return GrammarSchema::loadFromText(doc.dump(), "<vocab-perturbed>").has_value();
 }
@@ -298,7 +298,7 @@ TEST(TypeIdentityVocabulary, GenericIntVsLongDistinctUnderLlp64) {
     // pass on a wrong selection.
     std::string const src =
         "int f(long x){ return _Generic((x), int: 11, long: 22, default: 33); }\n";
-    auto m = analyzeCSubset(src, DataModel::Llp64);
+    auto m = analyzeC(src, DataModel::Llp64);
     expectGenericClean(m);
     EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"22"}))
         << "the `long:` arm must win — 11 means it matched `int:`, 33 means it "
@@ -309,7 +309,7 @@ TEST(TypeIdentityVocabulary, GenericIntVsLongDistinctUnderLlp64) {
 TEST(TypeIdentityVocabulary, GenericIntVsLongDistinctUnderLp64) {
     std::string const src =
         "int f(long x){ return _Generic((x), int: 11, long: 22, default: 33); }\n";
-    auto m = analyzeCSubset(src, DataModel::Lp64);
+    auto m = analyzeC(src, DataModel::Lp64);
     expectGenericClean(m);
     EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"22"}));
 }
@@ -321,7 +321,7 @@ TEST(TypeIdentityVocabulary, GenericLongVsLongLongDistinctUnderLp64) {
         "  return _Generic((a), long: 11, long long: 22, default: 33)\n"
         "       + _Generic((b), long: 44, long long: 55, default: 66); }\n";
     for (DataModel const dm : {DataModel::Lp64, DataModel::Llp64}) {
-        auto m = analyzeCSubset(src, dm);
+        auto m = analyzeC(src, dm);
         SCOPED_TRACE(dm == DataModel::Lp64 ? "LP64" : "LLP64");
         expectGenericClean(m);
         EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"11", "55"}))
@@ -340,7 +340,7 @@ TEST(TypeIdentityVocabulary, GenericUnsignedLongVsUnsignedIntDistinctUnderLlp64)
         "       + _Generic((c), unsigned int: 91, unsigned long: 92,\n"
         "                       unsigned long long: 93, default: 94); }\n";
     for (DataModel const dm : {DataModel::Lp64, DataModel::Llp64}) {
-        auto m = analyzeCSubset(src, dm);
+        auto m = analyzeC(src, dm);
         SCOPED_TRACE(dm == DataModel::Lp64 ? "LP64" : "LLP64");
         expectGenericClean(m);
         EXPECT_EQ(selectedGenericArms(m),
@@ -364,7 +364,7 @@ TEST(TypeIdentityVocabulary, GenericLongDoubleDistinctOnEveryAxis) {
             "  return _Generic((a), float: 11, double: 22, long double: 33)\n"
             "       + _Generic((b), float: 44, double: 55, long double: 66)\n"
             "       + _Generic((c), float: 77, double: 88, long double: 99); }\n";
-        auto m = analyzeCSubset(src, DataModel::Lp64, row.axis);
+        auto m = analyzeC(src, DataModel::Lp64, row.axis);
         SCOPED_TRACE(row.label);
         expectGenericClean(m);
         EXPECT_EQ(selectedGenericArms(m),
@@ -384,7 +384,7 @@ TEST(TypeIdentityVocabulary, TwoLongDeclarationsShareOneTypeId) {
         "int f(void){ long a; long int b; signed long c; signed long int d;\n"
         "  a = 0; b = 0; c = 0; d = 0; return 0; }\n";
     for (DataModel const dm : {DataModel::Lp64, DataModel::Llp64}) {
-        auto m = analyzeCSubset(src, dm);
+        auto m = analyzeC(src, dm);
         ASSERT_FALSE(m.hasErrors());
         TypeId const ta = typeOf(m, "a");
         EXPECT_EQ(typeOf(m, "b").v, ta.v);
@@ -405,7 +405,7 @@ TEST(TypeIdentityVocabulary, PromotedCharMatchesDeclaredInt) {
         "  auto s = c1 + c2;\n"
         "  return i + _Generic((s), int: 11, long: 22, default: 33); }\n";
     for (DataModel const dm : {DataModel::Lp64, DataModel::Llp64}) {
-        auto m = analyzeCSubset(src, dm);
+        auto m = analyzeC(src, dm);
         SCOPED_TRACE(dm == DataModel::Lp64 ? "LP64" : "LLP64");
         expectGenericClean(m);
         EXPECT_EQ(typeOf(m, "s").v, typeOf(m, "i").v)
@@ -421,7 +421,7 @@ TEST(TypeIdentityVocabulary, UnnamedVocabularyEntriesStayAnonymous) {
     std::string const src =
         "int f(int a, short b, unsigned int c, unsigned short d,\n"
         "      float e, double g, char h, bool k){ return 0; }\n";
-    auto m = analyzeCSubset(src, DataModel::Lp64);
+    auto m = analyzeC(src, DataModel::Lp64);
     ASSERT_FALSE(m.hasErrors());
     for (char const* name : {"a", "b", "c", "d", "e", "g", "h", "k"}) {
         EXPECT_EQ(vocabOf(m, name), "")
@@ -430,7 +430,7 @@ TEST(TypeIdentityVocabulary, UnnamedVocabularyEntriesStayAnonymous) {
                "anonymous primitive of that kind";
     }
     // ... while the entries that CAN collide all carry one.
-    auto named = analyzeCSubset(
+    auto named = analyzeC(
         "int f(long a, unsigned long b, long long c, unsigned long long d,\n"
         "      long double e){ return 0; }\n",
         DataModel::Lp64);
@@ -466,7 +466,7 @@ TEST(TypeIdentityVocabulary, SameRepresentationConversionsStayClean) {
 
     // Distinct types that share a representation still convert IMPLICITLY, in
     // BOTH directions — the conversion is C 6.3.1.3p1's identity, not an error.
-    auto llp = analyzeCSubset(
+    auto llp = analyzeC(
         "int f(int i, long l){ long a = i; int b = l; return a == b; }\n",
         DataModel::Llp64);
     EXPECT_FALSE(llp.hasErrors())
@@ -477,7 +477,7 @@ TEST(TypeIdentityVocabulary, SameRepresentationConversionsStayClean) {
     EXPECT_EQ(vocabOf(llp, "a"), "long");
     EXPECT_EQ(vocabOf(llp, "b"), "");
 
-    auto lp = analyzeCSubset(
+    auto lp = analyzeC(
         "int f(long l, long long q){ long long a = l; long b = q;\n"
         "  return a == b; }\n",
         DataModel::Lp64);
@@ -489,7 +489,7 @@ TEST(TypeIdentityVocabulary, SameRepresentationConversionsStayClean) {
 
     // The float pair on the f64 axis — where `long double` and `double` share a
     // representation and were ONE TypeId before the split. BOTH directions.
-    auto f64 = analyzeCSubset(
+    auto f64 = analyzeC(
         "int f(double d, long double ld){ double a = ld; long double b = d;\n"
         "  return a == 0.0 && b == 0.0L; }\n",
         DataModel::Lp64, LongDoubleFormat::F64);
@@ -509,12 +509,12 @@ TEST(TypeIdentityVocabulary, SameRepresentationConversionsStayClean) {
     for (LongDoubleFormat const axis : {LongDoubleFormat::X87_80,
                                         LongDoubleFormat::Ieee128}) {
         SCOPED_TRACE(static_cast<int>(axis));
-        auto widen = analyzeCSubset(
+        auto widen = analyzeC(
             "int f(double d){ long double b = d; return b == 0.0L; }\n",
             DataModel::Lp64, axis);
         EXPECT_FALSE(widen.hasErrors())
             << "double -> long double widening stays clean on a wider axis";
-        auto narrow = analyzeCSubset(
+        auto narrow = analyzeC(
             "int f(long double ld){ double a = ld; return a == 0.0; }\n",
             DataModel::Lp64, axis);
         EXPECT_EQ(countCode(narrow.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
@@ -530,7 +530,7 @@ TEST(TypeIdentityVocabulary, IncompatiblePointerTypesNowDiagnose) {
     // C requires a constraint diagnostic here. Under the collapse `int` and
     // `long` were ONE TypeId on LLP64, so this compiled SILENTLY — the collapse
     // did not merely fail loud, it ACCEPTED invalid code.
-    auto llp = analyzeCSubset(
+    auto llp = analyzeC(
         "int f(void){ int x = 0; int *p = &x; long *q = p; return *q != 0; }\n",
         DataModel::Llp64);
     EXPECT_TRUE(llp.hasErrors())
@@ -538,7 +538,7 @@ TEST(TypeIdentityVocabulary, IncompatiblePointerTypesNowDiagnose) {
     EXPECT_EQ(countCode(llp.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
 
     // The same tightening on LP64's OTHER same-representation pair.
-    auto lp = analyzeCSubset(
+    auto lp = analyzeC(
         "int f(void){ long x = 0; long *p = &x; long long *q = p;\n"
         "  return *q != 0; }\n",
         DataModel::Lp64);
@@ -548,7 +548,7 @@ TEST(TypeIdentityVocabulary, IncompatiblePointerTypesNowDiagnose) {
 
     // ... and the matching-type control stays CLEAN (proves the tightening is
     // not a blanket pointer reject).
-    auto ok = analyzeCSubset(
+    auto ok = analyzeC(
         "int f(void){ long x = 0; long *p = &x; long *q = p; return *q != 0; }\n",
         DataModel::Llp64);
     EXPECT_FALSE(ok.hasErrors()) << "same-vocabulary pointers stay assignable";
@@ -559,7 +559,7 @@ TEST(TypeIdentityVocabulary, CharFamilyStaysThreeDistinctTypes) {
     // unsigned char are three distinct CORES (Char/I8/U8), so their pointers
     // were already incompatible. Unrelated to the vocabulary split — pinned so a
     // future identity change cannot quietly merge them.
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(void){ char c = 0; char *p = &c; signed char *q = p;\n"
         "  return *q != 0; }\n",
         DataModel::Lp64);
@@ -576,7 +576,7 @@ TEST(TypeIdentityVocabulary, ArithmeticResultTakesHigherRankedVocabularyName) {
     std::string const lpSrc =
         "int f(long a, long long b){ auto s = a + b;\n"
         "  return _Generic((s), long: 11, long long: 22, default: 33); }\n";
-    auto lp = analyzeCSubset(lpSrc, DataModel::Lp64);
+    auto lp = analyzeC(lpSrc, DataModel::Lp64);
     expectGenericClean(lp);
     EXPECT_EQ(vocabOf(lp, "s"), "long long")
         << "long + long long is `long long` (rank 4 > 3), even at equal width";
@@ -586,7 +586,7 @@ TEST(TypeIdentityVocabulary, ArithmeticResultTakesHigherRankedVocabularyName) {
     std::string const llpSrc =
         "int f(int a, long b){ auto s = a + b;\n"
         "  return _Generic((s), int: 11, long: 22, default: 33); }\n";
-    auto llp = analyzeCSubset(llpSrc, DataModel::Llp64);
+    auto llp = analyzeC(llpSrc, DataModel::Llp64);
     expectGenericClean(llp);
     EXPECT_EQ(vocabOf(llp, "s"), "long")
         << "int + long is `long` (rank 3 > int's 0), even at equal width";
@@ -597,7 +597,7 @@ TEST(TypeIdentityVocabulary, ArithmeticResultTakesHigherRankedVocabularyName) {
     std::string const fSrc =
         "int f(double a, long double b){ auto s = a + b;\n"
         "  return _Generic((s), double: 11, long double: 22, default: 33); }\n";
-    auto f64 = analyzeCSubset(fSrc, DataModel::Lp64, LongDoubleFormat::F64);
+    auto f64 = analyzeC(fSrc, DataModel::Lp64, LongDoubleFormat::F64);
     expectGenericClean(f64);
     EXPECT_EQ(vocabOf(f64, "s"), "long double");
     EXPECT_EQ(selectedGenericArms(f64), (std::vector<std::string>{"22"}));
@@ -610,7 +610,7 @@ TEST(TypeIdentityVocabulary, SameVocabularySumKeepsItsName) {
     std::string const src =
         "int f(long a, long b){ auto s = a + b;\n"
         "  return _Generic((s), long: 11, default: 22); }\n";
-    auto m = analyzeCSubset(src, DataModel::Lp64);
+    auto m = analyzeC(src, DataModel::Lp64);
     expectGenericClean(m);
     EXPECT_EQ(vocabOf(m, "s"), "long");
     EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"11"}));
@@ -638,13 +638,13 @@ TEST(TypeIdentityVocabulary, SizeofYieldsTheDeclaredSizeTVocabularyEntry) {
         "       + _Generic(_Alignof(int), unsigned long: 100,\n"
         "                  unsigned long long: 200, default: 0); }\n";
     // LP64: size_t IS `unsigned long`.
-    auto lp = analyzeCSubset(src, DataModel::Lp64);
+    auto lp = analyzeC(src, DataModel::Lp64);
     expectGenericClean(lp);
     EXPECT_EQ(selectedGenericArms(lp), (std::vector<std::string>{"1", "10", "100"}))
         << "LP64 size_t IS `unsigned long` — a `default:` hit here is the SILENT "
            "wrong-arm selection an anonymous U64 causes";
     // LLP64: the SAME 64-bit representation, the OTHER vocabulary entry.
-    auto llp = analyzeCSubset(src, DataModel::Llp64);
+    auto llp = analyzeC(src, DataModel::Llp64);
     expectGenericClean(llp);
     EXPECT_EQ(selectedGenericArms(llp), (std::vector<std::string>{"2", "20", "200"}))
         << "LLP64 size_t IS `unsigned long long` — same core, different NAME, so "
@@ -655,11 +655,11 @@ TEST(TypeIdentityVocabulary, PointerDifferenceYieldsTheDeclaredPtrdiffTEntry) {
     std::string const src =
         "int f(int *a, int *b){\n"
         "  return _Generic((a - b), long: 1, long long: 2, default: 0); }\n";
-    auto lp = analyzeCSubset(src, DataModel::Lp64);
+    auto lp = analyzeC(src, DataModel::Lp64);
     expectGenericClean(lp);
     EXPECT_EQ(selectedGenericArms(lp), (std::vector<std::string>{"1"}))
         << "LP64 ptrdiff_t IS `long`";
-    auto llp = analyzeCSubset(src, DataModel::Llp64);
+    auto llp = analyzeC(src, DataModel::Llp64);
     expectGenericClean(llp);
     EXPECT_EQ(selectedGenericArms(llp), (std::vector<std::string>{"2"}))
         << "LLP64 ptrdiff_t IS `long long`";
@@ -675,11 +675,11 @@ TEST(TypeIdentityVocabulary, StdbitFiveWayAssociationSetAcceptsASizeofOperand) {
         "int f(int x){ return _Generic((sizeof x),\n"
         "    unsigned char: 1, unsigned short: 2, unsigned int: 3,\n"
         "    unsigned long: 4, unsigned long long: 5); }\n";
-    auto lp = analyzeCSubset(src, DataModel::Lp64);
+    auto lp = analyzeC(src, DataModel::Lp64);
     expectGenericClean(lp);
     EXPECT_EQ(selectedGenericArms(lp), (std::vector<std::string>{"4"}))
         << "LP64 size_t IS `unsigned long`";
-    auto llp = analyzeCSubset(src, DataModel::Llp64);
+    auto llp = analyzeC(src, DataModel::Llp64);
     expectGenericClean(llp);
     EXPECT_EQ(selectedGenericArms(llp), (std::vector<std::string>{"5"}))
         << "LLP64 size_t IS `unsigned long long`";
@@ -1111,12 +1111,12 @@ TEST(TypeIdentityVocabulary, DirectCallIntPointeeIndirectCallStaysStrict) {
 // the winning VOCABULARY ENTRY survives a mix with a qualified operand at the
 // same core — the shape that made `d + vld` produce a `volatile long double`
 // common type and, through it, a spurious Bitcast at the assignment (see
-// `MirLoweringCSubset.VolatileLongDoubleArithmeticEmitsNoExtraCast`).
+// `MirLoweringC.VolatileLongDoubleArithmeticEmitsNoExtraCast`).
 TEST(TypeIdentityVocabulary, QualifiedLongDoubleOperandStillYieldsTheEntry) {
     auto const check = [](std::string const& decl, char const* wantVocab) {
         std::string const src =
             "int f(" + decl + " double d){ auto s = d + q; return s == 0.0; }\n";
-        auto m = analyzeCSubset(src, DataModel::Lp64, LongDoubleFormat::F64);
+        auto m = analyzeC(src, DataModel::Lp64, LongDoubleFormat::F64);
         ASSERT_FALSE(m.hasErrors());
         TypeId const t = typeOf(m, "s");
         ASSERT_TRUE(t.valid());
@@ -1185,7 +1185,7 @@ TEST(TypeIdentityVocabularyLoader, ComplexMayDifferAcrossRowsSharingAName) {
     // The ONE axis deliberately excluded from the consistency check: plain and
     // `_Complex` `long double` legitimately share the name (the `_Complex` row's
     // core IS the shared element type). The shipped config relies on it.
-    nlohmann::json doc = loadShippedCSubsetJson();
+    nlohmann::json doc = loadShippedCJson();
     auto const& rows = doc["semantics"]["typeSpecifiers"];
     std::size_t named = 0;
     for (auto const& row : rows) {
@@ -1203,7 +1203,7 @@ namespace {
 // Perturb the shipped `synthesizedTypes` block and report whether the schema
 // still loads.
 [[nodiscard]] bool synthesizedTypesLoad(std::function<void(nlohmann::json&)> mutate) {
-    nlohmann::json doc = loadShippedCSubsetJson();
+    nlohmann::json doc = loadShippedCJson();
     mutate(doc["semantics"]["synthesizedTypes"]);
     return GrammarSchema::loadFromText(doc.dump(), "<synth-perturbed>").has_value();
 }
@@ -1271,7 +1271,7 @@ namespace {
 // Perturb the shipped `builtinFunctions` array and report whether the schema
 // still loads.
 [[nodiscard]] bool builtinFunctionsLoad(std::function<void(nlohmann::json&)> mutate) {
-    nlohmann::json doc = loadShippedCSubsetJson();
+    nlohmann::json doc = loadShippedCJson();
     mutate(doc["semantics"]["builtinFunctions"]);
     return GrammarSchema::loadFromText(doc.dump(), "<builtins-perturbed>").has_value();
 }
@@ -1292,7 +1292,7 @@ TEST(TypeIdentityVocabularyLoader, ShippedBuiltinFunctionsLoadUnperturbed) {
         << "fixture precondition: the SHIPPED builtins must load";
     // ... and the surface under test is actually EXERCISED by the shipped config
     // (otherwise every pin below would be testing an unused code path).
-    nlohmann::json const doc = loadShippedCSubsetJson();
+    nlohmann::json const doc = loadShippedCJson();
     auto const& arr = doc["semantics"]["builtinFunctions"];
     std::size_t withOverride = 0;
     for (auto const& e : arr) {
@@ -1362,7 +1362,7 @@ TEST(TypeIdentityVocabularyLoader, BuiltinFunctionUnknownKeyRejected) {
 // analyzed under the OTHER data model and must still error.
 TEST(TypeIdentityVocabulary, MalformedInactiveSignatureOverrideFailsOnEveryTarget) {
     auto const analyzeWithOverride = [](std::string const& text, DataModel dm) {
-        nlohmann::json doc = loadShippedCSubsetJson();
+        nlohmann::json doc = loadShippedCJson();
         auto& arr = doc["semantics"]["builtinFunctions"];
         bool patched = false;
         for (auto& e : arr) {
@@ -1421,7 +1421,7 @@ TEST(TypeIdentityVocabulary, IntegerLiteralSuffixesSelectTheirOwnGenericArm) {
     // S_GenericSelectionNoMatch rather than a silent fall-through.
     for (DataModel const dm : {DataModel::Lp64, DataModel::Llp64}) {
         SCOPED_TRACE(dm == DataModel::Lp64 ? "LP64" : "LLP64");
-        auto m = analyzeCSubset(src, dm);
+        auto m = analyzeC(src, dm);
         expectGenericClean(m);
         EXPECT_EQ(selectedGenericArms(m),
                   (std::vector<std::string>{"1", "2", "1", "2", "3"}))
@@ -1446,7 +1446,7 @@ TEST(TypeIdentityVocabulary, FloatLiteralSuffixSelectsLongDouble) {
                                         LongDoubleFormat::X87_80,
                                         LongDoubleFormat::Ieee128}) {
         SCOPED_TRACE(static_cast<int>(axis));
-        auto m = analyzeCSubset(src, DataModel::Lp64, axis);
+        auto m = analyzeC(src, DataModel::Lp64, axis);
         expectGenericClean(m);
         EXPECT_EQ(selectedGenericArms(m),
                   (std::vector<std::string>{"1", "2", "3"}))

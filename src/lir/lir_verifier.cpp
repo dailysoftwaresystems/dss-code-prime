@@ -1,7 +1,9 @@
 #include "lir/lir_verifier.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
+#include "lir/lir_pass_util.hpp"
 
+#include <algorithm>
 #include <format>
 #include <string>
 #include <string_view>
@@ -91,7 +93,7 @@ struct MemOpcodeIds {
 // on HAND-BUILT test modules. A rule whose only subjects are synthesised by
 // the same author who wrote the rule cannot discover what the shipped path
 // emits — it can only re-state its author's belief. That is why the
-// accept-arm pin for this rule lowers real c-subset source through the real
+// accept-arm pin for this rule lowers real c source through the real
 // `lowerToLir` instead of assembling a module out of arenas.
 //
 // ⚠ THE TWO FORMS ARE ASSERTED DISJOINT, WHICH IS WHAT KEEPS THIS FROM
@@ -209,9 +211,48 @@ void checkMemOperandPairing(Lir const& lir, TargetSchema const& sch,
 // dispatch uses. It is schema VOCABULARY (a closed enum every `.target.json`
 // declares into), never an arch / format / language identity: no arm asks which
 // CPU or which object format this is.
+//
+// ── AND THE ONE LEGAL WAY TO NAME FEWER BLOCKS THAN YOU BRANCH TO ───────────
+//
+// ★★★ D-OPT-JCC-FALLTHROUGH — THE PIN. `lir_peephole`'s R2 drops a branch's
+// TRAILING BlockRef operand when the successor it named is already the
+// NEXT-LAID-OUT BLOCK, so the encoder stops emitting a jump to +0. The CFG is
+// untouched (both successors stay); the operand list is one shorter.
+//
+// That is the only shape in which the two channels may legitimately differ,
+// and it carries the project's worst failure mode: an elided jump whose
+// successor is NOT the next block falls into the WRONG BLOCK, producing a
+// program with no bad byte in it — nothing a disassembler, a linker or a
+// crash could point at. So the elided shape is admitted ONLY when all four
+// hold, and the fourth is the one that matters:
+//
+//   1. exactly ONE successor is unnamed, and it is the LAST one;
+//   2. the operands that remain are the successor list's PREFIX, in order;
+//   3. the TARGET declares the fallthrough form of this opcode
+//      (`lir_pass_util::declaresFallthroughBranchForm` — the same predicate
+//      R2 consults, one owner, so the verifier can never bless an elision the
+//      encoder cannot spell); and
+//   4. ★ the unnamed successor IS the block laid out immediately after this
+//      one, RE-DERIVED FROM THE MODULE IN HAND rather than trusted from the
+//      pass that did the eliding.
+//
+// (4) is why this rule now also runs from `verifyLirPostRegalloc`. Before R2
+// existed it ran in `verifyLir` and `verifyLirText` only — both of which sit
+// BEFORE the peephole, i.e. at the one point in the pipeline where an elision
+// cannot yet be observed. A rule that runs only where the bug cannot occur is
+// not a net; that sentence is already in this file, about this same rule, for
+// the previous defect.
 void checkTerminatorBlockRefsMatchSuccessors(Lir const& lir,
                                              TargetSchema const& sch,
                                              DiagnosticReporter& reporter) {
+    // ⓘ HOISTED, and only because this rule's DUTY CYCLE changed. It used to
+    // run once per compile (`verifyLir`); since D-OPT-JCC-FALLTHROUGH it also
+    // runs from `verifyLirPostRegalloc`, which the pipeline calls three times.
+    // A fresh `std::vector` per TERMINATOR was invisible at 1×; at 4× over a
+    // module the size of sqlite it is hundreds of thousands of tiny
+    // allocations for a check that reads at most a handful of elements.
+    // `clear()` keeps the capacity, so the steady state is zero allocations.
+    std::vector<std::uint32_t> refs;
     std::size_t const fnCount = lir.moduleFuncCount();
     for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
         LirFuncId const fn = lir.funcAt(fi);
@@ -253,8 +294,9 @@ void checkTerminatorBlockRefsMatchSuccessors(Lir const& lir,
                         continue;
                 }
 
-                std::vector<std::uint32_t> refs;
-                for (auto const& o : lir.instOperands(inst)) {
+                auto const ops = lir.instOperands(inst);
+                refs.clear();
+                for (auto const& o : ops) {
                     if (o.kind == LirOperandKind::BlockRef) {
                         refs.push_back(o.blockSlot);
                     }
@@ -262,11 +304,29 @@ void checkTerminatorBlockRefsMatchSuccessors(Lir const& lir,
                 auto const succs = lir.blockSuccessors(bb);
                 if (refs.empty() && !refsRequired) continue;
 
-                bool same = (refs.size() == succs.size());
-                for (std::size_t k = 0; same && k < refs.size(); ++k) {
-                    same = (refs[k] == succs[k].v);
+                bool const prefixMatches =
+                    refs.size() <= succs.size()
+                    && std::equal(refs.begin(), refs.end(), succs.begin(),
+                                  [](std::uint32_t r, LirBlockId s) {
+                                      return r == s.v;
+                                  });
+                if (prefixMatches && refs.size() == succs.size()) continue;
+
+                // ★ D-OPT-JCC-FALLTHROUGH — the elided shape. Every clause is
+                // load-bearing; see the four numbered conditions above. The
+                // layout question is re-derived HERE, from this module, so a
+                // later pass that reorders blocks turns a silent wrong-block
+                // fall into a loud build failure.
+                bool elidedFallthrough = false;
+                if (prefixMatches && refs.size() + 1 == succs.size()
+                    && refs.size() == ops.size()
+                    && lir_pass_util::declaresFallthroughBranchForm(
+                           sch, lir.instOpcode(inst), ops.size() + 1)) {
+                    elidedFallthrough =
+                        (bi + 1 < blockCount)
+                        && (succs.back().v == lir.funcBlockAt(fn, bi + 1).v);
                 }
-                if (same) continue;
+                if (elidedFallthrough) continue;
 
                 std::string refText;
                 for (std::uint32_t r : refs) {
@@ -278,6 +338,47 @@ void checkTerminatorBlockRefsMatchSuccessors(Lir const& lir,
                     if (!succText.empty()) succText += ", ";
                     succText += std::format("^{}", s.v);
                 }
+                // ★ D-OPT-JCC-FALLTHROUGH: say WHICH of the four conditions a
+                // near-miss elision failed, and say it with the two block ids
+                // that decide it. "The operand list is one short" is the
+                // shape; "^7 is not the next block, ^3 is" is the bug.
+                std::string why;
+                if (prefixMatches && refs.size() + 1 == succs.size()
+                    && refs.size() == ops.size()) {
+                    if (!lir_pass_util::declaresFallthroughBranchForm(
+                            sch, lir.instOpcode(inst), ops.size() + 1)) {
+                        why = std::format(
+                            ". The trailing edge ^{} is unnamed, which is the "
+                            "shape of a D-OPT-JCC-FALLTHROUGH elision — but "
+                            "this target declares NO fallthrough encoding "
+                            "form for '{}' (no variant matching its guard "
+                            "tuple minus the trailing blockref), so there is "
+                            "no way to encode the branch without it",
+                            succs.back().v, info->mnemonic);
+                    } else if (bi + 1 >= blockCount) {
+                        why = std::format(
+                            ". The trailing edge ^{} is unnamed (a "
+                            "D-OPT-JCC-FALLTHROUGH elision) but this is the "
+                            "LAST block laid out in the function — there is "
+                            "nothing after it to fall through TO, so control "
+                            "would leave the function's bytes",
+                            succs.back().v);
+                    } else {
+                        why = std::format(
+                            ". The trailing edge ^{} is unnamed (a "
+                            "D-OPT-JCC-FALLTHROUGH elision), which is legal "
+                            "ONLY when that successor is the NEXT-LAID-OUT "
+                            "block — and the block laid out after ^{} is ^{}. "
+                            "Falling through would enter the WRONG BLOCK with "
+                            "no incorrect byte anywhere to show for it",
+                            succs.back().v, bb.v,
+                            lir.funcBlockAt(fn, bi + 1).v);
+                    }
+                } else if (refs.empty()) {
+                    why = ". The operand list is EMPTY: the branch has no "
+                          "target to encode, which is what a dropped-operand "
+                          "round trip looks like";
+                }
                 report(reporter, std::format(
                     "LirVerifier: terminator inst {} ('{}', {}) declares "
                     "successors [{}] but its BlockRef operands are [{}] — the "
@@ -288,11 +389,7 @@ void checkTerminatorBlockRefsMatchSuccessors(Lir const& lir,
                     targetTerminatorKindName(info->terminatorKind),
                     succText.empty() ? "" : succText,
                     refText.empty() ? "" : refText,
-                    refs.empty()
-                        ? ". The operand list is EMPTY: the branch has no target "
-                          "to encode, which is what a dropped-operand round trip "
-                          "looks like"
-                        : ""),
+                    why),
                     DiagnosticCode::L_TerminatorSuccessorMismatch);
             }
         }
@@ -488,7 +585,7 @@ void checkStoreRegClassMatchesMirType(
                 TypeKind const valueKind = interner.kind(valueTy);
                 // ⚠ THE WIDE FLOATS ARE MEMORY-RESIDENT AND THEIR VALUE
                 // OPERAND IS A GPR **WORD**, BY DESIGN — not a violation.
-                // ✔MEASURED 2026-08-15 (`examples/c-subset/c_long_double`,
+                // ✔MEASURED 2026-08-15 (`examples/c/c_long_double`,
                 // `…_constfold`, the last 2 of the 265 this rule set reddened):
                 // `lowerF80Store` / `lowerF128Store`
                 // (D-CSUBSET-LONG-DOUBLE-X87-ARITH / -IEEE128-ARITH) lower a
@@ -758,6 +855,17 @@ bool verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
     // where a dropped side-structure reference is both most likely and
     // most expensive — everything downstream of here turns into bytes.
     checkSideStructureIntegrity(lir, reporter);
+    // ★★★ D-OPT-JCC-FALLTHROUGH — THE PIN, AND THIS IS THE CHECKPOINT THAT
+    // MATTERS FOR IT. `lir_peephole`'s R2 elides a branch's trailing
+    // fallthrough operand on the strength of a LAYOUT claim, and this
+    // verifier runs on the two modules downstream of that claim — the
+    // peephole's own output AND `materializeCallingConvention`'s. Rule 1b
+    // re-derives "is the unnamed successor really the next-laid-out block?"
+    // from the module in hand, so callconv preserving block order 1:1 is
+    // CHECKED rather than believed, and any future pass that reorders blocks
+    // after the peephole fails the build instead of shipping a branch that
+    // falls into the wrong one.
+    checkTerminatorBlockRefsMatchSuccessors(lir, schema, reporter);
     return reporter.errorCount() == baseline;
 }
 
@@ -770,8 +878,8 @@ bool verifyLirText(Lir const& lir, TargetSchema const& schema,
     // join here too. The text-load path has no MIR cross-reference (the source
     // MIR isn't part of `.dsslir`), so MIR-dependent rules (2–4) are
     // deliberately not invoked.
-    // ★ Rule 1b matters MOST on this path (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-
-    // DROPPED): the text reader is the one producer that ever built a
+    // ★ Rule 1b matters MOST on this path (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED):
+    // the text reader is the one producer that ever built a
     // terminator whose two CFG channels disagreed, and it did so silently with
     // `ok == true`. A rule that runs only where the bug cannot occur is not a
     // net.

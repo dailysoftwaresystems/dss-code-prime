@@ -1,0 +1,34 @@
+{
+  "$comment": "D-PP-DEFINED-VIA-MACRO-EXPANSION runtime witness for the WHOLE conditional-inclusion operator family reached via macro expansion: `defined` (4 shapes) and `__has_include` (3 shapes), plus the OPERAND BARRIER that decides per operator what expansion may touch. Seven independent shapes contribute 40+2+0+0+0+0+0 = 42 through add7() as runtime function arguments, and the wrong-branch deltas are POWERS OF TWO (64/32/16/8/4/2/1) so the exit code names EXACTLY which shapes failed rather than merely that something did. THE TWO HALVES PULL OPPOSITE WAYS, which is the point: `defined`'s operand must NOT be expanded (shape 1 -- ZERO is #defined TO 0, so protected vs expanded differ in ANSWER, not in well-formedness), while a `__has_include` operand matching neither delimited form MUST be (shape 6). BEFORE THE FIX eleven of these shapes were hard refusals ('trailing tokens after #if controlling expression' / \"expected ')' in #if expression\" / \"operator '__has_include' requires <header> or \\\"header\\\"\") and NO binary was produced, so this example is red-on-disable by construction. REFERENCES MEASURED 2026-08-27 (gcc 13.3.0 -std=c2x, clang 18.1.3 -std=c23, MSVC 19.51 /std:c17 both preprocessors): all three accept and evaluate every shape with identical answers. ⓘ This example compiles WITH WARNINGS and no errors: the four `defined` shapes each raise P_PreprocessorDefinedFromExpansion (Warning), which is precisely what gcc/clang (-Wexpansion-to-defined) and MSVC (C5105) do with the same source. No corpus arm sets --warnings-as-errors, and the runner asserts errorCount()==0, which a Warning does not bump. The optimizedPipelines `release` arm runs the shipped pipeline over the same source.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true, "$commentMeasured": "MEASURED 2026-08-26 on this tree: the runner reported `[artifact-identity] optimized-arms-ran=1 compared=1 byte-identical=0` for the pe64-x86_64 arm, i.e. the release image genuinely DIFFERS from the baseline's. Declared rather than assumed, so a future release arm that goes byte-identical (a silently disabled optimizer over this feature's MIR shapes) fails here instead of passing an x==x comparison."}
+  ]
+}

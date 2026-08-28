@@ -403,21 +403,21 @@ TEST(SemanticAnalyzerGenericity, SpecifierPrefixStrippedFromEnumeratorValue) {
 }
 
 // Consumption-state guard (cycle 13 — adapts the cycle-12 design's unconsumed-
-// invariant pin to the post-consumption reality). c-subset CONSUMED
+// invariant pin to the post-consumption reality). c CONSUMED
 // D-CSUBSET-LINKAGE-SPECIFIERS (its `topLevelDecl` declares `specifierPrefixRule`);
 // toy + tsql-subset declare NONE (the substrate stays INERT for languages with no
 // linkage specifiers). Flips loudly the moment a future cycle wires the prefix
-// onto an unexpected shipped language, or un-wires c-subset — the attribution
+// onto an unexpected shipped language, or un-wires c — the attribution
 // signal the next consumer cycle needs. (The cycle-12 "no lang sets it" pin is now
-// obsolete: c-subset legitimately sets it as of cycle 13.)
+// obsolete: c legitimately sets it as of cycle 13.)
 TEST(SemanticAnalyzerGenericity, ShippedSpecifierPrefixConsumptionState) {
-    auto cs = GrammarSchema::loadShipped("c-subset");
-    ASSERT_TRUE(cs) << "c-subset must load";
+    auto cs = GrammarSchema::loadShipped("c");
+    ASSERT_TRUE(cs) << "c must load";
     std::size_t csWithPrefix = 0;
     for (auto const& d : (*cs)->semantics().declarations)
         if (d.specifierPrefixRule.has_value()) ++csWithPrefix;
     EXPECT_GE(csWithPrefix, 1u)
-        << "c-subset must declare >=1 specifierPrefixRule (it consumed "
+        << "c must declare >=1 specifierPrefixRule (it consumed "
            "D-CSUBSET-LINKAGE-SPECIFIERS); 0 means the consumption regressed";
 
     for (char const* lang : {"toy", "tsql-subset"}) {
@@ -686,7 +686,7 @@ TEST(SemanticAnalyzerGenericity, Synth2MutualAliasCycleDoesNotHang) {
 // uses `childPath: [2, 0]` to descend from topDecl → topTail → child to
 // reach the discriminator-deciding rule (fnTail) — the same shape c-
 // subset uses for its `topLevelDecl`. Proves the facet is purely
-// config-driven, not tied to c-subset's specific names.
+// config-driven, not tied to c's specific names.
 namespace {
 constexpr char kSynth3SchemaText[] = R"JSON({
   "dssSchemaVersion": 4,
@@ -1107,7 +1107,7 @@ TEST(SemanticAnalyzerGenericity, Synth2BuiltinFunctionArity) {
 // language. TWO declaration forms exercise the per-declaration opt-in:
 //   - `localDecl` (`loc <Word> ;`) sets `warnIfUnused: true`  → warns.
 //   - `slotDecl`  (`slot <Word> ;`) omits it (default false)  → never warns.
-// If the engine hardcoded c-subset's `varDeclHead` name (or "Identifier"),
+// If the engine hardcoded c's `varDeclHead` name (or "Identifier"),
 // these would fail — proving the facet is language-agnostic.
 namespace {
 constexpr char kSynth5SchemaText[] = R"JSON({
@@ -1195,7 +1195,7 @@ TEST(SemanticAnalyzerGenericity, Synth5NonOptedInDeclDoesNotWarn) {
 // a registered `typeExtensions[]` entry rather than a core-lattice primitive)
 // is 100% config-driven under NON-shipped vocabulary. The extension name
 // (`Demo::Money`), the type keyword (`cash`), the declaration rule (`hold`),
-// and the identifier token (`Word`) overlap nothing in tsql/c-subset. If the
+// and the identifier token (`Word`) overlap nothing in tsql/c. If the
 // facet were shaped around tsql's VARCHAR / TSQL::Varchar, the resolved type
 // would not carry the arbitrary `Demo::Money` name — this pins that it does.
 namespace {

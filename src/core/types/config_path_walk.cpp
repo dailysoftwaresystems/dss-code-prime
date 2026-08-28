@@ -1,5 +1,6 @@
 #include "core/types/config_path_walk.hpp"
 
+#include "core/substrate/phase_timers.hpp"        // the `locate-config` pipeline phase
 #include "core/types/predefined_macro_json.hpp"   // kBuildVersionText — the binary's own version
 
 #include <cstdlib>
@@ -371,6 +372,17 @@ installedConfigRootFrom(std::filesystem::path const& executableDir) {
 
 LoadResult<std::filesystem::path>
 findShippedConfig(ShippedConfigLocator const& loc) {
+    // ── `locate-config`, the precedence walk's own row in `--time` ──────────
+    // This is the ONE thing a shipped load pays that the content-addressed
+    // memo can never remove: the walk's answer depends on cwd and on
+    // `DSS_CONFIG_ROOT`, both of which a single process may change (the test
+    // harness does), so a resolved path is not a memoizable fact about a NAME.
+    // ✔MEASURED 2026-08-25: ~2 ms across the 13 grammar lookups of a one-line
+    // Debug C compile — small, and small is exactly the claim the row now
+    // carries evidence for instead of leaving it to `[other]`.
+    substrate::PhaseTimers::Scope const locateScope{
+        substrate::CompilePhase::LocateConfig};
+
     // Reject path-like names up front. `loadShipped` is the LOGICAL-
     // name resolver — only `csharp` / `x86_64` / `toy` / ... — never
     // arbitrary paths. Defending against `../` traversal here also
@@ -435,6 +447,37 @@ findShippedConfigDir(std::string_view                            subdir,
     // shared `resolveByPrecedence` preserves exactly that — it probes the
     // COMPOSED path (root+subdir+leaf, or root+subdir) at every candidate, so
     // each form keeps its own reach while the ORDER of the arms lives once.
+}
+
+// THE RESOLVED SYSTEM-INCLUDE DIRS — see the header for why this is the one
+// owner and what the three drifted copies did.
+//
+// ★ THE ANSWER IS COMPUTED ONCE PER CALL AND IS MEANT TO BE HOISTED BY THE
+// CALLER. Every entry costs a `findShippedConfigDir`, which reads the
+// environment and probes up to eight ancestor directories. The driver's
+// multi-TU build resolves ONCE for a whole `CuBuildKey` and hands the vector to
+// each unit rather than re-walking per source file — the answer is fixed for an
+// invocation (a language's `shippedLibDirs` and the config root are both), and
+// hoisting it is also one less piece of ambient filesystem state consulted from
+// inside a concurrent job.
+std::vector<std::filesystem::path> resolveSystemDirs(GrammarSchema const& grammar) {
+    std::vector<std::filesystem::path> out;
+    auto const&                        dirs = grammar.semantics().shippedLibDirs;
+    if (dirs.empty()) return out;
+    out.reserve(dirs.size());
+    std::error_code ec;
+    for (std::string const& sub : dirs) {
+        auto const resolved = findShippedConfigDir(sub);
+        if (!resolved) continue;   // fail loud downstream, not here
+        // Same idiom as the driver's `applyIncludeDirs`: on an `absolute`
+        // failure keep the RAW path rather than drop the dir — a dir the
+        // filesystem could not canonicalise is still more useful to the
+        // resolver than no dir at all.
+        std::filesystem::path const abs = std::filesystem::absolute(*resolved, ec);
+        out.push_back(ec ? *resolved : abs);
+        ec.clear();
+    }
+    return out;
 }
 
 } // namespace dss

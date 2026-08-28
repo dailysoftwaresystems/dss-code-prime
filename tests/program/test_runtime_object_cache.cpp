@@ -87,7 +87,13 @@
 // INSTALLED compiler on Windows, and that is the number that matters. With the
 // default `%LOCALAPPDATA%` root, a 5-character username, a 4-character unit
 // stem, `release` and the arm64 elf slug, the longest composed path was 223
-// (37 characters of headroom) and is now 177 — **83 characters of headroom**.
+// (37 characters of headroom) and is now 168 — **92 characters of headroom**.
+// ★ THE LAST 9 OF THOSE 92 WERE BOUGHT BY A RENAME THAT WAS NOT ABOUT PATH
+// LENGTH AT ALL: the vendor directory went from `dss-code-prime/runtime-cache`
+// to `dsscp/runtime-cache` (2026-08-24, cycle P32), and this case is what
+// MEASURED it — it red on the SHORTENING, which is the direction nobody
+// thinks to check, and is the argument for asserting an exact figure rather
+// than an upper bound.
 // It still fails LOUD when it bites, and the refusal now names the composed
 // path, its length, and a MEASURED verdict on whether the length was the cause
 // (see `composedPathNote`), plus the remedy: point `DSS_RUNTIME_CACHE_DIR` at a
@@ -109,6 +115,9 @@
 #include "core/crypto/sha256.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
+// The exclusive-create primitive the cache's temp claim now goes through
+// (D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK).
+#include "link/writer.hpp"
 #include "program/runtime_object_cache.hpp"
 
 #include "repo_root.hpp"
@@ -117,6 +126,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>   // std::reverse — the declaring-descriptor ORDER control
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -209,14 +219,14 @@ makeRequest(fs::path const&  configRoot,
             std::string_view targetSpec = "arm64:elf64-aarch64-linux-exec") {
     RuntimeObjectRequest request;
     request.configRoot        = configRoot;
-    request.descriptorPath    = std::string{kDescriptorPath};
+    request.descriptorPaths   = {std::string{kDescriptorPath}};
     request.sourcePath        = std::string{kSourcePath};
     request.targetSpec        = std::string{targetSpec};
     request.buildFormatName   = "elf64-aarch64-linux-exec";
     request.siblingFormatName = "elf64-aarch64-linux-staticlib";
     request.configName        = std::string{configName};
     request.loadedDocuments   = {
-        {"language", "languages/c-subset.lang.json",
+        {"language", "languages/c.lang.json",
          std::string{kLanguageDigest}},
         {"format", "object-formats/elf64-aarch64-linux-exec.format.json",
          std::string{kFormatDigest}},
@@ -363,9 +373,9 @@ constexpr SiblingCase kSiblingCases[] = {
 } // namespace
 
 TEST(RuntimeObjectCacheSibling, EveryShippedExecFormatResolvesItsExactSibling) {
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    fs::path const formatsDir = *root / "src" / "dss-config" / "object-formats";
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const formatsDir = *cfg / "object-formats";
     ASSERT_TRUE(fs::is_directory(formatsDir))
         << "the shipped object-format tree is the SUBJECT of this test; "
            "without it the case would silently pass over an empty scan: "
@@ -397,9 +407,9 @@ TEST(RuntimeObjectCacheSibling, EveryShippedExecFormatResolvesItsExactSibling) {
 // nothing.
 
 TEST(RuntimeObjectCacheSibling, SpirvHasNoArchiveSiblingAndRefusesByName) {
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    fs::path const formatsDir = *root / "src" / "dss-config" / "object-formats";
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const formatsDir = *cfg / "object-formats";
     ASSERT_TRUE(fs::is_directory(formatsDir)) << formatsDir.generic_string();
 
     auto const format = ObjectFormatSchema::loadShipped("spirv-1.6");
@@ -420,9 +430,9 @@ TEST(RuntimeObjectCacheSibling, SpirvHasNoArchiveSiblingAndRefusesByName) {
 }
 
 TEST(RuntimeObjectCacheSibling, WasmHasNoArchiveSiblingAndRefusesByName) {
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    fs::path const formatsDir = *root / "src" / "dss-config" / "object-formats";
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const formatsDir = *cfg / "object-formats";
     ASSERT_TRUE(fs::is_directory(formatsDir)) << formatsDir.generic_string();
 
     auto const format = ObjectFormatSchema::loadShipped("wasm32-v1");
@@ -442,9 +452,9 @@ TEST(RuntimeObjectCacheSibling, WasmHasNoArchiveSiblingAndRefusesByName) {
 // ── MORE THAN ONE: the arm a first-match rule would pass ────────────────────
 
 TEST(RuntimeObjectCacheSibling, TwoAgreeingArchiveFormatsRefuseAndNameBoth) {
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    fs::path const shippedStaticlib = *root / "src" / "dss-config"
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const shippedStaticlib = *cfg
                                     / "object-formats"
                                     / "elf64-x86_64-linux-staticlib.format.json";
     ASSERT_TRUE(fs::is_regular_file(shippedStaticlib))
@@ -563,7 +573,7 @@ TEST(RuntimeObjectCacheKey, DocumentHasTheExactLineShapeAndOrder) {
     }
 
     ASSERT_EQ(lines.size(), 12u) << key->document;
-    EXPECT_EQ(lines[0], "dss-runtime-object-cache-key/1");
+    EXPECT_EQ(lines[0], "dss-runtime-object-cache-key/2");
 
     // ⓘ `compiler=` is the ONE term this test cannot pin to a literal: its
     // value is a build-time stamp macro compiled into the library, and the
@@ -591,7 +601,7 @@ TEST(RuntimeObjectCacheKey, DocumentHasTheExactLineShapeAndOrder) {
     EXPECT_EQ(lines[10],
               "doc=format:object-formats/elf64-aarch64-linux-exec.format.json:"
                   + std::string{kFormatDigest});
-    EXPECT_EQ(lines[11], "doc=language:languages/c-subset.lang.json:"
+    EXPECT_EQ(lines[11], "doc=language:languages/c.lang.json:"
                              + std::string{kLanguageDigest});
 
     // The digest is the SHA-256 of exactly those bytes — no side channel.
@@ -744,6 +754,105 @@ TEST(RuntimeObjectCacheKey, OneByteDescriptorChangeAtEqualLengthMovesTheKey) {
            "is still reachable in BOTH roots.";
 }
 
+// ═══ EVERY TERM, ONE ROW EACH — THE TOO-COARSE-KEY DETECTOR ═════════════════
+//
+// ★★★ THIS IS THE CASE THAT REDS WHEN A TERM IS DROPPED, AND THAT IS THE ONLY
+// REASON IT IS TABLE-DRIVEN. The other key cases each pin one input they had a
+// specific argument about; this one asserts the WHOLE list, so deleting any
+// `field(...)` line from `computeRuntimeObjectKey` — or "simplifying" the
+// loaded-document loop, or dropping the sort — turns exactly one row red and
+// names it. A key that is too COARSE is not a slow build: it is a stale archive
+// served under a key that says it is current, which links clean and returns
+// wrong bytes.
+//
+// ⚠ EACH ROW MUTATES EXACTLY ONE THING, and every row is paired with the
+// `OutOfScopeDocumentChangeLeavesTheKeyUnmoved` control below — without that
+// control a key that hashed the entire config root would pass every row here
+// and hit never.
+//
+// ⓘ `relativePath` is asserted alongside `digest` because reachability is the
+// property, not distinguishability: the 16-character path index is a prefix of
+// the identity, so a moved digest must move the FILENAME too or the stale
+// artifact stays exactly where the next lookup will find it.
+TEST(RuntimeObjectCacheKey, EveryKeyTermMovesTheKeyAndTheArtifactPath) {
+    struct Row {
+        char const* term;
+        // Mutates the request in place, or the staged tree behind it, or both.
+        void (*mutate)(RuntimeObjectRequest&, fs::path const&);
+    };
+    constexpr Row kRows[] = {
+        {"target", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.targetSpec = "x86_64:elf64-x86_64-linux-exec";
+         }},
+        {"format", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.buildFormatName = "elf64-aarch64-linux-pie";
+         }},
+        {"sibling", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.siblingFormatName = "elf64-x86_64-linux-staticlib";
+         }},
+        {"config", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.configName = "release";
+         }},
+        {"unit path", [](RuntimeObjectRequest& r, fs::path const& root) {
+             constexpr std::string_view kOther = "runtime/platform/src/other.c";
+             writeFile(root / kOther, kUnitText);
+             r.sourcePath = std::string{kOther};
+         }},
+        {"unit bytes", [](RuntimeObjectRequest&, fs::path const& root) {
+             writeFile(root / kSourcePath,
+                       std::string{kUnitText} + "int extra(void){return 1;}\n");
+         }},
+        {"descriptor bytes", [](RuntimeObjectRequest&, fs::path const& root) {
+             writeFile(root / kDescriptorPath, kDescriptorV2);
+         }},
+        {"loaded document digest", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.loadedDocuments[0].digest = std::string(64u, 'b');
+         }},
+        {"loaded document path", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.loadedDocuments[0].path = "sources/somewhere-else.lang.json";
+         }},
+        {"loaded document label", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.loadedDocuments[0].label = "unit-language";
+         }},
+        {"loaded document count", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.loadedDocuments.push_back(
+                 {"sibling-format",
+                  "object-formats/elf64-aarch64-linux-staticlib.format.json",
+                  std::string(64u, 'c')});
+         }},
+    };
+
+    for (Row const& row : kRows) {
+        // A FRESH staged root per row: a mutation that rewrote a file would
+        // otherwise leak into the next row's baseline and make its "moved"
+        // assertion pass for the wrong reason.
+        ScratchDir scratch{Location::Temp, "roc-key-terms"};
+        ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1))
+            << "term: " << row.term;
+
+        auto const before = computeRuntimeObjectKey(makeRequest(scratch.path()));
+        ASSERT_TRUE(before.has_value()) << row.term << ": " << before.error();
+
+        auto mutated = makeRequest(scratch.path());
+        row.mutate(mutated, scratch.path());
+        auto const after = computeRuntimeObjectKey(mutated);
+        ASSERT_TRUE(after.has_value()) << row.term << ": " << after.error();
+
+        EXPECT_NE(before->digest, after->digest)
+            << "changing the '" << row.term
+            << "' term did NOT move the cache key. The key is too COARSE: a "
+               "build with this input changed would be served the artifact "
+               "compiled with the OLD one, which links clean and returns wrong "
+               "bytes.\n  before: " << before->document
+            << "\n  after:  " << after->document;
+        EXPECT_NE(before->relativePath.generic_string(),
+                  after->relativePath.generic_string())
+            << "changing the '" << row.term
+            << "' term moved the key but NOT the artifact path, so the stale "
+               "artifact is still exactly where the next lookup reads.";
+    }
+}
+
 TEST(RuntimeObjectCacheKey, OutOfScopeDocumentChangeLeavesTheKeyUnmoved) {
     // THE CONTROL THAT PROVES THE KEY IS SCOPED. A key that hashed the whole
     // config root would pass every invalidation case in this file and fail
@@ -789,7 +898,7 @@ TEST(RuntimeObjectCacheKey, EmptyLoadedDocumentDigestRefusesNamingLabelAndPath) 
     // Label AND path, both quoted — `language` is a prefix of `languages/...`,
     // so a bare substring test would be satisfied by the path alone.
     EXPECT_TRUE(contains(key.error(),
-                         "'language' at 'languages/c-subset.lang.json'"))
+                         "'language' at 'languages/c.lang.json'"))
         << key.error();
     EXPECT_TRUE(contains(key.error(), "EMPTY")) << key.error();
 }
@@ -806,7 +915,7 @@ TEST(RuntimeObjectCacheKey, MalformedLoadedDocumentDigestRefuses) {
         auto const key = computeRuntimeObjectKey(request);
         ASSERT_FALSE(key.has_value());
         EXPECT_TRUE(contains(key.error(),
-                             "'language' at 'languages/c-subset.lang.json'"))
+                             "'language' at 'languages/c.lang.json'"))
             << key.error();
         EXPECT_TRUE(contains(key.error(), "MALFORMED")) << key.error();
     }
@@ -819,6 +928,93 @@ TEST(RuntimeObjectCacheKey, MalformedLoadedDocumentDigestRefuses) {
         ASSERT_FALSE(key.has_value());
         EXPECT_TRUE(contains(key.error(), "MALFORMED")) << key.error();
     }
+}
+
+// ── THE SECOND DECLARING DESCRIPTOR ─────────────────────────────────────────
+//
+// `realization.<fmt>.source` is a per-DESCRIPTOR declaration, so a unit may be
+// named by more than one. ✔MEASURED 2026-08-25 the shipped corpus names exactly
+// one per unit — which is precisely the state in which a singular term looks
+// correct forever while a second declaration would silently fall outside the
+// key. These three cases are what make the plural term a measurement.
+TEST(RuntimeObjectCacheKey, ASecondDeclaringDescriptorMovesTheKey) {
+    ScratchDir scratch{Location::Temp, "roc-key-descr2"};
+    ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
+    // The second declarer is a REAL file with its own bytes — a path alone
+    // would be satisfied by a key that hashed paths and not content.
+    constexpr std::string_view kSecondPath = "shippedLibs/probe-two.json";
+    ASSERT_NO_FATAL_FAILURE(
+        writeFile(scratch.path() / kSecondPath, kDescriptorV2));
+
+    auto const one = computeRuntimeObjectKey(makeRequest(scratch.path()));
+    ASSERT_TRUE(one.has_value()) << one.error();
+
+    auto twoRequest = makeRequest(scratch.path());
+    twoRequest.descriptorPaths.emplace_back(kSecondPath);
+    auto const two = computeRuntimeObjectKey(twoRequest);
+    ASSERT_TRUE(two.has_value()) << two.error();
+
+    EXPECT_NE(one->digest, two->digest)
+        << "a SECOND declaring descriptor did not move the key — its bytes are "
+           "outside the key, so editing it would serve an archive compiled "
+           "against the old declarations.";
+    EXPECT_NE(one->relativePath.generic_string(),
+              two->relativePath.generic_string());
+
+    // ★ AND THE ORDER THE CALLER HAPPENED TO WALK IN MUST NOT MATTER — the key
+    // is a function of the SET. `directory_iterator` is sorted on NTFS and
+    // hash-ordered on ext4, so an order-sensitive key would make the SAME
+    // corpus miss on one filesystem and hit on the other.
+    auto reversed = twoRequest;
+    std::reverse(reversed.descriptorPaths.begin(),
+                 reversed.descriptorPaths.end());
+    auto const swapped = computeRuntimeObjectKey(reversed);
+    ASSERT_TRUE(swapped.has_value()) << swapped.error();
+    EXPECT_EQ(two->document, swapped->document)
+        << "the declaring-descriptor order changed the key document.";
+}
+
+TEST(RuntimeObjectCacheKey, EditingTheSecondDeclaringDescriptorMovesTheKey) {
+    ScratchDir scratch{Location::Temp, "roc-key-descr2edit"};
+    ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
+    constexpr std::string_view kSecondPath = "shippedLibs/probe-two.json";
+    ASSERT_NO_FATAL_FAILURE(
+        writeFile(scratch.path() / kSecondPath, kDescriptorV1));
+
+    auto request = makeRequest(scratch.path());
+    request.descriptorPaths.emplace_back(kSecondPath);
+    auto const before = computeRuntimeObjectKey(request);
+    ASSERT_TRUE(before.has_value()) << before.error();
+
+    // Equal length, one differing byte — the mutation a size- or mtime-based
+    // key would wave through. The FIRST descriptor is left untouched, so only
+    // the second can account for a moved key.
+    ASSERT_EQ(kDescriptorV1.size(), kDescriptorV2.size());
+    ASSERT_NO_FATAL_FAILURE(
+        writeFile(scratch.path() / kSecondPath, kDescriptorV2));
+    EXPECT_EQ(readFile(scratch.path() / kDescriptorPath), kDescriptorV1)
+        << "the first descriptor was disturbed, so this case no longer "
+           "attributes the moved key to the second.";
+
+    auto const after = computeRuntimeObjectKey(request);
+    ASSERT_TRUE(after.has_value()) << after.error();
+    EXPECT_NE(before->digest, after->digest)
+        << "editing the SECOND declaring descriptor did not move the key.";
+}
+
+TEST(RuntimeObjectCacheKey, NoDeclaringDescriptorRefusesRatherThanDroppingTheTerm) {
+    ScratchDir scratch{Location::Temp, "roc-key-descr0"};
+    ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
+
+    auto request = makeRequest(scratch.path());
+    request.descriptorPaths.clear();
+    auto const key = computeRuntimeObjectKey(request);
+    ASSERT_FALSE(key.has_value())
+        << "a request naming NO declaring descriptor produced a key anyway — "
+           "the term the whole mechanism exists for was dropped silently.";
+    EXPECT_TRUE(contains(key.error(), "runtime/platform/src/unit.c"))
+        << key.error();
+    EXPECT_TRUE(contains(key.error(), "NO declaring")) << key.error();
 }
 
 TEST(RuntimeObjectCacheKey, MissingUnitOrDescriptorRefuses) {
@@ -1127,7 +1323,7 @@ TEST(RuntimeObjectCacheRoots, PlatformDefaultsFollowTheDocumentedChain) {
     std::string const segment = runtimeCacheBuildStampSegment();
     ASSERT_FALSE(segment.empty());
 
-    fs::path const vendorTail = fs::path{"dss-code-prime"} / "runtime-cache";
+    fs::path const vendorTail = fs::path{"dsscp"} / "runtime-cache";
 
     // ── PHASE 1: LOCALAPPDATA present ⇒ it wins over XDG and HOME ───────────
     {
@@ -1207,7 +1403,7 @@ TEST(RuntimeObjectCacheRoots, AnEmptyOverrideFallsThroughRatherThanRootingAtCwd)
     auto const roots = resolveRuntimeCacheRoots(configRoot);
     ASSERT_FALSE(roots.perUser.empty()) << roots.trail;
     EXPECT_EQ(roots.perUser.generic_string(),
-              (localAppData / "dss-code-prime" / "runtime-cache"
+              (localAppData / "dsscp" / "runtime-cache"
                / runtimeCacheBuildStampSegment())
                   .generic_string());
     EXPECT_TRUE(roots.perUser.is_absolute())
@@ -1769,13 +1965,13 @@ TEST(RuntimeObjectCachePathBudget, TheLongestComposedNameFitsWindowsMaxPath) {
     std::size_t const installed =
         std::string_view{"C:/Users/"}.size() + 5u
         + std::string_view{"/AppData/Local"}.size()
-        + std::string_view{"/dss-code-prime/runtime-cache"}.size()
+        + std::string_view{"/dsscp/runtime-cache"}.size()
         + 1u + 41u          // the build-stamp segment
         + 1u + std::string_view{"release"}.size()
         + 1u + std::string_view{"arm64_elf64-aarch64-linux-exec"}.size()
         + 1u + longestName;
-    EXPECT_EQ(installed, 177u);
-    EXPECT_EQ(260u - installed, 83u)
+    EXPECT_EQ(installed, 168u);
+    EXPECT_EQ(260u - installed, 92u)
         << "the Windows MAX_PATH headroom for an installed compiler changed; "
            "re-measure and update this file's docblock.";
 
@@ -1857,4 +2053,196 @@ TEST(RuntimeObjectCachePathBudget, AnOverlongNameRefusesNamingThePathAndItsLengt
            "the directory arm and this case never reached the name-length one.";
     EXPECT_EQ(countEntries(key.userArtifactPath.parent_path()), 0u)
         << "the refusal left files behind in the artifact directory.";
+}
+
+
+// ═══ THE TEMP CLAIM ═════════════════════════════════════════════════════════
+//
+// D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK.
+//
+// ★★★ THE DEFECT: THE CLAIM ASKED ONE QUESTION AND THE WRITE ANSWERED ANOTHER.
+// `writeThroughTemp` probed each candidate name with `fs::exists` and then
+// opened it with `std::ofstream(..., trunc)`. `fs::exists` FOLLOWS symlinks, so
+// a DANGLING symlink at a candidate name answers FALSE — the loop reads "free",
+// claims it, and the truncating open CREATES THE LINK'S TARGET, outside the
+// cache directory. The `rename` then moves the LINK itself into place as the
+// cache entry, so the entry's bytes live wherever the attacker pointed.
+//
+// ⚠ STRICTLY WORSE THAN THE SAME BLINDNESS IN `link::writeBytes`
+// (D-LINK-WRITER-DANGLING-SYMLINK-CLAIM-MISROUTE): there the open is exclusive,
+// so the wrong branch was taken but NOTHING WAS WRITTEN. A truncating open
+// destroys before it can fail.
+//
+// ⚠⚠ POSIX ONLY, AND THE SKIP IS LOUD RATHER THAN SILENT. Creating a symlink on
+// Windows needs Developer Mode or elevation, so on the Windows leg this case
+// cannot construct its subject at all. It says so, by name, instead of passing
+// as though it had checked something — a vacuous green here would be worse than
+// no test, because the property it covers is a write escaping its directory.
+
+namespace {
+
+// A dangling symlink: the LINK exists as a directory entry, its TARGET does not.
+// Returns false if the platform refused to create it at all.
+[[nodiscard]] bool plantDanglingSymlink(fs::path const& link,
+                                        fs::path const& missingTarget) {
+    std::error_code ec;
+    fs::create_symlink(missingTarget, link, ec);
+    return !ec && fs::is_symlink(fs::symlink_status(link, ec));
+}
+
+} // namespace
+
+// ── (1) THE HOST CONTROL AND THE PRIMITIVE, SIDE BY SIDE ────────────────────
+//
+// Neither arm alone is worth anything. The CONTROL proves this host really does
+// let a truncating open escape through a dangling link — without it, the arm
+// below could pass on a platform where nothing was ever at risk. The PRIMITIVE
+// arm proves the exclusive create refuses the same name and leaves the target
+// uncreated, which is the whole reason the claim loop now goes through it.
+TEST(RuntimeObjectCacheStore, TempClaimNeverEscapesThroughADanglingSymlink) {
+    ScratchDir scratch{Location::Temp, "roc-claim-symlink"};
+    fs::path const inside  = scratch.path() / "cache";
+    fs::path const outside = scratch.path() / "outside";
+    std::error_code mkEc;
+    fs::create_directories(inside, mkEc);
+    ASSERT_FALSE(mkEc) << mkEc.message();
+    fs::create_directories(outside, mkEc);
+
+    fs::path const canaryA = outside / "escaped-a.bin";
+    fs::path const canaryB = outside / "escaped-b.bin";
+    fs::path const linkA   = inside / ".victim.a.tmp-1-0";
+    fs::path const linkB   = inside / ".victim.a.tmp-1-1";
+
+    if (!plantDanglingSymlink(linkA, canaryA)
+        || !plantDanglingSymlink(linkB, canaryB)) {
+        GTEST_SKIP() << "this platform refused to create a symlink, so the "
+                        "dangling-symlink claim hazard cannot be constructed "
+                        "here. On Windows that needs Developer Mode or "
+                        "elevation; the property is covered on the POSIX legs. "
+                        "This is a STATED scope limit, not a pass.";
+    }
+
+    // ── CONTROL: the OLD primitive pair, on this host, right now ────────────
+    std::error_code ec;
+    EXPECT_FALSE(fs::exists(linkA, ec))
+        << "`fs::exists` reported a DANGLING symlink as existing, so this host "
+           "does not exhibit the blindness the fix exists to close and the "
+           "assertions below would prove nothing";
+    {
+        std::ofstream out(linkA, std::ios::binary | std::ios::trunc);
+        EXPECT_TRUE(out.good())
+            << "a truncating open of a dangling symlink failed on this host, "
+               "so the escape is not reproducible here and the arm below is "
+               "not measuring what it claims";
+        out << 'x';
+    }
+    EXPECT_TRUE(fs::exists(canaryA))
+        << "THE CONTROL DID NOT FIRE: a truncating open through a dangling "
+           "symlink did not create the target, so this host cannot demonstrate "
+           "the escape and the arm below is vacuous";
+
+    // ── THE PRIMITIVE THE CLAIM NOW USES ───────────────────────────────────
+    std::FILE* const claimed = dss::linker::detail::createExclusiveBinary(linkB);
+    EXPECT_EQ(claimed, nullptr)
+        << "the exclusive create ACCEPTED a name occupied by a dangling "
+           "symlink — the claim would follow the link out of the cache "
+           "directory, exactly as the control above just did";
+    if (claimed != nullptr) std::fclose(claimed);
+    EXPECT_FALSE(fs::exists(canaryB))
+        << "THE WRITE ESCAPED: the claim created the symlink's TARGET, which "
+           "is outside the directory the cache thought it had claimed "
+           "(D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK)";
+    EXPECT_TRUE(fs::is_symlink(fs::symlink_status(linkB, ec)))
+        << "a refused claim must leave the existing entry untouched";
+}
+
+// ── (2) THE ROUTING: a real store, over a planted window of candidate names ─
+//
+// The arm above pins the PRIMITIVE. This one pins that `storeRuntimeObject`
+// actually goes THROUGH it — the two are independent, and a fix applied to only
+// one of them would leave the other green.
+//
+// ⚠ THE ONE STATED LIMIT, because a bound nobody writes down is a bound nobody
+// re-checks: the candidate names embed this process's pid (knowable) and a
+// process-wide counter (not). The window below covers the first 512 counter
+// values, so the arm is only meaningful while this test BINARY has performed
+// fewer than 512 cache writes before reaching here — comfortably true today
+// (each store consumes two) and asserted nowhere, because nothing can observe
+// the counter from outside. If that ever stops holding, this arm goes VACUOUS
+// rather than red, which is why arm (1) exists and does not depend on it.
+//
+// ★ THE DISCRIMINATOR NEEDS NO KNOWLEDGE OF WHICH SLOT WAS PICKED. With the
+// defect, the loop stops at the first planted link, writes through it, and then
+// RENAMES THE LINK ITSELF into place — so the cache entry becomes a symlink and
+// a file appears outside the cache. With the fix, every planted link is stepped
+// over and survives, and the entry is a regular file.
+TEST(RuntimeObjectCacheStore, TempClaimStepsOverPlantedDanglingCandidates) {
+    ScratchDir scratch{Location::Temp, "roc-claim-window"};
+    ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
+    ScopedUserCacheRoot userRoot{scratch.path() / "uc"};
+
+    auto const key = computeRuntimeObjectKey(makeRequest(scratch.path()));
+    ASSERT_TRUE(key.has_value()) << key.error();
+    ASSERT_FALSE(key->userArtifactPath.empty());
+
+    fs::path const dir     = key->userArtifactPath.parent_path();
+    fs::path const outside = scratch.path() / "outside";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    fs::create_directories(outside, ec);
+
+#ifdef _WIN32
+    auto const pid = static_cast<std::uint64_t>(_getpid());
+#else
+    auto const pid = static_cast<std::uint64_t>(getpid());
+#endif
+    constexpr std::uint64_t kWindow = 512;
+    std::vector<fs::path>   planted;
+    planted.reserve(static_cast<std::size_t>(kWindow) * 2u);
+    for (fs::path const& dest : {key->userArtifactPath,
+                                 fs::path{key->userArtifactPath}.replace_extension(".key")}) {
+        for (std::uint64_t n = 0; n < kWindow; ++n) {
+            fs::path const link =
+                dir / ("." + dest.filename().string() + ".tmp-"
+                       + std::to_string(pid) + "-" + std::to_string(n));
+            if (!plantDanglingSymlink(link, outside / ("escaped-" + std::to_string(n)))) {
+                GTEST_SKIP() << "this platform refused to create a symlink, so "
+                                "the planted-window arm cannot be constructed "
+                                "here (Windows needs Developer Mode or "
+                                "elevation). STATED scope limit, not a pass.";
+            }
+            planted.push_back(link);
+        }
+    }
+
+    auto const stored = storeRuntimeObject(*key, kBytesA);
+    ASSERT_TRUE(stored.has_value())
+        << "the store refused outright — the loop must STEP OVER occupied "
+           "candidate names, not exhaust itself on them: " << stored.error();
+
+    EXPECT_FALSE(fs::is_symlink(fs::symlink_status(*stored, ec)))
+        << "the cache entry IS A SYMLINK: the claim followed a planted link and "
+           "renamed it into place, so the entry's bytes live outside the cache "
+           "(D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK)";
+    EXPECT_EQ(readFile(*stored),
+              std::string(reinterpret_cast<char const*>(kBytesA.data()),
+                          kBytesA.size()))
+        << "the entry does not hold the stored bytes";
+
+    std::size_t escaped = 0;
+    for (auto const& e : fs::directory_iterator{outside, ec}) {
+        (void)e;
+        ++escaped;
+    }
+    EXPECT_EQ(escaped, 0u)
+        << "the store created " << escaped << " file(s) OUTSIDE the cache "
+           "directory — a write escaped the directory it claimed";
+
+    std::size_t survivors = 0;
+    for (auto const& link : planted) {
+        if (fs::is_symlink(fs::symlink_status(link, ec))) ++survivors;
+    }
+    EXPECT_EQ(survivors, planted.size())
+        << "the claim consumed " << (planted.size() - survivors)
+        << " planted entr(y/ies) instead of stepping over them";
 }

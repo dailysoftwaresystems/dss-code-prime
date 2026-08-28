@@ -1,0 +1,33 @@
+{
+  "$comment": "D-CSUBSET-TYPEOF-GNU-SPELLING + D-CSUBSET-ALIGNOF-GNU-SPELLING: the GNU spellings `__typeof__`/`__typeof` (== C23 `typeof`, qualifier-PRESERVING) and `__alignof__`/`__alignof` (== C11 `_Alignof`) are keyword-table ALIASES onto the existing token kinds — no new semantics. The empirical proof is a RUNTIME wrap-at-256 store+load, twice, through objects declared `__typeof__(base)` / `__typeof(base)` where `base` is an `unsigned char`: 260 -> 4 and 259 -> 3. `argc` is a runtime argument, so neither wrap nor the cast-to-`__typeof__` is const-folded, in the release pipeline either. If an alias resolved to `int` instead, the stores would not wrap and the exit would differ — so this is red on a WRONG alias, not merely on a missing one. All FOUR spellings are load-bearing (see main.c), so deleting any one keyword row makes this example fail to compile. exit = wrapped(4) + wrapped2(3) + __alignof__(double)(8) + __alignof(int)(4) + sizeof(__typeof__(unsigned short))(2) + castw(45) - 24 = 42. Data-model-independent (unsigned char/unsigned short widths and the alignments of double and int agree under LP64 and LLP64), so the one exit code holds on all four targets and the shipped release pipeline. Its ISO-spelling twin is examples/c/typeof_basic (the deliberate structural echo: the two must stay observationally identical).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

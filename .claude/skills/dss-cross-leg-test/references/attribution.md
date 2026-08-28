@@ -25,7 +25,7 @@ wsl.exe -e <stage>/reference-testfixture <the same staged .test>
 
 ### Grep the registry BEFORE commissioning an experiment
 
-Search `_deferred-anchor-registry.md` for the leg, the artifact, the test family and the
+Search `_deferred-anchor-registry*.md` for the leg, the artifact, the test family and the
 symptom; cite what you find or state that nothing matched. A 2×2 attribution was once
 commissioned from scratch whose identical experiment and verdict were already in the registry
 from seven cycles earlier — and the un-cited row would have pre-empted three false statements

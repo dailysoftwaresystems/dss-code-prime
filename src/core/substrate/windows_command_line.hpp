@@ -18,7 +18,7 @@
 // and one of them (`integrated_tests`, via `integrated_tests/runner.cpp`) links
 // NO DSS library at all and does not carry `src/` on its include path, because
 // it drives the compiler as a black-box subprocess. A call from there into
-// `dss-code-prime-lib` would break both its compile and its link, and widening
+// `dsscp-lib` would break both its compile and its link, and widening
 // that target's link graph to borrow a string helper is the wrong trade — the
 // black-box boundary is the point of the target.
 //

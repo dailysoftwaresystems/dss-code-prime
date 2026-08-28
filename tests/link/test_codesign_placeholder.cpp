@@ -628,7 +628,7 @@ TEST(MachOCodeSignPlaceholder, ShippedX86DarwinExecEmitsAdHocSignature) {
 // ── FLIP MARKER: the static exec arm DROPS an ad-hoc request ─────────
 //
 // D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM — the REGISTERED id, read
-// back from .plans/_deferred-anchor-registry.md rather than restated from
+// back from .plans/_deferred-anchor-registry*.md rather than restated from
 // memory. ⚠ This comment used to CARRY the withdrawn "proposed anchor"
 // spelling, and said the guard could not catch that because it scanned src/,
 // examples/ and real-examples/, never tests/. Both halves were right, and it
@@ -646,8 +646,8 @@ TEST(MachOCodeSignPlaceholder, ShippedX86DarwinExecEmitsAdHocSignature) {
 // MEASURED 2026-08-05. `macho::encode`'s dispatch gate routes a
 // codesign request to the dynamic arm by testing
 // `machoImage().codeSignatureSize != 0` ONLY
-// (src/link/format/macho.cpp:751), and `encodeExec`'s defensive
-// invariant belt re-tests the SAME field only (:1853). Neither looks at
+// (src/link/format/macho.cpp), and `encodeExec`'s defensive
+// invariant belt re-tests the SAME field only. Neither looks at
 // `image.codeSignature`. So a zero-extern module against a schema whose
 // ONLY signature request is the ad-hoc block takes the static arm,
 // which emits no __LINKEDIT and no LC_CODE_SIGNATURE — the request is

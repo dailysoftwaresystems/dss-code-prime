@@ -189,9 +189,9 @@ TEST(SuppressRequestIgnored, ProtectedCodeWarnsAndTheRunContinuesUnchanged) {
     };
 
     auto const [rcControl, outControl] =
-        run({"dss-code-prime", "--transpile", "probe.c", "--language", "c", kTarget});
+        run({"dsscp", "--transpile", "probe.c", "--language", "c", kTarget});
     auto const [rcSuppress, outSuppress] =
-        run({"dss-code-prime", "--transpile", "probe.c", "--language", "c", kTarget,
+        run({"dsscp", "--transpile", "probe.c", "--language", "c", kTarget,
              "--suppress=D_PlanNotLanded"});
 
     // (2) THE EXIT CODE IS UNCHANGED. Asserted against the CONTROL RUN's own
@@ -204,14 +204,22 @@ TEST(SuppressRequestIgnored, ProtectedCodeWarnsAndTheRunContinuesUnchanged) {
 
     // (1) THE REFUSAL IS SAID — and only when it was asked for.
     //
-    // ⓘ Matched on the code NAME, not on the `D0021` hex prefix, and that is
-    // MEASURED rather than stylistic: the driver's buffer-less renderer
-    // (`program.cpp`'s `severityName(...) << "[" << diagnosticCodeName(...)`)
-    // is the arm every driver-tier `D_*` takes, because it has no source
-    // span to point at. `diagnosticCodePrefix`'s `D0021` spelling belongs to
-    // `DiagnosticReporter::format`, which only positioned diagnostics reach.
-    // The first draft asserted `warning[D0021]` and went RED against a
-    // perfectly correct message.
+    // ⓘ Matched on the code NAME. ★ THIS USED TO BE A NOTE ABOUT WHICH ARM THE
+    // DIAGNOSTIC TOOK, AND IT IS NOW A NOTE ABOUT THE WHOLE COMPILER. What
+    // stood here read: "the driver's buffer-less renderer is the arm every
+    // driver-tier `D_*` takes … `diagnosticCodePrefix`'s `D0021` spelling
+    // belongs to `DiagnosticReporter::format`, which only positioned
+    // diagnostics reach. The first draft asserted `warning[D0021]` and went RED
+    // against a perfectly correct message."
+    //
+    // ⭐ THAT RED IS THE BEST EVIDENCE THE PROJECT HAS THAT THE SPLIT WAS A REAL
+    // DEFECT AND NOT A COSMETIC ONE — a developer read one rendering and wrote
+    // an assertion against the other, which is what a surface with two
+    // spellings guarantees. It is closed: D-DIAG-TWO-CODE-RENDERINGS unified
+    // every render surface on `severity[<diagnosticCodeName>]: `, so the name
+    // below is now correct for the reason it is correct EVERYWHERE, not because
+    // this particular code happens to be buffer-less. The assertions did not
+    // change; only the reason they hold did.
     EXPECT_NE(outSuppress.find("warning[D_SuppressRequestIgnored]"),
               std::string::npos)
         << "no D_SuppressRequestIgnored notice reached stderr. stderr was:\n"
@@ -254,7 +262,7 @@ TEST(SuppressRequestIgnored, ProtectedCodeStillLandsInTheReporterAfterTheNotice)
     // The same second half of the contract at the reporter tier, where it can
     // be asserted EXACTLY rather than by substring: full-sequence equality on
     // the emitted codes, in order, plus the error count.
-    auto rep = reporterFor({"dss-code-prime", "--transpile", "probe.c",
+    auto rep = reporterFor({"dsscp", "--transpile", "probe.c",
                             "--language", "c", kTarget, "--suppress=D_PlanNotLanded"});
 
     ASSERT_EQ(codesOf(rep),
@@ -302,7 +310,7 @@ TEST(SuppressRequestIgnored, ProtectedCodeStillLandsInTheReporterAfterTheNotice)
 TEST(SuppressRequestIgnored, AnOrdinarySuppressStillSuppressesAndSaysNothing) {
     // CONTROL — without the flag the ordinary code lands.
     {
-        auto rep = reporterFor({"dss-code-prime", "--transpile", "probe.c",
+        auto rep = reporterFor({"dsscp", "--transpile", "probe.c",
                                 "--language", "c", kTarget});
         ASSERT_TRUE(rep.all().empty())
             << "a run with no --suppress must build a silent reporter";
@@ -312,7 +320,7 @@ TEST(SuppressRequestIgnored, AnOrdinarySuppressStillSuppressesAndSaysNothing) {
     // EFFECT — with the flag it is dropped, and NO notice is produced (the
     // code is not protected, so there is nothing to refuse).
     {
-        auto rep = reporterFor({"dss-code-prime", "--transpile", "probe.c",
+        auto rep = reporterFor({"dsscp", "--transpile", "probe.c",
                                 "--language", "c", kTarget,
                                 "--suppress=P_DeprecatedSyntax"});
         EXPECT_TRUE(rep.all().empty())
@@ -334,7 +342,7 @@ TEST(SuppressRequestIgnored, TheNoticeIsSuppressibleAndPromotable) {
     // `--suppress`. The generation and the policy are separate steps and both
     // have to be right for this to come out empty.
     {
-        auto rep = reporterFor({"dss-code-prime", "--transpile", "probe.c",
+        auto rep = reporterFor({"dsscp", "--transpile", "probe.c",
                                 "--language", "c", kTarget, "--suppress=D_PlanNotLanded",
                                 "--suppress=D_SuppressRequestIgnored"});
         EXPECT_TRUE(rep.all().empty())
@@ -346,7 +354,7 @@ TEST(SuppressRequestIgnored, TheNoticeIsSuppressibleAndPromotable) {
     // standard mechanism, rather than the compiler deciding for them (the
     // measured clang `-Werror,-Wunknown-warning-option` posture).
     {
-        auto rep = reporterFor({"dss-code-prime", "--transpile", "probe.c",
+        auto rep = reporterFor({"dsscp", "--transpile", "probe.c",
                                 "--language", "c", kTarget, "--suppress=D_PlanNotLanded",
                                 "--warnings-as-errors"});
         ASSERT_EQ(rep.all().size(), 1u);
@@ -365,7 +373,7 @@ TEST(SuppressRequestIgnored, EveryRefusedCodeGetsItsOwnNoticeInDeterministicOrde
     // matters because `policy.suppress` is an `unordered_set`: iterating it
     // directly would make this stream vary run to run, which no full-sequence
     // pin could hold and no operator could diff between two builds.
-    auto rep = reporterFor({"dss-code-prime", "--transpile", "probe.c",
+    auto rep = reporterFor({"dsscp", "--transpile", "probe.c",
                             "--language", "c", kTarget,
                             "--suppress=H_VerifierFailure",   // 0xF...
                             "--suppress=D_PlanNotLanded",     // 0xD009
@@ -424,7 +432,7 @@ TEST(SuppressRequestIgnored, PolicyFlagsAreRefusedInModesThatBuildNoReporter) {
     };
     for (auto const& m : kModes) {
         for (auto const* flag : kPolicyFlags) {
-            Argv a{"dss-code-prime", m.mode, "--language", "c-subset",
+            Argv a{"dsscp", m.mode, "--language", "c",
                    "--target=x86_64:elf64-x86_64-linux", flag};
             auto r = parseCliArgs(a.argc(), a.argv());
             ASSERT_FALSE(r.has_value())
@@ -443,7 +451,7 @@ TEST(SuppressRequestIgnored, PolicyFlagsAreRefusedInModesThatBuildNoReporter) {
     // rejects the flags everywhere, which would be a worse defect than the
     // one being fixed.
     for (auto const* flag : kPolicyFlags) {
-        Argv a{"dss-code-prime", "--transpile", "probe.c", "--language", "c",
+        Argv a{"dsscp", "--transpile", "probe.c", "--language", "c",
                "--target=x86_64:elf64-x86_64-linux", flag};
         auto r = parseCliArgs(a.argc(), a.argv());
         EXPECT_TRUE(r.has_value())

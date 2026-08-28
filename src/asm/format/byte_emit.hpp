@@ -18,6 +18,14 @@
 
 namespace dss::asm_byte_emit {
 
+// D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: the 2-byte little-endian writer —
+// the `iw` trailing field of the 16-bit immediate forms. Shape-neutral
+// like every other helper here; a compressed-16-bit ISA reuses it.
+inline void appendU16LE(std::vector<std::uint8_t>& out, std::uint16_t v) noexcept {
+    out.push_back(static_cast<std::uint8_t>(v        & 0xFFu));
+    out.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFFu));
+}
+
 inline void appendU32LE(std::vector<std::uint8_t>& out, std::uint32_t v) noexcept {
     out.push_back(static_cast<std::uint8_t>(v         & 0xFFu));
     out.push_back(static_cast<std::uint8_t>((v >>  8) & 0xFFu));

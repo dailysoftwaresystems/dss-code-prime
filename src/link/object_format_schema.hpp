@@ -70,8 +70,8 @@ namespace dss {
 // work without touching its `#include`s.
 
 // SymbolBinding + SymbolVisibility lifted to `core/types/symbol_attrs.hpp`
-// so MIR-tier producers (the optimizer's DCE pass — D-OPT1-SYMBOL-
-// BINDING-VISIBILITY-THREAD) can consume the vocabulary without a
+// so MIR-tier producers (the optimizer's DCE pass —
+// D-OPT1-SYMBOL-BINDING-VISIBILITY-THREAD) can consume the vocabulary without a
 // layer inversion through the link header. The canonical definitions
 // + name-tables live there; the file-top `#include` re-exports them
 // into the `dss` namespace for every existing link-side consumer. No
@@ -253,8 +253,23 @@ struct DSS_EXPORT RelocationDecodeTable {
 // `__TEXT,__text` = section `__text` in segment `__TEXT`); ELF
 // and PE leave `segment` empty. This split was anchored as plan
 // 14 §3.1 **D-LK3-1** during LK1; closed by LK3.
+// `sectionKindUniqueRow`'s "this kind has no UNIQUE row" marker. A distinct
+// value rather than an erased entry, because erasing would make "declared
+// twice" and "never declared" the same observation, and the diagnostics the
+// two deserve are opposites.
+inline constexpr std::uint16_t kAmbiguousSectionRow = 0xFFFFu;
+
 struct DSS_EXPORT ObjectFormatSectionInfo {
     SectionKind   kind{};            // universal kind enum
+    // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE: the
+    // WIRE ENCODING of this row's contents, for the kinds whose role does not
+    // determine it. `Unspecified` (the absent key) on every row that predates
+    // the axis. A reader that must know the encoding DISPATCHES on this field
+    // and refuses `Unspecified` by name -- it never tests the section's NAME,
+    // which is the format-identity leak this field exists to prevent. See the
+    // `SectionEncoding` docblock in `core/types/section_kind.hpp` for the
+    // measurement that made a second axis necessary.
+    SectionEncoding encoding = SectionEncoding::Unspecified;
     std::string   name;              // section name
                                      //   ELF/PE: ".text" / ".rdata"
                                      //   Mach-O: "__text" / "__data"
@@ -550,8 +565,7 @@ struct DSS_EXPORT MachOIdentity {
                                      //   N_ALT_ENTRY in n_desc) that lets a
                                      //   reader tell a file-local body from
                                      //   an interior label — see
-                                     //   D-LINK-NONEXTERNAL-DEFINED-SYMBOL-
-                                     //   READ-AS-BLOCK-LABEL-NOT-ATOM and
+                                     //   D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM and
                                      //   the rationale in each object
                                      //   format's `macho.$comment`.
 };
@@ -1175,8 +1189,8 @@ struct DSS_EXPORT ObjectFormatData {
     // still applies and is still filtered ONCE downstream.
     std::vector<PredefinedMacroDef> predefinedMacros;
 
-    // ── NOT HERE: bare-`char` signedness (D-TARGET-CHAR-SIGNEDNESS-PER-
-    // PLATFORM) ─────────────────────────────────────────────────────────
+    // ── NOT HERE: bare-`char` signedness (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM)
+    // ─────────────────────────────────────────────────────────
     // The axis is (processor × platform), and it is declared ENTIRELY on the
     // TARGET — one key, `charIsUnsigned`, carrying its own per-object-format
     // overrides (`{"default": …, "byObjectFormat": {…}}`), resolved by
@@ -1194,11 +1208,48 @@ struct DSS_EXPORT ObjectFormatData {
     std::unordered_map<RelocationKind, std::uint16_t> relocationKindIndex;
 
     // Sections row (D-LK4-2). The walker reads sections by
-    // SectionKind; `kind` must be unique across rows so the lookup
-    // is unambiguous. `name`/`type`/`flags`/`addrAlign`/`entrySize`
+    // SectionKind; `name`/`type`/`flags`/`addrAlign`/`entrySize`
     // are format-specific (interpreted by the walker for its format).
     std::vector<ObjectFormatSectionInfo> sections;
-    std::unordered_map<SectionKind, std::uint16_t> sectionKindIndex;
+
+    // ★ THE ROW IDENTITY IS THE (KIND, ENCODING) PAIR, NOT THE KIND.
+    // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE: an
+    // x86_64 Mach-O relocatable carries TWO `unwind` sections in two
+    // encodings, so a kind-keyed index refused the document outright. Both
+    // maps are DERIVED-AT-LOAD from `sections` by `addSectionRow`, which is
+    // their ONE owner -- the same relationship the `runtimeLibraries` note
+    // below describes for its own derived copies.
+    std::unordered_map<SectionKindEncoding, std::uint16_t> sectionKindIndex;
+
+    // kind -> the index of its ONLY row, or `kAmbiguousSectionRow` when the
+    // document declares MORE THAN ONE row of that kind. `sectionByKind` --
+    // which every WRITER uses and which cannot name an encoding -- reads this,
+    // so an ambiguous kind makes it answer "no unique row" instead of silently
+    // picking whichever row loaded first. `validate()` additionally refuses a
+    // multi-row kind that `sectionKindIsEncodingDiscriminated` rejects, so no
+    // kind a writer resolves by kind alone can reach the ambiguous state.
+    std::unordered_map<SectionKind, std::uint16_t> sectionKindUniqueRow;
+
+    // Append `info` as the next section row and maintain BOTH indexes.
+    // Returns false -- appending nothing -- when a row with the same
+    // (kind, encoding) identity is already present; `duplicateOfOut` then
+    // names the index of the row that already holds it.
+    //
+    // ⚠ THE ONE OWNER OF THE INDEX-MAINTENANCE RULE, deliberately. The loader
+    // and the hand-built schemas in `tests/` both go through here, so a test
+    // fixture cannot drift into a `sections`/index disagreement that the
+    // shipped path would never produce.
+    //
+    // ⚠ NO `DSS_EXPORT` ON THIS DECLARATION, and the omission is load-bearing.
+    // `ObjectFormatData` is itself an exported class, so MSVC already exports
+    // every member of it; repeating the macro on a member is error C2487
+    // ("member of dll interface class may not be declared with dll interface")
+    // while GCC and Clang accept it silently. No local leg compiles with MSVC,
+    // so the shape reaches CI as a Windows-only build break — see
+    // [[D-BUILD-EXPORT-MACRO-ON-AN-EXPORTED-CLASS-MEMBER-BREAKS-MSVC]], which
+    // `export_macro_placement_guard` now refuses on every leg.
+    [[nodiscard]] bool addSectionRow(ObjectFormatSectionInfo info,
+                                     std::uint16_t& duplicateOfOut);
 
     // Per-format identity sub-blocks. Each is populated ONLY when
     // `kind` matches; otherwise zero-defaulted. The walker reads
@@ -1510,10 +1561,13 @@ struct DSS_EXPORT ObjectFormatData {
     // (`K_FormatLacksWeakDefinitionDialect`); a walker that never meets one
     // never asks, so the key is not a back-door requirement on every schema.
     //
-    // Declared today by the pe **object** and **staticlib** formats — the two
-    // whose walker arm (the COFF `.obj` writer) consults it. Deliberately NOT
-    // declared by ELF or Mach-O yet: their writers encode `STB_WEAK` /
-    // `N_WEAK_DEF` without asking, and a key nobody reads drifts silently while
+    // Declared by every format whose walker arm CONSULTS it, and by no other:
+    // the pe object + staticlib documents (the COFF `.obj` writer), all ten ELF
+    // documents (`elf::encode`, whose alias pass reaches `stbForBinding` on
+    // every flavor), and the four Mach-O OBJECT/staticlib documents
+    // (`macho::encode`'s MH_OBJECT arm). The Mach-O IMAGE documents, the pe
+    // IMAGE documents, wasm and spirv declare NOTHING, because their walkers
+    // encode no weak definition — a key nobody reads drifts silently while
     // reading as authoritative, which is worse than no key at all
     // ([[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]]).
     std::optional<WeakDefinition> weakDefinition;
@@ -1778,10 +1832,20 @@ public:
     [[nodiscard]] std::size_t
     sectionCount() const noexcept { return d_.sections.size(); }
 
+    // The UNIQUE row of this kind, or null when the document declares NONE --
+    // or (D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE)
+    // more than one, which the kind alone cannot tell apart. `validate()`
+    // guarantees the second case is reachable only for a kind
+    // `sectionKindIsEncodingDiscriminated` accepts, and ✔MEASURED 2026-08-25
+    // that no such kind is asked for here: `SectionKind::Unwind` appears in
+    // the two relocatable-object readers and in no writer.
     [[nodiscard]] ObjectFormatSectionInfo const*
     sectionByKind(SectionKind kind) const noexcept {
-        auto it = d_.sectionKindIndex.find(kind);
-        if (it == d_.sectionKindIndex.end()) return nullptr;
+        auto it = d_.sectionKindUniqueRow.find(kind);
+        if (it == d_.sectionKindUniqueRow.end()
+            || it->second == kAmbiguousSectionRow) {
+            return nullptr;
+        }
         return &d_.sections[it->second];
     }
 
@@ -1819,6 +1883,29 @@ public:
     // own `isImageFlavor()`. Null backend ⇒ false (fail-closed).
     [[nodiscard]] bool isImageFlavor() const noexcept {
         return d_.backend != nullptr && d_.backend->isImageFlavor(d_);
+    }
+
+    // Do these RAW BYTES look like a relocatable object file THIS format
+    // could have written? The public face of the backends'
+    // `looksLikeRelocatableObject()`: a caller holding a file named as a
+    // compile input asks it, and routes a `true` to the LINKER instead of to
+    // the tokenizer, which reports an object's first magic byte as `illegal
+    // character 0x7f` as though the author had typed it.
+    //
+    // ★ ABOUT THE INPUT, NOT ABOUT THIS SCHEMA'S OWN FLAVOR — see the
+    // interface comment on `ObjectFormatBackend::looksLikeRelocatableObject`.
+    // An image-flavored schema still recognizes the relocatable objects of
+    // its own family, which is the whole case that matters: the driver holds
+    // the format it is PRODUCING while it classifies the inputs.
+    //
+    // Null backend ⇒ false, the fail-closed shape of `isImageFlavor()`
+    // directly above: a document that resolved to no backend recognizes
+    // nothing, so the file falls through to the ordinary unknown-input path
+    // rather than to a linker that has no format to read it with.
+    [[nodiscard]] bool looksLikeRelocatableObject(
+            std::span<std::uint8_t const> bytes) const noexcept {
+        return d_.backend != nullptr
+            && d_.backend->looksLikeRelocatableObject(d_, bytes);
     }
 
     // Cross-format EXEC-flavor predicate. True iff the schema

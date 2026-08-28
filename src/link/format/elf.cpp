@@ -12,6 +12,7 @@
 #include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/object_symbol_names.hpp"
 #include "link/format/string_table.hpp"
+#include "link/format/weak_definition_gate.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -135,8 +136,8 @@ constexpr std::uint32_t PF_R = 4;
 // SHF_WRITE→PF_W, SHF_EXECINSTR→PF_X. A PT_LOAD covering several
 // sections takes the OR of its members' mapped flags. This replaces
 // the previously-hardcoded `p_flags = 5` for the single .text PT_LOAD
-// with a derivation from the actual sections' sh_flags (D-LK1-ELF-
-// EXEC-DATA-SECTIONS, plan-lock MF-5): .text(6→R+X=5) | .rodata(2→R=4)
+// with a derivation from the actual sections' sh_flags
+// (D-LK1-ELF-EXEC-DATA-SECTIONS, plan-lock MF-5): .text(6→R+X=5) | .rodata(2→R=4)
 // = 5, so the static-exec byte output is unchanged when no rodata is
 // present, and stays R+X (5) once SHF_ALLOC-only rodata folds in.
 [[nodiscard]] constexpr std::uint32_t
@@ -1704,8 +1705,8 @@ encodeElfExecDynamic(
     std::uint64_t const ptLoad1End = ehFrameHdrOff + ehFrameHdrSz;
 
     // PT_LOAD #2 (R+W) — page-aligned in both file + VA. Holds the WRITABLE
-    // sections: `.data` (file-backed, mutable initialized globals — D-LK4-
-    // DATA-PRODUCER) first, then .got + .dynamic (the dynamic-linker
+    // sections: `.data` (file-backed, mutable initialized globals —
+    // D-LK4-DATA-PRODUCER) first, then .got + .dynamic (the dynamic-linker
     // writables), then `.bss` (zero-fill — memsz only, NO file bytes) LAST.
     // Keeping mutable globals OUT of PT_LOAD #1 (R+X) preserves W^X. Within
     // the segment file offset and VA advance in lock-step (delta constant);
@@ -2089,8 +2090,8 @@ encodeElfExecDynamic(
     // the SHT entry below is what's gated on `hasRodataDyn`.
     auto const shsRodata   = shstrtab.add(
         secRodataDyn != nullptr ? std::string{secRodataDyn->name} : std::string{".rodata"});
-    // `.data` / `.bss` names from the schema rows when present (D-LK4-DATA-
-    // PRODUCER) — added unconditionally (a few unused bytes when absent); the
+    // `.data` / `.bss` names from the schema rows when present (D-LK4-DATA-PRODUCER)
+    // — added unconditionally (a few unused bytes when absent); the
     // SHT entries below are gated on hasDataDyn / hasBssDyn.
     auto const shsData     = shstrtab.add(
         secDataDyn != nullptr ? std::string{secDataDyn->name} : std::string{".data"});
@@ -2712,8 +2713,8 @@ encodeElfExecDynamic(
     // template bytes at the segment head — they must be mapped for the
     // loader to copy them per-thread); p_memsz additionally covers `.bss`
     // (zero-fill, no file bytes) so the loader reserves + zeroes the bss
-    // span at load. `.tbss` contributes to NEITHER (D-CSUBSET-THREAD-
-    // LOCAL: the per-thread copies live in loader-allocated TLS blocks
+    // span at load. `.tbss` contributes to NEITHER (D-CSUBSET-THREAD-LOCAL:
+    // the per-thread copies live in loader-allocated TLS blocks
     // sized by PT_TLS p_memsz, not in this segment). D-LK4-DATA-PRODUCER.
     appendPhdrEntry(PT_LOAD,    PF_W | PF_R, ptLoad2Start, ptLoad2VaStart,
                     ptLoad2FileSize, ptLoad2MemSize, pageAlign);
@@ -2768,8 +2769,8 @@ encodeElfExecDynamic(
         padToOffset(bytes, ehFrameHdrOff); appendBytes(bytes, ehFrameHdr);
     }
     padToOffset(bytes, ptLoad2Start);                                // PT_LOAD #2 boundary
-    // `.tdata` (thread-local template) opens PT_LOAD #2 (D-CSUBSET-THREAD-
-    // LOCAL) — its (possibly reloc-patched) bytes precede `.data`'s.
+    // `.tdata` (thread-local template) opens PT_LOAD #2 (D-CSUBSET-THREAD-LOCAL)
+    // — its (possibly reloc-patched) bytes precede `.data`'s.
     // `.tbss` emits NO file bytes (zero-fill template extent).
     if (hasTdataDyn) { padToOffset(bytes, tdataOff); appendBytes(bytes, tdataDynLayout.bytes); }
     // `.data` (mutable initialized globals) follows.
@@ -3058,6 +3059,47 @@ encode(AssembledModule const&    module,
                  + ")");
         return {};
     }
+
+    // ── D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS ──
+    //    ASK THE CONFIG BEFORE SPELLING A WEAK DEFINITION.
+    //
+    // `stbForBinding` maps `SymbolBinding::Weak` to STB_WEAK — the ELF spelling
+    // of a weak definition, and the `symbol-binding` dialect. Until this gate
+    // landed it did so UNCONDITIONALLY, i.e. this walker decided a per-FORMAT
+    // fact for itself while the config key that owns that fact sat unread on
+    // two pe documents. A key the writer does not read drifts silently while
+    // reading as authoritative, which is the defect
+    // [[D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED]] exists to prevent — so
+    // the declaration and this consultation land together, never one first.
+    //
+    // ★ ONE CALL COVERS EVERY ELF FLAVOR, because it sits at `encode()` — the
+    // single entry every flavor passes through — and NOT because every flavor
+    // funnels through one binding helper. The ET_DYN route below and the
+    // ET_REL/ET_EXEC fall-through therefore share this gate rather than
+    // carrying a copy each — a gate that refuses in one arm and shrugs in
+    // another is a silent downgrade wearing a fixed bug's clothes.
+    //
+    // ⚠ THIS COMMENT PREVIOUSLY GAVE THE WRONG REASON, and the P28 step-10
+    // audit caught it: it said *"every flavor reaches `stbForBinding` through
+    // the alias pass"*. ✔MEASURED FALSE — `encodeElfExecDynamic`'s `.dynsym`
+    // export loop open-codes `binding == Weak ? STB_WEAK : STB_GLOBAL` and
+    // never calls `stbForBinding` at all. Coverage was complete anyway, by
+    // position rather than by the stated mechanism.
+    // ★ That second open-coded ternary is precisely the hazard
+    // `weak_definition_gate.hpp` cites as its own justification, so the
+    // sentence was recommending the shape it exists to eliminate. Keep the
+    // gate where it is; do not move it into a helper on the strength of a
+    // funnel that does not exist.
+    //
+    // ★ SCAN FIRST, ASK SECOND: `requireWeakDefinitionDialect` only asks the
+    // schema when the module actually carries a weak definition, so an ELF
+    // document that never meets one is not forced to answer.
+    if (!link::format::requireWeakDefinitionDialect(
+            module, fmt, WeakDefinitionDialect::SymbolBinding, "elf::encode",
+            reporter)) {
+        return {};
+    }
+
     // c150 + c151 (D-LK1-4): ET_DYN routes to the dynamic-image
     // walker UNCONDITIONALLY — both sub-shapes need `.dynamic` /
     // `.dynsym` / `.hash` even with zero extern imports (a `.so` for
@@ -3214,7 +3256,7 @@ encode(AssembledModule const&    module,
     // walker emits a loadable `.rodata` section when the module
     // carries any `AssembledData` item with `section ==
     // DataSectionKind::Rodata`. Mirrors the PE walker's `.rdata` arm
-    // (pe.cpp:655-714) precisely: per-item bytes are placed at the
+    // (the `.rdata` build in `pe.cpp`) precisely: per-item bytes are placed at the
     // item's `Alignment` (padding zero-filled); the section's VA is
     // computed contiguously after `.text`. This rodata is folded
     // into the SAME R+X `.text` PT_LOAD (SHF_ALLOC only — strictly
@@ -3538,8 +3580,8 @@ encode(AssembledModule const&    module,
             ? secText->virtualAddress + alignUp(text.size(), rodataAlign)
             : 0;
 
-    // Writable data segment (R+W PT_LOAD #2) for `.data` + `.bss` — D-LK4-
-    // DATA-PRODUCER. Kept in a SEPARATE page-aligned segment from the R+X
+    // Writable data segment (R+W PT_LOAD #2) for `.data` + `.bss` —
+    // D-LK4-DATA-PRODUCER. Kept in a SEPARATE page-aligned segment from the R+X
     // text/rodata so mutable globals never share a page with executable code
     // (W^X). The segment starts one page above the end of the read-only
     // sections' VA span; `.data` (file-backed) first, then `.bss` (zero-fill,
@@ -3810,8 +3852,9 @@ encode(AssembledModule const&    module,
     // `ObjectSymbolNames::definedBinding` (coupled to the NAME from
     // `definedName`: a `sym_<id>`-named static/synthesized def is Local, a
     // real-named def keeps its Global/Weak binding), mapped to STB_* by the
-    // format-neutral `stbForBinding` — D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-
-    // FOREIGN-COLLISION (TF-C54). Pre-TF-C54 every defined symbol was hardcoded
+    // format-neutral `stbForBinding` —
+    // D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION
+    // (TF-C54). Pre-TF-C54 every defined symbol was hardcoded
     // STB_GLOBAL, so a static `sym_<id>` collided across TUs at a FOREIGN
     // multi-TU link (`ld: multiple definition`); DSS's own linker keys by
     // (cuId,SymbolId) and was unaffected.
@@ -3874,8 +3917,8 @@ encode(AssembledModule const&    module,
     //     the genuinely nameless — here the linker-injected entry trampoline.
     //   * RELOCATABLE `.o` → `definedName`: externally-visible names only, since
     //     these names ARE a foreign linker's resolution keys and a real-named
-    //     static would collide across TUs (D-LK-INTERNAL-LINKAGE-FN-EMITTED-
-    //     GLOBAL-FOREIGN-COLLISION).
+    //     static would collide across TUs
+    //     (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION).
     // `isExec` is an artifact-KIND question answered by the loaded schema
     // (`id.objectType`), not a format/target/language identity test.
     auto emitFuncSym = [&](FuncSymRecord const& f) {
@@ -3897,8 +3940,8 @@ encode(AssembledModule const&    module,
     };
 
     // Emit the defined DATA symbols of ONE binding class (`wantLocal` selects
-    // Local vs non-Local) for ONE section — ET_REL only (D-LK-OBJECT-DATA-
-    // SECTION-RELOCATABLE). A global lands in `.rodata`/`.data`/`.bss`; its
+    // Local vs non-Local) for ONE section — ET_REL only
+    // (D-LK-OBJECT-DATA-SECTION-RELOCATABLE). A global lands in `.rodata`/`.data`/`.bss`; its
     // symtab entry names the section (st_shndx) + section-relative offset
     // (st_value) + size the FINAL linker binds, so a `.text`→global reloc
     // resolves to a DEFINED symbol rather than being misclassified as an
@@ -4359,8 +4402,8 @@ encode(AssembledModule const&    module,
 
     // Section indices — IDX_TEXT==1 is pinned (the STT_SECTION sym
     // emitted above hardcodes st_shndx=1). Other indices depend on which
-    // optional sections are present. Since D-LK-OBJECT-DATA-SECTION-
-    // RELOCATABLE, data sections appear on BOTH forms (ET_REL now carries
+    // optional sections are present. Since D-LK-OBJECT-DATA-SECTION-RELOCATABLE,
+    // data sections appear on BOTH forms (ET_REL now carries
     // data + `.rela.text` together):
     //   ET_REL (no data):     Null(0), Text(1), Rela(2), Symtab(3), Strtab(4), ShStrtab(5)[, Note(6)].
     //   ET_REL (+ .data):     Null(0), Text(1), Data(2), Rela(3), Symtab(4), Strtab(5), ShStrtab(6)[, Note(7)].
@@ -4609,8 +4652,8 @@ encode(AssembledModule const&    module,
     std::uint64_t const pageAlign = fmt.elf().pageAlign;
     if (isExec) padTo(bytes, pageAlign);
     layoutSection(hText, text);
-    // `.rodata` immediately after `.text` (D-LK1-ELF-EXEC-DATA-
-    // SECTIONS). The on-disk rodata-from-text delta MUST equal the
+    // `.rodata` immediately after `.text` (D-LK1-ELF-EXEC-DATA-SECTIONS).
+    // The on-disk rodata-from-text delta MUST equal the
     // VA rodata-from-text delta so the single PT_LOAD's file<->mem
     // mapping is congruent: hText.offset is page-aligned (already
     // rodataAlign-aligned since rodataAlign | pageAlign for the

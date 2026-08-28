@@ -30,17 +30,33 @@
 // dispatch via `readAr`, which PROJECTS the armap to `ImportSurface`
 // rows (the linker-facing export surface -- see readAr's contract).
 //
-// Variant scope: the GNU / System V armap (a big-endian `u32` count +
-// `u32` member-header offsets + a NUL-terminated name blob) is the
-// PRIMARY, fully-supported form -- it is what `ar rcs` produces on Linux
-// and the first linker member of a Windows COFF `.lib`. GNU long member
-// names (a "//" string table + "/N" back-references) are resolved fully.
-// The BSD variant (a "__.SYMDEF" armap + "#1/N" inline-length names) and
-// the GNU 64-bit "/SYM64/" armap (>4 GiB archives) are DETECTED and
-// fail loud cleanly (anchor D-FF1-AR-BSD-VARIANT) rather than silently
-// misparsed. Every field is bounds-checked against the untrusted bytes;
-// structural corruption fails loud `CorruptedBinary`, mirroring the
-// c159 PE / c160 Mach-O readers' discipline.
+// Variant scope: BOTH mainstream archive variants are parsed, and the
+// variant is decided by THE BYTES (which special members the archive
+// carries), never by the host doing the reading -- this compiler builds
+// any target inside any host, so a Darwin archive must read identically
+// on Windows and a Linux archive identically on a Mac.
+//   * GNU / System V: a big-endian `u32` count + `u32` member-header
+//     offsets + a NUL-terminated name blob, in a "/" member; long member
+//     names via a "//" string table + "/N" back-references. What
+//     `ar rcs` produces on Linux, and the first linker member of a
+//     Windows COFF `.lib`.
+//   * BSD (anchor D-FF1-AR-BSD-VARIANT): a "__.SYMDEF" / "__.SYMDEF
+//     SORTED" member carrying a LITTLE-endian ranlib array of
+//     `(strx, offset)` pairs plus a trailing string table; long member
+//     names inline as "#1/N", where the first N bytes of the member DATA
+//     are the name (so the member's logical payload starts N bytes in
+//     and is N bytes shorter -- `dataOffset`/`size` below are already
+//     adjusted, so a consumer's `bytes.subspan(dataOffset, size)` yields
+//     the object and nothing else). What `ar` produces on macOS and what
+//     `llvm-ar --format=bsd|darwin` produces anywhere.
+// Still refused, LOUDLY and BY NAME: the 64-bit symbol tables
+// ("/SYM64/", "__.SYMDEF_64", "__.SYMDEF SORTED_64") for >4 GiB
+// archives, and any unrecognised "__.SYMDEF*" dialect -- an unexercised
+// parse arm would be a speculative build, and a shape this reader cannot
+// decode must refuse rather than fall through to a best-effort parse.
+// Every field is bounds-checked against the untrusted bytes; structural
+// corruption fails loud `CorruptedBinary`, mirroring the c159 PE / c160
+// Mach-O readers' discipline.
 
 namespace dss::ffi {
 
@@ -73,11 +89,14 @@ struct DSS_EXPORT ArArchive {
     std::string           archivePath;
 };
 
-// Parse a GNU / System V `ar` archive into its member list + armap.
-// Fails loud `CorruptedBinary` on any malformed shape (bad magic,
+// Parse a GNU / System V OR BSD `ar` archive into its member list +
+// armap. Fails loud `CorruptedBinary` on any malformed shape (bad magic,
 // member header past EOF, non-numeric size field, a "/N" long-name
 // offset past the "//" table, an armap count/offset out of range, an
-// armap offset that matches no member header). An archive with members
+// armap offset that matches no member header, a "#1/N" inline name
+// longer than its own member, a BSD ranlib array whose byte count is not
+// a multiple of 8, a BSD string-table index past the table, or an
+// archive carrying both armap shapes at once). An archive with members
 // but no armap parses successfully with an empty `symbols` vector (a
 // valid, if not-linker-indexable, archive).
 [[nodiscard]] DSS_EXPORT

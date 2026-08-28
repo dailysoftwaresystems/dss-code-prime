@@ -1,0 +1,15 @@
+{
+  "$comment": "D-CSUBSET-VLA-PTR-INIT-FORM-TYPING (CLOSED in P34) -- the NATURAL init form `int (*p)[n] = b;` compiles and strides correctly on every leg and in both pipeline arms. It was a deferral for a year, failing loud S_TypeMismatch, and its sibling `examples/c/c99_vla_ptr` had to witness the capability through the ASSIGNMENT form instead. The recorded root cause blamed the Pass-2 initializer stamp and a fix aimed there proved INERT; the real blocker was on the DECLARATOR side and closed as a side effect of D-CSUBSET-VLA-INITIALIZER (the flexible-array flag tested above the VLA arm built Ptr<incompleteArray<int>> instead of Ptr<vlaArray<int>>, so the decay compare could never match and the stride-freeze gate never fired). The OFF-DIAGONAL is the whole test: with a RUNTIME n == 3, `p[1][0]` must be 20, never 11 (a stride of one ELEMENT) and never 21 (a transposed read); returns 1..6 are strict in-program pins that name which read went wrong. A matched assignment-form control must agree cell for cell, and a write THROUGH p must land in b. MEASURED 2026-08-25 against gcc 13.3.0 and clang 19.1.1: both exit 42. The arm64 leg proves the runtime-stride math on the non-host target; the `release` arm proves the stride Loads survive the full optimizer rather than folding to a constant.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

@@ -78,8 +78,8 @@ std::uint16_t op(std::string_view mnemonic) {
 // input pinned to one register, an output in another, a third destroyed.
 // Register NAMES only — `regConstraintPoolAdd` derives the ordinals.
 //
-// ⚠ THE CALLER MUST KEEP `outputs ⊆ clobbered` (D-LIR-PER-INSTRUCTION-
-// OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED): the builder now rejects an
+// ⚠ THE CALLER MUST KEEP `outputs ⊆ clobbered`
+// (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED): the builder now rejects an
 // output that is not also clobbered, so `out` must name a register the
 // `clobber` list covers. The helper does NOT silently repair it — a
 // fixture that quietly satisfied the rule its subject enforces would
@@ -866,7 +866,7 @@ TEST(LirPassUtil, LiteralPoolStillSurvivesEachRebuildPassAfterTheRename) {
 // function that genuinely carries a wide literal through regalloc,
 // rewrite and callconv can.
 TEST(LirPassUtil, RealPipelineRebuildsPreserveEverySideStructureReference) {
-    auto lowered = test_support::lowerCSubsetToLir(
+    auto lowered = test_support::lowerCToLir(
         "long long f(long long x) { return x + 0x1122334455667788LL; }");
     ASSERT_TRUE(lowered.lir.ok);
     Lir const& src = lowered.lir.lir;

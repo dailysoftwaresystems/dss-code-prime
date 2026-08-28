@@ -380,13 +380,77 @@ public:
     // but the SHARED dispatch `lir_pass_util::emitTerminator` returns a
     // bool (it routes to one of five builder entrypoints), so its callers
     // otherwise have no handle on what it just emitted. Aborts if nothing
-    // has been appended yet.
+    // has been appended yet -- ask `hasAnyInst()` first when that is possible.
     [[nodiscard]] LirInstId lastInst() const;
+
+    // Whether ANY instruction has been appended yet.
+    //
+    // ★★★ THIS EXISTS BECAUSE ITS ABSENCE WAS A CRASH. A caller
+    // that needs "the id `addInst` will mint next" has to distinguish the
+    // empty module, and with no query to ask, `mir_to_lir` MIRRORED the arena
+    // in a `bool` it maintained itself. The assembly engine emits straight
+    // into the builder and bypassed the site that set the mirror, so the asm
+    // path re-derived it from the SHAPE OF THE INPUT (did the template carry
+    // a line?) rather than from what was emitted -- and a template that
+    // carries a line but emits nothing (a comment, a bare newline,
+    // whitespace) set the flag over an EMPTY arena. `lastInst()` then aborted
+    // with no diagnostic code and no source position, on source gcc compiles.
+    // ⇒ STATE THAT MIRRORS THE ARENA IS STATE THAT CAN DISAGREE WITH IT.
+    // `lastInst()` is defined in terms of this predicate, so "is it safe to
+    // call `lastInst()`" and `lastInst()`'s own refusal cannot drift apart.
+    [[nodiscard]] bool hasAnyInst() const noexcept;
+
+    // ★★★ THE DIAGNOSED-REFUSAL POISON — D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE.
+    //
+    // Five passes rebuild a module into a fresh builder, and every one of
+    // them emits its terminators through ONE shared dispatch
+    // (`lir_pass_util::emitTerminator`). When that dispatch REFUSES it
+    // appends nothing — so the block the pass opened ends without a
+    // terminator and this builder becomes a loaded gun: the next
+    // `beginBlock` fatals on "current block has no terminator", and
+    // `addFunction`/`finish()` fatal inside `closeFunction_`. The refusal
+    // has ALREADY been reported as a diagnostic by then, so the abort adds
+    // nothing except a process kill naming the BUILDER, from a pass that
+    // looked like it reported nothing.
+    //
+    // ⚠⚠ EVERY CALLER CHECKING THE `bool` IS NOT ENOUGH, AND THAT IS THE
+    // ENTIRE REASON THIS LIVES HERE RATHER THAN IN THE CALLERS.
+    // `[[nodiscard]]` on the dispatch catches a caller that DISCARDS the
+    // result; it cannot see a caller that READS it and keeps driving the
+    // builder anyway. `if (!emit(...)) { failed = true; }` with no bail
+    // compiles clean, satisfies `[[nodiscard]]`, passes review, reports
+    // SUCCESS — and aborts. That is verbatim the shape the anchor above
+    // records, and no attribute, warning or lint can see it. So the safety
+    // is moved OUT of the five callers, where it is one forgotten `return`
+    // away from a process kill, and INTO the builder, where forgetting it
+    // is not expressible: a poisoned builder does not abort, it yields an
+    // EMPTY module.
+    //
+    // ★ EMPTY IS THE CORRECT OUTPUT, NOT A LENIENT ONE. Every rebuild pass
+    // decides success by comparing the rebuilt function count against the
+    // count it started with, so an empty module fails that clause on its
+    // own — and the diagnostic the dispatch already emitted is what says
+    // WHY. Fail-loud is preserved in full; only the process kill is
+    // removed. ⚠ It is deliberately NOT a quiet success: a pass whose
+    // input was genuinely an empty module never reaches a terminator emit,
+    // so poison and "valid empty TU" cannot be confused.
+    //
+    // ⚠ ONE SETTER, NO CLEARING COUNTERPART. Poison is terminal by
+    // definition — a builder whose open block lost its terminator can never
+    // produce a valid module again — and an `unpoison()` would hand a
+    // caller exactly the half-built module this closes. Same discipline as
+    // `orInstFlags`, which likewise offers no unset.
+    void poison() noexcept;
+
+    // Whether a diagnosed refusal has abandoned this builder.
+    [[nodiscard]] bool poisoned() const noexcept { return poisoned_; }
 
     // Consume the builder, returning the frozen Lir module. Aborts
     // on any contract violation (open function with no terminated
     // block; created-but-never-opened block; etc.) — same discipline
-    // as `MirBuilder::finish()`.
+    // as `MirBuilder::finish()`. ⚠ EXCEPT when `poisoned()`: the one
+    // contract violation that has already been REPORTED yields an empty
+    // module instead of a process kill (see `poison()` above).
     [[nodiscard]] Lir finish() &&;
 
 private:
@@ -404,6 +468,11 @@ private:
     std::vector<LirBlockId> succPool_;
     LirLiteralPool          literalPool_;
     LirRegConstraintPool    regConstraintPool_;
+
+    // MODULE-wide, and deliberately NOT in the per-function block below: a
+    // refusal abandons the whole rebuild, not one function, so `addFunction`
+    // must never clear it. See `poison()`.
+    bool                    poisoned_ = false;
 
     // Per-function state, reset by `addFunction`.
     LirFuncId  openFunc_{};

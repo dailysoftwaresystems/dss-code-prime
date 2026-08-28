@@ -1,0 +1,35 @@
+{
+  "$comment": "D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: the runnable end-to-end witness for a population count realized as a DECLARED INSTRUCTION SEQUENCE (D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE) instead of one instruction — preprocess -> parse -> lower -> codegen -> LINK -> spawn -> exit code, on every shipped (architecture x object-format) leg. WHAT IT COVERS THAT `builtin_bitcount` DOES NOT: that example's arm64 arm witnessed the SWAR fallback and its inputs were chosen to discriminate WIDTH and to tell clz from ctz; a lane-based popcount has a different failure set, and inputs that catch a width bug do not catch a missing horizontal reduction. Each value here kills one specific way the sequence can go wrong: A = 0xFF00000000000000 has every set bit in the HIGHEST byte so lane 0 counts zero (a dropped reduction reads 0 instead of 8); B = 0x0102040810204080 puts one bit in each of the eight lanes so the answer is right only if all eight are summed; C = all-ones is the reduction's maximum, 64, which is what a byte-wide reduction target must hold without saturating; D = 0xFFFFFFFF00000000 answers 0 if the 64-bit count runs at 32 bits; E = 0xFFFFFFFF at the NARROW width exceeds 32 if the four lanes above the value are not zeroed by the entry move. exit = 8+8+64+32+32+1+16+1 = 162, HAND-DERIVED from the values, not read off DSS. ★ THE CROSS-TARGET AGREEMENT IS THE ASSERTION: x86-64 answers with one POPCNT and arm64 with `fmov`/`cnt`/`addv`/`fmov`, and the source names neither — the differential between the two realizations is what a single-target run cannot give. ✔MEASURED 2026-08-26 before this example was written: the four-instruction sequence was first proven in hand-written assembly under qemu-aarch64 with the destination register PRE-DIRTIED to all-ones (`movi v0.16b, #0xFF`), so the upper-lane zeroing that leg E depends on is observed rather than assumed; and the six encoding words were verified against aarch64-linux-gnu-as after a hand-conversion error put FCVTAU where FMOV belonged and killed the program with SIGILL. FOLD-RESISTANCE: each count runs behind a wrapper fn taking the value as an ARG, so the baseline pipeline's ConstFold never sees a literal, and Popcount is deliberately not in ConstFold's fold set — so the `release` arm inlines the wrappers and the ops stay LIVE, witnessing the sequence through the full optimizer as well. RED-ON-DISABLE: removing the `popcount` opcode row from arm64.target.json returns the arm64 legs to the SWAR and this example still exits 162 (the SWAR is correct — this is a PERFORMANCE row, not a correctness one), so the falsifiability that matters is the LOWERING pins in tests/lir/test_mir_to_lir.cpp and the byte pins in tests/asm/test_asm_arm64.cpp, which go red on that removal; what THIS example falsifies is a sequence that is wrong at runtime, which no unit pin observes.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 162,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

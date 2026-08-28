@@ -140,6 +140,12 @@ public:
     [[nodiscard]] std::uint32_t constLiteralIndex(MirInstId id) const; // Const
     [[nodiscard]] SymbolId      globalAddrSymbol(MirInstId id) const;  // GlobalAddr
     [[nodiscard]] MirBlockId    blockAddressTarget(MirInstId id) const;// BlockAddress
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED — BlockAddressExport: the
+    // synthetic per-block SymbolId a static-data relocation names. Its EXPORTED
+    // BLOCK is `blockAddressTarget(instOperands(id)[0])`, deliberately reached
+    // through the operand rather than stored here (see the opcode's docblock: a
+    // block id parked outside the instruction graph goes stale across a rebuild).
+    [[nodiscard]] SymbolId      blockAddressExportSymbol(MirInstId id) const;
     [[nodiscard]] std::uint32_t intrinsicId(MirInstId id) const;       // IntrinsicCall
     [[nodiscard]] std::uint32_t returnPieceOrdinal(MirInstId id) const;// ReturnPiece — per-class index
     // ReturnPiece — WHICH per-class pool `returnPieceOrdinal` indexes. Carried
@@ -559,6 +565,12 @@ public:
     // value (`type` = a pointer). `target` may be a forward block reference.
     MirInstId addBlockAddress(MirBlockId target, TypeId type,
                               MirInstFlags flags = MirInstFlags::None);
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: publish `blockAddr`'s
+    // block under the synthetic local symbol `blockSymbol`, so a static-storage
+    // initializer's `MirSymbolAddrValue{blockSymbol}` relocation resolves to the
+    // block's interior VA. `blockAddr` must be a `BlockAddress` instruction.
+    MirInstId addBlockAddressExport(MirInstId blockAddr, SymbolId blockSymbol,
+                                    MirInstFlags flags = MirInstFlags::None);
     // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS) + inline-asm P5: the k-th result
     // piece of a multi-result `producer` — a struct-returning `call` (piece 0 is
     // the call's own result, so pieces are ≥1) or an `InlineAsm` / `InlineAsmGoto`
@@ -699,7 +711,7 @@ public:
         // fall-through edge, which only a hand-built result can manage.
         //
         // ⓘ DEFINED INLINE ON PURPOSE, not for speed. ✔DOCUMENTED from the build
-        // files: `dss-code-prime-lib` is SHARED and `CMAKE_CXX_VISIBILITY_PRESET`
+        // files: `dsscp-lib` is SHARED and `CMAKE_CXX_VISIBILITY_PRESET`
         // is `hidden`, so only `DSS_EXPORT` symbols cross the boundary — and a
         // NESTED type's members are not covered by the enclosing class's export
         // attribute. An out-of-line definition here would therefore have to be

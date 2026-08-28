@@ -3,6 +3,8 @@
 #include "core/export.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
+#include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -27,9 +29,76 @@ namespace dss {
 // empty — `kUnsuppressableEntriesAllExplainThemselves` in the .cpp is a
 // consteval check, so a member added without a reason is a BUILD failure,
 // not a blank line in somebody's terminal.
+// ★★★ D-DIAG-UNSUPPRESSABLE-FAMILY-UNDECIDED — WHICH PRONG ADMITTED THIS CODE.
+//
+// The membership rule in `unsuppressable_codes.cpp` has always had two prongs.
+// ✔MEASURED 2026-08-26 over the shipped table: all 83 distinct `why` sentences
+// classify cleanly under it (75 prong (1), 7 prong (2), 1 genuinely both), so
+// the rule is TOTAL over its own table and never needed replacing. But only
+// **19 of 166** members were admitted under text that CITED a prong.
+//
+// ★ THAT GAP IS THE WHOLE DEFECT, AND IT IS NOT THE ONE THE ROW NAMED. The row
+// was filed as "the family is UNDECIDED and needs one considered decision".
+// The decision existed and was written down. It was simply never RUN against
+// the members — and **a written rule that is never applied looks exactly like a
+// missing rule**, because both produce a membership nobody can audit. Two
+// consecutive cycles making opposite local calls (TF-C86 added a preprocessor
+// code, TF-C87 declined to) was read at the time as evidence of a missing
+// policy; it was really evidence of an unapplied one.
+//
+// ⇒ The prong is now a FIELD, not a comment. Same move, for the same reason,
+// that `why` was promoted from comment to data one paragraph down: a comment
+// can be omitted and nothing notices, whereas an aggregate member cannot be
+// left out without the build saying so. Adding a member now forces the author
+// to answer "under which prong?" before the file compiles.
+enum class MembershipProng : std::uint8_t {
+    // Prong (1) — WRONG ARTIFACT SHIPS GREEN. Suppressing it lets a
+    // miscompile / wrong-bytes / undefined-extern artifact ship with a
+    // successful-looking build. The majority of the table.
+    WrongArtifactShipsGreen = 1,
+    // Prong (2) — THE BUILD FAILS WITH NOTHING SAID. No wrong bytes ship (the
+    // build still fails), but this diagnostic is the ONLY statement of why, so
+    // suppressing it leaves a non-zero exit with an empty explanation.
+    // ⚠ Narrow BY DESIGN, and the narrowness is what keeps it honest: it
+    // requires that the failure STILL HAPPENS. A code whose suppression merely
+    // hides advice while the build proceeds fails both prongs and must stay
+    // suppressable.
+    BuildFailsWithNothingSaid = 2,
+    // Both prongs, on different branches of the same code's behaviour. Rare
+    // and REAL — not a hedge for a verdict nobody wanted to make. The one
+    // shipped instance is `H_ConflictingStringLiteralPrefixes`, whose two
+    // outcomes genuinely differ: a mixed-prefix concatenation either fails the
+    // build with nothing shown (prong 2) or is typed as a plain narrow array
+    // (prong 1).
+    Both = 3,
+};
+
+// One membership ARGUMENT: the prong it turns on, and the user-visible sentence
+// that states it. ★ The unit is the ARGUMENT, not the member — ✔MEASURED, 166
+// members share only 83 of these, because a band-wide invariant is one argument
+// admitting fourteen codes. Keying the verdict here rather than on the entry
+// means a new member reusing an existing reason inherits that reason's prong,
+// which is correct: it is the same argument.
+struct MembershipReason {
+    MembershipProng  prong;
+    std::string_view text;
+};
+
 struct UnsuppressableEntry {
     DiagnosticCode   code;
-    std::string_view why;
+    MembershipReason reason;
+
+    // `why`/`prong` stay readable as before. Accessors rather than fields so
+    // the 166 entry initializers keep their two-element `{code, kWhyFoo}`
+    // shape — the verdict lands on the 83 reasons without touching a single
+    // entry line, which is what keeps this diff reviewable and keeps a
+    // concurrent append from being eaten by a wholesale rewrite.
+    [[nodiscard]] constexpr std::string_view why() const noexcept {
+        return reason.text;
+    }
+    [[nodiscard]] constexpr MembershipProng prong() const noexcept {
+        return reason.prong;
+    }
 };
 
 // D-FF2-UNSUPP: closed-table of DiagnosticCodes whose emission MUST reach the
@@ -126,8 +195,8 @@ struct UnsuppressableEntry {
 //     callee/arg-setup collision backstop), L_StackPassedArgUnsupported,
 //     L_CcRegLookupFailed, L_VlaDynamicAllocaUnsupported,
 //     L_VlaNonLeafFrameUnsupported,
-//     L_TerminatorSuccessorMismatch (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-
-//     DROPPED — the terminator's recorded successors and its own BlockRef
+//     L_TerminatorSuccessorMismatch (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED
+//     — the terminator's recorded successors and its own BlockRef
 //     operands disagree),
 //     L_SideStructureIndexDangling, L_SideStructurePoolShrank,
 //     L_SideStructureReferenceLost (D-LIR-PER-INST-REG-CONSTRAINTS — the
@@ -273,5 +342,12 @@ unsuppressableCodes() noexcept;
 // unreachable there by construction.
 [[nodiscard]] DSS_EXPORT std::string_view
 unsuppressableRationale(DiagnosticCode code) noexcept;
+
+// Which prong admitted `code`, or `nullopt` when `code` is not a member.
+// ⚠ The optional is load-bearing — see the definition. A defaulted prong would
+// make "admitted under prong (1)" and "never in the table" render identically,
+// which is the plausible-wrong-answer defect this whole cluster is about.
+[[nodiscard]] DSS_EXPORT std::optional<MembershipProng>
+membershipProngOf(DiagnosticCode code) noexcept;
 
 } // namespace dss

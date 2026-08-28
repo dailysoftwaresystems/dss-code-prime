@@ -1,0 +1,36 @@
+{
+  "$comment": "D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE: the corpus arm of the format-wide unwind CARRY. A function merged out of a foreign object used to arrive in a DSS image with NO unwind description at all -- a backtrace stopped at it, a profiler stack ended there, and an exception thrown through it terminated -- and on ELF DSS did not even say so. The fix decodes the foreign object's own encoding back into the neutral, PC-keyed `CfiFunction` vocabulary that every format writer in this tree already emits its unwind table from, so the merged function's table is RE-EMITTED rather than copied and no format gains a new emit path. WHY THE INPUT IS PREBUILT AND NOT `dependsOn`-BUILT: the subject of the row is a FOREIGN encoding, so a DSS-built prerequisite would be reading back this project's own writer and could not fail the way the row describes. `tests/link/data/libforeign_unwind_{x86_64,aarch64}.a` are `gcc -c` + `ar rcs` output with NO flags of any kind -- the ordinary output of the platform's own compiler, which is exactly what carries `.eh_frame` by default. Provenance, gcc 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1) and its aarch64-linux-gnu cross of the same version, ✔MEASURED 2026-08-24 with `readelf -SW`/`-rW`/`--debug-dump=frames`: each member carries TWO FDEs (one per non-leaf function) and a `.rela.eh_frame` binding each FDE's `initial_location` to `.text` + the function's offset -- x86_64 `R_X86_64_PC32 .text + 0 / +0x26`, aarch64 `R_AARCH64_PREL32 .text + 0 / +0x2c`. x86_64 member md5 bdbd154713427da907fc3ffd4616c6b4 (1568 B) in archive fdc4e74235a28a2cdcebe84038b8b8e7 (1832 B); aarch64 member md5 249f55d2f990df25255ac05b1909ce9a (1640 B) in archive 021a05847cc0c682e5df722709f85790 (1904 B). ★ THE `containerWitness` IS `.eh_frame` AND THAT CHOICE IS THE WHOLE POINT OF THE FIELD: it is the property that makes this input the thing the example claims to link against. A fixture regenerated with `-fno-asynchronous-unwind-tables` would still define both symbols, still merge, still exit 42, and would witness NOTHING -- so the manifest states the property and both runners check it, and the string comes out of the member's own section-name table. ⚠ HONEST LIMIT, and it is in `main.c` too: this example witnesses that the carry does not CORRUPT the link or the run; it does NOT witness the WALK, because observing an unwind from inside the program needs `backtrace` (glibc) or `_Unwind_Backtrace` (libgcc) and ✔MEASURED on both ELF legs NEITHER binds -- no shipped library descriptor exposes either symbol, and there is no platform-default binding (`K_SymbolUndefined` for a DSS-side extern AND for a merged member's own undefined reference). The WALK is witnessed by the row's end-to-end measurement instead, which binds `backtrace` through `--resolve-library <libc.so.6>` and gets exit 42 through TWO merged foreign frames on both legs, against exit 2 (the walk stopping at the first foreign frame) with the `unwind` section row deleted from the four ELF format documents -- a config-level mutant, so the binary under test was byte-identical either side. NO pe64 OR macho64 ARM: this example's inputs are ELF archives, and a foreign COFF/Mach-O member states its unwind facts in a different encoding whose carry is the named remainder on this row. ⚠ THE `release` ARM IS DELIBERATELY NOT ARMED WITH `mustDifferFromBaseline`, AND THE REASON IS A MEASUREMENT RATHER THAN AN OVERSIGHT (D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING): ✔MEASURED on both legs through the shipped CLI, the `--config=release` image is BYTE-IDENTICAL to the baseline (x86_64 md5 e332b791010cd12b2073f3a7411c77a2, aarch64 9eae7c6a47e52ccb335c5b49b70e46f5, debug == release), because the only code the optimizer can reach here is a one-line `main` and a one-line leaf -- everything else in the image came out of gcc and is merged, never recompiled. Arming the key would therefore be a GUARANTEED RED, and giving `main.c` something inlinable to force a difference would be arming a witness that has nothing to do with this row. What the arm DOES assert is that the release pipeline reaches the archive-merge path at all, which is the honest and smaller claim.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "gcc 13.3.0 `-c` with no flags + `ar rcs`. The witness is the member's own section name: an archive whose members carry NO `.eh_frame` cannot exercise this row.",
+          "path": "tests/link/data/libforeign_unwind_x86_64.a",
+          "containerWitness": ".eh_frame"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "prebuiltLibraries": [
+        {
+          "$comment": "aarch64-linux-gnu-gcc 13.3.0 `-c` with no flags + `ar rcs`. THE HALF ITS x86_64 SIBLING CANNOT REACH: this CIE states `DW_CFA_def_cfa r31 (sp) ofs 0` and NOTHING about the return address, relying on DWARF's `same_value` default for the RA column, where x86_64 gcc spells `DW_CFA_offset r16 at cfa-8` out. Deriving the entry state from the silence is what makes the decoded state agree with the one DSS's own producer builds from `cc.linkRegister`; without it the shared CIE cannot describe both and the whole image is refused. Its FDEs also use `DW_CFA_restore`, which the x86_64 fixture's do not.",
+          "path": "tests/link/data/libforeign_unwind_aarch64.a",
+          "containerWitness": ".eh_frame"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

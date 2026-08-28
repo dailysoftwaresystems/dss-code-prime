@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/enum_name_table.hpp"  // EnumNameTable (kModeOpTable, kUnterminatedFlavorTable)
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree_node.hpp"
 
@@ -26,7 +27,68 @@ enum class ModeOp : std::uint8_t {
     ReplaceMode,
 };
 
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// ★★ WHAT THIS REPLACED, AND IT WAS TWO OWNERS BEFORE THE SENTENCES ARE EVEN
+// COUNTED. `modeOpName` (`lexer_mode.cpp`) was a `switch` retyping all four
+// spellings, and `grammar_schema_json.cpp` decided acceptance with an INLINE
+// `opStr == "pushMode" / "popMode" / "replaceMode"` chain that knew nothing
+// about it — a READER and a WRITER of one vocabulary, each hand-written, plus
+// two diagnostics restating the accepted set beside the chain. The census that
+// swept this class could not see the chain at all
+// (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET), so nothing
+// compared the two.
+//
+// ⚠ ROW ORDER IS LOAD-BEARING: `None` is row 0, so `name()`'s fall-back for an
+// out-of-range value is `"none"` — byte-identical to the switch's own
+// `return "none"` unreachable arm, and semantically the right sentinel (a
+// lexeme with no mode effect).
+inline constexpr EnumNameTable<ModeOp, 4> kModeOpTable{{{
+    { ModeOp::None,        "none"        },
+    { ModeOp::PushMode,    "pushMode"    },
+    { ModeOp::PopMode,     "popMode"     },
+    { ModeOp::ReplaceMode, "replaceMode" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kModeOpTable);
+
 [[nodiscard]] DSS_EXPORT std::string_view modeOpName(ModeOp op) noexcept;
+
+[[nodiscard]] constexpr std::optional<ModeOp>
+modeOpFromName(std::string_view s) noexcept {
+    return kModeOpTable.fromName(s);
+}
+
+// The ops a schema may actually DECLARE — the table minus the sentinel, which
+// `modeOpFromName("none")` resolves and the loader then refuses. A loader's
+// "expected …" half renders THIS, never a retyped list. The `3` is checked by
+// `namesWhere` at compile time, so a fifth DECLARABLE op cannot silently keep a
+// three-name sentence.
+//
+// ★ THE `+ 1` BELOW IS THE HALF `namesWhere` CANNOT SEE.
+// D-CORE-NAMESWHERE-LITERAL-COUNT-IS-BLIND-TO-A-SECOND-SENTINEL: `namesWhere<M>`
+// compares `M` only against the rows the predicate ACCEPTS, so a fifth
+// UNDECLARABLE op moves nothing it can observe. ✔MEASURED 2026-08-23 in a
+// worktree with `g++ -std=c++23 -fsyntax-only -I src`: a fifth row plus the
+// widened `isDeclarableModeOp` that rejects it COMPILED CLEAN before this
+// assert existed. That is the direction that matters most for THIS vocabulary,
+// because the sentinel is what the grammar loader's `"none"` arm turns on: a
+// second unrefusable op would reach `modeOpFromName` and be accepted by a
+// loader whose "expected …" sentence never mentioned it. The assert relates the
+// table's own row total to this projection's literal — two numbers with
+// DIFFERENT OWNERS, so it is not the tautology a `rows.size() - 1` spelling
+// would have been
+// (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
+[[nodiscard]] constexpr bool isDeclarableModeOp(ModeOp op) noexcept {
+    return op != ModeOp::None;
+}
+inline constexpr auto kDeclarableModeOpNames =
+    namesWhere<3>(kModeOpTable, isDeclarableModeOp);
+static_assert(kModeOpTable.rows.size()
+                  == kDeclarableModeOpNames.size() + 1,
+              "kModeOpTable must have exactly ONE undeclarable row (the 'none' "
+              "sentinel) — a second one leaves `namesWhere`'s literal count "
+              "matching while the grammar loader's 'expected …' half silently "
+              "stops naming the set its `\"none\"` refusal arm enforces");
 
 // Stack of active lexer modes. Top frame chooses which tokens the
 // tokenizer produces next. `pop`/`replaceTop`/`top` abort on empty —
@@ -90,6 +152,29 @@ enum class UnterminatedFlavor : std::uint8_t {
     Comment,   // line- or block-comment modes
     Generic,   // mode names not in either family
 };
+
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// `lexerModes.<name>.unterminatedAs`. Its refusal rendered the set as escaped
+// double quotes (`"string", "comment", "generic"`) — correct on the day it was
+// typed, and a second owner from that day on. Every enumerator is declarable;
+// `String` is row 0, matching `UnterminatedFlavor`'s own default, so an
+// out-of-range value renders as the flavour it would behave as.
+inline constexpr EnumNameTable<UnterminatedFlavor, 3> kUnterminatedFlavorTable{{{
+    { UnterminatedFlavor::String,  "string"  },
+    { UnterminatedFlavor::Comment, "comment" },
+    { UnterminatedFlavor::Generic, "generic" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kUnterminatedFlavorTable);
+
+[[nodiscard]] constexpr std::string_view
+unterminatedFlavorName(UnterminatedFlavor f) noexcept {
+    return kUnterminatedFlavorTable.name(f);
+}
+[[nodiscard]] constexpr std::optional<UnterminatedFlavor>
+unterminatedFlavorFromName(std::string_view s) noexcept {
+    return kUnterminatedFlavorTable.fromName(s);
+}
 
 // Schema-declared specification for a body-mode's default token. The
 // bundle makes illegal states unrepresentable: a mode without a

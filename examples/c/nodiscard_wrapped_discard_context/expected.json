@@ -1,0 +1,46 @@
+{
+  "$comment": "D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT (P32 lane A): a `warn_unused_result` result discarded through an INTERPOSED wrapper. The discard test was TWO-HOP-EXACT (parent==expression, grandparent==exprStmt), right for the dominant `f();` idiom and blind to every other way C discards a value. MEASURED at the pre-change HEAD through the shipped CLI, one TU per shape with a bare `g();` positive control: `(g());`, `g(), calls;`, `for(g();;)` and `for(;;g())` ALL compiled with no diagnostic while gcc 13.3.0 AND clang 19.1.7 warn on all four. ** WHY THIS FILE EXISTS GIVEN THE EFFECT IS A WARNING: a warning does not change an exit code, so the DIAGNOSTIC is pinned in tests/analysis/semantic/test_nodiscard_discard_context.cpp (four shapes that must warn, four that must stay silent). What this file owns is the other half -- the fix walks the CST parent chain during semantic analysis, and a walk that mis-steps could change which node gets TYPED as easily as which node gets WARNED about. The program RUNS every wrapped shape and gates its exit on each call having happened, so a broken walk fails the RUN rather than the build: 5 calls * 8 + 2 = 42. RED-ON-DISABLE: drop `discardTransparentRules` + `discardClauseHosts` from `semantics.nodiscard` -> the four wrapped discards go silent and the unit test's warn-pins go red; THIS file stays green under that mutation by construction, which is exactly why the two are a pair and neither is sufficient alone. * `(void)g();` is deliberately absent here and present in the unit test as a MUST-NOT-WARN pin: the references disagree (gcc warns, clang does not) and the cast is the universal 'I meant to discard this' idiom, so DSS follows clang. * VERIFIED against BOTH references (-std=c2x -Wall -Wextra): gcc 13.3.0 and clang 19.1.7 compile it with exactly the four expected -Wunused-result warnings, and both binaries exit 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

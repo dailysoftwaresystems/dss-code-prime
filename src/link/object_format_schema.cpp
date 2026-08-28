@@ -1,6 +1,10 @@
 #include "link/object_format_schema.hpp"
 
+#include "core/crypto/sha256.hpp"                 // crypto::sha256Hex — the memo key
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
+#include "core/substrate/phase_timers.hpp"        // the load-config / build-config phases
 #include "core/substrate/relocation_table.hpp"
+#include "core/types/config_document_memo.hpp"    // the ONE content-addressed schema memo
 #include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList — the ONE closed-set renderer
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -31,8 +35,8 @@ typed rows and must not see JSON; move the JSON work to its *_json.cpp sibling \
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────
-// ★★★ COMPILE-ERROR PIN — D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-
-// BRANCHES (TF-C125). DO NOT DELETE TO "FIX A BUILD ERROR".
+// ★★★ COMPILE-ERROR PIN — D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES
+// (TF-C125). DO NOT DELETE TO "FIX A BUILD ERROR".
 // ─────────────────────────────────────────────────────────────────────────
 //
 // If your build just failed with `'ObjectFormatKind': ambiguous symbol`
@@ -95,15 +99,65 @@ namespace dss {
 
 LoadResult<std::shared_ptr<ObjectFormatSchema>>
 ObjectFormatSchema::loadFromFile(std::filesystem::path const& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    // `load-config` — see `core/substrate/phase_timers.hpp`. Spans the read,
+    // the digest, the memo lookup and (miss only) the nested `build-config`.
+    substrate::PhaseTimers::Scope const loadScope{
+        substrate::CompilePhase::LoadConfig};
+
+    // THE ONE CHECKED READ (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    // `.format.json` is the MOST-read shipped document class in the tree, so a
+    // torn read here is the one most likely to be met in the field — and it must
+    // say the READ failed, not that the format description is malformed.
+    auto text = core::readFileChecked(path);
+    if (!text) {
         return std::unexpected(std::vector<ConfigDiagnostic>{
             {DiagnosticCode::C_MissingField, DiagnosticSeverity::Error,
-             path.string(), "cannot open file"}});
+             path.string(), std::move(text).error().message}});
     }
-    std::ostringstream buf;
-    buf << in.rdbuf();
-    return loadFromText(std::move(buf).str(), path.string());
+
+    // ── THE CONTENT-ADDRESSED MEMO, THIRD FAMILY ──────────────────────────
+    // D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS.
+    // `.format.json` is the most-read shipped document class in the tree — ✔3
+    // loads for a one-line C compile (MEASURED 2026-08-25, cycle P35, Windows
+    // Debug, 7 ms) and one per declared sibling flavour on a link — so it is
+    // also the family that repeats itself most across a multi-target run.
+    // The key is the SHA-256 of the bytes just read; see
+    // `config_document_memo.hpp` for why that makes a stale hit structurally
+    // impossible rather than a policy to get right.
+    //
+    // ★ THE DEPENDENCY LEDGER IS EMPTY HERE FOR THE SAME MEASURED REASON AS THE
+    // TARGET FAMILY: ✔`object_format_schema_json.cpp` reads no file — no
+    // `readFileChecked`, no `ifstream`, no `<filesystem>` — so a built schema is
+    // a pure function of this document's own bytes. Sibling FLAVOURS are
+    // resolved by the caller through `loadShipped`, each one its own load with
+    // its own digest, so nothing is folded in behind this document's back.
+    //
+    // ⓘ The miss path digests these bytes twice (once here for the key, once
+    // inside `loadFromText` for `contentDigest()`) — bounded to the cold path,
+    // and 🧠DERIVED from the ✔MEASURED Debug digest rate (14.5 ns/byte) at well
+    // under a millisecond for a 20–46 KB format document; the same note on the
+    // target family carries the full reasoning.
+    std::string const label  = path.string();
+    std::string       digest = crypto::sha256Hex(*text);
+    if (auto hit =
+            detail::ConfigDocumentMemo<ObjectFormatSchema>::lookup(label, digest)) {
+        return hit;
+    }
+
+    // `build-config` — DEFINED as the work a memo hit skips.
+    auto schema = [&] {
+        substrate::PhaseTimers::Scope const buildScope{
+            substrate::CompilePhase::BuildConfig};
+        return loadFromText(*text, label);
+    }();
+    // ⚠ Stored only on the SUCCESS path — a failed load produced diagnostics and
+    // no schema, and the loader's own refusal already reports it every time.
+    if (schema) {
+        detail::ConfigDocumentMemo<ObjectFormatSchema>::store(
+            label, std::move(digest),
+            std::vector<detail::ConfigDocumentDependency>{}, *schema);
+    }
+    return schema;
 }
 
 LoadResult<std::shared_ptr<ObjectFormatSchema>>
@@ -189,7 +243,42 @@ ConfigDiagnostic makeProblem(std::string path, std::string message) {
     };
 }
 
+// The kinds a document MAY declare twice, rendered for a diagnostic.
+// D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE.
+//
+// ⚠ DERIVED FROM THE PREDICATE, NEVER SPELLED. A literal "unwind" here would
+// be a second owner of the membership rule, and the day a second role becomes
+// encoding-discriminated the messages would keep naming the old set while the
+// loader accepted the new one — the exact drift shape `namesWhere` exists to
+// prevent one vocabulary over.
+[[nodiscard]] std::string encodingDiscriminatedKindList() {
+    return renderAllowedList(kEncodingDiscriminatedKindNames);
+}
+
 } // namespace
+
+// D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE. Both
+// indexes are maintained HERE and nowhere else, so `sections` and its two
+// projections cannot disagree — the derived-at-load relationship the field's
+// own docblock claims.
+bool ObjectFormatData::addSectionRow(ObjectFormatSectionInfo info,
+                                     std::uint16_t& duplicateOfOut) {
+    SectionKindEncoding const id{info.kind, info.encoding};
+    auto const idx = static_cast<std::uint16_t>(sections.size());
+    auto [it, fresh] = sectionKindIndex.emplace(id, idx);
+    if (!fresh) {
+        duplicateOfOut = it->second;
+        return false;
+    }
+    // A SECOND row of a kind retires that kind's unique-row answer rather than
+    // overwriting it. Overwriting would make `sectionByKind` return whichever
+    // row happened to load LAST — a silent choice between two correct-looking
+    // answers, which is worse than no answer.
+    auto [uit, uFresh] = sectionKindUniqueRow.emplace(info.kind, idx);
+    if (!uFresh) uit->second = kAmbiguousSectionRow;
+    sections.push_back(std::move(info));
+    return true;
+}
 
 std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     std::vector<ConfigDiagnostic> problems;
@@ -451,18 +540,28 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
     }
 
-    // Sections: kind unique cross-row + name non-empty. The format
+    // Sections: (kind, encoding) unique cross-row + name non-empty. The format
     // walker resolves `sectionByKind(SectionKind::Text)` to find
     // the format-native section name + structural fields.
+    //
+    // ★ THE UNIQUENESS KEY IS THE PAIR SINCE
+    //   D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE, and
+    //   the three rules below are what keep `sectionByKind` -- the kind-only
+    //   lookup every WRITER uses -- honest afterwards. Without them a second
+    //   row of ANY kind would make that accessor answer "no such section" for
+    //   a section the document plainly declares.
     {
-        std::unordered_map<SectionKind, std::size_t> seenSection;
+        std::unordered_map<SectionKindEncoding, std::size_t> seenSection;
+        std::unordered_map<SectionKind, std::size_t> rowsPerKind;
         for (std::size_t i = 0; i < sections.size(); ++i) {
             auto const& s = sections[i];
             if (s.name.empty()) {
                 fail(std::format("/sections/{}/name", i),
                      "section row: 'name' must be a non-empty string");
             }
-            auto [it, fresh] = seenSection.emplace(s.kind, i);
+            ++rowsPerKind[s.kind];
+            auto [it, fresh] =
+                seenSection.emplace(SectionKindEncoding{s.kind, s.encoding}, i);
             if (!fresh) {
                 fail(std::format("/sections/{}/kind", i),
                      std::format("section '{}': duplicate 'kind' value "
@@ -470,6 +569,57 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "/sections/{})",
                                  s.name, sections[it->second].name,
                                  it->second));
+            }
+            // (b) AN ENCODING ON A ROLE THAT DOES NOT HAVE ONE IS INERT
+            // CONFIG, and inert config is rejected BY NAME here exactly as
+            // `charSignedness` rejects a second-owner key rather than letting
+            // it sit and read as meaningful. Declaring `"encoding"` on a
+            // `text` row states a discriminator nothing will ever dispatch on.
+            if (s.encoding != SectionEncoding::Unspecified
+                && !sectionKindIsEncodingDiscriminated(s.kind)) {
+                fail(std::format("/sections/{}/encoding", i),
+                     std::format("section '{}': 'kind' \"{}\" has exactly one "
+                                 "wire encoding, so declaring 'encoding' "
+                                 "\"{}\" states a discriminator no reader "
+                                 "dispatches on. Only these kinds are "
+                                 "encoding-discriminated: {}",
+                                 s.name, sectionKindName(s.kind),
+                                 sectionEncodingName(s.encoding),
+                                 encodingDiscriminatedKindList()));
+            }
+        }
+        for (std::size_t i = 0; i < sections.size(); ++i) {
+            auto const& s = sections[i];
+            if (rowsPerKind[s.kind] < 2u) continue;
+            // (c) A KIND MAY REPEAT ONLY WHERE THE ROLE HAS SEVERAL ENCODINGS.
+            if (!sectionKindIsEncodingDiscriminated(s.kind)) {
+                fail(std::format("/sections/{}/kind", i),
+                     std::format("section '{}': 'kind' \"{}\" is declared by "
+                                 "{} rows. A kind may appear more than once "
+                                 "only when its ROLE has several wire "
+                                 "encodings, because every other kind is "
+                                 "resolved by kind alone and a second row "
+                                 "makes that lookup answer nothing. "
+                                 "Encoding-discriminated kinds: {}",
+                                 s.name, sectionKindName(s.kind),
+                                 rowsPerKind[s.kind],
+                                 encodingDiscriminatedKindList()));
+                continue;
+            }
+            // (d) …AND THEN EVERY ONE OF THEM MUST SAY WHICH ENCODING IT IS.
+            // The pair rule alone would admit one `Unspecified` row beside one
+            // declared row: pair-unique, yet the `Unspecified` row is exactly
+            // the one no reader can identify.
+            if (s.encoding == SectionEncoding::Unspecified) {
+                fail(std::format("/sections/{}/encoding", i),
+                     std::format("section '{}': this document declares {} "
+                                 "rows of kind \"{}\", so each must say which "
+                                 "wire encoding it carries -- this row says "
+                                 "nothing, and a reader would have to guess "
+                                 "between them. One of: {}",
+                                 s.name, rowsPerKind[s.kind],
+                                 sectionKindName(s.kind),
+                                 renderAllowedList(kDeclarableSectionEncodingNames)));
             }
         }
     }

@@ -32,7 +32,7 @@ The result is a **hermetic, auditable toolchain**. DSS writes its own machine co
 DSS Code Prime already compiles and runs **real, unmodified, production software**:
 
 - **SQLite — compiled from the complete upstream source tree, and passing SQLite's own test suite.** Not just the amalgamation: **189 translation units** of unmodified upstream source go through a single `--project` manifest to build SQLite's own `testfixture`, which then runs **SQLite's own unit corpus**. At the `full` tier that is **~1.06 million assertions per run**: Linux x86_64 **7 failures / 1,061,830**, Linux arm64 **12 / 1,060,828**, Windows x86_64 **0 / 979,736**. Every residual failure is a known **non-DSS confound backed by a matched control** — a GCC-built reference `testfixture`, containing no DSS-compiled code, fails it identically on the same machine. **Nothing in the SQLite tree is patched and no test file is excluded to get there.** ⚠ **Read the numerator, not the denominator.** Those three totals were each taken against a *different* upstream revision of SQLite: the harness re-clones upstream on every run, so the corpus it executes is whatever SQLite shipped that day and the denominator moves with it — which is why the three differ. It is not a fixed yardstick and we do not offer it as one; the load-bearing figure is the **numerator**, the count of *DSS-attributable* failures, and that is **zero** in all three. A total quoted without the upstream commit it ran against is not comparable to any other; the most recent run we have pinned is 2026-08-04, SQLite upstream `0a5f27711f`, DSS `a3af1320` — **1 error / 331,333** on native arm64 Linux (`zipfile-25.0`, a known non-DSS confound) and **8 / 331,351** on x86_64 Linux, all eight likewise confounds. Those denominators are a smaller corpus tier than the `full`-tier figures above, which is precisely the point. **The `sqlite3` CLI is built from full upstream source as well — 103 translation units, not the amalgamation** — on **four OS × ISA targets** (Linux x86_64 + arm64, Windows x86_64, macOS arm64) with **zero special flags**: `sqlite3 --version` → 3.54.0 and a `CREATE` / `INSERT` / `SELECT` round-trip returns the correct result. The single-file amalgamation is compiled too, as a separate and much faster probe — it is an *additional* check, never the thing standing in for the real build.
-- **Cross-checked against GCC where it counts.** DSS's **ABI** — struct and bit-field layout — is verified byte-for-byte against GCC, Clang, and MSVC, and its **preprocessor** output byte-for-byte against `gcc -E`. It runs SQLite to correct results on every target, and continuously audits itself for **silent miscompiles** — the one failure class this project treats as unacceptable.
+- **Cross-checked against GCC where it counts.** DSS's **ABI** — struct and bit-field layout — is verified byte-for-byte against GCC, Clang, and MSVC, and its **preprocessor** output byte-for-byte against `gcc -E`. It runs SQLite to correct results on every target, and continuously audits itself for **silent miscompiles** — the one failure class this project treats as unacceptable. **The conformance target is a union, and it is stated as one: `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C`.** If any one of the three reference compilers accepts a correct construct, DSS must accept it too — a reference's *failure* is never evidence against DSS. If none of them accepts it but ISO C does, DSS must still accept it; the standard does not need an implementation to witness it. And DSS does not go above that union either — accepting what neither the references nor the standard sanction would make DSS the only compiler on earth that takes a given program, which is a silent trap rather than a feature. The goal is that correct code *works*.
 - **770+ internal tests, 100% green** on every leg (Windows x86_64, Linux x86_64, Linux arm64), backed by a test corpus nearly as large as the engine itself (~143,000 lines).
 - **Compile time, measured on the real thing rather than a microbenchmark.** Building the `sqlite3` CLI — **103 translation units of full upstream source, not the amalgamation** — through one `--project` manifest, cross-compiled from a Windows host (32 logical CPUs) to `x86_64:elf64-x86_64-linux-exec`:
 
@@ -42,26 +42,60 @@ DSS Code Prime already compiles and runs **real, unmodified, production software
   | `--config=release` | **38.0 s** | 16.6 s | 6,904,848 B |
 
   The figure is the compiler's own `--time` report, not a wrapper's stopwatch. The release build turns **4m08s of attributed CPU into 31.1 s of phase wall — 8.0× parallel** (the front-half CU stage runs 103 jobs at 30.2× concurrency). ⚠ **Quote both rows or neither:** the optimizer is the difference between them, and a debug-pipeline number presented as "SQLite compiles in 23 seconds" would be the release-only omission this project has been bitten by before. ⚠ The staged upstream tree these figures ran against carries **no recorded revision id**, so they are a this-host, this-day measurement and not a benchmark you can reproduce against a different checkout.
-- **Benchmarked head-to-head against GCC and MSVC, on SQLite's own benchmark, and we are behind.** The subject is `test/speedtest1.c` — SQLite's own performance program — linked against the same **103 full-source translation units**, *not* the amalgamation. (Upstream ships no full-source recipe for it: both `main.mk` and `Makefile.msc` build `speedtest1` from `sqlite3.c`. So the TU list is derived from the full-source `sqlite3d` recipe and has its one artifact TU substituted.) Native Windows 11 host, 32 logical CPUs, all three compilers on the same machine against the same source tree, cold builds (fresh object directory per repeat), median of 3; run times median of 5 after an uncounted warm-up, monotonic clock:
+- **Benchmarked head-to-head against GCC, Clang, MSVC and Apple clang on FOUR hosts, on SQLite's own benchmark. Single-threaded we are now the fastest or second-fastest compiler on every host we measure; at `-j4` we are still behind, and the reason is one specific thing.** The subject is `test/speedtest1.c` — SQLite's own performance program — linked against the same **103 full-source translation units**, *not* the amalgamation. (Upstream ships no full-source recipe for it: both `main.mk` and `Makefile.msc` build `speedtest1` from `sqlite3.c`. So the TU list is derived from the full-source `sqlite3d` recipe and has its one artifact TU substituted.) On each host every compiler builds the same source on the same machine; builds are **cold** — a fresh object directory per repeat — median of 3, run times median of 5 after an uncounted warm-up, monotonic clock. All four re-measured 2026-08-28.
 
-  | compiler | optimization | build −j1 | build −j4 | `speedtest1 --size 25` | parallelism |
+  **Windows 11 / x86_64, 32 logical CPUs — upstream `6f1110c`**
+
+  | compiler | optimization | build −j1 | build −j4 | `speedtest1 --size 25` | 1→4 scaling |
   |---|---|---|---|---|---|
-  | **DSS Code Prime** | `--config=release` | 66.56 s | **34.81 s** | 3.473 s | in-process CU thread pool (`--jobs N`) |
-  | gcc 13.2.0 (MinGW-W64) | `-O2` | 26.41 s | **7.12 s** | 2.473 s | 4 × `gcc -c` processes + link |
-  | MSVC `cl.exe` (VS 2026) | `/O2` | 13.26 s | **4.31 s** | 2.976 s | 4 × `cl /c` processes + link |
+  | **DSS Code Prime** | `--config=release` | **25.21 s** | 12.57 s | 3.325 s | 2.01× |
+  | gcc 13.2.0 (MinGW-W64) | `-O2` | 26.62 s | **7.08 s** | 3.063 s | 3.76× |
+  | MSVC `cl.exe` | `/O2` | 13.49 s | **4.45 s** | 3.571 s | 3.03× |
 
-  **Read this as the gap it is.** At `-j4` DSS takes **4.9× gcc's** and **8.1× MSVC's** compile time, and its output runs **1.40× slower than gcc's** and **1.17× slower than MSVC's**. We publish it because a compiler that only reports the axes it wins is not a measurement, it is marketing.
+  **Linux / x86_64 (WSL2), 32 logical CPUs — upstream `492e7fc0a7`**
 
-  ⚠ **The parallel mechanism is deliberately not equalized, and the sharpest number is the one that exposes.** DSS compiles every CU inside *one* process on a worker-thread pool; the references are four separate processes. Going 1 → 4 workers, DSS scales **1.91×** where gcc scales **3.71×** and MSVC **3.08×** — by Amdahl that puts roughly **a third of a full-source release build on a serial path**, which is a specific, addressable target rather than a vague "it is slower" (`D-PERF-CU-POOL-SCALES-HALF-AS-WELL-AS-SEPARATE-PROCESSES`).
+  | compiler | optimization | build −j1 | build −j4 | `speedtest1 --size 25` | 1→4 scaling |
+  |---|---|---|---|---|---|
+  | **DSS Code Prime** | `--config=release` | **15.12 s** | 7.71 s | 3.063 s | 1.96× |
+  | gcc 13.3.0 | `-O2` | 18.36 s | **5.17 s** | 2.091 s | 3.55× |
+  | clang 18.1.3 | `-O2` | 15.43 s | **4.27 s** | 2.333 s | 3.61× |
 
-  ✅ **What the benchmark also proves is correctness.** It runs `speedtest1 --verify`, whose hash upstream describes as being there "to verify that compilation is not miscompiled" — and **all three binaries produced the same hash**. Arms whose output disagrees are refused outright rather than reported side by side, because three programs computing different things do not have comparable times.
+  **macOS / arm64, 10 logical CPUs — upstream `492e7fc0a7`**
 
-  Reproduce it: [`real-examples/c/sqlite/benchmark-speedtest1.ps1`](real-examples/c/sqlite/benchmark-speedtest1.sh) (`.sh` twin for POSIX hosts; both share one derivation and one measurement core). ⚠ These figures are this-host and this-day, against upstream SQLite `6f1110c` — a compile-time number quoted without its host, its TU count and its upstream revision is not comparable to anything.
+  | compiler | optimization | build −j1 | build −j4 | `speedtest1 --size 25` | 1→4 scaling |
+  |---|---|---|---|---|---|
+  | **DSS Code Prime** | `--config=release` | 11.79 s | 5.88 s | 1.306 s | 2.01× |
+  | Apple clang 21.0.0 | `-O2` | **10.55 s** | **2.91 s** | 0.759 s | 3.62× |
+
+  **Linux / arm64 (native VPS), 4 logical CPUs — upstream `492e7fc0a7`**
+
+  | compiler | optimization | build −j1 | build −j4 | `speedtest1 --size 25` | 1→4 scaling |
+  |---|---|---|---|---|---|
+  | **DSS Code Prime** | `--config=release` | **39.77 s** | 19.88 s | 5.282 s | 2.00× |
+  | gcc 13.3.0 | `-O2` | 44.18 s | **11.90 s** | 3.126 s | 3.71× |
+
+  ⓘ No clang arm on the arm64 VPS and no `cl.exe` off Windows: an absent reference is **printed as absent with the probe that failed** rather than dropped, because a benchmark that quietly omits a compiler reads exactly like one where that compiler was slow.
+
+  **Read the two halves separately, because they say opposite things.**
+  ★ **At `-j1` DSS is now the FASTEST compiler on Linux x86_64 (15.12 s against clang's 15.43 s and gcc's 18.36 s), and faster than gcc on Windows (25.21 s vs 26.62 s) and on arm64 (39.77 s vs 44.18 s).** Only MSVC (13.49 s) and Apple clang (10.55 s) still lead, each on its own platform.
+  ⚠ **At `-j4` we are behind everywhere** — 1.5×–2.7× the best reference on each host. Its output runs **1.5×–1.7×** slower than the references. We publish both because a compiler that only reports the axes it wins is not a measurement, it is marketing.
+
+  ★★★ **THE `-j4` GAP IS ONE NUMBER, AND FOUR HOSTS NOW AGREE ON IT TO TWO DECIMAL PLACES.** Going 1 → 4 workers DSS scales **1.96×, 2.00×, 2.01×, 2.01×** while every reference scales **3.03×–3.76×** — on three operating systems, four toolchains and two ISAs. One host could not tell "our pool scales badly" apart from "this host schedules badly"; four can, and the answer is the pool. DSS compiles every CU inside *one* process on a worker-thread pool; the references are N separate processes. By Amdahl that puts roughly **half of a full-source release build on a serial path** — a specific, addressable target rather than a vague "it is slower" (`D-PERF-CU-POOL-SCALES-HALF-AS-WELL-AS-SEPARATE-PROCESSES`). ⓘ The consistency is the evidence: a 2.0× that reproduces on a 4-core arm64 VPS and a 32-core x86_64 box is a property of our code, not of anyone's scheduler.
+
+  ⚠ **Three of the four tables share upstream `492e7fc0a7` and are therefore comparable to each other; the Windows one is at `6f1110c` and is not.** The Windows table is deliberately kept on its old checkout so its row stays a true before/after against the 2026-08-27 measurement it replaces. Between tables at different revisions, nothing is being claimed. Within a table every arm compiled the same source on the same machine. A compile-time number quoted without its host, its TU count and its upstream revision is not comparable to anything — and the Mac has 10 logical CPUs against 32, while the VPS has 4.
+
+  ⚠⚠ **THE LINUX NUMBERS IN THE PREVIOUS REVISION OF THIS TABLE WERE WRONG, AND THE WAY THEY WERE WRONG IS WORTH KNOWING.** They read 40.40 s / 22.02 s. Re-measuring produced **220 s** at `-j1` — a fivefold *regression* that reproduced three times — and it was neither. The benchmark's own `DSS_CONFIG_ROOT` pin was one directory level too deep, so it silently missed and fell through to the CWD ancestor walk it exists to prevent; driven with a working directory on the `/mnt/c` 9P mount, every shipped-descriptor `weakly_canonical` became a cross-filesystem round trip. Same binary, same manifest, only the CWD moving: **213.50 s at 13% CPU with 1,834,545 voluntary context switches, against 15.16 s at 90% with 429.** ★ The instrument that found it is the compiler's own `--time` phase report, which now also prints the pre-scan memo's hit/build counts — `preprocess-splice` went 65.89 s → 508 ms. [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+
+  ⚠ **A per-invocation improvement will not show up here, and that is the point of measuring a real build.** DSS's fixed startup cost fell by **35 ms** during earlier work — **27% of a one-file compile**, 128.9 → 93.5 ms against an unmoving gcc control — and moved these numbers by less than their run-to-run spread, because a 103-TU build pays a fixed floor once. **Compile time has two different problems and this benchmark only sees the second one.**
+
+  ✅ **What the benchmark also proves is correctness.** It runs `speedtest1 --verify`, whose hash upstream describes as being there "to verify that compilation is not miscompiled" — and the harness compares every arm's *normalized* output, hash included, refusing the whole run (`R6`, exit 1) if two arms disagree. **All four hosts exited 0 with every arm reporting a time, so no arm's output differed from its host's references.** That refusal is the load-bearing part: three programs computing different things do not have comparable times, so a disagreeing arm is never reported side by side with a caveat. ⓘ It earned its keep in a second way this round — on a host whose `CLOCK_REALTIME` steps backwards, `speedtest1` printed a negative elapsed time that the normalizer could not match, and R6 correctly refused rather than comparing garbage. The normalizer now absorbs that spelling and the harness *says so* instead of hiding it.
+
+  Reproduce it: [`real-examples/c/sqlite/benchmark-speedtest1.sh`](real-examples/c/sqlite/benchmark-speedtest1.sh) (`.ps1` twin for Windows; both share one derivation and one measurement core). ⓘ The reference set is discovered, not hardcoded: every C compiler found becomes its own arm, and one that is absent is **printed as absent with the probe that failed** rather than dropped — a benchmark that quietly omits a compiler reads exactly like one where that compiler was slow. Two names resolving to one binary are measured once and labelled by what the compiler reports itself to be, which is why the macOS row reads *Apple clang* and not *gcc*.
 - **The whole pipeline is in-tree and complete**: tokenizer → parser → semantic analysis → three-tier IR (HIR → MIR → LIR) → register allocation → **its own assembler** (x86_64 + arm64 byte encoding with a round-trip oracle) → **its own linker** (ELF / PE / Mach-O, static and dynamic).
 
 | Capability | Status |
 |---|---|
-| **Source languages** | `c-subset` (→ full C23, in progress), `tsql-subset`, `toy` — each a `.lang.json` |
+| **Source languages** | `c` (→ full C23, in progress), `tsql-subset`, `toy` — each a `.lang.json` |
 | **CPU targets** | `x86_64`, `arm64` — shipped end-to-end (encoder + round-trip oracle) |
 | **Object formats** | ELF, PE, Mach-O — shipped (executables + dynamic linking); WASM, SPIR-V — skeletons |
 | **Real-world corpus** | [`real-examples/`](real-examples/) — the registry of **known real-world repositories DSS compiles from unmodified upstream source and then runs their own test suites against**. Today: [`c/sqlite`](real-examples/c/sqlite) — full source (189 TUs), ~1.06 M unit assertions per `full`-tier run. Each entry ships `build-and-test.sh` + `build-and-test.ps1`, which clone upstream, build, run the project's own suite and classify every failure against a reference build |
@@ -124,7 +158,7 @@ The compiler exposes a **program API** with three input modes.
 
 ```jsonc
 {
-  "language":        "c-subset",
+  "language":        "c",
   "artifactProfile": "cli",
   "targets":         ["x86_64:elf64-x86_64-linux-exec", "x86_64:pe64-x86_64-windows-exec"],
   "sources":         ["src/main.c"],
@@ -133,27 +167,27 @@ The compiler exposes a **program API** with three input modes.
 ```
 
 ```bash
-dss-code-prime --project myapp.dss-project.json
+dsscp --project myapp.dss-project.json
 ```
 
 **File list:**
 
 ```bash
-dss-code-prime --compile src/main.c src/utils.c --language c-subset \
+dsscp --compile src/main.c src/utils.c --language c \
   --target x86_64:elf64-x86_64-linux-exec --target x86_64:pe64-x86_64-windows-exec
 ```
 
 **Directory scan** (recurses for the language's configured extensions):
 
 ```bash
-dss-code-prime --dir ./src/ --language c-subset --target x86_64:elf64-x86_64-linux-exec
+dsscp --dir ./src/ --language c --target x86_64:elf64-x86_64-linux-exec
 ```
 
 ## Defining a language or target
 
 Everything the engine needs is declared in JSON — there is no per-language or per-target C++ to write.
 
-- **A source language** is a `.lang.json` under `src/dss-config/sources/`, declaring its lexer (`tokens`), grammar (`keywords` / `scopes` / `shapes`), semantics (symbol table + type system), and HIR lowering. Shipped references: `c-subset` (a substantial C subset en route to full C23), `tsql-subset` (T-SQL DDL + DML), and `toy` (a small typed language used as a genericity oracle).
+- **A source language** is a `.lang.json` under `src/dss-config/sources/`, declaring its lexer (`tokens`), grammar (`keywords` / `scopes` / `shapes`), semantics (symbol table + type system), and HIR lowering. Shipped references: `c` (a substantial C subset en route to full C23), `tsql-subset` (T-SQL DDL + DML), and `toy` (a small typed language used as a genericity oracle).
 - **A target** is a `.target.json` under `src/dss-config/targets/`, declaring its opcode set, register file, calling conventions, terminator kinds, encoding shapes, and relocation taxonomy. Shipped: `x86_64`, `arm64`.
 - **An object format** is declared as an `ObjectFormatSchema` the linker walks. Shipped: ELF, PE, Mach-O (WASM and SPIR-V are skeletons).
 

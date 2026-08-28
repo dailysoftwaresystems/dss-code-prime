@@ -70,7 +70,7 @@ namespace {
 // protocol and stay green. `harness/test_sqlite_harness_legs` §10 holds the
 // other end — it requires this exact spelling to appear in BOTH drivers AND in
 // `src/program/program.cpp`, so changing it in one place reds there.
-constexpr std::string_view kMarker = "dss-code-prime: artifact ";
+constexpr std::string_view kMarker = "dsscp: artifact ";
 
 struct ReportedArtifact {
     std::string spec;
@@ -159,7 +159,7 @@ TEST(ArtifactReport, ReportsTheExactFileItWroteForEveryTargetSuffix) {
         int                rc = 1;
         {
             CerrCapture cap;
-            rc       = prog.compileFiles({src.generic_string()}, "c-subset",
+            rc       = prog.compileFiles({src.generic_string()}, "c",
                                          {c.spec}, rep);
             captured = cap.text();
         }
@@ -207,7 +207,7 @@ TEST(ArtifactReport, TheReportedPathIsAbsoluteEvenWhenOutputWasRelative) {
     int                rc = 1;
     {
         CerrCapture cap;
-        rc = prog.compileFiles({src.generic_string()}, "c-subset",
+        rc = prog.compileFiles({src.generic_string()}, "c",
                                {"x86_64:pe64-x86_64-windows-exec"}, rep);
         captured = cap.text();
     }
@@ -238,7 +238,7 @@ TEST(ArtifactReport, AMultiTargetBuildReportsEveryArtifactTaggedByItsTarget) {
     int                rc = 1;
     {
         CerrCapture cap;
-        rc = prog.compileFiles({src.generic_string()}, "c-subset",
+        rc = prog.compileFiles({src.generic_string()}, "c",
                                {"x86_64:pe64-x86_64-windows-exec",
                                 "x86_64:elf64-x86_64-linux-exec"},
                                rep);
@@ -278,7 +278,7 @@ TEST(ArtifactReport, AFrontEndFailureReportsNoArtifact) {
     int                rc = 0;
     {
         CerrCapture cap;
-        rc = prog.compileFiles({src.generic_string()}, "c-subset",
+        rc = prog.compileFiles({src.generic_string()}, "c",
                                {"x86_64:pe64-x86_64-windows-exec"}, rep);
         captured = cap.text();
     }
@@ -308,7 +308,7 @@ TEST(ArtifactReport, ALinkFailureAfterThePathIsKnownReportsNoArtifact) {
     int                rc = 0;
     {
         CerrCapture cap;
-        rc = prog.compileFiles({src.generic_string()}, "c-subset",
+        rc = prog.compileFiles({src.generic_string()}, "c",
                                {"x86_64:pe64-x86_64-windows-exec"}, rep);
         captured = cap.text();
     }

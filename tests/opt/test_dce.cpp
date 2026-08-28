@@ -338,11 +338,11 @@ TEST(Dce, RuntimeInitGlobalsModuleEmitsXOptPassSkippedInfo) {
 
 // const-ness preservation across DCE's standalone global-clone loop
 // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL). DCE rebuilds the surviving globals
-// (dce.cpp:303) — it MUST carry `MirGlobal.isConst`, or a const global silently
+// (dce.cpp) — it MUST carry `MirGlobal.isConst`, or a const global silently
 // degrades to a writable `.data` section after DCE (loss of read-only-memory
 // protection). Both globals have external (Global/Default) linkage → liveness
 // ROOTS, kept regardless of references, isolating the clone-loop field-carry.
-// RED-ON-DISABLE: drop the `mir.globalIsConst(g)` arg at dce.cpp:306 → the const
+// RED-ON-DISABLE: drop the `mir.globalIsConst(g)` arg at dce.cpp → the const
 // global comes back mutable and `constCount == 1` fails.
 TEST(Dce, PreservesGlobalConstness) {
     TypeInterner interner{CompilationUnitId{1}};

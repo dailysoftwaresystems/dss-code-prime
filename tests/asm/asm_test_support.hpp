@@ -192,6 +192,21 @@ roundTripVerify(TargetSchema const&            schema,
             }
             case LirOperandKind::ImmInt:
                 expected = static_cast<std::int64_t>(srcOp.immInt32);
+                // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: the 2-byte immediate
+                // slot emits the LOW 16 BITS of the operand, and the field
+                // cannot say which of the two spellings that produce those
+                // bits was written — ✔MEASURED, GNU as 2.42 assembles
+                // `movw $-1, %cx` and `movw $65535, %cx` to the IDENTICAL
+                // `66 b9 ff ff`. Compare what the encoder actually wrote,
+                // i.e. modulo 2^16; comparing the signed int32 instead
+                // would report a mismatch on every negative halfword while
+                // the emitted bytes were correct. NARROW BY CONSTRUCTION:
+                // the mask is keyed on the SLOT, so every other immediate
+                // slot keeps its exact full-width comparison.
+                if (wire.slotKind == EncodingSlotKind::Imm16Bytes) {
+                    expected = static_cast<std::int64_t>(
+                        static_cast<std::uint32_t>(srcOp.immInt32) & 0xFFFFu);
+                }
                 break;
             case LirOperandKind::SymbolRef:
                 // Symbol-bearing slots: disasm reports nullopt

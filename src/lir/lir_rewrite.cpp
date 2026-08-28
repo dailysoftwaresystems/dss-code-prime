@@ -72,15 +72,15 @@ collectAllocatable(TargetSchema const& schema, std::uint16_t ccIndex,
                            static_cast<unsigned>(ccIndex)));
         return false;
     }
-    auto absorb = [&](std::vector<std::string> const& names) {
-        for (auto const& n : names) outAllocatable.insert(n);
-    };
-    absorb(cc->callerSaved);
-    absorb(cc->calleeSaved);
-    absorb(cc->argGprs);
-    absorb(cc->argFprs);
-    absorb(cc->returnGprs);
-    absorb(cc->returnFprs);
+    // D-TARGET-ALLOCATABLE-POOL-LIST-SET-HAS-NO-OWNER: the SAME published
+    // table `lir_regalloc::buildFreeLists` reads. This function and that one
+    // must agree on which registers exist for allocation — a register one
+    // treats as reserved while the other harvests it as spill scratch is a
+    // silent wrong-register answer that nothing compares. They no longer
+    // "agree"; they read one object (target_schema.hpp).
+    for (auto const list : kAllocatablePoolLists) {
+        for (auto const& n : cc->*list) outAllocatable.insert(n);
+    }
     outCallerSet.reserve(cc->callerSaved.size());
     for (auto const& n : cc->callerSaved) outCallerSet.insert(n);
     return true;
@@ -263,11 +263,11 @@ classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
     std::uint32_t argRegionIdx = 0;
     for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
         LirOperand const& argOp = ops[k];
-        if (argOp.kind == LirOperandKind::ByValueStackAgg) continue;  // marker
-        bool const isByValCarrier =
-            argOp.kind == LirOperandKind::Reg && (k + 1) < ops.size()
-            && ops[k + 1].kind == LirOperandKind::ByValueStackAgg;
-        if (isByValCarrier) {
+        // The marker, and the MemOffset stating where its aggregate was placed,
+        // are consumed WITH the carrier below — never argument positions of their
+        // own (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES).
+        if (lirIsByValueStackAggDescriptor(ops, k)) continue;
+        if (lirIsByValueStackAggCarrier(ops, k)) {
             // Wholly-stacked aggregate — NOT a register arg (keep scratch path).
             // Advance the shared cursors + class-exhaust clamp as callconv does.
             std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
@@ -394,8 +394,8 @@ rewriteOneFunc(Lir const&               src,
     // SAME `forbiddenBase` the spilled-indirect-callee filter uses; the
     // result's class pool only ever matches its own-class arg regs).
     // `arg` ops have no operands, so THIS handle covers only the arg-op's
-    // OWN spilled RESULT store. ★ SCOPE-CORRECTED (TF-C55, D-AS-REWRITE-SPILL-
-    // SCRATCH-INCOMING-ARG-CLOBBER): c75's premise that "every later
+    // OWN spilled RESULT store. ★ SCOPE-CORRECTED (TF-C55,
+    // D-AS-REWRITE-SPILL-SCRATCH-INCOMING-ARG-CLOBBER): c75's premise that "every later
     // instruction runs after all args are materialized, so the arg-op result
     // store is the SOLE entry-region reload that can clobber a live incoming
     // arg reg" is FALSE under the release optimizer, which reorders a spilled

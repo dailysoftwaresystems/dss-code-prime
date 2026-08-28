@@ -570,9 +570,9 @@ TEST(CrossValidateLanguageTarget, ShippedAsmArm64MatchesArm64TargetAcrossTheName
 
 // The portable languages the repo actually ships must declare NO `isa` — this
 // is verdict 3 asserted against config rather than a fixture. A stray `isa` on
-// `c-subset` would refuse every cross-architecture C build in the corpus.
+// `c` would refuse every cross-architecture C build in the corpus.
 TEST(CrossValidateLanguageTarget, ShippedPortableLanguagesDeclareNoIsa) {
-    for (std::string_view const stem : {"c-subset", "toy", "tsql-subset"}) {
+    for (std::string_view const stem : {"c", "toy", "tsql-subset"}) {
         auto lang = GrammarSchema::loadShipped(stem);
         ASSERT_TRUE(lang.has_value()) << "could not load " << stem;
         EXPECT_TRUE((*lang)->isa().empty())
@@ -746,9 +746,9 @@ struct DepFixture {
 
     fs::path const proj = dir / "app.dss-project.json";
     std::string const rootSource =
-        rootLanguage == "c-subset" ? "main.c" : "main.s";
+        rootLanguage == "c" ? "main.c" : "main.s";
     writeText(dir / rootSource,
-              rootLanguage == "c-subset" ? "int main(void){ return 0; }\n"
+              rootLanguage == "c" ? "int main(void){ return 0; }\n"
                                          : ".text\n");
     writeText(proj, std::string{R"({
   "language": ")"} + std::string{rootLanguage} + R"(",
@@ -773,7 +773,7 @@ TEST(CrossValidateLanguageTargetResolver, X86AsmDependencyRefusedByArm64Consumer
     ComposableAsmConfig cfg{dir.path() / "cfg"};
     ASSERT_TRUE(cfg.ok()) << cfg.why();
 
-    auto const fx = writeDepFixture(dir.path(), "c-subset", "staticlib",
+    auto const fx = writeDepFixture(dir.path(), "c", "staticlib",
                                     "arm64:elf64-aarch64-linux-exec");
 
     ScopedEnv const configRoot{"DSS_CONFIG_ROOT", cfg.envValue()};
@@ -805,7 +805,7 @@ TEST(CrossValidateLanguageTargetResolver, X86AsmDependencyAcceptedByX86Consumer)
     ComposableAsmConfig cfg{dir.path() / "cfg"};
     ASSERT_TRUE(cfg.ok()) << cfg.why();
 
-    auto const fx = writeDepFixture(dir.path(), "c-subset", "staticlib",
+    auto const fx = writeDepFixture(dir.path(), "c", "staticlib",
                                     "x86_64:elf64-x86_64-linux-exec");
 
     ScopedEnv const configRoot{"DSS_CONFIG_ROOT", cfg.envValue()};

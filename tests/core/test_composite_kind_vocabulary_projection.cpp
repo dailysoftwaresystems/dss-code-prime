@@ -32,7 +32,7 @@
 //
 // WHAT THE FOUR PINS ASSERT, and it takes four because "the message and the
 // check name the same set" is not one claim:
-//   (A) CORPUS EXERCISE — the shipped `c-subset.lang.json` really declares every
+//   (A) CORPUS EXERCISE — the shipped `c.lang.json` really declares every
 //       spelling, on BOTH axes. Without it, deleting a table row would break
 //       nothing and the red-on-disable would be theatre.
 //   (B) COMPLETENESS — every spelling the table owns appears in each arm's
@@ -70,7 +70,7 @@ namespace {
 // collided with a real name would make the negative arms pass for the wrong
 // reason.
 constexpr char const* kBadSpelling = "zzNotAnyCompositeKind";
-constexpr char const* kLanguage    = "c-subset";
+constexpr char const* kLanguage    = "c";
 
 using ::dss::test_support::at;
 using ::dss::test_support::quotedTokens;

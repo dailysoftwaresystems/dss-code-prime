@@ -1,0 +1,16 @@
+{
+  "$comment": "TF-C89 (D-CSUBSET-SHIPPED-TYPEDEF-POSITION-BLIND-SUPPRESSION) — the TYPEDEF sibling of `bare_proto_shipped_redecl`. A TU BOTH `#include <stdint.h>` (shipped descriptor injects `int16_t`) AND redeclares that name LOWER DOWN the way a platform header does (`typedef short int16_t;` — byte-for-byte the macOS SDK's <sys/_types/_int16_t.h>, and legal C11 6.7p3). The USE is ABOVE the redeclaration. Goal-2's skip used to key on a WHOLE-TU, POSITION-BLIND name set, so the lower redeclaration DELETED the shipped typedef for the whole unit while the user's own declaration stayed POSITION-SENSITIVE (Pass 1.5 resolves declaration types in tree order) — everything above it resolved to NOTHING, though C 6.2.1p7 puts the enclosing declaration in scope there. In SQLite that killed i16 / i8 / LogEst / ynVar: 80 of the 123 S0006 on the arm64 macho corpus leg (MEASURED before and after, per-TU isolated census: S0006 123 -> 43, leg total 144 -> 63; the 123 needed the per-code cap temporarily lifted in a local build because the shipped cap of 50 was saturated on two TUs). RUNTIME-OBSERVABLE, not merely 'it compiles': the wrong repair is to let the name resolve to SOMETHING, so the aliases on BOTH sides of the redeclaration are witnessed to be exactly 16 bits and exactly SIGNED — a `volatile` seed of 40000 crosses the cast at run time and 40000 truncated into 16 signed bits is -25536, a number any other width or signedness changes, flipping the exit code; `sizeof` pins the same fact from the compile-time face so the two must agree. CLANG GROUND TRUTH (MEASURED 2026-07-29, arm64-darwin host): `clang -std=c11 -Wall -Wextra -isysroot $(xcrun --show-sdk-path) main.c` is CLEAN (rc 0, no warnings) and the native binary prints `est16-both-sides` and exits 42 — byte-for-byte what DSS produces. RED-ON-DISABLE, either arm: (a) restore the typedef injection's goal-2 skip to `userDeclaredNames` — the shipped int16_t is deleted and `typedef int16_t Est;` fails error[S0006] 'got int16_t', no artifact; (b) restore resolveTypeNodeImpl's alias walk to plain ScopeTree::lookup — the not-yet-typed user binding stops the walk before the shipped declaration and the SAME error fires. Line endings per the adjacent_string_concat convention (manifest pin = pe CRLF; the elf/macho targets override LF). The `release` arm runs the SHIPPED release pipeline over the same source, so optimizer x feature composition is witnessed rather than assumed — a `volatile` seed keeps the truncation a live runtime cast instead of one folded immediate.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "est16-both-sides\r\n",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"], "expectedStdout": "est16-both-sides\n" },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64", "expectedStdout": "est16-both-sides\n" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "", "expectedStdout": "est16-both-sides\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

@@ -4,7 +4,7 @@ add_library(lir_lowering OBJECT
 
 target_include_directories(lir_lowering PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
-# Aggregated into dss-code-prime-lib via $<TARGET_OBJECTS:lir_lowering>. Same
+# Aggregated into dsscp-lib via $<TARGET_OBJECTS:lir_lowering>. Same
 # DSS_BUILDING_DLL convention as the sibling LIR / MIR / HIR OBJECT libs.
 target_compile_definitions(lir_lowering PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 

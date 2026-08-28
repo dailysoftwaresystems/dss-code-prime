@@ -1,0 +1,18 @@
+{
+  "$comment": "AP6 (plan 06 §5.1 B.6.2) — the CONSUMER manifest for the compiler's `dependsOn` SOURCE-MERGE arm. `dependsOn` here is the PRODUCT feature read by the project-config loader (docs/project-config-spec.md §2.6), NOT the corpus harness's same-named key in expected.json — see examples/README.md for why two keys share a name deliberately. The entry is a `path` dependency: plan 06 §5.1 B.7 forbids any example that reaches the network, so nothing here clones, fetches or creates a `.dss-deps` cache; the git arm is witnessed by tests/program/test_dependency_git_cache.cpp against an injected fake.",
+  "$commentComposition": "The verb is dispatched on the DEPENDENCY'S OWN artifactProfile, never on this project's and never on a profile NAME: `scalemod` declares `module` → SourceMerge → its sources join this compilation. Two sources then reach the driver, so Program::compileProject routes to compileUnits (`cc a.c b.c` semantics) and `dss_scale_by_seven` binds across the CU boundary.",
+  "$commentSourceOrder": "`artifactName` is stated explicitly, but the ROOT'S OWN SOURCES LEAD REGARDLESS (plan 06 §5.1 B.11 M4(b)): `sourceFiles.front()`'s stem names the artifact when `artifactName` is absent, so a merge order that put the dependency first would SILENTLY RENAME the output binary — a green build with zero diagnostics and a missing file.",
+  "language": "c",
+  "artifactProfile": "cli",
+  "artifactName": "module_merge",
+  "targets": [
+    "x86_64:pe64-x86_64-windows-exec",
+    "x86_64:elf64-x86_64-linux-exec",
+    "arm64:elf64-aarch64-linux-exec",
+    "arm64:macho64-arm64-darwin-exec"
+  ],
+  "sources": ["main.c"],
+  "dependsOn": [
+    { "path": "scalemod" }
+  ]
+}

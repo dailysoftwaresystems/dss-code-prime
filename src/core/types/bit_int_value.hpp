@@ -36,6 +36,75 @@ namespace dss {
 // exceeds this is a constraint violation the typing call sites raise fail-loud.
 inline constexpr std::uint32_t kBitIntMaxWidth = 8388608u;
 
+// ══ D-CSUBSET-BITINT-PADDING-POLICY-HAS-THREE-OWNERS ═════════════════════════
+// ★★★ THE ONE STATEMENT OF DSS's `_BitInt` PADDING-BIT POLICY. A `_BitInt(N)`
+// object occupies a container WIDER than N (`sizeOfScalarOrBitInt`); C23 6.2.6.1p6
+// leaves the values of the bits above N-1 UNSPECIFIED, so more than one
+// representation conforms and the choice has to be MADE. DSS's is:
+//
+//     the padding bits carry the value's ARITHMETIC EXTENSION at width N under
+//     its own signedness — ONES iff the type is signed AND bit N-1 is set,
+//     otherwise ZEROS.
+//
+// ★ WHY IT LIVES IN ONE PLACE NOW. This rule used to be STATED, independently,
+// by THREE owners — this file's `maskTopLimb` (host arithmetic), `hir_to_mir.cpp`'s
+// `bitIntMask` + wide `maskTopLimb` (emitted MIR), and `asm.cpp`'s
+// `encodeBitIntImage` extension byte (the static image). That is the duplicated-
+// truth-table shape four other P42 lanes each closed by DELETING a copy, and it is
+// the one shape where a divergence is a SILENT MISCOMPILE rather than a refusal:
+// the static image is READ BY DSS's OWN RUNTIME, so an emitter that zero-filled
+// while the runtime sign-extended would make `_BitInt(17) g = -3wb; g < 0` answer
+// FALSE (the container holding +131069). Every tier now ASKS here.
+//
+// ★★ WHY THIS IS *NOT* `.target.json` VOCABULARY, and the question was asked
+// against the `$defaultAssemblyLanguageComment` reversion block in
+// `x86_64.target.json` ([[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]]),
+// which records an `asmSyntax` block added, built, gated GREEN and reverted the
+// same day for storing a per-(target, DIALECT) fact per-target. That block
+// disqualifies a key when the fact VARIES along an axis the key does not carry.
+// The padding-fill key fails the MIRROR test — the fact does not vary along the
+// axis the key WOULD carry:
+//   ✔MEASURED 2026-08-27, clang 18.1.3 `-std=c23`, static images: `_BitInt(3) = -1wb`
+//     emits `07` — padding ZERO — on x86_64-linux, aarch64-linux, aarch64_be-linux
+//     (BIG-ENDIAN), s390x-linux (BIG-ENDIAN), x86_64-pc-windows-msvc, i386-linux and
+//     riscv64-linux; identically at -O0/-O1/-O2/-Os, under -fPIC, and for
+//     `const`/`static`/extern storage. Seven targets, two ENDIANNESSES, three object
+//     formats, two data models: the fill is CONSTANT. What actually varies per target
+//     is BYTE ORDER (`01fffd00` vs `fdff0100`), and that already has an owner —
+//     `asm.cpp`'s `appendLittleEndianBytes`, the file's one byte-order chokepoint.
+//   ✔MEASURED at 301e2a63 on DSS itself: the emitted images for 24 (width x
+//     signedness) globals are BYTE-IDENTICAL on `x86_64` and `arm64`.
+// ⇒ A `bitIntPaddingFill` target key would be a knob with exactly one admissible
+// value on every target that exists — and the value the OTHER setting names is one
+// this engine cannot honour at all, because zero-filling a signed container is only
+// coherent under a sign-extend-ON-READ codegen model DSS does not have. The
+// `$defaultAssemblyLanguageComment` rejects a `-masm=`-style flag today in exactly
+// those words — "a knob with nothing to switch to" — and the
+// `$endiannessPredefinesComment` in the same file states the other half: "A key with
+// no consumer is dead config that can silently disagree with the macro." N target
+// documents restating one C++ constant is strictly worse than the constant, because
+// each one can disagree with the engine and the loader cannot see it.
+// ⇒ SO THE FIX IS ONE OWNER, NOT ONE MORE DOCUMENT. If a target ever genuinely
+// needs the other fill, this is the function it changes, and the day it exists it
+// gets a key AND a coherence example — the `charIsUnsigned` bar, not before.
+enum class BitIntPadding : std::uint8_t { Zeros, Ones };
+
+// The padding a `_BitInt` value carries, from its declared signedness and the
+// state of its sign bit (bit N-1). The whole policy; everything else derives.
+[[nodiscard]] constexpr BitIntPadding
+bitIntPadding(bool isSigned, bool signBitSet) noexcept {
+    return (isSigned && signBitSet) ? BitIntPadding::Ones : BitIntPadding::Zeros;
+}
+
+// Does the padding of a `_BitInt` of THIS signedness depend on the value's sign
+// bit? The question a code EMITTER asks: it cannot know the runtime sign bit, so
+// it must choose between materializing the padding FROM that bit (an arithmetic
+// shift pair) and writing a constant zero (a mask). Derived from `bitIntPadding`
+// rather than restating `isSigned`, so the emitters cannot drift from the policy.
+[[nodiscard]] constexpr bool bitIntPaddingTracksSignBit(bool isSigned) noexcept {
+    return bitIntPadding(isSigned, /*signBitSet=*/true) == BitIntPadding::Ones;
+}
+
 class BitIntValue {
 public:
     BitIntValue() { limbs_.assign(1, 0); }
@@ -111,6 +180,21 @@ public:
         return ((limbs_[li] >> (b % 64)) & 1ull) != 0;
     }
     [[nodiscard]] bool isNegative() const noexcept { return isSigned_ && signBitSet(); }
+
+    // D-CSUBSET-BITINT-PADDING-POLICY-HAS-THREE-OWNERS: the byte every container
+    // byte ABOVE this value's declared width carries — 0xFF or 0x00, read off the
+    // ONE policy above. The STATIC-IMAGE producer (`asm.cpp`'s `encodeBitIntImage`)
+    // asks here instead of recomputing `(signd && signBitSet()) ? 0xFF : 0x00`,
+    // which is the third statement of the rule this anchor names. Well-defined at
+    // every width: `signBitSet()` reads bit N-1 of the wrapped limbs, and the
+    // post-`wrapTo` invariant guarantees the limbs above N already hold exactly
+    // this byte — so the image producer's wall check ("bits outside the container
+    // must BE the extension") and the value's own representation cannot disagree.
+    [[nodiscard]] std::uint8_t paddingByte() const noexcept {
+        return bitIntPadding(isSigned_, signBitSet()) == BitIntPadding::Ones
+                   ? std::uint8_t{0xFFu}
+                   : std::uint8_t{0x00u};
+    }
 
     // ── The ONE wrap chokepoint ──────────────────────────────────────────────
     // Re-establish the invariant at a (possibly new) (width, isSigned): resize to
@@ -321,17 +405,23 @@ private:
     }
 
     // Mask / sign-extend the TOP limb of `limbs` (already ceil(width/64) entries)
-    // to `width` bits under `isSigned`.
+    // to `width` bits under `isSigned` — the HOST realization of the ONE padding
+    // policy declared above (D-CSUBSET-BITINT-PADDING-POLICY-HAS-THREE-OWNERS). It
+    // ASKS `bitIntPadding` rather than restating "signed and the sign bit is set";
+    // the MIR emitter (`hir_to_mir.cpp`'s `bitIntMask`) and the static-image
+    // producer (`asm.cpp`, via `paddingByte()`) ask the same function, so a change
+    // to the policy reaches all three tiers or none.
     static void maskTopLimb(std::vector<std::uint64_t>& limbs, std::uint32_t width, bool isSigned) {
         if (limbs.empty()) return;
         std::uint32_t const hb = ((width - 1u) % 64u) + 1u;   // significant bits, top limb
         if (hb == 64) return;                                 // full limb — nothing to clear
         std::uint64_t const mask = (std::uint64_t{1} << hb) - 1u;
         std::uint64_t& top = limbs.back();
-        if (isSigned && ((top >> (hb - 1)) & 1ull))
-            top |= ~mask;     // sign-extend bit hb-1 across [hb, 64)
+        bool const topBit = ((top >> (hb - 1)) & 1ull) != 0;
+        if (bitIntPadding(isSigned, topBit) == BitIntPadding::Ones)
+            top |= ~mask;     // the padding is ONES — extend bit hb-1 across [hb, 64)
         else
-            top &= mask;      // zero the bits above width
+            top &= mask;      // the padding is ZEROS — clear the bits above width
     }
 
     // Portable 64×64 → 128 (lo, hi) via 32-bit halves (no __uint128_t / _umul128 —

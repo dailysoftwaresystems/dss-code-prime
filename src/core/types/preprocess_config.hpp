@@ -27,7 +27,15 @@ namespace dss {
 //   Date     -- the translation DATE, a string literal `"Mmm dd yyyy"` computed
 //               once at construction (C 6.10.8.1).
 //   Time     -- the translation TIME, a string literal `"hh:mm:ss"` computed once.
-enum class PredefinedMacroKind { Line, File, Constant, Date, Time };
+//   Counter  -- a per-TRANSLATION-UNIT monotonically increasing decimal that
+//               advances ONCE PER EXPANSION (gcc/clang `__COUNTER__`). The ONLY
+//               STATEFUL kind: `Line`/`File` are functions of the invocation
+//               OFFSET and `Date`/`Time` are fixed at construction, so every
+//               other kind is reproducible from its argument alone, while this
+//               one's value depends on how many times it has already been read.
+//               That is exactly why it cannot be a `constant` row in the config
+//               (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED).
+enum class PredefinedMacroKind { Line, File, Constant, Date, Time, Counter };
 
 // The kind's CONFIG SPELLING — the same verb `parsePredefinedMacroArray`
 // (`predefined_macro_json.cpp`) accepts for the `"kind"` key, in ONE table so the
@@ -44,12 +52,13 @@ enum class PredefinedMacroKind { Line, File, Constant, Date, Time };
 //
 // No fall-back row is reachable: `PredefinedMacroKind` has no invalid sentinel,
 // so every value the engine can hold is enumerated below.
-inline constexpr EnumNameTable<PredefinedMacroKind, 5> kPredefinedMacroKindTable{{{
+inline constexpr EnumNameTable<PredefinedMacroKind, 6> kPredefinedMacroKindTable{{{
     { PredefinedMacroKind::Line,     "line"     },
     { PredefinedMacroKind::File,     "file"     },
     { PredefinedMacroKind::Constant, "constant" },
     { PredefinedMacroKind::Date,     "date"     },
     { PredefinedMacroKind::Time,     "time"     },
+    { PredefinedMacroKind::Counter,  "counter"  },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -236,8 +245,11 @@ impliedSurfaceKindFromName(std::string_view s) noexcept {
 // audited across 39 rows, and a reason that cannot be audited is a `null` with
 // extra keystrokes.
 //
-// The three were enumerated from the real corpus census (rows / distinct names):
-// `erases-to-nothing` 8/8, `arch-property` 52/16, `standard-defined` 10/10.
+// The first three were enumerated from the real corpus census (rows / distinct
+// names): `erases-to-nothing` 8/8, `arch-property` 52/16, `standard-defined`
+// 10/10. `compiler-extension` was added 2026-08-24 with `__COUNTER__`
+// (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED), which none of the three could describe
+// truthfully — see its own note below.
 enum class ClaimsNothingReason {
     // The macro EXPANDS TO NOTHING -- a calling-convention or decoration
     // spelling the target does not need (`__stdcall`, `WINAPI`). It cannot imply
@@ -251,12 +263,26 @@ enum class ClaimsNothingReason {
     // that document (`__STDC__`, `__LINE__`, `__STDC_VERSION__`). Its backing is
     // the implementation's conformance, not a shipped header.
     StandardDefined,
+    // The macro is a documented REFERENCE-COMPILER EXTENSION that no language
+    // standard mandates, and whose meaning is fixed by the compiler that
+    // provides it (`__COUNTER__` — gcc and clang define it, ISO C does not).
+    // Its backing is this implementation's own preprocessor, so like the three
+    // above there is no header to point at.
+    //
+    // ★ WHY IT IS NOT `standard-defined`. That row's whole content is the claim
+    // "the language document fixes this meaning", which is exactly what an
+    // auditor of these 39 rows is reading them to check. Reusing it for an
+    // extension would put a FALSE claim into the one field built to make such
+    // claims auditable — the failure mode this closed set exists to prevent,
+    // one level up from the free-text reason it replaced.
+    CompilerExtension,
 };
 
-inline constexpr EnumNameTable<ClaimsNothingReason, 3> kClaimsNothingReasonTable{{{
-    { ClaimsNothingReason::ErasesToNothing, "erases-to-nothing" },
-    { ClaimsNothingReason::ArchProperty,    "arch-property"     },
-    { ClaimsNothingReason::StandardDefined, "standard-defined"  },
+inline constexpr EnumNameTable<ClaimsNothingReason, 4> kClaimsNothingReasonTable{{{
+    { ClaimsNothingReason::ErasesToNothing,   "erases-to-nothing"  },
+    { ClaimsNothingReason::ArchProperty,      "arch-property"      },
+    { ClaimsNothingReason::StandardDefined,   "standard-defined"   },
+    { ClaimsNothingReason::CompilerExtension, "compiler-extension" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -315,6 +341,125 @@ struct DSS_EXPORT ImpliedSurface {
 // is what reads correctly in the claims-nothing case, and that case is the one
 // that has to be unmistakable.
 
+// ── D-PP-PREDEFINE-REDEFINITION-PARTITION ───────────────────────────────────
+//
+// A program `#define`s or `#undef`s a name this implementation predefined.
+// ★★ IT ALWAYS TAKES EFFECT. This field selects only whether it is DIAGNOSED.
+//
+// ★★★ THE FIRST CUT OF THIS FIELD MADE THE OPPOSITE RULING, AND THE REASON IT
+// WAS WRONG IS THE MOST REUSABLE THING HERE. It read C23 6.10.10.1p2 — "None of
+// the following macro names in this subclause nor the identifiers defined,
+// __has_c_attribute, __has_include, or __has_embed shall be the subject of a
+// #define or a #undef preprocessing directive" — as a CONSTRAINT, and therefore
+// kept `#define __STDC__ 9` a hard error. ✔RE-MEASURED against N3220: 6.10.10
+// has NO `Constraints` heading (6.10.10.1 is "General"), while 6.10.5 Macro
+// replacement DOES. C23 4p2 then decides it: "If a 'shall' or 'shall not'
+// requirement that appears outside of a constraint or runtime-constraint is
+// violated, the behavior is undefined" — and J.2 lists exactly that as
+// undefined behaviour. UB requires NO diagnostic (5.1.1.3 demands one only for
+// a syntax rule or CONSTRAINT violation).
+// ⇒ The standard is STRICTER about redefining an ordinary macro (6.10.5p2, a
+// real constraint) than about redefining `__STDC__` (UB). The intuition is
+// exactly inverted, which is why reading `shall not` as `constraint` without
+// checking the enclosing subclause produced a confident, wrong refusal.
+//
+// ✔MEASURED 2026-08-26 — gcc 13.3.0 and clang 18.1.3, probed SEPARATELY on
+// Ubuntu, `-Wall -std=c17`: 36 names × bare `#undef`, plus {bare `#define`,
+// `#undef`-then-`#define`, `#undef`} × 26 names × {in-source, `-D`/`-U`}, plus
+// the runtime effect. Both references agree on every cell:
+//
+//   class                  | bare #define | #undef then #define | bare #undef
+//   -----------------------+--------------+---------------------+------------
+//   6.10.10 / engine-derived| warn, rc=0  | warn(from the undef) | warn, rc=0
+//   implementation-supplied | warn, rc=0  | SILENT               | SILENT
+//   `defined`               | ERROR, rc=1 | ERROR                | ERROR
+//
+// ★ AND IT TAKES EFFECT IN EVERY CELL. `#undef __LINE__` + `#define __LINE__
+// 4242` prints 4242; `#undef __FILE__` + `#define __FILE__ "replaced"` prints
+// replaced; `#undef __STDC__` + `#define __STDC__ 77` prints 77; after a bare
+// `#undef`, `#ifdef __LINE__` / `__STDC__` / `__COUNTER__` are all FALSE and
+// `int __LINE__ = 9;` compiles and returns 9. On BOTH references.
+// ⇒ DSS must ACCEPT and APPLY all of it. `defined` is the only genuine refusal,
+// and it is genuinely different in kind: 6.10.2 makes `defined` an OPERATOR
+// inside `#if`, so admitting it as a macro name makes conditional inclusion
+// unparseable. That refusal lives in the conditional-inclusion-operator guard,
+// not here.
+//
+// ★★ THE DISCRIMINATOR IS MEASURED, NOT ASSUMED — and the obvious guess fails.
+// `__SIZE_TYPE__`, `__CHAR_BIT__`, `__INT_MAX__`, `__VERSION__`,
+// `__CHAR16_TYPE__`, `__SIZEOF_INT__` are all gcc BUILTINS in the reserved
+// identifier namespace, and all six are SILENT — so "is it a compiler builtin"
+// and "is it reserved-looking" are both wrong. The 36-name sweep splits exactly
+// on: the name is listed by ISO 6.10.10 itself, OR the preprocessor DERIVES its
+// value per use (`__FILE__ __LINE__ __DATE__ __TIME__ __COUNTER__
+// __BASE_FILE__ __INCLUDE_LEVEL__ __TIMESTAMP__`), OR it is a
+// conditional-inclusion operator. Nothing else warns.
+// ⓘ `__STDC_IEC_559__` reads warn/silent across the two only because gcc
+// defines it and clang does not — a name a compiler never defined has nothing
+// to undefine. Not a counterexample; the same rule over different inventories.
+//
+// ⚠ THE TAG IS MANDATORY IN JSON — no default, no null, same reasoning as
+// `impliedSurface`. Neither default is safe: defaulting to the warn class makes
+// DSS noisy about the next `__ARM_NEON` somebody adds; defaulting to ordinary
+// drops the diagnostic on the next `__STDC_ISO_10646__`. Both are silent
+// failures pointing opposite ways, so the question is asked out loud per row.
+// ⓘ It is DECLARED per entry rather than derived in the engine on purpose. A
+// derivation that is 90% right is worse than data: the engine would have to
+// know which names ISO 6.10.10 lists, and a name list in `src/` is the one
+// thing this architecture forbids.
+enum class PredefinedMacroRedefinition {
+    // ISO C 6.10.10 itself lists this name (6.10.10.2 mandatory / .3
+    // environment / .4 conditional feature). A `#define` or `#undef` is
+    // DIAGNOSED (warning) and then APPLIED — matching both references, and
+    // permitted because 6.10.10.1p2 is UB rather than a constraint.
+    WarnIsoMacro,
+    // The preprocessor DERIVES this macro's value per use — a `line`/`file`/
+    // `date`/`time`/`counter` kind — so it has no static replacement list.
+    // Also diagnosed-then-applied. ✔MEASURED: `__COUNTER__` is a pure extension
+    // ISO never mentions, and gcc AND clang both diagnose `#undef __COUNTER__`
+    // exactly as they diagnose `#undef __LINE__`. So this arm is not a DSS
+    // invention — the derived-value property is half of the references' own
+    // discriminator, and it is the half that catches `__COUNTER__`.
+    WarnDerivedMacro,
+    // An implementation-supplied extension that is neither. It is an ORDINARY
+    // macro this implementation happens to pre-seed: `#undef` is silent, and a
+    // `#define` is governed only by the ordinary 6.10.5p2 policy (see
+    // D-PP-INCOMPATIBLE-REDEFINITION-IS-FATAL, which already warns-and-takes-
+    // the-new-definition and was itself measured against these references).
+    Ordinary,
+};
+
+inline constexpr EnumNameTable<PredefinedMacroRedefinition, 3>
+    kPredefinedMacroRedefinitionTable{{{
+        { PredefinedMacroRedefinition::WarnIsoMacro,     "warn-iso-macro"     },
+        { PredefinedMacroRedefinition::WarnDerivedMacro, "warn-derived-macro" },
+        { PredefinedMacroRedefinition::Ordinary,         "ordinary"           },
+    }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kPredefinedMacroRedefinitionTable);
+
+[[nodiscard]] constexpr std::string_view
+predefinedMacroRedefinitionName(PredefinedMacroRedefinition r) noexcept {
+    return kPredefinedMacroRedefinitionTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<PredefinedMacroRedefinition>
+predefinedMacroRedefinitionFromName(std::string_view s) noexcept {
+    return kPredefinedMacroRedefinitionTable.fromName(s);
+}
+
+// THE ONE PREDICATE the engine asks. Defined as the COMPLEMENT of `Ordinary`
+// rather than as an enumeration of the warn verbs, so a fourth warn reason
+// added tomorrow is diagnosed by default instead of silently falling through to
+// "say nothing" — the same polarity the anchor-balance gate uses for "open
+// unless explicitly closed", and for the same reason.
+[[nodiscard]] constexpr bool
+predefinedNameIsDiagnosedOnChange(PredefinedMacroRedefinition r) noexcept {
+    return r != PredefinedMacroRedefinition::Ordinary;
+}
+
 // FC15b: one config-declared predefined macro (C 6.10.8). `name` is the macro
 // identifier (matched by TEXT, like the directive words); `kind` selects the
 // materialization behavior; `value` is the literal replacement spelling and is
@@ -362,6 +507,15 @@ struct DSS_EXPORT PredefinedMacroDef {
     // The load guarantees this is populated and internally consistent for every
     // row that reaches this struct: a malformed row never lands.
     ImpliedSurface impliedSurface;
+
+    // D-PP-PREDEFINE-REDEFINITION-PARTITION: MANDATORY IN JSON on every row (see
+    // the enum above). The C++ default is the DIAGNOSED half deliberately: a
+    // construction site that has not been taught about the field gets a
+    // diagnostic rather than silence, and a spurious warning is a visible
+    // failure while a missing one is not. The JSON loader never relies on it —
+    // a row without the key fails to load.
+    PredefinedMacroRedefinition programRedefinition =
+        PredefinedMacroRedefinition::WarnIsoMacro;
 
     // PROVENANCE — the JSON POINTER of this entry inside its declaring document
     // (e.g. "/preprocess/predefinedMacros/7"), set by the shared entry parser.
@@ -644,8 +798,21 @@ struct DSS_EXPORT PreprocessConfig {
 
     // The token kind that marks a VARIADIC function-like macro's
     // catch-all parameter (C's `...` -> "EllipsisOp"). The macro engine reads
-    // it to RECOGNISE `#define V(...)` in parameter position (today: fail loud,
-    // D-PP-VARIADIC-MACRO -- the `__VA_ARGS__` substitution is FC15-area). Like
+    // it to RECOGNISE `#define V(...)` in parameter position.
+    // WARNING: this parenthetical USED TO READ "(today: fail loud,
+    // D-PP-VARIADIC-MACRO -- the `__VA_ARGS__` substitution is FC15-area)", and
+    // BOTH of its halves WERE FALSE by the time the commit landed. It is
+    // corrected here instead of deleted because the failure mode is the point:
+    // a bare "today" is a claim with no date and no instrument, so it never
+    // stops being read as the present tense
+    // (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+    // MEASURED at the CLI 2026-08-24 on x86_64:pe64-x86_64-windows-exec, debug
+    // AND release: `#define SUM3(...) dssAdd(__VA_ARGS__)` called as
+    // `SUM3(20, 15, 7)` compiles rc=0 and the program RUNS returning 42 -- the
+    // form is accepted and the substitution happens. The row it cited IS
+    // CLOSED, and this header contradicted itself about it: `variadicArgsName`
+    // two fields below is the config knob FOR that substitution and its own
+    // comment describes the engine performing it. Like
     // every other PP-vocabulary token this is a per-language CONFIG lexeme, NOT
     // a hard-coded `...`: a second preprocess-opting language whose variadic
     // marker is spelled differently would otherwise have a word-like marker
@@ -708,7 +875,7 @@ struct DSS_EXPORT PreprocessConfig {
     // `#` -> "HashOp", C 6.10.3.2). In a function-like macro's REPLACEMENT list,
     // a `#` immediately followed by a parameter stringizes that parameter's RAW
     // (un-pre-expanded) argument into a single string literal. The macro engine
-    // detects it by this token KIND -- which, in c-subset, is the SAME `HashOp`
+    // detects it by this token KIND -- which, in c, is the SAME `HashOp`
     // as `directiveIntroToken`: directives are peeled at top level (firstOnLine)
     // BEFORE expansion, so every `#` a replacement list carries IS a stringize
     // operator (no ambiguity). Per-language CONFIG kind, never a hard-coded `#`:
@@ -923,6 +1090,48 @@ struct DSS_EXPORT PreprocessConfig {
     // opt-in model). The engine matches THIS string, never a hard-coded "line".
     std::string lineDirective;     // "line"
 
+    // ── D-C-PREPROCESSED-INPUT-REFUSES-GCC-LINEMARKERS: the LINEMARKER form ──
+    //
+    // `# 1 "file"` / `# 1 "file" 1 3 4` — what `gcc -E` and `clang -E` write in
+    // place of a `#line`. It is the SAME presumed-position facility with a
+    // different spelling: the digits and the quoted name set the presumed line
+    // and file for what follows, exactly as `#line N "f"` does, and the engine
+    // records both through the one shared `recordPresumedPosition`.
+    //
+    // ★ WHY IT NEEDS ITS OWN DECLARATION RATHER THAN RIDING ON `lineDirective`.
+    // The directive WORD is a digit sequence, not a word, so there is no lexeme
+    // to match against a configured spelling — the SHAPE is the recognizer. A
+    // language that does not declare this block therefore leaves `# 1 "f"` on the
+    // generic unsupported-directive fail-loud (`P_PreprocessorUnsupported`), the
+    // same opt-in model `pragmaDirective`/`embedDirective`/`lineDirective` use.
+    //
+    // ⚠ AND THE FLAGS ARE NOT DECORATION, which is why they are DECLARED and not
+    // skipped. ✔MEASURED 2026-08-24 over one `_GNU_SOURCE` TU (stdio + string +
+    // a local header): gcc 13.3.0 emits 154 linemarkers and clang 18.1.3 / 19.1.1
+    // emit 177, carrying the flag tails {}, {1}, {2}, {3}, {1,3,4}, {2,3,4},
+    // {3,4} — no other combination, and no digit outside 1..4. Both references
+    // REFUSE an undeclared digit (`# 1 "f.c" 9`) and refuse two members of the
+    // enter/return pair together (`# 1 "f.c" 1 2`), so the validation below is
+    // the references' own, not an invention.
+    //
+    // ✔AND FLAG 3 GENUINELY CHANGES OBSERVABLE BEHAVIOUR IN THE REFERENCES,
+    // measured rather than assumed: clang 19.1.1 warns `-Wunused-variable` for an
+    // unused local inside a region marked `1` and does NOT warn when the same
+    // region is marked `1 3`. That is why an implementation may not parse the
+    // line and discard the tail in silence. What DSS does with it is stated on
+    // `LineMarkerFlagDef::name` below and pinned by a test.
+    struct LineMarkerFlagDef {
+        std::string digits;          // the flag SPELLING, e.g. "3" (decimal)
+        std::string name;            // its meaning, quoted in diagnostics
+        std::string exclusiveGroup;  // empty = no exclusion; else the group id
+    };
+    struct LineMarkerConfig {
+        std::vector<LineMarkerFlagDef> flags;
+    };
+    // OPTIONAL — absent (nullopt) means the language declares no linemarker
+    // surface at all and the line stays a loud unsupported directive.
+    std::optional<LineMarkerConfig> lineMarker;
+
     // D-CPP-ERROR-WARNING (`#error`; C23 6.10.5 / `#warning`; C23 6.10.6): the
     // DIAGNOSTIC directive words, matched by lexeme TEXT against the token after
     // `#` (like define/undef/include/line -- `error`/`warning` lex as plain
@@ -1005,7 +1214,7 @@ struct DSS_EXPORT PreprocessConfig {
 //           #ifndef __has_include
 //           #define __has_include(x) 0
 //           #endif
-//       (Apple SDK `sys/cdefs.h:91-93`, and the same three lines in glibc,
+//       (Apple SDK `sys/cdefs.h`, and the same three lines in glibc,
 //       musl, Boost, zlib, ...): the guard is DEAD on a compiler that has the
 //       operator. Reading the name as undefined takes the arm and SHADOWS the
 //       real operator with a function-like macro that answers 0 forever.

@@ -643,11 +643,11 @@ TEST(CoffObjectReader, DeclaredIsCallRoleUpgradesAnExternWithNoTypeHint) {
     ASSERT_NE(gRec, 0u);
     wr16(obj, gRec + 14u, 0x0000);
 
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
     std::string text;
     {
-        std::ifstream in{*root / "src" / "dss-config" / "object-formats"
+        std::ifstream in{*root / "object-formats"
                              / "pe64-x86_64-windows.format.json",
                          std::ios::binary};
         ASSERT_TRUE(in.good());
@@ -726,11 +726,11 @@ TEST(CoffObjectReader, EmitOnlyAliasIsHonouredNotRefused) {
     ASSERT_TRUE(loaded.target && loaded.format);
     auto obj = validObject(loaded);
 
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
     std::string text;
     {
-        std::ifstream in{*root / "src" / "dss-config" / "object-formats"
+        std::ifstream in{*root / "object-formats"
                              / "pe64-x86_64-windows.format.json",
                          std::ios::binary};
         ASSERT_TRUE(in.good());
@@ -1373,14 +1373,14 @@ TEST(CoffForeignObjectNative, SingleClObjStaticLinkExitsFortyTwo) {
     p.setResolveLibraries(std::vector<std::filesystem::path>{dir / "foo.lib"});
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{(dir / "main.c").string()}, "c-subset",
+        std::vector<std::string>{(dir / "main.c").string()}, "c",
         std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
     ASSERT_EQ(rc, 0) << "static-link against the real cl.exe `.lib` must succeed; errs="
                      << rep.errorCount();
     auto const exe = dir / "main.exe";
     ASSERT_TRUE(std::filesystem::exists(exe));
 
-    auto const r = test_support::runBinary(exe, std::chrono::milliseconds{5000});
+    auto const r = test_support::runBinary(exe);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -1422,14 +1422,14 @@ TEST(CoffForeignObjectNative, MultiMemberComdatDedupExitsFortyTwo) {
     p.setResolveLibraries(std::vector<std::filesystem::path>{dir / "ab.lib"});
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{(dir / "main.c").string()}, "c-subset",
+        std::vector<std::string>{(dir / "main.c").string()}, "c",
         std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
     ASSERT_EQ(rc, 0) << "both members pull + the shared_w COMDAT dedups; errs="
                      << rep.errorCount();
     auto const exe = dir / "main.exe";
     ASSERT_TRUE(std::filesystem::exists(exe));
 
-    auto const r = test_support::runBinary(exe, std::chrono::milliseconds{5000});
+    auto const r = test_support::runBinary(exe);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -1481,7 +1481,7 @@ TEST(CoffLocalFunctionInArchive, DssBuiltLibMemberCallingAStaticHelperExitsForty
     DiagnosticReporter libRep;
     ASSERT_EQ(pLib.compileFiles(
                   std::vector<std::string>{(dir / "dsslocal.c").string()},
-                  "c-subset",
+                  "c",
                   std::vector<std::string>{"x86_64:pe64-x86_64-windows-staticlib"},
                   libRep),
               0)
@@ -1550,7 +1550,7 @@ TEST(CoffLocalFunctionInArchive, DssBuiltLibMemberCallingAStaticHelperExitsForty
     pMain.setResolveLibraries(std::vector<std::filesystem::path>{libPath});
     DiagnosticReporter rep;
     int const rc = pMain.compileFiles(
-        std::vector<std::string>{(dir / "main.c").string()}, "c-subset",
+        std::vector<std::string>{(dir / "main.c").string()}, "c",
         std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
     ASSERT_EQ(rc, 0)
         << "linking an archive member that calls a file-local function must "
@@ -1575,7 +1575,7 @@ TEST(CoffLocalFunctionInArchive, DssBuiltLibMemberCallingAStaticHelperExitsForty
     // ★ The general shape: A CROSS-COMPILE TEST THAT SPAWNS ITS OUTPUT IS TWO
     // TESTS, and only the second one is about the host.
 #if defined(_WIN32)
-    auto const r = test_support::runBinary(exe, std::chrono::milliseconds{5000});
+    auto const r = test_support::runBinary(exe);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -1622,7 +1622,7 @@ TEST(CoffForeignObjectNative, ClObjLibMemberCallingAStaticHelperExitsFortyTwo) {
     p.setResolveLibraries(std::vector<std::filesystem::path>{dir / "loc.lib"});
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{(dir / "main.c").string()}, "c-subset",
+        std::vector<std::string>{(dir / "main.c").string()}, "c",
         std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
     ASSERT_EQ(rc, 0)
         << "a real cl.exe `.lib` member calling its own `static` helper must "
@@ -1630,7 +1630,7 @@ TEST(CoffForeignObjectNative, ClObjLibMemberCallingAStaticHelperExitsFortyTwo) {
     auto const exe = dir / "main.exe";
     ASSERT_TRUE(std::filesystem::exists(exe));
 
-    auto const r = test_support::runBinary(exe, std::chrono::milliseconds{5000});
+    auto const r = test_support::runBinary(exe);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -1781,9 +1781,8 @@ TEST(CoffForeignObject, ComdatSelectionComesFromTheSectionSymbolNotAPrecedingAux
 }
 
 // ============================================================================
-// THE COFF DATA HALF -- D-LK-COFF-ARCHIVE-MEMBER-READER-LOSES-STATIC-RODATA-
-// SYMBOLS, the second half of D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-
-// LABEL-NOT-ATOM.
+// THE COFF DATA HALF -- D-LK-COFF-ARCHIVE-MEMBER-READER-LOSES-STATIC-RODATA-SYMBOLS,
+// the second half of D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM.
 //
 // ★ WHY THE DERIVED TYPE CANNOT DECIDE THIS ONE. COFF stamps `notype` on EVERY
 // data symbol regardless of linkage -- `pe.cpp`'s defined-DATA loop says so in
@@ -2818,7 +2817,7 @@ TEST(CoffWeakExternalNative, RealMingwWeakUndefinedReferenceIsRefusedNotDowngrad
 //
 // [[D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE]] declined to build this writer on
 // 2026-08-05, on a measured premise: zero consumers, plus a named front-end
-// blocker ([[D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE]] -- the c-subset
+// blocker ([[D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE]] -- the c
 // cannot express `__attribute__((alias(...)))`, so a writer would be a path
 // nothing could invoke). That premise CHANGED, and this test is the proof: the
 // consumer is not a front end at all. gcc writes the alias, DSS READS it, DSS
@@ -2910,7 +2909,7 @@ TEST(CoffWeakExternalNative, ForeignLinkerConsumesADssReEmittedWeakAlias) {
 
     // 5. ...and it RUNS. 10*2 + 11*2 = 42, which is only reachable if BOTH
     //    names reached the SAME body.
-    auto const r = test_support::runBinary(exe, std::chrono::milliseconds{5000});
+    auto const r = test_support::runBinary(exe);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -2967,4 +2966,685 @@ TEST(CoffWeakExternalNative, RealMingwWeakDataDefinitionBindsToItsRealName) {
     ASSERT_GE(d->bytes.size(), 4u);
     EXPECT_EQ(d->bytes[0], 7u) << "the weak datum's initialiser, little-endian";
 #endif
+}
+
+// ── (h) A NAMELESS UNDEF RECORD: REFUSED, NOT DROPPED ────────────────────────
+//    D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED.
+//
+// The twin of `NamelessWeakExternalFailsLoudRatherThanBeingDropped` above, and
+// it was left alone when that one landed BECAUSE it is a decision rather than a
+// fix: unlike the weak external it carries no aux relation, and its skip was
+// DOCUMENTED as deliberate ("a nameless slot carries no import identity").
+//
+// ★★ THE DECISION IS REFUSAL, AND THE MEASUREMENT THAT SETTLES IT IS THE INDEX.
+// The record still occupies a `NumberOfSymbols` slot, so a relocation can name
+// it BY INDEX, and every gate that would catch such a relocation lets it
+// through: the bound check passes (the index is real), the aux-slot check
+// passes (it is not an aux), and `rel.target = SymbolId{ownerOf(symIdx)}` then
+// names a SymbolId this reader never produced. ✔MEASURED by reading the
+// relocation loop's own conclusion at (6.44) -- "an id that owns no body is
+// `K_SymbolUndefined` at the linker's compound index". So the drop does not
+// vanish; it re-emerges at MERGE time as an unresolved symbol with NO NAME TO
+// PRINT, attributed to whoever merged the object rather than to the malformed
+// record that caused it.
+//
+// ★ AND THE RECORD IS MALFORMED, NOT UNMODELED. PE/COFF 5.4.2 makes an UNDEF
+// record with Value 0 "a reference to an external symbol defined elsewhere" --
+// a reference resolved BY NAME. A nameless one names nothing any object could
+// satisfy, so there is no meaning DSS is declining to model; there is only a
+// record that cannot be represented, which the bar says must refuse by name.
+//
+// ⚠ BLAST RADIUS MEASURED BEFORE CHANGING IT, because it lands on objects DSS
+// did not write: the `CoffForeignObjectNative` witnesses over real cl.exe /
+// clang-cl objects (a `/GS-` object, a `/Gy` object, a multi-member `.lib`, and
+// the mingw-gcc probes) stay green, i.e. no real producer emits this shape.
+TEST(CoffObjectReader, NamelessUndefExternFailsLoudRatherThanBeingDropped) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         // UNDEF(0), EXTERNAL, Value 0 -- an import -- with NO NAME.
+         BSym{"", 0, 0, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value())
+        << "a nameless UNDEF record must be refused, not skipped -- its slot is "
+           "still addressable by a relocation";
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::F_CorruptedBinary));
+    EXPECT_TRUE(sawDetail(rep, "EMPTY name"));
+    EXPECT_TRUE(sawDetail(rep, "BY INDEX"))
+        << "the diagnostic must name the HAZARD, not merely the malformation -- "
+           "the next reader has to know why a skip was not good enough";
+    EXPECT_TRUE(sawDetail(rep, "D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED"));
+}
+
+// The same arm serves class-STATIC records, and it must: `roleForStorageClass`
+// resolves both EXTERNAL and STATIC before the UNDEF test, so a nameless STATIC
+// record with SectionNumber 0 reaches exactly the same line and occupies
+// exactly the same addressable slot.
+TEST(CoffObjectReader, NamelessUndefStaticRecordIsRefusedByTheSameArm) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"", 0, 0, 0, kClassStatic, std::nullopt, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::F_CorruptedBinary));
+    EXPECT_TRUE(sawDetail(rep, "D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED"));
+}
+
+// ANTI-SUBSUMPTION, and it is the arm that keeps the refusal NARROW. A NAMED
+// UNDEF extern -- the shape every real object is full of -- must still read
+// green and still become an import. Without this, a reader that had started
+// refusing every UNDEF record would satisfy both arms above.
+TEST(CoffObjectReader, ANamedUndefExternStillReadsGreenAsAnImport) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"puts", 0, 0, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_TRUE(hasExternNamed(*got, "puts"))
+        << "the named UNDEF record is still an extern import -- the refusal is "
+           "about the MISSING NAME, not about UNDEF records";
+}
+
+// ── SAME_SIZE(3) / EXACT_MATCH(4): THE TWO SELECTIONS THAT CARRY A DUTY ─────
+//    D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED
+//
+// ✔MEASURED BEFORE THIS BLOCK EXISTED: `grep 'SameSize\|ExactMatch'` over this
+// file returned ZERO hits, and the reader routed selections 3 and 4 into the
+// SAME switch arm as ANY(2) -- one fall-through, no size compare, no byte
+// compare anywhere in the tree. So the two selections whose ENTIRE contract is
+// "duplicates must match, else error" were exactly the two with no coverage,
+// and DSS accepted, silently, precisely the input the format tells it to
+// reject.
+//
+// The pins come in two halves and BOTH are needed:
+//   * the READER decodes the selection byte into a universal duty
+//     (`ModuleSymbol::duplicateMatch`) -- pinned here, per selection, because a
+//     narrowing typo in the switch would otherwise fall to the `default:`
+//     fail-loud arm and reject a legal object with nothing to notice;
+//   * the FOLD discharges the duty -- pinned end-to-end below through
+//     `linker::link`, and directly against the shared kernel in
+//     `tests/link/test_cross_cu_resolve.cpp`.
+//
+// RED ON DISABLE (reader half): collapse `case kComdatSelSameSize:` /
+// `case kComdatSelExactMatch:` back into the `kComdatSelAny` arm in
+// `coff_object_reader.cpp`. The duty degrades to `Any`, the mismatch is no
+// longer detected, and `MismatchedSameSizeComdatDuplicatesFailLoud` /
+// `MismatchedExactMatchComdatDuplicatesFailLoud` below go RED.
+
+namespace {
+
+// The two selection bytes this file had no constant for until now. Deliberately
+// spelled beside the existing four rather than inline: a literal `3` passed as
+// `auxSelection` reads as an ordinal, not as a policy.
+constexpr std::uint8_t kSelSameSize = 3, kSelExactMatch = 4;
+
+// The reconstructed ModuleSymbol row of a defined symbol (by name). `bindingOf`
+// above answers only about the binding; the COMDAT duty rides on the SAME row
+// and a test that could not read it would be asserting the lift while leaving
+// the promise -- the actual subject -- unobserved.
+[[nodiscard]] ModuleSymbol const*
+symbolNamed(AssembledModule const& m, std::string const& name) {
+    for (auto const& s : m.symbols) if (s.name == name) return &s;
+    return nullptr;
+}
+
+// One synthetic archive member: a COMDAT `.data` datum `shared_w` carrying
+// `wbytes` under `selection`, plus a distinct Global function so the two
+// members are not otherwise identical modules.
+[[nodiscard]] std::vector<std::uint8_t>
+comdatMember(std::string const& fn, std::uint8_t retImm, std::uint8_t selection,
+             std::vector<std::uint8_t> const& wbytes) {
+    std::vector<std::uint8_t> const body = {0xB8, retImm, 0x00, 0x00, 0x00, 0xC3};
+    return buildCoff(
+        {BSec{".data", kScnData | kScnLnkComdat, wbytes, {}},
+         BSec{".text$mn", kScnText, body, {}}},
+        {BSym{".data", 0, 1, 0, kClassStatic, selection},
+         BSym{"shared_w", 0, 1, 0, kClassExternal, std::nullopt},
+         BSym{fn, 0, 2, kDtypeFunction, kClassExternal, std::nullopt}});
+}
+
+// Read the two members back and merge them. Returns the link reporter so the
+// caller can assert on the diagnostics; asserts the READS themselves succeeded,
+// because a refused read would vacate every claim about the merge.
+struct MergedPair {
+    bool                       readsOk = false;
+    std::optional<SymbolBinding> bindingA;
+    std::optional<SymbolBinding> bindingB;
+    std::string                messages;
+    bool                       sawRedefinition = false;
+};
+
+[[nodiscard]] MergedPair
+mergeTwoComdatMembers(std::vector<std::uint8_t> const& objA,
+                      std::vector<std::uint8_t> const& objB,
+                      TargetSchema const& target,
+                      ObjectFormatSchema const& format) {
+    MergedPair out;
+    DiagnosticReporter repA, repB;
+    auto modA = pe::readRelocatableObject(objA, target, format, repA,
+                                          CompilationUnitId{1});
+    auto modB = pe::readRelocatableObject(objB, target, format, repB,
+                                          CompilationUnitId{2});
+    if (!modA.has_value() || !modB.has_value()) return out;
+    out.readsOk  = true;
+    out.bindingA = bindingOf(*modA, "shared_w");
+    out.bindingB = bindingOf(*modB, "shared_w");
+
+    std::array<AssembledModule, 2> const mods{*modA, *modB};
+    DiagnosticReporter linkRep;
+    (void)linker::link(std::span<AssembledModule const>{mods.data(), mods.size()},
+                       target, format, linkRep);
+    out.sawRedefinition =
+        sawCode(linkRep, DiagnosticCode::K_SymbolRedefinedAcrossUnits);
+    for (auto const& d : linkRep.all()) {
+        out.messages += d.actual;
+        out.messages += '\n';
+    }
+    return out;
+}
+
+} // namespace
+
+// -- Reader half: selection 3 lifts to Weak AND records the SAME_SIZE duty ----
+TEST(CoffForeignObject, DataComdatSameSizeLiftsWeak) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    std::vector<std::uint8_t> const wbytes = {42, 0, 0, 0};
+    auto const obj = buildCoff(
+        {BSec{".data", kScnData | kScnLnkComdat, wbytes, {}}},
+        {BSym{".data", 0, 1, 0, kClassStatic, kSelSameSize},
+         BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}});
+
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value())
+        << "SAME_SIZE(3) is a LEGAL selection and must not reach the fail-loud "
+           "default arm; errs=" << rep.errorCount();
+    EXPECT_EQ(bindingOf(*got, "W").value_or(SymbolBinding::Global),
+              SymbolBinding::Weak);
+    auto const* sym = symbolNamed(*got, "W");
+    ASSERT_NE(sym, nullptr);
+    EXPECT_EQ(sym->duplicateMatch, DuplicateMatch::SameSize)
+        << "the Selection byte is a PROMISE the linker must verify; lifting to "
+           "Weak while discarding WHICH promise was made is the defect "
+           "(D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED)";
+}
+
+// -- Reader half: selection 4 lifts to Weak AND records the EXACT_MATCH duty --
+TEST(CoffForeignObject, DataComdatExactMatchLiftsWeak) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    std::vector<std::uint8_t> const wbytes = {42, 0, 0, 0};
+    auto const obj = buildCoff(
+        {BSec{".data", kScnData | kScnLnkComdat, wbytes, {}}},
+        {BSym{".data", 0, 1, 0, kClassStatic, kSelExactMatch},
+         BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}});
+
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value())
+        << "EXACT_MATCH(4) is a LEGAL selection; errs=" << rep.errorCount();
+    EXPECT_EQ(bindingOf(*got, "W").value_or(SymbolBinding::Global),
+              SymbolBinding::Weak);
+    auto const* sym = symbolNamed(*got, "W");
+    ASSERT_NE(sym, nullptr);
+    EXPECT_EQ(sym->duplicateMatch, DuplicateMatch::ExactContent);
+}
+
+// -- ANY keeps promising nothing. The fix must NOT widen into the arm that was
+//    already correct: ANY is the encoding DSS's OWN writer emits for every weak
+//    definition, so comparing it would refuse DSS's own output.
+TEST(CoffForeignObject, DataComdatAnyRecordsNoDuplicatePromise) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".data", kScnData | kScnLnkComdat, {42, 0, 0, 0}, {}}},
+        {BSym{".data", 0, 1, 0, kClassStatic, kSelAny},
+         BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value());
+    auto const* sym = symbolNamed(*got, "W");
+    ASSERT_NE(sym, nullptr);
+    EXPECT_EQ(sym->duplicateMatch, DuplicateMatch::Any);
+}
+
+// -- NODUPLICATES stays Global and promises nothing: a duplicate is an error by
+//    a DIFFERENT rule (the all-strong merge), and giving it a duty as well
+//    would double-report the same condition.
+TEST(CoffForeignObject, ComdatNoDuplicatesRecordsNoDuplicatePromise) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".data", kScnData | kScnLnkComdat, {42, 0, 0, 0}, {}}},
+        {BSym{".data", 0, 1, 0, kClassStatic, kSelNoDup},
+         BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value());
+    auto const* sym = symbolNamed(*got, "W");
+    ASSERT_NE(sym, nullptr);
+    EXPECT_EQ(bindingOf(*got, "W").value_or(SymbolBinding::Weak),
+              SymbolBinding::Global);
+    EXPECT_EQ(sym->duplicateMatch, DuplicateMatch::Any);
+}
+
+// -- END TO END: a SAME_SIZE pair whose sizes AGREE folds silently -----------
+//
+// The control for the refusal below. Without it, that refusal could be caused
+// by anything at all about a two-member SAME_SIZE link.
+TEST(CoffForeignObject, MatchingSameSizeComdatDuplicatesFoldSilently) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // Same LENGTH, deliberately DIFFERENT bytes -- SAME_SIZE promises the size
+    // and nothing else, so this pair is legal and must link.
+    auto const objA = comdatMember("alpha", 20, kSelSameSize, {1, 0, 0, 0});
+    auto const objB = comdatMember("beta", 22, kSelSameSize, {2, 0, 0, 0});
+
+    auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                           *loaded.format);
+    ASSERT_TRUE(got.readsOk);
+    EXPECT_EQ(got.bindingA.value_or(SymbolBinding::Global), SymbolBinding::Weak);
+    EXPECT_EQ(got.bindingB.value_or(SymbolBinding::Global), SymbolBinding::Weak);
+    EXPECT_FALSE(got.sawRedefinition)
+        << "equal-length SAME_SIZE duplicates satisfy their promise and must "
+           "fold: " << got.messages;
+}
+
+// -- END TO END: a SAME_SIZE pair whose sizes DIFFER must FAIL LOUD ----------
+TEST(CoffForeignObject, MismatchedSameSizeComdatDuplicatesFailLoud) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const objA = comdatMember("alpha", 20, kSelSameSize, {1, 0, 0, 0});
+    auto const objB = comdatMember("beta", 22, kSelSameSize, {2, 0});
+
+    auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                           *loaded.format);
+    ASSERT_TRUE(got.readsOk)
+        << "both members are individually well-formed; the violation is a "
+           "property of the PAIR and must surface at the merge, not the read";
+    EXPECT_TRUE(got.sawRedefinition)
+        << "two IMAGE_COMDAT_SELECT_SAME_SIZE definitions of `shared_w` with 4 "
+           "and 2 bytes broke the promise their selection byte made, and DSS "
+           "kept one anyway. The format specifies this as a multiply defined "
+           "symbol error (D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED). "
+           "Diagnostics were: " << got.messages;
+    EXPECT_NE(got.messages.find("same-size"), std::string::npos)
+        << "the diagnostic must name WHICH promise was broken, otherwise the "
+           "reader cannot tell it from an ordinary two-strong collision: "
+        << got.messages;
+    EXPECT_NE(got.messages.find("shared_w"), std::string::npos);
+}
+
+// -- END TO END: EXACT_MATCH catches the case SAME_SIZE cannot --------------
+//
+// Same LENGTH, different BYTES: legal under SAME_SIZE (pinned above), an error
+// under EXACT_MATCH. The two tests together prove the scale has two real steps
+// rather than one check wearing two names.
+TEST(CoffForeignObject, MismatchedExactMatchComdatDuplicatesFailLoud) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const objA = comdatMember("alpha", 20, kSelExactMatch, {1, 0, 0, 0});
+    auto const objB = comdatMember("beta", 22, kSelExactMatch, {2, 0, 0, 0});
+
+    auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                           *loaded.format);
+    ASSERT_TRUE(got.readsOk);
+    EXPECT_TRUE(got.sawRedefinition)
+        << "two IMAGE_COMDAT_SELECT_EXACT_MATCH definitions of `shared_w` with "
+           "the SAME length and DIFFERENT bytes broke their promise; only a "
+           "content compare can see this one: " << got.messages;
+    EXPECT_NE(got.messages.find("exact-content"), std::string::npos)
+        << got.messages;
+    EXPECT_NE(got.messages.find("same length, differing content"),
+              std::string::npos)
+        << "the diagnostic must say WHY equal sizes were not enough: "
+        << got.messages;
+}
+
+TEST(CoffForeignObject, MatchingExactMatchComdatDuplicatesFoldSilently) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const objA = comdatMember("alpha", 20, kSelExactMatch, {7, 0, 0, 0});
+    auto const objB = comdatMember("beta", 22, kSelExactMatch, {7, 0, 0, 0});
+
+    auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                           *loaded.format);
+    ASSERT_TRUE(got.readsOk);
+    EXPECT_FALSE(got.sawRedefinition)
+        << "byte-identical EXACT_MATCH duplicates satisfy their promise: "
+        << got.messages;
+}
+
+// -- ANY duplicates that differ in EVERY way still fold ---------------------
+//
+// The guard against the fix widening. `CrossObjectComdatAnyDedupsInMerge` above
+// already links two ANY members, but their bodies are IDENTICAL, so it would
+// stay green even if ANY had been given an EXACT_MATCH duty by mistake. This
+// one differs in both size and content.
+TEST(CoffForeignObject, AnyComdatDuplicatesThatDifferEntirelyStillFold) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const objA = comdatMember("alpha", 20, kSelAny, {1, 0, 0, 0});
+    auto const objB = comdatMember("beta", 22, kSelAny, {2, 0});
+
+    auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                           *loaded.format);
+    ASSERT_TRUE(got.readsOk);
+    EXPECT_FALSE(got.sawRedefinition)
+        << "IMAGE_COMDAT_SELECT_ANY promises NOTHING about its duplicates; a "
+           "verification widened into this arm would refuse DSS's own weak "
+           "definitions, which are emitted as ANY: " << got.messages;
+}
+
+// -- A MIXED pair: one member ANY, the other EXACT_MATCH --------------------
+//
+// The stricter duty governs, so the ANY member does not license the mismatch.
+// Both orders are exercised because "whichever member declared it" is exactly
+// the half an implementation gets right by accident.
+TEST(CoffForeignObject, AMixedSelectionPairIsGovernedByTheStricterPromise) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    {
+        auto const objA = comdatMember("alpha", 20, kSelAny, {1, 0, 0, 0});
+        auto const objB = comdatMember("beta", 22, kSelExactMatch, {2, 0, 0, 0});
+        auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                               *loaded.format);
+        ASSERT_TRUE(got.readsOk);
+        EXPECT_TRUE(got.sawRedefinition)
+            << "the ANY member must not dilute the EXACT_MATCH member: "
+            << got.messages;
+    }
+    {
+        auto const objA = comdatMember("alpha", 20, kSelExactMatch, {1, 0, 0, 0});
+        auto const objB = comdatMember("beta", 22, kSelAny, {2, 0, 0, 0});
+        auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                               *loaded.format);
+        ASSERT_TRUE(got.readsOk);
+        EXPECT_TRUE(got.sawRedefinition)
+            << "the promise must be read off BOTH members: " << got.messages;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE THIRD WALKER: A DECLARED SECTION ALIGNMENT THIS READER USED TO DROP
+//    D-FORMAT-MACHO-SECTION-ALIGN-EMITTED-RAW-NOT-LOG2 (the read-side half)
+//
+// That row's closing work says, verbatim: *"Check the other walkers in the same
+// pass: the question 'is this field an exponent or a count' has one right answer
+// per format and this is the kind of mistake that is made once per writer."*
+// Running that sweep across the READ direction found the same shape as the
+// write-side defect the row closed, one file over:
+//
+//   ELF     `elf_object_reader.cpp`    `sh_addralign`, a BYTE COUNT   -> carried
+//   Mach-O  `macho_object_reader.cpp`  `section_64.align`, a LOG2     -> carried
+//   PE/COFF `coff_object_reader.cpp`   `IMAGE_SCN_ALIGN_*BYTES`       -> DROPPED
+//
+// ✔MEASURED 2026-08-27, before the fix: the identifier `Alignment` did not occur
+// in `coff_object_reader.cpp` at all, and neither of its two `AssembledData`
+// construction sites assigned `.alignment` -- so every atom read out of a COFF
+// object arrived at the newtype's default of ONE BYTE. Silent, because dropping
+// a constraint produces a merge that succeeds.
+//
+// ✔MEASURED against the references, probed SEPARATELY, on `_Alignas(32) const
+// unsigned char wide_ro[64]`: mingw-gcc AND clang `--target=x86_64-pc-windows-msvc`
+// both stamp `.rdata` with IMAGE_SCN_ALIGN_32BYTES, and both stamp an explicit
+// align class on EVERY section they emit. The dropped field was carrying real
+// producer intent on ordinary input, not a theoretical corner.
+//
+// ★ RED ON DISABLE: delete the `di.alignment = alignFromCharacteristics(...)`
+// line at either `AssembledData` site in `coff_object_reader.cpp` and the
+// matching case below goes red -- the named-atom site is pinned by
+// `DeclaredSectionAlignmentReachesTheAtom`, the synthetic-gap site by
+// `GapAtomsInheritTheirSectionsDeclaredAlignment`.
+// ⚠ AND THE PIN IS NOT VACUOUS IN THE OTHER DIRECTION: every case below states
+// an alignment DIFFERENT from the 1-byte default, and
+// `AlignClassIsAnOrdinalNotAnExponent` separates the three encodings that could
+// each be mistaken for one another -- a reader treating the class as a raw
+// exponent answers 64 where 32 is right, and one treating it as a byte count
+// answers 6.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Section Characteristics carrying one explicit IMAGE_SCN_ALIGN_*BYTES class.
+// Class N means 2^(N-1) bytes: 1 -> 1, 5 -> 16, 6 -> 32, 14 -> 8192.
+[[nodiscard]] constexpr std::uint32_t rdataWithAlignClass(std::uint32_t cls) {
+    return 0x40000040u | (cls << 20);   // INITIALIZED_DATA|READ + the class
+}
+
+// One `.rdata` object `datum` in a section whose Characteristics are `chars`.
+[[nodiscard]] std::vector<std::uint8_t>
+objWithRdataChars(std::uint32_t chars, std::vector<std::uint8_t> const& body) {
+    return buildCoff({BSec{".rdata", chars, body, {}}},
+                     {BSym{"datum", 0, 1, 0, kClassExternal, std::nullopt}});
+}
+
+// Read one hand-built object, spelling out the diagnostics on failure -- a read
+// refused for an unrelated reason would otherwise read as an alignment defect.
+[[nodiscard]] std::optional<AssembledModule>
+readOneObject(std::vector<std::uint8_t> const& obj, Loaded const& loaded,
+              std::string& why) {
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format,
+                                         rep, CompilationUnitId{1});
+    for (auto const& d : rep.all()) { why += d.actual; why += '\n'; }
+    return got;
+}
+
+} // namespace
+
+TEST(CoffForeignObject, DeclaredSectionAlignmentReachesTheAtom) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // class -> the byte alignment the atom must carry. The 32 case is the one
+    // the references were MEASURED emitting for `_Alignas(32)`; 1 and 2 bracket
+    // the low end so a reader returning a constant cannot pass.
+    struct AlignCase { std::uint32_t cls; std::uint32_t bytes; };
+    for (auto const& c : std::vector<AlignCase>{{1u, 1u}, {2u, 2u}, {4u, 8u},
+                                                {5u, 16u}, {6u, 32u}, {9u, 256u}}) {
+        SCOPED_TRACE("IMAGE_SCN_ALIGN class " + std::to_string(c.cls));
+        std::string why;
+        auto const got = readOneObject(
+            objWithRdataChars(rdataWithAlignClass(c.cls), {1, 2, 3, 4}),
+            loaded, why);
+        ASSERT_TRUE(got.has_value()) << why;
+        auto const* item = dataNamed(*got, "datum");
+        ASSERT_NE(item, nullptr) << "the `.rdata` object did not read back";
+        EXPECT_EQ(item->alignment.bytes(), c.bytes)
+            << "IMAGE_SCN_ALIGN_*BYTES declares the producer's alignment for "
+               "these bytes; dropping it hands the merge an atom it may place "
+               "anywhere, which is an UNDER-alignment and therefore silent";
+    }
+}
+
+TEST(CoffForeignObject, AlignClassIsAnOrdinalNotAnExponent) {
+    // The whole point of the parent row: three plausible readings of one field,
+    // and only one is right. Class 6 means 2^(6-1) = 32 bytes.
+    //   * as an ORDINAL (correct)   -> 32
+    //   * as a raw LOG2 EXPONENT    -> 64
+    //   * as a raw BYTE COUNT       -> 6, not even a power of two
+    // A pin on 32 alone would also pass for a reader that shifted by the right
+    // amount for the wrong reason, so the two wrong answers are named too.
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::string why;
+    auto const got = readOneObject(
+        objWithRdataChars(rdataWithAlignClass(6u), {7, 7, 7, 7}), loaded, why);
+    ASSERT_TRUE(got.has_value()) << why;
+    auto const* item = dataNamed(*got, "datum");
+    ASSERT_NE(item, nullptr);
+    EXPECT_EQ(item->alignment.bytes(), 32u);
+    EXPECT_NE(item->alignment.bytes(), 64u)
+        << "reading the class as a raw log2 exponent doubles every alignment";
+    EXPECT_NE(item->alignment.bytes(), 6u)
+        << "reading the class as a raw byte count is not even a power of two";
+}
+
+TEST(CoffForeignObject, UnspecifiedAlignClassTakesTheReferencesDefault) {
+    // ✔MEASURED 2026-08-27, by zeroing the align nibble of a real mingw-gcc
+    // `.rdata` section header IN PLACE and re-reading the same file:
+    //   GNU binutils `objdump -h`   class 6 -> `2**5`,  class 0 -> `2**4`
+    //   `lld-link`                  accepts the class-0 object, rc=0
+    // i.e. the reference reader answers SIXTEEN for "the producer declared
+    // nothing", and LLVM's `coff_section::getAlignment()` spells that default
+    // out. Answering 1 here would put DSS below every reference on identical
+    // bytes, in the under-aligning direction.
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::string why;
+    auto const got = readOneObject(objWithRdataChars(0x40000040u, {1, 1, 1, 1}),
+                                   loaded, why);   // align class 0
+    ASSERT_TRUE(got.has_value()) << why;
+    auto const* item = dataNamed(*got, "datum");
+    ASSERT_NE(item, nullptr);
+    EXPECT_EQ(item->alignment.bytes(), 16u)
+        << "class 0 is 'unspecified', and the reference readers resolve that "
+           "to 16 bytes";
+}
+
+TEST(CoffForeignObject, LegacyNoPadBitMeansByteAlignment) {
+    // IMAGE_SCN_TYPE_NO_PAD (0x8) is the pre-align-class spelling of
+    // ALIGN_1BYTES and the reference readers still honour it. Without it, a
+    // NO_PAD section carrying class 0 would take the 16-byte default -- an
+    // OVER-alignment claimed for bytes whose producer asked for none.
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::string why;
+    auto const got = readOneObject(objWithRdataChars(0x40000048u, {2, 2, 2, 2}),
+                                   loaded, why);   // class 0 | NO_PAD
+    ASSERT_TRUE(got.has_value()) << why;
+    auto const* item = dataNamed(*got, "datum");
+    ASSERT_NE(item, nullptr);
+    EXPECT_EQ(item->alignment.bytes(), 1u);
+}
+
+TEST(CoffForeignObject, AlignmentAboveWhatTheNewtypeModelsDegradesToByte) {
+    // COFF encodes up to 8192 (class 14); the `Alignment` newtype stops at 256.
+    // The degrade is DOWNWARD on purpose and is the only safe direction here:
+    // it can only make the merge place the atom more freely, which shows up as
+    // a layout difference. Substituting some "reasonable" larger alignment
+    // instead would let the atom ride at an alignment nothing in the input
+    // declared -- a false fact about our own output, which is what the parent
+    // row was filed about in the first place.
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    for (std::uint32_t cls : {10u, 12u, 14u}) {   // 512, 2048, 8192
+        SCOPED_TRACE("IMAGE_SCN_ALIGN class " + std::to_string(cls));
+        std::string why;
+        auto const got = readOneObject(
+            objWithRdataChars(rdataWithAlignClass(cls), {3, 3, 3, 3}),
+            loaded, why);
+        ASSERT_TRUE(got.has_value())
+            << "an alignment we cannot model is not a reason to refuse an "
+               "object every reference linker accepts: " << why;
+        auto const* item = dataNamed(*got, "datum");
+        ASSERT_NE(item, nullptr);
+        EXPECT_EQ(item->alignment.bytes(), 1u);
+    }
+}
+
+TEST(CoffForeignObject, GapAtomsInheritTheirSectionsDeclaredAlignment) {
+    // The synthetic-gap site (D-LK-COFF-READER-ANONYMOUS-GAP-ATOMS) is a SECOND
+    // `AssembledData` construction, and a fix applied only to the named-atom
+    // site would leave it at the 1-byte default -- the same "one site quietly
+    // reaching its own conclusion about one field" the parent row is about.
+    //
+    // ⚠ THE FIRST DRAFT PUT `datum` AT OFFSET 0 AND PRODUCED NO GAP AT ALL --
+    // a lone symbol at 0 takes the whole section by the geometry fallback, so
+    // the test would have asserted nothing about the second site. Its own
+    // "did a gap actually appear?" guard is what caught that, and the shape
+    // below is the one `GccStyleAnonymousRdataJumpTableIsFullyReconstructed`
+    // already proves reconstructs a gap: `datum` starts at 0x20, so [0,0x20)
+    // is unowned and becomes the ANONYMOUS atom.
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<std::uint8_t> rdata(0x40, 0u);
+    for (std::size_t i = 0; i < rdata.size(); ++i)
+        rdata[i] = static_cast<std::uint8_t>(i);
+    auto const obj = buildCoff(
+        {BSec{".rdata", rdataWithAlignClass(6u), rdata, {}}},
+        {BSym{"datum", 0x20, 1, 0, kClassStatic, std::nullopt}});
+    std::string why;
+    auto const got = readOneObject(obj, loaded, why);
+    ASSERT_TRUE(got.has_value()) << why;
+    ASSERT_EQ(got->dataItems.size(), 2u)
+        << "expected the anonymous [0,0x20) gap plus `datum` [0x20,0x40); "
+           "without a gap this test asserts nothing about the second "
+           "construction site";
+    AssembledData const* gapAtom = nullptr;
+    for (auto const& d : got->dataItems) {
+        bool named = false;
+        for (auto const& sy : got->symbols) named = named || (sy.symbol == d.symbol);
+        if (!named) gapAtom = &d;
+    }
+    ASSERT_NE(gapAtom, nullptr) << "no ANONYMOUS atom -- the gap arm never ran";
+    EXPECT_EQ(gapAtom->alignment.bytes(), 32u)
+        << "an atom carved out of a section carries that section's declared "
+           "alignment whether or not a symbol names it";
+    for (auto const& d : got->dataItems) {
+        EXPECT_EQ(d.alignment.bytes(), 32u)
+            << "every atom carved out of one section carries that section's "
+               "declared alignment, named or anonymous";
+    }
+}
+
+TEST(CoffForeignObject, AllThreeObjectReadersCarryADeclaredAlignment) {
+    // ★ THE SWEEP ITSELF, MADE TESTABLE. The parent row's instruction is a
+    // claim about THREE files, and the honest way to keep it true is to ask all
+    // three the same question through their own vocabularies rather than to
+    // assert in a comment that they agree.
+    //
+    // Same shape, same declared 32-byte alignment, three encodings:
+    //   COFF    IMAGE_SCN_ALIGN_32BYTES == class 6 == (log2 + 1) << 20
+    //   ELF     sh_addralign == 32, a raw byte count
+    //   Mach-O  section_64.align == 5, a raw log2 exponent
+    // A reader that dropped the field, or read it in a sibling's encoding,
+    // fails HERE with the other two still green -- which is what makes this a
+    // sweep and not three unrelated pins.
+    //
+    // ⚠ THE FIRST DRAFT OF THIS COMMENT CITED TWO SIBLING PINS THAT DID NOT
+    // EXIST -- one of them in a file (`test_elf_object_reader.cpp`) that is not
+    // in this tree at all; the ELF reader's suite is
+    // `test_relocatable_object_reader.cpp`. ✔MEASURED 2026-08-27 while checking
+    // it: `grep` for an EXPECT/ASSERT on `alignment` across `tests/link/**`
+    // returned NOTHING outside this block. Both sibling readers CARRIED the
+    // field and NEITHER was pinned for it, so "the other two are fine" rested
+    // on nobody having touched them. The legs now exist, added in the same
+    // pass, and it is those the sweep leans on:
+    //   tests/link/test_relocatable_object_reader.cpp
+    //       RelocatableObjectReader.DeclaredSectionAlignmentSurvivesTheRoundTrip
+    //   tests/link/test_macho_object_reader.cpp
+    //       MachOObjectReader.DeclaredSectionAlignmentSurvivesTheRoundTrip
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::string why;
+    auto const got = readOneObject(
+        objWithRdataChars(rdataWithAlignClass(6u), {5, 5, 5, 5}), loaded, why);
+    ASSERT_TRUE(got.has_value()) << why;
+    auto const* item = dataNamed(*got, "datum");
+    ASSERT_NE(item, nullptr);
+    EXPECT_EQ(item->alignment.bytes(), 32u)
+        << "the COFF leg of the three-reader sweep";
 }

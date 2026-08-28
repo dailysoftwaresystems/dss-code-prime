@@ -1,0 +1,21 @@
+{
+  "$comment": "D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE + D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT + D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE: the RUNNING witness for three shapes GNU as assembles and DSS refused fail-loud. ★★★ THIS EXAMPLE WAS BORN RED. ✔MEASURED at the CLI on a clean HEAD build, x86_64:pe64-x86_64-windows-exec and x86_64:elf64-x86_64-linux-exec at debug AND release: `cmpq %reg, mem` and `cmpq mem, %reg` were both `error[A0008] … no candidate target opcode encodes that shape`, `movw $300, %reg` was the same at width 16, and every `movzbl`/`movsbl`/`movswl`/`movzwl`/`movsbq`/`movswq`/`movslq`/`movzbq` spelling was `error[A0008] unknown mnemonic … it is not in this dialect's instruction table`. ★★★ THE REFERENCE DISJUNCTION, MEASURED PER SPELLING (bar §A.3b): GNU as 2.42 assembles all 83 spellings of these families that were probed, and REFUSES exactly three of the 86 — `movzbl %cl, %rcx` (destination width mismatch), `movl %rax, %ecx` (source width mismatch) and `imulb %al, %cl` (x86 has no two-operand byte IMUL) — all three of which DSS also refuses, so the conformance runs BOTH ways. gcc 13.3.0 compiles and RUNS the program below at -O0 and -O2, exit 42. ★★★ WHY EVERY SHAPE ASSERTS A VALUE: each subject's WRONG answer also assembles and links. Shapes 1 and 2 are the SAME two numbers with OPPOSITE expected outcomes, so a lost compare direction is a wrong answer rather than a lucky one (`39 /r` computes `mem - reg`, `3B /r` computes `reg - mem`, and the two build the byte-identical LIR operand list). Shapes 3-7 use values above 0xFF and read the result back, so a 1-byte immediate slot could only truncate and a 4-byte one would corrupt the instruction stream. Shapes 9-13 sign-extend a NEGATIVE seed, so a zero-extending encoding returns a large positive number: `movsbl` of -1 is -1 and `movzbl` of the same byte is 255, from the identical input. ★★ TWENTY SHAPES, EACH ITS OWN EXIT CODE, so a failure names the mechanism rather than the file. ⚠ THERE IS NO aarch64 ARM AND THAT IS A DECISION: every shape is written in x86 assembly TEXT and none of the three constructs exists on that CPU (no memory-destination ALU, no immediate-into-memory form, a different widening operand shape), so an aarch64 arm would be a DIFFERENT program held to the same exit code. Where a translation does exist the sibling `c_inline_asm_memory_arithmetic` carries one; here it does not. ⚠ THE `volatile` SEEDS ARE LOAD-BEARING: without them the release pipeline folds the values before lowering and silently changes which mechanism each arm tests.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

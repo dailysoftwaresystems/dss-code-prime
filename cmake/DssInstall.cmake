@@ -37,7 +37,7 @@ set_property(DIRECTORY "${CMAKE_SOURCE_DIR}"
 
 # ── Where the config tree lands ───────────────────────────────────────────────
 #
-# `<datadir>/dss-code-prime/<version>/dss-config/`.
+# `<datadir>/dsscp/<version>/dss-config/`.
 #
 # ★ THE `<version>` SEGMENT IS A CORRECTNESS DEVICE, NOT TIDINESS, and it is
 # gcc's own answer (`/usr/lib/gcc/<triple>/<version>/`). The compiler probes a
@@ -52,7 +52,7 @@ set_property(DIRECTORY "${CMAKE_SOURCE_DIR}"
 # architecture-independent: the SAME JSON serves all five legs, and a target's
 # register file is no more machine-specific to the HOST than a man page is.
 set(DSS_INSTALL_CONFIGDIR
-    "${CMAKE_INSTALL_DATADIR}/dss-code-prime/${DSS_VERSION}/dss-config")
+    "${CMAKE_INSTALL_DATADIR}/dsscp/${DSS_VERSION}/dss-config")
 
 # The compiler finds that tree by walking RELATIVE to its own executable, so both
 # components must be relative to the prefix or the hop is not computable and the
@@ -83,7 +83,7 @@ file(RELATIVE_PATH DSS_INSTALL_CONFIG_RELDIR
 # (`src/core/types/config_path_walk.cpp`), which `#error`s without it — the same
 # fail-the-build-loudly wireup `DSS_PROJECT_VERSION` uses one define over. `core`
 # is the object library whose .o files carry `config_path_walk.cpp` into
-# `dss-code-prime-lib`; a define on the SHARED target would not reach them.
+# `dsscp-lib`; a define on the SHARED target would not reach them.
 target_compile_definitions(core PRIVATE
     DSS_INSTALL_CONFIG_RELDIR="${DSS_INSTALL_CONFIG_RELDIR}")
 
@@ -95,15 +95,15 @@ target_compile_definitions(core PRIVATE
 # (RUNTIME destination), and the executable's own directory is first in the
 # Windows DLL search order.
 if(APPLE)
-    set_target_properties(dss-code-prime PROPERTIES
+    set_target_properties(dsscp PROPERTIES
         INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
 elseif(UNIX)
-    set_target_properties(dss-code-prime PROPERTIES
+    set_target_properties(dsscp PROPERTIES
         INSTALL_RPATH "\$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
 endif()
 
 # ── The artifacts ─────────────────────────────────────────────────────────────
-install(TARGETS dss-code-prime dss-code-prime-lib
+install(TARGETS dsscp dsscp-lib
         RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"    # the CLI, and the DLL on Windows
         LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"    # the .so / .dylib
         ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")   # the Windows import library
@@ -190,7 +190,7 @@ if(DSS_BUILD_TESTS)
                 -D "DSS_BUILD_CONFIG=$<CONFIG>"
                 -D "DSS_REPO_ROOT=${CMAKE_SOURCE_DIR}"
                 -D "DSS_VERSION=${DSS_VERSION}"
-                -D "DSS_EXE_NAME=$<TARGET_FILE_NAME:dss-code-prime>"
+                -D "DSS_EXE_NAME=$<TARGET_FILE_NAME:dsscp>"
                 -D "DSS_INSTALL_BINDIR=${CMAKE_INSTALL_BINDIR}"
                 -D "DSS_INSTALL_CONFIGDIR=${DSS_INSTALL_CONFIGDIR}"
                 -D "DSS_SMOKE_TARGET_SPEC=${_dss_smoke_spec}"

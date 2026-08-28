@@ -191,9 +191,11 @@ TEST(LK10EntrySliceA, FullTrampolineShapeSyscallArm) {
     (void)b.addFunction(SymbolId{42});
     auto blk = b.createBlock();
     b.beginBlock(blk);
-    // Physical regs use `makePhysicalReg(ordinal, regClass)` — bare
-    // `LirReg{ordinal}` defaults to a virtual reg whose id collides
-    // with the physical ordinal namespace.
+    // Physical regs use `makePhysicalReg(ordinal, regClass)`. This comment
+    // used to warn that a bare `LirReg{ordinal}` silently defaults to a
+    // VIRTUAL reg whose id collides with the physical ordinal namespace —
+    // D-LIR-POSITIONAL-LIRREG-INIT-MISCLASSIFIES-SILENTLY. That spelling no
+    // longer compiles: the factories are the only way in.
     auto const raxPhys = makePhysicalReg(*raxOrd, LirRegClass::GPR);
     auto const rdiPhys = makePhysicalReg(*rdiOrd, LirRegClass::GPR);
     // 1. call user_entry (SymbolRef = 88, the user function)
@@ -331,7 +333,7 @@ TEST(LK10EntrySliceA, FullTrampolineShapeByNameImportArm) {
 }
 
 // dim-2 M1 fold (negative-guard contract pins on the new Slice A
-// opcodes). The encoder's variant-guard match (walker_util.hpp:108)
+// opcodes). The encoder's variant-guard match (`operandsMatchGuard` in walker_util.hpp)
 // is length+kind exact; a regression to a length-only or
 // prefix-style match would silently accept malformed operands.
 // Three loud-fail pins on the new opcodes specifically.
@@ -350,10 +352,10 @@ TEST(LK10EntrySliceA, SyscallWithStrayOperandFailsLoud) {
     b.beginBlock(blk);
     // A stray imm operand on a zero-operand opcode does NOT match
     // the empty-list variant guard. ff7b76d 3rd-order audit:
-    // silent-failure verified `LirBuilder::addInst` (lir.cpp:210-227)
+    // silent-failure verified `LirBuilder::addInst` (lir.cpp)
     // checks only `opcode != 0` and `opcodeInfo(opcode) != nullptr`
     // — it does NOT enforce min/max-operands (see
-    // `x86_64.target.json:8` $reservedFields: "minOperands/
+    // `x86_64.target.json` $reservedFields: "minOperands/
     // maxOperands fields are NOT yet fully enforced"). The encoder's
     // variant-guard match in `walker_util.hpp::operandsMatchGuard`
     // is the SOLE gate today. Anchor D-LIR-BUILDER-OPERAND-COUNT-GATE

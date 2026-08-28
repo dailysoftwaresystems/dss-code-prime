@@ -1,11 +1,14 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/enum_name_table.hpp"  // EnumNameTable (kTypeNameCommitPolarityTable)
 #include "core/types/rule_id.hpp"
 #include "core/types/strong_ids.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -16,7 +19,7 @@ namespace dss {
 // API (`GrammarSchema::slotKind`); the per-slot `Position` storage stays
 // in `detail::`.
 enum class SlotKind : std::uint8_t {
-    TokenLeaf,   // expects `tokenId()`; advance(matching) → nextPos()
+    TokenLeaf,   // consumes EXACTLY ONE token, from `expectedSet()`; advance(member) → nextPos()
     RuleLeaf,    // expects FIRST(ruleId()); caller enters the rule then leaveRule resumes at nextPos()
     AltChoice,   // multiple branches; advance(tok) routes into the branch whose FIRST contains tok
     End,         // body completed
@@ -43,6 +46,28 @@ enum class TypeNameCommitPolarity : std::uint8_t {
     PreferType,
     RequireKnownType,
 };
+
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// `shapes[].commitRequiresTypeName.polarity`, whose two spellings were owned by
+// an inline `p == "preferType" / "requireKnownType"` chain in the grammar
+// loader with TWO sentences beside it restating them. `PreferType` is row 0,
+// matching the loader's own default for the object form.
+inline constexpr EnumNameTable<TypeNameCommitPolarity, 2>
+    kTypeNameCommitPolarityTable{{{
+        { TypeNameCommitPolarity::PreferType,       "preferType"       },
+        { TypeNameCommitPolarity::RequireKnownType, "requireKnownType" },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kTypeNameCommitPolarityTable);
+
+[[nodiscard]] constexpr std::string_view
+typeNameCommitPolarityName(TypeNameCommitPolarity p) noexcept {
+    return kTypeNameCommitPolarityTable.name(p);
+}
+[[nodiscard]] constexpr std::optional<TypeNameCommitPolarity>
+typeNameCommitPolarityFromName(std::string_view s) noexcept {
+    return kTypeNameCommitPolarityTable.fromName(s);
+}
 
 namespace detail {
 
@@ -106,6 +131,37 @@ public:
         return p;
     }
 
+    // D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED:
+    // a TOKEN-CLASS leaf — one slot that consumes exactly one token drawn from a
+    // config-declared SET of kinds (`tokenClasses.<name>` in the language
+    // document; the `{"tokenClass": "<name>"}` shape element form). It is the
+    // SAME SlotKind as a single-token leaf, and that is the design rather than a
+    // shortcut: every consumer of a TokenLeaf already asks a SET question
+    // (`expectedSet` / `expectedBits` drive the parser's match gate, the
+    // predictive-prefix run, alt routing and the "expected …" diagnostic), so a
+    // second kind would have duplicated four switch arms to express a property
+    // — "consumes exactly one token" — that both forms share exactly.
+    //
+    // ⚠ `tokenId()` is therefore meaningful ONLY on a single-token leaf and is
+    // left INVALID here. A consumer that needs "which kinds does this leaf
+    // admit?" must read `expectedSet()`; reading `tokenId()` on a class leaf
+    // yields the invalid id, which is a miss, not a crash — but a MISS is
+    // exactly the silent-skip failure this project refuses, so the three
+    // in-tree readers were converted to `expectedSet()` in the same change.
+    //
+    // The predictive-prefix computation stays EXACT: it records
+    // `p.expectedSet()` per offset for the leading run of TokenLeaf elements,
+    // and a class leaf still advances the input by exactly one token, so the
+    // recorded set remains the exact admissible set at that offset.
+    [[nodiscard]] static Position makeTokenClassLeaf(std::vector<SchemaTokenId> kinds,
+                                                     std::uint32_t nextPos) {
+        Position p;
+        p.slotKind_    = SlotKind::TokenLeaf;
+        p.nextPos_     = nextPos;
+        p.expectedSet_ = std::move(kinds);
+        return p;
+    }
+
     [[nodiscard]] static Position makeRuleLeaf(RuleId rule, std::uint32_t nextPos,
                                                std::vector<SchemaTokenId> firstSet) {
         Position p;
@@ -128,6 +184,8 @@ public:
     [[nodiscard]] static Position makeEnd() { return Position{}; }
 
     [[nodiscard]] SlotKind        slotKind()    const noexcept { return slotKind_; }
+    // ⚠ Valid ONLY on a SINGLE-token leaf (`makeTokenLeaf`). A TOKEN-CLASS leaf
+    // leaves it invalid on purpose — ask `expectedSet()` instead.
     [[nodiscard]] SchemaTokenId   tokenId()     const noexcept { return tokenId_; }
     [[nodiscard]] RuleId          ruleId()      const noexcept { return ruleId_; }
     [[nodiscard]] std::uint32_t   nextPos()     const noexcept { return nextPos_; }

@@ -133,12 +133,12 @@ namespace {
 // OUT-OF-TREE build finds it (the `test_shipped_type_consistency.cpp`
 // precedent). Empty on a miss, and every caller ASSERTs on it.
 [[nodiscard]] fs::path objectFormatsDir() {
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config" / "object-formats";
+    return *root / "object-formats";
 }
 
 [[nodiscard]] std::string readFile(fs::path const& p) {

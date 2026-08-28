@@ -432,7 +432,7 @@ TEST(DumpPredefinedMacros, CliPathFailsLoudAndWritesNothingToStdout) {
     // rc 1, a coded stderr line, and stdout untouched.
     CliArgs args;
     args.dumpPredefinedMacros = true;
-    args.languageName         = "c-subset";
+    args.languageName         = "c";
     args.targets              = {"x86_64:this-format-does-not-exist"};
 
     std::ostringstream out;
@@ -455,7 +455,7 @@ TEST(DumpPredefinedMacros, MissingLanguageOrTargetFailsLoud) {
     {
         CliArgs args;
         args.dumpPredefinedMacros = true;
-        args.languageName         = "c-subset";
+        args.languageName         = "c";
         std::ostringstream out, err;
         EXPECT_EQ(dumpPredefinedMacros(args, out, err), 1);
         EXPECT_EQ(out.str(), "");
@@ -466,7 +466,7 @@ TEST(DumpPredefinedMacros, MissingLanguageOrTargetFailsLoud) {
 TEST(DumpPredefinedMacros, MalformedTargetSpecFailsLoudBeforeAnyOutput) {
     CliArgs args;
     args.dumpPredefinedMacros = true;
-    args.languageName         = "c-subset";
+    args.languageName         = "c";
     args.targets              = {"no-colon-here"};
     std::ostringstream out, err;
     EXPECT_EQ(dumpPredefinedMacros(args, out, err), 1);
@@ -480,7 +480,7 @@ TEST(DumpPredefinedMacros, MalformedTargetSpecFailsLoudBeforeAnyOutput) {
 TEST(DumpPredefinedMacros, AFailureOnALaterTargetPrintsNothingForTheEarlierOnes) {
     CliArgs args;
     args.dumpPredefinedMacros = true;
-    args.languageName         = "c-subset";
+    args.languageName         = "c";
     args.targets              = {"x86_64:elf64-x86_64-linux-exec",
                                  "x86_64:pe64-x86_64-windows-exec",
                                  "x86_64:not-a-real-format"};
@@ -495,7 +495,7 @@ TEST(DumpPredefinedMacros, AFailureOnALaterTargetPrintsNothingForTheEarlierOnes)
 TEST(DumpPredefinedMacros, RealTripleDumpsAndSeparatesTargets) {
     CliArgs args;
     args.dumpPredefinedMacros = true;
-    args.languageName         = "c-subset";
+    args.languageName         = "c";
     args.targets              = {"x86_64:elf64-x86_64-linux-exec",
                                  "x86_64:pe64-x86_64-windows-exec"};
     args.defines              = {"SQLITE_TEST", "SQLITE_THREADSAFE=0"};
@@ -524,7 +524,7 @@ TEST(DumpPredefinedMacros, RealTripleDumpsAndSeparatesTargets) {
 
     // FLOOR: a section that enumerated nothing must not read as a pass.
     EXPECT_GE(std::count(dump.begin(), dump.end(), '\n'), 40)
-        << "two sections over c-subset's 33 language predefines cannot be "
+        << "two sections over c's 33 language predefines cannot be "
            "this short — the enumeration collapsed";
 }
 
@@ -535,7 +535,7 @@ TEST(DumpPredefinedMacros, ShippedPeOnlyMacroAppearsOnlyInThePeSection) {
     auto sectionFor = [](std::string const& spec) {
         CliArgs args;
         args.dumpPredefinedMacros = true;
-        args.languageName         = "c-subset";
+        args.languageName         = "c";
         args.targets              = {spec};
         std::ostringstream out, err;
         EXPECT_EQ(dumpPredefinedMacros(args, out, err), 0) << err.str();
@@ -569,7 +569,7 @@ TEST(DumpPredefinedMacros, EveryShippedObjectFormatDefinesNoStdcNoMacro) {
     ASSERT_TRUE(std::filesystem::is_directory(formatsDir)) << formatsDir;
     ASSERT_TRUE(std::filesystem::is_directory(targetsDir)) << targetsDir;
 
-    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    auto grammarR = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(grammarR.has_value());
     auto const languageMacros = (*grammarR)->preprocess().predefinedMacros;
 
@@ -619,7 +619,7 @@ TEST(DumpPredefinedMacros, EveryShippedObjectFormatDefinesNoStdcNoMacro) {
             ASSERT_TRUE(targetR.has_value()) << targetName;
 
             PredefinedMacroDumpRequest req;
-            req.languageName   = "c-subset";
+            req.languageName   = "c";
             req.targetName     = targetName;
             req.formatName     = formatName;
             req.languageMacros = languageMacros;
@@ -636,7 +636,7 @@ TEST(DumpPredefinedMacros, EveryShippedObjectFormatDefinesNoStdcNoMacro) {
             ++armsMerged;
             ++armsForThisFormat;
 
-            // FLOOR, per arm: c-subset declares 33 language predefines and the
+            // FLOOR, per arm: c declares 33 language predefines and the
             // filter removes only the format-gated ones, so an arm reporting a
             // near-empty set has not measured anything.
             MergedPredefinedMacros const merged = mergePredefinedMacros(
@@ -683,7 +683,7 @@ TEST(DumpPredefinedMacros, EveryShippedObjectFormatDefinesNoStdcNoMacro) {
         auto formatR = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
         ASSERT_TRUE(formatR.has_value());
         PredefinedMacroDumpRequest req;
-        req.languageName   = "c-subset";
+        req.languageName   = "c";
         req.targetName     = targetNames.front();
         req.formatName     = "elf64-x86_64-linux-exec";
         req.languageMacros = languageMacros;
@@ -711,11 +711,11 @@ TEST(DumpPredefinedMacros, EveryShippedObjectFormatDefinesNoStdcNoMacro) {
 //     in THREE places (usage block, Modes entry, Examples block), so deleting the
 //     Modes ENTRY left the other two and the pin stayed GREEN over a help text
 //     that no longer explained the flag. FAIL-OPEN.
-//   · v2 used `"dss-code-prime --dump-predefined-macros --language"` for the
+//   · v2 used `"dsscp --dump-predefined-macros --language"` for the
 //     usage block — which the EXAMPLES line also contains, so deleting the usage
 //     line stayed GREEN too. FAIL-OPEN again, one layer down.
 // v3 keys the usage witness on the `<name> --target <spec>` PLACEHOLDERS (usage
-// only) and the examples witness on `c-subset` (examples only). All three
+// only) and the examples witness on `c` (examples only). All three
 // deletions now red independently — MEASURED, not argued.
 TEST(DumpPredefinedMacros, HelpTextDocumentsTheFlagAndItsAbsentAlias) {
     auto const text = cliHelpText();
@@ -738,7 +738,7 @@ TEST(DumpPredefinedMacros, HelpTextDocumentsTheFlagAndItsAbsentAlias) {
     // would promise a family DSS does not implement.
     EXPECT_NE(text.find("no `-dM` alias"), std::string::npos);
     // (3) the EXAMPLES block: a runnable invocation, not just a synopsis.
-    EXPECT_NE(text.find("--dump-predefined-macros --language c-subset"),
+    EXPECT_NE(text.find("--dump-predefined-macros --language c"),
               std::string::npos);
 }
 
@@ -760,8 +760,8 @@ struct Argv {
 
 TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
     {   // the happy shape
-        Argv a{"dss-code-prime", "--dump-predefined-macros",
-               "--language", "c-subset",
+        Argv a{"dsscp", "--dump-predefined-macros",
+               "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux-exec"};
         auto r = parseCliArgs(a.argc(), a.argv());
         ASSERT_TRUE(r.has_value());
@@ -770,7 +770,7 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
         EXPECT_FALSE(r->lspMode);
     }
     {   // no --language: the triple is incomplete, so REFUSE at the parser
-        Argv a{"dss-code-prime", "--dump-predefined-macros",
+        Argv a{"dsscp", "--dump-predefined-macros",
                "--target", "x86_64:elf64-x86_64-linux-exec"};
         auto r = parseCliArgs(a.argc(), a.argv());
         ASSERT_FALSE(r.has_value());
@@ -781,8 +781,8 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
                   std::string::npos);
     }
     {   // no --target
-        Argv a{"dss-code-prime", "--dump-predefined-macros",
-               "--language", "c-subset"};
+        Argv a{"dsscp", "--dump-predefined-macros",
+               "--language", "c"};
         auto r = parseCliArgs(a.argc(), a.argv());
         ASSERT_FALSE(r.has_value());
         EXPECT_EQ(r.error().kind, CliArgsError::EmptyTargetList);
@@ -791,9 +791,9 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
     }
     {   // MUTUALLY EXCLUSIVE with a compile: "does the compile still happen?"
         // must never be an open question.
-        Argv a{"dss-code-prime", "--dump-predefined-macros",
+        Argv a{"dsscp", "--dump-predefined-macros",
                "--compile", "x.c",
-               "--language", "c-subset",
+               "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux-exec"};
         auto r = parseCliArgs(a.argc(), a.argv());
         ASSERT_FALSE(r.has_value());
@@ -801,7 +801,7 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
     }
     {   // `-dM` is NOT an alias and must stay an unknown flag, so adding one
         // later is a deliberate act rather than a silent accretion.
-        Argv a{"dss-code-prime", "-dM", "--language", "c-subset",
+        Argv a{"dsscp", "-dM", "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux-exec"};
         auto r = parseCliArgs(a.argc(), a.argv());
         ASSERT_FALSE(r.has_value());
@@ -809,8 +809,8 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
     }
     {   // --stack-reserve asks for a field in an EMITTED IMAGE; this mode emits
         // none, so the request must be REFUSED rather than silently dropped.
-        Argv a{"dss-code-prime", "--dump-predefined-macros",
-               "--language", "c-subset",
+        Argv a{"dsscp", "--dump-predefined-macros",
+               "--language", "c",
                "--target", "x86_64:pe64-x86_64-windows-exec",
                "--stack-reserve", "4194304"};
         auto r = parseCliArgs(a.argc(), a.argv());
@@ -826,10 +826,10 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
 // emits round-trips back to its enumerator, so the printed word is always a word
 // an operator can write into a config.
 TEST(DumpPredefinedMacros, EveryKindNameRoundTripsToItsEnumerator) {
-    constexpr std::array<PredefinedMacroKind, 5> kAll{
+    constexpr std::array<PredefinedMacroKind, 6> kAll{
         PredefinedMacroKind::Line, PredefinedMacroKind::File,
         PredefinedMacroKind::Constant, PredefinedMacroKind::Date,
-        PredefinedMacroKind::Time};
+        PredefinedMacroKind::Time, PredefinedMacroKind::Counter};
     for (PredefinedMacroKind const k : kAll) {
         auto const name = predefinedMacroKindName(k);
         EXPECT_FALSE(name.empty());
@@ -843,6 +843,10 @@ TEST(DumpPredefinedMacros, EveryKindNameRoundTripsToItsEnumerator) {
               predefinedMacroKindName(PredefinedMacroKind::File));
     EXPECT_NE(predefinedMacroKindName(PredefinedMacroKind::Date),
               predefinedMacroKindName(PredefinedMacroKind::Time));
+    // D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED: the STATEFUL kind must not collapse
+    // onto the offset-derived one it is most easily confused with.
+    EXPECT_NE(predefinedMacroKindName(PredefinedMacroKind::Counter),
+              predefinedMacroKindName(PredefinedMacroKind::Line));
     EXPECT_FALSE(predefinedMacroKindFromName("version").has_value())
         << "`version` is a LOAD-time lowering to Constant, not a runtime kind — "
            "a table row for it would claim a kind the engine cannot hold";

@@ -1,4 +1,5 @@
 #include "link/format/coff_object_reader.hpp"
+#include "link/format/foreign_section_alignment.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
 
@@ -202,14 +203,82 @@ constexpr std::uint16_t kSymDtypeFunction = 0x20u;
 // exemption; the section KIND is resolved from the schema name map.
 constexpr std::uint32_t kScnCntUninitializedData = 0x00000080u;
 
+// -- IMAGE_SCN_ALIGN_*BYTES: COFF's spelling of the declared section
+//    alignment (PE Format spec, "Section Flags") -----------------------------
+//
+// D-FORMAT-MACHO-SECTION-ALIGN-EMITTED-RAW-NOT-LOG2 (the read-side half of the
+// "one right answer per format" sweep that row prescribes).
+//
+// Bits [23:20] hold a CLASS ORDINAL, not an exponent and not a byte count:
+// class N means 2^(N-1) bytes, so class 5 = 16 and class 6 = 32, and the range
+// 1..14 spans 1..8192. Class 0 means the producer declared nothing.
+//
+// ⚠ THIS READER USED TO DECODE NOTHING AT ALL. ✔MEASURED 2026-08-27: the word
+// `Alignment` did not appear in this file, and neither `AssembledData`
+// construction site set `.alignment`, so every foreign COFF data item reached
+// the merge at the newtype's default of ONE byte no matter what the producer
+// asked for -- silently, because dropping a constraint yields a merge that
+// succeeds. Its two sibling readers (`elf_object_reader.cpp` via
+// `sh_addralign`, `macho_object_reader.cpp` via `section_64.align`) had both
+// carried the field since they were written.
+//
+// ★ THE END-TO-END CONSEQUENCE IS NARROWER THAN "EVERY OVER-ALIGNED DATUM WAS
+// MISPLACED", AND THE NARROWING IS MEASURED -- three corpus shapes were built
+// with this decode and without it and exited IDENTICALLY before one bit. The
+// reader slices atoms by their VALUE, so a producer's inter-item PADDING is
+// absorbed into the preceding atom's extent: relative offsets inside ONE
+// module survive regardless, and an over-aligned object FIRST in its section
+// is aligned by construction. What this field decides is where a member's
+// whole block LANDS once something else already occupies the section --
+// `exec_data_section.hpp` places `src` at `alignUp(into.spanSize,
+// src.maxAlign)`, and `maxAlign` is the max over these values. ✔MEASURED on
+// the PE leg with a consumer contributing five bytes of its own rodata: the
+// archive member's over-aligned datum sits at `mod 256 == 128` with this
+// decode and at `69` without it. `examples/c/staticlib_alignas_carry` is that
+// witness.
+//
+// ✔MEASURED against the references, separately, on an `_Alignas(32) const`
+// object: mingw-gcc and clang(--target=x86_64-pc-windows-msvc) BOTH stamp
+// `.rdata` with IMAGE_SCN_ALIGN_32BYTES, and both stamp an explicit class on
+// EVERY section -- so the dropped field was carrying real producer intent on
+// ordinary input, not a theoretical corner.
+//
+// ★ CLASS 0 DECODES TO 16 BYTES, AND THAT IS MEASURED RATHER THAN ASSUMED.
+// ✔MEASURED 2026-08-27 by zeroing the class nibble of a real `.rdata` header
+// in place and re-reading it: GNU binutils `objdump -h` reports `2**5` (32)
+// with class 6 and `2**4` (16) with class 0, and `lld-link` accepts the
+// class-0 object (rc=0). LLVM's own `coff_section::getAlignment()` spells the
+// same default. Reading class 0 as "1 byte" would put DSS BELOW every
+// reference reader on identical bytes -- and in the under-aligning direction,
+// which is the one that miscompiles rather than merely wastes padding.
+//
+// IMAGE_SCN_TYPE_NO_PAD is the legacy spelling of ALIGN_1BYTES and is honoured
+// for the same reason: it is what the references do with these bytes.
+constexpr std::uint32_t kScnAlignMask  = 0x00F00000u;
+constexpr std::uint32_t kScnAlignShift = 20u;
+constexpr std::uint32_t kScnTypeNoPad  = 0x00000008u;
+
+// Byte alignment the producer declared for `chars`, as the shared read-side
+// policy carries it (`link/format/foreign_section_alignment.hpp`): a
+// re-layout hint, degrading to byte alignment above what the newtype models.
+[[nodiscard]] Alignment
+alignFromCharacteristics(std::uint32_t chars) noexcept {
+    if ((chars & kScnTypeNoPad) != 0u) return Alignment{};
+    std::uint32_t const cls = (chars & kScnAlignMask) >> kScnAlignShift;
+    // Class 0 = unspecified = the references' 16-byte default = exponent 4.
+    // Otherwise the class ordinal is one MORE than the log2 exponent.
+    return link::format::foreignSectionAlignmentFromLog2(
+        cls == 0u ? 4u : cls - 1u);
+}
+
 // IMAGE_SCN_LNK_COMDAT: this section participates in COMDAT
 // duplicate-resolution. A real cl.exe/clang-cl `.obj` places each
 // function-level-linked (`/Gy`) / `__declspec(selectany)` / inline / template
 // body in its OWN COMDAT section; the duplicate-resolution policy lives in the
 // section-definition auxiliary record's Selection byte (decoded below --
 // D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION).
-// ⚠ THIS BIT IS NO LONGER FOREIGN-ONLY. It said so until D-LK-OBJECT-WEAK-DEF-
-// RELOCATABLE landed: COFF has no per-symbol weak-DEFINITION encoding, so DSS's
+// ⚠ THIS BIT IS NO LONGER FOREIGN-ONLY. It said so until D-LK-OBJECT-WEAK-DEF-RELOCATABLE
+// landed: COFF has no per-symbol weak-DEFINITION encoding, so DSS's
 // own writer now spells every weak definition as a per-body IMAGE_SCN_LNK_COMDAT
 // section with Selection = IMAGE_COMDAT_SELECT_ANY (`pe.cpp`, the COMDAT
 // sections walk). The COMDAT path below therefore runs on DSS's OWN output as
@@ -431,6 +500,11 @@ struct DefSym {
     // keeps `mod.symbols` in symbol-table order, which is the order every
     // existing round-trip pin reads it in.
     bool moduleSymbolAlreadyPushed = false;
+    // D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED: what this definition
+    // promises about the copies it may be folded against, decoded from the
+    // COMDAT Selection byte in (5.5). `Any` for every non-COMDAT symbol and for
+    // IMAGE_COMDAT_SELECT_ANY, which is the pre-existing behaviour verbatim.
+    DuplicateMatch duplicateMatch = DuplicateMatch::Any;
 };
 
 // A reconstructed [start, start+len) byte range within one section, plus the
@@ -457,7 +531,11 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     };
 
     // -- (0) Format sanity: this reader speaks PE/COFF only ----------
-    // ── SELF-GUARD (D-LINK-…-KIND-IDENTITY-BRANCHES, TF-C125) ──────────
+    // ── SELF-GUARD (TF-C125) ─────────────────────────────────────────
+    //    ⚠ THIS CITATION WAS ELIDED TO `D-LINK-…-KIND-IDENTITY-BRANCHES`,
+    //    which matches no id and so pointed at nothing any grep could find.
+    //    The id, whole and on its own line:
+    //    D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES
     //
     // ★★ THIS GUARD SURVIVED THE IDENTITY-BRANCH REMOVAL, AND THE REASON IS
     // MEASURED FOR THIS SITE. The TF-C125 brief expected it to become
@@ -869,7 +947,28 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // enumeration -- every kind-resolved COMDAT section maps to a binding or
     // FAILS LOUD; a selection is never silently defaulted (a wrong default
     // silently mis-dedups).
-    std::unordered_map<std::uint16_t, SymbolBinding> comdatBindingBySection;
+    //
+    // ★★ AND THE BINDING IS ONLY HALF OF WHAT THE SELECTION BYTE SAYS --
+    // D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED. ANY(2), SAME_SIZE(3)
+    // and EXACT_MATCH(4) all lift to Weak, but the last two additionally
+    // PROMISE something about the copies -- equal LENGTH, or equal BYTES -- and
+    // the format specifies a violation as "a multiply defined symbol error".
+    // Folding all three lowest-key with no comparison meant DSS silently
+    // accepted exactly the input the format tells it to reject. The duty
+    // travels with the binding, as `DuplicateMatch`, and the cross-CU fold
+    // discharges it (`link/cross_cu_resolve.cpp`).
+    //
+    // ⚠ ONE MAP CARRYING A PAIR, NOT TWO PARALLEL MAPS. The binding and the
+    // duty are read off the SAME aux byte at the SAME moment and are consumed
+    // at the same site; two maps keyed on the same ordinal is the shape that
+    // acquires an entry in one and not the other, and the failure would be a
+    // COMDAT lifted to Weak with its promise silently downgraded to `Any` --
+    // i.e. this exact defect, reintroduced by bookkeeping.
+    struct ComdatPolicy {
+        SymbolBinding  binding;
+        DuplicateMatch duty;
+    };
+    std::unordered_map<std::uint16_t, ComdatPolicy> comdatBindingBySection;
     for (std::uint16_t si = 0; si < numSections; ++si) {
         Section const& sec = sections[si];
         if ((sec.chars & kScnLnkComdat) == 0u) continue;  // not a COMDAT section
@@ -921,16 +1020,43 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // symbol STRONG (Global) so the existing all-strong merge fires
                 // K_SymbolRedefinedAcrossUnits on a duplicate -- which IS the
                 // NODUPLICATES contract.
-                comdatBindingBySection.emplace(ordinal, SymbolBinding::Global);
+                comdatBindingBySection.emplace(
+                    ordinal,
+                    ComdatPolicy{SymbolBinding::Global, DuplicateMatch::Any});
                 break;
             case kComdatSelAny:
+                // ANY: duplicates are legal and the copies need not agree about
+                // anything at all -- "any section that defines the same COMDAT
+                // symbol can be linked; the rest are removed". Lift to WEAK so
+                // the existing all-weak merge dedup keeps one body + drops the
+                // shadow (ZERO merge change), and promise NOTHING.
+                //
+                // ★ THIS ARM IS CORRECT AS IT STANDS AND THE FIX MUST NOT
+                // WIDEN INTO IT. Attaching a size or byte comparison here would
+                // start REFUSING the one selection the format says may differ
+                // freely -- which is the encoding DSS's OWN writer emits for
+                // every weak definition (D-LK-OBJECT-WEAK-DEF-RELOCATABLE), so
+                // it would refuse DSS's own output.
+                comdatBindingBySection.emplace(
+                    ordinal,
+                    ComdatPolicy{SymbolBinding::Weak, DuplicateMatch::Any});
+                break;
             case kComdatSelSameSize:
+                // SAME_SIZE: duplicates are legal ONLY IF every definition has
+                // the same size; otherwise the format requires a multiply-
+                // defined-symbol error. Same WEAK lift, plus the duty.
+                comdatBindingBySection.emplace(
+                    ordinal,
+                    ComdatPolicy{SymbolBinding::Weak,
+                                 DuplicateMatch::SameSize});
+                break;
             case kComdatSelExactMatch:
-                // ANY / SAME_SIZE / EXACT_MATCH: duplicates are legal; the
-                // linker keeps one and drops the rest. Lift to WEAK so the
-                // existing all-weak merge dedup keeps one body + drops the
-                // shadow (ZERO merge change).
-                comdatBindingBySection.emplace(ordinal, SymbolBinding::Weak);
+                // EXACT_MATCH: duplicates are legal ONLY IF the definitions
+                // match exactly -- the strictest of the three, and the reason
+                // the duty is an ordered scale rather than a flag.
+                comdatBindingBySection.emplace(
+                    ordinal, ComdatPolicy{SymbolBinding::Weak,
+                                          DuplicateMatch::ExactContent});
                 break;
             default:
                 // LARGEST(6) / ASSOCIATIVE(5) / 0 / unknown -> FAIL LOUD.
@@ -995,8 +1121,14 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                   "by its section alone -- the storage class is what says "
                   "whether a record names a body, a reference, or a "
                   "bookkeeping entry, and guessing it silently mis-slices the "
-                  "section (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-"
-                  "LABEL-NOT-ATOM).");
+                  "section ("
+                  // ANCHOR, ONE LINE, DO NOT WRAP. It WAS wrapped here across
+                  // two string literals: the concatenated runtime message read
+                  // correctly, so nothing failed, while the SOURCE stopped
+                  // matching a grep for the id -- the invisible half of the
+                  // wrap rule, met in the one place it is easiest to miss.
+                  "D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM"
+                  ").");
         }
         CoffSymbolRole const role = *roleOpt;
 
@@ -1100,9 +1232,50 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             isExt ? SymbolBinding::Global : SymbolBinding::Local;
 
         if (s.sectNum == kSymUndefined) {
-            // An UNDEFINED symbol -> an extern import. A nameless slot carries
-            // no import identity.
-            if (s.name.empty()) continue;
+            // An UNDEFINED symbol -> an extern import.
+            //
+            // ★ A NAMELESS UNDEF RECORD IS REFUSED, NOT SKIPPED --
+            // D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED. This arm read
+            // `if (s.name.empty()) continue;` under the comment "a nameless slot
+            // carries no import identity", which is TRUE and is not a reason to
+            // drop it: the record still occupies a `NumberOfSymbols` slot, so a
+            // relocation can name it BY INDEX, and every gate that would catch
+            // such a relocation lets it through -- the bound check passes
+            // (the index is real), the aux-slot check passes (it is not an aux),
+            // and `rel.target = SymbolId{ownerOf(symIdx)}` then names a SymbolId
+            // this reader never produced. ✔MEASURED by reading the relocation
+            // loop's own conclusion at (6.44): "an id that owns no body is
+            // `K_SymbolUndefined` at the linker's compound index". So the drop
+            // does not vanish; it re-emerges at MERGE time as an unresolved
+            // symbol with NO NAME TO PRINT, attributed to whoever merged the
+            // object rather than to the malformed record that caused it.
+            //
+            // ⚠ THE DECISION, AND IT IS THE ONE THIS ARM'S TWIN ALREADY TOOK.
+            // PE/COFF 5.4.2 makes an UNDEF record with Value 0 "a reference to
+            // an external symbol defined elsewhere" -- a reference resolved BY
+            // NAME, so a nameless one refers to nothing any object could
+            // satisfy. It is a malformed record, not a shape with a meaning DSS
+            // is failing to model. The identical skip in the WEAK_EXTERNAL arm
+            // above became a refusal for exactly this hazard, and refusing here
+            // too is what makes the reader's treatment of the two UNIFORM
+            // instead of accidental. ✔MEASURED before changing it: the
+            // `CoffForeignObjectNative` probes over real cl.exe / clang-cl
+            // objects (including a `/Gy` object and a multi-member `.lib`) stay
+            // green, i.e. no real producer emits this shape -- so the blast
+            // radius on objects DSS did not write is measured, not assumed.
+            if (s.name.empty()) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: symbol #" + std::to_string(i)
+                    + " has SectionNumber UNDEF and an EMPTY name. PE/COFF "
+                      "5.4.2 makes an UNDEF record a reference resolved BY "
+                      "NAME, so a nameless one names nothing any object can "
+                      "satisfy -- and dropping it silently leaves any "
+                      "relocation naming this record BY INDEX pointing at a "
+                      "symbol the reader never produced, which surfaces as an "
+                      "unresolved symbol against the wrong object long after "
+                      "the malformed record that caused it. "
+                      "D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED.");
+            }
             // ⚠ EXCEPT WHEN IT IS A COMMON SYMBOL, WHICH IS A DEFINITION.
             // PE/COFF 5.4.2: an EXTERNAL record with SectionNumber UNDEF(0) and
             // a NON-ZERO Value is a COMMON symbol, and the Value is its SIZE in
@@ -1174,18 +1347,24 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // a COMDAT section lifts the binding per its Selection policy (Weak
             // for ANY/SAME_SIZE/EXACT_MATCH so the all-weak dedup folds
             // duplicates; Global for NODUPLICATES / a non-COMDAT section).
-            SymbolBinding extBinding = SymbolBinding::Global;
+            // D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED: the duty rides
+            // out with the binding, on the SAME lookup, so a COMDAT can never
+            // arrive Weak with its promise lost on the way.
+            SymbolBinding  extBinding = SymbolBinding::Global;
+            DuplicateMatch extDuty    = DuplicateMatch::Any;
             if (auto it = comdatBindingBySection.find(s.sectNum);
                 it != comdatBindingBySection.end()) {
-                extBinding = it->second;
+                extBinding = it->second.binding;
+                extDuty    = it->second.duty;
             }
             defsBySection[s.sectNum].push_back(
                 DefSym{i, s.value, s.name, extBinding,
-                       SymbolVisibility::Default});
+                       SymbolVisibility::Default,
+                       /*moduleSymbolAlreadyPushed=*/false, extDuty});
         } else if (role == CoffSymbolRole::Static && declaresFunction(s)) {
             // A FILE-LOCAL (`static`) FUNCTION -- an atom BOUNDARY, exactly like
-            // an external one. D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-
-            // LABEL-NOT-ATOM: the only thing internal linkage changes is WHO MAY
+            // an external one. D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM:
+            // the only thing internal linkage changes is WHO MAY
             // SEE the definition, never whether it has a body, so classifying it
             // by EXTERNAL-ness dropped whole functions on the archive-member
             // read-back path (loud as `K_SymbolUndefined` when called, and
@@ -1350,7 +1529,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // `mod.symbols` (see `DefSym::moduleSymbolAlreadyPushed`).
         if (!d.name.empty() && !d.moduleSymbolAlreadyPushed) {
             mod.symbols.push_back(ModuleSymbol{SymbolId{d.symIdx}, d.name,
-                                               d.binding, d.visibility});
+                                               d.binding, d.visibility,
+                                               d.duplicateMatch});
         }
     };
 
@@ -1594,8 +1774,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // slice their bytes; a zero-fill (bss) section reserves the size
             // with empty bytes (the reservedSize invariant).
             AssembledData di;
-            di.symbol  = SymbolId{defs[k].symIdx};
-            di.section = *dk;
+            di.symbol    = SymbolId{defs[k].symIdx};
+            di.section   = *dk;
+            di.alignment = alignFromCharacteristics(sec.chars);  // section-granular
             if (isZeroFill(*dk)) {
                 di.reservedSize = len;
             } else {
@@ -1685,8 +1866,12 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // symbol's, and NO ModuleSymbol is recorded -- the atom stays
                 // module-private and is never folded cross-CU by name, which is
                 // right for bytes that have no name.
-                di.symbol  = SymbolId{nextSyntheticId++};
-                di.section = *dk;
+                di.symbol    = SymbolId{nextSyntheticId++};
+                di.section   = *dk;
+                // The gap's bytes belong to the SAME section, so they carry the
+                // same declared alignment as the named atoms around them --
+                // exactly as the ELF gap arm does.
+                di.alignment = alignFromCharacteristics(sec.chars);
                 std::size_t const b0 = static_cast<std::size_t>(sec.rawPtr + g.start);
                 di.bytes.assign(bytes.begin() + b0,
                                 bytes.begin() + b0 + static_cast<std::size_t>(g.len));

@@ -2,10 +2,16 @@
 
 #include "core/export.hpp"
 #include "core/substrate/arena_tag.hpp"
+// The closed-enum spelling table `kHirKindTable` below is built on it. This is
+// the dependency-free substrate header written for exactly this case — a leaf
+// vocabulary header carrying its own table without pulling in the config layer.
+#include "core/types/enum_name_table.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_id.hpp"   // TypeId
 
+#include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <type_traits>
 
 // HIR node model (HR1). The HIR is the language-neutral, structured, typed
@@ -133,6 +139,103 @@ static_assert(static_cast<std::uint32_t>(HirKind::Count_) < 256,
 // the [0, kFirstHirExtensionKind) range of the open kind space. Mirrors the
 // type lattice's kFirstExtensionKind.
 inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
+
+// ── the SPELLING of a core kind, for diagnostics ─────────────────────────────
+//
+// ★★★ A USER-FACING MESSAGE MAY NOT RENDER A RAW ENUM ORDINAL WHEN THE ENUM IS
+// A CLOSED SET (D-MIR-LVALUE-REFUSAL-RENDERS-A-RAW-ORDINAL-NOT-A-NAME).
+// `lowerLvalueAddress` refused with `lvalue kind ordinal 30 not supported by
+// this lowering` — ✔MEASURED at the CLI, reachable from ordinary C via
+// `__asm__(… : "=r"(1+2))`. The refusal is LOUD and CORRECT; `30` is the defect,
+// because the reader has to open this header and COUNT to learn it means
+// `BinaryOp`, and any inserted enumerator silently retargets every ordinal a
+// bug report ever quoted.
+//
+// ★★ THE SHAPE IS THE SUBSTRATE'S OWN `EnumNameTable`, NOT A HAND-WRITTEN
+// SWITCH. A switch here would be a SECOND OWNER of the spellings
+// (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET is that defect
+// wearing a config hat), and `enum_name_table.hpp` is dependency-free by
+// construction precisely so a leaf vocabulary header may carry its own table.
+//
+// ⚠ `Count_` IS DELIBERATELY UNLISTED and `nameOrEmpty` is therefore the ONLY
+// legal projection: it is a counter, not a kind, and `name()`'s row-0 fallback
+// would hand it `Module`'s spelling — a plausible wrong answer rather than a
+// loud one, which is the exact hazard `nameOrEmpty` exists for. The row COUNT
+// is asserted against `Count_` below, so a new enumerator that arrives without a
+// row FAILS THE BUILD instead of rendering empty at some future reader.
+inline constexpr EnumNameTable<HirKind, 53> kHirKindTable{{{
+    {HirKind::Module,          "Module"},
+    {HirKind::Function,        "Function"},
+    {HirKind::Global,          "Global"},
+    {HirKind::TypeDecl,        "TypeDecl"},
+    {HirKind::ExternFunction,  "ExternFunction"},
+    {HirKind::ExternGlobal,    "ExternGlobal"},
+    {HirKind::ImportGroup,     "ImportGroup"},
+    {HirKind::Block,           "Block"},
+    {HirKind::IfStmt,          "IfStmt"},
+    {HirKind::WhileStmt,       "WhileStmt"},
+    {HirKind::DoWhileStmt,     "DoWhileStmt"},
+    {HirKind::ForStmt,         "ForStmt"},
+    {HirKind::SwitchStmt,      "SwitchStmt"},
+    {HirKind::CaseArm,         "CaseArm"},
+    {HirKind::BreakStmt,       "BreakStmt"},
+    {HirKind::ContinueStmt,    "ContinueStmt"},
+    {HirKind::ReturnStmt,      "ReturnStmt"},
+    {HirKind::ExprStmt,        "ExprStmt"},
+    {HirKind::VarDecl,         "VarDecl"},
+    {HirKind::AssignStmt,      "AssignStmt"},
+    {HirKind::GotoStmt,        "GotoStmt"},
+    {HirKind::LabelStmt,       "LabelStmt"},
+    {HirKind::IndirectGotoStmt,"IndirectGotoStmt"},
+    {HirKind::SehTryExcept,    "SehTryExcept"},
+    {HirKind::InlineAsm,       "InlineAsm"},
+    {HirKind::Literal,         "Literal"},
+    {HirKind::Ref,             "Ref"},
+    {HirKind::Call,            "Call"},
+    {HirKind::IntrinsicCall,   "IntrinsicCall"},
+    {HirKind::BuiltinCall,     "BuiltinCall"},
+    {HirKind::BinaryOp,        "BinaryOp"},
+    {HirKind::UnaryOp,         "UnaryOp"},
+    {HirKind::Cast,            "Cast"},
+    {HirKind::MemberAccess,    "MemberAccess"},
+    {HirKind::Index,           "Index"},
+    {HirKind::Swizzle,         "Swizzle"},
+    {HirKind::ConstructAggregate, "ConstructAggregate"},
+    {HirKind::Ternary,         "Ternary"},
+    {HirKind::LogicalAnd,      "LogicalAnd"},
+    {HirKind::LogicalOr,       "LogicalOr"},
+    {HirKind::SizeOf,          "SizeOf"},
+    {HirKind::AlignOf,         "AlignOf"},
+    {HirKind::AddressOf,       "AddressOf"},
+    {HirKind::Deref,           "Deref"},
+    {HirKind::SeqExpr,         "SeqExpr"},
+    {HirKind::LabelAddressOf,  "LabelAddressOf"},
+    {HirKind::VaStart,         "VaStart"},
+    {HirKind::VaArg,           "VaArg"},
+    {HirKind::VaEnd,           "VaEnd"},
+    {HirKind::TypeRef,         "TypeRef"},
+    {HirKind::Unreachable,     "Unreachable"},
+    {HirKind::Error,           "Error"},
+    {HirKind::Extension,       "Extension"},
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kHirKindTable);
+// ★ COMPLETENESS, WHICH WELL-FORMEDNESS DOES NOT GIVE YOU. `DSS_CHECK_ENUM_NAME_TABLE`
+// proves no row is empty and no two rows collide; it cannot know an enumerator
+// was never listed. `Count_` is the member count, so "rows == Count_" says every
+// core kind has exactly one spelling — and a new kind added without a row is a
+// BUILD failure rather than a diagnostic that quietly renders nothing.
+static_assert(kHirKindTable.rows.size()
+                  == static_cast<std::size_t>(HirKind::Count_),
+              "kHirKindTable must carry one row per core HirKind member "
+              "(Count_ itself is a counter and is deliberately unlisted)");
+
+// The spelling of a core kind, or EMPTY for a value with none (`Count_`, a
+// corrupted node, a registry-minted extension id that reached a `HirKind`
+// parameter). ⚠ A caller rendering a diagnostic must handle the empty case
+// itself — printing `''` is the second plausible wrong answer.
+[[nodiscard]] constexpr std::string_view hirKindName(HirKind k) noexcept {
+    return kHirKindTable.nameOrEmpty(k);
+}
 
 // Does a node of this kind carry a resolved result type — i.e. must its `typeId`
 // be `valid()`? True for the whole Expressions group (every expression has a

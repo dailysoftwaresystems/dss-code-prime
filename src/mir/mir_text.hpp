@@ -45,6 +45,16 @@
 //     }
 //   }
 //
+// ★★ ONE INSTRUCTION PER LINE, and it is a RULE of this grammar rather than a
+// habit of the emitter. `parseInstruction` refuses any instruction whose line
+// still holds tokens after its arm has run (a closing `}` excepted, so a
+// hand-written body may end on the instruction's line). That is the CLASS guard
+// for a writer arm that renders an operand or payload tail its reader arm does
+// not consume — the defect three separate opcodes carried, each producing a
+// SUCCESSFUL parse of a WRONG instruction followed some tokens later by a
+// diagnostic about a line that was never the problem
+// (D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS).
+//
 // Verify-on-load: `parseMir` runs `MirVerifier` against the rebuilt
 // module + interner. `result->ok` is the delta on the reporter's
 // error count over the full parse + verify (so a pre-existing
@@ -56,9 +66,21 @@ class DiagnosticReporter;
 
 // ── MirTextContext ─────────────────────────────────────────────────
 //
-// Non-owning enrichment for the emitter. Fully-null context still
-// produces a complete, re-parseable file (synthetic symbol handles,
-// `?<v>` type placeholders with a Warning when interner is absent).
+// Non-owning enrichment for the emitter. A fully-null context still produces a
+// STRUCTURALLY complete file (synthetic symbol handles, `?` type placeholders,
+// one Warning).
+//
+// ⚠ IT IS NOT RE-PARSEABLE, and this sentence used to say it was. `parseType`
+// refuses `?` by name — it has to, because `?` names no type and guessing one
+// would silently retype the module — so a dump taken with no interner is a
+// one-way dump. Stating the opposite here made an emitter warning look like a
+// cosmetic note about a file that would still round-trip
+// (D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS).
+//
+// ⚠⚠ AND IT WAS WORSE THAN "NOT RE-PARSEABLE" UNTIL 2026-08-23: the refused type
+// travelled on as `InvalidType` into `MirBuilder::addFunction`/`addGlobal`, which
+// ABORT on one — so reading such a dump back killed the process rather than
+// returning a refusal (D-MIR-TEXT-INVALID-TYPE-REACHES-A-BUILDER-THAT-ABORTS).
 struct DSS_EXPORT MirTextContext {
     // Decodes each instruction's `TypeId` into structural text. The
     // real pipeline always supplies the interner the semantic phase
@@ -73,9 +95,20 @@ struct DSS_EXPORT MirTextContext {
     std::vector<std::string> const* symbolNames = nullptr;
 };
 
-// Serialize `mir` to canonical `.dssir` text. Pure function. Diagnostics
-// (e.g. typed instruction with no interner to decode) go to `reporter`
-// at Warning severity; the call never aborts.
+// Serialize `mir` to canonical `.dssir` text. Pure function. The call never
+// aborts.
+//
+// ★★ SEVERITY IS PER-DIAGNOSTIC, AND IT USED TO BE DOCUMENTED — AND
+// DEFAULTED — AS WARNING FOR ALL OF THEM. That put this tier one severity below
+// the sibling `hir_text.cpp`, whose emitter defaults to Error, for the SAME class
+// of event on two files that describe themselves as twins. The two classes are
+// now distinguished at each site rather than by a default:
+//   * ERROR   — a value or type this format cannot spell. The text is emitted
+//               with a named marker, the reader REFUSES that marker, and the
+//               module cannot be recovered from the text.
+//   * WARNING — a lossy dump the CALLER asked for (no `interner`, no
+//               `symbolNames`). Reported once, not per value.
+// (D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS.)
 [[nodiscard]] DSS_EXPORT std::string emitMir(Mir const& mir,
                                              MirTextContext const& ctx,
                                              DiagnosticReporter& reporter);

@@ -1,0 +1,20 @@
+{
+  "_comment": [
+    "Per-file ceilings for STALE REFUSAL CITATIONS: a present-tense sentence that",
+    "asserts something is refused, unsupported or blocked while every deferral row",
+    "it cites has a CLOSED status cell. Such a sentence was true when it was typed",
+    "and false when the commit landed, and it reads as evidence either way.",
+    "A ceiling may only come DOWN. Re-measure the claim, correct the sentence, and",
+    "lower the number in the SAME commit; the guard prints the new value. Raising",
+    "an entry, or adding a file, is a FAILURE -- that is the ratchet.",
+    "This file is DEBT, not a pass: green means no NEW instance landed.",
+    "EVERY ENTRY HERE IS AN UNREPAIRED CANDIDATE, NOT A SANCTIONED EXCEPTION. The",
+    "three false-positive classes an independent review found -- a residual scoped",
+    "outside what the row closed, an attributive `open`, and a run-on across a JSON",
+    "or parenthesis boundary -- were removed from the PREDICATE, so nothing is",
+    "silenced by a bare line with no argument behind it. Each remaining entry is a",
+    "sentence somebody should re-measure through the CLI and then correct.",
+    "Species record: D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED."
+  ],
+  "ceilings": {}
+}

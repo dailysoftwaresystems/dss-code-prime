@@ -12,8 +12,8 @@ dss_add_test(NAME analysis/semantic/test_type_rules
 dss_add_test(NAME analysis/semantic/test_semantic_analyzer_toy
              SOURCES test_semantic_analyzer_toy.cpp)
 
-dss_add_test(NAME analysis/semantic/test_semantic_analyzer_c_subset
-             SOURCES test_semantic_analyzer_c_subset.cpp)
+dss_add_test(NAME analysis/semantic/test_semantic_analyzer_c
+             SOURCES test_semantic_analyzer_c.cpp)
 
 dss_add_test(NAME analysis/semantic/test_semantic_analyzer_tsql
              SOURCES test_semantic_analyzer_tsql.cpp)
@@ -43,7 +43,7 @@ dss_add_test(NAME analysis/semantic/test_type_identity_vocabulary
              SOURCES test_type_identity_vocabulary.cpp)
 target_include_directories(dss_analysis_semantic_test_type_identity_vocabulary
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
-# Perturbs the SHIPPED c-subset JSON (the loader accept/reject matrix).
+# Perturbs the SHIPPED c JSON (the loader accept/reject matrix).
 target_link_libraries(dss_analysis_semantic_test_type_identity_vocabulary
                       PRIVATE nlohmann_json::nlohmann_json)
 
@@ -60,7 +60,7 @@ dss_add_test(NAME analysis/semantic/test_declarator_engine
 # libstdc++/gtest; same trap the compilation_unit suite hit).
 target_include_directories(dss_analysis_semantic_test_semantic_analyzer_toy
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
-target_include_directories(dss_analysis_semantic_test_semantic_analyzer_c_subset
+target_include_directories(dss_analysis_semantic_test_semantic_analyzer_c
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_include_directories(dss_analysis_semantic_test_semantic_analyzer_tsql
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
@@ -68,7 +68,7 @@ target_include_directories(dss_analysis_semantic_test_semantic_analyzer_generici
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_include_directories(dss_analysis_semantic_test_fc3_width_semantics
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
-# The FC3 suite perturbs the SHIPPED c-subset JSON — it needs nlohmann.
+# The FC3 suite perturbs the SHIPPED c JSON — it needs nlohmann.
 target_link_libraries(dss_analysis_semantic_test_fc3_width_semantics
                       PRIVATE nlohmann_json::nlohmann_json)
 # The FC4 declarator suite perturbs its SYNTHETIC schema doc the same way
@@ -93,3 +93,103 @@ target_include_directories(dss_analysis_semantic_test_inline_asm_template_sigil_
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_link_libraries(dss_analysis_semantic_test_inline_asm_template_sigil_agreement
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED: the FRONT-END half of
+# the three-armed constraint binding. `AsmConstraintBinding::OperandKind` — the
+# arm `"m"` and `"i"` land on — used to resolve to nothing, which is
+# byte-identical to "the letter is not declared", so a declared letter was
+# refused three tiers down with a reason that was false. Lives beside
+# `test_inline_asm_capture` (the P5 capture pins) because it asks the same
+# question one step later: not "what did the source write", but "what did the
+# TARGET say the letter binds". It runs the real CST->HIR lowering with a
+# shipped target in scope, which is the only configuration in which the
+# resolution runs at all.
+dss_add_test(NAME analysis/semantic/test_inline_asm_operand_kind_binding
+             SOURCES test_inline_asm_operand_kind_binding.cpp)
+# Shares `semantic_test_fixture.hpp` with the suites above, so it needs the
+# tests/ include root for the same reason they do (NOT the repo root -- its
+# `VERSION` file shadows `<version>` on case-insensitive filesystems).
+target_include_directories(dss_analysis_semantic_test_inline_asm_operand_kind_binding
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P31 (2026-08-24): the four GNU COMPILE-TIME operand forms -- alignof on a VALUE
+# ([[D-CSUBSET-ALIGNOF-VALUE-OPERAND]]), __builtin_offsetof ([[D-FFI-OFFSETOF-MACRO]]),
+# __builtin_types_compatible_p and __builtin_choose_expr. Lives here rather than in
+# the runnable corpus because it pins what a corpus example structurally CANNOT: the
+# REFUSALS and the exact diagnostic CODE each one carries, plus the Pass-1.5
+# const-expr tier (a different consumer from the Pass-2 + HIR path an ordinary
+# expression takes). Shares `semantic_test_fixture.hpp`, so it needs the tests/
+# include root for the same reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_builtin_compile_time_operators
+             SOURCES test_builtin_compile_time_operators.cpp)
+target_include_directories(dss_analysis_semantic_test_builtin_compile_time_operators
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P31 (2026-08-24): the GNU `__extension__` prefix ([[D-C-GNU-EXTENSION-KEYWORD]])
+# and the GNU statement expression ([[D-C-GNU-STATEMENT-EXPRESSION]]). Lives here
+# rather than only in the runnable corpus because it pins what a corpus example
+# structurally CANNOT: the REFUSED positions -- which are the ONLY thing that
+# distinguishes `__extension__`-as-a-prefix from `__extension__`-as-a-specifier,
+# since every ACCEPTING shape passes under both readings -- plus the two
+# statement-expression refusals and their exact diagnostic codes, plus the
+# per-DATA-MODEL fold of a constant written through the prefix. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root for the same
+# reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_gnu_extension_and_statement_expr
+             SOURCES test_gnu_extension_and_statement_expr.cpp)
+target_include_directories(dss_analysis_semantic_test_gnu_extension_and_statement_expr
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P32 lane A: [[D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED]]
+# -- an attribute clause NAME spelled with a KEYWORD (`__attribute__((__const__))`,
+# 50 occurrences in ONE preprocessed glibc TU). Lives here rather than only in the
+# runnable corpus because a corpus example must BUILD, so it can only exercise the
+# ACCEPTING half -- and the accepting half is exactly what a GRAMMAR-ONLY widening
+# also passes, while silently dropping every keyword-named attribute. The pins
+# that separate the two are REFUSALS and their exact codes: an unmodelled
+# keyword-spelled name must reach the strict gate and fail loud, and its modelled
+# sibling must not. Shares `semantic_test_fixture.hpp`, so it needs the tests/
+# include root for the same reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_attribute_clause_name_token_class
+             SOURCES test_attribute_clause_name_token_class.cpp)
+target_include_directories(dss_analysis_semantic_test_attribute_clause_name_token_class
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P32 lane A: [[D-C-SUBTREE-TYPE-WALKS-INTO-A-STATEMENT-EXPRESSION-BODY]] -- the
+# semantic expression typer must take a statement expression's type from the LAST
+# ITEM'S EXPRESSION (the same place the lowering takes its value) and not from a
+# declaration inside the body. The runnable example owns the accepting half; this
+# owns the REFUSING half, which an example structurally cannot carry: a `void`
+# statement expression in value position must be REFUSED with its own code, not
+# silently typed from whatever the body declared.
+dss_add_test(NAME analysis/semantic/test_stmt_expr_value_type
+             SOURCES test_stmt_expr_value_type.cpp)
+target_include_directories(dss_analysis_semantic_test_stmt_expr_value_type
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P32 lane A: [[D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT]] plus the SEMANTIC
+# half of [[D-CSUBSET-ATTRIBUTE-PARAM-POSITION]]. Every discard shape is pinned as
+# a PAIR -- a must-warn context beside a must-not-warn sibling -- because a
+# discard test can fail in two opposite directions and only the pair can tell a
+# fix that landed from a fix that over-reached. The parameter-attribute pin
+# asserts the EFFECT (a `deprecated` parameter warns at its USE site) rather than
+# the parse, which is what a grammar-only change would also pass.
+dss_add_test(NAME analysis/semantic/test_nodiscard_discard_context
+             SOURCES test_nodiscard_discard_context.cpp)
+target_include_directories(dss_analysis_semantic_test_nodiscard_discard_context
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P41 lane N: [[D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED]] --
+# C 6.7.6p1 permits redundant parentheses around a declarator, so
+# `int (foo)(int x) { … }` defines the FUNCTION foo (the glibc/musl idiom for a name
+# that is also a function-like macro). The runnable example
+# `examples/c/paren_fn_def_declarator/` owns the accepting half and the runtime
+# proof; this file owns the REFUSING half, which an example structurally cannot
+# carry -- a function-POINTER, an ARRAY, or an UNDECORATED parenthesized name with a
+# body must all STAY refused by code, and the parameter of a returned function
+# type's suffix must stay invisible to the body. Without those, "make the
+# parenthesized form work" is indistinguishable from "stop checking definitions".
+dss_add_test(NAME analysis/semantic/test_paren_declarator_function
+             SOURCES test_paren_declarator_function.cpp)
+target_include_directories(dss_analysis_semantic_test_paren_declarator_function
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

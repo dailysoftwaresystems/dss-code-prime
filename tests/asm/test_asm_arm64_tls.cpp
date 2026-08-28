@@ -83,9 +83,8 @@ assembleFirstFn(Lir const& lir, TargetSchema const& schema,
                              std::string_view name) {
     auto const ord = schema.registerByName(name);
     EXPECT_TRUE(ord.has_value()) << "register not found: " << name;
-    return LirReg{static_cast<std::uint32_t>(ord.value_or(0)),
-                  /*isPhysical=*/1,
-                  /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    return makePhysicalReg(static_cast<std::uint32_t>(ord.value_or(0)),
+                           LirRegClass::GPR);
 }
 
 [[nodiscard]] std::uint32_t rdWord(std::vector<std::uint8_t> const& b,

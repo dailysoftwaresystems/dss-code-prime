@@ -64,7 +64,7 @@ namespace dss {
 //   predefined-macro origin=<o> kind=<k> form=<f> name=<NAME> value=<...>
 //
 // A fixed leading marker (never a regex over prose) so a machine reader selects
-// these lines by prefix — the same discipline as the `dss-code-prime: artifact`
+// these lines by prefix — the same discipline as the `dsscp: artifact`
 // report line. Every field is a single token except `value`.
 inline constexpr std::string_view kPredefinedMacroLineMarker = "predefined-macro";
 
@@ -73,7 +73,7 @@ inline constexpr std::string_view kPredefinedMacroLineMarker = "predefined-macro
 // answered for nothing) is visible in the output itself rather than inferred
 // from a short list.
 inline constexpr std::string_view kPredefinedMacroHeaderMarker =
-    "dss-code-prime: predefined-macros";
+    "dsscp: predefined-macros";
 
 // A NOTE line, emitted after a section's macro lines. Its own marker (never the
 // macro marker) so a machine reader selecting macro lines by prefix never picks
@@ -89,7 +89,7 @@ inline constexpr std::string_view kPredefinedMacroHeaderMarker =
 // the handler. So the dump STATES the condition, names both governing clauses,
 // and leaves the verdict where it belongs.
 inline constexpr std::string_view kPredefinedMacroNoteMarker =
-    "dss-code-prime: predefined-macros-note";
+    "dsscp: predefined-macros-note";
 
 // The `origin=` field's closed vocabulary — WHICH CONFIG FAMILY (or the command
 // line) declared the entry. This is what makes the output an AUDIT instrument
@@ -105,17 +105,26 @@ enum class PredefinedMacroOrigin : std::uint8_t {
 [[nodiscard]] DSS_EXPORT std::string_view
 predefinedMacroOriginName(PredefinedMacroOrigin o) noexcept;
 
-// The `value=` field when there IS no single value. Two DIFFERENT reasons, and
+// The `value=` field when there IS no single value. THREE DIFFERENT reasons, and
 // they are spelled differently on purpose: an operator who sees one needs to
 // know which question to ask next ("where is it invoked?" vs "with what
-// arguments?"). Neither spelling can be mistaken for a macro value: both begin
-// with the reserved `<no-single-value` prefix, which no config value has (they
-// are integer-constant spellings, string literals, or empty).
+// arguments?" vs "how many times has it already been read?"). No spelling can be
+// mistaken for a macro value: all begin with the reserved `<no-single-value`
+// prefix, which no config value has (they are integer-constant spellings, string
+// literals, or empty).
 inline constexpr std::string_view kNoSingleValueOffsetDerived =
     "<no-single-value: derived from the invocation offset at each use>";
 inline constexpr std::string_view kNoSingleValueFunctionLike =
     "<no-single-value: function-like — expands against its arguments at each "
     "call>";
+// D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED. Deliberately NOT folded into the
+// offset-derived spelling: an offset-derived macro is reproducible from its
+// POSITION, and this one is not — the same site yields a different value on a
+// second expansion. That distinction is the entire semantics of `__COUNTER__`,
+// so a dump that blurred it would misdescribe the one thing worth knowing.
+inline constexpr std::string_view kNoSingleValueStateful =
+    "<no-single-value: per-translation-unit counter — advances at each "
+    "expansion>";
 
 // ── ONE triple's dump request ───────────────────────────────────────────────
 //

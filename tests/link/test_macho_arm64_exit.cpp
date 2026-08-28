@@ -1,7 +1,7 @@
 // macOS-ARM64 runnable backend — host-independent byte-pins
 // (D-LK10-ENTRY-MACHO-EXIT, v0.0.3).
 //
-// The `examples/c-subset/macho_arm64_exit` corpus is the END-TO-END
+// The `examples/c/macho_arm64_exit` corpus is the END-TO-END
 // runtime proof, but it only SPAWNS on the macos-latest (= Apple
 // Silicon) CI leg. These byte-pins are the ALWAYS-ON guard: they run on
 // EVERY leg (Windows / Linux included) and regression-catch the arm64
@@ -73,13 +73,13 @@ using dss::macho::test::readU64LE;
 // schema or nullptr (with an ADD_FAILURE) on miss.
 [[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
 loadDarwinExecByName(char const* fname) {
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root) {
-        ADD_FAILURE() << fname << ": " << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << fname << ": " << dss::test::configRootDiagnostic();
         return nullptr;
     }
     fs::path const shipped =
-        *root / "src" / "dss-config" / "object-formats" / fname;
+        *root / "object-formats" / fname;
     if (!fs::exists(shipped)) {
         ADD_FAILURE() << shipped.generic_string() << " does not exist";
         return nullptr;
@@ -129,7 +129,7 @@ loadArm64DarwinExecFormat() {
     // D-LK10-ENTRY 2.13 gate 6 (`resolveEntryFnIdx`, exec_reloc_apply.hpp):
     // a format declaring `processExit` — as macho64-arm64-darwin-exec does
     // — CONTRACTS that its image entry is the `_start` trampoline, and only
-    // `linker::link` injects one (entry_trampoline.cpp:732 — the file's
+    // `linker::link` injects one (`injectEntryTrampoline` — the file's
     // ONLY assignment to that field — sets this override on every
     // successful injection). Every pin built on this fixture drives
     // `macho::encode` DIRECTLY, so no trampoline exists: state that the
@@ -779,7 +779,7 @@ TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
 
 // ── __TEXT,__const read-only data section (D-LK1-MACHO-EXEC-DATA-SECTIONS)
 //
-// The parallel of the ELF `.rodata` cycle: a c-subset `int answer=42;`
+// The parallel of the ELF `.rodata` cycle: a c `int answer=42;`
 // global reaches a loadable __const folded into the R+X __TEXT segment.
 // These host-independent pins run on EVERY CI leg (the runtime "exit 42"
 // proof only spawns on macos-latest).

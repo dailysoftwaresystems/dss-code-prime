@@ -38,11 +38,17 @@ struct PassRunResult {
     bool mutated = false;
 };
 
+// `inlineLedger` is the per-`optimize()`-call memory the Inlining pass's
+// CUMULATIVE per-caller growth budget is measured against. It is threaded
+// from `optimize()` rather than owned by the pass because the pass is
+// re-entered on every fixpoint iteration and a budget re-baselined per
+// invocation compounds -- see `passes::InlineGrowthLedger`.
 [[nodiscard]] PassRunResult runPass(PassId id, Mir& mir,
                                     TargetSchema const& /*target*/,
                                     TypeInterner const& interner,
                                     OptPipeline const& pipeline,
-                                    DiagnosticReporter& reporter) {
+                                    DiagnosticReporter& reporter,
+                                    passes::InlineGrowthLedger& inlineLedger) {
     switch (id) {
         case PassId::Identity:
             return {true, false};  // no-op; exercises the engine wiring.
@@ -87,9 +93,10 @@ struct PassRunResult {
         }
         case PassId::Inlining: {
             // Marker maintenance rides the verify posture (see SimplifyCfg).
-            auto const r = passes::runInlining(mir, interner, reporter,
-                                               pipeline.inlineThreshold,
-                                               pipeline.verifyEveryPass);
+            auto const r = passes::runInlining(
+                mir, interner, reporter, pipeline.inlineThreshold,
+                pipeline.inlineCallerGrowthPercent, inlineLedger,
+                pipeline.verifyEveryPass);
             return {r.ok, r.callsInlined > 0};
         }
     }
@@ -242,6 +249,8 @@ struct ScheduleInterpreter {
     OptResult& result;
     std::size_t const entryErrorCount;
     bool const optTrace;
+    // Threaded to the Inlining leaf; see runPass's doc comment.
+    passes::InlineGrowthLedger& inlineLedger;
 
     // Failure latch — once a pass or a verify fails, unwind without
     // running anything further (the pre-tree early `return result`).
@@ -252,6 +261,28 @@ struct ScheduleInterpreter {
     // pessimistic `false` default).
     std::size_t completedFixpoints = 0;
     bool allFixpointsConverged = true;
+
+    // ★★★ WHAT A TRUNCATED FIXPOINT LOOKS LIKE, RECORDED SO IT CAN BE SAID
+    // OUT LOUD — `X_OptFixpointTruncated`, closing
+    // D-OPT-FIXPOINT-CONVERGENCE-IS-COMPUTED-AND-DISCARDED.
+    //
+    // Before this, the engine DETECTED that it had capped an unconverged
+    // optimization fixpoint and said nothing: `fixedPointReached` was
+    // computed and had zero consumers anywhere in the tree. A silent ceiling
+    // is exactly the class of thing the fail-loud bar exists to forbid — it
+    // is the one signal that would tell a user their release build did not
+    // finish optimizing, and it is why `{"max": 4}` truncating on the sqlite
+    // corpus went unnoticed until a lane went looking for it.
+    //
+    // Recorded per NODE rather than as one module-level flag because a
+    // schedule may hold several fixpoints, and "which one ran out" is the
+    // whole actionable content: the cap that needs raising is that node's.
+    struct TruncatedFixpoint {
+        std::string   path;       // index-path from the root ("" = the root)
+        std::uint32_t cap;        // the `max` it exhausted
+        std::size_t   lastDelta;  // passes that mutated in the LAST traversal
+    };
+    std::vector<TruncatedFixpoint> truncated;
 
     // Trace state. `iter` is the innermost enclosing FIXPOINT's
     // iteration index (a `repeat` contributes no counter — its leaves
@@ -305,6 +336,8 @@ struct ScheduleInterpreter {
         // traversal, never zero (rule 4).
         std::uint32_t const cap = n.count == 0 ? std::uint32_t{1} : n.count;
         unsigned const savedIter = iter;
+        std::string const selfPath = nodePath;
+        std::size_t lastDelta = 0;
         ++fixpointDepth;
         bool converged = false;
         for (std::uint32_t i = 0; i < cap; ++i) {
@@ -317,6 +350,10 @@ struct ScheduleInterpreter {
             std::size_t const mutatedAtTraversalStart = result.passesMutated;
             runChildren(n);
             if (stopped) break;
+            // The LAST traversal's delta, kept for the truncation report:
+            // "the cap was hit AND the traversal was still mutating" is the
+            // claim, and this is the number that substantiates it.
+            lastDelta = result.passesMutated - mutatedAtTraversalStart;
             // Fixed-point check: a full traversal with zero new
             // passes-mutated means no remaining transformation inside
             // this scope enables another.
@@ -328,6 +365,10 @@ struct ScheduleInterpreter {
         if (!stopped) {
             ++completedFixpoints;
             allFixpointsConverged = allFixpointsConverged && converged;
+            if (!converged) {
+                truncated.push_back(
+                    TruncatedFixpoint{selfPath, cap, lastDelta});
+            }
         }
         --fixpointDepth;
         iter = savedIter;
@@ -355,31 +396,49 @@ struct ScheduleInterpreter {
                              static_cast<int>(nm.size()), nm.data());
             }
             std::fflush(stderr);
+            // Zero the shared rebuild-time accumulator so `rebuild=` below
+            // reports THIS pass only (see `optRebuildNsTake` in
+            // opt/passes/mir_rebuild_helper.hpp).
+            (void)passes::optRebuildNsTake();
+            (void)passes::optRebuildInstsTake();
             t0 = std::chrono::steady_clock::now();
         }
         auto const passResult =
-            runPass(p, mir, target, interner, pipeline, reporter);
+            runPass(p, mir, target, interner, pipeline, reporter,
+                    inlineLedger);
         if (optTrace) {
             auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
+            // The per-function REBUILD half, summed over every function this
+            // pass rebuilt. `ms - rebuild` is the pass's ANALYSIS + module
+            // setup + finish() half — the fraction that reads a READ-ONLY
+            // `Mir` and therefore bounds what can ever run function-parallel.
+            auto const rebuildNs  = passes::optRebuildNsTake();
+            auto const rebuildMs  = static_cast<long long>(rebuildNs / 1000000u);
+            auto const rebuiltIns = passes::optRebuildInstsTake();
+            auto const nsPerInst  = static_cast<long long>(
+                rebuiltIns ? rebuildNs / rebuiltIns : 0);
             auto const nm = optPassIdName(p);
             if (fixpointDepth > 1) {
                 std::fprintf(stderr,
                              "opt: iter=%u path=%.*s pass=%.*s done %lldms "
-                             "mutated=%d\n",
+                             "mutated=%d rebuild=%lldms\n",
                              iter,
                              static_cast<int>(nodePath.size()),
                              nodePath.data(),
                              static_cast<int>(nm.size()), nm.data(),
                              static_cast<long long>(ms),
-                             passResult.mutated ? 1 : 0);
+                             passResult.mutated ? 1 : 0, rebuildMs);
             } else {
                 std::fprintf(stderr,
-                             "opt: iter=%u pass=%.*s done %lldms mutated=%d\n",
+                             "opt: iter=%u pass=%.*s done %lldms mutated=%d "
+                             "rebuild=%lldms insts=%llu ns/inst=%lld\n",
                              iter,
                              static_cast<int>(nm.size()), nm.data(),
                              static_cast<long long>(ms),
-                             passResult.mutated ? 1 : 0);
+                             passResult.mutated ? 1 : 0, rebuildMs,
+                             static_cast<unsigned long long>(rebuiltIns),
+                             nsPerInst);
             }
             std::fflush(stderr);
         }
@@ -494,9 +553,16 @@ OptResult optimize(Mir& mir,
         return result;
     }
 
+    // ONE ledger per optimize() call — the memory that makes the Inlining
+    // pass's per-caller growth budget CUMULATIVE across this schedule's
+    // iterations instead of re-baselining on each one. Scoped here, so the
+    // unit and program stages each get their own.
+    passes::InlineGrowthLedger inlineLedger;
+
     ScheduleInterpreter interp{mir, target, interner, pipeline, reporter,
                                result, entryErrorCount,
-                               std::getenv("DSS_OPT_TRACE") != nullptr};
+                               std::getenv("DSS_OPT_TRACE") != nullptr,
+                               inlineLedger};
     interp.run(pipeline.schedule, std::string{});
     if (interp.stopped) {
         // A failed pass / failed verify unwinds WITHOUT the epilogues —
@@ -509,6 +575,44 @@ OptResult optimize(Mir& mir,
     // reduce this to the pre-tree rule exactly.
     result.fixedPointReached =
         interp.completedFixpoints > 0 && interp.allFixpointsConverged;
+
+    // ★★★ THE FLAG NOW HAS A CONSUMER, AND IT IS THIS ONE
+    // (D-OPT-FIXPOINT-CONVERGENCE-IS-COMPUTED-AND-DISCARDED).
+    //
+    // `fixedPointReached` is the GATE on the report, deliberately, rather
+    // than the report being emitted from inside `runFixpoint`. Two reasons,
+    // and both are about the flag rather than about convenience: it makes the
+    // value load-bearing at the site that computes it — flip the computation
+    // and the diagnostic disappears, which is what makes the red-on-disable
+    // arm meaningful — and it keeps the emission on the NORMAL exit path
+    // only, so a pass or verifier failure unwinds without adding a
+    // truncation complaint to a build that already failed for a real reason.
+    //
+    // ⚠ NOT AN ERROR, AND THAT IS A JUDGEMENT, NOT A HEDGE. A truncated
+    // fixpoint emits a CORRECT program — just not the program a converged
+    // pipeline would have emitted. Failing the build here would refuse
+    // programs that compile fine today. `Warning` is the honest register:
+    // the compiler did not finish the job it was asked to do, and the user
+    // is entitled to know before they measure the result.
+    if (!result.fixedPointReached) {
+        for (auto const& t : interp.truncated) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::X_OptFixpointTruncated;
+            d.severity = DiagnosticSeverity::Warning;
+            d.actual   = std::format(
+                "opt::optimize: pipeline '{}' fixpoint node {} hit its cap of "
+                "{} iteration(s) with {} pass(es) still mutating the module on "
+                "the final traversal — the pipeline stopped because it ran out "
+                "of iterations, NOT because it converged. The emitted program "
+                "is correct but is not the program a converged pipeline would "
+                "have emitted. Raise that node's `max` in the pipeline "
+                "document, or reduce what re-exposes work between iterations.",
+                pipeline.name,
+                t.path.empty() ? std::string{"<root>"} : t.path,
+                t.cap, t.lastDelta);
+            reporter.report(std::move(d));
+        }
+    }
 
     // ★★★ THE INLINE-DEFINITION STRIP, unconditional and ahead of the final
     // verify (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED). Placed

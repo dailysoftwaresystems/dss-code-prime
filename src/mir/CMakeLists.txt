@@ -10,7 +10,7 @@ add_library(mir OBJECT
 
 target_include_directories(mir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
-# Aggregated into dss-code-prime-lib via $<TARGET_OBJECTS:mir> at
+# Aggregated into dsscp-lib via $<TARGET_OBJECTS:mir> at
 # src/CMakeLists.txt — same pattern as hir/, core/, etc. DSS_BUILDING_DLL must
 # live here (not on the SHARED target) so DSS_EXPORT decorations resolve to
 # dllexport when these .obj files are produced on MSVC.

@@ -2,13 +2,12 @@
 
 namespace dss {
 
+// PROJECTS `kEscapeKindTable` (string_style.hpp, beside the enum) rather than
+// retyping the spellings a second time — D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN.
+// The out-of-range fall-back is unchanged: `name()` returns row 0, which is
+// `EscapeKind::None` -> "none".
 std::string_view escapeKindName(EscapeKind k) noexcept {
-    switch (k) {
-        case EscapeKind::None:             return "none";
-        case EscapeKind::Char:             return "char";
-        case EscapeKind::DoubledDelimiter: return "doubled-delimiter";
-    }
-    return "none";   // unreachable; satisfies non-exhaustive compilers
+    return kEscapeKindTable.name(k);
 }
 
 std::string bracketInnerText(std::string_view src, std::size_t open) {

@@ -1,0 +1,34 @@
+{
+  "$comment": "D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES. A stacked SCALAR argument immediately followed by a stacked by-value AGGREGATE in ONE call. `lowerWideCallArgs` placed the scalars and REMOVED them from the Call; `lir_callconv` then placed the aggregate from a cursor of its own, which restarted at 0 because the scalars were no longer in the operand list to advance it — so both wrote the SAME outgoing-argument bytes and the scalar was destroyed before the call, silently, on both shipped pipelines. The repair is that ONE pass owns every outgoing byte offset: `lowerWideCallArgs` STATES the aggregate's offset on its carrier and stamps the Call, and callconv READS it and refuses to place anything itself. The route in is a function POINTER because HIR->MIR refuses the CALLEE of this shape (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS residual), so the callee is spelled in SCALARS with a byte-identical incoming layout and the observation is what the CALLEE actually read.",
+  "$commentRedOnDisable": "Exit code is a bit mask: 1 = the stacked scalar the aggregate overwrote, 2 = the aggregate's first eightbyte, 4 = its second, 8 = the earlier stacked scalars, 16 = the register-passed arguments, 32 = the ALL-SCALAR CONTROL. Restore the two-cursor scheme (callconv placing the aggregate from its own `stackCursor.placeNamedAggregate` instead of reading the stated offset) and the subject bits go red while bit 32 stays CLEAN — the control reaches the SAME callee over the SAME eleven incoming positions with every argument a scalar, so its cleanliness is what shows the red is the interleave and not the harness.",
+  "$commentTargetGating": "No pe64 arm, and the reason is structural rather than a platform gap: routing a by-value aggregate WHOLE to the outgoing area requires `!slotAligned` (hir_to_mir's `routeToStack`), and ms_x64 IS slot-aligned — a Win64 caller passes a 16-byte struct BY POINTER, so this interleave cannot arise there and a pe64 arm would be asserting a different ABI's layout under this row's name. The three declared arms still COMPILE on every host (the in-process runner compiles a `runOn`-excluded spec and only skips the spawn), so a Windows gate still witnesses the emission.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 0,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

@@ -819,23 +819,37 @@ TEST(X86Sse, FullPipelineRodataConstTwoLoadsKeepsLeaPlusBaseForm) {
 
 TEST(X86Sse, FullPipelineMsX64FprPrologueSpillsViaMovsdStore) {
     // The PE-float gap, end-to-end (FC2 runtime-corpus unblock,
-    // 2026-06-10): the SAME MIR as the SysV pipeline test above —
-    // i32 f(f64 a, f64 b) { return FPToSI(FAdd(a, b)); } — but
-    // allocated under ms_x64 (cc index 1). Win64 declares xmm6-15
-    // CALLEE-SAVED and the regalloc allocates callee-saved FIRST
-    // (lir_regalloc tryAllocate), so the very first FPR vreg lands
-    // in a callee-saved xmm → the prologue MUST spill it with the
-    // fpr class's `store` (registerClassOps → movsd_store, F2 [REX]
-    // 0F 11) and the epilogue restore it with `load` (F2 [REX]
-    // 0F 10). SysV has no callee-saved XMMs, which is why the gap
-    // only fired on PE.
+    // 2026-06-10): i32 f(f64 a, f64 b), allocated under ms_x64 (cc
+    // index 1), where the FAdd result MUST SURVIVE A CALL. Win64
+    // declares xmm6-15 CALLEE-SAVED, so a value live across a call
+    // CANNOT sit in a caller-saved xmm — the callee is free to
+    // destroy every one of them. The allocator therefore has no
+    // choice, and the prologue MUST spill the callee-saved xmm with
+    // the fpr class's `store` (registerClassOps → movsd_store,
+    // F2 [REX] 0F 11) and the epilogue restore it with `load`
+    // (F2 [REX] 0F 10). SysV has no callee-saved XMMs, which is why
+    // the gap only fired on PE.
+    //
+    // ★★★ THE CALL IS THE POINT, AND IT REPLACED AN ALLOCATOR
+    // ACCIDENT (plan 22 OPT8, 2026-08-26). This fixture used to have
+    // no call at all and relied on the allocator handing out the
+    // CALLEE-SAVED partition first — so what it actually pinned was a
+    // pessimization: a leaf function preserving a register it had no
+    // reason to touch. When OPT8 taught the allocator to prefer the
+    // caller-saved partition for a range that never crosses a call,
+    // the spill this test is named for simply stopped existing and
+    // the test went red while the CAPABILITY it claims to defend —
+    // "an FPR save uses the FPR store mnemonic, not a GPR mov" — was
+    // untouched. A call makes the preservation an ABI REQUIREMENT
+    // rather than an allocation choice, so no future allocator
+    // improvement can dissolve it again.
     //
     // RED-on-disable lever: remove `"store": "movsd_store"` from the
     // fpr registerClassOps row → classOpHandle reports
     // L_RequiredLirOpcodeMissing ("callconv: prologue saved-reg
     // store") and the callconv stage fails — this test cannot even
     // assemble, the exact pre-fix failure compiling ANY float-using
-    // c-subset program for x86_64 Windows PE.
+    // c program for x86_64 Windows PE.
     TypeInterner interner{CompilationUnitId{1}};
     auto const f64 = interner.primitive(TypeKind::F64);
     auto const i32 = interner.primitive(TypeKind::I32);
@@ -849,8 +863,17 @@ TEST(X86Sse, FullPipelineMsX64FprPrologueSpillsViaMovsdStore) {
     MirInstId const b = mb.addArg(1, f64);
     MirInstId const addOps[] = {a, b};
     MirInstId const s = mb.addInst(MirOpcode::FAdd, addOps, f64);
-    MirInstId const cvtOps[] = {s};
-    MirInstId const r = mb.addInst(MirOpcode::FPToSI, cvtOps, i32);
+    // The call `s` must survive. Its result is consumed too, so no
+    // pass can decide the call is dead and delete the very thing that
+    // makes the xmm live across a call boundary.
+    TypeId const ptrT = interner.pointer(interner.primitive(TypeKind::Void));
+    MirInstId const callee = mb.addGlobalAddr(SymbolId{2}, ptrT);
+    MirInstId const callOps[] = {callee};
+    MirInstId const t = mb.addInst(MirOpcode::Call, callOps, i32);
+    MirInstId const cvtOps[] = {s};   // `s` is READ AFTER the call
+    MirInstId const c = mb.addInst(MirOpcode::FPToSI, cvtOps, i32);
+    MirInstId const sumOps[] = {c, t};
+    MirInstId const r = mb.addInst(MirOpcode::Add, sumOps, i32);
     mb.addReturn(r);
     Mir mir = std::move(mb).finish();
 

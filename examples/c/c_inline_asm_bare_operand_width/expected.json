@@ -1,0 +1,30 @@
+{
+  "$comment": "THE WIDTH A BARE `%N` SUBSTITUTES AT, RUNNABLE ON BOTH CPUs (D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE). ★★★ THE POINT OF THIS EXAMPLE IS THAT THE TWO PORTS ASSERT DIFFERENT VALUES FOR THE SAME SOURCE SHAPE, and each port's correct answer is the other port's bug — so no single hard-coded rule can satisfy both arms, whichever rule it picked. ✔MEASURED 2026-08-27 from emitted code, gcc 13.3.0 AND clang 19.1.1, both ports, -O0 and -O2: a bare `%0` renders the 64-bit `x` name on aarch64 for EVERY integer type (`_Bool` through `__int128`), and renders `%al`/`%ax`/`%eax`/`%rax` on x86_64 tracking the operand's own type. The old build applied the x86_64 rule everywhere, emitting `str w28, [x29]` where gcc emits `str x1, [x0]` — a 4-byte store against an 8-byte one, same source text, no diagnostic at either end. Shape 1 of the aarch64 arm IS that program and it returned the wrong answer. ⚠ EVERY ASSERTION READS ABOVE BIT 31 because a 4-byte and an 8-byte store of 42 are indistinguishable through `(int)`, which is the observation the defect shipped under; shape 5 is the matched negative control that asserts that blindness directly. ★ THE `release` ARM IS NOT DECORATION: the seed and the operand are `volatile` precisely so the optimized pipeline still reaches the template, and a fold would show up as a shape-1 failure rather than as a silently vacuous pass.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

@@ -676,8 +676,8 @@ struct DSS_EXPORT ShippedExternSymbol {
     // precise WITHOUT anyone enumerating a core set — the mechanism already in the
     // tree does it, which is also why this needs no update when a recipe is added.
     //
-    // TRUE for every ordinary declared shipped extern (D-FFI-DESCRIPTOR-EAGER-
-    // IMPORT: a `#include`d descriptor's symbol is imported whether or not the TU
+    // TRUE for every ordinary declared shipped extern (D-FFI-DESCRIPTOR-EAGER-IMPORT:
+    // a `#include`d descriptor's symbol is imported whether or not the TU
     // calls it), so every pre-existing row is byte-identical.
     bool eagerImport = true;
     // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the CONFIG-ROOT-RELATIVE path of
@@ -790,6 +790,7 @@ public:
                   UnitAttribute<SymbolId>                nodeToSymbol,
                   UnitAttribute<TypeId>                  nodeToType,
                   UnitAttribute<NodeId>                  nodeToSelectedExpr,
+                  UnitAttribute<std::uint64_t>           nodeToFoldedConstant,
                   DiagnosticReporter                     diagnostics,
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
@@ -810,6 +811,7 @@ public:
           nodeToSymbol_(std::move(nodeToSymbol)),
           nodeToType_(std::move(nodeToType)),
           nodeToSelectedExpr_(std::move(nodeToSelectedExpr)),
+          nodeToFoldedConstant_(std::move(nodeToFoldedConstant)),
           diagnostics_(std::move(diagnostics)),
           usesBySymbol_(std::move(usesBySymbol)),
           compositeScopeByType_(std::move(compositeScopeByType)),
@@ -862,6 +864,17 @@ public:
     // analyzer left untyped + errored). The CST→HIR `lowerGeneric` reads this to
     // lower ONLY the selected sub-expression.
     [[nodiscard]] NodeId   selectedGenericExpr(NodeId id) const;
+
+    // P31: the COMPILE-TIME ANSWER for a node whose whole meaning is a number the
+    // semantic tier computed — `__builtin_offsetof(T, m)` (the member's byte
+    // offset, from the same `computeLayout` engine sizeof and codegen read) and
+    // `__builtin_types_compatible_p(T1, T2)` (0 or 1, from the same interned
+    // type-identity `_Generic` matches on). `nullopt` for every other node AND
+    // for one of these whose fold FAILED — which the CST→HIR lowering must treat
+    // as a hard refusal, never as a zero: a wrong offset is a silent wrong
+    // address, the exact class this compiler refuses to ship.
+    // The VALUE lives here; the TYPE stays in `typeAt` (one owner each).
+    [[nodiscard]] std::optional<std::uint64_t> foldedConstantAt(NodeId id) const;
 
     // Reverse use-index (SE7): every NodeId that resolved to `symbol`
     // during Pass 2 (the symbol's USE sites — NOT its declaration name
@@ -917,8 +930,8 @@ public:
         return shippedExterns_;
     }
 
-    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS) + c156 (D-LK-ELF-SYMBOL-
-    // VERSIONING): the link identity (per-format library map + required ELF
+    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS) + c156 (D-LK-ELF-SYMBOL-VERSIONING):
+    // the link identity (per-format library map + required ELF
     // version) of a shipped descriptor symbol that GOAL-2 SUPPRESSED because a
     // user declaration claimed the name (shell.c bare-declares `popen` while
     // also `#include <stdio.h>`; the versioned case is `realpath` over `#include
@@ -1005,6 +1018,8 @@ private:
     // FC16 (D-CSUBSET-GENERIC-SELECTION): `_Generic` node → selected assoc's
     // result-expression NodeId. See `selectedGenericExpr`.
     UnitAttribute<NodeId>                  nodeToSelectedExpr_;
+    // P31: the compile-time-answer side table — see `foldedConstantAt`.
+    UnitAttribute<std::uint64_t>           nodeToFoldedConstant_;
     DiagnosticReporter                     diagnostics_;
     // SymbolId.v → its USE-site NodeIds. Built once during analyze().
     std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol_;

@@ -93,15 +93,13 @@ TEST(TargetSpec, RejectsWhitespaceInEitherHalf) {
 TEST(TargetSpec, OutputExtensionElfObjForShippedRelocSchema) {
     auto r = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
     ASSERT_TRUE(r.has_value());
-    TargetSpec spec{"x86_64", "elf64-x86_64-linux"};
-    EXPECT_EQ(spec.outputExtension(**r), ".o");
+    EXPECT_EQ(outputExtensionFor(**r), ".o");
 }
 
 TEST(TargetSpec, OutputExtensionElfExecHasNoExtension) {
     auto r = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
     ASSERT_TRUE(r.has_value());
-    TargetSpec spec{"x86_64", "elf64-x86_64-linux-exec"};
-    EXPECT_EQ(spec.outputExtension(**r), "");
+    EXPECT_EQ(outputExtensionFor(**r), "");
 }
 
 TEST(TargetSpec, OutputExtensionElfDynSoAndPieNoExtension) {
@@ -113,54 +111,46 @@ TEST(TargetSpec, OutputExtensionElfDynSoAndPieNoExtension) {
     // format-name check.
     auto so = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-dyn");
     ASSERT_TRUE(so.has_value());
-    TargetSpec soSpec{"x86_64", "elf64-x86_64-linux-dyn"};
-    EXPECT_EQ(soSpec.outputExtension(**so), ".so");
+    EXPECT_EQ(outputExtensionFor(**so), ".so");
     auto pie = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-pie");
     ASSERT_TRUE(pie.has_value());
-    TargetSpec pieSpec{"x86_64", "elf64-x86_64-linux-pie"};
-    EXPECT_EQ(pieSpec.outputExtension(**pie), "");
+    EXPECT_EQ(outputExtensionFor(**pie), "");
 }
 
 TEST(TargetSpec, OutputExtensionPeObjForShippedObjSchema) {
     auto r = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
     ASSERT_TRUE(r.has_value());
-    TargetSpec spec{"x86_64", "pe64-x86_64-windows"};
-    EXPECT_EQ(spec.outputExtension(**r), ".obj");
+    EXPECT_EQ(outputExtensionFor(**r), ".obj");
 }
 
 TEST(TargetSpec, OutputExtensionPeExeForShippedExecSchema) {
     auto r = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
     ASSERT_TRUE(r.has_value());
-    TargetSpec spec{"x86_64", "pe64-x86_64-windows-exec"};
-    EXPECT_EQ(spec.outputExtension(**r), ".exe");
+    EXPECT_EQ(outputExtensionFor(**r), ".exe");
 }
 
 TEST(TargetSpec, OutputExtensionMachOObjectForShippedObjectSchema) {
     auto r = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin");
     ASSERT_TRUE(r.has_value());
-    TargetSpec spec{"x86_64", "macho64-x86_64-darwin"};
-    EXPECT_EQ(spec.outputExtension(**r), ".o");
+    EXPECT_EQ(outputExtensionFor(**r), ".o");
 }
 
 TEST(TargetSpec, OutputExtensionMachOExecuteHasNoExtension) {
     auto r = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
     ASSERT_TRUE(r.has_value());
-    TargetSpec spec{"x86_64", "macho64-x86_64-darwin-exec"};
-    EXPECT_EQ(spec.outputExtension(**r), "");
+    EXPECT_EQ(outputExtensionFor(**r), "");
 }
 
 TEST(TargetSpec, OutputExtensionWasmForShippedWasm) {
     auto r = ObjectFormatSchema::loadShipped("wasm32-v1");
     ASSERT_TRUE(r.has_value());
-    TargetSpec spec{"x86_64", "wasm32-v1"};
-    EXPECT_EQ(spec.outputExtension(**r), ".wasm");
+    EXPECT_EQ(outputExtensionFor(**r), ".wasm");
 }
 
 TEST(TargetSpec, OutputExtensionSpvForShippedSpirv) {
     auto r = ObjectFormatSchema::loadShipped("spirv-1.6");
     ASSERT_TRUE(r.has_value());
-    TargetSpec spec{"x86_64", "spirv-1.6"};
-    EXPECT_EQ(spec.outputExtension(**r), ".spv");
+    EXPECT_EQ(outputExtensionFor(**r), ".spv");
 }
 
 TEST(TargetSpec, OutputExtensionUnknownKindReturnsEmpty) {
@@ -179,8 +169,7 @@ TEST(TargetSpec, OutputExtensionUnknownKindReturnsEmpty) {
     data.backend = nullptr;
     data.name = "synthetic-unknown";
     ObjectFormatSchema synth{std::move(data)};
-    TargetSpec spec{"x86_64", "synthetic-unknown"};
-    EXPECT_EQ(spec.outputExtension(synth), "");
+    EXPECT_EQ(outputExtensionFor(synth), "");
 }
 
 // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): the static-library arm ──────
@@ -193,18 +182,15 @@ TEST(TargetSpec, OutputExtensionUnknownKindReturnsEmpty) {
 TEST(TargetSpec, StaticLibExtensionDotAForElfMachO) {
     auto elf = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-staticlib");
     ASSERT_TRUE(elf.has_value());
-    TargetSpec elfSpec{"x86_64", "elf64-x86_64-linux-staticlib"};
-    EXPECT_EQ(elfSpec.outputExtension(**elf), ".a");
+    EXPECT_EQ(outputExtensionFor(**elf), ".a");
 
     auto macho = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-staticlib");
     ASSERT_TRUE(macho.has_value());
-    TargetSpec machoSpec{"arm64", "macho64-arm64-darwin-staticlib"};
-    EXPECT_EQ(machoSpec.outputExtension(**macho), ".a");
+    EXPECT_EQ(outputExtensionFor(**macho), ".a");
 }
 
 TEST(TargetSpec, StaticLibExtensionDotLibForPe) {
     auto pe = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-staticlib");
     ASSERT_TRUE(pe.has_value());
-    TargetSpec peSpec{"x86_64", "pe64-x86_64-windows-staticlib"};
-    EXPECT_EQ(peSpec.outputExtension(**pe), ".lib");
+    EXPECT_EQ(outputExtensionFor(**pe), ".lib");
 }

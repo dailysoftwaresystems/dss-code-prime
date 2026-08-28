@@ -11,13 +11,16 @@
 // tier both readers already depend on.
 #include "core/types/project_config.hpp"
 #include "core/types/target_schema.hpp"
-// ⚠ STILL REACHED ACROSS A LAYER: `TargetSpec::parse` is the driver's
-// `<targetName>:<formatName>` splitter and cannot follow `project_config` down,
-// because `TargetSpec::outputExtension` binds the type to
-// `link/object_format_schema.hpp` and `core` must not depend on `link`.
-// Anchored `D-LSP-TARGET-SPEC-SPLITTER-LIVES-ABOVE-ITS-CONSUMERS`; see the note
-// in `src/lsp/CMakeLists.txt`.
-#include "program/target_spec.hpp"
+// ✅ AND THE SPLITTER FOLLOWED IT DOWN
+// (D-LSP-TARGET-SPEC-SPLITTER-LIVES-ABOVE-ITS-CONSUMERS, closed 2026-08-27).
+// This used to read `#include "program/target_spec.hpp"` — the LAST cross-tier
+// include in this file. `TargetSpec` could not move while it carried
+// `outputExtension(ObjectFormatSchema const&)`, which bound the type to `link/`
+// and would have inverted `core -> link`. That member turned out never to touch
+// `*this`, so it is now the free function `outputExtensionFor` in the driver
+// tier and the splitter is plain `core`. ONE splitter, reached downward — the
+// editor and the compiler cannot disagree about what a target spec MEANS.
+#include "core/types/target_spec.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -97,6 +100,28 @@ void collectManifests(fs::path const& root, std::vector<fs::path>& out) {
     }
 }
 
+// Does THIS platform's path type model `//authority/...` as a root name?
+//
+// ★★★ THE PREDICATE IS ASKED OF THE PATH TYPE, NEVER OF A PLATFORM MACRO, and
+// that is what lets one rule serve every leg. `fileUriFromPath` already emits an
+// authority exactly when `root_name()` is non-empty; asking the same question
+// here makes the two directions provably symmetric instead of two hand-kept
+// lists that drift. ✔MEASURED 2026-08-28: true under MSVC STL, false under
+// MinGW/libstdc++ (which discards the authority at construction) and false under
+// libc++ on Darwin (where POSIX has no root name and `//server/share` is a local
+// path, not an authority).
+//
+// ⇒ It is also the line between the two things that URI shape can mean. Where
+// UNC roots exist, `file://server/share/x` NAMES A PATH and refusing it loses
+// the round trip. Where they do not, the same text names a remote HOST, and
+// turning it into `//server/share/x` would be the guess that
+// `NonFileUriIsRefusedRatherThanGuessed` exists to refuse.
+[[nodiscard]] bool platformModelsUncRoots() {
+    static bool const modelled =
+        !fs::path{"//dss-unc-probe/share"}.root_name().empty();
+    return modelled;
+}
+
 [[nodiscard]] int hexValue(char c) noexcept {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -132,12 +157,38 @@ std::optional<fs::path> pathFromFileUri(std::string_view uri) {
     auto rest = uri.substr(kScheme.size());
 
     // Authority. `file:///path` (empty) and `file://localhost/path` are the two
-    // spellings clients emit. A real remote host is NOT a local directory, so
-    // it is refused rather than silently treated as one.
+    // spellings that name a path on THIS host.
+    //
+    // ★★★ A THIRD SPELLING NAMES A UNC SHARE, AND REFUSING IT BROKE THE ROUND
+    // TRIP ON THE ONE PLATFORM THAT EMITS IT.
+    // [[D-LSP-FILE-URI-WITH-A-UNC-AUTHORITY-DOES-NOT-ROUND-TRIP]]
+    //
+    // ⚠ THIS BRANCH USED TO READ "a real remote host is NOT a local directory,
+    // so it is refused rather than silently treated as one", and that sentence
+    // is true of an HTTP-style host and FALSE of a UNC authority — on Windows
+    // `\\server\share` IS how the platform names a path, and RFC 8089 renders it
+    // as `file://server/share/...` with `server` in the authority. ✔MEASURED
+    // 2026-08-28 (cycle P43), first MSVC run of this suite:
+    // `WorkspaceProject.FileUriRoundTrip` produced `file://server/share/x.c`
+    // from `//server/share/x.c` — MSVC's `fs::path` models that as a real
+    // `root_name()`, unlike MinGW (which discards the authority) and libc++
+    // (which keeps both slashes in the PATH and leaves the authority empty) —
+    // and `pathFromFileUri` then returned nullopt on our OWN output.
+    //
+    // ⇒ A non-empty, non-`localhost` authority is put back where it came from:
+    // `//authority` + the decoded path, which is exactly what `fileUriFromPath`
+    // took apart. ★ IT IS NOT A WIDENING TO "ACCEPT ANYTHING": the forward
+    // function emits an authority ONLY when the path type reports a non-empty
+    // `root_name()`, so on the platforms that never produce one this arm is
+    // unreachable and nothing changes. And the result is still a path the OS
+    // must resolve — an unreachable share fails to open, it does not silently
+    // become a local file, which is the concern the old sentence was reaching
+    // for.
     const auto slash = rest.find('/');
     if (slash == std::string_view::npos) return std::nullopt;
     const auto authority = rest.substr(0, slash);
-    if (!authority.empty() && authority != "localhost") return std::nullopt;
+    const bool uncAuthority = !authority.empty() && authority != "localhost";
+    if (uncAuthority && !platformModelsUncRoots()) return std::nullopt;
     rest = rest.substr(slash);
 
     std::string decoded;
@@ -157,10 +208,20 @@ std::optional<fs::path> pathFromFileUri(std::string_view uri) {
 
     // `/C:/dir` is the URI spelling of the Windows path `C:/dir`. The leading
     // slash is part of the URI grammar, not of the path.
-    if (decoded.size() >= 3 && decoded[0] == '/'
+    // ⓘ Guarded on `!uncAuthority`: a drive letter cannot follow a UNC
+    // authority, and the erase would eat the first slash of the `//host` prefix
+    // rebuilt below.
+    if (!uncAuthority && decoded.size() >= 3 && decoded[0] == '/'
         && (std::isalpha(static_cast<unsigned char>(decoded[1])) != 0)
         && decoded[2] == ':') {
         decoded.erase(0, 1);
+    }
+    // Put the UNC authority back in front of the path it was split from. The
+    // decoded remainder already begins with the `/` that separated them, so
+    // `//` + authority + `/share/...` is the spelling the path type parses back
+    // into a root name.
+    if (uncAuthority) {
+        decoded.insert(0, std::string{"//"} + std::string{authority});
     }
     if (decoded.empty()) return std::nullopt;
 
@@ -171,6 +232,93 @@ std::optional<fs::path> pathFromFileUri(std::string_view uri) {
     // find nothing. The `u8string` ctor is the one that states the encoding.
     return fs::path(std::u8string(
         reinterpret_cast<char8_t const*>(decoded.data()), decoded.size()));
+}
+
+// ── D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES ────────
+//
+// The EXACT INVERSE of `pathFromFileUri`, and it lives beside it for the reason
+// this repo keeps re-learning: two halves of one encoding, written apart, drift.
+//
+// ⚠ IT DID NOT EXIST IN `src/` AT ALL. Only `tests/lsp/lsp_test_helpers.hpp`
+// had one, so production had no way to NAME a file other than the one the
+// request came in on — which is precisely why `locationJson` hardcoded the
+// request's uri and a definition inside a header was reported as if it were in
+// the open document. A helper that exists only in the test tree is a helper the
+// product cannot use, and the test then measures its own copy.
+//
+// The three shapes that have to round-trip, all covered by
+// `WorkspaceProject.FileUriRoundTrip`:
+//   * percent-encoding — every byte outside the RFC 3986 unreserved set is
+//     encoded, so a space or a `#` in a path cannot terminate the uri early;
+//   * WINDOWS DRIVE LETTERS — `C:/dir` is `file:///C:/dir`: the URI grammar's
+//     leading slash is added here and stripped there. `:` is deliberately NOT
+//     encoded, matching what every LSP client emits;
+//   * UNC — `//server/share` is `file://server/share`, so the authority is the
+//     server rather than empty. `pathFromFileUri` refuses a non-`localhost`
+//     authority, which is correct for INBOUND (a remote host is not a local
+//     directory) and is why a UNC path round-trips to a uri but not back.
+//     Stated, not silently asymmetric.
+//
+// A path is percent-encoded UTF-8 BY DEFINITION (RFC 3986 §2.5), so the bytes
+// come from `u8string()` — the narrow `string()` would emit ACP bytes on
+// Windows and produce mojibake in the editor, the mirror of the note above.
+std::string fileUriFromPath(std::string_view path) {
+    // Text in, uri out: the caller keeps no filesystem surface. See the header
+    // for why this overload exists (check-path-identity, and a caller that was
+    // building an fs::path only to hand it straight back here).
+    return fileUriFromPath(fs::path{std::string{path}});
+}
+
+std::string fileUriFromPath(fs::path const& path) {
+    const std::u8string u8 = path.generic_u8string();
+    std::string_view bytes(reinterpret_cast<char const*>(u8.data()), u8.size());
+
+    std::string out = "file://";
+    // UNC: `//server/share` — the server IS the authority, so the leading
+    // separator(s) are consumed by the `file://` prefix already emitted.
+    //
+    // ⚠ DETECTED FROM `root_name()`, NOT from the generic string, and that is a
+    // MEASURED correction rather than a preference. This first tested
+    // `bytes[0] == '/' && bytes[1] == '/'` and produced `file:///server/...`
+    // for `//server/share/x.c`: on this toolchain `generic_u8string()` renders
+    // the UNC root with a SINGLE leading slash, so the double slash the check
+    // was looking for is not there to find. `root_name()` is the API that
+    // actually models "this path has an authority", and it survives the
+    // normalisation.
+    const std::u8string rootName = path.root_name().u8string();
+    const bool unc = rootName.size() > 1
+                  && (rootName[0] == u8'/' || rootName[0] == u8'\\');
+    if (unc) {
+        // Skip however many leading separators this platform's rendering kept.
+        while (!bytes.empty() && (bytes.front() == '/' || bytes.front() == '\\')) {
+            bytes.remove_prefix(1);
+        }
+    } else if (bytes.empty() || bytes.front() != '/') {
+        // A drive-letter or relative path: the URI grammar wants an empty
+        // authority plus a root slash.
+        out += '/';
+    }
+
+    auto unreserved = [](unsigned char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+            || (c >= '0' && c <= '9')
+            || c == '-' || c == '.' || c == '_' || c == '~'
+            // Structural, and must NOT be encoded: `/` separates segments and
+            // `:` follows a Windows drive letter in the form clients send.
+            || c == '/' || c == ':';
+    };
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    for (char const ch : bytes) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (unreserved(c)) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0x0F]);
+        }
+    }
+    return out;
 }
 
 WorkspacePreferenceResult resolveWorkspaceLanguagePreference(

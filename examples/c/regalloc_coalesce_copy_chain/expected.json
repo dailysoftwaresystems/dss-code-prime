@@ -1,0 +1,35 @@
+{
+  "$comment": "plan 22 OPT8 (register coalescing) -- the runtime witness for the linear-scan allocator's copy-coalescing partition. Seven shapes: three that MUST coalesce (a copy chain whose source dies at each link; the tied-operand accumulator `s += i`, where agreement means `legalizeTwoAddress` never mints the copy; an FPR-class chain, whose move is `movaps` on x86-64 and `fmov` on arm64 and must be resolved through `registerClassOps[].move` rather than assumed) and FOUR that must NOT (a copy whose source is still live and is then mutated; the untied operand of a two-address op, which the legalizer's pre-op `mov result, tied` would destroy; a value copy-related to a parameter that is still live at a call; and that same value living ACROSS the call, which forbids a caller-saved register). ★ THE NEGATIVES ARE WHY THIS IS A RUNTIME PIN AND NOT A SIZE TEST: a merge of two overlapping live ranges is a SILENT MISCOMPILE -- the LIR is well-formed, the post-regalloc verifier passes, the bytes assemble, and the answer is wrong. Each negative moves the exit code if it is broken (91->231 for the first, 28->20 for the untied one), so the arm reds at RUN time rather than merely emitting different bytes. The `release` arm (shippedPipeline, zero-drift) is the one where Mem2Reg has promoted the locals into virtual registers, so it is where the copies the coalescer acts on actually exist. exit = 91+6+10+28+3+9+3 = 150.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 150,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

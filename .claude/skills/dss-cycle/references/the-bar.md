@@ -171,6 +171,45 @@ bar **stops and reports** — it never pushes a partial or a workaround.
        keeping: the run reported *"1 failed"* and that one failure was an unrelated `(Not Run)` from
        another lane — **a mutant that reds the WRONG test is the same signal as one that reds
        nothing.** Read *which* test went red, never the count.
+     - **The witness MOVED WITHOUT THE MUTANT — and this one indicts the instrument the first
+       bullet prescribes.** ✔MEASURED 2026-08-24 (cycle P31,
+       `D-TEST-A-PE-IMAGE-MD5-IS-NOT-A-COMPILED-IN-PROOF`): **a PE image carries a LINK TIMESTAMP**,
+       so the shipped DLL's md5 moved **between two builds of IDENTICAL sources**
+       (`5e6cbe74…` vs `10eb22ea…`), and moved for CONFIG-ONLY mutants that recompile
+       nothing. ⇒ **a moved image md5 is NOT evidence the mutant compiled in — it is evidence
+       a LINK happened, which happens either way.** ★ The failure mode is the dangerous
+       direction: the check PASSES, so the lane believes it holds proof and stops looking, which is
+       worse than having no check at all. ⇒ **the subject is the mutated TU's `.obj`**, whose md5
+       must MOVE when the mutant is applied and RETURN to its baseline when restored, with **both
+       halves measured in the same run**, so the object's own reproducibility is DEMONSTRATED rather
+       than assumed. ⓘ Two things stay true and are worth keeping straight: **mtime remains a
+       sound BUILD-SUCCESS criterion** (this bullet corrects the md5 refinement, not the first
+       bullet's point about greps over build output), and **an UNCHANGED product binary is still
+       sound evidence that a config-level mutant recompiled nothing** — several P31 lanes relied
+       on exactly that and were right to. ⚠ Do NOT reach for `/Brepro` to make the image
+       deterministic instead: that changes what the SHIPPED ARTIFACT IS in order to make a test
+       convenient, and it would not fix the config-mutant case at all.
+       ★★ **AND THE `.obj` CHECK IS STILL ONLY THE WEAKER HALF.** The load-bearing proof
+       that a mutant was READ has always been that **the failure output carries the MESSAGE of the
+       refusal it names** — a mutant can be compiled into the right artifact and still exercise
+       nothing. Where the two disagree, the message wins.
+     - **The OBJECT moved and the mutant still never ran — because the LINK failed.** ✔MEASURED
+       2026-08-24 (cycle P31, `D-TEST-A-MOVED-OBJECT-MD5-IS-NOT-A-REACHED-THE-BINARY-PROOF`), one
+       cycle after the bullet above prescribed the object as the subject: a code mutant's ctest run
+       came back GREEN twice with the object md5 correctly MOVED both times. The compile had
+       succeeded; the link had not — `ld.exe: cannot open output file
+       bin\dss\libdss-code-prime.dll: Permission denied`, a stalled ctest child still holding the
+       DLL — so ctest executed the **PREVIOUS** binary and passed. ★ **A moved object md5
+       proves the mutant COMPILED. It does not prove the mutant reached the BINARY UNDER TEST**, and
+       the two are separated by exactly one failure mode that this repository hits routinely.
+       ⇒ **the BUILD'S RETURN CODE is the other half, checked in the same run**: a non-zero build
+       makes the arm VOID, not a data point, and a harness must never let ctest run against a binary
+       the build did not produce. ⓘ A third signal is cheap where the harness can take it — the
+       product binary's mtime must be NEWER than the mutated object's.
+       ★★ **TAKEN TOGETHER WITH THE BULLET ABOVE, THE PAIR IS THE WHOLE LESSON: the IMAGE
+       moves when nothing changed, and the OBJECT moves when nothing shipped.** Each check fails in
+       the flattering direction — it PASSES, so the lane stops looking — which is why neither
+       is trusted alone and why the message-names-the-refusal check below outranks both.
      ⇒ **The fifth check, and it subsumes the others: prove the mutated bytes reached the process that
      ran the pin.** A changed file on disk is not a changed input. Show the artifact rebuilt (mtime),
      or the config tree that was read (`DSS_CONFIG_ROOT`), or both — and if you cannot show it, the
@@ -291,7 +330,8 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    fix belongs to a later cycle.** "Not my cycle" / "I'll remember it" / "I excluded the failing
    test" / "it passes on the other leg" / "green modulo X" is *precisely the trigger to anchor*,
    never license to drop. Two obligations, BOTH mandatory, BOTH in **this** cycle:
-   - **(a) Anchor it now** — a real registry row in `_deferred-anchor-registry.md` (name +
+   - **(a) Anchor it now** — a real registry row in the deferred-anchor registry: `-production.md`
+     if a USER of the compiler could hit it, `-harness.md` if only WE can (name +
      what/why + trigger + closing-work), committed THIS cycle. A prose-only note in a commit
      message, a chat reply, or a code comment is **NOT** an anchor: an un-anchored issue is
      invisible to the next cycle, to the anchor guard, and to the plan sweep — so it *will* be

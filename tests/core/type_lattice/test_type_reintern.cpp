@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <string>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -566,4 +567,570 @@ TEST(TypeReintern, TwoCompilationUnitsUnifyVocabularyInOneHost) {
            "of its core just because it crossed a CU boundary";
     EXPECT_EQ(hi.name(h1Long), "long");
     EXPECT_EQ(hi.name(h2Anon), "");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// D-MIR-MERGE-COMPOSITE-HOST-IDENTITY-IS-THE-DECLARATION-SITE
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A composite's HOST identity used to be its SOURCE DECLARATION SITE, so ONE C
+// type forked once per CU that mentioned it. The suite below pins the two halves
+// that must hold TOGETHER: a forward declaration and its definition unify, and
+// two same-tag composites with DIFFERENT layouts never do.
+//
+// ⚠ Every test here uses the FIVE-argument reinternType with ONE shared,
+// pre-observed CompositeIdentityIndex — that is the merge's own calling
+// convention, and the four-argument overload cannot express the cross-CU case at
+// all (its scratch index has seen a single interner).
+namespace {
+
+// Build `struct Bitvec { int a; }` in `cu`, returning the composite.
+TypeId defineBitvec(TypeInterner& cu, std::uint64_t declSiteKey) {
+    const TypeId c = cu.forwardComposite(TypeKind::Struct, "Bitvec", declSiteKey);
+    std::array<TypeId, 1> const fields{cu.primitive(TypeKind::I32)};
+    cu.completeComposite(c, fields, /*packed=*/false);
+    return c;
+}
+
+} // namespace
+
+// ★ THE SHAPE THE FIX EXISTS FOR — sqlite's `typedef struct Bitvec Bitvec;` in a
+// header, defined in exactly one `.c`. Every TU that only ever handles a
+// `Bitvec*` contributes its OWN incomplete `Bitvec`; before the fix the merge
+// kept all of them apart from the definition, and the release build died with
+// I_StoreValueTypeMismatch on stores whose two sides were one C type.
+TEST(TypeReinternCompositeIdentity, OpaquePointerIdiomUnifiesAcrossCus) {
+    TypeInterner cuOpaque{CompilationUnitId{1}};   // sees only the typedef
+    const TypeId fwd = cuOpaque.forwardComposite(TypeKind::Struct, "Bitvec", 11);
+    ASSERT_TRUE(cuOpaque.isIncompleteComposite(fwd));
+
+    TypeInterner cuDef{CompilationUnitId{2}};      // bitvec.c
+    const TypeId def = defineBitvec(cuDef, 77);
+
+    CompositeIdentityIndex index;
+    index.observe(cuOpaque);
+    index.observe(cuDef);
+    EXPECT_EQ(index.observedTagCount(), 1u)
+        << "one COMPLETE definition of one tag was observed";
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> remapOpaque;
+    std::unordered_map<std::uint32_t, TypeId> remapDef;
+    const TypeId hFwd = reinternType(cuOpaque, fwd, host, remapOpaque, index);
+    const TypeId hDef = reinternType(cuDef, def, host, remapDef, index);
+
+    EXPECT_EQ(hFwd.v, hDef.v)
+        << "a forward declaration and its definition are ONE C type and must "
+           "reintern to ONE host TypeId";
+    EXPECT_FALSE(host.interner().isIncompleteComposite(hDef))
+        << "the unified host type carries the definition's body";
+    EXPECT_EQ(host.interner().operands(hDef).size(), 1u);
+}
+
+// The same pair walked the OTHER way round. The merge does not choose the order
+// its CUs are visited in, so a fix that only works when the definition happens to
+// come first is not a fix — it is a coin flip that passes its own test.
+TEST(TypeReinternCompositeIdentity, OpaquePointerIdiomUnifiesInEitherOrder) {
+    TypeInterner cuOpaque{CompilationUnitId{1}};
+    const TypeId fwd = cuOpaque.forwardComposite(TypeKind::Struct, "Bitvec", 11);
+    TypeInterner cuDef{CompilationUnitId{2}};
+    const TypeId def = defineBitvec(cuDef, 77);
+
+    CompositeIdentityIndex index;
+    index.observe(cuOpaque);
+    index.observe(cuDef);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> remapDef;
+    std::unordered_map<std::uint32_t, TypeId> remapOpaque;
+    const TypeId hDef = reinternType(cuDef, def, host, remapDef, index);
+    const TypeId hFwd = reinternType(cuOpaque, fwd, host, remapOpaque, index);
+
+    EXPECT_EQ(hFwd.v, hDef.v);
+    EXPECT_FALSE(host.interner().isIncompleteComposite(hFwd))
+        << "reaching the definition FIRST must still leave the forward "
+           "declaration resolving to the complete host type";
+}
+
+// ⚠⚠ THE MISCOMPILE GUARD, and it is the reason the key is the layout DIGEST and
+// not the tag. Two `.c` files may each define a private `struct S` differently;
+// C keeps them apart and so must the merge. Merging them would fix one
+// miscompile by shipping a worse one.
+TEST(TypeReinternCompositeIdentity, SameTagDifferentLayoutsStayDistinct) {
+    TypeInterner cuA{CompilationUnitId{1}};
+    const TypeId a = cuA.forwardComposite(TypeKind::Struct, "S", 5);
+    std::array<TypeId, 1> const aFields{cuA.primitive(TypeKind::I32)};
+    cuA.completeComposite(a, aFields, /*packed=*/false);
+
+    TypeInterner cuB{CompilationUnitId{2}};
+    const TypeId b = cuB.forwardComposite(TypeKind::Struct, "S", 5);
+    std::array<TypeId, 2> const bFields{cuB.primitive(TypeKind::F64),
+                                        cuB.primitive(TypeKind::I32)};
+    cuB.completeComposite(b, bFields, /*packed=*/false);
+
+    CompositeIdentityIndex index;
+    index.observe(cuA);
+    index.observe(cuB);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> remapA;
+    std::unordered_map<std::uint32_t, TypeId> remapB;
+    const TypeId hA = reinternType(cuA, a, host, remapA, index);
+    const TypeId hB = reinternType(cuB, b, host, remapB, index);
+
+    EXPECT_NE(hA.v, hB.v)
+        << "two same-tag composites with different layouts are different types";
+    EXPECT_EQ(host.interner().operands(hA).size(), 1u);
+    EXPECT_EQ(host.interner().operands(hB).size(), 2u);
+}
+
+// And when a tag is AMBIGUOUS, a forward declaration of it may not borrow either
+// layout — there is no fact that says which one it meant. It stays opaque, which
+// is exactly the pre-fix behaviour for this case and is the conservative answer.
+TEST(TypeReinternCompositeIdentity, AmbiguousTagLeavesForwardDeclarationOpaque) {
+    TypeInterner cuA{CompilationUnitId{1}};
+    const TypeId a = cuA.forwardComposite(TypeKind::Struct, "S", 5);
+    std::array<TypeId, 1> const aFields{cuA.primitive(TypeKind::I32)};
+    cuA.completeComposite(a, aFields, /*packed=*/false);
+
+    TypeInterner cuB{CompilationUnitId{2}};
+    const TypeId b = cuB.forwardComposite(TypeKind::Struct, "S", 5);
+    std::array<TypeId, 1> const bFields{cuB.primitive(TypeKind::F64)};
+    cuB.completeComposite(b, bFields, /*packed=*/false);
+
+    TypeInterner cuC{CompilationUnitId{3}};
+    const TypeId c = cuC.forwardComposite(TypeKind::Struct, "S", 5);
+
+    CompositeIdentityIndex index;
+    index.observe(cuA);
+    index.observe(cuB);
+    index.observe(cuC);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> rA, rB, rC;
+    const TypeId hA = reinternType(cuA, a, host, rA, index);
+    const TypeId hB = reinternType(cuB, b, host, rB, index);
+    const TypeId hC = reinternType(cuC, c, host, rC, index);
+
+    EXPECT_NE(hC.v, hA.v);
+    EXPECT_NE(hC.v, hB.v);
+    EXPECT_TRUE(host.interner().isIncompleteComposite(hC));
+}
+
+// Two CUs that each see the SAME definition (the ordinary case for any struct in
+// a shared header) hold one type between them, not two.
+TEST(TypeReinternCompositeIdentity, IdenticalDefinitionsInTwoCusUnify) {
+    TypeInterner cuA{CompilationUnitId{1}};
+    TypeInterner cuB{CompilationUnitId{2}};
+    const TypeId a = defineBitvec(cuA, 5);
+    const TypeId b = defineBitvec(cuB, 5000);   // a different decl-site key
+
+    CompositeIdentityIndex index;
+    index.observe(cuA);
+    index.observe(cuB);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> rA, rB;
+    EXPECT_EQ(reinternType(cuA, a, host, rA, index).v,
+              reinternType(cuB, b, host, rB, index).v)
+        << "identity is the STRUCTURE, so an unrelated decl-site key must not "
+           "fork one type in two";
+}
+
+// Two block-scoped `struct S`s in ONE CU with different layouts are distinct C
+// types, and the source interner already keeps them apart. Nothing about keying
+// the host on structure may collapse them.
+TEST(TypeReinternCompositeIdentity, TwoBlockScopeSameTagStructsInOneCuStayDistinct) {
+    TypeInterner cu{CompilationUnitId{1}};
+    const TypeId s1 = cu.forwardComposite(TypeKind::Struct, "S", 100);
+    std::array<TypeId, 1> const f1{cu.primitive(TypeKind::I32)};
+    cu.completeComposite(s1, f1, /*packed=*/false);
+    const TypeId s2 = cu.forwardComposite(TypeKind::Struct, "S", 200);
+    std::array<TypeId, 1> const f2{cu.primitive(TypeKind::F64)};
+    cu.completeComposite(s2, f2, /*packed=*/false);
+    ASSERT_NE(s1.v, s2.v);
+
+    CompositeIdentityIndex index;
+    index.observe(cu);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> remap;
+    EXPECT_NE(reinternType(cu, s1, host, remap, index).v,
+              reinternType(cu, s2, host, remap, index).v);
+}
+
+// A genuinely opaque type — declared everywhere, defined nowhere — still gets ONE
+// host placeholder instead of one per declaring CU.
+TEST(TypeReinternCompositeIdentity, ForwardDeclarationsWithNoDefinitionUnify) {
+    TypeInterner cuA{CompilationUnitId{1}};
+    TypeInterner cuB{CompilationUnitId{2}};
+    const TypeId a = cuA.forwardComposite(TypeKind::Struct, "Opaque", 1);
+    const TypeId b = cuB.forwardComposite(TypeKind::Struct, "Opaque", 2);
+
+    CompositeIdentityIndex index;
+    index.observe(cuA);
+    index.observe(cuB);
+    EXPECT_EQ(index.observedTagCount(), 0u)
+        << "observe() records DEFINITIONS; a tag with none is not a tag it can "
+           "resolve";
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> rA, rB;
+    const TypeId hA = reinternType(cuA, a, host, rA, index);
+    const TypeId hB = reinternType(cuB, b, host, rB, index);
+    EXPECT_EQ(hA.v, hB.v);
+    EXPECT_TRUE(host.interner().isIncompleteComposite(hA));
+}
+
+// ★★ THE DE BRUIJN PIN. A composite's digest is memoized, so a backreference
+// must be a RELATIVE depth: an absolute stack index would make `struct N` digest
+// differently depending on how deep the walk was when it reached it, and the memo
+// would then hand a digest computed at one depth to a lookup at another. Here the
+// SAME self-referential `N` is reached at depth 0 from one CU and at depth 1 (via
+// `Outer`) from the next; both must land on one host TypeId.
+TEST(TypeReinternCompositeIdentity, SelfReferentialCompositeUnifiesAtAnyDepth) {
+    auto defineN = [](TypeInterner& cu, std::uint64_t key) {
+        const TypeId n = cu.forwardComposite(TypeKind::Struct, "N", key);
+        std::array<TypeId, 2> const fields{cu.pointer(n),
+                                           cu.primitive(TypeKind::I32)};
+        cu.completeComposite(n, fields, /*packed=*/false);
+        return n;
+    };
+
+    TypeInterner cuA{CompilationUnitId{1}};
+    const TypeId nA = defineN(cuA, 7);
+
+    TypeInterner cuB{CompilationUnitId{2}};
+    const TypeId nB    = defineN(cuB, 9);
+    const TypeId outer = cuB.forwardComposite(TypeKind::Struct, "Outer", 10);
+    std::array<TypeId, 1> const oFields{cuB.pointer(nB)};
+    cuB.completeComposite(outer, oFields, /*packed=*/false);
+
+    CompositeIdentityIndex index;
+    index.observe(cuA);
+    index.observe(cuB);
+
+    // The host key is what decides this, so assert it DIRECTLY as well as
+    // through the reintern: if the two disagree here, the failure is in the
+    // digest, and if they agree here but the ids differ, it is in the reintern.
+    // Two assertions, two suspects, no bisection.
+    EXPECT_EQ(index.keyFor(cuA, nA), index.keyFor(cuB, nB));
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> rA, rB;
+    const TypeId hNA    = reinternType(cuA, nA, host, rA, index);
+    const TypeId hOuter = reinternType(cuB, outer, host, rB, index);
+
+    auto const& hi = host.interner();
+    ASSERT_EQ(hi.operands(hOuter).size(), 1u);
+    const TypeId nUnderOuter = hi.operands(hi.operands(hOuter)[0])[0];
+    EXPECT_EQ(hNA.v, nUnderOuter.v)
+        << "one `struct N` reached at two different walk depths is one type";
+    EXPECT_EQ(hi.operands(hi.operands(hNA)[0])[0].v, hNA.v)
+        << "and it is still self-referential in the host";
+}
+
+// Mutually recursive composites must unify PAIRWISE across CUs and must never
+// collapse into each other. `A` and `B` have identical field COUNTS and identical
+// field KINDS — only the tags and the cycle direction tell them apart — so this
+// fails loudly if the digest drops the tag or mishandles the backreference.
+TEST(TypeReinternCompositeIdentity, MutuallyRecursiveCompositesUnifyPairwise) {
+    auto definePair = [](TypeInterner& cu, std::uint64_t base) {
+        const TypeId a = cu.forwardComposite(TypeKind::Struct, "A", base);
+        const TypeId b = cu.forwardComposite(TypeKind::Struct, "B", base + 1);
+        std::array<TypeId, 1> const aFields{cu.pointer(b)};
+        std::array<TypeId, 1> const bFields{cu.pointer(a)};
+        cu.completeComposite(a, aFields, /*packed=*/false);
+        cu.completeComposite(b, bFields, /*packed=*/false);
+        return std::pair<TypeId, TypeId>{a, b};
+    };
+
+    TypeInterner cuA{CompilationUnitId{1}};
+    TypeInterner cuB{CompilationUnitId{2}};
+    auto const [a1, b1] = definePair(cuA, 100);
+    auto const [a2, b2] = definePair(cuB, 900);
+
+    CompositeIdentityIndex index;
+    index.observe(cuA);
+    index.observe(cuB);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> rA, rB;
+    const TypeId hA1 = reinternType(cuA, a1, host, rA, index);
+    const TypeId hB1 = reinternType(cuA, b1, host, rA, index);
+    const TypeId hA2 = reinternType(cuB, a2, host, rB, index);
+    const TypeId hB2 = reinternType(cuB, b2, host, rB, index);
+
+    EXPECT_EQ(hA1.v, hA2.v);
+    EXPECT_EQ(hB1.v, hB2.v);
+    EXPECT_NE(hA1.v, hB1.v)
+        << "`A` and `B` differ only by tag and cycle direction; collapsing them "
+           "would be a layout merge C does not license";
+}
+
+// ⚠ EVERY CHANNEL reinternType CARRIES ACROSS MUST BE IN THE DIGEST, or two
+// composites the digest calls equal would reintern to DIFFERENT layouts and the
+// merge would pick one. `packed` is the cheapest witness for the whole class: two
+// same-tag structs identical but for it must stay two types.
+TEST(TypeReinternCompositeIdentity, PackedIsPartOfCompositeIdentity) {
+    TypeInterner cuA{CompilationUnitId{1}};
+    const TypeId a = cuA.forwardComposite(TypeKind::Struct, "W", 1);
+    std::array<TypeId, 2> const aFields{cuA.primitive(TypeKind::I8),
+                                        cuA.primitive(TypeKind::I32)};
+    cuA.completeComposite(a, aFields, /*packed=*/true);
+
+    TypeInterner cuB{CompilationUnitId{2}};
+    const TypeId b = cuB.forwardComposite(TypeKind::Struct, "W", 1);
+    std::array<TypeId, 2> const bFields{cuB.primitive(TypeKind::I8),
+                                        cuB.primitive(TypeKind::I32)};
+    cuB.completeComposite(b, bFields, /*packed=*/false);
+
+    CompositeIdentityIndex index;
+    index.observe(cuA);
+    index.observe(cuB);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> rA, rB;
+    const TypeId hA = reinternType(cuA, a, host, rA, index);
+    const TypeId hB = reinternType(cuB, b, host, rB, index);
+    EXPECT_NE(hA.v, hB.v);
+    EXPECT_TRUE(host.interner().isPacked(hA));
+    EXPECT_FALSE(host.interner().isPacked(hB));
+}
+
+// The four-argument overload keeps working and keeps its single-source meaning:
+// it observes `src` and nothing else, so a definition IN THAT INTERNER still
+// resolves its own forward declaration.
+TEST(TypeReinternCompositeIdentity, SingleSourceOverloadResolvesItsOwnDefinition) {
+    TypeInterner cu{CompilationUnitId{1}};
+    const TypeId def = defineBitvec(cu, 3);
+    const TypeId fwd = cu.forwardComposite(TypeKind::Struct, "Bitvec", 4);
+    ASSERT_TRUE(cu.isIncompleteComposite(fwd));
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> remap;
+    const TypeId hDef = reinternType(cu, def, host, remap);
+    const TypeId hFwd = reinternType(cu, fwd, host, remap);
+    EXPECT_EQ(hDef.v, hFwd.v);
+}
+
+// ★★★ THE SECOND PASS, AND THE FIRST ONE SHIPPED WITHOUT IT. Keying a
+// composite on its FULL recursive layout still forked `struct BtCursor` on the
+// 103-TU sqlite corpus, and the reason is this shape: a TU that has seen
+// `struct Inner { ... }` and a TU that has only seen `struct Inner;` give the
+// ENCLOSING struct two different digests — even though the enclosing struct is
+// byte-for-byte identical in both, because a pointer is one word whatever it
+// points at. The completeness of something you only POINT AT was leaking into
+// your own identity: the same defect this file fixes, one level down.
+// RED-ON-DISABLE: make a named composite behind a pointer contribute its layout
+// again and this test forks the two `Outer`s.
+TEST(TypeReinternCompositeIdentity, PointeeCompletenessDoesNotForkTheEnclosingType) {
+    // CU 1 sees the definition of `Inner`.
+    TypeInterner cuSees{CompilationUnitId{1}};
+    const TypeId innerDef = cuSees.forwardComposite(TypeKind::Struct, "Inner", 1);
+    std::array<TypeId, 1> const innerFields{cuSees.primitive(TypeKind::I32)};
+    cuSees.completeComposite(innerDef, innerFields, /*packed=*/false);
+    const TypeId outerA = cuSees.forwardComposite(TypeKind::Struct, "Outer", 2);
+    std::array<TypeId, 1> const outerAFields{cuSees.pointer(innerDef)};
+    cuSees.completeComposite(outerA, outerAFields, /*packed=*/false);
+
+    // CU 2 has only the forward declaration — the ordinary opaque-handle header.
+    TypeInterner cuBlind{CompilationUnitId{2}};
+    const TypeId innerFwd = cuBlind.forwardComposite(TypeKind::Struct, "Inner", 1);
+    const TypeId outerB   = cuBlind.forwardComposite(TypeKind::Struct, "Outer", 2);
+    std::array<TypeId, 1> const outerBFields{cuBlind.pointer(innerFwd)};
+    cuBlind.completeComposite(outerB, outerBFields, /*packed=*/false);
+
+    CompositeIdentityIndex index;
+    index.observe(cuSees);
+    index.observe(cuBlind);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> rA, rB;
+    const TypeId hA = reinternType(cuSees, outerA, host, rA, index);
+    const TypeId hB = reinternType(cuBlind, outerB, host, rB, index);
+
+    EXPECT_EQ(hA.v, hB.v)
+        << "`Outer` is one word wide in both CUs and identical in every member; "
+           "what its member points AT cannot be part of ITS identity";
+    // And `Inner` itself still unifies onto the one definition that exists.
+    auto const& hi = host.interner();
+    ASSERT_EQ(hi.operands(hA).size(), 1u);
+    const TypeId hInner = hi.operands(hi.operands(hA)[0])[0];
+    EXPECT_FALSE(hi.isIncompleteComposite(hInner));
+}
+
+// ⚠ THE GUARD THE CLAUSE ABOVE MUST NOT BREAK: relaxing the POINTEE does not
+// relax the MEMBER. A struct that EMBEDS a composite by value takes that
+// composite's layout into its own, so two same-tag structs embedding different
+// layouts are still two types. This is the line between "one word whatever it
+// points at" and "my size depends on yours".
+TEST(TypeReinternCompositeIdentity, AnEmbeddedMembersLayoutIsStillPartOfIdentity) {
+    auto build = [](TypeInterner& cu, TypeKind memberKind) {
+        const TypeId inner = cu.forwardComposite(TypeKind::Struct, "Inner", 1);
+        std::array<TypeId, 1> const innerFields{cu.primitive(memberKind)};
+        cu.completeComposite(inner, innerFields, /*packed=*/false);
+        const TypeId outer = cu.forwardComposite(TypeKind::Struct, "Outer", 2);
+        std::array<TypeId, 1> const outerFields{inner};   // BY VALUE, not a Ptr
+        cu.completeComposite(outer, outerFields, /*packed=*/false);
+        return outer;
+    };
+
+    TypeInterner cuA{CompilationUnitId{1}};
+    TypeInterner cuB{CompilationUnitId{2}};
+    const TypeId a = build(cuA, TypeKind::I32);
+    const TypeId b = build(cuB, TypeKind::F64);
+
+    CompositeIdentityIndex index;
+    index.observe(cuA);
+    index.observe(cuB);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> rA, rB;
+    EXPECT_NE(reinternType(cuA, a, host, rA, index).v,
+              reinternType(cuB, b, host, rB, index).v)
+        << "an embedded member's layout IS this struct's layout; merging these "
+           "would be a size and offset miscompile";
+}
+
+// A pointer's pointee TAG still matters: `struct A { struct B *p; }` and
+// `struct A { struct C *p; }` are different types and neither the relaxation
+// above nor the memo may collapse them.
+TEST(TypeReinternCompositeIdentity, PointeeTagIsStillPartOfIdentity) {
+    auto build = [](TypeInterner& cu, char const* pointeeTag) {
+        const TypeId pointee = cu.forwardComposite(TypeKind::Struct, pointeeTag, 1);
+        const TypeId outer   = cu.forwardComposite(TypeKind::Struct, "A", 2);
+        std::array<TypeId, 1> const fields{cu.pointer(pointee)};
+        cu.completeComposite(outer, fields, /*packed=*/false);
+        return outer;
+    };
+
+    TypeInterner cuA{CompilationUnitId{1}};
+    TypeInterner cuB{CompilationUnitId{2}};
+    const TypeId a = build(cuA, "B");
+    const TypeId b = build(cuB, "C");
+
+    CompositeIdentityIndex index;
+    index.observe(cuA);
+    index.observe(cuB);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> rA, rB;
+    EXPECT_NE(reinternType(cuA, a, host, rA, index).v,
+              reinternType(cuB, b, host, rB, index).v);
+}
+
+// ★★★ THE DEFECT THAT SURVIVED TWO CORRECT-LOOKING FIXES, AND THE ONLY REASON
+// IT WAS FOUND IS THAT THE INDEX COUNTS ITS OWN FAILURES. An anonymous member is
+// named `<anon:RULE:NODEID>` where NODEID is a per-CU AST node index, so two CUs
+// that include the same header give one anonymous `union` two names — and every
+// NAMED struct that reaches it inherits the split. ✔MEASURED on 103-TU sqlite:
+// 98 tags forked, `Parse` / `Table` / `Select` / `Index` among them, EVERY ONE
+// with a single local layout signature — which is what proved the split could
+// not be a real layout difference.
+// RED-ON-DISABLE: mix the raw name instead of `anonNameWithoutDeclSite` and the
+// two `Outer`s fork while `forkedTagCount()` goes to 1.
+TEST(TypeReinternCompositeIdentity, AnonymousMemberDeclSiteDoesNotForkItsParent) {
+    // Two CUs, same header, DIFFERENT synthetic node ids for the anonymous union.
+    auto build = [](TypeInterner& cu, char const* anonName) {
+        const TypeId an = cu.forwardComposite(TypeKind::Union, anonName, 1);
+        std::array<TypeId, 2> const anFields{cu.primitive(TypeKind::I32),
+                                             cu.primitive(TypeKind::F32)};
+        cu.completeComposite(an, anFields, /*packed=*/false);
+        const TypeId outer = cu.forwardComposite(TypeKind::Struct, "Outer", 2);
+        std::array<TypeId, 1> const oFields{an};   // embedded anonymous union
+        cu.completeComposite(outer, oFields, /*packed=*/false);
+        return outer;
+    };
+
+    TypeInterner cuA{CompilationUnitId{1}};
+    TypeInterner cuB{CompilationUnitId{2}};
+    const TypeId a = build(cuA, "<anon:unionSpec:65291>");
+    const TypeId b = build(cuB, "<anon:unionSpec:71255>");
+
+    CompositeIdentityIndex index;
+    index.observe(cuA);
+    index.observe(cuB);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> rA, rB;
+    const TypeId hA = reinternType(cuA, a, host, rA, index);
+    const TypeId hB = reinternType(cuB, b, host, rB, index);
+
+    EXPECT_EQ(hA.v, hB.v)
+        << "the two `Outer`s differ only in WHERE their anonymous member was "
+           "written, which is not part of any type's identity";
+    EXPECT_EQ(index.forkedTagCount(), 0u);
+    // The anonymous member itself unified too, and it must, or `Outer`'s two
+    // completions would disagree on its field type and abort.
+    ASSERT_EQ(host.interner().operands(hA).size(), 1u);
+    EXPECT_EQ(host.interner().kind(host.interner().operands(hA)[0]),
+              TypeKind::Union);
+}
+
+// The rule keeps the RULE and drops only the node id, so a `structSpec` and a
+// `unionSpec` anonymous member of otherwise identical shape stay two types —
+// they overlay their fields differently, and merging them would be a layout
+// miscompile rather than a de-duplication.
+TEST(TypeReinternCompositeIdentity, AnonymousStructAndUnionStayDistinct) {
+    auto build = [](TypeInterner& cu, TypeKind k, char const* anonName) {
+        const TypeId an = cu.forwardComposite(k, anonName, 1);
+        std::array<TypeId, 2> const anFields{cu.primitive(TypeKind::I32),
+                                             cu.primitive(TypeKind::F32)};
+        cu.completeComposite(an, anFields, /*packed=*/false);
+        const TypeId outer = cu.forwardComposite(TypeKind::Struct, "Outer", 2);
+        std::array<TypeId, 1> const oFields{an};
+        cu.completeComposite(outer, oFields, /*packed=*/false);
+        return outer;
+    };
+
+    TypeInterner cuA{CompilationUnitId{1}};
+    TypeInterner cuB{CompilationUnitId{2}};
+    const TypeId a = build(cuA, TypeKind::Union,  "<anon:unionSpec:100>");
+    const TypeId b = build(cuB, TypeKind::Struct, "<anon:structSpec:200>");
+
+    CompositeIdentityIndex index;
+    index.observe(cuA);
+    index.observe(cuB);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> rA, rB;
+    EXPECT_NE(reinternType(cuA, a, host, rA, index).v,
+              reinternType(cuB, b, host, rB, index).v);
+}
+
+// ⚠ THE FIXED POINT MUST CONVERGE, NOT HIT ITS BOUND. A bound that BOUND means
+// two distinct types share a key, which `completeComposite` then reports by
+// aborting — loudly, but only at the end of a long build. `refinementRounds()`
+// is exposed so the property can be asserted where it is cheap.
+// ⓘ The naive alternative — a recursive digest cutting cycles with a de Bruijn
+// backreference — cannot memoize any subtree that back-references an outer
+// composite, so on a mutually recursive cluster it re-expands per path.
+// ✔MEASURED on 103-TU sqlite: 952 s of CPU and no output. This converges in 2.
+TEST(TypeReinternCompositeIdentity, MutualRecursionConvergesWithoutHittingTheBound) {
+    TypeInterner cu{CompilationUnitId{1}};
+    // A ring of four composites, each pointing at the next: the shape a de
+    // Bruijn walk cannot memoize and refinement handles as ordinary edges.
+    std::array<TypeId, 4> ring{};
+    for (std::uint32_t i = 0; i < 4; ++i)
+        ring[i] = cu.forwardComposite(TypeKind::Struct,
+                                      std::string("R") + char('0' + i), 10 + i);
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        std::array<TypeId, 2> const f{cu.pointer(ring[(i + 1) % 4]),
+                                      cu.primitive(TypeKind::I32)};
+        cu.completeComposite(ring[i], f, /*packed=*/false);
+    }
+
+    CompositeIdentityIndex index;
+    index.observe(cu);
+
+    TypeLattice host{CompilationUnitId{9}};
+    std::unordered_map<std::uint32_t, TypeId> remap;
+    for (TypeId t : ring) EXPECT_TRUE(reinternType(cu, t, host, remap, index).valid());
+
+    EXPECT_EQ(index.forkedTagCount(), 0u);
+    EXPECT_GT(index.refinementRounds(), 0u);
+    EXPECT_LT(index.refinementRounds(), index.nodeCount() + 2)
+        << "the refinement hit its backstop instead of converging, which means "
+           "two distinct types may share a key";
 }

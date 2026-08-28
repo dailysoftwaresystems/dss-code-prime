@@ -1,4 +1,6 @@
 #include "link/format/elf_object_reader.hpp"
+#include "link/format/dwarf_cfi_decode.hpp"
+#include "link/format/foreign_section_alignment.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
 
@@ -133,15 +135,13 @@ rangeExceedsBuffer(std::uint64_t off, std::uint64_t size, std::uint64_t total) n
     return v;
 }
 
-// ELF sh_addralign -> Alignment newtype. sh_addralign 0 or 1 means "no
-// constraint" (byte). Values above the newtype's 256-byte cap or
-// non-power-of-two (never emitted for a producer data section) fall back
-// to byte alignment -- the field is only a re-layout hint (the merge
-// re-lays-out every item), never a correctness input on read-back.
+// ELF sh_addralign -> Alignment newtype. `sh_addralign` is ELF's spelling of
+// the declared section alignment; the POLICY that turns a declared alignment
+// into an `Alignment` is shared with the Mach-O and COFF readers and lives in
+// `link/format/foreign_section_alignment.hpp` -- this reader supplies only the
+// fact that ELF spells it as a raw BYTE COUNT.
 [[nodiscard]] Alignment alignFromSection(std::uint64_t shAddrAlign) noexcept {
-    if (shAddrAlign <= 1u || shAddrAlign > 256u) return Alignment{};
-    return Alignment::fromBytes(static_cast<std::uint32_t>(shAddrAlign))
-        .value_or(Alignment{});
+    return link::format::foreignSectionAlignmentFromByteCount(shAddrAlign);
 }
 
 // NUL-terminated name at strtab[index], bounded by [tabStart, tabEnd).
@@ -1295,6 +1295,212 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 if (callSignalNativeIds.contains(rType)) {
                     mod.externImports[ex->second].isData = false;
                 }
+            }
+        }
+    }
+
+    // -- (8) UNWIND METADATA: carry it into the neutral vocabulary ---
+    //
+    // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE.
+    //
+    // Until this step existed a function merged from a foreign object
+    // arrived in a DSS image with NO unwind description at all -- a
+    // backtrace stopped at it, a profiler stack ended there, and an
+    // exception thrown through it terminated -- and, unlike the Mach-O
+    // reader, this one did not even say so. The information WAS present in
+    // the object (✔MEASURED on `gcc -c` output: `.rela.eh_frame` names
+    // `.text` once per function) and was dropped on the floor.
+    //
+    // ★ THE CARRY IS INTO `CfiFunction`, NOT INTO THE IMAGE'S BYTES. Every
+    //   format writer in this tree already encodes its own unwind table from
+    //   that neutral, PC-keyed representation, and `AssembledFunction::cfi`
+    //   is the slot each reconstructed function already has. So the whole
+    //   fix on this side is an INVERSE of the DWARF encoder plus a binding,
+    //   and the emit side needs no new path on any format. Merging the
+    //   foreign `.eh_frame` BYTES instead would have been a per-format carry
+    //   that bought nothing on the two formats whose encoding is not DWARF.
+    //
+    // ★ THE SECTION IS FOUND BY ITS UNIVERSAL `kind`, NEVER BY THE NAME
+    //   `.eh_frame`. A format that declares no `unwind` row simply carries
+    //   nothing, exactly as it did before -- the vocabulary is the switch.
+    {
+        Shdr const* unwindSec = nullptr;
+        for (auto const& s : secs) {
+            if (!s.kind.has_value() || *s.kind != SectionKind::Unwind) continue;
+            if (s.size == 0u) continue;
+            if (unwindSec != nullptr) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: object carries TWO unwind "
+                    "sections ('" + unwindSec->name + "' and '" + s.name
+                    + "'); their records would have to be merged into one "
+                      "description per function and this reader has no rule "
+                      "for which wins.");
+            }
+            unwindSec = &s;
+        }
+        if (unwindSec != nullptr) {
+            if (rangeExceedsBuffer(unwindSec->offset, unwindSec->size,
+                                   bytes.size())) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: unwind section '"
+                    + unwindSec->name + "' body runs past the end of the file.");
+            }
+            auto const decoded = link::format::decodeEhFrame(
+                bytes.subspan(static_cast<std::size_t>(unwindSec->offset),
+                              static_cast<std::size_t>(unwindSec->size)),
+                link::format::dwarfRegisterMappingOf(targetSchema),
+                "elf::readRelocatableObject", reporter);
+            if (!decoded.has_value()) return std::nullopt;  // already reported
+
+            // ── Bind each FDE to the function it describes ──
+            //
+            // In a relocatable object the FDE's `initial_location` field is
+            // ZERO and a real RELOCATION carries the reference. The relocation
+            // that may appear there is not a free choice: it is THE 32-bit
+            // PC-relative, zero-bias row, the same one `elf.cpp`'s ET_REL
+            // writer emits for this field, resolved through the SAME shared
+            // predicate rather than a second opinion about which row it is.
+            // Reusing the call-site rel32 row instead would bake its -4
+            // instruction-end bias into a data field and bind every FDE four
+            // bytes past its function.
+            std::uint32_t fdePtrNativeId = 0;
+            {
+                std::string relocErr;
+                auto const* fdePtrReloc =
+                    link::format::fdePointerRelocationOf(targetSchema, relocErr);
+                if (fdePtrReloc == nullptr) {
+                    return fail(DiagnosticCode::K_RelocationKindMismatch,
+                        "elf::readRelocatableObject: this object carries unwind "
+                        "information but " + relocErr);
+                }
+                auto const* fmtRow =
+                    objectFormatSchema.relocationByKind(fdePtrReloc->kind);
+                if (fmtRow == nullptr) {
+                    return fail(DiagnosticCode::K_RelocationKindMismatch,
+                        "elf::readRelocatableObject: target '"
+                        + std::string(targetSchema.name()) + "' declares the "
+                        "DWARF FDE pointer relocation '" + fdePtrReloc->name
+                        + "' but object format '"
+                        + std::string(objectFormatSchema.name())
+                        + "' maps no ELF type to it, so an FDE's function "
+                          "reference cannot be recognised and every merged "
+                          "function's unwind description would be dropped in "
+                          "silence.");
+                }
+                fdePtrNativeId = fmtRow->nativeId;
+            }
+
+            // r_offset -> (symbol index, addend) for the unwind section's own
+            // RELA. Built once; an FDE looks its `initial_location` field up.
+            struct FdeRef { std::uint32_t symIdx; std::int64_t addend; };
+            std::unordered_map<std::uint64_t, FdeRef> unwindRelocs;
+            std::uint16_t const unwindIdx = static_cast<std::uint16_t>(
+                static_cast<std::size_t>(unwindSec - secs.data()));
+            for (auto const& rela : secs) {
+                if (rela.type != kShtRela || rela.info != unwindIdx) continue;
+                std::size_t const n = static_cast<std::size_t>(rela.size / kRelaSz);
+                for (std::size_t e = 0; e < n; ++e) {
+                    std::size_t const ro =
+                        static_cast<std::size_t>(rela.offset) + e * kRelaSz;
+                    std::uint64_t const rOffset = rdU64(bytes, ro + 0);
+                    std::uint64_t const rInfo   = rdU64(bytes, ro + 8);
+                    auto const rAddend =
+                        static_cast<std::int64_t>(rdU64(bytes, ro + 16));
+                    auto const rType =
+                        static_cast<std::uint32_t>(rInfo & 0xFFFFFFFFu);
+                    if (rType != fdePtrNativeId) {
+                        return fail(DiagnosticCode::K_RelocationKindMismatch,
+                            "elf::readRelocatableObject: relocation section '"
+                            + rela.name + "' entry #" + std::to_string(e)
+                            + " patches the unwind section with ELF type "
+                            + std::to_string(rType) + ", but the only field an "
+                            "FDE has to relocate is its `initial_location`, "
+                            "whose relocation this target declares as type "
+                            + std::to_string(fdePtrNativeId)
+                            + ". A relocation this reader cannot account for "
+                              "means the section says something it is not "
+                              "reading, and dropping it would lose unwind "
+                              "information silently "
+                              "(D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE).");
+                    }
+                    unwindRelocs.emplace(
+                        rOffset,
+                        FdeRef{static_cast<std::uint32_t>(rInfo >> 32), rAddend});
+                }
+            }
+
+            for (auto const& fde : decoded->fdes) {
+                auto const it = unwindRelocs.find(fde.initialLocationFieldOffset);
+                if (it == unwindRelocs.end()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "elf::readRelocatableObject: the FDE whose "
+                        "`initial_location` field is at byte offset "
+                        + std::to_string(fde.initialLocationFieldOffset)
+                        + " of '" + unwindSec->name + "' carries no relocation, "
+                        "so nothing says which function it describes. In a "
+                        "relocatable object that field has no address to hold "
+                        "and the reference is the relocation.");
+                }
+                if (it->second.symIdx >= syms.size()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "elf::readRelocatableObject: an FDE's relocation names "
+                        "symbol #" + std::to_string(it->second.symIdx)
+                        + ", past the end of the symbol table.");
+                }
+                Sym const& tsym = syms[it->second.symIdx];
+                // A SECTION symbol has st_value 0, a function symbol its own
+                // offset; the sum is the function's offset either way, so this
+                // needs no case analysis over which form the producer chose
+                // (gcc emits the section form, and `-ffunction-sections` moves
+                // WHICH section rather than the shape of the reference).
+                auto const targetOff = static_cast<std::uint64_t>(
+                    static_cast<std::int64_t>(tsym.value) + it->second.addend);
+                Interval const* hit = nullptr;
+                if (auto fit = funcIntervalsBySec.find(tsym.shndx);
+                    fit != funcIntervalsBySec.end()) {
+                    for (auto const& iv : fit->second) {
+                        if (iv.start == targetOff) { hit = &iv; break; }
+                    }
+                }
+                if (hit == nullptr) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "elf::readRelocatableObject: an FDE describes the code "
+                        "at offset " + std::to_string(targetOff)
+                        + " of section #" + std::to_string(tsym.shndx)
+                        + ", where no reconstructed function BEGINS. An unwind "
+                          "record that cannot be attached to a function would "
+                          "have to be dropped, which is the silence this step "
+                          "exists to end "
+                          "(D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE).");
+                }
+                // ★ THE EXTENT MUST AGREE, AND IT IS CHECKED HERE RATHER THAN
+                //   IN THE WRITER. An FDE's `address_range` that is shorter
+                //   than the function leaves the tail undescribed: the
+                //   unwinder finds no record for a PC the function really
+                //   occupies and stops the walk with no error. The writer has
+                //   the same check, but by then the object's identity is gone
+                //   and the message can only name a function index.
+                if (fde.cfi.codeLength != hit->len) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "elf::readRelocatableObject: the FDE for the function "
+                        "at offset " + std::to_string(targetOff)
+                        + " of section #" + std::to_string(tsym.shndx)
+                        + " describes " + std::to_string(fde.cfi.codeLength)
+                        + " bytes but that function's symbol declares "
+                        + std::to_string(hit->len)
+                        + "; an unwind record that does not cover its whole "
+                          "function stops a stack walk mid-way with no "
+                          "diagnostic.");
+                }
+                if (mod.functions[hit->outIdx].cfi.has_value()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "elf::readRelocatableObject: TWO FDEs describe the "
+                        "function at offset " + std::to_string(targetOff)
+                        + " of section #" + std::to_string(tsym.shndx)
+                        + "; one of them is wrong and nothing here can tell "
+                          "which.");
+                }
+                mod.functions[hit->outIdx].cfi = fde.cfi;
             }
         }
     }

@@ -1,5 +1,5 @@
 // LIR liveness analysis tests (plan 12 §2.8). Exercises
-// `analyzeLiveness` over a mix of synthetic-MIR shapes and c-subset-
+// `analyzeLiveness` over a mix of synthetic-MIR shapes and c-
 // lowered shapes. Pins:
 //   * live-in / live-out propagation across the CFG
 //   * per-vreg live ranges respect block-end live-out (loops)
@@ -32,7 +32,7 @@
 #include <vector>
 
 using namespace dss;
-using dss::test_support::lowerCSubsetToLir;
+using dss::test_support::lowerCToLir;
 
 namespace {
 
@@ -94,7 +94,7 @@ TEST(LirLiveness, EmptyModuleProducesNoResults) {
 TEST(LirLiveness, StraightLineFunctionPinsArgRange) {
     // `f(int x) { return x; }` — arg lowers to a virtual reg defined
     // at the arg pseudo-op's late slot; return uses it.
-    auto lowered = lowerCSubsetToLir("int f(int x) { return x; }");
+    auto lowered = lowerCToLir("int f(int x) { return x; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const out = analyzeLiveness(lowered.lir.lir);
     ASSERT_EQ(out.perFunc.size(), 1u);
@@ -128,7 +128,7 @@ TEST(LirLiveness, BranchingFunctionPropagatesAcrossJoin) {
     // vreg). `x` is defined at entry and used in the post-join `return y + x`, so it
     // is genuinely live INTO the join block (and through both arms) — a non-empty
     // liveIn that is remat-independent.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x) {\n"
         "    int y;\n"
         "    if (x > 0) { y = 1; } else { y = 2; }\n"
@@ -155,7 +155,7 @@ TEST(LirLiveness, LoopRangeReachesLatchEnd) {
     // A while-loop where the induction variable is loop-carried.
     // The induction-var range's `end` must reach at least to the
     // latch block's end position.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int n) {\n"
         "    int i = 0; int acc = 0;\n"
         "    while (i < n) { acc = acc + i; i = i + 1; }\n"
@@ -210,7 +210,7 @@ TEST(LirLiveness, SwitchPinsFirstCmpAndFirstJccOnSwitchHeader) {
     // called). Lowering succeeds (lir.ok) AND the entry block of the
     // function contains `cmp` followed by `jcc` followed by no
     // further insts (the jcc seals the block).
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x) {\n"
         "    switch (x) {\n"
         "        case 1: return 10;\n"
@@ -246,7 +246,7 @@ TEST(LirLiveness, SwitchPinsFirstCmpAndFirstJccOnSwitchHeader) {
 }
 
 TEST(LirLiveness, FunctionCallProducesPerFuncOrderedResults) {
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int g(int a) { return a + 1; }\n"
         "int f(int x) { int y = g(x); return y; }\n");
     ASSERT_TRUE(lowered.lir.ok);
@@ -290,7 +290,7 @@ TEST(LirLiveness, SyntheticUnaryFunctionProducesArgRange) {
 }
 
 TEST(LirLiveness, RangesAreSortedByStart) {
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x, int y) {\n"
         "    int a = x + y;\n"
         "    int b = a * x;\n"
@@ -326,7 +326,7 @@ TEST(LirLiveness, VRegBitsetContainsRespectsSentinelAndCapacity) {
 }
 
 TEST(LirLiveness, PositionToInstReflectsDoubleSlotting) {
-    auto lowered = lowerCSubsetToLir("int f(int x) { return x; }");
+    auto lowered = lowerCToLir("int f(int x) { return x; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const out = analyzeLiveness(lowered.lir.lir);
     ASSERT_EQ(out.perFunc.size(), 1u);
@@ -357,7 +357,7 @@ TEST(LirLiveness, AllICmpVariantsLowerAndAnalyze) {
     std::array<Case, 10> const cases{{
         {"=="}, {"!="}, {"<"}, {"<="}, {">"}, {">="},
         // Unsigned comparisons exercised via type cast pattern.
-        // c-subset's unsigned types aren't trivially declarable in this
+        // c's unsigned types aren't trivially declarable in this
         // corpus, so the 4 unsigned variants are covered by the
         // synthetic path below.
         {"=="}, {"!="}, {"<"}, {">"}
@@ -366,7 +366,7 @@ TEST(LirLiveness, AllICmpVariantsLowerAndAnalyze) {
         std::string src =
             std::string("int f(int x, int y) { if (x ") + c.op
             + " y) return 1; return 0; }";
-        auto lowered = lowerCSubsetToLir(src);
+        auto lowered = lowerCToLir(src);
         ASSERT_TRUE(lowered.lir.ok) << "lower failed for op " << c.op;
         LirLiveness const out = analyzeLiveness(lowered.lir.lir);
         ASSERT_EQ(out.perFunc.size(), 1u);

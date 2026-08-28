@@ -4,6 +4,7 @@
 #include "analysis/semantic/constant_symbol_fold.hpp" // Item 1: shared enum/constant Ref->literal builder
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/type_rules.hpp"      // FC3 c1: usualArithmeticCommonType / resolveArithmeticRules
+#include "core/types/anon_member_name.hpp"       // isSyntheticAnonymousName (one owner)
 #include "core/types/attribute_naming.hpp"       // D-CSUBSET-PACKED (F4): stripDunder
 #include "core/types/data_model.hpp"
 #include "core/types/decl_prefix_strip.hpp"     // declRoleChildren / descendVisibleDecl / specifierPrefixChild
@@ -118,8 +119,8 @@ namespace {
         || k == TypeKind::BitInt;
 }
 
-// Full-width-integer return predicate for D-LK10-ENTRY-MAIN-IMPLICIT-
-// RETURN. Restricted to I32+ / U32+ because the SysV AMD64 + MS x64
+// Full-width-integer return predicate for D-LK10-ENTRY-MAIN-IMPLICIT-RETURN.
+// Restricted to I32+ / U32+ because the SysV AMD64 + MS x64
 // ABIs do NOT zero-extend sub-32-bit integer returns to the full GPR
 // — the trampoline's 64-bit `mov status, returnGprs[0]` would copy
 // indeterminate upper bits to the exit syscall arg → non-deterministic
@@ -285,6 +286,12 @@ struct Lowerer {
     // Only THREAD-LOCAL decls are recorded (absence ⇒ ordinary process-shared
     // storage), so the side-table stays sparse.
     std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& threadLocalAcc;
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: shared accumulator of
+    // (promoted-GLOBAL HIR node → EnclosingFunctionAttr) pairs, written at the ONE
+    // site that performs the D-CSUBSET-LOCAL-STATIC promotion. Sparse: only a
+    // block-scope `static` gets an entry — a file-scope global has no enclosing
+    // function, and its absence is a complete answer, not a hole.
+    std::vector<std::pair<HirNodeId, EnclosingFunctionAttr>>& enclosingFunctionAcc;
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared accumulator of (ACCESS HIR node
     // → VolatileAttr) pairs, populated from the bound symbol's / field's
     // `SymbolRecord.isVolatile` at each USER-access lowering site (object Ref,
@@ -451,6 +458,11 @@ struct Lowerer {
     // three are saved/restored around each function body, like `labelOrdinals_`.
     std::unordered_map<std::uint32_t, std::uint32_t> caseLabelOrdinals_;  // NodeId.v -> ordinal
     std::uint32_t                                    nextLabelOrdinal_{};
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the function whose body is
+    // being lowered — the OTHER half of the label-ordinal key, saved/restored on
+    // exactly the same three lines as the maps above. Invalid at file scope, which
+    // is correct: no label is in scope there, so no ordinal can be minted either.
+    SymbolId                                         currentFunctionSymbol_{};
     // The depth of switch BODIES we are currently lowering inside (per the CST
     // subtree). A `caseStmt`/bare `caseLabel` reached as a statement is an
     // IN-SWITCH nested case (lower to a LabelStmt marker) iff this is > 0 AND the
@@ -458,6 +470,21 @@ struct Lowerer {
     // switch body → fail loud S0023. Saved/restored as a guard around the body
     // lowering of each switch.
     std::uint32_t                                    switchBodyDepth_{};
+
+    // P31 (D-C-GNU-STATEMENT-EXPRESSION): the depth of FUNCTION BODIES currently
+    // being lowered. Raised and lowered at the same three sites that save/restore
+    // the per-function label namespace above — those three ARE the function-body
+    // lowering sites, and keeping the two facts adjacent is what stops a fourth
+    // one from acquiring a label scope and not a body depth.
+    // Read by `lowerStatementExpr`: a GNU statement expression needs an enclosing
+    // function (both references say so — see S_StatementExprAtFileScope), and a
+    // global initializer is lowered through the SAME `lowerExpr` a body is, so the
+    // expression tier cannot tell the two apart without this.
+    // ⚠ NOT `currentReturnType_.valid()`: a `void` function's return type is a
+    // VALID void TypeId, and an unresolved signature leaves it Invalid INSIDE a
+    // body — so that field answers a different question and would answer this one
+    // wrongly in both directions.
+    std::uint32_t                                    functionBodyDepth_{};
 
     // The result of lowering an expression: the HIR node + its resolved type.
     struct E { HirNodeId id; TypeId type; };
@@ -481,8 +508,8 @@ struct Lowerer {
         if (child.type == target) return child;
         TypeKind const ck = interner.kind(child.type);
         TypeKind const tk = interner.kind(target);
-        // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-
-        // STRING closure, 2026-06-02): `Array<T,N>` rvalue in a
+        // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-STRING
+        // closure, 2026-06-02): `Array<T,N>` rvalue in a
         // `Ptr<T>` context decays to the address of the first
         // element. Emitted as a `Cast` HIR node (the universal
         // type-conversion marker); HIR→MIR's `mapCast` recognizes
@@ -632,8 +659,8 @@ struct Lowerer {
         // permitted by C and C++; `void* → T*` (lhs is T*, rhs is
         // void*, this is the `ck == Void` arm) is unsafe narrowing,
         // permitted by C but FORBIDDEN by C++ (requires explicit
-        // cast). c-subset declares both true in
-        // `c-subset.lang.json`; default-constructed
+        // cast). c declares both true in
+        // `c.lang.json`; default-constructed
         // `PointerConversionRules` has both false (strict typing).
         //
         // Sister rule in `type_rules.hpp::isAssignable` — the
@@ -725,23 +752,44 @@ struct Lowerer {
         // Cast — `_Bool b = 2` MUST be true, but a `Cast -> MIR Trunc(2 -> Bool)`
         // keeps only the low bit (false). REUSE the ONE truthiness chokepoint
         // `coerceCondition` (the exact shape `if(x)` lowers) so the assignment and
-        // condition paths cannot drift. An Enum bridges to its underlying integer
-        // first (coerceCondition's arithmetic predicate excludes Enum); a `nullptr`
-        // is already an I32 0 here, so `Ne(0,0)` -> false as C requires. The
-        // semantic tier admits this via isAssignable's `scalarConvertsToBool` arm;
-        // coerce REALIZES it. Placed BEFORE the enum / int->ptr / arithmetic-core
-        // arms so a `_Bool` target never materializes the low-bit-truncating Cast.
-        if (tk == TypeKind::Bool
-            && ((isArithmeticCore(ck) && ck != TypeKind::Bool)
-                || ck == TypeKind::Enum || ck == TypeKind::Ptr)) {
-            E scalar = child;
-            if (ck == TypeKind::Enum) {
-                auto const scals = interner.scalars(child.type);
-                if (!scals.empty())
-                    scalar = coerce(child,
-                        interner.primitive(static_cast<TypeKind>(scals[0])));
-            }
-            E const asBool = coerceCondition(scalar, NodeId{});
+        // condition paths cannot drift. A `nullptr` is already an I32 0 here, so
+        // `Ne(0,0)` -> false as C requires. The semantic tier admits this via
+        // isAssignable's `scalarConvertsToBool` arm; coerce REALIZES it. Placed
+        // BEFORE the enum / int->ptr / arithmetic-core arms so a `_Bool` target
+        // never materializes the low-bit-truncating Cast.
+        // ⚠ THIS ARM USED TO BRIDGE AN ENUM TO ITS UNDERLYING INTEGER FIRST, and
+        // that bridge is DELETED rather than left standing beside its own
+        // replacement. It existed because `coerceCondition`'s arithmetic
+        // predicate excludes Enum; that function now owns the enum projection
+        // itself (D-CSUBSET-ENUM-FNSIG-NULLPTR-CONDITIONS-SKIP-THE-TRUTHINESS-CHOKEPOINT),
+        // so keeping a local copy would leave TWO owners of the enum→int rule in
+        // one file — the exact shape that drifts. The `_Bool b = e` case is
+        // covered by the same pins as every other site.
+        // ★★ THE GUARD DEFERS TO `coerceCondition` INSTEAD OF NAMING KINDS, and
+        // that is the cross-tier contract `type_rules.hpp`'s `scalarConvertsToBool`
+        // arm states in terms: a roster here is a SECOND owner of "which sources
+        // have a truth value", and the semantic tier is the first. When the two
+        // disagree the source is ADMITTED there and NOT REALIZED here, and the pair
+        // surfaces one tier down as `I_StoreValueTypeMismatch` / `H_ArgTypeMismatch`
+        // on legal C.
+        // ✔MEASURED at exactly that state: the roster read
+        // `(isArithmeticCore(ck) && ck != Bool) || ck == Enum || ck == Ptr`, so an
+        // ARRAY (C 6.3.2.1p3 decays it to `&a[0]` first) and a FUNCTION DESIGNATOR
+        // (6.3.2.1p4 decays it to `&fn`) were admitted by `isAssignable` and fell
+        // straight through this arm — `takeBool(z)` and `takeBool(sfn)` failed with
+        // `error[H0003] argument #0 type is not assignable to the callee's
+        // parameter #0`, while gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
+        // (`-std=c23`) compile and run both.
+        // ⇒ `coerceCondition` already owns the whole truth-value vocabulary
+        // (arithmetic, Enum→underlying, FnSig→Ptr decay, Array decay, Ptr null
+        // compare) and RETURNS ITS INPUT UNCHANGED for a kind it cannot convert —
+        // Struct, Union, Void — so deferring to it keeps the genuinely
+        // incompatible sources loud through the fall-through below without this
+        // site restating the roster. `ck != Bool` is the only condition left, and
+        // it is not a roster: an already-Bool child needs no conversion and must
+        // reach `coerce`'s later same-representation retag rather than return here.
+        if (tk == TypeKind::Bool && ck != TypeKind::Bool) {
+            E const asBool = coerceCondition(child, NodeId{});
             if (asBool.type.valid()
                 && interner.kind(asBool.type) == TypeKind::Bool) {
                 // Alias the synthetic truthiness node to the operand's span
@@ -808,8 +856,8 @@ struct Lowerer {
                 return {cast, target};
             }
         }
-        // C 6.7.2.2 enum ↔ int implicit conversion (D-CSUBSET-ENUM-INT-
-        // CONVERSION): an enum HAS an integer type, so a context that mixes
+        // C 6.7.2.2 enum ↔ int implicit conversion (D-CSUBSET-ENUM-INT-CONVERSION):
+        // an enum HAS an integer type, so a context that mixes
         // an enum value with an int (`int x = BLUE;`, `enum Color c = 1;`,
         // a `c += 1` write-back, an enum arg to an int param) materializes
         // a synthetic Cast so the MIR-tier sees a width-exact int↔int move.
@@ -854,6 +902,22 @@ struct Lowerer {
             }
             return {cast, target};
         }
+        // ⚠ THE MIRROR — AN IMPLICIT COMPLEX SOURCE INTO A REAL TARGET — IS
+        // DELIBERATELY ABSENT, AND THE SENTENCE ABOVE SAYING IT "stays a semantic
+        // reject, C99 6.3.1.7" IS THE WRONG REASON FOR THE RIGHT STATE.
+        // D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED.
+        //
+        // C 6.3.1.7p2 makes the conversion implicit (the imaginary part is
+        // discarded) and both references compile and run `double d = z;` — so this
+        // is a KNOWN DIVERGENCE, not a rule. The arm was written and WITHDRAWN the
+        // same day: `src/dss-config/shippedLibs/tgmath.json` borrows its `_Complex`
+        // loudness from this refusal, so admitting it turned `sqrt(z)` under
+        // `<tgmath.h>` from a loud `S_TypeMismatch` into a SILENT wrong answer
+        // (✔MEASURED: DSS returned 0 where gcc, dispatching to `csqrt`, returns 1).
+        // The admission needs the tgmath complex dispatch to have its OWN owner
+        // first — see the long note at the matching arm in
+        // `src/analysis/semantic/type_rules.hpp::isAssignable`, which carries the
+        // full measurement and why a `_Generic` arm cannot substitute.
         // Pointers, structs, FnSig are not coerced implicitly; let the
         // caller decide whether the mismatch is a diagnostic. Arithmetic
         // (int + float kinds — file-scope `isArithmeticCore`) is the
@@ -929,9 +993,15 @@ struct Lowerer {
     //    for a source-level zero in pointer context ("scalar" in C
     //    6.8.4.1 includes pointers). Languages without the rule keep the
     //    pass-through below.
-    //  - everything else (Struct, Array, Enum, FnSig, Void, …) →
+    //  - Enum / FnSig → the C-scalar family's remaining members, each
+    //    PROJECTED onto a kind this function already tests and then
+    //    re-entered (see the arms below). The family's third member,
+    //    `nullptr_t`, never arrives here as itself: it is projected to its
+    //    object representation at the semantic→HIR boundary (`reprOf`) and
+    //    reaches this function already wearing the Ptr arm's shape.
+    //  - everything else (Struct, Union, Void, …) →
     //    UNCHANGED: exactly the prior coerce(_, Bool) pass-through for
-    //    non-arithmetic kinds; the MIR verifier's CondBr-expects-Bool
+    //    non-scalar kinds; the MIR verifier's CondBr-expects-Bool
     //    check remains the loud gate.
     //
     // Replaced `coerce(cond, boolType())` at every condition site
@@ -963,7 +1033,78 @@ struct Lowerer {
         if (!cond.type.valid()) return cond;
         TypeKind const ck = interner.kind(cond.type);
         if (ck == TypeKind::Bool) return cond;
-        if (isArithmeticCore(ck)) {
+        // ★★ D-CSUBSET-VOID-CONTROLLING-EXPRESSION-LEAKS-AN-INTERNAL-ERROR.
+        // C 6.8.4.1p1 / 6.8.5p2 / 6.5.15p2 / 6.5.13p2 / 6.5.14p2: the controlling
+        // (or logical-operand) expression SHALL HAVE SCALAR TYPE, and `void` is not
+        // scalar — it has no value at all (6.3.2.2). gcc 13.3.0 (`-std=c2x`) and
+        // clang 18.1.3 (`-std=c23`), probed SEPARATELY, both REJECT `if (g())` and
+        // `while (g())` for a `void`-returning `g`, so this is NOT a conformance
+        // divergence: DSS refused them too. It refused them WRONGLY, though —
+        // ✔MEASURED through the shipped CLI, both came out as
+        // `error[I_TerminatorTypeMismatch]: mir inst #N: (condbr) …`, an INTERNAL
+        // MIR-verifier assertion with no source position, for a plain user
+        // constraint violation. Fail-loud means a POSITIONED diagnostic; an
+        // internal invariant leaking to the user is a defect even when the verdict
+        // is right, because the user cannot act on it and a maintainer reading it
+        // goes looking for a compiler bug.
+        //
+        // ★ THIS IS THE EXACT SHAPE THIS FUNCTION WAS ALREADY FIXED FOR ONCE, and
+        // the arms below say so: Enum / FnSig conditions fell through UNCHANGED and
+        // hit the same `I_TerminatorTypeMismatch`. The difference is the direction.
+        // Those kinds ARE scalar after a conversion, so the fix owed was a missing
+        // CONVERSION. `void` is not scalar under any conversion, so the fix owed is
+        // a REFUSAL — and it belongs here for the same reason theirs did: this is
+        // the ONE function every controlling-expression site funnels through
+        // (`ifPrologue`, the While / DoWhile / For prologues, `lowerTernary`,
+        // `combineBinary`'s LogicalAnd/LogicalOr arm, and `coerce`'s `_Bool`-target
+        // arm), so one arm here covers `if` / `while` / `do` / `for` / `?:` / `&&`
+        // / `||` at once instead of six edits that can drift apart.
+        //
+        // ⚠ THE MIR VERIFIER'S INVARIANT IS NOT TOUCHED, exactly as the Enum/FnSig
+        // note insists: relaxing the CondBr-expects-Bool check would trade a loud
+        // refusal for a silent miscompile. The refusal simply moves to the tier
+        // that can name the source.
+        //
+        // Same `S_TypeMismatch` code and same sentence as the operator-operand rule
+        // (D-CSUBSET-VOID-VALUE-AS-AN-OPERATOR-OPERAND, semantic tier): one defect
+        // — using a void expression's nonexistent value — keeps ONE code however it
+        // is reached. A discarded void expression is untouched; only a CONDITION
+        // reaches this function.
+        if (ck == TypeKind::Void) {
+            emitH(DiagnosticCode::S_TypeMismatch, anchor,
+                  "an expression of type `void` has no value to use (C 6.3.2.2), "
+                  "and a controlling expression must have scalar type "
+                  "(C 6.8.4.1p1 / 6.8.5p2 / 6.5.15p2): "
+                      + std::string{tree().text(anchor)});
+            return {errorNode(anchor), InvalidType};
+        }
+        // ★★ C 6.2.5: `isArithmeticCore` is the INT+FLOAT core roster, and C's
+        // ARITHMETIC types are that roster PLUS the complex types (6.2.5p11 makes
+        // the complex types floating types, p18 makes the floating types
+        // arithmetic, p21 makes the arithmetic types scalar). A `_Complex`
+        // condition is therefore an ordinary member of the arm below, not a new
+        // kind of test: C 6.8.4.1/6.8.5/6.5.15/6.5.13/6.5.14 all say the
+        // controlling expression "compares unequal to 0", and for a complex that
+        // is the componentwise comparison against `(0, 0)` — the SAME `Ne(x, 0)`
+        // node this arm already builds, whose zero `synthZeroOrError` now mints for
+        // a Complex type and whose lowering `emitComplexEq` realizes.
+        // ⇒ ADMITTED HERE rather than by widening `isArithmeticCore`, which is also
+        // `coerce`'s implicit-conversion gate: Complex is deliberately outside that
+        // roster (a complex↔real conversion is NOT a plain Cast — it constructs or
+        // discards a component, which `coerce`'s own Complex arm materializes), and
+        // widening it would silently admit `double d = z;` that C 6.3.1.7 forbids
+        // implicitly. The truth-value question and the implicit-conversion question
+        // are different questions about the same roster, so only ONE of them moves.
+        // ✔MEASURED before this arm existed (x86_64:pe64-x86_64-windows-exec): five
+        // `I_TerminatorTypeMismatch` on one probe — `if (z)`, `z && x`, `zero || 1`,
+        // `z ? a : b`, `while (z)`, `for (; z; )` — against gcc 13.3.0 (`-std=c2x`)
+        // and clang 18.1.3 (`-std=c23`), probed separately, both compiling and
+        // running every one of them.
+        // ⚠ `integerPromotedType` is a NO-OP on Complex and that is checked, not
+        // assumed: `floatRank(Complex)` is 0, so it reaches `promoteIntegerKind`,
+        // whose `intWidthRank(Complex)` is also 0 — the `r != 0` guard fails and the
+        // kind is returned unchanged, so no promotion Cast is minted.
+        if (isArithmeticCore(ck) || ck == TypeKind::Complex) {
             // c71 (D-CSUBSET-32BIT-ALU-FORMS): a SUB-INT arithmetic condition
             // (a `char`/`signed char`/`short` used as a truth value — sqlite's
             // pervasive `while (*z)`, `if (c)`) must integer-PROMOTE to `int`
@@ -991,6 +1132,123 @@ struct Lowerer {
                           anchor),
                     boolType()};
         }
+        // ★★ THE C SCALAR FAMILY'S REMAINING MEMBERS — Enum and FnSig — each
+        // PROJECTED onto a kind the arms above/below already test, then
+        // re-entered. Anchored as
+        // D-CSUBSET-ENUM-FNSIG-NULLPTR-CONDITIONS-SKIP-THE-TRUTHINESS-CHOKEPOINT
+        // ⓘ The anchor names THREE kinds because it was opened against three. The
+        // third, NullptrT, is no longer handled here: its projection moved OUT of
+        // this function and UP to the semantic→HIR type boundary (`reprOf`), where
+        // it fixes every position at once instead of this one — see the note where
+        // its arm used to sit, below the FnSig arm.
+        //
+        // ★ WHAT WAS WRONG, AND WHY IT WAS ONE DEFECT AND NOT THREE. C 6.8.4.1 /
+        // 6.8.5 / 6.5.15 / 6.5.13 / 6.5.14 all say the SAME thing — the
+        // controlling (or logical-operand) expression "shall have scalar type"
+        // and is compared unequal to 0 — and this function is the ONE place
+        // every one of those sites funnels through (`ifPrologue`, the While /
+        // DoWhile / For prologues, `lowerTernary`, `combineBinary`'s
+        // LogicalAnd/LogicalOr arm, and `coerce`'s `_Bool`-target arm). Scalar
+        // is ARITHMETIC ∪ POINTER (C 6.2.5p21), and the dispatch above covered
+        // only the arith-CORE kinds plus Ptr plus the Array decay — so the three
+        // kinds that are scalar-after-a-conversion fell through the whole
+        // function UNCHANGED and reached `mir.addCondBr` still carrying their
+        // source type. The MIR verifier then fired its CondBr-expects-Bool
+        // invariant (I_TerminatorTypeMismatch; I_NullptrTypeInMir for NullptrT)
+        // ON LEGAL USER INPUT.
+        // ⚠ THE INVARIANT WAS RIGHT AND IS NOT TOUCHED. A front-end conversion
+        // was MISSING; relaxing the terminator check would have traded a loud
+        // refusal for a silent miscompile (a raw Enum/pointer word used as a
+        // branch predicate). The fix is owed HERE, at the conversion.
+        // ✔MEASURED at the defect (297-probe battery, 9 controlling-expression
+        // contexts × 33 scalar shapes, x86_64:pe64-x86_64-windows-exec): 54
+        // I_TerminatorTypeMismatch across five enum shapes (a local, a bare
+        // enumerator, a `const enum`, a call result, an enum-typed BIT-FIELD)
+        // and the function designator, against clang 18.1.3 accepting all 297
+        // and gcc 13.3.0 accepting all but its own missing `_BitInt`. `if (e)`
+        // was refused while `int y = e; if (y)`, `!e` and `e != 0` all worked —
+        // the classic shape of a missing conversion at ONE chokepoint rather
+        // than a missing capability.
+        // ⚠ THE NullptrT ARM IS NARROWER THAN THE OTHER TWO AND SAYS SO: `if
+        // (nullptr)` — the LITERAL — always worked, because the literal is
+        // already an integer zero before this function sees it. What did not
+        // work is a NullptrT-typed VALUE reaching a condition, which is what a
+        // `nullptr_t`-typed OBJECT produces. Recording the narrower true claim
+        // rather than the tidier false one is the point: the first measurement
+        // of this arm conflated the two.
+        //
+        // ★ WHY PROJECT-AND-RE-ENTER RATHER THAN A FOURTH `Ne` SPELLING. Each
+        // arm converts to a kind that is ALREADY handled and recurses, exactly
+        // as the Array arm below does. That keeps ONE construction of the
+        // truthiness test, so the C 6.3.1.1 integer promotion, the FCmpUNE NaN
+        // rule and the null-pointer-constant shape can never drift between
+        // scalar kinds — and a future scalar kind joins by naming its
+        // projection, not by copying a test.
+        //
+        // ★ UNGATED, deliberately, and this is the same division of labour
+        // `coerce`'s Enum↔arith arm already states: the SEMANTIC tier owns
+        // WHETHER a language admits the conversion (`isAssignable`'s
+        // `scalarConvertsToBool` / `enumConvertsToArith` verbs); this tier only
+        // REALIZES what was admitted. Nothing here reads a language identity —
+        // the dispatch is a TypeKind SHAPE predicate, and a language whose
+        // enums are not int-compatible simply never reaches HIR with one in a
+        // condition.
+        //
+        // C 6.2.5p17 + 6.7.2.2: an ENUMERATED type IS an integer type, hence
+        // arithmetic, hence scalar. `isArithmeticCore` excludes Enum on purpose
+        // (Enum is the NOMINAL kind, not an arith-core kind), so the projection
+        // to the underlying integer is explicit — through `enumUnderlyingOrSelf`,
+        // the SAME owner `usualArithmeticCommonType` / `integerPromotedType`
+        // call, so the enum→int projection cannot drift; and through the ONE
+        // `coerce` funnel, whose Enum↔arith arm mints the width-exact synthetic
+        // Cast. Covers every enum shape measured: a variable, a bare enumerator,
+        // a `const enum`, `*p`, a call result, and an enum-typed BIT-FIELD. A
+        // shapeless Enum (empty scalar pool — malformed) leaves `under` equal to
+        // the input and falls through unchanged: it stays loud downstream.
+        if (ck == TypeKind::Enum) {
+            TypeId const under = enumUnderlyingOrSelf(interner, cond.type);
+            if (under.valid() && under.v != cond.type.v) {
+                E const asInt = coerce(cond, under);
+                if (asInt.type.valid() && asInt.type.v == under.v)
+                    return coerceCondition(asInt, anchor);
+            }
+        }
+        // C 6.3.2.1p4: a FUNCTION DESIGNATOR used anywhere but as the operand of
+        // `sizeof`/`_Alignof`/unary `&` is converted to "pointer to function" —
+        // so `if (fn)` / `fn ? a : b` / `fn && x` are legal (gcc warns
+        // -Waddress because the address is never null; the code compiles, and
+        // the always-true truth value is the CORRECT answer). Decays through the
+        // SAME `coerce` FnSig→Ptr funnel the assignment/argument paths use (a
+        // representation-free Bitcast at MIR), then RE-ENTERS so the pointer
+        // takes the null-pointer `Ne` arm below — the Array arm's shape exactly.
+        // ⚠ Note this is the DESIGNATOR (`fn`), not a function POINTER VALUE
+        // (`int (*p)(void)`): the latter is already Ptr and was always handled.
+        if (ck == TypeKind::FnSig) {
+            E const decayed = coerce(cond, interner.pointer(cond.type));
+            if (decayed.type.valid()
+                && interner.kind(decayed.type) == TypeKind::Ptr)
+                return coerceCondition(decayed, anchor);
+        }
+        // ★★ THE THIRD MEMBER — NullptrT — NO LONGER HAS AN ARM HERE, AND ITS
+        // ABSENCE IS THE FIX RATHER THAN A GAP (D-CSUBSET-NULLPTR-T-DECLARABLE).
+        // It used to carry one: C23 6.3.2.4p2 says a `nullptr_t` converts to
+        // `_Bool` as FALSE, so the arm yielded the Bool literal `false` directly,
+        // and that kept the `I_NullptrTypeInMir` invariant true AT THIS ONE
+        // POSITION. The input it handled was a `nullptr_t`-typed OBJECT — and such
+        // an object was refused one tier down anyway (its initializing store was
+        // `I_StoreValueTypeMismatch`, ✔MEASURED P41), so the arm was fixing a
+        // CONDITION for a construct that could not compile at all.
+        // ⇒ The type gap it was patching is now closed AT THE SOURCE: a
+        // `nullptr_t` object's type is projected to its representation (`void *`)
+        // by `reprOf` the moment it crosses out of the semantic tier, so no
+        // NullptrT value reaches ANY position — condition, store, argument,
+        // return, member, element — not merely this one. A NullptrT-typed
+        // condition is therefore unreachable, and an arm no input can reach is
+        // dead code whose red-on-disable can only be vacuous.
+        // ⓘ The RUNTIME ANSWER IS UNCHANGED and still `false`: the projected value
+        // takes the Ptr arm below, whose `Ne(o, (void *)0)` on a type with exactly
+        // one value is false by construction — witnessed end to end by
+        // `examples/c/nullptr_t_object` (the `o ? … : …` bit), debug AND release.
         // c91 (D-CSUBSET-ARRAY-DECAY-IN-CONDITION): an ARRAY condition
         // (`if (arr)`, `ok && arr`, `arr ? a : b`, `if ("x")` —
         // C 6.3.2.1p3 + 6.8.4.1p1) decays to Ptr<elem> via the ONE coerce
@@ -1118,6 +1376,7 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, NoSanitizeThreadAttr>>& nosanthr,
             std::vector<std::pair<HirNodeId, InlineDefinitionAttr>>& inldef,
             std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
+            std::vector<std::pair<HirNodeId, EnclosingFunctionAttr>>& enclFn,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
             std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>>& rtwice,
             std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln,
@@ -1131,7 +1390,7 @@ struct Lowerer {
           linkage(lk), mutability(mut), noInlineAcc(noinl),
           alwaysInlineAcc(alwinl), noOptimizeAcc(noopt),
           noSanitizeThreadAcc(nosanthr), inlineDefinitionAcc(inldef),
-          threadLocalAcc(tls), volatileAcc(vol),
+          threadLocalAcc(tls), enclosingFunctionAcc(enclFn), volatileAcc(vol),
           returnsTwiceAcc(rtwice), alignmentAcc(aln), vlaSizeAcc(vlaSz),
           sizeofVlaSymAcc(sizeofVlaSym), typedefOriginAcc(typedefOrigin),
           synthRecipeAcc(synthRecipe) {
@@ -1228,7 +1487,7 @@ struct Lowerer {
     // the two-answers-one-grammar drift the shared gatherer exists to end.
 
     // ── declaration-specifier prefix (D-DECL-SPECIFIER-PREFIX-SUBSTRATE consumer)
-    // The c-subset's `static`/`__attribute__` prefix rides as an OPTIONAL leading
+    // The c's `static`/`__attribute__` prefix rides as an OPTIONAL leading
     // child of a declaration. CST→HIR resolves positional declaration children
     // via the SHARED strip-aware helpers in `core/types/decl_prefix_strip.hpp`
     // (`declRoleChildren` / `descendVisibleDecl` / `specifierPrefixChild` —
@@ -1446,14 +1705,28 @@ struct Lowerer {
         // inherit the mark). A marked token is skipped for the KEY LOOKUP but
         // stays IN the list — see the flag's use below for why the distinction
         // between "marked" and "removed" is the whole design.
+        //
+        // P42 (D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED):
+        // `fromAttrName` is the SECOND parallel mark and it answers a DIFFERENT
+        // question — "did the DFS reach this token through an ATTRIBUTE
+        // SPECIFIER at all?" — where `fromAttrArg` answers "…through one
+        // attribute clause's ARGUMENT group?". The two are nested, never
+        // interchangeable: every arg token is also an attribute token, and it is
+        // the OUTER mark that separates an attribute NAME (`weak` in
+        // `__attribute__((weak))`) from a bare declaration specifier (`static`
+        // in `static int x;`), which the strict lookup below must tell apart
+        // because ONE config map holds both vocabularies. Marked at the
+        // language's own declared attribute-specifier shapes and inherited
+        // downward, exactly like `inArg`.
         std::vector<NodeId> toks;
         std::vector<char>   fromAttrArg;
+        std::vector<char>   fromAttrName;
         {
-            struct Frame { NodeId n; bool inArg; };
+            struct Frame { NodeId n; bool inArg; bool inAttr; };
             std::vector<Frame> stack;
             stack.reserve(roots.size());
             for (auto it = roots.rbegin(); it != roots.rend(); ++it)
-                if (it->valid()) stack.push_back({*it, false});  // reverse → source order
+                if (it->valid()) stack.push_back({*it, false, false});  // reverse → source order
             while (!stack.empty()) {
                 Frame const f = stack.back();
                 NodeId const n = f.n;
@@ -1461,6 +1734,7 @@ struct Lowerer {
                 if (isToken(n)) {
                     toks.push_back(n);
                     fromAttrArg.push_back(f.inArg ? char{1} : char{0});
+                    fromAttrName.push_back(f.inAttr ? char{1} : char{0});
                     continue;
                 }
                 bool skip = false;
@@ -1498,16 +1772,39 @@ struct Lowerer {
                     f.inArg
                     || (sem.attributeArgRule.valid()
                         && tree().rule(n).v == sem.attributeArgRule.v);
+                // P42: the OUTER attribute mark. `attrSpecRule` / `stdAttrRule`
+                // are the language's OWN declared attribute-specifier shapes —
+                // the same pair the semantic tier's `scanAttributeSemantics`
+                // stops at — so "is this token an attribute name?" is answered
+                // from config, never from a spelling. An INVALID rule marks
+                // nothing, which is exactly the pre-mark behaviour for a
+                // language that declares no attribute surface.
+                // ⓘ MEASURED for the shipped `c`: only the `attrSpecRule`
+                // disjunct can fire, because `topLevelDecl`/`externDecl` list
+                // `stdAttr` in `linkageSpecifierIgnoredRules` and the wholesale
+                // skip above removes that subtree before this line is reached.
+                // The `stdAttrRule` disjunct is kept because taking HALF of a
+                // language's declared attribute vocabulary is the very drift
+                // this change exists to remove — a language that honors linkage
+                // attributes in the `[[…]]` spelling must not silently lose
+                // normalization.
+                bool const childInAttr =
+                    f.inAttr
+                    || (sem.attrSpecRule.valid()
+                        && tree().rule(n).v == sem.attrSpecRule.v)
+                    || (sem.stdAttrRule.valid()
+                        && tree().rule(n).v == sem.stdAttrRule.v);
                 auto const kids = visible(n);
                 for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
-                    stack.push_back({*it, childInArg});   // reverse-push → source order
+                    // reverse-push → source order
+                    stack.push_back({*it, childInArg, childInAttr});
                 }
             }
         }
         // String-literal token kinds (from the language's hirLowering
         // literal config) drive the COMPOSITE form: a specifier identifier
         // immediately followed by a parenthesized string literal forms the
-        // lookup key `<identifier>:<decoded-body>` — c-subset's
+        // lookup key `<identifier>:<decoded-body>` — c's
         // `__attribute__((visibility("hidden")))` resolves the declared
         // facet key "visibility:hidden". Generic: ANY attr-with-string-arg
         // works; an unknown composite fails loud with the composite key.
@@ -1518,7 +1815,7 @@ struct Lowerer {
         // tokens (`(`, opener, body, closer) + `)`, not three. This scan must know
         // the third string piece exactly as it already knows the first two.
         //
-        // ★ Resolved from the SCHEMA, and THIS is the guard. The three c-subset
+        // ★ Resolved from the SCHEMA, and THIS is the guard. The three c
         // `linkageSpecifierIgnoredKinds` rows that also list `StringEnd` are
         // DEFENCE-IN-DEPTH, not the mechanism — keep them (they document the
         // closer's structural role at the config surface, and they are what a
@@ -1569,7 +1866,68 @@ struct Lowerer {
                 // grammar only admits strings inside an attr argument).
                 continue;
             }
-            std::string key{tree().text(n)};
+            // ★★★ P42 — THE ONE PLACE THIS TIER DERIVES A SPECIFIER'S LOOKUP
+            // NAME, and every lookup below reads it. Anchor:
+            // D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED
+            //
+            // ONE map, `linkageSpecifiers`, holds TWO vocabularies that C keeps
+            // apart: DECLARATION-SPECIFIER KEYWORDS (`static`, `constexpr`,
+            // `thread_local`, `_Thread_local`) and GNU ATTRIBUTE NAMES (`weak`,
+            // `visibility`). The dunder equivalence — `__x__` ≡ `x` — is a
+            // property of the ATTRIBUTE-name vocabulary ONLY: `__weak__` IS
+            // `weak`, while `__static__` is not `static` in any dialect. So the
+            // name a token resolves under is derived from its POSITION:
+            //
+            //   * ATTRIBUTE-name position → dunder-normalized, through the ONE
+            //     shared `stripDunder` that the semantic `effects` table, the
+            //     composite packed scan, the preprocessor's `__has_c_attribute`
+            //     and `linkageSpecifierIgnoredNames` all already use. That
+            //     single normalizer is now what this tier's BOTH lookups read,
+            //     so a THIRD lookup added here cannot drift from the other two —
+            //     which is precisely how this defect arose.
+            //   * BARE specifier position → the raw spelling. A keyword has no
+            //     dunder attribute form, and normalizing here would let
+            //     `__attribute__((__static__))` reach `static`'s entry.
+            //
+            // ⚠ AND POSITION ALONE IS NOT ENOUGH — the second clause is the one
+            // that closes a SILENT MISCOMPILE, ✔MEASURED with the shipped CLI at
+            // the pre-change tree: `__attribute__((static)) int gv = 1;`
+            // compiled rc=0 with ZERO diagnostics and emitted `sym_84 d` — the
+            // byte-identical TU-LOCAL symbol `static int gv = 1;` produces —
+            // while `int gv = 1;` emits the exported `gv D`. The name `gv`
+            // simply LEFT the object. Both references were probed separately
+            // and BOTH merely warn and IGNORE the attribute (gcc 13.3
+            // `'static' attribute directive ignored`, clang 18.1.3
+            // `unknown attribute 'static' ignored`), so every other TU in the
+            // program still expects `gv` to be there. ⇒ a KEYWORD-SPELLED
+            // clause name never denotes a linkage specifier: it falls through to
+            // the loud unknown-specifier gate instead of quietly rebinding the
+            // symbol. "Is this spelling a keyword?" is asked of the LANGUAGE's
+            // own lexeme table, so nothing here names `static`.
+            // ⓘ This does NOT disturb `__attribute__((__const__))` — glibc's
+            // 50-occurrence spelling, whose name also lexes as a keyword: the
+            // by-NAME ignore list below runs FIRST and consumes it.
+            std::string_view const rawText  = tree().text(n);
+            bool const inAttrName =
+                i < fromAttrName.size() && fromAttrName[i] != 0;
+            std::string key{inAttrName ? stripDunder(rawText) : rawText};
+            // ⚠ THE KEYWORD TEST ASKS ABOUT THE **DERIVED** NAME, NOT THE RAW
+            // SPELLING, AND THAT IS THE WHOLE POINT — asking about the raw text
+            // is the version of this guard that does NOT work, and it was BUILT
+            // AND MEASURED before this line was written:
+            // `__attribute__((__static__)) int gv;` went rc=1 → **rc=0, silently
+            // internal**, because `__static__` is not itself a declared lexeme
+            // while the `static` it normalizes to is. The dunder spelling is
+            // precisely the disguise the guard has to see through.
+            bool const keywordSpelledAttrName =
+                inAttrName && !tree().schema().lookupLexeme(key).empty();
+            // The spelling to REPORT is the one the user wrote, never the
+            // derived key — a diagnostic that renames the source is a diagnostic
+            // the reader cannot find in the file. It tracks the composite
+            // `<name>:<body>` append below, so for every input that existed
+            // before this change `reported` and `key` are the same string and
+            // no message moves.
+            std::string reported{rawText};
             // FC16 (D-CSUBSET-NORETURN): a specifier IDENTIFIER declared a semantic
             // NO-OP by NAME (`linkageSpecifierIgnoredNames`) is skipped WITHOUT a
             // linkage effect and WITHOUT firing H_UnknownLinkageSpecifier — the
@@ -1631,8 +1989,8 @@ struct Lowerer {
                 if (j + 1 < toks.size()
                     && tree().tokenKind(toks[j]) == strStart
                     && tree().tokenKind(toks[j + 1]) == strBody) {
-                    // C 5.1.1.2 phase 6 adjacent concat (D-CSUBSET-ADJACENT-
-                    // STRING-CONCAT) makes `("a" "b")` grammatically valid here
+                    // C 5.1.1.2 phase 6 adjacent concat (D-CSUBSET-ADJACENT-STRING-CONCAT)
+                    // makes `("a" "b")` grammatically valid here
                     // too, but a CONCATENATED facet key is unreachable in any
                     // real attribute (sqlite uses single-string args only). This
                     // path reads ONE body; rather than SILENTLY DROP a second
@@ -1647,24 +2005,41 @@ struct Lowerer {
                               toks[k2],
                               std::format("adjacent string concatenation in a "
                                           "linkage-specifier argument for '{}' "
-                                          "is not supported", key));
+                                          "is not supported", reported));
                         continue;
                     }
                     auto decoded =
                         decodeStringLiteralBody(tree().text(toks[j + 1]));
                     if (decoded.has_value()) {
-                        key += ':';
-                        key += *decoded;
+                        // P42: the composite separator has ONE owner
+                        // (`kLinkageSpecifierCompositeSeparator`), already read
+                        // by the loader's attribute-vocabulary drift check and
+                        // by the semantic tier's `languageModelsAttributeName`.
+                        // This site WRITES the key those two READ, so a bare
+                        // literal here is the third owner of one fact — the same
+                        // duplicated-truth-table shape as the lookup asymmetry
+                        // this change closes, one character wide.
+                        key      += kLinkageSpecifierCompositeSeparator;
+                        key      += *decoded;
+                        reported += kLinkageSpecifierCompositeSeparator;
+                        reported += *decoded;
                     } else {
                         emitH(DiagnosticCode::H_UnknownLinkageSpecifier,
                               toks[j + 1],
                               std::format("malformed string argument in "
-                                          "specifier '{}'", key));
+                                          "specifier '{}'", reported));
                         continue;
                     }
                 }
             }
-            auto it = decl.linkageSpecifiers.find(key);
+            // P42: a KEYWORD-spelled clause name is DENIED the map entirely —
+            // not merely "looked up and missed" — so that a keyword whose
+            // spelling happens to be a declared linkage specifier cannot bind
+            // through the attribute position. The `end()` seed is the whole
+            // mechanism; the fall-through below then reports it loudly, naming
+            // what the user wrote.
+            auto it = decl.linkageSpecifiers.end();
+            if (!keywordSpelledAttrName) it = decl.linkageSpecifiers.find(key);
             if (it != decl.linkageSpecifiers.end()) {
                 if (it->second.binding) {
                     // ★★ THE BINDING AXIS IS NOT LAST-WINS. Every other axis
@@ -1706,7 +2081,7 @@ struct Lowerer {
                                   "'{}' specifies '{}' binding, which conflicts "
                                   "with the '{}' binding already specified for "
                                   "this declaration",
-                                  key, symbolBindingName(*it->second.binding),
+                                  reported, symbolBindingName(*it->second.binding),
                                   symbolBindingName(attr.binding)));
                         // ★ THE RESIDUE OF A REJECTED CONFLICT IS THE CONFINING
                         // BINDING, and it is NOT "whichever came first". Plain
@@ -1807,7 +2182,7 @@ struct Lowerer {
                                   "'{}' specifies '{}' visibility, which "
                                   "conflicts with the '{}' visibility already "
                                   "specified for this declaration",
-                                  key,
+                                  reported,
                                   symbolVisibilityName(*it->second.visibility),
                                   symbolVisibilityName(attr.visibility)));
                         // ★ THE RESIDUE IS THE CONFINING VISIBILITY — the
@@ -1867,7 +2242,7 @@ struct Lowerer {
                     // rejected visibility must not also DROP an orthogonal axis
                     // the same key might carry: no shipped row pairs
                     // `visibility` with `staticStorage` today, so this is inert
-                    // in c-subset, but a `continue` would make a future pairing
+                    // in c, but a `continue` would make a future pairing
                     // silently lose the storage fact — the exact class this
                     // anchor exists to close.
                 }
@@ -1876,7 +2251,7 @@ struct Lowerer {
             } else {
                 emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
                       std::format("'{}' is not a recognized linkage specifier",
-                                  key));
+                                  reported));
             }
         }
         return attr;
@@ -2165,8 +2540,39 @@ struct Lowerer {
     [[nodiscard]] TypeId voidPtrType() {
         return interner.pointer(interner.primitive(TypeKind::Void));
     }
+    // ★★ THE ONE DOOR FROM THE SEMANTIC TIER'S TYPES INTO THIS TIER
+    // (D-CSUBSET-NULLPTR-T-DECLARABLE).
+    //
+    // Everything below HIR realizes VALUES; the semantic tier reasons about
+    // IDENTITIES. For every type in the lattice but one those are the same thing and
+    // `representationType` hands back the very TypeId it was given — so wrapping a
+    // type-entry point in this call is a provably byte-identical edit for any
+    // program that never mentions `nullptr_t`. C23 §6.2.5's `nullptr_t` is the one
+    // type where they differ: it must stay distinct for `_Generic` and for the
+    // one-way conversion rules, and it must be a plain `void *` from here down,
+    // because MIR's vocabulary refuses the kind outright (`I_NullptrTypeInMir`).
+    //
+    // ⚠ APPLY IT TO TYPES ARRIVING FROM `model`, NEVER TO A TYPE THIS TIER MINTS.
+    // The lowerer's own `interner.primitive(...)` / `pointer(...)` / arithmetic
+    // common types are already representations; the `nullptr` LITERAL is already an
+    // integer zero before it is typed (`lowerLiteral`'s NullptrT arm). The only
+    // NullptrT that can enter is one the semantic tier stamped on a node or wrote
+    // into a symbol record, which is exactly what the two accessors below read.
+    [[nodiscard]] TypeId reprOf(TypeId t) const {
+        return interner.representationType(t);
+    }
+    // The semantic tier's stamp on `n`, projected. Every read of `model.typeAt` in
+    // this file goes through here or through `symTypeOf` — see `reprOf`.
+    [[nodiscard]] TypeId semTypeAt(NodeId n) const {
+        return reprOf(model.typeAt(n));
+    }
+    // A DECLARED type (`SymbolRecord::type`) is projected at its read site with
+    // `reprOf` rather than through a second accessor: those reads all sit beside
+    // reads of OTHER record fields (`isConst`, `isProtoDeclaration`, `asmName`, the
+    // VLA-typedef origin), so a type-only accessor would fetch the record twice and
+    // the two fetches could drift apart.
     [[nodiscard]] TypeId typeAtOr(NodeId n, TypeId fallback) const {
-        TypeId t = model.typeAt(n);
+        TypeId t = semTypeAt(n);
         return t.valid() ? t : fallback;
     }
 
@@ -3175,7 +3581,32 @@ struct Lowerer {
             // `_Generic` surface leaves this invalid and skips it.
             if (cfg.genericRule.valid()
              && tree().rule(c).v == cfg.genericRule.v) {
-                return lowerGeneric(c);
+                return lowerRecordedSelection(c, "_Generic");
+            }
+            // P31: `__builtin_choose_expr` takes the SAME recorded-selection
+            // lowering, because the two constructs differ ONLY in how the
+            // semantic tier picked the winner. A second, near-identical body
+            // here would have been the slow way to grow two owners of "which
+            // sub-expression survives".
+            if (cfg.chooseExprRule.valid()
+             && tree().rule(c).v == cfg.chooseExprRule.v) {
+                return lowerRecordedSelection(c, "__builtin_choose_expr");
+            }
+            // P31 (D-C-GNU-STATEMENT-EXPRESSION): `({ … })` — its children are
+            // STATEMENTS, so it routes to a dedicated lowering for the same
+            // reason sizeof's and `_Generic`'s type children do: the generic
+            // operand descent would try to lower a declaration as a value.
+            if (cfg.stmtExprRule.valid()
+             && tree().rule(c).v == cfg.stmtExprRule.v) {
+                return lowerStatementExpr(c);
+            }
+            // P31: the compile-time-answer operators. Their ENTIRE meaning is a
+            // number the semantic tier computed, so there is no subtree to lower
+            // at all — the operands are type-names and member designators, which
+            // must NEVER be lowered as expressions (the sizeof/`_Generic`
+            // precedent, for the same reason).
+            if (isFoldedConstantRule(tree().rule(c))) {
+                return lowerFoldedConstant(c);
             }
         }
         for (NodeId c : visible(node)) {
@@ -3791,7 +4222,7 @@ struct Lowerer {
     // Shared callee-signature resolution (FC4 c2, plan-lock MUST-FIX 3):
     // a callee expression carries either the FnSig directly (a direct /
     // paren-wrapped designator) or `Ptr<FnSig>` (a function-pointer
-    // value — the canonical c-subset fn-ptr type). Unwrap ONE pointer
+    // value — the canonical c fn-ptr type). Unwrap ONE pointer
     // level, mirroring hir_verifier.cpp's checkCallArguments. Feeds
     // BOTH call arms' param COERCION + inferred result type — without
     // it, indirect-call arguments would silently skip coercion (the
@@ -4373,7 +4804,7 @@ struct Lowerer {
         // so it is a true pointer DIFFERENCE `p - q` (ptrdiff_t), not the p±n
         // index path. c59 deferred this (its array-decay fires only when the
         // OTHER operand is a SCALAR index; here the other is a Ptr or Array).
-        // sqlite vdbeSorter `(u8)(pTask - pSorter->aTask)` (sqlite3.c:107252) —
+        // sqlite vdbeSorter `(u8)(pTask - pSorter->aTask)` (sqlite3.c) —
         // without it the un-decayed Array RHS made ptrIntArith true → the MIR
         // `p±n` branch tried to widen the Array index via mapCast(Array,I64) →
         // MirOpcode::Invalid → an addInst ABORT (a compiler crash). Covers
@@ -4387,7 +4818,7 @@ struct Lowerer {
             // Decay ONLY when the element/pointee types MATCH (a true pointer
             // difference). A MISMATCHED pairing (`int* - char[]`, which gcc
             // rejects) is left UN-decayed → it stays an Array index → the MIR p±n
-            // widen hits the c65 fail-loud guard (hir_to_mir.cpp:1208), so it
+            // widen hits the c65 fail-loud guard in `hir_to_mir.cpp`, so it
             // fails LOUD (a clean diagnostic) rather than silently miscomputing
             // the array's address as an index — WITHOUT this match-guard the
             // decayed-but-mismatched `int* - char*` is non-ptrSub → it slips into
@@ -4426,7 +4857,7 @@ struct Lowerer {
         // → the BinaryOp mis-typed as the array → a downstream `*(array+i)` Deref came
         // out TYPELESS (H0001 Deref-unresolved + H0009 lvalue-classify on the
         // assignment-LHS form — sqlite `AtomicStore(aReadMark+i,…)`). Reuses the SAME
-        // coerce array-decay as the cast path (cst_to_hir.cpp:4299). GUARD: decay an
+        // coerce array-decay as the usual-arithmetic-conversions arm above. GUARD: decay an
         // array ONLY when the OTHER operand is a scalar index (non-Array AND non-Ptr)
         // — so `array - array` / `p - arrayName` stay on the deferred pointer-DIFF
         // path (D-CSUBSET-POINTER-DIFF-EDGE-CASES) and `array + ptr` (no C meaning) is
@@ -4673,10 +5104,29 @@ struct Lowerer {
         // the unary + ... shall have arithmetic type" (this is STRICTER than unary
         // `-`, which has no such gate today; `+` gets it because the identity fold
         // would otherwise silently pass a pointer value straight through).
+        // ★ COMPLEX IS ARITHMETIC TOO, AND `isArithmeticCore` IS THE INT+FLOAT
+        //   CORE ROSTER, NOT C'S DEFINITION OF ARITHMETIC.
+        // D-CSUBSET-COMPLEX-UNARY-PLUS-REFUSED. C 6.2.5p11 puts the complex types
+        // inside the FLOATING types and p18 therefore makes them arithmetic, so
+        // `+z` satisfies 6.5.3.3p1 exactly as `-z` does — and `-z` has worked since
+        // FC17.9(f). ✔MEASURED 2026-08-27 (x86_64:pe64-x86_64-windows-exec,
+        // binaries RUN): `+z` on a `(3,4)` complex was
+        // `error[H0009] operand of unary '+' must have arithmetic type` while `-z`
+        // on the SAME value compiled and ran; gcc 13.3.0 (`-std=c2x`) and clang
+        // 18.1.3 (`-std=c23`), probed SEPARATELY, both compile and run `+z`.
+        // ⚠ THE IDENTITY FOLD IS CORRECT FOR A COMPLEX AND THAT IS CHECKED, NOT
+        // ASSUMED: `+` yields the value unchanged with no node minted, so the
+        // by-address complex operand travels exactly as it arrived — there is no
+        // scalar Load to get wrong, which is the failure mode the `Not` arm hit
+        // (`D-CSUBSET-COMPLEX-LOGICAL-NOT-AND-BOOL-CAST-SILENT-MISCOMPILE`) and
+        // the reason this arm is widened rather than given its own materializer.
+        // ⓘ The GATE ITSELF STAYS — a Ptr/struct/union operand still fails loud,
+        // which is the whole reason `+` carries a check `-` does not.
         if (e.target == "Pos") {
             TypeKind const otk = operand.type.valid()
                 ? interner.kind(operand.type) : TypeKind::Void;
-            if (!isArithmeticCore(otk) && otk != TypeKind::Enum) {
+            if (!isArithmeticCore(otk) && otk != TypeKind::Enum
+                && otk != TypeKind::Complex) {
                 unsupported(node, "operand of unary '+' must have arithmetic type");
                 return {errorNode(node, operand.type), operand.type};
             }
@@ -5183,7 +5633,7 @@ struct Lowerer {
                 rest.push_back(c);
             }
         }
-        // Locate the field-name token inside the follower subtree (c-subset's
+        // Locate the field-name token inside the follower subtree (c's
         // `memberFollower = {sequence: [Identifier]}`). Robust against a future
         // schema that wraps the name: scan for a real token first, fall back to
         // the first visible child if the follower is all Internal.
@@ -5210,8 +5660,8 @@ struct Lowerer {
             return std::nullopt;
         // Field type: prefer the semantic-phase-propagated type on the field-name
         // node; fall back to the symbol record's type.
-        TypeId fieldType = model.typeAt(fieldNameN);
-        if (!fieldType.valid()) fieldType = frec->type;
+        TypeId fieldType = semTypeAt(fieldNameN);
+        if (!fieldType.valid()) fieldType = reprOf(frec->type);
         return ResolvedMember{frec, frec->fieldIndex, fieldType};
     }
 
@@ -5302,7 +5752,7 @@ struct Lowerer {
                                                "SymbolId has no record");
                     }
                     TypeId const hopType =
-                        volatileQualifiedAccess(arec->type, containerType);
+                        volatileQualifiedAccess(reprOf(arec->type), containerType);
                     object = track(builder.makeMemberAccess(
                                        object, arec->fieldIndex, hopType,
                                        HirFlags::Synthetic),
@@ -5562,8 +6012,9 @@ struct Lowerer {
             // body. It reuses the FILE-scope externDecl lowering WHOLESALE:
             // `lowerExternDeclInto` mints N ExternFunction/ExternGlobal HIR nodes (one
             // per declarator) AND records each import row. We route EACH node to the
-            // module-decls accumulator (the D-CSUBSET-LOCAL-STATIC / D-CSUBSET-BLOCK-
-            // SCOPE-PROTOTYPE pattern) — NEVER a statement-position push (lowerStmtNode
+            // module-decls accumulator (the D-CSUBSET-LOCAL-STATIC /
+            // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE
+            // pattern) — NEVER a statement-position push (lowerStmtNode
             // has no ExternFunction/ExternGlobal arm → it would fail-loud) — and lower
             // the STATEMENT itself to a no-op (an empty Block, the `Skip` precedent
             // below), since the extern emits no code in the body. Pass-1 bound each
@@ -5604,8 +6055,9 @@ struct Lowerer {
                 // D-CSUBSET-EXTERN-MULTI-DECLARATOR: a block-scope extern lowers to N
                 // ExternGlobal/ExternFunction nodes (one per declarator, or none when
                 // absorbed). They carry no runtime code, so route EACH to the module-
-                // decls accumulator (the D-CSUBSET-LOCAL-STATIC / D-CSUBSET-BLOCK-
-                // SCOPE-PROTOTYPE pattern — a statement-position push would fail loud
+                // decls accumulator (the D-CSUBSET-LOCAL-STATIC /
+                // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE
+                // pattern — a statement-position push would fail loud
                 // in lowerStmtNode, which has no Extern* arm) and lower the STATEMENT
                 // to a no-op empty Block (the Skip precedent).
                 std::vector<HirNodeId> externs;
@@ -5660,7 +6112,7 @@ struct Lowerer {
             // ★ UNREACHABLE-FROM-THE-DRIVER IS NOT UNREACHABLE. ✔MEASURED that the
             // semantic gate holds — `compile_pipeline.cpp` and `c_header_parser.cpp`
             // both bail on `hasErrors()` before lowering — but a THIRD caller,
-            // `tests/mir/test_mir_lowering_c_subset.cpp`'s `lowerCSubset`, calls
+            // `tests/mir/test_mir_lowering_c.cpp`'s `lowerC`, calls
             // `lowerToHir` with NO such guard, deliberately, so a lowering bug
             // cannot hide behind a semantic diagnostic. That is why the refusals
             // here are real diagnostics rather than assertions, and why they stay
@@ -5794,6 +6246,24 @@ struct Lowerer {
                                     // register. No class to record, and recording a
                                     // default one would claim a register binding
                                     // this constraint never asked for.
+                                    // ★★★ BUT THE FORM **IS** A RESOLUTION AND IS
+                                    // CARRIED AS ONE. This arm used to be a bare
+                                    // `break`, which left a DECLARED letter looking
+                                    // exactly like an UNDECLARED one to every tier
+                                    // below — and the tier that refuses said so, in
+                                    // those words, about a letter the target
+                                    // declares (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED).
+                                    // ⚠ GUARDED ON `has_value()` LIKE ITS TWO
+                                    // SIBLINGS, and here the guard is not
+                                    // ceremonial: `OperandKindFilter::Reg` is 0, so
+                                    // an unguarded copy of a disengaged payload
+                                    // would publish "binds a register form" as a
+                                    // measurement.
+                                    if (c->operandKind.has_value()) {
+                                        rec.operandKindResolved = true;
+                                        rec.operandKind = static_cast<std::uint8_t>(
+                                            *c->operandKind);
+                                    }
                                     break;
                             }
                         }
@@ -6353,6 +6823,32 @@ struct Lowerer {
         if (!lhsN.valid() || !rhsN.valid())  // malformed (parse-recovery) node — never abort
             return reportedError(binNode, "malformed assignment expression");
         E const lhs = lowerExpr(lhsN);
+        // ★★ THE STATEMENT PATH HAD NO LVALUE-SHAPE GUARD EITHER, AND THIS IS THE
+        //    ONE `8 = 5;` ACTUALLY TAKES.
+        // D-CSUBSET-ASSIGNMENT-TO-A-NON-LVALUE-REFUSED-BY-THE-LOWERING-TIER.
+        //
+        // `lowerAssign` lowered the left operand as an ordinary expression and
+        // built an `AssignStmt` around whatever came back, so C 6.5.16p2 was never
+        // asked. The refusal then happened three tiers later, in MIR's
+        // `lowerLvalueAddress`, as a message about the NODE KIND that arrived.
+        // ✔MEASURED 2026-08-27 on x86_64:pe64-x86_64-windows-exec — all refused,
+        // so never a miscompile, and all three wrong about why: `8 = 5;` gave
+        // `H_UnsupportedLoweringForKind: string-literal materialization … not a
+        // string arm` (a message about STRING literals, for an integer one),
+        // `(a+b) = 5;` gave `lvalue kind 'BinaryOp' (ordinal 30)` and `f() = 5;`
+        // gave `'Call' (ordinal 27)` — raw internal ordinals. gcc 13.3.0
+        // (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed SEPARATELY, both say
+        // "lvalue required as left operand of assignment" / "expression is not
+        // assignable" at the user's own token.
+        // ⓘ `const int x; x = 5;` is a DIFFERENT gap — the `Ref` is addressable
+        // and passes this test — still open as [[D-CSUBSET-INCDEC-CONST-LVALUE]].
+        if (lhs.type.valid() && !loweredNodeIsAddressable(lhs.id)) {
+            emitH(DiagnosticCode::S_AssignNeedsModifiableLvalue, lhsN,
+                  "the left operand of an assignment must be a modifiable lvalue "
+                  "(C 6.5.16p2); gcc 13.3.0 and clang 18.1.3 both refuse this "
+                  "(D-CSUBSET-ASSIGNMENT-TO-A-NON-LVALUE-REFUSED-BY-THE-LOWERING-TIER)");
+            return errorNode(binNode);
+        }
         // D5.3 cycle 1b.4: `s = {.x = 1};` lowers via the same helper
         // as VarDecl init / return — push the LHS type as the brace-
         // init's context type. Assignment is asymmetric (rhs coerces
@@ -6366,7 +6862,7 @@ struct Lowerer {
     // READ MORE THAN ONCE with no observable effect, which is what lets
     // compound-assignment and ++/-- lower by duplicating it. Returns (symbol,
     // type); nullopt for a complex lvalue (index / deref / call — those would
-    // need once-only evaluation HIR can't express, and c-subset can't form them).
+    // need once-only evaluation HIR can't express, and c can't form them).
     [[nodiscard]] std::optional<std::pair<SymbolId, TypeId>> simpleLvalue(NodeId exprCst) {
         NodeId core = peelToCore(exprCst);
         if (tree().kind(core) != NodeKind::Internal || tree().rule(core).v != cfg.operandRule.v)
@@ -6441,24 +6937,35 @@ struct Lowerer {
     // lowering's `scaleIndexToBytes`→`Gep` path (the SAME element scaling `p[1]`
     // uses; HIR→MIR hir_to_mir.cpp Index arm — no MIR change). `makeIndex` carries
     // the ELEMENT type T; `makeAddressOf` re-types the scaled Gep as `Ptr<T>` = the
-    // new pointer value. A `void*` (pointee Void) / function-pointer (pointee
-    // FnSig) element has no defined sizeof — the existing `scaleIndexToBytes`
-    // ALREADY fails loud there; an early guard here gives a clearer, positioned
-    // diagnostic. The shared single source for the pointer step at all THREE
+    // new pointer value. The shared single source for the pointer step at all THREE
     // ++/-- sites (lowerPostfix value-post, lowerIncDecStmt stmt, lowerPreIncDec
     // value-pre). Returns the new Ptr<T> value (or an error node).
+    //
+    // ★ A `void *` / function-pointer element is NOT special-cased here, and the
+    // DELETION of the guard that used to do so is load-bearing
+    // (D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED, P42). That guard was an early
+    // kind test — `pk == Void || pk == FnSig` → refuse — whose own comment admitted
+    // what it was: *"the existing `scaleIndexToBytes` ALREADY fails loud there; an
+    // early guard here gives a clearer, positioned diagnostic."* A nicety layered
+    // on top of the real decision point. The moment the DIALECT declares an operand
+    // size for those kinds (GNU C: 1 — gcc 13.3.0 and clang 18.1.3 both compile and
+    // RUN `p++` on a `void *`, probed SEPARATELY), a hard-coded kind test with no
+    // config input stops being a nicety and starts OVERRIDING the dialect: `p + 1`
+    // would compile while `p++`, `++p` and `--p` refused, which is a
+    // self-contradictory compiler. Teaching it to read the config instead would
+    // have created a SECOND owner of one question — the exact defect being closed.
+    // So the stride, INCLUDING its refusal, is owned by `scaleIndexToBytes` alone:
+    // a schema declaring no operand size still fails loud there, one tier lower and
+    // with a slightly less precise position, which is the whole price.
+    //   ⚠ Its message was wrong twice over, and worth recording: *"C 6.5.6 forbids
+    // pointer arithmetic on it"* cites the standard CORRECTLY and then draws the
+    // conclusion the `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` bar forbids — ISO C does
+    // forbid it, and that settles nothing when both references implement it.
     [[nodiscard]] HirNodeId pointerIncDecStep(Lvalue const& lv, bool inc, NodeId anchor) {
         // lv.type is Ptr<T>; extract the pointee T.
         auto const ops = interner.operands(lv.type);
         TypeId const pointee = ops.empty() ? InvalidType : ops[0];
         if (!pointee.valid()) return errorNode(anchor);
-        TypeKind const pk = interner.kind(pointee);
-        if (pk == TypeKind::Void || pk == TypeKind::FnSig) {
-            emitH(DiagnosticCode::H_UnsupportedLoweringForKind, anchor,
-                  "++/-- on a pointer whose pointee has no size (void* / "
-                  "function pointer) — C 6.5.6 forbids pointer arithmetic on it");
-            return errorNode(anchor);
-        }
         HirNodeId const baseRead = lvRead(lv);                 // the current Ptr<T>
         HirNodeId const step     = synthPtrStep(inc);          // ±1 (I64)
         HirNodeId const idx =
@@ -6526,13 +7033,7 @@ struct Lowerer {
         // reconstruction so a bit-field inc/dec is a read-modify-write.
         if (auto m = classifyMemberLvalue(core)) return m;
         E target = lowerExpr(core);
-        // An addressable lvalue lowers to Deref (`*p`), Index (`a[i]`), or
-        // MemberAccess (`s.f`/`s->f`). Anything else — Literal, BinaryOp, UnaryOp,
-        // Call, Cast, SeqExpr — is an rvalue with no modifiable object.
-        HirKind const k = target.id.valid() ? builder.kind(target.id) : HirKind::Error;
-        bool const addressable = (k == HirKind::Deref || k == HirKind::Index
-                                  || k == HirKind::MemberAccess);
-        if (!target.type.valid() || !addressable) {
+        if (!target.type.valid() || !loweredNodeIsAddressable(target.id)) {
             emitH(DiagnosticCode::S_IncDecNeedsModifiableLvalue, anchor,
                   "operand of ++/-- is not a modifiable lvalue (C 6.5.2.4 / 6.5.3.1)");
             return std::nullopt;
@@ -6623,6 +7124,40 @@ struct Lowerer {
             else                               v.value = std::uint64_t{0};
             return builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
         }
+        // C99 _Complex (D-CSUBSET-COMPLEX): the zero of a complex is `(0, 0)`, and
+        // it is minted as `Cast(<element zero> -> Complex)` rather than as a
+        // Complex-typed LITERAL. Two reasons, and the first is correctness:
+        //   • A complex is MEMORY-RESIDENT — it has no bare SSA value — so a
+        //     Complex-typed Literal has no MIR realization at all (the by-address
+        //     router recognizes BinaryOp / UnaryOp / Cast, and — for a wide
+        //     `_BitInt` only — Literal). Falling through to the scalar tail below
+        //     would have produced exactly that unrealizable node, tagged with a
+        //     `uint64_t` payload for a type whose components are floats.
+        //   • `Cast(real -> complex)` is ALREADY the shape `coerce`'s Complex arm
+        //     mints for `_Complex double z = 0.0;`, and `materializeComplexCast`
+        //     already realizes it as `(convert(v), 0)`. Reusing it means the zero a
+        //     truth test compares against is built by the same code that builds
+        //     every other real→complex promotion — one owner, not two.
+        // Reached from `coerceCondition`'s arithmetic arm (`if (z)` → `Ne(z, 0)`).
+        // ⚠ The element is read through `operands()`, NOT through
+        // `TypeInterner::complexElement`: that accessor `latticeFatal`s on an
+        // elementless Complex, which would ABORT the compiler where every sibling
+        // arm here reports and continues. A malformed type must stay LOUD, not
+        // fatal. And the element TypeId is copied OUT before the recursion, which
+        // may intern and invalidate the span — see
+        // D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD;
+        // the Array arm below copies `elemT` for the same reason.
+        if (core == TypeKind::Complex) {
+            auto const ops = interner.operands(type);
+            if (ops.empty()) {
+                return reportedError(at,
+                    "synthZero reached a malformed Complex type "
+                    "(no element operand)");
+            }
+            TypeId const elem = ops[0];
+            HirNodeId const elemZero = synthZeroOrError(at, elem);
+            return builder.makeCast(elemZero, type, HirFlags::Synthetic);
+        }
         if (core == TypeKind::Array) {
             auto const ops   = interner.operands(type);
             auto const scals = interner.scalars(type);
@@ -6633,10 +7168,35 @@ struct Lowerer {
             }
             TypeId const elemT = ops[0];
             auto   const len   = scals[0];
+            // ★★ D-HIR-SENTINEL-ARRAY-LENGTH-EXPANDED-AS-A-COUNT — the twin of the
+            // `initSlotAsAggregate` guard. `scalars()` is `std::int64_t`, so the two
+            // negative sentinels arrive here as lengths: `kIncompleteArrayLength`
+            // (-1) and `kVlaLength` (-2). Unguarded, `reserve(static_cast<size_t>
+            // (len))` asks for 2^64-1 elements and THROWS `std::length_error` — the
+            // compiler terminates, which is the one outcome worse than a wrong
+            // answer. ✔MEASURED at 8cb9afbd on `struct S { int n; char c[]; };
+            // struct S s = {};`, a program both references compile.
+            //   BOTH sentinels mean ZERO statically-known elements, and that is the
+            // right answer for each, for DIFFERENT reasons:
+            //   • INCOMPLETE (`[]`, a flexible array member): C 6.7.2.1p18 gives the
+            //     tail no storage in `sizeof`, so an all-zero object has nothing to
+            //     write there. gcc and clang agree — `sizeof(struct S)` is 4 and the
+            //     initializer is legal.
+            //   • VLA (`[n]`): the element count is a RUN-TIME value, so no static
+            //     child list can represent it. The empty `ConstructAggregate` is a
+            //     TYPED marker meaning "zero this whole object"; the MIR VarDecl arm
+            //     recognises it by TYPE (D-CSUBSET-VLA-INITIALIZER) and expands it
+            //     into a runtime byte loop over the object's real size. ⚠ IF THAT
+            //     ARM IS EVER REMOVED THIS BECOMES A SILENT NO-OP — an uninitialized
+            //     VLA where C23 6.7.10p4 promises zeros — which is why the MIR side
+            //     fails loud rather than falling through when it cannot size the
+            //     object.
             std::vector<HirNodeId> children;
-            children.reserve(static_cast<std::size_t>(len));
-            for (std::uint32_t i = 0; i < len; ++i) {
-                children.push_back(synthZeroOrError(at, elemT));
+            if (len > 0) {
+                children.reserve(static_cast<std::size_t>(len));
+                for (std::int64_t i = 0; i < len; ++i) {
+                    children.push_back(synthZeroOrError(at, elemT));
+                }
             }
             return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
         }
@@ -6675,7 +7235,7 @@ struct Lowerer {
     // D5-FU3: peel wrapper-rule layers off `n` UNTIL reaching one of the
     // recognized designator-leaf rules (designatedFieldRule /
     // designatedIndexRule), or until no more sole-meaningful descents
-    // are possible. The c-subset grammar's `designator: alt[...]` parses
+    // are possible. The c grammar's `designator: alt[...]` parses
     // to an auto-interned alt-wrapper whose rule isn't either leaf rule;
     // callers that need to recognize a designator-leaf in initElement
     // position use this peel rather than `peelToCore` (which over-peels
@@ -6758,7 +7318,7 @@ struct Lowerer {
     // outer `typeRefAllowingStruct` wrapper — so recursively probe the
     // subtree until a stamped type is found.
     [[nodiscard]] TypeId resolveStampedTypeBelow(NodeId n) const {
-        if (TypeId t = model.typeAt(n); t.valid()) return t;
+        if (TypeId t = semTypeAt(n); t.valid()) return t;
         if (tree().kind(n) != NodeKind::Internal) return InvalidType;
         for (NodeId c : visible(n)) {
             if (TypeId t = resolveStampedTypeBelow(c); t.valid()) return t;
@@ -6900,7 +7460,7 @@ struct Lowerer {
             && tree().rule(form).v == sem.sizeofValueRule.v;
         if (valueForm) {
             for (NodeId c : visible(form)) {
-                if (TypeId t = model.typeAt(c); t.valid()) { sized = t; break; }
+                if (TypeId t = semTypeAt(c); t.valid()) { sized = t; break; }
             }
             if (!sized.valid()) {
                 return exprError(node,
@@ -6947,18 +7507,64 @@ struct Lowerer {
         return {so, u64};
     }
 
-    // C11/C23 6.5.3.4: `_Alignof ( type-name )` | `alignof ( type-name )` → core
-    // `HirKind::AlignOf`, result type size_t (U64). An ADDITIVE mirror of
-    // `lowerSizeof` reading ALIGNMENT instead of size. TYPE-NAME FORM ONLY (no
-    // value form): the operand is ALWAYS the castTypeRef, whose semantic-stamped
-    // type this recovers via the SAME `resolveStampedTypeBelow` descent sizeof
-    // uses (past any wrapper), then emits the leaf. The operand is UNEVALUATED —
-    // only its type reaches the node; the AlignOf folds to that type's alignment
-    // via the `type_layout` engine at MIR lowering.
+    // C11/C23 6.5.3.4: `_Alignof ( type-name )` | `_Alignof unary-expression` →
+    // core `HirKind::AlignOf`, result type size_t (U64). An ADDITIVE mirror of
+    // `lowerSizeof` reading ALIGNMENT instead of size — including WHICH READ each
+    // form gets, which is the half that is easy to get wrong. The operand is
+    // UNEVALUATED (C 6.5.3.4p1) — only its type reaches the node; the AlignOf
+    // folds to that type's alignment via the `type_layout` engine at MIR lowering.
+    //
+    // ★ [[D-CSUBSET-ALIGNOF-VALUE-OPERAND]] (2026-08-24): the node handed here is
+    // the `alignofExpr` WRAPPER (the config's `alignofRule`), so the form has to
+    // be identified before its operand can be read — and the two forms need
+    // DIFFERENT reads:
+    //   * TYPE form → `resolveStampedTypeBelow` DESCENDS, because the stamp
+    //     legitimately lives on a leaf token under the (unstamped) type-ref.
+    //   * VALUE form → the DIRECT stamp on the operand node, and NEVER a descent.
+    //     This is [[D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK]] inherited, not
+    //     re-derived: a descent past an unstamped operator node lands on a CHILD's
+    //     stamp, so `__alignof__(*p)` would read `p`'s POINTER alignment and
+    //     `__alignof__(a[0])` the ARRAY's — a plausible wrong number, never a
+    //     refusal. An untyped value operand is a semantic-tier failure and FAILS
+    //     LOUD here rather than being guessed at one level down.
+    //
+    // ⚠★ THIS READ IS DEFENCE-IN-DEPTH, NOT THE GUARD, AND SAYING SO IS THE
+    // POINT — an earlier draft of this comment claimed it WAS the guard and a
+    // mutant refuted that. ✔MEASURED 2026-08-24 (P31 red-on-disable M2): swapping
+    // the direct read back to `resolveStampedTypeBelow` and rebuilding
+    // (`libdsscp.dll` md5 57bae630… → 6fddde1f…, so the mutant really was
+    // compiled in) left the WHOLE scoped suite GREEN, `examples/c/gnu_alignof_value_operand`
+    // included. The reason is that Pass 2's `alignofValueRule` arm STAMPS the
+    // operand node, so the descent finds that stamp immediately and never gets
+    // the chance to go looking at a child. ✔MEASURED in the same pass (M2b) that
+    // deleting THAT STAMP reddens the example — with this refusal, `H0009`, not
+    // with a wrong number. So: the STAMP is the guard, this read is what turns
+    // its absence into a build failure instead of a guess, and the two together
+    // are what make a missing type impossible to mistake for a small one.
     [[nodiscard]] E lowerAlignof(NodeId node) {
-        TypeId sized = InvalidType;
+        NodeId form{};
         for (NodeId c : visible(node)) {
-            if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
+            if (tree().kind(c) == NodeKind::Internal) { form = c; break; }
+        }
+        NodeId const scan = form.valid() ? form : node;
+        TypeId sized = InvalidType;
+        bool const valueForm =
+            form.valid() && sem.alignofValueRule.valid()
+            && tree().rule(form).v == sem.alignofValueRule.v;
+        if (valueForm) {
+            for (NodeId c : visible(form)) {
+                if (TypeId t = semTypeAt(c); t.valid()) { sized = t; break; }
+            }
+            if (!sized.valid()) {
+                return exprError(node,
+                    "_Alignof value-operand was not typed by the semantic analyzer "
+                    "(refusing to descend into a sub-expression and silently "
+                    "report the wrong operand's alignment)");
+            }
+        } else {
+            for (NodeId c : visible(scan)) {
+                if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
+            }
         }
         if (!sized.valid()) {
             return exprError(node, "_Alignof operand did not resolve to a type");
@@ -7074,18 +7680,25 @@ struct Lowerer {
     // analyzer already errored — fail loud here (never a silent mis-lower). The
     // NON-selected associations' expressions are discarded WITHOUT being lowered,
     // so a non-selected branch imposes no lowering-tier constraint (6.5.1.1p3).
-    [[nodiscard]] E lowerGeneric(NodeId node) {
+    // ★ P31: RENAMED FROM `lowerGeneric` AND SHARED, rather than copied. The body
+    // never knew anything about `_Generic` — it reads a NodeId the semantic tier
+    // recorded and lowers that sub-expression — so `__builtin_choose_expr`, whose
+    // only difference is that the winner was picked by an integer constant instead
+    // of a type match, routes here unchanged. `what` names the construct so the
+    // refusal message stays specific; that string is the ONLY thing that differs
+    // between the two callers, which is the measure of how much of this is shared.
+    [[nodiscard]] E lowerRecordedSelection(NodeId node, char const* what) {
         NodeId const selected = model.selectedGenericExpr(node);
         if (!selected.valid()) {
-            // The analyzer left this `_Generic` unselected (a constraint violation
-            // it already reported — S_GenericSelectionNoMatch / Ambiguous — or a
-            // cascade from an un-typeable controlling expression). Emit a loud HIR
-            // error so the failure is never silent even if the semantic diagnostic
-            // were suppressed; both selection-failure codes are unsuppressable.
-            return exprError(node,
-                "_Generic did not select an association (no matching type and no "
-                "default, an ambiguous match, or an un-typeable controlling "
-                "expression)");
+            // The analyzer recorded no winner — a constraint violation it already
+            // reported (S_GenericSelectionNoMatch / Ambiguous /
+            // S_BuiltinChooseExprNonConstant) or a cascade from an un-typeable
+            // operand. Emit a loud HIR error so the failure is never silent even
+            // if the semantic diagnostic were suppressed.
+            return exprError(node, std::format(
+                "{} did not select a sub-expression (no matching type and no "
+                "default, an ambiguous match, a non-constant condition, or an "
+                "un-typeable operand)", what));
         }
         // Lower ONLY the selected association's assignment-expression; its result
         // (id + type) IS the generic selection's result. `track` re-anchors the
@@ -7093,6 +7706,48 @@ struct Lowerer {
         E const chosen = lowerExpr(selected);
         if (!chosen.type.valid()) return chosen;   // diagnostic already emitted
         return {track(chosen.id, node), chosen.type};
+    }
+
+    // P31: does this rule lower to the semantic tier's recorded compile-time
+    // value? A linear scan of a list that holds 2 entries in the shipped C
+    // document and none in any other language.
+    [[nodiscard]] bool isFoldedConstantRule(RuleId rule) const {
+        for (RuleId r : cfg.foldedConstantRules) {
+            if (r.valid() && r.v == rule.v) return true;
+        }
+        return false;
+    }
+
+    // ── P31: `__builtin_offsetof(T, m)` / `__builtin_types_compatible_p(A, B)` ──
+    // The whole node IS a number, computed once by the semantic tier (which owns
+    // the type resolver and the target's layout engine) and read back here. The
+    // children are NEVER lowered: a type-name and a member designator are not
+    // expressions, and lowering them would resolve a member name in the wrong
+    // namespace — the `sizeof` / `va_arg` / `_Generic` precedent exactly.
+    //
+    // ⚠ A MISSING RECORDED VALUE IS A HARD REFUSAL, NOT A ZERO. `offsetof` feeds
+    // pointer arithmetic, so a fabricated 0 is a wrong ADDRESS: a program that
+    // builds, runs, and reads the wrong field. The semantic tier already reported
+    // WHY (S_OffsetofInvalidMember / S_UnknownType); this refusal exists so the
+    // build still fails even if that diagnostic were suppressed.
+    [[nodiscard]] E lowerFoldedConstant(NodeId node) {
+        TypeId const type = typeAtOr(node, InvalidType);
+        if (!type.valid()) {
+            return exprError(node,
+                "a compile-time builtin was not typed by the semantic analyzer");
+        }
+        auto const v = model.foldedConstantAt(node);
+        if (!v.has_value()) {
+            return exprError(node,
+                "a compile-time builtin did not fold to a value (refusing to "
+                "substitute a zero, which for an offset would be a wrong address "
+                "rather than a failed build)");
+        }
+        HirLiteralValue lit;
+        lit.core  = interner.kind(type);
+        lit.value = *v;
+        return {track(builder.makeLiteral(type, literals.add(std::move(lit))), node),
+                type};
     }
 
     // FC2: explicit cast `(T)expr` (`hirLowering.castRule`). The grammar
@@ -7170,6 +7825,99 @@ struct Lowerer {
             auto const elems = interner.operands(operand.type);
             if (!elems.empty()) {
                 operand = coerce(operand, interner.pointer(elems[0]));
+            }
+        }
+        // ── A FUNCTION DESIGNATOR DECAYS IN A CAST TOO, AND FOR THE SAME REASON
+        //    THE ARRAY ABOVE DOES. D-CSUBSET-FUNCTION-DESIGNATOR-TO-INTEGER-CAST-REFUSED.
+        //
+        // C 6.3.2.1p4 converts a function DESIGNATOR to "pointer to function" in
+        // every context but `sizeof` / `_Alignof` / unary `&`; a cast is such a
+        // context, exactly as p3 makes the array decay one. Reuse the ONE
+        // `coerce` FnSig→Ptr funnel (a representation-free Bitcast over the
+        // GlobalAddr at MIR) rather than teaching `mapCast` a second FnSig rule,
+        // so there is one owner for "what does a designator become".
+        //
+        // ⚠ SCOPED TO A NON-POINTER TARGET DELIBERATELY, AND THE SCOPE IS THE
+        // CONSERVATIVE HALF OF THE CHANGE, not a special case: `mapCast` has
+        // lowered `FnSig -> Ptr` directly since c12 and every fn-pointer cast in
+        // the corpus goes through it, so decaying first there would insert a
+        // second Cast node into a path that is already correct and already
+        // pinned. A NON-pointer target had no realization at all — `mapCast(FnSig,
+        // I64)` is not a form — which is precisely why the semantic tier had to
+        // keep refusing it. `_Bool` is reached by the truthiness arm below, whose
+        // `coerceCondition` does this same decay itself.
+        //
+        // ✔MEASURED 2026-08-27 (x86_64:pe64-x86_64-windows-exec, binaries RUN):
+        // with the semantic roster widened and this arm ABSENT, `long v = (long)fn;`
+        // fell to the `makeCast` tail and walled one tier down instead of
+        // compiling — the admitted-and-not-realized break the removed note in
+        // `isExplicitCastable` predicted. gcc 13.3.0 (`-std=c2x`) and clang
+        // 18.1.3 (`-std=c23`), probed SEPARATELY, compile and run it.
+        if (interner.kind(operand.type) == TypeKind::FnSig
+            && interner.kind(target) != TypeKind::Ptr) {
+            operand = coerce(operand, interner.pointer(operand.type));
+        }
+        // ── AN EXPLICIT `(_Bool)` CAST IS THE SAME CONVERSION AS `_Bool b = x`,
+        //    AND IT WAS THE ONE ROUTE THAT DID NOT USE THE TRUTHINESS CHOKEPOINT.
+        // D-CSUBSET-EXPLICIT-BOOL-CAST-IS-A-TRUNCATION.
+        //
+        // C 6.3.1.2 defines conversion of ANY scalar to `_Bool` as "compares equal
+        // to 0" — 0 → false, ANY nonzero → true. `coerce`'s `_Bool`-target arm
+        // (above, the assignment / init / call-arg / return family) already says
+        // exactly this and realizes it through `coerceCondition`, the ONE verb that
+        // owns the truth-value vocabulary. The EXPLICIT cast never went there: it
+        // fell to the `makeCast` tail below, and HIR→MIR's `mapCast(I32, Bool)`
+        // classifies Bool as an 8-bit integer, so the pair became a WIDTH
+        // conversion — `Trunc`, which keeps only the LOW BIT.
+        //
+        // ✔MEASURED at 301e2a63 (x86_64:pe64-x86_64-windows-exec AND
+        // x86_64:elf64-x86_64-linux-exec, `dsscp --compile`): `_Bool b = (_Bool)x;`
+        // on an `int` walls with
+        //   error[L_UnsupportedLoweringForOpcode] Trunc result: TypeKind ordinal 0
+        //   has no encoded conversion form on target 'x86_64' this cycle
+        // — i.e. LIR's missing Bool-width Trunc form is the ONLY thing standing
+        // between this and a silent miscompile, because the instruction MIR asks
+        // for computes `(_Bool)256 == 0` where C requires 1. gcc 13.3.0
+        // (`-std=c2x`) and clang 18.1.3 / 19 (`-std=c23`), probed SEPARATELY, all
+        // compile and run it, so the union rule requires DSS to.
+        //
+        // ★ THE DUPLICATED TRUTH TABLE IS THE REAL DEFECT. `coerceCondition`
+        // already knows every source that has a truth value — arithmetic (with the
+        // sub-int promotion), Complex, Enum→underlying, FnSig→pointer decay, Array
+        // decay, Ptr null-compare — and RETURNS ITS INPUT UNCHANGED for a kind it
+        // cannot convert, so deferring to it keeps a genuinely incompatible source
+        // loud through the `makeCast` tail without restating the roster here. That
+        // is the same reasoning, and the same non-roster guard (`ck != Bool` — an
+        // already-`_Bool` operand needs no conversion and must reach the
+        // same-representation retag below), that `coerce`'s arm records.
+        // ⓘ It also makes MIR's own Bool arms unreachable from C rather than
+        // contradicting them: a wide `_BitInt`/`__int128` source keeps
+        // `emitBoolFromWide` and a `_Complex` source keeps `emitBoolFromComplex`
+        // as the realization of the `Ne(x, 0)` node this builds — one law, one
+        // owner per representation.
+        // ⚠ THE DECLARED TypeId IS CARRIED, NOT THE VERB'S CANONICAL ONE.
+        // `coerceCondition` types its `Ne` node `boolType()` — `interner.primitive
+        // (TypeKind::Bool)`, the canonical row. The cast's own `target` is whatever
+        // the source spelling interned to, and the measured record of what happens
+        // when a produced value keeps a KIND-derived TypeId instead of the DECLARED
+        // one is
+        // D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE
+        // — the MIR
+        // verifier's identity test walls it. `_Bool` has one C spelling today so the
+        // two coincide, which is exactly why this must be CHECKED rather than
+        // assumed — the same accident made every sub-64-bit narrowing look correct.
+        // A representation-free retag reconciles them if they ever diverge.
+        if (interner.kind(target) == TypeKind::Bool
+            && interner.kind(operand.type) != TypeKind::Bool) {
+            E const asBool = coerceCondition(operand, castNode);
+            if (asBool.type.valid()
+                && interner.kind(asBool.type) == TypeKind::Bool) {
+                if (asBool.type.v == target.v) {
+                    return {track(asBool.id, castNode), target};
+                }
+                HirNodeId const retag =
+                    builder.makeCast(asBool.id, target, HirFlags::Synthetic);
+                return {track(retag, castNode), target};
             }
         }
         HirNodeId const cast =
@@ -7295,16 +8043,32 @@ struct Lowerer {
         if (!s.slotType.valid()) return;
         TypeKind const k = interner.kind(s.slotType);
         if (k == TypeKind::Struct) {
-            auto fields = interner.operands(s.slotType);
-            s.nested.resize(fields.size());
-            for (std::size_t i = 0; i < fields.size(); ++i)
-                s.nested[i].slotType = fields[i];
+            // Projected for the same reason as `slotType` in `lowerBraceInit`:
+            // a NESTED slot is a field access one level down. The COUNT is taken
+            // as a value and each field is re-read, because `reprOf` interns when
+            // it projects and that reallocates the operand pool.
+            std::size_t const nFields = interner.operands(s.slotType).size();
+            s.nested.resize(nFields);
+            for (std::size_t i = 0; i < nFields; ++i)
+                s.nested[i].slotType = reprOf(interner.operands(s.slotType)[i]);
         } else if (k == TypeKind::Array) {
             auto ops   = interner.operands(s.slotType);
             auto scals = interner.scalars(s.slotType);
-            if (!ops.empty() && !scals.empty()) {
-                s.nested.resize(scals[0]);
-                for (auto& n : s.nested) n.slotType = ops[0];
+            // ★★ D-HIR-SENTINEL-ARRAY-LENGTH-EXPANDED-AS-A-COUNT: `scals[0]` is a
+            // SIGNED length that carries the interner's two negative sentinels —
+            // `kIncompleteArrayLength` (-1, `T x[]`) and `kVlaLength` (-2, `T x[n]`)
+            // — and this `resize` used to take it unguarded. ✔MEASURED at 8cb9afbd:
+            // `struct S { int n; char c[]; }; struct S s = {};` reaches the -1 arm
+            // through the Struct recursion and the compiler DIES —
+            // `terminate called after throwing an instance of 'std::length_error'`
+            // — a C++ terminate, not a diagnostic, on a program gcc and clang both
+            // compile. A runtime-sized array has NO static element count to expand
+            // into slots, so leave `nested` EMPTY: `flattenInitSlot` then routes the
+            // slot through `synthZeroOrError`, which owns the two sentinels.
+            if (!ops.empty() && !scals.empty() && scals[0] >= 0) {
+                s.nested.resize(static_cast<std::size_t>(scals[0]));
+                TypeId const elem = reprOf(ops[0]);
+                for (auto& n : s.nested) n.slotType = elem;
             }
         }
     }
@@ -7538,6 +8302,22 @@ struct Lowerer {
     //     a scalar), or a NESTED brace list `{{42}}` (audit N2: 6.7.10p12
     //     requires a SINGLE expression; a brace list is not one) —
     //     → S_InvalidScalarInitializer (0xE03F), never a silent guess.
+    // The TOP-LEVEL element count of a brace list, through the SAME
+    // `initElementRule` filter every brace-init path in this file uses (the
+    // `{`/`}`/`,` tokens are not elements). Its one caller is the runtime-sized
+    // array gate in `lowerBraceInit`, which needs "is this the EMPTY initializer"
+    // and must not answer it with a second reading of what an element is.
+    [[nodiscard]] std::size_t braceInitElementCount(NodeId braceInitListNode) const {
+        std::size_t n = 0;
+        for (NodeId elem : visible(braceInitListNode)) {
+            if (tree().kind(elem) != NodeKind::Internal) continue;
+            if (!cfg.initElementRule.valid()
+             || tree().rule(elem).v != cfg.initElementRule.v) continue;
+            ++n;
+        }
+        return n;
+    }
+
     [[nodiscard]] HirNodeId lowerScalarBraceInit(NodeId braceInitListNode,
                                                  TypeId contextType) {
         // Collect the initElement children — the SAME rule filter the
@@ -7665,6 +8445,36 @@ struct Lowerer {
         if (isUnion) {
             return lowerUnionBraceInit(braceInitListNode, contextType);
         }
+        // ★★ D-HIR-SENTINEL-ARRAY-LENGTH-EXPANDED-AS-A-COUNT — the THIRD site of
+        // the same class (`initSlotAsAggregate` and `synthZeroOrError` carry the
+        // other two; the HIR verifier's Array child-count rule is the fourth).
+        // A RUNTIME-SIZED array — `kVlaLength` (-2) or `kIncompleteArrayLength`
+        // (-1) in `scalars()[0]` — has NO static slot count, and the positional
+        // machinery below is built entirely out of one: `slotCount` is a
+        // `std::uint32_t`, so -2 became 4,294,967,294 and the very next statement
+        // (`std::vector<bool> positionallySkippable(slotCount, false)`) allocated
+        // half a gigabyte before looping over four billion slots. ✔MEASURED: the
+        // compiler simply never returned on `int a[argc] = {};` — a HANG, which is
+        // the one failure mode worse than a crash because no watchdog reports it.
+        //   The EMPTY brace initializer is the whole of what may legally arrive
+        // here on such a type (C23 6.7.10p4 for the VLA; an incomplete array with a
+        // NON-empty initializer was already sized from that initializer by the
+        // semantic tier, so it reaches this function as a SIZED array). Route it to
+        // `synthZeroOrError`, whose sentinel arm mints the empty typed
+        // `ConstructAggregate` the MIR tier expands — one owner for "zero this
+        // runtime-sized object", not a second copy here. Anything else is a
+        // semantic-tier invariant break: fail LOUD.
+        if (isArray) {
+            auto const ctxScals = interner.scalars(contextType);
+            if (!ctxScals.empty() && ctxScals[0] < 0) {
+                if (braceInitElementCount(braceInitListNode) != 0) {
+                    return reportedError(braceInitListNode,
+                        "a runtime-sized array may be brace-initialized only by "
+                        "the empty initializer `{}` (C23 6.7.10p4)");
+                }
+                return synthZeroOrError(braceInitListNode, contextType);
+            }
+        }
         std::uint32_t slotCount = 0;
         TypeId elemTypeForArray{};
         std::span<TypeId const> structFields{};
@@ -7681,8 +8491,26 @@ struct Lowerer {
             return reportedError(braceInitListNode,
                 "brace-init target type has zero slots");
         }
+        // D-CSUBSET-NULLPTR-T-DECLARABLE: a brace-init SLOT is an ACCESS of the
+        // composite's field / element, so its type is projected here — the
+        // representation projection deliberately stops at a NOMINAL composite
+        // (rebuilding `struct S` would mint a different type), which makes every
+        // field ACCESS the place that owes the projection. Without it a
+        // `nullptr_t` member's slot keeps the semantic kind and the element's
+        // coercion target is a type MIR refuses: ✔MEASURED,
+        // `struct S { int a; nullptr_t n; int b; }; struct S s = {1, nullptr, 2};`
+        // failed `H0003 ConstructAggregate child[1] type 1 doesn't match field
+        // type 8`. `reprOf` is identity for every field that is not one.
+        // ⚠ AND IT RE-READS THE OPERANDS PER CALL. `reprOf` INTERNS when it
+        // really projects, which reallocates the interner's operand pool;
+        // `structFields` is the DECAYED `std::span` form, whose staleness guard
+        // was already consumed at the decay, so a capture-once read would dangle
+        // silently after the first projected field
+        // (D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD). `elemTypeForArray` is a
+        // TypeId VALUE and needs no re-read.
         auto slotType = [&](std::uint32_t i) -> TypeId {
-            return isStruct ? structFields[i] : elemTypeForArray;
+            if (!isStruct) return reprOf(elemTypeForArray);
+            return reprOf(interner.operands(contextType)[i]);
         };
 
         // FC8 D-CSUBSET-BITFIELD-INIT (C 6.7.9): an UNNAMED bit-field
@@ -7707,7 +8535,10 @@ struct Lowerer {
             if (sscope.valid()) {
                 std::vector<bool> named(slotCount, false);
                 for (auto const& [bname, bsym] : model.scopeRecord(sscope).bindings) {
-                    if (bname.rfind("<anon:", 0) == 0) continue;   // synthetic anon name
+                    // ONE OWNER for this spelling (core/types/anon_member_name.hpp) —
+                    // it had three inline copies, and the third one going stale is
+                    // how a per-CU node id ended up inside a cross-CU type identity.
+                    if (isSyntheticAnonymousName(bname)) continue;
                     auto const* brec = model.recordFor(bsym);
                     if (brec == nullptr || brec->kind != DeclarationKind::Variable)
                         continue;
@@ -7806,7 +8637,7 @@ struct Lowerer {
                         continue;
                     }
                     designatorPath.push_back(rec->fieldIndex);
-                    designatorCurrentType = rec->type;
+                    designatorCurrentType = reprOf(rec->type);
                     continue;
                 }
                 if (cfg.designatedIndexRule.valid()
@@ -8051,6 +8882,39 @@ struct Lowerer {
     // `classifyMemberLvalue`). Anything else (index / deref) → via a temp pointer
     // bound in `prep`. nullopt when the lvalue can't be lowered (no resolved type /
     // not an addressable form).
+    // ★★ THE ONE ANSWER TO "DOES THIS LOWERED NODE NAME AN OBJECT?", shared by
+    //    BOTH lvalue classifiers so they cannot drift.
+    // An addressable lvalue lowers to `Ref` (a variable), `Deref` (`*p`), `Index`
+    // (`a[i]`) or `MemberAccess` (`s.f` / `s->f`). Anything else — Literal,
+    // BinaryOp, UnaryOp, Call, Cast, SeqExpr — is an rvalue with no object behind
+    // it. D-CSUBSET-ASSIGNMENT-TO-A-NON-LVALUE-REFUSED-BY-THE-LOWERING-TIER: the
+    // roster used to be spelled out inline in `classifyIncDecLvalue` ALONE, which
+    // is exactly why plain assignment had no guard at all.
+    //
+    // ⚠⚠ `Ref` IS IN THE ROSTER, AND THE FIRST DRAFT LEFT IT OUT ON A REASON THAT
+    // MEASUREMENT REFUTED. That draft argued a plain variable "never reaches here
+    // — `simpleLvalue` claims it first". ✔THE CORPUS REFUTED IT IN ONE RUN:
+    // `examples/c/array_decay_deref` reddened on `((out) = (u32)*(zBuf))`, because
+    // `simpleLvalue` does NOT claim a PARENTHESIZED variable, so `(out)` arrived
+    // here as a `Ref` and a legal assignment was refused. C 6.5.1p5 is explicit —
+    // a parenthesized expression is an lvalue if the unparenthesized one is.
+    // ★ AND THE SAME OMISSION WAS ALREADY SHIPPING AS A SEPARATE DIVERGENCE, which
+    // is why this is a widening rather than a revert: `++(x)` and `(x)++` on a
+    // parenthesized variable were `S_IncDecNeedsModifiableLvalue` while gcc 13.3.0
+    // (`-std=c2x`) compiles and RUNS them (✔MEASURED, exit 0). One roster, three
+    // callers, two bugs.
+    // ⓘ A FnSig-typed `Ref` (a function DESIGNATOR — `f = 5;`, `++f`) is excluded:
+    // a function is not an object, and C 6.5.16p2 wants a MODIFIABLE lvalue.
+    [[nodiscard]] bool loweredNodeIsAddressable(HirNodeId id) {
+        HirKind const k = id.valid() ? builder.kind(id) : HirKind::Error;
+        if (k == HirKind::Ref) {
+            TypeId const t = builder.typeId(id);
+            return !t.valid() || interner.kind(t) != TypeKind::FnSig;
+        }
+        return k == HirKind::Deref || k == HirKind::Index
+            || k == HirKind::MemberAccess;
+    }
+
     [[nodiscard]] std::optional<Lvalue> classifyLvalue(NodeId exprCst) {
         if (auto s = simpleLvalue(exprCst)) {
             Lvalue lv; lv.simple = true; lv.sym = s->first; lv.type = s->second;
@@ -8061,6 +8925,42 @@ struct Lowerer {
         if (auto m = classifyMemberLvalue(core)) return m;
         E target = lowerExpr(core);
         if (!target.type.valid()) return std::nullopt;
+        // ★★ THE LVALUE-SHAPE GUARD PLAIN ASSIGNMENT NEVER HAD.
+        // D-CSUBSET-ASSIGNMENT-TO-A-NON-LVALUE-REFUSED-BY-THE-LOWERING-TIER.
+        //
+        // C 6.5.16p2 requires a MODIFIABLE LVALUE as the left operand. This arm
+        // used to accept ANY expression and take `AddressOf` of it, deferring the
+        // question to MIR — where it surfaced as an internal complaint about
+        // whichever node kind happened to arrive, and one of those complaints
+        // named the wrong construct entirely.
+        // ✔MEASURED 2026-08-27 on x86_64:pe64-x86_64-windows-exec, all refused
+        // (never a miscompile) and all three wrong about WHY: `8 = 5;` gave
+        // `H_UnsupportedLoweringForKind: string-literal materialization: the
+        // Literal pool entry is not a string arm` — a message about STRING
+        // literals for an integer one; `(a+b) = 5;` gave `lvalue kind 'BinaryOp'
+        // (ordinal …)` and `f() = 5;` gave `'Call' (ordinal 27)`, both naming a
+        // raw internal ordinal. gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
+        // (`-std=c23`), probed SEPARATELY, both refuse at the user's own token
+        // with "lvalue required as left operand of assignment" / "expression is
+        // not assignable".
+        // ★ IT SURFACED ONLY WHEN IT BECAME REACHABLE FROM PORTABLE C: lane AF's
+        // shipped-constant work made `CHAR_BIT = 5;` splice to `8 = 5;`, and the
+        // report then carried a `<built-in>` location for a construct in the
+        // user's own file. The defect is older than that change and independent
+        // of it — bare `8 = 5;` takes the identical route with no descriptor in
+        // the picture.
+        // ⓘ The `const`-QUALIFIED lvalue (`const int x; x = 5;`) is a DIFFERENT
+        // gap, still open as [[D-CSUBSET-INCDEC-CONST-LVALUE]]: a const lvalue IS
+        // addressable and passes this shape test, and the simple-variable path
+        // above never reaches here anyway. Narrowing that is a `const`-modelling
+        // question in the type lattice, not a shape question.
+        if (!loweredNodeIsAddressable(target.id)) {
+            emitH(DiagnosticCode::S_AssignNeedsModifiableLvalue, exprCst,
+                  "the left operand of an assignment must be a modifiable lvalue "
+                  "(C 6.5.16p2); gcc 13.3.0 and clang 18.1.3 both refuse this "
+                  "(D-CSUBSET-ASSIGNMENT-TO-A-NON-LVALUE-REFUSED-BY-THE-LOWERING-TIER)");
+            return std::nullopt;
+        }
         Lvalue lv;
         lv.simple  = false;
         // c27 (D-CSUBSET-VOLATILE-POINTEE): `target.type` already carries the
@@ -8184,6 +9084,22 @@ struct Lowerer {
     // is the bare lowered expression (wrapped in ExprStmt when `wrapBare`).
     HirNodeId lowerStmtExprCore(NodeId core, bool wrapBare) {
         if (tree().kind(core) == NodeKind::Internal) {
+            // P31 (D-C-GNU-STATEMENT-EXPRESSION): a statement expression whose
+            // VALUE IS DISCARDED **is** a block, and lowering it as one is what
+            // makes `({ int a = 1; });` and `({ });` legal here — ✔MEASURED
+            // accepted by gcc 13.3.0 AND clang 19.1.7, while the same construct
+            // used as a VALUE is refused by both (S_StatementExprHasNoValue).
+            // Routing the discard position through `Block` rather than through a
+            // SeqExpr that needs a result is what removes the need to INVENT a
+            // void-typed yield expression — the honest answer is that there is
+            // no value here and no node has to pretend otherwise.
+            // Covers BOTH callers: an `exprStmt` (wrapBare = true) and a bare
+            // for-init/for-update clause (wrapBare = false) — MIR's for-clause
+            // router already sends a `Block` clause through `lowerStmt`, so the
+            // same node is correct in both, and no `ExprStmt` wrap is wanted in
+            // either (a Block IS a statement).
+            if (NodeId const se = stmtExprChildOf(core); se.valid())
+                return lowerStatementExprAsBlock(se);
             std::uint32_t const rv = tree().rule(core).v;
             if (rv == cfg.binaryExprRule.v) {
                 for (NodeId c : visible(core)) {
@@ -8269,6 +9185,118 @@ struct Lowerer {
     HirNodeId lowerBlock(NodeId node) {
         std::vector<HirNodeId> stmts;
         for (NodeId c : blockChildNodes(node)) stmts.push_back(lowerStmt(c));
+        return track(builder.makeBlock(stmts), node);
+    }
+
+    // ── P31 (D-C-GNU-STATEMENT-EXPRESSION): the GNU `({ … })` construct ────────
+    //
+    // The DIRECT `stmtExpr` child of an operand node, or an invalid NodeId when
+    // there is none. A direct-child scan and not a peel, exactly as
+    // `lowerOperandTerminal` scans for `sizeof`/`_Generic`/the cast rule: the
+    // construct is a BRANCH of the operand alt, never a wrapper layer, and
+    // `peelToCore` stops at the operand node anyway (`isExprNode` covers it).
+    [[nodiscard]] NodeId stmtExprChildOf(NodeId operandNode) const {
+        if (!cfg.stmtExprRule.valid()) return {};
+        if (tree().kind(operandNode) != NodeKind::Internal) return {};
+        if (tree().rule(operandNode).v != cfg.operandRule.v) return {};
+        for (NodeId c : visible(operandNode)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (tree().rule(c).v == cfg.stmtExprRule.v) return c;
+        }
+        return {};
+    }
+
+    // The statement items of a `({ … })` body, plus — when the LAST item is an
+    // expression statement — the expression that item wraps, which is the
+    // construct's VALUE (GNU C 6.1: "the last thing in the compound statement
+    // should be an expression followed by a semicolon"). `valueNode` is left
+    // invalid when the last item is anything else (a declaration, a loop, an
+    // empty statement, or nothing at all) — that is the `void` statement
+    // expression, and the two callers differ ONLY in what they do about it.
+    //
+    // ★ The last item's expression is recovered and handed to `lowerExpr` rather
+    // than lowered through `lowerStmt`: `({ a = 1; })` and `({ a++; })` yield the
+    // assigned / pre-increment VALUE in gcc and clang (✔MEASURED, both), whereas
+    // statement position turns those two into an `AssignStmt` that yields
+    // nothing. Value position is the whole point of the construct, so the value
+    // path is the one the last item takes.
+    // ★ The recognition is by HIR KIND ("ExprStmt"), not by a grammar rule name —
+    // the `lowerStmt` driver's own idiom (`k == "Block"`, `k == "IfStmt"`), so no
+    // second config key has to name which rule an expression statement is.
+    void stmtExprItems(NodeId node, std::vector<NodeId>& items, NodeId& valueNode) {
+        for (NodeId c : visible(node)) {
+            if (isToken(c)) continue;          // ( { } )
+            items.push_back(c);
+        }
+        valueNode = NodeId{};
+        if (items.empty()) return;
+        NodeId const lastCore = peelToCore(items.back());
+        HirRuleMapping const* m = mappingFor(lastCore);
+        if (m == nullptr || m->hirKind != "ExprStmt") return;
+        for (NodeId c : visible(lastCore)) {
+            if (isToken(c)) continue;
+            valueNode = c;
+            return;
+        }
+    }
+
+    // `({ stmt… expr; })` in VALUE position → `HirKind::SeqExpr` ([stmts…,
+    // result]) — the node whose own header comment names GCC statement
+    // expressions as what it models, and which MIR already lowers by running
+    // each statement child through `lowerStmt` and yielding the last child's
+    // value. No new HIR kind, and no MIR/LIR change: `collectLocalDecls` already
+    // walks the whole body subtree, so a declaration nested inside an expression
+    // already gets its entry-block `Alloca`.
+    [[nodiscard]] E lowerStatementExpr(NodeId node) {
+        // C's block scope has no meaning without a frame, and both references
+        // refuse the construct at file scope (see S_StatementExprAtFileScope).
+        // Refuse BEFORE lowering anything: a global initializer that folded to
+        // the last literal would silently DISCARD every statement before it.
+        if (functionBodyDepth_ == 0) {
+            emitH(DiagnosticCode::S_StatementExprAtFileScope, node,
+                  "a statement expression '({ ... })' is only valid inside a "
+                  "function (GNU C 6.1) — at file scope there is no frame to "
+                  "run its statements in");
+            return E{errorNode(node), InvalidType};
+        }
+        std::vector<NodeId> items;
+        NodeId valueNode{};
+        stmtExprItems(node, items, valueNode);
+        if (!valueNode.valid()) {
+            emitH(DiagnosticCode::S_StatementExprHasNoValue, node,
+                  "this statement expression has no value: its last statement "
+                  "is not an expression statement, so its type is 'void' "
+                  "(GNU C 6.1) — it may be written as a statement, but not "
+                  "where a value is required");
+            return E{errorNode(node), InvalidType};
+        }
+        std::vector<HirNodeId> stmts;
+        stmts.reserve(items.size() - 1);
+        for (std::size_t i = 0; i + 1 < items.size(); ++i)
+            stmts.push_back(lowerStmt(items[i]));
+        E const yield = lowerExpr(valueNode);
+        return E{track(builder.makeSeqExpr(stmts, yield.id, yield.type), node),
+                 yield.type};
+    }
+
+    // `({ … })` in a DISCARD position → a plain `Block`. See the call site in
+    // `lowerStmtExprCore` for why the discard position is a block and not a
+    // value-less SeqExpr. The LAST item lowers as an ordinary statement here
+    // (its value, if it has one, is discarded exactly as `f();` discards one),
+    // so this arm needs no `valueNode` at all and the `void` case is not a case.
+    [[nodiscard]] HirNodeId lowerStatementExprAsBlock(NodeId node) {
+        if (functionBodyDepth_ == 0) {
+            emitH(DiagnosticCode::S_StatementExprAtFileScope, node,
+                  "a statement expression '({ ... })' is only valid inside a "
+                  "function (GNU C 6.1) — at file scope there is no frame to "
+                  "run its statements in");
+            return errorNode(node);
+        }
+        std::vector<HirNodeId> stmts;
+        for (NodeId c : visible(node)) {
+            if (isToken(c)) continue;
+            stmts.push_back(lowerStmt(c));
+        }
         return track(builder.makeBlock(stmts), node);
     }
 
@@ -8733,7 +9761,58 @@ struct Lowerer {
             // ALU form on x86 OR arm64). Promote to `int` so the compare
             // runs at ≥32-bit width with a sign/zero-extended operand.
             if (!disc && classify(c) == Role::Expr) {
-                disc = promoteSubIntArith(lowerExpr(c)).id; continue;
+                E const raw = lowerExpr(c);
+                // ★★ C 6.8.4.2p1: "The controlling expression of a switch
+                //    statement shall have integer type." THIS WAS NOT CHECKED AT
+                //    ALL, AND A COMPLEX DISCRIMINANT WAS THEREFORE ACCEPTED.
+                // D-CSUBSET-SWITCH-ON-A-NON-INTEGER-DISCRIMINANT-ACCEPTED.
+                //
+                // ✔MEASURED 2026-08-27 (x86_64:pe64-x86_64-windows-exec, binary
+                // RUN): `switch (z)` on a `double _Complex` COMPILED and RAN,
+                // while gcc 13.3.0 (`-std=c2x`) — *switch quantity not an
+                // integer* — and clang 18.1.3 (`-std=c23`) — *statement requires
+                // expression of integer type* — probed SEPARATELY, both REFUSE.
+                // That is direction B of the bar: accepting what NO reference
+                // accepts and the standard forbids is an invented extension, and
+                // this one is not even inert — a `_Complex` is memory-resident and
+                // reaches here as its ADDRESS, so a `case 1:` would compare an
+                // object address against 1 and silently take `default` forever.
+                // ⚠ THE ROSTER IS THE INTEGER ONE, NOT `isArithmeticCore`, and the
+                // difference is the whole rule: `isArithmeticCore` admits the
+                // FLOAT kinds, and `switch (aDouble)` is refused by both
+                // references for exactly the same clause. Enum is admitted because
+                // C 6.2.5p17 makes an enumerated type an integer type (and DSS
+                // interns it as its own nominal kind, the same reason
+                // `scalarConvertsToBool` names it separately); `_BitInt` because
+                // C23 6.2.5p5 does.
+                // ⓘ An INVALID operand type (a cascade from an already-diagnosed
+                // sub-expression) is deliberately let through untouched — adding a
+                // second diagnostic to a failed lowering is noise, and the
+                // enclosing context already fails.
+                if (raw.type.valid()) {
+                    TypeKind const dk = interner.kind(raw.type);
+                    bool const isIntegerType =
+                        dk == TypeKind::Bool  || dk == TypeKind::Char
+                        || dk == TypeKind::Byte || dk == TypeKind::Enum
+                        || dk == TypeKind::BitInt
+                        || dk == TypeKind::I8  || dk == TypeKind::I16
+                        || dk == TypeKind::I32 || dk == TypeKind::I64
+                        || dk == TypeKind::I128
+                        || dk == TypeKind::U8  || dk == TypeKind::U16
+                        || dk == TypeKind::U32 || dk == TypeKind::U64
+                        || dk == TypeKind::U128;
+                    if (!isIntegerType) {
+                        unsupported(c,
+                            "the controlling expression of a `switch` must have "
+                            "integer type (C 6.8.4.2p1); gcc 13.3.0 and clang "
+                            "18.1.3 both reject this. Convert it explicitly, or "
+                            "use `if`/`else` "
+                            "(D-CSUBSET-SWITCH-ON-A-NON-INTEGER-DISCRIMINANT-ACCEPTED)");
+                        disc = errorNode(c, raw.type);
+                        continue;
+                    }
+                }
+                disc = promoteSubIntArith(raw).id; continue;
             }
             ctx.items.push_back(c);   // switchBodyItem wrappers (caseLabel | statement)
         }
@@ -9001,10 +10080,10 @@ struct Lowerer {
                     // `synthesize` row an import is not a degradation, it is a
                     // binary that will not LOAD.
                     if (claimSuppressedShimSymbol(shipped, d, sym, pr->name,
-                                                  pr->type))
+                                                  reprOf(pr->type)))
                         continue;   // shim (or refusal) — never an import row.
                     HirNodeId const ef = track(
-                        builder.makeExternFunction(pr->type, sym.v, {}), d);
+                        builder.makeExternFunction(reprOf(pr->type), sym.v, {}), d);
                     // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): a bare-prototype
                     // cross-TU reference carries the
                     // prototype's own asm label (set below), so a labelled
@@ -9053,7 +10132,7 @@ struct Lowerer {
                 continue;
             }
             TypeId type = InvalidType;
-            if (auto const* rec = model.recordFor(sym)) type = rec->type;
+            if (auto const* rec = model.recordFor(sym)) type = reprOf(rec->type);
             // The init = the init-declarator's visible Internal child that
             // is NOT the declarator (`[declarator, '=', initValue]`).
             std::optional<HirNodeId> init;
@@ -9089,6 +10168,19 @@ struct Lowerer {
                 recordVolatility(g, sym);   // c21: volatile static-local global init store
                 recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
                 recordLinkage(g, staticLinkage);  // {Local, Default} — internal
+                // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: keep the
+                // provenance the promotion would otherwise destroy. The storage
+                // leaves the function; the INITIALIZER may still name something
+                // only the function has (`static void *tbl[] = {&&L0};`), and label
+                // ordinals restart per function, so HIR→MIR cannot re-derive which
+                // function's label ordinal 0 means. Recorded UNCONDITIONALLY (not
+                // only when a `&&label` is present): a conditional record would make
+                // the map's absence mean two different things, and a later consumer
+                // asking a different question would read the silence as an answer.
+                if (currentFunctionSymbol_.valid()) {
+                    enclosingFunctionAcc.push_back(
+                        {g, EnclosingFunctionAttr{currentFunctionSymbol_.v}});
+                }
                 moduleDecls_->push_back(g);
                 continue;
             }
@@ -9097,8 +10189,8 @@ struct Lowerer {
                 : track(builder.makeVarDecl(type, sym.v, init), d);
             // Carry const-ness from the bound symbol to the Global node so
             // HIR→MIR can route a const-init global to read-only `.rodata` and a
-            // mutable one to writable `.data` (D-LK4-DATA-PRODUCER-MUTABLE-
-            // GLOBAL). Locals are stack slots — mutability is irrelevant there.
+            // mutable one to writable `.data` (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL).
+            // Locals are stack slots — mutability is irrelevant there.
             // TLS C1: thread-storage duration rides the same global-only
             // discipline (a block-scope thread_local WITHOUT static already
             // failed loud in Pass 2 — no automatic can reach here marked).
@@ -9149,7 +10241,37 @@ struct Lowerer {
                 symRec != nullptr ? symRec->vlaTypedefOrigin : SymbolId{};
             if (!asGlobal && vlaOrigin.valid()) {
                 typedefOriginAcc.emplace_back(sym.v, vlaOrigin.v);
-            } else {
+            } else if (type.valid()) {
+                // ★★ D-HIR-VLA-PROBE-ABORTS-ON-AN-UNRESOLVED-DECLARED-TYPE — the
+                // `type.valid()` guard above is the fix, and it is a CRASH fix, not
+                // a tidy-up.
+                //
+                // `type` is `rec->type`, the SEMANTIC tier's answer for this
+                // declarator, and it is `InvalidType` whenever that tier could not
+                // resolve the declared type. `isVlaArray` guards against exactly
+                // that and SAYS SO in its own comment ("an unguarded
+                // `arena_.at(invalid)` would abort — TypeId out of range"), and
+                // `typeContainsVla`'s loop is `while (id.valid())`, so both were
+                // safe; the `isPtrToVla` probe added later called the RAW
+                // `interner.kind(type)` and was not. ⇒ every declaration whose type
+                // failed to resolve, in a var / param / global position, killed the
+                // compiler with `dss::substrate fatal: TypeInterner::get: TypeId out
+                // of range` instead of producing a diagnostic — an ABORT on user
+                // source, which the fail-loud contract forbids outright.
+                // ✔MEASURED at 301e2a63 on `x86_64:pe64-x86_64-windows-exec`, six
+                // distinct shapes, every one of them legal C that gcc 13.3.0
+                // (`-std=c2x`) and clang 18.1.3 (`-std=c23`) compile and run: a
+                // `typeof(<literal>)` parameter, the same in a prototype, a
+                // file-scope `static typeof(1) g;`, `typeof(1) a[3]`, `typeof(1) *p`
+                // and `typeof(nullptr) p`. All six abort at HEAD; all six emit
+                // H_TypeUnresolved with this guard.
+                // ⚠ THE GUARD IS THE WHOLE OF THE HIR TIER'S OBLIGATION AND NOT THE
+                // WHOLE OF THE BUG. An unresolved declared type still has to be
+                // reported, and it IS: `requiresValidType(HirKind::VarDecl)` is
+                // true, so the HIR verifier raises H_TypeUnresolved on this node
+                // (with its cascade suppression intact). What remains is the
+                // SEMANTIC-tier reason those six types were unresolved in the first
+                // place — see D-CSUBSET-TYPEOF-VALUE-FORM-RESOLVES-ONLY-FOR-AN-OBJECT-OPERAND.
                 bool const isPtrToVla =
                     interner.kind(type) == TypeKind::Ptr
                     && !interner.operands(type).empty()
@@ -9196,7 +10318,7 @@ struct Lowerer {
             // columnDecl name is a `nameAtom`, not a bare Identifier); probe for it.
             sym = model.symbolAt(nameNode);
             if (!sym.valid()) sym = firstNameToken(nameNode).sym;
-            if (auto const* rec = model.recordFor(sym)) type = rec->type;
+            if (auto const* rec = model.recordFor(sym)) type = reprOf(rec->type);
         }
         std::optional<HirNodeId> init;
         for (NodeId c : vis) {
@@ -9259,7 +10381,7 @@ struct Lowerer {
         // anon-composite path (`enum {V=16};` — a row with NO named declarator at
         // all, whose type is stamped on the declaration node itself).
         bool emittedPerDeclarator = false;
-        // FC4 c1: declarator-mode type rows (c-subset typedefDecl) carry the
+        // FC4 c1: declarator-mode type rows (c typedefDecl) carry the
         // declared name inside the declarator — the shared walk finds it.
         if (decl && decl->isDeclaratorMode() && sem.declarators.has_value()) {
             auto const carrier = decl->declaratorListChild.has_value()
@@ -9279,7 +10401,7 @@ struct Lowerer {
                     if (!nameNode.valid()) continue;
                     sym  = model.symbolAt(nameNode);
                     type = InvalidType;
-                    if (auto const* rec = model.recordFor(sym)) type = rec->type;
+                    if (auto const* rec = model.recordFor(sym)) type = reprOf(rec->type);
                     // VLA C4b (D-CSUBSET-VLA): a VARIABLE-LENGTH-array typedef
                     // (`typedef int R[n];` / multi-dim `R[n][m]`/`R[5][n]`/`R[n][5]`)
                     // must lower + capture its OWN runtime bound(s) NOW, keyed by the
@@ -9317,13 +10439,13 @@ struct Lowerer {
                     // GRAMMAR admitted one; it is the second half of the
                     // multi-declarator unit.
                     out.push_back(track(builder.makeTypeDecl(
-                        type.valid() ? type : model.typeAt(node), sym.v), d));
+                        type.valid() ? type : semTypeAt(node), sym.v), d));
                     emittedPerDeclarator = true;
                 }
             }
         } else if (decl && decl->nameChild && *decl->nameChild < vis.size()) {
             sym = model.symbolAt(vis[*decl->nameChild]);
-            if (auto const* rec = model.recordFor(sym)) type = rec->type;
+            if (auto const* rec = model.recordFor(sym)) type = reprOf(rec->type);
         }
         if (emittedPerDeclarator) return;
         // D-CSUBSET-ANON-TYPEDECL-TYPE-FALLBACK: an ANONYMOUS composite specifier
@@ -9336,7 +10458,7 @@ struct Lowerer {
         // const-expr (`enum { V = 16 }; int arr[V];`) fails H_TypeUnresolved at the
         // HIR verifier even though the enum type resolved fine (the NAMED form is
         // clean because vis[nameChild] is the tag Identifier, where the symbol binds).
-        if (!type.valid()) type = model.typeAt(node);
+        if (!type.valid()) type = semTypeAt(node);
         out.push_back(track(builder.makeTypeDecl(type, sym.v), node));
     }
 
@@ -9356,7 +10478,7 @@ struct Lowerer {
     }
 
     // DFS for the first descendant of `root` whose rule is a composite
-    // (fieldChildren) TYPE DEFINITION — c-subset's unified structSpec / unionSpec
+    // (fieldChildren) TYPE DEFINITION — c's unified structSpec / unionSpec
     // / enumSpec (which REPLACED the *SpecifierBody rules). Used to recover the
     // type-declaring node of a no-object top-level declaration (`struct P { … };`),
     // which — since the bare top-level structDecl/unionDecl/enumDecl rules were
@@ -9565,10 +10687,11 @@ struct Lowerer {
         // Claimed ⇒ no extern node, no import row, and (see the ★★ note above) no
         // body either: the shim IS this symbol's external definition and the synth
         // pass defines it, so a second definition here would be a redefinition.
-        if (claimSuppressedShimSymbol(shipped, node, sym, rec->name, rec->type))
+        if (claimSuppressedShimSymbol(shipped, node, sym, rec->name,
+                                      reprOf(rec->type)))
             return true;
         HirNodeId const ef =
-            track(builder.makeExternFunction(rec->type, sym.v, {}), node);
+            track(builder.makeExternFunction(reprOf(rec->type), sym.v, {}), node);
         externDecls.push_back(HirExternRecord{
             ef, rec->name,
             shipped != nullptr ? shipped->library
@@ -9634,22 +10757,23 @@ struct Lowerer {
         if (!fnName.valid()) return errorNode(node);
         SymbolId const sym = model.symbolAt(fnName);
         TypeId sig = InvalidType;
-        if (auto const* rec = model.recordFor(sym)) sig = rec->type;
-        // Params live in the fn suffix attached to the NAME's direct
-        // declarator (`int (*f(int a))(int b)` — f's params are `a`;
-        // the outer suffix shapes the return type only).
+        if (auto const* rec = model.recordFor(sym)) sig = reprOf(rec->type);
+        // Params live in the fn suffix that DECLARES the name — `f`'s own, not an
+        // inner or outer function type's (`int (*f(int a))(int b)` — f's params are
+        // `a`; the outer suffix shapes the return type only).
+        //
+        // ★ D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED: this
+        // used to be a single-level scan of the NAME'S OWN direct declarator, which
+        // finds nothing when C 6.7.6p1's redundant parentheses sit between them —
+        // `int (foo)(int x) { … }`, the glibc/musl macro-shadowing idiom that gcc and
+        // clang both compile and run. The harvest then came back EMPTY while the
+        // FnSig still carried the parameter, and the two disagreed one tier later
+        // (MEASURED: H0009 "Function param count 0 mismatches FnSig param count 1").
+        // The shared upward walk in `core/types/declarator_walk.hpp` answers the same
+        // question the semantic tier asks, so the two tiers cannot drift apart on it.
         std::vector<HirNodeId> params;
-        NodeId const direct = tree().parent(fnName);
-        if (direct.valid() && tree().kind(direct) == NodeKind::Internal
-            && tree().rule(direct).v == dc.directRule.v) {
-            for (NodeId c : visible(direct)) {
-                if (tree().kind(c) == NodeKind::Internal
-                    && isFnSuffixRule(tree().rule(c), dc)) {
-                    collectParams(c, params);
-                    break;
-                }
-            }
-        }
+        NodeId const fnSuffix = declaratorFnSuffixNode(tree(), fnName, dc);
+        if (fnSuffix.valid()) collectParams(fnSuffix, params);
         NodeId const bodyNode =
             (decl.kindByChild && !decl.kindByChild->bodyPath.empty())
                 ? descend(discNode, decl.kindByChild->bodyPath)
@@ -9661,16 +10785,25 @@ struct Lowerer {
         auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
         auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
         std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the owning function
+        // travels WITH the label-ordinal scope, saved and restored on the SAME
+        // three lines, because the two are the two halves of one key — an ordinal
+        // means nothing without the function whose namespace it was drawn from.
+        SymbolId const savedFnSym = currentFunctionSymbol_;
+        currentFunctionSymbol_ = sym;
         labelOrdinals_.clear();
         caseLabelOrdinals_.clear();
         nextLabelOrdinal_ = 0;
+        ++functionBodyDepth_;              // P31: see the field's comment
         if (bodyNode.valid()) prescanLabels(bodyNode);
         HirNodeId body = bodyNode.valid()
             ? lowerStmt(bodyNode)
             : track(builder.makeBlock({}), node);
+        --functionBodyDepth_;              // P31: see the field's comment
         labelOrdinals_ = std::move(savedLabels);
         caseLabelOrdinals_ = std::move(savedCaseLabels);
         nextLabelOrdinal_ = savedNextOrd;
+        currentFunctionSymbol_ = savedFnSym;
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(node, body, sym, retType, decl);
         HirNodeId const fn_ =
@@ -9735,8 +10868,8 @@ struct Lowerer {
                                   declarators.empty() ? NodeId{} : declarators[0]);
             // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): a C99 6.7.4p7 inline
             // definition provides no external definition — lower it as a
-            // DECLARATION, plus (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-
-            // EMITTED) a MARKED body the optimizer may inline from and whose
+            // DECLARATION, plus (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED)
+            // a MARKED body the optimizer may inline from and whose
             // emission the optimizer's epilogue unconditionally suppresses.
             if (lowerInlineDefinitionAsDeclaration(node, decl, dc, fnLink,
                                                    discNode, out)) {
@@ -9838,7 +10971,7 @@ struct Lowerer {
         TypeId type = InvalidType;
         if (decl.nameChild && *decl.nameChild < vis.size()) {
             sym = model.symbolAt(vis[*decl.nameChild]);
-            if (auto const* rec = model.recordFor(sym)) type = rec->type;
+            if (auto const* rec = model.recordFor(sym)) type = reprOf(rec->type);
         }
         // D-CSUBSET-LINKAGE-SPECIFIERS: linkage from the (optional) specifier
         // prefix, attached below to the lowered Function/Global node and threaded
@@ -9884,7 +11017,7 @@ struct Lowerer {
     }
 
     // A function declared by a DEDICATED rule (e.g. toy's `funcDef`), as opposed
-    // to c-subset's dual-purpose `topLevelDecl`+kindByChild. Reads the params/body
+    // to c's dual-purpose `topLevelDecl`+kindByChild. Reads the params/body
     // subtrees from the semantic DeclarationRule's `paramsChild`/`bodyChild`
     // visible-child indices.
     // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN (source-agnostic): if the
@@ -9895,7 +11028,7 @@ struct Lowerer {
     // original children + a synthetic `return <zero>`. Otherwise
     // return `body` unchanged. Shared between `lowerFunctionDecl`
     // (dedicated-rule front-ends like toy) and `lowerFunction`
-    // (kindByChild dispatch like c-subset's `topLevelDecl`) — both
+    // (kindByChild dispatch like c's `topLevelDecl`) — both
     // call this AFTER lowering the body and BEFORE handing it to
     // `builder.makeFunction`.
     [[nodiscard]] HirNodeId
@@ -9970,7 +11103,7 @@ struct Lowerer {
         TypeId sig = InvalidType;
         if (decl.nameChild && *decl.nameChild < vis.size()) {
             sym = model.symbolAt(vis[*decl.nameChild]);
-            if (auto const* rec = model.recordFor(sym)) sig = rec->type;
+            if (auto const* rec = model.recordFor(sym)) sig = reprOf(rec->type);
         }
         // LEGACY positional path: no declarator vocabulary, so no
         // after-declarator attribute slot exists — the prefix is the whole story.
@@ -9992,16 +11125,25 @@ struct Lowerer {
         auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
         auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
         std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the owning function
+        // travels WITH the label-ordinal scope, saved and restored on the SAME
+        // three lines, because the two are the two halves of one key — an ordinal
+        // means nothing without the function whose namespace it was drawn from.
+        SymbolId const savedFnSym = currentFunctionSymbol_;
+        currentFunctionSymbol_ = sym;
         labelOrdinals_.clear();
         caseLabelOrdinals_.clear();
         nextLabelOrdinal_ = 0;
+        ++functionBodyDepth_;              // P31: see the field's comment
         if (bodyNode.valid()) prescanLabels(bodyNode);
         HirNodeId body = bodyNode.valid()
                        ? lowerStmt(bodyNode)
                        : track(builder.makeBlock({}), node);
+        --functionBodyDepth_;              // P31: see the field's comment
         labelOrdinals_ = std::move(savedLabels);
         caseLabelOrdinals_ = std::move(savedCaseLabels);
         nextLabelOrdinal_ = savedNextOrd;
+        currentFunctionSymbol_ = savedFnSym;
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
@@ -10120,8 +11262,9 @@ struct Lowerer {
         std::vector<NodeId> declarators;
         collectDeclarators(tree(), vis[*decl.declaratorListChild], dc, declarators);
         // The specifier prefix (`externSpecifiers`) is per-DECLARATION — shared by
-        // every declarator — so resolve its linkage ONCE. D-CSUBSET-LINKAGE-UNKNOWN-
-        // SPECIFIER-DIAGNOSTIC: route through the SAME linkageFrom chokepoint as
+        // every declarator — so resolve its linkage ONCE.
+        // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC:
+        // route through the SAME linkageFrom chokepoint as
         // lowerTopLevel/lowerFunctionDecl so specifier validation is by-construction.
         // TF-C73: an AFTER-DECLARATOR attribute is per-DECLARATOR, so it is folded
         // on top of this base inside `recordExtern`, not here.
@@ -10130,7 +11273,7 @@ struct Lowerer {
         // D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3): the OPTIONAL trailing
         // `stringLiteralExpr` after the declarator list is a DSS per-declaration
         // import-library override (`extern void* GetStdHandle(int) "kernel32.dll";`
-        // — examples/c-subset/hello_writefile). Decode it ONCE and apply the same
+        // — examples/c/hello_writefile). Decode it ONCE and apply the same
         // map to EVERY declarator's import row (a source override is format-
         // independent → projected under every object-format key by uniformLibraryMap;
         // the compile-pipeline fold reads the active format's key). Absent → empty
@@ -10174,8 +11317,8 @@ struct Lowerer {
         //      undefined and rejected LOUD (K_SymbolUndefined). This is the SAME
         //      unbound channel the bare-prototype producer has always used; there is
         //      deliberately NO per-CU availability error here, because a per-CU
-        //      verdict can be wrong (D-FFI-FORMAT-ORACLE-BYPASSED-WITHOUT-RESOLVE-
-        //      LIBRARY, whose named prerequisite is
+        //      verdict can be wrong (D-FFI-FORMAT-ORACLE-BYPASSED-WITHOUT-RESOLVE-LIBRARY,
+        //      whose named prerequisite is
         //      D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD).
         //
         // AGNOSTIC: every input is DATA on a descriptor row, already per-format
@@ -10238,7 +11381,7 @@ struct Lowerer {
             // the binding) emits NO node + NO import row (the definition carries the
             // symbol; a duplicate import would be spurious). Per-declarator.
             if (rec->isAbsorbedProto) continue;
-            TypeId const type = rec->type;
+            TypeId const type = reprOf(rec->type);
             // A FUNCTION declarator (`extern int f(int);` — its name carries an
             // fnSuffix → Pass-1 set isProtoDeclaration) → ExternFunction. The FnSig
             // (rec->type) is the load-bearing signature (HIR→MIR reads it); the param
@@ -10376,14 +11519,23 @@ struct Lowerer {
         auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
         auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
         std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the owning function
+        // travels WITH the label-ordinal scope, saved and restored on the SAME
+        // three lines, because the two are the two halves of one key — an ordinal
+        // means nothing without the function whose namespace it was drawn from.
+        SymbolId const savedFnSym = currentFunctionSymbol_;
+        currentFunctionSymbol_ = sym;
         labelOrdinals_.clear();
         caseLabelOrdinals_.clear();
         nextLabelOrdinal_ = 0;
+        ++functionBodyDepth_;              // P31: see the field's comment
         if (bodyNode.valid()) prescanLabels(bodyNode);
         HirNodeId body = bodyNode.valid() ? lowerStmt(bodyNode) : track(builder.makeBlock({}), node);
+        --functionBodyDepth_;              // P31: see the field's comment
         labelOrdinals_ = std::move(savedLabels);
         caseLabelOrdinals_ = std::move(savedCaseLabels);
         nextLabelOrdinal_ = savedNextOrd;
+        currentFunctionSymbol_ = savedFnSym;
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
@@ -10418,7 +11570,7 @@ struct Lowerer {
     // (specifier prefix stripped — D-DECL-PREFIX-STRIP-SHARED-HELPER), so an
     // expr-shaped specifier argument (e.g. a future
     // `__attribute__((aligned(8)))`) can never be mistaken for the global's
-    // initializer. A no-op for every shipped prefix today (c-subset's
+    // initializer. A no-op for every shipped prefix today (c's
     // specifiers contain no expr-rule nodes).
     [[nodiscard]] std::vector<NodeId>
     descendantsForInit(NodeId node, RuleId skipRule = {},
@@ -10564,6 +11716,10 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared (decl node → ThreadLocalAttr)
     // accumulator, moved onto result->threadLocalMap after finish().
     std::vector<std::pair<HirNodeId, ThreadLocalAttr>> threadLocalAcc;
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: shared (promoted-global
+    // node → EnclosingFunctionAttr) accumulator, moved onto
+    // result->enclosingFunctionMap after finish().
+    std::vector<std::pair<HirNodeId, EnclosingFunctionAttr>> enclosingFunctionAcc;
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared (access node → VolatileAttr)
     // accumulator, moved onto result->volatileMap after finish().
     std::vector<std::pair<HirNodeId, VolatileAttr>> volatileAcc;
@@ -10607,7 +11763,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
             reporter, builder, literals, inlineAsmPool, spans, externDecls, linkage,
             mutability, noInlineAcc, alwaysInlineAcc, noOptimizeAcc,
             noSanitizeThreadAcc, inlineDefinitionAcc,
-            threadLocalAcc, volatileAcc, returnsTwiceAcc, alignmentAcc,
+            threadLocalAcc, enclosingFunctionAcc,
+            volatileAcc, returnsTwiceAcc, alignmentAcc,
             vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc, synthRecipeAcc));
     }
 
@@ -10718,6 +11875,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
     for (auto& [id, attr] : threadLocalAcc)
         result->threadLocalMap.set(id, attr);   // TLS C1
+    for (auto& [id, attr] : enclosingFunctionAcc)   // static-local provenance
+        result->enclosingFunctionMap.set(id, attr);
     for (auto& [id, attr] : volatileAcc) result->volatileMap.set(id, attr);  // c21
     for (auto& [id, attr] : returnsTwiceAcc)   // FC17.9(c) (D-CSUBSET-SETJMP)
         result->returnsTwiceMap.set(id, attr);

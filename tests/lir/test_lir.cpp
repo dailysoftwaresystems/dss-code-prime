@@ -183,11 +183,60 @@ TEST(Lir, VirtualRegisterMintingIsMonotonic) {
     (void)std::move(b).finish();
 }
 
-TEST(Lir, LirRegEqualityIgnoresPad) {
-    LirReg const a = makeVirtualReg(5, LirRegClass::GPR);
-    LirReg b = makeVirtualReg(5, LirRegClass::GPR);
-    b._pad = 1;
-    EXPECT_TRUE(a == b);
+// D-LIR-POSITIONAL-LIRREG-INIT-MISCLASSIFIES-SILENTLY.
+//
+// ★ WHAT THIS REPLACED, AND WHY THE REPLACEMENT IS THE STRONGER TEST.
+// `LirRegEqualityIgnoresPad` stood here: it built two equal registers, poked
+// the fourth `_pad : 1` bit-field on one of them, and asserted `==` still
+// held. It was testing a hand-written `operator==` that existed only because
+// aggregate initialization could leave that bit un-zeroed — a guard against a
+// hazard, not against a defect. The hazard is gone: `LirReg` has no aggregate
+// path, `_pad` has no name to poke, and `==` is defaulted over exactly the
+// three semantic fields. This test asserts what actually ships now.
+TEST(Lir, LirRegCannotBeBuiltPositionally) {
+    // ★★ THIS IS THE RED-ON-DISABLE ARM, AND IT IS A COMPILE-TIME ONE ON
+    // PURPOSE. The property being shipped is *"this mistake can no longer be
+    // made"*, which no runtime mutant can express: the old spelling
+    // `LirReg{ord, 1, cls}` was GREEN at runtime at all 97 of its sites — that
+    // was the entire defect. So the assertion has to be about the TYPE, and it
+    // has to fire in the compiler.
+    //
+    // C++20 parenthesized aggregate initialization (P0960) is what makes the
+    // property observable to `std::is_constructible`: while `LirReg` was an
+    // aggregate, `LirReg(id, classKind, isPhysical)` was a valid initialization
+    // and the trait was `true`. ✔MEASURED 2026-08-27 against both shapes.
+    static_assert(!std::is_aggregate_v<LirReg>);
+    static_assert(!std::is_constructible_v<LirReg, std::uint32_t,
+                                           std::uint32_t, std::uint32_t>);
+    // ⚠ AND THE CONTROL, WHICH IS THE HALF THAT CATCHES A VACUOUS SEAL. A type
+    // nobody can build satisfies both lines above. These prove the two ways
+    // that DO exist still work — and that they disagree, so the seal did not
+    // simply collapse every register onto one value.
+    static_assert(std::is_trivially_default_constructible_v<LirReg>);
+    constexpr LirReg kVirt = makeVirtualReg(5, LirRegClass::FPR);
+    constexpr LirReg kPhys = makePhysicalReg(5, LirRegClass::FPR);
+    static_assert(kVirt.regClass() == LirRegClass::FPR);
+    static_assert(!kVirt.isPhysical && kPhys.isPhysical);
+    static_assert(!(kVirt == kPhys));
+    static_assert(kVirt == makeVirtualReg(5, LirRegClass::FPR));
+
+    // ⚠⚠ THE COINCIDENCE ITSELF, PINNED AT RUNTIME SO IT CANNOT COME BACK BY
+    // A DIFFERENT ROUTE. The 17 transposed sites survived because
+    // `LirRegClass::GPR == 1 == true`, so the class slot and the one-bit
+    // physical slot were interchangeable FOR GPR ONLY. Anything that reorders
+    // the enum breaks the arithmetic those sites depended on — and now also
+    // breaks this, loudly, at the tier where the meaning lives.
+    EXPECT_EQ(static_cast<int>(LirRegClass::GPR), 1)
+        << "GPR's value is what made the old positional spelling accidentally "
+           "correct; it is pinned here so the accident is documented, not "
+           "because anything may depend on it";
+    LirReg const fpr = makePhysicalReg(5, LirRegClass::FPR);
+    EXPECT_EQ(fpr.regClass(), LirRegClass::FPR)
+        << "the old spelling put FPR (2) into the ONE-BIT isPhysical field, "
+           "yielding a VIRTUAL GPR — silently";
+    EXPECT_TRUE(fpr.isPhysical);
+    EXPECT_TRUE(fpr.valid());
+    EXPECT_FALSE(InvalidLirReg.valid());
 }
 
 TEST(LirDeathTest, AddBrRejectsNonTerminatorOpcode) {

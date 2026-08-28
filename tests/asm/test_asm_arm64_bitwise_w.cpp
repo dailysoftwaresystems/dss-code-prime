@@ -9,7 +9,7 @@
 // 64-bit instruction for an operation the source declared 32 bits wide. Their
 // siblings did not: `not`/`neg`/`shl`/`shr_l`/`shr_a`/`sdiv`/`udiv`/`msub` were
 // all width-keyed and all emitted W-forms for the same `int`. ✔MEASURED in ONE
-// binary (examples/c-subset/core_bitwise, arm64 debug, before the fix):
+// binary (examples/c/core_bitwise, arm64 debug, before the fix):
 //     b_not: 2a3d03fd  mvn w29, w29        ← W-form (`not` declared width:32)
 //     b_shl: 1adc23bc  lsl w28, w29, w28   ← W-form (`shl` declared width:32)
 //     b_and: 8a1c03bc  and x28, x29, x28   ← X-form — THE DEFECT
@@ -232,10 +232,9 @@ TEST(Arm64BitwiseWForms, CPathWidth32ElectsTheWForm) {
     auto const x2 = s->registerByName("x2");
     ASSERT_TRUE(x0.has_value() && x1.has_value() && x2.has_value());
 
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const r0{static_cast<std::uint32_t>(*x0), 1, cls};
-    LirReg const r1{static_cast<std::uint32_t>(*x1), 1, cls};
-    LirReg const r2{static_cast<std::uint32_t>(*x2), 1, cls};
+    LirReg const r0 = makePhysicalReg(static_cast<std::uint32_t>(*x0), LirRegClass::GPR);
+    LirReg const r1 = makePhysicalReg(static_cast<std::uint32_t>(*x1), LirRegClass::GPR);
+    LirReg const r2 = makePhysicalReg(static_cast<std::uint32_t>(*x2), LirRegClass::GPR);
 
     // Same builder shape at both widths — the ONLY difference is the width flag,
     // so a difference in the emitted word can only come from variant election.

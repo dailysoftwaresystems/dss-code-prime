@@ -21,6 +21,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
+#include "core/types/line_map.hpp"           // LineMap (D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES)
 #include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
@@ -66,6 +67,66 @@ struct DSS_EXPORT ShippedDescriptorRef {
     BufferId              buffer;  // the buffer the include directive was found in
 };
 
+// ★★★ ONE PREPROCESSED TREE'S COORDINATE BRIDGE — the CU-lifetime carrier of
+// the fact that this tree's `source()` is a SYNTHESIZED buffer whose offsets
+// belong to no file the user can open.
+//
+// WHY IT LIVES ON THE FINISHED CU AND NOT ONLY ON THE BUILDER SIDECAR
+// ([[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]]). The preprocessor's
+// line-map remap used to die with `UnitBuilder`, so exactly one tier could use
+// it: the PARSE tier, which is the only one that runs while the builder is
+// still alive. Every LATER tier re-derives its positions from the same trees
+// (`tree.source().id()` + `tree.span(node)`) and therefore re-mints SYNTH
+// coordinates — and it lands SILENTLY, because the synth buffer is constructed
+// with the main source's NAME, so the rendering shows a plausible file with a
+// shifted line. ✔MEASURED through the CLI: a semantic `S0001` on source line 2
+// printed line 4 under two `--define`s (one prologue line each) and line 6 on a
+// target contributing two predefine lines, and an ASM-tier `A0008` did the same
+// — while an error inside an `#include`d header printed the MAIN file's name.
+// Carrying the bridge on the CU is what lets any tier ask the question.
+struct DSS_EXPORT PreprocessedPositionMap {
+    // The SYNTHESIZED buffer this tree was parsed from. Recorded ONLY when
+    // `remap` is known to be able to move a position off it (the preprocessor
+    // produced a non-empty line map), so "still names this buffer after the
+    // remap ran" is an exact internal-invariant violation and not a shrug.
+    BufferId synth;
+    // The preprocessor's `makeRemap()` closure — self-gating on `synth`, so
+    // running EVERY tree's remap over EVERY position is a no-op for the ones
+    // that do not belong to it. That is what makes the CU-level application
+    // order-free and idempotent.
+    std::function<void(BufferId&, SourceSpan&)> remap;
+
+    // ── D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES ────
+    //
+    // THE MAP ITSELF, by value, beside the closure it is derived from.
+    //
+    // ★ THIS COSTS NOTHING AND IT IS WHY THE CLOSURE WAS NEVER ENOUGH.
+    // `makeRemap()` ALREADY copies the whole `LineMap` into the closure (its
+    // own note says so: the FC2 oracle reparse re-invokes it long after the
+    // `PreprocessResult` dies, so a pointer would dangle). So the segments were
+    // always here — sealed inside a `std::function` that exposes exactly ONE
+    // direction. Carrying the map openly makes BOTH directions derivable from
+    // one owner that cannot drift, instead of inviting a second table.
+    //
+    // ⚠ The closure is NOT deleted and must not be: `Tree::remapDiagnostics`
+    // and the FC2 oracle reparse take a closure-shaped adapter. It is DERIVED
+    // from this same map (`PreprocessResult::makeRemap`), so there stays
+    // exactly one implementation of the forward direction.
+    LineMap map;
+
+    // The MAIN source's origin buffer — the file the user actually opened, as
+    // opposed to a spliced header or a synthetic prologue.
+    //
+    // ★ WITHOUT THIS THE ONLY WAY TO FIND IT IS BY NAME among
+    // `auxiliaryBuffers()`, which is a workaround wearing a lookup's clothes:
+    // the synth buffer is CONSTRUCTED WITH THE MAIN SOURCE'S NAME (that is the
+    // very reason this whole defect class stayed invisible), so a name match
+    // has two right answers and no way to choose. `PreprocessResult` already
+    // knows the id — it is `mainSourceId` — so it is carried rather than
+    // re-derived.
+    BufferId mainOrigin;
+};
+
 // Single CompilationUnit. Move-only, single-use (built by UnitBuilder::finish,
 // consumed by phase #8). Artifact-profile-agnostic (D8): the profile lives
 // on CompilationContext (06-artifact-profile-plan AP3), not here.
@@ -91,7 +152,13 @@ public:
                         pragmaPackMaps = {},
                     // TF-C85: index-parallel to `trees` — see `pragmaNoOptimizeFor`.
                     std::vector<std::unordered_set<std::uint32_t>>
-                        pragmaNoOptimizeSets = {});
+                        pragmaNoOptimizeSets = {},
+                    // One entry per PREPROCESSED tree (NOT index-parallel — a
+                    // tree that never went through the preprocessor has no
+                    // synth buffer and contributes nothing). See
+                    // `remapPreprocessedPositions`.
+                    std::vector<PreprocessedPositionMap>
+                        preprocessedPositionMaps = {});
 
     ~CompilationUnit();  // out-of-line; mirrors Tree's discipline.
 
@@ -116,10 +183,42 @@ public:
     [[nodiscard]] std::span<Tree const>          trees()             const noexcept;
 
     // HR11: the CU's DISTINCT per-tree source-language names joined in tree
-    // order ("CSubset+TsqlSubset"); a homogeneous CU yields its one name. A
+    // order ("C+TsqlSubset"); a homogeneous CU yields its one name. A
     // best-effort informational label for downstream module / type-lattice
     // `sourceLanguage` tags — purely descriptive, never a dispatch key.
     [[nodiscard]] std::string                    compositeSourceLanguage() const;
+
+    // ★ THE NAME OF THE SOURCE THIS UNIT WAS BUILT FROM — the FIRST file the
+    // builder was handed, empty for a unit with no trees at all.
+    //
+    // D-STATICLIB-MEMBER-NAME-DERIVES-FROM-THE-FIRST-SOURCE. A static-archive
+    // build lowers each CU to its OWN member and has to NAME that member; it
+    // used to name every one of them after the DRIVER'S `sourceStem` (the first
+    // file of the whole command), so `--compile u1.c u2.c --target …-staticlib`
+    // emitted `u1_0.o` AND `u1_1.o` and every member-read refusal, every `ar t`
+    // listing, pointed at a file that did not produce the member.
+    //
+    // ★★ IT IS AN ACCESSOR AND NOT A LIST THE DRIVER THREADS ALONGSIDE `cus`.
+    // The unit ALREADY holds this fact — `trees_[0]`'s buffer carries the path
+    // `UnitBuilder::addFile` opened — so a per-CU stem vector passed in
+    // parallel would be a SECOND OWNER of it, kept in step by nothing but the
+    // discipline of every future caller. An index-parallel side list is exactly
+    // the shape that desynchronizes silently: the build stays green and the
+    // names simply stop matching. Deriving it from the trees cannot drift,
+    // because there is nothing to drift FROM.
+    //
+    // ⚠ THE FIRST TREE, NOT "THE" TREE. A CU may hold several (a CU5
+    // multi-file unit; a preprocess-enabled unit whose `#include`s the import
+    // resolver appended at `finish()`), and only the FIRST is the file the
+    // caller named — the resolver appends after every `addFile`. For a
+    // preprocessed tree the buffer is the SYNTHESIZED one, which carries the
+    // MAIN SOURCE'S OWN NAME (`preprocess()` builds it
+    // `SourceBuffer::fromString(synthText, mainSource->name())`), so this stays
+    // the operator's path rather than a `<synth>` label.
+    //
+    // ⓘ A `string_view` INTO THE BUFFER, whose lifetime is the CU's: the
+    // trees are frozen at `finish()` and each holds its source `shared_ptr`.
+    [[nodiscard]] std::string_view               primarySourceName() const noexcept;
 
     // Driver-level diagnostics (file-not-found, schema-load forwarding,
     // ...). Empty in CU1 — the first D_* codes land in CU2.
@@ -203,6 +302,80 @@ public:
     [[nodiscard]] std::unordered_set<std::uint32_t> const&
     pragmaNoOptimizeFor(std::size_t treeIndex) const noexcept;
 
+    // ★★★ REWRITE ONE (buffer, span) OUT OF THIS CU'S SYNTHESIZED PREPROCESSOR
+    // COORDINATES ONTO THE ORIGIN FILE IT CAME FROM.
+    // ([[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]])
+    //
+    // A no-op for a position that names no synth buffer of this CU, and for a CU
+    // whose files were never preprocessed (no maps at all) — so a caller never
+    // has to ASK whether the remap applies, which is the property that makes it
+    // safe to put at a chokepoint every tier passes through. Idempotent: once a
+    // position has been moved onto its origin it no longer names a synth buffer,
+    // so a second application changes nothing.
+    //
+    // ⚠ FAILS LOUD rather than leaving a coordinate no file can explain: if the
+    // position still names one of this CU's recorded synth buffers after every
+    // remap has run, the line-map could not resolve an offset it was recorded as
+    // covering — an internal invariant violation, not a user error. Refusing is
+    // the point: a SILENTLY wrong line is exactly the defect this closes.
+    void remapPreprocessedPosition(BufferId& buffer, SourceSpan& span) const;
+
+    // ── D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES ────
+    //
+    // THE INVERSE of the above, and the direction that did not exist: given a
+    // position in a REAL file the user can open, where is it in the synthesized
+    // buffer a tree was actually parsed from?
+    //
+    // Appends every synth image to `out` (CLEARED first), in ascending synth
+    // order, across every preprocessed tree of this CU. EMPTY is a legitimate,
+    // meaningful answer — see `LineMap::inverse` for the three cases — and the
+    // caller must treat it as "this position is not in the program" rather than
+    // reaching for a nearby offset.
+    //
+    // ⚠ THE MIRROR OF THE FORWARD REFUSAL, AND IT IS NOT SYMMETRY FOR ITS OWN
+    // SAKE. The forward direction fails loud rather than hand back a plausible
+    // wrong line. An inverse that quietly returned a plausible-but-wrong synth
+    // offset is the SAME defect facing the other way — it would answer a hover
+    // about a different token and look entirely reasonable doing it. So the one
+    // thing this cannot do is guess: it returns exactly the images the map
+    // records, or none.
+    //
+    // ⓘ It CANNOT fail loud the way the forward direction does, and the
+    // asymmetry is real rather than an oversight: "no image" is a legal state
+    // of the world (an `#if 0` region genuinely is not in the program), whereas
+    // "still in synth coordinates after the remap ran" is a contradiction. A
+    // refusal here would fire on correct input.
+    void inversePreprocessedPositions(BufferId originBuffer,
+                                      ByteOffset originOffset,
+                                      std::vector<ByteOffset>& out) const;
+
+    // The MAIN origin buffer recorded for the tree whose `source()` is `synth`,
+    // or an INVALID BufferId when that tree was not preprocessed. This is the
+    // buffer an editor's document coordinates are expressed in.
+    //
+    // ⚠ KEYED BY SYNTH BUFFER, NOT BY TREE INDEX, and that is load-bearing:
+    // `preprocessedPositionMaps_` SKIPS every tree that was not preprocessed
+    // (`if (!sc.ppRemap) continue;`), so it is NOT index-parallel to `trees()`
+    // — its own construction note says only the SET carries meaning, not the
+    // order. An index-based lookup would silently return another tree's map in
+    // any CU that mixes preprocessed and non-preprocessed files.
+    [[nodiscard]] BufferId mainOriginForSynth(BufferId synth) const;
+
+    // The same rewrite over every diagnostic a reporter has accumulated —
+    // primary AND related locations (`DiagnosticReporter::remapBuffers` applies
+    // the closure to both). This is the form the tiers use: the semantic
+    // analyzer runs it over its own reporter before publishing the model, and
+    // the driver runs it over the per-target scratch on the way out of a
+    // compile, so no tier has to remember the coordinate system it is in.
+    void remapPreprocessedPositions(DiagnosticReporter& reporter) const;
+
+    // TRUE when `buffer` is one of this CU's SYNTHESIZED preprocessor buffers —
+    // i.e. a position naming it is in coordinates NO user file has. The
+    // discriminator behind the refusal above, exposed so a test can assert the
+    // before/after states directly rather than inferring them from rendering.
+    [[nodiscard]] bool
+    isSynthesizedPreprocessorBuffer(BufferId buffer) const noexcept;
+
 private:
     CompilationUnitId                    id_;
     std::shared_ptr<GrammarSchema const> schema_;
@@ -217,6 +390,10 @@ private:
     std::vector<std::unordered_map<std::uint32_t, std::uint32_t>> pragmaPackMaps_;
     // TF-C85: index-parallel to `trees_`, on the same by-construction terms.
     std::vector<std::unordered_set<std::uint32_t>> pragmaNoOptimizeSets_;
+    // One entry per PREPROCESSED tree — deliberately NOT index-parallel, because
+    // the question every consumer asks is "does this POSITION belong to a synth
+    // buffer", which is answered by scanning the maps, never by a tree index.
+    std::vector<PreprocessedPositionMap> preprocessedPositionMaps_;
 };
 
 // Single-use builder for CompilationUnit. Non-copyable + non-movable, same
@@ -296,7 +473,7 @@ public:
     void addInMemory(std::string source, std::string label,
                      std::shared_ptr<GrammarSchema const> schema);
 
-    // Declare a directory the c-subset import resolver searches for
+    // Declare a directory the c import resolver searches for
     // `#include "x.h"` targets (in addition to the including file's own
     // directory). The full `.dss-project.json` include-path layer is AP2's
     // job; this is the minimal hook CU4 needs. Aborts if called after finish().
@@ -430,8 +607,9 @@ private:
         std::vector<AmbiguousTypeNameCandidate> candidates;
         std::vector<std::string>                globalTypeNames;
         // The tree's own global TYPE bindings with their name-token spans —
-        // the oracle's self-definition guard (D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-
-        // NAME): a candidate whose (name, span) matches one of THIS tree's
+        // the oracle's self-definition guard
+        // (D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME):
+        // a candidate whose (name, span) matches one of THIS tree's
         // bindings is a typedef's own defining occurrence (C 6.2.1p7) and is
         // not seeded for that tree's reparse.
         std::vector<std::pair<std::string, SourceSpan>> globalTypeBindings;
@@ -446,6 +624,19 @@ private:
         // diagnostics. Empty/null when the file was not preprocessed.
         std::vector<Token>                              ppTokens;
         std::function<void(BufferId&, SourceSpan&)>     ppRemap;
+        // The SYNTHESIZED buffer's id, recorded ONLY when the preprocessor
+        // produced a line map that can actually move a position off it (a
+        // non-empty map with at least one real origin). Invalid otherwise —
+        // which keeps the CU's refusal EXACT: it fires only where the remap was
+        // known to be able to act and did not. See `PreprocessedPositionMap`.
+        BufferId                                        ppSynthBuffer;
+        // D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES: the
+        // LINE MAP itself and the MAIN origin buffer, carried beside the closure
+        // that is derived from them so BOTH directions have one owner. Recorded
+        // under exactly the same condition as `ppSynthBuffer` — see
+        // `PreprocessedPositionMap` for why the closure alone was never enough.
+        LineMap                                         ppMap;
+        BufferId                                        ppMainOrigin;
         // TF-C82 (D-PP-PRAGMA-REGISTRY): synth byte offset of an emitted token ->
         // the `#pragma pack` member-alignment cap in effect when the preprocessor
         // emitted it. EMPTY for a tree that was not preprocessed, and for every
@@ -490,5 +681,27 @@ private:
     std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers_;
     bool                                 finished_ = false;
 };
+
+// Declare `grammar`'s SYSTEM include directories on `builder` — one
+// `builder.addSystemDir` per entry of `resolveSystemDirs(grammar)`
+// (`core/types/config_path_walk.hpp`, which owns the walk).
+//
+// ★★ THE PAIRING HAS ONE OWNER TOO, AND THAT IS THE POINT —
+// D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS. This
+// used to live at `dss` namespace scope inside `program/program.cpp` behind a
+// bare forward declaration, so the LSP — which builds a `UnitBuilder` for every
+// open document — had no way to reach it and simply did not declare any system
+// dir. An editor whose CU is built differently from the compiler's is an editor
+// that answers a different question than the one the user is asking.
+//
+// It is HERE rather than beside `resolveSystemDirs` because it is the half that
+// needs a `UnitBuilder`, and `core` must not depend on `analysis`. Everything
+// that does NOT need a builder — the driver's multi-TU path, which hoists the
+// walk out of a per-file loop, and `dump_predefined_macros`, which has no
+// builder at all — calls `resolveSystemDirs` directly.
+//
+// ⚠ CALL IT BEFORE `finish()`, like every other `UnitBuilder` mutator: it
+// forwards to `addSystemDir`, which aborts after `finish()`.
+DSS_EXPORT void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar);
 
 } // namespace dss

@@ -35,7 +35,7 @@
 #   1. IDENTIFY the host (Linux / WSL / macOS, online), then RESOLVE the declared
 #      leg set from legs.json through harness_legs.py — one host-independent
 #      resolver shared with build-and-test.ps1
-#   2. use the dss-code-prime checkout at ~/src AS-IS on its CURRENT branch —
+#   2. use the dsscp checkout at ~/src AS-IS on its CURRENT branch —
 #      NEVER switched or pulled (a probe tests the working tree exactly as it is).
 #      An ABSENT (or non-checkout) dir is a REFUSAL, never a silent clone of the
 #      default branch: DSS_ALLOW_FRESH_CLONE=1 opts in and DSS_BRANCH says which
@@ -53,10 +53,10 @@
 #      ORACLE, at <OUT_DIR>/reference-testfixture — copied out of the build tree
 #      because deriving the recipe requires DELETING the make target. Step 9
 #      prints its path, or says ABSENT when this run produced none.
-#   5. build dss-code-prime              (its default CMake-4 Release build)
+#   5. build dsscp              (its default CMake-4 Release build)
 #   6. stage the third-party HEADERS DSS parses agnostically (the host's REAL tcl
-#      headers — whatever version it has — + zlib, NO descriptor — D-FFI-SHIPPED-
-#      LIBS-OS-ONLY; portable C, shared by EVERY leg) and resolve EACH LEG'S OWN
+#      headers — whatever version it has — + zlib, NO descriptor — D-FFI-SHIPPED-LIBS-OS-ONLY;
+#      portable C, shared by EVERY leg) and resolve EACH LEG'S OWN
 #      (tcl, z) library pair from the provider its catalogue entry declares
 #      (the closed set `harness_legs.py --library-providers` prints — this header
 #      does NOT re-type it, and the resolution loop's refusal does not either;
@@ -74,15 +74,15 @@
 #      harness_legs.py `--acquire` fetches/verifies/extracts/slices them once for
 #      both drivers, and Step 7 stages the result BESIDE the artefact because such
 #      a library is a stand-in whose declared runtime identity is `@loader_path/…`.
-#   7. build the full-source `testfixture` with dss-code-prime, once PER LEG,
+#   7. build the full-source `testfixture` with dsscp, once PER LEG,
 #      from a generated `.dss-project.json` manifest (dss --project mode). Every
 #      declared leg is attempted, on every host. Each leg's manifest declares
-#      c-subset / cli / the leg's <targetName>:<formatName> target / the ~185 TUs
+#      c / cli / the leg's <targetName>:<formatName> target / the ~185 TUs
 #      (absolute `sources`) / the sqlite+tcl+zlib include dirs / the recipe defines
 #      (transformed per the leg's declared `recipeTransform`) / the leg's own
 #      resolveLibraries / its declared `stackReserve`; the build routes the binary
 #      to <out>/<leg>/<formatName>/, and the COMPILER says what it named it there
-#      (`dss-code-prime: artifact <spec> <path>` — see `dss_bh_reported_artifact`; the
+#      (`dsscp: artifact <spec> <path>` — see `dss_bh_reported_artifact`; the
 #      suffix is the object format's business, not this driver's). ONE manifest
 #      generator (gen-pe64-manifest.py) serves this driver and the .ps1.
 #   8. stage each leg's run dir — including the loadext extension the corpus
@@ -109,7 +109,7 @@
 #      never ran. Structural skips are reported, never fatal; ENVIRONMENTAL skips
 #      warn by default and become FATAL under DSS_STRICT_ARM_VERDICTS=1.
 #
-# DESIGN: every step is idempotent and FAIL-LOUD. dss-code-prime exits 0 even on
+# DESIGN: every step is idempotent and FAIL-LOUD. dsscp exits 0 even on
 # fatal compile errors, so step 7 reads success from the DIAGNOSTICS (no `error[`
 # line) + the emitted binary, never `$?` (probe a6b65f8b).
 #
@@ -134,17 +134,48 @@ if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
 fi
 
 # ── config (override via environment) ────────────────────────────────────────
-# dss-code-prime is ALWAYS used at its CURRENT branch — the harness never switches
+# dsscp is ALWAYS used at its CURRENT branch — the harness never switches
 # or pulls our own repo. SQLite DOES clone-or-pull (external dependency).
+# ⚠ THE REPOSITORY IS `dss-code-prime`; ONLY THE COMMAND IS `dsscp`. This line
+# read `dsscp.git` between the rename and 2026-08-26, which is a repo that does
+# not exist — so `DSS_ALLOW_FRESH_CLONE=1` on a host without $SRC_DIR cloned
+# nothing while every OTHER tier reported green, the same silent-miss shape as
+# the 13 checkout paths the rename over-reached on and `carriage_paths_guard`
+# now refuses. `SRC_DIR` on the next line always had it right; they disagreed.
 DSS_REPO_URL="${DSS_REPO_URL:-git@github.com:dailysoftwaresystems/dss-code-prime.git}"
 SQLITE_REPO_URL="${SQLITE_REPO_URL:-git@github.com:sqlite/sqlite.git}"
 SRC_DIR="${SRC_DIR:-$HOME/src/dss-code-prime}"
+# ★★ ABSENT-HOST FALLBACK, AND IT DOES NOT WEAKEN THE "deliberately NOT the default"
+# RULE STATED FURTHER DOWN BESIDE `SELF_REPO`. That rule is about AMBIGUITY —
+# deriving by default would silently change WHICH TREE gets built where two exist
+# (the WSL gate tree vs a `/mnt/c` one), and it is correct. It says nothing about a
+# host where the preferred default does not exist AT ALL, which is the only case
+# this clause fires in, so it cannot produce the surprise that rule guards against.
+# ✔MEASURED 2026-08-26: the arm64 VPS keeps its clone at `~/src/Github/dss-code-prime`
+# (the per-host locations are declared in `scripts/leg-tree/leg-tree.sh`), so
+# `$HOME/src/dss-code-prime` named nothing there and the benchmark leg died with
+# `no dsscp binary found ... Searched under /home/ubuntu/src/dss-code-prime/build/`
+# — a directory no host on this project has.
+# ★ THIS IS A TWIN-PARITY REPAIR, not a new idea: BOTH PowerShell siblings ALREADY
+# derive the repo from their own location (`build-and-test.ps1` `$RepoRoot`,
+# `benchmark-speedtest1.ps1` `$DssSrc`), so the `.sh` half was the one guessing.
+# Pairing by EXISTENCE is not pairing by BEHAVIOUR.
+# ⚠ MUST run BEFORE `OUT_DIR`, which is derived from `SRC_DIR` one line below: a
+# fallback applied after it would fix the source tree and leave the OUTPUT tree
+# inside the directory that does not exist.
+if [[ ! -d "$SRC_DIR" ]]; then
+  dss_self_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." 2>/dev/null && pwd)" || dss_self_repo=""
+  # Only a real checkout — a script copied out of the repo falls back to nothing
+  # and keeps the original diagnostic, rather than silently building somewhere odd.
+  if [[ -n "$dss_self_repo" && -e "$dss_self_repo/.git" ]]; then SRC_DIR="$dss_self_repo"; fi
+  unset dss_self_repo
+fi
 SQLITE_DIR="${SQLITE_DIR:-$HOME/src/sqlite}"
 OUT_DIR="${OUT_DIR:-$SRC_DIR/build/real-examples/c/sqlite}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
-LANGUAGE="c-subset"
+LANGUAGE="c"
 MIN_CMAKE_MAJOR=4
-# ── WHICH dss-code-prime IS UNDER TEST — declared, not inferred ───────────────
+# ── WHICH dsscp IS UNDER TEST — declared, not inferred ───────────────
 # D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE. Step 2 used to decide this from
 # ONE filesystem fact — "does $SRC_DIR/.git exist?" — and a corpus run is hours
 # long, so an answer that is merely PLAUSIBLE is worse here than almost anywhere
@@ -178,6 +209,10 @@ DSS_ALLOW_FRESH_CLONE="${DSS_ALLOW_FRESH_CLONE:-0}"
 # script copied out of the repo suggests nothing rather than something wrong.
 SELF_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." 2>/dev/null && pwd)" || SELF_REPO=""
 [[ -n "$SELF_REPO" && -e "$SELF_REPO/.git" ]] || SELF_REPO=""
+# ⓘ `SELF_REPO` is ALSO the absent-host fallback for `SRC_DIR` — applied up beside
+# the `SRC_DIR` default itself, because `OUT_DIR` is derived FROM `SRC_DIR` and a
+# fallback applied down here would leave `OUT_DIR` pointing into the tree that does
+# not exist. See the `dss_self_repo` note at that site.
 # The directory THIS driver ships in — home of its three siblings: the leg
 # catalogue (legs.json), the leg resolver (harness_legs.py) and the driver
 # self-test (test-confound-scope.sh). Resolved ONCE so every consumer below reads
@@ -192,7 +227,11 @@ CLI_SMOKE="$SCRIPT_DIR/cli-smoke.py"
 # (D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE).
 # NOT required to exist: a checkout without .plans still runs, it just gets one
 # line saying the lookup found nothing to read.
-ANCHOR_REGISTRY="$SCRIPT_DIR/../../../.plans/_deferred-anchor-registry.md"
+# A GLOB, not a file: the registry became two documents (production /
+# tools-harness) on 2026-08-25, and reading one of them is reading half the
+# controls. Because the lookup is fail-soft, a blind one and an empty one report
+# the same thing -- so the breadth has to be built in here, not noticed later.
+ANCHOR_REGISTRY="$SCRIPT_DIR/../../../.plans/_deferred-anchor-registry*.md"
 # ── THE SHARED CORE ──────────────────────────────────────────────────────────
 # base-harness.sh holds the recipe derivation, the artifact read-back and the
 # per-(leg, artifact) verdict ledger — the decisions this driver and
@@ -342,7 +381,7 @@ DSS_KILL_SETTLE="${DSS_KILL_SETTLE:-20}"
 # Parsed and VALIDATED at Step 1 (cheap) rather than at Step 9 (hours later) —
 # an unreadable gate setting must stop the run before it costs anything.
 DSS_STRICT_ARM_VERDICTS="${DSS_STRICT_ARM_VERDICTS:-}"
-# DSS_ALLOW_NONRELEASE_COMPILER: proceed with a dss-code-prime whose own tree does
+# DSS_ALLOW_NONRELEASE_COMPILER: proceed with a dsscp whose own tree does
 # NOT say Release, instead of refusing at Step 5. It silences nothing — the run
 # then states the actual build type on the Step-5 banner and again in the Step-9
 # verdict, so a log from such a run cannot later be quoted as a controlled
@@ -504,7 +543,7 @@ declare -a CAPABILITY_GAPS=()
 DSS_CLONE_LOCK_DIR=""; DSS_CLONE_ROLE=""; DSS_CLONE_NOTES=""
 dss_clone_lock_key() {         # dss_clone_lock_key <clone-path>
   local p; p="$(cd "$1" 2>/dev/null && pwd -P)" || p="$1"
-  printf '%s/dss-code-prime/clone-locks/%s' "${XDG_CACHE_HOME:-$HOME/.cache}" \
+  printf '%s/dsscp/clone-locks/%s' "${XDG_CACHE_HOME:-$HOME/.cache}" \
     "$(printf '%s' "$p" | tr -c 'A-Za-z0-9._-' '_')"
 }
 dss_proc_marker() { ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ' || true; }
@@ -854,8 +893,8 @@ clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-
 #                             run decision, the Step-8 gate sequence, parse_segment,
 #                             the precondition discriminator (driven over real
 #                             ZERO-BYTE segment logs, so "one resume, not ten" is
-#                             asserted rather than described — D-HARNESS-
-#                             PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH),
+#                             asserted rather than described —
+#                             D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH),
 #                             acq_field and the target-keyed loader variable, each
 #                             with its red-on-disable mutation asserted to have
 #                             LANDED.
@@ -1320,8 +1359,8 @@ done
 # question — "may this host EXECUTE this leg?" — and the answer is `run.mode` off
 # the RESOLVED plan, never `if [[ $HOST_OS ]]`. It is a FUNCTION, and defined HERE
 # beside the plan it reads, so the two call sites cannot drift into two different
-# answers: that drift is what D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-
-# AVAILABLE is about, and the fix its registry row asked for is one resolver, both
+# answers: that drift is what D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-AVAILABLE
+# is about, and the fix its registry row asked for is one resolver, both
 # call sites.
 #
 # ⚠ NOTE FOR THE NEXT READER, because the obvious reading of that row is WRONG and
@@ -1638,7 +1677,7 @@ else
   ensure_cmd ar binutils
 fi
 
-# ── Step 2 — dss-code-prime (current checkout, VERIFIED, untouched) ──────────
+# ── Step 2 — dsscp (current checkout, VERIFIED, untouched) ──────────
 # WHAT THIS GATE REPLACED, AND WHY IT IS WORTH THE LINES
 # (D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE). The old form decided the whole
 # question — WHICH COMPILER a multi-hour corpus run is about to validate — from one
@@ -1665,7 +1704,7 @@ fi
 if [[ -e "$SRC_DIR/.git" ]]; then
   # `-e`, not `-d` — a `git worktree` checkout keeps .git as a FILE, and under `-d`
   # such a tree fell through to shape (c) and was refused for no reason.
-  step "2/9  Use dss-code-prime at $SRC_DIR (current checkout, untouched)"
+  step "2/9  Use dsscp at $SRC_DIR (current checkout, untouched)"
 elif dir_has_entries "$SRC_DIR"; then
   die "$SRC_DIR exists and is NOT a git checkout (no .git entry).
       That is the tree the WSL ctest gate produces: it rsyncs the working tree with
@@ -1673,17 +1712,17 @@ elif dir_has_entries "$SRC_DIR"; then
       NOT clone over it — git clone refuses a non-empty directory anyway, which is
       how this used to surface (an opaque git error from inside a helper).
       Point SRC_DIR at a real checkout:
-        SRC_DIR=${SELF_REPO:-/path/to/dss-code-prime} $0
+        SRC_DIR=${SELF_REPO:-/path/to/dsscp} $0
       or, if this tree is disposable, remove it and opt in to a clone:
         DSS_ALLOW_FRESH_CLONE=1 DSS_BRANCH=<branch> $0"
 elif [[ "$DSS_ALLOW_FRESH_CLONE" == "1" ]]; then
-  step "2/9  Clone dss-code-prime -> $SRC_DIR (DSS_ALLOW_FRESH_CLONE=1, branch: ${DSS_BRANCH:-<repo default>})"
+  step "2/9  Clone dsscp -> $SRC_DIR (DSS_ALLOW_FRESH_CLONE=1, branch: ${DSS_BRANCH:-<repo default>})"
   # ★ The third argument is the entire fix for shape (a): clone_or_update has always
   # accepted a wanted branch and honoured it (see its `else` arm) — this call site
   # passed "" and let default_branch() resolve origin/HEAD to main.
   clone_or_update "$DSS_REPO_URL" "$SRC_DIR" "$DSS_BRANCH"
 else
-  die "no dss-code-prime checkout at $SRC_DIR, and this harness will NOT clone one silently.
+  die "no dsscp checkout at $SRC_DIR, and this harness will NOT clone one silently.
       A fresh clone takes $DSS_REPO_URL at its DEFAULT branch (main) unless told
       otherwise — so an unattended multi-hour corpus run would validate a compiler
       that is not the branch you are working on, and Step 9 would print that commit
@@ -1733,7 +1772,7 @@ elif [[ "$SRC_DIVERGE" != "0" ]]; then
       ctest gate's rsync. They are INDISTINGUISHABLE from inside the tree, so the
       count rides along on the Step-9 verdict rather than the harness guessing."
 fi
-pass "dss-code-prime ready"
+pass "dsscp ready"
 # <<< dss:src-gate <<<
 
 # ── Step 2b — take the RUN LOCK on the output tree ───────────────────────────
@@ -2760,8 +2799,8 @@ _assert_recipe_capabilities "testfixture" "$RECIPE"     "${RECIPE_DEFS[@]}"
 _assert_recipe_capabilities "sqlite3 CLI" "$CLI_RECIPE" "${CLI_DEFS[@]}"
 pass "capabilities: both recipes carry all ${STAGE_REQUIRED_DEFINES// /, }"
 
-# ── Step 5 — build dss-code-prime (CMake-4 Release) ──────────────────────────
-step "5/9  Build dss-code-prime (CMake ${MIN_CMAKE_MAJOR}+ Release)"
+# ── Step 5 — build dsscp (CMake-4 Release) ──────────────────────────
+step "5/9  Build dsscp (CMake ${MIN_CMAKE_MAJOR}+ Release)"
 cmake_major() { cmake --version 2>/dev/null | sed -n '1s/.*version \([0-9]*\).*/\1/p'; }
 ensure_cmake() {
   local major; major="$(cmake_major)"
@@ -2804,14 +2843,14 @@ _dss_bdir="$SRC_DIR/build/rel"
 # `build/mac/bin` BOTH matched and `-print -quit` resolved it by filesystem
 # enumeration order. It happened to pick the tree this step rebuilds; nothing
 # guaranteed it. Same class as a pin sampling `front()` of a discovered set.
-DSS_BIN="$(find "$_dss_bdir" -type f -name dss-code-prime -perm -u+x -print -quit 2>/dev/null)"
+DSS_BIN="$(find "$_dss_bdir" -type f -name dsscp -perm -u+x -print -quit 2>/dev/null)"
 # Widen to the whole root ONLY if the tree we built has none, and SAY SO — a
 # silent widening is how the ambiguity creeps back.
 if [[ -z "$DSS_BIN" ]]; then
-  DSS_BIN="$(find "$SRC_DIR/build" -type f -name dss-code-prime -perm -u+x -print -quit 2>/dev/null)"
-  [[ -n "$DSS_BIN" ]] && warn "no dss-code-prime under $_dss_bdir; widened to a root-wide search and took $DSS_BIN"
+  DSS_BIN="$(find "$SRC_DIR/build" -type f -name dsscp -perm -u+x -print -quit 2>/dev/null)"
+  [[ -n "$DSS_BIN" ]] && warn "no dsscp under $_dss_bdir; widened to a root-wide search and took $DSS_BIN"
 fi
-[[ -n "$DSS_BIN" && -x "$DSS_BIN" ]] || die "dss-code-prime binary not found under $_dss_bdir (nor anywhere under $SRC_DIR/build)."
+[[ -n "$DSS_BIN" && -x "$DSS_BIN" ]] || die "dsscp binary not found under $_dss_bdir (nor anywhere under $SRC_DIR/build)."
 
 # ★★ THE COMPILER'S OWN BUILD TYPE IS READ FROM THE TREE THAT PRODUCED IT, AND
 # PRINTED NEXT TO ITS PATH — even here, where the two lines above are what set it.
@@ -2899,7 +2938,7 @@ if [[ "${DSS_BUILD_TYPE,,}" != "release" ]]; then
       compiler   : $DSS_BIN
       build type : $DSS_BUILD_TYPE
       read from  : $DSS_BUILD_TYPE_SRC
-      A Debug dss-code-prime is -g, no -O and no NDEBUG: it compiles the same program correctly
+      A Debug dsscp is -g, no -O and no NDEBUG: it compiles the same program correctly
       and takes several times as long, and that difference lands in whatever this run is read for.
       The .ps1 twin holds the identical gate, so a number from either driver is comparable only
       because both of them state this.
@@ -2909,7 +2948,7 @@ if [[ "${DSS_BUILD_TYPE,,}" != "release" ]]; then
   DSS_BUILD_TYPE_NOTE="  (compiler build type: $DSS_BUILD_TYPE — NOT Release, DSS_ALLOW_NONRELEASE_COMPILER=1)"
   warn "DSS_ALLOW_NONRELEASE_COMPILER=1 — proceeding with a $DSS_BUILD_TYPE compiler. TIMINGS FROM THIS RUN ARE NOT COMPARABLE with build-and-test.ps1 or with any other run of this driver, which always times a Release compiler."
 fi
-pass "dss-code-prime built: $DSS_BIN  ($DSS_BUILD_TYPE)"
+pass "dsscp built: $DSS_BIN  ($DSS_BUILD_TYPE)"
 
 # ── Step 6 — stage third-party headers + obtain per-leg libs ─────────────────
 step "6/9  Third-party headers (parsed agnostically) + per-leg tcl/zlib libraries"
@@ -3337,7 +3376,7 @@ host_system_tcl_names() {       # host_system_tcl_names <leg>  -> one candidate 
 # the substitution, never through a pipe.
 #
 # No `--cache-root`: WHERE the cache lives is a host fact the resolver already
-# decides (`cache_root()`: $DSS_HARNESS_CACHE_ROOT, else ~/.cache/dss-code-prime),
+# decides (`cache_root()`: $DSS_HARNESS_CACHE_ROOT, else ~/.cache/dsscp),
 # and a second opinion here is exactly the fork this route exists to delete.
 acquire_leg_libs() {            # acquire_leg_libs <leg>  -> acquisition JSON
   local leg="$1"
@@ -3753,8 +3792,8 @@ resolve_leg_target_cc() {       # resolve_leg_target_cc <leg>  -> 0 + LEG_CC set
   # It reuses this function's OWN refusal mechanism, the same one both failure
   # exits below use — set LEG_CC_WHY, leave LEG_CC[$leg] unset, return non-zero —
   # so the caller reports "no CONTROL compiler here" and CARRIES ON.
-  # ⚠ CORRECTED 2026-08-06 (D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-
-  # AVAILABLE): this note used to say the caller "records
+  # ⚠ CORRECTED 2026-08-06 (D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-AVAILABLE):
+  # this note used to say the caller "records
   # `skipped-build-input-missing` for THIS leg and CONTINUES" via
   # `leg_marks_missing`. That STOPPED BEING TRUE when the control became optional
   # — the caller's branch now records NO verdict in either direction, by design —
@@ -4501,8 +4540,8 @@ run_fixture_segment() {        # run_fixture_segment <leg> <bin> <launch_bin> <l
 }
 # <<< dss:corpus-engine <<<
 
-# ── Step 7 — build the full-source testfixture with dss-code-prime, per leg ──
-step "7/9  Build the full-source testfixture (dss-code-prime --project), per leg"
+# ── Step 7 — build the full-source testfixture with dsscp, per leg ──
+step "7/9  Build the full-source testfixture (dsscp --project), per leg"
 declare -A FIXTURE=()          # leg -> binary path (on success)
 declare -A COMPILE_OK=()
 COMPILE_FAILS=0
@@ -4793,7 +4832,7 @@ leg_resolve_z_library_argv() {  # leg_resolve_z_library_argv <leg> -> one token 
 # disagreed. So the compiler now REPORTS every artifact it commits, one line each, on
 # stderr:
 #
-#     dss-code-prime: artifact <targetSpec> <absolute path>
+#     dsscp: artifact <targetSpec> <absolute path>
 #
 # and the shared core reads it. The target spec is a single token BY CONSTRUCTION (DSS
 # refuses whitespace in either half of a spec), so the path is the whole REMAINDER of
@@ -4808,7 +4847,7 @@ leg_resolve_z_library_argv() {  # leg_resolve_z_library_argv <leg> -> one token 
 # ★ ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-MACOS-PROVENANCE-KILLS-OVERWRITTEN-FIXTURE
 #
 # WHY THE EXEC'D FILE MUST BE A NEW INODE, AND WHY AN IN-PLACE REBUILD IS NOT ONE.
-# dss-code-prime writes the fixture with an O_TRUNC open (src/link/writer.cpp:
+# dsscp writes the fixture with an O_TRUNC open (src/link/writer.cpp:
 # `std::ofstream out(path, … | std::ios::trunc)`), so a rebuild replaces the
 # CONTENT of the SAME inode the previous run exec'd thousands of times. On macOS 26
 # that inode can pick up a PERMANENT exec DENY: every exec is SIGKILLed (137)
@@ -4898,8 +4937,8 @@ for leg in "${LEG_ORDER[@]}"; do
   # environment: one of its two staged header dirs could not be produced (a
   # ZINC-STAGE-FAIL or a CFG-STAGE-FAIL in Step 6). `poisoned`, named, and NO
   # fallback to a sibling stage's copy — that fallback IS
-  # D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED / D-HARNESS-MACHO-LEG-INHERITS-THE-
-  # DERIVING-LINUX-HOSTS-CONFIGURE-PROBES.
+  # D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED /
+  # D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES.
   if [[ -z "${LEG_INC_FILE[$leg]:-}" ]]; then
     LEG_VERDICT["$leg"]='poisoned'
     LEG_VERDICT_DETAIL["$leg"]="this leg has no include list: its staged zlib header dir 'zinc/${LEG_HEADER_STAGE_KEY[$leg]:-?}' (declared zconfGuards: ${LEG_ZCONF_GUARDS[$leg]:-none}) and/or its staged sqlite config dir 'cfg/${LEG_CONFIG_STAGE_KEY[$leg]:-?}' (declared configureAnswers: ${LEG_CONFIGURE_ANSWERS[$leg]:-none}) was NOT produced — see the ZINC-STAGE-FAIL / CFG-STAGE-FAIL line in Step 6. Compiling it against another target's zlib header, or against the DERIVING host's sqlite_cfg.h, is refused."
@@ -5087,7 +5126,7 @@ for leg in "${LEG_ORDER[@]}"; do
       # have written anything for this leg's target. That is a compiler that
       # returned quietly without producing an artefact — a defect worth a loud
       # verdict, and no longer reachable by merely mis-spelling a file name.
-      warn "[$leg] build FAILED$(dss_bh_compile_time_suffix "$log") — 0 error[ and the build reported NO artefact for $spec (expected a 'dss-code-prime: artifact $spec <path>' line in $log)"
+      warn "[$leg] build FAILED$(dss_bh_compile_time_suffix "$log") — 0 error[ and the build reported NO artefact for $spec (expected a 'dsscp: artifact $spec <path>' line in $log)"
     elif [[ $_rc -eq 4 ]]; then
       warn "[$leg] build FAILED$(dss_bh_compile_time_suffix "$log") — 0 error[ but the artefact the build REPORTED is not there: $bin"
     else
@@ -5170,7 +5209,7 @@ done
 # is a different question, asked by the smoke gate in Step 7c. A leg this host
 # can never run is still compiled and still linked, because that is the
 # capability under test.
-step "7b/9  Build the sqlite3 CLI (dss-code-prime --project), per leg"
+step "7b/9  Build the sqlite3 CLI (dsscp --project), per leg"
 declare -A CLI_BIN=() CLI_OK=()
 CLI_FAILS=0
 for leg in "${LEG_ORDER[@]}"; do
@@ -5250,7 +5289,7 @@ for leg in "${LEG_ORDER[@]}"; do
   fi
   # rc: 0 built · 1 no artefact reported · 2 AMBIGUOUS · 3 diagnostics. Judged
   # from `error[` plus the build's own artefact report, never from the process
-  # exit status — dss-code-prime returns 0 even on fatal errors.
+  # exit status — dsscp returns 0 even on fatal errors.
   # `|| _rc=$?` is LOAD-BEARING, not style. This file runs under `set -Eeuo
   # pipefail` with an ERR trap, and a plain `bin="$(fn)"; _rc=$?` lets the
   # assignment's non-zero status trip errexit BEFORE the next line runs — the
@@ -5267,7 +5306,7 @@ for leg in "${LEG_ORDER[@]}"; do
       3) _why="$(grep -m3 -E 'error\[' "$log" | tr '\n' ' ')" ;;
       2) _why="the build log reports MORE THAN ONE artefact for $spec — see the diagnostic above and $log" ;;
       4) _why="0 error[ but the artefact the build REPORTED is not there: $bin" ;;
-      *) _why="0 error[ and the build reported NO artefact for $spec (expected a 'dss-code-prime: artifact $spec <path>' line in $log)" ;;
+      *) _why="0 error[ and the build reported NO artefact for $spec (expected a 'dsscp: artifact $spec <path>' line in $log)" ;;
     esac
     dss_bh_set_verdict "$leg" sqlite3 'poisoned' "the sqlite3 CLI did not build for $spec — $_why  See $log"
     warn "[$leg] CLI build FAILED$(dss_bh_compile_time_suffix "$log") — $_why"
@@ -5937,8 +5976,8 @@ SQLITE_TESTDIR_SUBDIR="testdir"
 #
 # ★★★ WHO BUILDS IT, SINCE 2026-08-05: DSS ITSELF, FOR THE LEG'S DECLARED
 # `sharedLibFormat` — so this function no longer needs ANY third-party compiler and
-# no leg's corpus depends on one being installed here [D-HARNESS-CROSS-HOST-ANY-
-# TARGET]. The leg's verified target compiler is now the optional CONTROL arm
+# no leg's corpus depends on one being installed here [D-HARNESS-CROSS-HOST-ANY-TARGET].
+# The leg's verified target compiler is now the optional CONTROL arm
 # (Step 6), built beside the primary where it exists and STAGED only when the
 # operator asks (DSS_LOADEXT_HELPER=reference). A leg with neither used to record
 # `skipped-build-input-missing` and skip ~330,000 units; it now simply runs.
@@ -5965,8 +6004,7 @@ SQLITE_TESTDIR_SUBDIR="testdir"
 # project keeps paying for (a capability in one driver and not the other is a
 # silent harness bug), and it is why the .ps1 can finally stage a helper at all:
 # it never could, because it had no way to build one for a target its own host
-# has no compiler for [D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-
-# UNDECLARED].
+# has no compiler for [D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED].
 #
 # TWO FAILURE CLASSES, NOT ONE — this is why the return codes are 1 and 2:
 #   1  poisoned                    a REAL failure. The primary build produced no
@@ -7445,7 +7483,7 @@ if [[ ${#CAPABILITY_GAPS[@]} -gt 0 ]]; then
       OVERSTATEMENT of coverage: those files are counted as completed.
       [D-HARNESS-CORPUS-FILES-COMPLETE-WITHOUT-ASSERTING-BECAUSE-CAPABILITIES-ARE-OFF]"
 fi
-pass "$LEDGER_VERIFIED of $LEDGER_TOTAL declared leg(s) VERIFIED: compiled the full-source testfixture + ran the $DSS_TIER unit corpus GREEN — SQLite units pass with dss-code-prime.  ($LEDGER_SKIPPED skipped: $LEDGER_STRUCTURAL structural, $LEDGER_ENVIRONMENTAL environmental, $LEDGER_HARNESS harness — each named above; $LEDGER_FAILED poisoned)"
+pass "$LEDGER_VERIFIED of $LEDGER_TOTAL declared leg(s) VERIFIED: compiled the full-source testfixture + ran the $DSS_TIER unit corpus GREEN — SQLite units pass with dsscp.  ($LEDGER_SKIPPED skipped: $LEDGER_STRUCTURAL structural, $LEDGER_ENVIRONMENTAL environmental, $LEDGER_HARNESS harness — each named above; $LEDGER_FAILED poisoned)"
 # The CLI's own closing claim, BOUNDED the same way — it names how many legs
 # built it and how many actually EXECUTED the gate, because "built" and "ran the
 # 14 assertions" are different facts and a cross leg with no launcher on this

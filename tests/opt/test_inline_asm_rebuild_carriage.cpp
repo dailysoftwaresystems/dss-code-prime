@@ -25,7 +25,7 @@
 // noticed, because the merge runs only for N>=2 CUs (`mir_merge.hpp`: the
 // single-CU path is kept byte-identical for N==1) and EVERY inline-asm example
 // in the corpus was one source file. ✔MEASURED: a 2-TU build carrying any
-// `__asm__` aborted the compiler at BOTH configs. `examples/c-subset/
+// `__asm__` aborted the compiler at BOTH configs. `examples/c/
 // c_inline_asm_crosscu_merge` is the corpus half of the fix — the first
 // example that is both multi-source and asm-carrying.
 //

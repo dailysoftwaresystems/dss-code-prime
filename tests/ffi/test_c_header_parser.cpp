@@ -19,6 +19,42 @@ using namespace dss::ffi;
 using dss::test_support::countCode;
 namespace fs = std::filesystem;
 
+// ── D-TEST-SHIPPED-CONFIG-READ-FROM-A-TREE-ANOTHER-PROCESS-IS-WRITING ─────────
+//
+// ★★★ EVERY `readCHeaderFromText` CALL BELOW RE-OPENS THE SHIPPED `c` GRAMMAR
+// FROM DISK. `readCHeaderFromText` starts with `GrammarSchema::loadShipped("c")`,
+// so this file's ~25 cases are ~25 independent reads of a 478 KB document in the
+// LIVE working tree — ✔MEASURED with a writer-denial probe, the handle on
+// `src/dss-config/sources/c.lang.json` is open for ~67% of this suite's wall
+// time. That made this the single most exposed reader of that file in the tree,
+// and it is why a neighbouring lane's in-place rewrite of it (truncate, then
+// write) turned this suite — and only this suite — red once at 8-way parallelism
+// and green on the immediate re-run.
+//
+// ★★★ THE OPT-IN THAT USED TO SIT HERE IS GONE, AND ITS ABSENCE IS THE FIX
+// LANDING RATHER THAN BEING WITHDRAWN.
+// D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED measured
+// that this suite — the one that flaked — was not even the worst reader in the
+// tree: `analysis/semantic/test_semantic_analyzer_c` held that handle for ~42 s
+// per run against this suite's ~0.9 s, and 150 test sources reached the live
+// tree the same way. So the copy moved from an OPT-IN PER SUITE registration
+// (`installPrivateConfigRoot`, exactly ONE taker, one whole 2.6 MB tree copy per
+// PROCESS) to ONE decision at the `dss_add_test` chokepoint: a snapshot taken
+// ONCE per ctest run that every entry in the repository reads
+// (cmake/DssConfigSnapshot.cmake). This suite gets the same isolation it had,
+// from the shared mechanism, and `tests/test_support/private_config_root.hpp`
+// is DELETED — two mechanisms both owning config resolution is the drift that
+// bar rejects.
+//
+// RED-ON-DISABLE now belongs to the chokepoint, not to a line in this file, and
+// it is `test_support/config_snapshot`: it asserts the override was READ rather
+// than merely set, and that the snapshot still matches the live tree file for
+// file. ⚠ The warning that registration carried still governs any hand-rolled
+// probe here: EMPTY a shipped document, never DELETE it — a deleted file makes
+// the override a set-but-MISS, `findShippedConfig` falls THROUGH to its cwd
+// ancestor walk, lands on the real repo tree and rescues the run. ✔MEASURED
+// (P31): both arms passed under a delete and the probe proved nothing.
+
 // ── Happy-path row emission ───────────────────────────────────
 
 TEST(FfiCHeaderParser, ExternFunctionLandsAsImportSurfaceRow) {
@@ -156,9 +192,9 @@ TEST(FfiCHeaderParser, ParseFailurePropagatesUnderlyingDiagnostics) {
 
 TEST(FfiCHeaderParser, IncompatibleExternRedeclarationRejectedByFrontend) {
     // pr-test-analyzer P8 fold: an INCOMPATIBLE same-symbol redeclaration must
-    // propagate the c-subset frontend's S_* / P_* code (here S_IncompatibleRe-
-    // declaration), not be silently accepted. RE-DECIDED 2026-07-18 (D-CSUBSET-
-    // EXTERN-MULTI-DECLARATOR): externDecl became a declarator-mode declaration,
+    // propagate the c frontend's S_* / P_* code (here S_IncompatibleRe-
+    // declaration), not be silently accepted. RE-DECIDED 2026-07-18
+    // (D-CSUBSET-EXTERN-MULTI-DECLARATOR): externDecl became a declarator-mode declaration,
     // so a COMPATIBLE (identical) extern redeclaration now MERGES cleanly — the
     // C-conformant behavior (C 6.7p4; gcc accepts `extern int puts(const char*);`
     // twice), whereas the legacy single-declarator externDecl over-rejected it. So

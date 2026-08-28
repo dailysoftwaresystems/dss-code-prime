@@ -105,12 +105,12 @@ struct Divergence {
 };
 
 [[nodiscard]] fs::path objectFormatsDir() {
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config" / "object-formats";
+    return *root / "object-formats";
 }
 
 // Every shipped format's NAME, enumerated from disk. A format added tomorrow is
@@ -250,8 +250,9 @@ TEST(ArchiveMemberFormatVocabulary, ObjectAndImageRelocationTablesDivergeExactly
     // relocatable/staticlib; kind 3: 33554432 vs 67108864) until 2026-08-20,
     // and this guard fired exactly as it was built to when they left. THE
     // SCHEMA EDIT WAS RE-ARGUED, which is what the failure message demands,
-    // and the argument is `D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-
-    // CONTRADICTS-ITS-OWN-ROW`: the two image documents were not a second
+    // and the argument is
+    // `D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-OWN-ROW`:
+    // the two image documents were not a second
     // honest encoding, they were SELF-REFUTING. Under the packing their own
     // comments state -- (r_type<<28)|(r_length<<25)|(r_pcrel<<24) -- 369098752
     // decodes to r_type=1 (SIGNED), 8 bytes, NOT pc-relative, for a row named

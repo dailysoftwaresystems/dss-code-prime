@@ -43,6 +43,12 @@ NodeId SemanticModel::selectedGenericExpr(NodeId id) const {
     return p ? *p : InvalidNode;
 }
 
+std::optional<std::uint64_t> SemanticModel::foldedConstantAt(NodeId id) const {
+    auto const* p = nodeToFoldedConstant_.tryGet(id);
+    if (p == nullptr) return std::nullopt;
+    return *p;
+}
+
 std::span<NodeId const> SemanticModel::usesOf(SymbolId symbol) const noexcept {
     auto it = usesBySymbol_.find(symbol.v);
     if (it == usesBySymbol_.end()) return {};

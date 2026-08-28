@@ -17,21 +17,21 @@
   "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16, "bitFieldStrategy": "gnu_packed" },
   "$tlsComment": "TLS C2 (D-CSUBSET-THREAD-LOCAL): the CPU's static-TLS layout convention — psABI-per-CPU data (AArch64 is Variant I under EVERY OS, so it lives on the TARGET, not the format; the x86_64 twin declares variant2). variant1 = the thread pointer (TPIDR_EL0) points AT the TCB head and the TLS block FOLLOWS it; a symbol's link-time thread-pointer offset is POSITIVE: tpoff = alignUp(tcbHeaderBytes, p_align) + templateOffset. tcbHeaderBytes = 16 — the AArch64 TCB header is two pointers (the psABI/glibc `tcbhead_t` prefix: dtv pointer + private). Consumed ONLY by the walker's tpoff helper (addTlsSymbolOffsets) when the format's tlsAccess.model is local-exec — a config-keyed formula selector, never a machine-identity branch.",
   "tls": { "variant": "variant1", "tcbHeaderBytes": 16 },
-  "$charIsUnsignedComment": "TF-C56 + TF-C75 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET; D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM, CLOSED) — ★ THIS KEY IS THE SINGLE SOURCE OF TRUTH FOR BARE-`char` SIGNEDNESS. The whole fact is here, in ONE key, in the ONE file that owns it: `default` is the AArch64 PROCESSOR's answer and `byObjectFormat` carries the PLATFORM overrides. Nothing on the object-format side declares this axis at all — a `charSignedness` key in a *.format.json is now REJECTED by the format loader's closed root-key vocabulary. WHY THE FACT CANNOT LIVE ON THE FORMAT: `elf` serves BOTH aarch64 (unsigned) and x86_64 (signed), so any flat value there is a lie on one of them, and making it honest would force all 24 format files to enumerate CPU architectures — a layering inversion. WHY IT CANNOT BE A BARE BOOLEAN EITHER: bare `char` (unqualified — NOT `signed char`) signedness is IMPLEMENTATION-DEFINED (C 6.2.5p15), AAPCS64 leaves it implementation-defined too, the AArch64/GNU-Linux platform ABI chose UNSIGNED, APPLE'S PLATFORM ABI CHOSE SIGNED, and clang follows the PLATFORM, not the CPU — so `true` alone would be a claim about every AArch64 platform, and it was WRONG on Darwin. MEASURED BY THIS AGENT 2026-07-28 (Darwin 25.5.0 arm64, Apple clang 21.0.0 / clang-2100.1.1.101, /usr/bin/clang — note the PATH-default clang on that host is an Android NDK build that cannot link): `clang -dM -E` defines __CHAR_UNSIGNED__ 1 for aarch64-linux-gnu and NOT for arm64-apple-darwin; `_Static_assert((char)-1 < 0)` PASSES (signed) on arm64-apple-darwin, x86_64-linux and x86_64-windows-msvc, FAILS (unsigned) on aarch64-linux-gnu; codegen is a sign-extending byte load (ldrsb) native darwin-arm64 vs a zero-extending one (ldrb) under --target=aarch64-linux-gnu. THE `pe` ROW IS A FORWARD GUARD, not dead config: there is no pe64-arm64-*.format.json today, and if one lands while PE is silent here, Windows-ARM64 silently inherits `default: true` and re-acquires the exact zero-vs-sign-extend miscompile this anchor was opened for, with no diagnostic. Declaring it now states the RULE (“Windows, like Darwin, fixes `char` signedness for every CPU it serves”). ★ THE PREPROCESSOR FACE OF THIS KEY is the `__CHAR_UNSIGNED__` row in `predefinedMacros` below, gated [\"elf\"] so it fires on exactly the leg where `default` is the effective answer. The two declarations must agree; examples/c-subset/char_signedness_macro_coherence is the test that makes a drift between them impossible to leave green. Two corpus examples witness the CODEGEN half per platform, and their arm64 rows are SUPPOSED to differ: examples/c-subset/char_signedness (macho 10 / elf 20) and examples/c-subset/char_value (macho 132 / elf 131) — ★ never flip both arm64 rows of either example together; the elf row is the unsigned-`char` leg and is correct as it stands. x86_64/pe64 use signed `char` on every format they serve and x86_64.target.json therefore OMITS this key entirely (absent ⇒ signed everywhere). Resolved by `TargetSchema::charIsUnsigned(ObjectFormatKind)` — the object format is a REQUIRED argument, there is no no-arg overload, so a caller cannot silently get the processor half alone. Consumed by HIR→MIR: `isSignedIntKind(Char)` makes the one SExt-vs-ZExt decision for the char→int integer promotion, so `(char)0x80 < 0` is FALSE on arm64-elf (zero-extend, uxtb) and TRUE on arm64-macho (sign-extend, sxtb) — correct on both.",
+  "$charIsUnsignedComment": "TF-C56 + TF-C75 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET; D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM, CLOSED) — ★ THIS KEY IS THE SINGLE SOURCE OF TRUTH FOR BARE-`char` SIGNEDNESS. The whole fact is here, in ONE key, in the ONE file that owns it: `default` is the AArch64 PROCESSOR's answer and `byObjectFormat` carries the PLATFORM overrides. Nothing on the object-format side declares this axis at all — a `charSignedness` key in a *.format.json is now REJECTED by the format loader's closed root-key vocabulary. WHY THE FACT CANNOT LIVE ON THE FORMAT: `elf` serves BOTH aarch64 (unsigned) and x86_64 (signed), so any flat value there is a lie on one of them, and making it honest would force all 24 format files to enumerate CPU architectures — a layering inversion. WHY IT CANNOT BE A BARE BOOLEAN EITHER: bare `char` (unqualified — NOT `signed char`) signedness is IMPLEMENTATION-DEFINED (C 6.2.5p15), AAPCS64 leaves it implementation-defined too, the AArch64/GNU-Linux platform ABI chose UNSIGNED, APPLE'S PLATFORM ABI CHOSE SIGNED, and clang follows the PLATFORM, not the CPU — so `true` alone would be a claim about every AArch64 platform, and it was WRONG on Darwin. MEASURED BY THIS AGENT 2026-07-28 (Darwin 25.5.0 arm64, Apple clang 21.0.0 / clang-2100.1.1.101, /usr/bin/clang — note the PATH-default clang on that host is an Android NDK build that cannot link): `clang -dM -E` defines __CHAR_UNSIGNED__ 1 for aarch64-linux-gnu and NOT for arm64-apple-darwin; `_Static_assert((char)-1 < 0)` PASSES (signed) on arm64-apple-darwin, x86_64-linux and x86_64-windows-msvc, FAILS (unsigned) on aarch64-linux-gnu; codegen is a sign-extending byte load (ldrsb) native darwin-arm64 vs a zero-extending one (ldrb) under --target=aarch64-linux-gnu. THE `pe` ROW IS A FORWARD GUARD, not dead config: there is no pe64-arm64-*.format.json today, and if one lands while PE is silent here, Windows-ARM64 silently inherits `default: true` and re-acquires the exact zero-vs-sign-extend miscompile this anchor was opened for, with no diagnostic. Declaring it now states the RULE (“Windows, like Darwin, fixes `char` signedness for every CPU it serves”). ★ THE PREPROCESSOR FACE OF THIS KEY is the `__CHAR_UNSIGNED__` row in `predefinedMacros` below, gated [\"elf\"] so it fires on exactly the leg where `default` is the effective answer. The two declarations must agree; examples/c/char_signedness_macro_coherence is the test that makes a drift between them impossible to leave green. Two corpus examples witness the CODEGEN half per platform, and their arm64 rows are SUPPOSED to differ: examples/c/char_signedness (macho 10 / elf 20) and examples/c/char_value (macho 132 / elf 131) — ★ never flip both arm64 rows of either example together; the elf row is the unsigned-`char` leg and is correct as it stands. x86_64/pe64 use signed `char` on every format they serve and x86_64.target.json therefore OMITS this key entirely (absent ⇒ signed everywhere). Resolved by `TargetSchema::charIsUnsigned(ObjectFormatKind)` — the object format is a REQUIRED argument, there is no no-arg overload, so a caller cannot silently get the processor half alone. Consumed by HIR→MIR: `isSignedIntKind(Char)` makes the one SExt-vs-ZExt decision for the char→int integer promotion, so `(char)0x80 < 0` is FALSE on arm64-elf (zero-extend, uxtb) and TRUE on arm64-macho (sign-extend, sxtb) — correct on both.",
   "charIsUnsigned": {
     "default": true,
     "byObjectFormat": { "macho": false, "pe": false }
   },
-  "$predefinedMacrosComment": "TF-C74: the per-ARCHITECTURE identity macros this CPU predefines, merged with the language's `preprocess.predefinedMacros` at preprocess time. Declared on the TARGET (like charIsUnsigned/aggregateLayout/tls above) because they are per-CPU facts; putting them on the language would force c-subset.lang.json to enumerate CPU architectures. COLLISION POLICY: a name declared by BOTH this file and the language config is a LOAD-TIME-equivalent FATAL (C_ConflictingPredefinedMacro) — neither side silently wins. GATING (MEASURED 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>`): `__aarch64__` and `__ARM_ARCH_ISA_A64` are defined by EVERY AArch64 toolchain (present on both arm64-apple-darwin and aarch64-linux-gnu) so they are UNGATED; `__arm64__` and `__arm64` are APPLE-ONLY (present on arm64-apple-darwin, ABSENT on aarch64-linux-gnu) so they are gated [\"macho\"] — shipping them ungated would leak an Apple spelling onto the ELF leg, and shipping only `__aarch64__` would clear nothing on macOS, whose SDK arch ladders (machine/_types.h, sys/cdefs.h) gate on `__arm64__`. ★ `__CHAR_UNSIGNED__` is gated [\"elf\"] (TF-C75) and is the ONE ROW HERE WHOSE GATE IS AN ABI PROPERTY RATHER THAN A VENDOR SPELLING. It is not an identity macro at all: it is the PREPROCESSOR-VISIBLE FACE of this file's `charIsUnsigned` key above. That key is the SINGLE SOURCE OF TRUTH for bare-`char` signedness — `default: true` (the AArch64 processor's answer) with `byObjectFormat` overrides making macho and pe SIGNED — so this macro must be defined on exactly the leg where the `default` is the effective answer, i.e. elf, and must NOT appear where an override fires. MEASURED BY THIS AGENT 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>` (/usr/bin/clang, Apple clang 21.0.0 / clang-2100.1.1.101): DEFINED as 1 for aarch64-linux-gnu, and NOT defined for arm64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc or x86_64-apple-darwin — so arm64×elf defines it, arm64×macho does not, and x86_64 never does (x86_64.target.json ships no such row and declares no `charIsUnsigned` at all). It could not be expressed before TF-C75 because the split is (architecture × PLATFORM) and this file is per-ARCHITECTURE; the gate now supplies the platform half, exactly as it already does for `__arm64__`. ★ THIS ROW AND THE `charIsUnsigned` KEY ABOVE STATE THE SAME FACT IN TWO NOTATIONS — a preprocessor macro and a codegen switch — SO THEY CAN DRIFT. No engine-side coherence check is possible: any such check would have to name `__CHAR_UNSIGNED__` in engine code, which is a forbidden identity branch. The anti-drift device is therefore a TEST: examples/c-subset/char_signedness_macro_coherence asserts the macro and the emitted char codegen in ONE program with per-leg exit codes, so a disagreement between the two declarations cannot be made green. If you change this row, change `charIsUnsigned` above to match, and expect that example to be the thing that tells you if you did not. SHIPPED, BUT NOT HERE -- LANDED ON THE OBJECT FORMAT (TF-C97, D-PP-FORMAT-DATA-MODEL-PREDEFINES): `__LP64__`/`_LP64` are a DATA MODEL, not an architecture -- x86_64:pe64 is LLP64 while the SAME CPU is LP64 under elf64/macho64 -- so a row here would be wrong on one of this target's own formats. This note used to read 'DELIBERATELY NOT SHIPPED' and was a HANDOFF that went four cycles uncompleted; it is now DONE: every LP64 `*.format.json` declares both spellings through the format schema's own `predefinedMacros` key (the same key name, the same shared entry grammar, the same C_ConflictingPredefinedMacro collision policy as this file's), and every LLP64/ILP32 one declares NEITHER -- the negative being the whole reason the channel sits at the format layer. Do not add them here. ★ `__BYTE_ORDER__` WAS LISTED HERE AS 'DELIBERATELY NOT SHIPPED (its value must be a macro REFERENCE, e.g. `__ORDER_LITTLE_ENDIAN__`, which needs a different mechanism than a literal Constant body)'. THAT CLAIM WAS NEVER TESTED AND IS NOW REFUTED BY MEASUREMENT (TF-C115, D-PP-ENDIANNESS-PREDEFINES): a materialized predefine is spliced over its invocation and RESCANNED like any other replacement (`preprocessor.cpp` — `spliceOver(...); continue;   // rescan from the materialized value`), so a `constant` body that NAMES another macro resolves for free. MEASURED 2026-08-04 against a patched config copy reached through DSS_CONFIG_ROOT: with `__BYTE_ORDER__` = `__ORDER_LITTLE_ENDIAN__` the probe compiled rc 0 with all 8 `#error` legs silent (`defined(__BYTE_ORDER__)`, `__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__`, `__BYTE_ORDER__ == 1234`, `__BYTE_ORDER__ != __ORDER_BIG_ENDIAN__`); the same probe on the UNPATCHED config fired 6 of the 8 (6 x P001E), one of which was the big-endian leg — the unshipped state SELECTED THE BIG-ENDIAN ARM (`0 == 0`, C 6.10.1p4), silently. The two legs that stayed SILENT on the unpatched config are the instructive pair: `__BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__` was FALSE (both operands undefined, so `0 != 0`) — an accidental agreement that would have read as a pass — and the `__BIG_ENDIAN__`-absence leg, which was correctly quiet then and must stay quiet now. Zero engine change was required. The rows are SHIPPED below. Still DELIBERATELY NOT SHIPPED: toolchain identity (`__GNUC__`/`__clang__`/`__APPLE_CC__`) which is a COMPILER profile, not a CPU, and is blocked on two absent parser features anyway (leading-position `__attribute__`, and the `inline` function specifier).",
-  "$endiannessPredefinesComment": "TF-C115 (D-PP-ENDIANNESS-PREDEFINES) — the arm64 twin of the x86_64 note; read that file's copy for the full argument, and keep the two in step. ★ DOCUMENTATION KEY ONLY: there is deliberately NO `endianness` root key. THE LAYER: endianness varies by CPU (MEASURED 2026-08-04, `clang-19 -dM -E -x c /dev/null -target <triple>`, Ubuntu clang 19.1.1 — `aarch64_be-linux-gnu` defines `__BIG_ENDIAN__` 1 and `__BYTE_ORDER__` `__ORDER_BIG_ENDIAN__`, while `aarch64-linux-gnu` defines `__LITTLE_ENDIAN__` 1 and `__BYTE_ORDER__` `__ORDER_LITTLE_ENDIAN__`) and does NOT vary across the object formats one DSS target serves — arm64 is little-endian under BOTH elf64-aarch64-linux and macho64-arm64-darwin — so it passes the very test `__LP64__` failed and belongs on the TARGET. THAT IS ALSO WHY THIS ROW IS UNLIKE `__CHAR_UNSIGNED__` ABOVE, the one row here whose gate is an ABI property: bare-`char` signedness genuinely splits (architecture × PLATFORM) and needed `availableObjectFormats`; endianness does not split on this CPU, so both rows are UNGATED. GATING (MEASURED, same run): `__LITTLE_ENDIAN__` is defined as 1 on arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu, x86_64-unknown-linux-gnu AND x86_64-pc-windows-msvc — every triple DSS targets — so, unlike `__arm64__`/`__arm64`, it is NOT an Apple-only spelling and must not be gated `[\"macho\"]`; gating it would leave the ELF leg answering `#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__` with a silent TRUE. ★ `__BIG_ENDIAN__` IS DELIBERATELY ABSENT AND THE ABSENCE IS THE DECLARATION — MEASURED present ONLY on the big-endian triple. Apple's `libkern/OSByteOrder.h:165` tests `defined(__BIG_ENDIAN__)` BEFORE the little-endian arm, so a stray row would silently select byte-swapping macros; `examples/c-subset/endianness_predefines` is red if it ever appears on any leg. NO `endianness` KEY ACCOMPANIES THESE ROWS, on the `charIsUnsigned` lesson stated above: a second notation of one fact is a drift source that needs its own coherence example to be safe, and unlike `charIsUnsigned` — which HIR→MIR really reads — no engine consumer for an endianness value exists today. THE `__ORDER_*` CONSTANTS THE VALUE NAMES LIVE ON THE LANGUAGE (c-subset.lang.json): they are invariant across every measured triple including the big-endian one, so they are a naming vocabulary, not a per-CPU fact.",
+  "$predefinedMacrosComment": "TF-C74: the per-ARCHITECTURE identity macros this CPU predefines, merged with the language's `preprocess.predefinedMacros` at preprocess time. Declared on the TARGET (like charIsUnsigned/aggregateLayout/tls above) because they are per-CPU facts; putting them on the language would force c.lang.json to enumerate CPU architectures. COLLISION POLICY: a name declared by BOTH this file and the language config is a LOAD-TIME-equivalent FATAL (C_ConflictingPredefinedMacro) — neither side silently wins. GATING (MEASURED 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>`): `__aarch64__` and `__ARM_ARCH_ISA_A64` are defined by EVERY AArch64 toolchain (present on both arm64-apple-darwin and aarch64-linux-gnu) so they are UNGATED; `__arm64__` and `__arm64` are APPLE-ONLY (present on arm64-apple-darwin, ABSENT on aarch64-linux-gnu) so they are gated [\"macho\"] — shipping them ungated would leak an Apple spelling onto the ELF leg, and shipping only `__aarch64__` would clear nothing on macOS, whose SDK arch ladders (machine/_types.h, sys/cdefs.h) gate on `__arm64__`. ★ `__CHAR_UNSIGNED__` is gated [\"elf\"] (TF-C75) and is the ONE ROW HERE WHOSE GATE IS AN ABI PROPERTY RATHER THAN A VENDOR SPELLING. It is not an identity macro at all: it is the PREPROCESSOR-VISIBLE FACE of this file's `charIsUnsigned` key above. That key is the SINGLE SOURCE OF TRUTH for bare-`char` signedness — `default: true` (the AArch64 processor's answer) with `byObjectFormat` overrides making macho and pe SIGNED — so this macro must be defined on exactly the leg where the `default` is the effective answer, i.e. elf, and must NOT appear where an override fires. MEASURED BY THIS AGENT 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>` (/usr/bin/clang, Apple clang 21.0.0 / clang-2100.1.1.101): DEFINED as 1 for aarch64-linux-gnu, and NOT defined for arm64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc or x86_64-apple-darwin — so arm64×elf defines it, arm64×macho does not, and x86_64 never does (x86_64.target.json ships no such row and declares no `charIsUnsigned` at all). It could not be expressed before TF-C75 because the split is (architecture × PLATFORM) and this file is per-ARCHITECTURE; the gate now supplies the platform half, exactly as it already does for `__arm64__`. ★ THIS ROW AND THE `charIsUnsigned` KEY ABOVE STATE THE SAME FACT IN TWO NOTATIONS — a preprocessor macro and a codegen switch — SO THEY CAN DRIFT. No engine-side coherence check is possible: any such check would have to name `__CHAR_UNSIGNED__` in engine code, which is a forbidden identity branch. The anti-drift device is therefore a TEST: examples/c/char_signedness_macro_coherence asserts the macro and the emitted char codegen in ONE program with per-leg exit codes, so a disagreement between the two declarations cannot be made green. If you change this row, change `charIsUnsigned` above to match, and expect that example to be the thing that tells you if you did not. SHIPPED, BUT NOT HERE -- LANDED ON THE OBJECT FORMAT (TF-C97, D-PP-FORMAT-DATA-MODEL-PREDEFINES): `__LP64__`/`_LP64` are a DATA MODEL, not an architecture -- x86_64:pe64 is LLP64 while the SAME CPU is LP64 under elf64/macho64 -- so a row here would be wrong on one of this target's own formats. This note used to read 'DELIBERATELY NOT SHIPPED' and was a HANDOFF that went four cycles uncompleted; it is now DONE: every LP64 `*.format.json` declares both spellings through the format schema's own `predefinedMacros` key (the same key name, the same shared entry grammar, the same C_ConflictingPredefinedMacro collision policy as this file's), and every LLP64/ILP32 one declares NEITHER -- the negative being the whole reason the channel sits at the format layer. Do not add them here. ★ `__BYTE_ORDER__` WAS LISTED HERE AS 'DELIBERATELY NOT SHIPPED (its value must be a macro REFERENCE, e.g. `__ORDER_LITTLE_ENDIAN__`, which needs a different mechanism than a literal Constant body)'. THAT CLAIM WAS NEVER TESTED AND IS NOW REFUTED BY MEASUREMENT (TF-C115, D-PP-ENDIANNESS-PREDEFINES): a materialized predefine is spliced over its invocation and RESCANNED like any other replacement (`preprocessor.cpp` — `spliceOver(...); continue;   // rescan from the materialized value`), so a `constant` body that NAMES another macro resolves for free. MEASURED 2026-08-04 against a patched config copy reached through DSS_CONFIG_ROOT: with `__BYTE_ORDER__` = `__ORDER_LITTLE_ENDIAN__` the probe compiled rc 0 with all 8 `#error` legs silent (`defined(__BYTE_ORDER__)`, `__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__`, `__BYTE_ORDER__ == 1234`, `__BYTE_ORDER__ != __ORDER_BIG_ENDIAN__`); the same probe on the UNPATCHED config fired 6 of the 8 (6 x P001E), one of which was the big-endian leg — the unshipped state SELECTED THE BIG-ENDIAN ARM (`0 == 0`, C 6.10.1p4), silently. The two legs that stayed SILENT on the unpatched config are the instructive pair: `__BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__` was FALSE (both operands undefined, so `0 != 0`) — an accidental agreement that would have read as a pass — and the `__BIG_ENDIAN__`-absence leg, which was correctly quiet then and must stay quiet now. Zero engine change was required. The rows are SHIPPED below. Still DELIBERATELY NOT SHIPPED: toolchain identity (`__GNUC__`/`__clang__`/`__APPLE_CC__`) which is a COMPILER profile, not a CPU, and is blocked on two absent parser features anyway (leading-position `__attribute__`, and the `inline` function specifier).",
+  "$endiannessPredefinesComment": "TF-C115 (D-PP-ENDIANNESS-PREDEFINES) — the arm64 twin of the x86_64 note; read that file's copy for the full argument, and keep the two in step. ★ DOCUMENTATION KEY ONLY: there is deliberately NO `endianness` root key. THE LAYER: endianness varies by CPU (MEASURED 2026-08-04, `clang-19 -dM -E -x c /dev/null -target <triple>`, Ubuntu clang 19.1.1 — `aarch64_be-linux-gnu` defines `__BIG_ENDIAN__` 1 and `__BYTE_ORDER__` `__ORDER_BIG_ENDIAN__`, while `aarch64-linux-gnu` defines `__LITTLE_ENDIAN__` 1 and `__BYTE_ORDER__` `__ORDER_LITTLE_ENDIAN__`) and does NOT vary across the object formats one DSS target serves — arm64 is little-endian under BOTH elf64-aarch64-linux and macho64-arm64-darwin — so it passes the very test `__LP64__` failed and belongs on the TARGET. THAT IS ALSO WHY THIS ROW IS UNLIKE `__CHAR_UNSIGNED__` ABOVE, the one row here whose gate is an ABI property: bare-`char` signedness genuinely splits (architecture × PLATFORM) and needed `availableObjectFormats`; endianness does not split on this CPU, so both rows are UNGATED. GATING (MEASURED, same run): `__LITTLE_ENDIAN__` is defined as 1 on arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu, x86_64-unknown-linux-gnu AND x86_64-pc-windows-msvc — every triple DSS targets — so, unlike `__arm64__`/`__arm64`, it is NOT an Apple-only spelling and must not be gated `[\"macho\"]`; gating it would leave the ELF leg answering `#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__` with a silent TRUE. ★ `__BIG_ENDIAN__` IS DELIBERATELY ABSENT AND THE ABSENCE IS THE DECLARATION — MEASURED present ONLY on the big-endian triple. Apple's `libkern/OSByteOrder.h:165` tests `defined(__BIG_ENDIAN__)` BEFORE the little-endian arm, so a stray row would silently select byte-swapping macros; `examples/c/endianness_predefines` is red if it ever appears on any leg. NO `endianness` KEY ACCOMPANIES THESE ROWS, on the `charIsUnsigned` lesson stated above: a second notation of one fact is a drift source that needs its own coherence example to be safe, and unlike `charIsUnsigned` — which HIR→MIR really reads — no engine consumer for an endianness value exists today. THE `__ORDER_*` CONSTANTS THE VALUE NAMES LIVE ON THE LANGUAGE (c.lang.json): they are invariant across every measured triple including the big-endian one, so they are a naming vocabulary, not a per-CPU fact.",
   "predefinedMacros": [
-    { "name": "__aarch64__",          "kind": "constant", "value": "1", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
-    { "name": "__ARM_ARCH_ISA_A64",   "kind": "constant", "value": "1", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
-    { "name": "__arm64__",            "kind": "constant", "value": "1", "availableObjectFormats": ["macho"], "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
-    { "name": "__arm64",              "kind": "constant", "value": "1", "availableObjectFormats": ["macho"], "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
-    { "name": "__CHAR_UNSIGNED__",    "kind": "constant", "value": "1", "availableObjectFormats": ["elf"], "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" }   },
-    { "name": "__LITTLE_ENDIAN__",    "kind": "constant", "value": "1", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
-    { "name": "__BYTE_ORDER__",       "kind": "constant", "value": "__ORDER_LITTLE_ENDIAN__", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } }
+    { "name": "__aarch64__",          "kind": "constant", "value": "1", "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
+    { "name": "__ARM_ARCH_ISA_A64",   "kind": "constant", "value": "1", "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
+    { "name": "__arm64__",            "kind": "constant", "value": "1", "availableObjectFormats": ["macho"], "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
+    { "name": "__arm64",              "kind": "constant", "value": "1", "availableObjectFormats": ["macho"], "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
+    { "name": "__CHAR_UNSIGNED__",    "kind": "constant", "value": "1", "availableObjectFormats": ["elf"], "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" }   },
+    { "name": "__LITTLE_ENDIAN__",    "kind": "constant", "value": "1", "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
+    { "name": "__BYTE_ORDER__",       "kind": "constant", "value": "__ORDER_LITTLE_ENDIAN__", "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } }
   ],
   "opcodes": [
     {
@@ -145,6 +145,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "★★ WIDTH-KEYED TO 64 AS OF 2026-08-13, AND THE KEY IS A SILENT-MISCOMPILE FIX RATHER THAN TIDYING. This variant carried NO `guard.width`, and `walker_util::variantMatchesInst` treats a width-absent guard as matching ANY width — so a width-32 `mov` with a register source selected THIS word and encoded `ORR Xd, XZR, Xm`, a 64-bit move. Nothing reported it: the guard matched, the encoder emitted, the build was green. It became reachable the moment a hand-written `.s` could write `mov w0, w1`, whose ONLY observable difference from `mov x0, x1` is that it zeroes bits 63:32. ✔MEASURED before the change: every `mov` the compiler emits with a REGISTER operand passes width-default flags (64) — the one flags-carrying emitter, `mir_to_lir.cpp`'s `emitMovToFresh`, is reached only from the constant-materialization paths, whose operand is an ImmInt32 or a LiteralIndex — so keying this to 64 and adding the W sibling below is BYTE-NEUTRAL for existing codegen. (The `[\"imm32\"]` MOVZ variant below WAS deliberately left width-absent on that same reasoning — width-32 constants DO reach it, and an X-form MOVZ zeroes all 64 bits, which is value-identical to the W form. ⓘ UPDATED 2026-08-13: it is now width-keyed at 64 with a width-32 W sibling (D-ASM-ARM64-MOVZ-W-FORM-UNDECLARED), because value-identity was never the blocker — `variantHonorsDeclaredWidth` refuses a width-absent variant elected by a width-32 REQUEST, so `mov w0, #5` could not be written at all. Every variant of this opcode is width-keyed now.)",
@@ -216,6 +217,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "imm32"] },
@@ -240,6 +242,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "imm32"] },
@@ -264,6 +267,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "imm32"] },
@@ -325,6 +329,7 @@
       "encoding": {
         "$comment": "FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): the reg-reg shape is width-keyed 64/32 — the W-form is the SAME shifted-register ADD word with sf (bit 31) CLEARED (ARM ARM C6.2.5: a W-register write zeroes the upper 32 bits of the X register, the C-defined unsigned-int wraparound for free). The imm12 shape stays width:64-only — its sole producer is the callconv sp-adjust (Ptr-width); a width-32 add-imm inst would match NOTHING and fail loud rather than silently compute with a 64-bit carry.",
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -388,6 +393,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -455,6 +461,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -478,6 +485,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -501,6 +509,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -521,6 +530,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -552,6 +562,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -573,6 +584,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -601,6 +613,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -629,6 +642,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -666,6 +680,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 32 },
@@ -695,6 +710,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
@@ -726,6 +742,7 @@
       "maxOperands":   3,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
@@ -759,6 +776,7 @@
       "maxOperands":   4,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
@@ -792,6 +810,7 @@
       "maxOperands":   4,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
@@ -843,6 +862,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -872,6 +892,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -901,6 +922,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -932,6 +954,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -963,6 +986,7 @@
       "maxOperands":   3,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg", "reg"], "width": 64 },
@@ -996,6 +1020,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1027,6 +1052,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1057,6 +1083,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1087,6 +1114,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1118,6 +1146,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1149,6 +1178,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1183,6 +1213,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 64 — `CSET Xd, <cc>` (0x9A9F07E0, sf=1). ★ THE `width` KEY IS NEW BESIDE THE width-32 SIBLING BELOW AND IS NOT OPTIONAL: `variantMatchesInst` reads an ABSENT width as MATCH-ANY, so a match-any variant beside a width-keyed one either shadows it (if first) or silently absorbs the widths it does not declare (if last) — `validateTargetSchema`'s convergence-fix D refuses the mix outright (D-CSUBSET-32BIT-ALU-FORMS), which is why this key and the sibling below arrive together or not at all. ⓘ IT CHANGES NOTHING FOR THE COMPILER'S OWN PATH: every LIR `setcc` the C front-end emits comes from `lowerICmp`/`lowerFCmp`, which pass NO width flags, so `lirInstWidthBits(0)` = 64 and this guard is exactly what they already matched.",
@@ -1210,6 +1241,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 64 (Bool default, flags=0): MOV Wd, Wm = ORR Wd, WZR, Wm (0x2A0003E0). A Bool 0/1 register zero-extends to X via the W-write (bits 63:32 cleared). Width-keyed now that the byte/half forms below are declared (the convergence rule forbids a match-any sibling beside width-keyed ones).",
@@ -1261,6 +1293,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 32: SXTW Xd, Wn (SBFM Xd,Xn,#0,#31 = 0x93407C00) — I32→I64. Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. The MIR→LIR SExt arm threads widthFlagsForType(source): an I32 source → width 32 → here.",
@@ -1303,6 +1336,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 32 },
@@ -1335,6 +1369,7 @@
       "maxOperands":      255,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["symbol"] },
@@ -1403,6 +1438,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 64: LDUR Xt, [Xn, #simm9] (0xF8400000). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. Every GPR integer/pointer load carries width 64 (memAccessWidthFlags returns 0 ⇒ width 64 for non-Char GPR types).",
@@ -1462,6 +1498,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 64: STUR Xt, [Xn, #simm9] (0xF8000000). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. Every GPR integer/pointer store carries width 64 (memAccessWidthFlags returns 0 ⇒ width 64 for non-Char GPR types).",
@@ -1521,6 +1558,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 64: LDR Xt, [Xn, #pimm] (0xF9400000). accessSize 8 ⇒ imm12 = byteOffset/8 (e.g. [sp,#192] ⇒ imm12=24). Every GPR integer/pointer load carries width 64.",
@@ -1580,6 +1618,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 64: STR Xt, [Xn, #pimm] (0xF9000000). accessSize 8 ⇒ imm12 = byteOffset/8. Every GPR integer/pointer store carries width 64.",
@@ -1639,6 +1678,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": [] },
@@ -1678,6 +1718,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": [] },
@@ -1698,6 +1739,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["symbol"] },
@@ -1851,6 +1893,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["symbol"] },
@@ -1879,6 +1922,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1953,6 +1997,7 @@
       "maxSuccessors": 255,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"] },
@@ -1965,12 +2010,12 @@
       }
     },
     {
-      "$comment": "D-AS3-BLOCK-REL-IMM19/26: conditional intra-function jump with mandatory fallthrough. 2-WORD macro: `B.cond <ifTrue>` (word 0) then `B <ifFalse>` (word 1) — the AArch64 analog of x86's `0F 8x rel32; E9 rel32` compound. word0 = B.cond base 0x54000000 (opcode bits 24..31 = 0b01010100, bit 4 = 0); the cond nibble (bits 0..3) comes from the inst's payload (TargetCondCode) via `condCodeFromPayload` + the schema's `condCodeEncoding` table; the 19-bit signed PC-relative offset (bits 5..23, scaled by 4) goes to the Imm19 slot → ifTrue block. word1 = B base 0x14000000 with the Imm26 slot → ifFalse (fallthrough) block. Both displacements resolve at assemble time (BlockRef operands, no relocation). operand[0]=ifTrue (taken when cond holds), operand[1]=ifFalse. A future optimizer elides word1 when ifFalse is the next-laid-out block (D-OPT-JCC-FALLTHROUGH). Mirrors the x86 jcc wiring + the lea multi-word fixedWords+wordIndex shape.",
+      "$comment": "D-AS3-BLOCK-REL-IMM19/26: conditional intra-function jump with mandatory fallthrough. 2-WORD macro: `B.cond <ifTrue>` (word 0) then `B <ifFalse>` (word 1) — the AArch64 analog of x86's `0F 8x rel32; E9 rel32` compound. word0 = B.cond base 0x54000000 (opcode bits 24..31 = 0b01010100, bit 4 = 0); the cond nibble (bits 0..3) comes from the inst's payload (TargetCondCode) via `condCodeFromPayload` + the schema's `condCodeEncoding` table; the 19-bit signed PC-relative offset (bits 5..23, scaled by 4) goes to the Imm19 slot → ifTrue block. word1 = B base 0x14000000 with the Imm26 slot → ifFalse (fallthrough) block. Both displacements resolve at assemble time (BlockRef operands, no relocation). operand[0]=ifTrue (taken when cond holds), operand[1]=ifFalse. D-OPT-JCC-FALLTHROUGH: the SECOND variant is the FALLTHROUGH FORM — word0 alone, 4 bytes instead of 8 — selected by OPERAND COUNT when `lir_peephole`'s rule R2 drops the trailing BlockRef operand because ifFalse IS the next-laid-out block, both successors staying on the block. `lir_verifier`'s Rule 1b refuses the shortened operand list wherever that unnamed successor is not the block laid out next. Mirrors the x86 jcc wiring + the lea multi-word fixedWords+wordIndex shape.",
       "mnemonic":      "jcc",
       "result":        "none",
       "terminatorKind": "cond-br",
       "hasSideEffects": true,
-      "minOperands":   2,
+      "minOperands":   1,
       "maxOperands":   2,
       "minSuccessors": 2,
       "maxSuccessors": 2,
@@ -1984,6 +2029,14 @@
               { "index": 0, "slotKind": "imm19", "wordIndex": 0 },
               { "index": 1, "slotKind": "imm26", "wordIndex": 1 }
             ]
+          },
+          {
+            "$comment": "D-OPT-JCC-FALLTHROUGH: the FALLTHROUGH FORM. Word 0 alone — `B.cond <ifTrue>` (base 0x54000000 + the payload cond nibble, Imm19 → ifTrue) — WITHOUT the trailing `B <ifFalse>` word: 4 bytes instead of 8. Note `fixedWord` (singular) rather than `fixedWords`: a one-word macro is a one-word template, and the Imm19 wire drops its `wordIndex` with it. Selected when the instruction carries ONE BlockRef operand instead of two, which `lir_peephole`'s rule R2 produces by dropping the trailing operand once the ifFalse successor IS the next-laid-out block.",
+            "guard":    { "operandKinds": ["blockref"] },
+            "template": { "fixedWord": 1409286144, "condCodeFromPayload": true },
+            "wires":    [
+              { "index": 0, "slotKind": "imm19" }
+            ]
           }
         ]
       }
@@ -1996,6 +2049,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -2027,6 +2081,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -2058,6 +2113,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -2089,6 +2145,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -2120,6 +2177,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -2152,6 +2210,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -2181,6 +2240,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "$comment": "F64 source → FCVT Sd, Dn (narrow to single).",
@@ -2211,13 +2271,14 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 2658664448 },
             "resultSlot": "rd",
             "wires":      [
-              { "index": 0, "slotKind": "rn" }
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
             ]
           },
           {
@@ -2226,7 +2287,7 @@
             "template":   { "fixedWord": 2654470144 },
             "resultSlot": "rd",
             "wires":      [
-              { "index": 0, "slotKind": "rn" }
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
             ]
           }
         ]
@@ -2238,8 +2299,26 @@
       "result":        "value",
       "minOperands":   1,
       "maxOperands":   1,
+      "lowering": {
+        "$comment": "D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE. ★ THIS IS NOT A SPECIAL CASE AND NOT A `native` FLAG — it is the same kind of row x86-64's seven-step fp_to_ui carries, ONE ENTRY LONG, because on this machine the operation genuinely IS one instruction. Declaring it makes the statement uniform: every target STATES how the operation is realized, and the shared substrate reads one thing and emits what it was told. ✔MEASURED under qemu-aarch64 on all ten conversion probes (both directions, both source float widths, u32 and u64, at and above 2^31/2^63): 10/10 agree with gcc-13 and clang-19 — FCVTZU Xd is genuinely full-range from BOTH a Dn and an Sn source, so the one-step declaration is TRUE and not a half-truth. The step names this very opcode; that is well-founded, not circular, because a step is emitted as a MACHINE instruction and never re-expanded (the loader enforces it by requiring every step's opcode to declare an encoding).",
+        "sequences": [
+          {
+            "guard": { "width": 64 },
+            "steps": [
+              { "op": "fp_to_ui", "result": "result", "resultClass": "gpr", "width": 64, "operands": [{ "source": 0 }] }
+            ]
+          },
+          {
+            "guard": { "width": 32 },
+            "steps": [
+              { "op": "fp_to_ui", "result": "result", "resultClass": "gpr", "width": 32, "operands": [{ "source": 0 }] }
+            ]
+          }
+        ]
+      },
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "F64 source → FCVTZU Xd, Dn — ftype=01 double, base 0x9E790000 (the low 32 bits are the in-range U32 result; the full Xd is the NATIVE full-range U64).",
@@ -2247,7 +2326,7 @@
             "template":   { "fixedWord": 2658729984 },
             "resultSlot": "rd",
             "wires":      [
-              { "index": 0, "slotKind": "rn" }
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
             ]
           },
           {
@@ -2256,7 +2335,7 @@
             "template":   { "fixedWord": 2654535680 },
             "resultSlot": "rd",
             "wires":      [
-              { "index": 0, "slotKind": "rn" }
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
             ]
           }
         ]
@@ -2270,12 +2349,13 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "SCVTF Dd, Xn — sf=1 64-bit signed source -> double. base 0x9E620000. The sqlite i64 -> volatile double blocker.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 2657222656 },
-            "resultSlot": "rd",
+            "resultRegClass": "fpr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
@@ -2284,7 +2364,7 @@
             "$comment": "SCVTF Dd, Wn — sf=0 32-bit signed source -> double. base 0x1E620000 (the arm64 analog of cvtsi2sd xmm,r32; an I32 fits the F64 result exactly).",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 509739008 },
-            "resultSlot": "rd",
+            "resultRegClass": "fpr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
@@ -2298,14 +2378,32 @@
       "result":        "value",
       "minOperands":   1,
       "maxOperands":   1,
+      "lowering": {
+        "$comment": "D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE — the one-entry form of the same row x86-64 needs seven steps for. UCVTF Dd,Xn is full-range over the whole u64 and UCVTF Dd,Wn over the whole u32, so BOTH declarations are true at their declared width; the destination stays fixed at F64/Dd on this target, and an F32 destination still has no realization at all and fails loud upstream (D-CSUBSET-INT-TO-F32-CODEGEN) rather than being half-declared here.",
+        "sequences": [
+          {
+            "guard": { "width": 64 },
+            "steps": [
+              { "op": "ui_to_fp", "result": "result", "resultClass": "fpr", "width": 64, "operands": [{ "source": 0 }] }
+            ]
+          },
+          {
+            "guard": { "width": 32 },
+            "steps": [
+              { "op": "ui_to_fp", "result": "result", "resultClass": "fpr", "width": 32, "operands": [{ "source": 0 }] }
+            ]
+          }
+        ]
+      },
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "UCVTF Dd, Xn — sf=1 64-bit unsigned source -> double. base 0x9E630000.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 2657288192 },
-            "resultSlot": "rd",
+            "resultRegClass": "fpr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
@@ -2314,7 +2412,7 @@
             "$comment": "UCVTF Dd, Wn — sf=0 32-bit unsigned source -> double. base 0x1E630000.",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 509804544 },
-            "resultSlot": "rd",
+            "resultRegClass": "fpr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
@@ -2330,6 +2428,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"] },
@@ -2354,11 +2453,12 @@
       "encoding": {
         "$comment": "FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN): width-keyed pair — LDUR Dt (8-byte, 0xFC400000, width 64) vs LDUR St (4-byte, size=10 → 0xBC400000, width 32; ARM ARM C7.2 LDUR SIMD&FP). lowerLoad threads the loaded type's width for FPR-class results: an 8-byte D-load of a 4-byte F32 rodata item would read past the item.",
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
             "template":   { "fixedWord": 4232052736 },
-            "resultSlot": "rd",
+            "resultRegClass": "fpr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"             },
               { "index": 1, "slotKind": "membase.noscale" },
@@ -2369,7 +2469,7 @@
             "$comment": "FC3.5: LDUR St, [Xn, #simm9] — size=10 single, base 0xBC400000 (4-byte load).",
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
             "template":   { "fixedWord": 3158310912 },
-            "resultSlot": "rd",
+            "resultRegClass": "fpr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"             },
               { "index": 1, "slotKind": "membase.noscale" },
@@ -2391,12 +2491,13 @@
       "encoding": {
         "$comment": "FC3.5 sweep-c2: width-keyed pair — STUR Dt (8-byte, width 64) vs STUR St (4-byte, 0xBC000000, width 32). lowerStore threads the stored VALUE's type width for FPR-class stores; the regalloc spill path stays width-default 64 over 8-byte slots (value-preserving for both float widths).",
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "fixedWord": 4227858432 },
             "wires":    [
-              { "index": 0, "slotKind": "rd"             },
+              { "index": 0, "slotKind": "rd", "regClass": "fpr"             },
               { "index": 1, "slotKind": "rn"             },
               { "index": 2, "slotKind": "membase.noscale" },
               { "index": 3, "slotKind": "imm9"           }
@@ -2407,7 +2508,7 @@
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
             "template": { "fixedWord": 3154116608 },
             "wires":    [
-              { "index": 0, "slotKind": "rd"             },
+              { "index": 0, "slotKind": "rd", "regClass": "fpr"             },
               { "index": 1, "slotKind": "rn"             },
               { "index": 2, "slotKind": "membase.noscale" },
               { "index": 3, "slotKind": "imm9"           }
@@ -2427,12 +2528,13 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
             "template": { "fixedWord": 1015021568 },
             "wires":    [
-              { "index": 0, "slotKind": "rd"             },
+              { "index": 0, "slotKind": "rd", "regClass": "vr"             },
               { "index": 1, "slotKind": "rn"             },
               { "index": 2, "slotKind": "membase.noscale" },
               { "index": 3, "slotKind": "imm9"           }
@@ -2452,15 +2554,167 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
             "template":   { "fixedWord": 1019215872 },
-            "resultSlot": "rd",
+            "resultRegClass": "vr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"             },
               { "index": 1, "slotKind": "membase.noscale" },
               { "index": 2, "slotKind": "imm9"           }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: cross-class bit-copy GPR -> SIMD&FP register. The arm64 declaration of the SAME shared verb x86_64 declares as MOVQ xmm, r/m64 — the vocabulary is `movq_gpr_to_xmm` on BOTH targets and the bytes differ, which is the whole point of a target descriptor. FMOV (general), 'Conversion between FP and integer' group: sf [31] | 00 [30:29] | 11110 [28:24] | ftype [23:22] | 1 [21] | rmode=00 [20:19] | opcode=111 [18:16] | 000000 [15:10] | Rn [9:5] | Rd [4:0]. WIDTH AXIS = the SOURCE INTEGER width, the same axis si_to_fp/ui_to_fp above key on: width 64 -> FMOV Dd, Xn (sf=1, ftype=01, base 0x9E670000 = 2657550336); width 32 -> FMOV Sd, Wn (sf=0, ftype=00, base 0x1E270000 = 505872384). ★ THE UPPER-LANE ZEROING IS LOAD-BEARING AND IT IS MEASURED, NOT ASSUMED: a write to the D or S view of a SIMD&FP register zeroes every bit above it, so after the width-32 form bytes 4..7 of the register read ZERO and a following byte-lane count over 8 bytes still answers the 32-bit population count. ✔MEASURED 2026-08-26 by EXECUTION under qemu-aarch64 with the destination register pre-dirtied to all-ones via `movi v0.16b, #0xFF` — had the zeroing not happened the probe would have reported 32 extra bits. `registerClass: gpr` is the SOURCE bank (Rn); `resultRegClass: fpr` is the DESTINATION bank (Rd) — the identical split si_to_fp declares, and the reason the encoder cannot silently write a GPR ordinal into an FP field (D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD). Byte-pins verified against aarch64-linux-gnu-as: `fmov s3, w7` = 0x1E2700E3, `fmov d3, x7` = 0x9E6700E3.",
+      "mnemonic":      "movq_gpr_to_xmm",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FMOV Dd, Xn — 64-bit source integer into the D view. base 0x9E670000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657550336 },
+            "resultRegClass": "fpr", "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FMOV Sd, Wn — 32-bit source integer into the S view; bits 32..127 of the destination are zeroed by the write.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505872384 },
+            "resultRegClass": "fpr", "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: cross-class bit-copy SIMD&FP register -> GPR — the EXACT MIRROR of `movq_gpr_to_xmm` above, and a SEPARATE opcode for the reason x86_64's twin rows state verbatim: the variant guard keys only on (operandKinds, width) and BOTH directions are `reg` at the same width, so one opcode carrying both would silently pick a direction. Same FMOV (general) group with opcode=110 [18:16] instead of 111: width 64 -> FMOV Xd, Dn (sf=1, ftype=01, base 0x9E660000 = 2657484800); width 32 -> FMOV Wd, Sn (sf=0, ftype=00, base 0x1E260000 = 505806848). `registerClass: fpr` is the SOURCE bank (Rn), `resultRegClass: gpr` the DESTINATION bank (Rd) — the reverse of the row above, exactly as fp_to_si is the reverse of si_to_fp. ⚠ NOT declared on `movq_xclass`: that opcode is consumed BIDIRECTIONALLY by MIR Bitcast, and giving it either direction's bytes would silently mis-encode the other — the same trap x86_64's row documents. arm64 therefore still declares NO `movq_xclass` and a cross-class Bitcast still fails loud there; closing that is a different row's work, not this one's. Byte-pins verified against aarch64-linux-gnu-as: `fmov w7, s3` = 0x1E260067, `fmov x7, d3` = 0x9E660067.",
+      "mnemonic":      "movq_xmm_to_gpr",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FMOV Xd, Dn — the D view's 64 bits into a 64-bit GPR. base 0x9E660000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657484800 },
+            "resultRegClass": "gpr", "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FMOV Wd, Sn — the S view's 32 bits into a 32-bit GPR (a W write zeroes bits 63:32 of the X view).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505806848 },
+            "resultRegClass": "gpr", "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: PER-LANE population count over the register's EIGHT BYTE LANES — each byte of the operand is replaced by the number of set bits in that byte (0..8). The DSS verb is `popcount_bytes` and it names the OPERATION and the lane element, never the ISA: an x86_64 target with AVX-512 VPOPCNTB would declare this same row with its own bytes and inherit the sequence below unchanged. AArch64 realization CNT Vd.8B, Vn.8B (AdvSIMD two-register misc): 0 [31] | Q=0 8B [30] | U=0 [29] | 01110 [28:24] | size=00 [23:22] | 10000 [21:17] | opcode=00101 [16:12] | 10 [11:10] | Rn [9:5] | Rd [4:0] = 0x0E205800 = 237000704. Q=0 selects the 8-BYTE arrangement, which reads and writes only the low 64 bits and zeroes bits 64..127 — so this row is honestly a 64-bit operation on the `fpr` (D-view) bank and needs no allocatable `vr` register. The guard is keyed at width 64 for that reason: the instruction always processes eight bytes regardless of how wide the VALUE that reached it was, and a caller emitting it at any other width gets A_NoMatchingEncodingVariant rather than a lane count it did not ask for. Byte-pin verified against aarch64-linux-gnu-as: `cnt v3.8b, v7.8b` = 0x0E2058E3.",
+      "mnemonic":      "popcount_bytes",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 237000704 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: HORIZONTAL ADD of the register's eight byte lanes into the lowest lane — the reduction that turns eight per-byte counts into one total. The DSS verb is `addlanes_bytes`; it is the necessary partner of `popcount_bytes` and the reason this row's registry entry could NOT be closed by 'declare arm64 popcount as CNT', which was the closing work the row carried from 2026-07-15 until it was measured: CNT ALONE answers eight separate per-byte counts sitting in eight lanes, not a population count, so a single-opcode declaration on the `popcount` slot would have been a silent miscompile. AArch64 realization ADDV Bd, Vn.8B (AdvSIMD across lanes): 0 [31] | Q=0 8B [30] | U=0 [29] | 01110 [28:24] | size=00 [23:22] | 11000 [21:17] | opcode=11011 [16:12] | 10 [11:10] | Rn [9:5] | Rd [4:0] = 0x0E31B800 = 238139392. The destination is the B (8-bit) view, which is sufficient WITHOUT SATURATION: eight lanes of at most 8 sum to at most 64, and 64 fits an unsigned byte. Writing the B view zeroes bits 8..127, so the following cross-class move reads the total with no masking step. Guard keyed at width 64 for the same reason as `popcount_bytes` — the instruction always reduces eight bytes. Byte-pin verified against aarch64-linux-gnu-as: `addv b3, v7.8b` = 0x0E31B8E3.",
+      "mnemonic":      "addlanes_bytes",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 238139392 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-FULLC-STDBIT-ARM64-CNT-POPCOUNT (2026-08-26): MIR Popcount's arm64 realization. ★ THIS ROW HAS NO `encoding`, AND THAT IS THE FACT — AArch64 has no scalar-GPR population-count instruction at all, so there is no single instruction to name; what it has is a SIMD lane counter plus a lane reduction, reached through a register-bank round trip. That is four instructions, and D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE is exactly the vocabulary for saying so: the row states 'on this target this operation is realized by these machine instructions', PLURAL, and the shared substrate emits what it was told. ★★ WHAT THIS REPLACES AND WHY THE OLD PLAN WAS WRONG. Both this registry row and the x86_64 `popcount` row's own comment said a future arm64 would 'share this slot' with CNT and need no lowering change. ✔MEASURED and REFUTED: CNT alone produces eight per-byte counts in eight lanes and is not a population count, and it writes the SIMD bank while MIR Popcount's result is an integer — so a one-instruction declaration would have been a silent miscompile in two independent ways. The capability split DID survive intact, but at the level of the SEQUENCE, not the instruction. ★ NO REGISTER CLASS IS ADDED. The temporaries are `fpr` (the D/S views), which AAPCS64 already makes allocatable; the 8-byte lane arrangement touches only the low 64 bits, so the 128-bit `vr` class stays non-allocatable exactly as its register rows say. Sequence temporaries are FRESH VIRTUAL REGISTERS the ordinary allocator assigns — nothing is reserved and no fixed scratch is stolen. ★ THE FALLBACK STAYS REACHABLE. `lowerPopcount` probes this mnemonic; a target that declares no `popcount` row still lowers MIR Popcount to the branchless SWAR bit-trick, which remains pinned by the x86_64-minus-`popcount` mutant in tests/lir/test_mir_to_lir.cpp and by the arm64 mutant beside it. ✔MEASURED 2026-08-26 by EXECUTION under qemu-aarch64: the exact four-instruction sequence answers __builtin_popcountl for 0, 1, all-ones, the single high bit, byte-spread patterns and 0x5555...., at BOTH widths, with the destination register pre-dirtied to all-ones first. 4 instructions replace the SWAR's 22.",
+      "mnemonic":      "popcount",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "lowering": {
+        "$comment": "The width axis is the OPERAND's promotion width P, which is what mir_to_lir's bit-count arms thread as the operation width (the count itself is always a small integer). Both sequences share steps 2 and 3 — the lane count and the lane reduction are width-blind because the 8-byte arrangement is a property of the INSTRUCTION, not of the value that reached it. Only the two cross-class moves carry the width, and on the 32-bit arm the entry move's upper-lane zeroing is what makes the shared 8-byte tail correct.",
+        "sequences": [
+          {
+            "$comment": "P = 64. vec = FMOV Dd,Xn (all eight source bytes land in lanes 0..7); lanes = CNT (per-byte counts); sum = ADDV (total, 0..64, in the B view); result = FMOV Xd,Dn.",
+            "guard": { "width": 64 },
+            "steps": [
+              { "op": "movq_gpr_to_xmm", "result": "vec",    "resultClass": "fpr", "width": 64, "operands": [{ "source": 0 }] },
+              { "op": "popcount_bytes",  "result": "lanes",  "resultClass": "fpr", "width": 64, "operands": [{ "temp": "vec"   }] },
+              { "op": "addlanes_bytes",  "result": "sum",    "resultClass": "fpr", "width": 64, "operands": [{ "temp": "lanes" }] },
+              { "op": "movq_xmm_to_gpr", "result": "result", "resultClass": "gpr", "width": 64, "operands": [{ "temp": "sum"   }] }
+            ]
+          },
+          {
+            "$comment": "P = 32. Identical but for the two moves: FMOV Sd,Wn puts the four source bytes in lanes 0..3 AND zeroes lanes 4..7, so the shared 8-byte CNT/ADDV tail counts exactly the 32 bits that were asked about; FMOV Wd,Sn reads the total back into a W register.",
+            "guard": { "width": 32 },
+            "steps": [
+              { "op": "movq_gpr_to_xmm", "result": "vec",    "resultClass": "fpr", "width": 32, "operands": [{ "source": 0 }] },
+              { "op": "popcount_bytes",  "result": "lanes",  "resultClass": "fpr", "width": 64, "operands": [{ "temp": "vec"   }] },
+              { "op": "addlanes_bytes",  "result": "sum",    "resultClass": "fpr", "width": 64, "operands": [{ "temp": "lanes" }] },
+              { "op": "movq_xmm_to_gpr", "result": "result", "resultClass": "gpr", "width": 32, "operands": [{ "temp": "sum"   }] }
             ]
           }
         ]
@@ -2626,14 +2880,22 @@
     { "name": "w30",  "class": "gpr", "widthBytes": 4, "subOf": "x30",  "hwEncoding": 30 },
     { "name": "wzr", "class": "gpr", "widthBytes": 4, "subOf": "xzr", "hwEncoding": 31 }
   ],
-  "$asmConstraintsComment": "★★★ WHICH GNU INLINE-ASM CONSTRAINT LETTER MEANS WHICH REGISTER IS TARGET VOCABULARY — see the twin block in x86_64.target.json for the full rationale and for the [[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]] line this facet is drawn on. What THIS file adds is the proof that the mapping is config and not code.\n★★ THIS TARGET IS THE COUNTER-EXAMPLE THAT MAKES THE FACET NECESSARY. ✔MEASURED, aarch64-linux-gnu-gcc 13.3.0 `-O2 -S`: `\"=a\"` here is `error: impossible constraint in 'asm'` — and so are `b`, `c`, `d`, `D` and `q`, every one of which x86_64 declares. A shared C++ table would have had to branch on the architecture to say that; this file says it by SAYING NOTHING, and the consumer's refusal renders the valid list from whichever target it was handed.\n✔MEASURED with three competing live `\"r\"` operands: r→x0, w→v0, `\"m\"(*p)`→`[x0]`, `\"i\"(7)`→`7`. ⚠ NOTE `i` → `7` with NO sigil while x86_64 emits `$7`: the sigil is DIALECT grammar, which is exactly why the operandKind (`imm32`) is identical on both targets and the printing is not this file's business.\n★ `w` → `vr`, NOT `fpr`, AND THE MEASUREMENT SETTLES IT RATHER THAN INTUITION. gcc's `w` is the V register file; the natural guess is that a `double` bound with `\"=w\"` should be `d0`. ✔MEASURED: `double dw(double a){ __asm__(\"# W %0 %1\" : \"=w\"(o) : \"w\"(a)); }` emits `# W v0 v0` — gcc's DEFAULT print for a `w` operand is the V-register name regardless of the C type. The `d0`/`s0` narrow spellings come from the `%d0`/`%s0` operand MODIFIERS, which are dialect grammar and live with the dialect. So `vr` is the exact answer and `fpr` would have been the plausible wrong one.\n⚠ DELIBERATELY NOT DECLARED: `x` and `y`. Both bind V registers here (✔MEASURED x→v0, y→v0), and the restriction is MEASURED, not taken from the letter's documented meaning — the probe pushes N simultaneous live operands through one asm and reads the largest N that still compiles: **r=30, w=30, x=16, y=8**. ★ READ THOSE CAREFULLY: 30 is the ALLOCATOR CEILING, not a set size — `r` and `w` both stop there, and this target declares 65 gpr / 32 vr rows — so `w` is only proven to be ≥30 and is taken as the full V file. `x`=16 and `y`=8 sit BELOW that ceiling, which is what makes them genuine subclass measurements (V0-V15 and V0-V7) rather than 'too many operands'. The `w` control clinches it: it COMPILES the identical 18-operand asm that `x` refuses, printing `v0 v1 v2 v3 v4 v5 v6 v7 v16 v17 v18 v19 v20 v21 v22 v23 v24 v25`. TargetRegClass cannot express a SUBSET, so declaring `x` or `y` as plain `vr` would load clean, read as support, and hand the allocator registers gcc forbids ⇒ the same refusal x86_64 applies to `Q`, and the deferral is stated in full in that file's twin comment (a FOURTH binding axis — an explicit register-name list — deliberately not built; trigger: the first client whose inline asm uses a subclass letter, which ✔MEASURED none does today).\n⚠ Also absent: `k` (the stack pointer). ✔MEASURED in BOTH directions — `\"=k\"` as an output AND `\"k\"` as an input are each `error: inconsistent operand constraints in an 'asm'` — so there is no measured binding to declare. The two-direction check matters: an earlier note asserted only the output half, which would have left the input half an untested guess sitting inside a sentence that read as a measurement.",
+  "$asmConstraintsComment": "★★★ WHICH GNU INLINE-ASM CONSTRAINT LETTER MEANS WHICH REGISTER IS TARGET VOCABULARY — see the twin block in x86_64.target.json for the full rationale and for the [[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]] line this facet is drawn on. What THIS file adds is the proof that the mapping is config and not code.\n★★ THIS TARGET IS THE COUNTER-EXAMPLE THAT MAKES THE FACET NECESSARY. ✔MEASURED, aarch64-linux-gnu-gcc 13.3.0 `-O2 -S`: `\"=a\"` here is `error: impossible constraint in 'asm'` — and so are `b`, `c`, `d`, `D` and `q`, every one of which x86_64 declares. A shared C++ table would have had to branch on the architecture to say that; this file says it by SAYING NOTHING, and the consumer's refusal renders the valid list from whichever target it was handed.\n✔MEASURED, aarch64-linux-gnu-gcc 13.3.0 `-O2 -S`, with three competing live `\"r\"` operands: r→x0, w→v0, `\"m\"(*p)`→`[x0]`, `\"i\"(7)`→`7`. ⚠ THE COMPILER IS NAMED HERE BECAUSE ITS ABSENCE COST A CYCLE. Every arrow in this block is what **gcc PRINTS** — the evidence that the binding on the row below is the right one. It is not, and never was, a claim about what THIS compiler emits. An elided subject read as one: a lane took `\"m\"(*p)`→`[x0]` for a DSS capability claim, found the pipeline refusing the letter, and filed the two halves as a contradiction inside one config (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED). The row was RIGHT and the pipeline was WRONG — `\"m\"` is realized end-to-end now, witnessed by execution in `examples/c/c_inline_asm_memory_operand`. ⇒ the subject of a measurement is STATED in this file, never inferred from the paragraph it sits in. ⚠ NOTE `i` → `7` with NO sigil while x86_64 emits `$7`: the sigil is DIALECT grammar, which is exactly why the operandKind (`imm32`) is identical on both targets and the printing is not this file's business.\n★ `w` → `vr`, NOT `fpr`, AND THE MEASUREMENT SETTLES IT RATHER THAN INTUITION. gcc's `w` is the V register file; the natural guess is that a `double` bound with `\"=w\"` should be `d0`. ✔MEASURED: `double dw(double a){ __asm__(\"# W %0 %1\" : \"=w\"(o) : \"w\"(a)); }` emits `# W v0 v0` — gcc's DEFAULT print for a `w` operand is the V-register name regardless of the C type. The `d0`/`s0` narrow spellings come from the `%d0`/`%s0` operand MODIFIERS, which are dialect grammar and live with the dialect. So `vr` is the exact answer and `fpr` would have been the plausible wrong one.\n⚠ DELIBERATELY NOT DECLARED: `x` and `y`. Both bind V registers here (✔MEASURED x→v0, y→v0), and the restriction is MEASURED, not taken from the letter's documented meaning — the probe pushes N simultaneous live operands through one asm and reads the largest N that still compiles: **r=30, w=30, x=16, y=8**. ★ READ THOSE CAREFULLY: 30 is the ALLOCATOR CEILING, not a set size — `r` and `w` both stop there, and this target declares 65 gpr / 32 vr rows — so `w` is only proven to be ≥30 and is taken as the full V file. `x`=16 and `y`=8 sit BELOW that ceiling, which is what makes them genuine subclass measurements (V0-V15 and V0-V7) rather than 'too many operands'. The `w` control clinches it: it COMPILES the identical 18-operand asm that `x` refuses, printing `v0 v1 v2 v3 v4 v5 v6 v7 v16 v17 v18 v19 v20 v21 v22 v23 v24 v25`. TargetRegClass cannot express a SUBSET, so declaring `x` or `y` as plain `vr` would load clean, read as support, and hand the allocator registers gcc forbids ⇒ the same refusal x86_64 applies to `Q`, and the deferral is stated in full in that file's twin comment (a FOURTH binding axis — an explicit register-name list — deliberately not built; trigger: the first client whose inline asm uses a subclass letter, which ✔MEASURED none does today).\n⚠ Also absent: `k` (the stack pointer). ✔MEASURED in BOTH directions — `\"=k\"` as an output AND `\"k\"` as an input are each `error: inconsistent operand constraints in an 'asm'` — so there is no measured binding to declare. The two-direction check matters: an earlier note asserted only the output half, which would have left the input half an untested guess sitting inside a sentence that read as a measurement.",
   "asmConstraints": [
     { "$comment": "The general-register class. ✔x0 — and x86_64's SAME letter `r` resolves into a register set that contains rax and no x0. One letter, two targets, disjoint registers: the operator-required proof that this mapping is config, not code.",
       "letter": "r", "binds": "registerClass", "registerClass": "gpr" },
     { "letter": "w", "binds": "registerClass", "registerClass": "vr"  },
-    { "$comment": "✔MEASURED `\"m\"(*p)` → `[x0]` — a DIFFERENT printed form from x86_64's `(%rdi)` for the identical `membase` binding, which is the vocabulary/grammar split visible in one line.",
+    { "$comment": "✔MEASURED `\"m\"(*p)` → `[x0]` — a DIFFERENT printed form from x86_64's `(%rdi)` for the identical `membase` binding, which is the vocabulary/grammar split visible in one line. ★ REALIZED END-TO-END, AND THAT SENTENCE IS NEW: the pipeline used to REFUSE this letter with `has no resolved register class — the constraint letter was never bound to a processor`, about the row you are reading. The resolution carried only two of `binds`’ three arms, so a declared form-bound letter was byte-identical to an undeclared one. The ADDRESS is what gets a register; the form decides what the template writes around it. (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED; witnessed by execution in `examples/c/c_inline_asm_memory_operand`.) ★ THE OUTPUT DIRECTION (`\"=m\"`, `\"+m\"`, `\"=&m\"`) IS REALIZED TOO, BY THE SAME CARRIAGE: the operand's ADDRESS in a register, with the direction living entirely inside the template's own instruction (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED; witnessed by execution in `examples/c/c_inline_asm_memory_output_operand`, whose aarch64 arms run under qemu). ⚠ THIS SENTENCE REPLACED ONE THAT SAID THE OPPOSITE and had gone stale one cycle after it was written (*\"a different mechanism and is still refused BY NAME\"*); a config comment that reads as evidence is worth exactly as much as its last re-measurement (D-CONFIG-ASM-CONSTRAINT-COMMENT-CLAIMS-A-REFUSAL-THAT-NO-LONGER-EXISTS).",
       "letter": "m", "binds": "operandKind",   "operandKind":   "membase" },
-    { "letter": "i", "binds": "operandKind",   "operandKind":   "imm32"   }
+    { "$comment": "✔MEASURED, aarch64-linux-gnu-gcc 13.3.0 `-O2 -S`: `\"i\"(7)` → a bare `7`, where x86_64 prints `$7` for the IDENTICAL `imm32` binding — the sigil is DIALECT grammar, which is why the operandKind is the same on both targets and the printing is not this file's business. ★ REALIZED END-TO-END, AND THAT SENTENCE IS NEW: the pipeline used to REFUSE this letter by name (`binds the operand form 'imm32', which this pipeline does not yet realize`) while this row correctly declared it. An immediate binds NO register — the number is written INTO the instruction — so the VALUE travels instead, as an ordinary MIR `Const`. (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED; witnessed by execution in `examples/c/c_inline_asm_immediate_operand`, which emits `add x28, x28, #0x5` here and `add $0x5,%r14d` on x86_64.) ⚠ THE OPERAND MUST BE AN INTEGER CONSTANT EXPRESSION AND IS PROVEN ONE, NOT ASSUMED: ✔MEASURED, gcc 13.3.0 at -O0 AND -O2 on THIS target, a runtime value here is `error: impossible constraint in 'asm'`, and DSS refuses it too. The accepted set is gcc's — `\"i\"(1+2)` → `3`, `\"i\"(sizeof(int))` → `4`. An `\"=i\"` OUTPUT is refused on both sides (gcc: `output number 0 not directly addressable`). ⓘ THE TARGET'S OWN ENCODING GUARDS STILL APPLY UNDERNEATH: `add`'s imm12 variant declares `immMax: 4095` and a larger value falls through to the shifted word-pair — the constraint says the operand is a 32-bit immediate, the opcode rows say how each value is spelled in bytes.",
+      "letter": "i", "binds": "operandKind",   "operandKind":   "imm32"   }
+  ],
+  "$asmBareOperandWidthsComment": "★★★ WHICH REGISTER VIEW A **BARE** `%0` NAMES — the half `asmConstraints` cannot answer, because it is about the width a REFERENCE states rather than about which register a LETTER binds (D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE). ✔MEASURED 2026-08-27 from emitted code, never from documentation: `aarch64-linux-gnu-gcc` 13.3.0 AND `clang-19 --target=aarch64-linux-gnu`, `-O0` and `-O2`, template `__asm__(\"BARE %0 END\" : : \"r\"(v))` read out of `-S` — the 64-bit `x` name comes back for EVERY integer type: `_Bool`, `char`, `unsigned char`, `short`, `int`, `unsigned int`, `long`, `long long`, `void *` and `__int128` alike. The operand's own type does not enter into it. `%w` is how 32 bits is asked for, and clang says so in its own words under `-Wasm-operand-widths` (*\"value size does not match register size\"*, fix-it *use constraint modifier \"w\"*) on the exact source DSS used to miscompile. ⚠ THE OTHER PORT'S ANSWER IS THE OPPOSITE AND THAT IS WHY THIS IS DECLARED RATHER THAN DERIVED: x86_64 renders `%al`/`%ax`/`%eax`/`%rax`, tracking the type exactly. No width arithmetic reproduces both — *narrowest view ≥ the type width* yields `w0` for an `int` here (gcc renders `x0`), and *the widest view* yields `%rax` for an `int` there (gcc renders `%eax`). ★★ AND IT IS A TARGET FACT, CHECKED WITH THE INSTRUMENT `asmConstraints`' OWN CHARTER DEMANDS: under `-masm=att` vs `-masm=intel` on one processor the selected VIEW is identical and only the sigil moves, while the control (`movq %rsi, (%rdi)` → `mov QWORD PTR [rdi], rsi`) moves as a dialect fact must.",
+  "$asmBareOperandWidthsFpComment": "⚠ `fpr` AND `vr` ARE DECLARED `operandType` DELIBERATELY, AND THE DIFFERENCE FROM THE REFERENCE IS MEASURED RATHER THAN OVERLOOKED. ✔MEASURED 2026-08-27, gcc 13.3.0 and clang 19.1.1: a `\"w\"`-bound `float`, `double` AND `long double` all render `v0` here — the full vector name, at every width — so this port's FP rule is `registerNatural` too, and gcc expects the author to write `%s0`/`%d0` for a scalar view. DSS CANNOT ADOPT THAT YET AND MUST NOT PRETEND TO: this target declares NO FP width views (`registers` carries no `s0`/`d0`/`h0`/`b0`/`q0` row with a `subOf`) and this dialect declares no `%s`/`%d` modifier letters, so `registerNatural` here would widen every FP template operand to 128 bits with NO vocabulary left to ask for 32 or 64 back — turning working scalar-FP templates into wrong-width ones, which is the very defect the gpr row above fixes, in the opposite direction. `operandType` is what ships today and what keeps `fmov s`/`fmov d` selection honest. The FP half needs the view rows and the letters first; it is a strictly larger job and no shipped example is in that shape (this row's own blast-radius census: 27 divergent operand references, all integer `\"r\"`, zero FP).",
+  "asmBareOperandWidths": [
+    { "class": "gpr", "derivation": "registerNatural" },
+    { "class": "fpr", "derivation": "operandType" },
+    { "class": "vr",  "derivation": "operandType" }
   ],
   "$registerClassOpsComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): per-register-class move/load/store mnemonics — the same FC2 Part B table x86_64 declares. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (L_RequiredLirOpcodeMissing), because the class-blind alternative is a silent miscompile (a GPR ORR/LDUR against a D-register hwEncoding assembles to valid-looking words that move the WRONG register file). fpr: move=FMOV(D), load=LDUR(D), store=STUR(D).",
   "registerClassOps": [
@@ -2717,6 +2979,8 @@
       "aggregateMaxRegBytes":    16,
       "$aggregateStackExhaustsComment": "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: Apple arm64 inherits AAPCS64 stage-C register assignment (the Apple divergences are variadic-always-stack + small-int widening, NOT the composite placement rule) — a stacked composite EXHAUSTS the overflowed class, same as aapcs64.",
       "aggregateStackExhaustsRegisters": true,
+      "$stackArgPackingComment": "D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED — the NON-variadic half of D-FF3-APPLE-ARM64-ABI-DIVERGENCE, and the three axes MEASURED to differ rather than one boolean. Apple clang 21.0.0 / macOS 26.5.2, `otool -tV` of a `-target arm64-apple-macos` object, against `aarch64-linux-gnu-gcc 13.3.0` `objdump -d` on the same sources (2026-08-24): (1) NAMED SCALARS pack NATURALLY — `char,short,int,long,char` land at +0,+2,+4,+8,+16 and `float,float,double,float` at +0,+4,+8,+16 (the FPR pool obeys the same rule), where AAPCS64 uses one 8-byte slot each (+0,+8,+16,+24); (2) NAMED AGGREGATES keep whole 8-byte slots on BOTH — a 3-byte struct then an `int` puts the int at +8, a 12-byte struct puts it at +16; (3) VARIADIC args keep 8-byte slots on BOTH — Apple's caller emits `str x` at +8,+16. A single boolean would therefore encode Apple's own ABI wrongly on two of the three axes. Omitting a key means \"slot\", so aapcs64/sysv/ms_x64 declare nothing and stay byte-identical.",
+      "stackArgPacking": { "namedScalars": "natural", "namedAggregates": "slot", "variadic": "slot" },
       "indirectResultRegister":  "x8",
       "$fprComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): the SIMD&FP register vocabulary is IDENTICAL to AAPCS64 (Apple's documented divergences are variadic/indirect-result rules, not register assignment): args d0..d7, return d0, v0-v7/v16-v31 caller-saved, v8-v15 callee-saved in their LOW 64 BITS only (d8..d15 — same F128/SIMD-cycle caveat as the aapcs64 row's $calleeSavedFprComment).",
       "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18",

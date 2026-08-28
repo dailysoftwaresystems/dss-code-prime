@@ -25,9 +25,9 @@
 //                      diagnostics; `abi_catalog.cpp`'s `kAbiCatalog`
 //                      still SELECTS THE CALLING CONVENTION from a
 //                      table keyed on (target name, this enum) — an
-//                      OPEN identity branch, anchored at [[D-FFI-ABI-
-//                      CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-
-//                      IDENTITY]], NOT a sanctioned use.
+//                      OPEN identity branch, anchored at
+//                      [[D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY]],
+//                      NOT a sanctioned use.
 //                      ⚠ THIS BULLET USED TO READ "FF4 C-mangling
 //                      dispatches on `ObjectFormatKind` (per-format
 //                      leading-underscore rule)", which `c_mangle.cpp`
@@ -180,12 +180,32 @@ static_assert([] {
 // paragraph explaining is the ONE spelling that passes the name lookup and
 // then silently matches nothing. The filter is the point.
 //
-// The `- 1` is the sentinel, and `namesWhere` CHECKS it: a second unselectable
-// enumerator, or a new selectable one, makes this initializer a compile error
-// rather than a list that quietly stops matching what the check accepts.
+// ⚠⚠ THE COUNT USED TO BE `kObjectFormatKindCount - 1` AND THAT SPELLING COULD
+// NOT FAIL. D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY.
+// `kObjectFormatKindCount` IS `kObjectFormatKindTable.rows.size()`, and
+// `namesWhere<M>` compares `M` against the rows THIS TABLE's predicate accepts:
+// with a predicate that rejects exactly the one sentinel row, both sides were
+// computed from the same array and moved together. A SEVENTH format kind
+// compiled clean — while the comment that stood here said it "makes this
+// initializer a compile error", which was ✔MEASURED FALSE.
+//
+// ★ WHAT REPLACES IT, AND WHY IT TAKES TWO PARTS. ✔MEASURED with
+// `g++ -std=c++23 -fsyntax-only` over a nine-arm probe (see the full write-up
+// at `kSelectableExitMechanismNames` in `core/types/target_schema.hpp`): the
+// literal count reds on a NEW SELECTABLE enumerator but NOT on a second
+// UNSELECTABLE one, which is exactly the case the derived spelling did catch.
+// The literal alone therefore moves the blind spot rather than closing it. The
+// `static_assert` below pins the number of rows the predicate REJECTS, relating
+// the table's own row count to the projection's literal count — so both
+// mutations red, and the sentence above is true as written.
 inline constexpr auto kSelectableObjectFormatKindNames =
-    namesWhere<kObjectFormatKindCount - 1>(kObjectFormatKindTable,
-                                           isSelectableObjectFormatKind);
+    namesWhere<5>(kObjectFormatKindTable, isSelectableObjectFormatKind);
+static_assert(kObjectFormatKindTable.rows.size()
+                  == kSelectableObjectFormatKindNames.size() + 1,
+              "kObjectFormatKindTable must have exactly ONE unselectable row "
+              "(the 'unknown' sentinel) — a second one leaves `namesWhere`'s "
+              "literal count matching while every 'expected one of …' message "
+              "silently stops naming the set the check accepts");
 
 // ── C-symbol decoration scheme (D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN) ──
 //
@@ -439,8 +459,8 @@ dataImportBindingFromName(std::string_view s) noexcept {
     return kDataImportBindingTable.fromName(s);
 }
 
-// ── Extern-ADDRESS materialization binding (D-LK-ARM64-EXTERN-DATA-
-//     ADDR-PIE-GOT, TF-C52) ───────────────────────────────────────
+// ── Extern-ADDRESS materialization binding (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT,
+//     TF-C52) ───────────────────────────────────────
 //
 // How code MATERIALIZES the ADDRESS of an undefined/preemptible extern
 // (function OR data) as a LIVE code-form VALUE — an argument, an
@@ -747,6 +767,36 @@ runtimeLibraryRoleName(RuntimeLibraryRole r) noexcept {
 runtimeLibraryRoleFromName(std::string_view s) noexcept {
     return kRuntimeLibraryRoleTable.fromName(s);
 }
+
+// ── THE SELECTABLE SPELLINGS — the table MINUS the `none` sentinel ────────
+//
+// D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET: the roles a
+// `.format.json` may actually write. Every `runtimeLibraries[].role` arm
+// resolves the spelling and then rejects `RuntimeLibraryRole::None` explicitly,
+// so the accepted set is the table minus that one row.
+//
+// ★ BESIDE THE ENUM, NOT IN THE LOADER. The projection is a property of the
+// vocabulary; a copy inside whichever TU happens to render it makes the COUNT a
+// per-reader decision, which is how one of them ended up spelled so it could
+// never fail. `object_format_schema_json.cpp` and the projection pin in
+// `tests/link/` both consume this now.
+[[nodiscard]] constexpr bool
+isSelectableRuntimeLibraryRole(RuntimeLibraryRole r) noexcept {
+    return r != RuntimeLibraryRole::None;
+}
+
+// ⚠ Literal `M` plus the sentinel-count assert, both halves required — see the
+// nine-arm measurement written out at `kSelectableExitMechanismNames` in
+// `core/types/target_schema.hpp`
+// (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
+inline constexpr auto kSelectableRuntimeLibraryRoleNames =
+    namesWhere<3>(kRuntimeLibraryRoleTable, isSelectableRuntimeLibraryRole);
+static_assert(kRuntimeLibraryRoleTable.rows.size()
+                  == kSelectableRuntimeLibraryRoleNames.size() + 1,
+              "kRuntimeLibraryRoleTable must have exactly ONE unselectable row "
+              "(the 'none' sentinel) — a second one leaves `namesWhere`'s "
+              "literal count matching while the role refusals silently stop "
+              "naming the set the loader accepts");
 
 // One `runtimeLibraries` row: a role and the image identity that plays it.
 struct DSS_EXPORT RuntimeLibraryBinding {
@@ -1073,16 +1123,25 @@ struct DSS_EXPORT StackReserveControl {
 //     ALONGSIDE an ordinary binding — `N_WEAK_DEF` (0x0080) in the nlist's
 //     `n_desc`, on a symbol that is otherwise `N_SECT|N_EXT` (`macho.cpp`).
 //
-// ★ WHY ALL THREE SHIP AS VOCABULARY, AND WHAT THAT DOES NOT CLAIM. Each names
-// an encoder that EXISTS in this tree today, so none is a verb shipped ahead of
-// its walker arm (the `StackReserveVehicle` discipline). What the vocabulary
-// does NOT claim is that every writer CONSULTS the declaration: only the COFF
-// object writer does today, and only the pe object/staticlib documents declare
-// the block, precisely so that no shipped document carries a key nobody reads.
-// Widening consultation to the ELF and Mach-O writers is
-// [[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]] — and
-// each format document gains the key IN THE SAME CHANGE as its writer's
-// consultation, never before it.
+// ★ WHY ALL THREE SHIP AS VOCABULARY. Each names an encoder that EXISTS in
+// this tree today, so none is a verb shipped ahead of its walker arm (the
+// `StackReserveVehicle` discipline).
+//
+// ★★ ALL THREE ARE NOW CONSULTED BY THE WALKER THAT WRITES THEM
+// ([[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]],
+// cycle P28). The shared gate is `link/format/weak_definition_gate.hpp`, called
+// once by `pe::encode`'s Obj arm, once by `elf::encode`, and once by
+// `macho::encode`'s MH_OBJECT arm. A format document gains the key IN THE SAME
+// CHANGE as its writer's consultation, never before it — which is why the
+// shipped corpus declares it on 16 of 24 documents and not on 24: the four
+// Mach-O IMAGE documents, the two pe IMAGE documents, wasm and spirv encode no
+// weak definition in any spelling, so a declaration there would be a key nobody
+// reads, drifting silently while reading as authoritative.
+//
+// ★ AND THE SET IS CHECKED FROM BOTH ENDS. `ObjectFormatBackend::
+// weakDefinitionDialects()` reports which dialects a WALKER spells, so the
+// loader refuses a document declaring a dialect its own backend does not write
+// — a mis-declaration fails at LOAD rather than at the first weak definition.
 enum class WeakDefinitionDialect : std::uint8_t {
     // Zero is the INVALID sentinel and has NO JSON spelling — deliberately
     // absent from the table below, so `weakDefinitionDialectFromName` cannot

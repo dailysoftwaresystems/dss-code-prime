@@ -25,3 +25,16 @@ target_link_libraries(dss_lsp_test_lsp_semantic   PRIVATE nlohmann_json::nlohman
 # test). Mirror the include path the semantic suite already wires up.
 target_include_directories(dss_lsp_test_lsp_semantic
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+dss_add_test(NAME lsp/test_lsp_coordinates      SOURCES test_lsp_coordinates.cpp)
+target_include_directories(dss_lsp_test_lsp_coordinates
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS: the
+# editor and the driver must give the SAME verdict on the same file, in BOTH
+# directions. It drives a real `LspServer` AND the real `Program`, so it needs
+# nlohmann (to build the `didOpen` payload with correct escaping — the source
+# fixtures contain quotes and newlines that a hand-built string literal would
+# mis-frame).
+dss_add_test(NAME lsp/test_lsp_driver_agreement SOURCES test_lsp_driver_agreement.cpp)
+target_link_libraries(dss_lsp_test_lsp_driver_agreement
+                      PRIVATE nlohmann_json::nlohmann_json)

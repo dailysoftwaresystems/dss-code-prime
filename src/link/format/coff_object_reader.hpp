@@ -114,8 +114,8 @@
 //     the same bare N_SECT with no discriminator at all. Reading either
 //     reader as the template for the other is what let whole file-local
 //     functions be demoted here.
-//     ⓘ (c) is what closes D-LK-COFF-ARCHIVE-MEMBER-READER-LOSES-STATIC-
-//     RODATA-SYMBOLS, and it is the only clause that reaches a symbol in
+//     ⓘ (c) is what closes D-LK-COFF-ARCHIVE-MEMBER-READER-LOSES-STATIC-RODATA-SYMBOLS,
+//     and it is the only clause that reaches a symbol in
 //     TRAILING position: (d) sees nothing there, because the preceding
 //     atom already runs to the section end and therefore covers it. So a
 //     `static const` array after an exported one is placed by (c) or not

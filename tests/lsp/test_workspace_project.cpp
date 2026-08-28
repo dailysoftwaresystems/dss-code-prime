@@ -20,6 +20,9 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/project_config.hpp"   // dss::loadProjectConfig — the SHARED
+#include "core/types/target_spec.hpp"     // dss::TargetSpec — the ONE
+                                           // `<targetName>:<formatName>`
+                                           // splitter, now reached DOWNWARD
                                            // parser the LSP must be running
 #include "lsp/schema_cache.hpp"
 #include "lsp/workspace_project.hpp"
@@ -84,7 +87,7 @@ void writeFile(fs::path const& dir, std::string_view name, std::string_view body
 // these fixtures are manifests a human would actually commit.
 [[nodiscard]] std::string manifest(std::string_view targetsJsonArray) {
     return std::string{R"({
-  "language": "c-subset",
+  "language": "c",
   "artifactProfile": "cli",
   "targets": )"} + std::string{targetsJsonArray} + R"(,
   "sources": ["main.c"]
@@ -114,9 +117,44 @@ TEST(WorkspaceProject, PercentEncodedUriIsDecoded) {
 // guessed path would search the wrong tree and report the wrong project — the
 // exact silent-answer shape this cycle removed from the resolver.
 TEST(WorkspaceProject, NonFileUriIsRefusedRatherThanGuessed) {
+    // Refused on EVERY leg: neither is a `file:` URI at all.
     EXPECT_FALSE(pathFromFileUri("vscode-vfs://github/o/r").has_value());
-    EXPECT_FALSE(pathFromFileUri("file://someremotehost/share/x").has_value());
     EXPECT_FALSE(pathFromFileUri("untitled:Untitled-1").has_value());
+
+    // ★★★ AND THE NAMED-AUTHORITY CASE IS PLATFORM-SPLIT, BECAUSE THE SAME TEXT
+    // MEANS TWO DIFFERENT THINGS. [[D-LSP-FILE-URI-WITH-A-UNC-AUTHORITY-DOES-NOT-ROUND-TRIP]]
+    //
+    // ⚠ THIS CASE USED TO ASSERT A FLAT `EXPECT_FALSE` HERE, and ✔MEASURED
+    // 2026-08-28 that put it in DIRECT CONTRADICTION with
+    // `FileUriRoundTrip` the moment MSVC ran this suite: MSVC's `fs::path`
+    // models `//server/share` as a real `root_name()`, so `fileUriFromPath`
+    // emits `file://server/share/x.c` and losslessness REQUIRES the inverse to
+    // accept exactly the shape this line refused. Two live assertions, same
+    // input, opposite verdicts — and the flat one had never been challenged
+    // because no Windows leg could build MSVC.
+    //
+    // ⇒ Where UNC roots exist the URI NAMES A PATH and must round-trip; where
+    // they do not, it names a remote HOST and accepting it would be the guess
+    // this case is about. The expectation is derived from the SAME question the
+    // implementation asks — `root_name()` on a `//host/share` spelling — and the
+    // two arms are named explicitly, exactly as `FileUriRoundTrip` names its
+    // three renderings rather than widening to "anything goes".
+    const bool uncIsAPathHere =
+        !std::filesystem::path{"//dss-unc-probe/share"}.root_name().empty();
+    auto const unc = pathFromFileUri("file://someremotehost/share/x");
+    if (uncIsAPathHere) {
+        ASSERT_TRUE(unc.has_value())
+            << "this platform models `//host/share` as a root name, so that URI "
+               "names a UNC PATH — refusing it is what breaks the round trip on "
+               "our own emitted form";
+        EXPECT_EQ(unc->generic_string(), "//someremotehost/share/x")
+            << "the authority must come back where it came from, unaltered";
+    } else {
+        EXPECT_FALSE(unc.has_value())
+            << "this platform has no UNC root, so `//someremotehost/share/x` is "
+               "not a path spelling — turning the authority into one would be a "
+               "guess about a remote host";
+    }
 }
 
 // ── ★★ THE PROPERTY: one extension, two workspaces, two answers ─────────────
@@ -202,7 +240,7 @@ TEST(WorkspaceProject, PreferenceDoesNotPerturbAnUnambiguousExtension) {
     SchemaCache cache;
     auto r = cache.resolveByExtension(".c", pref->languages);
     ASSERT_TRUE(r.has_value()) << "exactly one shipped language claims .c";
-    EXPECT_EQ((*r)->name(), "CSubset");
+    EXPECT_EQ((*r)->name(), "C");
 }
 
 // ★ TWO TARGETS THAT DISAGREE LEAVE THE TIE UNBROKEN. This is the case a
@@ -305,7 +343,7 @@ TEST(WorkspaceProject, ManifestNamingNoTargetIsRejectedByTheSharedParser) {
 TEST(WorkspaceProject, UnknownManifestKeyIsRejectedByTheSharedParser) {
     ScratchDir ws{Location::Temp, "lsp-ws-badkey"};
     writeFile(ws.path(), "app.dss-project.json", R"({
-  "language": "c-subset",
+  "language": "c",
   "artifactProfile": "cli",
   "targets": ["x86_64:elf64-x86_64-linux-exec"],
   "sources": ["main.c"],
@@ -348,7 +386,7 @@ TEST(WorkspaceProject, LspAndDriverParseAManifestThroughTheSameLoader) {
     ScratchDir ws{Location::Temp, "lsp-ws-sameparser"};
     // Valid to a `targets`-only reader; rejected by the shared loader.
     writeFile(ws.path(), "app.dss-project.json", R"({
-  "language": "c-subset",
+  "language": "c",
   "artifactProfile": "cli",
   "targets": ["arm64:elf64-aarch64-linux-exec"],
   "sources": ["main.c"],
@@ -994,4 +1032,202 @@ TEST(WorkspaceProjectE2E, ADocumentOpenedBeforeInitializeSaysExactlyThat) {
     EXPECT_NE(errs[0].find("has not sent `initialize` yet"), std::string::npos)
         << "the pre-initialize reason must not be replaced by the "
            "no-workspace-folder one; got: " << errs[0];
+}
+
+// ══ D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES ════════
+//
+// `fileUriFromPath` is the EXACT INVERSE of `pathFromFileUri`, and it did not
+// exist in `src/` at all until this row -- only `tests/lsp/lsp_test_helpers.hpp`
+// had a copy. That is why production could name no file but the one the request
+// arrived on, and a definition inside a header was reported as living in the
+// open document.
+//
+// ★ THE TEST-TREE COPY ALSO DID LESS THAN IT CLAIMED: it did no
+// percent-encoding whatever, while its comment asserted that fixtures built
+// with it "round-trip through `dss::lsp::pathFromFileUri`". A path containing a
+// space decoded back to a DIFFERENT path, so the round-trip it advertised was
+// never closed. The helper now forwards here, and this pins the three shapes
+// that actually have to survive the trip.
+TEST(WorkspaceProject, FileUriRoundTrip) {
+    // (1) Plain POSIX-shaped absolute path.
+    {
+        const std::filesystem::path p{"/home/user/src/main.c"};
+        const std::string uri = dss::lsp::fileUriFromPath(p);
+        EXPECT_EQ(uri, "file:///home/user/src/main.c");
+        auto back = dss::lsp::pathFromFileUri(uri);
+        ASSERT_TRUE(back.has_value());
+        EXPECT_EQ(back->generic_string(), p.generic_string());
+    }
+    // (2) WINDOWS DRIVE LETTER. `C:/dir/x.c` is `file:///C:/dir/x.c`: the URI
+    // grammar's leading slash is added by the encoder and stripped by the
+    // decoder, and `:` is deliberately NOT encoded -- that is what every LSP
+    // client emits, so encoding it would produce a uri no editor matches.
+    {
+        const std::filesystem::path p{"C:/dev/proj/main.c"};
+        const std::string uri = dss::lsp::fileUriFromPath(p);
+        EXPECT_EQ(uri, "file:///C:/dev/proj/main.c");
+        auto back = dss::lsp::pathFromFileUri(uri);
+        ASSERT_TRUE(back.has_value());
+        EXPECT_EQ(back->generic_string(), p.generic_string());
+    }
+    // (3) PERCENT-ENCODING. The character the old test-tree copy silently got
+    // wrong: a space must encode, or the uri terminates early in a client.
+    {
+        const std::filesystem::path p{"C:/dev/my proj/a b.c"};
+        const std::string uri = dss::lsp::fileUriFromPath(p);
+        EXPECT_EQ(uri, "file:///C:/dev/my%20proj/a%20b.c");
+        auto back = dss::lsp::pathFromFileUri(uri);
+        ASSERT_TRUE(back.has_value());
+        EXPECT_EQ(back->generic_string(), p.generic_string())
+            << "a space must survive the round trip; the pre-row helper did no "
+               "encoding at all and this decoded to a different path";
+    }
+    // A `#` would otherwise be read as a fragment delimiter.
+    {
+        const std::filesystem::path p{"/tmp/a#b.c"};
+        const std::string uri = dss::lsp::fileUriFromPath(p);
+        EXPECT_EQ(uri, "file:///tmp/a%23b.c");
+        auto back = dss::lsp::pathFromFileUri(uri);
+        ASSERT_TRUE(back.has_value());
+        EXPECT_EQ(back->generic_string(), p.generic_string());
+    }
+    // (4) A UNC-SHAPED PATH. ⚠ THE INVARIANT IS THE ROUND TRIP; THE EXACT URI
+    // TEXT IS PLATFORM-DEFINED, AND PINNING ONE PLATFORM'S TEXT WAS A DEFECT.
+    // ✔MEASURED on TWO legs, and they disagree for a good reason:
+    //   * MinGW/GCC on Windows — `fs::path{"//server/share/x.c"}` reports an
+    //     EMPTY `root_name()` and renders with a SINGLE leading slash: the path
+    //     type discards the UNC authority at construction, so this encodes as an
+    //     ordinary absolute path → `file:///server/share/x.c`.
+    //   * libc++ on Darwin — POSIX makes a leading `//` IMPLEMENTATION-DEFINED
+    //     and libc++ PRESERVES it, because `//server/share` there is a LOCAL
+    //     path, not a network authority. `root_name()` is still empty (POSIX has
+    //     none), so the generic string keeps both slashes →
+    //     `file:////server/share/x.c`, an empty authority plus that path.
+    // ★ BOTH ARE CORRECT FOR THEIR PLATFORM, and treating Darwin's `server` as
+    // a URI authority would be the actual bug — it is a directory there.
+    // ⚠ THIS ASSERTION USED TO HARDCODE THE FIRST FORM, and the macOS leg is
+    // what caught it: the lane that wrote it said, accurately, that it pinned
+    // "what THIS leg actually does rather than a portability claim it cannot
+    // keep" — but "this leg" is FOUR legs. The two known-correct renderings are
+    // named explicitly rather than derived from `p`, because deriving the
+    // expectation would make this test re-implement the function it tests and
+    // assert nothing; a THIRD rendering still fails loudly here.
+    {
+        const std::filesystem::path p{"//server/share/x.c"};
+        const std::string uri = dss::lsp::fileUriFromPath(p);
+        //   * MSVC STL on Windows — models `//server/share` as a REAL
+        //     `root_name()`, so the authority survives and this renders as
+        //     `file://server/share/x.c`, the RFC 8089 spelling of a UNC share.
+        //     ✔MEASURED 2026-08-28 (cycle P43) on the first MSVC run of this
+        //     suite. ★ THIS IS THE "third arm" THE PARAGRAPH ABOVE PREDICTED,
+        //     added as one rather than by widening the check — and the round
+        //     trip below is what caught that `pathFromFileUri` refused our own
+        //     output, [[D-LSP-FILE-URI-WITH-A-UNC-AUTHORITY-DOES-NOT-ROUND-TRIP]].
+        const bool knownForm = uri == "file:///server/share/x.c"
+                            || uri == "file:////server/share/x.c"
+                            || uri == "file://server/share/x.c";
+        EXPECT_TRUE(knownForm)
+            << "unexpected UNC rendering '" << uri << "' — neither the "
+               "authority-discarding form nor the POSIX `//`-preserving one. "
+               "If a platform models a real UNC root this needs a third arm, "
+               "NOT a widened check";
+        auto back = dss::lsp::pathFromFileUri(uri);
+        ASSERT_TRUE(back.has_value());
+        EXPECT_EQ(back->generic_string(), p.generic_string())
+            << "whatever the platform makes of a UNC spelling, the trip must "
+               "be lossless in the form the path type actually holds — THIS is "
+               "the property, and it holds on every leg";
+    }
+    // The inbound REFUSAL of a real remote authority is the property that
+    // matters for safety, and it is pinned separately by
+    // `NonFileUriIsRefusedRatherThanGuessed`: a network host is not a local
+    // directory to scan, so `file://someremotehost/share/x` yields nullopt.
+}
+
+
+// ── D-LSP-TARGET-SPEC-SPLITTER-LIVES-ABOVE-ITS-CONSUMERS ────────────────────
+//
+// ★★ THE LAYER IS THE SUBJECT, SO THE PIN HAS TO BE ABLE TO SEE A LAYER. A
+// behaviour test cannot: `TargetSpec::parse` returns the same answer from
+// whichever tier it is declared in, so a test that only calls it stays green
+// through the exact regression this row closed. What CAN go wrong is an
+// `#include` — the LSP reaching UP into the driver tier for a splitter — and
+// that is a fact about the SOURCE, so the source is what gets read.
+//
+// ⚠ TWO HALVES, AND NEITHER IS SUFFICIENT ALONE. The scan below reds if any
+// `src/lsp/**` file re-acquires a `#include "program/..."`. The `#include
+// "core/types/target_spec.hpp"` at the top of THIS file reds at COMPILE time if
+// the type ever leaves `core` — which a text scan of `src/lsp/` could never
+// see, because a type that moved back up would take the LSP's include with it
+// and the scan would keep passing while the layering was gone.
+//
+// ★ WHY THE LIST IS ENUMERATED FROM THE DIRECTORY rather than hand-kept: a
+// hand-kept list silently stops covering the file someone adds next week, which
+// is precisely when a fresh cross-tier include appears.
+TEST(WorkspaceProject, TheLspNeverReachesUpIntoTheDriverTier) {
+    namespace fs = std::filesystem;
+    fs::path const lspDir = fs::path{DSS_TEST_REPO_ROOT} / "src" / "lsp";
+    ASSERT_TRUE(fs::is_directory(lspDir))
+        << "cannot find src/lsp under DSS_TEST_REPO_ROOT — the scan below "
+           "would pass by having nothing to read";
+
+    std::size_t scanned = 0;
+    for (auto const& entry : fs::directory_iterator{lspDir}) {
+        if (!entry.is_regular_file()) continue;
+        auto const ext = entry.path().extension().string();
+        if (ext != ".cpp" && ext != ".hpp") continue;
+        ++scanned;
+        std::ifstream in{entry.path(), std::ios::binary};
+        ASSERT_TRUE(in.good()) << "could not read " << entry.path().string();
+        std::string line;
+        std::size_t lineNo = 0;
+        while (std::getline(in, line)) {
+            ++lineNo;
+            // The INCLUDE DIRECTIVE only — a `program/...` mention inside a
+            // comment is documentation (this repo's comments name the tier
+            // they deliberately do NOT depend on, and must stay able to).
+            auto const hash = line.find('#');
+            if (hash == std::string::npos) continue;
+            if (line.find("include") == std::string::npos) continue;
+            if (line.find("\"program/") == std::string::npos) continue;
+            if (line.substr(0, hash).find_first_not_of(" \t") != std::string::npos) {
+                continue;   // not a directive: `#` appeared after other code
+            }
+            FAIL() << entry.path().filename().string() << ":" << lineNo
+                   << " includes the DRIVER tier: " << line
+                   << "\n`lsp` has no link edge to `program` and must not grow "
+                      "one — `program` already links `lsp` for the `--lsp` mode "
+                      "dispatch, so the reverse edge closes a cycle CMake "
+                      "refuses between OBJECT libraries. Move the shared fact "
+                      "DOWN into `core`, as `project_config` and `target_spec` "
+                      "both were "
+                      "(D-LSP-TARGET-SPEC-SPLITTER-LIVES-ABOVE-ITS-CONSUMERS).";
+        }
+    }
+    EXPECT_GT(scanned, 5U)
+        << "the scan read almost nothing, so it cannot have proved anything — "
+           "check the directory walk before trusting a green here";
+}
+
+// The splitter still splits, from its new home. Cheap, and it is what stops the
+// move from being a rename that lost a behaviour on the way down.
+TEST(WorkspaceProject, TheSplitterStillSplitsFromCore) {
+    auto const ok = dss::TargetSpec::parse("x86_64:elf64-x86_64-linux-exec");
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ(ok->targetName, "x86_64");
+    EXPECT_EQ(ok->formatName, "elf64-x86_64-linux-exec");
+
+    // The four remediation-distinct refusals travelled with it. A move that
+    // dropped `TargetSpecError` would leave the LSP unable to tell an operator
+    // WHICH way their manifest's target line is wrong.
+    EXPECT_EQ(dss::TargetSpec::parse("x86_64").error(),
+              dss::TargetSpecError::MissingColon);
+    EXPECT_EQ(dss::TargetSpec::parse("a:b:c").error(),
+              dss::TargetSpecError::MultipleColons);
+    EXPECT_EQ(dss::TargetSpec::parse(":fmt").error(),
+              dss::TargetSpecError::EmptyTargetName);
+    EXPECT_EQ(dss::TargetSpec::parse("tgt:").error(),
+              dss::TargetSpecError::EmptyFormatName);
+    EXPECT_EQ(dss::TargetSpec::parse("tg t:fmt").error(),
+              dss::TargetSpecError::WhitespaceInName);
 }

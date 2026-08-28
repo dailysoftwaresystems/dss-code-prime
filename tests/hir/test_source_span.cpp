@@ -40,7 +40,7 @@ TEST(HirSourceLoc, PresentWithCoveringSpanSpansText) {
 }
 
 TEST(HirSourceLoc, PresentWithZeroLengthSpanIsCaretNotText) {
-    // The contract per source_span.hpp:32-39 explicitly endorses a
+    // The contract on `HirSourceLoc::isPresent()` explicitly endorses a
     // zero-length span paired with a valid buffer as "caret-pointer at
     // a token boundary" — present, just not covering text. Pins the
     // asymmetry between `isPresent()` (yes — locus is bindable) and

@@ -55,12 +55,42 @@
 #                      accepts it" is a union over ALL of them, and the harness
 #                      rejects a narrowed B probe.
 #   @expect-ref accept|reject|varies
-#                      accept → at least one judging oracle must accept, else RED.
-#                      reject → NO judging oracle may accept, else RED.
-#                      varies → host/toolchain-dependent; NO assertion, and it must
-#                               carry `@varies-note`. Every `varies` probe is PRINTED
-#                               in the summary so this escape hatch cannot grow
-#                               quietly.
+#                      THE PIN. It declares what REFERENCE COMPILERS do with this
+#                      construct — not what the compilers on this machine managed
+#                      to say about it. `pin()` reads it and takes no roster
+#                      argument; the roster's opinion goes to `corroborate()`.
+#                      accept → the corpus asserts a reference compiler accepts it.
+#                               DSS rejecting it everywhere is direction A. ⚠ IT IS
+#                               *NOT* A RED FOR NO LOCAL ORACLE TO ACCEPT IT: that
+#                               is the un-refutable negative, reported as
+#                               `not-witnessed` with the full roster and never a
+#                               failure, because no finite roster can refute an
+#                               existential claim. (This line USED to say "at least
+#                               one judging oracle must accept, else RED"; it was
+#                               true until the roster-dependence row
+#                               `D-TEST-GATE-VERDICT-DEPENDS-ON-HOST-TOOLCHAIN`
+#                               split the decision in two, then went stale rather
+#                               than false-loud, and then justified a waiver that
+#                               hid a real gap — see `a_nested_function_gnu`.)
+#                      reject → NO judging oracle may accept, else RED. This one IS
+#                               a measurement red and soundly so: a universal claim
+#                               met by a WITNESS, which is positive evidence and
+#                               reads the same on every host.
+#                      varies → NO assertion in either direction, and it must carry
+#                               `@varies-note`. Every `varies` probe is PRINTED in
+#                               the summary so this escape hatch cannot grow quietly.
+#                      ★ WHEN `varies` IS THE RIGHT ANSWER, AND WHEN IT IS A HOLE.
+#                        Legitimate only when the DIRECTION ITSELF turns on which
+#                        reference you believe — `b_empty_enumerator_list`: DSS
+#                        accepts, MSVC accepts, the gnu family does not, so `reject`
+#                        would pin it as an INVENTION and `accept` as agreement, and
+#                        the corpus genuinely cannot state one reference behaviour.
+#                        WRONG whenever DSS is on the SAME side of every reference:
+#                        if DSS rejects and any reference accepts, the direction is
+#                        A no matter how the references split among themselves, and
+#                        a waiver there is a gap in neither census. Operator's
+#                        disjunction rule (bar A.3b): ONE WORKING REFERENCE MAKES IT
+#                        REQUIRED. ✔It has cost this corpus a row once already.
 #   @varies-note <text>   required iff `@expect-ref varies`; must be non-empty.
 #   @acknowledged-gap <text>
 #                      OPTIONAL. Presence means: a divergence on this probe is a
@@ -141,7 +171,7 @@ extern int dss_realization_fn_probe(int) "msvcrt.dll";
 @min-stdc 0
 @families gnu,msvc
 @expect-ref reject
-@acknowledged-gap STRICTLY WIDER than b_extern_library_realization_string: the optional string sits AFTER the whole initDeclaratorList (/shapes/externDecl in c-subset.lang.json), so per that rule's own $comment it applies to EVERY declarator in the declaration. No corpus file uses this form — it is pure grammar over-admission on top of an already-invented construct.
+@acknowledged-gap STRICTLY WIDER than b_extern_library_realization_string: the optional string sits AFTER the whole initDeclaratorList (/shapes/externDecl in c.lang.json), so per that rule's own $comment it applies to EVERY declarator in the declaration. No corpus file uses this form — it is pure grammar over-admission on top of an already-invented construct.
 @why A declaration-level realization suffix has no counterpart in C, GNU C or MSVC C.
 @code
 extern int dss_rl_a, *dss_rl_b, dss_rl_c[4] "msvcrt.dll";
@@ -211,7 +241,7 @@ int dss_comma_block_array_probe(int n) { int a[1, 2]; a[0] = n; return a[0]; }
 @min-stdc 0
 @families gnu,msvc
 @expect-ref reject
-@acknowledged-gap MEASURED: DSS ACCEPTS `case 1, 2:` while all five oracles refuse it with a pure SYNTAX error (gcc `expected ':' or '...' before ','`, clang `expected ':' after 'case'`, cl `C2051 case expression not constant`). /shapes/caseLabel takes the full `expression`, so the comma operator is admitted where C 6.8.4.2 requires a constant-expression -- and the shape it most resembles is the multi-value case label that no C compiler has, so a reader could reasonably believe `case 1, 2:` matches both values.
+@acknowledged-gap MEASURED: DSS ACCEPTS `case 1, 2:` while all five oracles refuse it with a pure SYNTAX error (gcc `expected ':' or '...' before ','`, clang `expected ':' after 'case'`, cl `C2051 case expression not constant`). /shapes/caseLabel takes the full `expression`, so the comma operator is admitted where C 6.8.4.2 requires a constant-expression -- and the shape it most resembles is the multi-value case label that no C compiler has, so a reader could reasonably believe `case 1, 2:` matches both values. ✔MEASURED 2026-08-24 that the reader is WRONG AT RUNTIME, which makes this a SILENT MISCOMPILE and not merely a permissive accept: for elf64-x86_64-linux the arm lowers to `cmp $0x2,%r15d` / `je` (the left operand becomes a dead `mov $0x1` overwritten by `mov $0x2` on the next instruction), and linking the DSS object against a gcc driver and RUNNING it prints `sel(0)=0 sel(1)=0 sel(2)=7 sel(3)=0` -- the label matches ONLY 2, so the value the author wrote FIRST is the one silently discarded.
 @why /shapes/caseLabel takes the full `expression`; C 6.8.4.2 requires a constant-expression. `case 1, 2:` reads to a reference compiler as an attempt at the (non-existent) multi-value case label.
 @code
 int dss_comma_case_probe(int x) { switch (x) { case 1, 2: return 7; } return 0; }
@@ -258,7 +288,7 @@ enum DssElidedEnum { DSS_EE_A, , DSS_EE_B };
 @min-stdc 0
 @families gnu,msvc
 @expect-ref reject
-@acknowledged-gap MEASURED: DSS ACCEPTS `{ 1, , 3 }`. Same `{optional}`-after-Comma shape as the enumerator list, in /shapes/braceInitList. This is the most dangerous of the elision family: the hole is SILENT, so the reader's third element lands at index 2 in DSS and the file does not compile anywhere else.
+@acknowledged-gap MEASURED: DSS ACCEPTS `{ 1, , 3 }`. Same `{optional}`-after-Comma shape as the enumerator list, in /shapes/braceInitList. This is the most dangerous of the elision family, and the acceptance is not merely permissive -- it SILENTLY MISCOMPILES. ✔MEASURED 2026-08-24: compiling this exact probe emits a 12-byte `.data` reading `01 00 00 00 03 00 00 00 00 00 00 00` for BOTH fixed targets (elf64-x86_64-linux read with WSL `objdump -s`, pe64-x86_64-windows identical), and adding a reader to the same TU, linking it against a gcc driver and RUNNING it prints `probe[0]=1 probe[1]=3 probe[2]=0`. So the hole is DROPPED, not zero-filled: every element after it shifts DOWN one index and the tail is zero -- `{ 1, , 3 }` means `{1,3,0}`, never `{1,0,3}`. ⚠ THIS SENTENCE PREVIOUSLY SAID THE `3` "lands at index 2", which was never measured and is the BENIGN reading (the one a hole-means-zero semantics would produce); it understated the row, so size the fix from the bytes above and not from that. The file does not compile anywhere else, so nothing outside DSS can witness the difference.
 @why /shapes/braceInitList has the same `{optional}`-after-Comma shape as enumBody, so an interior hole in an initializer list is admitted.
 @code
 static int dss_elided_init_probe[3] = { 1, , 3 };
@@ -620,7 +650,6 @@ int dss_enum_fixed_probe(void) { return (int)DSS_FIXED_B; }
 @min-stdc 202311
 @families gnu,msvc
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: `[[maybe_unused]] int p` in a PARAMETER declaration is rejected by DSS while clang 18/19 (C23) and cl /std:clatest accept it. Its LEADING-position twin (a_standard_attribute_leading_c23) is accepted, so this is a position-specific hole, not absent C23 attribute support. RECORDED, not fixed -- this lane builds the detector.
 @why C23 6.7.12.1 [[maybe_unused]] on a PARAMETER declaration.
 @code
 int dss_attr_param_probe([[maybe_unused]] int unused_param);
@@ -644,7 +673,7 @@ struct DssEmptyInit dss_empty_init_probe = {};
 @min-stdc 202311
 @families gnu,msvc
 @expect-ref accept
-@why C23 6.10.5.1 __VA_OPT__ (IMPLEMENTED, FC18a / D-PP-VA-OPT). The `@acknowledged-gap` line that stood here is DELETED: DSS now expands the construct and agrees with the oracles. Semantics + fail-loud arms are pinned by the `PreprocessorVaOpt.*` unit suite; the runtime witness is examples/c-subset/preprocessor_va_opt. clang-18 rejects THIS probe for a different, measured reason (-Wgnu-zero-variadic-macro-arguments promoted by -pedantic-errors on `DSS_CALL(1)`), which is why the direction rule is `any judging oracle accepts` rather than `all`.
+@why C23 6.10.5.1 __VA_OPT__ (IMPLEMENTED, FC18a / D-PP-VA-OPT). The `@acknowledged-gap` line that stood here is DELETED: DSS now expands the construct and agrees with the oracles. Semantics + fail-loud arms are pinned by the `PreprocessorVaOpt.*` unit suite; the runtime witness is examples/c/preprocessor_va_opt. clang-18 rejects THIS probe for a different, measured reason (-Wgnu-zero-variadic-macro-arguments promoted by -pedantic-errors on `DSS_CALL(1)`), which is why the direction rule is `any judging oracle accepts` rather than `all`.
 @code
 int dss_vaopt_sink(int);
 #define DSS_CALL(a, ...) dss_vaopt_sink(a __VA_OPT__(+) __VA_ARGS__)
@@ -818,8 +847,7 @@ __typeof(dss_typeof_gnu_src) dss_typeof_gnu_probe2;
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: GNU statement expressions `({ ... })` are rejected by DSS and accepted by all four gnu oracles. Pervasive in glibc/kernel-style headers and in macro-heavy corpora.
-@why GNU statement expressions `({ ... })`.
+@why GNU statement expressions `({ ... })`. CLOSED 2026-08-24 P31 ([[D-C-GNU-STATEMENT-EXPRESSION]]): the construct is a new `operand` alt whose body is a brace-delimited statement list, and it lowers onto the ALREADY-EXISTING `HirKind::SeqExpr` ([stmts..., result]) — the node whose own header comment in hir_node.hpp names GCC statement expressions as what it models, and which MIR already lowers by running each statement child through `lowerStmt`. Zero new HIR kinds, zero MIR change, zero LIR change; `collectLocalDecls` already walked the whole body subtree, so a declaration nested inside an expression already got its entry-block Alloca. Runnable witness examples/c/gnu_statement_expression (exit 42 on pe64 + elf64-x86_64 + elf64-aarch64 at BOTH debug and release, matching gcc 13.3.0 and clang 19.1.7 at -O0 and -O2). ★ THE TWO REFUSALS ARE NOT NARROWINGS: a body whose last statement is not an expression statement has type `void` (S_StatementExprHasNoValue where a value is required -- accepted in a DISCARD position, exactly as both references do), and the construct at FILE scope is S_StatementExprAtFileScope; gcc and clang refuse both too (`void value not ignored as it ought to be` / `braced-group within expression allowed only inside a function`). ★ WHY IT IS WORTH THE ROW, MEASURED: 59 occurrences across 15 C headers under /usr/include -- assert.h, math.h, ctype.h, unistd.h, netinet/in.h, bits/stdio.h, bits/select2.h, bits/cpu-set.h -- and 7 of those are written `__extension__ ({`, which is why this row and a_extension_prefix_gnu closed in the SAME cycle.
 @code
 int dss_stmt_expr_probe(int n) { return ({ int t = n; t + 1; }); }
 @end
@@ -876,9 +904,9 @@ int dss_label_value_probe(int n) { void *p = &&target; if (n) goto *p; return 0;
 @mode extended
 @min-stdc 0
 @families gnu
-@expect-ref varies
-@varies-note A gcc-only extension: gcc accepts a nested function definition, clang has never implemented it and rejects. Both are the `gnu` family, so the family-level verdict genuinely differs BY COMPILER and any single declared expectation would be false on some host.
-@why GNU nested functions.
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: DSS rejects a nested function definition for BOTH fixed targets with `error[P0001]: expected 'EndStatement' -- got '{'`, while win-gcc@Strawberry 13.2.0 and wsl-gcc-13 13.3.0 both compile it clean under `-std=gnu2x -c` (rc=0). ⚠ THIS ROW WAS A `varies` WAIVER UNTIL 2026-08-24 AND THE WAIVER WAS WRONG, so read why before restoring it. Its note argued that because clang 19.1.1 and 18.1.3 reject it (`function definition is not allowed here`) while gcc accepts, "any single declared expectation would be false on some host" -- but `@expect-ref` is a claim about REFERENCE BEHAVIOUR, not about a roster, and the harness is built so that the two cannot be confused: `pin()` takes NO roster argument, and an `accept` row that nothing local accepts routes to `not-witnessed`, which is printed with the full roster and NEVER reds. So `accept` is safe on a clang-only host and pins the row direction-A on every host, which is what the operator's disjunction rule (bar A.3b, "one WORKING reference makes it REQUIRED") says it is. Contrast b_empty_enumerator_list, where the waiver is still correct and for a different reason: there DSS ACCEPTS, so the row would pin as a direction-B INVENTION if the corpus declared `reject` and as agreement if it declared `accept` -- the direction itself, not just the strength of the evidence, turns on which reference you believe. Here it does not: DSS rejects, some reference accepts, and that is a gap in exactly one direction.
+@why GNU nested functions. A reference compiler ACCEPTS them (gcc, both hosts), so under the disjunction rule DSS must too; that clang never implemented them narrows the evidence, not the requirement.
 @code
 int dss_nested_fn_probe(int n) { int inner(int x) { return x + 1; } return inner(n); }
 @end
@@ -951,11 +979,23 @@ __forceinline int dss_forceinline_probe(int n) { return n + 1; }
 @min-stdc 0
 @families gnu,msvc
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: `__COUNTER__` is undefined in DSS (S0001) and predefined by ALL FIVE oracles -- the only probe in this corpus that every located reference compiler accepts and DSS refuses.
-@why __COUNTER__ — a gcc/clang/MSVC-common predefined macro used for unique-name generation.
+@why __COUNTER__ — a gcc/clang/MSVC-common predefined macro used for unique-name generation. CLOSED 2026-08-24 (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED): it is now a `counter`-kind predefined macro, the one STATEFUL kind — the value advances once per EXPANSION and resets per translation unit, so it cannot be a constant row in the config. The probe uses it TWICE on purpose: a single use compiled CLEAN against the broken behaviour (it pasted the literal text and minted a wrongly-NAMED symbol), so only the second use could ever have shown the defect.
 @code
 int dss_counter_probe_a = __COUNTER__;
 int dss_counter_probe_b = __COUNTER__;
+@end
+
+@probe a_typeof_unqual_gnu_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU __typeof_unqual__ / __typeof_unqual — the pre-standard spellings of C23's qualifier-STRIPPING typeof_unqual, available at every -std level unlike the C23 keyword. CLOSED 2026-08-24 (D-CSUBSET-TYPEOF-UNQUAL-GNU-SPELLING): two keyword rows onto the EXISTING TypeofUnqualKeyword, so they reach the already-shipped stripping arm with no semantic change. ⚠ THE ROSTER IS SPLIT AND THAT IS NOT A RED HERE: MEASURED 2026-08-24, gcc 13.3.0 and clang 18.1.3 REJECT both spellings and clang 19.1.1 accepts both. `@expect-ref accept` is an EXISTENTIAL claim — a roster that does not witness it reports `not-witnessed`, never a failure — and the operator's disjunction rule (bar A.3b, one working reference makes the behaviour REQUIRED) is what makes the split roster a direction-A gap rather than a reason to abstain. The second spelling is exercised on purpose: it also proves the lexer takes the LONGEST match rather than reading __typeof_unqual__ as __typeof_unqual plus a stray identifier.
+@code
+const volatile int dss_typeof_unqual_gnu_src;
+__typeof_unqual__(dss_typeof_unqual_gnu_src) dss_typeof_unqual_gnu_probe;
+__typeof_unqual(dss_typeof_unqual_gnu_src) dss_typeof_unqual_gnu_probe2;
 @end
 
 @probe a_inline_asm_gnu
@@ -1061,8 +1101,7 @@ int dss_local_label_probe(void) { __label__ done; goto done; done: return 0; }
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: rejected by DSS, accepted by gcc 13.3.0 and clang 19.1.1. It is the primitive every pre-C11 type-generic macro is written on, and it takes TYPE NAMES in an expression argument position — the same grammatical shape as `_Generic`, which DSS does support (a_generic_c11 passes).
-@why GNU `__builtin_types_compatible_p(T1, T2)`.
+@why GNU `__builtin_types_compatible_p(T1, T2)` — the primitive every pre-C11 type-generic macro is written on. CLOSED 2026-08-24 (cycle P31): a grammar rule in the `operand` alt beside `_Generic`, whose two type positions are the SHARED `castTypeRef` chokepoint, and whose 0/1 answer is the SAME interned type identity `_Generic` matches an association with (after the same top-level-volatile strip) — so no second compatibility predicate exists to drift from the first. The property that matters most is CROSS-TARGET: on LLP64 `long` and `int` share a REPRESENTATION, so an implementation comparing widths would answer 1 for `(int, long)` on the pe64 leg and 0 on the elf64 leg, from ONE source, with no diagnostic anywhere. Because D-LANG-TYPE-IDENTITY-VOCABULARY made the interned identity NAME-keyed, the answer is 0 under both — pinned under BOTH data models in analysis/semantic/test_builtin_compile_time_operators and run end-to-end by examples/c/gnu_choose_expr_types_compatible.
 @code
 int dss_types_compatible_probe(void) { return __builtin_types_compatible_p(int, long); }
 @end
@@ -1073,8 +1112,7 @@ int dss_types_compatible_probe(void) { return __builtin_types_compatible_p(int, 
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: rejected by DSS, accepted by gcc 13.3.0 and clang 19.1.1. Paired with __builtin_types_compatible_p above, this is how type-generic macros SELECT a branch without evaluating the other one.
-@why GNU `__builtin_choose_expr(const, a, b)`.
+@why GNU `__builtin_choose_expr(const, a, b)` — paired with __builtin_types_compatible_p above, this is how a type-generic macro SELECTS a branch without evaluating the other one. CLOSED 2026-08-24 (cycle P31), and it reuses `_Generic`'s machinery WHOLESALE rather than growing a second one: `_Generic` already makes a compile-time choice among sub-expressions, records the winner in the `nodeToSelectedExpr` side table, stamps the node with the winner's type and lowers ONLY that sub-expression — the one thing this construct changes is HOW the winner is picked (an integer constant instead of a type match), so the CST-to-HIR lowering is literally `_Generic`'s, renamed `lowerRecordedSelection` and shared. The discard is proven twice: `__builtin_choose_expr(1, 42, "not an int")` type-checks only if the unchosen arm is dropped before it is read as a value, and `__builtin_choose_expr(1, 4, 1/0)` folds in an array dimension only if the discarded arm is never visited at all. A NON-CONSTANT condition is refused (S_BuiltinChooseExprNonConstant), never read as false: both arms are valid programs, so a defaulted arm would build and do the wrong thing.
 @code
 int dss_choose_expr_probe(int n) { return __builtin_choose_expr(1, n, 0); }
 @end
@@ -1085,8 +1123,7 @@ int dss_choose_expr_probe(int n) { return __builtin_choose_expr(1, n, 0); }
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: rejected by DSS, accepted by gcc 13.3.0 and clang 19.1.1. This is what <stddef.h>'s `offsetof` EXPANDS TO on both of them, so a translation unit reaching it through the standard header hits this gap without ever writing `__builtin_offsetof`.
-@why GNU `__builtin_offsetof(type, member)`.
+@why GNU `__builtin_offsetof(type, member)` — what <stddef.h>'s `offsetof` EXPANDS TO on gcc 13.3.0 and clang 19.1.1 alike, so a TU reaching it through the standard header hit this gap without ever writing the token. CLOSED 2026-08-24 (cycle P31, D-FFI-OFFSETOF-MACRO). The type position is the SHARED `castTypeRef` chokepoint; the member-designator step rule is the SHIPPED `designator` alt a designated INITIALIZER already uses (`.field` / `[index]`), not a private copy, so the two spellings of that grammar cannot drift apart. The offset is walked over the SAME `computeLayout` engine codegen reads — examples/c/gnu_builtin_offsetof puts a `packed` and a plain struct with IDENTICAL member lists side by side (offsets 1 vs 4, 5 vs 8), so an implementation that summed member sizes itself fails, and that example also USES the offset through `(char *)&obj + off`, so a wrong answer is a wrong VALUE rather than only a failed comparison. Every unknowable case is REFUSED (S_OffsetofInvalidMember: unknown member, incomplete container, a BIT-FIELD with no byte offset, a non-constant `[index]`), because a fabricated 0 would be a wrong ADDRESS in a program that built and ran.
 @code
 struct DssOffs { int a, b; };
 unsigned long dss_builtin_offsetof_probe(void) { return __builtin_offsetof(struct DssOffs, b); }
@@ -1111,7 +1148,7 @@ double dss_real_imag_probe(void) { return __real__ dss_real_imag_src + __imag__ 
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@why GNU `__alignof__`. CLOSED 2026-08-11 (D-CSUBSET-ALIGNOF-GNU-SPELLING): `__alignof__` and `__alignof` are now keyword-table aliases onto the EXISTING AlignofKeyword, so both reach the same `alignofType` rule `_Alignof` does. TYPE-NAME operand only — the VALUE operand every oracle also accepts is a separate, PRE-EXISTING gap that hits `_Alignof` identically and is censused by a_alignof_expression_operand_gnu below.
+@why GNU `__alignof__`. CLOSED 2026-08-11 (D-CSUBSET-ALIGNOF-GNU-SPELLING): `__alignof__` and `__alignof` are now keyword-table aliases onto the EXISTING AlignofKeyword, so both reach the same `alignofType` rule `_Alignof` does. The VALUE operand every oracle also accepts was a separate, PRE-EXISTING gap that hit `_Alignof` identically; it CLOSED 2026-08-24 (cycle P31, D-CSUBSET-ALIGNOF-VALUE-OPERAND) and is exercised by a_alignof_expression_operand_gnu below.
 @code
 int dss_alignof_gnu_probe(void) { return (int)__alignof__(double); }
 int dss_alignof_gnu_probe2(void) { return (int)__alignof(double); }
@@ -1123,8 +1160,7 @@ int dss_alignof_gnu_probe2(void) { return (int)__alignof(double); }
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap, found 2026-08-11 while closing a_alignof_gnu_spelling and NOT previously censused — the sibling probe only ever exercised the TYPE-NAME operand, so the operand axis was invisible to the whole corpus. gcc 13.3.0, clang 18.1.3 and clang 19.1.1 all accept an EXPRESSION operand (measured with matched positive+negative controls, at -std=gnu17 and at each oracle's newest -std), and they accept it for EVERY spelling — `__alignof__(d)`, `__alignof(d)`, `_Alignof(d)`, `alignof(d)` via <stdalign.h>, and even the paren-free `_Alignof d`. DSS accepts NONE of them. This is therefore NOT a GNU-spelling gap: it hits the already-shipped `_Alignof` exactly as hard, and the new aliases neither caused it nor widened it. `alignofType` is type-name-only by construction (a keyword row cannot reach the value form), so closing it means an `alignofValue` rule plus an `alignofExpr` wrapper — the sizeofExpr/sizeofType/sizeofValue triple, verbatim — and a `valueRule` arm in the alignof semantics block. Tracked at D-CSUBSET-ALIGNOF-VALUE-OPERAND. Today it fails LOUD at parse; there is no wrong-alignment path.
-@why GNU/ISO alignof applied to an EXPRESSION rather than a type-name — the operand axis, not the spelling axis.
+@why GNU/ISO alignof applied to an EXPRESSION rather than a type-name — the operand axis, not the spelling axis. CLOSED 2026-08-24 (cycle P31, D-CSUBSET-ALIGNOF-VALUE-OPERAND), by the fix the gap note itself predicted: an `alignofValue` rule plus an `alignofExpr` wrapper (the sizeofExpr/sizeofType/sizeofValue triple, verbatim) plus a `valueRule` arm in the `semantics.alignof` block — so all three spellings AND the paren-free `_Alignof d` land together, the paren-free form coming free from `castOperand` rather than as a second feature. The lowering reads the operand's DIRECT stamp and NEVER descends, which inherits D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK's discipline instead of re-deriving it: a descent would make `__alignof__(*p)` report the POINTER's alignment, exactly as it once mis-sized `sizeof(*p)` and reached a shipped SQLite as a heap corruption. Landing it also moved `hirLowering.alignofRule` from the FORM onto the new WRAPPER, which three consumers dispatch on — the already-shipped `int a[_Alignof(double)]` is therefore pinned as a REGRESSION guard in analysis/semantic/test_builtin_compile_time_operators. ONE DIVERGENCE IS ANCHORED RATHER THAN ABSORBED: gcc reports the DECLARED alignment of an OVER-ALIGNED OBJECT here while clang reports the TYPE alignment; the references disagree, DSS takes the type reading, and D-CSUBSET-ALIGNOF-VALUE-OVERALIGNED-OBJECT holds the question. Historical note: this axis was invisible to the whole corpus until 2026-08-11 because the sibling spelling probe only ever exercised the TYPE-NAME operand.
 @code
 double dss_alignof_expr_src;
 int dss_alignof_expr_probe(void) { return (int)__alignof__(dss_alignof_expr_src); }
@@ -1303,7 +1339,7 @@ int dss_alias_probe(void) __attribute__((alias("dss_alias_target_probe")));
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: `extern __thread int x;` is rejected by DSS (P0009 at the declarator — `__thread` is absent from the keyword vocabulary, so it parses as the declared NAME and the following `int` has nowhere to go) and accepted by gcc 13.3.0, clang 18.1.3 and clang 19.1.1 at BOTH `-std=gnu17` and `-std=c17 -pedantic-errors`. Tracked at D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS (this class's exclusion set). ★ DELIBERATELY NOT CLOSED BY A KEYWORD-ALIAS ROW, and the reason is an OPERATOR DECISION, not an oversight: a plain alias would land `__thread` on `ThreadLocalKeyword` and thereby inherit `_Thread_local`'s POSITION-FREEDOM, shipping a placement rule DSS does not model — and the reference compilers DISAGREE about that rule, so there is no "what gcc/clang do" to copy. ✔MEASURED on `__thread static int x;`: gcc 13.3.0 rejects it as a HARD ERROR at every level (`error: '__thread' before 'static'`), while clang 18.1.3 and clang 19.1.1 ACCEPT it under `-std=gnu17` and reject it only under `-pedantic-errors`, where the same text is a `[-Wpedantic]` warning promoted by `-Werror`. So the two references differ in KIND (error vs pedantic warning), not merely in verdict. A further complication: `_Thread_local` and `thread_local` are DISTINCT kinds in c-subset.lang.json (ThreadLocalKeyword vs ThreadLocalC23Keyword), so `__thread` is not cleanly an alias of either one.
+@acknowledged-gap MEASURED direction-A gap: `extern __thread int x;` is rejected by DSS (P0009 at the declarator — `__thread` is absent from the keyword vocabulary, so it parses as the declared NAME and the following `int` has nowhere to go) and accepted by gcc 13.3.0, clang 18.1.3 and clang 19.1.1 at BOTH `-std=gnu17` and `-std=c17 -pedantic-errors`. Tracked at D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS (this class's exclusion set). ★ DELIBERATELY NOT CLOSED BY A KEYWORD-ALIAS ROW, and the reason is an OPERATOR DECISION, not an oversight: a plain alias would land `__thread` on `ThreadLocalKeyword` and thereby inherit `_Thread_local`'s POSITION-FREEDOM, shipping a placement rule DSS does not model — and the reference compilers DISAGREE about that rule, so there is no "what gcc/clang do" to copy. ✔MEASURED on `__thread static int x;`: gcc 13.3.0 rejects it as a HARD ERROR at every level (`error: '__thread' before 'static'`), while clang 18.1.3 and clang 19.1.1 ACCEPT it under `-std=gnu17` and reject it only under `-pedantic-errors`, where the same text is a `[-Wpedantic]` warning promoted by `-Werror`. So the two references differ in KIND (error vs pedantic warning), not merely in verdict. A further complication: `_Thread_local` and `thread_local` are DISTINCT kinds in c.lang.json (ThreadLocalKeyword vs ThreadLocalC23Keyword), so `__thread` is not cleanly an alias of either one.
 @why GNU `__thread` — the pre-C11 thread-local storage-class specifier, still what glibc's own headers write. ★ THE BODY USES `extern` ON PURPOSE. A DEFINITION (`static __thread int x;`) would ALSO be refused by DSS for a completely unrelated, MEASURED reason — the linker advertises `tbss` on no relocatable-object format (see a_thread_local_definition_c11) — so this row would then red on that gap forever and never turn when the spelling was added. `extern _Thread_local int x;` and `extern thread_local int x;` are both ACCEPTED by DSS today on both fixed targets (✔MEASURED), so with an `extern` body the SPELLING is the only variable left.
 @code
 extern __thread int dss_thread_local_gnu_probe;
@@ -1315,8 +1351,7 @@ extern __thread int dss_thread_local_gnu_probe;
 @min-stdc 0
 @families gnu,msvc
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: both positions are rejected by DSS — the DECLARATION prefix at parse (P0009, `__extension__` read as the declared name) and the EXPRESSION prefix in semantics (S0001 "got __extension__", an unknown identifier) — and both are accepted by gcc 13.3.0, clang 18.1.3, clang 19.1.1 at `-std=gnu17` AND `-std=c17 -pedantic-errors`, and by cl 19.51 at `/std:clatest /W4` with ZERO diagnostics (measured with a matched negative control: cl rejects `__no_such_keyword__ int x;` with C2054, so its acceptance here is recognition, not leniency). Tracked at D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS (this class's exclusion set). ★ DELIBERATELY NOT FOLDED INTO THE SPELLING-ALIAS CYCLE: `__extension__` has NO plain-C counterpart to alias onto. It is a transparent diagnostic-suppression prefix — a small GRAMMAR feature in two distinct slots (declaration-specifier position and unary-expression position) that must parse and then vanish, leaving the operand's type and value untouched. Calling that an alias would have mis-scoped it, and a keyword row cannot express it at all.
-@why GNU `__extension__` — the prefix that suppresses pedantic diagnostics for the construct it precedes. It is how glibc and libstdc++ headers keep `-pedantic` builds quiet, so a translation unit reaching those headers meets it without ever writing it.
+@why GNU `__extension__` — the prefix that suppresses pedantic diagnostics for the construct it precedes. It is how glibc and libstdc++ headers keep `-pedantic` builds quiet, so a translation unit reaching those headers meets it without ever writing it. CLOSED 2026-08-24 P31 ([[D-C-GNU-EXTENSION-KEYWORD]]): a new `ExtensionKeyword` plus four transparent PREFIX rules (file scope, block scope, struct member, expression), each self-recursive so the doubled spelling parses. Runnable witness examples/c/gnu_extension_keyword (exit 42 on pe64 + elf64-x86_64 + elf64-aarch64 at BOTH debug and release, matching gcc 13.3.0 and clang 19.1.7). ★★ THE ROW'S OWN DESCRIPTION OF THE FEATURE WAS WRONG, AND CORRECTING IT WAS THE DESIGN: it said `declaration-specifier position and unary-expression position`. The declaration half is NOT a specifier position. ✔MEASURED 2026-08-24, gcc 13.3.0 AND clang 19.1.7, one translation unit per case: `static __extension__ int g;`, `int __extension__ g;`, `_Alignas(8) __extension__ int x;` and `__attribute__((aligned(4))) __extension__ int x;` are REFUSED BY BOTH, while the same word LEADING each of those declarations is accepted by both. Implementing it as a row in `singleDeclSpecifier`'s alt -- the shape this repository reaches for first, and the one every other GNU dunder alias took -- would have accepted two spellings NO reference accepts, and every positive test would still have passed. The refusals are pinned in tests/analysis/semantic/test_gnu_extension_and_statement_expr.cpp. ★ WHY IT IS WORTH THE ROW, MEASURED: a plain `#include <stdlib.h>` plus 8 more ordinary headers expands (gcc -E, glibc 2.39) to 23 `__extension__` occurrences, and 40 C headers under /usr/include carry 261 in total -- the highest-frequency remaining GNU divergence in the direction-A set.
 @code
 __extension__ int dss_extension_decl_probe;
 int dss_extension_expr_probe(void) { return __extension__ (0); }

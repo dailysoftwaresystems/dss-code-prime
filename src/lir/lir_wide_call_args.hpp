@@ -18,13 +18,30 @@
 // the linear-scan allocator + rewriter never exhaust the register file on
 // a wide call (the func-2088 blocker).
 //
-// The overflow-slot indexing MIRRORS lir_callconv's post-regalloc placement
-// loop EXACTLY (same monotonic source-order NSAA cursor, same per-class /
-// slot-aligned pool logic, same ByValueStackAgg-carrier skip, same
-// hasIndirectResult / firstArgIdx handling), so the store offset callconv
-// computes for a `store_outgoing_arg` payload is byte-identical to what the
-// old placement loop stored — the caller-store ↔ callee-load contract is
-// unchanged.
+// ★★★ THIS PASS OWNS EVERY OUTGOING-ARGUMENT BYTE OFFSET
+// (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES), and it is the
+// only tier that CAN: it is the last one to see the call's COMPLETE argument
+// list, because removing the overflow scalars is its own job. Anything that
+// re-derives a placement afterwards is walking a list this pass shortened, so
+// its cursor restarts inside bytes already handed out — which is exactly the
+// silent caller-side miscompile the row above records (a stacked scalar and the
+// first eightbyte of a stacked aggregate written to the SAME bytes).
+//
+// So the pass emits, for one call:
+//   * each stacked SCALAR as a `store_outgoing_arg` whose PAYLOAD is its byte
+//     offset and whose `flags` are the access width the cursor chose, and
+//   * each stacked by-value AGGREGATE left on the Call (its byte-copy needs
+//     post-regalloc physical registers) with its byte offset STATED as a
+//     trailing `MemOffset` operand on the carrier triple,
+// and it stamps `kLirInstFlagOutgoingArgsPlaced` on the shrunken Call, which is
+// how `lir_callconv` KNOWS to read those placements rather than compute any.
+//
+// D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the byte placement rule
+// itself lives in `StackArgCursor` (lir_callconv.hpp) — the same object the
+// outgoing-area RESERVATION and the CALLEE's incoming reads walk, so a caller
+// store and a callee load cannot disagree. Under every `Slot`-packing CC an
+// offset is `idx*slot` and the width flags are 0 (= 64-bit), i.e. exactly the
+// pre-Apple encoding.
 //
 // Runs after MIR→LIR (which has NO active-cc knowledge) and before
 // liveness/regalloc (both of which receive callingConventionIndex), so this

@@ -239,6 +239,14 @@ public:
     void setCompileConfig(CompileConfig c) noexcept { compileConfig_ = c; }
     [[nodiscard]] CompileConfig compileConfig() const noexcept { return compileConfig_; }
 
+    /// D-OPT11-LAZY-IMPORT-EDGE: the link-time-optimization TOPOLOGY, stamped
+    /// from `CliArgs::lto` by `Program::run` before dispatch (the
+    /// setCompileConfig pattern). `Full` (the default) is what every build did
+    /// before the flag existed; `Thin` adds the per-TU on-demand import stage
+    /// between the CU pool and the whole-program merge.
+    void setLtoMode(LtoModeArg m) noexcept { ltoMode_ = m; }
+    [[nodiscard]] LtoModeArg ltoMode() const noexcept { return ltoMode_; }
+
     /// c105 (D-PP-USER-DEFINE): the CLI `--define NAME[=VALUE]` entries,
     /// stamped from `CliArgs::defines` by `Program::run` before dispatch
     /// (the setOutputDir/setCompileConfig pattern). Every CU build threads
@@ -441,6 +449,7 @@ private:
     bool                                   perFormatOutputSubdir_ = false;  // D-AP2-OUTPUT-ROUTING: project ⇒ force <formatName>/ subdir
     std::optional<::dss::opt::OptPipeline> optimizerPipelineOverride_;
     CompileConfig                          compileConfig_ = CompileConfig::Debug;
+    LtoModeArg                             ltoMode_ = LtoModeArg::Full;
     std::vector<std::string>               userDefines_;  // c105: --define
     std::vector<std::string>               includeDirs_;  // -I<dir> quote-include search path
     std::vector<ResolveLibrarySpec>        resolveLibraries_;  // c162: --resolve-library

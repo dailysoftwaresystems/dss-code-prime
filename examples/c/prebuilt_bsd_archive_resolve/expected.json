@@ -1,0 +1,43 @@
+{
+  "$comment": "D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS -- the corpus consuming a static archive THIS REPOSITORY DID NOT BUILD, in a container DSS's own `ar` writer cannot produce. ★★★ WHY THE CORPUS COULD NOT EXPRESS THIS BEFORE: every `dependsOn` entry names `sources` and the runner COMPILES them with DSS, so every library the corpus linked was one DSS produced from C in the same run. An archive somebody ELSE built was inexpressible -- and the BSD `ar` container (`__.SYMDEF` / `__.SYMDEF SORTED` little-endian ranlib pairs, `#1/N` inline member names) is exactly that class, because DSS's `ar` writer emits the GNU/SysV container only (src/link/format/ar.cpp). So [[D-FF1-AR-BSD-VARIANT]] shipped its two parse arms with driver-level compile-and-RUN witnesses but NO corpus example, and the gap it left is REGRESSION COVERAGE, not correctness: nothing in the standing suite would have noticed if those arms broke. The new per-target `prebuiltLibraries` key closes it in BOTH runners. ★★ THE TWO FIXTURES DELIBERATELY DISAGREE, which is why both are linked here rather than one: `libbsdllvm.a` is `llvm-ar-19 --format=bsd` output with a PLAIN `__.SYMDEF`, ELF members, un-prefixed symbols and UNSORTED entries; `libbsdapple.a` is Apple `ar` output with `__.SYMDEF SORTED`, Mach-O members, `_`-prefixed symbols and sorted-by-name entries (so its ranlib[0] names the SECOND member). A reader that hardcoded either producer's choices passes against that one and fails against the other, so a corpus example linking only one would leave half the capability unwitnessed. ★ THE EXIT CODE CANNOT PASS BY ACCIDENT: `dss_bsd_short` (20) and `dss_bsd_long` (22) are defined NOWHERE in this directory. Drop the archive and both are unresolved externs and the build fails; mis-parse the `#1/N` inline name and the long-named member's payload starts N bytes off, so what is merged is not a function. 42 is only reachable with the BSD arms working. ⚠ WHY `path` POINTS OUTSIDE THIS DIRECTORY, which no other corpus example does: ✔MEASURED, `.gitignore` ignores `*.a` tree-wide and re-includes exactly ONE directory, `!tests/ffi/data/*.a` -- so a `.a` copied in beside main.c would be SILENTLY un-committable, the same trap [[D-FF1-AR-BSD-VARIANT]] hit and had to add a negation for. Copying the bytes would also give ONE file TWO provenances, and a fixture whose provenance is a README rather than a build rule is a thing that rots. Pointing at the canonical fixture keeps one file, one README, two consumers -- the 12 hermetic reader tests and this example. ★ `containerWitness` IS WHAT KEEPS THAT HONEST, and it is required rather than optional: if either fixture were ever regenerated in the GNU container, the GNU reader would resolve the same two symbols and this example would go on passing while the BSD arms lost their only corpus witness, with every suite still green. Both runners READ the token and refuse the link without it. ⚠ NO windows target: neither fixture holds COFF members, and a BSD archive of ELF/Mach-O objects is not linkable into a PE image. ⇒ on a Windows host the in-process runner COMPILES both targets and spawns neither, and the CLI-subprocess runner (which binds only the host-runnable spec, user invariant 2026-06-02) exercises this example on the LINUX leg. That division of labour is the one `tests/test_support/coverage_boundary.hpp` states.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "prebuiltLibraries": [
+        {
+          "$comment": "llvm-ar-19 --format=bsd: a PLAIN `__.SYMDEF` symbol table, ELF members, un-prefixed symbols, entries in member order. `--format=darwin` produced a byte-identical file, so this one fixture covers both spellings.",
+          "path": "tests/ffi/data/libbsdllvm.a",
+          "containerWitness": "__.SYMDEF"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "prebuiltLibraries": [
+        {
+          "$comment": "Apple `ar`, macOS 26.5.2 arm64: `__.SYMDEF SORTED`, Mach-O members, `_`-prefixed symbols, sorted by symbol name. The witness names the SORTED spelling on purpose -- it is the half of the BSD surface the llvm fixture does not carry.",
+          "path": "tests/ffi/data/libbsdapple.a",
+          "containerWitness": "__.SYMDEF SORTED"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

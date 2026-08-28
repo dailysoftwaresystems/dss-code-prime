@@ -67,7 +67,7 @@ Skeleton:
   "dssMapVersion": 1,
 
   "pair": {
-    "source": "c-subset",
+    "source": "c",
     "target": "javascript",
     "version": "0.1.0"
   },
@@ -139,7 +139,7 @@ New artifactProfile value `transpile` (per [`06-artifact-profile-plan`](./06-art
 
 ```jsonc
 {
-  "language":        "c-subset",
+  "language":        "c",
   "artifactProfile": "transpile",
   "transpileTarget": "javascript",
   "languagePair":    "c-subset-to-javascript",

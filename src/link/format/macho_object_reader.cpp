@@ -1,4 +1,6 @@
 #include "link/format/macho_object_reader.hpp"
+#include "link/format/dwarf_cfi_decode.hpp"
+#include "link/format/foreign_section_alignment.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
 
@@ -62,8 +64,7 @@ constexpr std::size_t kHdrFlagsOff    = 24;
 // independently" -- i.e. EVERY defined symbol starts its own atom unless it
 // says otherwise with N_ALT_ENTRY. This is the flag that makes an object's
 // symbol table SUFFICIENT to slice it, which is exactly what a size-less
-// nlist_64 otherwise is not (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-
-// LABEL-NOT-ATOM).
+// nlist_64 otherwise is not (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
 constexpr std::uint32_t kMhSubsectionsViaSymbols = 0x00002000u;
 
 // nlist_64.n_type masks (<mach-o/nlist.h>).
@@ -188,15 +189,13 @@ rdName(std::span<std::uint8_t const> b, std::uint64_t tabStart, std::uint64_t ta
                        static_cast<std::size_t>(end - start)};
 }
 
-// section_64.align is a LOG2 field. Convert to an `Alignment` newtype. Only
-// a re-layout hint (the merge re-lays-out every item), so a value beyond
-// the newtype's 256-byte cap (or a wild log2) falls back to byte alignment
-// -- never a correctness input on read-back (mirrors the ELF reader's
-// alignFromSection contract).
+// section_64.align is a LOG2 field. Convert to an `Alignment` newtype. The
+// POLICY that turns a declared section alignment into an `Alignment` is shared
+// with the ELF and COFF readers and lives in
+// `link/format/foreign_section_alignment.hpp` -- this reader supplies only the
+// fact that Mach-O spells the field as a LOG2 EXPONENT.
 [[nodiscard]] Alignment alignFromLog2(std::uint32_t log2) noexcept {
-    if (log2 == 0u || log2 > 8u) return Alignment{};   // 1 byte, or > 256 -> byte
-    return Alignment::fromBytes(static_cast<std::uint32_t>(1u) << log2)
-        .value_or(Alignment{});
+    return link::format::foreignSectionAlignmentFromLog2(log2);
 }
 
 // N_PEXT (private extern) -> Hidden, else Default (matches the ffi
@@ -220,6 +219,14 @@ struct Section {
     std::uint32_t flags    = 0;
     bool          zeroFill = false;
     std::optional<SectionKind> kind;  // resolved from (segment, name) via the schema
+    // The schema ROW the (segment, name) pair resolved to, or null when it
+    // resolved to none. `kind` is a projection of it and stays for the dozen
+    // read sites that only ever ask that question -- this pointer exists for
+    // the sites that need a field the row owns and the enum cannot carry
+    // (`entrySize`, today). Points into `ObjectFormatSchema::sections()`, which
+    // outlives this reader's call by construction (the schema is a caller
+    // parameter). D-LK-MACHO-COMPACT-UNWIND-SECTION-REFUSED-BLOCKS-EVERY-STOCK-MACOS-ARCHIVE.
+    ObjectFormatSectionInfo const* schemaRow = nullptr;
 };
 
 // One decoded nlist_64.
@@ -519,16 +526,29 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         k.append(name);
         return k;
     };
-    std::unordered_map<std::string, SectionKind> pairToKind;
+    std::unordered_map<std::string, ObjectFormatSectionInfo const*> pairToRow;
     for (auto const& row : objectFormatSchema.sections()) {
-        pairToKind.emplace(pairKey(row.segment, row.name), row.kind);
+        pairToRow.emplace(pairKey(row.segment, row.name), &row);
     }
     for (auto& sec : sections) {
-        if (auto it = pairToKind.find(pairKey(sec.segName, sec.sectName));
-            it != pairToKind.end()) {
-            sec.kind = it->second;
+        if (auto it = pairToRow.find(pairKey(sec.segName, sec.sectName));
+            it != pairToRow.end()) {
+            sec.schemaRow = it->second;
+            sec.kind      = it->second->kind;
         }
     }
+
+    // -- (3b) UNWIND METADATA: moved to step (8) -----------------------
+    //
+    // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE. This
+    // step used to WARN here, before a single function had been reconstructed,
+    // because warning was all it could do. Now that a DWARF-encoded unwind
+    // section is CARRIED, the work has to happen after step (6): an FDE binds
+    // to a FUNCTION, and the honest subject of what remains uncarried is "how
+    // many functions reach the image undescribed", which is not knowable until
+    // the functions exist. So the whole pass is step (8), at the foot of this
+    // function -- the same position the ELF reader's carry occupies, for the
+    // same reason.
 
     // -- (4) Reverse reloc map (nativeId -> RelocationKind), from the
     //         FORMAT SCHEMA -- no hardcoded ARM64_RELOC_* numbers ---------
@@ -658,6 +678,49 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
         std::uint64_t const secRelOff = s.value - sec.addr;
 
+        // ── IS THAT EVEN A QUESTION FOR THIS SECTION? ─────────────
+        //
+        // D-LK-MACHO-COMPACT-UNWIND-SECTION-REFUSED-BLOCKS-EVERY-STOCK-MACOS-ARCHIVE.
+        // Everything below -- the atom-boundary rule, the bodiless-label
+        // fallback, the coverage staging -- presumes the section HOLDS BYTES
+        // THE IMAGE WILL CARRY. A classified section that carries no linkable
+        // body does not: its content describes OTHER sections' code and is
+        // consumed by the linker. Apple's clang puts a local label (`ltmp1`) at
+        // offset 0 of `__LD,__compact_unwind` and sets MH_SUBSECTIONS_VIA_SYMBOLS
+        // on the header, so that label is indistinguishable from an atom
+        // boundary by the rule alone -- and treating it as one is what drove the
+        // slicing loop into its "no known code/data section kind" refusal on
+        // EVERY stock macOS object.
+        //
+        // ★ ONE GATE, THREE CONSEQUENCES, AND THE THIRD IS THE ONE MEASUREMENT
+        //   CAUGHT. It mints no atom (the refusal above); it stages nothing for
+        //   the coverage guard (a body no atom covers is the guard's whole
+        //   subject, and this is not a body); and it publishes NO `ModuleSymbol`
+        //   -- ✔MEASURED 2026-08-24, because the first version of this fix
+        //   recorded the label and `nm -n` on the linked arm64 exec then showed
+        //   `T ltmp1` AT THE ADDRESS OF DSS'S OWN ENTRY TRAMPOLINE -- where the
+        //   same link with this gate in place shows the trampoline's own
+        //   `_sym_*` name, and a no-archive control shows it too. The program
+        //   still ran (nothing references the label), so that was a green build
+        //   shipping a symbol table which states something false about the
+        //   artifact.
+        //
+        // ★ THE PREDICATE IS THE TAXONOMY'S, NOT THIS READER'S
+        //   (`sectionKindCarriesLinkableBody`), so a future kind is classified
+        //   where the kinds live. This file must never test a section NAME.
+        // ⚠ `kind.has_value()` IS LOAD-BEARING AND IS NOT THE SAME TEST. An
+        //   UNRESOLVED section keeps the old path deliberately, so a symbol in a
+        //   section no format row describes still reaches the slicing loop's
+        //   loud refusal. "Classified as holding no body" and "unclassified" are
+        //   different claims, and only the first one licenses skipping.
+        // ⓘ A REFERENCE TO SUCH A LABEL NOW FAILS LOUD RATHER THAN BINDING
+        //   WRONG: an r_extern=1 relocation naming it resolves to nothing and
+        //   the link reports `K_SymbolUndefined` -- correct, because DSS
+        //   genuinely did not carry the bytes that reference points into.
+        if (sec.kind.has_value() && !sectionKindCarriesLinkableBody(*sec.kind)) {
+            continue;
+        }
+
         // ── Does this defined symbol START AN ATOM? ────────────────
         //
         // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM. The
@@ -750,6 +813,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // not hold, and that must be loud too. Only a KIND-RESOLVED section
             // is staged -- a symbol in an unmodeled metadata section
             // reconstructs no body BY DESIGN and is not a dropped body.
+            // ⓘ Its CLASSIFIED sibling -- a section that resolved to a kind
+            // carrying no linkable body -- never reaches this line at all; it
+            // left the loop at the gate above.
             if (sec.kind.has_value()) {
                 bodilessDefined.push_back(link::format::BodilessDefinedSymbol{
                     /*sectionKey=*/s.sect, /*sectionOffset=*/secRelOff,
@@ -1126,15 +1192,41 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         auto const dIt = dataIntervalsBySec.find(ordinal);
         bool const patchesText = (fIt != funcIntervalsBySec.end() && !fIt->second.empty());
         bool const patchesData = (dIt != dataIntervalsBySec.end() && !dIt->second.empty());
+        // ── A CLASSIFIED BODYLESS SECTION'S RELOCS GO WITH ITS BYTES ──
+        //
+        // D-LK-MACHO-COMPACT-UNWIND-SECTION-REFUSED-BLOCKS-EVERY-STOCK-MACOS-ARCHIVE.
+        // A `SectionKind::Unwind` section's relocations exist to bind ITS OWN
+        // record fields (each record's `functionStart`, and a personality or
+        // LSDA pointer) to the code the records describe. Those bytes are not
+        // reconstructed into any atom and never reach the image, so there is
+        // nothing for the relocations to patch -- routing them anywhere would be
+        // patching bytes that do not exist. They are consumed WITH the section,
+        // and whatever a COMPACT-encoded section still fails to carry is stated
+        // once, at full volume, by step (8) below; repeating it per relocation
+        // would bury it. ⚠ A DWARF-ENCODED unwind section is a DIFFERENT
+        // case and step (8) REFUSES it here rather than reaching this arm: its
+        // FDE binding reads the pcrel value STORED in the field, so a relocation
+        // this reader skipped would mean the stored value is only half the
+        // reference and every bound function could be the wrong one. ⚠ THE TEST IS THE KIND, NEVER THE NAME, and never `nreloc == 0`:
+        // an UNCLASSIFIED reloc-bearing section still falls through to the
+        // refusal below, which is what keeps an unknown foreign section loud.
+        if (sec.kind.has_value()
+            && !sectionKindCarriesLinkableBody(*sec.kind)) {
+            continue;
+        }
         if (!patchesText && !patchesData) {
             // A reloc-bearing section that reconstructed NO atom. DSS output has
             // none -- every reloc it emits patches a __text function or a data
             // item, each an N_EXT atom. Fail loud rather than `continue`
             // (silent-failure-review fold): skipping would also bypass the
             // r_extern=0 guard below, so a foreign object's atom-less
-            // section-relative relocs would vanish undiagnosed. A foreign
-            // metadata section with relocs (e.g. `__compact_unwind`) rides the
-            // named follow-up D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC.
+            // section-relative relocs would vanish undiagnosed. ⓘ THE SECTION
+            // THIS SENTENCE USED TO NAME IS NO LONGER ONE OF THEM: a
+            // `__LD,__compact_unwind` now resolves to `SectionKind::Unwind` and
+            // exits at the arm above, so what still reaches here is a section
+            // whose kind NO format row describes -- anonymous `__cstring` /
+            // jump-table content reached through a section symbol, which is the
+            // gap-atom half of D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC.
             return fail(DiagnosticCode::F_CorruptedBinary,
                 "macho::readRelocatableObject: section '" + sec.segName + ","
                 + sec.sectName + "' carries " + std::to_string(sec.nreloc)
@@ -1287,6 +1379,332 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     mod.externImports[ex->second].isData = false;
                 }
             }
+        }
+    }
+
+    // -- (8) UNWIND METADATA: carry what CAN be carried, name what cannot --
+    //
+    // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE.
+    //
+    // ★★ THE DISPATCH IS ON THE DECLARED **ENCODING**, NEVER ON THE SECTION
+    //    NAME, and that is the whole architectural content of this step.
+    //    ✔MEASURED 2026-08-25 on real Apple Silicon (macOS 26.5.2),
+    //    `/usr/bin/cc -arch <a> -c foreign.c` with no other flag: ONE x86_64
+    //    object carries BOTH `__LD,__compact_unwind` AND `__TEXT,__eh_frame`,
+    //    while the arm64 object from the SAME compiler and SAME source carries
+    //    compact only. Two sections, ONE role, TWO encodings -- so the `kind`
+    //    alone stopped identifying a row and the row identity became the
+    //    (kind, encoding) PAIR. This reader reads that pair and nothing else;
+    //    a third encoding (ARM EHABI, Win64 SEH) is a config row plus a
+    //    decoder, never a branch added here.
+    //
+    // ★ THE DWARF ARM ADDS NO EMIT PATH ANYWHERE. `dwarf_cfi_decode.hpp` is
+    //   the shared inverse of the DWARF encoder, `CfiFunction` is the neutral
+    //   PC-keyed vocabulary every format writer already encodes ITS table
+    //   from, and `macho.cpp` already builds `__TEXT,__eh_frame` from exactly
+    //   that. So the entire Mach-O carry is: decode, bind, attach.
+    {
+        auto undescribedFunctions = [&]() -> std::size_t {
+            return static_cast<std::size_t>(
+                std::count_if(mod.functions.begin(), mod.functions.end(),
+                              [](AssembledFunction const& f) {
+                                  return !f.cfi.has_value();
+                              }));
+        };
+        // A classified row always has its schema row; the null arm is the
+        // UNCLASSIFIED case, which `sec.kind` has already excluded.
+        auto encodingOf = [](Section const& sec) -> SectionEncoding {
+            return sec.schemaRow != nullptr ? sec.schemaRow->encoding
+                                            : SectionEncoding::Unspecified;
+        };
+        auto isCarryingUnwindSection = [](Section const& sec) {
+            return sec.kind.has_value() && *sec.kind == SectionKind::Unwind
+                && sec.size != 0u;   // nothing described, nothing to say
+        };
+
+        // ── PASS ONE: EVERY ENCODING THIS READER CAN CARRY ────────────────
+        //
+        // ⚠⚠ THE TWO PASSES ARE ORDERED, AND THE ORDER IS THE WHOLE POINT --
+        // a single loop over `sections` visits them in WIRE ORDER, and
+        // ✔MEASURED on every Apple x86_64 object (fixture and a fresh
+        // `cc -arch x86_64 -c` alike) `__LD,__compact_unwind` sits at a LOWER
+        // address than `__TEXT,__eh_frame`. So the compact arm asked "how many
+        // functions are still undescribed" BEFORE the DWARF arm had described
+        // any, and warned about three functions that were about to be covered
+        // -- precisely the false alarm the count exists to remove. Carrying
+        // must therefore finish before anything reports what was not carried.
+        for (auto const& sec : sections) {
+            if (!isCarryingUnwindSection(sec)) continue;
+            std::string const where = sec.segName + "," + sec.sectName;
+            SectionEncoding const encoding = encodingOf(sec);
+
+            // ── UNSPECIFIED IS REFUSED, NOT DEFAULTED ──────────────────────
+            //
+            // ★ THE ONE PLACE THIS STEP COULD HAVE BECOME A GUESS. Reading an
+            //   unwind body in "whichever encoding Mach-O usually uses" is how
+            //   a decoder walks a compact record as a CIE, resynchronizes onto
+            //   record bytes, and reports a confident table of noise -- which
+            //   is strictly worse than the silence this row exists to end,
+            //   because the unwinder TRUSTS a table that is present.
+            if (encoding == SectionEncoding::Unspecified) {
+                return fail(DiagnosticCode::F_UnsupportedBinaryFormat,
+                    "macho::readRelocatableObject: object format '"
+                    + std::string{objectFormatSchema.name()} + "' declares '"
+                    + where + "' as per-function unwind metadata but does not "
+                    "say which WIRE ENCODING it is in, and this reader will not "
+                    "guess: reading a compact-unwind body as DWARF (or the "
+                    "reverse) produces a plausible-looking unwind table that "
+                    "describes nothing real. Add an \"encoding\" key to that "
+                    "section row "
+                    "(D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE).");
+            }
+
+            if (encoding == SectionEncoding::CompactUnwind) {
+                continue;   // pass two, below -- after every carry has landed
+            }
+
+            // ── THE DWARF ARM: decode, bind, attach ────────────────────────
+            if (encoding != SectionEncoding::DwarfCfi) {
+                // Unreachable while `SectionEncoding` has three rows and the
+                // two above are handled -- and kept anyway, because the arm a
+                // NEW encoding lands on must be a refusal and not a fall
+                // -through into the DWARF decoder.
+                return fail(DiagnosticCode::F_UnsupportedBinaryFormat,
+                    "macho::readRelocatableObject: unwind section '" + where
+                    + "' is declared with encoding '"
+                    + std::string{sectionEncodingName(encoding)}
+                    + "', which this reader has no decoder for. Refusing rather "
+                      "than reading it as DWARF.");
+            }
+            // ⚠ NO RELOCATIONS, AND THAT IS CHECKED RATHER THAN ASSUMED.
+            // ✔MEASURED (Apple clang, both the fixture and a fresh `cc -arch
+            // x86_64 -c`): `__TEXT,__eh_frame` has nreloc 0 -- the FDE's
+            // `initial_location` is a pcrel DELTA resolved inside the object's
+            // own flat address space, which is the OPPOSITE of the ELF
+            // relocatable convention where that field is zero and a relocation
+            // carries the whole reference. So the binding below reads the
+            // STORED value, and a relocation nobody applied would make that
+            // value half of a reference -- binding every FDE to a wrong
+            // function while reporting success.
+            if (sec.nreloc != 0u) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: unwind section '" + where
+                    + "' carries " + std::to_string(sec.nreloc)
+                    + " relocation(s). A DWARF call-frame section in a Mach-O "
+                      "relocatable resolves each FDE's `initial_location` as a "
+                      "pc-relative delta within the object's own address space "
+                      "and carries none; a relocation here means the stored "
+                      "delta is only part of the reference, and binding on it "
+                      "would attach unwind rules to the wrong functions.");
+            }
+            if (rangeExceedsBuffer(sec.offset, sec.size, bytes.size())) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: unwind section '" + where
+                    + "' body runs past the end of the file.");
+            }
+            auto const decoded = link::format::decodeEhFrame(
+                bytes.subspan(static_cast<std::size_t>(sec.offset),
+                              static_cast<std::size_t>(sec.size)),
+                link::format::dwarfRegisterMappingOf(targetSchema),
+                "macho::readRelocatableObject", reporter);
+            if (!decoded.has_value()) return std::nullopt;  // already reported
+
+            for (auto const& fde : decoded->fdes) {
+                // ★ THE REFERENCE IS RESOLVED THROUGH THE ENCODING THE CIE
+                //   DECLARED, not through a convention this reader picked. The
+                //   decoder reports the field's own offset, the stored value
+                //   and the `R` encoding precisely so the tier that knows the
+                //   field's ADDRESS -- this one -- can finish the job.
+                std::uint64_t targetAddr = 0;
+                if (link::format::dwEhPeIsPcRelative(fde.pointerEncoding)) {
+                    std::uint64_t const fieldAddr =
+                        sec.addr + fde.initialLocationFieldOffset;
+                    targetAddr = static_cast<std::uint64_t>(
+                        static_cast<std::int64_t>(fieldAddr)
+                        + fde.storedInitialLocation);
+                } else {
+                    targetAddr =
+                        static_cast<std::uint64_t>(fde.storedInitialLocation);
+                }
+
+                // Which section does that flat-space address land in? The
+                // question is asked of the ADDRESS MAP, never of a section
+                // name -- an object is free to describe code in a section
+                // other than the first one, and `-ffunction-sections` moves
+                // WHICH section rather than the shape of the reference.
+                Section const* owner = nullptr;
+                for (auto const& cand : sections) {
+                    if (cand.size == 0u) continue;
+                    if (targetAddr >= cand.addr
+                        && targetAddr < cand.addr + cand.size) {
+                        owner = &cand;
+                        break;
+                    }
+                }
+                if (owner == nullptr) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: the FDE whose "
+                        "`initial_location` field is at byte offset "
+                        + std::to_string(fde.initialLocationFieldOffset)
+                        + " of '" + where + "' points at flat address "
+                        + std::to_string(targetAddr)
+                        + ", which lies in no section of this object.");
+                }
+                std::uint8_t const ownerOrdinal = static_cast<std::uint8_t>(
+                    (owner - sections.data()) + 1);
+                std::uint64_t const targetOff = targetAddr - owner->addr;
+                Interval const* hit = nullptr;
+                if (auto fit = funcIntervalsBySec.find(ownerOrdinal);
+                    fit != funcIntervalsBySec.end()) {
+                    for (auto const& iv : fit->second) {
+                        if (iv.start == targetOff) { hit = &iv; break; }
+                    }
+                }
+                if (hit == nullptr) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: an FDE describes the code "
+                        "at offset " + std::to_string(targetOff) + " of section '"
+                        + owner->segName + "," + owner->sectName
+                        + "', where no reconstructed function BEGINS. An unwind "
+                          "record that cannot be attached to a function would "
+                          "have to be dropped, which is the silence this step "
+                          "exists to end "
+                          "(D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE).");
+                }
+                // ★★ THE EXTENT RULE IS **NOT** THE ELF READER'S, AND COPYING
+                //    IT WAS A DESIGN CLAIM REAL APPLE BYTES REFUTED.
+                //
+                //    ✔MEASURED 2026-08-25, `/usr/bin/otool -tvV` on a stock
+                //    `cc -arch x86_64 -c` object: `_dss_foreign_leaf` is
+                //    FIFTEEN bytes of code (`…retq` at 0x0e) followed by a
+                //    `nop` at 0x0f, and `_dss_foreign_mid` begins at 0x10
+                //    because `__text` has align 2^4. Both of Apple's OWN
+                //    encodings agree the function is 15 bytes -- the FDE's
+                //    `address_range` and the compact record's `length` -- while
+                //    the atom this reader slices is SIXTEEN, because under
+                //    MH_SUBSECTIONS_VIA_SYMBOLS an atom runs to the NEXT
+                //    SYMBOL and therefore swallows the inter-function padding.
+                //    An exact-equality rule (which is right on ELF, where the
+                //    x86_64 and aarch64 gcc fixtures match to the byte) refused
+                //    the ordinary output of the platform's own compiler.
+                //
+                // ★ SO THE RULE IS STATED AGAINST THE DANGER INSTEAD OF THE
+                //   NUMBER. What must never happen is a PC the function really
+                //   EXECUTES having no unwind record: the unwinder finds
+                //   nothing and stops the walk with no error. The bytes an FDE
+                //   leaves undescribed are safe exactly when they are the
+                //   padding that carried the next atom to its alignment
+                //   boundary -- so rounding the described extent UP to the
+                //   section's own alignment must reach the end of the atom.
+                //   ⚠ NOT A TOLERANCE AND NOT A FUDGE: an FDE describing 3
+                //   bytes of a 100-byte function still fails, because 3 rounded
+                //   up to 16 is 16 and the atom ends at 100. The bound is the
+                //   document's declared alignment, not a constant.
+                std::uint64_t const atomEnd = hit->start + hit->len;
+                // `section_64.align` is a LOG2 exponent. Read from the OWNING
+                // section rather than from a constant, and refused rather than
+                // shifted when it is absurd -- a shift past the width of the
+                // type is undefined, and this value comes off a foreign wire.
+                if (owner->align > 31u) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: section '"
+                        + owner->segName + "," + owner->sectName
+                        + "' declares alignment 2^" + std::to_string(owner->align)
+                        + ", which is not an alignment any atom can have.");
+                }
+                std::uint64_t const alignBytes = std::uint64_t{1} << owner->align;
+                std::uint64_t const describedEnd = hit->start + fde.cfi.codeLength;
+                std::uint64_t const paddedEnd =
+                    ((describedEnd + alignBytes - 1u) / alignBytes) * alignBytes;
+                if (fde.cfi.codeLength > hit->len || paddedEnd < atomEnd) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: the FDE for the function "
+                        "at offset " + std::to_string(targetOff) + " of section '"
+                        + owner->segName + "," + owner->sectName + "' describes "
+                        + std::to_string(fde.cfi.codeLength)
+                        + " bytes of an atom that runs " + std::to_string(hit->len)
+                        + " bytes, and the difference is not the padding that "
+                          "carries the next atom to this section's "
+                        + std::to_string(alignBytes)
+                        + "-byte alignment; an unwind record that does not cover "
+                          "every PC its function executes stops a stack walk "
+                          "mid-way with no diagnostic.");
+                }
+                if (mod.functions[hit->outIdx].cfi.has_value()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: TWO FDEs describe the "
+                        "function at offset " + std::to_string(targetOff)
+                        + " of section '" + owner->segName + ","
+                        + owner->sectName
+                        + "'; one of them is wrong and nothing here can tell "
+                          "which.");
+                }
+                mod.functions[hit->outIdx].cfi = fde.cfi;
+            }
+        }
+
+        // ── PASS TWO: WHAT IS *STILL* NOT CARRIED, SAID OUT LOUD ──────────
+        //
+        // Runs only after every carrying encoding above has attached what it
+        // can, so what it reports is what a reader actually loses.
+        for (auto const& sec : sections) {
+            if (!isCarryingUnwindSection(sec)) continue;
+            if (encodingOf(sec) != SectionEncoding::CompactUnwind) continue;
+            std::string const where = sec.segName + "," + sec.sectName;
+
+            // ✔MEASURED and NOT a capability that was skipped: a compact
+            // record is `{fnStart, len, encoding, personality, lsda}` with
+            // NO PC DIMENSION, so it states the frame rule in the function
+            // BODY only. An FDE claiming that rule holds from pcOffset 0
+            // asserts something the producer never said and is WRONG for
+            // every prologue PC -- a table that is confidently wrong, which
+            // is the failure this whole row exists to prevent. Its honest
+            // carry is a `__TEXT,__unwind_info` synthesis on the WRITE
+            // side, which DSS does not yet emit.
+            //
+            // Counted from the SCHEMA's `entrySize`, never from a record
+            // layout typed into this file: the row declares how wide one
+            // function's unwind record is, so the count in the message is
+            // the format document's own arithmetic. A body that is not a
+            // whole number of records is a corrupt object and fails LOUD --
+            // a warning naming a wrong count is worse than no count.
+            std::uint64_t const entry =
+                sec.schemaRow != nullptr ? sec.schemaRow->entrySize : 0u;
+            if (entry == 0u || (sec.size % entry) != 0u) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: unwind section '" + where
+                    + "' is " + std::to_string(sec.size) + " bytes, which is not a "
+                    "whole number of " + std::to_string(entry) + "-byte records as "
+                    "object format '" + std::string{objectFormatSchema.name()}
+                    + "' declares in that section's `entrySize` -- refusing to "
+                    "report a record count this reader and the producer do not "
+                    "agree on.");
+            }
+            // ★★ THE WARNING IS NOW ABOUT FUNCTIONS, NOT RECORDS, AND THAT
+            //    IS A CORRECTION. It used to fire once per compact section
+            //    unconditionally. On x86_64 that is now a FALSE ALARM: the
+            //    same object's `__TEXT,__eh_frame` sibling describes those
+            //    very functions, they DO reach the image described, and a
+            //    warning saying otherwise trains a reader to ignore the
+            //    one case that is real. What is actually lost is a function
+            //    that arrives with NO description from ANY encoding, so
+            //    that is what is counted and that is what is said.
+            std::size_t const undescribed = undescribedFunctions();
+            if (undescribed == 0u) continue;
+            report(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
+                   DiagnosticSeverity::Warning,
+                   "macho::readRelocatableObject: section '" + where + "' carries "
+                   + std::to_string(sec.size / entry) + " function unwind "
+                   "record(s) in the compact-unwind encoding, which states a "
+                   "frame rule for a function's BODY with no PC dimension -- so "
+                   "it cannot become the PC-keyed call-frame information DSS "
+                   "builds its image unwind table from, and converting it would "
+                   "assert a rule the producer never stated for every prologue "
+                   "PC. " + std::to_string(undescribed) + " function(s) this "
+                   "object contributes will therefore appear in the image with "
+                   "NO unwind description: a backtrace stops at them and an "
+                   "exception thrown through them terminates. Anchored: "
+                   "D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE.");
         }
     }
 

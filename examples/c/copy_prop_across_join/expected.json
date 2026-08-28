@@ -1,0 +1,18 @@
+{
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 10,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "mem2reg-only", "passes": ["Mem2Reg"], "mustDifferFromBaseline": true},
+    {"label": "copyprop-after-mem2reg", "passes": ["Mem2Reg", "CopyProp"], "mustDifferFromBaseline": true}
+  ]
+}

@@ -137,7 +137,8 @@ callConvFromName(std::string_view s) noexcept {
 // round-trip with no diagnostic. Pin: table size MUST cover every
 // enum value, AND each row MUST sit at the index matching its
 // enum's underlying value (also makes the lookup O(1) on a dense
-// enum). Pattern mirrors `c_mangle.cpp:42`. Anchored
+// enum). Pattern mirrors `kMangleErrorTableRowsAligned` in
+// `c_mangle.cpp`. Anchored
 // D-ENUM-NAME-TABLE-STATIC-ASSERTS for retrofit to the 5 sibling
 // tables (TargetAbiModel / TargetCondCode / TargetResultRule /
 // TargetRegClass / TargetEncodingShape) — same silent-fallback
@@ -176,8 +177,8 @@ enum class TargetCondCode : std::uint8_t {
     Ule = 7,  // unsigned <=
     Ugt = 8,  // unsigned >
     Uge = 9,  // unsigned >=
-    // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-
-    // FCMP adjudication): FLOAT condition codes over the flags an FP
+    // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-FCMP
+    // adjudication): FLOAT condition codes over the flags an FP
     // compare instruction sets (x86 UCOMISD/UCOMISS → ZF/PF/CF; arm64
     // FCMP → NZCV). These are SEPARATE entries from the integer codes
     // because the (predicate → ISA condition) mapping diverges per
@@ -325,8 +326,21 @@ targetRegClassFromName(std::string_view s) noexcept {
 isOperableTargetRegClass(TargetRegClass c) noexcept {
     return c != TargetRegClass::None;
 }
+// ⚠ The `4` is a LITERAL and the companion assert is the other half of the
+// guard. D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY: written
+// as `rows.size() - 1` this would be `x == x`, because `namesWhere<M>` compares
+// `M` against the rows this same table's predicate accepts. The literal reds on
+// a new OPERABLE class; the assert reds on a SECOND inoperable one, which the
+// literal alone cannot see. Both arms ✔MEASURED — the write-up is at
+// `kSelectableExitMechanismNames` below.
 inline constexpr auto kOperableTargetRegClassNames =
     namesWhere<4>(kTargetRegClassTable, isOperableTargetRegClass);
+static_assert(kTargetRegClassTable.rows.size()
+                  == kOperableTargetRegClassNames.size() + 1,
+              "kTargetRegClassTable must have exactly ONE inoperable row (the "
+              "'none' no-class value) — a second one leaves `namesWhere`'s "
+              "literal count matching while `/registerClassOps/{}/class` "
+              "silently stops naming the set its gate accepts");
 
 // Map a substrate-tier `TypeKind` to its `TargetRegClass`. Universal
 // across all register-machine targets — floats use the FPR envelope,
@@ -568,6 +582,17 @@ struct VaListLayout {
     std::uint32_t gpSlotBytes = 0;    // bytes per integer save slot (SysV/AAPCS64: 8)
     std::uint32_t fpSaveCount = 0;    // SSE/VR arg regs spilled (SysV/AAPCS64: 8)
     std::uint32_t fpSlotBytes = 0;    // bytes per SSE/VR save slot (SysV/AAPCS64: 16)
+    // ── WHICH REGISTERS THE VR BLOCK SAVES IS NOT DECLARED HERE ─────────────
+    // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD. It is the CC's OWN
+    // `argVrs` list, and this note exists because the prologue used to read
+    // `argFprs` instead. On AArch64 those name the SIXTY-FOUR-BIT `d0..d7`
+    // views, so a 16-byte `STUR Qt` was emitted naming an 8-byte register;
+    // ✔MEASURED, it produced the right BYTES only because `d0` and `v0` share
+    // hwEncoding 0, which is exactly why nothing caught it. `validate()` now
+    // requires `argVrs` to cover `fpSaveCount` on an `Aapcs64DualCursor`
+    // layout, so the list the prologue reads is the one the ABI names
+    // (AAPCS64 §B saves `q0..q7`, sixteen bytes each) and no inference stands
+    // in for it.
 
     // `va_arg` reg-vs-overflow thresholds. gp_offset < gpOffsetLimit ⇒ read from
     // the save area (SysV: 48 = 6×8); fp_offset < fpOffsetLimit ⇒ likewise
@@ -591,6 +616,67 @@ struct VaListLayout {
     [[nodiscard]] constexpr std::uint32_t regSaveAreaBytes() const noexcept {
         return gpSaveCount * gpSlotBytes + fpSaveCount * fpSlotBytes;
     }
+};
+
+// D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: how ONE argument that
+// did not fit the argument registers occupies the overflow (stack) area.
+//
+// ★ THE RULE IS NOT ONE RULE — IT HAS THREE AXES AND THEY MEASURABLY DIFFER.
+// ✔MEASURED 2026-08-24 on Apple clang 21.0.0 / macOS 26.5.2 (`otool -tV` of a
+// `-target arm64-apple-macos` object) against `aarch64-linux-gnu-gcc 13.3.0`
+// (`objdump -d`) for the same sources:
+//   * NAMED SCALARS — Apple packs NATURALLY (`char,short,int,long,char` land at
+//     +0,+2,+4,+8,+16; `float,float,double,float` at +0,+4,+8,+16 — the FPR pool
+//     obeys the same rule), AAPCS64 uses an 8-byte slot each (+0,+8,+16,+24).
+//   * NAMED AGGREGATES — BOTH round to whole 8-byte slots (a 3-byte struct then
+//     an `int` puts the int at +8 on Apple, not +3; a 12-byte struct puts it at
+//     +16, not +12).
+//   * VARIADIC ARGS — BOTH use 8-byte slots (Apple's caller emits `str x` at
+//     +8,+16 for stacked varargs).
+// ⇒ A single boolean ("this CC packs naturally") would encode Apple's own ABI
+// WRONGLY on two of the three axes, which is why this is a three-field object
+// and not a flag. Do NOT add a fourth axis speculatively — three is what was
+// measured.
+//
+// `Slot` is the default on every axis, so a CC that declares nothing keeps the
+// classic one-pointer-width-slot-per-stacked-arg placement byte-for-byte.
+enum class StackArgPacking : std::uint8_t {
+    Slot    = 0,  // one whole pointer-width slot, whatever the datum's size
+    Natural = 1,  // aligned up to the datum's own alignment, advanced by its own size
+};
+
+inline constexpr EnumNameTable<StackArgPacking, 2> kStackArgPackingTable{{{
+    { StackArgPacking::Slot,    "slot"    },
+    { StackArgPacking::Natural, "natural" },
+}}};
+
+// Well-formedness of the table itself (no empty spelling, no duplicate spelling,
+// no duplicate enumerator) — an under-filled table is legal C++ and would make
+// "" resolve to `Slot`, i.e. silently disable a declared divergence.
+DSS_CHECK_ENUM_NAME_TABLE(kStackArgPackingTable);
+
+[[nodiscard]] constexpr std::string_view
+stackArgPackingName(StackArgPacking p) noexcept {
+    // The `-Werror=switch` backstop — it owns no spelling.
+    switch (p) {
+        case StackArgPacking::Slot:
+        case StackArgPacking::Natural:
+            break;
+    }
+    return kStackArgPackingTable.nameOrEmpty(p);
+}
+[[nodiscard]] constexpr std::optional<StackArgPacking>
+stackArgPackingFromName(std::string_view s) noexcept {
+    return kStackArgPackingTable.fromName(s);
+}
+
+// The three measured axes, declared per calling convention. An OMITTED
+// `stackArgPacking` object (and an omitted key inside it) means `Slot`, so every
+// pre-existing CC is byte-unchanged by construction rather than by testing.
+struct StackArgPackingRules {
+    StackArgPacking namedScalars    = StackArgPacking::Slot;
+    StackArgPacking namedAggregates = StackArgPacking::Slot;
+    StackArgPacking variadic        = StackArgPacking::Slot;
 };
 
 // One calling convention. A target may declare multiple (SysV AMD64,
@@ -794,6 +880,13 @@ struct DSS_EXPORT TargetCallingConvention {
     // sides agree AND va_start's `__gr_offs`/`__vr_offs` clamp reflects it.
     bool aggregateStackExhaustsRegisters = false;
 
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the three measured
+    // stacked-argument packing axes (see `StackArgPackingRules` above). Omitted
+    // in JSON ⇒ all three `Slot` ⇒ every pre-existing CC keeps its exact
+    // placement AND its 8-byte access width. `apple_arm64` declares
+    // `namedScalars: "natural"`.
+    StackArgPackingRules stackArgPacking{};
+
     // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the
     // classification STRATEGY for a struct/union passed/returned by value.
     // A closed enum (the `aggregate_abi` classifier switches on it, never on
@@ -891,6 +984,60 @@ struct DSS_EXPORT TargetCallingConvention {
     std::optional<VaListLayout> vaListLayout;
 };
 
+// ── THE ALLOCATABLE-POOL LISTS — ONE OWNER FOR "WHICH OF A CALLING
+//    CONVENTION'S REGISTER LISTS MAKE A REGISTER ALLOCATABLE" ─────────────
+//
+// D-TARGET-ALLOCATABLE-POOL-LIST-SET-HAS-NO-OWNER.
+//
+// The register-allocator's free lists and the rewriter's spill-reload scratch
+// pool are BOTH "the register table INTERSECTED with some of this calling
+// convention's name lists". Which lists is one fact, and until this table it
+// had TWO hand-kept owners — `lir_regalloc::buildFreeLists` and
+// `lir_rewrite::collectAllocatable` — each spelling out the same six
+// `absorb(...)` calls. ⚠ Two copies of a set is not a redundancy that shows
+// up as a build break if they drift: an allocator that thinks a register is
+// reserved while the rewriter thinks it is free scratch (or the reverse) is a
+// SILENT wrong-register answer, and nothing compares them.
+//
+// ★ WHY IT LIVES IN `core/` RATHER THAN BESIDE ITS TWO LIR CONSUMERS. It is
+// read by `TargetSchemaData::validate()` — the load-time judge — which is one
+// tier BELOW LIR and cannot include it. That placement is not a compromise: it
+// is what makes the aliased-view rule in `validate()` see the same set the
+// engine will absorb, so ADDING A LIST HERE is immediately judged against
+// every shipped target rather than silently changing what the allocator hands
+// out. Removing `argVrs` from this table is not an option a future cycle has
+// to remember — it is a list that was never in it, and putting it in is the
+// edit `validate()` refuses by name (see the aliased-view block there).
+//
+// ⚠ THE ARG/RETURN POOLS ARE HERE FOR A DIFFERENT REASON THAN `callerSaved`.
+// `callerSaved`/`calleeSaved` DECLARE allocability; the arg/return pools are
+// ABI PLACEMENT and appear here only because a register the ABI can place a
+// value in must also be one the allocator may hand out. On both shipped
+// targets they are subsets of `callerSaved`, so this table currently adds
+// nothing beyond it — which is exactly why an inconsistency here would be
+// invisible without a rule that judges the UNION.
+using TargetCcRegisterList = std::vector<std::string> TargetCallingConvention::*;
+inline constexpr std::array<TargetCcRegisterList, 6> kAllocatablePoolLists{{
+    &TargetCallingConvention::callerSaved,
+    &TargetCallingConvention::calleeSaved,
+    &TargetCallingConvention::argGprs,
+    &TargetCallingConvention::argFprs,
+    &TargetCallingConvention::returnGprs,
+    &TargetCallingConvention::returnFprs,
+}};
+// The JSON key each entry above is spelled with, in the SAME order — used by
+// the load-time diagnostic to name the list a register was found in. Kept
+// adjacent so a new entry that forgets its name fails the `static_assert`
+// below rather than reporting a register as belonging to the wrong list.
+inline constexpr std::array<std::string_view, 6> kAllocatablePoolListNames{{
+    "callerSaved", "calleeSaved", "argGprs", "argFprs", "returnGprs",
+    "returnFprs",
+}};
+static_assert(kAllocatablePoolLists.size() == kAllocatablePoolListNames.size(),
+              "every allocatable-pool list must carry the JSON key it is "
+              "spelled with — a nameless entry would be reported as another "
+              "list's");
+
 // Discriminates the byte-encoding shape an opcode commits to (plan 13
 // AS1). `None` is the default; opcodes without an `encoding` block in
 // the target JSON stay at `None` and the assembler emits
@@ -962,8 +1109,8 @@ enum class OperandKindFilter : std::uint8_t {
                     // signed 32-bit displacement for [base+disp]
                     // addressing. Wired to `Disp32Mem` to emit 4 LE
                     // bytes after the ModR/M (and SIB when present).
-    BlockRef  = 5,  // `LirOperand{kind == BlockRef}` — D-CSUBSET-
-                    // WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): refers
+    BlockRef  = 5,  // `LirOperand{kind == BlockRef}` —
+                    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): refers
                     // to an INTRA-FUNCTION basic block. Wired to the
                     // `BlockRel32` slot on x86 (4-byte trailing PC-
                     // relative displacement, resolved at assemble time
@@ -1109,6 +1256,81 @@ struct DSS_EXPORT TargetAsmConstraint {
     std::optional<std::uint16_t>     registerOrdinal;  // binds == Register
     std::optional<OperandKindFilter> operandKind;      // binds == OperandKind
 };
+
+// ── how a BARE inline-asm operand reference states its width ───────────────
+//
+// A GNU extended-asm template writes `%0` for an operand and a MODIFIER
+// (`%w0`, `%k0`) to pick a narrower or wider VIEW of the same register. The
+// modifier letters are DIALECT vocabulary and live in the language document's
+// `assembly.templateModifiers`. This facet answers the other half — the one a
+// dialect cannot answer, because it is not about spelling at all:
+//
+//     when NO letter is written, WHICH VIEW does `%0` name?
+//
+// ★★★ THE TWO REFERENCES DISAGREE ON THE **DERIVATION**, NOT ON THE SPELLING,
+// AND THAT IS WHY THIS IS A DECLARED POLICY RATHER THAN AN ARITHMETIC RULE.
+// ✔MEASURED 2026-08-27 by reading `-S` output, gcc 13.3.0 AND clang 19.1.1,
+// both ports, `-O0` and `-O2`, template `__asm__("BARE %0 END" : : "r"(v))`:
+//
+//   * aarch64 renders the 64-bit `x` name for **every** integer type —
+//     `_Bool`, `char`, `unsigned char`, `short`, `int`, `unsigned int`,
+//     `long`, `long long`, `void *` and `__int128` alike. The operand's type
+//     does not enter into it, and `%w` is how 32 bits is asked for. clang says
+//     so in its own words under `-Wasm-operand-widths`: *"value size does not
+//     match register size"*, fix-it *use constraint modifier "w"*.
+//   * x86_64 renders `%al` / `%ax` / `%eax` / `%rax` — tracking the operand's
+//     own type width exactly, at all four widths, on both compilers.
+//
+// ⇒ NO WIDTH ARITHMETIC REPRODUCES BOTH. "Narrowest view ≥ the type width"
+// yields `w0` for an `int` on aarch64 (it renders `x0`); "the widest view"
+// yields `%rax` for an `int` on x86_64 (it renders `%eax`). Each target's
+// answer is a fact about that processor, and the only honest representation of
+// a fact with no derivation is to declare it.
+//
+// ★★ AND IT IS A **TARGET** FACT, NOT A DIALECT ONE — checked with the exact
+// instrument `TargetAsmConstraint`'s own charter above demands, since that
+// charter is what forbids a dialect-varying fact from entering `.target.json`.
+// ✔MEASURED 2026-08-27, one processor under BOTH of its dialects
+// (`gcc -masm=att` vs `-masm=intel`, and the same pair under clang 19): the
+// selected VIEW is identical — `al`/`ax`/`eax`/`rax` — and only the SIGIL
+// moves. The control that keeps the test from being vacuous moved as it must:
+// the same flag turns `movq %rsi, (%rdi)` into `mov QWORD PTR [rdi], rsi`,
+// changing sigil, operand order and mnemonic together. A dialect-dependent
+// fact MOVES under that flag; this one does not.
+//
+//     D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE
+//
+// is the row this facet closes, and the operator ruled the derivation belongs
+// *"in config as a declared derivation policy, still with no branch"*.
+enum class AsmBareOperandWidth : std::uint8_t {
+    // The operand carries its own width: `%0` names the view whose width is
+    // the bound operand's type width. x86_64's rule, and DSS's behaviour on
+    // every target before this facet existed.
+    OperandType     = 0,
+    // The register carries the width: `%0` names the class's FULL register
+    // regardless of the operand's type, and a narrower access must be asked
+    // for with a modifier. aarch64's rule.
+    RegisterNatural = 1,
+};
+
+inline constexpr EnumNameTable<AsmBareOperandWidth, 2>
+    kAsmBareOperandWidthTable{{{
+        { AsmBareOperandWidth::OperandType,     "operandType"     },
+        { AsmBareOperandWidth::RegisterNatural, "registerNatural" },
+    }}};
+
+// Well-formedness of the table itself — see the sibling tables' note: an
+// under-filled table is legal C++ and would make "" a resolving spelling.
+DSS_CHECK_ENUM_NAME_TABLE(kAsmBareOperandWidthTable);
+
+[[nodiscard]] constexpr std::string_view
+asmBareOperandWidthName(AsmBareOperandWidth d) noexcept {
+    return kAsmBareOperandWidthTable.name(d);
+}
+[[nodiscard]] constexpr std::optional<AsmBareOperandWidth>
+asmBareOperandWidthFromName(std::string_view s) noexcept {
+    return kAsmBareOperandWidthTable.fromName(s);
+}
 
 // Encoding slot — names WHERE a register/immediate value goes inside
 // the emitted byte sequence. Closed vocabulary. The x86-variable
@@ -1503,11 +1725,59 @@ enum class EncodingSlotKind : std::uint8_t {
     // round-trip oracle recovers the ORIGINAL negative LIR operand value
     // rather than the raw field.
     Imm16Inverted = 31,
+    // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: TWO immediate bytes appended after
+    // the opcode (and ModR/M + SIB, when present), little-endian — the `iw`
+    // field of the 16-bit immediate forms (`mov r/m16, imm16` = 66 C7 /0 iw,
+    // `add/sub/and/or/xor/cmp r/m16, imm16` = 66 81 /N iw).
+    //
+    // ★★★ WHY IT IS NOT `Imm16`, WHICH IS THE OBVIOUS NAME AND IS ALREADY
+    // TAKEN BY A DIFFERENT MACHINE FACT. `Imm16` is a 16-bit BIT-WINDOW at
+    // bits 5..20 of a 32-bit fixed word (AArch64 MOVZ), so `slotShapeFor`
+    // binds it to the `fixed32` shape and `validate()` rejects it under an
+    // `x86-variable` opcode. This slot is the APPENDED-BYTES family — the
+    // one `Imm8` (1 byte), `Imm32` (4 bytes) and `Imm64` (8 bytes) belong to
+    // — and the width alone does not name it. Same relationship as
+    // `Imm12` / `Imm12Scaled` / `Imm12HiLo24` one level up: identical
+    // nominal width, different encode semantics, therefore distinct slots
+    // with qualified names.
+    //
+    // ⚠ DECLARING THE VARIANT WITH THE EXISTING `imm32` SLOT INSTEAD WOULD
+    // EMIT FOUR BYTES WHERE THE INSTRUCTION TAKES TWO — a corrupt
+    // instruction stream with no diagnostic anywhere. That is the failure
+    // this slot exists to make impossible, not merely a missing convenience.
+    //
+    // ENCODE CONTRACT (x86_variable.cpp `wireImm16`): the wired value is
+    // SILENT while it fits the 2-byte field read either as SIGNED or as
+    // UNSIGNED — [-32768, 65535] — because AT&T writes both `$-1` and
+    // `$65535` for the same halfword.
+    //
+    // ⚠ UPDATED cycle P34 (D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES).
+    // This paragraph used to end "Anything outside fails loud
+    // (`A_ImmediateOperandOutOfRange`); it never silently truncates", and the
+    // FIRST half of that stopped being true: outside the window the encoder no
+    // longer FAILS. It emits the low 16 bits — the bytes GNU as emits for the
+    // same source — and reports `A_ImmediateNarrowedToOperandField` (Warning,
+    // and UNSUPPRESSABLE, because a flag that could silence it would collapse
+    // the operator's ruling back into "match gas exactly, silently").
+    // ★ The SECOND half is unchanged and is the property this slot was created
+    // to hold: it never truncates SILENTLY. What changed is that a spelling a
+    // working reference assembles is no longer REFUSED.
+    // ⚠ A 16-bit field under a WIDER operation — `guard.width` != 16, i.e. the
+    // field is a fixed narrow PARAMETER rather than the operation's own value —
+    // still fails loud with `A_ImmediateOperandOutOfRange`. That distinction is
+    // the whole mechanism and it is read from config, never from the arch.
+    //
+    // GENERIC BY CONSTRUCTION: any variable-length ISA with a 2-byte
+    // trailing immediate wires this slot. The variant GUARD vocabulary is
+    // unchanged — the operand KIND filter stays `"imm32"` (the
+    // `LirOperandKind::ImmInt` discriminator, whose name is historical); the
+    // SLOT decides the emitted width, exactly as `Imm8` already does.
+    Imm16Bytes = 32,
     // Future fixed32 slots (paired with their consumer cycle):
     //   Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 32> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 33> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -1540,6 +1810,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 32> kEncodingSlotKindTable{{{
     { EncodingSlotKind::AbsoluteDisp32Mem, "absdisp32.mem" },
     { EncodingSlotKind::MemRelocDisp32,    "memreloc.disp32" },
     { EncodingSlotKind::Imm16Inverted, "imm16.inverted" },
+    { EncodingSlotKind::Imm16Bytes,   "imm16.bytes"    },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -1563,7 +1834,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 32,
+static_assert(kEncodingSlotKindCount == 33,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -1582,6 +1853,10 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Imm8:
+        // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: the 2-byte APPENDED immediate is
+        // an x86-variable construct (trailing bytes after ModR/M), unlike the
+        // fixed32 `Imm16` bit-window it shares a nominal width with.
+        case EncodingSlotKind::Imm16Bytes:
         case EncodingSlotKind::Disp32:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
@@ -1826,6 +2101,10 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Imm8:
+        // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: a literal 2-byte immediate,
+        // never a linker-patched field — a 16-bit displacement reaches no
+        // symbol on this ISA.
+        case EncodingSlotKind::Imm16Bytes:
         // D-CSUBSET-BITFIELD-WIDE-UNIT: the `mov r64, imm64` slots write
         // the wide value / opcode-byte register directly — no relocation.
         case EncodingSlotKind::Imm64:
@@ -1880,8 +2159,8 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
             // is `RipRelDisp32` above; it's distinct because it forces
             // the ModR/M state (mod=00 rm=101) in addition to the
             // disp32 patch site, where Disp32 alone (e.g. `call rel32`)
-            // has no associated ModR/M byte. CondCodeNibble (D-CSUBSET-
-            // WHILE-LOOP-SUBSTRATE) writes into the opcode byte from
+            // has no associated ModR/M byte. CondCodeNibble
+            // (D-CSUBSET-WHILE-LOOP-SUBSTRATE) writes into the opcode byte from
             // the inst payload — no symbol. BlockRel32 patches a 4-byte
             // intra-function displacement at assemble time — also no
             // symbol-tier relocation.
@@ -1906,6 +2185,13 @@ struct DSS_EXPORT TargetEncodingWire {
     std::uint8_t     index           = 0;
     EncodingSlotKind slotKind        = EncodingSlotKind::ModRmReg;
     std::optional<RelocationKind> relocationKind;
+    // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the REGISTER BANK this
+    // field draws from, when the wired operand is a register — the JSON key
+    // `regClass`. ABSENT means "inherit the opcode's `encoding.registerClass`";
+    // PRESENT overrides it for this one field. See the block comment on
+    // `encodingWireRegClass` below for why the two levels exist and why
+    // neither one may be missing for a register-bearing field.
+    std::optional<TargetRegClass> regClass;
     // D-AS4-3 (multi-instruction-macro encoder): which 32-bit word
     // (0-based) of a multi-word `fixed32` template this wire's slot
     // lives in. DEFAULT 0 — every existing single-word wire is
@@ -2032,6 +2318,31 @@ struct DSS_EXPORT TargetEncodingVariant {
     // on a variant with NEITHER an `imm32` NOR a `memoffset` operand (no
     // value to sign-route on).
     bool                               negValue = false;
+    // ── MEMORY-DIRECTION routing axis — the JSON key
+    // `guard.memoryDestination` (bool). Anchor:
+    // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE.
+    //
+    // ABSENT (nullopt) ⇒ this variant does not discriminate on the memory
+    // reference's ROLE — every pre-existing variant, including `store`,
+    // whose one operand shape is reached from a destination-LAST dialect's
+    // memory-destination path AND from a destination-FIRST dialect's
+    // register-destination path and must stay electable from both.
+    //
+    // PRESENT ⇒ the variant matches only an instruction whose
+    // `kLirInstFlagMemoryIsDestination` agrees with it. `true` is the
+    // direction that reads memory as the operation's LEFT operand
+    // (x86 `39 /r` — `cmp mem, reg`); `false` is the direction that reads
+    // it as the right one (`3B /r` — `cmp reg, mem`). The two build the
+    // BYTE-IDENTICAL LIR operand list, so this axis is the only thing that
+    // can separate them — and without it, declaring either would silently
+    // encode the other for the opposite spelling.
+    //
+    // ⚠ A `true`/`false` PAIR IS THE POINT: declaring only one leaves the
+    // other direction matching nothing, which is a loud refusal rather than
+    // a wrong encoding, but is rarely what an author means. validate()
+    // rejects the axis on a guard with no memory operand at all (nothing to
+    // route) — the same coherence family as `negValue` and immMin/immMax.
+    std::optional<bool>                memoryDestination;
     TargetEncodingTemplate             tmpl;
     // Where the instruction's RESULT register goes (when the inst
     // has a result). Nullopt for value-less instructions (e.g.
@@ -2040,6 +2351,14 @@ struct DSS_EXPORT TargetEncodingVariant {
     // filling the reg field. Implicitly word 0 for multi-word
     // templates; additional placements go in `extraResultSlots`.
     std::optional<EncodingSlotKind>    resultSlot;
+    // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the REGISTER BANK the
+    // RESULT field draws from — the JSON key `resultRegClass`. ABSENT means
+    // "inherit the opcode's `encoding.registerClass`"; PRESENT overrides it.
+    // Governs `resultSlot` AND every `extraResultSlots` placement, because
+    // those are additional placements of the SAME register and a register has
+    // one class. Meaningful only with a `resultSlot` (validate() refuses it
+    // otherwise — a class for a field the variant does not have).
+    std::optional<TargetRegClass>      resultRegClass;
     // D-AS4-3: additional placements of the SAME result register in a
     // multi-word template (see `ResultSlotExtra`). Empty for every
     // single-word / single-placement opcode. validate() requires a
@@ -2059,8 +2378,67 @@ struct DSS_EXPORT TargetEncodingVariant {
 // `shape == None`.
 struct DSS_EXPORT TargetEncodingInfo {
     TargetEncodingShape                shape = TargetEncodingShape::None;
+    // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the register bank THIS
+    // OPCODE's register fields draw from unless a field says otherwise — the
+    // JSON key `encoding.registerClass`. See the block comment on
+    // `encodingWireRegClass` / `encodingResultRegClass` just below.
+    std::optional<TargetRegClass>      registerClass;
     std::vector<TargetEncodingVariant> variants;
 };
+
+// ── WHICH REGISTER BANK DOES THIS ENCODING FIELD DRAW FROM? ───────────────
+// D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD.
+//
+// ★★★ THE DEFECT THIS VOCABULARY EXISTS FOR. The mixed-class argument
+// miscompile (`D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP`, audit F8)
+// disassembled to `cvttss2si %xmm15`: a GPR ordinal — `r15` — reached the
+// ModR/M.rm field of an instruction whose rm field is an XMM field, and the
+// encoder wrote 15 there without a word. Ordinal 15 is a perfectly legal
+// value for that 4-bit field, so the bytes were VALID and named a DIFFERENT
+// PHYSICAL REGISTER than the LIR meant. Nothing downstream could tell: the
+// disassembler read back the same bytes, the linker patched nothing, the
+// program simply computed with whatever `%xmm15` happened to hold. Every
+// wrong-class-operand bug in the tiers above the encoder — regalloc handing
+// out of the wrong bank, a lowering splicing the wrong actual, a hand-built
+// test LIR — lands here as a silent miscompile unless the encoder knows what
+// the field WANTS.
+//
+// ★★ WHY IT IS DECLARED RATHER THAN DERIVED. The slot KIND cannot answer it:
+// x86's `modrm.reg` is a GPR field under `add` and an XMM field under `addsd`,
+// and one instruction can want BOTH banks at once — `cvttsd2si` reads xmm
+// through `modrm.rm` and writes a GPR through `modrm.reg`, while `cvtsi2sd`
+// does exactly the reverse. Neither the mnemonic nor the opcode bytes are
+// something the engine may branch on (that is the agnosticism rule), so the
+// bank a field draws from is TARGET VOCABULARY and lives in `.target.json`
+// beside the `registers[]` table that declares each register's own class.
+//
+// ★ TWO LEVELS, AND THE OUTER ONE IS NOT A FALLBACK. `encoding.registerClass`
+// states the bank the instruction is ABOUT ("this is an FP instruction"); a
+// per-field `regClass` / `resultRegClass` states the exceptions the machine
+// actually has (an FP load's ADDRESS is still a GPR; a convert's other half is
+// the other bank). That is how the ISA manuals read, and it keeps the
+// declaration count proportional to the machine facts instead of restating
+// `gpr` on ~750 fields. It is NOT a silent default: `validate()` REFUSES a
+// document in which any register-bearing field resolves to nothing, naming the
+// opcode, the variant and the field — so every field has a declared class or
+// the target does not load.
+//
+// ⚠ AND THE FAILURE MODE OF A FORGOTTEN DECLARATION IS THE LOUD ONE. If an
+// author adds an FP opcode and forgets `registerClass`, the document is
+// refused at load. If they declare the WRONG bank, the first instruction
+// encoded through it fails loud with both classes named. The only way to get
+// silence is to declare a bank AND feed it a matching wrong-class operand —
+// i.e. to state the lie twice, in config and in the LIR.
+[[nodiscard]] inline std::optional<TargetRegClass>
+encodingWireRegClass(TargetEncodingInfo const& enc,
+                     TargetEncodingWire const& w) noexcept {
+    return w.regClass.has_value() ? w.regClass : enc.registerClass;
+}
+[[nodiscard]] inline std::optional<TargetRegClass>
+encodingResultRegClass(TargetEncodingInfo const& enc,
+                       TargetEncodingVariant const& v) noexcept {
+    return v.resultRegClass.has_value() ? v.resultRegClass : enc.registerClass;
+}
 
 // One relocation kind declared by the target schema (plan 13 §2.6, the
 // bucket-1 reloc taxonomy facet). Each row defines an opaque
@@ -2172,8 +2550,8 @@ enum class RelocFormulaKind : std::uint8_t {
     // slide-safe classifier from mis-treating it as a Linear-absolute-in-
     // `.text` fixup (D-LK-DYN-TEXT-ABS-RELOC keys `formulaKind == Linear`).
     Aarch64AdrGotPage     = 5,
-    // ARM64 R_AARCH64_LD64_GOT_LO12_NC (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-
-    // GOT, TF-C52): the LDR word of the same GOT-address macro (the
+    // ARM64 R_AARCH64_LD64_GOT_LO12_NC (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT,
+    // TF-C52): the LDR word of the same GOT-address macro (the
     // scaled 12-bit GOT-slot offset). Same foreign-linked-only /
     // fail-loud-in-kernel discipline as Aarch64AdrGotPage above.
     Aarch64Ld64GotLo12    = 6,
@@ -2258,6 +2636,51 @@ exitMechanismFromName(std::string_view s) noexcept {
     return kExitMechanismTable.fromName(s);
 }
 
+// ── THE SELECTABLE SPELLINGS — the table MINUS the `none` sentinel ────────
+//
+// D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET: the set a
+// `.format.json` author may actually write, which every refusal that names
+// this vocabulary has to render. `processExit.mechanism` resolves the spelling
+// and then rejects `ExitMechanism::None` explicitly, so the accepted set is the
+// table minus that one row.
+//
+// ★ IT LIVES HERE, BESIDE THE ENUM, BECAUSE THE PROJECTION IS A PROPERTY OF THE
+// VOCABULARY AND NOT OF ANY READER. Before this definition the SAME projection
+// was computed in FOUR places — `link/linker.cpp` (`kDeclarableExitMechanismNames`),
+// `link/format/exec_reloc_apply.hpp`, `link/object_format_schema_json.cpp` and
+// `tests/link/test_object_format_vocabulary_projection.cpp` — each with its own
+// predicate and its own count, and two of the four counts were unable to fail.
+// See `kSelectableObjectFormatKindNames` in `core/types/object_format_kind.hpp`
+// for the same shape one vocabulary over.
+[[nodiscard]] constexpr bool isSelectableExitMechanism(ExitMechanism m) noexcept {
+    return m != ExitMechanism::None;
+}
+
+// ⚠⚠ THE COUNT IS A LITERAL AND THE COMPANION `static_assert` IS NOT DECORATION
+// — TOGETHER THEY ARE THE ONLY SPELLING THAT REDS IN BOTH DIRECTIONS.
+// D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY.
+// `namesWhere<M>` compares the rows the predicate ACCEPTS against `M`, so
+// writing `M` as `rows.size() - 1` makes both sides move together and the check
+// can never fire. ✔MEASURED with `g++ -std=c++23 -fsyntax-only` over a nine-arm
+// probe (a 3-row / 4-row-with-a-new-selectable-row / 4-row-with-a-second-
+// sentinel copy of this exact table × the derived, literal, and literal-plus-
+// assert spellings of `M`):
+//   * a NEW SELECTABLE enumerator  — derived COMPILES, literal ERRORS;
+//   * a SECOND UNSELECTABLE row    — derived ERRORS,   literal COMPILES.
+// So the literal alone does not dominate the derived form; it MOVES the blind
+// spot. The `static_assert` below closes the second direction by relating the
+// table's own row count to the projection's literal count — two numbers with
+// different owners — so a second sentinel reds here even though `namesWhere`
+// would not see it.
+inline constexpr auto kSelectableExitMechanismNames =
+    namesWhere<2>(kExitMechanismTable, isSelectableExitMechanism);
+static_assert(kExitMechanismTable.rows.size()
+                  == kSelectableExitMechanismNames.size() + 1,
+              "kExitMechanismTable must have exactly ONE unselectable row (the "
+              "'none' sentinel) — a second one leaves `namesWhere`'s literal "
+              "count matching while the projection silently stops being 'the "
+              "table minus its sentinel'");
+
 // Per-OS process-exit descriptor. Lives on `ObjectFormatData`
 // (loaded from format JSON's `processExit` block). The trampoline
 // emitter (Slice C) reads the active arm based on `mechanism`:
@@ -2340,7 +2763,7 @@ struct DSS_EXPORT ProcessExit {
 //                     that stack address itself (no copy exists
 //                     anywhere else). envp follows argv's NULL
 //                     terminator; it is NOT materialized (the
-//                     c-subset entry signature is
+//                     c entry signature is
 //                     `(int, char**)` — envp is reachable via
 //                     libc `environ` for programs that need it).
 //   * `None`        — default-constructed sentinel. "No mechanism"
@@ -2381,7 +2804,7 @@ enum class ArgsMechanism : std::uint8_t {
     //     `__p___argv()` -> `char***` (ord 82),
     //     `__p___wargv()` -> `wchar_t***` (ord 83) — accessors returning the
     //     ADDRESS of the state, so each needs EXACTLY ONE dereference
-    //     (`ucrt/stdlib.h:1144-1145`, macros `:1153-1154`).
+    //     (their `ucrt/stdlib.h` declarations and the wrapper macros beside them).
     // Like CrtOutParam this needs a real call sequence, so it rides the SAME
     // MIR-tier synth-init seam (the trampoline's own arg-setup stays a no-op)
     // — the difference is entirely in the emitted body, which is why it is a
@@ -2414,6 +2837,27 @@ DSS_CHECK_ENUM_NAME_TABLE(kArgsMechanismTable);
 argsMechanismFromName(std::string_view s) noexcept {
     return kArgsMechanismTable.fromName(s);
 }
+
+// The selectable spellings — the table MINUS the `none` sentinel, which
+// `processArgs.mechanism` resolves and then rejects explicitly. Beside the enum
+// for the reason `kSelectableExitMechanismNames` states in full: the projection
+// belongs to the vocabulary, not to whichever loader renders it.
+[[nodiscard]] constexpr bool isSelectableArgsMechanism(ArgsMechanism m) noexcept {
+    return m != ArgsMechanism::None;
+}
+
+// ⚠ Literal `M` plus the sentinel-count assert, both halves required — see the
+// nine-arm measurement written out at `kSelectableExitMechanismNames`
+// (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY). A count
+// spelled `rows.size() - 1` here would be `x == x`.
+inline constexpr auto kSelectableArgsMechanismNames =
+    namesWhere<2>(kArgsMechanismTable, isSelectableArgsMechanism);
+static_assert(kArgsMechanismTable.rows.size()
+                  == kSelectableArgsMechanismNames.size() + 1,
+              "kArgsMechanismTable must have exactly ONE unselectable row (the "
+              "'none' sentinel) — a second one leaves `namesWhere`'s literal "
+              "count matching while the projection silently stops being 'the "
+              "table minus its sentinel'");
 
 // Per-OS program-entry argument descriptor. Lives on
 // `ObjectFormatData` (loaded from the format JSON's `processArgs`
@@ -2464,7 +2908,8 @@ struct DSS_EXPORT ProcessArgs {
     //     PROBE-0): one accessor serves both, so there is no
     //     `wideArgcAccessorFn`.
     //   * `argvMode` — the `_crt_argv_mode` value handed to the configure call.
-    //     The enum is `…/VC/Tools/MSVC/<ver>/include/vcruntime_startup.h:19-24`
+    //     That enum is declared in the MSVC toolset's
+    //     `…/VC/Tools/MSVC/<ver>/include/vcruntime_startup.h`
     //     (the MSVC TOOLSET header — NOT in the Windows SDK; a grep of the SDK
     //     include tree for the enumerator names returns zero hits), so the
     //     value is declared here rather than derived. MEASURED 2026-08-10 with a
@@ -2604,6 +3049,35 @@ struct DSS_EXPORT TargetRelocationInfo {
     // against a TLS symbol would write the bit-cast tpoff as if it
     // were an address — the CRIT-1 silent-garbage-pointer class).
     bool         tls         = false;
+    // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: true iff this relocation
+    // writes an IMAGE-RELATIVE value — the target's address MINUS the
+    // image base (an RVA) — rather than the absolute VA an ordinary
+    // Linear absolute row writes. Linear-only, and mutually exclusive
+    // with BOTH `pcRelative` (an RVA is relative to the image, not to
+    // the patch site) and `tls` (a tpoff is in a per-thread coordinate
+    // space that has no image base at all).
+    //
+    // ★ WHY IT IS A FIELD RATHER THAN A NAME MATCH, AND WHY IT PASSES
+    //   THE DEAD-CONFIG TEST. Win64's `RUNTIME_FUNCTION` (and every
+    //   PE data directory) stores RVAs, so `IMAGE_REL_AMD64_ADDR32NB`
+    //   and `IMAGE_REL_AMD64_ADDR32` are 32-bit absolute-formula rows
+    //   that differ ONLY in this property — writing the second where
+    //   the first belongs stores a full VA in a field the unwinder
+    //   reads as an offset from the image base. Nothing else in the
+    //   schema separates them: same formula, same width, same zero
+    //   bias, same non-pc-relativity. ✔The fact VARIES along the axis
+    //   the key carries — TRUE for the PE object formats' ADDR32NB row
+    //   and FALSE for every ELF and Mach-O row, on both architectures
+    //   — so this is not N documents restating one constant.
+    //
+    // ⚠ IT ALSO DISAMBIGUATES THE `widthBytes == n && !pcRelative`
+    //   SCANS. `absoluteRelocKind` (asm), the cross-CU thunk slot
+    //   (linker) and the symbol-address global (pipeline) all ask for
+    //   "the target's absolute pointer relocation of N bytes" by
+    //   formula. An image-relative row answers that description
+    //   structurally while being the WRONG answer, so those scans
+    //   exclude it explicitly rather than relying on table order.
+    bool         imageRelative = false;
 };
 
 // Discriminates the FIVE concrete terminator shapes a target's opcode
@@ -2746,8 +3220,8 @@ struct DSS_EXPORT ImplicitRegisterConstraint {
     std::vector<std::uint16_t> outputOrdinals;
     std::vector<std::uint16_t> clobberedOrdinals;
 
-    // Role-tagged projection contract (D-CSUBSET-MOD-OP-CODEGEN-
-    // OUTPUT-INDEX-CONTRACT closure, 2026-06-10). Optional JSON
+    // Role-tagged projection contract (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT
+    // closure, 2026-06-10). Optional JSON
     // objects `inputRoles` / `outputRoles` map a ROLE name (from the
     // loader's registered role vocabulary — "dividend", "quotient",
     // "remainder") to a register name that must ALSO appear in the
@@ -2786,39 +3260,187 @@ struct DSS_EXPORT ImplicitRegisterConstraint {
     }
 
     // ★★★ THE `outputs ⊆ clobbered` INVARIANT, AS A QUERY ON THE TYPE
-    // ITSELF (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-
-    // CLOBBERED, 2026-08-15). Returns the index of the first output
-    // ordinal absent from `clobberedOrdinals`, or nullopt when the
-    // invariant holds.
+    // ITSELF (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED,
+    // 2026-08-15).
     //
-    // ⚠ IT LIVES HERE BECAUSE THIS TYPE HAS **TWO** PRODUCERS AND ONLY
-    // ONE OF THEM MEETS A LOADER. The `.target.json` loader enforces
-    // the rule for the per-OPCODE carrier; `LirBuilder::
-    // regConstraintPoolAdd` accepts a per-INSTRUCTION one built by a
-    // lowering, with no loader in the path. And the register
-    // allocator's forbidden set is `inputs ∪ clobbered` — outputs are
-    // deliberately omitted, on the strength of this invariant holding.
-    // So a violating entry does not fail: it silently leaves a value
-    // allocated to a register the instruction overwrites. Two carriers,
-    // one validator, and a THIRD component's safety argument resting on
-    // the validation only one of them got.
+    // ⚠ IT LIVES HERE BECAUSE THIS TYPE HAS **TWO** PRODUCERS AND THEY MEET
+    // DIFFERENT GATES. The `.target.json` loader validates the per-OPCODE
+    // carrier; the per-INSTRUCTION carrier is built by a lowering and meets no
+    // loader at all. And the register allocator's forbidden set is
+    // `inputs ∪ clobbered` — outputs are deliberately omitted, and for a value
+    // that merely LIVES ACROSS the instruction that omission rests on this
+    // invariant and on nothing else. So a violating entry did not fail: it
+    // silently left a value allocated to a register the instruction
+    // overwrites. Two carriers, one rule, and a THIRD component's safety
+    // argument resting on a guarantee only one of them was given.
+    //
+    // ★ AS OF 2026-08-27 (P42) EVERY PRODUCER ASKS THIS TYPE, and the rule has
+    // no second implementation anywhere: the `.target.json` loader, the
+    // inline-asm lowering in `mir_to_lir.cpp`, the `.dsslir` reader's
+    // `constraintSubsetHolds` and `LirBuilder::regConstraintPoolAdd` all route
+    // here. The three that REFUSE ask `firstOutputNotClobbered`; the loader,
+    // which must name every offender, loops over `outputIsClobbered`. ⛔ A
+    // caller that re-derives the comparison locally is the drift this function
+    // exists to prevent — the two answers then disagree and the friendlier one
+    // wins by accident.
     //
     // Reads ORDINALS, not names: a target may spell one register
     // several ways (sub-register aliases), and two different spellings
     // of the same physical register must satisfy the rule. Callers that
     // hold only names must resolve first — which every producer already
     // does, because the ordinals are what the allocator reads.
+    // ★★★ THE RULE ITSELF, ASKED ONE OUTPUT AT A TIME — and this is the ONLY
+    // place it is implemented. `firstOutputNotClobbered` below is a loop over
+    // it, not a second copy.
+    //
+    // ⚠ IT EXISTS BECAUSE THE RULE'S FOUR CALLERS DO NOT ALL WANT THE SAME
+    // SHAPE OF ANSWER, and that is a real difference rather than an excuse for
+    // a second implementation. `LirBuilder::regConstraintPoolAdd`, the
+    // `.dsslir` reader and the inline-asm lowering each want THE FIRST
+    // offender: they abort or refuse, so nothing is gained by finding the
+    // rest. The `.target.json` loader wants EVERY offender, because it emits
+    // one diagnostic per output with that output's own JSON pointer and a
+    // first-failure query structurally cannot produce them — one re-run must
+    // surface every mistake in the document, not the earliest. ⇒ one rule,
+    // two shapes; the per-index predicate is the shape the other is built on.
+    //
+    // Out-of-range `k` is FALSE rather than UB: a caller that has lost
+    // index alignment between the names and the ordinals (the half-resolved
+    // shape a loader hits when one register name fails to resolve) gets a
+    // refusal, never a read past the end.
+    [[nodiscard]] bool outputIsClobbered(std::size_t k) const noexcept {
+        if (k >= outputOrdinals.size()) return false;
+        for (auto const cl : clobberedOrdinals) {
+            if (cl == outputOrdinals[k]) return true;
+        }
+        return false;
+    }
+
     [[nodiscard]] std::optional<std::size_t>
     firstOutputNotClobbered() const noexcept {
         for (std::size_t k = 0; k < outputOrdinals.size(); ++k) {
-            bool found = false;
-            for (auto const cl : clobberedOrdinals) {
-                if (cl == outputOrdinals[k]) { found = true; break; }
-            }
-            if (!found) return k;
+            if (!outputIsClobbered(k)) return k;
         }
         return std::nullopt;
     }
+};
+
+// ── D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE ────────
+//
+// ★★★ THE FACT AN OPCODE ROW STATES IS *"on this target, this operation is
+// realized by these machine instructions"* — PLURAL. Everything above this
+// point (`TargetEncodingInfo` and its variants) can only say it for ONE
+// instruction, and 1:1 is the DEGENERATE CASE of the real relationship, not
+// the relationship. The first consumer that needed more than one found the
+// hole: x86-64 SSE2 has NO unsigned integer↔double instruction at all, so
+// `ui_to_fp` / `fp_to_ui` were declared with the SIGNED cvt's bytes and
+// SILENTLY MISCOMPILED every value at or above 2^63 (and, on the u32 source
+// arm, every value at or above 2^31) — measured against gcc-13 and clang-19,
+// which agree on all of them.
+//
+// A two-valued "strategy" enum (native / fixup) was REJECTED as an arch
+// branch with a different spelling: no `if (arch == x86)` appears, but the
+// switch arm is x86-shaped and lives in shared substrate, and x86 has more of
+// these coming (popcount without POPCNT, 128-bit multiply-high, float min/max
+// NaN semantics). ⇒ **each target STATES A FACT in ONE uniform form and the
+// shared substrate understands ONE thing: emit what you were told.** A target
+// whose hardware does the job in one instruction declares a ONE-STEP sequence
+// (arm64's UCVTF / FCVTZU) — not a special case and not a `native` flag, the
+// same kind of row, one entry long.
+//
+// ★ WHY THIS IS A SIBLING OF `encoding`, NOT AN EXTENSION OF IT. The two
+// blocks answer questions at DIFFERENT TIERS and folding them would break the
+// assembler. `encoding` is LIR-instruction → BYTES (one instruction in, one
+// byte string out — the assembler's whole contract). `lowering` is MIR
+// operation → LIR INSTRUCTIONS, consumed at MIR→LIR while virtual registers
+// still exist, which is the only tier where a sequence's TEMPORARIES can be
+// register-allocated instead of stealing fixed scratch registers.
+//
+// ★ ONE LEVEL, NEVER RECURSIVE. A step names a REAL MACHINE INSTRUCTION: the
+// loader rejects a step whose opcode declares no `encoding`, and the expander
+// emits each step directly without re-consulting the step opcode's own
+// `lowering`. That is what makes arm64's SELF-NAMING one-step sequence
+// (`ui_to_fp` → [`ui_to_fp`]) well-founded rather than an infinite regress.
+
+// One operand of one lowering step. The four kinds are the complete
+// vocabulary a straight-line expansion needs:
+//   Source    — the k-th operand of the MIR instruction being lowered.
+//   Temp      — a register defined by an EARLIER step of this sequence.
+//   Immediate — an inline 32-bit immediate (a shift count, a mask).
+//   Constant  — a 64-bit BIT PATTERN materialized into a fresh GPR by the
+//               target's own declared wide-constant capability (x86's
+//               `mov r64, imm64`; arm64's MOVZ/MOVK ladder) before the step
+//               runs. This is the ONLY kind that costs an extra instruction,
+//               and it exists because the encoding table CANNOT name a
+//               constant-pool entry: `imm64` names a VALUE (integer only) and
+//               `symbol` needs a SymbolId minted upstream at HIR→MIR. A
+//               float constant therefore rides a GPR bit pattern and a
+//               declared cross-class move, not a rodata item.
+enum class TargetLoweringOperandKind : std::uint8_t {
+    Source = 0, Temp = 1, Immediate = 2, Constant = 3,
+};
+inline constexpr EnumNameTable<TargetLoweringOperandKind, 4>
+kTargetLoweringOperandKindTable{{{
+    { TargetLoweringOperandKind::Source,    "source"   },
+    { TargetLoweringOperandKind::Temp,      "temp"     },
+    { TargetLoweringOperandKind::Immediate, "imm"      },
+    { TargetLoweringOperandKind::Constant,  "const"    },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kTargetLoweringOperandKindTable);
+[[nodiscard]] constexpr std::string_view
+targetLoweringOperandKindName(TargetLoweringOperandKind k) noexcept {
+    return kTargetLoweringOperandKindTable.name(k);
+}
+[[nodiscard]] constexpr std::optional<TargetLoweringOperandKind>
+targetLoweringOperandKindFromName(std::string_view s) noexcept {
+    return kTargetLoweringOperandKindTable.fromName(s);
+}
+
+struct DSS_EXPORT TargetLoweringOperand {
+    TargetLoweringOperandKind kind = TargetLoweringOperandKind::Source;
+    std::uint8_t  sourceIndex = 0;   // Source: MIR operand index
+    std::uint16_t tempSlot    = 0;   // Temp: index into the sequence's temp table
+    std::int32_t  immediate   = 0;   // Immediate: the inline imm32 value
+    std::uint64_t constant    = 0;   // Constant: the 64-bit bit pattern
+    std::string   tempName;          // Temp: the declared spelling (diagnostics)
+};
+
+// One step = one machine instruction the operation expands into.
+//
+// `widthBits` is the LIR instruction's operation width, i.e. the axis the
+// encoding-variant guards key on. 0 means "the LIR default", which
+// `lirInstWidthBits` reads as 64 — the same absent-flag state every
+// pre-existing single-instruction lowering emits. It is per-STEP and not
+// inherited from the sequence guard because a real sequence mixes them: the
+// x86 F32→u64 expansion truncates at width 32 (CVTTSS2SI) and masks at
+// width 64 (SAR/AND/OR) in the same seven steps.
+struct DSS_EXPORT TargetLoweringStep {
+    std::string    opcodeMnemonic;               // the machine opcode to emit
+    std::uint16_t  opcodeIndex   = 0;            // loader-resolved (post-pass)
+    bool           hasResult     = false;        // the step defines a register
+    bool           definesResult = false;        // ...and it is the SEQUENCE's result
+    std::uint16_t  resultTempSlot = 0;           // when hasResult && !definesResult
+    std::string    resultName;                   // declared spelling (diagnostics)
+    TargetRegClass resultClass   = TargetRegClass::None;
+    std::uint8_t   widthBits     = 0;            // 0 / 8 / 16 / 32 / 64 / 128
+    std::vector<TargetLoweringOperand> operands;
+};
+
+// One sequence + the width it applies to. `guardWidthBits` mirrors
+// `TargetEncodingVariant::guardWidthBits` EXACTLY, including which width it
+// names: whatever axis the opcode's encoding variants key on (for the
+// int↔float conversions that is the SOURCE width, threaded as the
+// `widthOverride` at MIR→LIR). 0 = matches any width. The loader rejects two
+// sequences with the same width and the ambiguous keyed/absent mix, for the
+// same first-match-shadowing reason the encoding variants do.
+struct DSS_EXPORT TargetLoweringSequence {
+    std::uint8_t                    guardWidthBits = 0;
+    std::vector<std::string>        tempNames;   // slot → declared spelling
+    std::vector<TargetLoweringStep> steps;
+};
+
+struct DSS_EXPORT TargetLoweringInfo {
+    std::vector<TargetLoweringSequence> sequences;
 };
 
 // One row per opcode; index in the vector IS the opcode's numeric
@@ -2859,6 +3481,17 @@ struct DSS_EXPORT TargetOpcodeInfo {
     // requires a non-empty `encoding.variants[]` (validate()-enforced);
     // each variant carries its guard + template + slot wiring.
     TargetEncodingInfo   encoding;
+
+    // Instruction-SEQUENCE facet
+    // (D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE).
+    // EMPTY `sequences` (the default) means this opcode declares no expansion
+    // and MIR→LIR emits ONE instruction of it, exactly as before — every
+    // pre-existing opcode row keeps its behaviour byte-identically. A NON-empty
+    // block means MIR→LIR emits the matching sequence's steps INSTEAD, and the
+    // opcode itself may then legitimately carry NO `encoding` at all (x86-64's
+    // `ui_to_fp`/`fp_to_ui`: the machine has no such instruction, so declaring
+    // one was the miscompile). See the docblock above `TargetLoweringOperandKind`.
+    TargetLoweringInfo   lowering;
 
     // 2-address legalization constraint (plan 13 AS3 — `lir_2addr_
     // legalize.cpp`). ENGAGED means the LIR pre-assembly legalize pass
@@ -3006,6 +3639,23 @@ struct DSS_EXPORT TargetSchemaData {
     // it replaces; the loader rejects duplicate letters, so the scan is
     // unambiguous by construction rather than by convention.
     std::vector<TargetAsmConstraint> asmConstraints;
+
+    // Which view a BARE template operand reference names, per register class
+    // (the `asmBareOperandWidths` root key — see `AsmBareOperandWidth` for the
+    // measurement that makes this a declared policy rather than a derivation).
+    // Indexed by the `TargetRegClass` ordinal, mirroring `registerClassOps`.
+    //
+    // ⚠ `nullopt` MEANS **UNDECLARED**, AND THE CONSUMER REFUSES RATHER THAN
+    // PICKING ONE. Both values are plausible and both always assemble, so a
+    // default here would be a silent wrong width on whichever kind of machine
+    // the default did not describe — the exact failure
+    //
+    //     D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE
+    //
+    // records, where a 4-byte store shipped against the reference's 8-byte one
+    // with no diagnostic at either end. An `optional` is the only value that
+    // cannot be mistaken for a measurement.
+    std::array<std::optional<AsmBareOperandWidth>, 5> asmBareOperandWidths{};
 
     // The CIE's `return_address_register` — the DWARF column an unwinder
     // reads to find where this frame's return address went.
@@ -3159,7 +3809,7 @@ struct DSS_EXPORT TargetSchemaData {
     // `parsePredefinedMacroArray`). This lives on the TARGET, not the
     // language, because it is per-CPU-architecture semantics — exactly like
     // `charIsUnsigned` / `aggregateLayout` / `tls` above. The alternative
-    // (a language-side arch filter) would force `c-subset.lang.json` to
+    // (a language-side arch filter) would force `c.lang.json` to
     // enumerate CPU architectures: a layering inversion.
     //
     // Merged with the language list at preprocess time
@@ -3426,6 +4076,46 @@ public:
             out += '\'';
         }
         return out;
+    }
+
+    // Which view a BARE template operand reference names for register class
+    // `cls`. NULLOPT ⇒ this processor has not declared the policy for that
+    // class, which every consumer must turn into a refusal NAMING the class
+    // and this facet — never into a guess. See `AsmBareOperandWidth`.
+    [[nodiscard]] std::optional<AsmBareOperandWidth>
+    asmBareOperandWidth(TargetRegClass cls) const noexcept {
+        auto const idx = static_cast<std::size_t>(cls);
+        if (idx >= d_.asmBareOperandWidths.size()) return std::nullopt;
+        return d_.asmBareOperandWidths[idx];
+    }
+
+    // The width a register of class `cls` has when named IN FULL — what the
+    // `registerNatural` derivation substitutes.
+    //
+    // ★★ DERIVED FROM `registers[]`, NEVER DECLARED A SECOND TIME. A class's
+    // FULL registers are exactly the rows that declare no `subOf` (`x0`, `rax`,
+    // `v0`), and the narrow views hang off them; re-declaring their width in
+    // this facet would be a second owner of a fact the register table already
+    // states, and the two owners would drift the first time a target gained a
+    // view. ✔MEASURED at HEAD: arm64 `gpr` roots are 8 bytes (32 four-byte `w`
+    // views hang off them), arm64 `vr` roots 16, x86_64 `gpr` roots 8 (with 16
+    // views each at 4, 2 and 1 bytes) and x86_64 `fpr` roots 16.
+    //
+    // ⚠ NULLOPT ON **DISAGREEMENT** AS WELL AS ON ABSENCE, and the
+    // disagreement arm is the one worth having: a class whose full registers
+    // do not all share a width has no single natural width, and answering with
+    // whichever row was met first would be a silent wrong answer in precisely
+    // the place this whole facet exists to stop one. The consumer refuses.
+    [[nodiscard]] std::optional<std::uint32_t>
+    registerClassNaturalWidthBits(TargetRegClass cls) const noexcept {
+        std::optional<std::uint32_t> found;
+        for (auto const& r : d_.registers) {
+            if (r.regClass != cls || !r.subOf.empty()) continue;
+            auto const bits = static_cast<std::uint32_t>(r.widthBytes) * 8u;
+            if (!found.has_value()) { found = bits; continue; }
+            if (*found != bits) return std::nullopt;
+        }
+        return found;
     }
 
     // The CIE's `return_address_register` (see the field's docblock in

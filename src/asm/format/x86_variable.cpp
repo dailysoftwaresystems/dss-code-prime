@@ -110,6 +110,12 @@ struct EncodingState {
     // carries both; an ENTER-style imm16+imm8 shape would need
     // wiring-order-preserving emission when it lands.
     std::vector<std::uint8_t>     imm8s;
+    // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: 2-byte immediates (the `iw`
+    // field of `66 C7 /0 iw` and `66 81 /N iw`). Emitted BETWEEN imm8s
+    // and imm32s, which is the SDM's own trailing-field order for the
+    // shapes that carry more than one; no shipped instruction carries
+    // both an imm16 and an imm32 today.
+    std::vector<std::uint16_t>    imm16s;
     // D-CSUBSET-BITFIELD-WIDE-UNIT: 8-byte immediates (the `io` field
     // of `mov r64, imm64` = B8+rd io). `optional` makes a double-wire
     // detectable (a malformed schema with two Imm64 wires would
@@ -280,6 +286,10 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             return true;
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Imm8:
+        // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: the 2-byte immediate is
+        // filled from an ImmInt operand by the operand-kind dispatch,
+        // never from a register hwEnc — same as Imm8/Imm32.
+        case EncodingSlotKind::Imm16Bytes:
         // D-CSUBSET-BITFIELD-WIDE-UNIT: Imm64 carries the wide pool
         // literal value, filled by the LiteralIndex dispatch arm below —
         // never a register hwEnc.
@@ -381,25 +391,83 @@ wireImm32(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
 }
 
 // FC3.5 sweep-c1 (shifts): stash an ImmInt operand's value for a
-// 1-byte immediate slot (`SHL/SHR/SAR r/m, imm8` — C1 /4 /5 /7 ib).
-// RANGE-CHECKED [0, 255] fail-loud: silently truncating a wider
-// immediate to one byte would emit a valid-looking instruction with a
-// wrong count. (The MIR→LIR shift lowering only selects the imm form
-// for counts it verified fit; this is the defense-in-depth half.)
+// 1-byte immediate slot (`SHL/SHR/SAR r/m, imm8` — C1 /4 /5 /7 ib — and the
+// byte-width ALU/mov forms). RANGE-CHECKED fail-loud: silently truncating a
+// wider immediate to one byte would emit a valid-looking instruction with a
+// wrong count. (The MIR→LIR shift lowering only selects the imm form for
+// counts it verified fit; this is the defense-in-depth half.)
+//
+// ★★ ONE SLOT, TWO MACHINE MEANINGS, AND THE CONFIG ALREADY SEPARATES THEM
+// — D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES. `imm8` is wired
+// by the byte-width ALU/mov forms (`movb $5, %al` — `guard.width` 8, so the
+// byte IS the operation's value) AND by the shift counts (`shl` — those
+// variants declare `guard.width` 32/64, so the byte is a fixed PARAMETER of
+// a wider operation). The old window here was a flat `0..255` written for
+// the shift reading, and it made `movb $-1, %al` a hard error although
+// ✔GNU as 2.42 assembles it to `b0 ff`. Routing through the shared resolver
+// gives each reading its own window off the DECLARED width:
+//   `guard.width` == 8  -> [-128, 255], narrows-and-warns outside it
+//   `guard.width` != 8  -> [0, 255] as before, refuses outside it
+// ✔MEASURED that this is the reference's own split, not an approximation:
+// `movb $-1, %al` -> b0 ff (accepted), `shl $-1, %rax` -> Error, and
+// `shl $256, %rax` -> Error.
 [[nodiscard]] bool
-wireImm8(EncodingState& st, std::int32_t v,
+wireImm8(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
+         std::uint8_t guardWidthBits,
          std::string_view mnemonic, DiagnosticReporter& reporter) {
-    if (v < 0 || v > 255) {
+    auto const bits = walker_util::resolveImmediateForField(
+        v, slot, guardWidthBits, mnemonic, reporter);
+    if (!bits.has_value()) return false;
+    st.imm8s.push_back(static_cast<std::uint8_t>(*bits));
+    return true;
+}
+
+// D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: stash an ImmInt operand's value for
+// the 2-byte immediate slot (`66 C7 /0 iw`, `66 81 /N iw`).
+//
+// ★ THE WINDOW IS THE UNION OF THE SIGNED AND UNSIGNED READINGS OF THE SAME
+// 16 BITS — [-32768, 65535] — and that much IS a measurement: ✔GNU as 2.42
+// assembles BOTH `movw $-1, %cx` and `movw $65535, %cx` to the identical
+// `66 b9 ff ff`, so a range admitting only one of them would refuse input
+// the reference takes.
+//
+// ★★★ WHAT THE WINDOW GATES CHANGED IN CYCLE P34, AND THE WINDOW ITSELF DID
+// NOT MOVE — D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES. It used
+// to be the ACCEPTANCE threshold: outside it the encoder refused. But the
+// reference does not refuse — ✔MEASURED, `mov $0x10000, %cx` assembles rc=0
+// to `66 b9 00 00` (with a warning) and `mov $-32769, %cx` assembles rc=0 to
+// `66 b9 ff 7f` with NO DIAGNOSTIC AT ALL. Refusing what a working reference
+// assembles is a conformance defect; matching it exactly would have imported
+// its silence on the case where 0x8000 of magnitude disappears. The operator
+// ruled a THIRD arm: accept what gas accepts, and diagnose where gas is
+// silent. So this window is now the SILENCE threshold — outside it the low
+// 16 bits (the reference's own bytes) are emitted with an unsuppressable
+// `A_ImmediateNarrowedToOperandField` warning.
+//
+// ⚠ THE RANGE LITERALS ARE GONE ON PURPOSE. The window is derived from the
+// slot's declared field width in `walker_util::immediateFitsFieldWindow`,
+// and whether narrowing is even legal here is decided by the CONFIG —
+// `guard.width == 16` says this field carries the operation's whole value.
+// A 16-bit field under a wider operation (a fixed narrow parameter, as an
+// x86 shift count's `ib` is) still refuses, because the reference refuses
+// that too.
+[[nodiscard]] bool
+wireImm16(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
+          std::uint8_t guardWidthBits,
+          std::string_view mnemonic, DiagnosticReporter& reporter) {
+    if (slot != EncodingSlotKind::Imm16Bytes) {
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                DiagnosticSeverity::Error,
-               std::format("opcode '{}': immediate {} does not fit the "
-                           "imm8 slot (0..255) — the lowering must "
-                           "route out-of-range counts through the "
-                           "register form",
-                           mnemonic, v));
+               std::format("opcode '{}': variant wires a 2-byte immediate "
+                           "into slot '{}', which is not the 2-byte "
+                           "immediate slot",
+                           mnemonic, encodingSlotKindName(slot)));
         return false;
     }
-    st.imm8s.push_back(static_cast<std::uint8_t>(v));
+    auto const bits = walker_util::resolveImmediateForField(
+        v, slot, guardWidthBits, mnemonic, reporter);
+    if (!bits.has_value()) return false;
+    st.imm16s.push_back(static_cast<std::uint16_t>(*bits));
     return true;
 }
 
@@ -712,7 +780,13 @@ bool encode(Lir const&                  lir,
     // a green build emitting the wrong instruction, with no diagnostic.
     std::uint8_t const instWidth = lirInstWidthBits(lir.instFlags(inst));
     TargetEncodingVariant const* selected =
-        asm_elect::selectEncodingVariant(*info, instOps, instWidth);
+        asm_elect::selectEncodingVariant(
+            *info, instOps, instWidth,
+            // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE: the
+            // memory-direction axis, read off the SAME flags byte as the
+            // width so this walker elects exactly the variant the text
+            // lowering already elected.
+            lirInstMemoryIsDestination(lir.instFlags(inst)));
     if (selected == nullptr) {
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                DiagnosticSeverity::Error,
@@ -728,8 +802,18 @@ bool encode(Lir const&                  lir,
 
     // Wire the result register into its declared slot.
     if (selected->resultSlot.has_value()) {
+        // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the bank this
+        // variant declares for its result field (its own `resultRegClass`, or
+        // the opcode's `encoding.registerClass`). Resolved from config here
+        // and compared inside `hwEncodingOf` — never inferred from the slot
+        // kind, which is a GPR field under `add` and an XMM field under
+        // `addsd`.
         auto const hw = hwEncodingOf(result, schema, info->mnemonic,
-                                      kX86RegFieldBits, reporter);
+                                      kX86RegFieldBits,
+                                      encodingResultRegClass(info->encoding,
+                                                             *selected),
+                                      encodingSlotKindName(*selected->resultSlot),
+                                      reporter);
         if (!hw.has_value()) return false;
         if (!wireSlot(st, *selected->resultSlot, *hw,
                       info->mnemonic, reporter)) {
@@ -753,8 +837,14 @@ bool encode(Lir const&                  lir,
         }
         auto const& srcOp = instOps[wire.index];
         if (srcOp.kind == LirOperandKind::Reg) {
+            // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: this wire's
+            // declared bank (its own `regClass`, else the opcode's).
             auto const hw = hwEncodingOf(srcOp.reg, schema, info->mnemonic,
-                                          kX86RegFieldBits, reporter);
+                                          kX86RegFieldBits,
+                                          encodingWireRegClass(info->encoding,
+                                                               wire),
+                                          encodingSlotKindName(wire.slotKind),
+                                          reporter);
             if (!hw.has_value()) return false;
             if (!wireSlot(st, wire.slotKind, *hw,
                           info->mnemonic, reporter)) {
@@ -762,11 +852,26 @@ bool encode(Lir const&                  lir,
             }
         } else if (srcOp.kind == LirOperandKind::ImmInt) {
             // Slot decides the emitted width: Imm8 (the shift-count
-            // ib) emits ONE byte; everything else goes through the
+            // ib) emits ONE byte, Imm16Bytes (the `iw` of the 16-bit
+            // forms) emits TWO; everything else goes through the
             // Imm32 path (which rejects non-Imm32 slots loudly).
             if (wire.slotKind == EncodingSlotKind::Imm8) {
-                if (!wireImm8(st, srcOp.immInt32,
+                if (!wireImm8(st, wire.slotKind, srcOp.immInt32,
+                              selected->guardWidthBits,
                               info->mnemonic, reporter)) {
+                    return false;
+                }
+            } else if (wire.slotKind == EncodingSlotKind::Imm16Bytes) {
+                // The SELECTED variant's declared operation width is what
+                // decides whether this field may narrow — see
+                // `walker_util::fieldCarriesWholeOperationValue`. Read off
+                // the elected variant, never off `instWidth`: a
+                // width-ABSENT variant matches any width and therefore
+                // proves nothing, which is exactly the case that must keep
+                // refusing.
+                if (!wireImm16(st, wire.slotKind, srcOp.immInt32,
+                               selected->guardWidthBits,
+                               info->mnemonic, reporter)) {
                     return false;
                 }
             } else if (!wireImm32(st, wire.slotKind, srcOp.immInt32,
@@ -855,8 +960,8 @@ bool encode(Lir const&                  lir,
             //   * RipRelDisp32   — RIP-relative addressing form (e.g.
             //                      `lea r64, [rip + sym]`); the encoder
             //                      additionally forces ModR/M.mod=00 +
-            //                      ModR/M.rm=101 below. D-LK4-RODATA-
-            //                      PRODUCER (2026-06-02).
+            //                      ModR/M.rm=101 below.
+            //                      D-LK4-RODATA-PRODUCER (2026-06-02).
             //   * MemRelocDisp32 — TLS C1 (D-CSUBSET-THREAD-LOCAL):
             //                      the relocated displacement of a
             //                      `[base + disp32]` memory operand
@@ -1349,12 +1454,17 @@ bool encode(Lir const&                  lir,
 
     // 7) Immediates: append in slot-wiring order — imm8 bytes first
     //    (the shift-count ib; no shipped instruction carries both an
-    //    imm8 AND an imm32), then the 4-byte immediates, then the
+    //    imm8 AND an imm32), then the 2-byte immediates
+    //    (D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT — the `iw` of `66 C7 /0 iw`
+    //    and `66 81 /N iw`), then the 4-byte immediates, then the
     //    8-byte immediate (D-CSUBSET-BITFIELD-WIDE-UNIT — `mov r64,
     //    imm64` = B8+rd io; no shipped instruction carries both an
     //    imm32 AND an imm64).
     for (auto v : st.imm8s) {
         out.push_back(v);
+    }
+    for (auto v : st.imm16s) {
+        asm_byte_emit::appendU16LE(out, v);
     }
     for (auto v : st.imm32s) {
         asm_byte_emit::appendImm32LE(out, v);

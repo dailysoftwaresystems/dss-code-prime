@@ -56,7 +56,7 @@ struct Argv {
 // ── Help / no-arg / LSP modes ────────────────────────────────
 
 TEST(CliArgs, NoArgsProducesEmptyResult) {
-    Argv a{"dss-code-prime"};
+    Argv a{"dsscp"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
     EXPECT_FALSE(r->lspMode);
@@ -66,28 +66,28 @@ TEST(CliArgs, NoArgsProducesEmptyResult) {
 }
 
 TEST(CliArgs, HelpFlagSetsHelpMode) {
-    Argv a{"dss-code-prime", "--help"};
+    Argv a{"dsscp", "--help"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE(r->helpMode);
 }
 
 TEST(CliArgs, ShortHelpFlagSetsHelpMode) {
-    Argv a{"dss-code-prime", "-h"};
+    Argv a{"dsscp", "-h"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE(r->helpMode);
 }
 
 TEST(CliArgs, LspFlagSetsLspMode) {
-    Argv a{"dss-code-prime", "--lsp"};
+    Argv a{"dsscp", "--lsp"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE(r->lspMode);
 }
 
 TEST(CliArgs, LspWithSchemaDir) {
-    Argv a{"dss-code-prime", "--lsp", "--schema-dir=/tmp/schemas"};
+    Argv a{"dsscp", "--lsp", "--schema-dir=/tmp/schemas"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE(r->lspMode);
@@ -98,14 +98,14 @@ TEST(CliArgs, LspWithSchemaDir) {
 // ── Compile mode ─────────────────────────────────────────────
 
 TEST(CliArgs, CompileModeWithSingleFile) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
     ASSERT_EQ(r->sourceFiles.size(), 1u);
     EXPECT_EQ(r->sourceFiles[0], "hello.c");
-    EXPECT_EQ(r->languageName, "c-subset");
+    EXPECT_EQ(r->languageName, "c");
     ASSERT_EQ(r->targets.size(), 1u);
     EXPECT_EQ(r->targets[0], "x86_64:elf64-x86_64-linux");
 }
@@ -113,8 +113,8 @@ TEST(CliArgs, CompileModeWithSingleFile) {
 // ── --time flag (compile wall-clock reporting) ───────────────
 
 TEST(CliArgs, TimeFlagDefaultsFalse) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
@@ -122,8 +122,8 @@ TEST(CliArgs, TimeFlagDefaultsFalse) {
 }
 
 TEST(CliArgs, TimeFlagSetByCli) {   // RED-on-disable: drop the `--time` parse arm and this fails
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux", "--time"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
@@ -131,7 +131,7 @@ TEST(CliArgs, TimeFlagSetByCli) {   // RED-on-disable: drop the `--time` parse a
 }
 
 TEST(CliArgs, TimeFlagAloneIsNoModeError) {   // --time with no mode must fail loud, not be silently dropped
-    Argv a{"dss-code-prime", "--time"};
+    Argv a{"dsscp", "--time"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
@@ -149,8 +149,8 @@ TEST(CliArgs, FormatWallTimeHumanizesAllBands) {
 }
 
 TEST(CliArgs, CompileModeWithMultipleFiles) {
-    Argv a{"dss-code-prime", "--compile", "a.c", "b.c", "c.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "a.c", "b.c", "c.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
@@ -161,8 +161,8 @@ TEST(CliArgs, CompileModeWithMultipleFiles) {
 }
 
 TEST(CliArgs, MultipleTargetsAccepted) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--target", "x86_64:pe64-x86_64-windows"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -176,8 +176,8 @@ TEST(CliArgs, MultipleTargetsAccepted) {
 // accepted spellings parse into `includeDirs`, in order. RED-on-disable: drop
 // any of the four -I parse arms and the corresponding entry vanishes (size != 4).
 TEST(CliArgs, IncludeDirsAllFourForms) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "-I", "spaced_dir",               // -I <dir>
            "-Iattached_dir",                 // -I<dir> (gcc attached form)
@@ -194,8 +194,8 @@ TEST(CliArgs, IncludeDirsAllFourForms) {
 
 // A dangling `-I` (no directory argument) fails loud, not silently dropped.
 TEST(CliArgs, IncludeDirSpacedFormRequiresValue) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "-I"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -204,16 +204,16 @@ TEST(CliArgs, IncludeDirSpacedFormRequiresValue) {
 }
 
 TEST(CliArgs, CompileModeRejectsEmptyFileList) {
-    Argv a{"dss-code-prime", "--compile",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::EmptyFileList);
 }
 
-// ★★ `--language` IS OPTIONAL FOR --compile (D-DRIVER-ASM-DIALECT-SELECTED-BY-
-// TARGET). This test previously asserted the OPPOSITE — `MissingLanguage` —
+// ★★ `--language` IS OPTIONAL FOR --compile (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET).
+// This test previously asserted the OPPOSITE — `MissingLanguage` —
 // and the assertion was correct until a second assembly dialect shipped. Both
 // `asm-x86_64-att` and `asm-arm64-gas` declare `.s`/`.S`, so the extension
 // cannot name one and a single `--language` would force the wrong dialect on
@@ -225,7 +225,7 @@ TEST(CliArgs, CompileModeRejectsEmptyFileList) {
 // `tests/program/test_asm_dialect_per_target.cpp`. Parsing succeeding here is
 // not the same as the build being allowed to proceed languageless.
 TEST(CliArgs, CompileModeAcceptsAnOmittedLanguage) {
-    Argv a{"dss-code-prime", "--compile", "hello.s",
+    Argv a{"dsscp", "--compile", "hello.s",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value())
@@ -237,7 +237,7 @@ TEST(CliArgs, CompileModeAcceptsAnOmittedLanguage) {
 }
 
 TEST(CliArgs, DirectoryModeAcceptsAnOmittedLanguage) {
-    Argv a{"dss-code-prime", "--directory", "src/",
+    Argv a{"dsscp", "--directory", "src/",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
@@ -250,7 +250,7 @@ TEST(CliArgs, DirectoryModeAcceptsAnOmittedLanguage) {
 // Defaulting `--transpile` to the assembly dialect would replace a precise
 // error with a confidently wrong answer.
 TEST(CliArgs, TranspileModeStillRequiresLanguage) {
-    Argv a{"dss-code-prime", "--transpile", "hello.c",
+    Argv a{"dsscp", "--transpile", "hello.c",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -258,8 +258,8 @@ TEST(CliArgs, TranspileModeStillRequiresLanguage) {
 }
 
 TEST(CliArgs, CompileModeRequiresTarget) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset"};
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::EmptyTargetList);
@@ -268,8 +268,8 @@ TEST(CliArgs, CompileModeRequiresTarget) {
 // ── Directory mode ───────────────────────────────────────────
 
 TEST(CliArgs, DirectoryModeWithRecursive) {
-    Argv a{"dss-code-prime", "--directory", "src/",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--directory", "src/",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--recursive"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -280,8 +280,8 @@ TEST(CliArgs, DirectoryModeWithRecursive) {
 }
 
 TEST(CliArgs, DirectoryModeWithNoRecursive) {
-    Argv a{"dss-code-prime", "--directory", "src/",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--directory", "src/",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--no-recursive"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -290,8 +290,8 @@ TEST(CliArgs, DirectoryModeWithNoRecursive) {
 }
 
 TEST(CliArgs, DirectoryDefaultIsRecursive) {
-    Argv a{"dss-code-prime", "--directory", "src/",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--directory", "src/",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
@@ -301,7 +301,7 @@ TEST(CliArgs, DirectoryDefaultIsRecursive) {
 // ── Project mode ─────────────────────────────────────────────
 
 TEST(CliArgs, ProjectModeAccepted) {
-    Argv a{"dss-code-prime", "--project", "myproj.dss-project.json"};
+    Argv a{"dsscp", "--project", "myproj.dss-project.json"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
     ASSERT_TRUE(r->projectPath.has_value());
@@ -311,10 +311,10 @@ TEST(CliArgs, ProjectModeAccepted) {
 // ── Mutually-exclusive modes ─────────────────────────────────
 
 TEST(CliArgs, RejectsCompileAndDirectoryTogether) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "hello.c",
            "--directory", "src/",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -322,7 +322,7 @@ TEST(CliArgs, RejectsCompileAndDirectoryTogether) {
 }
 
 TEST(CliArgs, RejectsCompileAndLspTogether) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "hello.c", "--lsp"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -332,8 +332,8 @@ TEST(CliArgs, RejectsCompileAndLspTogether) {
 // ── Diagnostic policy (D-LK10-7 closure) ─────────────────────
 
 TEST(CliArgs, WarningsAsErrorsToggle) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--warnings-as-errors"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -342,8 +342,8 @@ TEST(CliArgs, WarningsAsErrorsToggle) {
 }
 
 TEST(CliArgs, SuppressByCodeName) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--suppress=D_FileNotFound"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -353,8 +353,8 @@ TEST(CliArgs, SuppressByCodeName) {
 }
 
 TEST(CliArgs, SuppressByHexValue) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--suppress=0xD001"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -364,8 +364,8 @@ TEST(CliArgs, SuppressByHexValue) {
 }
 
 TEST(CliArgs, SuppressMultipleCodesAccumulates) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--suppress=D_FileNotFound",
            "--suppress=D_DuplicateFile"};
@@ -375,8 +375,8 @@ TEST(CliArgs, SuppressMultipleCodesAccumulates) {
 }
 
 TEST(CliArgs, SuppressRejectsUnknownCode) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--suppress=No_Such_Code"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -387,7 +387,7 @@ TEST(CliArgs, SuppressRejectsUnknownCode) {
 // ── Error paths ──────────────────────────────────────────────
 
 TEST(CliArgs, RejectsUnknownFlag) {
-    Argv a{"dss-code-prime", "--no-such-flag"};
+    Argv a{"dsscp", "--no-such-flag"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::UnknownFlag);
@@ -395,7 +395,7 @@ TEST(CliArgs, RejectsUnknownFlag) {
 }
 
 TEST(CliArgs, RejectsMissingFlagValue) {
-    Argv a{"dss-code-prime", "--target"};
+    Argv a{"dsscp", "--target"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
@@ -422,24 +422,24 @@ TEST(CliArgs, HelpTextContainsCoreFlags) {
 // ── --transpile mode (plan 10 dispatch — fail-loud today) ────
 
 TEST(CliArgs, ParsesTranspileMode) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--transpile", "in.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "wasm32-v1-link-wasi"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
     EXPECT_TRUE(r->sourceFiles.empty());
     ASSERT_EQ(r->transpileFiles.size(), 1u);
     EXPECT_EQ(r->transpileFiles[0], "in.c");
-    EXPECT_EQ(r->languageName, "c-subset");
+    EXPECT_EQ(r->languageName, "c");
     ASSERT_EQ(r->targets.size(), 1u);
 }
 
 TEST(CliArgs, TranspileAndCompileAreMutuallyExclusive) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
            "--transpile", "b.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64-v1-link-elf"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -449,9 +449,9 @@ TEST(CliArgs, TranspileAndCompileAreMutuallyExclusive) {
 // ── --config=debug|release (plan 22 wiring slot) ─────────────
 
 TEST(CliArgs, ConfigDefaultsToDebug) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64-v1-link-elf"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
@@ -459,9 +459,9 @@ TEST(CliArgs, ConfigDefaultsToDebug) {
 }
 
 TEST(CliArgs, ConfigParsesReleaseEqualsForm) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64-v1-link-elf",
            "--config=release"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -470,9 +470,9 @@ TEST(CliArgs, ConfigParsesReleaseEqualsForm) {
 }
 
 TEST(CliArgs, ConfigParsesDebugSpaceForm) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64-v1-link-elf",
            "--config", "debug"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -481,9 +481,9 @@ TEST(CliArgs, ConfigParsesDebugSpaceForm) {
 }
 
 TEST(CliArgs, ConfigRejectsInvalidValue) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64-v1-link-elf",
            "--config=fast"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -500,9 +500,9 @@ TEST(CliArgs, CompileConfigNameRoundTrip) {
 // ── --jobs N (D-PERF-4-CU-PARALLELISM: per-CU build pool width) ─────
 
 TEST(CliArgs, JobsDefaultsToZeroAuto) {   // absent → 0 = auto (min(cores,TUs,16))
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
@@ -510,9 +510,9 @@ TEST(CliArgs, JobsDefaultsToZeroAuto) {   // absent → 0 = auto (min(cores,TUs,
 }
 
 TEST(CliArgs, JobsParsesEqualsForm) {   // RED-on-disable: drop the --jobs arm → this fails
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--jobs=4"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -521,9 +521,9 @@ TEST(CliArgs, JobsParsesEqualsForm) {   // RED-on-disable: drop the --jobs arm �
 }
 
 TEST(CliArgs, JobsParsesSpaceForm) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--jobs", "8"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -532,9 +532,9 @@ TEST(CliArgs, JobsParsesSpaceForm) {
 }
 
 TEST(CliArgs, JobsRejectsZero) {   // 0 is not a valid worker count — fail loud, never silent auto
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--jobs", "0"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -543,9 +543,9 @@ TEST(CliArgs, JobsRejectsZero) {   // 0 is not a valid worker count — fail lou
 }
 
 TEST(CliArgs, JobsRejectsNonNumeric) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--jobs=abc"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -555,9 +555,9 @@ TEST(CliArgs, JobsRejectsNonNumeric) {
 }
 
 TEST(CliArgs, JobsRejectsTrailingJunk) {   // partial parse ("4x") must fail, not silently take 4
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--jobs=4x"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -566,7 +566,7 @@ TEST(CliArgs, JobsRejectsTrailingJunk) {   // partial parse ("4x") must fail, no
 }
 
 TEST(CliArgs, JobsAloneIsNoModeError) {   // --jobs with no mode flag must fail loud, not be dropped
-    Argv a{"dss-code-prime", "--jobs", "4"};
+    Argv a{"dsscp", "--jobs", "4"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
@@ -584,9 +584,9 @@ TEST(CliArgs, JobsAloneIsNoModeError) {   // --jobs with no mode flag must fail 
 // "validate early" change has to face the layering decision.
 
 TEST(CliArgs, StackReserveDefaultsToNullopt) {   // absent → nullopt = take the format's default
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
@@ -595,9 +595,9 @@ TEST(CliArgs, StackReserveDefaultsToNullopt) {   // absent → nullopt = take th
 }
 
 TEST(CliArgs, StackReserveParsesEqualsForm) {   // RED-on-disable: drop the --stack-reserve arm → this fails
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--stack-reserve=4194304"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -607,9 +607,9 @@ TEST(CliArgs, StackReserveParsesEqualsForm) {   // RED-on-disable: drop the --st
 }
 
 TEST(CliArgs, StackReserveParsesSpaceForm) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--stack-reserve", "65536"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -622,9 +622,9 @@ TEST(CliArgs, StackReserveParsesSpaceForm) {
 // in a 32-bit `unsigned`, so a narrowing of either the CliArgs field or the
 // from_chars target would truncate (or fail to parse) — either way RED here.
 TEST(CliArgs, StackReserveLargeValueRoundTripsExactly) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--stack-reserve=8589934592"};   // 2^33 — above the 32-bit ceiling
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -634,9 +634,9 @@ TEST(CliArgs, StackReserveLargeValueRoundTripsExactly) {
 }
 
 TEST(CliArgs, StackReserveRejectsZero) {   // a zero-byte reserve cannot start a program — fail loud
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--stack-reserve", "0"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -645,9 +645,9 @@ TEST(CliArgs, StackReserveRejectsZero) {   // a zero-byte reserve cannot start a
 }
 
 TEST(CliArgs, StackReserveRejectsNonNumeric) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--stack-reserve=abc"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -657,9 +657,9 @@ TEST(CliArgs, StackReserveRejectsNonNumeric) {
 }
 
 TEST(CliArgs, StackReserveRejectsTrailingJunk) {   // partial parse ("4096x") must fail, not silently take 4096
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--stack-reserve=4096x"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -672,9 +672,9 @@ TEST(CliArgs, StackReserveRejectsTrailingJunk) {   // partial parse ("4096x") mu
 // target to a signed type would let `-4096` through (and then wrap to a huge
 // u64 at the assignment), which this asserts can never happen.
 TEST(CliArgs, StackReserveRejectsNegative) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--stack-reserve=-4096"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -683,7 +683,7 @@ TEST(CliArgs, StackReserveRejectsNegative) {
 }
 
 TEST(CliArgs, StackReserveAloneIsNoModeError) {   // no mode flag → the request would be silently discarded
-    Argv a{"dss-code-prime", "--stack-reserve", "4194304"};
+    Argv a{"dsscp", "--stack-reserve", "4194304"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
@@ -695,9 +695,9 @@ TEST(CliArgs, StackReserveRejectedInTranspileMode) {
     // request -- and unlike a compile against an incapable FORMAT (which the
     // linker gate refuses), no gate is even reached here. Accepting it would
     // be a silent discard, so the CLI refuses it up front.
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--transpile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--stack-reserve", "4194304"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -709,7 +709,7 @@ TEST(CliArgs, StackReserveRejectedInTranspileMode) {
 
 TEST(CliArgs, StackReserveRejectedInLspMode) {
     // Same reasoning for --lsp: a language server emits no artifact at all.
-    Argv a{"dss-code-prime", "--lsp", "--stack-reserve", "4194304"};
+    Argv a{"dsscp", "--lsp", "--stack-reserve", "4194304"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
@@ -720,7 +720,7 @@ TEST(CliArgs, StackReserveAcceptedInEveryImageEmittingMode) {
     // gate could be satisfied by refusing EVERYTHING. All three image-emitting
     // modes must still accept the flag and carry the exact value.
     {
-        Argv a{"dss-code-prime", "--compile", "a.c", "--language", "c-subset",
+        Argv a{"dsscp", "--compile", "a.c", "--language", "c",
                "--target", "x86_64:pe64-x86_64-windows-exec",
                "--stack-reserve", "4194304"};
         auto r = parseCliArgs(a.argc(), a.argv());
@@ -728,7 +728,7 @@ TEST(CliArgs, StackReserveAcceptedInEveryImageEmittingMode) {
         EXPECT_EQ(r->stackReserveBytes, std::optional<std::uint64_t>{4194304u});
     }
     {
-        Argv a{"dss-code-prime", "--directory", "src", "--language", "c-subset",
+        Argv a{"dsscp", "--directory", "src", "--language", "c",
                "--target", "x86_64:pe64-x86_64-windows-exec",
                "--stack-reserve", "4194304"};
         auto r = parseCliArgs(a.argc(), a.argv());
@@ -736,7 +736,7 @@ TEST(CliArgs, StackReserveAcceptedInEveryImageEmittingMode) {
         EXPECT_EQ(r->stackReserveBytes, std::optional<std::uint64_t>{4194304u});
     }
     {
-        Argv a{"dss-code-prime", "--project", "p.dss-project.json",
+        Argv a{"dsscp", "--project", "p.dss-project.json",
                "--stack-reserve", "4194304"};
         auto r = parseCliArgs(a.argc(), a.argv());
         ASSERT_TRUE(r.has_value()) << "project mode must accept it";
@@ -745,9 +745,9 @@ TEST(CliArgs, StackReserveAcceptedInEveryImageEmittingMode) {
 }
 
 TEST(CliArgs, StackReserveMissingValueRejected) {   // `--stack-reserve` as the last argv
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--stack-reserve"};   // no following arg
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -756,9 +756,9 @@ TEST(CliArgs, StackReserveMissingValueRejected) {   // `--stack-reserve` as the 
 }
 
 TEST(CliArgs, StackReserveEqualsEmptyRhsRejects) {   // symmetric with every other value flag
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--stack-reserve="};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -774,9 +774,9 @@ TEST(CliArgs, StackReserveEqualsEmptyRhsRejects) {   // symmetric with every oth
 // RED-on-disable: add a range check here and this goes red, forcing the
 // layering decision to be made deliberately rather than by drift.
 TEST(CliArgs, StackReserveNotRangeCheckedAtCliTier) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--stack-reserve=1"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -806,9 +806,9 @@ TEST(CliArgs, InvalidStackReserveErrorNameRoundTrip) {
 //     is a property of `DiagnosticReporter::report` rather than a preference.
 
 TEST(CliArgs, MaxDiagnosticsDefaultsToNullopt) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
@@ -818,9 +818,9 @@ TEST(CliArgs, MaxDiagnosticsDefaultsToNullopt) {
 }
 
 TEST(CliArgs, MaxDiagnosticsParsesEqualsForm) {   // RED-on-disable: drop the arm -> fails
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--max-diagnostics=250"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -830,9 +830,9 @@ TEST(CliArgs, MaxDiagnosticsParsesEqualsForm) {   // RED-on-disable: drop the ar
 }
 
 TEST(CliArgs, MaxDiagnosticsParsesSpaceForm) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--max-diagnostics", "7"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -854,9 +854,9 @@ TEST(CliArgs, MaxDiagnosticsParsesSpaceForm) {
 // program. Here 0 collides with nothing (absence is nullopt) and is a value the
 // library implements exactly.
 TEST(CliArgs, MaxDiagnosticsZeroIsLegalAndDistinctFromAbsent) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--max-diagnostics=0"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -868,9 +868,9 @@ TEST(CliArgs, MaxDiagnosticsZeroIsLegalAndDistinctFromAbsent) {
 }
 
 TEST(CliArgs, MaxDiagnosticsRejectsNonNumeric) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--max-diagnostics=lots"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -880,9 +880,9 @@ TEST(CliArgs, MaxDiagnosticsRejectsNonNumeric) {
 }
 
 TEST(CliArgs, MaxDiagnosticsRejectsTrailingJunk) {   // "100x" must not silently become 100
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--max-diagnostics=100x"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -891,9 +891,9 @@ TEST(CliArgs, MaxDiagnosticsRejectsTrailingJunk) {   // "100x" must not silently
 }
 
 TEST(CliArgs, MaxDiagnosticsRejectsNegative) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--max-diagnostics=-1"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -911,9 +911,9 @@ TEST(CliArgs, MaxDiagnosticsRejectsNegative) {
 TEST(CliArgs, MaxDiagnosticsRejectsOverflow) {
     std::string const tooBig =
         std::to_string(std::numeric_limits<std::size_t>::max()) + "0";
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--max-diagnostics=" + tooBig};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -926,9 +926,9 @@ TEST(CliArgs, MaxDiagnosticsRejectsOverflow) {
 // than merely somewhere.
 TEST(CliArgs, MaxDiagnosticsSizeMaxRoundTripsExactly) {
     auto const limit = std::numeric_limits<std::size_t>::max();
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--max-diagnostics=" + std::to_string(limit)};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -938,9 +938,9 @@ TEST(CliArgs, MaxDiagnosticsSizeMaxRoundTripsExactly) {
 }
 
 TEST(CliArgs, MaxDiagnosticsMissingValueRejected) {   // `--max-diagnostics` as the last argv
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--max-diagnostics"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -949,9 +949,9 @@ TEST(CliArgs, MaxDiagnosticsMissingValueRejected) {   // `--max-diagnostics` as 
 }
 
 TEST(CliArgs, MaxDiagnosticsEqualsEmptyRhsRejects) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--max-diagnostics="};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -960,7 +960,7 @@ TEST(CliArgs, MaxDiagnosticsEqualsEmptyRhsRejects) {
 }
 
 TEST(CliArgs, MaxDiagnosticsAloneIsNoModeError) {
-    Argv a{"dss-code-prime", "--max-diagnostics", "10"};
+    Argv a{"dsscp", "--max-diagnostics", "10"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
@@ -970,7 +970,7 @@ TEST(CliArgs, MaxDiagnosticsAloneIsNoModeError) {
 // discard it: `--lsp` returns from `Program::run` before the reporter config is
 // built, and `--dump-predefined-macros` deliberately uses no reporter at all.
 TEST(CliArgs, MaxDiagnosticsRejectedInLspMode) {
-    Argv a{"dss-code-prime", "--lsp", "--max-diagnostics=10"};
+    Argv a{"dsscp", "--lsp", "--max-diagnostics=10"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
@@ -978,8 +978,8 @@ TEST(CliArgs, MaxDiagnosticsRejectedInLspMode) {
 }
 
 TEST(CliArgs, MaxDiagnosticsRejectedInDumpPredefinedMacrosMode) {
-    Argv a{"dss-code-prime", "--dump-predefined-macros",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--dump-predefined-macros",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--max-diagnostics=10"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -992,8 +992,8 @@ TEST(CliArgs, MaxDiagnosticsRejectedInDumpPredefinedMacrosMode) {
 // the shape that silently omits a member.
 TEST(CliArgs, MaxDiagnosticsAcceptedInEveryCompilingMode) {
     {
-        Argv a{"dss-code-prime", "--compile", "a.c",
-               "--language", "c-subset",
+        Argv a{"dsscp", "--compile", "a.c",
+               "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux",
                "--max-diagnostics=10"};
         auto r = parseCliArgs(a.argc(), a.argv());
@@ -1001,8 +1001,8 @@ TEST(CliArgs, MaxDiagnosticsAcceptedInEveryCompilingMode) {
         EXPECT_EQ(*r->maxDiagnostics, std::size_t{10});
     }
     {
-        Argv a{"dss-code-prime", "--transpile", "a.c",
-               "--language", "c-subset",
+        Argv a{"dsscp", "--transpile", "a.c",
+               "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux",
                "--max-diagnostics=10"};
         auto r = parseCliArgs(a.argc(), a.argv());
@@ -1010,8 +1010,8 @@ TEST(CliArgs, MaxDiagnosticsAcceptedInEveryCompilingMode) {
         EXPECT_EQ(*r->maxDiagnostics, std::size_t{10});
     }
     {
-        Argv a{"dss-code-prime", "--directory", "src",
-               "--language", "c-subset",
+        Argv a{"dsscp", "--directory", "src",
+               "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux",
                "--max-diagnostics=10"};
         auto r = parseCliArgs(a.argc(), a.argv());
@@ -1019,7 +1019,7 @@ TEST(CliArgs, MaxDiagnosticsAcceptedInEveryCompilingMode) {
         EXPECT_EQ(*r->maxDiagnostics, std::size_t{10});
     }
     {
-        Argv a{"dss-code-prime", "--project", "p.dss-project.json",
+        Argv a{"dsscp", "--project", "p.dss-project.json",
                "--max-diagnostics=10"};
         auto r = parseCliArgs(a.argc(), a.argv());
         ASSERT_TRUE(r.has_value()) << "project: " << r.error().detail;
@@ -1044,8 +1044,8 @@ TEST(CliArgs, InvalidMaxDiagnosticsErrorNameRoundTrip) {
 // which is exactly why both arms are here.
 TEST(CliArgs, MaxDiagnosticsReachesReporterConfigThroughTheShippedProjection) {
     {
-        Argv a{"dss-code-prime", "--compile", "a.c",
-               "--language", "c-subset",
+        Argv a{"dsscp", "--compile", "a.c",
+               "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux",
                "--max-diagnostics=42"};
         auto r = parseCliArgs(a.argc(), a.argv());
@@ -1067,8 +1067,8 @@ TEST(CliArgs, MaxDiagnosticsReachesReporterConfigThroughTheShippedProjection) {
         // than against the literal 1000 on purpose: a test that spelled the
         // number would become the third place it is written down, and would
         // keep passing over exactly the drift it exists to catch.
-        Argv a{"dss-code-prime", "--compile", "a.c",
-               "--language", "c-subset",
+        Argv a{"dsscp", "--compile", "a.c",
+               "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux"};
         auto r = parseCliArgs(a.argc(), a.argv());
         ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
@@ -1079,8 +1079,8 @@ TEST(CliArgs, MaxDiagnosticsReachesReporterConfigThroughTheShippedProjection) {
         // 0 survives the projection intact — the arm most at risk from a
         // `value_or` / truthiness rewrite, which would silently turn an
         // explicit 0 back into the default.
-        Argv a{"dss-code-prime", "--compile", "a.c",
-               "--language", "c-subset",
+        Argv a{"dsscp", "--compile", "a.c",
+               "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux",
                "--max-diagnostics=0"};
         auto r = parseCliArgs(a.argc(), a.argv());
@@ -1093,8 +1093,8 @@ TEST(CliArgs, MaxDiagnosticsReachesReporterConfigThroughTheShippedProjection) {
 // move out of program.cpp — a relocation that dropped one would be invisible to
 // every pin above.
 TEST(CliArgs, ReporterConfigProjectionStillCarriesWarningsAsErrorsAndSuppress) {
-    Argv a{"dss-code-prime", "--compile", "a.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "a.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--warnings-as-errors",
            "--suppress=D_FileNotFound"};
@@ -1131,9 +1131,9 @@ TEST(CliArgs, MaxDiagnosticsCapAppearsOnRealStderrThroughProgramRun) {
     };
 
     {
-        Argv a{"dss-code-prime",
+        Argv a{"dsscp",
                "--compile", "no-such-file-for-the-max-diagnostics-pin.c",
-               "--language", "c-subset",
+               "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux",
                "--max-diagnostics=0"};
         auto const err = runCapturingStderr(a);
@@ -1147,9 +1147,9 @@ TEST(CliArgs, MaxDiagnosticsCapAppearsOnRealStderrThroughProgramRun) {
     {
         // CONTROL: same run, flag absent. The default cap is nowhere near
         // tripping on one missing file, so no marker may appear.
-        Argv a{"dss-code-prime",
+        Argv a{"dsscp",
                "--compile", "no-such-file-for-the-max-diagnostics-pin.c",
-               "--language", "c-subset",
+               "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux"};
         auto const err = runCapturingStderr(a);
         EXPECT_EQ(err.find("reporter cap of"), std::string::npos)
@@ -1174,9 +1174,9 @@ TEST(CliArgs, HelpTextDocumentsMaxDiagnosticsWithTheLiveDefault) {
 // ── --target=spec equals form ───────────────────────────────
 
 TEST(CliArgs, TargetAcceptsEqualsForm) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target=x86_64-v1-link-elf"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
@@ -1187,9 +1187,9 @@ TEST(CliArgs, TargetAcceptsEqualsForm) {
 // ── Silent-failure-hunter F1 fold: "Unknown" sentinel reject ──
 
 TEST(CliArgs, SuppressRejectsUnknownSentinel) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64-v1-link-elf",
            "--suppress=Unknown"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1200,9 +1200,9 @@ TEST(CliArgs, SuppressRejectsUnknownSentinel) {
 // ── F2 fold: bare `-` and empty filename rejected ────────────
 
 TEST(CliArgs, CompileRejectsBareHyphenPositional) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "-",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64-v1-link-elf"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -1210,9 +1210,9 @@ TEST(CliArgs, CompileRejectsBareHyphenPositional) {
 }
 
 TEST(CliArgs, CompileRejectsEmptyStringPositional) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64-v1-link-elf"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -1222,7 +1222,7 @@ TEST(CliArgs, CompileRejectsEmptyStringPositional) {
 // ── F3 fold: no-mode with options → NoModeSelected, not silent ──
 
 TEST(CliArgs, NoModeWithLanguageOptionRejects) {
-    Argv a{"dss-code-prime", "--language", "c-subset"};
+    Argv a{"dsscp", "--language", "c"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
@@ -1235,9 +1235,9 @@ TEST(CliArgs, NoModeWithLanguageOptionRejects) {
 // reject. Otherwise the user inserts a useless entry into the suppress
 // set and thinks something is suppressed.
 TEST(CliArgs, SuppressRejectsUnenumeratedHexCode) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64-v1-link-elf",
            "--suppress=0xFFFF"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1252,9 +1252,9 @@ TEST(CliArgs, SuppressAcceptsEnumeratedHexCode) {
     char hexBuf[8];
     std::snprintf(hexBuf, sizeof(hexBuf), "0x%04X", code);
     std::string const flag = std::string{"--suppress="} + hexBuf;
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64-v1-link-elf",
            flag};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1266,9 +1266,9 @@ TEST(CliArgs, SuppressAcceptsEnumeratedHexCode) {
 // C2: empty RHS in --target= must reject as MissingFlagValue (was
 // silently accepted as "" target spec).
 TEST(CliArgs, TargetEqualsEmptyRhsRejects) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target="};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -1277,9 +1277,9 @@ TEST(CliArgs, TargetEqualsEmptyRhsRejects) {
 
 // C2: same for --config= empty RHS.
 TEST(CliArgs, ConfigEqualsEmptyRhsRejects) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64-v1-link-elf",
            "--config="};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1290,9 +1290,9 @@ TEST(CliArgs, ConfigEqualsEmptyRhsRejects) {
 // H1: --schema-dir=<path> outside --lsp mode is silently dropped today —
 // must reject so the user sees the directive isn't being honored.
 TEST(CliArgs, SchemaDirOutsideLspModeRejects) {
-    Argv a{"dss-code-prime",
+    Argv a{"dsscp",
            "--compile", "a.c",
-           "--language", "c-subset",
+           "--language", "c",
            "--target", "x86_64-v1-link-elf",
            "--schema-dir=/tmp/schemas"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1303,7 +1303,7 @@ TEST(CliArgs, SchemaDirOutsideLspModeRejects) {
 
 // H1: but with --lsp it's accepted.
 TEST(CliArgs, SchemaDirInLspModeAccepted) {
-    Argv a{"dss-code-prime", "--lsp", "--schema-dir=/tmp/schemas"};
+    Argv a{"dsscp", "--lsp", "--schema-dir=/tmp/schemas"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
     EXPECT_TRUE(r->lspMode);
@@ -1315,7 +1315,7 @@ TEST(CliArgs, SchemaDirInLspModeAccepted) {
 // C2 symmetry (pr-test-analyzer Rating 9): every value-bearing flag
 // must reject empty RHS. Cover the 5 untested call sites.
 TEST(CliArgs, DirectoryEqualsEmptyRhsRejects) {
-    Argv a{"dss-code-prime", "--directory=", "--language", "c-subset",
+    Argv a{"dsscp", "--directory=", "--language", "c",
            "--target", "x86_64-v1-link-elf"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -1323,14 +1323,14 @@ TEST(CliArgs, DirectoryEqualsEmptyRhsRejects) {
 }
 
 TEST(CliArgs, ProjectEqualsEmptyRhsRejects) {
-    Argv a{"dss-code-prime", "--project="};
+    Argv a{"dsscp", "--project="};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
 }
 
 TEST(CliArgs, LanguageEqualsEmptyRhsRejects) {
-    Argv a{"dss-code-prime", "--compile", "a.c", "--language=",
+    Argv a{"dsscp", "--compile", "a.c", "--language=",
            "--target", "x86_64-v1-link-elf"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -1338,7 +1338,7 @@ TEST(CliArgs, LanguageEqualsEmptyRhsRejects) {
 }
 
 TEST(CliArgs, LangAliasEqualsEmptyRhsRejects) {
-    Argv a{"dss-code-prime", "--compile", "a.c", "--lang=",
+    Argv a{"dsscp", "--compile", "a.c", "--lang=",
            "--target", "x86_64-v1-link-elf"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -1346,7 +1346,7 @@ TEST(CliArgs, LangAliasEqualsEmptyRhsRejects) {
 }
 
 TEST(CliArgs, SuppressEqualsEmptyRhsRejects) {
-    Argv a{"dss-code-prime", "--compile", "a.c", "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "a.c", "--language", "c",
            "--target", "x86_64-v1-link-elf", "--suppress="};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -1357,7 +1357,7 @@ TEST(CliArgs, SuppressEqualsEmptyRhsRejects) {
 // arg must also reject (was silently accepted as ""). Comment-analyzer
 // caught the asymmetry between equalsValue and takeFlagValue.
 TEST(CliArgs, TargetSpaceFormEmptyNextArgRejects) {
-    Argv a{"dss-code-prime", "--compile", "a.c", "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "a.c", "--language", "c",
            "--target", ""};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -1367,7 +1367,7 @@ TEST(CliArgs, TargetSpaceFormEmptyNextArgRejects) {
 // C1 boundary (pr-test-analyzer Rating 8): 0x0000 must reject because
 // no enumerated code at value 0.
 TEST(CliArgs, SuppressRejectsHexZero) {
-    Argv a{"dss-code-prime", "--compile", "a.c", "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "a.c", "--language", "c",
            "--target", "x86_64-v1-link-elf", "--suppress=0x0000"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
@@ -1376,7 +1376,7 @@ TEST(CliArgs, SuppressRejectsHexZero) {
 
 // silent-failure post-fold #2: --config case-insensitive.
 TEST(CliArgs, ConfigAcceptsAllCapsRelease) {
-    Argv a{"dss-code-prime", "--compile", "a.c", "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "a.c", "--language", "c",
            "--target", "x86_64-v1-link-elf", "--config=RELEASE"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
@@ -1384,7 +1384,7 @@ TEST(CliArgs, ConfigAcceptsAllCapsRelease) {
 }
 
 TEST(CliArgs, ConfigAcceptsAllCapsDebug) {
-    Argv a{"dss-code-prime", "--compile", "a.c", "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "a.c", "--language", "c",
            "--target", "x86_64-v1-link-elf", "--config=DEBUG"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
@@ -1394,7 +1394,7 @@ TEST(CliArgs, ConfigAcceptsAllCapsDebug) {
 // type-design post-fold #2: UnknownFlag (bad spelling) vs
 // UnexpectedPositional (file outside --compile) split.
 TEST(CliArgs, BarePositionalEmitsUnexpectedPositional) {
-    Argv a{"dss-code-prime", "stray.c"};
+    Argv a{"dsscp", "stray.c"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::UnexpectedPositional);
@@ -1403,8 +1403,8 @@ TEST(CliArgs, BarePositionalEmitsUnexpectedPositional) {
 // ── D-LK10-ENTRY Slice C companion: `--output <dir>` ──────────────
 
 TEST(CliArgs, OutputFlagSpaceFormSetsOutputDir) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--output", "build/bin"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1414,8 +1414,8 @@ TEST(CliArgs, OutputFlagSpaceFormSetsOutputDir) {
 }
 
 TEST(CliArgs, OutputFlagEqualsFormSetsOutputDir) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--output=dist/x86_64"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1425,8 +1425,8 @@ TEST(CliArgs, OutputFlagEqualsFormSetsOutputDir) {
 }
 
 TEST(CliArgs, OutputFlagDefaultsToNullopt) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
@@ -1435,8 +1435,8 @@ TEST(CliArgs, OutputFlagDefaultsToNullopt) {
 }
 
 TEST(CliArgs, OutputFlagEmptyValueRejected) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--output="};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1445,8 +1445,8 @@ TEST(CliArgs, OutputFlagEmptyValueRejected) {
 }
 
 TEST(CliArgs, OutputFlagMissingValueRejected) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--output"};  // no following arg
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1459,8 +1459,8 @@ TEST(CliArgs, OutputFlagMissingValueRejected) {
 TEST(CliArgs, DefineFlagCollectsRepeatableVerbatim) {
     // Both spellings (`--define X` / `--define=Y=2`), repeatable, carried
     // VERBATIM (the preprocessor splits NAME=VALUE; the CLI only validates).
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--define", "X",
            "--define=Y=2"};
@@ -1479,8 +1479,8 @@ TEST(CliArgs, ResolveLibraryFlagCollectsRepeatable) {
     // the value ⇒ the PLAIN form: nothing is stated, so `declaredImportName`
     // stays EMPTY and the pre-D-FFI-DECLARED-IMPORT-NAME precedence (embedded
     // soname, else basename) applies unchanged.
-    Argv a{"dss-code-prime", "--compile", "main.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "main.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux-exec",
            "--resolve-library", "out/dsslib.so",
            "--resolve-library=out/other.so"};
@@ -1498,8 +1498,8 @@ TEST(CliArgs, ResolveLibraryFlagCollectsRepeatable) {
 TEST(CliArgs, ResolveLibraryFlagEmptyValueRejected) {
     // Symmetric with every other value flag: an empty value is a hard
     // MissingFlagValue, never a silently-stuffed "" resolve path.
-    Argv a{"dss-code-prime", "--compile", "main.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "main.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux-exec",
            "--resolve-library="};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1517,8 +1517,8 @@ TEST(CliArgs, ResolveLibraryDeclaredImportNameParsedOnBothFlagSpellings) {
     // flag's; the value's LAST `=` splits path from name). A parser that
     // consumed the wrong `=` would silently produce path="" or a name
     // containing the path.
-    Argv a{"dss-code-prime", "--compile", "main.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "main.c",
+           "--language", "c",
            "--target", "arm64:macho64-arm64-darwin-exec",
            "--resolve-library", "/opt/local/lib/libtcl8.6.dylib=@rpath/libtcl8.6.dylib",
            "--resolve-library=/opt/local/lib/libz.dylib=/usr/lib/libz.1.dylib"};
@@ -1538,8 +1538,8 @@ TEST(CliArgs, ResolveLibraryDeclaredImportNameSplitsOnTheLastEquals) {
     // name / install name) does not contain `=`. Splitting on the FIRST `=`
     // would yield path="/opt/a" and name="b=libtcl.dylib=libtcl8.6.dylib" --
     // a path that does not exist and an identity no loader could resolve.
-    Argv a{"dss-code-prime", "--compile", "main.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "main.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux-exec",
            "--resolve-library", "/opt/a=b/libtcl.dylib=libtcl8.6.dylib"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1554,8 +1554,8 @@ TEST(CliArgs, ResolveLibraryDeclaredImportNameEmptyPathRejected) {
     // `=libfoo.so` states an identity for NO file. An empty path reads no
     // export surface at all, so accepting it would bind nothing while looking
     // like it bound something. Hard reject, dedicated kind.
-    Argv a{"dss-code-prime", "--compile", "main.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "main.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux-exec",
            "--resolve-library", "=libfoo.so"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1569,8 +1569,8 @@ TEST(CliArgs, ResolveLibraryDeclaredImportNameEmptyNameRejected) {
     // would emit an empty DT_NEEDED / LC_LOAD_DYLIB the loader can never
     // resolve -- a link that succeeds and an artifact that dies at load.
     // Reject, and the message must point at omitting the '=' entirely.
-    Argv a{"dss-code-prime", "--compile", "main.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "main.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux-exec",
            "--resolve-library=libfoo.so="};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1600,8 +1600,8 @@ TEST(CliArgs, HelpTextDocumentsTheResolveLibraryImportNameSuffix) {
 TEST(CliArgs, DefineFlagFunctionLikeRejected) {
     // A '(' in NAME = a function-like -D — unsupported; must reject with a
     // pointer at the config predefinedMacros params axis, never half-parse.
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--define", "F(x)=x"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1615,8 +1615,8 @@ TEST(CliArgs, DefineFlagNonIdentifierNameRejected) {
     // `, BAR 1` (a silently wrong macro; gcc: "macro names must be
     // identifiers"). Also pins the leading-digit arm.
     {
-        Argv a{"dss-code-prime", "--compile", "hello.c",
-               "--language", "c-subset",
+        Argv a{"dsscp", "--compile", "hello.c",
+               "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux",
                "--define", "FOO,BAR=1"};
         auto r = parseCliArgs(a.argc(), a.argv());
@@ -1624,8 +1624,8 @@ TEST(CliArgs, DefineFlagNonIdentifierNameRejected) {
         EXPECT_EQ(r.error().kind, CliArgsError::InvalidDefine);
     }
     {
-        Argv a{"dss-code-prime", "--compile", "hello.c",
-               "--language", "c-subset",
+        Argv a{"dsscp", "--compile", "hello.c",
+               "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux",
                "--define", "1BAD=2"};
         auto r = parseCliArgs(a.argc(), a.argv());
@@ -1635,8 +1635,8 @@ TEST(CliArgs, DefineFlagNonIdentifierNameRejected) {
 }
 
 TEST(CliArgs, DefineFlagEmptyNameRejected) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--define", "=2"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1650,7 +1650,7 @@ TEST(CliArgs, DefineFlagEmptyNameRejected) {
 // is valid. Three properties are pinned, and each has its own silent failure.
 
 TEST(CliArgs, ForceGitCacheParsesInProjectMode) {
-    Argv a{"dss-code-prime", "--project", "app.dss-project.json",
+    Argv a{"dsscp", "--project", "app.dss-project.json",
            "--force-git-cache"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value()) << r.error().detail;
@@ -1658,7 +1658,7 @@ TEST(CliArgs, ForceGitCacheParsesInProjectMode) {
     // The DEFAULT is what every existing invocation gets, so it is pinned in
     // the same breath: a flag that defaulted on would silently re-fetch every
     // dependency of every build and destroy the offline guarantee.
-    Argv b{"dss-code-prime", "--project", "app.dss-project.json"};
+    Argv b{"dsscp", "--project", "app.dss-project.json"};
     auto s = parseCliArgs(b.argc(), b.argv());
     ASSERT_TRUE(s.has_value());
     EXPECT_FALSE(s->forceGitCache);
@@ -1668,8 +1668,8 @@ TEST(CliArgs, ForceGitCacheIsRefusedOutsideProjectMode) {
     // Only `--project` reads a `.dss-project.json`, so the flag would reach no
     // resolver in any other mode and the request would be SILENTLY DISCARDED —
     // the same defect the `--schema-dir` / `--stack-reserve` mode gates close.
-    Argv a{"dss-code-prime", "--compile", "hello.c",
-           "--language", "c-subset",
+    Argv a{"dsscp", "--compile", "hello.c",
+           "--language", "c",
            "--target", "x86_64:elf64-x86_64-linux",
            "--force-git-cache"};
     auto r = parseCliArgs(a.argc(), a.argv());
@@ -1684,7 +1684,7 @@ TEST(CliArgs, ForceGitCacheWithNoModeFlagIsRefused) {
     // Without a mode flag nothing is compiled at all, so the request lands
     // nowhere. Reaches the generic no-mode guard, whose message is the better
     // one there.
-    Argv a{"dss-code-prime", "--force-git-cache"};
+    Argv a{"dsscp", "--force-git-cache"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);

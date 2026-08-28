@@ -4,11 +4,11 @@
 #
 # The release tarball is a PREFIX TREE produced by `cmake --install`
 # (bin/, lib/, share/) — see cmake/DssInstall.cmake, which is the single owner
-# of what ships. `share/dss-code-prime/<version>/dss-config/` is NOT optional
+# of what ships. `share/dsscp/<version>/dss-config/` is NOT optional
 # packaging garnish: the compiler locates it by a path RELATIVE TO ITS OWN
 # EXECUTABLE, so the bin/-to-share/ relationship must survive packaging intact
 # or the installed compiler cannot resolve `#include <stdio.h>`.
-# Still depends on the queued dss-code-prime -> dsscp binary rename.
+# Still depends on the queued dsscp -> dsscp binary rename.
 pkgname=@PKGNAME@
 pkgver=@VERSION@
 pkgrel=1
@@ -36,8 +36,8 @@ package() {
 
   # Fail loudly rather than ship a compiler that cannot find its own config —
   # the failure would otherwise land on the user as an unresolvable <stdio.h>.
-  [ -d "$pkgdir/usr/share/dss-code-prime" ] || {
-    echo "dsscp: the release tarball carries no share/dss-code-prime config tree" >&2
+  [ -d "$pkgdir/usr/share/dsscp" ] || {
+    echo "dsscp: the release tarball carries no share/dsscp config tree" >&2
     return 1
   }
 }

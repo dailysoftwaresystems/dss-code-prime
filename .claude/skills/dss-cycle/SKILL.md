@@ -37,6 +37,298 @@ Operator ruling 2026-08-19: *"we must never crash on correct code, even if gcc f
 
 **The test is the DISJUNCTION, not the consensus.** If ANY reference (gcc, clang, MSVC, …) compiles and runs a correct construct, DSS must too. A reference's FAILURE is therefore never evidence against DSS — when DSS accepts what one reference rejects and another accepts, DSS is **right**, and the divergence is a **NON-DSS CONFOUND** to attribute and record. **Never make DSS fail in order to match a failing reference.** This bounds the bidirectional rule: "accepting what no reference accepts is a defect" turns on **NO** — not one. The implementation still owes the full bar (agnostic, config-driven, best-long-term, fail-loud, strictly tested): "it works" is the requirement, not the excuse. ⚠ Probe references **separately** — "the reference" is not one voice, and P14 nearly narrowed a working header chain because only gcc's failure was on file and MSVC's success was not. Full case: `references/the-bar.md` §A.3b.
 
+## ★★★ PRODUCTION ANCHORS ARE THE PRIORITY, ALWAYS — operator ruling 2026-08-25
+
+> *"the priority is always production anchors. ALWAYS. harness we fix as we need when we face the
+> problem (NEVER LATER)."*
+
+The registry is **two files** since 2026-08-25, split at the operator's instruction (*"the priority
+is real errors, not cosmetics"*):
+
+| file | holds |
+|---|---|
+| `.plans/_deferred-anchor-registry-production.md` | a defect **a user of the compiler could hit** — in the shipped binary, or in the config it reads |
+| `.plans/_deferred-anchor-registry-harness.md` | a defect **only we can hit** — tests, gates, guards, cycle machinery, plans, scripts, carriages, CI |
+
+⚠ A row's bucket follows the **DEFECT, never the instrument that found it**. `D-CONFIG-*` and
+`D-DIAG-*` are PRODUCTION deliberately: in this architecture a `.lang/.target/.format.json` document
+IS the compiler's behaviour, and a diagnostic IS its output to a user.
+
+**How the ruling binds this loop, clause by clause:**
+
+1. **Step 1 picks from PRODUCTION.** A harness row is never picked *because it is next*. If §0.1 is
+   dry, promote an eligible **production** anchor. `scripts/burndown-queue/burndown-queue.py`
+   already bands production errors highest — the ruling makes the FILE the outer sort key, above
+   any band.
+2. **"NEVER LATER" is the load-bearing half.** A harness defect is fixed **at the moment it is
+   faced** — this cycle, in the lane that hit it, as part of that lane's work. A gate that lies, a
+   guard blind to its subject, a script that blocks the work in front of you: fix it NOW. **Filing
+   it and routing around it is exactly the failure this ruling names.**
+3. **The harness registry is a RECORD, not a backlog.** It is drained by encounter, not by
+   scheduling. A harness row is normally written already ✅ CLOSED, naming a fix that landed in the
+   same cycle.
+4. **Still file the row.** *Anchor every issue found* is not repealed — a harness defect fixed
+   silently teaches nobody, and the row is what makes the fix auditable. This ruling governs what
+   gets **SCHEDULED**, not what gets **RECORDED**.
+5. **Step 2's "clear blockers FIRST" is unchanged, and is now the ONLY route a harness row takes
+   into a cycle** — it is worked because it BLOCKS the production priority, never on its own ticket.
+6. **The cycle report states production movement SEPARATELY**, because a single total cannot answer
+   the question the operator is actually asking. ★ A cycle whose closures are all harness rows has
+   hardened the workshop and shipped nothing; say so plainly rather than letting a healthy total
+   imply otherwise.
+
+⚠ **Do not quote a per-bucket count from here or from the handoff — re-derive it.** ✔MEASURED
+2026-08-25, and the correction is the reason this warning is here: the P34 handoff's own
+"475 production OPEN" was wrong by 20, caught only by cross-checking the per-bucket split against
+`check-anchor-balance`'s registry total. The instrument, which reuses that gate's own row scanner
+rather than re-typing the "is this row open" vocabulary:
+
+```
+python scripts/check-anchor-balance/check-anchor-balance.py --breakdown --denominator registry
+```
+
+⚠ That gate canonicalises BOTH registry files to ONE key — deliberately, so that MOVING a row
+between buckets is correctly a no-op — so its breakdown gives the registry TOTAL, and a per-bucket
+split must sum to it. ★ **That sum is the cross-check that catches a mis-bucketed or double-counted
+row, and it is the only reason the P34 error surfaced at all.**
+
+## ★★★★ NO FOLLOW-UPS. A ROW YOU OPEN, YOU CLOSE — operator ruling 2026-08-26
+
+> *"I'M REALLY UPSET with the follow UPS.... OUR PROJECT SEEMS TO BE A FOLLOW UP!! THIS MUST STOP
+> NOW."* … *"opened anchors that are not closed in the immediate cycle or the next are brutally
+> rare exceptions now, not the rule. found something new that must be done? DO IT. Priority
+> production, then harness. Fix harnesses immediately when they become a blocker."* … *"If I keep
+> seeing anchors rising after implementations or fixes I'll be really pissed!"*
+
+**This section is the enforcement of [[feedback-close-do-not-file]], which existed as a ruling
+since 2026-08-24 and — ✔MEASURED 2026-08-26 — had NEVER BEEN WRITTEN INTO EITHER SKILL. That is
+exactly why it eroded: a ruling that lives only in a memory index has no teeth at the moment of
+the decision. The absence of this section IS the defect this section closes.**
+
+### The rule
+
+1. **A row you open, you close — in this cycle, or the next one.** Longer than that is a
+   **brutally rare exception**, and an exception must be NAMED as one in the row, with the reason
+   it could not be closed and the predicate that will close it.
+2. **"Found something new that must be done?" → DO IT.** Discovering work is not a licence to
+   file it. A new row is the LAST RESORT, never the first response to a finding.
+3. **Priority is PRODUCTION, then harness. A harness defect that BLOCKS you is fixed the moment
+   you face it** — in this cycle, in the lane that hit it. Never later.
+4. **"Refused but not fixed" is NOT closed.** Neither is "measured and understood". Neither is
+   "the row now describes the real scope". A row closes when the BEHAVIOUR changed.
+
+### The gate — this is measured, not asserted
+
+`scripts/check-anchor-balance/check-anchor-balance.py` **already** implements
+*"a cycle may not end with more OPEN deferral rows than it began"*, comparing **by row name**
+across every sanctioned home. Run it against the cycle's OWN start commit and treat a rise as a
+**HARD STOP**, not a note:
+
+```
+python scripts/check-anchor-balance/check-anchor-balance.py --base <cycle-start-sha> --breakdown
+```
+
+⚠ **The delta the operator cares about is NET OPEN, and it must be ≤ 0.** A cycle that closes
+three and opens three has, from outside, done nothing. Report closed / opened / **net** as three
+separate numbers in the cycle report — a single total hides exactly the thing being asked about.
+
+### ⚠ A row that is SHIPPED but not marked ✅ is an anchor "rising" for free
+
+✔MEASURED 2026-08-26, and it is why this warning is here rather than in prose somewhere: of the
+15 `D-OPT*` rows the instrument reported OPEN, **three were shipped work** —
+`D-OPT-NOOPTIMIZE-NEUTERS-POLICY`, `D-OPT-REBUILD-POLICY-NEUTERED-STATE-HOOK`, and
+`D-OPT-REBUILD-MANDATORY-NORMALIZATION`, each whose own status cell opens with
+*"🟢 DESIGN RECORD — SHIPPED 2026-07-29 (TF-C85), NOT deferred work"*, and each verified present
+in the tree (`onFunctionNeutered`, `mandatoryNormalization`, the `funcNoOptimize` neuter, with
+their pins). **They counted as OPEN solely because the status cell begins with 🟢 instead of ✅**
+— the gate's deliberate "open unless explicitly closed" polarity, which is the right polarity and
+must not be softened.
+
+⇒ **The fix is never to relax the instrument. It is to mark a shipped row ✅ at the moment it
+ships.** A design record of landed work is CLOSED work; if it must stay legible as a record, it
+opens `✅ **CLOSED — DESIGN RECORD …**`. **Auditing for this class is part of the cycle**, because
+an inflated OPEN count is indistinguishable from a cycle that is filing instead of fixing — and
+the operator is reading that number.
+
+### ⚠ A LANE THAT **EXITS** DISCHARGES NOTHING — operator, 2026-08-27
+
+> *"if they don't address you must create another lane once they finish using /dss-cycle to
+> address remanescent anchors from current running lanes"*
+
+⚠ **This is not a new ruling — it is the rule above, applied to the one case the text did not
+spell out: the lane that owns the row is GONE.** (Stated as such by the operator when it was first
+written up as if it were new.) The rule binds the lane that opens a row; without this clause, a
+lane's exit silently converts *"my row"* into *"nobody's row"*, and the anchor count stops falling
+while every individual lane still looks compliant.
+
+⇒ **When a lane finishes with assigned rows still OPEN — or having minted an anchor id in source
+without filing its row — the orchestrator SPAWNS A NEW `/dss-cycle` LANE to close the remnants**,
+naming them explicitly. "Next cycle will notice" is the follow-up culture this section ends.
+
+⚠⚠ **AND THE BALANCE GATE IS BLIND TO HALF OF IT. `check-anchor-balance` COUNTS *ROWS*, so an
+anchor cited in source with NO ROW IS INVISIBLE TO IT.** ✔MEASURED P40: it reported **"opened 0"**
+while a finished lane had cited `D-PP-PREDEFINE-REDEFINITION-PARTITION` across **six** files with
+no row anywhere in `.plans/`. Only `scripts/check-anchor-registry/check-anchor-registry.sh` catches
+that class, and there it is the one telling the truth.
+⇒ **Run BOTH before calling a cycle clean. A green balance is NOT evidence that nothing was
+opened.**
+
+✔MEASURED P40, the sideways-move class: `D-FULLC-STDBIT-ADDRESSABLE-FN` was **re-verdicted** from
+*"⏳ DEFERRED, trigger-gated"* to plain 🟠 OPEN by a lane that then exited — better described, still
+open. **"Re-verdicted" is not closed**, exactly as *"refused but not fixed"* is not.
+
+## ★★★ A GATE HOST HOLDS THE REPO AND NOTHING ELSE — operator ruling 2026-08-25
+
+*"keep macos and vps linux arm64 updated with our repo files, and free of stale files/worktrees.
+you own the cleanup."*
+
+**The remote checkout is not a place work accumulates. It is a MIRROR of the tree under test,
+and the cycle owns keeping it one.** A leg that runs against a host holding anything else is
+not testing the tree it reports on.
+
+⚠ **✔MEASURED 2026-08-25 (cycle P34), and it produced a RED that looked like a code defect:**
+the macOS host held **16,312 files against a local 6,660**. `--push` is a `tar` extract and
+**tar extraction never deletes**, so that tree was the UNION of every tree ever pushed —
+including `.plans/_deferred-anchor-registry.md`, deleted locally in the same cycle and still
+sitting there at 6.7 MB. `plan_citations_guard` counted **4908 citations across 213 documents**
+where the live tree has **2853 across 212**, and reddened. The identical guard was `rc=0`
+locally. ★ **The failure named the guard, and the guard was innocent** — hours can go into a
+subject that was never wrong, because a stale remote file is invisible from the driver.
+
+⚠ **AND 9,638 OF THOSE FILES WERE `.claude/worktrees/**` — A FULL COPY OF THE REPO PER LIVE
+AGENT, shipped to the gate host on every push.** That is not merely transport cost: the
+examples runner **globs `examples/<lang>/*`**, and a worktree carries its own `examples/`
+tree, so a gate host holding one can run a corpus belonging to somebody's uncommitted lane
+and report the result as the cycle's.
+
+**The three rules:**
+- **A push is a SYNC, never an accumulation.** `ssh-macos.{sh,ps1}` take `--prune`/`-Prune`
+  and `macos-leg` passes it; the VPS path already had `rsync --delete`. A transport that only
+  adds is a transport that silently diverges.
+- **Worktrees are excluded at the transport, on BOTH carriages.** An agent worktree never
+  belongs on a gate host. ⓘ rsync does NOT delete excluded paths, so adding the exclude does
+  not clean a host that already holds one — that needs an explicit removal, once.
+- **The cleanup is the CYCLE's job, not a thing to notice later.** Before a leg is trusted,
+  the host holds the repo and nothing else.
+
+★ **The general form, which is the part worth carrying: ask what the remote tree IS, not what
+you last sent it.** Every reasoning error here came from thinking about the PUSH — "I sent the
+right files" — when the question is what the far side now CONTAINS. The same distinction that
+makes `git status` worth reading after a merge you are sure about.
+
+⚠ **This narrows, and does not repeal, the standing order against cleaning those hosts.** No
+`git clean`, no `reset --hard`, no `checkout --` on either machine unless the operator names it
+(`macos-leg --reset-to` stays opt-in for exactly that reason). What is authorised is removing
+what the repo does not have: stale files and worktrees.
+⇒ ★★★ **THE OPERATOR NAMED IT ON 2026-08-26. Read the next section — restoring a leg clone is
+now REQUIRED where this paragraph once forbade it, and `scripts/leg-tree/` is the only thing
+that may do it.**
+
+## ★★★ EVERY LEG HOST KEEPS A CLONE, AND THE LEG CLEANS UP AFTER ITSELF — operator ruling 2026-08-26
+
+> *"we should use already cloned repo in each leg [...] you can keep using the sync process you
+> already use, but CLEAN UP the changes after you finish them (you can also use worktree in leg
+> host if needed for parallel legs, clean up also needed). [...] don't forget to check each leg
+> branch before working in it, and also clean up the changes after finished. that's the standard"*
+
+| host | leg repository |
+|---|---|
+| WSL | `~/src/dss-code-prime` |
+| arm64 VPS | `~/src/Github/dss-code-prime` |
+| macOS | `~/src/dss-code-prime` |
+
+**The shape, and all four steps are the standard:**
+1. **PREPARE** — `git fetch`, put the host's clone on the DRIVER's branch at the DRIVER's commit,
+   `git clean -fd`. *This is the "check each leg branch before working in it" clause, and it is
+   done by MOVING the host rather than by asserting about it.*
+2. **SYNC** — the existing rsync/tar carriage, `.git` withheld on **all three** now. The host's
+   own history is the authority; the sync supplies only the working tree.
+3. **RUN** — build + ctest. Repo guards on the **root host only**.
+4. **RESTORE** — `git reset --hard`, `git clean -fd`, `git worktree prune`. On **every** exit
+   path, `die` included.
+
+★ **ONE OWNER: `scripts/leg-tree/leg-tree.sh`.** Both verbs, all three hosts. The two remote legs
+inline its text into their payload (`"$(cat …)"` — command-substitution output is not re-expanded,
+so the script's own `$` and quotes arrive verbatim); the WSL leg sources it. **Never hand-roll
+these git commands in a leg** — that is the four-hand-written-exclude-lists mistake with a
+destructive verb attached.
+
+⚠ **`-fd`, NEVER `-fdx`.** Ignored paths (`build/`, the ccache) are the leg's own working state;
+deleting them buys tidiness and costs every leg a cold rebuild.
+
+⚠ **CLEANUP BELONGS TO THE MODE THAT MADE THE MESS, not to every mode that runs afterwards.**
+✔Caught while wiring this: `remote-leg --mode sync-only` exists to LEAVE a host staged for a
+manual probe, and `--mode test-only` runs over whatever is already there. A restore on exit would
+have deleted the staging as the command returned, and a prepare would have made `test-only` test
+HEAD while reporting on the staged tree. ⇒ `full` prepares and restores; `sync-only` prepares
+only; `test-only` does neither.
+
+⚠ **WHY THIS REPLACED THE OLD ARRANGEMENT.** ✔MEASURED 2026-08-26: the macOS clone sat on branch
+`…-3` at `8cb9afbd` (**three commits back**) with a **2,696-path index under a 2,759-path working
+tree**, while two carriages withheld `.git` and one shipped it. ★ **The cost is not the disk — it
+is that guards ask git questions.** `check-line-endings` reads `git ls-files --eol`;
+`check-shell-portability` had ALREADY been rewritten in 2026-08-22 to stop asking `git ls-files`
+because this very host answered about a commit that deleted `tools/*.sh` in P17 and produced
+**seven violations against files that do not exist**. A host whose git disagrees with its files
+makes every git-reading guard a coin flip, and the flip is invisible from the driver.
+
+★★ **`git worktree prune` IS PART OF RESTORE, and it is the clause a human cleanup cannot cover.**
+✔MEASURED 2026-08-26: both remote hosts carried a registered, `prunable` `dss-probe-6f4aab73`
+worktree from a cycle that never cleaned up — and it **survived the operator's own manual pass**,
+because a stale worktree registration lives in `.git/worktrees/` and **never appears in
+`git status`**. A parallel lane may take a worktree on a leg host; the lane that takes it owns
+removing it.
+
+⚠ **AND THE TILDE DOES NOT EXPAND.** ✔MEASURED against the live VPS on the first run: every leg
+names its repo `~/src/…`, and `cd "$var"` does **not** expand a tilde held in a variable — `~` is
+expanded only where it appears unquoted in the source text. `leg-tree` normalises the path once,
+where both verbs share it. ★ The dangerous half was not the failed `cd`: `restore` returns 0 when
+the directory is missing, so an unexpanded path would have left every host dirty forever while
+every leg reported success.
+
+## ★★★ A LANE WORKTREE LIVES INSIDE THE REPO, AT `.worktrees/<short-name>` — operator ruling 2026-08-26
+
+> *"I want the worktrees implementation to be inside the project root, .worktrees directory (where
+> 100% of it's internal content ignored by .gitignore). This way we stop contaminating builds
+> outside repository bounds."* … *"worktrees MUST be ignored by ALL host copies to run legs"*
+
+**This SUPERSEDES the short-absolute-root convention** (`C:/dssp40k`, `C:/dss-<cycle><lane>-rod`).
+A worktree outside the repository is a full checkout — plus its `build/` — that nothing owns and no
+guard can see. ✔MEASURED 2026-08-26: the tree was already carrying **9,661 files / 410 MB** of
+orphaned checkouts under `.claude/worktrees/`, three full copies, one of them 287 MB, and
+**`git worktree list` knew about none of them**.
+
+**★ ONE OWNER: `scripts/lane-worktree/lane-worktree.sh`** (`add` / `remove` / `list`) — the same
+shape as `scripts/leg-tree/`, and binding for the same reason: **never hand-roll `git worktree add`
+in a lane.**
+
+```bash
+bash scripts/lane-worktree/lane-worktree.sh add k      # -> <repo>/.worktrees/k
+bash scripts/lane-worktree/lane-worktree.sh remove k   # removes AND prunes
+```
+
+Four clauses, and each is measured rather than asserted — detail in `references/worktrees.md` §H.0b:
+
+1. **`.gitignore`'s `/.worktrees/` rule is what satisfies the "ALL host copies" clause.** The
+   carriages derive their exclude list from git (`scripts/carriage-excludes/`), so that one line is
+   what stops four full repo copies riding to macOS and the arm64 VPS on every push. It is ALSO
+   pinned in that script's `MUST_NEVER_TRAVEL` floor, which re-asks git and **refuses the carriage**
+   if the line is ever edited away (refusal arm exercised: exit 3, naming `.worktrees/`).
+2. ⚠ **The MAX_PATH budget is now SPENT, not slack.** The move costs **46 characters** on every
+   build path: longest build-relative suffix **163**, so `C:/dssp40k` had **87 spare** and
+   `.worktrees/k` has **46**. `lane-worktree.sh` refuses by arithmetic any root leaving under 20,
+   naming `D-CYCLE-WORKTREE-UNDER-THE-SESSION-SCRATCH-PATH-CANNOT-BE-BUILT-ON-WINDOWS` — the defect
+   whose failure mode is a per-TU compile error in files the lane never touched.
+   ⇒ **Keep lane names SHORT** (`k`, `l`, `rod`); a descriptive name spends that margin.
+3. **The lane that takes a worktree owns removing it**, via `remove` — which prunes, because a stale
+   registration lives in `.git/worktrees/` and **never appears in `git status`**.
+4. ⚠ **`-fd`, never `-fdx`.** `git clean -fd` does not delete ignored paths, so a live worktree
+   survives a leg restore; `-fdx` would destroy it mid-build.
+
+✔**The move was measured, not hoped:** a real 2,792-file worktree at `.worktrees/probe` moved
+**zero** of the 16 runnable registered guards — identical verdicts and output volume — and
+`git status` reported 0 lines for it.
+
 ## The pause-and-ask gate — the most important behavioral rule
 
 The loop is autonomous for **execution** and escalates **decisions**. When any of these appears,
@@ -88,6 +380,45 @@ the references' acceptance genuinely IS conditional (under `__STRICT_ANSI__` the
 `__asm__`), so a **trigger-gated** row was opened for the day a strict-conformance mode ships —
 the §B's original concern preserved and made testable, without holding the fix hostage to it.
 
+### ★★★★ A TRIGGER WAITING ON A COMPONENT *WE* BUILD IS NOT A GATE (operator ruling 2026-08-26)
+
+> *"if C has any intrinsic, good time to build the intrinsic then the OPT"* … *"if [it] needs
+> something also to be built that can be built, build the one that can be built, then the
+> [gated row]"*
+
+Said while overruling the two rows a cycle had defended as *"legitimately gated"*.
+
+**The distinction, and it silently re-verdicts a large slice of the registry's ⏳ rows —
+classify every gated row by WHO OWNS THE TRIGGER:**
+- **Outside us** → genuinely gated: an operator decision, a profile from a real workload, an
+  upstream project, a hardware platform we do not have.
+- **A component of THIS compiler** → **NOT gated.** It is a two-part task that was written down
+  as one part. **Build the prerequisite, then close the row — in the same cycle.**
+
+⚠ **§E#5 (don't build a consumer-less mechanism) DOES NOT APPLY when the missing consumer is
+itself something we are supposed to build.** That is the exact misreading this ruling corrects.
+The test is still *"does a consumer exist?"* — what changed is that **a consumer we are committed
+to building counts**, so the honest response is to build it now, not to record that it is absent.
+⇒ And filing the prerequisite as its own new row is the follow-up habit wearing a different hat.
+
+★ **Prefer a prerequisite that unblocks MORE THAN ONE row, and name which when you pick it.**
+✔The case that produced the ruling: an escape-analysis / points-to substrate for `mirMayAlias` is
+the stated trigger for `D-OPT-MEMSSA-WALK-PAST-PRECISION` **and** the stated prerequisite for
+`D-OPT7-INLINE-LEGALITY-GATE` clause (c). One substrate, two rows.
+
+⚠ **CHECK THE TREE BEFORE CALLING THE PREREQUISITE MISSING.** ✔MEASURED 2026-08-26: DSS's HIR
+intrinsic registry was about to be described as absent. It EXISTS — `HirIntrinsicRegistry`,
+`Hir::intrinsicRegistry()`, `makeIntrinsicCall`, and a shipped `D-CSUBSET-INTRINSIC-UMULH`
+builtin-intrinsic node. Only the *routing* of a shipped C construct through it is missing, which
+is a far smaller job than the row implied.
+
+⚠ **AND THE MIRROR-IMAGE ERROR, corrected by the operator the SAME DAY: scheduling lives in the
+PLANS, not in the tree.** A cycle concluded from `src/dss-config/targets/` holding only
+little-endian `x86_64` and `arm64` that the big-endian trigger *"had not fired"* — while it is
+operator-sequenced as plan 23 **FC19** with a toolchain verified by execution. ★ **The absence of
+a thing in the tree is not evidence that it is unscheduled.** Read a trigger predicate against
+the plans AND the tree, never the tree alone.
+
 ## Workflow
 
 **Delegation is the default** — see the file map. The orchestrator judges; it should not be the one
@@ -101,6 +432,9 @@ hand-typing every edit or reading every subsystem.
 1. **Pick the next priority** from §0.1, top-to-bottom. An explicit argument overrides the auto-pick
    but is still subject to the bar, the pause gate, and the hard-stop checks. If §0.1 is dry, promote
    an *eligible* anchor (unconditional, or trigger already fired) into §0.1, then pick it.
+   ★★★ **The candidate set is `_deferred-anchor-registry-production.md` — ALWAYS** (operator, 2026-08-25). A harness row
+   enters a cycle only by BLOCKING the production priority (step 2), never on its own ticket; and a
+   harness defect you FACE is fixed in this cycle, never filed for later. See the ruling above.
 2. **Clear blockers FIRST** — from the §0.1 "Blocked by" column *and* the registry *and* any
    "requires deferrals" note. Highest-priority blocker first, before the priority itself.
 3. **Plan it** — delegate to `/feature-dev:feature-dev` or a `Plan` / `code-architect` agent.
@@ -120,8 +454,9 @@ hand-typing every edit or reading every subsystem.
    `src/dss-config/**` is a FILE SET like any other, and a config document is an INPUT to
    every lane's build. Editing one while a lane is running does not merely risk a merge
    conflict — it changes what that lane's binaries MEAN between two runs.
-   ⚠ ✔MEASURED 2026-08-20 (cycle P22, `D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-
-   OWNERSHIP`): the orchestrator corrected a relocation `nativeId` while a lane was mid
+   ⚠ ✔MEASURED 2026-08-20 (cycle P22,
+   `D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-OWNERSHIP`): the orchestrator
+   corrected a relocation `nativeId` while a lane was mid
    red-on-disable run. A test's verdict flipped between two runs of the same binary, and the
    lane reported a stale tree as a defect in its final report. **The damage is not the wasted
    report — it is that a red-on-disable observation is the ONE measurement this project
@@ -130,6 +465,45 @@ hand-typing every edit or reading every subsystem.
    until the lanes that read it have reported, or hand it to a lane that owns it. Re-measure
    anything a lane reported across such an edit before acting on it — and when a lane's
    report and the tree disagree, suspect the SEQUENCING before suspecting the lane.
+   ★★★★ **HANDING `src/dss-config/**` TO A LANE DOES NOT FIX THIS — IT ONLY MOVES WHOSE
+   HAND IS ON IT, AND ✔THE HAZARD RECURRED THAT WAY ON 2026-08-26 (cycle P38).** The P22
+   row [[D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-OWNERSHIP]] is CLOSED and the
+   mechanism it built is sound; what recurred was the SCHEDULING. A lane was given
+   `src/dss-config/targets/**` + `src/core/types/target_schema.*` and run CONCURRENTLY
+   with three lanes that gate — so `test_support/test_config_snapshot` reddened in one
+   lane and `core/test_target_schema` was momentarily UNCOMPILABLE in another, neither
+   caused by the lane reporting it. ★ **`test_config_snapshot` WAS RIGHT AND MUST NOT BE
+   "FIXED": it deliberately compares the run's snapshot against the LIVE tree, which is
+   the only clause proving the copy is still taken at ctest RUN time.** Softening it to
+   stop the flap would delete the mechanism's honesty check to hide an orchestration
+   error — the *guard weakened every time it fires* failure, exactly.
+   ⇒ **THE RULE: at most ONE lane may hold `src/dss-config/**` or `src/core/types/*schema*`
+   at a time, and NO OTHER LANE'S ctest VERDICT IS TRUSTWORTHY WHILE IT DOES.** Either
+   sequence that lane alone, or treat the concurrent lanes' gates as PROVISIONAL and
+   re-gate the integrated tree once it is quiescent. ★ A lane reporting "N-1/N, the one
+   red is another lane's config edit" has diagnosed it correctly — that report is a
+   SEQUENCING finding, and the integration gate, not the lane, is what settles it.
+   ★★ **AND THE TREE THAT RULE NAMES IS TOO NARROW: `.plans/**` IS AN INPUT TO A
+   GUARD, AND A GUARD IS A CTEST ENTRY, SO EVERY LANE'S GATE READS IT.**
+   ⚠ ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-THE-ORCHESTRATOR-EDITED-PLANS-UNDER-A-RUNNING-LANE-AND-FLIPPED-ITS-GATE`):
+   a lane's `plan_citations_guard` was RED in one gate and GREEN in the next **with no edit
+   of its own in between**, because the orchestrator applied registry rows and re-baselined
+   the citation ratchet while that gate was in flight. `anchor_registry_guard`,
+   `plan_citations_guard`, `check-anchor-balance`, `check-stale-refusal-citations` and
+   `check-retyped-closed-sets` all take `.plans/**` as their SUBJECT ⇒ a row written
+   mid-gate moves a lane's verdict exactly as a config edit moves a lane's binary.
+   ★ **THE DIRECTION THAT COSTS SOMETHING IS THE FLATTERING ONE.** That guard went
+   red→GREEN, so the lane could have concluded its earlier red was a flake and stopped
+   looking. It measured instead and named the mechanism, which is the only reason this is
+   written down rather than sitting in a wrong number.
+   ⇒ the orchestrator announces `src/dss-config/**` **and `.plans/**`** among its owned
+   paths, and holds a row application or a ratchet re-baseline until the lanes whose gates
+   read them have reported — the same hold it already owes a config edit.
+   ★★ **THE GENERAL FORM, WHICH IS THE PART WORTH CARRYING: ASK WHAT A FILE IS AN
+   INPUT TO, NOT WHICH DIRECTORY IT LIVES IN.** Both instances of this defect came from
+   reasoning about the directory — the first framed the hazard as *a config document is
+   an input to the compiler* and so stopped at `src/dss-config/**`. Any tree a GUARD takes
+   as its subject is a shared input, whatever it is called.
    ★★ **A LANE THAT BUILDS GETS ITS OWN BUILD TREE.** File ownership is not enough, because
    two lanes with disjoint FILE sets still collide in a shared `build/`: one relinks the DLL
    while the other is mid-`ctest`. ⚠ ✔MEASURED 2026-08-20 (cycle P22): `0xc0000043`
@@ -215,6 +589,90 @@ hand-typing every edit or reading every subsystem.
    ★ The reusable half: **an instruction that names the recipient's scope can be REFUTED by the
    recipient; one that only names the work cannot.** Redundancy in the addressing is what makes
    mis-delivery detectable at the destination, which is the only place it can still be caught.
+   ★★ **THE DELIVERABLE TRAVELS IN THE REPORT, NEVER AS A PATH — AND THE BRIEF SAYS SO.** A lane's
+   registry row text, its red-on-disable transcript, its md5s and any number the fold will quote come
+   back INLINE in the reply. `scratchpad/<cycle>/<lane>/` keeps its P23 job — a private place for
+   harnesses and intermediates — and stops being a place a RESULT is left.
+   ⚠ ✔MEASURED 2026-08-24 (cycle P31,
+   `D-CYCLE-A-LANE-DELIVERABLE-LEFT-IN-THE-SCRATCHPAD-IS-INVISIBLE-TO-THE-FOLD`): TWO lanes in one
+   cycle reported by citing a path, and both paths were empty when the orchestrator read them — one
+   of them holding the lane's **registry row**, which IS that lane's deliverable, and the other a
+   483-row byte-identity baseline taken at a named commit.
+   ★ **The mechanism is an interaction between two rules that are each correct alone**, which is why
+   neither side looked wrong: `scratchpad/` is gitignored, and a `git worktree` gets **no copy of an
+   ignored directory** — so a lane working in a worktree writes into a scratchpad the main tree does
+   not have, while the orchestrator reads one the lane never wrote to. Do NOT "fix" this by
+   un-ignoring `scratchpad/`: it holds build spill and half-written harnesses, and it would not help
+   the worktree half at all, because the ignore rule is not what separates the two trees.
+   ⇒ **The one-line test to put in the brief:** *if the orchestrator would have to open a file to
+   fold your work, the work is not reported yet.*
+   ⇒ **A lane that uses a `git worktree` NAMES IT in its report**, because the orchestrator must
+   `git worktree remove` it at the fold and cannot remove one it does not know about.
+   ★★ **AND BEFORE EDITING A FILE YOU OWN, COPY IT INTO YOUR SCRATCH DIRECTORY — that
+   copy is your ONLY sanctioned undo.** The standing order forbids `git stash` / `checkout --` /
+   `clean` / `reset` because the tree is shared, and that prohibition is correct and stays
+   BLANKET. ⚠ But it was SILENT about a need it creates: a lane that corrupts its own
+   exclusively-owned file has no way back except the one thing it is forbidden to do.
+   ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-THE-NEVER-CHECKOUT-RULE-LEAVES-A-LANE-NO-WAY-TO-UNDO-ITS-OWN-EDIT`):
+   a lane ran `git checkout -- <its own config file>` to undo a malformed patch of its own, then
+   disclosed it unprompted. ★ **The disclosure is the only reason anyone knows** — a restored
+   file looks exactly like a file that was never edited, so this violation leaves nothing in any
+   diff, which makes it the one class of rule-break that cannot be caught after the fact.
+   ⇒ restore from your scratch copy: it restores exactly one file, cannot reach another lane's
+   work even by mistake, and needs no judgement about what `--` would have swept.
+   ★ The distinction to hold: **the ban is on the INSTRUMENT, not on the intent.** Undoing your
+   own bad edit is legitimate; doing it with a tree-wide tool is not. And the prohibition keeps NO
+   carve-out for "only my own files" — a tired lane applies that to a file it merely BELIEVES
+   it owns, which is the case the rule exists for.
+   ★★ **A BYTE-IDENTITY BASELINE IS TAKEN AS AN ISOLATING PAIR, NEVER INHERITED —
+   AND IN A SHARED TREE ITS SHELF LIFE IS MEASURED IN HOURS.**
+   ⚠ ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-A-BYTE-IDENTITY-BASELINE-EXPIRES-WHEN-THE-SHARED-TREE-MOVES`):
+   a lane diffed a predecessor's 483-row baseline, taken two hours earlier at the same commit, and
+   got **13 differing lines with 8 examples flipping to NO-ARTIFACT — none of them its own**. A
+   sibling lane's front-end work had landed in between, while the instrument's `cfgroot` snapshot
+   still pinned HEAD's language document.
+   ★ **The trap is that both failure modes produce the SAME diff:** *"my change moved these
+   bytes"* and *"the world moved underneath my baseline"* are indistinguishable by looking, and only
+   one is a defect. A lane that trusts an inherited baseline either hunts a regression it did not
+   cause, or — worse — accepts 13 moved rows as noise and misses a real one.
+   ⇒ **Take BOTH halves yourself:** revert only YOUR files to HEAD with
+   `git cat-file -p HEAD:<path>` (never `checkout --` or `stash`, which reach the whole shared
+   tree), leave every other lane's work in place, take the BEFORE; restore your files, take the
+   AFTER. Both runs then see the same sibling state, so your diff is the only variable left. ✔That
+   is what produced that lane's result: **zero differing lines in 486 pre-existing rows**, the final
+   manifest differing by exactly one ADDED row for its new example.
+   ★ Two corollaries, each paid for: **an inherited baseline is usable only with a CONTROL** that
+   re-derives a handful of its rows against the live tree — cheap, and it separates stale from
+   broken in one run; and **a baseline's identity is the CONFIG SNAPSHOT plus the commit**, not the
+   commit alone, so an instrument pinning a `cfgroot` must record which one and a reader must never
+   assume HEAD.
+   ⭐ **AND A PATH THAT SOMEBODY ELSE MUST RESOLVE IS ABSOLUTE, OR NAMES ITS ROOT.** TWO roots
+   answer to the name `scratchpad/`: the repository's (gitignored) and the SESSION's, under
+   `…/AppData/Local/Temp/claude/<project>/<session>/scratchpad/`, which is outside the repo
+   entirely. A lane writing to one and reporting a bare relative path sends the orchestrator to the
+   other, and both readings are plausible.
+   ★★★ **AND THE CLAUSE THE ORCHESTRATOR'S OWN ERROR HERE ADDS, WHICH BINDS EVERY
+   PARTY: A NEGATIVE RESULT CARRIES THE SCOPE IT WAS TAKEN OVER.** ⚠ ✔MEASURED 2026-08-24
+   (cycle P31): the orchestrator ran `find` over the REPO root, found none of a lane's seven
+   instruments, and told that live lane *"✔MEASURED just now: none of them exists"*. They were
+   intact in the session root the whole time — the search could not have seen them. The lane
+   began rebuilding a 483-row byte-identity baseline on that word, and the next hazard was a
+   reconstructed baseline reconciled against a real one: a claim with two provenances and no way to
+   separate them. ⇒ *"not found under `<root>`"* is a measurement; *"does not exist"* is a claim
+   the instrument did not make. Before telling a lane something of its own is missing, search every
+   root that could hold it — and prefer **asking the lane where it put the thing**, since it is
+   the one party that knows. ★ This is the same species as a lane's vacuous key-name scan and as
+   a guard clause that cannot fire on the gating leg: **a SCOPED instrument reporting an UNSCOPED
+   claim.** It is worse from the orchestrator, because a lane can refute its brief, while a lane
+   cannot easily refute a measurement handed down as fact.
+   ★★ **AND A BRIEF THAT RELAYS A PRIOR LANE'S ARTIFACT MUST OPEN ONE OF THEM FIRST**, or say
+   *"unverified, rebuild your own"*. Same measurement: the replacement brief for that second lane
+   asserted its scratchpad *"ALREADY CONTAINS the instruments and baselines"* and named seven files,
+   relayed from the prior lane's report with none of them opened — this section's own
+   run-it-before-you-write-it rule, violated one level up by the party that enforces it. ★ The
+   damage that was nearly done is the instructive part: not wasted effort, but a **RECONSTRUCTED
+   baseline presented as the prior lane's** — a byte-identity claim with no provenance, which is
+   evidence-shaped and worth nothing.
 6. **Review and fold** — `/pr-review-toolkit:review-pr`, plus the agnosticism pass and the CI-hazard
    screen. ★★ **If this cycle created or modified a `.sh`/`.ps1` pair, TWIN PARITY IS PART OF THIS
    STEP** — same inputs, same properties, same flags, same exit codes, both siblings changed in this

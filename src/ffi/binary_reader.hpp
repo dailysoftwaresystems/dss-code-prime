@@ -90,7 +90,7 @@ struct DSS_EXPORT BinaryReadError {
 // diagnosed rather than silently dropped (-Wattributes). Public-header exposure
 // is unaffected: visibility here comes from the definition being in the header,
 // never from the macro. Same rule the tree_node.hpp free operators already
-// follow (see .plans/01-tree-node-model-plan - ok.md:459).
+// follow (see the `DSS_EXPORT` note in `.plans/01-tree-node-model-plan - ok.md`).
 [[nodiscard]] constexpr bool
 rangeExceedsBuffer(std::uint64_t off, std::uint64_t size,
                    std::uint64_t totalSize) noexcept {

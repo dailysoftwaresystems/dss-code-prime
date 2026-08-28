@@ -169,6 +169,26 @@ HeaderSearchResult findInDirs(std::string_view              filename,
     return HeaderSearchResult::notFound();
 }
 
+fs::path includingDirectoryOf(std::string_view sourceName) {
+    // No NAME at all -> no including FILE. Stays empty so the callers' self-dir
+    // guard skips the arm; see the header for why that case must not collapse
+    // into the working-directory one.
+    if (sourceName.empty()) return {};
+    fs::path const dir = fs::path{sourceName}.parent_path();
+    if (!dir.empty()) return dir;
+    // A bare name (`main.c`) names a file in the PROCESS WORKING DIRECTORY.
+    // `.` is a real directory the searches below can enumerate; the empty path
+    // is not -- MEASURED on this project's own toolchain, `fs::exists("h.h")`
+    // is cwd-relative and answers TRUE, but `fs::directory_iterator{fs::path{}}`
+    // fails with "Not a directory", so `descend` returns NotFound down BOTH the
+    // CaseSensitive and CaseInsensitive arms. That is why removing the callers'
+    // `!includingDir.empty()` guard would not have fixed anything: the defect is
+    // the derivation, not the guard.
+    // `.` is in C's basic character set, so no `L`-prefix / `#ifdef` is needed
+    // for the native-`wchar_t` build (same reasoning as `kDotChar` above).
+    return fs::path{"."};
+}
+
 HeaderSearchResult resolveIncludePath(std::string_view              filename,
                                       fs::path const&               includingDir,
                                       std::span<fs::path const>     includeDirs,

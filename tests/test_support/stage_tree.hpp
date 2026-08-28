@@ -25,7 +25,7 @@
 // `std::error_code` / `std::optional` / `<fstream>`, so it lifted verbatim; the
 // only edit was moving the `namespace fs` alias inside this header's namespace.
 // That matters beyond convenience: the two runners are different binaries with
-// different link sets (`dss_examples_runner` links dss-code-prime-lib + GTest;
+// different link sets (`dss_examples_runner` links dsscp-lib + GTest;
 // `integrated_tests` links nlohmann_json alone and drives the compiler as a
 // SUBPROCESS), so a shared home that needed either of those would not be shared.
 //
@@ -210,14 +210,14 @@ namespace fs = std::filesystem;
         {"main.c",
          "int main(void) { return 42; }\n"},
         {"dep_module/.dss-project.json",
-         "{\"language\":\"c-subset\",\"sources\":[\"src/*.c\"]}\n"},
+         "{\"language\":\"c\",\"sources\":[\"src/*.c\"]}\n"},
         {"dep_module/src/lib.c",
          "int dep_answer(void) { return 7; }\n"},
         {"dep_module/data/expected.json",
          "{\"note\":\"example DATA two levels down, not the manifest\"}\n"},
     };
     static constexpr char const* kManifestBody =
-        "{\"language\":\"c-subset\",\"source\":\"main.c\",\"exitCode\":42}\n";
+        "{\"language\":\"c\",\"source\":\"main.c\",\"exitCode\":42}\n";
 
     std::string findings;
     std::size_t findingCount = 0;

@@ -12,7 +12,7 @@
 //
 // ★★ THIS IS DEFENCE IN DEPTH, AND THE DEPTH IS THE POINT. The C front end now
 // refuses a symbolic name used twice in one statement
-// (`S_InlineAsmDuplicateSymbolicName`), so no c-subset source can reach these
+// (`S_InlineAsmDuplicateSymbolicName`), so no c source can reach these
 // shapes — which is exactly why they are BUILT BY HAND here. The tier that mints
 // the spellings and the tier that binds them are two tiers apart, and this one
 // has producers that never run the C semantic pass at all: the LSP, the FFI
@@ -135,7 +135,7 @@ struct AsmModule {
 // entries publish the same bracketed form.
 //
 // ⚠ BOTH LABEL BLOCKS ARE DISTINCT HERE, which is the stronger shape: from
-// c-subset a repeated label name resolves to ONE block through
+// c a repeated label name resolves to ONE block through
 // `getOrCreateLabelBlock`, so the two rows would name the same MIR block. A
 // direct producer is under no such constraint, and the row set is what this tier
 // can see.

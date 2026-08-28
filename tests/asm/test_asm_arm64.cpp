@@ -128,8 +128,7 @@ TEST(Arm64Encoder, BlrX9EncodesD63F0120) {
     ASSERT_TRUE(retOp.has_value());
     auto const x9 = (*s)->registerByName("x9");
     ASSERT_TRUE(x9.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const r_x9{static_cast<std::uint32_t>(*x9), 1, cls};
+    LirReg const r_x9 = makePhysicalReg(static_cast<std::uint32_t>(*x9), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -187,7 +186,7 @@ TEST(Arm64Encoder, UnreachableEncodesD4200000) {
 // Rd=Rn=sp=31), NOT the shifted-register SUB (0xCB000000) where reg 31
 // = XZR would compute `sp - 0` and silently discard the size. A byte
 // regression here is a silent stack miscompile the qemu run also
-// catches (examples/c-subset/c99_vla) — this is the host-independent
+// catches (examples/c/c99_vla) — this is the host-independent
 // red-on-disable pin.
 
 TEST(Arm64Encoder, SubSpRegEncodesExtendedRegisterWord) {
@@ -202,9 +201,8 @@ TEST(Arm64Encoder, SubSpRegEncodesExtendedRegisterWord) {
     auto const sp = (*s)->registerByName("sp");
     auto const x9 = (*s)->registerByName("x9");
     ASSERT_TRUE(sp.has_value() && x9.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const r_sp{static_cast<std::uint32_t>(*sp), 1, cls};
-    LirReg const r_x9{static_cast<std::uint32_t>(*x9), 1, cls};
+    LirReg const r_sp = makePhysicalReg(static_cast<std::uint32_t>(*sp), LirRegClass::GPR);
+    LirReg const r_x9 = makePhysicalReg(static_cast<std::uint32_t>(*x9), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -238,9 +236,8 @@ TEST(Arm64Encoder, SpCopyEncodesAddImmZero) {
     auto const sp  = (*s)->registerByName("sp");
     auto const x29 = (*s)->registerByName("x29");
     ASSERT_TRUE(sp.has_value() && x29.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const r_sp{static_cast<std::uint32_t>(*sp), 1, cls};
-    LirReg const r_x29{static_cast<std::uint32_t>(*x29), 1, cls};
+    LirReg const r_sp = makePhysicalReg(static_cast<std::uint32_t>(*sp), LirRegClass::GPR);
+    LirReg const r_x29 = makePhysicalReg(static_cast<std::uint32_t>(*x29), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -279,9 +276,8 @@ TEST(Arm64Encoder, MovX0FromX1EncodesORR) {
     auto const x0 = (*s)->registerByName("x0");
     auto const x1 = (*s)->registerByName("x1");
     ASSERT_TRUE(x0.has_value() && x1.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const r_x0{static_cast<std::uint32_t>(*x0), 1, cls};
-    LirReg const r_x1{static_cast<std::uint32_t>(*x1), 1, cls};
+    LirReg const r_x0 = makePhysicalReg(static_cast<std::uint32_t>(*x0), LirRegClass::GPR);
+    LirReg const r_x1 = makePhysicalReg(static_cast<std::uint32_t>(*x1), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -312,11 +308,8 @@ TEST(Arm64Encoder, MovX19FromX2DerivesBitFields) {
     ASSERT_TRUE(s.has_value());
     auto const movOp = (*s)->opcodeByMnemonic("mov");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const dst{
-        static_cast<std::uint32_t>(*(*s)->registerByName("x19")), 1, cls};
-    LirReg const src{
-        static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
+    LirReg const dst = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x19")), LirRegClass::GPR);
+    LirReg const src = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x2")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -362,8 +355,7 @@ TEST(Arm64Encoder, CsetEncodesInvertedCondAtBits12) {
     auto const setccOp = (*s)->opcodeByMnemonic("setcc");
     auto const retOp   = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(setccOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
 
     auto const encodeCset = [&](TargetCondCode cc) {
         LirBuilder b{**s};
@@ -408,9 +400,8 @@ TEST(Arm64Encoder, ZextEncodesOrrW) {
     auto const zextOp = (*s)->opcodeByMnemonic("zext");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(zextOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -443,9 +434,8 @@ TEST(Arm64Encoder, NegEncodesSubFromXzr) {
     auto const negOp = (*s)->opcodeByMnemonic("neg");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(negOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -477,9 +467,8 @@ TEST(Arm64Encoder, NotEncodesMvnFromXzr) {
     auto const notOp = (*s)->opcodeByMnemonic("not");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(notOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -517,10 +506,9 @@ TEST(Arm64Encoder, SdivEncodesDataProc2Source) {
     auto const sdivOp = (*s)->opcodeByMnemonic("sdiv");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(sdivOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
-    LirReg const x2{static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
+    LirReg const x2 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x2")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -558,10 +546,9 @@ TEST(Arm64Encoder, UdivEncodesDataProc2SourceHighRegs) {
     auto const udivOp = (*s)->opcodeByMnemonic("udiv");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(udivOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x3 {static_cast<std::uint32_t>(*(*s)->registerByName("x3")),  1, cls};
-    LirReg const x4 {static_cast<std::uint32_t>(*(*s)->registerByName("x4")),  1, cls};
-    LirReg const x14{static_cast<std::uint32_t>(*(*s)->registerByName("x14")), 1, cls};
+    LirReg const x3 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x3")), LirRegClass::GPR);
+    LirReg const x4 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x4")), LirRegClass::GPR);
+    LirReg const x14 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x14")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -599,10 +586,9 @@ TEST(Arm64Encoder, UmulhEncodesDataProc3SourceHighRegs) {
     auto const umulhOp = (*s)->opcodeByMnemonic("umulh");
     auto const retOp   = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(umulhOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x3 {static_cast<std::uint32_t>(*(*s)->registerByName("x3")),  1, cls};
-    LirReg const x4 {static_cast<std::uint32_t>(*(*s)->registerByName("x4")),  1, cls};
-    LirReg const x14{static_cast<std::uint32_t>(*(*s)->registerByName("x14")), 1, cls};
+    LirReg const x3 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x3")), LirRegClass::GPR);
+    LirReg const x4 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x4")), LirRegClass::GPR);
+    LirReg const x14 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x14")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -642,9 +628,8 @@ assembleArm64Unary(char const* mnemonic, char const* dst, char const* src,
     auto const op    = (*s)->opcodeByMnemonic(mnemonic);
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     EXPECT_TRUE(op.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const rd{static_cast<std::uint32_t>(*(*s)->registerByName(dst)), 1, cls};
-    LirReg const rn{static_cast<std::uint32_t>(*(*s)->registerByName(src)), 1, cls};
+    LirReg const rd = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName(dst)), LirRegClass::GPR);
+    LirReg const rn = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName(src)), LirRegClass::GPR);
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
     auto blk = b.createBlock();
@@ -695,6 +680,130 @@ TEST(Arm64Encoder, RbitX3X4EncodesDataProc1Source) {
     EXPECT_EQ(bytes[3], 0xDA);
 }
 
+// ── D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: the four steps of the vector popcount ──
+//
+// Every word below was VERIFIED AGAINST `aarch64-linux-gnu-as` (binutils 2.42)
+// rather than hand-derived, and the reason is recorded because it cost a
+// debugging round: the first draft of these rows carried hand-converted decimal
+// `fixedWord` values and ALL SIX WERE WRONG — `0x9E670000` had been written as
+// 2657419264, which is `0x9E650000`, i.e. FCVTAU. The compiler happily emitted
+// it, the disassembler read back `fcvtau x29, d16`, and qemu killed the program
+// with SIGILL on the two lane instructions. ⚠ A byte pin whose expected value
+// comes from the same head that wrote the config proves only that the head is
+// self-consistent. These come from the assembler.
+//
+// The registers are deliberately DIFFERENT (Rd=3, Rn=7) so a wire that swapped
+// the two slots — or a variant that placed the source in `rm` instead of `rn` —
+// changes the bytes. Rd rides bits 4:0 and Rn bits 9:5 on all four, so
+// Rn=7<<5=0xE0 | Rd=3 = 0xE3 is the low byte of every expected word.
+
+namespace {
+// The cross-class sibling of `assembleArm64Unary`: the destination and the
+// source can sit in DIFFERENT register banks, which is the whole point of the
+// two move rows and is a shape the GPR-only helper above cannot express.
+[[nodiscard]] std::vector<std::uint8_t>
+assembleArm64UnaryCrossClass(char const* mnemonic,
+                             char const* dst, LirRegClass dstCls,
+                             char const* src, LirRegClass srcCls,
+                             bool width32) {
+    auto s = TargetSchema::loadShipped("arm64");
+    EXPECT_TRUE(s.has_value());
+    auto const op    = (*s)->opcodeByMnemonic(mnemonic);
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    EXPECT_TRUE(op.has_value()) << "arm64 declares no `" << mnemonic << "`";
+    EXPECT_TRUE(retOp.has_value());
+    if (!op.has_value() || !retOp.has_value()) return {};
+    auto const dstOrd = (*s)->registerByName(dst);
+    auto const srcOrd = (*s)->registerByName(src);
+    EXPECT_TRUE(dstOrd.has_value() && srcOrd.has_value());
+    if (!dstOrd.has_value() || !srcOrd.has_value()) return {};
+    // D-LIR-POSITIONAL-LIRREG-INIT-MISCLASSIFIES-SILENTLY. This function
+    // discovered the trap and routed around it LOCALLY, with designated
+    // initializers; the trap itself is now gone — `LirReg` has no aggregate
+    // path at all, so the class argument is typed and the physical/virtual
+    // axis is a named `bool` at the one constructor that exists.
+    LirReg const rd = makePhysicalReg(static_cast<std::uint32_t>(*dstOrd), dstCls);
+    LirReg const rn = makePhysicalReg(static_cast<std::uint32_t>(*srcOrd), srcCls);
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(rn) };
+    (void)b.addInst(*op, rd, ops, /*payload=*/0,
+                    width32 ? ::dss::kLirInstFlagWidth32 : std::uint8_t{0});
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    // ⚠ A COUNT IS NOT A DIAGNOSIS. The GPR-only sibling above asserts only
+    // `errorCount() == 0`, and when this helper first failed that told me two
+    // errors had happened and nothing whatever about which. Carry the reporter's
+    // own text into the failure message so the next reader is not where I was.
+    std::string why;
+    for (auto const& d : rep.all()) { why += "\n    "; why += d.actual; }
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "assembling `" << mnemonic << "` " << dst << " <- " << src
+        << (width32 ? " (width 32)" : " (width 64)") << why;
+    return bytes;
+}
+
+void expectWord(std::vector<std::uint8_t> const& bytes, std::uint32_t word) {
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], static_cast<std::uint8_t>( word        & 0xFF));
+    EXPECT_EQ(bytes[1], static_cast<std::uint8_t>((word >>  8) & 0xFF));
+    EXPECT_EQ(bytes[2], static_cast<std::uint8_t>((word >> 16) & 0xFF));
+    EXPECT_EQ(bytes[3], static_cast<std::uint8_t>((word >> 24) & 0xFF));
+}
+} // namespace
+
+TEST(Arm64Encoder, MovqGprToFpEncodesFmovBothWidths) {
+    // `fmov d3, x7` = 0x9E6700E3 and `fmov s3, w7` = 0x1E2700E3 (assembler-
+    // verified). The width axis is the SOURCE INTEGER width, as on si_to_fp.
+    expectWord(assembleArm64UnaryCrossClass("movq_gpr_to_xmm",
+                                            "d3", LirRegClass::FPR,
+                                            "x7", LirRegClass::GPR,
+                                            /*width32=*/false), 0x9E6700E3u);
+    expectWord(assembleArm64UnaryCrossClass("movq_gpr_to_xmm",
+                                            "d3", LirRegClass::FPR,
+                                            "x7", LirRegClass::GPR,
+                                            /*width32=*/true),  0x1E2700E3u);
+}
+
+TEST(Arm64Encoder, MovqFpToGprEncodesFmovBothWidths) {
+    // `fmov x7, d3` = 0x9E660067 and `fmov w7, s3` = 0x1E260067. ⚠ Bit 16 is the
+    // ONLY thing separating this direction from the one above (opcode 110 vs
+    // 111): one opcode carrying both would silently pick a direction, which is
+    // why they are two rows — the trap x86_64's `movq_xmm_to_gpr` was minted for.
+    expectWord(assembleArm64UnaryCrossClass("movq_xmm_to_gpr",
+                                            "x7", LirRegClass::GPR,
+                                            "d3", LirRegClass::FPR,
+                                            /*width32=*/false), 0x9E660067u);
+    expectWord(assembleArm64UnaryCrossClass("movq_xmm_to_gpr",
+                                            "x7", LirRegClass::GPR,
+                                            "d3", LirRegClass::FPR,
+                                            /*width32=*/true),  0x1E260067u);
+}
+
+TEST(Arm64Encoder, PopcountBytesEncodesLaneCount) {
+    // `cnt v3.8b, v7.8b` = 0x0E2058E3. Q=0 (bit 30 clear) selects the EIGHT-byte
+    // arrangement; setting it would count sixteen bytes, half of them lanes the
+    // entry move zeroed but which a 16B read would still traverse.
+    expectWord(assembleArm64UnaryCrossClass("popcount_bytes",
+                                            "d3", LirRegClass::FPR,
+                                            "d7", LirRegClass::FPR,
+                                            /*width32=*/false), 0x0E2058E3u);
+}
+
+TEST(Arm64Encoder, AddLanesBytesEncodesLaneReduction) {
+    // `addv b3, v7.8b` = 0x0E31B8E3. Byte 2 (0x31 vs CNT's 0x20) is the across-
+    // lanes group plus the reduction opcode; without this instruction the result
+    // is eight separate per-byte counts and not a population count at all.
+    expectWord(assembleArm64UnaryCrossClass("addlanes_bytes",
+                                            "d3", LirRegClass::FPR,
+                                            "d7", LirRegClass::FPR,
+                                            /*width32=*/false), 0x0E31B8E3u);
+}
+
 // ── D-CSUBSET-INTRINSIC-BSWAP: REV16 / REV / REV(X) ──
 //
 // The arm64 byte-reverse trio — the same data-processing 1-source shape as
@@ -713,7 +822,7 @@ TEST(Arm64Encoder, RbitX3X4EncodesDataProc1Source) {
 // `REV32` is the trap: it is X-form only and reverses each 32-bit half
 // independently — NOT a 32-bit byte swap (that is REV at sf=0).
 // ⚠ MEASURED, and it is not hypothetical: the `D-CSUBSET-INTRINSIC-BSWAP` row of
-// `.plans/_deferred-anchor-registry.md` states arm64 declares "16/32/64
+// `.plans/_deferred-anchor-registry*.md` states arm64 declares "16/32/64
 // (REV16/REV32/REV)" — i.e. it prescribes REV32 for the WIDTH-32 slot, which is
 // the wrong instruction (and, being X-form, not even a 32-bit encoding). The
 // shipped config is correct; the registry prose is not. The width-32 test below
@@ -736,9 +845,8 @@ assembleArm64UnaryFlags(char const* mnemonic, char const* dst, char const* src,
     auto const op    = (*s)->opcodeByMnemonic(mnemonic);
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     EXPECT_TRUE(op.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const rd{static_cast<std::uint32_t>(*(*s)->registerByName(dst)), 1, cls};
-    LirReg const rn{static_cast<std::uint32_t>(*(*s)->registerByName(src)), 1, cls};
+    LirReg const rd = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName(dst)), LirRegClass::GPR);
+    LirReg const rn = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName(src)), LirRegClass::GPR);
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
     auto blk = b.createBlock();
@@ -843,9 +951,8 @@ TEST(Arm64Encoder, LdaxrW0X1EncodesLoadAcquireExclusive) {
     auto const ldaxrOp = (*s)->opcodeByMnemonic("ldaxr");
     auto const retOp   = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(ldaxrOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -878,10 +985,9 @@ TEST(Arm64Encoder, StlxrW2W0X1EncodesStoreReleaseExclusiveStatusInRs) {
     auto const stlxrOp = (*s)->opcodeByMnemonic("stlxr");
     auto const retOp   = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(stlxrOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
-    LirReg const x2{static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
+    LirReg const x2 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x2")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -922,9 +1028,8 @@ TEST(Arm64Encoder, LdarW0X1EncodesLoadAcquire) {
     auto const ldarOp = (*s)->opcodeByMnemonic("load_acquire");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(ldarOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -957,9 +1062,8 @@ TEST(Arm64Encoder, StlrW0X1EncodesStoreRelease) {
     auto const stlrOp = (*s)->opcodeByMnemonic("store_release");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(stlrOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -992,9 +1096,8 @@ TEST(Arm64Encoder, StoreSeqCstW0X1IsIdenticalStlr) {
     auto const seqOp = (*s)->opcodeByMnemonic("store_seqcst");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(seqOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1077,11 +1180,10 @@ TEST(Arm64Encoder, MsubEncodesDataProc3Source) {
     auto const msubOp = (*s)->opcodeByMnemonic("msub");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(msubOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
-    LirReg const x2{static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
-    LirReg const x3{static_cast<std::uint32_t>(*(*s)->registerByName("x3")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
+    LirReg const x2 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x2")), LirRegClass::GPR);
+    LirReg const x3 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x3")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1115,11 +1217,10 @@ TEST(Arm64Encoder, MsubWFormEncodesHighRegs) {
     auto const msubOp = (*s)->opcodeByMnemonic("msub");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(msubOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x3 {static_cast<std::uint32_t>(*(*s)->registerByName("x3")),  1, cls};
-    LirReg const x4 {static_cast<std::uint32_t>(*(*s)->registerByName("x4")),  1, cls};
-    LirReg const x14{static_cast<std::uint32_t>(*(*s)->registerByName("x14")), 1, cls};
-    LirReg const x21{static_cast<std::uint32_t>(*(*s)->registerByName("x21")), 1, cls};
+    LirReg const x3 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x3")), LirRegClass::GPR);
+    LirReg const x4 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x4")), LirRegClass::GPR);
+    LirReg const x14 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x14")), LirRegClass::GPR);
+    LirReg const x21 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x21")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1154,8 +1255,7 @@ TEST(Arm64Encoder, MovkLsl16EncodesHwField01) {
     auto const mkOp  = (*s)->opcodeByMnemonic("movk_lsl16");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(mkOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x5{static_cast<std::uint32_t>(*(*s)->registerByName("x5")), 1, cls};
+    LirReg const x5 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x5")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1190,9 +1290,8 @@ TEST(Arm64Encoder, MovkLsl32And48EncodeHwFields10And11) {
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(mk32Op.has_value() && mk48Op.has_value()
              && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x9 {static_cast<std::uint32_t>(*(*s)->registerByName("x9")),  1, cls};
-    LirReg const x21{static_cast<std::uint32_t>(*(*s)->registerByName("x21")), 1, cls};
+    LirReg const x9 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x9")), LirRegClass::GPR);
+    LirReg const x21 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x21")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1234,9 +1333,7 @@ TEST(Arm64Encoder, MovImm16EncodesMOVZ) {
     auto const movOp = (*s)->opcodeByMnemonic("mov");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(movOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x8{
-        static_cast<std::uint32_t>(*(*s)->registerByName("x8")), 1, cls};
+    LirReg const x8 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x8")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1267,9 +1364,7 @@ TEST(Arm64Encoder, MovImm16DerivesBitFields) {
     ASSERT_TRUE(s.has_value());
     auto const movOp = (*s)->opcodeByMnemonic("mov");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x5{
-        static_cast<std::uint32_t>(*(*s)->registerByName("x5")), 1, cls};
+    LirReg const x5 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x5")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1299,9 +1394,7 @@ TEST(Arm64Encoder, ImmediateWiderThanImm16FailsLoud) {
     ASSERT_TRUE(s.has_value());
     auto const movOp = (*s)->opcodeByMnemonic("mov");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{
-        static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1357,10 +1450,9 @@ assembleMovImmWord(TargetSchema const& s, std::string_view destReg,
     auto const movOp = s.opcodeByMnemonic("mov");
     auto const retOp = s.opcodeByMnemonic("ret");
     if (!movOp.has_value() || !retOp.has_value()) return std::nullopt;
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
     auto const regId = s.registerByName(destReg);
     if (!regId.has_value()) return std::nullopt;
-    LirReg const dest{static_cast<std::uint32_t>(*regId), 1, cls};
+    LirReg const dest = makePhysicalReg(static_cast<std::uint32_t>(*regId), LirRegClass::GPR);
 
     LirBuilder b{s};
     (void)b.addFunction(SymbolId{1});
@@ -1498,9 +1590,7 @@ TEST(Arm64Encoder, MovNegativeImmediateRoundTripsToTheOriginalValue) {
     auto const movOp = (*s)->opcodeByMnemonic("mov");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(movOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x1{
-        static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
     auto blk = b.createBlock();
@@ -1578,8 +1668,8 @@ TEST(Arm64Encoder, MovPositiveImmediateStillEncodesMovzAfterMovnLanded) {
 
 namespace {
 [[nodiscard]] LirReg gpr(TargetSchema const& s, std::string_view name) {
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    return LirReg{static_cast<std::uint32_t>(*s.registerByName(name)), 1, cls};
+    return makePhysicalReg(static_cast<std::uint32_t>(*s.registerByName(name)),
+                           LirRegClass::GPR);
 }
 } // namespace
 
@@ -2540,7 +2630,7 @@ TEST(EncodingValidate, RejectsModRmSlotInFixed32Variant) {
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "fixed32",
+                "format": "fixed32", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "fixedWord": 1 },
@@ -2563,7 +2653,7 @@ TEST(EncodingValidate, RejectsRdSlotInX86VariableVariant) {
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -2744,7 +2834,7 @@ TEST(EncodingValidate, MultiWordPerWordSlotReuseLoads) {
             { "mnemonic": "macro", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "fixed32",
+                "format": "fixed32", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["symbol"] },
                     "template": { "fixedWords": [2415919104, 2432696320] },
@@ -2777,7 +2867,7 @@ TEST(EncodingValidate, SameWordSlotDoubleWriteRejected) {
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "fixed32",
+                "format": "fixed32", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "fixedWord": 1 },
@@ -2827,7 +2917,7 @@ TEST(EncodingValidate, MultiWordRejectsWordIndexBeyondTemplate) {
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "fixed32",
+                "format": "fixed32", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "fixedWords": [1, 2] },
@@ -3209,7 +3299,17 @@ TEST(Arm64Encoder, FsturQEncodesByteExact) {
     auto blk = b.createBlock();
     b.beginBlock(blk);
     LirOperand const ops[] = {
-        LirOperand::makeReg(fpr(**s, "d0")),   // q0 shares the d0 ordinal (V register)
+        // ★ THE 128-BIT V VIEW, NOT THE 64-BIT D ONE
+        // (D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD). This line used to
+        // read `fpr(**s, "d0")` with the comment "q0 shares the d0 ordinal",
+        // and that sharing is precisely why the substitution was invisible:
+        // `d0` and `v0` carry the same hardware encoding, so a sixteen-byte
+        // `STUR Qt` naming an EIGHT-byte register emitted the right bytes. The
+        // target's `registerClassOps` binds `fstur_q` as the `vr` class's
+        // store; its data operand is a `vr` register.
+        LirOperand::makeReg(makePhysicalReg(
+            static_cast<std::uint32_t>(*(*s)->registerByName("v0")),
+            LirRegClass::VR)),
         LirOperand::makeReg(gpr(**s, "x1")),
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(0)
@@ -3755,10 +3855,22 @@ TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
     //   * the fpr `move` row (those copies ARE fmov, not the GPR
     //     ORR-alias mov against a D hwEncoding);
     //   * the fpr `store`/`load` rows: AAPCS64 declares d8-d15
-    //     callee-saved + the regalloc allocates callee-saved FIRST,
-    //     so the FPR vregs land in d-regs the prologue must FSTUR-
-    //     spill and the epilogue FLDUR-reload (the exact shape that
-    //     surfaced movsd_store on ms_x64).
+    //     callee-saved, and the FAdd result MUST SURVIVE A CALL, so
+    //     it cannot live in a caller-saved d-reg — the prologue must
+    //     FSTUR-spill a d8-d15 and the epilogue FLDUR-reload it (the
+    //     exact shape that surfaced movsd_store on ms_x64).
+    //
+    // ★★★ THE CALL REPLACED AN ALLOCATOR ACCIDENT (plan 22 OPT8,
+    // 2026-08-26). This fixture had no call and leaned on the
+    // allocator handing out the callee-saved partition FIRST, so the
+    // FSTUR/FLDUR clauses were pinning a leaf function preserving a
+    // register it had no reason to touch. OPT8 taught the allocator
+    // to prefer caller-saved for a range that never crosses a call,
+    // the spill vanished, and these two clauses went red while the
+    // FADD/FCVTZS/FMOV clauses — the instruction-SELECTION subject
+    // this test is named for — never moved. The call makes the
+    // preservation an ABI requirement, so a future allocator cannot
+    // dissolve it again.
     // RED-on-disable lever: strip the arm64 registerClassOps fpr row
     // → classOpHandle fails loud (L_RequiredLirOpcodeMissing, "no
     // 'move' operation for register class 'fpr'") at the arg copy
@@ -3776,8 +3888,16 @@ TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
     MirInstId const b = mb.addArg(1, f64);
     MirInstId const addOps[] = {a, b};
     MirInstId const s = mb.addInst(MirOpcode::FAdd, addOps, f64);
-    MirInstId const cvtOps[] = {s};
-    MirInstId const r = mb.addInst(MirOpcode::FPToSI, cvtOps, i32);
+    // The call `s` must survive. Its result is consumed too, so the
+    // call cannot be judged dead and removed.
+    TypeId const ptrT = interner.pointer(interner.primitive(TypeKind::Void));
+    MirInstId const callee = mb.addGlobalAddr(SymbolId{2}, ptrT);
+    MirInstId const callOps[] = {callee};
+    MirInstId const t = mb.addInst(MirOpcode::Call, callOps, i32);
+    MirInstId const cvtOps[] = {s};   // `s` is READ AFTER the call
+    MirInstId const c = mb.addInst(MirOpcode::FPToSI, cvtOps, i32);
+    MirInstId const sumOps[] = {c, t};
+    MirInstId const r = mb.addInst(MirOpcode::Add, sumOps, i32);
     mb.addReturn(r);
     Mir mir = std::move(mb).finish();
 
@@ -3795,20 +3915,40 @@ TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
     EXPECT_TRUE(containsWordMasked(ws, kFcvtzsMask, kFcvtzsBase))
         << "encoded function must contain FCVTZS Xd, Dn";
 
-    // The AAPCS64 d-register arg path: FMOV copies reading d0 (arg 0)
-    // and d1 (arg 1). Rn (the FMOV source) sits at bits 5..9.
+    // The AAPCS64 d-register arg path: the incoming doubles arrive in d0 and
+    // d1 and must be CONSUMED from there. Two encodings satisfy that, and the
+    // test admits both:
+    //   * an FMOV copying the argument out (Rn at bits 5..9) — what the
+    //     calling-convention materializer emits when the allocator homed the
+    //     parameter somewhere else;
+    //   * the FADD reading d0/d1 DIRECTLY (Rn at 5..9, Rm at 16..20) — which
+    //     is what happens once regalloc PRE-COLORS each parameter into its own
+    //     incoming register (plan 22 OPT8 / D-ML7-2.5) and `maybeMov` therefore
+    //     emits nothing at all.
+    // ⚠ The second form is strictly better code and used to read here as a
+    // failure. The property under test was never "a copy exists" — it is that
+    // the AAPCS64 d-register path is wired, which a direct read proves at
+    // least as well as a copy does.
     bool sawArgFromD0 = false;
     bool sawArgFromD1 = false;
     for (auto const w : ws) {
-        if ((w & kFmovMask) != kFmovBase) continue;
+        bool const isFmov = (w & kFmovMask) == kFmovBase;
+        bool const isFadd = (w & kFaddMask) == kFaddBase;
+        if (!isFmov && !isFadd) continue;
         std::uint32_t const rn = (w >> 5) & 0x1Fu;
         if (rn == 0u) sawArgFromD0 = true;
         if (rn == 1u) sawArgFromD1 = true;
+        if (!isFadd) continue;
+        std::uint32_t const rm = (w >> 16) & 0x1Fu;
+        if (rm == 0u) sawArgFromD0 = true;
+        if (rm == 1u) sawArgFromD1 = true;
     }
     EXPECT_TRUE(sawArgFromD0)
-        << "aapcs64 arg 0 must materialize as an FMOV reading d0";
+        << "aapcs64 arg 0 must be consumed from d0 — either an FMOV copies it "
+           "out or the FADD reads it in place";
     EXPECT_TRUE(sawArgFromD1)
-        << "aapcs64 arg 1 must materialize as an FMOV reading d1";
+        << "aapcs64 arg 1 must be consumed from d1 — either an FMOV copies it "
+           "out or the FADD reads it in place";
 
     // Callee-saved d-reg discipline (d8-d15 + callee-saved-first
     // regalloc): the prologue spills via FSTUR, the epilogue reloads

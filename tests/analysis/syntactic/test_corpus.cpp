@@ -105,11 +105,11 @@ void checkGoldenTree(Tree const& t, fs::path const& goldenPath) {
 
 } // namespace
 
-// ── c-subset ────────────────────────────────────────────────────────────
+// ── c ────────────────────────────────────────────────────────────
 
-TEST(Corpus, CSubsetMiniCalcParsesClean) {
-    const auto path = findCorpusRoot() / "c-subset" / "mini_calc.c";
-    Tree t = parseClean("c-subset", path);
+TEST(Corpus, CMiniCalcParsesClean) {
+    const auto path = findCorpusRoot() / "c" / "mini_calc.c";
+    Tree t = parseClean("c", path);
 
     ASSERT_NE(t.root(), InvalidNode);
     if (t.diagnostics().hasErrors()) {

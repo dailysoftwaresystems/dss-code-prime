@@ -36,13 +36,13 @@
     { "name": "pthread_cond_t", "type": "arr<i64, 6>" }
   ],
   "macros": [
-    { "name": "PTHREAD_MUTEX_INITIALIZER", "variants": [
+    { "name": "PTHREAD_MUTEX_INITIALIZER", "availableObjectFormats": ["elf", "macho"], "variants": [
       { "when": { "format": "elf" },   "replacement": "{0}" },
       { "when": { "format": "macho" }, "replacement": "{850045863}" }
     ] }
   ],
   "constants": [
-    { "name": "PTHREAD_MUTEX_RECURSIVE", "variants": [
+    { "name": "PTHREAD_MUTEX_RECURSIVE", "preprocessorVisible": false, "variants": [
       { "when": { "format": "elf" },   "value": 1, "type": "i32" },
       { "when": { "format": "macho" }, "value": 2, "type": "i32" }
     ] }

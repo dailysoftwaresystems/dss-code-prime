@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# PURPOSE: compile one fixed subject with a RELEASE dss-code-prime on this host and report where the time went, so the HOST is the only variable across legs.
+# PURPOSE: compile one fixed subject with a RELEASE dsscp on this host and report where the time went, so the HOST is the only variable across legs.
 # profile-compile.sh — compile ONE fixed subject on THIS host with a RELEASE
-# dss-code-prime and report where the time went. Run it on every leg with the
+# dsscp and report where the time went. Run it on every leg with the
 # same kit and the same target, and the HOST is the only thing that moves.
 #
 # ★★★ ONE SCRIPT, NO .ps1 TWIN, AND THAT IS A DECISION RATHER THAN AN OMISSION.
@@ -23,7 +23,7 @@
 #       python scripts/profile-compile/profile-compile-support.py kit \
 #           --manifest build/real-examples/c/sqlite/windows/sqlite3.elf64-x86_64.dss-project.json \
 #           --root stage=build/real-examples/c/sqlite/windows/stage \
-#           --root libs="$USERPROFILE/.cache/dss-code-prime/harness-libs" \
+#           --root libs="$USERPROFILE/.cache/dsscp/harness-libs" \
 #           --out build/perf/kit
 #     The kit is COPIED, never re-staged: the sqlite harness pulls upstream on
 #     every run, so a host that stages for itself is not compiling the same
@@ -98,10 +98,10 @@ export PATH
 if [[ -z "$REPO" ]]; then
   REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fi
-[[ -d "$REPO/src/dss-config" ]] || die "$REPO/src/dss-config is missing — that is not a dss-code-prime checkout"
+[[ -d "$REPO/src/dss-config" ]] || die "$REPO/src/dss-config is missing — that is not a dsscp checkout"
 
 # ★ NATIVE-TOOL PATHS. Under MSYS/Git Bash a POSIX path handed to a native
-# Windows binary (cmake, dss-code-prime) is either mangled by the argument
+# Windows binary (cmake, dsscp) is either mangled by the argument
 # translator or simply not understood. `cygpath -m` is the tree's own answer to
 # "spell this path for a native tool", and it exists only where the question
 # arises — everywhere else this is the identity function.
@@ -123,7 +123,8 @@ export DSS_CONFIG_ROOT
 
 OUT="${OUT:-$REPO/build/perf/$LABEL}"
 BUILD_DIR="${BUILD_DIR:-$REPO/build/rel}"
-JOBS="${JOBS:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
+# ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".
+JOBS="${JOBS:-${DSS_JOBS:-6}}"
 mkdir -p "$OUT" || die "cannot create $OUT"
 PY="$(command -v python3 || command -v python)"
 [[ -n "$PY" ]] || die "no python3/python on this host"
@@ -144,18 +145,18 @@ if [[ "$NO_BUILD" -eq 0 ]]; then
   cmake -S "$(native "$REPO")" -B "$(native "$BUILD_DIR")" -DCMAKE_BUILD_TYPE=Release \
       > "$OUT/cmake-configure.log" 2>&1
   rc=$?; [[ $rc -eq 0 ]] || { tail -20 "$OUT/cmake-configure.log"; die "cmake configure failed (rc=$rc)"; }
-  cmake --build "$(native "$BUILD_DIR")" --config Release --target dss-code-prime -j "$JOBS" \
+  cmake --build "$(native "$BUILD_DIR")" --config Release --target dsscp -j "$JOBS" \
       > "$OUT/cmake-build.log" 2>&1
-  rc=$?; [[ $rc -eq 0 ]] || { tail -30 "$OUT/cmake-build.log"; die "dss-code-prime build failed (rc=$rc)"; }
+  rc=$?; [[ $rc -eq 0 ]] || { tail -30 "$OUT/cmake-build.log"; die "dsscp build failed (rc=$rc)"; }
 else
   info "--no-build: reusing whatever is already in $BUILD_DIR"
 fi
 # BOTH spellings on EVERY host: the executable suffix is a fact about the machine
 # the compiler RUNS on, and probing for a name that cannot exist here costs
 # nothing — whereas assuming one name is how the predecessor of this script once
-# reported "no dss-code-prime" over a build that had just succeeded.
-DSS="$(find "$BUILD_DIR" -type f \( -name dss-code-prime -o -name dss-code-prime.exe \) -print -quit 2>/dev/null)"
-[[ -n "$DSS" ]] || die "no dss-code-prime under $BUILD_DIR (looked for both dss-code-prime and dss-code-prime.exe)"
+# reported "no dsscp" over a build that had just succeeded.
+DSS="$(find "$BUILD_DIR" -type f \( -name dsscp -o -name dsscp.exe \) -print -quit 2>/dev/null)"
+[[ -n "$DSS" ]] || die "no dsscp under $BUILD_DIR (looked for both dsscp and dsscp.exe)"
 # ★★ THE ASSERTION THAT MAKES THE NUMBER MEAN ANYTHING. --require Release exits
 # non-zero and says what it read and where it read it from; there is no flag to
 # proceed anyway, because a non-Release timing published beside Release ones is
@@ -196,7 +197,7 @@ if [[ $rc -ne 0 ]]; then
 fi
 
 say "phase report"
-grep -E 'compile time|^dss-code-prime:   phase' "$LOG" || true
+grep -E 'compile time|^dsscp:   phase' "$LOG" || true
 say "optimizer passes"
 "$PY" "$SUPPORT" agg-trace "$LOG" | sed -n '1,40p' || true
 say "artifact"

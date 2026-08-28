@@ -18,7 +18,7 @@
 // policy, an unsuppressed abort can raise a modal dialog and block
 // indefinitely. Nothing about that is visible in a compile log, and a plain
 // exit-code assertion cannot express it — which is why the run half of this
-// fix lives in examples/c-subset/shipped_set_abort_behavior, where the runner
+// fix lives in examples/c/shipped_set_abort_behavior, where the runner
 // spawns under `kRunBudget` and a timeout is a hard failure.
 //
 // WHAT THIS FILE PINS, AND WHY IT IS THE HOST-INDEPENDENT HALF
@@ -101,9 +101,9 @@ namespace {
 //
 // Spelled once, here, because every pin below and the corpus example must agree
 // on them. All four MEASURED against the real SDK + the real DLL:
-//   * signature verbatim from Windows Kits 10.0.26100.0 ucrt/stdlib.h:67-70,
+//   * signature verbatim from Windows Kits 10.0.26100.0 ucrt/stdlib.h,
 //     `unsigned int __cdecl _set_abort_behavior(unsigned int, unsigned int)`;
-//   * the two constants are unsuffixed hex `int` literals at ucrt/stdlib.h:63-65
+//   * the two constants are unsuffixed hex `int` literals at ucrt/stdlib.h
 //     — hence `i32` MIRRORING THE SDK even though the parameters are unsigned;
 //   * `_set_abort_behavior` is exported by ucrtbase.dll 10.0.26100.8875 at PE
 //     ordinal 1771 (objdump's 0-based name-table INDEX 1770 + OrdinalBase 1) and
@@ -118,12 +118,12 @@ constexpr std::int64_t kWriteMsgValue   = 1;
 constexpr std::int64_t kCallReportValue = 2;
 
 [[nodiscard]] fs::path stdlibDescriptorPath() {
-    auto const root = dss::test::findRepoRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config" / "shippedLibs" / "stdlib.json";
+    return *cfg / "shippedLibs" / "stdlib.json";
 }
 
 // ── AXIS 1: THE IMPORTED SYMBOL NAMES OF ONE PE IMAGE ────────────────────────
@@ -222,12 +222,12 @@ constexpr std::int64_t kCallReportValue = 2;
                                      std::istreambuf_iterator<char>());
 }
 
-// Compile one c-subset source to one target through the real production driver.
+// Compile one c source to one target through the real production driver.
 [[nodiscard]] int buildOne(fs::path const& outDir, fs::path const& src,
                            std::string const& target, DiagnosticReporter& rep) {
     Program p;
     p.setOutputDir(outDir);
-    return p.compileFiles(std::vector<std::string>{src.string()}, "c-subset",
+    return p.compileFiles(std::vector<std::string>{src.string()}, "c",
                           std::vector<std::string>{target}, rep);
 }
 
@@ -373,7 +373,7 @@ nlohmann::json const kNoRows = nlohmann::json::array();
             findings.emplace_back(
                 std::string{want.name} + " = " + std::to_string(got)
                 + ", expected " + std::to_string(want.value)
-                + " (MEASURED against ucrt/stdlib.h:63-65 by five independent "
+                + " (MEASURED against ucrt/stdlib.h by five independent "
                   "instruments, byte-identical across all four installed SDKs).");
         }
         auto const ty = body.find("type");

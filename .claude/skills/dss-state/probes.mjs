@@ -1,7 +1,7 @@
 // C-feature probe battery for the dss-state driver.
 //
 // Each probe is a tiny, UB-free C program with a deterministic exit code.
-// The driver compiles each through the REAL dss-code-prime CLI for the host
+// The driver compiles each through the REAL dsscp CLI for the host
 // target and runs the produced binary. A probe therefore measures the WHOLE
 // pipeline (lex → parse → semantic → HIR/MIR/LIR → asm → link → runtime),
 // not just the grammar. Probes deliberately include features the compiler

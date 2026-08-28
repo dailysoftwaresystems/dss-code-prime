@@ -1,5 +1,6 @@
 #include "mir/merge/mir_merge.hpp"
 
+#include "core/substrate/phase_timers.hpp"  // the merge-side whole-program verify's `--time` row
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_reintern.hpp"
 #include "link/cross_cu_resolve.hpp"   // resolveCrossCuDefs, CrossCuDef, LinkedSymbolKey
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <format>       // ffiImportKey — the length-prefixed import-identity key
 #include <functional>
+#include <optional>     // the per-CU subset-import filter
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -114,6 +116,12 @@ struct CuSymKeyHash {
 struct MergePlan {
     // Per-CU type-reintern memo (reused across that CU's functions/globals).
     std::vector<std::unordered_map<std::uint32_t, TypeId>> typeRemap;
+    // Cross-CU composite identity, SHARED by every CU and populated from EVERY
+    // source interner before the first reintern -- so a `typedef struct Bitvec
+    // Bitvec;` in one CU and the `struct Bitvec { ... }` in another land on ONE
+    // host TypeId whichever CU the merge walks first
+    // (D-MIR-MERGE-COMPOSITE-HOST-IDENTITY-IS-THE-DECLARATION-SITE).
+    CompositeIdentityIndex compositeIdentity;
     // (cuIdx, oldSym.v) → merged SymbolId. Covers func defs, global defs, AND
     // every extern import symbol.
     std::unordered_map<CuSymKey, SymbolId, CuSymKeyHash> symMerged;
@@ -227,7 +235,8 @@ public:
     // Clone `f` into `dst_`. Returns the merged MirFuncId.
     [[nodiscard]] MirFuncId clone(MirFuncId f, SymbolId mergedSymbol) {
         TypeId const sig = reinternType(srcInterner_, src_.funcSignature(f),
-                                        host_, typeRemap());
+                                        host_, typeRemap(),
+                                        plan_.compositeIdentity);
         // TF-C78 (D-CSUBSET-NOINLINE): carried across the cross-CU merge — the
         // merged module is what the optimizer then runs on, so a flag dropped
         // here would let a `noinline` function from CU A be inlined after link.
@@ -316,7 +325,8 @@ private:
     }
 
     [[nodiscard]] TypeId reType(TypeId t) {
-        return reinternType(srcInterner_, t, host_, typeRemap());
+        return reinternType(srcInterner_, t, host_, typeRemap(),
+                            plan_.compositeIdentity);
     }
 
     [[nodiscard]] MirBlockId mapBlock(MirBlockId oldB) {
@@ -409,6 +419,20 @@ private:
             // miscompile class, extended to BlockAddress). Re-map via `mapBlock`.
             local_.emplace(id.v, dst_.addBlockAddress(
                 mapBlock(src_.blockAddressTarget(id)), reType(src_.instType(id)),
+                src_.instFlags(id)));
+            return;
+        }
+        if (op == MirOpcode::BlockAddressExport) {
+            // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the payload is a
+            // per-CU SymbolId, which the merge RENUMBERS — a generic `addInst` copy
+            // would carry the stale id, and the initializer literal's own
+            // `MirSymbolAddrValue` (remapped by `remapLiteralSymbols`) would then
+            // relocate against a DIFFERENT symbol than the one the block is bound
+            // to. Both sides must go through the SAME `symMerged` map, which is
+            // exactly why step 3d assigns these symbols a merged id.
+            local_.emplace(id.v, dst_.addBlockAddressExport(
+                mapValue(src_.instOperands(id)[0], id),
+                mergedSymbolOf(plan_, cuIdx_, src_.blockAddressExportSymbol(id)),
                 src_.instFlags(id)));
             return;
         }
@@ -605,8 +629,52 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         }
     }
 
+    // ── THE SUBSET-IMPORT FILTER (OPT11, D-OPT11-LAZY-IMPORT-EDGE) ───────────
+    // `MergeCuInput::importOnly` turns a CU from a merge PARTICIPANT into an
+    // IMPORT SOURCE. Materialized ONCE, as a set per CU, so the six sites that
+    // consult it below ask the same question the same way — a per-site
+    // re-derivation is how two of them would eventually disagree about which
+    // functions a CU contributes, and a disagreement here is a symbol the clone
+    // emits with no definition behind it.
+    std::vector<std::optional<std::unordered_set<std::string>>>
+        importFilter(cus.size());
+    for (std::size_t i = 0; i < cus.size(); ++i) {
+        if (cus[i].importOnly == nullptr) continue;
+        importFilter[i].emplace(cus[i].importOnly->begin(),
+                                cus[i].importOnly->end());
+    }
+    // ⚠ CU0 IS THE DESTINATION, ALWAYS. Every id-retention rule below
+    // (`maxCu0`, `alloc.claim`) is written for "CU0 is the module we are
+    // importing INTO"; an import source in slot 0 would keep its own symbol
+    // values and mint fresh ones for the destination's, which is a silently
+    // renumbered module rather than an error.
+    if (importFilter[0].has_value()) {
+        mergeFatal("cus[0] carries an importOnly filter — slot 0 is the merge "
+                   "DESTINATION and must be a full participant "
+                   "(D-OPT11-LAZY-IMPORT-EDGE).");
+    }
+    auto const isImportSource = [&](std::uint32_t ci) {
+        return importFilter[ci].has_value();
+    };
+    // Does CU `ci` contribute `name` as a DEFINITION?
+    auto const contributesFunction = [&](std::uint32_t ci,
+                                         std::string const& name) {
+        if (!importFilter[ci].has_value()) return true;
+        return !name.empty() && importFilter[ci]->count(name) != 0;
+    };
+
     MergePlan plan;
     plan.typeRemap.resize(cus.size());
+
+    // ── (0) COMPOSITE IDENTITY PRE-PASS — before ANY reintern ────────────────
+    // Whether a forward-declared `struct T` may unify with a definition depends
+    // on CUs it does not itself contain, so the question cannot be answered
+    // while walking. Observing EVERY source interner first is what makes the
+    // merged type graph independent of the order the CUs are walked -- and
+    // order-independence is not a nicety here: the same operator ruling that
+    // requires byte-identical optimized output for any prefetch depth applies to
+    // a type graph that decides what the optimizer may inline.
+    for (auto const& cu : cus) plan.compositeIdentity.observe(*cu.interner);
 
     // ── (1)+(2) name → defining (cuIdx, MirFuncId, binding) + resolveCrossCuDefs.
     // A LinkedSymbolKey's cuId is the synthetic `cuIdx+1` (unique per CU, order-
@@ -625,6 +693,11 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             MirFuncId const f = m.funcAt(fi);
             std::string const name = cus[ci].nameOf(m.funcSymbol(f));
             if (name.empty()) continue;
+            // An import source contributes only its SELECTED functions — the
+            // rest are not definitions of this merge and must not enter the
+            // cross-CU election, or a name it merely happens to define would
+            // shadow the importer's own reference to the real one.
+            if (!contributesFunction(ci, name)) continue;
             SymbolBinding const binding = m.funcBinding(f);
             if (binding == SymbolBinding::Local) continue;
             plan.definedNames.insert(name);
@@ -635,6 +708,13 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         // Externally-visible globals participate in cross-CU resolution too (a
         // strong global shadows a weak one of the same name), exactly like
         // functions.
+        //
+        // ⚠ AN IMPORT SOURCE CONTRIBUTES NO GLOBAL AT ALL, and this is the
+        // asymmetry that makes a subset import safe. A global has IDENTITY and
+        // STATE; two copies of one are a miscompile, whereas a function body is
+        // pure code the inliner may duplicate. So the importer never receives a
+        // definition — only a reference the final whole-program merge resolves.
+        if (isImportSource(ci)) continue;
         std::size_t const ng = m.moduleGlobalCount();
         for (std::uint32_t gi = 0; gi < ng; ++gi) {
             MirGlobalId const g = m.globalAt(gi);
@@ -691,7 +771,23 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
 
     // (3a) one canonical merged id per externally-visible winner NAME. Use the
     // winner's natural value when it is a free CU0 value; otherwise mint fresh.
+    //
+    // ★★ IN SORTED NAME ORDER. `resolution.winners` is an `unordered_map`, and
+    // this loop MINTS SYMBOL IDS as it goes — so ranging over it directly makes
+    // the merged symbol numbering, and therefore the emitted symbol table, a
+    // function of the standard library's hash-table layout rather than of the
+    // input. Sorting the names first makes the numbering a pure function of the
+    // CU set, which is what lets two hosts (and two stdlib versions) agree on
+    // the artifact. Sibling of the `MirBuilder::finish` phi-pool flush ordering.
+    std::vector<std::string> winnerNames;
+    winnerNames.reserve(resolution.winners.size());
     for (auto const& [name, winKey] : resolution.winners) {
+        (void)winKey;
+        winnerNames.push_back(name);
+    }
+    std::sort(winnerNames.begin(), winnerNames.end());
+    for (std::string const& name : winnerNames) {
+        LinkedSymbolKey const& winKey = resolution.winners.at(name);
         SymbolId merged;
         if (cuIdxOf(winKey) == 0 && alloc.isFree(winKey.symbol.v)) {
             merged = alloc.claim(winKey.symbol.v);
@@ -770,8 +866,84 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         }
     };
 
+    // A symbol-address value nested anywhere inside one literal — the THIRD
+    // symbol carrier, beside `GlobalAddr` and `BlockAddressExport`, and the one
+    // a scan written from the instruction opcodes alone misses. It is exactly
+    // the set `remapLiteralSymbols` rewrites, so planning and remapping now walk
+    // the same shape; a body whose literal named a symbol the plan never saw
+    // would abort in `remapLiteralSymbols` with no way to tell which body did it.
+    auto const assignLiteralSymbols = [&](auto&& self, std::uint32_t ci,
+                                          MirLiteralValue const& v) -> void {
+        if (auto const* sa = std::get_if<MirSymbolAddrValue>(&v.value)) {
+            SymbolId const s{sa->symbol};
+            assignSymbol(ci, s, cus[ci].nameOf(s), /*ffiRow=*/nullptr,
+                         /*isLocalDef=*/false);
+            return;
+        }
+        if (auto const* agg = std::get_if<MirAggregateValue>(&v.value)) {
+            for (auto const& fld : agg->fields) self(self, ci, fld);
+        }
+    };
+
     for (std::uint32_t ci = 0; ci < cus.size(); ++ci) {
         Mir const& m = *cus[ci].mir;
+        if (isImportSource(ci)) {
+            // ── AN IMPORT SOURCE PLANS ONLY WHAT ITS SELECTED BODIES NEED ────
+            // Each selected function's own symbol, plus every symbol those
+            // bodies reference through any of the three carriers. Planning the
+            // WHOLE source CU would also be correct, but it is O(program) per
+            // importer — precisely the serial whole-program cost the lazy import
+            // edge exists to remove, reintroduced in the planning pass.
+            //
+            // Every REFERENCE is assigned with `isLocalDef=false` so it folds
+            // onto the cross-CU winner when one exists. A reference with no
+            // winner mints a private id and reaches the clone with no definition
+            // behind it — which is why the caller owes satisfiability (see
+            // `MergeCuInput::importOnly`); the lazy import driver refuses such an
+            // import rather than emitting a module that cannot link.
+            std::size_t const nfSrc = m.moduleFuncCount();
+            for (std::uint32_t fi = 0; fi < nfSrc; ++fi) {
+                MirFuncId const f = m.funcAt(fi);
+                std::string const fname = cus[ci].nameOf(m.funcSymbol(f));
+                if (!contributesFunction(ci, fname)) continue;
+                assignSymbol(ci, m.funcSymbol(f), fname, /*ffiRow=*/nullptr,
+                             /*isLocalDef=*/m.funcBinding(f)
+                                            == SymbolBinding::Local);
+                std::uint32_t const nb = m.funcBlockCount(f);
+                for (std::uint32_t bi = 0; bi < nb; ++bi) {
+                    MirBlockId const b = m.funcBlockAt(f, bi);
+                    std::uint32_t const ni = m.blockInstCount(b);
+                    for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                        MirInstId const inst = m.blockInstAt(b, ii);
+                        switch (m.instOpcode(inst)) {
+                        case MirOpcode::GlobalAddr: {
+                            SymbolId const s = m.globalAddrSymbol(inst);
+                            assignSymbol(ci, s, cus[ci].nameOf(s),
+                                         /*ffiRow=*/nullptr,
+                                         /*isLocalDef=*/false);
+                            break;
+                        }
+                        case MirOpcode::BlockAddressExport:
+                            // Anonymous + local, the same treatment the whole-CU
+                            // arm below gives it, and for the same reason.
+                            assignSymbol(ci, m.blockAddressExportSymbol(inst),
+                                         /*name=*/std::string{},
+                                         /*ffiRow=*/nullptr,
+                                         /*isLocalDef=*/true);
+                            break;
+                        case MirOpcode::Const:
+                            assignLiteralSymbols(
+                                assignLiteralSymbols, ci,
+                                m.literalValue(m.constLiteralIndex(inst)));
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         std::size_t const nf = m.moduleFuncCount();
         for (std::uint32_t fi = 0; fi < nf; ++fi) {
             MirFuncId const f = m.funcAt(fi);
@@ -795,6 +967,35 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             // the import identity the FFI collapse keys on.
             assignSymbol(ci, e.symbol, e.mangledName, /*ffiRow=*/&e,
                          /*isLocalDef=*/false);
+        }
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: a BLOCK symbol minted
+        // at HIR→MIR for a label whose address a static initializer took. It is a
+        // real symbol in every downstream sense — a `MirSymbolAddrValue` initializer
+        // relocates against it and the object file defines it as a local — but it is
+        // NOT a function, a global, or an extern, so the three loops above walk past
+        // it. Left unassigned, `remapLiteralSymbols` aborts the merge on the first
+        // 2-TU build containing one ("no unified merged id"), and no single-CU test
+        // can see that.
+        //
+        // ANONYMOUS AND LOCAL, both deliberately: it names an interior point of one
+        // function's code, so it must never collapse onto a same-named winner from
+        // another CU. Passing an empty name routes it straight to the mint arm,
+        // which is the same treatment the merge already gives a `static` object.
+        std::size_t const nfx = m.moduleFuncCount();
+        for (std::uint32_t fi = 0; fi < nfx; ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            std::uint32_t const nb = m.funcBlockCount(f);
+            for (std::uint32_t bi = 0; bi < nb; ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                std::uint32_t const ni = m.blockInstCount(b);
+                for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                    MirInstId const inst = m.blockInstAt(b, ii);
+                    if (m.instOpcode(inst) != MirOpcode::BlockAddressExport) continue;
+                    assignSymbol(ci, m.blockAddressExportSymbol(inst),
+                                 /*name=*/std::string{}, /*ffiRow=*/nullptr,
+                                 /*isLocalDef=*/true);
+                }
+            }
         }
     }
 
@@ -875,6 +1076,8 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         for (std::uint32_t fi = 0; fi < nf; ++fi) {
             MirFuncId const f = m.funcAt(fi);
             std::string const name = cus[ci].nameOf(m.funcSymbol(f));
+            // An import source contributes only its SELECTED bodies.
+            if (!contributesFunction(ci, name)) continue;
             if (isShadowedLoser(ci, name, m.funcSymbol(f),
                                 m.funcBinding(f) == SymbolBinding::Local))
                 continue;  // weak loser (never a Local — module-private, kept)
@@ -890,6 +1093,8 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // step 4); initLiteral is re-added by value.
     for (std::uint32_t ci = 0; ci < cus.size(); ++ci) {
         Mir const& m = *cus[ci].mir;
+        // An import source contributes NO global — see step (1)'s note.
+        if (isImportSource(ci)) continue;
         std::size_t const ng = m.moduleGlobalCount();
         for (std::uint32_t gi = 0; gi < ng; ++gi) {
             MirGlobalId const g = m.globalAt(gi);
@@ -899,7 +1104,8 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                 continue;
 
             TypeId const ty = reinternType(*cus[ci].interner, m.globalType(g),
-                                           host, plan.typeRemap[ci]);
+                                           host, plan.typeRemap[ci],
+                                           plan.compositeIdentity);
             SymbolId const mergedSym = mergedSymbolOf(plan, ci, m.globalSymbol(g));
 
             std::uint32_t initLit = m.globalInitLiteralIndex(g);
@@ -989,8 +1195,9 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     };
     // `dataSizeBytes` / `dataAlignBytes` SIZE the ELF copy-relocation `.bss` slot
     // (c84 D-LK-EXTERN-DATA-IMPORT). One CU legitimately holds an INCOMPLETE type
-    // (`extern const char v[];` ⇒ 0/0 — extern_import.hpp:76-81), so a zero is
-    // "unknown here", not a disagreement: take the non-zero. Two DIFFERING
+    // (`extern const char v[];` ⇒ 0/0 — see `ExternImport::dataSizeBytes` in
+    // extern_import.hpp), so a zero is "unknown here", not a disagreement:
+    // take the non-zero. Two DIFFERING
     // non-zero values would reserve the SAME slot two ways — the loader memcpy's
     // `st_size` bytes, so picking either silently truncates or over-copies.
     auto const foldNonZero = [&](std::uint64_t& kept, std::uint64_t incoming,
@@ -1005,6 +1212,13 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // collapsed duplicate can fold its payload into the already-emitted row.
     std::unordered_map<std::string, std::size_t> emittedExternIdx;
     for (std::uint32_t ci = 0; ci < cus.size(); ++ci) {
+        // An import source contributes NO extern row. Its rows describe ITS
+        // module's dependencies, not the importer's, and folding them in would
+        // make an importer's emitted import table depend on which bodies it
+        // happened to page in. The lazy import driver copies exactly the rows a
+        // SELECTED body actually needs onto the IMPORTER instead, so the row
+        // arrives as the importer's own dependency and rides its identity.
+        if (isImportSource(ci)) continue;
         for (ExternImport const& e : cus[ci].externImports) {
             if (plan.definedNames.count(e.mangledName)) continue;  // → direct, strip
             SymbolId const mergedSym = mergedSymbolOf(plan, ci, e.symbol);
@@ -1033,7 +1247,8 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                     ci, e.mangledName.c_str(), kept.symbol.v, mergedSym.v);
                 std::abort();
             }
-            // `isEagerImport` — OR-COMBINE, as extern_import.hpp:112-114 mandates
+            // `isEagerImport` — OR-COMBINE, as `ExternImport::isEagerImport`'s own
+            // contract note in extern_import.hpp mandates
             // (D-LINK-EXTERN-IMPORT-REFERENCE-GATE (e)). Keeping a NON-eager row
             // when a sibling CU declared the same import EAGER lets the linker's
             // `rejectOrDropUnreferencedExterns` DROP a
@@ -1077,6 +1292,9 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         std::unordered_set<std::string> entrySet(entryNames.begin(), entryNames.end());
         for (std::uint32_t ci = 0; ci < cus.size() && !userEntrySymbol; ++ci) {
             Mir const& m = *cus[ci].mir;
+            // An import source is not a participant, so it cannot supply the
+            // program's entry point even if it happens to define `main`.
+            if (isImportSource(ci)) continue;
             std::size_t const nf = m.moduleFuncCount();
             for (std::uint32_t fi = 0; fi < nf; ++fi) {
                 MirFuncId const f = m.funcAt(fi);
@@ -1102,7 +1320,20 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // ── verify the merged module before returning (the engine's verify-after-
     // every-transform discipline). A non-verifying merge is a build break, never
     // a silent miscompile.
+    //
+    // ★★ THIS VERIFY IS THE SECOND WHOLE-PROGRAM `MirVerifier` RUN OF A BUILD,
+    // and until cycle P36 it was INVISIBLE: `mergeCuMirs` is called from the
+    // driver OUTSIDE any `PhaseTimers::Scope`, so its cost landed in the
+    // `--time` report's `[other]` row, which names nothing
+    // ([[D-PERF-MERGE-SIDE-WHOLE-PROGRAM-VERIFY-IS-UNATTRIBUTED]]). It is
+    // scoped as `CompilePhase::Verify` — the phase whose verb IS "the
+    // MirVerifier ran" — so the row now counts EVERY whole-module verify a
+    // build pays instead of only the optimizer's. ⓘ The `runs` column is what
+    // keeps the two distinguishable: it now reads (CUs + 1 optimizer verifies)
+    // + 1 merge verify.
     {
+        substrate::PhaseTimers::Scope const verifyScope{
+            substrate::CompilePhase::Verify};
         MirVerifier verifier{merged, &host.interner()};
         if (!verifier.verify(reporter)) {
             ParseDiagnostic d;

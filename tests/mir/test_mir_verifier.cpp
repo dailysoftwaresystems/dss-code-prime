@@ -1677,6 +1677,514 @@ TEST(MirVerifier, CallSignatureRuleSkippedWithoutInterner) {
     EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u);
 }
 
+// ── P36: THE CALL **RESULT** HALF ───────────────────────────────────────────
+// (D-MIR-VERIFIER-CALLSITE-RESULT-TYPE-UNCHECKED)
+//
+// TF-C112 landed the OPERAND half and recorded the result half as a deliberate
+// scope boundary. These pin the four arms it needs — no result, a void callee,
+// a by-value-class return (piece 0), and a scalar return — and they pin the
+// ACCEPTING arms as hard as the rejecting ones, because an arm that accepts
+// everything is how a rule stops paying for itself.
+
+// RED-ON-DISABLE: delete ARM D in `checkCallSignatures` §2 and this goes green.
+TEST(MirVerifier, CallTakingAWrongTypedScalarResultRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const i64    = in.primitive(TypeKind::I64);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const calleeSig = in.fnSig({}, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    std::array<MirInstId, 1> const ops{ga};
+    b.addInst(MirOpcode::Call, ops, i64);   // callee returns i32 — result is i64
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 1u)
+        << allActuals(r);
+    EXPECT_TRUE(anyCallDiagContains(r, "RESULT")) << allActuals(r);
+}
+
+// RED-ON-DISABLE: delete ARM B and this goes green. The shape a synthesis pass
+// produces when it wires a value off a `void` shim.
+TEST(MirVerifier, CallTakingAResultFromAVoidCalleeRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const calleeSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    std::array<MirInstId, 1> const ops{ga};
+    b.addInst(MirOpcode::Call, ops, i32);   // a void callee cannot yield an i32
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 1u)
+        << allActuals(r);
+    EXPECT_TRUE(anyCallDiagContains(r, "void return")) << allActuals(r);
+}
+
+// ARM A, PINNED AS AN ACCEPTANCE. A DISCARDED result (an expression statement
+// calling a non-void function) carries `InvalidType` and is legal — `R::Optional`
+// exists for exactly this. If this ever reds, the rule has grown a claim the tier
+// cannot honour: MIR cannot distinguish a deliberate discard from a lowering that
+// LOST a needed result, so it must not guess.
+TEST(MirVerifier, CallDiscardingANonVoidResultPasses) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const calleeSig = in.fnSig({}, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    std::array<MirInstId, 1> const ops{ga};
+    b.addInst(MirOpcode::Call, ops, InvalidType);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u)
+        << allActuals(r);
+}
+
+// ARM C, THE ACCEPTING SIDE. A by-value-class (struct) return lowered
+// InRegisters makes the CALL'S OWN RESULT piece 0 — an I64 here — which is what
+// `emitStructReturningCall` emits. A rule that demanded the result equal the
+// declared struct type would contradict the lowering on every struct-returning
+// call in the corpus.
+TEST(MirVerifier, StructReturningCallTakingAbiPieceZeroPasses) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i64    = in.primitive(TypeKind::I64);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 2> const fields{i64, i64};
+    TypeId const s         = in.structType("S", fields);
+    TypeId const calleeSig = in.fnSig({}, s, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    std::array<MirInstId, 1> const ops{ga};
+    b.addInst(MirOpcode::Call, ops, i64);   // piece 0
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u)
+        << allActuals(r);
+}
+
+// ARM C, THE REJECTING SIDE — and it is what keeps the arm above from being
+// vacuous. A struct-returning call whose result is a DIFFERENT AGGREGATE is
+// neither the declared value nor any register piece, so it is named.
+// RED-ON-DISABLE: drop the `!sameSlotType(...)` half of ARM C's condition and
+// this goes green while the piece-0 test above stays green — the two tests
+// therefore constrain the arm from BOTH sides, which one alone cannot do.
+TEST(MirVerifier, StructReturningCallTakingAWrongAggregateResultRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i64    = in.primitive(TypeKind::I64);
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 2> const fieldsA{i64, i64};
+    std::array<TypeId, 3> const fieldsB{i32, i32, i32};
+    TypeId const sa        = in.structType("SA", fieldsA);
+    TypeId const sb        = in.structType("SB", fieldsB);
+    TypeId const calleeSig = in.fnSig({}, sa, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    std::array<MirInstId, 1> const ops{ga};
+    b.addInst(MirOpcode::Call, ops, sb);   // a DIFFERENT aggregate
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 1u)
+        << allActuals(r);
+    EXPECT_TRUE(anyCallDiagContains(r, "by-value-class")) << allActuals(r);
+}
+
+// ── P36: THE **STORE** HALF ─────────────────────────────────────────────────
+// (D-MIR-VERIFIER-STORE-CALLARG-TYPE-BLIND)
+//
+// The memory-write seam. `checkAtomicAccessLowered` already walked every Store
+// and read ONLY the pointee's atomic qualification, so a wrong `TypeId` on a
+// stored value passed SILENTLY — which is how
+// D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE hid: its `return` form was
+// diagnosed while the store-shaped form carried the SAME wrong TypeId with no
+// diagnostic at all.
+//
+// ⚠ THE VACUITY CONTROL THE ROW DEMANDS: the positive and negative controls must
+// yield DIFFERENT CODES, not merely different counts. Every rejecting test below
+// asserts I_StoreValueTypeMismatch AND asserts that the atomic belt
+// (I_AtomicAccessNotLowered) did NOT fire, so a rule that accidentally routed
+// through the wrong code cannot pass.
+
+namespace {
+
+// Does some I_StoreValueTypeMismatch diagnostic mention `needle`? Same posture
+// as `anyCallDiagContains`: the rule's value to a human debugging a miscompile
+// is the TYPES it names, so the tests assert on TEXT, not merely on a count.
+[[nodiscard]] bool anyStoreDiagContains(DiagnosticReporter const& r,
+                                        std::string_view needle) {
+    for (auto const& d : r.all()) {
+        if (d.code == DiagnosticCode::I_StoreValueTypeMismatch
+            && d.actual.find(needle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+// ★ THE HEADLINE SHAPE, and the one the `__int128` defect wore: a value whose
+// TypeId does not match the slot it is written into. Before this rule the module
+// verified CLEAN.
+// RED-ON-DISABLE: drop `checkStoreValueTypes` from `verify()` and this goes green.
+TEST(MirVerifier, StoreOfAWrongTypedValueRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const i64    = in.primitive(TypeKind::I64);
+    TypeId const pI64   = in.pointer(i64);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const fnSig  = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, pI64, /*bytes=*/8);
+    MirInstId const val  = b.addConst(litOf(7, TypeKind::I32), i32);   // i32 into an i64 slot
+    std::array<MirInstId, 2> const st{val, slot};
+    b.addInst(MirOpcode::Store, st, InvalidType);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StoreValueTypeMismatch), 1u)
+        << allActuals(r);
+    // ⚠ THE VACUITY CONTROL: a DIFFERENT code, not merely a different count.
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_AtomicAccessNotLowered), 0u)
+        << allActuals(r);
+    EXPECT_TRUE(anyStoreDiagContains(r, "pointee")) << allActuals(r);
+}
+
+// The POSITIVE control for the test above — same module, right type, clean.
+TEST(MirVerifier, StoreOfACorrectlyTypedValuePasses) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i64    = in.primitive(TypeKind::I64);
+    TypeId const pI64   = in.pointer(i64);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const fnSig  = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, pI64, /*bytes=*/8);
+    MirInstId const val  = b.addConst(litOf(7, TypeKind::I64), i64);
+    std::array<MirInstId, 2> const st{val, slot};
+    b.addInst(MirOpcode::Store, st, InvalidType);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StoreValueTypeMismatch), 0u)
+        << allActuals(r);
+}
+
+// `AtomicStore` is the identical seam with the identical operand order, so it is
+// covered too. Excluding it would leave a hole of exactly the shape this rule
+// exists to close — and an unstated one.
+TEST(MirVerifier, AtomicStoreOfAWrongTypedValueRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32       = in.primitive(TypeKind::I32);
+    TypeId const i64       = in.primitive(TypeKind::I64);
+    TypeId const atomicI64 = in.atomicQualified(i64);
+    TypeId const pAtomic   = in.pointer(atomicI64);
+    TypeId const voidTy    = in.primitive(TypeKind::Void);
+    TypeId const fnSig     = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, pAtomic, /*bytes=*/8);
+    MirInstId const val  = b.addConst(litOf(7, TypeKind::I32), i32);
+    std::array<MirInstId, 2> const st{val, slot};
+    b.addInst(MirOpcode::AtomicStore, st, InvalidType, /*payload=*/5);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StoreValueTypeMismatch), 1u)
+        << allActuals(r);
+}
+
+// ⚠ THE ONE NARROWING, PINNED SO IT CANNOT WIDEN BY ACCIDENT. `ptr<void>` is
+// MIR's spelling for "an address whose pointee is unknown or irrelevant" — the
+// ABSENCE of a type claim — so a store through one is not judged. If this ever
+// starts FAILING, the narrowing has been removed and the corpus will red on
+// every `memcpy`-shaped and frame-leaf store; if the rule ever stops firing on
+// the test above, the narrowing has swallowed the rule.
+TEST(MirVerifier, StoreThroughAVoidPointerIsNotJudged) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const pVoid  = in.pointer(voidTy);
+    TypeId const fnSig  = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, pVoid, /*bytes=*/8);
+    MirInstId const val  = b.addConst(litOf(7, TypeKind::I32), i32);
+    std::array<MirInstId, 2> const st{val, slot};
+    b.addInst(MirOpcode::Store, st, InvalidType);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StoreValueTypeMismatch), 0u)
+        << allActuals(r);
+}
+
+// The shared notion's ARM 2 reaching the Store seam: `long` vs `long long` are
+// identity-distinct but the data model makes both I64, so the tree RETAGS rather
+// than emitting a Cast. Rejecting this would make the verifier contradict the
+// lowering — and it is the arm most likely to be "fixed" by someone tightening
+// the rule against a corpus red, so it is pinned.
+TEST(MirVerifier, StoreOfASameRepresentationValueAccepted) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const lng    = in.primitive(TypeKind::I64, "long");
+    TypeId const lnglng = in.primitive(TypeKind::I64, "long long");
+    TypeId const pLng   = in.pointer(lng);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const fnSig  = in.fnSig({}, voidTy, CallConv::CcSysV);
+    ASSERT_NE(lng.v, lnglng.v) << "the two spellings must intern DISTINCTLY, "
+                                  "else this test is vacuous";
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, pLng, /*bytes=*/8);
+    MirInstId const val  = b.addConst(litOf(7, TypeKind::I64), lnglng);
+    std::array<MirInstId, 2> const st{val, slot};
+    b.addInst(MirOpcode::Store, st, InvalidType);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StoreValueTypeMismatch), 0u)
+        << allActuals(r);
+}
+
+// The interner-gate, matching every other interner-gated rule: a fixture with no
+// interner cannot decode a pointee, so the rule is SKIPPED rather than guessing.
+// ── THE DECLARED-REPRESENTATION NARROWING, PINNED FROM BOTH SIDES ───────────
+//
+// ⚠ A narrowing that only ever ACCEPTS is indistinguishable from a deleted rule,
+// so each of these has a twin that must stay RED. ✔MEASURED at P36: the shape
+// below is 16 of the 113 diagnostics the Store rule produced on its first corpus
+// run, all from the bit-field path, where hir_to_mir types the allocation-unit
+// ADDRESS with the member's DECLARED type while `emitBitfieldInsert` types the
+// VALUE with the tier's own CONTAINER (`bitIntReprType(enumReprType(...))`).
+// Width, signedness and every bit agree, so nothing can be miscompiled — which
+// is exactly the test that FAILS for `i64` vs `u64`, still rejected below.
+
+// ACCEPTING SIDE (enum). `enum Color : int` — a slot whose interner-declared
+// underlying kind IS the value's kind.
+TEST(MirVerifier, StoreOfAnEnumsDeclaredUnderlyingIntoItsSlotAccepted) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const color  = in.enumType("Color", TypeKind::I32);
+    TypeId const pColor = in.pointer(color);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const fnSig  = in.fnSig({}, voidTy, CallConv::CcSysV);
+    ASSERT_NE(color.v, i32.v) << "the enum must be identity-DISTINCT from its "
+                                 "underlying, else this test is vacuous";
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, pColor, /*bytes=*/4);
+    MirInstId const val  = b.addConst(litOf(5, TypeKind::I32), i32);
+    std::array<MirInstId, 2> const st{val, slot};
+    b.addInst(MirOpcode::Store, st, InvalidType);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StoreValueTypeMismatch), 0u)
+        << allActuals(r);
+}
+
+// REJECTING TWIN (enum). The narrowing reads the DECLARED underlying kind, so a
+// value of a DIFFERENT kind is still named — the arm cannot be read as "an enum
+// slot accepts any integer".
+// RED-ON-DISABLE: replace the `interner_->kind(valTy) == container` test with an
+// unconditional accept for Enum slots and this goes green while the test above
+// stays green — which is why both exist.
+TEST(MirVerifier, StoreOfAWrongWidthValueIntoAnEnumSlotStillRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i64    = in.primitive(TypeKind::I64);
+    TypeId const color  = in.enumType("Color", TypeKind::I32);
+    TypeId const pColor = in.pointer(color);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const fnSig  = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, pColor, /*bytes=*/4);
+    MirInstId const val  = b.addConst(litOf(5, TypeKind::I64), i64);
+    std::array<MirInstId, 2> const st{val, slot};
+    b.addInst(MirOpcode::Store, st, InvalidType);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StoreValueTypeMismatch), 1u)
+        << allActuals(r);
+}
+
+// ACCEPTING SIDE (`_BitInt`). A narrow `_BitInt(N)` slot taking its declared
+// container — the same shape, reached through `bitIntContainerKind` instead of
+// `scalars(enum)[0]`, so BOTH interner mappings the narrowing reads are pinned.
+TEST(MirVerifier, StoreOfABitIntsDeclaredContainerIntoItsSlotAccepted) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const bi     = in.bitInt(3, /*isSigned=*/false);
+    TypeId const pBi    = in.pointer(bi);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const fnSig  = in.fnSig({}, voidTy, CallConv::CcSysV);
+    TypeId const cont   = in.primitive(in.bitIntContainerKind(bi));
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, pBi, /*bytes=*/1);
+    MirInstId const val  = b.addConst(litOf(5, in.bitIntContainerKind(bi)), cont);
+    std::array<MirInstId, 2> const st{val, slot};
+    b.addInst(MirOpcode::Store, st, InvalidType);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StoreValueTypeMismatch), 0u)
+        << allActuals(r);
+}
+
+// ⚠ THE LINE THE NARROWING IS DRAWN ON, PINNED AS A TEST BECAUSE IT IS THE WHOLE
+// ARGUMENT. `i64` into a `u64` slot agrees on width and on every bit, exactly
+// like the enum case — and is still REJECTED, because signedness changes what a
+// later division, shift, comparison or widening does. If this ever goes green,
+// the narrowing has stopped being about representation and become about silence.
+TEST(MirVerifier, StoreOfASignednessMismatchIsStillRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i64    = in.primitive(TypeKind::I64);
+    TypeId const u64    = in.primitive(TypeKind::U64);
+    TypeId const pU64   = in.pointer(u64);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const fnSig  = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, pU64, /*bytes=*/8);
+    MirInstId const val  = b.addConst(litOf(5, TypeKind::I64), i64);
+    std::array<MirInstId, 2> const st{val, slot};
+    b.addInst(MirOpcode::Store, st, InvalidType);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StoreValueTypeMismatch), 1u)
+        << allActuals(r);
+}
+
+TEST(MirVerifier, StoreValueTypeRuleSkippedWithoutInterner) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const i64    = in.primitive(TypeKind::I64);
+    TypeId const pI64   = in.pointer(i64);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const fnSig  = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, pI64, /*bytes=*/8);
+    MirInstId const val  = b.addConst(litOf(7, TypeKind::I32), i32);
+    std::array<MirInstId, 2> const st{val, slot};
+    b.addInst(MirOpcode::Store, st, InvalidType);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, /*interner=*/nullptr};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StoreValueTypeMismatch), 0u)
+        << allActuals(r);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // THE TERMINATOR-SUCCESSOR-ARITY BACKSTOP + THE INLINE-ASM POOL RANGE CHECK
 // ─────────────────────────────────────────────────────────────────────────────

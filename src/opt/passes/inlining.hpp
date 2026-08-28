@@ -45,21 +45,25 @@
 //      SINGLE-BLOCK LEAF) has since been generalized: multi-block
 //      callees inline via the CFG-clone + return-merge-Phi machinery
 //      (cycle 2); a callee containing a regular `Call` (non-leaf) is
-//      admitted (cycle 3); a callee containing an `IntrinsicCall` is
-//      admitted (cycle 6); a callee containing a `Phi` is admitted
+//      admitted (cycle 3); a callee containing a `Phi` is admitted
 //      (cycle 7 — cloned via a deferred-incoming-flush: value remapped
 //      via the shared `local` map, pred via the callee-block clone map;
 //      D-OPT7-MULTIBLOCK-SPLICE-PHI). What REMAINS refused: a callee with
 //      NO returning path, a recursive-cycle call (the call-graph SCC
 //      gate, rule 3), and a callee whose instruction-count exceeds the
 //      cost bound (cycle 28).
-//      The IntrinsicCall admission carries a frame-sensitivity caveat —
-//      a frame-sensitive intrinsic (va_start / frameaddress / setjmp-
-//      class) must NOT be inlined — but no shipped frontend emits any
-//      intrinsic today, so blanket admission is correct for the current
-//      model; per-intrinsic inline-safety gating is trigger-gated to the
-//      first frame-sensitive intrinsic — D-OPT7-INLINE-FRAME-SENSITIVE-
-//      INTRINSIC.
+//      A callee containing an `IntrinsicCall` is REFUSED (cycle 6
+//      admitted it; the refusal is restored). The splice clones an
+//      intrinsic SSA-correctly, but SSA-correctness is not FRAME-
+//      correctness: a frame-sensitive intrinsic (va_start / frameaddress
+//      / returnaddress / stacksave / setjmp-class) means the frame it
+//      runs in, and spliced into the caller it binds to the WRONG frame.
+//      The MIR payload is a BARE intrinsic id, so this gate cannot prove
+//      which kind it has — and refusing what it cannot prove safe is the
+//      rule every other arm here follows. Re-admitting the frame-
+//      INSENSITIVE ones is a pure optimization relaxation, gated on a
+//      per-intrinsic frame-safety attribute that does not exist yet —
+//      D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.
 //
 // **NEVER DELETE a callee body in this pass.** OPT7 inlines call
 // SITES only. A now-dead callee is removed by a LATER DCE pass, which
@@ -110,12 +114,76 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 
 namespace dss::opt::passes {
 
 struct InliningResult {
-    bool        ok            = false;
-    std::size_t callsInlined  = 0;
+    bool        ok             = false;
+    std::size_t callsInlined   = 0;
+    // Call sites that passed EVERY correctness and per-callee rule and were
+    // refused ONLY by the per-caller cumulative growth budget. Purely an
+    // observation channel — the engine does not branch on it — but it is the
+    // difference between "the budget is doing nothing" and "the budget is
+    // doing everything", which is not otherwise visible from outside.
+    std::size_t callsBudgeted  = 0;
+};
+
+// ★★★ THE PER-CALLER CUMULATIVE GROWTH LEDGER.
+//
+// The Inlining pass is STATELESS across invocations — the engine calls
+// `runInlining` afresh on every fixpoint iteration. That is exactly why the
+// growth bound could not live inside the pass: a budget recomputed against
+// each iteration's ENTRY size compounds, `(1 + g)^iterations`, and the
+// iteration cap goes straight back to being the real bound. This ledger is
+// the memory that makes the budget CUMULATIVE: it records each caller's
+// ORIGINAL instruction count — the size it had the first time the pass saw
+// it in this `optimize()` call — so every later iteration measures growth
+// against the SAME fixed origin, and each caller's ceiling never moves.
+//
+// ⇒ total module size is bounded by SUM over callers of (original +
+// allowance) no matter how many iterations run. That, and not the iteration
+// cap, is what makes the fixpoint terminate.
+//
+// KEYED BY `SymbolId`, and the choice is load-bearing on both sides:
+//   * it SURVIVES a rebuild. Every pass reconstructs the module through
+//     `MirBuilder`, so `MirFuncId` ordinals shift the moment DCE deletes a
+//     dead function — but `addFunction` carries the function's SymbolId
+//     through unchanged, so the symbol is the one handle that means the same
+//     function on both sides of a rebuild.
+//   * it is UNIQUE IN A MERGED MODULE. SymbolId is documented as CU-scoped,
+//     which would be fatal here at the program stage (103 CUs, colliding
+//     ids, two functions sharing one budget). ✔MEASURED that the merge closes
+//     this: `mergeCuMirs`'s `SymbolAllocator` mints one merged id per
+//     distinct symbol and ABORTS on a collision, so within any module the
+//     optimizer ever sees, symbol identity IS function identity. It is the
+//     same handle the pass already trusts for the self-recursion rule.
+//
+// ONE LEDGER PER `optimize()` CALL. The unit and program stages each get a
+// fresh one, so a function's origin at the program stage is its
+// post-unit-stage size. That is deliberate and matches how an LTO re-summary
+// behaves: each stage gets its own budget rather than one stage's spending
+// silently mortgaging the other's.
+class InlineGrowthLedger {
+public:
+    // The caller's ORIGINAL instruction count. The FIRST call for a symbol
+    // records `currentInsts` and returns it; every later call returns the
+    // recorded value and IGNORES `currentInsts`. Idempotent by construction —
+    // there is no way to spell "re-baseline this caller", because that is the
+    // bug this class exists to prevent.
+    [[nodiscard]] std::uint32_t
+    originalInsts(SymbolId caller, std::uint32_t currentInsts) {
+        auto const [it, inserted] = original_.try_emplace(caller.v, currentInsts);
+        (void)inserted;
+        return it->second;
+    }
+
+    [[nodiscard]] std::size_t trackedCallers() const noexcept {
+        return original_.size();
+    }
+
+private:
+    std::unordered_map<std::uint32_t, std::uint32_t> original_;
 };
 
 // `inlineThreshold` is the size-based COST bound (OPT7 cycle 28): a
@@ -138,6 +206,60 @@ struct InliningResult {
 // pipeline instead — the whole-module derivation was ~91% of this pass's cost
 // on SQLite (the D-OPT1-VERIFY-FREQUENCY-CONFIG posture split, applied to
 // marker maintenance).
+// ── THE PRODUCTION ENTRY POINT ────────────────────────────────────────
+//
+// `callerGrowthPercent` + `ledger` together are the per-caller CUMULATIVE
+// growth budget (`opt::kDefaultInlineCallerGrowthPercent` carries the whole
+// argument for why it is per-caller and not per-module). A caller may grow,
+// across every invocation that shares this `ledger`, by at most
+//
+//     allowance = max(original * callerGrowthPercent / 100, inlineThreshold)
+//
+// instructions over its ORIGINAL size, and a call site whose callee does not
+// fit in what is left is REFUSED — conservatively, exactly like every other
+// gate refusal: the Call stays, the program compiles, nothing miscompiles.
+//
+// The `inlineThreshold` FLOOR is not slack for its own sake. Without it the
+// per-callee threshold would be a lie for small callers — a 4-instruction
+// wrapper could never absorb the 30-instruction helper the threshold says is
+// inlinable — and wrappers are where inlining pays most.
+//
+// ORDER-INDEPENDENCE, which is the property that made this per-caller: each
+// caller's ceiling is a function of its OWN original size and nothing else,
+// so no caller can consume another's budget and the result does not depend
+// on which function the walk reaches first. Within a caller the budget is
+// spent in the module's own block-then-instruction order, which is a fixed
+// property of the MIR rather than of the scheduler. A module-wide counter
+// would have neither property — and at the unit stage, where CUs are
+// optimized CONCURRENTLY, it would not even be deterministic.
+//
+// `always_inline` (TF-C81) WAIVES the budget, as it already waives
+// `inlineThreshold` — the attribute overrides profitability vetoes and this
+// is one. Such a splice still CHARGES the budget, so it reduces what
+// ordinary sites in the same caller may take; charged but never refused.
+[[nodiscard]] DSS_EXPORT InliningResult
+runInlining(Mir& mir, TypeInterner const& interner,
+            DiagnosticReporter& reporter, std::uint32_t inlineThreshold,
+            std::uint32_t callerGrowthPercent, InlineGrowthLedger& ledger,
+            bool maintainMarkers = true);
+
+// ── THE SINGLE-INVOCATION ENTRY POINT ─────────────────────────────────
+//
+// Exactly equivalent to constructing a fresh `InlineGrowthLedger`, running
+// ONE invocation against it at `opt::kDefaultInlineCallerGrowthPercent`, and
+// discarding it. For a caller that runs the pass ONCE — every hand-built
+// test fixture — that is not an approximation of the production semantics,
+// it IS the production semantics: with one invocation, "size at pass entry"
+// and "original size" are the same number.
+//
+// ⚠ NOT FOR A PIPELINE. A caller that invokes the pass repeatedly and reaches
+// for this overload gets a budget that RE-BASELINES every iteration, which
+// compounds to `(1 + g)^iterations` and hands the iteration cap back its role
+// as the real growth bound — the precise defect
+// `D-OPT-INLINING-FIXPOINT-TRUNCATES-BEFORE-CONVERGING` records. The engine
+// has exactly one call site and it uses the ledger overload above;
+// `Optimizer.InlineGrowthBudgetSpansFixpointIterations` in tests/opt fails if
+// that is ever swapped.
 [[nodiscard]] DSS_EXPORT InliningResult
 runInlining(Mir& mir, TypeInterner const& interner,
             DiagnosticReporter& reporter, std::uint32_t inlineThreshold,

@@ -1,7 +1,7 @@
 // A hand-written AArch64 jump table, taken at runtime, plus a data read-back.
 //
-// This file is the closing witness for D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-
-// AT-AN-OFFSET. Every claim it makes is an EXIT CODE, not a byte pattern:
+// This file is the closing witness for D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET.
+// Every claim it makes is an EXIT CODE, not a byte pattern:
 // three interior labels get three DIFFERENT runtime addresses, the table slot
 // that is read decides which one runs, and a separately-defined data object is
 // read back and used in the arithmetic that produces the answer.

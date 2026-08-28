@@ -1,0 +1,34 @@
+{
+  "$comment": "c48 (D-CSUBSET-BOOL-CHAR-WIDENING): an ACTUAL `_Bool` value assigned to a plain `char` lhs (C 6.3.1.1). Frontier: sqlite3.c:25926 `p->nFloor = (p->D==31);` (nFloor is char) fired S0003. UPDATED 2026-07-20: a comparison/logical RESULT now types `int` at the semantic tier (D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE), so `char c = (a==b)` routes via the int->char charConvertsToArith arm — to keep witnessing the boolWidensToArith+Char path the operand must be an ACTUAL _Bool (`_Bool flag=...; char c=flag;`). isAssignable's boolWidensToArith arm admits Bool into the int/float RANK kinds but not plain `char` (TypeKind::Char, outside the ranks) unless the `lk==Char` term (c48) is present. coerce() lowers Bool->Char as a same-width mov (DSS Bool is 8-bit). flag=(io(41)==41)=true, none=(io(41)<41)=false, c=flag=1, d=none=0, e=io(7)-io(7)=0 (the int->char differentiator, always OK) -> c+d+e+41 = 1+0+0+41 = 42. RED-ON-DISABLE: revert the `lk == TypeKind::Char` term -> `char c=flag` fails S0003 (does not compile); `e=io(7)-io(7)` stays fine, proving the gap is the Bool-value->char path, not int->char narrowing. (Obtaining `flag` also rides scalar->bool — dedicated red-on-disable in scalar_to_bool_convert.)",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

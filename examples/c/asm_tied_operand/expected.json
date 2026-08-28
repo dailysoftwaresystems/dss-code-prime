@@ -1,0 +1,32 @@
+{
+  "$comment": "`\"+r\"` — a GNU extended asm READ-WRITE operand, end to end (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE). ★★★ THIS PROGRAM DID NOT COMPILE BEFORE THIS CYCLE. ✔MEASURED 2026-08-17 through the real CLI on x86_64:pe64-x86_64-windows-exec, debug AND release: `int main(void){ int x; x = 40; __asm__(\"addl $2, %0\" : \"+r\"(x)); return x; }` → rc=1, `error[L_UnsupportedLoweringForOpcode] … output 0 uses the read-write constraint \"+r\"`. `bindAsmOperand` refused every read-write constraint outright — correct when written, because no MIR operand carried the read half; STALE by the time it was measured, because `hir_to_mir.cpp` had begun appending a matching-constraint input per `+` output (GNU 6.47.2.4) one commit earlier. What LIR owed was binding BOTH halves to ONE register, and this example is its runtime witness. ★★★ WHY THE DISCRIMINATING SHAPE HAS **TWO** TIED OPERANDS — MEASURED, NOT ASSUMED, AND THE FIRST VERSION OF THIS FILE WAS VACUOUS. The mutant is the tie deleted (the read half materialised into a FRESH vreg, so the template reads a register nothing wrote); it COMPILES CLEAN, so the failure is a wrong ANSWER, never a refusal. ✔MEASURED 2026-08-17 with the binary PROVEN rebuilt on every transition: ONE tied operand alone → baseline exit 42 AND release exit 42, i.e. THE MUTANT SURVIVES BOTH ARMS; TWO tied operands in one template → baseline 11, release 11 (RED); two tied + a source input behind a call → 11/11 (RED); three tied → 11/11 (RED). ★★ THE MECHANISM, because it generalises: under the mutant the read half's `mov` targets a DEAD vreg emitted immediately before the template, and the template's own result vreg starts its range right after it — the two never overlap, so the linear scan hands the result the register the dead `mov` just filled with exactly the right value. With TWO tied operands the two result vregs overlap EACH OTHER, cannot both inherit, and the luck breaks. ⇒ ★★★ A SINGLE-`\"+r\"` EXAMPLE IS A VACUOUS PIN ON EVERY ARM, AND ADDING A `release` ARM DOES NOT FIX IT — this is a sharper case than the sibling `c_inline_asm_operands`, where release still discriminated. ⛔ Do not simplify this file to the one-operand spelling. ★ SHAPE C (the ordinary single `\"+r\"`) is kept anyway as the coverage a reader comes looking for, and is documented as NOT the discriminating arm. ✔RED-ON-DISABLE, this example's own main.c, mutant applied: baseline RED (exit 11) and release RED (exit 11) on pe64-x86_64-windows-exec — BOTH arms. ⓘ Through `ctest` only the BASELINE arm is witnessed red, because the runner does not attempt the release compile once baseline fails; the release figure above was taken by driving this same main.c through the CLI directly. ⚠ THE `volatile` SEED IS LOAD-BEARING: without it release folds every operand to a constant before lowering, which does not make the pin vacuous but does silently change which mechanism each arm tests. ⚠ WHY THE aarch64 ARM USES `long`: `add %w0, %w0, %w2` is the natural 32-bit spelling and `%w` is an operand MODIFIER no shipped target declares a width-view vocabulary for; the semantic tier refuses it fail-loud (D-CSUBSET-INLINE-ASM-OPERANDS) rather than running the op at the wrong width. ⚠ WHY THE OPERANDS ARE LOCALS AND NOT PARAMETERS: an asm output bound to a PARAMETER is refused with `error[H0009] … symbol N has no storage slot (non-addressable param or unbound)` because an asm output takes its lvalue's ADDRESS and nothing marks the parameter address-taken — pre-existing, NOT `+`-specific (plain `\"=r\"(v)` fails identically), fail-loud rather than silent, and anchored as D-CSUBSET-ASM-OUTPUT-ON-A-PARAMETER-NOT-ADDRESS-TAKEN. ✔All four legs COMPILE at both configs (measured); the three non-Windows legs RUN on their own gate legs.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

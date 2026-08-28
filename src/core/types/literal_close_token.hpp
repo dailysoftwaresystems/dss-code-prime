@@ -39,7 +39,7 @@
 // loader enforces `coalesce ⇒ closeToken`, but NOT the grammar-side corollary
 // that every shape spelling the body also spells the closer. That gap is
 // LOUD, not silent, and MEASURED so: dropping `StringEnd` from
-// `stringLiteralExpr`'s head sequence in c-subset makes the very next string
+// `stringLiteralExpr`'s head sequence in c makes the very next string
 // literal fail to parse — `P0009 expected 'EndStatement' or 'BlockOpen' —
 // got '"'`, then `P0002 expected 'ParenClose' — got '"'` — because the closer
 // token is really in the stream and the schema cursor has no slot for it. A

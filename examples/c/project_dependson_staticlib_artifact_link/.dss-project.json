@@ -1,0 +1,18 @@
+{
+  "$comment": "AP6 (plan 06 §5.1 B.6.2) — the CONSUMER manifest for the compiler's `dependsOn` ARTIFACT-LINK arm. This `dependsOn` is the PRODUCT feature read by the project-config loader (docs/project-config-spec.md §2.6), NOT the corpus harness's same-named key in expected.json — examples/README.md records why two keys share a name deliberately. `path` only: plan 06 §5.1 B.7 forbids any example that touches the network, so nothing clones, fetches or creates a `.dss-deps` cache here.",
+  "$commentComposition": "The verb comes from the DEPENDENCY'S OWN artifactProfile, never from this project's and never from a profile NAME: `foldlib` declares `staticlib` → ArtifactLink → it is BUILT to an archive under <output>/deps/foldlib/<formatName>/ (U-9: collision-free by construction, and never a byte written into the dependency's own tree, which may be read-only) and that archive is appended to THIS target's resolveLibraries. The consumer's own profile (`cli`) has no bearing on the choice.",
+  "$commentPerTarget": "The additions are PER-TARGET internally — one derived archive per consumer target — while `resolveLibraries` stays program-wide in the user-facing surface (plan 06 §5.1 B.10, closing note). This example builds four consumer targets from one manifest, so a resolver that appended a single program-wide artifact would link a PE archive into an ELF image, or an aarch64 archive into an x86_64 one.",
+  "language": "c",
+  "artifactProfile": "cli",
+  "artifactName": "artifact_link",
+  "targets": [
+    "x86_64:pe64-x86_64-windows-exec",
+    "x86_64:elf64-x86_64-linux-exec",
+    "arm64:elf64-aarch64-linux-exec",
+    "arm64:macho64-arm64-darwin-exec"
+  ],
+  "sources": ["main.c"],
+  "dependsOn": [
+    { "path": "foldlib" }
+  ]
+}

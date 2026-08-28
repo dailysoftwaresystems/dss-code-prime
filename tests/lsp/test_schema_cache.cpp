@@ -140,7 +140,7 @@ TEST(SchemaCache, HasSchemaDirReflectsConstructionMode) {
 }
 
 // F14: prove the directory-scan covers ALL shipped languages by
-// extension — `.c`/`.h` resolve to c-subset, `.toy` to toy,
+// extension — `.c`/`.h` resolve to c, `.toy` to toy,
 // `.sql`/`.tsql` to tsql-subset. Without this pin a future change
 // that drops a language from the discovery loop would silently
 // regress LSP UX for that file type.
@@ -149,7 +149,7 @@ TEST(SchemaCache, ShippedModeFindsAllLanguagesByExtension) {
     {
         auto r = c.resolveByExtension(".c");
         ASSERT_TRUE(r.has_value());
-        EXPECT_EQ((*r)->name(), "CSubset");
+        EXPECT_EQ((*r)->name(), "C");
     }
     {
         auto r = c.resolveByExtension(".toy");

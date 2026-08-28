@@ -58,6 +58,28 @@ struct MirAsmOperand {
     // register table — this tier never enumerates register names). Empty ⇒ the
     // allocator picks within `regClass`.
     std::string    fixedRegister;
+
+    // ★★★ THE THIRD BINDING ARM: THE OPERAND **FORM**, for a letter that binds
+    // one (`"m"` → `membase`, `"i"` → `imm32`). `regClass` above is meaningless
+    // on such an operand and asking it for one is the defect this pair closes —
+    // a memory operand requires NO register class, because the ADDRESS is what
+    // gets a register (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED).
+    // The two arms are mutually exclusive: `TargetAsmConstraint::binds` names
+    // exactly one, so `operandKindResolved` and a meaningful `regClass` are
+    // never both live on one entry.
+    //
+    // ⚠ THE BOOL IS LOAD-BEARING FOR THE REASON THE `optional` PAYLOADS ARE ONE
+    // TIER UP: `OperandKindFilter::Reg` is 0, so a default-constructed operand
+    // would otherwise read back as "binds a register form" — a plausible wrong
+    // answer rather than a loud one.
+    //
+    // Raw `OperandKindFilter` value, for the reason `TargetRegClass` is declared
+    // opaquely above: this header is reached by every `mir.hpp` consumer and
+    // must not pull in the 3.4k-line target schema. A TU that names an
+    // enumerator includes `target_schema.hpp` itself, as it already must.
+    bool           operandKindResolved = false;
+    std::uint8_t   operandKind         = 0;
+
     // `"+r"` — this operand is read AND written: one input tied to one output.
     // Recorded on BOTH halves of a lowered `+` operand, because both entries
     // describe the SAME source operand and both are quoted by diagnostics.
@@ -138,8 +160,10 @@ struct DSS_EXPORT MirAsmDescriptor {
     // which names the byte INSIDE the template but never the source statement
     // that embedded it — so a reader with three `__asm__` blocks in one file
     // cannot tell which one is being refused. ✔MEASURED, both references:
-    // gcc 13.3 reports `gt.c:3: Error: no such instruction: …` and clang 18
-    // reports `gt.c:3:13: error: …` with a `note: instantiated into assembly
+    // on a 3-line C file whose `__asm__` names a bogus mnemonic, gcc 13.3
+    // reports the C statement's `<file>:<line>: Error: no such instruction: …`
+    // and clang 18 reports its `<file>:<line>:<col>: error: …` with a
+    // `note: instantiated into assembly
     // here` block — BOTH make the C statement the primary locus, neither has
     // template-primary. HIR→MIR is the last tier that can see the statement's
     // span (MIR→LIR has no source map), so the locus travels on the descriptor
@@ -190,10 +214,34 @@ struct DSS_EXPORT MirAsmDescriptor {
 
     // Outputs in SOURCE order. Output k is result piece k: the `ReturnPiece`
     // anchored to this instruction whose payload ordinal is k.
+    //
+    // ⚠ THAT DEFINITION IS EXACT AND IT EXCLUDES A SHAPE THE SOURCE CALLS AN
+    // OUTPUT. A memory-form operand written in the output section (`"=m"`,
+    // `"+m"`, `"=&m"`) produces NO result piece — the template writes the memory
+    // itself — so it is NOT a member of this list. It is filed in `inputs`,
+    // because its single MIR operand IS its address (see below, and
+    // `hir_to_mir.cpp` — `lowerInlineAsm`, which carries the full argument).
+    // ★ Read the two facts together: `outputs` is the RESULT-PIECE list, not the
+    // "things the source wrote left of the colon" list, and the two stopped
+    // coinciding when the memory-form output direction was realized
+    // ([[D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED]]).
     std::vector<MirAsmOperand> outputs;
     // Inputs in SOURCE order, ALIGNED 1:1 with the instruction's MIR operands
     // (operand j is input j — an asm block has no callee operand, which is why
     // `InlineAsm` is `{0,N}` and not `Call`'s `{1,N}`).
+    //
+    // ⚠⚠ THE ORDERING BELOW IS NOT EXHAUSTIVE ON ITS OWN — READ THIS FIRST. The
+    // full order is [MEMORY-FORM OUTPUTS][source-written inputs][tied read
+    // halves]. A memory-form operand written in the OUTPUT section is filed
+    // here, at the FRONT, because source order puts the output section before
+    // the input section. Nothing in the sentence below became false — `outputs`
+    // is still exactly the result-piece list, this list is still 1:1 with the
+    // instruction's operands, and the tied halves are still last — but a reader
+    // who takes the two-part enumeration as complete will mis-read entry 0 of a
+    // `"=m"` statement as a source-written input when it is the output's
+    // ADDRESS. ⓘ The staleness was introduced by the cycle that realized the
+    // memory-form output direction, which is why it is recorded rather than
+    // silently repaired ([[D-MIR-ASM-DESCRIPTOR-INPUTS-DOCBLOCK-DOES-NOT-NAME-THE-MEMORY-FORM-OUTPUTS]]).
     //
     // ⚠ THE SOURCE-WRITTEN INPUTS COME FIRST, THEN THE TIED READ HALVES. Every
     // `"+r"` OUTPUT appends one entry here carrying `tiedOutput` — GNU's own

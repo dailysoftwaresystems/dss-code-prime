@@ -2126,8 +2126,8 @@ TEST(AsmTextToLir, DataValueWiderThanItsUnitIsRefused) {
 // ★★ A SYMBOL-VALUED DATA ITEM IS A RELOCATION.
 // ⓘ SUPERSEDED 2026-08-13, NOT RE-CUT. This test previously asserted that
 // `.quad main` was REFUSED ("needs a relocation this build does not reach from
-// assembly yet"). That row — D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-
-// OFFSET — is closed, so the pin whose whole subject was the refusal is
+// assembly yet"). That row — D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET
+// — is closed, so the pin whose whole subject was the refusal is
 // replaced by one asserting the capability, exactly as the
 // `asm_x86_64_extern_call_exec_*` pair was. Re-cutting it to keep it green
 // (e.g. narrowing it to some other still-refused shape) is the weakened-guard

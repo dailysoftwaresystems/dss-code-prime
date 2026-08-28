@@ -184,275 +184,407 @@ namespace {
 // Style: reads as the tail of "cannot be suppressed: <text>". Present
 // tense, no anchor ids, no dates, no cross-references — those stay in the
 // prose, which remains the internal record this text is drawn from.
-constexpr std::string_view kWhyBuildHook =
+constexpr MembershipReason kWhyBuildHook{
+    MembershipProng::BuildFailsWithNothingSaid,
     "a failed build hook already aborts the build; silenced, it aborts "
-    "with nothing on stderr saying which hook failed or why";
-constexpr std::string_view kWhyGitNotFound =
+    "with nothing on stderr saying which hook failed or why"};
+constexpr MembershipReason kWhyGitNotFound{
+    MembershipProng::BuildFailsWithNothingSaid,
     "nothing can be acquired without git, so the build stops; silenced, it "
-    "stops with nothing naming the missing tool";
-constexpr std::string_view kWhyGitAcquireFailed =
+    "stops with nothing naming the missing tool"};
+constexpr MembershipReason kWhyGitAcquireFailed{
+    MembershipProng::BuildFailsWithNothingSaid,
     "a git dependency could not be fetched and no checkout exists to build "
     "from; silenced, the build stops without naming the dependency that is "
-    "missing";
-constexpr std::string_view kWhyGitFetchFallback =
+    "missing"};
+constexpr MembershipReason kWhyGitFetchFallback{
+    MembershipProng::WrongArtifactShipsGreen,
     "the build deliberately continued on a checkout it could not refresh; "
     "silenced, an artifact compiled from a revision the operator did not "
-    "choose ships green, with the only line that said so removed";
-constexpr std::string_view kWhyGitNameCollision =
+    "choose ships green, with the only line that said so removed"};
+constexpr MembershipReason kWhyGitNameCollision{
+    MembershipProng::BuildFailsWithNothingSaid,
     "two git dependencies want one cache directory and the build stops "
     "before either is fetched; silenced, it stops with nothing naming the "
-    "two entries that collide";
-constexpr std::string_view kWhyDependencyCycle =
+    "two entries that collide"};
+constexpr MembershipReason kWhyDependencyCycle{
+    MembershipProng::WrongArtifactShipsGreen,
     "the dependency graph has a ring, and the reject is what stops the walk "
     "from breaking it; silenced, the build resolves whichever half the walk "
-    "reached first and ships an artifact missing the rest";
-constexpr std::string_view kWhyPlanNotLanded =
+    "reached first and ships an artifact missing the rest"};
+constexpr MembershipReason kWhyPlanNotLanded{
+    MembershipProng::BuildFailsWithNothingSaid,
     "it announces a mode whose engine has not landed; silenced, the run "
-    "fails with no statement that the feature does not exist yet";
-constexpr std::string_view kWhyTargetAbi =
+    "fails with no statement that the feature does not exist yet"};
+constexpr MembershipReason kWhyTargetAbi{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a mismatched target spec dispatches the wrong backend and "
-    "the emitted image executes wrong machine code at user runtime";
-constexpr std::string_view kWhyLanguageTargetIsa =
+    "the emitted image executes wrong machine code at user runtime"};
+constexpr MembershipReason kWhyLanguageTargetIsa{
+    MembershipProng::BuildFailsWithNothingSaid,
     "it is the SOLE statement of why the build stopped; silenced, the run "
-    "exits non-zero having printed nothing at all";
-constexpr std::string_view kWhySynthRecipe =
+    "exits non-zero having printed nothing at all"};
+constexpr MembershipReason kWhySynthRecipe{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the shim recipe falls out of every synthesis pass and its "
     "symbol goes undefined, breaking the binary LOAD rather than the "
-    "build";
-constexpr std::string_view kWhyFfiIngest =
+    "build"};
+constexpr MembershipReason kWhyFfiIngest{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, FFI ingest builds wrong-shape metadata for an abiModel it "
-    "does not support, or shadows every row under an empty canonical name";
-constexpr std::string_view kWhyBinaryReaderPartial =
+    "does not support, or shadows every row under an empty canonical name"};
+constexpr MembershipReason kWhyBinaryReaderPartial{
+    MembershipProng::WrongArtifactShipsGreen,
     "translation continues on the salvaged part of an input the reader "
     "could not fully decode; silenced, that build ships green with "
-    "nothing saying so";
-constexpr std::string_view kWhyShippedHeaderNotFound =
+    "nothing saying so"};
+constexpr MembershipReason kWhyShippedHeaderNotFound{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a program that calls an undeclared shipped-library symbol "
-    "compiles clean";
-constexpr std::string_view kWhyShippedLibDescriptor =
+    "compiles clean"};
+constexpr MembershipReason kWhyShippedLibDescriptor{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the lowering synthesizes no externs and a program whose "
-    "system-header symbols resolve to nothing compiles clean";
-constexpr std::string_view kWhyShippedHeaderTarget =
+    "system-header symbols resolve to nothing compiles clean"};
+constexpr MembershipReason kWhyShippedHeaderTarget{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the header symbols, structs and typedefs are injected on a "
-    "platform its own descriptor says does not have them";
-constexpr std::string_view kWhyShippedSymbolTarget =
+    "platform its own descriptor says does not have them"};
+constexpr MembershipReason kWhyShippedSymbolTarget{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a symbol unknown to this object format binds to the "
-    "format-default library, links clean, and dies at LOAD";
-constexpr std::string_view kWhyHeaderNameCase =
+    "format-default library, links clean, and dies at LOAD"};
+constexpr MembershipReason kWhyHeaderNameCase{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the resolver picks one of several case-folded matches, and "
-    "which one it picks differs by build host";
-constexpr std::string_view kWhyUnbackedPredefine =
+    "which one it picks differs by build host"};
+constexpr MembershipReason kWhyUnbackedPredefine{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, an identity macro keeps promising a platform surface that "
     "was never built, and the failure surfaces inside the user's own "
-    "#ifdef branch instead of at the false claim";
-constexpr std::string_view kWhyShippedCorpusInvariant =
+    "#ifdef branch instead of at the false claim"};
+constexpr MembershipReason kWhyShippedCorpusInvariant{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, an include edge promises a header the corpus declares "
     "absent, or a header declares nothing at all, and the #include "
-    "compiles while its contents silently are not there";
-constexpr std::string_view kWhyShippedStructVariant =
+    "compiles while its contents silently are not there"};
+constexpr MembershipReason kWhyShippedStructVariant{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, an under-specified per-target variant picks the first "
-    "match, giving a wrong struct layout for the active target";
-constexpr std::string_view kWhyShippedVariant =
+    "match, giving a wrong struct layout for the active target"};
+constexpr MembershipReason kWhyShippedVariant{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, an under-specified per-target variant picks the first "
     "match, giving a wrong constant value, typedef width or macro "
-    "replacement";
-constexpr std::string_view kWhyTypeIdentityConflict =
+    "replacement"};
+constexpr MembershipReason kWhyTypeIdentityConflict{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, two descriptors declaring one tag as different types "
     "resolve first-wins by name, giving include-order-dependent member "
-    "access";
-constexpr std::string_view kWhyHirStructural =
+    "access"};
+constexpr MembershipReason kWhyHirStructural{
+    MembershipProng::WrongArtifactShipsGreen,
     "a HIR lowering / verifier structural invariant; silenced, the module "
-    "reaches codegen violating a contract every downstream tier assumes";
-constexpr std::string_view kWhyWideLiteral =
+    "reaches codegen violating a contract every downstream tier assumes"};
+constexpr MembershipReason kWhyWideLiteral{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a code point that does not fit the requested element width "
-    "ships as a wrong or truncated code unit";
-constexpr std::string_view kWhyConflictingStringPrefixes =
+    "ships as a wrong or truncated code unit"};
+constexpr MembershipReason kWhyConflictingStringPrefixes{
+    MembershipProng::Both,
     "silenced, a mixed-prefix literal concatenation fails the build with "
-    "nothing shown, or is typed as a plain narrow array";
-constexpr std::string_view kWhyShimSignature =
+    "nothing shown, or is typed as a plain narrow array"};
+constexpr MembershipReason kWhyShimSignature{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the build goes green and emits a call to a synthesized "
-    "shim under a different ABI than the caller made it";
-constexpr std::string_view kWhyMirVerifier =
+    "shim under a different ABI than the caller made it"};
+constexpr MembershipReason kWhyMirVerifier{
+    MembershipProng::WrongArtifactShipsGreen,
     "a frozen-module MIR-verifier invariant; silenced, an SSA, CFG, "
-    "dominance or type violation sails past the verifier into codegen";
-constexpr std::string_view kWhyVlaAllocaOperand =
+    "dominance or type violation sails past the verifier into codegen"};
+constexpr MembershipReason kWhyVlaAllocaOperand{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a runtime-sized alloca with a malformed operand shape "
-    "ships a mis-sized stack slot";
-constexpr std::string_view kWhyAtomicNotLowered =
+    "ships a mis-sized stack slot"};
+constexpr MembershipReason kWhyAtomicNotLowered{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a plain load or store of _Atomic memory performs a "
-    "NON-atomic access, the exact miscompile _Atomic exists to prevent";
-constexpr std::string_view kWhyCallSignature =
+    "NON-atomic access, the exact miscompile _Atomic exists to prevent"};
+constexpr MembershipReason kWhyCallSignature{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a call whose operands do not match its resolved callee "
-    "signature ships green with the arguments in the wrong slots";
-constexpr std::string_view kWhyLinkerImage =
+    "signature ships green with the arguments in the wrong slots"};
+constexpr MembershipReason kWhyStoreValueType{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, a store whose value type is not its slot type ships the "
+    "wrong BYTES to memory with no other build-time symptom"};
+constexpr MembershipReason kWhyLinkerImage{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, errorCount() reads zero while the image on disk is "
-    "refused, empty, missing or truncated";
-constexpr std::string_view kWhyNoMatchingObjectFormat =
+    "refused, empty, missing or truncated"};
+constexpr MembershipReason kWhyNoMatchingObjectFormat{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the linker dispatches the wrong format walker and writes a "
-    "corrupted artifact";
-constexpr std::string_view kWhyFormatLacksImportSupport =
+    "corrupted artifact"};
+constexpr MembershipReason kWhyFormatLacksImportSupport{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, an extern goes unresolved in a dynamic image whose format "
-    "cannot carry imports at all";
-constexpr std::string_view kWhyRelocationKindMismatch =
+    "cannot carry imports at all"};
+constexpr MembershipReason kWhyRelocationKindMismatch{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a relocation kind the format does not support is applied "
-    "anyway, putting wrong bytes in the image";
-constexpr std::string_view kWhyWalkerInputContract =
+    "anyway, putting wrong bytes in the image"};
+constexpr MembershipReason kWhyWalkerInputContract{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, malformed linker-driver input propagates through the "
-    "format walker undetected";
-constexpr std::string_view kWhyEntryResolvesToExtern =
+    "format walker undetected"};
+constexpr MembershipReason kWhyEntryResolvesToExtern{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the loader jumps to unrelocated import-stub bytes at "
-    "process entry, a fault with no diagnostic trail";
-constexpr std::string_view kWhyAssembledData =
+    "process entry, a fault with no diagnostic trail"};
+constexpr MembershipReason kWhyAssembledData{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a producer ships two data items at one symbol "
-    "(last-write-wins) or a bss item carrying bytes that silently drop";
-constexpr std::string_view kWhyStackReserve =
+    "(last-write-wins) or a bss item carrying bytes that silently drop"};
+constexpr MembershipReason kWhyStackReserve{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the build reports success while emitting an image whose "
-    "stack is not the size the program asked for";
-constexpr std::string_view kWhyEntryTrampoline =
+    "stack is not the size the program asked for"};
+constexpr MembershipReason kWhyEntryTrampoline{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the image entry points at the wrong code and the program "
-    "runs the wrong entry, or falls off it, from a green build";
-constexpr std::string_view kWhyProgramEntry =
+    "runs the wrong entry, or falls off it, from a green build"};
+constexpr MembershipReason kWhyProgramEntry{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, entry resolution proceeds on a wrong, absent or ambiguous "
-    "candidate and the binary faults at startup from a green build";
-constexpr std::string_view kWhyExternImportConflict =
+    "candidate and the binary faults at startup from a green build"};
+constexpr MembershipReason kWhyExternImportConflict{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, two CUs declaring one external name under different "
-    "binding models merge first-wins and half the calls bind wrong";
-constexpr std::string_view kWhyLirStructural =
+    "binding models merge first-wins and half the calls bind wrong"};
+constexpr MembershipReason kWhyLirStructural{
+    MembershipProng::WrongArtifactShipsGreen,
     "a LIR verifier / lowering structural invariant; silenced, the "
     "violation reaches the assembler and miscompiles through the LIR "
-    "layer";
-constexpr std::string_view kWhySideStructureIntegrity =
+    "layer"};
+constexpr MembershipReason kWhySideStructureIntegrity{
+    MembershipProng::WrongArtifactShipsGreen,
     "a module side structure (literal pool / per-instruction register-"
     "constraint pool) is referenced by index from the instruction stream; "
-    "silenced, a rebuild that loses the reference miscompiles silently";
-constexpr std::string_view kWhyVlaDynamicAlloca =
+    "silenced, a rebuild that loses the reference miscompiles silently"};
+constexpr MembershipReason kWhyVlaDynamicAlloca{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a runtime-sized alloca falls to the fixed-slot path and "
-    "emits a one-slot scalar for the whole VLA";
-constexpr std::string_view kWhyTerminatorSuccessors =
+    "emits a one-slot scalar for the whole VLA"};
+constexpr MembershipReason kWhyTerminatorSuccessors{
+    MembershipProng::WrongArtifactShipsGreen,
     "the terminator's recorded successors and its own BlockRef operands "
     "disagree; silenced, the encoder takes a branch displacement from an "
     "operand list the CFG no longer matches -- a branch to the wrong block, "
-    "or none at all";
-constexpr std::string_view kWhyAsmTextUnsupported =
+    "or none at all"};
+constexpr MembershipReason kWhyAsmTextUnsupported{
+    MembershipProng::WrongArtifactShipsGreen,
     "an unrecognized `.s` construct; silenced, the assembler emits a binary "
-    "that omits an instruction the programmer wrote";
-constexpr std::string_view kWhyInlineAsmExtended =
+    "that omits an instruction the programmer wrote"};
+constexpr MembershipReason kWhyInlineAsmExtended{
+    MembershipProng::WrongArtifactShipsGreen,
     "a GNU extended inline-asm statement lowers to a 0-child barrier that "
     "discards its operand list; silenced, the asm executes and clobbers "
     "registers the allocator still believes it owns, while the declared "
-    "outputs keep their prior values";
-constexpr std::string_view kWhyInlineAsmLabelSection =
+    "outputs keep their prior values"};
+constexpr MembershipReason kWhyInlineAsmLabelSection{
+    MembershipProng::WrongArtifactShipsGreen,
     "a label section without the `goto` qualifier; silenced, the statement "
     "reaches the extended-asm gate mis-sectioned, so which colon delimited "
-    "which operand role becomes a guess";
-constexpr std::string_view kWhyVlaNonLeafFrame =
+    "which operand role becomes a guess"};
+constexpr MembershipReason kWhyVlaNonLeafFrame{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a non-leaf VLA frame places outgoing call arguments inside "
-    "the VLA region, an ABI break";
-constexpr std::string_view kWhyRegallocInvariant =
+    "the VLA region, an ABI break"};
+constexpr MembershipReason kWhyRegallocInvariant{
+    MembershipProng::WrongArtifactShipsGreen,
     "a register-allocation calling-convention / class invariant; "
-    "silenced, allocation proceeds with no convention or class to honour";
-constexpr std::string_view kWhyEncodingBytes =
+    "silenced, allocation proceeds with no convention or class to honour"};
+constexpr MembershipReason kWhyEncodingBytes{
+    MembershipProng::WrongArtifactShipsGreen,
     "an assembler bytes-on-disk invariant; silenced, the encoder emits "
-    "wrong machine code";
-constexpr std::string_view kWhyImmediateRange =
+    "wrong machine code"};
+constexpr MembershipReason kWhyImmediateRange{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a too-wide immediate is truncated into a wrong "
-    "machine-code constant, a wrong syscall number for instance";
-constexpr std::string_view kWhyIncompleteType =
+    "machine-code constant, a wrong syscall number for instance"};
+constexpr MembershipReason kWhyImmediateNarrowed{
+    MembershipProng::WrongArtifactShipsGreen,
+    "the one statement that a shipped instruction carries a DIFFERENT "
+    "constant than the one written; silenced, the narrowing becomes "
+    "indistinguishable from the reference assembler's own silence, which is "
+    "the arm the operator's ruling exists to reject"};
+constexpr MembershipReason kWhyIncompleteType{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, an object or member of an incomplete composite folds its "
-    "size to zero, a wrong-bytes layout";
-constexpr std::string_view kWhySilentConstraint =
+    "size to zero, a wrong-bytes layout"};
+constexpr MembershipReason kWhySilentConstraint{
+    MembershipProng::BuildFailsWithNothingSaid,
     "the build already fails on this constraint violation; silenced, it "
-    "fails with ZERO diagnostics shown and no statement of why";
-constexpr std::string_view kWhyPackedBitfield =
+    "fails with ZERO diagnostics shown and no statement of why"};
+constexpr MembershipReason kWhyPackedBitfield{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a packed struct carrying a bit-field is laid out padded "
-    "instead, the wrong ABI";
-constexpr std::string_view kWhyNullptrOperand =
+    "instead, the wrong ABI"};
+constexpr MembershipReason kWhyNullptrOperand{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, nullptr lowers through the integer-0 null constant and "
-    "`nullptr + 1` compiles as `0 + 1`";
-constexpr std::string_view kWhyEnumUnderlying =
+    "`nullptr + 1` compiles as `0 + 1`"};
+constexpr MembershipReason kWhyEnumUnderlying{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the enum is laid out at the default width instead, or an "
-    "out-of-range enumerator wraps into a wrong constant";
-constexpr std::string_view kWhyTypeofBitfield =
+    "out-of-range enumerator wraps into a wrong constant"};
+constexpr MembershipReason kWhyTypeofBitfield{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the typeof resolves to the bit-field declared (widened) "
-    "type, a wrong type in the declaration it specifies";
-constexpr std::string_view kWhyConstexpr =
+    "type, a wrong type in the declaration it specifies"};
+constexpr MembershipReason kWhyConstexpr{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, constexpr degrades to plain const and an object that "
-    "cannot deliver a translation-time value compiles quietly";
-constexpr std::string_view kWhyAutoInference =
+    "cannot deliver a translation-time value compiles quietly"};
+constexpr MembershipReason kWhyAutoInference{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the declaration adopts its initializer type and compiles "
-    "the very form the constraint forbids";
-constexpr std::string_view kWhyThreadLocal =
+    "the very form the constraint forbids"};
+constexpr MembershipReason kWhyThreadLocal{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, thread storage lowers wrong: a per-call automatic, a split "
-    "binding, or a link-time tpoff bit-cast into a data slot";
-constexpr std::string_view kWhyBitIntWidth =
+    "binding, or a link-time tpoff bit-cast into a data slot"};
+constexpr MembershipReason kWhyBitIntWidth{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the _BitInt(N) type has no computable width and masking "
-    "and layout pick a garbage N";
-constexpr std::string_view kWhyBitIntFloatConv =
+    "and layout pick a garbage N"};
+constexpr MembershipReason kWhyBitIntFloatConv{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, wide _BitInt float conversion takes the naive scalar path, "
-    "emitting the wrong sign and dropping the upper limbs";
-constexpr std::string_view kWhyVlaStorage =
+    "emitting the wrong sign and dropping the upper limbs"};
+constexpr MembershipReason kWhyVlaStorage{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a runtime-sized array is carried into the static-local "
-    "lowering, whose layout has no static size";
-constexpr std::string_view kWhyVlaSize =
+    "lowering, whose layout has no static size"};
+constexpr MembershipReason kWhyVlaSize{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a non-integer VLA bound truncates to a garbage element "
-    "count, or a null bound gives a silent 0-byte array";
-constexpr std::string_view kWhyArrayParamQualifier =
+    "count, or a null bound gives a silent 0-byte array"};
+constexpr MembershipReason kWhyArrayParamQualifier{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the illegal array-declarator decoration is dropped and a "
-    "mis-typed or mis-sized object ships";
-constexpr std::string_view kWhyInlineAsmTemplate =
+    "mis-typed or mis-sized object ships"};
+constexpr MembershipReason kWhyInlineAsmTemplate{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a non-empty asm template lowers to a no-op barrier and its "
-    "instructions simply vanish";
+    "instructions simply vanish"};
 // ── inline-asm P5 operand binding ─────────────────────────────────────────
 // SEVEN reasons rather than one shared string, because the second candidate
 // lowering differs per code and the reason is what the operator is SHOWN when
 // their --suppress is refused. A shared "inline asm cannot be suppressed"
 // would tell them which table refused them and nothing about what would have
 // happened.
-constexpr std::string_view kWhyAsmConstraintLetter =
+constexpr MembershipReason kWhyAsmConstraintLetter{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, an operand whose constraint letter this target does not "
     "declare binds to nothing, and the asm runs on whatever the allocator "
-    "left in place";
-constexpr std::string_view kWhyAsmConstraintForm =
+    "left in place"};
+constexpr MembershipReason kWhyAsmConstraintForm{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a multi-alternative or multi-letter constraint makes the "
-    "binder pick one alternative on its own, unannounced";
-constexpr std::string_view kWhyAsmOperandModifier =
-    "silenced, a width-view modifier falls back to the full register, so a "
-    "32-bit operation executes 64-bit";
-constexpr std::string_view kWhyAsmClobberUnknown =
+    "binder pick one alternative on its own, unannounced"};
+// ⚠ THE WIDTH-VIEW MODIFIER ITSELF IS NO LONGER WHAT THIS CODE REFUSES (P30 —
+// the dialects declare `assembly.templateModifiers` and `%w0` lowers), so the
+// reason names the PROPERTY rather than the retired spelling: what is left is
+// every other `%`-form this build cannot expand, and silencing any of them
+// emits the operand at the full register width.
+constexpr MembershipReason kWhyAsmOperandModifier{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, a % form this build cannot expand is emitted with its operand "
+    "at the full register width, so an operation the template asked to be "
+    "narrow executes wide"};
+constexpr MembershipReason kWhyAsmClobberUnknown{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the clobber is dropped, a live value stays parked in a "
-    "register the asm overwrites, and the wrong value is read after it";
-constexpr std::string_view kWhyAsmTemplateUnparsable =
+    "register the asm overwrites, and the wrong value is read after it"};
+constexpr MembershipReason kWhyAsmTemplateUnparsable{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a template the dialect could not parse lowers to nothing and "
-    "the instructions the programmer wrote vanish";
-constexpr std::string_view kWhyAsmPlaceholderRange =
+    "the instructions the programmer wrote vanish"};
+constexpr MembershipReason kWhyAsmPlaceholderRange{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a placeholder past the last declared operand is dropped or "
-    "emitted raw, and the instruction operates on the wrong thing";
-constexpr std::string_view kWhyAsmPlaceholderInBasic =
+    "emitted raw, and the instruction operates on the wrong thing"};
+constexpr MembershipReason kWhyAsmPlaceholderInBasic{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a % form in a template with no operand sections is either "
     "bound against an operand list that does not exist or passed through "
-    "raw, and the two ship different machine code";
-constexpr std::string_view kWhyAsmDuplicateSymbolicName =
+    "raw, and the two ship different machine code"};
+constexpr MembershipReason kWhyAsmDuplicateSymbolicName{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, one of the two bindings the repeated name introduces is "
-    "discarded by a first-match lookup and the template reads the other";
-constexpr std::string_view kWhyBitfieldMutation =
+    "discarded by a first-match lookup and the template reads the other"};
+constexpr MembershipReason kWhyBitfieldMutation{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the mutation falls to a full-unit store that clobbers "
-    "packed neighbours and skips truncation";
-constexpr std::string_view kWhyErrorDirective =
+    "packed neighbours and skips truncation"};
+constexpr MembershipReason kWhyErrorDirective{
+    MembershipProng::WrongArtifactShipsGreen,
     "an #error the author wrote to stop exactly this configuration; "
     "silenced, the build they declared invalid is built, and reports "
-    "success";
-constexpr std::string_view kWhyPragmaUnhonored =
+    "success"};
+constexpr MembershipReason kWhyPragmaUnhonored{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a pragma that changes memory layout is ignored without a "
-    "word and composites are laid out at the wrong size";
-constexpr std::string_view kWhyPragmaPackAmbiguous =
+    "word and composites are laid out at the wrong size"};
+constexpr MembershipReason kWhyPragmaPackAmbiguous{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, a composite with two candidate layouts of different size "
-    "and offsets simply gets one of them, unannounced";
-constexpr std::string_view kWhyAsmLabel =
+    "and offsets simply gets one of them, unannounced"};
+constexpr MembershipReason kWhyAsmLabel{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, the intended symbol name is not restored: a C-mangled or "
-    "synthetic name ships and the build stays green all the way to link";
-constexpr std::string_view kWhyOperatorNameNotDefinable =
+    "synthetic name ships and the build stays green all the way to link"};
+constexpr MembershipReason kWhyOperatorNameNotDefinable{
+    MembershipProng::WrongArtifactShipsGreen,
     "silenced, __has_include(<h>) answers 0 while #include <h> still "
-    "splices the header, so the guard and the include disagree";
+    "splices the header, so the guard and the include disagree"};
+
+// ★★★ THE TWO CODES D-DIAG-UNSUPPRESSABLE-FAMILY-UNDECIDED WAS FILED ABOUT.
+//
+// TF-C87 minted `P_PreprocessorIncludeReentryRefused` and deliberately did NOT
+// add it here, on the ground that its sibling was not a member either and that
+// the whole family deserved one considered decision rather than a drive-by.
+// That was the right instinct about PROCESS and a wrong belief about the FACTS:
+// ✔MEASURED 2026-08-26, the two-prong rule at the top of this file answers both
+// codes cleanly, and had been able to the whole time. The family was never
+// undecided — the rule was simply never run against it.
+//
+// ⭐ AND THE VERDICT IS MEASURED, NOT ARGUED. Both were put through the shipped
+// CLI with the diagnostic suppressed, elf64-x86_64:
+//   * a TU whose quote-`#include` names a header that does not exist:
+//     UNSUPPRESSED -> `error[P0016]`, no artifact. SUPPRESSED -> **zero error
+//     lines and a 9,584-byte ELF64 executable on disk**.
+//   * a self-including header with no include guard: UNSUPPRESSED ->
+//     `error[P0022]`, no artifact. SUPPRESSED -> **zero error lines and a
+//     9,584-byte ELF64 executable on disk**.
+// A real binary, built green, from a translation unit that silently lost an
+// entire header. That is prong (1) with the artifact in hand, and it is exactly
+// the outcome the row predicted when it wrote that a build "can silently stop
+// reporting missing headers, and the only survivor of that is a smaller number
+// that looks like progress".
+constexpr MembershipReason kWhyIncludeError{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, a translation unit whose #include could not be resolved, read "
+    "or nested compiles WITHOUT that header's contents and links into a real "
+    "binary, green"};
+constexpr MembershipReason kWhyIncludeReentryRefused{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, a header this build refused to re-enter is simply absent from "
+    "the translation unit, which then compiles and links green -- and the "
+    "refusal fires only on a genuine cycle or a gap in the guard detector, so "
+    "it is the one line that could have told you which"};
 
 // ⓘ EXTENT 150 → 151 (2026-08-15): `D_LanguageTargetIsaMismatch` (0xD02A)
 // joined on prong (2) — see its row below. The extent is deliberately an
@@ -466,7 +598,25 @@ constexpr std::string_view kWhyOperatorNameNotDefinable =
 // ⓘ EXTENT 163 → 164 (2026-08-19, cycle P20): `S_InlineAsmDuplicateSymbolicName`
 // (0xE06C) joined on prong (1) — see its row below. ✔The explicit extent did its
 // job again: the row was written first and the build failed until this line moved.
-constexpr std::array<UnsuppressableEntry, 164> kUnsuppressableCodes{{
+// ⓘ EXTENT 164 → 165 (2026-08-25, cycle P34): `A_ImmediateNarrowedToOperandField`
+// (0x1009) joined on prong (1) — see its row below, and note it is the FIRST
+// WARNING-severity member, which strengthens rather than stretches the prong.
+// ✔The explicit extent did its job a third time: `too many initializers for
+// 'UnsuppressableEntry [164]'` was the build's answer until this line moved.
+// ⓘ EXTENT 165 → 166 (2026-08-26, cycle P36): `I_StoreValueTypeMismatch`
+// (0xA01A) joined on prong (1) — see its row below. ✔The explicit extent did its
+// job a FOURTH time: `too many initializers for 'UnsuppressableEntry [165]'` was
+// the build's answer until this line moved, and it was the first thing the new
+// row's syntax check reported.
+// ⓘ EXTENT 166 → 168 (2026-08-26, cycle P36, D-DIAG-UNSUPPRESSABLE-FAMILY-UNDECIDED):
+// `P_PreprocessorIncludeError` (0x0016) and `P_PreprocessorIncludeReentryRefused`
+// (0x0022) join, both on prong (1), both with a measured ELF64 artifact as the
+// evidence — see the block beside `kWhyIncludeError`. These are the two codes
+// the row was filed about, and they close the split it called "arbitrary on its
+// face": within the preprocessor's own codes, `#pragma` failures were
+// unsuppressable while `#include` failures were not. ✔The explicit extent did
+// its job a FIFTH time.
+constexpr std::array<UnsuppressableEntry, 168> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -887,6 +1037,45 @@ constexpr std::array<UnsuppressableEntry, 164> kUnsuppressableCodes{{
     // shim would call the C runtime with arguments in the wrong slots and ship
     // green — a wrong-BYTES miscompile with no other build-time symptom.
     {DiagnosticCode::I_CallSignatureMismatch, kWhyCallSignature},
+    // I_StoreValueTypeMismatch (P36, D-MIR-VERIFIER-STORE-CALLARG-TYPE-BLIND):
+    // the memory-write typing belt — a Store/AtomicStore whose value type is not
+    // its address pointee's. A member like every I_* verifier invariant;
+    // suppressed, the exact narrowing-cast class that hid inside
+    // D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE would go back to shipping
+    // green — wrong bytes in memory, no diagnostic, no other symptom.
+    //
+    // ★★ THE TIER ARGUMENT, ON THE RECORD, BECAUSE THIS CODE WAS BORN REDDENING
+    // FIFTEEN CORPUS EXAMPLES AND THAT IS EXACTLY WHEN A FALSE POSITIVE IS LEAST
+    // AFFORDABLE — unsuppressable means no user can ever get past it. Three
+    // reasons it is nonetheless a member, and one honest admission:
+    //
+    //  (1) WHAT IT GUARDS HAS NO OTHER SYMPTOM. Every other build-time signal is
+    //      silent for a wrong-typed store: the bytes are written, the link
+    //      succeeds, the binary runs and is wrong. A suppressible miscompile
+    //      guard is a guard the first person under deadline turns off, and the
+    //      thing they turn off is the only thing that was going to tell them.
+    //
+    //  (2) IT CANNOT BE TRIPPED BY A USER'S PROGRAM, ONLY BY OURS. The rule reads
+    //      MIR, which no source language can author directly. A firing is always
+    //      a defect in a DSS lowering or synthesis pass — never in the C the user
+    //      wrote — so there is no legitimate program for an escape hatch to
+    //      rescue. Suppressing it would let OUR defect ship under THEIR flag.
+    //
+    //  (3) THE WHOLE I_* BAND IS UNSUPPRESSABLE AND AN EXCEPTION WOULD BE UNSTATED.
+    //      Making this the one silenceable verifier invariant would leave the
+    //      band's meaning depending on which code fired.
+    //
+    //  ⚠ (4) THE ADMISSION: it DID have a false-positive class on day one — a
+    //      store into an `enum` / bit-field `_BitInt` slot whose value carries the
+    //      tier's own declared CONTAINER type. Width, signedness and bits all
+    //      agree there, so nothing could be miscompiled. That was fixed AT THE
+    //      RULE (mir_verifier.cpp, the declared-representation narrowing), which
+    //      is the only correct answer: the escape for a false positive is to fix
+    //      the rule, never to hand the user a switch that also silences the true
+    //      positives. If a future firing turns out to be a false positive, that is
+    //      a bug in this rule with the same severity as a missed store — fix it
+    //      there, and do NOT promote this code out of the band to buy time.
+    {DiagnosticCode::I_StoreValueTypeMismatch, kWhyStoreValueType},
 
     // K_* linker band — image refused / undefined extern + the LK10
     // image-write contract codes. Suppressing any K_ImageWrite* code
@@ -1094,6 +1283,41 @@ constexpr std::array<UnsuppressableEntry, 164> kUnsuppressableCodes{{
     // truncated to a wrong machine-code constant (e.g. wrong syscall
     // number). Same bytes-on-disk-invariant band as the others above.
     {DiagnosticCode::A_ImmediateOperandOutOfRange, kWhyImmediateRange},
+    // D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES (cycle P34).
+    //
+    // ★★★ THE STRONGEST PRONG-(1) MEMBER IN THIS TABLE, AND ITS SEVERITY IS
+    // WHY. Every other member above is an ERROR: suppress it and the build
+    // still fails, so no wrong bytes ship by that route alone. This one is a
+    // WARNING — the build SUCCEEDS and the narrowed instruction goes to disk
+    // by design. Prong (1) reads "wrong artifact ships green"; here the green
+    // is not a hypothetical consequence of silencing the code, it is the
+    // code's own normal operating condition. The diagnostic is the ONLY thing
+    // standing between a narrowed immediate and a silent one.
+    //
+    // ★★ AND THE ARCHITECTURAL REASON, WHICH IS THE DECIDING ONE. The
+    // operator ruled a THIRD arm over two opposed ones: (A) match the
+    // reference and truncate silently, (B) keep refusing what the reference
+    // assembles. The third arm is (A)'s acceptance plus (B)'s loudness. If
+    // `--suppress=0x1009` could silence the warning, the third arm would
+    // COLLAPSE BACK INTO ARM (A) at the flick of one flag — the ruling would
+    // ship as a default rather than as a behaviour, and the arm the operator
+    // rejected would be one command line away. A ruling that a flag can undo
+    // was not a ruling.
+    //
+    // ⓘ THE COUNTER-ARGUMENT, CONSIDERED AND REJECTED: "an unsilenceable
+    // warning breaks a -Werror build of legitimate code." It does not. This
+    // is not an error and does not gate `ok`; and every value that trips it
+    // has an exact, local, zero-cost remedy — write the constant that fits
+    // (`$0x7fff` for `$-32769`). A diagnostic whose remedy is one edit in the
+    // line that caused it is precisely the kind that may be made
+    // unsuppressable; one that merely hides advice about code the author
+    // cannot change is not, which is why P_PreprocessorWarningDirective and
+    // S_DeprecatedSymbolUsed stay suppressable below.
+    //
+    // ⓘ It needs no `DiagnosticDelivery::Guaranteed`: membership already
+    // bypasses the volume cap (`mustDeliver`), and a narrowing warning lost
+    // to a cap is as silent as a suppressed one.
+    {DiagnosticCode::A_ImmediateNarrowedToOperandField, kWhyImmediateNarrowed},
     {DiagnosticCode::A_AsmTextUnsupported, kWhyAsmTextUnsupported},
 
     // S_* semantic band — silent-MISCOMPILE guards.
@@ -1317,8 +1541,8 @@ constexpr std::array<UnsuppressableEntry, 164> kUnsuppressableCodes{{
     {DiagnosticCode::S_InlineAsmNonEmptyTemplate, kWhyInlineAsmTemplate},
     {DiagnosticCode::S_InlineAsmExtendedUnsupported, kWhyInlineAsmExtended},
     {DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto, kWhyInlineAsmLabelSection},
-    // Inline-asm P5 operand binding, 0xE065..0xE06B (D-CSUBSET-INLINE-ASM-
-    // OPERANDS + D-CSUBSET-INLINE-ASM-TEXT). SEVEN codes, all admitted on
+    // Inline-asm P5 operand binding, 0xE065..0xE06B (D-CSUBSET-INLINE-ASM-OPERANDS
+    // + D-CSUBSET-INLINE-ASM-TEXT). SEVEN codes, all admitted on
     // PRONG (1), and the prong is met the same way in each: the construct has
     // a SECOND CANDIDATE LOWERING that a silenced compiler would take without
     // saying so — an unbound operand, an alternative the binder chose itself,
@@ -1357,8 +1581,8 @@ constexpr std::array<UnsuppressableEntry, 164> kUnsuppressableCodes{{
     // it: `volatile volatile` has one candidate reading, a name used twice has
     // exactly two and the compiler picks one in silence.
     {DiagnosticCode::S_InlineAsmDuplicateSymbolicName, kWhyAsmDuplicateSymbolicName},
-    // S_BitfieldMutationUnsupportedBase (D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-
-    // RESIDUAL): a bit-field compound/inc-dec/value mutation through an anonymous-
+    // S_BitfieldMutationUnsupportedBase (D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL):
+    // a bit-field compound/inc-dec/value mutation through an anonymous-
     // member or array-arrow base. Suppressed, the mutation falls to the generic
     // via-ptr path whose full-unit store CLOBBERS packed neighbours + skips
     // truncation — a silent miscompile. Same silent-miscompile-guard class as the
@@ -1394,6 +1618,31 @@ constexpr std::array<UnsuppressableEntry, 164> kUnsuppressableCodes{{
     // translation continues, no wrong bytes ship, no build failure is hidden, and
     // `--suppress` must stay able to silence exactly that advisory class — the
     // same posture as S_DeprecatedSymbolUsed / S_UnknownAttribute above.
+    // P_PreprocessorDefinedFromExpansion (D-PP-DEFINED-VIA-MACRO-EXPANSION, C
+    // 6.10.1) is deliberately NOT a member either, and it is the cleanest case in
+    // the file for the "merely hides advice" prong: the construct it reports is
+    // one DSS deliberately SUPPORTS — it evaluates the operator and continues, so
+    // suppressing the warning changes no answer, ships no bytes and hides no
+    // failure. It is also advice about code the author usually CANNOT change:
+    // ✔MEASURED, Apple's `secure/_string.h` uses the construct on purpose, so a
+    // user compiling that SDK would be handed an unsilenceable warning per
+    // translation unit for a header they do not own. That is exactly the
+    // A_ImmediateNarrowedToOperandField distinction drawn above — a diagnostic
+    // whose remedy is one edit in the line that caused it may be made
+    // unsuppressable; one about a line the author cannot edit may not.
+    // `--warnings-as-errors` remains the lever for a project that wants the
+    // construct out of its own sources.
+    // P_PreprocessorIfLiteralImplicitlyUnsigned
+    // (D-PP-IF-LARGE-DECIMAL-LITERAL-HAS-NO-WARNING, C 6.10.1p4) is deliberately
+    // NOT a member, by the same two prongs: DSS evaluates the `#if` and takes
+    // the SAME branch both references take whether or not the warning is shown,
+    // so suppressing it ships no wrong bytes and hides no build failure. It also
+    // fails the "remedy is one edit in the offending line" test the
+    // A_ImmediateNarrowedToOperandField note draws — the literal is routinely in
+    // a system header the author does not own (a `SIZE_MAX`-shaped guard), which
+    // is exactly why both references make it an ordinary, silenceable warning
+    // (clang's is even named: -Wimplicitly-unsigned-literal) rather than an
+    // error. `--warnings-as-errors` is the lever for a project that wants it out.
     {DiagnosticCode::P_PreprocessorErrorDirective, kWhyErrorDirective},
     // TF-C82 (D-PP-PRAGMA-REGISTRY): a REACHED pragma DSS does not implement, or
     // one whose operand it cannot honour. Same argument as its `#error` neighbour
@@ -1441,6 +1690,16 @@ constexpr std::array<UnsuppressableEntry, 164> kUnsuppressableCodes{{
     // code (its guard is dead once the operator is `defined`), so membership
     // costs conforming input nothing.
     {DiagnosticCode::P_PreprocessorOperatorNameNotDefinable, kWhyOperatorNameNotDefinable},
+    // P36 (D-DIAG-UNSUPPRESSABLE-FAMILY-UNDECIDED): the two codes that row was
+    // filed about, admitted on prong (1) by the rule this file already had —
+    // with the ELF64 binaries the suppressed builds produced as the evidence.
+    // See the block beside `kWhyIncludeError` for the measurement.
+    // ★ THE SPLIT THE ROW CALLED "ARBITRARY ON ITS FACE" IS CLOSED: `#pragma`
+    // failures were unsuppressable while `#include` failures were not, in one
+    // subsystem, for no stated reason. Both are members now, for the same
+    // stated reason.
+    {DiagnosticCode::P_PreprocessorIncludeError, kWhyIncludeError},
+    {DiagnosticCode::P_PreprocessorIncludeReentryRefused, kWhyIncludeReentryRefused},
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the
@@ -1489,7 +1748,7 @@ static_assert(kUnsuppressableCodesHaveNoNone(),
 // value-initializes `why` to an empty view and compiles fine otherwise).
 consteval bool kUnsuppressableEntriesAllExplainThemselves() {
     for (auto const& e : kUnsuppressableCodes) {
-        if (e.why.empty()) return false;
+        if (e.why().empty()) return false;
     }
     return true;
 }
@@ -1498,6 +1757,40 @@ static_assert(kUnsuppressableEntriesAllExplainThemselves(),
               "the text is what `D_SuppressRequestIgnored` shows the operator "
               "whose --suppress request this table refuses, so a member "
               "without one refuses silently.");
+
+// ★★★ D-DIAG-UNSUPPRESSABLE-FAMILY-UNDECIDED: THE PRONG'S OWN GUARD, and it is
+// deliberately the same shape as the three checks above.
+//
+// `MembershipProng` has NO zero enumerator, on purpose. That is what makes this
+// check bite: a `MembershipReason` written with a short initializer, or a
+// future `kWhy*` that forgets the verdict, value-initializes `prong` to 0 —
+// which is not a valid enumerator and is caught HERE, at compile time, rather
+// than shipping a member whose admitting argument nobody ever stated.
+//
+// ⚠ THIS IS THE LIMB THE ROW ACTUALLY NEEDED. The row asked for the criterion
+// to be WRITTEN; ✔MEASURED, it already was, and had been for cycles. What was
+// missing is that nothing ever forced it to be APPLIED: 147 of 166 members were
+// admitted by text that cites no prong at all. A criterion in a comment drifts
+// exactly the way this registry keeps finding written principles drift — so the
+// verdict is a required field, and "I did not think about it" now fails to
+// compile instead of passing review.
+consteval bool kUnsuppressableEntriesAllStateTheirProng() {
+    for (auto const& e : kUnsuppressableCodes) {
+        switch (e.prong()) {
+            case MembershipProng::WrongArtifactShipsGreen:
+            case MembershipProng::BuildFailsWithNothingSaid:
+            case MembershipProng::Both:
+                continue;
+        }
+        return false;
+    }
+    return true;
+}
+static_assert(kUnsuppressableEntriesAllStateTheirProng(),
+              "every kUnsuppressableCodes entry must be admitted under a NAMED "
+              "prong of the two-prong membership rule at the top of this file. "
+              "A zero/absent prong means a member joined the table without an "
+              "argument — the drift this table's own history is a record of.");
 
 } // namespace
 
@@ -1514,7 +1807,30 @@ std::span<UnsuppressableEntry const> unsuppressableCodes() noexcept {
 std::string_view unsuppressableRationale(DiagnosticCode code) noexcept {
     auto const it = std::ranges::find(kUnsuppressableCodes, code,
                                       &UnsuppressableEntry::code);
-    return it == kUnsuppressableCodes.end() ? std::string_view{} : it->why;
+    return it == kUnsuppressableCodes.end() ? std::string_view{} : it->why();
+}
+
+std::optional<MembershipProng>
+membershipProngOf(DiagnosticCode code) noexcept {
+    auto const it = std::ranges::find(kUnsuppressableCodes, code,
+                                      &UnsuppressableEntry::code);
+    // ⚠ `std::optional`, NOT a defaulted prong — and the reason is this
+    // cluster's whole subject. Returning some prong for a NON-member would be
+    // a plausible wrong answer: the caller could not tell "admitted under prong
+    // (1)" from "not in the table at all", and every reading would look
+    // sensible. That is `diagnosticCodePrefix`'s `letter = 'P'` defect wearing
+    // a different hat, in the file whose row is about exactly this. `nullopt`
+    // is the only honest answer for a code that has no membership, and it
+    // mirrors `unsuppressableRationale`'s empty-view contract.
+    //
+    // A `None` enumerator would ALSO have been wrong here, and not merely
+    // stylistically: `MembershipProng`'s absent zero value is precisely what
+    // lets `kUnsuppressableEntriesAllStateTheirProng` catch a member whose
+    // verdict was never written. Adding None to serve this function would
+    // spend the guard to save an optional.
+    return it == kUnsuppressableCodes.end()
+               ? std::nullopt
+               : std::optional{it->prong()};
 }
 
 } // namespace dss

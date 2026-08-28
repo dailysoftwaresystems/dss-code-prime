@@ -1,8 +1,10 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/enum_name_table.hpp"  // EnumNameTable (kEscapeKindTable)
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -21,7 +23,28 @@ enum class EscapeKind : std::uint8_t {
     DoubledDelimiter,
 };
 
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// ★★ TWO HAND-WRITTEN OWNERS BEFORE THE SENTENCES ARE COUNTED, exactly as with
+// `ModeOp`: `escapeKindName` (`string_style.cpp`) was a `switch` retyping all
+// three, and `grammar_schema_json.cpp` decided acceptance with an inline
+// `ek == "none" / "char" / "doubled-delimiter"` chain that never consulted it —
+// plus a required-field sentence restating the set. Every enumerator is
+// declarable, and `None` is row 0, so `name()`'s fall-back is the same `"none"`
+// the switch's unreachable arm returned.
+inline constexpr EnumNameTable<EscapeKind, 3> kEscapeKindTable{{{
+    { EscapeKind::None,             "none"              },
+    { EscapeKind::Char,             "char"              },
+    { EscapeKind::DoubledDelimiter, "doubled-delimiter" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kEscapeKindTable);
+
 [[nodiscard]] DSS_EXPORT std::string_view escapeKindName(EscapeKind k) noexcept;
+
+[[nodiscard]] constexpr std::optional<EscapeKind>
+escapeKindFromName(std::string_view s) noexcept {
+    return kEscapeKindTable.fromName(s);
+}
 
 // Tokenizer metadata for a delimited string literal. Attached to the
 // opening-delimiter token's meaning (e.g. `"`, `@"`, `R"`).

@@ -114,8 +114,8 @@ class DiagnosticReporter;
 // variant, so it is not a substitute either. Naming a nonexistent core in a descriptor row
 // would break EVERY pe binary's LOAD with 0xC0000139 under the eager-import law — the exact
 // failure the advice to use that name was trying to prevent. The real UCRT does the same
-// thing this pass does: SDK 10.0.26100.0 `ucrt/stdio.h:1919` `snprintf` calls `vsnprintf`
-// (:1429), whose body (:1439-1444) is one `__stdio_common_vsprintf` call differing from
+// thing this pass does: in SDK 10.0.26100.0 `ucrt/stdio.h`, `snprintf` calls `vsnprintf`,
+// whose body is one `__stdio_common_vsprintf` call differing from
 // `sprintf`'s only in the two arguments that matter — the `_Options` bit and a REAL
 // `_BufferCount`. Which is why this recipe adds no import at all.
 //

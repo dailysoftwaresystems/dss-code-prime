@@ -1,0 +1,17 @@
+{
+  "$comment": "TF-C96 D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT (C 6.7.6.3p8): a parameter declared with FUNCTION type adjusts to 'pointer to function returning T' — the FUNCTION twin of c82's array adjustment (6.7.6.3p7), and what lets Darwin's bare function typedefs (`typedef int reader_t(int);` then `void f(reader_t r)`) be parameters at all. THE REAL SITES, measured in the macOS SDK: malloc/malloc.h:537,546,550 declare `memory_reader_t`, `vm_range_recorder_t` and `print_task_printer_t` as FUNCTION typedefs (not pointer typedefs) and malloc_introspection_t's `enumerator` at malloc.h:553 takes two of them BARE as parameters — 6 of sqlite mem1.c's residual S0018 diagnostics from this one rule. RUNTIME witness, not a compile-only one: every form is actually DISPATCHED through — a bare-function-TYPEDEF parameter (`viaTypedef(reader_t r, …)` called as `r(v)`), an INLINE function-type parameter (`viaInline(int g(int), …)` called as `g(v)`, plus the structural pin `sizeof(g)==sizeof(int*)` since an un-adjusted function-typed `g` has no sizeof at all), all three helpers declared by a PROTOTYPE above main and DEFINED below it so the adjustment must mint the SAME FnSig at BOTH resolution sites (an asymmetry yields S0022/S0003 and the TU fails to compile), the ARGUMENT side both ways (a bare decaying function NAME and an explicit `&func` into the SAME parameter slot), and `spin` handing its own adjusted parameter ONWARD into another function-typed parameter. Value-divergent: viaTypedef(addSeven,5)=12 + viaInline(twice,6)=12 + viaTypedef(&twice,5)=10 + spin(&addSeven,2,1)=8 = 42; MEASURED mis-dispatch of arm 3 gives 44. ANTI-FOLD: viaTypedef is called with TWO different callees (cannot be specialized), all operands are mutable globals, and `spin` is self-recursive so the inliner refuses it and the call stays a genuine indirect call in the release arm. RED-ON-DISABLE: revert the FnSig arm in the parameter-adjustment helper — the ONE chokepoint every parameter path routes through, the same one that already implements the p7 array adjustment -> the function-typed parameter declarators are minted as prototypes -> `S0018 function prototype declarations are not supported here` -> no binary. (The fix belongs at that chokepoint, NOT at the S0018 rejection site: suppressing the error there leaves the symbol typed FnSig — a silent miscompile, which is what the runtime dispatch here would catch.) Target- and format-agnostic (all 4 legs); clang -std=c17 -Wall -Wextra cross-checked clean at -O0 and -O2, same source exits 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

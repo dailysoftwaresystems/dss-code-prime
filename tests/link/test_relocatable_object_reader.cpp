@@ -321,8 +321,8 @@ TEST(RelocatableObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
     EXPECT_TRUE(got.ok());
 }
 
-// TF-C54 hermetic 2-TU witness (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-
-// FOREIGN-COLLISION): the ON-DISK static-lib readback + merge path. Two
+// TF-C54 hermetic 2-TU witness (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION):
+// the ON-DISK static-lib readback + merge path. Two
 // SEPARATELY-compiled TUs each restart the SymbolId counter, so both define the
 // SAME synthetic names -- a `static` function `sym_100` AND a string-literal
 // rodata `sym_101` (neither in module.symbols). This is the hermetic,
@@ -1137,8 +1137,8 @@ TEST(RelocatableObjectReader, NonElfFormatSchemaFailsLoud) {
 }
 
 // ============================================================================
-// THE GEOMETRY FALLBACK ON ELF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-
-// BLOCK-LABEL-NOT-ATOM, the third of the three readers (operator ruling
+// THE GEOMETRY FALLBACK ON ELF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM,
+// the third of the three readers (operator ruling
 // 2026-08-20: the fallback lands on all of them).
 //
 // ★★ ELF IS WHERE IT FIRES LEAST, AND SAYING SO PRECISELY IS THE POINT -- a
@@ -1497,4 +1497,101 @@ TEST(RelocatableObjectReader, EqualStValueWithDifferentStSizeFailsLoud) {
         }
     }
     EXPECT_TRUE(named) << "the diagnostic must name BOTH symbols and the reason";
+}
+
+// ── THE ELF LEG OF THE THREE-READER ALIGNMENT SWEEP ────────────────────────
+//    D-FORMAT-MACHO-SECTION-ALIGN-EMITTED-RAW-NOT-LOG2 (the read-side half)
+//
+// That row's closing work says to check the OTHER walkers for the same
+// "is this field an exponent or a count" mistake. ✔MEASURED 2026-08-27, and it
+// is why this test exists rather than a comment saying ELF was fine: the COFF
+// reader was dropping the field entirely, and when the two siblings were
+// checked for a pin that would have caught the same thing, a grep for an
+// EXPECT/ASSERT on `alignment` across `tests/link/**` returned NOTHING. This
+// reader CARRIED `sh_addralign` correctly and had never been asked to prove it
+// -- correct by nobody having touched it, which is not the same as pinned.
+//
+// ★ ELF SPELLS THE FIELD AS A RAW BYTE COUNT. Its two siblings do not:
+// Mach-O's `section_64.align` is a log2 exponent and COFF's align class is
+// (log2 + 1) << 20, so the three cannot share a decode and the shared thing is
+// the POLICY (`link/format/foreign_section_alignment.hpp`). A reader that
+// picked up a sibling's encoding by copy-paste would answer 2 or 3 where 4 is
+// right, and this asserts the BYTES so that reading is caught.
+//
+// RED ON DISABLE: drop `di.alignment = alignFromSection(sec.addrAlign)` at
+// either `AssembledData` site in `elf_object_reader.cpp`, or route it through
+// `foreignSectionAlignmentFromLog2` instead of `...FromByteCount`.
+TEST(RelocatableObjectReader, DeclaredSectionAlignmentSurvivesTheRoundTrip) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // One item per section, each with a DIFFERENT alignment, so a reader
+    // returning any single constant fails. ELF's `sh_addralign` is
+    // section-granular and the writer raises it to the section's strictest
+    // member, so with one member per section the item's own alignment is
+    // exactly what must come back.
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(fn);
+
+    AssembledData wide;
+    wide.symbol    = SymbolId{10};
+    wide.section   = DataSectionKind::Rodata;
+    wide.bytes.assign(32, 0xAB);
+    wide.alignment = Alignment::of<32>();
+    mod.dataItems.push_back(wide);
+
+    AssembledData narrow;
+    narrow.symbol    = SymbolId{11};
+    narrow.section   = DataSectionKind::Data;
+    narrow.bytes     = {7, 0, 0, 0};
+    narrow.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(narrow);
+
+    mod.symbols = {
+        ModuleSymbol{SymbolId{1},  "fn",     SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{10}, "wide",   SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{11}, "narrow", SymbolBinding::Global, SymbolVisibility::Default},
+    };
+
+    DiagnosticReporter wrep;
+    auto objBytes = elf::encode(mod, *loaded.target, *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u);
+    ASSERT_FALSE(objBytes.empty());
+
+    DiagnosticReporter rrep;
+    auto readOpt = elf::readRelocatableObject(objBytes, *loaded.target,
+                                              *loaded.format, rrep);
+    ASSERT_TRUE(readOpt.has_value());
+    ASSERT_EQ(rrep.errorCount(), 0u);
+
+    auto const* rWide   = dataNamed(*readOpt, "wide");
+    auto const* rNarrow = dataNamed(*readOpt, "narrow");
+    ASSERT_NE(rWide, nullptr);
+    ASSERT_NE(rNarrow, nullptr);
+    EXPECT_EQ(rWide->alignment.bytes(), 32u)
+        << "sh_addralign is a raw BYTE COUNT; 32 must come back as 32, not as "
+           "the log2 exponent 5 nor as the byte default 1";
+
+    // ⚠ THE FIRST DRAFT OF THIS TEST ASSERTED 4 HERE AND WENT RED AT 8 -- the
+    // read-back is SECTION-granular, and the shipped `.data` row declares an
+    // `addrAlign` FLOOR the writer never goes below. So the recovered value is
+    // `max(floor, strictest member)`, not the member's own alignment: `wide`
+    // RAISES its section above the floor, `narrow` sits under it. Asserting the
+    // floor from the schema rather than as the literal 8 keeps this honest
+    // across a schema edit -- and the two arms together are what make the pin
+    // non-vacuous, because either alone is satisfied by a reader that returns
+    // one constant.
+    auto const* dataRow = loaded.format->sectionByKind(SectionKind::Data);
+    ASSERT_NE(dataRow, nullptr);
+    EXPECT_EQ(rNarrow->alignment.bytes(),
+              std::max<std::uint64_t>(dataRow->addrAlign, 4u))
+        << "the recovered alignment is the SECTION's -- the schema floor raised "
+           "to the strictest member, never the member's own value on its own";
+    EXPECT_NE(rWide->alignment.bytes(), rNarrow->alignment.bytes())
+        << "a reader answering one constant for every section would satisfy "
+           "either assertion above on its own";
 }

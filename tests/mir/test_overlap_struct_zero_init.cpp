@@ -16,7 +16,7 @@
 // descriptor (`windows.json`'s `ULARGE_INTEGER`, `sys/stat.json`'s macho `struct
 // stat`). The FRONT-END half (that `{0}` and `{}` both reach MIR as an all-zero
 // aggregate, and that the result is right at RUNTIME) is pinned by the corpus
-// example `examples/c-subset/overlap_struct_zero_init/`, which compiles + RUNS the
+// example `examples/c/overlap_struct_zero_init/`, which compiles + RUNS the
 // real `ULARGE_INTEGER` on a pe64 target.
 //
 // ASSERTION STRENGTH: the zero-fill cases decode every emitted Store back to
@@ -128,7 +128,7 @@ struct Built {
                                      std::span<std::int64_t const> elemValues,
                                      bool synthetic = false) {
     Built        out;
-    HirBuilder   b{"c-subset"};
+    HirBuilder   b{"c"};
     TypeId const i32 = ti.primitive(TypeKind::I32);
 
     HirFlags const cf = synthetic ? HirFlags::Synthetic : HirFlags::None;
@@ -182,7 +182,7 @@ struct Built {
 [[nodiscard]] Built buildMinusZeroInit(TypeInterner& ti, TypeId structTy,
                                        double firstValue) {
     Built        out;
-    HirBuilder   b{"c-subset"};
+    HirBuilder   b{"c"};
     TypeId const i32 = ti.primitive(TypeKind::I32);
 
     auto const fieldTypes = ti.operands(structTy);
@@ -384,7 +384,7 @@ TEST(OverlapStructZeroInit, RealUlargeIntegerShapeZeroFills) {
 // `Synthetic` (no element came from source text) while `{0}` leaves the first
 // child plain. This pins that the accept decision is driven by the VALUES, never
 // by the synthetic bit. The end-to-end `{}` proof (real front end, real run) is
-// the corpus example `examples/c-subset/overlap_struct_zero_init/`.
+// the corpus example `examples/c/overlap_struct_zero_init/`.
 
 TEST(OverlapStructZeroInit, EmptyInitializerShapeZeroFillsIdentically) {
     TypeInterner ti = makeInterner();
@@ -493,7 +493,7 @@ TEST(OverlapStructZeroInit, DisjointExplicitOffsetStructLowersMemberWise) {
 // source map keyed by the reported node; this pins the MIR half (given an entry,
 // the diagnostic carries it). The CST→HIR half — that `lowerBraceInit` actually
 // RECORDS an entry for the aggregate, which it did not before this cycle — is
-// pinned in `tests/hir/test_hir_lowering_c_subset.cpp`.
+// pinned in `tests/hir/test_hir_lowering_c.cpp`.
 
 TEST(OverlapStructZeroInit, RefusalCarriesTheAggregateSourceSpan) {
     TypeInterner ti = makeInterner();

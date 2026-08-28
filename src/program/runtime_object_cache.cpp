@@ -2,6 +2,15 @@
 
 #include "core/crypto/sha256.hpp"
 #include "program/cross_validate_target_format.hpp"
+// D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK:
+// `detail::createExclusiveBinary` is the EXCLUSIVE-CREATE primitive the
+// linker's staging-temp claim already uses. Reused rather than re-derived —
+// its host split (`_wfopen "wbxN"` / `open(O_CREAT|O_EXCL|O_CLOEXEC)`) and
+// the reasoning behind both halves are measured at its definition site, and
+// a second hand-rolled exclusive create here would be a second chance to get
+// the Windows half wrong. No new link edge is needed: `lsp`, `program` and
+// `link` are all aggregated into one `dsscp-lib`.
+#include "link/writer.hpp"
 
 // ── THE COMPILER STAMP TERM ─────────────────────────────────────────────────
 //
@@ -55,7 +64,9 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <cstdio>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -80,7 +91,12 @@ namespace fs = std::filesystem;
 // The key document's first line. A VERSION is part of it on purpose: the day a
 // term is added or reordered, every previously-written artifact must become
 // unreachable rather than merely stale, and bumping this line is what does it.
-constexpr std::string_view kKeyDocumentHeader = "dss-runtime-object-cache-key/1";
+// ⓘ `/2` since 2026-08-25: the single `descriptor=`/`descriptor-sha256=` pair
+// became a SORTED RUN of pairs, one per declaring descriptor. A `/1` document
+// and a `/2` document over a one-descriptor unit would otherwise be byte-
+// identical, so every `/1` artifact would stay addressable under a scheme whose
+// term list had changed — the exact reachability this line exists to end.
+constexpr std::string_view kKeyDocumentHeader = "dss-runtime-object-cache-key/2";
 
 // Cited by every refusal below so a user landing on one message can find the
 // ruling that produced this whole mechanism.
@@ -259,9 +275,9 @@ struct RootCandidate {
 
 constexpr char const* kOverrideVariable = "DSS_RUNTIME_CACHE_DIR";
 
-// The vendor tail. `dss-code-prime` (never a bare `dss`) so the directory is
+// The vendor tail. `dsscp` (never a bare `dss`) so the directory is
 // attributable in a cache root shared with every other tool on the machine.
-constexpr char const* kVendorTail = "dss-code-prime/runtime-cache";
+constexpr char const* kVendorTail = "dsscp/runtime-cache";
 
 constexpr RootCandidate kRootCandidates[] = {
     // The override takes the directory VERBATIM — no vendor tail. The caller
@@ -274,7 +290,7 @@ constexpr RootCandidate kRootCandidates[] = {
     // The XDG spec's OWN documented default when `XDG_CACHE_HOME` is unset —
     // not an invention of this file, which is why it is `.cache` and not, say,
     // `.dss-cache`.
-    {"HOME", ".cache/dss-code-prime/runtime-cache", "$HOME"},
+    {"HOME", ".cache/dsscp/runtime-cache", "$HOME"},
 };
 
 // Join a candidate-name list for a diagnostic. Names are quoted so a message
@@ -473,16 +489,30 @@ private:
 
 [[nodiscard]] std::string unwritableMissRefusal(RuntimeObjectKey const& key,
                                                 std::string_view reason) {
+    // ⚠ THE WORDING SAYS WHAT **THE STORE** COULD NOT DO, NOT WHAT THE BUILD
+    // WILL DO — it used to say *"so this build cannot proceed"*, written when
+    // this function had no production caller and the author could assume the
+    // caller would treat it as fatal. It now has one, and it does NOT stop the
+    // build: the archive is already compiled and correct, and the driver links
+    // it out of its staging area, so a message claiming the build has stopped
+    // would be a diagnostic contradicted by the very run that printed it.
+    //
+    // ★ THE "REFUSAL, NOT A FALLBACK" ARGUMENT IS UNCHANGED AND IS SATISFIED,
+    // which is why it stays. What it forbids is a SILENT degradation — success
+    // reported while every later build recompiles the same unit, the cost
+    // permanent and invisible. This function is the loud half of that bargain;
+    // the caller's obligation is to SAY SO, and `reportRuntimeCacheNote` in
+    // `program.cpp` prints this text verbatim on every affected build.
     return std::format(
-        "runtime object cache: a cache MISS could not be WRITTEN, so this build "
-        "cannot proceed. {}. Roots considered, in precedence order: {}. This is "
-        "a REFUSAL and not a fallback, deliberately: compiling the runtime unit "
-        "and discarding it would report success while every later build "
-        "recompiled the same unit, so the cost would be permanent and "
-        "invisible — a mechanism that silently does nothing is worse than one "
-        "that fails. REMEDY: set {} to a writable directory; it is the explicit "
-        "override, it wins over every platform default, and it is what CI and "
-        "hermetic builds are expected to use. Anchored: {}.",
+        "runtime object cache: a cache MISS could not be WRITTEN, so the "
+        "compiled runtime archive was NOT added to the cache and every later "
+        "build will compile it again. {}. Roots considered, in precedence "
+        "order: {}. This is a REFUSAL by the store and never a silent fallback: "
+        "a mechanism that silently does nothing is worse than one that fails, "
+        "so it is reported on every affected build until it is fixed. REMEDY: "
+        "set {} to a writable directory; it is the explicit override, it wins "
+        "over every platform default, and it is what CI and hermetic builds are "
+        "expected to use. Anchored: {}.",
         reason, key.rootTrail, kOverrideVariable, kAnchor);
 }
 
@@ -634,19 +664,48 @@ writeThroughTemp(RuntimeObjectKey const&       key,
     // own name plus thirteen characters. That is why the path budget is measured
     // on the temp and never on the artifact.
     //
-    // ⓘ The exists-then-create window is not a correctness hazard HERE, and
-    // the reason is the header's own corollary: two processes racing on this
-    // path computed the SAME key, so they are writing the SAME bytes. Two LIVE
-    // processes cannot share a pid, so the only way to draw an occupied name
-    // is a temp left behind by a killed run — and overwriting that wholesale is
-    // exactly right.
+    // ── D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK ──
+    //
+    // ★★★ THIS USED TO PROBE WITH `fs::exists` AND THEN OPEN WITH
+    // `std::ofstream(..., trunc)`, AND THE TWO DISAGREE ABOUT WHAT A NAME IS.
+    // `fs::exists` FOLLOWS symlinks, so a DANGLING symlink sitting at a
+    // candidate name answers FALSE — the loop reads that as "free", claims the
+    // name, and the truncating open then CREATES THE LINK'S TARGET. ✔MEASURED
+    // 2026-08-27 on WSL with the exact primitives: `stat` says the name does not
+    // exist, `open(O_WRONLY|O_CREAT|O_TRUNC)` SUCCEEDS, and the byte written
+    // lands OUTSIDE the cache directory at wherever the link pointed. The
+    // `rename` below then moves that link into place as a cache entry.
+    //
+    // ⚠ IT IS STRICTLY WORSE THAN THE SAME BLINDNESS IN `link::writeBytes`
+    // ([[D-LINK-WRITER-DANGLING-SYMLINK-CLAIM-MISROUTE]]), and the difference is
+    // the OPEN, not the probe: there the actual open is exclusive, so the wrong
+    // branch was taken but NOTHING WAS WRITTEN and the run failed loud. A
+    // truncating open destroys before it can fail.
+    //
+    // ⭐ THE FIX IS TO STOP ASKING AND START CLAIMING. `createExclusiveBinary`
+    // IS the probe and the open in one indivisible step, so there is no window
+    // and no second opinion: it refuses any existing directory ENTRY — a
+    // dangling symlink included — and leaves it byte-intact, which is exactly
+    // the question this loop was trying to ask.
+    //
+    // ⓘ THE COMMENT THAT USED TO STAND HERE ARGUED THE RACE AWAY, AND THAT
+    // ARGUMENT WAS AND REMAINS CORRECT — it is preserved because it is still
+    // load-bearing: two processes racing on this path computed the SAME key and
+    // are writing the SAME bytes, and two LIVE processes cannot share a pid, so
+    // the only way to draw an occupied name is a temp left by a killed run.
+    // ★ What it did not cover is the case above: a dangling symlink is not a
+    // temp left by a killed run, and the loop never even reached the
+    // "overwriting that wholesale is exactly right" reasoning — it believed the
+    // name was free. An argument that is sound about the case it considered is
+    // still silent about the case it did not.
     static std::atomic<std::uint64_t> tempCounter{0};
 #ifdef _WIN32
     auto const pid = static_cast<std::uint64_t>(_getpid());
 #else
     auto const pid = static_cast<std::uint64_t>(getpid());
 #endif
-    fs::path temporary;
+    fs::path   temporary;
+    std::FILE* claimed = nullptr;
     for (std::uint32_t attempt = 0;; ++attempt) {
         if (attempt > 10000u) {
             return std::unexpected(unwritableMissRefusal(
@@ -659,40 +718,70 @@ writeThroughTemp(RuntimeObjectKey const&       key,
             / ("." + destination.filename().string() + ".tmp-"
                + std::to_string(pid) + "-"
                + std::to_string(tempCounter.fetch_add(1u)));
-        std::error_code probeEc;
-        if (!fs::exists(candidate, probeEc)) {
+        claimed = linker::detail::createExclusiveBinary(candidate);
+        if (claimed != nullptr) {
             temporary = std::move(candidate);
             break;
+        }
+        // ── WHY THE CLAIM WAS REFUSED, ASKED AT THE ENTRY AND NOT AT ITS
+        //    TARGET ────────────────────────────────────────────────────────
+        //
+        // Two OPPOSITE responses are possible here — "the slot is TAKEN, try
+        // the next name" and "this is a REAL error, stop now" — and the probe
+        // that chooses between them must ask the SAME question the claim asked.
+        // `createExclusiveBinary` refuses an existing directory ENTRY, so the
+        // probe looks at the ENTRY: `symlink_status` does NOT follow, so a
+        // dangling symlink reads as OCCUPIED, exactly as `O_EXCL` saw it.
+        //
+        // ⚠ `fs::exists(candidate)` HERE WOULD REINTRODUCE THE DEFECT IN ITS
+        // OTHER FORM — it follows, so a dangling symlink would read as absent,
+        // the loop would call the refusal a hard error, and an operator would
+        // be handed a path-budget explanation for a name that is merely
+        // occupied. That is [[D-LINK-WRITER-DANGLING-SYMLINK-CLAIM-MISROUTE]]
+        // verbatim, and its own preferred fix is this `symlink_status` probe.
+        //
+        // ★ AND THE HARD-ERROR ARM MUST STAY, rather than letting a real
+        // failure exhaust 10000 slots: ✔MEASURED as a red in
+        // `RuntimeObjectCachePathBudget.AnOverlongNameRefusesNamingThePathAndItsLength`
+        // when this loop retried instead. A name too long fails on EVERY slot,
+        // and the composed-path note is the only thing that tells the operator
+        // WHY — a "could not claim a unique temporary file after 10000
+        // attempts" message names the directory and explains nothing.
+        std::error_code    entryEc;
+        auto const         entry = fs::symlink_status(candidate, entryEc);
+        if (!fs::exists(entry)) {
+            return std::unexpected(unwritableMissRefusal(
+                key,
+                std::format("could not open the temporary file '{}' for "
+                            "writing.{}",
+                            candidate.generic_string(),
+                            composedPathNote(directory, candidate))));
         }
     }
     TempFileGuard guard{temporary};
 
     {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            // ⚠ THE ARM THE PATH-LENGTH WALL ACTUALLY LANDS ON — the directory
-            // exists (it was just created) and only the full name is too long,
-            // so without `composedPathNote` this reads as an unexplained "could
-            // not open". See that function's ✔MEASURED note.
+        // The claimed handle, closed on every path out — including one where
+        // building a diagnostic string throws.
+        struct FileCloser {
+            void operator()(std::FILE* f) const noexcept { std::fclose(f); }
+        };
+        std::unique_ptr<std::FILE, FileCloser> out{claimed};
+        if (!bytes.empty()
+            && std::fwrite(bytes.data(), 1u, bytes.size(), out.get())
+                   != bytes.size()) {
             return std::unexpected(unwritableMissRefusal(
-                key,
-                std::format("could not open the temporary file '{}' for "
-                            "writing.{}",
-                            temporary.generic_string(),
-                            composedPathNote(directory, temporary))));
+                key, std::format("failed writing {} byte(s) to the temporary "
+                                 "file '{}'",
+                                 bytes.size(), temporary.generic_string())));
         }
-        if (!bytes.empty()) {
-            out.write(reinterpret_cast<char const*>(bytes.data()),
-                      static_cast<std::streamsize>(bytes.size()));
-        }
-        // ⚠ CLOSED AND CHECKED EXPLICITLY, not left to the destructor. A
-        // destructor-time flush failure (a full disk, a quota) is DISCARDED by
-        // the standard library, and the next statement would rename a
-        // TRUNCATED file into place under a key that promises the full bytes —
-        // a silently wrong artifact, which is the one outcome this whole
-        // mechanism exists to make impossible.
-        out.close();
-        if (!out) {
+        // ⚠ CLOSED AND CHECKED EXPLICITLY, not left to the deleter. A
+        // close-time flush failure (a full disk, a quota) is DISCARDED by a
+        // destructor, and the next statement would rename a TRUNCATED file into
+        // place under a key that promises the full bytes — a silently wrong
+        // artifact, which is the one outcome this whole mechanism exists to
+        // make impossible.
+        if (std::fclose(out.release()) != 0) {
             return std::unexpected(unwritableMissRefusal(
                 key, std::format("failed writing {} byte(s) to the temporary "
                                  "file '{}'",
@@ -985,11 +1074,42 @@ computeRuntimeObjectKey(RuntimeObjectRequest const& request) {
     if (!unitContents.has_value()) {
         return std::unexpected(unitContents.error());
     }
-    auto const descriptorContents =
-        readWholeFile(request.configRoot / request.descriptorPath,
-                      "shipped-header descriptor");
-    if (!descriptorContents.has_value()) {
-        return std::unexpected(descriptorContents.error());
+    // ★★★ AN EMPTY DESCRIPTOR SET IS A REFUSAL AND NOT A KEY WITH ONE FEWER
+    // TERM. A realized unit exists only because a descriptor's
+    // `realization.<fmt>.source` named it, so "no declaring descriptor" is the
+    // caller's attribution disagreeing with the corpus reader that produced the
+    // unit — two owners of one fact, drifted. Keying anyway would drop the term
+    // the whole mechanism exists for, and drop it SILENTLY.
+    if (request.descriptorPaths.empty()) {
+        return std::unexpected(std::format(
+            "runtime object cache: the request for shipped runtime unit '{}' "
+            "names NO declaring shipped-header descriptor. A realized unit is "
+            "named by at least one descriptor's 'realization.<format>.source', "
+            "so an empty set means the caller's attribution and the corpus "
+            "reader disagree — and a key computed without the descriptor term "
+            "would serve an artifact compiled against declarations that have "
+            "since moved. Refusing. Anchored: {}.",
+            request.sourcePath, kAnchor));
+    }
+    // ★ SORTED AND DEDUPLICATED, so the key is a function of the SET. The
+    // caller's order is whatever its corpus walk happened to produce (sorted on
+    // NTFS, hash-ordered on ext4 — the same filesystem-decides-the-answer trap
+    // `resolveArchiveSiblingFormat` refuses), and one descriptor listed twice is
+    // ONE input.
+    std::vector<std::string> descriptorPaths = request.descriptorPaths;
+    std::sort(descriptorPaths.begin(), descriptorPaths.end());
+    descriptorPaths.erase(
+        std::unique(descriptorPaths.begin(), descriptorPaths.end()),
+        descriptorPaths.end());
+    std::vector<std::string> descriptorDigests;
+    descriptorDigests.reserve(descriptorPaths.size());
+    for (std::string const& descriptorPath : descriptorPaths) {
+        auto const contents = readWholeFile(request.configRoot / descriptorPath,
+                                            "shipped-header descriptor");
+        if (!contents.has_value()) {
+            return std::unexpected(contents.error());
+        }
+        descriptorDigests.push_back(dss::crypto::sha256Hex(*contents));
     }
 
     // ── STEP 3: the document ────────────────────────────────────────────────
@@ -1019,8 +1139,14 @@ computeRuntimeObjectKey(RuntimeObjectRequest const& request) {
     field("config=", request.configName);
     field("unit=", request.sourcePath);
     field("unit-sha256=", dss::crypto::sha256Hex(*unitContents));
-    field("descriptor=", request.descriptorPath);
-    field("descriptor-sha256=", dss::crypto::sha256Hex(*descriptorContents));
+    // ⓘ PATH AND DIGEST STAY ADJACENT, one pair per descriptor, in the sorted
+    // order above. Emitting all the paths and then all the digests would let a
+    // reader diffing two documents pair a path with the wrong digest, and would
+    // let two descriptors that swapped both fields produce the same document.
+    for (std::size_t i = 0; i < descriptorPaths.size(); ++i) {
+        field("descriptor=", descriptorPaths[i]);
+        field("descriptor-sha256=", descriptorDigests[i]);
+    }
 
     // ★ SORTED BY (label, path). The loaders report their documents in
     // whatever order resolution happened to reach them — which is a function

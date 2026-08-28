@@ -246,7 +246,7 @@ All deferred until §1 trigger conditions are met.
 
 ## 6. Deferred anchors (owned by this plan; register when it opens)
 
-These **33** `D-AXIS-*` anchors are **reserved/future** — they live here until the plan opens, then move into [`_deferred-anchor-registry`](./_deferred-anchor-registry.md) as active rows. (Reserved-plan anchors are not yet in `src/`, so the CI anchor-guard does not require registry rows today.)
+These **33** `D-AXIS-*` anchors are **reserved/future** — they live here until the plan opens, then move into [`_deferred-anchor-registry-production`](./_deferred-anchor-registry-production.md) as active rows. (Reserved-plan anchors are not yet in `src/`, so the CI anchor-guard does not require registry rows today.)
 
 | Anchor | Owns |
 |--------|------|

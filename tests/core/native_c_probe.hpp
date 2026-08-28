@@ -361,8 +361,9 @@ struct CompilerLocation {
         // `call vcvars` KEEPS its silencer: on success it prints a banner that is
         // pure noise, and its failure mode is already covered upstream — this batch
         // is only written after `locateMsvcToolchain` has validated the path.
-        // ★★★ `cd /d <work>` IS THE FIX FOR [D-TEST-NATIVE-PROBE-COMPILE-FAILS-
-        // UNDER-CONCURRENT-LOAD], AND IT IS A ROOT CAUSE, NOT A RETRY.
+        // ★★★ `cd /d <work>` IS THE FIX FOR
+        // [D-TEST-NATIVE-PROBE-COMPILE-FAILS-UNDER-CONCURRENT-LOAD],
+        // AND IT IS A ROOT CAUSE, NOT A RETRY.
         // ✔MEASURED (ctest -j 6, dss-wt-lane2): `core/test_bitfield_abi_conformance`
         // failed `NATIVE-PROBE-COMPILE-FAILED` with the compiler's own words —
         //   probe.c : fatal error C1083: Cannot open compiler generated file:

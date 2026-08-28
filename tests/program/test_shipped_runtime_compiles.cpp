@@ -116,12 +116,12 @@ namespace {
 // private cwd walk here would find nothing in an out-of-tree build, and a gate
 // with no tree to read is a hole rather than a pass.
 [[nodiscard]] fs::path configRoot() {
-    auto const root = dss::test::findRepoRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config";
+    return *cfg;
 }
 
 [[nodiscard]] fs::path descriptorDir()    { return configRoot() / "shippedLibs"; }
@@ -472,18 +472,17 @@ TEST(ShippedRuntimeCompiles, EveryDeclaredRealizationSourceCompilesForItsFormat)
                "compiled and would be silently skipped by a weaker gate.";
         if (machines.empty()) continue;
 
-        auto const resolved = dss::ffi::resolveShippedSourcePath(unit.source);
-        EXPECT_TRUE(resolved.has_value())
+        auto const resolved = dss::ffi::resolveShippedSource(unit.source);
+        EXPECT_TRUE(resolved.resolved())
             << "SHIPPED RUNTIME COMPILE GATE [unit " << (index + 1) << " of "
             << units.size() << "]: descriptor " << joined(unit.descriptors)
             << " declares realization." << unit.formatKey << ".source = '"
-            << unit.source
-            << "', but no readable file is there (resolved against "
-               "src/dss-config/) — the format would carry a DECLARED symbol "
-               "with no body.";
-        if (!resolved) continue;
+            << unit.source << "', but "
+            << dss::ffi::describeShippedSourceLookup(resolved, unit.source)
+            << " — the format would carry a DECLARED symbol with no body.";
+        if (!resolved.resolved()) continue;
 
-        auto const language = languageClaiming(*resolved);
+        auto const language = languageClaiming(resolved.path);
         if (!language) continue;   // languageClaiming already ADD_FAILURE'd
 
         bool attemptedThisUnit = false;
@@ -516,7 +515,7 @@ TEST(ShippedRuntimeCompiles, EveryDeclaredRealizationSourceCompilesForItsFormat)
                 program.setCompileConfig(config);
                 DiagnosticReporter rep;
                 int const rc = program.compileFiles(
-                    std::vector<std::string>{resolved->string()}, *language,
+                    std::vector<std::string>{resolved.path.string()}, *language,
                     std::vector<std::string>{spec}, rep);
 
                 bool const compiled = (rc == 0) && !rep.hasErrors();
@@ -551,8 +550,8 @@ TEST(ShippedRuntimeCompiles, EveryDeclaredRealizationSourceCompilesForItsFormat)
                     << head << "the archive sibling schema failed to load";
                 if (!siblingSchema) continue;
                 fs::path const artifact =
-                    outDir / (resolved->stem().generic_string()
-                              + std::string{parsed->outputExtension(**siblingSchema)});
+                    outDir / (resolved.path.stem().generic_string()
+                              + std::string{outputExtensionFor(**siblingSchema)});
 
                 std::error_code statEc;
                 bool const wrote = fs::is_regular_file(artifact, statEc);

@@ -52,7 +52,7 @@ namespace dss::substrate {
 // 5b) — which costs a host frame per nested `(`. Its measured crash floor on
 // THIS 64 MiB worker is ~3000 nested parens on the tightest build (MSVC Debug),
 // far higher on Release/MinGW. The parser's per-language `maxExpressionDepth`
-// cap is deliberately sized to fail loud BELOW that floor (c-subset = 1024), so
+// cap is deliberately sized to fail loud BELOW that floor (c = 1024), so
 // the worker never actually overflows — this reserve is the headroom that makes
 // the cap (not a stack crash) the real ceiling. A *reserved* stack of this size
 // costs almost nothing until touched — the OS commits pages lazily as the stack

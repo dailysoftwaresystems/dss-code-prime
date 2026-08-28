@@ -39,11 +39,11 @@ target_compile_definitions(ffi_shipped PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL
 # the descriptor reader parses JSON, mirroring `opt`'s optimizer_json.cpp.
 target_link_libraries(ffi_shipped PRIVATE core hir nlohmann_json::nlohmann_json)
 
-# Aggregated into dss-code-prime-lib via $<TARGET_OBJECTS:ffi>.
+# Aggregated into dsscp-lib via $<TARGET_OBJECTS:ffi>.
 target_compile_definitions(ffi PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 
 # Declared deps reflect actual include surface: c_header_parser.cpp
-# orchestrates the c-subset frontend (analysis_compilation_unit +
+# orchestrates the c frontend (analysis_compilation_unit +
 # analysis_semantic) into HIR (hir + hir_lowering). Documented per
 # architect Item A post-FF2 fold — every OBJECT lib in this repo
 # already PUBLIC-exposes its includes via target_include_directories,

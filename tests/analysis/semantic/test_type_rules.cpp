@@ -132,7 +132,7 @@ TEST(TypeRules, IsAssignableRejectsCrossSignedness) {
 }
 
 // D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT: with the `intCrossSignednessConverts` gate ON
-// (c-subset), signed↔unsigned IS assignable in BOTH directions and at ANY width (incl.
+// (c), signed↔unsigned IS assignable in BOTH directions and at ANY width (incl.
 // cross-signedness narrowing U64→I32) — C 6.3.1.3 / 6.5.16.1. coerce() materializes the
 // width-exact Cast. RED-ON-DISABLE: revert the isAssignable cross-signedness arm → the
 // four EXPECT_TRUE flip to false. SCOPE GUARD: the gate is signed↔unsigned ONLY — a
@@ -158,7 +158,7 @@ TEST(TypeRules, IsAssignableAdmitsCrossSignednessWhenGated) {
            "(needs the separate intSameSignednessNarrows gate, off here)";
 }
 
-// D-CSUBSET-INT-SAME-SIGN-NARROW: with `intSameSignednessNarrows` ON (c-subset), a
+// D-CSUBSET-INT-SAME-SIGN-NARROW: with `intSameSignednessNarrows` ON (c), a
 // SAME-signedness integer NARROWING (`short s = anInt;`, `signed char c = anInt;`,
 // `int i = aLong;`) IS assignable — C 6.3.1.3 / 6.5.16.1, value-preserving in range,
 // truncating (modular) out of range. coerce()'s arithmetic-core arm materializes the
@@ -216,7 +216,7 @@ TEST(TypeRules, IsAssignableRejectsIntFloatCross) {
 }
 
 // D-CSUBSET-INT-FLOAT-CONVERSION: with `intConvertsToFloat` / `floatConvertsToInt`
-// ON (c-subset), the int↔float implicit ASSIGNMENT conversion is admitted in the
+// ON (c), the int↔float implicit ASSIGNMENT conversion is admitted in the
 // gated direction — `double d = 5;` (int→float), `int n = aDouble;` (float→int) —
 // C 6.3.1.4 / 6.3.1.5 / 6.5.16.1. The two gates are INDEPENDENT: each admits only
 // its own direction. coerce()'s arithmetic-core arm materializes the MIR
@@ -280,7 +280,7 @@ TEST(TypeRules, IsAssignableRejectsFloatNarrowingByDefault) {
     EXPECT_TRUE (isAssignable(in, f64, f32)) << "F32 -> F64 widening IS admitted (gate-independent)";
 }
 
-// D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING: with `floatSameKindNarrows` ON (c-subset), a
+// D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING: with `floatSameKindNarrows` ON (c), a
 // WIDER floating rhs NARROWS into a NARROWER floating lhs — `float f = aDouble;` (F64→F32,
 // the GEOPOLY `typedef float GeoCoord` assigned from a `double`), F80/F128→F64/F32 — C
 // 6.3.1.4 / 6.5.16.1, precision-lossy (value the nearest representable). WIDENING stays
@@ -539,6 +539,83 @@ TEST(TypeRules, ScalarConvertsToBoolWhenGated) {
     EXPECT_FALSE(asg(boolT, nptr,    false));
     // A genuinely-incompatible (non-scalar) source stays LOUD even gated ON.
     EXPECT_FALSE(asg(boolT, voidT,   true));
+}
+
+// C 6.2.5p21 + C23 6.2.5 + C 6.3.2.1p3/p4 (D-CSUBSET-NULLPTR-BOOL-CONVERSION —
+// the THREE source categories the arm's FIRST roster left out). "Scalar" is
+// ARITHMETIC ∪ POINTER, and three C source categories land in that set without
+// ever appearing in a hand-written rank list:
+//   * `_BitInt(N)`          — C23 6.2.5 makes it a bit-precise INTEGER, hence
+//     arithmetic, hence scalar. It is admitted through the SHARED `isArithmetic`
+//     helper, which already recognized it — so the arm keeps ONE roster of what
+//     "arithmetic" means instead of a second copy that can drift from the first.
+//   * an ARRAY              — C 6.3.2.1p3 converts it to a pointer to its first
+//     element, and the POINTER is already admitted. This is one conversion
+//     COMPOSED with one already-admitted conversion, not a new rule about `_Bool`.
+//   * a FUNCTION DESIGNATOR — C 6.3.2.1p4, the same shape.
+// ✔MEASURED against the references, each probed SEPARATELY (the bar §A.3b — the
+// test is the DISJUNCTION, never the consensus): clang 18.1.3 `-std=c23` accepts
+// and RUNS all three; gcc 13.3.0 `-std=c2x` accepts and runs the array and the
+// designator, and refuses the `_BitInt` one with `expected ';' before 'x'` —
+// which is that gcc lacking `_BitInt` ENTIRELY, a missing FEATURE rather than a
+// rejection of the conversion. So all three are REQUIRED.
+// ⚠ THIS LAMBDA PASSES `bitIntConversions=false`, so a green `_BitInt -> _Bool`
+// row PROVES the truth-value conversion does not ride the WIDTH-conversion gate.
+// They answer different questions — does this language convert a scalar to a
+// truth value, versus does it convert between `_BitInt` widths — and giving one
+// behaviour two owners is exactly how the two drift apart.
+// RED-ON-DISABLE, in the REMOVE direction: every new row with `gate=false` must
+// revert to a loud mismatch, and the non-scalar rows stay refused even gated ON.
+TEST(TypeRules, ScalarConvertsToBoolAdmitsBitIntArrayAndFunctionDesignator) {
+    auto in = makeInterner();
+    TypeId const boolT = in.primitive(TypeKind::Bool);
+    TypeId const i32   = in.primitive(TypeKind::I32);
+    TypeId const voidT = in.primitive(TypeKind::Void);
+    TypeId const bi37  = in.bitInt(37, /*isSigned=*/true);
+    TypeId const bi80u = in.bitInt(80, /*isSigned=*/false);      // MULTI-LIMB
+    TypeId const arr4  = in.array(i32, 4);                       // int[4]
+    TypeId const one[1] = { i32 };
+    TypeId const fnSig = in.fnSig(one, i32, CallConv::CcSysV);   // int(int) designator
+    TypeId const structT = in.structType("SBool", one);
+    TypeId const unionT  = in.unionType("UBool", one);
+    SemanticConfig::PointerConversionRules pr;
+    auto asg = [&](TypeId lhs, TypeId rhs, bool gate) {
+        return isAssignable(in, lhs, rhs, pr,
+            /*boolWidensToArith=*/false, /*charConvertsToArith=*/false,
+            /*enumConvertsToArith=*/false, /*intCrossSignednessConverts=*/false,
+            /*intSameSignednessNarrows=*/false, /*intConvertsToFloat=*/false,
+            /*floatConvertsToInt=*/false, /*floatSameKindNarrows=*/false,
+            /*charArrayFromStringLiteralInit=*/false,
+            /*bitIntConversions=*/false, /*scalarConvertsToBool=*/gate);
+    };
+    // Gated ON — each of the three new categories admits.
+    EXPECT_TRUE(asg(boolT, bi37, true))
+        << "_BitInt(37) -> _Bool: C23 6.2.5 makes it an integer, hence scalar";
+    EXPECT_TRUE(asg(boolT, bi80u, true))
+        << "a MULTI-LIMB _BitInt is no different — the truth value is `!= 0` over"
+           " the WHOLE value, not over a limb";
+    EXPECT_TRUE(asg(boolT, arr4, true))
+        << "int[4] -> _Bool: C 6.3.2.1p3 decays to int*, and a pointer is scalar";
+    EXPECT_TRUE(asg(boolT, fnSig, true))
+        << "int(int) designator -> _Bool: C 6.3.2.1p4 decays to int(*)(int)";
+    // RED-ON-DISABLE (REMOVE direction): the gate genuinely controls all four rows.
+    EXPECT_FALSE(asg(boolT, bi37,  false));
+    EXPECT_FALSE(asg(boolT, bi80u, false));
+    EXPECT_FALSE(asg(boolT, arr4,  false));
+    EXPECT_FALSE(asg(boolT, fnSig, false));
+    // ★ The widening reaches ONLY a `_Bool` lhs. C gives an array and a function
+    // designator NO conversion to an integer, so those stay loud in BOTH arms —
+    // which is what separates "the decay composes into the pointer arm" from
+    // "the rule table got looser".
+    EXPECT_FALSE(asg(i32, arr4,  true));
+    EXPECT_FALSE(asg(i32, fnSig, true));
+    EXPECT_FALSE(asg(i32, bi37,  true))
+        << "int <- _BitInt is the bitIntConversions matrix's question, not this arm's";
+    // A genuinely non-scalar source has no truth value in C and stays LOUD even
+    // gated ON — void / struct / union.
+    EXPECT_FALSE(asg(boolT, voidT,   true));
+    EXPECT_FALSE(asg(boolT, structT, true));
+    EXPECT_FALSE(asg(boolT, unionT,  true));
 }
 
 // ── D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3) ─────────────────────────────────────
@@ -838,4 +915,61 @@ TEST(TypeRules, UsualArithmeticCommonTypeComplex) {
     EXPECT_EQ(UAC(i32, cf32).v, cf32.v);
     // float + float stays REAL (the complex arm must not over-fire).
     EXPECT_EQ(UAC(f32, f64).v, f64.v);
+}
+
+// ── P42 (D-CSUBSET-EXPLICIT-BOOL-CAST-OF-A-FUNCTION-DESIGNATOR) ───────────────
+// C 6.3.2.1p4 decays a function DESIGNATOR to a pointer-to-function in every
+// context but `sizeof`/`_Alignof`/unary `&`; a cast is such a context, and
+// Ptr -> `_Bool` is already castable. So `(_Bool)fn` is ONE admitted conversion
+// composed with ONE admitted decay — the explicit face of the `scalarConvertsTo
+// Bool` FnSig arm that already makes `_Bool b = fn;` and `if (fn)` work.
+// ✔MEASURED, each reference probed SEPARATELY: gcc 13.3.0 (`-std=c2x`) and
+// clang 18.1.3 (`-std=c23`) both compile and RUN `_Bool b = (_Bool)fn;` (gcc adds
+// -Waddress, a warning about the always-true ANSWER, not about legality).
+// RED-ON-DISABLE: narrow the arm back to `tk == Ptr` and the Bool row flips.
+TEST(TypeRules, FunctionDesignatorExplicitCastToBoolAndPointer) {
+    auto in = makeInterner();
+    TypeId const fnSig   = makeIntIntFnSig(in);
+    TypeId const fnPtr   = in.pointer(fnSig);
+    TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+    TypeId const boolT   = in.primitive(TypeKind::Bool);
+    TypeId const i64     = in.primitive(TypeKind::I64);
+    TypeId const f64     = in.primitive(TypeKind::F64);
+    // The two admitted targets.
+    EXPECT_TRUE(isExplicitCastable(in, boolT,   fnSig))
+        << "(_Bool)fn — the designator decays, then Ptr -> _Bool";
+    EXPECT_TRUE(isExplicitCastable(in, fnPtr,   fnSig))
+        << "(fp)fn — the c37 pointer target, unchanged";
+    EXPECT_TRUE(isExplicitCastable(in, voidPtr, fnSig));
+    // ★ THE INTEGER TARGET IS NOW ADMITTED, AND THE PREDICATE THIS PIN USED TO
+    // ASSERT HAS BEEN INVERTED RATHER THAN DELETED (P42 lane AI,
+    // D-CSUBSET-FUNCTION-DESIGNATOR-TO-INTEGER-CAST-REFUSED).
+    // The roster went from the literal `{Ptr, Bool}` to `{Ptr} ∪ isCastableInt`.
+    // C 6.3.2.1p4 decays the designator and C 6.3.2.3p6 converts the pointer to an
+    // integer; gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed
+    // SEPARATELY, both compile and RUN `(long long)fn`, the round trip back through
+    // a function pointer, and the CALL through it.
+    // ⚠ THE OLD COMMENT'S REASON WAS SOUND AND WAS REMOVED BY FIXING IT, NOT BY
+    // OVERRULING IT: it said `combineCast` decays only an ARRAY operand, so
+    // admitting an integer target here would be ADMITTED-AND-NOT-REALIZED one tier
+    // down. `combineCast` now decays a FnSig operand under a non-pointer target
+    // through the same `coerce` funnel, IN THE SAME COMMIT — and the predicted
+    // failure was OBSERVED before that arm landed, not assumed.
+    EXPECT_TRUE(isExplicitCastable(in, i64, fnSig))
+        << "(long long)fn — the designator decays, then Ptr -> integer";
+    EXPECT_TRUE(isExplicitCastable(in, in.primitive(TypeKind::U64), fnSig))
+        << "(unsigned long long)fn — the unsigned half of the same conversion";
+    EXPECT_TRUE(isExplicitCastable(in, in.primitive(TypeKind::I32), fnSig))
+        << "(int)fn — NARROWING is legal C with an implementation-defined value "
+           "(both references warn and compile); refusing it would be DSS "
+           "inventing a constraint";
+    // ⚠ THE NEGATIVE THAT KEEPS THIS FROM BECOMING "FnSig CASTS TO ANYTHING":
+    // float <-> pointer is a C constraint violation in either direction, and a
+    // FLOAT target is NOT in `isCastableInt`, so the widened roster must still
+    // refuse it. Without this line the widening would be indistinguishable from
+    // deleting the arm's guard.
+    EXPECT_FALSE(isExplicitCastable(in, f64, fnSig));
+    // Nothing casts TO a function-designator type.
+    EXPECT_FALSE(isExplicitCastable(in, fnSig, i64));
+    EXPECT_FALSE(isExplicitCastable(in, fnSig, voidPtr));
 }

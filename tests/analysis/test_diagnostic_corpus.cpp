@@ -102,7 +102,7 @@ namespace {
     // D-PARSE-DEEP-FRONTEND-STACK: build the CU on the large worker stack
     // exactly as the production driver does (Program::compileFiles). A
     // deeply-nested corpus fixture (e.g. expression_too_deeply_nested.c, whose
-    // paren nest exceeds the c-subset config cap `parser.maxExpressionDepth`
+    // paren nest exceeds the c config cap `parser.maxExpressionDepth`
     // = 1024 to trip the depth guard) parses a ~1024-deep tree, which would
     // overflow this test thread's default stack if built inline.
     auto cu = dss::substrate::callOnLargeStack(
@@ -119,7 +119,7 @@ namespace {
     for (auto const& tree : cu->trees()) {
         if (auto s = tree.sourceShared()) bufs.add(std::move(s));
     }
-    // FC13: a preprocessed CU (c-subset) remaps a diagnostic off the synth
+    // FC13: a preprocessed CU (c) remaps a diagnostic off the synth
     // buffer onto its real origin buffer (the original main file / a spliced
     // header), which lives on `auxiliaryBuffers()`, NOT in `trees()`. Register
     // those too so the remapped buffer resolves to line:col instead of the

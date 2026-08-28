@@ -32,6 +32,21 @@
 // `expected.json` lists host OS names ("windows" / "linux" /
 // "darwin") on which the binary should spawn.
 //
+// ★★★ AND THAT POLICY MAKES THIS RUNNER THE SOLE WITNESS FOR EVERY CROSS-HOST
+// SPEC, WHICH IS NOW A CHECKED FACT RATHER THAN A HABIT.
+// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+// The CLI-subprocess sibling binds ONE target per manifest and compiles only
+// that one, by a user invariant of 2026-06-02 stated in its own header. So the
+// sentence above is not merely this runner's policy — it is the ONLY reason a
+// `runOn`-excluded spec is compiled by anything at all, and moving the `runOn`
+// gate above the compile here would silently strip every cross-target
+// capability of its only witness while both corpus suites stayed green. ⚠ The
+// shared arm-verdict vocabulary cannot express the difference: `SkippedByRunOn`
+// means *compiled, not spawned* here and *never compiled* there.
+// `tests/test_support/coverage_boundary.hpp` carries the fact the ledger
+// cannot, and the `integrated_tests/coverage-boundary` entry runs BOTH
+// harnesses on one example and judges them against it.
+//
 // A SKIP IS NOT A PASS (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT). Every
 // declared arm — every target x every optimizedPipelines arm — lands in an
 // `ArmVerdictLedger` with a named reason, and the entry prints the accounting
@@ -44,6 +59,12 @@
 // bug, which is how this defect survived in both for as long as it did.
 
 #include "arm_verdict_ledger.hpp"
+// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+// The COVERAGE BOUNDARY vocabulary — one grammar, emitted by both runners and
+// parsed by the boundary guard. This runner is the SUPERSET half: it compiles
+// every declared target, including the ones this host can never spawn, and its
+// header states why that half is the only witness a cross-host spec has.
+#include "coverage_boundary.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -155,6 +176,61 @@ struct DependsOnArtifact {
     bool                     mustDifferFromBaseline = false;
 };
 
+// D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+// one library input the corpus CONSUMES WITHOUT BUILDING IT.
+//
+// ★★★ WHY THIS IS NOT A `dependsOn` WITH THE SOURCES LEFT OUT. Every
+// `dependsOn` entry names `sources` and the runner COMPILES them with DSS, so
+// every library the corpus links is one DSS produced from C in this same run.
+// That makes an entire class of input unreachable by the corpus: an archive
+// somebody ELSE built. The BSD `ar` container (`__.SYMDEF` / `__.SYMDEF
+// SORTED`, `#1/N` inline member names) is exactly such a class — DSS's own `ar`
+// writer emits the GNU/SysV container only, so no `dependsOn` entry can ever
+// produce one, and the BSD reader arms therefore shipped with driver-level
+// witnesses but NO corpus example. That is regression coverage, not
+// correctness: nothing in the standing suite would notice if those arms broke.
+//
+// PER-TARGET, like `dependsOn`, because an archive is format-specific: the
+// llvm-ar fixture holds ELF members and the Apple-ar one holds Mach-O members,
+// and neither is linkable into the other's image.
+//
+// ⚠ THE PATH IS REPO-ROOT-RELATIVE, NOT EXAMPLE-RELATIVE, AND THAT IS A
+// DELIBERATE CHOICE WITH A MEASURED REASON. The corpus normally keeps an
+// example's inputs beside it (`stageExampleTree` mirrors the whole neighborhood
+// into the scratch dir, which is how `environ_alias_object_identity` ships its
+// prebuilt gcc `.so`s). A foreign-built ARCHIVE cannot follow that rule today:
+// ✔`.gitignore` ignores `*.a` tree-wide and re-includes exactly one directory,
+// `!tests/ffi/data/*.a` — so a `.a` dropped into an example dir is SILENTLY
+// un-committable, the same trap [[D-FF1-AR-BSD-VARIANT]] hit and had to add a
+// negation for. Copying those bytes into `examples/` would also give ONE file
+// TWO provenances, and a fixture whose provenance is a README rather than a
+// build rule is a thing that rots. So the manifest points at the canonical
+// fixture instead, and the two consumers (the hermetic reader tests and this
+// corpus) read the same bytes with one README describing where they came from.
+struct PrebuiltLibrary {
+    // Path to the library, relative to the REPOSITORY ROOT. A path that could
+    // leave the tree, or that only opens on one host, is refused at parse time
+    // — `prebuiltLibraryPathRefusal` owns that rule and says why each clause is
+    // there.
+    std::string path;
+    // ★★★ THE FIELD THAT KEEPS THIS ENTRY FROM ROTTING INTO A VACUOUS PASS, and
+    // the reason it is REQUIRED rather than optional. An ASCII token that MUST
+    // appear in the file's bytes. The example's whole claim is *"DSS consumed an
+    // archive in the BSD container"* — but if that fixture were ever regenerated
+    // in the GNU container, the example would go on passing, because the GNU
+    // reader would resolve the same two symbols and produce the same exit code.
+    // The corpus witness for the BSD arms would evaporate with every suite still
+    // green, which is the precise failure this row exists to close. So the
+    // manifest STATES the property that makes its input the thing it claims to
+    // be, and both runners CHECK it — `__.SYMDEF SORTED` for the Apple fixture,
+    // `__.SYMDEF` for the llvm one.
+    //
+    // ⚠ A SUBSTRING PIN, NOT A PARSER, ON PURPOSE: a runner that decoded the
+    // container would be a second implementation of `ar_reader.cpp` living in a
+    // test harness, and it would agree with itself by construction.
+    std::string containerWitness;
+};
+
 // The IDENTITY of one prerequisite within an arm's build, used to match the
 // baseline arm's image for a dependency against an optimized arm's image for
 // THE SAME dependency.
@@ -196,6 +272,12 @@ struct ExampleTarget {
     // `--resolve-library` (`Program::setResolveLibraries`). Empty (the
     // default) ⇒ a plain single-artifact build (every pre-c171 example).
     std::vector<DependsOnArtifact> dependsOn;
+    // D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+    // library inputs this target links WITHOUT BUILDING — resolved against the
+    // repo root, verified, and threaded into the SAME `--resolve-library` set
+    // the `dependsOn` artifacts go into. Empty (the default) ⇒ every pre-P32
+    // example's build is byte-identical to what it was.
+    std::vector<PrebuiltLibrary> prebuiltLibraries;
     // D-LK10-ENTRY-ARM64: optional emulator command (e.g.
     // "qemu-aarch64") used when the target arch differs from the host
     // arch. Empty ⇒ native execution only (the pre-V2-1 default).
@@ -259,8 +341,8 @@ struct OptimizedArm {
 };
 
 // ★★★ THE EXEMPTION THAT UNLOCKS A PER-ARM EXPECTATION, AND WHY THE AXIOM DID
-// NOT SIMPLY GET RELAXED (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-
-// EMITTED). `OptimizedArm`'s contract — "same exit code + stdout as the
+// NOT SIMPLY GET RELAXED (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED).
+// `OptimizedArm`'s contract — "same exit code + stdout as the
 // baseline" — was carrying TWO facts in one sentence:
 //   (i)  the CORRECTNESS INVARIANT: an optimizer must not change a program's
 //        observable behaviour; and
@@ -490,6 +572,106 @@ parseDependsOnEntry(nlohmann::json const& d, fs::path const& manifestPath) {
         }
     }
     return dep;
+}
+
+// D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+// parse ONE `prebuiltLibraries` entry. Mirrored field-for-field by the
+// CLI-subprocess sibling's `parsePrebuiltLibraryEntry`
+// (integrated_tests/runner.cpp), because a manifest one runner accepts and the
+// other rejects is the silent-harness-bug class
+// [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] exists to catch. Returns nullopt
+// (ADD_FAILURE already fired) on any malformed field.
+//
+// ⚠ BOTH FIELDS ARE REQUIRED, and neither requirement is ceremony: a missing
+// `path` has nothing to link, and a missing `containerWitness` is an input
+// nobody stated a property of — see the field's own note for why an unwitnessed
+// prebuilt archive is a green that means nothing.
+
+// ★★★ THE PATH RULE, AND WHY IT JUDGES THE STRING RATHER THAN ASKING
+// `std::filesystem`. A corpus manifest must mean the SAME THING on every host,
+// and ✔MEASURED (this pin caught it, on the first run): `fs::path{"/abs/x"}
+// .is_absolute()` is TRUE on Linux and FALSE on Windows, because a Windows
+// absolute path needs a root NAME as well as a root directory. A rule built on
+// it would have refused a manifest on the Linux leg and accepted the very same
+// bytes on the Windows one — a corpus vocabulary that is a property of the host
+// reading it. So the four refusals below are pure string facts:
+//   * a leading '/' or '\'  — a root-relative path on some host;
+//   * any ':'               — a drive letter or device/stream spec;
+//   * any '\'               — a Windows-only spelling that cannot open on POSIX;
+//   * any ".."             — a reach outside the repository, which would make
+//                             the example's result depend on what is beside the
+//                             checkout rather than in it.
+// Returns the refusal clause, or an empty string when the path is acceptable.
+// Mirrored by the CLI-subprocess sibling's copy of the same name.
+[[nodiscard]] std::string prebuiltLibraryPathRefusal(std::string const& path) {
+    // Callers check emptiness first and report it with its own message; the
+    // guard is here anyway because `front()` on an empty string is undefined,
+    // and a helper that is only safe by its caller's discipline is a defect
+    // waiting for its second caller.
+    if (path.empty()) return "must not be empty";
+    if (path.front() == '/' || path.front() == '\\') {
+        return "must be RELATIVE to the repository root, and this one begins at"
+               " a root directory";
+    }
+    if (path.find(':') != std::string::npos) {
+        return "must be RELATIVE to the repository root, and ':' can only"
+               " introduce a drive or device";
+    }
+    if (path.find('\\') != std::string::npos) {
+        return "must be spelled with '/' separators — a '\\' opens on Windows"
+               " and not on POSIX, so the manifest would mean two things";
+    }
+    if (path.find("..") != std::string::npos) {
+        return "must not contain '..' — a corpus example must not reach outside"
+               " the repository";
+    }
+    return {};
+}
+
+[[nodiscard]] std::optional<PrebuiltLibrary>
+parsePrebuiltLibraryEntry(nlohmann::json const& p, fs::path const& manifestPath) {
+    if (!p.is_object()) {
+        ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                      << " prebuiltLibraries entries must be objects";
+        return std::nullopt;
+    }
+    // ★ THE CLOSED PER-ENTRY KEY SET RUNS FIRST HERE, AND THE ORDER IS A
+    // MEASURED CORRECTION rather than a style choice. Its sibling on the
+    // `dependsOn` entry runs after the required-field check, which is fine
+    // there because a typo'd `mustDifferFromBaseLine` leaves every required
+    // field intact. Here the required field IS the one that gets typo'd:
+    // ✔MEASURED, `containerWitnesss` made `containerWitness` read empty, so the
+    // required-field refusal fired first and the author was told a field was
+    // MISSING while the typo that made it missing went unnamed. Checking the
+    // key set first names the actual mistake.
+    for (auto const& [k, unusedV] : p.items()) {
+        (void)unusedV;
+        if (k == "path" || k == "containerWitness" || k.starts_with("$")) continue;
+        ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                      << " prebuiltLibraries entry declares unknown key '" << k
+                      << "' — the runner reads path / containerWitness (plus"
+                         " $comment keys). An expectation the runner does not"
+                         " read is an assertion that never fires.";
+        return std::nullopt;
+    }
+    PrebuiltLibrary lib;
+    lib.path             = p.value("path", "");
+    lib.containerWitness = p.value("containerWitness", "");
+    if (lib.path.empty() || lib.containerWitness.empty()) {
+        ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                      << " prebuiltLibraries entry needs non-empty 'path'"
+                         " (repo-root-relative) and 'containerWitness' (an"
+                         " ASCII token that must appear in the file's bytes)";
+        return std::nullopt;
+    }
+    if (std::string const why = prebuiltLibraryPathRefusal(lib.path);
+        !why.empty()) {
+        ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                      << " prebuiltLibraries 'path' " << why << " (got '"
+                      << lib.path << "')";
+        return std::nullopt;
+    }
+    return lib;
 }
 
 // ★★★ THE THREE LOAD-TIME REFUSALS THAT MAKE THE `optimizationObservable`
@@ -787,7 +969,8 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
             (void)unusedV;
             if (k == "spec" || k == "artifact" || k == "runOn"
                 || k == "emulator" || k == "expectedStdout" || k == "exitCode"
-                || k == "dependsOn" || k.starts_with("$")) {
+                || k == "dependsOn" || k == "prebuiltLibraries"
+                || k.starts_with("$")) {
                 continue;
             }
             ADD_FAILURE() << "manifest " << path.generic_string()
@@ -795,9 +978,9 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
                           << "' declares unknown key '" << k
                           << "' — the runner reads spec / artifact / runOn /"
                              " emulator / expectedStdout / exitCode /"
-                             " dependsOn (plus $comment keys). An expectation"
-                             " the runner does not read is an assertion that"
-                             " never fires.";
+                             " dependsOn / prebuiltLibraries (plus $comment"
+                             " keys). An expectation the runner does not read"
+                             " is an assertion that never fires.";
             return m;
         }
         if (t.contains("runOn") && t.at("runOn").is_array()) {
@@ -840,6 +1023,25 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
                 auto parsed = parseDependsOnEntry(d, path);
                 if (!parsed.has_value()) return m;  // ADD_FAILURE already fired
                 et.dependsOn.push_back(std::move(*parsed));
+            }
+        }
+        // D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+        // optional library inputs this target links WITHOUT building — an
+        // archive this repository did not produce. Parsed by the SAME helper the
+        // CLI-subprocess sibling mirrors.
+        if (t.contains("prebuiltLibraries")) {
+            if (!t.at("prebuiltLibraries").is_array()
+                || t.at("prebuiltLibraries").empty()) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " target 'prebuiltLibraries' must be a"
+                                 " NON-EMPTY array — an empty one declares a"
+                                 " capability the build then never exercises";
+                return m;
+            }
+            for (auto const& p : t.at("prebuiltLibraries")) {
+                auto parsed = parsePrebuiltLibraryEntry(p, path);
+                if (!parsed.has_value()) return m;  // ADD_FAILURE already fired
+                et.prebuiltLibraries.push_back(std::move(*parsed));
             }
         }
         m.targets.push_back(std::move(et));
@@ -1025,7 +1227,7 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
 //
 // This is the SUBDIRECTORY a project build routes its artifact into:
 // `Program::compileProject` forces `setPerFormatOutputSubdir(true)`
-// (src/program/program.cpp:1760), so a project artifact lands at
+// (src/program/program.cpp), so a project artifact lands at
 // `<outDir>/<formatName>/<name><ext>` even for a single-target build, where a
 // `--compile` build would have put it flat at `<outDir>/<name><ext>`.
 //
@@ -1278,6 +1480,12 @@ struct ArmResult {
     // SILENT MISS — exactly the class of defect this exists to end — and corpus
     // artifacts are single-digit KB, so the exact comparison costs nothing.
     std::string artifactBytes;
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // The ATTEMPT to exec, not its outcome. `verdict == Ran` cannot stand in for
+    // it — a spawn that FAILED is `Poisoned` — and the coverage-boundary clause
+    // that forbids exec'ing a foreign-host artifact must catch the attempt
+    // whether or not this machine let it succeed.
+    bool spawnAttempted = false;
     // Every PREREQUISITE image this arm produced, keyed by
     // `dependencyImageKey`. Captured for the SAME forced reason as
     // `artifactBytes` above — the deps are built into `scratch`'s out dir, and
@@ -1505,12 +1713,90 @@ struct ArtifactIdentityTally {
     std::size_t              depImagesIdentical = 0;
 };
 
+// D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+// resolve ONE declared prebuilt library against the repository root and PROVE
+// it is the file the manifest says it is. Returns the absolute path, or nullopt
+// (ADD_FAILURE already fired) — the caller poisons the arm.
+//
+// ★★★ EVERY FAILURE HERE IS A HARD RED, NEVER A SKIP, and that is the one
+// design decision in this function. A missing prebuilt input is exactly the
+// shape that tempts a harness into "the fixture is not here, so there is
+// nothing to check" — and the corpus already learned this the expensive way:
+// `environ_alias_object_identity` spends an exit code (10) on *the witness is
+// absent* precisely so a deleted `.so` cannot read as a pass. An input the
+// manifest ASKED FOR and the tree could not supply is a defect in the tree.
+//
+// The three checks are three DIFFERENT failures and each names itself, because
+// they send a reader to three different places: the path is wrong / the file is
+// unreadable or truncated / the file is no longer the container it claims.
+//
+// Mirrored behaviourally by the CLI-subprocess sibling
+// (integrated_tests/runner.cpp `resolvePrebuiltLibraryCli`) — same resolution
+// rule, same three checks, same order.
+[[nodiscard]] std::optional<fs::path>
+resolvePrebuiltLibrary(PrebuiltLibrary const& lib, fs::path const& exampleDir) {
+    fs::path root;
+    try {
+        root = ::dss::test::repoRoot();
+    } catch (std::exception const& e) {
+        ADD_FAILURE() << "prebuiltLibraries: cannot resolve the repository root"
+                         " that '" << lib.path << "' is relative to ("
+                      << exampleDir.generic_string() << "): " << e.what();
+        return std::nullopt;
+    }
+    auto const resolved = root / lib.path;
+    std::error_code ec;
+    if (!fs::is_regular_file(resolved, ec) || ec) {
+        ADD_FAILURE() << "prebuiltLibraries: '" << lib.path
+                      << "' declared by " << exampleDir.generic_string()
+                      << " is not a regular file at "
+                      << resolved.generic_string()
+                      << (ec ? " (" + ec.message() + ")" : "")
+                      << " — a library input the manifest asked for and the"
+                         " tree could not supply is a FAILURE, never a skip";
+        return std::nullopt;
+    }
+    std::error_code sizeEc;
+    auto const declaredSize = fs::file_size(resolved, sizeEc);
+    auto const bytes        = readArtifactBytes(resolved);
+    // Cross-checked against `file_size` and required non-empty, the SAME rule
+    // the dependency-image capture applies: a short read reaches the witness
+    // search as a PREFIX, and a prefix that happens to stop before the witness
+    // would report "this is not a BSD archive" about a file that is one.
+    if (sizeEc || !bytes.has_value() || bytes->empty()
+        || static_cast<std::uintmax_t>(bytes->size()) != declaredSize) {
+        ADD_FAILURE() << "prebuiltLibraries: could not read "
+                      << resolved.generic_string() << " whole (file_size "
+                      << (sizeEc ? std::string{"<unreadable>"}
+                                 : std::to_string(declaredSize))
+                      << " bytes, read "
+                      << (bytes.has_value() ? std::to_string(bytes->size())
+                                            : std::string{"<failed>"})
+                      << ") — a partial read cannot witness anything about the"
+                         " file's container";
+        return std::nullopt;
+    }
+    if (bytes->find(lib.containerWitness) == std::string::npos) {
+        ADD_FAILURE() << "prebuiltLibraries: " << resolved.generic_string()
+                      << " (" << bytes->size()
+                      << " bytes) does not contain the declared"
+                         " containerWitness '" << lib.containerWitness
+                      << "'. The manifest links this file for the sake of the"
+                         " container it is in; a regenerated fixture in a"
+                         " DIFFERENT container would still resolve the same"
+                         " symbols and the example would go on passing with the"
+                         " property it exists to witness no longer present";
+        return std::nullopt;
+    }
+    return resolved;
+}
+
 // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: build ONE
 // prerequisite LIBRARY artifact into `outDir`, RECURSIVELY building its own
 // nested `dependsOn` FIRST (into the same `outDir`) and threading their output
 // paths into THIS dep's `--resolve-library`. So a `-staticlib` dep listing a
-// nested `-staticlib` dep MERGES it (the fat archive, D-FF1-STATICLIB-FAT-
-// ARCHIVE): the nested input `.a` is built, then the fat `.a` build resolves it
+// nested `-staticlib` dep MERGES it (the fat archive, D-FF1-STATICLIB-FAT-ARCHIVE):
+// the nested input `.a` is built, then the fat `.a` build resolves it
 // and bundles its members in. ORDER-CORRECT (a dep's prerequisites exist on
 // disk before its own build runs) and fully generic (arbitrary depth, no
 // example-name special-casing). `dep.sources` resolve against `scratchPath`
@@ -1737,6 +2023,23 @@ compileAndRunArm(fs::path const& exampleDir,
     }
     // Every DECLARED source must have been among the copied files — a
     // manifest typo fails loud here, not as a confusing driver error.
+    //
+    // ★★ THESE PATHS ARE ABSOLUTE, AND THAT IS ONE OF THE FOUR SHAPES A USER CAN
+    // TYPE (`D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH`).
+    // `main.c`, `sub/main.c` and `./main.c` are the other three, and a corpus
+    // that spells only one of them could not see
+    // `D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH` — a
+    // HIGH, user-facing `#include` failure that reached HEAD behind a green
+    // gate. ⇒ THE OTHER THREE SHAPES ARE PINNED IN
+    // `tests/program/test_source_argument_shape.cpp` (in-process, the same
+    // `compileFiles`/`compileUnits` entry points this arm drives) and in
+    // `runSourceArgumentShapePin` on the `integrated_tests/cli-surface` entry
+    // (argv tier). ⚠ Do NOT "fix" the blindness by respelling this line: the
+    // shape is a property of the INVOCATION, not of an example, so respelling it
+    // would change the compile input for every manifest in the corpus and still
+    // leave
+    // exactly ONE shape covered — the corpus would simply be blind to a
+    // different one.
     std::vector<std::string> srcPaths;
     srcPaths.reserve(m.sources.size());
     for (auto const& s : m.sources) {
@@ -1850,7 +2153,19 @@ compileAndRunArm(fs::path const& exampleDir,
     // the arm witnessing the pipeline over only part of its own program. See
     // the ★ note on buildDependencyArtifact.
     std::vector<fs::path> resolveLibs;
-    resolveLibs.reserve(t.dependsOn.size());
+    resolveLibs.reserve(t.prebuiltLibraries.size() + t.dependsOn.size());
+    // D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+    // the PREBUILT inputs first, then the ones this arm built. Order is fixed
+    // (and identical in the CLI-subprocess sibling) so the `--resolve-library`
+    // sequence a manifest produces is a property of the manifest alone.
+    for (auto const& lib : t.prebuiltLibraries) {
+        auto resolved = resolvePrebuiltLibrary(lib, exampleDir);
+        if (!resolved.has_value()) {
+            armResult.verdict = ArmVerdict::Poisoned;
+            return armResult;
+        }
+        resolveLibs.push_back(std::move(*resolved));
+    }
     for (auto const& dep : t.dependsOn) {
         auto depArtifact = buildDependencyArtifact(dep, scratch.path(), outDir,
                                                    exampleDir, m.language,
@@ -1917,7 +2232,7 @@ compileAndRunArm(fs::path const& exampleDir,
     }
 
     // D-AP2-OUTPUT-ROUTING: a PROJECT build forces `setPerFormatOutputSubdir(true)`
-    // (src/program/program.cpp:1760), so its artifact is at
+    // (src/program/program.cpp), so its artifact is at
     // `<outDir>/<formatName>/<name><ext>`, NOT at `<outDir>/<artifact>`.
     //
     // COMPUTED EXPLICITLY rather than absorbed into the manifest string. Writing
@@ -2104,6 +2419,7 @@ compileAndRunArm(fs::path const& exampleDir,
     // this site was a bare `5000` literal that had to cover both, and the
     // OS half — a Gatekeeper notarization round trip that serializes across
     // concurrent execs — pushed 35/737 tests over it under `ctest -j8`.
+    armResult.spawnAttempted = true;  // the ATTEMPT, recorded BEFORE the outcome
     auto const result = runBinary(artifactPath,
                                   kRunBudget,
                                   captureStdout,
@@ -2136,7 +2452,8 @@ void runOneTarget(fs::path const&        exampleDir,
                   ExampleTarget const&   t,
                   std::string const&     exampleId,
                   ArmVerdictLedger&      ledger,
-                  ArtifactIdentityTally& identity) {
+                  ArtifactIdentityTally& identity,
+                  CoverageReport&        coverage) {
     ASSERT_FALSE(t.spec.empty())
         << "target spec missing in manifest";
     ASSERT_FALSE(t.artifact.empty())
@@ -2152,6 +2469,18 @@ void runOneTarget(fs::path const&        exampleDir,
                                            "baseline");
     ledger.record(exampleId, t.spec, "baseline", baseline.verdict,
                   baseline.detail);
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // ★★★ THE OBSERVATION THIS RUNNER IS THE ONLY ONE ABLE TO MAKE, AND WHICH
+    // THE ARM VERDICT ERASES. A `runOn`-excluded target lands in the ledger as
+    // `SkippedByRunOn` here AND in the CLI-subprocess sibling — but here it means
+    // *compiled, artifact produced, not spawned* and there it means *never
+    // compiled*. `artifactBytes` is non-empty exactly when a build succeeded (it
+    // is read off disk immediately after the size check, BEFORE the runOn gate),
+    // so it is the honest witness of the compile and is taken from the build's
+    // own result rather than re-derived from the verdict.
+    if (!baseline.artifactBytes.empty()) coverage.compiled.push_back(t.spec);
+    if (baseline.spawnAttempted) coverage.spawned.push_back(t.spec);
+    if (baseline.verdict == ArmVerdict::Ran) coverage.ran.push_back(t.spec);
     if (baseline.verdict != ArmVerdict::Ran) {
         // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the declared optimized arms
         // are NOT compiled when the baseline does not run (the early return is
@@ -2447,6 +2776,55 @@ void runErrorTarget(fs::path const&        exampleDir,
         << "\n  actual:"   << join(actual);
 }
 
+// ── THE CORPUS SCRATCH TREE MUST BE PER BUILD TREE ──────────────────────────
+//   D-TEST-EXAMPLES-CORPUS-SCRATCH-IS-SHARED-BY-EVERY-BUILD-TREE
+//
+// Every arm below opens `ScratchDir{Location::InsideRepo, "examples"}`, and
+// that location is literally `<cwd>/test-scratch/examples/<pid>-<n>` — so the
+// cwd ctest hands this process DECIDES which tree ~611 corpus entries write
+// into. While it was `${CMAKE_SOURCE_DIR}` that tree was the CHECKOUT, one
+// directory shared by every build tree, every lane and every worktree of this
+// repository, and 684 leaked directories had accumulated in it.
+//
+// ⚠ WHAT THIS IS *NOT*. It is not a collision guard. `ScratchDir` claims its
+// slot with the SINGULAR `create_directory`, which is atomic in the OS, so two
+// processes cannot share a slot however many of them run at once
+// (`D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE`, closed). The defect this
+// refuses is a shared WRITE LOCATION, and the distinction matters because a
+// reader who thinks it is about collisions will conclude the parallel gate was
+// unsafe, which was measured to be false: two full 1347-entry corpus runs at
+// `ctest -j 6` produced 0 reds before this changed.
+//
+// ★ THE PREDICATE IS "cwd IS A CHECKOUT ROOT", not "cwd is inside the repo".
+// Being inside the repository is fine and unavoidable — the default build tree
+// is `<repo>/build/<name>/`. The one cwd that must never be used is a directory
+// that IS a checkout root, because that is the single path every build tree of
+// that checkout resolves to identically. `src/dss-config` is the same marker
+// `tests/test_support/repo_root.hpp` uses to recognise a checkout, so this asks
+// the question the rest of the harness already asks.
+[[nodiscard]] std::string corpusScratchIsolationFailure() {
+    std::error_code ec;
+    fs::path const cwd = fs::current_path(ec);
+    if (ec) {
+        return "cannot read the process working directory ("
+             + ec.message() + ") — the corpus scratch root is derived from it,"
+               " so this check refuses rather than assumes";
+    }
+    std::error_code markerEc;
+    if (!fs::is_directory(cwd / "src" / "dss-config", markerEc) || markerEc) {
+        return {};  // not a checkout root — isolated per build tree
+    }
+    return "this corpus entry's working directory IS a repository checkout root"
+           " (" + cwd.generic_string() + " holds src/dss-config), so its"
+           " ScratchDir(InsideRepo) tree is "
+         + (cwd / "test-scratch" / "examples").generic_string()
+         + " — one directory shared by EVERY build tree, lane and worktree of"
+           " this checkout, and one that leaks into the source tree whenever a"
+           " scratch dtor loses its remove_all. Register the corpus entries"
+           " with a per-build-tree WORKING_DIRECTORY"
+           " (tests/examples/CMakeLists.txt, DSS_EXAMPLES_ENTRY_CWD).";
+}
+
 } // namespace
 
 // argv[1] = absolute path to the example dir (registered by cmake).
@@ -2454,6 +2832,14 @@ void runErrorTarget(fs::path const&        exampleDir,
 // The harness reads `<dir>/expected.json`, drives every target spec
 // in the manifest, and exits 0 only if every assertion passed.
 TEST(Examples, RunFromManifest) {
+    // FIRST, and fatal: every arm below roots its scratch tree at the process
+    // cwd, so a wrong cwd does not fail here — it silently relocates ~611
+    // entries' output into a directory the whole checkout shares. Asserted in
+    // the PER-EXAMPLE test rather than only in the lint suite so that reverting
+    // the per-example registration reddens the 611 entries it actually
+    // mis-registered, instead of one lint entry that was registered correctly.
+    ASSERT_EQ(corpusScratchIsolationFailure(), "");
+
     auto const argv0Dir =
         ::testing::internal::GetArgvs();
     ASSERT_GE(argv0Dir.size(), 2u)
@@ -2475,18 +2861,34 @@ TEST(Examples, RunFromManifest) {
 
     ArmVerdictLedger      ledger;
     ArtifactIdentityTally identity;
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // `declared` is filled from the manifest BEFORE the loop, so a target whose
+    // build dies mid-way still appears as declared-and-uncompiled rather than
+    // disappearing from the boundary judgement altogether.
+    CoverageReport coverage;
+    coverage.runner    = std::string{kCoverageRunnerInProcess};
+    coverage.exampleId = exampleId;
+    for (auto const& t : m.targets) coverage.declared.push_back(t.spec);
     for (auto const& t : m.targets) {
         SCOPED_TRACE("target spec=" + t.spec);
         // V2-4 Part C: an `expectDiagnostics` manifest asserts a failed
         // compile + positioned diagnostics; otherwise the source must
         // compile + run cleanly.
         if (m.expectDiagnostics.empty()) {
-            runOneTarget(exampleDir, m, t, exampleId, ledger, identity);
+            runOneTarget(exampleDir, m, t, exampleId, ledger, identity, coverage);
         } else {
             runErrorTarget(exampleDir, m, t, exampleId, ledger);
         }
     }
 
+    // ⚠ EMITTED IMMEDIATELY AFTER THE LOOP AND BEFORE THE FATAL ASSERTIONS
+    // BELOW, deliberately: the boundary guard's job includes catching a runner
+    // that started SPAWNING a spec this host cannot execute, and that change
+    // reds this entry. A coverage line printed after a fatal assert would be
+    // absent in exactly the run whose coverage the guard most needs to read,
+    // and the guard would report "the runner said nothing" instead of naming
+    // what it did.
+    std::cout << renderCoverageLine(coverage) << '\n';
 
     // ── D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the ledger ───────────────
     //
@@ -3275,6 +3677,128 @@ TEST(ExamplesCorpusLint, DependsOnEntryRefusesAnUnknownKeyAtEveryDepth) {
     }
 }
 
+// ── THE PREBUILT-LIBRARY ENTRY'S OWN REFUSALS ──────────────────────────────
+//
+// D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS
+//
+// ★★ WHY THIS ENTRY NEEDS PINNING AT ALL, given that a corpus example already
+// exercises it: the example proves the HAPPY path — an archive resolved, a
+// program linked, an exit code. It cannot prove a REFUSAL, and every refusal
+// here exists because its absence would produce a green that means nothing:
+//
+//   * no `containerWitness`  -> a prebuilt input nobody stated a property of.
+//     The example links a BSD archive FOR ITS CONTAINER; regenerate that
+//     fixture in the GNU container and the GNU reader resolves the same two
+//     symbols, the same exit code comes back, and the BSD arms lose their only
+//     corpus witness with every suite still green.
+//   * a `..` or absolute path -> an example whose result depends on a file
+//     outside the repository, i.e. on one machine's filesystem.
+//   * an unknown key          -> the same typo class the `dependsOn` pin above
+//     closes: `containerWitnesss` would parse clean and arm nothing.
+//
+// Mirrored, refusal for refusal, by the CLI-subprocess sibling's
+// `runPrebuiltLibraryParserPin` — a manifest one runner accepts and the other
+// rejects is [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]].
+TEST(ExamplesCorpusLint, PrebuiltLibraryEntryIsRefusedUnlessItIsWitnessed) {
+    ScratchDir sandbox{Location::Temp, "prebuilt-library-keys"};
+    auto const dir = sandbox.path();
+
+    // AGNOSTIC BY CONSTRUCTION, like every fixture in this file: the language,
+    // arch and format spellings are placeholders, because `readManifest` stores
+    // them as opaque strings and naming a real one here would put target
+    // identity into a file that has none. The PATH is a placeholder too — these
+    // directions are all refused at PARSE time, before any file is opened.
+    auto const plantAndRead = [&dir](char const* body) {
+        fs::path const mp = dir / "expected.json";
+        std::ofstream mf(mp);
+        mf << R"({
+  "language": "<fixture-language>",
+  "source": "<fixture-source>",
+  "exitCode": 0,
+  "targets": [{"spec": "<fixture-arch>:<fixture-format>",
+               "artifact": "<fixture-artifact>", "runOn": ["<fixture-host>"],
+               "prebuiltLibraries": [)" << body << R"(]}]
+})";
+        mf.close();
+        EXPECT_TRUE(mf.good()) << "could not plant " << mp.generic_string();
+        return readManifest(mp);
+    };
+
+    // DIRECTION 1 — a prebuilt input with NO declared witness is REFUSED. The
+    // load-bearing one: this is the entry that would otherwise rot silently.
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(R"({"path": "<fixture-dir>/<fixture-lib>"})");
+        },
+        "containerWitness");
+
+    // DIRECTION 2 — a path that leaves the repository, or that only opens on
+    // one host, is REFUSED. FOUR separate expectations because they are four
+    // different mistakes, and a check catching one would look like it caught
+    // all four. ★ The root-directory case is the one that made this pin worth
+    // writing: it caught `fs::path::is_absolute()` answering DIFFERENTLY on
+    // Windows and Linux for the same manifest bytes.
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                R"({"path": "../outside/<fixture-lib>",
+                    "containerWitness": "<fixture-witness>"})");
+        },
+        "must not contain '..'");
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                R"({"path": "/absolute/<fixture-lib>",
+                    "containerWitness": "<fixture-witness>"})");
+        },
+        "begins at a root directory");
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                R"({"path": "X:/drive/<fixture-lib>",
+                    "containerWitness": "<fixture-witness>"})");
+        },
+        "drive or device");
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                R"({"path": "tests/<fixture-dir>\\<fixture-lib>",
+                    "containerWitness": "<fixture-witness>"})");
+        },
+        "opens on Windows");
+
+    // DIRECTION 3 — an unknown key is REFUSED and the message NAMES it, so an
+    // author reads the fix off the failure. The spelling is the realistic typo:
+    // `containerWitnesss` blanks the very field it typo'd, so before the closed
+    // key set ran FIRST this reported a MISSING field and never named the key.
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                R"({"path": "<fixture-dir>/<fixture-lib>",
+                    "containerWitnesss": "<fixture-witness>"})");
+        },
+        "containerWitnesss");
+
+    // DIRECTION 4 — a well-formed entry PARSES, keeps a `$` documentation key,
+    // and BOTH of its values arrive on the target. Without this the three
+    // refusals above would be satisfied by a parser that refused everything.
+    {
+        auto const parsed = plantAndRead(
+            R"({"$comment": "why this archive and not another",
+                "path": "<fixture-dir>/<fixture-lib>",
+                "containerWitness": "<fixture-witness>"})");
+        ASSERT_EQ(parsed.targets.size(), 1u);
+        ASSERT_EQ(parsed.targets[0].prebuiltLibraries.size(), 1u)
+            << "a `$`-prefixed key must not cost the entry its parse";
+        EXPECT_EQ(parsed.targets[0].prebuiltLibraries[0].path,
+                  "<fixture-dir>/<fixture-lib>");
+        EXPECT_EQ(parsed.targets[0].prebuiltLibraries[0].containerWitness,
+                  "<fixture-witness>")
+            << "the witness must survive the parse — a field the runner drops"
+               " here is a check that never runs later";
+    }
+}
+
 // ── THE SAME REFUSAL, ONE AND TWO LEVELS UP ────────────────────────────────
 //
 // ★★ The `dependsOn` pin above closes the innermost of three closed key sets.
@@ -3286,10 +3810,16 @@ TEST(ExamplesCorpusLint, DependsOnEntryRefusesAnUnknownKeyAtEveryDepth) {
 // silently stops witnessing the optimizer; `expectedStdOut` on a target never
 // asserts the pin.
 //
-// ✔MEASURED 2026-08-20, all 611 corpus manifests parsed: the corpus declares
-// exactly the 10 non-`$` top-level keys and the 7 non-`$` per-target keys that
-// the runners read — nothing orphaned in either direction, so both sets fit
-// exactly rather than being supersets with slack.
+// ✔RE-MEASURED 2026-08-24 (not re-quoted — the figure below was 611 manifests
+// and 7 per-target keys four days ago, and BOTH numbers moved), all 629 corpus
+// manifests parsed: the corpus declares exactly the 10 non-`$` top-level keys
+// and the 8 non-`$` per-target keys that the runners read — nothing orphaned in
+// either direction, so both sets fit exactly rather than being supersets with
+// slack. The eighth per-target key is `prebuiltLibraries`
+// (D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS).
+// ⚠ A closed set is exactly the kind of code whose correctness is a property of
+// a corpus that moves underneath it: parse the tree before concluding anything
+// from this sentence.
 TEST(ExamplesCorpusLint, ManifestRefusesAnUnknownKeyAtTopLevelAndPerTarget) {
     ScratchDir sandbox{Location::Temp, "manifest-closed-keys"};
     auto const dir = sandbox.path();
@@ -3417,8 +3947,9 @@ TEST(ExamplesCorpusLint, StagingPrimitiveLivesOnlyInTheSharedHeader) {
         "tests/examples/examples_runner.cpp",
         "integrated_tests/runner.cpp",
     };
-    // Throws with `repoRootDiagnostic()` — which names all three resolution
-    // sources and the cwd — rather than failing as a puzzling absent file.
+    // Throws with `repoRootDiagnostic()` — which names both repo-root candidates,
+    // the cwd, and the config override it is NOT — rather than failing as a
+    // puzzling absent file.
     fs::path const root = ::dss::test::repoRoot();
 
     auto const slurp = [&root](char const* rel) -> std::string {
@@ -3475,6 +4006,64 @@ TEST(ExamplesCorpusLint, StagingPrimitiveLivesOnlyInTheSharedHeader) {
     }
 }
 
+// ── D-TEST-EXAMPLES-CORPUS-SCRATCH-IS-SHARED-BY-EVERY-BUILD-TREE ────────────
+//
+// TWO CLAUSES, because the property has a runtime half and a structural half
+// and neither one implies the other.
+//
+// CLAUSE 1 — THE LIVE HALF. This process's own cwd is not a checkout root, so
+// the scratch tree it is about to open belongs to one build tree. It is the
+// same call `Examples.RunFromManifest` makes; it is repeated here because the
+// lint entries are registered by a DIFFERENT `add_test` call than the
+// per-example ones, and a revert of either registration alone must be caught by
+// the entries it affected. ⚠ That is the whole reason this is not one test:
+// ✔MEASURED in this repository, a mutant that reds the WRONG entry reads
+// exactly like a mutant that reds nothing.
+//
+// CLAUSE 2 — THE STRUCTURAL HALF, AND IT COVERS *BOTH* CORPUS HARNESSES. The
+// corpus is registered twice — the in-process runner here, and the CLI
+// subprocess sibling in `integrated_tests/CMakeLists.txt` — and a capability
+// that lands on one is half a capability. ✔MEASURED 2026-08-27 by running both
+// harnesses on one example and sampling the filesystem while they were alive:
+// the in-process runner wrote `<cwd>/test-scratch/examples/<pid>-<n>` and the
+// CLI sibling wrote `%TEMP%/dss-integrated-tests-runs/<claimed>` — DISJOINT
+// roots, so the sibling already had the isolation this pin now requires, and
+// needed no change. Clause 2 is what keeps that true: neither registration may
+// name the checkout root as a corpus entry's working directory.
+//
+// ⚠ THE NEEDLE IS ASSEMBLED, NEVER SPELLED. If this file contained the literal
+// it searches for, the pin would find its own text and the failure arm could
+// never be reached — the same trap a mutation comment sprang on this project
+// once already (the-bar §A.5).
+TEST(ExamplesCorpusLint, CorpusScratchIsPerBuildTree) {
+    EXPECT_EQ(corpusScratchIsolationFailure(), "");
+
+    fs::path const root = ::dss::test::repoRoot();
+    std::string const needle =
+        std::string{"WORKING_DIRECTORY $"} + "{CMAKE_SOURCE_DIR}";
+    char const* const kRegistrations[] = {
+        "tests/examples/CMakeLists.txt",
+        "integrated_tests/CMakeLists.txt",
+    };
+    for (char const* rel : kRegistrations) {
+        fs::path const p = root / rel;
+        std::ifstream in(p, std::ios::binary);
+        ASSERT_TRUE(in.good())
+            << "cannot read " << p.generic_string()
+            << " — this pin must never pass because it failed to look";
+        std::string const text{std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>{}};
+        EXPECT_EQ(text.find(needle), std::string::npos)
+            << rel << " registers a corpus ctest entry with the CHECKOUT ROOT"
+                      " as its working directory. Every build tree of this"
+                      " checkout then resolves that cwd identically, so all of"
+                      " them write one shared scratch tree inside the source"
+                      " tree — 684 leaked directories were sitting there when"
+                      " this was measured. Use a per-build-tree directory"
+                      " (DSS_EXAMPLES_ENTRY_CWD) instead.";
+    }
+}
+
 // ── D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the carve-out
 //    CENSUS ───────────────────────────────────────────────────────────────────
 //
@@ -3506,7 +4095,7 @@ TEST(ExamplesCorpusLint, OnlyDeclaredExamplesMayDivergeFromTheirBaseline) {
     // The COMPLETE set of examples licensed to have an optimized arm whose exit
     // code differs from its baseline, each with the clause that licenses it.
     std::vector<std::pair<std::string, std::string>> const kExpected{
-        {"c-subset/inline_c99_inline_definition_crosscu", "C99 6.7.4p7"},
+        {"c/inline_c99_inline_definition_crosscu", "C99 6.7.4p7"},
     };
 
     std::vector<std::pair<std::string, std::string>> found;

@@ -45,11 +45,16 @@ using dss::report;
 // "'syscall' or 'by-name-import'" and the table's non-sentinel rows are exactly
 // {"syscall", "by-name-import"} — so this one had NOT yet drifted. The
 // conversion buys the future, not a repair.
-// The `2` is checked by `namesWhere` in a constant-evaluated context, so a third
-// mechanism breaks THIS initializer rather than silently shortening the message.
-constexpr auto kDeclarableExitMechanismNames =
-    namesWhere<2>(kExitMechanismTable,
-                  [](ExitMechanism m) { return m != ExitMechanism::None; });
+//
+// ★★ IT IS NO LONGER COMPUTED HERE. This file's `kDeclarableExitMechanismNames`
+// was one of FOUR copies of one projection, and a per-copy `namesWhere<M>` makes
+// the STRENGTH of the count check a per-reader decision: two of the four had
+// spelled `M` as `kExitMechanismTable.rows.size() - 1`, which cannot fail
+// (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY). The one
+// definition now lives beside the enum in `core/types/target_schema.hpp` as
+// `kSelectableExitMechanismNames`, with the literal count AND a `static_assert`
+// on the rejected-row count — the write-up and the nine-arm measurement are
+// there. "Declarable" and "selectable" were two names for the same set.
 
 // D-LK4-3 — build the collision-proof compound-key symbol index for one module.
 // Every function / data item / extern import is keyed by `(module.cuId, SymbolId)`
@@ -144,6 +149,58 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
 // schema's `allowsUndefinedImports()` (never a format name). Returns true when `m`
 // flowed through untouched (no drops), false when `filtered` holds the dropped-row
 // copy. Rejects (if any) are reported regardless of the return value.
+// ── NAMING AN UNDEFINED SYMBOL ──────────────────────────────────────────────
+// D-DIAG-K-SYMBOLUNDEFINED-NAMES-NO-SYMBOL
+//
+// ★★★ `K_SymbolUndefined` printed `symbol #2776 references undefined symbol
+// #13420` and NOTHING ELSE. A `SymbolId` is a per-CU integer with no meaning
+// outside the compiler, so the message named neither the thing that broke nor
+// the thing it wanted — the reader is told a number is missing and left to
+// guess which of 103 translation units it belonged to.
+// ✔MEASURED 2026-08-26: the pe64 sqlite CLI build emitted **1313** of these and
+// not one of them could be acted on; three separate hypotheses had to be built
+// and refuted by experiment purely because the diagnostic would not say what
+// 13420 WAS. A diagnostic that cannot be acted on has the cost of a failure and
+// the value of silence.
+//
+// ★ THE NAMES WERE ALREADY IN THE MODULE, which is what makes this a defect
+// rather than a missing feature: `ModuleSymbol` carries `name` for every DEFINED
+// function and global, and `ExternImport` carries `mangledName` for every import.
+// The undefined target is looked up in BOTH, and WHICH table answers is itself
+// the diagnosis:
+//   * found in `symbols`      — the symbol IS declared and its BODY did not
+//                               survive to the assembled module. That is a
+//                               dropped/merged-away definition, not a missing
+//                               extern, and it is the case a reader would never
+//                               have guessed from a bare number.
+//   * found in `externImports` — the import row exists but was not indexed.
+//   * found in neither         — a dangling target: minted by a producer and
+//                               never declared anywhere.
+// ⓘ Deliberately does NOT search sibling modules: this runs on ONE module, and a
+// name borrowed from another CU would be a guess wearing the same clothes as a
+// fact. Cheap by construction — only ever called on the error path.
+[[nodiscard]] std::string describeUndefinedSymbol(AssembledModule const& m, SymbolId id) {
+    for (auto const& s : m.symbols) {
+        if (s.symbol.v == id.v) {
+            return " '" + s.name + "' (declared in this module's symbol table as "
+                 + (s.binding == SymbolBinding::Local  ? "Local"
+                  : s.binding == SymbolBinding::Weak   ? "Weak" : "Global")
+                 + ", but NO assembled function or data item carries it — its"
+                   " definition did not survive to the assembled module)";
+        }
+    }
+    for (auto const& e : m.externImports) {
+        if (e.symbol.v == id.v) {
+            return " '" + e.mangledName + "' (an extern import"
+                 + (e.libraryPath.empty() ? ", no owning library declared"
+                                          : " from " + e.libraryPath)
+                 + ", but it is not in the link's symbol index)";
+        }
+    }
+    return " (no name: this id appears in no ModuleSymbol and no ExternImport of"
+           " this module, so it was minted by a producer and never declared)";
+}
+
 [[nodiscard]] bool rejectOrDropUnreferencedExterns(
     AssembledModule const& m,
     AssembledModule&       filtered,
@@ -271,15 +328,67 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
     // The key is (cuId, SymbolId, name); both leading fields are decimal digits, so
     // the two separators delimit unambiguously and an arbitrary trailing name cannot
     // forge a different triple's key.
+    //
+    // ★ AND ONE BODY VIEW PER DEFINITION —
+    //   D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED
+    // Two COMDAT selections promise that every copy of a weak
+    // definition has the same LENGTH (SAME_SIZE) or the same BYTES
+    // (EXACT_MATCH), and the kernel can only discharge a promise about bytes if
+    // it is handed the bytes. `modules` is a span the caller owns for the whole
+    // of this function, so a non-owning view into `fn.bytes` / `d.bytes` is
+    // safe and copies nothing — a link of a large archive would otherwise
+    // duplicate every COMDAT body just to compare a handful of them.
+    //
+    // ⚠ FUNCTIONS AND DATA ITEMS BOTH, because a COMDAT is a SECTION and MSVC
+    // puts `__declspec(selectany)` DATA in one just as readily as an inline
+    // function body. Indexing only `functions` would have made the data half of
+    // the promise silently unverifiable while reporting success.
+    //
+    // ⚠ THE SIZE IS `sizeInSection()`, NOT `bytes.size()`. A ZERO-FILL item
+    // (`.bss` / `.tbss`) holds its extent in `reservedSize` and stores no bytes
+    // at all, so keying the comparison on `bytes.size()` would compare 0 with 0
+    // and pronounce two `.bss` COMDATs of DIFFERENT declared sizes a match --
+    // this defect, reintroduced in the one shape nobody looks at. The producer
+    // already publishes the right answer; this reads it rather than
+    // reconstructing it.
+    struct DefBody {
+        std::size_t                   size = 0;
+        std::span<std::uint8_t const> bytes{};
+    };
+    auto bodyOfSymbol = [](AssembledModule const& m)
+        -> std::unordered_map<SymbolId, DefBody> {
+        std::unordered_map<SymbolId, DefBody> byId;
+        for (auto const& fn : m.functions) {
+            if (fn.symbol == SymbolId{}) continue;
+            byId.emplace(fn.symbol,
+                         DefBody{fn.bytes.size(),
+                                 std::span<std::uint8_t const>{fn.bytes}});
+        }
+        for (auto const& d : m.dataItems) {
+            // An anonymous item carries no ModuleSymbol row, so it can never be
+            // one of the definitions being folded.
+            if (d.symbol == SymbolId{}) continue;
+            byId.emplace(d.symbol,
+                         DefBody{static_cast<std::size_t>(d.sizeInSection()),
+                                 std::span<std::uint8_t const>{d.bytes}});
+        }
+        return byId;
+    };
+
     std::vector<CrossCuDef>         defs;
     std::unordered_set<std::string> seenDefs;
     for (auto const& m : modules) {
+        auto const bodies = bodyOfSymbol(m);
         for (auto const& s : m.symbols) {
             if (!seenDefs.insert(std::format("{}:{}:{}", m.cuId.v, s.symbol.v, s.name))
                      .second) {
                 continue;   // the same definition, described twice
             }
-            defs.push_back(CrossCuDef{s.name, s.binding, LinkedSymbolKey{m.cuId, s.symbol}});
+            auto const    bit  = bodies.find(s.symbol);
+            DefBody const body = bit == bodies.end() ? DefBody{} : bit->second;
+            defs.push_back(CrossCuDef{
+                s.name, s.binding, LinkedSymbolKey{m.cuId, s.symbol},
+                s.duplicateMatch, body.size, body.bytes});
         }
     }
     CrossCuResolution const resolution = resolveCrossCuDefs(defs);
@@ -291,6 +400,34 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
                std::to_string(c.existing.cuId.v) + " and CU #" +
                std::to_string(c.incoming.cuId.v) + ") — a strong symbol may be "
                "defined only once across the linked image.");
+    }
+    // ── A BROKEN DUPLICATE-MATCH PROMISE IS A MULTIPLY-DEFINED SYMBOL ──────
+    //    D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED
+    //
+    // ★ THE CODE IS `K_SymbolRedefinedAcrossUnits` DELIBERATELY, not a new one.
+    // The PE/COFF specification's own words for a SAME_SIZE / EXACT_MATCH
+    // violation are "a multiply defined symbol error is issued" — this IS that
+    // error, reached by a different route, and giving it a private code would
+    // split one diagnosable condition across two vocabularies for no gain to
+    // the reader. The MESSAGE is what distinguishes them, and it names the
+    // selection that was promised so the reader knows which rule was broken.
+    for (auto const& m : resolution.duplicateMismatches) {
+        report(reporter, DiagnosticCode::K_SymbolRedefinedAcrossUnits,
+               DiagnosticSeverity::Error,
+               std::format(
+                   "symbol \"{}\" is defined in CU #{} and CU #{} as duplicates "
+                   "whose duplicate-resolution policy '{}' PROMISES they match, "
+                   "and they do not: {} bytes versus {} bytes{}. That policy is "
+                   "a promise the linker is required to VERIFY — keeping one "
+                   "copy anyway would silently pick a body the program was "
+                   "never told it might get.",
+                   m.name, m.existing.cuId.v, m.incoming.cuId.v,
+                   duplicateMatchName(m.required), m.existingSize,
+                   m.incomingSize,
+                   (m.required == DuplicateMatch::ExactContent
+                    && m.existingSize == m.incomingSize)
+                       ? " (same length, differing content)"
+                       : ""));
     }
     // (2) Reference resolution — an extern import whose name is DEFINED in a sibling CU
     // binds to that definition (the definition shadows the extern declaration). Record
@@ -441,8 +578,8 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     //
     // ★ ONE id LEGITIMATELY CARRIES SEVERAL ROWS — the subject of
     // D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW. Equal-offset defined symbols collapse
-    // to ONE atom under several names (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-
-    // TWIN-ATOMS): `strong_fn` GLOBAL + `weak_alias` WEAK at one address is what gcc
+    // to ONE atom under several names (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS):
+    // `strong_fn` GLOBAL + `weak_alias` WEAK at one address is what gcc
     // emits for `__attribute__((weak, alias("strong_fn")))`, it is the representation
     // `object_symbol_names.hpp`'s `definedAliases` reads, and every relocatable-object
     // reader produces it. This map used to keep only the FIRST row per id, so every
@@ -895,6 +1032,28 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             if (isShadowedAtom(i, fn.symbol)) continue;  // shadowed weak body — drop
             AssembledFunction out = fn;  // bytes + relocations + sourceMap copied
             out.symbol = SymbolId{mergedIdFor(i, fn.symbol)};
+            // ★★★ THE BLOCK SYMBOLS ARE REMAPPED TOO, AND OMITTING THEM WAS A
+            // WHOLE-PROGRAM LINK FAILURE. D-LINK-MERGE-DOES-NOT-REMAP-BLOCK-SYMBOLS
+            // `AssembledFunction out = fn` copies `blockSymbols` VERBATIM, so before
+            // this line a synthetic per-block symbol kept its ORIGINAL per-CU id while
+            // every relocation naming it was retargeted through `retargetRelocs` to a
+            // freshly minted merged id. `buildCompoundIndex` then declared the OLD id
+            // and the reference asked for the NEW one, so the target resolved against
+            // nothing.
+            // ⚠ It is invisible in a single-CU build: with one module the mint is the
+            // identity, so the two ids coincide and the bug cannot fire. It needs a
+            // MERGE, which is why a 103-TU program found it and no test did.
+            // ✔MEASURED 2026-08-26 on the sqlite CLI for pe64: **1313**
+            // `K_SymbolUndefined`, every one of them a data-item relocation (a switch
+            // jump table is a data item whose relocations name block symbols) into an
+            // id that no ModuleSymbol and no ExternImport could name -- because a block
+            // symbol has neither, which is exactly what a dangling mint looks like.
+            // ★ `mergedIdFor` MEMOIZES into `remap`, so this call and the one inside
+            // `retargetRelocs` return the SAME id regardless of which runs first --
+            // the declaration and the reference cannot disagree by construction, which
+            // is the property that was missing rather than any particular ordering.
+            for (auto& bs : out.blockSymbols)
+                bs.symbol = SymbolId{mergedIdFor(i, bs.symbol)};
             retargetRelocs(i, out.relocations);
             combined.functions.push_back(std::move(out));
         }
@@ -1305,7 +1464,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
                      "rather than jumped to). REMEDY: add a "
                      "'processExit' block (mechanism "
                    + dss::detail::renderAllowedList(
-                         kDeclarableExitMechanismNames, " or ")
+                         kSelectableExitMechanismNames, " or ")
                    + ") plus the paired "
                      "'entryCallingConvention' to this format's schema, or "
                      "build for a format that declares them. The refusal is "
@@ -1412,8 +1571,8 @@ LinkedImage link(std::span<AssembledModule const> modules,
             //       string literal global, etc. (D-LK4-RODATA-PRODUCER
             //       2026-06-02 — the per-format walker merges these
             //       into its symbolVa map at section-relative offsets), OR
-            //   (d) it is a WRITER-RESERVED singleton id (D-CSUBSET-THREAD-
-            //       LOCAL TLS C3 — the PE `_tls_index` slot the format writer
+            //   (d) it is a WRITER-RESERVED singleton id (D-CSUBSET-THREAD-LOCAL
+            //       TLS C3 — the PE `_tls_index` slot the format writer
             //       mints + binds; the writer defines it into symbolVa or
             //       fails loud, exactly like an extern import in (b)).
             // Anything else is a hard undefined.
@@ -1421,8 +1580,10 @@ LinkedImage link(std::span<AssembledModule const> modules,
                 && !isWriterReservedSymbolIdValue(reloc.target.v)) {
                 std::string msg = "relocation in symbol #";
                 msg += std::to_string(fn.symbol.v);
+                msg += describeUndefinedSymbol(module, fn.symbol);
                 msg += " references undefined symbol #";
                 msg += std::to_string(reloc.target.v);
+                msg += describeUndefinedSymbol(module, reloc.target);
                 msg += " (not declared by any AssembledFunction, "
                        "ExternImport, nor AssembledData item)";
                 report(reporter,
@@ -1453,8 +1614,10 @@ LinkedImage link(std::span<AssembledModule const> modules,
                 && !isWriterReservedSymbolIdValue(reloc.target.v)) {
                 std::string msg = "data-item relocation in symbol #";
                 msg += std::to_string(di.symbol.v);
+                msg += describeUndefinedSymbol(module, di.symbol);
                 msg += " references undefined symbol #";
                 msg += std::to_string(reloc.target.v);
+                msg += describeUndefinedSymbol(module, reloc.target);
                 msg += " (not declared by any AssembledFunction, "
                        "ExternImport, nor AssembledData item)";
                 report(reporter,
@@ -1489,8 +1652,8 @@ LinkedImage link(std::span<AssembledModule const> modules,
     }
 
     // D-LK4-RODATA-SUBSTRATE precondition guard: until the per-
-    // format walker arms (D-LK2-RODATA / D-LK1-RODATA / D-LK3-
-    // RODATA) close, no walker consumes `module.dataItems`. A
+    // format walker arms (D-LK2-RODATA / D-LK1-RODATA /
+    // D-LK3-RODATA) close, no walker consumes `module.dataItems`. A
     // future producer (HIR string-literal promotion → MIR global →
     // assembler) that lands `dataItems` BEFORE the matching walker
     // arm would silently emit a binary with NO `.rdata`/`.rodata`/
@@ -1527,8 +1690,8 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // `supportedDataSections: ["rodata", ...]` array advertising
     // which `DataSectionKind` values its walker accepts. The gate
     // below consults that set per-item — formats whose walker arm
-    // has not landed (ELF + Mach-O until D-LK1-RODATA / D-LK3-
-    // RODATA close), AND format flavors that cannot carry rodata
+    // has not landed (ELF + Mach-O until D-LK1-RODATA / D-LK3-RODATA
+    // close), AND format flavors that cannot carry rodata
     // (PE Obj — relocatable .obj emits rodata via the symbol
     // table, not via the dataItems pipeline), reject loudly.
     //

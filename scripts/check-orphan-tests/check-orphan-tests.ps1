@@ -521,8 +521,9 @@ if ($collapsed)     { $finalRc = 2 }
 # TWIN of the block of the same name in `check-orphan-tests.sh`; same 12 arms,
 # same order, same verdict lines.
 #
-# ★★ EXERCISE THE FAILURE ARM, DO NOT READ IT. `D-TEST-NONFATAL-GUARD-DEGRADES-
-# TO-A-VACUOUS-PASS` and `D-CENSUS-INSTRUMENT-UNGUARDED-BY-CTEST` are both in this
+# ★★ EXERCISE THE FAILURE ARM, DO NOT READ IT.
+# `D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS`
+# and `D-CENSUS-INSTRUMENT-UNGUARDED-BY-CTEST` are both in this
 # repository's registry because an instrument nobody executed was believed. The
 # self-test therefore lives INSIDE the guard: it is impossible to run this check
 # without also proving it reds, and there is exactly ONE thing to wire into ctest.
@@ -574,8 +575,8 @@ $baseReg = $nReg
 # anchor in both editions (it holds `pwsh.exe` for 7.x and `powershell.exe` for
 # 5.1); PATH lookup is only the fallback.
 # ★★ AND IF NO HOST CAN BE FOUND, THIS IS A FAILURE, NEVER A SKIP. A self-test
-# that quietly does not run is precisely `D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-
-# VACUOUS-PASS`: the guard would print its census and look fine while having
+# that quietly does not run is precisely `D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS`:
+# the guard would print its census and look fine while having
 # proven nothing at all.
 $hostExe = ''
 foreach ($cand in @((Join-Path $PSHOME 'pwsh.exe'), (Join-Path $PSHOME 'powershell.exe'))) {

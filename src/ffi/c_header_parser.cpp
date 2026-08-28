@@ -3,6 +3,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/types/config_path_walk.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -88,7 +89,8 @@ firstConfigCauseInline(std::span<ConfigDiagnostic const> diags) {
 // reporter access). D-FF2-2 fold: the struct-side mirror closes the
 // gap where LSP / test pins had to re-parse reporter prose to locate
 // the offending decl. `HirSourceLoc{}` is the documented absent
-// value (source_span.hpp:31-39) — no optional wrapper.
+// value (`HirSourceLoc` in `hir/attributes/source_span.hpp`) — no optional
+// wrapper.
 [[nodiscard]] HeaderReadError
 emitAndReturn(HeaderReadErrorKind kind, std::string detail,
               DiagnosticReporter& reporter,
@@ -107,7 +109,7 @@ emitAndReturn(HeaderReadErrorKind kind, std::string detail,
     return err;
 }
 
-// Post-fold #7 silent-failure F2: when the c-subset frontend (parse /
+// Post-fold #7 silent-failure F2: when the c frontend (parse /
 // semantic / lowering) rejects, the underlying diagnostic carries a
 // (buffer, span) pointing at the offending construct — but the FF2
 // wrap kind (HeaderParseFailed) is the same across "no span possible"
@@ -207,31 +209,30 @@ emitWithFirstReportedCause(HeaderReadErrorKind              kind,
 
 [[nodiscard]] std::expected<std::string, HeaderReadError>
 slurpFile(std::filesystem::path const& path, DiagnosticReporter& reporter) {
-    std::ifstream in{path, std::ios::binary};
-    if (!in.is_open()) {
+    // Silent-failure C2 (mid-read I/O truncation) + C3 (output-side OOM): a
+    // successful open followed by a drain that hits either leaves a PARTIAL
+    // PREFIX, and the parser then either accepts truncated input or emits a
+    // misleading parse error. (post-FF2-#2 silent-failure CRITICAL fold.)
+    //
+    // ★★ THE CHECK THIS SITE CARRIED WAS THE FIRST IN THE TREE AND IT WAS STILL
+    // NOT ENOUGH — which is exactly why the drain now lives in ONE place
+    // (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    // ✔MEASURED: `in.bad()` after `ss << in.rdbuf()` is unreachable (the
+    // insertion goes through the STREAMBUF and never touches the istream
+    // object), `ss.bad()` does not fire when the streambuf THROWS (that is
+    // failbit), and a short read reporting EOF — what a real OS read error
+    // produces — sets no bit at all. The shared helper compares BYTES.
+    auto text = core::readFileChecked(path);
+    if (!text) {
+        auto const err = std::move(text).error();
         return std::unexpected(emitAndReturn(
             HeaderReadErrorKind::FileOpenFailed,
-            "FFI header file could not be opened: " + path.generic_string(),
+            (err.kind == core::FileReadFailure::OpenFailed
+                 ? "FFI header file could not be opened: " + path.generic_string()
+                 : "FFI header file: " + err.message),
             reporter));
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    // Silent-failure C2 (mid-read I/O truncation) + C3 (output-side
-    // OOM): a successful `is_open()` followed by `rdbuf` drain that
-    // hits either an input badbit (disk/network I/O error) OR an
-    // output badbit (allocation failure mid-stream) leaves a partial
-    // prefix in `ss`. Without checking BOTH, the parser would either
-    // silently accept truncated input or emit a misleading parse
-    // error. (post-FF2-#2 silent-failure CRITICAL fold.)
-    if (in.bad() || ss.bad()) {
-        return std::unexpected(emitAndReturn(
-            HeaderReadErrorKind::FileOpenFailed,
-            std::string{"FFI header file I/O error after open: "}
-                + path.generic_string()
-                + (ss.bad() ? " (output buffer allocation failure)" : ""),
-            reporter));
-    }
-    return ss.str();
+    return *std::move(text);
 }
 
 } // namespace
@@ -262,7 +263,7 @@ readCHeaderFromText(std::string_view    text,
             reporter));
     }
 
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     if (!loaded) {
         // Forward C_* diagnostics so they reach the reporter (subject
         // to user `--suppress` policy). Inline the first cause into
@@ -272,7 +273,7 @@ readCHeaderFromText(std::string_view    text,
         forwardConfigDiagnostics(loaded.error(), reporter);
         return std::unexpected(emitAndReturn(
             HeaderReadErrorKind::GrammarLoadFailed,
-            std::string{"FFI header reader could not load shipped c-subset "
+            std::string{"FFI header reader could not load shipped c "
                         "grammar"} + (cause.empty() ? "" : ": " + cause)
                 + ".",
             reporter));
@@ -326,13 +327,24 @@ readCHeaderFromText(std::string_view    text,
     for (auto const& tree : cu->trees()) {
         if (auto s = tree.sourceShared()) reporter.sourceBuffers().add(std::move(s));
     }
+    // ★ AND THE PREPROCESSOR'S ORIGIN BUFFERS TOO, FOR THE SAME REASON THE
+    // DRIVER REGISTERS THEM ([[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]]).
+    // A tree's own `source()` is the SYNTHESIZED buffer; every diagnostic whose
+    // position has been converted onto the file it really came from names one of
+    // THESE instead. Registering only the tree sources was sufficient while the
+    // semantic tier still reported synthesized coordinates — i.e. it was
+    // sufficient only because of the defect. `add` keys on the buffer's own id,
+    // so this is idempotent with the loop above.
+    for (auto const& b : cu->auxiliaryBuffers()) {
+        if (b) reporter.sourceBuffers().add(b);
+    }
     for (auto const& d : model.diagnostics().all()) {
         reporter.report(d);
     }
     if (model.hasErrors()) {
         return std::unexpected(emitWithFirstReportedCause(
             HeaderReadErrorKind::HeaderParseFailed,
-            std::string{"c-subset frontend rejected header '"}
+            std::string{"c frontend rejected header '"}
                 + std::string{headerPathLabel} + "' — see preceding diagnostics.",
             diagsSince(reporter, errStart),
             reporter));
@@ -427,7 +439,7 @@ readCHeaderFromText(std::string_view    text,
                         + "' contains an #include / import group — FF2 v1 "
                           "does not yet follow includes. Copy declarations "
                           "directly into the curated header, or anchor a "
-                          "follow-up to extend the c-subset import resolver.",
+                          "follow-up to extend the c import resolver.",
                     reporter, &loc));
             case HirKind::Error:
                 return std::unexpected(emitAndReturn(

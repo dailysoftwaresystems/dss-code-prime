@@ -1,5 +1,6 @@
 #include "opt/optimizer.hpp"
 
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/types/config_key_vocabulary.hpp"  // the ONE closed-key check + the `$` carve-out
 #include "core/types/config_path_walk.hpp"
@@ -35,7 +36,9 @@
 //         | {"fixpoint": {"max":  N, "passes": [element,...]}}
 //       "maxIterations": <1..32>,           — FLAT spelling only; refused
 //                                              beside structural nodes
-//       "inlineThreshold": <1..100000>, "verifyEveryPass": <bool> } }
+//       "inlineThreshold": <1..100000>,
+//       "inlineCallerGrowthPercent": <0..100000>,
+//       "verifyEveryPass": <bool> } }
 //
 // FLAT documents stay valid (all-string `passes` + optional top-level
 // `maxIterations` desugar to one top-level fixpoint). Every document
@@ -364,6 +367,38 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
         }
     }
 
+    // PER-CALLER CUMULATIVE GROWTH BUDGET (P36 Lane R). Optional. Default =
+    // `kDefaultInlineCallerGrowthPercent`. Same parse shape as
+    // `inlineThreshold` with ONE deliberate difference: the lower bound is
+    // 0, NOT 1. `inlineThreshold: 0` is rejected because it silently refuses
+    // every inline; `inlineCallerGrowthPercent: 0` refuses nothing on its
+    // own — the allowance floors at `inlineThreshold` instructions — so 0 is
+    // a real posture ("grow each caller by at most one maximal callee"), not
+    // a trap. Out of [0, kMaxInlineCallerGrowthPercent], or a non-integer →
+    // X_PipelineMalformed via `emitMalformed`.
+    std::uint32_t inlineCallerGrowthPercent = kDefaultInlineCallerGrowthPercent;
+    if (pipe.contains("inlineCallerGrowthPercent")) {
+        if (!pipe.at("inlineCallerGrowthPercent").is_number_integer()) {
+            emitMalformed(coll,
+                          std::string{sourceLabel}
+                              + "/pipeline/inlineCallerGrowthPercent",
+                          "must be an integer");
+        } else {
+            auto const v =
+                pipe.at("inlineCallerGrowthPercent").get<std::int64_t>();
+            if (v < 0
+                || v > static_cast<std::int64_t>(kMaxInlineCallerGrowthPercent)) {
+                emitMalformed(coll,
+                    std::string{sourceLabel}
+                        + "/pipeline/inlineCallerGrowthPercent",
+                    std::format("must be in [0, {}] (got {})",
+                                kMaxInlineCallerGrowthPercent, v));
+            } else {
+                inlineCallerGrowthPercent = static_cast<std::uint32_t>(v);
+            }
+        }
+    }
+
     // Verify frequency (D-OPT1-VERIFY-FREQUENCY-CONFIG). Optional bool; default
     // true = verify after EVERY pass (the developer posture: LLVM `-verify-each`
     // / GCC `--enable-checking=yes` — pinpoints the offending pass). false =
@@ -383,7 +418,7 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
     rejectUnknownKeys(coll, pipe, std::string{sourceLabel} + "/pipeline",
                       "the 'pipeline' block",
                       {"name", "passes", "maxIterations", "inlineThreshold",
-                       "verifyEveryPass"});
+                       "inlineCallerGrowthPercent", "verifyEveryPass"});
 
     // ★ ONE SPELLING PER DOCUMENT (P10 ruling): a document using ANY
     // structural node (repeat/fixpoint) REFUSES top-level
@@ -451,6 +486,7 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
     out.name             = std::move(name);
     out.schedule         = std::move(root);
     out.inlineThreshold  = inlineThreshold;
+    out.inlineCallerGrowthPercent = inlineCallerGrowthPercent;
     out.verifyEveryPass  = verifyEveryPass;
     if (doc.contains("unitPipeline")) {
         out.unitPipelineName = doc.at("unitPipeline").get<std::string>();
@@ -483,17 +519,21 @@ loadShippedPipeline(std::string_view name) {
         return std::unexpected(std::move(pathR).error());
     }
     auto const path = pathR.value();
-    std::ifstream in{path};
-    if (!in) {
+    // THE ONE CHECKED READ (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    // ★ This site also opened in TEXT mode, alone among the shipped-config
+    // loaders. On Windows that silently translated CRLF, so the bytes the parser
+    // saw were not the bytes on disk — harmless for JSON, but it made this the
+    // one loader whose read could not be size-checked at all. The shared helper
+    // is unconditionally binary.
+    auto text = core::readFileChecked(path);
+    if (!text) {
         substrate::DiagnosticCollector coll;
         coll.emit(DiagnosticCode::X_PipelineNameResolutionFailed,
                   path.string(),
-                  "failed to open pipeline file for reading");
+                  "pipeline file: " + std::move(text).error().message);
         return std::unexpected(std::move(coll).release());
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return loadPipelineFromText(ss.str(), path.string());
+    return loadPipelineFromText(*std::move(text), path.string());
 }
 
 } // namespace dss::opt

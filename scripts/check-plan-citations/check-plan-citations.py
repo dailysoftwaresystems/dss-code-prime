@@ -46,13 +46,68 @@ hides -- the same reasoning `check-no-abort-in-tests` states for `abort()`.
 ⚠ THE INVENTORY IS DEBT, NOT A PASS. A green run here means *no NEW positional
 citation landed*, never *the plans cite stably*.
 
-Exit codes: 0 OK · 1 a ceiling was exceeded or is stale · 2 the scan collapsed
-· 3 usage error.
+★★ TWO WRITE VERBS, AND THE SPLIT IS THE WHOLE SAFETY PROPERTY.
+Until 2026-08-23 there was one verb, `--write`, and it rewrote the inventory
+UNCONDITIONALLY. That made the command this guard's own failure message tells you
+to run — *"If you converted a citation, lower the ceiling in the same commit:
+… --write"* — just as willing to RAISE a ceiling or to add a document. ⇒ **the
+tool a lane reaches for after a red could launder the regression that caused the
+red**, which is the one thing a ratchet exists to prevent. A ratchet whose repair
+verb moves in both directions is not a ratchet
+(D-GATE-PLAN-CITATIONS-WRITE-CAN-RAISE-A-RATCHET-CEILING). So:
+  * `--write` is the BURN-DOWN verb and it CAN ONLY LOWER. It refuses, naming
+    every document that sits above its ceiling, and writes NOTHING at all in that
+    case — a partial write would be the same laundering in slow motion.
+  * `--baseline` establishes NEW ground unconditionally, prints a loud warning,
+    and is meant to be reviewed AS A DIFF, where every raised number is visible.
+    It exists because a strictly-lowering tool cannot write the first inventory,
+    and a ratchet whose baseline no in-repo tool can regenerate is one lost file
+    away from being un-rebuildable.
+⚠ Do NOT reach for `--baseline` to make a red go away. It is the bootstrap and
+deliberate-widening verb, not the burn-down verb.
+ⓘ The shape is ported verbatim from `check-wrapped-anchor-ids`, which shipped it
+first; a second, differently-behaved ratchet in the same battery is how two
+instruments start disagreeing about what a ratchet promises.
+
+★ WIDENING THIS GUARD'S SCOPE IS A `--baseline` EVENT, AND THE RECORD SHOWS BOTH
+OF THEM. ✔MEASURED 2026-08-23 by replaying every revision of `inventory.json`:
+the file has been raised in exactly two commits, and each of those commits also
+widened the guard in the same change — the `CODE_ROOTS` family being created
+(258 documents entered at their live counts), and the `CONTINUATION` matcher plus
+the later roots (17 ceilings raised, 10 documents added). Driving the widened
+matcher over the *older* tree reproduces all 17 raised ceilings exactly, so ZERO
+of that movement was an un-widened regression. Nothing was ever laundered — but
+nothing in the tool could have told the difference, and that was the defect.
+
+★★★ AND THE READ-ONLY VERB CHECKS THE INVENTORY'S `_comment` AGAINST
+`_INVENTORY_COMMENT`, BECAUSE IT IS THE ONLY VERB THAT **CAN**. `--write` and
+`--baseline` both STAMP the literal onto the JSON, so each resolves a
+disagreement — always in the CODE's favour — before anyone could observe that
+there was one. Until 2026-08-24 the literal had no NAME: it was an anonymous list
+inside `write_inventory`, so there was nothing to compare the file against and the
+read-only path asserted NOTHING about the one file this guard owns outright.
+⇒ a mismatch, or a `_comment` key deleted outright, is now a REFUSAL that quotes
+BOTH sides whole and names which side `--write` stamps. Graded with the ratchet
+failures rather than the collapses: the census ran and every ceiling still binds,
+so the COUNT is trustworthy — it is the inventory's PROSE that is not, and prose
+is what exit 1 governs here. Species record:
+D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED.
+ⓘ `--write` additionally ANNOUNCES an overwrite when the text it replaced
+disagreed, because the read-only arm structurally cannot see that direction:
+after the stamp the two AGREE again, so a correction made only in the JSON would
+be gone with rc=0 and nothing left to read. `--baseline` deliberately does NOT
+announce — it never reads the old inventory at all, being the bootstrap verb that
+must work when there IS no inventory, and its own ⚠ already sends the reader to
+review the written file as a diff, where a changed `_comment` is plainly visible.
+
+Exit codes: 0 OK · 1 a ceiling was exceeded or is stale, or the inventory's
+`_comment` diverged from the literal · 2 the scan collapsed · 3 usage error.
 
 Usage:
-    python scripts/check-plan-citations/check-plan-citations.py            # verify
-    python scripts/check-plan-citations/check-plan-citations.py --write    # re-baseline
-    python scripts/check-plan-citations/check-plan-citations.py --selftest # prove it fails
+    python scripts/check-plan-citations/check-plan-citations.py             # verify
+    python scripts/check-plan-citations/check-plan-citations.py --write     # burn down
+    python scripts/check-plan-citations/check-plan-citations.py --baseline  # new ground
+    python scripts/check-plan-citations/check-plan-citations.py --selftest  # prove it fails
 """
 from __future__ import annotations
 
@@ -65,6 +120,29 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+# ── OUTPUT ENCODING — NOT COSMETIC, AND THE STREAM IS HALF THE FACT ─────────────
+# ✔MEASURED 2026-08-23 (CPython 3.14.3, Windows, BOTH streams PIPES, which is
+# exactly how ctest runs every guard): `sys.stdout` comes up
+# `encoding='cp1252' errors='surrogateescape'` and `sys.stderr` comes up
+# `errors='backslashreplace'`. `surrogateescape` rescues only lone surrogates left
+# by an earlier decode; it does NOTHING for an ordinary unencodable character. So
+#   * a report printed to STDOUT raises `UnicodeEncodeError` and kills the guard
+#     INSIDE ITS OWN REPORT — the run still reds, but the finding is lost and the
+#     traceback names a `print`, not a citation;
+#   * a report printed to STDERR survives, with the glyph mangled into its
+#     backslash-u escape.
+# ⇒ This guard prints its ratchet findings — repository-relative DOCUMENT PATHS —
+# on STDOUT, so it is on the dying side, and `errors="replace"` alone would only
+# downgrade the death to a `?`. Reconfiguring to UTF-8 keeps the evidence intact.
+# Applied at IMPORT rather than inside `main()`, so every path this module can
+# print on is covered, including the ones a caller reaches by importing it.
+# D-GATE-PYTHON-GUARD-DIES-PRINTING-TREE-TEXT-ON-A-WINDOWS-PIPE
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):   # pragma: no cover - odd stream
+        pass
 
 INVENTORY_REL = os.path.join("scripts", "check-plan-citations", "inventory.json")
 
@@ -339,26 +417,57 @@ def census(root):
     return out
 
 
+# ★★★ THIS LITERAL IS THE INVENTORY'S SOURCE OF TRUTH, AND THAT IS WHY IT IS NOW
+# A NAMED CONSTANT RATHER THAN AN ANONYMOUS LIST INSIDE `write_inventory`.
+# Whatever these strings say, `--write` STAMPS ONTO `inventory.json`; a correction
+# made in the JSON alone is undone by the next burn-down, silently, with rc=0. A
+# literal with no name cannot be compared against the file it governs, so the
+# read-only path had nothing to compare and asserted nothing about it -- and the
+# species is one this battery has already suffered once, in a sibling guard whose
+# on-disk text was corrected while its literal was not
+# (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+# ★ THE TEXT IS UNCHANGED BY THE EXTRACTION, deliberately: ✔MEASURED 2026-08-24,
+# the on-disk `_comment` and this literal were byte-identical in UTF-8 before the
+# refusal was wired in, and rewording either one in the same edit that adds the
+# comparison would have made the first green run prove nothing.
+_INVENTORY_COMMENT = [
+    "Per-document ceilings for POSITIONAL citations (`path:line`).",
+    "A ceiling may only come DOWN. Convert citations to a stable reference -- a",
+    "symbol name, a comment id, or a [[D-ANCHOR]] -- and lower the ceiling in the",
+    "same commit. A raised ceiling is a new unreliable citation and reds the gate.",
+    "This file is DEBT, not a pass: green means no NEW positional citation landed.",
+]
+
+# ★ A DISTINCT VALUE FOR "THE KEY IS NOT THERE", and it is not defensive padding:
+# a `_comment` key that has been DELETED is a real divergence, and
+# `doc.get("_comment", _INVENTORY_COMMENT)` -- the obvious spelling -- would have
+# answered "they match" for the one input most likely to be wrong.
+_MISSING = object()
+
+
 def load_inventory(root):
+    """-> `(ceilings, comment)`; `comment` is `_MISSING` when the key is absent.
+
+    ★★ THE COMMENT COMES BACK RAW AND THE **CALLER** DECIDES WHAT A DIVERGENCE
+    MEANS FOR ITS VERB, rather than this function refusing on the spot. `--write`
+    calls it too, and `--write` is the verb that REPAIRS a divergence by
+    re-stamping the literal; a check buried here would make the divergence
+    unfixable by the only tool able to fix it.
+    """
     path = os.path.join(root, INVENTORY_REL)
     if not os.path.isfile(path):
         raise Collapse(
             "the inventory %s does not exist. Without it every count is "
             "unconstrained and this guard asserts nothing." % INVENTORY_REL)
     with io.open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)["ceilings"]
+        doc = json.load(fh)
+    return doc["ceilings"], doc.get("_comment", _MISSING)
 
 
 def write_inventory(root, ceilings):
     path = os.path.join(root, INVENTORY_REL)
     body = {
-        "_comment": [
-            "Per-document ceilings for POSITIONAL citations (`path:line`).",
-            "A ceiling may only come DOWN. Convert citations to a stable reference -- a",
-            "symbol name, a comment id, or a [[D-ANCHOR]] -- and lower the ceiling in the",
-            "same commit. A raised ceiling is a new unreliable citation and reds the gate.",
-            "This file is DEBT, not a pass: green means no NEW positional citation landed.",
-        ],
+        "_comment": _INVENTORY_COMMENT,
         "ceilings": dict(sorted(ceilings.items())),
     }
     tmp = path + ".tmp"
@@ -368,15 +477,121 @@ def write_inventory(root, ceilings):
     os.replace(tmp, path)
 
 
-def run(root, write):
+def _comment_text(label, value):
+    """One side of a `_comment` disagreement, quoted WHOLE and never trimmed.
+
+    ★ Untrimmed on purpose: the reader has to decide WHICH SIDE IS TRUE, and a
+    truncated quotation of the text under judgement is exactly the evidence that
+    decision needs.
+    """
+    if value is _MISSING:
+        return "    %s: there is no `_comment` key at all." % label
+    if not isinstance(value, list):
+        return "    %s: not a list of strings -- %r" % (label, value)
+    out = ["    %s -- %d line(s):" % (label, len(value))]
+    out.extend("      | %s" % line for line in value)
+    return "\n".join(out)
+
+
+def report_comment_divergence(comment):
+    """Print the refusal for a diverged inventory `_comment`. -> EXIT_RATCHET.
+
+    ★ GRADED WITH THE RATCHET FAILURES RATHER THAN THE COLLAPSES, following THIS
+    guard's exit vocabulary and not a sibling's: the census ran, the floors held,
+    and every ceiling still binds, so the COUNT is trustworthy. It is the
+    inventory's PROSE that is not -- and unreliable prose is what exit 1 already
+    governs here.
+    ⚠ PRINTED ON STDOUT, like every other finding this guard emits. `_arm`
+    redirects stdout alone, so a refusal written to stderr would be invisible to
+    its own self-test: the arm would see the exit code and none of the message,
+    which is the exact vacuity every red arm here exists to refuse.
+    """
+    print("check-plan-citations: FAIL -- the inventory's `_comment` has DIVERGED "
+          "from `_INVENTORY_COMMENT`, the in-code literal that is its source of "
+          "truth:")
+    print(_comment_text("in code, `_INVENTORY_COMMENT`", _INVENTORY_COMMENT))
+    print(_comment_text("on disk, %s" % INVENTORY_REL.replace("\\", "/"), comment))
+    print("")
+    print("  WHY THIS IS A REFUSAL AND NOT A COSMETIC DIFF: `--write` STAMPS the")
+    print("  in-code literal onto the JSON. For as long as the two disagree, the")
+    print("  on-disk text is one burn-down away from being replaced by whatever the")
+    print("  literal says -- silently, with rc=0 -- INCLUDING by text that has since")
+    print("  become false.")
+    print("  FIX: DECIDE WHICH SIDE IS TRUE FIRST; the repair is not symmetric. If")
+    print("  the CODE is right, re-stamp the JSON:")
+    print("      python scripts/check-plan-citations/check-plan-citations.py --write")
+    print("  If the JSON is right, edit `_INVENTORY_COMMENT` to match it -- running")
+    print("  `--write` would DESTROY the corrected text. Species record:")
+    print("      D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED")
+    return EXIT_RATCHET
+
+
+def run(root, write, baseline=False):
     now = census(root)
+
+    # ★ `--baseline` FIRST, AND IT DELIBERATELY DOES NOT READ THE INVENTORY.
+    # It is the bootstrap verb: requiring the file it exists to create would make
+    # a lost inventory unrecoverable by any in-repo tool.
+    if baseline:
+        write_inventory(root, now)
+        print("check-plan-citations: BASELINED %d document(s), %d citation(s)"
+              % (len(now), sum(now.values())))
+        print("  ⚠ This establishes NEW ground and CAN RAISE ceilings. Review the diff:")
+        print("    every raised number is a positional citation that is now permitted.")
+        print("    Use `--write` for burn-down; it can only lower.")
+        return EXIT_OK
+
+    ceilings, comment = load_inventory(root)
+
+    # ★★ `--write` MAY ONLY LOWER, AND IT WRITES NOTHING WHEN IT REFUSES.
+    # An absent entry is a ceiling of ZERO, so a NEW document carrying citations
+    # is a raise like any other — otherwise "add the file" would be the laundering
+    # path that "raise the number" no longer is.
     if write:
+        above = sorted((doc, ceilings.get(doc, 0), n)
+                       for doc, n in now.items() if n > ceilings.get(doc, 0))
+        if above:
+            print("check-plan-citations: REFUSING to re-baseline -- %d document(s) sit "
+                  "ABOVE their ceiling:" % len(above))
+            for doc, c, n in above:
+                print("    %s: ceiling %d, actual %d" % (doc, c, n))
+            print("")
+            print("  `--write` is the BURN-DOWN verb: it may only LOWER, and it has")
+            print("  written nothing. Convert the new citation to a stable reference")
+            print("  instead -- a symbol, a comment id, or a [[D-ANCHOR]]. A rename that")
+            print("  carries citations needs a hand edit of the JSON, which is visible")
+            print("  in review.")
+            print("  `--baseline` is the only verb that establishes new ground, and it")
+            print("  announces every raise it makes.")
+            return EXIT_RATCHET
         write_inventory(root, now)
         print("check-plan-citations: re-baselined %d document(s), %d citation(s)"
               % (len(now), sum(now.values())))
+        # ★★★ ANNOUNCE A COMMENT OVERWRITE. THE READ-ONLY REFUSAL STRUCTURALLY
+        # CANNOT CATCH THIS DIRECTION, which is exactly why the print belongs
+        # here and not to the other verb: once `--write` has stamped the literal
+        # the two AGREE again, so the next read-only run is GREEN and a
+        # correction that existed only in the JSON is gone with rc=0 and nothing
+        # left to read. Loud here, or lost forever.
+        if comment != _INVENTORY_COMMENT:
+            print("  ⚠ REWROTE the `_comment` block: the on-disk text disagreed with")
+            print("    `_INVENTORY_COMMENT` and has been REPLACED by it. If the on-disk")
+            print("    wording was the CORRECT one, that correction is now gone --")
+            print("    restore it by editing the LITERAL, the side `--write` stamps.")
         return EXIT_OK
 
-    ceilings = load_inventory(root)
+    # ★★★ CHECKED BEFORE ANY TREE-DERIVED VERDICT, AND THE ORDER IS DELIBERATE:
+    # a divergence is a defect in the INSTRUMENT, not in the subject, and a
+    # finding reported by an instrument whose own source of truth is in
+    # disagreement cannot be acted on until you know which text is true.
+    # ⚠ DO NOT "IMPROVE" THIS BY MOVING IT BELOW THE CITATION VERDICTS. Nothing
+    # is hidden by putting it first -- the guard stays RED, and the gate stays
+    # shut, until every arm is clean; a second run is the whole cost. The inverse
+    # order costs the same second run and buries the instrument defect under the
+    # subject one.
+    if comment != _INVENTORY_COMMENT:
+        return report_comment_divergence(comment)
+
     raised, stale = [], []
     for doc, n in sorted(now.items()):
         ceiling = ceilings.get(doc, 0)
@@ -397,6 +612,10 @@ def run(root, write):
         print("      a symbol      src/mir/lowering.cpp `lowerCallArgs()`")
         print("      a rationale   tests/CMakeLists.txt (the `no RUN_SERIAL` block)")
         print("      an anchor     [[D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES]]")
+        print("")
+        print("  `--write` will NOT make this go away. It may only LOWER, and it")
+        print("  refuses while any document sits above its ceiling. Raising ground is")
+        print("  `--baseline`, which says so loudly and is reviewed as a diff.")
         return EXIT_RATCHET
 
     if stale:
@@ -407,6 +626,7 @@ def run(root, write):
         print("  Unclaimed headroom is where the next one hides. If you converted a")
         print("  citation, lower the ceiling in the same commit:")
         print("      python scripts/check-plan-citations/check-plan-citations.py --write")
+        print("  That verb only lowers, so it cannot hide a regression while it does.")
         return EXIT_RATCHET
 
     total = sum(now.values())
@@ -422,7 +642,7 @@ def run(root, write):
 # an arm that checks only the code cannot tell which one it proved. That mistake
 # was measured in a sibling guard in this same cycle.
 
-EXPECTED_ARMS = 25
+EXPECTED_ARMS = 39
 _RAN = None
 
 # ⚠ THE MUTATION FIXTURE IS ASSEMBLED, NOT SPELLED OUT. A literal `path:line` in
@@ -434,29 +654,127 @@ _RAN = None
 _FIXTURE = "src/core/zz_selftest.cpp:%d"
 
 
-def _arm(label, root, expect, says=None, not_says=None):
+def _arm(label, root, expect, says=None, not_says=None, write=False, baseline=False):
+    """One arm. `says` is a string OR a tuple of strings that must ALL appear.
+
+    ★ The tuple form is not convenience: `--baseline` has TWO properties that must
+    hold together — it re-baselines AND it announces that it can raise — and an
+    arm that checks only the first would pass a silent `--baseline`, which is the
+    exact defect this split exists to remove.
+    """
     if _RAN is not None:
         _RAN.append(label)
     buf = io.StringIO()
     detail = ""
     try:
         with contextlib.redirect_stdout(buf):
-            rc = run(root, write=False)
+            rc = run(root, write=write, baseline=baseline)
     except Collapse as exc:
         rc = EXIT_COLLAPSE
         detail = str(exc)
     text = buf.getvalue() + detail
+    wants = (says,) if isinstance(says, str) else tuple(says or ())
+    missing = [w for w in wants if w not in text]
     ok, why = rc == expect, ""
     if not ok:
         why = "EXPECTED rc=%d" % expect
-    elif says is not None and says not in text:
-        ok, why = False, "rc right but the message never said %r" % says
+    elif missing:
+        ok, why = False, "rc right but the message never said %r" % missing[0]
     elif not_says is not None and not_says in text:
         ok, why = False, "rc right but the message said %r -- wrong refusal" % not_says
     first = (detail or buf.getvalue()).split("\n")[0][:72]
     print("plan-citations: self-test arm %-24s rc=%d %s%s"
           % (label, rc, "as expected" if ok else why, (" (" + first + ")") if first else ""))
     return ok
+
+
+def _fact(label, cond, detail=""):
+    """An arm that asserts a property of the TREE rather than of a run.
+
+    ⚠ It registers in `_RAN` like every other arm. A check that runs but is not
+    counted is a check that can silently stop running -- the same vacuity
+    `EXPECTED_ARMS` exists to refuse.
+    """
+    if _RAN is not None:
+        _RAN.append(label)
+    print("plan-citations: self-test arm %-24s %s%s"
+          % (label, "as expected" if cond else "FAILED",
+             (" (" + detail + ")") if detail else ""))
+    return bool(cond)
+
+
+# U+2502 BOX DRAWINGS LIGHT VERTICAL -- absent from cp1252, which is the entire
+# reason it is the fixture. Built with `chr()` rather than written as the glyph or
+# as a `\u` escape: the line that carries the fixture stays pure ASCII, so no
+# editor, transfer or re-encode anywhere in the chain can quietly turn it into
+# something cp1252 CAN encode and leave this arm passing while asserting nothing.
+_BOX = chr(0x2502)
+
+
+def _pipe_arms(fact):
+    """Drive the ratchet report through a REAL cp1252 pipe, in a CHILD process.
+
+    ★★★ THIS IS THE ONLY ARM HERE THAT CAN WITNESS AN ENCODING DEFECT, AND THE
+    REASON IS STRUCTURAL. Every other arm calls `run()` in process with stdout
+    redirected to a `StringIO`, which has NO encoding at all; a run attached to a
+    terminal proves nothing either. ✔MEASURED 2026-08-23 (CPython 3.14.3,
+    Windows): stdout on a pipe is `cp1252` with `errors='surrogateescape'`, and
+    `surrogateescape` does not rescue an ordinary unencodable character -- so a
+    report naming a document whose PATH carries one dies inside itself, and the
+    traceback names a `print` rather than a citation
+    (D-GATE-PYTHON-GUARD-DIES-PRINTING-TREE-TEXT-ON-A-WINDOWS-PIPE).
+
+    ★ `PYTHONIOENCODING=cp1252` IS FORCED, and that is what makes this arm mean
+    something on every host. Left to the ambient locale it would be vacuous on
+    Linux and macOS, where the pipe is already UTF-8 -- i.e. on most of the gate,
+    including both remote legs. The child's own `reconfigure` at import overrides
+    the variable, which is precisely the property under test.
+
+    ⚠ The exit code CANNOT carry the verdict: a refusal and an uncaught
+    `UnicodeEncodeError` are both exit 1. The message is the discriminator.
+    """
+    box = tempfile.mkdtemp(prefix="plan-citations-pipe-")
+    try:
+        os.makedirs(os.path.join(box, ".plans"))
+        os.makedirs(os.path.join(box, "src"))
+        os.makedirs(os.path.dirname(os.path.join(box, INVENTORY_REL)))
+        io.open(os.path.join(box, ".plans", "a%sb.md" % _BOX), "w",
+                encoding="utf-8", newline="").write(
+                    "See %s for the walk.\n" % (_FIXTURE % 2020))
+        io.open(os.path.join(box, "src", "x.cpp"), "w",
+                encoding="utf-8", newline="").write("int x;\n")
+        # ⚠ THE `_comment` IS WRITTEN FROM THE LITERAL, NOT OMITTED. This fixture
+        # drives the READ-ONLY path, which now refuses a `_comment` that is
+        # absent or divergent -- so a bare `{"ceilings": {}}` here would red on
+        # the WRONG refusal and this arm would stop witnessing the encoding
+        # property it exists for while still reporting a non-zero exit.
+        io.open(os.path.join(box, INVENTORY_REL), "w",
+                encoding="utf-8", newline="").write(
+                    json.dumps({"_comment": _INVENTORY_COMMENT, "ceilings": {}},
+                               indent=2, ensure_ascii=False) + "\n")
+
+        driver = ("import importlib.util, sys\n"
+                  "spec = importlib.util.spec_from_file_location('g', %r)\n"
+                  "m = importlib.util.module_from_spec(spec)\n"
+                  "spec.loader.exec_module(m)\n"
+                  "m.DOC_FLOOR = m.CODE_FLOOR = 1\n"
+                  "sys.exit(m.run(%r, write=False))\n"
+                  % (os.path.abspath(__file__), box))
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "cp1252"
+        p = subprocess.run([sys.executable, "-c", driver], cwd=box, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = (p.stdout + p.stderr).decode("utf-8", "replace")
+        died = "UnicodeEncodeError" in out
+        good = fact("20 PIPE-REPORT-SURVIVES",
+                    p.returncode == EXIT_RATCHET and not died
+                    and "new positional citation" in out,
+                    "rc=%d UnicodeEncodeError=%s" % (p.returncode, died))
+        good &= fact("20b PIPE-KEPT-THE-GLYPH", _BOX in out,
+                     "the offending document name reached the report unmangled")
+        return good
+    finally:
+        shutil.rmtree(box, ignore_errors=True)
 
 
 def selftest(root):
@@ -692,6 +1010,112 @@ def selftest(root):
                 shutil.move(os.path.join(held, rel_root), os.path.join(tmp, rel_root))
         shutil.rmtree(held, ignore_errors=True)
 
+        # ═══ THE TWO WRITE VERBS ════════════════════════════════════════════
+        # ★★★ THESE ARE THE ARMS THAT MAKE THE RATCHET A RATCHET. Before the
+        # split, `--write` rewrote unconditionally, so the repair command this
+        # guard's own stale-ceiling message prints would just as happily bank a
+        # NEW citation as lower a converted one
+        # (D-GATE-PLAN-CITATIONS-WRITE-CAN-RAISE-A-RATCHET-CEILING).
+        # ⚠ EVERY ONE OF THEM ASSERTS THE INVENTORY ON DISK, not merely the exit
+        # code. "Refused" and "refused but wrote anyway" share an exit code, and
+        # only the file can tell them apart -- which is the whole property.
+        io.open(subject, "w", encoding="utf-8", newline="").write(
+            pristine + ("\nSee %s for details.\n" % (_FIXTURE % 1717)))
+        ok &= _arm("17 WRITE-REFUSES-A-RAISE", tmp, EXIT_RATCHET, write=True,
+                   says=("REFUSING to re-baseline", "may only LOWER"))
+        ok &= _fact("17b WRITE-WROTE-NOTHING",
+                    io.open(inv_path, encoding="utf-8", newline="").read()
+                    == pristine_inv,
+                    "the inventory is byte-identical to before the refusal")
+        ok &= _arm("17c NOT-LAUNDERED", tmp, EXIT_RATCHET,
+                   says="new positional citation", not_says="above the live count")
+        io.open(subject, "w", encoding="utf-8", newline="").write(pristine)
+
+        # ★ The stale direction, which `--write` must still SERVE: the burn-down
+        # verb is useless if it cannot lower, and a guard that only ever refuses
+        # teaches lanes to reach for `--baseline`.
+        converted = CITATION.sub(lambda m: m.group(0).rsplit(":", 1)[0], pristine, count=3)
+        assert converted != pristine, "arm 18 mutation removed no citation"
+        io.open(subject, "w", encoding="utf-8", newline="").write(converted)
+        was = json.load(io.open(inv_path, encoding="utf-8"))["ceilings"]
+        ok &= _arm("18 WRITE-LOWERS-A-STALE", tmp, EXIT_OK, write=True,
+                   says="re-baselined")
+        now = json.load(io.open(inv_path, encoding="utf-8"))["ceilings"]
+        rel_subject = ".plans/_handoff.md"
+        ok &= _fact("18b LOWERED-TO-THE-LIVE",
+                    now.get(rel_subject, 0) == count_in(subject)
+                    and now.get(rel_subject, 0) < was.get(rel_subject, 0),
+                    "%s: %s -> %s" % (rel_subject, was.get(rel_subject),
+                                      now.get(rel_subject)))
+        io.open(inv_path, "w", encoding="utf-8", newline="").write(pristine_inv)
+        io.open(subject, "w", encoding="utf-8", newline="").write(pristine)
+
+        # ★ `--baseline` is the ONLY verb allowed to raise, and it must SAY SO.
+        # A silent baseline would be the original defect wearing a new name.
+        io.open(subject, "w", encoding="utf-8", newline="").write(
+            pristine + ("\nSee %s for details.\n" % (_FIXTURE % 1919)))
+        ok &= _arm("19 BASELINE-RAISES-LOUDLY", tmp, EXIT_OK, baseline=True,
+                   says=("BASELINED", "CAN RAISE ceilings"))
+        now = json.load(io.open(inv_path, encoding="utf-8"))["ceilings"]
+        ok &= _fact("19b BASELINE-BANKED-IT",
+                    now.get(rel_subject, 0) == count_in(subject)
+                    and now.get(rel_subject, 0) > was.get(rel_subject, 0),
+                    "%s: %s -> %s" % (rel_subject, was.get(rel_subject),
+                                      now.get(rel_subject)))
+        io.open(inv_path, "w", encoding="utf-8", newline="").write(pristine_inv)
+        io.open(subject, "w", encoding="utf-8", newline="").write(pristine)
+
+        # ═══ THE INVENTORY'S OWN PROSE ══════════════════════════════════════
+        # ★★★ THE READ-ONLY PATH IS THE ONLY PATH THAT CAN SEE A DIVERGENCE,
+        # which is exactly why it went unasserted for so long: `--write` and
+        # `--baseline` both STAMP `_INVENTORY_COMMENT`, so each resolves the
+        # disagreement -- always in the CODE's favour -- before anyone could
+        # observe there was one.
+        # ⓘ THERE IS DELIBERATELY NO "AN IDENTICAL COMMENT IS GREEN" ARM. Arm 0
+        # and every `b RESTORED` arm already depend on it, because the replica
+        # carries the REAL inventory; a comparison that always fired would red
+        # all of them. A separate arm would assert what a dozen arms prove.
+        def _stamp_comment(value):
+            body = json.load(io.open(inv_path, encoding="utf-8"))
+            if value is _MISSING:
+                body.pop("_comment", None)
+            else:
+                body["_comment"] = value
+            io.open(inv_path, "w", encoding="utf-8", newline="").write(
+                json.dumps(body, indent=2, ensure_ascii=False) + "\n")
+
+        _STALE_COMMENT = ["a sentence this guard's literal no longer says."]
+        _stamp_comment(_STALE_COMMENT)
+        # ★ ASSERTED BY REFERENCE, never by a copied string: a hard-coded
+        # quotation of `_INVENTORY_COMMENT` inside its own self-test would be one
+        # more copy of the very text whose divergence is the subject, and it
+        # would rot the first time the literal is reworded.
+        ok &= _arm("21 COMMENT-DIVERGED", tmp, EXIT_RATCHET,
+                   says=("has DIVERGED", _STALE_COMMENT[0],
+                         _INVENTORY_COMMENT[0]),
+                   not_says="new positional citation")
+        _stamp_comment(_MISSING)
+        ok &= _arm("22 COMMENT-ABSENT", tmp, EXIT_RATCHET,
+                   says="no `_comment` key",
+                   not_says="new positional citation")
+
+        # ★ `--write` must still REPAIR: it is the verb the refusal above sends
+        # the reader to, so an arm proving only the refusal would leave the
+        # remedy unproven -- and the ANNOUNCEMENT is the half no read-only run
+        # can ever witness, because after the stamp the two agree again and the
+        # next run is green with nothing left to read.
+        _stamp_comment(_STALE_COMMENT)
+        ok &= _arm("23 WRITE-REPAIRS-AND-ANNOUNCES", tmp, EXIT_OK, write=True,
+                   says=("re-baselined", "REWROTE the `_comment` block"))
+        ok &= _fact("23b COMMENT-NOW-MATCHES-THE-LITERAL",
+                    json.load(io.open(inv_path, encoding="utf-8"))["_comment"]
+                    == _INVENTORY_COMMENT,
+                    "the on-disk block is the literal, element for element")
+        io.open(inv_path, "w", encoding="utf-8", newline="").write(pristine_inv)
+        ok &= _arm("23c GREEN-AFTER-REPAIR", tmp, EXIT_OK)
+
+        ok &= _pipe_arms(_fact)
+
         ok &= _arm("6 GREEN-AFTER-RESTORE", tmp, EXIT_OK)
     finally:
         globals()["_RAN"] = None
@@ -711,21 +1135,39 @@ def selftest(root):
 
 def main(argv):
     write = "--write" in argv[1:]
+    baseline = "--baseline" in argv[1:]
     self_ = "--selftest" in argv[1:]
-    unknown = [a for a in argv[1:] if a not in ("--write", "--selftest")]
+    unknown = [a for a in argv[1:]
+               if a not in ("--write", "--baseline", "--selftest")]
     if unknown:
         print("check-plan-citations: unknown argument(s): %s" % " ".join(unknown))
+        return EXIT_USAGE
+    # ⚠ The two write verbs are OPPOSITE promises -- one may only lower, the other
+    # may raise -- so a run that names both has no defined meaning. Refuse rather
+    # than pick one; picking would make the safer spelling a coin toss.
+    if write and baseline:
+        print("check-plan-citations: `--write` and `--baseline` are different verbs "
+              "and cannot be combined.")
+        print("  `--write` burns down (it may only LOWER); `--baseline` establishes "
+              "new ground (it may RAISE, and says so). Choose one.")
         return EXIT_USAGE
     try:
         root = repo_root()
         if self_:
             return selftest(root)
-        if write:
-            return run(root, write=True)
+        if write or baseline:
+            return run(root, write=write, baseline=baseline)
+        # ★ BOTH HALVES RUN UNCONDITIONALLY, and the earlier `if rc != EXIT_OK:
+        # return rc` was a real hole rather than an optimisation: it SHORT-CIRCUITED
+        # the self-test whenever the tree check reddened, so the moment this guard
+        # had something to report was exactly the moment it stopped proving it could
+        # report anything. ✔MEASURED 2026-08-23 in a shared tree that was red on a
+        # sibling lane's citations: the self-test had not executed for the whole
+        # session. Same shape as D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS.
         rc = run(root, write=False)
-        if rc != EXIT_OK:
-            return rc
-        return selftest(root)
+        print("")
+        rc_self = selftest(root)
+        return rc or rc_self
     except Collapse as exc:
         print("check-plan-citations: FAIL (structural) -- %s" % exc)
         print("  This does NOT mean the plans are clean - it means the SCAN COLLAPSED.")

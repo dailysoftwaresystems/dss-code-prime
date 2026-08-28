@@ -1,6 +1,6 @@
 // GNU / System V `ar` static-archive WRITER tests -- c163, the
-// D-LK-STATIC-ARCHIVE-WRITER anchor (writer half of D-FF1-AR-WRITER-STATIC-
-// LINK). `dss::link::format::writeArArchive` is the EXACT INVERSE of the c161
+// D-LK-STATIC-ARCHIVE-WRITER anchor (writer half of D-FF1-AR-WRITER-STATIC-LINK).
+// `dss::link::format::writeArArchive` is the EXACT INVERSE of the c161
 // reader (`dss::ffi::readArArchive`), so the two paired end-to-end is the
 // strongest self-contained oracle -- write bytes, read them back, assert the
 // armap + member list survive exactly.

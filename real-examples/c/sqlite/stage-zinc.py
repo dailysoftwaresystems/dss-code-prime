@@ -9,8 +9,7 @@ configuration and VERIFIES what it wrote.
   1. zlib's `zconf.h`   — D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED
                           (one dir per `recipeTransform`, from `zconfGuards`)
   2. sqlite's `sqlite_cfg.h`
-                        — D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-
-                          CONFIGURE-PROBES
+                        — D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES
                           (one dir per TARGET OS, from `configureAnswers`)
 
 D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED.

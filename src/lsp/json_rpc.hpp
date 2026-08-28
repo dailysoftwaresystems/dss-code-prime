@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "lsp/protocol.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <string>
@@ -77,13 +78,64 @@ public:
 // Pure function; no I/O.
 [[nodiscard]] DSS_EXPORT std::string frameMessage(std::string_view body);
 
+// The largest header region (everything before the `\r\n\r\n`
+// separator) this framing will accept. A real client's header is
+// well under a hundred bytes; anything past this is a peer that will
+// never terminate its header, and the alternative to refusing is an
+// unbounded buffer that grows until the process dies. Refusing is the
+// fail-loud direction: the reader gets `MalformedHeader` and can say
+// so, instead of hanging with no diagnosis available to anyone.
+inline constexpr std::size_t kMaxFrameHeaderBytes = 8192;
+
+enum class FrameScanState : std::uint8_t {
+    Complete,         // a whole frame is present; see `consumed`
+    Incomplete,       // more bytes are required; see `bytesNeeded`
+    MalformedHeader,  // no Content-Length, unparseable value, or over the cap
+};
+
+// What one scan of a streaming buffer learned about the frame at its
+// front. The `bytesNeeded` field is the reason this type exists: LSP
+// framing is SELF-DESCRIBING, so once the header has been read the
+// exact size of the remainder is known — and a reader over a blocking
+// stream must ask for that exact count, never a fixed chunk size it
+// merely hopes will arrive. See `scanFramedMessage`.
+struct DSS_EXPORT FrameScan {
+    FrameScanState state = FrameScanState::Incomplete;
+
+    // `Complete` only: bytes to erase from the front of the buffer
+    // (header + separator + body). Zero in every other state.
+    std::size_t consumed = 0;
+
+    // `Incomplete` only: how many ADDITIONAL bytes the frame is known
+    // to require. ZERO means the header separator has not arrived yet,
+    // so the requirement is not yet knowable — a reader must then take
+    // the only amount a well-behaved peer is certain to send next,
+    // which is one byte. Zero in every other state.
+    std::size_t bytesNeeded = 0;
+};
+
+// Scan `input` for one Content-Length framed message. On
+// `FrameScanState::Complete`, `outBody` holds the JSON body with the
+// header stripped. `outBody` is not modified in any other state.
+//
+// THE ONE HEADER PARSER. `tryParseFramedMessage` below is a thin
+// projection of this result, and `StdioTransport::readMessage` drives
+// its byte reads from `bytesNeeded` — so "what does an LSP frame look
+// like" is answered in exactly one place, and a reader can never hold
+// a drifted second opinion about how many bytes a frame still owes it.
+[[nodiscard]] DSS_EXPORT FrameScan scanFramedMessage(
+    std::string_view input,
+    std::string&     outBody);
+
 // Attempt to parse a Content-Length framed message from `input`.
 // On success, sets `outBody` to the JSON body (header stripped) and
 // returns the total number of bytes consumed from `input` (header
 // + body). Returns 0 if `input` does not yet contain a complete
 // frame (caller should read more bytes). Returns -1 on framing
-// error (malformed header). The transport layer uses this to peel
-// messages from a streaming buffer.
+// error (malformed header).
+//
+// A projection of `scanFramedMessage` that discards `bytesNeeded`.
+// Callers that must SIZE a read cannot use it — see the transport.
 [[nodiscard]] DSS_EXPORT std::int64_t tryParseFramedMessage(
     std::string_view input,
     std::string&     outBody);

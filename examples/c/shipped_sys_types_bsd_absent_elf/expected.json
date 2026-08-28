@@ -1,0 +1,12 @@
+{
+  "$comment": "TF-C90 (D-CSUBSET-SYS-TYPES-BSD-SPELLING-GROUP-ABSENT) — the elf ABSENCE side of the BSD-ONLY pair. MEASURED per name rather than assumed: musl (emsdk sysroot sys/types.h) and bionic (Android NDK sysroot sys/types.h) declare NEITHER fixpt_t nor segsz_t — they are BSD process-accounting types present only on Darwin (macOS SDK sys/types.h:108,128) — so each carries a SINGLE macho `variant` and is therefore not injected on elf (0 matching variants, the off64_t mechanism). EXACT-SET pin: exactly two S_UnknownType and nothing else. ★ TWO POSITIVE CONTROLS make this a measurement rather than an assertion about nothing: `mode_t` (flat entry) proves the header resolved and the descriptor decoded; `u_int` (an elf+macho `variants` entry) proves the ELF ARM of the variants mechanism itself selects — so the two absences cannot be explained by 'variants are broken on elf' or by the header not being read. Their silence is enforced by the runner's exact-set equality. RED-ON-DISABLE: add an elf variant to fixpt_t or segsz_t -> its S_UnknownType disappears -> set mismatch; delete u_int's elf variant -> a THIRD S_UnknownType appears -> set mismatch. Siblings: shipped_sys_types_bsd_macho (the macho RUN witness for these two) and shipped_sys_types_bsd (the seven). There is deliberately NO pe corpus twin of this manifest: see the unit sibling's note — D-DIAG-PE-SPAN-LINE-MAPPING-SYNTHETIC-LINES (pe64 reports a shifted LINE for spanned diagnostics) and D-TEST-POSITIONED-FALSE-REQUIRES-SPANLESS-RENDERING (`positioned:false` is unusable because the integrated CLI arm requires the symbolic rendering that only SPAN-LESS diagnostics get). The pe absence is pinned by ShippedLibDescriptor.RealSysTypesBsdSpellingGroupPerFormat instead. Unit: ShippedLibDescriptor.RealSysTypesBsdSpellingGroupPerFormat.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "S_UnknownType", "line": 39, "col": 1 },
+    { "code": "S_UnknownType", "line": 40, "col": 1 }
+  ]
+}

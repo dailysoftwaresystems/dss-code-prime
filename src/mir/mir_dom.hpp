@@ -332,6 +332,51 @@ mirNaturalLoops(Mir const& mir,
                 std::vector<std::vector<MirBlockId>> const& preds,
                 std::span<std::uint32_t const> candidateSources);
 
+// ── THE TWO HELPERS THAT SATISFY THE COMPLETENESS CLAUSE ABOVE ──────────────
+//
+// They live HERE, beside the clause they exist to discharge, and not in any one
+// caller. ✔MEASURED 2026-08-25 (cycle P36): they were private to
+// `mir_struct_markers.cpp`, so the SECOND caller that needed them —
+// `opt::passes::runLicm`, which calls the whole-module overload once per
+// function — could not reach them and kept paying the O(functions × module
+// blocks) sweep the scoped overload was built to remove
+// ([[D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN]]: 2,239 ms of each 2,552 ms LICM
+// call on the merged sqlite module). A contract whose only satisfier is private
+// to one TU is a contract the next caller re-derives or, as here, silently does
+// not adopt.
+
+// The module's SELF-LOOPING blocks, ascending — a MODULE property, so a caller
+// that sweeps every function computes it ONCE and reuses it for all of them.
+//
+// Why the completeness clause needs it: `mirDominatesBlock(s, u, dom)`
+// short-circuits to `Dominates` whenever `s.v == u.v`, BEFORE it consults the
+// tree. So a self-looping block outside this function's dominator order still
+// registers as a back-edge source, and the whole-module sweep therefore
+// manufactures a single-block pseudo-loop for every self-looping block in the
+// module, in EVERY function's answer. Feeding this index to the scoped sweep
+// reproduces that bit-for-bit ([[D-MIR-STRUCTCF-DERIVATION-REACHES-PAST-THE-FUNCTION]]
+// is the row that holds the behaviour as canon).
+DSS_EXPORT void mirModuleSelfLoopBlocks(Mir const& mir,
+                                        std::vector<std::uint32_t>& out);
+
+// The back-edge SOURCE candidate set for `f`, in the shape the scoped
+// `mirNaturalLoops` demands (ascending, unique, in [1, blockCount)): `f`'s own
+// contiguous block range, plus anything in `rpo` outside that range (a
+// malformed cross-function edge — the verifier owns the diagnostic, but an
+// analysis must not silently answer differently while one exists), plus
+// `moduleSelfLoops`. That set is a superset of `rpo ∪ {module self-loops}`, so
+// the scoped sweep's output is byte-identical to the whole-module sweep's.
+//
+// `out` is cleared and refilled; pass the SAME vector across a function loop so
+// the storage is reused rather than reallocated per function. `f` must have at
+// least one block. Fails loud if `f`'s blocks are not contiguous in the arena —
+// the range enumeration rests on that, and a future non-contiguous layout would
+// otherwise silently NARROW the sweep instead of failing.
+DSS_EXPORT void mirBackEdgeCandidates(Mir const& mir, MirFuncId f,
+                                      std::vector<MirBlockId> const& rpo,
+                                      std::span<std::uint32_t const> moduleSelfLoops,
+                                      std::vector<std::uint32_t>& out);
+
 // Iterated dominance frontier (IDF) of a set of "def blocks". For
 // Cytron-Ferrante SSA construction (Mem2Reg): a Phi for variable V
 // must be inserted at every block in IDF(def-blocks-of(V)). The

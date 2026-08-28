@@ -537,7 +537,7 @@ Recorded, not silently assumed. **None of these edits has been made** — each i
 
 ## 12. Deferred anchors (owned by this plan; register when it opens)
 
-These **35** anchors are **reserved/future** — they live here until the plan opens, then move into [`_deferred-anchor-registry`](./_deferred-anchor-registry.md) as active four-cell rows. Reserved-plan anchors are not yet cited in `src/`, so the CI anchor-guard does not require registry rows today. Every ID carries ≥3 hyphen-separated segments after `D-`, which is what the guard's `D-[A-Z0-9_]+(-[A-Z0-9_]+){2,}` shape requires to treat it as a real anchor rather than an informal label.
+These **35** anchors are **reserved/future** — they live here until the plan opens, then move into [`_deferred-anchor-registry-production`](./_deferred-anchor-registry-production.md) as active four-cell rows. Reserved-plan anchors are not yet cited in `src/`, so the CI anchor-guard does not require registry rows today. Every ID carries ≥3 hyphen-separated segments after `D-`, which is what the guard's `D-[A-Z0-9_]+(-[A-Z0-9_]+){2,}` shape requires to treat it as a real anchor rather than an informal label.
 
 | Anchor | Owns |
 |--------|------|
