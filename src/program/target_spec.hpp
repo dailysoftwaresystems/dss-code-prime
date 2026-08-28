@@ -1,106 +1,63 @@
 #pragma once
 
+// ★★ THE SPEC TYPE ITSELF NOW LIVES IN `core`
+// (D-LSP-TARGET-SPEC-SPLITTER-LIVES-ABOVE-ITS-CONSUMERS). This header is the
+// DRIVER-TIER half of the same story, and it is included from here so every
+// existing `#include "program/target_spec.hpp"` keeps compiling unchanged —
+// a driver TU that wants both halves asks for the driver header and gets them.
+//
+// Read `core/types/target_spec.hpp` for WHY the split exists. The one-line
+// version: the extension rule below takes an `ObjectFormatSchema`, so keeping it
+// on the type dragged `link/` into every consumer of the splitter, and `core`
+// must not depend on `link`. The LSP wanted only the splitter and was reaching
+// UP a tier for it.
+#include "core/types/target_spec.hpp"
 #include "core/export.hpp"
 #include "link/object_format_schema.hpp"
 
-#include <expected>
-#include <string>
 #include <string_view>
-
-// Driver-tier compile target descriptor (plan 14 LK10 cycle 2).
-//
-// `compileFiles` / `compileDirectory` accept `std::vector<std::string>
-// targets` (the historic API surface), where each entry encodes a
-// (target-arch, object-format) pair as `"<targetName>:<formatName>"`.
-// `targetName` is a `TargetSchema::loadShipped` key (e.g. `"x86_64"`,
-// `"arm64"`); `formatName` is an `ObjectFormatSchema::loadShipped`
-// key (e.g. `"elf64-x86_64-linux"`, `"pe64-x86_64-windows-exec"`).
-//
-// Encoding rationale: keeping the public API as a flat vector of
-// strings preserves the C-ABI surface (`dss_compile_directory`)
-// unchanged. The colon separator is explicit — the driver never
-// infers a default for either half, because a "default format for
-// target X" lookup would silently route to an unintended output on
-// typo. CLI argument routing (LK10 cycle 3) parses the same strings.
-//
-// `outputExtension(ObjectFormatSchema const&)` derives the on-disk
-// file extension from the format's `kind()` + per-format
-// `objectType` sub-discriminator. This is a v1 driver-layer
-// convention; plan 6 (artifact profiles) will eventually own the
-// authoritative extension/output-dir policy. Anchored D-LK10-3.
 
 namespace dss {
 
-// Parse-failure modes for `TargetSpec::parse`. The driver branches
-// on this kind so each failure surfaces with a remediation-distinct
-// `D_InvalidTargetSpec` message rather than the same generic
-// diagnostic for four root causes. (silent-failure-hunter F7 fold,
-// LK10 cycle 2 post-audit review.)
-enum class TargetSpecError : std::uint8_t {
-    MissingColon       = 1,
-    MultipleColons     = 2,
-    EmptyTargetName    = 3,
-    EmptyFormatName    = 4,
-    // Either half contains whitespace. Whitespace in a logical
-    // schema name is almost always a CLI / config typo; rejecting
-    // loudly here beats silently failing `loadShipped` downstream
-    // with a confusing `D_SchemaLoadFailed` that names the wrong
-    // root cause. (pr-test-analyzer FOLD-NOW: whitespace handling.)
-    WhitespaceInName   = 5,
-};
-
+// Derive the on-disk artifact extension from a LOADED OBJECT FORMAT.
+//
+// ★★ A FREE FUNCTION TAKING ONLY THE FORMAT, BECAUSE THAT IS ALL IT EVER READ.
+// This was `TargetSpec::outputExtension(ObjectFormatSchema const&) const`, and
+// ✔MEASURED against its own body: it referenced neither `targetName` nor
+// `formatName`. A `const` member that uses nothing of `*this` is a free function
+// wearing a member's clothes, and here the disguise had a cost — it made the
+// extension look like a fact about a target SPEC, which pinned the spec type to
+// the `link` tier and kept the LSP reaching across a layer for the splitter.
+// The extension is a fact about the FORMAT, and now only the format is asked.
+//
+// ⚠ IT STAYS IN THE DRIVER TIER, DELIBERATELY, rather than moving onto
+// `ObjectFormatSchema` where the data lives. This is the v1 DRIVER output-naming
+// convention — plan 6 (artifact profiles) owns the authoritative
+// extension/output-dir policy and will replace it. Putting a driver convention
+// on the schema would give `link` an opinion about how a DRIVER names files,
+// which is the same one-fact-two-owners shape the split above just undid.
+//
+// Closed switch over `ObjectFormatKind` + the per-format objectType
+// sub-discriminator:
+//   * archive        → ".a"      (ELF / Mach-O ecosystems)
+//                      ".lib"    (COFF / PE ecosystem)
+//   * Elf+Rel        → ".o"
+//   * Elf+Exec       → ""        (Linux exec convention)
+//   * Elf+Dyn        → ".so", or "" for the PIE sub-shape — the entry
+//                      cluster discriminates (D-LK1-4 / c151)
+//   * Pe +Obj        → ".obj"
+//   * Pe +Exec       → ".exe"
+//   * Pe +Dll        → ".dll"
+//   * MachO+Object   → ".o"
+//   * MachO+Execute  → ""        (macOS exec convention)
+//   * MachO+Dylib    → ".dylib"
+//   * Wasm           → ".wasm"
+//   * Spirv          → ".spv"
+//   * Unknown        → ""        (never reached — the linker validates
+//                                 schema.kind() != Unknown before this is
+//                                 called; the defensive "" is closed-switch
+//                                 exhaustiveness, not a real arm)
 [[nodiscard]] DSS_EXPORT std::string_view
-    targetSpecErrorName(TargetSpecError e) noexcept;
-
-struct DSS_EXPORT TargetSpec {
-    std::string targetName;   // e.g. "x86_64"
-    std::string formatName;   // e.g. "elf64-x86_64-linux-exec"
-
-    // Parse the `"<targetName>:<formatName>"` shape. On failure
-    // returns the specific reason so the caller can dispatch a
-    // targeted diagnostic.
-    //
-    // Failure modes:
-    //   * `MissingColon`     — no ':' in `spec`.
-    //   * `MultipleColons`   — more than one ':' in `spec` (the
-    //                          grammar is unambiguous; reject so
-    //                          a future third axis doesn't silently
-    //                          claim an existing colon).
-    //   * `EmptyTargetName`  — `:formatName`.
-    //   * `EmptyFormatName`  — `targetName:`.
-    //   * `WhitespaceInName` — leading/trailing/embedded whitespace
-    //                          in either half.
-    [[nodiscard]] static std::expected<TargetSpec, TargetSpecError>
-        parse(std::string_view spec) noexcept;
-
-    // Derive on-disk file extension from the loaded format schema.
-    // Closed switch over `ObjectFormatKind` + per-format
-    // objectType sub-discriminator:
-    //   * Elf+Rel        → ".o"
-    //   * Elf+Exec       → ""        (Linux exec convention)
-    //   * Elf+Dyn        → ".so"     (D-LK1-4 — substrate pending)
-    //   * Pe +Obj        → ".obj"
-    //   * Pe +Exec       → ".exe"
-    //   * Pe +Dll        → ".dll"    (D-LK2-4 — substrate pending)
-    //   * MachO+Object   → ".o"
-    //   * MachO+Execute  → ""        (macOS exec convention)
-    //   * MachO+Dylib    → ".dylib"  (D-LK3-3 — substrate pending)
-    //   * Wasm           → ".wasm"
-    //   * Spirv          → ".spv"
-    //   * Unknown        → ""        (never reached — linker validates
-    //                                 schema.kind() != Unknown before
-    //                                 this is called; defensive "" is
-    //                                 belt-and-suspenders for closed-
-    //                                 switch exhaustiveness)
-    //
-    // The Dyn arm shipped at c150/c151 (D-LK1-4: `.so`, or "" for
-    // the PIE sub-shape — the entry cluster discriminates) and the
-    // Dll arm at c152 (D-LK2-4: `.dll`). Dylib still returns its
-    // canonical extension ahead of its walker: schemas with that
-    // `filetype` are rejected by validate() until D-LK3-3 closes —
-    // at which point the extension is already correct.
-    [[nodiscard]] std::string_view
-        outputExtension(ObjectFormatSchema const& fmt) const noexcept;
-};
+    outputExtensionFor(ObjectFormatSchema const& fmt) noexcept;
 
 } // namespace dss

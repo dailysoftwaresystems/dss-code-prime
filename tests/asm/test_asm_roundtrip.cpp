@@ -128,8 +128,8 @@ void assertRoundTripsClean(AsmBundle& bundle, TargetSchema const& schema) {
 [[nodiscard]] LirReg gpr(TargetSchema const& s, std::string_view name) {
     auto const ord = s.registerByName(name);
     EXPECT_TRUE(ord.has_value());
-    return LirReg{static_cast<std::uint32_t>(ord.value_or(0)), 1,
-                  static_cast<std::uint8_t>(LirRegClass::GPR)};
+    return makePhysicalReg(static_cast<std::uint32_t>(ord.value_or(0)),
+                           LirRegClass::GPR);
 }
 
 } // namespace
@@ -266,9 +266,8 @@ TEST(DisassemblerSlotShape, Imm32SlotsCarryConcreteValue) {
 
     auto bundle = buildAndAssemble(**schema, [&](LirBuilder& b) {
         auto const retOp = (*schema)->opcodeByMnemonic("ret");
-        LirReg const raxReg = LirReg{
-            static_cast<std::uint32_t>(*raxOpt), 1u,
-            static_cast<std::uint8_t>(LirRegClass::GPR)};
+        LirReg const raxReg =
+            makePhysicalReg(static_cast<std::uint32_t>(*raxOpt), LirRegClass::GPR);
         LirOperand const ops[] = { LirOperand::makeImmInt32(0x12345678) };
         (void)b.addInst(*movOpOpt, raxReg, ops);
         (void)b.addReturn(*retOp, {});
@@ -368,10 +367,7 @@ TEST(Arm64RoundTrip, MovImm16RoundTrips) {
     auto bundle = buildAndAssemble(**schema, [&](LirBuilder& b) {
         auto const movOp = (*schema)->opcodeByMnemonic("mov");
         auto const retOp = (*schema)->opcodeByMnemonic("ret");
-        auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-        LirReg const x8{
-            static_cast<std::uint32_t>(*(*schema)->registerByName("x8")),
-            1, cls};
+        LirReg const x8 = makePhysicalReg(static_cast<std::uint32_t>(*(*schema)->registerByName("x8")), LirRegClass::GPR);
         LirOperand const ops[] = { LirOperand::makeImmInt32(94) };
         (void)b.addInst(*movOp, x8, ops);
         (void)b.addReturn(*retOp, {});

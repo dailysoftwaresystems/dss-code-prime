@@ -682,4 +682,26 @@ private:
     bool                                 finished_ = false;
 };
 
+// Declare `grammar`'s SYSTEM include directories on `builder` — one
+// `builder.addSystemDir` per entry of `resolveSystemDirs(grammar)`
+// (`core/types/config_path_walk.hpp`, which owns the walk).
+//
+// ★★ THE PAIRING HAS ONE OWNER TOO, AND THAT IS THE POINT —
+// D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS. This
+// used to live at `dss` namespace scope inside `program/program.cpp` behind a
+// bare forward declaration, so the LSP — which builds a `UnitBuilder` for every
+// open document — had no way to reach it and simply did not declare any system
+// dir. An editor whose CU is built differently from the compiler's is an editor
+// that answers a different question than the one the user is asking.
+//
+// It is HERE rather than beside `resolveSystemDirs` because it is the half that
+// needs a `UnitBuilder`, and `core` must not depend on `analysis`. Everything
+// that does NOT need a builder — the driver's multi-TU path, which hoists the
+// walk out of a per-file loop, and `dump_predefined_macros`, which has no
+// builder at all — calls `resolveSystemDirs` directly.
+//
+// ⚠ CALL IT BEFORE `finish()`, like every other `UnitBuilder` mutator: it
+// forwards to `addSystemDir`, which aborts after `finish()`.
+DSS_EXPORT void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar);
+
 } // namespace dss

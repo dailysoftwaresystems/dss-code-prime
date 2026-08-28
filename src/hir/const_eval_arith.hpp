@@ -53,10 +53,11 @@ namespace dss::detail {
 }
 
 // Pull an integer-typed `HirLiteralValue` into a common `int64_t`
-// arithmetic representation. Bridges the three numeric variant arms
-// (`int64_t` / `uint64_t` / `bool`). Returns nullopt for non-integer
-// variants, or when an unsigned value exceeds int64's positive range
-// (the caller refuses with `Overflow`).
+// arithmetic representation. Bridges the four numeric variant arms
+// (`int64_t` / `uint64_t` / `bool` / `BitIntValue`). Returns nullopt for
+// non-integer variants, and — uniformly across every arm — for any value
+// outside int64's range, whatever container it arrived in (the caller
+// refuses with `Overflow`, or with "not an integer constant expression").
 [[nodiscard]] inline std::optional<std::int64_t>
 asInt64(HirLiteralValue const& v) noexcept {
     if (auto p = std::get_if<std::int64_t>(&v.value)) return *p;
@@ -67,13 +68,66 @@ asInt64(HirLiteralValue const& v) noexcept {
         return static_cast<std::int64_t>(*p);
     }
     if (auto p = std::get_if<bool>(&v.value)) return *p ? std::int64_t{1} : std::int64_t{0};
-    // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a NARROW (N≤64) `_BitInt` const value
-    // bridges to int64 (a `_BitInt` is an integer type, admissible in an ICE — e.g.
-    // `int a[(_BitInt(8))30]`). A WIDE (N>64) value cannot fit → nullopt (the caller
-    // surfaces "not a constant integer"); a wide compare/asBool routes via isZero.
+    // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a `_BitInt`/`__int128` const value
+    // bridges to int64 (both are integer types, admissible in an ICE — e.g.
+    // `int a[(_BitInt(8))30]`, `int a[(__int128)2 + 1]`).
+    //
+    // ── THE RULE IS THE VALUE'S MAGNITUDE, NOT ITS DECLARED WIDTH ─────────────
+    // D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE / D-CSUBSET-INT128-ICE-CONTEXT-REFUSED.
+    // This arm used to nullopt for EVERY `width() > 64` value, however small — so
+    // `int a[(__int128)2 + 1];` and `int a[(__uint128_t)3];` were refused while gcc
+    // 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed SEPARATELY, both
+    // accept them. ★ AND IT CONTRADICTED THIS VERB'S OWN OTHER ARM: the `uint64_t`
+    // arm six lines up already answers by MAGNITUDE (`> INT64_MAX → nullopt`). One
+    // verb was carrying two incompatible rules for one question ("does this value
+    // fit an int64?"); the width test was the wrong one.
+    //
+    // DEFINITION: the value fits iff `INT64_MIN ≤ value ≤ INT64_MAX`, compared as
+    // the value it IS at its declared (width, signedness). Equivalently — and this
+    // is the form implemented below, so it stays `noexcept` and allocation-free —
+    // its two's-complement bit pattern must BE the sign-extension of its low 64
+    // bits AT THE VALUE'S OWN SIGN. `ConstEvalAsInt64Magnitude.MatchesTheConvertToRoundTrip`
+    // pins the fast form against the range definition (spelled with the bignum's own
+    // `compare` against both int64 bounds) over a width × signedness × limb-pattern
+    // matrix, so the two cannot drift apart.
+    //
+    // ⚠ BOTH HALVES OF THE SIGN CHECK ARE LOAD-BEARING, AND THE SECOND ONE WAS
+    // MEASURED THE HARD WAY. Testing only "do the upper limbs repeat bit 63" admits
+    // `(__uint128_t)-1` — an UNSIGNED 2^128−1, whose limbs are all ones — and hands
+    // back −1, so `enum { EA = (__uint128_t)-1 };` would have silently become −1.
+    // An unsigned value is NEVER negative however its bits read, so bit 63 must
+    // already agree with the value's actual sign before the upper limbs are
+    // consulted at all.
+    //
+    // ⚠ THE TRUNCATION GUARD IS THE WHOLE POINT, AND IT IS STRICTER THAN A WIDTH
+    // TEST RATHER THAN WEAKER: a value that does NOT fit still nullopts, so a
+    // 64-bit ICE slot fails loud instead of silently taking a low-64-bit slice.
+    // `int a[((__int128)1 << 100) + 3];` — whose low 64 bits are 3 — must never
+    // become `int a[3]`, and does not: limb 1 is non-zero, so this returns nullopt.
+    // Pinned end-to-end by `examples/c/c_int128_ice_slot_overflow_error`.
+    //
+    // ⓘ ONE W ≤ 64 BEHAVIOUR MOVES, DELIBERATELY: an `unsigned _BitInt(N≤64)` whose
+    // value exceeds INT64_MAX used to bridge to a NEGATIVE int64 (`asI64()` on the
+    // raw bits) and now nullopts. That is this verb's `uint64_t` arm's rule applied
+    // to the arm that was contradicting it — the old answer made
+    // `enum { EA = (unsigned _BitInt(64))9223372036854775808uwb };` a negative
+    // enumerator. Every value at or below INT64_MAX, and every signed `_BitInt`,
+    // is bit-identical to what shipped.
     if (auto p = std::get_if<BitIntValue>(&v.value)) {
-        if (p->width() <= 64) return p->asI64();
-        return std::nullopt;
+        std::uint64_t const lo = p->low64();
+        // The value's REAL sign at its declared type (`isNegative` is false for
+        // every unsigned width, whatever the bits say).
+        bool const neg = p->isNegative();
+        if ((static_cast<std::int64_t>(lo) < 0) != neg) return std::nullopt;
+        // Every bit above 63 must repeat that sign. `wrapTo`/`maskTopLimb` keep the
+        // stored limbs canonical — bits above the declared width already carry the
+        // extension (the invariant `paddingByte` documents) — so the stored limbs
+        // can be read directly, with no widening allocation.
+        std::uint64_t const fill = neg ? ~std::uint64_t{0} : std::uint64_t{0};
+        for (std::size_t i = 1; i < p->limbCount(); ++i) {
+            if (p->limbs()[i] != fill) return std::nullopt;
+        }
+        return static_cast<std::int64_t>(lo);
     }
     return std::nullopt;
 }
@@ -151,8 +205,9 @@ asBool(HirLiteralValue const& v, bool allowFloat) noexcept {
         return *asDouble(v) != 0.0;
     }
     // C4b: a `_BitInt` truthiness folds via `isZero` for EVERY N — never through
-    // `asInt64`, which nullopt-fails for a WIDE value (a wide `_BitInt` condition in
-    // `&&`/`||`/`?:` would then spuriously fail the whole fold).
+    // `asInt64`, which nullopt-fails for a value that does not FIT an int64 (a
+    // `_BitInt` condition holding such a value in `&&`/`||`/`?:` would then
+    // spuriously fail the whole fold, though its truth value is perfectly defined).
     if (auto p = std::get_if<BitIntValue>(&v.value)) return !p->isZero();
     auto iv = asInt64(v);
     if (!iv.has_value()) return std::nullopt;

@@ -11,12 +11,104 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace dss {
+
+// ── THE ONE SPELLING OF A DIAGNOSTIC CODE ──────────────────────────────────
+//   D-DIAG-TWO-CODE-RENDERINGS
+//
+// ★★★ EVERY SURFACE THAT RENDERS A DIAGNOSTIC CODE FOR A READER SPELLS IT
+// `severity[<diagnosticCodeName>]: ` — the SYMBOLIC NAME, in the bracket,
+// followed by a colon and a space. No exceptions, and the exceptions are what
+// this contract exists to forbid.
+//
+// ⭐ WHAT WENT WRONG WITHOUT IT. One diagnostic concept had TWO rendered forms,
+// and which one a reader got depended on a property they could not see:
+// `program.cpp`'s `drainDiagnosticsToStderr` routes on `d.buffer.valid()`, so a
+// diagnostic WITH a source buffer came out `error[P0009]: …` (the 4-hex-digit
+// band form, colon) while a buffer-LESS one came out `error[K_SymbolUndefined] …`
+// (the symbolic name, NO colon). ★★ A census matching `[A-Z][0-9A-F]{4}` was
+// therefore not "undercounting" buffer-less diagnostics — it COULD NOT SEE THEM.
+// ⟲RELAYED from the row (not re-measured when this contract was written): 133 of
+// 189 per-TU runs in the sqlite corpus arc emitted only the invisible form. The
+// MECHANISM was re-verified here by reproducing both renderings through the
+// shipped CLI; it is the FIGURE that is second-hand. Either way it is the
+// mechanism by which a measurement can report a confident number having never
+// looked at most of its population.
+//
+// ★★ WHY THE NAME AND NOT THE HEX — the row that filed this proposed the hex
+// band form, and MEASUREMENT at closing time refuted it on four counts:
+//   (1) FIVE of the six render surfaces ALREADY spoke the name (this file's
+//       `format` header was the ONLY hex one): the CLI buffer-less one-liner,
+//       `dump_predefined_macros`' two emitters, the LSP `code` field, and
+//       `lsp/workspace_project`. Unifying on the name is a ONE-SITE change and
+//       makes the terminal and the IDE agree with NO LSP edit at all; unifying
+//       on hex would have moved four sites and split them again.
+//   (2) `diagnosticCodeName` is this project's stated ALLOCATION ORACLE — a
+//       `default:`-less switch, exact and TOTAL. `diagnosticCodePrefix` is a
+//       lossy projection whose own header documents that an unallocated family
+//       renders under a non-letter (`?3000`) precisely so scrapers cannot trust
+//       it. The identity is the enumerator; the hex is a rendering of it.
+//   (3) NO INFORMATION IS LOST: the name carries the same band as its prefix
+//       (`P_`, `S_`, `K_`, `D_`), so the tier is still legible, and the code is
+//       strictly more self-describing than `P0009`.
+//   (4) `integrated_tests` — the harness that drives the SHIPPED CLI — links
+//       only nlohmann_json, NOT core. ✔MEASURED: it can WRITE a symbolic name
+//       from a manifest but can never COMPUTE a hex without a fourth
+//       hand-maintained copy of the nibble table, which is exactly the
+//       third-copy drift hazard already anchored as D-CONFIG-COMMENT-CLAIM-ROT.
+//       Choosing hex would have made the CLI surface unaddressable by its own
+//       harness.
+//
+// ⚠ THE ROUTING SPLIT ITSELF STAYS, AND IT IS RIGHT. A buffer-less driver-tier
+// diagnostic has no location, and forcing it through the positioned renderer
+// would print a bogus `<unknown-buffer:0>` line and a spurious `got ` prefix.
+// What changed is WHICH TOKEN IDENTIFIES THE CODE and the punctuation after it —
+// never the layout. See `drainDiagnosticsToStderr`'s routing comment.
+//
+// ⚠ THE HEX IS NOT LOST AS AN INTERFACE: `--suppress=<code>` accepts BOTH the
+// symbolic name and the `0x____` form (`cli_args.cpp` `parseSuppressCode`), so a
+// reader who sees `error[P_UnexpectedToken]` can act on it directly and a
+// caller holding a hex value still resolves.
+//
+// ⚠ ONE DELIBERATE PLACE STILL PRINTS BOTH SPELLINGS, AND IT IS NOT AN
+// OVERSIGHT — DO NOT "FIX" IT. The elision marker built by `noteElisionText_`
+// renders `P0009 (P_UnexpectedToken) diagnostics were ELIDED …` in its PROSE.
+// That is prose ABOUT A DIFFERENT CODE than the one in its own bracket
+// (`P_DiagnosticsElided`), not a second spelling of its own; and it is the one
+// place in compiler output that shows the name↔hex correspondence, which is
+// what keeps plan 00 §0.3's table reachable from a log now that headers no
+// longer carry the hex. The contract above governs the BRACKET — the token that
+// identifies the diagnostic being reported — not every mention of a code
+// anywhere in a message.
+//
+// The empty-prose fallback below is the other half of the same contract.
+// ────────────────────────────────────────────────────────────────────────────
+
+// What a diagnostic's message body says when it carries no `expected`, no
+// `actual` and no `suggestion`.
+//
+// ★ IT MUST NOT BE THE CODE. Before this constant, both the CLI
+// (`appendExpectedActual`) and the LSP (`composeMessage`) fell back to
+// `diagnosticCodeName(d.code)`, which put a SECOND copy of the code on a line
+// that already names it in the bracket. Under the two-rendering split that was
+// hazard (H2) on the row — one line carrying two spellings of one code, which a
+// de-duplicating census double-counts unless it normalises first. Unifying the
+// bracket on the name did not remove it: it turned two spellings into the SAME
+// spelling twice, which a name-keyed census double-counts just as happily.
+// A body that states a fact instead of echoing the header removes the hazard
+// outright, and reads better: the LSP already carries `code` as its own
+// structured field, so repeating it in `message` was pure noise there.
+//
+// ⚠ Deliberately ASCII and deliberately not containing `[`, `]` or a code-shaped
+// token, so no scraper can mistake it for one.
+inline constexpr std::string_view kNoDiagnosticDetailRecorded =
+    "(no further detail was recorded for this diagnostic)";
 
 // Per-code severity remapping + suppression. Configured once per
 // compilation unit and applied inside DiagnosticReporter::report().

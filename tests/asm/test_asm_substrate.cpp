@@ -1217,39 +1217,324 @@ TEST(AsmDataSection, MutableInitializedGlobalLowersToData) {
     EXPECT_EQ(r.items[0].bytes, expect);
 }
 
-// ── I5 (D-CSUBSET-BITINT-DATA-GLOBAL): a const-folded `_BitInt` global fails loud ──
-// C4b makes `_BitInt` values const-fold, so one can reach the globals byte-emitter
-// as an initializer. Emitting its bytes is a DEFERRAL boundary — the emitter must
-// FAIL LOUD (a real diagnostic), NEVER emit wrong / zero bytes. The EXPLICIT
-// `BitIntValue` arm emits the SPECIFIC `D-CSUBSET-BITINT-DATA-GLOBAL` deferral
-// diagnostic; if it were removed the value would fall to the scalar arm, where
-// `scalarByteSize(BitInt)` returns nullopt → ALSO fail-loud, but with the GENERIC
-// `K_NoMatchingObjectFormat` message (SAME diagnostic CODE — so an error-count /
-// empty-items assertion alone is NOT red-on-disable). RED-ON-DISABLE therefore
-// pins the distinguishing MESSAGE substring, present only in the explicit arm.
-TEST(AsmDataSection, BitIntGlobalFailsLoud) {
+// ── D-CSUBSET-BITINT-DATA-GLOBAL: a `_BitInt(N)` global emits its container image ──
+// ⚠ THIS TEST USED TO ASSERT THE OPPOSITE (`BitIntGlobalFailsLoud`), AND THE
+// INVERSION IS DELIBERATE, NOT AN OVERSIGHT. C4b walled the arm fail-loud because
+// the encoder could not carry the image: `appendLE` takes a `std::uint64_t` (so any
+// width past 8 is a >>64 UB) and `scalarByteSize` takes a KIND (so it cannot know N).
+// P42 answered both — a wider SOURCE (the wrapped limbs) and the TypeId-aware
+// `sizeOfScalarOrBitInt` ladder — so the arm is a PRODUCER and the assertions turn
+// over with it. Leaving the old refusal pin standing would be the P36 mistake
+// [[D-CSUBSET-INT128-DATA-GLOBAL]] recorded: a gate that contradicts the shipped
+// binary.
+//
+// ★★ THE PADDING BITS ARE THE DECISION THIS PIN EXISTS TO FREEZE. C23 6.2.6.1p6
+// leaves padding-bit values UNSPECIFIED, so more than one image conforms. ✔MEASURED:
+// clang 18.1.3 `-std=c23` ZERO-fills a static image (`_BitInt(17) = -3wb` → `fd ff 01
+// 00`), but at -O0 its own RUNTIME padding is GARBAGE (`fd ff 01 a1`), so clang's
+// padding is not a stable target. ✔MEASURED by EXECUTION on DSS: a runtime
+// `_BitInt(17) = -3` reads byte 2 == 0xff and a runtime `_BitInt(65) = -1` reads byte
+// 8 == 0xff — DSS SIGN-EXTENDS, because that is the `bitIntMask`/`maskTopLimb` wrap
+// invariant the whole `_BitInt` tier is built on. The static image must agree with
+// the RUNTIME THAT READS IT: zero-filling would make `_BitInt(17) g = -3wb; g < 0`
+// answer false (the container would hold +131069) — a silent miscompile of the
+// compiler's own initializer. Every `0xff` padding byte below is that decision.
+//
+// ★ THE FOUR LITERAL ARMS ARE ALL EXERCISED AND NONE IMPLIES ANOTHER — the dispatch
+// lesson [[D-CSUBSET-INT128-DATA-GLOBAL]] paid for. A `_BitInt` initializer folds
+// into `BitIntValue` OR a plain `std::int64_t`/`std::uint64_t`/`bool`; only the
+// declared KIND is present in all four, so the arm keys on the kind. RED-ON-DISABLE:
+// re-key the arm on `holds_alternative<BitIntValue>` and cases (d)-(f) refuse; drop
+// the sign extension and (a)/(c) redden; emit `toLimbBytes()` untrimmed and (a)/(b)
+// get 8-byte and 8-byte images where 4 and 1 are reserved; reverse the limb order and
+// (c)/(g) redden while the single-limb cases stay green.
+TEST(AsmDataSection, BitIntGlobalEmitsContainerSizedLittleEndianImage) {
     TypeInterner ti{CompilationUnitId{1}};
-    // A WIDE _BitInt(100) global initialized by a const-folded bit-precise value.
-    MirLiteralValue wide;
-    wide.core  = TypeKind::BitInt;
-    wide.value = BitIntValue::fromU64(42, 100, /*isSigned=*/false);
-    auto const rw = lowerOneAggGlobal(ti, ti.bitInt(100, /*isSigned=*/false),
-                                      std::move(wide), kNatural16, DataModel::Lp64);
-    EXPECT_GE(rw.errors, 1u)
-        << "a wide _BitInt data-global must fail loud (D-CSUBSET-BITINT-DATA-GLOBAL)";
-    EXPECT_TRUE(rw.items.empty()) << "no bytes for a deferred _BitInt global";
-    EXPECT_NE(rw.messages.find("D-CSUBSET-BITINT-DATA-GLOBAL"), std::string::npos)
-        << "the EXPLICIT _BitInt arm's deferral diagnostic — red-on-disable: the "
-           "generic scalar-fallback message does not carry this anchor";
-    // A NARROW _BitInt(8) global is deferred TOO (uniform fail-loud, never bytes).
-    MirLiteralValue narrow;
-    narrow.core  = TypeKind::BitInt;
-    narrow.value = BitIntValue::fromI64(5, 8, /*isSigned=*/true);
-    auto const rn = lowerOneAggGlobal(ti, ti.bitInt(8, /*isSigned=*/true),
-                                      std::move(narrow), kNatural16, DataModel::Lp64);
-    EXPECT_GE(rn.errors, 1u) << "a narrow _BitInt data-global must also fail loud";
-    EXPECT_NE(rn.messages.find("D-CSUBSET-BITINT-DATA-GLOBAL"), std::string::npos)
-        << "the narrow arm emits the SAME explicit deferral diagnostic";
+    auto const bytesOf = [](LoweredAgg const& r) {
+        return r.items.empty() ? std::vector<std::uint8_t>{} : r.items[0].bytes;
+    };
+    auto const lowerBitInt = [&](std::int64_t n, bool signd, MirLiteralValue v) {
+        return lowerOneAggGlobal(ti, ti.bitInt(n, signd), std::move(v), kNatural16,
+                                 DataModel::Lp64);
+    };
+
+    // (a) NARROW SIGNED NEGATIVE — `_BitInt(17) g = -3wb;`. The container is FOUR
+    //     bytes and bits 17..31 are padding: sign-extended here, `01 00` in clang.
+    MirLiteralValue a;
+    a.core  = TypeKind::BitInt;
+    a.value = BitIntValue::fromI64(-3, 17, /*isSigned=*/true);
+    auto const ra = lowerBitInt(17, true, std::move(a));
+    EXPECT_EQ(ra.errors, 0u) << ra.messages;
+    ASSERT_EQ(ra.items.size(), 1u);
+    EXPECT_EQ(bytesOf(ra), (std::vector<std::uint8_t>{0xfd, 0xff, 0xff, 0xff}))
+        << "four container bytes, padding SIGN-EXTENDED (clang would say fd ff 01 00)";
+    EXPECT_EQ(ra.items[0].alignment.bytes(), 4u);
+
+    // (b) NARROW UNSIGNED — `unsigned _BitInt(8) g = 200uwb;`. ONE byte, not four:
+    //     an over-wide image would overrun the item the layout reserves.
+    MirLiteralValue b;
+    b.core  = TypeKind::BitInt;
+    b.value = BitIntValue::fromU64(200, 8, /*isSigned=*/false);
+    auto const rb = lowerBitInt(8, false, std::move(b));
+    EXPECT_EQ(rb.errors, 0u) << rb.messages;
+    ASSERT_EQ(rb.items.size(), 1u);
+    EXPECT_EQ(bytesOf(rb), (std::vector<std::uint8_t>{0xc8}));
+    EXPECT_EQ(rb.items[0].alignment.bytes(), 1u);
+
+    // (c) WIDE UNSIGNED, 2 limbs, N%64 == 36 — every byte distinct in position, so a
+    //     byte swap, a limb swap or a reversal cannot cancel out. The top limb's
+    //     value occupies exactly its 36 valid bits.
+    MirLiteralValue c;
+    c.core  = TypeKind::BitInt;
+    c.value = BitIntValue{
+        std::vector<std::uint64_t>{0x99aabbccddeeff00ull, 0x0000000fedcba987ull},
+        100, /*isSigned=*/false};
+    auto const rc = lowerBitInt(100, false, std::move(c));
+    EXPECT_EQ(rc.errors, 0u) << rc.messages;
+    ASSERT_EQ(rc.items.size(), 1u);
+    EXPECT_EQ(bytesOf(rc), (std::vector<std::uint8_t>{
+                               0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99,
+                               0x87, 0xa9, 0xcb, 0xed, 0x0f, 0x00, 0x00, 0x00}))
+        << "ceil(100/64)*8 == 16 bytes, limb 0 THEN limb 1, each little-endian";
+
+    // (d) THE PLAIN `std::int64_t` ARM — the one a variant-keyed dispatch misses.
+    MirLiteralValue d;
+    d.core  = TypeKind::BitInt;
+    d.value = std::int64_t{-3};
+    auto const rd = lowerBitInt(17, true, std::move(d));
+    EXPECT_EQ(rd.errors, 0u) << rd.messages;
+    EXPECT_EQ(bytesOf(rd), (std::vector<std::uint8_t>{0xfd, 0xff, 0xff, 0xff}))
+        << "an i64-arm initializer must produce the SAME image as the BitIntValue arm";
+
+    // (e) THE PLAIN `std::uint64_t` ARM.
+    MirLiteralValue e;
+    e.core  = TypeKind::BitInt;
+    e.value = std::uint64_t{200};
+    auto const re = lowerBitInt(8, false, std::move(e));
+    EXPECT_EQ(re.errors, 0u) << re.messages;
+    EXPECT_EQ(bytesOf(re), (std::vector<std::uint8_t>{0xc8}));
+
+    // (f) THE `bool` ARM.
+    MirLiteralValue f;
+    f.core  = TypeKind::BitInt;
+    f.value = true;
+    auto const rf = lowerBitInt(17, true, std::move(f));
+    EXPECT_EQ(rf.errors, 0u) << rf.messages;
+    EXPECT_EQ(bytesOf(rf), (std::vector<std::uint8_t>{0x01, 0x00, 0x00, 0x00}));
+
+    // (g) WIDE SIGNED NEGATIVE, N == 65 — the padding decision at a WIDE width. Bit
+    //     64 is the last value bit; bits 65..127 are padding and are ONES here.
+    //     clang emits eight 0xff then `01` and seven `00`.
+    MirLiteralValue g;
+    g.core  = TypeKind::BitInt;
+    g.value = BitIntValue::fromI64(-1, 65, /*isSigned=*/true);
+    auto const rg = lowerBitInt(65, true, std::move(g));
+    EXPECT_EQ(rg.errors, 0u) << rg.messages;
+    EXPECT_EQ(bytesOf(rg), std::vector<std::uint8_t>(16, 0xff))
+        << "a wide negative _BitInt's padding is the SIGN extension, matching what "
+           "DSS's own maskTopLimb leaves in memory at runtime";
+
+    // (h) THE IMAGE IS THE **WRAPPED** VALUE, never the raw limbs handed in. A limb
+    //     pair with every high bit set at N==100 must come back masked to 36 valid
+    //     bits in the top limb — the static twin of the runtime top-limb mask.
+    MirLiteralValue h;
+    h.core  = TypeKind::BitInt;
+    h.value = BitIntValue{std::vector<std::uint64_t>{~0ull, ~0ull}, 100,
+                          /*isSigned=*/false};
+    auto const rh = lowerBitInt(100, false, std::move(h));
+    EXPECT_EQ(rh.errors, 0u) << rh.messages;
+    EXPECT_EQ(bytesOf(rh), (std::vector<std::uint8_t>{
+                               0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                               0xff, 0xff, 0xff, 0xff, 0x0f, 0x00, 0x00, 0x00}))
+        << "bits 100..127 are ABOVE N and must be zero for an UNSIGNED value";
+}
+
+// ── D-CSUBSET-BITINT-DATA-GLOBAL: a wide `_BitInt` global's ALIGNMENT is the
+// psABI's, NOT its container size. `_BitInt(128)` is SIXTEEN bytes with align
+// EIGHT (x86-64 psABI; `computeLayout`'s BitInt arm, and pinned independently by
+// `examples/c/c23_bitint_wide`'s `_Alignof(_BitInt(128)) == 8` static assert) —
+// unlike `__int128`, which really is 16/16. This is the ONE assertion separating
+// the `_BitInt` arm from the neighbouring 128-bit one, and it is why the arm asks
+// `computeLayout` for its alignment instead of reusing the other scalar arms'
+// `Alignment::ofRuntimePow2(width)` rule. RED-ON-DISABLE: swap the alignment source
+// to the image width and this reads 16.
+TEST(AsmDataSection, WideBitIntGlobalKeepsPsAbiAlignmentNotContainerSize) {
+    TypeInterner ti{CompilationUnitId{1}};
+    MirLiteralValue v;
+    v.core  = TypeKind::BitInt;
+    v.value = BitIntValue::fromU64(1, 128, /*isSigned=*/false);
+    auto const r = lowerOneAggGlobal(ti, ti.bitInt(128, /*isSigned=*/false),
+                                     std::move(v), kNatural16, DataModel::Lp64);
+    ASSERT_EQ(r.errors, 0u) << r.messages;
+    ASSERT_EQ(r.items.size(), 1u);
+    EXPECT_EQ(r.items[0].bytes.size(), 16u);
+    EXPECT_EQ(r.items[0].alignment.bytes(), 8u)
+        << "_BitInt(128) is 16 bytes at align 8 — sharing a limb COUNT with "
+           "__int128 is not sharing a LAYOUT";
+}
+
+// ── D-CSUBSET-BITINT-DATA-GLOBAL: an initializer in NO integer literal arm is
+// REFUSED, never fabricated. The producer emits an image only from a value it can
+// actually read; a `double`-arm literal carrying a `_BitInt` kind is a malformed
+// pool entry, and the honest answer is a diagnostic naming the anchor rather than a
+// container full of whatever the bit pattern happened to be. RED-ON-DISABLE: give
+// the producer a `return zeroImage()` fallback and this goes green with 16 zero
+// bytes and no error — the exact silent-miscompile shape the wall existed to stop.
+TEST(AsmDataSection, BitIntGlobalWithNonIntegerInitializerFailsLoud) {
+    TypeInterner ti{CompilationUnitId{1}};
+    MirLiteralValue v;
+    v.core  = TypeKind::BitInt;
+    v.value = 1.5;                      // a `double` arm under a `_BitInt` kind
+    auto const r = lowerOneAggGlobal(ti, ti.bitInt(100, /*isSigned=*/false),
+                                     std::move(v), kNatural16, DataModel::Lp64);
+    EXPECT_GE(r.errors, 1u) << "no integer arm ⇒ no image";
+    EXPECT_TRUE(r.items.empty()) << "a refused global emits NO bytes";
+    EXPECT_NE(r.messages.find("D-CSUBSET-BITINT-DATA-GLOBAL"), std::string::npos)
+        << "the refusal names the anchor: " << r.messages;
+    EXPECT_NE(r.messages.find("no integer literal arm"), std::string::npos)
+        << "and states the actual cause: " << r.messages;
+}
+
+// ── D-CSUBSET-BITINT-DATA-GLOBAL: the AGGREGATE-LEAF recursion emits it too ──
+// This is the half that makes the close a whole contract rather than a scalar-only
+// one. A `struct S { _BitInt(17) a; unsigned _BitInt(8) b; }` global does NOT reach
+// the scalar arm — it routes through `encodeAggregateValue`, whose scalar leaf pairs
+// `scalarByteSize` (a KIND, so it cannot size a `_BitInt`) with
+// `decodeScalarLiteralBits` (a `std::uint64_t`, so it cannot carry an N>64 image).
+// Both sites now ask the SAME producer, so the two encoders cannot drift.
+// RED-ON-DISABLE: delete the leaf's `_BitInt` arm and every case here refuses with
+// the generic aggregate text; give the leaf its own copy of the encoder and the
+// padding decision has two homes to disagree in.
+TEST(AsmDataSection, BitIntAggregateLeafEmitsImage) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const b17 = ti.bitInt(17, /*isSigned=*/true);
+    TypeId const u8b = ti.bitInt(8, /*isSigned=*/false);
+    TypeId const w65 = ti.bitInt(65, /*isSigned=*/false);
+
+    // (1) STRUCT — a@0 (4 bytes, sign-extended padding), b@4 (ONE byte), size 8.
+    std::array<TypeId, 2> const sf{b17, u8b};
+    TypeId const st  = ti.structType("SBitInt", sf);
+    auto const   lay = computeLayout(st, ti, kNatural16, DataModel::Lp64);
+    ASSERT_TRUE(lay.has_value());
+    ASSERT_EQ(lay->size, 8u) << "fixture precondition: 4-byte + 1-byte members, align 4";
+    auto const rs = lowerOneAggGlobal(
+        ti, st,
+        aggOf({intField(-3, TypeKind::BitInt), intField(200, TypeKind::BitInt)},
+              TypeKind::Struct),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(rs.errors, 0u) << rs.messages;
+    ASSERT_EQ(rs.items.size(), 1u);
+    EXPECT_EQ(rs.items[0].bytes,
+              (std::vector<std::uint8_t>{0xfd, 0xff, 0xff, 0xff, 0xc8, 0, 0, 0}))
+        << "the 1-byte member must NOT widen over the struct's tail padding";
+
+    // (2) ARRAY of a WIDE element — the 16-byte stride is load-bearing: element 0
+    //     has bit 64 set (a low-limb-only leaf writes 0 there) and the two elements
+    //     differ in their low bytes, so a repeated or reversed walk shows.
+    TypeId const arr = ti.array(w65, 2);
+    MirLiteralValue e0;
+    e0.core  = TypeKind::BitInt;
+    e0.value = BitIntValue{std::vector<std::uint64_t>{23ull, 1ull}, 65,
+                           /*isSigned=*/false};
+    MirLiteralValue e1;
+    e1.core  = TypeKind::BitInt;
+    e1.value = BitIntValue::fromU64(29, 65, /*isSigned=*/false);
+    auto const rr = lowerOneAggGlobal(
+        ti, arr, aggOf({std::move(e0), std::move(e1)}, TypeKind::Array),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(rr.errors, 0u) << rr.messages;
+    ASSERT_EQ(rr.items.size(), 1u);
+    EXPECT_EQ(rr.items[0].bytes,
+              (std::vector<std::uint8_t>{23, 0, 0, 0, 0, 0, 0, 0,
+                                          1, 0, 0, 0, 0, 0, 0, 0,
+                                         29, 0, 0, 0, 0, 0, 0, 0,
+                                          0, 0, 0, 0, 0, 0, 0, 0}))
+        << "two 16-byte elements; element 0's bit 64 lives in its SECOND limb";
+
+    // (3) UNION — the first member is written at offset 0 and the slack stays zero.
+    std::array<TypeId, 1> const uf{w65};
+    TypeId const uni = ti.unionType("UBitInt", uf);
+    MirLiteralValue um;
+    um.core  = TypeKind::BitInt;
+    um.value = BitIntValue{std::vector<std::uint64_t>{19ull, 1ull}, 65,
+                           /*isSigned=*/false};
+    auto const ru = lowerOneAggGlobal(ti, uni, aggOf({std::move(um)}, TypeKind::Union),
+                                      kNatural16, DataModel::Lp64);
+    ASSERT_EQ(ru.errors, 0u) << ru.messages;
+    ASSERT_EQ(ru.items.size(), 1u);
+    EXPECT_EQ(ru.items[0].bytes,
+              (std::vector<std::uint8_t>{19, 0, 0, 0, 0, 0, 0, 0,
+                                          1, 0, 0, 0, 0, 0, 0, 0}));
+
+    // (4) A NEGATIVE WIDE MEMBER — the padding decision inside an aggregate. Its
+    //     bits 65..127 are ONES; a zero-filling leaf turns -1 into 2^65-1 silently.
+    std::array<TypeId, 1> const nf{ti.bitInt(65, /*isSigned=*/true)};
+    TypeId const nst = ti.structType("SNegWide", nf);
+    MirLiteralValue nm;
+    nm.core  = TypeKind::BitInt;
+    nm.value = BitIntValue::fromI64(-1, 65, /*isSigned=*/true);
+    auto const rn = lowerOneAggGlobal(ti, nst, aggOf({std::move(nm)}, TypeKind::Struct),
+                                      kNatural16, DataModel::Lp64);
+    ASSERT_EQ(rn.errors, 0u) << rn.messages;
+    ASSERT_EQ(rn.items.size(), 1u);
+    EXPECT_EQ(rn.items[0].bytes, std::vector<std::uint8_t>(16, 0xff));
+}
+
+// ── D-CSUBSET-BITINT-DATA-GLOBAL: the aggregate encoder's OTHER leaf — the static
+// BIT-FIELD packer, which packs into an allocation unit instead of writing an image.
+// ✔MEASURED as a LIVE gap while closing this row and fixed in the same pass:
+// `struct B { unsigned _BitInt(17) a : 5; unsigned _BitInt(17) b : 7; } g = {3uwb,
+// 9uwb};` refused with the GENERIC aggregate text, because the packer's only decoder
+// was `decodeScalarLiteralBits`, which has no `BitIntValue` arm at all — so a
+// const-folded `_BitInt` bit-field value returned nullopt. The RUNTIME twin
+// (`examples/c/c23_bitint_bitfield`) has always worked, which is exactly why nothing
+// caught it: only the STATIC initializer was walled.
+// RED-ON-DISABLE: route the `_BitInt` bit-field leaf back through
+// `decodeScalarLiteralBits` and every case here refuses; keep the route but drop the
+// value normalizer's conversion to the declared (N, signedness) and the SIGNED field
+// packs the wrong low bits.
+TEST(AsmDataSection, BitIntBitFieldStaticInitializerPacks) {
+    TypeInterner ti{CompilationUnitId{1}};
+    // `struct B { unsigned _BitInt(8) u : 4; signed _BitInt(8) s : 4; }` — one u8
+    // allocation unit, u in bits 0..3 and s in bits 4..7 (LSB-first packing).
+    std::array<TypeId, 2> const f{ti.bitInt(8, /*isSigned=*/false),
+                                  ti.bitInt(8, /*isSigned=*/true)};
+    std::array<std::int64_t, 2> const widths{4, 4};
+    TypeId const st = ti.structType("BFBitInt", f, widths);
+    // A bit-field layout needs a REALIZED packing strategy — `kNatural16` leaves it
+    // unset, which makes `computeLayout` refuse the struct outright (the shipped
+    // bit-field pins in this file set it the same way).
+    AggregateLayoutParams gnuPacked{ScalarAlignmentRule::Natural, 16};
+    gnuPacked.bitFieldStrategy = BitFieldStrategy::GnuPacked;
+
+    // u = 13 (0b1101) and s = -3, whose low FOUR bits are also 0b1101. The unit is
+    // therefore 0xdd — and the two nibbles being EQUAL is the point: it is the value
+    // a packer gets only by masking each field to its own width, so a sign-extended
+    // `s` (0xfd..) would blow past its nibble and show.
+    MirLiteralValue u;
+    u.core  = TypeKind::BitInt;
+    u.value = BitIntValue::fromU64(13, 8, /*isSigned=*/false);
+    MirLiteralValue s;
+    s.core  = TypeKind::BitInt;
+    s.value = BitIntValue::fromI64(-3, 8, /*isSigned=*/true);
+    auto const r = lowerOneAggGlobal(
+        ti, st, aggOf({std::move(u), std::move(s)}, TypeKind::Struct), gnuPacked,
+        DataModel::Lp64);
+    ASSERT_EQ(r.errors, 0u) << r.messages;
+    ASSERT_EQ(r.items.size(), 1u);
+    EXPECT_EQ(r.items[0].bytes, (std::vector<std::uint8_t>{0xdd}))
+        << "u:4 == 13 in bits 0..3, s:4 == -3 masked to 0b1101 in bits 4..7";
+
+    // The PLAIN `std::int64_t` arm packs identically — the bit-field leaf reaches the
+    // same normalizer, so its four literal arms are the scalar arm's four.
+    auto const r2 = lowerOneAggGlobal(
+        ti, st,
+        aggOf({intField(13, TypeKind::BitInt), intField(-3, TypeKind::BitInt)},
+              TypeKind::Struct),
+        gnuPacked, DataModel::Lp64);
+    ASSERT_EQ(r2.errors, 0u) << r2.messages;
+    ASSERT_EQ(r2.items.size(), 1u);
+    EXPECT_EQ(r2.items[0].bytes, (std::vector<std::uint8_t>{0xdd}));
 }
 
 // ── D-CSUBSET-INT128-DATA-GLOBAL: a 128-bit integer global emits 16 REAL bytes ──
@@ -1992,4 +2277,380 @@ TEST(AsmAggregateGlobal, NestedOverlappingMemberReportsOverlapReasonAtTopLevel) 
     EXPECT_NE(r.messages.find("overlapping explicit-offset struct is unsupported"),
               std::string::npos)
         << "a nested cause must reach the caller unchanged: " << r.messages;
+}
+
+// ── D-CSUBSET-ENUM-GLOBAL-CODEGEN: an ENUM-typed static object emits bytes ──
+//
+// C 6.7.2.2: an enumerated type has an implementation-defined COMPATIBLE integer
+// type, and its object representation IS that integer's. `TypeKind::Enum` is a
+// NOMINAL-IDENTITY marker carrying no width of its own — `scalarByteSize(Enum)`
+// is nullopt BY CONSTRUCTION, because the kind alone cannot know the width; only
+// the enum's `scalars[0]` underlying does.
+//
+// ⚠ WHAT THESE PINS EXIST FOR: `lowerMirGlobalsToDataItems` used to dispatch on
+// the DECLARED kind, so `enum E g = B;` — an utterly ordinary file-scope object
+// that gcc 13 -std=c2x and clang 18 -std=c23 both compile AND run — hit the
+// scalar arm's "non-primitive global types" refusal instead of emitting four
+// bytes. One gate refused EVERY enum-typed static shape at once (scalar,
+// tentative, struct member, array element, union member), which is why these
+// pins cover all of them: a subset would leave the rest latent (the multi-site
+// contract rule). The end-to-end runtime witness is
+// `examples/c/enum_typed_global`; these are the BYTE-EXACT pins that example's
+// exit code can only summarize, plus the substrate arms no C source can reach.
+namespace {
+
+// Lower ONE TENTATIVE (zero-init) module global of `type`, with a chosen
+// aggregate-layout block, and return the item + error count. The shipped
+// `lowerOneScalarGlobal` is I32-only and always passes `kNatural16`; the arm
+// under test here is precisely the one that must NOT need a layout block.
+[[nodiscard]] LoweredAgg lowerOneTentativeGlobal(
+        TypeInterner const& ti, TypeId type,
+        std::optional<AggregateLayoutParams> lp, DataModel dm) {
+    MirBuilder b;
+    b.addGlobal(type, SymbolId{1}, UINT32_MAX, MirFuncId{}, SymbolBinding::Global,
+                SymbolVisibility::Default, /*isConst=*/false,
+                MirThreadStorage::Shared);
+    Mir const          m = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto               items = lowerMirGlobalsToDataItems(m, ti, lp, dm, rep);
+    std::string                 msgs;
+    std::vector<DiagnosticCode> codes;
+    for (auto const& d : rep.all()) {
+        msgs += d.actual;
+        codes.push_back(d.code);
+    }
+    return {std::move(items), rep.errorCount(), std::move(msgs), std::move(codes)};
+}
+
+} // namespace
+
+// A DEFAULT-underlying (`int`) enum scalar global emits its underlying's four
+// little-endian bytes at its natural alignment. RED-ON-DISABLE: revert the
+// `materialScalarKind` projection at the initialized-global arm and this does not
+// merely change bytes — the global is REFUSED outright (errors >= 1, no items),
+// which is the exact defect this cycle closes.
+TEST(AsmEnumGlobal, ScalarEnumGlobalEmitsItsUnderlyingWidth) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const e = ti.enumType("E", TypeKind::I32);
+
+    MirLiteralValue v;
+    v.core  = TypeKind::I32;          // the underlying — the pipeline's own tag
+    v.value = std::int64_t{3};
+    auto const r = lowerOneAggGlobal(ti, e, std::move(v), kNatural16,
+                                     DataModel::Lp64);
+
+    ASSERT_EQ(r.errors, 0u) << r.messages;
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const want{3, 0, 0, 0};
+    EXPECT_EQ(r.items[0].bytes, want)
+        << "an int-backed enum global is four little-endian bytes of its value";
+    EXPECT_EQ(r.items[0].alignment.bytes(), 4u)
+        << "natural alignment comes from the UNDERLYING width, not from Enum";
+    EXPECT_EQ(r.items[0].section, DataSectionKind::Data)
+        << "a mutable initialized enum global is ordinary writable data";
+
+    // ★ THE TYPE DECIDES, NOT THE POOL'S `core` TAG. The literal pool carries a
+    // `core` kind alongside the value; the encoder must take its width from the
+    // GLOBAL'S TYPE. Re-tagging the identical value `Enum` must not move a byte —
+    // if it did, the width would be coming from the tag, and a tag the front end
+    // spells differently tomorrow would silently change the image.
+    MirLiteralValue tagged;
+    tagged.core  = TypeKind::Enum;
+    tagged.value = std::int64_t{3};
+    auto const rt = lowerOneAggGlobal(ti, e, std::move(tagged), kNatural16,
+                                      DataModel::Lp64);
+    ASSERT_EQ(rt.errors, 0u) << rt.messages;
+    ASSERT_EQ(rt.items.size(), 1u);
+    EXPECT_EQ(rt.items[0].bytes, want)
+        << "the emitted bytes must depend on the global's TYPE, not the pool tag";
+}
+
+// ★ THE WIDTH PIN, and the one a plausible WRONG fix fails. C23 6.7.2.2 lets an
+// enum FIX its underlying type (`enum Small : unsigned char`), so "an enum is an
+// int" is false: this global is ONE byte, value 200, aligned 1. A fix that mapped
+// Enum to I32 unconditionally would emit four bytes here and stay green on every
+// default-underlying pin above it.
+TEST(AsmEnumGlobal, FixedUnderlyingEnumGlobalEmitsExactlyOneByte) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const small = ti.enumType("Small", TypeKind::U8);
+
+    MirLiteralValue v;
+    v.core  = TypeKind::U8;
+    v.value = std::uint64_t{200};
+    auto const r = lowerOneAggGlobal(ti, small, std::move(v), kNatural16,
+                                     DataModel::Lp64);
+
+    ASSERT_EQ(r.errors, 0u) << r.messages;
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const want{200};
+    EXPECT_EQ(r.items[0].bytes, want)
+        << "an unsigned-char-backed enum is ONE byte — four would silently widen "
+           "the object and shift every neighbour that follows it";
+    EXPECT_EQ(r.items[0].alignment.bytes(), 1u);
+}
+
+// A TENTATIVE (`enum E g;`) enum global reserves its underlying's byte extent in
+// .bss with NO on-disk bytes — and, the load-bearing half, WITHOUT an
+// `aggregateLayout` block. Before the projection this arm reached the right size
+// only through the `computeLayout` fallback, so its correctness silently depended
+// on the target declaring a layout block that an integer-sized object has no
+// business needing. Passing `std::nullopt` is what makes this pin see that
+// difference at all; with `kNatural16` it would be green either way.
+TEST(AsmEnumGlobal, TentativeEnumGlobalReservesItsWidthWithNoLayoutBlock) {
+    TypeInterner ti{CompilationUnitId{1}};
+
+    auto const wide = lowerOneTentativeGlobal(ti, ti.enumType("E", TypeKind::I32),
+                                              /*lp=*/std::nullopt, DataModel::Lp64);
+    ASSERT_EQ(wide.errors, 0u) << wide.messages;
+    ASSERT_EQ(wide.items.size(), 1u);
+    EXPECT_EQ(wide.items[0].section, DataSectionKind::Bss);
+    EXPECT_TRUE(wide.items[0].bytes.empty())
+        << "a zero-fill global carries NO file bytes — only a reserved extent";
+    EXPECT_EQ(wide.items[0].reservedSize, 4u)
+        << "the reserved extent is the UNDERLYING integer's width";
+    EXPECT_EQ(wide.items[0].alignment.bytes(), 4u);
+
+    // The fixed-underlying twin, same arm: one byte, aligned 1.
+    auto const narrow = lowerOneTentativeGlobal(ti, ti.enumType("Small", TypeKind::U8),
+                                                /*lp=*/std::nullopt, DataModel::Lp64);
+    ASSERT_EQ(narrow.errors, 0u) << narrow.messages;
+    ASSERT_EQ(narrow.items.size(), 1u);
+    EXPECT_EQ(narrow.items[0].reservedSize, 1u);
+    EXPECT_EQ(narrow.items[0].alignment.bytes(), 1u);
+}
+
+// The AGGREGATE-LEAF half of the same defect: an enum member/element is a scalar
+// leaf, and the leaf encoder asked the same un-sized Enum kind for its width. All
+// four composite shapes are here because one gate refused them all. RED-ON-
+// DISABLE: revert the projection at `encodeAggregateValue` and every case below
+// turns into a refusal ("aggregate initializer could not be encoded"), not merely
+// into wrong bytes.
+TEST(AsmEnumGlobal, EnumLeavesInsideAggregatesEncodeAtTheirOffsets) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const e     = ti.enumType("E", TypeKind::I32);
+    TypeId const small = ti.enumType("Small", TypeKind::U8);
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const i8    = ti.primitive(TypeKind::I8);
+
+    // (1) STRUCT `{ enum E e; int n; }` = { 3, 40 } — e@0, n@4.
+    std::array<TypeId, 2> const pairFields{e, i32};
+    TypeId const pair = ti.structType("Pair", pairFields);
+    auto const rp = lowerOneAggGlobal(
+        ti, pair, aggOf({intField(3, TypeKind::I32), intField(40, TypeKind::I32)},
+                        TypeKind::Struct),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(rp.errors, 0u) << rp.messages;
+    ASSERT_EQ(rp.items.size(), 1u);
+    std::vector<std::uint8_t> const wantPair{3, 0, 0, 0, 40, 0, 0, 0};
+    EXPECT_EQ(rp.items[0].bytes, wantPair)
+        << "the enum member occupies its underlying's four bytes at offset 0";
+
+    // (2) ARRAY `enum E[3] = { 5, 3, 1 }` — three distinct values, so a stride
+    //     error, a reversed walk, or a repeated element cannot cancel out.
+    TypeId const arr = ti.array(e, 3);
+    auto const ra = lowerOneAggGlobal(
+        ti, arr,
+        aggOf({intField(5, TypeKind::I32), intField(3, TypeKind::I32),
+               intField(1, TypeKind::I32)}, TypeKind::Array),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(ra.errors, 0u) << ra.messages;
+    ASSERT_EQ(ra.items.size(), 1u);
+    std::vector<std::uint8_t> const wantArr{5, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0};
+    EXPECT_EQ(ra.items[0].bytes, wantArr);
+
+    // (3) UNION `{ enum E e; int n; }` = { 5 } — the first member is written and
+    //     the union's remaining bytes stay zero.
+    std::array<TypeId, 2> const uniFields{e, i32};
+    TypeId const uni = ti.unionType("U", uniFields);
+    auto const ru = lowerOneAggGlobal(
+        ti, uni, aggOf({intField(5, TypeKind::I32)}, TypeKind::Union),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(ru.errors, 0u) << ru.messages;
+    ASSERT_EQ(ru.items.size(), 1u);
+    std::vector<std::uint8_t> const wantUni{5, 0, 0, 0};
+    EXPECT_EQ(ru.items[0].bytes, wantUni);
+
+    // (4) ★ THE NARROW LEAF, and it is the case that cannot fail QUIETLY.
+    //     `{ signed char tag; enum Small s; }` is TWO bytes — tag@0, s@1. A leaf
+    //     that assumed four bytes for the enum would run off the item's own byte
+    //     extent, which the layout-vs-encoder bounds check refuses LOUD. So this
+    //     pin discriminates the width in both directions: right bytes, or a
+    //     diagnostic — never a quietly widened object.
+    std::array<TypeId, 2> const packedFields{i8, small};
+    TypeId const packed = ti.structType("Packed", packedFields);
+    auto const layout = computeLayout(packed, ti, kNatural16, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    ASSERT_EQ(layout->size, 2u)
+        << "fixture precondition: a u8-backed enum member makes this struct 2 bytes";
+    auto const rk = lowerOneAggGlobal(
+        ti, packed,
+        aggOf({intField(2, TypeKind::I8), intField(200, TypeKind::U8)},
+              TypeKind::Struct),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(rk.errors, 0u) << rk.messages;
+    ASSERT_EQ(rk.items.size(), 1u);
+    std::vector<std::uint8_t> const wantPacked{2, 200};
+    EXPECT_EQ(rk.items[0].bytes, wantPacked);
+}
+
+// FAIL LOUD ON A MALFORMED RECORD — never a guessed width. An Enum whose
+// underlying scalar is outside the core kind range is not something a C source
+// can produce; it is what a corrupted or incompletely-built type record looks
+// like. The projection must hand such a record back UNCHANGED so the existing
+// refusal fires, rather than invent a width for it.
+//
+// ★ RED-ON-DISABLE, AND THE MUTATION HAD TO BE CHOSEN CAREFULLY — ✔MEASURED,
+// because the obvious one leaves this pin GREEN. Deleting the whole projection
+// reddens the four pins above but NOT this one: with no projection every enum
+// refuses, including this one, for the reason the pin asserts. Deleting only the
+// RANGE CHECK also leaves it green: `TypeKind`'s underlying type is fixed
+// (`std::uint16_t`), so an out-of-range scalar still lands on a kind
+// `scalarByteSize` has no arm for, and the refusal still fires. What this pin
+// actually guards is the choice between REFUSING and GUESSING — so its mutation
+// is `return TypeKind::I32;` in place of `return k;`, i.e. the naive "an enum is
+// an int" fallback. ✔MEASURED RED under exactly that mutant (4 bytes emitted,
+// zero errors), and it is a realistic wrong implementation rather than a
+// contrived one: `FixedUnderlyingEnumGlobalEmitsExactlyOneByte` catches the same
+// mistake from the well-formed side, this one from the malformed side.
+TEST(AsmEnumGlobal, AnEnumWithAnOutOfRangeUnderlyingFailsLoud) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const bad = ti.enumType("Bad", static_cast<TypeKind>(9999));
+
+    MirLiteralValue v;
+    v.core  = TypeKind::I32;
+    v.value = std::int64_t{3};
+    auto const r = lowerOneAggGlobal(ti, bad, std::move(v), kNatural16,
+                                     DataModel::Lp64);
+
+    EXPECT_GE(r.errors, 1u)
+        << "an enum with no usable underlying must be refused, not sized by guess";
+    EXPECT_TRUE(r.items.empty()) << "a refused global emits NO bytes";
+    EXPECT_NE(r.messages.find("non-primitive global types"), std::string::npos)
+        << "and it reaches the pre-existing scalar refusal: " << r.messages;
+}
+
+// ══ D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE ═════════
+// ★★ A `_Complex` STATIC INITIALIZER EMITS A TWO-COMPONENT IMAGE — real at 0,
+//    imaginary at the ELEMENT SIZE.
+//
+// C 6.2.5p13 lays a complex out exactly like an array of two element-floats, and
+// `computeLayout`'s Complex arm realizes that as `StructLayout{es * 2, elem->align}`
+// — the imaginary component at exactly `es`, NOT at the align-rounded stride the
+// ARRAY arm uses. Copying the array arm would be invisible on F32/F64 (size ==
+// align) and wrong on any element where they differ, which is the class of defect
+// that surfaces one cycle after the gate it passed.
+//
+// ✔MEASURED at 301e2a63: every one of these refused with
+// `error[K_NoMatchingObjectFormat] … has a runtime initializer (__module_init__-
+// driven)`, because a complex initializer had no constant-image path at all and fell
+// to a load-time store-chain the producer does not emit. gcc 13.3.0 (`-std=c2x`) and
+// clang 18.1.3 (`-std=c23`), probed SEPARATELY, compile and run all of them.
+//
+// ★ THE IMAGINARY HALF IS WHAT EVERY CASE IS BUILT TO CATCH. A half-emitted image
+// (real right, imaginary zero) is a SILENT MISCOMPILE, not a refusal — nothing
+// recomputes the value at load. So no case below has a zero imaginary component
+// except the one that MUST (the real→complex promotion), and the two components are
+// never equal, so a producer that wrote `re` twice, swapped them, or dropped `im`
+// reddens on the bytes rather than on a count.
+//
+// RED-ON-DISABLE: delete the `TypeKind::Complex` arm from `encodeAggregateValue` and
+// every case refuses (the generic aggregate text); place the imaginary component at
+// the align-rounded stride instead of `elemLay->size` and the F32 case still passes
+// while a hypothetical wider element would not — which is why the F32 case pins the
+// OFFSET explicitly rather than trusting the F64 one.
+TEST(AsmDataSection, ComplexGlobalEmitsTwoComponentImageAtElementOffsets) {
+    TypeInterner ti{CompilationUnitId{1}};
+    auto const f64c = ti.complex(ti.primitive(TypeKind::F64));
+    auto const f32c = ti.complex(ti.primitive(TypeKind::F32));
+    auto const comp = [](double v, TypeKind k) {
+        MirLiteralValue l;
+        l.value = v;
+        l.core  = k;
+        return l;
+    };
+
+    // (a) F64 elements, BOTH components non-zero and DISTINCT — (3.0, 4.0).
+    //     16 bytes: 3.0 little-endian at 0, 4.0 little-endian at 8.
+    auto const ra = lowerOneAggGlobal(
+        ti, f64c,
+        aggOf({comp(3.0, TypeKind::F64), comp(4.0, TypeKind::F64)},
+              TypeKind::Complex),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(ra.errors, 0u) << ra.messages;
+    ASSERT_EQ(ra.items.size(), 1u);
+    EXPECT_EQ(ra.items[0].bytes,
+              (std::vector<std::uint8_t>{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x40}))
+        << "real 3.0 at byte 0, imaginary 4.0 at byte 8 — the exact image clang "
+           "emits for `double _Complex g = __builtin_complex(3.0, 4.0);`";
+    EXPECT_EQ(ra.items[0].alignment.bytes(), 8u)
+        << "a complex aligns as its ELEMENT does, never as its 16-byte size";
+
+    // (b) F32 elements — 8 bytes total, and the imaginary component starts at byte
+    //     FOUR. This is the offset assertion: it is `elemLay->size`, the layout
+    //     authority's own formula, not a stride derived some other way.
+    auto const rb = lowerOneAggGlobal(
+        ti, f32c,
+        aggOf({comp(1.5, TypeKind::F32), comp(2.5, TypeKind::F32)},
+              TypeKind::Complex),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(rb.errors, 0u) << rb.messages;
+    ASSERT_EQ(rb.items.size(), 1u);
+    EXPECT_EQ(rb.items[0].bytes,
+              (std::vector<std::uint8_t>{0x00, 0x00, 0xc0, 0x3f,
+                                         0x00, 0x00, 0x20, 0x40}))
+        << "F32 components: 1.5f at byte 0, 2.5f at byte 4";
+    EXPECT_EQ(rb.items[0].alignment.bytes(), 4u);
+
+    // (c) NEGATIVE imaginary — the sign must survive into the image. `conj(3+4i)`
+    //     is (3.0, -4.0), and gcc folds exactly this in a static initializer.
+    auto const rc = lowerOneAggGlobal(
+        ti, f64c,
+        aggOf({comp(3.0, TypeKind::F64), comp(-4.0, TypeKind::F64)},
+              TypeKind::Complex),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(rc.errors, 0u) << rc.messages;
+    ASSERT_EQ(rc.items.size(), 1u);
+    EXPECT_EQ(rc.items[0].bytes,
+              (std::vector<std::uint8_t>{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0xc0}));
+
+    // (d) A ONE-COMPONENT value — the real→complex promotion `double _Complex g =
+    //     7.0;`. The imaginary half is zero BY CONSTRUCTION (the caller pre-zeroes
+    //     the buffer to the layout size), which is the C 6.3.1.7 answer, and the
+    //     image is still the full 16 bytes rather than a short 8.
+    auto const rd = lowerOneAggGlobal(
+        ti, f64c, aggOf({comp(7.0, TypeKind::F64)}, TypeKind::Complex),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(rd.errors, 0u) << rd.messages;
+    ASSERT_EQ(rd.items.size(), 1u);
+    EXPECT_EQ(rd.items[0].bytes,
+              (std::vector<std::uint8_t>{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c, 0x40,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}));
+
+    // (e) FAIL LOUD, never partial. THREE components is a shape the type cannot
+    //     hold; writing the first two and dropping the third is precisely the
+    //     silent half-emit this arm exists to prevent.
+    auto const re = lowerOneAggGlobal(
+        ti, f64c,
+        aggOf({comp(1.0, TypeKind::F64), comp(2.0, TypeKind::F64),
+               comp(3.0, TypeKind::F64)},
+              TypeKind::Complex),
+        kNatural16, DataModel::Lp64);
+    EXPECT_GT(re.errors, 0u)
+        << "an over-long complex initializer must REFUSE, not truncate";
+    EXPECT_NE(re.messages.find(
+                  "D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE"),
+              std::string::npos)
+        << "the refusal must name its own anchor, not the generic aggregate text";
+
+    // (f) A SCALAR leaf where a two-component value is owed — the other half of the
+    //     same wall, and the arm that would otherwise silently write 8 of 16 bytes.
+    MirLiteralValue bare;
+    bare.value = 3.0;
+    bare.core  = TypeKind::F64;
+    auto const rf = lowerOneAggGlobal(ti, f64c, std::move(bare), kNatural16,
+                                      DataModel::Lp64);
+    EXPECT_GT(rf.errors, 0u)
+        << "a scalar leaf cannot carry both complex components";
 }

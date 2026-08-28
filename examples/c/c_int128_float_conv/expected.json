@@ -1,0 +1,34 @@
+{
+  "$comment": "128-bit integer <-> `double`, BOTH DIRECTIONS (D-CSUBSET-INT128-FLOAT-CONV) — the runnable witness for a conversion that shipped as a REFUSAL (`S0050`, whose message named `_BitInt` and cited a `_BitInt` row for a `__int128` source). gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 / 19 (`-std=c23`), probed SEPARATELY, all compile and run every term; clang is the only witness for the `_BitInt` terms because gcc 13.3 has no `_BitInt` at all, which is a missing FEATURE and not a refusal, so the disjunction still binds. THE ARITHMETIC IS THE SUBJECT, NOT THE ACCEPTANCE: the refusal existed because a naive scalar path 'would fill only limb 0 (wrong sign, wrong value, dropped upper limbs)', so every term is an EXACT integer relation and each one is broken by a specific wrong implementation. RED-ON-DISABLE: t1 — a value whose LOW LIMB IS ZERO (3·2^64); a limb-0-only conversion answers 0.0, and the round trip is an equality because 3·2^64 has two significant bits. t2 — ★ THE DOUBLE-ROUNDING TRAP and the reason this example exists: v = (2^53+1)·2^64+1, where the obvious two-step `(double)hi·2^64 + (double)lo` rounds TWICE and yields 2^117 while the correctly-rounded answer is 2^117+2^65 (the exact remainder 2^64+1 is just over half an ulp of 2^65); a ONE-ULP error is the whole difference and no other term can see it. t3 — the SIGNED counterpart, a negative whose magnitude needs both limbs: a logical rather than arithmetic treatment, a dropped sign, or a magnitude taken before the negation all break the sign symmetry. t4 — `double`->128-bit TRUNCATES TOWARD ZERO (C 6.3.1.4p1) on both signs; a floor-based conversion answers -4 where C requires -3. t5 — the top of the range: 2^128-1 rounds UP to 2^128, asserted as an exact relation between two CONVERTED values (exactly twice the double for 2^127) rather than against a literal. t6 — the `_BitInt` twins at TWO limb counts, 128 (2 limbs) and 200 (4 limbs), which is what proves the emitter is limb-count-general rather than 2-limb special-cased; the 200-bit value has limbs 0 AND 1 both zero. t7 — a `float` SOURCE, whose widening to `double` is exact, so it must give the identical answer: a second rounding would make the two forms differ. ⚠ NO FLOATING LITERAL IS COMPARED AGAINST ANYWHERE — ✔MEASURED while writing this, a decimal bound written to bracket a value ROUNDS TO THAT VALUE and the comparison goes vacuous (`d > 5.5340232221128654e19` is FALSE for d = 3·2^64). ⚠ Every operand is laundered through an opaque helper so the release arm exercises the runtime conversion rather than a front-end constant. ⓘ The terms are SPLIT INTO PER-TERM FUNCTIONS on purpose: ✔MEASURED, a single `main` holding all of them needs a 1088-byte frame and arm64 then fails with `A_ImmediateOperandOutOfRange` on `fstur`/`fldur` (the assembler's signed 9-bit `imm9` offset — a PRE-EXISTING limit unrelated to this conversion; the same file built clean once split). Each term is boolean-gated to 6 ⇒ the sum is 42 only when every one holds.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

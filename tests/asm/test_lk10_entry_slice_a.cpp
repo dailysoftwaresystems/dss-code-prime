@@ -191,9 +191,11 @@ TEST(LK10EntrySliceA, FullTrampolineShapeSyscallArm) {
     (void)b.addFunction(SymbolId{42});
     auto blk = b.createBlock();
     b.beginBlock(blk);
-    // Physical regs use `makePhysicalReg(ordinal, regClass)` — bare
-    // `LirReg{ordinal}` defaults to a virtual reg whose id collides
-    // with the physical ordinal namespace.
+    // Physical regs use `makePhysicalReg(ordinal, regClass)`. This comment
+    // used to warn that a bare `LirReg{ordinal}` silently defaults to a
+    // VIRTUAL reg whose id collides with the physical ordinal namespace —
+    // D-LIR-POSITIONAL-LIRREG-INIT-MISCLASSIFIES-SILENTLY. That spelling no
+    // longer compiles: the factories are the only way in.
     auto const raxPhys = makePhysicalReg(*raxOrd, LirRegClass::GPR);
     auto const rdiPhys = makePhysicalReg(*rdiOrd, LirRegClass::GPR);
     // 1. call user_entry (SymbolRef = 88, the user function)

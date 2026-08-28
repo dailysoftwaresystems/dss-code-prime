@@ -449,4 +449,35 @@ findShippedConfigDir(std::string_view                            subdir,
     // each form keeps its own reach while the ORDER of the arms lives once.
 }
 
+// THE RESOLVED SYSTEM-INCLUDE DIRS — see the header for why this is the one
+// owner and what the three drifted copies did.
+//
+// ★ THE ANSWER IS COMPUTED ONCE PER CALL AND IS MEANT TO BE HOISTED BY THE
+// CALLER. Every entry costs a `findShippedConfigDir`, which reads the
+// environment and probes up to eight ancestor directories. The driver's
+// multi-TU build resolves ONCE for a whole `CuBuildKey` and hands the vector to
+// each unit rather than re-walking per source file — the answer is fixed for an
+// invocation (a language's `shippedLibDirs` and the config root are both), and
+// hoisting it is also one less piece of ambient filesystem state consulted from
+// inside a concurrent job.
+std::vector<std::filesystem::path> resolveSystemDirs(GrammarSchema const& grammar) {
+    std::vector<std::filesystem::path> out;
+    auto const&                        dirs = grammar.semantics().shippedLibDirs;
+    if (dirs.empty()) return out;
+    out.reserve(dirs.size());
+    std::error_code ec;
+    for (std::string const& sub : dirs) {
+        auto const resolved = findShippedConfigDir(sub);
+        if (!resolved) continue;   // fail loud downstream, not here
+        // Same idiom as the driver's `applyIncludeDirs`: on an `absolute`
+        // failure keep the RAW path rather than drop the dir — a dir the
+        // filesystem could not canonicalise is still more useful to the
+        // resolver than no dir at all.
+        std::filesystem::path const abs = std::filesystem::absolute(*resolved, ec);
+        out.push_back(ec ? *resolved : abs);
+        ec.clear();
+    }
+    return out;
+}
+
 } // namespace dss

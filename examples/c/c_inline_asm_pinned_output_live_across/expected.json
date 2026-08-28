@@ -1,0 +1,21 @@
+{
+  "$comment": "D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED — the runnable half of the invariant the register allocator's forbidden set depends on. The allocator excludes `inputs ∪ clobbered` and deliberately OMITS outputs; that omission is sound for the instruction's OWN operands (it reads them before it writes) but says NOTHING about a value that merely lives ACROSS the instruction. What protects a crossing value is a separate invariant — every output is also a declared clobber — enforced by the `.target.json` loader for the per-OPCODE carrier and by `LirBuilder::regConstraintPoolAdd` for the per-INSTRUCTION carrier an `__asm__` statement fills. Here the template pins BOTH outputs (`\"=a\"`, `\"=d\"`) and fourteen unrelated values are live across it. ✔MEASURED 2026-08-27 on x86_64:pe64-x86_64-windows-exec with the lowering's output→clobber normalization and both of its fail-loud layers removed: baseline exit 42 (GREEN) and release exit 3 (RED — the crossing sum came back wrong, rc=0 and no diagnostic). ★★ THE `release` ARM IS THE ONLY ARM THAT REDDENS, AND THAT IS MEASURED: at baseline the fourteen values are memory-resident and the mutant's artifact is BYTE-IDENTICAL to the clean one, the same asymmetry `c_inline_asm_operands` records for a different mutant. ⛔ Do not drop the release arm as redundant. ⚠ The `volatile` seed is load-bearing: each `dss_seed + k` is a volatile READ, so the fourteen values can be neither folded nor recomputed after the block and must occupy registers, which is what puts them in the allocator's way. ⚠ FOURTEEN, not two — the count is what creates the pressure that makes the allocator reach for %rax and %rdx at all. ⚠ x86_64 ONLY, and for a CONFIG reason rather than a convenience one: a pinned output needs a constraint letter that BINDS A NAMED REGISTER, and `arm64.target.json` declares only class- and form-bound letters (r/w/m/i), so no aarch64 asm statement can populate the per-instruction OUTPUT carrier this example pins. The `#error` arm in main.c says so and will fire the day that changes. Precedent: `c_inline_asm_subnative_operand` and `c_inline_asm_width_and_direction` are x86_64-only for the same kind of reason. ★ The template writes CONSTANTS rather than reading a counter, unlike `c_inline_asm_extended`'s rdtsc: that shape cannot assert what its outputs HOLD, so a corruption BETWEEN the two pinned output registers is invisible to it — here `lo` must be 11 and `hi` must be 22, and the exit code says which half broke.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

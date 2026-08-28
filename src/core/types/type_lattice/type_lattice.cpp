@@ -1139,6 +1139,174 @@ bool TypeInterner::fnIsVariadic(TypeId id) const {
     return sc.size() >= 2 && sc[1] != 0;
 }
 
+// ── THE OBJECT-REPRESENTATION PROJECTION (D-CSUBSET-NULLPTR-T-DECLARABLE) ──
+//
+// See the header for the contract. Three things about the SHAPE of this function
+// are load-bearing and are stated here because they are what a future reader is
+// most likely to undo:
+//
+// ★ THE SWITCH HAS NO `default:` ARM, DELIBERATELY — the `isPrimitiveTypeKind`
+//   idiom. Project-wide `-Werror=switch` / MSVC C4062 then makes a NEW TypeKind
+//   fail the build here until somebody decides whether its identity and its
+//   representation coincide. A `default: return id` would silently answer "they
+//   coincide" for every future kind, which is exactly how a semantic-only kind
+//   reaches MIR again.
+//
+// ★ IT RETURNS `id` ITSELF WHENEVER NOTHING MOVED, and never interns on that
+//   path. That is what makes the query free for the ~100% of types that have no
+//   `nullptr_t` anywhere inside them, and it is also what makes applying it at a
+//   type-entry point a PROVABLY behaviour-preserving edit for every program that
+//   does not mention `nullptr_t`: the TypeId that comes out is the same object
+//   that went in, bit for bit.
+//
+// ★ IT STOPS AT NOMINAL TYPES. Rebuilding a Struct/Union/Enum would MINT A
+//   DIFFERENT TYPE (nominal identity is part of their content), so a `nullptr_t`
+//   MEMBER keeps its declared type on the composite and is projected where the
+//   member is ACCESSED instead. The layout tier needs no help there — the
+//   `scalarByteSize` NullptrT arm already sizes it as a pointer, which is the same
+//   answer the projection gives.
+TypeId TypeInterner::representationType(TypeId id) {
+    if (!id.valid()) return id;
+    // A QUALIFIER SKIN is transparent to `kind()`, so it has to be peeled and
+    // RE-APPLIED explicitly. Projecting through it and returning the bare material
+    // type would silently drop `volatile`/`_Atomic` from a `volatile nullptr_t`
+    // object — the loss-of-qualifier miscompile `qualified()`'s own "never DROPS a
+    // bit" note exists to prevent, arriving by a different door.
+    if (std::int64_t const bits = qualifierBits(id); bits != 0) {
+        TypeId const material  = stripVolatile(id);
+        TypeId const projected = representationType(material);
+        return projected.v == material.v ? id : qualified(projected, bits);
+    }
+    switch (kind(id)) {
+        // ★ THE ONE KIND WHOSE IDENTITY AND REPRESENTATION DIFFER, and the reason
+        // the kind exists at all. C23 §6.2.5: `nullptr_t` is an OBJECT type with
+        // exactly one value, whose size, alignment and REPRESENTATION are those of
+        // `void *`. The semantic tier needs it distinct (`_Generic(nullptr,
+        // typeof(nullptr): …)` must not select the `void *` arm — ✔MEASURED against
+        // gcc 13.3.0 and clang 18.1.3, both select the nullptr_t arm), and every
+        // tier below needs a pointer. This is the same division of labour the
+        // Enum→underlying and `_BitInt(N)`→container projections already draw; it
+        // is drawn one tier higher here because MIR's own vocabulary refuses the
+        // kind (`I_NullptrTypeInMir`, and `mir_text`'s table omits it as a stated
+        // CONTRACT), so the projection has to land before MIR rather than at LIR.
+        case TypeKind::NullptrT:
+            return pointer(primitive(TypeKind::Void));
+
+        // ── THE STRUCTURAL COMPOSERS — rebuild ONLY when the element moved ──
+        // These three are the whole C surface that can carry a `nullptr_t` inside
+        // a type without a nominal boundary: `nullptr_t *`, `nullptr_t [N]`, and a
+        // function taking/returning one.
+        // ⚠⚠ EVERY ARM BELOW COPIES THE OPERANDS AND SCALARS OUT *BEFORE* IT
+        // RECURSES, and that is not style — it is the
+        // D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD contract. `operands()` /
+        // `scalars()` / `fnParams()` hand back VIEWS into the interner's pools, and
+        // the recursive call may INTERN a projected element, which reallocates
+        // them. Reading the view after that is a heap-use-after-free.
+        // ✔MEASURED while writing this: the first draft held `auto const ops =
+        // operands(id)` across `representationType(ops[0])` and the guard fired
+        // (`stale operand/scalar span read`) the moment `nullptr_t *` was
+        // projected — a shape no C source can reach today, so ONLY the synthetic
+        // pin in `tests/hir/test_type_representation_projection.cpp` could see it.
+        case TypeKind::Ptr: {
+            auto const ops = operands(id);
+            if (ops.empty()) return id;
+            TypeId const elem = ops[0];             // copy OUT before interning
+            TypeId const e    = representationType(elem);
+            return e.v == elem.v ? id : pointer(e);
+        }
+        case TypeKind::Array: {
+            auto const ops = operands(id);
+            auto const sc  = scalars(id);
+            if (ops.empty() || sc.empty()) return id;
+            TypeId const       elem = ops[0];       // copy OUT before interning
+            // The length scalar travels VERBATIM — including the negative
+            // sentinels (`kIncompleteArrayLength` -1, `kVlaLength` -2). Rebuilding
+            // through `array()` with the raw scalar preserves an incomplete or
+            // variable-length array's kind exactly; reading it as a count would
+            // turn a flexible-array member into a 0-element array.
+            std::int64_t const len  = sc[0];
+            TypeId const       e    = representationType(elem);
+            return e.v == elem.v ? id : array(e, len);
+        }
+        case TypeKind::FnSig: {
+            // Snapshot the scalar-pool facts first, as VALUES: everything below
+            // recurses, and a retained view would be the stale read above.
+            std::int64_t ccScalar = 0;
+            {
+                auto const sc = scalars(id);
+                if (sc.empty()) return id;  // no cc scalar — malformed; stay loud
+                ccScalar = sc[0];
+            }
+            bool const     isVarArgs  = fnIsVariadic(id);
+            TypeId const   srcResult  = fnResult(id);
+            std::size_t const nParams = fnParams(id).size();
+            // ★ TWO PASSES, AND THE FIRST ALLOCATES NOTHING. This query runs at
+            // every type-entry point in the HIR lowering — `nameRefExpr` reaches
+            // it once per identifier, so every function NAME in every translation
+            // unit lands here — and for a signature with no `nullptr_t` inside it
+            // the answer is "unchanged". A single-pass rebuild heap-allocates the
+            // parameter list on that path just to hand back the TypeId it was
+            // given, which is a per-identifier allocation added to every compile.
+            bool moved = representationType(srcResult).v != srcResult.v;
+            for (std::size_t i = 0; !moved && i < nParams; ++i) {
+                TypeId const p = fnParams(id)[i];   // a FRESH view per probe
+                moved = representationType(p).v != p.v;
+            }
+            if (!moved) return id;
+            // PASS 2 — rebuild. Reached only by a signature that really moved.
+            std::vector<TypeId> projected;
+            projected.reserve(nParams);
+            for (std::size_t i = 0; i < nParams; ++i)
+                projected.push_back(representationType(fnParams(id)[i]));
+            // The 4-arg overload with the DECODED variadic flag reproduces the
+            // original scalar encoding exactly (non-variadic → the 1-slot legacy
+            // form), so a projected signature differs from its source in the
+            // param/result types and in nothing else.
+            return fnSig(projected, representationType(srcResult),
+                         static_cast<CallConv>(ccScalar), isVarArgs);
+        }
+
+        // ── IDENTITY, and each group has a reason ──
+        // The scalar leaves: identity IS representation for every one of them.
+        case TypeKind::Bool:
+        case TypeKind::I8:   case TypeKind::I16:  case TypeKind::I32:
+        case TypeKind::I64:  case TypeKind::I128:
+        case TypeKind::U8:   case TypeKind::U16:  case TypeKind::U32:
+        case TypeKind::U64:  case TypeKind::U128:
+        case TypeKind::F16:  case TypeKind::F32:  case TypeKind::F64:
+        case TypeKind::F80:  case TypeKind::F128:
+        case TypeKind::Char: case TypeKind::Byte: case TypeKind::Void:
+        case TypeKind::BitInt:                    // width tier projects it at LIR
+        // NOMINAL composites — rebuilding mints a DIFFERENT type (see the ★ note
+        // above); a `nullptr_t` field is projected at its ACCESS site.
+        case TypeKind::Struct: case TypeKind::Union: case TypeKind::Enum:
+        // Kinds no C declaration can wrap around a `nullptr_t`. They fall here
+        // by being WRITTEN OUT rather than by a `default:` arm, which is the
+        // whole point of the no-default switch: a NEW enumerator gets a build
+        // error until somebody decides which side it belongs on, instead of
+        // silently answering "identity is representation" and letting a
+        // semantic-only kind reach MIR through it.
+        case TypeKind::Tuple:    case TypeKind::Slice:
+        case TypeKind::Vector:   case TypeKind::Matrix:
+        case TypeKind::Ref:      case TypeKind::FnPtr:
+        case TypeKind::Nullable: case TypeKind::Optional:
+        case TypeKind::Param:    case TypeKind::Bind:
+        case TypeKind::Complex:
+        // An Extension type is refused outright one tier down
+        // (`I_ExtensionTypeInMir`), so projecting it would only change WHICH loud
+        // message the user gets.
+        case TypeKind::Extension:
+        // Transparent here: a qualifier skin was already peeled above, so `kind()`
+        // can only report this for a malformed record.
+        case TypeKind::VolatileQual:
+        case TypeKind::Count_:
+            return id;
+    }
+    // Out-of-range-ordinal backstop only (an enum switch is not exhaustive for
+    // control-flow purposes) — mirrors `isPrimitiveTypeKind`'s tail.
+    return id;
+}
+
 namespace {
 
 // Integer-rank (C99 §6.3.1.1). Bool < Char/I8/U8 < I16/U16 < I32/U32 < I64/U64

@@ -16,13 +16,13 @@
     { "name": "_CALL_REPORTFAULT", "variants": [{ "when": { "format": "pe" }, "value": 2, "type": "i32" }] }
   ],
   "macros": [
-    { "name": "atexit", "variants": [
+    { "name": "atexit", "availableObjectFormats": ["elf", "pe"], "variants": [
       { "when": { "format": "elf" }, "params": ["f"], "replacement": "__cxa_atexit((void (*)(void *))(f), 0, 0)" },
       { "when": { "format": "pe" }, "replacement": "_crt_atexit" }
     ] },
-    { "name": "strtoll", "variants": [{ "when": { "format": "pe" }, "replacement": "_strtoi64" }] },
-    { "name": "_fmode",   "variants": [{ "when": { "format": "pe" }, "replacement": "(*__p__fmode())" }] },
-    { "name": "_environ", "variants": [{ "when": { "format": "pe" }, "replacement": "(*__p__environ())" }] }
+    { "name": "strtoll", "availableObjectFormats": ["pe"], "variants": [{ "when": { "format": "pe" }, "replacement": "_strtoi64" }] },
+    { "name": "_fmode",   "availableObjectFormats": ["pe"], "variants": [{ "when": { "format": "pe" }, "replacement": "(*__p__fmode())" }] },
+    { "name": "_environ", "availableObjectFormats": ["pe"], "variants": [{ "when": { "format": "pe" }, "replacement": "(*__p__environ())" }] }
   ],
   "symbols": [
     { "name": "strtoll",  "signature": "fn(ptr<char>, ptr<ptr<char>>, i32) -> i64", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },

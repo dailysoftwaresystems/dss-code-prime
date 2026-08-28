@@ -122,7 +122,14 @@ std::string frameMessage(std::string_view body) {
     return std::format("Content-Length: {}\r\n\r\n{}", body.size(), body);
 }
 
-std::int64_t tryParseFramedMessage(std::string_view input, std::string& outBody) {
+FrameScan scanFramedMessage(std::string_view input, std::string& outBody) {
+    constexpr FrameScan kMalformed{FrameScanState::MalformedHeader, 0, 0};
+    // `bytesNeeded == 0` on an Incomplete scan is the "not yet knowable"
+    // answer: the separator has not arrived, so nothing can be said about
+    // the body's size. The reader's contract for that case is in the
+    // header — take one byte and ask again.
+    constexpr FrameScan kNeedHeaderBytes{FrameScanState::Incomplete, 0, 0};
+
     // Find the header/body separator. LSP §6.1 mandates `\r\n\r\n`
     // but some clients emit just `\n\n` — accept both.
     auto headerEnd = input.find("\r\n\r\n");
@@ -131,9 +138,15 @@ std::int64_t tryParseFramedMessage(std::string_view input, std::string& outBody)
         headerEnd = input.find("\n\n");
         sepLen    = 2;
         if (headerEnd == std::string_view::npos) {
-            return 0; // incomplete frame; caller reads more bytes
+            // A header that is already longer than any header can be is a
+            // peer that will never terminate one. Refuse LOUDLY rather than
+            // keep buffering: the caller's alternative is unbounded growth
+            // with no error it could ever report.
+            if (input.size() > kMaxFrameHeaderBytes) return kMalformed;
+            return kNeedHeaderBytes; // incomplete frame; caller reads more bytes
         }
     }
+    if (headerEnd > kMaxFrameHeaderBytes) return kMalformed;
 
     // Parse the headers. Only `Content-Length` is required; other
     // headers are tolerated and ignored.
@@ -160,7 +173,7 @@ std::int64_t tryParseFramedMessage(std::string_view input, std::string& outBody)
                     contentLength = n;
                     gotLength     = true;
                 } else {
-                    return -1; // malformed Content-Length
+                    return kMalformed; // malformed Content-Length
                 }
             }
         }
@@ -170,14 +183,33 @@ std::int64_t tryParseFramedMessage(std::string_view input, std::string& outBody)
               ? eol + 2
               : eol + 1;
     }
-    if (!gotLength) return -1; // header without Content-Length
+    if (!gotLength) return kMalformed; // header without Content-Length
 
     const auto bodyStart = headerEnd + sepLen;
-    if (input.size() < bodyStart + contentLength) {
-        return 0; // body not fully arrived; caller reads more bytes
+    const auto frameEnd  = bodyStart + contentLength;
+    if (input.size() < frameEnd) {
+        // The EXACT remainder. This is the number the transport reads,
+        // and the whole reason a fixed chunk size was wrong: a reader
+        // that asks a blocking stream for more than this waits for bytes
+        // the peer has no reason to send.
+        return FrameScan{FrameScanState::Incomplete, 0,
+                         frameEnd - input.size()};
     }
     outBody.assign(input.data() + bodyStart, contentLength);
-    return static_cast<std::int64_t>(bodyStart + contentLength);
+    return FrameScan{FrameScanState::Complete, frameEnd, 0};
+}
+
+std::int64_t tryParseFramedMessage(std::string_view input, std::string& outBody) {
+    const auto scan = scanFramedMessage(input, outBody);
+    switch (scan.state) {
+        case FrameScanState::Complete:
+            return static_cast<std::int64_t>(scan.consumed);
+        case FrameScanState::MalformedHeader:
+            return -1;
+        case FrameScanState::Incomplete:
+            break;
+    }
+    return 0;
 }
 
 } // namespace dss::lsp

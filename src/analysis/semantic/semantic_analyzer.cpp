@@ -910,6 +910,17 @@ selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
 // scope lookup but literal leaves only via the typeAt stamps Pass 2 writes).
 void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                       Tree const& tree, NodeId node);
+// D-CSUBSET-TYPEOF-VALUE-FORM-RESOLVES-ONLY-FOR-AN-OBJECT-OPERAND: the ONE
+// pre-stamp walk over an expression subtree's literal leaves, feeding the ONE
+// literal-typing chokepoint above. EXTRACTED (2026-08-27, P42) from the FC17.5
+// `auto` inference arm, which was its sole caller, the moment a SECOND Pass-1.5
+// `subtreeType` caller — the `typeof(<expression>)` arm — was found to need the
+// identical preparation. Two copies of this walk would be two places that can
+// disagree about which leaves a Pass-1.5 type query can see; the whole defect
+// this closes is what the ABSENCE of one of them looks like. See the definition
+// beside `typeLiteralIfAny` for why Pass 1.5 needs it at all.
+void preStampLiteralLeaves(EngineState& s, SemanticConfig const& cfg,
+                           Tree const& tree, NodeId root);
 // Core operator NAME → HirOpKind (reverse of opName()); std::nullopt if the
 // `target` string is a special tag (AddressOf/…), not a core op. Defined below;
 // forward-declared so pass2Post's nullptr operator gate (D-CSUBSET-NULLPTR) can
@@ -1980,9 +1991,30 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         if (internals == 1) { probe = next; continue; }
                         break;
                     }
-                    // The operand subtree was already typed by the blanket Pass-2
-                    // walk (which emitted any S_Undeclared/S_TypeMismatch); read its
-                    // type on-demand — InvalidType cascades, no double-diagnostic.
+                    // D-CSUBSET-TYPEOF-VALUE-FORM-RESOLVES-ONLY-FOR-AN-OBJECT-OPERAND:
+                    // PRE-STAMP the operand's literal leaves through the ONE shared
+                    // walk before reading the subtree's type. This arm runs at Pass
+                    // 1.5 (every declaration HEAD resolves there), where the Pass-2
+                    // blanket stamps DO NOT EXIST YET — the same condition the
+                    // FC17.5 `auto` arm meets and prepares for, via this same
+                    // helper. Without it `subtreeType` sees an UNTYPED literal leaf,
+                    // so `typeof(1)` resolved to nothing and every position that
+                    // needs a resolved head refused (param / global / array /
+                    // pointer / typedef / return type / struct member), while a
+                    // scalar local with an initializer silently took the
+                    // INITIALIZER's type from the Pass-2 backfill instead — the
+                    // no-diagnostic `typeof(1) x = 3.9;`-is-a-`double` miscompile.
+                    // A MIXED operand was worse than a refusal too: `typeof(uc + 1)`
+                    // typed as `unsigned char` (the literal half contributed
+                    // nothing) where C 6.3.1.1 integer promotion makes it `int`.
+                    // Idempotent, so the Pass-2 walk over the same leaves is a
+                    // no-op; an out-of-range literal's S_IntegerLiteralTooLarge now
+                    // fires at the HEAD (suppressible ⇒ the Pass-2 re-visit
+                    // collapses in the reporter's recent-duplicate window).
+                    preStampLiteralLeaves(s, cfg, tree, operandNode);
+                    // Read the operand subtree's type on-demand — Pass 2's blanket
+                    // walk emits any S_Undeclared/S_TypeMismatch, and InvalidType
+                    // cascades here, so there is no double-diagnostic.
                     raw = subtreeType(s, tree, operandNode, scope);
                 }
                 if (!raw.valid()) {
@@ -2530,8 +2562,16 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                 break;  // the single sizeof form
             }
             if (!sized.valid()) return std::nullopt;
-            auto const layout = computeLayout(sized, s.lattice.interner(),
-                                              *s.aggregateLayout, s.dataModel);
+            // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: `sizeof` asks the
+            // OPERAND question, not the object one, so this fold routes through
+            // `operandLayout` — identical to `computeLayout` for every type with a
+            // layout, plus the dialect's declared size for `void` / a function
+            // type. THE SAME query the MIR `SizeOf` case uses, which is what keeps
+            // `_Static_assert(sizeof(void) == 1)` and `char a[sizeof(void) * 4]`
+            // agreeing with the runtime fold instead of the two tiers drifting.
+            auto const layout = operandLayout(sized, s.lattice.interner(),
+                                              *s.aggregateLayout, s.dataModel,
+                                              cfg->nonObjectTypeSizes);
             if (!layout) return std::nullopt;
             return layout->size;
         };
@@ -2583,8 +2623,14 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                 break;  // the single alignof form
             }
             if (!queried.valid()) return std::nullopt;
-            auto const layout = computeLayout(queried, s.lattice.interner(),
-                                              *s.aggregateLayout, s.dataModel);
+            // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the OPERAND question, the
+            // same one `sizeof` asks above — `_Alignof(void)` is 1 on both
+            // references (MEASURED), and it falls out of the `{size = declared,
+            // align = 1}` layout `operandLayout` synthesizes rather than needing an
+            // alignment rule of its own.
+            auto const layout = operandLayout(queried, s.lattice.interner(),
+                                              *s.aggregateLayout, s.dataModel,
+                                              cfg->nonObjectTypeSizes);
             if (!layout) return std::nullopt;
             return layout->align.bytes();
         };
@@ -2649,15 +2695,23 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                 // hazard `bitIntOperandType` orders its checks against). The 128-bit
                 // Cast arm keys on `intBits == 128` and mints an I128/U128 core.
                 //   ★ NO TRUNCATION IS OPENED BY THIS — MEASURED, and this is the
-                // load-bearing safety property: the folded value rides a 128-bit
-                // `BitIntValue`, and BOTH 64-bit ICE slots reject that width rather
-                // than narrow it. `asInt64` (const_eval_arith.hpp) nullopts for
-                // `width() > 64`, so `asInt64Bridge` — the array-dimension /
-                // static-assert / enumerator bridge — fails loud, and the generic
-                // `isInteger` narrowing arm below is never reached for a wide operand
-                // for the same reason. That is byte-for-byte the behaviour
-                // `_BitInt(128)` has shipped with since C4b: `int a[(_BitInt(128))5];`
-                // MEASURED S_NonConstantArrayLength, never a truncated bound.
+                // load-bearing safety property. ⚠ THE RULE IS THE VALUE'S MAGNITUDE,
+                // NOT ITS DECLARED WIDTH — it was width until P42 closed
+                // [[D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE]], and a rationale
+                // that has gone false is worse than none. The folded value rides a
+                // 128-bit `BitIntValue`, and `asInt64` (const_eval_arith.hpp) bridges
+                // it to the 64-bit ICE slots IFF `INT64_MIN <= value <= INT64_MAX`;
+                // anything outside that range nullopts, so `asInt64Bridge` — the
+                // array-dimension / static-assert / enumerator bridge — fails loud
+                // rather than narrowing, and the generic `isInteger` narrowing arm
+                // below is never reached for an out-of-range operand for the same
+                // reason. `_BitInt(128)` obeys the identical rule (one predicate, both
+                // 128-bit families): `int a[(_BitInt(128))5];` ACCEPTS at 5, while
+                // `int a[((__int128)1 << 100) + 3];` MEASURED S_NonConstantArrayLength
+                // — and THAT is the cell that proves it, because 2^100+3 has low 64
+                // bits of exactly 3, so a truncating fold would have built a silent
+                // `int a[3]` instead of refusing. Pinned by
+                // `SemanticAnalyzerC.Int128WideConstantNeverTruncatesIntoA64BitSlot`.
                 case TypeKind::I128: t.isInteger=true; t.intBits=128; t.intSigned=true;  break;
                 case TypeKind::U128: t.isInteger=true; t.intBits=128; t.intSigned=false; break;
                 // C23 6.3.1.3 (D-CSUBSET-BITINT-CONSTFOLD-LARGE, C4b): a cast TO
@@ -4344,10 +4398,14 @@ extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
 // UNKNOWN names: a C23 `[[...]]` clause matching NO row emits the SUPPRESSIBLE
 // Warning S_UnknownAttribute — but ONLY when `emitUnknown` (the once-per-
 // declaration Pass-1.5 site + the bare-statement Pass-2 arm; a re-scan must
-// not double-fire). The GNU form NEVER warns here: its unknown names keep the
-// pre-existing loud gates (file-scope H_UnknownLinkageSpecifier at the HIR
-// linkage scan; the block-scope wholesale-ignore is the named deferral
-// D-CSUBSET-ATTRIBUTE-GNU-BLOCK-SCOPE-UNKNOWN-NAME).
+// not double-fire). The GNU form reaches the SAME chokepoint (see the three-way
+// decision inside `foldClause`): its name is tested against BOTH attribute
+// vocabularies, the HIR linkage tier keeps the verdict for the rows it actually
+// validates, and what is left is this row's `unknownStrictAttributeIsError`
+// Error or the same suppressible Warning the C23 form uses.
+// ⚠ THIS COMMENT PREVIOUSLY READ "The GNU form NEVER warns here", and that had
+// stopped being true of the code it describes — the exact rot that made the
+// dropped-message read look correct on review (D-CSUBSET-GNU-DEPRECATED-MESSAGE-SILENTLY-DROPPED).
 // The GNU `aligned(N)` arm folds its operand through the SHARED alignment ladder,
 // which is DEFINED below this TU point (it sits with the alignas machinery it was
 // extracted from) — forward-declare it, the same way `constIntExpr` is.
@@ -4355,11 +4413,85 @@ extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
 foldAlignmentOperand(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                      NodeId argNode, NodeId diagNode, ScopeId fromScope);
 
+// D-CSUBSET-STRICT-ATTRIBUTE-GATE-BLIND-TO-LINKAGE-VOCABULARY — THE MEMBERSHIP
+// HALF. "Does this language MODEL this attribute name AT ALL?", answered over
+// BOTH of the disjoint vocabularies a declaration may legitimately carry:
+//
+//   • the SEMANTIC one — `semantics.attributeSemantics.effects` (the caller has
+//     already asked it: a null `AttributeClause::row` IS that table's miss);
+//   • the LINKAGE one — every declaration row's `linkageSpecifiers` KEYS plus
+//     its `linkageSpecifierIgnoredNames`, which is where `weak` and `visibility`
+//     live and which no consumer of the effects table can see.
+//
+// ★★ THE UNION IS LANGUAGE-WIDE, NOT PER-DECLARATION-ROW, AND THAT IS A
+// CORRECTION MEASURED RATHER THAN A WIDENING CHOSEN. The row that named this
+// defect prescribed "the row's effects table AND **its** linkage vocabulary".
+// ✔MEASURED: a PER-ROW union closes nothing, because the rows whose gate is
+// strict declare NO linkage vocabulary at all (`typedefDecl`, `structSpec`,
+// `unionSpec`, `enumSpec`, `structField`, `unionField` — all empty), and the
+// one row that DOES carry `weak`/`visibility` (`topLevelDecl`) never reaches
+// this gate. Per-row, `typedef __attribute__((weak)) int T;` stays a loud
+// S0031 — which BOTH gcc 13.3 (`-std=c2x`) and clang 18 (`-std=c23`) compile
+// with a warning and exit 0, i.e. DSS would still be REFUSING legal C.
+//
+// The two questions are deliberately separated: whether the language KNOWS a
+// name is a language-level fact; whether the name may APPERTAIN to this
+// declarator is the decl-kind gate's question
+// (`S_AttributeIgnoredForDeclarationKind`), which has its own config key.
+// Collapsing them into one lookup is what produced the blindness.
+//
+// Names are compared dunder-normalized (`stripDunder`), and a COMPOSITE linkage
+// key (`visibility:hidden`) contributes its NAME segment only — the same two
+// normalizations `linkageSpecifierIgnoredNames` and the composite key scan
+// already apply, so this reader cannot disagree with the tier it mirrors.
+[[nodiscard]] bool
+languageModelsAttributeName(SemanticConfig const& cfg, std::string_view name) {
+    for (DeclarationRule const& d : cfg.declarations) {
+        for (std::string const& ig : d.linkageSpecifierIgnoredNames)
+            if (name == stripDunder(ig)) return true;
+        for (auto const& [key, unusedEffect] : d.linkageSpecifiers) {
+            // The composite key's IDENTIFIER half — split by the shared
+            // `linkageSpecifierBaseName`, which the loader's attribute-vocabulary
+            // drift cross-check also reads. Two readers, one definition of where
+            // a composite key's name ends.
+            if (name == stripDunder(linkageSpecifierBaseName(key))) return true;
+        }
+    }
+    return false;
+}
+
+// D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY — THE OWNERSHIP HALF. "Does the HIR
+// LINKAGE tier judge unknown attribute NAMES for declarations of this row?"
+//
+// A declaration whose row carries a linkage vocabulary AND does not skip the
+// GNU attribute rule wholesale has every clause name of that form validated by
+// `linkageFrom`, which fails loud H_UnknownLinkageSpecifier on a miss
+// (`topLevelDecl`, `externDecl`). A row that lists `attrSpecRule` in
+// `linkageSpecifierIgnoredRules` (`varDecl`, `autoInferredVarDecl`) or declares
+// no linkage at all (`typedefDecl`, the composites, the members, `param`) is
+// invisible to that tier, so the semantic tier is the ONLY place the name can
+// be judged.
+//
+// ★ THIS IS WHAT KEEPS ONE TYPO FROM BEING REPORTED TWICE UNDER TWO CODES —
+// the concern the blind-gate row raised against simply enabling the gate
+// everywhere. It is DERIVED from config that already exists rather than from a
+// second opt-in key, so the two tiers cannot drift into both claiming a name or
+// neither claiming it.
+[[nodiscard]] bool
+linkageTierJudgesAttributeNames(SemanticConfig const& cfg,
+                                DeclarationRule const& decl) {
+    if (decl.linkageSpecifiers.empty()) return false;
+    if (!cfg.attrSpecRule.valid()) return false;
+    for (RuleId r : decl.linkageSpecifierIgnoredRules)
+        if (r.v == cfg.attrSpecRule.v) return false;
+    return true;
+}
+
 void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                             Tree const& tree, NodeId startNode,
                             bool emitUnknown, AttributeSemanticsFacts& out,
                             ScopeId fromScope = {},
-                            bool strictUnknownIsError = false) {
+                            DeclarationRule const* owningDecl = nullptr) {
     if (!startNode.valid()) return;
     if (cfg.attributeEffects.empty()) return;
     if (!cfg.attrSpecRule.valid() && !cfg.stdAttrRule.valid()) return;
@@ -4393,10 +4525,50 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
             // The C23 `[[...]]` path is untouched: C23 REQUIRES an unknown
             // standard attribute to be ignorable, so it keeps its suppressible
             // S_UnknownAttribute Warning above and never reaches here.
-            if (!fromStdForm && emitUnknown && strictUnknownIsError) {
+            //
+            // ★★ THE THREE-WAY DECISION BELOW IS THE ONE CHOKEPOINT for
+            // "an unrecognized GNU attribute name on a declaration", and each
+            // arm answers a DIFFERENT question rather than restating a roster:
+            //
+            //   1. MEMBERSHIP (D-CSUBSET-STRICT-ATTRIBUTE-GATE-BLIND-TO-LINKAGE-VOCABULARY)
+            //      — a name the LINKAGE vocabulary carries is MODELLED by this
+            //      language even though the effects table misses it. Reporting
+            //      it as unknown is a REFUSAL OF LEGAL C, and a gate that
+            //      refuses valid C is worse than the silence it replaces.
+            //      ✔MEASURED, gcc 13.3 `-std=c2x` and clang 18 `-std=c23`
+            //      separately, `-Wall -Wextra`: `typedef
+            //      __attribute__((weak)) int T;` and the `visibility("hidden")`
+            //      twin each compile with a warning and exit 0 on BOTH, while
+            //      DSS exited 1 with `error[S0031]`.
+            //   2. OWNERSHIP (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY) — when
+            //      the HIR linkage tier already validates this row's GNU clause
+            //      names, it owns the verdict and this tier stays silent, so one
+            //      typo is never reported twice under two codes.
+            //   3. SEVERITY — the row's own `unknownStrictAttributeIsError`
+            //      opt-in, unchanged, else the SUPPRESSIBLE Warning the C23 form
+            //      already uses for exactly this fact.
+            //
+            // ★ ARM 3's WARNING IS WHAT CLOSES
+            // D-CSUBSET-BLOCK-SCOPE-UNKNOWN-ATTRIBUTE-SILENT, and it is a
+            // WARNING on measured grounds, not on preference: at BLOCK scope
+            // `__attribute__((cleanup(f)))`, `__attribute__((section("s")))` and
+            // `__attribute__((used))` are all accepted with NO diagnostic by
+            // gcc AND clang (✔MEASURED, each compiler separately) and are all
+            // accepted by DSS today, so promoting this arm to an Error would
+            // newly REJECT three real GNU attributes to catch one typo. The
+            // strict posture stays available through `--warnings-as-errors`,
+            // exactly as it does for the decl-kind gate.
+            if (!fromStdForm && emitUnknown
+                && !languageModelsAttributeName(cfg, clause->name)
+                && !(owningDecl != nullptr
+                     && linkageTierJudgesAttributeNames(cfg, *owningDecl))) {
+                bool const strict = owningDecl != nullptr
+                                    && owningDecl->unknownStrictAttributeIsError;
                 ParseDiagnostic d;
-                d.code     = DiagnosticCode::S_UnknownTypeAttribute;
-                d.severity = DiagnosticSeverity::Error;
+                d.code     = strict ? DiagnosticCode::S_UnknownTypeAttribute
+                                    : DiagnosticCode::S_UnknownAttribute;
+                d.severity = strict ? DiagnosticSeverity::Error
+                                    : DiagnosticSeverity::Warning;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(clauseNode);
                 d.actual   = std::string{tree.text(clauseNode)};
@@ -4611,8 +4783,16 @@ foldAlignmentOperand(EngineState& s, SemanticConfig const& cfg, Tree const& tree
         if (!s.aggregateLayout.has_value()) {
             emit(DiagnosticCode::S_AlignasNonConstant); return std::nullopt;
         }
-        auto const layout = computeLayout(queried, s.lattice.interner(),
-                                          *s.aggregateLayout, s.dataModel);
+        // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: `alignas(T)` asks the same
+        // OPERAND question `_Alignof(T)` does, and MEASURED it must — gcc 13.3.0
+        // (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed SEPARATELY, both
+        // BUILD AND RUN `_Alignas(void) char b[4];`. Reading the object layout
+        // here would have left `_Alignof(void)` folding to 1 while
+        // `_Alignas(void)` stayed S_AlignasNonConstant — one extension answering
+        // itself two ways.
+        auto const layout = operandLayout(queried, s.lattice.interner(),
+                                          *s.aggregateLayout, s.dataModel,
+                                          cfg.nonObjectTypeSizes);
         if (!layout) { emit(DiagnosticCode::S_AlignasNonConstant); return std::nullopt; }
         value = static_cast<std::int64_t>(layout->align.bytes());
     } else {
@@ -4882,13 +5062,72 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     continue;   // honored (or already diagnosed) — never "unknown"
                 }
             }
-            if (strict && !stdForm && emitDiagnostics) {
+            // ★★ D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY — THE SECOND SITE
+            // THAT WAS RESTATING A DRIFTED ROSTER. This arm's condition used to
+            // be `strict && !stdForm` ALONE, so it declared "unknown" any name
+            // that had not been consumed by one of the three arms above
+            // (`packed`, `warnOnUse`, `Align`) — even a name the language's own
+            // `attributeEffects` table MODELS. `extractOneAttrClause` has
+            // already resolved that table into `clause->row` for this very
+            // clause, so the answer was in hand and a second, narrower roster
+            // was consulted instead.
+            //
+            // ✔MEASURED, and every one of these is legal C that BOTH references
+            // accept (gcc 13.3 `-std=c2x` and clang 18 `-std=c23`, `-Wall
+            // -Wextra`, probed separately) while DSS exited 1 with
+            // `error[S0031]`:
+            //     struct __attribute__((unused))            S { int a; };  // both CLEAN
+            //     struct __attribute__((may_alias))         S { int a; };  // both CLEAN
+            //     struct __attribute__((cold))              S { int a; };  // both warn, rc=0
+            //     struct __attribute__((noreturn))          S { int a; };  // both warn, rc=0
+            //     struct __attribute__((nothrow))           S { int a; };  // both warn, rc=0
+            //     struct __attribute__((transparent_union)) S { int a; };  // both warn, rc=0
+            //     struct __attribute__((maybe_unused))      S { int a; };  // both warn, rc=0
+            // `may_alias` is the sharpest of them: it is a TYPE attribute whose
+            // whole purpose is to sit exactly here, and DSS refused the program.
+            //
+            // The membership question is now asked ONCE, of the same two
+            // vocabularies the declaration gate consults — the effects table
+            // (`clause->row`) and the language's LINKAGE vocabulary — so a name
+            // DSS declares it models can never be called unknown by one reader
+            // and known by another. A genuinely unmodelled name
+            // (`__attribute__((pakced))`) still fails loud, which is the typo
+            // protection this arm exists for.
+            //
+            // ★★ AND THE KNOWN-BUT-UNCONSUMED CASE IS **WARNED**, NEVER
+            // SILENTLY DROPPED. Trading a refusal for a silent drop would be the
+            // other half of the same mistake: a composite that reaches this
+            // point carries an attribute the language MODELS and this scan does
+            // NOT honor, which is precisely what
+            // `S_AttributeIgnoredForDeclarationKind` already says everywhere
+            // else — one code, one severity, and it is what BOTH references emit
+            // here (`-Wattributes` / `-Wignored-attributes`, exit 0). ⚠ The
+            // sharpest instance, named so it is not rediscovered:
+            // `union __attribute__((transparent_union)) U { … };` is CLEAN and
+            // HONORED on gcc and clang and is inert in DSS's `none` row, so it
+            // now warns rather than either erroring or vanishing.
+            if (strict && !stdForm && emitDiagnostics
+                && clause->row == nullptr
+                && !languageModelsAttributeName(cfg, id)) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::S_UnknownTypeAttribute;
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(cl);
                 d.actual   = std::string{tree.text(cl)};
+                s.reporter.report(std::move(d));
+            } else if (strict && !stdForm && emitDiagnostics
+                       && clause->row != nullptr) {
+                ParseDiagnostic d;
+                d.code = DiagnosticCode::S_AttributeIgnoredForDeclarationKind;
+                d.severity = DiagnosticSeverity::Warning;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(cl);
+                d.actual   = std::format(
+                    "attribute '{}' is ignored on this type definition and its "
+                    "effect was discarded: this language models the name but "
+                    "declares no effect that a struct, union or enum definition "
+                    "can carry", id);
                 s.reporter.report(std::move(d));
             }
         }
@@ -7388,10 +7627,11 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
 //      Pass-2 blanket stamps don't exist yet), then `subtreeType`;
 //   7. ★C3 normalize: Array→Ptr<element> + FnSig→Ptr<FnSig> DECAY (C
 //      6.3.2.1p3/p4 — `auto s = "str"` is char*, `auto f = fn` is a function
-//      pointer); REJECT LOUD Void (no object type) / NullptrT (semantic-tier
-//      -only — D-CSUBSET-NULLPTR-T-DECLARABLE) / invalid (incl. the
+//      pointer); REJECT LOUD Void (no object type) / invalid (incl. the
 //      self-reference `auto x = x;`, whose name resolves to the symbol being
-//      declared) — S_AutoInferenceInvalid; then stripVolatile (C23 6.7.9p2
+//      declared) — S_AutoInferenceInvalid. NullptrT is NOT rejected: it is a
+//      declarable object type since D-CSUBSET-NULLPTR-T-DECLARABLE landed (see
+//      the switch below). Then stripVolatile (C23 6.7.9p2
 //      drops top-level qualifiers; const never rides the type here — the row
 //      declares no constMarker, see its $comment).
 [[nodiscard]] TypeId
@@ -7592,24 +7832,11 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
         }
     }
 
-    // (6) PRE-STAMP the initializer subtree's literal leaves (bounded walk
-    // through the ONE shared literal-typing chokepoint — see typeLiteralIfAny;
-    // idempotent, and identical to what the Pass-2 blanket walk will stamp).
-    // A subtree beyond the guard leaves some literals unstamped → the
-    // inference below fails LOUD (never a silently-wrong type).
-    {
-        std::vector<NodeId> stack{valueNode};
-        for (int guard = 0; guard < 65536 && !stack.empty(); ++guard) {
-            NodeId c = stack.back(); stack.pop_back();
-            if (s.typeAt(c).valid()) continue;   // already stamped
-            typeLiteralIfAny(s, cfg, tree, c);
-            if (tree.kind(c) != NodeKind::Internal) continue;
-            // A rule-node stamp (the adjacent-string form) closes the subtree
-            // — mirror subtreeType's typeAt short-circuit, don't descend.
-            if (s.typeAt(c).valid()) continue;
-            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
-        }
-    }
+    // (6) PRE-STAMP the initializer subtree's literal leaves through the ONE
+    // shared walk (see preStampLiteralLeaves — the `typeof(<expression>)` arm
+    // is its other caller, and the two must prepare a Pass-1.5 `subtreeType`
+    // call identically or they disagree about which leaves that call can see).
+    preStampLiteralLeaves(s, cfg, tree, valueNode);
     TypeId inferred = subtreeType(s, tree, valueNode, here);
 
     // (7) ★C3 — normalize.
@@ -7629,17 +7856,20 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
                  "void type — there is no object type to declare: "
                      + snippet(initNode));
             return InvalidType;
-        case TypeKind::NullptrT:
-            // The predefined null-pointer constant's type is semantic-tier
-            // -only (it must never reach MIR — the 0xA014 tripwire); an
-            // object OF that type is the named deferral
-            // D-CSUBSET-NULLPTR-T-DECLARABLE.
-            emit(DiagnosticCode::S_AutoInferenceInvalid, initNode,
-                 "initializer-inferred declaration: the null-pointer "
-                 "constant's type is not a declarable object type here "
-                 "(initialize a concrete pointer type instead): "
-                     + snippet(initNode));
-            return InvalidType;
+        // ⓘ NO NullptrT ARM. It used to reject here, citing
+        // D-CSUBSET-NULLPTR-T-DECLARABLE — "an object of that type is a named
+        // deferral". That deferral LANDED (`examples/c/nullptr_t_object`
+        // declares, stores, copies, converts and sizes one end to end), so the
+        // reject became a gate on a capability that exists: `auto x = nullptr;`
+        // was refused S_AutoInferenceInvalid while gcc 13.3.0 (`-std=c2x`) and
+        // clang 18.1.3 (`-std=c23`), probed SEPARATELY, both compile and run
+        // it. A NullptrT inference now falls through to the ordinary
+        // declarator fold, exactly as the equivalent `typeof(nullptr) x =
+        // nullptr;` already did — ONE spelling of the type, ONE path.
+        // ★ The 0xA014 MIR tripwire is UNAFFECTED and still the backstop: it
+        // fires on a NullptrT that reaches MIR, and nothing does — the
+        // semantic→HIR boundary projects the type, for an inferred declaration
+        // by the same route as a written one.
         case TypeKind::Array: {
             // C 6.3.2.1p3 array-to-pointer decay: `auto s = "str";` is
             // char* (the ternary decayArray pattern).
@@ -7849,7 +8079,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                     scanAttributeSemantics(
                         s, cfg, tree, specifierPrefixChild(tree, node, decl),
                         /*emitUnknown=*/true, declAttrFacts, here,
-                        decl.unknownStrictAttributeIsError);
+                        /*owningDecl=*/&decl);
                     for (NodeId slot : visibleChildren(tree, node)) {
                         if (tree.kind(slot) != NodeKind::Internal) continue;
                         bool isSlot = false;
@@ -7858,8 +8088,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         if (!isSlot) continue;
                         scanAttributeSemantics(s, cfg, tree, slot,
                                                /*emitUnknown=*/true, declAttrFacts,
-                                               here,
-                                               decl.unknownStrictAttributeIsError);
+                                               here, /*owningDecl=*/&decl);
                     }
                     bool alignasHandledForDecl = false;
                     bool alignasBitfieldReported = false;
@@ -8157,6 +8386,88 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             // `T` member still lays out as a flexible array
                             // member, and the non-last / sole positions keep their
                             // own loud S_FlexibleArrayNotLast / SoleMember.
+                            //
+                            // D-CSUBSET-VOID-OBJECT-DECLARATION-ACCEPTED: the
+                            // THIRD incompleteness, and the one that was
+                            // SILENTLY MISSING. C 6.2.5p19 makes `void` "an
+                            // incomplete object type that cannot be completed",
+                            // so 6.7p7 forbids an object of it exactly as it
+                            // forbids the two above — but `void` is a PRIMITIVE
+                            // kind, not a composite or an array, so neither
+                            // predicate saw it. ✔MEASURED at P42 through the
+                            // shipped CLI: `void x;` compiled with only an
+                            // unused-variable `warning[S000A]`, `const void cv;`
+                            // and `typedef void V; V y;` with NO diagnostic at
+                            // all, and a file-scope `void g;` reached the LINK
+                            // tier and died `K_NoMatchingObjectFormat` inside
+                            // `lowerMirGlobalsToDataItems` — an internal message
+                            // with no source position, for a constraint
+                            // violation. gcc 13.3.0 (`-std=c2x`) and clang
+                            // 18.1.3 (`-std=c23`), probed SEPARATELY, reject all
+                            // four. ★ THIS ARM IS A HARD PREREQUISITE FOR
+                            // [[D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED]], not
+                            // merely an adjacent conformance fix: that row gives
+                            // `void` an OPERAND size of 1 (GNU C's rule, which
+                            // both references implement) so `void *p; p + 1;`
+                            // becomes byte arithmetic. `computeLayout` keeps
+                            // refusing `void`, so an object of it still has no
+                            // LAYOUT — but a tier that ever conflated the two
+                            // questions again would start silently ALLOCATING
+                            // these declarations instead of refusing them. This
+                            // arm makes the refusal a positioned SEMANTIC fact
+                            // that does not depend on the layout engine's answer.
+                            // `kind()` sees through the transparent qualifier
+                            // skin, so `const void` / `volatile void` are covered
+                            // by the same test; `extern void x;` stays admitted
+                            // by the `isExternDeclaration` exclusion above
+                            // (MEASURED: both references accept it — it declares
+                            // no object here); `int f(void)`, `void f(void){}`,
+                            // `(void)expr` and `void *p` are all untouched (a
+                            // parameter row carries no `requireNamedDeclarators`,
+                            // and a function is not `DeclarationKind::Variable`).
+                            // ★ THE FOURTH INCOMPLETENESS: AN ARRAY OF `void`.
+                            // D-CSUBSET-VOID-ARRAY-REFUSED-AT-THE-OBJECT-PRODUCER-NOT-THE-SEMANTIC-TIER
+                            //
+                            // C 6.7.6.2p1: *"The element type shall not be an
+                            // incomplete or function type."* `void a[3];` is a
+                            // COMPLETE array (it has a bound) of an element that
+                            // C 6.2.5p19 makes permanently incomplete, so none of
+                            // the three predicates above saw it.
+                            // ✔MEASURED 2026-08-27 (P42 lane AI) through the
+                            // shipped CLI on x86_64:pe64-x86_64-windows-exec,
+                            // alongside the six shapes this arm already covers:
+                            // `void a[3];` passed the SEMANTIC tier entirely and
+                            // died at the object producer as
+                            // `error[K_NoMatchingObjectFormat]` — a refusal, so
+                            // never a miscompile, but at the wrong tier, with no
+                            // source position, under a diagnostic about object
+                            // FORMATS. gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
+                            // (`-std=c23`), probed SEPARATELY, both reject it as
+                            // a declaration error.
+                            // ⚠ THE TEST IS `void`, NOT "incomplete", AND THE
+                            // NARROWNESS IS DELIBERATE: an array of an incomplete
+                            // STRUCT may be a file-scope TENTATIVE definition
+                            // that a later `struct S { … };` completes, which C
+                            // permits and both references accept. `void` is the
+                            // one element type that CANNOT be completed, so it
+                            // needs no such lookahead. Widening this to
+                            // `isIncompleteComposite` would reject legal C.
+                            auto const arrayElementIsVoid =
+                                [&](TypeId t) noexcept {
+                                    auto const& ti = s.lattice.interner();
+                                    if (!t.valid()
+                                        || ti.kind(t) != TypeKind::Array) {
+                                        return false;   // only an ARRAY declarator
+                                    }
+                                    while (t.valid()
+                                           && ti.kind(t) == TypeKind::Array) {
+                                        auto const ops = ti.operands(t);
+                                        if (ops.empty()) return false;
+                                        t = ops[0];
+                                    }
+                                    return t.valid()
+                                        && ti.kind(t) == TypeKind::Void;
+                                };
                             if (s.symbols.at(sym).kind
                                         == DeclarationKind::Variable
                                 && decl.requireNamedDeclarators
@@ -8164,7 +8475,11 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 && (s.lattice.interner()
                                         .isIncompleteComposite(declTy)
                                     || s.lattice.interner()
-                                           .isIncompleteArray(declTy))) {
+                                           .isIncompleteArray(declTy)
+                                    || arrayElementIsVoid(declTy)
+                                    || (declTy.valid()
+                                        && s.lattice.interner().kind(declTy)
+                                               == TypeKind::Void))) {
                                 ParseDiagnostic d;
                                 d.code     = DiagnosticCode::S_IncompleteTypeObject;
                                 d.severity = DiagnosticSeverity::Error;
@@ -8455,8 +8770,14 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 // emitUnknown=true: this run is THIS declarator's own
                                 // distinct spelling, so its unknown-name diagnostic is
                                 // the first and only one for that text.
+                                // ★ `owningDecl` is THIS declaration's row, exactly as
+                                // for the prefix and slot scans above: an attribute
+                                // must not mean two different things depending on which
+                                // side of the declarator it is written, and the
+                                // unknown-name verdict is part of what it means.
                                 scanAttributeSemantics(s, cfg, tree, ac,
-                                                       /*emitUnknown=*/true, attrFacts);
+                                                       /*emitUnknown=*/true, attrFacts,
+                                                       here, /*owningDecl=*/&decl);
                             }
                         }
                         // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): apply the
@@ -8514,14 +8835,26 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // free, because the clause list is populated above the verb
                         // switch in `scanAttributeSemantics`.
                         //
-                        // ★ THE `appliesTo.empty()` SKIP **IS** THE `none`-VERB
-                        // EXEMPTION, expressed as a property of the config rather
-                        // than as a verb test. The loader makes the two equivalent:
-                        // it REQUIRES a non-empty `appliesTo` on every verb but
-                        // `none` and REFUSES the key on `none`. So an empty set can
-                        // only mean "this row declares no kind axis" — never "a row
-                        // that forgot the key", which is the
-                        // [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]] trap.
+                        // ★ THE `appliesTo.empty()` SKIP MEANS "THIS ROW DECLARES
+                        // NO KIND AXIS", AND IT IS A PROPERTY OF THE CONFIG RATHER
+                        // THAN A VERB TEST. The loader REQUIRES a non-empty
+                        // `appliesTo` on every verb but `none`, so for a firing
+                        // verb an empty set is impossible and the
+                        // [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]] "a row that
+                        // forgot the key" trap cannot occur.
+                        //
+                        // ★★ P42 — AN INERT ROW MAY NOW DECLARE THE AXIS TOO, AND
+                        // THIS LOOP NEEDED NO CHANGE TO HONOR IT: the loader used
+                        // to REFUSE `appliesTo` on a `none` row, which is why the
+                        // skip was once describable as "the `none` exemption". It
+                        // is not that any more — a `none` row that declares kinds
+                        // is gated exactly like any other, which is what closes
+                        // [[D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT]]'s
+                        // decl-kind leak and lets the LINKAGE vocabulary
+                        // (`weak`, `visibility`) carry a kind axis at all. An inert
+                        // row that OMITS the key still means "no axis declared",
+                        // which some names genuinely need (statement attributes;
+                        // attributes of aggregate type DEFINITIONS).
                         //
                         // ★★ THE LATCH, AND AN HONEST ACCOUNT OF WHAT IT BUYS —
                         // BECAUSE THE OBVIOUS CLAIM ABOUT IT IS **MEASURABLY
@@ -8592,21 +8925,50 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // node and still reports — the same
                         // decl-level/declarator-level distinction the
                         // `attrAlignContextReported` gate draws with `fromDeclLevel`.
+                        //
+                        // ★★ P42
+                        // (D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT):
+                        // the declaration presents a kind SET, not a single kind —
+                        // its `DeclarationKind`, PLUS `functionPointer` when the
+                        // declared type is a pointer to a function — and the row
+                        // matches if it names ANY member. The refinement is
+                        // ADDITIVE, and both directions of that were MEASURED
+                        // against clang 18.1.3 and gcc 13.3.0 separately: a
+                        // function-pointer object must keep satisfying `variable`
+                        // (`unused`/`deprecated`/`aligned` are silent on one in
+                        // both references), and it must NOT satisfy `function`
+                        // (`noinline`/`always_inline`/`no_sanitize_thread`/`cold`/
+                        // `malloc` are diagnosed on one by both). Those two facts
+                        // together rule out every mapping cheaper than a fifth
+                        // spelling — which is what the registry row was filed to
+                        // record and what this loop now implements.
+                        //
+                        // ★ The predicate is the SHARED `isFnPointerType` the
+                        // `noreturn` carrier and the call path already use — the
+                        // same "no second hand-copy to lose a term" rule that
+                        // block states, applied here.
+                        bool const isFnPointerObject =
+                            declTy.valid()
+                            && isFnPointerType(s.lattice.interner(), declTy);
                         for (auto const& ksc : attrFacts.kindScopedClauses) {
                             if (ksc.row == nullptr) continue;
                             if (ksc.row->appliesTo.empty()) continue;
                             DeclarationKind const eff =
                                 effectiveDeclarationKind();
-                            if (std::ranges::find(ksc.row->appliesTo, eff)
-                                != ksc.row->appliesTo.end()) continue;
+                            if (std::ranges::any_of(
+                                    ksc.row->appliesTo,
+                                    [&](AttributeAppliesKind ak) {
+                                        return declarationSatisfiesAppliesKind(
+                                            ak, eff, isFnPointerObject);
+                                    })) continue;
                             if (std::ranges::find(declKindAttrReported,
                                                   ksc.clauseNode.v)
                                 != declKindAttrReported.end()) continue;
                             declKindAttrReported.push_back(ksc.clauseNode.v);
                             std::string allowed;
-                            for (DeclarationKind ak : ksc.row->appliesTo) {
+                            for (AttributeAppliesKind ak : ksc.row->appliesTo) {
                                 if (!allowed.empty()) allowed += ", ";
-                                allowed += declarationKindName(ak);
+                                allowed += attributeAppliesKindName(ak);
                             }
                             ParseDiagnostic d;
                             d.code = DiagnosticCode::
@@ -9676,6 +10038,48 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             // is correctly NOT flagged.
                                             famDiag(DiagnosticCode::S_IncompleteTypeMember);
                                             anyIncompleteMember = true;
+                                        } else if (ft.valid()
+                                                   && in.kind(ft)
+                                                          == TypeKind::Void) {
+                                            // The member twin of the void arm on
+                                            // `S_IncompleteTypeObject`, and the
+                                            // SAME row:
+                                            // D-CSUBSET-VOID-OBJECT-DECLARATION-ACCEPTED
+                                            // C 6.2.5p19 makes `void` an
+                                            // incomplete object type that can
+                                            // NEVER be completed, so 6.7.2.1p3
+                                            // forbids it as a member exactly as
+                                            // it forbids the forward-declared
+                                            // composite above — but `void` is a
+                                            // PRIMITIVE kind, so
+                                            // `isIncompleteComposite` never saw
+                                            // it. ✔MEASURED at P42 through the
+                                            // shipped CLI: `struct T { void x; };`
+                                            // and `union U { void x; int i; };`
+                                            // compiled with ZERO diagnostics, and
+                                            // the refusal only arrived if an
+                                            // OBJECT was declared — as
+                                            // `H0009 aggregate/array local
+                                            // requires a sizeable type`, a
+                                            // lowering message for a declaration-
+                                            // site constraint violation. gcc
+                                            // 13.3.0 and clang 18.1.3, probed
+                                            // SEPARATELY, reject both at the
+                                            // member. Marking the composite
+                                            // incomplete keeps `computeLayout`
+                                            // nullopting, so nothing downstream
+                                            // can lay out the half-formed type.
+                                            //   ★ THE UNION ARM IS NOT
+                                            // COSMETIC. `computeLayout`'s Union
+                                            // arm takes `max(field sizes)`, so a
+                                            // `void` member alongside an `int`
+                                            // would have been ABSORBED — size 4,
+                                            // no complaint, the illegal member
+                                            // simply invisible. The struct arm at
+                                            // least failed loud somewhere; the
+                                            // union arm failed nowhere at all.
+                                            famDiag(DiagnosticCode::S_IncompleteTypeMember);
+                                            anyIncompleteMember = true;
                                         } else if (in.isIncompleteArray(ft)) {
                                             // A direct FAM (struct only — a bare
                                             // union FAM never reaches here): legal
@@ -10312,20 +10716,26 @@ charLiteralWideCoreOf(EngineState const& s, Tree const& tree, NodeId owningNode)
 // are untouched. EXTRACTED from pass2Post (byte-identical body — the
 // buildConstEvalEnv extraction precedent) so TWO tiers share it:
 //   • Pass 2 (pass2Post) — the blanket post-order walk, exactly as before;
-//   • FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the Pass-1.5 inference arm's
-//     initializer PRE-STAMP. `subtreeType` types identifier leaves by scope
-//     lookup but relies on `typeAt` stamps for literal leaves (Pass-2-stamped
-//     on the blanket walk) — so at Pass 1.5 a literal initializer
-//     (`auto x = 42;`) would resolve to InvalidType (probe-confirmed: the
-//     typeof-of-literal analog `typeof(42) a = 7; int arr[sizeof(a)];` fails
-//     S_NonConstantArrayLength at HEAD — p1 passes only via the Pass-2
-//     initializer backfill). The arm walks the initializer subtree through
-//     THIS chokepoint first, so both tiers type literals identically by
-//     construction. Idempotent (re-stamping computes the same TypeId); the
-//     one diagnostic inside (S_IntegerLiteralTooLarge) leaves the node
-//     untyped on BOTH tiers, and its Pass-1.5 + Pass-2 double-visit
-//     collapses in the reporter's recent-duplicate window (suppressible
-//     code — the dedup applies; the typeof bit-field gate precedent).
+//   • EVERY Pass-1.5 `subtreeType` caller, through the ONE shared
+//     `preStampLiteralLeaves` walk defined below — FC17.5's `auto` inference arm
+//     (D-CSUBSET-AUTO-TYPE-INFERENCE) and the `typeof(<expression>)` arm
+//     (D-CSUBSET-TYPEOF-VALUE-FORM-RESOLVES-ONLY-FOR-AN-OBJECT-OPERAND).
+//     `subtreeType` types identifier leaves by scope lookup but relies on
+//     `typeAt` stamps for literal leaves (Pass-2-stamped on the blanket walk),
+//     so at Pass 1.5 a literal leaf is INVISIBLE and the query resolves to
+//     InvalidType. Idempotent (re-stamping computes the same TypeId); the one
+//     diagnostic inside (S_IntegerLiteralTooLarge) leaves the node untyped on
+//     BOTH tiers, and its Pass-1.5 + Pass-2 double-visit collapses in the
+//     reporter's recent-duplicate window (suppressible code — the dedup
+//     applies; the typeof bit-field gate precedent).
+//     ⚠ THIS COMMENT USED TO CITE A DEFECT AS ITS EVIDENCE AND CALL IT A PROBE.
+//     It read: *"probe-confirmed: the typeof-of-literal analog `typeof(42) a =
+//     7; int arr[sizeof(a)];` fails S_NonConstantArrayLength at HEAD — p1
+//     passes only via the Pass-2 initializer backfill"*. That is not a
+//     confirmation of the `auto` arm's need; it is a report that the SIBLING arm
+//     was missing the same preparation and was silently taking its type from the
+//     initializer instead. Both arms now share the walk, and the sentence is a
+//     pin: `SizeofTypeofLiteralOperandFoldsInArrayDim`.
 void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                       Tree const& tree, NodeId node) {
     auto const k = tree.kind(node);
@@ -10575,6 +10985,48 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
     }
 }
 
+// ── the Pass-1.5 pre-stamp (D-CSUBSET-TYPEOF-VALUE-FORM-RESOLVES-ONLY-FOR-AN-OBJECT-OPERAND)
+//
+// `subtreeType` types IDENTIFIER leaves by scope lookup but reads LITERAL leaves
+// only from the `typeAt` stamps Pass 2's blanket walk writes — so at Pass 1.5,
+// where the declaration heads resolve, a literal leaf is INVISIBLE. Walking the
+// subtree through `typeLiteralIfAny` first makes the two tiers agree BY
+// CONSTRUCTION (identical stamps, computed by the same chokepoint) rather than by
+// coincidence of walk order. Idempotent: an already-stamped node is skipped, and
+// re-stamping recomputes the same TypeId, so a Pass-1.5 pre-stamp followed by the
+// Pass-2 blanket walk is a no-op the second time.
+//
+// A subtree deeper than the guard leaves some leaves unstamped — the caller then
+// fails LOUD on an unresolvable type, never silently-wrong.
+//
+// ★★ WHY THIS IS A SHARED HELPER AND NOT TWO COPIES. It began (FC17.5) inline in
+// `resolveAutoInferredDeclaration` ★C3, whose own comment recorded the reason —
+// and named, as its probe, the very shape that was BROKEN: *"the typeof-of-literal
+// analog `typeof(42) a = 7; int arr[sizeof(a)];` fails S_NonConstantArrayLength at
+// HEAD — p1 passes only via the Pass-2 initializer backfill"*. That sentence
+// describes a defect, not a design: the `auto` arm was given the preparation and
+// the `typeof` arm was left without it, so `typeof(<literal>)` resolved to nothing
+// and every position that needs a resolved head REFUSED — while the one position
+// with an initializer silently adopted the INITIALIZER's type instead
+// (`typeof(1) x = 3.9;` was a `double`, with no diagnostic). ⇒ the preparation a
+// Pass-1.5 `subtreeType` call needs belongs to the CALL, in one place both callers
+// reach, not to whichever arm happened to be written first.
+void preStampLiteralLeaves(EngineState& s, SemanticConfig const& cfg,
+                           Tree const& tree, NodeId root) {
+    if (!root.valid()) return;
+    std::vector<NodeId> stack{root};
+    for (int guard = 0; guard < 65536 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (s.typeAt(c).valid()) continue;   // already stamped
+        typeLiteralIfAny(s, cfg, tree, c);
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        // A rule-node stamp (the adjacent-string form) closes the subtree
+        // — mirror subtreeType's typeAt short-circuit, don't descend.
+        if (s.typeAt(c).valid()) continue;
+        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    }
+}
+
 // D-CSUBSET-STATIC-ASSERT-OPERAND-DIAGNOSTIC: the FOLDED OPERANDS of a failing
 // static assertion's condition, rendered as a suffix for its diagnostic — or an
 // EMPTY string when the condition is not a binary comparison (degrade, never
@@ -10721,8 +11173,17 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // subexpression (`(c?nullptr:nullptr)+1`, astronomically rare) is not caught here
     // — it degrades to defined 0-arithmetic, never a crash:
     // D-CSUBSET-NULLPTR-NONLITERAL-OPERAND (trigger: a real program hits it).
-    if (k == NodeKind::Internal
-        && cfg.pointerConversions.nullPointerConstantFromNullptrT) {
+    // ⚠ THE OUTER GATE IS THE NODE SHAPE, NOT A LANGUAGE FLAG. It used to be
+    // `&& cfg.pointerConversions.nullPointerConstantFromNullptrT`, because the only
+    // arm inside was the nullptr one. P42 added a SECOND operand-type gate (void)
+    // that has nothing to do with nullptr, so the flag moved DOWN into
+    // `isNullptrOperand` — which every nullptr arm is already guarded by, so that
+    // arm stays inert byte-for-byte in a schema that declares no `nullptr`. Both
+    // gates now share ONE operator-node walk and ONE operand roster: two rosters
+    // for "which operands does this operator have" is how one gate silently stops
+    // seeing the shapes the other catches — exactly the failure one tier up in
+    // D-CSUBSET-NULLPTR-TYPED-OPERAND-ESCAPES-THE-GATE
+    if (k == NodeKind::Internal) {
         auto const& hirCfg = tree.schema().hirLowering();
         std::uint32_t const rule = tree.rule(node).v;
         bool const isBin = hirCfg.binaryExprRule.valid()
@@ -10731,14 +11192,75 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             && rule == hirCfg.unaryExprRule.v;
         if (isBin || isUn) {
             auto& interner = s.lattice.interner();
+            // ★★ TWO ANSWERS, ONE QUESTION — AND THE SYNTACTIC ONE IS ONLY THE
+            //    FAST PATH (D-CSUBSET-NULLPTR-TYPED-OPERAND-ESCAPES-THE-GATE).
+            // The descent below answers "is this operand SPELLED `nullptr`, or does
+            // it carry a Pass-2 stamp saying NullptrT" in O(1) for the shape that
+            // dominates — a literal, a paren, a thin wrapper. It CANNOT answer for
+            // an operand whose nullptr_t-ness is a property of the TYPE SYSTEM
+            // rather than of the spelling, because it stops at any node with two
+            // Internal children and never dereferences a pointer.
+            // ✔MEASURED at 301e2a63 (shipped CLI, x86_64:pe64-x86_64-windows-exec),
+            // with `typeof(nullptr) a[3];` / `typeof(nullptr) *p;` — the four shapes
+            // the descent DOES reach (`n + 1`, `(n) + 1`, `f() + 1`, `s.m + 1`) all
+            // refused S0033 correctly, while:
+            //   `a[1] + 1` and `*p + 1`  → `error[H0009] array/pointer index element
+            //                              type has no computable size` — a TRUE
+            //                              refusal with a FALSE reason, and the
+            //                              reason is false because `representation
+            //                              Type` has already projected NullptrT to
+            //                              `Ptr<Void>` by the time MIR sizes it, so
+            //                              MIR is answering about `void *`;
+            //   `a[1] < a[2]` and `-a[1]` → rc=0, A BINARY WAS PRODUCED. gcc 13.3.0
+            //                              (`-std=c2x`) and clang 18.1.3 (`-std=c23`),
+            //                              probed SEPARATELY, both REJECT every one
+            //                              of these ("invalid operands to binary +").
+            // ★ THE SILENT PAIR IS THE REASON THIS IS FIXED HERE AND NOWHERE ELSE.
+            // Below the semantic tier the type is GONE — `nullptr_t` and `void *`
+            // are the same `Ptr<Void>` — so no later tier can tell C's constraint
+            // violation from GNU's legal `void *` arithmetic. This gate is the last
+            // position that still knows, which also makes it a HARD PREREQUISITE for
+            // ever admitting `void * + 1`: admitting that scaling WITHOUT this arm
+            // would turn `a[1] + 1` from a loud H0009 into a silently-compiled byte
+            // offset (D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED, `src/mir/**`).
+            // ⇒ When the descent bottoms out with NO answer, ask the ONE expression
+            // typer instead of growing a second, differently-shaped roster of
+            // "transparent" node shapes — the identical repair `checkCall`'s
+            // per-argument loop already made ("Use subtreeType (not raw typeAt) so
+            // the check sees the type of a … descendant of the expression wrapper"),
+            // and the shape the variadic-tail nullptr scan in this same file uses.
+            // A node the descent DID answer for keeps its authoritative answer, so
+            // the fast path is unchanged and `subtreeType` runs only where the old
+            // code was about to return a WRONG `false`.
             auto const isNullptrOperand = [&](NodeId n) -> bool {
+                // The per-language gate, moved here from the outer condition when
+                // the void arm joined this walk. Every nullptr arm below is
+                // guarded by this predicate, so `false` makes the whole nullptr
+                // half inert — identical to the old outer-gate behavior.
+                if (!cfg.pointerConversions.nullPointerConstantFromNullptrT)
+                    return false;
+                NodeId const root = n;
                 for (int guard = 0; n.valid() && guard < 64; ++guard) {
-                    if (TypeId t = s.typeAt(n); t.valid())
-                        return interner.kind(t) == TypeKind::NullptrT;
+                    if (TypeId t = s.typeAt(n); t.valid()) {
+                        if (interner.kind(t) == TypeKind::NullptrT) return true;
+                        // ⚠ A NEGATIVE STAMP IS AUTHORITATIVE ONLY AT THE ROOT.
+                        // `internals == 1` cannot tell a PAREN from a real unary
+                        // operator, so the descent walks THROUGH `*p` and reads the
+                        // stamp on `p` — `Ptr<NullptrT>`, correctly not NullptrT,
+                        // and the WRONG question. ✔MEASURED: with the descent
+                        // trusted here, `typeof(nullptr) *p; *p + 1;` stayed
+                        // `H0009` while the sibling `a[1] + 1` was already fixed —
+                        // one repair passing over its own second case.
+                        if (guard == 0) return false;
+                        break;
+                    }
                     if (tree.kind(n) == NodeKind::Token) {
                         auto it = s.idx().literalTypeIds.find(tree.tokenKind(n).v);
-                        return it != s.idx().literalTypeIds.end()
-                            && interner.kind(it->second) == TypeKind::NullptrT;
+                        if (it != s.idx().literalTypeIds.end()
+                            && interner.kind(it->second) == TypeKind::NullptrT) {
+                            return true;
+                        }
+                        break;   // a non-literal leaf (an identifier) — ask the typer
                     }
                     // Descend one transparent layer: the single meaningful child is
                     // an Internal child (a paren / thin wrapper) if present, else a
@@ -10759,9 +11281,17 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     }
                     if (internals == 1) { n = nextInternal; continue; }
                     if (internals == 0 && litToken.valid()) { n = litToken; continue; }
-                    return false;
+                    break;   // a real operator / index / member — ask the typer
                 }
-                return false;
+                // The descent has no answer. `subtreeType` is the ONE expression
+                // typer (it short-circuits on the same `typeAt` stamp the loop
+                // already read, so this is never a second copy of that answer); it
+                // resolves index, deref, member, call and identifier operands
+                // alike. InvalidType — an operand this tier could not type at all —
+                // is NOT a nullptr operand: the cascade stays suppressed and the
+                // real diagnostic is whichever one made the type unresolvable.
+                TypeId const t = subtreeType(s, tree, root, here);
+                return t.valid() && interner.kind(t) == TypeKind::NullptrT;
             };
             auto const opEntry =
                 [&](std::vector<HirOperatorEntry> const& ops)
@@ -10782,6 +11312,116 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 d.actual   = std::string{tree.text(at)};
                 s.reporter.report(std::move(d));
             };
+
+            // ── D-CSUBSET-VOID-VALUE-AS-AN-OPERATOR-OPERAND (C 6.3.2.2) ─────
+            //
+            // "The (nonexistent) value of a void expression shall not be used in
+            // any way." An expression of type `void` is therefore admissible ONLY
+            // where its value is discarded, and an operator that READS its operand
+            // must refuse it.
+            //
+            // ★ THIS IS PART OF THE VOID-ARITHMETIC CHANGE, NOT AN ADJACENT FIX,
+            // AND IT IS THE ONE DIVERGENCE THAT CHANGE OPENED. ✔MEASURED through
+            // the shipped CLI: BEFORE the stride widened, `void *p; p[1] == 2` was
+            // refused `H0009` — for the WRONG reason (no computable stride), but
+            // refused. AFTER, the subscript lowers correctly and yields a `void`
+            // lvalue, and with no rule here the comparison SILENTLY COMPILED and
+            // returned the wrong answer. gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
+            // (`-std=c23`), probed SEPARATELY, both REJECT it ("void value not
+            // ignored as it ought to be" / "invalid operands to binary expression
+            // ('void' and 'int')"). A refusal replaced by a silent wrong answer is
+            // the one trade this project never makes, so the widening does not ship
+            // without this arm.
+            //
+            // ⚠ AND THE HOLE WAS ALREADY THERE, wider than the shape that exposed
+            // it. MEASURED at the same time, with no `void *` involved at all:
+            // `void g(void); … g() == 0` died `L_UnsupportedLoweringForOpcode` and
+            // `if (g())` died `I_TerminatorTypeMismatch` — INTERNAL messages from
+            // two tiers below, with no source position, for a plain constraint
+            // violation. Only the contexts that happen to route through
+            // `isAssignable` (`int x = g();` → S_TypeMismatch) or the return check
+            // (`return g();` → S_ReturnTypeMismatch) were diagnosed honestly. This
+            // arm makes the operator itself answer.
+            //
+            // WHAT IS DELIBERATELY NOT CAUGHT, each MEASURED accepted by BOTH
+            // references rather than reasoned about: the COMMA operator (`(g(), 0)`
+            // and `(p[1], 0)` — its left operand is discarded by definition, which
+            // is the whole point of the operator); a cast to void (`(void)g()`, not
+            // an operator node here); a ternary whose arms are both void
+            // (`c ? g() : h()`); and `sizeof` of a void expression (`sizeof(g())`
+            // is 1 — the very GNU extension this cycle is landing). Plain `Assign`
+            // is left to `isAssignable`, which already reports it positioned.
+            //
+            // The roster is the operator's OWN classification, never a name list:
+            // a CORE op (`coreOpFromNameSem` — every arithmetic, relational,
+            // equality, bitwise and shift operator), the two logical connectives,
+            // and any COMPOUND assignment (`x += g()`, which reads `x` AND the
+            // right operand). All four categories were measured refused by both
+            // references.
+            auto const isVoidTyped = [&](NodeId n) -> bool {
+                // `subtreeType` is the ONE expression typer — the same repair the
+                // nullptr arm above had to make. A raw `typeAt` reads the WRAPPER,
+                // which is unstamped for exactly the shapes that matter here
+                // (a subscript, a deref, a call). It short-circuits on the stamp
+                // for an already-typed node, so the common path is a lookup.
+                TypeId const t = subtreeType(s, tree, n, here);
+                return t.valid() && interner.kind(t) == TypeKind::Void;
+            };
+            auto const readsItsOperandValue =
+                [&](HirOperatorEntry const* e) -> bool {
+                if (e == nullptr) return false;          // unclassifiable: no
+                                                         // false positive
+                if (e->target == "Comma") return false;  // discards its left
+                if (!e->compoundBase.empty()) return true;   // `x += g()`
+                if (e->target == "Assign") return false;     // isAssignable owns it
+                if (e->target == "LogicalAnd" || e->target == "LogicalOr")
+                    return true;
+                return coreOpFromNameSem(e->target).has_value();
+            };
+            auto const emitVoidOperand = [&](NodeId at) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_TypeMismatch;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(at);
+                // S_TypeMismatch, NOT a new code — and that is deliberate. DSS
+                // ALREADY reports `int x = p[1];` as S_TypeMismatch through the
+                // assignability path, so one defect keeps ONE code no matter which
+                // context catches it. The text carries what the code cannot.
+                d.actual   = "an expression of type `void` has no value to use "
+                             "(C 6.3.2.2) — it is admissible only where the value "
+                             "is discarded: " + std::string{tree.text(at)};
+                s.reporter.report(std::move(d));
+            };
+            if (isBin) {
+                NodeId lN{}, rN{};
+                for (NodeId c : visibleChildren(tree, node)) {
+                    if (tree.kind(c) == NodeKind::Token) continue;
+                    if (!lN.valid()) lN = c; else if (!rN.valid()) rN = c;
+                }
+                if (readsItsOperandValue(opEntry(hirCfg.binaryOps))) {
+                    // Report the LEFT operand first when both are void, so a
+                    // `g() + h()` produces one positioned diagnostic per offending
+                    // operand rather than a cascade from one.
+                    if (lN.valid() && isVoidTyped(lN)) emitVoidOperand(lN);
+                    if (rN.valid() && isVoidTyped(rN)) emitVoidOperand(rN);
+                }
+            } else {  // unary
+                NodeId opndN{};
+                for (NodeId c : visibleChildren(tree, node)) {
+                    if (tree.kind(c) == NodeKind::Token) continue;
+                    opndN = c; break;
+                }
+                // `!g()`, `-g()`, `~g()` — all MEASURED refused by both references.
+                // `&`/`*` are not core ops and are owned by the lvalue / deref
+                // checks, which already report them positioned.
+                if (opndN.valid()
+                    && readsItsOperandValue(opEntry(hirCfg.unaryOps))
+                    && isVoidTyped(opndN)) {
+                    emitVoidOperand(opndN);
+                }
+            }
+
             if (isBin) {
                 NodeId lhsN{}, rhsN{};
                 for (NodeId c : visibleChildren(tree, node)) {
@@ -10814,12 +11454,31 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             // or an array name (Array → element pointer, 6.3.2.1p3)
                             // — `func == nullptr` / `arr == nullptr` are valid C23.
                             // Mirrors the combineTernary nullptr arm's Ptr/FnSig decay.
+                            //
+                            // D-CSUBSET-NULLPTR-NONLITERAL-OPERAND: a peer whose
+                            // TYPE is NullptrT is the `nullptr == nullptr` case the
+                            // branch ABOVE already admits — it just did not arrive
+                            // through the SYNTACTIC walk. `isNullptrOperand` answers
+                            // "is this spelled nullptr, or already stamped NullptrT",
+                            // and this line answers the same question of the TYPE
+                            // SYSTEM; while the two rosters disagreed, every
+                            // `nullptr_t` value the syntactic walk cannot see — a
+                            // subscript (`a[1]`), a deref (`*q`), a member, a call —
+                            // was REFUSED S_NullptrInvalidOperand against `nullptr`,
+                            // which gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
+                            // (`-std=c23`), probed SEPARATELY, both compile and run.
+                            // ⓘ A comparison between two such peers never reaches
+                            // here at all (neither side is `lNull`/`rNull`), and is
+                            // admitted — so admitting it when ONE side is spelled
+                            // `nullptr` is what makes this arm SELF-CONSISTENT, not
+                            // merely more permissive.
                             NodeId const peer = lNull ? rhsN : lhsN;
                             TypeId const pt = subtreeType(s, tree, peer, here);
                             TypeKind const pk =
                                 pt.valid() ? interner.kind(pt) : TypeKind::Void;
                             ok = (pk == TypeKind::Ptr || pk == TypeKind::FnSig
-                                  || pk == TypeKind::Array);
+                                  || pk == TypeKind::Array
+                                  || pk == TypeKind::NullptrT);
                         }
                     } else {
                         // A core arithmetic / relational / bitwise / shift op —
@@ -16154,7 +16813,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     : std::nullopt;
             auto realized = ffi::realizeShippedExternSymbols(
                 unrealized, s.lattice.interner(), s.lattice.registry(),
-                s.dataModel, activeTargetView, s.activeFormat, namedTypes);
+                s.reporter, s.dataModel, activeTargetView, s.activeFormat,
+                namedTypes);
             // nullopt ⇒ the shippedLibs directory could not be located. That is a
             // statement about the ENVIRONMENT, never about the user's program, so
             // every name simply stays unrealized and routes unbound — the exact

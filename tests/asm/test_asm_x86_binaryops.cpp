@@ -54,13 +54,14 @@ struct X86Fixture {
     f.xorOp = *f.schema->opcodeByMnemonic("xor");
     f.notOp = *f.schema->opcodeByMnemonic("not");
     f.retOp = *f.schema->opcodeByMnemonic("ret");
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    f.rax = LirReg{
-        static_cast<std::uint32_t>(*f.schema->registerByName("rax")), 1, cls};
-    f.rcx = LirReg{
-        static_cast<std::uint32_t>(*f.schema->registerByName("rcx")), 1, cls};
-    f.r8 = LirReg{
-        static_cast<std::uint32_t>(*f.schema->registerByName("r8")), 1, cls};
+    auto const phys = [&](char const* name) {
+        return makePhysicalReg(
+            static_cast<std::uint32_t>(*f.schema->registerByName(name)),
+            LirRegClass::GPR);
+    };
+    f.rax = phys("rax");
+    f.rcx = phys("rcx");
+    f.r8  = phys("r8");
     return f;
 }
 

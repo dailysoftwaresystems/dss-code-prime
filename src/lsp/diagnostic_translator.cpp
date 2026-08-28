@@ -1,5 +1,6 @@
 #include "lsp/diagnostic_translator.hpp"
 
+#include "core/types/diagnostic_reporter.hpp"   // kNoDiagnosticDetailRecorded
 #include "core/types/source_span.hpp"
 #include "lsp/utf16_column.hpp"
 
@@ -87,7 +88,19 @@ using json = nlohmann::json;
         prose += d.suggestion;
     }
     if (prose.empty()) {
-        prose = codeName(d.code);
+        // D-DIAG-TWO-CODE-RENDERINGS hazard (H2). This was
+        // `prose = codeName(d.code)`, which put the code into `message` on a
+        // Diagnostic that already carries it in the structured `code` field —
+        // pure noise for a client, and a second occurrence for anything
+        // counting codes across the wire. `kNoDiagnosticDetailRecorded` is
+        // shared with the CLI's `appendExpectedActual` so the two surfaces
+        // state the same thing in the same words.
+        //
+        // ⚠ `out.code` is UNCHANGED and stays `diagnosticCodeName` — the LSP
+        // was already speaking the canonical spelling, which is precisely why
+        // unifying the CLI ONTO the name rather than onto the hex needed no
+        // edit here and left the IDE and the terminal in agreement.
+        prose = std::string{kNoDiagnosticDetailRecorded};
     }
     return d.contextPrefix + prose;
 }

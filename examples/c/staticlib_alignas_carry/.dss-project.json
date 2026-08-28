@@ -1,0 +1,17 @@
+{
+  "$comment": "The CONSUMER manifest for the object-reader alignment carry witness (D-FORMAT-MACHO-SECTION-ALIGN-EMITTED-RAW-NOT-LOG2, the read-side half). `dependsOn` a `staticlib` project is what makes this example route its link through an OBJECT READER on every leg: the dependency is built to an archive, the archive is appended to this target's resolveLibraries, and the static-link pull reconstructs its atoms — alignment included, or not. `path` only: plan 06 §5.1 B.7 forbids an example that touches the network.",
+  "$commentWhyFourTargets": "One manifest, four legs, three readers. The PE leg is the one the fix repairs (`coff_object_reader.cpp` dropped the declared alignment entirely); the two ELF legs and the Mach-O leg exercise the siblings that already carried it, so a regression in EITHER of those shows up here too rather than only in a unit suite. That is the same reason the sweep's unit pins live in all three reader suites.",
+  "language": "c",
+  "artifactProfile": "cli",
+  "artifactName": "align_carry",
+  "targets": [
+    "x86_64:pe64-x86_64-windows-exec",
+    "x86_64:elf64-x86_64-linux-exec",
+    "arm64:elf64-aarch64-linux-exec",
+    "arm64:macho64-arm64-darwin-exec"
+  ],
+  "sources": ["main.c"],
+  "dependsOn": [
+    { "path": "alignlib" }
+  ]
+}

@@ -57,3 +57,14 @@ target_compile_definitions(dss_hir_test_torn_shipped_config_reds_not_crashes
         DSS_HIR_LOWERING_C_TEST_BINARY="$<TARGET_FILE:dss_hir_test_hir_lowering_c>")
 add_dependencies(dss_hir_test_torn_shipped_config_reds_not_crashes
                  dss_tokenizer_test_tokenizer dss_hir_test_hir_lowering_c)
+
+# D-CSUBSET-NULLPTR-T-DECLARABLE — `TypeInterner::representationType`, the
+# object-representation projection that keeps C23 `nullptr_t` a distinct semantic
+# identity while giving every tier below the semantic one a plain pointer.
+# Lives here rather than beside the other lattice tests because the projection
+# exists for exactly one consumer, the semantic->HIR boundary in `cst_to_hir`,
+# and because it must exercise the Ptr / Array / FnSig / qualified forms that no
+# C source can reach while `typeof(<literal>)` is unresolved (bar §A.5: an
+# unconsumed substrate's misses are latent by definition).
+dss_add_test(NAME hir/test_type_representation_projection
+             SOURCES test_type_representation_projection.cpp)

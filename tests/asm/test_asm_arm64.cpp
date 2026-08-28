@@ -128,8 +128,7 @@ TEST(Arm64Encoder, BlrX9EncodesD63F0120) {
     ASSERT_TRUE(retOp.has_value());
     auto const x9 = (*s)->registerByName("x9");
     ASSERT_TRUE(x9.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const r_x9{static_cast<std::uint32_t>(*x9), 1, cls};
+    LirReg const r_x9 = makePhysicalReg(static_cast<std::uint32_t>(*x9), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -202,9 +201,8 @@ TEST(Arm64Encoder, SubSpRegEncodesExtendedRegisterWord) {
     auto const sp = (*s)->registerByName("sp");
     auto const x9 = (*s)->registerByName("x9");
     ASSERT_TRUE(sp.has_value() && x9.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const r_sp{static_cast<std::uint32_t>(*sp), 1, cls};
-    LirReg const r_x9{static_cast<std::uint32_t>(*x9), 1, cls};
+    LirReg const r_sp = makePhysicalReg(static_cast<std::uint32_t>(*sp), LirRegClass::GPR);
+    LirReg const r_x9 = makePhysicalReg(static_cast<std::uint32_t>(*x9), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -238,9 +236,8 @@ TEST(Arm64Encoder, SpCopyEncodesAddImmZero) {
     auto const sp  = (*s)->registerByName("sp");
     auto const x29 = (*s)->registerByName("x29");
     ASSERT_TRUE(sp.has_value() && x29.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const r_sp{static_cast<std::uint32_t>(*sp), 1, cls};
-    LirReg const r_x29{static_cast<std::uint32_t>(*x29), 1, cls};
+    LirReg const r_sp = makePhysicalReg(static_cast<std::uint32_t>(*sp), LirRegClass::GPR);
+    LirReg const r_x29 = makePhysicalReg(static_cast<std::uint32_t>(*x29), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -279,9 +276,8 @@ TEST(Arm64Encoder, MovX0FromX1EncodesORR) {
     auto const x0 = (*s)->registerByName("x0");
     auto const x1 = (*s)->registerByName("x1");
     ASSERT_TRUE(x0.has_value() && x1.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const r_x0{static_cast<std::uint32_t>(*x0), 1, cls};
-    LirReg const r_x1{static_cast<std::uint32_t>(*x1), 1, cls};
+    LirReg const r_x0 = makePhysicalReg(static_cast<std::uint32_t>(*x0), LirRegClass::GPR);
+    LirReg const r_x1 = makePhysicalReg(static_cast<std::uint32_t>(*x1), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -312,11 +308,8 @@ TEST(Arm64Encoder, MovX19FromX2DerivesBitFields) {
     ASSERT_TRUE(s.has_value());
     auto const movOp = (*s)->opcodeByMnemonic("mov");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const dst{
-        static_cast<std::uint32_t>(*(*s)->registerByName("x19")), 1, cls};
-    LirReg const src{
-        static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
+    LirReg const dst = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x19")), LirRegClass::GPR);
+    LirReg const src = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x2")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -362,8 +355,7 @@ TEST(Arm64Encoder, CsetEncodesInvertedCondAtBits12) {
     auto const setccOp = (*s)->opcodeByMnemonic("setcc");
     auto const retOp   = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(setccOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
 
     auto const encodeCset = [&](TargetCondCode cc) {
         LirBuilder b{**s};
@@ -408,9 +400,8 @@ TEST(Arm64Encoder, ZextEncodesOrrW) {
     auto const zextOp = (*s)->opcodeByMnemonic("zext");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(zextOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -443,9 +434,8 @@ TEST(Arm64Encoder, NegEncodesSubFromXzr) {
     auto const negOp = (*s)->opcodeByMnemonic("neg");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(negOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -477,9 +467,8 @@ TEST(Arm64Encoder, NotEncodesMvnFromXzr) {
     auto const notOp = (*s)->opcodeByMnemonic("not");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(notOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -517,10 +506,9 @@ TEST(Arm64Encoder, SdivEncodesDataProc2Source) {
     auto const sdivOp = (*s)->opcodeByMnemonic("sdiv");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(sdivOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
-    LirReg const x2{static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
+    LirReg const x2 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x2")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -558,10 +546,9 @@ TEST(Arm64Encoder, UdivEncodesDataProc2SourceHighRegs) {
     auto const udivOp = (*s)->opcodeByMnemonic("udiv");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(udivOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x3 {static_cast<std::uint32_t>(*(*s)->registerByName("x3")),  1, cls};
-    LirReg const x4 {static_cast<std::uint32_t>(*(*s)->registerByName("x4")),  1, cls};
-    LirReg const x14{static_cast<std::uint32_t>(*(*s)->registerByName("x14")), 1, cls};
+    LirReg const x3 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x3")), LirRegClass::GPR);
+    LirReg const x4 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x4")), LirRegClass::GPR);
+    LirReg const x14 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x14")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -599,10 +586,9 @@ TEST(Arm64Encoder, UmulhEncodesDataProc3SourceHighRegs) {
     auto const umulhOp = (*s)->opcodeByMnemonic("umulh");
     auto const retOp   = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(umulhOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x3 {static_cast<std::uint32_t>(*(*s)->registerByName("x3")),  1, cls};
-    LirReg const x4 {static_cast<std::uint32_t>(*(*s)->registerByName("x4")),  1, cls};
-    LirReg const x14{static_cast<std::uint32_t>(*(*s)->registerByName("x14")), 1, cls};
+    LirReg const x3 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x3")), LirRegClass::GPR);
+    LirReg const x4 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x4")), LirRegClass::GPR);
+    LirReg const x14 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x14")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -642,9 +628,8 @@ assembleArm64Unary(char const* mnemonic, char const* dst, char const* src,
     auto const op    = (*s)->opcodeByMnemonic(mnemonic);
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     EXPECT_TRUE(op.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const rd{static_cast<std::uint32_t>(*(*s)->registerByName(dst)), 1, cls};
-    LirReg const rn{static_cast<std::uint32_t>(*(*s)->registerByName(src)), 1, cls};
+    LirReg const rd = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName(dst)), LirRegClass::GPR);
+    LirReg const rn = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName(src)), LirRegClass::GPR);
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
     auto blk = b.createBlock();
@@ -732,23 +717,13 @@ assembleArm64UnaryCrossClass(char const* mnemonic,
     auto const srcOrd = (*s)->registerByName(src);
     EXPECT_TRUE(dstOrd.has_value() && srcOrd.has_value());
     if (!dstOrd.has_value() || !srcOrd.has_value()) return {};
-    // ⚠⚠ DESIGNATED INITIALIZERS, AND THE POSITIONAL FORM IS A TRAP THIS
-    // FUNCTION FELL INTO. `LirReg`'s declaration order is
-    // {id, classKind, isPhysical, _pad}, but the ~29 GPR-only helpers in this
-    // file all spell it `{ordinal, 1, cls}` — which binds the literal 1 to
-    // classKind and `cls` to the ONE-BIT isPhysical. That is correct ONLY
-    // because `LirRegClass::GPR` IS 1, so both fields land right by coincidence,
-    // twice over. ✔MEASURED 2026-08-26: the identical spelling with
-    // `LirRegClass::FPR` (2) yields classKind=GPR and isPhysical=0, and the
-    // encoder correctly refuses it — "register operand is not a physical
-    // register". The coincidence is invisible until someone writes the first
-    // non-GPR test, which is this one.
-    LirReg const rd{.id         = static_cast<std::uint32_t>(*dstOrd),
-                    .classKind  = static_cast<std::uint32_t>(dstCls),
-                    .isPhysical = 1};
-    LirReg const rn{.id         = static_cast<std::uint32_t>(*srcOrd),
-                    .classKind  = static_cast<std::uint32_t>(srcCls),
-                    .isPhysical = 1};
+    // D-LIR-POSITIONAL-LIRREG-INIT-MISCLASSIFIES-SILENTLY. This function
+    // discovered the trap and routed around it LOCALLY, with designated
+    // initializers; the trap itself is now gone — `LirReg` has no aggregate
+    // path at all, so the class argument is typed and the physical/virtual
+    // axis is a named `bool` at the one constructor that exists.
+    LirReg const rd = makePhysicalReg(static_cast<std::uint32_t>(*dstOrd), dstCls);
+    LirReg const rn = makePhysicalReg(static_cast<std::uint32_t>(*srcOrd), srcCls);
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
     auto blk = b.createBlock();
@@ -870,9 +845,8 @@ assembleArm64UnaryFlags(char const* mnemonic, char const* dst, char const* src,
     auto const op    = (*s)->opcodeByMnemonic(mnemonic);
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     EXPECT_TRUE(op.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const rd{static_cast<std::uint32_t>(*(*s)->registerByName(dst)), 1, cls};
-    LirReg const rn{static_cast<std::uint32_t>(*(*s)->registerByName(src)), 1, cls};
+    LirReg const rd = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName(dst)), LirRegClass::GPR);
+    LirReg const rn = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName(src)), LirRegClass::GPR);
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
     auto blk = b.createBlock();
@@ -977,9 +951,8 @@ TEST(Arm64Encoder, LdaxrW0X1EncodesLoadAcquireExclusive) {
     auto const ldaxrOp = (*s)->opcodeByMnemonic("ldaxr");
     auto const retOp   = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(ldaxrOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1012,10 +985,9 @@ TEST(Arm64Encoder, StlxrW2W0X1EncodesStoreReleaseExclusiveStatusInRs) {
     auto const stlxrOp = (*s)->opcodeByMnemonic("stlxr");
     auto const retOp   = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(stlxrOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
-    LirReg const x2{static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
+    LirReg const x2 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x2")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1056,9 +1028,8 @@ TEST(Arm64Encoder, LdarW0X1EncodesLoadAcquire) {
     auto const ldarOp = (*s)->opcodeByMnemonic("load_acquire");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(ldarOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1091,9 +1062,8 @@ TEST(Arm64Encoder, StlrW0X1EncodesStoreRelease) {
     auto const stlrOp = (*s)->opcodeByMnemonic("store_release");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(stlrOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1126,9 +1096,8 @@ TEST(Arm64Encoder, StoreSeqCstW0X1IsIdenticalStlr) {
     auto const seqOp = (*s)->opcodeByMnemonic("store_seqcst");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(seqOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1211,11 +1180,10 @@ TEST(Arm64Encoder, MsubEncodesDataProc3Source) {
     auto const msubOp = (*s)->opcodeByMnemonic("msub");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(msubOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
-    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
-    LirReg const x2{static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
-    LirReg const x3{static_cast<std::uint32_t>(*(*s)->registerByName("x3")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
+    LirReg const x2 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x2")), LirRegClass::GPR);
+    LirReg const x3 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x3")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1249,11 +1217,10 @@ TEST(Arm64Encoder, MsubWFormEncodesHighRegs) {
     auto const msubOp = (*s)->opcodeByMnemonic("msub");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(msubOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x3 {static_cast<std::uint32_t>(*(*s)->registerByName("x3")),  1, cls};
-    LirReg const x4 {static_cast<std::uint32_t>(*(*s)->registerByName("x4")),  1, cls};
-    LirReg const x14{static_cast<std::uint32_t>(*(*s)->registerByName("x14")), 1, cls};
-    LirReg const x21{static_cast<std::uint32_t>(*(*s)->registerByName("x21")), 1, cls};
+    LirReg const x3 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x3")), LirRegClass::GPR);
+    LirReg const x4 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x4")), LirRegClass::GPR);
+    LirReg const x14 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x14")), LirRegClass::GPR);
+    LirReg const x21 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x21")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1288,8 +1255,7 @@ TEST(Arm64Encoder, MovkLsl16EncodesHwField01) {
     auto const mkOp  = (*s)->opcodeByMnemonic("movk_lsl16");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(mkOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x5{static_cast<std::uint32_t>(*(*s)->registerByName("x5")), 1, cls};
+    LirReg const x5 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x5")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1324,9 +1290,8 @@ TEST(Arm64Encoder, MovkLsl32And48EncodeHwFields10And11) {
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(mk32Op.has_value() && mk48Op.has_value()
              && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x9 {static_cast<std::uint32_t>(*(*s)->registerByName("x9")),  1, cls};
-    LirReg const x21{static_cast<std::uint32_t>(*(*s)->registerByName("x21")), 1, cls};
+    LirReg const x9 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x9")), LirRegClass::GPR);
+    LirReg const x21 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x21")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1368,9 +1333,7 @@ TEST(Arm64Encoder, MovImm16EncodesMOVZ) {
     auto const movOp = (*s)->opcodeByMnemonic("mov");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(movOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x8{
-        static_cast<std::uint32_t>(*(*s)->registerByName("x8")), 1, cls};
+    LirReg const x8 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x8")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1401,9 +1364,7 @@ TEST(Arm64Encoder, MovImm16DerivesBitFields) {
     ASSERT_TRUE(s.has_value());
     auto const movOp = (*s)->opcodeByMnemonic("mov");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x5{
-        static_cast<std::uint32_t>(*(*s)->registerByName("x5")), 1, cls};
+    LirReg const x5 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x5")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1433,9 +1394,7 @@ TEST(Arm64Encoder, ImmediateWiderThanImm16FailsLoud) {
     ASSERT_TRUE(s.has_value());
     auto const movOp = (*s)->opcodeByMnemonic("mov");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x0{
-        static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x0 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x0")), LirRegClass::GPR);
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
@@ -1491,10 +1450,9 @@ assembleMovImmWord(TargetSchema const& s, std::string_view destReg,
     auto const movOp = s.opcodeByMnemonic("mov");
     auto const retOp = s.opcodeByMnemonic("ret");
     if (!movOp.has_value() || !retOp.has_value()) return std::nullopt;
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
     auto const regId = s.registerByName(destReg);
     if (!regId.has_value()) return std::nullopt;
-    LirReg const dest{static_cast<std::uint32_t>(*regId), 1, cls};
+    LirReg const dest = makePhysicalReg(static_cast<std::uint32_t>(*regId), LirRegClass::GPR);
 
     LirBuilder b{s};
     (void)b.addFunction(SymbolId{1});
@@ -1632,9 +1590,7 @@ TEST(Arm64Encoder, MovNegativeImmediateRoundTripsToTheOriginalValue) {
     auto const movOp = (*s)->opcodeByMnemonic("mov");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(movOp.has_value() && retOp.has_value());
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const x1{
-        static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x1 = makePhysicalReg(static_cast<std::uint32_t>(*(*s)->registerByName("x1")), LirRegClass::GPR);
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
     auto blk = b.createBlock();
@@ -1712,8 +1668,8 @@ TEST(Arm64Encoder, MovPositiveImmediateStillEncodesMovzAfterMovnLanded) {
 
 namespace {
 [[nodiscard]] LirReg gpr(TargetSchema const& s, std::string_view name) {
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    return LirReg{static_cast<std::uint32_t>(*s.registerByName(name)), 1, cls};
+    return makePhysicalReg(static_cast<std::uint32_t>(*s.registerByName(name)),
+                           LirRegClass::GPR);
 }
 } // namespace
 

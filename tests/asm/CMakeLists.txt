@@ -182,3 +182,24 @@ target_link_libraries(dss_asm_test_asm_register_class_gate
     PRIVATE nlohmann_json::nlohmann_json)
 target_include_directories(dss_asm_test_asm_register_class_gate
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE: which register VIEW a
+# modifier-less `%N` substitutes at. The derivation is declared per target and
+# per register class (`asmBareOperandWidths`), because gcc and clang agree with
+# each other and DISAGREE across ports — aarch64 names the full `x` register
+# for every integer type, x86_64 tracks the operand's own type — so one rule
+# fixes one machine by breaking the other. Drives BOTH shipped targets from ONE
+# binding width and asserts they must not agree, plus two config-level mutants
+# (the declaration REMOVED must refuse; the declaration FLIPPED must emit the
+# other port's encoding, which is the control proving the pin is not simply
+# failing in both directions).
+# WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL, so it MUST run through
+# ctest -- dss_add_test sets DSS_CONFIG_ROOT, while a bare .exe walks the cwd
+# and would read whichever tree the shell stands in
+# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_bare_operand_width
+             SOURCES test_asm_bare_operand_width.cpp)
+target_link_libraries(dss_asm_test_asm_bare_operand_width
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_bare_operand_width
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)

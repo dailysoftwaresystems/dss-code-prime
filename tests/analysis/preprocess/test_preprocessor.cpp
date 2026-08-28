@@ -11622,3 +11622,1073 @@ TEST(PreprocessorCounter, ResetsPerTranslationUnit) {
         << "a second translation unit must start its own count at 0";
     EXPECT_EQ(b[8], "1");
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// D-PP-DEFINED-VIA-MACRO-EXPANSION — the `defined` operator ARRIVING VIA MACRO
+// EXPANSION, and the OPERAND BARRIER that makes it answerable.
+//
+// C 6.10.1 leaves the case UNDEFINED, so "the standard requires it" is NOT the
+// argument and these pins do not make it. The argument is the union of the
+// references, ✔MEASURED 2026-08-26 on eighteen shapes across three toolchains:
+//   gcc 13.3.0    `-std=c2x  -pedantic`  ACCEPTS + EVALUATES, warns
+//                                        `-Wexpansion-to-defined`
+//   clang 18.1.3  `-std=c23  -pedantic`  ACCEPTS + EVALUATES, warns
+//                                        `-Wexpansion-to-defined`
+//   MSVC 19.51    `/std:c17 /W4`, BOTH traditional AND `/Zc:preprocessor`
+//                                        ACCEPTS + EVALUATES, warns C5105
+// Unanimous, with IDENTICAL answers on every shape. Apple's own SDK depends on
+// it (`secure/_string.h`'s `__is_modern_darwin`, whose last operand is literally
+// `defined(__DRIVERKIT_VERSION_MIN_REQUIRED)`).
+//
+// ★★ THE PIN THAT MATTERS MOST IS THE OPERAND-PROTECTION ONE
+// (`DefinedViaMacroExpansionDoesNotExpandItsOperand`). Every other shape here
+// would also pass an implementation that simply re-ran the `defined` rewrite
+// after expansion — and that implementation would be WRONG, because by then the
+// operand has already been rescanned and replaced. `#define BAR 0` +
+// `#define HAS_BAR defined(BAR)` is the shape that separates the two: protected,
+// it is `defined(BAR)` == 1 (all three references agree); unprotected, it is
+// `defined(0)`, a DIFFERENT QUESTION rather than a syntax error to report.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// The row's headline shape: an OBJECT-like macro whose replacement list IS
+// `defined(X)`. Both polarities, so a fix that hard-wires "true" is red.
+// ✔REFERENCES: gcc/clang/MSVC all exit 11 (defined) / 22 (undefined).
+TEST(Preprocessor, DefinedViaMacroExpansionObjectLikeBothPolarities) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define FOO 1\n#define HAS_FOO defined(FOO)\n#if HAS_FOO\n"
+            "int a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "a macro-produced `defined` must EVALUATE, not fail loud";
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "a") << "HAS_FOO -> defined(FOO) -> 1 -> #if taken";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define HAS_FOO defined(FOO)\n#if HAS_FOO\n"
+            "int a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "b")
+            << "FOO is NOT defined -> defined(FOO) -> 0 -> #else taken. A fix "
+               "that answers 1 unconditionally passes the sibling case and "
+               "fails here";
+    }
+}
+
+// ★★ THE OPERAND BARRIER. `BAR` is defined TO ZERO, so the two readings differ
+// in ANSWER, not merely in well-formedness:
+//   operand PROTECTED (correct)   -> defined(BAR) -> 1 -> `int a;`
+//   operand EXPANDED  (the bug)   -> defined(0)   -> malformed / 0 -> `int b;`
+// ✔REFERENCES: gcc, clang and MSVC all exit 77 here, i.e. all three protect it.
+TEST(Preprocessor, DefinedViaMacroExpansionDoesNotExpandItsOperand) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define BAR 0\n#define HAS_BAR defined(BAR)\n#if HAS_BAR\n"
+        "int a;\n#else\nint b;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "`defined(BAR)` reached through a macro must not become `defined(0)`";
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "a")
+        << "the operand of `defined` is NEVER macro-expanded (C 6.10.1p1), "
+           "whichever construct produced the operator — BAR is DEFINED, and its "
+           "VALUE (0) is not the question being asked";
+}
+
+// The barrier holds one level deeper: the operand is itself a macro whose own
+// replacement is a macro. ✔REFERENCES: gcc/clang exit 55 (defined(NAME) == 1).
+TEST(Preprocessor, DefinedViaMacroExpansionOperandProtectedThroughAChain) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define FOO 1\n#define NAME FOO\n#define A defined(NAME)\n#if A\n"
+        "int a;\n#else\nint b;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "a")
+        << "NAME is a defined macro, so defined(NAME) is 1 — it must not be "
+           "expanded to FOO (also 1 here) NOR to 1 (which would be malformed)";
+}
+
+// The NO-PAREN form produced by expansion (`#define HAS_FOO defined FOO`), and
+// the operator KEYWORD ITSELF arriving from a macro with the operand written at
+// the call site (`#define D defined` + `#if D(FOO)`). The second is the shape
+// that forces the barrier to be driven over the EXPANDER'S OUTPUT rather than
+// its input — keyword and operand come from two different constructs.
+// ✔REFERENCES: gcc/clang/MSVC exit 99 and 101 respectively.
+TEST(Preprocessor, DefinedViaMacroExpansionNoParenAndKeywordFromAMacro) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define FOO 1\n#define HAS_FOO defined FOO\n#if HAS_FOO\n"
+            "int a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "a") << "`defined FOO` (no parens) via expansion";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define FOO 1\n#define D defined\n#if D(FOO)\n"
+            "int a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "a")
+            << "the KEYWORD comes from `D`'s replacement list and the OPERAND "
+               "from the directive line; a barrier driven over the expander's "
+               "INPUT would never join them and FOO would expand to 1";
+    }
+}
+
+// THE REAL-HEADER SHAPE, transcribed from Apple's `secure/_string.h`
+// (`__is_modern_darwin`): a FUNCTION-like macro whose last operand is a
+// `defined(...)` and whose earlier operands are ordinary comparisons using the
+// parameters. ✔REFERENCES: gcc/clang/MSVC all exit 55.
+TEST(Preprocessor, DefinedViaMacroExpansionRealHeaderFunctionLikeShape) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define A 101000\n#define B 130000\n"
+        "#define IS_MODERN(ios, macos) "
+        "(A >= (macos) || B >= (ios) || defined(NOT_SET))\n"
+        "#if IS_MODERN(120000, 999999)\nint a;\n#else\nint b;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the shipped-SDK shape must compile: this is the population the row "
+           "was opened for";
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "a")
+        << "A(101000) >= 999999 is false, B(130000) >= 120000 is TRUE -> taken";
+}
+
+// The barrier RESETS: two `defined`s produced by expansion in ONE controlling
+// expression must BOTH fold, and an identifier that is NOT a `defined` operand
+// must still expand. ✔REFERENCES: gcc/clang exit 99 and 109 respectively.
+TEST(Preprocessor, DefinedViaMacroExpansionBarrierResetsBetweenOperands) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define P 1\n#define A defined(P)\n#if A && A\n"
+            "int a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "a") << "both occurrences fold to 1";
+    }
+    {
+        // `FOO` appears TWICE in one replacement list: once as the protected
+        // operand of `defined`, once as an ordinary value. Only the first is
+        // protected — the second MUST expand to 3, or `FOO > 2` folds an
+        // identifier to 0 and the branch flips.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define FOO 3\n#define A (defined(FOO) && FOO > 2)\n#if A\n"
+            "int a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "a")
+            << "the barrier is exactly ONE operand wide: the second FOO is a "
+               "value and must still expand to 3";
+    }
+}
+
+// `#elif` takes the same path as `#if` (C 6.10.1p5 makes them one evaluator).
+// ✔REFERENCES: gcc/clang exit 105.
+TEST(Preprocessor, DefinedViaMacroExpansionInElif) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define FOO 1\n#define A defined(FOO)\n#if 0\nint dead;\n#elif A\n"
+        "int a;\n#else\nint b;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "a");
+}
+
+// ★★ THE BAR'S OTHER DIRECTION (§A.3b): accepting what NOT ONE reference accepts
+// is also a defect. A `defined` whose OPERAND is a macro PARAMETER, or a literal
+// `defined(...)` handed to a function-like macro as an ARGUMENT, is pre-expanded
+// before substitution — `defined(1)` — and every reference REFUSES it:
+//   gcc 13.3.0   `error: operator "defined" requires an identifier`
+//   clang 18.1.3 `error: macro name must be an identifier`
+//   MSVC 19.51   `error C2004: expected 'defined(id)'`  (both preprocessors)
+// DSS used to ACCEPT the second one (folding the literal `defined` off the raw
+// directive line before `ID` was ever invoked) and answer 1. Moving the fold to
+// AFTER expansion closes it by construction.
+TEST(Preprocessor, DefinedWithAPreExpandedOperandFailsLoudLikeEveryReference) {
+    {
+        PreprocessResult r;
+        (void)ppLexemes(
+            "#define FOO 1\n#define M(x) defined(x)\n#if M(FOO)\n"
+            "int a;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "the ARGUMENT is pre-expanded (FOO -> 1) before substitution, so "
+               "the operator gets `defined(1)` — all three references refuse it";
+    }
+    {
+        PreprocessResult r;
+        (void)ppLexemes(
+            "#define FOO 1\n#define ID(a) a\n#if ID(defined(FOO))\n"
+            "int a;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "a LITERAL `defined` inside a function-like macro's ARGUMENT list "
+               "is not the top-level operator: the argument is pre-expanded "
+               "first. Answering 1 here is accepting what no reference accepts";
+    }
+}
+
+// NO REGRESSION on the literal form — the path the whole shipped header corpus
+// walks. The `defined(__has_include)` half is the shape
+// `examples/c/has_include_operator_not_shadowable` exists for: an operand that
+// SPELLS an operator must be read as a NAME, never invoked.
+TEST(Preprocessor, LiteralDefinedStillFoldsAfterTheOrderingChange) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define FOO 1\n#if defined(FOO) && !defined(NOPE)\n"
+            "int a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "a");
+    }
+    {
+        // The operand is a defined macro whose VALUE is 0 — the literal-form
+        // twin of the barrier pin above.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define ZERO 0\n#if defined(ZERO)\nint a;\n#else\nint b;\n#endif\n",
+            r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "a")
+            << "literal `defined` must not expand its operand either";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#if defined(__has_include)\nint a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "`__has_include` as the OPERAND of `defined` is a NAME, not an "
+               "invocation — reading it as the operator would fail loud with "
+               "P_PreprocessorHasInclude";
+        ASSERT_EQ(lexs.size(), 3u);
+    }
+}
+
+// AGNOSTICISM pin (RED-ON-DISABLE, and the mutation is in the REMOVE direction:
+// the shipped spelling LOSES its operator status). Rebind
+// `preprocess.definedOperator` from "defined" to "isdefined" and reload. The
+// barrier + the fold must BOTH follow the config:
+//   (1) the NEW spelling now protects its operand through expansion;
+//   (2) the OLD spelling `defined` is now an ORDINARY IDENTIFIER — so the shape
+//       that used to answer the definedness question must NOT still answer it.
+// A hard-coded "defined" anywhere in the barrier or the fold fails (2).
+TEST(Preprocessor, DefinedOperatorSpellingIsConfigDrivenThroughExpansion) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    auto schema = reboundC("\"definedOperator\":     \"defined\"",
+                           "\"definedOperator\":     \"isdefined\"",
+                           "<rebound-defined-c>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().definedOperator, "isdefined");
+
+    auto lexemesOf = [&](std::string text, PreprocessResult& out) {
+        auto buf = SourceBuffer::fromString(std::move(text), "main.c");
+        out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+                         DiagnosticBudget::libraryDefault());
+        std::vector<std::string> lexs;
+        for (Token const& t : out.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            if (t.coreKind == CoreTokenKind::Whitespace) continue;
+            if (t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{out.synthBuffer->slice(t.span)});
+        }
+        return lexs;
+    };
+
+    // (1) the NEW spelling is the operator, barrier and all: ZERO is defined to
+    // 0, so an unprotected operand would give `isdefined(0)` and the #else.
+    {
+        PreprocessResult r;
+        auto lexs = lexemesOf(
+            "#define ZERO 0\n#define A isdefined(ZERO)\n#if A\n"
+            "int a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "a")
+            << "the rebound spelling must carry BOTH the operator and its "
+               "operand barrier";
+    }
+    // (2) THE REMOVE-DIRECTION HALF: the shipped spelling has LOST its operator
+    // status. `defined` is now a plain identifier, so `#if defined(NOPE)` no
+    // longer answers "is NOPE defined" — it is `<identifier> ( <identifier> )`,
+    // which the ICE parser refuses. A silent 1/0 here would mean the spelling is
+    // hard-coded somewhere.
+    {
+        PreprocessResult r;
+        (void)lexemesOf(
+            "#if defined(NOPE)\nint a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "with the operator rebound, a literal `defined` is an ordinary "
+               "identifier — if this still evaluated as the operator, the "
+               "spelling would be hard-coded somewhere";
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// D-PP-DEFINED-VIA-MACRO-EXPANSION, second half: the `__has_*` OPERATOR FAMILY
+// reached VIA MACRO EXPANSION, and the WARNING the references all emit.
+//
+// ✔MEASURED 2026-08-27, each toolchain SEPARATELY, on eleven `__has_*` shapes:
+//   gcc 13.3.0   `-std=c2x -pedantic -I.`
+//   clang 18.1.3 `-std=c23 -pedantic -I.`
+//   MSVC 19.51   `/std:c17 /W4 /I.`, traditional AND `/Zc:preprocessor`
+// All three give IDENTICAL answers on every `__has_include` shape below. The one
+// place MSVC differs is `__has_c_attribute`, which `/std:c17` does not implement
+// at all (it folds the name to 0) — that is the operator's ABSENCE, not a third
+// opinion, so gcc ∪ clang decides that arm.
+//
+// ★★ THE TWO ARMS PULL IN OPPOSITE DIRECTIONS, WHICH IS WHY BOTH ARE PINNED.
+// An operand already spelled `<...>` must NOT be expanded; an operand spelled
+// anything else MUST be. Get either backwards and a shipped header answers the
+// wrong question about which headers exist — silently, since both readings
+// produce a perfectly well-formed 1 or 0.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// The headline shape, both polarities: an object-like macro whose replacement
+// list IS the whole operator call. ✔REFERENCES: 11 / 44 (exists / does not).
+// `__has_include` here uses a name DSS resolves through the shipped descriptor
+// path, so the positive arm is a real resolution, not a stub.
+TEST(Preprocessor, HasIncludeViaMacroExpansionBothPolarities) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define HAS_H __has_include(<no_such_header_xyz.h>)\n#if HAS_H\n"
+            "int a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "a macro-produced `__has_include` must EVALUATE, not fail loud — "
+               "this exact shape was `error[P0013]: trailing tokens after #if "
+               "controlling expression` before the operator fold moved past "
+               "expansion";
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "b") << "the header does not exist -> 0 -> #else";
+    }
+    {
+        // POSITIVE arm through a real on-disk header, so the 1 is a resolution
+        // rather than a constant. Quote form, which is the other spelling.
+        namespace fs = std::filesystem;
+        auto dir = ppScratchRoot() / "dss_pp_hasinc_macro";
+        fs::create_directories(dir);
+        { std::ofstream(dir / "real_hdr.h", std::ios::binary) << "int q;\n"; }
+        auto mainPath = dir / "main.c";
+        { std::ofstream(mainPath, std::ios::binary)
+              << "#define HAS_Q __has_include(\"real_hdr.h\")\n#if HAS_Q\n"
+                 "int a;\n#else\nint b;\n#endif\n"; }
+        auto schema = cSubset();
+        auto buf = SourceBuffer::fromFile(mainPath);
+        ASSERT_NE(buf, nullptr);
+        std::vector<fs::path> noDirs;
+        PreprocessResult r = preprocess(buf, schema, noDirs,
+                                        dss::kDefaultHeaderNameMatching,
+                                        DiagnosticBudget::libraryDefault());
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        std::vector<std::string> lexs;
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            if (t.coreKind == CoreTokenKind::Whitespace) continue;
+            if (t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+        }
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "a")
+            << "the QUOTE form reached through a macro must resolve the real "
+               "header — its NAME is a coalesced literal body whose raw bytes "
+               "are read, which is the read the post-expansion move had to make "
+               "buffer-aware";
+    }
+}
+
+// ★★ THE PROTECTION ARM. `HDR` is a macro, but it sits INSIDE the angle
+// delimiters, so it is part of the header NAME and must not be expanded: this
+// asks for a header literally called `HDR.h`, which does not exist.
+// ✔REFERENCES: gcc, clang and MSVC all answer 0 here.
+// RED-ON-DISABLE shape: expand the interior and it asks for `stdio.h` instead —
+// a perfectly well-formed question, and the wrong one.
+TEST(Preprocessor, HasIncludeAngleInteriorIsNotMacroExpanded) {
+    // ⚠⚠ THE OPERAND MACRO MUST EXPAND TO A NAME THIS RUN ACTUALLY RESOLVES, or
+    // the pin is VACUOUS — and the first draft of it WAS, twice over. First it
+    // used a nonexistent name on both sides, so protected and expanded BOTH
+    // answered 0 and it passed over a completely broken barrier. The second
+    // draft named a real shipped descriptor but went through `ppLexemes`, which
+    // passes NO systemDirs — so the angle path resolved nothing and the arm was
+    // vacuous again, in a way only the control below could see. Both drafts were
+    // green. The control is the whole reason this test means anything.
+    //
+    // FC15c: the angle path maps `<stem.h>` onto `stem.json` on the SYSTEM path,
+    // so the fixture ships a descriptor into a scratch systemDir:
+    //   protected (correct) -> asks for `HDR.h`   -> no `HDR.json`  -> 0 -> #else
+    //   expanded  (the bug) -> asks for `ctype.h` -> `ctype.json`   -> 1 -> #if
+    namespace fs = std::filesystem;
+    auto sysdir = ppScratchRoot() / "dss_pp_angle_interior_sys";
+    fs::create_directories(sysdir);
+    { std::ofstream(sysdir / "ctype.json", std::ios::binary) << "{}\n"; }
+
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#define HDR ctype\n#if __has_include(<HDR.h>)\n"
+        "int a;\n#else\nint b;\n#endif\n", r, {}, {sysdir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "b")
+        << "the `<...>` interior is the header NAME, not an expression: a macro "
+           "spelled inside it stays spelled. `a` here means the interior WAS "
+           "expanded and the build asked about a DIFFERENT header";
+
+    // ★ THE CONTROL, and it is load-bearing: the very name `HDR` expands to IS
+    // resolvable in this run, so the arm above is a real refusal to expand and
+    // not a missing header. Without this the test cannot tell the two apart.
+    PreprocessResult ctl;
+    auto ctlLexs = ppLexemesWithDirs(
+        "#if __has_include(<ctype.h>)\nint a;\n#else\nint b;\n#endif\n",
+        ctl, {}, {sysdir});
+    EXPECT_FALSE(ctl.diagnostics->hasErrors());
+    ASSERT_EQ(ctlLexs.size(), 3u);
+    EXPECT_EQ(ctlLexs[1], "a")
+        << "control: `<ctype.h>` DOES resolve here, so the sibling arm's `b` "
+           "cannot be explained by the header simply being absent";
+
+    // ★★★ AND THIS IS THE ARM THAT ACTUALLY EXERCISES THE BARRIER — the two
+    // above pin the ANSWER but not the MECHANISM, which a red-on-disable run
+    // proved rather than a review: stripping the angle-interior protection left
+    // BOTH of them green, with the mutated object md5 correctly moved.
+    //
+    // ★ WHY THEY CANNOT SEE IT. A header name is read as a RAW BYTE RANGE from
+    // the angle-open token's end to the LAST interior token's end. In `<HDR.h>`
+    // the last interior token is `h`, which sits on the directive line whether or
+    // not `HDR` expanded — so the range, and therefore the answer, is identical
+    // either way. The protection only becomes observable when expanding the
+    // interior MOVES THE END OF THE RANGE, i.e. when the macro IS the last
+    // interior token:
+    //   protected (correct) -> the range is `HDR`, one contiguous run on the
+    //                          directive line -> no `HDR.json` -> 0 -> #else
+    //   expanded  (the bug) -> the last interior token is now on the `#define`
+    //                          line, BEFORE the range's start -> `ppRawRun`
+    //                          refuses -> P_PreprocessorHasInclude
+    // ✔REFERENCES: gcc 13.3.0 and clang 18.1.3 both answer 0 with NO diagnostic
+    // for exactly this shape (`#define HDR realname.h` + `__has_include(<HDR>)`
+    // takes the #else), i.e. both protect the interior here too.
+    PreprocessResult whole;
+    auto wholeLexs = ppLexemesWithDirs(
+        "#define HDR ctype.h\n#if __has_include(<HDR>)\n"
+        "int a;\n#else\nint b;\n#endif\n", whole, {}, {sysdir});
+    EXPECT_FALSE(whole.diagnostics->hasErrors())
+        << "with the interior protected the header name is one contiguous run "
+           "on the directive line; an expanded interior leaves the range ends in "
+           "two different constructs and the operator refuses";
+    ASSERT_EQ(wholeLexs.size(), 3u);
+    EXPECT_EQ(wholeLexs[1], "b")
+        << "the whole interior is the header NAME `HDR`, which does not resolve";
+}
+
+// ★★ THE OPPOSITE ARM, and it is the one a naive "protect the operand like
+// `defined`" fix gets wrong. An operand matching NEITHER `<...>` nor `"..."` IS
+// macro-expanded and re-examined — C's own `#include MACRO` rule (C23 6.10.1p4
+// deferring to 6.10.2). ✔REFERENCES: gcc, clang and MSVC all answer the
+// operator here rather than refusing.
+TEST(Preprocessor, HasIncludeOperandMatchingNeitherFormIsExpandedAndReExamined) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define H <no_such_header_xyz.h>\n#if __has_include(H)\n"
+        "int a;\n#else\nint b;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "`H` matches neither delimited form, so it MUST expand — refusing "
+           "here (P001C, \"requires <header> or \\\"header\\\"\") is what DSS "
+           "did before, and no reference does it";
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "b")
+        << "expanded to <no_such_header_xyz.h>, re-examined, resolved to 0";
+}
+
+// The operator KEYWORD alone from a macro, operand written at the call site —
+// the shape that forces the barrier to be driven over the expander's OUTPUT.
+// And the family composing with `defined` inside ONE replacement list.
+// ✔REFERENCES: both accepted by all three.
+TEST(Preprocessor, HasIncludeKeywordFromAMacroAndComposedWithDefined) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define HI __has_include\n#if HI(<no_such_header_xyz.h>)\n"
+            "int a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "b");
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define FOO 1\n"
+            "#define BOTH (defined(FOO) && !__has_include(<no_such_hdr_xyz.h>))\n"
+            "#if BOTH\nint a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "a")
+            << "two DIFFERENT operators produced by one replacement list, with "
+               "opposite operand rules, must both fold in the same pass";
+    }
+}
+
+// `__has_c_attribute`'s operand IS macro-expanded — the third rule in the
+// family, and the reason the barrier has no state for this operator at all.
+// ✔REFERENCES: gcc AND clang both answer the ATTRIBUTE's version here, i.e. `A`
+// expanded to `deprecated`. (MSVC `/std:c17` does not implement the operator, so
+// it contributes nothing to this arm.)
+TEST(Preprocessor, HasCAttributeOperandIsMacroExpanded) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define A deprecated\n#if __has_c_attribute(A)\nint a;\n#else\n"
+        "int b;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "a")
+        << "`A` expands to `deprecated`, a known attribute -> non-zero. Reading "
+           "the raw operand instead asks about an attribute named `A` -> 0, "
+           "which is what DSS answered before the fold moved past expansion";
+}
+
+// ★★★ THE REFUSAL THAT REPLACED THE OLD REFUSAL, and the reason moving these
+// operators past expansion is safe at all. A header NAME is read as RAW BYTES
+// spanning several tokens, so once expansion can splice two constructs into one
+// operand, a range read across the splice is not malformed — it is a PLAUSIBLE
+// header name made of unrelated bytes, which the resolver would then answer
+// confidently. `ppRawRun` refuses any range that crosses a line, and the
+// operator fails LOUD instead of guessing.
+// ⓘ This is the one shape in the family DSS does not answer. It is not a
+// conformance gap: gcc and clang reject it too (`#include` nested in the middle
+// of a header name is not a form either accepts), and the point of the pin is
+// that DSS's refusal is LOUD and specific rather than a wrong 1 or 0.
+TEST(Preprocessor, HasIncludeHeaderNameSplicedAcrossConstructsFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes(
+        "#define OPENA <no_such\n#if __has_include(OPENA.h>)\nint a;\n#endif\n",
+        r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+        << "half the header name comes from the #define line and half from the "
+           "#if line; the byte range between them is the rest of the file. It "
+           "must fail loud, never resolve whatever those bytes spell";
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "and it is an ERROR — guessing a header name is a silent wrong "
+           "answer, which is the one outcome worse than refusing";
+}
+
+// NO REGRESSION on the literal forms — the path the whole shipped header corpus
+// walks, and the one that had no reason to move.
+TEST(Preprocessor, LiteralHasIncludeStillFoldsAfterTheOrderingChange) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if !__has_include(<no_such_header_xyz.h>)\nint a;\n#else\n"
+        "int b;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "a");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// P_PreprocessorDefinedFromExpansion — the warning all three references emit.
+// ✔MEASURED: gcc `-Wexpansion-to-defined` ("this use of \"defined\" may not be
+// portable"), clang `-Wexpansion-to-defined` ("macro expansion producing
+// 'defined' has undefined behavior"), MSVC `C5105` (clang's wording), the last
+// in BOTH preprocessors. Evaluating in silence is the one behaviour none of the
+// three has.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Diagnosed, at WARNING severity, and translation CONTINUES with the operator
+// evaluated — all three properties asserted, because any one of them alone
+// would be satisfied by a wrong implementation (an error would also be
+// "diagnosed"; a silent evaluation would also "continue").
+TEST(Preprocessor, DefinedFromExpansionIsDiagnosedAsAWarningAndStillEvaluated) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define FOO 1\n#define HAS_FOO defined(FOO)\n#if HAS_FOO\n"
+        "int a;\n#else\nint b;\n#endif\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDefinedFromExpansion))
+        << "all three references say so while evaluating; evaluating in silence "
+           "is the one behaviour none of them has";
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDefinedFromExpansion),
+              DiagnosticSeverity::Warning);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a warning must never bump the error count — the construct is legal "
+           "by consensus and real SDK headers use it deliberately";
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "a") << "and the operator was still EVALUATED";
+}
+
+// The NEGATIVE that makes the pin above non-vacuous: a `defined` written in the
+// directive is NOT diagnosed. Without this, an implementation that warned on
+// every `defined` would pass the sibling test.
+TEST(Preprocessor, LiteralDefinedIsNotDiagnosedAsFromExpansion) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define FOO 1\n#if defined(FOO) && !defined(NOPE)\nint a;\n#else\n"
+        "int b;\n#endif\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorDefinedFromExpansion))
+        << "the literal form is fully defined by C 6.10.1 and must be silent";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "a");
+}
+
+// REACHABILITY (C 6.10p1), the `#error`/`#warning`/`#pragma` invariant: a
+// macro-produced `defined` inside a NOT-TAKEN branch is never evaluated, so it
+// is never diagnosed. Load-bearing rather than decorative — SDK headers park
+// these inside unsupported-configuration branches by the hundred, and a
+// per-lexed-token warning would fire on every one of them.
+TEST(Preprocessor, DefinedFromExpansionInADeadBranchIsSilent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define FOO 1\n#define HAS_FOO defined(FOO)\n#if 0\n#if HAS_FOO\n"
+        "int dead;\n#endif\n#endif\nint a;\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorDefinedFromExpansion))
+        << "a dead `#if` group is parsed only far enough to track nesting; its "
+           "controlling expression is never evaluated and must be silent";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "a");
+}
+
+// SUPPRESSABILITY, pinned as a NEGATIVE against the closed table itself. The
+// membership rule in `unsuppressable_codes.cpp` has two prongs — ship-a-wrong-
+// artifact-green, and fail-with-nothing-said — and this code satisfies NEITHER:
+// suppressing it changes no answer (the operator is still evaluated), ships no
+// bytes and hides no failure. It is also advice about code the author usually
+// cannot edit (Apple's `secure/_string.h` uses the construct on purpose), which
+// is the A_ImmediateNarrowedToOperandField distinction drawn in that file.
+// RED-ON-DISABLE: add the code to the table and this goes red immediately.
+TEST(Preprocessor, DefinedFromExpansionWarningIsSuppressable) {
+    EXPECT_FALSE(isUnsuppressable(
+        DiagnosticCode::P_PreprocessorDefinedFromExpansion))
+        << "`--suppress` must be able to silence exactly this advisory class — "
+           "the P_PreprocessorWarningDirective / S_DeprecatedSymbolUsed posture. "
+           "`--warnings-as-errors` remains the lever for a project that wants "
+           "the construct out of its own sources.";
+    // The sibling that IS in the table, so the assertion above is not vacuously
+    // true against a broken `isUnsuppressable`.
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::P_PreprocessorErrorDirective))
+        << "control: `#error` IS unsuppressable, so a query that answered false "
+           "for everything would fail here";
+}
+
+// ── D-PP-IF-UNSIGNED-INTMAX ─────────────────────────────────────────────────
+// C 6.10.1p4: a `#if`/`#elif` controlling expression is evaluated with every
+// integer type acting as `intmax_t` / `uintmax_t`.
+//
+// ★★ EVERY PIN BELOW IS A TWO-ARM DISCRIMINATOR, AND THAT SHAPE IS MANDATORY
+// RATHER THAN STYLISTIC. This defect selects the WRONG BRANCH and then compiles
+// it perfectly: no diagnostic, exit 0, a different program. A pin that asserted
+// "no errors" or counted diagnostics would have stayed green over it forever --
+// which is exactly what happened. The row spent four months labelled
+// "NOT silently wrong -- fail-loud" while DSS was emitting the opposite branch
+// from a unanimous gcc + clang. So each case writes `taken_if` in one arm and
+// `taken_else` in the other and asserts WHICH SURVIVED; the surviving lexeme is
+// the observation, never the absence of a diagnostic.
+//
+// ⓘ The unit tier reads the surviving TOKEN; the corpus example
+// `examples/c/c_pp_if_intmax` reads the same question out of a running
+// program's EXIT CODE; the lane's probe harness read it out of the emitted
+// object with `nm`. Three independent instruments, one answer.
+//
+// Every expectation is ✔MEASURED against gcc 13.3.0 `-std=c2x` and clang 18.1.3
+// `-std=c23`, probed SEPARATELY, with the taken arm read from the emitted object
+// via `nm`. Where they are cited as unanimous, they agreed.
+namespace {
+
+// The arm a controlling expression selects: "taken_if" / "taken_else", or a
+// description of why neither was observed. Deliberately returns the ARM rather
+// than a bool, so a test that stops discriminating fails loudly instead of
+// degrading into "something compiled".
+[[nodiscard]] std::string ppTakenArm(std::string const& cond,
+                                     PreprocessResult& out) {
+    auto lexs = ppLexemes("#if " + cond + "\nint taken_if;\n#else\n"
+                          "int taken_else;\n#endif\n", out);
+    bool sawIf = false, sawElse = false;
+    for (auto const& l : lexs) {
+        if (l == "taken_if")   sawIf = true;
+        if (l == "taken_else") sawElse = true;
+    }
+    if (sawIf && sawElse) return "BOTH";
+    if (sawIf)   return "taken_if";
+    if (sawElse) return "taken_else";
+    return "NEITHER";
+}
+
+}  // namespace
+
+TEST(PreprocessorIfIntmax, UnsignedLiteralComparesUnsigned) {
+    PreprocessResult r;
+    // gcc: taken_if. clang: taken_if. DSS before the fix: taken_else.
+    EXPECT_EQ(ppTakenArm("18446744073709551615u > 0", r), "taken_if")
+        << "a `u`-suffixed literal above INT64_MAX is unsigned and positive; "
+           "reading it as a signed -1 takes the wrong arm in silence";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+TEST(PreprocessorIfIntmax, SignedOperandConvertsToUnsignedInAMixedComparison) {
+    PreprocessResult r;
+    // C 6.3.1.8: `-1` converts to UINTMAX_MAX, so the comparison is FALSE.
+    // gcc: taken_else. clang: taken_else. DSS before the fix: taken_if.
+    EXPECT_EQ(ppTakenArm("-1 < 0u", r), "taken_else")
+        << "the usual arithmetic conversions make this comparison UNSIGNED; a "
+           "signed comparison answers the opposite";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+// ★ THE WIDTH HALF, WHICH THE ROW DID NOT KNOW ABOUT AND WHICH NEEDS NO
+// UNSIGNED LITERAL AT ALL. The leaf used to stamp every literal `TypeKind::I32`,
+// so `intOpDomain` ran the whole evaluator in 32-BIT signed -- not the "signed
+// int64" the row claimed -- and `wrapToIntTarget` truncated both operands before
+// every comparison. "Is INT64_MAX positive" answered NO.
+TEST(PreprocessorIfIntmax, EvaluationIsSixtyFourBitNotThirtyTwo) {
+    PreprocessResult r;
+    // All three: taken_if. DSS before the fix: taken_else, on all four.
+    EXPECT_EQ(ppTakenArm("9223372036854775807 > 0", r), "taken_if")
+        << "INT64_MAX is positive; a 32-bit domain truncates it to -1";
+    EXPECT_EQ(ppTakenArm("3000000000 > 0", r), "taken_if")
+        << "an ordinary decimal literal above INT32_MAX, no suffix in sight";
+    EXPECT_EQ(ppTakenArm("2147483647 + 1 > 0", r), "taken_if")
+        << "INT32_MAX+1 stays positive at intmax width";
+    EXPECT_EQ(ppTakenArm("(1 << 40) > 0", r), "taken_if")
+        << "a shift past bit 31 must not fall off a 32-bit domain";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+// ★★ THE SIGNEDNESS BOUNDARY IS INTMAX_MAX, NOT THE LITERAL'S OWN C TYPE, AND
+// THIS PAIR IS THE WHOLE REASON `preprocessorLiteralSignedness` EXISTS INSTEAD
+// OF A CALL TO `typeIntegerLiteral`. Asking the ordinary C 6.4.4.1 ladder types
+// `0xFFFFFFFF` as `unsigned int` -- correct 6.4.4.1 -- and carrying that
+// signedness into phase 4 converts `-1` to UINTMAX_MAX and takes the FALSE arm.
+// Both references take the TRUE arm: in phase 4 the only integer types are
+// intmax_t and uintmax_t, so signedness is re-decided at 64 bits.
+TEST(PreprocessorIfIntmax, LiteralSignednessIsDecidedAtIntmaxWidth) {
+    PreprocessResult r;
+    // Straddling INTMAX_MAX exactly. gcc and clang agree on both, opposite ways.
+    EXPECT_EQ(ppTakenArm("0x7FFFFFFFFFFFFFFF > -1", r), "taken_if")
+        << "INTMAX_MAX fits a signed intmax_t, so this is a SIGNED comparison";
+    EXPECT_EQ(ppTakenArm("0x8000000000000000 > -1", r), "taken_else")
+        << "one greater does not fit, so it is unsigned and -1 becomes "
+           "UINTMAX_MAX -- the adjacent cell that proves the boundary is real";
+    // A value that fits intmax_t but NOT a 32-bit int: 6.4.4.1 says `unsigned
+    // int`, phase 4 says signed. This is the cell the ladder-as-written got
+    // wrong, and it is the reason a second helper was needed.
+    EXPECT_EQ(ppTakenArm("0xFFFFFFFF > -1", r), "taken_if")
+        << "6.4.4.1 would type this `unsigned int`; phase 4 re-decides at "
+           "intmax width and both references take the TRUE arm";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+// A SUFFIX still forces unsignedness at any magnitude -- so the rule is not
+// merely "magnitude decides". Without this the previous test would be satisfied
+// by a bogus implementation that ignored suffixes entirely.
+TEST(PreprocessorIfIntmax, AnUnsignedSuffixForcesUnsignedAtAnyMagnitude) {
+    PreprocessResult r;
+    // gcc: taken_else. clang: taken_else.
+    EXPECT_EQ(ppTakenArm("0xFFFFFFFFu > -1", r), "taken_else")
+        << "the `u` suffix makes it unsigned even though the value fits an "
+           "intmax_t -- the control against a magnitude-only implementation";
+    EXPECT_EQ(ppTakenArm("4294967295u > -1", r), "taken_else")
+        << "the same in decimal, so the answer is not a radix artifact";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+// A decimal literal above INTMAX_MAX whose ladder is entirely SIGNED
+// (int/long/long long). ✔MEASURED: gcc warns "integer constant is so large that
+// it is unsigned", clang warns "interpreting as unsigned", and BOTH then take
+// the TRUE arm. Unanimous, so the union rule makes it required.
+TEST(PreprocessorIfIntmax, DecimalAboveIntmaxMaxIsUnsignedNotRefused) {
+    PreprocessResult r;
+    EXPECT_EQ(ppTakenArm("18446744073709551615 > 0", r), "taken_if")
+        << "both references accept this and evaluate it as unsigned with its "
+           "true value; refusing it would diverge from a unanimous pair";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+TEST(PreprocessorIfIntmax, UnsignedArithmeticUsesUnsignedFormsThroughout) {
+    PreprocessResult r;
+    // Each of these folded to the wrong value under a signed 32-bit domain.
+    EXPECT_EQ(ppTakenArm("0u - 1u > 0", r), "taken_if")
+        << "unsigned wraparound is a large positive, not -1";
+    EXPECT_EQ(ppTakenArm("(18446744073709551615u / 2u) == 9223372036854775807", r),
+              "taken_if") << "unsigned division, not signed";
+    EXPECT_EQ(ppTakenArm("(18446744073709551615u % 10u) == 5", r), "taken_if")
+        << "unsigned remainder, not signed";
+    EXPECT_EQ(ppTakenArm("(18446744073709551615u >> 60) == 15", r), "taken_if")
+        << "a LOGICAL right shift on an unsigned operand, not arithmetic";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+// ★ THE REGRESSION DIRECTION. Widening the domain must not make SIGNED
+// arithmetic behave unsigned. Without these, an implementation that simply
+// declared everything unsigned would pass every test above.
+TEST(PreprocessorIfIntmax, SignedArithmeticStaysSigned) {
+    PreprocessResult r;
+    EXPECT_EQ(ppTakenArm("-1 < 0", r), "taken_if")
+        << "a plain signed comparison; unsigned would answer the opposite";
+    EXPECT_EQ(ppTakenArm("(-1 >> 1) == -1", r), "taken_if")
+        << "an ARITHMETIC right shift on a signed operand";
+    EXPECT_EQ(ppTakenArm("(-1 / 2) == 0", r), "taken_if")
+        << "signed division truncating toward zero";
+    EXPECT_EQ(ppTakenArm("2 + 2 == 4", r), "taken_if")
+        << "THE CONTROL: all three implementations agree, so this harness can "
+           "demonstrate AGREEMENT and is not merely stuck reporting divergence";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+// The cell the ROW ITSELF cited as its witness for four months. It is the only
+// shape that came out right before the fix, and by coincidence -- both sides
+// landed on int64 -1. Kept as a pin precisely so the coincidence is recorded:
+// the row's own witness was the cell LEAST able to show the defect.
+TEST(PreprocessorIfIntmax, TheRowsOriginalWitnessCellStillHolds) {
+    PreprocessResult r;
+    EXPECT_EQ(ppTakenArm("0xFFFFFFFFFFFFFFFFu == -1", r), "taken_if")
+        << "right before the fix and right after it, for different reasons";
+    EXPECT_EQ(ppTakenArm("-1 < 0xFFFFFFFFFFFFFFFF", r), "taken_else")
+        << "the sibling that was ALSO right by coincidence";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+// A `#if` whose result is a legitimate unsigned value ABOVE INT64_MAX, used
+// bare as the controlling expression.
+//
+// ⚠ THIS CASE IS *NOT* RED-ON-DISABLE FOR `evaluate()`, AND SAYING SO IS THE
+// POINT. It was written believing it pinned the `asInt64` -> `asBool` change,
+// on the reasoning that the old bridge nullopts for a value above INT64_MAX.
+// ✔MEASURED (red-on-disable arm M3, 2026-08-27): reverting that line alone is
+// GREEN here and the corpus example still exits 42 — indistinguishable from the
+// line-inserting CONTROL arm. The reason is the shipped representation:
+// `intmaxOperand` stores the raw bit pattern in the INT64 arm (it must, or
+// `applyUnaryInt`'s `asInt64` bridge would refuse unary operators on large
+// unsigned values), and `asInt64`'s int64 arm always succeeds. The prediction
+// held only for the `uint64_t`-arm representation that was planned and not used.
+//
+// It is kept because the FACT is worth pinning — `#if UINT64_MAX` is truthy and
+// must not be refused — and because it is the case that would go red first if
+// any future producer here starts minting a `uint64_t` or `BitIntValue` arm.
+// Do not describe it as pinning `evaluate()`; it pins the behaviour, not the line.
+TEST(PreprocessorIfIntmax, AnUnsignedResultAboveIntmaxMaxIsTruthyNotRefused) {
+    PreprocessResult r;
+    EXPECT_EQ(ppTakenArm("18446744073709551615u", r), "taken_if")
+        << "UINT64_MAX is non-zero, so the branch is taken; asking whether it "
+           "fits an int64 asks a question C 6.10.1p2 never asks";
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "and it must not be reported as `not an integer constant`";
+}
+
+// ── THE SETTLED REFERENCE SPLIT, PINNED SO IT IS NOT RE-OPENED AS A GAP ──────
+// A literal too large for `uintmax_t` has no cast-free route into a `#if` other
+// than being written out. ✔MEASURED: clang REFUSES ("integer literal is too
+// large to be represented"); gcc accepts with a warning and evaluates a
+// TRUNCATED value. The references disagree, and the one that "accepts" does so
+// only by destroying the value -- the same silent wrongness this row exists to
+// remove. DSS refuses, matching clang and the fail-loud side. RULED 2026-08-27;
+// this pin records the ruling, it is not a defect report.
+TEST(PreprocessorIfIntmax, LiteralAboveUintmaxMaxIsRefusedMatchingClang) {
+    PreprocessResult r;
+    EXPECT_EQ(ppTakenArm("340282366920938463463374607431768211455 > 0", r),
+              "taken_else")
+        << "a refused controlling expression is treated as false by the caller";
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "and it must FAIL LOUD rather than silently pick an arm -- the "
+           "distinction from every other case in this block";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-PP-IF-LARGE-DECIMAL-LITERAL-HAS-NO-WARNING — the ADVICE half of the block
+// above. The branch is already right; what was missing is that both references
+// SAY the literal was reinterpreted, and DSS said nothing.
+//
+// ★★ THE PIN IS A PAIR AND THE SECOND HALF IS WHAT MAKES IT NON-VACUOUS. A pin
+// that only asserted PRESENCE would stay green over a diagnostic that fired on
+// every literal in the language. Each negative below is MEASURED on both
+// references, not reasoned: a `u` suffix, a hexadecimal spelling and a value at
+// INTMAX_MAX exactly all draw NO warning from gcc 13.3.0 or clang 18.1.3, and
+// `9223372036854775808` — one more than INTMAX_MAX — draws one from both. The
+// boundary is therefore pinned from both sides.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST(PreprocessorIfIntmax, DecimalAboveIntmaxMaxWarnsThatItIsUnsigned) {
+    PreprocessResult r;
+    EXPECT_EQ(ppTakenArm("18446744073709551615 > 0", r), "taken_if")
+        << "the ARM is unchanged by the warning -- both references warn and "
+           "then take this arm, and so must DSS";
+    EXPECT_EQ(ppCodeSeverity(r,
+                  DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned),
+              DiagnosticSeverity::Warning)
+        << "gcc: `integer constant is so large that it is unsigned`; clang: "
+           "`interpreting as unsigned`. Both on by default at -std=c2x with no "
+           "-W flag, so the union rule makes the warning REQUIRED";
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "and it must stay a WARNING: making it an error would REFUSE a "
+           "construct both references compile, breaking the union rule in the "
+           "other direction";
+}
+
+TEST(PreprocessorIfIntmax, TheImplicitlyUnsignedWarningIsAbsentWhereBothReferencesAreSilent) {
+    // (1) SUFFIXED. The `u` rule's candidates are unsigned outright, so nothing
+    // was reinterpreted. gcc: silent. clang: silent.
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("18446744073709551615u > 0", r), "taken_if");
+        EXPECT_FALSE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned))
+            << "an explicit `u` is not a surprise -- warning here would be an "
+               "invented diagnostic neither reference emits";
+    }
+    // (2) NON-DECIMAL. C 6.4.4.1 gives a hex literal unsigned candidates, so
+    // again nothing was reinterpreted. Both spellings measured silent on both.
+    for (char const* hex : {"0xFFFFFFFFFFFFFFFF > 0", "0x8000000000000000 > 0"}) {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm(hex, r), "taken_if");
+        EXPECT_FALSE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned))
+            << "hexadecimal: " << hex << " -- neither reference warns";
+    }
+    // (3) THE BOUNDARY, from below. INTMAX_MAX itself fits a signed candidate.
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("9223372036854775807 > 0", r), "taken_if");
+        EXPECT_FALSE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned))
+            << "INTMAX_MAX exactly -- silent on both references";
+    }
+    // (4) THE BOUNDARY, from above, one greater. This one DOES warn on both, so
+    // the boundary is exact rather than approximately right.
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("9223372036854775808 > 0", r), "taken_if");
+        EXPECT_TRUE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned))
+            << "INTMAX_MAX + 1 -- gcc and clang both warn here";
+    }
+    // (5) AN ORDINARY LITERAL. The control that the warning is not simply on.
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("42 > 0", r), "taken_if");
+        EXPECT_FALSE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-FFI-DESCRIPTOR-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR
+//
+// A shipped descriptor's `constants` surface reached the SEMANTIC seam and
+// nothing else, so after `#include <limits.h>` the preprocessor read `UINT_MAX`
+// as C 6.10.1p4's "identifier that survived expansion" = 0 and took the
+// OPPOSITE branch from gcc AND clang, at rc=0 with no diagnostic.
+//
+// ★★ EVERY CELL BELOW IS ARM-DISCRIMINATING, never "it compiled". A wrong
+// branch IS a successful compile of the wrong program, so a pin that asserts
+// `!hasErrors()` is structurally blind to the entire defect class.
+//
+// ★ THE HARNESS SYNTHESIZES ITS OWN DESCRIPTOR rather than reading the shipped
+// `limits.json`, so it pins the MECHANISM (a `constants` row becomes a
+// preprocessor macro with the right value AND the right signedness) and not one
+// header's current contents.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+// Write a descriptor exercising all four shapes the splice must get right:
+// an unsigned constant, a signed one, the MOST NEGATIVE value of its width, and
+// a `preprocessorVisible: false` row that must NOT become a macro.
+[[nodiscard]] std::filesystem::path ppConstantsSysDir() {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_pp_shipped_constants_sys";
+    fs::create_directories(dir);
+    std::ofstream(dir / "limits.json", std::ios::binary) << R"({
+  "header": "limits.h",
+  "constants": [
+    { "name": "T_UINT_MAX", "value": 4294967295, "type": "u32" },
+    { "name": "T_INT_MAX",  "value": 2147483647, "type": "i32" },
+    { "name": "T_INT_MIN",  "value": -2147483648, "type": "i32" },
+    { "name": "T_CHAR_BIT", "value": 8, "type": "i32" },
+    { "name": "T_ENUMERATOR", "value": 3, "type": "i32",
+      "preprocessorVisible": false }
+  ]
+}
+)";
+    return dir;
+}
+
+// The taken arm of `#if <cond>` after `#include <limits.h>`, with the synthetic
+// descriptor on the system path.
+[[nodiscard]] std::string ppShippedConstantArm(std::string const& cond,
+                                               PreprocessResult& out) {
+    auto const dir = ppConstantsSysDir();
+    auto lexs = ppLexemesWithDirs(
+        "#include <limits.h>\n#if " + cond
+            + "\nint taken_if;\n#else\nint taken_else;\n#endif\n",
+        out, {}, {dir});
+    bool sawIf = false, sawElse = false;
+    for (auto const& l : lexs) {
+        if (l == "taken_if")   sawIf = true;
+        if (l == "taken_else") sawElse = true;
+    }
+    if (sawIf && sawElse) return "BOTH";
+    if (sawIf)   return "taken_if";
+    if (sawElse) return "taken_else";
+    return "NEITHER";
+}
+}  // namespace
+
+TEST(PreprocessorShippedConstants, AConstantsRowIsVisibleToDefinedAndToIf) {
+    PreprocessResult r;
+    EXPECT_EQ(ppShippedConstantArm("defined(T_UINT_MAX)", r), "taken_if")
+        << "THE DISCRIMINATING CELL. `defined()` on a `constants` row was FALSE "
+           "while `defined()` on a `macros` row was TRUE -- which is how this "
+           "defect was localised to the surface rather than to the bridge";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+TEST(PreprocessorShippedConstants, TheThreeMeasuredWrongArmsNowMatchBothReferences) {
+    // gcc 13.3.0 -std=c2x and clang 18.1.3 -std=c2x, probed SEPARATELY with the
+    // arm read from the emitted object via `nm`: taken_if on all three, against
+    // DSS's taken_else on all three before this fix.
+    for (auto const* cond : {"T_UINT_MAX > T_INT_MAX",
+                             "T_UINT_MAX > 0",
+                             "T_INT_MIN < 0",
+                             "T_CHAR_BIT == 8"}) {
+        PreprocessResult r;
+        EXPECT_EQ(ppShippedConstantArm(cond, r), "taken_if")
+            << "cell: " << cond;
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << "cell: " << cond;
+    }
+}
+
+// ★★ THE SIGNEDNESS CELL, and it is the one a decimal-only implementation
+// FAILS. `-1 < UINT_MAX` is FALSE in gcc and clang because UINT_MAX is unsigned
+// and the -1 converts to uintmax_t. Spell the constant `4294967295` instead of
+// `4294967295u` and this arm flips -- so this cell, alone among them, proves the
+// splice carries the declared SIGNEDNESS and not merely the value.
+TEST(PreprocessorShippedConstants, AnUnsignedConstantConvertsTheOtherOperand) {
+    PreprocessResult r;
+    EXPECT_EQ(ppShippedConstantArm("-1 < T_UINT_MAX", r), "taken_else")
+        << "a signed spelling of the same value takes the OPPOSITE arm; both "
+           "references take this one";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+// ★ THE NEGATIVE THE SURFACE OWES, in the direction that matters. A name that
+// is an ENUMERATION CONSTANT in C (`memory_order_seq_cst`, `thrd_success`) is
+// NOT a macro in either reference; making it one would be an invented extension
+// -- above the union, which the bar forbids exactly as firmly as falling below
+// it. `preprocessorVisible: false` is the ONE field both seams read, and this
+// pin is what stops a future "splice every constant" simplification.
+TEST(PreprocessorShippedConstants, ASemanticOnlyConstantDoesNotBecomeAMacro) {
+    PreprocessResult r;
+    EXPECT_EQ(ppShippedConstantArm("defined(T_ENUMERATOR)", r), "taken_else")
+        << "a `preprocessorVisible: false` row must stay invisible to the "
+           "preprocessor while remaining a semantic constant";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+// THE CONTROL. An expression with no shipped constant in it at all, so this
+// harness can demonstrate AGREEMENT and is not merely stuck reporting
+// divergence -- and a descriptor that failed to load would fail this too.
+TEST(PreprocessorShippedConstants, ControlAnOrdinaryConditionIsUnaffected) {
+    PreprocessResult r;
+    EXPECT_EQ(ppShippedConstantArm("2 + 2 == 4", r), "taken_if");
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}

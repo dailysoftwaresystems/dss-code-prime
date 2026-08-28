@@ -829,6 +829,12 @@ static std::optional<CuMirModule> buildCuMirImpl(
         grammar.semantics().pointerAliasing.strictAliasingOnDistinctTypes;
     mirCfg.charTypesAliasAll =
         grammar.semantics().pointerAliasing.charTypesAliasAll;
+    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the SAME shape, and threaded
+    // here for the same reason — `void`/function operand sizes are a per-LANGUAGE
+    // fact (GNU C says 1, ISO C says none) read at TWO tiers, so the schema states
+    // it once and both the semantic const-fold and HIR→MIR read that one
+    // declaration. Absent ⇒ the strict-ISO refusal, unchanged.
+    mirCfg.nonObjectTypeSizes = grammar.semantics().nonObjectTypeSizes;
     // FC6: thread the active target's aggregate-layout params + the format's data
     // model so HIR→MIR can fold `sizeof(T)` to T's byte size via the type_layout
     // engine. The target supplies the alignment rule, the format the pointer width.
@@ -2248,12 +2254,29 @@ struct PlatformExternRealization {
 // program: the caller must then behave exactly as it did before this oracle
 // existed. `latticeOwner` / `latticeLabel` name the throwaway lattice the
 // descriptor decode needs; nothing reads the resulting TypeIds here.
+//
+// ── `reporter` — D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED
+//
+// ★★ IT IS THE REAL REPORTER, NOT A THROWAWAY, AND THE DISTINCTION IS THE FIX.
+// Every OTHER descriptor fault this path meets belongs to a descriptor the user
+// never asked for, so it is deliberately swallowed (see the skip rationale in the
+// oracle's header). A cross-descriptor realization DISAGREEMENT is the opposite
+// kind of fault: it is not "some unrelated file is malformed", it is "the corpus
+// gives TWO answers for a name THIS BUILD IS BINDING and the tie-break is a path
+// sort". Swallowing it is exactly the silence being deleted, so it travels on the
+// build's own reporter.
+//
+// ⓘ THE CALLER MUST REFUSE — the conflict is NOT in the return value. `nullopt`
+// keeps its single meaning ("the corpus directory could not be located", benign,
+// route unbound); a conflict is signalled by `reporter.errorCount()` having
+// moved, which is the `tierClean` idiom used throughout this file.
 [[nodiscard]] std::optional<std::unordered_map<std::string, PlatformExternRealization>>
 realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
                                      TargetSchema const&          target,
                                      ObjectFormatSchema const&    format,
                                      CompilationUnitId            latticeOwner,
-                                     std::string_view             latticeLabel) {
+                                     std::string_view             latticeLabel,
+                                     DiagnosticReporter&          reporter) {
     std::unordered_map<std::string, PlatformExternRealization> out;
     if (onBinaryNames.empty()) return out;
 
@@ -2354,7 +2377,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
 
     if (!forwardRequest.empty()) {
         auto const realized = ffi::realizeShippedExternSymbols(
-            forwardRequest, lattice.interner(), lattice.registry(),
+            forwardRequest, lattice.interner(), lattice.registry(), reporter,
             format.dataModel(), std::optional<std::string_view>{target.name()},
             format.kind(), namedTypes);
         if (!realized.has_value()) return std::nullopt;   // corpus not located
@@ -2396,10 +2419,18 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
         everyName.push_back(name);
     }
     if (everyName.empty()) return out;
+    // ★ THE AGREEMENT CHECK THIS CALL RUNS IS CORPUS-WIDE, BECAUSE THE QUESTION
+    // IS. Every other caller asks about a handful of names and is held to those;
+    // this arm genuinely asks "realize EVERY name", because the reverse index it
+    // is building is keyed on realized link names and cannot be narrowed before
+    // the realization exists. So a disagreement anywhere in the corpus is a
+    // disagreement about an answer this call is computing, and it is reported.
+    // ⓘ It is reached only when the FORWARD pass left a name unbound, so the
+    // ordinary build never pays for it.
     auto const wholeCorpus = ffi::realizeShippedExternSymbols(
-        everyName, lattice.interner(), lattice.registry(), format.dataModel(),
-        std::optional<std::string_view>{target.name()}, format.kind(),
-        namedTypes);
+        everyName, lattice.interner(), lattice.registry(), reporter,
+        format.dataModel(), std::optional<std::string_view>{target.name()},
+        format.kind(), namedTypes);
     if (!wholeCorpus.has_value()) return std::nullopt;   // corpus not located
 
     // on-binary name -> the row realizing to it. A SECOND row claiming one name
@@ -3017,9 +3048,20 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
             // the member's source language — an archive member has none in this
             // process. `format.name()` is the one fact that is actually true of
             // every member being bound here.
+            // D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED:
+            // the oracle reports a cross-descriptor realization disagreement on
+            // THIS reporter and still answers the name (omitting it would route
+            // it unbound and file the config's fault against the user's program).
+            // The refusal is therefore the caller's, off the errorCount snapshot
+            // — and it must be spelled here rather than left to a later tier,
+            // because the enclosing `entry` snapshot was taken before this
+            // function ran and nothing between here and the link would compare.
+            auto const corpusEntry = reporter.errorCount();
             auto const realized = realizePlatformExternsByOnBinaryName(
                 names, target, format,
-                substrate::mintMonotonicId<CompilationUnitId>(), format.name());
+                substrate::mintMonotonicId<CompilationUnitId>(), format.name(),
+                reporter);
+            if (!tierClean(reporter, corpusEntry)) return std::nullopt;
             // nullopt ⇒ the shippedLibs directory could not be located: a
             // statement about the ENVIRONMENT, never about the user's program.
             // Every name stays unbound and the link tier judges the reference,
@@ -3429,8 +3471,16 @@ namespace {
         writtenNames.push_back(e.libraryPath.empty() ? e.mangledName
                                                      : std::string{});
     }
+    // D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED: see the
+    // archive member's twin of this snapshot. The oracle reports a
+    // cross-descriptor realization disagreement on `reporter` and still answers
+    // the name; refusing is this caller's job, and it has to happen HERE —
+    // `compileAsmUnit` takes its `asmEntry` snapshot AFTER this function returns,
+    // so an error raised inside it would be carried past the tier gate.
+    auto const corpusEntry = reporter.errorCount();
     auto const realized = realizePlatformExternsByOnBinaryName(
-        writtenNames, target, format, cu.id(), grammar.name());
+        writtenNames, target, format, cu.id(), grammar.name(), reporter);
+    if (!tierClean(reporter, corpusEntry)) return false;
     // nullopt ⇒ the shippedLibs directory could not be located. A statement
     // about the ENVIRONMENT, never about the user's program: every name stays
     // unbound and the link tier judges the reference, exactly as before this

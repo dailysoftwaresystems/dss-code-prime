@@ -568,7 +568,7 @@ TEST(MachoDylibFormatPolicy, OutputExtensionIsDylib) {
     auto loaded = loadShippedDylib();
     ASSERT_TRUE(loaded.format);
     TargetSpec const spec{"arm64", "macho64-arm64-darwin-dylib"};
-    EXPECT_EQ(spec.outputExtension(*loaded.format), ".dylib");
+    EXPECT_EQ(outputExtensionFor(*loaded.format), ".dylib");
 }
 
 // ── (1) Header pins: the MH_DYLIB shape ──────────────────────────

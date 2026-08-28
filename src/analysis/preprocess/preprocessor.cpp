@@ -6,6 +6,7 @@
 #include "analysis/preprocess/pp_if_eval.hpp"
 #include "core/types/header_case_diagnostic.hpp"   // reportHeaderCaseAmbiguity (the ONE fold-collision emit)
 #include "core/types/include_path_resolve.hpp"
+#include "core/types/integer_literal_ladder.hpp"  // preprocessorLiteralSignedness (the ONE phase-4 signedness rule the shipped-constant spelling is verified against)
 #include "core/types/literal_close_token.hpp"   // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN
 #include "core/substrate/phase_timers.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
@@ -1218,6 +1219,109 @@ struct SynthBuilder {
         // downstream tokenizer + handleDefine build the MacroDef with the proven
         // function-like / param / redefinition machinery (an identical re-define on
         // a double-include is idempotent).
+        // ── D-FFI-DESCRIPTOR-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR ─────────
+        // Render one preprocessor-visible descriptor CONSTANT into the literal
+        // this language spells it with, so the synthetic `#define` below can go
+        // through the SAME `handleDefine` every `macros` entry uses. The
+        // descriptor hands over a NEUTRAL triple (value bits, signedness,
+        // width); everything language-shaped happens here, driven by the
+        // language's OWN `semantics.integerLiteralTyping` ladder.
+        //
+        // ★ THE SUFFIX IS SEARCHED AND VERIFIED, NEVER TABULATED. There is no
+        // "unsigned means `u`" map in this file: the candidate spellings are the
+        // config's own `suffixes` arrays, and the winner is the first whose
+        // PHASE-4 signedness — asked of `preprocessorLiteralSignedness`, the one
+        // rule the `#if` evaluator itself uses — equals the declared one. So the
+        // spelled macro and the evaluator that reads it cannot disagree, and a
+        // language whose ladder has different suffixes needs no change here.
+        //
+        // ⚠ AND THE SIGNEDNESS IS THE WHOLE POINT, not a detail. `#if -1 <
+        // UINT_MAX` is FALSE in gcc AND clang (the -1 converts to uintmax_t)
+        // and TRUE for any signed spelling of the same value. A decimal
+        // `4294967295` would take the wrong arm just as surely as the missing
+        // definition did — the defect would have moved, not closed.
+        //
+        // TWO FORMS, and the second exists for exactly one reason:
+        //   `<digits><suffix>`      — the ordinary case.
+        //   `(-<digits-1><sfx> - 1)`— the MOST NEGATIVE value of the declared
+        //                             width. `-2147483648` is not a literal in
+        //                             C, it is unary minus applied to
+        //                             `2147483648`, which no `int` candidate
+        //                             holds — so the naive spelling types
+        //                             `INT_MIN` as `long` and silently changes
+        //                             `sizeof(INT_MIN)` and every `_Generic` on
+        //                             it. Both references' own <limits.h> spell
+        //                             it compensated for this reason (gcc:
+        //                             `(-0x7fffffff - 1)`), and the condition is
+        //                             purely NUMERIC (value == -(2^(w-1))), so
+        //                             no language knowledge enters.
+        // A negative value is parenthesized so a use like `a-EOF` cannot re-parse
+        // (the references parenthesize too: glibc spells `EOF` as `(-1)`).
+        //
+        // nullopt ⇒ no spelling this language's ladder verifies. The caller
+        // REFUSES the descriptor rather than splicing a literal whose signedness
+        // it could not confirm — a wrong branch in silence is the one outcome
+        // this whole seam exists to prevent.
+        auto const spellConstant =
+            [this](ffi::ShippedPpConstant const& k) -> std::optional<std::string> {
+            auto const rules = schema->semantics().integerLiteralTyping;
+            if (rules.empty()) return std::nullopt;
+            NumberStyle const* const ns = schema->numberStyle();
+
+            // The first suffix spelling whose PHASE-4 signedness matches, for a
+            // literal of this magnitude. Iterates the rules in CONFIG ORDER, so
+            // the least-decorated spelling that works wins.
+            auto const suffixFor =
+                [&](std::uint64_t magnitude, bool wantUnsigned)
+                -> std::optional<std::string> {
+                for (auto const& r : rules) {
+                    // The unsuffixed rule is spelled by the EMPTY string; every
+                    // other rule contributes each of its own spellings.
+                    std::vector<std::string> spellings;
+                    if (r.suffixes.empty()) spellings.emplace_back();
+                    else for (auto const& s : r.suffixes) spellings.push_back(s);
+                    for (auto const& s : spellings) {
+                        std::string const text = std::to_string(magnitude) + s;
+                        auto const sgn = preprocessorLiteralSignedness(
+                            text, ns, rules, magnitude);
+                        if (sgn.has_value() && (*sgn != wantUnsigned)) return s;
+                    }
+                }
+                return std::nullopt;
+            };
+
+            if (k.isUnsigned) {
+                std::uint64_t const mag =
+                    (k.width >= 64)
+                        ? static_cast<std::uint64_t>(k.value)
+                        : (static_cast<std::uint64_t>(k.value)
+                           & ((std::uint64_t{1} << k.width) - 1));
+                auto const sfx = suffixFor(mag, /*wantUnsigned=*/true);
+                if (!sfx.has_value()) return std::nullopt;
+                return std::to_string(mag) + *sfx;
+            }
+
+            std::int64_t const v = k.value;   // already sign-correct in the carrier
+            if (v >= 0) {
+                auto const sfx = suffixFor(static_cast<std::uint64_t>(v),
+                                           /*wantUnsigned=*/false);
+                if (!sfx.has_value()) return std::nullopt;
+                return std::to_string(v) + *sfx;
+            }
+            // Negative. `-v` as a MAGNITUDE, computed in uint64 so the most
+            // negative value does not overflow on its way to being spelled.
+            std::uint64_t const mag =
+                ~static_cast<std::uint64_t>(v) + 1u;   // two's-complement negate
+            bool const mostNegative =
+                (k.width <= 64) && (mag == (std::uint64_t{1} << (k.width - 1)));
+            std::uint64_t const spelled = mostNegative ? (mag - 1u) : mag;
+            auto const sfx = suffixFor(spelled, /*wantUnsigned=*/false);
+            if (!sfx.has_value()) return std::nullopt;
+            std::string body = "-" + std::to_string(spelled) + *sfx;
+            if (mostNegative) body += " - 1";
+            return "(" + body + ")";
+        };
+
         auto const spliceMacro = [&out](ffi::ShippedMacro const& macro) {
             std::string def = "#define " + macro.name;
             if (macro.params.has_value()) {
@@ -1301,6 +1405,61 @@ struct SynthBuilder {
                     return;
                 }
                 for (auto const& macro : *macros) spliceMacro(macro);
+
+                // D-FFI-DESCRIPTOR-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR: the
+                // SECOND surface this chokepoint owes the translation unit. It
+                // rides the SAME closure walk, the SAME per-format availability
+                // gate and the SAME throwaway-reporter discipline as the macros
+                // above, so the two surfaces of one descriptor can never reach
+                // the TU under different conditions.
+                //
+                // ⓘ NO ACTIVE TARGET IS THREADED, and the loader makes that
+                // safe rather than lucky: a `preprocessorVisible` constant may
+                // key its `variants` on `format` ONLY (refused at load
+                // otherwise), and the format IS threaded. That refusal is what
+                // stops an arch-keyed constant from being silently absent from
+                // `#if` on every target.
+                // ⓘ REUSES `macroRep` rather than constructing a second
+                // throwaway. Not merely tidy: the reporter-enumeration pin
+                // (anchor
+                // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE)
+                // walks every `DiagnosticReporter` built in this file and
+                // requires each to carry the operator's budget or to be
+                // allowlisted with a reason — and it CAUGHT the second one. One
+                // reporter for both surface reads of one descriptor is the
+                // correct answer anyway: they share the same discard discipline
+                // and the same owner downstream.
+                auto consts = ffi::readShippedLibConstants(
+                    p, macroRep, std::nullopt, activeFormat);
+                if (!consts) {
+                    // The macros read above already decides Malformed for the
+                    // parent; a constants-only defect is surfaced by the
+                    // import-resolver / semantic tier that reads the SAME
+                    // descriptor with a positioned span. Silent here.
+                    return;
+                }
+                for (auto const& k : *consts) {
+                    auto const spelled = spellConstant(k);
+                    if (!spelled.has_value()) {
+                        // FAIL LOUD, and on the LIVE-branch condition only —
+                        // the same dead-branch inertness the malformed-macro
+                        // arm keeps. A constant whose spelling this language's
+                        // ladder cannot verify is NOT spliced with a guess: the
+                        // name then stays undefined, `#if` reads it as 0 and the
+                        // semantic tier still fails loud on any real use.
+                        if (reportMalformed) {
+                            emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                                   BufferId{}, SourceSpan::empty(0),
+                                   std::string{"shipped-header descriptor constant '"}
+                                       + k.name + "' has no literal spelling this "
+                                         "language's integerLiteralTyping ladder "
+                                         "verifies (descriptor "
+                                       + p.generic_string() + ")");
+                        }
+                        continue;
+                    }
+                    out.append("#define " + k.name + " " + *spelled + "\n");
+                }
             },
             [&](std::string const&, HeaderSearchResult const&) {
                 /* import resolver owns F_ShippedHeaderNotFound AND
@@ -1485,16 +1644,35 @@ struct SynthBuilder {
     // conservative by `sbEvalIfOperand`. Substituted tokens are MINTED into the
     // per-eval `product` string (never carried as foreign-buffer spans), so the
     // shared map stays buffer-independent.
+    // ⚠ `barrier`: see `sbMakeIfOperandBarrier` just below this function for
+    // what it is. It is threaded BY REFERENCE through the recursion rather
+    // than re-created per frame — that is what makes it compose ACROSS the
+    // replacement-list boundary. `#define D defined` + `#if D(FOO)` produces the
+    // KEYWORD inside a recursive frame and its OPERAND in the parent's remaining
+    // input; a per-frame barrier would see the two halves separately and protect
+    // neither, and `FOO` would expand to `1` before the operator ever ran (all
+    // three references answer 1 here — the operand is protected).
+    // D-PP-DEFINED-VIA-MACRO-EXPANSION.
     std::vector<Token> sbExpand(std::vector<Token> const& in,
                                 SourceBuffer const& buf, std::string& product,
-                                std::set<std::string>& active, int depth) const {
+                                std::set<std::string>& active, int depth,
+                                PpIfOperandBarrier& barrier) const {
         if (depth > 32) return in;   // backstop (a pathological cycle the guard
                                      // missed never loops the host)
         std::vector<Token> outToks;
         outToks.reserve(in.size());
         for (Token const& t : in) {
-            if (t.coreKind == CoreTokenKind::Word) {
-                std::string name{sbTextOf(t, buf, product)};
+            bool const isWordTok = (t.coreKind == CoreTokenKind::Word);
+            std::string name;
+            if (isWordTok) name = std::string{sbTextOf(t, buf, product)};
+            // A PROTECTED token is copied verbatim -- never looked up in the
+            // macro table, so `defined(BAR)` cannot become `defined(0)`.
+            if (barrier.protects(t, isWordTok ? std::string_view{name}
+                                              : std::string_view{})) {
+                outToks.push_back(t);
+                continue;
+            }
+            if (isWordTok) {
                 auto it = localMacros.find(name);
                 if (it != localMacros.end() && !it->second.functionLike
                     && active.find(name) == active.end()) {
@@ -1502,7 +1680,8 @@ struct SynthBuilder {
                     std::vector<Token> minted = sbMintProduct(
                         it->second.replacementText, buf, product);
                     std::vector<Token> sub =
-                        sbExpand(minted, buf, product, active, depth + 1);
+                        sbExpand(minted, buf, product, active, depth + 1,
+                                 barrier);
                     active.erase(name);
                     for (Token const& s : sub) outToks.push_back(s);
                     continue;
@@ -1511,6 +1690,17 @@ struct SynthBuilder {
             outToks.push_back(t);
         }
         return outToks;
+    }
+
+    // D-PP-DEFINED-VIA-MACRO-EXPANSION: the ONE place this pass builds a
+    // `defined`-operand barrier (`PpIfOperandBarrier`, pp_if_eval.hpp — the same
+    // class the authoritative expander and the evaluator use, so all three
+    // agree on what a `defined` operand IS by construction). Keyword + paren
+    // KINDS come from the schema, so a language declaring no `defined` operator
+    // gets a provably inert barrier (empty keyword -> every query answers false)
+    // and this pass behaves exactly as it did before the row.
+    [[nodiscard]] PpIfOperandBarrier sbMakeIfOperandBarrier() const {
+        return PpIfOperandBarrier{*schema};
     }
 
     // c17: evaluate an `#if`/`#elif` controlling expression in the SynthBuilder
@@ -1572,11 +1762,31 @@ struct SynthBuilder {
             [this, &buf, &sbProduct,
              &sbPostExpandUncertain](std::vector<Token> const& in) {
                 std::set<std::string> active;
-                std::vector<Token> out = sbExpand(in, buf, sbProduct, active, 0);
+                // D-PP-DEFINED-VIA-MACRO-EXPANSION: one barrier per evaluation,
+                // threaded through the whole recursion (see `sbExpand`).
+                PpIfOperandBarrier barrier = sbMakeIfOperandBarrier();
+                std::vector<Token> out =
+                    sbExpand(in, buf, sbProduct, active, 0, barrier);
+                // D-PP-DEFINED-VIA-MACRO-EXPANSION: the uncertainty scan below
+                // asks "did the expansion leave a function-like macro NAME the
+                // pre-scan cannot expand?". A `defined` OPERAND is not such a
+                // name — it is an operand the barrier deliberately preserved, and
+                // `#if defined(F)` for a function-like `F` is a perfectly
+                // decidable 1. Re-running the SAME barrier over the OUTPUT is
+                // what keeps the two answers from disagreeing; a second,
+                // hand-written "is this a defined operand?" test here is exactly
+                // the two-paths-for-one-concept the row forbids.
+                PpIfOperandBarrier scan = sbMakeIfOperandBarrier();
                 for (Token const& t : out) {
-                    if (t.coreKind != CoreTokenKind::Word) continue;
-                    auto it =
-                        localMacros.find(std::string{sbTextOf(t, buf, sbProduct)});
+                    bool const isWordTok = (t.coreKind == CoreTokenKind::Word);
+                    std::string name;
+                    if (isWordTok) name = std::string{sbTextOf(t, buf, sbProduct)};
+                    if (scan.protects(t, isWordTok ? std::string_view{name}
+                                                   : std::string_view{})) {
+                        continue;
+                    }
+                    if (!isWordTok) continue;
+                    auto it = localMacros.find(name);
                     if (it != localMacros.end() && it->second.functionLike) {
                         sbPostExpandUncertain = true;
                         return in;
@@ -1690,7 +1900,7 @@ struct SynthBuilder {
             uncertain = true;   // malformed/unsupported -> conservative (skip)
             return false;
         }
-        return *v != 0;
+        return *v;
     }
 
     // ── TF-C87 (D-PP-INCLUDE-REENTRY-GUARD-AWARE) ────────────────────────────
@@ -4113,7 +4323,7 @@ private:
         auto v = evaluateIfExpression(operand, *schema_, expandCb, definedCb,
                                       hasIncludeCb, *synth_, productCb, rep_,
                                       embedCb);
-        return v.has_value() && *v != 0;
+        return v.has_value() && *v;
     }
 
     // Macro-expand a token run with the SAME engine `run()` uses (object +
@@ -4121,6 +4331,21 @@ private:
     // expand, drop the hide sets. Used by the `#if` evaluator's callback so the
     // controlling expression's macros expand identically to the body's.
     std::vector<Token> expandTokens(std::vector<Token> const& toks) {
+        // D-PP-DEFINED-VIA-MACRO-EXPANSION: this is the ONLY entry point that
+        // expands a `#if`/`#elif` CONTROLLING EXPRESSION (the `run()` body pass
+        // has its own), so the `defined` operand barrier is armed HERE and
+        // nowhere else — an ordinary body token spelled `defined` stays an
+        // ordinary identifier. Armed for the duration of ONE evaluation and torn
+        // down after it, so a barrier can never leak into the body pass.
+        PpIfOperandBarrier barrier{*schema_};
+        struct ArmedBarrier {
+            PpIfOperandBarrier** slot;
+            explicit ArmedBarrier(PpIfOperandBarrier** s, PpIfOperandBarrier* b)
+                : slot(s) { *slot = b; }
+            ~ArmedBarrier() { *slot = nullptr; }
+            ArmedBarrier(ArmedBarrier const&)            = delete;
+            ArmedBarrier& operator=(ArmedBarrier const&) = delete;
+        } const armed{&ifDefinedBarrier_, &barrier};
         // FC15b: seed each token's own offset as its invocation anchor (a
         // `__LINE__` in a `#if` operand resolves against that operand's line).
         // `liftRun` additionally stamps `spacedBefore` from this run's trivia, so a
@@ -6220,6 +6445,67 @@ private:
             // REFERENCE into `work.front()` would dangle the instant the front is
             // popped.
             ExpToken t = work.front();
+            // ★★ D-PP-DEFINED-VIA-MACRO-EXPANSION — THE OPERAND BARRIER, and it
+            // sits HERE, before the non-Word early-out, because the barrier has
+            // to SEE the `(` and `)` to know where the operand is.
+            //
+            // Depth 0 ONLY: a depth>0 frame is ARGUMENT pre-expansion, and the
+            // references pre-expand a `defined`-bearing ARGUMENT unprotected —
+            // ✔MEASURED, `#define ID(a) a` + `#if ID(defined(FOO))` is an ERROR
+            // in gcc 13.3.0 AND clang 18.1.3 ("operator \"defined\" requires an
+            // identifier" / "macro name must be an identifier"), because `FOO`
+            // becomes `1` before substitution. Arming the barrier there would
+            // make DSS ACCEPT what no reference accepts, which §A.3b forbids in
+            // exactly the same words as failing on what one accepts.
+            //
+            // A protected token is copied VERBATIM: not macro-expanded, not
+            // materialized as a predefined, and never paired with a following
+            // `(` as a function-like invocation (`#if defined(F)` for a
+            // function-like `F` answers 1 on all three references).
+            if (ifDefinedBarrier_ != nullptr && depth == 0) {
+                bool const isProtected = ifDefinedBarrier_->protects(
+                    t.tok, isWord(t.tok) ? text(t.tok) : std::string_view{});
+                // ★★ D-PP-DEFINED-VIA-MACRO-EXPANSION — THE DIAGNOSTIC, and the
+                // AND that decides it is made of two facts each owner already
+                // holds: the BARRIER says "that token was the `defined`
+                // keyword", and the HIDE SET says "that token arrived from a
+                // replacement list". A token lifted from the directive line
+                // carries an EMPTY hide set (`fromToken`); every replacement
+                // token carries `hideAdd(t.hide, name)` and so is non-empty.
+                // Neither fact is re-derived here and no token flag was minted
+                // for it.
+                //
+                // C 6.10.1 leaves the construct UNDEFINED and DSS evaluates it
+                // anyway, because the union of the references does — but all
+                // three references SAY SO while doing it (gcc/clang
+                // `-Wexpansion-to-defined`, MSVC `C5105`), and evaluating in
+                // silence is the one behaviour none of them has. Warning
+                // severity: `errorCount()` is untouched, translation continues,
+                // and `--suppress` can silence it (deliberately NOT in the
+                // unsuppressable closed table — see the NEGATIVE pin there).
+                //
+                // Reachability is free here rather than argued: `expandTokens`
+                // is only ever called to evaluate a LIVE `#if`/`#elif` operand,
+                // so a macro-produced `defined` in a NOT-TAKEN branch is never
+                // expanded and never diagnosed (C 6.10p1) — the invariant the
+                // `#error`/`#warning`/`#pragma` arms state explicitly.
+                if (ifDefinedBarrier_->lastWasDefinedKeyword()
+                    && t.hide != nullptr && !t.hide->empty()) {
+                    emitPP(rep_,
+                           DiagnosticCode::P_PreprocessorDefinedFromExpansion,
+                           synth_->id(), t.tok.span,
+                           "the 'defined' operator here was produced by macro "
+                           "expansion; C 6.10.1 leaves the result undefined "
+                           "(gcc, clang and MSVC all evaluate it, and all three "
+                           "warn)",
+                           DiagnosticSeverity::Warning);
+                }
+                if (isProtected) {
+                    emitOut(std::move(t));
+                    work.pop_front();
+                    continue;
+                }
+            }
             if (!isWord(t.tok)) {
                 emitOut(std::move(t));
                 work.pop_front();
@@ -6494,6 +6780,13 @@ private:
     bool                                 truncated_ = false;
     // D-PERF-1: accumulated FRONT-splice token-move count (see `tokenMoves()`).
     std::size_t                          tokenMoves_ = 0;
+    // D-PP-DEFINED-VIA-MACRO-EXPANSION: non-null ONLY for the duration of one
+    // `#if`/`#elif` controlling-expression expansion (armed by `expandTokens`,
+    // torn down by its RAII guard). While armed, `expand`'s depth-0 frame asks it
+    // whether the token it is about to process is the OPERAND of a `defined`, and
+    // copies it VERBATIM when it is. Null in the body pass, so `defined` there is
+    // an ordinary identifier and nothing changes.
+    PpIfOperandBarrier*                    ifDefinedBarrier_ = nullptr;
     SchemaTokenId                        hashKind_{};
     SchemaTokenId                        parenOpen_{};
     SchemaTokenId                        parenClose_{};

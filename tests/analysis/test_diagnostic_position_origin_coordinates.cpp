@@ -50,6 +50,26 @@
 //   * `SemanticTierRelatedLocation*` — a `note:` location, which
 //     `DiagnosticReporter::remapBuffers` used to skip entirely. Red iff that
 //     loop stops visiting `related`.
+//
+// ── WHY THE CODE ASSERTIONS BELOW DERIVE THEIR SPELLING ────────────────────
+//   D-DIAG-TWO-CODE-RENDERINGS (cycle P42)
+//
+// Two arms here asserted the SHORT HEX literal `"A0008"` against captured CLI
+// output. When every render surface was unified on `diagnosticCodeName`, the
+// CLI stopped emitting that spelling and both arms went RED. They were right in
+// INTENT and stale in SPELLING, so they now derive the token from the
+// enumerator (`diagnosticCodeName(DiagnosticCode::A_AsmTextUnsupported)`) and
+// cannot go stale again.
+//
+// ★★ THE LESSON IS THE OPPOSITE OF THE USUAL INSTINCT, AND IT IS WORTH THE
+// PARAGRAPH. A hardcoded code inside `contains(...)` goes RED and ANNOUNCES
+// itself the moment the rendering changes. A test that instead EXTRACTED the
+// code with an `error\[[A-Z0-9]+\]`-shaped regex would have gone silently blank
+// and PASSED — matching nothing, asserting nothing, reporting success. Both
+// shapes exist in this tree; only one tells you it is wrong. ⇒ when you must
+// pin compiler output, prefer a literal you will be forced to update over an
+// extraction that can quietly stop matching — or, better still, derive it from
+// the enum as these two arms now do, which is loud AND cannot rot.
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
@@ -439,7 +459,9 @@ TEST(DriverPerTargetCompilePositionRemap, AsmTierDiagnosticUnderUserDefinesRepor
         captured = cap.text();
     }
 
-    ASSERT_TRUE(contains(captured, "A0008"))
+    ASSERT_TRUE(contains(captured,
+                         diagnosticCodeName(
+                             DiagnosticCode::A_AsmTextUnsupported)))
         << "the fixture must reach the assembly engine's unknown-mnemonic "
            "refusal — otherwise this asserts nothing about the tiers below "
            "semantic\n"
@@ -480,7 +502,9 @@ TEST(DriverPerTargetCompilePositionRemap, AsmTierDiagnosticInsideAnIncludedHeade
         captured = cap.text();
     }
 
-    ASSERT_TRUE(contains(captured, "A0008"))
+    ASSERT_TRUE(contains(captured,
+                         diagnosticCodeName(
+                             DiagnosticCode::A_AsmTextUnsupported)))
         << "the fixture must reach the assembly engine's unknown-mnemonic "
            "refusal\n"
         << captured;

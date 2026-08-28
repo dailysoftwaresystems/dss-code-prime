@@ -39,6 +39,7 @@ add_library(core OBJECT
     # both readers already depend on, so the dependency runs one way again.
     types/project_config.cpp
     types/target_schema.cpp
+    types/target_spec.cpp
     types/target_schema_json.cpp
     types/lexer_mode.cpp
     types/schema_walker.cpp

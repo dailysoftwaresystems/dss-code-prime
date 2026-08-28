@@ -1,5 +1,6 @@
 #include "link/format/macho_object_reader.hpp"
 #include "link/format/dwarf_cfi_decode.hpp"
+#include "link/format/foreign_section_alignment.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
 
@@ -188,15 +189,13 @@ rdName(std::span<std::uint8_t const> b, std::uint64_t tabStart, std::uint64_t ta
                        static_cast<std::size_t>(end - start)};
 }
 
-// section_64.align is a LOG2 field. Convert to an `Alignment` newtype. Only
-// a re-layout hint (the merge re-lays-out every item), so a value beyond
-// the newtype's 256-byte cap (or a wild log2) falls back to byte alignment
-// -- never a correctness input on read-back (mirrors the ELF reader's
-// alignFromSection contract).
+// section_64.align is a LOG2 field. Convert to an `Alignment` newtype. The
+// POLICY that turns a declared section alignment into an `Alignment` is shared
+// with the ELF and COFF readers and lives in
+// `link/format/foreign_section_alignment.hpp` -- this reader supplies only the
+// fact that Mach-O spells the field as a LOG2 EXPONENT.
 [[nodiscard]] Alignment alignFromLog2(std::uint32_t log2) noexcept {
-    if (log2 == 0u || log2 > 8u) return Alignment{};   // 1 byte, or > 256 -> byte
-    return Alignment::fromBytes(static_cast<std::uint32_t>(1u) << log2)
-        .value_or(Alignment{});
+    return link::format::foreignSectionAlignmentFromLog2(log2);
 }
 
 // N_PEXT (private extern) -> Hidden, else Default (matches the ffi

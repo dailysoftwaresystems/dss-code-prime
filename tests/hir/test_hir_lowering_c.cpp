@@ -15,6 +15,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
+#include "core/types/target_schema.hpp"   // D-TEST-THE-HIR-LOWERING-FIXTURE-ANALYZES-WITH-NO-TARGET-IN-SCOPE
 #include "hir/const_eval.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_intrinsic_registry.hpp"
@@ -53,6 +54,48 @@ namespace {
     return n;
 }
 
+// D-TEST-THE-HIR-LOWERING-FIXTURE-ANALYZES-WITH-NO-TARGET-IN-SCOPE: the shipped
+// `x86_64` target document + the `sysv_amd64` va_list strategy this file's fixtures
+// analyze under, OWNED for the whole process.
+//
+// ★★ WHY A PROCESS-LIFETIME OWNER AND NOT A LOCAL. `analyze` takes the target
+// NON-OWNING and the returned `SemanticModel` REPUBLISHES it as `model.target()`
+// for the HIR lowering to read. `analyzeC` returns the model BY VALUE, so a
+// function-local `shared_ptr` would be destroyed at the `return` and every caller
+// would lower against a dangling target. The sibling harness in
+// `tests/mir/test_mir_lowering_c.cpp` solves the same problem by holding the target
+// in its returned `Lowered` struct, ordered BEFORE `model` so members destroy in
+// the right order — it cannot be copied here without changing this helper's
+// signature at all 290-odd call sites, and a function-local static is the same
+// guarantee with none of that churn. Loaded once, thread-safely (C++11 magic
+// statics), and never freed.
+//
+// ★ WHY THE FIXTURE NEEDS IT AT ALL. `analyze`'s `target` parameter defaults to
+// `nullptr` for direct-API callers, which is a DELIBERATE default and correct for
+// the LSP — but it means this fixture analyzes a construct with LESS in scope than
+// the shipped CLI gives it, and a red here can therefore name a "compiler defect"
+// that the CLI does not have. That cost a P42 lane a whole measurement pass. A
+// fixture must not be able to fail on a construct the product compiles.
+// ⚠ ONLY the target (and the va_list strategy derived FROM it) is threaded. The
+// dataModel stays LP64 and the long-double axis stays `None` — those two change
+// TYPE WIDTHS, so moving them would silently re-point every one of this file's
+// fixtures at a different ABI, which is a separate decision with its own pins, not
+// a fixture repair. `analyzeCPe` remains the deliberate LLP64/PE variant.
+[[nodiscard]] TargetSchema const* fixtureTarget() {
+    static std::shared_ptr<TargetSchema const> const kTarget = [] {
+        auto t = TargetSchema::loadShipped("x86_64");
+        return t.has_value() ? *t : nullptr;
+    }();
+    return kTarget.get();
+}
+[[nodiscard]] std::optional<VaListStrategy> fixtureVaListStrategy() {
+    TargetSchema const* t = fixtureTarget();
+    if (t == nullptr) return std::nullopt;
+    auto const* cc = t->callingConventionByName("sysv_amd64");
+    if (cc == nullptr || !cc->vaListLayout.has_value()) return std::nullopt;
+    return cc->vaListLayout->strategy;
+}
+
 // Drive: c source → CompilationUnit → SemanticModel. Asserts the front
 // end (parse + semantic) is clean so a lowering test never chases a phantom.
 [[nodiscard]] SemanticModel analyzeC(std::string src) {
@@ -65,7 +108,12 @@ namespace {
     UnitBuilder builder{loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    return analyze(cu, DiagnosticBudget::libraryDefault());
+    // D-TEST-THE-HIR-LOWERING-FIXTURE-ANALYZES-WITH-NO-TARGET-IN-SCOPE: the target
+    // + its va_list strategy, exactly as `compile_pipeline.cpp` and the sibling MIR
+    // harness thread them. See `fixtureTarget` for why they are process-owned.
+    return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                   std::nullopt, fixtureVaListStrategy(), std::nullopt,
+                   std::nullopt, LongDoubleFormat::None, fixtureTarget());
 }
 
 // As `analyzeC`, but under the PE object format — so `L'…'`/`L"…"` (wchar_t)
@@ -2405,6 +2453,57 @@ TEST(HirLoweringC, GnuUnknownAttributeFileScopeStillFailsLoud) {
         << "an unknown GNU attribute must keep the loud typo-protection gate";
 }
 
+// P42 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY) — THE DRIFTED SECOND ROSTER,
+// at the tier that owns the file-scope verdict. `linkageSpecifierIgnoredNames`
+// is a hand-maintained restatement of the effects table, and the loader's
+// drift cross-check DELIBERATELY EXEMPTS the `none` row — so the C23 statement
+// and label hints, which THIS language declares KNOWN vocabulary, were never
+// added and a leading one on a file-scope object failed loud.
+// ✔MEASURED with the shipped CLI before the repair, every one rc=1:
+// `__attribute__((fallthrough)) int gv = 7;` → `error[H000C] 'fallthrough' is
+// not a recognized linkage specifier`, likewise `likely`, `unlikely`,
+// `reproducible`, `unsequenced`. gcc 13.3 (`-std=c2x`) and clang 18
+// (`-std=c23`), probed separately, each compile all five with a warning, exit 0.
+// RED-ON-DISABLE: delete the five names from `topLevelDecl`'s
+// `linkageSpecifierIgnoredNames` in `c.lang.json` → each count returns to 1.
+TEST(HirLoweringC, GnuInertHintNamesAreNotUnknownLinkageSpecifiers) {
+    for (char const* name : {"fallthrough", "likely", "unlikely",
+                             "reproducible", "unsequenced"}) {
+        SemanticModel model = analyzeC(
+            std::string("__attribute__((") + name + ")) int gv = 7; "
+            "int main(){ return gv - 7; }");
+        ASSERT_FALSE(model.hasErrors()) << name;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        (void)res;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << "a name the effects table declares KNOWN must not be refused by "
+               "the linkage scan's separate roster: " << name;
+    }
+}
+
+// THE CONTROL, and it is what stops the repair above from being read as
+// "silence more things": the three names deliberately LEFT OUT carry real
+// layout / aliasing / ABI weight that DSS does not implement, so the loud
+// refusal is the only tier still saying so. Silencing them would trade a
+// refusal for a SILENT DROP with observable consequences — a leading
+// `__attribute__((packed)) struct S {…} s;` is not reached by the composite
+// scan, so it would go from a loud error to a wrong `sizeof`.
+TEST(HirLoweringC, GnuWeightBearingHintNamesStayLoudAtFileScope) {
+    for (char const* name : {"packed", "may_alias", "transparent_union"}) {
+        SemanticModel model = analyzeC(
+            std::string("__attribute__((") + name + ")) int gv = 7; "
+            "int main(){ return gv - 7; }");
+        ASSERT_FALSE(model.hasErrors()) << name;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        (void)res;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+            << "an attribute DSS cannot honor must not be silently dropped: "
+            << name;
+    }
+}
+
 // ── TfC71 (D-HIR-ADJACENT-CONCAT-WALL-UNTESTED): the linkage-specifier
 //    argument's ADJACENT-STRING-CONCAT wall ─────────────────────────────────
 
@@ -2609,40 +2708,99 @@ TEST(HirLoweringC, VisibilityDefaultExternDeclLowersClean) {
            "leaving the topLevelDecl twin leaves this form H000C";
 }
 
-// (4) THE DUNDER SPELLING IS **NOT** MATCHED — pinned as the TRUE behaviour, not
-// as the desirable one, because the alternative is leaving a loud refusal
-// undocumented until someone "fixes" it by widening the wrong surface.
+// (4) THE DUNDER SPELLING **IS** MATCHED — P42, anchor
+// D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED.
 //
-// WHY, from the code: `linkageFrom` (cst_to_hir.cpp) applies `stripDunder` to
-// exactly ONE surface — the `linkageSpecifierIgnoredNames` membership test — and
-// the strict `linkageSpecifiers` lookup then runs on the RAW token text. So the
-// composite pairing assembles `__visibility__:default`, which is not a key in
-// either map, and the fail-loud fall-through reports it. The `effects` table for
-// attribute SEMANTICS is dunder-normalized; the linkage map is not, and the
-// config's own `$comment` on the `no_sanitize_thread` row states that asymmetry
-// as the reason a honored spelling belongs in `effects` rather than here.
+// ⚠ WHAT STOOD HERE BEFORE, RECORDED SO IT IS NOT RE-DERIVED AS A REGRESSION:
+// `VisibilityDefaultDunderSpellingIsRefusedLoud` pinned
+// `__attribute__((__visibility__("default")))` as a LOUD REFUSAL — the TRUE
+// behaviour at the time, pinned deliberately so the limit was documented rather
+// than discovered. Its own comment named the two ways out: "either two more keys
+// per value or dunder-normalizing the lookup — a mechanism change with its own
+// design". P42 took the second. That pin is INVERTED here, in the same change as
+// the mechanism, because it is the assertion that (correctly) goes red — the
+// CLOSING WITNESS, not an obstacle to route around.
 //
-// This is a VOCABULARY-COMPLETENESS limit, not a silent drop: `visibility:hidden`
-// has carried the identical limit since FC4 c1. Closing it means either two more
-// keys per value or dunder-normalizing the lookup — a mechanism change with its
-// own design. Real headers reaching DSS today (tcl.h, sqlite) write the bare
-// spelling, so the loud refusal is the correct residue.
-TEST(HirLoweringC, VisibilityDefaultDunderSpellingIsRefusedLoud) {
-    SemanticModel model = analyzeC(
-        "__attribute__((__visibility__(\"default\"))) int g_dd = 7;\n"
-        "int main(void){ return g_dd - 7; }\n");
-    ASSERT_FALSE(model.hasErrors());
-    DiagnosticReporter r;
-    auto res = lowerToHir(model, r);
-    (void)res;
-    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
-        << "the raw-key lookup cannot see through the dunder — and it must FAIL "
-           "LOUD rather than silently discard the visibility request";
-    EXPECT_NE(firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier)
-                  .find("__visibility__:default"),
-              std::string::npos)
-        << "the message must name the COMPOSITE key actually looked up, so the "
-           "reader can see that the pairing worked and only the key missed";
+// ✔THE REFERENCES, PROBED SEPARATELY AND WITH PER-COMPILER STD FLAGS (gcc
+// REJECTS `-std=c23`): gcc 13.3.0 under `-std=c2x` AND `-std=gnu2x`, clang
+// 18.1.3 under `-std=c23` AND `-std=gnu23`, all with `-Wall -Wextra`. All four
+// arms compile EVERY dunder form of `weak` and `visibility` at rc=0 with ZERO
+// errors and ZERO warnings, on objects and on functions, in the leading, the
+// after-declarator and the post-`extern` positions. DSS refused all eight at
+// rc=1 (`error[H000C] '__weak__' is not a recognized linkage specifier`). Under
+// `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` that is a conformance defect, not a
+// vocabulary preference — and these are the two spellings glibc and the macOS
+// SDK actually write.
+//
+// ★★ THE PIN IS DIFFERENTIAL AND ASSERTS THE EFFECT, NEVER "IT PARSED". A
+// count-only pin stays green when the dunder spelling is accepted and then
+// DISCARDED, which is the silent drop this project ranks BELOW a loud refusal.
+// So each arm requires the dunder form to record the SAME `LinkageAttr` the
+// plain form records — a config typo or a dropped facet moves one side only.
+// ✔Confirmed end-to-end on the emitted ELF object through the shipped CLI:
+// `__attribute__((__weak__)) int gv = 1;` emits `gv V`, byte-for-byte the
+// symbol the plain spelling emits, and `__attribute__((__visibility__
+// ("hidden")))` emits the TU-local `sym_84 d`, likewise identical to its plain
+// twin.
+TEST(HirLoweringC, GnuDunderLinkageSpellingsResolveLikeThePlainOnes) {
+    struct Folded {
+        std::size_t      unknown;
+        bool             ok;
+        bool             hasRow;
+        SymbolBinding    binding;
+        SymbolVisibility visibility;
+    };
+    auto fold = [](char const* spec) -> Folded {
+        std::string const src = std::string(spec)
+            + " int f_dd(int v) { return v + 1; }\n"
+              "int main(void){ return 0; }\n";
+        SemanticModel model = analyzeC(src);
+        EXPECT_FALSE(model.hasErrors()) << spec;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        Folded out{countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier),
+                   res->ok, false, SymbolBinding::Global,
+                   SymbolVisibility::Default};
+        HirNodeId const f = functionNamed(res->hir, model, "f_dd");
+        if (f.valid() && res->linkageMap.has(f)) {
+            out.hasRow     = true;
+            out.binding    = res->linkageMap.get(f).binding;
+            out.visibility = res->linkageMap.get(f).visibility;
+        }
+        return out;
+    };
+    struct Case { char const* plain; char const* dunder; };
+    for (Case const c : {
+             Case{"__attribute__((weak))",
+                  "__attribute__((__weak__))"},
+             Case{"__attribute__((visibility(\"hidden\")))",
+                  "__attribute__((__visibility__(\"hidden\")))"},
+             Case{"__attribute__((visibility(\"default\")))",
+                  "__attribute__((__visibility__(\"default\")))"},
+             // Two clauses in ONE specifier, both dundered: the composite
+             // pairing has to survive normalization of the NAME half, and the
+             // co-present `weak` forces the sparse row to exist so the
+             // visibility is readable at all.
+             Case{"__attribute__((weak, visibility(\"default\")))",
+                  "__attribute__((__weak__, __visibility__(\"default\")))"}}) {
+        Folded const p = fold(c.plain);
+        Folded const d = fold(c.dunder);
+        EXPECT_EQ(d.unknown, 0u)
+            << c.dunder << " — gcc and clang both compile this at rc=0 with no "
+                           "diagnostic; a count of 1 is the raw-key lookup back";
+        EXPECT_TRUE(d.ok) << c.dunder;
+        EXPECT_EQ(d.hasRow, p.hasRow)
+            << c.dunder << " — the sparse side-table must agree with the plain "
+                           "spelling: a MISSING row where the plain form has one "
+                           "is the silent-drop failure, not a fix";
+        EXPECT_EQ(d.binding, p.binding)
+            << c.dunder << " vs " << c.plain;
+        EXPECT_EQ(d.visibility, p.visibility)
+            << c.dunder << " vs " << c.plain;
+        // The control half: the PLAIN spelling must still be clean, so a green
+        // differential can never come from both sides breaking together.
+        EXPECT_EQ(p.unknown, 0u) << c.plain << " — the control arm moved";
+    }
 }
 
 namespace {
@@ -2652,10 +2810,16 @@ namespace {
 // `topLevelDecl`, row 2 is `externDecl`.
 //
 // The row is disabled by RENAMING ITS KEY to a spelling no source token can
-// produce, which is behaviourally identical to deleting it (the lookup is by raw
-// key) while keeping the JSON structurally valid — no trailing-comma surgery, and
-// no chance of a malformed-config false green. Surgical textual swap on the
+// produce, while keeping the JSON structurally valid — no trailing-comma surgery,
+// and no chance of a malformed-config false green. Surgical textual swap on the
 // shipped text, the `shiftResultKind` shape.
+// ⚠ UPDATED P42: this used to say the swap is behaviourally identical to a
+// delete "because the lookup is by raw key". THE LOOKUP IS NO LONGER BY RAW KEY
+// — an attribute-position name is dunder-normalized before the map is asked
+// (D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED). The
+// lever is still valid, and now for a stronger reason: no token text, dundered or
+// not, can NORMALIZE to `visibility:default__UNREACHABLE` either, since
+// `stripDunder` only ever removes a leading and trailing `__`.
 //
 // The quoted key occurs EXACTLY TWICE in the shipped file (verified): the two
 // `$visibilityDefaultComment` prose blocks spell it in BACKTICKS, so the search
@@ -3498,6 +3662,118 @@ TEST(HirLoweringC, WeakOnInternalLinkageFailsLoudAndKeepsStatic) {
                          "Weak here means the symbol escaped the TU (measured as "
                          "`V x` in the ELF object), Global means both were lost";
     }
+}
+
+// ★★★ P42 — A KEYWORD-SPELLED ATTRIBUTE CLAUSE NAME IS NEVER A LINKAGE
+// SPECIFIER. Anchor:
+// D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED
+//
+// ⚠ THIS PIN GUARDS A SILENT MISCOMPILE THAT WAS LIVE AT THE PRE-CHANGE TREE.
+// ✔MEASURED through the shipped CLI, reading the emitted ELF object with `nm`:
+//     `int gv = 1;`                         → `gv D`      (exported)
+//     `static int gv = 1;`                  → `sym_84 d`  (TU-local)
+//     `__attribute__((static)) int gv = 1;` → `sym_84 d`  ← rc=0, ZERO diagnostics
+// The third line is the defect, and it is the worst outcome this project
+// recognises: the name `gv` simply LEFT the object, so another TU links against
+// a different definition or fails to link, and nothing was said. The cause is
+// that ONE `linkageSpecifiers` map holds two vocabularies — declaration-specifier
+// KEYWORDS and attribute NAMES — and the lookup was position-blind, so a keyword
+// worn as an attribute clause name reached the keyword's own entry.
+// ✔BOTH REFERENCES PROBED SEPARATELY (gcc 13.3 `-std=c2x`/`-std=gnu2x`, clang
+// 18.1.3 `-std=c23`/`-std=gnu23`, `-Wall -Wextra`): each merely WARNS and IGNORES
+// the attribute — gcc `'static' attribute directive ignored`, clang
+// `unknown attribute 'static' ignored` — so both keep `gv` exported.
+//
+// ★ WHY THE RESIDUE IS A LOUD REFUSAL RATHER THAN THE REFERENCES' WARN-AND-
+// IGNORE: this tier has no Warning-severity route at all (`emitH` hardcodes
+// `DiagnosticSeverity::Error`, and there are ZERO `DiagnosticSeverity::Warning`
+// uses in cst_to_hir.cpp), so warn-and-ignore needs a diagnostic code this file
+// set does not own. It is the SAME missing tier the whole file-scope
+// unknown-name gate needs. Until that lands, LOUD is the correct residue and
+// SILENT WRONG LINKAGE is not — the refusal is visible, the rebinding was not.
+//
+// ★ THE THREE DUNDER ARMS ARE THE NEGATIVE DIRECTION OF THE SAME MECHANISM, and
+// they are why the keyword test asks about the DERIVED name and not the raw
+// spelling: normalization must reach `__weak__`→`weak` WITHOUT reaching
+// `__static__`→`static`. A first cut that tested the raw text was BUILT AND
+// MEASURED to let all three of these through — `__attribute__((__static__))`
+// went rc=1 → rc=0, silently internal.
+TEST(HirLoweringC, KeywordSpelledAttributeNameIsNeverALinkageSpecifier) {
+    for (char const* spec : {"__attribute__((static))",
+                             "__attribute__((__static__))",
+                             "__attribute__((__thread_local__))",
+                             "__attribute__((__constexpr__))"}) {
+        std::string const src = std::string(spec)
+            + " int gv = 1;\n"
+              "int *pgv = &gv;\n"
+              "int main(void){ return *pgv - 1; }\n";
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors()) << spec;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+            << spec << " — exactly one loud refusal. ZERO means a keyword bound "
+                       "through the attribute position again";
+        EXPECT_EQ(declaredBinding(*res, model, "gv"),
+                  std::optional{SymbolBinding::Global})
+            << spec << " — THE assertion of this pin, because a diagnostic count "
+                       "alone cannot see a wrong RESIDUE. `Local` is exactly the "
+                       "`sym_84 d` that made the symbol vanish; `nullopt` would "
+                       "mean the declaration was lost entirely";
+    }
+}
+
+// The control for the pin above, and it is required rather than tidy: the same
+// mechanism must leave the REAL keyword alone. `static int gv = 1;` is a BARE
+// declaration specifier, not an attribute name, so it must still bind Local and
+// stay silent. Had the keyword denial been written on the SPELLING instead of on
+// the POSITION, this goes red — which is the whole reason the position mark
+// exists.
+TEST(HirLoweringC, BareStorageClassKeywordStillBindsThroughLinkageSpecifiers) {
+    SemanticModel model = analyzeC(
+        "static int gv = 1;\n"
+        "int *pgv = &gv;\n"
+        "int main(void){ return *pgv - 1; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+    EXPECT_EQ(declaredBinding(*res, model, "gv"),
+              std::optional{SymbolBinding::Local})
+        << "the bare `static` keyword must keep resolving in `linkageSpecifiers`";
+}
+
+// P42 — the dunder spellings in the OBJECT and after-`extern` positions, read
+// through the linkage side-table rather than through a diagnostic count. The
+// differential pin earlier in this file covers the leading-on-a-function shape;
+// these are the two shapes REAL headers write — glibc puts the attribute after
+// `extern`, tcl.h puts it in the declaration head.
+TEST(HirLoweringC, GnuDunderLinkageSpellingsApplyInObjectAndExternPositions) {
+    SemanticModel model = analyzeC(
+        "__attribute__((__weak__)) int g_w = 1;\n"
+        "extern int e_w __attribute__((__weak__));\n"
+        "extern int e_v __attribute__((__visibility__(\"hidden\")));\n"
+        "int main(void){ return g_w + e_w + e_v - 1; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "all three are rc=0 with zero diagnostics on gcc 13.3 and clang "
+           "18.1.3, probed separately with per-compiler std flags";
+    EXPECT_EQ(declaredBinding(*res, model, "g_w"),
+              std::optional{SymbolBinding::Weak})
+        << "`__weak__` must APPLY the weak binding, not merely parse — `Global` "
+           "here is the SILENT DROP, which this project ranks below the loud "
+           "refusal it replaced (measured: the plain spelling emits `gv V`)";
+    EXPECT_EQ(declaredBinding(*res, model, "e_w"),
+              std::optional{SymbolBinding::Weak})
+        << "the after-`extern` run is a DIFFERENT scan root with its own map";
+    EXPECT_EQ(declaredVisibility(*res, model, "e_v"),
+              std::optional{SymbolVisibility::Hidden})
+        << "the COMPOSITE key survives normalization of its name half: the "
+           "derived key is `visibility:hidden`, not `__visibility__:hidden`";
 }
 
 // The other side of the same seam: an attribute that touches NO axis the prefix
@@ -8821,39 +9097,517 @@ TEST(HirLoweringC, FunctionDesignatorConditionDecaysAndTakesTheChokepoint) {
         << "one FnSig->Ptr decay + truth test per designator condition";
 }
 
-// The C23 `nullptr_t` member of the same class.
+// ★★ D-CSUBSET-COMPLEX — the `_Complex` member of the same scalar family, and the
+// same ONE chokepoint.
 //
-// ⚠ WHAT IS AND IS NOT CLAIMED HERE, because the first measurement of this arm
-// conflated two defects and the distinction is the whole value of the pin.
-// `if (nullptr)` — the LITERAL — always worked: the literal is already lowered
-// to an integer zero before `coerceCondition` sees it, so it took the arithmetic
-// arm. What did NOT work is a NullptrT-typed VALUE reaching a condition, which
-// is what a `nullptr_t`-typed object produces: `coerceCondition` dropped it
-// through unchanged and the semantic-tier-only kind reached MIR, tripping
-// `I_NullptrTypeInMir` — the invariant that says NullptrT must never get there.
-// C 6.3.2.4p2 settles it without a comparison at all: a `nullptr_t` converts to
-// `_Bool` as FALSE. Emitting the Bool literal is therefore what KEEPS that
-// tripwire true, rather than weakening it.
+// C 6.2.5 makes the complex types floating (p11), the floating types arithmetic
+// (p18) and the arithmetic types scalar (p21), so `if (z)` is governed by the very
+// sentence the enum/designator siblings above quote: the controlling expression
+// "shall have scalar type" and is compared unequal to 0. `isArithmeticCore` is the
+// int+float CORE roster and deliberately excludes Complex — it is also `coerce`'s
+// implicit-conversion gate, where a complex↔real conversion is NOT a plain Cast —
+// so the truthiness arm admits Complex explicitly instead.
+// ✔MEASURED at 301e2a63 (x86_64:pe64-x86_64-windows-exec): five
+// `I_TerminatorTypeMismatch` on one probe covering `if` / `&&` / `||` / `? :` /
+// `while` / `for`, against gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`),
+// probed SEPARATELY, both compiling and running every one of them.
 //
-// ⚠ THIS TEST STOPS AT THE HIR TIER ON PURPOSE. A `nullptr_t`-typed OBJECT is
-// still refused further down (`I_StoreValueTypeMismatch` on its initializing
-// store — a SEPARATE defect, ✔MEASURED in cycle P41 and reported with it),
-// so an end-to-end witness is not available yet. HIR lowering itself is
-// clean, which is exactly the tier this arm lives at, so the property is pinned
-// where it is decided rather than left unproven until the sibling gap closes.
+// This pin names the HIR tier — the SHAPE the conversion must produce. The MIR
+// siblings (MirLoweringC.ComplexConditionTestsBothComponentsAgainstZero and its
+// `!` / `(_Bool)` / `==` / `!=` neighbours) pin the componentwise lowering, and
+// examples/c/c99_complex_truth proves the VALUES on every run leg.
 //
-// RED-ON-DISABLE (REMOVE direction): delete the `ck == TypeKind::NullptrT` arm
-// in `coerceCondition` and `boolFalseLiterals` goes 2 -> 0 while
-// `nullptrCondNodes` goes 0 -> 2 — the NullptrT value survives the condition
-// position, which is the defect.
-TEST(HirLoweringC, NullptrTypedValueInAConditionBecomesTheBoolFalseLiteral) {
+// ✔ SEVEN SITES SINCE P42, AND THE SEVENTH IS THE ONE THIS COMMENT USED TO RECORD
+// AS MISSING. It read: *"SIX SITES, NOT SEVEN … the `_Bool b = z;` assignment form
+// the enum sibling counts is still refused one tier UP, by `isAssignable`'s
+// `scalarConvertsToBool` roster … The realize side is READY for it … so admitting
+// Complex there is the only remaining step."* That step landed (P42 lane H): the
+// roster now names `TypeKind::Complex` beside `Char` / `Enum` / `Ptr` / `NullptrT`,
+// for the reason C 6.2.5p11/p18/p21 gives and the same reason those are named —
+// `Complex` is a NOMINAL kind in DSS, so widening `isArithmetic` instead would
+// re-answer the usual-arithmetic-conversion question everywhere it is asked.
+// ✔MEASURED through the shipped CLI on x86_64:pe64-x86_64-windows-exec: before,
+// `_Bool b = z;` was `error[S0003]` while `if (z)` on the SAME type ran correctly —
+// the assignment site and the condition site disagreeing about one type's truth
+// value; after, the probe compiles and RUNS exit 2, agreeing with gcc 13.3.0
+// (`-std=c2x`) and clang 18.1.3 (`-std=c23`), which both accept it.
+// ★ Admit ⟺ realize needed no second change and could not have needed one:
+// `coerce`'s `_Bool`-target arm names NO kinds — it defers to `coerceCondition`,
+// whose Complex arm is what this test counts.
+//
+// RED-ON-DISABLE (REMOVE direction): drop `|| ck == TypeKind::Complex` from
+// `coerceCondition`'s arithmetic guard and a complex condition synthesizes NO Ne at
+// all — the count below goes 7 -> 0. Per-SITE on purpose: the revert cannot be
+// masked by any one site keeping a private conversion. ⚠ The SEVENTH site has a
+// SECOND revert that reds it alone: drop `|| rk == TypeKind::Complex` from
+// `scalarConvertsToBool` in `analysis/semantic/type_rules.hpp` and the count goes
+// 7 -> 6 while `ASSERT_FALSE(model.hasErrors())` fires first with S0003.
+// ★★ D-TEST-THE-HIR-LOWERING-FIXTURE-ANALYZES-WITH-NO-TARGET-IN-SCOPE — this
+// file's fixture must see what the shipped CLI sees.
+//
+// `analyzeC` called `analyze(cu, budget)` and nothing more, so its 290-odd
+// fixtures analyzed with `target == nullptr`. That default is CORRECT for the
+// direct API (the LSP and the FFI header parser have no target), which is exactly
+// what makes it dangerous HERE: a construct the CLI compiles can still red in this
+// binary, and the red is indistinguishable from a compiler defect. ✔MEASURED in
+// P42: a lane spent a full measurement pass proving that a red in this file "is not
+// a compiler defect — the exact source compiles and runs correctly through the
+// CLI". A fixture that can fail on working code is a fixture that costs a lane a
+// cycle every time it does.
+//
+// ★ WHAT IS ASSERTED, and it is the strongest property available: not that the
+// pointer is non-null, but that the target is REACHED and ANSWERS — the model
+// republishes it, it resolves the `"r"` letter through `asmConstraint` (a
+// question-answering object; the analyzer never learns WHICH processor it is), and
+// the lowered descriptor's operands carry a RESOLVED binding. With no target in
+// scope `HirInlineAsmOperand::regClassResolved` and `operandKindResolved` are BOTH
+// false — the header's own "the letter resolved to nothing" condition — and
+// `lowerInlineAsm` refuses rather than guessing a register bank. So this is a
+// property no other construct in this file can supply and none can fake.
+//
+// RED-ON-DISABLE: make `fixtureTarget()` return `nullptr` (the pre-fix state) and
+// the operand assertions go from 2 resolved to 0 while the `model.target()` assert
+// fires first. ⚠ The pin is deliberately NOT the `_Complex` truthiness test the
+// defect surfaced under — that test measures the semantic tier's roster and passes
+// either way, so it could never have witnessed this.
+TEST(HirLoweringC, TheFixtureAnalyzesWithTheSameTargetInScopeAsTheCli) {
+    SemanticModel model = analyzeC(
+        "int f(int a) {\n"
+        "    int r;\n"
+        "    __asm__ (\"movl %1, %0\" : \"=r\"(r) : \"r\"(a));\n"
+        "    return r;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "the inline-asm fixture must analyze clean";
+
+    // 1. The model republishes the target the fixture threaded — the `dataModel`
+    //    two-tier discipline, which is what lets the HIR lowering read the SAME
+    //    target the semantic tier resolved against.
+    ASSERT_NE(model.target(), nullptr)
+        << "analyzeC must thread the shipped target, as compile_pipeline.cpp does";
+    // 2. It ANSWERS. `"r"` is a letter every shipped processor declares; asking
+    //    through `asmConstraint` is the question-answering form (never an arch
+    //    identity string), so this assertion is target-agnostic by construction.
+    EXPECT_NE(model.target()->asmConstraint("r"), nullptr)
+        << "the threaded target must resolve the `r` constraint letter";
+
+    // 3. The RESOLUTION reached the lowered operands — the property that is false
+    //    with no target and that every downstream tier consumes.
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t asmStmts = 0, resolvedOperands = 0;
+    auto const walkAsm = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::InlineAsm) {
+            std::uint32_t const h = res->hir.payload(n);
+            if (res->inlineAsmPool.contains(h)) {
+                ++asmStmts;
+                for (auto const& op : res->inlineAsmPool.at(h).operands)
+                    if (op.regClassResolved || op.operandKindResolved)
+                        ++resolvedOperands;
+            }
+        }
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) != HirKind::Function) continue;
+        walkAsm(walkAsm, res->hir.functionBody(d));
+    }
+    ASSERT_EQ(asmStmts, 1u) << "one `__asm__` statement was lowered";
+    EXPECT_EQ(resolvedOperands, 2u)
+        << "BOTH operands (`=r` out, `r` in) must carry a binding resolved against "
+           "the target -- with no target in scope regClassResolved and "
+           "operandKindResolved are both false and lowerInlineAsm refuses";
+}
+
+TEST(HirLoweringC, ComplexConditionTakesTheTruthinessChokepointAtEverySite) {
+    SemanticModel model = analyzeC(
+        "int f(double _Complex z) {\n"
+        "    int r = 0;\n"
+        "    if (z) r = 1;\n"                       // 6.8.4.1  selection
+        "    while (z) { r = 2; break; }\n"         // 6.8.5    iteration
+        "    for (; z; ) { r = 3; break; }\n"       // 6.8.5    iteration
+        "    r = z ? 4 : 5;\n"                      // 6.5.15   conditional
+        "    r = (z && 1) ? 6 : 7;\n"               // 6.5.13   logical AND
+        "    r = (z || 0) ? 8 : 9;\n"               // 6.5.14   logical OR
+        "    _Bool b = z;\n"                        // 6.5.16.1 assignment/init
+        "    r = b ? 10 : 11;\n"                    // (uses `b`; its condition is
+        "    return r;\n"                           //  already Bool, so it adds no
+        "}\n");                                     //  second complex truth test)
+    // ⚠ THE FAILURE MESSAGE NAMES THE DIAGNOSTIC CODE, not just the offending
+    // token. ✔MEASURED the hard way: this assert once fired printing only `z`,
+    // which says nothing about WHICH rule rejected it — the code is the whole
+    // diagnostic value of the message.
+    if (model.hasErrors()) {
+        std::string why;
+        for (auto const& d : model.diagnostics().all()) {
+            why += "[" + std::to_string(static_cast<int>(d.code)) + "] " + d.actual + " | ";
+        }
+        FAIL() << "the fixture must analyze clean; diagnostics: " << why;
+    }
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    auto const& ti = model.lattice().interner();
+
+    // The shape this arm owes: a `Ne` BinaryOp typed Bool whose LEFT operand is
+    // Complex-typed and whose RIGHT operand is the synthesized complex ZERO — a
+    // Cast of a real zero INTO the complex type, which is the same node
+    // `materializeComplexCast` already realizes as `(0, 0)`. Asserting the zero's
+    // SHAPE (not merely "some second operand") is what makes the pin catch a zero
+    // minted as a Complex-typed integer literal, which has no MIR realization.
+    std::size_t complexTruthTests = 0;
+    auto const walkComplex = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::BinaryOp
+            && isCoreOp(res->hir.payload(n))
+            && decodeCoreOp(res->hir.payload(n)) == HirOpKind::Ne) {
+            auto const kids = res->hir.children(n);
+            if (kids.size() == 2 && res->hir.typeId(kids[0]).valid()
+                && ti.kind(res->hir.typeId(kids[0])) == TypeKind::Complex) {
+                ++complexTruthTests;
+                EXPECT_EQ(ti.kind(res->hir.typeId(n)), TypeKind::Bool)
+                    << "the synthesized truth test is Bool-typed";
+                EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Cast)
+                    << "the complex zero is a Cast of a real zero INTO the "
+                       "complex type -- a Complex-typed LITERAL is memory-"
+                       "resident with no MIR realization at all";
+                ASSERT_TRUE(res->hir.typeId(kids[1]).valid());
+                EXPECT_EQ(ti.kind(res->hir.typeId(kids[1])), TypeKind::Complex);
+                auto const inner = res->hir.children(kids[1]);
+                ASSERT_EQ(inner.size(), 1u);
+                EXPECT_EQ(res->hir.kind(inner[0]), HirKind::Literal);
+                ASSERT_TRUE(res->hir.typeId(inner[0]).valid());
+                EXPECT_EQ(ti.kind(res->hir.typeId(inner[0])), TypeKind::F64)
+                    << "the zero is built at the complex's ELEMENT type";
+            }
+        }
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    walkComplex(walkComplex, res->hir.functionBody(fn));
+
+    EXPECT_EQ(complexTruthTests, 7u)
+        << "one complex truth test per site that asks a complex value for a truth "
+           "value: if, while, for, ternary, && and || (the controlling-expression "
+           "six -- before the Complex arm every one of these reached the MIR "
+           "CondBr terminator carrying its raw complex type) PLUS the `_Bool b = z` "
+           "assignment/init, which this pin recorded as missing until the semantic "
+           "tier's scalarConvertsToBool roster admitted Complex (P42)";
+}
+
+// ★ D-CSUBSET-COMPLEX-UNARY-PLUS-REFUSED (P42 lane AI) — `+z` on a `_Complex`.
+//
+// C 6.2.5p11 puts the complex types inside the FLOATING types and p18 therefore
+// makes them arithmetic, so `+z` satisfies C 6.5.3.3p1 exactly as `-z` does.
+// ✔MEASURED at the pre-fix tree through the shipped CLI
+// (x86_64:pe64-x86_64-windows-exec, binaries RUN): `+z` was
+// `error[H0009] operand of unary '+' must have arithmetic type` while `-z` on the
+// SAME value compiled and ran; gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
+// (`-std=c23`), probed SEPARATELY, both compile and run `+z`. The gate read
+// `isArithmeticCore`, the int+float CORE roster, which excludes Complex — the
+// same roster mismatch that produced the `!z` silent miscompile one operator over
+// ([[D-CSUBSET-COMPLEX-LOGICAL-NOT-AND-BOOL-CAST-SILENT-MISCOMPILE]]).
+//
+// ⚠ THE NEGATIVE IS IN THE SAME TEST ON PURPOSE. `+` is the ONE unary operator
+// carrying an operand-type gate (`-` has none), so a fix that simply deleted the
+// gate would pass every positive assertion. The pointer arm below is what makes
+// this a widening of one kind rather than a removal.
+TEST(HirLoweringC, ComplexUnaryPlusIsAdmittedAndAPointerOperandStaysRefused) {
+    {
+        SemanticModel model = analyzeC(
+            "int f(double _Complex z) {\n"
+            "    double _Complex w = +z;\n"
+            "    return (int)__builtin_creal(w);\n"
+            "}\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok)
+            << "`+z` must lower; got: "
+            << (r.all().empty() ? std::string{"<no diagnostic>"} : r.all()[0].actual);
+    }
+    {
+        // The gate still fires for an operand C does NOT call arithmetic.
+        SemanticModel model = analyzeC(
+            "int f(int *p) { return (int)(long long)+p; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_FALSE(res->ok)
+            << "unary `+` on a POINTER must stay a loud refusal — without this "
+               "arm the Complex widening is indistinguishable from deleting the "
+               "operand-type gate entirely";
+    }
+}
+
+// ★★ D-CSUBSET-ASSIGNMENT-TO-A-NON-LVALUE-REFUSED-BY-THE-LOWERING-TIER
+// (P42 lane AI) — C 6.5.16p2.
+//
+// Neither assignment path asked whether its left operand was an lvalue.
+// `lowerAssign` (statement position) lowered the LHS as an ordinary expression
+// and wrapped an `AssignStmt` around whatever came back; `classifyLvalue` (value
+// position) took `AddressOf` of anything its two pre-filters had not claimed. The
+// refusal then happened three tiers down, in MIR's `lowerLvalueAddress`, as a
+// message about the NODE KIND that arrived.
+// ✔MEASURED 2026-08-27 through the shipped CLI on x86_64:pe64-x86_64-windows-exec
+// — every shape refused, so never a miscompile, and every one wrong about WHY:
+// `8 = 5;` reported `H_UnsupportedLoweringForKind: string-literal materialization:
+// the Literal pool entry is not a string arm` — a message about STRING literals,
+// for an integer one — while `(a+b) = 5;` and `f() = 5;` reported `lvalue kind
+// 'BinaryOp' (ordinal 30)` and `'Call' (ordinal 27)`, naming raw internal
+// ordinals. gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed
+// SEPARATELY, both refuse at the user's own token.
+//
+// ⚠ THE POSITIVE ARMS ARE HALF THE TEST. A guard that rejected every assignment
+// would satisfy the three negatives, so the four lvalue SHAPES C actually admits
+// — a plain variable (`Ref`), a deref, an index and a member — are asserted to
+// still lower clean in the same fixture.
+TEST(HirLoweringC, AssignmentRequiresAModifiableLvalue) {
+    auto refusalCount = [](char const* src) {
+        SemanticModel model = analyzeC(src);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        std::size_t n = 0;
+        for (auto const& d : r.all()) {
+            if (d.code == DiagnosticCode::S_AssignNeedsModifiableLvalue) ++n;
+        }
+        return n;
+    };
+    EXPECT_EQ(refusalCount("int f(void) { 8 = 5; return 0; }\n"), 1u)
+        << "an integer literal has no object — this used to report a STRING "
+           "literal materialization failure";
+    EXPECT_EQ(refusalCount("int f(int a, int b) { (a + b) = 5; return a; }\n"), 1u)
+        << "an arithmetic result is an rvalue";
+    EXPECT_EQ(refusalCount("int g(void) { return 1; }\n"
+                           "int f(void) { g() = 5; return 0; }\n"), 1u)
+        << "a call result is an rvalue";
+    EXPECT_EQ(refusalCount("int f(int a) { (int)a = 5; return a; }\n"), 1u)
+        << "a cast result is an rvalue (C 6.5.4 yields a value, not an object)";
+    // ── the four shapes C DOES admit ──
+    EXPECT_EQ(refusalCount(
+                  "struct S { int m; };\n"
+                  "int f(int *p, int *arr, struct S *s, struct S v) {\n"
+                  "    int a = 0;\n"
+                  "    a = 1;\n"          // Ref — a plain variable
+                  "    *p = 2;\n"         // Deref
+                  "    arr[0] = 3;\n"     // Index
+                  "    s->m = 4;\n"       // MemberAccess through a pointer
+                  "    v.m = 5;\n"        // MemberAccess on a value
+                  "    return a + v.m;\n"
+                  "}\n"), 0u)
+        << "every lvalue shape C admits must still assign — without this arm the "
+           "guard is satisfiable by refusing all assignment";
+    // ★★ THE PARENTHESIZED FORM, AND IT IS THE ARM THAT WAS PAID FOR. C 6.5.1p5:
+    // a parenthesized expression is an lvalue if the unparenthesized one is. The
+    // first draft of the guard left `Ref` out of the addressable roster on the
+    // reasoning that `simpleLvalue` claims every plain variable first — and
+    // `examples/c/array_decay_deref` reddened in one run on `((out) = (u32)*(zBuf))`,
+    // because it does NOT claim a PARENTHESIZED one.
+    EXPECT_EQ(refusalCount(
+                  "int f(void) { int x = 1; int y; y = ((x) = 5); return y; }\n"), 0u)
+        << "a parenthesized variable is an lvalue (C 6.5.1p5) — the corpus refuted "
+           "the first draft here";
+}
+
+// ★ D-CSUBSET-ASSIGNMENT-TO-A-NON-LVALUE-REFUSED-BY-THE-LOWERING-TIER, the
+// SIBLING divergence the same roster was already shipping (P42 lane AI).
+//
+// `classifyIncDecLvalue` carried the addressable roster inline and it too omitted
+// `Ref`, so `++(x)` and `(x)++` on a PARENTHESIZED variable were refused
+// `S_IncDecNeedsModifiableLvalue`. ✔MEASURED: gcc 13.3.0 (`-std=c2x`) compiles and
+// RUNS both (exit 0); DSS refused. One roster, three callers, two bugs — which is
+// the argument for extracting `loweredNodeIsAddressable` rather than adding a
+// second inline copy at the assignment sites.
+TEST(HirLoweringC, IncDecOnAParenthesizedVariableIsAnLvalue) {
+    SemanticModel model = analyzeC(
+        "int f(void) { int x = 1; ++(x); (x)++; return x; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok)
+        << "`++(x)` / `(x)++` must lower; got: "
+        << (r.all().empty() ? std::string{"<no diagnostic>"} : r.all()[0].actual);
+    // The negative that keeps the widening bounded: a manifest rvalue operand is
+    // still refused, so `Ref` joining the roster did not delete the ++/-- guard.
+    SemanticModel bad = analyzeC("int f(void) { return (5)++; }\n");
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(bad, r2);
+    EXPECT_FALSE(res2->ok)
+        << "`(5)++` has no object — the ++/-- lvalue guard must still fire";
+}
+
+// ★★ D-CSUBSET-SWITCH-ON-A-NON-INTEGER-DISCRIMINANT-ACCEPTED (P42 lane AI).
+//
+// C 6.8.4.2p1: "The controlling expression of a switch statement shall have
+// integer type." There was NO type constraint on it at any tier.
+// ✔MEASURED at the pre-fix tree through the shipped CLI
+// (x86_64:pe64-x86_64-windows-exec): `switch (z)` on a `double _Complex`
+// COMPILED and RAN, while gcc 13.3.0 (`-std=c2x`) — *switch quantity not an
+// integer* — and clang 18.1.3 (`-std=c23`) — *statement requires expression of
+// integer type* — probed SEPARATELY, both REFUSE. That is direction B of the bar:
+// accepting what NO reference accepts and the standard forbids is an invented
+// extension.
+// ⚠ AND IT WAS NOT INERT. A `_Complex` is memory-resident and reaches the
+// discriminant position as its ADDRESS, so a `case 1:` would have compared an
+// object address against 1 and silently taken `default` forever — an accepted
+// program with a wrong answer.
+//
+// ⚠ THE POSITIVE CONTROLS ARE THE POINT OF THE THIRD AND FOURTH ARMS: the roster
+// is C's INTEGER one, not `isArithmeticCore` (which admits the FLOAT kinds), so
+// the FLOAT arm must refuse while `int` and `enum` must still pass. A guard that
+// reddened every switch would satisfy the two negatives alone.
+TEST(HirLoweringC, SwitchDiscriminantMustHaveIntegerType) {
+    auto lowers = [](char const* src) {
+        SemanticModel model = analyzeC(src);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        return res->ok;
+    };
+    EXPECT_FALSE(lowers(
+        "int f(double _Complex z) { switch (z) { default: return 1; } }\n"))
+        << "a complex controlling expression must be refused (C 6.8.4.2p1)";
+    EXPECT_FALSE(lowers(
+        "int f(double d) { switch (d) { default: return 1; } }\n"))
+        << "a FLOATING controlling expression must be refused too — both "
+           "references reject it under the same clause, and this is what "
+           "separates C's integer roster from `isArithmeticCore`";
+    EXPECT_TRUE(lowers(
+        "int f(int n) { switch (n) { case 1: return 2; default: return 1; } }\n"))
+        << "the ordinary integer switch must still lower";
+    EXPECT_TRUE(lowers(
+        "enum E { A, B };\n"
+        "int f(enum E e) { switch (e) { case A: return 2; default: return 1; } }\n"))
+        << "C 6.2.5p17 makes an enumerated type an INTEGER type; DSS interns Enum "
+           "as its own nominal kind, so it must be named in the roster explicitly";
+}
+
+// ★★★ D-HIR-VLA-PROBE-ABORTS-ON-AN-UNRESOLVED-DECLARED-TYPE — a declaration whose
+// type the semantic tier could not resolve must FAIL LOUD, not kill the compiler.
+//
+// ✔MEASURED at 301e2a63 on x86_64:pe64-x86_64-windows-exec, with a gdb backtrace:
+// `lowerVarLikeInto`'s pointer-to-VLA probe called the RAW `interner.kind(type)` on
+// `rec->type`, which is `InvalidType` whenever the declared type is unresolved, and
+// the lattice's arena guard aborted the process —
+//     dss::substrate fatal: TypeInterner::get: TypeId out of range
+// rc=127, no diagnostic, no source location. Its two siblings on the same line
+// (`isVlaArray`, `typeContainsVla`) both guard against exactly this and say so in
+// their own comments; the probe added later did not.
+// SIX shapes reached it, every one legal C that gcc 13.3.0 (`-std=c2x`) and clang
+// 18.1.3 (`-std=c23`) compile and run: a `typeof(<literal>)` parameter (in a
+// definition AND in a prototype), a file-scope `static typeof(1) g;`,
+// `typeof(1) a[3]`, `typeof(1) *p`, and `typeof(nullptr) p`.
+//
+// ⚠⚠ THE FIXTURE CHANGED AT P42 BECAUSE ITS ORIGINAL PREMISE WAS A DEFECT, AND
+// THE DEFECT IS FIXED. This test used to reach the probe with
+// `static int f(typeof(1) p) { return p; }` — legal C whose declared type the
+// semantic tier could not resolve, which is what
+// [[D-CSUBSET-TYPEOF-VALUE-FORM-RESOLVES-ONLY-FOR-AN-OBJECT-OPERAND]] was. That
+// row is CLOSED (P42 lane H): `typeof(1)` now resolves in every specifier
+// position, so the old fixture compiles and RUNS (✔MEASURED exit 7), leaves no
+// typeless declaration node, and the pin went green-by-vacuity — `typelessDecls`
+// was 0 and the EXPECT_GE below caught it.
+// ★ THE LESSON, AND IT IS WHY THE FIXTURE WAS REPLACED RATHER THAN THE ASSERTION
+// WEAKENED: a fixture that synthesizes its precondition out of a BUG has a
+// shelf life ending the day the bug is fixed, and it takes the pin with it.
+// The replacement synthesizes the unresolved type out of something that can
+// never become valid — an UNDECLARED name inside the `typeof` operand. The
+// semantic tier reports S_Undeclared (✔MEASURED through the shipped CLI on
+// x86_64:pe64-x86_64-windows-exec: `error[S0001] nosuchsymbol`) and the
+// parameter's type stays InvalidType, which is exactly the state the probe used
+// to abort on. Nothing can "fix" an undeclared name into a resolved type, so
+// this fixture cannot rot the same way.
+//
+// What this tier owes is that an unresolved type produces a DIAGNOSTIC, and it does:
+// `requiresValidType(HirKind::VarDecl)` is true, so the HIR verifier raises
+// H_TypeUnresolved with the declarator's own source span.
+//
+// ★ THE ASSERTION IS PARTLY THAT THIS TEST RETURNS AT ALL. An abort inside
+// `lowerToHir` takes the whole executable out at 0xC0000409 with no `[ FAILED ]`
+// line — the failure mode `analyzeC`'s own comment records — so ctest reports the
+// crash rather than a case. That is the red; the EXPECTs below are what stops it
+// from being satisfied by a silent accept instead.
+//
+// RED-ON-DISABLE (REMOVE direction): change `} else if (type.valid()) {` back to
+// `} else {` in `lowerVarLikeInto` — this test's process aborts and ctest reports
+// hir/test_hir_lowering_c as crashed rather than failed.
+TEST(HirLoweringC, AnUnresolvedDeclaredTypeFailsLoudInsteadOfAbortingTheCompiler) {
+    // A parameter typed `typeof(<undeclared name>)`. The semantic tier reports
+    // S_Undeclared for the operand and leaves the parameter symbol's type
+    // UNRESOLVED — the state the pointer-to-VLA probe used to abort on. An
+    // undeclared name cannot later become resolvable, so this precondition does
+    // not depend on any open defect (see the docblock above).
+    SemanticModel model = analyzeC(
+        "static int f(typeof(nosuchsymbol) p) { return p; }\n"
+        "int main(void) { return f(0); }\n");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);          // must RETURN, not abort
+    ASSERT_TRUE(res != nullptr);
+
+    // The unresolved type must still be visible as a TYPELESS declaration node,
+    // which is what makes the HIR verifier's H_TypeUnresolved fire. Asserting the
+    // node EXISTS and is typeless is stronger than asserting "no crash": a
+    // lowering that silently dropped the declarator would also not crash.
+    std::size_t typelessDecls = 0;
+    auto const walk = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        HirKind const k = res->hir.kind(n);
+        if ((k == HirKind::VarDecl || k == HirKind::Global)
+            && !res->hir.typeId(n).valid())
+            ++typelessDecls;
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    walk(walk, res->hir.root());
+    EXPECT_GE(typelessDecls, 1u)
+        << "the unresolved parameter must survive as a TYPELESS declaration node "
+           "so the HIR verifier can report H_TypeUnresolved against its span -- a "
+           "silently dropped declarator would be a quiet accept, which is worse "
+           "than the abort this replaced";
+}
+
+// D-CSUBSET-NULLPTR-T-DECLARABLE — the C23 `nullptr_t` OBJECT, and the property
+// that replaced the per-site condition arm this test used to pin.
+//
+// ★ WHAT CHANGED AND WHY THE PIN GOT STRONGER RATHER THAN JUST DIFFERENT.
+// `nullptr_t` used to be a SEMANTIC-TIER-ONLY kind: legal only as the type of the
+// `nullptr` literal, which lowers to an integer zero before HIR ever sees it. An
+// OBJECT of the type therefore could not compile at all — ✔MEASURED at 301e2a63,
+// `typeof(nullptr) o = nullptr;` failed with `I_NullptrTypeInMir` +
+// `I_StoreValueTypeMismatch`, while gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
+// (`-std=c23`) both compile and RUN it. `coerceCondition` carried a NullptrT arm
+// that patched exactly ONE position (the condition) of a construct that could not
+// compile in any position.
+// ⇒ The type gap is now closed at its source: C23 §6.2.5 gives `nullptr_t` the
+// size, alignment and representation of `void *`, so
+// `TypeInterner::representationType` PROJECTS the kind to `Ptr<Void>` at the
+// semantic→HIR boundary while the semantic tier keeps the distinct identity
+// `_Generic` and the one-way conversion rules need. The condition arm became
+// unreachable and was removed.
+// ⇒ So this test no longer asks "did the condition slot get a Bool literal?" (a
+// claim about one position) but "can ANY node in the module carry the kind?" —
+// which is the invariant the projection actually establishes, and it covers the
+// four positions the old pin could not reach: the initializing store, the
+// declaration's own type, a same-type copy, and the conversion to `void *`.
+//
+// The runtime half is `examples/c/nullptr_t_object` (debug AND release, four
+// targets); this is the structural half, red on every leg.
+//
+// RED-ON-DISABLE (REMOVE direction): make `representationType`'s `NullptrT` arm
+// return `id` instead of `pointer(primitive(Void))` — the projection becomes the
+// identity, `nullptrTypedNodes` goes 0 -> nonzero and the VarDecl's type reverts
+// to NullptrT, so BOTH assertions red. (The mutant also reds the MIR pin and the
+// corpus example, which is the point: one projection, three tiers.)
+TEST(HirLoweringC, NullptrTObjectIsProjectedToItsPointerRepresentation) {
     SemanticModel model = analyzeC(
         "int f(void) {\n"
         "    int r = 0;\n"
-        "    typeof(nullptr) v = nullptr;\n"
-        "    if (v) r = 1;\n"               // nullptr_t VALUE, `if`
-        "    r = v ? 2 : 3;\n"              // nullptr_t VALUE, ternary
-        "    return r;\n"
+        "    typeof(nullptr) v = nullptr;\n"   // the OBJECT + its initializing store
+        "    typeof(nullptr) w = v;\n"         // a same-type copy (load + store)
+        "    void *p = w;\n"                   // the one-way conversion to a pointer
+        "    if (v) r = 1;\n"                  // nullptr_t value, `if`
+        "    r = v ? 2 : 3;\n"                 // nullptr_t value, ternary
+        "    return r + (p == nullptr ? 0 : 9);\n"
         "}\n");
     ASSERT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty() ? std::string{}
@@ -8865,38 +9619,44 @@ TEST(HirLoweringC, NullptrTypedValueInAConditionBecomesTheBoolFalseLiteral) {
     ASSERT_TRUE(fn.valid());
     auto const& ti = model.lattice().interner();
 
-    // The two condition slots: an `If`'s condition child and a `Ternary`'s.
-    // Reading them by POSITION is what makes the assertion about the CONDITION
-    // rather than about the program's NullptrT nodes in general — the
-    // declaration's own initializer is legitimately NullptrT-typed and must not
-    // be counted.
-    std::size_t boolFalseLiterals = 0;
-    std::size_t nullptrCondNodes  = 0;
-    auto const inspectCond = [&](HirNodeId c) {
-        if (!c.valid()) return;
-        TypeId const t = res->hir.typeId(c);
-        if (!t.valid()) return;
-        if (ti.kind(t) == TypeKind::NullptrT) ++nullptrCondNodes;
-        if (res->hir.kind(c) == HirKind::Literal && ti.kind(t) == TypeKind::Bool)
-            ++boolFalseLiterals;
-    };
-    auto const walkConds = [&](auto&& self, HirNodeId n) -> void {
+    // (1) TOTALITY — walk EVERY node in the module, not a chosen position. A
+    // per-position walk is what let the previous version of this pin be true of
+    // the condition while the store one tier down was still refused.
+    std::size_t nullptrTypedNodes = 0;
+    std::size_t varDeclsSeen      = 0;
+    std::size_t voidPtrVarDecls   = 0;
+    auto const walkAll = [&](auto&& self, HirNodeId n) -> void {
         if (!n.valid()) return;
-        if (res->hir.kind(n) == HirKind::IfStmt)
-            inspectCond(res->hir.ifCondition(n));
-        if (res->hir.kind(n) == HirKind::Ternary) {
-            auto const kids = res->hir.children(n);
-            if (!kids.empty()) inspectCond(kids[0]);
+        TypeId const t = res->hir.typeId(n);
+        if (t.valid() && ti.kind(t) == TypeKind::NullptrT) ++nullptrTypedNodes;
+        if (res->hir.kind(n) == HirKind::VarDecl) {
+            ++varDeclsSeen;
+            // (2) IDENTITY OF THE PROJECTION, not merely "not NullptrT": the two
+            // `nullptr_t` locals must be `Ptr<Void>` EXACTLY — the representation
+            // C23 §6.2.5 assigns the type. Asserting only "not NullptrT" would
+            // stay green if the projection picked, say, a bare `u64`.
+            if (t.valid() && ti.kind(t) == TypeKind::Ptr) {
+                auto const ops = ti.operands(t);
+                if (!ops.empty() && ti.kind(ops[0]) == TypeKind::Void)
+                    ++voidPtrVarDecls;
+            }
         }
         for (HirNodeId c : res->hir.children(n)) self(self, c);
     };
-    walkConds(walkConds, res->hir.functionBody(fn));
+    walkAll(walkAll, res->hir.functionBody(fn));
 
-    EXPECT_EQ(boolFalseLiterals, 2u)
-        << "a nullptr_t condition becomes the Bool literal `false` "
-           "(C 6.3.2.4p2), NOT a run-time comparison";
-    EXPECT_EQ(nullptrCondNodes, 0u)
-        << "no NullptrT-typed node may survive a condition slot -- it is a "
-           "semantic-tier-only kind, and the I_NullptrTypeInMir tripwire firing "
-           "on it is what exposed the defect";
+    EXPECT_EQ(nullptrTypedNodes, 0u)
+        << "no HIR node may carry TypeKind::NullptrT in ANY position -- the "
+           "semantic->HIR boundary projects the kind to its object "
+           "representation, and the I_NullptrTypeInMir tripwire one tier down "
+           "reports any site that projection missed";
+    // `r`, `v`, `w`, `p` — four locals; `v` and `w` are the nullptr_t pair and
+    // `p` is a real `void *`, so exactly three carry `Ptr<Void>`. Pinning the
+    // COUNT (not "at least one") is what makes a projection that fires on only
+    // the first declarator red.
+    EXPECT_EQ(varDeclsSeen, 4u) << "r, v, w, p";
+    EXPECT_EQ(voidPtrVarDecls, 3u)
+        << "both nullptr_t locals must be typed Ptr<Void> (C23 6.2.5: the size, "
+           "alignment and representation of `void *`), alongside the real void* "
+           "local";
 }

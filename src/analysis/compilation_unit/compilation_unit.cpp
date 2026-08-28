@@ -6,6 +6,7 @@
 #include "analysis/syntactic/parser.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/phase_timers.hpp"   // c97: per-phase --time accumulation
+#include "core/types/config_path_walk.hpp"   // resolveSystemDirs — THE owner of the shippedLibDirs walk
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "tokenizer/tokenizer.hpp"
@@ -601,6 +602,15 @@ void UnitBuilder::addSystemDir(std::filesystem::path dir) {
         cuFatal("UnitBuilder::addSystemDir called after finish()");
     }
     systemDirs_.push_back(std::move(dir));
+}
+
+// See the header. The WALK is `resolveSystemDirs`
+// (`core/types/config_path_walk.hpp`); this is only the binding onto a builder,
+// and it is a named function rather than an open-coded loop so that every
+// channel that builds a CU — driver, editor, and anything after them — is
+// visibly asking the SAME question.
+void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar) {
+    for (auto const& d : resolveSystemDirs(grammar)) builder.addSystemDir(d);
 }
 
 void UnitBuilder::setActiveFormat(ObjectFormatKind fmt) {

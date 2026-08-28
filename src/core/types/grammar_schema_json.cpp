@@ -7923,7 +7923,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // `builtinChooseExpr`. Siblings of `sizeof`/`alignof`/`generic`
             // rather than `builtinFunctions` rows, because their operands are
             // TYPE-NAMES and unevaluated expressions, not call arguments.
-            static constexpr std::array<std::string_view, 60> kSemanticsKeys{
+            // ⓘ 60 → 61 (P42, D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED):
+            // `nonObjectTypeSizes` — the byte size a dialect gives `void` and a
+            // function type as the OPERAND of `sizeof`/`_Alignof` or the ELEMENT
+            // of pointer arithmetic. A sibling of `pointerAliasing` (a per-language
+            // fact read at two tiers), NOT of `sizeof`/`alignof` (which name
+            // GRAMMAR RULES, while this names a size).
+            static constexpr std::array<std::string_view, 61> kSemanticsKeys{
                 // declaration / reference / scope surface (plan 08.6)
                 "declarators", "declarations", "references", "memberAccesses",
                 "scopes",
@@ -7963,7 +7969,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 "scalarConvertsToBool", "intCrossSignednessConverts",
                 "intSameSignednessNarrows", "intConvertsToFloat",
                 "floatConvertsToInt", "floatSameKindNarrows",
-                "pointerAliasing"};
+                "pointerAliasing", "nonObjectTypeSizes"};
             DSS_CHECK_KEY_VOCABULARY(kSemanticsKeys);
             (void)checkKeysAgainst(sem, kSemanticsKeys, "/semantics",
                                    "the 'semantics' block",
@@ -8124,6 +8130,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // contains a space.
             auto const closedKindSet = [] {
                 return renderAllowedList(allNames(kDeclarationKindTable), " | ");
+            };
+            // ★★ P42 (D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT):
+            // `appliesTo` speaks a WIDER vocabulary than `declarations[].kind`
+            // does — the four declaration kinds plus the `functionPointer`
+            // REFINEMENT — so it gets its own parse and its own rendered closed
+            // set. Both project `kAttributeAppliesKindTable`, which is itself
+            // built from `kDeclarationKindTable`, so the four shared spellings
+            // still have exactly one owner and only the fifth is new.
+            auto const parseAppliesKind = [](std::string_view name) {
+                return attributeAppliesKindFromName(name);
+            };
+            auto const closedAppliesKindSet = [] {
+                return renderAllowedList(allNames(kAttributeAppliesKindTable),
+                                         " | ");
             };
 
             // ── TWO VOCABULARIES, TWO TABLES, NO LOCAL CHAINS ──────────────
@@ -13322,13 +13342,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             // attached" is precisely "has a declared entity whose
                             // kind can be judged".
                             //
-                            // ★ A `none` row is EXEMPT, and must be: that verb
-                            // bundles function-only, type-only, statement-only and
+                            // ★★ P42 — A `none` ROW IS EXEMPT FROM THE
+                            // REQUIREMENT, BUT NO LONGER FORBIDDEN THE KEY, AND
+                            // THAT SINGLE-WORD CHANGE IS THE WHOLE FIX FOR TWO
+                            // RESIDUALS. The refusal that used to sit here
+                            // reasoned correctly from a premise it then made
+                            // permanent: the shipped `none` row bundled
+                            // function-only, type-only, statement-only and
                             // elsewhere-consumed names in ONE row, so no single
-                            // kind set is correct for it. See the c row's
-                            // own `$comment` for what closing that half costs (a
-                            // ROW SPLIT by applicable kind, not another key) and
-                            // for the measured bound on the residual silence.
+                            // kind set was correct for it — and the only cure for
+                            // that is a ROW SPLIT, which is exactly what a refusal
+                            // of the key makes pointless. Permitting it lets the
+                            // split rows say what they apply to
+                            // ([[D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT]]'s
+                            // residual) and lets the LINKAGE vocabulary carry a
+                            // kind axis at all
+                            // ([[D-CSUBSET-STRICT-ATTRIBUTE-GATE-BLIND-TO-LINKAGE-VOCABULARY]]'s).
+                            //
+                            // ★ It stays OPTIONAL rather than becoming required,
+                            // because some names genuinely have no expressible
+                            // kind set (statement attributes; attributes of
+                            // aggregate TYPE DEFINITIONS, which `type` — what a
+                            // typedef declares — does not mean). Omitting it on an
+                            // inert row can only preserve today's silence; omitting
+                            // it on a FIRING verb would let an effect apply to a
+                            // kind that cannot honor it. Bounded loss on one side,
+                            // wrong behaviour on the other: hence the asymmetry.
                             bool const kindAxisRequired =
                                 out.effect != AttributeEffect::None;
                             if (!row.contains("appliesTo")) {
@@ -13349,25 +13388,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                             "universal and stay silent on the "
                                             "misuse the decl-kind gate exists to "
                                             "report",
-                                            verb, closedKindSet()));
+                                            verb, closedAppliesKindSet()));
                                 }
-                            } else if (!kindAxisRequired) {
-                                // Present on a `none` row: not an error to reject
-                                // outright, but it can never be READ (the gate
-                                // skips a row with no declared kind axis only
-                                // because `none` rows have none), so accepting it
-                                // silently would be a knob that lies.
-                                coll.emit(
-                                    DiagnosticCode::C_InvalidSemantics,
-                                    rowPath + "/appliesTo",
-                                    "'appliesTo' must NOT appear on an 'effects' "
-                                    "row whose effect is 'none' — that verb "
-                                    "bundles names belonging to different entity "
-                                    "kinds (and names consumed by other scans "
-                                    "entirely), so no kind set is correct for it "
-                                    "and the declared one would never be read. "
-                                    "Closing that half means SPLITTING the row by "
-                                    "applicable kind, not annotating it");
                             } else if (!row.at("appliesTo").is_array()) {
                                 coll.emit(
                                     DiagnosticCode::C_InvalidSemantics,
@@ -13375,7 +13397,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     std::format("'appliesTo' must be an ARRAY of "
                                                 "declaration-kind strings — the "
                                                 "closed set is {}",
-                                                closedKindSet()));
+                                                closedAppliesKindSet()));
                             } else if (row.at("appliesTo").empty()) {
                                 coll.emit(
                                     DiagnosticCode::C_InvalidSemantics,
@@ -13396,11 +13418,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                 "each 'appliesTo' entry must be a "
                                                 "declaration-kind STRING — the "
                                                 "closed set is {}",
-                                                closedKindSet()));
+                                                closedAppliesKindSet()));
                                         continue;
                                     }
                                     auto const kindName = kn.get<std::string>();
-                                    auto const k = parseKind(kindName);
+                                    auto const k = parseAppliesKind(kindName);
                                     if (!k) {
                                         // Message DERIVED from the vocabulary
                                         // table, never restated beside it (the
@@ -13413,7 +13435,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                 "unknown declaration kind '{}' in "
                                                 "'appliesTo' — the closed set is "
                                                 "{}",
-                                                kindName, closedKindSet()));
+                                                kindName, closedAppliesKindSet()));
                                         continue;
                                     }
                                     if (std::ranges::find(out.appliesTo, *k)
@@ -15038,6 +15060,79 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: per-language
+            // `nonObjectTypeSizes` block — the byte size this dialect
+            // gives `void` and a function type as the OPERAND of
+            // `sizeof`/`_Alignof` or the ELEMENT of pointer arithmetic.
+            // GNU C (gcc AND clang, MEASURED separately at P42) says 1
+            // for both; ISO C says neither has a size, which is the
+            // ABSENT default. Same unknown-key fail-loud discipline as
+            // the two blocks above; the values are UNSIGNED INTEGERS,
+            // not booleans, so this reader is a `readSize`, not a
+            // `readBool`.
+            //   ⚠ A ZERO is refused HERE, at config load, rather than
+            // left to `operandLayout`'s own guard: a stride of 0 makes
+            // every element of an arithmetic sequence alias byte offset
+            // 0, and the two refusals disagree on WHERE the operator
+            // finds out. Config-load is the position that can name the
+            // key and the file.
+            if (sem.contains("nonObjectTypeSizes")) {
+                auto const& obj = sem.at("nonObjectTypeSizes");
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/nonObjectTypeSizes",
+                              "'nonObjectTypeSizes' must be an object with "
+                              "optional `voidBytes` and `functionBytes` "
+                              "positive-integer fields");
+                } else {
+                    auto readSize =
+                        [&](char const* field,
+                            std::optional<std::uint64_t>& out) {
+                            if (!obj.contains(field)) return;
+                            auto const& val = obj.at(field);
+                            if (!val.is_number_unsigned()) {
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidSemantics,
+                                    std::format(
+                                        "/semantics/nonObjectTypeSizes/{}",
+                                        field),
+                                    std::format("'{}' must be a positive "
+                                                "integer number of bytes",
+                                                field));
+                                return;
+                            }
+                            auto const n = val.get<std::uint64_t>();
+                            if (n == 0) {
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidSemantics,
+                                    std::format(
+                                        "/semantics/nonObjectTypeSizes/{}",
+                                        field),
+                                    std::format(
+                                        "'{}' must be at least 1 — a size of "
+                                        "0 makes every element of a pointer-"
+                                        "arithmetic sequence alias byte "
+                                        "offset 0", field));
+                                return;
+                            }
+                            out = n;
+                        };
+                    readSize("voidBytes",
+                             cfg.nonObjectTypeSizes.voidBytes);
+                    readSize("functionBytes",
+                             cfg.nonObjectTypeSizes.functionBytes);
+                    // DERIVED FROM THE `readSize` calls just above.
+                    static constexpr std::array<std::string_view, 2>
+                        kNonObjectTypeSizeKeys{"voidBytes", "functionBytes"};
+                    DSS_CHECK_KEY_VOCABULARY(kNonObjectTypeSizeKeys);
+                    (void)checkKeysAgainst(
+                        obj, kNonObjectTypeSizeKeys,
+                        "/semantics/nonObjectTypeSizes",
+                        "the 'nonObjectTypeSizes' block",
+                        DiagnosticCode::C_InvalidSemantics, coll);
+                }
+            }
+
             // A `nameMatch: "lastIdentifier"` rule (declaration or
             // reference) descends a subtree for its LAST identifier token —
             // which requires the engine to know which token kind IS the
@@ -15240,9 +15335,72 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     std::unordered_set<std::string> covered;
                     for (auto const& n : d.linkageSpecifierIgnoredNames)
                         covered.insert(norm(n));
-                    for (auto const& kv : d.linkageSpecifiers)
+                    for (auto const& kv : d.linkageSpecifiers) {
                         covered.insert(norm(kv.first));
+                        // ★ P42 — AND THE COMPOSITE KEY'S BASE NAME. A key may be
+                        // `<identifier><sep><string body>` (`visibility:hidden`),
+                        // and the thing a programmer can SPELL as a clause name is
+                        // the identifier half. Covering only the whole key made
+                        // this check ask a question no source text can answer: it
+                        // would demand `visibility` be added to
+                        // `linkageSpecifierIgnoredNames` — which is not merely
+                        // redundant but ACTIVELY WRONG, because the HIR lowerer
+                        // tests the ignored-name list BEFORE it assembles the
+                        // composite key, so the entry would make
+                        // `visibility("hidden")` be skipped by name and the
+                        // visibility fact SILENTLY DROPPED. ✔MEASURED by reading
+                        // `linkageFrom`'s scan order in cst_to_hir.cpp; a hidden
+                        // symbol becoming default-visible is a linker-visible
+                        // wrong answer, not a missing warning.
+                        covered.insert(
+                            norm(std::string{linkageSpecifierBaseName(kv.first)}));
+                    }
                     for (auto const& row : cfg.attributeEffects) {
+                        // ★★★ P42 — THE `none` SKIP STAYS, AND REMOVING IT WAS
+                        // TRIED AND **MEASURED TO PRODUCE A SILENT MISCOMPILE**.
+                        // This comment is here because the skip reads like an
+                        // unfinished exemption and the obvious next edit is to
+                        // delete it.
+                        //
+                        // The reasoning FOR deleting it is genuinely good: nothing
+                        // else forces an inert name into
+                        // `linkageSpecifierIgnoredNames`, so names drift out of
+                        // that hand-maintained roster unnoticed — and three of c's
+                        // had (`packed`, `may_alias`, `transparent_union`), leaving
+                        // `__attribute__((packed)) int gv = 1;` a loud
+                        // `error[H000C]` where clang 18.1.3 and gcc 13.3.0 both
+                        // compile at rc=0. That IS a real defect.
+                        //
+                        // ⛔ BUT THE REMEDY THIS CHECK PRESCRIBES IS WRONG FOR
+                        // THOSE THREE NAMES, AND WRONG IN THE WORST DIRECTION.
+                        // ✔MEASURED end-to-end with the shipped CLI, the skip
+                        // deleted and `packed` duly added to the roster the message
+                        // demands: `__attribute__((packed)) struct S { char c; int
+                        // v; } gv;` went from a loud refusal to **rc=0 with
+                        // `sizeof(struct S) == 8`** — byte-identical to the
+                        // UNPACKED control, while the trailing spelling correctly
+                        // yields 5. The linkage scan tests the ignored-name list
+                        // BEFORE anything can honor the attribute, so the entry
+                        // does not silence a diagnostic, it DISCARDS A LAYOUT FACT.
+                        // A refusal of valid C is bad; a wrong `sizeof` that still
+                        // links is the one outcome this project ranks below it.
+                        //
+                        // ★ THE DEEPER READING, which is why this is not merely a
+                        // veto: the check infers "the effects row is UNREACHABLE"
+                        // from "this declaration form would refuse the name". For a
+                        // FIRING verb that inference holds — the row exists to make
+                        // the effect happen, and a form that refuses the name
+                        // cannot. For an INERT name it does not: c's `packed` row
+                        // is reached from `typedefDecl`, `structSpec` and the
+                        // member rows, none of which runs the strict linkage scan,
+                        // and the file-scope refusal is a DELIBERATE statement that
+                        // DSS cannot honor `packed` in that position. Same shape as
+                        // [[D-LK-MACHO-ISDATA-NO-CALL-SIGNAL]]: a predicate that
+                        // sits near the decision but does not carry it.
+                        // ⇒ The residual — the plain-object case, where there is no
+                        // layout to lose and both references merely warn — needs the
+                        // HIR tier to distinguish "cannot honor it HERE" from
+                        // "nothing to honor", which is not a roster question at all.
                         if (row.effect == AttributeEffect::None) continue;
                         for (auto const& n : row.names) {
                             if (covered.contains(norm(n))) continue;
@@ -15252,8 +15410,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                             "linkageSpecifierIgnoredNames", i),
                                 std::format(
                                     "attribute-vocabulary drift: "
-                                    "'semantics.attributeSemantics.effects' gives "
-                                    "'{}' a declaration-attached effect, but "
+                                    "'semantics.attributeSemantics.effects' "
+                                    "declares '{}' as attribute vocabulary, but "
                                     "declaration '{}' runs the strict linkage "
                                     "specifier scan and its "
                                     "'linkageSpecifierIgnoredNames' does not cover "

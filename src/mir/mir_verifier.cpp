@@ -1041,16 +1041,29 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                             "the HIR→MIR boundary)",
                     t.v));
         }
-        // C23 nullptr_t (D-CSUBSET-NULLPTR): a never-fires backstop for the keystone
-        // invariant — the `nullptr` literal lowers to the integer-0 null constant at
-        // the HIR tier (cst_to_hir `lowerLiteral`), so NullptrT is a semantic-tier-
-        // only kind that must not reach MIR. A NullptrT result type here means a
-        // regression let a NullptrT-typed Const materialize.
+        // C23 nullptr_t (D-CSUBSET-NULLPTR / D-CSUBSET-NULLPTR-T-DECLARABLE): a
+        // never-fires backstop for the keystone invariant. TWO independent
+        // constructions keep NullptrT out of MIR, and this tripwire guards both:
+        //   • the `nullptr` LITERAL lowers to the integer-0 null constant at the HIR
+        //     tier (`cst_to_hir::lowerLiteral`), so it never mints a NullptrT Const;
+        //   • a `nullptr_t` OBJECT's type is PROJECTED to its representation
+        //     (`Ptr<Void>` — C23 §6.2.5) by `TypeInterner::representationType` at the
+        //     semantic→HIR boundary, so no declaration, parameter, return, member or
+        //     element carries the kind past that boundary either.
+        // ⚠ THE SECOND CONSTRUCTION IS WHY THIS CHECK IS WORTH MORE THAN IT WAS.
+        // While `nullptr_t` objects were simply refused, the only way to trip this
+        // was a regression in the literal path. Now the projection is applied at
+        // every site a semantic type crosses into this pipeline, and a MISSED site
+        // is precisely what this message reports — which is the failure mode a
+        // reviewer of that projection should expect to see here.
         if (interner_->kind(t) == TypeKind::NullptrT) {
             reportInst(reporter, DiagnosticCode::I_NullptrTypeInMir, id,
                 std::format("typeId {} resolves to TypeKind::NullptrT (C23 nullptr_t "
-                            "is semantic-tier-only — `nullptr` must lower to the "
-                            "integer-0 null constant and never reach MIR)",
+                            "is a semantic IDENTITY with a pointer REPRESENTATION — "
+                            "the `nullptr` literal must lower to the integer-0 null "
+                            "constant, and a nullptr_t OBJECT's type must be "
+                            "projected through TypeInterner::representationType at "
+                            "the semantic→HIR boundary; neither may reach MIR)",
                     t.v));
         }
         // C23 _BitInt(N) (D-CSUBSET-BITINT): the by-construction WRAP-CHOKEPOINT

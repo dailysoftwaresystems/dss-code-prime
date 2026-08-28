@@ -390,7 +390,7 @@
     { "name": "FORMAT_MESSAGE_ALLOCATE_BUFFER", "value": 256,        "type": "u32" },
     { "name": "FORMAT_MESSAGE_IGNORE_INSERTS",  "value": 512,        "type": "u32" },
     { "name": "FORMAT_MESSAGE_FROM_SYSTEM",     "value": 4096,       "type": "u32" },
-    { "name": "GetFileExInfoStandard",          "value": 0,          "type": "i32" },
+    { "name": "GetFileExInfoStandard",          "value": 0,          "type": "i32", "preprocessorVisible": false },
     { "name": "WAIT_OBJECT_0",                  "value": 0,          "type": "u32" },
     { "name": "WAIT_TIMEOUT",                   "value": 258,        "type": "u32" },
     { "name": "WAIT_FAILED",                    "value": 4294967295, "type": "u32" },

@@ -1,0 +1,42 @@
+{
+  "$comment": "D-CONFIG-SETJMP-MACRO-INVISIBLE-ON-ELF (cycle P42, lane AD). `setjmp` carried a `pe`-only macro variant, so `#ifdef setjmp` answered TRUE on pe and FALSE on elf and macho for a name reachable in CODE on all three. ⚠ THE ISO HALF OF THE USUAL ARGUMENT DOES NOT APPLY HERE AND THE ROW DOES NOT REST ON IT: C23 §7.13p1 lists `setjmp` among the macros the header defines, but §7.13p4 states outright that it is UNSPECIFIED whether `setjmp` is a macro or an identifier with external linkage. The binding rule is the REFERENCE UNION applied PER TARGET, and the references genuinely disagree with each other: glibc's <setjmp.h> writes `#define setjmp(env) _setjmp (env)` so gcc 13.3.0 -std=c2x and clang 18.1.3 -std=c23 are both rc=0 on `#ifndef setjmp -> #error` (✔MEASURED 2026-08-27 at c99/c11/c2x/gnu2x, with a control #error that fired on both instruments and a positive control that passed); MSVC does `#define setjmp _setjmp`, which is the pe arm DSS already shipped; and Apple's SDK <setjmp.h> declares `extern int setjmp(jmp_buf);` with NO #define at all, ✔MEASURED on the operator's macOS host with the same two controls, rc=1. ⇒ ELF WAS BELOW ITS REFERENCE AND IS FIXED; MACH-O MATCHES ITS OWN REFERENCE AND IS DELIBERATELY LEFT ALONE — adding a macho arm would put DSS ABOVE the only reference that target has, which is the worse half of the same rule and turns a correct refusal into an invented extension. ✔BEFORE through the shipped CLI, one binary and one source against a config root pinned outside the repo (so no sibling lane's live edit could move the measurement) with a positive control proving that snapshot is what loaded: elf64-x86_64 rc=1 P001E, elf64-aarch64 rc=1 P001E, pe64 rc=0, macho64-x86_64 rc=1, macho64-arm64 rc=1. ✔AFTER: elf64-x86_64 rc=0, elf64-aarch64 rc=0, pe64 rc=0, macho64-x86_64 rc=1, macho64-arm64 rc=1. The fix is one `elf` variant, NOT a loader change: the variant selector has no fallback arm by design (zero matches means the macro is not injected, never a wrong replacement) and `matchCount > 1` is a fail-loud F_ShippedMacroVariantAmbiguous, which is the property that keeps a per-format macro honest. The replacement is SELF-REFERENTIAL (`setjmp(env)` -> `setjmp(env)`) rather than glibc's `_setjmp(env)`, because glibc's macro routes to the entry point that does NOT save the signal mask while this descriptor's elf symbol binds `setjmp` (= `__sigsetjmp(env,1)`, which does) paired with a `longjmp` that restores on that flag — spelling it glibc's way would smuggle a runtime semantics change inside a preprocessor-visibility fix. ✔The existing `setjmp_longjmp` example still compiles, links and RUNS on elf64-x86_64 at exit 42 through the new macro, which is the proof that the self-reference terminates on DSS's hidesets and that the binding is unchanged. THE EXIT CODE NAMES THE DIRECTION of any regression because the two directions have opposite fixes: 42 = contract held; 34 = required-but-absent (an arm was dropped); 36 = forbidden-but-present (an arm was swept onto a format whose reference has none). ⚠ THIS EXAMPLE IS NOT SUFFICIENT ALONE: the elf and macho arms declare runOn linux/darwin, so on a Windows host they are BUILD-ONLY and the exit code cannot witness the elf regression — `tests/program/test_setjmp_macro_visibility.cpp` asserts the same contract at COMPILE time for all three formats on EVERY host, which is the hole lane T measured in the sibling stdio row (deleting an `elf` variant left that example green on Windows). RED-ON-DISABLE: drop the `elf` variant from setjmp.json and both ELF arms return 34 while pe stays 42 and macho stays 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"],
+      "mustDifferFromBaseline": true
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

@@ -16,7 +16,6 @@
 #include <format>
 #include <limits>
 #include <optional>
-#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1201,7 +1200,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // guard would reject every shipped target on its first load.
     //
     // Every name here is a key the loader genuinely reads.
-    static constexpr std::array<std::string_view, 16> kTargetDocumentKeys{
+    static constexpr std::array<std::string_view, 17> kTargetDocumentKeys{
         // identity + loader gates
         "dssTargetVersion", "target",
         // per-target LANGUAGE-affecting semantics
@@ -1225,6 +1224,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // facet, leaving a knob that lies. `ShippedTargetsDeclareAsm-
         // Constraints` pins that the key is genuinely consumed.
         "asmConstraints",
+        // Which register VIEW a BARE `%0` names, per register class — the
+        // half `asmConstraints` cannot answer, because it is about the
+        // width a reference states rather than about which register a
+        // letter binds. Undeclared is a legitimate state and every
+        // consumer refuses by name; see `AsmBareOperandWidth`.
+        "asmBareOperandWidths",
         // machine description
         "opcodes", "registers", "registerClassOps", "relocations",
         "condCodeEncoding",
@@ -1437,9 +1442,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             // belongs HERE rather than in the substrate — `ObjectFormatSchema`
             // drives the same substrate loader with a DIFFERENT extension set,
             // so a set placed there would reject the other family's keys.
-            static constexpr std::array<std::string_view, 7> kRelocationKeys{
+            static constexpr std::array<std::string_view, 8> kRelocationKeys{
                 "name", "kind", "formula", "widthBytes", "pcRelative",
-                "addendBias", "tls"};
+                "addendBias", "tls", "imageRelative"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationKeys);
             rejectUnknownKeys(r, kRelocationKeys,
                               std::format("/relocations/{}", i),
@@ -1528,6 +1533,25 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     return false;
                 }
                 info.tls = r.at("tls").get<bool>();
+            }
+            // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: `imageRelative`
+            // — the patched value is the target's address MINUS the
+            // image base (an RVA), not an absolute VA. The one
+            // property that separates PE's `IMAGE_REL_AMD64_ADDR32NB`
+            // from `IMAGE_REL_AMD64_ADDR32`; both are 32-bit Linear
+            // absolute rows with a zero bias, so without it a walker
+            // asking for "the RVA relocation" is choosing by table
+            // order. The coherence rules (imageRelative excludes
+            // pcRelative and tls) live in `TargetSchema::validate()`,
+            // which a programmatically-built schema also reaches.
+            if (r.contains("imageRelative")) {
+                if (!r.at("imageRelative").is_boolean()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/imageRelative", i),
+                           "'imageRelative' must be a boolean");
+                    return false;
+                }
+                info.imageRelative = r.at("imageRelative").get<bool>();
             }
             // Non-Linear coherence + default widthBytes=4 (ARM64
             // instruction word).
@@ -2956,6 +2980,123 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         }
     }
 
+    // ── asmBareOperandWidths (which view a BARE `%0` names — optional) ──
+    //
+    // See `AsmBareOperandWidth` in the header for the measurement: gcc and
+    // clang agree with each other and DISAGREE ACROSS PORTS about how a
+    // modifier-less template operand states its width, and no width arithmetic
+    // reproduces both — so the derivation is declared, per register class.
+    //
+    // ★ PARSED AFTER `registers` ON PURPOSE, the same precedent as
+    // `asmConstraints` and the `implicitRegisters` roles: the `registerNatural`
+    // derivation reads its width off the class's own full registers, so a class
+    // that declares none must be visible as a load-time fact rather than as a
+    // lookup that fails much later at a site with no target in hand.
+    //
+    // OPTIONAL, AND UNDECLARED IS NOT A DEFAULT. A target that omits this
+    // refuses every bare operand reference BY NAME rather than substituting at
+    // a plausible width — see the field's docblock for why a default here would
+    // be a silent wrong width rather than a missing feature.
+    if (doc.contains("asmBareOperandWidths")) {
+        // Rendered FROM THE TABLES at each use, never re-typed — the same rule
+        // the `asmConstraints` block states, and for the same reason.
+        auto const renderRows = [](auto const& table) {
+            std::string out;
+            for (auto const& row : table.rows) {
+                if (!out.empty()) out += ", ";
+                out += '\'';
+                out += row.second;
+                out += '\'';
+            }
+            return out;
+        };
+        if (!doc.at("asmBareOperandWidths").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/asmBareOperandWidths",
+                      "'asmBareOperandWidths' must be an array of "
+                      "per-register-class derivation rows");
+        } else {
+            auto const& rows = doc.at("asmBareOperandWidths");
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                auto const& r = rows[i];
+                auto const path =
+                    std::format("/asmBareOperandWidths/{}", i);
+                if (!r.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "asmBareOperandWidths entry must be an object");
+                    continue;
+                }
+                static constexpr std::array<std::string_view, 2>
+                    kBareWidthKeys{"class", "derivation"};
+                DSS_CHECK_KEY_VOCABULARY(kBareWidthKeys);
+                rejectUnknownKeys(r, kBareWidthKeys, path,
+                                  "an asmBareOperandWidths row", coll);
+
+                if (!r.contains("class") || !r.at("class").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/class", path),
+                              "missing or non-string 'class' — a bare-operand "
+                              "width row must name the register class whose "
+                              "references it describes");
+                    continue;
+                }
+                auto const clsName = r.at("class").get<std::string>();
+                auto const cls = targetRegClassFromName(clsName);
+                // ★ THE SAME `isOperableTargetRegClass` GATE `registerClassOps`
+                // USES, and for the same reason: `none` resolves as a NAME but
+                // is not a legitimate SUBJECT — the no-class sentinel has no
+                // registers, so no reference can name a view of one.
+                if (!cls.has_value() || !isOperableTargetRegClass(*cls)) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/class", path),
+                              std::format("unknown register class '{}' "
+                                          "(expected one of: {})",
+                                          clsName,
+                                          renderRows(kTargetRegClassTable)));
+                    continue;
+                }
+                if (!r.contains("derivation")
+                    || !r.at("derivation").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/derivation", path),
+                              std::format("missing or non-string 'derivation' "
+                                          "— a row must say WHICH view a bare "
+                                          "operand reference names (one of: "
+                                          "{})",
+                                          renderRows(
+                                              kAsmBareOperandWidthTable)));
+                    continue;
+                }
+                auto const derivName = r.at("derivation").get<std::string>();
+                auto const deriv = asmBareOperandWidthFromName(derivName);
+                if (!deriv.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/derivation", path),
+                              std::format("unknown derivation '{}' (expected "
+                                          "one of: {})",
+                                          derivName,
+                                          renderRows(
+                                              kAsmBareOperandWidthTable)));
+                    continue;
+                }
+                auto const idx = static_cast<std::size_t>(*cls);
+                // ⚠ A DUPLICATE ROW IS REFUSED RATHER THAN LAST-WINS. Two rows
+                // for one class is a document whose author believed two
+                // different things about the same reference, and silently
+                // keeping either one ships one of those beliefs unexamined.
+                if (data.asmBareOperandWidths[idx].has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/class", path),
+                              std::format("register class '{}' already has a "
+                                          "bare-operand width derivation — one "
+                                          "row per class",
+                                          clsName));
+                    continue;
+                }
+                data.asmBareOperandWidths[idx] = *deriv;
+            }
+        }
+    }
+
     // ── registerClassOps (FC2 Part B — optional) ───────────────────
     // Per-register-class move/load/store mnemonic table. A class with
     // no row resolves to the universal defaults iff it is GPR (see
@@ -4183,11 +4324,33 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // `outputs: ["rdx"]` is internally inconsistent + would
         // silently allow divisor vregs into RDX → zeroed by xor →
         // divide-by-zero trap. Fail loud at load time.
-        std::set<std::uint16_t> const clobberedSet(
-            ir.clobberedOrdinals.begin(),
-            ir.clobberedOrdinals.end());
-        for (std::size_t k = 0; k < ir.outputOrdinals.size(); ++k) {
-            if (clobberedSet.find(ir.outputOrdinals[k]) == clobberedSet.end()) {
+        //
+        // ★★★ ASKED WITH THE TYPE'S OWN PREDICATE (P42, 2026-08-27). This site
+        // used to hand-roll the comparison over a local `std::set`, which made
+        // it the SECOND implementation of a rule three other callers were
+        // already asking `ImplicitRegisterConstraint` for — the per-instruction
+        // builder, the `.dsslir` reader and the inline-asm lowering. Two
+        // implementations of one invariant do not stay equal; the friendlier
+        // one wins by accident, and the strict one's abort then contradicts a
+        // document this loader accepted.
+        //
+        // ★ WHY THE PER-INDEX PREDICATE AND NOT `firstOutputNotClobbered`. This
+        // caller must emit ONE diagnostic per offending output, each with that
+        // output's own JSON pointer, so a single re-run surfaces every mistake
+        // in the document. A first-failure query structurally cannot do that.
+        // One rule, two shapes — see the predicate's docblock.
+        //
+        // ⚠ A LENGTH MISMATCH BAILS RATHER THAN REPORTING. `resolveArr` SKIPS
+        // an unresolvable name (having already reported it), so `outputOrdinals`
+        // can be SHORTER than `outputNames` — and the message below subscripts
+        // the NAMES with an index taken from the ORDINALS. Reporting through a
+        // mismatch cannot make the test pass wrongly, but it CAN name the wrong
+        // register, which is the half-applied shape this repo keeps
+        // rediscovering. Nothing is silently dropped: every skipped name was
+        // already diagnosed by `resolveArr`, and the document cannot load.
+        if (ir.outputOrdinals.size() == ir.outputNames.size()) {
+            for (std::size_t k = 0; k < ir.outputOrdinals.size(); ++k) {
+                if (ir.outputIsClobbered(k)) continue;
                 coll.emit(DiagnosticCode::C_MalformedJson,
                           std::format(
                               "/opcodes/{}/implicitRegisters/outputs/{}",

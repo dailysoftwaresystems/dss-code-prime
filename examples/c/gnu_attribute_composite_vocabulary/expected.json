@@ -1,0 +1,34 @@
+{
+  "$comment": "P42 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY, composite half): three GNU attributes this language's OWN `attributeSemantics.effects` table declares KNOWN — `may_alias`, `unused`, `transparent_union` — were REFUSED on a type definition with `error[S0031]`, because `scanCompositePacked` decided 'unknown' from its own three consumed-here arms instead of from the shared clause reader's already-resolved effects row. ONE chokepoint knew the answer; a SECOND site restated a drifted roster. ✔MEASURED before the fix with the shipped CLI, all three exit 1; ✔MEASURED against gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`), each probed SEPARATELY with `-Wall -Wextra`, all three compile with ZERO diagnostics and exit 0 on BOTH — DSS was refusing programs every real toolchain builds, which is why this example could not exist before. ★ EVERY CHECK IS A `sizeof`, NEVER 'it compiled': the failure mode of a composite attribute scan is a struct of the WRONG SIZE, which emits nothing, so only an observed layout can catch it. MA -> exit 1, UU -> 2, TU -> 3, PK -> 4, the read-back -> 5, the loop -> 6; all correct -> 42. ★★ `PK` IS THE CONTROL AND IT IS WHAT MAKES THE OTHER THREE WORTH ANYTHING: `packed` is consumed by an arm ABOVE the one this cycle changed, so widening which names count as KNOWN must not cost it its layout effect — had the widening swallowed it, `sizeof(struct PK)` would be 8 rather than 5 and this example would exit 4. RED-ON-DISABLE: restore the composite arm's condition to `strict && !stdForm && emitDiagnostics` alone (drop the `clause->row == nullptr` precondition) and the example does not COMPILE at all — three `error[S0031]`, no artifact — which is a stronger red than a wrong number. The `release` arm is MANDATORY rather than decoration: the sizes are folded at compile time, so the optimized arm's job is witnessing that the SHIPPED pipeline preserves the composite layouts instead of re-deriving them.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

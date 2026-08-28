@@ -11,13 +11,16 @@
 // tier both readers already depend on.
 #include "core/types/project_config.hpp"
 #include "core/types/target_schema.hpp"
-// ⚠ STILL REACHED ACROSS A LAYER: `TargetSpec::parse` is the driver's
-// `<targetName>:<formatName>` splitter and cannot follow `project_config` down,
-// because `TargetSpec::outputExtension` binds the type to
-// `link/object_format_schema.hpp` and `core` must not depend on `link`.
-// Anchored `D-LSP-TARGET-SPEC-SPLITTER-LIVES-ABOVE-ITS-CONSUMERS`; see the note
-// in `src/lsp/CMakeLists.txt`.
-#include "program/target_spec.hpp"
+// ✅ AND THE SPLITTER FOLLOWED IT DOWN
+// (D-LSP-TARGET-SPEC-SPLITTER-LIVES-ABOVE-ITS-CONSUMERS, closed 2026-08-27).
+// This used to read `#include "program/target_spec.hpp"` — the LAST cross-tier
+// include in this file. `TargetSpec` could not move while it carried
+// `outputExtension(ObjectFormatSchema const&)`, which bound the type to `link/`
+// and would have inverted `core -> link`. That member turned out never to touch
+// `*this`, so it is now the free function `outputExtensionFor` in the driver
+// tier and the splitter is plain `core`. ONE splitter, reached downward — the
+// editor and the compiler cannot disagree about what a target spec MEANS.
+#include "core/types/target_spec.hpp"
 
 #include <algorithm>
 #include <cctype>

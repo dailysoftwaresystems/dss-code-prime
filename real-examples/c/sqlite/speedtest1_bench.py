@@ -395,7 +395,27 @@ def preflight_dss(binary: str, config_root: str,
         src = os.path.join(td, "probe.c")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("int main(void){return 0;}\n")
-        argv = [binary, "--compile", src, "--output", td]
+        # ⚠ `--language` IS REQUIRED HERE, AND ITS ABSENCE IS THE SAME BUG THIS
+        # DOCSTRING ALREADY RECORDS ABOUT `--target`, ONE DIMENSION OVER.
+        # ✔MEASURED 2026-08-27: `dsscp --compile probe.c --target
+        # x86_64:pe64-x86_64-windows-exec` (no --language) is REFUSED with
+        #   error[D_UnknownFileExtension]: no source language for 'probe.c':
+        #   no --language was given, so target 'x86_64' selected its declared
+        #   defaultAssemblyLanguage 'asm-x86_64-att' — which claims .s
+        # That is documented, intended CLI behaviour, not a regression (the
+        # message is byte-identical at HEAD): omitting `--language` selects the
+        # TARGET'S ASSEMBLY DIALECT, which is how one invocation compiles a `.s`
+        # for two CPUs. So the preflight refused before measuring anything.
+        #
+        # ★ THE ROOT CAUSE IS THAT THIS CONTROL DOES NOT MATCH ITS MEASUREMENT.
+        # `build_dss` compiles via `--project <manifest>`, where the manifest
+        # declares the language; this probe compiles via `--compile` on a bare
+        # `.c`, where nothing does. A CONTROL MUST MATCH THE THING IT VOUCHES
+        # FOR — the docstring above learned that about `--target` on 2026-08-26
+        # and the same sentence applies to the invocation FORM.
+        # ⓘ Hardcoding `c` is not a language-dispatch decision: this function
+        # writes the probe itself, three lines above, and it is C by construction.
+        argv = [binary, "--compile", src, "--language", "c", "--output", td]
         if target:
             argv += ["--target", target]
         # ⚠ rc is NOT the verdict — dsscp returns 0 on fatal errors, so

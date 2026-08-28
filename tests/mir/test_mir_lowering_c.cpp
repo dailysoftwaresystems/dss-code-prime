@@ -36,6 +36,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
@@ -44,6 +45,50 @@
 using namespace dss;
 
 namespace {
+
+// ★★ THE SHIPPED TARGET DOCUMENT, OR A LOUD STOP — never a silent default.
+// D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD
+//
+// Every site in this file that wanted a machine model wrote
+// `if (auto t = TargetSchema::loadShipped(...); t.has_value())` and simply did
+// LESS when the document would not load: no `aggregateLayout`, no calling
+// convention, a null `target` threaded into `analyze`. The fixture then ran to
+// completion against a machine that does not exist — and what a reader saw was
+// not "the target did not load" but an internal MIR abort naming a block id.
+// The two neighbouring loads in `lowerC` (`GrammarSchema::loadShipped("c")` and
+// `ObjectFormatSchema::loadShipped`) always stopped loud; only this one did not.
+// ⇒ ONE owner for "give me the target or stop", used by every site, so the
+// answer cannot differ between two questions asked in the same fixture.
+// ⚠ IT **THROWS**, AND THAT IS THE WHOLE POINT — `std::abort()` WOULD REPRODUCE
+// THE DEFECT THIS HELPER EXISTS TO FIX. An abort kills the test PROCESS: every
+// sibling in this binary loses its verdict, `ctest` names the executable and
+// `gtest` names nothing — the identical unattributable signature the swallowed
+// load produced. GoogleTest reports a THROW as a failure of that ONE test, with
+// the message intact. (`no_abort_in_tests_guard` enforces exactly this
+// distinction, and it is a MEASURED recurrence, not a style rule.)
+// ★ AND THE MESSAGE CARRIES THE LOADER'S OWN DIAGNOSTICS, not a restatement:
+// `loadShipped` returns `std::expected<…, std::vector<ConfigDiagnostic>>`, so the
+// reason the document was refused is already in hand. Re-deriving it by hand is
+// the hour this whole anchor is about.
+[[nodiscard]] std::shared_ptr<TargetSchema const>
+requireShippedTarget(std::string const& name) {
+    auto t = TargetSchema::loadShipped(name);
+    if (!t.has_value()) {
+        std::string why;
+        for (auto const& d : t.error()) {
+            why += "\n    " + d.path + ": " + d.message;
+        }
+        if (why.empty()) why = " <the loader reported no diagnostic>";
+        throw std::runtime_error(
+            "TargetSchema::loadShipped(\"" + name + "\") failed — the fixture "
+            "cannot proceed without a machine model, and continuing walks into "
+            "MIR building and aborts on a block it never terminated, naming a "
+            "block id instead of the config "
+            "(D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD)."
+            " The loader said:" + why);
+    }
+    return *t;
+}
 
 // Drive: c source → CompilationUnit → SemanticModel → HIR → MIR.
 // Each layer's diagnostics are surfaced to the test; ML2's are separated
@@ -103,8 +148,47 @@ struct Lowered {
     // `analyze` takes it NON-OWNING and the model republishes it.
     std::optional<VaListStrategy>       vaStrategy;
     std::shared_ptr<TargetSchema const> targetSchema;
-    if (auto t = TargetSchema::loadShipped(targetName); t.has_value()) {
-        targetSchema = *t;
+    // ★★ A FAILED TARGET LOAD IS A HARNESS FAILURE, NOT A CONFIGURATION THIS
+    //    FIXTURE MAY PROCEED UNDER.
+    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD
+    //
+    // Both neighbours here — `GrammarSchema::loadShipped("c")` above and
+    // `ObjectFormatSchema::loadShipped(formatName)` below — `ADD_FAILURE()` and
+    // `std::abort()` when their document will not load. This one, alone, took the
+    // `has_value()` branch and SILENTLY CONTINUED with a null target and a
+    // default-constructed `aggregateLayout`, so a fixture ran against a machine
+    // model that does not exist.
+    //
+    // ✔MEASURED 2026-08-27 (cycle P42, lane AI) — it is not hypothetical, and the
+    // failure it produces names nothing that would lead a reader here. With ONE
+    // unrecognized key injected into a private copy of `x86_64.target.json`,
+    // `MirLoweringC.LabelAddressInStaticArrayBecomesRelocatableStaticData` died
+    // with
+    //     dss::MirBuilder fatal: function MirFuncId=1: block MirBlockId=2 was
+    //     created but never filled + terminated
+    // and NO other output: `ctest` names the binary, `gtest` names nothing (the
+    // process dies mid-case), and the message names a block id. The SAME source
+    // through the real CLI, against the SAME broken document, refuses correctly
+    // and precisely — `error[C_MalformedJson] … unknown key … in the target
+    // document`, `error[D_SchemaLoadFailed]`, `info[D_LaterPhasesNotRun]` — and
+    // never reaches lowering at all. ⇒ the production pipeline was right and only
+    // the fixture proceeded into a tier the target had not been supplied to.
+    // ★ THE COST IS MEASURED, NOT ASSERTED: this exact abort was reported as a
+    // suspected `src/mir` regression, and the two build roots that reproduced it
+    // were doing so only because they predated a sibling lane's `*.target.json`
+    // edit — old loader, new document. Isolated by holding the binary fixed and
+    // swapping ONLY the config tree (HEAD's `src/dss-config` vs the live one),
+    // then bisecting the config: `targets/` flipped the verdict, `shippedLibs/`
+    // did not. A loud load failure here would have said that in one line.
+    //
+    // ⚠ LOADED EXACTLY ONCE. `loadShipped(targetName)` used to be called a SECOND
+    // time further down for `mirCfg.aggregateLayout`, so one fixture asked the same
+    // question twice and could have been answered differently on either side of a
+    // config edit — the shape this file's own `charIsUnsigned` note warns about
+    // from the other direction.
+    auto const loadedTarget = requireShippedTarget(targetName);
+    {
+        targetSchema = loadedTarget;
         if (auto const* cc = targetSchema->callingConventionByName(ccName);
             cc != nullptr && cc->vaListLayout.has_value()) {
             vaStrategy = cc->vaListLayout->strategy;
@@ -125,14 +209,30 @@ struct Lowered {
     // in `c.lang.json`.
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: thread the language's declared
+    // OPERAND sizes for `void` / a function type exactly as compile_pipeline.cpp
+    // does, so `sizeof(void)`, `_Alignof(void)` and `void *` element stride lower
+    // here the way they lower in a real build.
+    //   ★ READ FROM THE SHIPPED SCHEMA, NEVER HARD-CODED — and that is the whole
+    // difference between a pin and a decoration. A fixture that wrote `{1, 1}`
+    // here would stay GREEN if `c.lang.json` lost the key: an ADD-direction mutant
+    // that cannot fail (feedback-a-fixture-must-synthesize-the-negative, which
+    // cost this project 11 red tests to learn). Reading the real declaration means
+    // DELETING the key turns these pins RED, which is the direction that proves
+    // something.
+    mirCfg.nonObjectTypeSizes = (*loaded)->semantics().nonObjectTypeSizes;
     // FC7 (D-FC7-MEMBER-ACCESS): thread the target's aggregate-layout params
     // (struct/union field offsets + sizes) into the MIR config exactly as
     // compile_pipeline.cpp does, so member-access + aggregate-local lowering
     // resolves field byte offsets. dataModel stays the Lp64 default (an
     // int-based struct's field offsets are dataModel-independent here).
-    if (auto t = TargetSchema::loadShipped(targetName); t.has_value()) {
-        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
-        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: reuse the ONE
+    // load taken above (which already failed loud if the document will not load)
+    // instead of asking the same question a second time.
+    {
+        auto const& t = loadedTarget;
+        mirCfg.aggregateLayout       = t->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = t->aggregateLayoutLoaded();
         // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75
         // (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM): thread the RESOLVED bare-`char`
         // signedness exactly as compile_pipeline.cpp does, so the char→int
@@ -158,13 +258,13 @@ struct Lowered {
             }
             formatKind = (*f)->kind();
         }
-        mirCfg.charIsUnsigned        = (*t)->charIsUnsigned(formatKind);
+        mirCfg.charIsUnsigned        = t->charIsUnsigned(formatKind);
         // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the active CC's by-value
         // params so a struct passed/returned BY VALUE classifies. Mirrors
         // compile_pipeline.cpp. `targetName`/`ccName` default to x86_64/sysv_amd64
         // (the C1/C1c pins); the AAPCS64 x8-sret pins pass "arm64"/"aapcs64" so
         // `aggregateSretViaHiddenArg` resolves false (indirectResultRegister = x8).
-        if (auto const* cc = (*t)->callingConventionByName(ccName)) {
+        if (auto const* cc = t->callingConventionByName(ccName)) {
             mirCfg.aggregateClassification   = cc->aggregateClassification;
             mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
             mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
@@ -535,6 +635,283 @@ TEST(MirLoweringC, ComplexElementConvertEmitsTwoComponentConverts) {
     }
 }
 
+// ── C99 _Complex — THE ONE COMPONENTWISE COMPARISON (D-CSUBSET-COMPLEX) ────────
+//
+// C 6.5.9p2 admits `==`/`!=` on any ARITHMETIC pair and a complex is arithmetic
+// (6.2.5p11+p18); C 6.3.1.2 defines a scalar's `bool` conversion as "compares equal
+// to 0", which for a complex is that same comparison against (0, 0). So truthiness,
+// logical `!`, `(_Bool)z` and `==`/`!=` are ONE rule with ONE emitter
+// (`complexEqFromParts`), and these pins assert that ALL FOUR spellings reach it.
+//
+// ★★ TWO OF THE FOUR WERE SILENT MISCOMPILES BEFORE IT EXISTED, and the pins below
+// are written to go red on exactly those bugs rather than on "the count changed":
+//   • `!z` fell into the SCALAR `Not` arm, whose `isFloat` roster excludes Complex,
+//     so it emitted `ICmpEq(<the complex's ADDRESS>, 0)` — constant FALSE, because
+//     an object's address is never null. ✔MEASURED through the shipped CLI
+//     (x86_64:pe64-x86_64-windows-exec): `!(0.0 + 0.0i)` returned 0 where gcc 13.3.0
+//     (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed separately, both return 1.
+//   • `(_Bool)z` took the C 6.3.1.7 "complex → real discards the imaginary part"
+//     arm, which is the wrong law for a `bool` target. ✔MEASURED:
+//     `(_Bool)(0.0 + 5.0i)` returned false where both references return true.
+// ⇒ each pin asserts the per-component compares EXIST (a single compare, or a
+// compare against a pointer, is the bug) — never merely that the program lowered.
+namespace {
+
+// The count of MIR instructions whose opcode is `op`, module-wide.
+[[nodiscard]] std::size_t opCount(Mir const& m, MirOpcode op) {
+    return collectOps(m, op).size();
+}
+
+// Is any ICmpEq/ICmpNe in the module comparing a POINTER-typed value? That is the
+// exact silent-miscompile shape the `!z` bug produced (`ICmpEq(address, 0)`), and it
+// is what the pins below forbid — a shape assertion that survives a re-spelling of
+// the correct lowering, where an opcode COUNT would not.
+[[nodiscard]] bool anyIntCompareOnAPointer(Mir const& m, TypeInterner const& in) {
+    for (MirOpcode const op : {MirOpcode::ICmpEq, MirOpcode::ICmpNe}) {
+        for (MirInstId const id : collectOps(m, op)) {
+            for (MirInstId const o : m.instOperands(id)) {
+                TypeId const t = m.instType(o);
+                if (t.valid() && in.kind(t) == TypeKind::Ptr) return true;
+            }
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+// `ga == gb` on two `double _Complex` must compare BOTH components: EXACTLY two
+// ORDERED float equalities (FCmpOeq — the same opcode the scalar float `==` path
+// uses, so the NaN answer cannot drift between the scalar and complex spellings),
+// combined with an `And`. A lowering that compared only the real part would emit
+// ONE FCmpOeq and no And.
+// RED-ON-DISABLE: dropping either component compare, or swapping And→Or, breaks a
+// count; routing the operands as a scalar breaks `anyIntCompareOnAPointer`.
+TEST(MirLoweringC, ComplexEqualityComparesBothComponentsOrdered) {
+    auto L = lowerC(
+        "double _Complex ga;\n"
+        "double _Complex gb;\n"
+        "int main(void) { return ga == gb; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(opCount(m, MirOpcode::FCmpOeq), 2u)
+        << "complex == compares the REAL and the IMAGINARY component — a single "
+           "compare means the imaginary part was dropped";
+    EXPECT_EQ(opCount(m, MirOpcode::FCmpUne), 0u)
+        << "== is the ORDERED equality on both components";
+    EXPECT_EQ(opCount(m, MirOpcode::And), 1u)
+        << "the two component results are ANDed (both must hold)";
+    EXPECT_EQ(opCount(m, MirOpcode::Or), 0u);
+    EXPECT_FALSE(anyIntCompareOnAPointer(m, L.model.lattice().interner()))
+        << "a complex operand must never be compared as a POINTER";
+}
+
+// `ga != gb` is the exact negation: two UNORDERED float inequalities (FCmpUne — the
+// scalar float `!=` opcode) combined with an `Or`.
+TEST(MirLoweringC, ComplexInequalityComparesBothComponentsUnordered) {
+    auto L = lowerC(
+        "double _Complex ga;\n"
+        "double _Complex gb;\n"
+        "int main(void) { return ga != gb; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(opCount(m, MirOpcode::FCmpUne), 2u)
+        << "complex != compares BOTH components, unordered (so a NaN component "
+           "makes != true, exactly as the scalar float path does)";
+    EXPECT_EQ(opCount(m, MirOpcode::FCmpOeq), 0u);
+    EXPECT_EQ(opCount(m, MirOpcode::Or), 1u)
+        << "the two component results are ORed (either differing is enough)";
+    EXPECT_EQ(opCount(m, MirOpcode::And), 0u);
+    EXPECT_FALSE(anyIntCompareOnAPointer(m, L.model.lattice().interner()));
+}
+
+// `if (z)` — the truthiness path. `coerceCondition` builds `Ne(z, complexZero)`, so
+// this must reach the SAME emitter as `!=`: two FCmpUne against the two components
+// of a zero complex, ORed. Before this landed the raw complex reached `addCondBr`
+// and the MIR verifier fired `I_TerminatorTypeMismatch` on legal C (✔MEASURED — five
+// of them on one probe covering `if`, `&&`, `||`, `? :`, `while`, `for`).
+TEST(MirLoweringC, ComplexConditionTestsBothComponentsAgainstZero) {
+    auto L = lowerC(
+        "double _Complex gz;\n"
+        "int main(void) { if (gz) return 1; return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual)
+        << " — a complex condition must be converted to Bool BEFORE the CondBr; "
+           "reaching the terminator raw is I_TerminatorTypeMismatch";
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(opCount(m, MirOpcode::FCmpUne), 2u)
+        << "`if (z)` is `z != 0`, componentwise — one compare would ignore the "
+           "imaginary part, making `if (0.0 + 7.0i)` FALSE";
+    EXPECT_EQ(opCount(m, MirOpcode::Or), 1u);
+    EXPECT_FALSE(anyIntCompareOnAPointer(m, L.model.lattice().interner()));
+}
+
+// `!z` — C 6.5.3.3p5 makes it `(z == 0)`, so it is the ORDERED pair ANDed. THE
+// SILENT-MISCOMPILE PIN: the bug emitted ONE `ICmpEq` whose operand was the
+// complex's ADDRESS, which this asserts against directly as well as by count.
+TEST(MirLoweringC, ComplexLogicalNotTestsBothComponentsAgainstZero) {
+    auto L = lowerC(
+        "double _Complex gz;\n"
+        "int main(void) { return !gz; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(opCount(m, MirOpcode::FCmpOeq), 2u)
+        << "`!z` is `z == 0` on BOTH components";
+    EXPECT_EQ(opCount(m, MirOpcode::And), 1u);
+    EXPECT_FALSE(anyIntCompareOnAPointer(m, L.model.lattice().interner()))
+        << "THE REGRESSION THIS PIN EXISTS FOR: `!z` used to emit "
+           "ICmpEq(<the complex's ADDRESS>, 0), which is constant FALSE";
+}
+
+// `(_Bool)z` — the EXPLICIT cast. C 6.3.1.2 (not 6.3.1.7) governs a `bool` target,
+// so the whole value is tested. THE SECOND SILENT-MISCOMPILE PIN: the bug loaded
+// component 0 alone and converted it, which is ONE component Load and NO float
+// compare at all — so asserting the two compares exist is what goes red.
+TEST(MirLoweringC, ComplexCastToBoolTestsBothComponentsNotJustTheRealPart) {
+    auto L = lowerC(
+        "double _Complex gz;\n"
+        "int main(void) { return (_Bool)gz ? 4 : 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(opCount(m, MirOpcode::FCmpUne), 2u)
+        << "THE REGRESSION THIS PIN EXISTS FOR: `(_Bool)z` used to discard the "
+           "imaginary part (C 6.3.1.7's real-target rule), so `(_Bool)(0.0+5.0i)` "
+           "was FALSE where gcc and clang both give TRUE";
+    EXPECT_EQ(opCount(m, MirOpcode::Or), 1u);
+    // The imaginary-discarding arm is still CORRECT for every other real target and
+    // must not have been collateral damage: `(int)z` keeps exactly one component
+    // load and emits no float comparison at all.
+    auto R = lowerC(
+        "double _Complex gz;\n"
+        "int main(void) { return (int)gz; }\n");
+    ASSERT_TRUE(R.mir.ok)
+        << (R.mirReporter.all().empty() ? "" : R.mirReporter.all()[0].actual);
+    EXPECT_EQ(opCount(R.mir.mir, MirOpcode::FCmpUne), 0u)
+        << "(int)z still DISCARDS the imaginary part (C 6.3.1.7) — the bool arm "
+           "must not have widened to every real target";
+    EXPECT_EQ(opCount(R.mir.mir, MirOpcode::FCmpOeq), 0u);
+}
+
+// C 6.5.8p2: the RELATIONAL operators require REAL operands, so `a < b` on complex
+// is a constraint violation and must stay LOUD. gcc 13.3.0 and clang 18.1.3 both
+// refuse it ("invalid operands to binary <"), so a UNANIMOUS refusal is the
+// references obeying the standard — the one case where DSS must refuse too.
+// The pin also asserts the DIAGNOSTIC NAMES THE REAL CAUSE: it used to be refused by
+// the generic "must be materialized BY ADDRESS" misroute message, which pointed the
+// user at an internal routing decision instead of at the language rule.
+TEST(MirLoweringC, ComplexRelationalIsRefusedNamingTheRealOperandRule) {
+    auto L = lowerC(
+        "double _Complex ga;\n"
+        "double _Complex gb;\n"
+        "int main(void) { return ga < gb; }\n");
+    ASSERT_FALSE(L.mir.ok) << "a complex `<` must NOT lower";
+    bool named = false;
+    for (auto const& d : L.mirReporter.all()) {
+        if (d.actual.find("requires REAL operands") != std::string::npos
+            && d.actual.find("6.5.8p2") != std::string::npos)
+            named = true;
+    }
+    EXPECT_TRUE(named)
+        << "the refusal must name C 6.5.8p2 (a complex has no ordering), not the "
+           "internal by-address routing";
+}
+
+// I1 — a STATIC-STORAGE complex initializer is a COPY, not a Store.
+// `_Complex double g = 1.0;` at file scope (and, identically, a `static` LOCAL,
+// which is lowered as a global) reaches `emitGlobals_`'s runtime-init path. A
+// memory-resident type has NO bare SSA value: `lowerExpr` hands back the ADDRESS of
+// the materialized slot, so the old scalar `Store(val, addr)` stored a POINTER into
+// the object and the MIR verifier fired `I_StoreValueTypeMismatch` on legal C
+// (✔MEASURED: `'store' of value typed Ptr<Complex> into an address whose pointee is
+// Complex`), while the same initializer as an ordinary LOCAL compiled and ran —
+// because the LOCAL path already routed by-value-class types through
+// `lowerAggregateCopy`. This site restated only the scalar half of that rule.
+// ⓘ SCOPE, STATED HONESTLY: this pin proves the MIR is well-formed. The program
+// still does not LINK, because the `__module_init__` mechanism itself is unimplemented
+// in the asm producer (`D-LK4-RODATA-PRODUCER-RUNTIME-INIT`).
+//
+// ★★ THE FIXTURE MOVED, AND THE PIN GOT STRICTER FOR IT. It read
+// `double _Complex g = 1.0;` — and this comment predicted its own obsolescence:
+// *"the right end state is that a constant complex initializer never reaches a
+// runtime init at all but folds to a static image."* That landed
+// (D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE), so `= 1.0`
+// is now a CONSTANT and takes no runtime-init path at all — the old fixture went red
+// on its `sawInitFunc` assertion, correctly, by measuring a shape that no longer
+// exists.
+// ⚠ THE ANSWER IS A GENUINELY NON-FOLDABLE INITIALIZER, NOT A RELAXED ASSERTION.
+// `= z0` (another complex OBJECT) cannot fold at any tier — ✔MEASURED through the
+// shipped CLI, it still reaches `runtimeInit` — so every assertion below stands
+// unchanged and the pin can no longer be satisfied by the fold instead of by the
+// copy. The two are now independently mutable, which is what lets each one's
+// red-on-disable mean something: revert the copy arm and THIS reds; revert the
+// classifier and the static-image pins red.
+TEST(MirLoweringC, ComplexGlobalRuntimeInitCopiesTheObjectNotAPointer) {
+    auto L = lowerC(
+        "double _Complex z0;\n"
+        "double _Complex g = z0;\n"
+        "int main(void) { return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual)
+        << " — the load-time initialization of a by-value-class global must be an "
+           "aggregate COPY; a scalar Store of the materialized slot's ADDRESS is "
+           "I_StoreValueTypeMismatch";
+    Mir const& m = L.mir.mir;
+    // The exact bug shape: a Store whose VALUE is a pointer to a complex.
+    for (MirInstId const st : collectOps(m, MirOpcode::Store)) {
+        auto const ops = m.instOperands(st);
+        if (ops.size() != 2) continue;
+        TypeId const vt = m.instType(ops[0]);
+        if (!vt.valid() || L.model.lattice().interner().kind(vt) != TypeKind::Ptr) continue;
+        auto const pointee = L.model.lattice().interner().operands(vt);
+        ASSERT_TRUE(pointee.empty()
+                    || L.model.lattice().interner().kind(pointee[0]) != TypeKind::Complex)
+            << "the global's initialization stored a POINTER to the complex "
+               "instead of copying the object";
+    }
+    // A module-init function exists and carries the copy (the global is registered
+    // with an init func rather than a literal-pool index).
+    bool sawInitFunc = false;
+    for (std::size_t gi = 0; gi < m.moduleGlobalCount(); ++gi) {
+        if (m.globalInitFunc(m.globalAt(gi)).valid()) sawInitFunc = true;
+    }
+    EXPECT_TRUE(sawInitFunc)
+        << "a non-foldable complex initializer routes to __module_init__ today";
+}
+
 namespace {
 
 // FC17.9(d) atomic cycle-1 Phase D/E (D-CSUBSET-ATOMIC): lower a program that
@@ -578,10 +955,14 @@ namespace {
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
-        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
-        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
-        if (auto const* cc = (*t)->callingConventionByName("sysv_amd64")) {
+    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: a target that
+    // will not load is a STOP, never a fixture that quietly measures a default
+    // machine model.
+    {
+        auto const t = requireShippedTarget("x86_64");
+        mirCfg.aggregateLayout       = t->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = t->aggregateLayoutLoaded();
+        if (auto const* cc = t->callingConventionByName("sysv_amd64")) {
             mirCfg.aggregateClassification   = cc->aggregateClassification;
             mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
             mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
@@ -665,10 +1046,14 @@ namespace {
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
-        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
-        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
-        if (auto const* cc = (*t)->callingConventionByName("sysv_amd64")) {
+    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: a target that
+    // will not load is a STOP, never a fixture that quietly measures a default
+    // machine model.
+    {
+        auto const t = requireShippedTarget("x86_64");
+        mirCfg.aggregateLayout       = t->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = t->aggregateLayoutLoaded();
+        if (auto const* cc = t->callingConventionByName("sysv_amd64")) {
             mirCfg.aggregateClassification   = cc->aggregateClassification;
             mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
             mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
@@ -9381,9 +9766,13 @@ TEST(MirLoweringC, IterativeDeepIndexAddressChainLowersFlatAndByteIdentical) {
     // Thread the x86_64 aggregate layout so array stride/size resolve (mirrors
     // lowerC). A char[1]…[1] is 1 byte; stride at every level is 1.
     MirLoweringConfig mirCfg;
-    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
-        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
-        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: a target that
+    // will not load is a STOP, never a fixture that quietly measures a default
+    // machine model.
+    {
+        auto const t = requireShippedTarget("x86_64");
+        mirCfg.aggregateLayout       = t->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = t->aggregateLayoutLoaded();
     }
 
     DiagnosticReporter rep;
@@ -11150,34 +11539,164 @@ TEST(MirLoweringC, WideBitIntMulDivModLowersAtC3) {
     }
 }
 
-// D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV: a conversion between a FLOATING type and a wide
-// `_BitInt(N>64)` is not yet supported (the multi-limb FP<->limbs path is a later cycle);
-// EACH direction fails LOUD at the MIR cast site with the dedicated unsuppressable
-// S_BitIntWideFloatConvUnsupported (0xE050), never a silent scalar path. The naive path
-// keys signedness off the source + touches only limb 0 (wrong sign, wrong value, dropped
-// upper limbs). RED-ON-DISABLE: drop the guard in materializeWideCast (wide TARGET) or
-// combineCast's wide-SOURCE arm and a wide `(_BitInt(128))f` / `(double)wide` silently
-// miscompiles (mir.ok flips true with no diagnostic). NARROW (N<=64) float<->_BitInt is
-// unaffected — it rides the native container (asserted green just below).
-TEST(MirLoweringC, WideBitIntFloatConversionFailsLoud) {
-    struct Case { char const* src; char const* what; };
+// ── D-CSUBSET-INT128-FLOAT-CONV: THE CONVERSION LANDED; THIS PIN CHANGED SIDES ──
+// A wide integer (`_BitInt(N>64)`, `__int128`, `unsigned __int128`) <-> `double`
+// conversion used to fail loud in BOTH directions with S_BitIntWideFloatConvUnsupported
+// (0xE050), and the test that stood here asserted exactly that refusal. It now lowers,
+// so the pin asserts the LOWERING — and, load-bearingly, asserts the PRIMITIVES that
+// make it correct rather than merely that `mir.ok` flipped.
+//
+// ★ WHY THE OPCODE ASSERTIONS AND NOT JUST `mir.ok`. The refusal's own stated reason
+// was that "the naive scalar path touches only limb 0 (wrong sign, wrong value, dropped
+// upper limbs)" — i.e. a green `mir.ok` is precisely what a WRONG implementation also
+// produces. The three opcodes below are the ones a limb-0-only conversion would NOT
+// emit: `Clz` (the significance scan runs over the whole limb array), `FMul` (the exact
+// 2^shift re-scaling that puts the top 64 bits back where they belong) and, on the
+// other side, `FPToUI` once per limb. A naive implementation is a bare `UIToFP(limb0)`
+// with none of them.
+//
+// ⓘ The VALUES are pinned where a value can actually be observed — the runnable corpus
+// (`examples/c/c_int128_float_conv`), which compares against exact integer expectations
+// including the one-ulp double-rounding trap and is validated against clang 18/19. This
+// test pins the SHAPE; that one pins the ARITHMETIC. Neither substitutes for the other.
+//
+// RED-ON-DISABLE: replace `emitFloatFromWide`'s body with the naive `UIToFP(limb0)` and
+// the `Clz`/`FMul` expectations go red; delete the `FPToUI` loop in `emitWideFromFloat`
+// and its expectation goes red.
+TEST(MirLoweringC, WideBitIntFloatConversionLowersWithTheMultiLimbPrimitives) {
+    struct Case { char const* src; char const* what; MirOpcode must[3]; };
     Case const cases[] = {
         {"int main(void){ double f = 1.5; _BitInt(128) a = (_BitInt(128))f;\n"
-         "  return (int)a; }\n",                         "float -> wide _BitInt"},
+         "  return (int)a; }\n", "double -> wide _BitInt",
+         {MirOpcode::FPToUI, MirOpcode::FDiv, MirOpcode::FSub}},
         {"int main(void){ _BitInt(128) x = 3; double d = (double)x;\n"
-         "  return (int)d; }\n",                         "wide _BitInt -> float"},
+         "  return (int)d; }\n", "wide _BitInt -> double",
+         {MirOpcode::Clz, MirOpcode::UIToFP, MirOpcode::FMul}},
+        {"int main(void){ unsigned __int128 x = 3; double d = (double)x;\n"
+         "  return (int)d; }\n", "unsigned __int128 -> double",
+         {MirOpcode::Clz, MirOpcode::UIToFP, MirOpcode::FMul}},
+        {"int main(void){ double f = 1.5; __int128 a = (__int128)f;\n"
+         "  return (int)a; }\n", "double -> __int128",
+         {MirOpcode::FPToUI, MirOpcode::FDiv, MirOpcode::FSub}},
     };
     for (auto const& c : cases) {
         auto L = lowerC(c.src);
-        ASSERT_FALSE(L.model.hasErrors()) << c.what << ": " << c.src;  // it type-checks
+        ASSERT_FALSE(L.model.hasErrors()) << c.what << ": " << c.src;
         ASSERT_TRUE(L.hir->ok) << c.what << ": " << c.src;
-        EXPECT_FALSE(L.mir.ok) << c.what << ": " << c.src
-            << "\na float<->wide _BitInt conversion must fail loud at the MIR cast site";
+        EXPECT_TRUE(L.mir.ok) << c.what << ": " << c.src
+            << "\na wide-integer <-> double conversion must LOWER"
+            << "\n" << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
         std::size_t n = 0;
         for (auto const& d : L.mirReporter.all())
             if (d.code == DiagnosticCode::S_BitIntWideFloatConvUnsupported) ++n;
-        EXPECT_EQ(n, 1u) << c.what << ": " << c.src
+        EXPECT_EQ(n, 0u) << c.what << ": " << c.src
+            << "\nthe retired 0xE050 float boundary must NOT fire for a `double`";
+        auto const ops = allOpcodes(L.mir.mir);
+        for (MirOpcode want : c.must) {
+            EXPECT_GT(countOpcode(ops, want), 0u) << c.what << ": " << c.src
+                << "\nopcode " << static_cast<int>(want)
+                << " is missing — a conversion without it reads or writes limb 0 only,"
+                   " which is the silent miscompile the old refusal existed to prevent";
+        }
+    }
+}
+
+// D-CSUBSET-INT128-FLOAT-CONV: the refusal SURVIVES for every floating type that is not
+// `double`, and each survivor has its own reason — one message that covered all of them
+// would hide which. F32/F16 are reachable only as a rounding of the F64 result, so they
+// would round TWICE and can land outside the two values C 6.3.1.4p2 permits (and int->F32
+// has no encoded form at all one tier down, D-CSUBSET-INT-TO-F32-CODEGEN). F80/F128 carry
+// more precision than F64, so widening an F64 result into them would invent precision on
+// the way out and rounding into F64 would lose it on the way in (D-CSUBSET-LONG-DOUBLE).
+// ⚠ `long double` is NOT used here: it is F64 on this target, so a `long double` probe
+// would assert nothing. The `float` spelling is F32 on every shipped data model.
+// RED-ON-DISABLE: drop the `toK != TypeKind::F64` gate in combineCast's wide-source arm
+// and a `(float)wide` silently acquires a double-rounded value.
+TEST(MirLoweringC, WideBitIntToNonDoubleFloatStillFailsLoud) {
+    for (char const* src : {
+        "int main(void){ _BitInt(128) x = 3; float f = (float)x;\n"
+        "  return (int)f; }\n",
+        "int main(void){ unsigned __int128 x = 3; float f = (float)x;\n"
+        "  return (int)f; }\n"}) {
+        auto L = lowerC(src);
+        ASSERT_FALSE(L.model.hasErrors()) << src;
+        ASSERT_TRUE(L.hir->ok) << src;
+        EXPECT_FALSE(L.mir.ok) << src
+            << "\na wide-integer -> `float` conversion must still fail LOUD";
+        std::size_t n = 0;
+        for (auto const& d : L.mirReporter.all())
+            if (d.code == DiagnosticCode::S_BitIntWideFloatConvUnsupported) ++n;
+        EXPECT_EQ(n, 1u) << src
             << "\nexactly one S_BitIntWideFloatConvUnsupported (0xE050)";
+    }
+}
+
+namespace {
+// True when ANY instruction is a `Trunc` whose RESULT type is `_Bool`. That shape is
+// the whole of D-CSUBSET-EXPLICIT-BOOL-CAST-IS-A-TRUNCATION: it keeps
+// the low bit of the source instead of testing the value against 0. Walks with the
+// same `funcAt`/`blockAt`/`blockInstAt` accessors `allOpcodes` uses, plus `instType`.
+[[nodiscard]] bool anyBoolTypedTrunc(Mir const& m, TypeInterner const& in) {
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        std::uint32_t const nb = m.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            std::uint32_t const n = m.blockInstCount(b);
+            for (std::uint32_t ii = 0; ii < n; ++ii) {
+                MirInstId const id = m.blockInstAt(b, ii);
+                if (m.instOpcode(id) != MirOpcode::Trunc) continue;
+                TypeId const t = m.instType(id);
+                if (t.valid() && in.kind(t) == TypeKind::Bool) return true;
+            }
+        }
+    }
+    return false;
+}
+}  // namespace
+
+// ── D-CSUBSET-EXPLICIT-BOOL-CAST-IS-A-TRUNCATION ─────────────
+// C 6.3.1.2: converting ANY scalar to `_Bool` is `!= 0`, never a width truncation.
+// The DECLARATION family already routed through `coerceCondition`; the EXPLICIT cast
+// `(_Bool)x` did not, so it reached HIR->MIR's `mapCast`, which classifies `_Bool` as
+// an 8-bit integer and returned `Trunc` — an instruction that computes `(_Bool)256 == 0`
+// where C requires 1. ✔MEASURED at 301e2a63 through the shipped CLI: it walled with
+// `L_UnsupportedLoweringForOpcode Trunc result: TypeKind ordinal 0`, so LIR's missing
+// `_Bool`-width Trunc form was the only thing between this and a silent miscompile.
+//
+// ★ THE ASSERTION IS THE ABSENCE OF `Trunc`, not the presence of `ICmpNe`, because the
+// wide and complex sources realize the same `!= 0` through their own emitters
+// (`emitBoolFromWide` / `emitComplexEq`) and would make an ICmpNe expectation
+// source-kind-specific. What must hold for EVERY source is that no truncation to a
+// Bool-typed result is emitted.
+// RED-ON-DISABLE: remove the `_Bool`-target arm from cst_to_hir's `combineCast` and the
+// integer/float/pointer/enum rows re-acquire a Bool-typed `Trunc`.
+TEST(MirLoweringC, ExplicitBoolCastIsATruthTestNotATruncation) {
+    struct Case { char const* src; char const* what; };
+    Case const cases[] = {
+        {"int io(int x){ return x; }\n"
+         "int main(void){ _Bool b = (_Bool)io(256); return (int)b; }\n", "int"},
+        {"double io(double x){ return x; }\n"
+         "int main(void){ _Bool b = (_Bool)io(0.5); return (int)b; }\n", "double"},
+        {"int main(void){ static int s; int *p = &s; _Bool b = (_Bool)p;\n"
+         "  return (int)b; }\n", "pointer"},
+        {"enum E { EZ, ETwo = 2 };\n"
+         "int main(void){ enum E e = ETwo; _Bool b = (_Bool)e; return (int)b; }\n",
+         "enum"},
+        {"int main(void){ unsigned __int128 w = (unsigned __int128)3 << 64;\n"
+         "  _Bool b = (_Bool)w; return (int)b; }\n", "wide __int128"},
+    };
+    for (auto const& c : cases) {
+        auto L = lowerC(c.src);
+        ASSERT_FALSE(L.model.hasErrors()) << c.what << ": " << c.src;
+        ASSERT_TRUE(L.hir->ok) << c.what << ": " << c.src;
+        EXPECT_TRUE(L.mir.ok) << c.what << ": " << c.src
+            << "\n(_Bool)x must lower for every scalar source"
+            << "\n" << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_FALSE(anyBoolTypedTrunc(L.mir.mir, L.model.lattice().interner()))
+            << c.what << ": " << c.src
+            << "\na Bool-typed Trunc keeps only the LOW BIT — `(_Bool)256` would be"
+               " false where C 6.3.1.2 requires true";
     }
 }
 
@@ -13438,10 +13957,14 @@ constexpr char const* kSetjmpRoundTripSrc =
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
-        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
-        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
-        if (auto const* cc = (*t)->callingConventionByName("sysv_amd64")) {
+    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: a target that
+    // will not load is a STOP, never a fixture that quietly measures a default
+    // machine model.
+    {
+        auto const t = requireShippedTarget("x86_64");
+        mirCfg.aggregateLayout       = t->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = t->aggregateLayoutLoaded();
+        if (auto const* cc = t->callingConventionByName("sysv_amd64")) {
             mirCfg.aggregateClassification   = cc->aggregateClassification;
             mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
             mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
@@ -13995,9 +14518,15 @@ TEST(MirLoweringC, InlineAsmMarksEveryOutputParameterAddressable) {
 // the front end, so this test asserts the verifier still PASSES rather than that
 // it no longer complains.
 //
-// RED-ON-DISABLE (REMOVE direction): revert any one arm of `coerceCondition`
-// (Enum / FnSig / NullptrT) and `L.mir.ok` is false, or the verifier reds — the
-// exact diagnostics this closes.
+// RED-ON-DISABLE (REMOVE direction): revert either arm of `coerceCondition`
+// (Enum / FnSig) and `L.mir.ok` is false, or the verifier reds — the exact
+// diagnostics this closes.
+// ⓘ The family's third member, `nullptr_t`, no longer has an arm in
+// `coerceCondition`: it is projected to its object representation at the
+// semantic→HIR boundary and arrives here already Ptr-shaped
+// (D-CSUBSET-NULLPTR-T-DECLARABLE). The `if (nullptr)` / `nullptr ? …` lines
+// below exercise the LITERAL, which was always an integer zero by this point;
+// the OBJECT is pinned by `NullptrTObjectLowersToPointerShapedMir`.
 TEST(MirLoweringC, ScalarFamilyConditionsLowerToABoolCondBr) {
     auto L = lowerC(
         "enum Color { NONE = 0, EVEN = 4 };\n"
@@ -14060,6 +14589,102 @@ TEST(MirLoweringC, ScalarFamilyConditionsLowerToABoolCondBr) {
            "CondBr; a vacuous zero would make the Bool assertion assert nothing";
 }
 
+// ★★ D-CSUBSET-NULLPTR-T-DECLARABLE — a C23 `nullptr_t` OBJECT reaches MIR
+// wearing its POINTER representation, and nothing in the module wears the kind.
+//
+// ✔MEASURED at 301e2a63 on x86_64:pe64-x86_64-windows-exec: `typeof(nullptr) o =
+// nullptr;` produced `error[I_NullptrTypeInMir] mir inst #4` +
+// `error[I_StoreValueTypeMismatch] mir inst #3: store of value #2 typed 1 (I32)
+// into an address whose pointee is 8 (NullptrT)`. gcc 13.3.0 (`-std=c2x`) and
+// clang 18.1.3 (`-std=c23`), probed SEPARATELY, both compile and run it — so
+// under bar §A.3b DSS must too.
+//
+// ★ WHY THE PIN IS AT THIS TIER AS WELL AS THE HIR ONE, AND WHAT EACH OWES.
+// The HIR pin (`HirLoweringC.NullptrTObjectIsProjectedToItsPointerRepresentation`)
+// proves the projection HAPPENED. This one proves the RESULT is coherent one tier
+// down — that the alloca's pointee, the stored value and the loaded value agree,
+// which is precisely what `I_StoreValueTypeMismatch` was reporting they did not.
+// A green HIR pin alone would have stayed green over a projection that fixed the
+// declaration's type and left the initializing store's value type behind.
+//
+// RED-ON-DISABLE (REMOVE direction): make `TypeInterner::representationType`'s
+// `NullptrT` arm return `id` — `L.mir.ok` goes false and the verifier reds with
+// I_NullptrTypeInMir + I_StoreValueTypeMismatch, the two codes named above.
+TEST(MirLoweringC, NullptrTObjectLowersToPointerShapedMir) {
+    auto L = lowerC(
+        "int f(void) {\n"
+        "  typeof(nullptr) o = nullptr;\n"   // object + initializing store
+        "  typeof(nullptr) o2 = o;\n"        // load a nullptr_t slot, store another
+        "  void *p = o2;\n"                  // the one-way conversion
+        "  int r = (o == nullptr) ? 1 : 0;\n"
+        "  r += (p == nullptr) ? 2 : 0;\n"
+        "  r += o ? 0 : 4;\n"                // C23 6.3.2.4p2 truth value
+        "  return r + (int)sizeof(o);\n"     // the WIDTH: pointer-sized
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? std::string{} : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+
+    DiagnosticReporter vrep;
+    MirVerifier v{L.mir.mir, &L.model.lattice().interner()};
+    EXPECT_TRUE(v.verify(vrep))
+        << "a nullptr_t object must verify clean: "
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+    for (auto const& d : vrep.all()) {
+        EXPECT_NE(d.code, DiagnosticCode::I_NullptrTypeInMir) << d.actual;
+        EXPECT_NE(d.code, DiagnosticCode::I_StoreValueTypeMismatch) << d.actual;
+    }
+
+    // The property itself, read off the instructions rather than inferred from a
+    // clean verifier run. ⚠ The verifier is passed the interner ABOVE on purpose:
+    // without it `checkTypeInvariants` returns immediately and the NullptrT
+    // tripwire never runs, so a verifier constructed without one would report
+    // "clean" over exactly the state under test.
+    Mir const& m = L.mir.mir;
+    auto const& ti = L.model.lattice().interner();
+    std::size_t nullptrTypedInsts = 0;
+    std::size_t voidPtrStores     = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const fn = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+            MirBlockId const b = m.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                MirInstId const id = m.blockInstAt(b, ii);
+                TypeId const t = m.instType(id);
+                if (t.valid() && ti.kind(t) == TypeKind::NullptrT)
+                    ++nullptrTypedInsts;
+                // A `Store` whose STORED VALUE is a `void *` — the shape the
+                // projection produces for `o = nullptr` and for `o2 = o`. Store
+                // operand order is [value, ptr] (mir_opcode.hpp), so the value is
+                // operand 0 and reading operand 1 here would test the ADDRESS
+                // (always a pointer) and assert nothing.
+                if (m.instOpcode(id) != MirOpcode::Store) continue;
+                auto const ops = m.instOperands(id);
+                if (ops.size() < 2) continue;
+                TypeId const vt = m.instType(ops[0]);
+                if (!vt.valid() || ti.kind(vt) != TypeKind::Ptr) continue;
+                auto const pointee = ti.operands(vt);
+                if (!pointee.empty() && ti.kind(pointee[0]) == TypeKind::Void)
+                    ++voidPtrStores;
+            }
+        }
+    }
+    EXPECT_EQ(nullptrTypedInsts, 0u)
+        << "no MIR instruction may carry TypeKind::NullptrT -- the kind has no "
+           "MIR spelling at all (mir_text omits it as a stated contract)";
+    // `o = nullptr`, `o2 = o` and `p = o2` — three pointer-valued stores. Pinning
+    // the COUNT rather than ">= 1" is what makes a projection that fixed only the
+    // declaration's type, and left the stored VALUE behind, red.
+    EXPECT_EQ(voidPtrStores, 3u)
+        << "the initializing store, the same-type copy and the conversion to "
+           "`void *` must each store a pointer-typed value into a pointer slot";
+}
+
 // ★★ D-CSUBSET-LOGICAL-NOT-ON-A-FLOAT-MINTS-A-BARE-FLOAT-CONST
 //
 // `!E` is `(0 == E)` (C 6.5.3.3p5), so a FLOAT operand is exactly as legal there
@@ -14114,4 +14739,380 @@ TEST(MirLoweringC, LogicalNotOnAFloatComparesAgainstAPromotedZeroNotABareConst) 
     // shape), so both zeros are backed by module globals rather than immediates.
     EXPECT_GE(collectOps(m, MirOpcode::GlobalAddr).size(), 2u)
         << "each promoted zero is reached through a GlobalAddr";
+}
+
+// ══ D-CSUBSET-BITINT-PADDING-POLICY-HAS-THREE-OWNERS ═══════════════════════════
+// ★★ THE `_BitInt` PADDING POLICY IS READ FROM ONE OWNER AT *BOTH* WIDTHS.
+//
+// A `_BitInt(N)` container is wider than N, and C23 6.2.6.1p6 leaves the bits above
+// N-1 UNSPECIFIED — so DSS chose: they carry the value's ARITHMETIC EXTENSION under
+// its own signedness. That choice used to be STATED three times (the host
+// `BitIntValue::maskTopLimb`, this file's narrow `bitIntMask` AND its wide
+// `maskTopLimb`, and `asm.cpp`'s static-image extension byte), which is the one
+// duplication whose divergence is a SILENT MISCOMPILE rather than a refusal: the
+// image is read back by the code this file emits, so an emitter that zero-filled
+// while the runtime sign-extended would make `_BitInt(17) g = -3wb; g < 0` answer
+// FALSE on a container holding +131069. `bitIntPaddingTracksSignBit`
+// (core/types/bit_int_value.hpp) is now the sole owner and every tier asks it.
+//
+// ★ WHAT THIS PIN MEASURES, and why it needs all FOUR arms. The policy's observable
+// consequence is WHICH MASK SHAPE is emitted — the sign-tracking `Shl`+arithmetic
+// `AShr` pair (the padding is materialized FROM bit N-1) or the constant-zero `And`.
+// The narrow (N≤64) and wide (N>64) tiers reach that decision through DIFFERENT
+// code — `bitIntMask` directly, and `maskTopLimb` which now DELEGATES to it — so a
+// pin on one width cannot see a divergence at the other. That is exactly the state
+// this closed: two spellings of one rule, and nothing that could tell them apart.
+//
+// ★ THE SHIFT CONSTANT IS ASSERTED SHARED, and it is the second half of the same
+// deletion. `MirBuilder::addConst` does NOT dedupe, so the old narrow spelling built
+// the SAME shift amount TWICE and emitted a dead duplicate materialization
+// (✔MEASURED at 301e2a63, x86_64: `movl $0xf, %esi` twice in a row, surviving even
+// the release pipeline). The wide spelling already reused one constant; consolidating
+// onto ONE emitter took the better of the two, so `Shl` and `AShr` must now name the
+// SAME operand instruction.
+//
+// RED-ON-DISABLE (mutate the ONE OWNER, which is the whole point): make
+// `bitIntPadding` return `BitIntPadding::Zeros` unconditionally and BOTH signed arms
+// flip from Shl/AShr to And — narrow AND wide, from a single edit. Before this
+// consolidation that edit could not have reached either arm: neither file called the
+// policy, and neither even included its header. A second, narrower revert: give
+// `bitIntMask` back its two `constIntOfType(B - n, ty)` calls and the shared-operand
+// assertion reds alone.
+TEST(MirLoweringC, BitIntPaddingPolicyIsReadFromOneOwnerAtNarrowAndWideWidths) {
+    // ── (a) NARROW SIGNED — the padding tracks the sign bit ⇒ Shl + arithmetic AShr.
+    {
+        auto L = lowerC("_BitInt(17) f(_BitInt(17) a, _BitInt(17) b){ return a + b; }");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const shls  = collectOps(m, MirOpcode::Shl);
+        auto const ashrs = collectOps(m, MirOpcode::AShr);
+        ASSERT_EQ(shls.size(), 1u)  << "one wrap mask, one Shl";
+        ASSERT_EQ(ashrs.size(), 1u) << "one wrap mask, one arithmetic AShr";
+        EXPECT_EQ(collectOps(m, MirOpcode::And).size(), 0u)
+            << "a SIGNED `_BitInt` wrap must NOT take the zero-fill And arm";
+        // The SHARED shift amount: Shl.operand[1] IS AShr.operand[1], the same
+        // instruction, not merely an equal value.
+        auto const shOps = m.instOperands(shls[0]);
+        auto const arOps = m.instOperands(ashrs[0]);
+        ASSERT_EQ(shOps.size(), 2u);
+        ASSERT_EQ(arOps.size(), 2u);
+        EXPECT_EQ(shOps[1].v, arOps[1].v)
+            << "the wrap's shift amount is materialized ONCE and used by both "
+               "shifts -- two Consts is the dead duplicate this consolidation "
+               "deleted";
+        EXPECT_EQ(m.instOpcode(shOps[1]), MirOpcode::Const);
+    }
+    // ── (b) NARROW UNSIGNED — the padding is constant zero ⇒ And, and NO AShr.
+    {
+        auto L = lowerC("unsigned _BitInt(17) f(unsigned _BitInt(17) a,"
+                        "                       unsigned _BitInt(17) b){ return a + b; }");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(collectOps(m, MirOpcode::And).size(), 1u)
+            << "one wrap mask, one And";
+        EXPECT_EQ(collectOps(m, MirOpcode::AShr).size(), 0u)
+            << "an UNSIGNED `_BitInt` wrap must not sign-extend its padding";
+        EXPECT_EQ(collectOps(m, MirOpcode::Shl).size(), 0u);
+    }
+    // ── (c) WIDE SIGNED — the SAME decision, reached through `maskTopLimb`, which
+    //        delegates to the emitter arm (a) exercises. N=65 ⇒ hb == 1, so the top
+    //        limb keeps ONE bit and 63 are padding.
+    {
+        auto L = lowerC("_BitInt(65) p, q; void f(void){ p = p + q; }");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const shls  = collectOps(m, MirOpcode::Shl);
+        auto const ashrs = collectOps(m, MirOpcode::AShr);
+        ASSERT_EQ(ashrs.size(), 1u)
+            << "the wide top-limb mask is the sign-tracking form for a SIGNED "
+               "`_BitInt` -- exactly one, from `maskTopLimb`";
+        ASSERT_EQ(shls.size(), 1u);
+        auto const shOps = m.instOperands(shls[0]);
+        auto const arOps = m.instOperands(ashrs[0]);
+        ASSERT_EQ(shOps.size(), 2u);
+        ASSERT_EQ(arOps.size(), 2u);
+        EXPECT_EQ(shOps[1].v, arOps[1].v)
+            << "the wide mask always shared its shift constant; the delegation "
+               "must not have changed that";
+    }
+    // ── (d) WIDE UNSIGNED — the zero arm, at the wide width.
+    {
+        auto L = lowerC("unsigned _BitInt(65) p, q; void f(void){ p = p + q; }");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(collectOps(m, MirOpcode::AShr).size(), 0u)
+            << "an UNSIGNED wide `_BitInt` top-limb mask must not sign-extend";
+        EXPECT_EQ(collectOps(m, MirOpcode::Shl).size(), 0u);
+    }
+}
+
+// ── D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED ───────────────────────────────
+//
+// GNU C's "Arithmetic on void- and Function-Pointers": the size of a `void` or of
+// a function is 1, so `void *` arithmetic is BYTE arithmetic and `sizeof(void)` /
+// `_Alignof(void)` / `sizeof(f)` all fold to 1. gcc 13.3.0 (`-std=c2x`) and clang
+// 18.1.3 (`-std=c23`), probed SEPARATELY and RUN, accept every shape below; DSS
+// refused all of them at 301e2a63 with `H0009`. ISO C forbids them (6.5.3.4p1,
+// 6.5.6p2, 6.2.5p19), so it is the `(gcc ∪ clang ∪ MSVC) ∪ ISO C` union that
+// decides, and a unanimous ACCEPTANCE settles it.
+//
+// These pins read the sizes from the SHIPPED `c.lang.json` (see the `lowerC`
+// fixture note): delete `semantics.nonObjectTypeSizes` and every one of them goes
+// red, which is the REMOVE direction.
+
+// `p + 1` on a `void *` must produce a Gep at a ONE-byte offset — and with stride
+// 1 that means NO scaling `Mul` at all, exactly as `char *` indexing behaves. A
+// stride inherited from a neighbouring kind would emit a Mul and read the wrong
+// object; a synthesized 0 would make every element alias offset 0. Both would
+// still COMPILE, which is why this asserts the instruction shape and not merely
+// that lowering succeeded.
+TEST(MirLoweringC, VoidPointerAdditionStridesOneByteWithNoScalingMul) {
+    auto L = lowerC("void *f(void *p) { return p + 1; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "void* arithmetic must lower (GNU C, both references accept): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    bool foundGep = false;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        EXPECT_NE(m.instOpcode(id), MirOpcode::Mul)
+            << "a 1-byte element must emit NO scaling Mul — a Mul here means the "
+               "stride came from somewhere other than the declared void size";
+        if (m.instOpcode(id) != MirOpcode::Gep) continue;
+        auto ops = m.instOperands(id);
+        ASSERT_EQ(ops.size(), 2u);
+        EXPECT_NE(m.instOpcode(ops[1]), MirOpcode::Mul)
+            << "the Gep index is the raw (widened) 1, not a scaled product";
+        foundGep = true;
+    }
+    EXPECT_TRUE(foundGep) << "the addition must lower to a Gep";
+}
+
+// The DIFFERENCE of two `void *`s is an element COUNT, and with stride 1 the count
+// IS the byte difference — so the `p - q` arm must emit its Sub and then NO SDiv.
+// An SDiv by a wrong stride would silently divide a correct byte difference.
+TEST(MirLoweringC, VoidPointerDifferenceIsAByteCountWithNoDivide) {
+    auto L = lowerC("long f(void *a, void *b) { return a - b; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    bool foundSub = false;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        EXPECT_NE(m.instOpcode(id), MirOpcode::SDiv)
+            << "a 1-byte pointee makes the byte difference the element count — "
+               "an SDiv means a stride other than 1 reached the subtract";
+        if (m.instOpcode(id) == MirOpcode::Sub) foundSub = true;
+    }
+    EXPECT_TRUE(foundSub) << "the difference must lower to a Sub";
+}
+
+// The three OPERAND-size folds at the HIR→MIR tier, each a distinct case in the
+// lowering switch: `sizeof(void)`, `sizeof(*p)` through a `void *`, `_Alignof(void)`
+// and `sizeof(<function designator>)`. All four are 1 on both references.
+// ⓘ `_Alignof(<function>)` is deliberately ABSENT: gcc says 1, clang accepts the
+// form but does NOT say 1, so the references agree on ACCEPTANCE and disagree on
+// the VALUE. Pinning a value neither reference guarantees would make a future
+// divergence look like our regression.
+TEST(MirLoweringC, SizeofAndAlignofNonObjectTypesFoldToOne) {
+    struct Row { char const* src; char const* what; };
+    for (Row const r : {
+             Row{"unsigned long f(void) { return sizeof(void); }\n",
+                 "sizeof(void)"},
+             Row{"unsigned long f(void *p) { return sizeof(*p); }\n",
+                 "sizeof(*p) through a void* — the same rule reached by a deref"},
+             Row{"unsigned long f(void) { return _Alignof(void); }\n",
+                 "_Alignof(void) — falls out of the synthesized {size, align 1}, "
+                 "with no alignment rule of its own"},
+             Row{"int g(int x) { return x; }\n"
+                 "unsigned long f(void) { return sizeof(g); }\n",
+                 "sizeof(a function designator) — gcc states ONE rule covering "
+                 "both void and functions"}}) {
+        auto L = lowerC(std::string{r.src});
+        ASSERT_TRUE(L.mir.ok)
+            << r.what << ": "
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        // ⚠ `moduleFuncCount()`, NOT `funcCount()`. `funcCount()` is the ARENA's
+        // node count and arena slot 0 is a sentinel, so it is exactly one MORE
+        // than the bound `funcAt` accepts — indexing with `funcCount() - 1` aborts
+        // the PROCESS ("funcAt: index 1 out of range (module has 1 functions)").
+        // That is how this test was first written, and the red-on-disable CONTROL
+        // arm is what caught it: a crash shows up in a count-reading summary as
+        // one failing BINARY and zero failing TESTS, which is precisely the
+        // reading the "read failing NAMES, not counts" rule exists to prevent.
+        // The sized function is the LAST defined (the `sizeof(g)` row defines `g`
+        // first); a bare prototype is not usable here because this fixture leaves
+        // an ExternFunction without the `mangledName` the HIR verifier requires.
+        MirBlockId const entry =
+            m.funcEntry(m.funcAt(static_cast<std::uint32_t>(m.moduleFuncCount()) - 1));
+        bool sawOne = false;
+        for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+            MirInstId const id = m.blockInstAt(entry, k);
+            if (m.instOpcode(id) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.constLiteralIndex(id));
+            if (std::holds_alternative<std::uint64_t>(lit.value)
+                && std::get<std::uint64_t>(lit.value) == 1u) {
+                sawOne = true;
+            }
+        }
+        EXPECT_TRUE(sawOne) << r.what << " must fold to the constant 1";
+    }
+}
+
+// ★★ THE REFUSAL THAT MUST SURVIVE, and the reason widening the stride is safe
+// rather than a removal of a gate. An INCOMPLETE composite pointee has no operand
+// size EITHER — `operandLayout` names only `void` and `FnSig`, and every other
+// kind keeps `computeLayout`'s nullopt — so `p + 1` on a `struct S *` with no
+// definition must still FAIL LOUD. gcc: "invalid use of undefined type 'struct S'";
+// clang: "arithmetic on a pointer to an incomplete type". Both REFUSE, so DSS must.
+//
+// If this ever goes green, the non-object arm has stopped being a two-name list and
+// started answering for anything unsized — which is a silent wrong offset, not a
+// conformance win.
+TEST(MirLoweringC, IncompletePointeeArithmeticStillFailsLoud) {
+    auto L = lowerC("struct S;\n"
+                    "struct S *f(struct S *p) { return p + 1; }\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "arithmetic on a pointer to an INCOMPLETE type must stay refused — "
+           "both references reject it";
+    bool named = false;
+    for (auto const& d : L.mirReporter.all()) {
+        if (d.actual.find("computable size") != std::string::npos
+            || d.actual.find("element stride") != std::string::npos) {
+            named = true;
+        }
+    }
+    EXPECT_TRUE(named)
+        << "the refusal must name the missing stride, not fail for some unrelated "
+           "reason that would mask a regression here";
+}
+
+// ── D-CSUBSET-VOID-TERNARY-LOWERS-A-PHI-OF-VOID ────────────────────────────
+//
+// C 6.5.15p3: both arms `void` ⇒ the conditional has void type. gcc 13.3.0
+// (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed SEPARATELY, compile and RUN
+// it. ✔MEASURED at 301e2a63: five distinct source shapes ALL produced the same
+// `L_UnsupportedLoweringForOpcode` — the join `Phi`, a value-producing opcode
+// whose result type must be valid, was being asked for a phi of something with no
+// value. The fix lowers the diamond with NO phi and discards each arm.
+//
+// The assertion is the INSTRUCTION SHAPE, not merely that lowering succeeded: a
+// CondBr must exist (the branch really happens) and no Phi may (the join carries
+// no value). Asserting only `ok` would pass for a lowering that produced a phi of
+// some unrelated type.
+TEST(MirLoweringC, VoidTernaryLowersADiamondWithNoJoinPhi) {
+    auto L = lowerC("void g(void) { }\n"
+                    "void h(void) { }\n"
+                    "void f(int c) { c ? g() : h(); }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "a both-arms-void conditional is legal C that both references run: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // `moduleFuncCount()`, NOT `funcCount()` — see the note on
+    // SizeofAndAlignofNonObjectTypesFoldToOne. `f` is the last defined.
+    MirFuncId const f =
+        m.funcAt(static_cast<std::uint32_t>(m.moduleFuncCount()) - 1);
+    bool sawCondBr = false;
+    bool sawPhi    = false;
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const bb = m.funcBlockAt(f, b);
+        for (std::uint32_t k = 0; k < m.blockInstCount(bb); ++k) {
+            MirOpcode const op = m.instOpcode(m.blockInstAt(bb, k));
+            if (op == MirOpcode::CondBr) sawCondBr = true;
+            if (op == MirOpcode::Phi)    sawPhi    = true;
+        }
+    }
+    EXPECT_TRUE(sawCondBr)
+        << "the conditional must still BRANCH — a lowering that evaluated both "
+           "arms unconditionally would also produce no phi and pass a weaker test";
+    EXPECT_FALSE(sawPhi)
+        << "a void conditional joins with NO value — a Phi here is the "
+           "phi-of-void that made this fail loud two tiers down";
+}
+
+// The ordinary VALUE-producing ternary must be UNTOUCHED — it still joins with a
+// real phi. Without this, the test above is satisfiable by deleting the phi from
+// every conditional, which would be a silent miscompile of every `c ? a : b`.
+TEST(MirLoweringC, ScalarTernaryStillJoinsWithAPhi) {
+    auto L = lowerC("int f(int c) { return c ? 40 : 2; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const f = m.funcAt(0);
+    bool sawPhi = false;
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const bb = m.funcBlockAt(f, b);
+        for (std::uint32_t k = 0; k < m.blockInstCount(bb); ++k) {
+            if (m.instOpcode(m.blockInstAt(bb, k)) == MirOpcode::Phi) sawPhi = true;
+        }
+    }
+    EXPECT_TRUE(sawPhi)
+        << "a scalar conditional's value still comes from a join Phi — the void "
+           "arm must not have moved the ordinary diamond";
+}
+
+// ── D-CSUBSET-VOID-CONTROLLING-EXPRESSION-LEAKS-AN-INTERNAL-ERROR ──────────
+//
+// A `void` controlling expression is a constraint violation (C 6.8.4.1p1 /
+// 6.8.5p2 / 6.5.15p2 — the controlling expression shall have SCALAR type), and
+// both references reject it, so this is NOT a conformance divergence: DSS rejected
+// it too. It rejected it WRONGLY — ✔MEASURED through the shipped CLI, `if (g())`
+// and `while (g())` both came out as `error[I_TerminatorTypeMismatch]: mir inst
+// #N: (condbr) …`, an INTERNAL MIR-verifier assertion with no source position for
+// a plain user error. Fail-loud means a POSITIONED diagnostic; an internal
+// invariant leaking to the user is a defect even when the verdict is right.
+//
+// The refusal now lives in `coerceCondition`, the ONE function every controlling-
+// expression site funnels through, so all six contexts close with one arm. This
+// pin walks them all — a per-site fix would pass on `if` and fail on `for`.
+TEST(MirLoweringC, AVoidControllingExpressionIsRefusedWithAPositionedDiagnostic) {
+    struct Row { char const* body; char const* what; };
+    for (Row const r : {
+             Row{"if (g()) { }\n",          "if"},
+             Row{"while (g()) { }\n",       "while"},
+             Row{"do { } while (g());\n",   "do-while"},
+             Row{"for (; g(); ) { }\n",     "for"},
+             Row{"int x = g() ? 1 : 2; (void)x;\n", "the ternary CONDITION"},
+             Row{"int y = g() && 1; (void)y;\n",    "a logical connective"}}) {
+        auto L = lowerC(std::string{"void g(void) { }\n"}
+                        + "void f(void) { " + r.body + " }\n");
+        bool positioned = false;
+        for (auto const& d : L.hirReporter.all()) {
+            if (d.code == DiagnosticCode::S_TypeMismatch
+                && d.actual.find("controlling expression") != std::string::npos) {
+                positioned = true;
+            }
+        }
+        EXPECT_TRUE(positioned)
+            << "\n" << r.what
+            << " — the refusal must be a positioned S_TypeMismatch naming the "
+               "controlling expression, never an internal MIR-verifier assertion";
+    }
+}
+
+// The polarity pin for the arm above: an ORDINARY controlling expression must
+// still lower. Without it, "refuse every condition" satisfies the test.
+TEST(MirLoweringC, OrdinaryControllingExpressionsAreUntouchedByTheVoidRefusal) {
+    auto L = lowerC("int f(int c, int *p) {\n"
+                    "    int n = 0;\n"
+                    "    if (c) n++;\n"
+                    "    while (n < 2) n++;\n"
+                    "    for (int i = 0; i < 2; i++) n++;\n"
+                    "    if (p) n++;\n"                  // a POINTER condition
+                    "    return c ? n : 0;\n"
+                    "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    for (auto const& d : L.hirReporter.all()) {
+        EXPECT_NE(d.code, DiagnosticCode::S_TypeMismatch)
+            << "an int / pointer controlling expression is scalar and must lower "
+               "untouched: " << d.actual;
+    }
 }

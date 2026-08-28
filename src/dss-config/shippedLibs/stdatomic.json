@@ -7,11 +7,11 @@
     { "name": "atomic_int", "type": "atomic<i32>" }
   ],
   "constants": [
-    { "name": "memory_order_relaxed", "value": 0, "type": "i32" },
-    { "name": "memory_order_consume", "value": 1, "type": "i32" },
-    { "name": "memory_order_acquire", "value": 2, "type": "i32" },
-    { "name": "memory_order_release", "value": 3, "type": "i32" },
-    { "name": "memory_order_acq_rel", "value": 4, "type": "i32" },
-    { "name": "memory_order_seq_cst", "value": 5, "type": "i32" }
+    { "name": "memory_order_relaxed", "value": 0, "type": "i32", "preprocessorVisible": false },
+    { "name": "memory_order_consume", "value": 1, "type": "i32", "preprocessorVisible": false },
+    { "name": "memory_order_acquire", "value": 2, "type": "i32", "preprocessorVisible": false },
+    { "name": "memory_order_release", "value": 3, "type": "i32", "preprocessorVisible": false },
+    { "name": "memory_order_acq_rel", "value": 4, "type": "i32", "preprocessorVisible": false },
+    { "name": "memory_order_seq_cst", "value": 5, "type": "i32", "preprocessorVisible": false }
   ]
 }

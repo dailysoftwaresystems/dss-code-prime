@@ -203,4 +203,79 @@ computeLayout(TypeId id, TypeInterner const& interner,
 compositeFieldsOverlap(TypeId id, TypeInterner const& interner,
                        AggregateLayoutParams params, DataModel dm);
 
+// ── D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the OPERAND size, which is a
+//    DIFFERENT QUESTION from the object layout above ─────────────────────────
+//
+// `computeLayout` answers "how is an OBJECT of this type STORED". `sizeof`,
+// `_Alignof` and the element stride of pointer arithmetic ask something else:
+// "what size does this type have as an OPERAND". For every type that HAS an
+// object representation the two answers coincide, which is why one function
+// served both for so long — but they diverge on exactly the types that have no
+// object representation at all, and there the difference is the whole point.
+//
+// ISO C keeps them together: 6.5.3.4p1 forbids `sizeof` on a function type or an
+// incomplete type (`void` is one, permanently — 6.2.5p19), and 6.5.6p2 admits
+// pointer arithmetic only on a complete OBJECT type. GNU C splits them, and both
+// reference compilers implement the split identically: gcc's manual states the
+// rule once, as "the size of a void or of a function" being 1, which is what
+// makes `void *p; p + 1;` byte arithmetic and `sizeof(void) == 1`.
+// ✔MEASURED at P42, gcc 13.3.0 `-std=c2x` and clang 18.1.3 `-std=c23` probed
+// SEPARATELY, every shape BUILT AND RUN: both accept `p = p + 1` / `p += 2` /
+// `p++` / `++p` / `--p` / `p -= 1` / `q - p` / a `const void *` / `sizeof(void)`
+// / `sizeof(*p)` / `sizeof(f)` / `sizeof(*f)` / `_Alignof(void)` / `fp + 0`.
+// Under `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` a unanimous ACCEPTANCE settles it.
+//
+// ★ THE OBJECT QUESTION IS DELIBERATELY LEFT REFUSING, AND THAT IS THE SAFETY
+//   PROPERTY. `computeLayout` still nullopts for `void`/`FnSig`, so `void x;`,
+//   `struct T { void x; };` and `void a[3];` cannot start silently ALLOCATING —
+//   all three are constraint violations both references reject, and the first
+//   two were silently ACCEPTED by DSS before P42 (now `S_IncompleteTypeObject` /
+//   `S_IncompleteTypeMember`). Sizing `void` at the object question would have
+//   traded 19 conformance closures for a silent-allocation class.
+
+// The sizes a DIALECT assigns to types that have NO object representation.
+// ABSENT (the default) = the type has no operand size either, so every query
+// keeps the strict-ISO refusal — a schema that declares nothing is byte-identical
+// to the pre-P42 engine.
+//
+// ⚠ TWO NAMED FIELDS, NOT A MAP KEYED BY `TypeKind`, and the choice is
+// deliberate. The set of kinds for which this question is even MEANINGFUL is
+// exactly {Void, FnSig}: they are the only two that can never have an object
+// representation. `computeLayout`'s `default:` arm also catches Slice/Tuple/
+// Vector/Matrix/Nullable/Optional/Param/Bind/Extension, but those are types a
+// future language would give a REAL layout, not objectless ones — a map would
+// invite a schema to declare `"struct": 3` and silently override the engine that
+// actually knows. The failure mode decides it: a mistyped named field is caught
+// LOUD at config load by the block's own unknown-key check, whereas a mistyped
+// map entry is either the same error (no gain) or a silently ignored line. And a
+// genuinely-new objectless lattice kind is ALREADY a hand edit — `computeLayout`,
+// `isMemoryResidentType` and `isByValueClass` all have `default:` arms that
+// `-Werror=switch` cannot police — so the pair is consistent with how every other
+// kind-keyed decision in this engine is made. `operandLayout` falls through to
+// `computeLayout` for any kind not named here, i.e. it REFUSES rather than
+// guesses: a third objectless kind fails loud until someone teaches it, which is
+// the direction this project chooses every time.
+struct NonObjectTypeSizes {
+    std::optional<std::uint64_t> voidBytes;      // TypeKind::Void
+    std::optional<std::uint64_t> functionBytes;  // TypeKind::FnSig
+};
+
+// The size + alignment of `id` as the OPERAND of `sizeof`/`_Alignof`, or as the
+// ELEMENT of pointer arithmetic. Byte-identical to `computeLayout` for every type
+// that has a layout — the two non-object kinds are the ONLY ones that consult
+// `sizes`, and only when the dialect declared them. The synthesized layout is
+// `{size = declared, align = 1}`: an object of these types does not exist, so the
+// alignment is the one a byte-addressed offset needs, and `_Alignof(void) == 1`
+// is what both references report. nullopt keeps the caller's existing fail-loud.
+//
+// ★ THE SINGLE STRIDE RULE. Every element-scaling site (`elementStride` →
+// `scaleIndexToBytes`, the `p ± n` and `p - q` arms, the MIR `SizeOf`/`_Alignof`
+// cases, the semantic const-fold `resolveSizeof`/`resolveAlignof`) routes through
+// HERE, so there is no second stride rule to drift — the one rule simply stopped
+// asking the object question on behalf of the operand one.
+[[nodiscard]] DSS_EXPORT std::optional<StructLayout>
+operandLayout(TypeId id, TypeInterner const& interner,
+              AggregateLayoutParams params, DataModel dm,
+              NonObjectTypeSizes const& sizes);
+
 } // namespace dss

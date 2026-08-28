@@ -7,6 +7,7 @@
 #include "core/types/extern_import.hpp"
 #include "core/types/target_schema.hpp"   // VaListLayout
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_layout.hpp"  // NonObjectTypeSizes (operand sizes)
 #include "hir/hir.hpp"
 #include "hir/hir_attrs.hpp"
 #include "hir/hir_inline_asm.hpp"   // HirInlineAsmPool (inline-asm P5 descriptors)
@@ -92,6 +93,16 @@ struct DSS_EXPORT MirLoweringConfig {
     AggregateLayoutParams aggregateLayout{};
     bool                  aggregateLayoutLoaded = false;
     DataModel             dataModel = DataModel::Lp64;
+
+    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the source language's declared
+    // sizes for types with NO object representation (`void`, a function type),
+    // threaded from `semantics.nonObjectTypeSizes` exactly as `charTypesAliasAll`
+    // is threaded from `semantics.pointerAliasing`. Consumed ONLY through
+    // `operandLayout` — the sizeof/alignof/element-stride query — which is what
+    // keeps `elementStride` a SINGLE rule instead of growing a second one beside
+    // it. Both-absent by default, so a schema that declares nothing keeps the
+    // strict-ISO refusal and every pre-P42 lowering is byte-identical.
+    NonObjectTypeSizes    nonObjectTypeSizes{};
 
     // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75
     // (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM): whether bare `char` (`TypeKind::Char`, NOT

@@ -3,6 +3,7 @@
 // UTF-16 character). Hits severity mapping, message composition,
 // and UTF-16 column conversion on a multi-byte line.
 
+#include "core/types/diagnostic_reporter.hpp"   // kNoDiagnosticDetailRecorded
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
@@ -124,13 +125,22 @@ TEST(DiagnosticTranslator, ContextPrefixIsPrependedToMessage) {
               "expected ';' \xE2\x80\x94 got '}'");
 }
 
-// 0f7d714 audit-fold (2026-06-01): pin the empty-prose code-name
-// fallback. composeMessage restructured to build prose first then
-// prepend prefix at end specifically so this fallback survives
-// non-empty contextPrefix. A regression that gates the fallback on
-// `(prose+prefix).empty()` would emit a useless prefix-only
-// message; this test fails that case loudly.
-TEST(DiagnosticTranslator, EmptyProseFallsBackToCodeName) {
+// 0f7d714 audit-fold (2026-06-01): pin the empty-prose fallback.
+// composeMessage restructured to build prose first then prepend prefix at end
+// specifically so this fallback survives non-empty contextPrefix. A regression
+// that gates the fallback on `(prose+prefix).empty()` would emit a useless
+// prefix-only message; this test fails that case loudly.
+//
+// ★ D-DIAG-TWO-CODE-RENDERINGS UPDATE (cycle P42): the fallback WAS the bare
+// code name, which put a second copy of the code into `message` on a Diagnostic
+// that already carries it in the structured `code` field — hazard (H2) on that
+// row, and pure noise for a client. It now states the fact instead, in wording
+// shared with the CLI (`kNoDiagnosticDetailRecorded`). ⚠ THE PROPERTY THIS TEST
+// GUARDS IS UNCHANGED AND IS NOT THE WORDING: `message` must never be empty,
+// and the fallback must be applied BEFORE the prefix is prepended. Asserting
+// the shared constant rather than a retyped literal is what keeps this test
+// from becoming a second owner of the sentence.
+TEST(DiagnosticTranslator, EmptyProseFallsBackToAStatedNoDetailMessage) {
     auto buf = SourceBuffer::fromString("x", "t");
     ParseDiagnostic d;
     d.code     = DiagnosticCode::P_UnexpectedToken;
@@ -138,17 +148,28 @@ TEST(DiagnosticTranslator, EmptyProseFallsBackToCodeName) {
     d.span     = SourceSpan::of(ByteOffset{0}, ByteOffset{1});
     // expected/actual/suggestion all default-empty.
     auto out = dss::lsp::translateDiagnostic(d, *buf);
-    EXPECT_EQ(out.message, "P_UnexpectedToken")
-        << "all-empty prose must fall back to the bare code name; "
+    EXPECT_EQ(out.message, std::string{dss::kNoDiagnosticDetailRecorded})
+        << "all-empty prose must fall back to a stated no-detail message; "
            "without the fallback the LSP message field would be \"\"";
+    // ★ AND IT MUST NOT BE THE CODE. Re-echoing the code here is the exact
+    // regression (H2) the fallback was changed to remove, and it would pass the
+    // "not empty" assertion above on its own.
+    EXPECT_EQ(out.message.find("P_UnexpectedToken"), std::string::npos)
+        << "the message must not repeat the code — `out.code` already carries "
+           "it as a structured field";
+    EXPECT_EQ(out.code, "P_UnexpectedToken")
+        << "the structured `code` field is where the code belongs, and it is "
+           "the SAME spelling the CLI now puts in its bracket";
 }
 
 // 0f7d714 audit-fold: combined edge case — non-empty contextPrefix
-// + all-empty prose. The fallback assigns `prose = codeName(d.code)`
-// BEFORE the prefix is prepended, so the final message must contain
-// both. A regression that gates the fallback on the prefixed string
-// being empty would silently produce a prefix-only message.
-TEST(DiagnosticTranslator, ContextPrefixPlusEmptyProseEmitsPrefixAndCodeName) {
+// + all-empty prose. The fallback is assigned BEFORE the prefix is prepended,
+// so the final message must contain both. A regression that gates the fallback
+// on the prefixed string being empty would silently produce a prefix-only
+// message. (D-DIAG-TWO-CODE-RENDERINGS: the fallback text is now the stated
+// no-detail sentence rather than the code name; the ORDERING property this
+// test exists for is untouched.)
+TEST(DiagnosticTranslator, ContextPrefixPlusEmptyProseEmitsPrefixAndFallback) {
     auto buf = SourceBuffer::fromString("x", "t");
     ParseDiagnostic d;
     d.code          = DiagnosticCode::P_UnexpectedToken;
@@ -157,5 +178,8 @@ TEST(DiagnosticTranslator, ContextPrefixPlusEmptyProseEmitsPrefixAndCodeName) {
     d.contextPrefix = "[target=arm64:elf64-aarch64-linux] ";
     auto out = dss::lsp::translateDiagnostic(d, *buf);
     EXPECT_EQ(out.message,
-              "[target=arm64:elf64-aarch64-linux] P_UnexpectedToken");
+              "[target=arm64:elf64-aarch64-linux] "
+                  + std::string{dss::kNoDiagnosticDetailRecorded})
+        << "the fallback must be applied BEFORE the prefix is prepended, so a "
+           "prefix-only message can never be produced";
 }

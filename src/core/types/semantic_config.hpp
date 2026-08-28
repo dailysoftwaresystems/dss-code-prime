@@ -7,6 +7,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
+#include "core/types/type_lattice/type_layout.hpp"  // NonObjectTypeSizes (operand sizes)
 
 #include <cstdint>
 #include <optional>
@@ -98,6 +99,116 @@ declarationKindName(DeclarationKind k) noexcept {
 [[nodiscard]] constexpr std::optional<DeclarationKind>
 declarationKindFromName(std::string_view s) noexcept {
     return kDeclarationKindTable.fromName(s);
+}
+
+// ★★ P42 (D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT): the kind
+// vocabulary an `attributeSemantics.effects` row's `appliesTo` speaks. It is
+// `DeclarationKind` PLUS ONE REFINEMENT — `functionPointer`, an OBJECT whose
+// declared type is a pointer to a function.
+//
+// ★ WHY A REFINEMENT AND NOT A FIFTH `DeclarationKind`. `DeclarationKind` is
+// also the vocabulary of `declarations[].kind` and `kindByChild.whenKind`,
+// where "functionPointer" is not a thing a declaration ROW can be; adding it
+// there would ship a spelling those two keys must then refuse, which is dead
+// config wearing the shape of a feature. The `appliesTo` axis is the only one
+// that needs the distinction, so it is the only one that gets the spelling.
+//
+// ★★ IT IS ADDITIVE, NEVER A REPLACEMENT — AND THE MEASUREMENT IS WHY. A
+// function-pointer object satisfies BOTH `variable` and `functionPointer`; the
+// gate takes the union. Probed separately against clang 18.1.3 -std=c23 and
+// gcc 13.3.0 -std=c2x on `int (*fp)(void)`:
+//   * `warn_unused_result`, `nothrow`, `format`, `nonnull`, `sentinel` — both
+//     references SILENT, while both DIAGNOSE the same names on a plain data
+//     object. So the row needs a kind the plain object does not have.
+//   * `noinline`, `always_inline`, `no_sanitize_thread`, `cold`, `malloc` —
+//     both references DIAGNOSE on a function pointer. So mapping a
+//     `Ptr<FnSig>` variable to `Function` at the gate (the cheap fix the
+//     registry row proposed as option (a)'s shortcut) would have SILENCED
+//     five names every real toolchain reports. That refutation is the whole
+//     reason this vocabulary exists rather than a one-line gate widening.
+//   * `unused`, `deprecated`, `aligned` — both references SILENT on a
+//     function pointer, and their rows declare `variable`. So `variable` must
+//     KEEP matching a function-pointer object, which a replacement mapping
+//     would have broken in the other direction.
+enum class AttributeAppliesKind : std::uint8_t {
+    Variable        = static_cast<std::uint8_t>(DeclarationKind::Variable),
+    Function        = static_cast<std::uint8_t>(DeclarationKind::Function),
+    Table           = static_cast<std::uint8_t>(DeclarationKind::Table),
+    Type            = static_cast<std::uint8_t>(DeclarationKind::Type),
+    FunctionPointer,
+};
+
+// The ONE spelling this vocabulary adds. The other four are NOT restated here:
+// the table below is built BY PROJECTION from `kDeclarationKindTable`, so a
+// rename there reaches `appliesTo` with no second edit and the two vocabularies
+// cannot drift into disagreeing about what `variable` is called.
+inline constexpr std::string_view kFunctionPointerAppliesKindName =
+    "functionPointer";
+
+[[nodiscard]] consteval EnumNameTable<AttributeAppliesKind, 5>
+makeAttributeAppliesKindTable() noexcept {
+    EnumNameTable<AttributeAppliesKind, 5> t{};
+    for (std::size_t i = 0; i < kDeclarationKindTable.rows.size(); ++i) {
+        t.rows[i] = {static_cast<AttributeAppliesKind>(static_cast<std::uint8_t>(
+                         kDeclarationKindTable.rows[i].first)),
+                     kDeclarationKindTable.rows[i].second};
+    }
+    t.rows[4] = {AttributeAppliesKind::FunctionPointer,
+                 kFunctionPointerAppliesKindName};
+    return t;
+}
+inline constexpr auto kAttributeAppliesKindTable =
+    makeAttributeAppliesKindTable();
+DSS_CHECK_ENUM_NAME_TABLE(kAttributeAppliesKindTable);
+
+[[nodiscard]] constexpr std::string_view
+attributeAppliesKindName(AttributeAppliesKind k) noexcept {
+    return kAttributeAppliesKindTable.name(k);
+}
+[[nodiscard]] constexpr std::optional<AttributeAppliesKind>
+attributeAppliesKindFromName(std::string_view s) noexcept {
+    return kAttributeAppliesKindTable.fromName(s);
+}
+
+// Does a declaration of kind `have` — additionally known to be, or not to be, a
+// function-pointer OBJECT — satisfy the `appliesTo` entry `want`? The ONE place
+// the refinement's additive reading lives, so the gate and any future reader
+// cannot disagree about it.
+[[nodiscard]] constexpr bool
+declarationSatisfiesAppliesKind(AttributeAppliesKind want, DeclarationKind have,
+                                bool isFunctionPointerObject) noexcept {
+    if (want == AttributeAppliesKind::FunctionPointer)
+        return isFunctionPointerObject;
+    return static_cast<std::uint8_t>(want) == static_cast<std::uint8_t>(have);
+}
+
+// ── THE COMPOSITE LINKAGE-SPECIFIER KEY, AND ITS BASE NAME ─────────────────
+//
+// A `declarations[].linkageSpecifiers` key may be COMPOSITE — an identifier
+// plus the decoded body of its string argument, joined by this separator
+// (`visibility:hidden`). The separator is an ENGINE convention, not a language
+// fact: the HIR lowerer assembles the key, and every reader that wants to ask
+// "which identifier can SPELL this specifier" must split it the same way.
+//
+// ⚠ THIS IS THE SECOND OWNER, NOT THE FIRST. `src/hir/lowering/cst_to_hir.cpp`
+// still assembles the key with a bare `':'` literal of its own. That copy is
+// outside this cycle's lane and is NAMED rather than silently duplicated: the
+// two spellings agreeing today is a fact nothing checks. What this constant DOES
+// buy is that the two readers inside this vocabulary's own tier — the loader's
+// attribute-vocabulary drift cross-check and the semantic tier's
+// `languageModelsAttributeName` — read ONE definition instead of hand-writing
+// `find(':')` twice, which is how they would drift from each other first.
+inline constexpr char kLinkageSpecifierCompositeSeparator = ':';
+
+// The IDENTIFIER half of a linkage-specifier key: the whole key when it is
+// simple (`weak`), the part before the separator when it is composite
+// (`visibility:hidden` → `visibility`). This is the spelling a programmer
+// writes as an attribute clause NAME, which is what both readers are asking
+// about.
+[[nodiscard]] constexpr std::string_view
+linkageSpecifierBaseName(std::string_view key) noexcept {
+    auto const at = key.find(kLinkageSpecifierCompositeSeparator);
+    return at == std::string_view::npos ? key : key.substr(0, at);
 }
 
 enum class NameMatchMode : std::uint8_t {
@@ -1959,21 +2070,39 @@ struct DSS_EXPORT AttributeSemanticsRow {
     // engine names no attribute and no effect verb, it walks a config-declared
     // kind set.
     //
-    // ★ REQUIRED on every row whose `effect != None`; EXEMPT (and therefore
-    // EMPTY) on a `none` row. The loader enforces exactly that split — see the
-    // `appliesTo` block in `grammar_schema_json.cpp`, which extends the SAME
-    // `row.effect == AttributeEffect::None` predicate Clause B's drift
-    // cross-check already computes. A permissive "absent ⇒ applies to
-    // everything" default was REJECTED: it is the silent-permissive trap of
+    // ★ REQUIRED on every row whose `effect != None`; PERMITTED — and OPTIONAL
+    // — on a `none` row. A permissive "absent ⇒ applies to everything" default
+    // was REJECTED for the required half: it is the silent-permissive trap of
     // [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]], where a row that simply
     // forgot the key reads as deliberately universal.
     //
+    // ★★ P42 — THE KEY USED TO BE **REFUSED** ON A `none` ROW, AND THAT REFUSAL
+    // WAS THE DEFECT, NOT THE GUARD. The reasoning it shipped with was sound as
+    // far as it went: the shipped `none` verb bundled function-only, type-only
+    // and statement-only names in ONE row, so no single kind set was correct for
+    // it. The conclusion drawn — refuse the key — froze that bundling in place,
+    // because the only way to declare a correct kind set is to SPLIT the row,
+    // and a row split is worthless while its halves may not carry the key. The
+    // loader now permits it, the shipped `none` row is split by applicable kind,
+    // and the two residuals that shared this root
+    // ([[D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT]]'s decl-kind leak and
+    // [[D-CSUBSET-STRICT-ATTRIBUTE-GATE-BLIND-TO-LINKAGE-VOCABULARY]]'s silent
+    // typedef) close together, from one change.
+    //
+    // ★ THE ASYMMETRY IS DELIBERATE AND ITS COST IS BOUNDED. Forgetting the key
+    // on a row whose verb FIRES would leave an effect applying to a kind that
+    // cannot honor it; forgetting it on an INERT row can only leave today's
+    // silence, never a wrong effect and never a wrong byte. That is why one half
+    // is required and the other merely permitted — and why some shipped `none`
+    // rows deliberately still omit it (statement attributes, aggregate-type
+    // attributes: positions the four-kind vocabulary genuinely cannot express,
+    // where any value would manufacture a diagnosis no reference gives).
+    //
     // ★ CONSEQUENCE THE ENGINE RELIES ON: an EMPTY set means "this row declares
-    // no kind axis", which — given the loader's guarantee — is exactly the
-    // `None` exemption, and the gate skips such a row. The engine therefore
-    // tests the CONFIG (`appliesTo.empty()`), never the verb, and a future verb
+    // no kind axis", and the gate skips such a row. The engine therefore tests
+    // the CONFIG (`appliesTo.empty()`), never the verb, and a future verb
     // inherits the gate by being required to declare its kinds.
-    std::vector<DeclarationKind> appliesTo;
+    std::vector<AttributeAppliesKind> appliesTo;
 };
 
 // Literal token-kind → core TypeKind. Pass 2 reads the token-kind of a
@@ -2877,6 +3006,18 @@ struct DSS_EXPORT SemanticConfig {
     //     c gains pointer arithmetic, the void* arm rejects by
     //     default; a `allowVoidPtrArithmetic: bool` opt-in field
     //     extends this struct.
+    //     ✅ LANDED P42, and this 2026-06-02 sketch called the SHAPE
+    //     right and the LOCATION wrong — worth keeping for that. The
+    //     opt-in is real, but it is NOT a bool on THIS struct: `void`
+    //     and a function type are objectless in the same way and take
+    //     the same rule, so the fact is a SIZE (`nonObjectTypeSizes`,
+    //     at the bottom of this file) read by the ONE `operandLayout`
+    //     query that `sizeof`, `_Alignof` and the element stride all
+    //     ask. A bool here would have made this a POINTER-CONVERSION
+    //     rule, which it is not — nothing is being converted. The
+    //     tracked row is [[D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED]];
+    //     the id above never became a registry row and is kept only as
+    //     this pointer to the one that did.
     //   * `D-LANG-VOIDPTR-FN-CONVERT`: `void* ↔ fn-pointer` is
     //     technically UB in standard C even though every compiler
     //     permits it. Function-pointer types landed (FC4: Ptr<FnSig>
@@ -3177,6 +3318,25 @@ struct DSS_EXPORT SemanticConfig {
         bool charTypesAliasAll = true;
     };
     PointerAliasingRules pointerAliasing;
+
+    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the byte sizes this language
+    // gives to types with NO object representation — `void` and a function type —
+    // for `sizeof` / `_Alignof` / the element stride of pointer arithmetic. The
+    // struct, its ABSENT-means-refuse default, and the reasoning for two named
+    // fields rather than a kind-keyed map all live on `NonObjectTypeSizes` in
+    // `type_lattice/type_layout.hpp`, next to the `operandLayout` query that is
+    // its ONLY consumer.
+    //
+    // Read at TWO tiers from this ONE declaration: the semantic const-fold
+    // (`resolveSizeof` / `resolveAlignof` — array dimensions, `_Static_assert`)
+    // and, threaded through `MirLoweringConfig` by `compile_pipeline`, the HIR→MIR
+    // lowering (the `SizeOf`/`AlignOf` cases and `elementStride`). Same shape as
+    // `pointerAliasing.charTypesAliasAll`, which is threaded the same way for the
+    // same reason: one schema fact, two tiers, no second rule to drift.
+    //
+    // Defaults to both-absent, so every schema that declares nothing — toy, tsql,
+    // the assembly dialects — keeps the strict-ISO refusal byte-for-byte.
+    NonObjectTypeSizes nonObjectTypeSizes;
 };
 
 } // namespace dss

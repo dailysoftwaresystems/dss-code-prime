@@ -115,6 +115,9 @@
 #include "core/crypto/sha256.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
+// The exclusive-create primitive the cache's temp claim now goes through
+// (D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK).
+#include "link/writer.hpp"
 #include "program/runtime_object_cache.hpp"
 
 #include "repo_root.hpp"
@@ -2050,4 +2053,196 @@ TEST(RuntimeObjectCachePathBudget, AnOverlongNameRefusesNamingThePathAndItsLengt
            "the directory arm and this case never reached the name-length one.";
     EXPECT_EQ(countEntries(key.userArtifactPath.parent_path()), 0u)
         << "the refusal left files behind in the artifact directory.";
+}
+
+
+// ═══ THE TEMP CLAIM ═════════════════════════════════════════════════════════
+//
+// D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK.
+//
+// ★★★ THE DEFECT: THE CLAIM ASKED ONE QUESTION AND THE WRITE ANSWERED ANOTHER.
+// `writeThroughTemp` probed each candidate name with `fs::exists` and then
+// opened it with `std::ofstream(..., trunc)`. `fs::exists` FOLLOWS symlinks, so
+// a DANGLING symlink at a candidate name answers FALSE — the loop reads "free",
+// claims it, and the truncating open CREATES THE LINK'S TARGET, outside the
+// cache directory. The `rename` then moves the LINK itself into place as the
+// cache entry, so the entry's bytes live wherever the attacker pointed.
+//
+// ⚠ STRICTLY WORSE THAN THE SAME BLINDNESS IN `link::writeBytes`
+// (D-LINK-WRITER-DANGLING-SYMLINK-CLAIM-MISROUTE): there the open is exclusive,
+// so the wrong branch was taken but NOTHING WAS WRITTEN. A truncating open
+// destroys before it can fail.
+//
+// ⚠⚠ POSIX ONLY, AND THE SKIP IS LOUD RATHER THAN SILENT. Creating a symlink on
+// Windows needs Developer Mode or elevation, so on the Windows leg this case
+// cannot construct its subject at all. It says so, by name, instead of passing
+// as though it had checked something — a vacuous green here would be worse than
+// no test, because the property it covers is a write escaping its directory.
+
+namespace {
+
+// A dangling symlink: the LINK exists as a directory entry, its TARGET does not.
+// Returns false if the platform refused to create it at all.
+[[nodiscard]] bool plantDanglingSymlink(fs::path const& link,
+                                        fs::path const& missingTarget) {
+    std::error_code ec;
+    fs::create_symlink(missingTarget, link, ec);
+    return !ec && fs::is_symlink(fs::symlink_status(link, ec));
+}
+
+} // namespace
+
+// ── (1) THE HOST CONTROL AND THE PRIMITIVE, SIDE BY SIDE ────────────────────
+//
+// Neither arm alone is worth anything. The CONTROL proves this host really does
+// let a truncating open escape through a dangling link — without it, the arm
+// below could pass on a platform where nothing was ever at risk. The PRIMITIVE
+// arm proves the exclusive create refuses the same name and leaves the target
+// uncreated, which is the whole reason the claim loop now goes through it.
+TEST(RuntimeObjectCacheStore, TempClaimNeverEscapesThroughADanglingSymlink) {
+    ScratchDir scratch{Location::Temp, "roc-claim-symlink"};
+    fs::path const inside  = scratch.path() / "cache";
+    fs::path const outside = scratch.path() / "outside";
+    std::error_code mkEc;
+    fs::create_directories(inside, mkEc);
+    ASSERT_FALSE(mkEc) << mkEc.message();
+    fs::create_directories(outside, mkEc);
+
+    fs::path const canaryA = outside / "escaped-a.bin";
+    fs::path const canaryB = outside / "escaped-b.bin";
+    fs::path const linkA   = inside / ".victim.a.tmp-1-0";
+    fs::path const linkB   = inside / ".victim.a.tmp-1-1";
+
+    if (!plantDanglingSymlink(linkA, canaryA)
+        || !plantDanglingSymlink(linkB, canaryB)) {
+        GTEST_SKIP() << "this platform refused to create a symlink, so the "
+                        "dangling-symlink claim hazard cannot be constructed "
+                        "here. On Windows that needs Developer Mode or "
+                        "elevation; the property is covered on the POSIX legs. "
+                        "This is a STATED scope limit, not a pass.";
+    }
+
+    // ── CONTROL: the OLD primitive pair, on this host, right now ────────────
+    std::error_code ec;
+    EXPECT_FALSE(fs::exists(linkA, ec))
+        << "`fs::exists` reported a DANGLING symlink as existing, so this host "
+           "does not exhibit the blindness the fix exists to close and the "
+           "assertions below would prove nothing";
+    {
+        std::ofstream out(linkA, std::ios::binary | std::ios::trunc);
+        EXPECT_TRUE(out.good())
+            << "a truncating open of a dangling symlink failed on this host, "
+               "so the escape is not reproducible here and the arm below is "
+               "not measuring what it claims";
+        out << 'x';
+    }
+    EXPECT_TRUE(fs::exists(canaryA))
+        << "THE CONTROL DID NOT FIRE: a truncating open through a dangling "
+           "symlink did not create the target, so this host cannot demonstrate "
+           "the escape and the arm below is vacuous";
+
+    // ── THE PRIMITIVE THE CLAIM NOW USES ───────────────────────────────────
+    std::FILE* const claimed = dss::linker::detail::createExclusiveBinary(linkB);
+    EXPECT_EQ(claimed, nullptr)
+        << "the exclusive create ACCEPTED a name occupied by a dangling "
+           "symlink — the claim would follow the link out of the cache "
+           "directory, exactly as the control above just did";
+    if (claimed != nullptr) std::fclose(claimed);
+    EXPECT_FALSE(fs::exists(canaryB))
+        << "THE WRITE ESCAPED: the claim created the symlink's TARGET, which "
+           "is outside the directory the cache thought it had claimed "
+           "(D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK)";
+    EXPECT_TRUE(fs::is_symlink(fs::symlink_status(linkB, ec)))
+        << "a refused claim must leave the existing entry untouched";
+}
+
+// ── (2) THE ROUTING: a real store, over a planted window of candidate names ─
+//
+// The arm above pins the PRIMITIVE. This one pins that `storeRuntimeObject`
+// actually goes THROUGH it — the two are independent, and a fix applied to only
+// one of them would leave the other green.
+//
+// ⚠ THE ONE STATED LIMIT, because a bound nobody writes down is a bound nobody
+// re-checks: the candidate names embed this process's pid (knowable) and a
+// process-wide counter (not). The window below covers the first 512 counter
+// values, so the arm is only meaningful while this test BINARY has performed
+// fewer than 512 cache writes before reaching here — comfortably true today
+// (each store consumes two) and asserted nowhere, because nothing can observe
+// the counter from outside. If that ever stops holding, this arm goes VACUOUS
+// rather than red, which is why arm (1) exists and does not depend on it.
+//
+// ★ THE DISCRIMINATOR NEEDS NO KNOWLEDGE OF WHICH SLOT WAS PICKED. With the
+// defect, the loop stops at the first planted link, writes through it, and then
+// RENAMES THE LINK ITSELF into place — so the cache entry becomes a symlink and
+// a file appears outside the cache. With the fix, every planted link is stepped
+// over and survives, and the entry is a regular file.
+TEST(RuntimeObjectCacheStore, TempClaimStepsOverPlantedDanglingCandidates) {
+    ScratchDir scratch{Location::Temp, "roc-claim-window"};
+    ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
+    ScopedUserCacheRoot userRoot{scratch.path() / "uc"};
+
+    auto const key = computeRuntimeObjectKey(makeRequest(scratch.path()));
+    ASSERT_TRUE(key.has_value()) << key.error();
+    ASSERT_FALSE(key->userArtifactPath.empty());
+
+    fs::path const dir     = key->userArtifactPath.parent_path();
+    fs::path const outside = scratch.path() / "outside";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    fs::create_directories(outside, ec);
+
+#ifdef _WIN32
+    auto const pid = static_cast<std::uint64_t>(_getpid());
+#else
+    auto const pid = static_cast<std::uint64_t>(getpid());
+#endif
+    constexpr std::uint64_t kWindow = 512;
+    std::vector<fs::path>   planted;
+    planted.reserve(static_cast<std::size_t>(kWindow) * 2u);
+    for (fs::path const& dest : {key->userArtifactPath,
+                                 fs::path{key->userArtifactPath}.replace_extension(".key")}) {
+        for (std::uint64_t n = 0; n < kWindow; ++n) {
+            fs::path const link =
+                dir / ("." + dest.filename().string() + ".tmp-"
+                       + std::to_string(pid) + "-" + std::to_string(n));
+            if (!plantDanglingSymlink(link, outside / ("escaped-" + std::to_string(n)))) {
+                GTEST_SKIP() << "this platform refused to create a symlink, so "
+                                "the planted-window arm cannot be constructed "
+                                "here (Windows needs Developer Mode or "
+                                "elevation). STATED scope limit, not a pass.";
+            }
+            planted.push_back(link);
+        }
+    }
+
+    auto const stored = storeRuntimeObject(*key, kBytesA);
+    ASSERT_TRUE(stored.has_value())
+        << "the store refused outright — the loop must STEP OVER occupied "
+           "candidate names, not exhaust itself on them: " << stored.error();
+
+    EXPECT_FALSE(fs::is_symlink(fs::symlink_status(*stored, ec)))
+        << "the cache entry IS A SYMLINK: the claim followed a planted link and "
+           "renamed it into place, so the entry's bytes live outside the cache "
+           "(D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK)";
+    EXPECT_EQ(readFile(*stored),
+              std::string(reinterpret_cast<char const*>(kBytesA.data()),
+                          kBytesA.size()))
+        << "the entry does not hold the stored bytes";
+
+    std::size_t escaped = 0;
+    for (auto const& e : fs::directory_iterator{outside, ec}) {
+        (void)e;
+        ++escaped;
+    }
+    EXPECT_EQ(escaped, 0u)
+        << "the store created " << escaped << " file(s) OUTSIDE the cache "
+           "directory — a write escaped the directory it claimed";
+
+    std::size_t survivors = 0;
+    for (auto const& link : planted) {
+        if (fs::is_symlink(fs::symlink_status(link, ec))) ++survivors;
+    }
+    EXPECT_EQ(survivors, planted.size())
+        << "the claim consumed " << (planted.size() - survivors)
+        << " planted entr(y/ies) instead of stepping over them";
 }

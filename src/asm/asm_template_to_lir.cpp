@@ -2856,7 +2856,6 @@ public:
         if (auto const* b = bindingFor(spelling); b != nullptr) {
             out.reg         = b->reg;
             out.regClass    = b->regClass;
-            out.widthBits   = b->widthBits;
             // The form travels with the register; `decodePlaceholder` is what
             // turns it into the dialect's memory shape. A PHYSICAL register
             // spelling (the fallthrough below) leaves the default `Reg` — a
@@ -2869,6 +2868,15 @@ public:
             // themselves and no constraint letter is in play.
             out.hasImmediate = b->hasImmediate;
             out.value        = b->value;
+            // ★★★ AND THE WIDTH IS **DERIVED** RATHER THAN COPIED, WHICH IS THE
+            // ONE FACT ABOUT AN OPERAND REFERENCE THE CALLER CANNOT SUPPLY. The
+            // binding says how wide the OPERAND is; the target says which VIEW
+            // of its register a bare reference names, and the two are different
+            // questions on one of the two shipped processors. Last, because it
+            // reads the form and the class copied above.
+            if (!bareOperandWidth(*b, at, out.widthBits)) {
+                return AsmRegisterLookup::Reported;
+            }
             return AsmRegisterLookup::Resolved;
         }
         auto const physical =
@@ -3058,6 +3066,87 @@ private:
             if (b.spelling == spelling) return &b;
         }
         return nullptr;
+    }
+
+    // ★★★ WHICH VIEW A **BARE** OPERAND REFERENCE NAMES — THE TARGET'S ANSWER,
+    // ASKED HERE BECAUSE THIS IS THE ONE ARM THAT KNOWS THE SPELLING DENOTED AN
+    // OPERAND (D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE).
+    //
+    // A register written in the assembly TEXT denotes itself and keeps the width
+    // its own spelling states — `%eax` is 32 bits because `eax` is, and that
+    // resolution runs in `resolvePhysicalRegister`, which this function is
+    // deliberately not on the path of. Only a spelling the CALLER bound is an
+    // operand reference, and only an operand reference has a width to derive.
+    //
+    // ★★ THE WIDTH-VIEW MODIFIER COMPOSES BY CONSTRUCTION AND NEEDS NO ARM
+    // HERE. `decodePlaceholder` rebuilds `%w0` into the plain `%0` before
+    // asking, then OVERRIDES the answer with the letter's declared width — so a
+    // modified reference passes through this derivation and discards it, which
+    // is exactly the reference behaviour: ✔MEASURED 2026-08-27 on gcc 13.3.0
+    // and clang 19.1.1, `%w0`/`%x0` render `w0`/`x0` on aarch64 and
+    // `%b0`/`%w0`/`%k0`/`%q0` render `%al`/`%ax`/`%eax`/`%rax` on x86_64, each
+    // letter giving the SAME view for a `char`, an `int` and a `long long`.
+    // The letter wins on both ports; only the letter's ABSENCE differs.
+    //
+    // ⚠ ONLY THE REGISTER FORM. A `"m"` binding carries an ADDRESS and an `"i"`
+    // binding IS its value, so neither states an operation width — ✔MEASURED
+    // 2026-08-27, gcc renders a memory-bound `%0` as `[sp, 20]` / `-12(%rbp)`
+    // on the two ports, an address with no width in it at all. Those forms keep
+    // the binding's own number, which the decoder then discards; asking the
+    // target about them would refuse a shape both references accept.
+    [[nodiscard]] bool bareOperandWidth(AsmOperandBinding const& b, NodeId at,
+                                        std::uint32_t& out) const {
+        if (b.operandKind != OperandKindFilter::Reg) {
+            out = b.widthBits;
+            return true;
+        }
+        auto const cls = static_cast<TargetRegClass>(b.regClass);
+        auto const policy = target_.asmBareOperandWidth(cls);
+        // ⚠ UNDECLARED REFUSES, AND THE PLAUSIBLE WRONG ANSWER IS WHY. Both
+        // derivations always assemble, so falling back to either one ships a
+        // template that means something else with a clean build log — the
+        // 4-byte-store-against-an-8-byte-one this row was opened for.
+        if (!policy.has_value()) {
+            sink_.fail(at, std::format(
+                "'{}' is a bare operand reference — no width-view modifier — "
+                "and target '{}' does not declare which view of a '{}' register "
+                "a bare reference names ('asmBareOperandWidths'). The two "
+                "answers a processor can give BOTH assemble: substituting the "
+                "operand's own type width where the reference meant the full "
+                "register (or the reverse) runs the instruction at a width the "
+                "template did not ask for, with nothing to see in the build "
+                "log. Declare the derivation for this class{}",
+                b.spelling, target_.name(), targetRegClassName(cls),
+                sink_.pairSuffix()));
+            return false;
+        }
+        switch (*policy) {
+            case AsmBareOperandWidth::OperandType:
+                out = b.widthBits;
+                return true;
+            case AsmBareOperandWidth::RegisterNatural: {
+                auto const natural =
+                    target_.registerClassNaturalWidthBits(cls);
+                // The class declared the policy but declares no full register
+                // to take a width from — or declares several that disagree.
+                // Either way there is no natural width to substitute, and the
+                // operand's own is the answer this policy exists to reject.
+                if (!natural.has_value()) {
+                    sink_.fail(at, std::format(
+                        "'{}' is a bare operand reference, and target '{}' "
+                        "declares that such a reference names the FULL '{}' "
+                        "register — but that class declares no full register "
+                        "with a single width to take one from (a full register "
+                        "is a 'registers' row with no 'subOf'){}",
+                        b.spelling, target_.name(),
+                        targetRegClassName(cls), sink_.pairSuffix()));
+                    return false;
+                }
+                out = *natural;
+                return true;
+            }
+        }
+        return false;
     }
 
     TargetSchema const&                target_;

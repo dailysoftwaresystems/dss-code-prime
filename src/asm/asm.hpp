@@ -173,12 +173,66 @@ struct DSS_EXPORT AssembledFunction {
     // machine every format's unwind table is encoded from (`.eh_frame` CIE/FDE
     // on ELF and Mach-O, `.pdata`/`.xdata` UNWIND_INFO on PE).
     //
-    // nullopt when no producer attached one: the object-file `.obj` path, the
-    // linker-synthesized entry trampoline, and -- today -- every function that
-    // came from assembly source, whose `.cfi_*` directives are still parsed and
-    // dropped (D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED). A format writer that
-    // cannot describe such a function must SAY SO rather than emit a table that
-    // silently covers a subset of the image.
+    // nullopt when no producer attached one -- which today means the
+    // linker-synthesized entry trampoline, and an assembly-source function
+    // whose author wrote no `.cfi_*` directives at all. `nullopt` is
+    // UNDESCRIBED, and it is not the same as an engaged entry with an empty op
+    // list: gas lets a file describe some functions and not others, and an
+    // undescribed one must get no FDE (see `asm_text_to_lir.hpp`'s
+    // `perFuncCfi`). A format writer that cannot describe a function that IS
+    // described must SAY SO rather than emit a table that silently covers a
+    // subset of the image.
+    //
+    // ⚠⚠ TWO CLAIMS THAT USED TO STAND HERE ARE BOTH MEASURABLY FALSE, AND
+    // THEY ARE CORRECTED RATHER THAN DELETED BECAUSE EACH IS LOAD-BEARING
+    // SOMEWHERE ELSE.
+    //
+    // (1) "every function that came from assembly source, whose `.cfi_*`
+    // directives are still parsed and dropped". The row it cited,
+    // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED, has been CLOSED since
+    // 2026-08-17 -- the assembly producer landed on both ports -- and the
+    // comment outlived it. ✔MEASURED 2026-08-27: a `.s` carrying
+    // `.cfi_startproc` / `.cfi_def_cfa_offset` / `.cfi_offset` /
+    // `.cfi_endproc`, compiled `--language asm-x86_64-att --target
+    // x86_64:elf64-x86_64-linux`, emits `.eh_frame` 60 B + `.rela.eh_frame`
+    // 24 B. Assembly-sourced frames ARE described.
+    //
+    // (2) "the object-file `.obj` path" as a source of nullopt. It is
+    // quoted verbatim -- as "AssembledFunction::unwind is nullopt on the object
+    // path by construction" -- inside the `$sehPersonalityOmittedComment` of
+    // BOTH `pe64-x86_64-windows.format.json` and
+    // `pe64-x86_64-windows-staticlib.format.json`, where it is the stated
+    // reason those two formats decline `sehPersonality`, and again in
+    // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO's evidence chain. A reader who
+    // believes it concludes the unwind data does not EXIST on the object path
+    // and looks upstream for a producer to fix. It does exist.
+    //
+    // ✔MEASURED 2026-08-27, one source (a non-leaf frame, NO `__try`), three
+    // artifacts off the SAME front end:
+    //   * `--target x86_64:elf64-x86_64-linux`      (ET_REL, an OBJECT)
+    //         -> `.eh_frame` 68 B + `.rela.eh_frame` 24 B
+    //   * `--target x86_64:pe64-x86_64-windows-exec` (an IMAGE)
+    //         -> `.xdata` 32 B + `.pdata` 36 B
+    //   * `--target x86_64:pe64-x86_64-windows`      (an OBJECT)
+    //         -> `.text` ONLY, rc=0, not one diagnostic
+    // The ELF arm is the one that settles it: it reads THIS field on the object
+    // path and writes a table out of it. `cfi` is attached by the compile
+    // pipeline from the LIR frame, which knows nothing about the output kind,
+    // so it arrives populated for every target/format pair alike.
+    //
+    // ⇒ The PE `.obj` arm's emptiness was a WRITER gap, not an input gap, and
+    // it is CLOSED (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO, 2026-08-27).
+    // `pe::encode`'s Obj arm now reads this field and emits `.pdata` +
+    // `.xdata`, relocated with the target's image-relative 32-bit row
+    // (`imagerel32` -> `IMAGE_REL_AMD64_ADDR32NB`), three per
+    // RUNTIME_FUNCTION. ✔RE-MEASURED at that commit on the same source:
+    // `--target x86_64:pe64-x86_64-windows` -> `.text` + `.xdata` 24 B +
+    // `.pdata` 36 B with 9 relocations, and the object linked by MinGW ld
+    // produced an image whose EXCEPTION directory grew by exactly the three
+    // 12-byte entries covering `sink`, `nonleaf` and `main`. The paragraph
+    // above is kept because it is the MEASUREMENT that found the gap, and a
+    // reader who meets the old claim in a stale copy needs to be able to see
+    // why it was wrong.
     std::optional<CfiFunction> cfi;
     // c116 (D-WIN64-SEH-FUNCLETS): the SEH scopes this function guards. Empty
     // for every function without a `__try` (the overwhelming majority).

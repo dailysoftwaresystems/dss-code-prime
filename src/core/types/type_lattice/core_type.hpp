@@ -87,14 +87,28 @@ enum class TypeKind : std::uint16_t {
     VolatileQual,
 
     // ── C23 nullptr_t (D-CSUBSET-NULLPTR / C23 §6.2.5, §6.4.4.6) ──
-    // The type of the predefined constant `nullptr`. A SEMANTIC-TIER-ONLY kind: it
-    // exists so the conversion rules can be ONE-WAY (nullptr_t → any pointer / bool,
-    // but nothing converts TO nullptr_t) and so `_Generic(nullptr, ...)` sees a
-    // distinct type — but the `nullptr` literal LOWERS to the target-agnostic null
-    // constant at the HIR tier (exactly like an integer-0 null pointer constant), so
-    // NullptrT NEVER reaches MIR (the `I_NullptrTypeInMir` verifier tripwire enforces
-    // the invariant). Appended AFTER VolatileQual (before Count_) so every
-    // pre-existing kind keeps its integer value — see the VolatileQual note above.
+    // The type of the predefined constant `nullptr`, and — since
+    // D-CSUBSET-NULLPTR-T-DECLARABLE — a REAL OBJECT TYPE you can declare, store,
+    // pass and return, with the size, alignment and representation of `void *` and
+    // exactly one value.
+    //
+    // ★ IT IS A SEMANTIC IDENTITY WITH A BORROWED REPRESENTATION, which is a
+    // different thing from the "semantic-tier-only" kind this used to be. The
+    // identity has to be distinct: the conversion rules are ONE-WAY (nullptr_t → any
+    // pointer / bool, but nothing converts TO nullptr_t), and `_Generic(nullptr,
+    // typeof(nullptr): …)` must not select the `void *` arm (✔MEASURED: gcc 13.3.0
+    // and clang 18.1.3 both select the nullptr_t arm). The representation does not:
+    // every tier below the semantic one sees a plain pointer, because
+    // `TypeInterner::representationType` PROJECTS the kind to `Ptr<Void>` at the
+    // semantic→HIR boundary — the same move `reprKind` makes for Enum and
+    // `bitIntContainerKind` for `_BitInt(N≤64)`, one tier higher because MIR's own
+    // vocabulary refuses this kind outright (`I_NullptrTypeInMir`, and `mir_text`'s
+    // table omits its spelling as a stated contract). Clang draws the line in the
+    // same place. So NullptrT still NEVER reaches MIR — but now because it is
+    // projected there, not because objects of the type are refused.
+    //
+    // Appended AFTER VolatileQual (before Count_) so every pre-existing kind keeps
+    // its integer value — see the VolatileQual note above.
     NullptrT,
 
     // ── C23 _BitInt(N) bit-precise integer (D-CSUBSET-BITINT / C23 §6.2.5) ──

@@ -1,0 +1,49 @@
+{
+  "$comment": "D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED (P42 lane V): the GNU `__`-wrapped spellings of the two linkage attributes DSS models -- `__weak__` and `__visibility__` -- across a real cross-TU link. BEFORE: every dunder spelling was a hard `error[H000C]` in every position, on objects and on functions, while the bare spelling compiled clean; the cause was that `linkageFrom`'s strict `linkageSpecifiers` lookup ran on RAW TOKEN TEXT while `linkageSpecifierIgnoredNames`, on the SAME tier, was `stripDunder`-normalized. AFTER: an attribute-position name is normalized through that one shared `stripDunder` before the map is asked, and a KEYWORD-spelled clause name is denied the map so `__attribute__((static))` can no longer silently rebind a global to internal linkage. NON-VACUITY, BOTH DIRECTIONS: a refused dunder spelling does not build at all, and an ACCEPTED-then-DISCARDED one makes `wfun`/`wd_lead`/`wd_tail` STRONG here so the link fails with a duplicate symbol -- nothing in this file can pass by accident. RED-ON-DISABLE: revert the position-aware lookup-name derivation in `src/hir/lowering/cst_to_hir.cpp` (`linkageFrom`) -> every dunder spelling returns to H000C and the program no longer compiles (the runner reports a compile failure, not exit 42). The three `__visibility__` rows are COMPILE-GATE witnesses and cu_a.c says so: hidden visibility does not move a statically linked return value, so its side-table half is pinned where it can be READ, in `HirLoweringC.GnuDunderLinkageSpellingsResolveLikeThePlainOnes` and `HirLoweringC.GnuDunderLinkageSpellingsApplyInObjectAndExternPositions`. VERIFIED against BOTH references, probed separately with per-compiler std flags (gcc REJECTS -std=c23): gcc 13.3.0 -std=c2x and clang 18.1.3 -std=c23, each -Wall -Wextra over both CUs -- zero errors, zero warnings -- and each linked binary exits 42. The release arm re-witnesses that a real optimizer PRESERVES weak binding rather than inlining through it.",
+  "language": "c",
+  "sources": [
+    "cu_a.c",
+    "cu_b.c"
+  ],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "cu_a.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "cu_a",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "cu_a",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "cu_a",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 using namespace dss;
 
@@ -183,4 +184,90 @@ TEST(NumberDecode, IntegerOverflowReturnsNullopt) {
     EXPECT_EQ(decodeInteger("0xFFFFFFFFFFFFFFFF", &s),
               std::uint64_t{0xFFFFFFFFFFFFFFFFull});
     EXPECT_EQ(decodeInteger("0x10000000000000000", &s), std::nullopt);
+}
+
+// ─── D-CSUBSET-BITINT-ZERO-LITERAL-EATEN-BY-THE-OCTAL-PREFIX ──────────────
+//
+// THE DEFECT, AT THE TIER IT LIVED IN. C's octal prefix is spelled `0`, so for
+// the literal `0` the longest-prefix scan consumed the ONLY digit and left an
+// empty body. `decodeInteger` has no "no digits" verdict and returned 0 (right
+// answer, by luck); `decodeBigInteger` DOES have one and returned nullopt — and
+// its caller reports nullopt as "no declared type can hold it", so a
+// well-formed `_BitInt` ZERO was refused as TOO LARGE.
+//
+// ★ The two decoders are the same grammar read twice, and this is the shape the
+// pins below fix in place: they now share ONE normalization, so the pair is
+// asserted TOGETHER on every case. A future divergence cannot hide in one of
+// them.
+TEST(NumberDecode, IntegerZeroSurvivesADigitValuedPrefix) {
+    auto const s = cStyle();
+    // The bare decimal spelling — the one that was broken.
+    EXPECT_EQ(decodeInteger("0", &s), std::uint64_t{0});
+    ASSERT_TRUE(decodeBigInteger("0", &s).has_value())
+        << "a digit-valued prefix that consumes the whole literal IS the "
+           "literal's digits (C 6.4.4.1: octal-constant := 0 | …) — returning "
+           "nullopt here made the caller report a ZERO as 'too large'";
+    EXPECT_EQ(*decodeBigInteger("0", &s), (std::vector<std::uint64_t>{0}));
+    // …and every ladder spelling that ALREADY worked must keep working.
+    for (auto const* t : {"00", "0x0", "0X0", "0b0", "0B0", "0o0", "0O0"}) {
+        SCOPED_TRACE(t);
+        EXPECT_EQ(decodeInteger(t, &s), std::uint64_t{0});
+        ASSERT_TRUE(decodeBigInteger(t, &s).has_value());
+        EXPECT_EQ(*decodeBigInteger(t, &s), (std::vector<std::uint64_t>{0}));
+    }
+}
+
+// THE OTHER DIRECTION, and it is what keeps the fix from being "return 0 for
+// anything empty": a prefix carrying a LETTER that is not a digit in its own
+// radix stays a pure marker, so an empty remainder is still MALFORMED. These
+// are the spellings the tokenizer already refuses (`0xwb` → P0001); the decoder
+// must not become the tier that silently accepts them if it ever sees one.
+TEST(NumberDecode, IntegerLetterBearingPrefixWithNoBodyStaysMalformed) {
+    auto const s = cStyle();
+    for (auto const* t : {"0x", "0X", "0b", "0B", "0o", "0O"}) {
+        SCOPED_TRACE(t);
+        EXPECT_EQ(decodeBigInteger(t, &s), std::nullopt)
+            << "'x'/'b'/'o' are not valid digits in radix 16/2/8, so the prefix "
+               "is a marker and the body is genuinely empty";
+    }
+}
+
+// AND THE VALUE-BEARING CASE, which is the pin that would catch a fix that
+// merely seeded a flag: `010` must stay EIGHT. Re-prepending the prefix digits
+// is value-neutral only because C's octal marker is a ZERO; a fix that dropped
+// or double-counted them shows up here.
+TEST(NumberDecode, IntegerDigitValuedPrefixDoesNotMoveANonZeroValue) {
+    auto const s = cStyle();
+    EXPECT_EQ(decodeInteger("010", &s), std::uint64_t{8});
+    ASSERT_TRUE(decodeBigInteger("010", &s).has_value());
+    EXPECT_EQ(*decodeBigInteger("010", &s), (std::vector<std::uint64_t>{8}));
+    EXPECT_EQ(decodeInteger("0777", &s), std::uint64_t{511});
+    EXPECT_EQ(*decodeBigInteger("0777", &s), (std::vector<std::uint64_t>{511}));
+    // The RADIX CLASS is unmoved too — `0` is an octal constant per C 6.4.4.1,
+    // which is what gives it the extra unsigned ladder candidates.
+    EXPECT_TRUE(integerLiteralIsPrefixed("0", &s));
+    EXPECT_TRUE(integerLiteralIsPrefixed("010", &s));
+    EXPECT_FALSE(integerLiteralIsPrefixed("10", &s));
+}
+
+// THE AGNOSTIC ARM. The rule is derived from the DECLARED radix, never from the
+// spelling `0`: a language whose octal marker is `Q` (not a digit in base 8)
+// keeps a strictly-marker prefix, while one whose marker is `7` (a valid base-8
+// digit) gets the same standalone reading C's `0` gets — and its VALUE is the
+// prefix's own digits, not zero. Without this the fix would read as a C-ism.
+TEST(NumberDecode, IntegerDigitValuedPrefixRuleIsDerivedFromTheDeclaredRadix) {
+    NumberStyle marker;                     // letter marker: never digits
+    marker.integerPrefixes.push_back({"Q", 8, "0-7", std::nullopt});
+    EXPECT_EQ(decodeBigInteger("Q", &marker), std::nullopt);
+    EXPECT_EQ(*decodeBigInteger("Q7", &marker), (std::vector<std::uint64_t>{7}));
+
+    NumberStyle digitish;                   // digit marker: stands alone
+    digitish.integerPrefixes.push_back({"7", 8, "0-7", std::nullopt});
+    ASSERT_TRUE(decodeBigInteger("7", &digitish).has_value());
+    EXPECT_EQ(*decodeBigInteger("7", &digitish), (std::vector<std::uint64_t>{7}))
+        << "the standalone prefix's VALUE is its own digits read in its own "
+           "radix — 0 would be a C-ism smuggled in as a default";
+    EXPECT_EQ(decodeInteger("7", &digitish), std::uint64_t{7});
+    // With a body it is a marker again, exactly as `010` is.
+    EXPECT_EQ(decodeInteger("71", &digitish), std::uint64_t{1});
 }

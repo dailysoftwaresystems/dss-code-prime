@@ -311,7 +311,13 @@ LirFuncLiveness analyzeFuncLiveness(Lir const& lir, LirFuncId fn) {
             // liveIn[B] = use[B] ∪ (liveOut[B] - def[B])
             VRegBitset newIn = out.liveOut[bi];
             newIn.subtractInPlace(def[bi]);
-            newIn.unionInPlace(use[bi]);
+            // `(void)`: `newIn` is built from scratch each iteration, so
+            // "did it grow" says nothing about the FIXPOINT — the word-wise
+            // comparison two lines down is what decides `changed` here. The
+            // discard is deliberate and now spelled, because the `[[nodiscard]]`
+            // on `unionInPlace` exists to make the OTHER kind (a forgotten
+            // result at the `liveOut` join above) a compile diagnostic.
+            (void)newIn.unionInPlace(use[bi]);
             // Detect-by-word: only the changed flag matters here.
             if (newIn.bits != out.liveIn[bi].bits) {
                 out.liveIn[bi] = std::move(newIn);
@@ -418,11 +424,13 @@ LirFuncLiveness analyzeFuncLiveness(Lir const& lir, LirFuncId fn) {
         std::uint32_t const start = (s.firstDef == UINT32_MAX) ? 0u : s.firstDef;
         std::uint32_t const end   = (s.lastUse > start) ? (s.lastUse + 1u)
                                                         : (start + 1u);
-        LirReg vreg{};
-        vreg.id         = id;
-        vreg.classKind  = static_cast<std::uint32_t>(s.cls);
-        vreg.isPhysical = 0;
-        out.ranges.push_back(LirLiveRange::make(vreg, start, end));
+        // D-LIR-POSITIONAL-LIRREG-INIT-MISCLASSIFIES-SILENTLY: this used to
+        // assemble the register field-by-field, which is the one remaining
+        // way to write `classKind` without the type system checking that the
+        // value IS a register class. `makeVirtualReg` states both facts —
+        // typed class, virtual — in one expression.
+        out.ranges.push_back(
+            LirLiveRange::make(makeVirtualReg(id, s.cls), start, end));
     }
     std::sort(out.ranges.begin(), out.ranges.end(),
               [](LirLiveRange const& a, LirLiveRange const& b) {

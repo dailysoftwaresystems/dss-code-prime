@@ -698,7 +698,14 @@ void appendExpectedActual(std::string& out, ParseDiagnostic const& d) {
         // (D-DIAG-PROSE-MESSAGE-RENDERS-WITH-A-BARE-GOT-PREFIX).
         out += d.actual;
     } else {
-        out += diagnosticCodeName(d.code);
+        // D-DIAG-TWO-CODE-RENDERINGS hazard (H2). This used to be
+        // `diagnosticCodeName(d.code)` — a SECOND copy of the code on a line
+        // whose bracket already names it, which any de-duplicating census
+        // double-counts unless it normalises first. Stating the fact instead of
+        // echoing the header removes the hazard rather than relocating it; the
+        // one owner of the wording is `kNoDiagnosticDetailRecorded`, shared with
+        // the LSP's `composeMessage` so the two surfaces cannot drift.
+        out += kNoDiagnosticDetailRecorded;
     }
 }
 
@@ -729,18 +736,34 @@ std::string DiagnosticReporter::format(ParseDiagnostic const& d,
                                        BufferRegistry const& bufs) const {
     std::string out;
 
-    // Header line: <severityName>[<codePrefix>]: <contextPrefix><expected/actual prose>
-    // The two bracket-rendered fields are distinct concepts: <codePrefix>
-    // is the single-letter band (`P`/`D`/`H`/...) from `diagnosticCodePrefix`,
-    // while <contextPrefix> is the per-target `[target=...]` stamp set by
-    // `program::mergeWithTargetContext`.
+    // Header line: <severityName>[<diagnosticCodeName>]: <contextPrefix><expected/actual prose>
+    //
+    // ★★★ D-DIAG-TWO-CODE-RENDERINGS: THE BRACKET HOLDS THE SYMBOLIC NAME, AND
+    // THIS SITE IS THE ONE THAT MOVED. It used to render `diagnosticCodePrefix`
+    // (the 4-hex-digit band form, `error[P0009]:`) while the CLI's buffer-less
+    // one-liner, both `dump_predefined_macros` emitters, the LSP `code` field
+    // and `lsp/workspace_project` all rendered `diagnosticCodeName` — so ONE
+    // concept had TWO surface spellings and which one a reader got depended on
+    // whether the diagnostic happened to carry a source buffer. The full
+    // argument for the name over the hex, and the four measurements that
+    // refuted the hex, are in `diagnostic_reporter.hpp` above
+    // `kNoDiagnosticDetailRecorded` — read them before changing this line back.
+    //
+    // ⚠ `diagnosticCodePrefix` is NOT dead: `hir_text.cpp`'s `@diag(code N)`
+    // handler still renders it, deliberately, to show an operator what an
+    // unallocated code WOULD have looked like. That is a different surface
+    // (HIR text) with a different reader, and it is not a diagnostic header.
+    //
+    // The two bracket-rendered fields remain distinct concepts: the code
+    // identifies the diagnostic, while <contextPrefix> is the per-target
+    // `[target=...]` stamp set by `program::mergeWithTargetContext`.
     // D-MERGE-DEDUP-PREFIX-COLLISION: contextPrefix is rendered here
     // (not stored in `actual`) so the dedup hash key — which includes
     // `actual` — sees the un-prefixed diagnostic.
     std::format_to(std::back_inserter(out),
                    "{}[{}]: ",
                    severityName(d.severity),
-                   diagnosticCodePrefix(d.code));
+                   diagnosticCodeName(d.code));
     out += d.contextPrefix;
     appendExpectedActual(out, d);
     out += '\n';

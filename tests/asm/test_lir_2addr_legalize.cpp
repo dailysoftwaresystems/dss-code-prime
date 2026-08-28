@@ -118,10 +118,9 @@ struct Fixture {
     auto const rax = *f.schema->registerByName("rax");
     auto const rbx = *f.schema->registerByName("rbx");
     auto const rcx = *f.schema->registerByName("rcx");
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    f.rax = LirReg{static_cast<std::uint32_t>(rax), 1, cls};
-    f.rbx = LirReg{static_cast<std::uint32_t>(rbx), 1, cls};
-    f.rcx = LirReg{static_cast<std::uint32_t>(rcx), 1, cls};
+    f.rax = makePhysicalReg(static_cast<std::uint32_t>(rax), LirRegClass::GPR);
+    f.rbx = makePhysicalReg(static_cast<std::uint32_t>(rbx), LirRegClass::GPR);
+    f.rcx = makePhysicalReg(static_cast<std::uint32_t>(rcx), LirRegClass::GPR);
     return f;
 }
 

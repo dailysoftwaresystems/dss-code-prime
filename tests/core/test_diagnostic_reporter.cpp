@@ -809,7 +809,9 @@ TEST(ReporterFormat, IncludesPrefixSeverityAndCaret) {
     auto out = r.format(r.all()[0], bufs);
     // Spot-checks — exact pretty-print is intentionally not byte-locked
     // so we can polish the renderer without flaking tests.
-    EXPECT_NE(out.find("error[P0001]"), std::string::npos);
+    // D-DIAG-TWO-CODE-RENDERINGS: the header bracket holds the SYMBOLIC NAME on
+    // every surface now, not the 4-hex-digit band form. Was `error[P0001]`.
+    EXPECT_NE(out.find("error[P_UnexpectedToken]:"), std::string::npos);
     EXPECT_NE(out.find("expected ';' or ','"), std::string::npos);
     EXPECT_NE(out.find("got '}'"), std::string::npos);
     EXPECT_NE(out.find("var x = 1 + 2 }"), std::string::npos);
@@ -1060,7 +1062,8 @@ TEST(ReporterFormat, UnknownBufferDoesNotCrash) {
     r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error,
                       BufferId{42}, 0, 1));
     auto out = r.formatAll(bufs);
-    EXPECT_NE(out.find("error[P0003]"), std::string::npos);
+    // D-DIAG-TWO-CODE-RENDERINGS: symbolic name in the bracket. Was `error[P0003]`.
+    EXPECT_NE(out.find("error[P_UnknownToken]:"), std::string::npos);
     EXPECT_NE(out.find("<unknown-buffer:42>"), std::string::npos);
 }
 
@@ -1131,7 +1134,8 @@ TEST(ReporterFormat, PastEndSpanWithNewlineInTrailingCapacity) {
 
     // The contract: renders, does not abort, and never escapes the buffer.
     auto const out = r.format(r.all()[0], bufs);
-    EXPECT_NE(out.find("error[P0003]"), std::string::npos);
+    // D-DIAG-TWO-CODE-RENDERINGS: symbolic name in the bracket. Was `error[P0003]`.
+    EXPECT_NE(out.find("error[P_UnknownToken]:"), std::string::npos);
     EXPECT_NE(out.find("<tfc80>"), std::string::npos);
     // Past-end offsets clamp to the buffer, exactly as SourceBuffer::lineCol
     // already did — so this renders the LAST line, never heap garbage.

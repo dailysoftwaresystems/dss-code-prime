@@ -1560,6 +1560,16 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     //       `widthBytes` bytes. A bias that overflows the patch
     //       slot would silently corrupt every patched site
     //       (silent-failure M1 convergence).
+    //   (f) `imageRelative` ⇒ NOT `pcRelative` and NOT `tls`, and
+    //       `widthBytes != 0` — D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO.
+    //       An RVA is measured from the IMAGE BASE. "Relative to the
+    //       patch site" and "relative to the thread pointer" are two
+    //       other origins, and a row claiming two origins does not say
+    //       which value a walker should write — it says the author
+    //       copied a neighbouring row. Enforced HERE as well as in the
+    //       loader for the same reason rule (e) is: a schema built
+    //       programmatically (test fixture, fuzz harness) never sees
+    //       the loader.
     //
     // Rule (a) — `widthBytes ∈ {4, 8}` — is enforced by the JSON
     // loader before this code runs.
@@ -1604,6 +1614,49 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "patched site.",
                                  r.name, r.addendBias,
                                  r.widthBytes, sMin, sMax));
+            }
+        }
+        // Rule (f) — the RVA row's origin must be unambiguous.
+        if (r.imageRelative) {
+            if (r.pcRelative) {
+                fail(std::format("/relocations/{}/imageRelative", i),
+                     std::format("relocation '{}': 'imageRelative' and "
+                                 "'pcRelative' are both true, but an "
+                                 "image-relative value is measured from the "
+                                 "IMAGE BASE and a pc-relative one from the "
+                                 "PATCH SITE. A row cannot declare two "
+                                 "origins — a walker following either "
+                                 "reading writes a number the other side "
+                                 "will resolve to the wrong address.",
+                                 r.name));
+            }
+            if (r.tls) {
+                fail(std::format("/relocations/{}/imageRelative", i),
+                     std::format("relocation '{}': 'imageRelative' and 'tls' "
+                                 "are both true, but a thread-pointer offset "
+                                 "lives in a PER-THREAD coordinate space that "
+                                 "has no image base. An RVA computed from one "
+                                 "would name a byte of the image chosen by "
+                                 "whichever thread happened to ask.",
+                                 r.name));
+            }
+            if (r.widthBytes == 0) {
+                fail(std::format("/relocations/{}/widthBytes", i),
+                     std::format("relocation '{}': 'imageRelative' is true "
+                                 "but 'widthBytes' is 0 — an RVA is a "
+                                 "concrete-width field (PE uses 4) and a "
+                                 "zero-width row states no patch to make.",
+                                 r.name));
+            }
+            if (r.formulaKind != RelocFormulaKind::Linear) {
+                fail(std::format("/relocations/{}/imageRelative", i),
+                     std::format("relocation '{}': 'imageRelative' is a "
+                                 "Linear-only property, but this row declares "
+                                 "formula '{}', which encodes its own operand "
+                                 "placement into an instruction word. An RVA "
+                                 "is a DATA field.",
+                                 r.name,
+                                 relocFormulaName(r.formulaKind)));
             }
         }
         // Rule (e) — D-LK6-1 closure coherence: non-Linear formulas

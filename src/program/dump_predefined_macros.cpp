@@ -1,7 +1,7 @@
 #include "program/dump_predefined_macros.hpp"
 
 #include "analysis/preprocess/preprocessor.hpp"   // mergePredefinedMacros — THE owner
-#include "core/types/config_path_walk.hpp"   // findShippedConfigDir (the SHARED shippedLibDirs resolution)
+#include "core/types/config_path_walk.hpp"   // resolveSystemDirs — THE owner of the shippedLibDirs walk
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -40,9 +40,16 @@ namespace {
 // The CODE SPELLING and the SEVERITY SPELLING still have exactly one owner
 // (`diagnosticCodeName` / `severityName`), so nothing about the shape is
 // duplicated here beyond the `<<` chain itself.
+// D-DIAG-TWO-CODE-RENDERINGS: this is the FOURTH render surface, and the row
+// that filed the defect did not name it — it listed `program.cpp`,
+// `diagnostic_reporter.cpp` and `lsp/diagnostic_translator.cpp` only. It was
+// already spelling the code the canonical way (`diagnosticCodeName`); what it
+// shared with the CLI's buffer-less arm was the `] ` punctuation, so it is
+// brought to `]: ` here for the same reason. Finding it required grepping for
+// the RENDERER rather than trusting the row's own list.
 void emitLoud(std::ostream& err, DiagnosticCode code, std::string_view message) {
     err << severityName(DiagnosticSeverity::Error) << '['
-        << diagnosticCodeName(code) << "] " << message << '\n';
+        << diagnosticCodeName(code) << "]: " << message << '\n';
 }
 
 // Print a config document's own diagnostics verbatim, severity preserved.
@@ -60,8 +67,9 @@ void emitLoud(std::ostream& err, DiagnosticCode code, std::string_view message) 
 void emitConfigDiagnostics(std::ostream&                     err,
                            std::span<ConfigDiagnostic const> diags) {
     for (ConfigDiagnostic const& d : diags) {
+        // `]: ` for the same D-DIAG-TWO-CODE-RENDERINGS reason as `emitLoud`.
         err << severityName(d.severity) << '[' << diagnosticCodeName(d.code)
-            << "] " << d.path << ": " << d.message << '\n';
+            << "]: " << d.path << ": " << d.message << '\n';
     }
 }
 
@@ -522,17 +530,22 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
         // same reason the collision arm below prints nothing partial.
         //
         // The search path is the LANGUAGE's own `semantics.shippedLibDirs`,
-        // resolved by the SHARED `findShippedConfigDir` (`$DSS_CONFIG_ROOT`, else
-        // the cwd walk) — the same resolution `applySystemDirs` performs for a
-        // real compile, so the dump reads the same corpus the compile would.
-        std::vector<std::filesystem::path> systemDirs;
-        for (std::string const& sub : grammar->semantics().shippedLibDirs) {
-            if (auto const resolved = findShippedConfigDir(sub)) {
-                std::error_code ec;
-                auto const abs = std::filesystem::absolute(*resolved, ec);
-                systemDirs.push_back(ec ? *resolved : abs);
-            }
-        }
+        // resolved by `resolveSystemDirs` — the SAME call the compile path makes
+        // (through `applySystemDirs`), so the dump reads the same corpus the
+        // compile would.
+        //
+        // ⚠ THIS USED TO BE A PRIVATE COPY OF THAT WALK, and "the same
+        // resolution" was a claim in a comment rather than a shared call —
+        // D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS.
+        // A copy is exactly how this seam broke before
+        // ([[D-PROGRAM-APPLY-SYSTEM-DIRS-IGNORED-DSS-CONFIG-ROOT]]: the driver's
+        // own copy silently stopped reading `$DSS_CONFIG_ROOT`), and it matters
+        // more here than almost anywhere else — this instrument exists to verify
+        // a leg's macro identity, so a dump resolving a DIFFERENT corpus than the
+        // compiler would report a different answer than the compiler gives, from
+        // the very tool used to check the compiler.
+        std::vector<std::filesystem::path> const systemDirs =
+            resolveSystemDirs(*grammar);
         {
             DiagnosticReporter reqRep;
             std::array<std::pair<std::span<PredefinedMacroDef const>,

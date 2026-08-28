@@ -3385,3 +3385,266 @@ TEST(CoffForeignObject, AMixedSelectionPairIsGovernedByTheStricterPromise) {
             << "the promise must be read off BOTH members: " << got.messages;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE THIRD WALKER: A DECLARED SECTION ALIGNMENT THIS READER USED TO DROP
+//    D-FORMAT-MACHO-SECTION-ALIGN-EMITTED-RAW-NOT-LOG2 (the read-side half)
+//
+// That row's closing work says, verbatim: *"Check the other walkers in the same
+// pass: the question 'is this field an exponent or a count' has one right answer
+// per format and this is the kind of mistake that is made once per writer."*
+// Running that sweep across the READ direction found the same shape as the
+// write-side defect the row closed, one file over:
+//
+//   ELF     `elf_object_reader.cpp`    `sh_addralign`, a BYTE COUNT   -> carried
+//   Mach-O  `macho_object_reader.cpp`  `section_64.align`, a LOG2     -> carried
+//   PE/COFF `coff_object_reader.cpp`   `IMAGE_SCN_ALIGN_*BYTES`       -> DROPPED
+//
+// ✔MEASURED 2026-08-27, before the fix: the identifier `Alignment` did not occur
+// in `coff_object_reader.cpp` at all, and neither of its two `AssembledData`
+// construction sites assigned `.alignment` -- so every atom read out of a COFF
+// object arrived at the newtype's default of ONE BYTE. Silent, because dropping
+// a constraint produces a merge that succeeds.
+//
+// ✔MEASURED against the references, probed SEPARATELY, on `_Alignas(32) const
+// unsigned char wide_ro[64]`: mingw-gcc AND clang `--target=x86_64-pc-windows-msvc`
+// both stamp `.rdata` with IMAGE_SCN_ALIGN_32BYTES, and both stamp an explicit
+// align class on EVERY section they emit. The dropped field was carrying real
+// producer intent on ordinary input, not a theoretical corner.
+//
+// ★ RED ON DISABLE: delete the `di.alignment = alignFromCharacteristics(...)`
+// line at either `AssembledData` site in `coff_object_reader.cpp` and the
+// matching case below goes red -- the named-atom site is pinned by
+// `DeclaredSectionAlignmentReachesTheAtom`, the synthetic-gap site by
+// `GapAtomsInheritTheirSectionsDeclaredAlignment`.
+// ⚠ AND THE PIN IS NOT VACUOUS IN THE OTHER DIRECTION: every case below states
+// an alignment DIFFERENT from the 1-byte default, and
+// `AlignClassIsAnOrdinalNotAnExponent` separates the three encodings that could
+// each be mistaken for one another -- a reader treating the class as a raw
+// exponent answers 64 where 32 is right, and one treating it as a byte count
+// answers 6.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Section Characteristics carrying one explicit IMAGE_SCN_ALIGN_*BYTES class.
+// Class N means 2^(N-1) bytes: 1 -> 1, 5 -> 16, 6 -> 32, 14 -> 8192.
+[[nodiscard]] constexpr std::uint32_t rdataWithAlignClass(std::uint32_t cls) {
+    return 0x40000040u | (cls << 20);   // INITIALIZED_DATA|READ + the class
+}
+
+// One `.rdata` object `datum` in a section whose Characteristics are `chars`.
+[[nodiscard]] std::vector<std::uint8_t>
+objWithRdataChars(std::uint32_t chars, std::vector<std::uint8_t> const& body) {
+    return buildCoff({BSec{".rdata", chars, body, {}}},
+                     {BSym{"datum", 0, 1, 0, kClassExternal, std::nullopt}});
+}
+
+// Read one hand-built object, spelling out the diagnostics on failure -- a read
+// refused for an unrelated reason would otherwise read as an alignment defect.
+[[nodiscard]] std::optional<AssembledModule>
+readOneObject(std::vector<std::uint8_t> const& obj, Loaded const& loaded,
+              std::string& why) {
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format,
+                                         rep, CompilationUnitId{1});
+    for (auto const& d : rep.all()) { why += d.actual; why += '\n'; }
+    return got;
+}
+
+} // namespace
+
+TEST(CoffForeignObject, DeclaredSectionAlignmentReachesTheAtom) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // class -> the byte alignment the atom must carry. The 32 case is the one
+    // the references were MEASURED emitting for `_Alignas(32)`; 1 and 2 bracket
+    // the low end so a reader returning a constant cannot pass.
+    struct AlignCase { std::uint32_t cls; std::uint32_t bytes; };
+    for (auto const& c : std::vector<AlignCase>{{1u, 1u}, {2u, 2u}, {4u, 8u},
+                                                {5u, 16u}, {6u, 32u}, {9u, 256u}}) {
+        SCOPED_TRACE("IMAGE_SCN_ALIGN class " + std::to_string(c.cls));
+        std::string why;
+        auto const got = readOneObject(
+            objWithRdataChars(rdataWithAlignClass(c.cls), {1, 2, 3, 4}),
+            loaded, why);
+        ASSERT_TRUE(got.has_value()) << why;
+        auto const* item = dataNamed(*got, "datum");
+        ASSERT_NE(item, nullptr) << "the `.rdata` object did not read back";
+        EXPECT_EQ(item->alignment.bytes(), c.bytes)
+            << "IMAGE_SCN_ALIGN_*BYTES declares the producer's alignment for "
+               "these bytes; dropping it hands the merge an atom it may place "
+               "anywhere, which is an UNDER-alignment and therefore silent";
+    }
+}
+
+TEST(CoffForeignObject, AlignClassIsAnOrdinalNotAnExponent) {
+    // The whole point of the parent row: three plausible readings of one field,
+    // and only one is right. Class 6 means 2^(6-1) = 32 bytes.
+    //   * as an ORDINAL (correct)   -> 32
+    //   * as a raw LOG2 EXPONENT    -> 64
+    //   * as a raw BYTE COUNT       -> 6, not even a power of two
+    // A pin on 32 alone would also pass for a reader that shifted by the right
+    // amount for the wrong reason, so the two wrong answers are named too.
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::string why;
+    auto const got = readOneObject(
+        objWithRdataChars(rdataWithAlignClass(6u), {7, 7, 7, 7}), loaded, why);
+    ASSERT_TRUE(got.has_value()) << why;
+    auto const* item = dataNamed(*got, "datum");
+    ASSERT_NE(item, nullptr);
+    EXPECT_EQ(item->alignment.bytes(), 32u);
+    EXPECT_NE(item->alignment.bytes(), 64u)
+        << "reading the class as a raw log2 exponent doubles every alignment";
+    EXPECT_NE(item->alignment.bytes(), 6u)
+        << "reading the class as a raw byte count is not even a power of two";
+}
+
+TEST(CoffForeignObject, UnspecifiedAlignClassTakesTheReferencesDefault) {
+    // ✔MEASURED 2026-08-27, by zeroing the align nibble of a real mingw-gcc
+    // `.rdata` section header IN PLACE and re-reading the same file:
+    //   GNU binutils `objdump -h`   class 6 -> `2**5`,  class 0 -> `2**4`
+    //   `lld-link`                  accepts the class-0 object, rc=0
+    // i.e. the reference reader answers SIXTEEN for "the producer declared
+    // nothing", and LLVM's `coff_section::getAlignment()` spells that default
+    // out. Answering 1 here would put DSS below every reference on identical
+    // bytes, in the under-aligning direction.
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::string why;
+    auto const got = readOneObject(objWithRdataChars(0x40000040u, {1, 1, 1, 1}),
+                                   loaded, why);   // align class 0
+    ASSERT_TRUE(got.has_value()) << why;
+    auto const* item = dataNamed(*got, "datum");
+    ASSERT_NE(item, nullptr);
+    EXPECT_EQ(item->alignment.bytes(), 16u)
+        << "class 0 is 'unspecified', and the reference readers resolve that "
+           "to 16 bytes";
+}
+
+TEST(CoffForeignObject, LegacyNoPadBitMeansByteAlignment) {
+    // IMAGE_SCN_TYPE_NO_PAD (0x8) is the pre-align-class spelling of
+    // ALIGN_1BYTES and the reference readers still honour it. Without it, a
+    // NO_PAD section carrying class 0 would take the 16-byte default -- an
+    // OVER-alignment claimed for bytes whose producer asked for none.
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::string why;
+    auto const got = readOneObject(objWithRdataChars(0x40000048u, {2, 2, 2, 2}),
+                                   loaded, why);   // class 0 | NO_PAD
+    ASSERT_TRUE(got.has_value()) << why;
+    auto const* item = dataNamed(*got, "datum");
+    ASSERT_NE(item, nullptr);
+    EXPECT_EQ(item->alignment.bytes(), 1u);
+}
+
+TEST(CoffForeignObject, AlignmentAboveWhatTheNewtypeModelsDegradesToByte) {
+    // COFF encodes up to 8192 (class 14); the `Alignment` newtype stops at 256.
+    // The degrade is DOWNWARD on purpose and is the only safe direction here:
+    // it can only make the merge place the atom more freely, which shows up as
+    // a layout difference. Substituting some "reasonable" larger alignment
+    // instead would let the atom ride at an alignment nothing in the input
+    // declared -- a false fact about our own output, which is what the parent
+    // row was filed about in the first place.
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    for (std::uint32_t cls : {10u, 12u, 14u}) {   // 512, 2048, 8192
+        SCOPED_TRACE("IMAGE_SCN_ALIGN class " + std::to_string(cls));
+        std::string why;
+        auto const got = readOneObject(
+            objWithRdataChars(rdataWithAlignClass(cls), {3, 3, 3, 3}),
+            loaded, why);
+        ASSERT_TRUE(got.has_value())
+            << "an alignment we cannot model is not a reason to refuse an "
+               "object every reference linker accepts: " << why;
+        auto const* item = dataNamed(*got, "datum");
+        ASSERT_NE(item, nullptr);
+        EXPECT_EQ(item->alignment.bytes(), 1u);
+    }
+}
+
+TEST(CoffForeignObject, GapAtomsInheritTheirSectionsDeclaredAlignment) {
+    // The synthetic-gap site (D-LK-COFF-READER-ANONYMOUS-GAP-ATOMS) is a SECOND
+    // `AssembledData` construction, and a fix applied only to the named-atom
+    // site would leave it at the 1-byte default -- the same "one site quietly
+    // reaching its own conclusion about one field" the parent row is about.
+    //
+    // ⚠ THE FIRST DRAFT PUT `datum` AT OFFSET 0 AND PRODUCED NO GAP AT ALL --
+    // a lone symbol at 0 takes the whole section by the geometry fallback, so
+    // the test would have asserted nothing about the second site. Its own
+    // "did a gap actually appear?" guard is what caught that, and the shape
+    // below is the one `GccStyleAnonymousRdataJumpTableIsFullyReconstructed`
+    // already proves reconstructs a gap: `datum` starts at 0x20, so [0,0x20)
+    // is unowned and becomes the ANONYMOUS atom.
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<std::uint8_t> rdata(0x40, 0u);
+    for (std::size_t i = 0; i < rdata.size(); ++i)
+        rdata[i] = static_cast<std::uint8_t>(i);
+    auto const obj = buildCoff(
+        {BSec{".rdata", rdataWithAlignClass(6u), rdata, {}}},
+        {BSym{"datum", 0x20, 1, 0, kClassStatic, std::nullopt}});
+    std::string why;
+    auto const got = readOneObject(obj, loaded, why);
+    ASSERT_TRUE(got.has_value()) << why;
+    ASSERT_EQ(got->dataItems.size(), 2u)
+        << "expected the anonymous [0,0x20) gap plus `datum` [0x20,0x40); "
+           "without a gap this test asserts nothing about the second "
+           "construction site";
+    AssembledData const* gapAtom = nullptr;
+    for (auto const& d : got->dataItems) {
+        bool named = false;
+        for (auto const& sy : got->symbols) named = named || (sy.symbol == d.symbol);
+        if (!named) gapAtom = &d;
+    }
+    ASSERT_NE(gapAtom, nullptr) << "no ANONYMOUS atom -- the gap arm never ran";
+    EXPECT_EQ(gapAtom->alignment.bytes(), 32u)
+        << "an atom carved out of a section carries that section's declared "
+           "alignment whether or not a symbol names it";
+    for (auto const& d : got->dataItems) {
+        EXPECT_EQ(d.alignment.bytes(), 32u)
+            << "every atom carved out of one section carries that section's "
+               "declared alignment, named or anonymous";
+    }
+}
+
+TEST(CoffForeignObject, AllThreeObjectReadersCarryADeclaredAlignment) {
+    // ★ THE SWEEP ITSELF, MADE TESTABLE. The parent row's instruction is a
+    // claim about THREE files, and the honest way to keep it true is to ask all
+    // three the same question through their own vocabularies rather than to
+    // assert in a comment that they agree.
+    //
+    // Same shape, same declared 32-byte alignment, three encodings:
+    //   COFF    IMAGE_SCN_ALIGN_32BYTES == class 6 == (log2 + 1) << 20
+    //   ELF     sh_addralign == 32, a raw byte count
+    //   Mach-O  section_64.align == 5, a raw log2 exponent
+    // A reader that dropped the field, or read it in a sibling's encoding,
+    // fails HERE with the other two still green -- which is what makes this a
+    // sweep and not three unrelated pins.
+    //
+    // ⚠ THE FIRST DRAFT OF THIS COMMENT CITED TWO SIBLING PINS THAT DID NOT
+    // EXIST -- one of them in a file (`test_elf_object_reader.cpp`) that is not
+    // in this tree at all; the ELF reader's suite is
+    // `test_relocatable_object_reader.cpp`. ✔MEASURED 2026-08-27 while checking
+    // it: `grep` for an EXPECT/ASSERT on `alignment` across `tests/link/**`
+    // returned NOTHING outside this block. Both sibling readers CARRIED the
+    // field and NEITHER was pinned for it, so "the other two are fine" rested
+    // on nobody having touched them. The legs now exist, added in the same
+    // pass, and it is those the sweep leans on:
+    //   tests/link/test_relocatable_object_reader.cpp
+    //       RelocatableObjectReader.DeclaredSectionAlignmentSurvivesTheRoundTrip
+    //   tests/link/test_macho_object_reader.cpp
+    //       MachOObjectReader.DeclaredSectionAlignmentSurvivesTheRoundTrip
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::string why;
+    auto const got = readOneObject(
+        objWithRdataChars(rdataWithAlignClass(6u), {5, 5, 5, 5}), loaded, why);
+    ASSERT_TRUE(got.has_value()) << why;
+    auto const* item = dataNamed(*got, "datum");
+    ASSERT_NE(item, nullptr);
+    EXPECT_EQ(item->alignment.bytes(), 32u)
+        << "the COFF leg of the three-reader sweep";
+}

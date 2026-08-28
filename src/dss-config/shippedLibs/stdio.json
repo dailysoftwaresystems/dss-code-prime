@@ -94,8 +94,8 @@
     { "name": "_wpopen", "signature": "fn(ptr<u16>, ptr<u16>) -> ptr<struct \"FILE\" opaque>", "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] }
   ],
   "macros": [
-    { "name": "stdin", "variants": [{ "when": { "format": "pe" }, "replacement": "(__acrt_iob_func(0))" }, { "when": { "format": "macho" }, "replacement": "__stdinp" }] },
-    { "name": "stdout", "variants": [{ "when": { "format": "pe" }, "replacement": "(__acrt_iob_func(1))" }, { "when": { "format": "macho" }, "replacement": "__stdoutp" }] },
-    { "name": "stderr", "variants": [{ "when": { "format": "pe" }, "replacement": "(__acrt_iob_func(2))" }, { "when": { "format": "macho" }, "replacement": "__stderrp" }] }
+    { "name": "stdin", "variants": [{ "when": { "format": "pe" }, "replacement": "(__acrt_iob_func(0))" }, { "when": { "format": "macho" }, "replacement": "__stdinp" }, { "when": { "format": "elf" }, "replacement": "stdin" }] },
+    { "name": "stdout", "variants": [{ "when": { "format": "pe" }, "replacement": "(__acrt_iob_func(1))" }, { "when": { "format": "macho" }, "replacement": "__stdoutp" }, { "when": { "format": "elf" }, "replacement": "stdout" }] },
+    { "name": "stderr", "variants": [{ "when": { "format": "pe" }, "replacement": "(__acrt_iob_func(2))" }, { "when": { "format": "macho" }, "replacement": "__stderrp" }, { "when": { "format": "elf" }, "replacement": "stderr" }] }
   ]
 }

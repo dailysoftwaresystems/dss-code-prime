@@ -485,8 +485,36 @@ rangeCrossesCall(LirLiveRange const& r,
 //     pre-emit (CQO writes RDX before IDIV reads operand 0)
 //     destroys the operand's value mid-op. Silent miscompile
 //     (operand becomes sign-extension of dividend; 100/0 = trap).
-// Outputs are not forbidden (the op reads the operand BEFORE
-// writing outputs; same-reg overlap is fine).
+// ★★★ OUTPUTS ARE NOT FORBIDDEN, AND THE REASON IS DIFFERENT FOR THE TWO
+// KINDS OF VALUE THIS EXCLUSION SET GOVERNS. THE OLD ONE-LINE ARGUMENT
+// COVERED ONLY THE FIRST AND WAS SILENTLY CARRIED OVER TO THE SECOND, WHICH
+// IS THE DEFECT
+// D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED NAMES.
+//   - An OPERAND OF THIS INSTRUCTION may share a register with an implicit
+//     output, and that is safe ON ITS OWN TERMS: the op reads its operands
+//     before it writes its outputs. This half needs no invariant, and it is
+//     what the argument was originally about.
+//   - A RANGE THAT MERELY CROSSES this position — the case this very function
+//     collects — is NOT read by the instruction, so "reads before writes"
+//     says nothing whatever about it. A register the instruction WRITES
+//     destroys such a value exactly as a declared clobber would. What keeps
+//     it safe is a SEPARATE guarantee this exclusion set does not restate:
+//     `outputs ⊆ clobbered`, so the clobber half of the union already
+//     contains every output.
+// ⇒ the omission is not free-standing; it is a DEPENDENCY, and the guarantee
+// is enforced at both of the type's producers rather than assumed: the
+// `.target.json` loader validates it for the per-OPCODE carrier, and
+// `LirBuilder::regConstraintPoolAdd` refuses a per-INSTRUCTION entry that
+// violates it (`ImplicitRegisterConstraint::firstOutputNotClobbered` is the
+// one implementation of the rule; the inline-asm lowering pre-validates with
+// the same query, because a tier fed by USER text owes a diagnostic rather
+// than a process kill). ⛔ DO NOT "simplify" this by teaching the exclusion
+// set to forbid outputs instead: that diverges the per-instruction path from
+// the per-opcode one and pessimises every compound op (`idiv`, shift-by-CL)
+// whose output legitimately aliases an operand — the first bullet above.
+// ⛔ And do not delete the dependency sentence as redundant: an argument that
+// silently rests on a guarantee it does not name is what let the
+// per-instruction carrier ship for a cycle with no producer-side check at all.
 //
 // ★ CHOKEPOINT (2026-08-15, D-LIR-PER-INST-REG-CONSTRAINTS): the union is no
 // longer built here. It comes from `effectiveForbiddenOrdinals`, which reads

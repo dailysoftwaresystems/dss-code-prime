@@ -3,6 +3,7 @@
 #include "core/types/attribute_naming.hpp"   // stripDunder (shared with the packed scan)
 #include "core/types/char_decode.hpp"
 #include "core/types/hir_lowering_config.hpp"
+#include "core/types/integer_literal_ladder.hpp"   // C 6.4.4.1 ladder (D-PP-IF-UNSIGNED-INTMAX)
 #include "core/types/literal_close_token.hpp"   // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN
 #include "core/types/number_decode.hpp"
 #include "core/types/operator_table.hpp"
@@ -35,7 +36,49 @@ using detail::applyBinaryInt;
 using detail::applyUnaryInt;
 using detail::asBool;
 using detail::asInt64;
+using detail::asIntBits;
 using detail::makeBoolLiteral;
+
+// ── C 6.10.1p4: THE PHASE-4 EVALUATION TYPE (D-PP-IF-UNSIGNED-INTMAX) ────────
+//
+// A `#if`/`#elif` controlling expression is evaluated with every operand acting
+// as `intmax_t` or `uintmax_t` -- NOT as the operand's own C type. This mints an
+// operand carrying that type, and it is the ONE site that says what a `#if`
+// operand's (width, signedness) is.
+//
+// ★★ BOTH HALVES ARE LOAD-BEARING, AND BOTH WERE BROKEN. Every leaf used to be
+// stamped `TypeKind::I32` with the value cast to int64. Because `intOpDomain`
+// derives the operation's domain from the operands' CORES, that made the whole
+// evaluator run in **32-bit signed** -- not the "signed int64" the row and the
+// old comment here both claimed:
+//   * WIDTH: `wrapToIntTarget` truncated both operands to 32 bits before every
+//     comparison, so `#if 9223372036854775807 > 0` -- "is INT64_MAX positive"
+//     -- took the FALSE arm, as did `#if 3000000000 > 0` and
+//     `#if 2147483647 + 1 > 0`. Ordinary signed code, no unsigned suffix in
+//     sight.
+//   * SIGNEDNESS: the literal's unsignedness was discarded at the leaf, so
+//     `#if -1 < 0u` answered with a SIGNED comparison and took the wrong arm.
+// Both produced a perfectly successful compile of a DIFFERENT program, which is
+// why the defect survived four months labelled "fail-loud": a pin that asserts
+// "compiles clean" is structurally blind to it. See the pin harness, which reads
+// the taken arm out of the emitted object rather than from an exit code.
+//
+// ⚠ WIDTH IS ALWAYS 64 AND IS NOT THE LADDER'S ANSWER. C 6.4.4.1 types `1` as a
+// 32-bit `int`, which is the right answer to a question phase 4 is not asking.
+// Take the ladder's SIGNEDNESS and evaluate at width 64, or the 32-bit domain
+// comes straight back.
+//
+// The value is stored in the int64 arm as the raw two's-complement BIT PATTERN,
+// which is the representation `asIntBits` reads behind an established domain and
+// the one `applyBinaryInt`/`applyUnaryInt` already produce for their own
+// results. A `uint64_t` arm would instead make `asInt64` -- which `applyUnaryInt`
+// calls -- nullopt for exactly the large unsigned values this exists to carry.
+[[nodiscard]] HirLiteralValue intmaxOperand(std::uint64_t bits, bool isSigned) {
+    HirLiteralValue lv;
+    lv.core  = isSigned ? TypeKind::I64 : TypeKind::U64;
+    lv.value = static_cast<std::int64_t>(bits);
+    return lv;
+}
 
 // Trivia recognizers (mirroring the anon-namespace helpers in
 // preprocessor.cpp; duplicated here because they are TU-local statics there and
@@ -50,6 +93,79 @@ using detail::makeBoolLiteral;
 }
 [[nodiscard]] bool isWordTok(Token const& t) {
     return t.coreKind == CoreTokenKind::Word;
+}
+
+// ★ THE ONE SLICING RULE, AND IT IS `MacroExpander::text`'s RULE. A token's
+// bytes have exactly one home: a SYNTHETIC token (a `defined`/`__has_*` result
+// minted by the rewrite) slices `scratch`; every REAL token slices the PREFIX
+// (`prefix`) when its span starts inside it, and the PRODUCT TAIL when it starts
+// at-or-past the prefix's end (FC15a's A2 layout: a product token's span is
+// `[prefixLen + productOffset, …)`). Sharing the rule rather than materializing
+// `prefix + tail` as one buffer is what removed a whole-TU copy from every `#if`
+// — see D-PERF-PP-IF-REMATERIALIZES-THE-WHOLE-SYNTH-BUFFER-PER-EVALUATION at the
+// `evaluateIfExpression` call site.
+// The `e <= tail.size()` bound mirrors the expander's own defensive arm: a
+// malformed product span returns EMPTY rather than reading out of range (an empty
+// spelling then fails loud in `decodeInteger`, never a silent wrong value).
+// `scratch` may be null where the caller provably never asks about a synthetic
+// token (D-PP-DEFINED-VIA-MACRO-EXPANSION's post-expansion rewrite reads WORD
+// tokens only, and a minted result is an IntLiteral).
+[[nodiscard]] std::string_view ppTokenText(Token const& t,
+                                           SourceBuffer const& prefix,
+                                           SourceBuffer const* scratch,
+                                           std::string_view tail) {
+    if (has(t.flags, NodeFlags::Synthetic)) {
+        return scratch ? scratch->slice(t.span) : std::string_view{};
+    }
+    const ByteOffset prefixLen = static_cast<ByteOffset>(prefix.text().size());
+    if (t.span.start() >= prefixLen) {
+        const ByteOffset s = t.span.start() - prefixLen;
+        const ByteOffset e = t.span.end() - prefixLen;
+        if (e <= tail.size() && s <= e) return tail.substr(s, e - s);
+        return {};
+    }
+    return prefix.slice(t.span);
+}
+
+// D-PP-DEFINED-VIA-MACRO-EXPANSION: read the RAW BYTES `[start, end)` of an
+// operand that spans SEVERAL tokens -- an angle header name, whose spelling
+// includes whatever sat between its tokens (`<a b.h>` is the header `a b.h`), so
+// it cannot be rebuilt by concatenating token texts.
+//
+// ★★ THIS IS THE FUNCTION THAT REFUSES TO GUESS, and it exists because moving
+// the `__has_include` fold PAST macro expansion is exactly what makes guessing
+// possible. Before the move, both ends of the range always came from the same
+// directive line. After it, the tokens can arrive from a replacement list, from
+// the product tail, or from two different constructs spliced together -- and a
+// range read across such a splice is not a malformed header name, it is a
+// PLAUSIBLE one made of unrelated bytes, which the resolver would then answer
+// confidently. That is a silent wrong answer, strictly worse than the refusal
+// this change removed.
+//
+// Returns nullopt -- and EVERY caller then fails LOUD -- when the range cannot
+// be read without guessing:
+//   * the two ends live in DIFFERENT buffers (prefix vs product tail);
+//   * the range runs backwards, or past the end of its buffer;
+//   * the range CROSSES A LINE. A header name never does. A range that does is
+//     the tell that expansion joined two constructs: the `<` from a `#define`
+//     line and the `>` from the directive, with the whole file between them.
+[[nodiscard]] std::optional<std::string_view>
+ppRawRun(ByteOffset start, ByteOffset end, SourceBuffer const& prefix,
+         std::string_view tail) {
+    if (end < start) return std::nullopt;
+    const ByteOffset prefixLen = static_cast<ByteOffset>(prefix.text().size());
+    std::string_view text;
+    if (start < prefixLen) {
+        if (end > prefixLen) return std::nullopt;   // straddles both buffers
+        text = prefix.text().substr(start, end - start);
+    } else {
+        const ByteOffset s = start - prefixLen;
+        const ByteOffset e = end - prefixLen;
+        if (e > tail.size()) return std::nullopt;
+        text = tail.substr(s, e - s);
+    }
+    if (text.find('\n') != std::string_view::npos) return std::nullopt;
+    return text;
 }
 
 // Emit a positioned preprocessor diagnostic on the synth buffer.
@@ -151,7 +267,13 @@ public:
           binaryOps_(schema.hirLowering().binaryOps),
           unaryOps_(schema.hirLowering().unaryOps),
           opTable_(schema.operatorTable()),
-          numberStyle_(schema.numberStyle()) {
+          numberStyle_(schema.numberStyle()),
+          // D-PP-IF-UNSIGNED-INTMAX: the language's C 6.4.4.1 candidate ladder.
+          // ⓘ NO DATA MODEL ACCOMPANIES IT, and that is a property of C 6.10.1p4
+          // rather than an omission: at phase-4 widths every candidate is 64
+          // bits, so a WIDTH model cannot reach the signedness answer. See
+          // `preprocessorLiteralSignedness`.
+          intLadder_(schema.semantics().integerLiteralTyping) {
         // The string-literal OPENER (C's `"`). A string literal lexes as an
         // opener token (`StringStart`) + a coalesced body; the body's schema
         // kind is in `lits_.string`, but the FIRST token the parser meets is the
@@ -187,7 +309,7 @@ public:
 
     // Evaluate the whole token run. nullopt on any fail-loud condition (already
     // reported). A TRAILING unconsumed token is malformed.
-    [[nodiscard]] std::optional<std::int64_t> evaluate() {
+    [[nodiscard]] std::optional<bool> evaluate() {
         if (atEnd()) {
             fail(DiagnosticCode::P_PreprocessorDirective,
                  "#if with an empty controlling expression");
@@ -201,13 +323,38 @@ public:
                  "trailing tokens after #if controlling expression");
             return std::nullopt;
         }
-        auto iv = asInt64(*v);
-        if (!iv.has_value()) {
+        // ── D-PP-IF-UNSIGNED-INTMAX ──────────────────────────────────────────
+        // The question C 6.10.1p2 asks of the result is TRUTHINESS ("if it
+        // compares unequal to 0"), never int64 representability. This used to
+        // ask `asInt64`.
+        //
+        // ⓘ HONESTY NOTE, BECAUSE THE ROW ORIGINALLY CLAIMED OTHERWISE AND THE
+        // MEASUREMENT SAID NO. The plan for this fix predicted that changing the
+        // leaf ALONE would turn the wrong branch into a spurious "not an integer
+        // constant" refusal of `#if UINT64_MAX`, making this change load-bearing.
+        // ✔MEASURED (red-on-disable arm M3, 2026-08-27): reverting THIS line
+        // alone, with the leaf fix in place, is **GREEN** -- all 11
+        // `PreprocessorIfIntmax` pins pass and `examples/c/c_pp_if_intmax` still
+        // exits 42, indistinguishable from the line-inserting CONTROL arm.
+        // The prediction was correct for the representation the plan assumed (the
+        // large unsigned value in the `uint64_t` arm, where `asInt64` genuinely
+        // nullopts) and wrong for the one that shipped: `intmaxOperand` stores the
+        // raw bit pattern in the INT64 arm -- it must, or `applyUnaryInt`'s own
+        // `asInt64` bridge would refuse unary operators on large unsigned values
+        // -- and `asInt64`'s int64 arm always succeeds.
+        //
+        // ★ IT STAYS ANYWAY, as CONTRACT correctness rather than a behaviour fix:
+        // `asBool` is the question the standard actually asks, and it is the only
+        // spelling that stays right if any future producer in this evaluator mints
+        // a `uint64_t` or `BitIntValue` arm -- at which point `asInt64` would
+        // start refusing valid code silently. Do not "simplify" it back.
+        auto const truth = asBool(*v, /*allowFloat=*/false);
+        if (!truth.has_value()) {
             fail(DiagnosticCode::P_PreprocessorDirective,
                  "#if expression is not an integer constant");
             return std::nullopt;
         }
-        return *iv;
+        return *truth;
     }
 
 private:
@@ -228,6 +375,10 @@ private:
     std::vector<HirOperatorEntry> const& unaryOps_;
     OperatorTable const&          opTable_;
     NumberStyle const*            numberStyle_ = nullptr;
+    // D-PP-IF-UNSIGNED-INTMAX: C 6.4.4.1's ordered candidate ladder, borrowed
+    // from the schema (which outlives this parser). EMPTY for a language that
+    // declares none -- see `parsePrimary`'s literal arm for what that means.
+    std::span<IntegerLiteralTypingRule const> intLadder_{};
     SchemaTokenId                 stringOpenKind_{};
     SchemaTokenId                 charOpenKind_{};   // c12: `'` opener
     SchemaTokenId                 charBodyKind_{};   // c12: coalesced char body
@@ -240,30 +391,12 @@ private:
     [[nodiscard]] Token const& peek() const { return toks_[pos_]; }
     void advance() { ++pos_; }
 
-    // ★ THE ONE SLICING RULE, AND IT IS `MacroExpander::text`'s RULE. A synthetic
-    // `defined`-result token slices the scratch buffer. Every REAL token slices
-    // the PREFIX (`synth_`) when its span starts inside it, and the PRODUCT TAIL
-    // when it starts at-or-past the prefix's end (FC15a's A2 layout: a product
-    // token's span is `[prefixLen + productOffset, …)`). Sharing the rule rather
-    // than materializing `prefix + tail` as one buffer is what removed a
-    // whole-TU copy from every `#if` — see the call site's
-    // D-PERF-PP-IF-REMATERIALIZES-THE-WHOLE-SYNTH-BUFFER-PER-EVALUATION note.
-    // The `e <= productTail_.size()` bound mirrors the expander's own defensive
-    // arm: a malformed product span returns EMPTY rather than reading out of
-    // range (an empty spelling then fails loud in `decodeInteger`, never a
-    // silent wrong value).
+    // ★ THE ONE SLICING RULE — it lives in `ppTokenText` (top of this file), and
+    // the post-expansion `defined` rewrite (D-PP-DEFINED-VIA-MACRO-EXPANSION)
+    // reads WORD spellings through the SAME function, so the two readers of a
+    // three-homed token cannot drift.
     [[nodiscard]] std::string_view textOf(Token const& t) const {
-        if (has(t.flags, NodeFlags::Synthetic)) return scratch_.slice(t.span);
-        const ByteOffset prefixLen = static_cast<ByteOffset>(synth_.text().size());
-        if (t.span.start() >= prefixLen) {
-            const ByteOffset s = t.span.start() - prefixLen;
-            const ByteOffset e = t.span.end() - prefixLen;
-            if (e <= productTail_.size() && s <= e) {
-                return productTail_.substr(s, e - s);
-            }
-            return {};
-        }
-        return synth_.slice(t.span);
+        return ppTokenText(t, synth_, &scratch_, productTail_);
     }
 
     void fail(DiagnosticCode code, std::string msg) {
@@ -439,8 +572,9 @@ private:
             auto rhsOpt = parseExpr(nextMin, eval);
             if (!rhsOpt.has_value()) return std::nullopt;
             if (!eval) { lhs = makeBoolLiteral(0); continue; }  // dummy; not folded
-            // Both operands must be integers (no float in #if).
-            if (!asInt64(lhs).has_value() || !asInt64(*rhsOpt).has_value()) {
+            // Both operands must be integers (no float in #if). `asIntBits`, not
+            // `asInt64` -- see the unary gate above (D-PP-IF-UNSIGNED-INTMAX).
+            if (!asIntBits(lhs).has_value() || !asIntBits(*rhsOpt).has_value()) {
                 fail(DiagnosticCode::P_PreprocessorDirective,
                      "non-integer operand in #if expression");
                 return std::nullopt;
@@ -500,6 +634,74 @@ private:
         return condTrue ? std::move(*thenOpt) : std::move(*elseOpt);
     }
 
+    // ── D-PP-IF-UNSIGNED-INTMAX: is this integer literal SIGNED? ─────────────
+    //
+    // Delegated whole to `preprocessorLiteralSignedness` -- the language's own
+    // C 6.4.4.1 candidate ladder, run at C 6.10.1p4's phase-4 widths. The suffix
+    // match, the radix classification and the candidate order all come from
+    // `semantics.integerLiteralTyping`; nothing about which suffixes exist or
+    // what they admit is known here.
+    [[nodiscard]] std::optional<bool>
+    literalSignedness(std::string_view text, std::uint64_t magnitude) {
+        // A language that declares no ladder (toy / tsql) keeps the signed
+        // reading it has always had -- now at intmax width rather than 32 bits.
+        // The identity property: no ladder, no change in signedness.
+        if (intLadder_.empty()) return true;
+
+        auto const sgn = preprocessorLiteralSignedness(text, numberStyle_,
+                                                       intLadder_, magnitude);
+        if (!sgn.has_value()) {
+            // No rule covers the matched suffix, or a candidate's signedness is
+            // not model-invariant. The loader cross-checks both, so this is
+            // substrate drift. The semantic tier ABORTS here; a preprocessor
+            // reports instead -- but it still REFUSES rather than guessing a
+            // signedness, because a guess selects a wrong branch in silence,
+            // which is the entire defect this row exists to remove.
+            fail(DiagnosticCode::P_PreprocessorDirective,
+                 "integer literal in #if matched no integerLiteralTyping rule "
+                 "(config invariant violated): " + std::string{text});
+            return std::nullopt;
+        }
+        return *sgn;
+    }
+
+    // ── D-PP-IF-LARGE-DECIMAL-LITERAL-HAS-NO-WARNING (C 6.10.1p4) ────────────
+    // The literal was REINTERPRETED: a decimal, unsuffixed spelling whose every
+    // ladder candidate is signed, taken as UNSIGNED because phase 4 has nothing
+    // wider than intmax_t to put it in. Both references say so out loud, on by
+    // default, and then evaluate exactly as DSS does — so this is a warning, not
+    // a refusal, and the branch is unaffected.
+    //
+    // ★ THE CONDITION IS RE-DERIVED FROM THE LADDER'S OWN VERBS, never from a
+    // hand-parsed suffix: `matchIntegerSuffix` and `integerLiteralIsPrefixed`
+    // are the SAME two the ladder used to reach its answer, so "was this
+    // reinterpreted" cannot drift from "what signedness did we use". A `u`-
+    // suffixed or hexadecimal literal reaches unsigned through a rule that
+    // ADMITS unsigned candidates — nothing was reinterpreted, and neither
+    // reference warns (both measured; see the diagnostic's note).
+    //
+    // ⓘ A language with no ladder never gets here: `literalSignedness` returns
+    // signed for that case and this predicate is false.
+    void warnIfImplicitlyUnsigned(std::string_view text, bool isSigned,
+                                  SourceSpan span) {
+        if (isSigned) return;
+        if (intLadder_.empty()) return;
+        if (!matchIntegerSuffix(text, numberStyle_).empty()) return;  // suffixed
+        if (integerLiteralIsPrefixed(text, numberStyle_)) return;     // non-decimal
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned;
+        d.severity = DiagnosticSeverity::Warning;
+        d.buffer   = diagBufferId_;
+        d.span     = span;
+        d.actual   = "integer constant '" + std::string{text}
+                   + "' is too large for a signed intmax_t and is interpreted as "
+                     "UNSIGNED in this #if (C 6.10.1p4). A comparison against a "
+                     "negative operand therefore converts that operand to "
+                     "uintmax_t and can select the opposite branch; add a 'u' "
+                     "suffix to say so, or use a value that fits intmax_t.";
+        rep_.report(std::move(d));
+    }
+
     // primary := unary primary | '(' expr ')' | integer-literal | ident(=>0)
     [[nodiscard]] std::optional<HirLiteralValue> parsePrimary(bool eval) {
         if (atEnd()) {
@@ -546,7 +748,13 @@ private:
                          + "' is not permitted in a #if expression");
                 return std::nullopt;
             }
-            if (!asInt64(*operand).has_value()) {
+            // "Is this an INTEGER?", not "does it fit an int64?"
+            // (D-PP-IF-UNSIGNED-INTMAX). `asIntBits` is the verb `applyUnaryInt`
+            // itself reads the operand with, so the gate cannot disagree with the
+            // fold it guards; `asInt64` would refuse a legitimate `uintmax_t`
+            // above INT64_MAX -- turning the wrong branch into a spurious refusal
+            // instead of fixing it.
+            if (!asIntBits(*operand).has_value()) {
                 fail(DiagnosticCode::P_PreprocessorDirective,
                      "non-integer operand in #if expression");
                 return std::nullopt;
@@ -611,43 +819,57 @@ private:
                 && peek().schemaKind == charCloseKind_) {
                 advance();
             }
-            HirLiteralValue lv;
-            lv.core  = TypeKind::I32;
-            lv.value = static_cast<std::int64_t>(*cp);
-            return lv;
+            // C 6.10.1p4: an `int`, which that same paragraph then evaluates as
+            // a SIGNED intmax_t (D-PP-IF-UNSIGNED-INTMAX -- the value is
+            // unchanged; only the domain it folds in widens from 32 to 64).
+            return intmaxOperand(static_cast<std::uint64_t>(*cp),
+                                 /*isSigned=*/true);
         }
 
-        // Integer literal (real, or a synthetic `defined`-result). NOTE
-        // (D-PP-IF-UNSIGNED-INTMAX): `#if` arithmetic is evaluated in signed
-        // int64 (the shared `applyBinaryInt` core), NOT C's intmax_t/uintmax_t.
-        // An unsigned literal whose value exceeds INT64_MAX therefore FAILS LOUD
-        // (`asInt64` -> "not an integer constant") rather than evaluating with
-        // unsigned semantics. A conformance edge; fail-loud, never silently
-        // wrong; tracked for a future widen-to-intmax pass.
+        // Integer literal (real, or a synthetic `defined`-result).
+        //
+        // ── D-PP-IF-UNSIGNED-INTMAX ──────────────────────────────────────────
+        // The literal's SIGNEDNESS is C 6.4.4.1's -- the first candidate in the
+        // language's ordered ladder whose range holds the decoded magnitude,
+        // keyed by suffix spelling and radix class. ★ ASK THE LADDER; DO NOT
+        // PARSE THE SUFFIX HERE. `semantics.integerLiteralTyping` already owns
+        // this question for the CST leaf, complete with a loader cross-check
+        // that every declared `numberStyle` suffix is covered by exactly one
+        // rule -- a second, hand-rolled suffix reader in the preprocessor would
+        // be a parallel owner of "what type is this literal", free to drift.
+        // This arm being the ONE site that did not consult it was the defect.
+        //
+        // ⚠ The WIDTH is then discarded and replaced by 64 (`intmaxOperand`),
+        // because C 6.10.1p4 evaluates in intmax_t/uintmax_t rather than in the
+        // literal's own type. Keeping the ladder's width would type `1` as a
+        // 32-bit `int` -- 6.4.4.1's correct answer and phase 4's wrong one.
         bool const synthetic = has(t.flags, NodeFlags::Synthetic);
         if (synthetic || lits_.integer.count(t.schemaKind.v) != 0
             || t.coreKind == CoreTokenKind::IntLiteral) {
-            auto iv = decodeInteger(textOf(t), numberStyle_);
+            std::string_view const text = textOf(t);
+            auto iv = decodeInteger(text, numberStyle_);
             if (!iv.has_value()) {
                 fail(DiagnosticCode::P_PreprocessorDirective,
                      "malformed or out-of-range integer literal in #if "
-                     "expression: " + std::string{textOf(t)});
+                     "expression: " + std::string{text});
                 return std::nullopt;
             }
+            // The span must be taken BEFORE `advance()` — the warning below
+            // positions on the LITERAL, and after the advance `peek()` is the
+            // next token (the reference carets sit under the digits).
+            SourceSpan const litSpan = t.span;
             advance();
-            HirLiteralValue lv;
-            lv.core  = TypeKind::I32;
-            lv.value = static_cast<std::int64_t>(*iv);
-            return lv;
+            auto const signedness = literalSignedness(text, *iv);
+            if (!signedness.has_value()) return std::nullopt;   // already reported
+            warnIfImplicitlyUnsigned(text, *signedness, litSpan);
+            return intmaxOperand(*iv, *signedness);
         }
 
-        // Any other identifier that survived expansion -> 0 (C 6.10.1p4).
+        // Any other identifier that survived expansion -> 0 (C 6.10.1p4), which
+        // that same paragraph then evaluates as a SIGNED intmax_t.
         if (isWordTok(t)) {
             advance();
-            HirLiteralValue lv;
-            lv.core  = TypeKind::I32;
-            lv.value = std::int64_t{0};
-            return lv;
+            return intmaxOperand(0, /*isSigned=*/true);
         }
 
         fail(DiagnosticCode::P_PreprocessorDirective,
@@ -703,7 +925,104 @@ private:
     return 0;
 }
 
-std::optional<std::int64_t>
+// ── D-PP-DEFINED-VIA-MACRO-EXPANSION: the shared `#if`-operand barrier ───────
+// The state machine and the MEASUREMENT behind each arm are documented on the
+// class (pp_if_eval.hpp). Every slot that does not match its expected shape
+// returns to Idle WITHOUT protecting the token, so a malformed operator reaches
+// the evaluator's rewrite unchanged and fails loud there (`defined ( 1 )` ->
+// "operator 'defined' requires an identifier operand", which is what gcc, clang
+// and MSVC all do for that input).
+PpIfOperandBarrier::PpIfOperandBarrier(GrammarSchema const& schema) {
+    PreprocessConfig const& pp = schema.preprocess();
+    definedKw_    = pp.definedOperator;
+    hasIncludeKw_ = pp.hasIncludeOperator;
+    hasEmbedKw_   = pp.hasEmbedOperator;
+    openParen_    = schema.schemaTokens().find(pp.functionLikeOpenToken);
+    closeParen_   = schema.schemaTokens().find(pp.functionLikeCloseToken);
+    angleOpen_    = schema.schemaTokens().find(pp.hasIncludeAngleOpenToken);
+    angleClose_   = schema.schemaTokens().find(pp.hasIncludeAngleCloseToken);
+    stringOpen_   = schema.schemaTokens().find(pp.quoteIncludeToken);
+}
+
+bool PpIfOperandBarrier::protects(Token const& t, std::string_view word) {
+    lastWasDefinedKeyword_ = false;
+    // Trivia sits BETWEEN an operator and its operand (`defined ( X )` may be
+    // spelled with any amount of white space, and a macro replacement can put a
+    // comment in the middle). It neither advances the state nor is protected --
+    // trivia is not expandable, so protecting it would be a no-op that only made
+    // the state machine harder to reason about.
+    if (isTriviaTok(t)) return false;
+    bool const isWordT = isWordTok(t);
+    auto isKind = [&](SchemaTokenId k) {
+        return k.valid() && t.schemaKind == k;
+    };
+    switch (state_) {
+        case State::Idle:
+            // A language declaring none of these operators leaves the spelling
+            // EMPTY, and an empty spelling can never equal a Word's text, so the
+            // whole machine is provably inert for it.
+            if (isWordT && !definedKw_.empty() && word == definedKw_) {
+                state_ = State::DefKeyword;
+                lastWasDefinedKeyword_ = true;
+            } else if (isWordT
+                       && ((!hasIncludeKw_.empty() && word == hasIncludeKw_)
+                           || (!hasEmbedKw_.empty() && word == hasEmbedKw_))) {
+                state_ = State::HdrKeyword;
+            }
+            return false;   // the OPERATOR itself is never protected
+
+        // ── `defined`: the operand is ALWAYS protected ──
+        case State::DefKeyword:
+            if (isKind(openParen_)) { state_ = State::DefOpen; return true; }
+            state_ = State::Idle;
+            return isWordT;   // the NO-PAREN form: `defined X`
+        case State::DefOpen:
+            if (isWordT) {
+                state_ = State::DefOperand;
+                return true;   // ★ THE PROTECTED OPERAND
+            }
+            state_ = State::Idle;
+            return false;
+        case State::DefOperand:
+            state_ = State::Idle;
+            return isKind(closeParen_);
+
+        // ── `__has_include` / `__has_embed`: protected ONLY in the delimited
+        // forms; anything else is macro-expanded and re-examined (C's own
+        // `#include MACRO` rule, ✔MEASURED unanimous — see the class doc). ──
+        case State::HdrKeyword:
+            if (isKind(openParen_)) { state_ = State::HdrOpen; return true; }
+            state_ = State::Idle;
+            return false;
+        case State::HdrOpen:
+            if (isKind(angleOpen_))  { state_ = State::InAngle; return true; }
+            if (isKind(stringOpen_)) { state_ = State::InQuote; return true; }
+            // ★ THE RE-EXAMINE ARM. Not protected on purpose: `#define H
+            // <stdio.h>` + `#if __has_include(H)` answers 1 on all three
+            // references, which it can only do if `H` expands here.
+            state_ = State::Idle;
+            return false;
+        case State::InAngle:
+            // Everything between the angle delimiters is part of the header
+            // NAME and must reach the resolver as written -- `<HDR.h>` looks for
+            // a header called `HDR.h` even when `HDR` is a macro.
+            if (isKind(angleClose_)) { state_ = State::HdrOperand; return true; }
+            return true;
+        case State::InQuote:
+            // A quote operand is the opener, ONE coalesced body token and the
+            // closer; none of them is expandable and none of them is the
+            // operator's `)`, so running to that `)` is exact and needs no
+            // second spelling of the literal-close token rule.
+            if (isKind(closeParen_)) { state_ = State::Idle; return true; }
+            return true;
+        case State::HdrOperand:
+            state_ = State::Idle;
+            return isKind(closeParen_);
+    }
+    return false;   // unreachable -- every State handled above
+}
+
+std::optional<bool>
 evaluateIfExpression(std::span<Token const> operandTokens,
                      GrammarSchema const&   schema,
                      PpMacroExpand const&   macroExpand,
@@ -740,13 +1059,67 @@ evaluateIfExpression(std::span<Token const> operandTokens,
     SchemaTokenId const stringOpen =
         schema.schemaTokens().find(pp.quoteIncludeToken);
 
-    // ── Step 1: rewrite `defined X` / `defined(X)` -> 1/0 (MF-1: the parens
-    // are the CONFIG function-like-open/close tokens, never hard-coded). The
-    // operand of `defined` is NOT macro-expanded. The result is a synthetic
-    // IntLiteral token sliced from `scratch` and tagged Synthetic. ──
+    // ══ Step 1: MACRO-EXPAND THE WHOLE OPERAND FIRST ═════════════════════════
+    // D-PP-DEFINED-VIA-MACRO-EXPANSION. Expansion used to run SECOND, after the
+    // operators had been folded off the raw directive line, and that order is
+    // precisely what made an operator PRODUCED BY expansion unreachable. It now
+    // runs first, with a `PpIfOperandBarrier` (pp_if_eval.hpp) holding back the
+    // operands the references hold back — so every operator, however it was
+    // produced, meets ONE rewrite pass below and they cannot answer differently.
+    //
+    // Trivia is dropped on the way in, exactly as the pre-expansion pass used to
+    // drop it, so the expander sees the same run it always did.
+    std::vector<Token> operandNoTrivia;
+    operandNoTrivia.reserve(operandTokens.size());
+    for (Token const& t : operandTokens) {
+        if (!isTriviaTok(t)) operandNoTrivia.push_back(t);
+    }
+    std::vector<Token> const expanded = macroExpand(operandNoTrivia);
+
+    // FC15b: a predefined / `#` / `##` PRODUCT materialized during the expansion
+    // carries a span in the synth buffer's product TAIL (`[prefixLen + ..)`) --
+    // bytes NOT present in the prefix-only `synth`. Read AFTER `macroExpand` and
+    // BORROWED for the rest of this function: the rewrite below slices operand
+    // spellings out of it and the ICE parser slices product tokens out of it.
+    //
+    // ★★★ D-PERF-PP-IF-REMATERIALIZES-THE-WHOLE-SYNTH-BUFFER-PER-EVALUATION. This
+    // used to assemble a COMBINED buffer per evaluation -- `std::string
+    // combined{synth.text()}; combined.append(tail);` then a `SourceBuffer` around
+    // it -- i.e. it COPIED THE ENTIRE TRANSLATION UNIT, twice, once for every
+    // `#if`/`#elif` line evaluated after the TU's first `#`/`##`/predefined
+    // product. ✔MEASURED 2026-08-25 on the 103-TU sqlite full-source corpus
+    // (`--project … --config=release --jobs 1`): 13,242 evaluations copied
+    // 12,424 MB and cost 10.05 s -- 10.0 s of the 13.3 s `preprocess-expand`
+    // phase, on a build whose ENTIRE preprocessor cost 47 s. The cost is
+    // QUADRATIC in the shape that matters: a bigger TU makes each copy bigger AND
+    // gives it more `#if` lines to be copied at.
+    //
+    // ★ THE FIX IS NOT A CACHE OF THE COMBINED BUFFER -- it is to stop
+    // materializing a concatenation nothing needs. A token's bytes already have
+    // exactly one well-defined home, and `MacroExpander::text` (the expander's own
+    // slicer) has always known the rule: a span at-or-past `prefixLen` is a
+    // PRODUCT and slices the product tail at `start - prefixLen`; every other span
+    // slices the prefix. `ppTokenText` applies that SAME rule for every reader
+    // here, so none of them can drift -- and the per-`#if` copy is gone entirely.
+    //
+    // ⓘ `prefixLen` is not a new parameter because it is not new information:
+    // `synth` IS the prefix buffer (`preprocess()` builds it from `synthText`
+    // BEFORE appending `productText()`, and hands the same byte count to
+    // `MacroExpander` as its `prefixLen`), so `synth.text().size()` IS that
+    // length. Deriving it here rather than threading a second spelling of the
+    // same number is what keeps the two from disagreeing.
+    std::string_view const tail = productText ? productText() : std::string_view{};
+
+    // ── Step 2: rewrite the conditional-inclusion OPERATORS to their values
+    // (MF-1: the parens are the CONFIG function-like-open/close tokens, never
+    // hard-coded). Each result is a synthetic IntLiteral token sliced from
+    // `scratch` and tagged Synthetic. ──
     std::string scratchText;            // accumulates the synthetic digit bytes
     std::vector<Token> afterDefined;
-    afterDefined.reserve(operandTokens.size());
+    afterDefined.reserve(expanded.size());
+    // The run this pass walks. Named so every helper below reads ONE source and
+    // no line can accidentally reach back to the pre-expansion tokens.
+    std::span<Token const> const toks{expanded};
 
     // Mint a Synthetic IntLiteral token whose decimal spelling is `digits`,
     // spanning the bytes appended to the scratch buffer (assembled after the
@@ -768,8 +1141,15 @@ evaluateIfExpression(std::span<Token const> operandTokens,
 
     // Advance past trivia from `j`.
     auto skipFwd = [&](std::size_t j) {
-        while (j < operandTokens.size() && isTriviaTok(operandTokens[j])) ++j;
+        while (j < toks.size() && isTriviaTok(toks[j])) ++j;
         return j;
+    };
+
+    // Read a WORD token's spelling through the ONE slicing rule. `scratch` is
+    // null because a Word is never a token this pass minted (those are
+    // IntLiterals), so the synthetic arm is unreachable from here.
+    auto wordOf = [&](Token const& t) -> std::string_view {
+        return ppTokenText(t, synth, /*scratch=*/nullptr, tail);
     };
 
     // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: `body` indexes a coalesced literal
@@ -787,10 +1167,10 @@ evaluateIfExpression(std::span<Token const> operandTokens,
     // the pre-closer behaviour.
     auto skipBodyAndCloser = [&](std::size_t body) -> std::size_t {
         SchemaTokenId const closeKind =
-            closeTokenForCoalescedBody(schema, operandTokens[body].schemaKind);
+            closeTokenForCoalescedBody(schema, toks[body].schemaKind);
         std::size_t n = body + 1;
-        if (closeKind.valid() && n < operandTokens.size()
-            && operandTokens[n].schemaKind == closeKind) {
+        if (closeKind.valid() && n < toks.size()
+            && toks[n].schemaKind == closeKind) {
             ++n;
         }
         return n;
@@ -814,11 +1194,125 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         rewriteFailed = true;
     };
 
-    for (std::size_t i = 0; i < operandTokens.size(); ) {
-        Token const& t = operandTokens[i];
+    // D-PP-DEFINED-VIA-MACRO-EXPANSION: a token produced by macro expansion
+    // carries a PRODUCT-TAIL span (at or past the prefix buffer's end) or a
+    // SCRATCH span, and neither is a position in the registered buffer the
+    // diagnostic names. Attribute those to the directive's OWN first operand
+    // token -- which is where gcc and clang position the very same error
+    // (`#if HAS_FOO` for a `HAS_FOO` that expands to a malformed `defined`).
+    auto diagSpanFor = [&](Token const& t) -> SourceSpan {
+        const ByteOffset prefixLen = static_cast<ByteOffset>(synth.text().size());
+        if (!has(t.flags, NodeFlags::Synthetic) && t.span.start() < prefixLen) {
+            return t.span;
+        }
+        return operandTokens.empty() ? SourceSpan::empty(0)
+                                     : operandTokens.front().span;
+    };
+
+    // ★★★ THE `defined` OPERATOR — ONE IMPLEMENTATION, ONE REWRITE POINT, AND IT
+    // IS *AFTER* EXPANSION (D-PP-DEFINED-VIA-MACRO-EXPANSION requirement (2):
+    // one operator, one evaluation, never a second copy for the expanded case).
+    //
+    // ★ WHY AFTER, WHICH IS THE WHOLE ORDERING DESIGN. `defined` used to be
+    // folded BEFORE expansion, on the raw directive line, and that order is what
+    // made a macro-produced `defined` unreachable. Moving the fold AFTER
+    // expansion — with the operand protected DURING expansion by
+    // `PpIfOperandBarrier` — is the reference toolchains' own order: gcc, clang and
+    // MSVC all read the `#if` expression through a macro-expanding reader and
+    // recognise `defined` in the token stream that reader produces, whichever
+    // construct produced it. Both forms then take the SAME path, so they cannot
+    // answer differently.
+    // ✔MEASURED, and this is what the ordering buys beyond the row: with the
+    // pre-expansion fold, `#if ID(defined(FOO))` (a LITERAL `defined` inside a
+    // function-like macro's ARGUMENT list) was folded before `ID` was ever
+    // invoked, so DSS answered 1 and compiled. gcc 13.3.0, clang 18.1.3 AND MSVC
+    // 19.51 ALL REJECT it (`operator "defined" requires an identifier` / `macro
+    // name must be an identifier` / `C2004: expected 'defined(id)'`) — the
+    // argument is pre-expanded to `defined(1)` first. Accepting what NOT ONE
+    // reference accepts is §A.3b's other direction, and the single rewrite point
+    // closes it by construction rather than by a second special case.
+    //
+    // `toks[i]` is the `defined` keyword. On a well-formed shape the 1/0 result
+    // is appended to `out`, `i` advances past the whole construct, true is
+    // returned. On a malformed shape the positioned diagnostic is emitted,
+    // `rewriteFailed` is set and false is returned. `tail` is the product-tail
+    // view the operand's spelling may live in (empty before expansion).
+    auto foldDefined = [&](std::span<Token const> toks, std::size_t& i,
+                           std::string_view tail,
+                           std::vector<Token>& out) -> bool {
+        Token const kwTok = toks[i];
+        auto skip = [&](std::size_t k) {
+            while (k < toks.size() && isTriviaTok(toks[k])) ++k;
+            return k;
+        };
+        std::size_t j = skip(i + 1);
+        bool paren = false;
+        if (j < toks.size() && openParen.valid()
+            && toks[j].schemaKind == openParen) {
+            paren = true;
+            j = skip(j + 1);
+        }
+        if (j >= toks.size() || !isWordTok(toks[j])) {
+            emit(rep, DiagnosticCode::P_PreprocessorDirective, synth.id(),
+                 diagSpanFor(kwTok),
+                 "operator 'defined' requires an identifier operand");
+            rewriteFailed = true;
+            return false;
+        }
+        std::string const name{ppTokenText(toks[j], synth, nullptr, tail)};
+        ++j;
+        if (paren) {
+            j = skip(j);
+            if (j >= toks.size() || closeParen.valid() == false
+                || toks[j].schemaKind != closeParen) {
+                emit(rep, DiagnosticCode::P_PreprocessorDirective, synth.id(),
+                     diagSpanFor(kwTok),
+                     "expected ')' after 'defined(' in #if expression");
+                rewriteFailed = true;
+                return false;
+            }
+            ++j;
+        }
+        out.push_back(mintNumber(isDefined(name) ? 1 : 0));
+        i = j;
+        return true;
+    };
+
+    // ★★ THE SINGLE OPERATOR-REWRITE PASS, over the EXPANDED run.
+    // D-PP-DEFINED-VIA-MACRO-EXPANSION. Every conditional-inclusion operator is
+    // folded HERE and nowhere else, so a `defined` / `__has_include` /
+    // `__has_embed` / `__has_c_attribute` written in the directive and one
+    // PRODUCED BY macro expansion are the same token to this loop and cannot
+    // answer differently.
+    //
+    // ⚠ THE BARRIER RUNS AGAIN HERE, and it is not redundant with the one the
+    // expander ran. It answers a DIFFERENT question in this pass: which tokens
+    // are somebody's OPERAND and therefore must not be read as an operator in
+    // their own right. `#if defined(__has_include)` asks whether the NAME is
+    // defined — it does not invoke the operator (the shape
+    // `examples/c/has_include_operator_not_shadowable` exists for). Reusing the
+    // SAME class is what makes the expander's notion of an operand and this
+    // pass's notion identical by construction rather than by review.
+    PpIfOperandBarrier operandBarrier{schema};
+    for (std::size_t i = 0; i < toks.size(); ) {
+        Token const& t = toks[i];
         if (isTriviaTok(t)) { ++i; continue; }
-        std::string_view const word = isWordTok(t) ? synth.slice(t.span)
-                                                   : std::string_view{};
+        std::string_view const word =
+            isWordTok(t) ? wordOf(t) : std::string_view{};
+        if (operandBarrier.protects(t, word)) {
+            afterDefined.push_back(t);
+            ++i;
+            continue;
+        }
+
+        // `defined X` / `defined(X)` -> 1/0. Both the literal form and the one
+        // that arrived via a replacement list reach this arm; the operand
+        // survived expansion intact because the expander ran with the same
+        // barrier (see the class doc for the per-operator measurement).
+        if (isWordTok(t) && !definedKw.empty() && word == definedKw) {
+            if (!foldDefined(toks, i, tail, afterDefined)) break;
+            continue;
+        }
 
         // ── FC15c: `__has_include(<h>)` / `__has_include("h")` (C23 6.10.1p4).
         // The operand is NOT macro-expanded (like `defined`); the angle
@@ -826,17 +1320,17 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         // EVERY malformed shape fails loud with P_PreprocessorHasInclude. ──
         if (isWordTok(t) && !hasIncludeKw.empty() && word == hasIncludeKw) {
             std::size_t j = skipFwd(i + 1);
-            if (j >= operandTokens.size() || !openParen.valid()
-                || operandTokens[j].schemaKind != openParen) {
-                failHasInclude(t.span,
+            if (j >= toks.size() || !openParen.valid()
+                || toks[j].schemaKind != openParen) {
+                failHasInclude(diagSpanFor(t),
                     "operator '__has_include' requires a parenthesized header");
                 break;
             }
             j = skipFwd(j + 1);
             std::string filename;
             bool isAngle = false;
-            if (j < operandTokens.size() && angleOpen.valid()
-                && operandTokens[j].schemaKind == angleOpen) {
+            if (j < toks.size() && angleOpen.valid()
+                && toks[j].schemaKind == angleOpen) {
                 // ANGLE form `<h>`: the raw filename is the bytes between the
                 // angle-open and angle-close tokens (matched by KIND). Scan to
                 // the close token, accumulating the spelling of the interior
@@ -844,32 +1338,45 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                 isAngle = true;
                 std::size_t k = j + 1;
                 ByteOffset const innerStart =
-                    operandTokens[j].span.end();   // just past `<`
+                    toks[j].span.end();   // just past `<`
                 bool sawClose = false;
                 ByteOffset innerEnd = innerStart;
-                for (; k < operandTokens.size(); ++k) {
+                for (; k < toks.size(); ++k) {
                     if (angleClose.valid()
-                        && operandTokens[k].schemaKind == angleClose) {
+                        && toks[k].schemaKind == angleClose) {
                         sawClose = true;
                         break;
                     }
-                    innerEnd = operandTokens[k].span.end();
+                    innerEnd = toks[k].span.end();
                 }
                 if (!sawClose) {
-                    failHasInclude(t.span,
+                    failHasInclude(diagSpanFor(t),
                         "expected '>' to close '__has_include(<...'");
                     break;
                 }
-                // Slice the raw bytes `[innerStart, innerEnd)` from the synth
-                // buffer -- the filename verbatim, escapes NOT decoded (the
-                // include resolver reads the raw path too).
+                // The filename verbatim, escapes NOT decoded (the include
+                // resolver reads the raw path too).
+                // D-PP-DEFINED-VIA-MACRO-EXPANSION:
+                // `ppRawRun` REFUSES a range it cannot read without
+                // guessing -- one that straddles the prefix and the product
+                // tail, or that crosses a line because expansion spliced two
+                // constructs together. A guessed header name is a PLAUSIBLE one
+                // made of unrelated bytes, which the resolver would answer
+                // confidently; that is the silent wrong answer this operator's
+                // refusal used to prevent, and it stays prevented.
                 if (innerEnd > innerStart) {
-                    filename = std::string{
-                        synth.slice(SourceSpan::of(innerStart, innerEnd))};
+                    auto raw = ppRawRun(innerStart, innerEnd, synth, tail);
+                    if (!raw.has_value()) {
+                        failHasInclude(diagSpanFor(t),
+                            "operator '__has_include' header name could not be "
+                            "read as one contiguous run after macro expansion");
+                        break;
+                    }
+                    filename = std::string{*raw};
                 }
                 j = k + 1;   // past the close token
-            } else if (j < operandTokens.size() && stringOpen.valid()
-                       && operandTokens[j].schemaKind == stringOpen) {
+            } else if (j < toks.size() && stringOpen.valid()
+                       && toks[j].schemaKind == stringOpen) {
                 // QUOTE form `"h"`: the StringStart opener consumed only the
                 // opening `"`; the coalesced StringLiteral BODY is the next token
                 // and its raw text is the filename (escapes NOT decoded, like the
@@ -878,27 +1385,27 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                 // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN); without stepping past
                 // it the `)` check below sees the `"` and fails "expected ')'".
                 std::size_t k = j + 1;
-                if (k < operandTokens.size() && !isTriviaTok(operandTokens[k])
-                    && operandTokens[k].span.start()
-                           == operandTokens[j].span.end()) {
-                    filename = std::string{synth.slice(operandTokens[k].span)};
+                if (k < toks.size() && !isTriviaTok(toks[k])
+                    && toks[k].span.start()
+                           == toks[j].span.end()) {
+                    filename = std::string{wordOf(toks[k])};
                     k = skipBodyAndCloser(k);
                 }
                 j = k;
             } else {
-                failHasInclude(t.span,
+                failHasInclude(diagSpanFor(t),
                     "operator '__has_include' requires <header> or \"header\"");
                 break;
             }
             if (filename.empty()) {
-                failHasInclude(t.span,
+                failHasInclude(diagSpanFor(t),
                     "operator '__has_include' has an empty header name");
                 break;
             }
             j = skipFwd(j);
-            if (j >= operandTokens.size() || !closeParen.valid()
-                || operandTokens[j].schemaKind != closeParen) {
-                failHasInclude(t.span,
+            if (j >= toks.size() || !closeParen.valid()
+                || toks[j].schemaKind != closeParen) {
+                failHasInclude(diagSpanFor(t),
                     "expected ')' to close '__has_include('");
                 break;
             }
@@ -921,46 +1428,55 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         // fail loud P_PreprocessorEmbed. ──
         if (isWordTok(t) && !hasEmbedKw.empty() && word == hasEmbedKw) {
             std::size_t j = skipFwd(i + 1);
-            if (j >= operandTokens.size() || !openParen.valid()
-                || operandTokens[j].schemaKind != openParen) {
-                failHasEmbed(t.span,
+            if (j >= toks.size() || !openParen.valid()
+                || toks[j].schemaKind != openParen) {
+                failHasEmbed(diagSpanFor(t),
                     "operator '__has_embed' requires a parenthesized resource");
                 break;
             }
             j = skipFwd(j + 1);
             std::string filename;
             bool isAngle = false;
-            if (j < operandTokens.size() && angleOpen.valid()
-                && operandTokens[j].schemaKind == angleOpen) {
+            if (j < toks.size() && angleOpen.valid()
+                && toks[j].schemaKind == angleOpen) {
                 // ANGLE form `<r>`: accumulate the raw bytes between the angle
                 // delimiters (matched by KIND). The angle form is a loud deferral
                 // (D-PP-EMBED-ANGLE) at the DIRECTIVE; the operator recognises it
                 // only so the callback can answer 0 (NOT_FOUND) truthfully.
                 isAngle = true;
                 std::size_t k = j + 1;
-                ByteOffset const innerStart = operandTokens[j].span.end();
+                ByteOffset const innerStart = toks[j].span.end();
                 bool sawAngleClose = false;
                 ByteOffset innerEnd = innerStart;
-                for (; k < operandTokens.size(); ++k) {
+                for (; k < toks.size(); ++k) {
                     if (angleClose.valid()
-                        && operandTokens[k].schemaKind == angleClose) {
+                        && toks[k].schemaKind == angleClose) {
                         sawAngleClose = true;
                         break;
                     }
-                    innerEnd = operandTokens[k].span.end();
+                    innerEnd = toks[k].span.end();
                 }
                 if (!sawAngleClose) {
-                    failHasEmbed(t.span,
+                    failHasEmbed(diagSpanFor(t),
                         "expected '>' to close '__has_embed(<...'");
                     break;
                 }
+                // D-PP-DEFINED-VIA-MACRO-EXPANSION: same refusal as the
+                // `__has_include` angle arm -- `ppRawRun` will not guess a
+                // resource name out of bytes that expansion spliced together.
                 if (innerEnd > innerStart) {
-                    filename = std::string{
-                        synth.slice(SourceSpan::of(innerStart, innerEnd))};
+                    auto raw = ppRawRun(innerStart, innerEnd, synth, tail);
+                    if (!raw.has_value()) {
+                        failHasEmbed(diagSpanFor(t),
+                            "operator '__has_embed' resource name could not be "
+                            "read as one contiguous run after macro expansion");
+                        break;
+                    }
+                    filename = std::string{*raw};
                 }
                 j = k + 1;
-            } else if (j < operandTokens.size() && stringOpen.valid()
-                       && operandTokens[j].schemaKind == stringOpen) {
+            } else if (j < toks.size() && stringOpen.valid()
+                       && toks[j].schemaKind == stringOpen) {
                 // QUOTE form `"r"`: the coalesced StringLiteral BODY is the
                 // adjacent next token; its raw text is the resource name (escapes
                 // NOT decoded, like the include/embed resolver). An empty body
@@ -970,20 +1486,20 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                 // is what keeps the parameter scan below from counting the `"` as
                 // a parameter and SILENTLY answering NOT_FOUND.
                 std::size_t k = j + 1;
-                if (k < operandTokens.size() && !isTriviaTok(operandTokens[k])
-                    && operandTokens[k].span.start()
-                           == operandTokens[j].span.end()) {
-                    filename = std::string{synth.slice(operandTokens[k].span)};
+                if (k < toks.size() && !isTriviaTok(toks[k])
+                    && toks[k].span.start()
+                           == toks[j].span.end()) {
+                    filename = std::string{wordOf(toks[k])};
                     k = skipBodyAndCloser(k);
                 }
                 j = k;
             } else {
-                failHasEmbed(t.span,
+                failHasEmbed(diagSpanFor(t),
                     "operator '__has_embed' requires <resource> or \"resource\"");
                 break;
             }
             if (filename.empty()) {
-                failHasEmbed(t.span,
+                failHasEmbed(diagSpanFor(t),
                     "operator '__has_embed' has an empty resource name");
                 break;
             }
@@ -995,8 +1511,8 @@ evaluateIfExpression(std::span<Token const> operandTokens,
             bool sawClose  = false;
             int  depth     = 0;
             std::size_t k = skipFwd(j);
-            for (; k < operandTokens.size(); ++k) {
-                Token const& u = operandTokens[k];
+            for (; k < toks.size(); ++k) {
+                Token const& u = toks[k];
                 if (isTriviaTok(u)) continue;
                 if (openParen.valid() && u.schemaKind == openParen) {
                     hasParams = true;
@@ -1011,7 +1527,7 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                 hasParams = true;   // any other significant token = a parameter
             }
             if (!sawClose) {
-                failHasEmbed(t.span, "expected ')' to close '__has_embed('");
+                failHasEmbed(diagSpanFor(t), "expected ')' to close '__has_embed('");
                 break;
             }
             j = k + 1;   // past the operator's close paren
@@ -1019,7 +1535,7 @@ evaluateIfExpression(std::span<Token const> operandTokens,
             // trichotomy via the callback (null-tolerant -> 0 = NOT_FOUND).
             int const v = hasParams
                 ? 0
-                : (hasEmbed ? hasEmbed(filename, isAngle, t.span) : 0);
+                : (hasEmbed ? hasEmbed(filename, isAngle, diagSpanFor(t)) : 0);
             afterDefined.push_back(mintNumber(v));
             i = j;
             continue;
@@ -1030,29 +1546,29 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         // known-attribute set (raw + dunder-stripped), mint the version or 0. ──
         if (isWordTok(t) && !hasCAttrKw.empty() && word == hasCAttrKw) {
             std::size_t j = skipFwd(i + 1);
-            if (j >= operandTokens.size() || !openParen.valid()
-                || operandTokens[j].schemaKind != openParen) {
+            if (j >= toks.size() || !openParen.valid()
+                || toks[j].schemaKind != openParen) {
                 emit(rep, DiagnosticCode::P_PreprocessorDirective, synth.id(),
-                     t.span,
+                     diagSpanFor(t),
                      "operator '__has_c_attribute' requires a parenthesized "
                      "attribute name");
                 rewriteFailed = true;
                 break;
             }
             j = skipFwd(j + 1);
-            if (j >= operandTokens.size() || !isWordTok(operandTokens[j])) {
+            if (j >= toks.size() || !isWordTok(toks[j])) {
                 emit(rep, DiagnosticCode::P_PreprocessorDirective, synth.id(),
-                     t.span,
+                     diagSpanFor(t),
                      "operator '__has_c_attribute' requires an attribute name");
                 rewriteFailed = true;
                 break;
             }
-            std::string const attr{synth.slice(operandTokens[j].span)};
+            std::string const attr{wordOf(toks[j])};
             j = skipFwd(j + 1);
-            if (j >= operandTokens.size() || !closeParen.valid()
-                || operandTokens[j].schemaKind != closeParen) {
+            if (j >= toks.size() || !closeParen.valid()
+                || toks[j].schemaKind != closeParen) {
                 emit(rep, DiagnosticCode::P_PreprocessorDirective, synth.id(),
-                     t.span,
+                     diagSpanFor(t),
                      "expected ')' to close '__has_c_attribute('");
                 rewriteFailed = true;
                 break;
@@ -1063,93 +1579,25 @@ evaluateIfExpression(std::span<Token const> operandTokens,
             continue;
         }
 
-        if (isWordTok(t) && !definedKw.empty() && word == definedKw) {
-            // `defined` -- consume optional `(`, then a Word, then optional `)`.
-            std::size_t j = skipFwd(i + 1);
-            bool paren = false;
-            if (j < operandTokens.size() && openParen.valid()
-                && operandTokens[j].schemaKind == openParen) {
-                paren = true;
-                j = skipFwd(j + 1);
-            }
-            if (j >= operandTokens.size() || !isWordTok(operandTokens[j])) {
-                emit(rep, DiagnosticCode::P_PreprocessorDirective, synth.id(),
-                     t.span,
-                     "operator 'defined' requires an identifier operand");
-                rewriteFailed = true;
-                break;
-            }
-            std::string const name{synth.slice(operandTokens[j].span)};
-            ++j;
-            if (paren) {
-                j = skipFwd(j);
-                if (j >= operandTokens.size() || closeParen.valid() == false
-                    || operandTokens[j].schemaKind != closeParen) {
-                    emit(rep, DiagnosticCode::P_PreprocessorDirective,
-                         synth.id(), t.span,
-                         "expected ')' after 'defined(' in #if expression");
-                    rewriteFailed = true;
-                    break;
-                }
-                ++j;
-            }
-            afterDefined.push_back(mintNumber(isDefined(name) ? 1 : 0));
-            i = j;
-            continue;
-        }
         afterDefined.push_back(t);
         ++i;
     }
     if (rewriteFailed) return std::nullopt;
 
-    // ── Step 2: macro-expand the remaining operand tokens. The synthetic
-    // `defined`-result IntLiterals are NOT Words, so the expander copies them
-    // through by value without slicing (it only slices Word tokens against the
-    // synth buffer). ──
-    std::vector<Token> expanded = macroExpand(afterDefined);
+    // Everything from here reads ONE rewritten run. There is no second
+    // expansion and no second operator pass: the expansion happened at the top,
+    // the operators were folded once above, and `tail` was taken between them.
 
-    // Assemble the scratch buffer NOW that scratchText is final (the synthetic
-    // tokens' spans index into it). `SourceBuffer::fromString` copies the text.
+    // Assemble the scratch buffer NOW that scratchText is final -- the rewrite
+    // pass has minted into it and the synthetic tokens' spans index into it.
+    // `SourceBuffer::fromString` copies the text.
     auto scratchBuf = SourceBuffer::fromString(scratchText, "<pp-if-scratch>");
 
-    // FC15b: a predefined / `#` / `##` PRODUCT materialized during the expansion
-    // above carries a span in the synth buffer's product TAIL (`[prefixLen + ..)`)
-    // -- bytes NOT present in the prefix-only `synth`. The ICE parser must be able
-    // to slice such a real token (e.g. `__STDC_VERSION__` -> `202311L`).
-    //
-    // ★★★ D-PERF-PP-IF-REMATERIALIZES-THE-WHOLE-SYNTH-BUFFER-PER-EVALUATION. This
-    // used to assemble a COMBINED buffer per evaluation -- `std::string
-    // combined{synth.text()}; combined.append(tail);` then a `SourceBuffer` around
-    // it -- i.e. it COPIED THE ENTIRE TRANSLATION UNIT, twice, once for every
-    // `#if`/`#elif` line evaluated after the TU's first `#`/`##`/predefined
-    // product. ✔MEASURED 2026-08-25 on the 103-TU sqlite full-source corpus
-    // (`--project … --config=release --jobs 1`): 13,242 evaluations copied
-    // 12,424 MB and cost 10.05 s -- 10.0 s of the 13.3 s `preprocess-expand`
-    // phase, on a build whose ENTIRE preprocessor cost 47 s. The cost is
-    // QUADRATIC in the shape that matters: a bigger TU makes each copy bigger AND
-    // gives it more `#if` lines to be copied at.
-    //
-    // ★ THE FIX IS NOT A CACHE OF THE COMBINED BUFFER -- it is to stop
-    // materializing a concatenation nothing needs. A token's bytes already have
-    // exactly one well-defined home, and `MacroExpander::text` (the expander's own
-    // slicer) has always known the rule: a span at-or-past `prefixLen` is a
-    // PRODUCT and slices the product tail at `start - prefixLen`; every other span
-    // slices the prefix. `IceParser::textOf` now applies that SAME rule, so the
-    // two slicers cannot drift -- and the per-`#if` copy is gone entirely.
-    //
-    // ⓘ `prefixLen` is not a new parameter because it is not new information:
-    // `synth` IS the prefix buffer (`preprocess()` builds it from `synthText`
-    // BEFORE appending `productText()`, and hands the same byte count to
-    // `MacroExpander` as its `prefixLen`), so `synth.text().size()` IS that
-    // length. Deriving it here rather than threading a second spelling of the
-    // same number is what keeps the two from disagreeing.
-    std::string_view const tail = productText ? productText() : std::string_view{};
-
-    // ── Steps 3 + 4: drop trivia, then parse + fold (a surviving identifier ->
+    // ── Step 3: drop trivia, then parse + fold (a surviving identifier ->
     // 0 happens inside the parser's primary). ──
     std::vector<Token> nonTrivia;
-    nonTrivia.reserve(expanded.size());
-    for (Token const& t : expanded) {
+    nonTrivia.reserve(afterDefined.size());
+    for (Token const& t : afterDefined) {
         if (!isTriviaTok(t)) nonTrivia.push_back(t);
     }
 

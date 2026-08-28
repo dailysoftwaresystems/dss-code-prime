@@ -88,6 +88,23 @@ _Static_assert(sizeof(struct N) == 528,
                "the 16-byte alignment propagates through the aggregate (a "
                "_BitInt(128) member would make this 520)");
 
+/* ── A 128-BIT CONSTANT NARROWED BY AN EXPLICIT CAST, IN AN INTEGER-CONSTANT-
+ * EXPRESSION CONTEXT (D-CSUBSET-INT128-ICE-CONTEXT-REFUSED). ✔MEASURED at
+ * 301e2a63: every line below was `S0029 not an integer constant expression`
+ * while clang 18.1.3 (`-std=c23`) and gcc 13.3.0 (`-std=c2x`), probed
+ * SEPARATELY, folded all of them — and the `_BitInt` twin two lines down was
+ * ALREADY clean, which is what showed the two arms of one law had drifted.
+ * ⚠ THE LAST ONE IS THE LOAD-BEARING CELL: the operand does NOT fit 64 bits, so
+ * it pins that an EXPLICIT narrowing is the DEFINED modular conversion (C
+ * 6.3.1.3p2) rather than a refusal — while a BARE wide value used as a bound
+ * (`int a[(__uint128_t)1 << 100];`) must STILL fail loud, which it does. */
+_Static_assert((int)((__uint128_t)5) == 5, "wide -> int in an ICE");
+_Static_assert((unsigned long long)((__uint128_t)5) == 5, "wide -> u64 in an ICE");
+_Static_assert((_BitInt(8))((__uint128_t)5) == 5, "the _BitInt twin, already clean");
+_Static_assert((unsigned long long)(((__uint128_t)1 << 100) + 7) == 7,
+               "an explicit narrowing of a value that does NOT fit 64 bits is "
+               "C 6.3.1.3p2's modular conversion, not a refusal");
+
 /* ── RUNTIME block. Nothing below reads a `_Static_assert`. ───────────────────────── */
 
 typedef unsigned long long u64;
@@ -124,6 +141,46 @@ static long long          hiAsLongLong (__int128 r)    { return (long long)(r >>
 static long               hiAsLong     (__int128 r)    { return (long)(r >> 64); }
 
 struct Box { __uint128_t v; u64 lo; };
+
+/* ── t9: THE MATERIALIZATION SITES THE FIRST ROSTER LEFT OUT ─────────────────────
+ * D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE lists SEVEN contexts a wide value
+ * can be narrowed into. t1..t7 above cover return, assignment, initializer, pointer
+ * store, struct MEMBER store and array-element store. The four below are the rest —
+ * CALL ARGUMENT, COMPOUND ASSIGNMENT, STRUCT BRACE-INITIALIZER and TERNARY — and
+ * they are here because the row's own lesson is that a suite over a SUBSET of a
+ * multi-site contract is not proof of the contract, which is exactly how the defect
+ * shipped. Every one uses a 64-bit SPELLING (`unsigned long long` / `unsigned long`
+ * / `long`), because those are the four names over two kinds that made the declared
+ * TypeId differ from the canonical primitive; the sub-64-bit widths cannot see it.
+ *
+ * ★ THE TERNARY ARM ALSO CARRIES THE `(_Bool)` WITNESS, and it is the shape that
+ * found the defect: `c ? (_Bool)(w >> 64) : (_Bool)0` used to wall with
+ * `L_UnsupportedLoweringForOpcode Trunc result: TypeKind ordinal 0`, because the
+ * `(_Bool)0` arm took HIR→MIR's `mapCast` — which classifies `_Bool` as an 8-bit
+ * integer, so an int→`_Bool` cast became a WIDTH TRUNCATION keeping only the low
+ * bit. `wHi` here is 2 (an EVEN number, low bit 0) and its truth value is TRUE, so
+ * a truncating `(_Bool)` answers false and this term goes to 0. */
+static u64  sinkULL(unsigned long long v) { return (u64)v; }
+struct Halves { unsigned long hi; long shi; };
+
+static int wideSiteMatrix(__uint128_t w, __int128 sn, int cond) {
+    /* CALL ARGUMENT */
+    u64 const viaArg = sinkULL((unsigned long long)(w >> 64));
+    /* COMPOUND ASSIGNMENT into a 64-bit spelling */
+    unsigned long long acc = 1ull;
+    acc += (unsigned long long)(w >> 64);
+    /* STRUCT BRACE-INITIALIZER, both signednesses */
+    struct Halves const h = { (unsigned long)(w >> 64), (long)(sn >> 64) };
+    /* TERNARY, whose two arms must agree on the narrowed type */
+    unsigned long long const tv = cond ? (unsigned long long)(w >> 64) : 0ull;
+    /* `(_Bool)` of a WIDE value whose LOW LIMB IS ZERO, and of an EVEN scalar —
+     * both are TRUE, and both are false under a low-bit truncation. */
+    _Bool const bWide = (_Bool)(w & ~(__uint128_t)0xFFFFFFFFFFFFFFFFull);
+    _Bool const bEven = (_Bool)(int)(w >> 64);
+    return (viaArg == 2ull && acc == 3ull
+            && h.hi == (unsigned long)2ull && h.shi == (long)-3
+            && tv == 2ull && bWide == 1 && bEven == 1) ? 1 : 0;
+}
 
 int main(void) {
     /* Runtime seeds — every 128-bit operand descends from one of these, so no
@@ -224,5 +281,10 @@ int main(void) {
               && (u64)(dec >> 64) == 0ull
               && (u64)dec == 0xFFFFFFFFFFFFFFFFull) ? 1 : 0;
 
-    return (t1 + t2 + t3 + t4 + t5 + t6 + t7) * t8;   /* 7 * 6 * 1 == 42 */
+    /* t9: the four REMAINING materialization sites plus the `(_Bool)` witness —
+     * MULTIPLICATIVE, exactly like t8, so it is load-bearing without rebalancing
+     * t1..t7. `w` has high word 2 and `sn >> 64` is -3 (both computed above). */
+    int t9 = wideSiteMatrix(w, sn, s1 != 0);
+
+    return (t1 + t2 + t3 + t4 + t5 + t6 + t7) * t8 * t9;   /* 7 * 6 * 1 * 1 == 42 */
 }

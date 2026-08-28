@@ -698,18 +698,75 @@ void LspServer::enqueueParse_(std::string uri) {
         // `D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE`.
         dss::UnitBuilder builder{snap.schema, dss::DiagnosticBudget::libraryDefault()};
         builder.setHeaderNameMatching(dss::kDefaultHeaderNameMatching);
+        // ★★★ D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS
+        //
+        // THE LANGUAGE'S SYSTEM INCLUDE PATH — the `/usr/include` analogue the
+        // angle form `#include <h>` resolves against. Without this call
+        // `systemDirs` was EMPTY, so no shipped descriptor resolved and the
+        // editor compiled every buffer against a corpus the compiler never uses.
+        // ✔MEASURED through a real `dsscp --lsp` child, same file both ways:
+        // `#include <stdbool.h>` -> CLI rc=0, editor `P_PreprocessorErrorDirective`.
+        // That is a FALSE ALARM on the line the user is looking at.
+        //
+        // ★ IT IS NOT GATED ON THE WORKSPACE TARGET, and that is the distinction
+        // from the three channels reasoned about below.
+        // `semantics.shippedLibDirs` is a property of the LANGUAGE, and the
+        // language is exactly what a snapshot already carries (`snap.schema`) —
+        // there is nothing here to guess and nothing to wait for. The three
+        // channels below (target predefines, format predefines, header-name
+        // matching) are properties of a `<target>:<format>` pair the editor does
+        // not have; this one never was. Do not fold it into
+        // [[D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE]]: different axis.
+        //
+        // ⚠ AND IT MUST LAND WITH THE `driverDiagnostics()` PUBLISH BELOW, in
+        // BOTH directions. ✔MEASURED (the red-on-disable arm that removes THIS
+        // line): publishing driver diagnostics with an EMPTY system path puts
+        // ELEVEN spurious `C_UnbackedPredefinedMacro` diagnostics on every open
+        // document — including a buffer with no `#include` at all —
+        // because `UnitBuilder::finish()` validates each predefined macro's
+        // `impliedSurface` claim against the corpus reached through
+        // `systemDirs_`, and with no dirs every claim is unbacked. Half of this
+        // fix alone is worse than neither half.
+        // ⓘ The COUNT is a property of `c.lang.json`'s predefine set and will
+        // move when that document does; the pin asserts ZERO, never a number.
+        dss::applySystemDirs(builder, *snap.schema);
         builder.addInMemory(snap.text, uri);
         auto cu = std::make_shared<dss::CompilationUnit>(
             std::move(builder).finish());
         auto model = std::make_shared<dss::SemanticModel const>(
             dss::analyze(cu, dss::DiagnosticBudget::libraryDefault()));
 
-        // Union the per-tree parse diagnostics (lexer + parser, folded by
-        // UnitBuilder) with the semantic diagnostics for publishing.
+        // Union the CU's DRIVER diagnostics with the per-tree parse diagnostics
+        // (lexer + parser, folded by UnitBuilder) and the semantic diagnostics.
+        //
+        // ★★★ THE DRIVER TIER USED TO BE DROPPED ENTIRELY, AND ITS ABSENCE WAS
+        // SILENT — D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS.
+        // `CompilationUnit::driverDiagnostics()` is where the import resolver
+        // puts `F_ShippedHeaderNotFound`, `D_UnresolvedImport` and
+        // `D_FileNotFound`; this function published only the parse and semantic
+        // streams. ✔MEASURED through a real `dsscp --lsp` child:
+        // `#include <definitely_not_a_header_xyz.h>` -> CLI rc=1 `error[F001A]`,
+        // editor an EMPTY diagnostics array, which every client renders as a
+        // CLEAN FILE. An editor that stays silent about a miss the compiler
+        // calls fatal is the same class of harm as a silent miscompile: the
+        // instrument the user is watching reported success.
+        //
+        // ⓘ DRIVER FIRST, then parse, then semantic — the order the tiers run
+        // in, so a header that could not be found is read before the cascade of
+        // undeclared identifiers it caused.
+        //
+        // ⚠ EVERY tree's diagnostics, not `trees()[0]`'s, is a DIFFERENT
+        // question and is deliberately NOT changed here: an auto-loaded include
+        // is a full member of `cu->trees()`, and publishing those is
+        // [[D-LSP-DIAGNOSTIC-RENDERED-AGAINST-THE-OPEN-DOCUMENT-IGNORING-ITS-BUFFER]]'s
+        // territory (which already made `publishDiagnostics_` group by ORIGIN
+        // uri, so the grouping is ready for it).
         std::vector<dss::ParseDiagnostic> diags;
+        auto driverDiags = cu->driverDiagnostics().all();
+        diags.assign(driverDiags.begin(), driverDiags.end());
         if (!cu->trees().empty()) {
             auto parseDiags = cu->trees()[0].diagnostics().all();
-            diags.assign(parseDiags.begin(), parseDiags.end());
+            diags.insert(diags.end(), parseDiags.begin(), parseDiags.end());
         }
         auto semDiags = model->diagnostics().all();
         diags.insert(diags.end(), semDiags.begin(), semDiags.end());

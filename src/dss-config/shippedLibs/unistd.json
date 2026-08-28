@@ -57,7 +57,7 @@
     { "name": "swab",        "signature": "fn(ptr<char>, ptr<char>, i32) -> void",       "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] }
   ],
   "macros": [
-    { "name": "environ", "variants": [{ "when": { "format": "elf" }, "replacement": "__environ" }] }
+    { "name": "environ", "availableObjectFormats": ["elf"], "variants": [{ "when": { "format": "elf" }, "replacement": "__environ" }] }
   ],
   "typedefs": [
     { "name": "uuid_t", "variants": [

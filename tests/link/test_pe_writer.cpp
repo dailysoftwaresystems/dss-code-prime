@@ -5680,3 +5680,632 @@ TEST(PeExecWriter, StackReserveBoundsAreInclusiveAtBothEnds) {
             << want << " must not silently fall back to the default";
     }
 }
+
+// ── D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO — the Obj-arm unwind belt ──
+//
+// The image arm carries `D-WIN64-PDATA-ARM64-SILENT-SKIP`'s refusal (pinned
+// above by `NonX64MachineCarryingUnwindInfoFailsLoudButCfiFreeStillEncodes`).
+// The Obj arm dropped the SAME information for the SAME reason and said
+// nothing. These pins are that arm's equivalent.
+//
+// ⚠ THE PREMISE THAT KEPT IT UNGUARDED IS MEASURABLY FALSE. Three documents
+// state "AssembledFunction::unwind is nullopt on the object path by
+// construction" — `src/asm/asm.hpp`'s `cfi` comment and the
+// `$sehPersonalityOmittedComment` of both PE object formats. ✔MEASURED
+// 2026-08-27, one non-leaf source with NO `__try`, three targets off the same
+// front end: `elf64-x86_64-linux` (an OBJECT) emits `.eh_frame` 68 B +
+// `.rela.eh_frame` 24 B; `pe64-x86_64-windows-exec` emits `.xdata` 32 B +
+// `.pdata` 36 B; `pe64-x86_64-windows` (an OBJECT) emits `.text` alone, rc=0,
+// silently. `cfi` arrives populated on the object path. The gap is in the
+// WRITER.
+namespace {
+
+// A pe **Obj** schema identical in shape to the shipped `pe64-x86_64-windows`
+// except that it DECLARES `sehPersonality`. That declaration is exactly the
+// trap both shipped format documents warn about: the `synthesizeSehFunclets`
+// diagnostic used to end with "Add the block", and adding it makes the compile
+// SUCCEED while `.pdata`/`.xdata` vanish. It is synthesized HERE rather than
+// taken from the shipped tree precisely because no shipped format may carry it
+// — `tests/link/test_runtime_library_roles.cpp` asserts that — so the only way
+// to drive the writer with it is to build one.
+//
+// ★ SYNTHESIZED IN THE **REMOVE-FROM-CORRECT** DIRECTION, not the add-a-feature
+// one: the fixture takes the shipped Obj format and adds the key whose ABSENCE
+// is load-bearing, so the pin fails when the writer stops noticing rather than
+// when it stops supporting something.
+[[nodiscard]] char const* peObjSchemaWithPersonalityJson() {
+    return R"({
+      "$comment": "SYNTHETIC pe64 OBJ schema that declares sehPersonality. No shipped PE object format may carry this key (test_runtime_library_roles.cpp enforces it); this exists only to drive pe::encode's Obj arm with the declaration that would otherwise silently drop unwind tables.",
+      "dssObjectFormatVersion": 1,
+      "stackReserveUnsupportedReason": "no-image-field",
+      "format": {"name": "pe64-x86_64-windows-personality-synthetic", "version": "1.0", "kind": "pe"},
+      "dataModel": "LLP64",
+      "headerNameMatching": "case-insensitive",
+      "cSymbolDecoration": {"scheme": "none"},
+      "bitFieldStrategy": "msvc_straddle",
+      "longDoubleFormat": "f64",
+      "externCallDispatch": "direct-plt",
+      "weakDefinition": {"dialect": "comdat"},
+      "runtimeLibraries": [{"role":"unwindPersonality","image":"ucrtbase.dll"}],
+      "sehPersonality": {"role": "unwindPersonality", "mangledName": "__C_specific_handler"},
+      "pe": {"machine": 34404, "characteristics": 0},
+      "sections": [
+        {"kind":"text","name":".text","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0}
+      ],
+      "relocations": [
+        {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
+        {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
+        {"name":"IMAGE_REL_AMD64_ADDR32","kind":3,"nativeId":2}
+      ]
+    })";
+}
+
+// ONE module shape, three arms. `withCfi` and `withTry` are the ONLY things
+// that move between the refusal cases and the encodes-fine case, so each pin
+// measures the presence of unwind information and nothing else.
+[[nodiscard]] AssembledModule makePeObjUnwindModule(bool withCfi, bool withTry) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // `sub rsp,0x28` ; `add rsp,0x28` ; `ret`. Opaque to the walker — it never
+    // decodes instruction bytes on this path.
+    fn.bytes = {0x48, 0x83, 0xEC, 0x28, 0x48, 0x83, 0xC4, 0x28, 0xC3};
+    if (withCfi) {
+        CfiFunction cfi;
+        cfi.codeLength    = 9;
+        cfi.initial       = CfiInitialState{/*cfaRegister=*/7, /*cfaOffset=*/8,
+                                            /*returnAddressAtCfaOffset=*/-8,
+                                            /*returnAddressRegister=*/std::nullopt};
+        cfi.prologueEndPc = 4;
+        cfi.ops = { CfiOp{4, CfiOpKind::DefCfaOffset, CfiRegRef{},
+                          CfiRegRef{}, 0x30} };
+        fn.cfi = std::move(cfi);
+    }
+    if (withTry) {
+        SehScopeEntry scope;
+        scope.beginByteOffset      = 4;
+        scope.endByteOffset        = 8;
+        scope.jumpTargetByteOffset = 8;
+        scope.filterFuncletSymbol  = SymbolId{2};
+        scope.personalitySymbol    = SymbolId{3};
+        fn.sehScopes.push_back(scope);
+    }
+    mod.functions.push_back(std::move(fn));
+    return mod;
+}
+
+
+// ── Reading a `.obj` back — D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO ──
+//
+// ★ THE ASSERTIONS BELOW ARE ON EMITTED BYTES, NEVER ON A RETURN CODE, and
+// that is not a stylistic preference: the whole defect was an encode that
+// returned SUCCESS while the unwind data was absent. An rc-shaped assertion
+// cannot see it, and neither can DSS's own `coff_object_reader`, which skips
+// `.pdata`/`.xdata` as unmodeled metadata (D-LK-COFF-FOREIGN-UNWIND-DROP). So
+// these walk the COFF structures directly.
+constexpr std::uint16_t kImageRelAmd64Addr32NB = 3;
+
+struct ObjSectionHeader {
+    std::string   name;
+    std::uint32_t sizeOfRawData        = 0;
+    std::uint32_t pointerToRawData     = 0;
+    std::uint32_t pointerToRelocations = 0;
+    std::uint16_t numberOfRelocations  = 0;
+    std::uint32_t characteristics      = 0;
+    std::int16_t  ordinal              = 0;   // 1-based, as a SectionNumber
+};
+
+[[nodiscard]] std::vector<ObjSectionHeader>
+peObjSections(std::vector<std::uint8_t> const& obj) {
+    std::vector<ObjSectionHeader> out;
+    if (obj.size() < 20u) return out;
+    std::uint16_t const n       = readU16LE(obj, 2);
+    std::uint16_t const optSize = readU16LE(obj, 16);
+    for (std::uint16_t i = 0; i < n; ++i) {
+        std::size_t const h =
+            20u + static_cast<std::size_t>(optSize) + static_cast<std::size_t>(i) * 40u;
+        if (obj.size() < h + 40u) break;
+        ObjSectionHeader s;
+        for (std::size_t b = 0; b < 8 && obj[h + b] != 0; ++b) {
+            s.name.push_back(static_cast<char>(obj[h + b]));
+        }
+        s.sizeOfRawData        = readU32LE(obj, h + 16);
+        s.pointerToRawData     = readU32LE(obj, h + 20);
+        s.pointerToRelocations = readU32LE(obj, h + 24);
+        s.numberOfRelocations  = readU16LE(obj, h + 32);
+        s.characteristics      = readU32LE(obj, h + 36);
+        s.ordinal              = static_cast<std::int16_t>(i + 1);
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+[[nodiscard]] ObjSectionHeader const*
+findSection(std::vector<ObjSectionHeader> const& secs, std::string_view name) {
+    for (auto const& s : secs) {
+        if (s.name == name) return &s;
+    }
+    return nullptr;
+}
+
+// The ordinal of the `occurrence`-th section carrying `name` (0-based). A
+// COMDAT shares its ordinary sibling's NAME, so a weak function's body is a
+// SECOND `.text` — the occurrence index is the only thing that tells them
+// apart from outside.
+[[nodiscard]] std::int16_t
+peObjSectionOrdinal(std::vector<ObjSectionHeader> const& secs,
+                    std::string_view name, std::size_t occurrence) {
+    std::size_t seen = 0;
+    for (auto const& s : secs) {
+        if (s.name != name) continue;
+        if (seen++ == occurrence) return s.ordinal;
+    }
+    return 0;
+}
+
+struct ObjReloc {
+    std::uint32_t virtualAddress   = 0;
+    std::uint32_t symbolTableIndex = 0;
+    std::uint16_t type             = 0;
+};
+
+[[nodiscard]] std::vector<ObjReloc>
+peObjRelocations(std::vector<std::uint8_t> const& obj,
+                 ObjSectionHeader const&          sec) {
+    std::vector<ObjReloc> out;
+    for (std::uint16_t i = 0; i < sec.numberOfRelocations; ++i) {
+        std::size_t const o = static_cast<std::size_t>(sec.pointerToRelocations)
+                            + static_cast<std::size_t>(i) * 10u;
+        if (obj.size() < o + 10u) break;
+        out.push_back({readU32LE(obj, o), readU32LE(obj, o + 4),
+                       readU16LE(obj, o + 8)});
+    }
+    return out;
+}
+
+[[nodiscard]] std::vector<std::uint8_t>
+peObjSectionBytes(std::vector<std::uint8_t> const& obj,
+                  ObjSectionHeader const&          sec) {
+    std::size_t const b = sec.pointerToRawData;
+    std::size_t const e = b + sec.sizeOfRawData;
+    if (b == 0 || e > obj.size()) return {};
+    return {obj.begin() + static_cast<std::ptrdiff_t>(b),
+            obj.begin() + static_cast<std::ptrdiff_t>(e)};
+}
+
+// IMAGE_SYMBOL: Name[8] Value[4] SectionNumber[2] Type[2] StorageClass[1]
+// NumberOfAuxSymbols[1]. A name longer than 8 chars is `[0][strtab offset]`.
+[[nodiscard]] std::string
+peObjSymbolName(std::vector<std::uint8_t> const& obj, std::uint32_t idx) {
+    std::uint32_t const symPtr  = readU32LE(obj, 8);
+    std::uint32_t const numSyms = readU32LE(obj, 12);
+    std::size_t const   rec     = static_cast<std::size_t>(symPtr)
+                            + static_cast<std::size_t>(idx) * 18u;
+    if (obj.size() < rec + 18u) return {};
+    std::string s;
+    if (readU32LE(obj, rec) == 0u) {
+        std::size_t const strtab = static_cast<std::size_t>(symPtr)
+                                 + static_cast<std::size_t>(numSyms) * 18u;
+        std::size_t i = strtab + readU32LE(obj, rec + 4);
+        for (; i < obj.size() && obj[i] != 0; ++i) {
+            s.push_back(static_cast<char>(obj[i]));
+        }
+        return s;
+    }
+    for (std::size_t b = 0; b < 8 && obj[rec + b] != 0; ++b) {
+        s.push_back(static_cast<char>(obj[rec + b]));
+    }
+    return s;
+}
+
+[[nodiscard]] bool
+peObjHasUndefinedSymbol(std::vector<std::uint8_t> const& obj,
+                        std::string_view                 name) {
+    std::uint32_t const symPtr  = readU32LE(obj, 8);
+    std::uint32_t const numSyms = readU32LE(obj, 12);
+    for (std::uint32_t i = 0; i < numSyms;) {
+        std::size_t const rec = static_cast<std::size_t>(symPtr)
+                              + static_cast<std::size_t>(i) * 18u;
+        if (obj.size() < rec + 18u) break;
+        std::uint8_t const nAux = obj[rec + 17];
+        auto const sectionNumber =
+            static_cast<std::int16_t>(readU16LE(obj, rec + 12));
+        if (sectionNumber == 0 && peObjSymbolName(obj, i) == name) return true;
+        i += 1u + nAux;
+    }
+    return false;
+}
+
+// Auxiliary Format 5 (Section Definitions): Length[4] NumberOfRelocations[2]
+// NumberOfLinenumbers[2] CheckSum[4] Number[2] Selection[1] Unused[3].
+struct ObjSectionDefAux {
+    std::uint32_t length    = 0;
+    std::uint16_t numRelocs = 0;
+    std::uint16_t number    = 0;
+    std::uint8_t  selection = 0;
+};
+
+[[nodiscard]] std::optional<ObjSectionDefAux>
+peObjSectionDefAux(std::vector<std::uint8_t> const& obj,
+                   std::string_view                 name) {
+    std::uint32_t const symPtr  = readU32LE(obj, 8);
+    std::uint32_t const numSyms = readU32LE(obj, 12);
+    for (std::uint32_t i = 0; i < numSyms;) {
+        std::size_t const rec = static_cast<std::size_t>(symPtr)
+                              + static_cast<std::size_t>(i) * 18u;
+        if (obj.size() < rec + 18u) break;
+        std::uint8_t const nAux = obj[rec + 17];
+        if (nAux == 1u && peObjSymbolName(obj, i) == name
+            && obj.size() >= rec + 36u) {
+            std::size_t const a = rec + 18u;
+            return ObjSectionDefAux{readU32LE(obj, a), readU16LE(obj, a + 4),
+                                    readU16LE(obj, a + 12), obj[a + 14]};
+        }
+        i += 1u + nAux;
+    }
+    return std::nullopt;
+}
+
+// The personality-declaring fixture PLUS the image-relative relocation row,
+// which is what an object needs before it can state an RVA at all. Its
+// sibling above deliberately WITHOUT that row is the refusal fixture.
+[[nodiscard]] char const* peObjSchemaWithPersonalityAndRvaRelocJson() {
+    return R"({
+      "$comment": "SYNTHETIC pe64 OBJ schema declaring BOTH sehPersonality and the image-relative relocation row. No shipped PE object format declares the personality (test_runtime_library_roles.cpp enforces it), so this is the only way to drive pe::encode's Obj arm through a __try scope table.",
+      "dssObjectFormatVersion": 1,
+      "stackReserveUnsupportedReason": "no-image-field",
+      "format": {"name": "pe64-x86_64-windows-personality-rva-synthetic", "version": "1.0", "kind": "pe"},
+      "dataModel": "LLP64",
+      "headerNameMatching": "case-insensitive",
+      "cSymbolDecoration": {"scheme": "none"},
+      "bitFieldStrategy": "msvc_straddle",
+      "longDoubleFormat": "f64",
+      "externCallDispatch": "direct-plt",
+      "weakDefinition": {"dialect": "comdat"},
+      "runtimeLibraries": [{"role":"unwindPersonality","image":"ucrtbase.dll"}],
+      "sehPersonality": {"role": "unwindPersonality", "mangledName": "__C_specific_handler"},
+      "pe": {"machine": 34404, "characteristics": 0},
+      "sections": [
+        {"kind":"text","name":".text","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0}
+      ],
+      "relocations": [
+        {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
+        {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
+        {"name":"IMAGE_REL_AMD64_ADDR32","kind":3,"nativeId":2},
+        {"name":"IMAGE_REL_AMD64_ADDR32NB","kind":6,"nativeId":3}
+      ]
+    })";
+}
+
+// A parent function guarding ONE `__try`, its synthesized filter funclet, and
+// the personality extern. The three symbols are what a scope table names, and
+// each has to be reachable from the symbol table for the table to relocate.
+[[nodiscard]] AssembledModule makePeObjTryModule() {
+    AssembledModule mod = makePeObjUnwindModule(/*withCfi=*/true,
+                                                /*withTry=*/true);
+    mod.expectedFuncCount = 2;
+    AssembledFunction funclet;
+    funclet.symbol = SymbolId{2};
+    funclet.bytes  = {0x31, 0xC0, 0xC3};   // xor eax,eax ; ret
+    mod.functions.push_back(std::move(funclet));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "guarded",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{2}, "guarded$filt$0",
+                                       SymbolBinding::Local,
+                                       SymbolVisibility::Default});
+    ExternImport personality;
+    personality.symbol      = SymbolId{3};
+    personality.mangledName = "__C_specific_handler";
+    personality.isData      = false;
+    mod.externImports.push_back(std::move(personality));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{3}, "__C_specific_handler",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    return mod;
+}
+
+// The same one-function shape, but its definition is WEAK — so its body is a
+// COMDAT and its unwind tables must be COMDATs associative to it.
+[[nodiscard]] AssembledModule makePeObjWeakUnwindModule() {
+    AssembledModule mod = makePeObjUnwindModule(/*withCfi=*/true,
+                                                /*withTry=*/false);
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "weakfn",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+    return mod;
+}
+
+} // namespace
+
+TEST(PeObjWriter, ATryRegionCarriesItsScopeTableIntoTheObject) {
+    // ★ THE PIN THAT USED TO ASSERT THIS WAS REFUSED, INVERTED.
+    // A `__try` reaching the Obj arm was the worst shape of this defect: the
+    // synthesized filter funclets and the __C_specific_handler scope table were
+    // consumed ONLY by `encodeExec`'s `.xdata` emitter, so the object linked,
+    // the program ran, a fault landed inside the guarded range, and the walk
+    // went straight past a handler that was in no unwind table.
+    //
+    // `buildFunctionUnwindInfo` now states every RVA field of an UNWIND_INFO —
+    // the scope table's Begin / End / HandlerAddress / JumpTarget and the
+    // personality handler's own — as a PATCH REQUEST rather than a resolved
+    // image address, so this arm realizes each as an image-relative relocation
+    // exactly as it does the RUNTIME_FUNCTION fields.
+    //
+    // ⚠ THE ASSERTION IS ON THE EMITTED BYTES, NOT ON rc=0. The whole defect
+    // was an encode that returned success with the data absent, so a return
+    // code cannot see it: this reads the `.xdata` section's own relocation
+    // table and counts the fields that became relocations.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaWithPersonalityAndRvaRelocJson(),
+        "synthetic-pe-obj-personality-rva");
+    ASSERT_TRUE(fmt.has_value());
+    ASSERT_TRUE((*fmt)->sehPersonality().has_value())
+        << "the fixture is only meaningful if the declaration actually loaded";
+
+    DiagnosticReporter rep;
+    auto obj = pe::encode(makePeObjTryModule(), **target, **fmt, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(obj.empty());
+
+    auto const secs = peObjSections(obj);
+    auto const xdata = findSection(secs, ".xdata");
+    ASSERT_NE(xdata, nullptr) << "a __try function must carry an `.xdata`";
+    // ONE scope: UNWIND_INFO header + codes, then the handler RVA, then
+    // `count` plus four fields. FIVE of those are addresses, so five
+    // relocations — and every one of them must be the image-relative kind.
+    EXPECT_EQ(xdata->numberOfRelocations, 5u)
+        << "the personality handler plus a scope's Begin/End/Handler/"
+           "JumpTarget are five RVAs, and in an object every RVA is a "
+           "relocation - a lower count means a field was written as a raw "
+           "number the linker will never fix up";
+    for (auto const& r : peObjRelocations(obj, *xdata)) {
+        EXPECT_EQ(r.type, kImageRelAmd64Addr32NB)
+            << "an UNWIND_INFO field holds an RVA; ADDR32 there writes a full "
+               "VA the unwinder reads as an offset from the image base";
+    }
+    // The personality is an EXTERN. It must have reached the symbol table via
+    // the unwind scan, not merely been assumed present: an object that names
+    // no `__C_specific_handler` has a scope table pointing at symbol 0.
+    EXPECT_TRUE(peObjHasUndefinedSymbol(obj, "__C_specific_handler"))
+        << "the scope table's personality field must bind to an undefined "
+           "external symbol the final linker resolves";
+}
+
+TEST(PeObjWriter, DeclaringAPersonalityWithoutTheRvaRelocationIsRefused) {
+    // ★ THE TRAP, RE-AIMED AT WHAT IS ACTUALLY MISSING NOW.
+    // The old shape of this pin refused "the format declares `sehPersonality`
+    // while a function carries `cfi`", because the writer emitted no unwind
+    // tables at all and declaring the personality turned a loud refusal into a
+    // silent drop. That refusal is gone with the gap it guarded.
+    //
+    // What replaces it is narrower and still fail-loud: an object CANNOT carry
+    // an unwind table without an image-relative 32-bit relocation, so a format
+    // that declares the personality but maps no COFF type to the target's
+    // `imagerel32` row is refused BY THE WRITER rather than emitting a
+    // `.pdata` whose fields are raw section offsets. This fixture is exactly
+    // the shipped-Obj schema plus `sehPersonality` and WITHOUT the ADDR32NB
+    // row — the REMOVE direction, so the pin fails when the writer stops
+    // checking rather than when it stops supporting something.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(peObjSchemaWithPersonalityJson(),
+                                                "synthetic-pe-obj-personality");
+    ASSERT_TRUE(fmt.has_value());
+    ASSERT_TRUE((*fmt)->sehPersonality().has_value())
+        << "the fixture is only meaningful if the declaration actually loaded";
+
+    {
+        DiagnosticReporter rep;
+        auto obj = pe::encode(makePeObjUnwindModule(/*withCfi=*/true,
+                                                    /*withTry=*/false),
+                              **target, **fmt, rep);
+        EXPECT_TRUE(obj.empty())
+            << "an object whose RUNTIME_FUNCTION fields cannot be relocated "
+               "must emit NO bytes -- never a `.pdata` full of raw offsets";
+        EXPECT_EQ(::dss::test_support::countCode(
+                      rep, DiagnosticCode::K_RelocationKindMismatch),
+                  1u);
+        bool named = false;
+        for (auto const& d : rep.all()) {
+            if (d.code != DiagnosticCode::K_RelocationKindMismatch) continue;
+            if (d.actual.find("maps no COFF type") == std::string::npos) continue;
+            named = true;
+            EXPECT_NE(d.actual.find("imagerel32"), std::string::npos)
+                << "must name the target row it could not map: " << d.actual;
+            EXPECT_NE(d.actual.find("RtlLookupFunctionEntry"),
+                      std::string::npos)
+                << "must state the runtime consequence, not just the omission: "
+                << d.actual;
+            EXPECT_NE(d.actual.find("D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO"),
+                      std::string::npos)
+                << "must cite the anchor for future-grep navigability: " << d.actual;
+            break;
+        }
+        EXPECT_TRUE(named) << "the refusal must NAME the unmapped relocation";
+    }
+
+    // ── the complementary arm: the SHIPPED format, same module ─────
+    // This is the half that proves the refusal keys on the MISSING RELOCATION
+    // and not on `cfi` alone. A guard keyed on `cfi` would refuse every pe
+    // `.obj` compile in the corpus and still pass the arm above.
+    {
+        auto loaded = loadShipped();
+        ASSERT_TRUE(loaded.target);
+        ASSERT_TRUE(loaded.format);
+        DiagnosticReporter rep;
+        auto obj = pe::encode(makePeObjUnwindModule(/*withCfi=*/true,
+                                                    /*withTry=*/false),
+                              *loaded.target, *loaded.format, rep);
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_FALSE(obj.empty());
+    }
+}
+
+TEST(PeObjWriter, OrdinaryFramesCarryPdataAndXdataShapedLikeGccs) {
+    // ★★ THE REDEEMED PROMISSORY NOTE. This test replaces
+    // `TheUnwindGapItselfIsPinnedSoItsClosureAnnouncesItself`, which asserted
+    // the ABSENCE of `.pdata` and `.xdata` and was written to go RED the day
+    // the emitter landed. It did. The absence assertion is now the positive
+    // one it was holding a place for.
+    //
+    // ✔THE REFERENCE, MEASURED 2026-08-27 against gcc 13.2.0's OWN x64 COFF
+    // `.obj` (`gcc -c` on a three-function non-leaf source): `.xdata` 32 B
+    // with ZERO relocations, `.pdata` 36 B with NINE relocations, all of type
+    // IMAGE_REL_AMD64_ADDR32NB (3) — three per RUNTIME_FUNCTION, two naming
+    // the code and one naming `.xdata`, with each field's addend stamped in
+    // the section bytes because COFF carries no addend column. This asserts
+    // that shape, per function, on DSS's own output.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    DiagnosticReporter rep;
+    auto obj = pe::encode(makePeObjUnwindModule(/*withCfi=*/true,
+                                                /*withTry=*/false),
+                          *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(obj.empty());
+
+    auto const secs = peObjSections(obj);
+    auto const* text  = findSection(secs, ".text");
+    auto const* xdata = findSection(secs, ".xdata");
+    auto const* pdata = findSection(secs, ".pdata");
+    ASSERT_NE(text, nullptr) << "the object must still carry its code";
+    ASSERT_NE(xdata, nullptr)
+        << "`.xdata` is absent: a PE relocatable object with call-frame "
+           "information must carry the UNWIND_INFO it describes";
+    ASSERT_NE(pdata, nullptr)
+        << "`.pdata` is absent: without a RUNTIME_FUNCTION the UNWIND_INFO is "
+           "unreachable and RtlLookupFunctionEntry finds nothing";
+
+    // gcc's own Characteristics for both, byte for byte:
+    // IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_ALIGN_4BYTES | MEM_READ.
+    EXPECT_EQ(xdata->characteristics, 0x40300040u);
+    EXPECT_EQ(pdata->characteristics, 0x40300040u);
+
+    // ONE function ⇒ ONE 12-byte RUNTIME_FUNCTION ⇒ THREE relocations.
+    EXPECT_EQ(pdata->sizeOfRawData, 12u);
+    EXPECT_EQ(pdata->numberOfRelocations, 3u);
+    EXPECT_EQ(xdata->numberOfRelocations, 0u)
+        << "a frame with no `__try` names no address inside its UNWIND_INFO, "
+           "so `.xdata` needs no relocations -- exactly what gcc emits";
+
+    auto const rels = peObjRelocations(obj, *pdata);
+    ASSERT_EQ(rels.size(), 3u);
+    for (auto const& r : rels) {
+        EXPECT_EQ(r.type, kImageRelAmd64Addr32NB)
+            << "a RUNTIME_FUNCTION field holds an RVA; ADDR32 there writes a "
+               "full VA and the unwinder reads it as an image offset";
+    }
+    EXPECT_EQ(rels[0].virtualAddress, 0u);
+    EXPECT_EQ(rels[1].virtualAddress, 4u);
+    EXPECT_EQ(rels[2].virtualAddress, 8u);
+
+    // THE ADDENDS ARE IN THE FIELD, and that is the half a relocation-count
+    // assertion cannot see: a table with the right relocations and zeroed
+    // fields describes every function as starting at its section's origin.
+    auto const body = peObjSectionBytes(obj, *pdata);
+    ASSERT_EQ(body.size(), 12u);
+    EXPECT_EQ(readU32LE(body, 0), 0u) << "BeginAddress = offset in .text";
+    EXPECT_EQ(readU32LE(body, 4), 9u)
+        << "EndAddress = Begin + the function's 9 machine-code bytes; a "
+           "[Begin, End) that does not cover the body leaves a fault in the "
+           "tail with no unwind entry";
+    EXPECT_EQ(readU32LE(body, 8), 0u) << "UnwindInfoAddress = offset in .xdata";
+
+    // The first two name the FUNCTION and the third names `.xdata` — this
+    // writer mints no `.text` section symbol, so a function symbol is the only
+    // handle for the code fields, and it is also the one that survives COMDAT
+    // selection for a weak definition.
+    EXPECT_EQ(peObjSymbolName(obj, rels[0].symbolTableIndex),
+              peObjSymbolName(obj, rels[1].symbolTableIndex));
+    EXPECT_EQ(peObjSymbolName(obj, rels[2].symbolTableIndex), ".xdata");
+    EXPECT_NE(peObjSymbolName(obj, rels[0].symbolTableIndex), ".xdata");
+}
+
+TEST(PeObjWriter, AModuleWithNoFrameInformationGrowsNoUnwindSections) {
+    // THE COMPLEMENTARY ARM, and it is what keeps the emitter honest: the
+    // trigger is `cfi`, not the format. A writer that stamped `.pdata` on
+    // every object would put an empty RUNTIME_FUNCTION table in every artifact
+    // and would pass every assertion in the test above.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    DiagnosticReporter rep;
+    auto obj = pe::encode(makePeObjUnwindModule(/*withCfi=*/false,
+                                                /*withTry=*/false),
+                          *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(obj.empty());
+
+    auto const secs = peObjSections(obj);
+    EXPECT_EQ(findSection(secs, ".pdata"), nullptr);
+    EXPECT_EQ(findSection(secs, ".xdata"), nullptr);
+    EXPECT_NE(findSection(secs, ".text"), nullptr);
+}
+
+TEST(PeObjWriter, AWeakFunctionsUnwindTablesAreComdatsAssociativeToItsBody) {
+    // ★★ THE CASE THAT IS A SILENT MISCOMPILE IF IT IS GOT WRONG, and it is
+    // invisible in any single object.
+    //
+    // A weak definition (`__attribute__((weak))`, reachable from C today)
+    // already lives in its own IMAGE_SCN_LNK_COMDAT section so the linker keeps
+    // one copy. Putting its RUNTIME_FUNCTION in the SHARED `.pdata` would leave
+    // that entry behind when this object's copy is discarded: the relocation
+    // still resolves — to the surviving copy — so nothing fails, and the image
+    // ends up with an UNWIND_INFO computed from THIS translation unit's
+    // prologue describing an address range now occupied by a DIFFERENT one's
+    // body. A wrong stack walk with no diagnostic anywhere.
+    //
+    // ⇒ each such function's `.xdata`/`.pdata` are their own COMDATs with
+    // Selection IMAGE_COMDAT_SELECT_ASSOCIATIVE (5) and the aux record's
+    // `Number` naming the function's own section, so they are discarded with
+    // it. That is the shape MSVC and gcc both emit.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target);
+    ASSERT_TRUE(loaded.format);
+
+    DiagnosticReporter rep;
+    auto obj = pe::encode(makePeObjWeakUnwindModule(), *loaded.target,
+                          *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(obj.empty());
+
+    auto const secs = peObjSections(obj);
+    auto const* xdata = findSection(secs, ".xdata");
+    auto const* pdata = findSection(secs, ".pdata");
+    ASSERT_NE(xdata, nullptr);
+    ASSERT_NE(pdata, nullptr);
+    constexpr std::uint32_t kScnLnkComdatBit = 0x00001000u;
+    EXPECT_NE(xdata->characteristics & kScnLnkComdatBit, 0u)
+        << "a weak function's `.xdata` must be a COMDAT or it survives the "
+           "discard of the body it describes";
+    EXPECT_NE(pdata->characteristics & kScnLnkComdatBit, 0u)
+        << "a weak function's `.pdata` must be a COMDAT for the same reason";
+
+    // The section symbol's Auxiliary Format 5 is the only place COFF keeps the
+    // Selection byte and the associated ordinal, so that is where this is
+    // asserted rather than on the header alone.
+    auto const weakTextOrdinal = peObjSectionOrdinal(secs, ".text",
+                                                     /*occurrence=*/1);
+    ASSERT_GT(weakTextOrdinal, 0);
+    for (char const* name : {".xdata", ".pdata"}) {
+        auto const aux = peObjSectionDefAux(obj, name);
+        ASSERT_TRUE(aux.has_value()) << name << " has no section-definition aux";
+        EXPECT_EQ(aux->selection, 5u)
+            << name << " must be IMAGE_COMDAT_SELECT_ASSOCIATIVE";
+        EXPECT_EQ(aux->number, static_cast<std::uint16_t>(weakTextOrdinal))
+            << name << "'s associated section must be the weak function's own "
+                       "COMDAT `.text`, not section 1";
+    }
+}

@@ -2776,6 +2776,55 @@ void runErrorTarget(fs::path const&        exampleDir,
         << "\n  actual:"   << join(actual);
 }
 
+// ── THE CORPUS SCRATCH TREE MUST BE PER BUILD TREE ──────────────────────────
+//   D-TEST-EXAMPLES-CORPUS-SCRATCH-IS-SHARED-BY-EVERY-BUILD-TREE
+//
+// Every arm below opens `ScratchDir{Location::InsideRepo, "examples"}`, and
+// that location is literally `<cwd>/test-scratch/examples/<pid>-<n>` — so the
+// cwd ctest hands this process DECIDES which tree ~611 corpus entries write
+// into. While it was `${CMAKE_SOURCE_DIR}` that tree was the CHECKOUT, one
+// directory shared by every build tree, every lane and every worktree of this
+// repository, and 684 leaked directories had accumulated in it.
+//
+// ⚠ WHAT THIS IS *NOT*. It is not a collision guard. `ScratchDir` claims its
+// slot with the SINGULAR `create_directory`, which is atomic in the OS, so two
+// processes cannot share a slot however many of them run at once
+// (`D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE`, closed). The defect this
+// refuses is a shared WRITE LOCATION, and the distinction matters because a
+// reader who thinks it is about collisions will conclude the parallel gate was
+// unsafe, which was measured to be false: two full 1347-entry corpus runs at
+// `ctest -j 6` produced 0 reds before this changed.
+//
+// ★ THE PREDICATE IS "cwd IS A CHECKOUT ROOT", not "cwd is inside the repo".
+// Being inside the repository is fine and unavoidable — the default build tree
+// is `<repo>/build/<name>/`. The one cwd that must never be used is a directory
+// that IS a checkout root, because that is the single path every build tree of
+// that checkout resolves to identically. `src/dss-config` is the same marker
+// `tests/test_support/repo_root.hpp` uses to recognise a checkout, so this asks
+// the question the rest of the harness already asks.
+[[nodiscard]] std::string corpusScratchIsolationFailure() {
+    std::error_code ec;
+    fs::path const cwd = fs::current_path(ec);
+    if (ec) {
+        return "cannot read the process working directory ("
+             + ec.message() + ") — the corpus scratch root is derived from it,"
+               " so this check refuses rather than assumes";
+    }
+    std::error_code markerEc;
+    if (!fs::is_directory(cwd / "src" / "dss-config", markerEc) || markerEc) {
+        return {};  // not a checkout root — isolated per build tree
+    }
+    return "this corpus entry's working directory IS a repository checkout root"
+           " (" + cwd.generic_string() + " holds src/dss-config), so its"
+           " ScratchDir(InsideRepo) tree is "
+         + (cwd / "test-scratch" / "examples").generic_string()
+         + " — one directory shared by EVERY build tree, lane and worktree of"
+           " this checkout, and one that leaks into the source tree whenever a"
+           " scratch dtor loses its remove_all. Register the corpus entries"
+           " with a per-build-tree WORKING_DIRECTORY"
+           " (tests/examples/CMakeLists.txt, DSS_EXAMPLES_ENTRY_CWD).";
+}
+
 } // namespace
 
 // argv[1] = absolute path to the example dir (registered by cmake).
@@ -2783,6 +2832,14 @@ void runErrorTarget(fs::path const&        exampleDir,
 // The harness reads `<dir>/expected.json`, drives every target spec
 // in the manifest, and exits 0 only if every assertion passed.
 TEST(Examples, RunFromManifest) {
+    // FIRST, and fatal: every arm below roots its scratch tree at the process
+    // cwd, so a wrong cwd does not fail here — it silently relocates ~611
+    // entries' output into a directory the whole checkout shares. Asserted in
+    // the PER-EXAMPLE test rather than only in the lint suite so that reverting
+    // the per-example registration reddens the 611 entries it actually
+    // mis-registered, instead of one lint entry that was registered correctly.
+    ASSERT_EQ(corpusScratchIsolationFailure(), "");
+
     auto const argv0Dir =
         ::testing::internal::GetArgvs();
     ASSERT_GE(argv0Dir.size(), 2u)
@@ -3946,6 +4003,64 @@ TEST(ExamplesCorpusLint, StagingPrimitiveLivesOnlyInTheSharedHeader) {
         EXPECT_NE(text.find(includeLine), std::string::npos)
             << rel << " does not include " << kHeader
             << ", so whatever staging it performs is not the shared one.";
+    }
+}
+
+// ── D-TEST-EXAMPLES-CORPUS-SCRATCH-IS-SHARED-BY-EVERY-BUILD-TREE ────────────
+//
+// TWO CLAUSES, because the property has a runtime half and a structural half
+// and neither one implies the other.
+//
+// CLAUSE 1 — THE LIVE HALF. This process's own cwd is not a checkout root, so
+// the scratch tree it is about to open belongs to one build tree. It is the
+// same call `Examples.RunFromManifest` makes; it is repeated here because the
+// lint entries are registered by a DIFFERENT `add_test` call than the
+// per-example ones, and a revert of either registration alone must be caught by
+// the entries it affected. ⚠ That is the whole reason this is not one test:
+// ✔MEASURED in this repository, a mutant that reds the WRONG entry reads
+// exactly like a mutant that reds nothing.
+//
+// CLAUSE 2 — THE STRUCTURAL HALF, AND IT COVERS *BOTH* CORPUS HARNESSES. The
+// corpus is registered twice — the in-process runner here, and the CLI
+// subprocess sibling in `integrated_tests/CMakeLists.txt` — and a capability
+// that lands on one is half a capability. ✔MEASURED 2026-08-27 by running both
+// harnesses on one example and sampling the filesystem while they were alive:
+// the in-process runner wrote `<cwd>/test-scratch/examples/<pid>-<n>` and the
+// CLI sibling wrote `%TEMP%/dss-integrated-tests-runs/<claimed>` — DISJOINT
+// roots, so the sibling already had the isolation this pin now requires, and
+// needed no change. Clause 2 is what keeps that true: neither registration may
+// name the checkout root as a corpus entry's working directory.
+//
+// ⚠ THE NEEDLE IS ASSEMBLED, NEVER SPELLED. If this file contained the literal
+// it searches for, the pin would find its own text and the failure arm could
+// never be reached — the same trap a mutation comment sprang on this project
+// once already (the-bar §A.5).
+TEST(ExamplesCorpusLint, CorpusScratchIsPerBuildTree) {
+    EXPECT_EQ(corpusScratchIsolationFailure(), "");
+
+    fs::path const root = ::dss::test::repoRoot();
+    std::string const needle =
+        std::string{"WORKING_DIRECTORY $"} + "{CMAKE_SOURCE_DIR}";
+    char const* const kRegistrations[] = {
+        "tests/examples/CMakeLists.txt",
+        "integrated_tests/CMakeLists.txt",
+    };
+    for (char const* rel : kRegistrations) {
+        fs::path const p = root / rel;
+        std::ifstream in(p, std::ios::binary);
+        ASSERT_TRUE(in.good())
+            << "cannot read " << p.generic_string()
+            << " — this pin must never pass because it failed to look";
+        std::string const text{std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>{}};
+        EXPECT_EQ(text.find(needle), std::string::npos)
+            << rel << " registers a corpus ctest entry with the CHECKOUT ROOT"
+                      " as its working directory. Every build tree of this"
+                      " checkout then resolves that cwd identically, so all of"
+                      " them write one shared scratch tree inside the source"
+                      " tree — 684 leaked directories were sitting there when"
+                      " this was measured. Use a per-build-tree directory"
+                      " (DSS_EXAMPLES_ENTRY_CWD) instead.";
     }
 }
 

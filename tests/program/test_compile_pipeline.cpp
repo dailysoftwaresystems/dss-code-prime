@@ -1653,10 +1653,19 @@ TEST(Program_CompileFiles, CapMarkerAppearsExactlyOnceAfterMultiTargetSaturation
         << "single-chokepoint contract: cap fires EXACTLY ONCE at "
            "rep during merge, regardless of how many targets exceed "
            "their per-target diagnostic count.";
-    EXPECT_EQ(rep.all().size(), 2u)
+    // ★ THREE, NOT TWO, SINCE D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS.
+    // The third entry is `D_LaterPhasesNotRun`, and it is here for the same
+    // reason the cap marker is: it carries `DiagnosticDelivery::Guaranteed`, so
+    // `rep`'s volume gates cannot drop it. That is not an accident of ordering
+    // — a run that hit a cap is exactly the run whose completeness is most in
+    // doubt, so the ONE notice saying "phases did not run" must not be what the
+    // cap swallows. This run is doubly truncated (a cap elision AND a phase
+    // elision) and now says both.
+    EXPECT_EQ(rep.all().size(), 3u)
         << "rep contents must be exactly {first cap-filling diagnostic, "
-           "P_TooManyDiagnostics marker}; any other diagnostics signal "
-           "a regression in the per-target loop or merge path.";
+           "P_TooManyDiagnostics marker, D_LaterPhasesNotRun scope notice}; "
+           "any other diagnostics signal a regression in the per-target loop "
+           "or merge path.";
     // 9945457 audit fold (3-agent convergence: silent-failure H2 +
     // code-architect Q5 + test-analyzer-dim-2 #6): pin the IDENTITY
     // of the cap-filling diagnostic. A regression in
@@ -3737,14 +3746,23 @@ TEST(Program_CompileFiles, TFC74BadTargetDiagnosedWithoutHeaderErrorCascade) {
 
     // (b) ★ …and NOTHING ELSE accompanies it. The SET, not a count on one code.
     //
-    // MEASURED, not guessed: exactly two codes, and BOTH name the target. The
-    // config tier says WHAT it could not find (`C_InvalidTargetName`, forwarded
-    // verbatim by `forwardConfigDiagnostics` so the loader's own reason is not
-    // swallowed); the driver says what that MEANS for this build
-    // (`D_SchemaLoadFailed`). There is no third code, and in particular no
+    // MEASURED, not guessed: two codes NAME THE TARGET. The config tier says
+    // WHAT it could not find (`C_InvalidTargetName`, forwarded verbatim by
+    // `forwardConfigDiagnostics` so the loader's own reason is not swallowed);
+    // the driver says what that MEANS for this build (`D_SchemaLoadFailed`).
+    // There is no front-end code, and in particular no
     // `P_PreprocessorErrorDirective` — the front-end never ran.
+    //
+    // ★ AND A THIRD CODE SAYS EXACTLY THAT, IN THE STREAM RATHER THAN IN THIS
+    // COMMENT (D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS). "The front-end
+    // never ran" was a fact only a reader of this test knew; `D_LaterPhasesNotRun`
+    // is the run telling its operator the same thing, naming the altitude it
+    // stopped at and every phase that therefore produced nothing. Its ABSENCE
+    // from this set would mean the run had gone silent about its own scope
+    // again, so it is asserted here rather than tolerated.
     EXPECT_EQ(diagnosticCodeSet(rep),
               (std::set<std::string_view>{"C_InvalidTargetName",
+                                          "D_LaterPhasesNotRun",
                                           "D_SchemaLoadFailed"}))
         << "a bad `--target` must produce TARGET diagnostics alone — any "
            "front-end diagnostic here means the CU build ran before the target "
@@ -3848,8 +3866,15 @@ TEST(Program_CompileFiles, TFC74UnknownObjectFormatDiagnosedWithoutHeaderErrorCa
         EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c",
                                     {"arm64:elf64-aarch64-linux-exec"}, live), 1)
             << diagnosticDump(live);
+        // `D_LaterPhasesNotRun` joins the set because the unit failed at the
+        // PREPROCESSOR, so the cross-unit tiers ran for nothing — which is
+        // precisely what the notice states
+        // (D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS). The property this
+        // control asserts is unchanged: the `#error` is still the ONLY
+        // complaint about the SOURCE.
         EXPECT_EQ(diagnosticCodeSet(live),
-                  (std::set<std::string_view>{"P_PreprocessorErrorDirective"}))
+                  (std::set<std::string_view>{"D_LaterPhasesNotRun",
+                                              "P_PreprocessorErrorDirective"}))
             << "the ladder must still be gated on the OBJECT FORMAT — if this "
                "compiles clean, the gated macro is no longer format-restricted "
                "and this witness can no longer detect the cascade it exists to "
@@ -3875,6 +3900,7 @@ TEST(Program_CompileFiles, TFC74UnknownObjectFormatDiagnosedWithoutHeaderErrorCa
     // (b) ★ …and NOTHING ELSE accompanies it. The SET, not a count on one code.
     EXPECT_EQ(diagnosticCodeSet(rep),
               (std::set<std::string_view>{"C_InvalidFormatName",
+                                          "D_LaterPhasesNotRun",
                                           "D_SchemaLoadFailed"}))
         << "a bad `--target` FORMAT must produce FORMAT diagnostics alone — a "
            "front-end diagnostic here means the CU build ran before the format "
@@ -4010,8 +4036,15 @@ TEST(Program_CompileFiles, TFC74InvalidTargetFormatPairDiagnosedWithoutCascade) 
         EXPECT_EQ(prog.compileFiles({src.generic_string()}, "c",
                                     {"arm64:elf64-aarch64-linux-exec"}, live), 1)
             << diagnosticDump(live);
+        // `D_LaterPhasesNotRun` joins the set because the unit failed at the
+        // PREPROCESSOR, so the cross-unit tiers ran for nothing — which is
+        // precisely what the notice states
+        // (D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS). The property this
+        // control asserts is unchanged: the `#error` is still the ONLY
+        // complaint about the SOURCE.
         EXPECT_EQ(diagnosticCodeSet(live),
-                  (std::set<std::string_view>{"P_PreprocessorErrorDirective"}))
+                  (std::set<std::string_view>{"D_LaterPhasesNotRun",
+                                              "P_PreprocessorErrorDirective"}))
             << "the ladder must still be gated on the ARCHITECTURE and the "
                "cascade must still be reachable — if this compiles clean, this "
                "witness can no longer detect the cascade it exists to forbid"
@@ -4040,7 +4073,8 @@ TEST(Program_CompileFiles, TFC74InvalidTargetFormatPairDiagnosedWithoutCascade) 
 
     // (b) ★ …and NOTHING ELSE accompanies it. The SET, not a count on one code.
     EXPECT_EQ(diagnosticCodeSet(rep),
-              (std::set<std::string_view>{"D_TargetMachineCodeMismatch"}))
+              (std::set<std::string_view>{"D_LaterPhasesNotRun",
+                                          "D_TargetMachineCodeMismatch"}))
         << "a mutually-invalid pair must produce PAIR diagnostics alone — a "
            "front-end diagnostic here means the CU build ran before the pair "
            "was cross-validated, which is the ordering defect this anchor "
@@ -4112,7 +4146,8 @@ TEST(Program_CompileFiles, TFC74PairCheckDedupeKeyIsTheOrderedPair) {
                                      "arm64:elf64-x86_64-linux-exec"}, rep), 1)
             << diagnosticDump(rep);
         EXPECT_EQ(diagnosticCodeSet(rep),
-                  (std::set<std::string_view>{"D_TargetMachineCodeMismatch"}))
+                  (std::set<std::string_view>{"D_LaterPhasesNotRun",
+                                              "D_TargetMachineCodeMismatch"}))
             << "a dedupe keyed on the TARGET would have skipped the second "
                "spec — its target was already resolved by the first — and the "
                "front-end would have run and cascaded"
@@ -4143,7 +4178,8 @@ TEST(Program_CompileFiles, TFC74PairCheckDedupeKeyIsTheOrderedPair) {
                                      "x86_64:elf64-aarch64-linux-exec"}, rep), 1)
             << diagnosticDump(rep);
         EXPECT_EQ(diagnosticCodeSet(rep),
-                  (std::set<std::string_view>{"D_TargetMachineCodeMismatch"}))
+                  (std::set<std::string_view>{"D_LaterPhasesNotRun",
+                                              "D_TargetMachineCodeMismatch"}))
             << "a dedupe keyed on the FORMAT would have skipped the second "
                "spec — its format was already checked by the first — and the "
                "front-end would have run and cascaded"

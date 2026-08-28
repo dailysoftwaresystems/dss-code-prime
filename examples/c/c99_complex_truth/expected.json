@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-COMPLEX: runtime witness for the COMPARISON half of C99 `_Complex` — equality (`==`/`!=`, including the mixed real/complex form), truthiness (`if`/`while`/`for`/`?:`/`&&`/`||`), logical `!`, and the `_Bool` conversion — on BOTH the baseline (debug) and the `release` (shippedPipeline) arm. C 6.5.9p2 admits `==`/`!=` on any arithmetic pair and a complex IS arithmetic (6.2.5p11+p18+p21); C 6.3.1.2 defines a scalar's `bool` conversion as `compares equal to 0`. Both are the SAME componentwise comparison against (0,0), so all four spellings share one emitter and this example proves they agree at runtime. EVERY ARM IS BUILT SO THAT READING ONLY ONE COMPONENT CHANGES THE EXIT CODE: g_imOnly=(0,7) is truthy only if the imaginary part is read, and g_reOnly=(5,0) vs g_both=(5,7) compare equal only if it is ignored. That is deliberate — two SILENT MISCOMPILES were measured here and are what arms 2 and 3 pin: `!z` compared the complex's ADDRESS against 0 (constant FALSE — `!(0.0+0.0i)` gave 0 where gcc 13.3.0 -std=c2x and clang 18.1.3 -std=c23 both give 1), and `(_Bool)z` discarded the imaginary part via C 6.3.1.7's real-target rule (`(_Bool)(0.0+5.0i)` gave false where both references give true). ANTI-FOLD: every complex is a MUTABLE GLOBAL written at runtime, so the release arm proves real runtime comparisons rather than a constant fold. Arm 8 is the F32-ELEMENT arm (component offsets {0,4}, F32 compares), so a hard-coded F64 element size breaks only there. exit = 1+2+4+8+16+32+64+128 = 255 iff every arm passes; each failing arm subtracts its own distinct power of two, so the exit code names which arm broke.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 255,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

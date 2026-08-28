@@ -1,4 +1,5 @@
 #include "link/format/coff_object_reader.hpp"
+#include "link/format/foreign_section_alignment.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
 
@@ -201,6 +202,74 @@ constexpr std::uint16_t kSymDtypeFunction = 0x20u;
 // COFF analog of Mach-O's S_ZEROFILL -- used ONLY for the file-bounds
 // exemption; the section KIND is resolved from the schema name map.
 constexpr std::uint32_t kScnCntUninitializedData = 0x00000080u;
+
+// -- IMAGE_SCN_ALIGN_*BYTES: COFF's spelling of the declared section
+//    alignment (PE Format spec, "Section Flags") -----------------------------
+//
+// D-FORMAT-MACHO-SECTION-ALIGN-EMITTED-RAW-NOT-LOG2 (the read-side half of the
+// "one right answer per format" sweep that row prescribes).
+//
+// Bits [23:20] hold a CLASS ORDINAL, not an exponent and not a byte count:
+// class N means 2^(N-1) bytes, so class 5 = 16 and class 6 = 32, and the range
+// 1..14 spans 1..8192. Class 0 means the producer declared nothing.
+//
+// ⚠ THIS READER USED TO DECODE NOTHING AT ALL. ✔MEASURED 2026-08-27: the word
+// `Alignment` did not appear in this file, and neither `AssembledData`
+// construction site set `.alignment`, so every foreign COFF data item reached
+// the merge at the newtype's default of ONE byte no matter what the producer
+// asked for -- silently, because dropping a constraint yields a merge that
+// succeeds. Its two sibling readers (`elf_object_reader.cpp` via
+// `sh_addralign`, `macho_object_reader.cpp` via `section_64.align`) had both
+// carried the field since they were written.
+//
+// ★ THE END-TO-END CONSEQUENCE IS NARROWER THAN "EVERY OVER-ALIGNED DATUM WAS
+// MISPLACED", AND THE NARROWING IS MEASURED -- three corpus shapes were built
+// with this decode and without it and exited IDENTICALLY before one bit. The
+// reader slices atoms by their VALUE, so a producer's inter-item PADDING is
+// absorbed into the preceding atom's extent: relative offsets inside ONE
+// module survive regardless, and an over-aligned object FIRST in its section
+// is aligned by construction. What this field decides is where a member's
+// whole block LANDS once something else already occupies the section --
+// `exec_data_section.hpp` places `src` at `alignUp(into.spanSize,
+// src.maxAlign)`, and `maxAlign` is the max over these values. ✔MEASURED on
+// the PE leg with a consumer contributing five bytes of its own rodata: the
+// archive member's over-aligned datum sits at `mod 256 == 128` with this
+// decode and at `69` without it. `examples/c/staticlib_alignas_carry` is that
+// witness.
+//
+// ✔MEASURED against the references, separately, on an `_Alignas(32) const`
+// object: mingw-gcc and clang(--target=x86_64-pc-windows-msvc) BOTH stamp
+// `.rdata` with IMAGE_SCN_ALIGN_32BYTES, and both stamp an explicit class on
+// EVERY section -- so the dropped field was carrying real producer intent on
+// ordinary input, not a theoretical corner.
+//
+// ★ CLASS 0 DECODES TO 16 BYTES, AND THAT IS MEASURED RATHER THAN ASSUMED.
+// ✔MEASURED 2026-08-27 by zeroing the class nibble of a real `.rdata` header
+// in place and re-reading it: GNU binutils `objdump -h` reports `2**5` (32)
+// with class 6 and `2**4` (16) with class 0, and `lld-link` accepts the
+// class-0 object (rc=0). LLVM's own `coff_section::getAlignment()` spells the
+// same default. Reading class 0 as "1 byte" would put DSS BELOW every
+// reference reader on identical bytes -- and in the under-aligning direction,
+// which is the one that miscompiles rather than merely wastes padding.
+//
+// IMAGE_SCN_TYPE_NO_PAD is the legacy spelling of ALIGN_1BYTES and is honoured
+// for the same reason: it is what the references do with these bytes.
+constexpr std::uint32_t kScnAlignMask  = 0x00F00000u;
+constexpr std::uint32_t kScnAlignShift = 20u;
+constexpr std::uint32_t kScnTypeNoPad  = 0x00000008u;
+
+// Byte alignment the producer declared for `chars`, as the shared read-side
+// policy carries it (`link/format/foreign_section_alignment.hpp`): a
+// re-layout hint, degrading to byte alignment above what the newtype models.
+[[nodiscard]] Alignment
+alignFromCharacteristics(std::uint32_t chars) noexcept {
+    if ((chars & kScnTypeNoPad) != 0u) return Alignment{};
+    std::uint32_t const cls = (chars & kScnAlignMask) >> kScnAlignShift;
+    // Class 0 = unspecified = the references' 16-byte default = exponent 4.
+    // Otherwise the class ordinal is one MORE than the log2 exponent.
+    return link::format::foreignSectionAlignmentFromLog2(
+        cls == 0u ? 4u : cls - 1u);
+}
 
 // IMAGE_SCN_LNK_COMDAT: this section participates in COMDAT
 // duplicate-resolution. A real cl.exe/clang-cl `.obj` places each
@@ -462,7 +531,11 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     };
 
     // -- (0) Format sanity: this reader speaks PE/COFF only ----------
-    // ── SELF-GUARD (D-LINK-…-KIND-IDENTITY-BRANCHES, TF-C125) ──────────
+    // ── SELF-GUARD (TF-C125) ─────────────────────────────────────────
+    //    ⚠ THIS CITATION WAS ELIDED TO `D-LINK-…-KIND-IDENTITY-BRANCHES`,
+    //    which matches no id and so pointed at nothing any grep could find.
+    //    The id, whole and on its own line:
+    //    D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES
     //
     // ★★ THIS GUARD SURVIVED THE IDENTITY-BRANCH REMOVAL, AND THE REASON IS
     // MEASURED FOR THIS SITE. The TF-C125 brief expected it to become
@@ -1048,8 +1121,14 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                   "by its section alone -- the storage class is what says "
                   "whether a record names a body, a reference, or a "
                   "bookkeeping entry, and guessing it silently mis-slices the "
-                  "section (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-"
-                  "LABEL-NOT-ATOM).");
+                  "section ("
+                  // ANCHOR, ONE LINE, DO NOT WRAP. It WAS wrapped here across
+                  // two string literals: the concatenated runtime message read
+                  // correctly, so nothing failed, while the SOURCE stopped
+                  // matching a grep for the id -- the invisible half of the
+                  // wrap rule, met in the one place it is easiest to miss.
+                  "D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM"
+                  ").");
         }
         CoffSymbolRole const role = *roleOpt;
 
@@ -1695,8 +1774,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // slice their bytes; a zero-fill (bss) section reserves the size
             // with empty bytes (the reservedSize invariant).
             AssembledData di;
-            di.symbol  = SymbolId{defs[k].symIdx};
-            di.section = *dk;
+            di.symbol    = SymbolId{defs[k].symIdx};
+            di.section   = *dk;
+            di.alignment = alignFromCharacteristics(sec.chars);  // section-granular
             if (isZeroFill(*dk)) {
                 di.reservedSize = len;
             } else {
@@ -1786,8 +1866,12 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // symbol's, and NO ModuleSymbol is recorded -- the atom stays
                 // module-private and is never folded cross-CU by name, which is
                 // right for bytes that have no name.
-                di.symbol  = SymbolId{nextSyntheticId++};
-                di.section = *dk;
+                di.symbol    = SymbolId{nextSyntheticId++};
+                di.section   = *dk;
+                // The gap's bytes belong to the SAME section, so they carry the
+                // same declared alignment as the named atoms around them --
+                // exactly as the ELF gap arm does.
+                di.alignment = alignFromCharacteristics(sec.chars);
                 std::size_t const b0 = static_cast<std::size_t>(sec.rawPtr + g.start);
                 di.bytes.assign(bytes.begin() + b0,
                                 bytes.begin() + b0 + static_cast<std::size_t>(g.len));

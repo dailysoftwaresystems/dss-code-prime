@@ -1986,3 +1986,177 @@ TEST(ConstEvalUnsignedModular, AsIntBitsCarriesAnUnsignedPayloadAsItsBitPattern)
     // And the pair then compares as the large unsigned value it is.
     EXPECT_EQ(foldInt(HirOpKind::Gt, v, lit(TypeKind::U64, 0)), 1LL);
 }
+
+// ── D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE / D-CSUBSET-INT128-ICE-CONTEXT-REFUSED ──
+//
+// `asInt64` answers ONE question — "is this value representable as a signed
+// int64?" — and every 64-bit integer-constant-expression slot (array dimension,
+// enumerator, bit-field width, `asInt64Bridge`) depends on the answer. Its
+// `uint64_t` arm has always answered it by MAGNITUDE; its `BitIntValue` arm used
+// to answer a DIFFERENT question, "is the declared width ≤ 64?", and so refused
+// `(__int128)2 + 1` as an array bound while gcc 13.3.0 (`-std=c2x`) and clang
+// 18.1.3 (`-std=c23`), probed SEPARATELY, both accept it.
+//
+// The three tests below pin the three things that must all hold at once: the fix
+// is EQUIVALENT to its own stated definition, it ADMITS the values that fit, and
+// it still REFUSES the ones that do not.
+namespace {
+
+// Build a `BitIntValue`-armed literal from raw little-endian limbs.
+[[nodiscard]] HirLiteralValue wideLit(std::vector<std::uint64_t> limbs,
+                                      std::uint32_t width, bool isSigned,
+                                      TypeKind core) {
+    HirLiteralValue v;
+    v.core  = core;
+    v.value = BitIntValue(std::move(limbs), width, isSigned);
+    return v;
+}
+
+}  // namespace
+
+TEST(ConstEvalAsInt64Magnitude, MatchesTheConvertToRoundTrip) {
+    // THE DEFINITION: a value fits an int64 iff `INT64_MIN <= value <= INT64_MAX`,
+    // spelled here with the bignum's OWN `compare` against both bounds at a width
+    // that can hold every operand at once -- one bit wider than either needs, and
+    // SIGNED, so an unsigned source stays non-negative and both bounds are exact.
+    // `asInt64` implements the same predicate as a limb scan so it can stay
+    // `noexcept` and allocation-free; this test is what keeps the fast form and the
+    // definition from drifting apart.
+    //
+    // ★ IT HAS ALREADY EARNED ITS KEEP TWICE, WHICH IS WHY THE MATRIX IS SHAPED AS
+    // IT IS. It first rejected a WRONG definition -- "convert to int64 and back is
+    // value-preserving" -- which is a REPRESENTATION test, not a value test, and
+    // wrongly calls 2^65-1 at `unsigned _BitInt(65)` a fit because the sign
+    // extension lands exactly on the one bit above 64. It then caught a real bug in
+    // the implementation: an all-ones UNSIGNED value (`(__uint128_t)-1`) whose upper
+    // limbs do repeat bit 63 and which must still NOT bridge, as -1 or as anything
+    // else. Both cells are in the matrix below and must stay there.
+    std::array<std::uint32_t, 9> const widths{1, 7, 8, 63, 64, 65, 100, 128, 200};
+    std::array<std::vector<std::uint64_t>, 10> const seeds{{
+        {0},                                    // zero
+        {1},                                    // small positive
+        {0xFFFFFFFFFFFFFFFFULL},                // all ones in limb 0 (-1, or 2^64-1)
+        {0x8000000000000000ULL},                // exactly INT64_MAX+1 as a magnitude
+        {0x7FFFFFFFFFFFFFFFULL},                // exactly INT64_MAX
+        {3, 1},                                 // 2^64 + 3 -- low limb FITS, value does not
+        {3, std::uint64_t{1} << 36},            // 2^100 + 3 -- THE truncation trap
+        {0xFFFFFFFFFFFFFFFFULL, 0x0FULL},       // a mid-magnitude 2-limb value
+        {0xFFFFFFFFFFFFFFFFULL,
+         0xFFFFFFFFFFFFFFFFULL},                // all ones in BOTH limbs: -1 when signed,
+                                                // 2^N-1 when unsigned -- the two must part
+        {0x8000000000000000ULL,
+         0xFFFFFFFFFFFFFFFFULL},                // INT64_MIN sign-extended: fits iff signed
+    }};
+    for (std::uint32_t const w : widths) {
+        for (bool const sgn : {false, true}) {
+            for (auto const& seed : seeds) {
+                HirLiteralValue const v = wideLit(seed, w, sgn, TypeKind::BitInt);
+                auto const& bv = std::get<BitIntValue>(v.value);
+                std::uint32_t const cw = std::max(bv.width(), 64u) + 1u;
+                BitIntValue const val = bv.withType(cw, /*newSigned=*/true);
+                BitIntValue const lo  = BitIntValue::fromI64(
+                    std::numeric_limits<std::int64_t>::min(), cw, /*isSigned=*/true);
+                BitIntValue const hi  = BitIntValue::fromI64(
+                    std::numeric_limits<std::int64_t>::max(), cw, /*isSigned=*/true);
+                bool const definitionSaysFits =
+                    BitIntValue::compare(val, lo, cw, true) >= 0
+                 && BitIntValue::compare(val, hi, cw, true) <= 0;
+                auto const got = detail::asInt64(v);
+                EXPECT_EQ(got.has_value(), definitionSaysFits)
+                    << "width=" << w << " signed=" << sgn
+                    << " limb0=" << seed[0] << " limbCount=" << seed.size();
+                if (got.has_value() && definitionSaysFits) {
+                    EXPECT_EQ(*got, val.withType(64u, /*newSigned=*/true).asI64())
+                        << "width=" << w << " signed=" << sgn;
+                }
+            }
+        }
+    }
+}
+
+TEST(ConstEvalAsInt64Magnitude, AWideValueWhoseMagnitudeFitsBridges) {
+    // The row's own repros, at the unit tier. Each is a value living in a 128-bit
+    // (or 200-bit) container whose MAGNITUDE is small -- exactly the shape the
+    // width test refused and both reference compilers accept.
+    EXPECT_EQ(detail::asInt64(wideLit({3}, 128, true, TypeKind::I128)), 3LL);
+    EXPECT_EQ(detail::asInt64(wideLit({3}, 128, false, TypeKind::U128)), 3LL);
+    EXPECT_EQ(detail::asInt64(wideLit({5}, 200, false, TypeKind::BitInt)), 5LL);
+    // A NEGATIVE wide value: every limb above 0 is the sign fill, so it fits.
+    EXPECT_EQ(detail::asInt64(wideLit({0xFFFFFFFFFFFFFFFDULL,
+                                       0xFFFFFFFFFFFFFFFFULL}, 128, true,
+                                      TypeKind::I128)),
+              -3LL);
+    // The two exact edges of the int64 range, at a 128-bit width.
+    EXPECT_EQ(detail::asInt64(wideLit({0x7FFFFFFFFFFFFFFFULL}, 128, false,
+                                      TypeKind::U128)),
+              std::numeric_limits<std::int64_t>::max());
+    EXPECT_EQ(detail::asInt64(wideLit({0x8000000000000000ULL,
+                                       0xFFFFFFFFFFFFFFFFULL}, 128, true,
+                                      TypeKind::I128)),
+              std::numeric_limits<std::int64_t>::min());
+}
+
+TEST(ConstEvalAsInt64Magnitude, AWideValueThatDoesNotFitStillRefuses) {
+    // ★★ THE INVARIANT THE ROW EXISTS TO PROTECT. A value that exceeds int64 must
+    // nullopt so the ICE slot fails LOUD; it must never contribute its low 64 bits.
+    // The trap value is 2^100 + 3, whose low 64 bits are EXACTLY 3 -- so a
+    // `low64()` narrowing and a correct refusal give DIFFERENT answers here, which
+    // a rounder 2^100 could not distinguish (its low 64 bits are zero, and a
+    // zero-length array is also a refusal).
+    EXPECT_FALSE(detail::asInt64(wideLit({3, std::uint64_t{1} << 36}, 128, true,
+                                         TypeKind::I128)).has_value())
+        << "2^100+3 must never bridge as 3";
+    // Just one bit past the int64 range in each direction.
+    EXPECT_FALSE(detail::asInt64(wideLit({0x8000000000000000ULL}, 128, false,
+                                         TypeKind::U128)).has_value())
+        << "INT64_MAX+1 as an unsigned 128-bit value does not fit a signed int64";
+    EXPECT_FALSE(detail::asInt64(wideLit({0x7FFFFFFFFFFFFFFFULL,
+                                          0xFFFFFFFFFFFFFFFFULL}, 128, true,
+                                         TypeKind::I128)).has_value())
+        << "INT64_MIN-1 does not fit";
+    // 2^64 exactly: limb 0 is ZERO, so a bridge that only looked at limb 0 would
+    // hand back a legal-looking 0 and silently produce a zero-length array.
+    EXPECT_FALSE(detail::asInt64(wideLit({0, 1}, 128, false,
+                                         TypeKind::U128)).has_value())
+        << "2^64 must never bridge as 0";
+}
+
+TEST(ConstEvalAsInt64Magnitude, NarrowBitIntBehaviourIsBitIdentical) {
+    // A `_BitInt(N≤64)` value has exactly one limb, so the magnitude scan's loop
+    // body never runs and the answer is `asI64()` -- byte-for-byte what shipped
+    // before. This pins that the change is confined to N>64 and cannot have moved
+    // any of the shipped `c23_bitint_*` behaviour.
+    EXPECT_EQ(detail::asInt64(wideLit({30}, 8, true, TypeKind::BitInt)), 30LL);
+    EXPECT_EQ(detail::asInt64(wideLit({0xFFFFFFFFFFFFFFFDULL}, 8, true,
+                                      TypeKind::BitInt)),
+              -3LL);
+    EXPECT_EQ(detail::asInt64(wideLit({0x7FFFFFFFFFFFFFFFULL}, 64, true,
+                                      TypeKind::BitInt)),
+              std::numeric_limits<std::int64_t>::max());
+}
+
+TEST(ConstEvalAsInt64Magnitude, AnUnsignedWideValueNeverBridgesToANegative) {
+    // ★★ THE BUG THE CROSS-CHECK FOUND, kept as its own named pin because it is the
+    // one shape where "the upper limbs repeat bit 63" is TRUE and the answer is
+    // still NO. `(__uint128_t)-1` is 2^128-1: every limb is ones, so a scan that
+    // only compared the upper limbs against the sign extension of bit 63 accepted
+    // it and handed back -1 -- turning `enum { EA = (__uint128_t)-1 };` into a
+    // negative enumerator with no diagnostic. An unsigned value is never negative
+    // however its bits read.
+    EXPECT_FALSE(detail::asInt64(wideLit({0xFFFFFFFFFFFFFFFFULL,
+                                          0xFFFFFFFFFFFFFFFFULL}, 128, false,
+                                         TypeKind::U128)).has_value())
+        << "(__uint128_t)-1 must never bridge, least of all as -1";
+    // The SIGNED twin of the identical bit pattern IS -1 and must still bridge --
+    // otherwise the pin above could be satisfied by refusing all-ones outright.
+    EXPECT_EQ(detail::asInt64(wideLit({0xFFFFFFFFFFFFFFFFULL,
+                                       0xFFFFFFFFFFFFFFFFULL}, 128, true,
+                                      TypeKind::I128)),
+              -1LL);
+    // Same rule at a width that fits in ONE limb: this is the `uint64_t` arm's
+    // own contract ("nullopt above INT64_MAX") finally applied to the arm that
+    // used to contradict it.
+    EXPECT_FALSE(detail::asInt64(wideLit({0x8000000000000000ULL}, 64, false,
+                                         TypeKind::BitInt)).has_value())
+        << "an unsigned _BitInt(64) above INT64_MAX must not bridge to INT64_MIN";
+}

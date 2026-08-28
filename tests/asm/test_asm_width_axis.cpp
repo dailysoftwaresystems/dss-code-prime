@@ -54,8 +54,8 @@ assembleFirstFn(Lir const& lir, TargetSchema const& schema,
 [[nodiscard]] LirReg gpr(TargetSchema const& s, std::string_view name) {
     auto const ord = s.registerByName(name);
     EXPECT_TRUE(ord.has_value()) << name;
-    return LirReg{static_cast<std::uint32_t>(ord.value_or(0)), 1,
-                  static_cast<std::uint8_t>(LirRegClass::GPR)};
+    return makePhysicalReg(static_cast<std::uint32_t>(ord.value_or(0)),
+                           LirRegClass::GPR);
 }
 
 // Build one function (body + ret), legalize (x86 2-address), assemble.
@@ -1179,11 +1179,10 @@ TEST(WidthAxisX86, StrippedThirtyTwoBitVariantFailsLoudNeverFallsBack) {
 // ═══════════════════════════════════════════════════════════════════════
 
 namespace {
-// NOTE: built via makePhysicalReg — the aggregate-init shape the
-// file's `gpr()` helper uses ({ord, 1, cls}) sets LirReg's BITFIELD
-// order {id, classKind, isPhysical}, which is only accidentally
-// correct for GPR (classKind=1 == GPR, isPhysical=(GPR)1); for FPR it
-// would silently build a class-GPR NON-physical reg.
+// D-LIR-POSITIONAL-LIRREG-INIT-MISCLASSIFIES-SILENTLY: this helper was the
+// second site to discover the aggregate trap and route around it locally.
+// `gpr()` above now uses the same factory, and the aggregate form it warned
+// about no longer compiles anywhere.
 [[nodiscard]] LirReg fprReg(TargetSchema const& s, std::string_view name) {
     auto const ord = s.registerByName(name);
     EXPECT_TRUE(ord.has_value()) << name;

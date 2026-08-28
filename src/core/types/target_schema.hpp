@@ -1257,6 +1257,81 @@ struct DSS_EXPORT TargetAsmConstraint {
     std::optional<OperandKindFilter> operandKind;      // binds == OperandKind
 };
 
+// ── how a BARE inline-asm operand reference states its width ───────────────
+//
+// A GNU extended-asm template writes `%0` for an operand and a MODIFIER
+// (`%w0`, `%k0`) to pick a narrower or wider VIEW of the same register. The
+// modifier letters are DIALECT vocabulary and live in the language document's
+// `assembly.templateModifiers`. This facet answers the other half — the one a
+// dialect cannot answer, because it is not about spelling at all:
+//
+//     when NO letter is written, WHICH VIEW does `%0` name?
+//
+// ★★★ THE TWO REFERENCES DISAGREE ON THE **DERIVATION**, NOT ON THE SPELLING,
+// AND THAT IS WHY THIS IS A DECLARED POLICY RATHER THAN AN ARITHMETIC RULE.
+// ✔MEASURED 2026-08-27 by reading `-S` output, gcc 13.3.0 AND clang 19.1.1,
+// both ports, `-O0` and `-O2`, template `__asm__("BARE %0 END" : : "r"(v))`:
+//
+//   * aarch64 renders the 64-bit `x` name for **every** integer type —
+//     `_Bool`, `char`, `unsigned char`, `short`, `int`, `unsigned int`,
+//     `long`, `long long`, `void *` and `__int128` alike. The operand's type
+//     does not enter into it, and `%w` is how 32 bits is asked for. clang says
+//     so in its own words under `-Wasm-operand-widths`: *"value size does not
+//     match register size"*, fix-it *use constraint modifier "w"*.
+//   * x86_64 renders `%al` / `%ax` / `%eax` / `%rax` — tracking the operand's
+//     own type width exactly, at all four widths, on both compilers.
+//
+// ⇒ NO WIDTH ARITHMETIC REPRODUCES BOTH. "Narrowest view ≥ the type width"
+// yields `w0` for an `int` on aarch64 (it renders `x0`); "the widest view"
+// yields `%rax` for an `int` on x86_64 (it renders `%eax`). Each target's
+// answer is a fact about that processor, and the only honest representation of
+// a fact with no derivation is to declare it.
+//
+// ★★ AND IT IS A **TARGET** FACT, NOT A DIALECT ONE — checked with the exact
+// instrument `TargetAsmConstraint`'s own charter above demands, since that
+// charter is what forbids a dialect-varying fact from entering `.target.json`.
+// ✔MEASURED 2026-08-27, one processor under BOTH of its dialects
+// (`gcc -masm=att` vs `-masm=intel`, and the same pair under clang 19): the
+// selected VIEW is identical — `al`/`ax`/`eax`/`rax` — and only the SIGIL
+// moves. The control that keeps the test from being vacuous moved as it must:
+// the same flag turns `movq %rsi, (%rdi)` into `mov QWORD PTR [rdi], rsi`,
+// changing sigil, operand order and mnemonic together. A dialect-dependent
+// fact MOVES under that flag; this one does not.
+//
+//     D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE
+//
+// is the row this facet closes, and the operator ruled the derivation belongs
+// *"in config as a declared derivation policy, still with no branch"*.
+enum class AsmBareOperandWidth : std::uint8_t {
+    // The operand carries its own width: `%0` names the view whose width is
+    // the bound operand's type width. x86_64's rule, and DSS's behaviour on
+    // every target before this facet existed.
+    OperandType     = 0,
+    // The register carries the width: `%0` names the class's FULL register
+    // regardless of the operand's type, and a narrower access must be asked
+    // for with a modifier. aarch64's rule.
+    RegisterNatural = 1,
+};
+
+inline constexpr EnumNameTable<AsmBareOperandWidth, 2>
+    kAsmBareOperandWidthTable{{{
+        { AsmBareOperandWidth::OperandType,     "operandType"     },
+        { AsmBareOperandWidth::RegisterNatural, "registerNatural" },
+    }}};
+
+// Well-formedness of the table itself — see the sibling tables' note: an
+// under-filled table is legal C++ and would make "" a resolving spelling.
+DSS_CHECK_ENUM_NAME_TABLE(kAsmBareOperandWidthTable);
+
+[[nodiscard]] constexpr std::string_view
+asmBareOperandWidthName(AsmBareOperandWidth d) noexcept {
+    return kAsmBareOperandWidthTable.name(d);
+}
+[[nodiscard]] constexpr std::optional<AsmBareOperandWidth>
+asmBareOperandWidthFromName(std::string_view s) noexcept {
+    return kAsmBareOperandWidthTable.fromName(s);
+}
+
 // Encoding slot — names WHERE a register/immediate value goes inside
 // the emitted byte sequence. Closed vocabulary. The x86-variable
 // walker reads this enum to project an operand (or the instruction's
@@ -2974,6 +3049,35 @@ struct DSS_EXPORT TargetRelocationInfo {
     // against a TLS symbol would write the bit-cast tpoff as if it
     // were an address — the CRIT-1 silent-garbage-pointer class).
     bool         tls         = false;
+    // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: true iff this relocation
+    // writes an IMAGE-RELATIVE value — the target's address MINUS the
+    // image base (an RVA) — rather than the absolute VA an ordinary
+    // Linear absolute row writes. Linear-only, and mutually exclusive
+    // with BOTH `pcRelative` (an RVA is relative to the image, not to
+    // the patch site) and `tls` (a tpoff is in a per-thread coordinate
+    // space that has no image base at all).
+    //
+    // ★ WHY IT IS A FIELD RATHER THAN A NAME MATCH, AND WHY IT PASSES
+    //   THE DEAD-CONFIG TEST. Win64's `RUNTIME_FUNCTION` (and every
+    //   PE data directory) stores RVAs, so `IMAGE_REL_AMD64_ADDR32NB`
+    //   and `IMAGE_REL_AMD64_ADDR32` are 32-bit absolute-formula rows
+    //   that differ ONLY in this property — writing the second where
+    //   the first belongs stores a full VA in a field the unwinder
+    //   reads as an offset from the image base. Nothing else in the
+    //   schema separates them: same formula, same width, same zero
+    //   bias, same non-pc-relativity. ✔The fact VARIES along the axis
+    //   the key carries — TRUE for the PE object formats' ADDR32NB row
+    //   and FALSE for every ELF and Mach-O row, on both architectures
+    //   — so this is not N documents restating one constant.
+    //
+    // ⚠ IT ALSO DISAMBIGUATES THE `widthBytes == n && !pcRelative`
+    //   SCANS. `absoluteRelocKind` (asm), the cross-CU thunk slot
+    //   (linker) and the symbol-address global (pipeline) all ask for
+    //   "the target's absolute pointer relocation of N bytes" by
+    //   formula. An image-relative row answers that description
+    //   structurally while being the WRONG answer, so those scans
+    //   exclude it explicitly rather than relying on table order.
+    bool         imageRelative = false;
 };
 
 // Discriminates the FIVE concrete terminator shapes a target's opcode
@@ -3157,35 +3261,65 @@ struct DSS_EXPORT ImplicitRegisterConstraint {
 
     // ★★★ THE `outputs ⊆ clobbered` INVARIANT, AS A QUERY ON THE TYPE
     // ITSELF (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED,
-    // 2026-08-15). Returns the index of the first output
-    // ordinal absent from `clobberedOrdinals`, or nullopt when the
-    // invariant holds.
+    // 2026-08-15).
     //
-    // ⚠ IT LIVES HERE BECAUSE THIS TYPE HAS **TWO** PRODUCERS AND ONLY
-    // ONE OF THEM MEETS A LOADER. The `.target.json` loader enforces
-    // the rule for the per-OPCODE carrier; `LirBuilder::
-    // regConstraintPoolAdd` accepts a per-INSTRUCTION one built by a
-    // lowering, with no loader in the path. And the register
-    // allocator's forbidden set is `inputs ∪ clobbered` — outputs are
-    // deliberately omitted, on the strength of this invariant holding.
-    // So a violating entry does not fail: it silently leaves a value
-    // allocated to a register the instruction overwrites. Two carriers,
-    // one validator, and a THIRD component's safety argument resting on
-    // the validation only one of them got.
+    // ⚠ IT LIVES HERE BECAUSE THIS TYPE HAS **TWO** PRODUCERS AND THEY MEET
+    // DIFFERENT GATES. The `.target.json` loader validates the per-OPCODE
+    // carrier; the per-INSTRUCTION carrier is built by a lowering and meets no
+    // loader at all. And the register allocator's forbidden set is
+    // `inputs ∪ clobbered` — outputs are deliberately omitted, and for a value
+    // that merely LIVES ACROSS the instruction that omission rests on this
+    // invariant and on nothing else. So a violating entry did not fail: it
+    // silently left a value allocated to a register the instruction
+    // overwrites. Two carriers, one rule, and a THIRD component's safety
+    // argument resting on a guarantee only one of them was given.
+    //
+    // ★ AS OF 2026-08-27 (P42) EVERY PRODUCER ASKS THIS TYPE, and the rule has
+    // no second implementation anywhere: the `.target.json` loader, the
+    // inline-asm lowering in `mir_to_lir.cpp`, the `.dsslir` reader's
+    // `constraintSubsetHolds` and `LirBuilder::regConstraintPoolAdd` all route
+    // here. The three that REFUSE ask `firstOutputNotClobbered`; the loader,
+    // which must name every offender, loops over `outputIsClobbered`. ⛔ A
+    // caller that re-derives the comparison locally is the drift this function
+    // exists to prevent — the two answers then disagree and the friendlier one
+    // wins by accident.
     //
     // Reads ORDINALS, not names: a target may spell one register
     // several ways (sub-register aliases), and two different spellings
     // of the same physical register must satisfy the rule. Callers that
     // hold only names must resolve first — which every producer already
     // does, because the ordinals are what the allocator reads.
+    // ★★★ THE RULE ITSELF, ASKED ONE OUTPUT AT A TIME — and this is the ONLY
+    // place it is implemented. `firstOutputNotClobbered` below is a loop over
+    // it, not a second copy.
+    //
+    // ⚠ IT EXISTS BECAUSE THE RULE'S FOUR CALLERS DO NOT ALL WANT THE SAME
+    // SHAPE OF ANSWER, and that is a real difference rather than an excuse for
+    // a second implementation. `LirBuilder::regConstraintPoolAdd`, the
+    // `.dsslir` reader and the inline-asm lowering each want THE FIRST
+    // offender: they abort or refuse, so nothing is gained by finding the
+    // rest. The `.target.json` loader wants EVERY offender, because it emits
+    // one diagnostic per output with that output's own JSON pointer and a
+    // first-failure query structurally cannot produce them — one re-run must
+    // surface every mistake in the document, not the earliest. ⇒ one rule,
+    // two shapes; the per-index predicate is the shape the other is built on.
+    //
+    // Out-of-range `k` is FALSE rather than UB: a caller that has lost
+    // index alignment between the names and the ordinals (the half-resolved
+    // shape a loader hits when one register name fails to resolve) gets a
+    // refusal, never a read past the end.
+    [[nodiscard]] bool outputIsClobbered(std::size_t k) const noexcept {
+        if (k >= outputOrdinals.size()) return false;
+        for (auto const cl : clobberedOrdinals) {
+            if (cl == outputOrdinals[k]) return true;
+        }
+        return false;
+    }
+
     [[nodiscard]] std::optional<std::size_t>
     firstOutputNotClobbered() const noexcept {
         for (std::size_t k = 0; k < outputOrdinals.size(); ++k) {
-            bool found = false;
-            for (auto const cl : clobberedOrdinals) {
-                if (cl == outputOrdinals[k]) { found = true; break; }
-            }
-            if (!found) return k;
+            if (!outputIsClobbered(k)) return k;
         }
         return std::nullopt;
     }
@@ -3505,6 +3639,23 @@ struct DSS_EXPORT TargetSchemaData {
     // it replaces; the loader rejects duplicate letters, so the scan is
     // unambiguous by construction rather than by convention.
     std::vector<TargetAsmConstraint> asmConstraints;
+
+    // Which view a BARE template operand reference names, per register class
+    // (the `asmBareOperandWidths` root key — see `AsmBareOperandWidth` for the
+    // measurement that makes this a declared policy rather than a derivation).
+    // Indexed by the `TargetRegClass` ordinal, mirroring `registerClassOps`.
+    //
+    // ⚠ `nullopt` MEANS **UNDECLARED**, AND THE CONSUMER REFUSES RATHER THAN
+    // PICKING ONE. Both values are plausible and both always assemble, so a
+    // default here would be a silent wrong width on whichever kind of machine
+    // the default did not describe — the exact failure
+    //
+    //     D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE
+    //
+    // records, where a 4-byte store shipped against the reference's 8-byte one
+    // with no diagnostic at either end. An `optional` is the only value that
+    // cannot be mistaken for a measurement.
+    std::array<std::optional<AsmBareOperandWidth>, 5> asmBareOperandWidths{};
 
     // The CIE's `return_address_register` — the DWARF column an unwinder
     // reads to find where this frame's return address went.
@@ -3925,6 +4076,46 @@ public:
             out += '\'';
         }
         return out;
+    }
+
+    // Which view a BARE template operand reference names for register class
+    // `cls`. NULLOPT ⇒ this processor has not declared the policy for that
+    // class, which every consumer must turn into a refusal NAMING the class
+    // and this facet — never into a guess. See `AsmBareOperandWidth`.
+    [[nodiscard]] std::optional<AsmBareOperandWidth>
+    asmBareOperandWidth(TargetRegClass cls) const noexcept {
+        auto const idx = static_cast<std::size_t>(cls);
+        if (idx >= d_.asmBareOperandWidths.size()) return std::nullopt;
+        return d_.asmBareOperandWidths[idx];
+    }
+
+    // The width a register of class `cls` has when named IN FULL — what the
+    // `registerNatural` derivation substitutes.
+    //
+    // ★★ DERIVED FROM `registers[]`, NEVER DECLARED A SECOND TIME. A class's
+    // FULL registers are exactly the rows that declare no `subOf` (`x0`, `rax`,
+    // `v0`), and the narrow views hang off them; re-declaring their width in
+    // this facet would be a second owner of a fact the register table already
+    // states, and the two owners would drift the first time a target gained a
+    // view. ✔MEASURED at HEAD: arm64 `gpr` roots are 8 bytes (32 four-byte `w`
+    // views hang off them), arm64 `vr` roots 16, x86_64 `gpr` roots 8 (with 16
+    // views each at 4, 2 and 1 bytes) and x86_64 `fpr` roots 16.
+    //
+    // ⚠ NULLOPT ON **DISAGREEMENT** AS WELL AS ON ABSENCE, and the
+    // disagreement arm is the one worth having: a class whose full registers
+    // do not all share a width has no single natural width, and answering with
+    // whichever row was met first would be a silent wrong answer in precisely
+    // the place this whole facet exists to stop one. The consumer refuses.
+    [[nodiscard]] std::optional<std::uint32_t>
+    registerClassNaturalWidthBits(TargetRegClass cls) const noexcept {
+        std::optional<std::uint32_t> found;
+        for (auto const& r : d_.registers) {
+            if (r.regClass != cls || !r.subOf.empty()) continue;
+            auto const bits = static_cast<std::uint32_t>(r.widthBytes) * 8u;
+            if (!found.has_value()) { found = bits; continue; }
+            if (*found != bits) return std::nullopt;
+        }
+        return found;
     }
 
     // The CIE's `return_address_register` (see the field's docblock in

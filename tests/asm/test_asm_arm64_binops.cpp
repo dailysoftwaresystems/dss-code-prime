@@ -46,8 +46,8 @@ struct ArmFx {
 [[nodiscard]] LirReg xreg(TargetSchema const& s, std::string_view name) {
     auto const ord = s.registerByName(name);
     EXPECT_TRUE(ord.has_value());
-    return LirReg{static_cast<std::uint32_t>(ord.value_or(0)), 1,
-                  static_cast<std::uint8_t>(LirRegClass::GPR)};
+    return makePhysicalReg(static_cast<std::uint32_t>(ord.value_or(0)),
+                           LirRegClass::GPR);
 }
 
 template <typename Emit>

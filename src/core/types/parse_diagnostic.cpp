@@ -58,8 +58,12 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "P_PreprocessorPragma";
         case DiagnosticCode::P_PreprocessorOperatorNameNotDefinable:
             return "P_PreprocessorOperatorNameNotDefinable";
+        case DiagnosticCode::P_PreprocessorDefinedFromExpansion:
+            return "P_PreprocessorDefinedFromExpansion";
         case DiagnosticCode::P_PreprocessorIncludeReentryRefused:
             return "P_PreprocessorIncludeReentryRefused";
+        case DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned:
+            return "P_PreprocessorIfLiteralImplicitlyUnsigned";
         case DiagnosticCode::S_PragmaPackAmbiguous:
             return "S_PragmaPackAmbiguous";
         case DiagnosticCode::S_AsmLabelInvalid:
@@ -107,6 +111,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_StatementExprAtFileScope";
         case DiagnosticCode::S_VlaInitializerNotEmpty:
             return "S_VlaInitializerNotEmpty";
+        case DiagnosticCode::S_AssignNeedsModifiableLvalue:
+            return "S_AssignNeedsModifiableLvalue";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -292,6 +298,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_ConflictingInlineAttributes";   // TF-C81
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_FileReadFailed:           return "D_FileReadFailed";
+        case DiagnosticCode::D_LaterPhasesNotRun:        return "D_LaterPhasesNotRun";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
         case DiagnosticCode::D_UnresolvedImport:         return "D_UnresolvedImport";

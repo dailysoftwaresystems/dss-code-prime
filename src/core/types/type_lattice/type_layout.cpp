@@ -1006,4 +1006,50 @@ bool compositeFieldsOverlap(TypeId id, TypeInterner const& interner,
     return false;
 }
 
+std::optional<StructLayout>
+operandLayout(TypeId id, TypeInterner const& interner,
+              AggregateLayoutParams params, DataModel dm,
+              NonObjectTypeSizes const& sizes) {
+    // THE OBJECT QUESTION FIRST, ALWAYS. Anything with a real layout answers from
+    // the one engine, byte-identically to every pre-P42 caller — the non-object
+    // arm below is reached ONLY where `computeLayout` had nothing to say. Asking in
+    // this order is what makes the change additive rather than an override: no
+    // declared size can ever displace a layout the engine actually computed.
+    if (auto const layout = computeLayout(id, interner, params, dm)) return layout;
+
+    if (!id.valid()) return std::nullopt;
+    // The qualifier skin is transparent to `kind()`, so `const void` / `volatile
+    // void` reach the Void arm without a second strip (and `computeLayout` above
+    // already stripped volatile for its own answer).
+    std::optional<std::uint64_t> declared;
+    switch (interner.kind(id)) {
+        case TypeKind::Void:  declared = sizes.voidBytes;     break;
+        case TypeKind::FnSig: declared = sizes.functionBytes; break;
+        // EVERY OTHER KIND FALLS THROUGH TO THE REFUSAL, and that is the fail-loud
+        // contract: an incomplete composite, an incomplete array, a VLA, a
+        // Slice/Tuple/Vector a language has not taught the engine to lay out — all
+        // of them keep `computeLayout`'s nullopt and their callers' loud
+        // diagnostics. A future objectless lattice kind refuses here until someone
+        // teaches it, rather than inheriting a guessed size from a neighbour.
+        default: return std::nullopt;
+    }
+    if (!declared.has_value()) return std::nullopt;   // dialect declared none
+
+    // A ZERO operand size is refused rather than synthesized. It cannot be
+    // meaningful: `sizeof` would be 0 where both references say 1, and a stride of
+    // 0 makes every element of an arithmetic sequence alias byte offset 0 — the
+    // exact silent-miscompile `scaleIndexToBytes` already rejects for an empty
+    // aggregate. A schema asking for it gets the loud refusal, never the aliasing.
+    if (*declared == 0) return std::nullopt;
+
+    // `{size = declared, align = 1}`. There is no OBJECT of these types, so there is
+    // no natural alignment to derive from one; 1 is the alignment a byte-addressed
+    // offset needs, and it is what both references report for `_Alignof(void)`.
+    // Deliberately NOT `scalarAlign(*declared, params)`: that answers the object
+    // question this whole function exists to stop asking, and for a declared size of
+    // 1 it happens to agree — an agreement that would quietly stop holding if a
+    // dialect ever declared 2.
+    return StructLayout{*declared, Alignment{}, {}, false};
+}
+
 } // namespace dss

@@ -1,0 +1,8 @@
+{
+  "$comment": "The DEPENDENCY manifest. `staticlib`'s composition verb is ArtifactLink, so this project gets its OWN build into an archive and that archive is threaded into the consumer's resolveLibraries — which is exactly what routes the consumer's link through an OBJECT READER (`coff_object_reader.cpp` on the PE leg, `elf_object_reader.cpp` / `macho_object_reader.cpp` on the others). A SourceMerge dependency would not: it would hand the consumer this file's SOURCE and never write, or read back, an object at all.",
+  "$commentTargets": "Deliberately narrower than the consumer's, exactly as `project_dependson_staticlib_artifact_link` documents: a dependency's `targets[]` states what it builds FOR ITSELF and is not consulted when it is built as a dependency (plan 06 §5.1 B.10). The archive's object format is DERIVED from the consumer's target, which is what lets one manifest produce a PE, two ELF and one Mach-O archive.",
+  "language": "c",
+  "artifactProfile": "staticlib",
+  "targets": ["x86_64:elf64-x86_64-linux-staticlib"],
+  "sources": ["table.c"]
+}

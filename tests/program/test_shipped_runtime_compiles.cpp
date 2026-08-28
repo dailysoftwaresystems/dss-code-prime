@@ -551,7 +551,7 @@ TEST(ShippedRuntimeCompiles, EveryDeclaredRealizationSourceCompilesForItsFormat)
                 if (!siblingSchema) continue;
                 fs::path const artifact =
                     outDir / (resolved.path.stem().generic_string()
-                              + std::string{parsed->outputExtension(**siblingSchema)});
+                              + std::string{outputExtensionFor(**siblingSchema)});
 
                 std::error_code statEc;
                 bool const wrote = fs::is_regular_file(artifact, statEc);

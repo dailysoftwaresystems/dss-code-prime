@@ -866,10 +866,24 @@ private:
     // symbol-address global, and the same one the linker runs for a cross-CU
     // thunk slot. Matching on the string "abs64" would bind DSS to one
     // target's spelling of a property every target states structurally.
+    //
+    // ⚠ `!pcRelative` ALONE NO LONGER IDENTIFIES THE ROW, AND FIRST-MATCH WAS
+    // ALREADY LOAD-BEARING BEFORE IT STOPPED. On x86_64 the width-4
+    // non-pc-relative rows are `abs32`, `tls-tpoff32` and (since
+    // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO) `imagerel32`, and only the first
+    // writes the ABSOLUTE ADDRESS a `.long sym` slot needs. The other two are
+    // addresses in different coordinate spaces — a per-thread offset and an
+    // offset from the image base — so a table read through either lands
+    // somewhere that is not the label, with nothing to notice. They are
+    // excluded by NAMING THE PROPERTY, never by trusting that the right row
+    // happens to be declared first.
     [[nodiscard]] std::optional<RelocationKind>
     absoluteRelocKind(std::uint32_t widthBytes) const {
         for (auto const& r : target_.relocations()) {
-            if (r.widthBytes == widthBytes && !r.pcRelative) return r.kind;
+            if (r.widthBytes == widthBytes && !r.pcRelative && !r.tls
+                && !r.imageRelative) {
+                return r.kind;
+            }
         }
         return std::nullopt;
     }

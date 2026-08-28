@@ -57,13 +57,25 @@ namespace dss {
 // `(inputs ∪ clobbered)` over the per-OPCODE carrier and the per-INSTRUCTION
 // carrier — to `out`, skipping any ordinal `out` already holds.
 //
-// ⚠ OUTPUTS ARE DELIBERATELY NOT FORBIDDEN, and the omission is load-bearing
-// rather than an oversight: the instruction reads its operands BEFORE writing
-// its outputs, so an operand sharing a register with an output is fine. The
-// omission is SAFE only because `outputs ⊆ clobbered` is enforced — by the
-// loader for the per-opcode carrier (`target_schema_json.cpp`). A producer
-// filling the per-INSTRUCTION carrier owes the same discipline: every
-// register-pinned OUTPUT must also enter that instruction's `clobberedNames`.
+// ⚠⚠ OUTPUTS ARE DELIBERATELY NOT FORBIDDEN, AND THE OMISSION IS SOUND FOR
+// TWO DIFFERENT REASONS DEPENDING ON WHICH VALUE IS ASKING
+// (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED).
+// An OPERAND OF THIS INSTRUCTION may overlap an output freely — the
+// instruction reads its operands before it writes them — and that half stands
+// on its own. A range that merely LIVES ACROSS the instruction is not read by
+// it at all, so that argument does not reach: such a value is protected ONLY
+// by `outputs ⊆ clobbered`, which puts every output inside the clobber half of
+// the union this function returns.
+//
+// ★ THAT GUARANTEE IS NOW ENFORCED AT BOTH PRODUCERS RATHER THAN OWED BY ONE.
+// The `.target.json` loader validates it for the per-OPCODE carrier;
+// `LirBuilder::regConstraintPoolAdd` REFUSES a per-INSTRUCTION entry whose
+// outputs are not a subset of its clobbers, so this accessor's precondition is
+// a property of the pool rather than a convention its writers are trusted to
+// keep. `ImplicitRegisterConstraint::firstOutputNotClobbered` is the single
+// implementation of the rule; a producer fed by USER text (the inline-asm
+// lowering, the `.dsslir` reader) asks it FIRST and reports, because a tier
+// reading user text owes a diagnostic, not a process kill.
 //
 // Dedup is against the WHOLE of `out`, not just this call's additions, so a
 // caller that has already staged unrelated exclusions (the allocator's

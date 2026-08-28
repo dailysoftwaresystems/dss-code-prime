@@ -947,8 +947,8 @@ TEST(LirCallconv, Arm64ControlFlowSkeletonEncodesCmpBcondBWithResolvedOffsets) {
     auto xreg = [&](char const* name) {
         auto ord = s.registerByName(name);
         EXPECT_TRUE(ord.has_value());
-        return LirReg{static_cast<std::uint32_t>(ord.value_or(0)), 1,
-                      static_cast<std::uint8_t>(LirRegClass::GPR)};
+        return makePhysicalReg(static_cast<std::uint32_t>(ord.value_or(0)),
+                               LirRegClass::GPR);
     };
     LirReg const x0  = xreg("x0");
     LirReg const xzr = xreg("xzr");
@@ -3773,9 +3773,7 @@ TEST(LirCallconvAbi,
     // (otherwise we'd be testing the wrong negative pin).
     auto const raxOrd = sch.registerByName("rax");
     ASSERT_TRUE(raxOrd.has_value());
-    LirReg const presult{static_cast<std::uint32_t>(*raxOrd),
-                         /*isPhysical=*/1,
-                         /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirReg const presult = makePhysicalReg(static_cast<std::uint32_t>(*raxOrd), LirRegClass::GPR);
     b.addInst(*allocaOp, presult, std::span<LirOperand const>{});
     b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
     Lir lir = std::move(b).finish();

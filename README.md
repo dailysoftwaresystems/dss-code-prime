@@ -44,13 +44,15 @@ DSS Code Prime already compiles and runs **real, unmodified, production software
   The figure is the compiler's own `--time` report, not a wrapper's stopwatch. The release build turns **4m08s of attributed CPU into 31.1 s of phase wall — 8.0× parallel** (the front-half CU stage runs 103 jobs at 30.2× concurrency). ⚠ **Quote both rows or neither:** the optimizer is the difference between them, and a debug-pipeline number presented as "SQLite compiles in 23 seconds" would be the release-only omission this project has been bitten by before. ⚠ The staged upstream tree these figures ran against carries **no recorded revision id**, so they are a this-host, this-day measurement and not a benchmark you can reproduce against a different checkout.
 - **Benchmarked head-to-head against GCC, Clang and MSVC on THREE hosts, on SQLite's own benchmark, and we are behind on compile time.** The subject is `test/speedtest1.c` — SQLite's own performance program — linked against the same **103 full-source translation units**, *not* the amalgamation. (Upstream ships no full-source recipe for it: both `main.mk` and `Makefile.msc` build `speedtest1` from `sqlite3.c`. So the TU list is derived from the full-source `sqlite3d` recipe and has its one artifact TU substituted.) On each host every compiler builds the same source on the same machine; builds are **cold** — a fresh object directory per repeat — median of 3, run times median of 5 after an uncounted warm-up, monotonic clock.
 
-  **Windows 11 / x86_64, 32 logical CPUs — upstream `6f1110c`**
+  **Windows 11 / x86_64, 32 logical CPUs — upstream `6f1110c`** · re-measured 2026-08-27
 
   | compiler | optimization | build −j1 | build −j4 | `speedtest1 --size 25` | 1→4 scaling |
   |---|---|---|---|---|---|
-  | **DSS Code Prime** | `--config=release` | 64.54 s | **36.16 s** | 3.485 s | 1.78× |
-  | gcc 13.2.0 (MinGW-W64) | `-O2` | 26.71 s | **7.38 s** | 2.472 s | 3.62× |
-  | MSVC `cl.exe` | `/O2` | 13.74 s | **4.50 s** | 3.094 s | 3.05× |
+  | **DSS Code Prime** | `--config=release` | 33.80 s | **13.19 s** | 3.374 s | 2.56× |
+  | gcc 13.2.0 (MinGW-W64) | `-O2` | 27.51 s | **7.77 s** | 2.812 s | 3.54× |
+  | MSVC `cl.exe` | `/O2` | 14.30 s | **4.55 s** | 3.031 s | 3.14× |
+
+  ⚠ **Only this table was re-measured on 2026-08-27; the two below it were not, and are older runs.** It is stated because the alternative — refreshing one row and leaving the reader to assume the page is one measurement — is the kind of quiet staleness this section already warns about. The re-run is on the **same upstream checkout (`6f1110c`)** and the same host as the numbers it replaces, so the DSS movement is a like-for-like comparison and not a change of subject: **−j1 64.54 → 33.80 s, −j4 36.16 → 13.19 s.** ⓘ The reference arms moved only within ordinary machine variation over the same interval (gcc −j4 7.38 → 7.77 s, MSVC 4.50 → 4.55 s), which is what makes the DSS change readable as a real one rather than as a quieter machine.
 
   **Linux / x86_64 (WSL2), 32 logical CPUs — upstream `93f6407070`**
 
@@ -67,7 +69,7 @@ DSS Code Prime already compiles and runs **real, unmodified, production software
   | **DSS Code Prime** | `--config=release` | 36.63 s | **17.94 s** | 1.396 s | 2.04× |
   | Apple clang 21.0.0 | `-O2` | 10.69 s | **2.96 s** | 0.784 s | 3.61× |
 
-  **Read this as the gap it is.** At `-j4` DSS takes **4.9× gcc's** and **8.0× MSVC's** compile time on Windows, **4.5× gcc's** and **5.4× clang's** on Linux, and **6.1× Apple clang's** on macOS. Its output runs **1.13×–1.78×** slower than the references depending on host and vendor — closest to MSVC, furthest from Apple clang. We publish it because a compiler that only reports the axes it wins is not a measurement, it is marketing.
+  **Read this as the gap it is.** At `-j4` DSS takes **1.70× gcc's** and **2.90× MSVC's** compile time on Windows (was 4.9× and 8.0× before the 2026-08-27 re-measurement), **4.5× gcc's** and **5.4× clang's** on Linux, and **6.1× Apple clang's** on macOS. ⚠ **The Linux and macOS multipliers are computed from the older tables below and have NOT been re-measured** — the same work that moved the Windows numbers has not been re-timed on those hosts, so treat them as an upper bound rather than as today's gap. Its output runs **1.13×–1.78×** slower than the references depending on host and vendor — closest to MSVC, furthest from Apple clang. We publish it because a compiler that only reports the axes it wins is not a measurement, it is marketing.
 
   ⚠ **Three tables, three upstream revisions, and one of the hosts has a third of the cores — so do not read across them.** The checkouts are at `6f1110c`, `93f6407070` and `55bf04a530`, and the Mac has 10 logical CPUs against 32. Within a table every arm compiled the same source on the same machine; between tables, nothing is being claimed. A compile-time number quoted without its host, its TU count and its upstream revision is not comparable to anything.
 

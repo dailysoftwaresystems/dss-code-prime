@@ -10,6 +10,10 @@
 #include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/object_symbol_names.hpp"
 #include "link/format/string_table.hpp"
+// The ONE scanner that answers "which relocation row patches an unwind table's
+// code-pointer field" — shared with `dwarf_cfi.hpp`'s FDE pointer
+// (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO).
+#include "link/format/unwind_pointer_reloc.hpp"
 #include "link/format/weak_definition_gate.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -110,6 +114,22 @@ constexpr std::uint16_t IMAGE_SYM_DTYPE_FUNCTION = 0x20;
 // (Object Only)" + "Auxiliary Format 5: Section Definitions").
 constexpr std::uint32_t kScnLnkComdat          = 0x00001000u;
 constexpr std::uint8_t  IMAGE_COMDAT_SELECT_ANY = 2;
+// D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: "The section is linked only if the
+// associated section is linked" — the Selection a section that DESCRIBES
+// another section carries, with its aux record's `Number` naming the associated
+// section's 1-based ordinal. A weak function's `.pdata`/`.xdata` are exactly
+// that: keeping them after their function's COMDAT is discarded leaves a
+// RUNTIME_FUNCTION covering an address range whose prologue is now some other
+// translation unit's copy. ✔VERIFIED against the published PE/COFF format
+// ("Auxiliary Format 5: Section Definitions", Selection values).
+constexpr std::uint8_t  IMAGE_COMDAT_SELECT_ASSOCIATIVE = 5;
+// `.pdata` / `.xdata` Characteristics. IMAGE_SCN_CNT_INITIALIZED_DATA (0x40)
+// | IMAGE_SCN_ALIGN_4BYTES (0x00300000) | IMAGE_SCN_MEM_READ (0x40000000).
+// ✔MEASURED 2026-08-27 against gcc 13.2.0's own x64 COFF `.obj`: both sections
+// carry exactly 0x40300040. The 4-byte align class is what a table of u32
+// fields needs and what makes contributions from several objects concatenate
+// without the linker inserting a gap mid-table.
+constexpr std::uint32_t kUnwindObjCharacteristics = 0x40300040u;
 // Auxiliary Format 5 is 18 bytes like every symbol record: Length[4],
 // NumberOfRelocations[2], NumberOfLinenumbers[2], CheckSum[4], Number[2],
 // Selection[1], Unused[3].
@@ -315,28 +335,61 @@ constexpr std::size_t  kRuntimeFunctionSize = 12;  // BeginAddress + EndAddress 
 // is the personality extern whose thunk RVA is written there.
 struct SehHandlerPatch { std::uint32_t xdataOffset; SymbolId symbol; };
 
+// ★★ EVERY OTHER RVA FIELD AN `UNWIND_INFO` CARRIES, AS A REQUEST RATHER THAN
+// A VALUE — D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO.
+//
+// A `__try`'s `SCOPE_TABLE` states four image-relative addresses per scope:
+// the guarded range's Begin and End and the `__except` body's JumpTarget (all
+// interior to the parent function), and the filter funclet's HandlerAddress (a
+// different function). `buildFunctionUnwindInfo` used to write them RESOLVED,
+// because its only caller was the image walker — which is exactly what made
+// the relocatable-object arm unable to carry a scope table at all: in an
+// object none of the four is knowable.
+//
+// So the builder now states each as `{ where, which symbol, how far into it }`
+// and each caller realizes it in its own coordinate system: the image walker
+// adds the symbol's RVA and writes the sum; the object writer emits an
+// image-relative relocation against that symbol with the offset stamped in the
+// field. ★ ONE DESCRIPTION OF WHICH FIELDS ARE ADDRESSES, not one per arm —
+// the same reason the FDE-pointer lookup has one owner.
+struct XdataRvaPatch {
+    std::uint32_t xdataOffset;   // byte offset of the u32 field, .xdata-global
+    SymbolId      symbol;        // the defined function it points into
+    std::uint32_t addend;        // byte offset within that function
+};
+
 [[nodiscard]] inline std::optional<std::vector<std::uint8_t>>
 buildFunctionUnwindInfo(CfiFunction const&              cfi,
                         std::span<SehScopeEntry const>  sehScopes,
                         TargetSchema const&             targetSchema,
+                        // Which walker arm is asking. BOTH arms build
+                        // UNWIND_INFO from the same neutral `CfiFunction`
+                        // (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO gave the
+                        // relocatable-object arm its own tables), and a
+                        // refusal that names the wrong one sends the reader
+                        // to code that never ran.
+                        std::string_view                contextLabel,
                         std::size_t                     funcIndex,
-                        // c116: this function's image-RVA base (= textRva0 +
-                        // funcTextStart[funcIndex]) — the scope table's Begin/End/
-                        // JumpTarget are this + the SehScopeEntry byte offsets.
-                        std::uint32_t                   funcBeginRva,
-                        // c116: SymbolId → image-RVA (the filter-funclet function's
-                        // RVA = the scope-table HandlerAddress). Returns 0 when the
-                        // symbol is not a defined function (fail-loud caller).
-                        std::function<std::uint32_t(SymbolId)> const& symbolToRva,
+                        // This function's own symbol — the scope table's
+                        // Begin / End / JumpTarget are byte offsets INTO it,
+                        // and both callers resolve it in their own coordinate
+                        // system (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO).
+                        SymbolId                        ownFunctionSymbol,
                         // c116: the base byte offset THIS blob will occupy within
                         // the whole `.xdata` (= xdataBytes.size() at the call), so
-                        // recorded handler-field patch offsets are .xdata-global.
+                        // recorded patch offsets are .xdata-global.
                         std::uint32_t                   xdataBaseOffset,
+                        // The personality handler's RVA field. Kept SEPARATE
+                        // from `rvaPatches` because its symbol is an EXTERN
+                        // whose thunk the image walker cannot resolve until the
+                        // `.idata` pass — a different deferral, not a different
+                        // kind of address.
                         std::vector<SehHandlerPatch>&   handlerPatches,
+                        std::vector<XdataRvaPatch>&     rvaPatches,
                         DiagnosticReporter&             reporter) {
     auto fail = [&](std::string msg) -> std::optional<std::vector<std::uint8_t>> {
         emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
-             "pe::encodeExec: unwind info for function #"
+             std::string{contextLabel} + ": unwind info for function #"
                  + std::to_string(funcIndex) + ": " + msg);
         return std::nullopt;
     };
@@ -558,19 +611,22 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
         pushU32(0u);   // placeholder — back-patched to the thunk RVA post-.idata
 
         // SCOPE_TABLE: u32 Count; then Count × { Begin, End, Handler, JumpTarget }.
+        // Every one of the four is an RVA, so every one is a PATCH REQUEST —
+        // three naming this function with an interior byte offset, the fourth
+        // naming the filter funclet at offset 0. The field itself is written
+        // as a placeholder; the caller supplies the coordinate system.
         pushU32(static_cast<std::uint32_t>(sehScopes.size()));
+        auto pushRvaField = [&](SymbolId sym, std::uint32_t addend) {
+            rvaPatches.push_back(XdataRvaPatch{
+                xdataBaseOffset + static_cast<std::uint32_t>(out.size()), sym,
+                addend});
+            pushU32(0u);
+        };
         for (auto const& sc : sehScopes) {
-            std::uint32_t const filterRva = symbolToRva(sc.filterFuncletSymbol);
-            if (filterRva == 0u) {
-                return fail("SEH scope's filter funclet symbol #"
-                            + std::to_string(sc.filterFuncletSymbol.v)
-                            + " has no function RVA (unresolved funclet) — "
-                              "D-WIN64-SEH-FUNCLETS");
-            }
-            pushU32(funcBeginRva + sc.beginByteOffset);       // BeginAddress
-            pushU32(funcBeginRva + sc.endByteOffset);         // EndAddress
-            pushU32(filterRva);                               // HandlerAddress (filter funclet)
-            pushU32(funcBeginRva + sc.jumpTargetByteOffset);  // JumpTarget (__except body)
+            pushRvaField(ownFunctionSymbol, sc.beginByteOffset);       // BeginAddress
+            pushRvaField(ownFunctionSymbol, sc.endByteOffset);         // EndAddress
+            pushRvaField(sc.filterFuncletSymbol, 0u);                  // HandlerAddress
+            pushRvaField(ownFunctionSymbol, sc.jumpTargetByteOffset);  // JumpTarget
         }
         // The blob already ends u32-aligned (every appended field is a u32).
     }
@@ -797,6 +853,59 @@ encode(AssembledModule const&    module,
         return encodeExec(module, targetSchema, fmt, *secText, reporter,
                           request);
     }
+    // ── THE UNWIND GATE — D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO ──────
+    //
+    // ★★ THIS ARM NOW EMITS `.pdata` + `.xdata`. It did not until 2026-08-27,
+    // and the sentence that kept the gap invisible was written down in three
+    // places — `src/asm/asm.hpp`'s `cfi` comment and BOTH PE object formats'
+    // `$sehPersonalityOmittedComment` — each claiming
+    // "AssembledFunction::unwind is nullopt on the object path by
+    // construction". ✔MEASURED 2026-08-27, one non-leaf source with NO `__try`,
+    // off one front end: `elf64-x86_64-linux` (an OBJECT) emitted `.eh_frame`
+    // 108 B + `.rela.eh_frame` 72 B from the SAME `AssembledFunction::cfi` this
+    // arm was dropping. The producer was never missing; the WRITER was. All
+    // three sentences are corrected.
+    //
+    // ⚠ THE TWO REFUSALS THAT USED TO STAND HERE ARE BOTH GONE, AND THEIR
+    // REMOVAL IS THE FIX RATHER THAN A RELAXATION.
+    //   * "the format declares `sehPersonality` while a function carries
+    //     `cfi`" — that refused the state in which cfi would be DISCARDED. It
+    //     is no longer discarded.
+    //   * "a function guards a `__try`" — the scope table's four RVAs per
+    //     scope, and the personality handler's own, are now stated as patch
+    //     requests (`XdataRvaPatch`) rather than resolved image addresses, so
+    //     this arm realizes them as `.xdata` relocations exactly as it does the
+    //     `RUNTIME_FUNCTION` fields. There is no combination left in which
+    //     unwind or exception information is discarded quietly.
+    // What remains is the MACHINE belt, and it is gated on the INFORMATION
+    // rather than on the architecture — the same shape and the same reason as
+    // `encodeExec`'s D-WIN64-PDATA-ARM64-SILENT-SKIP `else` arm.
+    if (fmt.pe().machine != kMachineAmd64PE) {
+        // The machine belt, mirroring `encodeExec`'s
+        // D-WIN64-PDATA-ARM64-SILENT-SKIP `else` arm — and gated on the
+        // INFORMATION, never on the architecture, so a non-x64 PE object that
+        // carries no frame information still encodes.
+        std::size_t unwindFunctionCount = 0;
+        for (auto const& fn : module.functions) {
+            if (fn.cfi.has_value()) ++unwindFunctionCount;
+        }
+        if (unwindFunctionCount > 0) {
+            emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
+                 std::format(
+                     "pe::encode (Obj): no unwind-table emitter for PE machine "
+                     "0x{:x} — {} function(s) carry call-frame information, and "
+                     "emitting this object would drop it together with the "
+                     "`.pdata` + `.xdata` sections that carry it. This arm "
+                     "implements the x86_64 (0x{:x}) UNWIND_INFO encoding only; "
+                     "ARM64 (0xaa64) uses `.pdata` v2 packed/extended unwind, a "
+                     "DIFFERENT encoding. Add a per-machine unwind encoder (see "
+                     "buildFunctionUnwindInfo) to ship unwindable objects for "
+                     "this architecture (D-WIN64-PDATA-ARM64-SILENT-SKIP).",
+                     fmt.pe().machine, unwindFunctionCount, kMachineAmd64PE));
+            return {};
+        }
+    }
+
     // NOTE: the Obj path does not APPLY relocations (the assembler
     // stamped the bytes; the .obj writer serializes them + the
     // IMAGE_RELOCATION records link.exe resolves). `targetSchema` is
@@ -1145,9 +1254,25 @@ encode(AssembledModule const&    module,
         std::uint64_t spanSize = 0;
         // Exactly one of these is engaged. A function record serialises
         // `module.functions[fnIndex].bytes`; a data record serialises its own
-        // single-item layout (which also carries the item's in-slot addends).
+        // single-item layout (which also carries the item's in-slot addends);
+        // a WRITER-SYNTHESIZED record (a weak function's `.pdata` / `.xdata`)
+        // carries its bytes directly, because no producer ever handed them
+        // over as an `AssembledData`.
         std::optional<std::size_t> fnIndex;
         std::optional<link::format::ExecDataSectionLayout> dataLayout;
+        std::optional<std::vector<std::uint8_t>> rawBytes;
+        // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: a COMDAT that exists to
+        // DESCRIBE another COMDAT carries no program symbol of its own — MSVC
+        // and gcc both emit only the section symbol for an associative
+        // `.pdata`/`.xdata` — and it is `IMAGE_COMDAT_SELECT_ASSOCIATIVE`
+        // rather than SELECT_ANY, naming the section it lives and dies with.
+        bool          hasCanonicalSymbol = true;
+        std::uint8_t  selection = IMAGE_COMDAT_SELECT_ANY;
+        // Index INTO `comdats` of the section this one is associative to;
+        // resolved to that record's 1-based ordinal once ordinals are assigned
+        // (they are assigned in one later pass, so the ordinal is not yet
+        // knowable at construction).
+        std::optional<std::size_t> associatedComdat;
         std::int16_t  sectionNumber = 0;
         // Filled once the symbol table is minted / the reloc tables are built.
         std::size_t   sectionDefEntry = 0;  // index into the symbol entry list
@@ -1214,6 +1339,235 @@ encode(AssembledModule const&    module,
         rec.dataLayout      = std::move(*layoutOpt);
         comdats.push_back(std::move(rec));
     }
+    // `module.functions` index -> its COMDAT record, for the walks that must
+    // follow a weak function's body into its own section: the block symbols
+    // interior to it, its relocation table, and its unwind tables.
+    std::unordered_map<std::size_t, std::size_t> comdatByFuncIndex;
+    for (std::size_t ci = 0; ci < comdats.size(); ++ci) {
+        if (comdats[ci].fnIndex.has_value()) {
+            comdatByFuncIndex.emplace(*comdats[ci].fnIndex, ci);
+        }
+    }
+
+    // ══ `.pdata` + `.xdata` — D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO ══
+    //
+    // The relocatable-object mirror of `encodeExec`'s (b3) block, and of the
+    // ELF ET_REL arm's `.eh_frame` + `.rela.eh_frame`. Same input — the
+    // neutral `AssembledFunction::cfi` every producer already fills — and the
+    // same Win64 `UNWIND_INFO` encoder; what differs is that in an object NO
+    // address is known, so every `RUNTIME_FUNCTION` field is a RELOCATION with
+    // its addend stamped in the field itself (COFF has no addend column).
+    //
+    // ★ THE RELOCATION IS RESOLVED FROM THE TARGET'S OWN VOCABULARY, by the
+    //   scanner ELF's FDE pointer already uses (`unwind_pointer_reloc.hpp`).
+    //   `IMAGE_REL_AMD64_ADDR32NB` is not spelled anywhere in this file: the
+    //   x86_64 target declares a Linear, 32-bit, zero-bias, `imageRelative`
+    //   row and each PE object format maps it to a wire id. ⚠ ADDR32 IS NOT A
+    //   SUBSTITUTE — it writes a full VA where the unwinder reads an offset
+    //   from the image base — and `imageRelative` is the ONLY field that tells
+    //   the two apart, which is exactly why it exists.
+    //
+    // ★★ A WEAK FUNCTION'S TABLES ARE ASSOCIATIVE COMDATS, NOT SHARED ROWS.
+    //   A weak definition already lives in its own `IMAGE_SCN_LNK_COMDAT`
+    //   section so the linker keeps one copy. Putting its `RUNTIME_FUNCTION`
+    //   in the shared `.pdata` would leave that entry behind when its section
+    //   is discarded: the relocation still resolves (to the surviving copy),
+    //   so nothing fails — the image simply carries an `UNWIND_INFO` computed
+    //   from THIS object's prologue describing an address range now occupied
+    //   by a DIFFERENT translation unit's body. That is a wrong stack walk
+    //   with no diagnostic anywhere, so each such function gets its own
+    //   `.xdata`/`.pdata` pair marked `IMAGE_COMDAT_SELECT_ASSOCIATIVE` with
+    //   `Number` naming the function's own section — the shape MSVC and gcc
+    //   both emit under `/Gy` / `-ffunction-sections`.
+    struct UnwindFieldReloc {
+        std::uint32_t           offsetInSection = 0;
+        // Engaged  => the field is a `.text` RVA and relocates against this
+        //             symbol (a function, or the `__C_specific_handler`
+        //             extern for a scope table's handler field).
+        // Disengaged => it is the group's own `.xdata` RVA, relocating against
+        //             that section's STATIC section symbol.
+        std::optional<SymbolId> targetSymbol;
+        std::size_t             xdataRecord = 0;
+        std::uint32_t           addend      = 0;
+    };
+    struct UnwindSectionRecord {
+        std::string               name;
+        std::vector<std::uint8_t> bytes;
+        // Both `.pdata` (RUNTIME_FUNCTION fields) and `.xdata` (a `__try`
+        // scope table's fields + the personality handler) carry these.
+        std::vector<UnwindFieldReloc> rvaFields;
+        std::optional<std::size_t> associatedComdat;  // engaged => ASSOCIATIVE
+        std::int16_t  sectionNumber   = 0;
+        std::uint32_t sectionSymIdx   = 0;
+        std::size_t   sectionDefEntry = 0;
+        std::vector<std::uint8_t> relocs;
+        std::uint32_t relocCount   = 0;
+        std::uint32_t rawPointer   = 0;
+        std::uint32_t relocPointer = 0;
+    };
+    std::vector<UnwindSectionRecord> unwindSections;
+    // The relocation row is resolved ONCE, and ONLY when there is a table to
+    // relocate — the same order `elf.cpp`'s ET_REL arm documents: a module
+    // with no frame information must not be failed over a psABI row it has no
+    // use for.
+    std::uint32_t unwindRelocNativeId = 0;
+    {
+        std::size_t cfiFunctionCount = 0;
+        for (auto const& fn : module.functions) {
+            if (fn.cfi.has_value()) ++cfiFunctionCount;
+        }
+        if (cfiFunctionCount > 0) {
+            std::string relocErr;
+            auto const* rvaReloc = link::format::unwindPointerRelocationOf(
+                targetSchema, link::format::kWin64RuntimeFunctionPointerField,
+                relocErr);
+            if (rvaReloc == nullptr) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     "pe::encode (Obj): " + relocErr);
+                return {};
+            }
+            auto const* fmtRvaReloc = fmt.relocationByKind(rvaReloc->kind);
+            if (fmtRvaReloc == nullptr) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format(
+                         "pe::encode (Obj): target '{}' declares the "
+                         "image-relative relocation '{}' (kind {}) but object "
+                         "format '{}' maps no COFF type to it, so `.pdata` "
+                         "could only ship with its RUNTIME_FUNCTION fields "
+                         "left as raw section offsets — every entry would "
+                         "claim to describe the start of the image and "
+                         "RtlLookupFunctionEntry would attribute every frame "
+                         "to whatever lives there "
+                         "(D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO).",
+                         targetSchema.name(), rvaReloc->name,
+                         rvaReloc->kind.v, fmt.name()));
+                return {};
+            }
+            unwindRelocNativeId = fmtRvaReloc->nativeId;
+
+            auto makeGroup =
+                [&](std::optional<std::size_t> assoc) -> std::size_t {
+                UnwindSectionRecord x;
+                x.name = ".xdata";
+                x.associatedComdat = assoc;
+                UnwindSectionRecord p;
+                p.name = ".pdata";
+                p.associatedComdat = assoc;
+                unwindSections.push_back(std::move(x));
+                unwindSections.push_back(std::move(p));
+                return unwindSections.size() - 2;   // index of the `.xdata`
+            };
+            std::optional<std::size_t> sharedGroup;
+
+            for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+                auto const& fn = module.functions[fi];
+                if (!fn.cfi.has_value()) continue;
+                // The FDE-equivalent coverage check the ELF ET_REL arm makes
+                // for the same reason: a `codeLength` that disagrees with the
+                // real extent describes the wrong tail of the function, and it
+                // is invisible in a dump.
+                if (fn.cfi->codeLength
+                    != static_cast<std::uint32_t>(fn.bytes.size())) {
+                    emit(reporter,
+                         DiagnosticCode::K_UnwindRuleUnrepresentable,
+                         std::format(
+                             "pe::encode (Obj): function #{} carries "
+                             "call-frame information describing {} bytes but "
+                             "its machine code is {} bytes — the "
+                             "RUNTIME_FUNCTION's [Begin, End) would not cover "
+                             "the whole function and RtlVirtualUnwind would "
+                             "find no entry for a fault in the tail "
+                             "(D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO).",
+                             fi, fn.cfi->codeLength, fn.bytes.size()));
+                    return {};
+                }
+                auto const cit = comdatByFuncIndex.find(fi);
+                std::size_t groupBase;
+                if (cit != comdatByFuncIndex.end()) {
+                    groupBase = makeGroup(cit->second);
+                } else {
+                    if (!sharedGroup.has_value()) {
+                        sharedGroup = makeGroup(std::nullopt);
+                    }
+                    groupBase = *sharedGroup;
+                }
+                // Built with the group's CURRENT `.xdata` extent as the base,
+                // so every patch offset the builder records is already
+                // section-relative — the coordinate the IMAGE_RELOCATION's
+                // VirtualAddress column wants, since a `.obj` section's VA
+                // base is 0.
+                std::uint32_t const xdataOff = static_cast<std::uint32_t>(
+                    unwindSections[groupBase].bytes.size());
+                std::vector<SehHandlerPatch> handlerPatches;
+                std::vector<XdataRvaPatch>   rvaPatches;
+                auto uwOpt = buildFunctionUnwindInfo(
+                    *fn.cfi, fn.sehScopes, targetSchema, "pe::encode (Obj)",
+                    fi, fn.symbol, xdataOff, handlerPatches, rvaPatches,
+                    reporter);
+                if (!uwOpt.has_value()) return {};
+                unwindSections[groupBase].bytes.insert(
+                    unwindSections[groupBase].bytes.end(), uwOpt->begin(),
+                    uwOpt->end());
+                // A `__try`'s scope-table fields and its personality handler
+                // become `.xdata` relocations of the SAME image-relative kind
+                // the RUNTIME_FUNCTION fields use — the whole reason the
+                // builder states them as requests. The handler's symbol is an
+                // EXTERN here, which an object expresses perfectly well; only
+                // an IMAGE has to defer it to an import thunk.
+                for (auto const& p : rvaPatches) {
+                    unwindSections[groupBase].rvaFields.push_back(
+                        {p.xdataOffset, p.symbol, 0, p.addend});
+                }
+                for (auto const& p : handlerPatches) {
+                    unwindSections[groupBase].rvaFields.push_back(
+                        {p.xdataOffset, p.symbol, 0, 0u});
+                }
+
+                UnwindSectionRecord& prec = unwindSections[groupBase + 1];
+                std::uint32_t const pdataOff =
+                    static_cast<std::uint32_t>(prec.bytes.size());
+                // A weak function's `funcTextStart` is 0 (its COMDAT holds one
+                // body); an ordinary one's is its offset within `.text`. Both
+                // are the addend for a relocation against the FUNCTION symbol
+                // — this writer mints no `.text` section symbol, so the
+                // function symbol is the only handle, and it is also the one
+                // that survives COMDAT selection.
+                std::uint32_t const beginOff =
+                    static_cast<std::uint32_t>(funcTextStart[fi]);
+                std::uint32_t const endOff =
+                    beginOff + static_cast<std::uint32_t>(fn.bytes.size());
+                appendU32LE(prec.bytes, beginOff);
+                appendU32LE(prec.bytes, endOff);
+                appendU32LE(prec.bytes, xdataOff);
+                prec.rvaFields.push_back({pdataOff, fn.symbol, 0, beginOff});
+                prec.rvaFields.push_back(
+                    {pdataOff + 4u, fn.symbol, 0, endOff});
+                prec.rvaFields.push_back(
+                    {pdataOff + 8u, std::nullopt, groupBase, xdataOff});
+            }
+            // A group is created only when a function feeds it, so an empty
+            // `.xdata` here would mean the encoder returned a zero-length
+            // blob — impossible (the header alone is 4 bytes) and worth
+            // catching, since an empty unwind section reads as "this code
+            // needs no unwinding" rather than as a bug.
+            for (auto const& rec : unwindSections) {
+                if (!rec.bytes.empty()) continue;
+                emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
+                     std::format("pe::encode (Obj): synthesized an empty '{}' "
+                                 "section - substrate-invariant violation "
+                                 "(a group is created only when a function "
+                                 "contributes to it).",
+                                 rec.name));
+                return {};
+            }
+        }
+    }
+    // Unwind ordinals come BEFORE the COMDAT ones so the weak-definition
+    // ordinal arithmetic below (and the tripwire that reads it) is untouched.
+    for (auto& rec : unwindSections) {
+        rec.sectionNumber = ++sectOrdinalCursor;
+    }
+
     // COFF's IMAGE_SYMBOL.SectionNumber is a SIGNED 16-bit field whose negative
     // values are reserved specials (UNDEF is 0, ABSOLUTE is -1, DEBUG is -2),
     // so an object cannot carry more than 32767 sections. Every weak definition
@@ -1235,15 +1589,6 @@ encode(AssembledModule const&    module,
         return {};
     }
     for (auto& rec : comdats) rec.sectionNumber = ++sectOrdinalCursor;
-    // `module.functions` index -> its COMDAT record, for the two walks that
-    // must follow a weak function's body into its own section: the block
-    // symbols interior to it, and its relocation table.
-    std::unordered_map<std::size_t, std::size_t> comdatByFuncIndex;
-    for (std::size_t ci = 0; ci < comdats.size(); ++ci) {
-        if (comdats[ci].fnIndex.has_value()) {
-            comdatByFuncIndex.emplace(*comdats[ci].fnIndex, ci);
-        }
-    }
 
     std::size_t const numSections =
         static_cast<std::size_t>(sectOrdinalCursor);
@@ -1294,6 +1639,17 @@ encode(AssembledModule const&    module,
         std::uint32_t auxLength        = 0;
         std::uint16_t auxNumRelocs     = 0;  // patched once relocs are built
         std::uint8_t  auxSelection     = 0;
+        // Auxiliary Format 5's `Number` field. Read by a consumer ONLY for
+        // Selection 5 (IMAGE_COMDAT_SELECT_ASSOCIATIVE), where it names the
+        // 1-based ordinal of the section this one lives or dies WITH.
+        // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: a weak function's
+        // `.pdata`/`.xdata` must be discarded together with the copy of that
+        // function the linker discards, or the image ends up with a
+        // RUNTIME_FUNCTION describing a prologue that is not the one at that
+        // address. 0 for every other record, which is what the field was
+        // hardcoded to before this existed — so no emitted byte moves for a
+        // record that does not set it.
+        std::uint16_t auxNumber        = 0;
         // Auxiliary Format 3 (Weak Externals) -- engaged ONLY for an
         // IMAGE_SYM_CLASS_WEAK_EXTERNAL record, which is UNDEF by construction.
         // Mutually exclusive with `hasSectionDefAux`: one record carries one
@@ -1551,6 +1907,36 @@ encode(AssembledModule const&    module,
         }
     }
 
+    // ── Unwind sections' own STATIC section symbols ────────────
+    //
+    // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO. Two jobs, and only the first is
+    // obvious:
+    //   * a `RUNTIME_FUNCTION`'s UnwindInfoAddress relocates against the
+    //     `.xdata` that holds its blob, and a relocation names a SYMBOL — this
+    //     writer mints no section symbols anywhere else, so without these the
+    //     third field of every entry has nothing to point at;
+    //   * an ASSOCIATIVE COMDAT's Selection byte and its associated-section
+    //     `Number` live in this record's Auxiliary Format 5, which is the only
+    //     place COFF keeps them.
+    // A non-COMDAT unwind section carries the aux too: `Length` is the honest
+    // section size and Selection 0 means "not a COMDAT", which is what MSVC
+    // emits for an ordinary section symbol.
+    for (auto& rec : unwindSections) {
+        CoffSymEntry secDef;
+        secDef.name             = rec.name;
+        secDef.sectionNumber    = rec.sectionNumber;
+        secDef.storageClass     = IMAGE_SYM_CLASS_STATIC;
+        secDef.hasSectionDefAux = true;
+        secDef.auxLength = static_cast<std::uint32_t>(rec.bytes.size());
+        if (rec.associatedComdat.has_value()) {
+            secDef.auxSelection = IMAGE_COMDAT_SELECT_ASSOCIATIVE;
+            secDef.auxNumber    = static_cast<std::uint16_t>(
+                comdats[*rec.associatedComdat].sectionNumber);
+        }
+        rec.sectionDefEntry = symEntries.size();
+        rec.sectionSymIdx   = appendEntry(std::move(secDef));
+    }
+
     // D-CSUBSET-COMPUTED-GOTO / jump tables: synthetic per-block symbols
     // (the `&&label` / dense-switch jump-table relocation targets) are
     // intra-module DEFINED LOCAL symbols pointing at an interior offset of
@@ -1684,6 +2070,17 @@ encode(AssembledModule const&    module,
         for (auto const& rel : fn.relocations) noteExternTarget(rel.target);
     for (auto const& di : module.dataItems)
         for (auto const& rel : di.relocations) noteExternTarget(rel.target);
+    // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: an unwind table names symbols
+    // too, and one of them is normally an EXTERN. A `__try`'s UNWIND_INFO
+    // carries the personality handler's RVA (`__C_specific_handler`, which no
+    // object defines), so a scan that looked only at code and data relocations
+    // would leave that field with no symtab entry to bind to and the object
+    // would be refused for a symbol it legitimately imports.
+    for (auto const& rec : unwindSections) {
+        for (auto const& f : rec.rvaFields) {
+            if (f.targetSymbol.has_value()) noteExternTarget(*f.targetSymbol);
+        }
+    }
     std::unordered_map<SymbolId, bool> externIsData;
     for (auto const& imp : module.externImports)
         externIsData.emplace(imp.symbol, imp.isData);
@@ -1754,6 +2151,29 @@ encode(AssembledModule const&    module,
                  comdats[ci].sectionNumber, comdats[ci].sectionName,
                  objNames.definedName(comdats[ci].symId, "sym_")));
         return {};
+    }
+    // The same rule for the unwind sections (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO),
+    // which the arithmetic above cannot reach because their ordinals sit BELOW
+    // the COMDAT range. Their form is stricter and so is the check: an unwind
+    // section's own section symbol must be the ONLY record naming its ordinal —
+    // there is no COMDAT symbol, because a table that describes other code
+    // defines no program symbol of its own.
+    for (auto const& rec : unwindSections) {
+        for (std::size_t i = 0; i < symEntries.size(); ++i) {
+            if (symEntries[i].sectionNumber != rec.sectionNumber) continue;
+            if (i == rec.sectionDefEntry) continue;
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format(
+                     "pe::encode (Obj): '{}' also names unwind section {} "
+                     "('{}'), whose section-definition symbol must be the only "
+                     "record bearing that ordinal - a consumer reads the FIRST "
+                     "such record to find the Selection byte, and for an "
+                     "ASSOCIATIVE `.pdata`/`.xdata` that byte is what ties the "
+                     "table to the function it describes. "
+                     "Substrate-invariant violation.",
+                     symEntries[i].name, rec.sectionNumber, rec.name));
+            return {};
+        }
     }
 
     // ── Build .text relocation table ───────────────────────────
@@ -1968,6 +2388,47 @@ encode(AssembledModule const&    module,
             static_cast<std::uint16_t>(rec.relocCount);
     }
 
+    // ── `.pdata` IMAGE_RELOCATION tables — D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO ──
+    //
+    // Three per RUNTIME_FUNCTION, all of the target's image-relative kind, the
+    // shape ✔MEASURED against gcc 13.2.0's own x64 COFF `.obj`: two naming the
+    // code and one naming the `.xdata` blob, with each field's addend already
+    // stamped in the section bytes above (COFF carries no addend column, so
+    // the field IS the addend carrier — the same convention the data-reloc
+    // pass uses one block up).
+    for (std::size_t ri = 0; ri < unwindSections.size(); ++ri) {
+        UnwindSectionRecord& rec = unwindSections[ri];
+        for (auto const& f : rec.rvaFields) {
+            std::uint32_t symIdx = 0;
+            if (f.targetSymbol.has_value()) {
+                auto const it = symIdxBySymbol.find(*f.targetSymbol);
+                if (it == symIdxBySymbol.end()) {
+                    emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                         std::format(
+                             "pe::encode (Obj): the unwind RVA field at offset "
+                             "{} of '{}' names symbol #{}, which has no symtab "
+                             "entry - a function carrying call-frame "
+                             "information, a `__try` filter funclet and the "
+                             "personality extern must each be in the symbol "
+                             "table for the table to relocate. "
+                             "Substrate-invariant violation.",
+                             f.offsetInSection, rec.name, f.targetSymbol->v));
+                    return {};
+                }
+                symIdx = it->second;
+            } else {
+                symIdx = unwindSections[f.xdataRecord].sectionSymIdx;
+            }
+            appendU32LE(rec.relocs, f.offsetInSection);
+            appendU32LE(rec.relocs, symIdx);
+            appendU16LE(rec.relocs,
+                        static_cast<std::uint16_t>(unwindRelocNativeId));
+            ++rec.relocCount;
+        }
+        symEntries[rec.sectionDefEntry].auxNumRelocs =
+            static_cast<std::uint16_t>(rec.relocCount);
+    }
+
     // Silent-failure C1 guard: PE/COFF spec §4 says when a section's
     // relocation count > 65534, the writer must set
     // IMAGE_SCN_LNK_NRELOC_OVFL (0x01000000) in section Characteristics
@@ -1995,6 +2456,9 @@ encode(AssembledModule const&    module,
     }
     for (auto const& rec : comdats) {
         if (!checkRelocCountFits("COMDAT", rec.relocCount)) return {};
+    }
+    for (auto const& rec : unwindSections) {
+        if (!checkRelocCountFits(rec.name.c_str(), rec.relocCount)) return {};
     }
 
     // ── Build string table + symbol table records ─────────────
@@ -2075,13 +2539,18 @@ encode(AssembledModule const&    module,
         // would be a wrong number dressed as a real one. Zero is what a
         // producer that has no checksum to offer emits, and both toolchains
         // emit zero for their non-COMDAT section symbols.
-        // Number is 0: it names the ASSOCIATED section and is read only for
-        // selection 5 (ASSOCIATIVE), which this writer never emits.
+        // Number names the ASSOCIATED section and is read only for selection 5
+        // (ASSOCIATIVE). It is 0 for every record except a weak function's
+        // `.pdata`/`.xdata`, which IS associative
+        // (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO): those two sections must be
+        // discarded with the copy of the function the linker discards, or the
+        // image keeps a RUNTIME_FUNCTION whose UNWIND_INFO describes a prologue
+        // that is not the one living at that address.
         appendU32LE(symtab, e.auxLength);
         appendU16LE(symtab, e.auxNumRelocs);
         appendU16LE(symtab, 0);            // NumberOfLinenumbers
         appendU32LE(symtab, 0);            // CheckSum
-        appendU16LE(symtab, 0);            // Number (ASSOCIATIVE only)
+        appendU16LE(symtab, e.auxNumber);  // Number (ASSOCIATIVE only)
         appendU8(symtab, e.auxSelection);
         for (std::size_t k = 0; k < kAuxSectionDefUnusedTail; ++k) {
             appendU8(symtab, 0);
@@ -2125,6 +2594,14 @@ encode(AssembledModule const&    module,
     if (hasRelRo) {
         rawCursor += static_cast<std::uint32_t>(relroLayout.spanSize);
     }
+    // The unwind sections' bytes, in the ordinal order assigned above (they
+    // sit between the ordinary data sections and the COMDATs) —
+    // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO. Every one is file-backed: an
+    // unwind table with no bytes describes nothing.
+    for (auto& rec : unwindSections) {
+        rec.rawPointer = rawCursor;
+        rawCursor += static_cast<std::uint32_t>(rec.bytes.size());
+    }
     // Each COMDAT section's bytes follow, in the ordinal order assigned above
     // — a zero-fill one (a weak `bss` item) stores none, exactly like `.bss`.
     for (auto& rec : comdats) {
@@ -2145,6 +2622,10 @@ encode(AssembledModule const&    module,
     std::uint32_t const relroRelocPointer =
         relroRelocCount > 0 ? relocCursor : 0u;
     relocCursor += static_cast<std::uint32_t>(relroRelocs.size());
+    for (auto& rec : unwindSections) {
+        rec.relocPointer = rec.relocCount > 0 ? relocCursor : 0u;
+        relocCursor += static_cast<std::uint32_t>(rec.relocs.size());
+    }
     for (auto& rec : comdats) {
         rec.relocPointer = rec.relocCount > 0 ? relocCursor : 0u;
         relocCursor += static_cast<std::uint32_t>(rec.relocs.size());
@@ -2294,6 +2775,28 @@ encode(AssembledModule const&    module,
                               /*rawPointer=*/0, /*relocPointer=*/0,
                               /*relocCount=*/0, bssAlignBits);
     }
+    // Unwind section headers (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO), in the
+    // ordinal order assigned above — after the ordinary data sections, before
+    // the COMDATs. Characteristics are the gcc-witnessed 0x40300040
+    // (initialized data, 4-byte align class, read-only), plus
+    // IMAGE_SCN_LNK_COMDAT for the pair that describes a weak function.
+    for (auto const& rec : unwindSections) {
+        PeSectionHeader h{};
+        h.name                 = encodeSectionName(rec.name, 0);
+        h.virtualSize          = 0;
+        h.virtualAddress       = 0;
+        h.sizeOfRawData        = static_cast<std::uint32_t>(rec.bytes.size());
+        h.pointerToRawData     = rec.rawPointer;
+        h.pointerToRelocations = rec.relocPointer;
+        h.pointerToLinenumbers = 0;
+        h.numberOfRelocations  =
+            static_cast<std::uint16_t>(rec.relocCount);
+        h.numberOfLinenumbers  = 0;
+        h.characteristics =
+            kUnwindObjCharacteristics
+            | (rec.associatedComdat.has_value() ? kScnLnkComdat : 0u);
+        sectionHeaders.push_back(h);
+    }
     // COMDAT section headers, in the ordinal order assigned above. The name is
     // the ordinary section's name (a COMDAT does NOT need a distinct one —
     // ✔MEASURED: cl.exe and clang both emit a second plain `.data` for a
@@ -2358,7 +2861,12 @@ encode(AssembledModule const&    module,
         bytes.insert(bytes.end(), relroLayout.bytes.begin(),
                      relroLayout.bytes.end());
     }
-    // Each COMDAT section's single body, in the ordinal order assigned above.
+    // The unwind sections' bytes, then each COMDAT section's single body —
+    // both in the ordinal order assigned above, which is the order the raw
+    // cursor walked when it handed out PointerToRawData.
+    for (auto const& rec : unwindSections) {
+        bytes.insert(bytes.end(), rec.bytes.begin(), rec.bytes.end());
+    }
     for (auto const& rec : comdats) {
         if (rec.zeroFill) continue;   // reserves span, stores no bytes
         if (rec.fnIndex.has_value()) {
@@ -2372,6 +2880,9 @@ encode(AssembledModule const&    module,
     bytes.insert(bytes.end(), textRelocs.begin(), textRelocs.end());
     bytes.insert(bytes.end(), dataRelocs.begin(), dataRelocs.end());
     bytes.insert(bytes.end(), relroRelocs.begin(), relroRelocs.end());
+    for (auto const& rec : unwindSections) {
+        bytes.insert(bytes.end(), rec.relocs.begin(), rec.relocs.end());
+    }
     for (auto const& rec : comdats) {
         bytes.insert(bytes.end(), rec.relocs.begin(), rec.relocs.end());
     }
@@ -3010,6 +3521,12 @@ encodeExec(AssembledModule const&    module,
     // in the .idata pass below). Filled by buildFunctionUnwindInfo, applied after
     // `externThunkVaBySym` is populated.
     std::vector<SehHandlerPatch> sehHandlerPatches;
+    // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: the scope table's own RVA fields,
+    // stated as `{ field, symbol, offset }` by the builder and resolved HERE
+    // against this image's layout. Applied immediately after the blob loop —
+    // unlike `sehHandlerPatches`, whose symbol is an extern the `.idata` pass
+    // has not thunked yet.
+    std::vector<XdataRvaPatch> sehRvaPatches;
     if (id.machine == kMachineAmd64PE) {
         std::uint32_t const textRva0 =
             static_cast<std::uint32_t>(secText.virtualAddress);
@@ -3036,14 +3553,64 @@ encodeExec(AssembledModule const&    module,
             if (!fn.cfi.has_value()) continue;
             std::uint32_t const funcBeginRva =
                 textRva0 + static_cast<std::uint32_t>(funcTextStart[fi]);
+            // The scope table's interior fields are stated as offsets into
+            // THIS function's symbol, and the image walker resolves them
+            // through `funcRvaBySym` — which is a per-SYMBOL map, so a module
+            // that reused a SymbolId across two functions would resolve them
+            // against whichever came last. That was unrepresentable while the
+            // builder took a precomputed `funcBeginRva`; the check keeps it
+            // unrepresentable now that it does not.
+            if (!fn.sehScopes.empty()
+                && symbolToRva(fn.symbol) != funcBeginRva) {
+                emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
+                     std::format(
+                         "pe::encodeExec: function #{} guards a `__try` but its "
+                         "symbol #{} resolves to RVA 0x{:x} while the function "
+                         "itself begins at 0x{:x} - the scope table's interior "
+                         "addresses would describe a different function's "
+                         "body. A defined function's SymbolId must be unique. "
+                         "Substrate-invariant violation.",
+                         fi, fn.symbol.v, symbolToRva(fn.symbol),
+                         funcBeginRva));
+                return {};
+            }
             auto uwOpt = buildFunctionUnwindInfo(
-                *fn.cfi, fn.sehScopes, targetSchema, fi, funcBeginRva,
-                symbolToRva, static_cast<std::uint32_t>(xdataBytes.size()),
-                sehHandlerPatches, reporter);
+                *fn.cfi, fn.sehScopes, targetSchema, "pe::encodeExec", fi,
+                fn.symbol, static_cast<std::uint32_t>(xdataBytes.size()),
+                sehHandlerPatches, sehRvaPatches, reporter);
             if (!uwOpt.has_value()) return {};
             pdataEntries.push_back(
                 {fi, static_cast<std::uint32_t>(xdataBytes.size())});
             xdataBytes.insert(xdataBytes.end(), uwOpt->begin(), uwOpt->end());
+        }
+        // Resolve the scope table's RVA fields now that every blob is placed.
+        for (auto const& p : sehRvaPatches) {
+            std::uint32_t const rva = symbolToRva(p.symbol);
+            if (rva == 0u) {
+                emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
+                     std::format(
+                         "pe::encodeExec: a SEH scope-table field at `.xdata` "
+                         "offset {} names symbol #{}, which is not a defined "
+                         "function in this image - an unresolved filter "
+                         "funclet leaves the scope table pointing at RVA 0 "
+                         "(D-WIN64-SEH-FUNCLETS).",
+                         p.xdataOffset, p.symbol.v));
+                return {};
+            }
+            if (p.xdataOffset + 4u > xdataBytes.size()) {
+                emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
+                     std::format(
+                         "pe::encodeExec: SEH scope-table patch offset {} + 4 "
+                         "overruns the {}-byte `.xdata` blob - "
+                         "substrate-invariant violation.",
+                         p.xdataOffset, xdataBytes.size()));
+                return {};
+            }
+            std::uint32_t const value = rva + p.addend;
+            for (std::size_t b = 0; b < 4; ++b) {
+                xdataBytes[p.xdataOffset + b] =
+                    static_cast<std::uint8_t>((value >> (8u * b)) & 0xFFu);
+            }
         }
         if (!xdataBytes.empty()) {
             DataSectionLayout xl;

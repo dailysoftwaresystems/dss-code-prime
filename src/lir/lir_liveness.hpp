@@ -63,7 +63,18 @@ struct DSS_EXPORT VRegBitset {
     void insert(std::uint32_t vregId);
     void erase(std::uint32_t vregId) noexcept;
     // Set-union `other` into `*this`. Returns true iff `*this` grew.
-    bool unionInPlace(VRegBitset const& other);
+    //
+    // ⚠ `[[nodiscard]]` because the "grew" answer is the DATAFLOW FIXPOINT'S
+    // TERMINATION CONDITION, not a courtesy: `analyzeFuncLiveness`'s `while
+    // (changed)` loop is driven by it, and a site that drops it silently
+    // under-propagates liveness — a wrong live range, i.e. a register
+    // allocated over a still-live value, which is a silent miscompile rather
+    // than a crash. The one site that legitimately ignores it (`liveIn` is
+    // rebuilt from scratch and compared word-wise afterwards) now says so with
+    // an explicit `(void)`, so "ignored on purpose" and "forgotten" stop
+    // looking identical. Sibling of the same class as
+    // D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE, found while closing it.
+    [[nodiscard]] bool unionInPlace(VRegBitset const& other);
     // Set-difference: clear bits also set in `mask` from `*this`.
     void subtractInPlace(VRegBitset const& mask);
     // Reset all bits without releasing storage.

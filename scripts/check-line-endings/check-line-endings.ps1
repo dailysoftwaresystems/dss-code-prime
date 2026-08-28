@@ -16,6 +16,33 @@
 # not make the pairing enforced — nothing checks it — but it removes the
 # mechanism by which the other pair diverged.
 #
+# ┌─ CR-INSTRUMENT-QUOTED:BEGIN ─ this block QUOTES the blind idioms to explain
+# │  them; it does not run one. Check F honours the same region marker from any
+# │  file, and this twin uses it rather than being exempted by path.
+# ⚠⚠ THE COMMON CR INSTRUMENTS ARE BLIND ON THIS HOST, IN BOTH DIRECTIONS, and
+# an earlier version of the .sh sibling's note GOT THE REASON WRONG — it said
+# `grep -c $'\r'` "matches the LETTER `r`", refuted by a control containing no
+# `r` at all. ✔RE-MEASURED 2026-08-27 (cycle P42) on a `printf 'a\r\nb\n'`
+# control verified by `od -c` to hold exactly one CR:
+#   TRAP 1, FALSE POSITIVE — the literal `$'\r'` written INSIDE a command
+#     substitution expands to the EMPTY STRING, so `n=$(grep -c $'\r' f)` runs
+#     `grep -c ''` and returns the LINE COUNT: 2 for the CRLF control and 2 for
+#     its pure-LF twin. CR-specific and parse-time (a `$'\t'` in the identical
+#     position survives; a CR held in a VARIABLE survives).
+#   TRAP 2, FALSE NEGATIVE, the dangerous one — GNU grep and sed open files in
+#     TEXT MODE and strip the trailing CR BEFORE matching. On the CRLF control
+#     `grep -c "$CR"` -> 0 while `grep -U -c "$CR"` -> 1; `awk '/\r$/'` -> 0;
+#     `sed -n '/\r/p'` -> 0; `tr -dc '\r' | wc -c` -> 1 (the only correct one).
+#     `-a` does NOT help. A MID-LINE CR is found by all of them — the blindness
+#     is aimed exactly at the CR anyone hunts.
+# ★★ WHY IT SURVIVED, and why THIS twin is held to its own control rather than
+# assumed to inherit the sibling's: under WSL/Linux all three instruments are
+# CORRECT. An idiom sanity-checked on the wrong leg is verified nowhere. This
+# file runs on Windows, which is precisely where they lie.
+# ⓘ .NET is NOT affected by trap 2 — `[IO.File]::ReadAllBytes` reads bytes — but
+# `Get-Content` applies its own line splitting, so the byte reader is used below.
+# └─ CR-INSTRUMENT-QUOTED:END ─────────────────────────────────────────────────
+#
 # ⚠ INSTRUMENT NOTE specific to THIS shell: `Set-StrictMode` + a native command
 # exiting non-zero is a normal, expected outcome here (`git grep` exits 1 for
 # "no match", which is this guard's PASS). PowerShell 7.4 turns native stderr
@@ -30,6 +57,244 @@ if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $RepoRoot  = Split-Path -Parent (Split-Path -Parent $ScriptDir)
+# ⚠ CAPTURED BEFORE Set-Location, for the same reason the .sh sibling captures
+# INVOKED_FROM: `--files` takes paths from a caller standing somewhere else,
+# very often outside this repo, and resolving them against the repo root
+# silently answers about the wrong file.
+$InvokedFrom = (Get-Location).Path
+
+function Get-GitLines([string[]]$GitArgs) {
+    # `git grep` exits 1 for "no match", which is a legitimate answer here, so
+    # only the LINES are returned; callers that need to distinguish "empty"
+    # from "broken" use the positive control below, never an exit code.
+    # ⚠ DEFINED HERE, above the argument dispatch, because `--audit-instruments`
+    # calls it: in PowerShell a function must exist when it is CALLED, and the
+    # dispatch runs before the main body.
+    $out = & git @GitArgs 2>$null
+    if ($null -eq $out) { return @() }
+    return @($out | Where-Object { $_ -ne '' })
+}
+
+# ── THE ONE CORRECT INSTRUMENT ────────────────────────────────────────────
+# Bytes, never lines: `Get-Content` would split on the line ending and hide the
+# very byte in question, which is trap 2 wearing a PowerShell hat.
+function Get-CrCount([string]$Path) {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $n = 0
+    foreach ($b in $bytes) { if ($b -eq 13) { $n++ } }
+    return $n
+}
+
+# ── WHAT CHECK F REFUSES — the SAME ERE pair the .sh sibling uses ──────────
+# Both twins hand these identical strings to the identical `git grep`, so the
+# shells only marshal arguments; the pairing note at the top of this file
+# explains why that is the one drift-resistant arrangement available here.
+$CrVerb   = '(grep|egrep|fgrep|rg|awk|sed|findstr|Select-String)'
+# ⚠ IN A SINGLE-QUOTED POWERSHELL STRING A LITERAL `'` IS WRITTEN `''`, so the
+# character class `['"/]` must be typed `[''"/]`. An earlier draft here typed
+# `['']"/]`, which yields `[']"/]` — a class of just `'`, followed by three
+# LITERAL characters. ✔The self-test caught it (1 of 3 blind forms detected)
+# after `--audit-instruments` had already reported a cheerful OK over the whole
+# tree with it. That false green is precisely what the arms exist to refuse.
+$CrPat    = '(\$''(\\r|\\015)''|[''"/]\\r\$|[''"/]\\r[''"/])'
+$CrBlind  = "($CrVerb.*$CrPat|$CrPat.*$CrVerb)"
+$CrExempt = '(git +(grep|ls-files|diff|cat-file)|-U |--binary|sub\(|gsub\(|s/\\r|-replace|tr +-d|%\$''|CR-INSTRUMENT-QUOTED)'
+$CrAuditScope = ':(exclude).plans/'
+
+function Test-InQuotedRegion([string]$Path, [int]$LineNo) {
+    # A BEGIN/END region marks a whole documentation block at once. Inclusive of
+    # both marker lines, matching the .sh sibling's awk exactly.
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $inRegion = $false; $n = 0
+    foreach ($line in [IO.File]::ReadAllLines($Path)) {
+        $n++
+        if ($line -match 'CR-INSTRUMENT-QUOTED:BEGIN') { $inRegion = $true }
+        if ($n -eq $LineNo) { return $inRegion }
+        if ($line -match 'CR-INSTRUMENT-QUOTED:END')   { $inRegion = $false }
+    }
+    return $false
+}
+
+function Invoke-FilesMode([string[]]$Paths) {
+    $n = 0; $bad = 0; $unmeasured = 0
+    foreach ($p in $Paths) {
+        $n++
+        $abs = if ([IO.Path]::IsPathRooted($p)) { $p } else { Join-Path $InvokedFrom $p }
+        if (Test-Path -LiteralPath $abs -PathType Container) {
+            Write-Host "  UNMEASURED  $p - is a directory, not a file"; $unmeasured++; continue
+        }
+        if (-not (Test-Path -LiteralPath $abs -PathType Leaf)) {
+            Write-Host "  UNMEASURED  $p - no such file"; $unmeasured++; continue
+        }
+        try { $cr = Get-CrCount $abs }
+        catch { Write-Host "  UNMEASURED  $p - not readable"; $unmeasured++; continue }
+        if ($cr -eq 0) { Write-Host "  LF          $p" }
+        else { Write-Host "  CR  $cr    $p"; $bad++ }
+    }
+    if ($n -eq 0) {
+        Write-Host "line-endings: FAIL - --files was given no paths. Refusing to report a"
+        Write-Host "  pass over an empty list; that is a vacuous green, not a clean tree."
+        return 2
+    }
+    $rc = 0
+    if ($unmeasured -gt 0) {
+        Write-Host "line-endings: FAIL - $unmeasured of $n path(s) could NOT be measured (above)."
+        Write-Host "  A guard that cannot read a file must say so, never imply it was clean."
+        $rc = 2
+    }
+    if ($bad -gt 0) {
+        Write-Host "line-endings: FAIL - $bad of $n file(s) carry a CR."
+        if ($rc -eq 0) { $rc = 1 }
+    }
+    if ($rc -eq 0) { Write-Host "line-endings: OK ($n file(s), none carries a CR; measured as bytes)" }
+    return $rc
+}
+
+function Invoke-InstrumentAudit {
+    $raw = Get-GitLines @('grep','-n','-I','-E',$CrBlind,'--','.',$CrAuditScope) |
+           Where-Object { $_ -notmatch $CrExempt }
+    $hits = @()
+    foreach ($h in $raw) {
+        $parts = $h -split ':', 3
+        if ($parts.Count -lt 3) { continue }
+        if (Test-InQuotedRegion $parts[0] ([int]$parts[1])) { continue }
+        $hits += $h
+    }
+    $marked = (Get-GitLines @('grep','-c','-I','-e','CR-INSTRUMENT-QUOTED','--','.',$CrAuditScope)).Count
+    if ($hits.Count -gt 0) {
+        Write-Host "line-endings: FAIL - a CR instrument that cannot see a CR:"
+        Write-Host ""
+        foreach ($h in $hits) { Write-Host "  $h" }
+        Write-Host ""
+        # CR-INSTRUMENT-QUOTED:BEGIN - the refusal must SHOW what it refuses.
+        Write-Host "These spellings do not measure what they appear to measure on this host:"
+        Write-Host "  * ``grep -c `$'\r'``  returns the LINE COUNT - of a CLEAN file too;"
+        Write-Host "  * ``awk '/\r`$/'``, ``sed -n '/\r/p'``, ``grep -P '\r`$'`` return 0 over a"
+        Write-Host "    file that is entirely CRLF, because the reader strips the CR first."
+        Write-Host "Use instead:"
+        Write-Host "  (a) scripts/check-line-endings/check-line-endings.ps1 --files PATH..."
+        Write-Host "  (b) ``tr -dc '\r' < f | wc -c``  (expect 0) if you must inline it; or"
+        Write-Host "  (c) ``git grep``/``git ls-files --eol``, which read blobs and are unaffected."
+        Write-Host "If the line is DOCUMENTATION that quotes the idiom on purpose, put the"
+        Write-Host "marker CR-INSTRUMENT-QUOTED on it (or wrap the block in :BEGIN/:END)."
+        # CR-INSTRUMENT-QUOTED:END
+        return 1
+    }
+    Write-Host "line-endings: Check F OK (no blind CR instrument; $marked file(s) carry the quoted-idiom marker)"
+    return 0
+}
+
+function Invoke-SelfTest {
+    # ★★ SYNTHESIZES THE NEGATIVE. Every arm is built to fail if the instrument
+    # is blind: the control is written with explicit bytes and verified to hold
+    # exactly one 0x0D before it is used to judge anything.
+    # ⚠ The synthetic blind lines are ASSEMBLED AT RUN TIME, never written
+    # literally, or Check F would (correctly) refuse this very file.
+    $t = Join-Path ([IO.Path]::GetTempPath()) ("dss-le-" + [Guid]::NewGuid().ToString('N'))
+    $tr = (New-Item -ItemType Directory -Path $t).FullName
+    if ($tr.StartsWith($RepoRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        Write-Host "line-endings: FAIL - selftest temp dir '$tr' is inside the repo"
+        return 2
+    }
+    $fail = 0
+    try {
+        $crlf = Join-Path $tr 'ctl_crlf.txt'; $lf = Join-Path $tr 'ctl_lf.txt'
+        [IO.File]::WriteAllBytes($crlf, [byte[]]@(97,13,10,98,10))   # a CR LF b LF
+        [IO.File]::WriteAllBytes($lf,   [byte[]]@(97,10,98,10))      # a LF b LF
+        # ARM 0 - prove the CONTROL before trusting a verdict taken with it.
+        # ⚠ `@(...)` around every pipeline result: `Set-StrictMode -Version
+        # Latest` makes `.Count` on a SCALAR a terminating error, so a one-CR
+        # control would have killed the guard instead of measuring it.
+        $n = @([IO.File]::ReadAllBytes($crlf) | Where-Object { $_ -eq 13 }).Count
+        if ($n -ne 1) { Write-Host "line-endings: FAIL - selftest control is not one CR (got $n)"; $fail = 1 }
+        # ARM 1 - THE NEGATIVE: the counter must SEE the CR.
+        if ((Get-CrCount $crlf) -ne 1) { Write-Host "line-endings: FAIL - selftest: Get-CrCount reported no CR on the CRLF control. The instrument is blind."; $fail = 1 }
+        # ARM 2 - and must not invent one.
+        if ((Get-CrCount $lf) -ne 0) { Write-Host "line-endings: FAIL - selftest: Get-CrCount invented a CR on the pure-LF control."; $fail = 1 }
+        # ARM 3/4 - --files must RED on the dirty control and pass on the clean one.
+        if ((Invoke-FilesMode @($crlf) 6>$null) -eq 0) { Write-Host "line-endings: FAIL - selftest: --files reported success over a file holding a CR."; $fail = 1 }
+        if ((Invoke-FilesMode @($lf)   6>$null) -ne 0) { Write-Host "line-endings: FAIL - selftest: --files refused a pure-LF file."; $fail = 1 }
+        # ARM 5 - a missing path is UNMEASURED (2), never a quiet pass.
+        if ((Invoke-FilesMode @((Join-Path $tr 'nope.txt')) 6>$null) -ne 2) { Write-Host "line-endings: FAIL - selftest: a missing path did not exit 2."; $fail = 1 }
+        # ARM 6 - the detector must FIRE on blind lines, assembled from fragments.
+        $q = [char]39; $d = '$'; $b = '\'
+        $blind = @(
+            "n=$d(grep -c $d$q${b}r$q f)",
+            "awk $q/${b}r$d/ {bad++}$q f",
+            "sed -n $q/${b}r/p$q f | wc -l"
+        )
+        $fired = @($blind | Where-Object { $_ -match $CrBlind }).Count
+        if ($fired -ne 3) { Write-Host "line-endings: FAIL - selftest: Check F saw $fired/3 blind instruments. The detector is broken."; $fail = 1 }
+        # ...and must NOT fire on the measured-safe forms.
+        $safe = @(
+            "tr -dc $q${b}r$q < f | wc -c",
+            "git grep -I -l -P $q${b}r$d$q HEAD",
+            "sub(/${b}r$d/, `"`", line)",
+            "grep -U -c `"${d}CR`" f"
+        )
+        $bogus = @($safe | Where-Object { ($_ -match $CrBlind) -and ($_ -notmatch $CrExempt) }).Count
+        if ($bogus -ne 0) { Write-Host "line-endings: FAIL - selftest: Check F fired on $bogus SAFE form(s)."; $fail = 1 }
+        # ARM 7 - the marker must exempt, or nobody can document the idiom.
+        $marked = "awk $q/${b}r$d/$q f   CR-INSTRUMENT-QUOTED"
+        if (($marked -match $CrBlind) -and ($marked -notmatch $CrExempt)) { Write-Host "line-endings: FAIL - selftest: the CR-INSTRUMENT-QUOTED marker did not exempt a documented idiom."; $fail = 1 }
+    }
+    finally { Remove-Item -Recurse -Force -LiteralPath $tr -ErrorAction SilentlyContinue }
+    if ($fail -ne 0) {
+        Write-Host "line-endings: FAIL - the SELF-TEST failed (above). This guard cannot be trusted until it passes; do not silence it."
+        return 2
+    }
+    return 0
+}
+
+# CR-INSTRUMENT-QUOTED:BEGIN - the help text NAMES the blind idiom.
+function Show-Usage {
+    Write-Host @'
+check-line-endings.ps1 - the LF-contract guard, and the repo's CR instrument.
+
+  (no arguments)      Verify the whole repository (checks A-E) plus Check F,
+                      which refuses a CR instrument that cannot see a CR.
+                      Self-tests first, so it cannot pass without proving it
+                      can fail.
+  --files PATH...     Ask about SPECIFIC files: "are these clean?" Works on
+                      tracked, untracked and outside-the-repo paths alike.
+                      Exit 0 all clean - 1 a CR was found - 2 unreadable.
+  --files-from FILE   The same, one path per line ('-' reads stdin).
+  --audit-instruments Run Check F alone.
+  --selftest          Run the self-test alone.
+  --help              This text.
+
+WHY --files EXISTS: until 2026-08-27 this guard answered exactly one question,
+"is the whole repo clean?", and took no arguments. A lane holding thirteen
+specific files had NO entry point, so it hand-rolled an awk CR test that
+reports a clean tree over a fully CRLF file, and certified all thirteen while
+measuring nothing. The guard was not missing; its REACH was.
+'@
+}
+# CR-INSTRUMENT-QUOTED:END
+
+if ($args.Count -gt 0) {
+    switch ($args[0]) {
+        { $_ -in '--help','-h' } { Show-Usage; exit 0 }
+        '--files'   {
+            # ⚠ NOT `$args[1..($args.Count-1)]`: with no paths that range is
+            # `1..0`, which PowerShell walks BACKWARDS and returns element 0 —
+            # so `--files` alone would have measured the string "--files".
+            $paths = if ($args.Count -ge 2) { @($args[1..($args.Count-1)]) } else { @() }
+            exit (Invoke-FilesMode $paths)
+        }
+        '--files-from' {
+            if ($args.Count -lt 2) { Write-Host "line-endings: FAIL - --files-from needs a FILE (or -)"; exit 2 }
+            $src = $args[1]
+            $lines = if ($src -eq '-') { @($input) } elseif (Test-Path -LiteralPath $src -PathType Leaf) { [IO.File]::ReadAllLines($src) } else {
+                Write-Host "line-endings: FAIL - cannot read path list '$src'"; exit 2 }
+            exit (Invoke-FilesMode @($lines | Where-Object { $_ -ne '' }))
+        }
+        '--audit-instruments' { Set-Location $RepoRoot; exit (Invoke-InstrumentAudit) }
+        '--selftest'          { Set-Location $RepoRoot; exit (Invoke-SelfTest) }
+        default { Write-Host "line-endings: FAIL - unknown argument '$($args[0])' (see --help)"; exit 2 }
+    }
+}
+
 Set-Location $RepoRoot
 
 # ── fail-closed preconditions ─────────────────────────────────────────────
@@ -44,14 +309,11 @@ if ($LASTEXITCODE -ne 0) {
     exit 2
 }
 
-function Get-GitLines([string[]]$GitArgs) {
-    # `git grep` exits 1 for "no match", which is a legitimate answer here, so
-    # only the LINES are returned; callers that need to distinguish "empty"
-    # from "broken" use the positive control below, never an exit code.
-    $out = & git @GitArgs 2>$null
-    if ($null -eq $out) { return @() }
-    return @($out | Where-Object { $_ -ne '' })
-}
+# ── SELF-TEST FIRST - this entry cannot pass without proving it can fail ──
+# The same arrangement `orphan_tests_guard` uses: a guard wired into ctest is
+# only evidence if it is still capable of redding
+# (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+if ((Invoke-SelfTest) -ne 0) { exit 2 }
 
 # ── POSITIVE CONTROL ──────────────────────────────────────────────────────
 # The offender scan PASSES by returning nothing, which is exactly what a BROKEN
@@ -88,9 +350,14 @@ if ($controlFailed) { exit 2 }
 # index as `i/lf` with ZERO CR in the blob — `eol=` governs the SMUDGE
 # (checkout) direction only. The REAL exemption is `binary` / `-text`, already
 # honoured through `-I`. Kept identical to the .sh sibling.
+# CR-INSTRUMENT-QUOTED:BEGIN - these two ARE `git grep` (the array's first
+# element is the subcommand), which reads BLOBS and is unaffected by the text
+# mode that blinds a plain grep. Check F cannot see the `git` through the array
+# form, so the region says so explicitly rather than the guard exempting itself.
 $OffendersHead  = Get-GitLines @('grep','-I','-l','-P','\r$','HEAD') |
                   ForEach-Object { $_ -replace '^HEAD:', '' }
 $OffendersIndex = Get-GitLines @('grep','--cached','-I','-l','-P','\r$')
+# CR-INSTRUMENT-QUOTED:END
 
 # ── STALE-CHECKOUT DETECTION — kept identical in intent to the .sh sibling ──
 #
@@ -255,7 +522,15 @@ foreach ($f in (Get-GitLines @('ls-files','--others','--exclude-standard'))) {
     }
 }
 
-if ($report.Count -eq 0) {
+# ── Check F: the INSTRUMENT tier - a CR detector that cannot detect a CR ──
+# ★★ THE TIER CHECKS A-E CANNOT REACH. A-E judge BYTES; Check F judges the
+# MEASUREMENT - text that will be RUN or COPIED to answer "is there a CR here?"
+# and that answers wrongly on this host. ✔MEASURED 2026-08-27: a lane certified
+# thirteen files "pure LF" with a blind awk test. Every byte tier was green
+# throughout, correctly so - the tree WAS clean. The claim about it was worthless.
+$instrumentRc = Invoke-InstrumentAudit
+
+if ($report.Count -eq 0 -and $instrumentRc -eq 0) {
     if ($SkipHistoryScan) {
         # Never let the summary outrun the evidence: say what was NOT judged.
         Write-Host "line-endings: OK (WORKTREE ONLY - the history scan was SKIPPED, see above; the $ControlHead HEAD / $ControlIndex index blobs were NOT judged; $($AllTrackedEolRows.Count) working-tree paths were)"
@@ -268,6 +543,12 @@ if ($report.Count -eq 0) {
     }
     exit 0
 }
+
+# Check F failed on its own: it has already printed its finding and its fix, and
+# the byte tiers found nothing. Do not head that with an "LF contract violated"
+# banner over an empty list - a report whose heading outruns its evidence is the
+# same self-blindness this guard is about.
+if ($report.Count -eq 0) { exit 1 }
 
 Write-Host "line-endings: FAIL - the LF contract is violated (tier named per line):"
 Write-Host ""

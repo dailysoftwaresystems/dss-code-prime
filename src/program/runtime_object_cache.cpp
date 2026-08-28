@@ -2,6 +2,15 @@
 
 #include "core/crypto/sha256.hpp"
 #include "program/cross_validate_target_format.hpp"
+// D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK:
+// `detail::createExclusiveBinary` is the EXCLUSIVE-CREATE primitive the
+// linker's staging-temp claim already uses. Reused rather than re-derived —
+// its host split (`_wfopen "wbxN"` / `open(O_CREAT|O_EXCL|O_CLOEXEC)`) and
+// the reasoning behind both halves are measured at its definition site, and
+// a second hand-rolled exclusive create here would be a second chance to get
+// the Windows half wrong. No new link edge is needed: `lsp`, `program` and
+// `link` are all aggregated into one `dsscp-lib`.
+#include "link/writer.hpp"
 
 // ── THE COMPILER STAMP TERM ─────────────────────────────────────────────────
 //
@@ -55,7 +64,9 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <cstdio>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -653,19 +664,48 @@ writeThroughTemp(RuntimeObjectKey const&       key,
     // own name plus thirteen characters. That is why the path budget is measured
     // on the temp and never on the artifact.
     //
-    // ⓘ The exists-then-create window is not a correctness hazard HERE, and
-    // the reason is the header's own corollary: two processes racing on this
-    // path computed the SAME key, so they are writing the SAME bytes. Two LIVE
-    // processes cannot share a pid, so the only way to draw an occupied name
-    // is a temp left behind by a killed run — and overwriting that wholesale is
-    // exactly right.
+    // ── D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK ──
+    //
+    // ★★★ THIS USED TO PROBE WITH `fs::exists` AND THEN OPEN WITH
+    // `std::ofstream(..., trunc)`, AND THE TWO DISAGREE ABOUT WHAT A NAME IS.
+    // `fs::exists` FOLLOWS symlinks, so a DANGLING symlink sitting at a
+    // candidate name answers FALSE — the loop reads that as "free", claims the
+    // name, and the truncating open then CREATES THE LINK'S TARGET. ✔MEASURED
+    // 2026-08-27 on WSL with the exact primitives: `stat` says the name does not
+    // exist, `open(O_WRONLY|O_CREAT|O_TRUNC)` SUCCEEDS, and the byte written
+    // lands OUTSIDE the cache directory at wherever the link pointed. The
+    // `rename` below then moves that link into place as a cache entry.
+    //
+    // ⚠ IT IS STRICTLY WORSE THAN THE SAME BLINDNESS IN `link::writeBytes`
+    // ([[D-LINK-WRITER-DANGLING-SYMLINK-CLAIM-MISROUTE]]), and the difference is
+    // the OPEN, not the probe: there the actual open is exclusive, so the wrong
+    // branch was taken but NOTHING WAS WRITTEN and the run failed loud. A
+    // truncating open destroys before it can fail.
+    //
+    // ⭐ THE FIX IS TO STOP ASKING AND START CLAIMING. `createExclusiveBinary`
+    // IS the probe and the open in one indivisible step, so there is no window
+    // and no second opinion: it refuses any existing directory ENTRY — a
+    // dangling symlink included — and leaves it byte-intact, which is exactly
+    // the question this loop was trying to ask.
+    //
+    // ⓘ THE COMMENT THAT USED TO STAND HERE ARGUED THE RACE AWAY, AND THAT
+    // ARGUMENT WAS AND REMAINS CORRECT — it is preserved because it is still
+    // load-bearing: two processes racing on this path computed the SAME key and
+    // are writing the SAME bytes, and two LIVE processes cannot share a pid, so
+    // the only way to draw an occupied name is a temp left by a killed run.
+    // ★ What it did not cover is the case above: a dangling symlink is not a
+    // temp left by a killed run, and the loop never even reached the
+    // "overwriting that wholesale is exactly right" reasoning — it believed the
+    // name was free. An argument that is sound about the case it considered is
+    // still silent about the case it did not.
     static std::atomic<std::uint64_t> tempCounter{0};
 #ifdef _WIN32
     auto const pid = static_cast<std::uint64_t>(_getpid());
 #else
     auto const pid = static_cast<std::uint64_t>(getpid());
 #endif
-    fs::path temporary;
+    fs::path   temporary;
+    std::FILE* claimed = nullptr;
     for (std::uint32_t attempt = 0;; ++attempt) {
         if (attempt > 10000u) {
             return std::unexpected(unwritableMissRefusal(
@@ -678,40 +718,70 @@ writeThroughTemp(RuntimeObjectKey const&       key,
             / ("." + destination.filename().string() + ".tmp-"
                + std::to_string(pid) + "-"
                + std::to_string(tempCounter.fetch_add(1u)));
-        std::error_code probeEc;
-        if (!fs::exists(candidate, probeEc)) {
+        claimed = linker::detail::createExclusiveBinary(candidate);
+        if (claimed != nullptr) {
             temporary = std::move(candidate);
             break;
+        }
+        // ── WHY THE CLAIM WAS REFUSED, ASKED AT THE ENTRY AND NOT AT ITS
+        //    TARGET ────────────────────────────────────────────────────────
+        //
+        // Two OPPOSITE responses are possible here — "the slot is TAKEN, try
+        // the next name" and "this is a REAL error, stop now" — and the probe
+        // that chooses between them must ask the SAME question the claim asked.
+        // `createExclusiveBinary` refuses an existing directory ENTRY, so the
+        // probe looks at the ENTRY: `symlink_status` does NOT follow, so a
+        // dangling symlink reads as OCCUPIED, exactly as `O_EXCL` saw it.
+        //
+        // ⚠ `fs::exists(candidate)` HERE WOULD REINTRODUCE THE DEFECT IN ITS
+        // OTHER FORM — it follows, so a dangling symlink would read as absent,
+        // the loop would call the refusal a hard error, and an operator would
+        // be handed a path-budget explanation for a name that is merely
+        // occupied. That is [[D-LINK-WRITER-DANGLING-SYMLINK-CLAIM-MISROUTE]]
+        // verbatim, and its own preferred fix is this `symlink_status` probe.
+        //
+        // ★ AND THE HARD-ERROR ARM MUST STAY, rather than letting a real
+        // failure exhaust 10000 slots: ✔MEASURED as a red in
+        // `RuntimeObjectCachePathBudget.AnOverlongNameRefusesNamingThePathAndItsLength`
+        // when this loop retried instead. A name too long fails on EVERY slot,
+        // and the composed-path note is the only thing that tells the operator
+        // WHY — a "could not claim a unique temporary file after 10000
+        // attempts" message names the directory and explains nothing.
+        std::error_code    entryEc;
+        auto const         entry = fs::symlink_status(candidate, entryEc);
+        if (!fs::exists(entry)) {
+            return std::unexpected(unwritableMissRefusal(
+                key,
+                std::format("could not open the temporary file '{}' for "
+                            "writing.{}",
+                            candidate.generic_string(),
+                            composedPathNote(directory, candidate))));
         }
     }
     TempFileGuard guard{temporary};
 
     {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            // ⚠ THE ARM THE PATH-LENGTH WALL ACTUALLY LANDS ON — the directory
-            // exists (it was just created) and only the full name is too long,
-            // so without `composedPathNote` this reads as an unexplained "could
-            // not open". See that function's ✔MEASURED note.
+        // The claimed handle, closed on every path out — including one where
+        // building a diagnostic string throws.
+        struct FileCloser {
+            void operator()(std::FILE* f) const noexcept { std::fclose(f); }
+        };
+        std::unique_ptr<std::FILE, FileCloser> out{claimed};
+        if (!bytes.empty()
+            && std::fwrite(bytes.data(), 1u, bytes.size(), out.get())
+                   != bytes.size()) {
             return std::unexpected(unwritableMissRefusal(
-                key,
-                std::format("could not open the temporary file '{}' for "
-                            "writing.{}",
-                            temporary.generic_string(),
-                            composedPathNote(directory, temporary))));
+                key, std::format("failed writing {} byte(s) to the temporary "
+                                 "file '{}'",
+                                 bytes.size(), temporary.generic_string())));
         }
-        if (!bytes.empty()) {
-            out.write(reinterpret_cast<char const*>(bytes.data()),
-                      static_cast<std::streamsize>(bytes.size()));
-        }
-        // ⚠ CLOSED AND CHECKED EXPLICITLY, not left to the destructor. A
-        // destructor-time flush failure (a full disk, a quota) is DISCARDED by
-        // the standard library, and the next statement would rename a
-        // TRUNCATED file into place under a key that promises the full bytes —
-        // a silently wrong artifact, which is the one outcome this whole
-        // mechanism exists to make impossible.
-        out.close();
-        if (!out) {
+        // ⚠ CLOSED AND CHECKED EXPLICITLY, not left to the deleter. A
+        // close-time flush failure (a full disk, a quota) is DISCARDED by a
+        // destructor, and the next statement would rename a TRUNCATED file into
+        // place under a key that promises the full bytes — a silently wrong
+        // artifact, which is the one outcome this whole mechanism exists to
+        // make impossible.
+        if (std::fclose(out.release()) != 0) {
             return std::unexpected(unwritableMissRefusal(
                 key, std::format("failed writing {} byte(s) to the temporary "
                                  "file '{}'",

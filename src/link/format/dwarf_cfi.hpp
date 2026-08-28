@@ -10,6 +10,9 @@
 // it.
 #include "core/types/target_schema.hpp"
 #include "link/format/byte_emit.hpp"
+// The ONE scanner that answers "which relocation row patches an unwind
+// table's code-pointer field" — shared with the PE writer's Win64 arm.
+#include "link/format/unwind_pointer_reloc.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -171,43 +174,18 @@ dwarfRegisterMappingOf(TargetSchema const& target) noexcept {
 //   description means the schema no longer identifies one relocation, and
 //   silently picking either writes a table that is wrong for half the
 //   reasons the other row exists.
+//
+// ⚠ THE SCAN ITSELF NO LONGER LIVES HERE, AND THAT IS THE FIX RATHER THAN A
+//   TIDY-UP. `pe.cpp` asks the SAME question about a Win64 `RUNTIME_FUNCTION`
+//   field — a 32-bit IMAGE-relative pointer instead of a PC-relative one — and
+//   writing a second scanner there would have been two owners for one rule
+//   about a target's relocation vocabulary, each free to disagree about what
+//   "ambiguous" and "absent" mean. `unwind_pointer_reloc.hpp` holds the one
+//   scanner; the two formats differ only in the four scalars that describe
+//   their field, and each spells its own as a `constexpr` shape.
 [[nodiscard]] inline TargetRelocationInfo const*
 fdePointerRelocationOf(TargetSchema const& target, std::string& errorOut) {
-    TargetRelocationInfo const* found = nullptr;
-    for (auto const& r : target.relocations()) {
-        // `tls` rows are excluded explicitly: a thread-pointer offset is not
-        // an address, and a table built from one would describe frames in a
-        // per-thread coordinate space no unwinder uses.
-        if (r.formulaKind != RelocFormulaKind::Linear || !r.pcRelative
-            || r.addendBias != 0 || r.widthBytes != 4 || r.tls) {
-            continue;
-        }
-        if (found != nullptr) {
-            errorOut = "target '" + std::string(target.name())
-                     + "' declares TWO relocations matching the DWARF FDE "
-                       "pointer's description (32-bit PC-relative, no implicit "
-                       "addend bias): '" + found->name + "' and '" + r.name
-                     + "'. One of them is wrong for this field and nothing "
-                       "here can tell which, so no `.eh_frame` relocation is "
-                       "emitted rather than a coin-flip an unwinder would "
-                       "follow into the wrong function";
-            return nullptr;
-        }
-        found = &r;
-    }
-    if (found == nullptr) {
-        errorOut = "target '" + std::string(target.name())
-                 + "' declares no 32-bit PC-relative relocation with a zero "
-                   "addend bias, so the FDE `initial_location` in a "
-                   "relocatable object cannot be relocated. This is a "
-                   "per-target psABI row (x86_64: R_X86_64_PC32; aarch64: "
-                   "R_AARCH64_PREL32) and it belongs in that target's "
-                   "`*.target.json`. Reusing the call-site rel32 row instead "
-                   "would bake its -4 instruction-end bias into a DATA field "
-                   "and point every FDE 4 bytes past its function "
-                   "(D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS)";
-    }
-    return found;
+    return unwindPointerRelocationOf(target, kDwarfFdePointerField, errorOut);
 }
 
 // One FDE's `initial_location` field, recorded for the post-layout patch.

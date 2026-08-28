@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PURPOSE: refuse a tracked text blob that carries a CR.
+# PURPOSE: refuse a tracked text blob that carries a CR, and a CR instrument that cannot see one.
 # check-line-endings.sh — CI guard for D-REPO-GITATTRIBUTES-PINS-EOL-FOR-CONFIGS-BUT-NOT-FOR-SOURCES.
 #
 # Contract: NO tracked TEXT blob in this repository may contain a line-terminating
@@ -21,8 +21,55 @@
 #   · `git show HEAD:<path>` APPLIES eol conversion on the way out, so it can
 #     NEVER tell you what was committed. `git cat-file blob` can. This script
 #     uses `git grep <rev>`, which reads the BLOB, not a smudged checkout.
-#   · `grep -c $'\r'` matches the LETTER `r` in some shells — it does not count
-#     CRs at all. Counting is done here with `tr -dc '\r' | wc -c`.
+#   ┌─ CR-INSTRUMENT-QUOTED:BEGIN ─ the block below QUOTES the blind idioms in
+#   │  order to explain them; it does not run one as a measurement. Check F
+#   │  honours this region marker from any file, and uses it here rather than
+#   │  exempting itself by path — a guard that needs a private escape cannot be
+#   │  held to its own rule.
+#   · ⚠⚠ THE COMMON CR INSTRUMENTS ARE BLIND ON THIS HOST, IN BOTH DIRECTIONS.
+#     Counting is done here with `tr -dc '\r' | wc -c`, which is the only form
+#     measured correct. The two traps, and an EARLIER VERSION OF THIS VERY NOTE
+#     GOT THE FIRST ONE WRONG — it claimed `grep -c $'\r'` "matches the LETTER
+#     `r`", which is refuted by a control containing no `r` at all (`grep -c 'r'`
+#     returns 0 on it; the idiom returns the LINE COUNT). ✔RE-MEASURED 2026-08-27
+#     (cycle P42) against a control built with `printf 'a\r\nb\n'` and verified
+#     by `od -c` to hold exactly one CR:            CR-INSTRUMENT-QUOTED
+#
+#       TRAP 1 — FALSE POSITIVE, and it fires on a CLEAN file. The literal token
+#       `$'\r'` written INSIDE a command substitution expands to the EMPTY
+#       STRING, so `n=$(grep -c $'\r' f)` runs `grep -c ''` and returns the
+#       file's LINE COUNT — 2 for the CRLF control and 2 for its pure-LF twin.
+#       ✔The loss is at PARSE time and is CR-SPECIFIC: an argv-dumping shim shows
+#       `bash shim $'\r'` delivering byte `0d` when run BARE and an EMPTY
+#       argument when the same text sits inside `$( )`, while `$'\t'` and `$'A'`
+#       in that identical position both survive. A CR held in a VARIABLE is
+#       unaffected (`CR=$'\r'` at top level, then `"$CR"`, delivers `0d` either
+#       way) — so the defect is the SPELLING, not command substitution.
+#       ⓘ INFERRED, not measured: the likely cause is the substitution body
+#       being re-scanned by the parser, which consumes the expanded CR as line
+#       whitespace. The RULE above is measured; this sentence is a guess.
+#
+#       TRAP 2 — FALSE NEGATIVE, the dangerous one, and NO amount of quoting
+#       care avoids it because the READER discards the byte. GNU grep and sed
+#       here open files in TEXT MODE and strip the trailing CR BEFORE matching,
+#       so on the `od`-proved CRLF control:      CR-INSTRUMENT-QUOTED
+#           grep -c "$CR"   -> 0     grep -U -c "$CR" -> 1   (-U is the fix)
+#           grep -a -c "$CR"-> 0     awk '/\r$/'      -> 0   (-a does NOT help)
+#           sed -n '/\r/p'  -> 0     tr -dc '\r'|wc -c-> 1   (correct)
+#       A MID-LINE CR is found by every one of them — the blindness is aimed
+#       precisely at the only CR anyone ever hunts. This is why a lane can
+#       certify a tree "pure LF" with `awk '/\r$/'` while measuring nothing.
+#
+#     ★★ AND THIS IS WHY IT SURVIVED: under WSL/Linux all three instruments are
+#     CORRECT (1 on the CRLF control, 0 on the LF twin). An author who sanity-
+#     checks the idiom on Linux — or reads the GNU manual — gets a right answer
+#     and concludes it is sound. It then lies ONLY on Windows, the primary
+#     development host. An instrument verified on the wrong leg is verified
+#     nowhere, which is also why the `.ps1` twin below is held to its own
+#     control rather than assumed to inherit this one's correctness.
+#     ⇒ Check F refuses these spellings; `--files` is the entry point that
+#       exists so nobody needs to hand-roll one. See `--help`.
+#   └─ CR-INSTRUMENT-QUOTED:END ─────────────────────────────────────────────
 #   · a `grep -P` that ABORTS (no PCRE support, a hostile locale) prints nothing
 #     and is trivially misread as "measured zero offenders". That is why the
 #     POSITIVE CONTROL below exists: the same `-P` engine, the same ref, a
@@ -38,6 +85,278 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# ⚠ CAPTURED BEFORE THE `cd` BELOW. `--files` takes paths from a CALLER who is
+# somewhere else — very often a lane's own scratchpad, outside this repo
+# entirely — so a relative path must resolve against where the user stood, not
+# against the repo root. Resolving them after the `cd` silently answered about
+# the wrong file (or "missing"), which is the failure this mode exists to end.
+INVOKED_FROM="$(pwd -P)"
+
+# ── THE ONE CORRECT INSTRUMENT ────────────────────────────────────────────
+# ✔MEASURED (see the instrument note above): `tr -dc '\r' | wc -c` is the only
+# form that answers correctly on BOTH a CRLF file and a pure-LF file on BOTH
+# Git Bash and Linux. Every CR count in this script goes through here so there
+# is exactly ONE place to be right.                 CR-INSTRUMENT-QUOTED
+_cr_count() { tr -dc '\r' < "$1" | wc -c | tr -d ' '; }
+
+# ── WHAT CHECK F REFUSES — one ERE pair, shared with the `.ps1` twin ───────
+# A DETECTOR VERB and a CR PATTERN on the same line, in either order. The verb
+# co-requirement is what keeps prose out: `.gitattributes` discusses `$'\r'` in
+# a sentence with no verb, and a Windows path `'Z:\home\rafael\test'` carries a
+# bare `\r` that is not a CR pattern at all — ✔both MEASURED not to fire.
+_CR_VERB="(grep|egrep|fgrep|rg|awk|sed|findstr|Select-String)"
+_CR_PAT="(\\\$'(\\\\r|\\\\015)'|['\"/]\\\\r\\\$|['\"/]\\\\r['\"/])"
+_CR_BLIND="(${_CR_VERB}.*${_CR_PAT}|${_CR_PAT}.*${_CR_VERB})"
+# ★★ THE EXEMPTIONS, AND WHY THE MARKER EXISTS. A guard that refuses an idiom
+# must still let people WRITE ABOUT the idiom — otherwise it cannot describe its
+# own subject, which is the very defect it is guarding against. So the escape is
+# an IN-BAND MARKER any file may use, `CR-INSTRUMENT-QUOTED`, and this script
+# uses the SAME marker as everyone else rather than exempting itself by path.
+# The other exemptions are MEASURED-SAFE forms, not conveniences:
+#   · `git grep`/`ls-files`/`diff`/`cat-file` read BLOBS internally and never go
+#     through stdio text mode — ✔probed against a purpose-built repo holding a
+#     genuinely CRLF blob, and `git grep -I -l -P '\r$'` found it correctly;
+#   · `grep -U`/`--binary` disables the CRLF stripping — ✔measured to return 1
+#     where plain grep returns 0 (`-a` does NOT, and is deliberately absent);
+#   · `sub(`/`gsub(`/`s/\r`/`-replace`/`tr -d`/`${v%$'\r'}` are CONVERTERS —
+#     they REWRITE a CR rather than ask whether one is there, so they cannot
+#     report a wrong answer. Four other guards strip CR this way, correctly.
+_CR_EXEMPT="(git +(grep|ls-files|diff|cat-file)|-U |--binary|sub\\(|gsub\\(|s/\\\\r|-replace|tr +-d|%\\\$'|CR-INSTRUMENT-QUOTED)"
+# ⚠ `.plans/**` is EXCLUDED, and this is a scope ruling rather than an oversight.
+# That tree is the deferred-anchor REGISTRY: a historical record of defects,
+# which necessarily QUOTES the broken instruments it recorded — ✔five rows do.
+# Nothing executes it and nothing copies from it, and this repository's standing
+# rule already excludes `.plans/**` from sweeps (a record must not be rewritten
+# to satisfy a guard). Check F's subject is text a lane might RUN or COPY.
+_CR_AUDIT_SCOPE=":(exclude).plans/"
+
+# CR-INSTRUMENT-QUOTED:BEGIN — the help text NAMES the blind idiom so a reader
+# recognises it; the marker is out here as a comment so the token never appears
+# in `--help` output itself.
+_usage() {
+    cat <<'USAGE'
+check-line-endings.sh — the LF-contract guard, and the repo's CR instrument.
+
+  (no arguments)      Verify the whole repository: committed blobs, the index,
+                      and the working tree (checks A–E), plus Check F, which
+                      refuses a CR instrument that cannot see a CR. Self-tests
+                      first, so it cannot pass without proving it can fail.
+  --files PATH...     Ask about SPECIFIC files: "are these clean?" Works on
+                      tracked, untracked and outside-the-repo paths alike.
+                      Exit 0 all clean · 1 a CR was found · 2 unreadable.
+  --files-from FILE   The same, one path per line (`-` reads stdin).
+  --audit-instruments Run Check F alone.
+  --selftest          Run the self-test alone.
+  --help              This text.
+
+★ WHY `--files` EXISTS. Until 2026-08-27 this guard answered exactly one
+question — "is the whole repo clean?" — and took no arguments. A lane holding
+thirteen specific files had NO entry point, so it hand-rolled `awk '/\r$/'`,
+which reports a clean tree over a fully CRLF file, and certified all thirteen
+while measuring nothing. The guard was not missing; its REACH was.
+                                                  CR-INSTRUMENT-QUOTED
+USAGE
+}
+# CR-INSTRUMENT-QUOTED:END
+
+# ── `--files`: the per-file question, answered with the one correct tool ──
+# Fail-loud by construction: a path that does not exist, is a directory, or
+# cannot be read is exit 2 (UNMEASURED), never a silent skip that reads as a
+# pass. That distinction is the whole point — a skip shaped like a pass is the
+# failure class this guard exists to refuse.
+_run_files_mode() {
+    local _rc=0 _n=0 _bad=0 _unmeasured=0 _p _abs _cr
+    for _p in "$@"; do
+        _n=$((_n + 1))
+        case "${_p}" in /*|[A-Za-z]:[/\\]*) _abs="${_p}" ;; *) _abs="${INVOKED_FROM}/${_p}" ;; esac
+        if [[ -d "${_abs}" ]]; then
+            echo "  UNMEASURED  ${_p} — is a directory, not a file" >&2
+            _unmeasured=$((_unmeasured + 1)); continue
+        fi
+        if [[ ! -e "${_abs}" ]]; then
+            echo "  UNMEASURED  ${_p} — no such file" >&2
+            _unmeasured=$((_unmeasured + 1)); continue
+        fi
+        if [[ ! -r "${_abs}" ]]; then
+            echo "  UNMEASURED  ${_p} — not readable" >&2
+            _unmeasured=$((_unmeasured + 1)); continue
+        fi
+        _cr="$(_cr_count "${_abs}")"
+        if [[ "${_cr}" -eq 0 ]]; then
+            echo "  LF          ${_p}"
+        else
+            echo "  CR  ${_cr}    ${_p}"
+            _bad=$((_bad + 1))
+        fi
+    done
+    if [[ "${_n}" -eq 0 ]]; then
+        echo "line-endings: FAIL — --files was given no paths. Refusing to report a" >&2
+        echo "  pass over an empty list; that is a vacuous green, not a clean tree." >&2
+        return 2
+    fi
+    if [[ "${_unmeasured}" -gt 0 ]]; then
+        echo "line-endings: FAIL — ${_unmeasured} of ${_n} path(s) could NOT be measured (above)." >&2
+        echo "  A guard that cannot read a file must say so, never imply it was clean." >&2
+        _rc=2
+    fi
+    if [[ "${_bad}" -gt 0 ]]; then
+        echo "line-endings: FAIL — ${_bad} of ${_n} file(s) carry a CR." >&2
+        echo "  Convert with \`tr -d '\\r' < f > f.tmp && mv f.tmp f\`, or see --help." >&2
+        [[ "${_rc}" -eq 0 ]] && _rc=1
+    fi
+    [[ "${_rc}" -eq 0 ]] && echo "line-endings: OK (${_n} file(s), none carries a CR; measured with tr -dc)"
+    return "${_rc}"
+}
+
+# ── Check F: refuse a CR instrument that cannot see a CR ───────────────────
+_run_instrument_audit() {
+    local _hits _marked _raw _h _hf _rest _hl
+    _raw="$(git grep -n -I -E "${_CR_BLIND}" -- . "${_CR_AUDIT_SCOPE}" 2>/dev/null \
+             | grep -v -E "${_CR_EXEMPT}" || true)"
+    # ── REGION EXEMPTION, and it is why this guard can document itself ──────
+    # ★★ A same-line marker is right for a one-off, and USELESS for a paragraph
+    # that explains the trap — which is exactly the text most worth writing.
+    # ✔MEASURED while building this: the corrected instrument note at the top of
+    # this file tripped Check F TWELVE times, and per-line markers would have put
+    # the token on twelve consecutive lines of prose. A guard whose escape hatch
+    # is unusable for documentation punishes the documentation that prevents the
+    # defect. So a BEGIN/END region marks a whole block at once.
+    # ⓘ Scanned per offending FILE rather than by pairing markers globally: the
+    # hit list is short, and reading the file itself cannot get the pairing wrong.
+    _hits=""
+    while IFS= read -r _h; do
+        [[ -z "${_h}" ]] && continue
+        _hf="${_h%%:*}"; _rest="${_h#*:}"; _hl="${_rest%%:*}"
+        if [[ -f "${_hf}" ]] && awk -v L="${_hl}" '
+                /CR-INSTRUMENT-QUOTED:BEGIN/ { r = 1 }
+                { if (r && NR == L) found = 1 }
+                /CR-INSTRUMENT-QUOTED:END/   { r = 0 }
+                END { exit !found }' "${_hf}" 2>/dev/null; then
+            continue
+        fi
+        _hits+="${_h}"$'\n'
+    done <<< "${_raw}"
+    _hits="${_hits%$'\n'}"
+    # A census of the escape hatch on every run, so silencing trends are visible
+    # rather than accumulating unseen — the ratchet shape used elsewhere here.
+    _marked="$(git grep -c -I -e 'CR-INSTRUMENT-QUOTED' -- . "${_CR_AUDIT_SCOPE}" 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ -n "${_hits}" ]]; then
+        echo "line-endings: FAIL — a CR instrument that cannot see a CR:" >&2
+        echo "" >&2
+        printf '%s\n' "${_hits}" | sed 's/^/  /' >&2
+        # CR-INSTRUMENT-QUOTED:BEGIN — the refusal must SHOW the spellings it
+        # refuses, or the reader cannot recognise their own line in it.
+        cat >&2 <<'FIXF'
+
+These spellings do not measure what they appear to measure on this host
+(both directions are MEASURED in the note at the top of this script):
+  · `grep -c $'\r'`  returns the LINE COUNT — of a CLEAN file too;
+  · `awk '/\r$/'`, `sed -n '/\r/p'`, `grep -P '\r$'` return 0 over a
+    file that is entirely CRLF, because the reader strips the CR first.
+Use instead:
+  (a) `scripts/check-line-endings/check-line-endings.sh --files PATH...`
+      — the supported way to ask about specific files; or
+  (b) `tr -dc '\r' < f | wc -c`  (expect 0) if you must inline it; or
+  (c) `git grep`/`git ls-files --eol`, which read blobs and are unaffected.
+If the line is DOCUMENTATION that quotes the idiom on purpose, put the
+marker CR-INSTRUMENT-QUOTED on it — the same escape this script uses for
+its own warnings, so the guard can describe its own subject.
+FIXF
+        # CR-INSTRUMENT-QUOTED:END
+        return 1
+    fi
+    echo "line-endings: Check F OK (no blind CR instrument; ${_marked} file(s) carry the quoted-idiom marker)"
+    return 0
+}
+
+# ── THE SELF-TEST — it synthesizes the NEGATIVE, which is the only direction ──
+# ★★ A fixture that feeds this guard a CLEAN file and asserts a pass stays green
+# forever after the guard stops working. So every arm below is built to FAIL if
+# the instrument is blind: the CR control is constructed with `printf` and
+# verified by `od` to hold exactly one 0x0D before it is ever used as a control,
+# and the blind-idiom arms assert the detector FIRES.
+#
+# ⚠ THE SYNTHETIC BLIND LINES ARE ASSEMBLED FROM FRAGMENTS AT RUN TIME, never
+# written literally. A literal `grep -c $'\r'`   CR-INSTRUMENT-QUOTED
+# sitting in this file would be a
+# true positive for Check F scanning this very script — the guard would refuse
+# itself. Building the string at run time keeps the source honest AND still
+# exercises the detector against a genuinely blind line.
+_run_selftest() {
+    local _t _fail=0 _q="'" _d='$' _b='\' _crlf _lf _n
+    _t="$(mktemp -d 2>/dev/null)" || { echo "line-endings: FAIL — selftest cannot mktemp -d" >&2; return 2; }
+    # Never write inside the repository, compared by RESOLVED prefix (not substring).
+    local _tr; _tr="$(cd "${_t}" && pwd -P)"
+    case "${_tr}/" in "${REPO_ROOT}/"*) echo "line-endings: FAIL — selftest temp dir '${_tr}' is inside the repo" >&2; return 2 ;; esac
+    trap 'rm -rf "${_t}"' RETURN
+
+    _crlf="${_t}/ctl_crlf.txt"; _lf="${_t}/ctl_lf.txt"
+    printf 'a\r\nb\n' > "${_crlf}"
+    printf 'a\nb\n'   > "${_lf}"
+    # ARM 0 — prove the CONTROL before trusting any verdict taken with it.
+    _n="$(od -An -tx1 -v < "${_crlf}" | tr ' ' '\n' | grep -c '^0d$' || true)"
+    [[ "${_n}" -eq 1 ]] || { echo "line-endings: FAIL — selftest control is not one CR (od says ${_n})" >&2; _fail=1; }
+    _n="$(od -An -tx1 -v < "${_lf}" | tr ' ' '\n' | grep -c '^0d$' || true)"
+    [[ "${_n}" -eq 0 ]] || { echo "line-endings: FAIL — selftest LF twin carries a CR (od says ${_n})" >&2; _fail=1; }
+
+    # ARM 1 — THE NEGATIVE: the counter must SEE the CR.
+    [[ "$(_cr_count "${_crlf}")" -eq 1 ]] || { echo "line-endings: FAIL — selftest: _cr_count reported no CR on the CRLF control. The instrument is blind." >&2; _fail=1; }
+    # ARM 2 — and must not invent one.
+    [[ "$(_cr_count "${_lf}")" -eq 0 ]] || { echo "line-endings: FAIL — selftest: _cr_count invented a CR on the pure-LF control." >&2; _fail=1; }
+    # ARM 3/4 — `--files` must RED on the dirty control and pass on the clean one.
+    if _run_files_mode "${_crlf}" >/dev/null 2>&1; then
+        echo "line-endings: FAIL — selftest: --files reported success over a file holding a CR." >&2; _fail=1
+    fi
+    if ! _run_files_mode "${_lf}" >/dev/null 2>&1; then
+        echo "line-endings: FAIL — selftest: --files refused a pure-LF file." >&2; _fail=1
+    fi
+    # ARM 5 — a missing path is UNMEASURED (exit 2), never a quiet pass.
+    _run_files_mode "${_t}/does-not-exist" >/dev/null 2>&1
+    [[ $? -eq 2 ]] || { echo "line-endings: FAIL — selftest: a missing path did not exit 2." >&2; _fail=1; }
+
+    # ARM 6 — the Check F detector must FIRE on genuinely blind lines...
+    {
+        printf 'n=%s(grep -c %s%s%sr%s f)\n' "${_d}" "${_d}" "${_q}" "${_b}" "${_q}"
+        printf 'awk %s/%sr%s/ {bad++}%s f\n'  "${_q}" "${_b}" "${_d}" "${_q}"
+        printf 'sed -n %s/%sr/p%s f | wc -l\n' "${_q}" "${_b}" "${_q}"
+    } > "${_t}/blind.txt"
+    _n="$(grep -c -E "${_CR_BLIND}" "${_t}/blind.txt" || true)"
+    [[ "${_n}" -eq 3 ]] || { echo "line-endings: FAIL — selftest: Check F saw ${_n}/3 blind instruments. The detector is broken." >&2; _fail=1; }
+    # ...and must NOT fire on the measured-safe forms.
+    {
+        printf 'tr -dc %s%sr%s < f | wc -c\n'        "${_q}" "${_b}" "${_q}"
+        printf 'git grep -I -l -P %s%sr%s%s HEAD\n'  "${_q}" "${_b}" "${_d}" "${_q}"
+        printf 'sub(/%sr%s/, "", line)\n'            "${_b}" "${_d}"
+        printf 'grep -U -c "%sCR" f\n'               "${_d}"
+    } > "${_t}/safe.txt"
+    _n="$(grep -E "${_CR_BLIND}" "${_t}/safe.txt" 2>/dev/null | grep -v -c -E "${_CR_EXEMPT}" || true)"
+    [[ "${_n}" -eq 0 ]] || { echo "line-endings: FAIL — selftest: Check F fired on ${_n} SAFE form(s)." >&2; _fail=1; }
+    # ARM 7 — the marker must exempt, or nobody can document the idiom.
+    printf 'awk %s/%sr%s/%s f   CR-INSTRUMENT-QUOTED\n' "${_q}" "${_b}" "${_d}" "${_q}" > "${_t}/marked.txt"
+    _n="$(grep -E "${_CR_BLIND}" "${_t}/marked.txt" 2>/dev/null | grep -v -c -E "${_CR_EXEMPT}" || true)"
+    [[ "${_n}" -eq 0 ]] || { echo "line-endings: FAIL — selftest: the CR-INSTRUMENT-QUOTED marker did not exempt a documented idiom." >&2; _fail=1; }
+
+    [[ "${_fail}" -eq 0 ]] || { echo "line-endings: FAIL — the SELF-TEST failed (above). This guard cannot be trusted until it passes; do not silence it." >&2; return 2; }
+    return 0
+}
+
+case "${1:-}" in
+    --help|-h)           _usage; exit 0 ;;
+    --files)             shift; _run_files_mode "$@"; exit $? ;;
+    --files-from)
+        [[ $# -ge 2 ]] || { echo "line-endings: FAIL — --files-from needs a FILE (or -)" >&2; exit 2; }
+        _ff="$2"
+        if [[ "${_ff}" == "-" ]]; then mapfile -t _ffpaths
+        elif [[ -r "${_ff}" ]]; then mapfile -t _ffpaths < "${_ff}"
+        else echo "line-endings: FAIL — cannot read path list '${_ff}'" >&2; exit 2; fi
+        _kept=(); for _l in "${_ffpaths[@]}"; do [[ -n "${_l}" ]] && _kept+=("${_l}"); done
+        _run_files_mode "${_kept[@]+"${_kept[@]}"}"; exit $? ;;
+    --audit-instruments) cd "${REPO_ROOT}"; _run_instrument_audit; exit $? ;;
+    --selftest)          cd "${REPO_ROOT}"; _run_selftest; exit $? ;;
+    "")                  : ;;
+    *) echo "line-endings: FAIL — unknown argument '$1' (see --help)" >&2; exit 2 ;;
+esac
+
 cd "${REPO_ROOT}"
 
 # ── fail-closed preconditions ─────────────────────────────────────────────
@@ -54,6 +373,14 @@ if ! git rev-parse --verify --quiet HEAD >/dev/null; then
     echo "  with a commit. Refusing to report a pass over a tree it cannot read." >&2
     exit 2
 fi
+
+# ── SELF-TEST FIRST — this entry cannot pass without proving it can fail ──
+# ★ The same arrangement `orphan_tests_guard` uses, and for the same reason: a
+# guard wired into ctest is only evidence if it is still capable of redding. The
+# arms below construct a file that genuinely holds a CR and assert this script
+# SEES it, so a regression that blinds the instrument reds here instead of
+# quietly reporting a clean tree forever (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+_run_selftest || exit 2
 
 # ── POSITIVE CONTROL ──────────────────────────────────────────────────────
 # The offender scan below PASSES by returning nothing, which is exactly what a
@@ -271,8 +598,11 @@ fi
 # A pinned untracked file is deliberately NOT reported: its clean filter
 # normalises it on `git add`, so it cannot land CRLF, and a guard that reds on a
 # state git is about to fix teaches people to ignore it.
-# ⚠ `tr -dc '\r' | wc -c`, never `grep -c $'\r'` — the latter matches the LETTER
-# `r` in some shells (instrument note at the top of this file).
+# ⚠ `tr -dc '\r' | wc -c`, never `grep -c $'\r'` (which returns the LINE COUNT,
+# on a clean file too) and never `awk '/\r$/'`   CR-INSTRUMENT-QUOTED
+# (which returns 0 over a fully
+# CRLF file). Both traps are measured in the instrument note at the top of this
+# file, and Check F refuses them repo-wide.        CR-INSTRUMENT-QUOTED
 _worktree_untracked=""
 while IFS= read -r _f; do
     [[ -z "${_f}" ]] && continue
@@ -295,7 +625,21 @@ if [[ -n "${_worktree_untracked}" ]]; then
     done <<< "${_worktree_untracked}"
 fi
 
-if [[ -z "${_report}" ]]; then
+# ── Check F: the INSTRUMENT tier — a CR detector that cannot detect a CR ──
+# ★★ THE TIER CHECKS A–E CANNOT REACH, and the one that let this whole class
+# through. A–E judge BYTES: what is in a blob, an index, a working file. Check F
+# judges the MEASUREMENT — text that will be RUN or COPIED to answer "is there a
+# CR here?" and that answers wrongly on this host. ✔MEASURED 2026-08-27: a lane
+# certified thirteen files "pure LF" with `awk '/\r$/'`,  CR-INSTRUMENT-QUOTED
+# which returns 0 over a
+# file that is entirely CRLF. Every byte-tier check was green throughout, and
+# correctly so — the tree WAS clean. The claim about it was worthless.
+# ⇒ A guard cannot only ask whether the tree is clean; it must also refuse the
+#   instruments that will be used to answer that question next time.
+_instrument_rc=0
+_run_instrument_audit || _instrument_rc=$?
+
+if [[ -z "${_report}" && "${_instrument_rc}" -eq 0 ]]; then
     if [[ -n "${_skip_binary_check:-}" ]]; then
         # Say plainly what was NOT checked. A guard reporting "OK" while having
         # silently skipped half its checks is the self-blind-instrument shape
@@ -309,6 +653,14 @@ if [[ -z "${_report}" ]]; then
         echo "line-endings: OK (committed ${_control_head} + staged ${_control_index} text blobs, working tree ${_eol_row_count} tracked paths + untracked, core.autocrlf=${_autocrlf}; none carries CR)"
     fi
     exit 0
+fi
+
+# Check F failed on its own: it has already printed its finding and its fix, and
+# the byte tiers found nothing. Do not head that with an "LF contract violated"
+# banner over an empty list — a report whose heading outruns its evidence is the
+# same self-blindness this guard is about.
+if [[ -z "${_report}" ]]; then
+    exit 1
 fi
 
 echo "line-endings: FAIL — the LF contract is violated (tier named per line):"

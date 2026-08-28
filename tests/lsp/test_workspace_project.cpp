@@ -20,6 +20,9 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/project_config.hpp"   // dss::loadProjectConfig — the SHARED
+#include "core/types/target_spec.hpp"     // dss::TargetSpec — the ONE
+                                           // `<targetName>:<formatName>`
+                                           // splitter, now reached DOWNWARD
                                            // parser the LSP must be running
 #include "lsp/schema_cache.hpp"
 #include "lsp/workspace_project.hpp"
@@ -1095,4 +1098,92 @@ TEST(WorkspaceProject, FileUriRoundTrip) {
     // matters for safety, and it is pinned separately by
     // `NonFileUriIsRefusedRatherThanGuessed`: a network host is not a local
     // directory to scan, so `file://someremotehost/share/x` yields nullopt.
+}
+
+
+// ── D-LSP-TARGET-SPEC-SPLITTER-LIVES-ABOVE-ITS-CONSUMERS ────────────────────
+//
+// ★★ THE LAYER IS THE SUBJECT, SO THE PIN HAS TO BE ABLE TO SEE A LAYER. A
+// behaviour test cannot: `TargetSpec::parse` returns the same answer from
+// whichever tier it is declared in, so a test that only calls it stays green
+// through the exact regression this row closed. What CAN go wrong is an
+// `#include` — the LSP reaching UP into the driver tier for a splitter — and
+// that is a fact about the SOURCE, so the source is what gets read.
+//
+// ⚠ TWO HALVES, AND NEITHER IS SUFFICIENT ALONE. The scan below reds if any
+// `src/lsp/**` file re-acquires a `#include "program/..."`. The `#include
+// "core/types/target_spec.hpp"` at the top of THIS file reds at COMPILE time if
+// the type ever leaves `core` — which a text scan of `src/lsp/` could never
+// see, because a type that moved back up would take the LSP's include with it
+// and the scan would keep passing while the layering was gone.
+//
+// ★ WHY THE LIST IS ENUMERATED FROM THE DIRECTORY rather than hand-kept: a
+// hand-kept list silently stops covering the file someone adds next week, which
+// is precisely when a fresh cross-tier include appears.
+TEST(WorkspaceProject, TheLspNeverReachesUpIntoTheDriverTier) {
+    namespace fs = std::filesystem;
+    fs::path const lspDir = fs::path{DSS_TEST_REPO_ROOT} / "src" / "lsp";
+    ASSERT_TRUE(fs::is_directory(lspDir))
+        << "cannot find src/lsp under DSS_TEST_REPO_ROOT — the scan below "
+           "would pass by having nothing to read";
+
+    std::size_t scanned = 0;
+    for (auto const& entry : fs::directory_iterator{lspDir}) {
+        if (!entry.is_regular_file()) continue;
+        auto const ext = entry.path().extension().string();
+        if (ext != ".cpp" && ext != ".hpp") continue;
+        ++scanned;
+        std::ifstream in{entry.path(), std::ios::binary};
+        ASSERT_TRUE(in.good()) << "could not read " << entry.path().string();
+        std::string line;
+        std::size_t lineNo = 0;
+        while (std::getline(in, line)) {
+            ++lineNo;
+            // The INCLUDE DIRECTIVE only — a `program/...` mention inside a
+            // comment is documentation (this repo's comments name the tier
+            // they deliberately do NOT depend on, and must stay able to).
+            auto const hash = line.find('#');
+            if (hash == std::string::npos) continue;
+            if (line.find("include") == std::string::npos) continue;
+            if (line.find("\"program/") == std::string::npos) continue;
+            if (line.substr(0, hash).find_first_not_of(" \t") != std::string::npos) {
+                continue;   // not a directive: `#` appeared after other code
+            }
+            FAIL() << entry.path().filename().string() << ":" << lineNo
+                   << " includes the DRIVER tier: " << line
+                   << "\n`lsp` has no link edge to `program` and must not grow "
+                      "one — `program` already links `lsp` for the `--lsp` mode "
+                      "dispatch, so the reverse edge closes a cycle CMake "
+                      "refuses between OBJECT libraries. Move the shared fact "
+                      "DOWN into `core`, as `project_config` and `target_spec` "
+                      "both were "
+                      "(D-LSP-TARGET-SPEC-SPLITTER-LIVES-ABOVE-ITS-CONSUMERS).";
+        }
+    }
+    EXPECT_GT(scanned, 5U)
+        << "the scan read almost nothing, so it cannot have proved anything — "
+           "check the directory walk before trusting a green here";
+}
+
+// The splitter still splits, from its new home. Cheap, and it is what stops the
+// move from being a rename that lost a behaviour on the way down.
+TEST(WorkspaceProject, TheSplitterStillSplitsFromCore) {
+    auto const ok = dss::TargetSpec::parse("x86_64:elf64-x86_64-linux-exec");
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ(ok->targetName, "x86_64");
+    EXPECT_EQ(ok->formatName, "elf64-x86_64-linux-exec");
+
+    // The four remediation-distinct refusals travelled with it. A move that
+    // dropped `TargetSpecError` would leave the LSP unable to tell an operator
+    // WHICH way their manifest's target line is wrong.
+    EXPECT_EQ(dss::TargetSpec::parse("x86_64").error(),
+              dss::TargetSpecError::MissingColon);
+    EXPECT_EQ(dss::TargetSpec::parse("a:b:c").error(),
+              dss::TargetSpecError::MultipleColons);
+    EXPECT_EQ(dss::TargetSpec::parse(":fmt").error(),
+              dss::TargetSpecError::EmptyTargetName);
+    EXPECT_EQ(dss::TargetSpec::parse("tgt:").error(),
+              dss::TargetSpecError::EmptyFormatName);
+    EXPECT_EQ(dss::TargetSpec::parse("tg t:fmt").error(),
+              dss::TargetSpecError::WhitespaceInName);
 }

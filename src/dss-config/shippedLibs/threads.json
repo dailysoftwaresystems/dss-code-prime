@@ -113,13 +113,13 @@
     ] }
   ],
   "constants": [
-    { "name": "thrd_success",   "value": 0, "type": "i32" },
-    { "name": "thrd_busy",      "value": 1, "type": "i32" },
-    { "name": "thrd_error",     "value": 2, "type": "i32" },
-    { "name": "thrd_nomem",     "value": 3, "type": "i32" },
-    { "name": "thrd_timedout",  "value": 4, "type": "i32" },
-    { "name": "mtx_plain",      "value": 0, "type": "i32" },
-    { "name": "mtx_recursive",  "value": 1, "type": "i32" },
-    { "name": "mtx_timed",      "value": 2, "type": "i32" }
+    { "name": "thrd_success",   "value": 0, "type": "i32", "preprocessorVisible": false },
+    { "name": "thrd_busy",      "value": 1, "type": "i32", "preprocessorVisible": false },
+    { "name": "thrd_error",     "value": 2, "type": "i32", "preprocessorVisible": false },
+    { "name": "thrd_nomem",     "value": 3, "type": "i32", "preprocessorVisible": false },
+    { "name": "thrd_timedout",  "value": 4, "type": "i32", "preprocessorVisible": false },
+    { "name": "mtx_plain",      "value": 0, "type": "i32", "preprocessorVisible": false },
+    { "name": "mtx_recursive",  "value": 1, "type": "i32", "preprocessorVisible": false },
+    { "name": "mtx_timed",      "value": 2, "type": "i32", "preprocessorVisible": false }
   ]
 }

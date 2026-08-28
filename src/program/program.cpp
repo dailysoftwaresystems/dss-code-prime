@@ -79,15 +79,18 @@ namespace fs = std::filesystem;
 
 namespace dss {
 
-// Defined further down (the `#include <h>` system-dir wiring). Forward-declared
-// at NAMESPACE scope so the shipped-source unit build below can call the ONE
-// system-dir helper rather than grow a second copy of it. Declaring it inside the
-// anonymous namespace instead would MINT a second overload and make every later
-// call ambiguous.
-void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar);
-// Same seam, resolution only — see the definition for why the multi-TU CU
-// build resolves once instead of per file.
-[[nodiscard]] std::vector<fs::path> resolveSystemDirs(GrammarSchema const& grammar);
+// ✅ THE TWO SYSTEM-DIR HELPERS ARE NO LONGER DECLARED HERE, and the deleted
+// forward declarations are the defect rather than a detail of it —
+// D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS. They
+// were defined at `dss` namespace scope FURTHER DOWN THIS FILE with no header
+// declaring them, so a signature existed that no owner published: the LSP,
+// which builds a `UnitBuilder` per open document, could not call them and grew
+// no system dirs at all, while `dump_predefined_macros.cpp` re-walked
+// `shippedLibDirs` with a private loop. The walk now lives once in
+// `core/types/config_path_walk.hpp` (`resolveSystemDirs`) and its builder
+// binding once beside `UnitBuilder::addSystemDir`
+// (`analysis/compilation_unit/compilation_unit.hpp`, `applySystemDirs`) — both
+// reached through includes this file already had.
 
 namespace {
 
@@ -162,8 +165,18 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
         if (d.buffer.valid()) {
             std::cerr << rep.format(d, bufs);
         } else {
+            // D-DIAG-TWO-CODE-RENDERINGS hazard (H1) — the PUNCTUATION was the
+            // other half of the split, and it is easy to miss because the token
+            // gets all the attention. This arm emitted `] ` (bracket-space, NO
+            // colon) while the positioned renderer emitted `]: `, so a census
+            // that generalised the bracket CONTENTS but kept a `:` anchored in
+            // its pattern still could not see a buffer-less diagnostic. Both
+            // paths now spell the code with `diagnosticCodeName` AND close it
+            // with `]: `; the contract is stated once in
+            // `diagnostic_reporter.hpp`. The location-free LAYOUT is unchanged
+            // and deliberately so — see the routing comment above.
             std::cerr << severityName(d.severity)
-                      << "[" << diagnosticCodeName(d.code) << "] "
+                      << "[" << diagnosticCodeName(d.code) << "]: "
                       << d.contextPrefix
                       << d.actual << '\n';
         }
@@ -272,6 +285,57 @@ void emitDriver(DiagnosticReporter& rep,
                 DiagnosticCode code,
                 std::string msg) {
     dss::report(rep, code, DiagnosticSeverity::Error, std::move(msg));
+}
+
+// ── D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS: SAY WHAT WAS NOT MEASURED ─
+//
+// ★★★ THE DEFECT THIS EXISTS TO END. A driver that stops early deletes every
+// diagnostic the phases it skipped would have produced, and NOTHING in the
+// output says so — so an absent `S0006` reads as "DSS is fine with
+// `__uint128_t`" when the truth is "semantic analysis never ran". ✔MEASURED
+// before this landed: a two-TU build where TU-1 has a parse error and TU-2 has
+// an `S0001` reported the parse errors and was TOTALLY SILENT about TU-2, while
+// compiling TU-2 alone reported `S0001` at 2:12. Two registry rows carried a
+// false blocking relationship because of exactly that inference, and a cycle
+// was ordered around it.
+//
+// ⚠ `Info`, because the notice must not gate `hasErrors()` — it is emitted AT
+// the gates that read `hasErrors()`, so an Error-severity notice would be a
+// diagnostic that re-triggers the condition it describes. `Guaranteed`, because
+// a run that hit a volume cap is exactly the run whose completeness is most in
+// doubt: the one notice saying "this stream is incomplete" must not itself be
+// the diagnostic the cap drops. Both fields mirror `P_DiagnosticsElided`, which
+// is the same fact one tier down.
+void emitPhasesNotRun(DiagnosticReporter& rep, std::string msg) {
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::D_LaterPhasesNotRun;
+    d.severity = DiagnosticSeverity::Info;
+    d.delivery = DiagnosticDelivery::Guaranteed;
+    d.actual   = std::move(msg);
+    rep.report(std::move(d));
+}
+
+// The sentence every altitude ends with. One wording, one place — a reader who
+// learns what an absent diagnostic means here must not have to re-learn it from
+// a differently-phrased sibling.
+constexpr char const* kNotMeasuredNotAbsent =
+    " A diagnostic that would have come from a phase named above as NOT RUN is "
+    "MISSING FROM THIS RUN BECAUSE IT WAS NOT MEASURED — never because the "
+    "condition it reports is absent.";
+
+// The run stopped BEFORE any translation unit was built: no source was parsed,
+// so no tier past the driver's own pre-flight ran for anything. `what` names the
+// altitude in the driver's own vocabulary.
+void emitStoppedBeforeCuBuild(DiagnosticReporter& rep,
+                              char const*         what,
+                              std::size_t         sourceCount) {
+    emitPhasesNotRun(
+        rep,
+        std::string{"the build stopped at "} + what
+            + ", before any translation unit was built: parsing, semantic "
+              "analysis, HIR, MIR, LIR, assembly and link ran for NONE of the "
+            + std::to_string(sourceCount) + " source file(s)."
+            + kNotMeasuredNotAbsent);
 }
 
 // Stamp `[target=<spec>]` context into every error message emitted
@@ -554,7 +618,19 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                     // a multi-target project may name one
                                     // format that can carry it and one that
                                     // cannot, and the second must fail loud.
-                                    ImageRequest const&    imageRequest) {
+                                    ImageRequest const&    imageRequest,
+                                    // D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS:
+                                    // MEASURE, DO NOT EMIT. Set when a sibling
+                                    // translation unit failed to parse and was
+                                    // excluded, so this program is knowingly
+                                    // incomplete: run the per-unit front half
+                                    // (semantic analysis, HIR, MIR) so its
+                                    // diagnostics reach the operator, then stop
+                                    // BEFORE the first cross-unit step and
+                                    // write nothing. It is never set by a
+                                    // healthy build, so the ordinary path is
+                                    // byte-identical.
+                                    bool                   analysisOnly) {
     // ★★★ [[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]] — EVERY DIAGNOSTIC
     // THIS COMPILE PRODUCES LEAVES IN ORIGIN COORDINATES, WHATEVER TIER MADE IT
     // AND WHICHEVER EXIT IT LEAVES BY.
@@ -724,7 +800,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // per-platform. The CLI single-target path leaves it false ⇒ flat
     // (unchanged). `formatName` already encodes machine+OS, so we don't add a
     // separate `<targetName>` subdir (redundant + bloats the path).
-    auto const ext = parsed->outputExtension(**formatR);
+    auto const ext = outputExtensionFor(**formatR);
     fs::path const outDir = resolveArtifactOutputDir(
         outputDir, parsed->formatName, multiTargetBuild, perFormatOutputSubdir);
     std::error_code ec;
@@ -971,6 +1047,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                      "(assembleAsmUnit)");
                 return std::nullopt;
             }
+            // D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS: the same
+            // measure-only stop the full pipeline takes below, at this tier's
+            // own equivalent point — the assembly unit has been built and every
+            // diagnostic it produced is reported; the LINK is what must not
+            // happen for a knowingly-incomplete program.
+            if (analysisOnly) return std::nullopt;
             // D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER, the STATIC
             // half: this route used to call `linkAndWrite` directly, so a `.a` /
             // `.lib` named on `--resolve-library` was partitioned out of the
@@ -1097,6 +1179,25 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             return std::nullopt;  // ≥1 front-half tier failure — all diagnostics reported
         }
     }
+
+    // ── D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS: THE MEASURE-ONLY STOP ──
+    //
+    // Everything above is PER UNIT: `buildCuMir` ran semantic analysis, HIR and
+    // MIR for each surviving CU and every one of their diagnostics is already
+    // on `reporter`. Everything below is CROSS-UNIT, starting at `mergeCuMirs`,
+    // and this program is knowingly missing a unit — so a "no entry point" or
+    // an unresolved cross-unit symbol from here down would be a complaint about
+    // the EXCLUSION, not about the source. That is the derivative noise the
+    // old run-wide gate was built to avoid, and it is avoided here instead,
+    // one tier lower, having kept the census the old gate deleted.
+    //
+    // ⚠ NO `emitNullNoDiagnostic` HERE, AND THAT IS NOT AN OVERSIGHT. Its
+    // contract is "a null module with no diagnostic behind it is a substrate
+    // bug"; this null has the excluded unit's own parse errors behind it, on
+    // the RUN-WIDE reporter, which is where the caller put them and where the
+    // operator reads them. Emitting the internal-error code here would report a
+    // driver defect for a build that is behaving exactly as designed.
+    if (analysisOnly) return std::nullopt;
 
     // Collect the built modules into the in-order vector the lower/merge path below consumes
     // (every slot is engaged here: N==1 built slot 0 inline, N>1 filled every slot + checked).
@@ -3376,6 +3477,16 @@ int runCusToTargets(
         }
     }
     if (rep.hasErrors()) {
+        // D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS, the FIRST gate in the
+        // chain. This one genuinely CANNOT continue and is not the row's
+        // defect: with no target or format schema there is no pair to compile
+        // AGAINST, so there is nothing to run the later tiers with. What it
+        // owed the reader is the SCOPE of its silence, which it now states.
+        // `sourceFiles`, not `sourcesToBuild`: the source/object partition has
+        // not happened yet at this altitude, and the count the reader needs is
+        // "what you named on the command line", which is exactly this list.
+        emitStoppedBeforeCuBuild(rep, "target/object-format resolution",
+                                 sourceFiles.size());
         drainDiagnosticsToStderr(rep);
         return 1;
     }
@@ -3476,6 +3587,10 @@ int runCusToTargets(
         }
     }
     if (rep.hasErrors()) {
+        // Second gate in the chain, same class as the first and equally
+        // unavoidable: with no grammar there is no front end to parse WITH.
+        emitStoppedBeforeCuBuild(rep, "source-language resolution",
+                                 sourcesToBuild.size());
         drainDiagnosticsToStderr(rep);
         return 1;
     }
@@ -3544,6 +3659,12 @@ int runCusToTargets(
                          "build's own '<targetName>:<formatName>' specs.");
         }
         if (unmatched) {
+            // Third gate in the chain. It rejects the INVOCATION, before any
+            // source is read, so it deletes the same census the two above do
+            // and says so in the same words.
+            emitStoppedBeforeCuBuild(rep, "per-target --resolve-library "
+                                          "validation",
+                                     sourcesToBuild.size());
             drainDiagnosticsToStderr(rep);
             return 1;
         }
@@ -3633,10 +3754,65 @@ int runCusToTargets(
     // (plan 06 V2-4 Part A); `add` keys on the buffer's own id, idempotent on a
     // header shared across trees / builds.
     BufferRegistry bufs;
-    for (auto const& kv : cuByKey) {
-        for (auto const& cu : kv.second) {
+    // ── D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS: THE GATE IS PER-UNIT ──
+    //
+    // ★★★ WHAT USED TO BE HERE, AND WHY IT WAS THE LARGEST DEFECT OF ITS CLASS.
+    // The drain below fed EVERY CU of EVERY build key into one run-wide
+    // reporter, and the next statement was a bare `if (rep.hasErrors())` ->
+    // drain -> `return 1`, commented *"the per-target loop would only produce
+    // derivative noise"*. `compileOneTarget` is the site that runs semantic
+    // analysis, HIR, MIR, LIR, assembly and link — so ONE parse error in ONE
+    // translation unit DELETED the semantic-and-later census for ALL of them.
+    // Not degraded: deleted. The `S_*` / `I_*` / `H_*` / `M_*` families could
+    // not appear at all, and their absence was indistinguishable from their
+    // non-existence. Two registry rows carried a false blocking relationship
+    // because of that inference, and a cycle was ordered around it.
+    //
+    // ★★★ THE SCOPE DECISION, AND IT IS THE REFERENCES OWN VERDICT. ✔MEASURED
+    // 2026-08-27 on a two-TU program (TU-1 a parse error, TU-2 an undeclared
+    // identifier): `gcc 13.3.0 -std=c2x` and `clang 18.1.3 -std=c23` BOTH report
+    // the parse error AND the semantic error, on `-c` and on a real LINK job
+    // alike, and neither writes an artifact. `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO
+    // C` therefore does not merely PERMIT continuing — it REQUIRES it. DSS
+    // reported only TU-1 and was silent about TU-2.
+    //
+    // ★★ SO THE GATE'S SCOPE MOVES FROM THE RUN TO THE UNIT, AND ITS REFUSAL IS
+    // KEPT WHOLE. A unit that failed to parse is EXCLUDED — its broken tree
+    // never reaches a later tier, which is the derivative noise the original
+    // comment was right to avoid. Every unit that DID parse is analysed. And no
+    // artifact is written by any target, because a program missing a
+    // translation unit is not a program: `analysisOnly` stops each target after
+    // the per-CU front half, BEFORE `mergeCuMirs` — the first cross-unit step,
+    // and therefore the first one that could invent a complaint (a missing
+    // entry point, an unresolved cross-unit symbol) out of the EXCLUSION rather
+    // than out of the source. That is exactly where gcc stops: it compiles each
+    // unit and declines to link.
+    //
+    // ⚠ `L_*` AND `K_*` STAY UNMEASURED WHEN A UNIT FAILS, DELIBERATELY, AND
+    // THE NOTICE SAYS SO. Those tiers consume a MERGED program; running them
+    // over a knowingly-incomplete one is how a clean refusal becomes a cascade.
+    // The honest answer is to NAME them as not-run, not to guess at them.
+    std::size_t                       totalCus  = 0;
+    std::size_t                       failedCus = 0;
+    std::map<CuBuildKey, std::size_t> liveCusPerKey;
+    for (auto& kv : cuByKey) {
+        std::vector<CompilationUnit>& keyCus = kv.second;
+        std::vector<char>             cuFailed(keyCus.size(), 0);
+        for (std::size_t ci = 0; ci < keyCus.size(); ++ci) {
+            CompilationUnit const& cu = keyCus[ci];
+            // ★ THE DELTA *AND* THE UNIT'S OWN VERDICT, BOTH, BECAUSE EACH SEES
+            // WHAT THE OTHER CANNOT. `rep.errorCount()` moves when a WARNING is
+            // promoted by `--warnings-as-errors` (the unit's own reporter,
+            // which never saw that policy, still calls itself clean); the
+            // unit's own `hasErrors()` still fires when `rep`'s dedup window
+            // collapses the only error a unit had against an identical earlier
+            // one. The UNION is conservative in the safe direction: a unit that
+            // errored is excluded.
+            auto const errorsBefore = rep.errorCount();
+            bool       failed       = cu.driverDiagnostics().hasErrors();
             copyDiagnostics(cu.driverDiagnostics(), rep);
             for (auto const& tree : cu.trees()) {
+                if (tree.diagnostics().hasErrors()) failed = true;
                 copyDiagnostics(tree.diagnostics(), rep);
                 // Defense-in-depth: a driver-produced tree always has a non-null
                 // source, but `BufferRegistry::add` THROWS on null — guard so a
@@ -3653,15 +3829,53 @@ int runCusToTargets(
             for (auto const& b : cu.auxiliaryBuffers()) {
                 if (b) bufs.add(b);
             }
+            if (rep.errorCount() != errorsBefore) failed = true;
+            cuFailed[ci] = failed ? 1 : 0;
+            ++totalCus;
+            if (failed) ++failedCus;
         }
+        // Compact the survivors to the FRONT, order preserved, so a target can
+        // be handed `span{data(), live}` without a second container. Safe only
+        // BECAUSE the loop above already copied every unit's diagnostics into
+        // `rep` and every unit's buffers into `bufs` (which owns them by
+        // `shared_ptr`) — the husks left in the tail are never read again.
+        std::size_t live = 0;
+        for (std::size_t ci = 0; ci < keyCus.size(); ++ci) {
+            if (cuFailed[ci] != 0) continue;
+            if (ci != live) keyCus[live] = std::move(keyCus[ci]);
+            ++live;
+        }
+        liveCusPerKey.emplace(kv.first, live);
     }
-    // If parsing already failed, the per-target loop would only produce derivative noise.
-    if (rep.hasErrors()) {
+
+    if (failedCus != 0) {
+        emitPhasesNotRun(
+            rep,
+            std::to_string(failedCus) + " of " + std::to_string(totalCus)
+                + " translation unit(s) failed to parse and were EXCLUDED from "
+                  "the later tiers; semantic analysis, HIR and MIR DID run for "
+                  "the other "
+                + std::to_string(totalCus - failedCus)
+                + ". The cross-unit tiers -- module merge, LIR, assembly "
+                  "and link -- ran for NOTHING, and NO ARTIFACT WAS WRITTEN, "
+                  "because a program missing a translation unit is not a "
+                  "program."
+                + kNotMeasuredNotAbsent);
+    } else if (rep.hasErrors()) {
+        // A driver-tier error with no failing unit behind it. There is nothing
+        // to exclude, so there is nothing to continue WITH — the run stops, and
+        // says so rather than leaving the reader to infer it.
+        emitStoppedBeforeCuBuild(rep, "the translation-unit build",
+                                 sourcesToBuild.size());
         drainDiagnosticsToStderr(rep, bufs);
         return 1;
     }
 
-    int exitCode = 0;
+    // A failed unit fails the BUILD, exactly as before this change: the only
+    // thing that moved is how much of the program gets MEASURED on the way to
+    // that verdict.
+    bool const analysisOnly = failedCus != 0;
+    int        exitCode     = analysisOnly ? 1 : 0;
     // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: where a cache MISS compiles
     // its archive before it can be stored, and where the build links it from
     // when the store cannot write. Declared HERE so its lifetime covers every
@@ -3687,6 +3901,26 @@ int runCusToTargets(
         std::string const& spec = targets[i];
         // Route this target to the CUs built for its object-format-kind (c9).
         std::vector<CompilationUnit> const& cus = cuByKey.at(keyPerTarget[i]);
+        // D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS: the units that PARSED,
+        // compacted to the front above.
+        //
+        // ⚠ `!cus.empty() && liveCus == 0`, NEVER `liveCus == 0` ALONE, AND THE
+        // DIFFERENCE IS A REGRESSION THIS CAUGHT. Zero units is ALSO the normal,
+        // successful shape of an ALL-OBJECT LINK (`--compile a.obj b.obj`,
+        // D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE): nothing is parsed because
+        // there is no source, and `compileOneTarget` must still run to link the
+        // pre-assembled objects. The bare test conflated "every unit failed"
+        // with "there were never any units" and silently stopped linking them —
+        // ✔MEASURED as four reds in `program/test_static_link`
+        // (`ObjectInputCompileSurface.*`), including one that turned a
+        // fail-loud refusal into rc=0.
+        //
+        // With units present and none surviving there is genuinely nothing to
+        // analyse, and skipping is not a silent drop: `exitCode` is already 1
+        // and every excluded unit is already named in the stream by its own
+        // parse errors.
+        std::size_t const liveCus = liveCusPerKey.at(keyPerTarget[i]);
+        if (!cus.empty() && liveCus == 0) continue;
         // Per-target scratch reporter inheriting `rep`'s POLICY axes (suppress / overrides
         // / warningsAsErrors) but with the CAP/DEDUP axes RELAXED — those run-wide limits
         // are enforced once at `rep` during merge (silent-failure-hunter F9 / H1 fix; see
@@ -3823,11 +4057,11 @@ int runCusToTargets(
         // CU was parsed under — never the invocation's, which no longer
         // exists as a single value.
         auto artifact = compileOneTarget(
-            std::span<CompilationUnit const>{cus.data(), cus.size()},
+            std::span<CompilationUnit const>{cus.data(), liveCus},
             *grammarPerTarget[i], sourceStem, spec, scratch,
             outputDir, /*multiTargetBuild*/ targets.size() > 1u,
             artifactName, perFormatOutputSubdir, compileOpts,
-            executor, jobsOverride, imageRequest);
+            executor, jobsOverride, imageRequest, analysisOnly);
         mergeWithTargetContext(scratch, spec, rep);
         // AP6: a target counts as having produced an artifact only if it BOTH
         // wrote one and reported no error — the same conjunction the exit code
@@ -4648,62 +4882,29 @@ int Program::transpile(
     return 1;
 }
 
-// FF11: declare the language's SYSTEM include dirs (its
-// `semantics.shippedLibDirs`, the /usr/include analogue) on `builder`
-// so the angle form `#include <h>` resolves against them. Each config
-// string is a subdirectory under `src/dss-config/`; `findShippedConfigDir`
-// resolves it with the SHARED precedence — `$DSS_CONFIG_ROOT` first, then
-// the 8-level cwd walk — so it works from repo root, build/, a nested
-// ctest cwd, or anywhere at all when the override is set. A dir that
-// resolves NOWHERE is skipped — a header miss then hard-fails downstream
-// with F_ShippedHeaderNotFound, which is the correct fail-loud surface
-// (vs. silently swallowing here). NO language branch: the dirs come
-// entirely from the schema's per-language config.
+// ✅ `resolveSystemDirs` / `applySystemDirs` WERE DEFINED HERE AND HAVE MOVED --
+// D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS.
 //
-// ⚠ THIS USED TO BE A PRIVATE COPY OF THE WALK THAT NEVER READ THE
-// OVERRIDE, and the comment claimed it mirrored `findShippedConfig` while
-// omitting the one branch that makes discovery cwd-independent. MEASURED:
-// same binary, `DSS_CONFIG_ROOT` set in BOTH arms, `#include <stdio.h>` —
-// cwd inside the repo gave rc 0, cwd `C:\` gave `error[F001A]: got
-// stdio.h`. The shipped CLI could not resolve an angle include from any
-// working directory outside its own source tree. Do not re-open a local
-// walk here.
-// The resolved system-include dirs for `grammar`, as absolute paths in the
-// language's declared order.
+// The FF11 walk that turned a language's `semantics.shippedLibDirs` into
+// absolute system-include dirs lived at `dss` namespace scope in THIS file,
+// published by nothing but a forward declaration at the top of it. Two other
+// channels needed the same answer and could not have it: the LSP built every
+// open document's `UnitBuilder` with NO system dirs at all, and
+// `dump_predefined_macros.cpp` re-walked `shippedLibDirs` with a private loop.
+// One fact, three sites, and the site with no copy is the one a user sat in.
 //
-// ★ SPLIT OUT OF `applySystemDirs` SO THE ANSWER CAN BE COMPUTED ONCE. Every
-// call walks the filesystem: `findShippedConfigDir` reads the environment and
-// probes up to eight ancestor directories PER declared dir. That was being
-// re-done for every source file, and the answer is identical for every file
-// built under one `CuBuildKey` — a language's `shippedLibDirs` and the config
-// root are both fixed for the whole invocation. The multi-TU CU build now
-// resolves once and hands the result to each unit, which is both less work and
-// one less piece of ambient filesystem state consulted from inside a
-// concurrent job.
-[[nodiscard]] std::vector<fs::path> resolveSystemDirs(GrammarSchema const& grammar) {
-    std::vector<fs::path> out;
-    auto const&           dirs = grammar.semantics().shippedLibDirs;
-    if (dirs.empty()) return out;
-    out.reserve(dirs.size());
-    std::error_code ec;
-    for (std::string const& sub : dirs) {
-        auto const resolved = findShippedConfigDir(sub);
-        if (!resolved) continue;   // fail loud downstream, not here
-        // ABSOLUTE, because `ResolutionContext::systemDirs` documents its
-        // dirs as absolute: the cwd walk produced that for free, but a
-        // RELATIVE `DSS_CONFIG_ROOT` (permitted — see config_path_walk.hpp)
-        // would not. Same idiom as `applyIncludeDirs` below: on an `absolute`
-        // failure keep the raw path rather than drop the dir.
-        fs::path const abs = fs::absolute(*resolved, ec);
-        out.push_back(ec ? *resolved : abs);
-        ec.clear();
-    }
-    return out;
-}
-
-void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar) {
-    for (auto const& d : resolveSystemDirs(grammar)) builder.addSystemDir(d);
-}
+//   * the WALK          -> `dss::resolveSystemDirs(GrammarSchema const&)`,
+//                          `core/types/config_path_walk.hpp`, beside the
+//                          `findShippedConfigDir` it wraps;
+//   * the BUILDER BIND  -> `dss::applySystemDirs(UnitBuilder&, GrammarSchema const&)`,
+//                          `analysis/compilation_unit/compilation_unit.hpp`,
+//                          beside `UnitBuilder::addSystemDir`.
+//
+// Both are already reachable from here: this file includes both headers. Do NOT
+// re-open a local copy -- the whole history of this seam is copies drifting
+// ([[D-PROGRAM-APPLY-SYSTEM-DIRS-IGNORED-DSS-CONFIG-ROOT]], where the driver's
+// private walk never read `$DSS_CONFIG_ROOT` and the shipped CLI could not
+// resolve an angle include from any cwd outside its own source tree).
 
 // SQLite-testfixture arc C3: thread the CLI `-I` dirs (the C quote-include
 // search path, `Options::includeDirs`) onto `builder` via `addIncludeDir`. Each

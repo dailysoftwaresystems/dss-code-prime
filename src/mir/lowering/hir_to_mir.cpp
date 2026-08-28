@@ -1,6 +1,7 @@
 #include "mir/lowering/hir_to_mir.hpp"
 
 #include "core/types/aggregate_abi.hpp"
+#include "core/types/bit_int_value.hpp"   // the ONE `_BitInt` padding policy (bitIntPaddingTracksSignBit)
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"  // c103: BuiltinLowering (BuiltinCall payload)
@@ -207,6 +208,15 @@ struct Lowerer {
     // `fieldByteOffset` (member-access offset resolution) and
     // `aggregateByteSize` (aggregate-local Alloca sizing).
     std::unordered_map<std::uint32_t, StructLayout> layoutCache_;
+    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the same memo for the OPERAND
+    // question (`operandLayout`), read by `elementStride` and the MIR
+    // `SizeOf`/`AlignOf` cases. A SEPARATE map on purpose — the two questions have
+    // different answers for `void`/a function type, so one map keyed by TypeId
+    // could not hold both, and merging them would make whichever caller asked
+    // FIRST decide what every later caller sees. `operandLayout` is pure and
+    // delegates to the same `computeLayout`, so this is invariant within the CU
+    // and never cleared, exactly like its twin.
+    std::unordered_map<std::uint32_t, StructLayout> operandLayoutCache_;
     // FC17.5 F2 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): per-MODULE byte-content
     // memo for `materializeStringLiteralGlobal` — (interned array TypeId.v,
     // exact byte content) → the already-minted rodata global's SymbolId. C
@@ -869,20 +879,39 @@ struct Lowerer {
                            interner.primitive(compute));
     }
 
-    // Mask `raw` (typed `ty`, whose compute width is B bits) to the low N bits: the
-    // signed sign-extend (Shl(B-N) then arithmetic AShr(B-N)) or the unsigned
-    // zero-extend (And with (1<<N)-1). A no-op when N==B (a _BitInt(32)/_BitInt(64)
-    // whose native op already wraps at the full width). Reuses the bit-field
-    // primitive's exact shift+mask sequence.
+    // ★★ THE ONE `_BitInt` MASK EMITTER, at every width and both tiers
+    // (D-CSUBSET-BITINT-PADDING-POLICY-HAS-THREE-OWNERS). Mask `raw` (typed `ty`,
+    // whose compute width is B bits) to the low `n` bits, re-establishing the
+    // container's declared padding: the sign-tracking form (Shl(B-n) then
+    // ARITHMETIC AShr(B-n) — the padding is materialized FROM bit n-1) or the
+    // zero form (And with (1<<n)-1). A no-op when n==B (a `_BitInt(32)`/
+    // `_BitInt(64)` whose native op already wraps at the full width). Reuses the
+    // bit-field primitive's exact shift+mask sequence.
+    //
+    // ★ WHICH FORM IS NOT DECIDED HERE. `bitIntPaddingTracksSignBit` (core/types/
+    // bit_int_value.hpp) owns the padding policy for every tier — this emitter, the
+    // host `BitIntValue::maskTopLimb`, and the static-image producer's
+    // `paddingByte()`. Restating "signed ⇒ sign-extend" at each of the three is
+    // exactly the duplicated truth table that anchor names, and it is the one shape
+    // whose divergence is a SILENT MISCOMPILE (the static image is read back by the
+    // code this function emits), not a refusal.
+    //
+    // ★ THE WIDE TIER CALLS THIS TOO. `maskTopLimb` — the N>64 top-limb clean-up —
+    // used to carry its own copy of the same Shl/AShr-vs-And choice; it is now
+    // `bitIntMask(top, hb, signd, 64, i64Ty())`. ⓘ The shift constant is
+    // materialized ONCE and used by BOTH shifts. That is the wide spelling, which
+    // was already right; the narrow one built the SAME constant twice (`addConst`
+    // does not dedupe), so consolidating onto one emitter also drops one redundant
+    // `Const` per narrow signed mask. ✔MEASURED — the wide functions' bytes are
+    // unchanged and the narrow ones lose exactly that instruction.
     [[nodiscard]] MirInstId
     bitIntMask(MirInstId raw, std::int64_t n, bool signd, int B, TypeId ty) {
         if (n >= B) return raw;
-        if (signd) {
-            MirInstId const s1 = constIntOfType(B - n, ty);
-            std::array<MirInstId, 2> a1{raw, s1};
+        if (bitIntPaddingTracksSignBit(signd)) {
+            MirInstId const sh = constIntOfType(B - n, ty);
+            std::array<MirInstId, 2> a1{raw, sh};
             MirInstId const shl = mir.addInst(MirOpcode::Shl, a1, ty);
-            MirInstId const s2 = constIntOfType(B - n, ty);
-            std::array<MirInstId, 2> a2{shl, s2};
+            std::array<MirInstId, 2> a2{shl, sh};
             return mir.addInst(MirOpcode::AShr, a2, ty);
         }
         std::uint64_t const mask = (n >= 64) ? ~0ull : ((1ull << n) - 1);
@@ -1130,11 +1159,22 @@ struct Lowerer {
     }
 
     // The TOP-limb mask — the wide analog of C1's `bitIntMask`, applied to ONE limb.
-    // The highest limb keeps `hb = ((N-1)%64)+1` significant bits; the rest are 0
-    // (unsigned) or a sign-extension of bit hb-1 (signed). L1: at hb==64 (N a multiple
-    // of 64) the top limb is ALREADY full-width — a NO-OP (unsigned `(1<<64)-1` is UB;
-    // signed shift-by-0 is identity). Idempotent on an already-clean limb, so a
-    // producer may always end here. `slot` is the result's Ptr<BitInt(N)>.
+    // The highest limb keeps `hb = ((N-1)%64)+1` significant bits; the rest carry the
+    // container's declared padding. L1: at hb==64 (N a multiple of 64) the top limb is
+    // ALREADY full-width — a NO-OP (an unsigned `(1<<64)-1` mask is UB; a signed
+    // shift-by-0 is identity). Idempotent on an already-clean limb, so a producer may
+    // always end here. `slot` is the result's Ptr<BitInt(N)>.
+    //
+    // ★ IT NO LONGER SPELLS THE MASK ITSELF (D-CSUBSET-BITINT-PADDING-POLICY-HAS-THREE-OWNERS).
+    // This function used to carry its own `if (signd) Shl/AShr else And` — the SAME
+    // choice `bitIntMask` makes, written a second time in this same file, so the two
+    // could drift on a policy change and nothing would catch it. A top limb is just
+    // an i64 masked to its low `hb` bits, which is exactly `bitIntMask(top, hb,
+    // signd, /*B=*/64, i64Ty())`: at hb==64 that emitter's own `n >= B` guard is the
+    // L1 no-op, and each arm is instruction-for-instruction what this wrote (the ONE
+    // reused shift constant included — see `bitIntMask`'s note). ⚠ `wideIntWidthBits`
+    // / `wideIntIsSigned` are the WIDE facade accessors (they serve I128/U128 too, on
+    // which the BitInt-only interner accessors abort), so they stay.
     [[nodiscard]] bool maskTopLimb(MirInstId slot, TypeId bitIntTy) {
         std::int64_t const n  = wideIntWidthBits(interner, bitIntTy);
         bool const signd      = wideIntIsSigned(interner, bitIntTy);
@@ -1142,15 +1182,7 @@ struct Lowerer {
         if (hb == 64) return true;                      // L1: full limb — nothing to clear
         MirInstId const topAddr = limbAddrConst(slot, wideLimbCount(bitIntTy) - 1);
         MirInstId const top     = loadLimb(topAddr);
-        MirInstId masked;
-        if (signd) {
-            // Sign-extend bit hb-1 across [hb,64): Shl(64-hb) then arithmetic AShr(64-hb).
-            MirInstId const sh = ci64(64 - hb);
-            masked = i64bin(MirOpcode::AShr, i64bin(MirOpcode::Shl, top, sh), sh);
-        } else {
-            masked = i64bin(MirOpcode::And, top,
-                            ci64(static_cast<std::int64_t>((1ull << hb) - 1)));
-        }
+        MirInstId const masked  = bitIntMask(top, hb, signd, /*B=*/64, i64Ty());
         if (!masked.valid()) return false;
         storeLimb(masked, topAddr);
         return true;
@@ -1860,6 +1892,261 @@ struct Lowerer {
         return maskTopLimb(dst, resultTy);                          // re-mask SIGNED (sign-ext)
     }
 
+    // ════ WIDE INTEGER ↔ `double` (D-CSUBSET-INT128-FLOAT-CONV) ═════════════════
+    // The three emitters below realize C 6.3.1.4 in BOTH directions for a wide
+    // integer. They replaced a REFUSAL, and the refusal existed for a real reason
+    // the row states: "the naive scalar path would fill only limb 0 (wrong sign,
+    // wrong value, dropped upper limbs)" — so a silent wrong value here is a
+    // miscompile, and correctness is the whole bar. Every step below is EXACT or
+    // CORRECTLY ROUNDED, and the argument for each is written where it is used.
+    //
+    // ★ NO FLOATING CONSTANT IS MATERIALIZED ANYWHERE. Every constant these need
+    // (0.0, ±1.0, 2^k) is minted by converting an INTEGER — `SIToFP(0)`,
+    // `SIToFP(1-2s)`, `UIToFP(1 << k)` — because a float literal in a function body
+    // lowers through the anonymous-module-global rodata path (see the Literal arm's
+    // note), and a conversion emitter has no business minting data items. Every one
+    // of them is exactly representable, so the trick costs nothing in precision.
+
+    // Leading-zero count over the WHOLE limb array (64 · limbCount bits), as i64.
+    // MS→LS scan: add each limb's `Clz` until the first NON-ZERO limb is seen, then
+    // stop adding. `Clz` is DEFINED at 0 = 64 (mir_opcode.hpp), which is what makes
+    // an all-zero prefix accumulate exactly 64 per limb. Branchless: the "have we
+    // stopped" flag multiplies the addend, so the loop body has no CFG of its own.
+    // ⓘ A `_BitInt(N)` whose top limb is partial is already masked by every producer
+    // (`maskTopLimb`), so its padding bits are zero and they are COUNTED — callers
+    // therefore read significance against the limb CAPACITY (64·limbCount), never
+    // against N. Both callers do exactly that.
+    [[nodiscard]] MirInstId emitWideClz(MirInstId srcAddr, TypeId wideTy) {
+        std::int64_t const limbCount = wideLimbCount(wideTy);
+        MirInstId const acc  = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        MirInstId const done = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!acc.valid() || !done.valid()) return InvalidMirInst;
+        storeLimb(ci64(0), acc);
+        storeLimb(ci64(0), done);
+        if (!emitLimbLoop(limbCount, [&](MirInstId i) {
+                // MS→LS: limb index (limbCount-1) - i.
+                MirInstId const idx = i64bin(MirOpcode::Sub, ci64(limbCount - 1), i);
+                MirInstId const v   = loadLimb(limbAddrRuntime(srcAddr, idx));
+                MirInstId const lz  = i64un(MirOpcode::Clz, v);
+                MirInstId const d   = loadLimb(done);
+                // acc += (1 - done) * lz   — contributes only while still all-zero.
+                MirInstId const keep = i64bin(MirOpcode::Sub, ci64(1), d);
+                MirInstId const add  = i64bin(MirOpcode::Mul, keep, lz);
+                if (!add.valid()) return false;
+                storeLimb(i64bin(MirOpcode::Add, loadLimb(acc), add), acc);
+                MirInstId const nz = zextCmp(MirOpcode::ICmpNe, v, ci64(0));
+                if (!nz.valid()) return false;
+                storeLimb(i64bin(MirOpcode::Or, d, nz), done);
+                return true;
+            }))
+            return InvalidMirInst;
+        return loadLimb(acc);
+    }
+
+    // `max(v, 0)` and `min(v, hi)` on an i64, BRANCHLESS — an arithmetic shift builds
+    // the mask (`AShr(x,63)` is all-ones exactly when x < 0). Used to clamp the
+    // shift amounts below; a CFG diamond per clamp would triple the block count of
+    // every conversion for no gain.
+    [[nodiscard]] MirInstId i64ClampLow0(MirInstId v) {
+        MirInstId const m = i64bin(MirOpcode::AShr, v, ci64(63));   // v<0 ? ~0 : 0
+        return i64bin(MirOpcode::And, v, i64un(MirOpcode::Not, m));
+    }
+    [[nodiscard]] MirInstId i64ClampHigh(MirInstId v, std::int64_t hi) {
+        MirInstId const diff = i64bin(MirOpcode::Sub, v, ci64(hi));  // v - hi
+        MirInstId const m    = i64bin(MirOpcode::AShr, diff, ci64(63));
+        return i64bin(MirOpcode::Add, ci64(hi), i64bin(MirOpcode::And, diff, m));
+    }
+
+    // `2^k` as an F64, for a RUNTIME k ≥ 0, EXACT. One `UIToFP(1 << e)` factor per
+    // 62 bits of range, each factor's exponent clamped into [0, 62] so the chain's
+    // exponents SUM to k whenever k ≤ 62·factors. 62 rather than 63 keeps every
+    // shifted i64 POSITIVE, so the factor is the same value whichever int→float
+    // opcode a future reader expects; a product of powers of two is exact until it
+    // overflows, and an overflow to +inf is the arithmetically correct answer for a
+    // magnitude a `double` cannot hold. `factors` is capped at 18 (18·62 = 1116 >
+    // 1024 = the double exponent ceiling), so a `_BitInt` of any width — up to
+    // `kBitIntMaxWidth` — emits a bounded chain rather than one factor per limb.
+    [[nodiscard]] MirInstId emitPow2F64(MirInstId kI64, std::int64_t maxK) {
+        TypeId const f64 = interner.primitive(TypeKind::F64);
+        std::int64_t factors = (maxK + 61) / 62;
+        if (factors < 1)  factors = 1;
+        if (factors > 18) factors = 18;
+        MirInstId pow = InvalidMirInst;
+        for (std::int64_t f = 0; f < factors; ++f) {
+            MirInstId const raw = i64bin(MirOpcode::Sub, kI64, ci64(62 * f));
+            MirInstId const e   = i64ClampHigh(i64ClampLow0(raw), 62);
+            MirInstId const p2  = i64bin(MirOpcode::Shl, ci64(1), e);
+            if (!p2.valid()) return InvalidMirInst;
+            std::array<MirInstId, 1> c{p2};
+            MirInstId const fv = mir.addInst(MirOpcode::UIToFP, c, f64);
+            if (!fv.valid()) return InvalidMirInst;
+            if (!pow.valid()) { pow = fv; continue; }
+            std::array<MirInstId, 2> m{pow, fv};
+            pow = mir.addInst(MirOpcode::FMul, m, f64);
+            if (!pow.valid()) return InvalidMirInst;
+        }
+        return pow;
+    }
+
+    // wide integer → `double`, CORRECTLY ROUNDED, for any limb count.
+    //
+    // ★★ THE ROUNDING ARGUMENT, because "close enough" is the failure mode this
+    // whole emitter exists to avoid. The obvious two-step — `(double)hi · 2^64 +
+    // (double)lo` — rounds TWICE and can land a full ulp off the correctly-rounded
+    // result. Instead the value is first reduced to its top 64 bits with a STICKY
+    // bit ORed into the low bit (ROUND-TO-ODD), and only then handed to the
+    // hardware's 64→53 round-to-nearest-even. Round-to-odd at an intermediate
+    // precision p' ≥ p+2 followed by round-to-nearest at p is provably equal to
+    // rounding the exact value once at p (Boldo–Melquiond); here p' = 64 and
+    // p = 53, so 64 ≥ 55 holds with room. The final scaling by 2^shift is exact
+    // (a power of two), so nothing after the single rounding perturbs it.
+    //
+    // Shape, with `sd` = the number of significant bits of the magnitude:
+    //     shift = max(sd - 64, 0)
+    //     t     = mag >> shift            (≤ 64 significant bits, top bit set when
+    //                                      shift > 0)
+    //     sticky= (t << shift) != mag     (anything dropped?)
+    //     d     = (double)(limb0(t) | sticky) · 2^shift
+    // `shift == 0` (a magnitude that already fits in 64 bits) falls out of the SAME
+    // expression with sticky 0 — no special case, and ZERO needs none either: clz is
+    // the full capacity, sd is 0, shift is 0, the limb is 0, and 0.0 · 1.0 is +0.0.
+    // The sign is applied as a multiplication by ±1.0, which is exact and keeps the
+    // whole emitter branch-free.
+    [[nodiscard]] MirInstId emitFloatFromWide(MirInstId srcAddr, TypeId wideTy) {
+        TypeId const f64 = interner.primitive(TypeKind::F64);
+        std::int64_t const limbCount = wideLimbCount(wideTy);
+        std::int64_t const capacity  = 64 * limbCount;
+        std::int64_t const n         = wideIntWidthBits(interner, wideTy);
+        bool const signd             = wideIntIsSigned(interner, wideTy);
+        // CRIT-B precedent (`emitWideDivMod`): the MAGNITUDE rides an UNSIGNED wide
+        // type, because `emitWideShift`'s arithmetic arm and `emitWideOrder`'s top
+        // limb both bake signedness into their tails and would corrupt a magnitude
+        // ≥ 2^(n-1). Only the sign fixup reads the signed type.
+        TypeId const uType = interner.bitInt(n, /*isSigned=*/false);
+        MirInstId mag = srcAddr;
+        MirInstId sgn = ci64(0);
+        if (signd) {
+            MirInstId const um = freshAggregateTemp(uType);
+            if (!um.valid()) return InvalidMirInst;
+            sgn = signBitI64(srcAddr, wideTy);
+            if (!sgn.valid() || !emitWideCondNeg(um, srcAddr, sgn, uType))
+                return InvalidMirInst;
+            mag = um;
+        }
+        MirInstId const clz = emitWideClz(mag, uType);
+        if (!clz.valid()) return InvalidMirInst;
+        MirInstId const sd    = i64bin(MirOpcode::Sub, ci64(capacity), clz);
+        MirInstId const shift = i64ClampLow0(i64bin(MirOpcode::Sub, sd, ci64(64)));
+        if (!shift.valid()) return InvalidMirInst;
+        MirInstId const t    = freshAggregateTemp(uType);
+        MirInstId const back = freshAggregateTemp(uType);
+        if (!t.valid() || !back.valid()) return InvalidMirInst;
+        if (!emitWideShift(/*isLeft=*/false, /*isArith=*/false, t, mag, shift, uType))
+            return InvalidMirInst;
+        if (!emitWideShift(/*isLeft=*/true, /*isArith=*/false, back, t, shift, uType))
+            return InvalidMirInst;
+        MirInstId const differs = emitWideEq(/*isNe=*/true, back, mag, uType);
+        if (!differs.valid()) return InvalidMirInst;
+        MirInstId const sticky = zextBoolToI64(differs);
+        MirInstId const t0 =
+            i64bin(MirOpcode::Or, loadLimb(limbAddrConst(t, 0)), sticky);
+        if (!t0.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> cv{t0};
+        MirInstId d = mir.addInst(MirOpcode::UIToFP, cv, f64);
+        if (!d.valid()) return InvalidMirInst;
+        MirInstId const pow = emitPow2F64(shift, capacity);
+        if (!pow.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> sc{d, pow};
+        d = mir.addInst(MirOpcode::FMul, sc, f64);
+        if (!d.valid()) return InvalidMirInst;
+        if (!signd) return d;
+        // ±1.0 from an INTEGER `1 - 2·signBit`, then one exact multiplication.
+        MirInstId const sgnI =
+            i64bin(MirOpcode::Sub, ci64(1), i64bin(MirOpcode::Mul, ci64(2), sgn));
+        if (!sgnI.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> sv{sgnI};
+        MirInstId const sgnF = mir.addInst(MirOpcode::SIToFP, sv, f64);
+        if (!sgnF.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> mm{d, sgnF};
+        return mir.addInst(MirOpcode::FMul, mm, f64);
+    }
+
+    // `double` → wide integer, TRUNCATING toward zero (C 6.3.1.4p1), EXACT.
+    //
+    // Limb j takes `trunc(|d| / 2^(64j))` and the scaled-back product is subtracted
+    // before the next limb, MS→LS. Every step is exact and the argument is short:
+    //   * `q = |d| / 2^(64j)` is a scaling by a power of two — exact (no rounding).
+    //   * `trunc(q)` is `FPToUI` → u64 → `UIToFP` back. It round-trips exactly
+    //     because truncating a `double` only CLEARS low bits, so the integer keeps
+    //     ≤ 53 significant bits and converts back with no rounding.
+    //   * `|d| - trunc(q)·2^(64j)` is exact: both operands are multiples of
+    //     `ulp(|d|)` and the difference is smaller in magnitude than either.
+    // So the limbs are the exact base-2^64 digits of `trunc(|d|)`.
+    //
+    // ★ THE LIMB COUNT IS CAPPED AT 16, AND THAT IS A PROPERTY OF `double`, NOT A
+    // SHORTCUT. A finite `double` is < 2^1024, so every limb from index 16 up is
+    // necessarily ZERO — the destination is zeroed first and those limbs are simply
+    // never written. This is what lets a `_BitInt` of ANY width convert with a
+    // bounded, unrolled emission instead of one division per limb.
+    // ⚠ OUT-OF-RANGE AND NaN ARE UNDEFINED BEHAVIOUR (C 6.3.1.4p1) and are NOT
+    // diagnosed here — the references do not diagnose them either, and inventing a
+    // trap would be an extension above the union. What this must never do is
+    // produce a plausible wrong value for an IN-range operand, which is the whole
+    // reason the exactness argument above is spelled out rather than asserted.
+    [[nodiscard]] bool emitWideFromFloat(MirInstId dst, MirInstId srcVal,
+                                         TypeId wideTy) {
+        TypeId const f64 = interner.primitive(TypeKind::F64);
+        std::int64_t const limbCount = wideLimbCount(wideTy);
+        bool const signd             = wideIntIsSigned(interner, wideTy);
+        if (!zeroWide(dst, limbCount)) return false;
+        auto f64bin = [&](MirOpcode op, MirInstId a, MirInstId b) {
+            std::array<MirInstId, 2> o{a, b};
+            return mir.addInst(op, o, f64);
+        };
+        auto toF64 = [&](MirOpcode op, MirInstId a) {
+            std::array<MirInstId, 1> o{a};
+            return mir.addInst(op, o, f64);
+        };
+        // |d| and the sign, both branchless: `d < 0.0` → 0/1 → the ±1.0 factor.
+        MirInstId const fzero = toF64(MirOpcode::SIToFP, ci64(0));
+        if (!fzero.valid()) return false;
+        MirInstId const isNeg = zextCmp(MirOpcode::FCmpOlt, srcVal, fzero);
+        if (!isNeg.valid()) return false;
+        MirInstId const sgnI =
+            i64bin(MirOpcode::Sub, ci64(1), i64bin(MirOpcode::Mul, ci64(2), isNeg));
+        MirInstId const sgnF = toF64(MirOpcode::SIToFP, sgnI);
+        if (!sgnF.valid()) return false;
+        MirInstId cur = f64bin(MirOpcode::FMul, srcVal, sgnF);   // |d|, exact
+        if (!cur.valid()) return false;
+        std::int64_t const top = (limbCount < 16 ? limbCount : 16);
+        for (std::int64_t j = top - 1; j >= 0; --j) {
+            MirInstId const scale = emitPow2F64(ci64(64 * j), 64 * j);
+            if (!scale.valid()) return false;
+            MirInstId const q = f64bin(MirOpcode::FDiv, cur, scale);
+            if (!q.valid()) return false;
+            std::array<MirInstId, 1> qi{q};
+            MirInstId const digit = mir.addInst(MirOpcode::FPToUI, qi, i64Ty());
+            if (!digit.valid()) return false;
+            storeLimb(digit, limbAddrConst(dst, j));
+            if (j == 0) break;                       // nothing left to subtract
+            MirInstId const backF = toF64(MirOpcode::UIToFP, digit);
+            if (!backF.valid()) return false;
+            cur = f64bin(MirOpcode::FSub, cur,
+                         f64bin(MirOpcode::FMul, backF, scale));
+            if (!cur.valid()) return false;
+        }
+        if (signd) {
+            // Two's-complement negate IN PLACE when the source was negative. The
+            // magnitude is already the exact truncated value, so this is the same
+            // conditional negate `emitWideDivMod` applies to its quotient.
+            MirInstId const neg = freshAggregateTemp(wideTy);
+            if (!neg.valid()) return false;
+            if (!emitWideCondNeg(neg, dst, isNeg, wideTy)) return false;
+            if (!copyWide(dst, neg, limbCount)) return false;
+        }
+        return maskTopLimb(dst, wideTy);
+    }
+
     // The plain integer kind a scalar SOURCE projects to (enum→underlying, narrow
     // `_BitInt`→container, else its own kind) — the scalar feeding a wide conversion
     // or a shift count. A WIDE `_BitInt` source is handled separately by the caller
@@ -2111,18 +2398,52 @@ struct Lowerer {
         // the correct multi-limb FP->limbs conversion lands in a later cycle. NARROW
         // (N<=64) float->_BitInt is unaffected — it never reaches materializeWideCast.
         if (srcTy.valid() && isFloatingKind(interner.kind(srcTy))) {
-            // D-CSUBSET-UINT128-TYPE (TF-C94, message text only — the REFUSAL stands):
-            // `__int128 x = (__int128)d;` MEASURED as "…to a `_BitInt` wider than 64
-            // bits…", naming a type absent from the source. `wideIntSpelling` names
-            // the one the user actually wrote. The deferral itself is unchanged and
-            // covers all three wide kinds, so both anchors are cited.
-            diagnoseCode(node, DiagnosticCode::S_BitIntWideFloatConvUnsupported,
-                std::format(
-                    "conversion from a floating type to {} is not yet supported — the "
-                    "multi-limb float-to-wide-integer conversion lands in a later cycle "
-                    "(D-CSUBSET-UINT128-TYPE / D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV)",
-                    wideIntSpelling(t)));
-            return InvalidMirInst;
+            // ── D-CSUBSET-INT128-FLOAT-CONV: THIS IS NO LONGER A REFUSAL ────────
+            // `emitWideFromFloat` realizes C 6.3.1.4p1's truncating conversion
+            // exactly, for any limb count (see its own exactness argument). What
+            // the refusal protected against — "the naive scalar path fills only
+            // limb 0" — is precisely what that emitter does not do.
+            //
+            // A NARROWER float source (F16/F32) is EXACT under `FPExt` to F64, so
+            // it converts through the same emitter rather than through a second
+            // one: every F32 value is a F64 value, so no rounding is introduced and
+            // there is only ever ONE rounding step in the whole conversion.
+            // F80/F128 are NOT widened — they carry more precision than F64, so
+            // routing them through it would round FIRST and truncate second, which
+            // can differ from truncating the true value. They keep the loud
+            // refusal, now under the long-double anchor that actually owns them.
+            TypeKind const srcK = interner.kind(srcTy);
+            if (srcK == TypeKind::F80 || srcK == TypeKind::F128) {
+                diagnoseCode(node, DiagnosticCode::S_BitIntWideFloatConvUnsupported,
+                    std::format(
+                        "conversion from a long double (F80/F128) to {} is not "
+                        "supported — the F64 path would round before truncating and "
+                        "could differ from the true value "
+                        "(D-CSUBSET-INT128-FLOAT-CONV / D-CSUBSET-LONG-DOUBLE)",
+                        wideIntSpelling(t)));
+                return InvalidMirInst;
+            }
+            MirInstId srcVal = lowerExpr(kids[0]);
+            if (!srcVal.valid()) return InvalidMirInst;
+            TypeId const f64 = interner.primitive(TypeKind::F64);
+            if (srcK != TypeKind::F64) {
+                std::array<MirInstId, 1> e{srcVal};
+                srcVal = mir.addInst(MirOpcode::FPExt, e, f64);   // exact widening
+                if (!srcVal.valid()) return InvalidMirInst;
+            }
+            MirInstId const slot = freshAggregateTemp(t);
+            if (!slot.valid()) {
+                unsupported(node, "wide integer result of a float conversion "
+                                   "requires a sizeable layout");
+                return InvalidMirInst;
+            }
+            if (!emitWideFromFloat(slot, srcVal, t)) {
+                unsupported(node, std::format(
+                    "float → {} conversion could not be emitted "
+                    "(D-CSUBSET-INT128-FLOAT-CONV)", wideIntSpelling(t)));
+                return InvalidMirInst;
+            }
+            return slot;
         }
         MirInstId const dst = freshAggregateTemp(t);
         if (!dst.valid()) {
@@ -2225,6 +2546,93 @@ struct Lowerer {
     }
     [[nodiscard]] MirInstId elementZero(TypeId elemTy) {
         return elementFloatConst(0.0, elemTy);
+    }
+
+    // ── C99 _Complex — THE ONE COMPONENTWISE COMPARISON (D-CSUBSET-COMPLEX) ──
+    //
+    // C 6.5.9p2 makes `==`/`!=` legal on any pair of ARITHMETIC operands, and a
+    // complex is arithmetic (6.2.5p11+p18), so `a == b` holds exactly when BOTH
+    // components compare equal and `a != b` is its exact negation. C 6.3.1.2 then
+    // defines a scalar's conversion to `bool` as "compares equal to 0", which for a
+    // complex is that SAME comparison against `(0, 0)` — so truthiness, logical
+    // `!`, and `==`/`!=` are ONE rule, not three, and they are built here once.
+    // ✔MEASURED on gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed
+    // SEPARATELY, both compiling and running every shape: `a == c` / `a != b`,
+    // `z == 2` (a real operand promoted to complex), `if (z)` / `while` / `for` /
+    // `? :` / `&&` / `||`, `!z`, and `(_Bool)z`.
+    //
+    // ★★ TWO OF THOSE SHAPES WERE SILENT MISCOMPILES BEFORE THIS EXISTED, and both
+    // are the "one rule spelled in the consumers" failure this helper removes:
+    //   • `!z` reached `combineUnaryOp`'s scalar `Not` arm, whose `isFloat` roster
+    //     (F16/F32/F64/F80/F128) EXCLUDES Complex — so it minted an INTEGER zero
+    //     and emitted `ICmpEq(<the complex's ADDRESS>, 0)`. An object's address is
+    //     never null, so `!z` was CONSTANT FALSE. ✔MEASURED: `!(0.0+0.0i)`
+    //     returned 0 where gcc and clang both return 1.
+    //   • `(_Bool)z` took the C 6.3.1.7 "complex → real discards the imaginary
+    //     part" arm, which is the WRONG law for a `bool` target: 6.3.1.2 tests the
+    //     WHOLE value. ✔MEASURED: `(_Bool)(0.0 + 5.0i)` returned false where gcc
+    //     and clang both return true. The imaginary-discarding arm is still right
+    //     for every OTHER real target and is left exactly as it was.
+    // ⚠ ORDERED comparisons (`< <= > >=`) are NOT built here and must stay LOUD:
+    // C 6.5.8p2 requires REAL operands, and gcc 13.3.0 / clang 18.1.3 both refuse
+    // `a < b` on complex ("invalid operands to binary <"). A unanimous refusal is
+    // the references obeying a constraint — §A.3b's bidirectional bar.
+
+    // Componentwise `==` / `!=` over two complex values already loaded into their
+    // (re, im) component VALUES. Ordered/unordered are chosen so the NaN answer
+    // matches the SCALAR float path exactly (`mapBinaryOp`: Eq → FCmpOeq, Ne →
+    // FCmpUne), which is what makes `!=` the exact negation of `==` per component.
+    // The two per-component Bools are combined through the file's OWN 0/1-in-an-i64
+    // idiom (`zextBoolToI64` + `i64bin`, the branchless-clamp precedent) because MIR
+    // has no Bool-width bitwise form; the final `!= 0` re-narrows to Bool.
+    [[nodiscard]] MirInstId complexEqFromParts(bool isNe,
+                                               MirInstId ar, MirInstId ai,
+                                               MirInstId br, MirInstId bi) {
+        if (!ar.valid() || !ai.valid() || !br.valid() || !bi.valid())
+            return InvalidMirInst;
+        MirOpcode const cmp = isNe ? MirOpcode::FCmpUne : MirOpcode::FCmpOeq;
+        MirInstId const rc = icmp(cmp, ar, br);
+        MirInstId const ic = icmp(cmp, ai, bi);
+        if (!rc.valid() || !ic.valid()) return InvalidMirInst;
+        MirInstId const comb = i64bin(isNe ? MirOpcode::Or : MirOpcode::And,
+                                      zextBoolToI64(rc), zextBoolToI64(ic));
+        if (!comb.valid()) return InvalidMirInst;
+        return icmp(MirOpcode::ICmpNe, comb, ci64(0));
+    }
+
+    // complex `==` / `!=` : both operands arrive BY ADDRESS (the `request` value→
+    // address flip). Result Bool.
+    [[nodiscard]] MirInstId emitComplexEq(bool isNe, MirInstId aAddr, MirInstId bAddr,
+                                          TypeId complexTy, HirNodeId node) {
+        auto const cp = complexParts(complexTy);
+        if (!cp.has_value()) {
+            unsupported(node, "a complex comparison requires a sizeable element "
+                              "layout (D-CSUBSET-COMPLEX)");
+            return InvalidMirInst;
+        }
+        MirInstId ar = InvalidMirInst, ai = InvalidMirInst;
+        MirInstId br = InvalidMirInst, bi = InvalidMirInst;
+        if (!loadComplex(aAddr, *cp, ar, ai)) return InvalidMirInst;
+        if (!loadComplex(bAddr, *cp, br, bi)) return InvalidMirInst;
+        return complexEqFromParts(isNe, ar, ai, br, bi);
+    }
+
+    // The TRUTH VALUE of the complex at `addr` — `z == 0` when `zeroIsTrue` (logical
+    // `!`), `z != 0` otherwise (a `bool` conversion). The `emitBoolFromWide` twin,
+    // and the zero it compares against comes from the SAME `elementZero` owner the
+    // real→complex construct and the scalar-float `!` arm already use.
+    [[nodiscard]] MirInstId emitBoolFromComplex(MirInstId addr, TypeId complexTy,
+                                                bool zeroIsTrue, HirNodeId node) {
+        auto const cp = complexParts(complexTy);
+        if (!cp.has_value()) {
+            unsupported(node, "a complex truth value requires a sizeable element "
+                              "layout (D-CSUBSET-COMPLEX)");
+            return InvalidMirInst;
+        }
+        MirInstId re = InvalidMirInst, im = InvalidMirInst;
+        if (!loadComplex(addr, *cp, re, im)) return InvalidMirInst;
+        return complexEqFromParts(/*isNe=*/!zeroIsTrue, re, im,
+                                  elementZero(cp->elemTy), elementZero(cp->elemTy));
     }
     // Convert a scalar value from `fromTy` to `toTy` (float<->float, int->float),
     // or return it unchanged when the kinds already match. Fails loud on a pair with
@@ -2613,10 +3021,17 @@ struct Lowerer {
                                       "'aggregateLayout' params");
                     return InvalidMirInst;
                 }
-                auto const layout = computeLayout(sized, interner,
-                                                  config.aggregateLayout,
-                                                  config.dataModel);
-                if (!layout) {
+                // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: `sizeof` asks the
+                // OPERAND question, not the object one — `cachedOperandLayout`
+                // (memoized `operandLayout`) is `computeLayout` for every type
+                // that has a layout and additionally answers the dialect's
+                // declared size for `void` / a function type, which is what makes
+                // `sizeof(void)`, `sizeof(*p)` on a `void *`, `sizeof(f)` and
+                // `sizeof(*f)` all fold to 1 as gcc and clang do (MEASURED,
+                // probed separately). A schema declaring no such size keeps this
+                // refusal byte-for-byte.
+                auto const* layout = cachedOperandLayout(sized);
+                if (layout == nullptr) {
                     unsupported(node, "sizeof of an incomplete or un-sizeable type");
                     return InvalidMirInst;
                 }
@@ -2643,10 +3058,14 @@ struct Lowerer {
                     return InvalidMirInst;
                 }
                 TypeId const queried = hir.typeId(kids.front());
-                auto const layout = computeLayout(queried, interner,
-                                                  config.aggregateLayout,
-                                                  config.dataModel);
-                if (!layout) {
+                // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the OPERAND question
+                // here too, and it is the SAME extension rather than a second one
+                // — `_Alignof(void)` is 1 on both references (MEASURED), which
+                // falls straight out of the `{size = declared, align = 1}` layout
+                // `operandLayout` synthesizes. No separate alignment rule exists
+                // or is needed.
+                auto const* layout = cachedOperandLayout(queried);
+                if (layout == nullptr) {
                     unsupported(node, "_Alignof of an incomplete or un-alignable type");
                     return InvalidMirInst;
                 }
@@ -3539,6 +3958,30 @@ struct Lowerer {
         TypeId const operandType = hir.typeId(kids[0]);
         TypeKind const tk = operandType.valid()
             ? interner.kind(operandType) : TypeKind::Void;
+        // C99 _Complex (D-CSUBSET-COMPLEX): logical `!` on a complex operand, which
+        // arrives BY ADDRESS (the `request` value→address flip) exactly as a wide
+        // `_BitInt` does. C 6.5.3.3p5 defines `!E` as `(E == 0)`, so this is the
+        // componentwise comparison against `(0, 0)` — `emitBoolFromComplex`, the ONE
+        // owner shared with `==`/`!=`, the bool conversion and the truthiness path.
+        // ⚠ PLACED BEFORE THE WIDE-INT BLOCK AND BEFORE THE SCALAR ARM, and that
+        // ORDER is the whole fix: falling through to the scalar arm is what produced
+        // the ✔MEASURED silent miscompile (`isFloat` excludes Complex ⇒ an INTEGER
+        // zero ⇒ `ICmpEq(address, 0)` ⇒ `!z` constant FALSE, wrong for `z == 0`,
+        // and invisible to `requireNativeIntWidth` because the operand is a Ptr).
+        // Neg / BitNot on a complex are NOT here: unary `-` produces a COMPLEX
+        // result and is materialized by address (materializeComplexUnaryOp), and
+        // `~z` (the GNU complex-conjugate extension) is not supported — both keep
+        // the misroute fail-loud below.
+        if (tk == TypeKind::Complex) {
+            if (op == HirOpKind::Not)
+                return emitBoolFromComplex(operand, operandType,
+                                           /*zeroIsTrue=*/true, node);
+            unsupported(node, std::format(
+                "internal: UnaryOp '{}' on a complex must be materialized BY "
+                "ADDRESS (lowerLvalueAddress -> materializeComplexUnaryOp), never "
+                "as a bare SSA value (D-CSUBSET-COMPLEX)", opName(op)));
+            return InvalidMirInst;
+        }
         // C23 _BitInt(N) (D-CSUBSET-BITINT, CRIT-2): a unary op on a `_BitInt`.
         // ★ D-CSUBSET-UINT128-TYPE (TF-C94): the gate admits any WIDE integer, not
         // just the BitInt kind. Load-bearing, MEASURED: once `isMemoryResidentType`
@@ -3676,10 +4119,44 @@ struct Lowerer {
         // lowerLvalueAddressNode; the request flip diverts a complex value read
         // there). Reaching here with a complex operand OR a complex result is a
         // MISROUTE — fail loud, never a silent bad scalar lowering (mirrors the
-        // wide-BitInt guard). A complex COMPARISON (== !=) yielding Bool is a future
-        // cycle (D-CSUBSET-COMPLEX); it too must not silently scalar-lower.
+        // wide-BitInt guard).
+        //
+        // ★ THE EQUALITY COMPARISONS ARE NO LONGER A FUTURE CYCLE — they are the
+        // `emitWideEq` twin and land HERE, in the value path, exactly as the wide
+        // `_BitInt` comparisons do: the operands arrive BY ADDRESS (the `request`
+        // flip) and the result is a Bool, so nothing is materialized. C 6.5.9p2
+        // admits any ARITHMETIC pair and a complex is arithmetic (6.2.5p11+p18);
+        // ✔MEASURED accepted+run by gcc 13.3.0 and clang 18.1.3, probed separately,
+        // for `a == b`, `a != b` and the mixed `z == 2` (the real operand promoted
+        // to complex by `coerce`'s CRITICAL-3 arm). This ALSO closes `if (z)`:
+        // `coerceCondition` builds its truthiness test as `Ne(z, complexZero)`, the
+        // SAME node shape, so the condition path needs no second lowering.
+        // ⚠ ORDERED comparisons stay in the fail-loud below on purpose — C 6.5.8p2
+        // requires REAL operands and BOTH references refuse `a < b` on complex.
         if (tk == TypeKind::Complex
             || (t.valid() && interner.kind(t) == TypeKind::Complex)) {
+            bool const complexResult =
+                t.valid() && interner.kind(t) == TypeKind::Complex;
+            if (!complexResult
+                && (op == HirOpKind::Eq || op == HirOpKind::Ne)) {
+                return emitComplexEq(op == HirOpKind::Ne, lhs, rhs,
+                                     operandType, node);
+            }
+            // C 6.5.8p2: the relational operators require REAL operands, so a
+            // complex `<`/`<=`/`>`/`>=` is a CONSTRAINT VIOLATION, not a lowering
+            // that has not been written yet. It was already refused here — by the
+            // misroute message below, which named the wrong cause and pointed the
+            // user at `materializeComplexBinaryOp`. Say what is actually wrong.
+            if (!complexResult
+                && (op == HirOpKind::Lt || op == HirOpKind::Le
+                    || op == HirOpKind::Gt || op == HirOpKind::Ge)) {
+                unsupported(node, std::format(
+                    "relational operator '{}' requires REAL operands — a complex "
+                    "has no ordering (C 6.5.8p2). gcc 13.3.0 and clang 18.1.3 both "
+                    "reject this; use the components (creal/cimag) or `cabs`. "
+                    "D-CSUBSET-COMPLEX", opName(op)));
+                return InvalidMirInst;
+            }
             unsupported(node, std::format(
                 "internal: BinaryOp '{}' on a complex must be materialized BY ADDRESS "
                 "(lowerLvalueAddress -> materializeComplexBinaryOp), never as a bare "
@@ -3925,6 +4402,25 @@ struct Lowerer {
                               "(D-CSUBSET-COMPLEX)");
             return InvalidMirInst;
         }
+        // ★★ complex -> `_Bool` IS NOT A "COMPLEX → REAL" CONVERSION, and reading it
+        // as one was a ✔MEASURED SILENT MISCOMPILE (D-CSUBSET-COMPLEX).
+        // C 6.3.1.7p2 ("when a value of complex type is converted to a real type the
+        // imaginary part is discarded") governs every real target EXCEPT `_Bool`,
+        // which C 6.3.1.2 defines separately and in terms of the WHOLE value: "the
+        // result is 0 if the value compares equal to 0; otherwise 1". Falling into
+        // the discard arm below therefore answered `creal(z) != 0` and dropped the
+        // imaginary part: `(_Bool)(0.0 + 5.0i)` returned FALSE where gcc 13.3.0 and
+        // clang 18.1.3 both return TRUE (probed separately, both compile and run).
+        // ⇒ route it to the SAME `emitBoolFromComplex` owner `!z`, `if (z)` and
+        // `==`/`!=` use, so the four spellings of one comparison cannot drift.
+        // ⓘ The `_Bool` DECLARATION forms (`_Bool b = z;`) do not arrive here at all
+        // — `coerce`'s `_Bool`-target arm realizes them through `coerceCondition`,
+        // which builds `Ne(z, complexZero)` and lowers via `emitComplexEq`. This arm
+        // is the EXPLICIT cast `(_Bool)z`, which has no such front-end rewrite.
+        if (fromTy.valid() && interner.kind(fromTy) == TypeKind::Complex
+            && toK == TypeKind::Bool) {
+            return emitBoolFromComplex(operand, fromTy, /*zeroIsTrue=*/false, node);
+        }
         // complex -> real (C99 6.3.1.7): the imaginary part is discarded — the value
         // IS the real component. `operand` is the complex's ADDRESS (the request flip
         // delivered it). Load component 0 (the element float), then convert to the
@@ -3963,18 +4459,42 @@ struct Lowerer {
             // miscompile; the correct multi-limb limbs->FP conversion lands in a later
             // cycle. NARROW (N<=64) _BitInt->float rides the container and never gets here.
             if (isFloatingKind(toK)) {
-                // D-CSUBSET-UINT128-TYPE (TF-C94, message text only — the REFUSAL
-                // stands): the twin of the float→wide site in materializeWideCast.
-                // `(double)someU128` MEASURED as "…from a `_BitInt` wider than 64
-                // bits…"; the SOURCE type `fromTy` is what names it correctly.
-                diagnoseCode(node, DiagnosticCode::S_BitIntWideFloatConvUnsupported,
-                    std::format(
-                        "conversion from {} to a floating type is not yet supported — "
-                        "the multi-limb wide-integer-to-float conversion lands in a "
-                        "later cycle (D-CSUBSET-UINT128-TYPE / "
-                        "D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV)",
-                        wideIntSpelling(fromTy)));
-                return InvalidMirInst;
+                // ── D-CSUBSET-INT128-FLOAT-CONV: THE OTHER DIRECTION, ALSO LIVE ──
+                // `emitFloatFromWide` is CORRECTLY ROUNDED at F64 (round-to-odd at
+                // 64 bits, then one hardware rounding to 53 — the argument is on the
+                // emitter). It reads EVERY limb, which is what the old refusal's
+                // "emitScalarFromWide reads only limb 0" objection was about.
+                //
+                // ⚠ ONLY F64 IS PRODUCED, AND THE OTHERS STAY LOUD FOR THREE
+                // DIFFERENT REASONS — a single "not supported" would hide all three:
+                //   * F32: reachable only as `FPTrunc(F64)`, which ROUNDS TWICE and
+                //     can land outside the two values C 6.3.1.4p2 permits. It is
+                //     also already walled one tier down for a plain 64-bit source
+                //     (D-CSUBSET-INT-TO-F32-CODEGEN has no int→F32 encoding at all),
+                //     so admitting it here would only move the wall, not remove it.
+                //   * F16: the same double-rounding objection, and no encoded form.
+                //   * F80/F128: the long-double deferral — the F64 result cannot be
+                //     widened into extra precision it never had.
+                if (toK != TypeKind::F64) {
+                    diagnoseCode(node, DiagnosticCode::S_BitIntWideFloatConvUnsupported,
+                        std::format(
+                            "conversion from {} to a non-`double` floating type is not "
+                            "supported — only the `double` conversion can be produced "
+                            "with a single correctly-rounded step; narrower targets "
+                            "would round twice and wider ones have no encoded form "
+                            "(D-CSUBSET-INT128-FLOAT-CONV / "
+                            "D-CSUBSET-INT-TO-F32-CODEGEN / D-CSUBSET-LONG-DOUBLE)",
+                            wideIntSpelling(fromTy)));
+                    return InvalidMirInst;
+                }
+                MirInstId const d = emitFloatFromWide(operand, fromTy);
+                if (!d.valid()) {
+                    unsupported(node, std::format(
+                        "{} → `double` conversion could not be emitted "
+                        "(D-CSUBSET-INT128-FLOAT-CONV)", wideIntSpelling(fromTy)));
+                    return InvalidMirInst;
+                }
+                return d;
             }
             if (toK == TypeKind::Bool)
                 return emitBoolFromWide(operand, fromTy, /*zeroIsTrue=*/false);
@@ -5382,14 +5902,62 @@ struct Lowerer {
         return layout->size;
     }
 
+    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the memoized OPERAND layout of
+    // `ty` — the `sizeof`/`_Alignof`/element-stride question — or nullptr, the
+    // fail-loud signal. The twin of `cachedLayout` above, and the two are
+    // deliberately DIFFERENT QUESTIONS with different caches: `cachedLayout` asks
+    // how an OBJECT of the type is stored (what `fieldByteOffset`,
+    // `aggregateByteSize` and `bitfieldPlacementOf` need, and what must keep
+    // refusing `void`), while this asks what size the type has as an OPERAND
+    // (which the dialect may define for `void`/a function even though no object
+    // exists). `operandLayout` delegates to the same `computeLayout` for every
+    // type that HAS a layout, so the two agree everywhere except the two
+    // non-object kinds — and the ORDERING that makes that true lives in
+    // `operandLayout` alone, never re-derived here.
+    [[nodiscard]] StructLayout const* cachedOperandLayout(TypeId ty) {
+        if (!config.aggregateLayoutLoaded) return nullptr;
+        if (auto it = operandLayoutCache_.find(ty.v);
+            it != operandLayoutCache_.end())
+            return &it->second;
+        auto layout = operandLayout(ty, interner, config.aggregateLayout,
+                                    config.dataModel, config.nonObjectTypeSizes);
+        if (!layout) return nullptr;
+        return &operandLayoutCache_.emplace(ty.v, std::move(*layout))
+                    .first->second;
+    }
+
     // The byte STRIDE of an array/pointer element of type `elemTy` — the
     // multiplier that turns an element index into a byte offset (Option A,
-    // D-MIR-STORAGE-ARRAY-INDEX-GEP). `computeLayout` sizes ANY type: a scalar
-    // (int→4, a pointer→8) via the dataModel, an aggregate (incl. tail padding
-    // = the C array stride) via the layout params. nullopt (caller fail-louds)
-    // when the element type is incomplete / the target declared no layout.
+    // D-MIR-STORAGE-ARRAY-INDEX-GEP). Sizes ANY type: a scalar (int→4, a
+    // pointer→8) via the dataModel, an aggregate (incl. tail padding = the C
+    // array stride) via the layout params. nullopt (caller fail-louds) when the
+    // element type is incomplete / the target declared no layout.
+    //
+    // ★ THE ONE STRIDE RULE, AND IT STAYED ONE. Every scaling site funnels here
+    // — `scaleIndexToBytes` (both Index arms, `p ± n`, `p++`/`--p`), the `p - q`
+    // element-count divide, the constant-address Index fold, the complex
+    // component offset, the VLA base-element size, the array-initializer element
+    // offset. P42 did not add a second rule beside it for `void *`; it changed
+    // WHICH QUESTION this one asks, from the object layout to the OPERAND layout.
+    // For every type that has an object representation the answer is unchanged
+    // byte-for-byte; `void` and a function type now answer from the dialect's
+    // declared operand size (GNU C: 1 — MEASURED accepted by gcc 13.3.0 and clang
+    // 18.1.3, probed separately) instead of inheriting the object question's
+    // refusal, and a schema declaring nothing keeps that refusal exactly.
+    //
+    // ⚠ THE `nullptr_t` PREREQUISITE, and it is not optional. `representationType`
+    // projects `nullptr_t` → `Ptr<Void>` on the way out of the semantic tier, so
+    // `nullptr_t` element arithmetic and `void *` arithmetic arrive HERE as the
+    // SAME type and this site CANNOT tell them apart. Both references REJECT
+    // `nullptr_t` arithmetic and must keep being rejected, so that refusal lives
+    // at the last tier that still knows — the `S_NullptrInvalidOperand` gate in
+    // `pass2Post` (D-CSUBSET-NULLPTR-TYPED-OPERAND-ESCAPES-THE-GATE, closed
+    // earlier in P42). ✔VERIFIED CLOSED through the shipped CLI before this
+    // widening landed and RE-VERIFIED after: `typeof(nullptr) a[3]; a[1] + 1;`
+    // is `S0033`, not a silent byte offset. Weaken that gate and this function
+    // turns a loud refusal into a miscompile.
     [[nodiscard]] std::optional<std::uint64_t> elementStride(TypeId elemTy) {
-        StructLayout const* layout = cachedLayout(elemTy);
+        StructLayout const* layout = cachedOperandLayout(elemTy);
         if (layout == nullptr) return std::nullopt;
         return layout->size;
     }
@@ -8521,6 +9089,79 @@ struct Lowerer {
             // request-flip — harmless, but off the shared funnel).
             if (isMemoryResidentType(interner, et)) {
                 return lowerLvalueAddress(expr).valid();
+            }
+            // D-CSUBSET-VOID-TERNARY-LOWERS-A-PHI-OF-VOID: a conditional whose
+            // arms are BOTH `void` (C 6.5.15p3 — "if both the second and third
+            // operands have void type, the result has void type") is legal C that
+            // gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed
+            // SEPARATELY, both compile and RUN. DSS refused it, and the refusal
+            // was an INTERNAL message two tiers below the source:
+            // `L_UnsupportedLoweringForOpcode: MIR value %N used …`.
+            //
+            // ✔MEASURED: the value path's diamond ends in `mir.addPhi(t, …)`, and
+            // `Phi` is a `Value`-result opcode — its type MUST be valid — so a
+            // VOID result asks for a phi of a thing that has no value. FIVE
+            // distinct source shapes all produced that one error, which is what
+            // identified the phi rather than any one syntax as the defect:
+            // `c ? g() : h();` · `(void)(c ? g() : h());` · `((c?g():h()), 5)` ·
+            // the same inside a loop body · `c ? g() : (void)0;`.
+            //
+            // ★ AND ALL FIVE ARRIVE HERE, WHICH IS WHY ONE ARM CLOSES THEM ALL.
+            // The bare statement and the loop body are ExprStmts; the comma's left
+            // operand is a `SeqExpr` side-effect statement, hence an ExprStmt; and
+            // `(void)X` mints NO Cast node at all (D-CSUBSET-CAST-VOID-DISCARD in
+            // cst_to_hir strips it and keeps the operand with a void type), so it
+            // is an ExprStmt too. This funnel is the ONE discard chokepoint they
+            // share — the same property that already lets the aggregate arm above
+            // cover every discarded aggregate shape.
+            //
+            // The lowering is the diamond WITHOUT the join phi: each arm is
+            // DISCARDED through this same funnel (so a nested void ternary, or a
+            // discarded aggregate inside an arm, keeps working by recursion), and
+            // the join is simply where control resumes. No value is produced
+            // because none exists — the correct answer, not a synthesized one.
+            //
+            // ⚠ THE VALUE PATH KEEPS ITS REFUSAL DELIBERATELY. A void ternary
+            // whose value is USED is a constraint violation (C 6.3.2.2), refused
+            // at the semantic tier by D-CSUBSET-VOID-VALUE-AS-AN-OPERATOR-OPERAND;
+            // if one ever reached `lowerExpr` anyway it still hits the phi-of-void
+            // fail-loud rather than silently acquiring a value here.
+            if (interner.kind(et) == TypeKind::Void
+                && hir.kind(expr) == HirKind::Ternary) {
+                auto kids = hir.children(expr);
+                if (kids.size() != 3) {
+                    unsupported(expr, "malformed Ternary (expect 3 children)");
+                    return false;
+                }
+                MirInstId const cond = lowerExpr(kids[0]);
+                if (!cond.valid()) return false;
+                // The SAME StructCfMarker triple the scalar diamond uses — the
+                // verifier pairs markers by COUNT, so an IfThen/IfElse/IfJoin
+                // that did not match would break the structured-CF invariant.
+                MirBlockId const thenBB = mir.createBlock(StructCfMarker::IfThen);
+                MirBlockId const elseBB = mir.createBlock(StructCfMarker::IfElse);
+                MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
+                mir.addCondBr(cond, thenBB, elseBB);
+
+                mir.beginBlock(thenBB);
+                if (!lowerDiscardedExpr(kids[1])) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(elseBB);
+                    sealCreatedAsUnreachable(joinBB);
+                    return false;   // fail-loud already reported
+                }
+                mir.addBr(joinBB);
+
+                mir.beginBlock(elseBB);
+                if (!lowerDiscardedExpr(kids[2])) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(joinBB);
+                    return false;   // fail-loud already reported
+                }
+                mir.addBr(joinBB);
+
+                mir.beginBlock(joinBB);
+                return true;
             }
         }
         return lowerExpr(expr).valid();
@@ -13327,6 +13968,20 @@ struct Lowerer {
                 agg.fields.push_back(std::move(*itp));
                 continue;
             }
+            // D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE: a
+            // `_Complex` MEMBER / ELEMENT — `struct S { double _Complex z; } s = {…};`,
+            // `double _Complex a[2] = {…}`. The same classifier the TOP-LEVEL scalar
+            // arm uses, asked here for the same reason c80 wired the null-pointer
+            // recognizer into both loops: an arm present at only one of the two is a
+            // capability the compiler has and refuses at the other site. The child's
+            // OWN type is the declared type here (positional children carry it), and
+            // `evaluateConstant` below cannot serve a complex at all — it returns ONE
+            // scalar — so without this the whole aggregate bails to runtimeInit.
+            if (auto cx = tryClassifyComplexConst(child, hir.typeId(child),
+                                                  env, opts)) {
+                agg.fields.push_back(std::move(*cx));
+                continue;
+            }
             ConstEvalResult const r =
                 evaluateConstant(hir, interner, literals, child, env, opts);
             if (!r.value.has_value()) return std::nullopt;  // one un-foldable → bail
@@ -13341,6 +13996,303 @@ struct Lowerer {
         out.value = std::move(agg);
         out.core  = interner.kind(hir.typeId(initNode));  // Struct / Union / Array
         return out;
+    }
+
+    // ══ D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE ══════
+    //
+    // A `_Complex`-typed STATIC-storage initializer folded to its TWO components.
+    //
+    // ★ WHY IT IS A CLASSIFIER AND NOT A CONST-EVAL ARM. `evaluateConstant` returns
+    // ONE `HirLiteralValue`, and a complex is memory-resident with no single scalar
+    // value — the same reason `tryClassifyAggregateConst` exists beside the engine
+    // rather than inside it. The output is the shape the STATIC-IMAGE producer
+    // reads: a two-field `MirAggregateValue` (real, imaginary) with `core =
+    // Complex`, which `asm.cpp`'s Complex arm lays at 0 and `elemSize`.
+    //
+    // ★★ WHY IT IS OWED AT ALL, and it is NOT the `_Complex` problem it looked
+    // like. `emitGlobals_`'s by-value-class copy arm (P42 lane I) fixed the MIR:
+    // `double _Complex g = 1.0;` stopped storing a POINTER into the object. But the
+    // refusal only MOVED — a global with ANY runtime initializer is refused whole at
+    // the producer tier (`D-LK4-RODATA-PRODUCER-RUNTIME-INIT`), so the real close is
+    // to never become one. ✔MEASURED at 301e2a63 (x86_64:pe64-x86_64-windows-exec):
+    // `= __builtin_complex(3.0,4.0)`, `= 1.0` and a `static _Complex double` LOCAL
+    // each got `error[K_NoMatchingObjectFormat] … has a runtime initializer`, while
+    // gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed separately,
+    // compile and run all three.
+    //
+    // ★★★ THE SCOPE IS EXACTLY THE SHAPES THE REFERENCES FOLD, AND EVERY FOLD HERE
+    // IS THE BYTES THE EMITTED CODE WOULD HAVE STORED. Both halves are load-bearing.
+    // ✔MEASURED 2026-08-27 (clang 18.1.3 `-std=c23` and gcc 13.3.0 `-std=c2x`, probed
+    // SEPARATELY, static storage): `= 1.0`, `= 5`, `= __builtin_complex(3.0,4.0)`,
+    // `= I`, `= -__builtin_complex(…)`, `= 3.0 + 4.0*I`, `= 1.0*I*I`,
+    // `= (1.0+2.0*I)/(3.0+4.0*I)`, a `float _Complex`, a struct MEMBER, an ARRAY, and
+    // a `static` LOCAL are accepted by BOTH. `= conj(__builtin_complex(3.0,4.0))` is
+    // accepted by gcc and REFUSED by clang — and §A.3b's disjunction makes ONE
+    // working reference enough, so it is folded here too.
+    // ⇒ THE ARITHMETIC IS NOT OPTIONAL. An earlier draft of this arm refused complex
+    // `+`/`-`/`*`/`/` "because reproducing the rounding is not proven"; that
+    // measurement refuted it — every reference folds them, so refusing is a
+    // conformance defect, and the rounding claim is PROVABLE rather than merely
+    // assumed. See `foldComplexComponents` for the proof and the operand order.
+    //
+    // ⚠ THE ELEMENT TYPE IS GATED TO F32/F64 for the same reason complex ARITHMETIC
+    // already walls at F80/F128 — a wide-float component has its own host
+    // representation (`WideFloatValue`) that a `double` pair structurally cannot
+    // carry, and folding through `double` would SILENTLY TRUNCATE an 80-bit
+    // initializer. A `long double _Complex` cannot reach here anyway: the
+    // `__builtin_complex` signature is `fn(f64,f64) -> complex<f64>`, the shipped
+    // F64 monomorph (D-CSUBSET-COMPLEX-MONOMORPH-F64), so that width is a
+    // pre-existing NAMED deferral and not a refusal this arm introduces.
+    // ⚠ AND `opts.allowFloat` IS HONOURED: a schema that declares its floats
+    // non-IEEE (`hirLowering.globalsConstEval.allowFloat: false`) gets NO fold here,
+    // exactly as it gets none from the engine.
+    [[nodiscard]] std::optional<MirLiteralValue>
+    tryClassifyComplexConst(HirNodeId initNode, TypeId declaredTy,
+                            EvalEnvironment const& env, EvalOptions const& opts) {
+        if (!declaredTy.valid() || !isComplex(interner, declaredTy))
+            return std::nullopt;
+        if (!opts.allowFloat) return std::nullopt;
+        TypeId const elem = interner.complexElement(declaredTy);
+        if (!elem.valid()) return std::nullopt;
+        TypeKind const ek = interner.kind(elem);
+        if (ek != TypeKind::F32 && ek != TypeKind::F64) return std::nullopt;
+        auto const parts = foldComplexComponents(initNode, env, opts);
+        if (!parts.has_value()) return std::nullopt;
+        MirAggregateValue agg;
+        agg.fields.push_back(realComponentLeaf(parts->first, ek));
+        agg.fields.push_back(realComponentLeaf(parts->second, ek));
+        MirLiteralValue out;
+        out.value = std::move(agg);
+        out.core  = TypeKind::Complex;
+        return out;
+    }
+
+    // ★★ ROUND ONE INTERMEDIATE TO THE COMPONENT'S OWN PRECISION — the clause that
+    // makes the fold below EQUAL to the emitted code rather than merely close to it.
+    // `materializeComplexBinaryOp` emits every FAdd/FSub/FMul/FDiv at the ELEMENT
+    // type `e`, so a `float _Complex` chain rounds to `float` after EACH operation.
+    // Folding the same chain in host `double` and rounding only at the end is a
+    // DIFFERENT function (`(float)(a*b - c*d)` ≠ `(float)((float)(a*b) -
+    // (float)(c*d))`), which would put an initializer in the image that disagrees
+    // with the code reading it — a silent miscompile, since nothing recomputes it.
+    // Applying this after every single operation makes them the same function: one
+    // IEEE double op rounded to float is CORRECTLY ROUNDED to float (53 ≥ 2·24 + 2,
+    // the classical double-rounding-safe bound), so each step matches the target's
+    // single float op exactly. At F64 it is the identity. ⚠ It is applied to the
+    // INPUTS too, not only to results: a source `0.1f` folds to the host double
+    // `0.1`, while the runtime loads `(float)0.1` — round at production and the two
+    // chains start from the same value.
+    //
+    // ⚠⚠ THE PRECISION IS EACH NODE'S OWN, NEVER THE DECLARATION'S — a bug in this
+    // arm's first draft, caught by re-reading it rather than by any test, because the
+    // fixture that would have shown it does not exist yet. `float _Complex z = 0.1f +
+    // 0.2f*I;` computes at **F64** (the `I` operand makes the sum `complex<f64>`) and
+    // converts to F32 ONCE, at the outer Cast — so threading the DECLARED element
+    // kind down the recursion would have rounded every intermediate to float and
+    // produced a different number from the emitted code on any expression where the
+    // two roundings differ. ⇒ every arm below takes its kind from `hir.typeId(n)`,
+    // and the CAST arm is where a precision change happens, exactly as
+    // `materializeComplexCast`'s `convertScalar` is.
+    // ★★★ AND "MATCH A REFERENCE" IS NOT AN AVAILABLE SHORTCUT HERE. ✔MEASURED
+    // 2026-08-27 on `float _Complex z = (0.1f+0.2f*I)*(0.3f+0.7f*I);`, the imaginary
+    // component as raw f32 bits:
+    //     gcc 13.3.0   static 3e051eb9   runtime 3e051eb8   <- DISAGREES WITH ITSELF
+    //     clang 18.1.3 static 3e051eb8   runtime 3e051eb8
+    //     DSS          static 3e051eb9   runtime 3e051eb9
+    // The standard leaves the evaluation-format latitude and the two references spend
+    // it differently, one of them inconsistently — so there is no reference byte
+    // pattern to copy. The invariant that IS well-defined is the one this arm holds:
+    // a compiler's static image equals what its OWN emitted code computes. Identical
+    // in shape to the `_BitInt` padding decision one file over
+    // ([[D-CSUBSET-BITINT-PADDING-POLICY-HAS-THREE-OWNERS]]), and reached the same
+    // way — by measuring the references SEPARATELY instead of as one voice.
+    // ⓘ The buggy draft would have emitted `3e051eb8` — clang's value — while DSS's
+    // own code computes `3e051eb9`. It would have looked RIGHT against a reference
+    // and been a silent miscompile of the compiler's own initializer.
+    [[nodiscard]] static double roundToComponent(double v, TypeKind ek) noexcept {
+        return ek == TypeKind::F32 ? static_cast<double>(static_cast<float>(v)) : v;
+    }
+
+    // The element TypeKind a complex node's components are computed at, or nullopt
+    // for a non-complex / un-representable element (F80/F128 — see the scope note).
+    [[nodiscard]] std::optional<TypeKind> complexComponentKind(TypeId ty) const {
+        if (!ty.valid() || !isComplex(interner, ty)) return std::nullopt;
+        TypeId const elem = interner.complexElement(ty);
+        if (!elem.valid()) return std::nullopt;
+        TypeKind const k = interner.kind(elem);
+        if (k != TypeKind::F32 && k != TypeKind::F64) return std::nullopt;
+        return k;
+    }
+
+    // One complex COMPONENT as a MIR literal leaf at the element kind. The encoder's
+    // scalar arm widths it from `core` (F32 → 4 bytes, F64 → 8), exactly as every
+    // other float leaf in a static aggregate is widthed.
+    [[nodiscard]] static MirLiteralValue realComponentLeaf(double v, TypeKind ek) {
+        MirLiteralValue leaf;
+        leaf.value = v;
+        leaf.core  = ek;
+        return leaf;
+    }
+
+    // The host `double` value of a REAL constant sub-expression, or nullopt. Routes
+    // through `evaluateConstant` — the one const-fold engine — and accepts the
+    // integer arms too (`_Complex double g = 1;` is legal C: the integer converts to
+    // the element type, which for F32/F64 is exact for every value this arm can see,
+    // and inexact only past 2^24/2^53 where the RUNTIME conversion rounds the same
+    // way the host `static_cast<double>` does).
+    [[nodiscard]] std::optional<double>
+    foldRealComponent(HirNodeId n, EvalEnvironment const& env, EvalOptions const& opts) {
+        ConstEvalResult const r =
+            evaluateConstant(hir, interner, literals, n, env, opts);
+        if (!r.value.has_value()) return std::nullopt;
+        if (auto const* d = std::get_if<double>(&r.value->value))       return *d;
+        if (auto const* i = std::get_if<std::int64_t>(&r.value->value))
+            return static_cast<double>(*i);
+        if (auto const* u = std::get_if<std::uint64_t>(&r.value->value))
+            return static_cast<double>(*u);
+        return std::nullopt;   // BitIntValue / WideFloatValue / string / aggregate
+    }
+
+    // (real, imaginary) of a constant expression, whether its type is complex or
+    // real, with every value rounded to THAT NODE'S OWN precision at the point it is
+    // produced. A REAL expression is the pair (v, 0) — the C 6.3.1.7 promotion, and
+    // the reason this recursion needs no separate real/complex entry points.
+    //
+    // ★★★ EVERY ARM MIRRORS ONE `materializeComplex*` ARM, OPERAND ORDER INCLUDED.
+    // That correspondence is the safety property, not a stylistic one: this fold and
+    // that emitter must be the SAME function of the source, because whichever one
+    // runs, the other's result is what the program observes. Where the emitter
+    // writes `FSub(FMul(ar,br), FMul(ai,bi))` this writes `rnd(rnd(ar*br) -
+    // rnd(ai*bi))` — same operands, same order, same per-op rounding.
+    // ⚠ Floating-point `+` and `*` are NOT associative, so "the same operations in a
+    // different order" is a different answer; do not tidy these expressions.
+    //
+    // Returns nullopt for any shape this cannot fold; the caller then falls through
+    // to the pre-existing loud refusal, never to a partial image.
+    [[nodiscard]] std::optional<std::pair<double, double>>
+    foldComplexComponents(HirNodeId n, EvalEnvironment const& env,
+                          EvalOptions const& opts) {
+        if (!n.valid()) return std::nullopt;
+        TypeId const ty = hir.typeId(n);
+        if (!isComplex(interner, ty)) {
+            // A REAL operand, rounded to ITS OWN type: a `float`-typed sub-expression
+            // is a float value even inside a wider complex, and an integer one is
+            // exact (`roundToComponent` is the identity at every non-F32 kind).
+            auto const v = foldRealComponent(n, env, opts);
+            if (!v.has_value()) return std::nullopt;
+            TypeKind const rk = ty.valid() ? interner.kind(ty) : TypeKind::F64;
+            return std::pair<double, double>{roundToComponent(*v, rk), 0.0};
+        }
+        auto const ekOpt = complexComponentKind(ty);
+        if (!ekOpt.has_value()) return std::nullopt;   // F80/F128 element → wall
+        TypeKind const ek = *ekOpt;
+        auto const pair = [ek](double re, double im) {
+            return std::optional<std::pair<double, double>>{
+                std::pair<double, double>{roundToComponent(re, ek),
+                                          roundToComponent(im, ek)}};
+        };
+        auto const kids = hir.children(n);
+        switch (hir.kind(n)) {
+            case HirKind::Cast: {
+                // real→complex is (v, 0); complex→complex is a componentwise element
+                // convert. BOTH are what `materializeComplexCast` stores — the real
+                // arm's zero is its `elementZero(e)`. ★ THIS IS THE ONLY ARM THAT
+                // CHANGES PRECISION, and `pair`'s rounding to THIS node's `ek` is
+                // exactly the `convertScalar(srcElem → e)` that arm emits. The child
+                // is folded at the CHILD's precision first, which is what makes
+                // `float _Complex z = 0.1f + 0.2f*I;` compute its F64 sum before
+                // converting once, like the emitted code.
+                if (kids.size() != 1) return std::nullopt;
+                auto const inner = foldComplexComponents(kids[0], env, opts);
+                if (!inner.has_value()) return std::nullopt;
+                return pair(inner->first, inner->second);
+            }
+            case HirKind::UnaryOp: {
+                if (kids.size() != 1) return std::nullopt;
+                auto const inner = foldComplexComponents(kids[0], env, opts);
+                if (!inner.has_value()) return std::nullopt;
+                // ⓘ There is no `Plus` member of `HirOpKind` to admit here: unary
+                // `+` is an identity the front end does not materialize as a node.
+                switch (decodeCoreOp(hir.payload(n))) {
+                    case HirOpKind::Neg:
+                        // A SIGN FLIP, not arithmetic: exact at every precision, and
+                        // it is what `materializeComplexUnaryOp` emits.
+                        return pair(-inner->first, -inner->second);
+                    default:
+                        return std::nullopt;
+                }
+            }
+            case HirKind::BinaryOp: {
+                // ⓘ Both children carry THIS node's complex type — the coerce arm
+                // (CRITICAL-3) promotes a real operand to `complex(v, 0)` before the
+                // lowering ever sees it, which is why `materializeComplexBinaryOp`
+                // can load both by address. So `ek` below is their precision too.
+                if (kids.size() != 2) return std::nullopt;
+                auto const a = foldComplexComponents(kids[0], env, opts);
+                auto const b = foldComplexComponents(kids[1], env, opts);
+                if (!a.has_value() || !b.has_value()) return std::nullopt;
+                double const ar = a->first, ai = a->second;
+                double const br = b->first, bi = b->second;
+                auto const r = [ek](double v) { return roundToComponent(v, ek); };
+                switch (decodeCoreOp(hir.payload(n))) {
+                    case HirOpKind::Add:
+                        return pair(ar + br, ai + bi);
+                    case HirOpKind::Sub:
+                        return pair(ar - br, ai - bi);
+                    case HirOpKind::Mul: {
+                        // (a+bi)(c+di) = (ac - bd) + (ad + bc)i — the emitter's four
+                        // FMul then FSub/FAdd, in its order.
+                        double const ac = r(ar * br), bd = r(ai * bi);
+                        double const ad = r(ar * bi), bc = r(ai * br);
+                        return pair(ac - bd, ad + bc);
+                    }
+                    case HirOpKind::Div: {
+                        // (a+bi)/(c+di) = [(ac+bd) + (bc-ad)i] / (c² + d²) — the BASIC
+                        // algebraic formula the emitter uses. ⓘ A ZERO denominator is
+                        // NOT special-cased and must not be: host IEEE division yields
+                        // the same inf/NaN the emitted FDiv produces, so folding and
+                        // running agree. Annex-G infinity/NaN recovery is absent from
+                        // BOTH sides — one deferral (D-CSUBSET-COMPLEX-ANNEX-G), not a
+                        // new divergence between them.
+                        double const ac = r(ar * br), bd = r(ai * bi);
+                        double const bc = r(ai * br), ad = r(ar * bi);
+                        double const cc = r(br * br), dd = r(bi * bi);
+                        double const denom = r(cc + dd);
+                        double const numR  = r(ac + bd);
+                        double const numI  = r(bc - ad);
+                        return pair(numR / denom, numI / denom);
+                    }
+                    default:
+                        return std::nullopt;
+                }
+            }
+            case HirKind::BuiltinCall: {
+                switch (static_cast<BuiltinLowering>(hir.payload(n))) {
+                    case BuiltinLowering::ComplexMake: {
+                        if (kids.size() != 2) return std::nullopt;
+                        auto const re = foldRealComponent(kids[0], env, opts);
+                        auto const im = foldRealComponent(kids[1], env, opts);
+                        if (!re.has_value() || !im.has_value()) return std::nullopt;
+                        return pair(*re, *im);
+                    }
+                    case BuiltinLowering::ComplexConj: {
+                        // ✔MEASURED: gcc 13.3.0 folds this in a static initializer and
+                        // clang 18.1.3 refuses it ("initializer element is not a
+                        // compile-time constant"). §A.3b — ONE working reference makes
+                        // the behaviour required — so it is folded, and DSS being
+                        // BROADER than clang here is the correct outcome, not drift.
+                        if (kids.size() != 1) return std::nullopt;
+                        auto const inner = foldComplexComponents(kids[0], env, opts);
+                        if (!inner.has_value()) return std::nullopt;
+                        return pair(inner->first, -inner->second);
+                    }
+                    default:
+                        return std::nullopt;
+                }
+            }
+            default:
+                return std::nullopt;
+        }
     }
 
     // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a NULL POINTER CONSTANT
@@ -13648,6 +14600,17 @@ struct Lowerer {
                         // the null-pointer + null-base-index arms, BEFORE
                         // runtimeInit — same order as the aggregate member loop.
                         pg.constInit = std::move(*itp);
+                    } else if (auto cx = tryClassifyComplexConst(*initN, pg.type,
+                                                                 env, opts)) {
+                        // D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE:
+                        // a `_Complex` initializer is STATIC DATA, not a load-time
+                        // store-chain. LAST of the classifiers, immediately before
+                        // the runtimeInit fallback, because it is the only one keyed
+                        // on the DECLARED type rather than on a recognizable
+                        // initializer SHAPE — every arm above gets first refusal on
+                        // its own shape, exactly as the aggregate member loop orders
+                        // its handlers.
+                        pg.constInit = std::move(*cx);
                     } else {
                         pg.runtimeInit = *initN;
                     }
@@ -13757,6 +14720,49 @@ struct Lowerer {
             mir.beginBlock(initEntry);
             for (auto const& pg : pendingGlobals) {
                 if (!pg.runtimeInit.valid()) continue;
+                // ★★ A BY-VALUE-CLASS INITIALIZER IS A COPY, NOT A STORE — the same
+                // rule the LOCAL `VarDecl` init and the `AssignStmt` paths already
+                // apply, through the same `isByValueClass` → `lowerAggregateCopy`
+                // chokepoint. This site restated only the SCALAR half of that rule,
+                // and a memory-resident type has no bare SSA value to store: the
+                // `request` value→address flip hands `lowerExpr` back an ADDRESS, so
+                // the Store below stored a POINTER into the object.
+                // ✔MEASURED at exactly that state (x86_64:pe64-x86_64-windows-exec):
+                // `_Complex double g = 1.0;` at file scope, `= __builtin_complex(3,4)`,
+                // and a `static _Complex double` LOCAL (which is lowered as a global,
+                // and is why this is not a file-scope-only defect) each failed
+                // `error[I_StoreValueTypeMismatch] … 'store' of value typed
+                // Ptr<Complex> into an address whose pointee is Complex` — while
+                // `_Complex double z = 1.0;` as an ordinary LOCAL compiled and ran,
+                // because the local path had the copy arm. gcc 13.3.0 (`-std=c2x`)
+                // and clang 18.1.3 (`-std=c23`), probed separately, compile and run
+                // all three.
+                // ⚠ The VERIFIER WAS RIGHT and is untouched — a front-end/lowering
+                // step was missing, and relaxing `I_StoreValueTypeMismatch` would
+                // have traded a loud refusal for an object holding an address.
+                // ⓘ ARRAY is deliberately NOT in `isByValueClass` (it decays), so an
+                // array global with a non-foldable initializer keeps its existing
+                // loud refusal rather than silently changing behaviour here.
+                if (isByValueClass(interner, pg.type)) {
+                    MirInstId const srcPtr = lowerLvalueAddress(pg.runtimeInit);
+                    if (!srcPtr.valid()) { ok = false; continue; }
+                    MirInstId const dstPtr = mir.addGlobalAddr(
+                        pg.symbol, interner.pointer(pg.type));
+                    if (!dstPtr.valid()) { ok = false; continue; }
+                    // c21: a `volatile` global's load-time init copy flags every
+                    // structural Store, exactly as the scalar arm below does.
+                    // FC17.9(d): `AtomicInitExempt` for the same reason as below —
+                    // initialization is not itself atomic (C11 7.17.2.1), and the
+                    // verifier's atomic belt must spare it.
+                    MirInstFlags const vf =
+                        (pg.isVolatile ? MirInstFlags::Volatile
+                                       : MirInstFlags::None)
+                        | MirInstFlags::AtomicInitExempt;
+                    if (!lowerAggregateCopy(pg.runtimeInit, srcPtr, dstPtr,
+                                            pg.type, vf))
+                        ok = false;
+                    continue;
+                }
                 MirInstId const val = lowerExpr(pg.runtimeInit);
                 if (!val.valid()) {
                     // Inner expression lowering already emitted a

@@ -3370,16 +3370,35 @@ void corpusWideFloors(std::size_t declared, std::size_t built,
         // ⇒ A reader sent to their `-R` by the old wording would have found
         // nothing wrong with it. Naming both causes costs one sentence; naming
         // the wrong one costs a search.
+        //
+        // ★ A THIRD CAUSE, ✔MEASURED 2026-08-27 (cycle P42, lane L) and it is a
+        // SPECIAL CASE of the second one rather than a new mechanism — worth
+        // naming anyway, because the remedy reads as absurd when you know your
+        // tree was freshly built. `population` is counted from the LIVE
+        // `examples/` tree AT RUN TIME, and several workstreams share one
+        // checkout: a neighbour lane that lands a new example WHILE a gate is
+        // running raises the population under a run whose entries were fixed at
+        // configure time. Observed exactly once in 12 full-corpus runs, in the
+        // one run whose before/after fingerprint of `examples/` DIFFERED.
+        // ⚠ The consequence is the one worth reading twice: the run still
+        // reports `100% tests passed`, and every corpus-wide floor asserted
+        // NOTHING in it. A gate number taken while a neighbour was landing a
+        // corpus example is therefore not the same measurement as one taken on a
+        // quiet tree, and only this line says so.
         std::cout << "  [SKIP] " << cells.size() << " of " << population
                   << " example(s) reported a cell — a corpus-wide existence"
                      " floor cannot be judged from part of the corpus."
-                     " Classified skip, never a pass. TWO causes reach here:"
-                     " a deliberate SUBSET run (`-R`/`--only`), or a BUILD TREE"
+                     " Classified skip, never a pass. THREE causes reach here:"
+                     " a deliberate SUBSET run (`-R`/`--only`); a BUILD TREE"
                      " whose per-example entries predate an example that now"
                      " exists on disk — re-run `cmake --build` (the manifest"
                      " glob is CONFIGURE_DEPENDS, so building re-globs; ctest"
                      " alone does not) and compare `ctest -N -R"
-                     " '^integrated_tests/'` against the population above.\n";
+                     " '^integrated_tests/'` against the population above; or a"
+                     " CONCURRENT WORKSTREAM that added an example to this"
+                     " shared checkout while the run was in flight, which is the"
+                     " same shape and needs no fix beyond re-running on a quiet"
+                     " tree.\n";
         return kAdjudicatorSkipRc;
     }
 
@@ -4711,29 +4730,47 @@ void runCoverageBoundaryJudge(fs::path const& subjectDir,
         + quote(subjectDir.string())
         + " --gtest_filter=Examples.RunFromManifest > "
         + quote(siblingLog.string()) + " 2>&1";
-    // The sibling resolves its scratch + config relative to the repo root, which
-    // is what its own ctest registration gives it (`WORKING_DIRECTORY
-    // ${CMAKE_SOURCE_DIR}`). Restored by the guard, because this runner resolves
-    // relative paths of its own afterwards.
+    // ── WHERE THE SIBLING IS RUN FROM ───────────────────────────────────────
+    //   D-TEST-EXAMPLES-CORPUS-SCRATCH-IS-SHARED-BY-EVERY-BUILD-TREE
+    //
+    // ★★★ THIS USED TO chdir TO THE REPO ROOT, and its reason was a QUOTE of the
+    // sibling's ctest registration: "the sibling resolves its scratch + config
+    // relative to the repo root, which is what its own ctest registration gives
+    // it (`WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}`)". That registration changed —
+    // the corpus entries now get a per-build-tree working directory, because the
+    // checkout root is one directory every build tree, lane and worktree writes
+    // into, and 684 leaked scratch directories had accumulated in it. So this
+    // line stopped mirroring the sibling the moment the sibling moved, which is
+    // precisely the two-runner drift `integrated_tests/coverage-boundary` exists
+    // to catch — and it caught it: ✔MEASURED, the sibling refused with rc=1 and
+    // this entry reported "no coverage line", loudly, on the first run after the
+    // registration changed.
+    //
+    // ⇒ RUN IT FROM THIS RUN'S OWN SCRATCH ROOT. The property the sibling needs
+    // is not "the repo root" — it never was. It is a cwd that is NOT a checkout
+    // root, so that `ScratchDir{Location::InsideRepo}` lands somewhere private
+    // to this run instead of in the shared source tree. `outputBase` is claimed
+    // per run under the system temp directory, so it satisfies that BY
+    // CONSTRUCTION and cannot drift with anybody's CMake variable. Everything
+    // the sibling actually resolves comes from elsewhere: the corpus root from
+    // the `DSS_TEST_REPO_ROOT` baked into that binary, and shipped config from
+    // the `$DSS_CONFIG_ROOT` this entry carries (`dss_use_config_snapshot`) and
+    // the child inherits.
+    //
+    // Restored by the guard, because this runner resolves relative paths of its
+    // own afterwards.
     int siblingRc = -1;
     bool cwdOk = false;
     {
-        fs::path repo;
-        try {
-            repo = ::dss::test::repoRoot();
-        } catch (std::exception const& e) {
-            check("resolve the repo root to run the sibling from", false,
-                  std::string{e.what()});
-            return;
-        }
-        CwdGuard cwd{repo};
+        CwdGuard cwd{outputBase};
         cwdOk = cwd.ok;
         if (cwd.ok) siblingRc = std::system(shellWrap(cmd).c_str());
     }
     if (!cwdOk) {
-        check("chdir to the repo root to run the sibling", false,
-              "the sibling resolves its scratch tree and shipped config against"
-              " the repo root; running it elsewhere measures a different thing");
+        check("chdir to this run's scratch root to run the sibling", false,
+              "the sibling roots its ScratchDir at the process working"
+              " directory, so it must be started somewhere private to this run"
+              " — never a checkout root, which every build tree shares");
         return;
     }
 

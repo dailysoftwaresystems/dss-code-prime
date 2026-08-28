@@ -8,6 +8,14 @@ dss_add_test(NAME program/test_compile_pipeline
              SOURCES test_compile_pipeline.cpp)
 dss_add_test(NAME program/test_max_diagnostics_reaches_every_tier
              SOURCES test_max_diagnostics_reaches_every_tier.cpp)
+dss_add_test(NAME program/test_parse_gate_scope
+             SOURCES test_parse_gate_scope.cpp)
+dss_add_test(NAME program/test_stdio_stream_macros
+             SOURCES test_stdio_stream_macros.cpp)
+dss_add_test(NAME program/test_setjmp_macro_visibility
+             SOURCES test_setjmp_macro_visibility.cpp)
+dss_add_test(NAME program/test_diagnostic_code_rendering
+             SOURCES test_diagnostic_code_rendering.cpp)
 dss_add_test(NAME program/test_ffi_resolve_library
              SOURCES test_ffi_resolve_library.cpp)
 dss_add_test(NAME program/test_static_link

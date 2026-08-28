@@ -721,11 +721,20 @@ evalNode(NodeId                              expr,
         //
         // ★ WHY THE WIDE RESULT CANNOT TRUNCATE DOWNSTREAM (measured, and the reason
         // reviving this arm is safe): the value it produces rides a 128-bit
-        // `BitIntValue`, and `asInt64` nullopts for `width() > 64`. So the two
-        // 64-bit ICE slots — `asInt64Bridge` (array dimension / static-assert /
-        // enumerator) and the `isInteger` narrowing arm just below — REFUSE a wide
-        // value instead of narrowing it. `int a[(__uint128_t)1 << 100];` fails loud
-        // with S_NonConstantArrayLength; it never becomes a truncated bound.
+        // `BitIntValue`, and `asInt64` admits one only when its VALUE is
+        // representable in an int64 — never merely because the low limb looks
+        // small (D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE). So the two 64-bit ICE
+        // slots — `asInt64Bridge` (array dimension / static-assert / enumerator) and
+        // the `isInteger` narrowing arm just below — REFUSE a value that does not
+        // fit instead of narrowing it. `int a[(__uint128_t)1 << 100];` fails loud
+        // with S_NonConstantArrayLength, and so does the sharper
+        // `int a[((__int128)1 << 100) + 3];`, whose low 64 bits are exactly 3;
+        // neither ever becomes a truncated bound.
+        //   ⓘ WHAT CHANGED, AND WHAT DID NOT: the rule used to be the declared
+        // WIDTH (`width() > 64` ⇒ always nullopt), which ALSO refused
+        // `int a[(__int128)2 + 1];` — a value both gcc 13.3.0 (`-std=c2x`) and
+        // clang 18.1.3 (`-std=c23`) accept. Those now fold. The refusal of values
+        // that genuinely exceed int64 is unchanged, and is what this note is about.
         if (tgt->isInteger && tgt->intBits == 128) {
             auto bv = detail::asBitIntValue(*inner.value);
             if (!bv.has_value()) {
@@ -779,9 +788,54 @@ evalNode(NodeId                              expr,
             // `(long long)0xffffffffffffffffull` are both well-defined C
             // (6.3.1.3p2), so refusing the operand for not fitting a SIGNED
             // int64 refused legal conversions.
-            auto const iv = detail::asIntBits(*inner.value);
+            auto iv = detail::asIntBits(*inner.value);
             if (!iv.has_value()) {
-                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+                // ── A WIDE OPERAND NARROWED BY AN EXPLICIT CAST IS NOT A REFUSAL ──
+                // D-CSUBSET-INT128-ICE-CONTEXT-REFUSED / D-CSUBSET-INT128-CONSTFOLD-WIDE.
+                //
+                // `asIntBits` nullopts for a `BitIntValue` wider than 64 bits — the
+                // right answer to ITS question ("what is this value as an int64?").
+                // It is the wrong answer HERE, because the programmer WROTE a
+                // narrowing cast, and C 6.3.1.3p2 defines exactly what that yields:
+                // the value reduced modulo 2^N for an unsigned target, and the
+                // implementation-defined two's-complement answer for a signed one —
+                // which is the very rule `narrowIntToBits` below already implements
+                // for a 64-bit source.
+                //
+                // ✔MEASURED at `301e2a63`, DSS vs clang 18.1.3 (`-std=c23`) and gcc
+                // 13.3.0 (`-std=c2x`), probed SEPARATELY — both references fold all
+                // four, DSS refused all four:
+                //     _Static_assert((int)((__uint128_t)5) == 5, "");        S0029
+                //     _Static_assert((unsigned long long)((__uint128_t)5) == 5, "");
+                //     enum Q { QA = (int)(__int128)7 };                      S0029
+                //     int b[(int)(__uint128_t)4];                            S000B
+                // ★ THE ARM DIRECTLY ABOVE ALREADY DID THIS. A `(_BitInt(8))` target
+                // routes a wide operand through the bignum's own wrap-aware
+                // `convertTo`, so `_Static_assert((_BitInt(8))((__uint128_t)5) == 5)`
+                // was CLEAN while the `int` twin was refused — one law, two arms, and
+                // only one of them knew it. This reuses the SAME verb rather than
+                // adding a second narrowing rule.
+                //
+                // ⚠ THE ROW'S INVARIANT IS UNTOUCHED: "a value exceeding int64 can
+                // never SILENTLY truncate into an ICE". Nothing here is silent — this
+                // path is reached only through a cast the programmer wrote, whose
+                // whole meaning is the narrowing. A BARE wide value used as an array
+                // bound or enumerator still goes through `asInt64`, which admits it
+                // only when its VALUE fits an int64
+                // (D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE), so
+                // `int a[(__uint128_t)1 << 100];` keeps failing loud rather than
+                // becoming a truncated bound.
+                auto wide = detail::asBitIntValue(*inner.value);
+                if (!wide.has_value()) {
+                    return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+                }
+                // Reduce to the low 64 bits FIRST (mod 2^64, exact and total), then
+                // let `narrowIntToBits` apply the declared width exactly as it does
+                // for every other source. Composing the two is the same modular
+                // reduction as converting straight to `intBits`, because `intBits`
+                // here is ≤ 64 (the 128-bit target was handled above).
+                wide->convertTo(64u, /*isSigned=*/false);
+                iv = static_cast<std::int64_t>(wide->low64());
             }
             HirLiteralValue v;
             v.core  = castCore();

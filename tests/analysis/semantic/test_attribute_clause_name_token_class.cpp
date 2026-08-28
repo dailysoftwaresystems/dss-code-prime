@@ -219,22 +219,41 @@ TEST(AttributeClauseNameTokenClass, KeywordNamedTrailingClauseIsEnumerated) {
 // a keyword-named FIRST clause must not cost the identifier-named trailing one
 // its effect. `packed` is a LAYOUT effect — losing it silently produces a struct
 // of the wrong size, which is wrong bytes rather than a missing warning.
+// ⚠ RE-FIXTURED 2026-08-27 (P42, D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY).
+// THE ASSERTION IS UNCHANGED IN INTENT AND STRICTLY STRONGER IN FORM; ONLY THE
+// FIXTURE MOVED, BECAUSE THE OLD ONE MANUFACTURED ITS PRECONDITION OUT OF A BUG.
+// It read the count of `S_UnknownTypeAttribute` and expected ONE — and that one
+// came from `__const__` being REFUSED by the composite scan's drifted second
+// roster, a refusal of legal C that gcc and clang both compile (✔MEASURED, each
+// separately). The moment that defect was fixed the count went to 0 and the pin
+// went red WITHOUT ITS SUBJECT HAVING CHANGED AT ALL: `packed` was recognised
+// before and is recognised now.
+// ★ The comment above already named the honest fixture — "losing it silently
+// produces a struct of the WRONG SIZE, which is wrong bytes rather than a
+// missing warning" — so the pin now asserts THE SIZE, in the source, where no
+// diagnostic-roster change can reach it. `_Static_assert` fails loud at the
+// semantic tier if the layout is wrong, so a swallowed `packed` (sizeof 8, not
+// 5) turns this test red no matter what the diagnostics do.
 TEST(AttributeClauseNameTokenClass, KeywordFirstClauseDoesNotCostTheTrailingPackedEffect) {
     std::string const src =
         "struct __attribute__((__const__, packed)) S { int a; char b; };\n"
+        "_Static_assert(sizeof(struct S) == 5, \"packed lost beside a "
+        "keyword-named clause\");\n"
         "int main(void){ return (int)sizeof(struct S); }\n";
     ASSERT_EQ(parseErrorsFor(src), 0u);
     auto model = analyzeC(src);
-    // `__const__` is a `none` row and the composite gate is strict, so ONE
-    // S_UnknownTypeAttribute is expected here (the composite gate's vocabulary is
-    // `packed` + the align rows, NOT the whole effects table — ✔MEASURED
-    // pre-existing: `struct __attribute__((deprecated)) S {…};` is refused the
-    // same way at HEAD, with an identifier name and no keyword involved). What
-    // this pin owns is that the count is ONE and not TWO: the trailing `packed`
-    // was recognised, not swept into the same refusal.
+    EXPECT_FALSE(model.hasErrors())
+        << "'packed' must still be recognised beside a keyword-named clause — "
+           "the _Static_assert is what proves the LAYOUT, not a diagnostic count";
+    // And the keyword-named clause is still ENUMERATED and judged on its own
+    // merits — it is now reported as a MODELLED attribute this scan cannot honor
+    // rather than refused as unknown, which is the one code both references emit
+    // here. Exactly ONE: the trailing `packed` is consumed, never swept in.
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
-        << "'packed' must still be recognised beside a keyword-named clause";
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AttributeIgnoredForDeclarationKind), 1u)
+        << "the keyword-named clause must be enumerated and judged, not skipped";
 }
 
 

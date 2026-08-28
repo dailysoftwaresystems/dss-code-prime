@@ -204,14 +204,22 @@ TEST(SuppressRequestIgnored, ProtectedCodeWarnsAndTheRunContinuesUnchanged) {
 
     // (1) THE REFUSAL IS SAID — and only when it was asked for.
     //
-    // ⓘ Matched on the code NAME, not on the `D0021` hex prefix, and that is
-    // MEASURED rather than stylistic: the driver's buffer-less renderer
-    // (`program.cpp`'s `severityName(...) << "[" << diagnosticCodeName(...)`)
-    // is the arm every driver-tier `D_*` takes, because it has no source
-    // span to point at. `diagnosticCodePrefix`'s `D0021` spelling belongs to
-    // `DiagnosticReporter::format`, which only positioned diagnostics reach.
-    // The first draft asserted `warning[D0021]` and went RED against a
-    // perfectly correct message.
+    // ⓘ Matched on the code NAME. ★ THIS USED TO BE A NOTE ABOUT WHICH ARM THE
+    // DIAGNOSTIC TOOK, AND IT IS NOW A NOTE ABOUT THE WHOLE COMPILER. What
+    // stood here read: "the driver's buffer-less renderer is the arm every
+    // driver-tier `D_*` takes … `diagnosticCodePrefix`'s `D0021` spelling
+    // belongs to `DiagnosticReporter::format`, which only positioned
+    // diagnostics reach. The first draft asserted `warning[D0021]` and went RED
+    // against a perfectly correct message."
+    //
+    // ⭐ THAT RED IS THE BEST EVIDENCE THE PROJECT HAS THAT THE SPLIT WAS A REAL
+    // DEFECT AND NOT A COSMETIC ONE — a developer read one rendering and wrote
+    // an assertion against the other, which is what a surface with two
+    // spellings guarantees. It is closed: D-DIAG-TWO-CODE-RENDERINGS unified
+    // every render surface on `severity[<diagnosticCodeName>]: `, so the name
+    // below is now correct for the reason it is correct EVERYWHERE, not because
+    // this particular code happens to be buffer-less. The assertions did not
+    // change; only the reason they hold did.
     EXPECT_NE(outSuppress.find("warning[D_SuppressRequestIgnored]"),
               std::string::npos)
         << "no D_SuppressRequestIgnored notice reached stderr. stderr was:\n"

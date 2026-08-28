@@ -1,5 +1,6 @@
 #include "link/format/elf_object_reader.hpp"
 #include "link/format/dwarf_cfi_decode.hpp"
+#include "link/format/foreign_section_alignment.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
 
@@ -134,15 +135,13 @@ rangeExceedsBuffer(std::uint64_t off, std::uint64_t size, std::uint64_t total) n
     return v;
 }
 
-// ELF sh_addralign -> Alignment newtype. sh_addralign 0 or 1 means "no
-// constraint" (byte). Values above the newtype's 256-byte cap or
-// non-power-of-two (never emitted for a producer data section) fall back
-// to byte alignment -- the field is only a re-layout hint (the merge
-// re-lays-out every item), never a correctness input on read-back.
+// ELF sh_addralign -> Alignment newtype. `sh_addralign` is ELF's spelling of
+// the declared section alignment; the POLICY that turns a declared alignment
+// into an `Alignment` is shared with the Mach-O and COFF readers and lives in
+// `link/format/foreign_section_alignment.hpp` -- this reader supplies only the
+// fact that ELF spells it as a raw BYTE COUNT.
 [[nodiscard]] Alignment alignFromSection(std::uint64_t shAddrAlign) noexcept {
-    if (shAddrAlign <= 1u || shAddrAlign > 256u) return Alignment{};
-    return Alignment::fromBytes(static_cast<std::uint32_t>(shAddrAlign))
-        .value_or(Alignment{});
+    return link::format::foreignSectionAlignmentFromByteCount(shAddrAlign);
 }
 
 // NUL-terminated name at strtab[index], bounded by [tabStart, tabEnd).

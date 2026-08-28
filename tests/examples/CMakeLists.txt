@@ -9,11 +9,68 @@
 # them — the trade-off is zero runtime discovery cost AND ctest -j
 # parallelism across examples.
 #
-# Working directory invariant: the runner uses `ScratchDir(InsideRepo)
-# + useAsCwd()`. ScratchDir walks UP from cwd looking for
-# `src/dss-config/`, so the test process MUST start in (or under)
-# the repo tree. CMake's WORKING_DIRECTORY is set to ${CMAKE_SOURCE_DIR}
-# below to guarantee this on every host.
+# ── WORKING DIRECTORY: PER BUILD TREE, NEVER THE CHECKOUT ROOT ───────────────
+#   D-TEST-EXAMPLES-CORPUS-SCRATCH-IS-SHARED-BY-EVERY-BUILD-TREE
+#
+# ★★★ THIS BLOCK USED TO SAY THE OPPOSITE, AND ITS REASON HAD EXPIRED.
+# It read: "the runner uses `ScratchDir(InsideRepo) + useAsCwd()`. ScratchDir
+# walks UP from cwd looking for `src/dss-config/`, so the test process MUST
+# start in (or under) the repo tree" — and therefore pointed every entry below
+# at ${CMAKE_SOURCE_DIR}. ✔MEASURED 2026-08-27, both halves of that sentence are
+# now false:
+#   * `ScratchDir` does NOT walk. `Location::InsideRepo` is literally
+#     `<cwd>/test-scratch/<group>/` (tests/test_support/scratch_dir.hpp) — the
+#     walk belongs to `findShippedConfig`, which is a different question.
+#   * That walk is no longer reached anyway. Every entry registered here carries
+#     `dss_use_config_snapshot`, which sets `$DSS_CONFIG_ROOT` at the run's
+#     snapshot, and `findShippedConfig` prefers the variable over its cwd walk.
+#     The corpus root goes through `tests/test_support/repo_root.hpp`, whose
+#     FIRST candidate is the `DSS_TEST_REPO_ROOT` baked below — which is why
+#     that -D exists and is documented at length further down this file.
+#
+# ⇒ WHAT ${CMAKE_SOURCE_DIR} ACTUALLY BOUGHT WAS A SHARED WRITE TARGET. With the
+# cwd at the checkout root, `<cwd>/test-scratch/examples/` is ONE directory
+# inside the repository that EVERY build tree, EVERY lane and EVERY worktree of
+# this checkout writes into concurrently — the corpus is ~611 entries, so this
+# loop was the largest population of shared-location writers in the repository,
+# and the only ctest population that wrote into the source tree at all (every
+# `dss_add_test` entry has always had its own build directory as cwd).
+# ✔MEASURED on this tree the day this changed: **684 leaked scratch directories**
+# sitting in `<repo>/test-scratch/examples/`, 636 of them dated to a single day,
+# and a fresh 611-entry corpus run left **8 more** — a ~1.3% leak rate, straight
+# into the checkout, forever, because a `remove_all` that loses a race with a
+# still-open handle is best-effort by design.
+#
+# ⚠ THE COLLISION IS NOT WHAT MAKES THIS WRONG, AND SAYING SO IS THE POINT.
+# `ScratchDir`'s ctor claims its slot with `create_directory` (SINGULAR), which
+# is atomic in the OS, so two concurrent processes CANNOT end up in one
+# directory — that was `D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE` and it
+# is closed. ✔MEASURED here: two full 1347-entry corpus runs at `ctest -j 6`,
+# 0 reds. So this change fixes a SHARED-LOCATION defect, not a flake, and a
+# reader must not come away thinking the flake was re-found. What it removes is
+# the last reason for any lane's corpus run to write outside its own build tree.
+#
+# ⇒ `${CMAKE_CURRENT_BINARY_DIR}` — the same cwd `dss_add_test` gives every other
+# entry in the suite. The scratch tree becomes
+# `<build>/tests/examples/test-scratch/examples/<pid>-<n>`: isolated per build
+# tree by construction, and it dies with `local-build.sh --clean` instead of
+# accumulating in the source tree.
+#
+# ⚠ WINDOWS PATH BUDGET, MEASURED rather than assumed (the runtime object cache
+# learned this the expensive way — see `runtime_object_cache.hpp`). The longest
+# path any example composes inside its scratch dir is the staged tree's deepest
+# relative path (27 characters, `libdss_env_probe_aarch64.so`) or the per-format
+# artifact `out/<formatName>/<artifact>` (~79). Against this checkout the base
+# grows from 68 to 83 characters, so the longest composed path moves ~147 → ~162
+# and keeps ~98 characters of headroom under MAX_PATH. CI's Windows checkout
+# (`D:\a\dss-code-prime\dss-code-prime`) is five characters SHORTER than this
+# one, so it has more.
+#
+# The invariant is pinned at runtime, not merely written down here:
+# `Examples.RunFromManifest` and `ExamplesCorpusLint.CorpusScratchIsPerBuildTree`
+# both refuse a cwd that IS the checkout root, so reverting any of the three
+# registrations below reddens the gate instead of passing quietly.
+set(DSS_EXAMPLES_ENTRY_CWD "${CMAKE_CURRENT_BINARY_DIR}")
 
 add_executable(dss_examples_runner examples_runner.cpp)
 target_link_libraries(dss_examples_runner
@@ -169,7 +226,7 @@ foreach(MANIFEST ${EXAMPLE_MANIFESTS})
     add_test(NAME ${TEST_NAME}
              COMMAND dss_examples_runner ${EXAMPLE_DIR}
                      --gtest_filter=-${EXAMPLES_LINT_SUITE}.*
-             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+             WORKING_DIRECTORY ${DSS_EXAMPLES_ENTRY_CWD})
     # D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED.
     # ★ These entries carried NO `DSS_CONFIG_ROOT` at all: the runner's
     # `ScratchDir(InsideRepo) + useAsCwd()` put the cwd under the repo, so every
@@ -218,7 +275,7 @@ foreach(_pair ${EXAMPLES_LINT_NAMED_ENTRIES})
     add_test(NAME "${_lint_entry}"
              COMMAND dss_examples_runner ${CMAKE_SOURCE_DIR}/examples
                      --gtest_filter=${EXAMPLES_LINT_SUITE}.${_lint_test}
-             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+             WORKING_DIRECTORY ${DSS_EXAMPLES_ENTRY_CWD})
     dss_use_config_snapshot("${_lint_entry}")
     dss_refuse_a_vacuous_gtest_selection("${_lint_entry}")
     # The SAME iteration that gave this lint an entry takes it out of the
@@ -240,6 +297,6 @@ endif()
 add_test(NAME "examples/corpus-lints"
          COMMAND dss_examples_runner ${CMAKE_SOURCE_DIR}/examples
                  --gtest_filter=${_dss_lint_catchall}
-         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+         WORKING_DIRECTORY ${DSS_EXAMPLES_ENTRY_CWD})
 dss_use_config_snapshot("examples/corpus-lints")
 dss_refuse_a_vacuous_gtest_selection("examples/corpus-lints")

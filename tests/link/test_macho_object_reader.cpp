@@ -1657,3 +1657,97 @@ TEST(MachoObjectReader, RelocationTargetingAnEqualOffsetAliasBindsToTheOwner) {
         << "a target naming the alias must bind to the atom that owns the body";
     EXPECT_EQ(nameOf(*got, atom.relocations[0].target), "fn1");
 }
+
+// ── THE MACH-O LEG OF THE THREE-READER ALIGNMENT SWEEP ────────────────────
+//    D-FORMAT-MACHO-SECTION-ALIGN-EMITTED-RAW-NOT-LOG2 (the read-side half)
+//
+// The parent row is about `section_64.align` being written RAW where the field
+// is a LOG2 exponent, and its closing work says to check the other walkers for
+// the same class of mistake. Running that sweep across the READ direction found
+// the COFF reader dropping its equivalent field entirely -- and found that
+// NEITHER surviving reader had ever been pinned for carrying its own.
+// ✔MEASURED 2026-08-27: a grep for an EXPECT/ASSERT on `alignment` across
+// `tests/link/**` returned nothing at all.
+//
+// ★ THIS IS THE LEG WHERE THE ENCODING TRAP IS SHARPEST, because this reader
+// faces the SAME field the row was filed about, from the other side. Reading
+// `section_64.align` as a raw byte count answers 5 where 32 is right -- which
+// is not even a power of two, so it degrades to 1 and the atom silently loses
+// its constraint. That is the read-side mirror of writing 16 into a field that
+// then claims 2^16.
+//
+// RED ON DISABLE: drop `di.alignment = alignFromLog2(sec.align)` in
+// `macho_object_reader.cpp`, or route it through
+// `foreignSectionAlignmentFromByteCount` instead of `...FromLog2`.
+TEST(MachOObjectReader, DeclaredSectionAlignmentSurvivesTheRoundTrip) {
+    auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // One item per section, each with a DIFFERENT alignment, so a reader
+    // answering a single constant cannot pass. `section_64.align` is
+    // section-granular and the writer raises it to the section's strictest
+    // member, so one member per section makes the item's own alignment the
+    // value that must come back.
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};   // ret
+    mod.functions.push_back(fn);
+
+    AssembledData wide;
+    wide.symbol    = SymbolId{10};
+    wide.section   = DataSectionKind::Rodata;
+    wide.bytes.assign(32, 0xAB);
+    wide.alignment = Alignment::of<32>();
+    mod.dataItems.push_back(wide);
+
+    AssembledData narrow;
+    narrow.symbol    = SymbolId{11};
+    narrow.section   = DataSectionKind::Data;
+    narrow.bytes     = {7, 0, 0, 0};
+    narrow.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(narrow);
+
+    mod.symbols = {
+        ModuleSymbol{SymbolId{1},  "_fn",     SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{10}, "_wide",   SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{11}, "_narrow", SymbolBinding::Global, SymbolVisibility::Default},
+    };
+
+    DiagnosticReporter wrep;
+    auto objBytes = macho::encode(mod, *loaded.target, *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u);
+    ASSERT_FALSE(objBytes.empty());
+
+    DiagnosticReporter rrep;
+    auto readOpt = macho::readRelocatableObject(objBytes, *loaded.target,
+                                                *loaded.format, rrep);
+    ASSERT_TRUE(readOpt.has_value());
+    ASSERT_EQ(rrep.errorCount(), 0u);
+
+    auto const* rWide   = dataNamed(*readOpt, "_wide");
+    auto const* rNarrow = dataNamed(*readOpt, "_narrow");
+    ASSERT_NE(rWide, nullptr);
+    ASSERT_NE(rNarrow, nullptr);
+    EXPECT_EQ(rWide->alignment.bytes(), 32u)
+        << "section_64.align is a LOG2 EXPONENT; the emitted 5 must come back "
+           "as 32 bytes, never as the raw 5";
+
+    // ⚠ THE FIRST DRAFT OF THIS TEST ASSERTED 4 HERE AND WENT RED AT 8, exactly
+    // as its ELF twin did -- the read-back is SECTION-granular and the shipped
+    // `__data` row declares an `addrAlign` FLOOR the walker H1-RAISES but never
+    // goes below. The recovered value is `max(floor, strictest member)`:
+    // `_wide` raises its section above the floor, `_narrow` sits under it.
+    // Reading the floor from the schema rather than writing the literal 8 keeps
+    // the pin honest across a schema edit.
+    auto const* dataRow = loaded.format->sectionByKind(SectionKind::Data);
+    ASSERT_NE(dataRow, nullptr);
+    EXPECT_EQ(rNarrow->alignment.bytes(),
+              std::max<std::uint64_t>(dataRow->addrAlign, 4u))
+        << "the recovered alignment is the SECTION's -- the schema floor raised "
+           "to the strictest member, never the member's own value on its own";
+    EXPECT_NE(rWide->alignment.bytes(), rNarrow->alignment.bytes())
+        << "a reader answering one constant for every section would satisfy "
+           "either assertion above on its own";
+}

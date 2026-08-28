@@ -13,6 +13,7 @@
 #include <string_view>
 #include <variant>
 
+using dss::lsp::FrameScanState;
 using dss::lsp::frameMessage;
 using dss::lsp::IncomingMessage;
 using dss::lsp::JsonRpc;
@@ -21,6 +22,7 @@ using dss::lsp::Method;
 using dss::lsp::Notification;
 using dss::lsp::ParseErrorKind;
 using dss::lsp::Request;
+using dss::lsp::scanFramedMessage;
 using dss::lsp::tryParseFramedMessage;
 
 // ── JsonRpc::parse — request shapes ────────────────────────────────────
@@ -187,4 +189,73 @@ TEST(JsonRpc, TryParseRejectsMalformedContentLength) {
 TEST(JsonRpc, TryParseRejectsMissingContentLength) {
     std::string body;
     EXPECT_EQ(tryParseFramedMessage("Content-Type: x\r\n\r\n{}", body), -1);
+}
+
+// ── scanFramedMessage — the `bytesNeeded` contract ─────────────────────
+//
+// `tryParseFramedMessage` collapses "incomplete" to a single 0, which is
+// all a caller needs when it can read whatever it likes. A caller over a
+// BLOCKING stream cannot: it must ask for a count that is certain to
+// arrive, and these pins are the promise it relies on. See
+// `StdioTransport::readMessage`.
+
+TEST(JsonRpc, ScanReportsExactRemainderOfAPartialBody) {
+    const auto framed = frameMessage(R"({"x":1})");   // 7-byte body
+    std::string body;
+    // Everything but the last three body bytes.
+    const auto scan = scanFramedMessage(
+        std::string_view{framed}.substr(0, framed.size() - 3), body);
+    EXPECT_EQ(scan.state, FrameScanState::Incomplete);
+    EXPECT_EQ(scan.bytesNeeded, 3u);
+    EXPECT_EQ(scan.consumed, 0u);
+}
+
+TEST(JsonRpc, ScanReportsWholeBodyWhenOnlyTheHeaderHasArrived) {
+    std::string body;
+    const auto scan = scanFramedMessage("Content-Length: 42\r\n\r\n", body);
+    EXPECT_EQ(scan.state, FrameScanState::Incomplete);
+    EXPECT_EQ(scan.bytesNeeded, 42u);
+}
+
+TEST(JsonRpc, ScanCannotSizeAnUnterminatedHeader) {
+    // ZERO here does NOT mean "nothing needed" — it means "not knowable
+    // yet". A reader must take one byte and ask again; taking a fixed
+    // chunk is exactly the defect this field exists to prevent.
+    std::string body;
+    const auto scan = scanFramedMessage("Content-Length: 7\r\n", body);
+    EXPECT_EQ(scan.state, FrameScanState::Incomplete);
+    EXPECT_EQ(scan.bytesNeeded, 0u);
+}
+
+TEST(JsonRpc, ScanReportsConsumedForOneFrameOfMany) {
+    const auto first  = frameMessage(R"({"a":1})");
+    const auto framed = first + frameMessage(R"({"b":2})");
+    std::string body;
+    const auto scan = scanFramedMessage(framed, body);
+    EXPECT_EQ(scan.state, FrameScanState::Complete);
+    EXPECT_EQ(scan.consumed, first.size());
+    EXPECT_EQ(scan.bytesNeeded, 0u);
+    EXPECT_EQ(body, R"({"a":1})");
+}
+
+TEST(JsonRpc, ScanRefusesAnUnterminatedHeaderPastTheCap) {
+    // Without the cap this is an unbounded buffer with no error path:
+    // the reader keeps asking for one more byte until the process dies.
+    std::string body;
+    const std::string junk(dss::lsp::kMaxFrameHeaderBytes + 1, 'A');
+    EXPECT_EQ(scanFramedMessage(junk, body).state,
+              FrameScanState::MalformedHeader);
+    // One byte under the cap is still merely incomplete.
+    const std::string shorter(dss::lsp::kMaxFrameHeaderBytes, 'A');
+    EXPECT_EQ(scanFramedMessage(shorter, body).state,
+              FrameScanState::Incomplete);
+}
+
+TEST(JsonRpc, ScanRefusesAnOversizedTerminatedHeader) {
+    std::string body;
+    const std::string header =
+        "Content-Length: 2\r\nX-Pad: " + std::string(dss::lsp::kMaxFrameHeaderBytes, 'p')
+        + "\r\n\r\n{}";
+    EXPECT_EQ(scanFramedMessage(header, body).state,
+              FrameScanState::MalformedHeader);
 }

@@ -2292,9 +2292,15 @@ namespace {
 // %EFFECTS%    the `attributeSemantics.effects` array;
 // %ROWEXTRA%   extra keys on the single declaration row (trailing comma);
 // %BLOCKS%     extra `semantics` sub-blocks (trailing comma).
+// P42: `linkageExtra` splices EXTRA entries into the row's `linkageSpecifiers`
+// object (it must therefore end in a comma). It defaults to empty so every
+// pre-existing 3-argument call site is untouched — the one test that needs it
+// asks about a COMPOSITE key (`visibility:hidden`), which is a shape the fixed
+// `st` entry cannot express and which no other test needs.
 [[nodiscard]] std::string attrVocabSchema(std::string_view effects,
                                           std::string_view rowExtra,
-                                          std::string_view blocks) {
+                                          std::string_view blocks,
+                                          std::string_view linkageExtra = "") {
     std::string cfg = R"JSON({
       "dssSchemaVersion": 4,
       "language": { "name": "AttrVocab", "version": "0.1.0" },
@@ -2321,7 +2327,7 @@ namespace {
           { "rule": "vdecl", "name": 0, "kind": "variable",
             "specifierPrefix": "vprefix",
             %ROWEXTRA%
-            "linkageSpecifiers": { "st": { "binding": "local" } } }
+            "linkageSpecifiers": { %LINKEXTRA%"st": { "binding": "local" } } }
         ],
         %BLOCKS%
         "attributeSemantics": {
@@ -2332,9 +2338,10 @@ namespace {
         }
       }
     })JSON";
-    cfg.replace(cfg.find("%ROWEXTRA%"), 10, rowExtra);
-    cfg.replace(cfg.find("%BLOCKS%"),    8, blocks);
-    cfg.replace(cfg.find("%EFFECTS%"),   9, effects);
+    cfg.replace(cfg.find("%ROWEXTRA%"),  10, rowExtra);
+    cfg.replace(cfg.find("%LINKEXTRA%"), 11, linkageExtra);
+    cfg.replace(cfg.find("%BLOCKS%"),     8, blocks);
+    cfg.replace(cfg.find("%EFFECTS%"),    9, effects);
     return cfg;
 }
 
@@ -2631,10 +2638,14 @@ TEST(GrammarSchema, AttributeEffectAppliesToMissingOnDeclAttachedRowReportsInval
         << errorDiags(r.error());
 }
 
-// THE EXEMPTION, asserted in the same file as the requirement so neither can
-// drift. A `none`-verb row bundles function-only, type-only, statement-only and
-// elsewhere-consumed names in ONE list, so no single kind set is correct for it
-// — and the loader must not demand one.
+// THE EXEMPTION FROM THE **REQUIREMENT**, asserted in the same file as the
+// requirement so neither can drift. Some inert names have no expressible kind
+// set at all — statement attributes; attributes of aggregate type DEFINITIONS —
+// so the loader must not demand one, and an omitted key must still reach
+// `SemanticConfig` as the empty set the gate reads as "no axis declared".
+// ⚠ P42: exempt from the REQUIREMENT is no longer the same as FORBIDDEN the key
+// — see `AttributeEffectAppliesToOnANoneVerbRowIsPermitted` below, which is the
+// flipped form of the pin that used to assert the refusal.
 TEST(GrammarSchema, AttributeEffectAppliesToIsExemptOnANoneVerbRow) {
     auto const cfg = attrVocabSchema(
         R"([ { "names": ["fallthrough", "likely"], "effect": "none" } ])",
@@ -2652,20 +2663,38 @@ TEST(GrammarSchema, AttributeEffectAppliesToIsExemptOnANoneVerbRow) {
            "the verb)";
 }
 
-// …and the key is REFUSED on a `none` row, not silently accepted. The gate can
-// never read it there (an empty set is what marks the exemption), so accepting
-// it would be a knob that lies — the same defect class as every unknown-key
-// check in this loader.
-TEST(GrammarSchema, AttributeEffectAppliesToOnANoneVerbRowReportsInvalid) {
+// …and the key is PERMITTED on a `none` row — reaching `SemanticConfig`, where
+// the gate reads it exactly as it reads any other row's.
+//
+// ★★ P42 — THIS PIN IS **FLIPPED**, NOT DELETED, AND THE FLIP IS THE FIX. It
+// used to assert the loader REFUSED the key here, on the reasoning that the gate
+// "could never read it there". That reasoning was circular: the gate could not
+// read it only because the shipped `none` row bundled names of different kinds,
+// and the only cure for that bundling is a ROW SPLIT — which a refusal of the
+// key makes pointless. So the refusal did not protect an invariant, it PRESERVED
+// the defect ([[D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT]]'s decl-kind
+// leak, and [[D-CSUBSET-STRICT-ATTRIBUTE-GATE-BLIND-TO-LINKAGE-VOCABULARY]]'s
+// silent typedef, which needs an inert row to carry a kind axis at all).
+// RED-ON-DISABLE: restore the refusal and this load fails.
+TEST(GrammarSchema, AttributeEffectAppliesToOnANoneVerbRowIsPermitted) {
     auto const cfg = attrVocabSchema(
         R"([ { "names": ["fallthrough"], "appliesTo": ["variable"],
                "effect": "none" } ])",
-        kIgnoresDeprecated, "");
+        R"("linkageSpecifierIgnoredNames": ["deprecated", "fallthrough"],)", "");
     auto r = GrammarSchema::loadFromText(cfg);
-    ASSERT_FALSE(r.has_value())
-        << "'appliesTo' on a 'none' row could never be read — accepting it would "
-           "let an author believe a kind restriction is in force when none is";
-    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    ASSERT_TRUE(r.has_value())
+        << "an inert row must be able to declare which kinds its names appertain "
+           "to — without that the decl-kind gate is blind to every name the "
+           "language models but does not act on: "
+        << errorDiags(r.error());
+    ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
+    EXPECT_EQ((*r)->semantics().attributeEffects[0].effect,
+              AttributeEffect::None);
+    ASSERT_EQ((*r)->semantics().attributeEffects[0].appliesTo.size(), 1u);
+    EXPECT_EQ((*r)->semantics().attributeEffects[0].appliesTo[0],
+              AttributeAppliesKind::Variable)
+        << "and it must REACH SemanticConfig — accepted-then-dropped would be "
+           "the knob-that-lies the old refusal was written to prevent";
 }
 
 // An UNKNOWN kind string. The rejection must ENUMERATE the closed set, and the
@@ -2794,9 +2823,57 @@ TEST(GrammarSchema, AttributeEffectAppliesToMultiKindSetReachesConfig) {
     ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
     auto const& applies = (*r)->semantics().attributeEffects[0].appliesTo;
     ASSERT_EQ(applies.size(), 3u);
-    EXPECT_EQ(applies[0], DeclarationKind::Variable);
-    EXPECT_EQ(applies[1], DeclarationKind::Function);
-    EXPECT_EQ(applies[2], DeclarationKind::Type);
+    EXPECT_EQ(applies[0], AttributeAppliesKind::Variable);
+    EXPECT_EQ(applies[1], AttributeAppliesKind::Function);
+    EXPECT_EQ(applies[2], AttributeAppliesKind::Type);
+}
+
+// P42 (D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT): the FIFTH
+// spelling reaches `SemanticConfig`, and it is a value `declarations[].kind`
+// does NOT accept. Both halves are the pin: the first says the vocabulary grew,
+// the second says it grew ONLY on the axis that needed it — a `functionPointer`
+// declaration ROW would be dead config, since no declaration IS a function
+// pointer, it merely declares an object whose type is one.
+TEST(GrammarSchema, AttributeEffectAppliesToAdmitsFunctionPointerSpelling) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["aligned"], "appliesTo": ["function", "functionPointer"],
+               "effect": "align" } ])",
+        R"("linkageSpecifierIgnoredNames": ["aligned"],)", "");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    ASSERT_EQ((*r)->semantics().attributeEffects.size(), 1u);
+    auto const& applies = (*r)->semantics().attributeEffects[0].appliesTo;
+    ASSERT_EQ(applies.size(), 2u);
+    EXPECT_EQ(applies[0], AttributeAppliesKind::Function);
+    EXPECT_EQ(applies[1], AttributeAppliesKind::FunctionPointer);
+    // …and the DECLARATION-kind vocabulary is deliberately unchanged.
+    EXPECT_FALSE(declarationKindFromName("functionPointer").has_value());
+    EXPECT_TRUE(attributeAppliesKindFromName("functionPointer").has_value());
+}
+
+// P42: a COMPOSITE linkage-specifier key covers its own IDENTIFIER half. A key
+// may be `<identifier><sep><string body>` (`visibility:hidden`), and the thing a
+// programmer can WRITE as a clause name is the identifier half — so a row named
+// `visibility` is reachable and the drift check must not fire on it.
+//
+// ⚠ WITHOUT THIS THE CHECK DEMANDS SOMETHING ACTIVELY WRONG, not merely
+// redundant: adding `visibility` to `linkageSpecifierIgnoredNames` would make
+// `visibility("hidden")` be skipped BY NAME, because the HIR lowerer consults
+// that list before it assembles the composite key — the visibility fact would be
+// SILENTLY DROPPED and a hidden symbol would link as default-visible.
+//
+// The verb here is a FIRING one deliberately: the check exempts inert rows (see
+// the exemption pin above), so an inert row would make this test vacuous — it
+// would pass with the base-name insert deleted. RED-ON-DISABLE: drop the
+// `linkageSpecifierBaseName` insert and this load FAILS.
+TEST(GrammarSchema, AttributeVocabularyDriftCheckCoversCompositeSpecifierBaseName) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["visibility"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" } ])",
+        R"("linkageSpecifierIgnoredNames": ["somethingElse"],)", "",
+        R"("visibility:hidden": { "visibility": "hidden" }, )");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
 }
 
 // ★ THE SHIPPED CONFIG ITSELF loads with every non-`none` row carrying a
@@ -2818,11 +2895,18 @@ TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedC) {
     ASSERT_TRUE(r.has_value())
         << "the shipped c config must satisfy its own `appliesTo` rule";
     std::size_t declAttached = 0;
+    std::size_t inertWithKinds = 0;
     for (auto const& row : (*r)->semantics().attributeEffects) {
         if (row.effect == AttributeEffect::None) {
-            EXPECT_TRUE(row.appliesTo.empty())
-                << "a 'none' row must carry NO kind set — an empty set is what "
-                   "marks the exemption the engine's gate reads";
+            // ★★ P42 — THE ASSERTION HERE IS **FLIPPED**, NOT DROPPED. It used
+            // to demand that an inert row carry NO kind set, on the reading that
+            // "an empty set marks the exemption the engine's gate reads". The
+            // gate's reading is unchanged — empty still means "no axis declared"
+            // — but the loader no longer FORBIDS the key, and the shipped config
+            // now splits its inert vocabulary so that the names whose applicable
+            // kind IS expressible say so. Demanding emptiness would re-freeze
+            // exactly the bundling that made the decl-kind silence structural.
+            if (!row.appliesTo.empty()) ++inertWithKinds;
             continue;
         }
         ++declAttached;
@@ -2839,15 +2923,35 @@ TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedC) {
            "noSanitizeThread. A lower count means a row was lost, demoted to "
            "'none', or merged back into a sibling — each of which is how a sink "
            "goes silent, and the middle two are invisible to a verb-count";
+    // ★ P42: and the inert half is asserted POSITIVELY rather than merely
+    // permitted — the shipped `none` vocabulary is SPLIT, so at least two of its
+    // rows declare a kind axis (function-only, and function-or-function-pointer,
+    // plus the linkage row). A count of zero here would mean the split was
+    // reverted or merged back, which is precisely how
+    // D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT's decl-kind leak returns:
+    // silently, with every other assertion in this file still green.
+    EXPECT_GE(inertWithKinds, 3u)
+        << "the shipped inert vocabulary must stay SPLIT by applicable kind — a "
+           "single bundled 'none' row cannot carry a correct kind set, which is "
+           "what made the decl-kind silence structural rather than chosen";
 }
 
 // ── the drift cross-check ─────────────────────────────────────────────────
 
 // BASELINE. A consistent vocabulary loads clean, so every negative below
-// cannot pass for the wrong reason. Note what this pins POSITIVELY: the inert
-// `fallthrough` is NOT linkage-ignored and that is FINE — a statement-attached
-// attribute never reaches a declaration's specifier scan, and a cross-check
-// that demanded it would reject correct config.
+// cannot pass for the wrong reason.
+//
+// ★★ P42 — THAT POSITIVE PIN WAS ATTACKED THIS CYCLE AND **SURVIVED BY
+// MEASUREMENT**; it is stronger than its own wording suggests, so read the
+// engine comment beside the `AttributeEffect::None` skip before touching it.
+// Deleting the skip looks right — nothing else forces an inert name into the
+// roster, which is exactly how three of the shipped c's inert names drifted out
+// of it unnoticed. But the roster entry the check then demands ✔MEASURED turns
+// `__attribute__((packed)) struct S { char c; int v; } gv;` from a loud refusal
+// into rc=0 with `sizeof == 8`, byte-identical to the UNPACKED control: the
+// ignored-name list is consulted BEFORE anything can honor the attribute, so
+// the entry discards a LAYOUT FACT rather than a diagnostic. The exemption is
+// load-bearing, not unfinished.
 TEST(GrammarSchema, AttributeVocabularyConsistentPairLoadsCleanly) {
     auto const cfg =
         attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, "");
@@ -2890,6 +2994,29 @@ TEST(GrammarSchema, AttributeVocabularyDriftedIgnoreListReportsInvalid) {
 // cross-check from becoming the over-broad "every effects name must be
 // ignored everywhere" rule, which would reject the shipped c (whose
 // `fallthrough`/`likely`/`packed` rows are deliberately not ignore-listed).
+//
+// ★★★ P42 — THIS PIN IS **STRONGER THAN IT LOOKS, AND IT WAS EARNED**. The
+// exemption reads like an unfinished carve-out, and this cycle tried to delete
+// it: nothing else forces an inert name into `linkageSpecifierIgnoredNames`,
+// which is exactly how `packed`, `may_alias` and `transparent_union` drifted out
+// of the shipped roster unnoticed, leaving `__attribute__((packed)) int gv = 1;`
+// a loud `error[H000C]` where clang 18.1.3 and gcc 13.3.0 both compile at rc=0.
+//
+// ⛔ THE REMEDY THE CHECK PRESCRIBES IS A SILENT MISCOMPILE FOR THOSE THREE.
+// ✔MEASURED end-to-end with the shipped CLI, the skip deleted and `packed` duly
+// added to the roster: `__attribute__((packed)) struct S { char c; int v; } gv;`
+// went from a loud refusal to **rc=0 with `sizeof(struct S) == 8`** — identical
+// to the UNPACKED control, while the trailing spelling still yields 5. The
+// linkage scan consults the ignored-name list BEFORE anything can honor the
+// attribute, so the entry discards a LAYOUT FACT, not a diagnostic.
+//
+// ★ The general reading, which is the part worth carrying: the check infers
+// "this effects row is UNREACHABLE" from "this declaration form refuses the
+// name". For a FIRING verb that holds. For an INERT name it does not — c's
+// `packed` row is reached from `typedefDecl`/`structSpec`/the member rows, none
+// of which runs the strict scan, and the file-scope refusal is a DELIBERATE
+// statement that DSS cannot honor `packed` there. Do not delete this exemption
+// without a way to tell those two apart.
 TEST(GrammarSchema, AttributeVocabularyInertEffectNeedsNoIgnoreEntry) {
     auto const cfg = attrVocabSchema(
         R"([ { "names": ["deprecated"], "appliesTo": ["variable"],

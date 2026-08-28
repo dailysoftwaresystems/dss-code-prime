@@ -3562,9 +3562,25 @@ struct Lowerer {
         if (!tieAsmReadWriteOperands(desc, id, outs, ins)) return false;
 
         // ── 2. the ONE per-instruction constraint ──
+        // ⚠ THE ORDINAL ARRAYS FILLED BELOW ARE SCRATCH FOR THE INVARIANT
+        // QUERY, NOT A HALF-RESOLUTION THE POOL COULD INHERIT.
+        // `regConstraintPoolAdd` RE-DERIVES all five arrays from the names
+        // ("names are the authored source of truth"), so nothing written here
+        // survives into the pool. `lir_text.cpp`'s `constraintSubsetHolds` is
+        // the precedent for the shape, and for the same reason: the rule is
+        // stated over ORDINALS, so a caller that wants to ask it must hold
+        // them. This tier is not resolving anything EARLY to do it — every
+        // ordinal below is already in hand (`AsmBound::ordinal`,
+        // `canonicalAsmRegister`'s out-parameter) and used to be discarded.
         ImplicitRegisterConstraint c;
-        for (auto const& b : ins)  if (b.pinned) c.inputNames.push_back(b.name);
-        for (auto const& b : outs) if (b.pinned) c.outputNames.push_back(b.name);
+        for (auto const& b : ins) {
+            if (b.pinned) c.inputNames.push_back(b.name);
+        }
+        for (auto const& b : outs) {
+            if (!b.pinned) continue;
+            c.outputNames.push_back(b.name);
+            c.outputOrdinals.push_back(b.ordinal);
+        }
         // The SOURCE's clobber list, resolved through the target's table. (The
         // `"memory"` and `"cc"` spellings never reach here — the front end
         // hoists them into `clobbersMemory` / `clobbersConditionCodes`, so this
@@ -3578,55 +3594,59 @@ struct Lowerer {
                 return false;
             }
             c.clobberedNames.push_back(std::move(name));
+            c.clobberedOrdinals.push_back(ord);
         }
-        // ★★★ `outputs ⊆ clobbered`, REPLICATED HERE BECAUSE NO LOADER RUNS ON
-        // THIS PATH. ✔MEASURED: the target JSON loader enforces the invariant for
-        // the per-OPCODE carrier (`target_schema_json.cpp`), and
-        // `effectiveForbiddenOrdinals` deliberately omits OUTPUTS from the
-        // forbidden set — *"the instruction reads its operands BEFORE writing its
-        // outputs"*. The second is safe ONLY because of the first. The
-        // per-INSTRUCTION carrier is lowering-built and meets no loader, so
-        // without this loop a value live in the output's register ACROSS the
-        // block keeps its allocation and dies with no diagnostic.
+        // ★★★ GNU SEMANTICS → THE CARRIER'S CONTRACT, AND THIS IS **NOT** THE
+        // INVARIANT CHECK — it is the translation that makes the invariant
+        // TRUE, which is a different operation and stays a separate loop.
+        // A `"=a"` output is a register the block WRITES, and GNU C forbids the
+        // SOURCE from naming an output register in the clobber list (gcc and
+        // clang both reject it), so the user CANNOT declare what the allocator
+        // needs to read. This tier is the only place that knows both halves.
+        // Without it a value live in the output's register ACROSS the block
+        // keeps its allocation and dies with no diagnostic.
         // (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED)
-        for (auto const& outName : c.outputNames) {
-            bool present = false;
-            for (auto const& cl : c.clobberedNames) {
-                if (cl == outName) { present = true; break; }
-            }
-            if (!present) c.clobberedNames.push_back(outName);
+        //
+        // ⚠ KEYED BY ORDINAL, NOT BY NAME, SO IT AGREES WITH THE RULE IT IS
+        // SATISFYING. The name compare it replaced would have re-added a
+        // register already clobbered under a different spelling; the check
+        // below reads ordinals, so a name-keyed normalization could hand it a
+        // pair it then refused. Both arrays grow together — the names are the
+        // authored source of truth the builder re-resolves, the ordinals are
+        // scratch for the query.
+        for (std::size_t k = 0; k < c.outputOrdinals.size(); ++k) {
+            if (c.outputIsClobbered(k)) continue;
+            c.clobberedNames.push_back(c.outputNames[k]);
+            c.clobberedOrdinals.push_back(c.outputOrdinals[k]);
         }
-        // The fail-loud half. The loop above cannot leave a violation behind, so
-        // reaching this is a defect in THIS function rather than in its input —
-        // which is exactly when a silent pass is most expensive, because the
-        // invariant it guards is invisible to every downstream test.
-        // ⓘ `regConstraintPoolAdd` now ABORTS on the same violation
-        // (`ImplicitRegisterConstraint::firstOutputNotClobbered`), so this loop
-        // is no longer the only guard — but it stays, and it stays FIRST: this
-        // tier is fed by USER text and owes a diagnostic, never a process kill.
-        // The builder's abort is the backstop for producers that forget; the
-        // ordinal-based query cannot be used here because the ordinals are
-        // derived by the builder, so the canonical NAMES are what this tier has.
-        for (auto const& outName : c.outputNames) {
-            bool present = false;
-            for (auto const& cl : c.clobberedNames) {
-                if (cl == outName) { present = true; break; }
-            }
-            if (!present) {
-                dss::report(reporter,
-                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
-                    DiagnosticSeverity::Error,
-                    std::format(
-                        "inline asm (MIR inst {}): internal invariant violated — "
-                        "output register '{}' is not in the instruction's clobber "
-                        "set. Register allocation omits outputs from the "
-                        "forbidden set on the strength of `outputs ⊆ clobbered`, "
-                        "so shipping this entry would let a value live across the "
-                        "block keep a register the block overwrites "
-                        "(D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-"
-                        "CLOBBERED)", id.v, outName));
-                return false;
-            }
+        // The fail-loud half, ASKED WITH THE TYPE'S OWN QUERY — one rule, one
+        // implementation, shared with the `.target.json` loader, the `.dsslir`
+        // reader and `regConstraintPoolAdd`. The loop above cannot leave a
+        // violation behind, so reaching this is a defect in THIS function
+        // rather than in its input — which is exactly when a silent pass is
+        // most expensive, because the invariant it guards is invisible to every
+        // downstream test.
+        // ⓘ `regConstraintPoolAdd` ABORTS on the same violation, so this is no
+        // longer the only guard — but it stays, and it stays FIRST: this tier
+        // is fed by USER text and owes a diagnostic, never a process kill. The
+        // builder's abort is the backstop for producers that forget.
+        if (auto const bad = c.firstOutputNotClobbered(); bad.has_value()) {
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "inline asm (MIR inst {}): internal invariant violated — "
+                    "output register '{}' is not in the instruction's clobber "
+                    "set. Register allocation omits outputs from the "
+                    "forbidden set on the strength of `outputs ⊆ clobbered`, "
+                    "so shipping this entry would let a value live across the "
+                    "block keep a register the block overwrites ("
+                    // Break BEFORE the id and AFTER it, never inside it: a
+                    // split id still READS as a citation but no grep for the
+                    // whole id returns it, so it does not fail — it vanishes.
+                    "D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED"
+                    ")", id.v, c.outputNames[*bad]));
+            return false;
         }
         bool const anyConstraint = !c.inputNames.empty()
                                 || !c.outputNames.empty()

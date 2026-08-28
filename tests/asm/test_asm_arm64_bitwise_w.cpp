@@ -232,10 +232,9 @@ TEST(Arm64BitwiseWForms, CPathWidth32ElectsTheWForm) {
     auto const x2 = s->registerByName("x2");
     ASSERT_TRUE(x0.has_value() && x1.has_value() && x2.has_value());
 
-    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
-    LirReg const r0{static_cast<std::uint32_t>(*x0), 1, cls};
-    LirReg const r1{static_cast<std::uint32_t>(*x1), 1, cls};
-    LirReg const r2{static_cast<std::uint32_t>(*x2), 1, cls};
+    LirReg const r0 = makePhysicalReg(static_cast<std::uint32_t>(*x0), LirRegClass::GPR);
+    LirReg const r1 = makePhysicalReg(static_cast<std::uint32_t>(*x1), LirRegClass::GPR);
+    LirReg const r2 = makePhysicalReg(static_cast<std::uint32_t>(*x2), LirRegClass::GPR);
 
     // Same builder shape at both widths — the ONLY difference is the width flag,
     // so a difference in the emitted word can only come from variant election.

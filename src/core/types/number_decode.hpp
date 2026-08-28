@@ -51,6 +51,98 @@ stripTrailingSuffix(std::string_view text,
     return text;
 }
 
+// The digit VALUE of one character under the a..z → 10..35 map that covers
+// every loader-admitted radix in [2,36], or nullopt for a character that is
+// not a digit at all. ONE owner: `decodeInteger`, `decodeBigInteger` and the
+// digit-valued-prefix test below all read it, so the map cannot drift between
+// a decoder and the rule that decides whether a body has any digits.
+[[nodiscard]] inline std::optional<std::uint64_t>
+digitValue(char c) noexcept {
+    if (c >= '0' && c <= '9') return static_cast<std::uint64_t>(c - '0');
+    if (c >= 'a' && c <= 'z') return static_cast<std::uint64_t>(10 + (c - 'a'));
+    if (c >= 'A' && c <= 'Z') return static_cast<std::uint64_t>(10 + (c - 'A'));
+    return std::nullopt;
+}
+
+// An integer literal's text after the ONE normalization every reader of one
+// shares. `digits` is the body the digit loop consumes; `base` its resolved
+// radix; `prefixed` whether a declared prefix matched at all (the RADIX CLASS
+// C 6.4.4.1 keys its extra unsigned candidates on).
+struct IntegerLiteralBody {
+    std::string   digits;
+    std::uint64_t base     = 10;
+    bool          prefixed = false;
+};
+
+// ★★ THE ONE NORMALIZATION — strip ONE trailing declared suffix, strip digit
+// separators, resolve the radix from the LONGEST declared prefix. This was
+// written out THREE times (`integerLiteralIsPrefixed`, `decodeInteger`,
+// `decodeBigInteger`), and the three had drifted: the two decoders disagreed
+// about whether an empty digit body is the value ZERO or a malformed token.
+// D-CSUBSET-BITINT-ZERO-LITERAL-EATEN-BY-THE-OCTAL-PREFIX is exactly that
+// disagreement reaching a user — `0wb` decoded fine through `decodeInteger`
+// and came back `nullopt` from `decodeBigInteger`, whose caller then reported
+// the u64 fall-through's message and told the programmer their ZERO was
+// "too large for any declared type".
+//
+// ★ A PREFIX IS A RADIX MARKER — EXCEPT WHEN IT IS ITSELF THE LITERAL'S
+// DIGITS. C's octal prefix is spelled `0`, and C 6.4.4.1 gives
+// `octal-constant: 0 | octal-constant octal-digit` — the leading `0` is the
+// grammar's BASE CASE, a digit and not merely a marker. So consuming it out of
+// `0` leaves an empty body that is not malformed at all; it is the number
+// zero. The rule, stated once and applied by every reader: the prefix is
+// removed UNLESS removing it would empty the body AND the prefix is itself a
+// valid digit sequence in the resolved radix.
+//
+// ⚠ Deliberately NOT a config key. ✔MEASURED across every shipped
+// `integerPrefixes` table: `0x`/`0X`/`0b`/`0B`/`0o`/`0O` all carry a letter
+// that is NOT a valid digit in their own radix ('x'→33 ≥ 16, 'b'→11 ≥ 2,
+// 'o'→24 ≥ 8), so they stay pure markers and `0xwb`/`0bwb`/`0owb` remain
+// malformed here exactly as before — while `0` is all-digits and stands alone.
+// The fact does not vary along any axis a key would carry; it is one decoder
+// rule derived from the radix the config already declares.
+[[nodiscard]] inline IntegerLiteralBody
+normalizeIntegerLiteral(std::string_view text, NumberStyle const* ns) {
+    IntegerLiteralBody out;
+    if (ns != nullptr) {
+        text = stripTrailingSuffix(text, ns->integerSuffixes);
+    }
+    out.digits.reserve(text.size());
+    char const sep = (ns && ns->digitSeparator) ? *ns->digitSeparator : '\0';
+    for (char c : text) {
+        if (sep != '\0' && c == sep) continue;
+        out.digits += c;
+    }
+    if (ns == nullptr) return out;
+
+    std::size_t  bestLen   = 0;
+    std::uint8_t bestRadix = 10;
+    for (auto const& p : ns->integerPrefixes) {
+        if (p.prefix.size() > bestLen && out.digits.size() >= p.prefix.size()
+            && std::string_view{out.digits}.substr(0, p.prefix.size()) == p.prefix) {
+            bestLen   = p.prefix.size();
+            bestRadix = p.radix;
+        }
+    }
+    if (bestLen == 0) return out;
+    out.prefixed = true;
+    out.base     = bestRadix;
+    if (out.digits.size() == bestLen) {
+        // The prefix is the WHOLE text. Keep it as the body when every one of
+        // its characters is a digit in the radix it just selected — that is
+        // the `0`-is-octal-zero case — and drop it otherwise, leaving an empty
+        // body the caller may judge malformed.
+        bool allDigits = true;
+        for (char c : out.digits) {
+            auto const d = digitValue(c);
+            if (!d.has_value() || *d >= out.base) { allDigits = false; break; }
+        }
+        if (allDigits) return out;
+    }
+    out.digits.erase(0, bestLen);
+    return out;
+}
+
 }  // namespace detail
 
 // FC3 c1: the declared integer suffix spelling an integer literal's raw
@@ -75,90 +167,60 @@ matchFloatSuffix(std::string_view text, NumberStyle const* ns) {
     return detail::matchTrailingSuffix(text, ns->floatSuffixes);
 }
 
-// FC3 c1: true iff the literal's text (suffix + separators stripped —
-// the SAME normalization `decodeInteger` applies) starts with a declared
-// `integerPrefixes` prefix. This is the ladder's radix-CLASS test: C
-// 6.4.4.1 gives octal/hex ("nondecimal") constants extra unsigned
-// candidates. Mirrors `decodeInteger`'s longest-prefix scan exactly so
-// the class and the decoded value can never disagree about the radix.
+// FC3 c1: true iff the literal's text (suffix + separators stripped) starts
+// with a declared `integerPrefixes` prefix. This is the ladder's radix-CLASS
+// test: C 6.4.4.1 gives octal/hex ("nondecimal") constants extra unsigned
+// candidates. It reads the SHARED normalization rather than mirroring the
+// decoders' prefix scan, so the class and the decoded value cannot disagree
+// about the radix even in principle.
+//
+// ★ `0` IS PREFIXED, and that is C 6.4.4.1's own reading — `0` is an
+// octal-constant, so it takes the nondecimal candidate list. Unchanged by the
+// digit-valued-prefix rule, which decides what the DIGIT BODY is, never
+// whether a prefix matched.
 [[nodiscard]] inline bool
 integerLiteralIsPrefixed(std::string_view text, NumberStyle const* ns) {
-    if (ns == nullptr) return false;
-    text = detail::stripTrailingSuffix(text, ns->integerSuffixes);
-    std::string s;
-    s.reserve(text.size());
-    char const sep = ns->digitSeparator ? *ns->digitSeparator : '\0';
-    for (char c : text) {
-        if (sep != '\0' && c == sep) continue;
-        s += c;
-    }
-    for (auto const& p : ns->integerPrefixes) {
-        if (s.size() >= p.prefix.size()
-            && std::string_view{s}.substr(0, p.prefix.size()) == p.prefix) {
-            return true;
-        }
-    }
-    return false;
+    return detail::normalizeIntegerLiteral(text, ns).prefixed;
 }
 
-// Decode an integer literal's text per the language's NumberStyle:
-// strip ONE trailing declared integer suffix, strip digit separators,
-// resolve the radix from the longest matching DECLARED prefix
-// (FC1 cycle 2, 2026-06-10 — previously a hardcoded 0x/0b/0o/0 set
-// that silently returned 0 for any non-C-shaped prefix like `$ff`),
-// then parse base-valid digits. Returns std::nullopt on overflow of
-// the 64-bit accumulator (the value is reported by the caller, never
-// silently wrapped). `ns` may be null (treated as plain decimal, no
-// separator, no prefixes, no suffixes).
+// Decode an integer literal's text per the language's NumberStyle, over the
+// SHARED `normalizeIntegerLiteral` (one suffix strip, separator strip and
+// longest-declared-prefix radix resolution — FC1 cycle 2, 2026-06-10, which
+// replaced a hardcoded 0x/0b/0o/0 set that silently returned 0 for any
+// non-C-shaped prefix like `$ff`). Returns std::nullopt on overflow of the
+// 64-bit accumulator (the value is reported by the caller, never silently
+// wrapped). `ns` may be null (treated as plain decimal, no separator, no
+// prefixes, no suffixes).
 //
 // The suffix strip happens FIRST (on the raw text) because at high
 // radices a suffix letter is also a valid digit ('u' is the digit 30
 // in base ≥31) — the digit loop's stop-at-non-digit can no longer be
 // relied on to terminate at the suffix.
+//
+// ⚠ This decoder deliberately keeps NO "no digits at all" verdict: it returns
+// 0 for an empty body, and its `nullopt` means OVERFLOW to every caller. Do
+// not add an `anyDigit` guard here — it would report a malformed token under
+// the overflow diagnostic, which is the mirror image of
+// D-CSUBSET-BITINT-ZERO-LITERAL-EATEN-BY-THE-OCTAL-PREFIX (there, a
+// well-formed ZERO was reported as an overflow). Since the shared
+// normalization now keeps a digit-valued prefix as the body, an empty body
+// reaching here means a token the tokenizer already refuses.
 [[nodiscard]] inline std::optional<std::uint64_t>
 decodeInteger(std::string_view text, NumberStyle const* ns) {
-    if (ns != nullptr) {
-        text = detail::stripTrailingSuffix(text, ns->integerSuffixes);
-    }
-    std::string s;
-    s.reserve(text.size());
-    char const sep = (ns && ns->digitSeparator) ? *ns->digitSeparator : '\0';
-    for (char c : text) {
-        if (sep != '\0' && c == sep) continue;
-        s += c;
-    }
-    std::string_view v{s};
-    std::uint64_t base = 10;
-    if (ns != nullptr) {
-        std::size_t  bestLen   = 0;
-        std::uint8_t bestRadix = 10;
-        for (auto const& p : ns->integerPrefixes) {
-            if (p.prefix.size() > bestLen && v.size() >= p.prefix.size()
-                && v.substr(0, p.prefix.size()) == p.prefix) {
-                bestLen   = p.prefix.size();
-                bestRadix = p.radix;
-            }
-        }
-        if (bestLen > 0) {
-            base = bestRadix;
-            v.remove_prefix(bestLen);
-        }
-    }
-    // Parse as many base-valid digits as possible. Letters map a..z →
-    // 10..35 (covering every loader-admitted radix in [2,36]; the
-    // pre-FC1c2 map stopped at 'f', silently mis-valuing radix-17+
-    // configs).
+    auto const body = detail::normalizeIntegerLiteral(text, ns);
+    // Parse as many base-valid digits as possible. The digit map (a..z →
+    // 10..35, covering every loader-admitted radix in [2,36]) is
+    // `detail::digitValue`'s, shared with `decodeBigInteger` — the pre-FC1c2
+    // map stopped at 'f' and silently mis-valued radix-17+ configs, and two
+    // hand-copies of the replacement is how that class of defect returns.
     std::uint64_t value = 0;
-    for (char c : v) {
-        std::uint64_t digit;
-        if (c >= '0' && c <= '9') digit = static_cast<std::uint64_t>(c - '0');
-        else if (c >= 'a' && c <= 'z') digit = static_cast<std::uint64_t>(10 + (c - 'a'));
-        else if (c >= 'A' && c <= 'Z') digit = static_cast<std::uint64_t>(10 + (c - 'A'));
-        else break;  // stray char (e.g. a fraction point) — caller's domain
-        if (digit >= base) break;
-        if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / base)
+    for (char c : body.digits) {
+        auto const d = detail::digitValue(c);
+        if (!d.has_value()) break;  // stray char (e.g. a fraction point) — caller's domain
+        if (*d >= body.base) break;
+        if (value > (std::numeric_limits<std::uint64_t>::max() - *d) / body.base)
             return std::nullopt;  // overflow — caller reports
-        value = value * base + digit;
+        value = value * body.base + *d;
     }
     return value;
 }
@@ -167,47 +229,30 @@ decodeInteger(std::string_view text, NumberStyle const* ns) {
 // to its ARBITRARY-MAGNITUDE unsigned value as little-endian 64-bit limbs. The
 // sibling of `decodeInteger` for a `wb`/`uwb` bit-precise literal ONLY — whose
 // magnitude may exceed u64 (`633825300114114700748351602688uwb`), which
-// `decodeInteger` rejects (nullopt) by design. Same normalization as
-// `decodeInteger` (strip ONE declared suffix, strip separators, resolve the
-// radix from the longest declared prefix), then a bignum multiply-accumulate.
-// Returns std::nullopt only when the body has NO base-valid digits (a malformed
-// token the caller surfaces fail-loud) — never on "overflow" (there is none).
-// `ns` may be null (plain decimal). The suffix strip happens FIRST (a suffix
-// letter is a valid high-radix digit).
+// `decodeInteger` rejects (nullopt) by design. Literally the SAME
+// normalization as `decodeInteger` — `normalizeIntegerLiteral`, one function,
+// not a second copy of the same four steps — then a bignum
+// multiply-accumulate. Returns std::nullopt only when the body has NO
+// base-valid digits (a malformed token the caller surfaces fail-loud) — never
+// on "overflow" (there is none). `ns` may be null (plain decimal). The suffix
+// strip happens FIRST (a suffix letter is a valid high-radix digit).
+//
+// ★ D-CSUBSET-BITINT-ZERO-LITERAL-EATEN-BY-THE-OCTAL-PREFIX: the `anyDigit`
+// verdict below is CORRECT and stays. What was wrong lived one step earlier —
+// the normalization consumed `0`'s only digit as a radix marker, so a
+// well-formed `0wb` arrived here with an empty body and came back malformed.
+// The fix is in the shared normalization, which is why the two callers this
+// decoder shares with `cst_const_eval` and `cst_to_hir` needed no edit.
 [[nodiscard]] inline std::optional<std::vector<std::uint64_t>>
 decodeBigInteger(std::string_view text, NumberStyle const* ns) {
-    if (ns != nullptr) {
-        text = detail::stripTrailingSuffix(text, ns->integerSuffixes);
-    }
-    std::string s;
-    s.reserve(text.size());
-    char const sep = (ns && ns->digitSeparator) ? *ns->digitSeparator : '\0';
-    for (char c : text) {
-        if (sep != '\0' && c == sep) continue;
-        s += c;
-    }
-    std::string_view v{s};
-    std::uint64_t base = 10;
-    if (ns != nullptr) {
-        std::size_t  bestLen   = 0;
-        std::uint8_t bestRadix = 10;
-        for (auto const& p : ns->integerPrefixes) {
-            if (p.prefix.size() > bestLen && v.size() >= p.prefix.size()
-                && v.substr(0, p.prefix.size()) == p.prefix) {
-                bestLen   = p.prefix.size();
-                bestRadix = p.radix;
-            }
-        }
-        if (bestLen > 0) { base = bestRadix; v.remove_prefix(bestLen); }
-    }
+    auto const body = detail::normalizeIntegerLiteral(text, ns);
+    std::uint64_t const base = body.base;
     std::vector<std::uint64_t> mag{0};   // little-endian magnitude accumulator
     bool anyDigit = false;
-    for (char c : v) {
-        std::uint64_t digit;
-        if (c >= '0' && c <= '9') digit = static_cast<std::uint64_t>(c - '0');
-        else if (c >= 'a' && c <= 'z') digit = static_cast<std::uint64_t>(10 + (c - 'a'));
-        else if (c >= 'A' && c <= 'Z') digit = static_cast<std::uint64_t>(10 + (c - 'A'));
-        else break;                       // stray char — caller's domain
+    for (char c : body.digits) {
+        auto const dv = detail::digitValue(c);
+        if (!dv.has_value()) break;       // stray char — caller's domain
+        std::uint64_t const digit = *dv;
         if (digit >= base) break;
         anyDigit = true;
         // mag = mag * base + digit, as a little-endian bignum multiply-accumulate.

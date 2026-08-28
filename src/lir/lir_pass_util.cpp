@@ -94,15 +94,22 @@ remapBlockRef(LirOperand const& op,
     return op;
 }
 
-bool emitTerminator(LirBuilder& b, std::uint16_t op,
-                    TargetOpcodeInfo const* info,
-                    std::span<LirBlockId const> succs,
-                    std::span<LirOperand const> newOps,
-                    std::uint32_t payload,
-                    std::uint8_t  flags,
-                    std::unordered_map<std::uint32_t, LirBlockId> const& srcToDst,
-                    std::string_view passName,
-                    DiagnosticReporter& reporter) {
+namespace {
+
+// The dispatch proper. Split from `emitTerminator` so the POISON below is
+// applied at ONE place rather than at each `return false` — a future refusal
+// arm added here inherits it, and cannot be the arm that forgot.
+// (D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE.)
+[[nodiscard]] bool
+emitTerminatorDispatch(LirBuilder& b, std::uint16_t op,
+                       TargetOpcodeInfo const* info,
+                       std::span<LirBlockId const> succs,
+                       std::span<LirOperand const> newOps,
+                       std::uint32_t payload,
+                       std::uint8_t  flags,
+                       std::unordered_map<std::uint32_t, LirBlockId> const& srcToDst,
+                       std::string_view passName,
+                       DiagnosticReporter& reporter) {
     // Schema-driven dispatch via `info->terminatorKind` — shared with
     // the `.dsslir` parser. Earlier draft used a successor-count +
     // operand-emptiness heuristic that silently mis-classified any
@@ -171,6 +178,44 @@ bool emitTerminator(LirBuilder& b, std::uint16_t op,
                        passName, static_cast<unsigned>(op),
                        targetTerminatorKindName(info->terminatorKind),
                        static_cast<unsigned>(succs.size())));
+    return false;
+}
+
+} // namespace
+
+bool emitTerminator(LirBuilder& b, std::uint16_t op,
+                    TargetOpcodeInfo const* info,
+                    std::span<LirBlockId const> succs,
+                    std::span<LirOperand const> newOps,
+                    std::uint32_t payload,
+                    std::uint8_t  flags,
+                    std::unordered_map<std::uint32_t, LirBlockId> const& srcToDst,
+                    std::string_view passName,
+                    DiagnosticReporter& reporter) {
+    if (emitTerminatorDispatch(b, op, info, succs, newOps, payload, flags,
+                               srcToDst, passName, reporter)) {
+        return true;
+    }
+    // ★★★ D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE — THE REFUSAL IS
+    // TERMINAL FOR THE WHOLE REBUILD, SO SAY SO TO THE BUILDER AND NOT ONLY
+    // TO THE CALLER.
+    //
+    // Every arm above reports a diagnostic and appends NOTHING, which leaves
+    // the caller's open block without a terminator. Five passes call this,
+    // each of which must then stop driving `b` — and the `[[nodiscard]]`
+    // return can only make them LOOK at the answer, never act on it. A caller
+    // that reads the bool, records a failure flag and carries on is the
+    // original defect verbatim: it reported success and the process died
+    // inside `LirBuilder::closeFunction`.
+    //
+    // Poisoning here removes that possibility for every present and future
+    // caller in one line: `finish()` on a poisoned builder yields an empty
+    // module, so the worst a forgotten bail can now produce is the same
+    // already-diagnosed empty result the correct bail produces. The callers
+    // still check — bailing early is cheaper and keeps the diagnostic count
+    // at one — but their check is no longer what stands between a refusal and
+    // a process kill.
+    b.poison();
     return false;
 }
 

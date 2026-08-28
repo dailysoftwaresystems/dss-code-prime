@@ -6874,4 +6874,368 @@ TEST(ShippedLibDescriptor, RealTimeAndSysStatShareOneTimespecTypeId) {
     EXPECT_EQ(interner.kind(fromTime->typeId), TypeKind::Struct);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// D-FFI-DESCRIPTOR-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR — the interner-free
+// `constants` read, the second seam of the ONE owner `preprocessorVisible`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The projection: value BIT PATTERN, declared signedness, declared width. All
+// three matter — the preprocessor spells the literal from them, and dropping
+// the signedness is exactly the wrong-arm defect this row closed.
+TEST(ShippedLibDescriptor, ReadShippedLibConstantsInternerFree) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "limits.json", R"JSON({
+        "header": "limits.h",
+        "constants": [
+          { "name": "UINT_MAX", "value": 4294967295, "type": "u32" },
+          { "name": "INT_MIN",  "value": -2147483648, "type": "i32" },
+          { "name": "BIGU",     "value": 18446744073709551615, "type": "u64" }
+        ]
+    })JSON");
+    DiagnosticReporter rep;
+    auto ks = readShippedLibConstants(path, rep);   // NO interner / typeReg
+    ASSERT_TRUE(ks.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(ks->size(), 3u);
+
+    EXPECT_EQ(ks->at(0).name, "UINT_MAX");
+    EXPECT_TRUE(ks->at(0).isUnsigned);
+    EXPECT_EQ(ks->at(0).width, 32u);
+    EXPECT_EQ(static_cast<std::uint64_t>(ks->at(0).value), 4294967295ULL);
+
+    EXPECT_EQ(ks->at(1).name, "INT_MIN");
+    EXPECT_FALSE(ks->at(1).isUnsigned);
+    EXPECT_EQ(ks->at(1).width, 32u);
+    EXPECT_EQ(ks->at(1).value, INT64_C(-2147483648));
+
+    // The full unsigned range round-trips through the int64 carrier — the
+    // property `decodeConstantValue` documents and the spelling depends on.
+    EXPECT_TRUE(ks->at(2).isUnsigned);
+    EXPECT_EQ(ks->at(2).width, 64u);
+    EXPECT_EQ(static_cast<std::uint64_t>(ks->at(2).value),
+              18446744073709551615ULL);
+}
+
+// `preprocessorVisible: false` is EXCLUDED from this read and PRESENT in the
+// semantic one — the whole point of the field being ONE fact with two readers.
+// Asserting only the exclusion would leave a "drop the row entirely" bug green.
+TEST(ShippedLibDescriptor, PreprocessorVisibleFalseIsSemanticOnly) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "threadsx.json", R"JSON({
+        "header": "threadsx.h",
+        "constants": [
+          { "name": "VISIBLE",    "value": 1, "type": "i32" },
+          { "name": "ENUMERATOR", "value": 2, "type": "i32",
+            "preprocessorVisible": false }
+        ]
+    })JSON");
+    {
+        DiagnosticReporter rep;
+        auto ks = readShippedLibConstants(path, rep);
+        ASSERT_TRUE(ks.has_value());
+        ASSERT_EQ(ks->size(), 1u);
+        EXPECT_EQ(ks->at(0).name, "VISIBLE")
+            << "the enumerator row must not reach the preprocessor -- making it "
+               "a macro would be an extension neither reference has";
+    }
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+        ASSERT_TRUE(desc.has_value());
+        ASSERT_EQ(desc->constants.size(), 2u)
+            << "and it must STILL be injected semantically -- this row ADDS a "
+               "preprocessor surface, it does not relocate the semantic one";
+        EXPECT_TRUE(desc->constants.at(0).preprocessorVisible);
+        EXPECT_FALSE(desc->constants.at(1).preprocessorVisible);
+    }
+}
+
+// A non-boolean `preprocessorVisible` FAILS LOUD rather than being coerced —
+// a truthy string would otherwise silently make an enumerator a macro.
+TEST(ShippedLibDescriptor, PreprocessorVisibleMustBeBoolean) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "badvis.json", R"JSON({
+        "header": "badvis.h",
+        "constants": [
+          { "name": "X", "value": 1, "type": "i32",
+            "preprocessorVisible": "yes" }
+        ]
+    })JSON");
+    DiagnosticReporter rep;
+    EXPECT_FALSE(readShippedLibConstants(path, rep).has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// ★ THE AXIS REFUSAL, and it is what makes the preprocessor's `activeTarget =
+// nullopt` SAFE rather than merely lucky. The splice threads the object-format
+// and no arch, so an arch-keyed VISIBLE constant would select in the semantic
+// tier and be absent from `#if` on every target — this row's defect, one axis
+// over. Refused at LOAD, on every target.
+TEST(ShippedLibDescriptor, APreprocessorVisibleConstantMaySelectOnFormatOnly) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // NEGATIVE: an arch axis on a visible constant.
+    {
+        auto const path = writeTemp(dir, "archy.json", R"JSON({
+            "header": "archy.h",
+            "constants": [
+              { "name": "K", "variants": [
+                { "when": { "arch": "x86_64" }, "value": 1, "type": "i32" },
+                { "when": { "arch": "arm64" },  "value": 2, "type": "i32" }
+              ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        EXPECT_FALSE(readShippedLibConstants(path, rep).has_value());
+        EXPECT_TRUE(rep.hasErrors());
+    }
+    // POSITIVE CONTROL 1: the same shape on `format` loads clean, so the
+    // refusal is about the AXIS and not about variants as such.
+    {
+        auto const path = writeTemp(dir, "fmtk.json", R"JSON({
+            "header": "fmtk.h",
+            "constants": [
+              { "name": "K", "variants": [
+                { "when": { "format": "elf" }, "value": 1, "type": "i32" },
+                { "when": { "format": "pe" },  "value": 2, "type": "i32" }
+              ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        auto ks = readShippedLibConstants(path, rep, std::nullopt,
+                                          ObjectFormatKind::Elf);
+        ASSERT_TRUE(ks.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(ks->size(), 1u);
+        EXPECT_EQ(ks->at(0).value, 1);
+    }
+    // POSITIVE CONTROL 2: a SEMANTIC-ONLY constant may still use any axis — the
+    // refusal is scoped to the rows that must reach the preprocessor.
+    {
+        auto const path = writeTemp(dir, "archyok.json", R"JSON({
+            "header": "archyok.h",
+            "constants": [
+              { "name": "K", "preprocessorVisible": false, "variants": [
+                { "when": { "arch": "x86_64" }, "value": 1, "type": "i32" },
+                { "when": { "arch": "arm64" },  "value": 2, "type": "i32" }
+              ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        auto ks = readShippedLibConstants(path, rep, std::string_view{"x86_64"});
+        ASSERT_TRUE(ks.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_TRUE(ks->empty()) << "semantic-only, so nothing for the splice";
+    }
+}
+
+// EMPTY (not nullopt) for a descriptor with no `constants` — the same
+// no-surface contract `readShippedLibMacros` keeps for a typed-only header.
+TEST(ShippedLibDescriptor, ReadShippedLibConstantsEmptyWhenNoSurface) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "assert2.json", R"JSON({
+        "header": "assert2.h",
+        "macros": [ { "name": "assert", "params": ["e"], "replacement": "((void)0)" } ]
+    })JSON");
+    DiagnosticReporter rep;
+    auto ks = readShippedLibConstants(path, rep);
+    ASSERT_TRUE(ks.has_value());
+    EXPECT_TRUE(ks->empty());
+    EXPECT_FALSE(rep.hasErrors());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-FFI-DESCRIPTOR-MACRO-VARIANT-COVERAGE-AND-ARITY-UNCHECKED — three loader
+// guards. ★★ TWO OF THE THREE ARE DELIBERATELY NOT WHAT THE ROW PRESCRIBED,
+// because the row's prescriptions were MEASURED to reject correct shipped
+// config; the tests below pin BOTH what is refused and what must keep loading,
+// and the second half is the one that matters.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// limb (a): a macro's variants must cover the formats THE MACRO claims.
+TEST(ShippedLibDescriptor, MacroVariantsMustCoverTheMacrosOwnAvailability) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // NEGATIVE: claims elf+pe, ships only elf. Without this guard the pe build
+    // simply would not inject it and `#if defined(M)` would take the other arm
+    // with no diagnostic at all.
+    {
+        auto const path = writeTemp(dir, "gap.json", R"JSON({
+            "header": "gap.h",
+            "macros": [
+              { "name": "M", "availableObjectFormats": ["elf", "pe"],
+                "variants": [
+                  { "when": { "format": "elf" }, "replacement": "1" }
+                ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        EXPECT_FALSE(readShippedLibMacros(path, rep, ObjectFormatKind::Elf)
+                         .has_value());
+        EXPECT_TRUE(rep.hasErrors())
+            << "and it must fail on EVERY target, including the one whose arm "
+               "IS present -- an inactive gap that only reds on the format it "
+               "affects is a gap nobody's leg finds";
+    }
+    // POSITIVE 1: claims exactly what it ships.
+    {
+        auto const path = writeTemp(dir, "covered.json", R"JSON({
+            "header": "covered.h",
+            "macros": [
+              { "name": "M", "availableObjectFormats": ["elf"],
+                "variants": [
+                  { "when": { "format": "elf" }, "replacement": "1" }
+                ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        auto ms = readShippedLibMacros(path, rep, ObjectFormatKind::Elf);
+        ASSERT_TRUE(ms.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(ms->size(), 1u);
+    }
+    // ★★ POSITIVE 2 — THE ONE THE ROW'S OWN PRESCRIPTION WOULD HAVE FAILED. The
+    // row said to check the variants against the DESCRIPTOR's
+    // `availableObjectFormats`. ✔MEASURED by applying exactly that rule to the
+    // tree: it rejects 14 of the 44 variant-bearing shipped macros, nearly all
+    // correct platform facts (`S_ISSOCK` has no pe arm because Windows has no
+    // socket mode bit; `_stati64` is MSVC-only). A macro claims its OWN reach;
+    // the descriptor's is the union over all its surfaces and is wider.
+    {
+        auto const path = writeTemp(dir, "narrow.json", R"JSON({
+            "header": "narrow.h",
+            "availableObjectFormats": ["elf", "macho", "pe"],
+            "macros": [
+              { "name": "S_ISSOCK", "variants": [
+                  { "when": { "format": "elf" },   "replacement": "1" },
+                  { "when": { "format": "macho" }, "replacement": "1" }
+              ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        auto ms = readShippedLibMacros(path, rep, ObjectFormatKind::Pe);
+        ASSERT_TRUE(ms.has_value())
+            << "a macro narrower than its descriptor is CORRECT and must load";
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_TRUE(ms->empty()) << "and it is simply not injected on pe";
+    }
+}
+
+// limb (b): two FUNCTION-LIKE arms may not disagree on arity.
+TEST(ShippedLibDescriptor, MacroFunctionLikeVariantsMustAgreeOnArity) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // NEGATIVE: F(a) on elf and F(a,b) on pe. A source file writes ONE
+    // invocation, so no call site can satisfy both.
+    {
+        auto const path = writeTemp(dir, "arity.json", R"JSON({
+            "header": "arity.h",
+            "macros": [
+              { "name": "F", "variants": [
+                  { "when": { "format": "elf" }, "params": ["a"], "replacement": "(a)" },
+                  { "when": { "format": "pe" },  "params": ["a","b"], "replacement": "(a)" }
+              ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        EXPECT_FALSE(readShippedLibMacros(path, rep, ObjectFormatKind::Elf)
+                         .has_value());
+        EXPECT_TRUE(rep.hasErrors());
+    }
+    // NEGATIVE: same arity but one arm variadic — also a different call shape.
+    {
+        auto const path = writeTemp(dir, "variadic.json", R"JSON({
+            "header": "variadic.h",
+            "macros": [
+              { "name": "F", "variants": [
+                  { "when": { "format": "elf" }, "params": ["a"], "replacement": "(a)" },
+                  { "when": { "format": "pe" },  "params": ["a"], "variadic": true,
+                    "replacement": "(a)" }
+              ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        EXPECT_FALSE(readShippedLibMacros(path, rep, ObjectFormatKind::Elf)
+                         .has_value());
+        EXPECT_TRUE(rep.hasErrors());
+    }
+    // ★★ POSITIVE — THE ROW'S PRESCRIPTION WOULD HAVE FAILED THIS TOO, and it is
+    // shipped config, not a hypothetical. The row said every variant must agree
+    // on `params.has_value()`. `stdlib.json`'s `atexit` is FUNCTION-like on elf
+    // (`atexit(f) -> __cxa_atexit(...)`) and OBJECT-like on pe (`atexit ->
+    // _crt_atexit`), and BOTH expand `atexit(g)` correctly: an object-like
+    // rename substitutes the NAME and leaves the argument list standing. So an
+    // object-like arm is compatible with any function-like arity.
+    {
+        auto const path = writeTemp(dir, "rename.json", R"JSON({
+            "header": "rename.h",
+            "macros": [
+              { "name": "atexit", "variants": [
+                  { "when": { "format": "elf" }, "params": ["f"],
+                    "replacement": "__cxa_atexit((void (*)(void *))(f), 0, 0)" },
+                  { "when": { "format": "pe" }, "replacement": "_crt_atexit" }
+              ] }
+            ]
+        })JSON");
+        for (auto fmt : {ObjectFormatKind::Elf, ObjectFormatKind::Pe}) {
+            DiagnosticReporter rep;
+            auto ms = readShippedLibMacros(path, rep, fmt);
+            ASSERT_TRUE(ms.has_value())
+                << "the object-like/function-like split is a real, correct "
+                   "shipped shape and must keep loading on every format";
+            EXPECT_FALSE(rep.hasErrors());
+        }
+    }
+}
+
+// limb (c): an EMPTY `when` was an unconditional catch-all by accident — no key
+// present meant no branch ran and `matches` kept its initial true, so the arm
+// selected on every target INCLUDING one with no active format, contradicting
+// this evaluator's own documented contract.
+TEST(ShippedLibDescriptor, AnEmptyWhenSelectorIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    {
+        auto const path = writeTemp(dir, "emptywhen.json", R"JSON({
+            "header": "emptywhen.h",
+            "macros": [
+              { "name": "M", "variants": [ { "when": {}, "replacement": "1" } ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        EXPECT_FALSE(readShippedLibMacros(path, rep, ObjectFormatKind::Elf)
+                         .has_value());
+        EXPECT_TRUE(rep.hasErrors());
+    }
+    // ★ AND IT MUST BE REFUSED WITH NO ACTIVE FORMAT TOO — the caller for whom
+    // the old behaviour was most obviously wrong, since the contract says
+    // nullopt can select nothing and the empty selector selected anyway.
+    {
+        auto const path = writeTemp(dir, "emptywhen2.json", R"JSON({
+            "header": "emptywhen2.h",
+            "constants": [
+              { "name": "K", "variants": [
+                  { "when": {}, "value": 1, "type": "i32" } ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        EXPECT_FALSE(readShippedLibConstants(path, rep).has_value());
+        EXPECT_TRUE(rep.hasErrors());
+    }
+    // POSITIVE CONTROL: a one-key `when` is unaffected, so the refusal is about
+    // EMPTINESS and not about `when` objects as such.
+    {
+        auto const path = writeTemp(dir, "onekey.json", R"JSON({
+            "header": "onekey.h",
+            "macros": [
+              { "name": "M", "variants": [
+                  { "when": { "format": "elf" }, "replacement": "1" } ] }
+            ]
+        })JSON");
+        DiagnosticReporter rep;
+        auto ms = readShippedLibMacros(path, rep, ObjectFormatKind::Elf);
+        ASSERT_TRUE(ms.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(ms->size(), 1u);
+    }
+}
+
 } // namespace

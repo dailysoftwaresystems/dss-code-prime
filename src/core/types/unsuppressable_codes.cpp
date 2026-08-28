@@ -1618,6 +1618,31 @@ constexpr std::array<UnsuppressableEntry, 168> kUnsuppressableCodes{{
     // translation continues, no wrong bytes ship, no build failure is hidden, and
     // `--suppress` must stay able to silence exactly that advisory class — the
     // same posture as S_DeprecatedSymbolUsed / S_UnknownAttribute above.
+    // P_PreprocessorDefinedFromExpansion (D-PP-DEFINED-VIA-MACRO-EXPANSION, C
+    // 6.10.1) is deliberately NOT a member either, and it is the cleanest case in
+    // the file for the "merely hides advice" prong: the construct it reports is
+    // one DSS deliberately SUPPORTS — it evaluates the operator and continues, so
+    // suppressing the warning changes no answer, ships no bytes and hides no
+    // failure. It is also advice about code the author usually CANNOT change:
+    // ✔MEASURED, Apple's `secure/_string.h` uses the construct on purpose, so a
+    // user compiling that SDK would be handed an unsilenceable warning per
+    // translation unit for a header they do not own. That is exactly the
+    // A_ImmediateNarrowedToOperandField distinction drawn above — a diagnostic
+    // whose remedy is one edit in the line that caused it may be made
+    // unsuppressable; one about a line the author cannot edit may not.
+    // `--warnings-as-errors` remains the lever for a project that wants the
+    // construct out of its own sources.
+    // P_PreprocessorIfLiteralImplicitlyUnsigned
+    // (D-PP-IF-LARGE-DECIMAL-LITERAL-HAS-NO-WARNING, C 6.10.1p4) is deliberately
+    // NOT a member, by the same two prongs: DSS evaluates the `#if` and takes
+    // the SAME branch both references take whether or not the warning is shown,
+    // so suppressing it ships no wrong bytes and hides no build failure. It also
+    // fails the "remedy is one edit in the offending line" test the
+    // A_ImmediateNarrowedToOperandField note draws — the literal is routinely in
+    // a system header the author does not own (a `SIZE_MAX`-shaped guard), which
+    // is exactly why both references make it an ordinary, silenceable warning
+    // (clang's is even named: -Wimplicitly-unsigned-literal) rather than an
+    // error. `--warnings-as-errors` is the lever for a project that wants it out.
     {DiagnosticCode::P_PreprocessorErrorDirective, kWhyErrorDirective},
     // TF-C82 (D-PP-PRAGMA-REGISTRY): a REACHED pragma DSS does not implement, or
     // one whose operand it cannot honour. Same argument as its `#error` neighbour

@@ -44,6 +44,14 @@ dss_add_test(NAME lir/test_lir_asm_goto_labels SOURCES test_lir_asm_goto_labels.
 # shape and this guard exists for the producers that never run that pass.
 dss_add_test(NAME lir/test_lir_asm_binding_collision
              SOURCES test_lir_asm_binding_collision.cpp)
+# D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED: a
+# register-pinned `"=a"` output must enter the per-instruction constraint's
+# CLOBBER set and so reach `effectiveForbiddenOrdinals`, because the allocator
+# omits outputs from its forbidden set on exactly that invariant. Drives the
+# REAL c → HIR → MIR → LIR lowering — a hand-built constraint would satisfy
+# the invariant because the test wrote it that way.
+dss_add_test(NAME lir/test_lir_asm_pinned_output_clobber
+             SOURCES test_lir_asm_pinned_output_clobber.cpp)
 dss_add_test(NAME lir/test_lir_text      SOURCES test_lir_text.cpp)
 # D-OPT-JCC-FALLTHROUGH: Rule 1b's ONE legal asymmetry — a branch whose
 # trailing fallthrough operand `lir_peephole` elided, verified against the
@@ -148,3 +156,12 @@ target_link_libraries(dss_lir_test_lir_peephole PRIVATE nlohmann_json::nlohmann_
 # what this tier bound.
 dss_add_test(NAME lir/test_lir_label_address_static_table
              SOURCES test_lir_label_address_static_table.cpp)
+
+# D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE: a refusal that crashes is not a
+# refusal. FIVE passes rebuild a module through the one shared terminator
+# dispatch, and a refusal from it leaves the open block unterminated — which
+# `LirBuilder` used to answer with `std::abort()`. Pins all five callers'
+# unwind AND the builder poison that makes the sixth caller's omission
+# survivable, so the guarantee does not rest on five independent `return`s.
+dss_add_test(NAME lir/test_lir_rebuild_unwind
+             SOURCES test_lir_rebuild_unwind.cpp)

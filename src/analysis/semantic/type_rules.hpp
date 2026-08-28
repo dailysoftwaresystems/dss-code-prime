@@ -308,8 +308,45 @@ namespace detail::type_rules {
             || unsignedIntRank(rk) != 0 || rk == TypeKind::Bool
             || rk == TypeKind::Char;                // a real constructs (v, 0)
     }
-    // (a complex rhs into a non-complex lhs is NOT admitted here → falls through to
-    //  the loud reject; the explicit complex->real cast lives in isExplicitCastable.)
+    // ★★★ THE MIRROR DIRECTION — AN IMPLICIT COMPLEX → REAL — IS LEGAL C AND IS
+    //     STILL REFUSED HERE ON PURPOSE, AND THE REASON IS NOT THE ONE THIS
+    //     COMMENT USED TO GIVE. D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED.
+    //
+    // The text that used to sit here called an implicit complex→real *"a
+    // constraint violation"*. That is WRONG: C 6.3.1.7p2 defines the conversion —
+    // the imaginary part is discarded — with no requirement that a cast request
+    // it, and C 6.5.16.1p1 asks only that both operands have ARITHMETIC type,
+    // which C 6.2.5p11+p18 make true of a complex. ✔MEASURED 2026-08-27 (shipped
+    // CLI, x86_64:pe64-x86_64-windows-exec, binaries RUN): `double d = z;` on a
+    // `(3,4)` complex exits 3 under gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
+    // (`-std=c23`), probed SEPARATELY; DSS refuses `error[S0003]`. So this is a
+    // KNOWN DIVERGENCE, correctly described, not a rule.
+    //
+    // ⚠⚠ THE ARM WAS WRITTEN, BUILT, AND WITHDRAWN THE SAME DAY, BECAUSE IT
+    // CONVERTED A LOUD REFUSAL INTO A SILENT WRONG ANSWER SOMEWHERE ELSE — and
+    // that coupling is the finding, not the arm. `src/dss-config/shippedLibs/
+    // tgmath.json` borrows its `_Complex` loudness FROM THIS REFUSAL: its own
+    // `$comment` says the `default:` arm must stay a BARE `sqrt((x))` because
+    // *"(double)z is legal C, silently drops the imaginary part → a conformance
+    // MISCOMPILE"*, and concludes *"Bare ⇒ a complex arg fails S_TypeMismatch
+    // LOUD"*. That conclusion holds ONLY while this conversion is missing.
+    // ✔MEASURED with the arm present: `#include <tgmath.h>` + `sqrt(z)` on a
+    // `(0, 4i)` COMPILED and returned 0, where gcc dispatches to `csqrt` and
+    // returns 1 — a silently wrong answer, which this project ranks below a
+    // crash. Three pins caught it (`SemanticAnalyzerC.TgmathComplexArg{Sqrt,Pow,
+    // Fabs}FailsLoud*`) and they were RIGHT.
+    // ⇒ ADMITTING THIS CONVERSION REQUIRES AN OWNER FOR THE TGMATH COMPLEX
+    // DISPATCH FIRST — [[D-CSUBSET-TGMATH-COMPLEX]] riding
+    // [[D-CSUBSET-COMPLEX-TRANSCENDENTAL]] (`csqrt`/`cpow`/`cabs`…). A
+    // `_Generic` arm cannot substitute: `_Generic`'s UNSELECTED arms are fully
+    // type-checked (that file's own cast discipline depends on it), so an arm
+    // naming an unshipped `csqrt` would break EVERY `sqrt` call, not only the
+    // complex one. The two must land together.
+    // ★ The general shape, which is why this is written at length instead of
+    // deleted: a guard whose loudness comes from a DIFFERENT tier's missing
+    // feature is one fact with two owners, and fixing either half alone breaks
+    // the other. The same duplicated-truth-table defect this cycle has now met
+    // repeatedly.
     // C 6.3.1.4 / 6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION, int→float): an integer
     // value is implicitly assignable to a floating lhs — `double d = 5;`,
     // `f(anInt)` to a `double` param (the sqlite `kahanBabuskaNeumaierStep(pSum,
@@ -364,22 +401,86 @@ namespace detail::type_rules {
     }
     // C 6.3.1.2 (D-CSUBSET-NULLPTR-BOOL-CONVERSION / scalar->_Bool): the MIRROR of
     // the arm above — ANY scalar value converts INTO a `_Bool` lhs (the result is
-    // 0 if the value compares equal to 0, else 1). An arithmetic (int rank / float
-    // / Char / Enum) OR pointer OR `nullptr` rhs is admitted; the HIR `coerce()`
-    // materializes it as the `!= 0` truthiness test — NOT a low-bit-truncating
-    // Cast (so `_Bool b = 2` is true) — reusing the ONE condition-materialization
-    // chokepoint `coerceCondition`. Gated on `scalarConvertsToBool` (a non-C
-    // schema keeps `_Bool` strict; the post-coerce verifier — default false —
-    // stays strict too). Genuinely-INCOMPATIBLE sources (struct / union / void /
-    // FnSig — all rank-0 and non-pointer) are NOT admitted -> they stay a loud
-    // reject. Was the c48-masked gap the [[D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE]]
-    // fix unmasked: once `a < b` types `int`, `_Bool b = (a<b)` needs this arm.
-    if (scalarConvertsToBool && lk == TypeKind::Bool
-        && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0
-            || floatRank(rk) != 0
+    // 0 if the value compares equal to 0, else 1). The HIR `coerce()` materializes
+    // it as the `!= 0` truthiness test — NOT a low-bit-truncating Cast (so
+    // `_Bool b = 2` is true) — reusing the ONE condition-materialization chokepoint
+    // `coerceCondition`. Gated on `scalarConvertsToBool` (a non-C schema keeps
+    // `_Bool` strict; the post-coerce verifier — default false — stays strict too).
+    // Was the c48-masked gap the [[D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE]] fix
+    // unmasked: once `a < b` types `int`, `_Bool b = (a<b)` needs this arm.
+    //
+    // ★ WHAT "SCALAR" IS, AND WHY THE ROSTER IS SPELLED IN TWO PIECES.
+    // C 6.2.5p21: scalar == ARITHMETIC ∪ POINTER. The first disjunct is the
+    // arithmetic half and DELEGATES to the shared `isArithmetic` helper above
+    // rather than re-listing the rank families — so `_BitInt(N)`, which
+    // `isArithmetic` already recognizes as the integer type C23 6.2.5 says it is,
+    // joins WITHOUT a second roster to keep in sync. (`Char` and `Enum` are
+    // deliberately outside `isArithmetic` — they are the NOMINAL kinds, bridged to
+    // their integer meanings by the `charConvertsToArith` / `enumConvertsToArith`
+    // arms — so they are named explicitly here, exactly as C names them arithmetic.)
+    // `Ptr` and `NullptrT` are the pointer half.
+    // ⚠ `_BitInt` is admitted by `scalarConvertsToBool` ALONE and NOT additionally
+    // by `bitIntConversions`: that flag governs the _BitInt↔integer WIDTH
+    // conversion matrix (a value question — masking to N), while this arm asks a
+    // different question — does the language convert a scalar to a truth value.
+    // Giving one behaviour two owners is how the two drift. The realize side
+    // agrees by construction: the truthiness chokepoint `coerceCondition`'s
+    // arithmetic arm keys off `isArithmeticCore`, which admits BitInt ungated too,
+    // so admit ⟺ realize holds exactly.
+    //
+    // ★ ARRAY AND FUNCTION DESIGNATORS CONVERT VIA THEIR DECAY, NOT AS AN
+    // EXCEPTION TO IT. C 6.3.2.1p3 converts an array to a pointer-to-first-element
+    // and 6.3.2.1p4 converts a function DESIGNATOR to a pointer-to-function, in any
+    // context but `sizeof` / `_Alignof` / unary `&` (and, for p3, the string-literal
+    // array initializer the `charArrayFromStringLiteralInit` arm owns). The decayed
+    // POINTER is then exactly the pointer half of the disjunct above — so this is
+    // one conversion composed with one already-admitted conversion, not a new rule
+    // about `_Bool`. gcc's -Waddress warns on both (the address is never null); the
+    // always-true truth value is the CORRECT answer and the code is legal.
+    // ⚠ The decayed pointer type is NOT MATERIALIZED here, and cannot be: interning
+    // `Ptr<elem>` mutates the interner and this function holds a `TypeInterner
+    // const&`. That is exactly why every decay in this file is written as a
+    // pairwise-kind arm that compares ELEMENTS (`lk == Ptr && rk == Array` below)
+    // rather than as a decay-then-recurse — and why naming the projection here is
+    // the whole of the rule. The Array guard mirrors `coerceCondition`'s: a
+    // SHAPELESS array (no element operand — malformed) has no pointer to decay to,
+    // so it is not admitted and stays loud, keeping admit ⟺ realize exact.
+    // ⚠ THE ARRAY AND FnSig ADMISSIONS CARRY A CROSS-TIER CONTRACT, and breaking it
+    // is loud rather than silent but is still a defect: `cst_to_hir.cpp::coerce`'s
+    // `_Bool`-TARGET ARM must route an Array or FnSig child into `coerceCondition`,
+    // which already decays both and re-enters (c91 / P41 taught it, which is why
+    // `if (a)` and `if (fn)` have worked all along). If that arm's guard names kinds
+    // instead of deferring to `coerceCondition`, these two sources are ADMITTED here
+    // and NOT REALIZED there, and the pair surfaces one tier down as
+    // `I_StoreValueTypeMismatch` on legal C (✔MEASURED at exactly that state).
+    // Genuinely-INCOMPATIBLE sources (struct / union / void — no truth value in C)
+    // are still NOT admitted and stay a loud reject.
+    // ★ COMPLEX IS A SCALAR, AND THE CONDITION SITES ALREADY KNEW IT. C 6.2.5p11
+    // puts the complex types inside the FLOATING types and p18/p21 therefore make
+    // them arithmetic, hence scalar; `_Bool b = z;` is legal C that gcc 13.3.0
+    // (`-std=c2x`) and clang 18.1.3 (`-std=c23`) both compile and run. It is named
+    // here rather than folded into `isArithmetic` for the same reason `Char` and
+    // `Enum` are: DSS interns `Complex` as its own NOMINAL kind, and widening
+    // `isArithmetic` would silently re-answer the usual-arithmetic-conversion
+    // question everywhere it is asked — a different question with a different owner.
+    // ✔MEASURED before this arm existed, on x86_64:pe64-x86_64-windows-exec:
+    // `if (z)` ran correctly (exit 5) while `_Bool b = z;` on the SAME type refused
+    // S0003 — the ASSIGNMENT site disagreeing with the CONDITION site about one
+    // type's truth value, which is the two-owner drift this whole comment is about.
+    // Admit ⟺ realize holds by construction, not by review: `cst_to_hir`'s
+    // `_Bool`-TARGET arm names no kinds at all — it defers to `coerceCondition`,
+    // whose Complex arm is what made `if (z)` work.
+    if (scalarConvertsToBool && lk == TypeKind::Bool) {
+        if (isArithmetic(interner, rhs)
             || rk == TypeKind::Char || rk == TypeKind::Enum
-            || rk == TypeKind::Ptr  || rk == TypeKind::NullptrT)) {
-        return true;
+            || rk == TypeKind::Complex
+            || rk == TypeKind::Ptr  || rk == TypeKind::NullptrT
+            || rk == TypeKind::FnSig) {
+            return true;
+        }
+        if (rk == TypeKind::Array && !interner.operands(rhs).empty()) {
+            return true;
+        }
     }
     // C 6.3.1.1 / 6.5.16.1: `char` is an integer type — implicitly convertible to AND
     // from the integer ranks in assignment (the usual arithmetic conversions). DSS
@@ -757,10 +858,55 @@ namespace detail::type_rules {
     // signature match — the sqlite `(sqlite3_destructor_type)fn` /
     // `(sqlite3_syscall_ptr)fn` shapes are exactly that conversion. SIBLING:
     // `isAssignable`'s Ptr/FnSig arm admits the same decay for init/assign/arg;
-    // this closes the explicit-CAST path. A non-Ptr TARGET (`(long)g`) and a
-    // non-FnSig OPERAND (`(fp)struct`) stay rejected (the tk==Ptr / ok==FnSig
-    // guards do not fire for them) — verified by red-on-disable pins.
-    if (tk == TypeKind::Ptr && ok == TypeKind::FnSig) return true;
+    // this closes the explicit-CAST path. A non-FnSig OPERAND (`(fp)struct`)
+    // stays rejected (the ok==FnSig guard does not fire) — red-on-disable pinned.
+    //
+    // ★ P42 (D-CSUBSET-EXPLICIT-BOOL-CAST-OF-A-FUNCTION-DESIGNATOR): `_Bool`
+    // JOINS `Ptr` AS AN ADMITTED TARGET, and it is the SAME conversion, not a
+    // second rule. C 6.3.2.1p4 decays the designator to a pointer-to-function in
+    // every context but `sizeof`/`_Alignof`/unary `&`; a cast is such a context,
+    // and Ptr→`_Bool` is already admitted by the `isCastableInt(tk) && ok == Ptr`
+    // arm two lines below. So `(_Bool)fn` is one already-admitted conversion
+    // composed with one already-admitted decay — the shape `scalarConvertsToBool`'s
+    // FnSig arm records for the IMPLICIT direction (`_Bool b = fn;`, `if (fn)`).
+    // ✔MEASURED at 301e2a63 with the shipped CLI on
+    // x86_64:pe64-x86_64-windows-exec: `_Bool b = (_Bool)fn;` was
+    // `error[S0010]` while `if (fn)` on the SAME designator compiled and ran —
+    // the explicit-cast site disagreeing with the condition site about one type's
+    // truth value, the same two-owner drift the Complex arm above records.
+    // gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed SEPARATELY,
+    // both compile and run it (gcc adds -Waddress, which is a warning about the
+    // always-true ANSWER, not about legality).
+    // ⚠ ADMIT ⟺ REALIZE HOLDS, AND IT IS CHECKED RATHER THAN ASSUMED: the HIR
+    // cast epilogue `combineCast` routes a `_Bool` TARGET into `coerceCondition`,
+    // whose FnSig arm decays through the one `coerce` funnel and re-enters — the
+    // very arm that already makes `if (fn)` work. No HIR/MIR change is needed and
+    // none was made.
+    // ★★ P42 (D-CSUBSET-FUNCTION-DESIGNATOR-TO-INTEGER-CAST-REFUSED): THE TARGET
+    // ROSTER IS NOW `{Ptr}` ∪ `isCastableInt`, AND `_Bool` IS NOT A SEPARATE
+    // MEMBER OF IT — it is an integer kind, so `isCastableInt` already held it.
+    // ⚠ THE PREVIOUS NOTE HERE SAID `(long)fn` MUST STAY REJECTED "because
+    // `combineCast` decays an ARRAY operand and nothing else". That reason was
+    // correct and has been REMOVED rather than worked around: `combineCast` now
+    // decays a FnSig operand through the SAME `coerce` FnSig→Ptr funnel, in the
+    // same commit, so admit ⟺ realize still holds — this is not a widened
+    // admission over an unchanged realizer.
+    // ✔MEASURED 2026-08-27, shipped CLI on x86_64:pe64-x86_64-windows-exec, with
+    // gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`) probed SEPARATELY and
+    // each binary RUN: `(long)fn`, `(unsigned long)fn` and the round trip
+    // `(FP)(long)fn` then CALLED all exit 0 on both references, while DSS gave
+    // `error[S0010]`. C 6.3.2.1p4 decays the designator to a pointer in every
+    // context but `sizeof`/`_Alignof`/unary `&`, and C 6.3.2.3p6 converts a
+    // pointer to an integer — so this is ONE admitted decay composed with ONE
+    // admitted conversion, exactly as the `_Bool` half (P42 lane W) was.
+    // ⓘ A NARROWING integer target (`(int)fn` on LP64) is legal C with an
+    // implementation-defined value; gcc/clang warn (-Wpointer-to-int-cast) and
+    // compile. The roster is `isCastableInt`, not a width-filtered subset, for
+    // that reason — refusing the narrow case would be DSS inventing a constraint.
+    if (ok == TypeKind::FnSig
+        && (tk == TypeKind::Ptr || isCastableInt(tk))) {
+        return true;
+    }
     if (tk == TypeKind::Ptr && isCastableInt(ok))     return true;
     if (isCastableInt(tk) && ok == TypeKind::Ptr)     return true;
     // C23 (D-CSUBSET-NULLPTR): `nullptr` (a NullptrT operand) casts explicitly to

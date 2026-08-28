@@ -64,7 +64,7 @@ the other in the same commit.
 | **`check-diagnostic-codes`** | `check-diagnostic-codes.py` | refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal. |
 | **`check-enum-name-table-guards`** | `check-enum-name-table-guards.py` | refuse an `EnumNameTable` vocabulary declared in `src/` without a `DSS_CHECK_ENUM_NAME_TABLE` well-formedness assert. |
 | **`check-guard-output-encoding`** | `check-guard-output-encoding.py` | refuse a Python script whose report cannot carry a non-cp1252 character through a pipe. |
-| **`check-line-endings`** | `check-line-endings.ps1`, `check-line-endings.sh` | refuse a tracked text blob that carries a CR. |
+| **`check-line-endings`** | `check-line-endings.ps1`, `check-line-endings.sh` | refuse a tracked text blob that carries a CR, and a CR instrument that cannot see one. |
 | **`check-lsp-coordinates`** | `check-lsp-coordinates.py` | refuse a raw coordinate conversion in src/lsp/ outside lsp_coordinates.cpp — the anti-regression device for D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES. |
 | **`check-ninja-deps`** | `check-ninja-deps.py` | refuse a gate over a build directory whose objects recorded no header dependencies. |
 | **`check-no-abort-in-tests`** | `check-no-abort-in-tests.py` | refuse a new live `abort()` call site in test or test-support code. |
@@ -114,6 +114,57 @@ the other in the same commit.
   resolves nowhere else), and the macOS carriage needs absolute paths because a
   non-interactive shell drops `/opt/homebrew/bin`.
 - **`local-build`** — incremental build plus optional ctest, for this host.
+
+<!-- CR-INSTRUMENT-QUOTED:BEGIN — this section QUOTES the blind idioms in order
+     to warn about them; it does not run one as a measurement. -->
+
+## ★★★ NEVER HAND-ROLL A LINE-ENDING CHECK — the idiom lies on this host
+
+**Asking "are THESE files clean?" has an entry point. Use it:**
+
+```
+scripts/check-line-endings/check-line-endings.sh  --files PATH...   # or --files-from -
+scripts/check-line-endings/check-line-endings.ps1 --files PATH...
+```
+
+Exit **0** all clean · **1** a CR was found · **2** a path could not be measured
+(missing, unreadable, a directory) — never a silent skip. It works on tracked,
+untracked and outside-the-repo paths, so a lane's scratchpad is fair game.
+
+⚠⚠ **DO NOT write your own.** ✔MEASURED 2026-08-27 (P42) on Git Bash against a
+`printf 'a\r\nb\n'` control verified by `od -c` to hold exactly one CR, beside a
+pure-LF twin — **the obvious instruments are wrong in BOTH directions:**
+
+| what you would type | CRLF file | pure-LF file | correct |
+|---|---|---|---|
+| `grep -c $'\r'` (captured in `$(...)`) | **2** | **2** | 1 / 0 — false POSITIVE, always |
+| `awk '/\r$/'` | **0** | **0** | 1 / 0 — **false NEGATIVE, always** |
+| `sed -n '/\r/p'` | **0** | **0** | 1 / 0 — false NEGATIVE |
+| `tr -dc '\r' < f \| wc -c` | **1** | **0** | ✅ correct |
+
+- **The false positive:** the literal `$'\r'` written *inside* a command
+  substitution expands to the **empty string**, so `n=$(grep -c $'\r' f)` runs
+  `grep -c ''` and returns the file's **line count** — on a clean file too.
+  (A CR held in a *variable* is fine; `$'\t'` in the same spot is fine. It is
+  this spelling, in this position.)
+- **The false negative, the dangerous one:** Git Bash `grep` and `sed` read in
+  **text mode** and strip the trailing CR *before matching*, so they report a
+  clean tree over a file that is entirely CRLF. `grep -U` sees it; `-a` does not.
+  A *mid-line* CR is found by everything — the blindness is aimed precisely at
+  the only CR anyone hunts.
+- ★★ **This is why it survived: under WSL/Linux all three are CORRECT.** An
+  idiom sanity-checked on Linux, or read out of the GNU manual, looks sound and
+  then lies only on Windows — the primary dev host. **An instrument verified on
+  the wrong leg is verified nowhere.**
+
+A lane in P42 certified thirteen files "pure LF" with `awk '/\r$/'` and was
+measuring nothing. `line_endings_guard`'s **Check F** now refuses these
+spellings repo-wide, so they cannot be committed. If a line *quotes* the idiom
+as documentation, put `CR-INSTRUMENT-QUOTED` on it, or wrap the block in
+`CR-INSTRUMENT-QUOTED:BEGIN` / `:END` — the guard uses that same marker for its
+own warnings rather than exempting itself by path.
+
+<!-- CR-INSTRUMENT-QUOTED:END -->
 
 ## Where the rest of the gate battery is documented
 

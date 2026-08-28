@@ -167,6 +167,101 @@ bitPreciseLiteralSignedness(std::string_view rawText,
     return std::nullopt;
 }
 
+// ── C 6.10.1p4: THE SAME LADDER, RUN AT PHASE-4 WIDTHS ───────────────────
+//   D-PP-IF-UNSIGNED-INTMAX
+//
+// A `#if`/`#elif` controlling expression is evaluated with every integer type
+// acting as `intmax_t` or `uintmax_t`. So the ONLY thing the preprocessor needs
+// from a literal is its SIGNEDNESS, and the ladder that decides it is this same
+// ordered candidate list -- with every candidate's WIDTH replaced by 64, because
+// in phase 4 there are only two integer types and both are 64 bits wide.
+//
+// Returns true = signed, false = unsigned; nullopt = no rule covers the matched
+// suffix (the loader cross-checks that cannot happen for a shipped config, so it
+// is substrate drift the caller surfaces fail-loud -- never a guessed
+// signedness, because a guess here selects a wrong BRANCH in silence).
+//
+// ★★ WHY THIS IS NOT `typeIntegerLiteral` WITH THE WIDTH IGNORED, WHICH IS THE
+// DESIGN THIS REPLACED AND WHICH IS MEASURABLY WRONG. Asking the ordinary ladder
+// for `0xFFFFFFFF` returns `unsigned int` -- correct C 6.4.4.1, since the value
+// does not fit a 32-bit `int`. Carry that signedness into phase 4 and
+// `#if 0xFFFFFFFF > -1` converts `-1` to `UINTMAX_MAX` and takes the FALSE arm.
+// ✔MEASURED 2026-08-27, gcc 13.3.0 `-std=c2x` and clang 18.1.3 `-std=c23` probed
+// SEPARATELY with the taken arm read out of the emitted object via `nm`: BOTH
+// take the TRUE arm. They do not use the literal's own C type here; they
+// re-decide against intmax_t. The boundary is exactly INTMAX_MAX, pinned by the
+// adjacent pair `#if 0x7FFFFFFFFFFFFFFF > -1` (both: TRUE => signed) and
+// `#if 0x8000000000000000 > -1` (both: FALSE => unsigned).
+//
+// ⓘ AND THE CONSEQUENCE IS THAT THIS QUESTION TAKES NO `DataModel`. A data model
+// fixes type WIDTHS; at phase-4 widths every candidate is 64 bits, so the model
+// cannot reach the answer. `#if -1 < 0x80000000L` is therefore the SAME branch on
+// LP64 and LLP64 -- which is what both references do, and which removes the
+// per-target threading this rule would otherwise have needed.
+[[nodiscard]] inline std::optional<bool>
+preprocessorLiteralSignedness(std::string_view rawText,
+                              NumberStyle const* ns,
+                              std::span<IntegerLiteralTypingRule const> rules,
+                              std::uint64_t magnitude) {
+    std::string_view const suffix = matchIntegerSuffix(rawText, ns);
+
+    // Rule select + radix class: IDENTICAL to `typeIntegerLiteral`'s steps 2-3.
+    IntegerLiteralTypingRule const* rule = nullptr;
+    for (auto const& r : rules) {
+        if (suffix.empty()) {
+            if (r.suffixes.empty()) { rule = &r; break; }
+            continue;
+        }
+        for (auto const& s : r.suffixes) {
+            if (s == suffix) { rule = &r; break; }
+        }
+        if (rule != nullptr) break;
+    }
+    if (rule == nullptr) return std::nullopt;
+    auto const& candidates = integerLiteralIsPrefixed(rawText, ns)
+                                 ? rule->nondecimal
+                                 : rule->decimal;
+
+    // A candidate's SIGNEDNESS, which a data model must not change. LP64 / LLP64
+    // / ILP32 are WIDTH models -- `long` is 64-bit or 32-bit but signed in every
+    // one of them. Verified rather than assumed: if a config ever declares a name
+    // whose signedness varies by model, that is substrate drift and this refuses
+    // (nullopt) instead of silently picking one.
+    auto signednessOf =
+        [](DataModelTypeRef const& t) -> std::optional<bool> {
+        bool const base = detail::int_ladder::isSignedIntKind(t.core);
+        if (detail::int_ladder::integerWidth(t.core) == 0) return std::nullopt;
+        for (auto const& [dm, k] : t.coreByDataModel) {
+            (void)dm;
+            if (detail::int_ladder::integerWidth(k) == 0) return std::nullopt;
+            if (detail::int_ladder::isSignedIntKind(k) != base) return std::nullopt;
+        }
+        return base;
+    };
+
+    // First candidate whose PHASE-4 range holds the magnitude. The candidate's
+    // own width is discarded and 64 substituted, so the test collapses to
+    // "signed candidate ⇒ fits iff magnitude <= INTMAX_MAX; unsigned ⇒ always".
+    for (auto const& c : candidates) {
+        auto const sgn = signednessOf(c);
+        if (!sgn.has_value()) return std::nullopt;
+        TypeKind const at64 = *sgn ? TypeKind::I64 : TypeKind::U64;
+        if (detail::int_ladder::magnitudeFits(at64, magnitude)) return *sgn;
+    }
+
+    // Every candidate is signed and the magnitude exceeds INTMAX_MAX -- C's
+    // decimal-unsuffixed ladder (int/long/long long) meeting
+    // `18446744073709551615`. ✔MEASURED: gcc warns "integer constant is so large
+    // that it is unsigned", clang warns "interpreting as unsigned", and BOTH then
+    // evaluate it as UNSIGNED with its true value. Unanimous, so the union rule
+    // makes it required.
+    // ⚠ Distinct from the settled >64-bit-literal split, where gcc warns and
+    // substitutes a TRUNCATED value while clang refuses and DSS refuses with it.
+    // A magnitude too large for `uintmax_t` never reaches here: `decodeInteger`
+    // has already nullopt'd and the caller has failed loud.
+    return false;
+}
+
 // ── FC3.5 sweep-c2: the float-literal typing rule (C 6.4.4.2) ────────────
 //
 // The float sibling of `typeIntegerLiteral`, shared by the SAME two

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 // Shared loader substrate for the `loadShipped(name)` lookup pattern.
 // Both `GrammarSchema` (`src/dss-config/sources/<name>.lang.json`) and
@@ -161,5 +162,50 @@ findShippedConfig(ShippedConfigLocator const& loc);
 findShippedConfigDir(
     std::string_view                            subdir,
     std::optional<std::filesystem::path> const& startPath = std::nullopt);
+
+// THE RESOLVED SYSTEM-INCLUDE DIRS for `grammar`: its declared
+// `semantics.shippedLibDirs` strings mapped through `findShippedConfigDir` to
+// ABSOLUTE directories, in the language's own order. This is the `/usr/include`
+// analogue — the search path the ANGLE form `#include <h>` resolves against,
+// and the corpus a predefined macro's `impliedSurface` claim is validated
+// against. AGNOSTIC: every dir comes from the language document; nothing here
+// knows a language, a target, or a format.
+//
+// ★★ ONE OWNER, BECAUSE THREE SITES HELD THREE DIFFERENT ANSWERS —
+// D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS.
+// The driver defined this walk at `dss` NAMESPACE SCOPE inside
+// `program/program.cpp`, with no header declaring it — only a forward
+// declaration at the top of that same file, i.e. a signature with no owner.
+// `program/dump_predefined_macros.cpp` re-walked `shippedLibDirs` with its own
+// loop. And `src/lsp/` had NO copy at all, so the editor built every buffer
+// with an EMPTY system path: `#include <stdbool.h>` failed in the editor while
+// the compiler accepted it, and `#include <no_such_header.h>` — fatal
+// `F_ShippedHeaderNotFound` for the compiler — was reported by the editor as a
+// clean file.
+//
+// ★ IT LIVES HERE, and the alternative was measured rather than assumed. The
+// other candidate was `analysis/compilation_unit/`, beside
+// `UnitBuilder::addSystemDir`. But this answer is a property of the (language
+// document, config root) pair and of NOTHING else — `dump_predefined_macros.cpp`
+// wants the vector with no `UnitBuilder` anywhere in sight, and would have had
+// to include the whole CU header (the one already carrying `/bigobj` on MSVC for
+// its include surface) to reach a function about config paths. Putting it here,
+// beside the `findShippedConfigDir` it wraps, is the same move
+// `D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS` made for the project-manifest
+// reader: down to the tier every reader already depends on, so the dependency
+// runs one way. Binding the result to a builder is `applySystemDirs`, declared
+// one tier up beside `UnitBuilder::addSystemDir` — where the `UnitBuilder` is.
+//
+// A dir that resolves NOWHERE is SKIPPED rather than reported. An unresolvable
+// entry only matters if something actually asks for a header, and that miss
+// then fails loud downstream as `F_ShippedHeaderNotFound`, positioned at the
+// include that wanted it — whereas reporting here would fire on every compile.
+//
+// ⚠ THE PATHS ARE ABSOLUTE, and that is a REQUIREMENT rather than a tidiness:
+// `ResolutionContext::systemDirs` documents its dirs as absolute. The cwd walk
+// produces that for free; a RELATIVE `DSS_CONFIG_ROOT` — permitted, see the
+// precedence above — would not.
+[[nodiscard]] DSS_EXPORT std::vector<std::filesystem::path>
+resolveSystemDirs(GrammarSchema const& grammar);
 
 } // namespace dss
