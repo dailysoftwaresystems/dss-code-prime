@@ -166,6 +166,42 @@ esac
 
 carriage() { bash "$CARRIAGE_SH" "$@"; }
 
+# ── RESOLVE THE HOST ONCE, FOR THE WHOLE LEG ────────────────────────────────
+# D-SCRIPT-MACOS-LEG-RERESOLVES-THE-HOST-AT-EVERY-CARRIAGE-CALL.
+#
+# ⚠ A leg calls `carriage` many times — reachability, the lock, `leg-tree
+# prepare`, the rsync, the configure, the build, the ctest, `leg-tree restore` —
+# and `ssh-macos.sh` re-runs its whole resolver on EVERY one. The Mac is named by
+# a `.local` mDNS name, and under WSL the only arm of that resolver which answers
+# is a hop out to the Windows resolver. So the leg's success depends on N
+# independent lookups all succeeding, and any ONE transient miss kills a run that
+# has already done minutes of work.
+# ✔MEASURED 2026-08-28, cycle P43: this script resolved for `leg-tree prepare`
+# (reaching the host and moving its clone from `301e2a63` + 2854 dirty paths to a
+# pristine `73f74972`) and then FAILED to resolve for the rsync seconds later.
+# ★ `ssh-macos.sh`'s own header already recorded the same shape from the other
+# side — "mDNS then answered for the rsync and failed for the build minutes
+# later" — attributing it to a WSLENV problem. It is a property of ASKING
+# REPEATEDLY, and it survives every fix aimed at any single lookup.
+#
+# ⛔ THIS DOES NOT PIN AN ADDRESS ANYWHERE PERSISTENT. The Mac is on DHCP, so a
+# config holding an IP is wrong the moment the lease changes. The config keeps
+# the NAME; only THIS PROCESS gets an address, and only for its own lifetime.
+# ⓘ A caller that already exported `DSS_MACOS_HOST` is left alone — an explicit
+# override outranks anything derived here.
+# ⓘ arm64-vps needs none of this: it is reached by a literal host entry, not mDNS.
+if [[ "$CARRIAGE" == "macos" && -z "${DSS_MACOS_HOST:-}" ]]; then
+    if _resolved_host=$(bash "$CARRIAGE_SH" --resolve 2>/dev/null | tail -1) \
+       && [[ -n "$_resolved_host" ]]; then
+        export DSS_MACOS_HOST="$_resolved_host"
+        printf 'host   : %s (resolved ONCE for this leg)\n' "$DSS_MACOS_HOST"
+    else
+        # Not fatal here: the reachability probe below is the honest place to
+        # fail, and it prints the carriage's own full diagnostic when it does.
+        printf 'host   : could not pre-resolve; each call will resolve on its own\n'
+    fi
+fi
+
 # ── the leg repository is a CLONE (operator ruling 2026-08-26) ───────────────
 # Run one `leg-tree` verb on the carriage. The script text is INLINED rather than
 # assumed present on the far side: the host's checkout can predate this file, and a

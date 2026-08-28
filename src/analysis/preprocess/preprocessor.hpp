@@ -401,6 +401,47 @@ struct DSS_EXPORT TranslationTimestamp {
 };
 [[nodiscard]] DSS_EXPORT TranslationTimestamp translationTimestamp();
 
+// How much work the per-FILE pre-scan actually did.
+//
+// ★★★ THIS EXISTS BECAUSE THE PROPERTY
+// [[D-PERF-PP-EVERY-INCLUDE-RE-READS-AND-RE-TOKENIZES-THE-SAME-HEADER]] PINS IS
+// A COUNT, AND IT WAS BEING PINNED WITH A CLOCK. The defect was that the read +
+// continuation-splice + tokenize of a header was paid per OCCURRENCE of an
+// `#include` naming it rather than once per FILE. That is a statement about HOW
+// MANY TIMES the work happened — so the honest instrument is a counter, not a
+// stopwatch. ✔MEASURED on CI run 33156833090: the ratio pin that stood in for
+// this counter read x1.048 against a bound of 0.85 on `linux-gcc-release` and
+// PASSED on `linux-arm64-gcc-release` in the same run at the same commit, which
+// is a property of the runner rather than of the compiler
+// [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]].
+//
+// ⚠ COUNTERS, NOT A CACHE POLICY SURFACE. There is nothing to configure here
+// and nothing a caller may switch off: the memo is a memo of a pure function,
+// so a hit and a miss cannot disagree. These are OBSERVATIONS of it, in the
+// shape `substrate::PhaseTimers` already established for phase accounting —
+// static accessors, process-wide, plus a `reset()` that exists for test
+// isolation and that the driver never calls.
+//
+// ⓘ `builds` counts WORK DONE, not misses: two threads racing on a cold header
+// both build it and the first to publish wins, so `builds` may exceed the
+// number of distinct files by the number of lost races. It is exact on the one
+// thread a test uses. A request whose file cannot be READ counts as neither —
+// nothing was memoized and nothing was served.
+class DSS_EXPORT PreScanMemoCounters {
+public:
+    struct Row {
+        // Files read, continuation-spliced and tokenized by the pre-scan.
+        std::uint64_t builds = 0;
+        // Pre-scan requests answered from the memo without doing that work.
+        std::uint64_t hits = 0;
+    };
+
+    [[nodiscard]] static Row read() noexcept;
+
+    // Zero both counters. Test isolation only — the driver never resets.
+    static void reset() noexcept;
+};
+
 // Run the preprocessor over `mainSource` under `schema`. Precondition:
 // `schema->preprocess().enabled` is true (the caller gates on it; calling
 // with a disabled schema is a usage error and fatal-asserted). `includeDirs`

@@ -50,6 +50,10 @@ param(
     # Makes the push a SYNC rather than an accumulation. See the push block.
     [switch]  $Prune,
     [string]  $PushDest,
+    # Sibling of ssh-macos.sh's `--resolve`: print the resolved address and exit,
+    # so a caller resolves ONCE for a whole leg instead of once per carriage call.
+    # See that script's `--resolve` block for the measurement behind it.
+    [switch]  $Resolve,
     [string[]]$Command
 )
 $ErrorActionPreference = 'Stop'
@@ -137,6 +141,14 @@ cannot resolve '$HostName' on this network.
         exit 3
     }
     $target = $ip
+}
+
+# `-Resolve` -- print the address and exit. Twin of ssh-macos.sh's `--resolve`;
+# the reasoning, and the measurement that produced it, live there.
+# D-SCRIPT-MACOS-LEG-RERESOLVES-THE-HOST-AT-EVERY-CARRIAGE-CALL
+if ($Resolve) {
+    Write-Output $target
+    exit 0
 }
 
 $a = @('-o','ConnectTimeout=10','-o','BatchMode=yes')

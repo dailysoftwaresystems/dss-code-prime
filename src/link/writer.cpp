@@ -17,10 +17,20 @@
 // exclusive claim (see `detail::createExclusiveBinary`). Same include dance as
 // `tests/test_support/scratch_dir.hpp`, which established this precedent.
 #ifdef _WIN32
-#include <process.h>
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
+
+    #include <fcntl.h>
+    #include <io.h>
+    #include <process.h>
 #else
-#include <fcntl.h>
-#include <unistd.h>
+    #include <fcntl.h>
+    #include <unistd.h>
 #endif
 
 // Linker image file emission — plan 14 LK10 cycle 1 substrate
@@ -230,10 +240,76 @@ namespace detail {
 //
 // RED ON DISABLE, per arm: drop the `N` on Windows, or `O_CLOEXEC` on POSIX,
 // and `AClaimedStagingTempNeverCrossesIntoASpawnedChild` goes red on that leg.
+// ★★★ AND THE WINDOWS ARM IS NOT `_wfopen(…, L"wbxN")`, BECAUSE `CREATE_NEW`
+// IS NOT THE WINDOWS SPELLING OF `O_EXCL`.
+// [[D-LINK-WRITER-WINDOWS-EXCLUSIVE-CLAIM-FOLLOWS-A-DANGLING-SYMLINK]]
+//
+// POSIX.1 REQUIRES `O_CREAT|O_EXCL` to fail with `EEXIST` when the pathname is a
+// SYMBOLIC LINK — target existing or not. That mandate is the whole reason the
+// staging claim is safe: a planted link at a candidate name is refused, and the
+// writer steps to the next name. Windows `CREATE_NEW` carries no such rule: it
+// FOLLOWS the reparse point and creates the TARGET, so the claim succeeds and
+// the compiler's staged artifact is written wherever the link pointed.
+//
+// ✔MEASURED 2026-08-28 (cycle P43), first MSVC run of this suite:
+// `LinkWriterExclusiveClaim.ADanglingSymlinkRefusesTheClaimButExistsSaysNo`
+// reported `claim(p)` = TRUE where the case demands false, and then
+// `fs::exists(p)` = TRUE — because the claim had just created the target
+// through the link. Same defect in
+// `RuntimeObjectCacheStore.TempClaimNeverEscapesThroughADanglingSymlink`, which
+// reuses this primitive.
+//
+// ⚠⚠ IT WAS INVISIBLE FOR A REASON WORTH RECORDING, AND NOT BECAUSE NOBODY
+// LOOKED: the cases exist, and their own header states — correctly, and
+// measured — that MinGW's libstdc++ `create_symlink` returns ENOSYS, so the
+// shipping Windows toolchain CANNOT CONSTRUCT the input. They therefore SKIP on
+// the Windows leg and run only on POSIX, where the primitive was always right.
+// MSVC implements `create_symlink`, so the first build that reached this suite
+// also ran the guard. ★ A test that skips on the one platform whose primitive
+// differs is not covering that platform — it is reporting that it did not.
+//
+// ⇒ `FILE_FLAG_OPEN_REPARSE_POINT` is what restores the POSIX guarantee: the
+// create no longer traverses the link, so an existing reparse point at `p` makes
+// `CREATE_NEW` fail with `ERROR_FILE_EXISTS`, exactly as `O_EXCL` fails with
+// `EEXIST`. On a name that holds nothing the flag is inert and an ordinary file
+// is created.
+//
+// ⓘ THE TWO PROPERTIES THE OLD SPELLING CARRIED ARE BOTH PRESERVED, and neither
+// is incidental — see the `wbxN` measurement above:
+//   * `N` (no inherit) -> `bInheritHandle` is FALSE, which is what a null
+//     `SECURITY_ATTRIBUTES` means. Without it a spawned child inherits the
+//     handle and the commit's `MoveFileExW` fails with ERROR_SHARING_VIOLATION
+//     blaming a scanner for our own child.
+//   * `wb` (binary, write) -> `_O_WRONLY | _O_BINARY` on the fd, then `"wb"` on
+//     the `FILE*`. `_wfopen`'s default share mode is deny-none, so the three
+//     `FILE_SHARE_*` bits keep a reader from being newly locked out.
+// ⓘ `_close` owns the descriptor AND the underlying handle once
+// `_open_osfhandle` succeeds, so the failure paths below must not also
+// `CloseHandle` — that would be a double close.
 [[nodiscard]] std::FILE*
 createExclusiveBinary(std::filesystem::path const& p) {
 #ifdef _WIN32
-    return ::_wfopen(p.c_str(), L"wbxN");
+    HANDLE const h = ::CreateFileW(
+        p.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,                                    // bInheritHandle = FALSE
+        CREATE_NEW,                                 // the exclusive claim
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr);
+    if (h == INVALID_HANDLE_VALUE) { return nullptr; }
+    int const fd =
+        ::_open_osfhandle(reinterpret_cast<std::intptr_t>(h), _O_WRONLY | _O_BINARY);
+    if (fd < 0) {
+        ::CloseHandle(h);
+        return nullptr;
+    }
+    std::FILE* const f = ::_fdopen(fd, "wb");
+    if (!f) {
+        ::_close(fd);   // closes the handle too
+        return nullptr;
+    }
+    return f;
 #else
     // 0666 & umask — the same permissions `fopen` would have created, so
     // `writeImage`'s load-bearing re-apply (D-OUTPUT-EXEC-BIT) is unaffected.

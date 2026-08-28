@@ -100,6 +100,28 @@ void collectManifests(fs::path const& root, std::vector<fs::path>& out) {
     }
 }
 
+// Does THIS platform's path type model `//authority/...` as a root name?
+//
+// ★★★ THE PREDICATE IS ASKED OF THE PATH TYPE, NEVER OF A PLATFORM MACRO, and
+// that is what lets one rule serve every leg. `fileUriFromPath` already emits an
+// authority exactly when `root_name()` is non-empty; asking the same question
+// here makes the two directions provably symmetric instead of two hand-kept
+// lists that drift. ✔MEASURED 2026-08-28: true under MSVC STL, false under
+// MinGW/libstdc++ (which discards the authority at construction) and false under
+// libc++ on Darwin (where POSIX has no root name and `//server/share` is a local
+// path, not an authority).
+//
+// ⇒ It is also the line between the two things that URI shape can mean. Where
+// UNC roots exist, `file://server/share/x` NAMES A PATH and refusing it loses
+// the round trip. Where they do not, the same text names a remote HOST, and
+// turning it into `//server/share/x` would be the guess that
+// `NonFileUriIsRefusedRatherThanGuessed` exists to refuse.
+[[nodiscard]] bool platformModelsUncRoots() {
+    static bool const modelled =
+        !fs::path{"//dss-unc-probe/share"}.root_name().empty();
+    return modelled;
+}
+
 [[nodiscard]] int hexValue(char c) noexcept {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -135,12 +157,38 @@ std::optional<fs::path> pathFromFileUri(std::string_view uri) {
     auto rest = uri.substr(kScheme.size());
 
     // Authority. `file:///path` (empty) and `file://localhost/path` are the two
-    // spellings clients emit. A real remote host is NOT a local directory, so
-    // it is refused rather than silently treated as one.
+    // spellings that name a path on THIS host.
+    //
+    // ★★★ A THIRD SPELLING NAMES A UNC SHARE, AND REFUSING IT BROKE THE ROUND
+    // TRIP ON THE ONE PLATFORM THAT EMITS IT.
+    // [[D-LSP-FILE-URI-WITH-A-UNC-AUTHORITY-DOES-NOT-ROUND-TRIP]]
+    //
+    // ⚠ THIS BRANCH USED TO READ "a real remote host is NOT a local directory,
+    // so it is refused rather than silently treated as one", and that sentence
+    // is true of an HTTP-style host and FALSE of a UNC authority — on Windows
+    // `\\server\share` IS how the platform names a path, and RFC 8089 renders it
+    // as `file://server/share/...` with `server` in the authority. ✔MEASURED
+    // 2026-08-28 (cycle P43), first MSVC run of this suite:
+    // `WorkspaceProject.FileUriRoundTrip` produced `file://server/share/x.c`
+    // from `//server/share/x.c` — MSVC's `fs::path` models that as a real
+    // `root_name()`, unlike MinGW (which discards the authority) and libc++
+    // (which keeps both slashes in the PATH and leaves the authority empty) —
+    // and `pathFromFileUri` then returned nullopt on our OWN output.
+    //
+    // ⇒ A non-empty, non-`localhost` authority is put back where it came from:
+    // `//authority` + the decoded path, which is exactly what `fileUriFromPath`
+    // took apart. ★ IT IS NOT A WIDENING TO "ACCEPT ANYTHING": the forward
+    // function emits an authority ONLY when the path type reports a non-empty
+    // `root_name()`, so on the platforms that never produce one this arm is
+    // unreachable and nothing changes. And the result is still a path the OS
+    // must resolve — an unreachable share fails to open, it does not silently
+    // become a local file, which is the concern the old sentence was reaching
+    // for.
     const auto slash = rest.find('/');
     if (slash == std::string_view::npos) return std::nullopt;
     const auto authority = rest.substr(0, slash);
-    if (!authority.empty() && authority != "localhost") return std::nullopt;
+    const bool uncAuthority = !authority.empty() && authority != "localhost";
+    if (uncAuthority && !platformModelsUncRoots()) return std::nullopt;
     rest = rest.substr(slash);
 
     std::string decoded;
@@ -160,10 +208,20 @@ std::optional<fs::path> pathFromFileUri(std::string_view uri) {
 
     // `/C:/dir` is the URI spelling of the Windows path `C:/dir`. The leading
     // slash is part of the URI grammar, not of the path.
-    if (decoded.size() >= 3 && decoded[0] == '/'
+    // ⓘ Guarded on `!uncAuthority`: a drive letter cannot follow a UNC
+    // authority, and the erase would eat the first slash of the `//host` prefix
+    // rebuilt below.
+    if (!uncAuthority && decoded.size() >= 3 && decoded[0] == '/'
         && (std::isalpha(static_cast<unsigned char>(decoded[1])) != 0)
         && decoded[2] == ':') {
         decoded.erase(0, 1);
+    }
+    // Put the UNC authority back in front of the path it was split from. The
+    // decoded remainder already begins with the `/` that separated them, so
+    // `//` + authority + `/share/...` is the spelling the path type parses back
+    // into a root name.
+    if (uncAuthority) {
+        decoded.insert(0, std::string{"//"} + std::string{authority});
     }
     if (decoded.empty()) return std::nullopt;
 

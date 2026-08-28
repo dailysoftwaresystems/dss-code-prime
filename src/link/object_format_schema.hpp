@@ -1239,9 +1239,17 @@ struct DSS_EXPORT ObjectFormatData {
     // and the hand-built schemas in `tests/` both go through here, so a test
     // fixture cannot drift into a `sections`/index disagreement that the
     // shipped path would never produce.
-    [[nodiscard]] DSS_EXPORT bool
-    addSectionRow(ObjectFormatSectionInfo info,
-                  std::uint16_t& duplicateOfOut);
+    //
+    // ⚠ NO `DSS_EXPORT` ON THIS DECLARATION, and the omission is load-bearing.
+    // `ObjectFormatData` is itself an exported class, so MSVC already exports
+    // every member of it; repeating the macro on a member is error C2487
+    // ("member of dll interface class may not be declared with dll interface")
+    // while GCC and Clang accept it silently. No local leg compiles with MSVC,
+    // so the shape reaches CI as a Windows-only build break — see
+    // [[D-BUILD-EXPORT-MACRO-ON-AN-EXPORTED-CLASS-MEMBER-BREAKS-MSVC]], which
+    // `export_macro_placement_guard` now refuses on every leg.
+    [[nodiscard]] bool addSectionRow(ObjectFormatSectionInfo info,
+                                     std::uint16_t& duplicateOfOut);
 
     // Per-format identity sub-blocks. Each is populated ONLY when
     // `kind` matches; otherwise zero-defaulted. The walker reads

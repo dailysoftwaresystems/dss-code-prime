@@ -18,15 +18,34 @@
 //       opens read 109.2 MB and the pre-scan tokenized 118.7 MB into 13.2 M
 //       pp-tokens, 10.2 s of the 16.1 s `preprocess-splice` phase.
 //
-// ★★ WHY EVERY PIN HERE IS A RATIO AND NEVER A WALL-CLOCK THRESHOLD. A test
-// that asserts "this preprocesses in under N ms" is a machine benchmark: it
-// goes red on a loaded CI box and green on a fast one, and it says nothing
-// about the property. Both defects had the same signature — a cost that GREW
-// WITH SOMETHING IT MUST NOT GROW WITH — so each case builds two inputs that
-// differ ONLY in that one dimension and asserts the cost ratio stays bounded.
-// The bound is deliberately loose (a small multiple, not a tight constant), so
-// the case is insensitive to host speed and to load while still being FALSE by
-// one to two orders of magnitude when the rework returns.
+// ★★★ NO PIN HERE IS A WALL-CLOCK THRESHOLD, AND ONLY ONE IS STILL A CLOCK AT
+// ALL. A test that asserts "this preprocesses in under N ms" is a machine
+// benchmark: it reds on a loaded CI box and greens on a fast one, and it says
+// nothing about the property. Both defects had the same signature — a cost that
+// GREW WITH SOMETHING IT MUST NOT GROW WITH — so each case builds two inputs
+// that differ ONLY in that one dimension.
+//
+// ⚠ THIS BLOCK USED TO SAY "EVERY PIN HERE IS A RATIO", AND CALLED A RATIO
+// "insensitive to host speed and to load". ✔MEASURED FALSE on CI run
+// 33156833090: the include case read x1.048 against its 0.85 bound on
+// `linux-gcc-release` and PASSED on `linux-arm64-gcc-release` in the SAME run at
+// the SAME commit. A ratio's MEANING is host-insensitive; its MEASUREMENT is
+// two half-second samples on a shared two-vCPU runner, where scheduling noise
+// is the same order as the effect. [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]]
+//
+// ⇒ THE RULE THE TWO CASES NOW FOLLOW, AND THE SPLIT IS THE POINT:
+//   • ASK THE PROPERTY WHAT KIND OF QUANTITY IT IS. The include defect is
+//     "the same file is read N times instead of once" — a COUNT. It is pinned on
+//     `PreScanMemoCounters`: exact integers, identical on every host at every
+//     load, and false by a factor of `kUnits` the moment the memo goes unread.
+//   • A CLOCK ONLY WHERE COST IS GENUINELY THE OBSERVABLE. The `#if` defect is a
+//     memcpy that leaves no trace but time; a counter for it would have no
+//     writer in the fixed code and so could never fire. That case keeps a ratio
+//     and fixes the ESTIMATOR instead — `min` over interleaved rounds, because
+//     scheduling noise is additive and one-sided.
+// The surviving bound stays deliberately loose (a small multiple, not a tight
+// constant) and is still FALSE by one to two orders of magnitude when the
+// rework returns.
 //
 // ★ AND EVERY CASE ALSO ASSERTS THE ANSWER. A performance pin that does not
 // check the OUTPUT is how an optimization that changes a token gets a green
@@ -44,11 +63,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -142,9 +163,15 @@ void forceADistinctWriteTime(fs::path const& path,
     return out;
 }
 
-// Elapsed time of ONE preprocess, in microseconds. Every comparison below is a
-// RATIO of two of these taken back to back in the same process, so a slow or
-// loaded host scales both sides together.
+// Elapsed time of ONE preprocess, in microseconds.
+//
+// ⚠ ONE case still uses this, and it reads a MINIMUM over interleaved rounds
+// rather than a single sample. The comment here used to say that a ratio of two
+// back-to-back samples means "a slow or loaded host scales both sides together"
+// — ✔MEASURED FALSE on CI run 33156833090, where exactly that shape reddened on
+// one runner and passed on another at the same commit. Load does not scale two
+// samples; it is ADDED to whichever one it lands on.
+// [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]]
 template <typename F>
 [[nodiscard]] double microseconds(F&& f) {
     auto const t0 = std::chrono::steady_clock::now();
@@ -225,8 +252,36 @@ TEST(PpIfNoRework, AProductInTheUnitDoesNotMakeEveryIfCostTheWholeUnit) {
 
     PreprocessResult noR   = pp(noProduct);
     PreprocessResult withR = pp(withProduct);
-    const double noUs   = microseconds([&] { noR   = pp(noProduct); });
-    const double withUs = microseconds([&] { withR = pp(withProduct); });
+
+    // ★★★ THE ESTIMATOR IS A MINIMUM OVER INTERLEAVED ROUNDS, AND THAT IS A
+    // CORRECTION TO THE ESTIMATOR RATHER THAN A LOOSENING OF THE BOUND — the
+    // bound below is untouched. Scheduling noise on a shared CI runner is
+    // ADDITIVE and one-sided: a descheduled arm can only be measured as SLOWER
+    // than it is, never faster. A single sample of each arm therefore estimates
+    // `true cost + whatever that arm happened to be charged`, and the ratio of
+    // two such samples is a ratio of two noise draws. `min` over k rounds is the
+    // consistent estimator of the quantity this case is actually about, and the
+    // arms are INTERLEAVED so a load excursion lands on both rather than on
+    // whichever ran second.
+    //
+    // ✔MEASURED, and this is why it is here rather than left as it was: the
+    // SIBLING case in this file — same file, same idiom, a single sample per arm
+    // — went red on `linux-gcc-release` at x1.048 against its 0.85 bound while
+    // PASSING on `linux-arm64-gcc-release` in the SAME CI run at the SAME commit
+    // (run 33156833090). That case has since been re-pinned on an exact COUNT
+    // because its property IS a count. This one's property is a MEMCPY whose
+    // only trace is time, so the instrument stays a clock and the fix belongs in
+    // how the clock is read. [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]]
+    //
+    // ⓘ `kRounds` is a repetition count, not a duration: it is not sized on any
+    // machine and cannot go stale on a slower one.
+    constexpr int kRounds = 3;
+    double noUs   = std::numeric_limits<double>::infinity();
+    double withUs = std::numeric_limits<double>::infinity();
+    for (int round = 0; round < kRounds; ++round) {
+        noUs   = std::min(noUs,   microseconds([&] { noR   = pp(noProduct); }));
+        withUs = std::min(withUs, microseconds([&] { withR = pp(withProduct); }));
+    }
 
     ASSERT_FALSE(noR.diagnostics->hasErrors());
     ASSERT_FALSE(withR.diagnostics->hasErrors());
@@ -357,7 +412,7 @@ void writeIdenticalHeaders(fs::path const& dir, char const* stem,
 
 constexpr std::size_t kUnits = 12;
 
-TEST(PpIncludeNoRework, OneHeaderAcrossManyUnitsCostsLessThanManyIdenticalOnes) {
+TEST(PpIncludeNoRework, OneHeaderAcrossManyUnitsIsReadAndTokenizedOnce) {
     test_support::ScratchDir scratch{test_support::Location::Temp,
                                      "pp-include-rework"};
     fs::path const dir = scratch.path();
@@ -366,7 +421,8 @@ TEST(PpIncludeNoRework, OneHeaderAcrossManyUnitsCostsLessThanManyIdenticalOnes) 
     std::vector<fs::path> const dirs{dir};
 
     // One unit per arm element. Each includes exactly one header, so every unit
-    // splices the same bytes and every unit's downstream work is the same.
+    // splices the same bytes and every unit's downstream work is the same. The
+    // arms differ ONLY in how many DISTINCT files those kUnits includes name.
     auto runSame = [&] {
         for (std::size_t i = 0; i < kUnits; ++i) {
             PreprocessResult r = pp("#include \"same0.h\"\nint use = BIG_MACRO_0;\n",
@@ -383,50 +439,62 @@ TEST(PpIncludeNoRework, OneHeaderAcrossManyUnitsCostsLessThanManyIdenticalOnes) 
         }
     };
 
-    // ★★ WARM THE OS FILE CACHE, AND NOTHING ELSE. An earlier cut warmed by
-    // PREPROCESSING both arms first, which populated the per-file memo for
-    // BOTH — so the timed runs were two fully-memoized runs doing identical
-    // work, and the pin read x1.00 with the memo demonstrably hitting (37 hits,
-    // 13 misses on the probe). A warm-up that warms the very thing under test
-    // measures nothing. So the bytes are pulled through the OS cache with a
-    // plain read, the schema and allocator are warmed on an UNRELATED unit, and
-    // the memo is left cold for both arms.
-    for (std::size_t i = 0; i < kUnits; ++i) {
-        for (char const* stem : {"same", "dist"}) {
-            fs::path const h =
-                dir / (std::string{stem} + std::to_string(stem[0] == 's' ? 0 : i)
-                       + ".h");
-            std::ifstream is{h, std::ios::binary};
-            std::string sink{std::istreambuf_iterator<char>{is},
-                             std::istreambuf_iterator<char>{}};
-            if (sink.empty()) ADD_FAILURE() << "fixture header is empty: " << h;
-        }
-    }
-    (void)pp("int warm = 1;\n", dirs, "warm.c");
+    // Each arm is measured from a ZEROED counter, and the reset is what makes
+    // the two arms independent of every sibling case in this binary — the memo
+    // and its counters are process-lifetime, so a shared scratch state would
+    // make this case's verdict depend on test ORDER.
+    PreScanMemoCounters::reset();
+    runSame();
+    PreScanMemoCounters::Row const same = PreScanMemoCounters::read();
 
-    const double sameUs = microseconds(runSame);
-    const double distUs = microseconds(runDistinct);
+    PreScanMemoCounters::reset();
+    runDistinct();
+    PreScanMemoCounters::Row const dist = PreScanMemoCounters::read();
 
-    // THE PIN. `kUnits` units sharing ONE header must cost meaningfully less
-    // than `kUnits` units with one header EACH, because only the shared arm can
-    // reuse a pre-scan: it reads, splices and tokenizes ONE file where the other
-    // does `kUnits`. Everything else — bytes spliced, tokens produced, macro
-    // work, unit count — is identical. The bound is loose on purpose (host- and
-    // load-insensitive); it is ~1.0 with the rework present.
-    const double ratio = sameUs / (distUs > 0.0 ? distUs : 1.0);
-    EXPECT_LT(ratio, 0.85)
-        << kUnits << " units sharing ONE header cost x" << ratio
-        << " what " << kUnits << " units with one identical header each cost ("
-        << sameUs << "us vs " << distUs
-        << "us). Those two differ only in how many DISTINCT files exist, so a "
-           "ratio near 1 means every unit is re-reading, re-splicing and "
-           "re-tokenizing bytes the pre-scan has already processed — the "
-           "per-FILE memo is not being consulted.";
+    // THE PIN, AND IT IS A COUNT BECAUSE THE PROPERTY IS A COUNT. The read +
+    // continuation-splice + tokenize of a header must be paid once per FILE and
+    // not once per OCCURRENCE of an `#include` naming it. `kUnits` units sharing
+    // ONE header therefore do that work ONCE and take `kUnits - 1` memo hits;
+    // `kUnits` units with one byte-identical header EACH must do it `kUnits`
+    // times and can take none, because no two of them name the same file.
+    //
+    // ★★★ THIS USED TO BE A WALL-CLOCK RATIO (`sameUs / distUs < 0.85`) AND THE
+    // RATIO IS WHAT BROKE, NOT THE PROPERTY.
+    // [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]]. ✔MEASURED on
+    // CI run 33156833090: it read x1.0483 against the 0.85 bound on
+    // `linux-gcc-release` and PASSED on `linux-arm64-gcc-release` in the SAME
+    // run at the SAME commit — two half-second arms on a shared two-vCPU runner,
+    // where scheduling noise is the same order as the effect being measured. The
+    // file's own header argued a ratio is host- and load-insensitive; that is
+    // true of the ratio's MEANING and false of its MEASUREMENT.
+    // ⇒ The counters below are exact integers on any host at any load, and they
+    // are FALSE BY A FACTOR OF `kUnits` the moment the memo stops being
+    // consulted — a far larger margin than the 1.7x the ratio ever had.
+    EXPECT_EQ(same.builds, 1u)
+        << kUnits << " units sharing ONE header read, spliced and tokenized it "
+        << same.builds << " times. It must be read ONCE: those units differ only "
+           "in how many distinct files exist, so anything above 1 is the "
+           "per-OCCURRENCE rework this case exists to refuse.";
+    EXPECT_EQ(same.hits, kUnits - 1)
+        << "the shared header was built " << same.builds << " time(s) but served "
+        << same.hits << " time(s) from the memo, where " << (kUnits - 1)
+        << " was due. A build count of 1 with no hits means the other units "
+           "never asked at all, which would make the count above vacuous.";
+    EXPECT_EQ(dist.builds, kUnits)
+        << kUnits << " units naming " << kUnits << " DISTINCT byte-identical "
+           "headers did the per-file work " << dist.builds << " times. This arm "
+           "is the control: the memo cannot collapse it, and if it does then the "
+           "key is matching on something weaker than file identity.";
+    EXPECT_EQ(dist.hits, 0u)
+        << "a distinct-file arm took " << dist.hits << " memo hit(s). Two "
+           "byte-identical files are not the same file; a hit here means the key "
+           "has stopped distinguishing them.";
 
     // THE ANSWER. A unit that includes `same0.h` and a unit that includes
     // `dist0.h` must be the same program — the files are byte-identical. This is
-    // what a memo that ever served the wrong entry would break, loudly. Checked
-    // AFTER the timing so it cannot warm either arm's memo entry.
+    // what a memo that ever served the wrong entry would break, loudly. A pin on
+    // work avoided that does not check the OUTPUT is how "avoid all the work"
+    // gets a green test.
     PreprocessResult const a =
         pp("#include \"same0.h\"\nint use = BIG_MACRO_0;\n", dirs, "a.c");
     PreprocessResult const b =

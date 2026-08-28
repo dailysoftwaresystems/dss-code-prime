@@ -117,9 +117,44 @@ TEST(WorkspaceProject, PercentEncodedUriIsDecoded) {
 // guessed path would search the wrong tree and report the wrong project — the
 // exact silent-answer shape this cycle removed from the resolver.
 TEST(WorkspaceProject, NonFileUriIsRefusedRatherThanGuessed) {
+    // Refused on EVERY leg: neither is a `file:` URI at all.
     EXPECT_FALSE(pathFromFileUri("vscode-vfs://github/o/r").has_value());
-    EXPECT_FALSE(pathFromFileUri("file://someremotehost/share/x").has_value());
     EXPECT_FALSE(pathFromFileUri("untitled:Untitled-1").has_value());
+
+    // ★★★ AND THE NAMED-AUTHORITY CASE IS PLATFORM-SPLIT, BECAUSE THE SAME TEXT
+    // MEANS TWO DIFFERENT THINGS. [[D-LSP-FILE-URI-WITH-A-UNC-AUTHORITY-DOES-NOT-ROUND-TRIP]]
+    //
+    // ⚠ THIS CASE USED TO ASSERT A FLAT `EXPECT_FALSE` HERE, and ✔MEASURED
+    // 2026-08-28 that put it in DIRECT CONTRADICTION with
+    // `FileUriRoundTrip` the moment MSVC ran this suite: MSVC's `fs::path`
+    // models `//server/share` as a real `root_name()`, so `fileUriFromPath`
+    // emits `file://server/share/x.c` and losslessness REQUIRES the inverse to
+    // accept exactly the shape this line refused. Two live assertions, same
+    // input, opposite verdicts — and the flat one had never been challenged
+    // because no Windows leg could build MSVC.
+    //
+    // ⇒ Where UNC roots exist the URI NAMES A PATH and must round-trip; where
+    // they do not, it names a remote HOST and accepting it would be the guess
+    // this case is about. The expectation is derived from the SAME question the
+    // implementation asks — `root_name()` on a `//host/share` spelling — and the
+    // two arms are named explicitly, exactly as `FileUriRoundTrip` names its
+    // three renderings rather than widening to "anything goes".
+    const bool uncIsAPathHere =
+        !std::filesystem::path{"//dss-unc-probe/share"}.root_name().empty();
+    auto const unc = pathFromFileUri("file://someremotehost/share/x");
+    if (uncIsAPathHere) {
+        ASSERT_TRUE(unc.has_value())
+            << "this platform models `//host/share` as a root name, so that URI "
+               "names a UNC PATH — refusing it is what breaks the round trip on "
+               "our own emitted form";
+        EXPECT_EQ(unc->generic_string(), "//someremotehost/share/x")
+            << "the authority must come back where it came from, unaltered";
+    } else {
+        EXPECT_FALSE(unc.has_value())
+            << "this platform has no UNC root, so `//someremotehost/share/x` is "
+               "not a path spelling — turning the authority into one would be a "
+               "guess about a remote host";
+    }
 }
 
 // ── ★★ THE PROPERTY: one extension, two workspaces, two answers ─────────────
@@ -1080,8 +1115,17 @@ TEST(WorkspaceProject, FileUriRoundTrip) {
     {
         const std::filesystem::path p{"//server/share/x.c"};
         const std::string uri = dss::lsp::fileUriFromPath(p);
+        //   * MSVC STL on Windows — models `//server/share` as a REAL
+        //     `root_name()`, so the authority survives and this renders as
+        //     `file://server/share/x.c`, the RFC 8089 spelling of a UNC share.
+        //     ✔MEASURED 2026-08-28 (cycle P43) on the first MSVC run of this
+        //     suite. ★ THIS IS THE "third arm" THE PARAGRAPH ABOVE PREDICTED,
+        //     added as one rather than by widening the check — and the round
+        //     trip below is what caught that `pathFromFileUri` refused our own
+        //     output, [[D-LSP-FILE-URI-WITH-A-UNC-AUTHORITY-DOES-NOT-ROUND-TRIP]].
         const bool knownForm = uri == "file:///server/share/x.c"
-                            || uri == "file:////server/share/x.c";
+                            || uri == "file:////server/share/x.c"
+                            || uri == "file://server/share/x.c";
         EXPECT_TRUE(knownForm)
             << "unexpected UNC rendering '" << uri << "' — neither the "
                "authority-discarding form nor the POSIX `//`-preserving one. "

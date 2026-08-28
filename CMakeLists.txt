@@ -854,6 +854,44 @@ if(DSS_BUILD_TESTS)
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    # Export-macro placement guard (2026-08-28 —
+    # D-BUILD-EXPORT-MACRO-ON-AN-EXPORTED-CLASS-MEMBER-BREAKS-MSVC).
+    # `DSS_EXPORT` on a MEMBER of a class that is already `DSS_EXPORT` is MSVC
+    # error C2487 and is accepted silently by GCC and Clang.
+    #
+    # ★★★ THE COMPILER THAT REFUSES IT IS THE ONE NO LOCAL LEG RUNS. The four-leg
+    # gate is Windows/MinGW-GCC, WSL x86_64 GCC, qemu arm64 GCC and macOS Clang;
+    # MSVC exists only in CI. ✔MEASURED: the declaration on
+    # `ObjectFormatData::addSectionRow` landed in cycle P34 and sat green through
+    # eight cycles and a 1708/1708 local Windows gate before `windows-msvc-release`
+    # failed to BUILD on it. ⇒ A defect class whose only detector is a
+    # fourteen-minute remote job is a defect class that LANDS, so the rule is
+    # re-expressed as a static check every leg can run.
+    #
+    # ★★ WHAT IS REFUSED IS THE MEMBER, NOT THE MACRO INSIDE THE BODY, and the
+    # boundary is MEASURED against `cl` rather than reasoned: member function,
+    # static member function and static member data are C2487; a nested
+    # class/struct and a `friend` declaration are ACCEPTED. A guard keyed on "any
+    # `DSS_EXPORT` inside an exported class" would refuse nine live sites the
+    # compiler is happy with — `PhaseTimers::Scope`, `TreeCursor::Bookmark`,
+    # `TokenStream::Bookmark` and six more — and would have been switched off the
+    # same day.
+    #
+    # ★ A BAN, NOT A RATCHET, and the population is why: after the one site above
+    # is repaired the live count is ZERO across src/, tests/, integrated_tests/
+    # and libs/, and there is no legitimate instance to grandfather. A ratchet
+    # with an empty inventory is a ban with extra moving parts.
+    # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
+    # the tree and then drives every refuse-arm AND every accept-arm, so this
+    # entry cannot pass without also proving the guard can fail, nor without
+    # proving it does not over-reach onto the nine legitimate nested types
+    # (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    add_test(
+        NAME export_macro_placement_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-export-macro-placement/check-export-macro-placement.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     # Guard-output-encoding ratchet (2026-08-23 —
     # D-GATE-NOTHING-RATCHETS-A-NEW-GUARD-INTO-RECONFIGURING-ITS-STREAMS).
     # On Windows a Python child whose stdout is a PIPE — which is how ctest runs

@@ -183,6 +183,30 @@ if ! printf '%s' "$DSS_MACOS_HOST" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; t
     target=$resolved
 fi
 
+# ★★★ `--resolve` — PRINT THE ADDRESS AND EXIT, SO A CALLER CAN ASK THE QUESTION
+# ONCE INSTEAD OF ONCE PER CARRIAGE CALL.
+#
+# ⚠ D-SCRIPT-MACOS-LEG-RERESOLVES-THE-HOST-AT-EVERY-CARRIAGE-CALL. A leg invokes
+# this script several times — `leg-tree prepare`, the rsync, the build, the
+# ctest — and each invocation re-runs the whole resolver above. Under WSL that
+# resolver's only working arm is a hop out to the Windows mDNS resolver, so any
+# ONE transient miss kills a leg that has already done minutes of work.
+# ✔MEASURED 2026-08-28: `remote-leg --carriage macos` resolved for
+# `leg-tree prepare` (reaching 192.168.0.71 and moving the clone from `301e2a63`
+# + 2854 dirty paths to a pristine `73f74972`) and then FAILED to resolve for the
+# rsync seconds later. ★ This file's own header already recorded the same shape
+# from the other side — *"mDNS then answered for the rsync and failed for the
+# build minutes later"* — as a symptom of a different defect; it is a property of
+# ASKING REPEATEDLY, and that is what this mode removes.
+#
+# ⛔ IT DOES NOT PUT AN IP IN THE CONFIG, and that distinction is the whole design:
+# the Mac is on DHCP, so a pinned address is wrong the moment the lease changes.
+# The config keeps the NAME; the RUN gets one resolution, valid for its lifetime.
+if [ "${1:-}" = "--resolve" ]; then
+    printf '%s\n' "$target"
+    exit 0
+fi
+
 args=(-o ConnectTimeout=10 -o BatchMode=yes)
 # ★★ A KEY ON A WINDOWS DRIVE IS WORLD-READABLE TO WSL, AND ssh REFUSES IT.
 # ✔MEASURED 2026-08-17 on the arm64-vps twin: the repo lives on `/mnt/c`, whose

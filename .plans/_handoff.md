@@ -9,7 +9,15 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-27 — cycles **P14 … P42**.
+**Last updated:** 2026-08-28 — cycles **P14 … P43**.
+
+★★★ **P43: THE TWO RED CI LEGS WERE TWO DIFFERENT WAYS OF NOT BEING ABLE TO SEE A DEFECT LOCALLY, AND BOTH ARE NOW STATIC OR DETERMINISTIC.** ✔MEASURED `check-anchor-balance --base 73f74972`: **closed 0, opened 0, net +0**, registry+plans **879 → 879** — the correct reading for a cycle whose five rows are ALL **BORN CLOSED**, since a row that did not exist at base cannot be counted as newly closed. **Three production fixes and two harness fixes.** ⚠ **Only TWO of the five were the reported CI failures.** Repairing the Windows BUILD break ran the MSVC suite for the first time since P34 and uncovered two production defects underneath it — one a symlink escape in the staging-temp claim; a third was faced while taking the gate itself and fixed in the lane that hit it, per *"harness we fix as we need when we face the problem (NEVER LATER)"*. ★ **A build break does not just stop a build: it hides every test behind it, and the longer it stands the more it hides.**
+
+★★★ **THE WINDOWS LEG: `DSS_EXPORT` ON A MEMBER OF AN ALREADY-`DSS_EXPORT` CLASS IS MSVC ERROR C2487, AND MSVC IS THE ONE COMPILER NO LOCAL LEG RUNS.** ✔MEASURED: `windows-msvc-release` on CI run 33156833090 failed to BUILD `src/link/entry_trampoline.cpp` and `src/link/image_request.cpp`, naming `ObjectFormatData::addSectionRow`. GCC and Clang accept the shape silently, and the four-leg gate is Windows/**MinGW-GCC**, WSL GCC, qemu arm64 GCC and macOS Clang — so the declaration landed in **P34 (`5085664a`)** and sat green through **eight cycles and a 1708/1708 local Windows gate**. ⇒ **The instance is one deleted macro; the CYCLE'S deliverable is that the rule is now a static check every leg can run** — `export_macro_placement_guard`, a BAN (live population zero), whose boundary was MEASURED against `cl` one arm at a time: member function / static member function / static member data are C2487, while a nested class, a nested struct and a `friend` declaration are ACCEPTED. ⚠ **A guard keyed on "any `DSS_EXPORT` inside an exported class" would have refused NINE live sites the compiler is happy with** and been switched off the same day. ✔The repair is verified BY EXECUTION under Visual Studio 18 with CI's own generator and build type, not by reading: `MSVC_LINK_TARGET_OK`, zero `error C`, both objects present. [[D-BUILD-EXPORT-MACRO-ON-AN-EXPORTED-CLASS-MEMBER-BREAKS-MSVC]]
+
+★★★ **THE LINUX GCC LEG: A PROPERTY THAT IS A COUNT WAS PINNED WITH A RATIO OF TWO WALL-CLOCK SAMPLES.** `PpIncludeNoRework` read **x1.0483 against a 0.85 bound on `linux-gcc-release` and PASSED on `linux-arm64-gcc-release` in the SAME run at the SAME commit** — two half-second arms on a shared two-vCPU runner, where scheduling noise is the same order as the effect. ⚠ **The test file's own header called a ratio *"insensitive to host speed and to load"*; a ratio's MEANING is host-insensitive and its MEASUREMENT is not.** ⇒ **The fix is to ask the property what kind of quantity it is**, and the split is the reusable half: the include defect is *the same file read N times instead of once* — a COUNT — so `PreScanMemoCounters` now publishes the pre-scan's `builds`/`hits` and the case asserts **exact integers** (12 units sharing one header ⇒ 1 build + 11 hits; 12 distinct byte-identical headers ⇒ 12 builds + 0 hits), false by a factor of `kUnits` on any host at any load. The sibling `#if` defect is a **memcpy whose only trace is time**, so a counter for it would have **no writer** in the fixed code and could never fire — that case keeps the clock and fixes the **ESTIMATOR** instead (`min` over 3 interleaved rounds; noise is additive and one-sided), bound untouched. [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]]
+
+⚠ **THE SAME GAP EXPLAINS BOTH LEGS, AND IT IS THE ONE THING TO CARRY FORWARD: A RULE ENFORCED ONLY BY A REMOTE JOB IS A RULE THAT GETS BROKEN.** One was a compiler nobody runs locally; the other was a runner nobody can reproduce locally. Neither was fixed by making CI more tolerant — one became a static check, the other became an integer.
 
 ★★★ **P42: 68 DEFECTS FIXED, AND THE GATE CAN ONLY SEE 28 OF THEM — PLUS AN AUDIT THAT CORRECTED 84 ROWS THAT WERE ALREADY FIXED AND STILL READ OPEN.** ✔MEASURED `check-anchor-balance --base 301e2a63`: **closed 112, opened 3, net −109**, registry **665 → 556**. ⚠ **Those two sentences are different numbers and both are needed.** Diffing anchor ids AND their status cells against `301e2a63`: **28** pre-existing rows flipped OPEN→CLOSED, **40** rows were **BORN CLOSED** (found and fixed inside the cycle, filed already ✅ because the rule is *close, do not file*), and **84** were re-statused by the end-of-cycle audit as **already fixed in behaviour while their cell still read OPEN**. ⇒ **P42 fixed 68 defects; the audit corrected 84 records; the OPEN count fell 109.** ★ **The better a cycle obeys "close, do not file", the LESS of it a row-counting gate can see** — a born-closed row did not exist at base, so it cannot be counted as newly closed. Report both or neither. **62 of the 68 are PRODUCTION; all 6 harness closures are born-closed** — not one was scheduled, every one was a blocker fixed in the lane that hit it, which is exactly what *"harness we fix as we need when we face the problem (NEVER LATER)"* prescribes.
 
@@ -710,6 +718,220 @@ second pattern beside the one P23 built and pinned.**
   `examples/*/*/expected.json` (**613** examples, hoisted to the root `CMakeLists.txt` in P24); a
   `"[=+]?w"` constraint search over `.c/.h/.s/.S/.json` under `examples/` returns **0 files**, and the
   same search over the sqlite real-example tree returns **0**. No corpus example exercises `"w"`.
+
+---
+
+## 0.0000000000000000000000000000000000000000 ★★★ CYCLE P43 — TWO RED CI LEGS, TWO DIFFERENT BLIND SPOTS, AND NEITHER WAS CLOSED BY LOOSENING ANYTHING
+
+> Invoked on the operator's words: *"windows and linux gcc CI failed. address the root cause with no
+> workarounds, 100% config driven, first class implementation and no follow ups"*. Both failures were
+> on CI run **33156833090** (PR #55) at `73f74972`; `linux-arm64-gcc-release` was GREEN in that same
+> run, which is what made both diagnoses possible.
+
+### The Windows leg — a build break, in a compiler no local leg runs
+
+✔**MEASURED.** `windows-msvc-release` failed at **Build**, not at Test:
+
+```
+src\link\..\link/object_format_schema.hpp: error C2487: 'addSectionRow':
+    member of dll interface class may not be declared with dll interface
+```
+
+`ObjectFormatData` is `struct DSS_EXPORT`, and its member `addSectionRow` carried `DSS_EXPORT` too.
+`src/core/export.hpp` expands that macro to `__declspec(dllexport)` under MSVC, to
+`__attribute__((visibility("default")))` under GCC and Clang, and to nothing in a static build. **Only
+MSVC calls the repetition an error.**
+
+★★★ **THE STRUCTURAL FACT, WHICH IS THE ACTUAL DEFECT: the four-leg gate is Windows/MinGW-GCC, WSL
+x86_64 GCC, qemu arm64 GCC and macOS Clang. MSVC exists ONLY in CI.** ✔The declaration landed in
+cycle **P34 (`5085664a`)** and survived **eight cycles and a 1708/1708 local Windows gate** before a
+fourteen-minute remote job saw it.
+
+**What shipped:**
+- The macro is deleted from the declaration — the enclosing class already exports every member — with
+  the omission annotated at the site so it is not re-added.
+- `scripts/check-export-macro-placement/` + the `export_macro_placement_guard` ctest entry: a **BAN**,
+  not a ratchet, because the live population across `src/`, `tests/`, `integrated_tests/` and `libs/`
+  is **zero** once the site is repaired, and there is no legitimate instance to grandfather.
+
+⚠ **THE BOUNDARY WAS MEASURED AGAINST `cl`, ONE ARM PER SHAPE, NOT REASONED** — and it is the reason
+the guard is usable at all. Inside a `struct DSS_EXPORT Outer`:
+
+| shape | MSVC |
+|---|---|
+| member function | **error C2487** |
+| static member function | **error C2487** |
+| static member data | **error C2487** |
+| nested class / nested struct | accepted |
+| `friend` declaration | accepted |
+
+⇒ **A guard keyed on *any* `DSS_EXPORT` inside an exported class would have refused NINE live sites**
+— `PhaseTimers::Scope`, `TreeCursor::Bookmark`, `TokenStream::Bookmark`, `TreeBuilder::OpenScope`,
+`TreeBuilder::Checkpoint`, `DiagnosticReporter::Snapshot`, `LexerModeStack::Snapshot`,
+`SchemaWalker::Snapshot`, `CompilationUnit::PrivateTag` — **and would have been switched off the same
+day.**
+
+✔**VERIFIED BY EXECUTION, NOT BY READING.** `build/p43-msvc` configured with CI's own
+`-G Ninja -DCMAKE_BUILD_TYPE=Release -DDSS_BUILD_TESTS=ON` under Visual Studio 18's `vcvars64`; the
+`link` target built to completion (`MSVC_LINK_TARGET_OK`), **zero `error C` in the log**, and both
+objects CI could not produce are on disk.
+
+✔**RED-ON-DISABLE VALID.** The defect was re-applied to the live header; the guard's ctest form
+refused it naming the file and the owning class; both control arms rc=0; the subject's md5 moved and
+returned. ⓘ Its first run reported the wrong LINE (288 for a declaration near 1250) — the shared
+comment stripper preserves newlines but **not length**, so a stripped offset must be counted in the
+STRIPPED text. Repaired, and pinned by a self-test arm that puts a long comment block ahead of the
+violation so a regression to raw-offset counting cannot pass.
+
+### The linux-gcc leg — a count pinned with a clock
+
+✔**MEASURED.** `analysis/preprocess/test_preprocess_no_rework` failed:
+
+```
+Expected: (ratio) < (0.85), actual: 1.0483303905332229
+    (543916.069 us vs 518840.314 us)
+```
+
+…and **PASSED on `linux-arm64-gcc-release` in the same run at the same commit**. Two half-second arms
+on a shared two-vCPU runner: the noise is the same order as the effect.
+
+⚠ **THE FILE'S OWN HEADER ARGUED THE OPPOSITE** — *"the bound is deliberately loose … so the case is
+insensitive to host speed and to load"* — and that sentence is the defect in one line. **A ratio's
+MEANING is host-insensitive; its MEASUREMENT is two samples.** The header is corrected in place
+rather than left to read as evidence.
+
+⚠ **AND IT IS THE SAME SPECIES `check-wall-clock-in-tests` ALREADY REFUSES**, one level of
+indirection out: that guard's own docstring says *"a wall-clock assertion sized on a developer
+machine is the same defect wearing an assertion's clothes"*, but its subject is a `chrono` **literal**
+— and a RATIO has none, so it measured green over this.
+
+★★★ **THE FIX IS TO ASK THE PROPERTY WHAT KIND OF QUANTITY IT IS, AND THE SPLIT IS THE PART WORTH
+CARRYING:**
+
+- **A COUNT gets a counter.** [[D-PERF-PP-EVERY-INCLUDE-RE-READS-AND-RE-TOKENIZES-THE-SAME-HEADER]] is
+  *the same file is read N times instead of once*. `PreScanMemoCounters` publishes the pre-scan's
+  `builds` and `hits` — relaxed atomics on the include path, static accessors plus a test-only
+  `reset()`, the shape `substrate::PhaseTimers` already established. The case now asserts **exact
+  integers**: 12 units sharing ONE header ⇒ **1 build, 11 hits**; 12 units naming 12 byte-identical
+  DISTINCT headers ⇒ **12 builds, 0 hits**. Identical on every host at every load, and **false by a
+  factor of `kUnits`** the moment the memo goes unconsulted — against the ~1.7× the ratio ever had.
+  Renamed to what it proves: `OneHeaderAcrossManyUnitsIsReadAndTokenizedOnce`.
+- **A COST keeps a clock, and the ESTIMATOR is what gets fixed.**
+  [[D-PERF-PP-IF-REMATERIALIZES-THE-WHOLE-SYNTH-BUFFER-PER-EVALUATION]] is a **memcpy whose only trace
+  is time**. ⚠ A counter for it would have **NO WRITER** in the fixed code — the copy is gone — so it
+  could never fire: a fixture synthesizing nothing, which is the failure this project keeps closing
+  elsewhere. That case therefore keeps its ratio, **bound untouched at 2.0**, and takes `min` over **3
+  INTERLEAVED rounds**, because scheduling noise is additive and one-sided (a descheduled arm can only
+  be measured slower than it is). `kRounds` is a repetition count, not a duration, so it cannot go
+  stale on a slower host.
+
+✔**RED-ON-DISABLE VALID, TWO MUTANTS**, verdicts through `ctest` and read by failing NAME:
+**M1** the memo is never consulted — the original defect put back — reds with *12 units sharing ONE
+header read, spliced and tokenized it 12 times*; **M2** the hit counter is never incremented — the
+**anti-vacuity** arm, since a `builds == 1` that held because the other eleven units never asked would
+otherwise read green — reds with *built 1 time but served 0 times, where 11 was due*. Both controls
+rc=0, md5 moved and returned, every build rc asserted.
+
+⚠⚠ **AND THE FIRST RUN OF THAT CONTROL WAS INVALID, FOR A REASON THAT WILL RECUR.** `shutil.copy2`
+restores the backup's **mtime**, which is OLDER than the objects the mutant build produced — so ninja
+called them up to date, skipped the rebuild, and the closing control measured **the MUTANT while
+reading a pristine md5**. This is the tree's own *"REBUILD BEFORE YOU TRUST ANY RED"* wearing a new
+hat: the restore now bumps the mtime, and the OPENING control forces its own rebuild too, because a
+previous run can leave a stale object behind for the next one to inherit.
+
+### The third defect — found by taking the gate, not by reading CI
+
+✔**MEASURED while running the four-leg gate for this very commit.**
+`remote-leg --carriage macos` resolved the host for `leg-tree prepare` — reaching it at
+192.168.0.71 and moving its clone from `301e2a63` with 2854 dirty paths to a pristine
+`73f74972` — and then **failed to resolve the same `.local` name for the rsync seconds
+later**. A leg calls the carriage eight or so times and `ssh-macos.sh` re-ran its whole
+resolver on every one, so a run's success depended on N independent mDNS lookups ALL
+succeeding. Under WSL the only arm of that resolver which answers a `.local` name is a
+hop out to the Windows resolver.
+
+★★ **THE SHAPE WAS ALREADY ON FILE AND MIS-ATTRIBUTED.** `ssh-macos.sh`'s own header
+records *"mDNS then answered for the rsync and failed for the build minutes later, so the
+run got FAR enough to look like the override had worked"* — filed under
+[[D-SCRIPT-MACOS-HOST-OVERRIDE-DOES-NOT-CROSS-THE-WSLENV-BOUNDARY]], i.e. as a missing
+environment variable. ⇒ It is not. It is a property of **asking repeatedly**, and it
+survives every fix aimed at any single lookup. ⓘ ✔Five consecutive direct lookups all
+returned the address, so the failure is transient — which is precisely why a per-call
+resolver hides it until a leg is half-finished.
+
+⇒ `ssh-macos.sh` gains `--resolve` and `ssh-macos.ps1` the matching `-Resolve` (twin
+parity, same commit); `remote-leg.sh` calls it ONCE per macos leg and exports
+`DSS_MACOS_HOST` for that process only. ⛔ **It pins no address anywhere persistent** —
+the Mac is on DHCP, which is why that config deliberately stores the NAME; only the RUN
+gets an address, for its own lifetime. ⓘ The failed run discharged its cleanup correctly:
+`leg-tree restore` ran on the die path and reported *0 dirty, at 73f74972*, so no host was
+left staged. [[D-SCRIPT-MACOS-LEG-RERESOLVES-THE-HOST-AT-EVERY-CARRIAGE-CALL]]
+
+### ★★★ AND FIXING THE BUILD BREAK UNCOVERED TWO PRODUCTION DEFECTS, ONE OF THEM A SYMLINK ESCAPE
+
+⚠⚠ **THE MSVC JOB HAD NEVER REACHED ITS *TEST* STEP.** The build has been broken since P34,
+so repairing it ran that suite for the first time — **1775 tests, 6 cases failing in 4 binaries**,
+none of them a regression and none of them reachable before. Two were real defects in shipped code.
+
+**(1) The Windows exclusive claim followed a planted dangling symlink.**
+[[D-LINK-WRITER-WINDOWS-EXCLUSIVE-CLAIM-FOLLOWS-A-DANGLING-SYMLINK]]
+`CREATE_NEW` is **not** the Windows spelling of `O_EXCL`. POSIX.1 *requires* `O_CREAT|O_EXCL` to
+fail with `EEXIST` when the pathname is a symbolic link — target existing or not — and that mandate
+is the entire reason the staging-temp claim is safe there. Windows carries no such rule: it
+traverses the reparse point and creates the **target**, so the compiler's staged artifact goes
+wherever the link pointed. ✔MEASURED: `claim(p)` returned TRUE where the case demands false, then
+`fs::exists(p)` returned TRUE — because the claim had just created the target through the link.
+
+⚠⚠ **AND IT WAS INVISIBLE FOR A REASON WORTH CARRYING, NOT BECAUSE NOBODY LOOKED.** The guards
+exist. Their own header states — correctly, and measured — that MinGW's libstdc++ `create_symlink`
+returns **ENOSYS**, so the shipping Windows toolchain *cannot construct the input*; they therefore
+**SKIP** on Windows and assert only on POSIX. ★ **A test that skips on the one platform whose
+primitive differs is not covering that platform — it is reporting that it did not, and the report
+was read as a pass.** ⇒ Fixed at the ONE owner (`detail::createExclusiveBinary`, which the runtime
+object cache already reuses rather than re-deriving): `CreateFileW` with
+**`FILE_FLAG_OPEN_REPARSE_POINT`**, which restores the POSIX guarantee exactly — the create no
+longer traverses the link, so an occupied name fails `ERROR_FILE_EXISTS`. Both properties the old
+`wbxN` spelling carried (no-inherit, binary) are preserved and their measurements are at the site.
+
+**(2) An LSP `file://` URI with a UNC authority did not round-trip.**
+[[D-LSP-FILE-URI-WITH-A-UNC-AUTHORITY-DOES-NOT-ROUND-TRIP]]
+`pathFromFileUri` refused every non-empty, non-`localhost` authority, so on the one platform that
+models UNC roots the LSP **could not parse back the URI its own `fileUriFromPath` had just
+emitted** — a Windows client opening a file on a network share was unreachable. ⚠ **Two live
+assertions were in direct contradiction the moment MSVC ran**: `FileUriRoundTrip` requires
+`file://server/share/x.c` to round-trip while `NonFileUriIsRefusedRatherThanGuessed` asserted a
+flat `EXPECT_FALSE` on the same URI shape. Neither had ever been challenged, because no Windows leg
+could build MSVC.
+⇒ The predicate is asked of the **path type**, never of a platform macro: `platformModelsUncRoots()`
+tests `fs::path{"//dss-unc-probe/share"}.root_name()`. `fileUriFromPath` already emits an authority
+exactly when that is non-empty, so asking the same question in the inverse makes the two directions
+**provably symmetric** instead of two hand-kept lists that drift. Where UNC roots exist the
+authority is restored; where they do not, a named authority is still refused — there the text names
+a remote HOST and turning it into a path would be the guess the sibling case exists to prevent.
+★ Both tests are fixed **as tests, not widened**: `FileUriRoundTrip` gains the THIRD ARM its own
+comment predicted (*"this needs a third arm, NOT a widened check"*), and the refusal case splits
+into two NAMED arms.
+
+ⓘ The other four failures were not defects in the repo. `HeaderNameMatching.ShippedConfigTreeHasNo`-
+`CaseCollidingPaths` threw an opaque locale-language exception (*"no mapping for the Unicode
+character in the target multi-byte code page"*) because that case sweeps the WHOLE working tree and
+this checkout held a stray **empty directory literally named `C:`** — the U+F03A mangling a
+mis-quoted WSL command leaves behind, untracked, and exactly the accident the standing orders warn
+about. Removed. ⚠ A fresh CI checkout has none, so that one would not have reddened there; it is
+recorded because the case's verdict depending on untracked junk, and THROWING rather than naming
+the file, is worth knowing before it costs somebody an afternoon.
+
+### What this cycle did NOT do
+
+- ⓘ **This bullet is CORRECTED rather than deleted, because its correction is the cycle's largest
+  finding.** It read: *"the MSVC leg's test results are unknown at the tree this cycle ships; a green
+  MSVC suite is not claimed here."* True when typed. The full MSVC leg was then run locally under
+  Visual Studio 18 with CI's own generator and build type — and it is what surfaced the two
+  production defects above. ✔The four affected binaries are now green under MSVC.
+- ⚠ **`linux-clang-asan` was still running** when both diagnoses were taken. No claim is made about it.
+- ⓘ `build/` carries dozens of stale lane trees and hundreds of `p3x-*.log` files from earlier
+  cycles. Not swept: it is gitignored working state in a tree a concurrent workstream shares, and
+  deleting it is the operator's call, not a cycle's side effect.
 
 ---
 

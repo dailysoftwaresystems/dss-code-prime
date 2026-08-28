@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -837,6 +838,20 @@ preScanMemo() {
     return m;
 }
 
+// The counters `PreScanMemoCounters` publishes. RELAXED, deliberately: they are
+// an accounting of work already done, never a synchronisation point between the
+// threads doing it, so no reader's decision depends on seeing them ordered
+// against anything else. Making them acquire/release would put a barrier on the
+// hot include path to buy an ordering nobody reads.
+std::atomic<std::uint64_t>& preScanBuildCount() {
+    static std::atomic<std::uint64_t> n{0};
+    return n;
+}
+std::atomic<std::uint64_t>& preScanHitCount() {
+    static std::atomic<std::uint64_t> n{0};
+    return n;
+}
+
 // Look the file up, or read + splice + tokenize it and publish the result.
 // Returns null EXACTLY when `SourceBuffer::fromFile` would have — the callers'
 // unreadable-include diagnostics are unchanged.
@@ -852,10 +867,17 @@ preScanIncludeFile(fs::path const& path,
     {
         std::lock_guard<std::mutex> lk{preScanMemoMutex()};
         auto it = preScanMemo().find(key);
-        if (it != preScanMemo().end()) return it->second;
+        if (it != preScanMemo().end()) {
+            preScanHitCount().fetch_add(1, std::memory_order_relaxed);
+            return it->second;
+        }
     }
     auto buf = SourceBuffer::fromFile(path);
     if (!buf) return nullptr;   // caller emits the unreadable-include diagnostic
+    // Counted HERE rather than at the miss, because what this counts is the WORK
+    // — the read, the splice and the tokenize below — and a request whose file
+    // cannot be read does none of it.
+    preScanBuildCount().fetch_add(1, std::memory_order_relaxed);
     auto built = std::make_shared<PreScannedFile>();
     built->source = std::move(buf);
     appendWithContinuationSplice(built->source->text(), built->source, 0,
@@ -6910,6 +6932,27 @@ private:
 };
 
 } // namespace
+
+// The pre-scan work counters. See `PreScanMemoCounters` in preprocessor.hpp for
+// why the property [[D-PERF-PP-EVERY-INCLUDE-RE-READS-AND-RE-TOKENIZES-THE-SAME-HEADER]]
+// pins is observed as a COUNT and not as elapsed time.
+//
+// ⚠ THE TWO LOADS ARE NOT TAKEN TOGETHER, and no caller may treat them as a
+// consistent pair. On a THREAD POOL another unit can build or hit between them,
+// so `builds + hits` is not "requests at an instant" — it is two independent
+// accounting totals. Locking them into a snapshot would put the include path's
+// mutex on a read that exists only to be reported.
+PreScanMemoCounters::Row PreScanMemoCounters::read() noexcept {
+    Row r;
+    r.builds = preScanBuildCount().load(std::memory_order_relaxed);
+    r.hits   = preScanHitCount().load(std::memory_order_relaxed);
+    return r;
+}
+
+void PreScanMemoCounters::reset() noexcept {
+    preScanBuildCount().store(0, std::memory_order_relaxed);
+    preScanHitCount().store(0, std::memory_order_relaxed);
+}
 
 // FC17.9(h) (D-PP-EMBED, the streaming boundary): the PURE size-budget check
 // (declared in preprocessor.hpp for direct unit-testability). Returns a
