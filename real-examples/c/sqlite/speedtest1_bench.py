@@ -99,8 +99,42 @@ MAIN_TU_BASENAME = "speedtest1.c"
 # alone left `TOTAL....    <t>` against `TOTAL....  <t>`, and the arms would have
 # been declared to have done different work purely because one was faster. The
 # whitespace runs are collapsed for that reason, not for tidiness.
-_ELAPSED = re.compile(r"\b\d+\.\d+s\b")
+#
+# ⚠⚠ AND A NEGATIVE ELAPSED TIME IS STILL AN ELAPSED TIME, WHICH THE FIRST
+# PATTERN HERE (`\b\d+\.\d+s\b`) COULD NOT MATCH.
+# [[D-TEST-SPEEDTEST1-NORMALIZER-LETS-A-BACKWARD-CLOCK-LOOK-LIKE-DIFFERENT-WORK]]
+# `"%4d.%03ds"` formats a NEGATIVE delta with a sign in BOTH fields, so a clock
+# that steps backwards mid-run prints `-29.-29s` — no leading word boundary and a
+# `-` after the dot, so the old pattern skipped it and the corrupted token
+# survived into the normalized text. R6 then compared it against the other arm's
+# `<t>` and declared *"the two binaries did not do the same work"*, which is a
+# false accusation against both compilers.
+#
+# ✔MEASURED 2026-08-28 on the WSL x86_64 leg: the gcc arm printed
+# `160 - 100 DELETEs using rowid.... -29.-29s` and the whole benchmark refused
+# with R6. ★ This host family's WSL2 `CLOCK_REALTIME` is the known cause — it
+# oscillates ±34.47 s every ~5 s, which this file's own header already warns
+# about two screens above, for the harness's OWN timing. The gap was that the
+# warning had never been extended to the SUBJECT's self-reported times.
+#
+# ⇒ Both spellings are normalized, so R6 goes back to comparing WORK (test
+# names, order, counts, the `--verify` hash). ⓘ It does NOT invalidate the run:
+# the numbers this harness reports come from `time.monotonic()` in this process,
+# never from speedtest1's internal timer — but a host whose clock runs backwards
+# is worth saying out loud, so `malformed_elapsed_times()` below lets the caller
+# report it instead of silently swallowing it.
+_ELAPSED = re.compile(r"(?<![\w.])-?\d+\.-?\d+s\b")
+_ELAPSED_BACKWARD = re.compile(r"-\d+\.-?\d+s|\d+\.-\d+s")
 _RUNS = re.compile(r"[ \t]+")
+
+
+def malformed_elapsed_times(text: str) -> int:
+    """How many elapsed times in `text` carry a negative field.
+
+    Non-zero means the HOST's clock stepped backwards during the run, not that
+    the program is wrong. Reported rather than hidden.
+    """
+    return len(_ELAPSED_BACKWARD.findall(text))
 
 
 def die(msg: str, code: int = 1) -> "NoReturn":  # type: ignore[valid-type]
@@ -473,7 +507,23 @@ def run_workload(binpath: str, workload: dict, repeats: int) -> tuple[dict, str,
                                 + (r.stderr or r.stdout or "")[:800])
             times.append(elapsed)
             if not normalized:
-                normalized = normalize_output(r.stdout or "")
+                raw = r.stdout or ""
+                normalized = normalize_output(raw)
+                # ⚠ SAY IT, DO NOT SWALLOW IT. The normalizer above now absorbs a
+                # NEGATIVE elapsed time so a backward clock cannot masquerade as
+                # "the arms did different work" — but absorbing it silently would
+                # trade a false refusal for a hidden fact about the host.
+                # ⓘ The numbers this harness reports are unaffected: they come
+                # from `time.monotonic()` in THIS process, never from
+                # speedtest1's own timer.
+                backward = malformed_elapsed_times(raw)
+                if backward:
+                    print(f"  !  {os.path.basename(binpath)}: {backward} elapsed "
+                          f"time(s) came back NEGATIVE — this host's clock "
+                          f"stepped backwards during the run. The comparison "
+                          f"below is unaffected (it ignores times); the "
+                          f"program's own per-test seconds on this host are not "
+                          f"trustworthy.")
     return stats(times), normalized, ""
 
 
@@ -736,6 +786,25 @@ def selftest() -> int:
     h2 = "Verification Hash: 1234 fedcba\n"
     check("normalizer preserves the verification hash",
           normalize_output(h1) != normalize_output(h2))
+
+    # ★★ A BACKWARD CLOCK IS NOT A WORK DIFFERENCE, and this arm is the pin for
+    # the live refusal that produced it. `"%4d.%03ds"` signs BOTH fields, so a
+    # clock that steps backwards mid-run prints `-29.-29s`; the original pattern
+    # could not match that, the token survived into the normalized text, and R6
+    # declared two identical workloads to have "done different work".
+    # ✔MEASURED 2026-08-28 on the WSL x86_64 leg, which is a host whose
+    # CLOCK_REALTIME is known to oscillate ±34.47 s.
+    # [[D-TEST-SPEEDTEST1-NORMALIZER-LETS-A-BACKWARD-CLOCK-LOOK-LIKE-DIFFERENT-WORK]]
+    fwd = "160 - 100 DELETEs using rowid.....    1.234s\n"
+    back = "160 - 100 DELETEs using rowid.....  -29.-29s\n"
+    check("normalizer absorbs a NEGATIVE elapsed time (a backward host clock)",
+          normalize_output(fwd) == normalize_output(back))
+    check("a negative elapsed time is COUNTED, not silently swallowed",
+          malformed_elapsed_times(back) == 1 and malformed_elapsed_times(fwd) == 0)
+    # ...and the absorbing must not have eaten the identity along with the time.
+    other = "160 - 100 UPDATEs using rowid.....  -29.-29s\n"
+    check("absorbing a negative time still keeps the workload identity",
+          normalize_output(back) != normalize_output(other))
 
     import io
     import contextlib

@@ -191,15 +191,30 @@ carriage() { bash "$CARRIAGE_SH" "$@"; }
 # override outranks anything derived here.
 # ⓘ arm64-vps needs none of this: it is reached by a literal host entry, not mDNS.
 if [[ "$CARRIAGE" == "macos" && -z "${DSS_MACOS_HOST:-}" ]]; then
-    if _resolved_host=$(bash "$CARRIAGE_SH" --resolve 2>/dev/null | tail -1) \
-       && [[ -n "$_resolved_host" ]]; then
+    # ⚠ IT RETRIES, BECAUSE ONE LOOKUP IS THE VERY THING THIS BLOCK EXISTS TO
+    # STOP RELYING ON. ✔MEASURED 2026-08-28, minutes after the resolve-once fix
+    # landed: a single pre-resolve returned empty — moments after an identical
+    # manual probe had answered — the leg fell through to per-call resolution,
+    # and the reachability probe then reported the RESOLVER'S ERROR TEXT where a
+    # `uname -sm` belonged. ★ Resolving once was the right shape and still asked
+    # the flaky question exactly once; the fix is to make THAT one answer
+    # reliable, not to add another single-shot caller.
+    _resolved_host=""
+    for _try in 1 2 3 4 5; do
+        _resolved_host=$(bash "$CARRIAGE_SH" --resolve 2>/dev/null | tail -1)
+        [[ -n "$_resolved_host" ]] && break
+        sleep 2
+    done
+    if [[ -n "$_resolved_host" ]]; then
         export DSS_MACOS_HOST="$_resolved_host"
-        printf 'host   : %s (resolved ONCE for this leg)\n' "$DSS_MACOS_HOST"
+        printf 'host   : %s (resolved ONCE for this leg, attempt %s)\n' \
+               "$DSS_MACOS_HOST" "$_try"
     else
-        # Not fatal here: the reachability probe below is the honest place to
+        # Still not fatal: the reachability probe below is the honest place to
         # fail, and it prints the carriage's own full diagnostic when it does.
-        printf 'host   : could not pre-resolve; each call will resolve on its own\n'
+        printf 'host   : could not pre-resolve after 5 attempts; each call will resolve on its own\n'
     fi
+    unset _try
 fi
 
 # ── the leg repository is a CLONE (operator ruling 2026-08-26) ───────────────
