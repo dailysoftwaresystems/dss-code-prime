@@ -231,9 +231,21 @@ Info "dss       : $Dss"
 # ✔MEASURED 2026-08-21: a two-day-stale build against the current config refuses
 # with `unknown key 'templateLabelRule' in 'assembly'` — correct, well-named, and
 # three minutes too late without this.
-$CfgRoot = Join-Path $DssSrc 'src\dss-config'
-if (-not (Test-Path $CfgRoot)) {
-  Die "no dss config root at $CfgRoot`n      Pass -DssSrc pointing at the checkout the compiler was built from."
+# ⚠⚠ THE PIN IS THE DIRECTORY THAT *CONTAINS* `src\dss-config`, NOT THAT
+# DIRECTORY ITSELF. [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+# `config_path_walk.hpp`: "DSS_CONFIG_ROOT (optional): a directory that CONTAINS
+# src/dss-config/" -- the resolver composes the rest. This used to be
+# `$DssSrc\src\dss-config`, so the resolver probed
+# `...\src\dss-config\src\dss-config`, missed, and -- because "a set-but-miss
+# falls through" by documented design -- landed on the CWD ancestor walk. The
+# paragraph directly above promises the opposite. Same defect, same line, in the
+# `.sh` twin; both corrected together because they are one capability.
+# ✔MEASURED 2026-08-28 on the WSL leg: cwd on the 9P mount made the SAME binary
+# on the SAME manifest take 213.50 s at 13% CPU (1,834,545 voluntary context
+# switches) against 15.16 s at 90% (429) with the cwd on ext4.
+$CfgRoot = $DssSrc
+if (-not (Test-Path (Join-Path $CfgRoot 'src\dss-config'))) {
+  Die "no dss config tree at $CfgRoot\src\dss-config`n      DSS_CONFIG_ROOT names the checkout root that CONTAINS src\dss-config, not that directory itself.`n      Pass -DssSrc pointing at the checkout the compiler was built from."
 }
 # ★★ `-Target` IS PASSED, and its absence is what let this check pass while the
 # measurement failed. ✔MEASURED 2026-08-26: the probe compiled with no --target,

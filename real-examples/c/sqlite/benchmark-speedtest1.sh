@@ -675,11 +675,38 @@ fi
 #     102-object reference build and a recipe derivation. The same refusal costs
 #     one second here, and it is the difference between "the benchmark told me my
 #     compiler is stale" and "the benchmark failed".
-DSS_CONFIG_ROOT_PIN="${DSS_CONFIG_ROOT:-$SRC_DIR/src/dss-config}"
-[[ -d "$DSS_CONFIG_ROOT_PIN" ]] || die "no dss config root at $DSS_CONFIG_ROOT_PIN
-      Pass --dss-src pointing at the checkout the compiler was built from, or set
-      DSS_CONFIG_ROOT. Leaving it unset would let the CWD decide which config the
-      measured binary reads."
+# ⚠⚠ THE PIN IS THE DIRECTORY THAT *CONTAINS* `src/dss-config`, NOT THAT
+# DIRECTORY ITSELF, AND GETTING THAT WRONG MADE THE PIN A NO-OP FOR ITS WHOLE
+# LIFE. [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+# `config_path_walk.hpp` states the contract: "`DSS_CONFIG_ROOT` (optional): a
+# directory that CONTAINS `src/dss-config/`", and the resolver composes
+# `$DSS_CONFIG_ROOT/src/dss-config`. This line used to default to
+# `$SRC_DIR/src/dss-config`, so the resolver probed
+# `…/src/dss-config/src/dss-config`, missed -- and "a set-but-miss falls
+# through", by documented design -- landing on the CWD ANCESTOR WALK. The
+# comment above promises the exact opposite: "Leaving it unset would let the CWD
+# decide which config the measured binary reads." It was never set effectively,
+# so the CWD decided every time.
+#
+# ✔MEASURED 2026-08-28, and it cost a 14x wrong number that was one edit away
+# from being published: the WSL leg driven with its cwd on `/mnt/c` resolved the
+# config tree across the 9P mount, and the SAME binary on the SAME manifest at
+# `--jobs 1` took **213.50 s at 13% CPU with 1,834,545 voluntary context
+# switches**, against **15.16 s at 90% CPU with 429** once the cwd moved to
+# ext4. `preprocess-splice` alone went 65.89 s -> 508 ms. Every descriptor stat
+# had become a 9P round trip.
+# ⓘ Invisible on Windows and on native Linux, where the cwd walk happens to find
+# the same tree -- which is exactly why a silently-ignored pin survives.
+DSS_CONFIG_ROOT_PIN="${DSS_CONFIG_ROOT:-$SRC_DIR}"
+[[ -d "$DSS_CONFIG_ROOT_PIN/src/dss-config" ]] || die \
+    "no dss config tree at $DSS_CONFIG_ROOT_PIN/src/dss-config
+      DSS_CONFIG_ROOT names the directory that CONTAINS src/dss-config (the
+      checkout root), not that directory itself -- the resolver composes the
+      'src/dss-config' part. Pass --dss-src pointing at the checkout the
+      compiler was built from, or set DSS_CONFIG_ROOT to it.
+      ⚠ The check is on the COMPOSED path on purpose: a pin whose own directory
+      exists but whose config tree does not is exactly the shape that used to
+      pass here and then silently fall through to the CWD walk."
 # ★★ THE TARGET IS RESOLVED HERE, BEFORE THE PRE-FLIGHT, AND THAT ORDER IS THE
 # WHOLE POINT (D-BENCH-COMPILER-AND-CONFIG-MAY-COME-FROM-DIFFERENT-COMMITS).
 # It used to be resolved in step 5, AFTER this check — so the probe compiled for

@@ -421,8 +421,17 @@ def preflight_dss(binary: str, config_root: str,
     still get the weaker check; every caller in this repository passes one, and a
     caller that omits it is TOLD so rather than silently downgraded.
     """
-    if not os.path.isdir(config_root):
-        return False, f"the config root does not exist: {config_root}"
+    # ⚠ CHECK THE COMPOSED PATH, NOT THE PIN ITSELF.
+    # [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+    # `DSS_CONFIG_ROOT` names the directory that CONTAINS `src/dss-config`, and
+    # the resolver composes the rest. A pin whose own directory exists but whose
+    # config tree does not passed this check for its whole life and then fell
+    # through to the CWD ancestor walk -- silently, because a set-but-miss
+    # falling through is documented, deliberate behaviour in the resolver.
+    if not os.path.isdir(os.path.join(config_root, "src", "dss-config")):
+        return False, (f"no config tree at {config_root}/src/dss-config -- "
+                       f"DSS_CONFIG_ROOT names the checkout root that CONTAINS "
+                       f"src/dss-config, not that directory itself")
     env = dict(os.environ)
     env["DSS_CONFIG_ROOT"] = config_root
     with tempfile.TemporaryDirectory(prefix="dss-preflight-") as td:
