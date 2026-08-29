@@ -824,8 +824,54 @@ def selftest(root):
         subject = os.path.join(tmp, ".plans", "_handoff.md")
         pristine = io.open(subject, encoding="utf-8", newline="").read()
         inv_path = os.path.join(tmp, INVENTORY_REL)
+
+        # ── THE FIXTURE'S GROUND STATE, ESTABLISHED BEFORE ANY ARM RUNS ──
+        #
+        # ⚠⚠ EVERY GREEN ARM BELOW IS AN ASSERTION THAT THIS REPLICA IS GREEN, AND THE
+        # REPLICA IS A `copytree` OF THE LIVE TREE. "0 GREEN-CONTROL", "1b/2b/7b
+        # RESTORED", "23c GREEN-AFTER-REPAIR" and "6 GREEN-AFTER-RESTORE" all inherit
+        # whatever the live tree owes. So a tree that merely has a STALE CEILING --
+        # the normal state right after a lane converts a `path:line` citation to a
+        # stable reference, which is DEBT GOING DOWN and the behaviour this guard
+        # exists to encourage -- used to make this suite print "this guard is NOT
+        # proven able to fail". That sentence accuses the instrument for the tree's
+        # state, while the main check one line above already reports the true
+        # condition correctly. ✔MEASURED 2026-08-29 (cycle P45), twice in one cycle:
+        # running `--write` on `.plans/` -- ZERO change to this script -- flipped the
+        # suite from FAILED to OK.
+        # D-GATE-PLAN-CITATIONS-SELFTEST-BLAMES-THE-GUARD-FOR-THE-TREE
+        #
+        # ★ THE CONTROL-ARM DISCIPLINE IS NOT THE DEFECT AND IS NOT TOUCHED. What is
+        # fixed is that a fixture may be CONSTRUCTED to a known state instead of
+        # inheriting one. `--write` may only LOWER, so neutralising here cannot hide a
+        # rise; a NEW citation survives it and is reported below as what it is.
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                run(tmp, write=True)
+                ground = run(tmp, write=False)
+        except Collapse as exc:
+            print("plan-citations: self-test DECLINED -- the fixture collapsed before "
+                  "any arm ran: %s" % exc)
+            return EXIT_COLLAPSE
+        if ground != EXIT_OK:
+            print("plan-citations: self-test DECLINED -- the fixture's ground state is "
+                  "not green, so no control arm can speak.")
+            print("  ⚠ THIS IS A STATEMENT ABOUT THE TREE, NOT ABOUT THIS GUARD. The "
+                  "fixture is a copy of the live tree and a `--write` on the copy has "
+                  "already reclaimed every stale ceiling, so what remains is a NEW "
+                  "positional citation the ratchet refuses. Fix that (the main check "
+                  "above names the document), then re-run; the guard itself is "
+                  "unexercised either way and this is NOT evidence against it.")
+            return EXIT_COLLAPSE
+
+        # ⓘ READ AFTER the neutralisation, deliberately: arm 3 restores this content,
+        # and restoring the PRE-neutralisation inventory would hand every arm after it
+        # the coupling this block just removed.
         pristine_inv = io.open(inv_path, encoding="utf-8", newline="").read()
 
+        # ★ ARM 0 IS UNCHANGED IN CODE AND STRONGER IN MEANING: it used to say "the
+        # live tree happens to be green", and now says "the guard passes a tree whose
+        # inventory matches its contents" -- the property a green control is for.
         ok &= _arm("0 GREEN-CONTROL", tmp, EXIT_OK)
 
         # a new positional citation

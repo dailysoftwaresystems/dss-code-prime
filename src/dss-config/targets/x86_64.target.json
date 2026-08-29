@@ -4112,6 +4112,31 @@
       }
     },
     {
+      "$comment": "★★★ THE REGISTER-to-REGISTER SCALAR MOVE — MOVSD xmm1, xmm2 = F2 0F 10 /r and MOVSS = F3 0F 10 /r, both mod=11 (D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME, cycle P45). ★★ IT IS A SEPARATE OPCODE FROM `movsd_load`/`movsd_store` BECAUSE IT IS A SEPARATE INSTRUCTION, not a variant of a load: those two guard on MEMORY operand shapes ([reg, membase, memoffset] and [reg, reg, membase, memoffset]) and a register-to-register move reads no address at all. Adding a [reg] guard to `movsd_load` would have made an opcode whose NAME says `load` encode something that loads nothing. ★★★ AND IT IS NOT `movaps` EITHER — THE DIFFERENCE IS SEMANTIC, NOT COSMETIC, AND IT IS MEASURED BY EXECUTION RATHER THAN REASONED ABOUT. ✔MEASURED 2026-08-29 under gcc 13.3.0, two doubles packed in one xmm: after `movsd %xmm1, %xmm0` the destination's HIGH LANE is UNCHANGED (111), and after `movaps %xmm1, %xmm0` it is CLOBBERED (222). MOVSD merges into the upper lane — the false dependency the `movaps` row above already names — so a dialect that reached the register move through `movaps` would silently destroy the high half of every destination, with correct-looking low-lane results. That is exactly the near-miss this block's refusals exist to prevent, and it is why the spelling needed its own encoding rather than a redirect. ★★ EVERY BYTE MEASURED DIRECTLY, NOT DERIVED FROM THE MEMORY FORM, under GNU as 2.42 AND clang 18.1.3 which agree on all eight probes: `movsd %xmm1, %xmm0` = F2 0F 10 C1, `movss %xmm1, %xmm0` = F3 0F 10 C1, `movsd %xmm3, %xmm5` = F2 0F 10 EB. ⚠ THE HIGH-REGISTER FORMS PIN THE PREFIX/REX ORDER, which is load-bearing and would decode as a different instruction if reversed: `movsd %xmm8, %xmm9` = F2 45 0F 10 C8 — the mandatory prefix PRECEDES the REX byte, the same order `fadd` (F2 45 0F 58) already relies on. ⓘ WIDTH-KEYED like every other scalar-FP pair here: F2 = scalar double = width 64, F3 = scalar single = width 32, one opcode under two guards. ⓘ NO PRODUCER FROM THE C FRONT END BY DESIGN — `registerClassOps` binds the `fpr` class's `move` slot to `movaps`, which is the right codegen choice for a whole-register copy; this opcode exists so a hand-written `.s` or an `__asm__` template can WRITE the spelling gas accepts.",
+      "mnemonic": "movsd_reg", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [242], "opcode": [15, 16] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "opcode": [15, 16] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "FC2 Part B: FPR-class 8-byte load — MOVSD xmm, m64 = F2 0F 10 /r. Two variants: (a) the 3-op [base + disp32] form mirroring the universal `load` operand shape ([base_reg, MemBase(scale), MemOffset(disp)]) — what MIR Load-of-pointer lowers to (GlobalAddr → `lea reg, [rip+sym]` materializes the address, this loads through it); (b) the 1-op RIP-relative SymbolRef form mirroring `lea`'s riprel.disp32 variant (F2 0F 10 05 rel32 + rel32 relocation) — byte-pinned now, consumed end-to-end when a GlobalAddr+Load fold peephole lands. Bound to the `fpr` class's `load` slot in registerClassOps[]. The STORE form is `movsd_store` (next row — landed with its first consumer, the ms_x64 FPR saved-reg prologue spill). WIDTH-KEYED since FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN closure): the F64 variants (F2, width 64) carry their F32 MOVSS siblings (F3 0F 10, width 32) directly below — see the encoding-level $comment. (Audit-residue sweep c2 corrected the prior 'F64-WIDTH ONLY … when an F32 consumer exists' tail, which the variants below had already contradicted.)",
       "mnemonic": "movsd_load", "result": "value",
       "hasSideEffects": false,

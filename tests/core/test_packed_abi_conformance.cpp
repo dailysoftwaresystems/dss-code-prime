@@ -444,6 +444,195 @@ TEST(PackedAbiConformance, DssPackBitfieldLayoutMatchesNativeCompiler) {
 #endif
 }
 
+// D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT. The zero-width battery, and the mirror
+// image of the twin above: that one runs on GNU-ABI hosts and skips on Windows,
+// this one runs on Windows and skips on GNU-ABI hosts. The asymmetry is not
+// tidiness — it is WHICH HALF OF THIS ROW HAS A SETTLED ANSWER.
+//
+// `msvc_straddle` has one reference (cl.exe) for every PE format, and it answers the
+// same way on x64 and arm64 (MEASURED via clang's `-target {x86_64,aarch64}-pc-
+// windows-msvc` record dumps, then CONFIRMED exactly by cl.exe 19.51). So the MSVC
+// half is decidable and is what this battery pins.
+//
+// `gnu_packed` does NOT have one answer. The formats that select it DISAGREE, and
+// gcc 13.3.0 and clang 18.1.3 agree with each other per target rather than with each
+// other across targets (MEASURED, `{char c; unsigned :0; char d;}`):
+//     elf64-x86_64-linux ....... 5 / 1      macho64-{arm64,x86_64}-darwin .. 5 / 1
+//     elf64-aarch64-linux ...... 8 / 4      (arm-linux-gnueabihf also 8 / 4)
+// dss currently computes 8/4 for ALL of them — right on the aarch64 ELF formats,
+// a silent miscompile on the x86_64 ELF and every Mach-O one. Closing that half needs
+// a per-ABI layout key on the format documents (the same place `bitFieldStrategy`
+// lives), NOT a change to this packer, so running this battery on a GNU host today
+// would red on a gap that is filed, measured and out of this file's reach.
+// ⚠ THE SKIP BELOW IS THEREFORE A STATED GAP, NOT A MISSING TOOLCHAIN, and its
+// message must keep saying so — a skip that reads like "no compiler here" is exactly
+// how a live miscompile goes quiet.
+std::vector<PackBitProbe> zeroWidthBattery() {
+    using K = TypeKind;
+    std::int64_t const O = kNotBitfield;
+    return {
+        // No unit open ⇒ the zero-width field is INERT. cl.exe 2/1 (dss was 8/4) —
+        // THE row the defect got wrong, and it needs no `#pragma pack` to reproduce.
+        {"W1", "struct W1 { char c; unsigned :0; char d; };", 0,
+         {K::Char, K::U32, K::Char}, {O, 0, O}},
+        // Trailing, no unit open: cl.exe 1/1 (dss was 4/4).
+        {"W2", "struct W2 { char c; unsigned :0; };", 0, {K::Char, K::U32}, {O, 0}},
+        // A WIDER inert zero-width is still inert: cl.exe 2/1 (dss was 16/8).
+        {"W3", "struct W3 { char c; unsigned long long :0; char d; };", 0,
+         {K::Char, K::U64, K::Char}, {O, 0, O}},
+        // Unit OPEN ⇒ the zero-width field terminates it: cl.exe 8/4 (already right).
+        {"W4", "struct W4 { unsigned a:1; unsigned :0; unsigned b:1; };", 0,
+         {K::U32, K::U32, K::U32}, {1, 0, 1}},
+        // THE DISCRIMINATOR. Only a rule that BOTH folds the terminating type's
+        // alignment AND bumps the high-water to it reaches 16/8; "close the unit and
+        // do nothing" gives 8/4. cl.exe 16/8.
+        {"W5", "struct W5 { unsigned a:1; unsigned long long :0; unsigned b:1; };", 0,
+         {K::U32, K::U64, K::U32}, {1, 0, 1}},
+        // Leading zero-width, nothing open yet: cl.exe 1/1 (dss was 4/4).
+        {"W6", "struct W6 { unsigned :0; char c; };", 0, {K::U32, K::Char}, {0, O}},
+        {"W7", "struct W7 { char c; unsigned short :0; char d; };", 0,
+         {K::Char, K::U16, K::Char}, {O, 0, O}},
+        // Trailing zero-width AFTER an open unit still sizes that unit: cl.exe 4/4.
+        {"W8", "struct W8 { unsigned a:3; unsigned :0; };", 0,
+         {K::U32, K::U32}, {3, 0}},
+        // CONTROL — `pack(1)` was already correct BY ACCIDENT (the cap clamped the
+        // folded alignment to 1), which is how the TF-C97 pack battery missed this
+        // row entirely. It must not move. cl.exe 8/1.
+        {"W9", "struct W9 { unsigned a:1; unsigned :0; unsigned b:1; };", 1,
+         {K::U32, K::U32, K::U32}, {1, 0, 1}},
+        // …and the caps that were NOT correct by accident. cl.exe 2/1 for both
+        // (dss was 4/2 and 8/4).
+        {"W10", "struct W10 { char c; unsigned :0; char d; };", 2,
+         {K::Char, K::U32, K::Char}, {O, 0, O}},
+        {"W11", "struct W11 { char c; unsigned long long :0; char d; };", 4,
+         {K::Char, K::U64, K::Char}, {O, 0, O}},
+        // CONTROLS — no zero-width anywhere. Green before AND after; a regression
+        // that reds these is a different bug from one that reds only the W rows.
+        {"W12", "struct W12 { char c; char d; };", 0, {K::Char, K::Char}, {O, O}},
+        {"W13", "struct W13 { unsigned a:1; unsigned b:1; };", 0,
+         {K::U32, K::U32}, {1, 1}},
+    };
+}
+
+// The ONE row that is not portable, and the reason is a MEASURED engine limitation
+// rather than an ABI fact. `{char c; unsigned :3; char d;}` is an UNNAMED bit-field
+// WITH storage, so the same per-ABI axis governs it: cl.exe 12/4, aarch64-linux 4/4,
+// but x86_64-linux and Apple arm64 say 3/1 — where dss says 4/4, because
+// `TypeInterner` stores a per-field WIDTH and no per-field NAME and this packer
+// therefore cannot tell `unsigned :3` from `unsigned x:3`. Zero width needs no such
+// channel (a NAMED zero-width bit-field is a hard error, so width 0 is unnamed by
+// construction), which is why every other row above IS portable.
+// ⇒ Kept as a Windows-only CONTROL: on MSVC named and unnamed agree, so it pins that
+// the zero-width inertness did NOT leak into fields with storage. It is deliberately
+// absent from the `ignored` hosts rather than skipped there, because a row that
+// silently self-disables on the platform where it would fail is the shape this file
+// exists to avoid. See D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT.
+std::vector<PackBitProbe> zeroWidthMsvcOnlyBattery() {
+    using K = TypeKind;
+    std::int64_t const O = kNotBitfield;
+    return {
+        {"W14", "struct W14 { char c; unsigned :3; char d; };", 0,
+         {K::Char, K::U32, K::Char}, {O, 3, O}},
+    };
+}
+
+// ★ THIS BATTERY RUNS ON EVERY HOST. The earlier revision of this cycle skipped it on
+// GNU-ABI hosts because the `gnu_packed` half of the row was still open; that half is
+// now closed by the `unnamedBitFieldAlignment` format key, so the skip is RETIRED
+// rather than left standing. A skip whose stated reason has been fixed is a test that
+// has quietly stopped testing.
+//
+// The host's own ABI selects BOTH axes, the way `test_bitfield_abi_conformance`
+// selects the strategy — the probe below is compiled by THIS machine's compiler, so
+// the expectations must be read under THIS machine's rules. ✔MEASURED per host family
+// (gcc 13.3.0, clang 18.1.3, Apple clang 21.0.0, cl.exe 19.51):
+//   Windows/PE ......... msvc_straddle; the axis is not consulted by that packer
+//   Apple (any arch) ... gnu_packed + ignored   (an APPLE divergence from AAPCS64)
+//   aarch64 / arm ELF .. gnu_packed + contributes
+//   everything else .... gnu_packed + ignored   (x86_64 SysV, riscv64, ppc64le)
+TEST(PackedAbiConformance, DssZeroWidthBitfieldLayoutMatchesNativeCompiler) {
+    auto bs = zeroWidthBattery();
+#if defined(_WIN32)
+    for (auto const& r : zeroWidthMsvcOnlyBattery()) bs.push_back(r);
+#endif
+    auto const probe = native_probe::runNativeCProbe(
+        "zero-width-bitfield-abi", [&bs](fs::path const& src, native_probe::Toolchain) {
+            writePackBitProbeSource(src, bs);
+        });
+
+    // The ONE legitimate skip: no toolchain on this machine (see the twins above).
+    if (probe.toolAbsent()) {
+        GTEST_SKIP() << "no usable native C compiler on this host (" << probe.detail
+                     << ") — the hermetic MsvcStraddle goldens in test_type_layout "
+                        "still pin this layout; this leg re-derives them from cl.exe "
+                        "where a toolchain is present.";
+    }
+    ASSERT_TRUE(probe.ok()) << probe.describe();
+    // The dss-side rules and the reference must describe the SAME ABI. A host whose
+    // toolchain does not match the arm selected below would be a wrong GREEN as
+    // easily as a wrong red, so assert the pairing rather than assume it.
+#if defined(_WIN32)
+    ASSERT_EQ(probe.toolchain, native_probe::Toolchain::Msvc)
+        << "the Windows arm pins the MSVC bit-field ABI and must be measured with "
+           "cl.exe, not with whatever else answered on PATH";
+#else
+    ASSERT_EQ(probe.toolchain, native_probe::Toolchain::Unix)
+        << "the GNU arm pins the SysV/AAPCS bit-field ABI and must be measured with "
+           "cc/clang/gcc";
+#endif
+
+    auto const native = parsePackBitNative(probe.lines);
+
+#if defined(_WIN32)
+    AggregateLayoutParams const params{ScalarAlignmentRule::Natural, 16,
+                                       BitFieldStrategy::MsvcStraddle};
+#elif defined(__APPLE__)
+    // Apple DIVERGES from generic AAPCS64 on this axis — the claim this repo's own
+    // format `$comment`s asserted the opposite of until P45. ✔MEASURED on the physical
+    // macOS host, Apple clang 21.0.0: `{char c; unsigned :0; char d;}` is 5/1.
+    AggregateLayoutParams const params{ScalarAlignmentRule::Natural, 16,
+                                       BitFieldStrategy::GnuPacked,
+                                       UnnamedBitFieldAlignment::Ignored};
+#elif defined(__aarch64__) || defined(__arm__)
+    AggregateLayoutParams const params{ScalarAlignmentRule::Natural, 16,
+                                       BitFieldStrategy::GnuPacked,
+                                       UnnamedBitFieldAlignment::Contributes};
+#else
+    AggregateLayoutParams const params{ScalarAlignmentRule::Natural, 16,
+                                       BitFieldStrategy::GnuPacked,
+                                       UnnamedBitFieldAlignment::Ignored};
+#endif
+
+    native_probe::ExecutedRows sizeRows{"zero-width sizeof vs native", bs.size()};
+    native_probe::ExecutedRows alignRows{"zero-width _Alignof vs native", bs.size()};
+
+    TypeInterner ti{CompilationUnitId{1}};
+    std::uint64_t key = 1900;
+    for (auto const& b : bs) {
+        ASSERT_EQ(b.fieldTypes.size(), b.widths.size())
+            << b.name << ": probe field/width arity disagreement";
+        auto const itN = native.find(b.name);
+        ASSERT_NE(itN, native.end()) << b.name;
+        NativeSizeAlign const& nl = itN->second;
+        ASSERT_GT(nl.size, 0u) << b.name << ": native probe produced no size";
+
+        TypeId const s = internPackBit(ti, b, key++);
+        auto const l = computeLayout(s, ti, params, DataModel::Lp64);
+        ASSERT_TRUE(l.has_value())
+            << "dss failed to lay out " << b.cDecl << " (pack " << b.packN << ")";
+
+        EXPECT_EQ(l->size, nl.size)
+            << b.cDecl << " (pack " << b.packN << "): dss sizeof " << l->size
+            << " != native " << nl.size;
+        sizeRows.record();
+
+        EXPECT_EQ(l->align.bytes(), nl.align)
+            << b.cDecl << " (pack " << b.packN << "): dss _Alignof "
+            << l->align.bytes() << " != native " << nl.align;
+        alignRows.record();
+    }
+}
+
 // The KNOWN GAP, pinned so it cannot regress into silence.
 //
 // Under a member-alignment cap the GNU ABI stops bumping a bit-field past its unit

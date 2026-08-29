@@ -56,6 +56,7 @@ the other in the same commit.
 <!-- BEGIN GENERATED SCRIPT INDEX -->
 | Script | Runs as | Purpose |
 | --- | --- | --- |
+| **`apply-registry-row`** | `apply-registry-row.py` | replace one deferred-anchor registry row with a lane's verbatim row text from a file. |
 | **`burndown-queue`** | `burndown-queue.py` | re-derive the prioritized burndown queue from the registry, production errors first. |
 | **`carriage-excludes`** | `carriage-excludes.py` | emit the transport exclude list for a gate carriage, derived from what git ignores rather than re-typed once per carriage. |
 | **`check-anchor-balance`** | `check-anchor-balance.py` | refuse a cycle that ends with more OPEN deferral-registry rows than it began. |
@@ -82,6 +83,7 @@ the other in the same commit.
 | **`compile-bench`** | `compile-bench.py`, `compile-bench.sh` | time dsscp against gcc/clang/MSVC/tcc on ONE host over a subject size ladder, naming every reference it could not find. |
 | **`corpus-census`** | `corpus-census.ps1`, `corpus-census.py`, `corpus-census.sh` | census the real-example corpus into a run-identified report instead of one overwritten log. |
 | **`examples-census`** | `examples-census.py` | re-derive every corpus-manifest figure examples/README.md states, by parsing the manifests. |
+| **`lane-fold`** | `lane-fold.py` | seed a lane worktree from the main tree and fold only that lane's real changes back. |
 | **`lane-worktree`** | `lane-worktree.ps1`, `lane-worktree.sh` | create and remove lane worktrees inside the ignored .worktrees/, refusing any root that would exceed Windows MAX_PATH. |
 | **`leg-tree`** | `leg-tree.sh` | put a gate host's own clone on the tree under test before a leg, and restore it to pristine afterwards. |
 | **`local-build`** | `local-build.ps1`, `local-build.sh` | build dsscp incrementally on this host, and optionally run ctest. |

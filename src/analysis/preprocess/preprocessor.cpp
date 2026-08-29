@@ -1017,6 +1017,106 @@ preScanIncludeFile(fs::path const& path,
 // splices the recursively-preprocessed header text in place of each quote
 // include directive, and copies everything else (including angle includes)
 // VERBATIM with a 1:1 line-map segment.
+// ══ D-PP-PRAGMA-RECOGNIZED-SEMANTICS: the TU's INCLUDE-ONCE REGISTRY ═════════
+//
+// Every file whose REACHED include-once `#pragma` has fired in ONE translation
+// unit. Answers exactly one question — "has this FILE already been spliced?" —
+// and it is a different question from the include STACK's "am I inside this file
+// right now?". The stack is pushed and popped and catches a CYCLE; this is only
+// ever inserted and catches a REPEAT. A header included twice as SIBLINGS is
+// never simultaneously on the stack, which is precisely why the pre-existing
+// cycle guard did not dedup it and why this row's defect survived that guard.
+//
+// ★★★ TWO LEVELS, BECAUSE ONE KEY CANNOT ANSWER IT ON THIS HOST — ✔MEASURED
+// 2026-08-29 WITH THE STL THAT BUILDS DSS (libstdc++ 13.2, MinGW-w64 UCRT), one
+// real `mklink` symlink and one real hard link (same inode, link count 2):
+//     fs::is_symlink(link)     no          <- WRONG, it is one
+//     fs::read_symlink(link)   ec = "Function not implemented"
+//     fs::weakly_canonical     link.h      <- NOT resolved, returned unchanged
+//     fs::canonical            link.h      <- NOT resolved either
+//     fs::equivalent(h, link)  TRUE
+//     fs::equivalent(h, hard)  TRUE
+// So `core::PathIdentity` — which normalises a PATH — answers `h.h` twice,
+// `./h.h` and `sub/../h.h`, and CANNOT answer a symlink or a hard link here.
+// This corrects a premise this row carried: `PathIdentity` was described as
+// covering the symlink case, and on this host it does not, because the platform
+// STL implements no symlink resolution at all.
+//
+// ★★★ `fs::equivalent` IS THE AUTHORITY, AND ITS NEGATIVE DIRECTION IS THE
+// CONTROL THAT MAKES IT SAFE. It opens both files and compares the filesystem's
+// own identity, so it is the STANDARD's spelling of the operator's 2026-08-28
+// ruling (IDENTITY, NOT CONTENT) rather than a host-specific shim. ✔MEASURED
+// all four directions on the same run: two byte-identical files at different
+// paths -> FALSE, same content in a subdirectory -> FALSE, hard link -> TRUE,
+// symlink -> TRUE. The false arms matter more than the true ones: a test that
+// merged distinct files would DROP TEXT silently.
+//
+// ★★★ NO SIZE PRE-FILTER, AND THE DRAFT THAT HAD ONE WAS UNSOUND — ✔MEASURED,
+// AND IT IS WORTH THE PARAGRAPH BECAUSE THE REASONING LOOKED AIRTIGHT. The first
+// version of this class bucketed candidates on `fs::file_size` to avoid a linear
+// scan, justified as "two NAMES OF ONE FILE always report the SAME SIZE, so the
+// bucket can only ever produce a false NEGATIVE if that invariant broke, which it
+// cannot". It CAN, on the host that builds DSS:
+//     fs::file_size(h.h)     52
+//     fs::file_size(link.h)   0      <- the SAME FILE, through a real symlink
+// libstdc++ reads the REPARSE POINT's own size rather than the target's, so the
+// two aliases landed in different buckets and the symlink silently failed to
+// dedup — a bug whose only symptom was a correct-looking redefinition error.
+// The lesson is the one this project keeps paying for: an invariant that "cannot"
+// break is a claim about a platform, and it is worth exactly what it was measured
+// on. The scan below consults `fs::equivalent` and nothing else.
+//
+// ★★ IT IS STILL NOT O(n^2), FOR A REASON THAT IS MEASURED RATHER THAN HOPED.
+// `files_` counts only files that ACTUALLY FIRED an include-once pragma — not
+// headers in general. The TF-C82 reached-set census puts that at ZERO for the
+// whole sqlite corpus and at 21 for the macOS SDK, so the scan is over a handful
+// of entries, and it is skipped entirely while `files_` is empty. On top of that
+// the scan is INCREMENTAL: `checkedUpTo_` remembers how far each spelling has
+// already been compared, so a spelling is never re-compared against an entry it
+// has already been tested against, and a spelling that HITS is promoted into
+// `spellings_` and answers by hash from then on. A plain repeated `#include`
+// never touches the filesystem at all.
+class IncludeOnceRegistry {
+public:
+    // Has the file named by `p` (already reduced to `canon`) been spliced once?
+    [[nodiscard]] bool alreadySpliced(core::PathIdentity const& canon,
+                                      fs::path const&           p) {
+        // ZERO COST WHEN THE FEATURE IS UNUSED. No include-once pragma has fired
+        // in this TU, so nothing can match and there is nothing to remember —
+        // this returns before touching either map. That is the whole sqlite
+        // corpus, where the TF-C82 reached-set census measured `once` UNREACHED,
+        // and it keeps this row from taxing every `#include` in a build that
+        // never uses the pragma.
+        if (files_.empty()) return false;
+        if (spellings_.count(canon) != 0) return true;
+        // How far this spelling has already been compared. `files_` only ever
+        // grows, so everything below the watermark is settled and re-testing it
+        // could not change the answer.
+        std::size_t& from = checkedUpTo_[canon];
+        for (std::size_t k = from; k < files_.size(); ++k) {
+            std::error_code ec;
+            if (fs::equivalent(p, files_[k], ec) && !ec) {
+                from = files_.size();
+                spellings_.insert(canon);   // memoise: hash hit from now on
+                return true;
+            }
+        }
+        from = files_.size();
+        return false;
+    }
+
+    // Record the file named by `p` as include-once for the rest of this TU.
+    void record(core::PathIdentity const& canon, fs::path const& p) {
+        if (!spellings_.insert(canon).second) return;   // this spelling is known
+        files_.push_back(p);
+    }
+
+private:
+    std::unordered_set<core::PathIdentity>              spellings_;
+    std::unordered_map<core::PathIdentity, std::size_t> checkedUpTo_;
+    std::vector<fs::path>                               files_;
+};
+
 struct SynthBuilder {
     std::shared_ptr<GrammarSchema const> schema;
     std::span<fs::path const>            includeDirs;
@@ -1038,6 +1138,11 @@ struct SynthBuilder {
     DiagnosticReporter&                  rep;
     int                                  depth;
     std::vector<core::PathIdentity>&     includeStack;
+    // D-PP-PRAGMA-RECOGNIZED-SEMANTICS: the TU's include-once registry, shared
+    // by reference across the whole builder tree (like `includeStack`) because
+    // include-once is a property of the TRANSLATION UNIT, not of one nesting
+    // level. See `IncludeOnceRegistry` above for the identity argument.
+    IncludeOnceRegistry&                 includeOnce;
     // Set TRUE when the include-nesting backstop fires (truncating the
     // splice). Shared by reference across the recursive child builders so
     // a deep-nest truncation at any level reaches `preprocess()`.
@@ -2094,19 +2199,35 @@ struct SynthBuilder {
                 // the recursion converges after exactly one extra level.
                 return true;
             case IncludeOnceMechanism::OncePragma:
+                // ⚠ D-PP-PRAGMA-RECOGNIZED-SEMANTICS RE-WORDED THIS MESSAGE, AND
+                // THE OLD WORDING IS NOW A LIE RATHER THAN MERELY STALE: it said
+                // "this implementation has not built include-once dedup", which
+                // stopped being true when the `includeOnceSet` landed. A message
+                // that misdescribes the engine sends the user hunting the wrong
+                // thing, which is the exact failure TF-C87 split this arm out to
+                // prevent.
+                //
+                // Reaching this arm now means something NARROW and worth saying
+                // precisely: the file carries an include-once pragma, DSS
+                // implements that pragma, and yet the file is on the include
+                // stack — so the pragma had NOT YET BEEN REACHED at the point it
+                // re-entered. That is a header that includes itself ABOVE its own
+                // `#pragma once`, which no include-once mechanism can terminate,
+                // because the declaration comes after the recursion.
                 emitPP(rep,
                        DiagnosticCode::P_PreprocessorIncludeReentryRefused,
                        BufferId{}, SourceSpan::empty(0),
                        std::string{"refusing to re-enter "} + std::string{name}
-                           + ": its include-once mechanism is a '#pragma' whose "
+                           + ": it carries an include-once '#pragma' (its "
                              "'preprocess.pragmaEffects' row declares "
-                             "'includeOnce', and this implementation has not "
-                             "built include-once dedup — it relies on macro "
-                             "include guards. This is NOT a missing guard and NOT "
-                             "a cycle in your code: re-entry is refused because "
-                             "DSS cannot make the repeat expansion empty the way a "
-                             "macro guard does. The pragma is reported separately "
-                             "at its own line");
+                             "'includeOnce') and DSS DOES honour that pragma — "
+                             "but the file is already on the include stack, which "
+                             "means the pragma had not been REACHED yet when this "
+                             "re-entry happened. A header that includes itself "
+                             "ABOVE its own include-once line cannot be terminated "
+                             "by that line, because the declaration comes after "
+                             "the recursion. This is NOT a missing guard: move the "
+                             "include-once directive above the self-include");
                 return false;
             case IncludeOnceMechanism::None:
                 emitPP(rep,
@@ -2477,6 +2598,69 @@ struct SynthBuilder {
                 continue;
             }
 
+            // ── D-PP-PRAGMA-RECOGNIZED-SEMANTICS: `#pragma once` FIRES HERE ───
+            //
+            // A REACHED pragma whose registry row declares `includeOnce` records
+            // THIS FILE's identity in the TU-wide `includeOnceSet`; both include
+            // arms below consult that set and SKIP a repeat splice.
+            //
+            // ★★★ WHY THE EFFECT IS REALIZED IN THE PRE-SCAN AND NOT AT
+            // `applyPragma`. `applyPragma` runs in the AUTHORITATIVE
+            // `MacroExpander` pass, which walks a buffer this builder has ALREADY
+            // spliced — by the time the pragma is seen there, the second copy of
+            // the header's text is in the buffer and the decision is spent.
+            // Include-once is an INCLUDE-MACHINERY effect, so the only place it
+            // can be honoured is the machinery that performs the splice.
+            //
+            // ★★★ GATED ON `includeResolvable()` — THE CONSERVATIVE ORACLE, AND
+            // THE DIRECTION IS THE WHOLE ARGUMENT. ✔MEASURED 2026-08-29, all
+            // four references AGREE that a `#pragma once` buried in a NOT-TAKEN
+            // `#if 0` does NOT fire (WSL gcc 13.3.0, WSL clang 18.1.3, mingw-w64
+            // gcc 13.2.0, MSVC 19.51.36252 — every one re-splices and fails with
+            // a redefinition). So recording must be reachability-aware, and the
+            // two error directions are NOT symmetric:
+            //   • recorded-but-actually-dead  → a later include is SKIPPED →
+            //     TEXT SILENTLY VANISHES. The class the bar most abhors.
+            //   • not-recorded-but-live       → the header is spliced twice →
+            //     a LOUD redefinition. Recoverable, and self-announcing.
+            // `includeResolvable()` (stack-active AND nothing uncertain in the
+            // enclosing chain) is the same gate that already decides whether an
+            // `#include` is resolved at all, so this adds no new liveness
+            // judgement — it reuses the one the splice itself is already trusting.
+            //
+            // ⚠ THIS IS A REAL DIVERGENCE FROM `detectIncludeOnceMechanism`, AND
+            // DELIBERATELY SO. That detector is documented as "deliberately NOT
+            // gated on the conditional stack", which was CORRECT for its own
+            // reader: it gates whether re-entry is PERMITTED, where
+            // over-recognition merely splices again and the real conditional
+            // logic decides. Here over-recognition DROPS content, so the safe
+            // direction is inverted and the gate must be too. Same word, opposite
+            // risk — which is why this arm does not call that function.
+            //
+            // Deliberately NO `continue`: the line falls through to the existing
+            // flow exactly as before, so this arm ADDS a record and changes
+            // nothing else about how a `#pragma` line is pre-scanned.
+            if (!cfg().pragmaDirective.empty()
+                && dirWord == cfg().pragmaDirective && includeResolvable()
+                && !includeStack.empty()) {
+                std::size_t const         lineEndTok = sbLineEndTok(i);
+                std::vector<std::string>  pragmaWords;
+                for (std::size_t p = j + 1; p < lineEndTok; ++p) {
+                    if (isTrivia(toks[p].tok) || isNewline(toks[p].tok)) continue;
+                    if (toks[p].tok.coreKind == CoreTokenKind::Eof) continue;
+                    pragmaWords.emplace_back(toks[p].text);
+                }
+                auto const pm = matchPragmaEffect(cfg(), pragmaWords);
+                if (pm.has_value() && pm->effect == PragmaEffect::IncludeOnce) {
+                    // `includeStack.back()` IS this builder's own file: the
+                    // parent pushes the resolved identity before constructing the
+                    // child, and `preprocess()` pushes the main source for the
+                    // root. One rule, no special case for depth 0.
+                    includeOnce.record(includeStack.back(),
+                                       includeStack.back().path());
+                }
+            }
+
             // ── D-CPP-ERROR-WARNING (F2): skip a DIAGNOSTIC directive's line. Its
             // operand is PROSE, and prose routinely contains the very words this
             // pre-scan hunts for — `#error you must #define FOO first`, `#error see
@@ -2647,6 +2831,18 @@ struct SynthBuilder {
                         continue;
                     }
                     auto const& headerBuf = headerPre->source;
+                    // D-PP-PRAGMA-RECOGNIZED-SEMANTICS: this file's `#pragma once`
+                    // already fired in this TU — SKIP the repeat splice. Checked
+                    // BEFORE the include-stack test because include-once is the
+                    // stronger statement: a file that says "once" needs no cycle
+                    // adjudication, and answering here keeps the two mechanisms
+                    // from having to agree about a case only one of them owns.
+                    if (includeOnce.alreadySpliced(canon, angleRes.path)) {
+                        copyVerbatim(spliced, localMap, copiedUpTo, dStart, out,
+                                     map);
+                        copiedUpTo = dirEnd;   // DROP the directive, splice nothing
+                        continue;
+                    }
                     if (std::find(includeStack.begin(), includeStack.end(), canon)
                             != includeStack.end()
                         && !permitReentry(headerBuf, angleName)) {
@@ -2656,7 +2852,8 @@ struct SynthBuilder {
                     includeStack.push_back(canon);
                     SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
                                        headerNameMatching,
-                                       rep, depth + 1, includeStack, fatal,
+                                       rep, depth + 1, includeStack,
+                                       includeOnce, fatal,
                                        preScanDefinePrefix, effectivePredefines,
                                        resolvedDescriptorsOut, localMacros};
                     child.build(headerBuf, out, map, headerPre);
@@ -2835,6 +3032,14 @@ struct SynthBuilder {
                 copiedUpTo = dirEnd;   // Finding 5: sole reporter, drop the line
                 continue;
             }
+            // D-PP-PRAGMA-RECOGNIZED-SEMANTICS: this file's `#pragma once` already
+            // fired in this TU — SKIP the repeat splice. Same placement and same
+            // reasoning as the angle arm above (before the include-stack test).
+            if (includeOnce.alreadySpliced(canon, *resolved)) {
+                copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
+                copiedUpTo = dirEnd;   // DROP the directive, splice nothing
+                continue;
+            }
             if (std::find(includeStack.begin(), includeStack.end(), canon)
                     != includeStack.end()
                 && !permitReentry(headerBuf, filename)) {
@@ -2851,7 +3056,8 @@ struct SynthBuilder {
             includeStack.push_back(canon);
             SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
                                headerNameMatching, rep,
-                               depth + 1, includeStack, fatal, preScanDefinePrefix,
+                               depth + 1, includeStack, includeOnce, fatal,
+                               preScanDefinePrefix,
                                effectivePredefines, resolvedDescriptorsOut,
                                localMacros};
             child.build(headerBuf, out, map, headerPre);
@@ -3686,16 +3892,21 @@ private:
                              "change behavior silently");
                 return;
             }
-            case PragmaEffect::IncludeOnce: {
-                // TF-C87: a REFINEMENT of `Unsupported`, and refused with exactly
-                // the same force. The verb is not a licence to ignore the pragma —
-                // DSS implements no include-once dedup, so honouring it would mean
-                // guessing, and ignoring it means a header the author declared
-                // single-inclusion gets textually included twice. The ONLY thing
-                // the separate verb changes is that the include-guard detector can
-                // say "this header's include-once mechanism is one I do not
-                // implement" instead of falsely reporting "no include guard
-                // detected" (D-PP-INCLUDE-REENTRY-GUARD-AWARE).
+            case PragmaEffect::StandardFloatState:
+                // C23 6.10.8 `standard-pragma`, in a state THIS implementation
+                // satisfies — accepted and inert. See the long per-form
+                // measurement on `PragmaEffect::StandardFloatState`. Silence
+                // here is a CLAIM (a row asserts DSS's behaviour already meets
+                // the request), not an omission.
+                return;
+            case PragmaEffect::StandardFloatStateDiverges: {
+                // ★★★ ACCEPTED WITH NOTICE — the TU COMPILES and the unhonoured
+                // request is NAMED. Refusing would be below the reference union
+                // (all four accept all nine forms, ✔measured); accepting in
+                // silence would ship wrong numerics without a word. The notice
+                // rides an UNSUPPRESSABLE code at WARNING severity, so it can be
+                // neither capped nor `--suppress`ed away, and it does not fail
+                // the build.
                 std::string joined;
                 for (auto const& w : words) {
                     if (!joined.empty()) joined += ' ';
@@ -3704,15 +3915,47 @@ private:
                 emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(),
                        diagSpan,
                        std::string{"pragma '"} + joined
-                           + "' declares this file include-once, and its "
+                           + "' is RECOGNIZED and ACCEPTED, but this "
+                             "implementation does not provide the state it asks "
+                             "for, and the difference changes floating-point "
+                             "RESULTS rather than only performance. Its "
                              "'preprocess.pragmaEffects' row says so "
-                             "('includeOnce'). This implementation has not built "
-                             "include-once dedup — it relies on macro include "
-                             "guards — so honouring the pragma would be a guess "
-                             "and ignoring it would include this file's text "
-                             "twice");
+                             "('standardFloatStateDiverges'). Translation "
+                             "continues — every reference compiler accepts this "
+                             "pragma, so refusing it would reject a valid "
+                             "program — but the request is NOT honoured: DSS "
+                             "contracts nothing, takes no floating-point "
+                             "environment into account, and evaluates complex "
+                             "multiply and divide with the usual algebraic "
+                             "formulas (no infinity/NaN recovery)",
+                       DiagnosticSeverity::Warning);
                 return;
             }
+            case PragmaEffect::IncludeOnce:
+                // ★★★ D-PP-PRAGMA-RECOGNIZED-SEMANTICS — THIS ARM WAS THE DEFECT,
+                // AND IT IS NOW INERT BY CONSTRUCTION RATHER THAN BY OMISSION.
+                //
+                // Until 2026-08-29 this arm REFUSED the translation unit, which
+                // meant every real-world header using the commonest guard idiom
+                // failed to compile under DSS against an idiom gcc, clang and
+                // MSVC all accept. TF-C87's justification for the refusal —
+                // "DSS implements no include-once dedup" — was TRUE when written
+                // and is FALSE now: `SynthBuilder` maintains a TU-wide
+                // `includeOnceSet` keyed on `core::PathIdentity`, records this
+                // file when the pragma is REACHED, and skips a repeat splice.
+                //
+                // ★★ SILENCE HERE IS NOT A DROPPED PRAGMA. The effect has ALREADY
+                // HAPPENED by the time this pass runs — the pre-scan honoured it
+                // while splicing, which is the only phase that can. Re-reporting
+                // it here would be reporting a fact, not a problem, and refusing
+                // here would refuse a program DSS has already handled correctly.
+                //
+                // ⚠ IF THE PRE-SCAN DID NOT RECORD IT (a conditional this weaker
+                // evaluator could not confidently call live), the header is
+                // spliced TWICE and the duplicate definitions fail LOUD in the
+                // semantic tier. That is the safe direction and it is the one the
+                // gate is chosen to fall toward — never a silent text drop.
+                return;
         }
     }
 
@@ -7696,6 +7939,12 @@ PreprocessResult preprocessRun(
     std::vector<core::PathIdentity> includeStack;
     includeStack.push_back(
         core::PathIdentity::of(fs::path{mainSource->name()}));
+    // D-PP-PRAGMA-RECOGNIZED-SEMANTICS: the TU's include-once set. Its lifetime
+    // is EXACTLY this translation unit — a fresh set per `preprocess()` call, so
+    // one TU's `#pragma once` can never suppress another TU's include. The main
+    // source is deliberately NOT seeded: `#pragma once` in the main file records
+    // itself when the pragma is REACHED, exactly as it does in a header.
+    IncludeOnceRegistry includeOnce;
     // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE, Option 2): the `#define NAME
     // VALUE\n` VALUE prefix for the include-gating pre-scan. So a `#if
     // <cmdline/predefined>` VALUE guard (`#if SQLITE_TEST >= 1`,
@@ -7762,7 +8011,8 @@ PreprocessResult preprocessRun(
     std::unordered_map<std::string, SynthBuilder::SbMacro> preScanMacros;
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
                          headerNameMatching,
-                         *result.diagnostics, 0, includeStack, result.fatal,
+                         *result.diagnostics, 0, includeStack, includeOnce,
+                         result.fatal,
                          preScanDefinePrefix, merged.effective,
                          resolvedParents, preScanMacros};
     {

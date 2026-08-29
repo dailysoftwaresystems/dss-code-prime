@@ -1889,6 +1889,27 @@ struct AsmInstructionLowering::Impl {
         auto const width = effectiveWidth(ins, row, dataOperands);
         if (!width.has_value()) return;
 
+        // ★★★ THIS REFUSAL USED TO SAY *"which LIR does not model (8, 16, 32 or
+        // 64)"* AND THAT SENTENCE WAS FALSE — corrected 2026-08-29 (cycle P45).
+        // LIR models 128: `kLirInstFlagWidth128` is declared in `lir_node.hpp`
+        // and `lirInstWidthBits` already decodes it. The limit is HERE, in this
+        // translator's flag mapping, which has no 128 arm.
+        //
+        // ★★ THE COST OF THE LIE WAS MEASURED RATHER THAN IMAGINED: reading it
+        // back, two readers in one cycle mis-scoped a one-case gap in this
+        // switch as a missing width model one tier down, and nearly opened an
+        // arc against the wrong file. A fail-loud message that misplaces its own
+        // limit sends every future reader to the wrong tier, which is a worse
+        // failure than the gap it reports.
+        //
+        // ⚠ AND THE ARM IS DELIBERATELY STILL ABSENT, WHICH IS WHY THIS IS A
+        // MESSAGE FIX AND NOT A `case 128:`. `kLirInstFlagWidth128`'s own
+        // comment says it is DECLARED, NOT STAMPED — no shipped lowering sets
+        // it and no shipped target declares an encoding variant guarded on
+        // width 128, so stamping the flag here would elect nothing and hand the
+        // encoder a width no variant matches. The arm belongs in the same
+        // change as the first opcode that consumes it; adding it now would be a
+        // mechanism with no consumer, which is the shape this project refuses.
         std::uint8_t flags = 0;
         switch (*width) {
         case 8:  flags = kLirInstFlagWidth8;  break;
@@ -1897,9 +1918,19 @@ struct AsmInstructionLowering::Impl {
         case 64: flags = 0;                   break;
         default:
             sink_.fail(ins.node,
-                 std::format("'{}' operates on {} bits, which LIR does not "
-                             "model (8, 16, 32 or 64){}", ins.mnemonic, *width,
-                             sink_.pairSuffix()));
+                 std::format("'{}' operates on {} bits, and this assembly "
+                             "TEMPLATE lowering elects no variant at that "
+                             "width — it maps 8, 16, 32 and 64. The limit is "
+                             "this translator's, NOT the instruction model's: "
+                             "LIR carries 128 (`kLirInstFlagWidth128`, decoded "
+                             "by `lirInstWidthBits`), but the flag is declared "
+                             "and never stamped, because no shipped target "
+                             "declares an encoding variant guarded on width "
+                             "128 for a template to elect. This refuses rather "
+                             "than narrowing to 64, which would run the "
+                             "operation on half the register with nothing in "
+                             "the build log{}",
+                             ins.mnemonic, *width, sink_.pairSuffix()));
             return;
         }
         std::uint8_t const widthBits = lirInstWidthBits(flags);

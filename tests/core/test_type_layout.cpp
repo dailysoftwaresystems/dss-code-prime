@@ -36,6 +36,18 @@ constexpr AggregateLayoutParams kGnu16{
     ScalarAlignmentRule::Natural, 16, BitFieldStrategy::GnuPacked};
 constexpr AggregateLayoutParams kMsvc16{
     ScalarAlignmentRule::Natural, 16, BitFieldStrategy::MsvcStraddle};
+// D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: gnu_packed carries a SECOND per-ABI axis —
+// whether an UNNAMED bit-field contributes its declared type's alignment. The two
+// values below are BOTH shipped ABIs, not a preference: `ignored` is what
+// elf64-x86_64-linux and every macho64 format declare, `contributes` is what
+// elf64-aarch64-linux does. `kGnu16` leaves the axis UNDECLARED on purpose, so the
+// fail-loud path has a fixture too.
+constexpr AggregateLayoutParams kGnuIgnored16{
+    ScalarAlignmentRule::Natural, 16, BitFieldStrategy::GnuPacked,
+    UnnamedBitFieldAlignment::Ignored};
+constexpr AggregateLayoutParams kGnuContributes16{
+    ScalarAlignmentRule::Natural, 16, BitFieldStrategy::GnuPacked,
+    UnnamedBitFieldAlignment::Contributes};
 
 [[nodiscard]] StructLayout layoutOf(TypeId id, TypeInterner const& ti,
                                     AggregateLayoutParams p = kNatural16,
@@ -1139,18 +1151,167 @@ TEST(TypeLayout, BitFieldStraddleStartsNewUnit) {
 
 // A zero-width unnamed bit-field forces the next field to a fresh unit boundary:
 // a:3 in unit 0; the `:0` breaks; b:3 starts unit 1 (offset 4).
+//
+// ★ THE BREAK IS THE ABI-INVARIANT HALF, and that is why this test asserts OFFSETS and
+// the break marker but never `size` or `align`: the placement below is identical under
+// BOTH values of the unnamed-bit-field alignment axis, while the size/alignment answer
+// genuinely differs (D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT). Asserting a size here
+// would have pinned ONE ABI's answer as if it were universal — which is exactly the
+// pinned-wrong-expectation hazard, and this test is clean of it only by construction.
 TEST(TypeLayout, BitFieldZeroWidthForcesNewUnit) {
     auto ti = makeInterner(1);
     std::array<TypeId, 3> const fields{
         ti.primitive(TypeKind::U32), ti.primitive(TypeKind::U32),
         ti.primitive(TypeKind::U32)};
     std::array<std::int64_t, 3> const widths{3, 0, 3};  // middle = zero-width break
-    auto const l = layoutOf(ti.structType("S", fields, widths), ti, kGnu16);
-    EXPECT_EQ(l.fieldOffsets[0], 0u);
-    EXPECT_EQ(l.bitFields[0].bitOffset, 0u);
-    EXPECT_EQ(l.bitFields[1].unitBytes, 0u);   // the break is not an addressable field
-    EXPECT_EQ(l.fieldOffsets[2], 4u);          // c forced to the next unit
-    EXPECT_EQ(l.bitFields[2].bitOffset, 0u);
+    TypeId const s = ti.structType("S", fields, widths);
+    for (auto const p : {kGnuIgnored16, kGnuContributes16, kMsvc16}) {
+        auto const l = layoutOf(s, ti, p);
+        EXPECT_EQ(l.fieldOffsets[0], 0u);
+        EXPECT_EQ(l.bitFields[0].bitOffset, 0u);
+        EXPECT_EQ(l.bitFields[1].unitBytes, 0u);  // the break is not addressable
+        EXPECT_EQ(l.fieldOffsets[2], 4u);         // c forced to the next unit
+        EXPECT_EQ(l.bitFields[2].bitOffset, 0u);
+    }
+}
+
+// The fail-loud half of the axis: gnu_packed with the axis UNDECLARED must REFUSE a
+// zero-width bit-field rather than pick a side. Both sides are a real ABI, so a
+// default would be a silent miscompile on every platform holding the other — the
+// `BitFieldWithoutStrategyFailsLoud` discipline, one axis down.
+TEST(TypeLayout, BitFieldZeroWidthWithoutAbiAxisFailsLoud) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 3> const fields{
+        ti.primitive(TypeKind::U32), ti.primitive(TypeKind::U32),
+        ti.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 3> const zero{3, 0, 3};
+    EXPECT_FALSE(computeLayout(ti.structType("Z", fields, zero), ti, kGnu16,
+                               DataModel::Lp64).has_value())
+        << "a zero-width bit-field under gnu_packed with no declared "
+           "unnamedBitFieldAlignment must fail loud, never guess an ABI";
+    // …and the SAME struct with no zero-width field still lays out: the refusal is
+    // scoped to the case that actually needs the rule, so a format that declares no
+    // C ABI is unaffected. Without this arm the test above would also pass if the
+    // axis had simply broken every bit-field struct.
+    std::array<std::int64_t, 3> const stored{3, 3, 3};
+    EXPECT_TRUE(computeLayout(ti.structType("S", fields, stored), ti, kGnu16,
+                              DataModel::Lp64).has_value())
+        << "an undeclared axis must not disturb a struct with no unnamed bit-field";
+    // The union arm has the same two-sided property.
+    std::array<TypeId, 2> const uf{ti.primitive(TypeKind::Char),
+                                   ti.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 2> const uzero{kNotBitfield, 0};
+    EXPECT_FALSE(computeLayout(ti.unionType("UZ", uf, uzero), ti, kGnu16,
+                               DataModel::Lp64).has_value());
+    std::array<std::int64_t, 2> const ustored{kNotBitfield, 1};
+    EXPECT_TRUE(computeLayout(ti.unionType("US", uf, ustored), ti, kGnu16,
+                              DataModel::Lp64).has_value());
+}
+
+// ── D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: the gnu_packed per-ABI goldens ──
+//
+// The SAME struct under the SAME strategy, laid out for the two ABIs `gnu_packed`
+// actually serves. Every number is a MEASUREMENT, never a derivation:
+//   `ignored`     — gcc 13.3.0 + clang 18.1.3 on x86_64-linux, AND Apple clang 21.0.0
+//                   via `/usr/bin/clang -arch arm64` on the physical macOS host
+//                   (where a DSS-built Mach-O arm64 binary was also EXECUTED and
+//                   agreed row for row).
+//   `contributes` — gcc 13.3.0 + clang 18.1.3 on aarch64-linux (qemu), which also
+//                   matches arm-linux-gnueabihf.
+// ⚠ dss produced the `contributes` column for EVERY format before this axis existed.
+// So these are not two new answers: one column is the old behaviour, now correctly
+// scoped, and the other is the miscompile that was shipping on x86_64 ELF and Mach-O.
+TEST(TypeLayout, BitFieldZeroWidthGnuPackedIsPerAbi) {
+    auto ti = makeInterner(1);
+    TypeId const c8  = ti.primitive(TypeKind::Char);
+    TypeId const u16 = ti.primitive(TypeKind::U16);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    std::int64_t const O = kNotBitfield;
+
+    struct Row {
+        char const*                 name;
+        std::vector<TypeId>         fields;
+        std::vector<std::int64_t>   widths;
+        std::uint64_t ignoredSize, ignoredAlign;      // measured on x86_64 + Apple
+        std::uint64_t contributesSize, contributesAlign;  // measured on aarch64 ELF
+    };
+    std::vector<Row> const rows{
+        // `{char c; unsigned :0; char d;}` — THE row the defect was reported on.
+        {"Z1", {c8, u32, c8}, {O, 0, O},   5, 1,   8, 4},
+        // trailing zero-width: the break still SIZES the struct on both ABIs
+        {"Z2", {c8, u32},     {O, 0},      4, 1,   4, 4},
+        {"Z3", {c8, u64, c8}, {O, 0, O},   9, 1,  16, 8},
+        {"Z5", {c8, u16, c8}, {O, 0, O},   3, 1,   4, 2},
+        // leading zero-width, nothing before it to break
+        {"Z6", {u32, c8},     {0, O},      1, 1,   4, 4},
+        // between two bit-fields: the neighbours already supply align 4, so the two
+        // ABIs AGREE — the control that proves the axis is not simply "align 1".
+        {"Z4", {u32, u32, u32}, {1, 0, 1}, 8, 4,   8, 4},
+        // …and the same shape with a WIDER break, where they diverge again
+        {"Z8", {u32, u64, u32}, {1, 0, 1}, 12, 4, 16, 8},
+        {"Z10", {u32, u32},   {3, 0},      4, 4,   4, 4},
+        // a char-unit break: 1-byte alignment either way — the second control
+        {"Z11", {c8, c8, c8}, {O, 0, O},   2, 1,   2, 1},
+    };
+    for (auto const& r : rows) {
+        TypeId const s = ti.structType(r.name, r.fields, r.widths);
+        auto const ign = layoutOf(s, ti, kGnuIgnored16);
+        EXPECT_EQ(ign.size, r.ignoredSize)            << r.name << " (ignored) size";
+        EXPECT_EQ(ign.align.bytes(), r.ignoredAlign)  << r.name << " (ignored) align";
+        auto const con = layoutOf(s, ti, kGnuContributes16);
+        EXPECT_EQ(con.size, r.contributesSize)        << r.name << " (contributes) size";
+        EXPECT_EQ(con.align.bytes(), r.contributesAlign)
+            << r.name << " (contributes) align";
+    }
+}
+
+// `#pragma pack(N)` × the axis. TWO independent things are pinned here and the second
+// is the one that was silently wrong on EVERY ABI:
+//   (a) the cursor BREAK is uncapped — unchanged, and the row's "must not change";
+//   (b) on `contributes` the ALIGNMENT contribution is uncapped TOO. dss folded the
+//       CAPPED unit align, which is why it answered 6/2 to `pack(2) {char c; unsigned
+//       :0; char d;}` — a value NO reference produces on EITHER side of the axis
+//       (5/1 on ignored, 8/4 on contributes). A defect that matches nobody is easy to
+//       miss precisely because it looks like a third opinion rather than a bug.
+TEST(TypeLayout, BitFieldZeroWidthPackCapIsPerAbiAndUncapped) {
+    auto ti = makeInterner(1);
+    TypeId const c8  = ti.primitive(TypeKind::Char);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    std::int64_t const O = kNotBitfield;
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 0> const noAligns{};
+
+    struct Row {
+        char const*               name;
+        std::vector<TypeId>       fields;
+        std::vector<std::int64_t> widths;
+        std::uint32_t             cap;
+        std::uint64_t ignoredSize, ignoredAlign, contributesSize, contributesAlign;
+    };
+    std::vector<Row> const rows{
+        // pack(1) + u64 :0 — the row's stated "the break is NOT capped" case. 9/1 is
+        // the ignored answer it quoted; 16/8 is the contributes one it did not have.
+        {"P1", {c8, u64, c8}, {O, 0, O}, 1,   9, 1,  16, 8},
+        {"P2", {c8, u32, c8}, {O, 0, O}, 1,   5, 1,   8, 4},
+        {"P3", {u32, u32, u32}, {1, 0, 1}, 1, 5, 1,   8, 4},
+        // pack(2)/pack(4): dss said 6/2, 10/2 and 12/4 here — matching NEITHER column.
+        {"P4", {c8, u32, c8}, {O, 0, O}, 2,   5, 1,   8, 4},
+        {"P5", {c8, u64, c8}, {O, 0, O}, 2,   9, 1,  16, 8},
+        {"P6", {c8, u64, c8}, {O, 0, O}, 4,   9, 1,  16, 8},
+    };
+    for (auto const& r : rows) {
+        TypeId const s = ti.structType(r.name, r.fields, r.widths, noOffs, noAligns,
+                                       /*explicitAlign=*/0, r.cap);
+        auto const ign = layoutOf(s, ti, kGnuIgnored16);
+        EXPECT_EQ(ign.size, r.ignoredSize)           << r.name << " (ignored) size";
+        EXPECT_EQ(ign.align.bytes(), r.ignoredAlign) << r.name << " (ignored) align";
+        auto const con = layoutOf(s, ti, kGnuContributes16);
+        EXPECT_EQ(con.size, r.contributesSize)       << r.name << " (contributes) size";
+        EXPECT_EQ(con.align.bytes(), r.contributesAlign)
+            << r.name << " (contributes) align";
+    }
 }
 
 // A bit-field followed by an ORDINARY field: the ordinary field closes the open
@@ -1409,6 +1570,294 @@ TEST(TypeLayout, BitFieldAbiExact_UnionAgreesAndFailsLoudOnNone) {
     // None (kNatural16) → fail loud.
     EXPECT_FALSE(
         computeLayout(u, ti, kNatural16, DataModel::Lp64).has_value());
+}
+
+// ── D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT (MsvcStraddle half) ──────────────
+//
+// A ZERO-WIDTH unnamed bit-field under the MSVC rule is CONDITIONAL on there being
+// an OPEN allocation unit. It TERMINATES a run of bit-fields — folding its declared
+// type's (capped) alignment and bumping the high-water to it — and where there is no
+// run to terminate it is a complete NO-OP.
+//
+// Every expectation below is cl.exe 19.51's, MEASURED (`/std:c17`, `_Static_assert`
+// on sizeof AND __alignof so a wrong expectation names ITSELF), and re-derived at run
+// time on a Windows host by `PackedAbiConformance.DssZeroWidthBitfieldLayoutMatches`
+// `NativeCompiler`. These hermetic twins carry the pin on hosts with no cl.exe.
+//
+// ⚠ BEFORE THE FIX the effective half applied UNCONDITIONALLY: `{char c; unsigned :0;
+// char d;}` came out 8/4 where cl.exe says 2/1 — a silent layout miscompile on every
+// PE target, with no diagnostic. `#pragma pack(1)` variants agreed by ACCIDENT (the
+// cap clamped the folded alignment to 1), which is why the TF-C97 pack battery
+// missed it; `pack(2)`/`pack(4)` did not.
+//
+// ⚠ THE GNU HALF IS DELIBERATELY ABSENT. `gnu_packed` does not agree with itself
+// across the formats that select it (MEASURED: `{char c; unsigned :0; char d;}` is
+// 5/1 under SysV-x86_64 and Apple arm64 but 8/4 under AAPCS64 ELF, gcc 13.3.0 and
+// clang 18.1.3 agreeing per target), so there is no single number to pin here and
+// pinning either one would cement a miscompile on the other. That half waits on the
+// per-ABI layout key; see the row.
+TEST(TypeLayout, BitFieldZeroWidthMsvcIsInertWithNoOpenUnit) {
+    auto ti = makeInterner(1);
+    TypeId const c8  = ti.primitive(TypeKind::Char);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    TypeId const u16 = ti.primitive(TypeKind::U16);
+
+    // `{char c; unsigned :0; char d;}` — cl.exe 2/1, d at byte 1. The zero-width
+    // field sits between two ORDINARY fields, so no unit is open and it changes
+    // nothing at all. This is THE row the defect got wrong (was 8/4, d at byte 4).
+    {
+        std::array<TypeId, 3> const f{c8, u32, c8};
+        std::array<std::int64_t, 3> const w{kNotBitfield, 0, kNotBitfield};
+        auto const l = layoutOf(ti.structType("MZ1", f, w), ti, kMsvc16);
+        EXPECT_EQ(l.size, 2u);
+        EXPECT_EQ(l.align.bytes(), 1u);
+        EXPECT_EQ(l.fieldOffsets[0], 0u);
+        EXPECT_EQ(l.fieldOffsets[2], 1u);      // d NOT pushed to a unit boundary
+        EXPECT_EQ(l.bitFields[1].unitBytes, 0u);   // the break is not addressable
+    }
+    // The same with a WIDER zero-width type — still inert. cl.exe 2/1.
+    {
+        std::array<TypeId, 3> const f{c8, u64, c8};
+        std::array<std::int64_t, 3> const w{kNotBitfield, 0, kNotBitfield};
+        auto const l = layoutOf(ti.structType("MZ3", f, w), ti, kMsvc16);
+        EXPECT_EQ(l.size, 2u);
+        EXPECT_EQ(l.align.bytes(), 1u);
+        EXPECT_EQ(l.fieldOffsets[2], 1u);
+    }
+    // `{char c; unsigned short :0; char d;}` — cl.exe 2/1.
+    {
+        std::array<TypeId, 3> const f{c8, u16, c8};
+        std::array<std::int64_t, 3> const w{kNotBitfield, 0, kNotBitfield};
+        auto const l = layoutOf(ti.structType("MZ5", f, w), ti, kMsvc16);
+        EXPECT_EQ(l.size, 2u);
+        EXPECT_EQ(l.align.bytes(), 1u);
+    }
+    // TRAILING and LEADING zero-width, with no bit-field anywhere: cl.exe 1/1 both.
+    {
+        std::array<TypeId, 2> const f{c8, u32};
+        std::array<std::int64_t, 2> const w{kNotBitfield, 0};
+        auto const l = layoutOf(ti.structType("MZ2", f, w), ti, kMsvc16);
+        EXPECT_EQ(l.size, 1u);
+        EXPECT_EQ(l.align.bytes(), 1u);
+    }
+    {
+        std::array<TypeId, 2> const f{u32, c8};
+        std::array<std::int64_t, 2> const w{0, kNotBitfield};
+        auto const l = layoutOf(ti.structType("MZ6", f, w), ti, kMsvc16);
+        EXPECT_EQ(l.size, 1u);
+        EXPECT_EQ(l.align.bytes(), 1u);
+        EXPECT_EQ(l.fieldOffsets[1], 0u);
+    }
+}
+
+// The OTHER half of the MSVC rule, and the pair that makes it a measurement rather
+// than a guess: with a unit OPEN the zero-width field IS effective. `{u32 a:1; u64 :0;
+// u32 b:1;}` reaches cl.exe's 16/8 ONLY if the zero-width member folds align 8 AND
+// bumps the high-water to it; a "close the unit and do nothing" rule gives 8/4, and
+// the unconditional pre-fix rule gives the right answer here for the wrong reason.
+// Removing EITHER statement in the `unitTypeSize != 0` arm reds this test.
+TEST(TypeLayout, BitFieldZeroWidthMsvcTerminatesAnOpenUnit) {
+    auto ti = makeInterner(1);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+
+    // `{unsigned a:1; unsigned long long :0; unsigned b:1;}` — cl.exe 16/8.
+    {
+        std::array<TypeId, 3> const f{u32, u64, u32};
+        std::array<std::int64_t, 3> const w{1, 0, 1};
+        auto const l = layoutOf(ti.structType("MZ8", f, w), ti, kMsvc16);
+        EXPECT_EQ(l.size, 16u);
+        EXPECT_EQ(l.align.bytes(), 8u);
+        EXPECT_EQ(l.fieldOffsets[2], 8u);   // b opens a fresh unit past the u64 bump
+    }
+    // `{unsigned a:1; unsigned :0; unsigned b:1;}` — cl.exe 8/4 (same-width break).
+    {
+        std::array<TypeId, 3> const f{u32, u32, u32};
+        std::array<std::int64_t, 3> const w{1, 0, 1};
+        auto const l = layoutOf(ti.structType("MZ4", f, w), ti, kMsvc16);
+        EXPECT_EQ(l.size, 8u);
+        EXPECT_EQ(l.align.bytes(), 4u);
+        EXPECT_EQ(l.fieldOffsets[2], 4u);
+    }
+    // A SECOND consecutive zero-width has no unit left to terminate and is inert:
+    // `{a:1; :0; :0; b:1;}` is cl.exe 8/4, the same as one break.
+    {
+        std::array<TypeId, 4> const f{u32, u32, u32, u32};
+        std::array<std::int64_t, 4> const w{1, 0, 0, 1};
+        auto const l = layoutOf(ti.structType("MZ12", f, w), ti, kMsvc16);
+        EXPECT_EQ(l.size, 8u);
+        EXPECT_EQ(l.align.bytes(), 4u);
+    }
+    // A TRAILING zero-width after an open unit still sizes that unit: cl.exe 4/4.
+    {
+        std::array<TypeId, 2> const f{u32, u32};
+        std::array<std::int64_t, 2> const w{3, 0};
+        auto const l = layoutOf(ti.structType("MZ10", f, w), ti, kMsvc16);
+        EXPECT_EQ(l.size, 4u);
+        EXPECT_EQ(l.align.bytes(), 4u);
+    }
+}
+
+// `#pragma pack(N)` + a zero-width bit-field. `pack(1)` agreed BEFORE the fix by
+// accident (the cap clamped the folded alignment to 1) — it is kept as the CONTROL
+// that must not move — while `pack(2)`/`pack(4)` were mis-sized and are the rows the
+// fix corrects. Every number is cl.exe 19.51's.
+TEST(TypeLayout, BitFieldZeroWidthMsvcUnderPackCap) {
+    auto ti = makeInterner(1);
+    TypeId const c8  = ti.primitive(TypeKind::Char);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 0> const noAligns{};
+
+    // CONTROL — `pack(1) {unsigned a:1; unsigned :0; unsigned b:1;}` is 8/1, the
+    // value it already had. The cap clamps the terminating fold to 1; the high-water
+    // bump and the unit break still happen.
+    {
+        std::array<TypeId, 3> const f{u32, u32, u32};
+        std::array<std::int64_t, 3> const w{1, 0, 1};
+        TypeId const s = ti.structType("MP3", f, w, noOffs, noAligns, 0, 1);
+        auto const l = layoutOf(s, ti, kMsvc16);
+        EXPECT_EQ(l.size, 8u);
+        EXPECT_EQ(l.align.bytes(), 1u);
+    }
+    // `pack(2) {char c; unsigned :0; char d;}` — cl.exe 2/1 (dss was 4/2).
+    {
+        std::array<TypeId, 3> const f{c8, u32, c8};
+        std::array<std::int64_t, 3> const w{kNotBitfield, 0, kNotBitfield};
+        TypeId const s = ti.structType("MP4", f, w, noOffs, noAligns, 0, 2);
+        auto const l = layoutOf(s, ti, kMsvc16);
+        EXPECT_EQ(l.size, 2u);
+        EXPECT_EQ(l.align.bytes(), 1u);
+    }
+    // `pack(4) {char c; unsigned long long :0; char d;}` — cl.exe 2/1 (dss was 8/4).
+    {
+        std::array<TypeId, 3> const f{c8, u64, c8};
+        std::array<std::int64_t, 3> const w{kNotBitfield, 0, kNotBitfield};
+        TypeId const s = ti.structType("MP6", f, w, noOffs, noAligns, 0, 4);
+        auto const l = layoutOf(s, ti, kMsvc16);
+        EXPECT_EQ(l.size, 2u);
+        EXPECT_EQ(l.align.bytes(), 1u);
+    }
+}
+
+// The UNION half. A union places every member at offset 0 in its own unit, so a
+// zero-width member has no run to terminate and contributes NEITHER alignment NOR
+// size under the MSVC rule. cl.exe 19.51: both unions below are 1/1; dss computed
+// 4/4 and 8/8, raising the union's alignment AND — through `align.alignUp(maxSize)` —
+// its size.
+//
+// The `kGnu16` arm is the CONTROL, and it deliberately pins the UNCHANGED value: the
+// GNU family splits on this question (1/1 under SysV-x86_64 and Apple arm64, 4/4 and
+// 8/8 under AAPCS64 ELF), so this arm asserts only that the fix did not touch it.
+TEST(TypeLayout, BitFieldZeroWidthUnionMemberIsInertUnderMsvc) {
+    auto ti = makeInterner(1);
+    TypeId const c8  = ti.primitive(TypeKind::Char);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+
+    std::array<TypeId, 2> const f32{c8, u32};
+    std::array<TypeId, 2> const f64{c8, u64};
+    std::array<std::int64_t, 2> const w{kNotBitfield, 0};
+    TypeId const u1 = ti.unionType("MU1", f32, w);
+    TypeId const u2 = ti.unionType("MU2", f64, w);
+
+    auto const m1 = layoutOf(u1, ti, kMsvc16);
+    EXPECT_EQ(m1.size, 1u);
+    EXPECT_EQ(m1.align.bytes(), 1u);
+    auto const m2 = layoutOf(u2, ti, kMsvc16);
+    EXPECT_EQ(m2.size, 1u);
+    EXPECT_EQ(m2.align.bytes(), 1u);
+
+    // The gnu_packed arms follow the SAME per-ABI axis the struct packer reads —
+    // `ignored` agrees with MSVC here (1/1), `contributes` does not (4/4, 8/8).
+    // ✔MEASURED: x86_64-linux and Apple arm64 give 1/1; aarch64-linux gives 4/4, 8/8.
+    auto const i1 = layoutOf(u1, ti, kGnuIgnored16);
+    EXPECT_EQ(i1.size, 1u);
+    EXPECT_EQ(i1.align.bytes(), 1u);
+    auto const i2 = layoutOf(u2, ti, kGnuIgnored16);
+    EXPECT_EQ(i2.size, 1u);
+    EXPECT_EQ(i2.align.bytes(), 1u);
+    auto const g1 = layoutOf(u1, ti, kGnuContributes16);
+    EXPECT_EQ(g1.size, 4u);
+    EXPECT_EQ(g1.align.bytes(), 4u);
+    auto const g2 = layoutOf(u2, ti, kGnuContributes16);
+    EXPECT_EQ(g2.size, 8u);
+    EXPECT_EQ(g2.align.bytes(), 8u);
+
+    // CONTROL: a union member with STORAGE keeps its placement in BOTH strategies —
+    // the inertness is scoped to width 0, never to bit-field members generally.
+    std::array<std::int64_t, 2> const wStore{kNotBitfield, 1};
+    TypeId const u3 = ti.unionType("MU3", f32, wStore);
+    for (auto const p : {kGnuIgnored16, kGnuContributes16, kMsvc16}) {
+        auto const l = layoutOf(u3, ti, p);
+        EXPECT_EQ(l.size, 4u);
+        EXPECT_EQ(l.bitFields[1].bitWidth, 1u);
+        EXPECT_EQ(l.bitFields[1].unitBytes, 4u);
+    }
+}
+
+// The msvc_straddle UNION rule for a bit-field member WITH storage — measured
+// alongside the zero-width one and fixed in the same arm, because it is the same
+// statement folding the same alignment.
+//
+// ✔MEASURED, cl.exe 19.51: under MSVC a bit-field member gives the union its unit's
+// SIZE but NOT its alignment, while an ORDINARY member contributes normally.
+//     `union {char c; unsigned b:1;}`           4/1   (dss said 4/4)
+//     `union {char c; unsigned long long b:1;}` 8/1   (dss said 8/8)
+//     `union {unsigned b:1;}`                   4/1
+//     `union {int a; unsigned b:1;}`            4/4   ← `int a` restores the alignment
+//     `union {double d; unsigned b:1;}`         8/8   ← and so does `double d`
+// The last two are what make this a RULE rather than "unions are align 1 under MSVC":
+// a fix that simply stopped folding every member would pass the first three and mint
+// a new miscompile on these. The gnu_packed family does NOT share the rule — every
+// gnu_packed target measures 4/4 for the first — so it is strategy-keyed, not the
+// per-ABI axis.
+TEST(TypeLayout, BitFieldUnionMemberAlignmentIsStrategyKeyed) {
+    auto ti = makeInterner(1);
+    TypeId const c8  = ti.primitive(TypeKind::Char);
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const f64 = ti.primitive(TypeKind::F64);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    std::int64_t const O = kNotBitfield;
+
+    std::array<TypeId, 2> const cu32{c8, u32};
+    std::array<TypeId, 2> const cu64{c8, u64};
+    std::array<TypeId, 1> const lone{u32};
+    std::array<TypeId, 2> const iu32{i32, u32};
+    std::array<TypeId, 2> const du32{f64, u32};
+    std::array<std::int64_t, 2> const w2{O, 1};
+    std::array<std::int64_t, 1> const w1{1};
+
+    TypeId const v1 = ti.unionType("V1", cu32, w2);
+    TypeId const v2 = ti.unionType("V2", cu64, w2);
+    TypeId const v3 = ti.unionType("V3", lone, w1);
+    TypeId const v6 = ti.unionType("V6", iu32, w2);
+    TypeId const v7 = ti.unionType("V7", du32, w2);
+
+    // MSVC: size from the unit, alignment only from ORDINARY members.
+    EXPECT_EQ(layoutOf(v1, ti, kMsvc16).size, 4u);
+    EXPECT_EQ(layoutOf(v1, ti, kMsvc16).align.bytes(), 1u);
+    EXPECT_EQ(layoutOf(v2, ti, kMsvc16).size, 8u);
+    EXPECT_EQ(layoutOf(v2, ti, kMsvc16).align.bytes(), 1u);
+    EXPECT_EQ(layoutOf(v3, ti, kMsvc16).size, 4u);
+    EXPECT_EQ(layoutOf(v3, ti, kMsvc16).align.bytes(), 1u);
+    EXPECT_EQ(layoutOf(v6, ti, kMsvc16).size, 4u);
+    EXPECT_EQ(layoutOf(v6, ti, kMsvc16).align.bytes(), 4u);
+    EXPECT_EQ(layoutOf(v7, ti, kMsvc16).size, 8u);
+    EXPECT_EQ(layoutOf(v7, ti, kMsvc16).align.bytes(), 8u);
+
+    // CONTROL — gnu_packed keeps the bit-field member's alignment, on BOTH values of
+    // the per-ABI axis (this rule is orthogonal to it). ✔MEASURED 4/4 and 8/8 on
+    // x86_64-linux, aarch64-linux and Apple arm64 alike.
+    for (auto const p : {kGnuIgnored16, kGnuContributes16}) {
+        EXPECT_EQ(layoutOf(v1, ti, p).size, 4u);
+        EXPECT_EQ(layoutOf(v1, ti, p).align.bytes(), 4u);
+        EXPECT_EQ(layoutOf(v2, ti, p).size, 8u);
+        EXPECT_EQ(layoutOf(v2, ti, p).align.bytes(), 8u);
+    }
 }
 
 // Explicit RED-ON-DISABLE marker for the per-ABI feature: the SAME struct under

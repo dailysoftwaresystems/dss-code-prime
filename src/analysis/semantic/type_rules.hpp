@@ -297,8 +297,19 @@ namespace detail::type_rules {
     // C99 _Complex (D-CSUBSET-COMPLEX §6.3.1.7/§6.5.16.1, D8): a real OR a
     // differently-elemented complex is assignable INTO a complex lhs — real->complex
     // constructs (v, 0); complex->complex element-converts. A complex rhs into a REAL
-    // lhs is NOT implicitly assignable (the imaginary part is discarded only on an
-    // EXPLICIT cast — an implicit complex->real is a constraint violation → loud).
+    // lhs is not admitted HERE — but that is a KNOWN DIVERGENCE with its own row,
+    // NOT a rule, and the long note below is where it is stated in full.
+    // ⚠ THE CLAUSE THAT USED TO CLOSE THIS SENTENCE — *"an implicit complex->real is
+    // a constraint violation → loud"* — ASSERTED THE STANDARD AND GOT IT BACKWARDS,
+    // and it SURVIVED the P42 correction that rewrote the note below: one false rule
+    // with two renditions, of which only one was fixed. That is the shape of
+    // feedback-a-partial-fix-reads-as-a-complete-one applied to a COMMENT (bare, not
+    // `[[…]]`: that bracket form is the registry's ANCHOR link and this is a topic,
+    // not an anchor — the tests/mir precedent spells it this way too), and it
+    // is worse than the original error because the surviving half now contradicts,
+    // in the same function, the note that corrects it. C 6.3.1.7p2 DEFINES the
+    // conversion (the imaginary part is discarded) and requires no cast to request
+    // it; C 6.5.16.1p1 asks only that both operands have arithmetic type.
     // UNGATED shape admission: Complex only ever appears in a `_Complex`-declaring
     // schema, so this is inert elsewhere (the coerce `isArithmeticCore`-BitInt
     // precedent). The identical-type case already returned via `sameType` above.
@@ -347,6 +358,35 @@ namespace detail::type_rules {
     // feature is one fact with two owners, and fixing either half alone breaks
     // the other. The same duplicated-truth-table defect this cycle has now met
     // repeatedly.
+    //
+    // ✔RE-MEASURED 2026-08-29 (P45), and THREE things sharpened.
+    // (1) THE REFERENCE VOTE IS COMPLETE. `double d = z;` on a (3,4) exits 3 under
+    //     gcc 13.3.0 `-std=c2x`, clang 18.1.3 `-std=c23` AND mingw-w64 gcc 13.2.0
+    //     (a DISTINCT reference), each probed separately; the ARGUMENT form
+    //     `takes_double(z)` exits 3 on all three, which matters because C 6.5.2.2p7
+    //     converts an argument "as if by assignment" — assignment and argument are
+    //     ONE rule with no seam. MSVC 19.51 ABSTAINS: it has no `_Complex` type
+    //     specifier at all (C2146), which is an abstention, not a refusal.
+    // (2) THE tgmath RATIONALE IS REFUTED AS STATED. `tgmath.json`'s `$comment`
+    //     calls `(double)z` *"legal C, silently drops the imaginary part → a
+    //     conformance MISCOMPILE"*. ✔MEASURED: `#include <math.h>` + `sqrt(z)` —
+    //     the plain `double sqrt(double)` prototype — compiles and exits 0 under
+    //     ALL THREE references. The drop is CONFORMANT. What is not conformant is a
+    //     `<tgmath.h>` MACRO reaching a real prototype at all (C23 7.25 requires
+    //     dispatch to `csqrt`). So the loudness that must survive is not "a cast
+    //     launders a complex" but "DSS's <tgmath.h> has no complex dispatch and must
+    //     refuse rather than answer with `creal`" — same fact, correctly aimed.
+    // (3) ⚠⚠ "GAINS THE MIRROR OF ITS real→complex ARM" IS A TRAP, ✔MEASURED. That
+    //     arm is a RETURNING block (`if (lk == Complex) { … return …; }`) that owns
+    //     every rhs once the lhs is complex. Mirroring its SHAPE here — returning the
+    //     rank disjunction — answers FALSE for a `_Bool` lhs and stops `_Bool b = z;`
+    //     from ever reaching `scalarConvertsToBool`, whose roster already names
+    //     Complex. Written that way the arm broke
+    //     `HirLoweringC.ComplexConditionTakesTheTruthinessChokepointAtEverySite`
+    //     with `[0xE003 S_TypeMismatch] z`, regressing the execution-verified
+    //     [[D-CSUBSET-COMPLEX-TO-BOOL-ASSIGNMENT-NOT-ADMITTED-BY-THE-SEMANTIC-TIER]].
+    //     The correct form ADMITS-OR-FALLS-THROUGH (`if (rk == Complex && <ranks>)
+    //     return true;`) — the shape every gated arm below already uses.
     // C 6.3.1.4 / 6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION, int→float): an integer
     // value is implicitly assignable to a floating lhs — `double d = 5;`,
     // `f(anInt)` to a `double` param (the sqlite `kahanBabuskaNeumaierStep(pSum,

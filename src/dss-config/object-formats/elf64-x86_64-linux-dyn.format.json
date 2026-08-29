@@ -36,6 +36,8 @@
 
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: SysV/GNU LSB-first bit-field packing, same as the ELF siblings.",
   "bitFieldStrategy": "gnu_packed",
+  "$unnamedBitFieldAlignmentComment": "D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: an UNNAMED bit-field contributes NO alignment to the enclosing composite. MEASURED P45 -- `struct { char c; unsigned :0; char d; }` is 5/1 here, against 8/4 on the AAPCS64 ELF formats that share this very same `gnu_packed` strategy.  The zero-width field still BREAKS the packing cursor to its declared type's unit boundary (uncapped by `#pragma pack`); only the alignment contribution is dropped. ~ Declared on the FORMAT and not the target for exactly the reason `bitFieldStrategy` is: one CPU target serves several ABIs. There is NO target-side fallback for this key -- omitting it does not inherit, it leaves the axis undeclared and the layout engine fails loud the moment a zero-width bit-field needs it.",
+  "unnamedBitFieldAlignment": "ignored",
 
   "$externCallDispatchComment": "Same call-site shape as the exec image: the walker synthesizes a PLT stub per extern FUNCTION (jmp through the GOT slot, GLOB_DAT eager-bound) and the call site is a plain direct `call rel32` to the stub -- pc-relative, so the code needs no fixup under the ET_DYN load slide. D-FFI-EXTERN-CALL-DISPATCH.",
   "externCallDispatch": "direct-plt",

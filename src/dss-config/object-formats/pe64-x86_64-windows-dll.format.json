@@ -32,6 +32,8 @@
 
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: MSVC x64 bit-field packing, same as the PE siblings.",
   "bitFieldStrategy": "msvc_straddle",
+  "$unnamedBitFieldAlignmentComment": "D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: an UNNAMED bit-field contributes NO alignment. MEASURED with cl.exe 19.51 (`_Static_assert` on sizeof AND __alignof): `struct { char c; unsigned :0; char d; }` is 2/1. ~ DECLARED FOR COMPLETENESS AND DELIBERATELY NOT LOAD-BEARING: `msvc_straddle` never reads this key, because the MSVC rule is a property OF that strategy -- a zero-width field is INERT unless it terminates an open allocation unit, and when it does it folds its type's alignment and bumps the high-water. That is measured identical on x64 and arm64 PE, so there is nothing per-format left to declare. The key is stated so this document answers the same question every other C-ABI format answers, rather than being silently exempt for a reason a reader would have to reconstruct.",
+  "unnamedBitFieldAlignment": "ignored",
 
   "$externCallDispatchComment": "Same call-site shape as the exec image: one `jmp *[IAT slot]` code thunk per extern FUNCTION and a plain `call rel32 -> thunk` at the site -- pc-relative, so the code needs no fixup when the loader rebases the DLL. D-FFI-EXTERN-CALL-DISPATCH + D-FFI-PE-IMPORT-THUNK.",
   "externCallDispatch": "direct-plt",

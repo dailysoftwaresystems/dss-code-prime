@@ -2583,6 +2583,9 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         std::uint32_t ptrDepth = 0;
         TypeId inner = InvalidType;
         NodeId absDirect{};   // c26: an abstract-declarator type-name tail
+        // The child that SUPPLIED `inner` — carried only so the ambiguous-head
+        // guard below can name BOTH resolving children in its diagnostic.
+        NodeId headChild{};
         for (auto child : kids) {
             // Each bare star OR pointerLayer child = ONE pointer level. c29: a
             // pointerLayer's ptrQualifiers (const/volatile/restrict, after the
@@ -2624,7 +2627,89 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 auto t = resolveTypeNodeImpl(s, cfg, tree, child, scope,
                                              /*emitOnMiss=*/false, emitTypeUse,
                                              specifierDiagnosed);
-                if (t.valid()) inner = t;
+                if (t.valid()) { inner = t; headChild = child; }
+                continue;
+            }
+            // ★★ THE AMBIGUOUS-HEAD GUARD — D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK.
+            //
+            // The descent above is FIRST-CHILD-THAT-RESOLVES-WINS: not by index,
+            // not by rule, just "whichever child resolves first". That is only
+            // safe while EXACTLY ONE child of a type-position node can ever name a
+            // type. Every shipped head rule holds to that (qualifier keywords plus
+            // ONE base slot), but nothing in the ENGINE enforced it — so any
+            // grammar edit that drags a second identifier into a type-resolved head
+            // silently re-pointed the head at that identifier, and the user got a
+            // wrong-width type in a CLEAN-COMPILING program. The canonical way in
+            // is a DECORATION placed inside the head instead of beside it:
+            //
+            //     typedef int aligned;
+            //     typedef __attribute__((aligned(16))) long T;   // T became `int`
+            //
+            // — the attribute NAME resolves through the scope chain (the Token arm
+            // below tries ANY identifier as a type alias), wins the race against
+            // the real head, and no diagnostic is emitted anywhere. An identifier
+            // in the attribute's ARGUMENT list hijacks by the same route.
+            //
+            // ⛔ THE TEMPTING WRONG FIX, RECORDED SO IT IS NEVER RE-PROPOSED: put
+            // the attribute run INSIDE the head rule, "where the type head already
+            // is". It looks right and it fails SILENTLY. The decoration belongs in
+            // a SIBLING slot — the declaration row's `specifierPrefix`, which
+            // `specifierPrefixChild` hands to the alignas / noreturn / attribute
+            // scans — never in the type-resolved head.
+            //
+            // ★ WHY THE GUARD LIVES HERE AND NOT IN THE LOADER. Whether a child
+            // "names a type" depends on the SCOPE it is resolved in, not on the
+            // grammar alone: the very same head shape is fine until some
+            // translation unit happens to typedef the decoration's name. A static
+            // config check cannot see that, and it cannot distinguish the head's
+            // LEGITIMATE bare `Identifier` (the typedef-name base) from a smuggled
+            // one. This is the one chokepoint EVERY type position routes through,
+            // so guarding it guards them all — including positions no enumeration
+            // foresaw.
+            //
+            // The probe is NET-SILENT (the established rollback chokepoint shape):
+            // `emitTypeUse=false` and a LOCAL `specifierDiagnosed` so a probe-only
+            // diagnosis can neither reach the user nor suppress the outer miss
+            // report, and the reporter is truncated back afterwards. Only a
+            // genuinely AMBIGUOUS head — a second child resolving to a DIFFERENT
+            // type, i.e. exactly the case where the choice changes the program —
+            // emits, and it emits ONCE. A second child resolving to the SAME type
+            // cannot miscompile, so it is not an error.
+            {
+                auto const snap = s.reporter.snapshotForRollback();
+                bool probeDiagnosed = false;
+                TypeId const other =
+                    resolveTypeNodeImpl(s, cfg, tree, child, scope,
+                                        /*emitOnMiss=*/false,
+                                        /*emitTypeUse=*/false, probeDiagnosed);
+                s.reporter.truncateTo(snap);
+                if (other.valid() && other.v != inner.v) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_InvalidTypeSpecifierCombination;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    // ⚠ NAME BOTH RESOLVING CHILDREN, AND DO NOT LABEL EITHER AS
+                    // "the decoration". The engine cannot know which the author
+                    // meant — that is precisely the ambiguity being reported —
+                    // and an earlier draft of this message called `tree.text(node)`
+                    // "the sibling", which printed the WHOLE head and read as
+                    // though the real type were the intruder.
+                    d.actual   = std::format(
+                        "ambiguous type head '{}': two of its children name types "
+                        "('{}' and '{}'), so which one this declaration takes is "
+                        "decided by child ORDER rather than by the grammar. A type "
+                        "position must contain exactly one type — a decoration "
+                        "(attribute / specifier run) belongs BESIDE the head, "
+                        "never inside it",
+                        tree.text(node),
+                        headChild.valid() ? tree.text(headChild)
+                                          : std::string_view{"<head>"},
+                        tree.text(child));
+                    s.reporter.report(std::move(d));
+                    specifierDiagnosed = true;
+                    return InvalidType;
+                }
             }
         }
         if (inner.valid()) {
@@ -3008,16 +3093,32 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                                                 /*emitOnMiss=*/false);
                 } else if (cfg->sizeofValueRule.valid()
                            && fr.v == cfg->sizeofValueRule.v) {
+                    // ★ ASSERT THE ORDINAL ASSUMPTION RATHER THAN TRUST IT
+                    // (D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK, second
+                    // tier). Unlike the TYPE form above, the value form has no
+                    // declared operand index in `semantics.sizeof` — so this arm
+                    // must take "the first Internal child", and that is only safe
+                    // while there is exactly ONE. `sizeofValue` is
+                    // `[SizeofKeyword, castOperand]` today, so the assumption
+                    // holds by construction; the point of counting is that a
+                    // grammar edit adding a second Internal child (a decoration
+                    // run, most likely) would otherwise silently size the WRONG
+                    // operand. Two candidates ⇒ nullopt ⇒ the caller fails loud
+                    // with its own positioned diagnostic, never a wrong size.
+                    NodeId operand{};
+                    bool ambiguousOperand = false;
                     for (NodeId opnd : visibleChildren(tree, form)) {
-                        if (tree.kind(opnd) == NodeKind::Internal) {
-                            // FC6 c-subtreeType: pass the const-context scope so
-                            // a Pass-1.5 `sizeof e` whose operand is an
-                            // identifier (`sizeof b` / `sizeof(b[0])`) resolves
-                            // its leaf type by scope-lookup (leaves are not yet
-                            // Pass-2-stamped at this declaration-type stage).
-                            sized = subtreeType(s, tree, opnd, fromScope);
-                            break;
-                        }
+                        if (tree.kind(opnd) != NodeKind::Internal) continue;
+                        if (operand.valid()) { ambiguousOperand = true; break; }
+                        operand = opnd;
+                    }
+                    if (operand.valid() && !ambiguousOperand) {
+                        // FC6 c-subtreeType: pass the const-context scope so
+                        // a Pass-1.5 `sizeof e` whose operand is an
+                        // identifier (`sizeof b` / `sizeof(b[0])`) resolves
+                        // its leaf type by scope-lookup (leaves are not yet
+                        // Pass-2-stamped at this declaration-type stage).
+                        sized = subtreeType(s, tree, operand, fromScope);
                     }
                 }
                 break;  // the single sizeof form
@@ -3105,10 +3206,22 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
         // nullopt ⇒ the fold fails loud (one positioned diagnostic from the caller).
         env.resolveCastTarget = [&s, &tree, cfg, fromScope](NodeId castNode)
             -> std::optional<CstCastTarget> {
-            NodeId typeRefN{};
-            for (NodeId c : visibleChildren(tree, castNode)) {
-                if (tree.kind(c) == NodeKind::Internal) { typeRefN = c; break; }
-            }
+            // ★★ THE DECLARED INDEX, NOT "THE FIRST INTERNAL CHILD"
+            // (D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK, second tier). This
+            // used to take the first Internal child as the cast's type-ref —
+            // KIND-ONLY, no rule check, no index — which is the same first-match
+            // defect the type-head guard closes one tier up: any node a grammar
+            // edit drags in front of the type-ref becomes the cast TARGET, and a
+            // const-expr folds against the wrong type in a clean-compiling
+            // program. The `casts` row already DECLARES where the type sits
+            // (`typeChild`), and Pass 2's own cast arm reads exactly that field —
+            // so the two tiers now agree BY CONSTRUCTION instead of by review.
+            auto const castIt = s.idx().castByRule.find(tree.rule(castNode).v);
+            if (castIt == s.idx().castByRule.end()) return std::nullopt;
+            auto const& crow = cfg->castRules[castIt->second];
+            auto const ckids = visibleChildren(tree, castNode);
+            if (crow.typeChild >= ckids.size()) return std::nullopt;
+            NodeId const typeRefN = ckids[crow.typeChild];
             if (!typeRefN.valid()) return std::nullopt;
             TypeId const ty = resolveTypeNode(s, *cfg, tree, typeRefN, fromScope,
                                               /*emitOnMiss=*/false);
@@ -15255,13 +15368,55 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 result = combineTernary(thenT, result, thenN, elseN);
             }
             break;
+        // ★★ THE TRANSPARENT-WRAPPER AMBIGUITY GUARD
+        //    (D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK, second tier).
+        //
+        // This frame used to be FIRST-VALID-CHILD-WINS and stop: the moment any
+        // child typed, that became the wrapper's type. It is the same first-match
+        // shape as the type head one tier up, and its history is the argument for
+        // guarding it rather than adding to it — EVERY arm above this fallthrough
+        // (cast, sizeof, alignof, `_Generic`, ternary, statement-expression, …)
+        // was added AFTER the fallthrough had already produced a wrong answer for
+        // that construct. The node reaching here is one the config does NOT
+        // declare transparent, so "pass the first child through" is a GUESS, and
+        // the guess is silent: a wrong type here is a wrong width, not a refusal.
+        // It was outrun nine times; a tenth arm would be the same debt again.
+        //
+        // ★ THE GUARD IS ON GENUINE AMBIGUITY, NOT ON STRUCTURE. Refusing any
+        // wrapper with ≥2 Internal children was considered and REJECTED: it keys
+        // on shape rather than on the thing that actually goes wrong, so it would
+        // refuse legitimate wrappers whose extra children simply do not type. A
+        // wrapper is transparent iff EXACTLY ONE of its children carries a type;
+        // so keep scanning, keep the first type in `c0` (the slot Binary uses for
+        // its lhs — unused by this frame), and refuse only when a second child
+        // types to a DIFFERENT type. One type ⇒ pass it through, exactly as
+        // before. Same type twice ⇒ not a miscompile, so not an error.
+        //
+        // A refusal returns InvalidType rather than emitting: `subtreeType` runs
+        // inside Pass-1.5 speculative and reporter-ROLLBACK windows, and this TU's
+        // established design for that is to CASCADE — the caller (array dimension,
+        // `auto` inference, `typeof`) already owns one positioned diagnostic and
+        // fails loud with it. Never a guessed type, and never a double-diag.
         case Frame::Kind::Wrapper:
             if (f.phase == 0) {
-                if (f.idx >= f.list.size()) { work.pop_back(); result = InvalidType; }
-                else { f.phase = 1; NodeId n = f.list[f.idx]; enter(n); }
+                if (f.idx >= f.list.size()) {
+                    // Children exhausted: `c0` holds the single type found, or
+                    // InvalidType when nothing typed (the old empty-list result).
+                    TypeId const only = f.c0;
+                    work.pop_back();
+                    result = only;
+                } else { f.phase = 1; NodeId n = f.list[f.idx]; enter(n); }
             } else {  // phase 1: a child just delivered `result`
-                if (result.valid()) { work.pop_back(); }  // first valid wins
-                else { ++f.idx; f.phase = 0; }             // try the next child
+                if (result.valid()) {
+                    if (!f.c0.valid()) {
+                        f.c0 = result;                 // the first typed child
+                    } else if (f.c0.v != result.v) {
+                        work.pop_back();               // AMBIGUOUS — refuse
+                        result = InvalidType;
+                        break;
+                    }
+                }
+                ++f.idx; f.phase = 0;                  // keep scanning
             }
             break;
         case Frame::Kind::Generic:

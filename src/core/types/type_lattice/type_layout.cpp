@@ -272,16 +272,69 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
         // capped u64), not 8 (uncapped) and not 1 (dropped).
         auto const unitAlign = clampedBaselineAlign(packed, packCap, fl->align);
         if (!unitAlign) return std::nullopt;
-        out.align = maxAlign(out.align, *unitAlign);
         std::uint64_t const unitBits = fl->size * 8;
         std::uint32_t const w        = *bw;
         if (w == 0) {
-            // Zero-width unnamed bit-field: force the cursor to the next
-            // unit boundary of its type; contributes no addressable field.
+            // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT.
+            //
+            // THE BREAK IS UNCONDITIONAL AND UNCAPPED, and stays exactly as it was:
+            // the cursor is forced to the DECLARED TYPE's full unit boundary whatever
+            // `#pragma pack` says (✔MEASURED: `pack(1) {char c; u64 :0; char d;}` still
+            // breaks to bit 64). Only the ALIGNMENT contribution is per-ABI.
+            //
+            // ⚠ THE ALIGNMENT ANSWER SPLITS *WITHIN* gnu_packed, which is why it is a
+            // config key and not a strategy. Same struct, same strategy (✔MEASURED,
+            // gcc 13.3.0 + clang 18.1.3 agreeing PER TARGET, and Apple clang 21.0.0 on
+            // the physical macOS host for the darwin rows):
+            //     `{char c; unsigned :0; char d;}`
+            //     x86_64-linux · arm64-apple · x86_64-apple · riscv64 · ppc64le -> 5/1
+            //     aarch64-linux · arm-linux-gnueabihf ......................... -> 8/4
+            // Before this key dss computed 8/4 for ALL of them: correct on the aarch64
+            // ELF formats, a SILENT LAYOUT MISCOMPILE on the x86_64 ELF and every
+            // Mach-O one. ⚠ Note what that means for the obvious "fix": simply dropping
+            // the fold — which is what the defect report proposed — would have repaired
+            // five ABIs and BROKEN the one that was right.
+            switch (params.unnamedBitFieldAlignment) {
+                case UnnamedBitFieldAlignment::Contributes:
+                    // The NATURAL alignment, deliberately NOT `*unitAlign`: on this ABI
+                    // the contribution is UNCAPPED by `#pragma pack`, the same uncapped
+                    // quantity that decides the break two lines below. ✔MEASURED on
+                    // aarch64-linux: `pack(1) {char c; u64 :0; char d;}` is 16/8, and
+                    // `pack(2) {char c; unsigned :0; char d;}` is 8/4. Folding the
+                    // CAPPED unit align here is what made dss answer 6/2 to that second
+                    // one — a value NO reference produces, on either side of the axis.
+                    out.align = maxAlign(out.align, fl->align);
+                    break;
+                case UnnamedBitFieldAlignment::Ignored:
+                    break;   // contributes nothing; the break below still happens
+                case UnnamedBitFieldAlignment::None:
+                    // Undeclared. FAIL LOUD rather than pick a side: both answers are a
+                    // real ABI, so a default would be a silent miscompile on every
+                    // platform holding the other. Reached only when a zero-width
+                    // bit-field is ACTUALLY laid out, so a format that declares no C
+                    // ABI is unaffected.
+                    return std::nullopt;
+            }
             bitCursor = ((bitCursor + unitBits - 1) / unitBits) * unitBits;
             out.fieldOffsets.push_back(bitCursor / 8);   // marker; unitBytes stays 0
             continue;
         }
+        // A bit-field WITH STORAGE contributes its unit's (capped) alignment. Folded
+        // here rather than above the zero-width arm so that arm can decide for itself.
+        //
+        // ⚠ KNOWN GAP, MEASURED AND FILED, NOT AN OVERSIGHT: the same per-ABI axis
+        // governs an UNNAMED bit-field that HAS storage — `{char c; unsigned :3; char
+        // d;}` is 3/1 under `ignored` where `{char c; unsigned x:3; char d;}` is 4/4
+        // (✔MEASURED on x86_64-linux AND on the macOS host, Apple clang 21.0.0). This
+        // line therefore over-contributes for an unnamed non-zero-width field on an
+        // `ignored` ABI. It is NOT fixable here: `TypeInterner` stores a per-field
+        // WIDTH and no per-field NAME, so this packer cannot tell `unsigned :3` from
+        // `unsigned x:3`. Zero width needs no such channel — a NAMED zero-width
+        // bit-field is a hard error, so width 0 is unnamed by construction. Closing the
+        // gap means carrying unnamed-ness from the semantic phase through the interner;
+        // the key above is already named for the general rule so that lands with no
+        // second decision. See D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT.
+        out.align = maxAlign(out.align, *unitAlign);
         if (w > unitBits) return std::nullopt;   // defensive (semantic validates first)
         // If w bits at the cursor would straddle the type's unit boundary, bump to
         // the next aligned unit (the GNU rule) — UNLESS a member-alignment cap is in
@@ -401,19 +454,53 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
         // capped composite can never open a unit at an over-aligned byte.
         auto const unitAlign = clampedBaselineAlign(packed, packCap, fl->align);
         if (!unitAlign) return std::nullopt;
-        out.align = maxAlign(out.align, *unitAlign);
         std::uint64_t const t        = fl->size;          // unit type size (bytes)
         std::uint64_t const unitBits = t * 8;
         std::uint32_t const w        = *bw;
         if (w == 0) {
-            // Zero-width unnamed bit-field: break the run AND force the high-water
-            // to this type's (capped) unit boundary; no addressable field. (Next
-            // real field then opens fresh, re-aligned to ITS own type.)
-            unitTypeSize  = 0;
-            highWaterByte = unitAlign->alignUp(highWaterByte);
+            // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT. A zero-width unnamed bit-field
+            // under the MSVC rule is CONDITIONAL on there being an OPEN allocation
+            // unit: it TERMINATES a run of bit-fields, and where there is no run to
+            // terminate it is a complete NO-OP — it neither raises the struct's
+            // alignment nor moves the high-water mark.
+            //
+            // ✔MEASURED, cl.exe 19.51 (`/std:c17`, `_Static_assert` on sizeof AND
+            // __alignof, so a wrong expectation names itself):
+            //   `{char c; unsigned :0; char d;}`           -> 2/1  (d at byte 1)
+            //   `{char c; unsigned long long :0; char d;}` -> 2/1
+            //   `{char c; unsigned :0;}`                   -> 1/1
+            //   `{unsigned :0; char c;}`                   -> 1/1
+            //   `{unsigned a:1; unsigned :0; unsigned b:1;}`           -> 8/4
+            //   `{unsigned a:1; unsigned long long :0; unsigned b:1;}` -> 16/8
+            // The last two are the pair that fixes the rule: with a unit OPEN the
+            // zero-width field DOES fold its (capped) type alignment and DOES bump the
+            // high-water to it — that is the only way `u64 :0` between two `u32`
+            // bit-fields reaches 16/8 rather than 8/4 — while the first four show that
+            // with NO unit open the very same declaration changes nothing at all.
+            //
+            // ⚠ THE OLD ARM APPLIED THE EFFECTIVE HALF UNCONDITIONALLY, and that was a
+            // SILENT LAYOUT MISCOMPILE on every PE target: `{char c; unsigned :0; char
+            // d;}` came out 8/4 where cl.exe says 2/1 — no diagnostic, just a struct
+            // laid out to the wrong ABI. It also mis-sized `#pragma pack(2)`/`(4)`
+            // variants (4/2 and 8/4 where cl.exe says 2/1). `pack(1)` happened to agree
+            // ONLY because the cap clamped the folded alignment to 1, which is how the
+            // defect survived the TF-C97 pack battery.
+            //
+            // ⚠ This is the MSVC rule ONLY. The GNU/AAPCS/Apple family answers this
+            // question differently AND does not agree with itself across targets — see
+            // the zero-width arm in `layoutStructBitfieldsGnuPacked`.
+            if (unitTypeSize != 0) {
+                out.align     = maxAlign(out.align, *unitAlign);
+                highWaterByte = unitAlign->alignUp(highWaterByte);
+                unitTypeSize  = 0;   // close the run (MSVC never reopens it)
+            }
             out.fieldOffsets.push_back(highWaterByte);   // marker; unitBytes stays 0
             continue;
         }
+        // A bit-field with STORAGE always contributes its unit's (capped) alignment.
+        // Folded here rather than above the zero-width arm so the zero-width case can
+        // decide for itself (D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT).
+        out.align = maxAlign(out.align, *unitAlign);
         if (w > unitBits) return std::nullopt;   // defensive (semantic validates first)
         bool const canContinue =
             (unitTypeSize == t) && (unitBitsUsed + w <= unitBits);
@@ -938,20 +1025,86 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 if (!a) return std::nullopt;    // stored non-pow2/>256 = upstream bug
                 return maxAlign(baseline, *a);
             };
+            // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT. A union member that is a
+            // ZERO-WIDTH unnamed bit-field declares no storage and names nothing, so
+            // under the MSVC rule it contributes NEITHER alignment NOR size — there is
+            // no run of bit-fields for it to terminate in a union (every member sits at
+            // offset 0 in its own unit), which makes it the same complete NO-OP the
+            // MsvcStraddle struct packer's zero-width arm documents.
+            //
+            // ✔MEASURED, cl.exe 19.51 (`_Static_assert` on sizeof AND __alignof):
+            //   `union {char c; unsigned :0;}`           -> 1/1  (dss was 4/4)
+            //   `union {char c; unsigned long long :0;}` -> 1/1  (dss was 8/8)
+            // Folding the member in raised BOTH the union's alignment and — through
+            // the closing `align.alignUp(maxSize)` — its size, a silent layout
+            // miscompile on every PE target.
+            //
+            // ⚠ STRATEGY-CONDITIONAL BECAUSE THE ANSWER GENUINELY DIVERGES, and this
+            // arm's standing comment above ("identical under EVERY realized strategy")
+            // is true of a member with STORAGE only. The GNU family does not agree with
+            // itself here: the same two unions are 1/1 and 1/1 under SysV-x86_64 and
+            // Apple arm64, but 4/4 and 8/8 under AAPCS64 ELF (✔MEASURED, gcc 13.3.0 and
+            // clang 18.1.3, both targets, agreeing per target). Picking either answer
+            // for `gnu_packed` would be right on one shipped format and a NEW silent
+            // miscompile on the other, so the GNU half is deliberately UNTOUCHED here
+            // and waits on the per-ABI layout key the row calls for. MSVC is decidable
+            // today because cl.exe is the single reference for every PE format and it
+            // answers the same way on x64 and arm64.
+            // Is a ZERO-WIDTH member inert (contributes neither alignment nor size)?
+            // A union places every member at offset 0 in its own unit, so there is no
+            // run for it to terminate — under msvc_straddle that makes it a complete
+            // no-op, and under gnu_packed the answer is the SAME per-ABI axis the
+            // struct packer reads. ✔MEASURED, `union { char c; unsigned :0; }`:
+            //     cl.exe 19.51 (PE) ......................... 1/1
+            //     x86_64-linux · arm64-apple (ignored) ...... 1/1
+            //     aarch64-linux (contributes) ............... 4/4
+            // dss computed 4/4 for ALL of them, so it raised the union's alignment AND
+            // — through the closing `align.alignUp(maxSize)` — its SIZE.
+            bool const msvc = params.bitFieldStrategy == BitFieldStrategy::MsvcStraddle;
+            bool zeroWidthMemberIsInert = msvc;
+            if (!msvc && anyBitfield) {
+                switch (params.unnamedBitFieldAlignment) {
+                    case UnnamedBitFieldAlignment::Ignored:
+                        zeroWidthMemberIsInert = true;   break;
+                    case UnnamedBitFieldAlignment::Contributes:
+                        zeroWidthMemberIsInert = false;  break;
+                    case UnnamedBitFieldAlignment::None:
+                        // Only fatal if a zero-width member is actually present —
+                        // decided in the loop, so a bitfield-bearing union WITHOUT one
+                        // still lays out. Fail loud, never a silent side.
+                        break;
+                }
+            }
+            bool const zeroWidthUndeclared =
+                !msvc && anyBitfield
+                && params.unnamedBitFieldAlignment == UnnamedBitFieldAlignment::None;
             std::uint64_t maxSize = 0;
             for (std::size_t i = 0; i < fields.size(); ++i) {
                 auto const fl = computeLayout(fields[i], interner, params, dm);
                 if (!fl) return std::nullopt;
+                auto const bw = anyBitfield ? interner.fieldBitWidth(id, i)
+                                            : std::optional<std::uint32_t>{};
+                bool const isZeroWidth = bw.has_value() && *bw == 0;
+                if (isZeroWidth && zeroWidthUndeclared) return std::nullopt;
+                if (isZeroWidth && zeroWidthMemberIsInert) continue;
                 auto const ea = effectiveAlign(i, fl->align);
                 if (!ea) return std::nullopt;
-                out.align = maxAlign(out.align, *ea);
-                if (anyBitfield) {
-                    auto const bw = interner.fieldBitWidth(id, i);
-                    if (bw.has_value() && *bw > 0) {
-                        if (fl->size == 0) return std::nullopt;
-                        out.bitFields[i] = BitFieldPlacement{
-                            static_cast<std::uint32_t>(fl->size), 0, *bw};
-                    }
+                // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT (the msvc_straddle union
+                // rule, measured alongside the zero-width one): under MSVC a bit-field
+                // member gives the union its unit's SIZE but NOT its alignment.
+                // ✔MEASURED, cl.exe 19.51: `union {char c; unsigned b:1;}` 4/1 ·
+                // `union {char c; u64 b:1;}` 8/1 · `union {unsigned b:1;}` 4/1 — while
+                // an ORDINARY member still contributes normally, which is what makes
+                // `union {int a; unsigned b:1;}` 4/4 and `union {double d; unsigned
+                // b:1;}` 8/8. dss answered 4/4 and 8/8 to the first three. The GNU
+                // family does NOT share this: every gnu_packed target measures 4/4.
+                if (!(msvc && bw.has_value())) {
+                    out.align = maxAlign(out.align, *ea);
+                }
+                if (bw.has_value() && *bw > 0) {
+                    if (fl->size == 0) return std::nullopt;
+                    out.bitFields[i] = BitFieldPlacement{
+                        static_cast<std::uint32_t>(fl->size), 0, *bw};
                 }
                 maxSize = std::max(maxSize, fl->size);
             }

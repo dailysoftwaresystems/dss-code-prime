@@ -349,11 +349,12 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // (absence is "makes no claim", the deleted table's own behaviour for an
     // unlisted target), so the asymmetry applies in its harmless direction.
     // 32 + 1 = 33.
-    static constexpr std::array<std::string_view, 34> kFormatDocumentKeys{
+    static constexpr std::array<std::string_view, 35> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
         "dataModel", "bitFieldStrategy", "longDoubleFormat",
+        "unnamedBitFieldAlignment",
         // the per-OS `#include` header-NAME case rule — a silent WRONG-ACCEPT
         // in one direction and a wrong REJECT in the other if it typos
         "headerNameMatching",
@@ -1078,6 +1079,59 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                       bitFieldStrategyName(BitFieldStrategy::None)));
             } else {
                 data.bitFieldStrategy = *bs;
+            }
+        }
+    }
+
+    // ── D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: OPTIONAL
+    //    `unnamedBitFieldAlignment` ────────────────────────────────────────────
+    //
+    // Does an UNNAMED bit-field contribute its declared type's alignment to the
+    // enclosing composite? MEASURED (`{char c; unsigned :0; char d;}`): 5/1 under
+    // SysV-x86_64, Apple arm64 and Apple x86_64; 8/4 under AAPCS64/AAPCS32 ELF.
+    // gcc 13.3.0 and clang 18.1.3 agree PER TARGET, so it is an ABI property.
+    //
+    // ★ A SEPARATE KEY FROM `bitFieldStrategy`, NOT A NEW STRATEGY ROW: it cuts
+    // ACROSS gnu_packed (elf64-x86_64-linux and elf64-aarch64-linux are the SAME
+    // strategy and differ here), and a duplicate strategy would have to restate
+    // every other gnu_packed rule to vary one bit.
+    //
+    // ⚠ FORMAT-ONLY — no target-side fallback field exists (the `longDoubleFormat`
+    // shape, NOT the `bitFieldStrategy` one). So `none` is refused here for a
+    // DIFFERENT reason than it is on bitFieldStrategy: not because it would be
+    // ambiguous with a fallback, but because omitting the key already says
+    // "undeclared" and a spelled `none` adds nothing while looking like an answer.
+    // A wrong spelling is a HARD error — a typo must never silently pick an ABI.
+    if (doc.contains("unnamedBitFieldAlignment")) {
+        if (!doc.at("unnamedBitFieldAlignment").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/unnamedBitFieldAlignment",
+                      std::format("'unnamedBitFieldAlignment' must be a string ({})",
+                                  allowedList(
+                                      kSelectableUnnamedBitFieldAlignmentNames)));
+        } else {
+            auto const s = doc.at("unnamedBitFieldAlignment").get<std::string>();
+            auto const ua = unnamedBitFieldAlignmentFromName(s);
+            if (!ua) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/unnamedBitFieldAlignment",
+                          std::format("unknown unnamedBitFieldAlignment '{}' — "
+                                      "accepted: {}", s,
+                                      allowedList(
+                                          kSelectableUnnamedBitFieldAlignmentNames)));
+            } else if (!isSelectableUnnamedBitFieldAlignment(*ua)) {
+                // ⓘ NO APOSTROPHE IN THE PROSE — this sentence quotes vocabulary
+                // spellings and the projection pins pair `'` characters. See the
+                // identical note on bitFieldStrategy above.
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/unnamedBitFieldAlignment",
+                          std::format("unnamedBitFieldAlignment '{}' is not "
+                                      "selectable — omit the field to leave the "
+                                      "axis undeclared (there is no target-side "
+                                      "fallback to inherit)",
+                                      unnamedBitFieldAlignmentName(
+                                          UnnamedBitFieldAlignment::None)));
+            } else {
+                data.unnamedBitFieldAlignment = *ua;
             }
         }
     }

@@ -13541,8 +13541,28 @@ TEST(SemanticAnalyzerC, TgmathMatrixCleanOnPeViaVariantBridge) {
 // `sqrt((z))` passes a complex value to the f64 param (loud); the UNSELECTED
 // float arm's `(float)(z)` cast type-checks but never lowers. RED-ON-DISABLE:
 // rewrite the default arm as `sqrt((double)(x))` and this compiles clean —
-// the cast launders the complex arg (drops imag), the exact conformance
-// miscompile the bare arm exists to prevent.
+// the cast lets the complex arg through, dropping the imaginary part.
+//
+// ⚠ WHY THAT DROP IS THE DEFECT IS NOT WHAT THIS COMMENT USED TO SAY, AND THE
+// DIFFERENCE DECIDES WHERE THE FIX BELONGS. The old wording called the drop
+// "the exact conformance miscompile the bare arm exists to prevent".
+// ✔MEASURED 2026-08-29 (P45): `#include <math.h>` + `sqrt(z)` — the plain
+// `double sqrt(double)` prototype — compiles and exits 0 under gcc 13.3.0
+// `-std=c2x`, clang 18.1.3 `-std=c23` AND mingw-w64 gcc 13.2.0 alike. Dropping
+// the imaginary part into a real prototype IS conformant; all three references
+// do it (C 6.3.1.7p2 / 6.5.2.2p7). The miscompile is narrower and lives one
+// level up: a <tgmath.h> MACRO must never reach a real prototype for a complex
+// argument at all — C23 7.25 requires it to dispatch to `csqrt`, which DSS does
+// not ship ([[D-CSUBSET-TGMATH-COMPLEX]] riding
+// [[D-CSUBSET-COMPLEX-TRANSCENDENTAL]]).
+// ⇒ THESE THREE PINS ARE RIGHT AND MUST NOT BE SOFTENED, but they are guarding
+// via a PROXY: their loudness is borrowed from
+// [[D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED]], a separate and
+// ✔MEASURED-legal conversion DSS still refuses. ✔MEASURED at `build/cx`: admit
+// that conversion and `sqrt(z)` compiles and exits 0 where all three references
+// exit 1 — and EXACTLY these three tests go red, out of 745 in this binary.
+// So when the tgmath complex surface gets a real owner, the guard these three
+// express must move ONTO that owner rather than be deleted with the proxy.
 TEST(SemanticAnalyzerC, TgmathComplexArgSqrtFailsLoud) {
     auto model = analyzeRealTgmath(
         "#include <tgmath.h>\n"

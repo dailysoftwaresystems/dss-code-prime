@@ -3395,10 +3395,52 @@ TEST(Preprocessor, TfC82RegisteredInertPragmaIsSilentUnknownIsLoud) {
     // is a considered answer.
     {
         PreprocessResult r;
-        auto lexs = ppLexemes("#pragma STDC FP_CONTRACT OFF\nint v=1;\n", r);
+        // ⚠ THE FIXTURE MOVED 2026-08-29 AND THE REASON IS THE POINT, NOT
+        // BOOKKEEPING. This arm used `#pragma STDC FP_CONTRACT OFF`, which was
+        // an `unsupported` row when the arm was written.
+        // D-PP-PRAGMA-RECOGNIZED-SEMANTICS BUILT the `STDC` family, and
+        // `FP_CONTRACT OFF` is now `standardFloatState` — a state DSS SATISFIES
+        // (C23 7.12.2p2 disallows contraction, and MEASURED, DSS contracts
+        // nothing anywhere), so it is accepted and silent. Keeping it here would
+        // have pinned the OLD behaviour of a pragma that deliberately changed.
+        // `GCC poison` is used instead because it is STILL genuinely
+        // `unsupported`: it makes an identifier an error if used, DSS has not
+        // built that, and ignoring it silently accepts code the header author
+        // forbade. The arm therefore tests exactly what it always meant to —
+        // a row that CLAIMS real unbuilt semantics is LOUD — with an exemplar
+        // that still has them.
+        auto lexs = ppLexemes("#pragma GCC poison evil\nint v=1;\n", r);
         EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
             << "an `unsupported` row must fail loud, not be silently ignored";
         ASSERT_EQ(lexs.size(), 5u);
+    }
+    // (D) ★ THE FOURTH VERDICT, ADDED 2026-08-29: ACCEPTED-WITH-NOTICE. A
+    // `standardFloatStateDiverges` row means the pragma is RECOGNIZED and the TU
+    // COMPILES (all four references accept it, so refusing is below the union)
+    // while the unhonoured request is NAMED at WARNING severity. It is the only
+    // verdict in this table that is neither silent nor fatal, and it exists
+    // because the other two are both wrong for a numerics request DSS cannot
+    // meet: silence ships wrong results, refusal rejects a valid program.
+    {
+        PreprocessResult r;
+        auto lexs =
+            ppLexemes("#pragma STDC CX_LIMITED_RANGE OFF\nint v=1;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "the translation unit must still compile — every reference "
+               "accepts this pragma";
+        bool sawWarning = false;
+        for (auto const& d : r.diagnostics->all()) {
+            if (d.code == DiagnosticCode::P_PreprocessorPragma
+                && d.severity == DiagnosticSeverity::Warning) {
+                sawWarning = true;
+            }
+        }
+        EXPECT_TRUE(sawWarning)
+            << "…and the divergence must be NAMED: DSS evaluates complex "
+               "multiply and divide with the usual algebraic formulas, which is "
+               "the state this pragma is asking it NOT to use";
+        ASSERT_EQ(lexs.size(), 5u)
+            << "an accepted-with-notice pragma emits no tokens either";
     }
 }
 
@@ -3946,11 +3988,28 @@ TEST(Preprocessor, TfC85ProfileCensusFixtureActuallyReachesTheProfileGatedRows) 
 // Apple SDK headers park hundreds of pragmas inside unsupported-configuration
 // branches, and erroring on them would break every macOS compile.
 TEST(Preprocessor, FC15cPragmaInDeadBranchIsSilent) {
+    // ⚠ ONE FIXTURE MOVED 2026-08-29 (D-PP-PRAGMA-RECOGNIZED-SEMANTICS) BECAUSE
+    // THE BEHAVIOUR IT STOOD FOR CHANGED, NOT BECAUSE THE TEST WAS WRONG. This
+    // list needs pragmas that are MEASURABLY LOUD WHEN REACHED — that is what
+    // makes the dead-branch arms non-vacuous — and `#pragma STDC FP_CONTRACT
+    // OFF` stopped being one: it is now `standardFloatState`, a state DSS
+    // satisfies, so it is accepted and silent. `FP_CONTRACT MAYBE` replaces it
+    // and keeps the arm's ORIGINAL meaning intact: `MAYBE` is not an
+    // on-off-switch (C23 6.10.8 spells it `one of ON OFF DEFAULT`), so it
+    // matches no three-word row, falls through to the one-word `STDC` row, and
+    // is loud for exactly the reason the comment claims — an `unsupported` row.
     char const* const deadPragmas[] = {
-        "#pragma whatever here",        // unregistered -> loud if reached
-        "#pragma STDC FP_CONTRACT OFF", // `unsupported` row -> loud if reached
-        "#pragma pack(3)",              // malformed operand -> loud if reached
-        "#pragma pack(pop)",            // unbalanced pop    -> loud if reached
+        "#pragma whatever here",          // unregistered -> loud if reached
+        "#pragma STDC FP_CONTRACT MAYBE", // `unsupported` row -> loud if reached
+        // ★ THE FOURTH VERDICT, and it belongs in this list precisely because it
+        // is NOT fatal: an accepted-with-notice pragma still emits a
+        // `P_PreprocessorPragma` (at Warning severity) when REACHED, and must
+        // still be entirely silent when elided. A verdict that fires a warning
+        // is exactly the kind a hoisted recognizer would leak out of a dead
+        // branch, which is the failure this test exists to catch.
+        "#pragma STDC CX_LIMITED_RANGE OFF",
+        "#pragma pack(3)",                // malformed operand -> loud if reached
+        "#pragma pack(pop)",              // unbalanced pop    -> loud if reached
     };
     for (char const* const dead : deadPragmas) {
         PreprocessResult r;
@@ -9620,14 +9679,27 @@ TEST(Preprocessor, Tf87UnguardedSelfIncludeIsRefusedLoudlyAndDiagnosably) {
            "— the two are different failures and must read differently";
 }
 
-// ── `#pragma once` — RECOGNISED as a mechanism, and refused with its OWN ────
-// message. MEASURED: 21 macOS SDK headers carry `#pragma once`, 18 of them
-// (AppleArchive/*) with NO macro guard at all. DSS declares `once` `includeOnce`
-// in `preprocess.pragmaEffects` and has NOT built include-once dedup, so it
-// cannot make the repeat expansion empty — but reporting "no include guard
-// detected" would be a FALSE accusation that sends the reader hunting a
-// detector gap that is not there.
-TEST(Preprocessor, Tf87PragmaOnceReentryRefusedWithItsOwnDistinctMessage) {
+// ── `#pragma once` — HONOURED, so a self-include BELOW it is SKIPPED. ───────
+//
+// ⚠⚠ THIS TEST ASSERTED THE OPPOSITE UNTIL 2026-08-29, AND WHAT IT ASSERTED WAS
+// BELOW THE REFERENCE UNION. Its previous body required BOTH
+// `P_PreprocessorIncludeReentryRefused` AND `P_PreprocessorPragma` on this exact
+// fixture, with the rationale "`includeOnce` is a REFINEMENT of `unsupported`,
+// not an escape from it: this cycle must not let `#pragma once` quietly start
+// working". That was a correct reading of TF-C87's scope and a correct guard
+// against an ACCIDENTAL behaviour change — but it pinned a REFUSAL of a program
+// every reference compiles. ✔MEASURED 2026-08-29 on this fixture verbatim, each
+// reference invoked separately: WSL gcc 13.3.0 rc=0, WSL clang 18.1.3 rc=0,
+// mingw-w64 gcc 13.2.0 rc=0, MSVC 19.51.36252 rc=0.
+// D-PP-PRAGMA-RECOGNIZED-SEMANTICS built the dedup deliberately, so the pin is
+// inverted rather than deleted, and the old rationale is kept above so nobody
+// re-derives it.
+//
+// The fixture is a header that declares itself include-once and THEN includes
+// itself. The pragma is REACHED before the self-include, so it has already
+// fired: the inner `#include` names a file identity already in the registry and
+// is skipped. No refusal, no pragma diagnostic, and `once_sym` is defined once.
+TEST(Preprocessor, PragmaOnceSelfIncludeBelowTheDirectiveIsSkippedNotRefused) {
     namespace fs = std::filesystem;
     auto dir = ppScratchRoot() / "dss_tf87_pragma_once";
     std::error_code ec;
@@ -9638,36 +9710,73 @@ TEST(Preprocessor, Tf87PragmaOnceReentryRefusedWithItsOwnDistinctMessage) {
     PreprocessResult r;
     auto lexs = ppLexemesWithDirs("#include \"once.h\"\nint m = 1;\n", r,
                                   {dir}, {});
+
+    EXPECT_FALSE(hasPPCode(r,
+                           DiagnosticCode::P_PreprocessorIncludeReentryRefused))
+        << "the pragma had already FIRED when the self-include was reached, so "
+           "the repeat is skipped and there is no re-entry to adjudicate";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
+        << "`#pragma once` is IMPLEMENTED now — refusing it here refused a "
+           "program all four references compile";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+
+    // The substantive property, not just the absence of diagnostics: the
+    // header's text was spliced exactly ONCE.
+    std::size_t onceSymCount = 0;
+    for (auto const& lx : lexs)
+        if (lx == "once_sym") ++onceSymCount;
+    EXPECT_EQ(onceSymCount, 1u)
+        << "a header that declares itself include-once must contribute its text "
+           "once; two would be a duplicate definition downstream";
+}
+
+// ── …AND THE `OncePragma` RE-ENTRY ARM STILL HAS A REACHABLE CASE. ──────────
+// A header whose self-include sits ABOVE its own `#pragma once` cannot be
+// terminated by that pragma, because the declaration comes after the recursion.
+// ✔MEASURED 2026-08-29: WSL gcc 13.3.0 and WSL clang 18.1.3 BOTH fail this
+// (rc=1) with a runaway `In file included from` chain naming the header over and
+// over into their nesting-depth limits — so refusing is matching them, not
+// out-stricting them.
+// The message must say WHY without repeating the now-false claim that DSS has
+// not built include-once dedup.
+TEST(Preprocessor, PragmaOnceSelfIncludeAboveTheDirectiveIsStillRefused) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_pragma_once_above";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "once.h", std::ios::binary)
+          << "#include \"once.h\"\n#pragma once\nint once_sym;\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs("#include \"once.h\"\nint m = 1;\n", r,
+                                  {dir}, {});
     (void)lexs;
-    EXPECT_TRUE(hasPPCode(r,
-                          DiagnosticCode::P_PreprocessorIncludeReentryRefused))
-        << "the `#pragma once` re-entry refusal is a REFUSAL and must carry the "
-           "refusal code, not the overloaded include-error code";
-    // ★ AND THE PRAGMA ITSELF IS STILL LOUD. `includeOnce` is a REFINEMENT of
-    // `unsupported`, not an escape from it: this cycle must not let `#pragma
-    // once` quietly start working as a side effect of teaching the guard
-    // detector to recognise it.
-    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
-        << "`#pragma once` must STILL fail loud at its own line — the registry "
-           "row says DSS has not built include-once dedup, and recognising the "
-           "shape in the guard detector changes nothing about that";
-    bool sawOnceRefusal = false, sawNoMechanismClaim = false;
+
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "a header that includes itself above its own include-once line is a "
+           "genuine unbounded recursion; both gcc and clang fail it";
+
+    bool sawOnceRefusal = false, sawNoMechanismClaim = false, sawStaleClaim = false;
     for (auto const& d : r.diagnostics->all()) {
         if (d.actual.find(kRefusalPhrase) == std::string::npos) continue;
-        if (d.actual.find("'includeOnce'") != std::string::npos) {
+        if (d.actual.find("'includeOnce'") != std::string::npos)
             sawOnceRefusal = true;
-        }
-        if (d.actual.find(kNoMechanismPhrase) != std::string::npos) {
+        if (d.actual.find(kNoMechanismPhrase) != std::string::npos)
             sawNoMechanismClaim = true;
-        }
+        if (d.actual.find("has not built include-once dedup")
+            != std::string::npos)
+            sawStaleClaim = true;
     }
     EXPECT_TRUE(sawOnceRefusal)
-        << "a `#pragma once` header's re-entry refusal must NAME the mechanism "
-           "and the registry verb that declares it";
+        << "the refusal must NAME the mechanism and the registry verb that "
+           "declares it";
     EXPECT_FALSE(sawNoMechanismClaim)
         << "it must NOT claim no include-once mechanism was found — the header "
-           "carries one; this implementation just has not built it. Saying "
-           "otherwise sends the reader hunting a detector gap that is not there";
+           "carries one";
+    EXPECT_FALSE(sawStaleClaim)
+        << "it must NOT say DSS has not built include-once dedup: that stopped "
+           "being true when this row landed, and a message that misdescribes the "
+           "engine sends the reader hunting the wrong thing";
 }
 
 // ── THE DEPTH CAP REALLY FIRES on a GUARDED-BUT-STILL-RECURSIVE header. ─────

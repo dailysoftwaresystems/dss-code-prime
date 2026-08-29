@@ -371,6 +371,19 @@ effectiveBitFieldStrategy(TargetSchema const&       target,
 effectiveLongDoubleFormat(TargetSchema const&       target,
                           ObjectFormatSchema const& format) noexcept;
 
+// D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: resolve whether an UNNAMED bit-field
+// contributes its declared type's alignment, for a (target, format) pair. The
+// `effectiveLongDoubleFormat` twin, NOT the `effectiveBitFieldStrategy` one: the axis
+// is FORMAT-ONLY, so there is no target-side field to fall back to and `None` means
+// genuinely undeclared. The layout engine then fails loud — but ONLY if an unnamed
+// bit-field is actually laid out under `gnu_packed`, so the wasm/spirv skeletons that
+// declare no C ABI stay unaffected. Never a silent default: BOTH answers are a real
+// ABI somewhere (`ignored` on SysV/Darwin, `contributes` on AAPCS), so guessing one
+// would be a silent miscompile on every platform holding the other.
+[[nodiscard]] DSS_EXPORT UnnamedBitFieldAlignment
+effectiveUnnamedBitFieldAlignment(TargetSchema const&       target,
+                                  ObjectFormatSchema const& format) noexcept;
+
 // ★ NO `effectiveCharIsUnsigned` HERE — and its absence is the design, not an
 // omission (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM, TF-C75). The two resolvers
 // above exist because their axes have contributions from BOTH schemas that must
@@ -711,6 +724,13 @@ struct DSS_EXPORT CuMirModule {
     // exact for the active format. The target's alignment params come from
     // `*target`; this overlays the per-format bit-field rule onto them.
     BitFieldStrategy bitFieldStrategy = BitFieldStrategy::None;
+    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: the FORMAT-resolved unnamed-bit-field
+    // alignment rule, captured for the SAME reason as `bitFieldStrategy` above — the
+    // LOWER half sees only this struct, and a const-init global whose struct carries a
+    // zero-width bit-field must be laid out to the active format's ABI, not to
+    // whichever one the target happened to imply.
+    UnnamedBitFieldAlignment unnamedBitFieldAlignment =
+        UnnamedBitFieldAlignment::None;
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER) + D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3):
     // shim SymbolId.v → recipe id for EVERY `synthesize`-tagged shipped-library symbol this
     // CU touched, carried from the BUILD half's `CstToHirResult.synthRecipeBySymbol` so the
@@ -1025,6 +1045,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       TargetSchema const&  target,
                       DataModel            dataModel,
                       BitFieldStrategy     bitFieldStrategy,
+                      UnnamedBitFieldAlignment unnamedBitFieldAlignment,
                       std::uint16_t        callingConventionIndex,
                       CompilationUnitId    cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,

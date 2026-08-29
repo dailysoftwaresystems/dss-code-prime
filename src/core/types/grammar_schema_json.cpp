@@ -7463,7 +7463,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // `kEffectVerbs` precedent, which was written after exactly
                     // that drift was MEASURED in the attribute loader).
                     static constexpr std::array<
-                        std::pair<std::string_view, PragmaEffect>, 7>
+                        std::pair<std::string_view, PragmaEffect>, 9>
                         kPragmaVerbs{{
                             {"diagnosticsOnly", PragmaEffect::DiagnosticsOnly},
                             {"annotationOnly",  PragmaEffect::AnnotationOnly},
@@ -7472,7 +7472,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             {"structPacking",   PragmaEffect::StructPacking},
                             {"optimizerControl", PragmaEffect::OptimizerControl},
                             {"unsupported",     PragmaEffect::Unsupported},
-                            {"includeOnce",     PragmaEffect::IncludeOnce}}};
+                            {"includeOnce",     PragmaEffect::IncludeOnce},
+                            // D-PP-PRAGMA-RECOGNIZED-SEMANTICS: the `#pragma
+                            // STDC` pair. `standardFloatState` = this
+                            // implementation SATISFIES the requested state
+                            // (accepted, silent); `standardFloatStateDiverges` =
+                            // it does not, so the TU is still ACCEPTED (every
+                            // reference accepts it) and a WARNING names the
+                            // divergence. Which form gets which verb is a
+                            // per-row judgement in the language document, not a
+                            // decision in this engine.
+                            {"standardFloatState",
+                             PragmaEffect::StandardFloatState},
+                            {"standardFloatStateDiverges",
+                             PragmaEffect::StandardFloatStateDiverges}}};
                     DSS_CHECK_KEY_VOCABULARY(kPragmaVerbs);
                     static constexpr std::array<std::string_view, 2>
                         kPragmaRowKeys{"prefix", "effect"};

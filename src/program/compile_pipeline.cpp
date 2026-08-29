@@ -113,6 +113,16 @@ effectiveLongDoubleFormat([[maybe_unused]] TargetSchema const& target,
     return format.longDoubleFormat();
 }
 
+UnnamedBitFieldAlignment
+effectiveUnnamedBitFieldAlignment([[maybe_unused]] TargetSchema const& target,
+                                  ObjectFormatSchema const&            format) noexcept {
+    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: FORMAT-only — no target-side field
+    // exists to fall back to (see the header docblock). `None` propagates as the
+    // honest undeclared state; the layout engine fails loud on it, and only when an
+    // unnamed bit-field actually needs the rule.
+    return format.unnamedBitFieldAlignment();
+}
+
 // ── NOT HERE: `effectiveCharIsUnsigned` (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM)
 // ──────────────────────────────────────────────────────────────
 // There is deliberately no third member of the `effective*` family for
@@ -348,10 +358,17 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // supplies only the alignment rule). A `sizeof` over a bit-field struct in an
     // array dimension then folds with the byte-ABI-exact layout.
     auto const effectiveBfStrategy = effectiveBitFieldStrategy(target, format);
+    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: resolved beside the strategy and
+    // overlaid at the SAME three consumer sites, because the two axes are read by one
+    // packer and a site that got one without the other would lay out to a mixture of
+    // two ABIs.
+    auto const effectiveUnnamedBfAlign =
+        effectiveUnnamedBitFieldAlignment(target, format);
     std::optional<AggregateLayoutParams> analyzeLayout;
     if (target.aggregateLayoutLoaded()) {
         analyzeLayout = target.aggregateLayout();
         analyzeLayout->bitFieldStrategy = effectiveBfStrategy;
+        analyzeLayout->unnamedBitFieldAlignment = effectiveUnnamedBfAlign;
     }
     // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2): capture the RESOLVED CC's
     // WHOLE `vaListLayout` block. Read from the SAME resolved CC the MirLoweringConfig
@@ -845,6 +862,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // gnu_packed), not just whatever the target declared.
     mirCfg.aggregateLayout       = target.aggregateLayout();
     mirCfg.aggregateLayout.bitFieldStrategy = effectiveBfStrategy;
+    mirCfg.aggregateLayout.unnamedBitFieldAlignment = effectiveUnnamedBfAlign;
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
     // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75
@@ -996,6 +1014,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // D-CSUBSET-C11-THREADS-MACHO: capture the format's synth vehicle (win32/pthread +
     // import library) the SAME post-construction way as libraryShimRecipes, so the LOWER
     // half's `synthesizeThreadsShim` picks the right primitive family. nullopt on elf.
+    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: set post-construction (the
+    // `librarySynthesis` idiom) rather than positionally, so adding this axis cannot
+    // silently shift a neighbouring member of the aggregate initializer above.
+    cuMir.unnamedBitFieldAlignment = effectiveUnnamedBfAlign;
     cuMir.librarySynthesis = format.librarySynthesis();
     // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN (C4): the DECLARED rule, not the identity.
     cuMir.cSymbolDecoration = format.cSymbolDecoration().scheme;
@@ -1076,6 +1098,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          TargetSchema const&                         target,
                          DataModel                                   dataModel,
                          BitFieldStrategy                            bitFieldStrategy,
+                         UnnamedBitFieldAlignment                    unnamedBitFieldAlignment,
                          std::uint16_t                               callingConventionIndex,
                          CompilationUnitId                           cuId,
                          std::optional<ExternCallDispatch>           externCallDispatch,
@@ -1421,6 +1444,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     if (target.aggregateLayoutLoaded()) {
         globalsLayout = target.aggregateLayout();
         globalsLayout->bitFieldStrategy = bitFieldStrategy;
+        globalsLayout->unnamedBitFieldAlignment = unnamedBitFieldAlignment;
     }
     // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): find the target's ABSOLUTE-64 pointer
     // relocation kind by FORMULA (widthBytes==8 && !pcRelative), never by name —
@@ -2106,7 +2130,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     return lowerMirModuleToAssembly(
         cuMir.mir, model.lattice().interner(), nameOf,
         std::move(cuMir.externImports), userEntry, *cuMir.target,
-        cuMir.dataModel, cuMir.bitFieldStrategy,
+        cuMir.dataModel, cuMir.bitFieldStrategy, cuMir.unnamedBitFieldAlignment,
         cuMir.callingConventionIndex, cuMir.cuId,
         cuMir.externCallDispatch, cuMir.dataImportBinding,
         cuMir.externAddrBinding,
@@ -2134,6 +2158,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       TargetSchema const& target,
                       DataModel           dataModel,
                       BitFieldStrategy    bitFieldStrategy,
+                      UnnamedBitFieldAlignment unnamedBitFieldAlignment,
                       std::uint16_t       callingConventionIndex,
                       CompilationUnitId   cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
@@ -2163,7 +2188,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
     return lowerMirModuleToAssembly(
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
-        dataModel, bitFieldStrategy, callingConventionIndex, cuId,
+        dataModel, bitFieldStrategy, unnamedBitFieldAlignment,
+        callingConventionIndex, cuId,
         externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
 }

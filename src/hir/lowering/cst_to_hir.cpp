@@ -893,7 +893,11 @@ struct Lowerer {
         // (a bare F64) — mis-lowering the op (the child is the "leaves 2.0 a bare
         // F64" bug). real->complex constructs (v, 0); complex->complex element-
         // converts — both realized by materializeComplexCast at hir_to_mir. Implicit
-        // complex->real is NOT here (it stays a semantic reject, C99 6.3.1.7). The
+        // complex->real is NOT here — ⚠ and the clause that used to say it "stays a
+        // semantic reject, C99 6.3.1.7" CITED THE STANDARD FOR THE OPPOSITE OF WHAT
+        // THE STANDARD SAYS: C 6.3.1.7p2 DEFINES that conversion and requires no cast
+        // to request it. It is a KNOWN DIVERGENCE, recorded in the note below and in
+        // [[D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED]], not a rule. The
         // identical-type case already returned at the top (`child.type == target`).
         if (tk == TypeKind::Complex
             && (ck == TypeKind::Complex || isArithmeticCore(ck))) {
@@ -923,6 +927,17 @@ struct Lowerer {
         // first — see the long note at the matching arm in
         // `src/analysis/semantic/type_rules.hpp::isAssignable`, which carries the
         // full measurement and why a `_Generic` arm cannot substitute.
+        // ✔P45 MEASURED THE REALIZE SIDE SO A CLOSING LANE NEED NOT: the arm is
+        //   `if (ck == Complex && tk != TypeKind::Bool && isArithmeticCore(tk))`
+        // minting the SAME `Cast(complex -> real)` the EXPLICIT cast builds, which
+        // `mapCast`'s C 6.3.1.7 discard arm already realizes — no new lowering.
+        // ⚠ `tk != Bool` MUST BE SPELLED, not inferred from arm ORDER.
+        // `isArithmeticCore` INCLUDES Bool, and only the `_Bool`-target arm sitting
+        // EARLIER in this function keeps a Bool from reaching here today; a future
+        // reorder would silently route `_Bool b = z;` through the imaginary-
+        // DISCARDING path, which is
+        // [[D-CSUBSET-COMPLEX-LOGICAL-NOT-AND-BOOL-CAST-SILENT-MISCOMPILE]].
+        // Naming Bool makes that reorder a loud reject instead of a wrong answer.
         // Pointers, structs, FnSig are not coerced implicitly; let the
         // caller decide whether the mismatch is a diagnostic. Arithmetic
         // (int + float kinds — file-scope `isArithmeticCore`) is the
@@ -7385,13 +7400,51 @@ struct Lowerer {
     // name token of a struct, builtin keywords, etc.) — not on the
     // outer `typeRefAllowingStruct` wrapper — so recursively probe the
     // subtree until a stamped type is found.
+    // ── the CONFIG rows that say WHERE a construct's type child sits ──
+    //
+    // ★★ D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK (second tier). Every
+    // construct carrying a type-name child — cast, compound literal, va_arg,
+    // sizeof, alignof — has that child's position DECLARED in the same
+    // `semantics` block the analyzer reads. The HIR tier used to re-derive it by
+    // ORDINAL ("the first Internal child", "the first non-brace Internal"), i.e.
+    // the two tiers located the SAME child by two different mechanisms and
+    // agreed only by luck. These accessors make the config the single source of
+    // truth. Linear scans: C declares ONE row of each, and the lookup is once per
+    // lowered construct.
+    [[nodiscard]] CastRule const* castRowFor(NodeId n) const {
+        RuleId const r = tree().rule(n);
+        for (auto const& row : sem.castRules)
+            if (row.rule.v == r.v) return &row;
+        return nullptr;
+    }
+    [[nodiscard]] CompoundLiteralRule const* compoundLiteralRowFor(NodeId n) const {
+        RuleId const r = tree().rule(n);
+        for (auto const& row : sem.compoundLiteralRules)
+            if (row.rule.v == r.v) return &row;
+        return nullptr;
+    }
+
+    // ★ AMBIGUITY-GUARDED (D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK, second
+    // tier). The DFS is FIRST-STAMP-WINS, so if a type-ref subtree ever carries
+    // two different stamps the lowering silently takes whichever the walk reaches
+    // first. A stamp on `n` itself is authoritative and returns immediately (the
+    // compound-literal / typeof case — Pass 2 stamps the node); only an UNSTAMPED
+    // node descends, and there a second, DIFFERENT stamp among the children means
+    // the walk is choosing, not reading. Refuse instead: every caller already
+    // fails loud with its own positioned "did not resolve to a type" message, so
+    // the outcome is a refusal rather than a wrong width. Two stamps that AGREE
+    // cannot miscompile and are not an error.
     [[nodiscard]] TypeId resolveStampedTypeBelow(NodeId n) const {
         if (TypeId t = semTypeAt(n); t.valid()) return t;
         if (tree().kind(n) != NodeKind::Internal) return InvalidType;
+        TypeId found = InvalidType;
         for (NodeId c : visible(n)) {
-            if (TypeId t = resolveStampedTypeBelow(c); t.valid()) return t;
+            TypeId const t = resolveStampedTypeBelow(c);
+            if (!t.valid()) continue;
+            if (!found.valid())      found = t;
+            else if (found.v != t.v) return InvalidType;   // ambiguous — refuse
         }
-        return InvalidType;
+        return found;
     }
     // VLA C2 (D-CSUBSET-VLA): the SymbolId of a `sizeof <operand>` when the operand is a
     // DIRECT reference to a VLA object (`a`, `(a)`, `((a))`). Mirrors `simpleLvalue`'s
@@ -7472,13 +7525,32 @@ struct Lowerer {
         return SymbolId{};
     }
     [[nodiscard]] E lowerCompoundLiteral(NodeId clNode) {
-        NodeId typeRefN{}, braceN{};
-        for (NodeId c : visible(clNode)) {
-            if (isToken(c)) continue;
-            if (tree().kind(c) != NodeKind::Internal) continue;
-            if (isBraceInitList(c))                     braceN   = c;
-            else if (!typeRefN.valid())                 typeRefN = c;
+        // ★★ THE DECLARED INDEX for the TYPE (
+        // D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK, second tier): the
+        // `compoundLiterals` row's `typeChild`, the same field Pass 2 resolves and
+        // stamps. This used to be "the first non-brace Internal child", which a
+        // decoration node would have displaced silently. The BRACE stays located
+        // by its own rule (`isBraceInitList`) — that is a POSITIVE rule check, not
+        // an ordinal guess, so it is already sound.
+        auto const* clrow = compoundLiteralRowFor(clNode);
+        if (clrow == nullptr) {
+            return exprError(clNode,
+                "compound literal's rule declares no `semantics.compoundLiterals` "
+                "row, so its type child cannot be located");
         }
+        auto const clkids = visible(clNode);
+        NodeId braceN{};
+        for (NodeId c : clkids) {
+            if (tree().kind(c) == NodeKind::Internal && isBraceInitList(c)) {
+                braceN = c;
+                break;
+            }
+        }
+        if (clrow->typeChild >= clkids.size()) {
+            return exprError(clNode,
+                "compound literal is missing its type-ref or brace-init");
+        }
+        NodeId const typeRefN = clkids[clrow->typeChild];
         if (!typeRefN.valid() || !braceN.valid()) {
             return exprError(clNode,
                 "compound literal is missing its type-ref or brace-init");
@@ -7716,13 +7788,21 @@ struct Lowerer {
     // type-child/operand-child split, just in the opposite order (cast = type
     // first; va_arg = operand first).
     [[nodiscard]] E lowerVaArg(NodeId node) {
-        NodeId apN{}, typeRefN{};
-        for (NodeId c : visible(node)) {
-            if (isToken(c)) continue;
-            if (tree().kind(c) != NodeKind::Internal) continue;
-            if (!apN.valid())            apN      = c;
-            else if (!typeRefN.valid()) { typeRefN = c; break; }
+        // ★★ THE DECLARED INDICES (D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK,
+        // second tier) — `vaArgApChild` / `vaArgTypeChild`, the same two fields
+        // Pass 2 resolves and stamps against. This used to be the ordinal
+        // "1st Internal = ap, 2nd Internal = type" scan, which the comment above
+        // even describes as mirroring `castPrologue`'s split "in the opposite
+        // order" — two sites guessing, in opposite directions, with nothing
+        // holding them to the config. An extra Internal child would have swapped
+        // the roles and read the va_list as a type.
+        auto const vkids = visible(node);
+        if (sem.vaArgApChild >= vkids.size()
+            || sem.vaArgTypeChild >= vkids.size()) {
+            return exprError(node, "va_arg is missing its va_list operand or type");
         }
+        NodeId const apN      = vkids[sem.vaArgApChild];
+        NodeId const typeRefN = vkids[sem.vaArgTypeChild];
         if (!apN.valid() || !typeRefN.valid()) {
             return exprError(node, "va_arg is missing its va_list operand or type");
         }
@@ -7840,13 +7920,31 @@ struct Lowerer {
     // here — BEFORE the operand lowers — matches the source evaluation order.
     [[nodiscard]] std::optional<E> castPrologue(NodeId castNode, NodeId& operandN,
                                                 TypeId& target) {
-        NodeId typeRefN{};
-        for (NodeId c : visible(castNode)) {
-            if (isToken(c)) continue;
-            if (tree().kind(c) != NodeKind::Internal) continue;
-            if (!typeRefN.valid())       typeRefN = c;
-            else if (!operandN.valid()) { operandN = c; break; }
+        // ★★ THE DECLARED INDICES, NOT ORDINAL INTERNAL CHILDREN
+        // (D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK, second tier). This used
+        // to take "the 1st Internal child" as the type-ref and "the 2nd" as the
+        // operand. That is the same first-match defect the type-head guard closes
+        // one tier up, and it is worse here for being ORDINAL: any node a grammar
+        // edit drags into the child list shifts BOTH roles by one, so the cast
+        // silently converts to the wrong type AND converts the wrong expression.
+        // The `casts` row already declares exactly where both sit, and the
+        // semantic tier reads those same two fields — so the tiers now agree BY
+        // CONSTRUCTION rather than by two independent guesses that happened to
+        // match. A row this rule has no entry for, or an index past the end, is a
+        // LOUD refusal: never a fallback to the old scan.
+        auto const* crow = castRowFor(castNode);
+        if (crow == nullptr) {
+            return exprError(castNode,
+                "cast expression's rule declares no `semantics.casts` row, so "
+                "the type and operand children cannot be located");
         }
+        auto const ckids = visible(castNode);
+        if (crow->typeChild >= ckids.size() || crow->operandChild >= ckids.size()) {
+            return exprError(castNode,
+                "cast expression is missing its type-ref or operand");
+        }
+        NodeId const typeRefN = ckids[crow->typeChild];
+        operandN = ckids[crow->operandChild];
         if (!typeRefN.valid() || !operandN.valid()) {
             return exprError(castNode,
                 "cast expression is missing its type-ref or operand");
@@ -10438,9 +10536,23 @@ struct Lowerer {
     void lowerTypeDeclInto(NodeId node, std::vector<HirNodeId>& out) {
         auto it = declMap_.find(tree().rule(node).v);
         DeclarationRule const* decl = (it != declMap_.end()) ? &sem.declarations[it->second] : nullptr;
-        // Strip-aware for the same reason as `lowerVarLike` above: no shipped
-        // type-decl rule declares a `specifierPrefix` today (behavior-
-        // preserving), but a prefixed one must not shift `nameChild`.
+        // Strip-aware for the same reason as `lowerVarLike` above: a declaration
+        // row that declares a `specifierPrefix` must not have that prefix shift
+        // `nameChild` / the declarator carrier off their authored indices.
+        //
+        // ⚠ THIS COMMENT USED TO READ "no shipped type-decl rule declares a
+        // `specifierPrefix` today (behavior-preserving)", AND THAT WENT FALSE
+        // WITHOUT ANYTHING NOTICING. TF-C72 gave the shipped c `typedefDecl`
+        // (kind: type) `specifierPrefix: typedefDeclSpecifiers` — the SIBLING slot
+        // that keeps an attribute decoration OUT of the type-resolved head
+        // (D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK). So the strip below is
+        // LIVE on every C typedef, not a hypothetical kept warm for a future
+        // language: `typedefDeclSpecifiers` owns the `typedef` keyword itself and
+        // is therefore ALWAYS the first visible child, hence ALWAYS stripped.
+        // ✔MEASURED 2026-08-29 by reading the shipped `c.lang.json` — it is the
+        // ONLY `kind: type` row carrying a prefix. The CODE was already right;
+        // only the sentence explaining it had rotted, which is precisely the
+        // failure mode that hides behind a green suite.
         auto vis = decl ? declRoleChildren(tree(), node, *decl) : visible(node);
         SymbolId sym{};
         TypeId type = InvalidType;

@@ -36,6 +36,8 @@
 
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: SysV/GNU LSB-first bit-field packing (byte-ABI-exact to gcc). OS/format-determined (x86_64 serves both ELF and PE), so on the format not the target. See elf64-x86_64-linux for the full rule.",
   "bitFieldStrategy": "gnu_packed",
+  "$unnamedBitFieldAlignmentComment": "D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: an UNNAMED bit-field contributes NO alignment to the enclosing composite. MEASURED P45 -- `struct { char c; unsigned :0; char d; }` is 5/1 here, against 8/4 on the AAPCS64 ELF formats that share this very same `gnu_packed` strategy.  The zero-width field still BREAKS the packing cursor to its declared type's unit boundary (uncapped by `#pragma pack`); only the alignment contribution is dropped. ~ Declared on the FORMAT and not the target for exactly the reason `bitFieldStrategy` is: one CPU target serves several ABIs. There is NO target-side fallback for this key -- omitting it does not inherit, it leaves the axis undeclared and the layout engine fails loud the moment a zero-width bit-field needs it.",
+  "unnamedBitFieldAlignment": "ignored",
 
   "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: SysV x86_64 `long double` is the x87 80-bit extended format stored 16/16. The axis resolves the c row to F80 — declarations/layout/sizeof work; VALUE arithmetic walls loud (L_UnsupportedLoweringForOpcode) until D-CSUBSET-LONG-DOUBLE-X87-ARITH lands. OS/format-determined (the same x86_64 target serves pe64's f64), so the axis lives here next to dataModel.",
   "longDoubleFormat": "x87-80",

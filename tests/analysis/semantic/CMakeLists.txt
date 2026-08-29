@@ -211,3 +211,19 @@ dss_add_test(NAME analysis/semantic/test_redeclaration_compat
              SOURCES test_redeclaration_compat.cpp)
 target_include_directories(dss_analysis_semantic_test_redeclaration_compat
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P45 lane td: [[D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK]] — the SWEEP.
+# `resolveTypeNodeImpl` picks a type head FIRST-CHILD-THAT-RESOLVES-WINS, so any
+# identifier a decoration drags into a type-resolved child list can win over the
+# real head and silently retype the declaration. This suite pins the resolved
+# TYPE (never "compiles clean" — a hijack IS clean-compiling) at every head rule
+# in the shipped c grammar, and APPLIES the tempting wrong fix (the attribute run
+# moved inside `typedefHeadFull`) to the SHIPPED document to prove the engine now
+# refuses it loudly instead of miscompiling. It perturbs that document, so like
+# the FC3 suite it needs nlohmann and the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_type_head_hijack_sweep
+             SOURCES test_type_head_hijack_sweep.cpp)
+target_include_directories(dss_analysis_semantic_test_type_head_hijack_sweep
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(dss_analysis_semantic_test_type_head_hijack_sweep
+                      PRIVATE nlohmann_json::nlohmann_json)

@@ -65,6 +65,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 # ── OUTPUT ENCODING — AND HERE THE GLYPH **IS** THE FACT ────────────────────────
 # ⚠ A GATE THAT CRASHES WHILE REPORTING IS WORSE THAN ONE THAT SAYS NOTHING.
@@ -1300,6 +1301,65 @@ def scan_at_ref(root, ref):
     return scan
 
 
+def per_bucket_report(root, registry_open_total):
+    """Print the registry's OPEN split per BUCKET, and reconcile it. -> bool ok
+
+    ★★★ WHY THIS LIVES INSIDE THE GATE RATHER THAN BESIDE IT (operator ruling
+    2026-08-25: *"the priority is always production anchors. ALWAYS"*). That ruling
+    makes "how many PRODUCTION rows are open" a number every cycle report owes, and
+    `row_key()` above deliberately canonicalises **both** registry files to ONE key
+    so that MOVING a row between buckets is correctly a no-op for the balance. Those
+    two facts are both right and they pull opposite ways: the gate cannot answer the
+    per-bucket question from `after.rows`, because by then the bucket is gone.
+
+    ⚠ SO THE BUCKET PART IS NEW CODE AND THE **OPEN** PART IS NOT. *"Is this row
+    open?"* is a question this gate already answers, and answering it a second time
+    by hand is how a sibling instrument reported **562** where the gate reported 556
+    -- it re-typed the vocabulary and did not know that `scan_document` SKIPS rows
+    inside HTML comment blocks, so it counted commented-out rows as live ones.
+    ✔MEASURED 2026-08-28. This function therefore calls `scan_document` per file and
+    counts what IT returns; nothing here decides what "open" means.
+
+    ★ THE SUM IS THE CROSS-CHECK, AND IT IS THE ONLY REASON A MIS-BUCKETED ROW IS
+    VISIBLE AT ALL. Per-file scans key registry rows through the same canonical
+    prefix, so ONE anchor id present in BOTH buckets is counted twice here and once
+    in the merged total -- the sums disagree and the run fails. Without the
+    reconciliation the two figures would simply be wrong together and read as
+    authoritative. ✔The equivalent hand-check caught a 20-row error in the P34
+    handoff's own production figure.
+
+    ⓘ The enumeration is by PREFIX, matching `REG_PREFIX`'s own rationale: a third
+    split costs nothing and no reader can silently see part of the registry.
+    """
+    plans = os.path.join(root, PLANS_DIR)
+    names = sorted(n for n in os.listdir(plans)
+                   if n.endswith(".md") and ("%s/%s" % (PLANS_DIR, n)).startswith(REG_PREFIX))
+    if not names:
+        # A collapsed enumeration reports a clean split over a corpus it never read.
+        print()
+        print("anchor-balance: per-bucket scan found NO registry file under %s/ -- the "
+              "scan collapsed. This is a structural failure, not an empty registry."
+              % PLANS_DIR)
+        return False
+
+    print()
+    total_open = 0
+    for n in names:
+        rel = "%s/%s" % (PLANS_DIR, n)
+        with io.open(os.path.join(plans, n), encoding="utf-8") as fh:
+            scan = scan_document(fh.read(), rel)
+        # `scan.rows` holds OPEN rows only; `scan.names` holds every data row.
+        label = n[len("_deferred-anchor-registry"):].lstrip("-").rsplit(".", 1)[0] or "(unsplit)"
+        print("anchor-balance: bucket %-12s %4d OPEN / %4d rows   (%s)"
+              % (label.upper(), len(scan.rows), len(scan.names), rel))
+        total_open += len(scan.rows)
+
+    ok = total_open == registry_open_total
+    print("anchor-balance: bucket %-12s %4d OPEN   <- must equal the registry total %d   %s"
+          % ("SUM", total_open, registry_open_total, "OK" if ok else "MISMATCH"))
+    return ok
+
+
 def scan_worktree(root):
     scan = Scan()
     plans = os.path.join(root, PLANS_DIR)
@@ -2058,6 +2118,59 @@ def self_test():
         "expected=%s got=%s" % (sorted(want4.items()), sorted(anchors5.items())))
     extra_total += 4
 
+    # ── THE PER-BUCKET SPLIT, AND ITS RECONCILIATION ────────────────────────────
+    # ⚠ THE ARM THAT MATTERS IS THE **MISMATCH**, NOT THE SPLIT. A bucket report
+    # that merely prints two numbers is right by construction and proves nothing;
+    # what has to be exercised is the case where the buckets DISAGREE with the
+    # merged registry total, because `row_key()` canonicalises both files to one
+    # key and a row filed in BOTH is therefore counted twice per-file and once
+    # merged. That double-count is the only failure this reconciliation can see,
+    # and it is invisible everywhere else in the gate.
+    # ⓘ Filesystem-based rather than document-based, because `per_bucket_report`
+    # takes a ROOT: the bucket is a property of WHICH FILE a row is in, which a
+    # single in-memory document cannot express.
+    def bucket_probe(dup):
+        rows_p = ["| `D-XX-ALPHA` | \U0001f7e0 **OPEN** | w | r |",
+                  "| `D-XX-BETA` | ✅ **CLOSED** | w | r |"]
+        rows_h = ["| `D-XX-GAMMA` | \U0001f7e0 **OPEN** | w | r |"]
+        if dup:
+            # The same anchor id filed in BOTH buckets, which is what a mis-bucketed
+            # row looks like after a careless move: per-file it counts twice.
+            rows_h.append("| `D-XX-ALPHA` | \U0001f7e0 **OPEN** | w | r |")
+        with tempfile.TemporaryDirectory() as tmp:
+            plans = os.path.join(tmp, PLANS_DIR)
+            os.makedirs(plans)
+            for name, rows in (("_deferred-anchor-registry-production.md", rows_p),
+                               ("_deferred-anchor-registry-harness.md", rows_h)):
+                with io.open(os.path.join(plans, name), "w", encoding="utf-8") as fh:
+                    fh.write(_doc(*(REG_HDR + rows)))
+            merged = len(scan_worktree(tmp).rows)   # canonical: a dup collapses to one
+            held, sys.stdout = sys.stdout, io.StringIO()
+            try:
+                ok = per_bucket_report(tmp, merged)
+                out = sys.stdout.getvalue()
+            finally:
+                sys.stdout = held
+        return ok, merged, out
+
+    ok_clean, merged_clean, out_clean = bucket_probe(dup=False)
+    pin(ok_clean and merged_clean == 2,
+        "per-bucket: two buckets with distinct rows reconcile against the merged total",
+        "ok=%s merged=%d" % (ok_clean, merged_clean))
+    pin("PRODUCTION" in out_clean and "HARNESS" in out_clean and "SUM" in out_clean,
+        "per-bucket: the report names each bucket and the SUM that cross-checks them",
+        "out=%r" % out_clean)
+
+    ok_dup, merged_dup, out_dup = bucket_probe(dup=True)
+    pin(not ok_dup and merged_dup == 2,
+        "per-bucket: ONE anchor id filed in BOTH buckets is REFUSED -- it counts twice "
+        "per-file and once merged, and only this sum can see it",
+        "ok=%s merged=%d out=%r" % (ok_dup, merged_dup, out_dup))
+    pin("MISMATCH" in out_dup,
+        "per-bucket: the refusal SAYS mismatch rather than failing silently",
+        "out=%r" % out_dup)
+    extra_total += 4
+
     failed += extra_failed[0]
     print("self-test: %d case(s), %d failed" % (len(cases) + extra_total, failed))
     return 1 if failed else 0
@@ -2077,6 +2190,9 @@ def main():
                          "SKILL.md section F.2 sanctions.")
     ap.add_argument("--breakdown", action="store_true",
                     help="also print OPEN rows per plan file")
+    ap.add_argument("--per-bucket", action="store_true",
+                    help="also print the OPEN split across the registry's buckets "
+                         "(production / harness), reconciled against the registry total")
     ap.add_argument("--self-test", action="store_true",
                     help="check the instrument, not the registry")
     args = ap.parse_args()
@@ -2128,6 +2244,10 @@ def main():
             per[k.split("#", 1)[0]] = per.get(k.split("#", 1)[0], 0) + 1
         for f in sorted(per, key=lambda x: (-per[x], x)):
             print("  %-52s %d OPEN" % (f, per[f]))
+
+    bucket_split_ok = True
+    if args.per_bucket:
+        bucket_split_ok = per_bucket_report(root, len(a_reg))
 
     # == ARM 2: A ROW WHOSE OPENING VERDICT CONTRADICTS ITS OWN MARKER =========
     # star A DIFFERENTIAL, NOT A HAND-KEPT INVENTORY, and the reason is the one
@@ -2343,6 +2463,14 @@ def main():
                   "NON_GATE_LEAD_MARKS if it is emphasis or a verdict -- after reading "
                   "the row. Do not delete this check: an enumeration whose residual is "
                   "silent is how this instrument under-counted four times before.")
+        return 1
+
+    if not bucket_split_ok:
+        print()
+        print("anchor-balance: FAIL - the per-bucket split does not reconcile with the "
+              "registry total.")
+        print("  A row counted in two buckets, or a bucket this scan never read, makes "
+              "every per-bucket figure a guess. Fix the registry, never this sum.")
         return 1
 
     net_new = bal.net_new

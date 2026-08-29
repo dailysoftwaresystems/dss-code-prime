@@ -203,3 +203,25 @@ target_link_libraries(dss_asm_test_asm_bare_operand_width
     PRIVATE nlohmann_json::nlohmann_json)
 target_include_directories(dss_asm_test_asm_bare_operand_width
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME (the x86_64
+# half): the SSE/scalar-FP instruction rows that make the `x` constraint's
+# `fpr` register class nameable by a template. Before them the target declared
+# 103 opcodes, this dialect spelled 36, and ALL EIGHTEEN FP/SSE opcodes were
+# unspelled -- so `"x"` could be bound and never used.
+# The pins read the MANDATORY PREFIX, because that is the only byte separating
+# the `sd`/`ss` pair: one target opcode under two width-keyed guards, so a row
+# declared at the wrong width still assembles and still runs. Also pins the
+# ucomisd/ucomiss prefix ASYMMETRY (66 vs none, against the F2/F3 pattern every
+# arithmetic row follows) and the near-miss set that must REFUSE rather than
+# bind to a neighbouring opcode.
+# WARNING ITS RED-ON-DISABLE MUTANT IS CONFIG-LEVEL -- it removes a row from the
+# SHIPPED dialect document -- so it MUST run through ctest: dss_add_test sets
+# DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever tree
+# the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_x86_sse_dialect_rows
+             SOURCES test_asm_x86_sse_dialect_rows.cpp)
+target_link_libraries(dss_asm_test_asm_x86_sse_dialect_rows
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_x86_sse_dialect_rows
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)

@@ -1971,6 +1971,8 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
     auto mod = lowerMergedToAssembly(*merged, *grammar, **targetR,
                                      (*formatR)->dataModel(),
                                      effectiveBitFieldStrategy(**targetR, **formatR),
+                                     effectiveUnnamedBitFieldAlignment(**targetR,
+                                                                       **formatR),
                                      ccIndex,
                                      cuMirs[0].cuId,
                                      /*externCallDispatch=*/std::nullopt,

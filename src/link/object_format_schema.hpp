@@ -1232,6 +1232,32 @@ struct DSS_EXPORT ObjectFormatData {
     // arm64 does NOT diverge from generic AAPCS64 on bit-field packing).
     BitFieldStrategy     bitFieldStrategy = BitFieldStrategy::None;
 
+    // ── D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: unnamed-bit-field alignment ──
+    //
+    // OPTIONAL top-level `"unnamedBitFieldAlignment"` ("ignored" / "contributes";
+    // closed enum, loader fails loud on an unknown spelling AND on the reserved
+    // `none` — the bitFieldStrategy discipline).
+    //
+    // ★ IT SITS BESIDE `bitFieldStrategy` RATHER THAN INSIDE IT because it cuts
+    // ACROSS a strategy instead of selecting one: `elf64-x86_64-linux` and
+    // `elf64-aarch64-linux` are BOTH `gnu_packed`, same LSB-first packing, same
+    // straddle bump, and they answer THIS question differently (MEASURED,
+    // `{char c; unsigned :0; char d;}`: 5/1 vs 8/4). It is the same discrimination
+    // `bitFieldStrategy` itself exists to carry -- one CPU target serving two ABIs --
+    // one level finer, so it belongs on the same document for the same reason.
+    //
+    // ⚠ FORMAT-ONLY: unlike `bitFieldStrategy` there is NO target-side fallback
+    // field, so `None` means genuinely undeclared (the `longDoubleFormat` shape).
+    // A format that never lays out a C aggregate (wasm / spirv skeletons) may omit
+    // it; the consumer fails loud only when an unnamed bit-field is ACTUALLY laid
+    // out under `gnu_packed` with a `None` effective value -- never a silent guess,
+    // because either guess is a real ABI on some other platform.
+    // ⇒ elf64-aarch64-* → contributes; elf64-x86_64-*, macho64-* → ignored;
+    //   pe64-* → ignored (declared for completeness; `msvc_straddle` never reads
+    //   it -- the MSVC rule is a property of that strategy).
+    UnnamedBitFieldAlignment unnamedBitFieldAlignment =
+        UnnamedBitFieldAlignment::None;
+
     // ── FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the per-format `long double` axis ──
     //
     // OPTIONAL top-level `"longDoubleFormat"` ("f64" / "x87-80" / "ieee128";
@@ -1919,6 +1945,13 @@ public:
     // `AggregateLayoutParams` it threads into the layout engine.
     [[nodiscard]] BitFieldStrategy     bitFieldStrategy() const noexcept {
         return d_.bitFieldStrategy;
+    }
+    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: the format's declared
+    // unnamed-bit-field alignment rule, or `None` if it declared none. FORMAT-ONLY
+    // (no target-side fallback); read by the driver via
+    // `effectiveUnnamedBitFieldAlignment(target, format)`.
+    [[nodiscard]] UnnamedBitFieldAlignment unnamedBitFieldAlignment() const noexcept {
+        return d_.unnamedBitFieldAlignment;
     }
     // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the format's declared `long double`
     // axis, or `None` if it declared none (the semantic bind then leaves any
