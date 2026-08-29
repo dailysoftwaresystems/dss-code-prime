@@ -16,7 +16,7 @@
 # §0 — RESUME HERE (a session with no context reads this block first)
 
 **State, ✔measured at the tip and not re-quoted:** branch `feature/c23-conformance-burndown-5`,
-**PR #56 OPEN**, HEAD **`c6a936f0`** ("Cycle P44 set 2"). `git status --porcelain` → **0 paths**.
+**PR #56 OPEN**. ⚠ **NO SHA IS PINNED HERE ON PURPOSE** — a handoff cannot name its own commit, since writing it moves HEAD, and the public-repo bot rebases and squashes besides. **P44 landed as two commits, `Cycle P44` and `Cycle P44 set 2`, followed by the commit that wrote this section**; re-derive with `git log --oneline -4`. `git status --porcelain` → **0 paths**.
 `git worktree list` → **the repo only** (every P44 lane worktree folded and removed). Cycle P44
 is **committed and pushed**; it is NOT mid-flight. Four legs green at that tree — Windows
 **1793/1793** (all 20 repo guards), WSL x86_64 / arm64-VPS / macOS **1773/1773** each
