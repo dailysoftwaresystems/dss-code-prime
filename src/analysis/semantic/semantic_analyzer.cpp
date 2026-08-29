@@ -4472,6 +4472,13 @@ struct AttributeSemanticsFacts {
     bool        noInline    = false;   // noInline row matched (TF-C78)
     bool        alwaysInline = false;  // alwaysInline row matched (TF-C81)
     bool        noSanitizeThread = false;  // noSanitizeThread row matched (TF-C92)
+    // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the
+    // runBeforeEntry / runAfterEntry rows' folded schedule. Two channels, each
+    // with its own priority, because one function may occupy BOTH (MEASURED —
+    // see `StaticInitSchedule`). Folded across every clause of every attribute
+    // node on the declaration by `mergeFrom`, so `((constructor(101),
+    // destructor(102)))` and the two-clause spelling reach the same state.
+    StaticInitSchedule staticInit{};
     // TF-C73 (GNU `aligned(N)`): the Align row's requested alignment, MAX-folded
     // over every clause per C 6.7.5p6 ("the strictest — the largest — wins"),
     // exactly as `resolveAlignasOverride` folds several `alignas` specifiers.
@@ -5153,6 +5160,90 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 // draft of THIS comment cited by name and which never existed.
                 out.noSanitizeThread = true;
                 break;
+            // ★★ D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN —
+            // THE STATIC-INITIALIZER PAIR, and the FIRST declaration-attached
+            // verbs here that read an ARGUMENT. The two arms are one call because
+            // the only thing that differs is WHICH CHANNEL the declaration joins;
+            // writing them as two blocks is how the priority ladder would come to
+            // exist twice and then disagree.
+            //
+            // ★ THE ARGUMENT IS OPTIONAL AND ITS ABSENCE IS NOT AN ERROR — the
+            // bare `__attribute__((constructor))` is the common spelling and the
+            // one sqlite-shaped code writes. Absent ⇒ `kUnprioritizedStaticInit`,
+            // which sorts LAST among constructors (✔MEASURED unanimous across
+            // gcc 13.3.0 / clang 18.1.3 / mingw-w64 gcc 13.2.0: `c101 c102
+            // cBARE`). This is the opposite of the `Align` arm above, where a
+            // bare `aligned` FAILS LOUD — and the difference is real rather than
+            // stylistic: a bare `aligned` has a target-dependent MEANING this
+            // engine refuses to invent, while a bare `constructor` has one exact
+            // meaning all three references agree on.
+            //
+            // ★ A PRESENT ARGUMENT GOES THROUGH THE SHARED `constIntExpr`, the
+            // same integer-constant folder `foldAlignmentOperand` uses, so
+            // `constructor(50+51)` and a `#define`d priority both work and a
+            // non-constant fails loud rather than silently defaulting to
+            // unprioritized — which would move the initializer to the END of the
+            // schedule, the single most damaging silent answer available here.
+            case AttributeEffect::RunBeforeEntry:
+            case AttributeEffect::RunAfterEntry: {
+                auto const phase = row->effect == AttributeEffect::RunBeforeEntry
+                                       ? StaticInitPhase::BeforeEntry
+                                       : StaticInitPhase::AfterEntry;
+                std::uint32_t prio = kUnprioritizedStaticInit;
+                if (NodeId const operand = attrClauseArgOperand(cfg, tree, clauseNode);
+                    operand.valid()) {
+                    auto const folded =
+                        constIntExpr(s, tree, operand, fromScope, &cfg);
+                    if (!folded.has_value()) {
+                        if (emitUnknown) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_AlignasNonConstant;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(clauseNode);
+                            d.actual   = std::format(
+                                "attribute '{}' takes an integer constant "
+                                "priority; this argument is not a constant "
+                                "expression, and guessing one would place the "
+                                "initializer at an arbitrary point in the "
+                                "schedule",
+                                clause->name);
+                            s.reporter.report(std::move(d));
+                        }
+                        break;
+                    }
+                    // ⚠ THE RANGE IS CHECKED, AND THE REASON IS THE SENTINEL. A
+                    // NEGATIVE priority cannot be represented, and the MAXIMUM
+                    // value IS the "unprioritized" sentinel — accepting it
+                    // verbatim would silently turn `constructor(4294967295)` into
+                    // the bare form, which is a different position in the
+                    // schedule. Refuse both rather than encode a lie.
+                    if (*folded < 0
+                        || static_cast<std::uint64_t>(*folded)
+                               >= kUnprioritizedStaticInit) {
+                        if (emitUnknown) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_AlignasExceedsMax;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(clauseNode);
+                            d.actual   = std::format(
+                                "attribute '{}' priority {} is out of range — a "
+                                "priority is a non-negative integer below {}, "
+                                "whose value denotes the UNPRIORITIZED form and "
+                                "so cannot also name a priority",
+                                clause->name, *folded, kUnprioritizedStaticInit);
+                            s.reporter.report(std::move(d));
+                        }
+                        break;
+                    }
+                    prio = static_cast<std::uint32_t>(*folded);
+                }
+                StaticInitSchedule one{};
+                one.setPriorityFor(phase, prio);
+                out.staticInit.mergeFrom(one);
+                break;
+            }
             case AttributeEffect::None:
                 break;   // known vocabulary, consumed elsewhere / inert
         }
@@ -9511,6 +9602,23 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // therefore INERT rather than recorded on a data object.
                         if (isFnSig && attrFacts.noSanitizeThread)
                             s.symbols.at(sym).isNoSanitizeThread = true;
+                        // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN:
+                        // the fourth attribute-borne per-function fact, same FnSig
+                        // gate and the same reason as its three neighbours — this
+                        // one reaches CODEGEN harder than any of them (it puts the
+                        // symbol's ADDRESS in an emitted table and a CALL in the
+                        // synthesized entry), so a symbol whose kind could never
+                        // honor it must not carry it. `__attribute__((constructor))
+                        // int x;` is therefore inert HERE and diagnosed by the
+                        // shared decl-kind gate above, which reads the row's
+                        // `appliesTo: ["function"]` — the engine names nothing.
+                        //
+                        // MERGED, not assigned: a prototype and its definition are
+                        // two declarations of one symbol and the schedule must
+                        // survive the join (see `SymbolRecord::staticInit`).
+                        if (isFnSig && attrFacts.staticInit.any())
+                            s.symbols.at(sym).staticInit.mergeFrom(
+                                attrFacts.staticInit);
                         // ★★ TF-C85: the `#pragma optimize("", off)` region flag.
                         // Same FnSig gate and the same reason (it feeds a CODEGEN
                         // decision), but its SOURCE is different in kind from the
@@ -16994,6 +17102,26 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                               || s.symbols.at(absorbed).isNoSanitizeThread;
                 s.symbols.at(survivor).isNoSanitizeThread = nst;
                 s.symbols.at(absorbed).isNoSanitizeThread = nst;
+            }
+            // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the
+            // same join for the static-initializer schedule, in the same
+            // pre-type-gate position and for the identical reason — HIR→MIR
+            // stamps from the DEFINITION's symbol, so `constructor` spelled only
+            // on the prototype (the ordinary header/impl split) would otherwise
+            // lower to a MirFunc with no schedule and the initializer would never
+            // run: the exact defect this row exists to close, re-created between
+            // two declarations of one function.
+            //
+            // ★ MERGE, NOT OR, AND THAT IS THE WHOLE DIFFERENCE FROM ITS THREE
+            // NEIGHBOURS. Those axes are BITS, so OR is the join; this one carries
+            // a PRIORITY, and `mergeFrom` takes the earliest per channel. An OR of
+            // "has a schedule" would keep the fact and lose the position, which
+            // reads as working right up until the order matters.
+            {
+                StaticInitSchedule joined = s.symbols.at(survivor).staticInit;
+                joined.mergeFrom(s.symbols.at(absorbed).staticInit);
+                s.symbols.at(survivor).staticInit = joined;
+                s.symbols.at(absorbed).staticInit = joined;
             }
             // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4p7): the
             // inline-definition reading merges with **AND**, not OR — the one

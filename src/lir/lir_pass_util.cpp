@@ -243,6 +243,15 @@ copyModuleSideStructures(Lir const& src, LirBuilder& dst) {
     for (std::uint32_t i = 0; i < constraints.size(); ++i) {
         (void)dst.regConstraintPoolAdd(constraints.at(i));
     }
+    // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the THIRD side
+    // structure, carried HERE for the same reason as the two above — this helper
+    // is the one call every LIR rebuild pass already makes, so the schedule
+    // crosses all five of them with no per-pass edit and no fifth chance to
+    // forget. Keyed by SymbolId, so unlike the pools there is no index identity
+    // to preserve and the order is free.
+    for (auto const& e : src.staticInitSchedule()) {
+        dst.staticInitAdd(e.symbol, e.schedule);
+    }
 }
 
 void

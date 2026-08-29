@@ -257,7 +257,12 @@ public:
         MirFuncId const newF = dst_.addFunction(
             sig, mergedSymbol, src_.funcBinding(f), src_.funcVisibility(f),
             src_.funcNoInline(f), src_.funcAlwaysInline(f),
-            src_.funcNoOptimize(f), src_.funcNoSanitizeThread(f));
+            src_.funcNoOptimize(f), src_.funcNoSanitizeThread(f),
+            // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN:
+            // the schedule must cross the CU boundary or a constructor defined
+            // in one translation unit stops running the moment a second unit
+            // joins the link — the sharpest form of the drop this axis fears.
+            src_.funcStaticInit(f));
         plan_.funcMerged.emplace(CuSymKey{cuIdx_, src_.funcSymbol(f).v}, newF);
 
         std::uint32_t const nb = src_.funcBlockCount(f);

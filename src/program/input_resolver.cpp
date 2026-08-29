@@ -1,5 +1,6 @@
 #include "program/input_resolver.hpp"
 
+#include "core/substrate/path_identity.hpp"  // genericSpelling
 #include "core/types/parse_diagnostic.hpp"
 
 #include <algorithm>
@@ -43,7 +44,7 @@ bool InputResolver::resolveDirectory(
     std::error_code ec;
     if (!fs::exists(directoryPath, ec) || !fs::is_directory(directoryPath, ec)) {
         emit(reporter, DiagnosticCode::D_FileNotFound,
-             "InputResolver: '" + directoryPath.generic_string()
+             "InputResolver: '" + core::genericSpelling(directoryPath)
              + "' does not exist or is not a directory.");
         return false;
     }
@@ -61,13 +62,16 @@ bool InputResolver::resolveDirectory(
                 emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
                      "InputResolver: directory-scan interrupted after "
                      "partial enumeration of '"
-                     + directoryPath.generic_string() + "': "
+                     + core::genericSpelling(directoryPath) + "': "
                      + ec.message());
                 return false;
             }
             if (!iter->is_regular_file()) continue;
             if (extensionMatches(iter->path(), fileExtensions)) {
-                matched.push_back(iter->path().generic_string());
+                // Not a message — the INPUT LIST the compiler goes on to open.
+                // `iter` walks `directoryPath`, so every entry inherits that
+                // path's root, authority included.
+                matched.push_back(core::genericSpelling(iter->path()));
             }
         }
         return true;
@@ -79,7 +83,7 @@ bool InputResolver::resolveDirectory(
         if (ec) {
             emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
                  "InputResolver: failed to open directory '"
-                 + directoryPath.generic_string() + "': " + ec.message());
+                 + core::genericSpelling(directoryPath) + "': " + ec.message());
             return false;
         }
         scanOk = captureMatches(it);
@@ -88,7 +92,7 @@ bool InputResolver::resolveDirectory(
         if (ec) {
             emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
                  "InputResolver: failed to open directory '"
-                 + directoryPath.generic_string() + "': " + ec.message());
+                 + core::genericSpelling(directoryPath) + "': " + ec.message());
             return false;
         }
         scanOk = captureMatches(it);
@@ -98,7 +102,7 @@ bool InputResolver::resolveDirectory(
     if (matched.empty()) {
         emit(reporter, DiagnosticCode::D_EmptyInput,
              "InputResolver: no files in '"
-             + directoryPath.generic_string()
+             + core::genericSpelling(directoryPath)
              + "' match the configured extensions.");
         return false;
     }

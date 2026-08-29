@@ -1096,8 +1096,9 @@ TEST(TextTierVocabulary, MirFunctionAttributeRefusalProjectsBindingAndVisibility
     ASSERT_FALSE(msg.empty()) << "an unknown function attribute must be refused.";
     auto advertised = quotedTokens(msg);
     std::erase(advertised, std::string{kBadSpelling});
-    // 3 bindings + 4 visibilities + the 4 text-format keywords this file owns.
-    EXPECT_EQ(advertised.size(), 11u)
+    // 3 bindings + 4 visibilities + the 6 text-format keywords this file owns
+    // (P44 lane h joined `initbefore` / `initafter`).
+    EXPECT_EQ(advertised.size(), 13u)
         << "the advertised function-attribute set changed size — a SHRINK means "
            "an attribute the reader takes stopped being advertised.\nmessage:\n  "
         << msg;

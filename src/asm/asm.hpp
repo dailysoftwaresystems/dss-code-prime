@@ -522,6 +522,26 @@ struct DSS_EXPORT AssembledModule {
     // `dataItems` populate) is anchored as a follow-up cycle.
     std::vector<AssembledData>     dataItems;
 
+    // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ──
+    //
+    // The module's STATIC-INITIALIZER SCHEDULE, copied verbatim from
+    // `Lir::staticInitSchedule()` by `assemble`. Each entry names a DEFINED
+    // function in this module and the priority at which it joins each channel.
+    //
+    // ★★ IT ARRIVES HERE THROUGH `assemble` RATHER THAN FROM THE COMPILE
+    // PIPELINE, AND THAT IS LOAD-BEARING. `symbols` and `dataItems` are filled by
+    // the caller in `src/program/`; this is not, because the linker is what turns
+    // the schedule into bytes and calls, and routing one more fact through a
+    // second owner is how `dataItems` acquired the two-caller asymmetry that file
+    // documents as a past bug source. Everything the linker needs is already in
+    // the `Lir` the assembler was handed.
+    //
+    // ★ THE LINKER OWNS THE ORDER, NOT THIS VECTOR. Entries are in whatever order
+    // the lowerer emitted them; sorting is a WHOLE-PROGRAM question (priority
+    // first, then a deterministic tie-break across every module), so it happens
+    // once, in the one place that can see every translation unit.
+    std::vector<LirStaticInitEntry> staticInitSchedule;
+
     // D-LK10-ENTRY Slice C (plan 14 §2.13): override of the image
     // entry-point function index. When set, the format walker
     // (PE/ELF/Mach-O) uses `functions[*imageEntryOverride]` as the

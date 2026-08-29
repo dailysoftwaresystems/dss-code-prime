@@ -1,5 +1,6 @@
 #include "ffi/binary_reader.hpp"
 
+#include "core/substrate/path_identity.hpp"  // genericSpelling
 #include "ffi/binary_readers/ar_reader.hpp"
 #include "ffi/binary_readers/elf_reader.hpp"
 #include "ffi/binary_readers/macho_reader.hpp"
@@ -154,7 +155,7 @@ readImports(std::filesystem::path const& libraryPath,
         return std::unexpected(emitAndReturn(
             BinaryReadErrorKind::FileOpenFailed,
             "readImports: failed to open '"
-            + libraryPath.generic_string() + "' for reading",
+            + core::genericSpelling(libraryPath) + "' for reading",
             reporter));
     }
     std::vector<std::uint8_t> bytes{
@@ -162,7 +163,7 @@ readImports(std::filesystem::path const& libraryPath,
         std::istreambuf_iterator<char>()};
     return readImportsFromBytes(
         std::span<std::uint8_t const>{bytes.data(), bytes.size()},
-        libraryPath.generic_string(), reporter);
+        core::genericSpelling(libraryPath), reporter);
 }
 
 } // namespace dss::ffi

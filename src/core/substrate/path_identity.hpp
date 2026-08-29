@@ -74,6 +74,33 @@ namespace dss::core {
 [[nodiscard]] DSS_EXPORT std::string
 genericSpelling(std::filesystem::path const& p);
 
+// The same spelling as UTF-8, for the one caller that cannot use the narrow
+// form: a diagnostic that must NAME a file whose characters the active code
+// page cannot represent.
+//
+// ★★★ WHY THIS IS OWED SEPARATELY RATHER THAN LEFT AS `generic_u8string()`.
+// The two losses are INDEPENDENT and each has already been measured, so a
+// caller can only avoid both by having a transform that avoids both.
+// `generic_string()` throws on a name the code page cannot encode
+// ([[D-PP-HEADER-CASE-NON-ASCII-NAME-NARROWING-THROW]]), and `u8` was the
+// repair; but `generic_u8string()` performs the SAME generic-format conversion
+// and so eats the leading separator run exactly as its narrow sibling does.
+// ✔MEASURED 2026-08-28 on a REACHABLE UNC directory (`exists()` true), one path
+// object, both renderings printed side by side:
+//     .string()          '//localhost/C$/Source/DailySoftware'   run 2
+//     .generic_string()  '/localhost/C$/Source/DailySoftware'    run 1
+//     .generic_u8string()'/localhost/C$/Source/DailySoftware'    run 1
+// A header-collision report that renames the machine is the same lie as one
+// that cannot spell the filename; escaping one and not the other would have
+// left the report wrong in the case it was rewritten for.
+//
+// ⚠ THROWS EXACTLY WHERE `u8string()` DOES, WHICH IS THE POINT. A native name
+// can be text no encoding accepts (NTFS permits lone surrogates) and the caller
+// owns a code-unit-by-code-unit fallback for it; swallowing the throw here
+// would take that fallback away and hand back a name that is not the file's.
+[[nodiscard]] DSS_EXPORT std::u8string
+genericSpellingU8(std::filesystem::path const& p);
+
 // `fs::absolute` WITHOUT letting it invent a drive for a path that already names
 // an AUTHORITY. Same invariant as `genericSpelling` above and as this file's
 // private `normalizeKeepingRoot`: never change the leading separator RUN.

@@ -163,6 +163,12 @@ dss_add_test(NAME link/test_link_writer_exclusive_claim
 # (first DSS-produced binary the OS actually runs).
 dss_add_test(NAME link/test_lk10_entry_slice_c   SOURCES test_lk10_entry_slice_c.cpp)
 
+# D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the link tier's
+# half of the static-initializer feature -- the whole-program ORDER, the
+# per-format RUNNER axis (including the `imageLoader` arm no shipped document
+# selects, which nothing else exercises), and the shipped-document sweep.
+dss_add_test(NAME link/test_static_init_schedule SOURCES test_static_init_schedule.cpp)
+
 # c163 (D-LK-STATIC-ARCHIVE-WRITER, writer half of D-FF1-AR-WRITER-STATIC-LINK)
 # — the GNU/System V `ar` static-archive WRITER: byte-exact framing + armap
 # pins, round-trip through the shipped c161 reader (the inverse-pair oracle),

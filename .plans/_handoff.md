@@ -9,7 +9,13 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-28 — cycles **P14 … P43**.
+**Last updated:** 2026-08-28 — cycles **P14 … P44**.
+
+★★★ **P44: TWENTY-ONE ANCHORS CLOSED ACROSS NINE LANES, THE GATE CAN SEE NINETEEN OF THEM, AND NOTHING THIS CYCLE OPENED IS STILL OPEN.** ✔MEASURED `check-anchor-balance --base b1684e7f` ⇒ **closed 19, opened 0, net −19**; registry **556 → 537** (**production 349 OPEN / harness 188**, and the sum is the cross-check). Both anchor gates run, plus `stale-refusal-citations`, `wrapped-anchor-ids`, `plan-citations`, `path-identity` and `retyped-closed-sets`, all rc=0. ⚠⚠ **THE GATE CANNOT SEE TWO OF THE TWENTY-ONE, AND THE REPORT OWES BOTH FIGURES**: it counts ROWS BY NAME across base and tip, so a row MINTED and closed inside the cycle (lane `a` → lane `h`) and a row written BORN CLOSED (lane `i`) are invisible — ✔measured from both bases, `b1684e7f` reads closed 19 and `6c6d6077` reads closed 1, and 19+1≠21. That blindness is RIGHT for *"did this cycle leave more open than it found?"* and WRONG for *"what did it fix?"*; **never soften the instrument, report both numbers.**
+
+★★★ **P44's HEADLINE: TWO LANES SHIPPED TWO CORRECT HALVES, BOTH CORRECTLY DECLINED TO CLOSE THE ROW, AND THE COMPOSED BINARY WAS STILL 0/30.** The cause was one tier below either lane: bare `fs::absolute` re-roots a path that already names an AUTHORITY (`//host/share`) onto the local drive. ★ **A lane that ships a correct half and declines to close is the process working**; the orchestrator owes the composition measurement, and nobody's green was wrong.
+
+★★ **AND THE SECOND-BIGGEST FINDING WAS A BRIEF OF MINE BEING REFUTED.** Lane `h` was told to emit `.init_array` / `__mod_init_func` / `.CRT$XCU`; it measured `readelf -d` on a DSS artifact instead — **no `DT_INIT_ARRAY`, no `DT_INIT`** — and observed that ld.so walks the TAG, not the section, while PE never links the UCRT startup. **DSS links no crt: the synthesized `_start` IS the runtime**, so such a section would be bytes nothing reads. Four lanes measured one of my premises this cycle and **three refuted it**. A brief's premise is a HYPOTHESIS carrying its author's confidence and not their measurement.
 
 ★★★ **P43: THE TWO RED CI LEGS WERE TWO DIFFERENT WAYS OF NOT BEING ABLE TO SEE A DEFECT LOCALLY, AND BOTH ARE NOW STATIC OR DETERMINISTIC.** ✔MEASURED `check-anchor-balance --base 73f74972`: **closed 0, opened 0, net +0**, registry+plans **879 → 879** — the correct reading for a cycle whose five rows are ALL **BORN CLOSED**, since a row that did not exist at base cannot be counted as newly closed. **Three production fixes and two harness fixes.** ⚠ **Only TWO of the five were the reported CI failures.** Repairing the Windows BUILD break ran the MSVC suite for the first time since P34 and uncovered two production defects underneath it — one a symlink escape in the staging-temp claim; a third was faced while taking the gate itself and fixed in the lane that hit it, per *"harness we fix as we need when we face the problem (NEVER LATER)"*. ★ **A build break does not just stop a build: it hides every test behind it, and the longer it stands the more it hides.**
 
@@ -721,21 +727,34 @@ second pattern beside the one P23 built and pinned.**
 
 ---
 
-## 0.00000000000000000000000000000000000000000 ★★★ CYCLE P44 — SEVEN LANES CLOSED NINETEEN ROWS, AND THE ONE THAT MATTERED MOST WAS FOUND BY MEASURING THE COMPOSITION OF TWO GREEN LANES
+## 0.00000000000000000000000000000000000000000 ★★★ CYCLE P44 — NINE LANES CLOSED TWENTY-ONE ANCHORS, THE GATE CAN ONLY SEE NINETEEN OF THEM, AND THE ONE THAT MATTERED MOST WAS FOUND BY MEASURING THE COMPOSITION OF TWO GREEN LANES
 
 **Balance at this commit, re-measured rather than re-quoted:**
 `python scripts/check-anchor-balance/check-anchor-balance.py --base b1684e7f` ⇒
-**closed 19, opened 1, net −18**; registry **556 → 538**. Per bucket via the gate's own
-`scan_document`: **production 350 OPEN / harness 188 OPEN / sum 538**, which equals the gate's
+**closed 19, opened 0, net −19**; registry **556 → 537**. Per bucket via the gate's own
+`scan_document`: **production 349 OPEN / harness 188 OPEN / sum 537**, which equals the gate's
 registry figure — that sum is the cross-check, and it is the only thing that catches a
 mis-bucketed or double-counted row.
+
+⚠⚠ **AND THE GATE CANNOT SEE TWO OF THE TWENTY-ONE ANCHORS THIS CYCLE CLOSED, WHICH IS
+WHY THE HEADLINE SAYS BOTH NUMBERS.** `check-anchor-balance` counts ROWS BY NAME across the base
+and the tip, so a row that did not exist at `b1684e7f` cannot be counted as newly closed no matter
+what it records. Two rows are in exactly that position: lane `a` MINTED
+`D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN` mid-cycle and lane `h` closed it,
+and lane `i` wrote `D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS` BORN CLOSED.
+✔MEASURED both ways: against `b1684e7f` the gate reads **closed 19, opened 0**; against the
+cycle's own first commit `6c6d6077` it reads **closed 1, opened 0**, and 19 + 1 ≠ 21 because
+the born-closed row is invisible from BOTH bases. ★ The blindness is the RIGHT behaviour for
+the question the gate is asked (*"did this cycle leave more open than it found?"*) and the WRONG
+number for *"what did this cycle fix?"* — so a cycle report owes both, and a lane whose whole
+output is a born-closed row reads as **zero** in the only figure the ruling watches.
 `scripts/check-anchor-registry/check-anchor-registry.sh` ⇒ **rc=0**, 0 cell-width violations,
 15 self-test arms proving the guard can fail. **Both gates were run**: a green balance is not
 evidence that nothing was opened.
 
-The single OPEN row is `D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN`, minted by
-lane `a` when closing a refusal exposed what the refusal had been hiding. It is **in flight as lane
-`h` at this commit**, not deferred.
+`D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN` — minted by lane `a` when
+closing a refusal exposed what the refusal had been hiding — **is CLOSED at this commit by lane
+`h`**, in the cycle that opened it. Nothing this cycle opened is still open.
 
 ### ★★★ THE HEADLINE: TWO LANES SHIPPED TWO CORRECT HALVES, BOTH CORRECTLY DECLINED TO CLOSE THE ROW, AND THE COMPOSED BINARY WAS STILL BROKEN
 
@@ -806,12 +825,17 @@ independently load-bearing.
 
 | leg | result |
 |---|---|
-| Windows (root host) | **1790/1790**, all 20 repo guards |
-| WSL x86_64 | **1770/1770**, `run-gate` OK on a tool-emitted witness, **+ emulator witness: arm64 artifacts were spawned and RAN** |
-| arm64 VPS (native) | **1770/1770**, `run-gate` OK |
-| macOS (native arm64) | **1770/1770**, `run-gate` OK |
+| Windows (root host) | **1793/1793**, all 20 repo guards — and the 20 were **re-run alone after the last `.plans/` edit**, since the full pass predated it |
+| WSL x86_64 | **1773/1773**, `run-gate` OK on a tool-emitted witness, **+ emulator witness: arm64 artifacts were spawned and RAN** |
+| arm64 VPS (native) | **1773/1773**, `run-gate` OK |
+| macOS (native arm64) | **1773/1773**, `run-gate` OK |
 
-**1770 = 1790 − the 20 root-host-only repo guards, on every leg, no residual.** ⓘ The macOS leg ran
+**1773 = 1793 − the 20 root-host-only repo guards, on every leg, no residual.** The count rose
+1790 → 1793 with lane `h`'s three new tests. ★ **The macOS leg is the one that tests lane
+`h`'s least-certain claim** — that Mach-O runs its static initializers through the same
+`entryTrampoline` as every other exec flavor rather than needing a loader-recognized section —
+because `examples/c/gnu_constructor_attribute_runs` declares a `macho64-arm64-darwin-exec` target
+with `runOn: ["darwin"]`. It is not a formality on that leg. ⓘ The macOS leg ran
 ~27 min of `ctest` against the other legs' ~13; that was **probed live** (`ctest` at 27:08 elapsed
 with a freshly-spawned `dsscp` child, load 2.33) rather than assumed to be a hang — a silent leg is a
 question, not a verdict.
@@ -820,6 +844,82 @@ Residue scan on the composed tree: **42 marker candidates across 146 changed fil
 every hit under `src/` is a comment or a fixture (the preprocessor discussing `#if 0`, English
 "mutate the top", and one `MUTANT` token inside a `$comment` field where a lane recorded its own
 red-on-disable measurement).
+
+### ★★★ LANE `h`: THE ATTRIBUTE RUNS — AND THE BRIEF'S SECOND HALF WAS REFUTED BY READING THE EMITTED IMAGE
+
+`__attribute__((constructor))` / `((destructor))` are honoured end to end. ✔MEASURED: the row's
+own program exits **42** (it exited **0**, with a warning naming the attribute it had dropped) on
+`pe64-x86_64-windows-exec` natively, `elf64-x86_64-linux-exec` under WSL and
+`elf64-aarch64-linux-exec` under `qemu-aarch64`, at `--config=debug` AND `--config=release`. A
+six-initializer probe gives `c101 c102 cBARE | MAIN | dBARE d102 d101` on every leg and both
+configs — byte-identical to gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0, each probed
+SEPARATELY.
+
+★★ **THE BRIEF SAID TO EMIT `.init_array` / `__mod_init_func` / `.CRT$XCU`. THE LANE
+REFUTED THAT BY MEASUREMENT RATHER THAN SKIPPING IT.** ✔`readelf -d` on a DSS
+`elf64-x86_64-linux-exec` artifact shows an eleven-entry dynamic section with **no `DT_INIT_ARRAY`
+and no `DT_INIT`** — and ld.so walks the TAG, never the section; PE never links the UCRT
+startup object, so `_initterm` never runs. Those sections are how a program tells a **C runtime**
+what to run before main, and **DSS links no crt: `injectEntryTrampoline` synthesises `_start`, and
+that entry IS the runtime.** On every image DSS produces and starts, such a section would be bytes
+nothing reads. What shipped instead is the axis that is real and per-format:
+`staticInitializers.runner`, declared beside `processExit` / `processArgs` / `entryVerbs` —
+every exec flavor says `entryTrampoline`; a shared library, a relocatable object and a static
+library declare NOTHING, so the linker REFUSES such a program **by name** rather than building one
+whose initializers never run.
+⚠ **This contradicts the brief I wrote, including its claim about Mach-O**, which I had said
+would need `imageLoader`; it uses `entryTrampoline` like the others. **THREE OF THE FOUR LANES THAT
+MEASURED A PREMISE OF MINE THIS CYCLE REFUTED IT** (`e` on the config tier, `d` withdrawing its own
+residual, `h` here). A brief's premise is a HYPOTHESIS carrying its author's measurement and no
+more; relaying one inherits that, and this one was wrong the day it was written rather than decayed.
+
+★★ **TWO REAL BUGS, BOTH FOUND BY REVIEW AND NEITHER BY A TEST.** (1) DCE deleted every
+`static` constructor at `--config=release` — invisible in debug, whose pipeline is `Identity`,
+which is why the corpus example's release arm is load-bearing and not a formality. (2) The
+before-entry calls **clobbered the caller-saved argument registers**, so `main(int argc, char
+**argv)` received garbage: argc/argv are materialised into the convention's ARGUMENT registers
+before the ABI prologue, and a `call` inserted between that and `call main` destroys them.
+
+⚠⚠ **AND THE WITNESS FOR THAT SECOND FIX WAS VACUOUS THREE TIMES, EVERY ONE CAUGHT BY
+RUNNING THE MUTANT RATHER THAN BY READING THE PIN.** (i) the example's constructors were pure
+arithmetic and never touched an argument register, so argc survived the missing park by accident;
+(ii) on Windows only the `pe64` arm runs, and PE fetches argv through **CRT accessor calls**, so the
+park is INERT on the one leg observing it; (iii) the structural pin's bound `> 10` was cleared by the
+mutant at 19, because deleting the RESTORE half leaves the SAVE half. Calibrated bound is now
+`>= 25`, and the end-to-end statement is made on the leg that can make it: the example built for
+`elf64-x86_64-linux-exec` exits 42 clean, **9** under the mutant (its own `argc != 1` code, firing by
+name) and 42 on restore. **Six mutants, all REMOVE-direction, control green in every arm, object md5
+moved AND returned on all five code arms.**
+
+⚠ **THE MUTATION HARNESS ITSELF HAD THE ONE DEFECT SUCH A HARNESS MUST NEVER HAVE**, and it is
+recorded because it is the INSTRUMENT: its first version restored by searching for the REPLACEMENT
+text and asserting exactly one occurrence — the wrong question for a DELETION, since one arm's
+replacement was the EMPTY STRING and counting an empty string over a file returns its LENGTH. The
+guard tripped at 24512, the restore was SKIPPED, and `dce.cpp` was left MUTATED in the tree. Restore
+is now a full-content snapshot with an md5 check on the way back, and the tree was verified clean.
+
+### ★★ LANE `i`: THE PATH-SPELLING AUDIT — AND THREE OF THE WORST SITES WERE NOT THE FUNCTION THE ROW NAMED
+
+The census that opened the row handed over 15 files; the audit found the class in **four more**, and
+three of the worst instances were not `generic_string()` at all. **Eight sites were judged PROVABLY
+SAFE and left untouched, each with its reason** (`lexically_relative()` results — ✔measured
+leading-separator run **0** — plus `filename()` and `extension()`, none of which can carry a
+root), and the rest converted. ★ The row named **three sites in two files the lane did not own**
+and marked them OWNED AND PENDING rather than filing a follow-up; they were discharged in this
+commit's pre-commit gate once lane `h` freed the files. `src/link/writer.cpp`'s `pathForDiag` was the
+sharpest: **its two arms disagreed about which file they name** — the `try` arm's
+`generic_string()` collapsed a UNC path's leading separator run to one (naming a path on the local
+drive root), while the `catch` arm's `u8string()` kept the run and also kept native separators. One
+path object, two spellings, and which one a user saw depended on whether narrowing happened to throw
+for an unrelated reason. Both arms now go through the run-preserving transforms and differ in
+ENCODING only, which is the one axis that fallback exists for.
+
+✔**THE LIST IS EXHAUSTED RATHER THAN SHORTENED**, measured after the gate: **zero** bare
+`fs::absolute` and **zero** `generic_string()` / `generic_u8string()` on a path that can carry a root
+anywhere in `src/`. Of the fourteen remaining mentions, five are comments citing the rule, eight are
+the sites this row judged safe, and one is `src/lsp/workspace_project.cpp` — a PRIOR sighting of
+the same defect, handled locally and correctly: it detects the authority from `root_name()` precisely
+BECAUSE the generic rendering had already eaten the run.
 
 ### THE OTHER LANES
 
@@ -848,11 +948,72 @@ red-on-disable measurement).
   a guess"* was true when written, and `core::PathIdentity` landed 2026-08-18 precisely so that every
   spelling of one file reduces to one key — the machinery an include-once set needs **had already been
   built, by someone else, for another reason**.
-- **The wider path-spelling audit is lane `i`'s and is IN FLIGHT at this commit**: `generic_string()`
-  appears in ~20 further `src/` files and `lexically_normal()` in ~6. This cycle fixed only the sites
-  on the two paths it measured.
-- **sqlite `veryquick` / `speedtest1` not re-run.** It would have contended with live lane builds and
-  measured a tree that will change when `h` and `i` land.
+  ★★★ **THE OPERATOR RULED ON IT 2026-08-28 AND THE RULING BOUNDS THE BAR ITSELF.**
+  ✔MEASURED across all three references separately, one self-contained program per question:
+  gcc, clang and MSVC all dedup `./h.h`, `sub/../h.h`, a symlink and a hard link — but on **two
+  different files with byte-identical contents**, gcc DEDUPS (content-keyed) while clang and MSVC do
+  NOT (identity-keyed). A mechanical reading of the disjunction picks gcc. **The operator chose
+  IDENTITY-KEYED**: `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` decides whether a construct is
+  ACCEPTED, and does **not** automatically decide what a program MEANS when the references disagree
+  about the meaning. Content-keying does not merely accept more — it **silently omits text** when
+  a macro is redefined between two `#include`s of byte-identical headers, which is the class the bar
+  most abhors. DSS will deliberately refuse a program gcc compiles, with the cost recorded in the row
+  so a later cycle does not "discover" the divergence and fix it back. **Dispatchable now: lanes `h`
+  and `i` have landed and the file-set contention is gone.**
+- **The wider path-spelling audit LANDED as lane `i`** — see its subsection above. ✔Zero
+  residue in `src/` afterwards, measured rather than asserted.
+- **sqlite `veryquick` / `speedtest1` not re-run.** Deferred to the cycle's closing gate rather than
+  spent per commit: it costs hours and measures a tree that still changes with every landing set.
+  ⚠ **This is the STANDING PR EXIT REGIME and PR #56 inherits it undischarged**: units + sqlite
+  `veryquick` + `speedtest1` on FOUR legs, then the README — which still says *"THREE hosts"*
+  and has **no arm64-VPS table**.
+
+### ★★★ START HERE — the state at THIS COMMIT (the tip of `feature/c23-conformance-burndown-5`, PR #56), for a session with no context
+
+**Worktrees:** none. Lanes `a`, `b`, `d`, `h`, `i` were removed after folding; `git worktree list`
+should show only the repo itself. **PR #56 is open** on
+`feature/c23-conformance-burndown-5`; both P44 commits are pushed.
+
+**The next lane set, from `scripts/burndown-queue/burndown-queue.py` — four disjoint tiers so
+they cannot contend.** ⚠ Re-derive every status from the registry before acting: a row's
+status lives in its status cell, and this list will be stale the moment something lands.
+
+1. ★★★ **`D-PP-PRAGMA-RECOGNIZED-SEMANTICS`** (preprocess tier) — **take this
+   first, and it is READY TO BRIEF**: the measurement and the operator's ruling are both already
+   IN the row. `#pragma once` does not merely lack effect, **DSS REFUSES the translation unit**
+   (`P_PreprocessorPragma`, exit 1) against an idiom gcc, clang and MSVC all accept, so every
+   real-world header using the commonest guard fails to compile. The dedup key is **RULED
+   IDENTITY, not content** (operator 2026-08-28): `core::PathIdentity`, which landed 2026-08-18
+   and is exactly the machinery needed. The full 7-case reference matrix and the stated cost of
+   the deliberate divergence from gcc are in the row.
+2. **`D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT`** (type-layout tier) — P0 RED, a **silent
+   layout miscompile**, trigger fired, independent of `#pragma pack`. Ground truth is in the row.
+3. **`D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK`** (semantic/HIR tier) — P0 RED; the row
+   exists to stop the tempting WRONG fix being re-proposed, so read it before designing.
+4. **`D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE`** (asm tier) — a NAMED
+   EXCEPTION carrying its own closing predicate; check whether the infrastructure it waits on now
+   exists, per *"a buildable prerequisite is not a gate"*.
+
+⚠ **All four may want `src/dss-config/sources/c.lang.json`.** The fold instrument REFUSES a
+destination the main tree has drifted on, so a collision fails loud rather than silently reverting
+a sibling — but tell each lane to keep its config edit minimal and to report the exact keys it
+added.
+
+⚠⚠ **THE ORCHESTRATOR'S CYCLE INSTRUMENTS LIVE IN A SESSION-SCOPED SCRATCHPAD AND DO NOT
+SURVIVE A NEW SESSION.** They are at
+`C:\Users\rafae\AppData\Local\Temp\claude\C--Source-DailySoftware-dss-code-prime\0da5ab3a-fae5-4d34-b834-a49c20f74be6\scratchpad\p44\`
+and that directory still exists on disk — **read them from there rather than rewriting them.**
+The ones that earned their keep: `porcelain.py` (`git status -z`, because git C-QUOTES a path with
+spaces and this repo holds one), `seed_lane.py` + `fold_seeded.py` (a lane's contribution is
+*its status set MINUS seeded paths whose md5 is unchanged*, and the fold REFUSES a destination the
+main tree has drifted on), `apply_one_row.py` (replaces one row from a FILE, never retyped — a
+retyped row can WRAP an anchor id, which does not fail: it goes invisible and mints a false one),
+and `bucket_counts.py` (per-bucket OPEN split **through the gate's own `scan_document`**, because
+a hand-rolled row scanner counted commented-out rows and reported 562 where the gate said 556).
+★ **They are cycle machinery, they get rewritten every session, and `scripts/wsl-leg.sh`'s own
+header records that exact waste happening three times in one session. Decide at the START of the
+next cycle whether they are promoted into `scripts/`** — recorded as a decision to take, not
+filed as a row nobody closes.
 
 ### ⓘ A HARNESS DEFECT FIXED THE MOMENT IT BLOCKED, per the standing ruling
 

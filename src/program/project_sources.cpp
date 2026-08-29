@@ -3,6 +3,7 @@
 #include "core/substrate/path_identity.hpp"
 
 #include "core/types/glob_match.hpp"
+#include "core/types/include_path_resolve.hpp"  // isRootedPath — the ONE rooted-path predicate
 #include "core/types/parse_diagnostic.hpp"
 
 #include <system_error>
@@ -27,7 +28,7 @@ void emitDriver(DiagnosticReporter& rep, DiagnosticCode code, std::string msg) {
 // that describes nothing.
 std::string baseLabel(fs::path const& baseDir) {
     return baseDir.empty() ? std::string{"the working directory"}
-                           : ("'" + baseDir.generic_string() + "'");
+                           : ("'" + core::genericSpelling(baseDir) + "'");
 }
 
 } // namespace
@@ -63,10 +64,20 @@ expandAndDedupProjectSources(std::vector<std::string> const& sources,
             // the common `"src/lib.c"` form silently resolves against the wrong
             // tree (header, AP6 M4a). An ABSOLUTE literal keeps its own base; an
             // empty `baseDir` keeps the entry's exact characters.
+            // ⚠ `isRootedPath`, NOT `is_absolute()`, and `core::genericSpelling`,
+            // NOT `generic_string()` — the same defect twice on one line.
+            // ✔MEASURED 2026-08-28 on a REACHABLE UNC directory: such a path
+            // answers `is_absolute()` FALSE, so a literal source naming another
+            // machine was classified RELATIVE and re-based, producing
+            // `C://localhost/C$/…` — the manifest's base drive glued in front of
+            // an authority. And the rendering that follows collapses the run
+            // again, so even a correctly-rooted literal came out naming the
+            // local drive. Both spellings are equally absent from disk, which is
+            // why fixing either one alone still looks fixed.
             fs::path const p{entry};
-            expanded.push_back(baseDir.empty() || p.is_absolute()
+            expanded.push_back(baseDir.empty() || isRootedPath(p)
                                    ? entry
-                                   : (baseDir / p).generic_string());
+                                   : core::genericSpelling(baseDir / p));
             continue;
         }
         std::error_code ec;

@@ -862,6 +862,32 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
     }
 
+    // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ──
+    //
+    // `entryTrampoline` says "the entry DSS synthesizes for this format calls the
+    // scheduled functions". Only an EXEC flavor HAS such an entry — the injector
+    // is gated on `isExecFlavor()` — so on any other flavor the claim is false and
+    // the initializers would silently never run. Refuse it at LOAD, where the
+    // claim is written, rather than at link time on some program that happens to
+    // use a constructor.
+    //
+    // ★ THE OTHER ARM IS NOT SO GATED, DELIBERATELY. `imageLoader` says the
+    // PLATFORM walks a section, which is exactly what a non-exec image (a Mach-O
+    // dylib) can be true of — it is the arm a shared library would use once a
+    // writer emits a loader-recognized section. Gating both on exec-ness would
+    // write today's missing writer into the schema as a permanent rule.
+    if (staticInitRunner == StaticInitRunner::EntryTrampoline && !isExecFlavor) {
+        fail("/staticInitializers/runner",
+             "format declares `\"runner\": \"entryTrampoline\"` but is not an "
+             "EXEC flavor, so DSS synthesizes no entry for it and there is "
+             "nothing to make those calls. A shared library / relocatable object "
+             "/ static library must declare `imageLoader` (once a writer emits a "
+             "loader-recognized section for it) or declare no "
+             "`staticInitializers` block at all, which makes the linker REFUSE a "
+             "program that schedules initializers for this format instead of "
+             "silently never running them.");
+    }
+
     // D-LK10-ENTRY Slice B (plan 14 §2.13): cross-field coherence
     // between `processExit` and `entryCallingConvention`. Both go
     // together — the trampoline emitter needs both to construct the

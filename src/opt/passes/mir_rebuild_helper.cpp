@@ -363,7 +363,14 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
                      src_.funcBinding(oldFn), src_.funcVisibility(oldFn),
                      src_.funcNoInline(oldFn), src_.funcAlwaysInline(oldFn),
                      src_.funcNoOptimize(oldFn),
-                     src_.funcNoSanitizeThread(oldFn));
+                     src_.funcNoSanitizeThread(oldFn),
+                     // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN:
+                     // the ONE chokepoint under all 8 rebuild passes, so a miss
+                     // here silently un-schedules every initializer in a
+                     // `--config=release` build while the debug build stays
+                     // correct — the exact split a corpus example's release arm
+                     // exists to catch.
+                     src_.funcStaticInit(oldFn));
 
     // ★★ TF-C85 (D-OPT-NOOPTIMIZE-NEUTERS-POLICY): THE per-function optimizer
     // opt-out, applied at the ONE shared chokepoint under all 8 rebuild passes.

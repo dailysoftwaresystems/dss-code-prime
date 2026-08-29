@@ -165,9 +165,10 @@ std::optional<std::string> repoTreeVersionSkew(fs::path const& treeRoot) {
     std::string const mine{detail::kBuildVersionText};
     if (*declared == mine) return std::nullopt;
     return "shipped-config version skew: this compiler is version " + mine
-         + " but the config tree at '" + repoShapedConfigRoot(treeRoot).generic_string()
+         + " but the config tree at '"
+         + core::genericSpelling(repoShapedConfigRoot(treeRoot))
          + "' belongs to version " + *declared
-         + " (declared by '" + (treeRoot / "VERSION").generic_string()
+         + " (declared by '" + core::genericSpelling(treeRoot / "VERSION")
          + "'). Refusing to compile against a config tree from a different "
            "version — it would not fail, it would silently compile something "
            "else. Rebuild, or point DSS_CONFIG_ROOT at the matching tree.";
@@ -238,7 +239,13 @@ Resolution resolveByPrecedence(std::string_view                             subd
             envRoot != nullptr && envRoot[0] != '\0') {
             fs::path const treeRoot{envRoot};
             fs::path const candidate = compose(repoShapedConfigRoot(treeRoot));
-            out.tried.push_back("$DSS_CONFIG_ROOT -> " + candidate.generic_string());
+            // `core::genericSpelling` at every `tried` entry: this list is the
+            // ONLY record of what discovery looked at, and `DSS_CONFIG_ROOT` is
+            // an environment variable — the one input an operator can trivially
+            // point at a share. A `tried` line that renames the machine sends
+            // the reader to look on the wrong host for a tree that was there.
+            out.tried.push_back("$DSS_CONFIG_ROOT -> "
+                                + core::genericSpelling(candidate));
             if (probe(candidate, ec)) {
                 // Judge the tree only when it is the one about to be USED. A
                 // set-but-miss override falls THROUGH to the arms below, exactly
@@ -256,7 +263,8 @@ Resolution resolveByPrecedence(std::string_view                             subd
         if (auto const exeDir = runningExecutableDir()) {
             if (auto const installedRoot = installedConfigRootFrom(*exeDir)) {
                 fs::path const candidate = compose(*installedRoot);
-                out.tried.push_back("installed layout -> " + candidate.generic_string());
+                out.tried.push_back("installed layout -> "
+                                    + core::genericSpelling(candidate));
                 if (probe(candidate, ec)) {
                     // No version check: the probed path was composed FROM this
                     // binary's own version, so reaching it IS the agreement.
@@ -269,8 +277,13 @@ Resolution resolveByPrecedence(std::string_view                             subd
             }
             out.tried.push_back(
                 "installed layout -> "
-                + (*exeDir / fs::path{std::string{installedConfigRelDir()}})
-                      .lexically_normal().generic_string()
+                // BOTH transforms, because a path that passes through both loses
+                // the run TWICE and a partial repair reads exactly like a whole
+                // one — the two wrong spellings are equally absent from disk.
+                // This line must name what `installedConfigRootFrom` actually
+                // probed, or the reader is told the wrong thing was missing.
+                + core::genericSpelling(core::normalizeKeepingRoot(
+                    *exeDir / fs::path{std::string{installedConfigRelDir()}}))
                 + " (no such directory — this is not an installed tree)");
         } else {
             out.tried.push_back(
@@ -283,7 +296,7 @@ Resolution resolveByPrecedence(std::string_view                             subd
     fs::path here = startPath.value_or(fs::current_path(ec));
     for (int i = 0; i < 8 && !here.empty(); ++i) {
         fs::path const candidate = compose(repoShapedConfigRoot(here));
-        out.tried.push_back("cwd walk -> " + candidate.generic_string());
+        out.tried.push_back("cwd walk -> " + core::genericSpelling(candidate));
         if (probe(candidate, ec)) {
             if (auto skew = repoTreeVersionSkew(here)) {
                 out.refusal = std::move(skew);
@@ -364,9 +377,21 @@ installedConfigRootFrom(std::filesystem::path const& executableDir) {
     // by the red-on-disable: a mutant that changed the accessor left every test
     // GREEN. One reader, or a test can only ever prove something about the
     // reader it happens to share.
-    fs::path const root =
-        (executableDir / fs::path{std::string{installedConfigRelDir()}})
-            .lexically_normal();
+    //
+    // ★★★ `core::normalizeKeepingRoot`, NOT `lexically_normal()` — and here the
+    // difference is BEHAVIOUR, not wording. ✔MEASURED 2026-08-28 on a REACHABLE
+    // UNC directory (`exists()` true) with the toolchain that builds DSS:
+    //     base                     '//localhost/C$/Source/DailySoftware'  run 2
+    //     join + lexically_normal  '\localhost\C$\Source\dss-config'      run 1
+    // A DSS installed on a network share reports its own executable directory
+    // with that run intact; the collapse demotes the authority to a directory
+    // on the LOCAL drive root, `is_directory` answers false for a tree that is
+    // right there, and this arm — which the block above calls AUTHORITATIVE
+    // once found — silently declines and lets the cwd walk answer instead. That
+    // is the worst shape available: not a refusal naming a path, but a
+    // DIFFERENT config tree, chosen without a word.
+    fs::path const root = core::normalizeKeepingRoot(
+        executableDir / fs::path{std::string{installedConfigRelDir()}});
     if (!fs::is_directory(root, ec)) return std::nullopt;
     return root;
 }

@@ -1,4 +1,5 @@
 #include "link/entry_trampoline.hpp"
+#include "link/static_init_tables.hpp"
 
 #include "core/types/config_key_vocabulary.hpp"  // renderAllowedList — the ONE closed-set renderer
 #include "core/types/extern_import.hpp"
@@ -9,11 +10,13 @@
 #include "lir/lir_node.hpp"
 #include "lir/lir_reg.hpp"
 
+#include <algorithm>   // std::min -- the argument-register park
 #include <cstdint>
 #include <format>
 #include <limits>
 #include <optional>
 #include <string>
+#include <utility>   // std::pair -- the parked (saved, original) pairs
 #include <vector>
 
 namespace dss::linker {
@@ -562,16 +565,161 @@ bool injectEntryTrampoline(AssembledModule&          module,
         (void)b.addInst(*subOp, spReg, subOps);
     }
 
+    // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ─────────
+    //
+    // THE STATIC-INITIALIZER CALLS. DSS links no crt — this trampoline IS the
+    // program's runtime — so on every format whose document names
+    // `entryTrampoline` as the runner, these calls are the only thing that makes
+    // `__attribute__((constructor))` mean anything.
+    //
+    // ★★ THE ARM IS CHOSEN BY THE FORMAT DOCUMENT, NEVER BY A FORMAT NAME, and
+    // the other direction is a real platform behaviour rather than a placeholder:
+    // on the `imageLoader` arm the platform loader walks a section it recognizes
+    // (dyld and `S_MOD_INIT_FUNC_POINTERS`), so emitting calls here would run
+    // every initializer TWICE. No shipped document selects that arm today —
+    // selecting it needs a writer that emits such a section, which is why
+    // `StaticInitSchedule.ImageLoaderRunnerEmitsNoTrampolineCalls` is the only
+    // thing standing between this branch and silent deletion.
+    //
+    // ★ A MODULE WITH NO RUNNER CANNOT REACH THIS POINT CARRYING A SCHEDULE: the
+    // linker refuses that program before injection, naming the format. So the
+    // `false` arm below means "the loader owns it", never "nobody does".
+    //
+    // ★ DIRECT CALLS, AND NO EMITTED TABLE AT ALL. The linker knows the whole
+    // program here, so the sequence is a straight line of `call`s — no loop, no
+    // indirect call through a register, no synthesized boundary symbols, and
+    // nothing for a `.init_array` to be read by (see `static_init_tables.hpp` for
+    // the measurement that settles it).
+    bool const runsSchedule =
+        format.staticInitRunner() == StaticInitRunner::EntryTrampoline;
+    auto const beforeEntry =
+        runsSchedule ? staticInitOrder(module, StaticInitPhase::BeforeEntry)
+                     : std::vector<StaticInitOrderEntry>{};
+    auto const afterEntry =
+        runsSchedule ? staticInitOrder(module, StaticInitPhase::AfterEntry)
+                     : std::vector<StaticInitOrderEntry>{};
+
+    // The convention's own callee-saved GENERAL-PURPOSE registers, handed out in
+    // declaration order. Every value the trampoline must carry ACROSS a call goes
+    // in one of these, and none of them is named in this file.
+    //
+    // ⚠ FILTERED BY REGISTER CLASS. `calleeSaved` is not GPR-only on every
+    // convention (MEASURED: `ms_x64` lists rbx…r15 AND xmm6…xmm15), so taking
+    // entries blindly would work on SysV and hand back an XMM register on another
+    // table — a `mov` between register files, or a refused encoding.
+    std::size_t nextCalleeSaved = 0;
+    auto const takeCalleeSavedGpr = [&]() -> std::optional<LirReg> {
+        while (nextCalleeSaved < cc->calleeSaved.size()) {
+            auto const& rn  = cc->calleeSaved[nextCalleeSaved++];
+            auto const  ord = target.registerByName(rn);
+            if (!ord.has_value()) continue;
+            auto const* info = target.registerInfo(*ord);
+            if (info == nullptr || info->regClass != TargetRegClass::GPR) continue;
+            if (auto r = physRegByName(target, rn); r.has_value()) return r;
+        }
+        return std::nullopt;
+    };
+
+    // ★★ THE PROGRAM'S ARGUMENTS HAVE TO SURVIVE THE BEFORE-ENTRY CALLS, and
+    // this is the half that is easy to miss. The argument registers were loaded
+    // ABOVE — before the prologue, because the stack offsets are defined against
+    // the untouched process-entry SP — and they are CALLER-saved on every
+    // convention here. A `call` to an initializer therefore hands
+    // `main(int argc, char **argv)` whatever that initializer left behind.
+    //
+    // ★ IT IS NOT CONFINED TO FORMATS THAT DECLARE `processArgs`. On the
+    // pass-through arm (Mach-O, where dyld already delivers argc/argv in the
+    // argument registers) the trampoline never touches them — so the clobber is
+    // identical, and the park is gated on there BEING calls, not on how the
+    // registers came to hold their values.
+    std::vector<std::pair<LirReg, LirReg>> parkedArgs;   // (saved, original)
+    if (!beforeEntry.empty()) {
+        std::size_t const nArgs = std::min<std::size_t>(2, cc->argGprs.size());
+        for (std::size_t i = 0; i < nArgs; ++i) {
+            auto const orig = physRegByName(target, cc->argGprs[i]);
+            if (!orig.has_value()) continue;
+            auto const save = takeCalleeSavedGpr();
+            if (!save.has_value()) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("entry-trampoline: calling convention '{}' does "
+                                 "not declare enough callee-saved GENERAL-PURPOSE "
+                                 "registers to carry the program's arguments "
+                                 "across the before-entry static initializers "
+                                 "this program schedules. Widen the target's "
+                                 "`calleeSaved`, or `main(argc, argv)` would "
+                                 "receive whatever the last initializer left in "
+                                 "the argument registers. "
+                                 "(D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN.)",
+                                 ccName));
+                return false;
+            }
+            LirOperand const saveOps[] = { LirOperand::makeReg(*orig) };
+            (void)b.addInst(*movOp, *save, saveOps);
+            parkedArgs.emplace_back(*save, *orig);
+        }
+    }
+
+    // 0. call each before-entry initializer, in schedule order. Emitted AFTER the
+    //    ABI prologue above — these are ordinary calls and need the shadow space
+    //    and the alignment bias the prologue established, exactly as the user
+    //    entry does.
+    for (auto const& e : beforeEntry) {
+        LirOperand const ctorOps[] = { LirOperand::makeSymbolRef(e.symbol.v) };
+        (void)b.addInst(*callOp, InvalidLirReg, ctorOps);
+    }
+
+    // …and put the arguments back, immediately before the entry call.
+    for (auto const& [save, orig] : parkedArgs) {
+        LirOperand const restoreOps[] = { LirOperand::makeReg(save) };
+        (void)b.addInst(*movOp, orig, restoreOps);
+    }
+
     // 1. call user_entry — produces REL32 reloc on the disp32.
     LirOperand const callOps[] = {
         LirOperand::makeSymbolRef(userEntrySym.v)
     };
     (void)b.addInst(*callOp, InvalidLirReg, callOps);
 
+    // ★★ THE STATUS HAS TO SURVIVE THE AFTER-ENTRY CALLS, and the return register
+    // will not: it is caller-saved on every convention here, so the first
+    // destructor would clobber the program's exit code with whatever it returned.
+    // Park it in the convention's OWN first callee-saved GPR — declared config,
+    // never a register name in this file — and read it back afterwards.
+    //
+    // ⚠ FILTERED BY REGISTER CLASS. `calleeSaved` is not GPR-only on every
+    // convention (MEASURED: `ms_x64` lists rbx…r15 AND xmm6…xmm15), so taking
+    // `calleeSaved[0]` blindly would work on SysV and pick an XMM register on
+    // some other table — a `mov` between register files, or a refused encoding.
+    std::optional<LirReg> statusSaveReg;
+    if (!afterEntry.empty()) {
+        statusSaveReg = takeCalleeSavedGpr();
+        if (!statusSaveReg.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("entry-trampoline: calling convention '{}' does not "
+                             "declare enough callee-saved GENERAL-PURPOSE "
+                             "registers, so the entry function's status cannot "
+                             "survive the after-entry static initializers this "
+                             "program schedules. Widen the target's "
+                             "`calleeSaved`, or the exit code would be whatever "
+                             "the last destructor happened to leave behind. "
+                             "(D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN.)",
+                             ccName));
+            return false;
+        }
+        LirOperand const saveOps[] = { LirOperand::makeReg(*returnReg) };
+        (void)b.addInst(*movOp, *statusSaveReg, saveOps);
+        for (auto const& e : afterEntry) {
+            LirOperand const dtorOps[] = { LirOperand::makeSymbolRef(e.symbol.v) };
+            (void)b.addInst(*callOp, InvalidLirReg, dtorOps);
+        }
+    }
+
     // 2. mov argGprs[0], returnGprs[0] — status into syscall/call
-    //    arg register from user fn's return register.
+    //    arg register from user fn's return register (or from the callee-saved
+    //    register it was parked in while the after-entry initializers ran).
     LirOperand const movRegOps[] = {
-        LirOperand::makeReg(*returnReg)
+        LirOperand::makeReg(statusSaveReg.has_value() ? *statusSaveReg
+                                                      : *returnReg)
     };
     (void)b.addInst(*movOp, *argReg, movRegOps);
 

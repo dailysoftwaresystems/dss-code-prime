@@ -64,6 +64,21 @@ inline constexpr std::string_view kMirTextNoOptimizeAttr = "nooptimize";
 // source→MIR chain exists to produce. Deleting the printer arm below does not
 // degrade a diagnostic — it erases the feature.
 inline constexpr std::string_view kMirTextNoSanitizeThreadAttr = "nosanitizethread";
+// D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the STATIC-
+// INITIALIZER pair. Same one-spelling discipline as the four keywords above,
+// and the same `.dssir`-is-its-own-format naming — these are not C's
+// `constructor`/`destructor`, they are this text format's words for the two
+// channels, which is why they are named for WHEN they run.
+//
+// ★ THEY ARE THE ONLY FUNCTION ATTRIBUTES HERE THAT TAKE AN ARGUMENT, and the
+// argument is what makes the round trip meaningful: a printer that emitted the
+// keyword and dropped the priority would round-trip a module whose initializers
+// run in a different ORDER than the one it was handed, which no equality check
+// on the keyword set would notice. The bare form prints without parentheses and
+// means `kUnprioritizedStaticInit` — the same spelling asymmetry the C source
+// has, kept so the text reads the way the attribute was written.
+inline constexpr std::string_view kMirTextRunBeforeEntryAttr = "initbefore";
+inline constexpr std::string_view kMirTextRunAfterEntryAttr  = "initafter";
 
 // D-MIRTEXT-GLOBAL-FLAGS-DROPPED-BY-ROUNDTRIP: the GLOBAL-side vocabulary.
 // Same one-spelling discipline, same `.dssir`-is-its-own-format reasoning as
@@ -773,8 +788,9 @@ private:
         bool             const ai = mir_.funcAlwaysInline(f);   // TF-C81
         bool             const no = mir_.funcNoOptimize(f);     // TF-C85
         bool             const ns = mir_.funcNoSanitizeThread(f);   // TF-C92
+        StaticInitSchedule const si = mir_.funcStaticInit(f);
         if (b == SymbolBinding::Global && v == SymbolVisibility::Default && !ni
-            && !ai && !no && !ns) {
+            && !ai && !no && !ns && !si.any()) {
             return;
         }
         out_ += " [";
@@ -786,6 +802,20 @@ private:
         if (ai)                             { sep(); out_ += kMirTextAlwaysInlineAttr; }
         if (no)                             { sep(); out_ += kMirTextNoOptimizeAttr; }
         if (ns)                             { sep(); out_ += kMirTextNoSanitizeThreadAttr; }
+        // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: one arm per
+        // channel, read through `priorityFor` so neither is spelled by member name
+        // — the same reason the DCE root clause asks `any()` rather than testing
+        // one direction and silently losing the other.
+        for (auto const [phase, word] :
+             {std::pair{StaticInitPhase::BeforeEntry, kMirTextRunBeforeEntryAttr},
+              std::pair{StaticInitPhase::AfterEntry,  kMirTextRunAfterEntryAttr}}) {
+            auto const prio = si.priorityFor(phase);
+            if (!prio.has_value()) continue;
+            sep();
+            out_ += word;
+            if (*prio != kUnprioritizedStaticInit)
+                out_ += std::format("({})", *prio);
+        }
         out_ += "]";
     }
 
@@ -1959,6 +1989,7 @@ private:
         bool             alwaysInline = false;   // TF-C81
         bool             noOptimize   = false;   // TF-C85
         bool             noSanitizeThread = false;   // TF-C92
+        StaticInitSchedule staticInit{};   // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN
         if (lex_.peek().kind == TokKind::LBracket) {
             lex_.take();
             while (true) {
@@ -1983,6 +2014,48 @@ private:
                     noSanitizeThread = true;
                     continue;
                 }
+                // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the
+                // two channels, each with an OPTIONAL parenthesized priority. A
+                // malformed argument is REFUSED rather than defaulted: silently
+                // reading `initbefore(oops)` as the bare form would move the
+                // initializer to the end of the schedule, which is a different
+                // program and not a lost annotation.
+                if (a.text == kMirTextRunBeforeEntryAttr
+                    || a.text == kMirTextRunAfterEntryAttr) {
+                    auto const phase = a.text == kMirTextRunBeforeEntryAttr
+                                           ? StaticInitPhase::BeforeEntry
+                                           : StaticInitPhase::AfterEntry;
+                    std::uint32_t prio = kUnprioritizedStaticInit;
+                    if (lex_.peek().kind == TokKind::LParen) {
+                        lex_.take();
+                        Tok const n = lex_.take();
+                        if (n.kind != TokKind::Integer) {
+                            emitMalformed(std::format(
+                                "'{}' takes an integer priority, got '{}'",
+                                a.text, n.text));
+                            break;
+                        }
+                        auto const parsed = parseNumber<std::uint64_t>(
+                            n.text, "static-initializer priority");
+                        if (parsed >= kUnprioritizedStaticInit) {
+                            emitMalformed(std::format(
+                                "'{}' priority '{}' is out of range (a priority "
+                                "is below {}, whose value denotes the "
+                                "unprioritized form)",
+                                a.text, n.text, kUnprioritizedStaticInit));
+                            break;
+                        }
+                        prio = static_cast<std::uint32_t>(parsed);
+                        if (lex_.peek().kind != TokKind::RParen) {
+                            emitMalformed(std::format(
+                                "expected ')' closing the '{}' priority", a.text));
+                            break;
+                        }
+                        lex_.take();
+                    }
+                    staticInit.setPriorityFor(phase, prio);
+                    continue;
+                }
                 if (auto b = symbolBindingFromName(a.text); b.has_value()) {
                     binding = *b;
                     continue;
@@ -2003,12 +2076,13 @@ private:
                 // Both halves are projected off the tables the lookups use.
                 emitMalformed(std::format(
                     "unknown function attribute '{}' — expected a binding ({}), "
-                    "a visibility ({}), '{}', '{}', '{}' or '{}'",
+                    "a visibility ({}), '{}', '{}', '{}', '{}', '{}' or '{}'",
                     a.text,
                     detail::renderAllowedList(allNames(kSymbolBindingTable), " | "),
                     detail::renderAllowedList(allNames(kSymbolVisibilityTable), " | "),
                     kMirTextNoInlineAttr, kMirTextAlwaysInlineAttr,
-                    kMirTextNoOptimizeAttr, kMirTextNoSanitizeThreadAttr));
+                    kMirTextNoOptimizeAttr, kMirTextNoSanitizeThreadAttr,
+                    kMirTextRunBeforeEntryAttr, kMirTextRunAfterEntryAttr));
                 break;
             }
         }
@@ -2028,7 +2102,8 @@ private:
             builder_.addFunction(sig, SymbolId{sym}, binding, visibility, noInline,
                                  alwaysInline,    // TF-C81
                                  noOptimize,      // TF-C85
-                                 noSanitizeThread);   // TF-C92
+                                 noSanitizeThread,   // TF-C92
+                                 staticInit);   // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN
         // Text initfunc references use %f<MirFuncId.v>. Track in
         // parse order so deferred-resolution at finalize works even
         // when a global with `initfunc` precedes its target function.

@@ -7,6 +7,7 @@
 #include "core/types/section_kind.hpp"        // relocBearingGlobalSection (c145 chokepoint)
 #include "link/cross_cu_resolve.hpp"
 #include "link/entry_trampoline.hpp"
+#include "link/static_init_tables.hpp"
 #include "link/format/elf.hpp"
 #include "link/format/macho.hpp"
 #include "link/format/pe.hpp"
@@ -1114,6 +1115,27 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         combined.userEntrySymbol = SymbolId{mergedIdFor(i, *modules[i].userEntrySymbol)};
         entrySet = true;
     }
+    // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ──
+    //
+    // Every CU's static-initializer schedule, with each entry's SymbolId pushed
+    // through the SAME `mergedIdFor` remap the entry symbol above uses. Without
+    // the remap the entries would name PER-CU ids, which in a multi-CU link
+    // denote different atoms — the table would be emitted pointing at whatever
+    // function happened to hold that id in the merged module, which is a silent
+    // wrong-code outcome rather than a missing feature.
+    //
+    // ★ NO DEDUP AND NO MERGE OF DUPLICATE SYMBOLS HERE. Two CUs cannot both
+    // DEFINE one function (the merge already refuses that), and a schedule entry
+    // is only ever recorded for a definition, so a repeated merged id would mean
+    // the merge folded two definitions — which it reports on its own. Silently
+    // collapsing them here would hide that.
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        for (auto const& e : modules[i].staticInitSchedule) {
+            combined.staticInitSchedule.push_back(
+                LirStaticInitEntry{SymbolId{mergedIdFor(i, e.symbol)},
+                                   e.schedule});
+        }
+    }
     // combined.cuId stays default — the merged image is not a single CU.
     return combined;
 }
@@ -1479,6 +1501,42 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // check (entry_trampoline.cpp) is now a genuine backstop for its
     // OTHER callers rather than the dead code the old caller-side
     // predicate made it.
+    // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ──
+    //
+    // A program that SCHEDULES static initializers and a format that declares
+    // NOBODY to run them is refused here, by name.
+    //
+    // ★★ THIS IS THE GATE THAT KEEPS THE FEATURE HONEST ACROSS FORMATS. DSS runs
+    // the schedule from the entry it synthesizes, so a format with no
+    // DSS-synthesized entry — a shared library, a relocatable object, a static
+    // library — cannot run one, and its document says so by declaring no
+    // `staticInitializers` block. Without this check those builds would succeed
+    // and simply never call the initializer: the ORIGINAL defect this anchor was
+    // filed for, moved from the front end to the link tier and made silent again.
+    //
+    // ⓘ Costs nothing for the overwhelmingly common case: a module that schedules
+    // nothing never reaches the body.
+    if (!inputModule.staticInitSchedule.empty()
+        && !objectFormatSchema.staticInitRunner().has_value()) {
+        report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+               DiagnosticSeverity::Error,
+               std::string{"linker: this program declares static initializers "
+                           "(`__attribute__((constructor))` / `((destructor))` "
+                           "in C) but object format '"}
+                   + std::string{objectFormatSchema.name()}
+                   + "' declares no 'staticInitializers' block, so nothing would "
+                     "run them. DSS runs the schedule from the entry it "
+                     "synthesizes, and this format has no such entry (a shared "
+                     "library, a relocatable object or a static library) -- "
+                     "whatever links or loads the artifact would have to run "
+                     "them, and DSS emits no table for it to walk. REMEDY: build "
+                     "the initializers into an executable, or remove them. The "
+                     "refusal is the point: without it the build would succeed "
+                     "and the initializer would simply never run. "
+                     "(D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN.)");
+        image.resolvedFuncCount = 0;
+        return image;
+    }
     if (needsTrampoline) {
         moduleCopy = inputModule;
         if (!injectEntryTrampoline(moduleCopy, targetSchema,

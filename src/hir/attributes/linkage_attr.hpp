@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/types/section_kind.hpp"  // StaticInitSchedule
 #include "core/types/symbol_attrs.hpp"  // SymbolBinding, SymbolVisibility
 
 // Declaration linkage side-table value (HR5). Attached per-node via
@@ -51,6 +52,32 @@ struct LinkageAttr {
     // ★ It cannot leak BETWEEN declarators: `declaratorLinkage` takes its `base`
     // BY VALUE, so each declarator folds onto its own copy of the prefix.
     bool             visibilitySpecified = false;
+    // ★★ D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: this
+    // declaration's place in the program's static-initializer schedule, read from
+    // its symbol's `SymbolRecord::staticInit` by `recordLinkage` and carried to
+    // `MirFunc::staticInit`.
+    //
+    // ★★ WHY IT RIDES *THIS* SIDE-TABLE, STATED PLAINLY BECAUSE IT IS NOT
+    // OBVIOUSLY LINKAGE. Every other per-function attribute fact (`noInline`,
+    // `alwaysInline`, `noSanitizeThread`, `noOptimize`) gets its OWN
+    // `HirAttribute<>` map and its own `lowerHirToMir` parameter — and each of
+    // those parameters is passed from `src/program/compile_pipeline.cpp`, which
+    // this lane does not own. A new map would therefore have landed with nothing
+    // passing it, i.e. a defaulted `nullptr` and a feature that is dead in the
+    // shipped pipeline while every unit test that constructs the map by hand goes
+    // green: a half-landed flag, which is indistinguishable in the OUTPUT from no
+    // flag at all. `linkageMap` is ALREADY threaded, so the fact travels for free.
+    //
+    // ★ AND THE FIT IS BETTER THAN "IT WAS AVAILABLE". What this side-table
+    // carries is how a declaration participates in the IMAGE rather than in the
+    // program text — binding, visibility, and now whether the symbol's address is
+    // filed in a table some runtime walks. All three are answered from the
+    // declaration's specifiers and all three are consumed by the object writer,
+    // not by any expression.
+    //
+    // Empty ⇒ an ordinary function, so the side-table stays sparse in the sense
+    // `recordLinkage` means: absence is the correct default.
+    StaticInitSchedule staticInit{};
 };
 
 } // namespace dss

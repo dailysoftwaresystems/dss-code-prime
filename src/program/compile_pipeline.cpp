@@ -1,6 +1,7 @@
 #include "program/compile_pipeline.hpp"
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "core/substrate/path_identity.hpp"  // genericSpelling
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "asm/asm.hpp"
@@ -454,7 +455,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
                     "--resolve-library: failed to open '{}' for reading "
                     "(the resolve-library binary must exist + be readable at "
                     "compile time). Check the path.",
-                    lib.path.generic_string());
+                    core::genericSpelling(lib.path));
                 reporter.report(std::move(d));
                 continue;  // unopenable: nothing to classify, one message is enough
             }
@@ -2683,7 +2684,7 @@ archiveMemberFormat(ArchiveMemberFormat&          cache,
             "relocatable member; the member's own object format {}. {} "
             "Anchored: D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-"
             "OBJECT-FORMAT.",
-            memberName, archivePath.generic_string(), linkFormat.name(),
+            memberName, core::genericSpelling(archivePath), linkFormat.name(),
             objectFormatName.empty()
                 ? std::string{"could not be resolved"}
                 : std::format("resolved to '{}' but could not be loaded",
@@ -2823,7 +2824,7 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
             d.actual   = std::format(
                 "static-link: failed to open archive '{}' for reading "
                 "(D-LK-STATIC-LINK).",
-                archivePath.generic_string());
+                core::genericSpelling(archivePath));
             reporter.report(std::move(d));
             return std::nullopt;
         }
@@ -3143,7 +3144,7 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
             d.actual   = std::format(
                 "fat-archive: failed to open input static archive '{}' for "
                 "reading (D-FF1-STATICLIB-FAT-ARCHIVE).",
-                archivePath.generic_string());
+                core::genericSpelling(archivePath));
             reporter.report(std::move(d));
             return std::nullopt;
         }
@@ -3209,7 +3210,7 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
                 "a link input, so it cannot be skipped -- an omitted object "
                 "would link into a smaller image that may still run "
                 "(D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION).",
-                objectPath.generic_string());
+                core::genericSpelling(objectPath));
             reporter.report(std::move(d));
             return std::nullopt;
         }

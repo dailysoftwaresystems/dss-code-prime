@@ -362,6 +362,62 @@ TEST(PathIdentitySubstrate, AbsoluteDoesNotRerootAMultiSeparatorPath) {
         << got.string();
 }
 
+// ── [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]] ─────
+//
+// THE `u8` SPELLING LOSES THE RUN EXACTLY AS THE NARROW ONE DOES, and that is
+// not obvious from the name — `generic_u8string()` reads like the LOSSLESS
+// member, and it is, but only along the ENCODING axis.
+//
+// ★★★ ✔MEASURED 2026-08-28, one path object, all three renderings printed side
+// by side on a REACHABLE UNC directory:
+//     .string()           '//localhost/C$/Source/DailySoftware'   run 2
+//     .generic_string()   '/localhost/C$/Source/DailySoftware'    run 1
+//     .generic_u8string() '/localhost/C$/Source/DailySoftware'    run 1
+// `renderCandidatePath` in the header-case diagnostic had moved to the `u8` form
+// to stop `std::system_error` on a name the active code page cannot encode
+// ([[D-PP-HEADER-CASE-NON-ASCII-NAME-NARROWING-THROW]]) — a real repair on a
+// DIFFERENT axis, which left the report naming the wrong MACHINE while spelling
+// the filename perfectly.
+TEST(PathIdentitySubstrate, GenericSpellingU8KeepsAMultiSeparatorRoot) {
+    dss::test_support::ScratchDir sd{dss::test_support::Location::Temp,
+                                     "generic-u8-keeping-root"};
+    fs::path const unc = dss::test_support::uncSpellingOf(sd.path());
+    if (unc.empty())
+        GTEST_SKIP()
+            << "D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS"
+               ": this host offers no reachable multi-separator spelling of '"
+            << sd.path().string()
+            << "', so the u8 rendering WAS NOT MEASURED on this leg. This is an "
+               "UNMEASURED property, not a passing one.";
+    ASSERT_GE(dss::test_support::leadingSeparatorRun(unc), 2u);
+
+    std::u8string const got = dss::core::genericSpellingU8(unc);
+    std::string const   narrow(reinterpret_cast<char const*>(got.data()),
+                             got.size());
+    EXPECT_GE(dss::test_support::leadingSeparatorRun(fs::path{narrow}), 2u)
+        << "the u8 spelling collapsed the leading run, so a diagnostic built "
+           "from it names a path on this drive instead of the host that was "
+           "asked about: " << narrow;
+    // The generic CONVENTION still holds — this is a spelling fix, not a
+    // licence to leak native separators into a rendered path.
+    EXPECT_EQ(narrow.find('\\'), std::string::npos)
+        << "a rendered spelling must use one separator convention: " << narrow;
+}
+
+// The CONTROL for the u8 spelling: a path with NO multi-separator root must come
+// back byte-identical to what it always was, so the new transform cannot be the
+// reason any existing diagnostic's wording moved.
+TEST(PathIdentitySubstrate, GenericSpellingU8LeavesAnOrdinaryPathAlone) {
+    dss::test_support::ScratchDir sd{dss::test_support::Location::Temp,
+                                     "generic-u8-control"};
+    std::u8string const got = dss::core::genericSpellingU8(sd.path());
+    std::string const   narrow(reinterpret_cast<char const*>(got.data()),
+                             got.size());
+    EXPECT_EQ(narrow, sd.path().generic_string())
+        << "on a path with a leading run below 2 the two spellings must agree "
+           "exactly — this arm is what keeps the fix inert everywhere else";
+}
+
 // The CONTROL, and it is the arm that stops the fix from becoming a regression.
 // A run of ONE separator is a genuine location on the current drive and MUST
 // still be made absolute — `isRootedPath` would have called it rooted and

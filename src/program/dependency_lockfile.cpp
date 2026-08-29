@@ -1,5 +1,6 @@
 #include "program/dependency_lockfile.hpp"
 
+#include "core/substrate/path_identity.hpp"       // genericSpelling
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey — the shared `$` carve-out
 #include "core/types/parse_diagnostic.hpp"
 
@@ -38,7 +39,7 @@ constexpr std::array<std::string_view, 3> kEntryKeys = {"url", "ref",
 void emitLockfileMalformed(DiagnosticReporter& rep, fs::path const& lockPath,
                            std::string detail) {
     report(rep, DiagnosticCode::C_MalformedJson, DiagnosticSeverity::Error,
-           "dependency lockfile '" + lockPath.generic_string() + "': "
+           "dependency lockfile '" + core::genericSpelling(lockPath) + "': "
                + std::move(detail)
                + ". This file is written and read by the compiler and must not "
                  "be edited by hand; it records nothing that cannot be "
@@ -198,7 +199,7 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
         // `create_directories` reports "already exists" as NO error, so a true
         // `ec` here means the directory genuinely could not be established.
         if (ec) {
-            emitLockfileWriteFailed(rep, "the directory '" + dir.generic_string()
+            emitLockfileWriteFailed(rep, "the directory '" + core::genericSpelling(dir)
                                              + "' could not be created: "
                                              + ec.message());
             return false;
@@ -233,7 +234,7 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
         std::ofstream out{tmp, std::ios::binary | std::ios::trunc};
         if (!out) {
             emitLockfileWriteFailed(rep, "the scratch file '"
-                                             + tmp.generic_string()
+                                             + core::genericSpelling(tmp)
                                              + "' could not be opened for "
                                                "writing");
             return false;
@@ -247,7 +248,7 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
         out.close();
         if (!out) {
             emitLockfileWriteFailed(rep, "writing the scratch file '"
-                                             + tmp.generic_string()
+                                             + core::genericSpelling(tmp)
                                              + "' failed");
             std::error_code rmec;
             fs::remove(tmp, rmec);
@@ -258,9 +259,9 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
     std::error_code ec;
     fs::rename(tmp, lockPath, ec);
     if (ec) {
-        emitLockfileWriteFailed(rep, "'" + tmp.generic_string()
+        emitLockfileWriteFailed(rep, "'" + core::genericSpelling(tmp)
                                          + "' could not be renamed over '"
-                                         + lockPath.generic_string()
+                                         + core::genericSpelling(lockPath)
                                          + "': " + ec.message());
         std::error_code rmec;
         fs::remove(tmp, rmec);

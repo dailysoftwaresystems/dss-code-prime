@@ -11016,6 +11016,13 @@ struct Lowerer {
             exportOnlyBlockAddrs_.insert(valueV);
         }
         lir.addFunction(mir.funcSymbol(mf));
+        // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the
+        // per-function MIR fact becomes a module-level LIR entry here, and the
+        // change of shape is the point — see `LirStaticInitEntry` for why each
+        // tier carries it in whatever its own rebuild path already maintains.
+        // `staticInitAdd` refuses an empty schedule, so the ordinary function
+        // costs one predicate and adds nothing.
+        lir.staticInitAdd(mir.funcSymbol(mf), mir.funcStaticInit(mf));
 
         // Pre-pass 1: pre-allocate LIR blocks (1:1 with MIR blocks).
         std::uint32_t const blockCount = mir.funcBlockCount(mf);

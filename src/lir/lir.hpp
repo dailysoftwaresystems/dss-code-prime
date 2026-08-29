@@ -4,6 +4,7 @@
 #include "core/substrate/arena_attribute.hpp"
 #include "core/substrate/arena_container.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/section_kind.hpp"   // StaticInitSchedule
 #include "core/types/target_schema.hpp"
 #include "lir/lir_literal_pool.hpp"
 #include "lir/lir_node.hpp"
@@ -38,6 +39,30 @@
 
 namespace dss {
 
+// ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ─────────────
+//
+// One entry in a module's STATIC-INITIALIZER SCHEDULE: a function the runtime
+// runs around the program's entry, and its priority in each channel it joins.
+//
+// ★★ KEYED BY `SymbolId`, NEVER BY A FUNCTION INDEX. `SymbolId` is the identity
+// that survives every rebuild verbatim; a function ORDINAL does not — the
+// optimizer's `stripInlineDefinitions` epilogue reorders ordinals at EVERY
+// optimization level, and a list holding indices would silently start naming
+// different functions after it ran. The same reasoning `stripInlineDefinitions`
+// states for its own carrier applies unchanged here, and the consequence of
+// getting it wrong is worse: an initializer table pointing at the wrong code.
+//
+// ★ IT IS A MODULE-LEVEL LIST AT THIS TIER AND A PER-FUNCTION FIELD AT MIR, on
+// purpose. MIR is rebuilt function-by-function through one chokepoint that
+// copies per-function state, so a field rides for free there; LIR is rebuilt by
+// five passes that share ONE `copyModuleSideStructures` helper, so a module-level
+// list rides for free HERE. Each tier uses the carrier its own rebuild shape
+// already maintains, rather than one shape forced through both.
+struct LirStaticInitEntry {
+    SymbolId           symbol{};
+    StaticInitSchedule schedule{};
+};
+
 class DSS_EXPORT Lir {
 public:
     using InstArena  = substrate::ArenaContainer<detail::LirInst,  LirInstId,  LirModuleId>;
@@ -63,7 +88,13 @@ public:
         FuncArena funcArena, std::vector<LirOperand> operandPool,
         std::vector<LirBlockId> succPool,
         LirLiteralPool literalPool,
-        LirRegConstraintPool regConstraintPool) noexcept;
+        LirRegConstraintPool regConstraintPool,
+        // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the
+        // THIRD module-level side structure, and a TRAILING NON-DEFAULTED
+        // parameter for the reason this ctor's own comment already gives
+        // about the first two — a side structure with a default is one
+        // `finish()` can silently omit.
+        std::vector<LirStaticInitEntry> staticInit) noexcept;
 
     Lir(Lir const&)            = delete;
     Lir& operator=(Lir const&) = delete;
@@ -133,6 +164,12 @@ public:
         return literalPool_.at(i);
     }
     [[nodiscard]] LirLiteralPool const& literalPool() const noexcept { return literalPool_; }
+    // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the
+    // module's static-initializer schedule, in no particular order — the
+    // ORDER is computed by the linker, which is the only tier that can see
+    // every translation unit at once.
+    [[nodiscard]] std::span<LirStaticInitEntry const>
+    staticInitSchedule() const noexcept { return staticInit_; }
 
     // ── register-constraint pool (inline-asm carrier) ──
     [[nodiscard]] LirRegConstraintPool const& regConstraintPool() const noexcept {
@@ -148,6 +185,7 @@ private:
     std::vector<LirBlockId>   succPool_;
     LirLiteralPool            literalPool_;
     LirRegConstraintPool      regConstraintPool_;
+    std::vector<LirStaticInitEntry> staticInit_;
 };
 
 static_assert(substrate::Arena<Lir>,
@@ -293,6 +331,15 @@ public:
     // this for int64/double/string literals that don't fit in the
     // 8-byte operand POD's `immInt32` arm.
     [[nodiscard]] std::uint32_t literalPoolAdd(LirLiteralValue value);
+
+    // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: record that
+    // `symbol` is in the module's static-initializer schedule. The re-add
+    // primitive for the third module-level side structure, mirroring
+    // `literalPoolAdd` — `lir_pass_util::copyModuleSideStructures` calls it for
+    // every entry so the five rebuild passes carry the schedule with no per-pass
+    // edit. A schedule with nothing in it is not recorded (an empty entry names a
+    // function that is in no channel, which is every ordinary function).
+    void staticInitAdd(SymbolId symbol, StaticInitSchedule schedule);
 
     // ── per-instruction register constraints ──────────────────────
     //
@@ -468,6 +515,7 @@ private:
     std::vector<LirBlockId> succPool_;
     LirLiteralPool          literalPool_;
     LirRegConstraintPool    regConstraintPool_;
+    std::vector<LirStaticInitEntry> staticInit_;
 
     // MODULE-wide, and deliberately NOT in the per-function block below: a
     // refusal abandons the whole rebuild, not one function, so `addFunction`

@@ -1,5 +1,7 @@
 #include "core/substrate/checked_file_read.hpp"
 
+#include "core/substrate/path_identity.hpp"  // genericSpelling
+
 #include <fstream>
 #include <ios>
 #include <istream>
@@ -109,10 +111,18 @@ readStreamChecked(std::istream& in, std::string_view label,
 
 std::expected<std::string, FileReadError>
 readFileChecked(fs::path const& path) {
-    // `generic_string()` throughout: one spelling of a path in a diagnostic, on
-    // every host. (Several call sites already rendered it this way and their
-    // wording is asserted by tests.)
-    std::string const shown = path.generic_string();
+    // ONE spelling of a path in a diagnostic, on every host. (Several call
+    // sites already rendered it this way and their wording is asserted by
+    // tests.)
+    //
+    // ★ `genericSpelling` AND NOT `path.generic_string()`. This is the chokepoint
+    // EVERY checked read reports through, so it is the single site where the
+    // loss would reach the most messages: `readFileChecked` is handed whatever
+    // the caller was given — a CLI argument, a config path, a descriptor — and
+    // the four errors below are the only thing an operator sees when one of them
+    // cannot be read. The two spellings are byte-identical for every path with a
+    // leading separator run below 2, so no asserted wording moves.
+    std::string const shown = genericSpelling(path);
 
     std::ifstream in(path, std::ios::binary);
     if (!in) {

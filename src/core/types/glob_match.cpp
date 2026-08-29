@@ -1,5 +1,7 @@
 #include "core/types/glob_match.hpp"
 
+#include "core/substrate/path_identity.hpp"     // genericSpelling /
+                                                // normalizeKeepingRoot
 #include "core/types/include_path_resolve.hpp"  // isRootedPath — the ONE
                                                 // rooted-path predicate
 
@@ -206,8 +208,13 @@ bool expandGlob(std::string_view pattern,
         std::error_code fec;
         auto const lit = rebase(fs::path{std::string{pattern}});
         if (fs::exists(lit, fec) && !fec) {
+            // `core::genericSpelling` and NOT `lit.generic_string()`: what this
+            // pushes is not a message, it is the SOURCE PATH the compiler will
+            // open. `rebase` above is careful to leave a multi-separator
+            // authority alone; rendering it here with the lossy spelling would
+            // hand that care straight back.
             out.push_back(baseDir.empty() ? std::string{pattern}
-                                          : lit.generic_string());
+                                          : core::genericSpelling(lit));
         }
         return true;
     }
@@ -270,9 +277,20 @@ bool expandGlob(std::string_view pattern,
         // error) is fatal.
         entEc.clear();
         if (!it->is_regular_file(entEc)) continue;
+        // ⚠ THE TWO RENDERINGS BELOW ARE DELIBERATELY DIFFERENT, AND THE
+        // ASYMMETRY IS THE MEASUREMENT. `lexically_relative` yields a path with
+        // NO root — ✔MEASURED 2026-08-28 against a reachable UNC base:
+        // `//localhost/C$/…/leaf.c` relative to `//localhost/C$/…` is `leaf.c`,
+        // leading run 0 — so nothing there can lose an authority and the plain
+        // spelling is exact. The MATCH, by contrast, is the absolute source path
+        // handed on to be compiled, and it passes through BOTH lossy transforms:
+        // measured on that same base, `lexically_normal()` alone already
+        // returned `\localhost\C$\…\leaf.c`. A glob over a share would have
+        // yielded a whole source list naming a local drive that has none of it.
         std::string const rel = it->path().lexically_relative(base).generic_string();
         if (globMatch(tail, rel)) {
-            matched.push_back(it->path().lexically_normal().generic_string());
+            matched.push_back(
+                core::genericSpelling(core::normalizeKeepingRoot(it->path())));
         }
     }
 

@@ -1000,7 +1000,9 @@ public:
                          src_.funcBinding(caller), src_.funcVisibility(caller),
                          src_.funcNoInline(caller), src_.funcAlwaysInline(caller),
                          src_.funcNoOptimize(caller),
-                         src_.funcNoSanitizeThread(caller));
+                         src_.funcNoSanitizeThread(caller),
+                         // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN
+                         src_.funcStaticInit(caller));
 
         std::uint32_t const nb = src_.funcBlockCount(caller);
 

@@ -1,5 +1,6 @@
 #include "ffi/ingest.hpp"
 
+#include "core/substrate/path_identity.hpp"  // genericSpelling
 #include "core/types/parse_diagnostic.hpp"
 #include "ffi/abi/abi_catalog.hpp"
 #include "ffi/binary_reader.hpp"
@@ -149,7 +150,7 @@ checkLibraryMatchesTargetFormat(std::filesystem::path const& libraryPath,
             "satisfy a {3} link, and binding its exports would record an import "
             "the loader can never resolve. Point --resolve-library at the {3} "
             "build of this library, or build for a {1} target.",
-            libraryPath.generic_string(),
+            core::genericSpelling(libraryPath),
             objectFormatKindName(*detected),
             format.name(),
             objectFormatKindName(format.kind())),
@@ -288,7 +289,7 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
         return std::unexpected(HeaderReadError{
             HeaderReadErrorKind::FileOpenFailed,
             std::string{"readCHeaderDirectory: not a directory: "}
-                + headerDir.generic_string()
+                + core::genericSpelling(headerDir)
         });
     }
     if (importLibrary.empty()) {

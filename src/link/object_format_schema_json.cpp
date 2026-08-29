@@ -349,7 +349,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // (absence is "makes no claim", the deleted table's own behaviour for an
     // unlisted target), so the asymmetry applies in its harmless direction.
     // 32 + 1 = 33.
-    static constexpr std::array<std::string_view, 33> kFormatDocumentKeys{
+    static constexpr std::array<std::string_view, 34> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -405,7 +405,14 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // it at all.
         "weakDefinition",
         // section / relocation description
-        "sections", "relocations", "supportedDataSections"};
+        "sections", "relocations", "supportedDataSections",
+        // WHO RUNS THE STATIC-INITIALIZER SCHEDULE
+        // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN). It sits
+        // with the program-entry cluster in spirit — it answers a question about
+        // what happens around the entry function — but it is listed here because
+        // the thing it governs is the emitted init-array/fini-array SECTIONS
+        // directly above, and the validate() rule below ties the two together.
+        "staticInitializers"};
     DSS_CHECK_KEY_VOCABULARY(kFormatDocumentKeys);
 
     // ★ THE PER-KIND IDENTITY BLOCKS ARE **NOT** LISTED ABOVE ANY MORE, and
@@ -2763,6 +2770,67 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     }
                 }
                 ++i;
+            }
+        }
+    }
+
+    // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ──
+    //
+    // `staticInitializers` — WHO walks the init-array / fini-array tables this
+    // format emits. A `{ "runner": ... }` OBJECT rather than a bare scalar,
+    // mirroring `processExit`'s shape, because the question "who runs the
+    // schedule" is the first of a family (a future document may need to name the
+    // boundary symbols a foreign crt expects) and a scalar would have to be
+    // widened incompatibly on the day the second key arrives.
+    //
+    // Absent ⇒ the document makes no claim, which is correct for a relocatable
+    // object or a static library. The validate() rule pairs it with the section
+    // rows so an EXEC flavor cannot emit a table nothing walks.
+    if (doc.contains("staticInitializers")) {
+        static constexpr std::array<std::string_view, 1> kStaticInitKeys{
+            {"runner"}};
+        DSS_CHECK_KEY_VOCABULARY(kStaticInitKeys);
+        json const& si = doc.at("staticInitializers");
+        if (!si.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/staticInitializers",
+                      "'staticInitializers' must be an OBJECT — the "
+                      "`processExit` shape, so a second key can join it without "
+                      "an incompatible widening");
+        } else {
+            for (auto const& [k, unused] : si.items()) {
+                (void)unused;
+                if (k.starts_with('$')) continue;
+                if (std::ranges::find(kStaticInitKeys, k) != kStaticInitKeys.end())
+                    continue;
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("/staticInitializers/{}", k),
+                          std::format("unknown key '{}' in 'staticInitializers' "
+                                      "(accepted: {})",
+                                      k, allowedList(kStaticInitKeys)));
+            }
+            if (!si.contains("runner") || !si.at("runner").is_string()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/staticInitializers/runner",
+                          std::format("'runner' is REQUIRED and must be one of "
+                                      "{} — a `staticInitializers` block that "
+                                      "names no runner declares the capability "
+                                      "and answers nothing, which is the one "
+                                      "state that emits an initializer table "
+                                      "with nothing to walk it",
+                                      allowedList(allNames(kStaticInitRunnerTable))));
+            } else {
+                auto const name = si.at("runner").get<std::string>();
+                auto const r    = staticInitRunnerFromName(name);
+                if (!r.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/staticInitializers/runner",
+                              std::format("unknown static-initializer runner "
+                                          "'{}' (expected {})",
+                                          name,
+                                          allowedList(allNames(kStaticInitRunnerTable))));
+                } else {
+                    data.staticInitRunner = *r;
+                }
             }
         }
     }

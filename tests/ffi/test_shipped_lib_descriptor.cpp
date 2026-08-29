@@ -70,6 +70,114 @@ namespace {
 
 // ── Happy path: structural FnSig inspection ──────────────────────────────────
 
+// ── [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]] ─────
+//
+// A `realization.source` THAT NAMES AN AUTHORITY MUST BE REFUSED. The decode
+// states the rule plainly — the path is "RELATIVE to src/dss-config/" and "a
+// `..` component or an absolute/rooted spelling would let a descriptor reach an
+// arbitrary file on the host, so both are refused HERE rather than at the
+// filesystem" — and the predicate it asked did not implement it.
+//
+// ★★★ THE HOLE, ✔MEASURED 2026-08-28 on the toolchain that builds DSS:
+//     '//host/share/x'.is_absolute()        -> FALSE
+//     '//host/share/x'.has_root_name()      -> FALSE   (empty root_name)
+//     '//host/share/x'.has_root_directory() -> TRUE
+// The guard asked `is_absolute() || has_root_name()`, so an all-forward-slash
+// authority passed every test it applied: the backslash check never saw one, and
+// none of `//`, `host`, `share`, `x` is `.` or `..`. `resolveShippedSource` then
+// JOINS it, and `operator/` with a rooted right operand REPLACES rather than
+// appends — so the composed path is the descriptor's, not the config root's.
+//
+// ⚠ NO HOST UNC SUPPORT IS NEEDED AND THAT IS WHY THIS ARM CARRIES THE CLASS ON
+// EVERY LEG. The defect is in CLASSIFYING a string, not in reaching a file, so
+// there is nothing to skip: `//host/share/x` is refused, or it is not.
+//
+// ⚠⚠ THE ASSERTION IS ON THE CONTAINMENT MESSAGE, NOT ON `hasErrors()`, AND THAT
+// CORRECTION CAME FROM THE RED-ON-DISABLE ITSELF. The first version of this arm
+// asked only whether the read reported ANY error; it stayed GREEN over a built,
+// verified mutant (object md5 moved and returned) because a descriptor naming a
+// source that is not there ALSO fails, one tier later, with a completely
+// different diagnostic. A true answer to an adjacent question — and it fails
+// toward "clean", so nothing would have flagged it.
+[[nodiscard]] bool sawContainmentRefusal(DiagnosticReporter const& rep) {
+    for (auto const& d : rep.all())
+        if (d.actual.find("must be a non-empty path RELATIVE to")
+            != std::string::npos)
+            return true;
+    return false;
+}
+
+TEST(ShippedLibDescriptor, RealizationSourceNamingAnAuthorityIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib-escape"};
+    auto const path = writeTemp(dir, "escape.json", R"({
+        "header": "escape.h",
+        "realization": { "elf": { "source": "//host/share/evil.c" } },
+        "symbols": [
+            { "name": "e", "signature": "fn() -> i32",
+              "kind": "function", "linkage": "external" }
+        ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    static_cast<void>(readShippedLibDescriptor(path, interner, typeReg, rep));
+    EXPECT_TRUE(sawContainmentRefusal(rep))
+        << "a realization source whose root is a multi-separator authority was "
+           "accepted as a path relative to src/dss-config/, so a descriptor can "
+           "name a file on another machine";
+}
+
+// The same rule for a SINGLE leading separator, which the old predicate also let
+// through on this host: `/abs/x` answers `is_absolute()` FALSE with an empty
+// `root_name()` wherever a drive letter is what makes a path absolute. It is a
+// location on the current drive, not inside the config root, so it escapes too.
+TEST(ShippedLibDescriptor, RealizationSourceNamingARootedPathIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib-escape-rooted"};
+    auto const path = writeTemp(dir, "rooted.json", R"({
+        "header": "rooted.h",
+        "realization": { "elf": { "source": "/etc/evil.c" } },
+        "symbols": [
+            { "name": "r", "signature": "fn() -> i32",
+              "kind": "function", "linkage": "external" }
+        ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    static_cast<void>(readShippedLibDescriptor(path, interner, typeReg, rep));
+    EXPECT_TRUE(sawContainmentRefusal(rep))
+        << "a root-relative realization source escaped the config root";
+}
+
+// The CONTROL, chosen to be INERT: an ordinary relative source with no root at
+// all must still be ACCEPTED. This is what keeps the widened predicate from
+// being a blanket refusal — `isRootedPath` answers FALSE here, exactly as the
+// pair it replaced did.
+TEST(ShippedLibDescriptor, RealizationSourceThatIsPlainlyRelativeIsAccepted) {
+    ScratchDir dir{Location::Temp, "shipped-lib-escape-control"};
+    auto const path = writeTemp(dir, "ok.json", R"({
+        "header": "ok.h",
+        "realization": { "elf": { "source": "runtime/ok.c" } },
+        "symbols": [
+            { "name": "k", "signature": "fn() -> i32",
+              "kind": "function", "linkage": "external" }
+        ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    static_cast<void>(readShippedLibDescriptor(path, interner, typeReg, rep));
+    // The descriptor names a source that does not exist in this scratch tree, so
+    // the read legitimately reports THAT. What must not appear is the
+    // containment refusal — the assertion is on the message, not on the count.
+    EXPECT_FALSE(sawContainmentRefusal(rep))
+        << "a plainly relative realization source was refused as an escape — "
+           "the widened predicate became a regression";
+}
+
 TEST(ShippedLibDescriptor, ReadsPutsWithDecodedFnSig) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "stdio.json", R"({

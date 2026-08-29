@@ -1603,7 +1603,7 @@ struct SynthBuilder {
                                        + k.name + "' has no literal spelling this "
                                          "language's integerLiteralTyping ladder "
                                          "verifies (descriptor "
-                                       + p.generic_string() + ")");
+                                       + core::genericSpelling(p) + ")");
                         }
                         continue;
                     }
@@ -1633,7 +1633,7 @@ struct SynthBuilder {
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
                        SourceSpan::empty(0),
                        std::string{"shipped-header descriptor malformed (macros): "}
-                           + descPath->generic_string()
+                           + core::genericSpelling(*descPath)
                            + (parentMacrosDetail.empty()
                                   ? std::string{}
                                   : std::string{" — "} + parentMacrosDetail));

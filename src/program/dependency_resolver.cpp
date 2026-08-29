@@ -4,6 +4,7 @@
 #include "core/types/artifact_profile.hpp"
 #include "core/types/config_path_walk.hpp"   // findShippedConfigDir
 #include "core/types/grammar_schema.hpp"
+#include "core/types/include_path_resolve.hpp"  // isRootedPath — the ONE rooted-path predicate
 #include "core/types/object_format_kind.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -311,15 +312,28 @@ Resolver::locateEntry_(Node const& parent, DependencyEntry const& entry,
         // B.3: a DEPENDENCY path is relative to the CONSUMING manifest's own
         // directory. Anything else makes a dependency's meaning depend on
         // where the depender happened to be invoked from.
-        dir = canonicalize(raw.is_absolute() ? raw : (parent.dir / raw));
+        //
+        // ⚠ `isRootedPath`, NOT `is_absolute()`
+        // ([[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] is the same
+        // discriminator, on the include path). ✔MEASURED 2026-08-28 on a
+        // REACHABLE UNC directory with the toolchain that builds DSS:
+        //     '//localhost/C$/…'.is_absolute()   -> FALSE
+        //     'C:/some/consumer/project' / that  -> 'C://localhost/C$/…'
+        // So the bare test classifies a dependency that names ANOTHER MACHINE
+        // as relative and glues the consumer's DRIVE in front of the authority.
+        // That is the exact silent relocation the paragraph above forbids, and
+        // it fails as a not-a-directory report naming a path the manifest never
+        // wrote. The run of TWO is the discriminator; a run of ONE is genuinely
+        // a location on this drive and must keep being re-based.
+        dir = canonicalize(isRootedPath(raw) ? raw : (parent.dir / raw));
         std::error_code ec;
         if (!fs::is_directory(dir, ec)) {
             emitDriverError(
                 rep_, DiagnosticCode::D_FileNotFound,
                 "project 'dependsOn': path dependency '" + spelling
-                + "' declared by '" + parent.manifestPath.generic_string()
+                + "' declared by '" + core::genericSpelling(parent.manifestPath)
                 + "' does not name a directory (looked at '"
-                + dir.generic_string()
+                + core::genericSpelling(dir)
                 + "'). A path entry names the dependency's project DIRECTORY, "
                   "resolved against the directory of the manifest that "
                   "declares it.");
@@ -337,15 +351,15 @@ Resolver::locateEntry_(Node const& parent, DependencyEntry const& entry,
         emitGuaranteed(
             rep_, DiagnosticCode::D_DependencyManifestNotFound,
             "project 'dependsOn': '" + spelling + "' (declared by '"
-            + parent.manifestPath.generic_string()
-            + "') resolves to the directory '" + dir.generic_string()
+            + core::genericSpelling(parent.manifestPath)
+            + "') resolves to the directory '" + core::genericSpelling(dir)
             + "', but that directory holds no '"
             + std::string{kDependencyManifestName}
             + "'. The directory exists — it is simply not a DSS project. The "
               "usual cause is a path one level too deep (name the project "
               "directory, not its 'src'); the other is a dependency that has "
               "no manifest yet, in which case add '"
-            + (manifest).generic_string() + "'.");
+            + core::genericSpelling(manifest) + "'.");
         return std::nullopt;
     }
     return canonicalize(manifest);
@@ -379,7 +393,7 @@ bool Resolver::registerOutputName_(Node& node) {
         emitGuaranteed(
             rep_, DiagnosticCode::D_DependencyOutputNameCollision,
             "project 'dependsOn': the dependency at '"
-            + node.dir.generic_string()
+            + core::genericSpelling(node.dir)
             + "' derives no usable output name from its directory (got '" + name
             + "'). Dependency artifacts are filed under '"
             + std::string{kDependencyOutputDirName}
@@ -388,13 +402,13 @@ bool Resolver::registerOutputName_(Node& node) {
         return false;
     }
     auto const [it, inserted] =
-        outputNameOwner_.emplace(name, node.dir.generic_string());
-    if (!inserted && it->second != node.dir.generic_string()) {
+        outputNameOwner_.emplace(name, core::genericSpelling(node.dir));
+    if (!inserted && it->second != core::genericSpelling(node.dir)) {
         emitGuaranteed(
             rep_, DiagnosticCode::D_DependencyOutputNameCollision,
             "project 'dependsOn': two different dependencies both derive the "
             "output name '" + name + "' — '" + it->second + "' and '"
-            + node.dir.generic_string()
+            + core::genericSpelling(node.dir)
             + "'. Their artifacts would both be written to '"
             + std::string{kDependencyOutputDirName} + "/" + name
             + "/', so whichever is built second would silently overwrite the "
@@ -432,7 +446,16 @@ bool Resolver::prepareNodeSources_(std::size_t index) {
 std::optional<std::size_t>
 Resolver::admitNode_(std::size_t parent, fs::path const& manifestPath,
                      std::size_t depth) {
-    std::string const key = manifestPath.generic_string();
+    // ★★ NOT A DIAGNOSTIC — THE GRAPH'S IDENTITY. This key answers both
+    // "is this node on the stack (a cycle)" and "have I seen it before (a
+    // diamond)", and `manifestPath` arrives from `canonicalize`, i.e. from
+    // `PathIdentity`, which goes to some trouble to keep a multi-separator root
+    // intact. `generic_string()` threw that away one line later: two manifests
+    // differing ONLY in their leading separator run folded to ONE key, which on
+    // the diamond arm silently substitutes one project's node for another's.
+    // `core::genericSpelling` of an already-canonical path reproduces that
+    // path's identity key exactly.
+    std::string const key = core::genericSpelling(manifestPath);
 
     // ── CYCLE vs DIAMOND, and they are answered by two different tables ──────
     // ON THE STACK ⇒ a cycle: fail loud with the PATH as payload, because a
@@ -440,10 +463,10 @@ Resolver::admitNode_(std::size_t parent, fs::path const& manifestPath,
     // VISITED but NOT on the stack ⇒ a diamond, i.e. a legitimate shared
     // dependency, and it must NOT diagnose — the memo answers it.
     for (std::size_t i = 0; i < stack_.size(); ++i) {
-        if (nodes_[stack_[i]].manifestPath.generic_string() != key) continue;
+        if (core::genericSpelling(nodes_[stack_[i]].manifestPath) != key) continue;
         std::string cycle;
         for (std::size_t j = i; j < stack_.size(); ++j) {
-            cycle += nodes_[stack_[j]].manifestPath.generic_string();
+            cycle += core::genericSpelling(nodes_[stack_[j]].manifestPath);
             cycle += "\n    -> ";
         }
         cycle += key;
@@ -471,7 +494,7 @@ Resolver::admitNode_(std::size_t parent, fs::path const& manifestPath,
     if (depth > kMaxDependencyDepth) {
         std::string chain;
         for (std::size_t const s : stack_) {
-            chain += "\n    " + nodes_[s].manifestPath.generic_string();
+            chain += "\n    " + core::genericSpelling(nodes_[s].manifestPath);
         }
         emitDriverError(
             rep_, DiagnosticCode::D_DependencyGraphTooDeep,
@@ -585,7 +608,7 @@ Resolver::admitNode_(std::size_t parent, fs::path const& manifestPath,
                     "project 'dependsOn': source-merge dependency '" + key
                     + "' declares language '" + node.config.language
                     + "', but the consumer '"
-                    + consumer.manifestPath.generic_string()
+                    + core::genericSpelling(consumer.manifestPath)
                     + "' compiles '" + consumer.config.language
                     + "'. A source-merge dependency's translation units join "
                       "the consumer's own set and are parsed by the consumer's "
@@ -664,7 +687,7 @@ bool Resolver::walkChildren_(std::size_t parent, std::size_t depth) {
                 return false;          // 0xD01E already reported
             }
             // The checkout path replaces the name for the locate step below.
-            gitNames[i] = got.checkout.generic_string();
+            gitNames[i] = core::genericSpelling(got.checkout);
         }
     }
 
@@ -730,7 +753,7 @@ Resolver::deriveFormat_(Node const& node, std::string const& consumerSpec,
         emitDriverError(
             rep_, DiagnosticCode::D_DependencyTargetFormatUnresolvable,
             "project 'dependsOn': no shipped object format can build dependency "
-            "'" + node.manifestPath.generic_string() + "' for the consumer "
+            "'" + core::genericSpelling(node.manifestPath) + "' for the consumer "
             "target '" + consumerSpec + "'. The search was: format kind '"
             + std::string{objectFormatKindName(consumerFmt.kind())}
             + "' (taken from the consumer's own format '"
@@ -752,7 +775,7 @@ Resolver::deriveFormat_(Node const& node, std::string const& consumerSpec,
         rep_, DiagnosticCode::D_DependencyTargetFormatAmbiguous,
         "project 'dependsOn': " + std::to_string(candidates.size())
         + " shipped object formats can build dependency '"
-        + node.manifestPath.generic_string() + "' for the consumer target '"
+        + core::genericSpelling(node.manifestPath) + "' for the consumer target '"
         + consumerSpec + "' — " + list
         + ". The derivation must be UNIQUE: with two producers the pick decides "
           "the dependency's container, and therefore what the consumer's link "
@@ -832,7 +855,7 @@ Resolver::buildNode_(std::size_t index, std::string const& consumerSpec,
     std::vector<std::string> const sources = buildSourcesFor_(index);
     if (sources.empty()) {
         emitDriverError(rep_, DiagnosticCode::D_EmptyInput,
-                        "dependency '" + node.manifestPath.generic_string()
+                        "dependency '" + core::genericSpelling(node.manifestPath)
                         + "' resolved to no source files at all, so there is "
                           "nothing to build for consumer target '"
                         + consumerSpec + "'.");
@@ -872,7 +895,7 @@ Resolver::buildNode_(std::size_t index, std::string const& consumerSpec,
         // is unchanged — the attribution it carries, and the prefixed inner
         // diagnostics merged just above, are the load-bearing half.
         emitDriverError(rep_, DiagnosticCode::D_DependencyBuildFailed,
-                        "dependency '" + node.manifestPath.generic_string()
+                        "dependency '" + core::genericSpelling(node.manifestPath)
                         + "' failed to build for consumer target '"
                         + consumerSpec + "' (built as '" + depSpec
                         + "'). The reason is in the diagnostic(s) above, "
@@ -883,7 +906,7 @@ Resolver::buildNode_(std::size_t index, std::string const& consumerSpec,
     auto const& produced = prog.artifactPaths();
     if (produced.size() != 1 || !produced.front().has_value()) {
         emitDriverError(rep_, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
-                        "dependency '" + node.manifestPath.generic_string()
+                        "dependency '" + core::genericSpelling(node.manifestPath)
                         + "' reported a successful build for '" + depSpec
                         + "' but produced no artifact path, so there is nothing "
                           "to link into consumer target '" + consumerSpec
@@ -949,7 +972,7 @@ Resolver::gather_(std::size_t index, std::string const& consumerSpec,
                    *nodes_[child].grammar, nodes_[child].config.language,
                    target, consumerSpec,
                    "project 'dependsOn': dependency '"
-                       + nodes_[child].manifestPath.generic_string() + "'",
+                       + core::genericSpelling(nodes_[child].manifestPath) + "'",
                    rep_)) {
             return std::nullopt;
         }
@@ -1009,7 +1032,7 @@ std::optional<DependencyResolution> Resolver::run(ProjectConfig const& rootConfi
     // be able to claim `deps/<consumer name>/` with no complaint, which reads
     // as the consumer's own output tree.
     nodes_.push_back(std::move(root));
-    nodeByManifest_.emplace(nodes_.front().manifestPath.generic_string(),
+    nodeByManifest_.emplace(core::genericSpelling(nodes_.front().manifestPath),
                             std::size_t{0});
     if (!registerOutputName_(nodes_.front())) return std::nullopt;
 

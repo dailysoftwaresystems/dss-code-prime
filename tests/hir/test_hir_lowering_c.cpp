@@ -9744,3 +9744,147 @@ TEST(HirLoweringC, NullptrTObjectIsProjectedToItsPointerRepresentation) {
            "alignment and representation of `void *`), alongside the real void* "
            "local";
 }
+
+// ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ─────────────
+//
+// The STATIC-INITIALIZER SCHEDULE, at the tier where the front-end fact becomes
+// a carried one. Everything below the HIR reads `LinkageAttr::staticInit`, so a
+// fact missing here is a program whose initializer never runs — the exact defect
+// this anchor was filed for.
+//
+// ⚠⚠ THE PAIR OF PINS BELOW IS THE POINT, NOT EITHER ONE ALONE. Adding
+// `constructor` to the language's `attributeEffects` table SILENCES the
+// `H_UnknownLinkageSpecifier` warning BY CONSTRUCTION — the ignored-names roster
+// is DERIVED from that table and the derivation is verb-blind. So "the warning
+// stopped" is NOT evidence the attribute is honoured; it is equally consistent
+// with the attribute having become silently inert, which is STRICTLY WORSE than
+// the announced divergence it replaced. The schedule assertion is what tells the
+// two apart, and the `frobnicate` control is what stops the silencing from
+// widening to names the language really does not model.
+TEST(HirLoweringC, GnuConstructorAttributeRecordsTheBeforeEntrySchedule) {
+    SemanticModel model = analyzeC(
+        "static int g = 0; "
+        "__attribute__((constructor)) static void init(void){ g = 42; } "
+        "int main(void){ return g; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "`constructor` is vocabulary this language now MODELS, so the linkage "
+           "scan must not adjudicate it";
+    HirNodeId const f = functionNamed(res->hir, model, "init");
+    ASSERT_TRUE(f.valid());
+    ASSERT_TRUE(res->linkageMap.has(f))
+        << "the side-table is sparse, and `recordLinkage`'s sparseness test had "
+           "to GROW to ask about the schedule — an absent entry here means a "
+           "non-`static` constructor would have been dropped while the `static` "
+           "spelling worked";
+    auto const sched = res->linkageMap.get(f).staticInit;
+    ASSERT_TRUE(sched.beforeEntry().has_value())
+        << "the function must be recorded in the BEFORE-entry channel";
+    EXPECT_EQ(*sched.beforeEntry(), kUnprioritizedStaticInit)
+        << "the bare spelling is the UNPRIORITIZED priority, which sorts LAST "
+           "among constructors — a zero here would sort it first, the opposite "
+           "of what all three references do";
+    EXPECT_FALSE(sched.afterEntry().has_value())
+        << "a `constructor` joins ONE channel";
+}
+
+// THE CONTROL for the pin above: silencing `constructor` must not silence a name
+// the language models NOWHERE. Without this pair, deleting the unknown-name arm
+// outright would look like the feature working.
+TEST(HirLoweringC, GnuConstructorSilencingDoesNotWidenToUnmodelledNames) {
+    SemanticModel model = analyzeC(
+        "__attribute__((frobnicate)) int gv = 11; "
+        "__attribute__((constructor)) static void init(void){ gv = 42; } "
+        "int main(void){ return gv; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok) << "…as a WARNING: every reference compiles this";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "EXACTLY one — `frobnicate` still reported, `constructor` no longer. "
+           "A count of 2 means the schedule landed without the config row; a "
+           "count of 0 means the config row silenced the typo protection too, "
+           "which is the announced-to-silent regression this anchor forbids";
+}
+
+// The PRIORITY argument reaches the schedule. An implementation that parsed the
+// attribute and dropped `(101)` runs a program's initializers in an order all
+// three references disagree with, and nothing above this tier could tell.
+TEST(HirLoweringC, GnuConstructorPriorityArgumentReachesTheSchedule) {
+    SemanticModel model = analyzeC(
+        "__attribute__((constructor(101))) static void early(void){} "
+        "__attribute__((destructor(102)))  static void late(void){} "
+        "int main(void){ return 0; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok);
+    HirNodeId const e = functionNamed(res->hir, model, "early");
+    HirNodeId const l = functionNamed(res->hir, model, "late");
+    ASSERT_TRUE(e.valid() && l.valid());
+    ASSERT_TRUE(res->linkageMap.has(e) && res->linkageMap.has(l));
+    auto const es = res->linkageMap.get(e).staticInit;
+    auto const ls = res->linkageMap.get(l).staticInit;
+    ASSERT_TRUE(es.beforeEntry().has_value());
+    EXPECT_EQ(*es.beforeEntry(), 101u);
+    EXPECT_FALSE(es.afterEntry().has_value());
+    ASSERT_TRUE(ls.afterEntry().has_value());
+    EXPECT_EQ(*ls.afterEntry(), 102u);
+    EXPECT_FALSE(ls.beforeEntry().has_value())
+        << "`destructor` joins the AFTER-entry channel only — a schedule that "
+           "filed it in both would run it twice";
+}
+
+// ✔MEASURED (mingw-w64 gcc 13.2.0): `__attribute__((constructor,destructor))`
+// compiles clean under `-Wall -Wextra` and runs at BOTH ends. One function, two
+// channels, and each may carry its own priority — which is why the schedule is
+// two independent optionals rather than a phase plus a priority. A design that
+// collapsed them would silently drop one half of every such declaration.
+TEST(HirLoweringC, GnuConstructorAndDestructorOnOneFunctionOccupyBothChannels) {
+    SemanticModel model = analyzeC(
+        "__attribute__((constructor(101))) __attribute__((destructor(102))) "
+        "static void both(void){} "
+        "int main(void){ return 0; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok);
+    HirNodeId const f = functionNamed(res->hir, model, "both");
+    ASSERT_TRUE(f.valid());
+    ASSERT_TRUE(res->linkageMap.has(f));
+    auto const s = res->linkageMap.get(f).staticInit;
+    ASSERT_TRUE(s.beforeEntry().has_value());
+    ASSERT_TRUE(s.afterEntry().has_value());
+    EXPECT_EQ(*s.beforeEntry(), 101u);
+    EXPECT_EQ(*s.afterEntry(), 102u);
+}
+
+// The ordinary C header/impl split: annotate the PROTOTYPE, define plainly. MIR
+// is stamped from the DEFINITION's symbol, so without the redeclaration merge the
+// schedule would be lost between two declarations of one function.
+TEST(HirLoweringC, GnuConstructorOnThePrototypeSurvivesToTheDefinition) {
+    SemanticModel model = analyzeC(
+        "__attribute__((constructor(101))) static void init(void); "
+        "static void init(void){} "
+        "int main(void){ return 0; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok);
+    HirNodeId const f = functionNamed(res->hir, model, "init");
+    ASSERT_TRUE(f.valid());
+    ASSERT_TRUE(res->linkageMap.has(f))
+        << "the prototype's schedule must reach the definition's node";
+    auto const s = res->linkageMap.get(f).staticInit;
+    ASSERT_TRUE(s.beforeEntry().has_value());
+    EXPECT_EQ(*s.beforeEntry(), 101u) << "…with its PRIORITY intact, not merely "
+                                         "the fact that a schedule exists";
+}

@@ -13218,7 +13218,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // to learn the vocabulary, so it is derived from the
                         // vocabulary rather than restated alongside it.
                         static constexpr std::array<
-                            std::pair<std::string_view, AttributeEffect>, 8>
+                            std::pair<std::string_view, AttributeEffect>, 10>
                             kEffectVerbs{{
                                 {"suppressUnused", AttributeEffect::SuppressUnused},
                                 {"warnOnUse",      AttributeEffect::WarnOnUse},
@@ -13244,6 +13244,24 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 // queryable in `.dssir` MIR text.
                                 {"noSanitizeThread",
                                  AttributeEffect::NoSanitizeThread},
+                                // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN:
+                                // the STATIC-INITIALIZER pair (C
+                                // `__attribute__((constructor))` /
+                                // `((destructor))`). DECLARATION-ATTACHED like
+                                // the three verbs above, so the derived
+                                // `linkageSpecifierIgnoredNames` roster picks
+                                // their names up automatically — which is exactly
+                                // the hazard their landing had to close: that
+                                // derivation is VERB-BLIND, so naming them here
+                                // WITHOUT a sink downstream would have silenced
+                                // the `H_UnknownLinkageSpecifier` warning that was
+                                // the only thing telling an author the
+                                // initializer had been dropped. Announced-to-
+                                // silent is strictly worse than the defect; the
+                                // config row and the sink land together or not at
+                                // all.
+                                {"runBeforeEntry", AttributeEffect::RunBeforeEntry},
+                                {"runAfterEntry",  AttributeEffect::RunAfterEntry},
                                 {"none",           AttributeEffect::None}}};
                         DSS_CHECK_KEY_VOCABULARY(kEffectVerbs);
 

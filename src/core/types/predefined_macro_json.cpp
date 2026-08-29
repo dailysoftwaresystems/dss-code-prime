@@ -1,5 +1,6 @@
 #include "core/types/predefined_macro_json.hpp"
 
+#include "core/substrate/path_identity.hpp"     // genericSpelling
 #include "core/types/config_key_vocabulary.hpp" // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY — the SHARED closed-key substrate
 #include "core/types/object_format_kind.hpp"
 
@@ -153,7 +154,10 @@ predefinedMacroDocumentDisagreements(std::string_view configRootDir) {
         }
         if (arr == nullptr) continue;
 
-        std::string const where = f.generic_string();
+        // `f` is a config document found under the shipped-config root, which
+        // `DSS_CONFIG_ROOT` can point anywhere — a share included. `where` is
+        // the only locator on every diagnostic this loop emits.
+        std::string const where = core::genericSpelling(f);
         for (json const& e : *arr) {
             if (!e.is_object()) continue;
             auto const n = e.find("name");

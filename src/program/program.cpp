@@ -828,7 +828,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // `D_DirectoryScanFailed` (mid-scan failure on input dirs).
         emitDriver(reporter, DiagnosticCode::D_OutputDirCreateFailed,
                    "failed to create output directory '"
-                   + outDir.generic_string() + "': " + ec.message());
+                   + core::genericSpelling(outDir) + "': " + ec.message());
         return std::nullopt;
     }
     auto const outPath =
@@ -868,13 +868,29 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // above names still fires: a bare ".." normalizes the parent away, and a
     // differing root-name ("D:app") makes `operator/` REPLACE `outDir` so the
     // parents differ by root.
+    //
+    // ★★ AND BOTH SIDES GO THROUGH `core::normalizeKeepingRoot`, NOT
+    // `lexically_normal()`.
+    // [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]]
+    // Normalising IDENTICALLY is necessary but not
+    // sufficient: `lexically_normal()` collapses a leading separator RUN, so for
+    // an `outDir` naming a share it maps TWO different locations onto ONE
+    // spelling. ✔MEASURED 2026-08-28 — `//host/share/out` normalises to
+    // `\host\share\out`, which is what a genuinely LOCAL `/host/share/out`
+    // normalises to as well. An artifact name carrying that root would then
+    // match the basis and be judged CONTAINED while resolving onto the local
+    // drive — the escape this block exists to refuse, admitted by the
+    // comparison rather than by the rule. `normalizeKeepingRoot` is identical to
+    // `lexically_normal()` for every path with a run below 2, so the `--output .`
+    // repair described above is untouched.
     auto const containmentBasis =
-        (outDir / "dss-containment-probe").lexically_normal().parent_path();
-    if (outPath.lexically_normal().parent_path() != containmentBasis) {
+        core::normalizeKeepingRoot(outDir / "dss-containment-probe")
+            .parent_path();
+    if (core::normalizeKeepingRoot(outPath).parent_path() != containmentBasis) {
         emitDriver(reporter, DiagnosticCode::D_ArtifactNameEscapesOutputDir,
                    "artifact name '" + artifactName.value_or(sourceStem)
                    + "' resolves outside the output directory '"
-                   + outDir.generic_string()
+                   + core::genericSpelling(outDir)
                    + "' — it must be a bare file name (no path separators, no "
                      "drive/root prefix, and not '.' or '..').");
         return std::nullopt;
@@ -1536,7 +1552,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 std::string objs;
                 for (auto const& p : objectPaths) {
                     if (!objs.empty()) objs += ", ";
-                    objs += p.generic_string();
+                    objs += core::genericSpelling(p);
                 }
                 emitDriver(reporter, DiagnosticCode::K_SymbolUndefined,
                            "no program entry: none of the object inputs ("
@@ -2543,7 +2559,7 @@ struct ShippedSourceLanguage {
         emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                    "shipped-source realization: the shipped language directory "
                    "(src/dss-config/sources) could not be located, so '"
-                   + path.generic_string() + "' has no front end to compile it");
+                   + core::genericSpelling(path) + "' has no front end to compile it");
         return {};
     }
 
@@ -2589,7 +2605,7 @@ struct ShippedSourceLanguage {
                 emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                            "shipped-source realization: shipped language '" + name
                            + "' is the only one that claims the extension '" + ext
-                           + "' of '" + path.generic_string()
+                           + "' of '" + core::genericSpelling(path)
                            + "', but it could not be loaded — the reason is in the "
                              "configuration diagnostic(s) above (config: "
                              "src/dss-config/sources/" + name + ".lang.json)");
@@ -2613,11 +2629,11 @@ struct ShippedSourceLanguage {
     emitDriver(rep, DiagnosticCode::D_UnknownFileExtension,
                claimants.empty()
                    ? "shipped-source realization: no shipped language claims the "
-                     "extension '" + ext + "' of '" + path.generic_string()
+                     "extension '" + ext + "' of '" + core::genericSpelling(path)
                          + "', so there is no front end to compile it"
                    : "shipped-source realization: " + std::to_string(claimants.size())
                          + " shipped languages claim the extension '" + ext
-                         + "' of '" + path.generic_string()
+                         + "' of '" + core::genericSpelling(path)
                          + "', so the extension alone cannot name one — refusing "
                            "rather than guessing which front end owns this file");
     return {};
@@ -2747,7 +2763,7 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
     if (ec) {
         emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
                    "shipped-source realization: the descriptor corpus at '"
-                   + descriptorDir.generic_string()
+                   + core::genericSpelling(descriptorDir)
                    + "' could not be walked (" + ec.message()
                    + "), so the descriptor(s) declaring each shipped runtime "
                      "unit cannot be identified — and the runtime object "
@@ -2776,7 +2792,8 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
         // honest answer; `computeRuntimeObjectKey` resolves it against the root
         // and reports the miss where it is real.
         std::string const spelling =
-            (relEc || rel.empty()) ? it->path().generic_string()
+            // The RELATIVE arm has no root to lose; the ABSOLUTE fallback does.
+            (relEc || rel.empty()) ? core::genericSpelling(it->path())
                                    : rel.generic_string();
         for (auto const& source : declared)
             declarers[source].push_back(spelling);
@@ -2790,7 +2807,7 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
                        "shipped-source realization: object format '" + formatKey
                        + "' realizes '" + source
                        + "', but no descriptor under '"
-                       + descriptorDir.generic_string()
+                       + core::genericSpelling(descriptorDir)
                        + "' was found to declare it. The corpus reader and the "
                          "descriptor walk disagree, so the runtime object "
                          "cache key would omit the declaring descriptor's "
@@ -3170,7 +3187,7 @@ void appendSchemaDocuments(
         if (mkEc && !fs::is_directory(unitDir)) {
             emitDriver(rep, DiagnosticCode::D_OutputDirCreateFailed,
                        "shipped-source realization: could not create the "
-                       "staging directory '" + unitDir.generic_string()
+                       "staging directory '" + core::genericSpelling(unitDir)
                        + "' for shipped runtime unit '" + claim.source
                        + "': " + mkEc.message());
             continue;
@@ -3261,7 +3278,8 @@ void appendSchemaDocuments(
         auto const bytes = readWholeBinaryFile(archives.back());
         if (!bytes.has_value()) {
             reportRuntimeCacheNote(
-                "the shipped runtime archive '" + archives.back().generic_string()
+                "the shipped runtime archive '"
+                + core::genericSpelling(archives.back())
                 + "' could not be read back, so it was not added to the runtime "
                   "object cache; this build links it from the staging area and "
                   "the next build will compile it again.");

@@ -12756,8 +12756,19 @@ struct Lowerer {
         if (noSanitizeThreadMap != nullptr)
             if (auto const* p = noSanitizeThreadMap->tryGet(node))
                 noSanitizeThread = p->isNoSanitizeThread;
+        // ★★ D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: THE
+        // FIFTH MINT SITE, and the only one that reads from `la` — the
+        // `LinkageAttr` this call already consults for binding and visibility —
+        // rather than from a side map of its own. That is deliberate and is
+        // explained at `LinkageAttr::staticInit`: a separate `Hir*Map` would need
+        // a `lowerHirToMir` parameter, and every such parameter is passed from
+        // the program tier, so it would have landed defaulted to nullptr — a
+        // feature dead in the shipped pipeline while hand-built unit tests stayed
+        // green. `la` is already threaded, so the schedule travels with the
+        // linkage it belongs beside.
         mir.addFunction(signature, symbol, la.binding, la.visibility, noInline,
-                        alwaysInline, noOptimize, noSanitizeThread);
+                        alwaysInline, noOptimize, noSanitizeThread,
+                        la.staticInit);
         MirBlockId const entry = mir.createBlock(StructCfMarker::EntryBlock);
         mir.beginBlock(entry);
 

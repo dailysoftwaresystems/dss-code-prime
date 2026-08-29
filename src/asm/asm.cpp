@@ -169,6 +169,13 @@ AssembledModule assemble(Lir const&                 lir,
     // source of these rows when threading from real source
     // declarations (LK6 cycle 2d — D-LK6-6 closure).
     result.externImports.assign(externs.begin(), externs.end());
+    // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the module's
+    // static-initializer schedule crosses the LIR→object boundary verbatim. No
+    // filtering here on purpose — `staticInitAdd` already refused the empty and
+    // symbol-less entries, and deciding WHICH entries survive is a whole-program
+    // question the linker answers with every module in hand.
+    auto const schedule = lir.staticInitSchedule();
+    result.staticInitSchedule.assign(schedule.begin(), schedule.end());
     std::size_t const funcCount = lir.moduleFuncCount();
     result.expectedFuncCount = funcCount;
 

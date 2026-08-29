@@ -37,6 +37,32 @@ Operator ruling 2026-08-19: *"we must never crash on correct code, even if gcc f
 
 **The test is the DISJUNCTION, not the consensus.** If ANY reference (gcc, clang, MSVC, …) compiles and runs a correct construct, DSS must too. A reference's FAILURE is therefore never evidence against DSS — when DSS accepts what one reference rejects and another accepts, DSS is **right**, and the divergence is a **NON-DSS CONFOUND** to attribute and record. **Never make DSS fail in order to match a failing reference.** This bounds the bidirectional rule: "accepting what no reference accepts is a defect" turns on **NO** — not one. The implementation still owes the full bar (agnostic, config-driven, best-long-term, fail-loud, strictly tested): "it works" is the requirement, not the excuse. ⚠ Probe references **separately** — "the reference" is not one voice, and P14 nearly narrowed a working header chain because only gcc's failure was on file and MSVC's success was not. Full case: `references/the-bar.md` §A.3b.
 
+### ★★★★ THE DISJUNCTION DECIDES **ACCEPTANCE**, NOT **MEANING** — operator ruling 2026-08-28
+
+**The rule above settles whether a construct is ACCEPTED. It does NOT automatically settle what a
+program MEANS when the references disagree about the meaning itself.** ✔The case that produced this,
+measured with each reference probed separately: `#pragma once` — gcc dedups two DIFFERENT files with
+byte-identical contents (**content-keyed**); clang 18.1.3 and MSVC 19.51 do not (**identity-keyed**).
+The unanimous rows (`./h.h`, `sub/../h.h`, symlink, hard link — all DEDUP everywhere) make
+`core::PathIdentity` REQUIRED; the split row decides the KEY.
+
+A mechanical reading of the disjunction picks **gcc, the minority**. ⇒ **THE OPERATOR RULED
+IDENTITY-KEYED**: DSS refuses a program gcc compiles (a vendored/copied header), deliberately.
+
+**The two reasons, because they generalise:**
+1. **Content-keying does not merely accept MORE — it SILENTLY OMITS TEXT** in a constructible case
+   (two byte-identical headers whose meaning differs because a macro was redefined between the
+   `#include`s). "Accept more" is not a virtue when the extra acceptance is bought by DROPPING code,
+   and a silent omission is the class the bar most abhors.
+2. **2 of 3, including the vendor that invented the pragma.** A minority-of-one winning on the
+   disjunction deserves a second look — not a veto, a prompt to state the trade-off.
+
+⇒ **Before invoking the disjunction, ask which question the references are splitting on.**
+Accept-vs-refuse ⇒ the disjunction governs and the accepting reference wins. Disagreement about what
+a valid program MEANS ⇒ **that is an architectural fork: PAUSE and ask.**
+⇒ **Record the refusal cost in the row**, or a later cycle applying the disjunction by reflex will
+"fix" it back. This ruling is exactly that shape.
+
 ## ★★★ PRODUCTION ANCHORS ARE THE PRIORITY, ALWAYS — operator ruling 2026-08-25
 
 > *"the priority is always production anchors. ALWAYS. harness we fix as we need when we face the
@@ -589,6 +615,17 @@ hand-typing every edit or reading every subsystem.
    next three red-on-disable cycles executed the WRONG SCRIPT with the first lane's arguments.
    Nothing was corrupted only because that harness restored its subject from a `finally` and
    verified the hash. ⇒ Name `scratchpad/<cycle>/<lane>/` in the brief.
+   ★★★ **AND THE BRIEF MUST REQUIRE THE LANE TO *WRITE ITS ROW TO A FILE* THERE, NOT MERELY TO
+   EMIT IT.** ✔MEASURED TWICE in cycle P44: a finished lane's task transcript came back **0 BYTES**,
+   so its row — correct, complete, already written — reached the orchestrator not at all. The
+   second time it was a lane that had emitted the row as a TOOL OUTPUT rather than as prose, which
+   a text-only harvester silently drops. **Both failures look identical from the orchestrator's
+   side: a harvest that simply reports one fewer row, indistinguishable from a lane that produced
+   none.** ⇒ Every brief names an exact path (`…/<lane>/row.md`) and says: write the row there
+   VERBATIM as one physical line, and reply with the path and a byte count. ⚠ The recovery is
+   always to ASK THE LANE TO WRITE IT — **never to retype the row from a report**, because a
+   retyped row can WRAP an anchor id, and a wrapped id does not fail: it goes invisible to every
+   grep and MINTS a false one.
    ★★ **AN ANCHOR ID IS NEVER LINE-WRAPPED, AND THIS CLAUSE IS THE PROOF OF WHY.** The row
    above was cited here for hours WITHOUT EXISTING, and the step-10 audit was the first thing
    to notice — because the id was split across two lines, so neither the registry guard nor a

@@ -1385,6 +1385,23 @@ struct DSS_EXPORT ObjectFormatData {
     // closed-enum schema vocabulary.
     std::optional<ProcessExit> processExit;
 
+    // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ──
+    //
+    // WHO runs this format's static-initializer schedule, from the document's
+    // `staticInitializers.runner`. nullopt = the document makes NO claim, which
+    // is the correct answer for a RELOCATABLE object or a static library: those
+    // produce no program entry, so the tables they carry are run by whatever
+    // links them, and inventing a runner for them would be a claim about somebody
+    // else's linker.
+    //
+    // ★ THE VALIDATE() RULE BELOW IS WHAT MAKES THE FIELD LOAD-BEARING RATHER
+    // THAN ADVISORY: an EXEC-flavor document that declares an init-array or
+    // fini-array section row and NO runner is REFUSED. That combination emits a
+    // table nothing walks — an initializer silently never running, which is
+    // precisely the defect the row this closes was filed for, re-created one tier
+    // down and in config rather than in code.
+    std::optional<StaticInitRunner> staticInitRunner;
+
     // ── D-RUNTIME-MAIN-ARGC-ARGV (c88): ProcessArgs substrate ──
     //
     // `processArgs`: per-OS program-entry argument mechanism
@@ -2178,6 +2195,14 @@ public:
     // ── D-LK10-ENTRY Slice B accessors ──────────────────────────
     [[nodiscard]] std::optional<ProcessExit> const& processExit() const noexcept {
         return d_.processExit;
+    }
+    // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: WHO walks this
+    // format's static-initializer tables. Read by the entry-trampoline emitter,
+    // which emits calls ONLY for `EntryTrampoline` — see the enum for why the
+    // other arm must emit none.
+    [[nodiscard]] std::optional<StaticInitRunner>
+    staticInitRunner() const noexcept {
+        return d_.staticInitRunner;
     }
     [[nodiscard]] std::string_view entryCallingConvention() const noexcept {
         return d_.entryCallingConvention;

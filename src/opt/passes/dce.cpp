@@ -60,7 +60,31 @@ namespace {
 // True iff a function / global must survive DCE because it is
 // observable from outside the compilation unit. Reads the linkage
 // attributes threaded by D-OPT1-SYMBOL-BINDING-VISIBILITY-THREAD.
+// ★★ D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN — THE SECOND
+// DISJUNCT, AND WITHOUT IT THE WHOLE FEATURE IS DELETED AT `--config=release`.
+//
+// A static initializer is called from NOWHERE in the program text: that is what
+// it is for. So all three of this pass's liveness routes miss it — a `static
+// __attribute__((constructor)) void f(void)` has `SymbolBinding::Local` (so
+// `isExternallyVisible` returns false on its first line), is named by no
+// `GlobalAddr` in any live function, and is named by no global initializer.
+// `runDce` would clone every other function and silently drop this one, leaving
+// the linker to emit an initializer table naming a function the module no longer
+// contains. The debug pipeline is `["Identity"]`, so the failure appears ONLY in
+// a release build — which is exactly why the corpus example carries a release
+// arm.
+//
+// ★ IT IS A ROOT, NOT A LIVENESS EDGE, AND THE DIFFERENCE MATTERS: the function
+// is not reachable FROM anything, it is reached by the runtime. Rooting it also
+// transitively keeps everything it calls, which the BFS then handles with no
+// further help.
+//
+// ★ THE PREDICATE IS `staticInit.any()`, NOT A TEST OF EITHER CHANNEL BY NAME. A
+// destructor is as unreachable as a constructor and is rooted by the same clause;
+// asking about `beforeEntry` alone would have deleted every `destructor` while
+// the constructor tests stayed green.
 [[nodiscard]] bool funcIsRoot(Mir const& mir, MirFuncId f) noexcept {
+    if (mir.funcStaticInit(f).any()) return true;
     return isExternallyVisible(mir.funcBinding(f), mir.funcVisibility(f));
 }
 [[nodiscard]] bool globalIsRoot(Mir const& mir, MirGlobalId g) noexcept {

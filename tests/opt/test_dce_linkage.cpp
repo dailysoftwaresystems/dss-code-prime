@@ -16,6 +16,7 @@
 //     IS the contract DCE consults; this test asserts DCE honors it.
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/section_kind.hpp"   // StaticInitSchedule / StaticInitPhase
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -158,4 +159,119 @@ TEST(DceLinkage, PreservesBindingVisibilityOnSurvivor) {
     EXPECT_EQ(fx.mir.funcVisibility(survivor), SymbolVisibility::Default);
     EXPECT_TRUE(isExternallyVisible(fx.mir.funcBinding(survivor),
                                     fx.mir.funcVisibility(survivor)));
+}
+
+// ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ─────────────
+//
+// A STATIC INITIALIZER IS A THIRD KIND OF ROOT, and without it the whole feature
+// is deleted at `--config=release`.
+//
+// ★★ WHY IT DOES NOT FALL OUT OF EITHER EXISTING ROUTE. `runDce` keeps a function
+// iff it is externally visible, is named by a `GlobalAddr` in a live function, or
+// is named by a live global's initializer. A `__attribute__((constructor))`
+// function written the way C code actually writes it — `static`, so Local binding
+// — satisfies NONE of those: being called from nowhere in the program text is
+// what it is FOR. It is reached by the RUNTIME, which is not an edge this graph
+// has.
+//
+// ★ AND THE FAILURE IS CONFIG-SPLIT, WHICH IS THE WORST SHAPE. The debug pipeline
+// is `Identity`, so a missing root clause is invisible in every debug build and
+// every debug test; only a release build loses the initializer. The corpus
+// example carries a release arm for the same reason, and these two pins are what
+// name the cause when it does.
+TEST(DceLinkage, StaticInitializerFunctionSurvivesDespiteLocalBindingAndNoCallers) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const voidFn = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                         CallConv::CcSysV);
+    SymbolId const ctorSym = SymbolId{200};
+    SymbolId const dtorSym = SymbolId{201};
+    SymbolId const plainSym = SymbolId{202};
+
+    StaticInitSchedule beforeEntry;
+    beforeEntry.setPriorityFor(StaticInitPhase::BeforeEntry, 101);
+    StaticInitSchedule afterEntry;
+    afterEntry.setPriorityFor(StaticInitPhase::AfterEntry,
+                              kUnprioritizedStaticInit);
+
+    MirBuilder mb;
+    mb.addFunction(voidFn, ctorSym, SymbolBinding::Local,
+                   SymbolVisibility::Default, false, false, false, false,
+                   beforeEntry);
+    mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
+    mb.addReturn();
+    mb.addFunction(voidFn, dtorSym, SymbolBinding::Local,
+                   SymbolVisibility::Default, false, false, false, false,
+                   afterEntry);
+    mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
+    mb.addReturn();
+    // THE CONTROL, in the same module: byte-identical in every respect EXCEPT the
+    // schedule. Without it a DCE that had simply stopped deleting anything would
+    // pass both assertions above.
+    mb.addFunction(voidFn, plainSym, SymbolBinding::Local,
+                   SymbolVisibility::Default);
+    mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
+    mb.addReturn();
+    Mir mir = std::move(mb).finish();
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"static-init-root-test", {opt::PassId::Dce}};
+    auto const result = opt::optimize(mir, **targetR, interner, pipeline, rep);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    EXPECT_TRUE(moduleContainsFuncSymbol(mir, ctorSym))
+        << "a BEFORE-entry initializer is a root: it is called by the runtime, "
+           "not by the program, so no liveness edge reaches it";
+    EXPECT_TRUE(moduleContainsFuncSymbol(mir, dtorSym))
+        << "…and so is an AFTER-entry one. The root clause asks `staticInit."
+           "any()` rather than testing one channel precisely so this half cannot "
+           "be lost while the constructor half stays green";
+    EXPECT_FALSE(moduleContainsFuncSymbol(mir, plainSym))
+        << "THE CONTROL: an identical Local function with no schedule must still "
+           "be eliminated — otherwise the two pins above prove only that DCE "
+           "stopped working";
+}
+
+// The schedule must SURVIVE the rebuild, not merely protect the function from it.
+// `runDce` clones every live function through the shared rebuild helper, and a
+// clone that dropped the schedule would produce a module whose initializer is
+// present, unreferenced, and no longer scheduled — so the linker emits no call
+// and the next pass's DCE deletes it outright.
+TEST(DceLinkage, StaticInitScheduleSurvivesTheDceRebuild) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const voidFn = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                         CallConv::CcSysV);
+    SymbolId const ctorSym = SymbolId{300};
+    StaticInitSchedule sched;
+    sched.setPriorityFor(StaticInitPhase::BeforeEntry, 137);
+
+    MirBuilder mb;
+    mb.addFunction(voidFn, ctorSym, SymbolBinding::Local,
+                   SymbolVisibility::Default, false, false, false, false, sched);
+    mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
+    mb.addReturn();
+    Mir mir = std::move(mb).finish();
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"static-init-carry-test", {opt::PassId::Dce}};
+    ASSERT_TRUE(opt::optimize(mir, **targetR, interner, pipeline, rep).ok);
+
+    bool seen = false;
+    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f) != ctorSym) continue;
+        seen = true;
+        auto const after = mir.funcStaticInit(f);
+        ASSERT_TRUE(after.beforeEntry().has_value())
+            << "the rebuilt function kept no schedule — it would be emitted and "
+               "never called";
+        EXPECT_EQ(*after.beforeEntry(), 137u)
+            << "…and the PRIORITY has to survive too: keeping the fact while "
+               "losing the position reads as working until the order matters";
+    }
+    EXPECT_TRUE(seen);
 }

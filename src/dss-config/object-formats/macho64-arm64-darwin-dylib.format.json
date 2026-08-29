@@ -70,8 +70,7 @@
     "segmentPageSize": 16384,
     "installName": "@rpath/libdss.dylib",
     "loadDylibs": [
-      "/usr/lib/libSystem.B.dylib"
-    ],
+      "/usr/lib/libSystem.B.dylib"],
     "bindNow": true,
     "buildVersion": {
       "platform": "macos",
@@ -85,6 +84,7 @@
       "identifier": "com.dss.dylib"
     }
   },
+    "$staticInitializersComment": "D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: THIS FORMAT DECLARES NO STATIC-INITIALIZER RUNNER, AND THE ABSENCE IS THE ANSWER -- recorded so nobody 'completes' the key by adding one.\nA dylib is an IMAGE but not an EXEC flavor: `isExecFlavor()` is false, so DSS injects no entry trampoline and there is no synthesized entry to call anything. `imageLoader` would be the truthful arm -- dyld really does run a `__mod_init_func` section in a dylib -- but it requires a WRITER that emits one typed S_MOD_INIT_FUNC_POINTERS, and no DSS writer emits any static-initializer section today. Declaring either arm would therefore be false. With nothing declared, the linker REFUSES a program that schedules an initializer for this format, naming the format and the remedy -- which beats an initializer that silently never runs.",
 
   "sections": [
     {

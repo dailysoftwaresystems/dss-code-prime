@@ -1,5 +1,6 @@
 #include "program/dependency_cache.hpp"
 
+#include "core/substrate/path_identity.hpp"  // genericSpelling
 #include "core/types/parse_diagnostic.hpp"
 
 #include <system_error>
@@ -227,13 +228,13 @@ DependencyCache::cloneStaged_(std::string const& name, std::string const& url,
     // any URL (see `kDependencyStagingDirName`).
     fs::remove_all(staging, ec);
     if (ec) {
-        out.detail = "the staging directory '" + staging.generic_string()
+        out.detail = "the staging directory '" + core::genericSpelling(staging)
                    + "' could not be cleared: " + ec.message();
         return out;
     }
     fs::create_directories(stagingRoot, ec);
     if (ec) {
-        out.detail = "the staging directory '" + stagingRoot.generic_string()
+        out.detail = "the staging directory '" + core::genericSpelling(stagingRoot)
                    + "' could not be created: " + ec.message();
         return out;
     }
@@ -259,7 +260,7 @@ DependencyCache::cloneStaged_(std::string const& name, std::string const& url,
     fs::create_directories(depsDir_, ec);
     if (ec) {
         out.ok     = false;
-        out.detail = "the cache directory '" + depsDir_.generic_string()
+        out.detail = "the cache directory '" + core::genericSpelling(depsDir_)
                    + "' could not be created: " + ec.message();
         return abandon(std::move(out));
     }
@@ -267,8 +268,8 @@ DependencyCache::cloneStaged_(std::string const& name, std::string const& url,
     if (ec) {
         out.ok     = false;
         out.detail = "the completed checkout could not be moved from '"
-                   + staging.generic_string() + "' to '"
-                   + landed.generic_string() + "': " + ec.message();
+                   + core::genericSpelling(staging) + "' to '"
+                   + core::genericSpelling(landed) + "': " + ec.message();
         return abandon(std::move(out));
     }
     return out;
@@ -382,7 +383,7 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
                     + " could not be refreshed (" + acq.detail
                     + "), so the build is CONTINUING on the existing checkout "
                       "at '"
-                    + checkoutDir.generic_string() + "', commit " + now.output
+                    + core::genericSpelling(checkoutDir) + "', commit " + now.output
                     + ". Those sources may be out of date. This is deliberate — "
                       "an unreachable network must not stop a build that has "
                       "everything it needs on disk — and it is reported so that "
@@ -401,14 +402,14 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
                 return out;
             }
             acq.detail += "; the existing checkout at '"
-                        + checkoutDir.generic_string()
+                        + core::genericSpelling(checkoutDir)
                         + "' is no longer usable either (" + now.detail + ")";
         }
         report(rep, DiagnosticCode::D_DependencyGitAcquireFailed,
                DiagnosticSeverity::Error,
                "git dependency " + describeEntry(url, ref)
                    + " could not be acquired into '"
-                   + checkoutDir.generic_string() + "': " + acq.detail
+                   + core::genericSpelling(checkoutDir) + "': " + acq.detail
                    + ". There is no usable checkout to fall back on, so the "
                      "dependency's sources do not exist on this machine and "
                      "continuing would compile against a hole. Check the URL, "
@@ -427,7 +428,7 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
         report(rep, DiagnosticCode::D_DependencyGitAcquireFailed,
                DiagnosticSeverity::Error,
                "git dependency " + describeEntry(url, ref)
-                   + " was acquired into '" + checkoutDir.generic_string()
+                   + " was acquired into '" + core::genericSpelling(checkoutDir)
                    + "' but its commit could not be read: " + head.detail
                    + ". Without it the build cannot record what it compiled, so "
                      "the checkout is treated as unusable rather than used "

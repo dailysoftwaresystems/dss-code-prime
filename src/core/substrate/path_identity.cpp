@@ -153,6 +153,21 @@ std::string genericSpelling(fs::path const& p) {
     return out;
 }
 
+std::u8string genericSpellingU8(fs::path const& p) {
+    // `u8string()` and NOT `generic_u8string()` -- the NATIVE spelling carries
+    // the leading run, and the substitution below is the same normalisation
+    // without the generic-format conversion that eats it. See the header.
+    std::u8string out = p.u8string();
+    if constexpr (fs::path::preferred_separator != fs::path::value_type{'/'}) {
+        // Every path separator is ASCII, so it is ONE UTF-8 code unit and a
+        // per-unit substitution cannot land inside a multi-byte sequence.
+        std::replace(out.begin(), out.end(),
+                     static_cast<char8_t>(fs::path::preferred_separator),
+                     char8_t{'/'});
+    }
+    return out;
+}
+
 fs::path absoluteKeepingRoot(fs::path const& p, std::error_code& ec) {
     // A multi-separator prefix names an AUTHORITY, not a location on the current
     // drive, so there is nothing here to make absolute. See the header for the

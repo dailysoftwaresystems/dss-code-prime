@@ -2307,9 +2307,28 @@ struct Lowerer {
     }
     // Record NON-default linkage for a lowered decl node (sparse: default linkage
     // is the implicit externally-visible state and needn't be stored).
-    void recordLinkage(HirNodeId node, LinkageAttr attr) {
+    // `sym`, when valid, contributes the STATIC-INITIALIZER SCHEDULE the semantic
+    // tier folded onto its record (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN).
+    // It is a defaulted parameter rather than a second `recordX(node, sym)` helper
+    // because the schedule must land on the SAME `LinkageAttr` this call stores:
+    // two pushes for one node would both reach `linkageMap.set(id, …)` and the
+    // second would overwrite the first, silently dropping either the schedule or
+    // the `static` that came with it.
+    void recordLinkage(HirNodeId node, LinkageAttr attr, SymbolId sym = {}) {
+        if (sym.valid()) {
+            auto const* rec = model.recordFor(sym);
+            if (rec != nullptr) attr.staticInit.mergeFrom(rec->staticInit);
+        }
+        // ⚠ THE SPARSENESS TEST HAD TO GROW WITH THE STRUCT. It is what decides
+        // whether the attribute is stored at all, so a new field that it does not
+        // ask about is a field that reaches HIR only when some OTHER axis happens
+        // to be non-default — `__attribute__((constructor)) void f(void)` (no
+        // `static`, default visibility) would have been dropped here while the
+        // `static` spelling worked, which is the worst possible split: it works in
+        // the test you write first.
         if (attr.binding != SymbolBinding::Global
-            || attr.visibility != SymbolVisibility::Default)
+            || attr.visibility != SymbolVisibility::Default
+            || attr.staticInit.any())
             linkage.push_back({node, attr});
     }
     // TF-C78 (D-CSUBSET-NOINLINE): record the inliner opt-out for a lowered
@@ -10857,7 +10876,11 @@ struct Lowerer {
         body = maybeAppendImplicitReturnZero(node, body, sym, retType, decl);
         HirNodeId const fn_ =
             track(builder.makeFunction(sig, sym.v, params, body), node);
-        recordLinkage(fn_, linkAttr);
+        // `sym` folds in the static-initializer schedule
+        // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN) — the
+        // same symbol the four `recordX` calls below read, on the ONE attribute
+        // that must share a side-table entry with the linkage this call stores.
+        recordLinkage(fn_, linkAttr, sym);
         recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
@@ -11197,7 +11220,11 @@ struct Lowerer {
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
         HirNodeId const fn_ = track(builder.makeFunction(sig, sym.v, params, body), node);
-        recordLinkage(fn_, linkAttr);
+        // `sym` folds in the static-initializer schedule
+        // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN) — the
+        // same symbol the four `recordX` calls below read, on the ONE attribute
+        // that must share a side-table entry with the linkage this call stores.
+        recordLinkage(fn_, linkAttr, sym);
         recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
@@ -11589,7 +11616,11 @@ struct Lowerer {
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
         HirNodeId const fn_ = track(builder.makeFunction(sig, sym.v, params, body), node);
-        recordLinkage(fn_, linkAttr);
+        // `sym` folds in the static-initializer schedule
+        // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN) — the
+        // same symbol the four `recordX` calls below read, on the ONE attribute
+        // that must share a side-table entry with the linkage this call stores.
+        recordLinkage(fn_, linkAttr, sym);
         recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)

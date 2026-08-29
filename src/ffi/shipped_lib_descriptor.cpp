@@ -1,6 +1,7 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 
 #include "core/substrate/checked_file_read.hpp"    // the ONE checked whole-file read
+#include "core/substrate/path_identity.hpp"        // genericSpelling / normalizeKeepingRoot — the lossless spellings
 #include "core/types/config_key_vocabulary.hpp"   // the ONE closed-key check + the `$`-prose carve-out
 #include "core/types/config_path_walk.hpp"       // findShippedConfigDir — shared src/dss-config/<dir> resolver
 #include "core/types/data_model.hpp"             // dataModelFromName (signatureByDataModel keys)
@@ -210,13 +211,13 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
         doc = json::parse(*text);
     } catch (json::parse_error const& e) {
         emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
+            std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
                 + "': JSON parse error: " + e.what());
         return nullptr;
     }
     if (!doc.is_object()) {
         emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
+            std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
                 + "': top-level value must be a JSON object");
         return nullptr;
     }
@@ -1242,7 +1243,25 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
         bool escapes = src.empty();
         {
             std::filesystem::path const asPath{src};
-            if (asPath.is_absolute() || asPath.has_root_name()
+            // ★★★ `isRootedPath`, NOT `is_absolute() || has_root_name()` —
+            // [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]].
+            // This is a CONTAINMENT check, and the pair it used to ask left a
+            // hole exactly the shape this row is about. ✔MEASURED 2026-08-28 on
+            // the toolchain that builds DSS:
+            //     '//host/share/x'.is_absolute()      -> FALSE
+            //     '//host/share/x'.has_root_name()    -> FALSE   (empty)
+            //     '//host/share/x'.has_root_directory -> TRUE
+            // so a descriptor declaring `"source": "//host/share/evil.c"` — all
+            // forward slashes, so the backslash test below never sees it, and no
+            // `.`/`..` segment — was accepted as "relative to src/dss-config/".
+            // `resolveShippedSource` then joins it, and `operator/` with a rooted
+            // right operand REPLACES rather than appends, so the descriptor
+            // reaches an arbitrary host — precisely what the note above says is
+            // refused HERE rather than at the filesystem. The same hole admitted
+            // a plain `/abs/x` on this host, which also answers `is_absolute()`
+            // FALSE with no root name. `isRootedPath` closes both, and it is the
+            // ONE predicate the rest of the compiler already asks.
+            if (isRootedPath(asPath)
                 || src.find('\\') != std::string::npos)
                 escapes = true;
             for (auto const& seg : asPath)
@@ -2092,7 +2111,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     if (!doc.contains("header") || !doc.at("header").is_string()
         || doc.at("header").get<std::string>().empty()) {
         emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
+            std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
                 + "': missing or empty required 'header' provenance string "
                   "(e.g. \"stdio.h\")");
         return std::nullopt;
@@ -2103,7 +2122,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     if (doc.contains("standard")) {
         if (!doc.at("standard").is_string()) {
             emitMalformed(reporter,
-                std::string{"shipped-lib descriptor '"} + path.generic_string()
+                std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
                     + "': 'standard' must be a string");
             return std::nullopt;
         }
@@ -2125,7 +2144,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // fails the whole read (a malformed descriptor-level map is unrecoverable —
         // there is nothing left to bind); per-key errors ride the errorCount delta.
         if (!decodeLibraryMap(doc.at("library"),
-                              std::string{"'"} + path.generic_string() + "'",
+                              std::string{"'"} + core::genericSpelling(path) + "'",
                               "library", reporter, out.library))
             return std::nullopt;
     }
@@ -2137,7 +2156,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // discipline and the same hard-fail-on-shape contract as `library` above.
     if (doc.contains("realization")) {
         if (!decodeRealizationMap(doc.at("realization"),
-                                  std::string{"'"} + path.generic_string() + "'",
+                                  std::string{"'"} + core::genericSpelling(path) + "'",
                                   "realization", reporter, out.realization))
             return std::nullopt;
     }
@@ -2146,7 +2165,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // (which object-formats this header EXISTS on). Absent/empty ⇒ available on
     // every format (back-compat). Decoded through the SHARED chokepoint so the
     // full read + the fast front-end reader never drift.
-    decodeShippedAvailability(doc, path.generic_string(), reporter,
+    decodeShippedAvailability(doc, core::genericSpelling(path), reporter,
                               out.availableObjectFormats);
 
     // (2.6) Optional `includes` — the transitive sibling-header NAMES
@@ -2159,7 +2178,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // partial import). `activeFormat` gates which edges the decode KEEPS, so the
     // descriptor this read returns carries exactly the transitive set the closure
     // walker builds for the same format.
-    decodeShippedIncludes(doc, path.generic_string(), reporter, out.includes,
+    decodeShippedIncludes(doc, core::genericSpelling(path), reporter, out.includes,
                           activeFormat);
 
     // (3) `symbols` array — OPTIONAL. A header may carry only `constants`
@@ -2170,7 +2189,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // it must be an array.
     if (doc.contains("symbols") && !doc.at("symbols").is_array()) {
         emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
+            std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
                 + "': 'symbols' must be an array");
         return std::nullopt;
     }
@@ -2211,7 +2230,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     if (doc.contains("typedefs")) {
         if (!doc.at("typedefs").is_array()) {
             emitMalformed(reporter,
-                std::string{"shipped-lib descriptor '"} + path.generic_string()
+                std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
                     + "': 'typedefs' must be an array");
             return std::nullopt;
         }
@@ -2219,7 +2238,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         out.typedefs.reserve(typedefs.size());
         std::size_t tidx = 0;
         for (auto const& t : typedefs) {
-            std::string const at = std::string{"'"} + path.generic_string()
+            std::string const at = std::string{"'"} + core::genericSpelling(path)
                 + "' typedefs[" + std::to_string(tidx) + "]";
             ++tidx;
             if (!t.is_object()) {
@@ -2370,13 +2389,13 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // (D-FFI-DESCRIPTOR-UNION-MEMBER-INJECTION)
     if (doc.contains("unions")) {
         if (!doc.at("unions").is_array()) {
-            emitMalformed(reporter, "shipped-lib descriptor '" + path.generic_string()
+            emitMalformed(reporter, "shipped-lib descriptor '" + core::genericSpelling(path)
                                         + "': 'unions' must be an array");
         } else {
             std::size_t uidx = 0;
             for (auto const& udef : doc.at("unions")) {
                 std::string const at =
-                    "'" + path.generic_string() + "' unions[" + std::to_string(uidx) + "]";
+                    "'" + core::genericSpelling(path) + "' unions[" + std::to_string(uidx) + "]";
                 ++uidx;
                 if (!udef.is_object()) {
                     emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
@@ -2443,7 +2462,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     std::size_t idx = 0;
     for (auto const& sym : symbols) {
         std::string const at =
-            std::string{"'"} + path.generic_string() + "' symbols[" + std::to_string(idx) + "]";
+            std::string{"'"} + core::genericSpelling(path) + "' symbols[" + std::to_string(idx) + "]";
         ++idx;
         if (!sym.is_object()) {
             emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
@@ -2794,7 +2813,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     // at any compile stage.
                     if (auto const libIt = lib.find(fmt); libIt != lib.end()) {
                         emitMalformed(reporter,
-                            "shipped-lib descriptor '" + path.generic_string() + "' "
+                            "shipped-lib descriptor '" + core::genericSpelling(path) + "' "
                             + ctx + " declares BOTH an import ('library." + fmt
                             + "' = '" + libIt->second
                             + "') AND a shipped-source realization ('realization."
@@ -2809,7 +2828,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     if (auto const look = resolveShippedSource(src);
                         !look.resolved()) {
                         emitMalformed(reporter,
-                            "shipped-lib descriptor '" + path.generic_string() + "' "
+                            "shipped-lib descriptor '" + core::genericSpelling(path) + "' "
                             + ctx + " declares a shipped-source realization naming '"
                             + src + "' for the object format '" + fmt + "', but "
                             + describeShippedSourceLookup(look, src)
@@ -2833,7 +2852,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // `decodeShippedConstants`), so the semantic read here and the
     // preprocessor's interner-free `readShippedLibConstants` validate
     // identically and select the same per-target variant.
-    if (!decodeShippedConstants(doc, path.generic_string(), interner, typeReg,
+    if (!decodeShippedConstants(doc, core::genericSpelling(path), interner, typeReg,
                                 reporter, out.constants, activeTarget,
                                 activeFormat, activeDataModelName,
                                 mergedNamedTypes)) {
@@ -2854,7 +2873,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     if (doc.contains("floatConstants")) {
         if (!doc.at("floatConstants").is_array()) {
             emitMalformed(reporter,
-                std::string{"shipped-lib descriptor '"} + path.generic_string()
+                std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
                     + "': 'floatConstants' must be an array");
             return std::nullopt;
         }
@@ -2862,7 +2881,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         out.floatConstants.reserve(fconstants.size());
         std::size_t fcidx = 0;
         for (auto const& c : fconstants) {
-            std::string const at = std::string{"'"} + path.generic_string()
+            std::string const at = std::string{"'"} + core::genericSpelling(path)
                 + "' floatConstants[" + std::to_string(fcidx) + "]";
             ++fcidx;
             if (!c.is_object()) {
@@ -3028,13 +3047,13 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     };
     if (doc.contains("structs")) {
         if (!doc.at("structs").is_array()) {
-            emitMalformed(reporter, "shipped-lib descriptor '" + path.generic_string()
+            emitMalformed(reporter, "shipped-lib descriptor '" + core::genericSpelling(path)
                                         + "': 'structs' must be an array");
         } else {
             std::size_t sidx = 0;
             for (auto const& sdef : doc.at("structs")) {
                 std::string const at =
-                    "'" + path.generic_string() + "' structs[" + std::to_string(sidx) + "]";
+                    "'" + core::genericSpelling(path) + "' structs[" + std::to_string(sidx) + "]";
                 ++sidx;
                 if (!sdef.is_object()) {
                     emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
@@ -3239,7 +3258,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // included (e.g. `assert(e) -> ((void)0)`). Per-FORMAT macro variants select
     // on the active format (the semantic read carries it; arch is not part of a
     // macro selector).
-    decodeShippedMacros(doc, path.generic_string(), reporter, out.macros, activeFormat);
+    decodeShippedMacros(doc, core::genericSpelling(path), reporter, out.macros, activeFormat);
 
     // (7.5) An OBJECT-LIKE macro that SHADOWS one of this descriptor's own symbol
     // rows on a format they share, WITHOUT referencing it, is a defect — see
@@ -3249,7 +3268,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // this reads the raw JSON instead of the decoded `out.macros`. Runs here, after
     // both surfaces exist, and its diagnostics fail the read through the errBefore
     // delta below (never a partial surface).
-    checkMacroSymbolShadowing(doc, out, path.generic_string(), reporter);
+    checkMacroSymbolShadowing(doc, out, core::genericSpelling(path), reporter);
 
     // (8) A descriptor must declare SOMETHING — a file with no symbols, no
     // constants, no typedefs, AND no macros is a no-op artifact that should not
@@ -3276,7 +3295,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         && !declaredStructs && !declaredUnions && !declaredConstants
         && !declaredTypedefs && !declaredMacroVariants) {
         emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
+            std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
                 + "': declares nothing — needs at least one of 'symbols', "
                   "'constants', 'floatConstants', 'typedefs', 'structs', 'unions', "
                   "or 'macros'");
@@ -3311,7 +3330,7 @@ readShippedLibMacros(std::filesystem::path const&    path,
     // Only MALFORMED macros (decodeShippedMacros below) + a broken JSON fail loud.
 
     std::vector<ShippedMacro> out;
-    decodeShippedMacros(doc, path.generic_string(), reporter, out, activeFormat);
+    decodeShippedMacros(doc, core::genericSpelling(path), reporter, out, activeFormat);
     if (reporter.errorCount() != errBefore) return std::nullopt;
     return out;  // empty when the descriptor declares no `macros` (typed-only)
 }
@@ -3354,7 +3373,7 @@ readShippedLibConstants(std::filesystem::path const&    path,
 
     TypeLattice lattice{CompilationUnitId{1}};
     std::vector<ShippedConstant> decoded;
-    if (!decodeShippedConstants(*docPtr, path.generic_string(), lattice.interner(),
+    if (!decodeShippedConstants(*docPtr, core::genericSpelling(path), lattice.interner(),
                                 lattice.registry(), reporter, decoded, activeTarget,
                                 activeFormat, dataModelName(DataModel::Lp64), {})) {
         return std::nullopt;
@@ -3393,7 +3412,7 @@ readShippedLibAvailability(std::filesystem::path const& path,
     if (!docPtr) return std::nullopt;
     json const& doc = *docPtr;
     std::vector<std::string> out;
-    decodeShippedAvailability(doc, path.generic_string(), reporter, out);
+    decodeShippedAvailability(doc, core::genericSpelling(path), reporter, out);
     if (reporter.errorCount() != errBefore) return std::nullopt;
     return out;  // empty ⇒ available on every format
 }
@@ -3447,7 +3466,7 @@ readShippedLibIncludes(std::filesystem::path const&    path,
     if (!docPtr) return std::nullopt;
     json const& doc = *docPtr;
     std::vector<std::string> out;
-    decodeShippedIncludes(doc, path.generic_string(), reporter, out, activeFormat);
+    decodeShippedIncludes(doc, core::genericSpelling(path), reporter, out, activeFormat);
     if (reporter.errorCount() != errBefore) return std::nullopt;
     return out;  // empty ⇒ no transitive edges
 }
@@ -3669,7 +3688,7 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
     json const* const docPtr = cachedDescriptorJson(path, reporter);
     if (!docPtr) return std::nullopt;
     json const&       doc      = *docPtr;
-    std::string const pathStr  = path.generic_string();
+    std::string const pathStr  = core::genericSpelling(path);
     std::string const fmtName{objectFormatKindName(fmt)};
 
     std::vector<std::string> out;
@@ -3810,7 +3829,10 @@ struct CorpusIndex {
         std::error_code relEc;
         auto rel = fs::relative(entry.path(), idx.root, relEc);
         std::string const relPath =
-            relEc ? entry.path().generic_string() : rel.generic_string();
+            // ASYMMETRIC ON PURPOSE. `rel` is a RELATIVE path — no root, so no
+            // authority to lose — while the fallback arm is the ABSOLUTE entry
+            // and is exactly the shape that loses one.
+            relEc ? core::genericSpelling(entry.path()) : rel.generic_string();
         // DOCUMENT-level availability — the fallback a symbol row with no
         // `availableObjectFormats` key of its own inherits (mirrors the semantic
         // injector's two-level gate). `hasDoc == false` ⇒ the document itself is
@@ -3922,7 +3944,11 @@ realizeRow(ShippedLibDescriptor const& desc, ShippedSymbol const& sym,
 [[nodiscard]] CorpusIndex const* corpusIndex() {
     auto const rootOpt = findShippedConfigDir("shippedLibs");
     if (!rootOpt) return nullptr;   // discovery failed — NOT memoized
-    std::string key = rootOpt->generic_string();
+    // ★ A MEMO KEY, so the loss here is a WRONG-CONTENT hazard rather than a
+    // wording one: two config roots that differ ONLY in their leading separator
+    // run collapse to one key and the second caller silently receives the
+    // FIRST's corpus index. `core::genericSpelling` keeps them apart.
+    std::string key = core::genericSpelling(*rootOpt);
     static std::mutex                              mu;
     static std::unordered_map<std::string, CorpusIndex> cache;
     std::lock_guard<std::mutex> const lock{mu};
@@ -4378,8 +4404,14 @@ resolveShippedSource(std::string_view configRelativePath) {
         out.status = ShippedSourceResolution::NoConfigRoot;
         return out;
     }
-    out.path = (*root / std::filesystem::path{std::string{configRelativePath}})
-                   .lexically_normal();
+    // ★★ `core::normalizeKeepingRoot`, NOT `lexically_normal()` — BEHAVIOUR.
+    // `*root` is whatever the config walk found, and `DSS_CONFIG_ROOT` may name
+    // a share. The collapse would re-root a shipped SOURCE BODY onto the local
+    // drive, and everything below reports on `out.path`: `status()` would answer
+    // `not_found` for a file that is there, and `describeShippedSourceLookup`
+    // would go on to tell the reader "no file exists at" a path nobody named.
+    out.path = core::normalizeKeepingRoot(
+        *root / std::filesystem::path{std::string{configRelativePath}});
     // ★ `status()` RATHER THAN `is_regular_file()`, and the difference is the whole
     // repair: the predicate form answers false for "absent" and for "I could not
     // look" alike. `status()` reports `not_found` for a clean absence and sets `ec`
@@ -4420,17 +4452,17 @@ describeShippedSourceLookup(ShippedSourceLookup const& lookup,
                             std::string_view           configRelativePath) {
     switch (lookup.status) {
     case ShippedSourceResolution::Resolved:
-        return "resolved to '" + lookup.path.generic_string() + "'";
+        return "resolved to '" + core::genericSpelling(lookup.path) + "'";
     case ShippedSourceResolution::NoConfigRoot:
         return "the shipped-config root (src/dss-config/) was not found from here — "
                "that is a statement about this ENVIRONMENT, not about the descriptor, "
                "and '"
                + std::string{configRelativePath} + "' was never looked for";
     case ShippedSourceResolution::NotPresent:
-        return "no file exists at '" + lookup.path.generic_string()
+        return "no file exists at '" + core::genericSpelling(lookup.path)
                + "' (resolved against src/dss-config/)";
     case ShippedSourceResolution::NotAFile:
-        return "'" + lookup.path.generic_string()
+        return "'" + core::genericSpelling(lookup.path)
                + "' exists but is not a regular file";
     case ShippedSourceResolution::QueryFailed:
         break;
@@ -4438,7 +4470,7 @@ describeShippedSourceLookup(ShippedSourceLookup const& lookup,
     // ★ THE ARM THIS WHOLE TYPE EXISTS FOR. Say what happened and explicitly refuse
     // to claim absence: the file is very often right there, held by antivirus, a
     // network share, or another process mid-write.
-    return "'" + lookup.path.generic_string()
+    return "'" + core::genericSpelling(lookup.path)
            + "' could not be examined (" + lookup.error.message()
            + ") — this is an I/O failure, NOT a missing file; the body may well be "
              "present. Retry before treating it as absent";
@@ -4565,7 +4597,7 @@ bool validateShippedSourceTree(std::filesystem::path const& descriptorDir,
         // the whole point: silently scanning the wrong tree is how a guard passes
         // while guarding nothing.
         emitMalformed(reporter,
-            "shipped-source tree: '" + runtimeRootDir.generic_string()
+            "shipped-source tree: '" + core::genericSpelling(runtimeRootDir)
             + "' looks like a TIER (it has a 'src' child), but this check takes the "
               "runtime ROOT and derives '<root>/<tier>/src' itself — passing a tier "
               "would put the generated 'dist/' cache in scope and red every warm "
@@ -4588,11 +4620,13 @@ bool validateShippedSourceTree(std::filesystem::path const& descriptorDir,
             std::filesystem::path const p = it->path();
             if (claimedPaths.contains(core::PathIdentity::of(p))) continue;
             emitMalformed(reporter,
-                "shipped-source tree: '" + p.generic_string() + "' is named by NO "
-                "shipped-lib descriptor under '" + descriptorDir.generic_string()
+                "shipped-source tree: '" + core::genericSpelling(p)
+                + "' is named by NO "
+                "shipped-lib descriptor under '"
+                + core::genericSpelling(descriptorDir)
                 + "' in a 'realization' map, so nothing can ever add it to a build "
                   "graph. Only files a descriptor names may live under '"
-                + authored.generic_string()
+                + core::genericSpelling(authored)
                 + "' — in particular a HEADER here would sit at an INCLUDE PATH and "
                   "silently shadow the descriptor a unit exists to consume "
                   "(D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R2/R4)");
@@ -4634,7 +4668,7 @@ closureSurfaceOnFormat(std::filesystem::path const&           startPath,
             DiagnosticReporter throwaway;
             auto names = shippedSurfaceNamesForFormat(p, fmt, throwaway);
             if (!names) {
-                outS.undecodable.push_back(p.generic_string());
+                outS.undecodable.push_back(core::genericSpelling(p));
                 return;
             }
             for (auto& n : *names) outS.names.push_back(std::move(n));
@@ -4767,7 +4801,7 @@ bool validateShippedIncludeClosure(
     std::span<std::filesystem::path const> const searchDirs{&descriptorDir, 1};
 
     for (std::filesystem::path const& p : descriptors) {
-        std::string const rel = p.generic_string();
+        std::string const rel = core::genericSpelling(p);
         DiagnosticReporter availRep;
         auto const avail = readShippedLibAvailability(p, availRep);
         if (!avail) {

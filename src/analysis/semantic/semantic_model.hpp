@@ -7,6 +7,7 @@
 #include "core/types/data_model.hpp"
 #include "core/types/declared_qualification.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/section_kind.hpp"   // StaticInitSchedule (leaf header — no cycle)
 #include "core/types/semantic_config.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
@@ -441,6 +442,25 @@ struct DSS_EXPORT SymbolRecord {
     // composes freely with `noinline`, `always_inline` and the pragma-borne
     // `isNoOptimize`. Default false.
     bool            isNoSanitizeThread = false;
+    // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: this FUNCTION
+    // symbol's place in the program's static-initializer schedule, from the
+    // `runBeforeEntry` / `runAfterEntry` attribute effects. Empty ⇒ an ordinary
+    // function, which is every symbol before this landed.
+    //
+    // ★ MERGED ACROSS DECLARATIONS FOR THE SAME REASON `isNoSanitizeThread` IS,
+    // and the merge is `StaticInitSchedule::mergeFrom` rather than an OR because
+    // the fact is not a bit: the ordinary C shape annotates a prototype in a
+    // header and defines plainly in the .c, and the DEFINITION's symbol is the one
+    // HIR→MIR stamps from, so the schedule has to survive the join with its
+    // PRIORITY intact. Strictest-wins there, so a re-declaration can pull an
+    // initializer earlier but never silently push it later.
+    //
+    // ★ FnSig-GATED at the fold site, the `isNoInline` discipline: this feeds a
+    // CODEGEN decision (a slot in an emitted table and a call from the entry
+    // trampoline), so a symbol whose kind cannot honor it must not carry it.
+    // `__attribute__((constructor)) int x;` is diagnosed by the shared decl-kind
+    // gate — the row declares `appliesTo: ["function"]` — and is inert here.
+    StaticInitSchedule staticInit{};
     // ★★ TF-C85: TRUE iff this FUNCTION symbol's declaration sits inside an MSVC
     // `#pragma optimize("", off)` region. Its two neighbours above come from an
     // ATTRIBUTE on the declaration; this one comes from a LEXICALLY SCOPED

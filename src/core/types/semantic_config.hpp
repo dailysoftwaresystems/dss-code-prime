@@ -2078,6 +2078,38 @@ enum class AttributeEffect : std::uint8_t {
     // than semantic — it cannot tell a comment from a `if (name == …)`, and that
     // conservatism is the point. Cite such macros by description in engine C++.
     NoSanitizeThread,
+    // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the declared
+    // function joins the program's STATIC-INITIALIZER SCHEDULE — run by a runtime
+    // around the entry function rather than called from the program text. C
+    // spells the pair `__attribute__((constructor))` / `((destructor))`; the verbs
+    // are named for WHAT HAPPENS, not for either spelling, because the schedule is
+    // a property of every hosted program and not of one language's attribute
+    // vocabulary.
+    //
+    // ★ THEY TAKE AN OPTIONAL PRIORITY ARGUMENT AND IT IS PART OF THE UNION, NOT
+    // AN EXTRA. ✔MEASURED 2026-08-28, gcc 13.3.0 / clang 18.1.3 / mingw-w64 gcc
+    // 13.2.0 probed SEPARATELY, each function printing its own tag so stdout order
+    // IS run order — all three produce exactly `c101 c102 cBARE | MAIN | dBARE
+    // d102 d101`. So: ascending priority, the UNPRIORITIZED form LAST, and the
+    // after-entry direction is that same sequence walked BACKWARD. An
+    // implementation that dropped the argument would run a program's initializers
+    // in an order all three references disagree with.
+    //
+    // ★★ WHY TWO VERBS AND NOT ONE VERB WITH A DIRECTION ARGUMENT. An effect verb
+    // is what the row MEANS, and the two mean different things at different times;
+    // an argument would make the row's meaning depend on a value the decl-kind
+    // gate and every consumer would then have to re-read. It also keeps the
+    // channel a declaration joins a total function of the verb alone, which is
+    // what lets `StaticInitSchedule::priorityFor` be written once and read in
+    // both directions.
+    //
+    // ⚠ NOT `None`. `None` is "known vocabulary, consumed elsewhere or
+    // deliberately inert", and that is exactly the state this row is closing: for
+    // one cycle `constructor` was accepted, WARNED and dropped, so the program's
+    // initializer never ran. A verb with a real sink is what makes the vocabulary
+    // entry true.
+    RunBeforeEntry,
+    RunAfterEntry,
     None,
 };
 struct DSS_EXPORT AttributeSemanticsRow {

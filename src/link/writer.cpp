@@ -1,5 +1,6 @@
 #include "link/writer.hpp"
 
+#include "core/substrate/path_identity.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
 #include <atomic>
@@ -349,17 +350,33 @@ using StagedFile = std::unique_ptr<std::FILE, StagedFileCloser>;
 // current locale's ANSI codepage. A throw inside the failure-
 // reporting path would silently abort the writer mid-diagnostic.
 //
-// Safe approach: try the narrow form first; on throw, fall back
-// to `u8string()` (returns `std::u8string`, guaranteed UTF-8, never
-// throws per the C++20 spec) and reinterpret to `std::string`.
+// Safe approach: try the narrow form first; on throw, fall back to the
+// UTF-8 form and reinterpret to `std::string`.
 // (silent-failure-hunter HIGH fold #2, LK10 cycle 1 post-fold #2
 // review — the post-fold #1 `generic_string()`-only fix did not
 // fully close the Windows throw hazard.)
+//
+// ★★★ AND THE TWO ARMS USED TO DISAGREE ABOUT WHICH FILE THEY NAME, which is
+// strictly worse than the throw they were written for. `generic_string()`
+// collapses a UNC path's leading separator RUN, so the try arm reported
+// `//host/share/x` as `/host/share/x` — a path on the LOCAL drive root, a
+// different file — while the catch arm's `u8string()` kept the run and also
+// kept NATIVE separators. One path object, two spellings, and which one a user
+// saw depended on whether narrowing happened to throw for an unrelated reason.
+// Both arms now go through the run-preserving transforms
+// ([[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]), so they differ in ENCODING
+// only — which is the one axis this fallback exists for.
+//
+// ⚠ `genericSpellingU8` throws exactly where `u8string()` does (a native name
+// can be text no encoding accepts), which is unchanged from the code this
+// replaced: the catch arm could always propagate. Swallowing it here would hand
+// back a name that is not the file's, and this function's whole job is to name
+// the file.
 [[nodiscard]] std::string pathForDiag(std::filesystem::path const& p) {
     try {
-        return p.generic_string();
+        return core::genericSpelling(p);
     } catch (...) {
-        auto const u8 = p.u8string();
+        auto const u8 = core::genericSpellingU8(p);
         return std::string(reinterpret_cast<char const*>(u8.data()),
                            u8.size());
     }

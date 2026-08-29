@@ -2388,15 +2388,19 @@ TEST(GrammarSchema, AttributeEffectAlignLoads) {
 TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
     // TF-C78 (D-CSUBSET-NOINLINE) added `noInline`; TF-C81
     // (D-CSUBSET-ALWAYSINLINE) added `alwaysInline`; TF-C92
-    // (D-CSUBSET-NO-SANITIZE-THREAD) added `noSanitizeThread`. This list is the
-    // hand-maintained mirror of the loader's `kEffectVerbs`, and it going RED
-    // on a vocabulary change is the test working as designed — the whole point
-    // is that a verb cannot be added to the loader without the closed-set
-    // message and this mirror both accounting for it.
+    // (D-CSUBSET-NO-SANITIZE-THREAD) added `noSanitizeThread`; P44 lane h
+    // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN) added
+    // `runBeforeEntry` and `runAfterEntry`. This list is the hand-maintained
+    // mirror of the loader's `kEffectVerbs`, and it going RED on a vocabulary
+    // change is the test working as designed — the whole point is that a verb
+    // cannot be added to the loader without the closed-set message and this
+    // mirror both accounting for it.
     constexpr std::string_view kVerbs[] = {"suppressUnused", "warnOnUse",
                                            "warnOnDiscard", "align",
                                            "noInline", "alwaysInline",
-                                           "noSanitizeThread", "none"};
+                                           "noSanitizeThread",
+                                           "runBeforeEntry", "runAfterEntry",
+                                           "none"};
     // The message under test.
     auto const bad = attrVocabSchema(
         R"([ { "names": ["aligned"], "effect": "algin" } ])", "", "");

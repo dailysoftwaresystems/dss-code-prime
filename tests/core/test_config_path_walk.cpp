@@ -16,6 +16,7 @@
 
 #include "core/types/config_path_walk.hpp"
 #include "repo_root.hpp"     // the repo-root VERSION — the compiler's own identity
+#include "unc_spelling.hpp"  // the ONE multi-separator-root fixture
 #include "scoped_env.hpp"    // the ONE env override (this file used to carry a copy)
 #include "scratch_dir.hpp"
 
@@ -361,6 +362,75 @@ TEST(ConfigPathWalk, InstalledRootRoundTripsThroughTheComputedRelDir) {
     ASSERT_TRUE(got.has_value())
         << "a planted installed layout must resolve from its executable dir";
     expectSameDir(*got, planted);
+}
+
+// ── [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]] ─────
+//
+// AN INSTALLED COMPILER ON A SHARE MUST STILL FIND ITS OWN CONFIG TREE, and this
+// is the arm where the collapse costs BEHAVIOUR rather than wording.
+//
+// ★★★ THE DEFECT, ✔MEASURED 2026-08-28 with a standalone probe against the
+// toolchain that builds DSS (g++ MinGW-W64 UCRT 13.2.0), on a REACHABLE UNC
+// directory (`exists()` true), printed with `.string()` so no print-side
+// transform can be blamed:
+//     base                        '//localhost/C$/Source/DailySoftware'   run 2
+//     join + lexically_normal()   '\localhost\C$\Source\dss-config'       run 1
+// `installedConfigRootFrom` composed the hop and normalised it exactly that way.
+// One separator gone demotes the AUTHORITY to an ordinary directory on the local
+// drive root, `is_directory` then answers false for a tree that is right there,
+// and this arm — which `findShippedConfig` calls AUTHORITATIVE once found —
+// declines without a word and lets the cwd walk answer instead. Not a refusal
+// naming a path: a DIFFERENT config tree, silently.
+//
+// ⚠ WHY THE ASSERTION IS ON THE SEPARATOR RUN AND NOT ONLY ON `has_value()`.
+// Both wrong spellings (`C:\localhost\…` and `\localhost\…`) are equally absent
+// from disk, so a partial repair reads exactly like a complete one. The run is
+// the property that was destroyed, so the run is what gets pinned.
+TEST(ConfigPathWalk, InstalledRootSurvivesAMultiSeparatorExecutableDir) {
+    ScratchDir scratch(Location::Temp, "config-walk-installed-unc");
+    fs::path const exeDir = scratch.path() / "bin";
+    std::error_code ec;
+    fs::create_directories(exeDir, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    fs::path const planted = plantInstalledLayout(exeDir, "sources");
+
+    fs::path const uncExeDir = dss::test_support::uncSpellingOf(exeDir);
+    if (uncExeDir.empty())
+        GTEST_SKIP()
+            << "D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS"
+               ": this host offers no reachable multi-separator spelling of '"
+            << exeDir.string()
+            << "', so the installed-layout arm WAS NOT MEASURED on this leg. "
+               "This is an UNMEASURED property, not a passing one.";
+    ASSERT_GE(dss::test_support::leadingSeparatorRun(uncExeDir), 2u);
+
+    auto const got = dss::installedConfigRootFrom(uncExeDir);
+    ASSERT_TRUE(got.has_value())
+        << "an installed tree reached through an authority-rooted executable "
+           "directory was not found — the leading separator run was collapsed, "
+           "so the probe asked the LOCAL drive about a path that lives on "
+        << uncExeDir.string();
+    EXPECT_GE(dss::test_support::leadingSeparatorRun(*got), 2u)
+        << "the resolved root no longer names the machine it was asked about: "
+        << got->string();
+
+    // ⚠ DELIBERATELY NOT `expectSameDir`, AND THE REASON IS THIS ROW'S OTHER
+    // HALF. That helper compares through the THROWING `fs::weakly_canonical`,
+    // and ✔MEASURED on this same host that overload does not merely mis-answer
+    // for an authority-rooted path — it THROWS `filesystem error: cannot make
+    // canonical path: No such file or directory` for a directory whose
+    // `exists()` is true. (The non-throwing overload sets `ENOENT` instead;
+    // that is the SAFE direction, which is why every call site with a
+    // keep-the-original-on-error arm was already correct.) So the equality is
+    // stated on what was actually planted: the subdirectory
+    // `plantInstalledLayout` created must be reachable THROUGH the resolved
+    // root, which no collapsed spelling can satisfy.
+    std::error_code sameEc;
+    EXPECT_TRUE(fs::is_directory(*got / "sources", sameEc))
+        << "the resolved root does not hold the planted tree, so it is not the "
+           "tree that was installed: " << got->string();
+    EXPECT_EQ(got->filename(), planted.filename())
+        << "the hop must still land on the config tree itself";
 }
 
 // A DEVELOPMENT build has no installed layout around its binary, so the arm must

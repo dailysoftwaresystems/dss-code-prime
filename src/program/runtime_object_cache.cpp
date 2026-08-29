@@ -1,6 +1,7 @@
 #include "program/runtime_object_cache.hpp"
 
 #include "core/crypto/sha256.hpp"
+#include "core/substrate/path_identity.hpp"  // genericSpelling
 #include "program/cross_validate_target_format.hpp"
 // D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK:
 // `detail::createExclusiveBinary` is the EXCLUSIVE-CREATE primitive the
@@ -191,14 +192,14 @@ readWholeFile(fs::path const& path, std::string_view role) {
             "runtime object cache: the {} '{}' does not exist or is not a "
             "regular file, so its content digest cannot enter the cache key. "
             "Anchored: {}.",
-            role, path.generic_string(), kAnchor));
+            role, core::genericSpelling(path), kAnchor));
     }
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         return std::unexpected(std::format(
             "runtime object cache: could not open the {} '{}' for reading. "
             "Anchored: {}.",
-            role, path.generic_string(), kAnchor));
+            role, core::genericSpelling(path), kAnchor));
     }
     std::string contents{std::istreambuf_iterator<char>(in),
                          std::istreambuf_iterator<char>()};
@@ -208,7 +209,7 @@ readWholeFile(fs::path const& path, std::string_view role) {
             "PARTIAL read would hash to a digest that names bytes nobody "
             "compiled, so this is a refusal rather than a best-effort. "
             "Anchored: {}.",
-            role, path.generic_string(), kAnchor));
+            role, core::genericSpelling(path), kAnchor));
     }
     return contents;
 }
@@ -452,7 +453,13 @@ private:
 // is informative in both directions rather than a hedge.
 [[nodiscard]] std::string composedPathNote(fs::path const& directory,
                                            fs::path const& composed) {
-    std::string const rendered = composed.generic_string();
+    // ★ `core::genericSpelling`, and here the LOSS WOULD FALSIFY THE NUMBER,
+    // not just the name: this note's whole job is to answer "is the composed
+    // path too long?", and it answers by measuring `rendered.size()`. The
+    // generic-format collapse deletes a separator, so on a path that names an
+    // authority the verdict is computed on a string one character shorter than
+    // the path that actually failed — a length report about a different string.
+    std::string const rendered = core::genericSpelling(composed);
     std::string       note     = std::format(
         " COMPOSED PATH: '{}' — {} characters", rendered, rendered.size());
 
@@ -550,14 +557,14 @@ readKeyDocumentBeside(fs::path const& artifactPath) {
             "stored key cannot be read and a hit cannot be verified. This is a "
             "refusal rather than a miss: something else owns that name, and "
             "treating it as absent would let the cache write over it",
-            documentPath.generic_string()));
+            core::genericSpelling(documentPath)));
     }
 
     std::ifstream in(documentPath, std::ios::binary);
     if (!in) {
         return std::unexpected(std::format(
             "the key document '{}' exists but could not be opened for reading",
-            documentPath.generic_string()));
+            core::genericSpelling(documentPath)));
     }
     std::string contents{std::istreambuf_iterator<char>(in),
                          std::istreambuf_iterator<char>()};
@@ -566,7 +573,7 @@ readKeyDocumentBeside(fs::path const& artifactPath) {
             "an I/O error interrupted the read of key document '{}'. A PARTIAL "
             "read would compare unequal and be reported as a collision, so this "
             "is a refusal rather than a verdict",
-            documentPath.generic_string()));
+            core::genericSpelling(documentPath)));
     }
     return std::optional<std::string>{std::move(contents)};
 }
@@ -591,8 +598,8 @@ readKeyDocumentBeside(fs::path const& artifactPath) {
         "named above (both the artifact and its '.key' sibling) and rebuild; if "
         "it lives in a packaged read-only tree, the package is corrupt. "
         "Anchored: {}.",
-        artifactPath.generic_string(), reason, key.pathDigest, key.digest,
-        runtimeKeyDocumentPath(artifactPath).generic_string(), kAnchor);
+        core::genericSpelling(artifactPath), reason, key.pathDigest, key.digest,
+        core::genericSpelling(runtimeKeyDocumentPath(artifactPath)), kAnchor);
 }
 
 // Present + verified ⇒ empty. Otherwise the refusal text, already composed.
@@ -711,7 +718,7 @@ writeThroughTemp(RuntimeObjectKey const&       key,
             return std::unexpected(unwritableMissRefusal(
                 key, std::format("could not claim a unique temporary file in "
                                  "'{}' after 10000 attempts",
-                                 directory.generic_string())));
+                                 core::genericSpelling(directory))));
         }
         fs::path candidate =
             directory
@@ -754,7 +761,7 @@ writeThroughTemp(RuntimeObjectKey const&       key,
                 key,
                 std::format("could not open the temporary file '{}' for "
                             "writing.{}",
-                            candidate.generic_string(),
+                            core::genericSpelling(candidate),
                             composedPathNote(directory, candidate))));
         }
     }
@@ -773,7 +780,7 @@ writeThroughTemp(RuntimeObjectKey const&       key,
             return std::unexpected(unwritableMissRefusal(
                 key, std::format("failed writing {} byte(s) to the temporary "
                                  "file '{}'",
-                                 bytes.size(), temporary.generic_string())));
+                                 bytes.size(), core::genericSpelling(temporary))));
         }
         // ⚠ CLOSED AND CHECKED EXPLICITLY, not left to the deleter. A
         // close-time flush failure (a full disk, a quota) is DISCARDED by a
@@ -785,7 +792,7 @@ writeThroughTemp(RuntimeObjectKey const&       key,
             return std::unexpected(unwritableMissRefusal(
                 key, std::format("failed writing {} byte(s) to the temporary "
                                  "file '{}'",
-                                 bytes.size(), temporary.generic_string())));
+                                 bytes.size(), core::genericSpelling(temporary))));
         }
     }
 
@@ -802,8 +809,8 @@ writeThroughTemp(RuntimeObjectKey const&       key,
         return std::unexpected(unwritableMissRefusal(
             key,
             std::format("could not rename '{}' into place as '{}': {}.{}",
-                        temporary.generic_string(),
-                        destination.generic_string(), ec.message(),
+                        core::genericSpelling(temporary),
+                        core::genericSpelling(destination), ec.message(),
                         composedPathNote(directory, destination))));
     }
     guard.release();  // the temp no longer exists under that name
@@ -825,7 +832,7 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
             "{}: the object-format directory '{}' does not "
             "exist or is not a directory, so the archive-writing sibling of "
             "build format '{}' cannot be resolved. Anchored: {}.",
-            requester.label, objectFormatsDir.generic_string(),
+            requester.label, core::genericSpelling(objectFormatsDir),
             buildFormat.name(), requester.anchor));
     }
 
@@ -844,7 +851,7 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
             return std::unexpected(std::format(
                 "{}: could not open the object-format "
                 "directory '{}': {}. Anchored: {}.",
-                requester.label, objectFormatsDir.generic_string(),
+                requester.label, core::genericSpelling(objectFormatsDir),
                 ec.message(), requester.anchor));
         }
         for (fs::directory_iterator const end{}; it != end; it.increment(ec)) {
@@ -854,7 +861,7 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
                     "'{}' was interrupted after PARTIAL enumeration: {}. A "
                     "partial scan cannot prove the archive-writing sibling is "
                     "unique, so this is a refusal. Anchored: {}.",
-                    requester.label, objectFormatsDir.generic_string(),
+                    requester.label, core::genericSpelling(objectFormatsDir),
                     ec.message(), requester.anchor));
             }
             // A dedicated error_code: `ec` carries the ITERATION's status and
@@ -900,7 +907,8 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
                 "cannot be read could have been a second candidate, so "
                 "skipping it would turn an AMBIGUOUS set into a silently "
                 "UNIQUE one. Anchored: {}.",
-                requester.label, document.generic_string(), buildFormat.name(),
+                requester.label, core::genericSpelling(document),
+                buildFormat.name(),
                 detail, requester.anchor));
         }
         ObjectFormatSchema const& candidate = **loaded;
@@ -943,7 +951,7 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
             "Anchored: {}.",
             requester.label, buildFormat.name(),
             objectFormatKindName(buildFormat.kind()), target.name(),
-            documents.size(), objectFormatsDir.generic_string(),
+            documents.size(), core::genericSpelling(objectFormatsDir),
             requester.anchor));
     }
 
@@ -958,7 +966,7 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
         requester.label, buildFormat.name(),
         objectFormatKindName(buildFormat.kind()), matches.size(),
         target.name(), quotedList(matches), documents.size(),
-        objectFormatsDir.generic_string(), requester.anchor));
+        core::genericSpelling(objectFormatsDir), requester.anchor));
 }
 
 // ═══ THE TWO ROOTS ═══════════════════════════════════════════════════════════
@@ -986,7 +994,7 @@ RuntimeCacheRoots resolveRuntimeCacheRoots(fs::path const& configRoot) {
     // an answer that omitted the root the lookup consulted FIRST would send
     // them hunting for a cache the compiler had already read.
     note(std::format("shipped (read-only, never written) -> '{}'",
-                     roots.shipped.generic_string()));
+                     core::genericSpelling(roots.shipped)));
 
     // ★ EVERY CANDIDATE IS WALKED, INCLUDING THE ONES AFTER THE WINNER — the
     // selection stops at the first that resolves, the ENUMERATION does not. The
@@ -1013,7 +1021,7 @@ RuntimeCacheRoots resolveRuntimeCacheRoots(fs::path const& configRoot) {
         bool const selected = roots.perUser.empty();
         if (selected) roots.perUser = resolved;
         note(std::format("{} -> '{}'{}", candidate.spelling,
-                         resolved.generic_string(),
+                         core::genericSpelling(resolved),
                          selected ? " [SELECTED]" : ""));
     }
     return roots;
@@ -1336,7 +1344,9 @@ storeRuntimeObject(RuntimeObjectKey const&      key,
             // completely different fixes. The composed path and its LENGTH go
             // with it: a directory chain can be refused for being too long too,
             // and there is no directory yet to run the short-name control in.
-            std::string const rendered = directory.generic_string();
+            // Same reason as `composedPathNote`: the length rides on this
+            // string, so a collapsed separator is a wrong MEASUREMENT.
+            std::string const rendered = core::genericSpelling(directory);
             return std::unexpected(unwritableMissRefusal(
                 key,
                 std::format("could not create the artifact directory '{}' ({} "

@@ -18513,3 +18513,90 @@ TEST(SemanticAnalyzerC, TheDiscardingContextsForAVoidExpressionStillCompile) {
            "comma, the (void) cast, a bare statement, and sizeof";
     EXPECT_FALSE(model.diagnostics().hasErrors());
 }
+
+// ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ─────────────
+//
+// The semantic tier's two REFUSALS. The schedule itself is pinned where it is
+// carried (HirLoweringC); what belongs here is what the fold declines to invent.
+
+// The priority is an integer CONSTANT EXPRESSION. A non-constant is refused
+// rather than silently defaulted, because the default is not a neutral value: it
+// is `kUnprioritizedStaticInit`, which moves the initializer to the END of the
+// schedule. Guessing here produces a program that runs its initializers in a
+// different order than its source asked for, with no diagnostic anywhere.
+TEST(SemanticAnalyzerC, GnuConstructorPriorityMustBeAConstantExpression) {
+    // ⚠ THE ARGUMENT IS A VARIABLE, NOT A CALL, AND THAT IS FORCED. A call does
+    // not reach the fold at all: the attribute-ARGUMENT grammar admits ATOMS only,
+    // so `constructor(f())` is a PARSE error — identically to
+    // `aligned(f())`, which is the pre-existing shape of that limitation. A
+    // variable parses, reaches `constIntExpr`, and is not constant, which is the
+    // state this pin is about.
+    auto const model = analyzeShipped("c", {
+        "int gv;\n"
+        "__attribute__((constructor(gv))) static void init(void){}\n"
+        "int main(void){ return 0; }\n"});
+    EXPECT_TRUE(model.hasErrors())
+        << "a non-constant priority must FAIL, never default to unprioritized — "
+           "the default is `kUnprioritizedStaticInit`, which is a POSITION (the "
+           "end of the schedule), not an absence";
+}
+
+// A constant expression IS accepted: the refusal above must be about
+// constant-ness, not about "anything that is not a bare integer literal". Without
+// this control, an arm that refused every argument would look correct.
+TEST(SemanticAnalyzerC, GnuConstructorPriorityAcceptsAMacroExpandedConstant) {
+    auto const model = analyzeShipped("c", {
+        "#define P 101\n"
+        "__attribute__((constructor(P))) static void init(void){}\n"
+        "int main(void){ return 0; }\n"});
+    EXPECT_FALSE(model.hasErrors())
+        << "the priority goes through the SHARED integer-constant folder, so a "
+           "macro-borne constant works — the refusal above is about "
+           "constant-NESS, not about 'anything that is not a literal in the "
+           "source text'. Without this control an arm that refused every "
+           "argument would look correct.";
+}
+
+// ⚠ A NAMED, MEASURED RESIDUAL, RECORDED HERE RATHER THAN LEFT TO BE FOUND:
+// `__attribute__((constructor(50 + 51)))` is a PARSE ERROR in DSS
+// (`P_UnexpectedToken: expected 'ParenClose' — got '+'`) while mingw-w64 gcc
+// 13.2.0 accepts it at rc=0 under `-Wall -Wextra`. It is NOT a gap this feature
+// opened and NOT specific to this verb: the attribute-ARGUMENT grammar admits
+// ATOMS only, and the already-shipped `aligned` verb diverges identically —
+// ✔MEASURED, `__attribute__((aligned(2 + 2))) int gv = 1;` fails with the same
+// code at the same position while the same gcc accepts it. Closing it is the
+// attribute-argument grammar's question, and widening a predictive rule shared by
+// `aligned` / `format` / `nonnull` / `visibility` is not a change to make as a
+// side effect of a different feature.
+
+// The BARE form takes no argument and is NOT an error. This is the opposite of
+// the `aligned` arm one verb over, and the asymmetry is real rather than
+// stylistic: a bare `aligned` has a TARGET-DEPENDENT meaning this engine refuses
+// to invent, while a bare `constructor` has one exact meaning all three
+// references agree on — and it is the spelling real code writes.
+TEST(SemanticAnalyzerC, GnuConstructorBareFormNeedsNoPriorityArgument) {
+    auto const model = analyzeShipped("c", {
+        "__attribute__((constructor)) static void init(void){}\n"
+        "__attribute__((destructor))  static void fini(void){}\n"
+        "int main(void){ return 0; }\n"});
+    EXPECT_FALSE(model.hasErrors())
+        << "the bare spelling is the common one; failing it loud would refuse "
+           "the form every reference documents first";
+}
+
+// The shared decl-kind gate reports `constructor` on a DATA object, from the
+// row's own `appliesTo: ["function"]` — the engine names no attribute here. A
+// WARNING, matching the uniform severity that gate applies to its other axes.
+TEST(SemanticAnalyzerC, GnuConstructorOnADataObjectIsReportedByTheDeclKindGate) {
+    auto const model = analyzeShipped("c", {
+        "__attribute__((constructor)) int gv = 7;\n"
+        "int main(void){ return gv; }\n"});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AttributeIgnoredForDeclarationKind), 1u)
+        << "an initializer schedule on a data object cannot be honoured — the "
+           "gate must say so rather than record a schedule on a symbol whose "
+           "kind can never be called";
+    EXPECT_FALSE(model.hasErrors())
+        << "…as a WARNING: the gate's severity is uniform across its axes";
+}
+

@@ -13,7 +13,16 @@ using namespace dss;
 // ── POD layout budgets (the scan-hot density discipline) ──
 static_assert(sizeof(detail::MirInst) <= 32);
 static_assert(sizeof(detail::MirBlock) <= 32);
-static_assert(sizeof(detail::MirFunc) <= 32);
+// D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN moved this budget
+// 32 → 40. `MirFunc` gained an 8-byte `StaticInitSchedule`, which is the first
+// member here that is not a 1-byte flag, so the old ceiling's arithmetic (a run
+// of flags rounded to 4) stopped describing the record. The new ceiling keeps
+// EXACTLY the four bytes of slack the old one carried at 28 — the point of the
+// budget is that the NEXT addition still trips it, not that it can absorb one.
+// The exact size and alignment are pinned beside the struct itself; this is the
+// budget mirror, and it is deliberately a separate statement in a separate file
+// so a header edit alone cannot move both.
+static_assert(sizeof(detail::MirFunc) <= 40);
 static_assert(std::is_trivially_copyable_v<detail::MirInst>);
 static_assert(std::is_trivially_copyable_v<detail::MirBlock>);
 static_assert(std::is_trivially_copyable_v<detail::MirFunc>);

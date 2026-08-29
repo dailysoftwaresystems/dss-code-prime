@@ -6,6 +6,7 @@ add_library(link OBJECT
     object_format_backend.cpp
     object_format_schema.cpp
     object_format_schema_json.cpp
+    static_init_tables.cpp
     # D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES (TF-C125).
     # `object_format_backends.cpp` holds THE table — the one place in the tree
     # that names every format. The substrate calls into it, which makes each

@@ -62,6 +62,8 @@
     "pageAlign": 4096,
     "bindNow": true
   },
+  "$staticInitializersComment": "D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: THIS FORMAT DECLARES NO STATIC-INITIALIZER CHANNEL, AND THE ABSENCE IS THE ANSWER RATHER THAN AN OMISSION -- recorded here so nobody 'completes' the table by adding one.\\nThis is an IMAGE flavor that is NOT an EXEC flavor: `isExecFlavor()` is false, so DSS injects no entry trampoline and there is no DSS-synthesized entry to call anything. Nor will the platform: ld.so runs `DT_INIT_ARRAY`, a DYNAMIC TAG the ELF writer does not emit (MEASURED on a DSS image -- `readelf -d` lists eleven tags and none is an init tag), and a PE DLL's initializers run from `DllMain`/`_DllMainCRTStartup`, which DSS does not synthesize either.\\nSo both runners would be FALSE here, and declaring the SECTIONS with no runner would emit a table nothing walks -- the silent shape this anchor exists to remove. With nothing declared, a program that schedules an initializer for this format is REFUSED by the linker, naming the format and the remedy. Making it work needs a real capability first (emit DT_INIT_ARRAY/DT_INIT_ARRAYSZ, or synthesize a DllMain), not a config row. Contrast macho64-*-dylib, which DOES declare `imageLoader`: dyld really does run `__mod_init_func` in a dylib, so that arm is a capability DSS has.",
+
 
   "sections": [
     {

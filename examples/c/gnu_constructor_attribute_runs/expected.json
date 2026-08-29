@@ -1,0 +1,16 @@
+{
+  "$comment": "D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN — the runnable witness that GNU `__attribute__((constructor))` / `((destructor))` are HONOURED. Before this landed, the same source exited 0 under DSS (with `warning[H_UnknownLinkageSpecifier]` naming the attribute it had dropped) and 42 under mingw-w64 gcc 13.2.0. THE EXIT CODE IS THE CONSTRUCTOR WITNESS and the STDOUT IS THE DESTRUCTOR WITNESS, because destructors run after `main` returns and no exit code is left to influence by then. Exit 42 = 20+1+1+10+10, reachable only if all five constructors ran exactly once; a wrong PRIORITY ORDER exits 7 instead, so 'nothing ran' and 'ran in the wrong order' are distinguishable rather than folded into one answer. ⚠⚠ THE TOTAL IS BUILT COMMUTATIVELY ON PURPOSE: order among EQUAL-priority constructors is NOT portable — ✔MEASURED, two bare same-priority constructors run 1,2 under Linux gcc 13.3.0 and clang 18.1.3 and 2,1 under mingw-w64 gcc 13.2.0 — so `bump_a`/`bump_b` both add 10 and either order gives 42. What IS portable and IS asserted: DISTINCT priorities order ascending, the BARE form runs LAST, and the destructor channel walks that same sequence BACKWARD ('dBARE d102 d101 ') — unanimous across all three references. THE RELEASE ARM PINS A SEPARATE DEFECT: every constructor here is `static` and is called from nowhere in the program text, so module-level DCE deletes it unless the liveness scan roots the static-initializer schedule; without that clause this example passes in `debug` (pipeline `Identity`) and fails in `release`. FOUR TARGETS: pe runs natively on the Windows gate host, elf x86_64 + arm64 under qemu on Linux, macho on darwin.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "dBARE d102 d101 ",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "$comment": "The release arm is load-bearing here rather than a formality — see the DCE note above. It runs the full optimizer over a module whose only reference to five of its functions is the static-initializer schedule itself.", "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

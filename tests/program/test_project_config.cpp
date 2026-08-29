@@ -23,6 +23,7 @@
 // notes (no shipped format serves a non-cli profile; the profile does
 // NOT yet drive artifact shape — that is D-AP2-COMPILATION-CONTEXT).
 
+#include "core/substrate/path_identity.hpp"   // genericSpelling — the lossless spelling
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/glob_match.hpp"          // D-AP2-SOURCES-GLOB: matcher + expander
 #include "core/types/grammar_schema.hpp"
@@ -36,6 +37,7 @@
 #include "host_native_target.hpp"       // hostNativeTarget (build-and-spawn on EVERY leg)
 #include "run_binary.hpp"               // runBinary (behavioral exit-code proof)
 #include "scratch_dir.hpp"
+#include "unc_spelling.hpp"             // the ONE multi-separator-root fixture
 
 #include <gtest/gtest.h>
 
@@ -3134,6 +3136,164 @@ TEST(ExpandGlob, TwoMatchesSortedDedupedRoutesMulti) {
     EXPECT_EQ(std::filesystem::path{out[1]}.filename().string(), "b.c");
     EXPECT_TRUE(routesToMultiUnit(out.size()))
         << "2 matches → the multi-CU route, exactly as two literal sources would";
+}
+
+// ── [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]] ─────
+//
+// A GLOB OVER A SHARE MUST YIELD SOURCE PATHS THAT STILL NAME THE SHARE. What
+// `expandGlob` appends is not a message — it is the list of files the compiler
+// then OPENS, so a collapsed authority here is a build that cannot find its own
+// sources, reported as a per-file open failure naming a local path nobody wrote.
+//
+// ★★★ THE DEFECT, ✔MEASURED 2026-08-28 on a REACHABLE UNC directory with the
+// toolchain that builds DSS. The match was rendered
+// `it->path().lexically_normal().generic_string()` — BOTH transforms, and each
+// removes one separator of the run:
+//     child                        '//localhost/C$/…/leaf.c'    run 2
+//     child.lexically_normal()     '\localhost\C$\…\leaf.c'     run 1
+//     …then .generic_string()      '/localhost/C$/…/leaf.c'     run 1
+// ⚠ FIXING EITHER ONE ALONE READS EXACTLY LIKE FIXING BOTH, because both wrong
+// spellings are equally absent from disk — which is why the pin is on the RUN.
+//
+// ⚠ THE TAIL KEY IS DELIBERATELY NOT PART OF THIS CLAIM. `lexically_relative`
+// yields a path with NO root (✔MEASURED: `leaf.c`, run 0), so the plain spelling
+// is exact there and this test must not be read as covering it.
+TEST(ExpandGlob, MatchKeepsAMultiSeparatorRoot) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program-glob-unc"};
+    writeText(scratch.path() / "a.c", "int a(void){return 0;}\n");
+
+    std::filesystem::path const uncDir =
+        dss::test_support::uncSpellingOf(scratch.path());
+    if (uncDir.empty())
+        GTEST_SKIP()
+            << "D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS"
+               ": this host offers no reachable multi-separator spelling of '"
+            << scratch.path().string()
+            << "', so the glob expander's rendering WAS NOT MEASURED on this "
+               "leg. This is an UNMEASURED property, not a passing one.";
+    ASSERT_GE(dss::test_support::leadingSeparatorRun(uncDir), 2u);
+
+    std::vector<std::string> out;
+    std::error_code          ec;
+    ASSERT_TRUE(expandGlob(dss::core::genericSpelling(uncDir / "*.c"), out, ec));
+    EXPECT_FALSE(ec) << ec.message();
+    ASSERT_EQ(out.size(), 1u)
+        << "the glob must still walk the tree it was pointed at";
+    EXPECT_GE(dss::test_support::leadingSeparatorRun(
+                  std::filesystem::path{out[0]}),
+              2u)
+        << "the matched SOURCE PATH lost its authority, so the compiler would "
+           "go on to open it on this drive: " << out[0];
+    std::error_code existsEc;
+    EXPECT_TRUE(std::filesystem::exists(std::filesystem::path{out[0]}, existsEc))
+        << "a match the compiler cannot open is not a match: " << out[0];
+
+    // ⚠ THE SECOND RENDERING, WHICH THE ARM ABOVE CANNOT REACH. `expandGlob`
+    // has a metacharacter-free path that renders `rebase()`'s result instead of
+    // the walk's, and it is a SEPARATE `generic_string()` call. Reaching it
+    // needs a RELATIVE pattern against a multi-separator BASE — the one shape
+    // where re-basing happens AND the result carries an authority. Without this
+    // the fix on that line would be untested and would read as covered.
+    std::vector<std::string> lit;
+    std::error_code          litEc;
+    ASSERT_TRUE(expandGlob("a.c", lit, litEc, uncDir));
+    EXPECT_FALSE(litEc) << litEc.message();
+    ASSERT_EQ(lit.size(), 1u);
+    EXPECT_GE(dss::test_support::leadingSeparatorRun(
+                  std::filesystem::path{lit[0]}),
+              2u)
+        << "the re-based literal lost its authority: " << lit[0];
+}
+
+// ── [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]] ─────
+//
+// A LITERAL SOURCE THAT NAMES ANOTHER MACHINE MUST NOT BE RE-BASED ONTO THE
+// MANIFEST'S DIRECTORY. `expandAndDedupProjectSources` classified with a bare
+// `is_absolute()`, and ✔MEASURED 2026-08-28 that predicate answers FALSE for a
+// path whose root is a multi-separator authority:
+//     '//localhost/C$/…'.is_absolute()          -> FALSE
+//     'C:/some/consumer/project' / that         -> 'C://localhost/C$/…'
+// So an already-exact source was treated as relative and had the consuming
+// manifest's DRIVE glued in front of the authority — the silent relocation the
+// re-basing rule exists to prevent, in the one case the rule cannot see.
+//
+// ⚠ TWO DEFECTS ON ONE LINE: the rendering that followed was `generic_string()`,
+// which collapses the run again. A correctly-classified literal still came out
+// naming the local drive, so neither repair alone is observable.
+TEST(ProjectSources, LiteralWithAMultiSeparatorRootIsNotRebased) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program-sources-unc"};
+    writeText(scratch.path() / "a.c", "int a(void){return 0;}\n");
+
+    std::filesystem::path const uncDir =
+        dss::test_support::uncSpellingOf(scratch.path());
+    if (uncDir.empty())
+        GTEST_SKIP()
+            << "D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS"
+               ": this host offers no reachable multi-separator spelling of '"
+            << scratch.path().string()
+            << "', so the literal-source classification WAS NOT MEASURED on "
+               "this leg. This is an UNMEASURED property, not a passing one.";
+    ASSERT_GE(dss::test_support::leadingSeparatorRun(uncDir), 2u);
+
+    // A base directory that is DELIBERATELY somewhere else: if the literal is
+    // misclassified as relative it acquires THIS path's root, which is exactly
+    // what the assertion below refuses.
+    std::filesystem::path const otherBase = scratch.path() / "unrelated_base";
+    DiagnosticReporter          rep;
+    auto const expanded = expandAndDedupProjectSources(
+        {dss::core::genericSpelling(uncDir / "a.c")}, otherBase, rep);
+    ASSERT_TRUE(expanded.has_value()) << "errors: " << rep.errorCount();
+    ASSERT_EQ(expanded->size(), 1u);
+    EXPECT_GE(dss::test_support::leadingSeparatorRun(
+                  std::filesystem::path{(*expanded)[0]}),
+              2u)
+        << "the literal was re-based or re-spelled onto the local drive: "
+        << (*expanded)[0];
+    std::error_code existsEc;
+    EXPECT_TRUE(
+        std::filesystem::exists(std::filesystem::path{(*expanded)[0]}, existsEc))
+        << "the expanded source must still name the file that was declared: "
+        << (*expanded)[0];
+
+    // ⚠ THE OTHER HALF OF THE SAME LINE, and the arm above CANNOT reach it: a
+    // rooted literal is returned verbatim, so the re-basing RENDERING never
+    // runs. A relative literal against a multi-separator BASE is the only shape
+    // that exercises it — and it is exactly where `generic_string()` would
+    // silently hand back a source on the local drive.
+    DiagnosticReporter rebaseRep;
+    auto const rebased =
+        expandAndDedupProjectSources({"a.c"}, uncDir, rebaseRep);
+    ASSERT_TRUE(rebased.has_value()) << "errors: " << rebaseRep.errorCount();
+    ASSERT_EQ(rebased->size(), 1u);
+    EXPECT_GE(dss::test_support::leadingSeparatorRun(
+                  std::filesystem::path{(*rebased)[0]}),
+              2u)
+        << "the re-based literal lost its authority: " << (*rebased)[0];
+}
+
+// The CONTROL for both arms above, and it is chosen to be INERT: a RELATIVE
+// literal has no root at all, so it must still be re-based against `baseDir`
+// exactly as before. This is what proves the fix is a discrimination on the
+// separator RUN and not a blanket "stop re-basing" regression — `isRootedPath`
+// answers FALSE here and the re-basing arm must still run.
+TEST(ProjectSources, RelativeLiteralIsStillRebasedAgainstTheBase) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program-sources-rebase"};
+    DiagnosticReporter rep;
+    auto const expanded =
+        expandAndDedupProjectSources({"src/lib.c"}, scratch.path(), rep);
+    ASSERT_TRUE(expanded.has_value());
+    ASSERT_EQ(expanded->size(), 1u);
+    EXPECT_EQ(std::filesystem::path{(*expanded)[0]},
+              std::filesystem::path{
+                  dss::core::genericSpelling(scratch.path() / "src" / "lib.c")})
+        << "a relative literal stopped being resolved against the manifest's "
+           "own directory: " << (*expanded)[0];
 }
 
 // ── 2g. expandGlob: `**` descends subdirectories ────────────────
