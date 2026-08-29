@@ -543,6 +543,20 @@ hand-typing every edit or reading every subsystem.
    `references/delegation.md`. Build the best long-term agnostic solution: extend
    config vocabulary, never branch the engine on identity. Any new `D-*` cited in `src/` is
    registered in the same commit.
+   ⚠⚠ **CONTENTION IS PER *FILE*, NOT PER DIRECTORY — AND A DIRECTORY-SHAPED
+   FORBIDDEN LIST COSTS A LANE ITS WHOLE RUN.** ✔MEASURED 2026-08-28 (P44): lane `h` was
+   forbidden `src/core/**`, `src/ffi/**` and `src/program/**` because a sibling owned *some*
+   files beneath them. It needed three specific files, **none of which the sibling touched**,
+   and it stopped rather than edit a forbidden path — correctly, by the rule as written
+   — after a ~27-minute run that produced zero edits. Justifying the grant then took one
+   `grep`. ⇒ **State each lane's owned and forbidden sets as PATHS, and when a lane asks
+   for a file inside a forbidden directory, MEASURE whether any sibling touches that FILE
+   before refusing.** A directory-shaped forbidden list is a GUESS about contention, not a
+   measurement of it — and the guess fails in the expensive direction, because a lane that
+   obeys it looks compliant while doing nothing. ★ The repair is cheap and does not restart
+   the work: grant the file, say why it is safe, and **resume the SAME agent** rather than
+   spawning a fresh one that has to re-derive everything.
+
    ★★ **THE ORCHESTRATOR IS A LANE TOO — ITS OWN EDITS OBEY THE SAME OWNERSHIP.**
    `src/dss-config/**` is a FILE SET like any other, and a config document is an INPUT to
    every lane's build. Editing one while a lane is running does not merely risk a merge

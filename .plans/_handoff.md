@@ -11,6 +11,102 @@
 
 **Last updated:** 2026-08-28 — cycles **P14 … P44**.
 
+---
+
+# §0 — RESUME HERE (a session with no context reads this block first)
+
+**State, ✔measured at the tip and not re-quoted:** branch `feature/c23-conformance-burndown-5`,
+**PR #56 OPEN**, HEAD **`c6a936f0`** ("Cycle P44 set 2"). `git status --porcelain` → **0 paths**.
+`git worktree list` → **the repo only** (every P44 lane worktree folded and removed). Cycle P44
+is **committed and pushed**; it is NOT mid-flight. Four legs green at that tree — Windows
+**1793/1793** (all 20 repo guards), WSL x86_64 / arm64-VPS / macOS **1773/1773** each
+(`1773 = 1793 − the 20 root-host-only guards`).
+
+★★★ **The queue for the next cycle is the “START HERE” subsection inside the
+P44 section below** — four disjoint lanes, `D-PP-PRAGMA-RECOGNIZED-SEMANTICS` first because its
+measurement and the operator’s ruling are already written into its row. **Re-derive every
+status from the registry before acting on that list.**
+
+## §0.1 — The four gate legs, verbatim
+
+```
+cmake --build build/dbg  &&  ctest --test-dir build/dbg --output-on-failure -j 12
+wsl.exe -e bash scripts/wsl-leg/wsl-leg.sh --mode full
+wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage arm64-vps --mode full
+wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage macos     --mode full
+```
+
+All three remote legs PREPARE (fetch, move the host’s clone to the driver’s branch and
+commit, clean), SYNC the working tree, RUN, and RESTORE on every exit path — `scripts/leg-tree/`
+owns those git verbs and **a leg must never hand-roll them**. Both remote carriages are driven
+from **inside WSL**; the arm64 VPS is WSL-only by construction. Repo guards run on the **root host
+only**, which is why the remote count is 20 lower. Wall clock this cycle: WSL ~7 min build +
+5 min ctest, arm64 ~19 min build + 13 min ctest, **macOS ~20 min build + 33 min ctest** — macOS
+is the long pole and a silent macOS leg is a question, not a verdict.
+
+⚠ **A `.plans/`-only edit still needs the 20 repo guards re-run**, because several of them read
+`.plans/**`: `ctest --test-dir build/dbg -I 1,21` takes ~2.5 min and is the cheap way to do it.
+This cycle needed exactly that — the full Windows pass predated the last registry amendment.
+
+## §0.2 — The reference toolchains, and WHERE MSVC IS
+
+`DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` is only checkable if all three can be RUN, and
+each must be probed **separately** — “the reference” is not one voice.
+
+| reference | version | how to reach it |
+|---|---|---|
+| gcc | 13.3.0 | inside WSL: `wsl.exe -e gcc` |
+| clang | 18.1.3 | inside WSL: `wsl.exe -e clang` |
+| mingw-w64 gcc | 13.2.0 | on PATH natively as `gcc` on the Windows host |
+| **MSVC** | **19.51.36252 (VS 18 / MSVC 14.51)** | **`C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64\cl.exe`** — operator, 2026-08-28 |
+
+★★ **MSVC IS REACHABLE WITHOUT `vcvars` FOR A FRONT-END QUESTION.** `cl.exe /c` compiles
+only; a redefinition or a syntax refusal is a front-end error, so no link and no CRT environment
+are needed — write the fixture so it includes **no system header** and the probe runs bare.
+⚠ This mattered: MSVC was nearly left unmeasured on the `#pragma once` question for want of an
+obvious invocation, and its vote **flipped the count from 1–1 to 2–1** on the axis the
+operator then ruled. A reference you cannot invoke becomes a reference you stop consulting.
+⚠ `mingw-w64 gcc` and `WSL gcc` are DIFFERENT references and they DISAGREE — ✔measured
+this cycle on same-priority constructor ordering (1,2 vs 2,1). Never treat one as a stand-in.
+
+## §0.3 — Rulings issued 2026-08-28, and where each now lives
+
+| ruling | now recorded in |
+|---|---|
+| **`#pragma once` dedups on IDENTITY, not content** — the disjunction decides ACCEPTANCE, not MEANING | the `D-PP-PRAGMA-RECOGNIZED-SEMANTICS` row (with the 7-case matrix and the stated cost of diverging from gcc) |
+| **A completed set of lanes is a COMMIT POINT** — commit + push + PR before seeding the next set | `dss-cycle` SKILL.md §“A COMPLETED SET OF LANES IS A COMMIT POINT” |
+| **“Complete” means FOLDED** — a lane that has REPORTED has not landed | `dss-cycle` SKILL.md §“‘COMPLETE’ MEANS FOLDED” |
+| **MSVC’s location** | §0.2 above |
+
+## §0.4 — What is OWED, stated so it is not mistaken for done
+
+1. **The standing PR exit regime, inherited by PR #56 and undischarged**: units + sqlite
+   `veryquick` + `speedtest1` on **FOUR** legs, then the README — which still says
+   *“THREE hosts”* and has **no arm64-VPS table**. P44 deliberately did not spend it per
+   commit (hours, over a tree that changes with every landing set). **Stated, not skipped.**
+2. **The orchestrator’s cycle instruments live in a session-scoped scratchpad** and do not
+   survive a new session — the path and the inventory are in “START HERE” below, and the
+   directory still exists on disk. **Read them from there rather than rewriting them**, and decide
+   at the START of the next cycle whether they are promoted into `scripts/`.
+
+## §0.5 — Three traps this session paid for again
+
+- ⛔ **A quoted heredoc EATS BACKSLASHES.** Hit **three** more times here, twice inside a regex
+  (`(?<!\\)\|` arriving as `(?<!)|`) where it did not merely mangle output — it changed what
+  the pattern MEANT and the script died on an unrelated-looking parse error. **Any throwaway script
+  that writes or deletes goes in a FILE**, written with the Write tool, and asserts it is not inside
+  the repository by comparing RESOLVED PATH PREFIXES (`os.path.realpath`), never substrings.
+- ⚠ **A probe that runs from the wrong CWD fails as `C_InvalidLanguageName`.** `findShippedConfig`
+  walks UP from the working directory, so a probe launched from a scratch dir finds no config and the
+  error names the language, not the path. Run probes with `cwd=<repo>`, and make the probe print the
+  RESOLVED config path it used. This cost three rounds in one lane and a full arm battery in another.
+- ⚠ **`git status --porcelain` C-QUOTES a path that needs one**, and this repo holds
+  `.plans/23-full-c-plan - tbd.md`. A naive `line[3:]` does not error — it SILENTLY OMITS that
+  path. Use `-z`. (`core.quotePath=false` does NOT help: it governs non-ASCII bytes, not the quoting
+  a space triggers.)
+
+---
+
 ★★★ **P44: TWENTY-ONE ANCHORS CLOSED ACROSS NINE LANES, THE GATE CAN SEE NINETEEN OF THEM, AND NOTHING THIS CYCLE OPENED IS STILL OPEN.** ✔MEASURED `check-anchor-balance --base b1684e7f` ⇒ **closed 19, opened 0, net −19**; registry **556 → 537** (**production 349 OPEN / harness 188**, and the sum is the cross-check). Both anchor gates run, plus `stale-refusal-citations`, `wrapped-anchor-ids`, `plan-citations`, `path-identity` and `retyped-closed-sets`, all rc=0. ⚠⚠ **THE GATE CANNOT SEE TWO OF THE TWENTY-ONE, AND THE REPORT OWES BOTH FIGURES**: it counts ROWS BY NAME across base and tip, so a row MINTED and closed inside the cycle (lane `a` → lane `h`) and a row written BORN CLOSED (lane `i`) are invisible — ✔measured from both bases, `b1684e7f` reads closed 19 and `6c6d6077` reads closed 1, and 19+1≠21. That blindness is RIGHT for *"did this cycle leave more open than it found?"* and WRONG for *"what did it fix?"*; **never soften the instrument, report both numbers.**
 
 ★★★ **P44's HEADLINE: TWO LANES SHIPPED TWO CORRECT HALVES, BOTH CORRECTLY DECLINED TO CLOSE THE ROW, AND THE COMPOSED BINARY WAS STILL 0/30.** The cause was one tier below either lane: bare `fs::absolute` re-roots a path that already names an AUTHORITY (`//host/share`) onto the local drive. ★ **A lane that ships a correct half and declines to close is the process working**; the orchestrator owes the composition measurement, and nobody's green was wrong.
