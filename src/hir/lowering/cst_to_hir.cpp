@@ -893,11 +893,9 @@ struct Lowerer {
         // (a bare F64) — mis-lowering the op (the child is the "leaves 2.0 a bare
         // F64" bug). real->complex constructs (v, 0); complex->complex element-
         // converts — both realized by materializeComplexCast at hir_to_mir. Implicit
-        // complex->real is NOT here — ⚠ and the clause that used to say it "stays a
-        // semantic reject, C99 6.3.1.7" CITED THE STANDARD FOR THE OPPOSITE OF WHAT
-        // THE STANDARD SAYS: C 6.3.1.7p2 DEFINES that conversion and requires no cast
-        // to request it. It is a KNOWN DIVERGENCE, recorded in the note below and in
-        // [[D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED]], not a rule. The
+        // complex->real is the SEPARATE arm below (P46,
+        // [[D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED]]): C 6.3.1.7p2
+        // DEFINES that conversion and requires no cast to request it. The
         // identical-type case already returned at the top (`child.type == target`).
         if (tk == TypeKind::Complex
             && (ck == TypeKind::Complex || isArithmeticCore(ck))) {
@@ -911,33 +909,36 @@ struct Lowerer {
             }
             return {cast, target};
         }
-        // ⚠ THE MIRROR — AN IMPLICIT COMPLEX SOURCE INTO A REAL TARGET — IS
-        // DELIBERATELY ABSENT, AND THE SENTENCE ABOVE SAYING IT "stays a semantic
-        // reject, C99 6.3.1.7" IS THE WRONG REASON FOR THE RIGHT STATE.
-        // D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED.
+        // THE MIRROR — AN IMPLICIT COMPLEX SOURCE INTO A REAL TARGET — P46,
+        // [[D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED]] (closed).
         //
         // C 6.3.1.7p2 makes the conversion implicit (the imaginary part is
-        // discarded) and both references compile and run `double d = z;` — so this
-        // is a KNOWN DIVERGENCE, not a rule. The arm was written and WITHDRAWN the
-        // same day: `src/dss-config/shippedLibs/tgmath.json` borrows its `_Complex`
-        // loudness from this refusal, so admitting it turned `sqrt(z)` under
-        // `<tgmath.h>` from a loud `S_TypeMismatch` into a SILENT wrong answer
-        // (✔MEASURED: DSS returned 0 where gcc, dispatching to `csqrt`, returns 1).
-        // The admission needs the tgmath complex dispatch to have its OWN owner
-        // first — see the long note at the matching arm in
-        // `src/analysis/semantic/type_rules.hpp::isAssignable`, which carries the
-        // full measurement and why a `_Generic` arm cannot substitute.
-        // ✔P45 MEASURED THE REALIZE SIDE SO A CLOSING LANE NEED NOT: the arm is
-        //   `if (ck == Complex && tk != TypeKind::Bool && isArithmeticCore(tk))`
-        // minting the SAME `Cast(complex -> real)` the EXPLICIT cast builds, which
-        // `mapCast`'s C 6.3.1.7 discard arm already realizes — no new lowering.
-        // ⚠ `tk != Bool` MUST BE SPELLED, not inferred from arm ORDER.
+        // discarded) and gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 all
+        // compile and RUN `double d = z;` (exit 3 on a (3,4)); MSVC abstains, having
+        // no `_Complex` specifier at all. This mints the SAME `Cast(complex -> real)`
+        // node the EXPLICIT cast already builds, which `mapCast`'s C 6.3.1.7 discard
+        // arm in `src/mir/lowering/hir_to_mir.cpp` already realizes — no new
+        // lowering. The full reference vote, and why this could not land without the
+        // `<tgmath.h>` complex dispatch that shipped WITH it, are in the long note at
+        // the matching arm in `src/analysis/semantic/type_rules.hpp::isAssignable`.
+        // ⚠ `tk != Bool` IS SPELLED, not inferred from arm ORDER.
         // `isArithmeticCore` INCLUDES Bool, and only the `_Bool`-target arm sitting
         // EARLIER in this function keeps a Bool from reaching here today; a future
-        // reorder would silently route `_Bool b = z;` through the imaginary-
-        // DISCARDING path, which is
+        // reorder would otherwise silently route `_Bool b = z;` through the
+        // imaginary-DISCARDING path, which is
         // [[D-CSUBSET-COMPLEX-LOGICAL-NOT-AND-BOOL-CAST-SILENT-MISCOMPILE]].
         // Naming Bool makes that reorder a loud reject instead of a wrong answer.
+        if (ck == TypeKind::Complex && tk != TypeKind::Bool && isArithmeticCore(tk)) {
+            HirNodeId const cast =
+                builder.makeCast(child.id, target, HirFlags::Synthetic);
+            for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                if (it->first == child.id) {
+                    spans.push_back({cast, it->second});
+                    break;
+                }
+            }
+            return {cast, target};
+        }
         // Pointers, structs, FnSig are not coerced implicitly; let the
         // caller decide whether the mismatch is a diagnostic. Arithmetic
         // (int + float kinds — file-scope `isArithmeticCore`) is the

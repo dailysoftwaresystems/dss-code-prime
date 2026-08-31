@@ -25,10 +25,23 @@
  * calls, not folded constants.
  *
  * RED-ON-DISABLE (descriptor): delete shippedLibs/tgmath.json -> the include
- * fails F_ShippedHeaderNotFound. RED-ON-DISABLE (cast discipline): flip a
- * default arm to `(double)(x)` and a `_Complex` argument compiles SILENTLY
- * (drops imag — the conformance miscompile); the bare arm keeps it S0003-loud
- * (pinned in test_semantic_analyzer_c, D-CSUBSET-TGMATH-COMPLEX).
+ * fails F_ShippedHeaderNotFound.
+ *
+ * ⚠ THE COMPLEX-ARGUMENT CLAUSE THAT USED TO END THIS COMMENT IS STALE AND IS
+ * CORRECTED IN P46, not merely deleted, because it named the wrong owner. It
+ * read: "RED-ON-DISABLE (cast discipline): flip a default arm to `(double)(x)`
+ * and a `_Complex` argument compiles SILENTLY (drops imag — the conformance
+ * miscompile); the bare arm keeps it S0003-loud". The DROP is conformant —
+ * MEASURED, gcc, clang and mingw-w64 gcc all do it for `<math.h>`'s real
+ * `double sqrt(double)` — and the bare arm's loudness was borrowed from a
+ * separate refusal DSS has since removed. As of P46 a complex argument
+ * DISPATCHES to `csqrt`/`cpow`/`cabs`/… on the eleven macros that have a
+ * counterpart, and is refused `S_GenericSelectionNoMatch` on the six that do
+ * not — the C 6.5.1.1 constraint, which is how gcc and clang refuse them too.
+ * The complex surface is witnessed at runtime by `examples/c/c99_tgmath_complex`
+ * and pinned at the semantic tier in test_semantic_analyzer_c
+ * (D-CSUBSET-TGMATH-COMPLEX,
+ * D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED).
  *
  * exit = (int)sqrtf(1764.0f) = 42, every other arm contributing 0.
  */

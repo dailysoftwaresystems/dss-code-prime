@@ -366,3 +366,36 @@ dss_add_test(NAME program/test_runtime_cache_wiring
 # mutation tests in tests/core use.
 target_link_libraries(dss_program_test_runtime_cache_wiring
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CONFIG-MEMO-CAPACITY-IS-HALF-THE-SHIPPED-CORPUS-SO-A-TOTAL-SCAN-THRASHES-IT
+#
+# APPENDED, never interleaved: this file is append-only by lane convention, and a
+# whole-file rewrite once reddened three other lanes by changing its line endings.
+#
+# ★ THE CASE THAT MATTERS MOST HERE IS THE ONE THAT LOOKS LEAST LIKE A TEST.
+# `TheCapacityExceedsTheWholeShippedCorpus` counts the shipped config documents
+# on disk and compares them against `ConfigDocumentMemoStore::capacity()`. It is
+# the ONLY thing in the tree that watches a bound whose failure mode is silent:
+# when the corpus outgrows the memo, every build in the repository slows down and
+# nothing else reports it. Do not "simplify" it into a constant comparison — the
+# whole value is that neither side of the relation is spelled here.
+#
+# ⓘ It declares no fixture and needs none. The residency cases call
+# `ConfigDocumentMemoStore::clear()` themselves, and the project-mode case stages
+# its own tree and points DSS_RUNTIME_CACHE_DIR at a private root.
+dss_add_test(NAME program/test_config_memo_holds_a_total_scan
+             SOURCES test_config_memo_holds_a_total_scan.cpp)
+
+# D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION — the
+# PREREQUISITE half. `CompilationUnit::inputDigest()` is the unit's textual input
+# closure, and it exists because a cross-run artifact cache keyed on anything the
+# DRIVER can see is unsound: a quote-included header is in no manifest, in no
+# `sources[]`, and under no config root.
+#
+# ★ It lives in tests/program rather than beside the compilation unit because its
+# subject is what a CACHE KEY may rely on, and the key's other terms
+# (`runtime_object_cache.hpp`) are program-tier. Its `#pragma pack` case is the
+# one to read first: that directive is REMOVED from the token stream, so a digest
+# built the obvious way is blind to a change that relays out every struct.
+dss_add_test(NAME program/test_compilation_unit_input_digest
+             SOURCES test_compilation_unit_input_digest.cpp)

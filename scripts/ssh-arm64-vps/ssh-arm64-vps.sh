@@ -15,6 +15,12 @@
 #   This script never accepts, stores or forwards a password, and no key material lives
 #   in the repo — `.secrets/` holds the key's PATH, never the key.
 #
+# ⓘ THE TRANSPORT VERBS (`--rsync`, `--rsync-from`) LIVE ONLY IN THIS `.sh`, AND
+# THAT IS THE JUDGEMENT NOT A DRIFT. The `.ps1` sibling has never carried either:
+# Windows PowerShell has no `rsync`, and this carriage is reachable only from WSL
+# anyway (its key exists there). A PowerShell twin of a verb that cannot run under
+# PowerShell would be a second implementation with no host to work on.
+#
 # Usage: scripts/ssh-arm64-vps/ssh-arm64-vps.sh              # interactive
 #        scripts/ssh-arm64-vps/ssh-arm64-vps.sh uname -m     # run a command, exit with ITS status
 set -uo pipefail
@@ -154,6 +160,47 @@ if [ "${1:-}" = "--rsync" ]; then
     _dest=${!#}
     set -- "${@:1:$#-1}"
     exec rsync -a --delete -e "$_rsh" "$@" "$DSS_VPS_USER@$DSS_VPS_HOST:$_dest"
+fi
+
+# ★★ `--rsync-from <remote-src...> <local-dest>` — THE OTHER DIRECTION, and it is
+# not symmetry for its own sake. `--rsync` above serves the LEG shape: the driver
+# owns the tree and pushes it out. The ROUND TRIP (Table 2 of the cross-leg matrix)
+# has the opposite shape — a build host that is NOT the driver produces an artefact
+# which then has to reach the machine its target runs on, and that machine is
+# usually back here. Until this verb existed there was no carriage-sanctioned way
+# to bring a byte home, so every such transport in this project's history was
+# hand-rolled, and the registry records what hand-rolling cost: a one-file `scp`
+# that left `zlib.dll` behind and produced 14 smoke failures reading exactly like
+# "macOS emits a broken PE".
+#
+# ⚠ NOT A `tar czf - | ssh` PULL, for the reason the block above documents one hop
+# over: that shape depends on the remote login profile being quiet, which is not a
+# property any caller can test. `exec`ing rsync keeps `$?` rsync's own status here
+# too.
+#
+# ⓘ NO `--delete` HERE, and the asymmetry is deliberate. On the push side the
+# remote directory is the driver's to own. On the pull side the LOCAL destination
+# is a directory a caller chose, and a transport verb that can erase local files
+# the caller did not name is a footgun aimed at the wrong host.
+if [ "${1:-}" = "--rsync-from" ]; then
+    shift
+    if [ $# -lt 2 ]; then
+        echo "ssh-arm64-vps: --rsync-from needs at least <remote-src> and <local-dest>" >&2
+        exit 2
+    fi
+    _rsh=ssh
+    for _o in "${args[@]}"; do
+        _rsh="$_rsh '$_o'"
+    done
+    # The LAST argument is the LOCAL destination; everything before it is remote.
+    _dest=${!#}
+    set -- "${@:1:$#-1}"
+    _srcs=""
+    for _s in "$@"; do
+        _srcs="$_srcs $DSS_VPS_USER@$DSS_VPS_HOST:$_s"
+    done
+    # shellcheck disable=SC2086  # each element was built above and carries no spaces by construction
+    exec rsync -a -e "$_rsh" $_srcs "$_dest"
 fi
 
 args+=("$DSS_VPS_USER@$DSS_VPS_HOST")

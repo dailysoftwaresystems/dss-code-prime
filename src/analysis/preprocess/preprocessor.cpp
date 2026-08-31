@@ -8128,10 +8128,40 @@ PreprocessResult preprocessRun(
         return false;
     };
     {
+        // ── [[D-PP-SKIPPED-CONDITIONAL-GROUP-VALIDATED-AS-A-PHASE-7-NUMBER]] ──
+        //
+        // THIS GATE IS THE PHASE-7 BOUNDARY, and it used to name one code.
+        // DSS scans the synth buffer ONCE, in phase 3, and hands those
+        // preprocessing tokens straight to the parser — there is no second,
+        // phase-7 scan for a preprocessed language. So every judgement phase 7
+        // owes is made EAGERLY here, over text that includes groups phase 4 is
+        // about to delete, and this loop is the only place that knows which of
+        // them the conditional pass kept.
+        //
+        // The condition above read `d.code == P_IllegalChar`, with a comment
+        // saying all other tokenizer diagnostics forward unconditionally. That
+        // is not a rule about illegal characters — it is C 6.10.1p6, which says
+        // a skipped group's text is divided into preprocessing tokens and *not
+        // otherwise processed*, and it governs every phase-7 judgement equally.
+        // Spelled as one code name it silently excluded the next one: when the
+        // pp-number tail scan landed ([[D-PP-PASTE-REJECTS-A-VALID-PREPROCESSING-NUMBER]]),
+        // `P_MalformedNumber` began firing on `%2d` inside upstream sqlite's
+        // `#if 0` Tcl script and refused every translation unit that contains
+        // one, on every host. The class now comes from
+        // `isTokenConversionDiagnostic`, beside the codes themselves, so a third
+        // conversion diagnostic inherits the rule instead of waiting for someone
+        // to widen this line a second time.
+        //
+        // ⚠ THE ORACLE IS UNCHANGED AND STAYS THE BYTE'S LIVENESS, deliberately:
+        // it is what keeps a `#if` CONTROLLING EXPRESSION loud. A controlling
+        // directive's own line is outside the dead range (the range opens at the
+        // line's END), and C 6.10.1p4 converts that line's preprocessing tokens
+        // to tokens whether or not the expression evaluates them — ✔MEASURED,
+        // gcc 13.3.0 and clang 18.1.3 both refuse `#if 0 && 2d`.
         for (ParseDiagnostic const& d : provisionalTokDiags.all()) {
-            if (d.code == DiagnosticCode::P_IllegalChar
+            if (isTokenConversionDiagnostic(d.code)
                 && byteInDeadRegion(d.span.start())) {
-                continue;   // dead-branch illegal char — elided, no error
+                continue;   // skipped group — divided into pp-tokens, not converted
             }
             result.diagnostics->report(d);
         }

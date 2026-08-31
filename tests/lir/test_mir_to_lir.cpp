@@ -2671,18 +2671,30 @@ TEST(MirToLir, FloatArithmeticLowersToFPRClassResults) {
     }
 }
 
-TEST(MirToLir, BitcastCrossClassEmitsMovqXClass) {
-    // The cycle-3c-anchored cross-class Bitcast hazard: F64 → I64 must
-    // emit `movq_xclass` (not plain `mov`) because the source register
-    // class differs from the destination class. The cycle-3c lowering
-    // unconditionally emitted `mov` regardless of class — silently
-    // wrong for cross-class. Cycle 3d closes this via the regClassFor
-    // check in `lowerBitcast`.
-    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+namespace {
+// One cross-class Bitcast, lowered on `targetName`, asserting that the emitted
+// copy is the target's DECLARED move for that exact class pair — and that it is
+// neither class's own diagonal move, which is the wrong-file write.
+//
+// ★★★ WHY THE SUBJECT MOVED (D-TARGET-NO-CROSS-CLASS-MOVE-VERB). These arms
+// used to assert `movq_xclass`, a MnemonicSlot minted because
+// `registerClassOps` was indexed by ONE class and the cross-product had nowhere
+// to live. That slot is DELETED and so is the x86_64 opcode it named — which
+// carried no `encoding` at all, so a cross-class Bitcast on x86_64 lowered and
+// then failed at ENCODE time, and arm64 declared no `movq_xclass` whatsoever
+// and failed one tier earlier. The table is now keyed by the class PAIR, both
+// targets declare both directions out of opcodes that already shipped
+// byte-pinned, and the assertion is about the pair rather than about a slot.
+void expectCrossClassBitcastUsesTheDeclaredPairMove(
+        char const* targetName, ::dss::TypeKind fromKind,
+        ::dss::TypeKind toKind, ::dss::TargetRegClass fromCls,
+        ::dss::TargetRegClass toCls) {
+    SCOPED_TRACE(targetName);
+    auto target = ::dss::TargetSchema::loadShipped(targetName);
     ASSERT_TRUE(target.has_value());
     auto const& sch = **target;
-    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::F64};
-    auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::I64,
+    std::array<::dss::TypeKind, 1> paramKinds{fromKind};
+    auto syn = buildSyntheticFn(paramKinds, toKind,
         [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
             std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
             ::dss::MirInstId const a = mb.addArg(0, params[0]);
@@ -2691,77 +2703,110 @@ TEST(MirToLir, BitcastCrossClassEmitsMovqXClass) {
         });
     ::dss::DiagnosticReporter rep;
     auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
-    ASSERT_TRUE(result.ok);
-    auto const movqOp = *sch.opcodeByMnemonic("movq_xclass");
+    ASSERT_TRUE(result.ok) << "a cross-class Bitcast must lower";
+    auto const pairMove =
+        sch.regClassOpOpcode(fromCls, toCls, ::dss::RegClassOp::Move);
+    ASSERT_TRUE(pairMove.has_value())
+        << targetName << " declares no move for this class pair — the arm "
+           "below would assert nothing";
+    auto const fromDiag = sch.regClassOpOpcode(fromCls, ::dss::RegClassOp::Move);
+    auto const toDiag   = sch.regClassOpOpcode(toCls,   ::dss::RegClassOp::Move);
+    ASSERT_TRUE(fromDiag.has_value());
+    ASSERT_TRUE(toDiag.has_value());
+    // The discriminating precondition: were the cross-class cell the same
+    // opcode as a diagonal one, the search below would pass over the miscompile.
+    ASSERT_NE(*pairMove, *fromDiag);
+    ASSERT_NE(*pairMove, *toDiag);
+
     ::dss::Lir const& lir = result.lir;
     LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
-    bool foundXClass = false;
+    bool found = false;
     for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
-        if (lir.instOpcode(lir.blockInstAt(entry, i)) == movqOp) {
-            foundXClass = true; break;
+        LirInstId const id = lir.blockInstAt(entry, i);
+        auto const op = lir.instOpcode(id);
+        if (op == *pairMove) {
+            found = true;
+            EXPECT_EQ(static_cast<::dss::TargetRegClass>(
+                          lir.instResult(id).regClass()),
+                      toCls)
+                << "the pair's move must LAND in the destination class";
         }
+        EXPECT_NE(op, *fromDiag)
+            << "a cross-class Bitcast emitted the SOURCE class's own move — "
+               "the encoder writes the register number into the wrong file";
+        EXPECT_NE(op, *toDiag)
+            << "a cross-class Bitcast emitted the DESTINATION class's own move";
     }
-    EXPECT_TRUE(foundXClass)
-        << "FPR→GPR Bitcast must emit `movq_xclass`, not plain `mov`";
+    EXPECT_TRUE(found)
+        << "no cross-class move was emitted, so the bit pattern never changed "
+           "register files";
+}
+} // namespace
+
+TEST(MirToLir, BitcastCrossClassFprToGprUsesTheDeclaredPairMove) {
+    for (char const* const t : {"x86_64", "arm64"}) {
+        expectCrossClassBitcastUsesTheDeclaredPairMove(
+            t, ::dss::TypeKind::F64, ::dss::TypeKind::I64,
+            ::dss::TargetRegClass::FPR, ::dss::TargetRegClass::GPR);
+    }
 }
 
-TEST(MirToLir, BitcastCrossClassEmitsMovqXClassReverse) {
-    // Reverse direction of `BitcastCrossClassEmitsMovqXClass`
-    // (cycle-3e deferral D-3e.8 folded ML6 cycle 1). The lowerer's
-    // class-symmetric check at `lowerBitcast` is direction-agnostic
-    // — same operand-shape exercises the I64→F64 path with the
-    // source class flipped to GPR and the destination class flipped
-    // to FPR.
-    auto target = ::dss::TargetSchema::loadShipped("x86_64");
-    ASSERT_TRUE(target.has_value());
-    auto const& sch = **target;
-    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::I64};
-    auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::F64,
-        [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
-            std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
-            ::dss::MirInstId const a = mb.addArg(0, params[0]);
-            std::array<::dss::MirInstId, 1> ops{a};
-            mb.addReturn(mb.addInst(::dss::MirOpcode::Bitcast, ops, retT));
-        });
-    ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
-    ASSERT_TRUE(result.ok);
-    auto const movqOp = *sch.opcodeByMnemonic("movq_xclass");
-    ::dss::Lir const& lir = result.lir;
-    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
-    bool foundXClass = false;
-    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
-        if (lir.instOpcode(lir.blockInstAt(entry, i)) == movqOp) {
-            foundXClass = true; break;
-        }
+TEST(MirToLir, BitcastCrossClassGprToFprUsesTheDeclaredPairMove) {
+    // The reverse direction (cycle-3e deferral D-3e.8 folded ML6 cycle 1).
+    // ★ IT IS A SEPARATE OPCODE ON BOTH TARGETS AND DELIBERATELY SO: the
+    // encoding-variant guard keys only on (operandKinds, width) and both
+    // directions are `reg` at the same width, so one opcode carrying both
+    // would silently pick a direction.
+    for (char const* const t : {"x86_64", "arm64"}) {
+        expectCrossClassBitcastUsesTheDeclaredPairMove(
+            t, ::dss::TypeKind::I64, ::dss::TypeKind::F64,
+            ::dss::TargetRegClass::GPR, ::dss::TargetRegClass::FPR);
     }
-    EXPECT_TRUE(foundXClass)
-        << "GPR→FPR Bitcast must emit `movq_xclass`, not plain `mov`";
 }
 
-TEST(MirToLir, BitcastSameClassStaysAsMov) {
-    // Positive control: I64 → Ptr (both GPR-class) emits `mov`, not
-    // `movq_xclass`. Pins the class-symmetry branch.
-    auto target = ::dss::TargetSchema::loadShipped("x86_64");
-    ASSERT_TRUE(target.has_value());
-    auto const& sch = **target;
-    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::I64};
-    auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::Ptr,
-        [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
-            std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
-            ::dss::MirInstId const a = mb.addArg(0, params[0]);
-            std::array<::dss::MirInstId, 1> ops{a};
-            mb.addReturn(mb.addInst(::dss::MirOpcode::Bitcast, ops, retT));
-        });
-    ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
-    ASSERT_TRUE(result.ok);
-    auto const movqOp = *sch.opcodeByMnemonic("movq_xclass");
-    ::dss::Lir const& lir = result.lir;
-    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
-    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
-        EXPECT_NE(lir.instOpcode(lir.blockInstAt(entry, i)), movqOp)
-            << "same-class Bitcast must use `mov`, not `movq_xclass`";
+TEST(MirToLir, BitcastSameClassStaysOnTheDiagonal) {
+    // Positive control: I64 → Ptr (both GPR-class) takes the DIAGONAL cell of
+    // the same table — the plain `mov` — and never either cross-class move.
+    // Pins that generalizing the table to class×class did not move the
+    // same-class case off it.
+    for (char const* const t : {"x86_64", "arm64"}) {
+        SCOPED_TRACE(t);
+        auto target = ::dss::TargetSchema::loadShipped(t);
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::I64};
+        auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::Ptr,
+            [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+                std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
+                ::dss::MirInstId const a = mb.addArg(0, params[0]);
+                std::array<::dss::MirInstId, 1> ops{a};
+                mb.addReturn(mb.addInst(::dss::MirOpcode::Bitcast, ops, retT));
+            });
+        ::dss::DiagnosticReporter rep;
+        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+        ASSERT_TRUE(result.ok);
+        auto const toFpr = *sch.regClassOpOpcode(::dss::TargetRegClass::GPR,
+                                                 ::dss::TargetRegClass::FPR,
+                                                 ::dss::RegClassOp::Move);
+        auto const toGpr = *sch.regClassOpOpcode(::dss::TargetRegClass::FPR,
+                                                 ::dss::TargetRegClass::GPR,
+                                                 ::dss::RegClassOp::Move);
+        auto const gprMove = *sch.regClassOpOpcode(::dss::TargetRegClass::GPR,
+                                                   ::dss::RegClassOp::Move);
+        ::dss::Lir const& lir = result.lir;
+        LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+        bool sawDiagonal = false;
+        for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+            auto const op = lir.instOpcode(lir.blockInstAt(entry, i));
+            if (op == gprMove) sawDiagonal = true;
+            EXPECT_NE(op, toFpr)
+                << "same-class Bitcast must use the diagonal move";
+            EXPECT_NE(op, toGpr)
+                << "same-class Bitcast must use the diagonal move";
+        }
+        EXPECT_TRUE(sawDiagonal)
+            << "the same-class Bitcast emitted no diagonal move at all, so the "
+               "two EXPECT_NEs above are vacuous";
     }
 }
 
@@ -2851,8 +2896,9 @@ INSTANTIATE_TEST_SUITE_P(
         CastCase{::dss::MirOpcode::ZExt,     "zext",  ::dss::TypeKind::Bool, ::dss::TypeKind::I64, LirRegClass::GPR},
         CastCase{::dss::MirOpcode::IntToPtr, "mov",   ::dss::TypeKind::I64, ::dss::TypeKind::Ptr, LirRegClass::GPR},
         CastCase{::dss::MirOpcode::PtrToInt, "mov",   ::dss::TypeKind::Ptr, ::dss::TypeKind::I64, LirRegClass::GPR},
-        // Bitcast same-class is mov; different test (BitcastCrossClass)
-        // pins the cross-class movq_xclass path.
+        // Bitcast same-class is the DIAGONAL cell of `registerClassOps`
+        // (`mov` for gpr); the cross-class cells are pinned by the two
+        // `BitcastCrossClass…UsesTheDeclaredPairMove` tests above.
         CastCase{::dss::MirOpcode::Bitcast,  "mov",   ::dss::TypeKind::I64, ::dss::TypeKind::Ptr, LirRegClass::GPR},
         // Cycle 3d float casts. fpcvt handles BOTH FPTrunc + FPExt.
         // FPToSI/FPToUI: float → integer, result is GPR.

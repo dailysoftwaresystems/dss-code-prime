@@ -1,0 +1,32 @@
+{
+  "$comment": "THE CROSS-CLASS REGISTER MOVE (D-TARGET-NO-CROSS-CLASS-MOVE-VERB, cycle P46). ★★★ EVERY SHAPE IN THIS FILE WAS REFUSED BEFORE THE CHANGE, ON BOTH SHIPPED TARGETS, AT BOTH CONFIGS: ✔MEASURED 2026-08-31 at the CLI, rc=1 with `error[L_UnsupportedLoweringForOpcode]: … binds register class 'gpr', but the value it carries lives in class 'fpr'` — while `aarch64-linux-gnu-gcc 13.3.0 -O2` compiles the same source to `fmov x0, d0 / nop / fmov d0, x0`. In GNU inline asm the register class is the CONSTRAINT's, never the value type's, so a `double` bound to `\"r\"` needs a copy between two register FILES, which is a different machine operation from a copy within one. The vocabulary shipped (`movq_gpr_to_xmm`/`movq_xmm_to_gpr`, byte-pinned on both targets); the SLOT did not, because `registerClassOps` was indexed by ONE class. It is now indexed by the class PAIR — ONE table, the same-class move at the diagonal — and `MnemonicSlot::MovqXClass`, the placeholder the missing slot had forced, is DELETED along with the encoding-less `movq_xclass` opcode it named. ★★ AFTER: ✔MEASURED BY EXECUTION, rc=42 on x86_64 natively and on arm64 under qemu-aarch64 with QEMU_LD_PREFIX, at debug AND release; DSS's arm64 release body is `fmov x17, d0 / nop / fmov d0, x17` and its x86_64 release body is `movq %xmm0,%r10 / nop / movq %r10,%xmm0` — the reference's shape, register allocation aside. ★★★ FOUR OPERANDS, NOT ONE, AND THE COUNT IS A MEASUREMENT: the bar records that a SINGLE `\"+r\"` operand stayed green over a live mutant at BOTH debug and release, because the read half's copy targets a dead vreg and the allocator hands the result the register already holding the right value. ★ AND ONE OF THE FOUR IS THE MATCHED DIAGONAL CONTROL (`\"+r\"` on an `int`, the gpr->gpr cell that always worked), so a change that broke the diagonal while adding the off-diagonal reds here. ★ THE VALUES DISCRIMINATE A PARTIAL MOVE: 0x400921FB54442D18 has BOTH 32-bit halves significant, and the float and int seeds have all four bytes significant, so a copy that carried half the pattern — or one through the wrong register file — cannot produce them. ⚠ THE `volatile` SEEDS ARE LOAD-BEARING: without them release folds each operand to a constant before lowering and the optimized arm stops exercising the move. ⚠ THE TEMPLATE IS `nop` BECAUSE THE TWO SHIPPED DIALECTS SHARE ALMOST NO SPELLING; the subject is the moves the expansion emits AROUND the template, not the template's own instruction. ⓘ NO `\"x\"`/`\"w\"` ARM: on x86_64 `\"x\"` binds `fpr` and a `double` already lives there (no cross-class move to witness), and on arm64 `\"w\"` binds `vr` against a value in `fpr` — which is the aliased-views defect D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME and D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE close at R1, by declaring arm64's ONE SIMD&FP file once. Declaring an fpr->vr `move` here would have papered a config defect with a fake copy between two WIDTH VIEWS of the same physical register, which is the opposite of a fix.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

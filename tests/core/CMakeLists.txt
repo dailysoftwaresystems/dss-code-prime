@@ -350,3 +350,39 @@ dss_add_test(NAME core/test_config_document_memo
 #    an ATOMIC replace; the shipped tree is only ever READ.
 dss_add_test(NAME core/test_config_memo_all_families
              SOURCES test_config_memo_all_families.cpp)
+
+# D-TARGET-NO-CROSS-CLASS-MOVE-VERB: `registerClassOps` keyed by the CLASS PAIR
+# (`class` -> `to`, `to` omitted = the diagonal) so the cross-FILE move has a
+# slot at all -- ONE table, the same-class move at its diagonal. Pins the four
+# load-time refusals the new surface owes, and the REMOVE-direction config
+# mutant that no C++ mutant can stand in for.
+# * The bank-coherence refusal is the load-bearing one: filing the integer `mov`
+#   as the gpr->fpr move would load clean and re-create
+#   D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND through the very table that closes it.
+# ** Mutates the SHIPPED JSON in memory (nlohmann consumer), never a parallel
+#    hand-written file that could drift from the real config.
+dss_add_test(NAME core/test_target_register_class_pair_ops
+             SOURCES test_target_register_class_pair_ops.cpp)
+target_link_libraries(dss_core_test_target_register_class_pair_ops
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC: a config
+# document that declares a key TWICE used to load at rc=0 with zero
+# diagnostics, keeping the LAST declaration -- ✔MEASURED by the operator to
+# MOVE the emitted bytes. `dss::detail::parseConfigDocument` is now the ONE
+# entry every config-document reader parses through, and a repeat REFUSES the
+# load naming the JSON pointer of the offending key.
+# * Tier 3 is the load-bearing one: it scans every .cpp/.hpp under src/ for the
+#   THREE spellings that ingest JSON (`json::parse`, `sax_parse`, and
+#   `operator>>` into a json-typed name) and refuses a new reader outside the
+#   owner -- the chokepoint is what makes tiers 1 and 2 durable.
+# ** The scanner has its own fixtures: synthesised sources carrying each
+#    spelling, plus prose/string-literal negatives, so a scan that has stopped
+#    seeing anything reds instead of reporting a clean tree.
+# *** The target-loader pin READS the shipped arm64 document and mutates the
+#     bytes IN MEMORY (the `test_target_register_class_pair_ops` precedent);
+#     nothing under src/dss-config/ is written.
+dss_add_test(NAME core/test_config_document_parse
+             SOURCES test_config_document_parse.cpp)
+target_link_libraries(dss_core_test_config_document_parse
+                      PRIVATE nlohmann_json::nlohmann_json)

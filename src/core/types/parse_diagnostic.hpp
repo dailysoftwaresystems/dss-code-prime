@@ -4882,6 +4882,41 @@ inline constexpr char kUnallocatedFamilyLetter = '?';
 // EVERY allocated code rather than for a hand-listed sample.
 [[nodiscard]] DSS_EXPORT char diagnosticFamilyLetter(DiagnosticCode c) noexcept;
 
+// ── [[D-PP-SKIPPED-CONDITIONAL-GROUP-VALIDATED-AS-A-PHASE-7-NUMBER]]: WHICH
+//    TRANSLATION PHASE'S JUDGEMENT A SCANNER DIAGNOSTIC IS ──────────────────
+//
+// C 5.1.1.2 draws the line this predicate names. PHASE 3 decomposes source text
+// into PREPROCESSING tokens; PHASE 7 converts each preprocessing token into a
+// token. A judgement phase 7 makes cannot apply to a preprocessing token that is
+// never converted — the text of a skipped conditional group is divided into
+// preprocessing tokens and, per C 6.10.1p6, *not otherwise processed*.
+//
+// ★★ WHY IT IS A PROPERTY OF THE CODE AND NOT A LIST AT THE GATE. The
+// preprocessor already suppressed exactly ONE code (`P_IllegalChar`) inside a
+// dead conditional region, with a comment stating that every other tokenizer
+// diagnostic forwards unconditionally. That is the same rule, spelled as one
+// name — and the second consumption site (a preprocessing NUMBER, C 6.4.8) was
+// therefore missed when the pp-number tail scan arrived, refusing every
+// translation unit that keeps a script inside `#if 0`. Naming the CLASS here
+// means a third conversion diagnostic inherits the rule by classifying itself,
+// at the tier that owns diagnostic identity, instead of by someone remembering
+// to widen a condition in `preprocess()`.
+//
+// ✔MEASURED 2026-08-31, gcc 13.3.0 and clang 18.1.3 probed SEPARATELY, one TU
+// per shape with a positive control compiled in the same run. Inside `#if 0`
+// BOTH ACCEPT a pp-number (`2d`, `1e`), a stray `@`, an invalid escape (`"\q"`)
+// and an unterminated `'`; BOTH REFUSE an unterminated COMMENT — because a
+// comment is replaced by one space in phase 3 whether or not its group is
+// skipped. That single split is the whole classification below.
+//
+// ⚠ THE DEFAULT IS `false`, AND THE DIRECTION IS LOAD-BEARING. An unclassified
+// code is a code that is FORWARDED: a wrong `false` costs a false positive an
+// operator can see and report, while a wrong `true` silences a real diagnostic
+// inside a dead branch, which is a silent miscompile arriving by omission. Only
+// the tokenizer's own codes reach the phase gate; everything else answers
+// `false` and keeps its existing unconditional delivery.
+[[nodiscard]] DSS_EXPORT bool isTokenConversionDiagnostic(DiagnosticCode c) noexcept;
+
 // A secondary location attached to a diagnostic — "matching opener here",
 // "previously declared here", etc. May reference a *different* buffer than
 // the diagnostic's primary span (cross-file includes, when we get them).

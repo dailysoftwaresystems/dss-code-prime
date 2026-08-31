@@ -94,6 +94,7 @@ the other in the same commit.
 | **`refresh_landing_log`** | `refresh_landing_log.py`, `test_refresh_landing_log.py` | regenerate the PR landing-log hash anchors in the plans from git log. |
 | **`remote-leg`** | `remote-leg.sh` | run a DSS gate leg on a physical remote host -- push the working tree over a carriage, build clean, and run ctest through run-gate. |
 | **`run-gate`** | `run-gate.ps1`, `run-gate.sh` | run a gate command and REFUSE to report success without evidence that it ran. |
+| **`sqlite-round-trip`** | `sqlite-round-trip.py` | carry a sqlite leg's DSS-built artefacts to a machine that runs their target and prove they EXECUTE there (the round trip). |
 | **`sqlite-runtime-bench`** | `sqlite-runtime-bench.py` | measure the RUNTIME of an emitted sqlite3 binary, the standing runtime-differential instrument. |
 | **`ssh-arm64-vps`** | `ssh-arm64-vps.ps1`, `ssh-arm64-vps.sh` | reach the native aarch64 Linux VPS (the carriage; WSL only). |
 | **`ssh-macos`** | `ssh-macos.ps1`, `ssh-macos.sh` | reach the operator's physical macOS host (the carriage). |

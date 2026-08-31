@@ -4,6 +4,7 @@
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table_json.hpp"
+#include "core/types/config_document_parse.hpp"   // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"   // TF-C74: the shared closed-key guard
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/predefined_macro_json.hpp"   // TF-C74: the shared predefine parser
@@ -1169,14 +1170,20 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     std::string digest = crypto::sha256Hex(jsonText);
 
     Collector coll;
-    json doc;
-    try {
-        doc = json::parse(jsonText);
-    } catch (json::parse_error const& e) {
-        coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
-                  std::format("JSON parse error: {}", e.what()));
+    // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`). A raw
+    // `json::parse` here would accept a document whose key is declared twice
+    // and silently keep the LAST declaration —
+    // D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC, whose
+    // measured consequence on THIS family was a different emitted binary at
+    // rc=0 with zero diagnostics.
+    auto parsed = detail::parseConfigDocument(jsonText);
+    if (!parsed) {
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  parsed.error().locus(sourceLabel),
+                  parsed.error().detailText("JSON parse error: "));
         return std::unexpected(std::move(coll).release());
     }
+    json doc = std::move(*parsed);
     if (!doc.is_object()) {
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   "top-level value must be a JSON object");
@@ -3098,8 +3105,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     }
 
     // ── registerClassOps (FC2 Part B — optional) ───────────────────
-    // Per-register-class move/load/store mnemonic table. A class with
-    // no row resolves to the universal defaults iff it is GPR (see
+    // The register-data-movement mnemonic table, keyed by the ORDERED PAIR
+    // (`class` → `to`; `to` omitted means the diagonal — see
+    // `TargetRegisterClassOps` and D-TARGET-NO-CROSS-CLASS-MOVE-VERB). A pair
+    // with no row resolves to the universal defaults iff it is GPR→GPR (see
     // TargetSchema::regClassOpOpcode); a declared row may omit slots
     // (consumers fail loud on an omitted slot — trigger discipline).
     if (doc.contains("registerClassOps")) {
@@ -3116,59 +3125,85 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               "registerClassOps entry must be an object");
                     continue;
                 }
-                static constexpr std::array<std::string_view, 4> kRegClassOpKeys{
-                    "class", "move", "load", "store"};
+                static constexpr std::array<std::string_view, 5> kRegClassOpKeys{
+                    "class", "to", "move", "load", "store"};
                 DSS_CHECK_KEY_VOCABULARY(kRegClassOpKeys);
                 rejectUnknownKeys(r, kRegClassOpKeys,
                                   std::format("/registerClassOps/{}", i),
                                   "a registerClassOps row", coll);
-                if (!r.contains("class") || !r.at("class").is_string()) {
-                    coll.emit(DiagnosticCode::C_MissingField,
-                              std::format("/registerClassOps/{}/class", i),
-                              "missing or non-string 'class'");
-                    continue;
+                // ★ ONE resolver for BOTH ends of the pair, so the `to` half
+                // inherits every refusal the `class` half already made — the
+                // no-class sentinel, the unknown spelling, and the allowed-list
+                // rendering. A second hand-written copy is how the two ends
+                // would come to disagree about what a class name is.
+                auto readClassField =
+                    [&](char const* field) -> std::optional<TargetRegClass> {
+                    auto const path =
+                        std::format("/registerClassOps/{}/{}", i, field);
+                    if (!r.contains(field) || !r.at(field).is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField, path,
+                                  std::format("missing or non-string '{}'",
+                                              field));
+                        return std::nullopt;
+                    }
+                    auto const c =
+                        targetRegClassFromName(r.at(field).get<std::string>());
+                    if (!c.has_value()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                  std::format("expected {}",
+                                              detail::renderAllowedList(
+                                                  kOperableTargetRegClassNames,
+                                                  " / ")));
+                        return std::nullopt;
+                    }
+                    // The sentinel SPELLS correctly, so the lookup above accepts
+                    // it — the `isSelectableObjectFormatKind` hazard, on this
+                    // vocabulary. A row naming the no-class sentinel would
+                    // declare move/load/store mnemonics for registers that by
+                    // definition do not exist. See `isOperableTargetRegClass`.
+                    if (!isOperableTargetRegClass(*c)) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                  std::format("'{}' is the no-class sentinel, "
+                                              "not a class that owns registers "
+                                              "— a registerClassOps row naming "
+                                              "it could never fire. Expected {}",
+                                              targetRegClassName(*c),
+                                              detail::renderAllowedList(
+                                                  kOperableTargetRegClassNames,
+                                                  " / ")));
+                        return std::nullopt;
+                    }
+                    return c;
+                };
+                auto const cls = readClassField("class");
+                if (!cls.has_value()) continue;
+                // `to` ABSENT IS THE DIAGONAL, and that is what every row
+                // written before this key existed meant. Present, it is
+                // resolved by the same predicate as `class`.
+                std::optional<TargetRegClass> dst = cls;
+                if (r.contains("to")) {
+                    dst = readClassField("to");
+                    if (!dst.has_value()) continue;
                 }
-                auto const cls =
-                    targetRegClassFromName(r.at("class").get<std::string>());
-                if (!cls.has_value()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/registerClassOps/{}/class", i),
-                              std::format("expected {}",
-                                          detail::renderAllowedList(
-                                              kOperableTargetRegClassNames,
-                                              " / ")));
-                    continue;
-                }
-                // The sentinel SPELLS correctly, so the lookup above accepts
-                // it — the `isSelectableObjectFormatKind` hazard, on this
-                // vocabulary. A row for the no-class sentinel would occupy
-                // slot 0 of `registerClassOps` and declare move/load/store
-                // mnemonics for registers that by definition do not exist.
-                // See `isOperableTargetRegClass`.
-                if (!isOperableTargetRegClass(*cls)) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/registerClassOps/{}/class", i),
-                              std::format("'{}' is the no-class sentinel, not a "
-                                          "class that owns registers — a "
-                                          "registerClassOps row under it could "
-                                          "never fire. Expected {}",
-                                          targetRegClassName(*cls),
-                                          detail::renderAllowedList(
-                                              kOperableTargetRegClassNames,
-                                              " / ")));
-                    continue;
-                }
-                auto& row = data.registerClassOps[static_cast<std::size_t>(*cls)];
+                auto& row = data.registerClassOps[static_cast<std::size_t>(*cls)]
+                                                 [static_cast<std::size_t>(*dst)];
                 if (row.declared) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               std::format("/registerClassOps/{}/class", i),
-                              std::format("duplicate registerClassOps row for "
-                                          "class '{}'",
-                                          targetRegClassName(*cls)));
+                              *cls == *dst
+                                  ? std::format("duplicate registerClassOps row "
+                                                "for class '{}'",
+                                                targetRegClassName(*cls))
+                                  : std::format("duplicate registerClassOps row "
+                                                "for the class pair '{}' -> "
+                                                "'{}'",
+                                                targetRegClassName(*cls),
+                                                targetRegClassName(*dst)));
                     continue;
                 }
                 row.declared = true;
-                auto readOp = [&](char const* field, std::string& out) {
+                auto readOp = [&](char const* field, std::string& out,
+                                  bool diagonalOnly) {
                     if (!r.contains(field)) return;
                     if (!r.at(field).is_string()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,
@@ -3176,11 +3211,34 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                   "must be a mnemonic string");
                         return;
                     }
+                    // ⚠ MEMORY IS NOT A REGISTER CLASS. `load`/`store` relate a
+                    // class to memory, so on a CROSS-CLASS row they ask
+                    // nothing — there is no "load from 'gpr' into 'fpr'".
+                    // Refused HERE, where the config is judged, rather than
+                    // stored into a slot `regClassOpOpcode` then has to refuse
+                    // to read: a key that loads clean and can never resolve is
+                    // dead vocabulary that reads like a declaration.
+                    if (diagonalOnly && *cls != *dst) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/registerClassOps/{}/{}", i, field),
+                                  std::format(
+                                      "'{}' is declared on a CROSS-CLASS row "
+                                      "('{}' -> '{}'), where it means nothing: "
+                                      "'{}' relates a register class to MEMORY, "
+                                      "and memory is not a register class. Only "
+                                      "'move' is meaningful when 'to' differs "
+                                      "from 'class'; declare '{}' on the "
+                                      "same-class row for '{}'",
+                                      field, targetRegClassName(*cls),
+                                      targetRegClassName(*dst), field, field,
+                                      targetRegClassName(*cls)));
+                        return;
+                    }
                     out = r.at(field).get<std::string>();
                 };
-                readOp("move",  row.move);
-                readOp("load",  row.load);
-                readOp("store", row.store);
+                readOp("move",  row.move,  /*diagonalOnly=*/false);
+                readOp("load",  row.load,  /*diagonalOnly=*/true);
+                readOp("store", row.store, /*diagonalOnly=*/true);
             }
         }
     }

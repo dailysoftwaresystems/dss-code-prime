@@ -1,5 +1,6 @@
 #include "core/types/project_config.hpp"
 
+#include "core/types/config_document_parse.hpp"  // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey + DSS_CHECK_KEY_VOCABULARY
 #include "core/types/parse_diagnostic.hpp"
 #include "program/platform_token.hpp"            // kRunOnPlatformTokens / isValidRunOnToken / runOnTokenList
@@ -611,14 +612,19 @@ std::optional<ProjectConfig>
 parseProjectConfig(std::string_view jsonText,
                    std::string_view sourceLabel,
                    DiagnosticReporter& rep) {
-    json doc;
-    try {
-        doc = json::parse(jsonText);
-    } catch (json::parse_error const& e) {
+    // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`) —
+    // D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC. The
+    // manifest is the document a USER hand-edits most often, so it is the one
+    // most likely to grow a second `language` or `target` on a copy-paste — and
+    // the loser is the declaration nearer the top of the file, the one the user
+    // is looking at.
+    auto parsed = detail::parseConfigDocument(jsonText);
+    if (!parsed) {
         emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
-                         std::string{"invalid JSON — "} + e.what());
+                         parsed.error().detailTextWithLocus("invalid JSON — "));
         return std::nullopt;
     }
+    json doc = std::move(*parsed);
     if (!doc.is_object()) {
         emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
                          "project config root must be a JSON object");

@@ -13536,76 +13536,366 @@ TEST(SemanticAnalyzerC, TgmathMatrixCleanOnPeViaVariantBridge) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
-// D-CSUBSET-TGMATH-COMPLEX: a `double _Complex` argument through the shipped
-// sqrt macro fails EXACTLY one S_TypeMismatch — the SELECTED bare default arm
-// `sqrt((z))` passes a complex value to the f64 param (loud); the UNSELECTED
-// float arm's `(float)(z)` cast type-checks but never lowers. RED-ON-DISABLE:
-// rewrite the default arm as `sqrt((double)(x))` and this compiles clean —
-// the cast lets the complex arg through, dropping the imaginary part.
+// ── D-CSUBSET-TGMATH-COMPLEX + D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED
 //
-// ⚠ WHY THAT DROP IS THE DEFECT IS NOT WHAT THIS COMMENT USED TO SAY, AND THE
-// DIFFERENCE DECIDES WHERE THE FIX BELONGS. The old wording called the drop
-// "the exact conformance miscompile the bare arm exists to prevent".
-// ✔MEASURED 2026-08-29 (P45): `#include <math.h>` + `sqrt(z)` — the plain
-// `double sqrt(double)` prototype — compiles and exits 0 under gcc 13.3.0
-// `-std=c2x`, clang 18.1.3 `-std=c23` AND mingw-w64 gcc 13.2.0 alike. Dropping
-// the imaginary part into a real prototype IS conformant; all three references
-// do it (C 6.3.1.7p2 / 6.5.2.2p7). The miscompile is narrower and lives one
-// level up: a <tgmath.h> MACRO must never reach a real prototype for a complex
-// argument at all — C23 7.25 requires it to dispatch to `csqrt`, which DSS does
-// not ship ([[D-CSUBSET-TGMATH-COMPLEX]] riding
-// [[D-CSUBSET-COMPLEX-TRANSCENDENTAL]]).
-// ⇒ THESE THREE PINS ARE RIGHT AND MUST NOT BE SOFTENED, but they are guarding
-// via a PROXY: their loudness is borrowed from
-// [[D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED]], a separate and
-// ✔MEASURED-legal conversion DSS still refuses. ✔MEASURED at `build/cx`: admit
-// that conversion and `sqrt(z)` compiles and exits 0 where all three references
-// exit 1 — and EXACTLY these three tests go red, out of 745 in this binary.
-// So when the tgmath complex surface gets a real owner, the guard these three
-// express must move ONTO that owner rather than be deleted with the proxy.
-TEST(SemanticAnalyzerC, TgmathComplexArgSqrtFailsLoud) {
-    auto model = analyzeRealTgmath(
-        "#include <tgmath.h>\n"
-        "int main(void) { double _Complex z; double r; z = 4.0;\n"
-        "                 r = sqrt(z); return (int)r; }\n",
-        ObjectFormatKind::Elf, DataModel::Lp64);
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << "sqrt(double _Complex) must fail LOUD through the bare default arm "
-           "— zero means the arm laundered the complex arg ((double)(x) crept "
-           "back in): a silent drop-imag miscompile";
+// ★★★ THESE PINS REPLACE THREE THAT GUARDED THE RIGHT FACT THROUGH THE WRONG
+// OWNER, AND THAT IS THE WHOLE STORY OF THIS ROW. Until P46 a complex argument
+// to ANY tgmath macro was loud for a borrowed reason: the `default:` arm was a
+// bare `sqrt((x))` and DSS refused the implicit complex→real conversion one
+// subsystem over. That conversion is legal C — C 6.3.1.7p2 defines it, C
+// 6.5.2.2p7 makes an argument the same rule as an assignment, and gcc 13.3.0,
+// clang 18.1.3 and mingw-w64 gcc 13.2.0 all compile and RUN `double d = z;`
+// (exit 3 on a (3,4)) while MSVC abstains, having no `_Complex` at all. So the
+// refusal had to go, and the loudness had to stop being its side effect.
+//
+// ⇒ P46 SPLIT THE SEVENTEEN MACROS THE WAY C23 7.25 SPLITS THEM, and the split
+// is MEASURED against both references rather than read off the standard:
+//   • ELEVEN have a <complex.h> counterpart and now DISPATCH to it — csqrt,
+//     csin, ccos, ctan, casin, cacos, catan, cexp, clog, cpow, cabs. ✔gcc and
+//     clang: `sqrt(0+4i)` exits 1, `fabs(3+4i)` exits 5, `pow(2i,2)` gives -4.
+//   • SIX have none — log10, floor, ceil, atan2, fmod, ldexp — and must REFUSE.
+//     ✔gcc and clang BOTH reject all six at compile time ("no matching function
+//     for type-generic call" / "call to '__tg_floor' is ambiguous").
+// The refusal is now `S_GenericSelectionNoMatch` from the real-only macros'
+// `_Generic((x) + 0.0, double: …)` arm — the C 6.5.1.1 constraint itself, which
+// is the same mechanism the references refuse with, and which owes nothing to
+// any other tier's missing feature. THAT is what these pins guard.
+//
+// ⚠ WHY THE DISPATCH PINS ASSERT `hasErrors()` FALSE PLUS A ZERO
+// S_TypeMismatch COUNT RATHER THAN A RETURN TYPE: the semantic tier is where a
+// wrong ARM is visible as a diagnostic, and the runtime VALUE that proves the
+// right SYMBOL was called is `examples/c/c99_tgmath_complex` (exit 42 on pe64,
+// elf64-x86_64 and elf64-aarch64, and byte-identically under all three
+// references). Neither pin is sufficient alone: this one cannot see a
+// wrong-library binding, and the corpus example cannot assert a refusal.
+
+// The eleven complex-capable macros, every one of them, in ONE model — a
+// per-macro miss is invisible in a spot check of three (the multi-site rule: a
+// green suite over a SUBSET of the forms is not proof). `fabs` is included even
+// though `cabs` returns a REAL, because that asymmetry is exactly where a
+// hand-written arm goes wrong.
+//
+// ★★★ WHAT THESE TWO PINS CAN AND CANNOT SEE, STATED BECAUSE THE M3
+// RED-ON-DISABLE ARM MEASURED THE DIFFERENCE AND IT IS NOT INTUITIVE. They catch
+// a complex arm that is MISSING ITS SYMBOL or is ill-typed — the failure that
+// produces a diagnostic. They CANNOT catch a complex arm that is simply GONE:
+// delete every `double _Complex:` association from `tgmath.json` and the complex
+// argument falls through to `default:`, reaches the real prototype, and produces
+// NO ERROR AT ALL. ✔MEASURED (arm M3): these pins stayed GREEN over exactly that
+// mutant, and only `examples/c/c99_tgmath_complex` went red.
+// ⇒ THE ARM-SELECTION WITNESS LIVES IN THE CORPUS EXAMPLE, and it has to: the
+// discriminator is `sizeof(sqrt(z))` — 16 iff the complex arm was selected, 8 if
+// the macro reached the real prototype, since `_Generic` selection is static and
+// `sizeof` does not evaluate — and ✔MEASURED, that does not FOLD here. `analyze()`
+// takes `aggregateLayout` as `std::nullopt` for every direct-API caller and its
+// own header says so in terms ("an array-dim `sizeof` simply does not fold"), so
+// a `_Static_assert(sizeof(...))` in this helper reports `not an integer constant
+// expression` while the identical file compiles clean through the real CLI.
+// Neither tier is sufficient alone and both are kept: this one can assert a
+// DIAGNOSTIC, which a running program cannot, and the corpus can assert the
+// SELECTED ARM and the runtime VALUE, which this cannot.
+constexpr char const* kTgmathComplexDispatchSrc =
+    "#include <tgmath.h>\n"
+    "int main(void) {\n"
+    "    double _Complex z; double _Complex w; double r;\n"
+    "    z = __builtin_complex(3.0, 4.0);\n"
+    "    w = sqrt(z); w = sin(z);  w = cos(z);  w = tan(z);\n"
+    "    w = asin(z); w = acos(z); w = atan(z);\n"
+    "    w = exp(z);  w = log(z);\n"
+    "    w = pow(z, z); w = pow(z, 2.0); w = pow(2.0, z);\n"
+    "    r = fabs(z);\n"
+    "    return (int)r + (int)__builtin_creal(w); }\n";
+
+TEST(SemanticAnalyzerC, TgmathComplexArgDispatchesToTheComplexFunctionOnElf) {
+    auto model = analyzeRealTgmath(kTgmathComplexDispatchSrc,
+                                   ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_FALSE(model.hasErrors())
+        << "every complex-capable tgmath macro must dispatch a `double _Complex` "
+           "argument to its <complex.h> counterpart (C23 7.25). An error here "
+           "means the complex extern row did not resolve or the arm is ill-typed; "
+           "a complex arm that is simply GONE is INVISIBLE to this pin and is "
+           "caught by examples/c/c99_tgmath_complex instead (see the note above) — "
+           << (model.diagnostics().all().empty()
+                   ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
-// The two-arg nested `_Generic` (pow) with a complex first arg: TWO
-// S_TypeMismatch — the SELECTED outer default `pow((z),(y))` plus the
-// UNSELECTED-but-type-checked inner default arm (same bare-call text inside
-// the float branch). Both are the SAME loudness guarantee; the count is
-// pinned so a silent-arm regression (either bare call gaining a cast) drops
-// the count and flips this red.
-TEST(SemanticAnalyzerC, TgmathComplexArgPowFailsLoudTwice) {
-    auto model = analyzeRealTgmath(
-        "#include <tgmath.h>\n"
-        "int main(void) { double _Complex z; double r; z = 4.0;\n"
-        "                 r = pow(z, 2.0); return (int)r; }\n",
-        ObjectFormatKind::Elf, DataModel::Lp64);
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 2u)
-        << "pow(double _Complex, double) must fail LOUD through both bare "
-           "default arms (selected outer + type-checked inner)";
+// The SAME source on pe, where `fabs` takes the per-format `variants` arm. A
+// complex arm added to only one realization of a variant macro is a divergence
+// no single-format pin can see.
+TEST(SemanticAnalyzerC, TgmathComplexArgDispatchesToTheComplexFunctionOnPe) {
+    auto model = analyzeRealTgmath(kTgmathComplexDispatchSrc,
+                                   ObjectFormatKind::Pe, DataModel::Llp64);
+    EXPECT_FALSE(model.hasErrors())
+        << "the pe `variants` realization must carry the same complex arms — "
+           << (model.diagnostics().all().empty()
+                   ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
-// fabs — the per-format `variants` macro — keeps the SAME complex loudness on
-// BOTH realizations: the elf arm's `fabs((x))` and the pe BRIDGE arm's
-// `fabs((x))` default are equally bare. One S_TypeMismatch each.
-TEST(SemanticAnalyzerC, TgmathComplexArgFabsFailsLoudOnBothFormats) {
-    constexpr char const* src =
+// ★★ AND THE THIRD FORMAT, WHICH THIS TEST REPLACES A DELIBERATE TRIPWIRE TO
+// ASSERT. Until 2026-08-31 this position held
+// `TgmathComplexArgRefusesLoudlyOnMachOPendingTheDarwinOracle`, which pinned the
+// OPPOSITE — that a complex argument on macho was `S_GenericSelectionNoMatch`.
+// That was never an endorsement of the refusal. P46's first landing shipped the
+// eleven `<complex.h>` extern rows gated `availableObjectFormats: ["pe","elf"]`
+// because `tests/ffi/test_darwin_link_name_oracle` refuses a Mach-O import whose
+// Darwin link name nothing has ever asked a real Darwin compiler for, and that
+// oracle is RIGHT: an export check cannot settle the question, because a
+// wrong-but-existing spelling links clean, loads clean and misbinds SILENTLY —
+// the `_fstat` / `_fstat$INODE64` case that made sqlite call every database
+// malformed. So macho refused LOUDLY, which is below clang on that one platform
+// but never a wrong answer.
+// ⇒ THE TRIPWIRE WAS WRITTEN TO FAIL WHEN THE MEASUREMENT WAS TAKEN, so the gap
+// could not outlive its reason, and it did exactly that: the eleven identifiers
+// were measured on a real Mac (macOS 26.6.2, Apple clang 21.0.0), all eleven are
+// PLAIN on both arches, the rows are in `tests/ffi/data/darwin-link-names.tsv`
+// and pinned by `DarwinLinkNameOracle.TgmathComplexImportsAreMeasuredAndPlainOnBothArches`,
+// and each macho arm now carries the text its elf arm already carried.
+// ⚠ WHAT THIS PIN CANNOT SEE IS UNCHANGED FROM ITS TWO SIBLINGS and is the
+// reason the corpus example is not redundant with it: a complex arm that is
+// simply GONE produces NO diagnostic — the argument falls through to `default:`,
+// reaches the real prototype, and answers 0 where every reference answers 1.
+// That is caught by `examples/c/c99_tgmath_complex`, whose darwin arm landed
+// with this change. [[D-CSUBSET-TGMATH-COMPLEX]]
+TEST(SemanticAnalyzerC, TgmathComplexArgDispatchesToTheComplexFunctionOnMachO) {
+    auto model = analyzeRealTgmath(kTgmathComplexDispatchSrc,
+                                   ObjectFormatKind::MachO, DataModel::Lp64);
+    EXPECT_FALSE(model.hasErrors())
+        << "every complex-capable tgmath macro must dispatch a `double _Complex` "
+           "argument to its <complex.h> counterpart on MACH-O too, now that the "
+           "eleven imports carry a MEASURED Darwin link name. An "
+           "S_GenericSelectionNoMatch here means the gate came back — either the "
+           "eleven rows regained `availableObjectFormats` or a macho arm lost its "
+           "complex associations — "
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// A `float _Complex` argument rides the SAME arms — the cycle-1 F64 monomorph
+// (D-CSUBSET-COMPLEX-MONOMORPH-F64) element-converts it into `complex<f64>`.
+// Without a `float _Complex:` association it would fall to `default:` and reach
+// the real prototype: a SILENT wrong answer, not a diagnostic.
+TEST(SemanticAnalyzerC, TgmathFloatComplexArgAlsoDispatches) {
+    auto model = analyzeRealTgmath(
         "#include <tgmath.h>\n"
-        "int main(void) { double _Complex z; double r; z = 4.0;\n"
-        "                 r = fabs(z); return (int)r; }\n";
-    auto elf = analyzeRealTgmath(src, ObjectFormatKind::Elf, DataModel::Lp64);
-    EXPECT_EQ(countCode(elf.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << "fabs(double _Complex) must fail LOUD on elf (fabsf variant arm)";
-    auto pe = analyzeRealTgmath(src, ObjectFormatKind::Pe, DataModel::Llp64);
-    EXPECT_EQ(countCode(pe.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << "fabs(double _Complex) must fail LOUD on pe (the f64 bridge arm)";
+        "int main(void) { float _Complex z; double _Complex w; double r;\n"
+        "                 z = __builtin_complex(3.0f, 4.0f);\n"
+        "                 w = sqrt(z); r = fabs(z);\n"
+        "                 return (int)r + (int)__builtin_creal(w); }\n",
+        ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// ★★ THE REFUSAL HALF, AND IT IS THE ONE THAT MUST NEVER BE SOFTENED. Each of
+// the six real-only macros is asserted SEPARATELY so a failure names the macro
+// rather than a count — a regression that loses the guard on `fmod` alone reads
+// identically to one that loses all six if the pin aggregates.
+// RED-ON-DISABLE (config, REMOVE-direction): delete the ` + 0.0` from the
+// `default:` arm of any one of these six in shippedLibs/tgmath.json and its
+// row here goes green-to-red… in the other direction — the macro then ACCEPTS
+// the complex argument and silently drops the imaginary part, which is exactly
+// the miscompile this row exists to prevent.
+namespace {
+struct RealOnlyTgmathCase {
+    char const* macroName;
+    char const* call;
+};
+constexpr RealOnlyTgmathCase kRealOnlyTgmath[] = {
+    {"log10", "log10(z)"},
+    {"floor", "floor(z)"},
+    {"ceil",  "ceil(z)"},
+    {"atan2", "atan2(z, 1.0)"},
+    {"fmod",  "fmod(z, 4.0)"},
+    {"ldexp", "ldexp(z, 2)"},
+};
+}  // namespace
+
+TEST(SemanticAnalyzerC, TgmathRealOnlyMacroRefusesAComplexArgumentLoudly) {
+    for (auto const& c : kRealOnlyTgmath) {
+        std::string src =
+            std::string("#include <tgmath.h>\n"
+                        "int main(void) { double _Complex z; double r;\n"
+                        "                 z = __builtin_complex(3.5, 4.0);\n"
+                        "                 r = ") + c.call +
+            "; return (int)r; }\n";
+        for (auto const& fmt : {std::pair{ObjectFormatKind::Elf, DataModel::Lp64},
+                                std::pair{ObjectFormatKind::Pe, DataModel::Llp64},
+                                std::pair{ObjectFormatKind::MachO, DataModel::Lp64}}) {
+        auto model = analyzeRealTgmath(src, fmt.first, fmt.second);
+        EXPECT_GE(countCode(model.diagnostics(),
+                            DiagnosticCode::S_GenericSelectionNoMatch), 1u)
+            << c.macroName
+            << "(complex) must REFUSE — it has no <complex.h> counterpart and BOTH "
+               "gcc 13.3.0 and clang 18.1.3 reject it. Zero here means the `(x) + 0.0` "
+               "guard on the real-only `default:` arm was lost and the macro is "
+               "silently dropping the imaginary part into a real prototype.";
+        }
+    }
+}
+
+// The complement, and it is what makes the pin above non-vacuous: the SAME six
+// macros must stay clean for every REAL argument, including the integer and
+// `_Bool` shapes that ride the `(x) + 0.0` promotion rather than a named
+// association. A guard written as `_Generic((x), double: …)` with no promotion
+// would pass the refusal pin and break every integer call.
+TEST(SemanticAnalyzerC, TgmathRealOnlyMacroStaysCleanForEveryRealArgument) {
+    auto model = analyzeRealTgmath(
+        "#include <tgmath.h>\n"
+        "int main(void) {\n"
+        "    float f; double d; int i; _Bool b; char c; unsigned long u;\n"
+        "    float s; double r;\n"
+        "    f = 1.0f; d = 1.0; i = 1; b = 1; c = 1; u = 1;\n"
+        "    s = floor(f); r = floor(d); r = floor(i); r = floor(b);\n"
+        "    r = floor(c); r = floor(u);\n"
+        "    s = ceil(f);  r = ceil(i);  s = log10(f); r = log10(i);\n"
+        "    s = atan2(f, f); r = atan2(d, i); r = atan2(i, d);\n"
+        "    s = fmod(f, f);  r = fmod(d, i);  r = fmod(i, d);\n"
+        "    s = ldexp(f, i); r = ldexp(d, i); r = ldexp(i, i);\n"
+        "    return (int)s + (int)r; }\n",
+        ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_FALSE(model.hasErrors())
+        << "the real-only complex guard must be TRANSPARENT to every real argument "
+           "(the `(x) + 0.0` promotion covers int/char/_Bool/unsigned as C 7.25p3 "
+           "requires) — "
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 0u);
+}
+
+// ★ `ldexp`'s SECOND argument is an `int` and is NOT a generic parameter (C23
+// 7.25p4), so it is deliberately UNGUARDED — a complex exponent converts to int
+// and the imaginary part is dropped. That is not an oversight: ✔MEASURED, gcc
+// 13.3.0 and clang 18.1.3 BOTH accept `ldexp(3.0, z)` with z = (2,3i) and both
+// exit 12 (= 3·2²), and DSS now exits 12 there too. Refusing it would put DSS
+// BELOW the union; guarding it would be inventing a rule neither reference has.
+TEST(SemanticAnalyzerC, TgmathLdexpNonGenericSecondArgAcceptsAComplex) {
+    auto model = analyzeRealTgmath(
+        "#include <tgmath.h>\n"
+        "int main(void) { double _Complex z; double b; double r;\n"
+        "                 z = __builtin_complex(2.0, 3.0); b = 3.0;\n"
+        "                 r = ldexp(b, z); return (int)r; }\n",
+        ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// ── char ↔ float — D-CSUBSET-INT-FLOAT-CONVERSION owns this axis and its gates,
+// and it closed in P19 with this ONE TypeKind missed. The registry record of the
+// miss is a born-closed row of its own; the code cites the parent deliberately so
+// the anchor guard resolves whichever order the two land in.
+//
+// ★ FOUND FROM THE OTHER END, WHICH IS WHY IT WAS NEVER FILED. `char` is an
+// integer type (C 6.3.1.1) that promotes to `int` (6.3.1.1p2), and an `int`
+// converts to a floating type (6.3.1.4) — so `double d = aChar;` is two
+// conversions the language spells out separately, and both references perform
+// it. ✔MEASURED, binaries RUN: `char c = 7; double r = floor(c); double d = c;`
+// exits 7 under gcc 13.3.0 `-std=c2x` and clang 18.1.3 `-std=c23`, and the
+// mirror `double d = 3.5; char c = d;` exits 3 on both; DSS refused BOTH with
+// `error[S_TypeMismatch]` — BELOW the union in both directions.
+// ⚠ IT IS INVISIBLE THROUGH ORDINARY CODE, which is the interesting part: a
+// `char` reaches a float perfectly well on the BINARY path (`aChar + 0.0`, the
+// usual arithmetic conversions), a DIFFERENT code path from assignment. It
+// surfaced only through `<tgmath.h>`, where a `char` argument must reach a
+// `double` PARAMETER — C 6.5.2.2p7 assignment semantics — and `floor(aChar)`
+// refused while `floor(anInt)` did not.
+// The admission is the COMPOSITION of two gates already present,
+// `charConvertsToArith && intConvertsToFloat` (and the `floatConvertsToInt`
+// twin), never a new key — a fact with an owner does not get a second owner.
+TEST(SemanticAnalyzerC, CharConvertsToAndFromFloatInAssignmentAndArgument) {
+    auto model = analyzeRealTgmath(
+        "#include <tgmath.h>\n"
+        "double sink(double v);\n"
+        "int main(void) { char c; double d; float f; signed char sc; unsigned char uc;\n"
+        "                 c = 7; d = 3.5;\n"
+        "                 d = c;             /* char -> double, assignment  */\n"
+        "                 c = d;             /* double -> char, the mirror  */\n"
+        "                 d = sink(c);       /* char -> double, argument    */\n"
+        "                 d = floor(c);      /* the shape that found it     */\n"
+        "                 sc = d; uc = d;    /* the two that already worked */\n"
+        "                 d = sc; d = uc;\n"
+        "                 f = 1.0f; d = f;\n"
+        "                 return (int)d + c + sc + uc + (int)f; }\n",
+        ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_FALSE(model.hasErrors())
+        << "`char` must convert to and from a floating type in assignment AND "
+           "argument position (C 6.3.1.1 + 6.3.1.4 + 6.5.2.2p7); gcc and clang "
+           "both do it — "
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// ⚠ THE SCOPE CONTROL, and it is what keeps the arm above from being read as
+// "Char is now a rank". A `char` is admitted to a FLOAT slot; it is NOT admitted
+// to a POINTER one, and neither gate says otherwise. Without this the pin above
+// would pass equally well over an arm that returned `true` for everything.
+TEST(SemanticAnalyzerC, CharToFloatAdmissionDoesNotLeakIntoPointerTargets) {
+    auto model = analyzeRealTgmath(
+        "#include <tgmath.h>\n"
+        "int main(void) { char c; double *p; c = 7; p = c; return (int)*p; }\n",
+        ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_TRUE(model.hasErrors())
+        << "`double *p = aChar;` must still be refused — the P46 clause admits "
+           "Char to a FLOAT slot, not to every slot";
+}
+
+// ── D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED — the conversion
+// itself, at the tier that admits it, in all three positions ONE rule governs.
+// The corpus example proves the VALUES; this proves the ADMISSION, which is the
+// half that a lowering change could break without moving any runtime answer.
+TEST(SemanticAnalyzerC, ComplexToRealImplicitConversionIsAdmitted) {
+    auto model = analyzeRealTgmath(
+        "#include <tgmath.h>\n"
+        "double sink(double v);\n"
+        "int main(void) { double _Complex z; double d; int n; float f;\n"
+        "                 z = __builtin_complex(3.0, 4.0);\n"
+        "                 d = z;            /* C 6.5.16.1p1 assignment */\n"
+        "                 n = z;            /* C 6.3.1.7p2 to integer  */\n"
+        "                 f = z;            /* narrower float target   */\n"
+        "                 d = sink(z);      /* C 6.5.2.2p7 argument    */\n"
+        "                 return (int)d + n + (int)f; }\n",
+        ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_FALSE(model.hasErrors())
+        << "C 6.3.1.7p2 defines complex->real implicitly (the imaginary part is "
+           "discarded) and gcc, clang and mingw-w64 gcc all perform it in BOTH "
+           "assignment and argument position — "
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// ⚠ AND THE ONE TARGET THAT MUST *NOT* TAKE THAT ARM. `_Bool b = z;` is NOT an
+// imaginary-discarding conversion: C 6.3.1.2 makes it "compares unequal to 0",
+// which for a complex tests BOTH components. The admits-or-falls-through shape
+// in `isAssignable` and the explicit `tk != TypeKind::Bool` in `coerce` exist
+// exactly so this keeps reaching `scalarConvertsToBool` — a returning arm, or a
+// coerce arm inferring Bool-exclusion from arm ORDER, silently routes it
+// through the discarding path instead
+// ([[D-CSUBSET-COMPLEX-LOGICAL-NOT-AND-BOOL-CAST-SILENT-MISCOMPILE]], and the
+// execution-verified
+// [[D-CSUBSET-COMPLEX-TO-BOOL-ASSIGNMENT-NOT-ADMITTED-BY-THE-SEMANTIC-TIER]]).
+// The end-to-end truthiness behaviour is pinned in HirLoweringC; this is the
+// semantic-tier half, sited next to the arm whose shape it constrains.
+TEST(SemanticAnalyzerC, ComplexToBoolStillTakesTheTruthinessPathNotTheDiscardPath) {
+    auto model = analyzeRealTgmath(
+        "#include <tgmath.h>\n"
+        "int main(void) { double _Complex z; _Bool b;\n"
+        "                 z = __builtin_complex(0.0, 4.0);\n"
+        "                 b = z;\n"
+        "                 return b ? 1 : 0; }\n",
+        ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_FALSE(model.hasErrors())
+        << "`_Bool b = z;` must stay admitted through the truthiness chokepoint — "
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -27,6 +27,11 @@ add_library(core OBJECT
     # The content-addressed memo every schema family loads through
     # (D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS).
     types/config_document_memo.cpp
+    # The ONE entry every config document is parsed through — the sole place
+    # `json::parse` is called for config bytes, and therefore the sole place a
+    # REPEATED key can be noticed
+    # (D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC).
+    types/config_document_parse.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
     types/predefined_macro_json.cpp

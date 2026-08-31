@@ -25,9 +25,16 @@
 // to any descriptor tomorrow is covered by nothing. ★ AND THAT IS NOT
 // HYPOTHETICAL — that table's own docblock records the fix's sweep as 232
 // Mach-O-visible descriptor functions on 2026-08-05; ✔RE-MEASURED 2026-08-25 the
-// same sweep is 277. Whatever the exact delta, ~45 symbols entered the
-// eager-import set with no one asking the platform what it calls them, and the
-// ten-row list could not have noticed.
+// same sweep is 277, and ✔RE-MEASURED 2026-08-31 it is 288. Whatever the exact
+// delta, ~45 symbols entered the eager-import set with no one asking the platform
+// what it calls them, and the ten-row list could not have noticed.
+// ★ THE 2026-08-31 STEP IS THE MECHANISM WORKING RATHER THAN DRIFTING, and it is
+// worth the sentence because it is the only entry in that series that is: the
+// eleven <tgmath.h> complex imports (cabs cacos casin catan ccos cexp clog cpow
+// csin csqrt ctan) were REFUSED by this file when P46 first shipped them, were
+// gated `availableObjectFormats: ["pe","elf"]` rather than guessed, and entered
+// the census only once a real Mac had answered for each of them.
+// [[D-CSUBSET-TGMATH-COMPLEX]]
 //
 // So this file inverts the question. Instead of "are these ten names right?" it
 // asks "is EVERY Mach-O-visible imported function accounted for by a
@@ -46,10 +53,12 @@
 //      the undefined symbol it emits.
 //
 // That measurement is `tests/ffi/data/darwin-link-names.tsv`, taken on the
-// operator's Mac (macOS 26.5.2, Apple `cc`), 236 identifiers x 2 arches. This
-// file is the machinery that holds the descriptors to it on every gate, on every
-// host — the table is DATA, so the check runs on Windows and Linux where no Mach-O
-// can even be executed.
+// operator's Mac — 236 identifiers x 2 arches on macOS 26.5.2 (2026-08-25) plus
+// ELEVEN more on macOS 26.6.2 (2026-08-31), 247 identifiers today. Both dates and
+// both host versions live in that file's header rather than here, because a
+// TABLE's provenance belongs with the table. This file is the machinery that
+// holds the descriptors to it on every gate, on every host — the table is DATA,
+// so the check runs on Windows and Linux where no Mach-O can even be executed.
 //
 // ── THE FOUR AXES, AND WHY EACH IS SEPARATE ──────────────────────────────────
 //
@@ -324,7 +333,7 @@ sysvVaListBinding(TypeInterner& interner) {
 
 // The `linkName` the REAL READER resolves for one descriptor on one arch. Keyed
 // per (descriptor, arch) and cached, because a descriptor read is not free and
-// the census walks 277 rows twice.
+// the census walks 288 rows twice.
 [[nodiscard]] std::map<std::string, std::string>
 readLinkNames(fs::path const& descriptor, std::string_view arch) {
     std::map<std::string, std::string> out;
@@ -353,7 +362,7 @@ readLinkNames(fs::path const& descriptor, std::string_view arch) {
 TEST(DarwinLinkNameOracle, TableLoadsAndIsSubstantial) {
     auto const oracle = loadOracle();
     ASSERT_GE(oracle.size(), 200u)
-        << "the measured table holds 236 identifiers; a much smaller one means "
+        << "the measured table holds 247 identifiers; a much smaller one means "
            "it was truncated or the parser stopped early, and every census "
            "below would then pass by measuring nothing";
     // The eight MEASURED divergences, spelled out — the table is data, and this
@@ -394,13 +403,62 @@ TEST(DarwinLinkNameOracle, TableLoadsAndIsSubstantial) {
     }
 }
 
+// ── THE ELEVEN <tgmath.h> COMPLEX IMPORTS — [[D-CSUBSET-TGMATH-COMPLEX]] ──────
+//
+// ★ WHY THESE GET THEIR OWN PIN RATHER THAN JOINING THE `plain` CONTROLS ABOVE.
+// Those controls exist to prove the `$INODE64` rename belongs to individual
+// SYMBOLS and never to a HEADER. These eleven prove something different and
+// narrower: that a specific gap was closed by MEASUREMENT rather than by
+// assumption. P46 shipped the <tgmath.h> complex dispatch C23 7.25 requires on
+// elf and pe, and THIS FILE REFUSED IT ON MACH-O — the eleven rows carried
+// `availableObjectFormats: ["pe","elf"]` and each macro's macho arm took the
+// real-only shape, so a complex argument was `S_GenericSelectionNoMatch`: loud,
+// and BELOW clang on that one platform rather than silently divergent from it.
+// The gate came off only once a real Mac had answered for each identifier
+// (macOS 26.6.2, Apple clang 21.0.0, 2026-08-31 — provenance in the table's
+// header). If a later edit deletes one of those rows, the forward census reds
+// with a message about a missing measurement; this pin reds naming the ANCHOR,
+// which is the faster read.
+//
+// ⚠ ALL ELEVEN ARE PLAIN ON BOTH ARCHES, AND THAT IS THE ANSWER MOST LIKELY TO
+// BE ASSUMED RATHER THAN TAKEN — which is exactly why it is pinned. A table that
+// contains only non-diverging rows for a symbol family looks like a table nobody
+// needed to write; the `_fstat` case is the standing proof that the same
+// reasoning applied to `stat` cost a corrupted database. An absent measurement
+// and a measurement that came back plain are NOT the same state, and only one of
+// them is evidence.
+TEST(DarwinLinkNameOracle, TgmathComplexImportsAreMeasuredAndPlainOnBothArches) {
+    auto const oracle = loadOracle();
+    for (char const* sym : {"cabs", "cacos", "casin", "catan", "ccos", "cexp",
+                            "clog", "cpow", "csin", "csqrt", "ctan"}) {
+        auto const it = oracle.find(sym);
+        ASSERT_NE(it, oracle.end())
+            << sym << " has no MEASURED row. It is one of the eleven "
+               "<complex.h> counterparts shippedLibs/tgmath.json imports on "
+               "Mach-O, and without a row here the descriptor must go back to "
+               "`availableObjectFormats: [\"pe\",\"elf\"]` — a guessed cell is "
+               "worse than an absent one, because it is evidence-shaped";
+        EXPECT_EQ(it->second.emitted[0], std::string("_") + sym)
+            << sym << " on x86_64-Darwin";
+        EXPECT_EQ(it->second.emitted[1], std::string("_") + sym)
+            << sym << " on arm64-Darwin";
+        EXPECT_EQ(it->second.probeHeader, "tgmath.h")
+            << sym << "'s row must record the header the measurement actually "
+                      "INCLUDED. ✔MEASURED: <tgmath.h> — the descriptor's own "
+                      "header — compiles all eleven on both arches; <math.h> "
+                      "does not (`use of undeclared identifier`). The row is "
+                      "the recipe for re-taking the measurement, so a header "
+                      "that was not the one used makes it unreproducible";
+    }
+}
+
 // ── (1) CENSUS FORWARD — the axis that covers every FUTURE symbol ────────────
 
 TEST(DarwinLinkNameOracle, EveryMachOImportedFunctionHasAMeasuredRow) {
     auto const oracle = loadOracle();
     auto const fns    = machOImportedFunctions();
     ASSERT_GE(fns.size(), 250u)
-        << "the Mach-O import surface is 277 declared functions; a much smaller "
+        << "the Mach-O import surface is 288 declared functions; a much smaller "
            "sweep means the enumeration broke and this census is vacuous";
     for (auto const& f : fns) {
         EXPECT_NE(oracle.find(f.symbol), oracle.end())
@@ -469,7 +527,7 @@ TEST(DarwinLinkNameOracle, EveryDeclaredLinkNameMatchesTheMeasurement) {
         }
     }
     EXPECT_GE(compared, 500)
-        << "fail-closed: 277 symbols x 2 arches should be ~554 comparisons; a "
+        << "fail-closed: 288 symbols x 2 arches should be ~576 comparisons; a "
            "small number means the loop skipped nearly everything";
 }
 

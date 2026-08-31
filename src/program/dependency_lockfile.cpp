@@ -1,6 +1,7 @@
 #include "program/dependency_lockfile.hpp"
 
 #include "core/substrate/path_identity.hpp"       // genericSpelling
+#include "core/types/config_document_parse.hpp"   // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey — the shared `$` carve-out
 #include "core/types/parse_diagnostic.hpp"
 
@@ -103,11 +104,23 @@ DependencyLockfile::load(fs::path const& lockPath, DiagnosticReporter& rep) {
     std::string const text{std::istreambuf_iterator<char>{in},
                            std::istreambuf_iterator<char>{}};
 
-    json doc = json::parse(text, nullptr, /*allow_exceptions=*/false);
-    if (doc.is_discarded()) {
-        emitLockfileMalformed(rep, lockPath, "the contents are not valid JSON");
+    // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`). A raw
+    // `json::parse` here accepted a lockfile declaring `url` or
+    // `resolvedCommit` TWICE and silently kept the LAST declaration —
+    // D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC.
+    // ⚠ ON THIS DOCUMENT THE CONSEQUENCE IS THE SHARPEST OF THE ELEVEN
+    // INGESTION SITES, which is why it was not left to the next cycle: the
+    // build resolves a DIFFERENT SOURCE than the one a reader of the file
+    // meets first, with no diagnostic and no diff — and this is the one config
+    // document whose whole job is to say, reproducibly, which bytes were used.
+    auto parsed = detail::parseConfigDocument(text);
+    if (!parsed) {
+        emitLockfileMalformed(rep, lockPath,
+                              parsed.error().detailTextWithLocus(
+                                  "the contents are not valid JSON: "));
         return std::nullopt;
     }
+    json doc = std::move(*parsed);
     if (!doc.is_object()) {
         emitLockfileMalformed(rep, lockPath, "the root value is not an object");
         return std::nullopt;

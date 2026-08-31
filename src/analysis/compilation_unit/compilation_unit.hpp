@@ -158,7 +158,12 @@ public:
                     // synth buffer and contributes nothing). See
                     // `remapPreprocessedPositions`.
                     std::vector<PreprocessedPositionMap>
-                        preprocessedPositionMaps = {});
+                        preprocessedPositionMaps = {},
+                    // The unit's TEXTUAL INPUT CLOSURE, as one digest. See
+                    // `inputDigest()`. Empty only for a CU built by a path that
+                    // predates this parameter, which `inputDigest()` reports as
+                    // "not computed" rather than as a value.
+                    std::string inputDigest = {});
 
     ~CompilationUnit();  // out-of-line; mirrors Tree's discipline.
 
@@ -270,6 +275,90 @@ public:
     // entry).
     [[nodiscard]] std::span<std::shared_ptr<SourceBuffer> const>
     auxiliaryBuffers() const noexcept;
+
+    // ═══ THE UNIT'S TEXTUAL INPUT CLOSURE, AS ONE 64-HEX SHA-256 ═════════════
+    // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION's stated
+    // PREREQUISITE (cycle P46). A cross-run artifact cache cannot key on
+    // anything the DRIVER can see: ✔MEASURED by lane `dc` at `f865897c`, a
+    // `staticlib` dependency whose `fold.c` carries `#include "fold_impl.h"`
+    // produces a DIFFERENT archive when only that header is edited, while every
+    // term a manifest-level key names — both manifests, both source files, the
+    // target, the derived format, the config — is byte-identical. A C
+    // dependency's `#include` closure is not in `sources[]`, not in any
+    // manifest and not under the config root, so no datum
+    // `dependency_resolver.cpp` can reach names it.
+    //
+    // ★★★ THE ANSWER IS FOR THE COMPILER TO REPORT WHAT IT ACTUALLY READ,
+    // RATHER THAN FOR ANYONE ELSE TO ENUMERATE IT. An enumeration of inputs can
+    // always miss one and fails toward HIT — the flattering direction, and the
+    // one that ships wrong bytes. What is DOWNSTREAM of every input BY
+    // CONSTRUCTION cannot.
+    //
+    // ── WHAT IT COVERS, AND WHY EACH TERM IS SEPARATELY NECESSARY ────────────
+    //   * each tree's PARSE SOURCE TEXT — for a preprocessed file that is the
+    //     SYNTHESIZED buffer. ✔MEASURED 2026-08-31 (cycle P46) by reading one,
+    //     rather than assumed: it is the SPLICED text and it RETAINS DIRECTIVES
+    //     and UNEXPANDED macro uses. A TU with `#include "fold_impl.h"` renders
+    //     as the target/format predefine prologue, then `#define DSS_FOLD_BIAS 2`
+    //     from the header, then `… return v + v + DSS_FOLD_BIAS;` — the macro
+    //     NOT expanded. ⇒ this term covers every spliced header's bytes, every
+    //     `--define` and predefine, and every directive INCLUDING the pragmas;
+    //     it does NOT by itself cover what expansion PRODUCES, which is why the
+    //     token term below is a separate term and not a belt-and-braces copy of
+    //     this one.
+    //   * the PREPROCESSED TOKEN STREAM's (kind, schemaKind, flags, span)
+    //     sequence — the parser's literal input, so a change that reclassifies
+    //     text without changing it is caught.
+    //   * the `#pragma pack` AND `#pragma optimize` STAMP MAPS. Those directives
+    //     are REMOVED from the token stream and their effect survives only in an
+    //     out-of-band side table keyed by synth offset, so a digest over the
+    //     TOKENS alone would be blind to them.
+    //     ⚠⚠ **THIS TERM IS DEFENCE IN DEPTH AND NO TEST WITNESSES IT — SAID
+    //     HERE BECAUSE THE FIRST VERSION OF THIS COMMENT CLAIMED THE OPPOSITE.**
+    //     ✔MEASURED 2026-08-31 (cycle P46, lane `dg`) by REMOVE-direction
+    //     mutation: delete this whole block and
+    //     `program/test_compilation_unit_input_digest` stays GREEN — object md5
+    //     moved `20550740…` -> `610efdc8…` and returned, build rc 0, control
+    //     green, so the mutant was compiled in and read. The reason is that the
+    //     parse-source text above ALREADY carries the `#pragma pack(N)`
+    //     directive verbatim: this project's synthesized buffer retains
+    //     directives rather than stripping them, so the text term moves first.
+    //     ⇒ IT IS KEPT ANYWAY, under `runtime_object_cache.hpp`'s stated
+    //     asymmetry — over-invalidation costs one recompile, under-invalidation
+    //     ships wrong bytes — because "the parse-source text carries every
+    //     pragma on every path" is a property of `src/analysis/preprocess/`
+    //     that this file does not own and has not proven. Do not delete it on
+    //     the strength of the mutant alone; prove that premise first, and if you
+    //     do, delete this term AND this paragraph together.
+    //   * every SHIPPED DESCRIPTOR the unit resolved, by path AND by the digest
+    //     of its bytes. An angle `#include <h>` resolves to a neutral JSON
+    //     descriptor that is never spliced and never tokenized, so it is
+    //     invisible to all three terms above while deciding the declarations the
+    //     unit compiles against.
+    //
+    // ── WHAT IT DELIBERATELY DOES NOT COVER, BECAUSE THOSE HAVE OWNERS ───────
+    // The `.lang` / `.target` / `.format` documents, the target spec, the object
+    // format, debug-vs-release, and the compiler's own build stamp. Every one is
+    // already a first-class term of `runtime_object_cache.hpp`'s key and each
+    // has a loader that reports its own `contentDigest()`. Folding them in here
+    // would make this a SECOND owner of facts that already have one — the defect
+    // `runtime_object_cache.hpp`'s "ask the loaders, never hand-list" note
+    // records. ⇒ A CACHE KEY IS THIS DIGEST **PLUS** THOSE TERMS, never this
+    // digest alone.
+    //
+    // ⚠ `auxiliaryBuffers()` IS NOT THIS SET AND MUST NOT BE USED AS ONE.
+    // ✔MEASURED 2026-08-31 (cycle P46, lane `dg`), confirming lane `dc`'s
+    // flag: it is collected from `lineMap.segments()`, i.e. from buffers that
+    // contributed RENDERED TEXT for diagnostic positioning. A header that
+    // contributes no segment is absent from it — so as an input closure it
+    // fails toward HIT, which is the direction that ships wrong bytes. It
+    // answers a real and adjacent question (which buffers must be registered so
+    // a remapped diagnostic renders) and that is the only question it answers.
+    //
+    // ⓘ EMPTY means NOT COMPUTED — a CU built through a path that predates this
+    // — and a key builder must treat empty as a REFUSAL, never as "no inputs".
+    // Empty is detectable; wrong is not.
+    [[nodiscard]] std::string_view inputDigest() const noexcept;
 
     // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): tree `treeIndex`'s `#pragma pack` stamps —
     // synth byte offset of a token -> the MAXIMUM MEMBER ALIGNMENT (bytes) the
@@ -394,6 +483,8 @@ private:
     // the question every consumer asks is "does this POSITION belong to a synth
     // buffer", which is answered by scanning the maps, never by a tree index.
     std::vector<PreprocessedPositionMap> preprocessedPositionMaps_;
+    // 64 lowercase hex, or EMPTY meaning NOT COMPUTED — see `inputDigest()`.
+    std::string                          inputDigest_;
 };
 
 // Single-use builder for CompilationUnit. Non-copyable + non-movable, same

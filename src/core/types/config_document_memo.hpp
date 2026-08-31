@@ -74,12 +74,59 @@
 // mechanism with a separate failure surface; see the P34 lane report.
 //
 // ── CAPACITY ────────────────────────────────────────────────────────────────
-// Bounded, FIFO, and the bound is a MEMORY guard rather than a correctness
-// one: evicting an entry can only cost a rebuild, never a wrong answer. The
-// real working set is the handful of documents one invocation touches (the
-// shipped-language scan is six), so the bound only ever bites on a harness
-// that walks many distinct MUTANTS of one document — exactly the case where
-// holding them all would be the defect.
+// Bounded, LEAST-RECENTLY-USED, and the bound is a MEMORY guard rather than a
+// correctness one: evicting an entry can only cost a rebuild, never a wrong
+// answer. The bound only ever bites on a harness that walks many distinct
+// MUTANTS of one document — exactly the case where holding them all would be
+// the defect.
+//
+// ⚠⚠ THE FIRST CUT OF THIS PARAGRAPH STATED A PREMISE THAT TWO SHIPPED CODE
+// PATHS REFUTE, AND THE PREMISE IS WHAT SET THE NUMBER
+// (D-CONFIG-MEMO-CAPACITY-IS-HALF-THE-SHIPPED-CORPUS-SO-A-TOTAL-SCAN-THRASHES-IT).
+// It read *"the real working set is the handful of documents one invocation
+// touches (the shipped-language scan is six)"* and fixed the bound at 16.
+// ✔MEASURED 2026-08-31 (cycle P46, lane `dg`), Windows Debug, at `f865897c`:
+// the shipped corpus is **32** documents — 24 `.format.json`, 6 `.lang.json`,
+// 2 `.target.json` — and TWO production paths scan the object-format class in
+// FULL, in one uninterruptible loop, because each is proving UNIQUENESS and a
+// uniqueness proof cannot early-exit:
+//   * `runtime::resolveArchiveSiblingFormat` (`program/runtime_object_cache.cpp`),
+//     run once per BUILD — the root's and every dependency sub-build's;
+//   * `Resolver::shippedFormats_` (`program/dependency_resolver.cpp`), once per
+//     dependency resolve.
+// A 24-document loop through a 16-slot store evicts EIGHT OF ITS OWN ENTRIES
+// before it finishes, so the sweep's hit rate is ZERO no matter how many times
+// it runs — and it additionally evicts everything loaded BEFORE it, which
+// includes the 506 KB language document, the single most expensive build in the
+// process. ✔MEASURED, a project-mode compile with one `staticlib` dependency at
+// one consumer target: `build-config` runs — the phase whose `runs` IS the miss
+// count — **105**, against **29** for the same project with no `dependsOn`, and
+// dead linear at **+26 per additional dependency and +25 per additional consumer
+// target** (105 / 131 / 183 / 287 at K = 1 / 2 / 4 / 8).
+//
+// ★★★ SO THE DEFECT WAS NEVER "THE NUMBER IS TOO SMALL" — IT IS THAT A COUNT
+// BOUND HAS A SILENT CLIFF AND NOTHING WATCHES IT. The store degrades from a
+// 100% hit rate to a 0% one the moment one document class outgrows the bound,
+// with no diagnostic, no test, and no symptom other than the compiler getting
+// slower. ⇒ TWO changes, and the second is the load-bearing one:
+//   1. the policy is LRU, not FIFO. FIFO evicts the OLDEST-INSERTED entry,
+//      which is precisely the language document — loaded first, used
+//      throughout, and the most expensive one to rebuild. LRU keeps a document
+//      that is still being used, so a total scan over a DIFFERENT class can no
+//      longer displace it. (LRU alone does not fix a working set larger than
+//      the bound; it fixes which entry loses when one is over.)
+//   2. `kCapacity` is stated as a MULTIPLE OF THE WHOLE SHIPPED CORPUS rather
+//      than as a guess about a working set — and
+//      `tests/program/test_config_memo_holds_a_total_scan` COUNTS the real
+//      corpus on disk and goes RED when it no longer fits with headroom. That
+//      is what makes the cliff loud: the document that would silently halve the
+//      compiler now reddens a test in the same commit that ships it.
+//
+// ⓘ Capacity is a compiled constant and deliberately not config: it names no
+// vocabulary, changes no output, and a document that has to be READ to learn how
+// much of itself to remember is a bootstrapping problem with nothing to gain.
+// `capacity()` is exported so the test asserts the RELATION against a measured
+// corpus instead of re-spelling the number.
 
 namespace dss::detail {
 
@@ -145,6 +192,17 @@ public:
 
     [[nodiscard]] static Stats stats();
     static void resetStats();
+
+    // The entry bound, so a test can assert it against the corpus it has just
+    // COUNTED rather than against a number copied out of the implementation —
+    // see the capacity note above for why the relation, not the value, is what
+    // has to hold.
+    [[nodiscard]] static std::size_t capacity() noexcept;
+
+    // How many entries are resident right now. Exported for the same reason:
+    // "the total scan fit" is a statement about residency, and a test that
+    // inferred it from a hit count could not tell "fit" from "was re-read".
+    [[nodiscard]] static std::size_t size();
 };
 
 // The typed facade. `SchemaT`'s own `typeid` name is the family key.

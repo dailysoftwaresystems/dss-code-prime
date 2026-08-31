@@ -2,6 +2,7 @@
 
 #include "core/substrate/checked_file_read.hpp"    // the ONE checked whole-file read
 #include "core/substrate/path_identity.hpp"        // genericSpelling / normalizeKeepingRoot — the lossless spellings
+#include "core/types/config_document_parse.hpp"   // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"   // the ONE closed-key check + the `$`-prose carve-out
 #include "core/types/config_path_walk.hpp"       // findShippedConfigDir — shared src/dss-config/<dir> resolver
 #include "core/types/data_model.hpp"             // dataModelFromName (signatureByDataModel keys)
@@ -26,6 +27,7 @@
 #include <cstdint>
 #include <deque>         // std::deque (Option C: address-stable typedef-name backing)
 #include <fstream>
+#include <iterator>   // istreambuf_iterator — the lenient scan's whole-file read
 #include <functional>    // std::function (forEachDescriptorInClosure callbacks)
 #include <initializer_list>
 #include <mutex>         // std::mutex/lock_guard (the corpus-index memo)
@@ -205,16 +207,21 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
         cache.erase(it);                  // the file changed ⇒ re-parse it
         ++cacheStats().staleEvictions;
     }
-    json doc;
     ++cacheStats().parses;
-    try {
-        doc = json::parse(*text);
-    } catch (json::parse_error const& e) {
+    // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`) —
+    // D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC. A
+    // descriptor whose `symbols` or whose per-symbol `signature` is declared
+    // twice used to inject the LAST spelling and discard the first, which for
+    // this family means the front end binds a DIFFERENT extern than the
+    // document appears to declare.
+    auto parsed = detail::parseConfigDocument(*text);
+    if (!parsed) {
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
-                + "': JSON parse error: " + e.what());
+                + "': " + parsed.error().detailTextWithLocus("JSON parse error: "));
         return nullptr;
     }
+    json doc = std::move(*parsed);
     if (!doc.is_object()) {
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
@@ -3816,12 +3823,21 @@ struct CorpusIndex {
             continue;
         std::ifstream in(entry.path(), std::ios::binary);
         if (!in) continue;  // lenient: unreadable descriptor skipped
-        json j;
-        try {
-            in >> j;
-        } catch (...) {
-            continue;
-        }
+        // THE ONE CONFIG PARSE, and the reason a LENIENT scanner routes through
+        // it too: `operator>>` into a `json` is `json::parse` under another
+        // spelling, so leaving this site alone would leave one of the three
+        // ways this repository ingests JSON outside the owner — and the guard
+        // that keeps the next reader honest would have a hole in exactly the
+        // shape that is hardest to grep for.
+        // ⚠ The lenient contract is UNCHANGED: a document this scan cannot use
+        // is skipped, and a duplicate key now joins malformed bytes in that
+        // set. It is not silence — the authoritative reader above REFUSES the
+        // same document by name the moment anything `#include`s it.
+        std::string const scanText{std::istreambuf_iterator<char>{in},
+                                   std::istreambuf_iterator<char>{}};
+        auto scanned = detail::parseConfigDocument(scanText);
+        if (!scanned) continue;
+        json j = std::move(*scanned);
         if (!j.is_object() || !j.contains("symbols")
             || !j.at("symbols").is_array()) {
             continue;

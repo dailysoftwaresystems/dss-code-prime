@@ -4024,13 +4024,7 @@
       }
     },
     {
-      "$comment": "Cross-class bit-pattern move (GPR↔FPR). AS1 emits x86_64 `movq` (the QWord variant). Cycle-3d Bitcast lowers via this opcode whenever src and dst register classes differ; same-class Bitcasts continue to use `mov` (handled by cycle 3c).",
-      "mnemonic": "movq_xclass", "result": "value",
-      "minOperands": 1, "maxOperands": 1,
-      "minSuccessors": 0, "maxSuccessors": 0
-    },
-    {
-      "$comment": "FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): xmm→r64 bit-copy — MOVQ r/m64, xmm = 66 REX.W 0F 7E /r (Intel SDM MOVQ, the store-to-GPR direction). The CALLER of a Win64 variadic function duplicates each FP vararg into its matching integer (home) register so the callee's va_arg(double) can read it from the home slot. A SEPARATE opcode from `movq_xclass`: the variant guard keys only on (operandKinds, width) and CANNOT disambiguate the two MOVQ directions (both are `reg`/width-64), and `movq_xclass` is consumed bidirectionally by Bitcast — overloading it would force a silent miscompile on the GPR→FPR Bitcast direction. ModR/M.reg = the xmm SOURCE (the wired source operand → modrm.reg), ModR/M.rm = the r64 DESTINATION (the result vreg → modrm.rm). Byte-pin: `movq rdx, xmm1` = 66 48 0F 7E CA (66 prefix; REX.W=0x48; 0F 7E; ModR/M mod=11 reg=xmm1=001 rm=rdx=010 → 0xCA).",
+      "$comment": "FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): xmm→GPR bit-copy — MOVQ r/m64, xmm = 66 REX.W 0F 7E /r and MOVD r/m32, xmm = 66 0F 7E /r (Intel SDM, the store-to-GPR direction). The CALLER of a Win64 variadic function duplicates each FP vararg into its matching integer (home) register so the callee's va_arg(double) can read it from the home slot. ★ D-TARGET-NO-CROSS-CLASS-MOVE-VERB: this opcode is ALSO the `fpr` -> `gpr` cell of `registerClassOps`, so a cross-class Bitcast and a `\"r\"`-bound floating inline-asm operand both lower through the bytes that already shipped here. It stays a SEPARATE opcode from its `movq_gpr_to_xmm` mirror: the variant guard keys only on (operandKinds, width) and CANNOT disambiguate the two directions (both are `reg` at the same width), so one opcode carrying both would silently pick a direction. ModR/M.reg = the xmm SOURCE (the wired source operand → modrm.reg), ModR/M.rm = the GPR DESTINATION (the result vreg → modrm.rm). ⚠ THE ONLY BYTE SEPARATING THE TWO WIDTHS IS REX.W, so a wrong-width row still assembles and still runs — both spellings are byte-pinned, ✔MEASURED 2026-08-31 under GNU as 2.42 AND clang, agreeing: `movq rdx, xmm1` = 66 48 0F 7E CA and `movd edx, xmm1` = 66 0F 7E CA (66 prefix; REX.W present only at 64; 0F 7E; ModR/M mod=11 reg=xmm1=001 rm=rdx=010 → 0xCA).",
       "mnemonic": "movq_xmm_to_gpr", "result": "value",
       "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
@@ -4044,12 +4038,19 @@
             "template":   { "mandatoryPrefix": [102], "rexW": true, "opcode": [15, 126] },
             "resultSlot": "modrm.rm",
             "wires":      [{ "index": 0, "slotKind": "modrm.reg", "regClass": "fpr" }]
+          },
+          {
+            "$comment": "MOVD r/m32, xmm — the 32-bit view. `movd %xmm1,%edx` = 66 0F 7E CA, ✔measured. Without it a `float` bound to an integer constraint would elect the 64-bit form and read eight bytes out of a four-byte value.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [102], "opcode": [15, 126] },
+            "resultSlot": "modrm.rm",
+            "wires":      [{ "index": 0, "slotKind": "modrm.reg", "regClass": "fpr" }]
           }
         ]
       }
     },
     {
-      "$comment": "D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE: r64→xmm bit-copy — MOVQ xmm, r/m64 = 66 REX.W 0F 6E /r (Intel SDM MOVQ, the load-from-GPR direction). The EXACT MIRROR of `movq_xmm_to_gpr` above and a SEPARATE opcode for the SAME reason that one is: the variant guard keys only on (operandKinds, width) and both directions are `reg`/width-64, so one opcode carrying both would silently pick a direction. Why it exists now: an FP constant in a lowering sequence travels as a GPR bit pattern (the encoding table cannot name a constant-pool entry), so the sequence needs a DECLARED way to put that pattern in an XMM. ⚠ NOT declared on `movq_xclass` — that opcode is consumed BIDIRECTIONALLY by Bitcast, and giving it these bytes would silently mis-encode the FPR→GPR direction (the trap `movq_xmm_to_gpr` was minted to avoid). ModR/M.reg = the xmm DESTINATION (resultSlot), ModR/M.rm = the r64 SOURCE. Byte-pin: `movq xmm1, rdx` = 66 48 0F 6E CA (66 prefix; REX.W=0x48; 0F 6E; ModR/M mod=11 reg=xmm1=001 rm=rdx=010 → 0xCA).",
+      "$comment": "D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE: GPR→xmm bit-copy — MOVQ xmm, r/m64 = 66 REX.W 0F 6E /r and MOVD xmm, r/m32 = 66 0F 6E /r (Intel SDM, the load-from-GPR direction). The EXACT MIRROR of `movq_xmm_to_gpr` above and a SEPARATE opcode for the SAME reason that one is: the variant guard keys only on (operandKinds, width) and both directions are `reg` at the same width, so one opcode carrying both would silently pick a direction. Why it exists: an FP constant in a lowering sequence travels as a GPR bit pattern (the encoding table cannot name a constant-pool entry), so the sequence needs a DECLARED way to put that pattern in an XMM. ★ D-TARGET-NO-CROSS-CLASS-MOVE-VERB: it is ALSO the `gpr` -> `fpr` cell of `registerClassOps`. ModR/M.reg = the xmm DESTINATION (resultSlot), ModR/M.rm = the GPR SOURCE. Byte-pins ✔MEASURED 2026-08-31 under GNU as 2.42 AND clang, agreeing: `movq xmm1, rdx` = 66 48 0F 6E CA and `movd xmm1, edx` = 66 0F 6E CA.",
       "mnemonic": "movq_gpr_to_xmm", "result": "value",
       "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
@@ -4061,6 +4062,13 @@
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [102], "rexW": true, "opcode": [15, 110] },
+            "resultRegClass": "fpr", "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "MOVD xmm, r/m32 — the 32-bit view. `movd %edx,%xmm1` = 66 0F 6E CA, ✔measured.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [102], "opcode": [15, 110] },
             "resultRegClass": "fpr", "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
@@ -4342,9 +4350,13 @@
     { "class": "gpr", "derivation": "operandType" },
     { "class": "fpr", "derivation": "operandType" }
   ],
-  "$registerClassOpsComment": "FC2 Part B: per-register-class move/load/store mnemonics. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (a GPR mov against an XMM hwEncoding assembles to valid-looking-but-WRONG bytes — the class-blind silent miscompile this table kills). fpr's `store` landed with its FIRST consumer (trigger discipline honored): the ms_x64 prologue saved-reg spill — Win64 callee-saved xmm6-15 + regalloc's callee-saved-first policy put the first FPR vreg in a callee-saved xmm, and classOpHandle failed loud L_RequiredLirOpcodeMissing until movsd_store was declared.",
-  "registerClassOps": [
-    { "class": "fpr", "move": "movaps", "load": "movsd_load", "store": "movsd_store" }
+  "$registerClassOpsComment": "FC2 Part B: per-register-class move/load/store mnemonics. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (a GPR mov against an XMM hwEncoding assembles to valid-looking-but-WRONG bytes — the class-blind silent miscompile this table kills). fpr's `store` landed with its FIRST consumer (trigger discipline honored): the ms_x64 prologue saved-reg spill — Win64 callee-saved xmm6-15 + regalloc's callee-saved-first policy put the first FPR vreg in a callee-saved xmm, and classOpHandle failed loud L_RequiredLirOpcodeMissing until movsd_store was declared. ★★ THE TWO PARAGRAPHS ABOVE AND BELOW WERE TWO SEPARATE `$registerClassOpsComment` KEYS IN THIS DOCUMENT UNTIL 2026-08-30 (cycle P46), AND JSON LET THAT PASS: every mainstream parser -- nlohmann, which is what DSS uses -- keeps the LAST occurrence and drops the first WITHOUT A DIAGNOSTIC. So the paragraph above this sentence was dead text the loader never saw, while being the one a reader meets first. Merged rather than deleted, because neither subsumes the other: the first says WHY this table exists and what a missing row costs, the second says what a ROW MEANS now that its subject is an ordered pair. D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC. D-TARGET-NO-CROSS-CLASS-MOVE-VERB: a row's subject is an ORDERED PAIR of register classes — `class` is the SOURCE and the optional `to` is the DESTINATION, `to` omitted meaning the DIAGONAL (a copy within one file), which is what every row written before this key existed meant. ★ ONE TABLE, not two: `move` answers the single question *how does this machine copy a bit pattern from class A to class B?* for every (A,B) including A == B. A separate cross-class list would have given that one question two homes and a reader would have found whichever their grep reached first. ⚠ `load`/`store` are DIAGONAL-ONLY and the loader refuses them off it: they relate a class to MEMORY, and memory is not a register class. ⚠ AND THE MOVE'S OWN ENCODING IS CHECKED AGAINST THE PAIR IT IS FILED UNDER — filing the integer `mov` as the gpr->fpr move would load clean and re-create D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND (a register NUMBER written into the wrong file, silently), so `validate()` refuses a move whose declared banks disagree with its row.",
+"registerClassOps": [
+    { "class": "fpr", "move": "movaps", "load": "movsd_load", "store": "movsd_store" },
+    { "$comment": "gpr -> fpr, the cross-FILE move. MOVQ/MOVD xmm, r/m — the SAME opcode the Win64 variadic caller and the FP-constant materialization already use, so this row mints no vocabulary; it fills the slot the table never had. Reachable from ordinary C as an inline-asm operand whose constraint class differs from its value's (`double y; __asm__(\"nop\" : \"+r\"(y));`, which gcc 13.3.0 -O2 compiles) and from a cross-class MIR Bitcast.",
+      "class": "gpr", "to": "fpr", "move": "movq_gpr_to_xmm" },
+    { "$comment": "fpr -> gpr, the mirror direction. A SEPARATE opcode from the row above and deliberately so: both directions are `reg` at the same width, so one opcode carrying both would silently pick a direction — the trap both opcode rows document in their own $comments.",
+      "class": "fpr", "to": "gpr", "move": "movq_xmm_to_gpr" }
   ],
   "$callingConventionsComment": "Per-platform x86_64 ABIs. ML7 callconv lowering selects one based on driver flag / function attribute. SysV AMD64 = Linux/macOS/BSD; ms_x64 = Windows. argGprs/argFprs ordering is significant (caller MUST place int args in those registers in that order, then spill to stack).",
   "callingConventions": [

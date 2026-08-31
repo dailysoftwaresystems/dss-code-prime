@@ -12,6 +12,7 @@
 #include "core/types/tree_node.hpp"
 #include "core/types/artifact_profile.hpp"     // kRegisteredArtifactProfiles / isRegisteredArtifactProfile (shared with the object-format loader, AP3)
 #include "core/types/attribute_naming.hpp"     // stripDunder — the ONE dunder normalizer, shared with the semantic attribute scans (TF-C73 drift cross-check)
+#include "core/types/config_document_parse.hpp" // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp" // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY (TF-C74: shared with the target loader)
 #include "core/types/config_path_walk.hpp"     // findShippedConfig — the ONE shipped-config discovery precedence, reused by `languageReferences` (plan 29)
 #include "core/types/data_model.hpp"           // dataModelFromName + kDataModelTable (FC3 c1 coreByDataModel keys)
@@ -3210,15 +3211,21 @@ void mergeLanguageReferences(
         // schema must know it.
         outDependencies.push_back(
             ConfigDocumentDependency{resolved->string(), crypto::sha256Hex(text)});
-        json refDoc;
-        try {
-            refDoc = json::parse(text);
-        } catch (json::parse_error const& e) {
-            coll.emit(DiagnosticCode::C_MalformedJson, docLabel,
-                      std::format("JSON parse error in referenced language "
-                                  "document: {}", e.what()));
+        // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`) —
+        // D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC. A
+        // REFERENCED document is a language document, so it gets the identical
+        // refusal: this loader already refuses to give a fragment a weaker typo
+        // discriminator than its host, and a duplicate key is the same class of
+        // question.
+        auto parsedRef = detail::parseConfigDocument(text);
+        if (!parsedRef) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      parsedRef.error().locus(docLabel),
+                      parsedRef.error().detailText(
+                          "JSON parse error in referenced language document: "));
             continue;
         }
+        json refDoc = std::move(*parsedRef);
         if (!refDoc.is_object()) {
             coll.emit(DiagnosticCode::C_MalformedJson, docLabel,
                       "top-level value of a referenced language document must "
@@ -4370,15 +4377,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     std::string_view sourceLabel) {
 
     Collector coll;
-    json doc;
-    try {
-        doc = json::parse(jsonText);
-    } catch (json::parse_error const& e) {
+    // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`) —
+    // D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC.
+    auto parsed = detail::parseConfigDocument(jsonText);
+    if (!parsed) {
         coll.emit(DiagnosticCode::C_MalformedJson,
-                  std::string{sourceLabel},
-                  std::format("JSON parse error: {}", e.what()));
+                  parsed.error().locus(sourceLabel),
+                  parsed.error().detailText("JSON parse error: "));
         return std::unexpected(std::move(coll).release());
     }
+    json doc = std::move(*parsed);
     if (!doc.is_object()) {
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   "top-level value must be a JSON object");

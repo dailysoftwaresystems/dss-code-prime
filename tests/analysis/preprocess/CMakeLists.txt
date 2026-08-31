@@ -93,3 +93,15 @@ dss_add_test(NAME analysis/preprocess/test_pragma_stdc_float_state
 target_include_directories(
     dss_analysis_preprocess_test_pragma_stdc_float_state
     PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# [[D-PP-SKIPPED-CONDITIONAL-GROUP-VALIDATED-AS-A-PHASE-7-NUMBER]]: the text of a
+# SKIPPED conditional group is divided into preprocessing tokens and NOT
+# otherwise processed (C 6.10.1p6), so no phase-7 conversion judgement applies to
+# it -- and the pp-number tail's exponent-letter set is the UNION of the decimal
+# and per-prefix declarations. A separate binary rather than more cases in
+# test_preprocessor.cpp because every arm here PAIRS an accept inside a skipped
+# group with the refusal that must still follow the same spelling when it is
+# live, and because two of them assert the diagnostic-tier classification
+# directly rather than through a preprocess run.
+dss_add_test(NAME analysis/preprocess/test_skipped_group_not_otherwise_processed
+             SOURCES test_skipped_group_not_otherwise_processed.cpp)

@@ -1494,30 +1494,107 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         }
     }
 
-    // ── registerClassOps (FC2 Part B) ───────────────────────────
-    // Every DECLARED per-class mnemonic must resolve to an opcode row
+    // ── registerClassOps (FC2 Part B, class×class per
+    //    D-TARGET-NO-CROSS-CLASS-MOVE-VERB) ───────────────────────
+    // Every DECLARED mnemonic must resolve to an opcode row
     // — a typo here would otherwise surface per-instruction at the
     // consumer (`regClassOpOpcode` returning nullopt looks identical
     // to "op not declared"); load-time is the one place the mistake
     // is distinguishable from trigger-disciplined omission.
-    for (std::size_t ci = 0; ci < registerClassOps.size(); ++ci) {
-        auto const& row = registerClassOps[ci];
+    for (std::size_t fi = 0; fi < registerClassOps.size(); ++fi) {
+    for (std::size_t ti = 0; ti < registerClassOps[fi].size(); ++ti) {
+        auto const& row = registerClassOps[fi][ti];
         if (!row.declared) continue;
-        auto const clsName =
-            targetRegClassName(static_cast<TargetRegClass>(ci));
-        auto checkOp = [&](char const* field, std::string const& name) {
-            if (name.empty()) return;  // omitted op — consumer fails loud
-            if (mnemonicIndex.find(name) == mnemonicIndex.end()) {
-                fail(std::format("/registerClassOps/{}/{}", clsName, field),
-                     std::format("registerClassOps class '{}': '{}' "
+        auto const fromCls = static_cast<TargetRegClass>(fi);
+        auto const toCls   = static_cast<TargetRegClass>(ti);
+        auto const fromName = targetRegClassName(fromCls);
+        auto const toName   = targetRegClassName(toCls);
+        // The JSON path names the PAIR on a cross-class row and the single
+        // class on a diagonal one, so a reader is pointed at the row they
+        // actually wrote rather than at a synthetic index.
+        auto const rowPath = fi == ti
+            ? std::string(fromName)
+            : std::format("{}->{}", fromName, toName);
+        auto const rowDesc = fi == ti
+            ? std::format("class '{}'", fromName)
+            : std::format("class pair '{}' -> '{}'", fromName, toName);
+        auto checkOp = [&](char const* field, std::string const& name)
+                -> std::optional<std::size_t> {
+            if (name.empty()) return std::nullopt;  // omitted — consumer fails loud
+            auto const it = mnemonicIndex.find(name);
+            if (it == mnemonicIndex.end()) {
+                fail(std::format("/registerClassOps/{}/{}", rowPath, field),
+                     std::format("registerClassOps {}: '{}' "
                                  "mnemonic '{}' does not resolve to any "
                                  "opcode row",
-                                 clsName, field, name));
+                                 rowDesc, field, name));
+                return std::nullopt;
             }
+            return it->second;
         };
-        checkOp("move",  row.move);
+        auto const moveIdx = checkOp("move",  row.move);
         checkOp("load",  row.load);
         checkOp("store", row.store);
+
+        // ★★★ THE MOVE'S OWN ENCODING MUST AGREE WITH THE PAIR IT IS FILED
+        // UNDER, AND THIS IS THE RULE THAT KEEPS THE CROSS-CLASS SLOT FROM
+        // RE-CREATING THE DEFECT IT CLOSES
+        // (D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND was a class-blind copy that
+        // wrote a register NUMBER into the wrong file, silently). Filing
+        // `mov` — the GPR move — under `{"class": "gpr", "to": "fpr"}` would
+        // load clean, resolve, and emit an integer move for a cross-FILE
+        // copy: the identical wrong answer, reached through the very table
+        // that exists to prevent it. So the opcode's declared banks are
+        // checked against the row's own claim, where the config is judged.
+        //
+        // ⚠ EVERY variant is checked, not the first: a target may key
+        // variants on width (arm64's FMOV Xd,Dn and FMOV Wd,Sn), and a single
+        // rogue variant is exactly the one that would encode a live
+        // instruction wrongly.
+        // ⓘ An opcode with NO encoding is not checked here and is not
+        // silent: `A_NoEncodingDeclared` refuses it at the first attempt to
+        // encode one.
+        if (moveIdx.has_value() && *moveIdx < opcodes.size()) {
+            auto const& mo = opcodes[*moveIdx];
+            for (std::size_t vi = 0; vi < mo.encoding.variants.size(); ++vi) {
+                auto const& v = mo.encoding.variants[vi];
+                auto const res = encodingResultRegClass(mo.encoding, v);
+                if (res.has_value() && *res != toCls) {
+                    fail(std::format("/registerClassOps/{}/move", rowPath),
+                         std::format(
+                             "registerClassOps {}: the declared move '{}' "
+                             "writes register bank '{}' in variant {}, not "
+                             "'{}' — a move filed under this pair must LAND "
+                             "in '{}', or the encoder writes the register "
+                             "number into the wrong file and the copy reads "
+                             "an unrelated register (a silent wrong answer, "
+                             "not a diagnostic)",
+                             rowDesc, row.move, targetRegClassName(*res), vi,
+                             toName, toName));
+                    break;
+                }
+                for (std::size_t wi = 0; wi < v.wires.size(); ++wi) {
+                    auto const& w = v.wires[wi];
+                    if (w.index >= v.operandKinds.size()) continue;
+                    if (v.operandKinds[w.index] != OperandKindFilter::Reg) continue;
+                    auto const src = encodingWireRegClass(mo.encoding, w);
+                    if (src.has_value() && *src != fromCls) {
+                        fail(std::format("/registerClassOps/{}/move", rowPath),
+                             std::format(
+                                 "registerClassOps {}: the declared move '{}' "
+                                 "reads register bank '{}' for operand {} in "
+                                 "variant {}, not '{}' — a move filed under "
+                                 "this pair must take its SOURCE from '{}', or "
+                                 "the encoder reads the register number out of "
+                                 "the wrong file",
+                                 rowDesc, row.move, targetRegClassName(*src),
+                                 w.index, vi, fromName, fromName));
+                        break;
+                    }
+                }
+            }
+        }
+    }
     }
 
     // ── Relocation taxonomy (AS1 §2.6) ──────────────────────────

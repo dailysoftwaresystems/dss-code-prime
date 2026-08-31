@@ -112,16 +112,54 @@ cmd_add() {  # <name> [committish]
 
 cmd_remove() {  # <name>
   name="${1:-}"; [ -n "$name" ] || _die 5 "usage: lane-worktree.sh remove <name>"
-  repo="$(_repo_root)"; rel=".worktrees/$name"
+  # ⚠⚠ THE SAME NAME VALIDATION `cmd_add` PERFORMS, AND IT MATTERS MORE HERE, because
+  # this verb now DELETES a directory tree. `cmd_add` refused a name with a slash or a
+  # leading dot and `cmd_remove` did not -- harmless while the only verb was
+  # `git worktree remove`, which simply declines an unknown path, and NOT harmless the
+  # moment an `rm -rf` stands behind it. `remove ../..` must never resolve anywhere.
+  case "$name" in
+    */*|.*) _die 5 "lane name must be a single path component and must not start with '.': '$name'" ;;
+  esac
+  repo="$(_repo_root)"; rel=".worktrees/$name"; abs="$repo/$rel"
   # --force because a lane worktree always carries an ignored build/ tree; without
   # it git refuses and the caller is tempted to `rm -rf`, which leaves the
   # registration behind in .git/worktrees/ where `git status` never shows it.
   git -C "$repo" worktree remove --force "$rel" 2>/dev/null \
     || _say "worktree remove declined for '$rel' (already gone?) -- pruning anyway"
   git -C "$repo" worktree prune
+  # ⚠⚠ THE GIT VERB CAN DECLINE AND LEAVE THE ENTIRE TREE ON DISK, AND THIS FUNCTION
+  # USED TO REPORT SUCCESS ANYWAY. ✔MEASURED 2026-08-31 (cycle P46): lane `cm` was
+  # folded mid-flight and its `.git` emptied, so `git worktree remove` could not see it
+  # and exited non-zero; control fell through to `prune` and printed
+  # "removed .worktrees/cm and pruned stale registrations" over **4.4 GB that was still
+  # there**. ★ An instrument reporting a pass over work it did not do is this project's
+  # worst class -- and the failure is invisible, because the caller's next `git worktree
+  # list` agrees the worktree is gone. ⇒ REMOVE, THEN VERIFY, THEN SPEAK.
+  if [ -e "$abs" ]; then
+    # Belt and braces over the name check: resolve both sides and require the target to
+    # sit STRICTLY inside the repository's .worktrees/. A symlink is the one way a
+    # single-component name could still land elsewhere.
+    real="$(cd "$abs" 2>/dev/null && pwd -P)" || real=""
+    container="$(cd "$repo/.worktrees" 2>/dev/null && pwd -P)" || container=""
+    if [ -z "$real" ] || [ -z "$container" ]; then
+      _die 2 "refusing to delete '$abs': could not resolve it or its container."
+    fi
+    case "$real" in
+      "$container"/?*) rm -rf "$abs" ;;
+      *) _die 2 "refusing to delete '$abs': it resolves to '$real', which is not" \
+                "strictly inside '$container'." ;;
+    esac
+  fi
+  if [ -e "$abs" ]; then
+    _die 6 "'$rel' is STILL ON DISK after worktree-remove, prune and rm -rf." \
+           "REFUSING to report success over work that did not happen." \
+           "A locked file is the likely cause -- a stalled ctest holding libdsscp.dll" \
+           "is this repository's known instance. Close it and re-run."
+  fi
+  git -C "$repo" worktree prune
   # Drop the container only when WE emptied it; never disturb a sibling lane's.
   rmdir "$repo/.worktrees" 2>/dev/null && _say "removed the now-empty .worktrees/"
-  _say "removed $rel and pruned stale registrations"
+  _say "removed $rel (VERIFIED absent) and pruned stale registrations"
 }
 
 cmd_list() {

@@ -204,8 +204,13 @@ enum class MnemonicSlot : std::uint8_t {
     // cycle 3d float arithmetic + casts
     FAdd, FSub, FMul, FDiv, FNeg,
     FpCvt, FpToSi, FpToUi, SiToFp, UiToFp,
-    // cycle 3d cross-class move (movq via FPR↔GPR Bitcast)
-    MovqXClass,
+    // ⓘ `MovqXClass` USED TO LIVE HERE and is DELETED, not deprecated
+    // (D-TARGET-NO-CROSS-CLASS-MOVE-VERB). A cross-class move is not a
+    // module-wide mnemonic SLOT — it is one cell of the `registerClassOps`
+    // class×class table, resolved by `classOp(from, to, RegClassOp::Move)`
+    // like every other register-data movement. The slot existed only because
+    // that table had no room for the off-diagonal, and it named an x86_64
+    // opcode that carried no `encoding` at all.
     // cycle 3e: Call + IntrinsicCall (GlobalAddr reuses Mov via SymbolRef)
     Call, IntrinsicCall,
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): indirect
@@ -520,7 +525,6 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::FpToUi,        "fp_to_ui"},
     {MnemonicSlot::SiToFp,        "si_to_fp"},
     {MnemonicSlot::UiToFp,        "ui_to_fp"},
-    {MnemonicSlot::MovqXClass,    "movq_xclass"},
     {MnemonicSlot::Call,           "call"},
     {MnemonicSlot::IntrinsicCall,  "intrinsic_call"},
     {MnemonicSlot::CallIndirectViaExtern, "call_indirect_via_extern"},
@@ -699,14 +703,19 @@ struct Lowerer {
     // gates the one-shot diagnostic.
     std::array<MnemonicCache, kMnemonicCount> cache_;
 
-    // FC2 Part B: per-(register-class, op) opcode handles resolved from
-    // the target's `registerClassOps[]` table (with the GPR universal
-    // defaults — see TargetSchema::regClassOpOpcode). `nullopt` = the
-    // class has no such operation; consumers fail loud at the use site
-    // (a class/op combination a module never emits must not fail the
-    // whole lowering at construction). Generalizes the lowerBitcast
-    // class-dispatch pattern to EVERY mov/load/store emission.
-    std::array<std::array<std::optional<std::uint16_t>, kRegClassOpCount>, 5>
+    // FC2 Part B, class×class per D-TARGET-NO-CROSS-CLASS-MOVE-VERB:
+    // per-(fromClass, toClass, op) opcode handles resolved from the target's
+    // `registerClassOps[]` table (with the GPR→GPR universal defaults — see
+    // TargetSchema::regClassOpOpcode). `nullopt` = the pair has no such
+    // operation; consumers fail loud at the use site (a pair/op combination a
+    // module never emits must not fail the whole lowering at construction).
+    // The DIAGONAL is the within-a-file copy; an OFF-DIAGONAL cell is the
+    // cross-FILE move, which is why `lowerBitcast` and `emitAsmOperandMove`
+    // no longer branch on whether the two classes agree.
+    std::array<std::array<std::array<std::optional<std::uint16_t>,
+                                     kRegClassOpCount>,
+                          kTargetRegClassCount>,
+               kTargetRegClassCount>
         classOpCache_{};
 
     // Per-function state. Cleared at the top of `lowerFunction`.
@@ -1157,14 +1166,17 @@ struct Lowerer {
             cache_[i].id       = target.opcodeByMnemonic(r.mnemonic);
         }
 
-        // FC2 Part B: resolve the per-class move/load/store handles
+        // FC2 Part B: resolve the per-class-PAIR move/load/store handles
         // once (mirrors the mnemonic cache). Unresolvable cells stay
         // nullopt — diagnosed at the emitting site, not here.
-        for (std::size_t c = 0; c < classOpCache_.size(); ++c) {
-            for (std::size_t o = 0; o < kRegClassOpCount; ++o) {
-                classOpCache_[c][o] = target.regClassOpOpcode(
-                    static_cast<TargetRegClass>(c),
-                    static_cast<RegClassOp>(o));
+        for (std::size_t f = 0; f < classOpCache_.size(); ++f) {
+            for (std::size_t t = 0; t < classOpCache_[f].size(); ++t) {
+                for (std::size_t o = 0; o < kRegClassOpCount; ++o) {
+                    classOpCache_[f][t][o] = target.regClassOpOpcode(
+                        static_cast<TargetRegClass>(f),
+                        static_cast<TargetRegClass>(t),
+                        static_cast<RegClassOp>(o));
+                }
             }
         }
 
@@ -1347,33 +1359,73 @@ struct Lowerer {
     // shared sign matcher. The lowering is target-blind; the config picks the
     // encoding. See lowerGep's const-disp arm.)
 
-    // FC2 Part B: the opcode that performs `op` on a value of register
-    // class `cls` (the registerClassOps resolution). GPR resolves to
-    // the universal mov/load/store; a class with no declared operation
-    // returns nullopt — callers MUST route through
-    // `reportMissingClassOp` rather than falling back to the GPR
-    // handle (the silent class-blind miscompile this table kills).
+    // FC2 Part B, class×class per D-TARGET-NO-CROSS-CLASS-MOVE-VERB: the
+    // opcode that performs `op` moving a value OUT OF class `from` INTO class
+    // `to` (the registerClassOps resolution). GPR→GPR resolves to the
+    // universal mov/load/store; a pair with no declared operation returns
+    // nullopt — callers MUST route through `reportMissingClassOp` rather than
+    // falling back to either class's own handle (the silent class-blind
+    // miscompile this table kills).
     [[nodiscard]] std::optional<std::uint16_t>
-    classOp(LirRegClass cls, RegClassOp op) const {
-        auto const c = static_cast<std::size_t>(cls);
-        if (c >= classOpCache_.size()) return std::nullopt;
-        return classOpCache_[c][static_cast<std::size_t>(op)];
+    classOp(LirRegClass from, LirRegClass to, RegClassOp op) const {
+        auto const f = static_cast<std::size_t>(from);
+        auto const t = static_cast<std::size_t>(to);
+        if (f >= classOpCache_.size())    return std::nullopt;
+        if (t >= classOpCache_[f].size()) return std::nullopt;
+        return classOpCache_[f][t][static_cast<std::size_t>(op)];
     }
 
-    void reportMissingClassOp(LirRegClass cls, RegClassOp op,
+    // The DIAGONAL query, spelled once — a copy WITHIN one class, which is
+    // what every spill, phi copy and value plumb asks for.
+    [[nodiscard]] std::optional<std::uint16_t>
+    classOp(LirRegClass cls, RegClassOp op) const {
+        return classOp(cls, cls, op);
+    }
+
+    void reportMissingClassOp(LirRegClass from, LirRegClass to, RegClassOp op,
                               std::string_view context) {
+        auto const fromName =
+            targetRegClassName(static_cast<TargetRegClass>(from));
+        auto const toName =
+            targetRegClassName(static_cast<TargetRegClass>(to));
+        // ⚠ THE CROSS-FILE SENTENCE IS A DIFFERENT SENTENCE, because the fix
+        // is different: a missing DIAGONAL move is a class whose vocabulary
+        // the target never declared; a missing OFF-DIAGONAL move is a machine
+        // operation (arm64 `fmov x0, d0`, x86_64 `movq %xmm0, %rax`) whose
+        // row simply is not in the table. Both are `registerClassOps` edits,
+        // and telling the author WHICH one saves them re-deriving it.
         dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
             DiagnosticSeverity::Error,
-            std::format(
-                "target '{}' declares no '{}' operation for register "
-                "class '{}' (required for lowering {}) — declare it in "
-                "the target's `registerClassOps[]` (the universal "
-                "mov/load/store bindings cover only the GPR class); "
-                "falling back to the GPR instruction forms would "
-                "silently mis-encode",
-                target.name(), regClassOpName(op),
-                targetRegClassName(static_cast<TargetRegClass>(cls)),
-                context));
+            from == to
+                ? std::format(
+                    "target '{}' declares no '{}' operation for register "
+                    "class '{}' (required for lowering {}) — declare it in "
+                    "the target's `registerClassOps[]` (the universal "
+                    "mov/load/store bindings cover only the GPR class); "
+                    "falling back to the GPR instruction forms would "
+                    "silently mis-encode",
+                    target.name(), regClassOpName(op), fromName, context)
+                : std::format(
+                    "target '{}' declares no move from register class '{}' "
+                    "to register class '{}' (required for lowering {}). "
+                    "Moving between two register FILES is a distinct machine "
+                    "operation from a copy within one (arm64 spells it "
+                    "`fmov x0, d0`, x86_64 `movq %xmm0, %rax`) — declare it "
+                    "in the target's `registerClassOps[]` as a row with "
+                    "`\"class\": \"{}\"` and `\"to\": \"{}\"`. Emitting "
+                    "either class's own move instead would encode the "
+                    "register NUMBER in the wrong file and read an unrelated "
+                    "register, which is a silent wrong answer rather than a "
+                    "diagnostic",
+                    target.name(), fromName, toName, context,
+                    fromName, toName));
+    }
+
+    // The diagonal-only spelling, kept so the ~20 same-class call sites read
+    // as the one-class question they are asking.
+    void reportMissingClassOp(LirRegClass cls, RegClassOp op,
+                              std::string_view context) {
+        reportMissingClassOp(cls, cls, op, context);
     }
 
     // ── D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND ───────────────────────────────
@@ -1385,43 +1437,71 @@ struct Lowerer {
     // module-wide `MnemonicSlot::Mov` per BLOCK and using it for every operand
     // whatever class it bound. See the call site in `expandInlineAsm` for the
     // two measured disassemblies.
+    // ★★★ D-TARGET-NO-CROSS-CLASS-MOVE-VERB: THE CLASS COMPARISON IS GONE.
+    // `registerClassOps` is now keyed by the class PAIR, so "copy this bit
+    // pattern from the value's file into the constraint's file" is ONE lookup
+    // whether or not the two files are the same one. A target that declares
+    // the cross-FILE row gets the machine's own instruction (arm64
+    // `fmov x0, d0`, x86_64 `movq %xmm0, %rax`); one that does not is refused
+    // by the same `reportMissingClassOp` that names a missing diagonal move.
+    // The special case that used to sit here WAS the missing slot.
     [[nodiscard]] std::optional<LirInstId>
     emitAsmOperandMove(MirInstId at, LirReg dest, LirReg src,
                        std::string_view role, std::size_t gnuIndex,
-                       std::string_view constraint) {
-        // ⚠ A CROSS-FILE MOVE IS A DIFFERENT MACHINE OPERATION FROM A COPY
-        // WITHIN A FILE, and `registerClassOps` binds one move PER class. There
-        // is no slot to ask, so this refuses rather than picking one of the two
-        // classes and encoding the register NUMBER into the wrong file.
-        if (dest.regClass() != src.regClass()) {
-            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
-                DiagnosticSeverity::Error,
-                std::format(
-                    "inline asm (MIR inst {}): {} {} (constraint \"{}\") binds "
-                    "register class '{}', but the value it carries lives in "
-                    "class '{}'. Moving between two register FILES is a "
-                    "distinct machine operation from a copy within one (arm64 "
-                    "spells it `fmov x0, d0`, x86_64 `movq %xmm0, %rax`), and "
-                    "no target declares it — `registerClassOps` binds one move "
-                    "PER class. Emitting that class's move would encode the "
-                    "register NUMBER in the wrong file and read an unrelated "
-                    "register, which is a silent wrong answer rather than a "
-                    "diagnostic. Bind this operand with a constraint whose "
-                    "class matches the value, or route the value through "
-                    "memory (D-TARGET-NO-CROSS-CLASS-MOVE-VERB)",
-                    at.v, role, gnuIndex, constraint,
-                    lirRegClassName(dest.regClass()),
-                    lirRegClassName(src.regClass())));
-            return std::nullopt;
-        }
-        auto const op = classOp(dest.regClass(), RegClassOp::Move);
+                       std::string_view constraint,
+                       std::uint32_t widthBits) {
+        auto const op = classOp(src.regClass(), dest.regClass(),
+                                RegClassOp::Move);
         if (!op.has_value()) {
-            reportMissingClassOp(dest.regClass(), RegClassOp::Move,
-                                 "inline asm operand materialisation");
+            // The operand's own coordinates go in the context so the refusal
+            // still locates the `%N` a programmer wrote, which is the half of
+            // the old message that was about THIS site rather than about the
+            // table.
+            reportMissingClassOp(
+                src.regClass(), dest.regClass(), RegClassOp::Move,
+                std::format("inline asm (MIR inst {}) {} {} (constraint "
+                            "\"{}\") — bind this operand with a constraint "
+                            "whose class matches the value, or declare the "
+                            "cross-class row",
+                            at.v, role, gnuIndex, constraint));
             return std::nullopt;
         }
+        // ⚠ THE WIDTH IS LOAD-BEARING ON A CROSS-FILE MOVE AND WAS NOT NEEDED
+        // BEFORE. A within-a-file copy is width-agnostic on both shipped
+        // targets (x86_64 `movaps` copies the whole XMM, arm64 `fmov d,d`
+        // copies the D view), but the cross-file instruction is width-KEYED —
+        // arm64 elects FMOV Xd,Dn at 64 and FMOV Wd,Sn at 32, and the two
+        // read different numbers of bytes out of the source file. Emitting the
+        // 64-bit form for a 32-bit operand is the wrong-bytes answer this row
+        // exists to stop, so the operand's own declared width is threaded here
+        // rather than left at the width-default.
         std::array<LirOperand, 1> const pin{LirOperand::makeReg(src)};
-        return emitInst(*op, dest, pin);
+        return emitInst(*op, dest, pin, /*payload=*/0,
+                        lirWidthFlagsForBits(widthBits));
+    }
+
+    // Project an operand's declared width in BITS onto the LIR instruction
+    // width flags of a register-to-register COPY (`lirInstWidthBits` is the
+    // inverse). 64 is the width-default and carries no flag; an unmodelled
+    // width also falls to the default, where the encoding-variant election
+    // refuses it by name rather than silently electing a neighbour.
+    //
+    // ⚠ SUB-32 PROMOTES TO 32, THE SAME RULE `registerOpWidthFlags` APPLIES
+    // to every other register plumb: a sub-32-bit register WRITE is a
+    // partial-register hazard, and neither shipped target declares a
+    // byte/half-word register-to-register move at all — asking for one would
+    // turn a `"r"`-bound `char` operand from a working 32-bit copy into
+    // `A_NoMatchingEncodingVariant`. The narrowing realizes at the
+    // width-exact CONSUMER, never in the plumbing.
+    [[nodiscard]] static constexpr std::uint8_t
+    lirWidthFlagsForBits(std::uint32_t bits) noexcept {
+        switch (bits) {
+            case 8:
+            case 16:
+            case 32:  return kLirInstFlagWidth32;
+            case 128: return kLirInstFlagWidth128;
+            default:  return 0;
+        }
     }
 
     // Map a MIR `TypeId` to the LIR register class that holds its
@@ -2837,6 +2917,16 @@ struct Lowerer {
         std::uint16_t ordinal = 0;     // meaningful iff `pinned`
         std::string   name;            // canonical parent name iff `pinned`
         std::uint32_t widthBits = 64;
+        // ★★★ THE CLASS THE **VALUE** LIVES IN, WHICH IS NOT ALWAYS `cls`
+        // (D-TARGET-NO-CROSS-CLASS-MOVE-VERB). `cls` is the CONSTRAINT's class
+        // — the register file the template's `%N` denotes — and GNU inline asm
+        // lets the two disagree routinely: the class is the constraint's, never
+        // the type's, so `"r"` with a `double` and `"x"` with an `int` are both
+        // legal. An OUTPUT whose value class differs must be moved back out of
+        // the constraint's file into its own before it becomes the MIR value,
+        // or the LIR verifier meets an `fpr`-typed MIR value living in a `gpr`
+        // register — which is the loud half of the same fact.
+        LirRegClass   valueCls = LirRegClass::None;
         // ★★★ EVERY spelling the template may write for this operand, CARRIED
         // from the descriptor — the positional form and, when the source named
         // the operand, the symbolic one. One binding row is emitted per entry,
@@ -2928,6 +3018,10 @@ struct Lowerer {
                    AsmBound& out) {
         out.spellings  = o.spellings;
         out.widthBits  = asmWidthBitsForType(valueType);
+        // The VALUE's own class, recorded once here beside its width and from
+        // the same `valueType`. Every arm below sets `cls` from the CONSTRAINT;
+        // this is the other half of the pair the cross-class move needs.
+        out.valueCls   = regClassForType(valueType);
         out.constraint = o.constraint;
         // ⚠ `"+r"` IS BOUND LIKE ANY OTHER OPERAND **HERE**, AND TIED IN
         // `tieAsmReadWriteOperands` (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE). This
@@ -3139,6 +3233,22 @@ struct Lowerer {
         out.ordinal = ord;
         out.name    = std::move(name);
         return true;
+    }
+
+    // ★★★ WHEN AN OUTPUT MUST BE COPIED OUT OF THE REGISTER THE TEMPLATE WROTE.
+    // TWO independent reasons, and stating them once keeps the in-block loop and
+    // the `asm goto` edge loop from drifting apart:
+    //   * PINNED — the value sits in a PHYSICAL register the block also
+    //     clobbers, so it has to be read out before anything else can take it;
+    //   * a CLASS CHANGE — the constraint's file is not the value's file
+    //     (`"r"` with a `double`), so the bit pattern has to physically move
+    //     between register FILES before it can be the MIR value
+    //     (D-TARGET-NO-CROSS-CLASS-MOVE-VERB).
+    // An unpinned output whose classes AGREE still needs no copy: the template
+    // wrote the operand's own vreg, which IS the `%N` binding, and a copy of a
+    // register into a fresh one of the same class would be dead.
+    [[nodiscard]] static bool asmOutputNeedsCapture(AsmBound const& b) noexcept {
+        return b.pinned || b.cls != b.valueCls;
     }
 
     // ★★★ `"+r"` — THE TIE IS A **LOCATION IDENTITY**, AND THIS IS WHERE IT IS
@@ -3692,9 +3802,10 @@ struct Lowerer {
         // meantime: the alternative measured above is a wrong register, quietly.
         auto emitOperandMove =
             [this, id](LirReg dest, LirReg src, std::string_view role,
-                       std::size_t gnuIndex,
-                       std::string_view constraint) -> std::optional<LirInstId> {
-            return emitAsmOperandMove(id, dest, src, role, gnuIndex, constraint);
+                       std::size_t gnuIndex, std::string_view constraint,
+                       std::uint32_t widthBits) -> std::optional<LirInstId> {
+            return emitAsmOperandMove(id, dest, src, role, gnuIndex, constraint,
+                                      widthBits);
         };
 
         // ── 3. parse the template on the RIGHT SURFACE ──
@@ -3776,7 +3887,8 @@ struct Lowerer {
             // Same early-out shape as the `regForValue` line above: this runs
             // BEFORE any capture block is opened, so there is none to seal.
             if (!emitOperandMove(ins[j].reg, *src, "input", j,
-                                 ins[j].constraint).has_value()) {
+                                 ins[j].constraint,
+                                 ins[j].widthBits).has_value()) {
                 return false;
             }
         }
@@ -3932,14 +4044,17 @@ struct Lowerer {
         // placement differs, the capture does not.
         if (!isGoto) {
             for (std::size_t k = 0; k < outs.size(); ++k) {
-                if (!outs[k].pinned) continue;
-                LirReg const dest = lir.newVReg(outs[k].cls);
-                // Same class on both sides by construction (`bindAsmOperand`
-                // takes `out.cls` from the pinned register itself), so this
-                // copy can only ever fail on a target that declares no `move`
-                // for that class — which `emitOperandMove` names.
+                if (!asmOutputNeedsCapture(outs[k])) continue;
+                LirReg const dest = lir.newVReg(outs[k].valueCls);
+                // The destination is the VALUE's class, not the constraint's
+                // (D-TARGET-NO-CROSS-CLASS-MOVE-VERB). When the two agree this
+                // is the readout it always was and can only fail on a target
+                // declaring no `move` for that class; when they differ it is
+                // the cross-FILE move that carries the value home. Either way
+                // `emitOperandMove` names the pair it could not resolve.
                 if (!emitOperandMove(dest, outs[k].reg, "output", k,
-                                     outs[k].constraint).has_value()) {
+                                     outs[k].constraint,
+                                     outs[k].widthBits).has_value()) {
                     sealOrphanedAsmCaptureBlocks(captureBlocks);
                     return false;
                 }
@@ -4134,16 +4249,19 @@ struct Lowerer {
             reportMissingOpcode(MnemonicSlot::Jmp, "MIR InlineAsmGoto edge");
             return false;
         }
-        // One destination vreg per pinned output, minted ONCE and written at the
-        // head of every edge. The MIR reads the piece in ONE place (the landing
-        // block's `ReturnPiece`), so the paths must agree on the register; the
-        // several defs sit on mutually exclusive paths, which is the shape a
-        // linear scan over live ranges already handles (`firstDef` takes the
-        // minimum — the same widening a `"+r"` operand's two defs produce).
+        // One destination vreg per captured output, minted ONCE and written at
+        // the head of every edge. The MIR reads the piece in ONE place (the
+        // landing block's `ReturnPiece`), so the paths must agree on the
+        // register; the several defs sit on mutually exclusive paths, which is
+        // the shape a linear scan over live ranges already handles (`firstDef`
+        // takes the minimum — the same widening a `"+r"` operand's two defs
+        // produce). The class is the VALUE's and the capture predicate is
+        // `asmOutputNeedsCapture`, both shared with the in-block loop so the
+        // edge placement is the only thing that differs.
         std::vector<LirReg> captureDest(outs.size(), InvalidLirReg);
         for (std::size_t k = 0; k < outs.size(); ++k) {
-            if (!outs[k].pinned) continue;
-            captureDest[k] = lir.newVReg(outs[k].cls);
+            if (!asmOutputNeedsCapture(outs[k])) continue;
+            captureDest[k] = lir.newVReg(outs[k].valueCls);
         }
         // D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND: the edge captures are the SAME
         // copy the in-block capture loop emits, so they go through the SAME
@@ -4154,10 +4272,11 @@ struct Lowerer {
         bool captureOk = true;
         auto emitCaptures = [&] {
             for (std::size_t k = 0; k < outs.size(); ++k) {
-                if (!outs[k].pinned) continue;
+                if (!asmOutputNeedsCapture(outs[k])) continue;
                 auto const li = emitAsmOperandMove(at, captureDest[k],
                                                    outs[k].reg, "output", k,
-                                                   outs[k].constraint);
+                                                   outs[k].constraint,
+                                                   outs[k].widthBits);
                 if (!li.has_value()) { captureOk = false; return; }
                 if (constraintHandle.has_value()) {
                     lir.setInstRegConstraints(*li, *constraintHandle);
@@ -4178,9 +4297,11 @@ struct Lowerer {
             if (!captureOk) return false;
             emitBr(*jmpOp, lirSucc(succs[j]));
         }
-        // The VALUE now lives in the vreg rather than in the pin, on every path.
+        // The VALUE now lives in the vreg rather than in the register the
+        // template wrote, on every path — the pin for a pinned output, the
+        // constraint's file for a cross-class one.
         for (std::size_t k = 0; k < outs.size(); ++k) {
-            if (outs[k].pinned) outs[k].reg = captureDest[k];
+            if (asmOutputNeedsCapture(outs[k])) outs[k].reg = captureDest[k];
         }
         return true;
     }
@@ -6105,12 +6226,18 @@ struct Lowerer {
     }
 
     // Bitcast lowering — closes the cycle-3c-anchored hazard 3 review
-    // agents flagged. If src + dst share a register class (GPR↔GPR or
-    // FPR↔FPR), emit a plain `mov` (bit-pattern-preserving). If they
-    // differ, emit `movq_xclass` (cycle-3d cross-class move that AS1
-    // maps to x86_64 `movq xmm,rax` or `movq rax,xmm`). A regression
-    // omitting the cross-class case would silently mis-lower float
-    // reinterpretation.
+    // agents flagged. A bit-pattern-preserving copy from the SOURCE value's
+    // register class into the RESULT's.
+    //
+    // ★★★ ONE LOOKUP, NO CLASS COMPARISON (D-TARGET-NO-CROSS-CLASS-MOVE-VERB).
+    // This function used to fork: same class → the per-class move table,
+    // different classes → a dedicated `MnemonicSlot::MovqXClass`. Its own
+    // comment said the same-class arm "WAS the class-dispatch pattern the
+    // table generalizes" — and the cross-class arm was the half that never
+    // got the table. `registerClassOps` is now keyed by the class PAIR, so
+    // the diagonal and the off-diagonal are the same question with different
+    // arguments, and the fork is gone along with the placeholder slot it
+    // needed. A target that declares no move for the pair is refused by name.
     void lowerBitcast(MirInstId id) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 1) {
@@ -6121,31 +6248,22 @@ struct Lowerer {
         if (!src.has_value()) return;
         LirRegClass const srcCls = src->regClass();
         LirRegClass const dstCls = regClassFor(id);
-        // FC2 Part B: the same-class arm now routes through the
-        // per-register-class move table (this function WAS the
-        // class-dispatch pattern the table generalizes) — an FPR↔FPR
-        // bitcast copies via the class's move (x86_64 movaps), never
-        // the GPR mov. Cross-class keeps the dedicated movq_xclass.
-        std::optional<std::uint16_t> copyOp;
-        if (srcCls == dstCls) {
-            copyOp = classOp(dstCls, RegClassOp::Move);
-            if (!copyOp.has_value()) {
-                reportMissingClassOp(dstCls, RegClassOp::Move,
-                                     "MIR Bitcast (same-class)");
-                poisonValue(id);
-                return;
-            }
-        } else {
-            if (!opcode(MnemonicSlot::MovqXClass).has_value()) {
-                reportMissingOpcode(MnemonicSlot::MovqXClass,
-                                    "MIR Bitcast (cross-class)");
-                return;
-            }
-            copyOp = opcode(MnemonicSlot::MovqXClass);
+        auto const copyOp = classOp(srcCls, dstCls, RegClassOp::Move);
+        if (!copyOp.has_value()) {
+            reportMissingClassOp(srcCls, dstCls, RegClassOp::Move,
+                                 "MIR Bitcast");
+            poisonValue(id);
+            return;
         }
         LirReg const result = lir.newVReg(dstCls);
         std::array<LirOperand, 1> ops{LirOperand::makeReg(*src)};
-        emitInst(*copyOp, result, ops);
+        // The cross-FILE move is width-KEYED on arm64 (FMOV Xd,Dn at 64,
+        // FMOV Wd,Sn at 32) and on x86_64 (MOVQ at 64, MOVD at 32), so the
+        // value's own plumbing width decides the variant. The diagonal moves
+        // both shipped targets declare carry no width guard, so this is a
+        // no-op there — one call, correct on both.
+        emitInst(*copyOp, result, ops, /*payload=*/0,
+                 registerOpWidthFlags(mir.instType(id)));
         defineValue(id, result);
     }
 

@@ -1,6 +1,7 @@
 #include "core/types/predefined_macro_json.hpp"
 
 #include "core/substrate/path_identity.hpp"     // genericSpelling
+#include "core/types/config_document_parse.hpp" // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp" // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY — the SHARED closed-key substrate
 #include "core/types/object_format_kind.hpp"
 
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>   // istreambuf_iterator — the lenient scan's whole-file read
 #include <map>
 #include <span>
 #include <string>
@@ -131,12 +133,20 @@ predefinedMacroDocumentDisagreements(std::string_view configRootDir) {
     for (fs::path const& f : files) {
         std::ifstream in(f, std::ios::binary);
         if (!in) continue;
-        json doc;
-        try {
-            in >> doc;
-        } catch (...) {
-            continue;   // the schema loaders own malformed JSON
-        }
+        // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`).
+        // `operator>>` into a `json` is `json::parse` under another spelling —
+        // one of the THREE ways this repository ingests JSON, and the one a
+        // `json::parse` grep cannot see. Routed so the owner has no hole.
+        // ⚠ The lenient contract is UNCHANGED and its reason is unchanged: the
+        // schema loaders own a document's health, and this walk reads
+        // documents it has no intention of loading. A duplicate key now joins
+        // malformed bytes in the skipped set; the loader that actually loads
+        // that document REFUSES it by name.
+        std::string const text{std::istreambuf_iterator<char>{in},
+                               std::istreambuf_iterator<char>{}};
+        auto parsed = detail::parseConfigDocument(text);
+        if (!parsed) continue;   // the schema loaders own malformed JSON
+        json const doc = std::move(*parsed);
         if (!doc.is_object()) continue;
         json const* arr = nullptr;
         if (auto const pp = doc.find("preprocess");

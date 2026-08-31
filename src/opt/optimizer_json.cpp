@@ -2,6 +2,7 @@
 
 #include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/diagnostic_collector.hpp"
+#include "core/types/config_document_parse.hpp"  // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"  // the ONE closed-key check + the `$` carve-out
 #include "core/types/config_path_walk.hpp"
 
@@ -499,14 +500,19 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
 LoadResult<OptPipeline>
 loadPipelineFromText(std::string_view jsonText, std::string_view sourceLabel) {
     substrate::DiagnosticCollector coll;
-    json doc;
-    try {
-        doc = json::parse(jsonText);
-    } catch (json::parse_error const& e) {
-        coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
-                  std::format("JSON parse error: {}", e.what()));
+    // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`) —
+    // D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC. A
+    // `.pipeline.json` declaring `schedule` or `inlineThreshold` twice used to
+    // run the LAST one silently, which is a different optimizer over the same
+    // source.
+    auto parsed = detail::parseConfigDocument(jsonText);
+    if (!parsed) {
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  parsed.error().locus(sourceLabel),
+                  parsed.error().detailText("JSON parse error: "));
         return std::unexpected(std::move(coll).release());
     }
+    json doc = std::move(*parsed);
     return parsePipelineDoc(doc, sourceLabel);
 }
 

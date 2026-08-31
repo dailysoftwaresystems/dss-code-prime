@@ -7,6 +7,7 @@
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table_json.hpp"
 #include "core/types/artifact_profile.hpp"  // isRegisteredArtifactProfile / registeredArtifactProfileList (AP3, shared w/ grammar loader)
+#include "core/types/config_document_parse.hpp"  // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY (TF-C74 extraction)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/predefined_macro_json.hpp"  // detail::parsePredefinedMacroArray (TF-C97 — the SHARED predefine grammar, 3rd family)
@@ -238,14 +239,20 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     std::string digest = crypto::sha256Hex(jsonText);
 
     Collector coll;
-    json doc;
-    try {
-        doc = json::parse(jsonText);
-    } catch (json::parse_error const& e) {
-        coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
-                  std::format("JSON parse error: {}", e.what()));
+    // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`) —
+    // D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC. This
+    // family is the one where a silently-dropped declaration bites hardest:
+    // `dataModel`, `bitFieldStrategy`, `longDoubleFormat`, `externCallDispatch`
+    // and `tlsAccess` all carry silent-miscompile semantics, and a second
+    // declaration of any of them used to win without a word.
+    auto parsed = detail::parseConfigDocument(jsonText);
+    if (!parsed) {
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  parsed.error().locus(sourceLabel),
+                  parsed.error().detailText("JSON parse error: "));
         return std::unexpected(std::move(coll).release());
     }
+    json doc = std::move(*parsed);
     if (!doc.is_object()) {
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   "top-level value must be a JSON object");

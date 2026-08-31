@@ -299,6 +299,13 @@ inline constexpr EnumNameTable<TargetRegClass, 5> kTargetRegClassTable{{{
 // would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
 DSS_CHECK_ENUM_NAME_TABLE(kTargetRegClassTable);
 
+// The number of register classes, DERIVED from the table rather than restated
+// beside it — the `registerClassOps` matrix below is indexed by a PAIR of these
+// ordinals, so an added class must grow that storage, and a second owner for
+// this count is exactly how the two would drift apart.
+inline constexpr std::size_t kTargetRegClassCount =
+    kTargetRegClassTable.rows.size();
+
 [[nodiscard]] constexpr std::string_view targetRegClassName(TargetRegClass c) noexcept {
     return kTargetRegClassTable.name(c);
 }
@@ -437,13 +444,30 @@ inline constexpr std::size_t kRegClassOpCount = 3;
     return "?";
 }
 
-// One register class's declared operation mnemonics (the JSON
-// `registerClassOps[]` row). An EMPTY string means "not declared" —
-// an op consulted on a declared row with an empty slot fails loud at
-// the consumer (e.g. x86_64's fpr declares move+load but NO store
+// One `registerClassOps[]` row's declared operation mnemonics. An EMPTY string
+// means "not declared" — an op consulted on a declared row with an empty slot
+// fails loud at the consumer (e.g. x86_64's fpr declares move+load but NO store
 // until a real FPR-store consumer exists — trigger discipline; a
 // silent fallback to the GPR "store" would 8-byte-GPR-write an XMM
 // ordinal).
+//
+// ★★★ A ROW'S SUBJECT IS AN ORDERED **PAIR** OF CLASSES, AND THE SAME-CLASS ROW
+// IS THE DIAGONAL OF THAT PAIR (D-TARGET-NO-CROSS-CLASS-MOVE-VERB). The JSON
+// row's `class` names the SOURCE class and its optional `to` names the
+// DESTINATION; `to` omitted means `to == class`, which is what every row that
+// predates the generalization meant. So `move` answers ONE question —
+// *"how does this machine copy a bit pattern from class A to class B?"* — for
+// every (A,B) including A == B, and it answers it in ONE table.
+//
+// ⚠ WHY ONE TABLE AND NOT TWO, which is the whole ruling: a separate
+// `crossClassMoves` list would give that one question two homes, and a reader
+// asking it would find whichever home their grep reached first. The diagonal
+// and the off-diagonal are the same question about different arguments.
+//
+// ⚠ `load` / `store` ARE DIAGONAL-ONLY, and the loader refuses them off it.
+// They relate a register class to MEMORY, which is not a register class: there
+// is no "load from gpr into fpr". A row with `to != class` may declare `move`
+// and nothing else.
 struct DSS_EXPORT TargetRegisterClassOps {
     bool        declared = false;  // a JSON row exists for this class
     std::string move;
@@ -3764,17 +3788,25 @@ struct DSS_EXPORT TargetSchemaData {
     // half a numbering is a table that loads clean and cannot be used.
     std::optional<std::uint16_t> dwarfReturnAddressColumn;
 
-    // FC2 Part B: per-register-class move/load/store mnemonic table
-    // (the JSON `registerClassOps[]` section), indexed by the
-    // TargetRegClass ordinal. A class WITHOUT a row resolves to the
-    // universal default bindings ("mov"/"load"/"store") iff it is the
-    // substrate's default class (GPR — the class every existing
-    // lowering pass assumed); any OTHER row-less class resolves to
-    // nothing so the consumer fails loud instead of silently emitting
-    // the GPR instruction forms against a foreign register file.
-    // validate() guarantees every DECLARED mnemonic resolves to an
-    // opcode row. arm64 (no table, no fpr registers) is untouched.
-    std::array<TargetRegisterClassOps, 5> registerClassOps{};
+    // FC2 Part B, generalized to class×class by
+    // D-TARGET-NO-CROSS-CLASS-MOVE-VERB: the register-data-movement mnemonic
+    // table (the JSON `registerClassOps[]` section), indexed
+    // `[fromClass][toClass]` by the TargetRegClass ordinals. The DIAGONAL
+    // (`from == to`) is the within-a-file copy plus that class's memory
+    // load/store; an OFF-DIAGONAL entry is the cross-FILE move, a distinct
+    // machine operation (arm64 `fmov x0, d0`, x86_64 `movq %xmm0, %rax`) that
+    // the table previously had no slot to declare at all.
+    //
+    // A PAIR WITHOUT a row resolves to the universal default bindings
+    // ("mov"/"load"/"store") iff it is the substrate's default class on the
+    // DIAGONAL (GPR→GPR — the copy every existing lowering pass assumed); any
+    // OTHER row-less pair resolves to nothing so the consumer fails loud
+    // instead of silently emitting one class's instruction forms against a
+    // foreign register file. validate() guarantees every DECLARED mnemonic
+    // resolves to an opcode row.
+    std::array<std::array<TargetRegisterClassOps, kTargetRegClassCount>,
+               kTargetRegClassCount>
+        registerClassOps{};
 
     // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the per-`WideFloatOp`
     // softfloat-libcall table (the JSON `wideFloatSoftcalls[]` section),
@@ -4215,37 +4247,60 @@ public:
         return d_.dwarfReturnAddressColumn;
     }
 
-    // FC2 Part B: resolve the opcode handle that performs `op` on a
-    // value of register class `cls` (the per-register-class operation
-    // table — `registerClassOps[]` in the target JSON). Resolution:
-    //   * class has a declared row + the row names this op → that
+    // FC2 Part B, generalized by D-TARGET-NO-CROSS-CLASS-MOVE-VERB: resolve the
+    // opcode handle that performs `op` moving a value OUT OF class `from` INTO
+    // class `to` (the `registerClassOps[]` table in the target JSON, indexed by
+    // the class PAIR). Resolution:
+    //   * the pair has a declared row + the row names this op → that
     //     mnemonic's opcode (validate() guarantees it resolves; the
     //     optional still guards a hand-built schema);
-    //   * class has a declared row but the row OMITS this op →
-    //     nullopt — the CALLER fails loud naming class+op (e.g. an
+    //   * the pair has a declared row but the row OMITS this op →
+    //     nullopt — the CALLER fails loud naming the pair+op (e.g. an
     //     FPR store with no declared store mnemonic must never fall
     //     back to the GPR `store` encoding);
-    //   * class has NO row: GPR (the substrate default class — what
-    //     every pre-FC2 lowering pass emitted unconditionally) → the
-    //     universal "mov"/"load"/"store" bindings; any other class →
-    //     nullopt (fail loud at the caller).
+    //   * the pair has NO row: GPR→GPR (the substrate default class on the
+    //     diagonal — what every pre-FC2 lowering pass emitted
+    //     unconditionally) → the universal "mov"/"load"/"store" bindings; any
+    //     other pair → nullopt (fail loud at the caller).
+    //
+    // ⚠ `Load` / `Store` OFF THE DIAGONAL ARE A CATEGORY ERROR, not an
+    // omission: memory is not a register class, so "load from gpr into fpr"
+    // asks nothing. The loader refuses such a row, and this returns nullopt
+    // for one regardless — a hand-built schema must not be able to reach a
+    // memory mnemonic through a cross-class query.
     [[nodiscard]] std::optional<std::uint16_t> regClassOpOpcode(
-            TargetRegClass cls, RegClassOp op) const noexcept {
-        auto const idx = static_cast<std::size_t>(cls);
-        if (idx >= d_.registerClassOps.size()) return std::nullopt;
-        auto const& row = d_.registerClassOps[idx];
+            TargetRegClass from, TargetRegClass to,
+            RegClassOp op) const noexcept {
+        auto const fromIdx = static_cast<std::size_t>(from);
+        auto const toIdx   = static_cast<std::size_t>(to);
+        if (fromIdx >= d_.registerClassOps.size())      return std::nullopt;
+        if (toIdx   >= d_.registerClassOps[fromIdx].size()) return std::nullopt;
+        if (from != to && op != RegClassOp::Move)       return std::nullopt;
+        auto const& row = d_.registerClassOps[fromIdx][toIdx];
         if (row.declared) {
             auto const name = row.nameFor(op);
             if (name.empty()) return std::nullopt;
             return opcodeByMnemonic(name);
         }
-        if (cls != TargetRegClass::GPR) return std::nullopt;
+        if (from != TargetRegClass::GPR || to != TargetRegClass::GPR) {
+            return std::nullopt;
+        }
         switch (op) {
             case RegClassOp::Move:  return opcodeByMnemonic("mov");
             case RegClassOp::Load:  return opcodeByMnemonic("load");
             case RegClassOp::Store: return opcodeByMnemonic("store");
         }
         return std::nullopt;
+    }
+
+    // The DIAGONAL query — `regClassOpOpcode(cls, cls, op)`, spelled once.
+    // Kept as the terse form because the overwhelming majority of call sites
+    // ask about a copy WITHIN one class (a spill, a phi copy, a two-address
+    // legalization), and because it is the same table: this is a shorthand for
+    // one argument pair, never a second lookup path.
+    [[nodiscard]] std::optional<std::uint16_t> regClassOpOpcode(
+            TargetRegClass cls, RegClassOp op) const noexcept {
+        return regClassOpOpcode(cls, cls, op);
     }
 
     // ── Wide-float softcalls (LD-2, D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH) ──

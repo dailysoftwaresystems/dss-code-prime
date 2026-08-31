@@ -53,6 +53,31 @@
 # stat fstat lstat statfs fstatfs opendir readdir (x86_64 only, `$INODE64`) and
 # realpath (BOTH arches, `$DARWIN_EXTSN`). No other identifier is renamed on
 # either arch.
+#
+# EXTENDED 2026-08-31 (cycle P46, lane `dw`) by ELEVEN rows — <tgmath.h>'s
+# complex counterparts cabs cacos casin catan ccos cexp clog cpow csin csqrt
+# ctan — on macOS 26.6.2 (build 25G83, Darwin 25.6.0, arm64 host), Apple clang
+# 21.0.0 (clang-2100.1.1.101), MacOSX.sdk 26.5. The HOST MOVED between the two
+# measurements (26.5.2 -> 26.6.2, and a newer toolchain), which is stated rather
+# than smoothed over: every cell above was taken on the older one and is NOT
+# re-asserted here. 66 probes for the eleven (11 x 3 candidate headers x 2
+# arches); the 22 that count each returned exactly one undefined symbol.
+# NONE of the eleven diverges — the emission is the plain decorated identifier
+# on BOTH arches, so all eleven imply an ABSENT `linkName`, which is the arm a
+# one-sided table would get wrong in the flattering direction.
+# ⚠ THE PROBE HEADER WAS MEASURED, NOT ASSUMED, and the guess was WRONG: the
+# brief expected these to need <complex.h> the way statfs needs <sys/mount.h>.
+# `tgmath.h` — the descriptor's OWN header — compiles all eleven on both arches,
+# and so does `complex.h`; `math.h` is the one that fails (`use of undeclared
+# identifier 'csqrt'`). The descriptor's own header is recorded, per the
+# convention 220 of these rows follow.
+# ⓘ A SECOND measurement the oracle does not ask for was taken in the same
+# session, because DSS EAGER-IMPORTS every function a descriptor lists and one
+# ABSENT symbol breaks the LOAD of every binary including the header: all eleven
+# LINK on both arches against libSystem, and csqrt/cabs/cpow were RUN natively
+# (1.414214+1.414214i, 5.000000, -4.000000+0.000000i — the values gcc 13.3.0,
+# clang 18.1.3 and ucrtbase.dll produced for the same inputs in P46).
+# [[D-CSUBSET-TGMATH-COMPLEX]]
 __error	errno.h	___error	___error
 abort	stdlib.h	_abort	_abort
 abs	stdlib.h	_abs	_abs
@@ -73,18 +98,29 @@ atof	stdlib.h	_atof	_atof
 atoi	stdlib.h	_atoi	_atoi
 atol	stdlib.h	_atol	_atol
 bsearch	stdlib.h	_bsearch	_bsearch
+cabs	tgmath.h	_cabs	_cabs
+cacos	tgmath.h	_cacos	_cacos
 calloc	stdlib.h	_calloc	_calloc
+casin	tgmath.h	_casin	_casin
+catan	tgmath.h	_catan	_catan
+ccos	tgmath.h	_ccos	_ccos
 ceil	math.h	_ceil	_ceil
 ceilf	math.h	_ceilf	_ceilf
+cexp	tgmath.h	_cexp	_cexp
 chdir	unistd.h	_chdir	_chdir
 chmod	sys/stat.h	_chmod	_chmod
 clearerr	stdio.h	_clearerr	_clearerr
 clock	time.h	_clock	_clock
+clog	tgmath.h	_clog	_clog
 close	unistd.h	_close	_close
 closedir	dirent.h	_closedir	_closedir
 cos	math.h	_cos	_cos
 cosf	math.h	_cosf	_cosf
 cosh	math.h	_cosh	_cosh
+cpow	tgmath.h	_cpow	_cpow
+csin	tgmath.h	_csin	_csin
+csqrt	tgmath.h	_csqrt	_csqrt
+ctan	tgmath.h	_ctan	_ctan
 dlclose	dlfcn.h	_dlclose	_dlclose
 dlerror	dlfcn.h	_dlerror	_dlerror
 dlopen	dlfcn.h	_dlopen	_dlopen

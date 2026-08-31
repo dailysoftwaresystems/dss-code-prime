@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-29 — cycles **P14 … P45**.
+**Last updated:** 2026-08-31 — cycles **P14 … P46**.
 
 ---
 
@@ -17,29 +17,47 @@
 
 **State, ✔measured at the tip and not re-quoted:** branch `feature/c23-conformance-burndown-5`,
 **PR #56 OPEN**. ⚠ **NO SHA IS PINNED HERE ON PURPOSE** — a handoff cannot name its own commit,
-since writing it moves HEAD, and the public-repo bot rebases and squashes besides. **P45 landed
+since writing it moves HEAD, and the public-repo bot rebases and squashes besides. **P46 landed
 as one commit**; re-derive with `git log --oneline -3`. `git worktree list` → **the repo only**
-(every P45 lane worktree folded and removed).
+(every P46 lane worktree folded and removed; `.worktrees/` holds `.manifests` and nothing else).
 
-★★★ **THE NEXT SET IS ALREADY CHOSEN, BRIEFED, AND NOT YET SEEDED — the operator stopped the
-loop at this commit (*"once you finish this batch don't start another until I say so. the
-credits are running off"*, 2026-08-29). Do NOT seed lanes on resume without a fresh go-ahead.**
-The set, its order, and why the order is forced are in §0.6.
+★★★ **THE OPERATOR HALTED THE LOOP AT THIS COMMIT — 2026-08-31, in terms: *"once this batch ends
+(fully done and folded, and green), wait my call to start a new one"*. DO NOT SEED LANES ON
+RESUME WITHOUT A FRESH GO-AHEAD.** The next set is chosen and briefed in §0.6; it is a plan, not
+a queue in flight. This is the SECOND consecutive cycle to end on an explicit halt (P45's was
+*"the credits are running off"*) — treat the standing `/loop` order as suspended until the
+operator lifts it by name.
 
 ## §0.1 — The four gate legs, verbatim
 
 ```
 cmake --build build/dbg  &&  ctest --test-dir build/dbg --output-on-failure -j 12
-wsl.exe -e bash scripts/wsl-leg/wsl-leg.sh --mode full
-wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage arm64-vps --mode full
-wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage macos     --mode full
+wsl.exe -e bash /mnt/c/Source/DailySoftware/dss-code-prime/scripts/wsl-leg/wsl-leg.sh --mode full
+wsl.exe -e bash /mnt/c/Source/DailySoftware/dss-code-prime/scripts/remote-leg/remote-leg.sh --carriage arm64-vps --mode full
+wsl.exe -e bash /mnt/c/Source/DailySoftware/dss-code-prime/scripts/remote-leg/remote-leg.sh --carriage macos     --mode full
 ```
+
+⛔⛔ **RUN THOSE THREE FROM POWERSHELL, WITH AN ABSOLUTE `/mnt/c/...` PATH, AND NOT FROM GIT
+BASH — ✔MEASURED THE HARD WAY IN P46 AND IT COST THREE FALSE LEG RESULTS.** Git Bash's MSYS
+argument conversion rewrites a leading `/mnt/c/...` into `C:/Program Files/Git/mnt/c/...` before
+`wsl.exe` ever sees it, so the leg dies with *"No such file or directory"* on a path that plainly
+exists. ⚠ **AND THE TWO FAILURES DO NOT LOOK ALIKE**: `wsl-leg.sh` refused with *"the Windows
+checkout is not visible at /mnt/c/..."* (its `[[ -d "$SRC" ]]` was being evaluated by Git Bash,
+on the wrong side of the boundary), while both `remote-leg` runs got far enough to PREPARE the
+host and then died on `exec: rsync: not found` — **`rsync` exists at `/usr/bin/rsync` inside WSL
+and does not exist in Git Bash at all**. Neither reads as a quoting fault, which is why this
+paragraph is here rather than in a memory.
+⚠⚠ **AND NEVER READ A LEG'S VERDICT THROUGH A PIPE.** `bash …/remote-leg.sh … | tail -20` reports
+`[exited with code 0]` — that is **`tail`'s** exit code. ✔The same run measured directly is
+`rc=1`. The scripts are honest; the pipeline is not. (`remote-leg`'s own message
+*"rsync failed (rc=0)"* is nonetheless self-contradictory and worth repairing.)
 
 All three remote legs PREPARE (fetch, move the host's clone to the driver's branch and commit,
 clean), SYNC the working tree, RUN, and RESTORE on every exit path — `scripts/leg-tree/` owns
-those git verbs and **a leg must never hand-roll them**. Both remote carriages are driven from
-**inside WSL**; the arm64 VPS is WSL-only by construction. Repo guards run on the **root host
-only**, which is why the remote count is 20 lower.
+those git verbs and **a leg must never hand-roll them**. ✔Both PREPARE halves were confirmed
+working in P46 even in the runs that failed at transport: macOS was moved `94971261` → the
+driver's commit and restored to 0 dirty paths. Repo guards run on the **root host only**, which
+is why the remote count is 20 lower.
 
 ⚠ **A `.plans/`-only edit still needs the 20 repo guards re-run**, because several of them read
 `.plans/**`: `ctest --test-dir build/dbg -I 1,21` takes ~2.5 min and is the cheap way to do it.
@@ -55,85 +73,137 @@ probed **separately** — "the reference" is not one voice.
 | clang | 18.1.3 | inside WSL: `wsl.exe -e clang` |
 | mingw-w64 gcc | 13.2.0 | on PATH natively as `gcc` on the Windows host |
 | **MSVC** | **19.51.36252 (VS 18 / MSVC 14.51)** | **`C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64\cl.exe`** |
+| **Apple clang** | **21.0.0 (clang-2100.1.1.101), MacOSX.sdk 26.5** | **on the Mac, via `scripts/ssh-macos/`** |
 
 ★★ **MSVC IS REACHABLE WITHOUT `vcvars` FOR A FRONT-END QUESTION.** `cl.exe /c` compiles only, so
 a redefinition or a syntax refusal needs no link and no CRT environment — write the fixture so it
-includes **no system header**. ✔P45 used exactly this: lane `cx` established that MSVC has no
-`_Complex` type specifier at all (`error C2146`), which is an **ABSTENTION, not a refusal**, and
-the difference decided the row.
-⚠ `mingw-w64 gcc` and `WSL gcc` are DIFFERENT references and they DISAGREE — ✔re-confirmed in P45
-by lane `pp` on `#pragma once` content-dedup (WSL gcc dedups two byte-identical files; mingw-w64
-gcc does not). Never treat one as a stand-in for the other.
+includes **no system header**.
+⚠ `mingw-w64 gcc` and `WSL gcc` are DIFFERENT references and they DISAGREE. Never treat one as a
+stand-in for the other.
 
 ## §0.3 — What is OWED, stated so it is not mistaken for done
 
 1. **The standing PR exit regime, inherited by PR #56 and still undischarged**: units + sqlite
    `veryquick` + `speedtest1` on **FOUR** legs, then the README — which still says *"THREE hosts"*
-   and has **no arm64-VPS table**. Neither P44 nor P45 spent it (hours, over a tree that changes
-   with every landing set). **Stated, not skipped.**
-2. **`D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED` is still 🟠 OPEN and it is the one
-   row this cycle deliberately did not close.** Lane `cx` proved the conversion is REQUIRED and
-   proved that shipping it alone is a **silent miscompile**; the fix needs one lane holding four
-   files that two lanes owned. §0.6 names it. This is a remnant with an owner, not a follow-up.
+   and has **no arm64-VPS table**. P44, P45 and P46 all declined to spend it (hours, over a tree
+   that changes with every landing set). **Stated, not skipped.**
+2. **ONE row was opened this cycle and is still OPEN**, with a named shape and a named reason:
+   `D-PP-PRE-SCAN-MEMO-SERVES-A-SAME-SIZE-EDIT-INSIDE-ONE-TIMESTAMP-TICK-STALE`. See §0.6 — it
+   needs **one lane owning two halves**, and lane `pn` declined it for that reason rather than
+   half-taking it.
 3. **The clang ASan/UBSan leg is still absent from `scripts/`** —
    `D-GATE-SCRIPTS-LIVE-ONLY-IN-THE-SCRATCHPAD` stays OPEN for exactly that half.
+4. ★ **`D-SQLITE-CLI-BUILT-ON-NO-LEG` is NOT blocked by host availability** — operator,
+   2026-08-31: *"MacOS is UP: D-SQLITE-CLI-BUILT-ON-NO-LEG is not blocked by this"*. Its macho64
+   build cells and Table 2's darwin run cells are **runnable work**. ✔P46 unblocked its
+   elf64-x86_64 build cells by execution (both artefacts `rc=0`); the rest is unspent, not gated.
 
-## §0.4 — Three traps, two of them paid for AGAIN in P45
+## §0.4 — Four traps, three of them paid for AGAIN in P46
 
-- ⛔ **A quoted heredoc EATS BACKSLASHES.** Hit again in P45, again inside a regex
-  (`(?<!\\)\|` arriving as `(?<!)|`), where it did not merely mangle output — it changed what the
-  pattern MEANT and the script died on an unrelated-looking parse error. **Any throwaway script
-  that writes or deletes goes in a FILE**, written with the Write tool, asserting it is not inside
-  the repository by comparing RESOLVED PATH PREFIXES (`os.path.realpath`), never substrings.
-- ⚠ **`git status --porcelain` C-QUOTES a path that needs one**, and this repo holds
-  `.plans/23-full-c-plan - tbd.md`. A naive `line[3:]` SILENTLY OMITS it. Use `-z`.
-- ★★ **NEW, and it is the P45 one worth carrying: `git status --porcelain` reports an UNTRACKED
-  DIRECTORY as ONE BARE ENTRY, never as its files.** Anything that answers that with `os.walk`
-  takes every file on disk and asks git nothing — so `.gitignore` is bypassed *inward*. ✔MEASURED:
-  the fold of lane `cx` offered two `__pycache__/*.pyc` as the lane's own work. Ask git:
-  `git ls-files --others --exclude-standard`.
+- ⛔ **A quoted heredoc EATS BACKSLASHES.** Hit **six times** in P46 alone, every time inside a
+  regex (`(?<!\\)\|` arriving as `(?<!)|`, which does not mangle output — it changes what the
+  pattern MEANS and dies on an unrelated-looking parse error). **Any throwaway script goes in a
+  FILE**, written with the Write tool, asserting it is not inside the repository by comparing
+  RESOLVED PATH PREFIXES (`os.path.realpath`), never substrings.
+- ⛔ **MSYS ARGUMENT CONVERSION** — see §0.1. Git Bash rewrites `/mnt/c/...` on the way to
+  `wsl.exe`. Drive WSL from PowerShell.
+- ⚠ **`git status --porcelain` C-QUOTES a path that needs one** (this repo holds
+  `.plans/23-full-c-plan - tbd.md`); a naive `line[3:]` SILENTLY OMITS it. Use `-z`. And it
+  reports an UNTRACKED DIRECTORY as ONE BARE ENTRY, never as its files — answer that with
+  `git ls-files --others --exclude-standard`, never `os.walk`.
+- ★★ **A `| tail` MASKS THE EXIT CODE.** Paid for in P46 on three leg runs at once (§0.1).
 
-## §0.5 — P45 IN ONE PARAGRAPH
+## §0.5 — P46 IN ONE PARAGRAPH
 
-**Five lanes ran, four closed their rows, one correctly refused to.** ✔`check-anchor-balance
---base 94971261` ⇒ **closed 3, opened 0, net −3**; registry **537 → 534** (**production 346 OPEN /
-harness 188**, and the sum is the cross-check). ⚠⚠ **THE COUNTED FIGURE IS 3 AND THE REAL FIGURE
-IS 6 — BOTH ARE OWED IN ANY REPORT.** The gate counts ROWS BY NAME across base and tip, so a row
-written **BORN CLOSED** is invisible from both bases; P45 wrote **three** of them
-(`D-CYCLE-THE-LANE-SEEDER-COPIES-EVERY-SIBLING-WORKTREE-INTO-THE-LANE-IT-SEEDS`,
-`D-CYCLE-LANE-FOLD-WALKS-AN-UNTRACKED-DIRECTORY-PAST-GITIGNORE`,
-`D-GATE-PLAN-CITATIONS-SELFTEST-BLAMES-THE-GUARD-FOR-THE-TREE`). That blindness is RIGHT for
-*"did this cycle leave more open than it found?"* and WRONG for *"what did it fix?"*.
+**Eight lanes ran across the cycle** (`dc`, `rt`, `xm`, `cm`, `dg`, `pn`, `jk`, `dw`), plus the
+orchestrator as a lane. ✔`check-anchor-balance --base f865897c` ⇒ **closed 3, opened 1, net −2**;
+registry **534 → 532**, ✔per-bucket **production 346 → 344 OPEN / harness 188 / per-plan 323**,
+**SUM 855 = 532 + 323** and that sum is the cross-check.
+⚠⚠ **THE COUNTED FIGURE IS 3 AND THE REAL FIGURE IS 11 — BOTH ARE OWED IN ANY REPORT.** The gate
+counts ROWS BY NAME across base and tip, so a row minted inside the cycle is invisible from both
+bases; **eight of this cycle's eleven closures are that shape** (✔measured, not estimated:
+`scratchpad/p46/count_real_closures.py` enumerates them). That blindness is RIGHT for *"did this
+cycle leave more open than it found?"* and WRONG for *"what did it fix?"*.
 **Never soften the instrument; report both numbers.**
 
-Windows gate at this tree: **1803/1803**, 0 failed, all 20 repo guards. Remote legs, each ✔MEASURED at THIS tree on 2026-08-29 and not re-quoted: WSL x86_64 **1783/1783** · arm64-VPS **1783/1783** · macOS **1783/1783** (1783 = 1803 minus the 20 root-host-only guards). Every remote host PREPAREd, SYNCed, RAN and RESTOREd. ⚠ macOS was re-verified DIRECTLY afterwards (`HEAD=94971261, dirty=0, worktrees=1`) because EMSDK shell init noise buries that leg's restore line in its own log — a restore you cannot read in the log is not a restore you have measured.
+Windows gate at this tree: **1816/1816**, 0 failed, all 20 repo guards.
+Remote legs, each ✔MEASURED at THIS tree on 2026-08-31 and not re-quoted: WSL x86_64 **1796/1796** · arm64-VPS **1796/1796** · macOS **1796/1796** (1796 = 1816 minus the 20 root-host-only repo guards, and that arithmetic is the cross-check). Every leg came back through `run-gate.sh` with a TOOL-EMITTED witness (`rc=0` **and** `/100% tests passed/` present), and the WSL leg additionally carried its emulator witness — arm64 artifacts were spawned and RAN, not skipped.
+⚠ **BOTH REMOTE HOSTS WERE RE-VERIFIED DIRECTLY AFTERWARDS**, because a restore you cannot read is not a restore you have measured: arm64-VPS and macOS each report `branch=feature/c23-conformance-burndown-5, HEAD=f865897c, dirty=0, worktrees=1`. ✔The `leg-tree: restored` line was ABSENT FROM BOTH LOGS and that was MY defect, not the legs': the runs were piped through `Select-Object -Last 25`, which keeps only the final 25 lines. ⭐ Same family as the `| tail` exit-code mask in §0.1 — **do not truncate or pipe a leg's output; write the whole log and read it.**
+ⓘ macOS resolves from **inside WSL** and NOT from Git Bash (`cannot resolve 'MacBook-Pro-de-Rafael.local'`, its own hint blaming mDNS). That is a resolver difference, not the Mac being down — ✔the leg and the direct re-verification both succeeded from WSL minutes either side of a Git Bash failure.
 
 ## §0.6 — THE NEXT SET: chosen, briefed, NOT seeded
 
 ⚠ **The operator halted seeding at this commit. This is a plan, not a queue in flight.**
 
-The **§B arc** the operator ruled on 2026-08-28 (clauses R0–R8) is the spine, and **file
-contention forces it SERIAL** — R6 and R1 both need `src/core/types/target_schema.*`, so
-"depends on neither" (the operator's words about R6) is a LOGICAL statement, not a scheduling one:
+**FIRST, because it is the only row this cycle left open and the ruling says a row you open you
+close:**
+
+| lane | closes | why it needs ONE lane and not two |
+|---|---|---|
+| **memo** — the pre-scan memo's same-tick hole | `D-PP-PRE-SCAN-MEMO-SERVES-A-SAME-SIZE-EDIT-INSIDE-ONE-TIMESTAMP-TICK-STALE` | needs `src/analysis/preprocess/**` **and** either `src/program/**` or `dg`'s `CompilationUnit::inputDigest()`, **together** |
+
+★★ **READ THAT ROW BEFORE SCOPING IT — its own name was WRONG until P46 renamed it, and the
+correction is the interesting part.** ✔`pn` measured that a shipped, PASSING test
+(`AHeaderRewrittenToTheSameLengthIsNotServedFromTheMemo`) already contradicts the old name: the
+memo DOES notice a same-size edit whenever the write time moves. The real hole is a same-size
+edit landing inside ONE filesystem timestamp tick — ✔**114/200 back-to-back rewrites collided,
+86/200 did not, 0/5 with a 20 ms gap, tick ≈15.6 ms**. ⇒ **57% reproducible, NOT deterministic**,
+so a probe that ran once and saw the key move would report the tree clean, and **the pin must
+FORCE the collision** (`fs::last_write_time(h, stampInMemo)`), never race for it.
+
+Then the **§B arc** (operator clauses R0–R8), whose spine is unchanged and whose **R6 landed in
+P46**. File contention still forces it SERIAL:
 
 | order | lane | closes | why it cannot move |
 |---|---|---|---|
-| 1 | **R6** — the cross-class move slot | `D-TARGET-NO-CROSS-CLASS-MOVE-VERB` | operator: *"start R6 now"* |
-| 2 | **R1+R2+R3** — arm64 declares its SIMD&FP file ONCE | `D-TARGET-ARM64-W-CONSTRAINT-BINDS-A-CLASS-NO-C-VALUE-EVER-LIVES-IN`, `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS` | contends with R6 on `target_schema.*` |
-| 3 | **R4+R5+R7** — modifier letters, bare `%0`, the dialect's unusable class | `D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE`, `D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME` | operator: depends on R1 |
-| — | **tgmath/complex** — one lane holding **four** files | `D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED` | needs `type_rules.hpp` + `cst_to_hir.cpp` + `tgmath.json` + `c.lang.json` together; **cannot** run with a `c.lang.json` lane |
+| 1 | **R1+R2+R3** — arm64 declares its SIMD&FP file ONCE | `D-TARGET-ARM64-W-CONSTRAINT-BINDS-A-CLASS-NO-C-VALUE-EVER-LIVES-IN`, `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS` | brief written, premises re-measured |
+| 2 | **R4+R5+R7** — modifier letters, bare `%0`, the dialect's unusable class | `D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE`, `D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME` | operator: depends on R1 |
 
-📄 **Briefs are WRITTEN for R6 and R1+R2+R3**, with every premise re-measured rather than relayed
-(the operator's C1/C2/C3 all CONFIRMED, plus one correction of my own: an encoding-less opcode
-**fails loud**, so R6 is an ENABLEMENT and not a silent-miscompile fix). They are in the P45
-section below, in full, because a scratchpad does not survive a session.
+📄 **The R1+R2+R3 brief is WRITTEN, in full, in the P45 section below** — a scratchpad does not
+survive a session. ⚠ The R6 brief there is now HISTORY: R6 shipped in P46.
+⛔ **DO NOT SCHEDULE `D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE` AS ITS OWN
+LANE** even though the burndown queue ranks it P0 ORANGE and unowned — ✔its own status cell says
+it *"closes at R1+R5"*. Seeding it standalone is two lanes fixing one anchor differently. ✔P46
+came one step from doing exactly this and stopped by reading the row.
 
 ⚠ **One finding is carried HERE and nowhere else, deliberately un-anchored** so the cycle does not
-close with a rising count: lane `cx` measured that **DSS accepts a `_Generic` whose UNSELECTED arm
-holds a C constraint violation that gcc AND clang both reject** — DSS more permissive than every
-reference, i.e. Direction B, an invented extension. The lane that fixes it files its row
-**born closed**. If a session finds this paragraph and no such row, the work is undone.
+close with a rising count: lane `cx` (P45) measured that **DSS accepts a `_Generic` whose
+UNSELECTED arm holds a C constraint violation that gcc AND clang both reject** — DSS more
+permissive than every reference, i.e. Direction B, an invented extension. The lane that fixes it
+files its row **born closed**. If a session finds this paragraph and no such row, the work is undone.
 ---
+
+★★★ **P46: ELEVEN ROWS CLOSED IN TRUTH AND THREE BY THE GATE'S COUNT, ONE ROW LEFT OPEN ON PURPOSE, AND THE CYCLE'S TWO SHARPEST FINDINGS WERE A LANE REFUTING MY BRIEF AND MY OWN PROBE REFUTING A LANE THAT WAS RIGHT.** ✔MEASURED `check-anchor-balance --base f865897c` ⇒ **closed 3, opened 1, net −2** counted; **11 closed in truth, 1 opened** (§0.5 owes both figures and so does every report).
+
+### ★★★ THE HEADLINE: TWICE THIS CYCLE AN INSTRUMENT ANSWERED AN ADJACENT QUESTION, AND BOTH TIMES IT FAILED TOWARD *CLEAN*
+
+Not a lane defect either time — **both were mine, and both were caught by USING the instrument rather than by auditing it.**
+
+1. **`burndown-queue.py` banded by the anchor's SPELLING where the ruling defines the bucket by the FILE.** `D-CONF-REFERENCE-DIFFERENTIAL-ORACLE` lives in `-harness.md` and was printed as the **#1 row of the P0 WRONG-OUTPUT band**, with nothing on the line saying harness, because `D-CONF-` is not in `NS_HARNESS` and never was. ⚠ **I read the queue top-down to pick the 4th lane and came ONE STEP from seeding a lane on a harness row**, which the standing ruling forbids outright. ✔Census: **18 harness rows banded above P3, two of them in P0**. The reverse direction — a PRODUCTION row hidden under P3 — measured **0 today, and only by luck of spelling**. Fixed so the FILE decides in BOTH directions; 8 self-test arms now ship and run on every invocation, with a two-mutant red-on-disable transcript through the real CLI.
+2. **`lane-worktree.sh remove` REPORTED SUCCESS OVER 4.4 GB STILL ON DISK.** Lane `cm` was folded mid-flight with its `.git` emptied, so `git worktree remove` could not see it and exited non-zero; control fell through to `prune` and printed `removed …` unconditionally. ⚠ **The failure is invisible from the caller** — `git worktree list` agrees the worktree is gone, because the registration WAS pruned. Only `ls .worktrees/` disagrees and nothing in the cycle runs it. Now it removes, **verifies**, and only then speaks. ⚠ Fixing it dragged in a hazard first: **`cmd_add` validated the lane name and `cmd_remove` did not** — harmless while the verb merely declined an unknown path, and not harmless the moment an `rm -rf` stands behind it.
+
+### ★★★ THE SECOND HEADLINE: A LANE WAS RIGHT AND MY PROBE SAID IT WAS WRONG
+
+Lane `dw` reported that ten `tgmath.json` macros now carry three format arms asserting a difference that no longer exists. ✔My probe compared whole arms by serialisation and reported **0 collapsible** — because `when: {format: …}` differs BY CONSTRUCTION in every arm. **The question is not *"are the arms identical"* but *"are they identical APART FROM THE SELECTOR"*.** Re-measured correctly, `dw`'s list reproduced exactly: **ten collapsible (`sqrt sin cos tan asin acos atan exp log pow`), two genuinely format-dependent (`fabs`, `ldexp`, because pe lacks `fabsf`/`ldexpf`)**. ⇒ a confident, true answer to the wrong question would have discarded a correct finding from a lane that had done the work properly. **The collapse landed** (25129 → 20183 chars, 20 arm-lines out), and it is NOT cosmetic: this compiler is config-driven, so a user can add a format, and under the old structure those ten macros went **silently undefined** for it.
+
+### THE LANES
+
+| lane | closed | the part worth carrying |
+|---|---|---|
+| `pn` | `D-PP-SKIPPED-CONDITIONAL-GROUP-VALIDATED-AS-A-PHASE-7-NUMBER` | **Three defects wearing one symptom**, and the blocker for the WHOLE sqlite corpus. The phase-7 gate was spelled with ONE code name; the phase-3 pp-number tail was **unreachable from the prefix arm**; `isExponentLetter` read **half its config**, so `0x1e+2` BUILT AN ARTIFACT where gcc and clang both refuse. ✔Both sqlite artefacts now `rc=0`. It also **declined** my second row with three measured reasons — the control loop working. |
+| `jk` | `D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC` | **Eleven ingestion sites, THREE spellings** — a `json::parse` grep alone misses two real readers. One owner (`detail::parseConfigDocument`), refusal not warning, and a tier-3 scanner that refuses a NEW reader outside the owner. ⚠ Its own guard-stripper had the defect it exists to catch (digit separators `1'000` blanked whole regions). |
+| `dw` | `D-CSUBSET-TGMATH-COMPLEX` | The Darwin oracle, unblocked by the operator's *"MacOS is UP"*. **66 `nm -u` probes**, all eleven complex symbols plain on both arches; then a **link-and-run** the oracle does not ask for, and Mach-O arm64 binaries built on Windows and executed on the Mac. Refuted my brief's probe header (`tgmath.h`, not `complex.h`) and my "also check `f`/`l` variants" (no such rows exist). |
+| `cm` | `D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED` (+1 born closed) | The conversion is 8 lines of C++; the `<tgmath.h>` complex dispatch shipped with it as **pure config**. Deliberately wrote its Mach-O test to FAIL once the oracle landed — a tripwire, not a hole — which `dw` then replaced one-for-one. |
+| `xm` | `D-TARGET-NO-CROSS-CLASS-MOVE-VERB` (+1 born closed) | `registerClassOps` keyed by the **ordered pair** `{class, to}`, `to` omitted = the diagonal. **Two call sites lost their class comparison entirely.** |
+| `dg` | (2 born closed) | Config-document memo FIFO→LRU, capacity 16→128. |
+| `dc`, `rt` | — | `rt` created the skipped-group row `pn` then closed, and left `scripts/sqlite-round-trip/`. |
+
+### ⚠ WHAT THIS CYCLE DID NOT DO, NAMED SO IT IS NOT MISTAKEN FOR DONE
+
+- **The PR exit regime is still unspent** (§0.3.1). The README still says *"THREE hosts"*.
+- **The one open row** (§0.6) is scoped and owner-shaped, not started.
+- **`_Generic`'s unselected arm** (§0.6, last paragraph) is still un-anchored by design.
+- **Ten `variants` collapsed; `fabs`/`ldexp` were left** — correctly, and the row says why.
 
 ★★★ **P45: FOUR ROWS CLOSED, ONE CORRECTLY REFUSED, AND THE TWO DEFECTS THAT MATTERED MOST WERE IN MY OWN INSTRUMENTS.** ✔MEASURED `check-anchor-balance --base 94971261` ⇒ **closed 3, opened 0, net −3** counted, **6 closed in truth** (three rows born closed are invisible to the gate — see §0.5, which owes both figures and so does every report).
 

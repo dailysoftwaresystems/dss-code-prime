@@ -50,10 +50,23 @@ struct MemoEntry {
     return s;
 }
 
-// Six shipped languages plus the targets and formats one invocation touches,
-// with headroom. See the capacity note in the header: evicting can only cost a
-// rebuild, never a wrong answer.
-constexpr std::size_t kCapacity = 16;
+// ★ FOUR TIMES THE WHOLE SHIPPED CORPUS, AND THE DERIVATION IS THE POINT —
+// see the capacity note in the header for the measurement that replaced the
+// refuted "handful of documents" premise this constant used to rest on.
+//
+// ✔MEASURED 2026-08-31 at `f865897c`: the corpus is 32 documents (24
+// `.format.json` + 6 `.lang.json` + 2 `.target.json`), and TWO production paths
+// scan the object-format class in FULL because they are proving uniqueness. The
+// bound must therefore exceed the whole corpus, not one path's working set —
+// any smaller number reintroduces the same cliff one document class at a time.
+// 4x leaves room for the corpus to QUADRUPLE before the bound binds again, and
+// `tests/program/test_config_memo_holds_a_total_scan` reddens if it ever does.
+//
+// ⓘ It is not larger, and that bound is what keeps the memory guard a guard: a
+// mutation harness walking many distinct MUTANTS of one 506 KB grammar is the
+// case this exists to bound, and it is the one case where holding every entry
+// would be the defect rather than the fix.
+constexpr std::size_t kCapacity = 128;
 
 // ★ Stops at the FIRST dependency that moved. Re-reading the rest would be
 // wasted work — the verdict is already settled, and the verdict is all a
@@ -79,15 +92,29 @@ std::shared_ptr<void> ConfigDocumentMemoStore::lookup(std::string_view family,
     // the window smaller rather than closing it. The contended case is a
     // handful of documents per process, so the simple correct order wins.
     std::lock_guard const guard{memoMutex()};
-    for (auto const& e : memoEntries()) {
-        if (e.family != family || e.label != label || e.digest != digest) continue;
-        if (!dependenciesStillMatch(e.dependencies)) {
+    auto& entries = memoEntries();
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        if (it->family != family || it->label != label || it->digest != digest) {
+            continue;
+        }
+        if (!dependenciesStillMatch(it->dependencies)) {
             memoStats().dependencyRejections += 1;
             memoStats().misses += 1;
             return nullptr;
         }
         memoStats().hits += 1;
-        return e.schema;
+        // ★ THE `store` SIDE EVICTS FROM THE FRONT, SO A HIT MOVES ITS ENTRY TO
+        // THE BACK — that pair IS the LRU policy, and the reason it is here
+        // rather than in `store` is that a hit is the only evidence a document
+        // is still in use. Under the previous FIFO the language document, loaded
+        // first and used throughout, was the FIRST thing a 24-document
+        // object-format scan evicted. The schema is copied out BEFORE the
+        // rotation because the rotation invalidates `it`.
+        std::shared_ptr<void> schema = it->schema;
+        MemoEntry             moved  = std::move(*it);
+        entries.erase(it);
+        entries.push_back(std::move(moved));
+        return schema;
     }
     memoStats().misses += 1;
     return nullptr;
@@ -129,6 +156,13 @@ ConfigDocumentMemoStore::Stats ConfigDocumentMemoStore::stats() {
 void ConfigDocumentMemoStore::resetStats() {
     std::lock_guard const guard{memoMutex()};
     memoStats() = Stats{};
+}
+
+std::size_t ConfigDocumentMemoStore::capacity() noexcept { return kCapacity; }
+
+std::size_t ConfigDocumentMemoStore::size() {
+    std::lock_guard const guard{memoMutex()};
+    return memoEntries().size();
 }
 
 } // namespace dss::detail

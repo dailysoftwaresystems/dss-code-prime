@@ -1,0 +1,34 @@
+{
+  "$comment": "P46 (D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED): the runtime witness for the implicit complex->real conversion C 6.3.1.7p2 defines — the imaginary part is discarded and no cast is required to request it. WHY IT IS SEPARATE FROM c99_tgmath_complex, and the reason is a measured gate rather than tidiness: the tgmath example needs the eleven <complex.h> extern imports, and those are gated off Mach-O until a real Mac measures their Darwin link names (tests/ffi/test_darwin_link_name_oracle over tests/ffi/data/darwin-link-names.tsv). THIS half needs no library at all — __builtin_complex and the conversion are compiler-intrinsic — so it carries ALL FOUR targets, darwin included, and the conversion is witnessed on every leg even while the dispatch half is not. ALL THREE POSITIONS ARE ONE RULE AND ALL THREE ARE PINNED: assignment (C 6.5.16.1p1, which asks only that both operands have ARITHMETIC type — C 6.2.5p11+p18 make that true of a complex), an integer target (C 6.3.1.7p2 then 6.3.1.4, truncating toward zero — the 3.75 operand makes truncation observable where a whole number would not), and a call ARGUMENT (C 6.5.2.2p7 converts it 'as if by assignment'); a fix admitting only the assignment would look complete and leave the argument position refusing, which is why both are here. ⚠ CHECKS 6 AND 7 GUARD THE ONE TARGET THAT MUST *NOT* TAKE THE DISCARDING PATH: `_Bool b = z;` is not a discard-and-truncate but C 6.3.1.2 'compares unequal to 0', which for a complex tests BOTH components — so the (0, 4i) operand, whose REAL part is zero, is TRUE, and a discard would make it FALSE. That is a silent wrong answer (D-CSUBSET-COMPLEX-LOGICAL-NOT-AND-BOOL-CAST-SILENT-MISCOMPILE, D-CSUBSET-COMPLEX-TO-BOOL-ASSIGNMENT-NOT-ADMITTED-BY-THE-SEMANTIC-TIER), and it is exactly what the `tk != TypeKind::Bool` clause in cst_to_hir's `coerce` and the admits-or-falls-through shape in type_rules' `isAssignable` exist to prevent — P45 measured that mirroring the returning real->complex arm instead broke it. These two checks are the runtime half of that guard. REFERENCE AGREEMENT, each probed SEPARATELY and every binary RUN: gcc 13.3.0 -std=c2x, clang 18.1.3 -std=c23 and mingw-w64 gcc 13.2.0 all compile this same file and exit 42; MSVC 19.51 ABSTAINS, having no _Complex type specifier at all (error C2146), which removes it from the vote rather than opposing it. ANTI-FOLD: every operand rides a MUTABLE GLOBAL so the `release` shippedPipeline arm exercises real conversions rather than constants folded before any of it runs. exit = 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}
