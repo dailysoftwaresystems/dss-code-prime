@@ -227,3 +227,23 @@ target_include_directories(dss_analysis_semantic_test_type_head_hijack_sweep
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_link_libraries(dss_analysis_semantic_test_type_head_hijack_sweep
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# P49 lane gi: [[D-CSUBSET-GENERIC-SELECTION-IS-NOT-AN-INTEGER-CONSTANT-EXPRESSION]]
+# — C23 6.5.1.1p3 makes a generic selection an integer constant expression when
+# its SELECTED assignment-expression is one, and leaves the unselected
+# associations unevaluated. `examples/c/generic_selection_constant_expression/`
+# owns the accepting half and the RUNTIME proof (the array extent is observed
+# through `sizeof`, so the example witnesses the selected VALUE and not merely a
+# successful build). This file owns what an example structurally cannot: the two
+# BOUNDARY pins, which point in opposite directions — a non-constant SELECTED arm
+# must STAY refused (the control that stops the fix closing into "a selection is
+# always constant"), while a non-constant UNSELECTED arm must fold ANYWAY. It
+# also pins all four const-expr consumers separately (`_Static_assert`, a file-
+# and block-scope array dimension, a struct member array, an enumerator value),
+# because each fails loud in its own words and the block-scope one failed
+# SILENTLY — as a VLA. Shares `semantic_test_fixture.hpp`, so it needs the tests/
+# include root for the same reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_generic_selection_constant_expression
+             SOURCES test_generic_selection_constant_expression.cpp)
+target_include_directories(dss_analysis_semantic_test_generic_selection_constant_expression
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

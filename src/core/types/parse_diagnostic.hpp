@@ -4886,6 +4886,64 @@ enum class DiagnosticCode : std::uint16_t {
     //   ONE implementation, not three (see
     //   `src/link/format/object_atom_coverage.hpp`).
     F_ObjectReaderSymbolBodyDropped = 0x5027,
+    // ── D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE ────────
+    //
+    // A `--resolve-library <path>=<import-name>` (or a manifest
+    // `{"path","importName"}` entry) whose PATH turns out to be an input the
+    // build MERGES rather than IMPORTS FROM — an `ar` static archive, or a
+    // relocatable object. Those forms record no runtime dependency for the
+    // stated identity to name, so the name has nowhere to go.
+    //
+    // ✔MEASURED at `c1754511`, shipped CLI, pe64 leg, before this code existed:
+    // `--resolve-library dsslib.lib=totally_bogus_name.dll` returned rc=0 with
+    // ZERO diagnostics, and the emitted `main.exe` was BYTE-IDENTICAL (md5
+    // 1039fd348f4713b2bba4859a5fd6f567) to the one built with no `=<name>` at
+    // all, while the string `totally_bogus_name.dll` appeared nowhere in the
+    // image. Not merely unreported — entirely without effect. The relocatable
+    // OBJECT arm was silent in the same way, and `--warnings-as-errors` did not
+    // change either outcome. The DYNAMIC control DID carry its stated name into
+    // the import descriptor, which is what makes the silence a defect rather
+    // than a description of the feature.
+    //
+    // ── WHY A WARNING AND NOT AN ERROR, AND IT IS MEASURED, NOT PREFERRED ────
+    // The row's own closing sentence asked for a rejection ("a declaration
+    // error, not a no-op"). That half is REFUTED, by the probe this project
+    // already uses to settle exactly this question (`test_suppress_request_-
+    // ignored`'s `ReferenceCompilersDoNotRejectAnUnhonourableSilencingRequest`
+    // — an unhonourable request on a script-driven flag). ✔MEASURED 2026-09-01,
+    // each toolchain separately, over the closest available analogue — an
+    // operator STATING a runtime identity where the chosen mode records none:
+    //   gcc 13.3.0     `-c … -Wl,-soname,libfoo.so.1`      rc=0, SILENT
+    //   gcc 13.3.0     `-static … -Wl,-soname,…`           rc=0, SILENT
+    //   clang 18.1.3   `-c … -Wl,-soname,libfoo.so.1`      rc=0, WARNS
+    //                  (`'linker' input unused`, -Wunused-command-line-argument)
+    //   clang 18.1.3   `-static … -Wl,-soname,…`           rc=0, SILENT
+    //   GNU ld 2.42    `ld -r … -soname libfoo.so.1`       rc=0, SILENT
+    //   MSVC 19.51     `/c /Fe:bogus.exe`                  rc=0, SILENT
+    // ZERO of four refuse; ONE warns. An Error would make DSS the only
+    // toolchain that fails a build every reference accepts AND that produces a
+    // correct, runnable artifact — and the artifact here IS correct: the
+    // archive's members are merged, the program links and runs, nothing is
+    // miscompiled. So this is the clang position, and `--warnings-as-errors` is
+    // the strict posture for anyone who wants the refusal.
+    //
+    // ⚠ It is NOT the `--stack-reserve` shape, which DOES refuse
+    // (`K_FormatLacksStackReserveControl`), and the difference is the one that
+    // decides severity: a silently-dropped stack reserve is a RUNTIME HAZARD —
+    // the program can overflow — while a silently-dropped import name costs the
+    // operator only a self-contained artifact where they expected a dependent
+    // one. Fail-loud is about wrong bytes; there are none here.
+    //
+    // SUPPRESSIBLE (deliberately NOT in the unsuppressable table): neither
+    // membership prong applies — no wrong artifact can ship green, and the
+    // build does not fail, so suppressing it cannot leave a non-zero exit with
+    // an empty explanation.
+    //
+    // The `.actual` NAMES BOTH VALUES and the remedy: the path, the ignored
+    // name, what the input turned out to BE, and where the identity would be
+    // honoured. A message reading only "importName ignored" sends the reader
+    // hunting through a manifest for which entry it meant.
+    F_DeclaredImportNameNotRecordable = 0x5028,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

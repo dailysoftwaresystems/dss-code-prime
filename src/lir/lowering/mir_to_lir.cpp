@@ -5198,35 +5198,98 @@ struct Lowerer {
             poisonValue(id);
             return;
         }
-        // The VLA base is only as aligned as the stack pointer the `sub` leaves it at
-        // (rounded to stackAlignment below). An element demanding MORE alignment than
-        // the stack guarantees would land under-aligned — reuse the over-aligned-local
-        // fail-loud class (the dynamically-realigned-SP case is a separate cycle).
+        // ★★ AN OVER-ALIGNED VLA ELEMENT IS HONOURED, AND IT IS THE SAME ANSWER THE
+        // FIXED-SIZE OVER-ALIGNED LOCAL GOT — reserve headroom, round the address, leave
+        // the stack pointer alone (D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL, which
+        // closed by reserving `align - stackAlignment` bytes above a frame SLOT and
+        // rounding at each materialization). A VLA never visits the frame-slot walk —
+        // its base IS the post-`sub sp` stack pointer — so the SAME reservation rides
+        // its runtime size instead: over-allocate `elemAlign` bytes and round the
+        // captured base up to `elemAlign`.
+        //
+        // ⚠⚠ THE RESERVATION IS `elemAlign`, NOT `elemAlign - stackAlign`, AND THE
+        // DIFFERENCE IS A MEASURED SILENT STACK MISCOMPILE, NOT A MARGIN OF TASTE.
+        // `elemAlign - stackAlign` is the bound the FIXED-local mechanism uses
+        // (`frameSlotAlignHeadroom`), and it is correct THERE because it rests on a
+        // premise about the frame base. It does NOT transfer: this base is the live
+        // stack pointer, and ✔MEASURED on `x86_64:pe64-x86_64-windows-exec` the
+        // post-`sub sp` SP of a VLA leaf is congruent to 8 mod 16, NOT to 0 mod
+        // `cc.stackAlignment`. Two live VLAs in one function then sat 120 bytes apart
+        // where the first is 128 bytes long — an 8-byte OVERLAP of two distinct
+        // objects, found by a corpus example that writes every byte of both (an earlier
+        // draft wrote only the named members and missed it entirely, because the
+        // overrun landed in the last element's trailing padding). The round-up consumes
+        // up to `elemAlign - 1` bytes for an arbitrary base residue, so the reservation
+        // must cover that with no premise about SP at all. `elemAlign` is the smallest
+        // power of two that does, which keeps the arithmetic below in powers of two.
+        //
+        // THIS USED TO FAIL LOUD with `L_OverAlignedStackLocal`, on the stated premise
+        // that it "needs a dynamically realigned stack pointer". It does not, and no
+        // reference agrees with the refusal: ✔MEASURED 2026-09-01, gcc 13.3.0 and clang
+        // 18.1.3 probed SEPARATELY (`-std=c17 -Wall -Wextra`) both compile AND run a VLA
+        // of a member-`alignas(32)` struct and hand back a genuinely 32-aligned base.
+        // (MSVC refuses it, but for having no C99 VLA at all — `error C2057` on the
+        // bound — so the disjunction, not unanimity, decides.)
+        //
+        // ★ AGNOSTIC: `emitAlignUpToPowerOfTwo` is the shared primitive the fixed-local
+        // rounding already uses, and its docblock carries the argument for the reg-reg
+        // `and` + materialized negative mask. Nothing here is keyed on an architecture
+        // or an object format; SP, the prologue, the unwind data and the C5 teardown
+        // watermark (captured BEFORE the `sub`) are all untouched.
         std::uint32_t const elemAlign  = mir.instPayload2(id);
         std::uint32_t const stackAlign =
             cc->stackAlignment > 0 ? cc->stackAlignment : 16u;
-        if (elemAlign > stackAlign) {
+        // A non-power-of-two alignment would make the `(x + A-1) & ~(A-1)` round-up
+        // below meaningless (its mask is only a mask for a power of two). The semantic
+        // tier validates `alignas` as a power of two and every composite's alignment is
+        // one by construction, so this is an INVARIANT guard rather than a user-facing
+        // refusal — and it is the only site left that can raise this code, which is
+        // deliberate: an unreachable guard against a broken invariant is honest, while
+        // rounding by a nonsense mask would be a silent under-alignment.
+        if (elemAlign > stackAlign
+            && (elemAlign & (elemAlign - 1u)) != 0u) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::L_OverAlignedStackLocal;
             d.severity = DiagnosticSeverity::Error;
             d.actual   = std::format(
-                "variable-length array element requires {}-byte alignment, which "
-                "exceeds the {}-byte stack alignment the dynamic `sub sp` guarantees "
-                "— an over-aligned VLA element needs a dynamically realigned stack "
-                "pointer, not built (D-CSUBSET-VLA)",
-                elemAlign, stackAlign);
+                "variable-length array element requires {}-byte alignment, which is "
+                "not a power of two — the runtime align-up cannot express it "
+                "(D-CSUBSET-VLA)",
+                elemAlign);
             reporter.report(std::move(d));
             poisonValue(id);
             return;
         }
+        std::uint32_t const alignHeadroom = elemAlign > stackAlign ? elemAlign : 0u;
         std::optional<LirReg> const sizeRaw = regForValue(mir.instOperands(id)[0]);
         if (!sizeRaw.has_value()) { poisonValue(id); return; }
+        // Reserve the rounding headroom INSIDE the allocation before the stack-alignment
+        // round-up, so the whole array still fits below the pre-`sub` SP. Zero headroom
+        // emits nothing — a VLA whose element needs no over-alignment is byte-identical
+        // to before this change.
+        LirReg sizeWithHeadroom = *sizeRaw;
+        if (alignHeadroom > 0) {
+            auto const addOp = opcode(MnemonicSlot::Add);
+            if (!addOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Add,
+                                    "an over-aligned variable-length array element's "
+                                    "rounding headroom");
+                poisonValue(id);
+                return;
+            }
+            LirReg const withRoom = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 2> ops{
+                LirOperand::makeReg(*sizeRaw),
+                LirOperand::makeImmInt32(static_cast<std::int32_t>(alignHeadroom))};
+            emitInst(*addOp, withRoom, ops, /*payload=*/0, /*flags=*/0);  // width 64
+            sizeWithHeadroom = withRoom;
+        }
         // alignUp(size, A) = (size + (A-1)) & ~(A-1), all width-64 (byte counts) —
         // now the SHARED `emitAlignUpToPowerOfTwo` primitive, which this sequence
         // used to spell inline. Its docblock carries the agnosticism argument for
         // the reg-reg `and` + materialized negative mask.
         std::optional<LirReg> const size16Opt =
-            emitAlignUpToPowerOfTwo(*sizeRaw, stackAlign,
+            emitAlignUpToPowerOfTwo(sizeWithHeadroom, stackAlign,
                                     "a variable-length array's runtime byte size");
         if (!size16Opt.has_value()) { poisonValue(id); return; }
         LirReg const size16 = *size16Opt;
@@ -5244,10 +5307,23 @@ struct Lowerer {
         // `base = sp_copy SP`: capture the POST-sub SP as the VLA base. hasSideEffects
         // on BOTH ops pins the order — the capture cannot float above the sub. Every
         // `a[i]` address use routes to `base` via `defineValue`/`regForValue`.
-        LirReg const base = lir.newVReg(LirRegClass::GPR);
+        LirReg const rawBase = lir.newVReg(LirRegClass::GPR);
         {
             std::array<LirOperand, 1> ops{LirOperand::makeReg(sp)};
-            emitInst(*copyOp, base, ops, /*payload=*/0, /*flags=*/0);
+            emitInst(*copyOp, rawBase, ops, /*payload=*/0, /*flags=*/0);
+        }
+        // An OVER-ALIGNED element: round the captured base up into the headroom
+        // reserved above. Every later `a[i]` reads this rounded vreg, so the whole
+        // object — not merely element 0 — sits at the demanded alignment (the elements
+        // are `elemAlign`-strided by construction, since a type's size is a multiple of
+        // its alignment).
+        LirReg base = rawBase;
+        if (alignHeadroom > 0) {
+            std::optional<LirReg> const alignedBase = emitAlignUpToPowerOfTwo(
+                rawBase, elemAlign,
+                "an over-aligned variable-length array's runtime base address");
+            if (!alignedBase.has_value()) { poisonValue(id); return; }
+            base = *alignedBase;
         }
         defineValue(id, base);
     }

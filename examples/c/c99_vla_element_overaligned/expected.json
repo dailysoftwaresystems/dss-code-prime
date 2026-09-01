@@ -1,0 +1,34 @@
+{
+  "$comment": "C11/C23 6.7.5 + C99 6.7.6.2 (D-CSUBSET-VLA): VARIABLE-LENGTH arrays whose ELEMENT type is OVER-ALIGNED — a member alignas(32)/alignas(64) raises the element above the 16-byte stack alignment the dynamic `sub sp` guarantees. REPLACES `alignas_vla_element_overaligned_error`, which pinned the refusal of exactly this program; that refusal was a gap, not a boundary, and its own stated premise ('the SIZE must carry the headroom and the captured base must be rounded') is precisely the work this now witnesses. gcc 13.3.0 and clang 18.1.3, probed separately, both compile this exact source and exit 42. A VLA never visits the frame-slot walk that honours a FIXED over-aligned local (D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL) — its base IS the post-`sub sp` stack pointer — so the reservation rides the RUNTIME SIZE and the captured base is rounded with the shared `emitAlignUpToPowerOfTwo`. SP is never realigned, no register is reserved, the C5 teardown watermark is untouched, nothing is keyed on an architecture or object format. TWO INDEPENDENT PROPERTIES: (1) THE BASE IS ALIGNED — checked on every element of all three arrays (returns 1/2/3); (2) THE ARRAY STILL FITS IN WHAT WAS RESERVED — rounding the base upward eats bytes off the front of the reservation, so the SIZE must carry matching headroom or the array's tail lands on whatever was allocated before it (returns 9..15). ★ (2) IS WHY THIS EXAMPLE LOOKS THE WAY IT DOES. An earlier draft used only `struct { alignas(32) int head; int body[3]; }` and wrote only its named members; the overrun landed in that element's 16 bytes of trailing PADDING, nothing observed it, and the example passed OVER A LIVE MISCOMPILE — ✔MEASURED: with the headroom set to `elemAlign - stackAlignment` (the bound the fixed-local mechanism uses) two live VLAs here sat 120 bytes apart while the first was 128 bytes long, an 8-byte OVERLAP of two distinct objects, because the post-`sub sp` SP on x86_64/pe64 is congruent to 8 mod 16 and not to 0 mod stackAlignment. So `struct Over` is 32 bytes of addressable ints with NO padding and every byte is written; the padded shape is still exercised as `struct Pad` because it is the withdrawn example's subject, and `struct Wide` (alignas(64)) exercises a headroom wider than one element. Each VLA is allocated below the previous, so an overrun runs up into its predecessor, and every object is re-verified after every other has been fully written. Returns 16..20 pin that the headroom never leaks into `sizeof`. main is a LEAF (no calls) — a VLA function that calls anything is separately refused (L_VlaNonLeafFrameUnsupported), so a sink call would measure that refusal instead. The `release` arm proves the runtime rounding survives the full optimizer. exitCode 42; returns 1..20 are the strict in-program pins. Red-on-disable: zero `alignHeadroom` in lowerVlaAlloca and (2) returns 9; drop the emitAlignUpToPowerOfTwo on the captured base and (1) returns 1.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

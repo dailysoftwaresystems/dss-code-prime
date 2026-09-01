@@ -2960,6 +2960,84 @@ function Get-DssSearchNote {
           "outside these roots.")
 }
 
+# ⚠⚠ REFRESH A *LOCATED* COMPILER — A BINARY THAT WAS FOUND IS NOT EVIDENCE IT WAS
+# BUILT FROM THE SOURCES THIS RUN WILL COMPILE.
+# [[D-HARNESS-PS1-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-SOURCES-IT-COMPILES]]
+#
+# TWO EXISTING INSTRUMENTS LOOK LIKE THEY COVER THIS AND NEITHER DOES — each answers
+# a NEIGHBOURING question, and both fail toward *clean*:
+#   · the compiler-currency pre-flight (`Assert-DssCompilerCurrent`, below) proves the
+#     binary can CONSUME today's `src/dss-config` vocabulary. That is CONFIG drift —
+#     D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN — and a
+#     binary from four cycles ago passes it whenever no config KEY moved.
+#   · Step 9's `(+N file(s) differ from HEAD)` compares the WORKING TREE to HEAD and says
+#     nothing about the BINARY. ✔MEASURED 2026-09-01: it read `+56 file(s) differ from
+#     HEAD` BYTE-IDENTICALLY in a run whose compiler was built four cycles earlier and in
+#     the re-run whose compiler was built minutes before. It cannot separate the two, and
+#     it prints AFTER the run is spent besides.
+# ✔MEASURED, same day: the located-binary branch handed `veryquick` a `build\rel\dsscp`
+# built 08/31 23:25 while the working tree carried a whole cycle of `src/` changes;
+# forcing the build recompiled 144 targets. The corpus would have been compiled by the
+# PREVIOUS cycle's compiler and reported as this one's. It survived only because sqlite
+# reaches no <threads.h> recipe — LUCK, not design, since that cycle moved `threads.json`
+# and the closed recipe vocabulary TOGETHER, which is exactly the config/source pair the
+# currency probe cannot see across.
+#
+# ⇒ THE FIX MAKES THE QUESTION UNASKABLE INSTEAD OF ANSWERING IT, WHICH IS WHAT THE .sh
+# TWIN ALREADY DOES (build-and-test.sh Step 5 runs `cmake --build` unconditionally). The
+# twins now agree on what compiler a run uses. An incremental build of a current tree is a
+# ninja no-op against a run measured in hours.
+# ⚠ A FAILED REBUILD IS FATAL, NEVER A FALLBACK TO THE BINARY WE FOUND. Falling back is
+# the defect itself: an unverifiable compiler under a reassuring [OK].
+# ⓘ THE BUILD IS INJECTED (`$invokeBuild`) so the pin can drive this WITHOUT a cmake or a
+# configured tree — a self-test that shells out to a real build measures the machine, not
+# this logic. It returns the child's exit code.
+function Update-LocatedDssCompiler($tree, $binPath, $builtWhen, $jobs, $invokeBuild) {
+  if (-not $tree) {
+    Die @"
+the located Release compiler's build TREE could not be determined, so this run cannot refresh it
+      and cannot know that its compiler embodies the sources it is about to compile.
+      binary : $binPath (built $builtWhen)
+      Name one with `$env:DSS_BIN, or build a Release tree (cmake -S . -B build/rel -DCMAKE_BUILD_TYPE=Release).
+"@
+  }
+  $rc = & $invokeBuild $tree $jobs
+  # ⚠⚠ A NATIVE COMMAND'S STDOUT IS PIPELINE OUTPUT, so a builder that does not
+  # SWALLOW it returns `[...every line..., code]` and `$rc -ne 0` is then TRUE for
+  # a build that SUCCEEDED. ✔MEASURED 2026-09-01: the first call site written here
+  # did exactly that, and this function refused a compiler it had just rebuilt —
+  # the message read `could not be rebuilt (exit [0/2] Re-checking globbed
+  # directories... )`, with ninja's own progress where the code belongs.
+  # ⇒ REFUSE THE CONTRACT VIOLATION IN ITS OWN WORDS rather than coercing it. A
+  # silent `$rc[-1]` would read the right number and hide a builder that is
+  # printing into its own return value, which is the next reader's trap; and
+  # treating it as a failed build sends them to repair a tree that is fine.
+  if ($null -eq $rc -or -not ($rc -is [int])) {
+    Die @"
+the injected build did not return an EXIT CODE, so this run cannot tell a successful rebuild from a
+      failed one.
+      tree     : $tree
+      returned : $(if ($null -eq $rc) { '<null>' } else { "$($rc.GetType().Name) — " + (($rc | Select-Object -First 3) -join ' / ') })
+      A builder must SWALLOW the child's stdout (…| Out-Host) and return only `$LASTEXITCODE — a
+      native command's output is pipeline output, so an unswallowed line becomes part of the value.
+"@
+  }
+  if ($rc -ne 0) {   # FATAL: falling back to the binary we located IS the defect
+    Die @"
+the LOCATED Release compiler could not be rebuilt (exit $rc), so this run cannot know that its
+      compiler embodies the sources it is about to compile.
+      tree   : $tree
+      binary : $binPath (built $builtWhen)
+      This is FATAL rather than a fallback: reusing the binary found here is precisely the defect
+      D-HARNESS-PS1-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-SOURCES-IT-COMPILES describes.
+      Repair the tree (cmake -S . -B $tree -DCMAKE_BUILD_TYPE=Release), point this run at another
+      one, or set SKIP_DSS_BUILD=1 to reuse a binary DELIBERATELY — that path says so in every
+      report line of the run.
+"@
+  }
+  return $tree
+}
+
 $DssBin = $null; $DssInfo = $null; $DssCands = @()
 # Every branch below sets this; the initial value is what a branch added LATER
 # and not extended would report, and "unstated" is the only honest default.
@@ -3042,11 +3120,24 @@ $(Format-DssCandidateList $DssCands)
     $DssInfo  = Select-DssCompiler $DssCands
     if ($DssInfo) { $DssBin = $DssInfo.Path; $DssOrigin = 'BUILT by this run' }
   } else {
+    # ⚠⚠ THE BRANCH THE OLD ROW WAS OPENED ON — IT NOW REFRESHES RATHER THAN MERELY
+    # LOCATING. The reasoning, the measurement and the two instruments that each
+    # answer a neighbouring question are stated at `Update-LocatedDssCompiler`.
     $DssBin = $DssInfo.Path
-    # ⚠ THE BRANCH THIS ROW WAS OPENED ON. An eligible Release binary was FOUND,
-    # so nothing is built and nothing re-reads how old it is — the run then
-    # compiles today's config with whatever this root happened to hold.
-    $DssOrigin = 'LOCATED under an eligible build root — NOT built by this run'
+    Info "refreshing the located Release compiler ($($DssInfo.Tree)) — a located binary is not evidence it was built from these sources"
+    # ⚠ `| Out-Host` IS LOAD-BEARING, NOT COSMETIC: it keeps ninja's progress on the
+    # console while keeping it OUT of this scriptblock's return value. Without it the
+    # value is `[...output..., code]` and the refusal above fires on a build that
+    # succeeded — ✔measured, and the reason that refusal names the contract.
+    [void](Update-LocatedDssCompiler $DssInfo.Tree $DssBin $DssInfo.LastWriteTime $Jobs `
+             { param($t, $j) & cmake --build $t --config Release --target dsscp -j $j | Out-Host; return $LASTEXITCODE })
+    # RE-READ rather than assume the build moved it: the reported timestamp must be
+    # the one on disk NOW, and a build that landed elsewhere must not be reported as
+    # this one. Same discipline as the from-scratch branch above.
+    $DssCands = Find-DssCandidates
+    $DssInfo  = Select-DssCompiler $DssCands
+    if ($DssInfo) { $DssBin = $DssInfo.Path }
+    $DssOrigin = 'LOCATED under an eligible build root, then REBUILT by this run (incremental)'
   }
 }
 if (-not $DssBin -or -not (Test-Path -LiteralPath $DssBin)) {

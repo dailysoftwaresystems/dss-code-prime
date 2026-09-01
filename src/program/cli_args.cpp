@@ -273,7 +273,17 @@ std::string cliHelpText() {
             "cross-compiling against a stand-in library whose on-disk "
             "identity is not the target's; it is meaningful only for a "
             "dynamic library, since a merged archive records no import at "
-            "all. Split on the LAST `=`; both sides must be non-empty.\n"
+            "all. Split on the LAST `=`; both sides must be non-empty. "
+            // D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE:
+            // the sentence above already said the name is meaningless on an
+            // archive, and the compiler used to prove it by saying nothing.
+            // The help now states what it DOES, because a documented no-op a
+            // user cannot observe is the same silence in another file.
+            "Stating one for an `ar` archive or a relocatable object — inputs "
+            "the build MERGES rather than imports from — is REPORTED "
+            "(F_DeclaredImportNameNotRecordable, a warning; "
+            "--warnings-as-errors refuses it) rather than silently "
+            "ignored.\n"
         "  --stack-reserve <bytes>  stack reserve to request in the emitted "
             "image, in bytes (e.g. 4194304 = 4 MiB). Overrides the object "
             "format's default; a project manifest's `stackReserve` key is "

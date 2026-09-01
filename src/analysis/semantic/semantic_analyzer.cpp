@@ -995,6 +995,60 @@ resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
     }
     return false;
 }
+// VLA (D-CSUBSET-VLA): is the declared type of an object built from its declaration's
+// HEAD type (a typedef alias's type) by nothing but this declarator's OWN decoration?
+// The three shapes a VLA-typedef object can take, and the ONLY three:
+//
+//   `R a;`     declTy == headTy                     — the object IS the alias
+//   `R a[m];`  declTy == array(...array(headTy))    — the object's own suffix(es) sit
+//                                                     ABOVE the alias's array spine
+//   `R *p;`    declTy == Ptr(headTy)                — the alias IS the pointee
+//
+// Used to decide whether to stamp `SymbolRecord::vlaTypedefOrigin`, which is how the
+// later tiers learn WHICH typedef froze the runtime size C99 §6.7.7p2 evaluates once.
+// Deliberately EXACT rather than a containment walk: `R *q[3]` (array of pointers) and
+// `R **r` do not match, because neither the HIR capture nor the MIR composition below
+// is built for them — and an unstamped object keeps its existing loud refusal, which
+// is the safe direction. Terminates: the array spine is finite (each step takes
+// `operands[0]` of an Array, and the interned operand DAG is acyclic).
+[[nodiscard]] bool declaredTypeDerivesFromAliasHead(TypeInterner const& in,
+                                                    TypeId declTy, TypeId headTy) {
+    if (!declTy.valid() || !headTy.valid()) return false;
+    if (declTy == headTy) return true;
+    // A head that is ALREADY a pointer (`typedef int (*P)[n];`) admits only the bare
+    // `P p;` above — the pipeline freezes ONE pointee row stride per pointer, so
+    // `P q[3]` (an array of them) and `P *r` (a pointer to one) have no composition and
+    // must keep their loud refusal rather than inherit a stride that is not theirs.
+    if (in.kind(headTy) == TypeKind::Ptr) return false;
+    if (in.kind(declTy) == TypeKind::Ptr) {
+        auto const ops = in.operands(declTy);
+        return !ops.empty() && ops[0] == headTy;
+    }
+    TypeId walk = declTy;
+    for (int guard = 0; guard < 4096 && in.kind(walk) == TypeKind::Array; ++guard) {
+        auto const ops = in.operands(walk);
+        if (ops.empty()) return false;
+        walk = ops[0];
+        if (walk == headTy) return true;
+    }
+    return false;
+}
+
+// VLA (D-CSUBSET-VLA): does a declaration's HEAD type carry a runtime array bound whose
+// size C99 §6.7.7p2 froze at the typedef — either directly (`typedef int R[n];`, an
+// array or an array containing one) or as a pointee (`typedef int (*P)[n];`, where the
+// frozen quantity is the POINTEE ROW STRIDE `p[i]` steps by)? `typeContainsVla` stops at
+// a pointer top by design — the pointer itself is a fixed 8 bytes — so the pointee is
+// tested explicitly, exactly as the HIR and MIR tiers do at their own decision sites.
+[[nodiscard]] bool aliasHeadCarriesVla(TypeInterner const& in, TypeId headTy) {
+    if (!headTy.valid()) return false;
+    if (in.isVlaArray(headTy) || in.typeContainsVla(headTy)) return true;
+    if (in.kind(headTy) == TypeKind::Ptr) {
+        auto const ops = in.operands(headTy);
+        return !ops.empty() && in.typeContainsVla(ops[0]);
+    }
+    return false;
+}
 [[nodiscard]] bool admitsNullPointerConstant(
     EngineState& s, Tree const& tree,
     TypeId lhsTy, NodeId rhsExpr,
@@ -1960,6 +2014,28 @@ foldCompileTimeAnswer(EngineState& s, SemanticConfig const& cfg, Tree const& tre
 [[nodiscard]] NodeId
 chooseExprSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                       NodeId node, ScopeId here, bool loud);
+
+// P49 (D-CSUBSET-GENERIC-SELECTION-IS-NOT-AN-INTEGER-CONSTANT-EXPRESSION):
+// `_Generic` — the NodeId of the association its CONTROLLING TYPE selects, or
+// InvalidNode when the selection cannot be made here (unresolved controlling
+// type / no match with no `default` / ambiguous). The type-keyed twin of
+// `chooseExprSelectedArm` above, with the SAME single-owner discipline: it types
+// the controlling child through `subtreeType` and hands that type to the ONE
+// generic-selection chokepoint `selectGenericAssociation`, so the winner this
+// returns in a const-expr context is BY CONSTRUCTION the winner Pass 2 stamps
+// and the CST→HIR tier lowers. A private match here would be a third opinion on
+// which association survives, and the two could disagree about the VALUE of a
+// program that still compiled.
+//
+// ALWAYS SILENT, and that is not a convenience: `S_GenericSelectionNoMatch` /
+// `S_GenericSelectionAmbiguous` are Pass 2's to emit (it visits every `_Generic`
+// node), and this runs from a const-expr fold whose own caller already fails
+// loud in its own words (`S_StaticAssertFailed`, `S_NonConstantArrayLength`,
+// `S_NonConstantEnumeratorValue`). Hence no `loud` parameter — unlike its twin,
+// there is no caller that would pass true.
+[[nodiscard]] NodeId
+genericSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                   NodeId node, ScopeId here);
 
 // VLA C1a (D-CSUBSET-VLA): the two array-suffix arms (`applyArraySuffix`,
 // `applyDeclaratorSuffix` — both DEFINED above the definition below) gate the VLA
@@ -3344,14 +3420,37 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
             return foldCompileTimeAnswer(s, *cfg, tree, node, fromScope,
                                          /*loud=*/false);
         };
-        // P31: `__builtin_choose_expr` in a const-expr context. Returns the
-        // SELECTED arm so the engine evaluates only that one — which is why
-        // `__builtin_choose_expr(1, 4, 1/0)` folds to 4 instead of tripping the
-        // divide-by-zero wall, exactly as gcc does.
-        env.resolveChosenExpr = [&s, &tree, cfg, fromScope](NodeId node)
+        // P31 / P49: a COMPILE-TIME SELECTION in a const-expr context. ONE
+        // closure serves BOTH selection constructs — the engine has one arm for
+        // them because what it does with a selection does not depend on how the
+        // winner was chosen; this closure is where the two ways of choosing live,
+        // each delegating to the selector that already owns it:
+        //   * `__builtin_choose_expr` — winner from an integer constant condition
+        //     (`chooseExprSelectedArm`). Returning the arm is why
+        //     `__builtin_choose_expr(1, 4, 1/0)` folds to 4 instead of tripping
+        //     the divide-by-zero wall, exactly as gcc does.
+        //   * `_Generic` — winner from the CONTROLLING TYPE
+        //     (`genericSelectedArm` → the ONE `selectGenericAssociation`
+        //     chokepoint). C23 6.5.1.1p3: a generic selection IS an integer
+        //     constant expression when the SELECTED assignment-expression is one,
+        //     and the unselected associations are unevaluated. Returning only the
+        //     winner delivers both halves at once — an unselected `default:
+        //     f()` cannot poison a constant `int:` arm, and a NON-constant
+        //     SELECTED arm still fails, because the engine folds what it is
+        //     handed and gets no separate assertion of constness from here.
+        // Both are SILENT: the const-expr caller owns the user-facing message.
+        env.resolveSelectedArm = [&s, &tree, cfg, fromScope](NodeId node)
             -> std::optional<NodeId> {
-            NodeId const arm = chooseExprSelectedArm(s, *cfg, tree, node,
-                                                     fromScope, /*loud=*/false);
+            NodeId arm{};
+            RuleId const rule = tree.kind(node) == NodeKind::Internal
+                                    ? tree.rule(node) : RuleId{};
+            if (cfg->genericRule.valid() && rule.valid()
+                && rule.v == cfg->genericRule.v) {
+                arm = genericSelectedArm(s, *cfg, tree, node, fromScope);
+            } else {
+                arm = chooseExprSelectedArm(s, *cfg, tree, node,
+                                            fromScope, /*loud=*/false);
+            }
             if (!arm.valid()) return std::nullopt;
             return arm;
         };
@@ -3623,6 +3722,53 @@ chooseExprSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tre
     }
     return *cond != 0 ? kids[cfg.builtinChooseThenChild]
                       : kids[cfg.builtinChooseElseChild];
+}
+
+// P49 (D-CSUBSET-GENERIC-SELECTION-IS-NOT-AN-INTEGER-CONSTANT-EXPRESSION): the
+// type-keyed twin of `chooseExprSelectedArm` (see its forward declaration for
+// the single-owner and silence rules). Types the controlling child on
+// `subtreeType`'s own work-stack and hands that type to the ONE
+// `selectGenericAssociation` chokepoint — so a const-expr fold, Pass 1.5's type
+// query and Pass 2's stamp all name the SAME winner.
+//
+// ★ THE CONTROLLING EXPRESSION IS TYPED, NEVER FOLDED. C 6.5.1.1p3 makes it an
+// unevaluated operand: `_Generic(f(), int: 4, default: 1)` is a perfectly good
+// integer constant expression even though `f()` is not, because only the
+// controlling TYPE is consulted. Asking `constIntExpr` about it — the shape the
+// choose-expr twin correctly uses, since ITS controlling expression must be an
+// ICE — would refuse exactly the programs the standard admits.
+//
+// ⚠ `subtreeType` at Pass 1.5 (an array dimension, before Pass 2 stamps
+// expression types) resolves an identifier's type by scope lookup, which is what
+// makes `int a[_Generic(x, int: 4, default: 1)]` fold at declaration-type time.
+// A controlling expression whose type this pass cannot yet see yields
+// InvalidType, `selectGenericAssociation` then reports no resolved controlling
+// type, and this returns InvalidNode → the caller fails loud with its own
+// positioned diagnostic. NEVER a guessed association: picking `default` for an
+// unresolved controlling type would silently choose a DIFFERENT VALUE from the
+// one Pass 2 goes on to stamp.
+NodeId
+genericSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                   NodeId node, ScopeId here) {
+    if (!node.valid() || tree.kind(node) != NodeKind::Internal) return InvalidNode;
+    if (!cfg.genericRule.valid() || tree.rule(node).v != cfg.genericRule.v) {
+        return InvalidNode;
+    }
+    auto kids = visibleChildren(tree, node);
+    if (cfg.genericControlChild >= kids.size()) return InvalidNode;
+    // NET-SILENT, the discipline `subtreeType`'s own cast arm states: a Pass-1.5
+    // type query resolves association / cast type-names, and the `_BitInt` /
+    // typeof-bitfield constraint diagnostics fire UNCONDITIONALLY and bypass the
+    // reporter's dedup window — so a bare query here would double-emit against
+    // Pass 2's loud re-resolve of the same node. The resolved TypeIds and the
+    // benign interner side effects persist; only the reports are dropped.
+    auto const snap = s.reporter.snapshotForRollback();
+    TypeId const controllingType =
+        subtreeType(s, tree, kids[cfg.genericControlChild], here);
+    GenericSelection const sel =
+        selectGenericAssociation(s, cfg, tree, node, here, controllingType);
+    s.reporter.truncateTo(snap);
+    return sel.selected.valid() ? sel.selected : InvalidNode;
 }
 
 // FC17 (D-CSUBSET-CONSTEXPR): the FLOAT-CAPABLE full-value sibling of
@@ -9015,12 +9161,30 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             // AND that head type is (or contains) a VLA, descend the head
                             // for the alias type-name identifier and, if it resolves to a
                             // typedef of that VLA type, stamp the object's
-                            // `vlaTypedefOrigin`. The `declTy == headTy` gate is
-                            // load-bearing: `R a[m]` (extra dim → declTy has one more
-                            // array level) and `R *p` (declTy is Ptr) DIFFER from headTy
+                            // `vlaTypedefOrigin`. A miss here is a safe fail-loud
+                            // downstream (no captured size), never a silent miscompile.
+                            //
+                            // ★★ THE GATE USED TO BE `declTy == headTy` AND THAT
+                            // EXCLUSION WAS THE WHOLE OF THIS ROW'S RESIDUE. It read
+                            // "`R a[m]` (extra dim) and `R *p` (Ptr) DIFFER from headTy
                             // → EXCLUDED (they keep their own capture + deferred
-                            // fail-loud). A miss here is a safe fail-loud downstream (no
-                            // captured size), never a silent miscompile.
+                            // fail-loud)". ✔MEASURED 2026-09-01, gcc 13.3.0 and clang
+                            // 18.1.3 probed SEPARATELY (`-std=c17 -Wall -Wextra`, one
+                            // self-contained block-scope TU): BOTH shapes compile, run
+                            // and print the right values under BOTH — so by
+                            // `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` they are REQUIRED.
+                            // (MSVC refuses them because it implements no C99 VLA at
+                            // all — `error C2057: expected constant expression` on the
+                            // typedef itself — which is why the disjunction, not
+                            // unanimity, decides.) The gate is now `declaredTypeDerives
+                            // FromAliasHead`: EXACTLY headTy, or headTy under `k ≥ 1`
+                            // of this declarator's OWN array suffixes, or `Ptr<headTy>`.
+                            // The object then carries `ownDims` bounds of its own and
+                            // the alias contributes every level below them; HIR captures
+                            // the object's own suffixes and MIR composes the two (C99
+                            // §6.7.7p2 keeps the alias's levels FROZEN at the typedef).
+                            // Anything else — `R *q[3]`, `R **r` — still fails to match
+                            // and keeps its deferred fail-loud.
                             // Gate to OBJECT declarations only — `vlaTypedefOrigin`
                             // means "the VLA typedef this OBJECT froze its size from",
                             // read solely by the object's HIR alloca. A chained VLA
@@ -9029,9 +9193,9 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             // (declaratorHasArraySuffix), so it needs no origin flag —
                             // keeping this write off typedef symbols.
                             if (s.symbols.at(sym).kind == DeclarationKind::Variable
-                                && declTy == headTy
-                                && (s.lattice.interner().isVlaArray(headTy)
-                                    || s.lattice.interner().typeContainsVla(headTy))
+                                && declaredTypeDerivesFromAliasHead(
+                                       s.lattice.interner(), declTy, headTy)
+                                && aliasHeadCarriesVla(s.lattice.interner(), headTy)
                                 && decl.headChild.has_value()
                                 && *decl.headChild < kids.size()) {
                                 // First type-name identifier token in the head (the
@@ -9071,10 +9235,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         auto const& arec = s.symbols.at(aliasSym);
                                         if (arec.kind == DeclarationKind::Type
                                             && arec.type.valid()
-                                            && (s.lattice.interner()
-                                                    .isVlaArray(arec.type)
-                                                || s.lattice.interner()
-                                                       .typeContainsVla(arec.type)))
+                                            && aliasHeadCarriesVla(
+                                                   s.lattice.interner(), arec.type))
                                             s.symbols.at(sym).vlaTypedefOrigin = aliasSym;
                                     }
                                 }

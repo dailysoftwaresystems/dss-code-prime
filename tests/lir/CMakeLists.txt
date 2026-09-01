@@ -204,10 +204,24 @@ dss_add_test(NAME lir/test_lir_text_unsealed_block
 # are over the two published derivations that decide the reservation, and over the
 # SUFFICIENCY PROPERTY (rounding any raw slot address must land inside its own
 # reservation) rather than over a table of offsets — a table would be right at 32 and
-# silent at 64. Nothing here drives the unit-tier front end, whose frame shapes can
-# measure zero
-# ([[D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO]]);
-# the end-to-end evidence is the runtime corpus (`examples/c/alignas_local_over32`,
-# `alignas_local_cacheline64`, `alignas_member_over32_local`).
+# silent at 64. Nothing here drives the unit-tier front end — a sufficiency property
+# is pinned harder by calling the derivation directly than by inspecting one lowered
+# program, and the file's own banner carries the reason (the row it used to cite,
+# D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO, closed
+# in P49 and no longer states a live hazard). The end-to-end evidence is the runtime
+# corpus (`examples/c/alignas_local_over32`, `alignas_local_cacheline64`,
+# `alignas_member_over32_local`).
 dss_add_test(NAME lir/test_lir_overaligned_local_frame
              SOURCES test_lir_overaligned_local_frame.cpp)
+
+# D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO:
+# the pin over `lowered_lir_fixture.hpp` ITSELF. `lowerCToLir` used to return a
+# refused lowering looking exactly like an accepted one, so every pin driving it
+# could be asserting over a mutilated module. Its arms run the fixture INSIDE
+# `EXPECT_NONFATAL_FAILURE` — an instrument that reports is worth nothing until
+# it has been seen to report — and carry the false-red controls (an empty body,
+# and a body whose one statement is a bare `return`) that keep the refusal off
+# correct C. Its own target because it is the only file here that asserts the
+# harness fails rather than that the compiler succeeds.
+dss_add_test(NAME lir/test_lir_fixture_vacuity_guard
+             SOURCES test_lir_fixture_vacuity_guard.cpp)

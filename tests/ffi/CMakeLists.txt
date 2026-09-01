@@ -164,3 +164,33 @@ dss_add_test(NAME ffi/test_stdint_alias_identity
              SOURCES test_stdint_alias_identity.cpp)
 target_link_libraries(dss_ffi_test_stdint_alias_identity
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CSUBSET-C11-THREADS-TIMED (P49 lane th): the per-format `struct timespec`
+# body, in BOTH descriptors that declare it. `time.json` and `sys/stat.json` each
+# carried a FLAT {i64,i64} body while listing `pe` among their formats, and on
+# LLP64 the nanoseconds field is `long` = FOUR bytes. sizeof is 16 on both worlds
+# and tv_nsec is at offset 8 on both, so neither a size nor an offset assertion
+# can discriminate — this is a WIDTH + IDENTITY pin, like the timeval one it
+# follows. Builds REMOVE-direction mutants of the shipped descriptors on a COPY
+# (drop the pe arm from both files; drop it from only one, the half-fix the
+# cross-file identity guard caught), so it needs the JSON reader directly like
+# its siblings.
+dss_add_test(NAME ffi/test_shipped_timespec_layout
+             SOURCES test_shipped_timespec_layout.cpp)
+target_link_libraries(dss_ffi_test_shipped_timespec_layout
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CSUBSET-C11-THREADS-TIMED (P49 lane tw): the FOUR C11 <threads.h> functions
+# that were declared on NO object format — thrd_sleep (elf only), mtx_timedlock,
+# cnd_timedwait, thrd_equal — and the per-format MECHANISM each now uses. The
+# corpus examples prove the BEHAVIOUR but only on the host whose format they
+# target; this asserts all three formats' declarations from ANY host, so dropping
+# the macho arms reds on the Windows leg instead of waiting for a Mac. Builds
+# REMOVE-direction mutants of the shipped descriptor on a COPY (delete the pe/macho
+# rows; delete only the `synthesize` KEY, which is the state that produced a
+# cleanly-compiled .exe that would not LOAD), so it needs the JSON reader directly
+# like its siblings.
+dss_add_test(NAME ffi/test_shipped_threads_timed_declarations
+             SOURCES test_shipped_threads_timed_declarations.cpp)
+target_link_libraries(dss_ffi_test_shipped_threads_timed_declarations
+                      PRIVATE nlohmann_json::nlohmann_json)

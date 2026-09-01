@@ -5079,18 +5079,143 @@ TEST(LirCallconv, Aarch64HighStackDoubleParamUsesScaledFpFrameLoad) {
         << "every beyond-reach FP frame load took the encodable scaled form";
 }
 
-// ⚠ THERE IS NO OUTGOING-STACK-ARG STORE PIN AT THIS TIER, AND THE REASON
-// IS A MEASUREMENT, NOT AN OVERSIGHT. One was written — an 80-double
-// outgoing arg list, whose args 8.. are stored at [sp + i*8] and so run
-// past the short reach — and it measured ZERO scaled stores. ✔MEASURED
-// why: `lowerCToLir`, the C front end this file's fixture drives, lowers
-// an 80-ARGUMENT CALL to nothing at all (srcInsts=3, funcs=1, insts=2)
-// with `lowerOk`, `allocOk` and `rewriteOk` ALL TRUE and zero diagnostics
-// — the full CLI pipeline compiles the identical source and emits forty
-// `str d0, [sp, #256..568]`. So a pin here would have asserted a
-// selection over an EMPTY module: green, and about nothing.
+// ── THE OUTGOING-ARGUMENT STORE TWIN OF THE ARM ABOVE ──────────────────────
 //
-// The STORE direction is pinned where it can be seen instead:
+// ★★ THIS PIN EXISTS AGAIN, AND ITS ABSENCE WAS THE WHOLE OF
+// D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO.
+// Lane `fo` wrote it in P47, measured ZERO scaled stores, and REMOVED it rather
+// than ship a green test about nothing — the correct call, and the row was
+// filed from it. What the row could not see is WHY: `lowerCToLir` passed a NULL
+// `ffiMap`, so the `double g(...);` PROTOTYPE this source needs was refused at
+// HIR->MIR, the call to it was dropped as an unbound Ref, and the module `fo`
+// measured had no call in it at all. `mirReporter` carried both errors and
+// `HirToMirResult.ok` was FALSE the entire time; the fixture returned them
+// unread. The map is threaded now and the fixture states its verdict, so the
+// same source lowers the same forty stores the CLI always emitted.
+//
+// ⚠ THE ARGUMENT COUNT WAS NEVER THE TRIGGER. `Aarch64HighStackDoubleParamUses
+// ScaledFpFrameLoad` above passes the identical eighty doubles as PARAMETERS
+// and always lowered clean, because a definition's parameter list mints no
+// extern node. The load twin worked and the store twin did not for one reason:
+// only the store twin needed a callee to call.
+TEST(LirCallconv, Aarch64HighOutgoingStackDoubleArgUsesScaledFpFrameStore) {
+    // EIGHTY outgoing `double` args: AAPCS64 passes the first 8 in v0..v7 and
+    // stores the rest at [sp + i*8], so the last lands at sp+568 — past the
+    // unscaled imm9 reach — and its class is FPR. The store direction must
+    // therefore reach for the FP file's OWN scaled twin, exactly as the load
+    // direction does one screen up.
+    //
+    // ⚠ THE ARGUMENTS ARE TWO PARAMETERS ALTERNATED, NOT EIGHTY CONSTANTS, AND
+    // THAT IS A MEASUREMENT RATHER THAN A STYLE CHOICE. Eighty distinct
+    // constants make eighty simultaneously-live FP vregs, and `lowerThroughRewrite`
+    // — which runs allocate → rewrite with none of the passes `compile_pipeline`
+    // interposes — then refuses with *"rewriteOneFunc: function 1 exhausted the
+    // per-class scratch pool"*. ✔MEASURED: the CLI compiles the identical
+    // eighty-constant source CLEAN on this target (`R_SpilledDueToPressure: func
+    // 1 spilled 49 vreg(s)`, artifact emitted), so the wall is this helper's
+    // shorter pipeline, NOT a codegen defect — and NOT something to widen the
+    // source until it squeaks past. Two live values keep the pressure at two
+    // while the outgoing offsets still climb to 568, which is the only property
+    // this pin is about.
+    auto bundle = lowerThroughRewrite(
+        "double g(\n"
+        "         double p00,double p01,double p02,double p03,\n"
+        "         double p04,double p05,double p06,double p07,\n"
+        "         double p08,double p09,double p10,double p11,\n"
+        "         double p12,double p13,double p14,double p15,\n"
+        "         double p16,double p17,double p18,double p19,\n"
+        "         double p20,double p21,double p22,double p23,\n"
+        "         double p24,double p25,double p26,double p27,\n"
+        "         double p28,double p29,double p30,double p31,\n"
+        "         double p32,double p33,double p34,double p35,\n"
+        "         double p36,double p37,double p38,double p39,\n"
+        "         double p40,double p41,double p42,double p43,\n"
+        "         double p44,double p45,double p46,double p47,\n"
+        "         double p48,double p49,double p50,double p51,\n"
+        "         double p52,double p53,double p54,double p55,\n"
+        "         double p56,double p57,double p58,double p59,\n"
+        "         double p60,double p61,double p62,double p63,\n"
+        "         double p64,double p65,double p66,double p67,\n"
+        "         double p68,double p69,double p70,double p71,\n"
+        "         double p72,double p73,double p74,double p75,\n"
+        "         double p76,double p77,double p78,double p79\n"
+        "        );\n"
+        "double f(double x, double y) {\n"
+        "  return g(\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y\n"
+        "        );\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    // ⚠ EACH STAGE REPORTS ITS OWN REFUSAL. `lowerThroughRewrite` RETURNS EARLY
+    // on a failed allocation, so a bare `ASSERT_TRUE(rewritten.ok)` names the
+    // wrong stage — the read-the-verdict discipline this pin exists to restore,
+    // applied to the stages BELOW the fixture.
+    ASSERT_TRUE(bundle.alloc.ok())
+        << (bundle.regallocRep.all().empty()
+                ? std::string{} : bundle.regallocRep.all()[0].actual);
+    ASSERT_TRUE(bundle.rewritten.ok)
+        << (bundle.rewriteRep.all().empty()
+                ? std::string{} : bundle.rewriteRep.all()[0].actual);
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok())
+        << (ccRep.all().empty() ? std::string{} : ccRep.all()[0].actual);
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+
+    auto const fstrU = bundle.lowered.target->opcodeByMnemonic("fstr_u");
+    ASSERT_TRUE(fstrU.has_value())
+        << "arm64 must declare fstr_u — the SIMD&FP scaled unsigned-offset "
+           "store, and the twin the loader refuses to accept fldr_u without";
+    EXPECT_GT(countOpcodeInModule(cc.lir, *fstrU), 0u)
+        << "an 80-double outgoing argument list must emit at least one fstr_u: "
+           "the trailing arguments sit past the unscaled reach whatever the "
+           "frame size. 0 means the chokepoint swaps only the integer file's "
+           "op — the defect D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-"
+           "MEMORY-FORM closed, in the direction its own lane could not pin.";
+
+    // The arm that separates "the swap fired" from "the swap fired CORRECTLY":
+    // the INTEGER twin must not have been used for an FP store, which would put
+    // the double in an X register on its way to memory.
+    auto const storeU = bundle.lowered.target->opcodeByMnemonic("store_u");
+    ASSERT_TRUE(storeU.has_value());
+    EXPECT_NE(*fstrU, *storeU);
+
+    // And it must still assemble: the point is that the refusal is gone, not
+    // that a different opcode appears.
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    (void)assemble(cc.lir, *bundle.lowered.target, lirToMir, asmRep);
+    EXPECT_EQ(asmRep.errorCount(), 0u)
+        << "every beyond-reach FP outgoing-argument store took the encodable "
+           "scaled form";
+}
+
+// The STORE direction is ALSO pinned outside this tier, and those pins stand:
 //   * `Arm64Encoder.FpScaledStore*` — the encoder, byte-exact, every leg;
 //   * `TargetRegisterClassPairOps.HalfTheLongReachPairIsLoadTimeFatal` —
 //     the config, which refuses a store direction without its twin;

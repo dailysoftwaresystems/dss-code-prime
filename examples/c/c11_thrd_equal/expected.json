@@ -1,0 +1,15 @@
+{
+  "$comment": "FC17.9(a) Cycle 3 (D-CSUBSET-C11-THREADS-TIMED) — the C11 `thrd_equal` witness on 4 legs. ★★ THE LOAD-BEARING CASE IS THE CROSS ONE: a spawned thread asking whether its own `thrd_current()` names the same thread as the `thrd_t` its creator holds. On pe that is exactly where a plausible wrong implementation fails — pe's thrd_t IS a HANDLE, but `thrd_current()` answers kernel32's PSEUDO-handle (HANDLE)-2, so comparing handle VALUES reports NOT-EQUAL for the thread doing the asking, a wrong answer with no fault. The pe shim compares GetThreadId of each handle (kernel32 resolves the pseudo-handle to the caller's real id), which is also what MSVC's own <threads.h> does. Remove that indirection and this program exits 43, not 42. ★ NO RACE AND NO POLLED FLAG: thrd_create cannot hand a thread its own thrd_t, so publication is ordered by a mutex main holds from BEFORE the thread exists until after it has stored g_worker — nothing here depends on timing and nothing needs `volatile`. elf x86_64 + arm64 (qemu) resolve thrd_equal as DIRECT libc.so.6 FFI (thrd_equal@@GLIBC_2.28, `nm -D --defined-only` verified on both arches); macho DIRECT-PASSes to libSystem's pthread_equal, where thrd_current() is already a real pthread_self() id. exit = 42 + worker_verdict so both witnesses stay load-bearing. RED-on-disable: delete shippedLibs/threads.json -> the #include fires F_ShippedHeaderNotFound and the compile fails.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

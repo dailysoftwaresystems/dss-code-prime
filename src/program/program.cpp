@@ -1102,8 +1102,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // D-FFI-DECLARED-IMPORT-NAME: a STATED import name is meaningful only on
     // the DYNAMIC side (it names a runtime dependency); a static archive is
     // merged into the image and records no import at all. The partition keeps
-    // the whole spec on the dynamic side and takes only the PATH for archives,
-    // so nothing is silently dropped where it would have had an effect.
+    // the whole spec on the dynamic side and takes only the PATH for archives.
+    // ⚠ THAT DROP USED TO BE SILENT AND IS THE ANCHOR
+    // D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE: correct to
+    // drop, wrong to say nothing. `partitionResolveLibraries` now owns BOTH the
+    // dispatch and the report, so the branch that drops the name and the
+    // diagnostic that names it cannot be separated by a later edit.
     // ── D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION: the THIRD arm
     // of the same dispatch ────
     //
@@ -1114,35 +1118,23 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // had no arm for the file's actual shape. ✔MEASURED on the shipped CLI
     // before the arm landed.
     //
-    // ★ THE ORDER OF THE THREE PROBES IS NOT ARBITRARY. `ar` first, because an
-    // archive's global magic is unambiguous and its members are objects (a
-    // relocatable probe must never see the container). Then the object probe,
-    // which is asked OF THE FORMAT. Dynamic last, as the residual -- keeping the
-    // pre-existing rule that an unreadable path stays dynamic so its eager
-    // open-probe fails loud rather than being silently diverted.
-    //
-    // The whole spec rides to the dynamic side; the object and archive sides
-    // take only the PATH, because a merged input records no runtime import for a
-    // STATED import name to name (D-FFI-DECLARED-IMPORT-NAME). Nothing is
-    // dropped where it would have had an effect.
-    std::vector<std::filesystem::path> staticArchives;
+    // The probe ORDER, the unreadable-path-stays-dynamic rule and the
+    // whole-spec-rides-to-the-dynamic-side rule all live with the function now;
+    // this site states only what it does with the three lists.
+    auto resolveLibs = partitionResolveLibraries(
+        std::span<ResolveLibrarySpec const>{compileOpts.resolveLibraries},
+        **formatR, reporter);
+    std::vector<std::filesystem::path> staticArchives =
+        std::move(resolveLibs.staticArchives);
     CompileOptions perCuOpts = compileOpts;
-    {
-        std::vector<ResolveLibrarySpec> dynamicLibs;
-        for (auto const& lib : compileOpts.resolveLibraries) {
-            if (isArArchiveFile(lib.path)) {
-                staticArchives.push_back(lib.path);
-            } else if (isRelocatableObjectFile(lib.path, **formatR)) {
-                // Joins the SAME list a `--compile`-named object lands in --
-                // one channel, so there is one definition of what an object
-                // input means and no second engine to keep in step.
-                perCuOpts.objectInputs.push_back(lib.path);
-            } else {
-                dynamicLibs.push_back(lib);
-            }
-        }
-        perCuOpts.resolveLibraries = std::move(dynamicLibs);
-    }
+    // Objects join the SAME list a `--compile`-named object lands in -- one
+    // channel, so there is one definition of what an object input means and no
+    // second engine to keep in step. APPENDED, never assigned: `compileOpts`
+    // may already carry objects the source partition routed here.
+    perCuOpts.objectInputs.insert(perCuOpts.objectInputs.end(),
+                                  resolveLibs.objectInputs.begin(),
+                                  resolveLibs.objectInputs.end());
+    perCuOpts.resolveLibraries = std::move(resolveLibs.dynamicLibraries);
 
     // Cycle 24/25 build-then-lower sequence. LOOP 1: build EVERY CU's MIR up front
     // (`buildCuMir` — sem→HIR→FFI→MIR→optimize), holding each `CuMirModule` (which keeps
@@ -3364,9 +3356,24 @@ buildDependencyArtifactKey(
                                + compileOpts.objectInputs.size());
     for (ResolveLibrarySpec const& lib : compileOpts.resolveLibraries) {
         auto entry = digestLinkInput("resolve-library", fs::path{lib.path});
-        // ⚠ THE DECLARED IMPORT NAME RIDES WITH THE PATH. It outranks the
-        // binary's own embedded soname and is therefore recorded INTO the
-        // artifact — two builds differing only in it produce different bytes.
+        // ⚠ THE DECLARED IMPORT NAME RIDES WITH THE PATH. On the DYNAMIC arm it
+        // outranks the binary's own embedded soname and is therefore recorded
+        // INTO the artifact — two builds differing only in it produce different
+        // bytes.
+        // ⓘ CORRECTED 2026-09-01 (D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE):
+        // that sentence used to be stated UNCONDITIONALLY and it is FALSE for a
+        // MERGED input. ✔MEASURED at `c1754511`: two execs built from one
+        // archive, one with `=totally_bogus_name.dll` and one with no stated
+        // name, were BYTE-IDENTICAL (md5 1039fd348f4713b2bba4859a5fd6f567).
+        // Keying on it anyway is deliberate and is the SAFE direction —
+        // over-invalidation costs one rebuild, under-invalidation serves an
+        // artifact built by a different command line, and the partition that
+        // decides which arm a path takes runs BELOW this point (per target),
+        // while the key is computed ABOVE it (once for the CU set), so this
+        // site cannot know which arm the entry will reach without moving the
+        // dispatch it does not own. The build now WARNS about the moot half
+        // (`F_DeclaredImportNameNotRecordable`), so the operator is told rather
+        // than left to discover it in a cache miss.
         if (!lib.declaredImportName.empty()) {
             entry.path += "=" + lib.declaredImportName;
         }

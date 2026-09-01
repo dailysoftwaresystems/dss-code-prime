@@ -1883,6 +1883,111 @@ if (Invoke-Mutation 'F22 report an unrunnable check as a stale binary' $m22 '   
   Red 'F22 an unrunnable check is NOT a stale-binary verdict' 'Pin-CompilerCurrency' $m22
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# P - A LOCATED COMPILER IS REFRESHED, NOT TRUSTED
+#     [D-HARNESS-PS1-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-SOURCES-IT-COMPILES]
+#
+# The sibling pin O proves a located binary can READ today's config. That is a
+# DIFFERENT question from whether it was BUILT from today's sources, and the two
+# were conflated until a run compiled the sqlite corpus with a compiler four
+# cycles old and reported it as the current tree's.
+# ⓘ THE BUILD IS INJECTED, so this pin never shells out to cmake: a self-test that
+# ran a real build would measure the machine rather than this logic, and would be
+# skipped on any host without a configured tree - which is every CI host.
+# ═══════════════════════════════════════════════════════════════════════════
+function Pin-CompilerRefresh($driver) {
+  $fns = Get-Fns $driver @('Update-LocatedDssCompiler')
+  if (-not $fns) { return }
+  . ([scriptblock]::Create($fns))
+
+  # (1) IT BUILDS, AND IT BUILDS THE LOCATED TREE - not a default, not the repo
+  #     root. A refresh aimed at the wrong tree leaves the located binary exactly
+  #     as stale as before while printing that it refreshed something.
+  $seen = New-Object 'System.Collections.Generic.List[string]'
+  $okBuild = { param($t, $j) [void]$seen.Add("$t|$j"); return 0 }
+  $ret = Update-LocatedDssCompiler 'T:\rel' 'T:\rel\bin\dss\dsscp.exe' '2026-08-31 23:25:16' 7 $okBuild
+  Ck 'P1   the LOCATED tree is what gets rebuilt, with this run''s job count' 'T:\rel|7' ($seen -join ',')
+  Ck 'P2   ...and the refresh reports back the tree it built'                 'T:\rel'   "$ret"
+
+  # (3) A FAILED REBUILD REFUSES. This is the whole point: falling back to the
+  #     binary we found is the defect, dressed as resilience.
+  $badBuild = { param($t, $j) return 1 }
+  $msg = ''
+  $threw = $false
+  try { [void](Update-LocatedDssCompiler 'T:\rel' 'T:\rel\bin\dss\dsscp.exe' '2026-08-31 23:25:16' 7 $badBuild) }
+  catch { $threw = $true; $msg = "$_" }
+  if ($threw) {
+    Ok 'P3   a FAILED rebuild REFUSES, never falls back to the located binary'
+  } else {
+    $script:PinFails++
+    if (-not $script:Quiet) { Bad 'P3   a failed rebuild did NOT refuse - the run would proceed on an unverifiable compiler' }
+  }
+  # The message must name what a fallback would reinstate, or the next reader
+  # "fixes" the refusal by removing it. Asserted as a FRAGMENT: a whole anchor id
+  # here would be a citation this file does not own.
+  CkHas 'P4   ...and says which defect a fallback would reinstate' $msg 'OLDER-THAN-THE-SOURCES-IT-COMPILES'
+
+  # (5) NO TREE IS ITS OWN REFUSAL, distinct from a failed build - a binary whose
+  #     build root cannot be named cannot be refreshed, and that is not the same
+  #     fact as a build that ran and failed.
+  $msg2 = ''
+  $threw2 = $false
+  try { [void](Update-LocatedDssCompiler '' 'T:\somewhere\dsscp.exe' '2026-08-31 23:25:16' 7 $okBuild) }
+  catch { $threw2 = $true; $msg2 = "$_" }
+  if ($threw2) {
+    Ok 'P5   a binary with NO build tree REFUSES, and is not silently reused'
+  } else {
+    $script:PinFails++
+    if (-not $script:Quiet) { Bad 'P5   an untreed binary did NOT refuse' }
+  }
+  CkHas 'P6   ...and the two refusals are told apart' $msg2 'build TREE could not be determined'
+
+  # (6b) A LEAKY BUILDER IS ITS OWN REFUSAL, NOT A FAILED BUILD. ✔MEASURED on the
+  #      first real run of this fix: `& cmake ...; return $LASTEXITCODE` in a
+  #      scriptblock returns [...every output line..., code], because a native
+  #      command's stdout IS pipeline output - and the refusal above then fired on
+  #      a compiler that had just been rebuilt successfully. Coercing with $rc[-1]
+  #      would read the right number and HIDE the leak; charging it to the build
+  #      sends the reader to repair a tree that is fine.
+  $leaky = { param($t, $j) return @('[1/5] dss: computing DSS_BUILD_STAMP', '[5/5] Linking', 0) }
+  $msg3 = ''
+  $threw3 = $false
+  try { [void](Update-LocatedDssCompiler 'T:\rel' 'T:\rel\bin\dss\dsscp.exe' '2026-08-31 23:25:16' 7 $leaky) }
+  catch { $threw3 = $true; $msg3 = "$_" }
+  if ($threw3) {
+    Ok 'P6b  a builder that LEAKS its child''s stdout is refused in its own words'
+  } else {
+    $script:PinFails++
+    if (-not $script:Quiet) { Bad 'P6b  a leaky builder was accepted - a successful build would be read as a failed one' }
+  }
+  CkHas 'P6c  ...and is NOT reported as a failed build' $msg3 'did not return an EXIT CODE'
+  # The CONTROL for P6b: a plain integer 0 must still pass, or P6b is passing
+  # because the function refuses everything.
+  $seen2 = New-Object 'System.Collections.Generic.List[string]'
+  $ret2 = Update-LocatedDssCompiler 'T:\rel2' 'T:\rel2\dsscp.exe' 'w' 3 { param($t, $j) [void]$seen2.Add($t); return 0 }
+  Ck 'P6d  CONTROL: a scalar 0 still refreshes' 'T:\rel2' "$ret2"
+
+  # (7) THE CALL SITE. A function that is defined and never called is precisely
+  #     the vacuity this file exists to refuse - pin O learned the same lesson.
+  $text = (Get-Content -LiteralPath $driver) -join "`n"
+  CkHas 'P7   the located-binary branch CALLS the refresh' $text '[void](Update-LocatedDssCompiler $DssInfo.Tree'
+  CkHas 'P8   ...and the origin line says the run rebuilt it' $text 'then REBUILT by this run (incremental)'
+}
+Green 'P    a located compiler is REFRESHED, not trusted' 'Pin-CompilerRefresh'
+
+# F23 - TAKE THE FATAL ARM AWAY, i.e. "a failed rebuild is not worth stopping
+# for". That is the exact reading the pre-fix driver embodied by never building at
+# all, and it fails toward *clean*: the run continues on whatever the root held.
+$m23 = Join-Path $Work 'm23.ps1'
+if (Invoke-Mutation 'F23 let a failed rebuild fall back to the located binary' $m23 '  if ($rc -ne 0) {   # FATAL: falling back to the binary we located IS the defect' {
+      param($src)
+      return @($src | ForEach-Object {
+        if ($_.Contains('# FATAL: falling back to the binary we located IS the defect')) { '  if ($false) {' } else { $_ }
+      })
+    }) {
+  Red 'F23 a failed rebuild is FATAL, not a fallback' 'Pin-CompilerRefresh' $m23
+}
+
 Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
 Write-Host ''
 Write-Host "passed=$($script:Passed) failed=$($script:Failed) skipped=$($script:Skipped)"

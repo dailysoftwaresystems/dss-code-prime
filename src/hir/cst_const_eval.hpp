@@ -191,13 +191,30 @@ using CstFieldOffsetResolver =
 using CstFoldedConstantResolver =
     std::function<std::optional<std::uint64_t>(NodeId)>;
 
-// P31: compile-time-SELECTION resolver — given a node of the config's
-// `chooseExprRule` (`__builtin_choose_expr`), return the NodeId of the arm its
-// constant condition selects, or nullopt (non-constant condition / malformed).
-// The engine then evaluates THAT node, so the discarded arm is never even
-// visited — which is what makes `__builtin_choose_expr(1, 4, 1/0)` fold rather
-// than trip the divide-by-zero wall, exactly as gcc does.
-using CstChosenExprResolver = std::function<std::optional<NodeId>(NodeId)>;
+// P31 / P49: compile-time-SELECTION resolver — given a node of ANY config-
+// declared compile-time-selection rule, return the NodeId of the arm that
+// selection picks, or nullopt (the selection could not be made / malformed).
+// The engine then evaluates THAT node, so the discarded arms are never even
+// visited.
+//
+// TWO rules reach it, and they are ONE arm here on purpose — the two constructs
+// differ ONLY in HOW the semantic tier picks the winner, never in what a
+// consumer then does with it, which is the same reason the CST→HIR tier routes
+// both through one `lowerRecordedSelection` body:
+//   * `chooseExprRule` (`__builtin_choose_expr`) — winner picked by an INTEGER
+//     CONSTANT condition. Makes `__builtin_choose_expr(1, 4, 1/0)` fold to 4
+//     instead of tripping the divide-by-zero wall, exactly as gcc does.
+//   * `genericRule` (C11/C23 6.5.1.1 `_Generic`) — winner picked by the
+//     controlling expression's TYPE. C23 6.5.1.1p3 makes a generic selection an
+//     integer constant expression WHEN THE SELECTED assignment-expression is
+//     one, and makes the unselected associations unevaluated — so evaluating
+//     only the returned arm is not an optimization here, it IS the standard's
+//     rule: `_Generic(x, int: 4, default: f())` must fold to 4 while
+//     `_Generic(x, int: f(), default: 4)` must stay non-constant.
+// A resolver that returns a valid arm asserts nothing about that arm's
+// constness — the engine folds it like any other expression, so the standard's
+// boundary is enforced by the ordinary fold rather than by a second opinion.
+using CstSelectedArmResolver = std::function<std::optional<NodeId>(NodeId)>;
 
 struct CstEvalEnvironment {
     CstSymbolInitResolver  resolveSymbolInit{};
@@ -207,7 +224,7 @@ struct CstEvalEnvironment {
     CstCastTargetResolver  resolveCastTarget{};   // c43 — (T*)0 / (char*)x / (size_t)int
     CstFieldOffsetResolver resolveFieldOffset{};  // c43 — &((T*)0)->M offsets
     CstFoldedConstantResolver resolveFoldedConstant{};  // P31 — offsetof / types_compatible_p
-    CstChosenExprResolver     resolveChosenExpr{};      // P31 — __builtin_choose_expr
+    CstSelectedArmResolver    resolveSelectedArm{};     // P31/P49 — __builtin_choose_expr / _Generic
 };
 
 // Static recognition context. All fields are non-owning references

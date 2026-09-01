@@ -29,17 +29,24 @@
 // reddens. That property's violation is precisely the silent miscompile: a rounded
 // address landing in the NEXT local's bytes.
 //
-// ⚠ THIS FILE DELIBERATELY DOES NOT DRIVE THE UNIT-TIER FRONT END.
-// [[D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO]]:
-// `lowerCToLir` has returned `lowerOk` true with an EMPTY saved-register set for a
-// program that plainly has one, so any `tests/lir` pin whose subject is a frame, a
-// spill or a saved register can be VACUOUS while looking green. Everything here is
-// either a pure function called directly or a fact read off the shipped schema —
-// there is no lowered program to measure zero of. The end-to-end evidence lives in
-// the corpus, where it is unforgeable: `examples/c/alignas_local_over32`,
-// `alignas_local_cacheline64` and `alignas_member_over32_local` each RUN on all four
-// targets under both the baseline and the shipped release pipeline and check the
-// emitted address at run time.
+// ⚠ THIS FILE DELIBERATELY DOES NOT DRIVE THE UNIT-TIER FRONT END — and the
+// reason has CHANGED, so read this rather than inheriting the old one.
+// [[D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO]]
+// is CLOSED (P49): `lowerCToLir` no longer discards a refusal, and the reason it
+// used to return `lowerOk` true over a mutilated module was a NULL `ffiMap` that
+// refused every source carrying a prototype — now threaded. So the old sentence
+// here ("any `tests/lir` pin whose subject is a frame, a spill or a saved
+// register can be VACUOUS while looking green") no longer holds, and nothing in
+// this file rests on it.
+// What DOES still hold is the positive reason: everything here is either a pure
+// function called directly or a fact read off the shipped schema, which is a
+// STRONGER pin than any lowered program for a SUFFICIENCY property — there is no
+// allocator decision that could make a derivation look right by accident. The
+// end-to-end evidence lives in the corpus, where it is unforgeable:
+// `examples/c/alignas_local_over32`, `alignas_local_cacheline64` and
+// `alignas_member_over32_local` each RUN on all four targets under both the
+// baseline and the shipped release pipeline and check the emitted address at run
+// time.
 
 #include "core/types/target_schema.hpp"
 #include "lir/lir_callconv.hpp"

@@ -179,6 +179,29 @@ STATUS_WORDS = tuple(STATUS)
 # to keep rows reachable. Spell a compound feature word as ONE segment (`ALWAYSINLINE`,
 # not `ALWAYS-INLINE`) -- see D-PLANS-ANCHOR-NAME-SEGMENT-COUNT-GATE.
 ANCHOR_ID = re.compile(r"^D-[A-Z0-9_]+(?:-[A-Za-z0-9_]+){2,}$")
+
+# ⚠⚠ THE SEGMENT COUNT IS A **MINTING** RULE, NOT A MAINTENANCE ONE.
+# [D-GATE-ANCHORS-WRITER-CANNOT-MAINTAIN-A-ROW-THE-REGISTRY-ALREADY-HOLDS]
+# ✔MEASURED 2026-09-01 (P49): `set` refused `D-CSUBSET-VLA` -- an EXISTING row, cited 275
+# times across 82 files -- so a finished closure could not be recorded by the only
+# sanctioned writer. A writer that cannot maintain a row the registry already contains is
+# not finished, and it fails in the FLATTERING-LOOKING direction: the rows it refuses to
+# maintain are exactly the ones no guard is watching, so it seizes up hardest where the
+# registry is weakest.
+# ⇒ MINT (`write --insert`) keeps ANCHOR_ID whole: a NEW name must be guard-resolvable,
+#   no exceptions. UPDATE (`write` without `--insert`, and every `set`) checks only that
+#   the id is WELL-FORMED, because the identity did not come from the caller -- it came
+#   from the registry.
+# ★ A TYPO STILL CANNOT MINT ON THIS PATH, and this is the reason the count is not needed
+#   as belt-and-braces: `place_row` already refuses an update whose anchor has NO row
+#   ("no row for %s in any registry ... a mistyped id mints a second row"). *The id exists
+#   in the registry* is a STRICTLY STRONGER identity check than the segment count ever was
+#   here. Do not re-add the count -- it only re-breaks maintenance.
+# ⓘ The threshold itself is the real defect and is sized in
+#   [D-GATE-ANCHOR-REGISTRY-SEGMENT-THRESHOLD-HIDES-SEVENTY-ROWS]; this split is correct
+#   whatever that threshold becomes, so it is not a placeholder for it.
+ANCHOR_ID_WELLFORMED = re.compile(r"^D-[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*$")
+
 BACKTICKED_ID = re.compile(r"^`(D-[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*)`$")
 
 
@@ -330,15 +353,28 @@ def normalise_status(value):
         "had to agree where the verdict stopped." % (value, "/".join(STATUS_WORDS)))
 
 
-def make_row(anchor, priority, status, trigger, closing="", cross_refs=""):
-    """The six fields -> the canonical row text. Raises Refused."""
-    if not ANCHOR_ID.match(anchor):
+def make_row(anchor, priority, status, trigger, closing="", cross_refs="", minting=True):
+    """The six fields -> the canonical row text. Raises Refused.
+
+    `minting` selects WHICH id rule applies -- see the ANCHOR_ID_WELLFORMED note. A NEW
+    name must be guard-resolvable; an EXISTING one must only be well-formed, because
+    `place_row` has already proved it names a row that exists."""
+    if minting:
+        if not ANCHOR_ID.match(anchor):
+            raise Refused(
+                "%r is not a well-formed anchor id. The guard resolves `D-` plus THREE or "
+                "more `-`-separated segments; a two-segment name is an informal label it "
+                "ignores, so a row named that way is unreachable by the guard that exists to "
+                "keep rows reachable. Spell a compound feature word as ONE segment "
+                "(ALWAYSINLINE, not ALWAYS-INLINE)." % anchor)
+    elif not ANCHOR_ID_WELLFORMED.match(anchor):
         raise Refused(
-            "%r is not a well-formed anchor id. The guard resolves `D-` plus THREE or "
-            "more `-`-separated segments; a two-segment name is an informal label it "
-            "ignores, so a row named that way is unreachable by the guard that exists to "
-            "keep rows reachable. Spell a compound feature word as ONE segment "
-            "(ALWAYSINLINE, not ALWAYS-INLINE)." % anchor)
+            "%r is not a well-formed anchor id: it must be `D-` plus `-`-separated "
+            "alphanumeric segments, on one line, with no whitespace and no `|`. This is "
+            "the UPDATE path, so the segment COUNT is deliberately not re-litigated -- "
+            "`place_row` refuses an id that names no existing row, which is a stronger "
+            "identity check than counting segments. What is refused here is a name no "
+            "registry could hold at all." % anchor)
     if not str(trigger).strip():
         raise Refused("the Trigger cell is empty. A row states what is wrong and what "
                       "would change it; a status glyph alone explains nothing to the "
@@ -568,7 +604,10 @@ def cmd_write(argv):
               % (priority, why))
         print("  ⚠ A SUGGESTION. The column is a declaration -- correct it with "
               "`set-anchor --priority` and the correction survives every later edit.")
-    row = make_row(a.anchor, priority, status, a.trigger, a.closing, a.cross_refs)
+    # MINT only when --insert: otherwise this is an UPDATE of a row place_row
+    # will refuse unless it already exists. See ANCHOR_ID_WELLFORMED.
+    row = make_row(a.anchor, priority, status, a.trigger, a.closing, a.cross_refs,
+                   minting=bool(a.insert))
     dest = place_row(ROOT, working, a.anchor, row, write=a.apply, insert=a.insert)
     print("  row     %d chars" % len(row))
     print("anchors: WROTE %s" % dest if a.apply
@@ -613,8 +652,10 @@ def cmd_set(argv):
         print("  %-10s %r -> %r" % (k, " ".join(str(fields[k]).split())[:48],
                                     " ".join(str(v).split())[:48]))
         fields[k] = v
+    # `set` NEVER mints: it read this row's own cells above, so the id came from the
+    # registry rather than from the caller.
     new = make_row(a.anchor, fields["priority"], fields["status"], fields["trigger"],
-                   fields["closing"], fields["cross_refs"])
+                   fields["closing"], fields["cross_refs"], minting=False)
     dest = place_row(ROOT, row.table, a.anchor, new, write=a.apply)
     print("anchors: WROTE %s" % dest if a.apply
           else "anchors: dry run. pass --apply to write.")
@@ -753,7 +794,26 @@ def self_test():
 
     # ── the row ASSEMBLER refuses what a hand-written row gets wrong ──────────
     pin("not a well-formed anchor id" in (refuse(make_row, "D-TWO", "P1", "open", "t") or ""),
-        "(1) a two-segment id is REFUSED -- the guard would never resolve it")
+        "(1) a two-segment id is REFUSED when MINTING -- the guard would never resolve it")
+    # ── (1b/1c/1d) THE SEGMENT COUNT IS A MINTING RULE, NOT A MAINTENANCE ONE ──────
+    # [D-GATE-ANCHORS-WRITER-CANNOT-MAINTAIN-A-ROW-THE-REGISTRY-ALREADY-HOLDS]
+    # ⚠ (1d) IS THE ARM THAT MAKES THE OTHER TWO MEAN ANYTHING. Without a control that a
+    # guard-resolvable id STILL MINTS, (1b) and (1c) both pass over a predicate deleted
+    # outright -- the fixture would be measuring nothing, which is the exact class this
+    # cycle closed in `lowerCToLir`.
+    pin(refuse(make_row, "D-TWO", "P1", "open", "t", minting=False) is None,
+        "(1b) the SAME two-segment id UPDATES -- identity came from the registry, and "
+        "place_row already refuses an id that names no row")
+    pin("not a well-formed anchor id" in (refuse(make_row, "D-TWO", "P1", "open", "t",
+                                                 minting=True) or ""),
+        "(1c) ... and is still REFUSED on the minting path, so --insert cannot smuggle "
+        "an unresolvable NEW name in")
+    pin(refuse(make_row, _FX + "-MINTABLE", "P1", "open", "t", minting=True) is None,
+        "(1d) CONTROL: a guard-resolvable id still MINTS -- without this, (1b)+(1c) pass "
+        "over a predicate that was deleted rather than moved")
+    pin("not a well-formed anchor id" in (refuse(make_row, "D-has space", "P1", "open",
+                                                 "t", minting=False) or ""),
+        "(1e) the UPDATE path still refuses a name no registry could hold at all")
     pin("Trigger cell is empty" in (refuse(make_row, CC_, "P1", "open", " ") or ""),
         "(2) an empty Trigger cell is REFUSED")
     pin("is not one of" in (refuse(make_row, CC_, "P9", "open", "t") or ""),

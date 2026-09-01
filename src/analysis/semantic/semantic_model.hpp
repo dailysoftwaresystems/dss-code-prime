@@ -374,16 +374,22 @@ struct DSS_EXPORT SymbolRecord {
     // object aliases; `InvalidSymbol` (default) for every other symbol. C99
     // §6.7.7p2: the size expression `n` is evaluated ONCE, when the typedef `R`
     // is reached, and FROZEN — every later `R a;` allocates with that frozen
-    // size. `R a;`'s VLA-ness comes entirely from the head alias, so the object's
-    // own declarator carries no size to capture; this field records WHICH typedef
-    // froze it. Set in `resolveDeclTypesPost` ONLY when the object's declared type
-    // is EXACTLY the head type (`declTy == headTy` — a pure `R a;`, no own suffix
-    // / stars) AND that head type is (or contains) a VLA; the `declTy == headTy`
-    // gate excludes the deferred stacked-suffix (`R a[m]`) and ptr (`R *p`)
-    // shapes. Read at HIR lowering (record a.v→R.v into `typedefVlaOriginBySymbol`
-    // + skip the object's own size capture) and threaded to HIR→MIR, where `R a;`'s
-    // alloca copies R's decl-frozen size slots down into its own. A dropped/unset
-    // origin is a safe fail-loud downstream (no captured size), never a miscompile.
+    // size. The object's VLA-ness comes from the head alias, in whole or in part,
+    // so this field records WHICH typedef froze it. Set in `resolveDeclTypesPost`
+    // when the head type CARRIES a runtime bound (`aliasHeadCarriesVla` — an array
+    // that is or contains a VLA, or a pointer whose pointee does) AND the declared
+    // type derives from that head by nothing but this declarator's own decoration
+    // (`declaredTypeDerivesFromAliasHead`): EXACTLY the head (`R a;`), the head
+    // under this declarator's own array suffix(es) (`R a[m];`), or a pointer to it
+    // (`R *p;`). ⚠ THE GATE USED TO BE THE BARE `declTy == headTy` AND THE TWO
+    // SHAPES IT EXCLUDED WERE THIS ROW'S RESIDUE — both are compiled and run by
+    // gcc 13.3.0 and clang 18.1.3 (✔MEASURED 2026-09-01, probed separately), so
+    // excluding them was a conformance gap. Read at HIR lowering (record a.v→R.v
+    // into `typedefVlaOriginBySymbol`, and capture the object's OWN suffixes when
+    // it has any) and threaded to HIR→MIR, where the object's alloca copies the
+    // alias's decl-frozen size slots down into its own and folds its own
+    // dimensions over them. A dropped/unset origin is a safe fail-loud downstream
+    // (no captured size), never a miscompile.
     SymbolId        vlaTypedefOrigin{};
     // FC16 (D-CSUBSET-NORETURN): TRUE iff this FUNCTION symbol is declared
     // `noreturn` (C11 6.7.4 `_Noreturn` / C23 6.7.12.7 `[[noreturn]]` / GNU

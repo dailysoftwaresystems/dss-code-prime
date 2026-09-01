@@ -5412,6 +5412,17 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
     // … + the 3 trampolines.
     {"thrd_create", ShimFamily::Threads},   {"thrd_join", ShimFamily::Threads},
     {"call_once", ShimFamily::Threads},
+    // … + the 4 that closed the header on every leg (D-CSUBSET-C11-THREADS-TIMED,
+    // P49 lane tw). ★ THREE OF THESE GRADUATED OUT OF `kNonRecipes` BELOW, where they
+    // sat as "deferred threads ids" — the negative list was RIGHT while the deferral
+    // stood and is WRONG the moment it lifts, which is why the graduation is a
+    // deliberate two-place edit rather than an append. What gated them was a pe
+    // `struct timespec` layout nobody had measured; P49 lane th measured it (tv_nsec
+    // is `long` = FOUR bytes on LLP64, against 8 on LP64, at the same offset in a
+    // struct of the same size on both) and the recipes could then be written without
+    // guessing. `thrd_equal` was never in the negative list — it was simply absent.
+    {"thrd_sleep", ShimFamily::Threads},    {"mtx_timedlock", ShimFamily::Threads},
+    {"cnd_timedwait", ShimFamily::Threads}, {"thrd_equal", ShimFamily::Threads},
     // <stdio.h> printf/scanf family over the UCRT __stdio_common_v* cores — SIX recipes
     // as of TF-C119, where `sprintf` was once the only one and P3 grew it to five.
     // ucrtbase.dll exports NOT ONE of these six names (in a real MSVC build each is a
@@ -5463,7 +5474,13 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
 // through it), and it has no descriptor row, so a recipe landing ahead of one still reds.
 constexpr char const* kNonRecipes[] = {
     "vsnprintf", "snprintf_s",                               // unshipped stdio arms
-    "thrd_sleep", "mtx_timedlock", "cnd_timedwait",          // deferred threads ids
+    // ★ `thrd_sleep`, `mtx_timedlock` and `cnd_timedwait` USED TO SIT HERE as
+    // "deferred threads ids" and MOVED into kPinnedRecipes in P49
+    // (D-CSUBSET-C11-THREADS-TIMED): they are real recipes on pe and macho now. The
+    // negative below is the deliberate replacement — `thrd_sleep_until` is not a C11
+    // function at all, so no descriptor row can ever justify a recipe for it, which is
+    // exactly the property a member of this list must have.
+    "thrd_sleep_until",
     "puts", "fputs", "__stdio_common_vsprintf",
     "mtx_lokc", "SPRINTF", "Sprintf", "sprintf ", " sprintf", "",
 };
@@ -5492,7 +5509,10 @@ TEST(ShippedLibDescriptor, ShimFamilyOfPartitionsEveryRecipeInTheVocabulary) {
         (r.family == ShimFamily::Threads ? threads : stdio) += 1;
     }
     // The shape of the vocabulary itself, so a silent addition/removal is visible.
-    EXPECT_EQ(threads, 21u) << "the <threads.h> family is the 18 non-trampoline + 3 trampolines";
+    EXPECT_EQ(threads, 25u)
+        << "the <threads.h> family is the 18 non-trampoline + 3 trampolines + the 4 "
+           "timed/identity recipes that closed the header on every leg "
+           "(D-CSUBSET-C11-THREADS-TIMED)";
     EXPECT_EQ(stdio, 6u)
         << "the <stdio.h> family ships EXACTLY "
            "printf/fprintf/sprintf/snprintf/vfprintf/sscanf (P3 grew it from 1 to 5; "

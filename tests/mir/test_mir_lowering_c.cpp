@@ -12396,17 +12396,45 @@ TEST(MirLoweringC, VlaTypedefObjectAllocaLoadsFrozenSizeNotReLoweredN) {
            "8-byte slot — so `a[i]` / `sizeof a` Load a's own copied slot";
 }
 
-// VLA C4b (D-CSUBSET-VLA) — the DEFERRED shapes STAY fail-loud (I4). Type-dedup makes
-// `vlaArray(int)` a shared TypeId, so a VLA-typedef-WITH-OWN-SUFFIX object looks type-
-// identical to the in-scope `R a;` and MUST be pinned distinct. All three below fail loud
-// (no binary), never a silent miscompile. Red-on-disable: were the `declTy == headTy`
-// origin gate to leak and admit an own-suffix / ptr shape, the C4b copy-down would
-// mis-size (a captured-bound / array-level mismatch).
+// VLA (D-CSUBSET-VLA) — THE COMPOSED VLA-TYPEDEF SHAPES LOWER. These three tests were
+// the C4b DEFERRAL pins ("the DEFERRED shapes STAY fail-loud (I4)") and they are now the
+// CAPABILITY pins for the same three shapes, because ✔MEASURED 2026-09-01 gcc 13.3.0 and
+// clang 18.1.3 — probed SEPARATELY, `-std=c17 -Wall -Wextra`, one self-contained
+// block-scope TU each — COMPILE AND RUN all three and print the expected values, so
+// `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` requires them. (MSVC 19.51.36252 refuses all
+// three, but for having no C99 VLA at all: `error C2057: expected constant expression`
+// on the typedef's own bound. A refusal that lands on the whole feature is not a vote
+// about these shapes.) The distinctness the old I4 pins protected still holds and is
+// still checked: type-dedup makes `vlaArray(int)` a shared TypeId, so each test asserts
+// the SIZES its shape must produce, which a mis-composed spine would get wrong.
+//
+// Each asserts a POSITIVE instruction count on the lowered body before reading anything
+// out of it — a lowering that produced NOTHING would otherwise satisfy every "no error"
+// assertion vacuously.
 
-// (a) Stacked-suffix `typedef int R[5]; R a[n];` — R is FIXED, the object adds a VLA `[n]`:
-// type `int[n][5]` (2 array levels) with only 1 declarator bound captured → the
-// computeVlaByteSize depth-vs-dims guard fires → fail loud.
-TEST(MirLoweringC, VlaTypedefStackedFixedThenVlaSuffixFailsLoud) {
+namespace {
+// The count of instructions across every block of the lowered module's single function.
+// A pin whose subject is an emitted sequence must first establish that a sequence WAS
+// emitted; `mir.ok` alone does not.
+[[nodiscard]] std::uint32_t totalInstCount(Mir const& m) {
+    std::uint32_t total = 0;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        MirFuncId const fn = m.funcAt(f);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b)
+            total += m.blockInstCount(m.funcBlockAt(fn, b));
+    }
+    return total;
+}
+}   // namespace
+
+// (a) Stacked FIXED alias + a VLA object suffix, `typedef int R[5]; R a[n];` — type
+// `int[n][5]`: 2 array levels but only 1 declarator bound. The alias's sub-spine is
+// FULLY FIXED, so it has a COMPILE-TIME size and needs no freeze; `computeVlaByteSize`
+// seeds the fold with that constant instead of failing the depth-vs-dims guard. The
+// object is a plain VLA local from there on — one runtime-operand Alloca.
+// RED-ON-DISABLE: remove the fixed-sub-spine seam in `computeVlaByteSize` and the
+// depth-vs-dims guard fires again, `mir.ok` goes false.
+TEST(MirLoweringC, VlaTypedefStackedFixedThenVlaSuffixLowers) {
     auto L = lowerC(
         "int main(void) {\n"
         "  int n;\n"
@@ -12415,17 +12443,46 @@ TEST(MirLoweringC, VlaTypedefStackedFixedThenVlaSuffixFailsLoud) {
         "  R a[n];\n"
         "  return a[0][0];\n"
         "}\n");
-    EXPECT_FALSE(L.mir.ok)
-        << "a fixed typedef with a VLA object suffix (`typedef int R[5]; R a[n];`) is a "
-           "2-level type with 1 captured bound — must fail loud (deferred), never guess";
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? ""
+                                                : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "a fixed typedef with a VLA object suffix (`typedef int R[5]; R a[n];`) must "
+           "lower — gcc and clang both compile and run it: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    ASSERT_GT(totalInstCount(m), 0u)
+        << "the lowered body must contain instructions — a zero-instruction lowering "
+           "would satisfy every assertion below vacuously";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // Exactly ONE runtime-operand Alloca — the object itself. The alias contributes a
+    // compile-time constant, so no size slot is frozen for it and no Load is needed.
+    int runtimeAllocas = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && !m.instOperands(id).empty())
+            ++runtimeAllocas;
+    }
+    EXPECT_EQ(runtimeAllocas, 1)
+        << "`R a[n];` reserves exactly one runtime-sized slot (the object); the fixed "
+           "`int[5]` row contributes a compile-time constant, never a second one";
 }
 
-// (b) VLA-typedef WITH its own suffix `typedef int R[n]; R a[m];` — R is a VLA, the object
-// adds another VLA `[m]`: type `int[m][n]`, again 2 levels vs 1 captured bound. The
-// `declTy == headTy` origin gate EXCLUDES it (declTy has the extra dim) → normal capture +
-// depth mismatch → fail loud. THE type-dedup distinctness pin (I4): it must NOT slip into
-// the C4b copy-down path just because `vlaArray(int)` dedups with the in-scope `R a;`.
-TEST(MirLoweringC, VlaTypedefWithOwnVlaSuffixFailsLoud) {
+// (b) VLA alias + the object's OWN VLA suffix, `typedef int R[n]; R a[m];` — type
+// `int[m][n]`, 2 levels, 1 captured bound. THE COMPOSITION: the alias's frozen
+// whole-object size (C99 6.7.7p2) is COPIED DOWN into the object's inner-level slot and
+// the object's own `[m]` multiplies it. THE I4 DISTINCTNESS PIN SURVIVES AS A SIZE
+// CHECK: the object's alloca size must be a Mul (its own dimension applied), NOT a bare
+// Load — a bare Load would mean it slipped into the suffix-less `R a;` copy-down and
+// allocated ONE row instead of `m`.
+// RED-ON-DISABLE: revert the semantic origin gate to `declTy == headTy` and this shape
+// loses its origin, falls back to its own capture, and fails the depth-vs-dims guard.
+TEST(MirLoweringC, VlaTypedefWithOwnVlaSuffixComposesOwnDimOverFrozenAlias) {
     auto L = lowerC(
         "int main(void) {\n"
         "  int n; int m;\n"
@@ -12434,15 +12491,61 @@ TEST(MirLoweringC, VlaTypedefWithOwnVlaSuffixFailsLoud) {
         "  R a[m];\n"
         "  return a[0][0];\n"
         "}\n");
-    EXPECT_FALSE(L.mir.ok)
-        << "a VLA typedef with its own VLA object suffix (`typedef int R[n]; R a[m];`) must "
-           "STAY fail-loud — NOT take the C4b copy-down path (I4)";
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? ""
+                                                : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "`typedef int R[n]; R a[m];` must lower — gcc and clang both compile and run "
+           "it: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    ASSERT_GT(totalInstCount(m), 0u)
+        << "the lowered body must contain instructions";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // The object's runtime Alloca: the operand-bearing Alloca whose pointee is a
+    // vlaArray. (The alias's own freeze emits only 8-byte fixed size slots.)
+    MirInstId objAlloca{};
+    int objCount = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Alloca) continue;
+        if (m.instOperands(id).empty()) continue;
+        TypeId const t = m.instType(id);
+        if (in.kind(t) != TypeKind::Ptr) continue;
+        auto const po = in.operands(t);
+        if (po.size() == 1u && in.isVlaArray(po[0])) { objAlloca = id; ++objCount; }
+    }
+    ASSERT_EQ(objCount, 1) << "exactly one composed VLA object alloca (ptr<vlaArray>)";
+
+    auto const aOps = m.instOperands(objAlloca);
+    ASSERT_EQ(aOps.size(), 1u);
+    EXPECT_EQ(m.instOpcode(aOps[0]), MirOpcode::Mul)
+        << "`R a[m];`'s alloca size must be `m * <alias's frozen row size>` — a bare "
+           "Load would mean it took the suffix-less `R a;` copy-down and reserved ONE "
+           "row (the I4 type-dedup distinctness this shape must keep)";
+
+    // And the multiplied-in value must itself be a LOAD of the alias's frozen slot —
+    // NOT a fresh Mul, which would mean `n` was re-evaluated at the object (freeze-once
+    // violated, C99 6.7.7p2).
+    auto const mulOps = m.instOperands(aOps[0]);
+    ASSERT_EQ(mulOps.size(), 2u);
+    EXPECT_EQ(m.instOpcode(mulOps[1]), MirOpcode::Load)
+        << "the row size the object multiplies must be a LOAD of the alias's decl-frozen "
+           "slot — re-lowering `n` here would break freeze-once (C99 6.7.7p2)";
 }
 
-// (c) Ptr-to-VLA typedef `typedef int (*P)[n]; P p;` — the pointee is a VLA; the C4a+C4b
-// composition is deferred. `P p`'s declarator carries no array suffix, so captureVlaSize
-// fails loud (H0009) at the HIR tier (hir->ok flips false).
-TEST(MirLoweringC, PtrToVlaTypedefObjectFailsLoud) {
+// (c) Ptr-to-VLA typedef `typedef int (*P)[n]; P p;` — the alias freezes ONE quantity at
+// its own declaration, the POINTEE ROW STRIDE, and the object copies it. `p` itself is
+// an ordinary 8-byte pointer: it must NOT acquire a runtime-operand alloca.
+// RED-ON-DISABLE: drop the Ptr arm from the MIR TypeDecl freeze and `P p;` finds no
+// frozen slot → the "origin froze no whole-object size slot" fail-loud.
+TEST(MirLoweringC, PtrToVlaTypedefObjectCopiesFrozenPointeeStride) {
     auto L = lowerC(
         "int main(void) {\n"
         "  int n;\n"
@@ -12452,9 +12555,45 @@ TEST(MirLoweringC, PtrToVlaTypedefObjectFailsLoud) {
         "  (void)p;\n"
         "  return 0;\n"
         "}\n");
-    EXPECT_FALSE(L.hir->ok)
-        << "a ptr-to-VLA typedef object (`typedef int (*P)[n]; P p;`) is deferred — must "
-           "fail loud (H0009 at HIR), never silently produce a bogus pointer";
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? ""
+                                                : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "a ptr-to-VLA typedef object (`typedef int (*P)[n]; P p;`) must lower — gcc "
+           "and clang both compile and run it: "
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    ASSERT_GT(totalInstCount(m), 0u)
+        << "the lowered body must contain instructions";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // NO runtime-operand Alloca: a pointer is a fixed 8 bytes however variable its
+    // pointee is. A runtime one here would mean `P p;` took the array copy-down path.
+    // And the stride copy-down IS present: a Store whose value is a Load, into an
+    // 8-byte slot.
+    int runtimeAllocas   = 0;
+    bool sawStrideCopy   = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && !m.instOperands(id).empty())
+            ++runtimeAllocas;
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto const ops = m.instOperands(id);
+        if (ops.size() == 2u && m.instOpcode(ops[0]) == MirOpcode::Load
+            && m.instOpcode(ops[1]) == MirOpcode::Alloca
+            && m.instPayload(ops[1]) == 8u) {
+            sawStrideCopy = true;
+        }
+    }
+    EXPECT_EQ(runtimeAllocas, 0)
+        << "`P p;` is a fixed 8-byte pointer — it must never take a runtime-sized slot";
+    EXPECT_TRUE(sawStrideCopy)
+        << "`P p;` must COPY the alias's frozen pointee row stride into its own slot — "
+           "a Load(P's slot) Stored into an 8-byte slot — so `p[i]` steps by it";
 }
 
 // (d) CHAINED VLA typedef `typedef int R[n]; typedef R S;` — S aliases a VLA typedef with

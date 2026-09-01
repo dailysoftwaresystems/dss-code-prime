@@ -42,6 +42,11 @@
 // round-trip (needs an ar WRITER + a static-link model DSS does not yet have)
 // -- anchored D-FF1-AR-WRITER-STATIC-LINK.
 
+// genericSpelling — the ONE path spelling the driver's diagnostics use, so the
+// message assertions below compare against what the compiler actually printed
+// rather than against a re-derived string
+// (D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE).
+#include "core/substrate/path_identity.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/object_format_kind.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -50,6 +55,10 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "host_native_target.hpp"
 #include "image_dependency_table.hpp"
+// isArArchiveFile — the magic-byte predicate the `--resolve-library` dispatch
+// keys on. Asserted DIRECTLY in the fixtures below so a fixture that is not
+// really an archive reds instead of exercising the wrong arm.
+#include "program/compile_pipeline.hpp"
 #include "program/program.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
@@ -1746,4 +1755,336 @@ TEST(FfiResolveLibraryWrongFormat, WrongFormatIsRefusedEvenWithNoExternsAtAll) {
     EXPECT_EQ(buildOne(dir / "out-noextern-ok", {elfLib}, mainSrc.string(),
                        kElfExec, okRep), 0)
         << (okRep.all().empty() ? "" : okRep.all().front().actual);
+}
+
+// ══ D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE ═══════════
+//
+// A STATED runtime identity (`--resolve-library <path>=<import-name>`, or a
+// manifest `{"path","importName"}` entry) is correct to DROP when the path is
+// an input the build MERGES rather than imports from -- an `ar` static archive
+// or a relocatable object record no runtime dependency for the name to be --
+// and it used to be dropped in SILENCE, which is the defect.
+//
+// ✔MEASURED at `c1754511` on the shipped CLI (pe64 leg) BEFORE this fix, and
+// the measurement is stronger than "no diagnostic": the exec built WITH
+// `=totally_bogus_name.dll` on a `.lib` was BYTE-IDENTICAL (md5
+// 1039fd348f4713b2bba4859a5fd6f567) to the one built with no `=<name>` at all,
+// and the string appeared nowhere in the image. `--warnings-as-errors` changed
+// nothing. The relocatable-object arm behaved the same way.
+//
+// ── WHY THESE ASSERT rc == 0 AND A **WARNING**, WHICH IS THE ROW'S OWN
+//    CLOSING SENTENCE REFUTED ─────────────────────────────────────────────
+// The row asked for a rejection ("a declaration error, not a no-op"). The
+// artifact this build produces is CORRECT -- the archive's members are merged,
+// the program links, nothing is miscompiled -- so refusing it would make DSS
+// the only toolchain that fails a build every reference accepts. ✔MEASURED
+// 2026-09-01, each toolchain probed SEPARATELY over the closest analogue (an
+// operator stating a runtime identity where the chosen mode records none):
+// gcc 13.3.0 `-c -Wl,-soname,…` rc=0 SILENT; gcc `-static -Wl,-soname,…` rc=0
+// SILENT; clang 18.1.3 `-c -Wl,-soname,…` rc=0 **WARNS**; clang `-static` rc=0
+// SILENT; GNU ld 2.42 `ld -r … -soname` rc=0 SILENT; MSVC 19.51 `/c
+// /Fe:bogus.exe` rc=0 SILENT. ZERO of four refuse, ONE warns. So `rc == 0` in
+// the tests below is not incidental -- it IS the severity decision under test,
+// and an escalation to Error reds them by NAME rather than by count.
+//
+// ⚠ THE TESTS ASSERT THE CODE AND THE SEVERITY, NEVER A BARE EXIT. A build
+// that merely "failed" would pass an exit-code assertion for any reason at
+// all; and here the build does not fail, so an exit assertion alone would be
+// satisfied by the ORIGINAL silent behaviour.
+
+namespace {
+
+// One object format's (staticlib, relocatable-object, dynamic, exec) target
+// quad. DSS is a cross-compiler with no external toolchain, so every leg BUILDS
+// on every host and nothing here is RUN -- "what did the compiler SAY, and what
+// is in the bytes it wrote" is a compile-time judgment, exactly the reasoning
+// `kFormatLegs` above already records.
+struct MergedInputLeg {
+    char const* label;
+    char const* staticlibTarget;
+    char const* objectTarget;
+    char const* dynamicTarget;
+    char const* execTarget;
+    char const* archiveArtifact;
+    char const* objectArtifact;
+    char const* dynamicArtifact;
+};
+constexpr MergedInputLeg kMergedInputLegs[] = {
+    {"pe",
+     "x86_64:pe64-x86_64-windows-staticlib", "x86_64:pe64-x86_64-windows",
+     "x86_64:pe64-x86_64-windows-dll",       "x86_64:pe64-x86_64-windows-exec",
+     "dsslib.lib", "dsslib.obj", "dsslib.dll"},
+    {"elf",
+     "x86_64:elf64-x86_64-linux-staticlib",  "x86_64:elf64-x86_64-linux",
+     "x86_64:elf64-x86_64-linux-dyn",        "x86_64:elf64-x86_64-linux-exec",
+     "dsslib.a", "dsslib.o", "dsslib.so"},
+    {"macho",
+     "x86_64:macho64-x86_64-darwin-staticlib", "x86_64:macho64-x86_64-darwin",
+     "x86_64:macho64-x86_64-darwin-dylib",     "x86_64:macho64-x86_64-darwin-exec",
+     "dsslib.a", "dsslib.o", "dsslib.dylib"},
+};
+
+// The stated identity, chosen so it can never collide with anything DSS emits
+// on its own: no shipped descriptor, no format default and no basename spells
+// it, so finding it in an image proves it was RECORDED and not merely present.
+constexpr char const* kStatedIdentity = "dss_stated_identity_probe.dll";
+
+// Does the emitted image carry `needle` anywhere in its bytes? The
+// dependency-table extractors above answer the same question per format; this
+// is the format-blind form, and it is used in the NEGATIVE direction (the name
+// must be ABSENT) plus one POSITIVE control, so a false positive from an
+// unrelated string would red the test rather than hide a defect.
+[[nodiscard]] bool imageContainsBytes(fs::path const& image,
+                                      std::string_view needle) {
+    auto const bytes = readWholeBinary(image);
+    if (bytes.empty() || needle.empty()) return false;
+    std::string_view const hay{reinterpret_cast<char const*>(bytes.data()),
+                               bytes.size()};
+    return hay.find(needle) != std::string_view::npos;
+}
+
+// The emitted exec's file name for a leg. Only the PE leg carries an
+// extension; deriving it from the leg label rather than repeating a literal at
+// six call sites keeps one owner of the rule.
+[[nodiscard]] fs::path execArtifactIn(fs::path const& outDir,
+                                      MergedInputLeg const& leg) {
+    return outDir / (std::string_view{leg.label} == "pe" ? "main.exe" : "main");
+}
+
+}  // namespace
+
+// ── (1) THE ARCHIVE ARM: the anchor's own case, on all three formats ───────
+TEST(FfiResolveLibraryDeclaredImportName, StaticArchiveInputReportsTheIgnoredName) {
+    for (auto const& leg : kMergedInputLegs) {
+        SCOPED_TRACE(leg.label);
+        ScratchDir scratch{Location::InsideRepo,
+                           std::string{"ffi-importname-ar-"} + leg.label};
+        auto const dir = scratch.path();
+        auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+
+        // A REAL `ar` archive, built here by the shipped driver rather than
+        // committed: a checked-in blob would make the pin hostage to an
+        // artifact nothing regenerates, and this one is regenerated per run.
+        DiagnosticReporter libRep;
+        ASSERT_EQ(buildOne(dir / "ar", {}, libSrc.string(),
+                           leg.staticlibTarget, libRep), 0)
+            << (libRep.all().empty() ? "" : libRep.all().front().actual);
+        auto const archive = dir / "ar" / leg.archiveArtifact;
+        ASSERT_TRUE(fs::exists(archive)) << archive.string();
+        ASSERT_TRUE(isArArchiveFile(archive))
+            << "the fixture must really be an `ar` container -- the dispatch "
+               "this diagnostic rides on is by MAGIC BYTES, so a fixture that "
+               "is not one would exercise the dynamic arm and pass vacuously";
+
+        auto const mainSrc = writeSrc(dir, "main.c", kMainSrc);
+        DiagnosticReporter rep;
+        int const rc = buildOneWithSpecs(
+            dir / "out", {ResolveLibrarySpec{archive, kStatedIdentity}},
+            mainSrc.string(), leg.execTarget, rep);
+
+        // THE SEVERITY DECISION, ASSERTED: the build still SUCCEEDS.
+        EXPECT_EQ(rc, 0)
+            << "an unrecordable import name must not refuse a build that is "
+               "otherwise correct -- no reference toolchain refuses the "
+               "equivalent declaration; "
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        ASSERT_GE(countCode(rep,
+                            DiagnosticCode::F_DeclaredImportNameNotRecordable),
+                  1u)
+            << "the drop must be REPORTED -- silence here is the anchor";
+        EXPECT_EQ(severityForCode(
+                      rep, DiagnosticCode::F_DeclaredImportNameNotRecordable),
+                  DiagnosticSeverity::Warning);
+
+        // THE MESSAGE MUST NAME BOTH VALUES. A diagnostic saying only
+        // "importName ignored" sends the reader hunting through a manifest.
+        auto const msg = messageForCode(
+            rep, DiagnosticCode::F_DeclaredImportNameNotRecordable);
+        EXPECT_NE(msg.find(kStatedIdentity), std::string::npos)
+            << "must name the IGNORED NAME: " << msg;
+        EXPECT_NE(msg.find(core::genericSpelling(archive)), std::string::npos)
+            << "must name the ARCHIVE: " << msg;
+        EXPECT_NE(msg.find("merged-static-archive"), std::string::npos)
+            << "must name the reason verb: " << msg;
+
+        // AND THE CLAIM MUST BE TRUE. The diagnostic says the name is ignored;
+        // this asserts it really is, so the pin cannot pass while a future
+        // change starts recording the name and leaves the warning behind.
+        auto const image = execArtifactIn(dir / "out", leg);
+        ASSERT_TRUE(fs::exists(image)) << image.string();
+        EXPECT_FALSE(imageContainsBytes(image, kStatedIdentity))
+            << "the stated identity must be ABSENT from the image -- if it is "
+               "recorded, the diagnostic is lying and the arm is wrong";
+    }
+}
+
+// ── (2) THE SIBLING SHAPE: a relocatable OBJECT drops the name the same way ─
+//
+// The partial-fix-reads-as-complete class, named directly: the archive arm and
+// the object arm are TWO transforms on ONE value, and closing only the archive
+// would leave the second silent path exactly as it was. ✔MEASURED silent at
+// `c1754511` before the fix, on the same CLI run as the archive arm.
+TEST(FfiResolveLibraryDeclaredImportName, RelocatableObjectInputReportsTheIgnoredName) {
+    for (auto const& leg : kMergedInputLegs) {
+        SCOPED_TRACE(leg.label);
+        ScratchDir scratch{Location::InsideRepo,
+                           std::string{"ffi-importname-obj-"} + leg.label};
+        auto const dir = scratch.path();
+        auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+
+        DiagnosticReporter libRep;
+        ASSERT_EQ(buildOne(dir / "obj", {}, libSrc.string(),
+                           leg.objectTarget, libRep), 0)
+            << (libRep.all().empty() ? "" : libRep.all().front().actual);
+        auto const object = dir / "obj" / leg.objectArtifact;
+        ASSERT_TRUE(fs::exists(object)) << object.string();
+        ASSERT_FALSE(isArArchiveFile(object))
+            << "an object must NOT take the archive arm -- if it did, this "
+               "test would be a duplicate of (1) wearing another name";
+
+        auto const mainSrc = writeSrc(dir, "main.c", kMainSrc);
+        DiagnosticReporter rep;
+        int const rc = buildOneWithSpecs(
+            dir / "out", {ResolveLibrarySpec{object, kStatedIdentity}},
+            mainSrc.string(), leg.execTarget, rep);
+        EXPECT_EQ(rc, 0)
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        ASSERT_GE(countCode(rep,
+                            DiagnosticCode::F_DeclaredImportNameNotRecordable),
+                  1u);
+        EXPECT_EQ(severityForCode(
+                      rep, DiagnosticCode::F_DeclaredImportNameNotRecordable),
+                  DiagnosticSeverity::Warning);
+        auto const msg = messageForCode(
+            rep, DiagnosticCode::F_DeclaredImportNameNotRecordable);
+        EXPECT_NE(msg.find(kStatedIdentity), std::string::npos) << msg;
+        EXPECT_NE(msg.find(core::genericSpelling(object)), std::string::npos)
+            << msg;
+        // The reason verb must be the OBJECT one, not the archive one -- the
+        // two arms share a code and would otherwise be indistinguishable, so a
+        // dispatch that routed an object through the archive arm would pass.
+        EXPECT_NE(msg.find("merged-relocatable-object"), std::string::npos)
+            << msg;
+    }
+}
+
+// ── (3) THE CONTROL THAT STOPS AN OVER-BROAD PREDICATE READING AS SUCCESS ──
+//
+// A DYNAMIC library with a legitimate stated identity must stay SILENT **and**
+// must still RECORD the name. Without this arm, "warn on every
+// `--resolve-library` that states a name" would satisfy every assertion in (1)
+// and (2) while breaking the feature D-FFI-DECLARED-IMPORT-NAME exists for.
+TEST(FfiResolveLibraryDeclaredImportName, DynamicLibraryStaysSilentAndStillRecordsTheName) {
+    for (auto const& leg : kMergedInputLegs) {
+        SCOPED_TRACE(leg.label);
+        ScratchDir scratch{Location::InsideRepo,
+                           std::string{"ffi-importname-dyn-"} + leg.label};
+        auto const dir = scratch.path();
+        auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+
+        DiagnosticReporter libRep;
+        ASSERT_EQ(buildOne(dir / "dyn", {}, libSrc.string(),
+                           leg.dynamicTarget, libRep), 0)
+            << (libRep.all().empty() ? "" : libRep.all().front().actual);
+        auto const dynamicLib = dir / "dyn" / leg.dynamicArtifact;
+        ASSERT_TRUE(fs::exists(dynamicLib)) << dynamicLib.string();
+
+        auto const mainSrc = writeSrc(dir, "main.c", kMainSrc);
+        DiagnosticReporter rep;
+        ASSERT_EQ(buildOneWithSpecs(
+                      dir / "out",
+                      {ResolveLibrarySpec{dynamicLib, kStatedIdentity}},
+                      mainSrc.string(), leg.execTarget, rep), 0)
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_EQ(countCode(rep,
+                            DiagnosticCode::F_DeclaredImportNameNotRecordable),
+                  0u)
+            << "a dynamic library CAN record the stated identity -- warning "
+               "here would refuse the feature the anchor's sibling row exists "
+               "to provide";
+
+        auto const image = execArtifactIn(dir / "out", leg);
+        ASSERT_TRUE(fs::exists(image)) << image.string();
+        EXPECT_TRUE(imageContainsBytes(image, kStatedIdentity))
+            << "the POSITIVE half of the control: silence is only correct "
+               "because the identity really was recorded";
+    }
+}
+
+// ── (4) THE SECOND CONTROL: an archive with NO stated name says NOTHING ────
+//
+// The predicate is "an identity was STATED and cannot be recorded", not "this
+// input is an archive". DSS's own shipped runtime archives ride the same
+// `--resolve-library` channel with an EMPTY `declaredImportName`, so a
+// predicate keyed on the input KIND alone would warn on every ordinary build.
+TEST(FfiResolveLibraryDeclaredImportName, ArchiveWithNoStatedNameSaysNothing) {
+    for (auto const& leg : kMergedInputLegs) {
+        SCOPED_TRACE(leg.label);
+        ScratchDir scratch{Location::InsideRepo,
+                           std::string{"ffi-importname-arq-"} + leg.label};
+        auto const dir = scratch.path();
+        auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+        DiagnosticReporter libRep;
+        ASSERT_EQ(buildOne(dir / "ar", {}, libSrc.string(),
+                           leg.staticlibTarget, libRep), 0);
+        auto const archive = dir / "ar" / leg.archiveArtifact;
+        ASSERT_TRUE(isArArchiveFile(archive));
+
+        auto const mainSrc = writeSrc(dir, "main.c", kMainSrc);
+        DiagnosticReporter rep;
+        ASSERT_EQ(buildOne(dir / "out", {archive}, mainSrc.string(),
+                           leg.execTarget, rep), 0)
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_EQ(countCode(rep,
+                            DiagnosticCode::F_DeclaredImportNameNotRecordable),
+                  0u)
+            << "nothing was stated, so there is nothing to report";
+    }
+}
+
+// ── (5) THE STRICT POSTURE IS REACHABLE ────────────────────────────────────
+//
+// The whole Warning-not-Error argument rests on `--warnings-as-errors` being
+// available to anyone who wants the refusal. A claim about a flag is a claim
+// this project measures rather than asserts, so this runs it: the SAME build
+// that returned 0 in (1) must return non-zero under the strict reporter, and
+// the code must still be the one under test rather than some other failure.
+TEST(FfiResolveLibraryDeclaredImportName, WarningsAsErrorsPromotesTheUnrecordableName) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-importname-wae"};
+    auto const dir = scratch.path();
+    auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+    // ONE leg: the promotion is the REPORTER's behaviour, not the format's, and
+    // arms (1)-(4) already carry the per-format coverage.
+    auto const& leg = kMergedInputLegs[0];
+    DiagnosticReporter libRep;
+    ASSERT_EQ(buildOne(dir / "ar", {}, libSrc.string(),
+                       leg.staticlibTarget, libRep), 0);
+    auto const archive = dir / "ar" / leg.archiveArtifact;
+    ASSERT_TRUE(isArArchiveFile(archive));
+    auto const mainSrc = writeSrc(dir, "main.c", kMainSrc);
+
+    DiagnosticReporter::Config strict;
+    strict.policy.warningsAsErrors = true;  // the `--warnings-as-errors` flag,
+                                            // through the same field the CLI
+                                            // sets — not a second mechanism
+    DiagnosticReporter strictRep{strict};
+    Program p;
+    p.setOutputDir(dir / "out-strict");
+    p.setResolveLibraries(std::vector<ResolveLibrarySpec>{
+        ResolveLibrarySpec{archive, kStatedIdentity}});
+    int const rc = p.compileFiles(std::vector<std::string>{mainSrc.string()},
+                                  "c",
+                                  std::vector<std::string>{leg.execTarget},
+                                  strictRep);
+    EXPECT_NE(rc, 0)
+        << "--warnings-as-errors is the strict posture the severity decision "
+           "leans on; if it cannot refuse this, the decision has no escape "
+           "hatch";
+    ASSERT_GE(countCode(strictRep,
+                        DiagnosticCode::F_DeclaredImportNameNotRecordable), 1u)
+        << "the non-zero rc must come from THIS code, not from some other "
+           "failure the strict reporter happened to promote";
+    EXPECT_EQ(severityForCode(
+                  strictRep, DiagnosticCode::F_DeclaredImportNameNotRecordable),
+              DiagnosticSeverity::Error);
 }

@@ -316,7 +316,7 @@ TEST(LirAsmMemoryOutput, ReadWriteInTheInputSectionIsStillRefused) {
             auto r = lowerCToLir(
                 std::string{"void f(int *p, int v){ __asm__(\""} + a.store
                     + "\" : : \"" + letter + "\"(*p), \"r\"(v)); }",
-                a.target);
+                a.target, /*mirCcIndex=*/0, LoweringExpectation::Refuses);
             requireFrontEndClean(r);
             EXPECT_TRUE(r.mirReporter.hasErrors() || r.lirReporter.hasErrors())
                 << a.target << " " << letter

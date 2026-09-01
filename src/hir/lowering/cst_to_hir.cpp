@@ -2428,6 +2428,20 @@ struct Lowerer {
             alignmentAcc.push_back(
                 {node, AlignmentAttr{*rec->explicitAlignment}});
     }
+    // VLA (D-CSUBSET-VLA): does this type carry a runtime array bound that must be
+    // lowered and frozen — an array that is (or contains) a VLA, or a POINTER whose
+    // pointee is one? `typeContainsVla` deliberately stops at a pointer top (the pointer
+    // itself is a fixed 8 bytes), so the pointee is tested explicitly; what is frozen
+    // for a pointer is the ROW STRIDE its subscript steps by, not a storage size.
+    // The one predicate for both the typedef arm and the object arm, so a shape can
+    // never be capturable in one and not the other.
+    [[nodiscard]] bool typeCarriesVlaBound(TypeId t) const {
+        if (!t.valid()) return false;
+        if (interner.isVlaArray(t) || interner.typeContainsVla(t)) return true;
+        if (interner.kind(t) != TypeKind::Ptr) return false;
+        auto const ops = interner.operands(t);
+        return !ops.empty() && interner.typeContainsVla(ops[0]);
+    }
     // VLA C4b (D-CSUBSET-VLA): does this declarator carry its OWN array suffix
     // (`[...]`)? The HIR-tier discriminator that separates the ORIGINAL VLA typedef
     // (`typedef int R[n];` — has the `[n]` suffix, so its runtime bound is
@@ -10546,20 +10560,27 @@ struct Lowerer {
             // compile time).
             // VLA C4b (D-CSUBSET-VLA): a VLA-TYPEDEF object (`typedef int R[n]; R a;`)
             // gets its VLA-ness from the head alias, NOT its own declarator — it carries
-            // NO `[n]` suffix, so calling `captureVlaSize` on it would fail loud
-            // ("carries no array suffix"). Record a.v→origin R.v instead (the object's
-            // `SymbolRecord.vlaTypedefOrigin`, set semantically ONLY for the in-scope
-            // pure `R a;` shape where declTy == headTy — so the deferred stacked-suffix
-            // `R a[m]` and ptr `R *p` shapes never take this arm) and SKIP the object's
-            // own capture; HIR→MIR's alloca copies R's decl-frozen per-level size slots
-            // down into a's own slots + sizes a's runtime alloca from R's whole-object
-            // slot. R's own bound was already captured under R's SymbolId in
-            // `lowerTypeDecl`.
+            // NO `[n]` suffix of its own for THAT part of the type. Record a.v→origin
+            // R.v (the object's `SymbolRecord.vlaTypedefOrigin`); HIR→MIR's alloca
+            // copies R's decl-frozen per-level size slots down into a's own slots +
+            // sizes a's runtime alloca from R's whole-object slot. R's own bound was
+            // already captured under R's SymbolId in `lowerTypeDecl`.
+            // ★ AND THE OBJECT'S OWN SUFFIXES, WHEN IT HAS ANY. The semantic origin
+            // stamp now also admits `R a[m]` (the object's own array suffix(es) sit
+            // ABOVE the alias's spine) and `R *p` (the alias IS the pointee) — the two
+            // shapes this row's residue was, both accepted by gcc 13.3.0 and clang
+            // 18.1.3 (✔MEASURED 2026-09-01). `R a;` and `R *p` carry NO array suffix,
+            // and calling `captureVlaSize` on them fails loud ("carries no array
+            // suffix"); `R a[m]` carries exactly its own, and those bounds are the half
+            // of the size the alias does NOT supply. `declaratorHasArraySuffix` is the
+            // self-contained HIR-tier discriminator between them (the same one the
+            // chained-typedef arm uses) — it depends on no semantic flag.
             auto const* symRec = sym.valid() ? model.recordFor(sym) : nullptr;
             SymbolId const vlaOrigin =
                 symRec != nullptr ? symRec->vlaTypedefOrigin : SymbolId{};
             if (!asGlobal && vlaOrigin.valid()) {
                 typedefOriginAcc.emplace_back(sym.v, vlaOrigin.v);
+                if (declaratorHasArraySuffix(d)) captureVlaSize(d, sym);
             } else if (type.valid()) {
                 // ★★ D-HIR-VLA-PROBE-ABORTS-ON-AN-UNRESOLVED-DECLARED-TYPE — the
                 // `type.valid()` guard above is the fix, and it is a CRASH fix, not
@@ -10591,14 +10612,13 @@ struct Lowerer {
                 // (with its cascade suppression intact). What remains is the
                 // SEMANTIC-tier reason those six types were unresolved in the first
                 // place — see D-CSUBSET-TYPEOF-VALUE-FORM-RESOLVES-ONLY-FOR-AN-OBJECT-OPERAND.
-                bool const isPtrToVla =
-                    interner.kind(type) == TypeKind::Ptr
-                    && !interner.operands(type).empty()
-                    && interner.typeContainsVla(interner.operands(type)[0]);
-                if (!asGlobal
-                    && (interner.isVlaArray(type) || interner.typeContainsVla(type)
-                        || isPtrToVla))
-                    captureVlaSize(d, sym);
+                // ★ The ptr-to-VLA probe that used to be spelled inline here is now the
+                // shared `typeCarriesVlaBound`, which the TYPEDEF arm asks too — one
+                // predicate, so a shape can never be capturable as an object and not as
+                // an alias. It carries the same `!t.valid()` guard this comment is
+                // about, so the crash fix is preserved by construction rather than by
+                // repetition.
+                if (!asGlobal && typeCarriesVlaBound(type)) captureVlaSize(d, sym);
             }
             pushOut(lowered, d);
         }
@@ -10743,12 +10763,17 @@ struct Lowerer {
                     // suffix(es), so `captureVlaSize` works unmodified (mirrors the
                     // local-VarDecl VLA condition below). HIR→MIR's TypeDecl case then
                     // freezes R's per-level size slots from `vlaSizeExprBySymbol[R.v]`.
-                    // A ptr-to-VLA typedef (`typedef int (*P)[n];`) is `kind==Ptr` —
-                    // `typeContainsVla` stops at the pointer top → NOT captured (its
-                    // ptr-to-VLA-typedef composition is deferred, fail-loud).
-                    if (type.valid()
-                        && (interner.isVlaArray(type)
-                            || interner.typeContainsVla(type))) {
+                    // ★ A ptr-to-VLA typedef (`typedef int (*P)[n];`) is `kind==Ptr`, and
+                    // `typeContainsVla` stops at the pointer top, so the POINTEE is
+                    // tested explicitly — the frozen quantity there is the ROW STRIDE
+                    // `p[i]` steps by, and it is frozen at the TYPEDEF for the same C99
+                    // §6.7.7p2 reason an array typedef's size is. `captureVlaSize`
+                    // handles the `(*P)[n]` declarator unmodified (its Ptr arm skips the
+                    // leading decayed suffixes; here there are none to skip).
+                    // ✔MEASURED 2026-09-01: gcc 13.3.0 and clang 18.1.3 both compile and
+                    // run `typedef int (*P)[n]; P p = b;`, so refusing it was a
+                    // conformance gap.
+                    if (type.valid() && typeCarriesVlaBound(type)) {
                         // Discriminate the ORIGINAL VLA typedef (VLA from its OWN `[n]`
                         // suffix — capturable) from a CHAINED VLA typedef
                         // (`typedef R S;` — VLA inherited from ANOTHER typedef, NO own

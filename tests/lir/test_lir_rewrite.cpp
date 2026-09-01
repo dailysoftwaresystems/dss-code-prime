@@ -387,6 +387,27 @@ TEST(LirRewrite, MultiSpilledSameClassOperandsGetDistinctScratches) {
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.alloc.ok());
+
+    // ★★ THE PRESSURE MUST ACTUALLY EXIST — a positive-count assertion before
+    // any assertion of shape. The row:
+    // D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO
+    // ✔MEASURED, P49: this pin's source declares
+    // `int g(int,int);`, and while `lowerCToLir` passed a NULL ffiMap the extern
+    // was refused, the call to it was dropped as an unbound Ref, and the whole
+    // cross-call pressure this test is named for never existed. The walk below
+    // then quantified over instructions that were never emitted, and passed.
+    // Nothing here reads a spill; the FACT THAT ONE HAPPENED is the premise
+    // every assertion below rests on, so it is asserted rather than assumed.
+    std::uint32_t spillSlots = 0;
+    for (std::uint32_t fi = 0; fi < bundle.lowered.lir.lir.moduleFuncCount(); ++fi) {
+        auto const* fa = bundle.alloc.forFunc(bundle.lowered.lir.lir.funcAt(fi));
+        if (fa != nullptr) spillSlots += fa->numSpillSlots;
+    }
+    ASSERT_GT(spillSlots, 0u)
+        << "eight cross-call values against five callee-saved GPRs must spill — "
+           "with no spill there are no scratch registers to distribute and this "
+           "test measures nothing";
+
     DiagnosticReporter rewriteRep;
     auto rewritten = rewriteWithAllocation(bundle.lowered.lir.lir,
                                            *bundle.lowered.target,
@@ -398,6 +419,7 @@ TEST(LirRewrite, MultiSpilledSameClassOperandsGetDistinctScratches) {
     // the silent-miscompile scenario only arises with TWO DIFFERENT
     // spilled vregs.)
     Lir const& dst = rewritten.lir;
+    std::size_t examined = 0;
     for (std::uint32_t fi = 0; fi < dst.moduleFuncCount(); ++fi) {
         LirFuncId const fn = dst.funcAt(fi);
         for (std::uint32_t bi = 0; bi < dst.funcBlockCount(fn); ++bi) {
@@ -421,10 +443,15 @@ TEST(LirRewrite, MultiSpilledSameClassOperandsGetDistinctScratches) {
                 for (auto const& r : regOps) {
                     EXPECT_EQ(r.isPhysical, 1u);
                     EXPECT_TRUE(r.valid());
+                    ++examined;
                 }
             }
         }
     }
+    // The walk is a UNIVERSAL claim, and a universal claim over an empty set is
+    // true and says nothing. Same reason as the spill assertion above.
+    EXPECT_GT(examined, 0u)
+        << "no register operand was examined — the walk quantified over nothing";
     DiagnosticReporter verifyRep;
     EXPECT_TRUE(verifyLirPostRegalloc(rewritten.lir, *bundle.lowered.target, verifyRep));
 }

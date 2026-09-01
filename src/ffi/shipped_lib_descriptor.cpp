@@ -2042,20 +2042,29 @@ ShippedDescriptorCacheStats shippedDescriptorCacheStats() { return cacheStats();
 namespace {
 
 // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER + Cycle-2 D-CSUBSET-C11-THREADS-TRAMPOLINES) +
-// D-FFI-PE-CRT-UCRT-MIGRATION Phase 3: the CLOSED pe64 synth-recipe vocabulary — 27
-// recipes across TWO families: 21 <threads.h> + 6 <stdio.h>. Each is named for the C
+// D-FFI-PE-CRT-UCRT-MIGRATION Phase 3: the CLOSED pe64 synth-recipe vocabulary — 31
+// recipes across TWO families: 25 <threads.h> + 6 <stdio.h>. Each is named for the C
 // function it implements (the `synthesize` value MUST equal the symbol name); rows are
 // grouped by family for auditability.
 //
-// <threads.h> (21): Cycle 1 shipped the 18 single-basic-block recipes; Cycle 2 adds
+// <threads.h> (25): Cycle 1 shipped the 18 single-basic-block recipes; Cycle 2 adds
 // thrd_create (a branchless SINGLE block — DIRECT-PASS to CreateThread, no closure: the
 // C11 int(*)(void*) start routine has the SAME x64 ABI as the Win32 DWORD(*)(void*)),
 // call_once (SINGLE block over InitOnceExecuteOnce, via the module-scoped __dss_once_tramp
 // adapter the synth pass emits once + address-takes), and thrd_join (the first MULTI-block
 // recipe — `WaitForSingleObject; if(res) GetExitCodeThread; CloseHandle`, its canonical
-// StructCfMarkers rederived module-wide after finish()). STILL deferred: thrd_equal · the
-// timed-waits AND thrd_sleep (a pe timespec read has an unverified time_t/long-width
-// layout — a wrong offset is a silent miscompile → elf-FFI-only, D-CSUBSET-C11-THREADS-TIMED).
+// StructCfMarkers rederived module-wide after finish()).
+//
+// Cycle 3 (D-CSUBSET-C11-THREADS-TIMED, P49 lane tw) adds the LAST FOUR — thrd_sleep,
+// mtx_timedlock, cnd_timedwait, thrd_equal — closing the header on all three formats.
+// These are the first recipes that READ A SHIPPED STRUCT (`struct timespec`, at the
+// per-format offsets time.json declares) and the first that emit a LOOP: neither vehicle
+// has a timed-mutex primitive (`TryEnterCriticalSection` carries no timeout, and
+// `pthread_mutex_timedlock` is ABSENT from Darwin — measured by link probe), so
+// `mtx_timedlock` is a trylock/deadline loop on both, and `thrd_sleep` loops on pe because
+// `Sleep` takes a 32-bit millisecond count that a `time_t` duration can exceed.
+// The only <threads.h> function still deferred is macho `mtx_recursive`'s semantics
+// (D-CSUBSET-C11-THREADS-MACHO-MTX-PLAIN-RECURSIVE) — a mutex TYPE, not a function.
 //
 // <stdio.h> (6): the WHOLE printf/scanf family the UCRT leaves undefined — `printf`,
 // `fprintf`, `sprintf`, `snprintf`, `vfprintf`, `sscanf`. `ucrtbase.dll` exports NOT ONE of
@@ -2095,6 +2104,9 @@ constexpr RecipeRow kRecipes[] = {
     // Cycle 2 (direct-pass / trampoline / multi-block)
     {"thrd_create", ShimFamily::Threads},   {"thrd_join", ShimFamily::Threads},
     {"call_once", ShimFamily::Threads},
+    // Cycle 3 (the timed waits + the identity predicate) — D-CSUBSET-C11-THREADS-TIMED
+    {"thrd_sleep", ShimFamily::Threads},    {"mtx_timedlock", ShimFamily::Threads},
+    {"cnd_timedwait", ShimFamily::Threads}, {"thrd_equal", ShimFamily::Threads},
     // <stdio.h> printf/scanf family — synthesized over the UCRT __stdio_common_v* cores,
     // which ucrtbase exports in place of any concrete printf/sprintf/…
     // (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3). See the note above for why these six and no more.

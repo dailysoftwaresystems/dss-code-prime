@@ -55,12 +55,14 @@
 //       naked. A spill slot is DSS's own memory, so it round-trips the WHOLE
 //       register regardless of ABI; pinned on the emitted encoding.
 //
-// ⚠ EVERY EMISSION ARM ASSERTS A **POSITIVE COUNT** BEFORE IT ASSERTS A SHAPE.
-// D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO
-// records this tier's fixture lowering a call to NOTHING with `lowerOk` true,
-// so an "assert no bad instruction appears" pin here can read green over an
-// empty instruction list. Each arm below first proves the saved register it is
+// ⚠ EVERY EMISSION ARM ASSERTS A **POSITIVE COUNT** BEFORE IT ASSERTS A SHAPE,
+// and it stays that way now that the row below has closed. An "assert no bad
+// instruction appears" pin reads green over an empty instruction list whatever
+// produced the emptiness, so each arm first proves the saved register it is
 // talking about EXISTS in the layout and that the function assembled to bytes.
+// D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO
+// (closed P49) removed ONE way to reach that state; the discipline is cheap and
+// covers the others.
 
 #include "asm/asm.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -103,14 +105,25 @@ namespace {
 // source spills — `dsscp --compile` on it reports
 // `R_SpilledDueToCrossCallExhaustion: func 1 spilled 1 vreg(s)` and the
 // `ms_x64` build saves a callee-saved xmm. Driven through THIS fixture the same
-// source lowers to SEVEN LIR instructions with `lowerOk` true and zero
-// diagnostics, `savedRegs` EMPTY and `spillAreaSize` 0 — so every arm below
-// would have been a claim about saved-register stores in a function that has
-// none, and would have passed. That is
-// D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO
-// (harness registry) reproducing on a ONE-argument call, not only on the
-// eighty-argument one it was written from — a wider blast radius than that row
-// currently states, and the reason the arms below do not use that fixture.
+// source lowered to SEVEN LIR instructions with `lowerOk` true, `savedRegs`
+// EMPTY and `spillAreaSize` 0 — so every arm below would have been a claim about
+// saved-register stores in a function that has none, and would have passed. That
+// was D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO.
+//
+// ⚠⚠ THE "AND ZERO DIAGNOSTICS" HALF OF THAT SENTENCE WAS WRONG, AND THE ROW
+// INHERITED IT. ✔RE-MEASURED (lane `lt`, P49): the fixture's `mirReporter`
+// carried TWO `H_UnsupportedLoweringForKind` errors and `HirToMirResult.ok` was
+// FALSE on that very source. `lowerOk`, `allocOk` and `rewriteOk` — the three
+// flags this file and the row both read — are the LIR and regalloc verdicts, and
+// none of them is the MIR one. The cause was the fixture passing `ffiMap =
+// nullptr`, so the `double k(double);` PROTOTYPE was refused and its four calls
+// were dropped: not argument pressure, not "shapes the front end cannot build",
+// just a prototype. Both are fixed (P49) and the row is CLOSED.
+//
+// The arms below still do NOT use that fixture, for the reason stated next — a
+// hand-built `FAdd` across a `Call` makes preservation an ABI REQUIREMENT rather
+// than an allocator preference — which was always the better reason and is now
+// the only one.
 //
 // ★ SO THE MIR IS BUILT DIRECTLY, which is what `tests/asm/test_asm_x86_sse.cpp`
 // already does for the sibling claim about this same prologue: an `FAdd` whose

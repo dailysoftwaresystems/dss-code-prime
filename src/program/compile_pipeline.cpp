@@ -2620,6 +2620,69 @@ bool isRelocatableObjectFile(std::filesystem::path const& path,
         std::span<std::uint8_t const>{buf, got});
 }
 
+// D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE — the dispatch
+// and the drop, in one place, so neither can move without the other. Contract +
+// the severity measurement are on the declaration and on the diagnostic's own
+// docblock; this is only the mechanism.
+ResolveLibraryPartition
+partitionResolveLibraries(std::span<ResolveLibrarySpec const> libraries,
+                          ObjectFormatSchema const&           format,
+                          DiagnosticReporter&                 reporter) {
+    // ★ THE REPORT IS A CLOSURE OVER THE ARM, not a statement repeated in two
+    // branches. A second copy is how the archive arm and the object arm would
+    // come to disagree about what they say — which is the shape this whole
+    // surface has already paid for once (the asm binder restating `ingest()`'s
+    // symbol-version policy clause for clause).
+    auto const reportUnrecordable =
+        [&](ResolveLibrarySpec const&                lib,
+            DeclaredImportNameUnrecordableReason     reason) {
+            if (lib.declaredImportName.empty()) return;  // nothing was stated
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_DeclaredImportNameNotRecordable;
+            d.severity = DiagnosticSeverity::Warning;
+            // ⚠ BOTH VALUES, SPELLED OUT. The path is what the operator must
+            // find in their manifest or command line and the name is what they
+            // must move or delete; a message carrying only one of them sends
+            // the reader hunting for the other, which is the half of this
+            // anchor a bare "importName ignored" would have left open.
+            d.actual   = std::format(
+                "--resolve-library '{0}={1}': the declared import name '{1}' "
+                "is IGNORED for '{0}' (reason: {2}) -- {3}",
+                core::genericSpelling(lib.path), lib.declaredImportName,
+                declaredImportNameUnrecordableReasonName(reason),
+                declaredImportNameUnrecordableRemedy(reason));
+            reporter.report(std::move(d));
+        };
+
+    ResolveLibraryPartition out;
+    for (auto const& lib : libraries) {
+        // ★ THE ORDER OF THE THREE PROBES IS THE PRE-EXISTING ONE AND IS NOT
+        // ARBITRARY -- `ar` first (a container's members are objects, so the
+        // relocatable probe must never see the container), then the object
+        // probe asked OF THE FORMAT, then the dynamic residual. An unreadable
+        // path answers false to both and stays DYNAMIC, where the eager
+        // open-probe fails it loud; it is deliberately NOT reported here, since
+        // a file we could not classify has not been shown to be unable to carry
+        // the name, and one message about a bad path is enough.
+        if (isArArchiveFile(lib.path)) {
+            reportUnrecordable(
+                lib, DeclaredImportNameUnrecordableReason::MergedStaticArchive);
+            out.staticArchives.push_back(lib.path);
+        } else if (isRelocatableObjectFile(lib.path, format)) {
+            reportUnrecordable(
+                lib,
+                DeclaredImportNameUnrecordableReason::MergedRelocatableObject);
+            out.objectInputs.push_back(lib.path);
+        } else {
+            // The WHOLE SPEC rides to the dynamic side: this is the one arm
+            // that can record a stated identity, and it is the control that
+            // must stay silent.
+            out.dynamicLibraries.push_back(lib);
+        }
+    }
+    return out;
+}
+
 // ── D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT ────
 //
 // THE FORMAT AN ARCHIVE MEMBER **IS**, WHICH IS NOT THE FORMAT THE LINK IS

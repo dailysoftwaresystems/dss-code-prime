@@ -7336,7 +7336,23 @@ TEST(MirToLir, VlaBlockScopeStackRestoreLowersToSpRestore) {
 // at MIR->LIR — the base a `sub sp` leaves is only stack-aligned, so a 32-aligned
 // element would land under-aligned. RED-ON-DISABLE: drop the elemAlign gate in
 // lowerVlaAlloca -> the VLA would silently under-align its elements.
-TEST(MirToLir, VlaOverAlignedElementFailsLoud) {
+// VLA (D-CSUBSET-VLA): a VLA whose ELEMENT is over-aligned beyond the alignment the
+// dynamic `sub sp` guarantees is HONOURED — the runtime size carries `elemAlign` bytes of
+// rounding headroom and the captured base is rounded up through the shared
+// `emitAlignUpToPowerOfTwo`, with SP never realigned.
+//
+// ⚠ THIS TEST USED TO ASSERT THE OPPOSITE, as `VlaOverAlignedElementFailsLoud`, on the
+// premise that honouring the shape needed a dynamically realigned stack pointer.
+// ✔MEASURED 2026-09-01: gcc 13.3.0 and clang 18.1.3 both compile the shape, run it, and
+// hand back a genuinely 32-aligned base — so the refusal was a conformance gap, not a
+// design choice, and the premise went false while the assertion kept passing.
+//
+// ★ THE LOAD-BEARING PIN IS NOT HERE. An address's alignment, and its non-overlap with a
+// neighbouring VLA, are RUN-TIME facts that cannot be read off a lowering — the runtime
+// witness is `examples/c/c99_vla_element_overaligned`, whose first draft passed OVER an
+// 8-byte overlap of two live objects because the overrun landed in trailing padding.
+// This test pins only that the lowering no longer REFUSES, and that it emitted something.
+TEST(MirToLir, VlaOverAlignedElementLowers) {
     auto L = lowerCToLir(
         "int f(int n) {\n"
         "  _Alignas(32) int a[n];\n"
@@ -7344,14 +7360,24 @@ TEST(MirToLir, VlaOverAlignedElementFailsLoud) {
         "}\n");
     ASSERT_FALSE(L.model.hasErrors());
     ASSERT_TRUE(L.mir.ok);
-    EXPECT_FALSE(L.lir.ok)
-        << "an over-aligned VLA element must fail the LIR lowering";
-    bool sawOverAlign = false;
+    EXPECT_TRUE(L.lir.ok)
+        << "an over-aligned VLA element must LOWER — the runtime size carries the "
+           "rounding headroom and the captured base is rounded";
     for (auto const& d : L.lirReporter.all()) {
-        if (d.code == DiagnosticCode::L_OverAlignedStackLocal) sawOverAlign = true;
+        EXPECT_NE(d.code, DiagnosticCode::L_OverAlignedStackLocal)
+            << "L_OverAlignedStackLocal survives only as the non-power-of-two invariant "
+               "guard; an ordinary _Alignas(32) element must not reach it";
     }
-    EXPECT_TRUE(sawOverAlign)
-        << "an over-aligned VLA element must surface L_OverAlignedStackLocal";
+    // ⚠ A lowering that emitted NOTHING would satisfy both assertions vacuously — the
+    // exact class D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO
+    // was closed for this cycle. Assert a POSITIVE count rather than trusting `ok`.
+    std::uint32_t insts = 0;
+    for (std::size_t f = 0; f < L.lir.lir.moduleFuncCount(); ++f) {
+        LirFuncId const fn = L.lir.lir.funcAt(static_cast<std::uint32_t>(f));
+        for (std::uint32_t b = 0; b < L.lir.lir.funcBlockCount(fn); ++b)
+            insts += L.lir.lir.blockInstCount(L.lir.lir.funcBlockAt(fn, b));
+    }
+    EXPECT_GT(insts, 0u) << "the lowered function must contain instructions";
 }
 
 // ── FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): native-vs-SWAR lowering ─────────
