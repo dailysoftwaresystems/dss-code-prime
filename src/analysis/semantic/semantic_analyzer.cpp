@@ -1000,6 +1000,13 @@ resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
     TypeId lhsTy, NodeId rhsExpr,
     SemanticConfig::PointerConversionRules const& rules,
     ScopeId scope, SemanticConfig const& cfg);
+// The structural null-pointer-constant test (a lone integer-literal `0`), forward
+// declared because P48's pass2Post conditional check must ask the SAME question
+// `combineTernary`'s null arms ask — a check whose idea of "null pointer constant"
+// differs from the TYPER's would warn about the very pairings the typer just
+// resolved cleanly.
+[[nodiscard]] bool isLiteralIntegerZero(EngineState const& s, Tree const& tree,
+                                        NodeId node);
 
 // True iff a token of kind `kind` appears anywhere in `node`'s subtree,
 // stopping descent at any NESTED declaration-rule node (other than the
@@ -7685,6 +7692,31 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 : subtreeContainsToken(
                                       tree, node, *decl.constMarker,
                                       &s.idx().declByRule);
+                            // P48 (D-CSUBSET-POINTEE-CONST-ENFORCEMENT): the SAME
+                            // three config roles, one question deeper. `isConst`
+                            // above is spine level 0 and keeps its exact meaning;
+                            // this records EVERY level, so the const-violation
+                            // check can answer for a deref / subscript / member
+                            // lvalue instead of only a plain identifier. It is the
+                            // walk P44 already built for the C23 redeclaration
+                            // qualifier axis — reused, not re-derived, so the two
+                            // answers cannot disagree about where a `const` lives.
+                            // ⚠ THIS SITE ONLY. The anonymous-field site below has
+                            // no declarator to walk, and the legacy positional site
+                            // is unreached in c (its own comment says so) — both
+                            // leave `qualSpine` nullopt, which is "no claim", not
+                            // "unqualified".
+                            if (cfg.declarators.has_value()) {
+                                rec.qualSpine = declaratorConstSpine(
+                                    tree, dNode,
+                                    (decl.headChild.has_value()
+                                     && *decl.headChild < kids.size())
+                                        ? kids[*decl.headChild] : NodeId{},
+                                    *cfg.declarators, *decl.constMarker,
+                                    &s.idx().declByRule, typeofOpaqueRules,
+                                    decl.restrictMarker.value_or(SchemaTokenId{}),
+                                    &s.idx());
+                            }
                         }
                         // c27 (D-CSUBSET-VOLATILE-POINTEE): object-volatility is now
                         // derived from the symbol's resolved TYPE (top-level
@@ -11867,6 +11899,278 @@ inlineAsmSection(std::string_view label, std::vector<std::string> const& items,
 // `return;` here ends THIS node's post-work and the driver loop continues —
 // exactly as the recursive `return;` did. The body is byte-identical to the
 // prior post-child portion of `pass2`.
+// ── P48: THE CHEAP PRE-FILTER THE TWO NEW pass2Post ARMS ASK FIRST ───────────
+//
+// Both new arms are constraint checks about POINTER operands, and both would
+// otherwise call `subtreeType` on every operand of every `-` and every
+// conditional in the program merely to discover that the operands are ordinary
+// arithmetic. That is not free, and it was MEASURED rather than assumed: two
+// translation units of IDENTICAL shape and size (6000 statements each) differing
+// ONLY in the operator compiled in 4423 ms with `-` against 3306 ms with `*` —
+// **+34% on subtraction-heavy code**, ~0.19 ms per subtraction node, on a
+// project that is running a compile-time campaign.
+//
+// ★★ AND THE FIX WAS MEASURED THE SAME WAY, WITH A PAIRED INSTRUMENT, BECAUSE
+// THE FIRST INSTRUMENT COULD NOT DECIDE IT. Re-running one binary at a time made
+// the arms-off build look faster on `mul` and `noternary` TOO — variants these
+// arms never enter — so the machine's load had moved between runs and only
+// within-run deltas meant anything. Running BOTH binaries interleaved over the
+// same inputs, min-of-6: `sub` 2920 ms → 2952 ms (**+32 ms over 6000 nodes,
+// +1.1%**), `ternary` 9109 → 9171 (+61 ms, +0.7%), against a noise floor of
+// +10 ms / +6 ms on the two variants the arms cannot touch. ⚠ A third reading —
+// 5 ms for everything — was a LIE the clock told: a `dsscp` copied into a bare
+// directory finds none of its DLLs, exits 0 with no output, and times as an
+// instant compile. The benchmark now asserts a non-empty ARTIFACT per sample
+// rather than trusting the stopwatch.
+//
+// So the arms ask THIS first: following only transparent single-child wrappers
+// (bounded, O(1)), does the nearest Pass-2 TYPE STAMP say this operand is a
+// pointer or an array? `false` is a definitive NO and the arm returns without
+// paying for the walk; `nullopt` means the stamp could not answer and the arm
+// falls back to `subtreeType`, so nothing is ever MISSED — the filter can only
+// cost a diagnostic if it answered `false` for something that is a pointer, and
+// it answers `false` only from a stamp that names a concrete non-pointer kind.
+[[nodiscard]] std::optional<bool>
+stampedOperandMayBePointer(EngineState const& s, Tree const& tree, NodeId n) {
+    auto const& in  = s.lattice.interner();
+    NodeId      cur = n;
+    for (int guard = 0; guard < 16 && cur.valid(); ++guard) {
+        if (TypeId t = s.typeAt(cur); t.valid()) {
+            auto const k = in.kind(t);
+            return k == TypeKind::Ptr || k == TypeKind::Array
+                || k == TypeKind::FnSig || k == TypeKind::Slice;
+        }
+        if (tree.kind(cur) == NodeKind::Token) return std::nullopt;
+        NodeId sole{};
+        bool   many = false;
+        for (NodeId c : visibleChildren(tree, cur)) {
+            if (tree.kind(c) == NodeKind::Token) continue;
+            if (sole.valid()) { many = true; break; }
+            sole = c;
+        }
+        if (many || !sole.valid()) return std::nullopt;
+        cur = sole;
+    }
+    return std::nullopt;
+}
+
+// P48: a node's source text with surrounding whitespace removed. A `tree.text`
+// span runs to the next token, so `*p = 'x'` renders the LHS as "*p " — and a
+// diagnostic that quotes the user's own expression must quote it the way the
+// user wrote it. Shared by the three P48 diagnostics that embed operand text.
+[[nodiscard]] std::string trimmedNodeText(Tree const& tree, NodeId node) {
+    std::string_view t = tree.text(node);
+    auto const isSpace = [](char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'
+            || c == '\v';
+    };
+    while (!t.empty() && isSpace(t.front())) t.remove_prefix(1);
+    while (!t.empty() && isSpace(t.back()))  t.remove_suffix(1);
+    return std::string{t};
+}
+
+// ── P48 (D-CSUBSET-POINTEE-CONST-ENFORCEMENT): IS THIS LVALUE CONST? ─────────
+//
+// SE4's const check used to ask its question of a PLAIN IDENTIFIER and nothing
+// else, so `const char *p; *p = 'x';`, `struct S{const int v;}; s.v = 2;` and
+// `const int a[2]; a[0] = 5;` all compiled in silence. All four references
+// REJECT every one of them with a hard error — ✔MEASURED 2026-09-01, each probed
+// SEPARATELY at -O0 AND -O2: gcc 13.3.0 *"assignment of read-only location"*,
+// clang 18.1.3 *"read-only variable is not assignable"* / *"cannot assign to
+// variable with const-qualified type"*, mingw-w64 gcc 13.2.0 the same as gcc,
+// MSVC 19.51.36252 `C2166: l-value specifies const object` / `C2678`. A
+// UNANIMOUS refusal, so the diagnostic is REQUIRED and an Error is the right
+// severity — the one case in this cycle where the row's stated direction and the
+// references agree outright.
+//
+// ★★ THE WALK IS OUTSIDE-IN AND COUNTS INDIRECTION LEVELS, which is what lets it
+// read the SAME `QualifierSpine` a declarator produced. Level 0 is the declared
+// object; level i+1 is what level i points to or contains. `*E` and `E[i]` each
+// add one level; `E.f` adds none and `E->f` adds one to the OBJECT side. At the
+// base identifier the accumulated level indexes the spine.
+//
+// ★★★ LEVEL 0 IS ANSWERED BY `isConst`, NOT BY THE SPINE, AND THAT IS
+// DELIBERATE. Every verdict SE4 produced before P48 came from `rec.isConst`, and
+// it still does: this function only ever ADDS an answer where the old check had
+// none. A spine that disagreed with `isConst` at level 0 could otherwise silently
+// change a shipped verdict, and the two are computed by different walks.
+//
+// ⚠ A MEMBER'S OBJECT QUALIFIER REACHES LEVEL 0 ONLY (C 6.5.2.3). `const struct
+// S s; s.v = 2;` is a violation because `s`'s const qualifies the member; but
+// `struct S { int *p; }; const struct S s; *s.p = 1;` is NOT — the const makes
+// `p` an `int *const`, it does not make `*p` a `const int`. So the object side is
+// consulted at level 0 and never deeper.
+//
+// ⚠ NO CLAIM IS NOT "UNQUALIFIED". A base whose declarator shape the spine walk
+// does not model returns `nullopt`, and this returns false there — a missed
+// diagnostic, never a refused correct program (declared_qualification.hpp,
+// "ABSENT IS NOT UNQUALIFIED"). Anything that is not an identifier / deref /
+// subscript / member — a call result, a cast, a comma — also answers false: the
+// walk makes claims only about shapes it actually understands.
+// P48 lane cq: the walk's verdict, plus the ONE fact the report site needs in
+// order to pick a severity the reference union actually licenses. See
+// `ConstLvalueVerdict::viaConstDeclaredBitField` for why one shape is a Warning.
+struct ConstLvalueVerdict {
+    // The designated object is const-qualified ⇒ C 6.5.16.1 is violated.
+    bool isConst = false;
+    // ⚠⚠ THE ONE SHAPE ON WHICH THE REFERENCES SPLIT, AND THE SPLIT IS
+    // ACCEPT-vs-REFUSE, SO THE DISJUNCTION GOVERNS. ✔MEASURED 2026-09-01 (P48
+    // lane cq), each reference probed SEPARATELY at -O0 AND -O2: a write to a
+    // member that is BOTH declared `const` AND a BIT-FIELD —
+    // `struct S { const int v : 3; }; s->v = 1;` — is a WARNING that COMPILES
+    // on gcc 13.3.0 and mingw-w64 gcc 13.2.0 (*"assignment of read-only
+    // location 's->v'"*, exit 0, unchanged under `-std=c17`, `-Wall -Wextra`
+    // and even `-pedantic-errors`) while clang 18.1.3 and MSVC 19.51.36252
+    // REJECT it. `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` makes an Error here a
+    // refusal BELOW the union, so DSS reports and COMPILES: a suppressible
+    // Warning, promoted by `--warnings-as-errors` for anyone wanting the strict
+    // posture — the same resolution this repo already reached for
+    // `S_UnknownAttribute`.
+    // ★ THE PREDICATE IS EXACT, AND NARROWER THAN "the LHS is a bit-field".
+    // ✔MEASURED: a PLAIN bit-field of a CONST OBJECT
+    // (`struct S { int v : 3; }; void f(const struct S *s){ s->v = 1; }`) is a
+    // HARD ERROR on ALL FOUR, identical to its non-bit-field twin. gcc's
+    // leniency is about the const on the MEMBER'S OWN DECLARATION, so that is
+    // what this flag keys on — never bit-field-ness alone, which would
+    // wrongly soften the unanimous const-object case.
+    bool viaConstDeclaredBitField = false;
+};
+
+[[nodiscard]] ConstLvalueVerdict
+constQualifiedLvalue(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                     NodeId lhsNode, ScopeId here) {
+    auto const& hirCfg = tree.schema().hirLowering();
+    // Bit `level` of a spine, honoring "absent is not unqualified".
+    auto const spineConstAt = [](std::optional<QualifierSpine> const& sp,
+                                 unsigned level) {
+        return sp.has_value() && level < sp->levels && level < 64
+            && ((sp->constBits >> level) & 1u) != 0u;
+    };
+    // The qualification of a SYMBOL's declared type at `level`: level 0 is the
+    // object itself (the pre-P48 answer), deeper levels come from the spine.
+    auto const symbolConstAt = [&](SymbolId sym, unsigned level) {
+        if (!sym.valid()) return false;
+        auto const& rec = s.symbols.at(sym);
+        return level == 0 ? rec.isConst : spineConstAt(rec.qualSpine, level);
+    };
+    // Which `hirLowering` target does this operator node carry?
+    auto const targetOf = [&](NodeId n,
+                              std::vector<HirOperatorEntry> const& ops)
+        -> std::string_view {
+        for (NodeId c : visibleChildren(tree, n)) {
+            if (tree.kind(c) != NodeKind::Token) continue;
+            for (auto const& e : ops)
+                if (e.token.v == tree.tokenKind(c).v) return e.target;
+        }
+        return {};
+    };
+    auto const firstInternal = [&](NodeId n) {
+        for (NodeId c : visibleChildren(tree, n))
+            if (tree.kind(c) != NodeKind::Token) return c;
+        return NodeId{};
+    };
+
+    NodeId   cur    = lhsNode;
+    unsigned levels = 0;
+    for (int guard = 0; guard < 128 && cur.valid(); ++guard) {
+        if (tree.kind(cur) == NodeKind::Token) {
+            if (!cfg.identifierToken.valid()
+                || tree.tokenKind(cur) != cfg.identifierToken) {
+                return {};
+            }
+            return {symbolConstAt(
+                s.scopes.lookup(here, std::string{tree.text(cur)}), levels),
+                    false};
+        }
+        std::uint32_t const r = tree.rule(cur).v;
+        if (hirCfg.unaryExprRule.valid() && r == hirCfg.unaryExprRule.v) {
+            if (targetOf(cur, hirCfg.unaryOps) != "Deref") return {};
+            NodeId const operand = firstInternal(cur);
+            if (!operand.valid()) return {};
+            ++levels;
+            cur = operand;
+            continue;
+        }
+        if (hirCfg.postfixExprRule.valid() && r == hirCfg.postfixExprRule.v) {
+            auto const tgt = targetOf(cur, hirCfg.postfixOps);
+            if (tgt == "Index") {
+                NodeId const base = firstInternal(cur);
+                if (!base.valid()) return {};
+                ++levels;
+                cur = base;
+                continue;
+            }
+            if (tgt != "MemberAccess" && tgt != "MemberAccessThruPtr")
+                return {};                          // Call / ++ / -- : no claim
+            auto const mr = resolveMemberAccess(s, cfg, tree, cur, here);
+            if (mr.status != MemberResolution::Status::Ok) return {};
+            // ★ THIS LINE ANSWERED `false` FOR EVERY CONST-DECLARED FIELD UNTIL
+            // P48 CLOSED THE CONFIG SIDE, AND THE FIX WAS NEVER HERE. `sm`
+            // measured the cause and lane cq re-measured and applied it: c's
+            // `structField` and `unionField` declaration rows carried
+            // `volatileMarker` ALONE, so a member's own `const` was scanned by
+            // nothing and `SymbolRecord.isConst` was never set on a field
+            // symbol. Adding `constMarker` + `restrictMarker` to those two rows
+            // in `src/dss-config/sources/c.lang.json` made this line answer
+            // correctly with no change to the walk — the question was always
+            // right, only the answer was missing. See those rows'
+            // `$p48ConstMarkerComment` for the reference measurement.
+            if (symbolConstAt(mr.fieldSym, levels)) {
+                // ⚠ THE SEVERITY FORK. A member that is BOTH declared `const`
+                // AND a BIT-FIELD is the one shape in this family where the
+                // references split accept-vs-refuse, so the disjunction governs
+                // and DSS must not refuse it. See `ConstLvalueVerdict` for the
+                // measurement and for why the predicate is the member's OWN
+                // const rather than bit-field-ness alone.
+                bool const bitField =
+                    mr.fieldSym.valid()
+                    && s.symbols.at(mr.fieldSym).bitFieldWidth.has_value();
+                return {true, bitField};
+            }
+            // Deeper than the member itself ⇒ the object's own qualifier cannot
+            // reach it (see the C 6.5.2.3 note above).
+            if (levels != 0) return {};
+            NodeId const object = firstInternal(cur);
+            if (!object.valid()) return {};
+            levels = mr.dereferences ? 1u : 0u;     // `->` is `(*E).f`
+            cur    = object;
+            continue;
+        }
+        // ⚠ AN IDENTIFIER OPERAND IS AN INTERNAL NODE WRAPPING ONE TOKEN, not a
+        // bare Token, so the leaf test above is not the one that fires in
+        // practice — ✔MEASURED with a trace on this walk, where every base
+        // arrived as an operand rule whose ONLY visible child is the identifier
+        // token, and a peel that skipped tokens found nothing to descend into and
+        // gave up one step short of the answer. `extractNameNode(Self)` is the
+        // repo's existing owner of "this node IS a name, or wraps exactly one",
+        // and it is the SAME call SE4's plain-identifier arm makes — so the two
+        // arms cannot disagree about what counts as naming an object.
+        // It is asked AFTER the operator arms, never before: `*p` also wraps a
+        // single visible identifier, and answering from the name there would
+        // silently drop the indirection this walk exists to count.
+        if (auto named = extractNameNode(tree, cur, NameMatchMode::Self,
+                                         cfg.identifierToken);
+            named.node.valid() && tree.kind(named.node) == NodeKind::Token
+            && cfg.identifierToken.valid()
+            && tree.tokenKind(named.node) == cfg.identifierToken) {
+            return {symbolConstAt(s.scopes.lookup(here, named.name), levels),
+                    false};
+        }
+        // A transparent wrapper (a paren group, a single-child expression rule):
+        // exactly one non-token child and nothing else to interpret.
+        NodeId sole{};
+        bool   many = false;
+        for (NodeId c : visibleChildren(tree, cur)) {
+            if (tree.kind(c) == NodeKind::Token) continue;
+            if (sole.valid()) { many = true; break; }
+            sole = c;
+        }
+        if (many || !sole.valid()) return {};
+        cur = sole;
+    }
+    return {};
+}
+
 void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                NodeId node, ScopeId here, int loopDepth) {
     auto const k = tree.kind(node);
@@ -13100,6 +13404,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (!gated) continue;
                 if (assign.lhsChild < kids.size()) {
                     NodeId lhsNode = kids[assign.lhsChild];
+                    bool reported = false;
                     auto resolved = extractNameNode(
                         tree, lhsNode, NameMatchMode::Self, cfg.identifierToken);
                     if (resolved.node.valid()
@@ -13115,7 +13420,47 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             d.span     = tree.span(resolved.node);
                             d.actual   = resolved.name;
                             s.reporter.report(std::move(d));
+                            reported = true;
                         }
+                    }
+                    // P48 (D-CSUBSET-POINTEE-CONST-ENFORCEMENT): the SAME C
+                    // 6.5.16.1 constraint for every NON-plain-identifier const
+                    // lvalue — a deref of a pointer-to-const, a const member, a
+                    // member of a const object, an element of a const array.
+                    //
+                    // ★ IT RUNS ONLY WHERE THE PLAIN-IDENTIFIER ARM DID NOT FIRE,
+                    // which is what makes it purely additive: the pre-P48 verdict
+                    // is produced by the pre-P48 code on the pre-P48 path, and a
+                    // const identifier can never draw TWO reports for one
+                    // assignment. The span is the whole LHS, because for `*p` or
+                    // `a[0].v` the offending thing is the DESIGNATION, not any one
+                    // token in it.
+                    ConstLvalueVerdict const cv =
+                        reported ? ConstLvalueVerdict{}
+                                 : constQualifiedLvalue(s, cfg, tree, lhsNode,
+                                                        here);
+                    if (cv.isConst) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::S_ConstViolation;
+                        // P48 lane cq: Error everywhere the four references
+                        // REFUSE, Warning on the one shape they SPLIT on — a
+                        // member declared `const` that is also a BIT-FIELD,
+                        // which gcc and mingw-w64 gcc warn about and COMPILE.
+                        // An Error there would refuse a program the union
+                        // accepts; silence would drop a diagnostic ISO C
+                        // requires and all four references emit. See
+                        // `ConstLvalueVerdict`.
+                        d.severity = cv.viaConstDeclaredBitField
+                                   ? DiagnosticSeverity::Warning
+                                   : DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(lhsNode);
+                        d.actual   = "assignment to `"
+                                   + trimmedNodeText(tree, lhsNode)
+                                   + "`, which designates a const-qualified "
+                                     "object — C 6.5.16.1 requires a MODIFIABLE "
+                                     "lvalue as the left operand";
+                        s.reporter.report(std::move(d));
                     }
                 }
                 // D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS: an assignment
@@ -13188,6 +13533,203 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     }
                 }
                 break;  // operator matched — no further entry can apply
+            }
+        }
+    }
+
+    // ── SE4b (P48, D-CSUBSET-TERNARY-ARRAY-ARM-INCOMPATIBLE) ──────────────────
+    // C 6.5.15p3: the second and third operands of a conditional must be two
+    // arithmetic types, two compatible structs/unions, two `void`s, two
+    // compatible pointers, a pointer and a null pointer constant, or an object
+    // pointer and a `void *`. A POINTER (or an array / function designator, which
+    // contributes one by C 6.3.2.1p3-p4 decay) paired with an INTEGER that is not
+    // a null pointer constant satisfies NONE of them — `cond ? "%s" : 1`.
+    //
+    // ★★ THE SEVERITY IS MEASURED, NOT CHOSEN — see the docblock on
+    // `S_ConditionalOperandTypeMismatch`. All four references (gcc 13.3.0,
+    // clang 18.1.3, mingw-w64 gcc 13.2.0, MSVC 19.51.36252) probed SEPARATELY at
+    // -O0 and -O2 WARN and COMPILE, so an error here would refuse a program the
+    // whole union accepts. `--warnings-as-errors` is the strict posture.
+    //
+    // ★ THE TYPE IS DELIBERATELY LEFT ALONE. The row that asked for this states
+    // — and this cycle re-measured — that DSS's codegen for the shape already
+    // matches the references' error-recovery runtime, so the ONLY gap was the
+    // missing diagnostic. Retyping the conditional here would change a working
+    // program's meaning to fix a message.
+    //
+    // ⚠ IT ASKS THE TYPER'S OWN QUESTIONS, NOT LOOKALIKES. The arm types come
+    // from `subtreeType` and the decay from the shared `arrayToPointerDecay` —
+    // the same two the `combineTernary` null / array arms use — and the
+    // null-pointer-constant escape runs BOTH the structural `isLiteralIntegerZero`
+    // that `combineTernary` keys its arms on AND the full
+    // `admitsNullPointerConstant` (which also admits the folded `1-1` / `-0`
+    // forms). A check whose idea of "null pointer constant" were narrower than
+    // the typer's would warn about pairings the typer resolves cleanly.
+    if (k == NodeKind::Internal) {
+        auto const& hirCfgT = tree.schema().hirLowering();
+        if (hirCfgT.ternaryExprRule.valid()
+            && tree.rule(node).v == hirCfgT.ternaryExprRule.v) {
+            std::vector<NodeId> arms;
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) != NodeKind::Token) arms.push_back(c);
+            }
+            // The cheap pre-filter (see `stampedOperandMayBePointer`): this
+            // constraint needs ONE arm to contribute a pointer, so a definitive
+            // NO on BOTH arms ends it before the `subtreeType` walks. The
+            // two-arithmetic-arm conditional — by far the common one — pays
+            // nothing.
+            bool const neitherArmIsPointerish =
+                arms.size() == 3
+                && stampedOperandMayBePointer(s, tree, arms[1]) == std::optional<bool>{false}
+                && stampedOperandMayBePointer(s, tree, arms[2]) == std::optional<bool>{false};
+            if (arms.size() == 3 && !neitherArmIsPointerish) {
+                auto& in = s.lattice.interner();
+                TypeId const thenT = subtreeType(s, tree, arms[1], here);
+                TypeId const elseT = subtreeType(s, tree, arms[2], here);
+                // A pointer-CONTRIBUTING arm: a pointer, or an array / function
+                // designator that decays to one.
+                auto const pointerArm = [&](TypeId t) {
+                    if (!t.valid()) return false;
+                    TypeId const d = arrayToPointerDecay(in, t);
+                    return in.kind(d) == TypeKind::Ptr
+                        || in.kind(d) == TypeKind::FnSig;
+                };
+                // An INTEGER arm. Char / Bool / Enum ride here beside the ranked
+                // integer kinds because C's constraint is about the pointer-vs-
+                // integer split, not about the promotion lattice — and a `_BitInt`
+                // is an integer type by C23 6.2.5.
+                auto const integerArm = [&](TypeId t) {
+                    if (!t.valid()) return false;
+                    auto const tk = in.kind(t);
+                    return tk == TypeKind::BitInt || tk == TypeKind::Char
+                        || tk == TypeKind::Bool  || tk == TypeKind::Enum
+                        || detail::type_rules::signedIntRank(tk)   != 0
+                        || detail::type_rules::unsignedIntRank(tk) != 0;
+                };
+                auto const& ptrRulesT =
+                    tree.schema().semantics().pointerConversions;
+                auto const nullConstantArm =
+                    [&](NodeId n, TypeId pointerSide) {
+                        return isLiteralIntegerZero(s, tree, n)
+                            || admitsNullPointerConstant(s, tree, pointerSide, n,
+                                                         ptrRulesT, here, cfg);
+                    };
+                NodeId ptrN{}, intN{};
+                TypeId ptrT{};
+                if (pointerArm(thenT) && integerArm(elseT)) {
+                    ptrN = arms[1]; intN = arms[2];
+                    ptrT = arrayToPointerDecay(in, thenT);
+                } else if (pointerArm(elseT) && integerArm(thenT)) {
+                    ptrN = arms[2]; intN = arms[1];
+                    ptrT = arrayToPointerDecay(in, elseT);
+                }
+                if (intN.valid() && !nullConstantArm(intN, ptrT)) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_ConditionalOperandTypeMismatch;
+                    d.severity = DiagnosticSeverity::Warning;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(intN);
+                    d.actual   = "the second and third operands of this "
+                                 "conditional are a pointer (`"
+                               + trimmedNodeText(tree, ptrN)
+                               + "`) and an integer (`"
+                               + trimmedNodeText(tree, intN)
+                               + "`), which is none of the operand pairings C "
+                                 "6.5.15p3 admits";
+                    d.suggestion =
+                        "an integer arm may pair with a pointer arm only when it "
+                        "is a null pointer constant; write `0` (or cast the "
+                        "integer to the pointer type) if that is what was meant";
+                    s.reporter.report(std::move(d));
+                }
+            }
+        }
+    }
+
+    // ── SE4c (P48, D-CSUBSET-POINTER-DIFF-EDGE-CASES part 2) ──────────────────
+    // C 6.5.6p3: for `-`, both operands must be pointers to compatible complete
+    // object types (or arithmetic, or pointer-minus-integer). `char *a; int *b;
+    // a - b` satisfies none of those.
+    //
+    // ★★ A WARNING, AND THAT REFUTES THE ROW THAT ASKED FOR A LOUD ERROR — see
+    // the docblock on `S_PointerDifferenceIncompatiblePointee`. gcc 13.3.0,
+    // clang 18.1.3 and mingw-w64 gcc 13.2.0 REJECT it; MSVC 19.51.36252
+    // COMPILES it (`C4133`). The disjunction settles accept-vs-refuse, so DSS
+    // accepts — and the pointer-difference RESULT TYPE arm in `combineBinary`
+    // now covers the mismatched pairing too, which is what removes the
+    // pre-existing below-union refusals (`long n = a - b;` and `g(a - b)` used
+    // to fail S_TypeMismatch here while `(int)(a - b)` compiled silently — the
+    // same expression accepted or refused by the CONTEXT it landed in).
+    if (k == NodeKind::Internal) {
+        auto const& hirCfgS = tree.schema().hirLowering();
+        if (hirCfgS.binaryExprRule.valid()
+            && tree.rule(node).v == hirCfgS.binaryExprRule.v) {
+            NodeId lhsN{}, rhsN{};
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) == NodeKind::Token) continue;
+                if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
+            }
+            HirOperatorEntry const* sub = nullptr;
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) != NodeKind::Token) continue;
+                for (auto const& e : hirCfgS.binaryOps) {
+                    if (e.token.v == tree.tokenKind(c).v
+                        && e.target == "Sub" && e.compoundBase.empty()) {
+                        sub = &e;
+                        break;
+                    }
+                }
+                if (sub != nullptr) break;
+            }
+            // The cheap pre-filter (see `stampedOperandMayBePointer`): a pointer
+            // difference needs BOTH operands to contribute a pointer, so a
+            // definitive NO on EITHER side ends the arm before the `subtreeType`
+            // walk. ✔MEASURED: this is what keeps an all-subtraction translation
+            // unit at parity with an all-multiplication one.
+            auto const lMay = lhsN.valid()
+                ? stampedOperandMayBePointer(s, tree, lhsN) : std::optional<bool>{};
+            auto const rMay = rhsN.valid()
+                ? stampedOperandMayBePointer(s, tree, rhsN) : std::optional<bool>{};
+            bool const cannotBePointerDifference =
+                (lMay.has_value() && !*lMay) || (rMay.has_value() && !*rMay);
+            if (sub != nullptr && lhsN.valid() && rhsN.valid()
+                && !cannotBePointerDifference) {
+                auto& in = s.lattice.interner();
+                TypeId const ltD =
+                    arrayToPointerDecay(in, subtreeType(s, tree, lhsN, here));
+                TypeId const rtD =
+                    arrayToPointerDecay(in, subtreeType(s, tree, rhsN, here));
+                if (ltD.valid() && rtD.valid()
+                    && in.kind(ltD) == TypeKind::Ptr
+                    && in.kind(rtD) == TypeKind::Ptr
+                    && !in.operands(ltD).empty() && !in.operands(rtD).empty()
+                    && in.operands(ltD)[0] != in.operands(rtD)[0]
+                    // A `void` pointee has no element stride, so it is NOT part
+                    // of this pairing: `void *` arithmetic is its own question
+                    // with its own row (D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED,
+                    // `src/mir/**`) and its own existing fail-loud path. Excluding
+                    // it here keeps this diagnostic and the result-type arm in
+                    // `combineBinary` describing exactly the same set — a warning
+                    // that says "computed with the LEFT operand's stride" about a
+                    // pairing that produces no stride would be a false sentence.
+                    && in.kind(in.operands(ltD)[0]) != TypeKind::Void
+                    && in.kind(in.operands(rtD)[0]) != TypeKind::Void) {
+                    ParseDiagnostic d;
+                    d.code =
+                        DiagnosticCode::S_PointerDifferenceIncompatiblePointee;
+                    d.severity = DiagnosticSeverity::Warning;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = "the two operands of this pointer subtraction "
+                                 "point to incompatible types, which C 6.5.6p3 "
+                                 "does not admit; the element count is computed "
+                                 "with the LEFT operand's stride";
+                    d.suggestion =
+                        "cast one operand so both point to the same type, or "
+                        "subtract the addresses explicitly by casting each to an "
+                        "integer type";
+                    s.reporter.report(std::move(d));
+                }
             }
         }
     }
@@ -14774,11 +15316,14 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     // C 6.3.2.1p3 array-to-pointer decay: an `Array<T,N>` in a value context decays
     // to `Ptr<T>`. Shared by the pointer-SUBTRACTION arm (below) and the ternary
     // (D-CSUBSET-TERNARY-ARRAY-DECAY) so the one decay law has a single chokepoint —
-    // a non-array passes through unchanged.
+    // a non-array passes through unchanged. P48 MOVED that chokepoint into the
+    // shared `type_rules.hpp` (`arrayToPointerDecay`) because the pass2Post
+    // conditional / pointer-difference CHECKS must decide the arm pairing by
+    // exactly the law the TYPER used; a second copy is how a diagnostic starts
+    // disagreeing with the type it is describing. This alias keeps the local
+    // spelling the arms below already read.
     auto const decayArray = [&](TypeId t) -> TypeId {
-        if (!t.valid() || interner.kind(t) != TypeKind::Array) return t;
-        auto const elems = interner.operands(t);
-        return elems.empty() ? t : interner.pointer(elems[0]);
+        return arrayToPointerDecay(interner, t);
     };
     auto const combineBinary =
         [&](HirOperatorEntry const* e, TypeId lt, TypeId rt) -> TypeId {
@@ -14819,17 +15364,40 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             // Ptr the un-decayed fallback would yield. Mirrors the HIR combineBinary
             // c65 (D-CSUBSET-POINTER-DIFF-EDGE-CASES) which already emits the decay
             // Cast + the p-q lowering — this closes the semantic-tier asymmetry the
-            // explicit-cast pointer_minus_array example masked. Same-pointee only
-            // (matches c65): a mismatched `int* - char[]` (gcc rejects) is left
-            // un-decayed → falls through (loud, not silent). `p - n` / `arr - n`
+            // explicit-cast pointer_minus_array example masked. `p - n` / `arr - n`
             // (integer rhs) keep the pre-existing behavior (decay leaves rtD non-Ptr
             // → this arm does not fire).
+            // ⚠ THIS USED TO SAY "Same-pointee only (matches c65): a mismatched
+            // `int* - char[]` (gcc rejects) is left un-decayed → falls through
+            // (loud, not silent)", AND P48 CHANGED IT. gcc does reject it — so do
+            // clang and mingw — but MSVC 19.51.36252 COMPILES it (`C4133`), and
+            // the disjunction settles accept-vs-refuse, so a mismatched pointee
+            // pair now types as the pointer-difference type here too and
+            // pass2Post's SE4c warns at the operator. See the arm's own
+            // P48 note below.
             if (*op == HirOpKind::Sub && lt.valid() && rt.valid()) {
                 TypeId const ltD = decayArray(lt);
                 TypeId const rtD = decayArray(rt);
                 if (interner.kind(ltD) == TypeKind::Ptr
                     && interner.kind(rtD) == TypeKind::Ptr
-                    && interner.operands(ltD)[0] == interner.operands(rtD)[0]) {
+                    && (interner.operands(ltD)[0] == interner.operands(rtD)[0]
+                        // P48 (D-CSUBSET-POINTER-DIFF-EDGE-CASES part 2): a
+                        // MISMATCHED pointee pairing types as the pointer-
+                        // difference type too. C 6.5.6p3 does not admit it, but
+                        // MSVC 19.51.36252 COMPILES it (`C4133`) — ✔MEASURED
+                        // 2026-09-01, gcc/clang/mingw rejecting — so the
+                        // disjunction requires DSS to accept, and pass2Post's
+                        // SE4c warns at the operator. Typing it here is what
+                        // removes the pre-existing CONTEXT-dependent verdict:
+                        // `(int)(a - b)` compiled while `long n = a - b;` and
+                        // `g(a - b)` failed S_TypeMismatch on the un-typed `Ptr`
+                        // that fell out of the fallback. A `void` pointee is
+                        // excluded on BOTH sides (no element stride) so this arm
+                        // and SE4c describe exactly the same set.
+                        || (interner.kind(interner.operands(ltD)[0])
+                                != TypeKind::Void
+                            && interner.kind(interner.operands(rtD)[0])
+                                != TypeKind::Void))) {
                     return synthesizedType(interner, sem.pointerDifferenceType,
                                            s.dataModel, TypeKind::I64);
                 }
@@ -15004,6 +15572,52 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                     || interner.kind(elseT) == TypeKind::Array)) {
                 return thenD;
             }
+        }
+        // P48 (D-CSUBSET-TERNARY-ARRAY-ARM-INCOMPATIBLE part 2) C 6.5.15p6, the
+        // LAST of the six admissible operand pairings and the only one DSS did not
+        // implement: *"one operand is a pointer to an object type and the other is
+        // a pointer to a qualified or unqualified version of `void`"* — the
+        // conditional then has the `void *` type.
+        //
+        // ★★ THE ROW CALLED THIS A GAP AND IT IS ONE, BUT IN THE OPPOSITE
+        // DIRECTION FROM EVERY OTHER ITEM ON IT. ✔MEASURED 2026-09-01, each
+        // reference probed SEPARATELY at -O0 AND -O2: gcc 13.3.0, clang 18.1.3,
+        // mingw-w64 gcc 13.2.0 and MSVC 19.51.36252 ALL accept
+        // `c ? "%s" : (void *)0` with NO diagnostic at all. DSS REFUSED it —
+        // `error[H_UnsupportedLoweringForKind]: lvalue kind 'Cast'` — because
+        // neither the c66 literal-0 arm (the `0` is not bare) nor the c64
+        // array-decay arm (a `char` element is not a `void` one) fires, so the
+        // conditional fell to the first-arm fallback, typed as the ARRAY, and
+        // reached the aggregate-Ternary lowering. That is a refusal BELOW the
+        // union, so the fix is to ACCEPT, not to diagnose better.
+        //
+        // Gated on the language's own `implicitToVoidPtr` — the SAME flag
+        // `isAssignable` and the HIR `coerce` Array→`Ptr<Void>` decay arm read, so
+        // a language without void-pointer conversions keeps the old fallback
+        // byte-for-byte. A FUNCTION pointee is excluded on the object side: C
+        // 6.5.15p6 says pointer to an OBJECT type, and gcc/clang both warn on
+        // `void *` beside a function pointer rather than treating it as this
+        // pairing. Handles both arm orders; an array arm decays first, so
+        // `array : void*` and `objptr : void*` take one path.
+        if (sem.pointerConversions.implicitToVoidPtr) {
+            TypeId const thenD = decayArray(thenT);
+            TypeId const elseD = decayArray(elseT);
+            auto const pointeeKind = [&](TypeId t) {
+                return (t.valid() && interner.kind(t) == TypeKind::Ptr
+                        && !interner.operands(t).empty())
+                    ? interner.kind(interner.operands(t)[0])
+                    : TypeKind::Count_;
+            };
+            auto const isVoidPtr = [&](TypeId t) {
+                return pointeeKind(t) == TypeKind::Void;
+            };
+            auto const isObjectPtr = [&](TypeId t) {
+                TypeKind const pk = pointeeKind(t);
+                return pk != TypeKind::Count_ && pk != TypeKind::Void
+                    && pk != TypeKind::FnSig;
+            };
+            if (isVoidPtr(thenD) && isObjectPtr(elseD)) return thenD;
+            if (isVoidPtr(elseD) && isObjectPtr(thenD)) return elseD;
         }
         // C23 §6.5.15 (D-CSUBSET-NULLPTR): a conditional with ONE arm a pointer (or a
         // function designator, which decays to a pointer) and the OTHER the predefined

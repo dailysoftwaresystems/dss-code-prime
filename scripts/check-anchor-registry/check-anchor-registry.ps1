@@ -226,7 +226,17 @@ function RetiredIdsIn([string[]]$lines) {
         $cells = $line -split '\|'
         if ($cells.Count -lt 3) { continue }
         $key = $cells[1] -replace '[` ]', ''
-        if ($cells[2] -cmatch '^ *\**✅ \*\*CLOSED [0-9-]+ — RETIRED-ID') { [void]$out.Add($key) }
+        # ⚠⚠ TWO CELL POSITIONS, matching the `.sh`'s awk clause for clause. On
+        # 2026-09-01 the registry gained explicit `Priority` and `Status` columns
+        # (`| Anchor | Priority | Status | Trigger | ... |`), so the glyph-led prose
+        # this matcher keys on moved from index 2 to index 4. ✔MEASURED: with only
+        # index 2 the scan returned ZERO and the guard refused the whole tree -- its
+        # fail-closed arm working exactly as its own message predicts. Plan-side §3.1
+        # tables were NOT migrated and still lead with the glyph at index 2, so BOTH
+        # are read; the marker is anchored to the START of a cell either way, which is
+        # what keeps this from becoming a substring search.
+        if ($cells[2] -cmatch '^ *\**✅ \*\*CLOSED [0-9-]+ — RETIRED-ID') { [void]$out.Add($key); continue }
+        if ($cells.Count -gt 4 -and $cells[4] -cmatch '^ *\**✅ \*\*CLOSED [0-9-]+ — RETIRED-ID') { [void]$out.Add($key) }
     }
     return $out.ToArray()
 }
@@ -343,18 +353,30 @@ try {
     [void](ScanOneRoot (Join-Path $stDir 'root') 1 @('*.md') $stSink)
     St-Arm 'at-floor-root-passes-and-collects' $stAnchor (($stSink.Keys | Sort-Object) -join ' ')
 
-    # ── arms 10-12: the retired-id matcher, against its two production false positives
+    # ── arms 10-14: the retired-id matcher, against its two production false positives
+    # AND both cell layouts. The four-cell rows are plan-side §3.1 tables, which were not
+    # migrated; the six-cell rows are the registry as it has stood since 2026-09-01.
+    # ⚠ WITHOUT THE SIX-CELL PAIR THE index-4 CLAUSE IS UNTESTED, and an untested clause
+    # is one a later edit deletes in silence -- which is exactly how this matcher came to
+    # read only index 2 while the live registry had already moved past it.
     $stR1 = 'D-RETA' + '-FIXTURE-ROW'; $stR2 = 'D-RETB' + '-FIXTURE-ROW'; $stR3 = 'D-RETC' + '-FIXTURE-ROW'
+    $stR4 = 'D-RETD' + '-FIXTURE-ROW'; $stR5 = 'D-RETE' + '-FIXTURE-ROW'
     $stGot = ((@(RetiredIdsIn ([string[]]@(
         "| ``$stR1`` | ✅ **CLOSED 2026-01-01 — RETIRED-ID, renamed** | t | c |",
         "| ``$stR2`` | 🟠 **OPEN** — the prose here merely says ""as a retired id"" | t | c |",
-        "| ``$stR3`` | 🟠 **OPEN** — this row DOCUMENTS the RETIRED-ID token | t | c |")))) -join ' ') + ' '
+        "| ``$stR3`` | 🟠 **OPEN** — this row DOCUMENTS the RETIRED-ID token | t | c |",
+        "| ``$stR4`` | P1 | ✅ CLOSED | ✅ **CLOSED 2026-01-01 — RETIRED-ID, renamed** | t | c |",
+        "| ``$stR5`` | P1 | ✅ CLOSED | ✅ **CLOSED 2026-01-01 — an ordinary closure** | t | c |")))) -join ' ') + ' '
     St-Arm 'retired-matcher-extracts-a-positionally-marked-row' 'yes' `
            $(if ($stGot -clike "*$stR1*") { 'yes' } else { $stGot })
     St-Arm 'retired-matcher-ignores-prose-that-says-retired-id' '' `
            (($stGot -split ' ' | Where-Object { $_ -ceq $stR2 }) -join ' ')
     St-Arm 'retired-matcher-ignores-a-row-that-documents-the-token' '' `
            (($stGot -split ' ' | Where-Object { $_ -ceq $stR3 }) -join ' ')
+    St-Arm 'retired-matcher-reads-the-SIX-cell-layout-too' 'yes' `
+           $(if ($stGot -clike "*$stR4*") { 'yes' } else { $stGot })
+    St-Arm 'retired-matcher-ignores-a-plain-six-cell-closure' '' `
+           (($stGot -split ' ' | Where-Object { $_ -ceq $stR5 }) -join ' ')
 } finally {
     Remove-Item -Recurse -Force -LiteralPath $stDir -ErrorAction SilentlyContinue
 }
@@ -362,7 +384,7 @@ if ($stFail) {
     Write-Host "anchor-registry: FAIL - the self-test did not pass, so no verdict from this run means anything."
     exit 6
 }
-Write-Host "anchor-registry: self-test OK - 15 arms (4 wrap recovery incl. 3 refusals to join, 4 quotation classification incl. the positional rule and the word boundary, 3 root existence/floor, 3 retired-id matcher incl. both production false positives, 1 green control); this guard is PROVEN able to fail."
+Write-Host "anchor-registry: self-test OK - 17 arms (4 wrap recovery incl. 3 refusals to join, 4 quotation classification incl. the positional rule and the word boundary, 3 root existence/floor, 5 retired-id matcher incl. both production false positives and BOTH cell layouts, 1 green control); this guard is PROVEN able to fail."
 
 # The scanned set MUST match the .sh sibling EXACTLY (`src/ examples/` x
 # {cpp,hpp,json,c}). It did not: this script scanned `src` without `*.c` and

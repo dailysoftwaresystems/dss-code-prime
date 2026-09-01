@@ -2027,6 +2027,180 @@ struct SynthBuilder {
         return PpIfOperandBarrier{*schema};
     }
 
+    // ── C23 6.10.2p4 — THE COMPUTED `#include` FORM ────────────────────────
+    // [[D-PP-COMPUTED-INCLUDE-SILENT-DROP]]
+    //
+    // `#include pp-tokens` whose operand matches NEITHER `"q-char-sequence"`
+    // NOR `<h-char-sequence>`: the pp-tokens are MACRO-EXPANDED and the RESULT
+    // must match one of those two forms.
+    //
+    // ★ THE UNION IS UNANIMOUS, NOT MERELY SUFFICIENT. ✔MEASURED 2026-09-01,
+    // each reference probed SEPARATELY, over the quote / angle / multi-token
+    // angle (`<sys/types.h>`) / chained / stringize operand shapes: gcc 13.3.0
+    // and clang 18.1.3 COMPILE AND RUN every one; MSVC 19.51.36252 resolves
+    // every one (its `<stdio.h>` arm reports `Cannot open include file:
+    // 'stdio.h'` under a bare `cl /c` with no `vcvars` INCLUDE path — a MISS on
+    // a name it had already computed, not a refusal to compute it). So
+    // `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` REQUIRES this, and refusing loudly
+    // would still be refusing correct C.
+    //
+    // ★ WHAT THIS RETURNS IS A NAME, NOT A RESOLUTION, and that is the whole
+    // design. It hands back a header name in the SAME two shapes the literal
+    // arms in `build()` already consume, so the computed form funnels into the
+    // EXISTING quote/angle resolution instead of growing a THIRD resolver that
+    // could drift from them — the duplication [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]
+    // already charges this pre-scan for once, and a second copy would make that
+    // row worse rather than better.
+    enum class SbIncludeForm { Quote, Angle, Malformed, Unresolvable };
+    struct SbIncludeOperand {
+        SbIncludeForm form = SbIncludeForm::Unresolvable;
+        std::string   name;   // header name, delimiters stripped
+    };
+
+    // Expand a COMPUTED `#include` operand through the SHARED object-like map
+    // and read a header name off the result. `in` is the operand run (the
+    // tokens after the directive word, trivia and the newline already dropped);
+    // `buf` is the scan buffer.
+    //
+    // ★★ THE FOUR OUTCOMES, AND WHY `Unresolvable` IS NOT FOLDED INTO
+    // `Malformed`. The two say opposite things about WHOSE fault it is:
+    //   Quote/Angle  — a name the ordinary arms can resolve.
+    //   Malformed    — the expansion COMPLETED and does not spell a header
+    //                  name (an operand that expands to nothing, to a number,
+    //                  to an unclosed delimiter run). This pass is
+    //                  AUTHORITATIVE here: every name it was asked to expand,
+    //                  it expanded. All three references hard-error on exactly
+    //                  this shape (`#include expects "FILENAME" or <FILENAME>`
+    //                  / `expected "FILENAME" or <FILENAME>` / `error C2006`),
+    //                  so the caller reports the C 6.10.2 constraint violation
+    //                  itself.
+    //   Unresolvable — the expansion did NOT complete: a FUNCTION-LIKE macro
+    //                  this weaker (object-like-only) evaluator never expands,
+    //                  a self-referential one, or a name no `#define` this pass
+    //                  has seen defines (a descriptor-injected macro —
+    //                  [[D-PP-PRESCAN-DESCRIPTOR-MACROS-UNTRACKED]]). Calling
+    //                  THAT malformed would hard-error on valid C, so the
+    //                  caller leaves the directive verbatim and the
+    //                  AUTHORITATIVE macro pass — which holds the full table —
+    //                  fails loud on it there.
+    // ⚠ SILENCE IS THE ONE OUTCOME THIS FUNCTION MAY NEVER PRODUCE. Every
+    // verdict above ends in a resolution or a loud diagnostic; that is the
+    // entire content of the row this closes.
+    [[nodiscard]] SbIncludeOperand sbExpandComputedInclude(
+        std::vector<Token> const& in, SourceBuffer const& buf) const {
+        SbIncludeOperand op;
+        // The per-EXPANSION product tail, exactly as `sbEvalIfOperand` owns one
+        // per evaluation: substituted replacements are MINTED into it, so the
+        // shared `localMacros` stays buffer-independent and nothing is ever
+        // re-lexed across a substitution boundary (TF-C60's BLOCKER-2).
+        std::string           product;
+        std::set<std::string> active;
+        // The `defined`-operand barrier is deliberately NOT armed here: an
+        // `#include` operand is not an `#if` controlling expression, so a token
+        // spelled `defined` in one is an ordinary identifier (C 6.10.1p4 scopes
+        // the operator to `#if`/`#elif`). `sbExpand` requires a barrier
+        // reference, and a barrier the operand never satisfies is inert.
+        PpIfOperandBarrier barrier = sbMakeIfOperandBarrier();
+        std::vector<Token> const ex =
+            sbExpand(in, buf, product, active, 0, barrier);
+
+        // Empty after expansion -> the constraint violation all three
+        // references diagnose (`#define H` then `#include H`).
+        if (ex.empty()) {
+            op.form = SbIncludeForm::Malformed;
+            return op;
+        }
+
+        // (1) QUOTE form. The opener kind is the CONFIG kind (`quoteIncludeToken`),
+        // never the `"` byte, and the coalesced BODY is the adjacent next token —
+        // the same POSITION-keyed extraction the literal arm uses.
+        auto const quoteKind = schema->schemaTokens().find(cfg().quoteIncludeToken);
+        if (quoteKind.valid() && ex[0].schemaKind == quoteKind) {
+            if (ex.size() < 2 || ex[1].span.start() != ex[0].span.end()) {
+                op.form = SbIncludeForm::Malformed;   // `#include ""` / unterminated
+                return op;
+            }
+            op.name = std::string{sbTextOf(ex[1], buf, product)};
+            op.form = op.name.empty() ? SbIncludeForm::Malformed
+                                      : SbIncludeForm::Quote;
+            return op;
+        }
+
+        // (2) ANGLE form. ⚠ The delimiters CANNOT be `angleIncludeToken`
+        // (HeaderStart): that kind exists only inside the tokenizer's
+        // `header-context` mode, which `#include` arms and a macro REPLACEMENT
+        // LIST never enters — so `#define H <stdio.h>` lexes its `<`/`>` as the
+        // ordinary comparison operators. The kinds that DO spell an
+        // angle-delimited header name in an ORDINARY token stream are already
+        // declared for exactly this job and already used by `__has_include` and
+        // `__has_embed`: `hasIncludeAngleOpenToken` / `hasIncludeAngleCloseToken`.
+        // Matching by those KINDS (not the `<`/`>` bytes) is what keeps this
+        // agnostic, and reusing them is what keeps `#include H` and
+        // `__has_include(H)` from ever disagreeing about what an angle form is.
+        auto const angleOpen =
+            schema->schemaTokens().find(cfg().hasIncludeAngleOpenToken);
+        auto const angleClose =
+            schema->schemaTokens().find(cfg().hasIncludeAngleCloseToken);
+        if (angleOpen.valid() && angleClose.valid()
+            && ex[0].schemaKind == angleOpen) {
+            // The h-char-sequence ends at the FIRST closer, not the last: C 6.4.7
+            // defines an h-char as any character except `>` and a newline, so the
+            // sequence cannot contain one. Reading `ex.back()` instead would
+            // REFUSE `#define H <a.h> trailing` -- which gcc and clang accept
+            // with an extra-tokens WARNING -- putting DSS below the union for a
+            // shape the literal arms already tolerate (they ignore trailing
+            // tokens too).
+            std::size_t close = 0;
+            for (std::size_t n = 1; n < ex.size(); ++n) {
+                if (ex[n].schemaKind == angleClose) { close = n; break; }
+            }
+            if (close == 0) {          // unterminated: `#define H <a.h`
+                op.form = SbIncludeForm::Malformed;
+                return op;
+            }
+            // A name token still naming a macro means expansion did NOT
+            // complete for it (`<FOO>` where FOO is function-like or
+            // self-referential). Resolving `FOO` as a literal header name would
+            // be a WRONG include, so this is the conservative verdict.
+            for (std::size_t n = 1; n < close; ++n) {
+                if (ex[n].coreKind != CoreTokenKind::Word) continue;
+                if (localMacros.find(std::string{sbTextOf(ex[n], buf, product)})
+                    != localMacros.end()) {
+                    op.form = SbIncludeForm::Unresolvable;
+                    return op;
+                }
+            }
+            // C 6.10.2p4: "the method by which a sequence of preprocessing
+            // tokens between a < and a > is combined into a single header name
+            // is implementation-defined". THIS implementation concatenates the
+            // token SPELLINGS and re-inserts ONE space wherever the operand had
+            // whitespace — ✔MEASURED to be what the whole reference set does:
+            // `#define H <sys / types.h>` resolves the header NAME `sys / types.h`
+            // in gcc 13.3.0, clang 18.1.3 AND MSVC 19.51 (each quotes it back
+            // verbatim in its not-found message), so a whitespace-NORMALIZING
+            // join would disagree with all three at once. Adjacency is read off
+            // the SPANS rather than a trivia token because `sbMintProduct` drops
+            // trivia when it re-tokenizes a replacement.
+            for (std::size_t n = 1; n < close; ++n) {
+                if (n > 1 && ex[n].span.start() != ex[n - 1].span.end()) {
+                    op.name += ' ';
+                }
+                op.name += sbTextOf(ex[n], buf, product);
+            }
+            op.form = op.name.empty() ? SbIncludeForm::Malformed
+                                      : SbIncludeForm::Angle;
+            return op;
+        }
+
+        // (3) An IDENTIFIER survived the expansion -> this pass could not
+        // finish the job (see the Unresolvable note above); anything else
+        // completed and simply is not a header name.
+        op.form = (ex[0].coreKind == CoreTokenKind::Word)
+                      ? SbIncludeForm::Unresolvable
+                      : SbIncludeForm::Malformed;
+        return op;
+    }
+
     // c17: evaluate an `#if`/`#elif` controlling expression in the SynthBuilder
     // pre-scan, to decide whether a quote-`#include` nested under it should be
     // resolved NOW (the P0016 fix). Reuses the SHARED `evaluateIfExpression`
@@ -2780,7 +2954,84 @@ struct SynthBuilder {
             if (k >= toks.size()) continue;
             const bool isQuote =
                 quoteKind.valid() && toks[k].tok.schemaKind == quoteKind;
-            if (!isQuote) {
+            const bool isAngleLiteral =
+                angleKind.valid() && toks[k].tok.schemaKind == angleKind;
+
+            // ── C23 6.10.2p4, the COMPUTED form [[D-PP-COMPUTED-INCLUDE-SILENT-DROP]] ──
+            //
+            // The operand is neither literal form, so the pp-tokens are
+            // macro-expanded and the RESULT must spell one. What was here
+            // before was a bare `continue` that left the line verbatim, and
+            // that is the whole defect: the macro pass then FORWARDED the line
+            // as inert tokens, the operand expanded in the ordinary body
+            // stream, and the parser's `includeDirective` rule (`hirKind: Skip`)
+            // matched `#include "inner.h"` and lowered it to NOTHING. ✔MEASURED
+            // 2026-09-01 at dac121cc: `#define HDR "missing.h"` + `#include HDR`
+            // compiled rc=0 with ZERO diagnostics and EMITTED AN ARTIFACT, while
+            // gcc/clang/MSVC all refuse it — a header silently deleted from the
+            // translation unit, the exact class TF-C60 closed one token shape over.
+            //
+            // ★ RESOLVED HERE RATHER THAN REFUSED HERE. The row offered a
+            // fail-loud "minimum"; the standing order forbids a workaround, and
+            // all three references implement this, so the pre-scan RESOLVES it
+            // and the fail-loud is only the backstop for the residue this
+            // weaker evaluator cannot expand (see `sbExpandComputedInclude`).
+            //
+            // ★ GATED ON `includeResolvable()`, LIKE THE QUOTE ARM AND UNLIKE
+            // THE ANGLE SPLICE, and the asymmetry is deliberate. This does not
+            // merely ADD synthetic `#define` lines for the authoritative pass to
+            // arbitrate — it REWRITES the directive's bytes (and, for the quote
+            // form, EAGERLY RESOLVES A FILE) from a macro table weaker than the
+            // authoritative one. Committing a header NAME chosen on a liveness
+            // verdict this pass is not confident about is the P0016 hazard
+            // exactly. Left verbatim, a truly-dead one is elided by the macro
+            // pass and a live one fails loud there; neither is silent.
+            SbIncludeOperand computed;   // Unresolvable unless set just below
+            // ⚠ SEEDED AT THE DIRECTIVE WORD'S END, NEVER 0. This is the cut
+            // point a Malformed/Angle outcome assigns to `copiedUpTo`, and the
+            // EMPTY-operand case (a bare `#include` with nothing after it, which
+            // all three references reject) has no operand token to read it from.
+            // A 0 here would REWIND `copiedUpTo` behind everything already
+            // emitted and the closing `copyVerbatim` would re-emit the entire
+            // buffer prefix — a silent duplication, which is worse than the
+            // silent drop this row closes.
+            ByteOffset       computedEnd = toks[j].tok.span.end();
+            if (!isQuote && !isAngleLiteral) {
+                if (!includeResolvable()) continue;
+                std::size_t const opEndTok = sbLineEndTok(i);
+                std::vector<Token> operand;
+                operand.reserve(opEndTok - k);
+                for (std::size_t q = k; q < opEndTok; ++q) {
+                    if (isTrivia(toks[q].tok) || isNewline(toks[q].tok)) continue;
+                    operand.push_back(toks[q].tok);
+                    // The directive ends at the last OPERAND token, not past the
+                    // newline — the literal arms cut the same way
+                    // (`literalEndPastCloser`), so the line's own newline is
+                    // still copied verbatim and the line map does not shift.
+                    computedEnd = toks[q].tok.span.end();
+                }
+                computed = sbExpandComputedInclude(operand, *scanBuf);
+                if (computed.form == SbIncludeForm::Unresolvable) {
+                    continue;   // verbatim; the macro pass fails loud on it
+                }
+                if (computed.form == SbIncludeForm::Malformed) {
+                    // The C 6.10.2 constraint violation, reported by the tier
+                    // that is authoritative about it. SOLE REPORTER (the TF-C60
+                    // Finding-5 discipline): drop the directive so the macro
+                    // pass's computed-include fail-loud cannot re-report one
+                    // root cause twice.
+                    const ByteOffset mStart = toks[i].tok.span.start();
+                    emitPP(rep, DiagnosticCode::P_PreprocessorDirective,
+                           BufferId{}, SourceSpan::empty(0),
+                           "computed #include (C23 6.10.2p4): the operand's "
+                           "macro expansion does not spell a header name — "
+                           "expected \"FILENAME\" or <FILENAME>");
+                    copyVerbatim(spliced, localMap, copiedUpTo, mStart, out, map);
+                    copiedUpTo = computedEnd;
+                    continue;
+                }
+            }
+            if (!isQuote && computed.form != SbIncludeForm::Quote) {
                 // D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS (Option B):
                 // the angle shipped-macro splice is NOT gated on the pre-scan's
                 // (weaker) conditional verdict -- UNLIKE the quote-include INLINE
@@ -2813,19 +3064,54 @@ struct SynthBuilder {
                 // injects the typed surfaces (symbols/constants/typedefs). Inert
                 // when the language declares no angle token or there are no
                 // systemDirs.
-                if (!angleKind.valid() || toks[k].tok.schemaKind != angleKind) {
-                    continue;
+                std::string angleName;
+                ByteOffset angleDirEnd = 0;
+                if (computed.form == SbIncludeForm::Angle) {
+                    // C23 6.10.2p4: the operand expanded to the angle form.
+                    // From here the resolution is the LITERAL arm's, byte for
+                    // byte — that identity is the design (one resolver, not two).
+                    angleName   = computed.name;
+                    angleDirEnd = computedEnd;
+                } else {
+                    if (!isAngleLiteral) continue;
+                    // The angle BODY is the coalesced token immediately after
+                    // the opener (mirrors the quote-body extraction below).
+                    const std::size_t aBody = k + 1;
+                    if (aBody >= toks.size() || isTrivia(toks[aBody].tok)
+                        || isNewline(toks[aBody].tok)
+                        || toks[aBody].tok.span.start()
+                               != toks[k].tok.span.end()) {
+                        continue;  // malformed/empty angle include — leave verbatim
+                    }
+                    angleName   = std::string{toks[aBody].text};
+                    angleDirEnd = literalEndPastCloser(*schema, toks, aBody);
+                    if (angleName.empty()) continue;
                 }
-                // The angle BODY is the coalesced token immediately after the
-                // opener (mirrors the quote-body extraction below).
-                const std::size_t aBody = k + 1;
-                if (aBody >= toks.size() || isTrivia(toks[aBody].tok)
-                    || isNewline(toks[aBody].tok)
-                    || toks[aBody].tok.span.start() != toks[k].tok.span.end()) {
-                    continue;  // malformed/empty angle include — leave verbatim
-                }
-                std::string const angleName{toks[aBody].text};
-                if (angleName.empty()) continue;
+
+                // ★ THE ONE THING A COMPUTED ANGLE INCLUDE NEEDS THAT A LITERAL
+                // ONE DOES NOT. Every outcome below except the source-splice
+                // KEEPS the `#include <h>` line, because the post-parse import
+                // resolver owns typed-surface injection and only ever sees the
+                // ANGLE form. `#include H` is not that form — left in place it
+                // reaches the parser as a malformed include (✔MEASURED at
+                // dac121cc: `warning[D_UnresolvedImport]: <malformed include>`
+                // pointing at the `#define` LINE, plus
+                // `error[P_NoAlternativeMatched]: expected 'StringStart' or
+                // 'HeaderStart' — got '<'`). So a computed angle include is
+                // NORMALIZED to its canonical literal spelling here: the same
+                // rewrite the quote->angle fallback below already performs, for
+                // the same reason. A NO-OP for a literal angle include, which
+                // keeps its own bytes -- so every "leave verbatim" outcome below
+                // can call it unconditionally and mean the same thing it always
+                // meant.
+                auto normalizeComputedAngleLine = [&](ByteOffset dStart) -> void {
+                    if (computed.form != SbIncludeForm::Angle) return;
+                    copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
+                    out.append("#include <");
+                    out.append(angleName);
+                    out.append(">\n");
+                    copiedUpTo = angleDirEnd;
+                };
 
                 // D-INCLUDE-ANGLE-SOURCE-FALLBACK: the SHARED angle funnel —
                 // descriptor FIRST (the DSS neutral `<stem>.json` model), else a
@@ -2858,6 +3144,7 @@ struct SynthBuilder {
                     reportHeaderCaseAmbiguity(rep, BufferId{},
                                               SourceSpan::empty(0), angleName,
                                               angleRes.ambiguousCandidates);
+                    normalizeComputedAngleLine(toks[i].tok.span.start());
                     continue;   // left verbatim; the macro pass elides it
                 }
 
@@ -2877,13 +3164,13 @@ struct SynthBuilder {
                 if (angleRes.kind == AngleIncludeKind::Source
                     && includeResolvable()) {
                     const ByteOffset dStart = toks[i].tok.span.start();
-                    // Directive end: PAST the angle body's `>` closer, read off the
-                    // closer's own token (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN).
-                    // `toks[aBody]` spans only the header name — its span stops
-                    // BEFORE the `>`, so cutting there would leave the delimiter in
-                    // the output. Mirrors the quote arm below.
-                    const ByteOffset dirEnd =
-                        literalEndPastCloser(*schema, toks, aBody);
+                    // Directive end: for the LITERAL form, PAST the angle body's
+                    // `>` closer, read off the closer's own token
+                    // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN) — the body token
+                    // spans only the header name, so cutting there would leave the
+                    // delimiter in the output; for the COMPUTED form, past the last
+                    // operand token. Both are already in `angleDirEnd`.
+                    const ByteOffset dirEnd = angleDirEnd;
                     auto const canon = core::PathIdentity::of(angleRes.path);
                     // TF-C87: the buffer is loaded BEFORE the stack test now,
                     // because the re-entry decision reads the header's own text.
@@ -2898,6 +3185,7 @@ struct SynthBuilder {
                         emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                                BufferId{}, SourceSpan::empty(0),
                                std::string{"system include unreadable: "} + angleName);
+                        normalizeComputedAngleLine(dStart);
                         continue;
                     }
                     auto const& headerBuf = headerPre->source;
@@ -2916,6 +3204,7 @@ struct SynthBuilder {
                     if (std::find(includeStack.begin(), includeStack.end(), canon)
                             != includeStack.end()
                         && !permitReentry(headerBuf, angleName)) {
+                        normalizeComputedAngleLine(dStart);
                         continue;   // permitReentry emitted the refusal
                     }
                     copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
@@ -2951,6 +3240,7 @@ struct SynthBuilder {
                                                  /*reportMalformed=*/includeResolvable(),
                                                  &splicedParent)
                     != SystemMacroSplice::Spliced) {
+                    normalizeComputedAngleLine(toks[i].tok.span.start());
                     continue;
                 }
                 const ByteOffset dStart = toks[i].tok.span.start();
@@ -2965,7 +3255,22 @@ struct SynthBuilder {
                 resolvedDescriptorsOut.push_back(
                     {splicedParent, static_cast<ByteOffset>(out.size())});
                 out.append(defs);
-                copiedUpTo = dStart;  // KEEP the include line — final copyVerbatim copies it
+                if (computed.form == SbIncludeForm::Angle) {
+                    // C23 6.10.2p4: the computed operand's own bytes cannot be
+                    // kept (the import resolver reads the ANGLE form only), so
+                    // emit the canonical spelling right AFTER the descriptor's
+                    // `#define`s — the same order the quote->angle fallback
+                    // below uses. Written out rather than routed through
+                    // `normalizeComputedAngleLine` because the verbatim copy up
+                    // to `dStart` has ALREADY happened here; the helper would
+                    // repeat it and duplicate those bytes.
+                    out.append("#include <");
+                    out.append(angleName);
+                    out.append(">\n");
+                    copiedUpTo = angleDirEnd;
+                } else {
+                    copiedUpTo = dStart;  // KEEP the include line — final copyVerbatim copies it
+                }
                 continue;
             }
 
@@ -2991,7 +3296,17 @@ struct SynthBuilder {
             std::string filename;
             const ByteOffset dirStart = toks[i].tok.span.start();
             ByteOffset dirEnd = toks[k].tok.span.end();
-            if (bodyIdx < toks.size() && !isTrivia(toks[bodyIdx].tok)
+            if (computed.form == SbIncludeForm::Quote) {
+                // C23 6.10.2p4: the operand expanded to the quote form. From
+                // here down NOTHING is computed-include-specific — the search,
+                // the include-once check, the re-entry guard, the splice and
+                // every diagnostic are the literal arm's, unchanged. That
+                // identity is the design: one resolver, reached two ways.
+                // No rewrite is needed on this side (unlike the angle arm)
+                // because EVERY outcome below DROPS the directive.
+                filename = computed.name;
+                dirEnd   = computedEnd;
+            } else if (bodyIdx < toks.size() && !isTrivia(toks[bodyIdx].tok)
                 && !isNewline(toks[bodyIdx].tok)
                 && toks[bodyIdx].tok.span.start() == toks[k].tok.span.end()) {
                 filename = std::string{toks[bodyIdx].text};
@@ -3529,6 +3844,16 @@ public:
             schema_->schemaTokens().find(cfg().quoteIncludeToken);
         embedAngleOpenKind_ =
             schema_->schemaTokens().find(cfg().hasIncludeAngleOpenToken);
+        // [[D-PP-COMPUTED-INCLUDE-SILENT-DROP]]: the `#include <h>` opener kind
+        // (`angleIncludeToken` = HeaderStart), which the include arm's
+        // computed-form backstop needs to tell a NORMAL angle include (forwarded
+        // to the post-parse import resolver) from an operand the pre-scan could
+        // not turn into a header name. A CONFIG kind like every sibling here,
+        // OPTIONAL for the same reason: a language declaring no angle include
+        // leaves it InvalidSchemaToken and the backstop's `.valid()` guard keeps
+        // the arm inert.
+        angleIncludeKind_ =
+            schema_->schemaTokens().find(cfg().angleIncludeToken);
     }
 
     // TRUE iff a fatal nesting-backstop truncated the expansion.
@@ -4538,6 +4863,45 @@ private:
                                  "not evaluate its conditional guard, so the "
                                  "header was never spliced; refusing to silently "
                                  "drop it");
+                    return end;
+                }
+                // [[D-PP-COMPUTED-INCLUDE-SILENT-DROP]], the BACKSTOP half. The
+                // arm above keys on the QUOTE opener, so a COMPUTED `#include
+                // MACRO` (C23 6.10.2p4) — whose first operand token is a Word —
+                // fell straight through to the inert forward below. It did not
+                // merely vanish quietly: the forwarded tokens are macro-expanded
+                // in the ordinary body stream, so `#define HDR "h"` produced a
+                // perfectly well-formed `#include "h"` for the parser, whose
+                // `includeDirective` rule carries `hirKind: Skip` and lowered it
+                // to NOTHING. ✔MEASURED at dac121cc: a computed include of a
+                // MISSING header compiled rc=0, emitted an artifact, and said
+                // nothing at all.
+                //
+                // The pre-scan now RESOLVES the computed form (it rewrites the
+                // angle case to its literal spelling and splices the quote case),
+                // so reaching here means it could NOT: a function-like or
+                // otherwise unexpandable operand, or a guard whose liveness that
+                // weaker evaluator would not commit to. This is authoritatively
+                // LIVE (the dead-branch gate returned above), so the header would
+                // be silently deleted from the translation unit. Refuse.
+                //
+                // ★ CAUSE-NEUTRAL on purpose, exactly like the arm above and for
+                // the same reason: the message names the SHAPE, not one of the
+                // several causes that reach it.
+                // Guarded on BOTH config kinds being declared, so a language that
+                // declares no include-token vocabulary keeps this arm inert.
+                if (q < end && quoteIncludeKind_.valid()
+                    && angleIncludeKind_.valid()
+                    && in[q].schemaKind != quoteIncludeKind_
+                    && in[q].schemaKind != angleIncludeKind_) {
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorIncludeError,
+                           synth_->id(), in[q].span,
+                           std::string{"computed #include (C23 6.10.2p4) `"}
+                               + std::string{text(in[q])}
+                               + "` is LIVE here but the include pre-scan could "
+                                 "not expand its operand to a header name, so no "
+                                 "header was spliced; refusing to silently drop "
+                                 "it");
                     return end;
                 }
             }
@@ -7406,6 +7770,12 @@ private:
     // (InvalidSchemaToken when the language declares no `#embed`).
     SchemaTokenId                        quoteIncludeKind_{};
     SchemaTokenId                        embedAngleOpenKind_{};
+    // [[D-PP-COMPUTED-INCLUDE-SILENT-DROP]]: the `#include <h>` ANGLE opener
+    // kind (`angleIncludeToken` = HeaderStart). Distinct from
+    // `embedAngleOpenKind_` above, which is the `hasIncludeAngleOpenToken`
+    // (LtOp) an `__has_include`/`__has_embed` operand uses — the two spell the
+    // same `<` in DIFFERENT tokenizer modes and are not interchangeable.
+    SchemaTokenId                        angleIncludeKind_{};
     // FC15a (A2): byte length of the PREFIX buffer (`synth_`), and the
     // accumulated `#`/`##` PRODUCT spellings appended AFTER it. A product token's
     // span is `[prefixLen_ + offsetInProductText_, ...)`; `text()` dispatches a

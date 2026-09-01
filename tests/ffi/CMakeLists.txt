@@ -138,3 +138,29 @@ dss_add_test(NAME ffi/test_shipped_descriptor_cache_staleness
 # descriptor sweeps above it.
 target_link_libraries(dss_ffi_test_abi_catalog
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-FFI-DARWIN-FSID-T-SHAPE + D-FFI-DARWIN-MALLOC-ZONE-TAIL-OPAQUE (P48): the two
+# Darwin FFI struct SHAPES, pinned by OFFSET and TOTAL SIZE. One of the two rows
+# closed with NO edit to the tree — the SDK confirmed the inferred `fsid`/`val`
+# spelling — so this file is the only durable record of that measurement, and a
+# later edit that moves it has nothing else to trip over. Builds REMOVE-direction
+# mutants of the shipped descriptors (drop a variant arm, drop a member, drop a
+# struct entry) on a COPY, so it needs the JSON reader directly like its siblings.
+dss_add_test(NAME ffi/test_darwin_struct_shapes
+             SOURCES test_darwin_struct_shapes.cpp)
+target_link_libraries(dss_ffi_test_darwin_struct_shapes
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-FFI-DESCRIPTOR-TYPE-ALIAS-SPELLING-KEYED-ON-DATA-MODEL-ALONE (P48): WHICH named
+# C type each shipped 64-bit alias IS, per (data model, object format). The defect
+# was a `when:{dataModel}` selector describing a two-world universe that has three
+# worlds in it — Darwin is LP64 and spells `uint64_t` `unsigned long long` while
+# keeping `size_t` `unsigned long`. Every alias is 8 bytes everywhere, so this is an
+# IDENTITY pin, not a width one: the assertions are TypeId equalities against a
+# reference vocabulary read into the same interner. Builds REMOVE-direction mutants
+# of the shipped descriptor on a COPY (drop the macho arms; drop just the `format`
+# keys this row added), so it needs the JSON reader directly like its siblings.
+dss_add_test(NAME ffi/test_stdint_alias_identity
+             SOURCES test_stdint_alias_identity.cpp)
+target_link_libraries(dss_ffi_test_stdint_alias_identity
+                      PRIVATE nlohmann_json::nlohmann_json)

@@ -4895,11 +4895,17 @@ struct Lowerer {
         // (S_TypeMismatch — the sqlite `fmt - bufpt` blocker) and the MIR value
         // is the raw byte difference. The MIR tier (`combineBinaryOp`) reads this
         // I64 result type WITH Ptr operands as the signal to emit
-        // PtrToInt+Sub(+SDiv by sizeof(pointee)). SAME-pointee only: a mismatched
-        // `char* - int*` falls through to a Ptr-typed result — caught ONLY when
-        // coerced to a numeric param (in a non-arg context like `(int)(a-b)` it
-        // is NOT diagnosed today: D-CSUBSET-POINTER-DIFF-EDGE-CASES). `p ± n`
-        // (pointer ± integer → Ptr result) is the SEPARATE c41 value-scaling fix.
+        // PtrToInt+Sub(+SDiv by sizeof(pointee)). `p ± n` (pointer ± integer →
+        // Ptr result) is the SEPARATE c41 value-scaling fix.
+        // ⚠ THIS USED TO SAY "SAME-pointee only", AND P48 CHANGED THAT. It read:
+        // "a mismatched `char* - int*` falls through to a Ptr-typed result —
+        // caught ONLY when coerced to a numeric param (in a non-arg context like
+        // `(int)(a-b)` it is NOT diagnosed today)". Both halves are now false:
+        // the mismatched pair takes this same path with the LEFT pointee's
+        // stride, and it is diagnosed at the operator
+        // (`S_PointerDifferenceIncompatiblePointee`, a Warning) regardless of the
+        // context it lands in. See the `ptrSub` predicate below for the
+        // measurement that required it.
         //
         // c65 (D-CSUBSET-POINTER-DIFF-EDGE-CASES): `p - arrayName` — an ARRAY
         // operand of pointer SUBTRACTION decays to Ptr<elem> (C 6.3.2.1p3) FIRST,
@@ -4924,13 +4930,35 @@ struct Lowerer {
             // fails LOUD (a clean diagnostic) rather than silently miscomputing
             // the array's address as an index — WITHOUT this match-guard the
             // decayed-but-mismatched `int* - char*` is non-ptrSub → it slips into
-            // the c41 p±n path (the audit's fail-loud-regression catch). The
-            // mismatched TWO-pointer `int* - char*` (no array) stays the
-            // pre-existing part-2 silent-accept (untouched here).
+            // the c41 p±n path (the audit's fail-loud-regression catch).
+            // ⓘ The last sentence of this paragraph used to read "the mismatched
+            // TWO-pointer `int* - char*` (no array) stays the pre-existing part-2
+            // silent-accept (untouched here)" — P48 closed part 2, so that
+            // sentence is no longer true and has been replaced rather than left
+            // to read as current.
+            // ★★ P48 (D-CSUBSET-POINTER-DIFF-EDGE-CASES part 2) WIDENS THE
+            // MATCH-GUARD ABOVE, AND THE AUDIT'S FAIL-LOUD-REGRESSION HAZARD IS
+            // CLOSED BY CONSTRUCTION RATHER THAN BY THE GUARD. The c65 audit's
+            // catch was that a decayed-but-MISMATCHED pair was non-`ptrSub`, so
+            // it slipped into the c41 `p ± n` path and treated an array ADDRESS
+            // as an index. `ptrSub` below now admits a mismatched pointee pair,
+            // so a decayed mismatched pair lands on the pointer-DIFFERENCE path
+            // and can no longer reach `ptrIntArith` (which requires the right
+            // operand NOT to be a pointer). The reason to admit it at all is
+            // measured: MSVC 19.51.36252 COMPILES `char* - int*` (`C4133`) while
+            // gcc/clang/mingw reject it, and the disjunction settles
+            // accept-vs-refuse — pass2Post's SE4c warns at the operator.
+            // A `void` pointee on either side still stays UN-decayed (it has no
+            // element stride), so `void *` arithmetic keeps its own path.
             if ((lPtr && rArr) || (lArr && rPtr) || (lArr && rArr)) {
                 auto const lo = interner.operands(lc.type);
                 auto const ro = interner.operands(rc.type);
-                if (!lo.empty() && !ro.empty() && lo[0] == ro[0]) {
+                bool const strideable =
+                    !lo.empty() && !ro.empty()
+                    && (lo[0] == ro[0]
+                        || (interner.kind(lo[0]) != TypeKind::Void
+                            && interner.kind(ro[0]) != TypeKind::Void));
+                if (strideable) {
                     if (lArr) lc = coerce(lc, interner.pointer(lo[0]));
                     if (rArr) rc = coerce(rc, interner.pointer(ro[0]));
                 }
@@ -4939,11 +4967,23 @@ struct Lowerer {
         // ptrSub reads the (possibly array-decayed) lc/rc — identical to lhs/rhs
         // for the plain `p - q` case (two pointers never coerce: `common` is
         // Invalid), and now also true for the decayed `p - array`.
+        // P48: a MISMATCHED pointee pair is a pointer DIFFERENCE too. The MIR
+        // lowering already takes its stride from `hir.typeId(kids[0])` — the LEFT
+        // operand — which is exactly the rule MSVC follows: ✔MEASURED from its own
+        // `/FAs` listing at /O2, `char* - int*` emits a bare `sub` (stride 1),
+        // `int* - char*` emits `sub; sar 2` (stride 4), `double* - char*` emits
+        // `sub; sar 3` (stride 8). So no MIR change is needed for the value to
+        // match the only reference that accepts the construct. A `void` pointee on
+        // EITHER side is excluded (no stride); an equal-pointee `void* - void*`
+        // keeps its pre-existing fail-loud in the MIR arm, untouched.
         bool const ptrSub =
             *op == HirOpKind::Sub && lc.type.valid() && rc.type.valid()
             && interner.kind(lc.type) == TypeKind::Ptr
             && interner.kind(rc.type) == TypeKind::Ptr
-            && interner.operands(lc.type)[0] == interner.operands(rc.type)[0];
+            && (interner.operands(lc.type)[0] == interner.operands(rc.type)[0]
+                || (interner.kind(interner.operands(lc.type)[0]) != TypeKind::Void
+                    && interner.kind(interner.operands(rc.type)[0])
+                        != TypeKind::Void));
         // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC) C 6.5.6p8: `p + n` / `n + p` /
         // `p - n` (pointer ± integer → a Ptr). `n + p` is CANONICALIZED here
         // (swap lc/rc so the Ptr operand is ALWAYS kids[0]) → combineBinaryOp
@@ -5495,6 +5535,33 @@ struct Lowerer {
                 && (interner.kind(thenE.type) == TypeKind::Array
                     || interner.kind(elseE.type) == TypeKind::Array)) {
                 common = thenD;
+            }
+            // P48 (D-CSUBSET-TERNARY-ARRAY-ARM-INCOMPATIBLE part 2) C 6.5.15p6:
+            // object-pointer beside `void *` → the conditional is `void *`. The
+            // EXACT mirror of the semantic `combineTernary` arm; setting `common`
+            // to the void pointer drives the existing coerce calls below, where
+            // an Array arm hits coerce's `toVoidPtr` decay Cast (already gated on
+            // the same `implicitToVoidPtr` flag) and a pointer arm the Ptr→Ptr
+            // bitcast. Without it the conditional typed as the ARRAY and the
+            // aggregate lowering refused `c ? "%s" : (void *)0` — a construct all
+            // four references compile with no diagnostic (✔MEASURED 2026-09-01).
+            if (!common.valid() && sem.pointerConversions.implicitToVoidPtr) {
+                auto const pointeeKind = [&](TypeId t) {
+                    return (t.valid() && interner.kind(t) == TypeKind::Ptr
+                            && !interner.operands(t).empty())
+                        ? interner.kind(interner.operands(t)[0])
+                        : TypeKind::Count_;
+                };
+                auto const isVoidPtr = [&](TypeId t) {
+                    return pointeeKind(t) == TypeKind::Void;
+                };
+                auto const isObjectPtr = [&](TypeId t) {
+                    TypeKind const pk = pointeeKind(t);
+                    return pk != TypeKind::Count_ && pk != TypeKind::Void
+                        && pk != TypeKind::FnSig;
+                };
+                if (isVoidPtr(thenD) && isObjectPtr(elseD))      common = thenD;
+                else if (isVoidPtr(elseD) && isObjectPtr(thenD)) common = elseD;
             }
         }
         if (common.valid()) {

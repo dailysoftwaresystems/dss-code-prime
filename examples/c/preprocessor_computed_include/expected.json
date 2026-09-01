@@ -1,0 +1,34 @@
+{
+  "$comment": "[[D-PP-COMPUTED-INCLUDE-SILENT-DROP]] -- the C23 6.10.2p4 COMPUTED `#include` runtime witness. A `#include MACRO` used to be SILENTLY DROPPED: the pre-scan could not resolve a non-literal operand and left the line verbatim, the macro pass's fail-loud arm keyed on the QUOTE OPENER so a `Word`-led include fell through to the inert forward, the forwarded tokens then expanded in the ORDINARY BODY STREAM into a well-formed `#include \"h\"`, and the parser's `includeDirective` rule (`hirKind: Skip`) lowered it to NOTHING. MEASURED at dac121cc: a computed include of a MISSING header compiled rc=0, EMITTED AN ARTIFACT and said nothing at all. The reference set is unanimous and was probed SEPARATELY on 2026-09-01: gcc 13.3.0 and clang 18.1.3 compile AND run every shape here; MSVC 19.51.36252 resolves every one; so the union rule requires the RESOLUTION, not merely a loud refusal. FOUR SHAPES, FOUR ADDENDS: (1) quote via an object-like macro -> PART_A=30; (2) quote via a CHAIN of object-like macros, so the pre-scan must rescan its own substitution -> PART_B=4; (3) ANGLE via an object-like macro into the shipped `<limits.h>` descriptor -- the form that must be NORMALIZED to its literal spelling because the post-parse import resolver reads the angle form only -> CHAR_BIT=8; (4) a DEAD-BRANCH computed include of a header that does not exist, the negative the resolution owes (gcc compiles a dead-branch include of a missing header rc=0), which an over-eager pre-scan would hard-error on. 30+4+8 = 42. RED-ON-DISABLE: every addend arrives as a MACRO from a header the computed form had to resolve, so a regression in (1)-(3) leaves an undeclared identifier and the program does NOT COMPILE -- it cannot degrade into a wrong exit code -- and a regression in (4) fails the build loudly. The operands reach `combine` as FUNCTION ARGUMENTS so the baseline arm keeps a live runtime add; the `release` arm re-runs the same source through the shipped optimizer pipeline.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

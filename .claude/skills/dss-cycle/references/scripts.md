@@ -56,6 +56,7 @@ the other in the same commit.
 <!-- BEGIN GENERATED SCRIPT INDEX -->
 | Script | Runs as | Purpose |
 | --- | --- | --- |
+| **`anchors`** | `anchors.py`, `read-anchor.ps1`, `read-anchor.sh`, `read-anchors.ps1`, `read-anchors.sh`, `set-anchor.ps1`, `set-anchor.sh`, `write-anchor.ps1`, `write-anchor.sh` | read and write deferred-anchor registry rows in the one canonical form, so a row is never hand-assembled. |
 | **`apply-registry-row`** | `apply-registry-row.py` | replace one deferred-anchor registry row with a lane's verbatim row text from a file. |
 | **`burndown-queue`** | `burndown-queue.py` | re-derive the prioritized burndown queue from the registry, production errors first. |
 | **`carriage-excludes`** | `carriage-excludes.py` | emit the transport exclude list for a gate carriage, derived from what git ignores rather than re-typed once per carriage. |

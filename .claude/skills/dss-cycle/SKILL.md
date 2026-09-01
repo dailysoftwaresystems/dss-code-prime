@@ -68,17 +68,82 @@ a valid program MEANS ⇒ **that is an architectural fork: PAUSE and ask.**
 > *"the priority is always production anchors. ALWAYS. harness we fix as we need when we face the
 > problem (NEVER LATER)."*
 
-The registry is **two files** since 2026-08-25, split at the operator's instruction (*"the priority
-is real errors, not cosmetics"*):
+The registry is **three files** — two WORKING lists and one ARCHIVE. It split into production and
+harness on 2026-08-25 (*"the priority is real errors, not cosmetics"*), and the archive was carved
+out on 2026-09-01 (*"split what's done from what's to be done. this way we adjust our skills to only
+read what's yet to be done"*):
 
 | file | holds |
 |---|---|
-| `.plans/_deferred-anchor-registry-production.md` | a defect **a user of the compiler could hit** — in the shipped binary, or in the config it reads |
-| `.plans/_deferred-anchor-registry-harness.md` | a defect **only we can hit** — tests, gates, guards, cycle machinery, plans, scripts, carriages, CI |
+| `.plans/_deferred-anchor-registry-production.md` | a **still-open** defect **a user of the compiler could hit** — in the shipped binary, or in the config it reads |
+| `.plans/_deferred-anchor-registry-harness.md` | a **still-open** defect **only we can hit** — tests, gates, guards, cycle machinery, plans, scripts, carriages, CI |
+| `.plans/_deferred-anchor-registry-done.md` | every **CLOSED** row, in two tables that preserve which working list it came from. **Nothing here is work.** |
+
+### ★★★ MOVE ON CLOSE — a closed row does not stay where it was
+
+> *"the `_deferred-anchor-registry-{harness|production}.md` is a list of remaining items, that
+> always delete a done item and put into `_deferred-anchor-registry-done.md` once finished."*
+> — operator, 2026-09-01
+
+- **Closing a row MOVES it.** It is deleted from its working registry and appended to the archive's
+  matching table. Reopening moves it BACK. Neither is an edit in place.
+- **You do not do this by hand.** `scripts/anchors/anchors.py` performs the move as part of writing
+  the row, and `apply-registry-row` delegates to it. Hand-editing the tables is how the two halves
+  drift.
+- **`check-anchor-balance` refuses both directions** (ARM 6's sibling, the partition arm): a CLOSED
+  row left in a working registry, or an OPEN row filed in the archive. The second is the dangerous
+  one — every queue in this project reads the two working registries ONLY, so a live row filed in
+  the archive can never be picked up.
+- ⚠ **The audit trail is NOT deleted, it is RELOCATED.** "Never delete a closed row" still holds;
+  the archive is where it goes.
+- ★ **RESOLUTION reads all three; ORIENTATION reads only the two working ones.** A `D-*` cited in
+  `src/` must resolve wherever its row now lives, so every guard that RESOLVES a citation globs
+  `_deferred-anchor-registry*.md`. Everything that asks *what is left* — `burndown-queue`, Step 1's
+  priority pick, this skill — reads production and harness and stops there.
 
 ⚠ A row's bucket follows the **DEFECT, never the instrument that found it**. `D-CONFIG-*` and
 `D-DIAG-*` are PRODUCTION deliberately: in this architecture a `.lang/.target/.format.json` document
 IS the compiler's behaviour, and a diagnostic IS its output to a user.
+
+### ★★★ THE ROW SHAPE IS SIX CELLS, AND TWO OF THEM ARE DECLARATIONS
+
+    | Anchor | Priority | Status | Trigger | Closing work | Cross-refs |
+
+Operator, 2026-09-01: *"add columns for priority and status ... then the write explicitly writes it
+correctly, this way we always have clean statuses."* `Priority` is `P0`..`P5`; `Status` is a
+three-value controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED`.
+
+- ⚠ **The status cell keeps its glyph, and the glyph is the contract.** A row is CLOSED iff its
+  status cell OPENS with ✅ after stripping `*_ ` — the complement defined, never the variants. A
+  column holding the bare word `CLOSED` would make that test false for every closed row at once.
+- ⚠ **`Priority` is a DECLARATION, not a sieve result.** `burndown-queue` seeds it on a new row and
+  then READS it; its own docstring warns a band is *"a sort key, not a verdict"* because a census
+  built from that keyword sieve reported 103 where the truth was 4. Correct the cell and the
+  correction survives.
+- ⚠ **`check-anchor-balance` ARM 6 refuses a row whose `Status` column contradicts the verdict
+  leading its `Trigger` prose.** Two cells now state the same fact, so they can disagree — silently,
+  because the gate would believe the column while every human reads the prose.
+- ★ **Plan-side §3.1 tables were NOT migrated** and still use the four-cell shape. Both are
+  recognized; only the three registry documents changed.
+
+### The four verbs — `scripts/anchors/`
+
+Each has a `.sh` and a `.ps1` launcher over one implementation (`anchors.py`), so the pair cannot
+drift. Every verb takes `--production` / `--harness` / `--done`.
+
+```
+scripts/anchors/write-anchor.sh  --production D-XX-NAME --priority P1 --status open \
+                                 --trigger '...' --closing '...' --cross-refs '...' --apply
+scripts/anchors/set-anchor.sh    D-XX-NAME --status closed --closing '...' --apply   # MOVES it
+scripts/anchors/read-anchor.sh   D-XX-NAME                    # the full row, field by field
+scripts/anchors/read-anchors.sh  --production --band P0       # name + priority + status only
+scripts/anchors/read-anchors.sh  --lint                       # every row a reader cannot key on
+```
+
+⚠ **Never hand-assemble a row.** The writer takes the FIELDS, so a wrapped anchor id (invisible to
+every grep, and it MINTS a false id), an unescaped `|` (silently adds a column) and a wrong cell
+count are all inexpressible. `set-anchor` is the ordinary way to close a row: it patches only the
+fields you name, preserves the rest byte-for-byte, and performs the move.
 
 **How the ruling binds this loop, clause by clause:**
 
@@ -519,7 +584,12 @@ hand-typing every edit or reading every subsystem.
 
 0. **Orient.** Read `.plans/_handoff.md` first — the previous cycle's claim, not ground truth; where
    it disagrees with your own measurements, say so and correct it this cycle. Check `git status`,
-   branch, last commit subject. Read plan-00 §0.1 and skim the anchor registry. Establish a green
+   branch, last commit subject. Read plan-00 §0.1 and skim the anchor registry.
+   ⚠ **ORIENTATION READS THE TWO WORKING REGISTRIES ONLY** — `-production.md` and `-harness.md`
+   hold what is LEFT, and `bash scripts/anchors/read-anchors.sh --production` is the whole list in
+   one screen. **Do not read `_deferred-anchor-registry-done.md` to choose work**: it is the
+   archive, it is by far the largest of the three, and reading it to orient is how a closed row got
+   recommended three times in this project's history. Establish a green
    baseline (`cmake --build build`, then full `ctest`). **A red baseline with no WIP-repair context
    is itself a pause gate** — present it; do not silently "fix it".
 1. **Pick the next priority** from §0.1, top-to-bottom. An explicit argument overrides the auto-pick
@@ -798,7 +868,14 @@ hand-typing every edit or reading every subsystem.
    below. **Re-review the fold** if folding changed logic; iterate to a fixed point. Passes that
    keep surfacing logic findings without converging are a pause signal — stop and report, do not grind.
 7. **Fail-loud gate** — the mechanical battery, including the anchor-balance gate.
-8. **Pin every deferral** discovered this cycle.
+8. **Pin every deferral** discovered this cycle — and **CLOSE by MOVING**, never by editing a status
+   in place. `scripts/anchors/set-anchor.sh <ANCHOR> --status closed --closing '...' --apply` rewrites
+   the row and lifts it out of the working registry into `_deferred-anchor-registry-done.md`; a lane
+   handing you a verbatim row FILE goes through `apply-registry-row`, which delegates to the same
+   writer. A NEW row is `write-anchor.sh --production|--harness ... --insert --apply`. ⚠ Never
+   hand-edit a table: `check-anchor-balance`'s partition arm fails the tree for a closed row left
+   behind or an open row filed in the archive, and its ARM 6 fails it for a `Status` column that
+   contradicts its own `Trigger` prose.
 9. **Cross-plan update**, including rewriting `.plans/_handoff.md`, in the same commit as the code.
 10. **Self-audit before lock** — an **independent** subagent runs the `dss-audit` rule-lens and
     guardrails on the complete, gate-passed cycle. On findings, return to step 5 and re-flow through

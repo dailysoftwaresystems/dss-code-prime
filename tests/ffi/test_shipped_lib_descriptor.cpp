@@ -4858,12 +4858,23 @@ TEST(ShippedLibDescriptor, RealResourcePerFormatRusageTimeval) {
 // ── c106 (the shell.c pe header/descriptor batch) ──────────────────────────
 
 // Decode a REAL shipped descriptor for one format (the RealTimeStructTm idiom).
+// ⚠ `model` DEFAULTS TO Lp64 AND THE DEFAULT IS ONLY RIGHT FOR elf/macho.
+// D-FFI-DESCRIPTOR-TYPE-ALIAS-SPELLING-KEYED-ON-DATA-MODEL-ALONE (P48 lane st)
+// made the shipped type-alias selectors name BOTH axes — `when:{dataModel,format}`
+// — because Darwin is LP64 while spelling `uint64_t` `unsigned long long`. Once
+// both axes participate, handing this helper an object format and a data model
+// that DO NOT GO TOGETHER asks about a target that does not exist: every pe
+// `.format.json` declares LLP64, so `(Pe, Lp64)` matches no arm and the alias is
+// not injected. Before that row the pair silently resolved — to the LP64 arm, on
+// a pe-only descriptor — so `RealIntrinHeaderIsPeOnlyAndCarriesNoEagerSymbols`
+// was reading an arm that can never be selected and checking only its 8-byte
+// WIDTH, which both spellings share. Pass the model that matches `fmt`.
 static std::optional<ShippedLibDescriptor> decodeShippedFor(
     fs::path const& p, TypeInterner& interner, TypeRegistry& typeReg,
-    ObjectFormatKind fmt) {
+    ObjectFormatKind fmt, DataModel model = DataModel::Lp64) {
     DiagnosticReporter rep;
     auto desc = readShippedLibDescriptor(p, interner, typeReg, rep,
-                                         DataModel::Lp64,
+                                         model,
                                          std::string_view{"x86_64"}, fmt);
     EXPECT_TRUE(desc.has_value()) << p.generic_string();
     EXPECT_FALSE(rep.hasErrors()) << p.generic_string();
@@ -4921,8 +4932,12 @@ TEST(ShippedLibDescriptor, RealIntrinHeaderIsPeOnlyAndCarriesNoEagerSymbols) {
     ASSERT_FALSE(root.empty());
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry typeReg;
+    // (Pe, Llp64) — the pair a real Windows target actually is. See the
+    // `decodeShippedFor` note: `size_t`'s arm is `when:{dataModel:LLP64,
+    // format:pe}` since D-FFI-DESCRIPTOR-TYPE-ALIAS-SPELLING-KEYED-ON-DATA-MODEL-ALONE,
+    // and the LP64 arm that used to answer here was unreachable dead config.
     auto desc = decodeShippedFor(root / "intrin.json", interner, typeReg,
-                                 ObjectFormatKind::Pe);
+                                 ObjectFormatKind::Pe, DataModel::Llp64);
     ASSERT_TRUE(desc.has_value());
     EXPECT_EQ(desc->header, "intrin.h");
     // (1) the header-level gate is exactly ["pe"].

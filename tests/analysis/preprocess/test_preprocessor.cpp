@@ -12801,3 +12801,442 @@ TEST(PreprocessorShippedConstants, ControlAnOrdinaryConditionIsUnaffected) {
     EXPECT_EQ(ppShippedConstantArm("2 + 2 == 4", r), "taken_if");
     EXPECT_FALSE(r.diagnostics->hasErrors());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// [[D-PP-COMPUTED-INCLUDE-SILENT-DROP]] — C23 6.10.2p4, THE COMPUTED `#include`
+//
+// `#include pp-tokens` whose operand is neither `"q-char-seq"` nor
+// `<h-char-seq>`: the operand is MACRO-EXPANDED and the result must spell one of
+// those forms. Before this cycle DSS neither honoured it NOR reported it. The
+// mechanism of the silence is the part worth writing down, because "the
+// pre-scan skipped it" is only half: the macro pass then FORWARDED the line as
+// inert tokens, the operand expanded in the ORDINARY BODY STREAM, and the
+// parser's `includeDirective` rule -- which carries `hirKind: Skip` -- matched
+// the resulting well-formed `#include "h"` and lowered it to NOTHING. ✔MEASURED
+// at dac121cc: a computed include of a MISSING header compiled rc=0, emitted an
+// artifact and said nothing at all.
+//
+// ★ THE REFERENCE SET IS UNANIMOUS, probed SEPARATELY (2026-09-01): gcc 13.3.0
+// and clang 18.1.3 COMPILE AND RUN the quote / angle / multi-token-angle /
+// chained / stringize shapes; MSVC 19.51.36252 resolves every one. All three
+// hard-error on an operand that expands to nothing. So this is REQUIRED by
+// `DSS = (gcc union clang union MSVC) union ISO C`, and a loud refusal would
+// still be a refusal of correct C.
+//
+// Every pin below is REMOVE-direction red-on-disable, and the two directions are
+// both covered on purpose: reverting the RESOLUTION turns a working splice into
+// a hard error (loud, still not silent), and reverting the BACKSTOP turns a hard
+// error into the original silence.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+// A scratch include dir carrying `computed_inner.h` (a macro + a declaration)
+// and `sub/computed_deep.h`. Each caller owns its own directory so the shuffled
+// second ctest entry of this binary cannot contend for it (see ppScratchRoot).
+[[nodiscard]] std::filesystem::path computedIncludeDir(std::string const& tag) {
+    namespace fs = std::filesystem;
+    auto const inc = ppScratchRoot() / ("dss_computed_include_" + tag);
+    fs::create_directories(inc / "sub");
+    { std::ofstream(inc / "computed_inner.h", std::ios::binary)
+        << "#define COMPUTED_OK 7\nint computed_sym;\n"; }
+    { std::ofstream(inc / "sub" / "computed_deep.h", std::ios::binary)
+        << "int computed_deep_sym;\n"; }
+    return inc;
+}
+[[nodiscard]] bool hasLexeme(std::vector<std::string> const& lexs,
+                             std::string_view want) {
+    for (auto const& l : lexs) if (l == want) return true;
+    return false;
+}
+} // namespace
+
+// (1) THE HEADLINE, in the direction the row is written in. A computed
+// `#include` of a header that EXISTS must splice it -- the macro must expand and
+// the declaration must arrive -- and the directive must be fully consumed.
+// RED-ON-DISABLE: revert the pre-scan's Quote arm and the operand is left
+// verbatim, so `COMPUTED_OK` never expands to `7`, `computed_sym` never appears,
+// AND the macro pass's backstop fires -- three independent failures.
+TEST(Preprocessor, ComputedIncludeQuoteFormSplicesTheHeader) {
+    namespace fs = std::filesystem;
+    auto const inc = computedIncludeDir("quote");
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#define HDR \"computed_inner.h\"\n#include HDR\nint u = COMPUTED_OK;\n",
+        r, {inc}, {});
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a computed #include of an existing header must resolve cleanly "
+           "(gcc/clang/MSVC all compile and run this)";
+    EXPECT_TRUE(hasLexeme(lexs, "computed_sym"))
+        << "the computed include's header text must be spliced into the TU";
+    EXPECT_TRUE(hasLexeme(lexs, "7"))
+        << "the spliced header's macro must EXPAND -- proving a real textual "
+           "splice, not a directive that merely stopped erroring";
+    EXPECT_FALSE(hasLexeme(lexs, "HDR"))
+        << "the operand macro must not survive into the parser-visible stream";
+    EXPECT_FALSE(hasLexeme(lexs, "#"))
+        << "the computed directive must be consumed, not forwarded verbatim";
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// (2) THE SILENT DROP ITSELF. A computed `#include` of a MISSING header must
+// fail loud. ✔MEASURED at dac121cc: this exact program compiled rc=0 with ZERO
+// diagnostics and emitted an artifact. RED-ON-DISABLE in the strongest sense --
+// reverting either half of the fix restores that silence and this goes red,
+// because the assertion is on the DIAGNOSTIC, not on a token count.
+TEST(Preprocessor, ComputedIncludeOfAMissingHeaderFailsLoudNeverSilently) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define HDR \"no_such_computed_header.h\"\n#include HDR\nint x;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a LIVE computed #include whose header does not exist must be "
+           "REPORTED; vanishing is the miscompile class this row closes";
+    (void)lexs;
+}
+
+// (3) THE ANGLE FORM. `#define H <foo.h>` cannot reach the resolver as its own
+// bytes: the post-parse import resolver reads the ANGLE form only, and
+// `#include H` is not it (✔MEASURED at dac121cc: `D_UnresolvedImport
+// <malformed include>` plus `P_NoAlternativeMatched: expected 'StringStart' or
+// 'HeaderStart'`). The pre-scan therefore NORMALIZES a computed angle include to
+// its canonical literal spelling. Here the header is a real source file on the
+// -I path, so the angle SOURCE fallback splices it textually -- the same outcome
+// the literal `#include <sub/computed_deep.h>` control produces.
+// RED-ON-DISABLE: revert the Angle arm -> the operand is left verbatim ->
+// `computed_deep_sym` never arrives and the backstop fires.
+TEST(Preprocessor, ComputedIncludeAngleFormNormalizesToTheLiteralSpelling) {
+    namespace fs = std::filesystem;
+    auto const inc = computedIncludeDir("angle");
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#define H <sub/computed_deep.h>\n#include H\nint x;\n", r, {inc}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "a computed ANGLE include of a resolvable header must not error";
+        EXPECT_TRUE(hasLexeme(lexs, "computed_deep_sym"))
+            << "the computed angle include must resolve through the SAME funnel "
+               "the literal form uses (multi-token name re-assembly included)";
+    }
+    {   // THE CONTROL. The literal spelling of the same include, same dirs.
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#include <sub/computed_deep.h>\nint x;\n", r, {inc}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_TRUE(hasLexeme(lexs, "computed_deep_sym"))
+            << "the LITERAL angle form is the control: the computed form must "
+               "reach exactly this outcome, not merely some outcome";
+    }
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// (4) THE IMPLEMENTATION-DEFINED JOIN, pinned against the reference set rather
+// than against taste. C 6.10.2p4 leaves "the method by which a sequence of
+// preprocessing tokens between a < and a > is combined into a single header
+// name" implementation-defined. ✔MEASURED 2026-09-01: gcc 13.3.0, clang 18.1.3
+// AND MSVC 19.51 all PRESERVE the operand's internal whitespace -- each quotes
+// the name back as `sys / types.h` in its not-found message -- so a
+// whitespace-NORMALIZING join would disagree with all three at once. The
+// un-resolvable name is left in the stream as the canonical angle spelling,
+// which is what makes the assembled name directly observable here.
+// RED-ON-DISABLE: drop the span-adjacency test in the join and the lexeme
+// becomes `nosuchdir/x.h` (spaces eaten) or `no such dir / x . h` (spaces
+// everywhere); either way this EXPECT fails.
+TEST(Preprocessor, ComputedIncludeAngleNameKeepsTheOperandsInternalSpacing) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define H <no such dir/x.h>\n#include H\nint x;\n", r);
+    EXPECT_TRUE(hasLexeme(lexs, "no such dir/x.h"))
+        << "the assembled h-char-sequence must preserve the operand's internal "
+           "whitespace exactly once per gap -- what gcc, clang AND MSVC do";
+}
+
+// (5) THE CONSTRAINT VIOLATION. An operand that expands to NOTHING is not a
+// header name, and all three references say so (`#include expects "FILENAME" or
+// <FILENAME>` / `expected "FILENAME" or <FILENAME>` / `error C2006`). The
+// pre-scan is authoritative here -- it expanded every name it was asked to -- so
+// it reports rather than deferring. RED-ON-DISABLE: without the Malformed arm
+// this produces no preprocessor diagnostic at all (the fault surfaced only as a
+// downstream PARSER error, which `preprocess()` never sees).
+TEST(Preprocessor, ComputedIncludeExpandingToNothingIsAConstraintViolation) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define H\n#include H\nint x;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "an operand that expands to nothing must be reported as the C 6.10.2 "
+           "constraint violation it is";
+    (void)lexs;
+}
+
+// (6) THE BACKSTOP, and the honest boundary of this cycle. The include pre-scan
+// expands OBJECT-like macros only -- deliberately, because a second
+// function-like expander here is the duplication
+// [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] already charges this pass for.
+// gcc/clang/MSVC all resolve the stringize form, so DSS REFUSING it is a real
+// residual; what must never happen is that it vanishes. This pins the refusal.
+// RED-ON-DISABLE: remove the macro pass's computed-include arm and the operand is
+// forwarded, expands in the body stream, and the parser's `hirKind: Skip` include
+// rule swallows it -- no diagnostic, no header, exactly the original defect.
+TEST(Preprocessor, ComputedIncludeWithAFunctionLikeOperandFailsLoudNeverSilent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define STR(x) #x\n#define HDR(x) STR(x)\n#include HDR(inner.h)\n"
+        "int x;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "an operand this pre-scan cannot expand must be REFUSED loudly; the "
+           "one outcome forbidden is silence";
+    (void)lexs;
+}
+
+// (7) THE NEGATIVE THE RESOLUTION OWES. A computed include in a DEAD branch must
+// NOT resolve and must NOT error -- ✔MEASURED as required reference behaviour
+// (gcc compiles a dead-branch include of a missing header rc=0). This is the
+// P0016 direction: an eager resolve in a branch the pre-scan is not confident
+// about is the hazard the `includeResolvable()` gate exists for, and without
+// that gate this test goes red with a spurious not-found error.
+TEST(Preprocessor, ComputedIncludeInADeadBranchNeitherResolvesNorErrors) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define HDR \"no_such_computed_header.h\"\n#if 0\n#include HDR\n#endif\n"
+        "int x;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a dead-branch computed include must be inert -- resolving it would "
+           "re-open the P0016 class the pre-scan's live-gate closes";
+    EXPECT_FALSE(hasLexeme(lexs, "#"))
+        << "the dead branch (directive included) must be elided by the macro pass";
+}
+
+// (8) THE CROSS-BUFFER CASE. The operand macro is defined in a QUOTE-INCLUDED
+// HEADER, so resolving it needs the pre-scan's macro state to be shared across
+// the whole builder tree (TF-C60's `localMacros`-by-reference). A per-builder
+// map would leave `HDR` unknown here -> Unresolvable -> the backstop's hard
+// error, so this pin is red the moment that sharing regresses.
+TEST(Preprocessor, ComputedIncludeResolvesAMacroDefinedInAnIncludedHeader) {
+    namespace fs = std::filesystem;
+    auto const inc = computedIncludeDir("crossbuffer");
+    { std::ofstream(inc / "computed_names.h", std::ios::binary)
+        << "#define HDR \"computed_inner.h\"\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#include \"computed_names.h\"\n#include HDR\nint u = COMPUTED_OK;\n",
+        r, {inc}, {});
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the operand macro arrives via a nested include; the pre-scan's "
+           "shared macro state must see it";
+    EXPECT_TRUE(hasLexeme(lexs, "computed_sym"))
+        << "the header named by a header-supplied macro must be spliced";
+    EXPECT_TRUE(hasLexeme(lexs, "7"));
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// (9) THE CONTROL ARM ON BOTH SIDES. The literal forms must be untouched by the
+// computed path -- a quote include still splices, and an `#include` line the
+// pre-scan already handled must not trip the new backstop. Without a control a
+// green above could mean "the computed arm works" or "every include now errors".
+TEST(Preprocessor, ComputedIncludeArmLeavesTheLiteralFormsUnchanged) {
+    namespace fs = std::filesystem;
+    auto const inc = computedIncludeDir("control");
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#include \"computed_inner.h\"\nint u = COMPUTED_OK;\n", r, {inc}, {});
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the LITERAL quote include is the control and must stay clean";
+    EXPECT_TRUE(hasLexeme(lexs, "computed_sym"));
+    EXPECT_TRUE(hasLexeme(lexs, "7"));
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// (10) THE ANGLE DELIMITERS ARE CONFIG, NOT THE `<`/`>` BYTES. A computed
+// operand's `<`/`>` are the ORDINARY comparison operators -- the tokenizer's
+// `header-context` mode (which mints `HeaderStart`) is entered only after a
+// literal `#include`, never inside a macro REPLACEMENT LIST -- so this arm
+// matches `hasIncludeAngleOpenToken`/`CloseToken`, the very kinds
+// `__has_include` and `__has_embed` already use for the same job. This is the
+// JSON-KEY-REBINDING mutant that proves it: rebind the OPEN delimiter off `LtOp`
+// and the operand can no longer spell an angle form, so it becomes the C 6.10.2
+// constraint violation instead of resolving.
+// RED-ON-DISABLE: matching the `<` BYTE (or hard-coding `find("LtOp")`) ignores
+// the rebind, the include still resolves, no diagnostic fires, and this fails.
+TEST(Preprocessor, ComputedIncludeAngleDelimitersAreConfigDrivenNotHardcoded) {
+    namespace fs = std::filesystem;
+    auto const inc = computedIncludeDir("rebind");
+    std::vector<std::filesystem::path> dirs{inc};
+    std::vector<std::filesystem::path> noSys;
+    {   // BASELINE: the shipped config resolves it.
+        auto buf = SourceBuffer::fromString(
+            std::string{"#define H <sub/computed_deep.h>\n#include H\nint x;\n"},
+            "main.c");
+        PreprocessResult r = preprocess(buf, cSubset(), dirs,
+                                        dss::kDefaultHeaderNameMatching,
+                                        DiagnosticBudget::libraryDefault(), noSys);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "baseline control: the shipped angle-delimiter kinds resolve this";
+    }
+    {   // REBOUND: `hasIncludeAngleOpenToken` moved off `LtOp`.
+        auto schema = reboundC("\"hasIncludeAngleOpenToken\":  \"LtOp\"",
+                               "\"hasIncludeAngleOpenToken\":  \"PlusOp\"",
+                               "<rebound-angle-open-c>");
+        ASSERT_NE(schema, nullptr);
+        ASSERT_EQ(schema->preprocess().hasIncludeAngleOpenToken, "PlusOp");
+        auto buf = SourceBuffer::fromString(
+            std::string{"#define H <sub/computed_deep.h>\n#include H\nint x;\n"},
+            "main.c");
+        PreprocessResult r = preprocess(buf, schema, dirs,
+                                        dss::kDefaultHeaderNameMatching,
+                                        DiagnosticBudget::libraryDefault(), noSys);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "with the angle OPEN delimiter rebound away, the operand no "
+               "longer spells a header name -- the arm must read the KIND from "
+               "config, never the `<` byte";
+    }
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// (11) THE SHAPE THAT IS ACTUALLY IN THE CORPUS, and the reason it stays quiet.
+// ✔MEASURED over the staged sqlite tree at dac121cc: SEVEN real computed
+// includes, and every single one is the FUNCTION-LIKE stringize operand under an
+// `#ifdef` -- `src/sqliteInt.h` and `bld/sqlite3.c` (`# include
+// INC_STRINGIFY(SQLITE_CUSTOM_INCLUDE)`), `bld/shell.c` twice
+// (`SHELL_STRINGIFY` of `SQLITE_CUSTOM_INCLUDE` and of `SQLITE_SHELL_EXTSRC`),
+// `bld/tclsqlite3.c`, and the jni/wasm pair. That is EXACTLY the operand shape
+// pin (6) proves this pre-scan refuses -- so if a dead `#ifdef` did not keep
+// them inert, this change would hard-error the project's headline corpus on
+// unmodified upstream source.
+//
+// It does keep them inert, in BOTH tiers and for two independent reasons: the
+// pre-scan never reaches the operand (`includeResolvable()` is false on a dead
+// stack) and the macro pass returns at its dead-branch gate before the include
+// arm. This pin holds that open. The shell.c variant is included because it
+// differs in the way that matters: its stringify macros are defined OUTSIDE the
+// guard, so they ARE in the pre-scan's table when the dead include line is
+// reached -- the one arrangement in which a liveness slip would actually
+// produce a name.
+TEST(Preprocessor, ComputedIncludeSqliteStringifyShapeUnderADeadGuardIsInert) {
+    {   // src/sqliteInt.h / bld/sqlite3.c: macros defined INSIDE the guard.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#ifdef SQLITE_CUSTOM_INCLUDE\n"
+            "# define INC_STRINGIFY_(f) #f\n"
+            "# define INC_STRINGIFY(f) INC_STRINGIFY_(f)\n"
+            "# include INC_STRINGIFY(SQLITE_CUSTOM_INCLUDE)\n"
+            "#endif\n"
+            "int x;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "the sqliteInt.h computed-include shape under an undefined "
+               "#ifdef must be INERT -- reporting it would red the corpus on "
+               "unmodified upstream source";
+        EXPECT_FALSE(hasLexeme(lexs, "#"))
+            << "the whole dead group must be elided";
+    }
+    {   // bld/shell.c: stringify macros defined OUTSIDE the guard.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "# define SHELL_STRINGIFY_(f) #f\n"
+            "# define SHELL_STRINGIFY(f) SHELL_STRINGIFY_(f)\n"
+            "#ifdef SQLITE_CUSTOM_INCLUDE\n"
+            "# include SHELL_STRINGIFY(SQLITE_CUSTOM_INCLUDE)\n"
+            "#endif\n"
+            "int x;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "the shell.c variant -- stringify macros VISIBLE to the pre-scan "
+               "at the dead include line -- must be inert for the same reason";
+        (void)lexs;
+    }
+    {   // THE POSITIVE CONTROL, so the two greens above cannot mean "this arm
+        // never fires". Same source, guard made LIVE by a command-line define:
+        // the operand is still unexpandable here, so it must be REFUSED LOUDLY.
+        auto schema = cSubset();
+        auto buf = SourceBuffer::fromString(
+            std::string{"# define SHELL_STRINGIFY_(f) #f\n"
+                        "# define SHELL_STRINGIFY(f) SHELL_STRINGIFY_(f)\n"
+                        "#ifdef SQLITE_CUSTOM_INCLUDE\n"
+                        "# include SHELL_STRINGIFY(SQLITE_CUSTOM_INCLUDE)\n"
+                        "#endif\n"
+                        "int x;\n"},
+            "main.c");
+        std::vector<std::filesystem::path> noDirs;
+        std::vector<std::string> defines{"SQLITE_CUSTOM_INCLUDE=x.h"};
+        auto r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+                            DiagnosticBudget::libraryDefault(), {}, std::nullopt,
+                            defines);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "with the guard LIVE the same directive must fail loud -- the "
+               "inertness above is the DEAD-branch rule, not a disarmed arm";
+    }
+}
+
+// (12) THE EMPTY OPERAND, and the DUPLICATION it nearly caused. A bare
+// `#include` with nothing after it is the degenerate computed form: the operand
+// run is empty, so the expansion is empty, so it is the same C 6.10.2 constraint
+// violation pin (5) covers -- all three references reject it. It gets its own
+// pin because it is the ONE shape with no operand token to read a cut point off,
+// and the first draft of this arm seeded that cut point at 0. That would have
+// REWOUND `copiedUpTo` behind everything already emitted, and the closing
+// `copyVerbatim` would have re-emitted the WHOLE buffer prefix -- a silent
+// DUPLICATION, strictly worse than the silent drop this row closes. The cut is
+// seeded at the directive WORD's end instead, and the duplication half is what
+// the lexeme counts below assert; the diagnostic half is the easy part.
+TEST(Preprocessor, ABareIncludeIsReportedAndNeverDuplicatesTheBuffer) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("int before;\n#include\nint after;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "an `#include` with no operand is the C 6.10.2 constraint violation "
+           "gcc, clang and MSVC all report";
+    auto count = [&](std::string_view want) {
+        std::size_t n = 0;
+        for (auto const& l : lexs) if (l == want) ++n;
+        return n;
+    };
+    EXPECT_EQ(count("before"), 1u)
+        << "the text BEFORE the malformed directive must appear exactly once -- "
+           "a rewound cut point re-emits the whole prefix";
+    EXPECT_EQ(count("after"), 1u)
+        << "the text AFTER it must appear exactly once";
+    EXPECT_FALSE(hasLexeme(lexs, "include"))
+        << "the malformed directive is the sole reporter and drops its own line";
+}
+
+// (13) THE h-char-SEQUENCE ENDS AT THE FIRST `>`, AND TRAILING TOKENS ARE
+// TOLERATED. C 6.4.7 defines an h-char as any character except `>` and a
+// newline, so the sequence cannot contain one -- reading the LAST closer instead
+// of the first would refuse a shape the references accept. ✔MEASURED 2026-09-01:
+// `#define H <inner.h> trailing` + `#include H` COMPILES AND RUNS under gcc
+// 13.3.0 and clang 18.1.3, each emitting only `warning: extra tokens at end of
+// #include directive`; the quote form with a trailing token does the same. An
+// UNTERMINATED operand (`#define H <inner.h`) is a hard error in BOTH (`missing
+// terminating > character` / `expected '>'`), so that half must stay refused.
+// This is a bar pin in both directions at once: too strict is BELOW the union,
+// too loose is ABOVE it.
+// RED-ON-DISABLE: reading `ex.back()` as the closer makes the first case
+// Malformed (an error where two references warn); dropping the unterminated
+// check makes the second resolve a header name with no closer at all.
+TEST(Preprocessor, ComputedIncludeTakesTheFirstCloserAndToleratesTrailingTokens) {
+    namespace fs = std::filesystem;
+    auto const inc = computedIncludeDir("trailing");
+    {   // TRAILING TOKENS: accepted, and the header really is spliced.
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#define H <sub/computed_deep.h> trailing\n#include H\nint x;\n",
+            r, {inc}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "gcc and clang both COMPILE AND RUN a computed include with "
+               "trailing tokens -- refusing it would put DSS below the union";
+        EXPECT_TRUE(hasLexeme(lexs, "computed_deep_sym"))
+            << "the header name ends at the FIRST `>`; the trailing token is "
+               "ignored exactly as the literal arms ignore theirs";
+    }
+    {   // UNTERMINATED: refused, as both references refuse it.
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#define H <sub/computed_deep.h\n#include H\nint x;\n",
+            r, {inc}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "an operand with no terminating `>` is a hard error in gcc AND "
+               "clang; accepting it would put DSS above the union";
+        (void)lexs;
+    }
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}

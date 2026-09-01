@@ -1,19 +1,301 @@
 {
-  "$comment": "Neutral shipped <malloc/malloc.h> (Darwin), added by the SQLite-CLI-for-arm64-Darwin cycle. ★ RESOLVER NOTE FIRST, because the filename looks like a collision and is not: resolveSystemDescriptor maps `<stem>.json` PRESERVING the subdirectory (include_path_resolve.cpp:50-53), so `<malloc/malloc.h>` → `malloc/malloc.json` (this file) and `<malloc.h>` → the top-level malloc.json (the pe-only MSVC header) are DISTINCT descriptors that never see each other. The live precedent for the pattern is `<sys/time.h>` → sys/time.json vs `<time.h>` → time.json. ★ WHY A REAL LAYOUT AND NOT AN OPAQUE TYPE: sqlite3.c:28165 is `_sqliteZone_ ? _sqliteZone_->size(_sqliteZone_, x) : malloc_size(x)` — it CALLS through the `size` member, so an opaque `malloc_zone_t` would compile to a fail-loud member-access miss and the whole zone path would be unbuildable. `size` is the ONLY member sqlite touches. ★★ SIZEOF IS 200 BYTES, AND HERE IS EXACTLY HOW THAT NUMBER WAS DERIVED. The full `typedef struct _malloc_zone_t { … } malloc_zone_t;` was read from MacOSX26.4.sdk (extracted read-only at /tmp/apple_sdk_probe/MacOSX26.4.sdk/usr/include/malloc/malloc.h; nothing from the SDK is copied into this repo) and every member counted in order on LP64 (pointer 8, size_t 8, unsigned 4, align 8): THIRTEEN pointer-width members first — reserved1, reserved2, size, malloc, calloc, valloc, free, realloc, destroy, zone_name, batch_malloc, batch_free, introspect — occupying 0..103; then `unsigned version` at 104 (4 bytes), which forces 4 bytes of TAIL PADDING at 108 so the next pointer can 8-align; then ELEVEN more pointer-width members — memalign, free_definite_size, pressure_relief, claimed_address, try_free_default, malloc_with_options, and the five version>=16 typed-memory entries malloc_type_{malloc,calloc,realloc,memalign,malloc_with_options} — running 112..199. 104 + 4 + 4 + 88 = 200, and 200 is already 8-aligned so there is no trailing pad. That arithmetic was then RE-MEASURED, not trusted: an LP64 replica of the struct with every member in order compiled with gcc reports `sizeof=200 align=8 reserved1@0 reserved2@8 size@16 version@104 memalign@112 last@192`. ★ WHY DECLARE THE FULL 200 AT ALL when sqlite only ever holds a `malloc_zone_t *` and never a by-value instance: because a descriptor SHADOWS the real header TOTALLY (include_path_resolve.hpp:60-75, Descriptor → Source → NotFound), including on a NATIVE macOS host where the SDK header is used today via D-INCLUDE-ANGLE-SOURCE-FALLBACK, so the FIRST consumer to write `sizeof(malloc_zone_t)` or to embed one by value would get whatever number we declared — silently. Relying on sqlite's access pattern would make this file correct by coincidence. The three members sqlite needs are declared at their real offsets; the remaining 176 bytes ship as ONE opaque `__opaque_tail` byte array rather than 22 typed function pointers, deliberately: their per-member signatures involve Apple bounds-safety attributes (__sized_by_or_null, __counted_by), a `malloc_type_id_t`, an introspection table, and a `boolean_t` that were NOT independently verified on a real Mac this cycle, and an under-verified callable signature is a silent-miscompile risk in a way that a correctly-sized opaque region is not. Calling any of them fails LOUD as a missing member — the right failure. Tracked at D-FFI-DARWIN-MALLOC-ZONE-TAIL-OPAQUE (closing work: type the tail member-by-member against a measured SDK, keeping the total at 200). ★ THE EXPLICIT `offset` ON EVERY FIELD is the all-or-none explicit-layout channel (D-FFI-DESCRIPTOR-UNION-OVERLAY, enforced at shipped_lib_descriptor.cpp:2124-2133; the sys/stat.json:120-146 macho-arm precedent). Nothing overlaps here — the offsets are stated so the tail's start (24) and therefore its length (200-24 = 176) are reviewable facts rather than a re-derivation, and so the bare typedef's inline `struct \"_malloc_zone_t\" { … @off }` body canonicalizes to the SAME TypeId as the `structs` entry, which is what makes `.size` resolve on a value spelled with the bare typedef name. The interner computes size = alignUp(max field extent, align) = alignUp(24+176, 8) = 200. ★ `size`'s signature is `ptr<fn(ptr<void>, ptr<void>) -> u64 \"unsigned long\">` — `size_t (*)(struct _malloc_zone_t *zone, const void *ptr)` with the self-pointer spelled `ptr<void>`. ★★ THE RETURN TAG IS NOT DECORATION AND MUST NOT BE DROPPED TO `u64`: #47 / D-LANG-TYPE-IDENTITY-VOCABULARY makes IDENTITY, not representation, decide the interned TypeId, so a BARE `u64` return mints the ANONYMOUS 8-byte representative while `size_t` on LP64 IS `unsigned long` (stddef.json's `size_t` LP64 arm is exactly `u64 \"unsigned long\"`, and this file is availableObjectFormats:[macho] where all EIGHT macho formats are MEASURED `dataModel: LP64`, so no `when` variant is needed and none is declared — an ILP32/LLP64 macho target does not exist to disagree). An untagged scalar nested inside `ptr<fn(...)>` makes the WHOLE `Ptr<FnSig>` a DIFFERENT TypeId than the one a user's real `size_t (*)(...)` spells, which is the identical defect fixed at windows.json:324 (`ptr<fn(u32 \"unsigned long\") -> i32>` for `BOOL WINAPI(DWORD)`) — that one was LIVE because the callback was PASSED as a pointer; this one is latent only because sqlite3.c:28165 CALLS through the member and a call converts the RESULT by value. Latent is not absent: the first consumer to take `&zone->size` or assign it to a declared `size_t (*)(void*, const void*)` would get a fail-loud type mismatch. ⇒ the tag rides on BOTH spellings below — the `typedefs` inline struct body AND the `structs` entry — because they must canonicalize to the SAME TypeId (see the explicit-offset note above); tagging only one would silently split them and `.size` would stop resolving on the bare-typedef spelling (ordinary C pointer coercion accepts the `malloc_zone_t *` sqlite passes, and it avoids a self-referential type), matching how unistd.json and stdlib.json already spell every zone parameter. ★ NO `symbols` AND NO `library` KEY: all seven zone functions this header declares in C are ALREADY shipped and ALREADY export-verified by a real dlopen+dlsym run on an actual Mac ([[D-LK-SQLITE-MACHO-UNDEFINED-LIBSYSTEM-SYMBOLS]]) — malloc_default_zone, malloc_create_zone, malloc_set_zone_name, malloc_size, malloc_zone_malloc, malloc_zone_free, malloc_zone_realloc, at stdlib.json:50-56, all gated [macho]. Re-declaring them would plant a second eager import of each for no gain, and DSS EAGER-IMPORTS every function a descriptor lists, so an unexported name breaks EVERY binary's LOAD (D-FFI-DESCRIPTOR-EAGER-IMPORT, macho exit 127). The consequence, stated rather than hidden: under DSS `#include <malloc/malloc.h>` yields the TYPE but not the FUNCTIONS — a caller must also include <stdlib.h>, which real Darwin does not require. Anchored at D-FFI-DARWIN-MALLOC-ZONE-FN-PROVENANCE. #47 is untouched: MEASURED — `malloc_zone_t` occurs nowhere in shippedLibs today except as prose, and stdlib.json's zone parameters are `ptr<void>`, so this introduces no duplicate typedef and stdlib.json needs no edit. Gated availableObjectFormats:[macho] — an elf/pe #include fails loud (the windows.json:5 [pe] precedent, inverted); zones are an Apple libmalloc concept with no glibc or UCRT counterpart.",
+  "$comment": "Neutral shipped <malloc/malloc.h> (Darwin), added by the SQLite-CLI-for-arm64-Darwin cycle. ★ RESOLVER NOTE FIRST, because the filename looks like a collision and is not: resolveSystemDescriptor maps `<stem>.json` PRESERVING the subdirectory (include_path_resolve.cpp:50-53), so `<malloc/malloc.h>` → `malloc/malloc.json` (this file) and `<malloc.h>` → the top-level malloc.json (the pe-only MSVC header) are DISTINCT descriptors that never see each other. The live precedent for the pattern is `<sys/time.h>` → sys/time.json vs `<time.h>` → time.json. ★ WHY A REAL LAYOUT AND NOT AN OPAQUE TYPE: sqlite3.c:28165 is `_sqliteZone_ ? _sqliteZone_->size(_sqliteZone_, x) : malloc_size(x)` — it CALLS through the `size` member, so an opaque `malloc_zone_t` would compile to a fail-loud member-access miss and the whole zone path would be unbuildable. `size` is the ONLY member sqlite touches. ★★ SIZEOF IS 200 BYTES, AND HERE IS EXACTLY HOW THAT NUMBER WAS DERIVED. The full `typedef struct _malloc_zone_t { … } malloc_zone_t;` was read from MacOSX26.4.sdk (extracted read-only at /tmp/apple_sdk_probe/MacOSX26.4.sdk/usr/include/malloc/malloc.h; nothing from the SDK is copied into this repo) and every member counted in order on LP64 (pointer 8, size_t 8, unsigned 4, align 8): THIRTEEN pointer-width members first — reserved1, reserved2, size, malloc, calloc, valloc, free, realloc, destroy, zone_name, batch_malloc, batch_free, introspect — occupying 0..103; then `unsigned version` at 104 (4 bytes), which forces 4 bytes of TAIL PADDING at 108 so the next pointer can 8-align; then ELEVEN more pointer-width members — memalign, free_definite_size, pressure_relief, claimed_address, try_free_default, malloc_with_options, and the five version>=16 typed-memory entries malloc_type_{malloc,calloc,realloc,memalign,malloc_with_options} — running 112..199. 104 + 4 + 4 + 88 = 200, and 200 is already 8-aligned so there is no trailing pad. That arithmetic was then RE-MEASURED, not trusted: an LP64 replica of the struct with every member in order compiled with gcc reports `sizeof=200 align=8 reserved1@0 reserved2@8 size@16 version@104 memalign@112 last@192`. ★ WHY DECLARE THE FULL 200 AT ALL when sqlite only ever holds a `malloc_zone_t *` and never a by-value instance: because a descriptor SHADOWS the real header TOTALLY (include_path_resolve.hpp:60-75, Descriptor → Source → NotFound), including on a NATIVE macOS host where the SDK header is used today via D-INCLUDE-ANGLE-SOURCE-FALLBACK, so the FIRST consumer to write `sizeof(malloc_zone_t)` or to embed one by value would get whatever number we declared — silently. Relying on sqlite's access pattern would make this file correct by coincidence. EVERY member is declared at its real offset (see the P48 measurement at the end of this comment); no part of this struct is opaque any more.  ★ THE EXPLICIT `offset` ON EVERY FIELD is the all-or-none explicit-layout channel (D-FFI-DESCRIPTOR-UNION-OVERLAY, enforced where the struct decoder counts the fields carrying an `offset` and refuses a mix; the sys/stat.json macho-arm precedent). Nothing overlaps here — the offsets are stated so every member's placement is a reviewable fact rather than a re-derivation, and so the bare typedef's inline `struct \"_malloc_zone_t\" { … @off }` body canonicalizes to the SAME TypeId as the `structs` entry, which is what makes `.size` resolve on a value spelled with the bare typedef name. The interner computes size = alignUp(max field extent, align) = alignUp(192+8, 8) = 200. ★ `size`'s signature is `ptr<fn(ptr<void>, ptr<void>) -> u64 \"unsigned long\">` — `size_t (*)(struct _malloc_zone_t *zone, const void *ptr)` with the self-pointer spelled `ptr<void>`. ★★ THE RETURN TAG IS NOT DECORATION AND MUST NOT BE DROPPED TO `u64`: #47 / D-LANG-TYPE-IDENTITY-VOCABULARY makes IDENTITY, not representation, decide the interned TypeId, so a BARE `u64` return mints the ANONYMOUS 8-byte representative while `size_t` on LP64 IS `unsigned long` (stddef.json's `size_t` LP64 arm is exactly `u64 \"unsigned long\"`, and this file is availableObjectFormats:[macho] where all EIGHT macho formats are MEASURED `dataModel: LP64`, so no `when` variant is needed and none is declared — an ILP32/LLP64 macho target does not exist to disagree). An untagged scalar nested inside `ptr<fn(...)>` makes the WHOLE `Ptr<FnSig>` a DIFFERENT TypeId than the one a user's real `size_t (*)(...)` spells, which is the identical defect fixed at windows.json:324 (`ptr<fn(u32 \"unsigned long\") -> i32>` for `BOOL WINAPI(DWORD)`) — that one was LIVE because the callback was PASSED as a pointer; this one is latent only because sqlite3.c:28165 CALLS through the member and a call converts the RESULT by value. Latent is not absent: the first consumer to take `&zone->size` or assign it to a declared `size_t (*)(void*, const void*)` would get a fail-loud type mismatch. ⇒ the tag rides on BOTH spellings below — the `typedefs` inline struct body AND the `structs` entry — because they must canonicalize to the SAME TypeId (see the explicit-offset note above); tagging only one would silently split them and `.size` would stop resolving on the bare-typedef spelling (ordinary C pointer coercion accepts the `malloc_zone_t *` sqlite passes, and it avoids a self-referential type), matching how unistd.json and stdlib.json already spell every zone parameter. ★ NO `symbols` AND NO `library` KEY: all seven zone functions this header declares in C are ALREADY shipped and ALREADY export-verified by a real dlopen+dlsym run on an actual Mac ([[D-LK-SQLITE-MACHO-UNDEFINED-LIBSYSTEM-SYMBOLS]]) — malloc_default_zone, malloc_create_zone, malloc_set_zone_name, malloc_size, malloc_zone_malloc, malloc_zone_free, malloc_zone_realloc, at stdlib.json:50-56, all gated [macho]. Re-declaring them would plant a second eager import of each for no gain, and DSS EAGER-IMPORTS every function a descriptor lists, so an unexported name breaks EVERY binary's LOAD (D-FFI-DESCRIPTOR-EAGER-IMPORT, macho exit 127). The consequence, stated rather than hidden: under DSS `#include <malloc/malloc.h>` yields the TYPE but not the FUNCTIONS — a caller must also include <stdlib.h>, which real Darwin does not require. Anchored at D-FFI-DARWIN-MALLOC-ZONE-FN-PROVENANCE. #47 is untouched: MEASURED — `malloc_zone_t` occurs nowhere in shippedLibs today except as prose, and stdlib.json's zone parameters are `ptr<void>`, so this introduces no duplicate typedef and stdlib.json needs no edit. Gated availableObjectFormats:[macho] — an elf/pe #include fails loud (the windows.json:5 [pe] precedent, inverted); zones are an Apple libmalloc concept with no glibc or UCRT counterpart. ★★★ 2026-09-01 (P48, lane ff) — THE TAIL IS NO LONGER OPAQUE, AND THE MEASUREMENT THAT CLOSED D-FFI-DARWIN-MALLOC-ZONE-TAIL-OPAQUE IS THIS. All 25 members are now typed at their real offsets; the 176-byte `__opaque_tail` is GONE. Evidence, on the operator's physical Mac (macOS 26.6.2 build 25G83, arm64), against MacOSX26.5.sdk reached through BOTH /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk and Xcode's /Applications/Xcode.app/.../MacOSX.sdk (the same file: md5 fc7d0cdacbb156c7da8342b1eecc800b for sys/_types/_fsid_t.h, and MacOSX.sdk is a symlink to MacOSX26.5.sdk on both roots): a probe TU asserting sizeof==200, _Alignof==8 and EVERY ONE of the 25 `offsetof` values as _Static_assert compiles rc=0 under `/usr/bin/cc -arch arm64` AND `-arch x86_64`, and each member's exact SIGNATURE is pinned by assigning it to an independently spelled function-pointer variable (a wrong parameter list or return type is a compile error there, so the probe is a signature oracle, not a size check). A CONTROL arm asserting sizeof==199 FAILS to compile, so the probe can go red. The live default zone reports version=10 name=DefaultMallocZone. ★ THE ROW'S STATED REASON FOR OPACITY IS REFUTED, NOT WORKED AROUND: the Apple bounds-safety attributes (__sized_by_or_null, __counted_by, __unsafe_indexable, __null_terminated) are literally EMPTY object- and function-like macros in the default configuration — read at usr/include/malloc/_ptrcheck.h and usr/include/sys/cdefs.h — so they are ABI-NEUTRAL ANNOTATIONS and were never a signature hazard. Likewise MALLOC_ZONE_FN_PTR(fn) / MALLOC_INTROSPECT_TBL_PTR(ptr) expand to the bare member NAME unless __has_feature(ptrauth_calls) (arm64e, which DSS does not target); the arm64e expansion adds a __ptrauth qualifier, which changes signing, never size or offset. ★★ THE ONE GENUINE PER-ARCH DIVERGENCE IS `claimed_address`'S RETURN TYPE, AND IT IS WHY THIS STRUCT IS NOW `variants` RATHER THAN FLAT. Its return is mach `boolean_t`, and Darwin defines that DIFFERENTLY per arch: mach/arm/boolean.h is `typedef int boolean_t;` while mach/i386/boolean.h is `typedef unsigned int boolean_t;` under `#if defined(__x86_64__) && !defined(KERNEL)` (and `int` otherwise). ✔MEASURED by compiling `(boolean_t)-1 < 0` as a _Static_assert for each arch: SIGNED on arm64, UNSIGNED on x86_64. Both are 4 bytes, so NO OFFSET MOVES — only the interned TypeId of that one member differs, and under #47 / D-LANG-TYPE-IDENTITY-VOCABULARY identity, not width, decides. ⇒ `i32` on arm64, `u32` on x86_64. ⚠ THE TWO ARMS MUST MATCH IN ALL 24 OTHER CELLS; they are generated from one field list and PINNED cell-by-cell by tests/ffi/test_darwin_struct_shapes.cpp, which also refuses a second divergent member added without a decision. ⚠ THE ARMS ARE MUTUALLY EXCLUSIVE BY NECESSITY, not by taste: the variant selector requires EXACTLY ONE match (F_ShippedTypedefVariantAmbiguous / the struct sibling), so a `{format:macho}` catch-all beside an arch arm would fail loud rather than act as a default. The cost, stated: a THIRD Darwin arch would match neither arm and the tag would inject NOTHING — the same shape sys/stat.json's per-arch elf arms already carry. ★ `introspect` IS SPELLED `ptr<void>`, and that is a decision rather than an omission: `struct malloc_introspection_t` is a real definition in the same header, but it is a SECOND ~20-member function-pointer table that no consumer of this descriptor touches, and the member's contribution here is 8 bytes of pointer either way. `ptr<void>` is the convention this file already uses for the zone self-pointer in every signature above; dereferencing it fails LOUD as a missing member, which is the right failure. ★ `zone_name` is `ptr<char>` — the house spelling for `char *` (stdlib.json's getenv / malloc_set_zone_name). ★ `version` is a bare `u32` (`unsigned`). ⚠⚠ `malloc_with_options` AND THE FIVE malloc_type_* MEMBERS CARRY `u64 \"unsigned long long\"`, WHICH IS THE REAL DARWIN SPELLING AND DOES NOT MATCH DSS'S OWN `uint64_t` TODAY. ✔MEASURED on both arches: Darwin's uint64_t is `unsigned long long` (usr/include/_types/_uint64_t.h) and malloc_type_id_t is `unsigned long long` (malloc/_malloc_type.h), while size_t is `unsigned long` — but stdint.json maps uint64_t on dataModel LP64 to `u64 \"unsigned long\"`, which is correct for LP64 ELF and WRONG for Darwin. The TRUE spelling is written here deliberately: a consumer assigning one of these members to a pointer declared with DSS's uint64_t gets a FAIL-LOUD type mismatch (latent today — no consumer touches these members), whereas writing DSS's wrong spelling would record a false ABI and turn silent the day stdint.json is corrected. That stdint.json divergence is a SEPARATE defect with a tree-wide blast radius and is reported, not fixed here.",
   "header": "malloc/malloc.h",
   "standard": "darwin",
-  "availableObjectFormats": ["macho"],
+  "availableObjectFormats": [
+    "macho"
+  ],
   "typedefs": [
-    { "name": "malloc_zone_t", "type": "struct \"_malloc_zone_t\" { ptr<void> @0, ptr<void> @8, ptr<fn(ptr<void>, ptr<void>) -> u64 \"unsigned long\"> @16, arr<u8, 176> @24 }" }
+    {
+      "name": "malloc_zone_t",
+      "variants": [
+        {
+          "when": {
+            "format": "macho",
+            "arch": "arm64"
+          },
+          "type": "struct \"_malloc_zone_t\" { ptr<void> @0, ptr<void> @8, ptr<fn(ptr<void>, ptr<void>) -> u64 \"unsigned long\"> @16, ptr<fn(ptr<void>, u64 \"unsigned long\") -> ptr<void>> @24, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\") -> ptr<void>> @32, ptr<fn(ptr<void>, u64 \"unsigned long\") -> ptr<void>> @40, ptr<fn(ptr<void>, ptr<void>) -> void> @48, ptr<fn(ptr<void>, ptr<void>, u64 \"unsigned long\") -> ptr<void>> @56, ptr<fn(ptr<void>) -> void> @64, ptr<char> @72, ptr<fn(ptr<void>, u64 \"unsigned long\", ptr<ptr<void>>, u32) -> u32> @80, ptr<fn(ptr<void>, ptr<ptr<void>>, u32) -> void> @88, ptr<void> @96, u32 @104, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\") -> ptr<void>> @112, ptr<fn(ptr<void>, ptr<void>, u64 \"unsigned long\") -> void> @120, ptr<fn(ptr<void>, u64 \"unsigned long\") -> u64 \"unsigned long\"> @128, ptr<fn(ptr<void>, ptr<void>) -> i32> @136, ptr<fn(ptr<void>, ptr<void>) -> void> @144, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>> @152, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>> @160, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>> @168, ptr<fn(ptr<void>, ptr<void>, u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>> @176, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>> @184, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\", u64 \"unsigned long long\") -> ptr<void>> @192 }"
+        },
+        {
+          "when": {
+            "format": "macho",
+            "arch": "x86_64"
+          },
+          "type": "struct \"_malloc_zone_t\" { ptr<void> @0, ptr<void> @8, ptr<fn(ptr<void>, ptr<void>) -> u64 \"unsigned long\"> @16, ptr<fn(ptr<void>, u64 \"unsigned long\") -> ptr<void>> @24, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\") -> ptr<void>> @32, ptr<fn(ptr<void>, u64 \"unsigned long\") -> ptr<void>> @40, ptr<fn(ptr<void>, ptr<void>) -> void> @48, ptr<fn(ptr<void>, ptr<void>, u64 \"unsigned long\") -> ptr<void>> @56, ptr<fn(ptr<void>) -> void> @64, ptr<char> @72, ptr<fn(ptr<void>, u64 \"unsigned long\", ptr<ptr<void>>, u32) -> u32> @80, ptr<fn(ptr<void>, ptr<ptr<void>>, u32) -> void> @88, ptr<void> @96, u32 @104, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\") -> ptr<void>> @112, ptr<fn(ptr<void>, ptr<void>, u64 \"unsigned long\") -> void> @120, ptr<fn(ptr<void>, u64 \"unsigned long\") -> u64 \"unsigned long\"> @128, ptr<fn(ptr<void>, ptr<void>) -> u32> @136, ptr<fn(ptr<void>, ptr<void>) -> void> @144, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>> @152, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>> @160, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>> @168, ptr<fn(ptr<void>, ptr<void>, u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>> @176, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>> @184, ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\", u64 \"unsigned long long\") -> ptr<void>> @192 }"
+        }
+      ]
+    }
   ],
   "structs": [
     {
       "name": "_malloc_zone_t",
-      "fields": [
-        { "name": "reserved1",     "type": "ptr<void>",                              "offset": 0 },
-        { "name": "reserved2",     "type": "ptr<void>",                              "offset": 8 },
-        { "name": "size",          "type": "ptr<fn(ptr<void>, ptr<void>) -> u64 \"unsigned long\">", "offset": 16 },
-        { "name": "__opaque_tail", "type": "arr<u8, 176>",                           "offset": 24 }
+      "variants": [
+        {
+          "when": {
+            "format": "macho",
+            "arch": "arm64"
+          },
+          "fields": [
+            {
+              "name": "reserved1",
+              "type": "ptr<void>",
+              "offset": 0
+            },
+            {
+              "name": "reserved2",
+              "type": "ptr<void>",
+              "offset": 8
+            },
+            {
+              "name": "size",
+              "type": "ptr<fn(ptr<void>, ptr<void>) -> u64 \"unsigned long\">",
+              "offset": 16
+            },
+            {
+              "name": "malloc",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\") -> ptr<void>>",
+              "offset": 24
+            },
+            {
+              "name": "calloc",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\") -> ptr<void>>",
+              "offset": 32
+            },
+            {
+              "name": "valloc",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\") -> ptr<void>>",
+              "offset": 40
+            },
+            {
+              "name": "free",
+              "type": "ptr<fn(ptr<void>, ptr<void>) -> void>",
+              "offset": 48
+            },
+            {
+              "name": "realloc",
+              "type": "ptr<fn(ptr<void>, ptr<void>, u64 \"unsigned long\") -> ptr<void>>",
+              "offset": 56
+            },
+            {
+              "name": "destroy",
+              "type": "ptr<fn(ptr<void>) -> void>",
+              "offset": 64
+            },
+            {
+              "name": "zone_name",
+              "type": "ptr<char>",
+              "offset": 72
+            },
+            {
+              "name": "batch_malloc",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", ptr<ptr<void>>, u32) -> u32>",
+              "offset": 80
+            },
+            {
+              "name": "batch_free",
+              "type": "ptr<fn(ptr<void>, ptr<ptr<void>>, u32) -> void>",
+              "offset": 88
+            },
+            {
+              "name": "introspect",
+              "type": "ptr<void>",
+              "offset": 96
+            },
+            {
+              "name": "version",
+              "type": "u32",
+              "offset": 104
+            },
+            {
+              "name": "memalign",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\") -> ptr<void>>",
+              "offset": 112
+            },
+            {
+              "name": "free_definite_size",
+              "type": "ptr<fn(ptr<void>, ptr<void>, u64 \"unsigned long\") -> void>",
+              "offset": 120
+            },
+            {
+              "name": "pressure_relief",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\") -> u64 \"unsigned long\">",
+              "offset": 128
+            },
+            {
+              "name": "claimed_address",
+              "type": "ptr<fn(ptr<void>, ptr<void>) -> i32>",
+              "offset": 136
+            },
+            {
+              "name": "try_free_default",
+              "type": "ptr<fn(ptr<void>, ptr<void>) -> void>",
+              "offset": 144
+            },
+            {
+              "name": "malloc_with_options",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>>",
+              "offset": 152
+            },
+            {
+              "name": "malloc_type_malloc",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>>",
+              "offset": 160
+            },
+            {
+              "name": "malloc_type_calloc",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>>",
+              "offset": 168
+            },
+            {
+              "name": "malloc_type_realloc",
+              "type": "ptr<fn(ptr<void>, ptr<void>, u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>>",
+              "offset": 176
+            },
+            {
+              "name": "malloc_type_memalign",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>>",
+              "offset": 184
+            },
+            {
+              "name": "malloc_type_malloc_with_options",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\", u64 \"unsigned long long\") -> ptr<void>>",
+              "offset": 192
+            }
+          ]
+        },
+        {
+          "when": {
+            "format": "macho",
+            "arch": "x86_64"
+          },
+          "fields": [
+            {
+              "name": "reserved1",
+              "type": "ptr<void>",
+              "offset": 0
+            },
+            {
+              "name": "reserved2",
+              "type": "ptr<void>",
+              "offset": 8
+            },
+            {
+              "name": "size",
+              "type": "ptr<fn(ptr<void>, ptr<void>) -> u64 \"unsigned long\">",
+              "offset": 16
+            },
+            {
+              "name": "malloc",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\") -> ptr<void>>",
+              "offset": 24
+            },
+            {
+              "name": "calloc",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\") -> ptr<void>>",
+              "offset": 32
+            },
+            {
+              "name": "valloc",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\") -> ptr<void>>",
+              "offset": 40
+            },
+            {
+              "name": "free",
+              "type": "ptr<fn(ptr<void>, ptr<void>) -> void>",
+              "offset": 48
+            },
+            {
+              "name": "realloc",
+              "type": "ptr<fn(ptr<void>, ptr<void>, u64 \"unsigned long\") -> ptr<void>>",
+              "offset": 56
+            },
+            {
+              "name": "destroy",
+              "type": "ptr<fn(ptr<void>) -> void>",
+              "offset": 64
+            },
+            {
+              "name": "zone_name",
+              "type": "ptr<char>",
+              "offset": 72
+            },
+            {
+              "name": "batch_malloc",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", ptr<ptr<void>>, u32) -> u32>",
+              "offset": 80
+            },
+            {
+              "name": "batch_free",
+              "type": "ptr<fn(ptr<void>, ptr<ptr<void>>, u32) -> void>",
+              "offset": 88
+            },
+            {
+              "name": "introspect",
+              "type": "ptr<void>",
+              "offset": 96
+            },
+            {
+              "name": "version",
+              "type": "u32",
+              "offset": 104
+            },
+            {
+              "name": "memalign",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\") -> ptr<void>>",
+              "offset": 112
+            },
+            {
+              "name": "free_definite_size",
+              "type": "ptr<fn(ptr<void>, ptr<void>, u64 \"unsigned long\") -> void>",
+              "offset": 120
+            },
+            {
+              "name": "pressure_relief",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\") -> u64 \"unsigned long\">",
+              "offset": 128
+            },
+            {
+              "name": "claimed_address",
+              "type": "ptr<fn(ptr<void>, ptr<void>) -> u32>",
+              "offset": 136
+            },
+            {
+              "name": "try_free_default",
+              "type": "ptr<fn(ptr<void>, ptr<void>) -> void>",
+              "offset": 144
+            },
+            {
+              "name": "malloc_with_options",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>>",
+              "offset": 152
+            },
+            {
+              "name": "malloc_type_malloc",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>>",
+              "offset": 160
+            },
+            {
+              "name": "malloc_type_calloc",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>>",
+              "offset": 168
+            },
+            {
+              "name": "malloc_type_realloc",
+              "type": "ptr<fn(ptr<void>, ptr<void>, u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>>",
+              "offset": 176
+            },
+            {
+              "name": "malloc_type_memalign",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\") -> ptr<void>>",
+              "offset": 184
+            },
+            {
+              "name": "malloc_type_malloc_with_options",
+              "type": "ptr<fn(ptr<void>, u64 \"unsigned long\", u64 \"unsigned long\", u64 \"unsigned long long\", u64 \"unsigned long long\") -> ptr<void>>",
+              "offset": 192
+            }
+          ]
+        }
       ]
     }
   ]

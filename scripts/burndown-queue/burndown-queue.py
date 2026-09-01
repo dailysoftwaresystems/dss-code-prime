@@ -184,9 +184,15 @@ NS_ENV = ("D-ENV-", "D-UPSTREAM-")
 # ⇒ D-QUEUE-BURNDOWN-BANDED-A-HARNESS-ROW-INTO-THE-PRODUCTION-QUEUE (closed 2026-08-31)
 REG_PRODUCTION = ".plans/_deferred-anchor-registry-production.md"
 REG_HARNESS = ".plans/_deferred-anchor-registry-harness.md"
+# ★ THE ARCHIVE (operator, 2026-09-01). The registry became THREE documents: the two
+# WORKING lists above hold what is LEFT, and every closed row is moved out to this one.
+# It is named here so a row from it is IMPOSSIBLE to band -- see `BUCKET_ARCHIVE`.
+REG_DONE = ".plans/_deferred-anchor-registry-done.md"
+REGISTRIES = (REG_PRODUCTION, REG_HARNESS, REG_DONE)
 BUCKET_PRODUCTION = "PRODUCTION"
 BUCKET_HARNESS = "harness"
 BUCKET_PLAN = "plan"
+BUCKET_ARCHIVE = "archive"
 
 
 def bucket_of(rel):
@@ -195,6 +201,8 @@ def bucket_of(rel):
         return BUCKET_PRODUCTION
     if rel == REG_HARNESS:
         return BUCKET_HARNESS
+    if rel == REG_DONE:
+        return BUCKET_ARCHIVE
     return BUCKET_PLAN
 
 BANDS = ("P0", "P1", "P2", "P3", "P4", "P5")
@@ -373,14 +381,27 @@ def load_row_text(root):
                 # correct disagree about which rows exist.
                 key = bal.row_key(rel, bal.row_name(cells[1]))
                 flat = bal.strip_decoration(line)
-                status = bal.strip_decoration(cells[2])
+                # ★★ THE REGISTRY GREW A `Priority` AND A `Status` COLUMN ON 2026-09-01,
+                # so its verdict is cell 3 and its band is cell 2 -- while every
+                # plan-side §3.1 table still leads with the glyph in cell 2.
+                # ⚠ KEYED ON THE FILE, NOT ON THE CELL COUNT. plan-00 §0.2 also carries
+                # six columns (`# | Deferred item | Why deferred | Class | Owner | Trigger`),
+                # so counting cells would read ITS "Why deferred" prose as a status. The
+                # file is ground truth about the shape exactly as it is about the bucket
+                # -- the same principle `bucket_of` above already states.
+                declared = ""
+                if rel in REGISTRIES and len(cells) > 3:
+                    status = bal.strip_decoration(cells[3])
+                    declared = bal.strip_decoration(cells[2]).strip()
+                else:
+                    status = bal.strip_decoration(cells[2])
                 # ⚠ `rel` IS CARRIED even though `row_key` deliberately canonicalises
                 # the two registry files to ONE prefix. That canonicalisation is right
                 # for the BALANCE gate -- moving a row between buckets must be a no-op
                 # there -- and exactly wrong here, where the file IS the priority.
                 # Reusing the key without re-reading the home is how this instrument
                 # lost the production/harness distinction in the first place.
-                out.setdefault(key, (flat, status, rel))
+                out.setdefault(key, (flat, status, rel, declared))
     return out
 
 
@@ -394,14 +415,37 @@ def build(root):
     text = load_row_text(root)
     items, residue = [], []
     for key in scan.rows:
-        flat, status, rel = text.get(key, ("", "", ""))
+        flat, status, rel, declared = text.get(key, ("", "", "", ""))
         if not flat:
             # A row the balance scanner counted OPEN but whose line this reader could
             # not find. NEVER silent: it is the difference between the two instruments.
             residue.append(key)
             continue
         bucket = bucket_of(rel)
-        band, why, demoted_phrase = band_of(key, flat, bucket)
+        # ⚠⚠ AN OPEN ROW IN THE ARCHIVE IS A STRUCTURAL FAILURE, NOT A ROW TO BAND.
+        # The archive holds finished work; a live row filed there is invisible to this
+        # queue by design, so silently banding it would hide the one defect the split
+        # of 2026-09-01 made possible. `check-anchor-balance`'s partition arm refuses
+        # it too -- this is the SAME invariant seen from the consumer's side, and a
+        # consumer that quietly copes is how an invariant stops being one.
+        if bucket == BUCKET_ARCHIVE:
+            sys.exit("burndown-queue: FAIL -- %s is OPEN in the ARCHIVE (%s). The two "
+                     "working registries are what this queue reads; a live row filed in "
+                     "the archive can never be picked up. Move it back with:\n"
+                     "    python scripts/anchors/anchors.py set %s --status open --apply"
+                     % (key.split("#")[-1], rel, key.split("#")[-1]))
+        # ★★★ THE BAND IS A DECLARATION WHERE ONE EXISTS, AND THE SIEVE ONLY WHERE IT
+        # DOES NOT. Every registry row has carried an explicit `Priority` cell since
+        # 2026-09-01; the keyword sieve below now SEEDS a new row and is the fallback
+        # for plan-side tables, which have no such column. This is the correction this
+        # instrument's own docstring asks for: it warns that the band is *"a sort key,
+        # not a verdict"* because a census built from the same kind of sieve reported
+        # 103 where the truth was 4. A cell a human can correct, and whose correction
+        # SURVIVES, is strictly better than re-running the sieve forever.
+        if declared in BANDS:
+            band, why, demoted_phrase = declared, "declared in the Priority column", None
+        else:
+            band, why, demoted_phrase = band_of(key, flat, bucket)
         gated = key in scan.gated_rows
         unblocked = key in scan.unblocked
         items.append({

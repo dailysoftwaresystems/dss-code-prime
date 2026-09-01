@@ -1,0 +1,31 @@
+{
+  "$comment": "D-FFI-DESCRIPTOR-TYPE-ALIAS-SPELLING-KEYED-ON-DATA-MODEL-ALONE (P48 lane st) — the ELF and PE CONTROL for the row whose Darwin half lives in examples/c/shipped_stdint_alias_identity_macho. THE ROW ADDED A THIRD WORLD, AND THE FIRST DUTY OF THAT CHANGE WAS TO MOVE NEITHER OF THE OTHER TWO: glibc's LP64 uint64_t genuinely IS `unsigned long` and the LLP64 answers were already right, so a fix that 'corrected' Darwin by shifting elf or pe would be strictly worse than the defect. This manifest is the runnable statement that neither shifted. ★ WHY TWO MANIFESTS AND NOT ONE SOURCE: nothing a C program can read distinguishes elf-LP64 from macho-LP64 — both formats predefine __LP64__/_LP64 (D-PP-FORMAT-DATA-MODEL-PREDEFINES) and nothing else separates them — so a single source would have had to infer its own platform from some OTHER config fact, making the pin partly self-referential. Splitting by MANIFEST puts the platform in the target spec, where it is a fact. The `#ifdef __LP64__` split here is therefore only LP64-vs-LLP64, and the #else (pe) arm is the STRONGER direction: it names `unsigned long long` where `unsigned long` is 32 bits, so it fails loud if the LP64 rows are ever pasted onto a Windows target. ★ INSTRUMENTS: sizeof cannot see this defect (every alias is 8 bytes on all three platforms, before and after), so identity is checked twice — pointer-assignment compatibility at COMPILE time (wrong spelling ⇒ S_TypeMismatch, no artifact) and _Generic at RUN time, with a DIFFERENT expectedStdout per platform so no blanket answer satisfies both. The exit code is 42 on both arms by construction (8+9+10+7+8), so the status alone cannot tell the worlds apart — the printed tag is what does, exactly as in the predefined_lp64_macho precedent. ✔MEASURED 2026-09-01 with a compile-only _Generic probe testing every alias against every candidate named type, references probed SEPARATELY: WSL gcc 13.3.0, clang 18.1.3 and aarch64-linux-gnu-gcc 13.3.0 all answer `long`/`unsigned long` on elf; mingw-w64 gcc 13.2.0 (ucrt) and MSVC cl.exe 19.51.36252 both answer `long long`/`unsigned long long` on pe. ✔EXECUTED, not predicted — the DSS-built artifacts were run: pe64 natively on the Windows host, elf64-x86_64 under WSL, elf64-aarch64 under qemu-aarch64 with QEMU_LD_PREFIX=/usr/aarch64-linux-gnu; each printed the line pinned below and exited 42. RED-ON-DISABLE: reverting the shipped descriptors to their `when:{dataModel}` form leaves BOTH of these legs green — which is the whole content of a control, and is why the Darwin manifest and tests/ffi/test_stdint_alias_identity.cpp carry the red instead. That C++ pin uses key-DELETING mutants (drop the macho arms; drop just the `format` keys the row added) so a config that LOSES the feature is seen.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "u64=ul umax=ul uptr=ul size=ul i64=l imax=l\n",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "u64=ul umax=ul uptr=ul size=ul i64=l imax=l\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "u64=ul umax=ul uptr=ul size=ul i64=l imax=l\n"
+    },
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "expectedStdout": "u64=ull umax=ull uptr=ull size=ull i64=ll imax=ll\r\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

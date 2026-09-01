@@ -319,7 +319,21 @@ function parseRegistry() {
   }
   let total = 0, closed = 0;
   for (const f of docs) {
+    // ⚠⚠ THE ALLOWLIST IS NOT DEFERRED WORK AND WAS BEING COUNTED AS EIGHT OPEN
+    // ANCHORS. `## Allowlist (code-internal pins, NOT deferred work)` says so on the
+    // tin: its rows are `| Pattern | Reason |`, the pattern is a BACKTICKED `D-*`, and
+    // this reader is line-based, so all eight matched the row regex and — having no
+    // status cell to lead with ✅ — landed in the OPEN column. ✔MEASURED 2026-09-01
+    // against `check-anchor-balance`'s table-based scan: this axis read 531 open where
+    // the gate reads 523, and 2083 rows where it counts 2078. A pre-existing defect,
+    // surfaced by cross-checking the two instruments rather than by either alone.
+    // ⓘ Fixed HERE rather than filed, per the standing rule that a harness defect is
+    // repaired at the moment it is faced.
+    let inAllowlist = false;
     for (const line of readFileSync(join(dir, f), 'utf8').split('\n')) {
+      if (/^##\s+Allowlist\b/.test(line)) { inAllowlist = true; continue; }
+      if (inAllowlist && /^##\s/.test(line)) inAllowlist = false;
+      if (inAllowlist) continue;
       if (!/^\|\s*`D-/.test(line)) continue;
       const cells = line.split('|');
       if (cells.length < 3) continue;
@@ -329,7 +343,20 @@ function parseRegistry() {
       // routinely cite ANOTHER anchor's closure, and counting those
       // over-reported this axis by 99 rows (1338 against a true 1239): about
       // five percentage points, always in the flattering direction.
-      if (/^✅/.test(cells[2].replace(/^[\s*_]+/, ''))) closed++;
+      //
+      // ⚠⚠ THE STATUS CELL MOVED ON 2026-09-01 and this axis had to move with it.
+      // The registry gained explicit `Priority` and `Status` columns
+      // (`| Anchor | Priority | Status | Trigger | ... |`), so the verdict is cell 3;
+      // cell 2 is now the band, which begins with `P`, never with ✅. Left unchanged
+      // this would have reported **0 closed of 2078** -- a total collapse of the axis
+      // reading as "nothing has ever been finished", which is the same shape as the
+      // rename that broke this driver's probe battery once before.
+      // ⓘ Both cells are read, and the OLD position is accepted too, because
+      // plan-side §3.1 tables were NOT migrated and still lead with the glyph in
+      // cell 2. Whichever cell carries a leading ✅ decides; a row cannot have one
+      // in both without `check-anchor-balance`'s ARM 6 refusing the tree.
+      const lead = (c) => (c ?? '').replace(/^[\s*_]+/, '');
+      if (/^✅/.test(lead(cells[3])) || /^✅/.test(lead(cells[2]))) closed++;
     }
   }
   return { total, closed, docs: docs.length };

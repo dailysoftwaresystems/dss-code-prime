@@ -319,6 +319,51 @@ frameSlotStrideForClasses(TargetSchema const& schema,
                                        occupants.begin(), occupants.size()});
 }
 
+// ── D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL ───────────────────────────────
+//
+// PLACING ONE LOCAL WHOSE ALIGNMENT MAY EXCEED WHAT A STATIC FRAME OFFSET CAN
+// PROMISE. The post-prologue stack pointer is congruent to 0 modulo the cc's
+// `stackAlignment` and NO FINER — that congruence is the whole of what an ABI
+// guarantees at a call boundary, and `alignedSizeWithBias` is what establishes it.
+// So `sp + <compile-time constant>` is only ever `stackAlignment`-aligned, and an
+// `alignas(32)` / `alignas(64)` local cannot be placed by choosing its offset. It is
+// placed by RESERVING SPARE BYTES above it and rounding its address up at run time
+// (`mir_to_lir`'s `emitAlignUpToPowerOfTwo`, three ordinary arithmetic instructions
+// over virtual registers). The stack pointer, the prologue, the unwind data, the
+// spill addressing and the register allocation are all untouched — which is why this
+// carries no arch-keyed code and no new config key.
+//
+// ★ PUBLISHED RATHER THAN PRIVATE, for the reason
+// [[D-LIR-RETURN-REG-REFUSAL-IS-UNREACHABLE-FROM-THE-TEST-TIER]] recorded and the
+// reason `frameSlotStride` above is published: these two decide a frame's byte
+// layout between them, and a derivation no tier can observe is a derivation whose
+// mutant reddens nothing. They are also the pair that must AGREE across the three
+// walks that place allocas, so having exactly one definition of each is the property.
+
+// The alignment an alloca's in-frame OFFSET is rounded up to. Never above the frame's
+// own guarantee: rounding an offset to 64 when its base is only 16-aligned buys
+// nothing and wastes up to 48 bytes. `allocaAlign == 0` (no override) answers 1, so
+// `alignUp` by it is the identity.
+[[nodiscard]] inline constexpr std::uint32_t
+frameSlotPlacementAlign(std::uint32_t allocaAlign,
+                        std::uint32_t frameAlign) noexcept {
+    if (allocaAlign == 0) return 1u;
+    return (allocaAlign > frameAlign) ? frameAlign : allocaAlign;
+}
+
+// The spare bytes reserved ABOVE an alloca so the runtime rounding of its address
+// stays inside its own reservation. The rounded address exceeds the raw one by at
+// most `allocaAlign - frameAlign`: the raw address is `frameAlign`-aligned (the
+// placement rule above, plus the SP congruence), so the distance to the next
+// `allocaAlign` boundary is a multiple of `frameAlign` strictly below `allocaAlign`.
+// `0` for every alloca at or below the frame's guarantee — i.e. every alloca in every
+// shipped corpus before this row, which is why existing frames stay byte-identical.
+[[nodiscard]] inline constexpr std::uint32_t
+frameSlotAlignHeadroom(std::uint32_t allocaAlign,
+                       std::uint32_t frameAlign) noexcept {
+    return (allocaAlign > frameAlign) ? (allocaAlign - frameAlign) : 0u;
+}
+
 // ── D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT ──
 //
 // THE TWO — AND ONLY TWO — WAYS A FRAME MOVE THAT CARRIES A WHOLE REGISTER MAY
@@ -713,6 +758,17 @@ struct DSS_EXPORT FrameLayout {
     // re-scanning the LIR.
     std::uint32_t       localAreaSize     = 0;  // bytes occupied by local-alloca slots
     std::uint32_t       numLocalAllocas   = 0;  // count of `alloca` LIR ops in this function
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the SP-relative byte offset of each
+    // local alloca, indexed by 0-based scan order — `numLocalAllocas` entries. THE
+    // ONE PLACE THE PROGRESSION IS DECIDED; every consumer reads it rather than
+    // re-deriving it. There is no closed form to re-derive: an alloca's span is
+    // `ceil(size / slotSize)` slots (a struct local is more than one), each offset is
+    // rounded up to that alloca's own placement alignment, and an OVER-aligned one
+    // additionally reserves `align - stackAlignment` bytes of headroom for the
+    // runtime rounding its address materialization applies. `localAreaOffset() +
+    // index * slotSize` — the shape three separate consumers used to spell — is that
+    // form only for a function whose every local is a single-slot scalar.
+    std::vector<std::int32_t> allocaSlotOffsets;
     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: padding bytes inserted BETWEEN the
     // spill area and the local-alloca area so the local base lands on the
     // max-local-alignment boundary. Nonzero ONLY when a function has an

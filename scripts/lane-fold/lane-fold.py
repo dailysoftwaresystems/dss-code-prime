@@ -310,15 +310,51 @@ def cmd_seed(root, lane, empty=False, force=False):
 # ──────────────────────────────────── fold ─────────────────────────────────────
 
 def classify(root, wt, seed):
-    """-> (mine, inherited, refusals). Pure measurement; writes nothing."""
-    mine, inherited, refusals = [], [], []
+    """-> (mine, deleted, inherited, refusals). Pure measurement; writes nothing.
+
+    ⚠⚠ `deleted` EXISTS BECAUSE A LANE'S DELETION USED TO VANISH AT THE FOLD.
+    [D-CYCLE-LANE-FOLD-DROPS-A-LANE-S-DELETION] `git status` reports a removed path
+    as `D <path>`, so `changed_paths` always offered it -- and this function then hit
+    `if not os.path.isfile(src): continue` and dropped it on the floor. The fold
+    reported success, having silently kept the file.
+    ✔MEASURED 2026-09-01 folding lane `al`, which REPLACED an error example whose
+    subject its own change had made legal: 17 paths copied, the removal skipped, and
+    the surviving example asserts a refusal that no longer happens -- a RED the next
+    gate would have charged to the lane's code rather than to this tool. It fails in
+    the direction that keeps stale assertions alive, which is the direction that
+    looks like nothing happened.
+    ⓘ A deletion is DESTRUCTIVE, so it carries the SAME baseline proof a copy does:
+    the main tree's bytes must still match the seed (or the HEAD blob), or the fold
+    REFUSES the whole batch rather than destroying work it cannot account for."""
+    mine, deleted, inherited, refusals = [], [], [], []
     for rel in sorted(set(changed_paths(wt))):
         if is_lane_tree(rel):
             continue          # a nested lane tree is never this lane's contribution
         src = os.path.join(wt, rel)
-        if not os.path.isfile(src):
-            continue
         dest = os.path.join(root, rel)
+        if not os.path.isfile(src):
+            # The lane removed it (or it never existed). Only a path the MAIN TREE
+            # still holds is a deletion this fold has to carry out.
+            if not inside(root, dest):
+                refusals.append("escapes the repository: %s" % rel)
+                continue
+            if not os.path.exists(dest):
+                continue                      # already absent both sides: nothing to do
+            baseline = seed.get(rel)
+            if baseline is None:
+                blob = subprocess.run(["git", "-C", root, "show", "HEAD:%s" % rel],
+                                      capture_output=True)
+                if blob.returncode != 0:
+                    refusals.append(
+                        "lane deleted an UNTRACKED path the main tree holds, so there "
+                        "is no baseline to prove it is safe to remove: %s" % rel)
+                    continue
+                baseline = hashlib.md5(blob.stdout).hexdigest()
+            if md5_file(dest) != baseline:
+                refusals.append("main tree DRIFTED; refusing to DELETE it: %s" % rel)
+                continue
+            deleted.append(rel)
+            continue
         if not inside(root, dest):
             refusals.append("escapes the repository: %s" % rel)
             continue
@@ -351,7 +387,7 @@ def classify(root, wt, seed):
                 refusals.append("untracked at HEAD yet present in the main tree: %s" % rel)
                 continue
         mine.append(rel)
-    return mine, inherited, refusals
+    return mine, deleted, inherited, refusals
 
 
 def cmd_fold(root, lane, apply_it):
@@ -366,7 +402,7 @@ def cmd_fold(root, lane, apply_it):
             % (mpath, lane))
     seed = json.load(io.open(mpath, encoding="utf-8"))
 
-    mine, inherited, refusals = classify(root, wt, seed)
+    mine, deleted, inherited, refusals = classify(root, wt, seed)
 
     if refusals:
         print("lane-fold: REFUSED -- nothing written. %d problem(s):" % len(refusals))
@@ -386,6 +422,14 @@ def cmd_fold(root, lane, apply_it):
         # like a lane's tests had gone missing.
         print("   %s%s" % (rel, "" if rel in seed
                                 else "   (not seeded -- no prior lane touched it)"))
+    # ⚠ DELETIONS ARE LISTED SEPARATELY AND LOUDLY. They are the destructive half of
+    # a fold, and a reader scanning the copy list would not otherwise see them at all
+    # -- which is exactly how [D-CYCLE-LANE-FOLD-DROPS-A-LANE-S-DELETION] stayed
+    # invisible: nothing printed, so nothing looked wrong.
+    if deleted:
+        print("lane-fold: and %d path(s) this lane DELETED:" % len(deleted))
+        for rel in deleted:
+            print("   %s   (will be REMOVED from the main tree)" % rel)
 
     if not apply_it:
         print("lane-fold: dry run. pass --apply to write.")
@@ -393,7 +437,18 @@ def cmd_fold(root, lane, apply_it):
 
     for rel in mine:
         copy_atomic(os.path.join(wt, rel), os.path.join(root, rel))
-    print("lane-fold: WROTE %d path(s) into the main tree." % len(mine))
+    for rel in deleted:
+        os.remove(os.path.join(root, rel))
+        # Take the directory too once it is empty, so a removed example leaves no
+        # husk -- but never recursively, and never past the repository root.
+        d = os.path.dirname(os.path.join(root, rel))
+        while inside(root, d) and os.path.realpath(d) != os.path.realpath(root):
+            if os.listdir(d):
+                break
+            os.rmdir(d)
+            d = os.path.dirname(d)
+    print("lane-fold: WROTE %d path(s) into the main tree%s."
+          % (len(mine), (" and REMOVED %d" % len(deleted)) if deleted else ""))
     return 0
 
 
@@ -489,7 +544,7 @@ def self_test():
         # (a) the lane leaves the seeded file alone and edits two of its own.
         write_atomic(os.path.join(wt, "tracked.txt"), "lane edit\n")
         write_atomic(os.path.join(wt, "a file - with spaces.md"), "lane edit\n")
-        mine, inherited, refusals = classify(root, wt, seed)
+        mine, _del, inherited, refusals = classify(root, wt, seed)
         pin(not refusals, "a clean fold refuses nothing", "refusals=%s" % refusals)
         pin(inherited == ["shared.json"],
             "(a) a seeded path the lane never touched is INHERITED, not folded back",
@@ -500,7 +555,7 @@ def self_test():
 
         # (b) the main tree drifts under the lane.
         write_atomic(os.path.join(root, "tracked.txt"), "someone else\n")
-        mine2, _inh2, refusals2 = classify(root, wt, seed)
+        mine2, _del2, _inh2, refusals2 = classify(root, wt, seed)
         pin(len(refusals2) == 1 and "DRIFTED from HEAD" in refusals2[0],
             "(b) a destination that drifted from HEAD is REFUSED", "got=%s" % refusals2)
         pin(cmd_fold(root, "x", apply_it=True) == 2,
@@ -514,7 +569,7 @@ def self_test():
         # the seeded document drifts too -- the two-lanes-on-one-file case.
         write_atomic(os.path.join(wt, "shared.json"), '{"from":"lane-two"}\n')
         write_atomic(os.path.join(root, "shared.json"), '{"from":"folded-one"}\n')
-        _m3, _i3, refusals3 = classify(root, wt, seed)
+        _m3, _d3, _i3, refusals3 = classify(root, wt, seed)
         pin(any("DRIFTED since seeding" in r and "shared.json" in r for r in refusals3),
             "two lanes on ONE shared document REFUSES rather than reverting the first",
             "got=%s" % refusals3)
@@ -575,6 +630,42 @@ def self_test():
             "kept=%s dropped=%s"
             % ("newdir/kept.txt" in seen,
                "newdir/__pycache__/dropped.pyc" in seen))
+
+        # (h) A DELETION THE LANE MADE IS CARRIED, AND A DELETION OVER DRIFT IS NOT.
+        # [D-CYCLE-LANE-FOLD-DROPS-A-LANE-S-DELETION] Before this, `classify` hit
+        # `if not os.path.isfile(src): continue` and the removal simply vanished --
+        # the fold reported success having kept the file. ✔That happened for real on
+        # lane `al`, whose replaced error example survived a fold that printed 17
+        # written paths and no mention of the removal.
+        # ★ The REMOVE direction is the whole point: the arm deletes the file in the
+        # lane and requires the fold to SEE it, then dirties the main tree's copy and
+        # requires the fold to REFUSE. A pin that only checked the happy path would
+        # pass over a tool that deletes drifted work.
+        # ⓘ The fixture's root and worktree are INDEPENDENT repositories, so the
+        # subject has to be committed in each before the lane can delete it -- that
+        # is what makes `git status` in the lane say `D` rather than "untracked".
+        # ⚠ Assertions here name the SUBJECT PATH rather than requiring an empty
+        # refusal set: arm (b) deliberately leaves the main tree drifted, and a pin
+        # that demanded global cleanliness would be measuring that instead of this.
+        for repo in (root, wt):
+            write_atomic(os.path.join(repo, "todelete.txt"), "doomed\n")
+            subprocess.run(["git", "-C", repo, "add", "todelete.txt"],
+                           capture_output=True, check=True)
+            subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "add todelete"],
+                           capture_output=True, check=True)
+        os.remove(os.path.join(wt, "todelete.txt"))
+        m_del, d_del, _i, r_del = classify(root, wt, {})
+        pin("todelete.txt" in d_del and "todelete.txt" not in m_del
+            and not [x for x in r_del if "todelete.txt" in x],
+            "(h) a path the lane DELETED is measured as a deletion, not dropped",
+            "deleted=%s mine=%s refusals=%s" % (d_del, m_del, r_del))
+
+        write_atomic(os.path.join(root, "todelete.txt"), "someone else edited this\n")
+        _m, d_drift, _i2, r_drift = classify(root, wt, {})
+        pin("todelete.txt" not in d_drift
+            and any("refusing to DELETE" in x and "todelete.txt" in x for x in r_drift),
+            "(h) a deletion whose destination DRIFTED is REFUSED, not carried out",
+            "deleted=%s refusals=%s" % (d_drift, r_drift))
 
     print("lane-fold self-test: %d failed" % failed[0])
     return 1 if failed[0] else 0

@@ -113,6 +113,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_VlaInitializerNotEmpty";
         case DiagnosticCode::S_AssignNeedsModifiableLvalue:
             return "S_AssignNeedsModifiableLvalue";
+        case DiagnosticCode::S_ConditionalOperandTypeMismatch:
+            return "S_ConditionalOperandTypeMismatch";
+        case DiagnosticCode::S_PointerDifferenceIncompatiblePointee:
+            return "S_PointerDifferenceIncompatiblePointee";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";

@@ -196,11 +196,32 @@ ANCHOR_TOKEN = re.compile(r"D-[A-Za-z0-9_]+(?:[-.][A-Za-z0-9_]+)+")
 class Shape(object):
     """A recognized deferral-table shape: how to find its status cell."""
 
-    def __init__(self, kind, status_col):
+    def __init__(self, kind, status_col, trigger_col=None, closing_col=None):
         self.kind = kind
         # 1-based index into the row's cells, or None when the shape HAS no status
         # cell (see RESERVED below).
         self.status_col = status_col
+        # ★★ THE VERDICT CELL AND THE PROSE CELLS BECAME DIFFERENT CELLS ON 2026-09-01,
+        # and conflating them would have moved four arms onto the wrong column. In the
+        # 4-cell shape one cell carries all three roles: it opens with the verdict glyph
+        # and continues as the trigger prose. The 6-cell registry shape separates them --
+        # `Status` is a three-value controlled vocabulary, `Trigger` is the prose -- so:
+        #   status_col  : what `is_closed` reads. THE verdict. Nothing else may.
+        #   trigger_col : the prose `is_gated` / `is_mismarked_closure` read.
+        #   closing_col : the closing-work cell, whose LEAD MARKER arm 5 classifies.
+        # Defaulting the two prose columns to the verdict's own position is what keeps
+        # every 4-cell table -- the plan-side §3.1 registries, plan-17 §5.4 -- reading
+        # exactly as before, with no fixture in the self-test changed.
+        # ⓘ RESERVED has no status cell at all (`status_col is None`), so the two prose
+        # columns stay None with it rather than becoming arithmetic on a missing index.
+        # The three status-cell arms are already silent for that shape.
+        self.trigger_col = status_col if trigger_col is None else trigger_col
+        if closing_col is not None:
+            self.closing_col = closing_col
+        elif self.trigger_col is None:
+            self.closing_col = None
+        else:
+            self.closing_col = self.trigger_col + 1
 
 
 # ── The sanctioned deferral-table shapes, ✔MEASURED across all 39 files in .plans/ ──
@@ -231,8 +252,27 @@ class Shape(object):
 #    column, so `status_col` is None and every row is unconditionally OPEN. That is
 #    both the safe direction AND the correct one: it is what makes the eventual MOVE
 #    into the registry arithmetically neutral instead of a +1 regression.
+#
+# 1b. REGISTRY-SHAPED, SIX CELLS (2026-09-01)
+#    `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |`
+#    The three `_deferred-anchor-registry*.md` documents. Operator: *"add columns for
+#    priority and status ... this way we always have clean statuses."* Before this the
+#    verdict was the first glyph of a prose blob that also carried the trigger, the
+#    history and the retraction, and every reader had to agree on where the verdict
+#    stopped -- which is exactly the agreement that failed four times in this file's
+#    own comment history.
+#    ⚠ THE STATUS CELL STILL LEADS WITH THE GLYPH (`✅ CLOSED`, `🟠 OPEN`, `⏳ GATED`).
+#    A column holding the bare word `CLOSED` would have made `is_closed` -- which tests
+#    for a LEADING ✅, the one definition this whole battery shares -- return False for
+#    1,555 closed rows at once. The word is for the reader; the glyph is the contract.
+#    ★ THE 4-CELL SHAPE IS NOT RETIRED. Plan-side §3.1 tables and plan-17 §5.4 still use
+#    it, and plan-17's prose says its shape "matches `_deferred-anchor-registry*.md`" --
+#    a sentence that is now about the registry's ANCESTOR. Both shapes are recognized;
+#    only the registry documents were migrated.
 SHAPES_EXACT = {
     ("anchor", "trigger", "closing work", "cross-refs"): Shape("registry", 2),
+    ("anchor", "priority", "status", "trigger", "closing work", "cross-refs"):
+        Shape("registry6", 3, trigger_col=4, closing_col=5),
     ("anchor", "owns"): Shape("reserved", None),
 }
 SHAPES_PREFIX = [
@@ -1054,6 +1094,10 @@ class Scan(object):
                  silent; see ARM 5.
     unblocked  : {"relpath#name": reason} -- the row still PRESENTS as blocked but
                  the blocker it names has been discharged. See ARM 4.
+    split_verdict: {"relpath#name": (status_cell, prose_excerpt)} -- SIX-CELL SHAPE
+                 ONLY. The `Status` column and the glyph leading the `Trigger` prose
+                 state the same fact and disagree. Silent by construction: the gate
+                 believes the column, every human reads the prose. See ARM 6.
     plan_phases: {plan_number: {PHASE_TOKEN}} -- the SECOND namespace an opener may
                  resolve in. Populated per document from its numbered headings and
                  its phase-table ids; unnumbered files contribute nothing. Merged by
@@ -1069,6 +1113,7 @@ class Scan(object):
         self.gated_rows = {}
         self.unclassified = {}
         self.unblocked = {}
+        self.split_verdict = {}
         self.plan_phases = {}
 
     def merge(self, other):
@@ -1080,6 +1125,7 @@ class Scan(object):
         self.gated_rows.update(other.gated_rows)
         self.unclassified.update(other.unclassified)
         self.unblocked.update(other.unblocked)
+        self.split_verdict.update(other.split_verdict)
         # ⚠ UNION, not `update`: `.plans/` really does carry two `24-` plans, and an
         # overwrite would silently delete one of them from the namespace an opener
         # resolves against -- a dangling verdict on a phase that exists.
@@ -1215,17 +1261,39 @@ def scan_document(text, relpath):
                     # reason: there is no cell for them to read.
                     opened, excerpt = True, "(reserved anchor - no status column)"
                 else:
-                    status = cells[shape.status_col] if len(cells) > shape.status_col else ""
+                    def _cell(idx):
+                        return cells[idx] if len(cells) > idx else ""
+                    # ★★ ONE SPLIT, STATED ONCE: `is_closed` reads the VERDICT cell and
+                    # every other predicate reads the PROSE cell. In the 4-cell shape
+                    # they are the SAME cell, so that path is byte-for-byte what it was
+                    # -- deliberately, because `is_mismarked_closure` and `is_gated` are
+                    # windowed regex families whose comments record six defects, and
+                    # widening what they are handed would silently re-open them.
+                    # In the 6-cell registry shape `Status` is a three-value controlled
+                    # vocabulary and `Trigger` still carries the glyph-led prose, so the
+                    # bookkeeping mark, the walk-back retraction and the TRIGGER-GATED
+                    # declaration all stay exactly where those predicates already look.
+                    status = _cell(shape.status_col)     # THE verdict. Only is_closed.
+                    prose = _cell(shape.trigger_col)     # the trigger prose
+                    closing = _cell(shape.closing_col)
                     opened = not is_closed(status)
-                    excerpt = " ".join(status.split())[:80]
-                    closing = (cells[shape.status_col + 1]
-                               if len(cells) > shape.status_col + 1 else "")
-                    if is_bookkeeping_closure(status):
+                    excerpt = " ".join(prose.split())[:80]
+                    if is_bookkeeping_closure(prose):
                         scan.bookkeeping.add(key)
-                    if is_mismarked_closure(status, closing):
+                    if is_mismarked_closure(prose, closing):
                         scan.mismarked[key] = excerpt
+                    # ⚠ A SIXTH ARM, AND IT EXISTS ONLY BECAUSE THE VERDICT LEFT THE
+                    # PROSE. Two cells now state the same fact, so they can disagree --
+                    # and the disagreement is silent: the gate would believe the column
+                    # while every human reads the prose. Recorded here, refused in main.
+                    if (shape.trigger_col != shape.status_col
+                            and prose.strip()
+                            and is_closed(status) != is_closed(prose)):
+                        scan.split_verdict[key] = (
+                            " ".join(status.split())[:24],
+                            " ".join(strip_decoration(prose).split())[:60])
                     if opened:
-                        gated = is_gated(status, closing)
+                        gated = is_gated(prose, closing)
                         if gated:
                             scan.gated_rows[key] = (opener_of(raw), excerpt)
                         marker = lead_mark_class(closing)
@@ -1301,6 +1369,125 @@ def scan_at_ref(root, ref):
     return scan
 
 
+def registry_documents(root):
+    """-> the registry `.md` basenames under `.plans/`, sorted. May be empty.
+
+    ⓘ ONE ENUMERATION, TWO READERS (`per_bucket_report` and `partition_report`).
+    Spelling the `REG_PREFIX` filter twice is how a third registry gets added to one
+    reader and not the other, and the reader that missed it would report a clean
+    split over a corpus it never read -- silently, in the flattering direction.
+    """
+    plans = os.path.join(root, PLANS_DIR)
+    if not os.path.isdir(plans):
+        return []
+    return sorted(n for n in os.listdir(plans)
+                  if n.endswith(".md")
+                  and ("%s/%s" % (PLANS_DIR, n)).startswith(REG_PREFIX))
+
+
+# ── THE ARCHIVE, AND HOW IT IS RECOGNIZED ──────────────────────────────────────
+# Operator, 2026-09-01: *"the `_deferred-anchor-registry-{harness|production}.md` is a
+# list of remaining items, that always delete a done item and put into
+# `_deferred-anchor-registry-done.md` once finished."*
+#
+# ★ RECOGNIZED BY FILENAME SUFFIX, DECLARED ONCE, because the archive is a THIRD
+# registry rather than a different KIND of document: it carries the same four-column
+# rows, is globbed by every resolver, and is counted in every total. What separates it
+# is a single invariant -- which side of the partition its rows sit on -- and a name is
+# the cheapest honest carrier for that. Keying on "does it contain closed rows" instead
+# would make the file define its own contract, which is not a check.
+DONE_SUFFIX = "-done.md"
+
+
+def is_done_registry(name):
+    """True for the ARCHIVE document, whose rows must all be CLOSED."""
+    return name.endswith(DONE_SUFFIX)
+
+
+def partition_report(root):
+    """Refuse a registry whose rows are on the wrong side of the partition. -> bool ok
+
+    ★★★ THE INVARIANT, AND IT IS SYMMETRIC BY NECESSITY (operator, 2026-09-01):
+    a WORKING registry (`-production`, `-harness`) holds only OPEN rows; the ARCHIVE
+    (`-done`) holds only CLOSED ones. Both directions fail, and the two failures are
+    not the same defect:
+
+      * A CLOSED ROW LEFT IN A WORKING REGISTRY re-inflates the answer to *"what is
+        left"*. That is the state this split was created to end: before 2026-09-01
+        the two working files held **1,555 closed rows against 523 open ones**, so
+        three quarters of every orientation read was finished work and the priority
+        was buried under its own audit trail.
+      * ★ AN OPEN ROW FILED IN THE ARCHIVE IS THE DANGEROUS DIRECTION, and it is why
+        this arm is symmetric rather than a tidiness check on one file. Every
+        instrument that asks *what should I work on* -- `burndown-queue`, the cycle's
+        priority pick, the skills -- reads the two working registries ONLY, by
+        design. A live row that lands here is therefore not merely mis-filed: it is
+        **invisible to every queue in the project** while still counting OPEN in
+        every total, so the work can never be picked up and the number never explains
+        why. Nothing else in the battery can see that.
+
+    ⚠ A DAY-ONE REFUSAL, NOT A DIFFERENTIAL, and that is deliberate. The other arms
+    here are differentials because they inherited populations nobody in this cycle
+    created; this partition was established whole by the migration in the same commit
+    that added this function, so its clean state is the baseline. A differential would
+    let the first violation become the permanent floor -- which is exactly how the
+    `## Anchor Index (continued)` table accreted.
+
+    ⚠ IT DOES NOT DECIDE WHAT "CLOSED" MEANS. `is_closed` is the one definition, the
+    same one the balance arithmetic uses. A second opinion inside the gate that MOVES
+    rows on that opinion is how two instruments start disagreeing about one registry.
+    """
+    names = registry_documents(root)
+    if not names:
+        print()
+        print("anchor-balance: partition scan found NO registry file under %s/ -- the "
+              "scan collapsed. This is a structural failure, not an empty registry."
+              % PLANS_DIR)
+        return False
+    if not any(is_done_registry(n) for n in names):
+        # Fail-closed: with no archive present, every closed row is "correctly" filed
+        # and this arm would report a clean partition over a discipline that is not
+        # being kept at all.
+        print()
+        print("anchor-balance: FAIL - no archive registry (`*%s`) under %s/. The "
+              "move-on-close discipline has no destination, so this arm cannot "
+              "measure it." % (DONE_SUFFIX, PLANS_DIR))
+        return False
+
+    plans = os.path.join(root, PLANS_DIR)
+    misfiled = []
+    for n in names:
+        rel = "%s/%s" % (PLANS_DIR, n)
+        archive = is_done_registry(n)
+        with io.open(os.path.join(plans, n), encoding="utf-8") as fh:
+            scan = scan_document(fh.read(), rel)
+        # `scan.rows` holds OPEN rows only; `scan.names` holds every data row. The
+        # complement is taken rather than re-deriving "closed", for the reason above.
+        open_here = set(scan.rows)
+        wrong = (open_here if archive else (set(scan.names) - open_here))
+        for k in sorted(wrong):
+            misfiled.append((rel, k.split("#", 1)[1], "OPEN" if archive else "CLOSED"))
+
+    if not misfiled:
+        return True
+
+    print()
+    print("anchor-balance: FAIL - %d row(s) are on the wrong side of the registry "
+          "partition:" % len(misfiled))
+    for rel, name, state in misfiled[:40]:
+        print("  ! %-6s row in %s   %s" % (state, rel, name))
+    if len(misfiled) > 40:
+        print("  ... and %d more." % (len(misfiled) - 40))
+    print("  A WORKING registry answers ONE question -- what is LEFT -- so a CLOSED row")
+    print("  belongs in the archive. An OPEN row in the archive is worse: every queue in")
+    print("  this project reads the working registries only, so it can never be picked up.")
+    print("  Move it with the tool that performs the move as part of applying the row:")
+    print("      python scripts/apply-registry-row/apply-registry-row.py "
+          "<working-registry> <anchor> <row-file> --apply")
+    print("  Do NOT hand-edit the tables to settle this, and do NOT soften this arm.")
+    return False
+
+
 def per_bucket_report(root, registry_open_total):
     """Print the registry's OPEN split per BUCKET, and reconcile it. -> bool ok
 
@@ -1331,9 +1518,7 @@ def per_bucket_report(root, registry_open_total):
     ⓘ The enumeration is by PREFIX, matching `REG_PREFIX`'s own rationale: a third
     split costs nothing and no reader can silently see part of the registry.
     """
-    plans = os.path.join(root, PLANS_DIR)
-    names = sorted(n for n in os.listdir(plans)
-                   if n.endswith(".md") and ("%s/%s" % (PLANS_DIR, n)).startswith(REG_PREFIX))
+    names = registry_documents(root)
     if not names:
         # A collapsed enumeration reports a clean split over a corpus it never read.
         print()
@@ -1342,6 +1527,7 @@ def per_bucket_report(root, registry_open_total):
               % PLANS_DIR)
         return False
 
+    plans = os.path.join(root, PLANS_DIR)
     print()
     total_open = 0
     for n in names:
@@ -2171,6 +2357,96 @@ def self_test():
         "out=%r" % out_dup)
     extra_total += 4
 
+    # ── THE SIX-CELL REGISTRY SHAPE (2026-09-01) ─────────────────────────────
+    # Every arm here would pass over a shape that was silently unrecognized -- an
+    # unrecognized table contributes no rows, and "no rows" is indistinguishable from
+    # "no findings" in a count. So the first case pins the COUNT, and the rest pin
+    # that each predicate reads the cell the six-cell shape moved it to.
+    REG6 = ["| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |",
+            "|---|---|---|---|---|---|"]
+    s6 = scan_document(_doc(*(REG6 + [
+        "| `D-XX-SIXOPEN` | P1 | \U0001f7e0 OPEN | \U0001f7e0 **OPEN -- normal** | w | r |",
+        "| `D-XX-SIXSHUT` | P0 | ✅ CLOSED | ✅ **CLOSED 2026-09-01** | - | r |"])), REG_REL)
+    pin(sorted(n.split("#")[1] for n in s6.names) == ["D-XX-SIXOPEN", "D-XX-SIXSHUT"]
+        and sorted(n.split("#")[1] for n in s6.rows) == ["D-XX-SIXOPEN"]
+        and not [f for f in s6.findings if f[2] == "FATAL"],
+        "six-cell: the shape is RECOGNIZED and its verdict read -- an unrecognized "
+        "table would contribute zero rows and zero findings, which reads as clean",
+        "names=%r rows=%r" % (sorted(s6.names), sorted(s6.rows)))
+
+    # ★ THE ONE THAT MATTERS: the verdict comes from the STATUS COLUMN, and a
+    # disagreeing prose glyph does NOT decide it -- but it is REPORTED. Point
+    # `is_closed` at the prose cell instead and the first half of this flips.
+    s6b = scan_document(_doc(*(REG6 + [
+        "| `D-XX-SPLIT` | P2 | ✅ CLOSED | \U0001f7e0 **OPEN -- the prose disagrees** "
+        "| w | r |"])), REG_REL)
+    pin(not s6b.rows and list(s6b.split_verdict) == [REG_PREFIX + "#D-XX-SPLIT"],
+        "six-cell: the STATUS COLUMN is the verdict, and a contradicting Trigger glyph "
+        "is REPORTED rather than silently believed either way",
+        "rows=%r split=%r" % (sorted(s6b.rows), sorted(s6b.split_verdict)))
+    s6c = scan_document(_doc(*(REG6 + [
+        "| `D-XX-AGREE` | P2 | \U0001f7e0 OPEN | \U0001f7e0 **OPEN** | w | r |"])), REG_REL)
+    pin(not s6c.split_verdict,
+        "six-cell: the CONTROL -- agreeing cells report nothing, so the arm above is "
+        "not firing on every row")
+
+    # `is_gated` and the closing-work lead marker must follow the PROSE cell, three
+    # columns to the right of where they used to sit.
+    s6d = scan_document(_doc(*(REG6 + [
+        "| `D-XX-SIXGATE` | P2 | ⏳ GATED | \U0001f7e0 **OPEN -- TRIGGER-GATED: not "
+        "yet** | ⛔ opened by [[D-XX-SIXOPEN]] | r |",
+        "| `D-XX-SIXOPEN` | P2 | \U0001f7e0 OPEN | \U0001f7e0 **OPEN** | w | r |"])),
+        REG_REL)
+    pin(sorted(n.split("#")[1] for n in s6d.gated_rows) == ["D-XX-SIXGATE"]
+        and s6d.gated_rows[REG_PREFIX + "#D-XX-SIXGATE"][0] == "D-XX-SIXOPEN",
+        "six-cell: is_gated reads the TRIGGER prose and the opener the CLOSING cell, "
+        "both moved right by two columns",
+        "gated=%r" % {k: v[0] for k, v in s6d.gated_rows.items()})
+    extra_total += 4
+
+    # ── THE PARTITION ARM ────────────────────────────────────────────────────
+    def partition_probe(prod_rows, harn_rows, done_rows, with_archive=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            plans = os.path.join(tmp, PLANS_DIR)
+            os.makedirs(plans)
+            docs = [("_deferred-anchor-registry-production.md", prod_rows),
+                    ("_deferred-anchor-registry-harness.md", harn_rows)]
+            if with_archive:
+                docs.append(("_deferred-anchor-registry-done.md", done_rows))
+            for name, rows in docs:
+                with io.open(os.path.join(plans, name), "w", encoding="utf-8") as fh:
+                    fh.write(_doc(*(REG6 + rows)))
+            held, sys.stdout = sys.stdout, io.StringIO()
+            try:
+                ok = partition_report(tmp)
+                out = sys.stdout.getvalue()
+            finally:
+                sys.stdout = held
+        return ok, out
+
+    OPEN6 = "| `D-XX-%s` | P2 | \U0001f7e0 OPEN | \U0001f7e0 **OPEN** | w | r |"
+    SHUT6 = "| `D-XX-%s` | P2 | ✅ CLOSED | ✅ **CLOSED** | - | r |"
+    ok_p, out_p = partition_probe([OPEN6 % "A"], [OPEN6 % "B"], [SHUT6 % "C"])
+    pin(ok_p and not out_p.strip(),
+        "partition: a clean tree passes SILENTLY -- the control that proves the three "
+        "refusals below are not refusing everything", "out=%r" % out_p)
+    ok_c, out_c = partition_probe([OPEN6 % "A", SHUT6 % "STUCK"], [OPEN6 % "B"],
+                                  [SHUT6 % "C"])
+    pin(not ok_c and "D-XX-STUCK" in out_c and "CLOSED row in" in out_c,
+        "partition: a CLOSED row left in a working registry is REFUSED and NAMED",
+        "out=%r" % out_c[:200])
+    ok_o, out_o = partition_probe([OPEN6 % "A"], [OPEN6 % "B"],
+                                  [SHUT6 % "C", OPEN6 % "HIDDEN"])
+    pin(not ok_o and "D-XX-HIDDEN" in out_o and "OPEN row in" in out_o,
+        "partition: an OPEN row in the ARCHIVE is REFUSED -- the direction no queue in "
+        "this project can see", "out=%r" % out_o[:200])
+    ok_n, out_n = partition_probe([OPEN6 % "A"], [OPEN6 % "B"], [], with_archive=False)
+    pin(not ok_n and "no archive registry" in out_n,
+        "partition: with NO archive present the arm FAILS CLOSED -- otherwise every "
+        "closed row is 'correctly filed' and the discipline is unmeasured",
+        "out=%r" % out_n[:160])
+    extra_total += 4
+
     failed += extra_failed[0]
     print("self-test: %d case(s), %d failed" % (len(cases) + extra_total, failed))
     return 1 if failed else 0
@@ -2248,6 +2524,12 @@ def main():
     bucket_split_ok = True
     if args.per_bucket:
         bucket_split_ok = per_bucket_report(root, len(a_reg))
+
+    # == ARM 6: THE REGISTRY PARTITION (operator ruling 2026-09-01) ============
+    # ⚠ UNCONDITIONAL, unlike the per-bucket REPORT above. That one answers a
+    # question ("how does the open population split?") and is asked for with a flag;
+    # this one is a REFUSAL, and a refusal behind a flag is a refusal nobody runs.
+    partition_ok = partition_report(root)
 
     # == ARM 2: A ROW WHOSE OPENING VERDICT CONTRADICTS ITS OWN MARKER =========
     # star A DIFFERENTIAL, NOT A HAND-KEPT INVENTORY, and the reason is the one
@@ -2471,6 +2753,34 @@ def main():
               "registry total.")
         print("  A row counted in two buckets, or a bucket this scan never read, makes "
               "every per-bucket figure a guess. Fix the registry, never this sum.")
+        return 1
+
+    if not partition_ok:
+        return 1
+
+    # == ARM 6: THE STATUS COLUMN AND THE TRIGGER PROSE MUST AGREE ============
+    # ⚠⚠ A DAY-ONE REFUSAL over the WHOLE population, not a differential, and the
+    # asymmetry with arms 2-5 is the point. Those inherited debt nobody in the cycle
+    # created; this one cannot inherit any, because the `Priority`/`Status` columns
+    # were seeded on 2026-09-01 FROM `is_closed` itself over all 2,078 rows -- so a
+    # disagreement is necessarily something a later edit introduced. And it is the
+    # one defect the six-cell shape makes possible: two cells now state the verdict,
+    # the gate believes the column, and every human reads the prose. Neither notices.
+    if after.split_verdict:
+        print()
+        print("anchor-balance: FAIL - %d row(s) whose `Status` column contradicts the "
+              "verdict leading their `Trigger` prose:" % len(after.split_verdict))
+        for k in sorted(after.split_verdict):
+            col, prose = after.split_verdict[k]
+            print("  ! %s\n      Status column: %s\n      Trigger prose: %s"
+                  % (k, col, prose))
+        print("  Decide which is TRUE, then make both say it. Set the column with")
+        print("      python scripts/anchors/anchors.py set --<registry> <anchor> "
+              "--status open|gated|closed --apply")
+        print("  which rewrites the column and MOVES the row if the verdict changed;")
+        print("  reword the prose only if the prose is the half that is wrong. Do NOT")
+        print("  silence this by reading one cell -- the whole reason the column exists")
+        print("  is that a verdict buried in prose was read differently by every tool.")
         return 1
 
     net_new = bal.net_new

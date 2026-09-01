@@ -1,0 +1,19 @@
+{
+  "$comment": "D-CSUBSET-POINTEE-CONST-ENFORCEMENT (negative / diagnostic): writing through a const lvalue is a C 6.5.16.1 constraint violation, and before P48 DSS enforced it for a PLAIN IDENTIFIER LHS only. PART ONE (lane sm) — a deref of a pointer-to-const, an element of a const array, a member of a const object and a double-indirect write all compiled in SILENCE. PART TWO (lane cq) — so did every write to a field DECLARED const, and for a different reason: c's `structField` / `unionField` declaration rows carried `volatileMarker` alone, so a member's own `const` was scanned by nothing and no field symbol was ever marked const. Adding `constMarker` + `restrictMarker` to those two rows closed it with NO change to the const-lvalue walk, which had been asking the right question all along. MEASURED 2026-09-01, each reference probed SEPARATELY at -O0 AND -O2, one self-contained translation unit per shape: gcc 13.3.0 ('assignment of read-only location' / 'assignment of read-only member'), clang 18.1.3 ('read-only variable is not assignable' / 'cannot assign to non-static data member with const-qualified type'), mingw-w64 gcc 13.2.0 and MSVC 19.51.36252 ('l-value specifies const object') ALL REJECT every one of the eleven shapes below — a UNANIMOUS refusal, so the diagnostic is REQUIRED and Error is the references' own severity rather than a choice. The eleven expected reports sit at several different qualifier-spine levels and reach the answer by four different routes (the base object's spine, a field symbol's own isConst, a field symbol's own spine, and the C 6.5.2.3 object-qualifier step). The file also carries the POLARITY CONTROLS in the same translation unit — a mutable-pointer-to-const walk (`r++`, the c36 shape), four non-const writes through the identical syntax, and three non-const FIELD writes including a `const int *` member and an `int *restrict` member (the sqlite `const char *zName;` shape, whose POINTER is legally assignable in all four references) — and because the expectation is EXACT SET EQUALITY, a check that fired on every deref/subscript/member, or a marker that answered const for every member, would red this entry instead of passing it. NOT PINNED HERE, AND NOT A GAP: a member that is BOTH declared const AND a BIT-FIELD, the one shape on which the references SPLIT (gcc and mingw-w64 gcc warn and COMPILE; clang and MSVC refuse) — DSS warns and builds, a verdict this manifest cannot express because expectDiagnostics carries a code and a position but no severity, so it has its own RUNNABLE entry `examples/c/const_bitfield_write_warns`. RED-ON-DISABLE: revert `constQualifiedLvalue` and its SE4 call in semantic_analyzer.cpp -> the four PART ONE writes are silently accepted; delete `constMarker` from the `structField` / `unionField` rows of c.lang.json -> the seven PART TWO writes are silently accepted. Either way the produced set shrinks and the set equality fails.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:elf64-x86_64-linux-exec" } ],
+  "expectDiagnostics": [
+    { "code": "S_ConstViolation", "line": 81,  "col": 45 },
+    { "code": "S_ConstViolation", "line": 83,  "col": 42 },
+    { "code": "S_ConstViolation", "line": 85,  "col": 56 },
+    { "code": "S_ConstViolation", "line": 87,  "col": 59 },
+    { "code": "S_ConstViolation", "line": 90,  "col": 48 },
+    { "code": "S_ConstViolation", "line": 92,  "col": 53 },
+    { "code": "S_ConstViolation", "line": 94,  "col": 47 },
+    { "code": "S_ConstViolation", "line": 96,  "col": 50 },
+    { "code": "S_ConstViolation", "line": 98,  "col": 60 },
+    { "code": "S_ConstViolation", "line": 100, "col": 53 },
+    { "code": "S_ConstViolation", "line": 102, "col": 49 }
+  ]
+}

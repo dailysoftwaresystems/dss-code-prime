@@ -2012,6 +2012,61 @@ enum class DiagnosticCode : std::uint16_t {
     // lvalue IS addressable and passes the shape guard this code reports on.
     S_AssignNeedsModifiableLvalue = 0xE072,
 
+    // P48 (D-CSUBSET-TERNARY-ARRAY-ARM-INCOMPATIBLE): the second and third
+    // operands of a conditional satisfy NONE of the C 6.5.15p3 pairings —
+    // specifically, one arm is a pointer (or an array/function designator that
+    // decays to one) and the other is an INTEGER that is not a null pointer
+    // constant. `cond ? "%s" : 1`, `cond ? p : n`.
+    //
+    // ★★ IT IS A WARNING, AND THAT SEVERITY IS MEASURED RATHER THAN CHOSEN.
+    // ✔MEASURED 2026-09-01, each reference probed SEPARATELY at -O0 AND -O2 on
+    // `void f(int c) { (void)(c ? "%s" : 1); }`: gcc 13.3.0 (`-std=c2x`) and
+    // mingw-w64 gcc 13.2.0 say *"pointer/integer type mismatch in conditional
+    // expression"*, clang 18.1.3 (`-std=c23`) says the same under
+    // `-Wconditional-type-mismatch`, and MSVC 19.51.36252 (`/std:c17`) says
+    // `C4047: ':': 'char [3]' differs in levels of indirection from 'int'`.
+    // ALL FOUR compile it (rc=0) — so under `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C`
+    // an ERROR here would REFUSE a program every reference accepts, which is a
+    // conformance regression rather than a fix. The strict posture stays
+    // reachable through `--warnings-as-errors`, exactly as it does for gcc's
+    // `-Werror` / `-pedantic-errors`.
+    //
+    // ⓘ The pairings C 6.5.15p3 DOES admit are handled elsewhere and stay
+    // silent: two arithmetic arms, two compatible pointers, pointer-and-null-
+    // pointer-constant (`S_` never fires — `D-CSUBSET-TERNARY-NULL-STRING-LITERAL`
+    // types those), and object-pointer-and-`void*`.
+    S_ConditionalOperandTypeMismatch = 0xE073,
+
+    // P48 (D-CSUBSET-POINTER-DIFF-EDGE-CASES part 2): `p - q` where both operands
+    // are pointers (or arrays that decay to pointers) whose POINTEE types are not
+    // compatible — `char *a; int *b; a - b`. A C 6.5.6p3 constraint violation.
+    //
+    // ★★ ALSO A WARNING, AND FOR THE OPPOSITE REASON TO THE ROW THAT ASKED FOR
+    // IT. The row's stated closing work was *"emit a loud diagnostic at the
+    // binary node"*. ✔MEASURED 2026-09-01, each reference probed SEPARATELY at
+    // -O0 AND -O2: gcc 13.3.0 (*"invalid operands to binary - (have 'char *' and
+    // 'int *')"*), clang 18.1.3 (*"'char *' and 'int *' are not pointers to
+    // compatible types"*) and mingw-w64 gcc 13.2.0 all REJECT it — but **MSVC
+    // 19.51.36252 COMPILES it** (rc=0) with `C4133: '-': incompatible types -
+    // from 'int *' to 'char *'`. The disjunction settles accept-vs-refuse and the
+    // accepting reference wins, so a hard error would put DSS BELOW the union.
+    //
+    // ★★★ AND THE MESSAGE'S OWN WORDING TOLD US THE MEANING. C4133 says
+    // *"from 'int *' TO 'char *'"* — MSVC converts the RIGHT operand to the
+    // LEFT's type and then performs an ordinary same-type difference, so the
+    // stride is `sizeof(*LEFT)`. ✔MEASURED from MSVC's own `/FAs` listing at /O2:
+    // `char* - int*` emits a bare `sub` (stride 1); `int* - char*` emits
+    // `sub; sar 2` (stride 4); `double* - char*` emits `sub; sar 3` (stride 8).
+    // DSS therefore types the result as the language's pointer-difference type
+    // and divides by the LEFT pointee's stride — matching the only reference that
+    // accepts the construct, instead of the raw unscaled byte count it used to
+    // produce for one operand order and refuse for the other.
+    //
+    // ⓘ `int* - unsigned int*` is NOT diagnosed by MSVC at all and IS rejected by
+    // gcc/clang; DSS warns, because the pointees are genuinely incompatible and
+    // the warning costs nothing an accepting compiler does not already pay.
+    S_PointerDifferenceIncompatiblePointee = 0xE074,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

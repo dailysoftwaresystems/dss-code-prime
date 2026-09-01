@@ -1132,6 +1132,29 @@ indexResultType(TypeInterner const& interner, TypeId base) noexcept {
     return InvalidType;
 }
 
+// C 6.3.2.1p3 ARRAY-TO-POINTER DECAY, as a lattice law: an `Array<T,N>` in a
+// value context is `Ptr<T>`; anything else passes through UNCHANGED. It is the
+// one place that law is spelled, so every consumer that must ask "what pointer
+// does this operand contribute" — the conditional's arm pairing, the pointer
+// SUBTRACTION arm, and the P48 pointer/integer and incompatible-pointee
+// diagnostics — asks the SAME question. A degenerate elementless Array is
+// returned unchanged rather than turned into a pointer to nothing.
+//
+// ⚠ IT IS NOT A UNIVERSAL REWRITE, AND THE EXCEPTIONS ARE WHY IT IS A CALLED
+// HELPER RATHER THAN SOMETHING THE TYPER APPLIES EVERYWHERE. `sizeof`,
+// `_Alignof` and unary `&` are the C 6.3.2.1p3 decay EXCEPTIONS — an operand
+// there keeps its array type — so only the sites that genuinely place the
+// operand in a value context call this.
+// ⚠ The interner is taken by NON-const reference because forming `Ptr<T>` INTERNS
+// a type — the decay is a lattice CONSTRUCTION, not a query, which is why it
+// cannot sit beside the `const&` `derefResultType`/`indexResultType` laws.
+[[nodiscard]] inline TypeId
+arrayToPointerDecay(TypeInterner& interner, TypeId t) noexcept {
+    if (!t.valid() || interner.kind(t) != TypeKind::Array) return t;
+    auto const elems = interner.operands(t);
+    return elems.empty() ? t : interner.pointer(elems[0]);
+}
+
 // ── FC3 c1: config-driven usual arithmetic conversions (C 6.3.1.8) ──────
 //
 // The `arithmeticConversions` SemanticConfig block, RESOLVED for the

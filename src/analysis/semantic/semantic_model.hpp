@@ -180,6 +180,35 @@ struct DSS_EXPORT SymbolRecord {
     // found in the type subtree. A reassignment of a const symbol emits
     // S_ConstViolation.
     bool            isConst = false;
+    // ★★ P48 (D-CSUBSET-POINTEE-CONST-ENFORCEMENT): `isConst` above answers ONE
+    // question — is the declared OBJECT const — and that is why const enforcement
+    // stopped at a plain-identifier assignment LHS. Writing through a const
+    // POINTEE (`const char *p; *p = 'x';`), into a const MEMBER, or into an
+    // element of a const array all need the qualifier at a DEEPER derivation
+    // level, and this carries the whole spine: bit i == level i is const, level 0
+    // being the object itself and level i+1 what level i points to or contains.
+    //
+    // ★★★ IT IS A `QualifierSpine` AND NOT A `QualBit::Const` IN THE INTERNER,
+    // AND THAT IS THE ARCHITECTURE'S OWN ANSWER RATHER THAN A SHORTCUT. The row
+    // that asked for this named *"a transparent `ConstQual` mirroring c27's
+    // `VolatileQual`"* and called the choice a §B type-system decision. That fork
+    // has since been decided the other way and written down where the data lives
+    // — `declared_qualification.hpp` and `c.lang.json`'s `$p44RestrictMarkerComment`
+    // both state that `const` is deliberately NOT interned because *"interning it
+    // would perturb every type comparison in the compiler to serve one rule"*.
+    // `volatile` and `_Atomic` ARE interned because they change access codegen;
+    // `const` and `restrict` do not, and they ride this side channel instead.
+    //
+    // ⚠ ABSENT IS NOT UNQUALIFIED (the rule this header's producer states): a
+    // `nullopt` spine means the declarator shape was not modelled, and the
+    // const-lvalue check then makes NO claim about the deeper levels rather than
+    // inventing "unqualified". A missed diagnostic is the safe direction; a
+    // fabricated one refuses correct code.
+    //
+    // ⓘ Level 0 is deliberately NOT read by the const-lvalue check — `isConst`
+    // above stays the sole answer there, so every verdict that existed before P48
+    // is produced by exactly the code that produced it before.
+    std::optional<QualifierSpine> qualSpine;
     // c27 (D-CSUBSET-VOLATILE-POINTEE) RETIRED the c21 `isVolatile` bool: volatile
     // is now a TYPE qualifier (TypeKind::VolatileQual), so OBJECT-volatility is
     // read directly off a symbol's resolved `type` (top-level VolatileQual) at

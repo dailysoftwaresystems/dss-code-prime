@@ -1,0 +1,11 @@
+{
+  "$comment": "C11/C23 6.7.5 + 6.7.6.2 (D-CSUBSET-VLA): a VLA whose ELEMENT type is over-aligned (a member `alignas(32)` raises the struct to 32) exceeds the 16-byte stack alignment the dynamic `sub sp` guarantees, so `lowerVlaAlloca` fails loud with L_OverAlignedStackLocal rather than silently under-align every element. This is the REMAINING half of that diagnostic's class, and the refusal is owned by D-CSUBSET-VLA, which is OPEN and names it. The FIXED-size over-aligned local WAS refused too until D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL closed on 2026-09-01; it is honoured now (see examples/c/alignas_local_over32), so that row blocks nothing and is named here only as the landing this example was split out of. A VLA takes the post-`sub sp` stack pointer as its base and never visits the frame-slot headroom path, so honouring it is a change to the dynamic-stack lowering. This example REPLACES the pre-close `alignas_local_overaligned_error`, whose subject (`alignas(32) int loc;`) now compiles and runs. The diagnostic is raised at the MIR->LIR tier, which carries NO source span/buffer, so the CLI renders it CODE-ONLY (`error[L_OverAlignedStackLocal]`) with no `:line:col` — hence `positioned:false`: the in-process runner matches the CODE (position-independent) and the CLI/integrated harness greps for `error[L_OverAlignedStackLocal]`. The load-bearing pin is the CODE + a rejected compile (EXACT diagnostic-set equality). Red-on-disable: drop the `elemAlign > stackAlign` gate in `lowerVlaAlloca` and this compiles instead of erroring, so the runner no longer finds L_OverAlignedStackLocal.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "L_OverAlignedStackLocal", "line": 1, "col": 1, "positioned": false }
+  ]
+}

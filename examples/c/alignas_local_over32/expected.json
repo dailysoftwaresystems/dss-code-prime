@@ -1,0 +1,33 @@
+{
+  "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL): an `alignas(32)` stack local — an alignment ABOVE the 16-byte stack alignment every shipped ABI guarantees, so no compile-time frame offset can deliver it. The frame reserves `align - stackAlignment` headroom above the slot and the address is rounded up at each materialization. THREE runtime checks, each with its own failure mode. (1) `&buf[0] & 31 == 0` — the rounding happened at all. (2) `&buf[3] & 31 == 12` — a constant Gep displacement is added AFTER the rounding, never inside it: folding it inside yields a 32-aligned address instead, and the low bits of a frame address are not compile-time foldable. ⚠ WHICH LOWERING PATH CARRIES THAT DISPLACEMENT IS MEASURED, NOT ASSUMED, and it differs by config: the `lea_frame_slot` displacement FOLD is reached for this shape only under the RELEASE pipeline (the baseline lowers the Gep through the general address path), on both x86_64 and arm64 — so the release arm pins the fold ordering, the baseline arm pins the general path, and that is why this example carries both rather than one. A shape whose fold is reached in BOTH configs is `alignas_member_over32_local`'s `&s.field`. (3) a local declared AFTER the over-aligned one is read back intact — the headroom did not overrun the next slot. `pad` ahead of the local makes its running offset nonzero, and `sink9`'s 9 args overflow the stack ODDLY on every ABI, so the raw local base is 8 mod 16. exit = 42. Red-on-disable: zero `frameSlotAlignHeadroom` or drop the `emitAlignUpToPowerOfTwo` call in `emitLeaFrameSlot` and this returns 1. One exit code across all four targets incl. the shipped release pipeline. Before this row closed DSS REFUSED the program with L_OverAlignedStackLocal; gcc 13.3, clang 18.1.3, mingw-w64 gcc 13.2 and MSVC 19.51 all accept it.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

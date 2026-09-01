@@ -221,22 +221,51 @@ Where the width genuinely denotes the anonymous representative (`int`,
 `unsigned`, `short`, `BOOL`, `WORD`, `mode_t`, …) the type stays **untagged** —
 tagging it would be the same lie in the other direction.
 
-When the correct NAME is **data-model-dependent** — C's `size_t` IS
-`unsigned long` on LP64 and `unsigned long long` on LLP64, `ptrdiff_t` IS `long`
-/ `long long`, and every `<stdint.h>` 64-bit alias follows — a fixed tag cannot
-express it. `when` therefore carries a third selector axis alongside
-`arch`/`format`:
+When the correct NAME varies per target, a fixed tag cannot express it, so `when`
+carries a `dataModel` axis alongside `arch`/`format`. **⚠ AND THE DATA MODEL
+ALONE IS NOT ENOUGH — NAME BOTH AXES.**
+(`D-FFI-DESCRIPTOR-TYPE-ALIAS-SPELLING-KEYED-ON-DATA-MODEL-ALONE`, P48.) This
+section used to say the answer was data-model-dependent and stop there —
+*"`size_t` IS `unsigned long` on LP64 and `unsigned long long` on LLP64"* — and
+every shipped alias was keyed that way. That is a **two-world assumption and
+there is a third world**: ✔MEASURED 2026-09-01 on macOS 26.6.2 / MacOSX26.5.sdk
+with Apple clang 21 on both arches, **Darwin is LP64 and its `uint64_t` is
+`unsigned long long` while its `size_t` stays `unsigned long`** — so the aliases
+one `dataModel` key held together SPLIT, and Darwin recorded a false ABI
+spelling for six of them. Every alias is 8 bytes on every platform, so nothing
+miscompiled by size; what was wrong was IDENTITY, which only `_Generic` and
+pointer compatibility can see.
 
 ```jsonc
 { "name": "size_t", "variants": [
-    { "when": { "dataModel": "LP64" },  "type": "u64 \"unsigned long\"" },
-    { "when": { "dataModel": "LLP64" }, "type": "u64 \"unsigned long long\"" } ] }
+    { "when": { "dataModel": "LP64",  "format": "elf"   }, "type": "u64 \"unsigned long\"" },
+    { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "u64 \"unsigned long\"" },
+    { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "u64 \"unsigned long long\"" } ] }
+
+{ "name": "uint64_t", "variants": [
+    { "when": { "dataModel": "LP64",  "format": "elf"   }, "type": "u64 \"unsigned long\"" },
+    { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "u64 \"unsigned long long\"" },  // ← the split
+    { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "u64 \"unsigned long long\"" } ] }
 ```
+
+**Both conjuncts are load-bearing, in opposite directions.** `format` is DSS's
+per-OS axis (the object format IS the per-OS artifact — `core/types/data_model.hpp`),
+and it is what lets Darwin differ from Linux at the same data model. `dataModel`
+stays because dropping it would let a future ILP32 elf target match the `elf` arm
+and silently bind an 8-byte `unsigned long` where the platform's is 4. **Enumerate
+the platforms you MEASURED and no others**: an unlisted (model, format) pair
+matches 0 variants, the alias is not injected, and a reference to it fails LOUD as
+an undefined type — which is exactly how `D-FFI-STDINT-PTR-WIDTH-ILP32` stays a
+deferral instead of a silent wrong width. Never write a catch-all arm to make an
+unmeasured platform "just work".
 
 The contract is the same MATCH-ALL-SPECIFIED / exactly-one-match rule the other
 axes use, and the value is validated against the closed data-model vocabulary
 (`LP64`/`LLP64`/`ILP32`) so a typo **fails loud** instead of silently never
-matching. Keys compose: `{ "format": "macho", "dataModel": "LP64" }`.
+matching. ⚠ Because the match must be EXACTLY ONE, adding an arm that OVERLAPS an
+existing one is refused (`F_ShippedTypedefVariantAmbiguous`) rather than
+defaulted — so a `{dataModel}`-only arm cannot coexist with a
+`{dataModel,format}` one for the same target.
 
 ### Two ENFORCED rules — `F_ShippedTypeIdentityConflict`
 
@@ -264,6 +293,13 @@ sweep over every descriptor × every shipped target):
    as I32, so that pair matches no `_Generic` association and no pointer of that
    spelling. Give the entry per-format / per-`dataModel` `variants` instead (as
    `off_t` and `ssize_t` do).
+   ⚠ **One shared data model is NECESSARY and NOT SUFFICIENT**
+   (`D-FFI-DESCRIPTOR-TYPE-ALIAS-SPELLING-KEYED-ON-DATA-MODEL-ALONE`, P48). elf
+   and macho are BOTH LP64 and still spell `uint64_t` differently, so a flat tag
+   on an elf+macho descriptor can be a phantom on one of them at identical width
+   — which `sizeof` cannot see and only `_Generic` or a pointer assignment can.
+   The rule to apply is the one above it: enumerate `{dataModel,format}` arms for
+   the platforms you measured, and let an unmeasured one match nothing.
 
 ---
 

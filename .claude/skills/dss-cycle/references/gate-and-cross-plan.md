@@ -299,8 +299,14 @@ Keep the plans honest in the **same commit** as the code:
 - Update plan 00 §0 status table + §0.1 stepper row (flip status, update ctest count).
 - Update the owning sub-plan: flip the §0 status row AND stamp the §3.1 deferred-items row
   (status flip in §0; `✅ CLOSED` stamp in §3.1 — update both, not one).
-- In `_deferred-anchor-registry*.md`: mark closed anchors `✅ CLOSED <date>` with the commit;
-  **never delete a row** (the audit trail is load-bearing); add new anchors.
+- In the registry: **close a row by MOVING it**, never by editing a status in place —
+  `bash scripts/anchors/set-anchor.sh <ANCHOR> --status closed --closing '...' --apply` stamps the
+  `Status` column and lifts the row out of its working registry into
+  `_deferred-anchor-registry-done.md`. Add new anchors with `write-anchor.sh ... --insert --apply`.
+  **The row is never DELETED** — the audit trail is load-bearing, which is exactly why the archive
+  exists rather than a deletion (operator, 2026-09-01). ⚠ Hand-editing a table is refused by
+  `check-anchor-balance`'s partition arm; a hand-typed row can also wrap the anchor id, which does
+  not fail — it disappears from every grep and mints a false id at the same time.
 - Record the cycle in the running cycle-log (memory entry per the established convention).
 - Update the `dss-code-prime` skill if a convention changed.
 - **★★★ Update the HANDOFF (below). MANDATORY — the cycle does not reach Step 9 without it.**

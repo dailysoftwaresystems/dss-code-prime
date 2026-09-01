@@ -752,6 +752,41 @@ struct Lowerer {
     std::unordered_map<std::uint32_t, std::uint32_t> allocaSlotIndex_;
     std::uint32_t                   allocaLirCount_ = 0;
 
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the EFFECTIVE alignment of each
+    // reserved frame slot, indexed by the SAME 0-based scan-order index
+    // `allocaLirCount_` hands out — one entry pushed at every reservation site, so
+    // `allocaSlotAlign_.size() == allocaLirCount_` always holds. `0` = no explicit
+    // override (the overwhelming majority; a compiler-internal home such as an x87
+    // scratch slot always records 0). Read at `emitLeaFrameSlot` to decide whether a
+    // slot's address needs the RUNTIME align-up: a slot whose alignment EXCEEDS the
+    // cc's stack alignment cannot be placed at a statically-aligned frame offset
+    // (post-prologue SP is only congruent to 0 modulo `stackAlignment`), so its
+    // address is rounded up at each materialization inside the headroom
+    // `lir_callconv` reserves above it. Reset per function alongside the counter.
+    std::vector<std::uint32_t>      allocaSlotAlign_;
+    // Per-function record of the above, keyed by MIR function index — the source
+    // the post-lowering harvest CROSS-CHECKS its own frozen-LIR walk against. The
+    // two must agree element-for-element: the harvest decides how much headroom the
+    // frame reserves, this vector decides which addresses get rounded up, and a
+    // scan-order skew between them would round up an address the frame never
+    // reserved room for (a silent overrun of the neighbouring slot).
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>
+                                    allocaSlotAlignByFunc_;
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: for the SEH
+    // filter funclet currently being lowered, the MIR function whose frame its
+    // `RecoverParentFrameSlot` ops read. Set per function from the scope records
+    // (`MirSehScope` carries both symbols), empty for every ordinary function.
+    //
+    // ★ WHY A FUNCLET NEEDS THIS AT ALL. It addresses a parent local off the
+    // ESTABLISHER frame — the parent's post-prologue SP at fault time — at the
+    // parent's own slot offset. When that local is OVER-ALIGNED the parent does not
+    // use the raw slot address either: it rounds it up. The funclet must apply the
+    // IDENTICAL rounding to the identical base, or the two disagree about where the
+    // local is, which is a silent miscompile in the one direction that used to be
+    // impossible only because the whole construct was refused.
+    std::optional<MirFuncId>        currentFuncletParent_;
+    std::unordered_map<std::uint32_t, MirFuncId> funcletParentByFuncSymbol_;
+
     // ── inline-asm P5 state ───────────────────────────────────────────────
     //
     // The dialect grammar the ACTIVE TARGET names in `defaultAssemblyLanguage`,
@@ -5073,6 +5108,65 @@ struct Lowerer {
 
     // ── memory ops (cycle 3c) ────────────────────────────────────────
 
+    // ── THE SHARED RUNTIME ALIGN-UP PRIMITIVE ────────────────────────────────
+    //
+    // `alignUp(value, alignBytes)` = `(value + (alignBytes-1)) & ~(alignBytes-1)`,
+    // emitted as ordinary width-64 LIR over VIRTUAL registers, returning the fresh
+    // vreg holding the rounded result (`value` itself when `alignBytes` is 0 or 1 —
+    // no instruction at all). Two callers, and they are the only two places a value
+    // the stack layout cannot round at compile time has to be rounded at run time:
+    // the VLA byte count (D-CSUBSET-VLA), and the address of a frame slot whose
+    // alignment exceeds what a static frame offset can promise
+    // (D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL).
+    //
+    // ★ AGNOSTIC BY CONSTRUCTION, and this is the whole reason the over-aligned-local
+    // case needs no target-shaped machinery. The mask is a NEGATIVE constant
+    // materialized into a register and consumed by a REG-REG `and` — the single form
+    // both shipped ISAs share (x86_64 also declares an AND-imm32; AArch64's logical
+    // immediates are a different encoding entirely, so a reg-imm spelling would be
+    // one ISA's shape imposed on the other). `emitBareConstToFresh` owns the
+    // per-target materialization (x86 sign-extending mov-imm32, arm64 MOVZ/MOVK).
+    // Everything downstream — 2-address legalization, register allocation,
+    // peepholes — sees three unremarkable arithmetic instructions on vregs.
+    //
+    // nullopt (with the fail-loud already reported, naming `context`) when the target
+    // declares no `add`/`and` or the constant cannot be materialized. NEVER a
+    // silently un-rounded value: an under-aligned address that still runs is the
+    // miscompile both callers exist to prevent.
+    [[nodiscard]] std::optional<LirReg>
+    emitAlignUpToPowerOfTwo(LirReg value, std::uint32_t alignBytes,
+                            std::string_view context) {
+        if (alignBytes <= 1) return value;
+        auto const addOp = opcode(MnemonicSlot::Add);
+        if (!addOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::Add, context);
+            return std::nullopt;
+        }
+        auto const andOp = opcode(MnemonicSlot::And);
+        if (!andOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::And, context);
+            return std::nullopt;
+        }
+        LirReg const biased = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 2> ops{
+                LirOperand::makeReg(value),
+                LirOperand::makeImmInt32(
+                    static_cast<std::int32_t>(alignBytes) - 1)};
+            emitInst(*addOp, biased, ops, /*payload=*/0, /*flags=*/0);  // width 64
+        }
+        std::optional<LirReg> const mask =
+            emitBareConstToFresh(-static_cast<std::int64_t>(alignBytes));
+        if (!mask.has_value()) return std::nullopt;
+        LirReg const rounded = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 2> ops{
+                LirOperand::makeReg(biased), LirOperand::makeReg(*mask)};
+            emitInst(*andOp, rounded, ops, /*payload=*/0, /*flags=*/0);  // width 64
+        }
+        return rounded;
+    }
+
     // VLA C1b (D-CSUBSET-VLA): lower a runtime-sized `Alloca` (a variable-length
     // array `int a[n]`) to the LEAF dynamic-stack sequence. The MIR Alloca's
     // operand[0] is the total runtime BYTE size (an i64 `Mul(count, stride)`, C1a);
@@ -5127,28 +5221,15 @@ struct Lowerer {
         }
         std::optional<LirReg> const sizeRaw = regForValue(mir.instOperands(id)[0]);
         if (!sizeRaw.has_value()) { poisonValue(id); return; }
-        // alignUp(size, A) = (size + (A-1)) & ~(A-1), all width-64 (byte counts). The
-        // `& ~(A-1)` mask is a wide NEGATIVE constant materialized into a register (a
-        // reg-reg `and` — the single AArch64/x86 form both targets share; a bitmask-
-        // immediate AND is not portable, and the const materialization is arch-correct
-        // via emitBareConstToFresh: x86 sign-extending mov-imm32, arm64 MOVZ/MOVK).
-        std::int64_t const addend = static_cast<std::int64_t>(stackAlign) - 1;
-        LirReg const t0 = lir.newVReg(LirRegClass::GPR);
-        {
-            std::array<LirOperand, 2> ops{
-                LirOperand::makeReg(*sizeRaw),
-                LirOperand::makeImmInt32(static_cast<std::int32_t>(addend))};
-            emitInst(*addOp, t0, ops, /*payload=*/0, /*flags=*/0);  // width 64
-        }
-        std::optional<LirReg> const mask =
-            emitBareConstToFresh(-static_cast<std::int64_t>(stackAlign));
-        if (!mask.has_value()) { poisonValue(id); return; }
-        LirReg const size16 = lir.newVReg(LirRegClass::GPR);
-        {
-            std::array<LirOperand, 2> ops{
-                LirOperand::makeReg(t0), LirOperand::makeReg(*mask)};
-            emitInst(*andOp, size16, ops, /*payload=*/0, /*flags=*/0);  // width 64
-        }
+        // alignUp(size, A) = (size + (A-1)) & ~(A-1), all width-64 (byte counts) —
+        // now the SHARED `emitAlignUpToPowerOfTwo` primitive, which this sequence
+        // used to spell inline. Its docblock carries the agnosticism argument for
+        // the reg-reg `and` + materialized negative mask.
+        std::optional<LirReg> const size16Opt =
+            emitAlignUpToPowerOfTwo(*sizeRaw, stackAlign,
+                                    "a variable-length array's runtime byte size");
+        if (!size16Opt.has_value()) { poisonValue(id); return; }
+        LirReg const size16 = *size16Opt;
         // `sub sp, size16`: descend the stack. operand0 = the physical SP (the r/m
         // destination+source1 on x86, the baked Rd=Rn=sp on arm64), operand1 = the
         // aligned byte count. result:none (SP mutates in place). A physical-reg
@@ -5245,6 +5326,10 @@ struct Lowerer {
         // `allocaLirCount_` post-increments: the index recorded is the 0-based
         // position of this `alloca` op among the function's alloca ops, == the
         // index lir_callconv's scan assigns its offset under.
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: record THIS slot's effective
+        // alignment under the same index. MUST be pushed before the early-return-free
+        // tail below so `allocaSlotAlign_.size()` tracks `allocaLirCount_` exactly.
+        allocaSlotAlign_.push_back(mir.instPayload2(id));
         if (opcode(MnemonicSlot::LeaFrameSlot).has_value()) {
             allocaSlotIndex_.emplace(id.v, allocaLirCount_);
         } else {
@@ -5254,9 +5339,46 @@ struct Lowerer {
             // without the pressure relief (no shipped target hits this: both x86_64
             // and arm64 declare lea_frame_slot; a register-machine schema with
             // `alloca` but no `lea_frame_slot` is a config that predates c69).
-            defineValue(id, result);
+            // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: this single-vreg model
+            // needs the SAME runtime rounding the remat path applies — the address
+            // is bound ONCE here, so rounding it here rounds every use of it.
+            std::uint32_t const rtAlign =
+                (mir.instPayload2(id) > ccStackAlignment()) ? mir.instPayload2(id)
+                                                            : 0u;
+            std::optional<LirReg> const bound =
+                (rtAlign != 0)
+                    ? emitAlignUpToPowerOfTwo(
+                          result, rtAlign,
+                          "an over-aligned local's frame address")
+                    : std::optional<LirReg>{result};
+            if (bound.has_value()) defineValue(id, *bound);
+            else                   poisonValue(id);
         }
         ++allocaLirCount_;
+    }
+
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the cc's stack alignment — the
+    // bound a STATIC frame offset can promise, because the post-prologue stack
+    // pointer is congruent to 0 modulo exactly this and nothing finer. cc index 0
+    // is the canonical source at MIR→LIR (pre-abi-resolution): the stack alignment
+    // is TARGET-uniform, which is the same reason `lowerVlaAlloca` reads it there.
+    // The 16 fallback covers only a schema that declares no stack alignment at all.
+    [[nodiscard]] std::uint32_t ccStackAlignment() const {
+        auto const* cc = target.callingConvention(0);
+        return (cc != nullptr && cc->stackAlignment > 0)
+            ? static_cast<std::uint32_t>(cc->stackAlignment) : 16u;
+    }
+
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the alignment slot `slotIndex`'s
+    // ADDRESS must be rounded up to at run time, or 0 when the static frame offset
+    // already carries it (every slot on every shipped corpus today). An unknown
+    // index answers 0 — a compiler-internal home reserved through a path that
+    // recorded nothing is never over-aligned, and answering "no rounding" for it
+    // reproduces the pre-existing behaviour exactly.
+    [[nodiscard]] std::uint32_t runtimeAlignForSlot(std::uint32_t slotIndex) const {
+        if (slotIndex >= allocaSlotAlign_.size()) return 0u;
+        std::uint32_t const a = allocaSlotAlign_[slotIndex];
+        return (a > ccStackAlignment()) ? a : 0u;
     }
 
     // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): emit a fresh `lea_frame_slot k`
@@ -5290,6 +5412,47 @@ struct Lowerer {
             reportMissingOpcode(MnemonicSlot::LeaFrameSlot,
                                 "MIR Alloca address rematerialization");
             return std::nullopt;
+        }
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: a slot whose effective
+        // alignment EXCEEDS the cc's stack alignment cannot be placed at a
+        // statically-aligned frame offset — post-prologue SP is congruent to 0
+        // modulo `stackAlignment` and no finer, so `sp + <const>` is only ever
+        // `stackAlignment`-aligned. lir_callconv therefore reserves
+        // `align - stackAlignment` bytes of HEADROOM above such a slot and this arm
+        // rounds the address up into it at every materialization. The rounding is a
+        // pure function of the (fixed, post-prologue) frame base, so every
+        // rematerialization of the same slot yields the SAME address — which is the
+        // invariant the c69 remat model rests on.
+        //
+        // ⚠ THE DISPLACEMENT IS FOLDED AFTER THE ROUNDING, NEVER INTO IT:
+        // `alignUp(x) + d` and `alignUp(x + d)` are different addresses, and folding
+        // `d` into the `lea` would compute the second one. It rides a materialized
+        // constant + a REG-REG `add` rather than an immediate operand, because the
+        // immediate `add` forms the two shipped ISAs declare do not cover the same
+        // set (AArch64's are bounded and unsigned; a negative `&a[-1]` displacement
+        // has no variant there) — a reg-reg add has no range or sign hazard at all.
+        if (std::uint32_t const rtAlign = runtimeAlignForSlot(slotIndex);
+            rtAlign != 0) {
+            LirReg const raw = lir.newVReg(LirRegClass::GPR);
+            emitInst(*op, raw, std::span<LirOperand const>{},
+                     /*payload=*/slotIndex);
+            std::optional<LirReg> const aligned =
+                emitAlignUpToPowerOfTwo(
+                    raw, rtAlign, "an over-aligned local's frame address");
+            if (!aligned.has_value() || byteDisp == 0) return aligned;
+            auto const addOp = opcode(MnemonicSlot::Add);
+            if (!addOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Add,
+                                    "over-aligned frame-slot displacement");
+                return std::nullopt;
+            }
+            std::optional<LirReg> const disp = emitBareConstToFresh(byteDisp);
+            if (!disp.has_value()) return std::nullopt;
+            LirReg const shifted = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 2> ops{LirOperand::makeReg(*aligned),
+                                          LirOperand::makeReg(*disp)};
+            emitInst(*addOp, shifted, ops, /*payload=*/0, /*flags=*/0);  // width 64
+            return shifted;
         }
         LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
         if (byteDisp == 0) {
@@ -5352,6 +5515,12 @@ struct Lowerer {
         emitInst(*allocaOp, reservation, std::span<LirOperand const>{},
                  /*payload=*/bytes);
         std::uint32_t const slotIndex = allocaLirCount_;
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: a compiler-internal home has no
+        // source-level `alignas`, so it records 0 (no override) — the SAME value the
+        // frozen-LIR harvest derives for it (`lirToMir` maps it to a non-Alloca MIR
+        // inst). One push per reservation keeps this vector index-parallel with the
+        // counter.
+        allocaSlotAlign_.push_back(0u);
         ++allocaLirCount_;
         return slotIndex;
     }
@@ -5930,6 +6099,32 @@ struct Lowerer {
     // op — operand[0] = the establisher-frame base register, payload = the slot
     // index. lir_callconv materializes it into `lea result, [establisherReg +
     // parentLocalAreaOffset(slotIndex)]` (the parent's config-driven FrameLayout).
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: the EFFECTIVE
+    // alignment of the parent function's alloca at 0-based scan index `index`.
+    //
+    // The walk is deliberately the SAME one three other places already run — the
+    // funclet's `payload` is minted by `synth_seh_funclets.cpp::parentAllocaSlotIds`
+    // over blocks-then-instructions, `lir_callconv`'s `functionLocalAllocaPayloads`
+    // resolves the offset over the same order, and this reads the alignment off it.
+    // An index the parent cannot answer returns nullopt, and the caller refuses
+    // rather than guessing an alignment for a slot it cannot identify.
+    [[nodiscard]] std::optional<std::uint32_t>
+    parentAllocaAlign(MirFuncId parent, std::uint32_t index) const {
+        std::uint32_t seen = 0;
+        std::uint32_t const nb = mir.funcBlockCount(parent);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(parent, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                MirInstId const inst = mir.blockInstAt(b, ii);
+                if (mir.instOpcode(inst) != MirOpcode::Alloca) continue;
+                if (seen == index) return mir.instPayload2(inst);
+                ++seen;
+            }
+        }
+        return std::nullopt;
+    }
+
     void lowerRecoverParentFrameSlot(MirInstId id) {
         auto const op = opcode(MnemonicSlot::RecoverParentFrameSlot);
         if (!op.has_value()) {
@@ -5948,7 +6143,58 @@ struct Lowerer {
         if (!base.has_value()) { poisonValue(id); return; }
         LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
         std::array<LirOperand, 1> ops{LirOperand::makeReg(*base)};
-        emitInst(*op, result, ops, /*payload=*/mir.instPayload(id));
+        std::uint32_t const slot = mir.instPayload(id);
+        emitInst(*op, result, ops, /*payload=*/slot);
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the recovered address is the
+        // parent's RAW slot address off the establisher frame. If the parent's local
+        // is over-aligned the parent itself does not use that address either — it
+        // rounds it up — so the funclet must round identically or the two disagree
+        // about where the local is. The establisher frame IS the parent's
+        // post-prologue stack pointer, so it carries exactly the congruence the
+        // rounding's bound rests on, and the SAME primitive applies to it.
+        //
+        // ⚠ AND AN UNRESOLVABLE PARENT IS A REFUSAL, NOT A SHRUG. This construct was
+        // refused outright until this row closed, so "the alignment is probably 0"
+        // has no history behind it: guessing here would newly permit a funclet and
+        // its parent to address one local two different ways.
+        if (!currentFuncletParent_.has_value()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "mir_to_lir: RecoverParentFrameSlot (MIR inst {}) appears in a "
+                "function with no resolvable SEH parent, so the parent local's "
+                "alignment cannot be read and the recovered address cannot be "
+                "proven to match the parent's own "
+                "(D-WIN64-SEH-FUNCLETS x D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL)",
+                id.v);
+            reporter.report(std::move(d));
+            poisonValue(id);
+            return;
+        }
+        std::optional<std::uint32_t> const parentAlign =
+            parentAllocaAlign(*currentFuncletParent_, slot);
+        if (!parentAlign.has_value()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "mir_to_lir: RecoverParentFrameSlot (MIR inst {}) references parent "
+                "local-alloca index {}, which the parent function does not have "
+                "(D-WIN64-SEH-FUNCLETS)",
+                id.v, slot);
+            reporter.report(std::move(d));
+            poisonValue(id);
+            return;
+        }
+        if (*parentAlign > ccStackAlignment()) {
+            std::optional<LirReg> const rounded = emitAlignUpToPowerOfTwo(
+                result, *parentAlign,
+                "an over-aligned parent local recovered by a SEH funclet");
+            if (!rounded.has_value()) { poisonValue(id); return; }
+            defineValue(id, *rounded);
+            return;
+        }
         defineValue(id, result);
     }
 
@@ -11264,6 +11510,18 @@ struct Lowerer {
         // per-function scan callconv runs (`functionLocalAllocaPayloads` is per-fn).
         allocaSlotIndex_.clear();
         allocaLirCount_ = 0;
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: same per-function lifetime as
+        // the counter it is indexed by.
+        allocaSlotAlign_.clear();
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: if this
+        // function is a filter funclet, the parent whose frame its recovered locals
+        // live in. Empty for every other function, which is why an ordinary function
+        // can never take the funclet arm's refusal.
+        currentFuncletParent_.reset();
+        if (auto const it = funcletParentByFuncSymbol_.find(mir.funcSymbol(mf).v);
+            it != funcletParentByFuncSymbol_.end()) {
+            currentFuncletParent_ = it->second;
+        }
         computeValueUses(mf);
         // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: which of this
         // function's `BlockAddress` values exist ONLY to be exported to static
@@ -11312,6 +11570,12 @@ struct Lowerer {
             MirBlockId const mb = mir.funcBlockAt(mf, i);
             lowerBlock(mb);
         }
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: hand this function's
+        // reservation-order alignment record to the post-lowering harvest, which
+        // cross-checks it against its own frozen-LIR walk and fails loud on any
+        // skew. Keyed by MIR function id so the harvest can find it without
+        // depending on either walk's ordering.
+        allocaSlotAlignByFunc_[mf.v] = allocaSlotAlign_;
     }
 
     // Record the LIR inst → source MIR inst mapping. Resizes the
@@ -11444,6 +11708,23 @@ struct Lowerer {
         // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED — must precede every
         // symbol mint and every block-address lowering. See the function's docblock.
         bindPreMintedBlockSymbols();
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: bind each
+        // filter funclet to its parent MIR function BEFORE any function is lowered.
+        // A MODULE-WIDE pre-pass for the same reason `bindPreMintedBlockSymbols` is
+        // one: `synthesizeSehFunclets` APPENDS the funclets after the parents today,
+        // so a lazy binding would happen to work — and would break silently the day
+        // that order changed. The scope records carry both symbols, so the binding is
+        // a lookup rather than an inference.
+        for (auto const& s : sehScopesIn_) {
+            std::size_t const nf = mir.moduleFuncCount();
+            for (std::uint32_t fi = 0; fi < nf; ++fi) {
+                MirFuncId const f = mir.funcAt(fi);
+                if (mir.funcSymbol(f).v == s.parentFuncSymbol.v) {
+                    funcletParentByFuncSymbol_[s.filterFuncletSymbol.v] = f;
+                    break;
+                }
+            }
+        }
         std::size_t const fnCount = mir.moduleFuncCount();
         for (std::uint32_t i = 0; i < fnCount; ++i) {
             // D-OPT-SWITCH-JUMP-TABLE (c70): `lir.addFunction` runs in this same
@@ -11511,6 +11792,39 @@ struct Lowerer {
                         maxLocalAlign = std::max(maxLocalAlign, a);
                         perAllocaAlign.push_back(a);
                     }
+                }
+                // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: CROSS-CHECK this
+                // frozen-LIR walk against the reservation-order record `lowerFunction`
+                // kept. The two answer the same question by different routes (this one
+                // walks the finished LIR and maps back through `lirToMir`; the other
+                // was written at each reservation site), and they DECIDE DIFFERENT
+                // HALVES OF ONE MECHANISM: this list is what `lir_callconv` sizes the
+                // headroom from, and that one is what `emitLeaFrameSlot` rounded an
+                // address up with. A scan-order skew between them would round an
+                // address up into space the frame never reserved — a silent overrun of
+                // the next slot, which is exactly the miscompile class this row exists
+                // to remove. Fail loud instead; they agree on every shipped shape.
+                // ⚠ Bounded on the MIR side before asking: this loop counts FROZEN
+                // LIR functions, and `mir.funcAt` past the MIR module's own count is
+                // not a question with an answer. The two counts agree today (one
+                // `addFunction` per lowered MIR function) — the guard is so that
+                // ceasing to agree is a skipped cross-check, never a bad read.
+                auto const rec = (fi < mir.moduleFuncCount())
+                    ? allocaSlotAlignByFunc_.find(mir.funcAt(fi).v)
+                    : allocaSlotAlignByFunc_.end();
+                if (rec != allocaSlotAlignByFunc_.end()
+                    && rec->second != perAllocaAlign) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = std::format(
+                        "mir_to_lir: the frozen-LIR per-alloca alignment walk ({} "
+                        "entries) disagrees with the reservation-order record ({} "
+                        "entries) for function index {} — the frame-headroom source "
+                        "and the address-rounding source have drifted "
+                        "(D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL)",
+                        perAllocaAlign.size(), rec->second.size(), fi);
+                    reporter.report(std::move(d));
                 }
                 if (maxLocalAlign > gprWidth)
                     funcLocalAlignments.push_back(

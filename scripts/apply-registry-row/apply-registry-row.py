@@ -14,27 +14,44 @@ because the same id appeared unwrapped nearby.
 ★★ AND A DUPLICATE IS REFUSED, NEVER RESOLVED. Parallel lanes give one anchor TWO
 renditions -- typically an OPENER from one lane and a CLOSER from another. Settling
 that pair by POSITION (or by sort order) wrote the OPEN rendition back over a fixed
-defect **three times in cycle P42**. This tool refuses and names the count; a human
-reads both and decides.
+defect **three times in cycle P42**. The shared writer refuses and names the count; a
+human reads both and decides.
 
 WHAT IS VALIDATED BEFORE ANYTHING IS WRITTEN -- each clause is a way a bad row lands
 looking fine:
   1. the row file holds EXACTLY ONE physical line (a wrapped row is the defect above);
-  2. it splits into EXACTLY 4 content cells on UNESCAPED pipes, between a leading and a
-     trailing pipe -- a `|` inside a cell must be written `\\|` or the registry table
-     silently gains a column;
+  2. it splits into EXACTLY 6 content cells on UNESCAPED pipes, between a leading and a
+     trailing pipe -- a raw pipe inside a cell must be backslash-escaped or the registry
+     table silently gains a column;
   3. the first cell is a BACKTICKED anchor id equal to the one named on the command
      line -- so a row cannot be applied to the wrong anchor by a slip in either place;
-  4. the destination holds EXACTLY ONE row for that anchor (see the duplicate rule);
+  4. no registry holds more than ONE row for that anchor (see the duplicate rule);
   5. the destination is inside the repository, compared by RESOLVED PATH PREFIX.
 
-The status transition is PRINTED (old marker -> new marker) so the caller sees whether
-this application actually closed anything. ⓘ A row is CLOSED iff its status cell begins
-with the closure mark after stripping `*_ ` -- the complement is defined, never
-enumerated, exactly as `check-anchor-balance` defines it.
+⚠ SIX CELLS SINCE 2026-09-01, not four. The registry gained explicit `Priority` and
+`Status` columns -- `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |`
+-- so the verdict is a cell of its own rather than the first glyph of the trigger prose.
+A row written to the old four-cell shape would land with its TRIGGER sitting in the
+STATUS column, which is why the count is a refusal and not a warning.
+
+★★★ AND SINCE THE SAME DATE IT DOES NOT PLACE THE ROW ITSELF -- `scripts/anchors/anchors.py`
+DOES. The registry became THREE documents (production / harness / done) with a
+move-on-close rule: a row whose status is closed is DELETED from its working registry and
+appended to the archive's matching table, and a reopened one moves back. That routing is
+ONE decision, and two programs that both write the registry are two programs that will
+eventually disagree about it. This file keeps what is uniquely its own -- the validation
+of a lane's VERBATIM row file, where the bytes are copied and never retyped -- and hands
+the placement to the shared writer. `anchors.py write` is the same act from PARAMETERS
+instead of from a file; `anchors.py set` patches named fields on a row that already
+exists.
+
+The status transition and any MOVE are PRINTED, so the caller sees whether this
+application actually closed anything. ⓘ A row is CLOSED iff its STATUS cell begins with
+the closure mark after stripping `*_ ` -- the complement is defined, never enumerated,
+exactly as `check-anchor-balance` defines it, and this file does not define it a second
+time.
 
 Write-temp + `os.replace`. Never stages, never runs a git write verb.
-
 
 ⓘ NO `.ps1` TWIN, DELIBERATELY. This is a `.py`, which runs unchanged on the
 Windows leg and on every POSIX leg, so a PowerShell sibling would be a SECOND
@@ -52,6 +69,7 @@ Usage:
 """
 from __future__ import annotations
 
+import importlib.util
 import io
 import os
 import re
@@ -65,10 +83,11 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):  # pragma: no cover
         pass
 
-CLOSED_MARK = "✅"
 # A cell separator is a pipe that is NOT backslash-escaped. The lookbehind is the whole
-# grammar: `\|` inside a cell is content, `|` between cells is structure.
+# grammar: an escaped pipe inside a cell is content, a bare one between cells is
+# structure.
 SPLIT = re.compile(r"(?<!\\)\|")
+CELLS = 6
 
 
 class Refused(Exception):
@@ -83,13 +102,39 @@ def repo_root():
     return os.path.realpath(out.stdout.decode("utf-8", "surrogateescape").strip())
 
 
-def status_mark(cell):
-    """The leading marker of a status cell, with emphasis stripped."""
-    return cell.lstrip("*_ ")[:1]
+# The shared writer, resolved from THIS FILE rather than from the tree being edited.
+# ⚠ THE DISTINCTION IS LOAD-BEARING: `apply_row` takes a repository ROOT (which the
+# self-test points at a temporary fixture), while the writer is a SIBLING SCRIPT that
+# always lives beside this one. Resolving it from the root would mean any tree without a
+# `scripts/anchors/` had no writer -- including every fixture.
+ANCHORS_PY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "anchors", "anchors.py")
+
+
+def _anchors():
+    """The shared writer. Imported by path -- a hyphen is not a module name.
+
+    ⚠ FAILS LOUD rather than falling back to a local copy of the placement rule. A
+    fallback here would be a second, quieter answer to "where does a closed row go",
+    which is precisely what centralising it was for.
+    """
+    path = ANCHORS_PY
+    if not os.path.isfile(path):
+        raise Refused("cannot find scripts/anchors/anchors.py -- this tool VALIDATES a "
+                      "row file and delegates the PLACEMENT to it; it does not carry a "
+                      "second copy of the move-on-close rule.")
+    spec = importlib.util.spec_from_file_location("dss_anchors", path)
+    mod = importlib.util.module_from_spec(spec)
+    held, sys.argv = sys.argv, [path]
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.argv = held
+    return mod
 
 
 def read_row(rowfile, anchor):
-    """-> the validated row text. Raises Refused with the reason."""
+    """-> the validated row text and its cells. Raises Refused with the reason."""
     if not os.path.isfile(rowfile):
         raise Refused("no row file at %s" % rowfile)
     raw = io.open(rowfile, encoding="utf-8", newline="").read()
@@ -99,112 +144,56 @@ def read_row(rowfile, anchor):
                       "is ONE line -- a wrapped anchor id goes invisible to every grep "
                       "instead of failing.")
     cells = SPLIT.split(row)
-    # `| a | b | c | d |` splits to ['', a, b, c, d, ''] -- 6 parts, 4 content cells.
-    if len(cells) != 6 or cells[0].strip() or cells[-1].strip():
-        raise Refused("%d part(s) after splitting on UNESCAPED pipes; a row must have "
-                      "exactly 4 content cells between a leading and a trailing pipe. "
-                      "A literal pipe inside a cell must be written as an escaped pipe."
-                      % len(cells))
+    if len(cells) != CELLS + 2 or cells[0].strip() or cells[-1].strip():
+        raise Refused(
+            "%d part(s) after splitting on UNESCAPED pipes; a row must have exactly %d "
+            "content cells between a leading and a trailing pipe -- `| Anchor | Priority "
+            "| Status | Trigger | Closing work | Cross-refs |`. A literal pipe inside a "
+            "cell must be backslash-escaped. (The registry grew the Priority and Status "
+            "columns on 2026-09-01; a four-cell row would land with its trigger sitting "
+            "in the status column.)" % (len(cells), CELLS))
     first = cells[1].strip()
     if first != "`%s`" % anchor:
         raise Refused("first cell is %r, expected a backticked %s" % (first, anchor))
     return row, cells
 
 
-ANCHOR_TABLE_HEADER = "| Anchor | Trigger | Closing work | Cross-refs |"
-
-
-def anchor_table_end(lines):
-    """Index AFTER the last row of the file's anchor table. Raises Refused.
-
-    A new row is APPENDED to the end of the anchor table rather than sorted into it.
-    ⚠ Sorting is exactly what must not happen: an alphabetical fold is how an
-    opener/closer pair gets settled by position, which wrote an OPEN row back over a
-    fixed defect three times in cycle P42. Append is order-preserving and reviewable
-    as a one-line diff.
-
-    ⚠ AND THE TABLE IS LOCATED, NEVER GUESSED. If a registry ever grows a SECOND
-    anchor table this refuses rather than picking one -- an insert into the wrong
-    table is invisible to a reader and still counted by the gate, so silence here
-    would be worse than a red.
-    """
-    heads = [i for i, ln in enumerate(lines) if ln.strip() == ANCHOR_TABLE_HEADER]
-    if len(heads) != 1:
-        raise Refused("found %d anchor-table header(s) (%r); an insert needs exactly "
-                      "one, and picking between two would be invisible to a reader."
-                      % (len(heads), ANCHOR_TABLE_HEADER))
-    i = heads[0] + 1
-    if i >= len(lines) or set(lines[i].replace("|", "").strip()) - set("- :"):
-        raise Refused("the line after the anchor-table header is not a separator row.")
-    i += 1
-    last = None
-    while i < len(lines) and lines[i].startswith("|"):
-        if lines[i].startswith("| `D-"):
-            last = i
-        i += 1
-    if last is None:
-        raise Refused("the anchor table holds no rows -- refusing to insert into a "
-                      "table this scan could not read. Fix the scan, never the floor.")
-    return last + 1
-
-
 def apply_row(root, rel, anchor, rowfile, write, insert=False):
-    dest = os.path.realpath(os.path.join(root, rel))
-    if not (dest + os.sep).startswith(root + os.sep):
+    dest_decl = os.path.realpath(os.path.join(root, rel))
+    if not (dest_decl + os.sep).startswith(root + os.sep):
         raise Refused("destination escapes the repository: %s" % rel)
-    if not os.path.isfile(dest):
+    if not os.path.isfile(dest_decl):
         raise Refused("no registry at %s" % rel)
 
-    row, cells = read_row(rowfile, anchor)
-    new_mark = status_mark(cells[2])
+    an = _anchors()
+    row, _cells = read_row(rowfile, anchor)
 
-    text = io.open(dest, encoding="utf-8", newline="").read()
-    lines = text.split("\n")
-    hits = [i for i, ln in enumerate(lines) if ln.startswith("| `%s`" % anchor)]
-    if len(hits) > 1:
-        raise Refused("%d existing row(s) for %s in %s -- a duplicate is read by a "
-                      "human, never settled here. Two lanes give one anchor two "
-                      "renditions; picking by position has written an OPEN row back "
-                      "over a fixed defect." % (len(hits), anchor, rel))
-    # ⚠ INSERT AND REPLACE ARE DECLARED, NEVER INFERRED FROM WHETHER THE ROW HAPPENS
-    # TO EXIST. A typo in the anchor name would otherwise MINT a new row that looks
-    # exactly like the one somebody meant to update -- and both would then sit in the
-    # registry, the stale one still OPEN. Each mode refuses the other's world.
-    if not hits and not insert:
-        raise Refused("no row for %s in %s. If this row is NEW, say so with --insert; "
-                      "otherwise check the anchor spelling -- a mistyped id here mints "
-                      "a second row and leaves the real one untouched." % (anchor, rel))
-    if hits and insert:
-        raise Refused("--insert was given but %s already has a row in %s. Drop "
-                      "--insert to replace it." % (anchor, rel))
+    # ⚠ THE ARGUMENT NAMES THE BUCKET, NOT THE FILE THE ROW ENDS UP IN. A caller says
+    # "this is a production row"; where it LANDS follows from its status, and the
+    # archive is derived rather than declared -- see anchors.place_row.
+    # Resolved-path comparison, not a string match on `rel`: the same registry can be
+    # named `.plans/x.md` or `./.plans/x.md` and only one of those would match by text.
+    bucket = next((b for b, r in an.REL.items()
+                   if os.path.realpath(os.path.join(root, r)) == dest_decl), None)
+    if bucket is None:
+        raise Refused("%s is not one of the three anchor registries (%s)."
+                      % (rel, ", ".join(sorted(an.REL.values()))))
+    if bucket == "done":
+        raise Refused(
+            "the archive is not a destination a caller declares. Name the WORKING "
+            "registry the row belongs to (%s); a row whose status is closed is routed "
+            "into the archive from there, and a reopened one is moved back out."
+            % ", ".join(an.WORKING))
 
-    print("apply-registry-row: %s in %s" % (anchor, rel))
-    if hits:
-        i = hits[0]
-        old_mark = status_mark(SPLIT.split(lines[i])[2])
-        print("  status  %r -> %r   (%s -> %s)"
-              % (old_mark, new_mark,
-                 "CLOSED" if old_mark == CLOSED_MARK else "OPEN",
-                 "CLOSED" if new_mark == CLOSED_MARK else "OPEN"))
-        print("  size    %d chars -> %d chars" % (len(lines[i]), len(row)))
-    else:
-        i = anchor_table_end(lines)
-        print("  INSERT  new row, status %r (%s), %d chars, appended to the anchor table"
-              % (new_mark, "CLOSED" if new_mark == CLOSED_MARK else "OPEN", len(row)))
-
+    try:
+        dest = an.place_row(root, bucket, anchor, row, write=write, insert=insert)
+    except an.Refused as exc:
+        raise Refused(str(exc))
+    print("  size    %d chars" % len(row))
     if not write:
         print("apply-registry-row: dry run. pass --apply to write.")
-        return 0
-
-    if hits:
-        lines[i] = row
     else:
-        lines.insert(i, row)
-    tmp = dest + ".row-tmp"
-    with io.open(tmp, "w", encoding="utf-8", newline="") as fh:
-        fh.write("\n".join(lines))
-    os.replace(tmp, dest)
-    print("apply-registry-row: WROTE %s" % rel)
+        print("apply-registry-row: WROTE %s" % dest)
     return 0
 
 
@@ -218,8 +207,31 @@ def self_test():
     here only as the CONTROL that proves the refusals are not refusing everything --
     a guard that refuses unconditionally reports the same clean transcript as one that
     works.
+
+    ⚠ THE PLACEMENT ARMS LIVE IN `anchors.py --self-test`, WHERE THE PLACEMENT LIVES.
+    Re-asserting the move-on-close rule here would be a second pin on a behaviour this
+    file no longer owns -- and a pin that keeps passing after the real one is deleted is
+    worse than no pin. What IS pinned here is the hand-off: that a validated row reaches
+    the shared writer, and that an absent writer is a REFUSAL rather than a local
+    fallback.
     """
     failed = [0]
+    # ⚠⚠ THE FIXTURE IDS ARE ASSEMBLED FROM FRAGMENTS, NEVER WRITTEN WHOLE.
+    # `scripts/` is a scanned root for `check-anchor-registry`, so a three-segment `D-*`
+    # written as ONE literal in this file is a CITATION that must resolve to a registry
+    # row -- and these are INPUT DATA to a parser test, not citations. ✔MEASURED: written
+    # whole they red the entire tree. The project already settled this class -- make the
+    # fixture stop being anchor-shaped, never allowlist the name, because an Allowlist
+    # entry silences a name repo-wide and forever and would blind the guard to a real
+    # future anchor. The VALUE is still well-formed at runtime, which is what `make_row`
+    # validates; only the LITERAL is split.
+    _FX = "D-" + "FIXTURE-ANCHORS"
+    A_ = _FX + "-ALPHA"
+    B_ = _FX + "-BETA"
+    G_ = _FX + "-GAMMA"
+    CC_ = _FX + "-CELLS"
+    HG_ = _FX + "-HGAMMA"
+
 
     def pin(ok, why, detail=""):
         print("  %-4s %s%s" % ("ok" if ok else "FAIL", why,
@@ -227,8 +239,29 @@ def self_test():
         if not ok:
             failed[0] += 1
 
-    def refusal(root, rel, anchor, body):
-        path = os.path.join(root, "row.md")
+    an = _anchors()
+    HDR, SEP = an.TABLE_HEADER, an.SEP_ROW_TEXT
+    GOOD = "| `" + A_ + "` | P1 | ✅ CLOSED | ✅ **shipped** | w | r |"
+
+    def fixture(box):
+        os.makedirs(os.path.join(box, ".plans"), exist_ok=True)
+
+        def doc(rel, *body):
+            with io.open(os.path.join(box, rel), "w", encoding="utf-8",
+                         newline="") as fh:
+                fh.write("\n".join(body) + "\n")
+        doc(an.REL["production"], "# p", "", HDR, SEP,
+            "| `" + A_ + "` | P1 | 🟠 OPEN | 🟠 **OPEN** | w | r |",
+            "| `" + B_ + "` | P2 | 🟠 OPEN | 🟠 **OPEN** | w | r |", "")
+        doc(an.REL["harness"], "# h", "", HDR, SEP,
+            "| `" + HG_ + "` | P3 | 🟠 OPEN | 🟠 **OPEN** | w | r |", "")
+        doc(an.REL["done"], "# d", "", an.DONE_TABLE["production"], "", HDR, SEP,
+            "| `" + _FX + "-OLDP` | P1 | ✅ CLOSED | ✅ **CLOSED** | - | r |", "",
+            an.DONE_TABLE["harness"], "", HDR, SEP,
+            "| `" + _FX + "-OLDH` | P3 | ✅ CLOSED | ✅ **CLOSED** | - | r |", "")
+
+    def refusal(box, rel, anchor, body):
+        path = os.path.join(box, "row.md")
         with io.open(path, "w", encoding="utf-8", newline="") as fh:
             fh.write(body)
         try:
@@ -236,94 +269,108 @@ def self_test():
             # exercises it exactly; and an arm that is supposed to be ACCEPTED (2b)
             # must not mutate the fixture, or the (C0) "nothing was written" control
             # is measuring this helper rather than the tool.
-            apply_row(root, rel, anchor, path, write=False)
+            apply_row(box, rel, anchor, path, write=False)
             return None
         except Refused as exc:
             return str(exc)
 
-    GOOD = "| `D-XX-ALPHA` | ✅ **CLOSED -- shipped** | w | r |"
     with tempfile.TemporaryDirectory() as tmp:
-        root = os.path.realpath(tmp)
-        rel = "reg.md"
-        original = ("| Anchor | Trigger | Closing work | Cross-refs |\n"
-                    "|---|---|---|---|\n"
-                    "| `D-XX-ALPHA` | \U0001f7e0 **OPEN** | w | r |\n"
-                    "| `D-XX-BETA` | \U0001f7e0 **OPEN** | w | r |\n")
-        with io.open(os.path.join(root, rel), "w", encoding="utf-8", newline="") as fh:
-            fh.write(original)
+        box = os.path.realpath(tmp)
+        fixture(box)
+        rel = an.REL["production"]
+        original = io.open(os.path.join(box, rel), encoding="utf-8",
+                           newline="").read()
 
         # (1) a WRAPPED row -- the defect this tool exists for.
-        msg = refusal(root, rel, "D-XX-ALPHA",
-                      "| `D-XX-ALPHA` | ✅ **CLOSED -- shipped\nmore** | w | r |")
+        msg = refusal(box, rel, A_,
+                      "| `" + A_ + "` | P1 | ✅ CLOSED | ✅ **shipped\nmore** | w | r |")
         pin(msg is not None and "more than one physical line" in msg,
             "(1) a row spanning two physical lines is REFUSED", "got=%r" % msg)
 
         # (2) a stray UNESCAPED pipe silently adds a column.
-        msg = refusal(root, rel, "D-XX-ALPHA",
-                      "| `D-XX-ALPHA` | ✅ a | b | c | d |")
-        pin(msg is not None and "4 content cells" in msg,
+        msg = refusal(box, rel, A_,
+                      "| `" + A_ + "` | P1 | ✅ CLOSED | a | b | c | d |")
+        pin(msg is not None and "6 content cells" in msg,
             "(2) a row with the wrong cell count is REFUSED", "got=%r" % msg)
 
-        # ...and an ESCAPED pipe is CONTENT, so it must still be accepted. Without this
+        # (2a) ...and the OLD four-cell shape is exactly that failure, named.
+        msg = refusal(box, rel, A_,
+                      "| `" + A_ + "` | ✅ **CLOSED** | w | r |")
+        pin(msg is not None and "6 content cells" in msg,
+            "(2a) a row in the RETIRED four-cell shape is REFUSED, not silently landed "
+            "with its trigger in the status column", "got=%r" % msg)
+
+        # (2b) an ESCAPED pipe is CONTENT, so it must still be accepted. Without this
         # the obvious 'fix' for (2) is to split on every pipe, which would refuse every
         # legitimate row containing one.
-        msg = refusal(root, rel, "D-XX-ALPHA",
-                      "| `D-XX-ALPHA` | ✅ a \\| b | w | r |")
+        msg = refusal(box, rel, A_,
+                      "| `" + A_ + "` | P1 | ✅ CLOSED | a \\| b | w | r |")
         pin(msg is None, "(2b) an ESCAPED pipe is cell CONTENT, not a separator",
             "got=%r" % msg)
 
         # (3) the row's own anchor must equal the one named on the command line.
-        msg = refusal(root, rel, "D-XX-BETA", GOOD)
+        msg = refusal(box, rel, B_, GOOD)
         pin(msg is not None and "expected a backticked" in msg,
             "(3) a row applied to the WRONG anchor is REFUSED", "got=%r" % msg)
 
         # (4) a duplicate is refused, never settled by position.
-        with io.open(os.path.join(root, "dup.md"), "w", encoding="utf-8",
+        with io.open(os.path.join(box, an.REL["harness"]), encoding="utf-8",
                      newline="") as fh:
-            fh.write(original + "| `D-XX-ALPHA` | \U0001f7e0 **OPEN again** | w | r |\n")
-        msg = refusal(root, "dup.md", "D-XX-ALPHA", GOOD)
-        pin(msg is not None and "2 existing row(s)" in msg,
-            "(4) TWO rows for one anchor are REFUSED, never settled by position",
-            "got=%r" % msg)
+            hl = fh.read().split("\n")
+        hl.insert(5, "| `" + A_ + "` | P1 | 🟠 OPEN | 🟠 **OPEN again** | w | r |")
+        io.open(os.path.join(box, an.REL["harness"]), "w", encoding="utf-8",
+                newline="").write("\n".join(hl))
+        msg = refusal(box, rel, A_, GOOD)
+        pin(msg is not None and "One id, one home" in msg,
+            "(4) one anchor with rows in TWO registries is REFUSED, never settled by "
+            "position", "got=%r" % msg)
+        fixture(box)
 
         # (5) a destination outside the repository.
-        msg = refusal(root, "../escape.md", "D-XX-ALPHA", GOOD)
+        msg = refusal(box, "../escape.md", A_, GOOD)
         pin(msg is not None and "escapes the repository" in msg,
             "(5) a destination outside the repo is REFUSED", "got=%r" % msg)
 
-        # (C) THE CONTROL: the good row lands, replaces exactly one line, and the
-        # SIBLING row is untouched.
-        after = io.open(os.path.join(root, rel), encoding="utf-8", newline="").read()
-        pin(after == original,
-            "(C0) not one byte was written by any of the refusals above", "")
-        path = os.path.join(root, "row.md")
-        with io.open(path, "w", encoding="utf-8", newline="") as fh:
-            fh.write(GOOD + "\n")
-        rc = apply_row(root, rel, "D-XX-ALPHA", path, write=True)
-        after = io.open(os.path.join(root, rel), encoding="utf-8", newline="").read()
-        pin(rc == 0 and GOOD in after and "D-XX-BETA` | \U0001f7e0 **OPEN**" in after
-            and len(after.split("\n")) == len(original.split("\n")),
-            "(C) the control lands: one line replaced, the sibling row untouched", "")
+        # (5a) ...and the ARCHIVE is not a destination a caller may declare.
+        msg = refusal(box, an.REL["done"], A_, GOOD)
+        pin(msg is not None and "not a destination a caller declares" in msg,
+            "(5a) naming the archive is REFUSED -- it is DERIVED from the status",
+            "got=%r" % msg)
+
+        # (C0) THE CONTROL: not one byte was written by any refusal above.
+        pin(io.open(os.path.join(box, rel), encoding="utf-8", newline="").read()
+            == original,
+            "(C0) not one byte was written by any of the refusals above")
+
+        # (C) THE CONTROL: the good row lands, and because it is CLOSED it MOVES.
+        # ⓘ This asserts the HAND-OFF, not the routing rule: that a validated row
+        # reaches the shared writer at all. The routing itself is pinned where it lives.
+        path = os.path.join(box, "row.md")
+        io.open(path, "w", encoding="utf-8", newline="").write(GOOD + "\n")
+        rc = apply_row(box, rel, A_, path, write=True)
+        prod = io.open(os.path.join(box, rel), encoding="utf-8").read()
+        done = io.open(os.path.join(box, an.REL["done"]), encoding="utf-8").read()
+        pin(rc == 0 and A_ not in prod and GOOD in done
+            and B_ in prod,
+            "(C) the control lands: the CLOSED row reached the shared writer, which "
+            "moved it to the archive, and the sibling row is untouched")
 
         # (6) INSERT is DECLARED. A missing row without --insert is refused, because
         # the alternative -- inserting whatever anchor was typed -- turns a typo into a
         # second row while the real one stays stale and OPEN.
-        with io.open(path, "w", encoding="utf-8", newline="") as fh:
-            fh.write("| `D-XX-GAMMA` | \u2705 **CLOSED** | w | r |\n")
-        try:
-            apply_row(root, rel, "D-XX-GAMMA", path, write=True)
-            msg = None
-        except Refused as exc:
-            msg = str(exc)
+        fixture(box)
+        io.open(path, "w", encoding="utf-8", newline="").write(
+            "| `" + G_ + "` | P1 | 🟠 OPEN | 🟠 **OPEN** | w | r |\n")
+        msg = refusal(box, rel, G_,
+                      "| `" + G_ + "` | P1 | 🟠 OPEN | 🟠 **OPEN** | w | r |")
         pin(msg is not None and "--insert" in msg,
             "(6) a row that does not exist is REFUSED unless --insert is declared",
             "got=%r" % msg)
 
         # (7) ...and --insert over a row that DOES exist is refused just as loudly.
-        with io.open(path, "w", encoding="utf-8", newline="") as fh:
-            fh.write(GOOD + "\n")
+        io.open(path, "w", encoding="utf-8", newline="").write(GOOD + "\n")
         try:
-            apply_row(root, rel, "D-XX-ALPHA", path, write=True, insert=True)
+            apply_row(box, rel, A_, path, write=False, insert=True)
             msg = None
         except Refused as exc:
             msg = str(exc)
@@ -331,21 +378,36 @@ def self_test():
             "(7) --insert over an EXISTING row is REFUSED -- each mode refuses the "
             "other's world", "got=%r" % msg)
 
-        # (8) THE CONTROL FOR THE INSERT PATH: the new row lands at the END of the
-        # anchor table, and nothing already there moves.
-        before_lines = io.open(os.path.join(root, rel), encoding="utf-8",
-                               newline="").read().split("\n")
-        with io.open(path, "w", encoding="utf-8", newline="") as fh:
-            fh.write("| `D-XX-GAMMA` | \u2705 **CLOSED** | w | r |\n")
-        rc = apply_row(root, rel, "D-XX-GAMMA", path, write=True, insert=True)
-        after_lines = io.open(os.path.join(root, rel), encoding="utf-8",
-                              newline="").read().split("\n")
-        added = [ln for ln in after_lines if ln not in before_lines]
-        pin(rc == 0 and len(after_lines) == len(before_lines) + 1
-            and added == ["| `D-XX-GAMMA` | \u2705 **CLOSED** | w | r |"]
-            and after_lines[:len(before_lines) - 1] == before_lines[:-1],
-            "(8) --insert appends ONE row at the table's end and moves nothing else",
-            "added=%r" % added)
+        # (8) THE HAND-OFF ITSELF: with no shared writer this REFUSES rather than
+        # falling back to a local copy of the placement rule.
+        # The RESOLVER CONSTANT is what is probed, because the resolver is what would
+        # have to be edited to reintroduce a fallback.
+        global ANCHORS_PY
+        held = ANCHORS_PY
+        try:
+            ANCHORS_PY = os.path.join(box, "no-such-anchors.py")
+            fixture(box)
+            io.open(path, "w", encoding="utf-8", newline="").write(GOOD + "\n")
+            try:
+                apply_row(box, rel, A_, path, write=False)
+                msg = None
+            except Refused as exc:
+                msg = str(exc)
+            pin(msg is not None and "scripts/anchors/anchors.py" in msg,
+                "(8) an absent shared writer is a REFUSAL, never a local fallback copy "
+                "of the move-on-close rule", "got=%r" % msg)
+        finally:
+            ANCHORS_PY = held
+        # ...and the CONTROL for that arm: with the resolver restored the same call
+        # succeeds, so arm (8) is measuring the resolver rather than a broken fixture.
+        try:
+            apply_row(box, rel, A_, path, write=False)
+            msg = None
+        except Refused as exc:
+            msg = str(exc)
+        pin(msg is None,
+            "(8b) the CONTROL: with the resolver restored the same call is accepted",
+            "got=%r" % msg)
 
     print("apply-registry-row self-test: %d failed" % failed[0])
     return 1 if failed[0] else 0

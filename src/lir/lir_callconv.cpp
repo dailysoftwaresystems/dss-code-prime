@@ -176,6 +176,13 @@ collectUsedCalleeSaved(Lir const& lir, LirFuncId fn,
 [[nodiscard]] inline std::uint32_t
 allocaSlotCount(std::uint32_t payload, std::uint32_t slotWidth) noexcept;
 
+// D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: `frameSlotPlacementAlign` and
+// `frameSlotAlignHeadroom` — the two pure derivations that between them place one
+// local whose alignment may exceed what a static frame offset can promise — live in
+// `lir_callconv.hpp` alongside `frameSlotStride`, published for the same reason and
+// carrying the argument there. They are called from all three walks that place
+// allocas, so the walks cannot disagree; neither knows an architecture.
+
 [[nodiscard]] std::optional<FrameLayout>
 computeFrameLayout(LirFuncAllocation const& alloc,
                    TargetSchema const& schema,
@@ -307,13 +314,23 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     // above it) would overrun. For a function with no over-aligned local
     // (`perAllocaAligns` empty) this is byte-identical to the prior
     // `Σ allocaSlotCount*slotWidth` sum.
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: an alloca whose alignment exceeds
+    // what the frame can promise is placed at the frame's own alignment and given
+    // `frameSlotAlignHeadroom` spare bytes for the runtime rounding. The offsets are
+    // RECORDED (`layout.allocaSlotOffsets`) rather than left to be re-derived —
+    // absolutised at the end of this function, once `localAreaOffset()` is final.
+    std::uint32_t const frameAlign = (cc.stackAlignment > 0) ? cc.stackAlignment : 1u;
+    std::vector<std::int32_t> localOffsets;
+    localOffsets.reserve(allocaPayloads.size());
     std::uint32_t localRunning = 0;
     for (std::size_t i = 0; i < allocaPayloads.size(); ++i) {
-        std::uint32_t const a =
-            (i < perAllocaAligns.size() && perAllocaAligns[i] != 0)
-                ? perAllocaAligns[i] : 1u;
-        localRunning = alignUp(localRunning, a);
+        std::uint32_t const declared =
+            (i < perAllocaAligns.size()) ? perAllocaAligns[i] : 0u;
+        localRunning =
+            alignUp(localRunning, frameSlotPlacementAlign(declared, frameAlign));
+        localOffsets.push_back(static_cast<std::int32_t>(localRunning));
         localRunning += allocaSlotCount(allocaPayloads[i], slotWidth) * slotWidth;
+        localRunning += frameSlotAlignHeadroom(declared, frameAlign);
     }
     layout.localAreaSize       = localRunning;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the variadic register-save-area is the
@@ -333,43 +350,44 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     // slot is 8 bytes but the stack is 16-aligned, so a 16-aligned local IS
     // representable there — using slotWidth (8) as the bound would wrongly reject
     // it. TWO cases:
-    //   (B3 gate) maxLocalAlign > stackAlignment — a local needing MORE alignment
-    //     than the stack itself provides (`alignas(32)`/`alignas(64)`, or an
-    //     over-aligned struct used as a local) needs a DYNAMICALLY realigned SP
-    //     (an AND-mask of the stack pointer + a frame pointer to find spills),
-    //     which this static frame layout does not build. Fail loud, reporting the
-    //     COMPUTED bound (agnostic — no arch name).
+    //   (B3, WAS A GATE, NOW A RESERVATION) maxLocalAlign > stackAlignment — a local
+    //     needing MORE alignment than the stack itself provides (`alignas(32)` /
+    //     `alignas(64)`, or an over-aligned struct used as a local). This USED TO
+    //     FAIL LOUD with `L_OverAlignedStackLocal`, on the premise that honouring it
+    //     required a dynamically realigned stack pointer plus frame-pointer-relative
+    //     spill addressing. It does not: the stack pointer is left alone and the
+    //     ADDRESS is rounded up at each materialization, inside the headroom the
+    //     local-area walk above reserved (`frameSlotAlignHeadroom`). Nothing in the
+    //     prologue, the unwind data, the spill addressing or the register allocation
+    //     changes — which is why this arrives with no arch-keyed code anywhere.
     //     D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL.
-    //   (B2 pad) 0 < maxLocalAlign ≤ stackAlignment AND the raw base does not
-    //     already satisfy it — insert exactly enough padding to align the local
-    //     base to `maxLocalAlign`. This changes ONLY a frame with a
-    //     >stack-slot-multiple-aligned local whose base is off (e.g. an odd
-    //     outgoing-arg count leaves the x86 base ≡ 8 mod 16); every other frame's
+    //   (B2 pad) 0 < maxLocalAlign AND the raw base does not already satisfy the
+    //     local area's placement alignment — insert exactly enough padding to align
+    //     the local base to it. The padding target is capped at `frameAlign` for the
+    //     same reason `frameSlotPlacementAlign` caps a per-alloca offset: padding an
+    //     offset past the base's own guarantee buys nothing. This changes ONLY a
+    //     frame with a >stack-slot-multiple-aligned local whose base is off (e.g. an
+    //     odd outgoing-arg count leaves the x86 base ≡ 8 mod 16); every other frame's
     //     pad is 0 (byte-identical layout — the zero-blast-radius invariant).
-    std::uint32_t const frameAlign = (cc.stackAlignment > 0) ? cc.stackAlignment : 1u;
     std::uint32_t localAreaAlignPad = 0;
-    if (maxLocalAlign > frameAlign) {
-        report(reporter, DiagnosticCode::L_OverAlignedStackLocal,
-               DiagnosticSeverity::Error,
-               std::format(
-                   "computeFrameLayout: a stack local requires {}-byte alignment, "
-                   "which exceeds the {}-byte stack alignment this frame layout can "
-                   "guarantee — an over-aligned local beyond the stack alignment "
-                   "needs a dynamically realigned stack pointer, not built "
-                   "(D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL)",
-                   maxLocalAlign, frameAlign));
-        return std::nullopt;
-    }
     if (maxLocalAlign > 0) {
         std::uint32_t const rawLocalBase =
             layout.outgoingArgAreaSize + layout.savedRegAreaSize
             + layout.spillAreaSize;
-        // maxLocalAlign ≤ frameAlign here (the gate above returned otherwise).
-        if (rawLocalBase % maxLocalAlign != 0u) {
-            localAreaAlignPad = alignUp(rawLocalBase, maxLocalAlign) - rawLocalBase;
+        std::uint32_t const baseAlign =
+            frameSlotPlacementAlign(maxLocalAlign, frameAlign);
+        if (rawLocalBase % baseAlign != 0u) {
+            localAreaAlignPad = alignUp(rawLocalBase, baseAlign) - rawLocalBase;
         }
     }
     layout.localAreaAlignPad   = localAreaAlignPad;
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: absolutise the recorded per-alloca
+    // offsets now that `localAreaOffset()` is final (it folds the pad just set), and
+    // publish them. This IS the progression — the materialize pass and the SEH
+    // parent-frame recovery both read it instead of walking their own.
+    for (std::int32_t& off : localOffsets)
+        off += static_cast<std::int32_t>(layout.localAreaOffset());
+    layout.allocaSlotOffsets   = std::move(localOffsets);
     // Frame zones stack from SP+0 upward: outgoing-args, saved regs,
     // spill slots, then local-alloca slots. Caller-side `frame_store
     // srcReg, [sp + outgoingOffset]` writes into this function's
@@ -2867,6 +2885,12 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
         std::uint32_t const a = perAllocaAligns[i];
         return a == 0u ? 1u : a;
     };
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the cc's stack alignment, spelled
+    // exactly as `computeFrameLayout` spells it — the two walks feed the SAME pair of
+    // placement/headroom functions, so this value has to be the same number on both
+    // sides or the consistency assert in the alloca arm fires.
+    std::uint32_t const frameAlignBytes =
+        (cc.stackAlignment > 0) ? cc.stackAlignment : 1u;
     // FC12a/b/c: does this function call va_start? Detected by the presence of ANY
     // va_start base op — `va_reg_save_area` (SysV + AAPCS64), `va_home_arg_area`
     // (Win64), or `va_overflow_arg_area` (Apple arm64). The op-presence test + the
@@ -2981,33 +3005,20 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     StackArgCursor incomingStackArgs{cc, widthForClass(schema, LirRegClass::GPR)};
 
     // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the per-alloca FRAME OFFSET
-    // (sp-relative), indexed by the alloca's 0-based scan-order index — the SAME
-    // progression `localAllocaByteOffset` walks below, precomputed up front so a
+    // (sp-relative), indexed by the alloca's 0-based scan-order index, so a
     // `lea_frame_slot k` re-reference (which can appear in ANY block, possibly
     // BEFORE the original `alloca` is materialized in the loop) resolves to its
-    // alloca's offset. Built from `localAllocaPayloads` (the scan-order payload
-    // list `computeFrameLayout` already sized the local area from), with the
-    // identical `localAreaOffset() + Σ allocaSlotCount*slotSize` formula. The
-    // alloca arm below ASSERTS its running offset equals `allocaSlotOffsets[i]`
-    // (defense-in-depth: a divergence would mean a `lea_frame_slot` points at the
-    // wrong slot — a silent miscompile — so it fails loud instead).
-    std::vector<std::int32_t> allocaSlotOffsets;
-    allocaSlotOffsets.reserve(localAllocaPayloads.size());
-    {
-        std::uint32_t running = 0;
-        for (std::size_t i = 0; i < localAllocaPayloads.size(); ++i) {
-            // #2 per-alloca fix: align this alloca's offset up to ITS OWN effective
-            // alignment before placing it (a no-op for ≤ slot-width). The local
-            // area BASE is already aligned to `maxLocalAlign` (≥ every per-alloca
-            // alignment) by computeFrameLayout's B2 pad, so a base-relative alignUp
-            // yields an absolute offset that IS `allocaAlign`-aligned. The
-            // materialize arm below MUST reproduce this identically (asserted).
-            running = alignUp(running, allocaAlignAt(i));
-            allocaSlotOffsets.push_back(static_cast<std::int32_t>(
-                outLayout.localAreaOffset() + running));
-            running += allocaSlotCount(localAllocaPayloads[i], slotSize) * slotSize;
-        }
-    }
+    // alloca's offset.
+    //
+    // ★ THIS USED TO BE A SECOND HAND-WRITTEN COPY of the progression
+    // `computeFrameLayout` had just walked to size the local area, kept honest by the
+    // assertion in the alloca arm below. It is now the layout's OWN published table
+    // (`FrameLayout::allocaSlotOffsets`) — one producer, three consumers. The
+    // assertion stays, because the alloca arm still walks its own running offset for
+    // placement and the two must agree; what changed is that a drift can now only be
+    // in the arm, never a second full transcription of the rule.
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL.
+    std::vector<std::int32_t> const& allocaSlotOffsets = outLayout.allocaSlotOffsets;
     // Running scan-order index of the alloca arm — pairs with the offset
     // precompute above for the consistency assertion.
     std::uint32_t allocaScanIndex = 0;
@@ -3340,13 +3351,19 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     return false;
                 }
                 // #2 per-alloca fix: align this alloca's offset up to ITS OWN
-                // effective alignment BEFORE placing — reproducing the precompute
-                // above byte-for-byte (a no-op for ≤ slot-width, so x86_64 and
-                // arm64-≤8 frames are unchanged; only a >slot-width alloca on
-                // arm64 shifts). The consistency assert below re-proves the two
-                // progressions agree.
-                localAllocaByteOffset =
-                    alignUp(localAllocaByteOffset, allocaAlignAt(allocaScanIndex));
+                // effective alignment BEFORE placing — reproducing
+                // `computeFrameLayout`'s walk byte-for-byte (a no-op for ≤
+                // slot-width, so x86_64 and arm64-≤8 frames are unchanged; only a
+                // >slot-width alloca on arm64 shifts). The consistency assert below
+                // re-proves the two progressions agree.
+                // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: an OVER-aligned alloca
+                // is placed at the frame's own alignment (rounding further is idle —
+                // the base is no better aligned than that) and given headroom above
+                // it, added when the running offset advances below.
+                localAllocaByteOffset = alignUp(
+                    localAllocaByteOffset,
+                    frameSlotPlacementAlign(allocaAlignAt(allocaScanIndex),
+                                            frameAlignBytes));
                 // Assign this alloca its frame offset = the running byte
                 // offset (matches functionLocalAllocaPayloads' traversal —
                 // shared loop nesting + identical visit order keep the two
@@ -3374,10 +3391,15 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                        allocaSlotOffsets.size()));
                     return false;
                 }
-                ++allocaScanIndex;
                 localAllocaByteOffset +=
                     allocaSlotCount(payload, outLayout.slotSize)
                     * outLayout.slotSize;
+                // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the spare bytes the
+                // runtime address rounding lives in. 0 for every alloca at or below
+                // the frame's own alignment.
+                localAllocaByteOffset += frameSlotAlignHeadroom(
+                    allocaAlignAt(allocaScanIndex), frameAlignBytes);
+                ++allocaScanIndex;
                 // D-CSUBSET-VLA (C1b): a FIXED local's address → `frameBase` (FP in a
                 // VLA function; the fixed local sits in the fixed frame that the
                 // runtime VLA sub does not move — same offset off FB). The VLA array
@@ -3496,10 +3518,31 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     return false;
                 }
                 FrameLayout const& parentLayout = siblingLayouts[*parentLayoutIndex];
-                std::int64_t const slotOffset =
-                    static_cast<std::int64_t>(parentLayout.localAreaOffset())
-                    + static_cast<std::int64_t>(payload)
-                          * static_cast<std::int64_t>(parentLayout.slotSize);
+                // ★ THE PAYLOAD IS AN ALLOCA SCAN INDEX, NOT A SLOT INDEX, AND THIS
+                // ARM USED TO MULTIPLY IT BY `slotSize` AS IF IT WERE ONE
+                // (`synth_seh_funclets.cpp::parentAllocaSlotIds` numbers the parent's
+                // allocas 0,1,2,…). The two coincide only when every preceding parent
+                // alloca is a single-slot scalar: a parent with a struct local
+                // (`ceil(size/slotSize)` slots) ahead of the referenced one already
+                // handed the funclet an address short of the real slot, and an
+                // over-aligned local's headroom is a second way to diverge. Read the
+                // layout's own published progression instead — the same table the
+                // `lea_frame_slot` arm resolves against, so a funclet and its parent
+                // cannot disagree about where a local is.
+                // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL.
+                if (payload >= parentLayout.allocaSlotOffsets.size()) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: recover_parent_frame_slot inst {} "
+                                       "references parent local-alloca index {} but "
+                                       "the parent frame has only {} alloca slot(s) "
+                                       "(D-WIN64-SEH-FUNCLETS)",
+                                       inst.v, payload,
+                                       parentLayout.allocaSlotOffsets.size()));
+                    return false;
+                }
+                std::int64_t const slotOffset = static_cast<std::int64_t>(
+                    parentLayout.allocaSlotOffsets[payload]);
                 if (slotOffset < std::numeric_limits<std::int32_t>::min()
                     || slotOffset > std::numeric_limits<std::int32_t>::max()) {
                     report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,

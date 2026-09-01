@@ -196,3 +196,18 @@ target_link_libraries(dss_lir_test_lir_frame_pointer_reservation
 # assertion: keep it away from the 100-odd unrelated pins in test_lir_text.
 dss_add_test(NAME lir/test_lir_text_unsealed_block
              SOURCES test_lir_text_unsealed_block.cpp)
+
+# D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: a local whose alignment exceeds the
+# convention's `stackAlignment` cannot be placed by CHOOSING an offset — the
+# post-prologue stack pointer is congruent to 0 modulo that and no finer. It is
+# placed by reserving spare bytes and rounding the address at run time. These pins
+# are over the two published derivations that decide the reservation, and over the
+# SUFFICIENCY PROPERTY (rounding any raw slot address must land inside its own
+# reservation) rather than over a table of offsets — a table would be right at 32 and
+# silent at 64. Nothing here drives the unit-tier front end, whose frame shapes can
+# measure zero
+# ([[D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO]]);
+# the end-to-end evidence is the runtime corpus (`examples/c/alignas_local_over32`,
+# `alignas_local_cacheline64`, `alignas_member_over32_local`).
+dss_add_test(NAME lir/test_lir_overaligned_local_frame
+             SOURCES test_lir_overaligned_local_frame.cpp)

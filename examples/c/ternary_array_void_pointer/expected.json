@@ -1,0 +1,15 @@
+{
+  "$comment": "D-CSUBSET-TERNARY-ARRAY-ARM-INCOMPATIBLE part (2): `c ? \"%s\" : (void *)0` is the sixth C 6.5.15p6 operand pairing (object pointer beside `void *`) and it was the one DSS did not implement — the conditional typed as the ARRAY, reached the aggregate-Ternary lowering, and the compile died `error[H_UnsupportedLoweringForKind]: lvalue kind 'Cast' (ordinal 32)`. That is a refusal BELOW `DSS = (gcc u clang u MSVC) u ISO C`: MEASURED 2026-09-01 with each reference probed SEPARATELY at -O0 AND -O2, gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51.36252 ALL compile it with NO diagnostic at all. So the fix is ACCEPTANCE, not a better message. Each arm is SELECTED at runtime and then dereferenced or compared, and both arm ORDERS are exercised, so a conditional that picked the wrong arm changes the exit code rather than merely still compiling. RED-ON-DISABLE: revert the `void *` arm in the semantic combineTernary and in the cst_to_hir combineTernary -> the conditional types as char[3] and this example does not COMPILE (H_UnsupportedLoweringForKind), which is a harder red than a wrong number.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

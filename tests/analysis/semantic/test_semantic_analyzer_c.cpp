@@ -5394,20 +5394,72 @@ TEST(SemanticAnalyzerC, PointerSubtractionReturnAndAssignIsClean) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
-// c40d — GUARD: MISMATCHED-pointee `char* - int*` does NOT get the ptrdiff rule
-// (same-pointee only) → it stays a Ptr-typed value. When that value is passed to
-// a NUMERIC param the call-arg `isAssignable` rejects it (S_TypeMismatch). NOTE:
-// this is the ARG-CONTEXT catch ONLY — in a non-arg context (`(int)(a-b)`,
-// `long n=a-b`) a mismatched-pointee difference is NOT diagnosed today (a
-// deferred general fail-loud, D-CSUBSET-POINTER-DIFF-EDGE-CASES, flagged by the
-// c40 audit). This pin documents the arg-context behavior, not a universal flag.
-TEST(SemanticAnalyzerC, MismatchedPointeeSubtractionRejectedAsNumericArg) {
+// ── P48 (D-CSUBSET-POINTER-DIFF-EDGE-CASES part 2) — THIS PIN WAS INVERTED, AND
+//    THE MEASUREMENT IS WHY ────────────────────────────────────────────────────
+//
+// It used to assert `EXPECT_GE(S_TypeMismatch, 1)` — the mismatched-pointee
+// `char* - int*` REFUSED in numeric-arg context. That refusal was BELOW the
+// union. ✔MEASURED 2026-09-01, each reference probed SEPARATELY at -O0 AND -O2:
+// gcc 13.3.0 (*"invalid operands to binary -"*), clang 18.1.3 (*"'char *' and
+// 'int *' are not pointers to compatible types"*) and mingw-w64 gcc 13.2.0
+// reject it, but MSVC 19.51.36252 (`/std:c17`) COMPILES it with `C4133: '-':
+// incompatible types - from 'int *' to 'char *'`. `DSS = (gcc ∪ clang ∪ MSVC) ∪
+// ISO C` settles accept-vs-refuse by the DISJUNCTION, so DSS must accept.
+//
+// ★ AND THE OLD VERDICT WAS NOT EVEN CONSISTENT WITH ITSELF: the identical
+// expression compiled in a CAST context (`(int)(a - b)`) and was refused in an
+// arg or init context, because the refusal was an incidental `isAssignable`
+// failure on an un-typed `Ptr` rather than a decision about the subtraction. The
+// pin's own comment said so. It is now typed as the pointer-difference type in
+// every context, with `S_PointerDifferenceIncompatiblePointee` (a WARNING,
+// matching MSVC's severity) reported AT the operator.
+TEST(SemanticAnalyzerC, MismatchedPointeeSubtractionWarnsAndStillTypesAsPtrdiff) {
     auto model = analyzeShipped("c", {
         "void g(long x){ (void)x; }\n"
         "int f(char* a, int* b){ g(a - b); return 0; }\n"
         "int main(void){ return 0; }\n",
     });
-    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+    // Accepted: no type error anywhere, in ANY context.
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    // Diagnosed: exactly one warning, at the subtraction itself.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_PointerDifferenceIncompatiblePointee),
+              1u);
+}
+
+// P48 — the CONTEXT-INDEPENDENCE half of the pin above: the same expression in a
+// cast, an initializer and an argument gets the SAME verdict (one warning each,
+// no error). Red-on-disable: revert the `combineBinary` mismatched-pointee arm
+// and the initializer form fails S_TypeMismatch while the cast form stays clean —
+// the asymmetry this closed.
+TEST(SemanticAnalyzerC, MismatchedPointeeSubtractionVerdictDoesNotDependOnContext) {
+    auto model = analyzeShipped("c", {
+        "void g(long x){ (void)x; }\n"
+        "int f(char* a, int* b){\n"
+        "  int   c = (int)(a - b);\n"
+        "  long  n = a - b;\n"
+        "  g(a - b);\n"
+        "  return c + (int)n;\n"
+        "}\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_PointerDifferenceIncompatiblePointee),
+              3u);
+}
+
+// P48 — POLARITY CONTROL: a SAME-pointee difference draws NO warning. Without it
+// this pair could both pass over a check that fires on every subtraction.
+TEST(SemanticAnalyzerC, SamePointeeSubtractionDrawsNoIncompatiblePointeeWarning) {
+    auto model = analyzeShipped("c", {
+        "long span(char* a, char* b){ return a - b; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_PointerDifferenceIncompatiblePointee),
+              0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // ── c41 D-CSUBSET-POINTER-INT-ARITHMETIC — `p ± n` is a pointer (C 6.5.6p8) ──
@@ -18910,3 +18962,425 @@ TEST(SemanticAnalyzerC, GnuConstructorOnADataObjectIsReportedByTheDeclKindGate) 
         << "…as a WARNING: the gate's severity is uniform across its axes";
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// P48 lane sm — three C-constraint rows, and the reference verdict that decided
+// each one's SEVERITY. Every measurement below was taken 2026-09-01 with each
+// reference probed SEPARATELY at -O0 AND -O2:
+//   gcc 13.3.0 (`-std=c2x`, WSL) · clang 18.1.3 (`-std=c23`, WSL) ·
+//   mingw-w64 gcc 13.2.0 (native) · MSVC 19.51.36252 (`/std:c17`, `cl /c`).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── D-CSUBSET-POINTEE-CONST-ENFORCEMENT — writing through a const lvalue ──────
+//
+// UNANIMOUS HARD REJECT on all four references for every shape below, so the
+// diagnostic is REQUIRED and Error is the measured severity. Before P48 DSS
+// compiled all of them in silence: SE4's const check looked at a PLAIN
+// IDENTIFIER LHS and nothing else.
+
+// The row's pin (i): a deref of a pointer-to-const.
+TEST(SemanticAnalyzerC, WriteThroughPointerToConstIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "void f(const char *p){ *p = 'x'; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// ── P48 lane cq — THE ROW'S PIN (ii), A FIELD DECLARED `const` ────────────────
+//
+// ⚠ THE PIN ABOVE THIS ONE WAS DELETED BY LANE `sm`, ON PURPOSE, AND IT IS BACK.
+// `sm` measured that the walk asked the right question — `symbolConstAt(
+// mr.fieldSym, level)` — and that the ANSWER was missing in CONFIG rather than
+// in code: c's `structField` and `unionField` declaration rows carried
+// `volatileMarker` ALONE, so a member's own `const` keyword was scanned by
+// nothing and `SymbolRecord.isConst` was never set on any field symbol. `sm`
+// could not edit `c.lang.json`, so rather than let a test assert the defective
+// silence it removed the pin and said so in place. Lane cq re-measured the
+// premise, found it exact (7 declaration rows carry all three qualifier markers;
+// `typedefDecl`, `structField` and `unionField` carried `volatileMarker` alone),
+// added `constMarker` + `restrictMarker` to the two field rows, and these tests
+// are the pin that was owed. NO C++ CHANGED — the closure is entirely config.
+//
+// ★★ THE REFERENCE VERDICT, RE-MEASURED 2026-09-01 BY THIS LANE rather than
+// inherited: gcc 13.3.0 (`-std=c2x`), clang 18.1.3 (`-std=c23`), mingw-w64 gcc
+// 13.2.0 and MSVC 19.51.36252 (`/std:c17`), each probed SEPARATELY, at -O0 AND
+// -O2, one self-contained translation unit per shape. UNANIMOUS HARD REJECT on
+// all eight const-field shapes — gcc/mingw *"assignment of read-only member
+// 'v'"*, clang *"cannot assign to non-static data member 'v' with
+// const-qualified type 'const int'"*, MSVC `error C2166: l-value specifies
+// const object` — and UNANIMOUS ACCEPT on all five controls. A unanimous refusal
+// is what makes the diagnostic REQUIRED and Error the references' own severity.
+//
+// ★ NO NEW DIAGNOSTIC CODE. `S_ConstViolation` already names this fault for the
+// plain-identifier LHS and for every shape `sm` widened the walk to; a second
+// ordinal for the same constraint violation would be a worse outcome than none.
+
+// The arrow form — the row's own spelling of pin (ii).
+TEST(SemanticAnalyzerC, WriteToAConstDeclaredFieldThroughAPointerIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "struct S { const int v; };\n"
+        "void f(struct S *s){ s->v = 5; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// The dot form on a local object. The OBJECT is not const here — only the
+// member is — so this fires from the field symbol's own `isConst`, never from
+// the object side of the walk, which is what separates it from
+// `WriteToAMemberOfAConstObjectIsAConstViolation` above.
+TEST(SemanticAnalyzerC, WriteToAConstDeclaredFieldOfANonConstObjectIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "struct S { const int v; };\n"
+        "int main(void){ struct S s = {1}; s.v = 2; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// ⚠ `unionField` IS A SEPARATE CONFIG ROW AND WAS THEREFORE A SEPARATE
+// OMISSION. A language whose `struct` enforces a member's const and whose
+// `union` does not is one no reference implements — all four reject this with
+// the same error they give the struct form.
+TEST(SemanticAnalyzerC, WriteToAConstDeclaredUnionFieldIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "union U { const int v; int w; };\n"
+        "void f(union U *u){ u->v = 5; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// Compound assignment reaches the same `assignments` entries, so the field
+// answer must ride it exactly as the pointee answer already does.
+TEST(SemanticAnalyzerC, CompoundAssignToAConstDeclaredFieldIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "struct S { const int v; };\n"
+        "void f(struct S *s){ s->v += 1; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// A CONST POINTER member (`int *const p`) — the c36 axis one level in. The
+// field's const sits on the outermost POINTER LAYER, not on the head, so this
+// is what proves the field row reaches `declaratorObjectIsConst` and not merely
+// a coarse whole-declaration token scan: a scan would answer the same here but
+// would also fire on the control below, and the two together pin the direction.
+TEST(SemanticAnalyzerC, WriteToAConstPointerFieldIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "struct S { int *const p; };\n"
+        "void f(struct S *s){ s->p = 0; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// Two member steps composed, with the const on the INNER member. Neither the
+// object nor the outer member is const, so a walk that only ever consulted the
+// base object would miss this entirely.
+TEST(SemanticAnalyzerC, WriteToANestedConstDeclaredFieldIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "struct Inner { const int v; };\n"
+        "struct Outer { struct Inner in; };\n"
+        "void f(struct Outer *o){ o->in.v = 5; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// C 6.5.2.3 through a member: a `const struct Inner` MEMBER makes ITS members
+// const. The inner member is declared plain, so this reads the OBJECT side of
+// the walk at level 0 with the object itself being another field.
+TEST(SemanticAnalyzerC, WriteToAMemberOfAConstDeclaredStructFieldIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "struct Inner { int v; };\n"
+        "struct Outer { const struct Inner in; };\n"
+        "void f(struct Outer *o){ o->in.v = 5; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// An ELEMENT of a const-declared ARRAY member: the subscript adds a level, so
+// this reads the field symbol's qualifier SPINE at level 1 rather than its
+// `isConst` at level 0 — the config change has to reach `declaratorConstSpine`,
+// not only `declaratorObjectIsConst`, and this is the pin that says so.
+TEST(SemanticAnalyzerC, WriteToAnElementOfAConstDeclaredArrayFieldIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "struct S { const int a[2]; };\n"
+        "void f(struct S *s){ s->a[0] = 5; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// ★★ THE POLARITY CONTROLS FOR THE FIELD AXIS, AND THEY ARE THE HALF THAT
+// MATTERS: a marker that answered `const` for every member would satisfy all
+// eight pins above while refusing correct C across the whole sqlite corpus,
+// where `const char *zName;` members are everywhere. `struct S { const int *p; }`
+// declares a MUTABLE pointer to const — assigning the POINTER is legal, and all
+// four references accept it. `int *restrict p` is here because `restrictMarker`
+// rides beside `constMarker` on the all-or-nothing spine rule and must not, by
+// arriving, change any verdict.
+TEST(SemanticAnalyzerC, WritesToNonConstFieldsDrawNoConstViolation) {
+    auto model = analyzeShipped("c", {
+        "struct S { int v; const int *p; int *restrict r; };\n"
+        "struct T { int a[2]; };\n"
+        "void f(struct S *s, int *q, struct T *t){\n"
+        "  s->v = 5;\n"
+        "  s->p = 0;\n"
+        "  s->r = q;\n"
+        "  t->a[0] = 5;\n"
+        "}\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// A const-declared member READ, and INITIALIZED through the aggregate
+// initializer that is the only way C lets you give it a value. Neither is an
+// assignment, and neither may be caught.
+TEST(SemanticAnalyzerC, ReadingAndInitializingAConstDeclaredFieldIsClean) {
+    auto model = analyzeShipped("c", {
+        "struct S { const int v; };\n"
+        "int main(void){ struct S s = {41}; return s.v - 41; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ★★★ THE ONE SHAPE IN THIS FAMILY WHERE THE REFERENCES SPLIT, AND IT SPLITS ON
+// ACCEPT-vs-REFUSE, SO THE DISJUNCTION GOVERNS AND DSS MUST NOT REFUSE.
+// ✔MEASURED 2026-09-01, each probed SEPARATELY: a member that is BOTH declared
+// `const` AND a BIT-FIELD is a WARNING THAT COMPILES on gcc 13.3.0 and
+// mingw-w64 gcc 13.2.0 — *"assignment of read-only location 's->v'"*, exit 0,
+// and unchanged under `-std=c17`, `-Wall -Wextra` AND `-pedantic-errors` — while
+// clang 18.1.3 and MSVC 19.51.36252 REJECT it. gcc ERRORS on the identical write
+// to a non-bit-field const member, so this is a real, narrow gcc leniency and
+// not a probe artifact. An Error here would be a refusal BELOW the union; silence
+// would drop a diagnostic ISO C requires and all four references emit. DSS
+// reports and COMPILES.
+TEST(SemanticAnalyzerC, WriteToAConstDeclaredBitFieldWarnsAndStillCompiles) {
+    auto model = analyzeShipped("c", {
+        "struct S { const int v : 3; };\n"
+        "union  U { const int w : 3; int x; };\n"
+        "void f(struct S *s, union U *u){ s->v = 1; u->w = 1; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 2u)
+        << "ISO C 6.5.16.1 is violated and all four references say so — the "
+           "split is only over severity, never over whether to speak";
+    EXPECT_FALSE(model.hasErrors())
+        << "gcc and mingw-w64 gcc COMPILE this; an Error would refuse a program "
+           "the reference union accepts";
+}
+
+// ★★ THE PREDICATE IS NARROWER THAN "the LHS is a bit-field", AND THIS IS THE
+// PIN THAT SAYS SO. A PLAIN bit-field of a CONST OBJECT is a HARD ERROR on all
+// four references — ✔MEASURED, gcc included — because gcc's leniency is about
+// the const on the MEMBER'S OWN declaration, not about bit-field-ness. A
+// severity fork keyed on bit-field-ness alone would pass the test above while
+// silently softening this unanimous case.
+TEST(SemanticAnalyzerC, WriteToAPlainBitFieldOfAConstObjectIsStillAnError) {
+    auto model = analyzeShipped("c", {
+        "struct S { int v : 3; };\n"
+        "void f(const struct S *s){ s->v = 1; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+    EXPECT_TRUE(model.hasErrors())
+        << "all four references REJECT this; a Warning here would be an "
+           "invented permissiveness ABOVE the union";
+}
+
+// ⚠ THE ANONYMOUS-FIELD MINTING SITE BECOMES REACHABLE FOR THE FIRST TIME with
+// this key, because it is guarded by `decl.constMarker.has_value()` and that
+// was false for every field row until now. It mints through a COARSE whole-node
+// scan, which its own in-code comment argues is harmless (an anonymous field is
+// never an assignment LHS). This is the pin that holds that argument to the
+// tree rather than to the comment.
+TEST(SemanticAnalyzerC, AnonymousAndAnonymousCompositeFieldsAreUnaffectedByTheFieldConstMarker) {
+    auto model = analyzeShipped("c", {
+        "struct B { int a; int : 3; int b; };\n"
+        "struct A { int a; struct { int x; }; };\n"
+        "int main(void){ struct B b = {1, 2}; struct A a; \n"
+        "  b.a = 4; b.b = 5; a.a = 1; a.x = 2;\n"
+        "  return (b.a - 4) + (a.x - 2); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// The row's pin (iii): an element of a const ARRAY. The spine puts the element
+// at level 1 (`const int a[2]` folds to [Array] + base(const)), which is why the
+// subscript answers const while the array NAME itself answers from `isConst`.
+TEST(SemanticAnalyzerC, WriteToAConstArrayElementIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "int main(void){ const int a[2] = {1, 2}; a[0] = 5; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// C 6.5.2.3: a member of a CONST OBJECT is const-qualified even when the member
+// declaration is not. The object side of the walk, at level 0.
+TEST(SemanticAnalyzerC, WriteToAMemberOfAConstObjectIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "struct S { int v; };\n"
+        "int main(void){ const struct S s = {1}; s.v = 2; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// The arrow form of the same rule: `p->v` is `(*p).v`, so a pointer-to-const
+// object makes the member const. This is the case a `.`-only walk would miss.
+TEST(SemanticAnalyzerC, WriteThroughAPointerToConstStructIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "struct S { int v; };\n"
+        "void f(const struct S *s){ s->v = 2; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// Subscript through a pointer-to-const, then a member — two walk steps composed.
+TEST(SemanticAnalyzerC, WriteToAMemberOfAConstArrayElementIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "struct S { int v; };\n"
+        "void f(const struct S *a){ a[1].v = 3; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// Two levels of indirection: `const int *const *p; **p = 1;` reads spine bit 2.
+TEST(SemanticAnalyzerC, WriteThroughADoubleConstPointerIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "void f(const int *const *p){ **p = 1; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// COMPOUND assignment routes through the same `assignments` entries, so it must
+// draw the same verdict — the references reject `*p += 1` exactly as they reject
+// `*p = 1`.
+TEST(SemanticAnalyzerC, CompoundAssignThroughPointerToConstIsAConstViolation) {
+    auto model = analyzeShipped("c", {
+        "void f(const int *p){ *p += 1; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// ★★ THE POLARITY CONTROLS. Every shape above with the `const` REMOVED must stay
+// silent — a check that fired on every deref / member / subscript would pass the
+// pins above while refusing correct code, and this pair is what tells them apart.
+// `const char *p; p++` (a MUTABLE pointer to const, the c36 shape) is included
+// because that is the exact false positive c36 was written to kill.
+TEST(SemanticAnalyzerC, WritesThroughNonConstLvaluesDrawNoConstViolation) {
+    auto model = analyzeShipped("c", {
+        "struct S { int v; };\n"
+        "void f(char *p, int *q, struct S *s, struct S *a){\n"
+        "  *p = 'x';\n"
+        "  q[0] = 5;\n"
+        "  s->v = 2;\n"
+        "  a[1].v = 3;\n"
+        "}\n"
+        "void walk(const char *r){ r++; r += 2; }\n"
+        "int main(void){ int b[2] = {1, 2}; b[0] = 5; return b[0] - 5; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ⚠ THE SHAPE THE OBJECT QUALIFIER MUST **NOT** REACH (C 6.5.2.3). A `const
+// struct S` makes the member `p` an `int *const`; it does NOT make `*p` a
+// `const int`. Writing through it is legal, and a walk that propagated the
+// object's const past level 0 would refuse this correct program.
+TEST(SemanticAnalyzerC, ConstObjectDoesNotMakeItsPointerMembersPointeeConst) {
+    auto model = analyzeShipped("c", {
+        "struct S { int *p; };\n"
+        "void f(const struct S s){ *s.p = 1; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+
+// ── D-CSUBSET-TERNARY-ARRAY-ARM-INCOMPATIBLE ─────────────────────────────────
+
+// Part (1): an array arm beside a NON-null-constant integer. ALL FOUR references
+// WARN AND COMPILE (gcc/mingw "pointer/integer type mismatch in conditional
+// expression", clang the same under `-Wconditional-type-mismatch`, MSVC
+// `C4047`), so this is a Warning and the program still builds — an Error would
+// refuse what the whole union accepts.
+TEST(SemanticAnalyzerC, ConditionalWithArrayArmAndNonZeroIntWarnsAndCompiles) {
+    auto model = analyzeShipped("c", {
+        "int main(void){ int c = 1; (void)(c ? \"%s\" : 1); return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConditionalOperandTypeMismatch), 1u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// The same constraint with a plain pointer arm and a RUNTIME integer — neither
+// operand is a literal, so a check keyed on literal shapes would miss it.
+TEST(SemanticAnalyzerC, ConditionalWithPointerArmAndRuntimeIntWarns) {
+    auto model = analyzeShipped("c", {
+        "int main(void){ int c = 1, n = 3; char *p = 0;\n"
+        "  (void)(c ? p : n); (void)(c ? \"%s\" : n); return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConditionalOperandTypeMismatch), 2u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ★★ POLARITY CONTROL for part (1): every pairing C 6.5.15p3 DOES admit stays
+// silent — pointer/null-pointer-constant (the c66 `? "%s" : 0` sqlite idiom),
+// two arrays (c64), two arithmetic arms, and the P48 object-pointer/`void *`
+// pairing below. Without this the warning could fire across the sqlite corpus.
+TEST(SemanticAnalyzerC, AdmissibleConditionalPairingsDrawNoOperandWarning) {
+    auto model = analyzeShipped("c", {
+        "int main(void){ int c = 1; char *p = 0;\n"
+        "  (void)(c ? \"%s\" : 0);\n"
+        "  (void)(c ? \"a\" : \"bb\");\n"
+        "  (void)(c ? p : 0);\n"
+        "  (void)(c ? 1 : 2);\n"
+        "  (void)(c ? \"%s\" : (void *)0);\n"
+        "  return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConditionalOperandTypeMismatch), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// Part (2), AND IT RUNS THE OTHER WAY: `c ? "%s" : (void *)0` is the sixth
+// C 6.5.15p6 pairing (object pointer beside `void *`) and ALL FOUR references
+// accept it with NO diagnostic at all. DSS REFUSED it —
+// `H_UnsupportedLoweringForKind`, because the conditional typed as the ARRAY and
+// reached the aggregate lowering — which is a refusal BELOW the union. The fix
+// is acceptance, not a better message. Red-on-disable: revert the semantic and
+// HIR `void *` arms and the conditional types as `char[3]` again.
+TEST(SemanticAnalyzerC, ConditionalWithArrayArmAndVoidPointerIsAccepted) {
+    auto model = analyzeShipped("c", {
+        "const char *f(int c){ return c ? \"%s\" : (void *)0; }\n"
+        "int main(void){ return f(1) == 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConditionalOperandTypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// The pointer form of the same pairing, both arm orders.
+TEST(SemanticAnalyzerC, ConditionalWithObjectPointerAndVoidPointerIsAccepted) {
+    auto model = analyzeShipped("c", {
+        "void *f(int c, char *p, void *v){ return c ? p : v; }\n"
+        "void *g(int c, char *p, void *v){ return c ? v : p; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConditionalOperandTypeMismatch), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
