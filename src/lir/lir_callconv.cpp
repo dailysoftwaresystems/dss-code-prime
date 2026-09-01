@@ -834,32 +834,62 @@ LirInstId emitStackProbe(LirBuilder& b, std::uint16_t op, LirReg sp,
     return b.addInst(op, InvalidLirReg, ops);
 }
 
-// D-ASM-AARCH64-LARGE-FRAME-IMM12 (chokepoint selection): pick the frame
-// load/store mnemonic from the OFFSET VALUE. The unscaled form (`load`/
-// `store`, AArch64 LDUR/STUR imm9) reaches only ±256; a frame offset beyond
-// that (a deep spill area, a ≥9-fixed-param callee's 9th incoming-stack
-// param, a high saved-reg slot) takes the SCALED unsigned-offset form
-// (`load_u`/`store_u`, LDR/STR imm12-scaled, reach 4095*accessSize). This
-// MUST be decided HERE, not in the encoder: the encoder's variant selector
-// commits on operand KINDS (both forms share [reg, membase, memoffset]) and
-// cannot inspect the offset value, and the encoder does not backtrack on an
-// encode-range failure (§B.1). Placed at the SINGLE chokepoint every frame
-// load/store funnels through (emitFrameLoad/emitFrameStore) so the swap
-// covers incoming args, spill reload/store, saved-reg save/restore, and the
-// variadic spills BY CONSTRUCTION — no per-site application to miss.
+// ── THE FRAME MEMORY-OP TWIN TABLE ──────────────────────────────────────────
 //
-// AGNOSTIC: the swap is gated on `baseOp` BEING the universal GPR `load`/
-// `store` (`universalGprOp` — so an FPR/other-class form, fldur/fstur/fstur_q,
-// keeps its own encoding; those have no scaled twin here, and the `==` gate is
-// what makes the chokepoint SAFE to feed every class's op through), and on
-// `scaledOp != 0` (`load_u`/`store_u` absent ⇒ field 0 on a target without the
-// scaled form, e.g. x86_64 — whose memory ops already carry a disp32, so the
-// imm9 path is never hit). On x86_64 the swap is inert and the emitted bytes
-// are byte-identical. The genuinely-unencodable TAIL (negative beyond −256,
+// D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM. One row per
+// register class: the class's SHORT-reach frame load/store and the SCALED
+// long-reach twin each may be swapped for. Resolved once per module from
+// `registerClassOps` (`resolveOpcodeHandles`), so a class that declares no
+// twin leaves its scaled fields 0 and the swap is inert for it.
+//
+// ★ THE TABLE IS WHAT MAKES THE CHOKEPOINT PER-CLASS RATHER THAN PER-TARGET.
+// The predecessor threaded ONE (universal GPR op, its scaled twin) pair down
+// to the chokepoint and compared `baseOp` against it — which answered "is this
+// the integer file's load?" when the question is "does the op I was handed
+// have a longer-reach twin?". Those coincide only while one class has a twin.
+struct FrameMemScaledOps {
+    std::uint16_t load        = 0;  // the class's short-reach load  (swap FROM)
+    std::uint16_t loadScaled  = 0;  // its scaled long-reach twin    (swap TO)
+    std::uint16_t store       = 0;
+    std::uint16_t storeScaled = 0;
+};
+using FrameMemScaledTable =
+    std::array<FrameMemScaledOps, kTargetRegClassCount>;
+
+// D-ASM-AARCH64-LARGE-FRAME-IMM12 (chokepoint selection): pick the frame
+// load/store mnemonic from the OFFSET VALUE. The unscaled form (AArch64
+// LDUR/STUR imm9 — `load`/`store` for the integer file, `fldur`/`fstur` for
+// SIMD&FP) reaches only ±256; a frame offset beyond that (a deep spill area, a
+// ≥9-fixed-param callee's 9th incoming-stack param, a high saved-reg slot, an
+// FP slot in a frame whose stride is 16) takes the SCALED unsigned-offset form
+// (LDR/STR imm12-scaled, reach 4095*accessSize). This MUST be decided HERE, not
+// in the encoder: the encoder's variant selector commits on operand KINDS (both
+// forms share [reg, membase, memoffset]) and cannot inspect the offset value,
+// and the encoder does not backtrack on an encode-range failure (§B.1). Placed
+// at the SINGLE chokepoint every frame load/store funnels through
+// (emitFrameLoad/emitFrameStore) so the swap covers incoming args, spill
+// reload/store, saved-reg save/restore, and the variadic spills BY
+// CONSTRUCTION — no per-site application to miss.
+//
+// AGNOSTIC, AND MORE SO THAN THE PREDECESSOR WAS: the swap is a LOOKUP OF
+// `baseOp` IN THE PER-CLASS TWIN TABLE
+// (D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM).
+// No class is privileged, no architecture is named,
+// and a class with no twin declared simply is not in the table with a nonzero
+// scaled field — so the short form is kept and, on a target whose memory forms
+// already carry a wide displacement (x86_64's disp32), the emitted bytes are
+// byte-identical. The genuinely-unencodable TAIL (negative beyond −256,
 // non-access-aligned, or scaled >4095) keeps `baseOp` and STAYS fail-loud at
 // the encoder — the narrower residual
 // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-SCALED-IMM12 (register-offset /
-// address-materialization, future).
+// address-materialization).
+//
+// ⚠ THE LOOKUP IS BY OPCODE IDENTITY, WHICH IS WHY A MIS-FILED TWIN WOULD BE A
+// SILENT WRONG ANSWER RATHER THAN A REFUSAL — filing the integer `load_u`
+// under `{"class":"fpr"}` would make a large-frame FP reload emit `LDR Xt` and
+// land the float in an integer register of the same hwEncoding. `validate()`
+// refuses that where the config is judged (the memory-verb bank check), which
+// is the load-time half of this chokepoint's correctness.
 //
 // accessSizeBytes: the chokepoint emits a frame op of the caller's stated WIDTH
 // (`widthFlags`, 0 ⇒ width 64), so the encoder's `instWidth` matches and its
@@ -877,12 +907,17 @@ LirInstId emitStackProbe(LirBuilder& b, std::uint16_t op, LirReg sp,
 // large frame, i.e. only in the shapes a small test never builds.
 // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED.
 [[nodiscard]] std::uint16_t
-selectFrameMemOp(std::uint16_t baseOp, std::uint16_t universalGprOp,
-                 std::uint16_t scaledOp, std::int32_t offset,
-                 std::uint8_t widthFlags = 0) {
-    // Only the universal GPR load/store has the scaled twin; an FPR/other
-    // class op is never swapped (it would mis-encode as a GPR LDR/STR).
-    if (scaledOp == 0 || baseOp != universalGprOp) return baseOp;
+selectFrameMemOp(std::uint16_t baseOp, FrameMemScaledTable const& twins,
+                 std::int32_t offset, std::uint8_t widthFlags) {
+    // The scaled twin of `baseOp`, whichever class declared it. 0 (the invalid
+    // opcode sentinel) both for a class with no twin and for an op that is not
+    // a frame memory verb at all — one `== 0` bail covers both.
+    std::uint16_t scaledOp = 0;
+    for (auto const& row : twins) {
+        if (row.load  != 0 && row.load  == baseOp) { scaledOp = row.loadScaled;  break; }
+        if (row.store != 0 && row.store == baseOp) { scaledOp = row.storeScaled; break; }
+    }
+    if (scaledOp == 0) return baseOp;
     bool const fitsImm9 = offset >= -256 && offset <= 255;
     if (fitsImm9) return baseOp;
     std::uint32_t const accessSizeBytes =
@@ -901,24 +936,34 @@ selectFrameMemOp(std::uint16_t baseOp, std::uint16_t universalGprOp,
 // Emit `store reg, [SP + offset]` (saved-reg store, or frame-store
 // materialization). `store` operand layout per x86_64.target.json:
 // [value_reg, base_reg, MemBase(scale), MemOffset(disp)] — 4 ops, no result.
-// `universalStore`/`storeU` are the universal GPR `store` opcode and its
-// scaled-imm12 twin `store_u` (both 0 on a target without the scaled form);
-// the chokepoint swaps to `storeU` for an out-of-imm9 GPR-store offset (see
-// selectFrameMemOp). Threading them through the ONE store chokepoint covers
-// every frame-store caller (saved-reg, spill, va-spill, by-value copy) by
-// construction.
+// `twins` is the per-class (short-reach → scaled) frame memory-op table; the
+// chokepoint swaps `storeOp` for ITS OWN CLASS's scaled twin when the offset
+// overruns the short reach (see selectFrameMemOp). Threading the table through
+// the ONE store chokepoint covers every frame-store caller (saved-reg, spill,
+// va-spill, by-value copy) of every class by construction.
 //
 // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: `widthFlags` states the
-// ACCESS WIDTH (`kLirInstFlagWidth*`; 0 ⇒ 64-bit, which is what every frame slot,
-// spill, saved register and va-spill is). It DEFAULTS to 0 so all pre-existing
-// call sites keep emitting the exact byte sequence they always did BY
-// CONSTRUCTION rather than by re-measuring each of them — only the two stacked-
-// argument sites pass anything else, and only when the CC declares that a stacked
-// datum owns fewer bytes than a slot.
+// ACCESS WIDTH (`kLirInstFlagWidth*`; 0 ⇒ 64-bit).
+//
+// ⚠⚠ IT IS REQUIRED, AND THE DEFAULT IT USED TO CARRY WAS THE DEFECT
+// D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT
+// NAMES. The parameter read `std::uint8_t widthFlags = 0`, justified as keeping
+// "all pre-existing call sites emitting the exact byte sequence they always
+// did BY CONSTRUCTION rather than by re-measuring each of them" — which is
+// true, and is exactly how a saved-register store of the SIXTEEN-byte `xmm15`
+// came to move eight bytes: the site that never thought about width was
+// indistinguishable from the site that had thought about it and chosen 64.
+// ✔MEASURED at HEAD (`ms_x64`, pe64): `movsd %xmm15,0x20(%rsp)` into a slot
+// `frameSlotStride` had made 16 bytes wide, no diagnostic. With the default
+// gone, a call site that forgets the width does not compile; the two published
+// derivations in `lir_callconv.hpp` (`wholeRegisterAccessFlags` for DSS-private
+// slots, `calleeSavedAccessFlags` for the ABI-facing save) are what the
+// whole-register sites pass, and the stacked-argument sites keep passing the
+// width their own cursor chose.
 LirInstId emitFrameStore(LirBuilder& b, std::uint16_t storeOp, LirReg value,
                          LirReg sp, std::int32_t offset,
-                         std::uint16_t universalStore = 0, std::uint16_t storeU = 0,
-                         std::uint8_t widthFlags = 0) {
+                         FrameMemScaledTable const& twins,
+                         std::uint8_t widthFlags) {
     std::array<LirOperand, 4> ops{
         LirOperand::makeReg(value),
         LirOperand::makeReg(sp),
@@ -926,27 +971,30 @@ LirInstId emitFrameStore(LirBuilder& b, std::uint16_t storeOp, LirReg value,
         LirOperand::makeMemOffset(offset)
     };
     return b.addInst(
-        selectFrameMemOp(storeOp, universalStore, storeU, offset, widthFlags),
+        selectFrameMemOp(storeOp, twins, offset, widthFlags),
         InvalidLirReg, ops, /*payload=*/0, widthFlags);
 }
 
 // Emit `result = load [SP + offset]`. `load` operand layout:
 // [base_reg, MemBase(scale), MemOffset(disp)] — 3 ops + result.
-// `universalLoad`/`loadU` are the universal GPR `load` opcode and its scaled-
-// imm12 twin `load_u` (both 0 if none); the chokepoint swaps to `loadU` for
-// an out-of-imm9 GPR-load offset (see selectFrameMemOp).
-// `widthFlags`: see `emitFrameStore` — same contract, same 0-default, same reason.
+// `twins`: see `emitFrameStore` — the same per-class table, consulted for the
+// load direction.
+// `widthFlags`: see `emitFrameStore` — same contract, likewise REQUIRED, same
+// reason. ⚠ A load and its matching store must be given the SAME width: a
+// 16-byte save read back 8 bytes wide leaves the top half of the restored
+// register holding whatever the caller's value was, which is the same silent
+// wrong answer from the other direction.
 LirInstId emitFrameLoad(LirBuilder& b, std::uint16_t loadOp, LirReg result,
                         LirReg sp, std::int32_t offset,
-                        std::uint16_t universalLoad = 0, std::uint16_t loadU = 0,
-                        std::uint8_t widthFlags = 0) {
+                        FrameMemScaledTable const& twins,
+                        std::uint8_t widthFlags) {
     std::array<LirOperand, 3> ops{
         LirOperand::makeReg(sp),
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(offset)
     };
     return b.addInst(
-        selectFrameMemOp(loadOp, universalLoad, loadU, offset, widthFlags),
+        selectFrameMemOp(loadOp, twins, offset, widthFlags),
         result, ops, /*payload=*/0, widthFlags);
 }
 
@@ -1054,28 +1102,38 @@ struct OpcodeHandles {
     // FP varargs differently). Absent ⇒ 0; the FP-dup path requires it and fails loud
     // if a HomogeneousPointer CC reaches the dup with the opcode missing.
     std::uint16_t movqXmmToGpr;
-    // FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE): the 128-bit VR spill store (`fstur_q`,
-    // STUR Qt) the AAPCS64 variadic prologue uses to spill v0..v7 into the VR block of
-    // the register-save-area (16B slots — the class `store` op is the 8-byte D-form,
-    // which would spill only the low half). Optional (arm64 declares it; x86_64 does
-    // not — its SSE save uses the 16-byte movaps via the class store). Absent ⇒ 0; the
-    // AAPCS64 spill path requires it and fails loud if a dual-cursor CC reaches the
-    // VR-spill with the opcode missing.
-    std::uint16_t vaVrSpillStore;
-    // D-ASM-AARCH64-LARGE-FRAME-IMM12: the SCALED imm12 unsigned-offset LDR/STR
-    // (`load_u`/`store_u`), the large-frame siblings of the universal `load`/`store`
-    // (unscaled imm9). The frame load/store CHOKEPOINT (emitFrameLoad/emitFrameStore →
-    // selectFrameMemOp) picks these over `load`/`store` when the frame offset exceeds
-    // the imm9 ±256 reach — covering EVERY frame access (incoming args, spill reload/
-    // store, saved-reg save/restore, va spills) by construction. Optional — only a
-    // target with a scaled load/store form declares them (arm64 does; x86_64 does not —
-    // its memory forms already carry a disp32). Absent ⇒ field 0; the selection then
-    // keeps `load`/`store` and the encoder fails loud on an out-of-imm9 offset (the
-    // residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-SCALED-IMM12). Resolved via the same
-    // optional-handle table (FOLD 2 — NOT a new RegClassOp role; the scaled form is a
-    // single-ISA concern, parallel to fstur_q).
-    std::uint16_t loadU;
-    std::uint16_t storeU;
+    // ⚠ THERE IS NO `vaVrSpillStore` HANDLE ANY MORE (R2 of design A′). It
+    // named `fstur_q` — a SECOND store mnemonic that existed only because the
+    // 16-byte access looked like a different register CLASS's store while
+    // arm64 declared its SIMD&FP file twice. The AAPCS64 variadic prologue now
+    // resolves the FP class's OWN `store` and states 128 in the instruction's
+    // width flag, which elects that opcode's Q-form variant — one mnemonic,
+    // one class, the width where a width belongs.
+    // D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM: the
+    // (short-reach → scaled long-reach) frame memory-op twins, ONE ROW PER
+    // REGISTER CLASS. The frame load/store CHOKEPOINT (emitFrameLoad/
+    // emitFrameStore → selectFrameMemOp) swaps a short-reach op for its scaled
+    // twin when the frame offset overruns the short form's reach — covering
+    // EVERY frame access (incoming args, spill reload/store, saved-reg
+    // save/restore, va spills) of EVERY class by construction.
+    //
+    // ⚠⚠ THIS REPLACED A PAIR OF SCALAR FIELDS `loadU`/`storeU` THREADED
+    // ALONGSIDE `load`/`store`, AND THE SHAPE WAS THE DEFECT, not the values.
+    // The old chokepoint could only swap when `baseOp` WAS the universal GPR
+    // op, because those were the only two handles it had; a comment beside it
+    // read "an FPR fldur/fstur keeps its class encoding — those have no scaled
+    // twin here", which described the CONFIG rather than the machine. AArch64
+    // has had scaled SIMD&FP LDR/STR all along; nothing had declared it. So an
+    // FP frame access past ±256 kept the unscaled form and fail-louded at the
+    // encoder with no form to swap to (✔MEASURED: eight refusals in
+    // `examples/c/varargs_aapcs64_struct`). Keyed by class, the chokepoint
+    // asks a question about the OP IT WAS HANDED and never about which class
+    // is privileged.
+    //
+    // A class with no scaled twin declared leaves both fields 0, and 0 never
+    // matches a real opcode — so the swap is inert there and the short form is
+    // kept (x86_64, whose memory forms already carry a disp32).
+    FrameMemScaledTable frameMemScaled;
     // D-WIN64-LARGE-FRAME-STACK-PROBE: the `stack_probe` virtual op the
     // prologue emits INSTEAD of a plain `sub SP, F` when the cc declares
     // a nonzero `stackProbePageBytes` AND the frame exceeds it. The
@@ -1150,7 +1208,7 @@ void emitPrologue(LirBuilder& b, FrameLayout const& layout,
                   TargetSchema const& schema,
                   TargetCallingConvention const& cc, LirReg sp,
                   std::uint16_t subOp, std::uint16_t stackProbeOp,
-                  std::uint16_t gprStore, std::uint16_t gprStoreU,
+                  FrameMemScaledTable const& frameMemScaled,
                   std::vector<LirCfiOp>& cfiOut,
                   DiagnosticReporter& reporter, bool& ok) {
     // The CFA offset once this prologue's SP-adjust has run: what the CALL
@@ -1223,13 +1281,26 @@ void emitPrologue(LirBuilder& b, FrameLayout const& layout,
             schema, layout.savedRegs[i].regClass(), RegClassOp::Store,
             "callconv: prologue saved-reg store", reporter);
         if (!storeOp.has_value()) { ok = false; return; }
-        // Chokepoint swaps to store_u when a high saved-reg slot exceeds the
-        // imm9 reach (gprStore/gprStoreU are the GPR store + its scaled twin;
-        // an FPR saved-reg store keeps its class form — selectFrameMemOp gate).
+        // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT:
+        // the save's WIDTH is as class-resolved as its mnemonic, and it is the
+        // ABI's number rather than the register's — `cc` publishes how much of
+        // a callee-saved register of this class it guarantees preserved, and
+        // says nothing when the answer is "all of it". Before this, the width
+        // was `emitFrameStore`'s 64-bit default for every class on every
+        // target, so `ms_x64`'s 16-byte `xmm15` was saved eight bytes wide.
+        auto const saveWidth = calleeSavedAccessFlags(
+            schema, cc, layout.savedRegs[i].regClass(),
+            "callconv: prologue saved-reg store", reporter);
+        if (!saveWidth.has_value()) { ok = false; return; }
+        // Chokepoint swaps in the scaled twin when a high saved-reg slot
+        // exceeds the short reach — of the SAVED REGISTER'S OWN CLASS, so an
+        // FPR callee-save high in a big frame is covered exactly as a GPR one
+        // is (D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM).
         std::int32_t const slotOff =
             static_cast<std::int32_t>(base + i * layout.slotSize);
         LirInstId const st = emitFrameStore(b, *storeOp, layout.savedRegs[i],
-                                            sp, slotOff, gprStore, gprStoreU);
+                                            sp, slotOff, frameMemScaled,
+                                            *saveWidth);
         // The slot is at SP_post + slotOff and CFA == SP_post + framedCfaOffset,
         // so the saved location is CFA + (slotOff - framedCfaOffset) -- negative,
         // as every unwinder expects for a callee-save below the CFA.
@@ -1247,10 +1318,19 @@ void emitPrologue(LirBuilder& b, FrameLayout const& layout,
 // return address `totalFrameSize` bytes away from where it actually is. gcc
 // emits it (`.cfi_def_cfa 7, 8` after the frame teardown) for exactly this
 // reason. A frame SHAPE cannot express it -- there is no PC to hang it on.
+//
+// ⚠ IT TAKES THE `cc` FOR THE SAME REASON THE PROLOGUE DOES, AND THE PAIRING IS
+// THE POINT (D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT).
+// The restore's ACCESS WIDTH is the same declared number as the save's; reading
+// it from the same function on the same `cc` is what makes the two physically
+// unable to disagree, exactly as `savedRegAreaOffset()` already does for the
+// two directions' OFFSET.
 void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
-                  TargetSchema const& schema, LirReg sp,
-                  std::uint16_t addOp, std::uint16_t gprLoad,
-                  std::uint16_t gprLoadU, std::int64_t entryCfaOffset,
+                  TargetSchema const& schema,
+                  TargetCallingConvention const& cc, LirReg sp,
+                  std::uint16_t addOp,
+                  FrameMemScaledTable const& frameMemScaled,
+                  std::int64_t entryCfaOffset,
                   std::vector<LirCfiOp>& cfiOut,
                   DiagnosticReporter& reporter, bool& ok) {
     // Reverse the prologue: load saved regs FIRST, then restore SP.
@@ -1262,12 +1342,20 @@ void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
             schema, layout.savedRegs[i].regClass(), RegClassOp::Load,
             "callconv: epilogue saved-reg load", reporter);
         if (!loadOp.has_value()) { ok = false; return; }
-        // Chokepoint swaps to load_u for a high saved-reg slot (mirrors the
-        // prologue store; gprLoad/gprLoadU = GPR load + its scaled twin).
+        // The SAME derivation the prologue store used, on the same `cc` and the
+        // same class — a restore narrower than its save leaves the top of the
+        // register holding the caller's value rather than its own.
+        auto const restoreWidth = calleeSavedAccessFlags(
+            schema, cc, layout.savedRegs[i].regClass(),
+            "callconv: epilogue saved-reg load", reporter);
+        if (!restoreWidth.has_value()) { ok = false; return; }
+        // Chokepoint swaps in the scaled twin for a high saved-reg slot,
+        // mirroring the prologue store — same table, same per-class lookup, so
+        // the two directions of one slot cannot disagree about encodability.
         LirInstId const ld = emitFrameLoad(
             b, *loadOp, layout.savedRegs[i], sp,
             static_cast<std::int32_t>(base + i * layout.slotSize),
-            gprLoad, gprLoadU);
+            frameMemScaled, *restoreWidth);
         // Restored: the register holds its entry value again, so revert to this
         // function's ENTRY rule rather than inventing a fresh one.
         cfiOut.push_back(LirCfiOp{ld, CfiOpKind::RegRestoreInitial,
@@ -1320,11 +1408,45 @@ resolveCcReg(TargetSchema const& schema, std::string_view name, LirRegClass cls,
 emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
                           TargetSchema const& schema,
                           TargetCallingConvention const& cc, LirReg sp,
-                          std::uint16_t vaVrSpillStore, std::uint16_t addOp,
-                          std::uint16_t gprStore, std::uint16_t gprStoreU,
+                          std::uint16_t addOp,
+                          FrameMemScaledTable const& frameMemScaled,
                           DiagnosticReporter& reporter) {
     if (!cc.vaListLayout.has_value()) return true;   // guarded by caller, defensive
     VaListLayout const& vl = *cc.vaListLayout;
+
+    // ── THE SAVE-AREA ACCESS WIDTH, ONE DERIVATION FOR ALL FOUR SPILL LOOPS ──
+    //
+    // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT.
+    // The register-save area's geometry is DECLARED by this `vaListLayout` — a
+    // slot is `gpSlotBytes` / `fpSlotBytes` wide and `va_arg` reads it back at
+    // that stride — so the slot size is the width, and the register is spilled
+    // whole into it.
+    //
+    // ⚠ THREE OF THESE FOUR LOOPS USED TO TAKE `emitFrameStore`'s 64-BIT
+    // DEFAULT, AND ONE OF THE THREE WAS WRONG. `sysv_amd64` declares
+    // `fpSlotBytes: 16` — the SSE half of the 176-byte area SysV's `va_start`
+    // fills — and the spill emitted `movsd`, writing eight bytes into each
+    // sixteen-byte slot. The AAPCS64 FP loop was the ONE site that had already
+    // been made to derive its width from `fpSlotBytes` (and it is the site
+    // whose own defect taught that lesson); this hoists that derivation out so
+    // its three siblings cannot keep answering a question nobody asked them.
+    auto const vaSlotWidth =
+        [&](std::uint16_t slotBytes,
+            std::string_view label) -> std::optional<std::uint8_t> {
+        auto const flags = lirInstWidthFlagForBits(
+            static_cast<std::uint32_t>(slotBytes) * 8u);
+        if (!flags.has_value()) {
+            report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                   DiagnosticSeverity::Error,
+                   std::format("callconv: {}: this convention's vaListLayout "
+                               "declares a {}-byte save slot, which is not a "
+                               "width the LIR instruction model can state — the "
+                               "save area would be written at some other width "
+                               "with nothing to see in the build log",
+                               label, slotBytes));
+        }
+        return flags;
+    };
 
     if (vl.strategy == VaListStrategy::HomogeneousPointer) {
         // FC12c: Apple arm64 (variadicUsesOverflowBase) has NO home area — its named
@@ -1355,6 +1477,16 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
         auto const gpStore = classOpHandle(schema, LirRegClass::GPR, RegClassOp::Store,
                                            "callconv: Win64 home GPR spill", reporter);
         if (!gpStore.has_value()) return false;
+        // The home slot holds a WHOLE argument register — `va_arg` reads it
+        // back as one — so the access is the class's own full width, DERIVED
+        // rather than defaulted:
+        // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT.
+        // The bytes are unchanged on every shipped target, whose GPRs are 64
+        // bits; what changed is that a target whose integer file is wider
+        // would now spill all of it.
+        auto const gpWidth = wholeRegisterAccessFlags(
+            schema, LirRegClass::GPR, "callconv: Win64 home GPR spill", reporter);
+        if (!gpWidth.has_value()) return false;
         // The home space holds exactly the integer arg-register pool (4 on Win64).
         std::uint32_t const gpN =
             static_cast<std::uint32_t>(cc.argGprs.size());
@@ -1365,7 +1497,7 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
             emitFrameStore(b, *gpStore, *reg, sp,
                            static_cast<std::int32_t>(
                                homeBase + i * layout.outgoingSlotSize),
-                           gprStore, gprStoreU);
+                           frameMemScaled, *gpWidth);
         }
         return true;
     }
@@ -1393,13 +1525,6 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
         // the SP-adjust + saved-reg stores, before any body inst — the only live values
         // are the incoming args (x0..x7) and the incoming x8 sret pointer; every other
         // caller-saved GPR holds nothing.
-        if (vaVrSpillStore == 0) {
-            report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
-                   DiagnosticSeverity::Error,
-                   "callconv: AAPCS64 variadic prologue VR spill requires the "
-                   "128-bit 'fstur_q' opcode (D-FC12C-AAPCS64-VARIADIC-CALLEE)");
-            return false;
-        }
         // Pick a caller-saved GPR that is neither an arg register being spilled (x0..x7)
         // NOR the indirect-result register (x8 — the live incoming sret pointer; see the
         // block comment above). Config-derived over cc.callerSaved; on AAPCS64/Apple this
@@ -1455,6 +1580,9 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
                                            "callconv: AAPCS64 variadic GR spill",
                                            reporter);
         if (!gpStore.has_value()) return false;
+        auto const gpWidthFlags =
+            vaSlotWidth(vl.gpSlotBytes, "AAPCS64 variadic GR spill");
+        if (!gpWidthFlags.has_value()) return false;
         std::uint32_t const gpN =
             std::min<std::uint32_t>(vl.gpSaveCount,
                                     static_cast<std::uint32_t>(cc.argGprs.size()));
@@ -1465,36 +1593,57 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
             if (!reg.has_value()) return false;
             emitFrameStore(b, *gpStore, *reg, *scratch,
                            static_cast<std::int32_t>(i * vl.gpSlotBytes),
-                           gprStore, gprStoreU);
+                           frameMemScaled, *gpWidthFlags);
         }
-        // VR block: 16-byte slots via the 128-bit `fstur_q` (the class store is the
-        // 8-byte D-form, which would spill only the low half of a v-register), at
-        // [scratch + gpBlock + i*16]. The VR block follows the full GR block.
+        // FP block: 16-byte slots at [scratch + gpBlock + i*16], following the
+        // full GR block. AAPCS64 §B saves `q0..q7` — the WHOLE SIMD&FP
+        // register, sixteen bytes each — so this store is a Q-form access.
         //
-        // ★★ THE REGISTERS COME FROM `argVrs`, NOT `argFprs`
-        // (D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD). Those two CC lists
-        // name TWO VIEWS of one AArch64 register file: `argFprs` = `d0..d7`
-        // (8 bytes, class `fpr`), `argVrs` = `v0..v7` (16 bytes, class `vr`).
-        // This loop emits a SIXTEEN-byte store, so its data operand is the
-        // 16-byte view — the same one the target's `registerClassOps` `vr` row
-        // binds `fstur_q` to, and the same one `mir_to_lir`'s F128 path already
-        // uses for this opcode. Reading `argFprs` here (the shape this replaced)
-        // produced the RIGHT BYTES from the WRONG REGISTER: `d0` and `v0` share
-        // hardware encoding 0, so the operand claimed half the width the
-        // instruction moves and nothing downstream could see it. The encoder's
-        // register-class gate is what surfaced it, and `validate()` now pins
-        // `argVrs` to cover `fpSaveCount` so the list cannot come up short.
+        // ★★ ONE LIST, ONE CLASS, AND THE WIDTH IS STATED RATHER THAN IMPLIED
+        // BY A SECOND CLASS (R1+R2 of design A′;
+        // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD). This loop used to
+        // read `cc.argVrs` and resolve it as `LirRegClass::VR`, naming the
+        // `fstur_q` mnemonic directly, because arm64 declared its SIMD&FP file
+        // TWICE: `argFprs` = `d0..d7` (8 bytes, class `fpr`) and `argVrs` =
+        // `v0..v7` (16 bytes, class `vr`), two rows over one physical file.
+        // With the file declared once, `argFprs` names the FULL registers, the
+        // class store IS the right opcode, and the sixteen bytes come from the
+        // instruction's WIDTH FLAG electing that opcode's Q-form variant.
+        //
+        // ⚠ THE ORIGINAL DEFECT STAYS FIXED BY CONSTRUCTION RATHER THAN BY A
+        // SECOND LIST. It was a 16-byte `STUR Qt` whose data operand named an
+        // 8-byte `d0`; the bytes came out right only because `d0` and `v0`
+        // shared hwEncoding 0. There is no narrow ROW to name here any more,
+        // and the width the operand claims is the width the variant guard
+        // matched — they cannot disagree.
+        //
+        // ⚠ THE WIDTH IS DERIVED FROM `fpSlotBytes`, NOT ASSUMED. A layout
+        // declaring a different slot width gets that width's variant, or a
+        // loud election failure if the target declares none — never a silent
+        // half-register spill.
+        auto const fpStore = classOpHandle(schema, LirRegClass::FPR,
+                                           RegClassOp::Store,
+                                           "callconv: AAPCS64 variadic FP spill",
+                                           reporter);
+        if (!fpStore.has_value()) return false;
+        // The derivation this loop introduced, now HOISTED so its three
+        // siblings share it rather than each defaulting to 64 — see
+        // `vaSlotWidth` at the top of this function.
+        auto const fpWidthFlags =
+            vaSlotWidth(vl.fpSlotBytes, "AAPCS64 variadic FP spill");
+        if (!fpWidthFlags.has_value()) return false;
         std::uint32_t const vrBase = vl.gpSaveCount * vl.gpSlotBytes;
         std::uint32_t const fpN =
             std::min<std::uint32_t>(vl.fpSaveCount,
-                                    static_cast<std::uint32_t>(cc.argVrs.size()));
+                                    static_cast<std::uint32_t>(cc.argFprs.size()));
         for (std::uint32_t i = 0; i < fpN; ++i) {
-            auto const reg = resolveCcReg(schema, cc.argVrs[i], LirRegClass::VR,
-                                          "callconv: AAPCS64 variadic VR spill",
+            auto const reg = resolveCcReg(schema, cc.argFprs[i], LirRegClass::FPR,
+                                          "callconv: AAPCS64 variadic FP spill",
                                           reporter);
             if (!reg.has_value()) return false;
-            emitFrameStore(b, vaVrSpillStore, *reg, *scratch,
-                           static_cast<std::int32_t>(vrBase + i * vl.fpSlotBytes));
+            emitFrameStore(b, *fpStore, *reg, *scratch,
+                           static_cast<std::int32_t>(vrBase + i * vl.fpSlotBytes),
+                           frameMemScaled, *fpWidthFlags);
         }
         return true;
     }
@@ -1519,6 +1668,9 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
     auto const gpStore = classOpHandle(schema, LirRegClass::GPR, RegClassOp::Store,
                                        "callconv: variadic GPR save spill", reporter);
     if (!gpStore.has_value()) return false;
+    auto const gpWidthFlags =
+        vaSlotWidth(vl.gpSlotBytes, "variadic GPR save spill");
+    if (!gpWidthFlags.has_value()) return false;
     std::uint32_t const gpN =
         std::min<std::uint32_t>(vl.gpSaveCount,
                                 static_cast<std::uint32_t>(cc.argGprs.size()));
@@ -1528,7 +1680,7 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
         if (!reg.has_value()) return false;
         emitFrameStore(b, *gpStore, *reg, sp,
                        static_cast<std::int32_t>(base + i * vl.gpSlotBytes),
-                       gprStore, gprStoreU);
+                       frameMemScaled, *gpWidthFlags);
     }
 
     // SSE arg regs → [sp + base + gpSaveCount*gpSlotBytes + i*fpSlotBytes] (the SSE
@@ -1537,6 +1689,15 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
     auto const fpStore = classOpHandle(schema, LirRegClass::FPR, RegClassOp::Store,
                                        "callconv: variadic SSE save spill", reporter);
     if (!fpStore.has_value()) return false;
+    // ⚠ THIS IS THE LOOP THE 64-BIT DEFAULT WAS ACTUALLY WRONG IN, on the
+    // busiest x86_64 convention. `sysv_amd64` declares `fpSlotBytes: 16` — the
+    // System V AMD64 ABI's register save area is 48 bytes of GPRs followed by
+    // EIGHT SIXTEEN-BYTE XMM slots, which is why `fpOffsetLimit` is 176 — and
+    // this store took `emitFrameStore`'s default and emitted `movsd`, filling
+    // half of each. gcc emits a 16-byte `movaps` here.
+    auto const fpWidthFlags =
+        vaSlotWidth(vl.fpSlotBytes, "variadic SSE save spill");
+    if (!fpWidthFlags.has_value()) return false;
     std::uint32_t const fpN =
         std::min<std::uint32_t>(vl.fpSaveCount,
                                 static_cast<std::uint32_t>(cc.argFprs.size()));
@@ -1545,7 +1706,8 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
                                       "callconv: variadic SSE save spill", reporter);
         if (!reg.has_value()) return false;
         emitFrameStore(b, *fpStore, *reg, sp,
-                       static_cast<std::int32_t>(fpBase + i * vl.fpSlotBytes));
+                       static_cast<std::int32_t>(fpBase + i * vl.fpSlotBytes),
+                       frameMemScaled, *fpWidthFlags);
     }
     return true;
 }
@@ -1624,6 +1786,93 @@ std::uint32_t frameSlotStride(TargetSchema const&          schema,
         stride = std::max(stride, widest(cls));
     }
     return stride;
+}
+
+// ── THE FRAME ACCESS WIDTHS (contract: `lir_callconv.hpp`) ──────────────────
+//
+// D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT.
+// Published for the reason `frameSlotStride` above states: a derivation no
+// tier can call is a derivation whose mutant reddens nothing.
+
+std::optional<std::uint8_t>
+wholeRegisterAccessFlags(TargetSchema const& schema, LirRegClass cls,
+                         std::string_view contextLabel,
+                         DiagnosticReporter& reporter) {
+    // ★ ONE OWNER FOR "how wide is a register of this class". `TargetSchema`
+    // derives it from the rows that declare no `subOf` — the FULL registers —
+    // and returns nullopt when they DISAGREE, which is the arm worth having:
+    // a class with no single natural width has no honest answer here, and
+    // taking whichever row came first would be a silent wrong width in the one
+    // place this whole derivation exists to stop one.
+    auto const bits = schema.registerClassNaturalWidthBits(
+        static_cast<TargetRegClass>(static_cast<std::uint8_t>(cls)));
+    if (!bits.has_value()) {
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+               DiagnosticSeverity::Error,
+               std::format("{}: register class '{}' declares no single full-"
+                           "register width on this target, so a frame move "
+                           "carrying a whole register of it cannot state its "
+                           "access width — the store would run at whatever "
+                           "width nobody chose",
+                           contextLabel,
+                           targetRegClassName(
+                               static_cast<TargetRegClass>(
+                                   static_cast<std::uint8_t>(cls)))));
+        return std::nullopt;
+    }
+    auto const flags = lirInstWidthFlagForBits(*bits);
+    if (!flags.has_value()) {
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+               DiagnosticSeverity::Error,
+               std::format("{}: register class '{}' declares full registers of "
+                           "{} bits, which is not a width the LIR instruction "
+                           "model can state — a whole-register frame move of it "
+                           "would be emitted at some other width with nothing "
+                           "to see in the build log",
+                           contextLabel,
+                           targetRegClassName(
+                               static_cast<TargetRegClass>(
+                                   static_cast<std::uint8_t>(cls))),
+                           *bits));
+        return std::nullopt;
+    }
+    return *flags;
+}
+
+std::optional<std::uint8_t>
+calleeSavedAccessFlags(TargetSchema const& schema,
+                       TargetCallingConvention const& cc, LirRegClass cls,
+                       std::string_view contextLabel,
+                       DiagnosticReporter& reporter) {
+    auto const idx = static_cast<std::size_t>(cls);
+    // Undeclared ⇒ the whole register. See the header for why silence must
+    // mean the WIDE answer and not the narrow one.
+    if (idx >= cc.calleeSavedPreservedBits.size()
+        || !cc.calleeSavedPreservedBits[idx].has_value()) {
+        return wholeRegisterAccessFlags(schema, cls, contextLabel, reporter);
+    }
+    auto const bits = *cc.calleeSavedPreservedBits[idx];
+    // `TargetSchemaData::validate()` has already refused a declaration wider
+    // than the class's own registers and one the width model cannot state, so
+    // this lookup cannot fail on a LOADED schema. It is still checked rather
+    // than dereferenced: a hand-built schema in a fixture reaches here too, and
+    // the alternative to refusing is emitting the width-64 default this whole
+    // row is about.
+    auto const flags = lirInstWidthFlagForBits(bits);
+    if (!flags.has_value()) {
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+               DiagnosticSeverity::Error,
+               std::format("{}: calling convention '{}' declares that {} bits "
+                           "of a callee-saved '{}' register are preserved, "
+                           "which is not a width the LIR instruction model can "
+                           "state",
+                           contextLabel, cc.name, bits,
+                           targetRegClassName(
+                               static_cast<TargetRegClass>(
+                                   static_cast<std::uint8_t>(cls)))));
+        return std::nullopt;
+    }
+    return *flags;
 }
 
 // ── THE ARG-PASSING POOL LOOKUP (rows + spellings: `lir_callconv.hpp`) ───────
@@ -1754,12 +2003,18 @@ ArgCursors::ArgCursors(TargetSchema const& schema, TargetCallingConvention const
         }
     }
     // Each group's bound is the LARGEST pool among its member rows. For a
-    // genuine shared-cursor group the members are views of one file and their pools are
-    // the same registers, so the max IS the common size (✔MEASURED on arm64:
-    // argFprs = d0..d7 and argVrs = v0..v7, both 8, sharing dwarf 64..71). The
-    // max is what keeps a config that declared them at different lengths from
-    // silently truncating the longer one without a diagnostic — it errs toward
-    // the register path, where `argPassingRegister` still refuses by name.
+    // genuine shared-cursor group the members are views of one file and their
+    // pools are the same registers, so the max IS the common size.
+    //
+    // ⚠ THE EXAMPLE THIS COMMENT USED TO CARRY IS GONE, AND ITS ABSENCE IS THE
+    // FINDING RATHER THAN A DELETION. It read "✔MEASURED on arm64: argFprs =
+    // d0..d7 and argVrs = v0..v7, both 8, sharing dwarf 64..71" — a TRUE
+    // measurement of a config that declared one physical register file twice.
+    // With arm64's SIMD&FP file declared once (R1 of design A′) there is a
+    // single FP arg pool, so NEITHER shipped target now declares two arg pools
+    // over one file and this grouping is inert on both. It is kept because the
+    // shape is describable and the alternative — assuming independent cursors —
+    // hands slot k out twice. [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]
     for (std::size_t i = 0; i < kArgPoolRows.size(); ++i) {
         auto const* pool = argRegisterPool(cc, kArgPoolRows[i].cls);
         auto const n = pool == nullptr
@@ -1988,17 +2243,21 @@ struct RegMove {
 // needs to lower a mem-src move (`frame_load argReg, [slot]`) into a real sp-
 // relative load — the SAME formula the frame_load materialization uses
 // (`spillAreaOffset() + (slot.v-1)*slotSize`), so a direct-arg reload reads the
-// exact slot the rewriter would have. `sp` + `gprLoad`/`gprLoadU` feed the
-// emitFrameLoad chokepoint (the load op itself is class-resolved per dst). Passed
-// with `hasMemSrc=false` by the return-piece caller (which never has a mem-src
-// move), so the fields are unread there.
+// exact slot the rewriter would have. `sp` + `frameMemScaled` feed the
+// emitFrameLoad chokepoint (the load op itself is class-resolved per dst, and the
+// twin table is consulted for THAT class — an FP arg reloaded from a high spill
+// slot swaps to the FP scaled form, not to the integer one). Passed with
+// `hasMemSrc=false` by the return-piece caller (which never has a mem-src move),
+// so the fields are unread there.
 struct MemSrcLoadCtx {
     bool          valid = false;
     LirReg        sp{};
     std::uint32_t spillAreaOffset = 0;
     std::uint32_t slotSize = 0;
-    std::uint16_t gprLoad = 0;
-    std::uint16_t gprLoadU = 0;
+    // Non-owning: the module's `OpcodeHandles::frameMemScaled`, which outlives
+    // every context built from it (both are function-local to one
+    // materializeOneFunc call chain).
+    FrameMemScaledTable const* frameMemScaled = nullptr;
 };
 
 // Pick a caller-saved register of class `cls` not among the registers `moves`
@@ -2169,8 +2428,28 @@ emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
             schema, m.dst.regClass(), RegClassOp::Load,
             "materializeOneFunc: direct-arg spill reload", reporter);
         if (!spillLoad.has_value()) return false;
+        // A `valid` context always carries the table (the one construction site
+        // states it); the null check refuses rather than silently dropping the
+        // swap, which would fail loud at the encoder one tier further away.
+        if (memCtx.frameMemScaled == nullptr) {
+            report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                   DiagnosticSeverity::Error,
+                   "materializeOneFunc: direct-arg spill reload has no frame "
+                   "memory-op twin table (internal: MemSrcLoadCtx built valid "
+                   "without one)");
+            return false;
+        }
+        // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT:
+        // this reads a SPILL SLOT, which is DSS's own memory with no ABI facing
+        // it, so the access is the destination class's FULL register width —
+        // the same answer `frameSlotStride` sized the slot with, and the same
+        // one the `frame_store` that filled it uses.
+        auto const loadWidth = wholeRegisterAccessFlags(
+            schema, m.dst.regClass(),
+            "materializeOneFunc: direct-arg spill reload", reporter);
+        if (!loadWidth.has_value()) return false;
         emitFrameLoad(b, *spillLoad, m.dst, memCtx.sp, offset,
-                      memCtx.gprLoad, memCtx.gprLoadU);
+                      *memCtx.frameMemScaled, *loadWidth);
         return true;
     };
     while (!moves.empty()) {
@@ -2260,7 +2539,15 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 28> const table{{
+    // ⚠ THE SIZE IS DERIVED, AND IT IS DERIVED BECAUSE THE LITERAL FAILED.
+    // This read `std::array<Entry, 27>` with the count restated beside the
+    // rows; deleting the two rows that named `load_u`/`store_u` left TWO
+    // default-constructed entries whose mnemonic is "" and whose field pointer
+    // is null, and the loop then refused every arm64 lowering with `target
+    // schema missing '' opcode`. It fails LOUD, which is why it cost minutes
+    // rather than a miscompile — but a count with a second owner is a count
+    // that will disagree with its rows, so it no longer has one.
+    auto const table = std::to_array<Entry>({
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -2321,17 +2608,12 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // that declares it). Absent ⇒ field 0; never matches a real input opcode.
         {&OpcodeHandles::recvByValueStackParam, "recv_by_value_stack_param", true},
         {&OpcodeHandles::movqXmmToGpr,      "movq_xmm_to_gpr",      true},
-        // FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE): optional — only the AAPCS64 dual-
-        // cursor prologue's VR spill emits the 128-bit `fstur_q`. Absent ⇒ field 0;
-        // the spill fails loud if a dual-cursor CC reaches the VR-spill without it.
-        {&OpcodeHandles::vaVrSpillStore,    "fstur_q",              true},
-        // D-ASM-AARCH64-LARGE-FRAME-IMM12: optional — only a target with a scaled
-        // unsigned-offset load/store form declares these (arm64). Absent ⇒ field 0;
-        // the incoming-stack-arg selection then keeps `load`/`store` (the encoder
-        // fails loud on an out-of-imm9 offset — the residual). Fail-loud once HERE,
-        // not per-inst (FOLD 2 — the fstur_q/lea optional-handle pattern).
-        {&OpcodeHandles::loadU,             "load_u",               true},
-        {&OpcodeHandles::storeU,            "store_u",              true},
+        // ⚠ `load_u`/`store_u` ARE NO LONGER RESOLVED HERE BY MNEMONIC. They are
+        // the GPR class's entries in the per-class twin table, resolved through
+        // `registerClassOps` below with every other class's
+        // (D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM). Naming
+        // them in this table was what made the scaled form look like a single-ISA
+        // concern belonging to one privileged class.
         // D-WIN64-LARGE-FRAME-STACK-PROBE: optional — only a target whose
         // CC declares a nonzero stackProbePageBytes emits it (x86_64).
         // Absent ⇒ field 0; the prologue emit site fails loud if a CC
@@ -2348,7 +2630,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // non-VLA target/module takes the SP-relative fixed-frame path unchanged.
         {&OpcodeHandles::subSpReg,          "sub_sp_reg",           true},
         {&OpcodeHandles::spCopy,            "sp_copy",              true},
-    }};
+    });
     for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
         if (!op.has_value()) {
@@ -2365,6 +2647,35 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
             return std::nullopt;
         }
         h.*field = *op;
+    }
+
+    // ── the per-class frame memory-op twin table ────────────────────────────
+    //
+    // D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM: resolved from
+    // `registerClassOps` for EVERY class, over the same accessor every emitting
+    // site uses (`regClassOpOpcode`) — so the GPR class picks up its universal
+    // `load`/`store`/`load_u`/`store_u` defaults from the no-row fallback and a
+    // declared class picks up its own row, with no second resolution path to
+    // drift from the first.
+    //
+    // ⚠ A CLASS WITH A SHORT FORM BUT NO TWIN IS THE NORMAL CASE, NOT AN ERROR.
+    // `regClassOpOpcode` returns nullopt both for "no twin declared" and for a
+    // target that declares no scaled mnemonic at all; both leave the scaled
+    // field 0, and `selectFrameMemOp` reads 0 as "keep the short form". The
+    // pairing rules that make a HALF-declared class impossible are enforced at
+    // LOAD time (`TargetSchemaData::validate`), where the config is judged —
+    // this loop must not re-litigate them, or the two would come to disagree.
+    for (std::size_t ci = 0; ci < kTargetRegClassCount; ++ci) {
+        auto const cls = static_cast<TargetRegClass>(ci);
+        auto& row = h.frameMemScaled[ci];
+        auto const get = [&](RegClassOp op) -> std::uint16_t {
+            auto const v = schema.regClassOpOpcode(cls, op);
+            return v.has_value() ? *v : std::uint16_t{0};
+        };
+        row.load        = get(RegClassOp::Load);
+        row.loadScaled  = get(RegClassOp::LoadScaled);
+        row.store       = get(RegClassOp::Store);
+        row.storeScaled = get(RegClassOp::StoreScaled);
     }
     return h;
 }
@@ -2715,7 +3026,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
         if (bi == 0) {
             bool prologueOk = false;
             emitPrologue(b, outLayout, schema, cc, sp, h.sub,
-                         h.stackProbe, h.store, h.storeU, outCfiFn.ops, reporter,
+                         h.stackProbe, h.frameMemScaled, outCfiFn.ops, reporter,
                          prologueOk);
             if (!prologueOk) return false;
             // FC12a/b/c: a function that calls va_start spills its arg registers
@@ -2725,8 +3036,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             // AAPCS64 GR+VR save / Apple no-op); straight-line stores — no CFG.
             if (usesVaStart
                 && !emitVariadicPrologueSpill(b, outLayout, schema, cc, sp,
-                                              h.vaVrSpillStore, h.add,
-                                              h.store, h.storeU, reporter))
+                                              h.add,
+                                              h.frameMemScaled, reporter))
                 return false;
             // D-CSUBSET-VLA CRITICAL-3 (C1b): the frame-pointer setup goes AFTER the
             // prologue's `sub sp,F` + saved-reg stores (incl. the caller's rbp/x29
@@ -2938,13 +3249,13 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // once the frame (register-save-area + locals) grows past
                     // 255. The scaled-imm12 swap (load → load_u) is now done at
                     // the emitFrameLoad CHOKEPOINT (selectFrameMemOp), so this
-                    // site — like every other frame load — just passes the GPR
-                    // load identity + its scaled twin and the chokepoint picks.
+                    // site — like every other frame load — just passes the
+                    // per-class twin table and the chokepoint picks.
                     // D-CSUBSET-VLA (C1b): a FIXED-FRAME ref → `frameBase` (== FP in a
                     // VLA function, captured at FB where SP == the entry SP - F, so
                     // the offset is UNCHANGED). `frameBase == sp` for a non-VLA fn.
                     emitFrameLoad(b, *argLoad, result, frameBase, offset,
-                                  h.load, h.loadU, place.widthFlags);
+                                  h.frameMemScaled, place.widthFlags);
                 }
                 continue;
             }
@@ -3959,7 +4270,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // AreaSize) base; a call with many stack args can push them
                     // past imm9 — the chokepoint swaps a GPR store to store_u.
                     emitFrameStore(b, *stkStore, s.src, sp, s.offset,
-                                   h.store, h.storeU, s.widthFlags);
+                                   h.frameMemScaled, s.widthFlags);
                 }
                 // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): emit the by-
                 // value-stack aggregate byte-copies — ALSO in the stack-store phase
@@ -3987,6 +4298,26 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                DiagnosticSeverity::Error,
                                "callconv: by-value-stack aggregate copy requires a "
                                "nonzero GPR width (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                        return false;
+                    }
+                    // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT:
+                    // the loop STEPS by `chunk` and the memory ops must ACCESS
+                    // `chunk`, so the two come off one number rather than off a
+                    // step here and a defaulted 64 at the emit call. They agree
+                    // on every shipped target; a target whose GPR is not 8
+                    // bytes would previously have stepped by its own width and
+                    // copied 8 bytes each time — overlapping or gapping the
+                    // aggregate with no diagnostic.
+                    auto const chunkWidth = lirInstWidthFlagForBits(chunk * 8u);
+                    if (!chunkWidth.has_value()) {
+                        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: by-value-stack aggregate copy "
+                                           "steps {} bytes at a time, which is not a "
+                                           "width the LIR instruction model can state "
+                                           "— the copy would access some other width "
+                                           "than it advances",
+                                           chunk));
                         return false;
                     }
                     // FOLD (adversarial-review BLOCKER-3, silent miscompile): the
@@ -4063,10 +4394,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         for (; off < cpy.bytes; off += chunk) {
                             emitFrameLoad(b, *gpLoad, *scratch, cpy.addr,
                                           static_cast<std::int32_t>(off),
-                                          h.load, h.loadU);
+                                          h.frameMemScaled, *chunkWidth);
                             emitFrameStore(b, *gpStore, *scratch, sp,
                                            cpy.dstOffset + static_cast<std::int32_t>(off),
-                                           h.store, h.storeU);
+                                           h.frameMemScaled, *chunkWidth);
                         }
                     }
                 }
@@ -4106,7 +4437,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // in a VLA function. `frameBase == sp` for a non-VLA fn (byte-identical).
                 MemSrcLoadCtx const argMemCtx{
                     /*valid=*/true, frameBase, outLayout.spillAreaOffset(),
-                    outLayout.slotSize, h.load, h.loadU};
+                    outLayout.slotSize, &h.frameMemScaled};
                 if (!emitParallelRegMoves(
                         b, schema, cc, std::move(argRegMoves),
                         argScratchReserved,
@@ -4308,17 +4639,36 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     "materializeOneFunc: spill reload", reporter);
                 if (!spillLoad.has_value()) return false;
                 // The spill area sits ABOVE the saved-reg area; a high spill
-                // slot (deep register pressure) exceeds the imm9 reach — the
-                // chokepoint swaps a GPR reload to load_u (the primary gap
-                // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 closes). An FPR spill
-                // reload keeps its fldur form (selectFrameMemOp gate).
+                // slot (deep register pressure) exceeds the short-form reach —
+                // the chokepoint swaps the reload for the SPILLED VALUE'S OWN
+                // class's scaled twin (the primary gap
+                // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 closes for the
+                // integer file, and for every other one
+                // D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM —
+                // an FPR spill reload used to keep `fldur` here and fail loud
+                // at the encoder).
                 // D-CSUBSET-VLA CRITICAL-1 (C1b): spills are FIXED-FRAME refs → use
                 // `frameBase` (FP in a VLA function). A spill lands in a LEAF function
                 // and can be reloaded AFTER the runtime `sub sp,<vlaSize>` moved SP —
                 // an SP-relative reload would then read garbage below the VLA (the #1
                 // silent miscompile this switch closes). Offset unchanged (FP == FB).
+                //
+                // ★ D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT,
+                // THE SECOND OF THE TWO SITES THAT ROW NAMES — and the one it
+                // calls NAKED, because nothing here asserted anything about
+                // width: the reload took `emitFrameLoad`'s 64-bit default, so
+                // an FPR spill of a class whose registers are SIXTEEN bytes was
+                // reloaded eight bytes wide out of the sixteen-byte slot
+                // `frameSlotStride` had already sized for it. A spill slot is
+                // DSS's own memory — no ABI faces it — so the access is the
+                // class's FULL register width, and the store below reads the
+                // same derivation so the two halves of one slot cannot differ.
+                auto const reloadWidth = wholeRegisterAccessFlags(
+                    schema, result.regClass(),
+                    "materializeOneFunc: spill reload", reporter);
+                if (!reloadWidth.has_value()) return false;
                 emitFrameLoad(b, *spillLoad, result, frameBase, offset,
-                              h.load, h.loadU);
+                              h.frameMemScaled, *reloadWidth);
                 continue;
             }
             if (op == h.frameStore) {
@@ -4337,12 +4687,18 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     "materializeOneFunc: spill store", reporter);
                 if (!spillStore.has_value()) return false;
                 // Mirror of the spill reload: a high spill slot's store swaps
-                // to store_u via the chokepoint (FPR spill keeps fstur).
+                // to its own class's scaled twin via the chokepoint.
                 // D-CSUBSET-VLA CRITICAL-1 (C1b): spill store is a FIXED-FRAME ref →
                 // `frameBase` (FP in a VLA function), for the same reason as the
                 // reload above. Offset unchanged (FP captured at FB).
+                // Same whole-register derivation as the reload — one class, one
+                // slot, one width.
+                auto const spillWidth = wholeRegisterAccessFlags(
+                    schema, ops[0].reg.regClass(),
+                    "materializeOneFunc: spill store", reporter);
+                if (!spillWidth.has_value()) return false;
                 emitFrameStore(b, *spillStore, ops[0].reg, frameBase, offset,
-                               h.store, h.storeU);
+                               h.frameMemScaled, *spillWidth);
                 continue;
             }
             // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E): the pre-regalloc
@@ -4374,7 +4730,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     "materializeOneFunc: store_outgoing_arg", reporter);
                 if (!stkStore.has_value()) return false;
                 emitFrameStore(b, *stkStore, ops[0].reg, sp, offset,
-                               h.store, h.storeU, src.instFlags(inst));
+                               h.frameMemScaled, src.instFlags(inst));
                 continue;
             }
 
@@ -4462,8 +4818,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // Emit epilogue BEFORE the return.
                     std::size_t const cfiMark = outCfiFn.ops.size();
                     bool epilogueOk = false;
-                    emitEpilogue(b, outLayout, schema, sp, h.add,
-                                 h.load, h.loadU,
+                    emitEpilogue(b, outLayout, schema, cc, sp, h.add,
+                                 h.frameMemScaled,
                                  static_cast<std::int64_t>(cc.callPushBytes),
                                  outCfiFn.ops, reporter, epilogueOk);
                     if (!epilogueOk) return false;

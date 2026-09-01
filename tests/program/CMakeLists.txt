@@ -399,3 +399,24 @@ dss_add_test(NAME program/test_config_memo_holds_a_total_scan
 # built the obvious way is blind to a change that relays out every struct.
 dss_add_test(NAME program/test_compilation_unit_input_digest
              SOURCES test_compilation_unit_input_digest.cpp)
+
+# D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION — clause (C),
+# the cache itself: the manifest surface, the second key subject class, and the
+# driver consult at the `buildCus` boundary.
+#
+# APPENDED, never interleaved — this file is append-only by lane convention, and
+# a whole-file rewrite once reddened three other lanes by changing its line
+# endings.
+#
+# ★ THE CASE TO READ FIRST IS `AHeaderNoManifestNamesMovesTheKey`. It edits a
+# header that appears in NO `sources[]` and in no config document, so every term
+# a manifest-level cache key could reach is byte-identical across its two
+# builds. It is the P46 measurement that justified the whole input-closure
+# prerequisite, turned into a pin — and its failure mode is a GREEN build that
+# links an archive compiled against a header that has since changed.
+#
+# ⓘ Each build case takes its own scratch tree AND its own cache root through
+# the MANIFEST-DECLARED override variable, so cold and warm are proven
+# separately and the suite is not order-dependent.
+dss_add_test(NAME program/test_dependency_artifact_cache
+             SOURCES test_dependency_artifact_cache.cpp)

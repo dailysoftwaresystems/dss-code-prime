@@ -1,5 +1,6 @@
 #include "analysis/preprocess/preprocessor.hpp"
 
+#include "core/crypto/sha256.hpp"   // the pre-scan memo's CONTENT key
 #include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/path_identity.hpp"
 
@@ -894,10 +895,52 @@ detectIncludeOnceMechanism(std::shared_ptr<SourceBuffer> const&        buf,
 // there is no eviction, no staleness window, and no way for a hit and a miss to
 // disagree — a hit returns the same object the miss would have built.
 //
-// ⚠ THE KEY IS (identity, size, last-write-time), NOT the path alone. A file
-// edited mid-compile MISSES and is re-read rather than silently served stale
-// bytes — the fail-loud direction, and it costs two `stat`s against an 80 KB
-// read plus a tokenize.
+// ── THE KEY IS THE FILE'S CONTENT DIGEST ────────────────────────────────────
+// D-PP-PRE-SCAN-MEMO-SERVES-A-SAME-SIZE-EDIT-INSIDE-ONE-TIMESTAMP-TICK-STALE.
+//
+// ⛔ THE KEY USED TO BE (identity, size, last-write-time), AND THE SAFETY CLAIM
+// WRITTEN HERE — "a file edited mid-compile MISSES and is re-read rather than
+// silently served stale bytes" — WAS FALSE. `(size, mtime)` is a HEURISTIC for
+// "same bytes" and it fails toward HIT: an edit that changes neither the length
+// nor the recorded write time addresses the OLD entry, and the compiler reads
+// the old header and compiles it with a clean exit code. ✔MEASURED on this
+// host: 114 of 200 back-to-back same-size rewrites produced an IDENTICAL
+// `(size, mtime_ns)` key — the filesystem's stamp granularity is ~15.6 ms and
+// two writes inside one tick are indistinguishable to `stat`. That is a SILENT
+// MISCOMPILE, 57% reproducible, and the same rejected shape that
+// `core/types/config_document_memo.hpp`'s ★★★ note already refuses by name.
+//
+// ⛔ AND NO `stat`-ONLY TIGHTENING REPLACES IT. Nanosecond mtime, an inode or a
+// file-id term all narrow the window without closing it: each is still a
+// heuristic for "same bytes", each still fails toward HIT, and none can be
+// shown correct by a test that does not enumerate filesystem timestamp
+// granularities. Neither does a driver-controlled invalidation epoch — the
+// preprocessor has no monopoly on when its inputs change. `LspServer::run()` is
+// a `while (!exitReceived_)` loop that rebuilds a `CompilationUnit` per request
+// with only the MAIN document in memory, so every `#include` it resolves is
+// read from a disk an external editor writes to at moments no build phase
+// brackets.
+//
+// ⇒ THE KEY IS (identity, SHA-256 OF THE FILE'S BYTES). There is no
+// invalidation policy to get wrong because there is no invalidation: an entry
+// is reachable ONLY from the bytes that produced it, which is exactly the
+// property `ConfigDocumentMemoStore` is built on.
+//
+// ★ IDENTITY STAYS IN THE KEY, and not as belt-and-braces. `PreScannedFile`
+// holds a `SourceBuffer` NAMED for the path it was read from, and every
+// `LineMapSegment::origin` points into it, so two DISTINCT files with identical
+// bytes must not share one entry — a hit would name the wrong file in every
+// diagnostic mapped through it. `PathIdentity` answers "same file" across
+// spellings; the digest answers "same bytes"; neither answers the other.
+//
+// ⚠ THE HONEST COST, STATED RATHER THAN GLOSSED: the digest is NOT free the way
+// `ConfigDocumentMemoStore`'s is. That store's load path already hashed the
+// bytes for `contentDigest()`; here the HIT path previously did no read at all,
+// and now must read the file to have bytes to hash. So this trades two `stat`s
+// for a read plus a hash on every hit, and keeps the splice and the tokenize —
+// the dominant terms, 118.7 MB tokenized into 13.2M pp-tokens above — memoized.
+// Exactness is not purchasable more cheaply: knowing the bytes are unchanged
+// requires reading the bytes.
 // ⚠ THE ENTRY IS IMMUTABLE ONCE PUBLISHED and handed out as a `shared_ptr<const
 // …>`, because the driver preprocesses translation units on a THREAD POOL: a
 // reader must never see a half-built entry, and an entry must outlive the
@@ -918,29 +961,48 @@ struct PreScannedFile {
     std::vector<PPToken>          toks;      // the ONE tokenize of `spliced`
 };
 
-// The memo's identity key. `core::PathIdentity` answers "same file" across
-// spellings; size + mtime answer "same bytes".
+// The memo's key. `core::PathIdentity` answers "same file" across spellings;
+// the SHA-256 of the bytes answers "same bytes". See the ⛔ note above for why
+// the second term is a digest and not a `stat` triple.
 struct PreScanKey {
-    core::PathIdentity      path;
-    std::uintmax_t          size = 0;
-    std::int64_t            mtime = 0;
+    core::PathIdentity            path;
+    std::array<std::uint8_t, 32>  digest{};
     bool operator==(PreScanKey const& o) const noexcept {
-        return path == o.path && size == o.size && mtime == o.mtime;
+        return path == o.path && digest == o.digest;
     }
 };
 struct PreScanKeyHash {
     std::size_t operator()(PreScanKey const& k) const noexcept {
         std::size_t h = std::hash<core::PathIdentity>{}(k.path);
-        h ^= std::hash<std::uintmax_t>{}(k.size) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        h ^= std::hash<std::int64_t>{}(k.mtime) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        // The digest is already uniformly distributed, so its leading bytes are
+        // folded in directly rather than re-hashed. Eight bytes, because
+        // `std::size_t` is eight on every leg this ships to and taking fewer
+        // would discard entropy the container can use.
+        std::size_t d = 0;
+        for (std::size_t i = 0; i < sizeof(std::size_t) && i < k.digest.size(); ++i) {
+            d = (d << 8) | static_cast<std::size_t>(k.digest[i]);
+        }
+        h ^= d + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         return h;
     }
 };
 
 // Process-lifetime storage. A driver process compiles one invocation and exits,
-// so the memo's size is bounded by that invocation's distinct include set.
+// so the memo's size is bounded by that invocation's distinct include set —
+// now by its distinct (file, CONTENT) set.
+//
+// ⓘ THE CONTENT KEY DOES NOT COST MEMORY AGAINST THE KEY IT REPLACES, and the
+// comparison is worth stating because the opposite is the natural guess. There
+// was no eviction under `(identity, size, mtime)` either, and a SAVE moves the
+// write time, so that key ALSO minted a fresh entry per edit. Keying on content
+// mints one per DISTINCT CONTENT, which is the same count or fewer — an
+// edit-and-revert re-addresses the ORIGINAL entry instead of adding a third.
+// Retention is required either way: entries are immutable and handed out as
+// `shared_ptr<const …>`, and a CU that took the pre-edit bytes still holds
+// `PPToken::text` views into them.
+//
 // `tests` that need isolation do not exist for this: an entry can only ever be
-// re-served for a file whose identity, size and mtime all still match.
+// re-served for a file whose identity AND whose bytes still match.
 std::mutex& preScanMemoMutex() {
     static std::mutex m;
     return m;
@@ -973,25 +1035,33 @@ std::atomic<std::uint64_t>& preScanHitCount() {
 [[nodiscard]] std::shared_ptr<PreScannedFile const>
 preScanIncludeFile(fs::path const& path,
                    std::shared_ptr<GrammarSchema const> const& schema) {
-    std::error_code ec;
-    PreScanKey key{core::PathIdentity::of(path), 0, 0};
-    const auto sz = fs::file_size(path, ec);
-    if (!ec) key.size = sz;
-    const auto wt = fs::last_write_time(path, ec);
-    if (!ec) key.mtime = wt.time_since_epoch().count();
+    // ⚠ THE READ COMES FIRST, AND IT HAS TO. The key's second term is the
+    // digest of the bytes, so there is nothing to look up until the bytes are
+    // in hand. A lookup that could be answered without reading would be a
+    // lookup answered by a heuristic — the defect this shape exists to remove.
+    auto buf = SourceBuffer::fromFile(path);
+    if (!buf) return nullptr;   // caller emits the unreadable-include diagnostic
+    PreScanKey key{core::PathIdentity::of(path),
+                   crypto::sha256OfText(buf->text())};
     {
         std::lock_guard<std::mutex> lk{preScanMemoMutex()};
         auto it = preScanMemo().find(key);
         if (it != preScanMemo().end()) {
             preScanHitCount().fetch_add(1, std::memory_order_relaxed);
+            // The freshly-read buffer is DISCARDED, deliberately. The memoized
+            // entry's `scanBuf` owns every `PPToken::text` view and every
+            // `LineMapSegment::origin` already handed to a live CU, so serving
+            // a second buffer holding the same bytes would fork the identity
+            // the diagnostic registry deduplicates on.
             return it->second;
         }
     }
-    auto buf = SourceBuffer::fromFile(path);
-    if (!buf) return nullptr;   // caller emits the unreadable-include diagnostic
-    // Counted HERE rather than at the miss, because what this counts is the WORK
-    // — the read, the splice and the tokenize below — and a request whose file
-    // cannot be read does none of it.
+    // Counted HERE rather than at the miss, because what this counts is the
+    // memoized WORK — the splice and the tokenize below. ⚠ THE READ IS NO
+    // LONGER PART OF IT: since the key is the content digest, every request
+    // reads, and only a request that goes on to splice and tokenize is a
+    // `build`. A request whose file cannot be read returns above and counts as
+    // neither.
     preScanBuildCount().fetch_add(1, std::memory_order_relaxed);
     auto built = std::make_shared<PreScannedFile>();
     built->source = std::move(buf);

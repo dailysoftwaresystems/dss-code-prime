@@ -44,6 +44,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <optional>
 #include <string>
 
 namespace {
@@ -136,11 +137,19 @@ TEST(TargetRegisterClassPairOps, TheTwoArgFormIsExactlyTheDiagonal) {
 
 // ── An UNDECLARED pair resolves to nothing, so the consumer fails loud ──────
 //
-// ⚠ NOT A GAP TO BE FILLED BY A DEFAULT. arm64's `vr` and `fpr` are two WIDTH
-// VIEWS of ONE physical register file (all 32 pairs share a `dwarfNumber`), so
-// a "move" between them would be a fake copy papering over a config defect;
-// the fix is to declare that file ONCE. And a `Flags` pair has no data to move
-// at all. Both must answer nullopt rather than borrowing a neighbour.
+// ⚠ NOT A GAP TO BE FILLED BY A DEFAULT. A `Flags` pair has no data to move at
+// all, and `vr` has no members on either shipped target, so neither can borrow
+// a neighbour's opcode — both must answer nullopt.
+//
+// ★ THE fpr↔vr PAIR IS STILL UNDECLARED, BUT FOR A DIFFERENT REASON THAN THIS
+// COMMENT USED TO GIVE, AND THE REASON IS THE FINDING. It read: "arm64's `vr`
+// and `fpr` are two WIDTH VIEWS of ONE physical register file (all 32 pairs
+// share a `dwarfNumber`), so a 'move' between them would be a fake copy
+// papering over a config defect; the fix is to declare that file ONCE." ✔That
+// fix LANDED — R1 of design A′ — so arm64 declares no `vr` register at all and
+// the pair is undeclared because one side of it is EMPTY, not because a real
+// pair was deliberately withheld. The nullopt is the same; what it means is
+// not.
 TEST(TargetRegisterClassPairOps, AnUndeclaredPairResolvesToNothing) {
     for (char const* const t : kTargets) {
         SCOPED_TRACE(t);
@@ -368,4 +377,275 @@ TEST(TargetRegisterClassPairOps, RemovingTheCrossClassRowsLosesTheCapability) {
         EXPECT_TRUE(s.regClassOpOpcode(TargetRegClass::GPR,
                                        RegClassOp::Move).has_value());
     }
+}
+
+// ── D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM ──────────────
+//
+// ★★★ THE SECOND SLOT PAIR ON THIS TABLE, AND IT EXISTS FOR THE REASON THE
+// FIRST ONE DID: the machine had the instruction and the table had no home for
+// it. AArch64 spells a memory access two ways — the UNSCALED `LDUR/STUR
+// [Xn,#simm9]` (±256) and the SCALED unsigned-offset `LDR/STR [Xn,#pimm]`
+// (0..4095×accessSize) — and WHICH one an access takes is a property of the
+// OFFSET, decided at the frame chokepoint, not of the instruction the lowering
+// asked for. So the long-reach form has to be reachable FROM the short one,
+// per class.
+//
+// ⚠⚠ WHAT WENT WRONG WITHOUT IT, AND WHY IT WAS INVISIBLE. The scaled twin was
+// declared for the INTEGER file alone, as a pair of `load_u`/`store_u` handles
+// resolved by MNEMONIC, and the chokepoint swapped only when the op it was
+// handed WAS the universal GPR one. That reads as a safety gate and is really a
+// vocabulary gap: `fldur`/`fstur` had no twin because nobody had declared one,
+// not because AArch64 lacks the form. The moment the SIMD&FP file was declared
+// once and the frame stride became 16, FP frame slots crossed ±256 and the
+// compiler REFUSED to build a shipped corpus example.
+//
+// ★★ EVERY NEW SCHEMA SURFACE OWES A LOAD-TIME REFUSAL, and this one owes
+// three, because a scaled twin is never named by a lowering pass — it is
+// SUBSTITUTED — so all three failure shapes load clean and do nothing visible:
+//   * a twin with no short form to be substituted FOR (dead vocabulary);
+//   * HALF the pair on a class that owns both short forms (one direction of a
+//     slot encodes, the other fails loud, on the same frame);
+//   * a twin whose ENCODING moves a different register bank than the row it is
+//     filed under — the silent wrong answer, and the reason the memory verbs
+//     are now bank-checked exactly as `move` already was.
+
+// ── The positive control for the long-reach slots ───────────────────────────
+//
+// ⚠ ANTI-VACUITY MATTERS MORE HERE THAN ANYWHERE ELSE IN THIS FILE: `nullopt`
+// is the CORRECT answer for a class with no twin, so a suite that only checked
+// "nullopt where undeclared" would pass over a target that had lost every
+// binding. This arm refuses to pass unless SOME shipped class really declares
+// the pair.
+TEST(TargetRegisterClassPairOps, SomeShippedClassDeclaresTheLongReachPair) {
+    bool anyDeclared = false;
+    for (char const* const t : kTargets) {
+        SCOPED_TRACE(t);
+        auto schema = TargetSchema::loadShipped(t);
+        ASSERT_TRUE(schema.has_value());
+        auto const& s = **schema;
+        for (auto const cls : {TargetRegClass::GPR, TargetRegClass::FPR,
+                               TargetRegClass::VR, TargetRegClass::Flags}) {
+            auto const ls = s.regClassOpOpcode(cls, RegClassOp::LoadScaled);
+            auto const ss = s.regClassOpOpcode(cls, RegClassOp::StoreScaled);
+            if (!ls.has_value() && !ss.has_value()) continue;
+            anyDeclared = true;
+            // Both halves, always — the pairing rule, observed through the
+            // accessor rather than argued from the loader.
+            EXPECT_TRUE(ls.has_value());
+            EXPECT_TRUE(ss.has_value());
+            // And a twin is a DIFFERENT opcode from its short form. A config
+            // that pointed both at one mnemonic would read as declared and
+            // leave the out-of-reach offset exactly where it was.
+            EXPECT_NE(ls, s.regClassOpOpcode(cls, RegClassOp::Load));
+            EXPECT_NE(ss, s.regClassOpOpcode(cls, RegClassOp::Store));
+        }
+    }
+    EXPECT_TRUE(anyDeclared)
+        << "no shipped target declares a scaled long-reach memory form at all "
+           "— every 'undeclared resolves to nullopt' assertion in this file "
+           "would then be passing for the wrong reason";
+}
+
+// ── arm64 declares the pair for BOTH its register files ─────────────────────
+//
+// The integer file gets its twin from the universal `load_u`/`store_u`
+// no-row default; the SIMD&FP file names `fldr_u`/`fstr_u` on its own row.
+// The asymmetry is `move`'s, not a new one — but the RESULT must be
+// symmetric, because a frame does not care which file a slot belongs to.
+TEST(TargetRegisterClassPairOps, Arm64GivesBothRegisterFilesALongReachForm) {
+    auto schema = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(schema.has_value());
+    auto const& s = **schema;
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::GPR, RegClassOp::LoadScaled),
+              s.opcodeByMnemonic("load_u"));
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::GPR, RegClassOp::StoreScaled),
+              s.opcodeByMnemonic("store_u"));
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::LoadScaled),
+              s.opcodeByMnemonic("fldr_u"));
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::StoreScaled),
+              s.opcodeByMnemonic("fstr_u"));
+}
+
+// ── x86_64 declares NONE, and that is the right answer ──────────────────────
+//
+// Its memory forms already carry a disp32, so no offset a frame can produce
+// overruns them. The agnosticism claim is exactly this: the feature is absent
+// because the CONFIG does not declare it, with no code anywhere asking which
+// target is running.
+TEST(TargetRegisterClassPairOps, X8664DeclaresNoLongReachFormAtAll) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const& s = **schema;
+    for (auto const cls : {TargetRegClass::GPR, TargetRegClass::FPR,
+                           TargetRegClass::VR, TargetRegClass::Flags}) {
+        EXPECT_EQ(s.regClassOpOpcode(cls, RegClassOp::LoadScaled), std::nullopt);
+        EXPECT_EQ(s.regClassOpOpcode(cls, RegClassOp::StoreScaled), std::nullopt);
+    }
+    EXPECT_EQ(s.opcodeByMnemonic("load_u"), std::nullopt);
+    EXPECT_EQ(s.opcodeByMnemonic("store_u"), std::nullopt);
+    EXPECT_EQ(s.opcodeByMnemonic("fldr_u"), std::nullopt);
+    EXPECT_EQ(s.opcodeByMnemonic("fstr_u"), std::nullopt);
+}
+
+// ── The long-reach slots are DIAGONAL-ONLY, like the forms they replace ─────
+TEST(TargetRegisterClassPairOps, LongReachMemoryOpsNeverResolveAcrossAPair) {
+    for (char const* const t : kTargets) {
+        SCOPED_TRACE(t);
+        auto schema = TargetSchema::loadShipped(t);
+        ASSERT_TRUE(schema.has_value());
+        auto const& s = **schema;
+        for (auto const op : {RegClassOp::LoadScaled, RegClassOp::StoreScaled}) {
+            EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::GPR,
+                                         TargetRegClass::FPR, op),
+                      std::nullopt);
+            EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::FPR,
+                                         TargetRegClass::GPR, op),
+                      std::nullopt);
+        }
+    }
+}
+
+// ── Load-time refusal: a twin with no short form to substitute for ──────────
+//
+// ★ THE REMOVE DIRECTION. The mutant DELETES the `load` key from a shipped row
+// that already carries `loadScaled`, rather than adding a key — an added key
+// is a shape no shipped config has, and a fixture that only ever adds cannot
+// tell a LIVE key from dead config.
+TEST(TargetRegisterClassPairOps, ATwinWithoutItsShortFormIsLoadTimeFatal) {
+    for (char const* const field : {"load", "store"}) {
+        SCOPED_TRACE(field);
+        auto mutated = mutateShippedTargetSchemaDoc(
+            "arm64", [field](nlohmann::json& doc) {
+                for (auto& row : doc["registerClassOps"]) {
+                    if (row.value("class", std::string{}) != "fpr") continue;
+                    if (row.contains("to")) continue;   // the diagonal row only
+                    row.erase(field);
+                }
+            });
+        EXPECT_FALSE(mutated.has_value())
+            << "a scaled twin is SUBSTITUTED for the short form, never named — "
+               "with the short form deleted it can never be selected, and a "
+               "key that loads clean and does nothing reads like a declaration";
+    }
+}
+
+// ── Load-time refusal: half the long-reach pair ─────────────────────────────
+//
+// ★ ALSO THE REMOVE DIRECTION, and this is the one that guards a frame whose
+// two directions disagree: with `storeScaled` gone, a big-frame FP spill STORE
+// fails loud while its RELOAD encodes — on the SAME slot.
+TEST(TargetRegisterClassPairOps, HalfTheLongReachPairIsLoadTimeFatal) {
+    for (char const* const field : {"loadScaled", "storeScaled"}) {
+        SCOPED_TRACE(field);
+        auto mutated = mutateShippedTargetSchemaDoc(
+            "arm64", [field](nlohmann::json& doc) {
+                for (auto& row : doc["registerClassOps"]) {
+                    if (row.value("class", std::string{}) != "fpr") continue;
+                    if (row.contains("to")) continue;
+                    row.erase(field);
+                }
+            });
+        EXPECT_FALSE(mutated.has_value())
+            << "a class owning both short forms must declare both long ones or "
+               "neither — half a pair is a frame that encodes in one direction "
+               "and refuses in the other";
+    }
+}
+
+// ── Load-time refusal: a memory verb whose ENCODING banks disagree ──────────
+//
+// ★★★ THE ONE THAT GUARDS A SILENT WRONG ANSWER RATHER THAN A DEAD KEY, and
+// the reason it became load-bearing NOW: the chokepoint swaps PER CLASS, by
+// opcode identity. Filing the INTEGER `load_u` as the fpr class's `loadScaled`
+// would resolve happily, and a large-frame FP reload would emit `LDR Xt` —
+// landing the float in the integer register of the same hwEncoding, rc=0, no
+// diagnostic. That is D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND rebuilt one role
+// over, so the memory verbs are bank-checked exactly as `move` already was.
+TEST(TargetRegisterClassPairOps, AMemoryVerbWhoseEncodingBanksDisagreeIsLoadTimeFatal) {
+    struct Case { char const* field; char const* wrongBankMnemonic; };
+    for (auto const& c : {Case{"loadScaled",  "load_u"},
+                          Case{"storeScaled", "store_u"},
+                          Case{"load",        "load"},
+                          Case{"store",       "store"}}) {
+        SCOPED_TRACE(c.field);
+        auto mutated = mutateShippedTargetSchemaDoc(
+            "arm64", [&c](nlohmann::json& doc) {
+                for (auto& row : doc["registerClassOps"]) {
+                    if (row.value("class", std::string{}) != "fpr") continue;
+                    if (row.contains("to")) continue;
+                    row[c.field] = c.wrongBankMnemonic;
+                }
+            });
+        EXPECT_FALSE(mutated.has_value())
+            << "an INTEGER memory verb filed under the fpr class resolves and "
+               "then writes the register number into the wrong file — the "
+               "banks must be checked where the config is judged";
+    }
+}
+
+// ── The refusal is about the BANK, not about the key being unusual ──────────
+//
+// ⚠ THE CONTROL FOR THE ARM ABOVE. Every one of those mutants also swapped a
+// mnemonic, so a loader that refused ANY change to those keys would produce
+// the same four reds for the wrong reason. Re-declaring the SHIPPED mnemonic
+// under a `$comment` edit must still LOAD — the mutation is real (the helper
+// throws on a no-op) and the schema is still correct.
+TEST(TargetRegisterClassPairOps, ACorrectlyBankedMemoryVerbStillLoads) {
+    auto mutated = mutateShippedTargetSchemaDoc(
+        "arm64", [](nlohmann::json& doc) {
+            for (auto& row : doc["registerClassOps"]) {
+                if (row.value("class", std::string{}) != "fpr") continue;
+                if (row.contains("to")) continue;
+                // Restate the SHIPPED bindings verbatim + a prose key: the
+                // document differs, the meaning does not.
+                row["loadScaled"]  = "fldr_u";
+                row["storeScaled"] = "fstr_u";
+                row["$bankControlComment"] = "correctly banked; must load";
+            }
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "a correctly-banked long-reach pair must LOAD — otherwise the four "
+           "bank refusals above are reds about the key, not about the bank";
+    EXPECT_EQ((*mutated)->regClassOpOpcode(TargetRegClass::FPR,
+                                           RegClassOp::LoadScaled),
+              (*mutated)->opcodeByMnemonic("fldr_u"));
+}
+
+// ── Load-time refusal: one memory mnemonic claimed by two register files ────
+//
+// ★★★ A SORT-ORDER RULE, NOT A TIDINESS ONE. The frame chokepoint finds a
+// short form's long-reach twin by looking the OPCODE up in a per-class table.
+// If two classes named one mnemonic as their `load`, WHICH twin an
+// out-of-reach access got would be decided by which row the walk reached
+// first — exactly
+// [[feedback-an-opener-closer-duplicate-must-never-be-settled-by-sort-order]],
+// and the wrong answer it produces is an access encoded against the other
+// register file.
+//
+// ⚠ THE FIXTURE USES A BANK-AGNOSTIC OPCODE ON PURPOSE. The memory-verb bank
+// check already refuses a mnemonic whose encoding DECLARES the wrong file, so
+// a fixture naming `fldur` under `vr` would red for that reason and this rule
+// would never be exercised. Stripping the encoding's bank declarations first
+// leaves the collision as the only thing left to refuse.
+TEST(TargetRegisterClassPairOps, TwoClassesClaimingOneMemoryVerbIsLoadTimeFatal) {
+    auto mutated = mutateShippedTargetSchemaDoc(
+        "arm64", [](nlohmann::json& doc) {
+            // Make `fldur`/`fstur` bank-agnostic so only the collision is left.
+            for (auto& o : doc["opcodes"]) {
+                auto const m = o.value("mnemonic", std::string{});
+                if (m != "fldur" && m != "fstur") continue;
+                if (!o.contains("encoding")) continue;
+                for (auto& v : o["encoding"]["variants"]) {
+                    v.erase("resultRegClass");
+                    if (!v.contains("wires")) continue;
+                    for (auto& w : v["wires"]) w.erase("regClass");
+                }
+            }
+            // A SECOND class naming the SAME two memory verbs.
+            doc["registerClassOps"].push_back(
+                {{"class", "vr"}, {"load", "fldur"}, {"store", "fstur"}});
+        });
+    EXPECT_FALSE(mutated.has_value())
+        << "one memory verb cannot belong to two register files — the "
+           "chokepoint's per-class lookup would settle the twin by row order";
 }

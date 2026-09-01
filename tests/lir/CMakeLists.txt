@@ -99,6 +99,14 @@ target_link_libraries(dss_lir_test_lir_aliased_view_allocability
 dss_add_test(NAME lir/test_lir_frame_slot_stride
              SOURCES test_lir_frame_slot_stride.cpp)
 
+# D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT: the
+# SIBLING of the row above — the stride sized the slot correctly and the store
+# then wrote 8 bytes into it, because `emitFrameStore`'s width DEFAULTED to 64
+# for every class on every target. Drives the real c -> ... -> assemble
+# pipeline on both shipped targets and closes on the emitted ENCODING.
+dss_add_test(NAME lir/test_lir_frame_access_width
+             SOURCES test_lir_frame_access_width.cpp)
+
 # D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND + D-TARGET-NO-CROSS-CLASS-MOVE-VERB: the
 # inline-asm operand materialisation used ONE module-wide integer `mov` for
 # every operand whatever class it bound — a live silent miscompile on both

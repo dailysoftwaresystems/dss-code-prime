@@ -4573,30 +4573,70 @@ TEST(HirLoweringC, IncludeDirectiveIsSkippedNotFailed) {
     EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Function);
 }
 
+// The mutation-lvalue RECONSTRUCTION shape: a `MemberAccess` chain of exactly
+// `hops` links standing on the `Deref` of the temp pointer `classifyMemberLvalue`
+// binds. `hops == 1` is an ordinary named member; `hops == 2` is a field behind ONE
+// anonymous struct/union member (`s.<anon>.f`), and so on. Counting the chain — not
+// merely "a MemberAccess exists" — is what makes this test fail in the REMOVE
+// direction: the generic via-ptr path this fix replaces emits a bare `Deref(Ref)`
+// with NO MemberAccess above it, so the count drops to zero.
+[[nodiscard]] std::size_t countReconstructedChains(Hir const& hir, HirNodeId n,
+                                                   std::size_t hops) {
+    if (!n.valid()) return 0;
+    std::size_t total = 0;
+    if (hir.kind(n) == HirKind::MemberAccess) {
+        HirNodeId cur = n;
+        std::size_t depth = 0;
+        while (cur.valid() && hir.kind(cur) == HirKind::MemberAccess) {
+            ++depth;
+            auto const kids = hir.children(cur);
+            cur = kids.empty() ? HirNodeId{} : kids.front();
+        }
+        // The chain must END on the Deref of the bound temp pointer. A source-level
+        // `s.anon.f` rvalue also stacks MemberAccess nodes, but over a `Ref`, not a
+        // `Deref` — so this counts reconstructions only.
+        if (depth == hops && cur.valid() && hir.kind(cur) == HirKind::Deref) {
+            auto const dk = hir.children(cur);
+            if (!dk.empty() && hir.kind(dk.front()) == HirKind::Ref) ++total;
+        }
+    }
+    for (HirNodeId c : hir.children(n))
+        total += countReconstructedChains(hir, c, hops);
+    return total;
+}
+
 // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: the bit-field-safe reconstruction
-// (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION) handles NAMED `.`/`->` bit-field
-// mutation; a bit-field reached through an ANONYMOUS-member hop chain or an
-// ARRAY-arrow base cannot be addressed by the single-field lvalue, so a
-// compound/inc-dec/value mutation there FAILS LOUD (S_BitfieldMutationUnsupportedBase)
-// rather than silently full-unit-store via the generic via-ptr path (which would
-// clobber the packed neighbour + skip truncation). Statement plain-`=` stays correct
-// (lowerAssign never routes through classifyMemberLvalue), and NON-bit-field members
-// through the same bases are unaffected. RED-ON-DISABLE: drop the `isBitfield`
-// fail-loud arms in classifyMemberLvalue → the anon/array-arrow bit-field mutation
-// silently lowers (0 S0058) into the neighbour-clobbering full-unit store.
-TEST(HirLoweringC, AnonAndArrowBitfieldMutationFailsLoud) {
-    // (1) compound `+=` on an ANON-struct bit-field → fail loud.
+// (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION) once handled NAMED `.`/`->` bit-field
+// mutation ONLY. A bit-field reached through an ANONYMOUS-member hop chain, or
+// through an ARRAY-arrow decay base (`sarr->bf`, C 6.3.2.1p3), could not be named by
+// the single-field `Lvalue`, so a compound / inc-dec / value mutation there was
+// REFUSED (S_BitfieldMutationUnsupportedBase) — loud, never a miscompile, but a
+// capability gap: ✔MEASURED 2026-08-31, gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc
+// 13.2.0 all COMPILE AND RUN both shapes correctly and MSVC 19.51 accepts both, so
+// DSS must. The `Lvalue` now carries an ordered member-hop CHAIN (one hop per
+// anonymous ancestor, then the field) and the arrow base runs through the same
+// `coerce` Array→Ptr decay arm `combineMember` uses — so both shapes reconstruct
+// the very `MemberAccess` chain the MIR bit-field read-modify-write chokepoint keys
+// on. RED-ON-DISABLE: collapse the chain back to a single index (or drop the decay)
+// → these mutations either refuse again or fall to the generic via-ptr path, and the
+// reconstruction-chain counts below go to zero.
+TEST(HirLoweringC, AnonAndArrowBitfieldMutationReconstructsTheMemberChain) {
+    // (1) compound `+=` on an ANON-struct bit-field: compiles, and rebuilds the
+    //     TWO-hop chain `Deref(p).<anon>.a` the RMW chokepoint needs.
     {
         SemanticModel model = analyzeC(
             "struct O { struct { unsigned a : 4; unsigned b : 4; }; };\n"
             "void f(struct O* o) { o->a += 1; }\n");
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_GE(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 1u)
-            << "anon-member bit-field compound mutation must fail loud, not silently "
-               "full-unit-store";
+        ASSERT_TRUE(res->ok) << "anon-member bit-field `+=` must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
+            << "the anon-member bit-field mutation is supported — nothing to refuse";
+        EXPECT_GE(countReconstructedChains(res->hir, res->hir.root(), 2), 2u)
+            << "the read AND the write-back must each rebuild the 2-hop anon chain, "
+               "or the mutation is a neighbour-clobbering full-unit store";
     }
-    // (2) inc-dec on an anon bit-field (statement + value) → fail loud.
+    // (2) inc-dec on an anon bit-field (statement + value) both reconstruct.
     {
         SemanticModel model = analyzeC(
             "struct O { struct { unsigned a : 4; unsigned b : 4; }; };\n"
@@ -4604,11 +4644,28 @@ TEST(HirLoweringC, AnonAndArrowBitfieldMutationFailsLoud) {
             "unsigned g(struct O* o) { return (++o->a); }\n");
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_GE(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 2u)
-            << "anon-member bit-field inc/dec (statement + value) must both fail loud";
+        ASSERT_TRUE(res->ok) << "anon-member bit-field inc/dec must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u);
+        EXPECT_GE(countReconstructedChains(res->hir, res->hir.root(), 2), 4u)
+            << "statement `o->a++` (read+write) and value `++o->a` (read+write+yield) "
+               "must all rebuild the anon chain";
     }
-    // (3) STATEMENT plain-`=` on the SAME anon bit-field stays CORRECT (compiles,
-    //     no fail-loud — it routes through lowerAssign, not classifyMemberLvalue).
+    // (3) NESTED anonymous members — TWO anon levels, a THREE-hop chain. The chain
+    //     is a loop over `anonAncestorPath`, so one level working is no evidence
+    //     that two do; this is the assertion a single-hop special case fails.
+    {
+        SemanticModel model = analyzeC(
+            "struct O { struct { struct { unsigned a : 4; unsigned b : 4; }; }; };\n"
+            "void f(struct O* o) { o->a += 1; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << "a doubly-nested anon bit-field `+=` must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u);
+        EXPECT_GE(countReconstructedChains(res->hir, res->hir.root(), 3), 2u)
+            << "two anonymous levels must produce a 3-hop chain, not a truncated one";
+    }
+    // (4) STATEMENT plain-`=` on the SAME anon bit-field stays CORRECT — it routes
+    //     through lowerAssign, not classifyMemberLvalue, and always did.
     {
         SemanticModel model = analyzeC(
             "struct O { struct { unsigned a : 4; unsigned b : 4; }; };\n"
@@ -4617,38 +4674,61 @@ TEST(HirLoweringC, AnonAndArrowBitfieldMutationFailsLoud) {
         auto res = lowerToHir(model, r);
         EXPECT_TRUE(res->ok) << "statement plain-`=` on an anon bit-field must compile";
         EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
-            << "statement plain-`=` on an anon bit-field is correct — no fail-loud";
+            << "statement plain-`=` on an anon bit-field is correct — no refusal";
     }
-    // (4) a NON-bit-field anon member compound-assign is UNAFFECTED (generic path).
+    // (5) a NON-bit-field anon member compound-assign compiles. It now takes the
+    //     reconstruction too (it used to fall through to the generic path); the
+    //     chain it rebuilds is the SAME node a plain `o->x = v` builds, so the store
+    //     stays an ordinary scalar store. This is the blast-radius guard.
     {
         SemanticModel model = analyzeC(
             "struct O { struct { int x; int y; }; };\n"
             "void f(struct O* o) { o->x += 1; }\n");
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_TRUE(res->ok) << "non-bit-field anon member compound-assign must compile";
-        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
-            << "a non-bit-field anon member takes the correct generic scalar store";
+        ASSERT_TRUE(res->ok) << "non-bit-field anon member compound-assign must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u);
+        EXPECT_GE(countReconstructedChains(res->hir, res->hir.root(), 2), 2u)
+            << "a non-bit-field anon member reconstructs the same 2-hop chain";
     }
-    // (5) an ARRAY-arrow bit-field base (`sarr->a`, C 6.3.2.1p3 decay) → fail loud;
-    //     a NON-bit-field array-arrow member is unaffected.
+    // (6) an ARRAY-arrow bit-field base (`sarr->a`, C 6.3.2.1p3 decay): compiles,
+    //     and rebuilds a ONE-hop chain over the DECAYED pointer.
     {
         SemanticModel model = analyzeC(
             "struct S { unsigned a : 4; unsigned b : 4; };\n"
             "void f(void) { struct S sarr[2]; sarr->a += 1; }\n");
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_GE(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 1u)
-            << "array-arrow bit-field compound mutation must fail loud";
+        ASSERT_TRUE(res->ok) << "array-arrow bit-field `+=` must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u);
+        EXPECT_GE(countReconstructedChains(res->hir, res->hir.root(), 1), 2u)
+            << "the array-arrow base must decay and reconstruct, not full-unit-store";
     }
+    // (7) a NON-bit-field array-arrow member is unaffected (and now reconstructs).
     {
         SemanticModel model = analyzeC(
             "struct S { int a; int b; };\n"
             "void f(void) { struct S sarr[2]; sarr->a += 1; }\n");
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
-            << "a non-bit-field array-arrow member is unaffected";
+        ASSERT_TRUE(res->ok) << "a non-bit-field array-arrow member must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u);
+    }
+    // (8) CONTROL: a plain NAMED member keeps its ONE-hop reconstruction — the
+    //     shape this fix generalised must not have moved for the case that already
+    //     worked. Without this arm a chain-walk bug that added a phantom hop
+    //     everywhere would still satisfy every assertion above.
+    {
+        SemanticModel model = analyzeC(
+            "struct S { unsigned a : 4; unsigned b : 4; };\n"
+            "void f(struct S* s) { s->a += 1; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok);
+        EXPECT_GE(countReconstructedChains(res->hir, res->hir.root(), 1), 2u)
+            << "a named member is a ONE-hop chain — unchanged by the generalisation";
+        EXPECT_EQ(countReconstructedChains(res->hir, res->hir.root(), 2), 0u)
+            << "a named member must NOT grow a phantom anonymous hop";
     }
 }
 

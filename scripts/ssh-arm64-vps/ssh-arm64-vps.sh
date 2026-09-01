@@ -26,7 +26,20 @@
 set -uo pipefail
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-CONF=$REPO/.secrets/arm64-vps.env
+# ★ `.secrets/` IS GITIGNORED, SO A LANE WORKTREE HAS NONE -- `git worktree add`
+# writes only tracked files. Resolved through the one owner rather than assumed to sit
+# beside this script: `scripts/repo-secrets/` follows a linked worktree back to the
+# main checkout that actually holds the file. Without it this carriage refused rc=3
+# for every lane, naming a path inside the worktree and inviting the one repair that
+# must never be made (a second copy of key material, per lane).
+# ⚠ THE EMPTY ARGUMENT IS LOAD-BEARING: `.` forwards THIS script's positional
+# parameters unless given its own, and this carriage is routinely called with a remote
+# command as `$1`.
+# shellcheck source=../repo-secrets/repo-secrets.sh
+. "$REPO/scripts/repo-secrets/repo-secrets.sh" "" \
+    || { echo "ssh-arm64-vps: cannot load $REPO/scripts/repo-secrets/repo-secrets.sh" >&2; exit 3; }
+SECRETS=$(repo_secrets_dir "$REPO")
+CONF=$SECRETS/arm64-vps.env
 
 # ★ ENV MUST WIN OVER THE CONFIG FILE — see the twin block in `ssh-macos.sh` for the
 # measurement. `.` sources into THIS shell, so a bare `. "$CONF"` overwrites what the
@@ -65,7 +78,7 @@ DSS_VPS_KEY=$(eval printf '%s' "\"$DSS_VPS_KEY\"")   # allow $HOME in the config
 # repo-local key is used; only then do we fail. A non-existent explicit path does
 # NOT silently fall through to a different key — that would answer a question the
 # caller did not ask — but it DOES fall through to discovery, and says so.
-_repo_key=$REPO/.secrets/arm64-vps.key
+_repo_key=$SECRETS/arm64-vps.key
 if [ -n "$DSS_VPS_KEY" ] && [ ! -f "$DSS_VPS_KEY" ] && [ -f "$_repo_key" ]; then
     echo "ssh-arm64-vps: DSS_VPS_KEY='$DSS_VPS_KEY' does not exist; using the repo-local key $_repo_key" >&2
     DSS_VPS_KEY=$_repo_key

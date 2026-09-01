@@ -3125,8 +3125,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               "registerClassOps entry must be an object");
                     continue;
                 }
-                static constexpr std::array<std::string_view, 5> kRegClassOpKeys{
-                    "class", "to", "move", "load", "store"};
+                static constexpr std::array<std::string_view, 7> kRegClassOpKeys{
+                    "class", "to", "move", "load", "store",
+                    "loadScaled", "storeScaled"};
                 DSS_CHECK_KEY_VOCABULARY(kRegClassOpKeys);
                 rejectUnknownKeys(r, kRegClassOpKeys,
                                   std::format("/registerClassOps/{}", i),
@@ -3239,6 +3240,15 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readOp("move",  row.move,  /*diagonalOnly=*/false);
                 readOp("load",  row.load,  /*diagonalOnly=*/true);
                 readOp("store", row.store, /*diagonalOnly=*/true);
+                // D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM:
+                // the SCALED long-reach twins. Diagonal-only for the identical
+                // reason — they relate a class to MEMORY. Their pairing rules
+                // (a twin needs its short form; both-or-neither when the class
+                // owns both short forms) live in `validate()`, beside the
+                // mnemonic-resolution check they extend, rather than here:
+                // this loop reads keys one at a time and cannot see the row.
+                readOp("loadScaled",  row.loadScaled,  /*diagonalOnly=*/true);
+                readOp("storeScaled", row.storeScaled, /*diagonalOnly=*/true);
             }
         }
     }
@@ -3462,10 +3472,14 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // instances carry the most `$...Comment` prose keys - which is
                 // exactly why the carve-out lives in `rejectUnknownKeys` as a
                 // PREFIX test rather than a literal `"$comment"` entry.
-                static constexpr std::array<std::string_view, 28> kCallConvKeys{
+                static constexpr std::array<std::string_view, 27> kCallConvKeys{
                     "name",
                     "argGprs", "argFprs", "returnGprs", "returnFprs",
-                    "argVrs", "returnVrs", "callerSaved", "calleeSaved",
+                    "callerSaved", "calleeSaved",
+                    // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT:
+                    // how much of a callee-saved register this ABI preserves,
+                    // per register class. Absent ⇒ the whole register.
+                    "calleeSavedPreservedBits",
                     "stackAlignment", "shadowSpaceBytes", "redZoneBytes",
                     "entryStackPointerBias", "callPushBytes",
                     "stackProbePageBytes", "aggregateMaxRegBytes",
@@ -3522,12 +3536,132 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readStringArray(c, i, "argFprs",     cc.argFprs);
                 readStringArray(c, i, "returnGprs",  cc.returnGprs);
                 readStringArray(c, i, "returnFprs",  cc.returnFprs);
-                // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the binary128 VR
-                // arg/return register lists (empty on non-ieee128 targets).
-                readStringArray(c, i, "argVrs",      cc.argVrs);
-                readStringArray(c, i, "returnVrs",   cc.returnVrs);
+                // ⚠ `argVrs`/`returnVrs` ARE RETIRED KEYS, and they are absent
+                // from `kCallConvKeys` on purpose so a target still declaring
+                // one is REFUSED by `rejectUnknownKeys` rather than silently
+                // ignored. They named a second arg/return pool over the same
+                // physical registers `argFprs`/`returnFprs` name — the cc half
+                // of arm64 declaring its SIMD&FP file twice (R1, design A′).
                 readStringArray(c, i, "callerSaved", cc.callerSaved);
                 readStringArray(c, i, "calleeSaved", cc.calleeSaved);
+                // ── calleeSavedPreservedBits (optional, per register class) ──
+                //
+                // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT.
+                // Same row shape as `asmBareOperandWidths` — `[{class, bits}]`
+                // — and the same three refusals: an unknown/inoperable class, a
+                // width the LIR instruction model cannot STATE, and a duplicate
+                // row for one class. The `bits <= the class's own natural
+                // width` cross-check belongs to `validate()`, which sees the
+                // finished register table.
+                //
+                // ⚠ ABSENT IS A DECISION AND IT IS THE **WIDE** ONE. Unlike
+                // `asmBareOperandWidths` (where undeclared means REFUSE), a cc
+                // that says nothing here preserves the WHOLE register: an ABI
+                // that guarantees everything has nothing to declare, and the
+                // failure direction of guessing wide is a slower prologue
+                // rather than a restored-garbage register.
+                if (c.contains("calleeSavedPreservedBits")) {
+                    auto const cspPath =
+                        std::format("/callingConventions/{}/calleeSavedPreservedBits", i);
+                    if (!c.at("calleeSavedPreservedBits").is_array()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, cspPath,
+                                  "'calleeSavedPreservedBits' must be an array "
+                                  "of per-register-class rows");
+                    } else {
+                        auto const& rows = c.at("calleeSavedPreservedBits");
+                        for (std::size_t ri = 0; ri < rows.size(); ++ri) {
+                            auto const& r = rows[ri];
+                            auto const rPath = std::format("{}/{}", cspPath, ri);
+                            if (!r.is_object()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, rPath,
+                                          "a calleeSavedPreservedBits entry "
+                                          "must be an object");
+                                continue;
+                            }
+                            static constexpr std::array<std::string_view, 2>
+                                kPreservedKeys{"class", "bits"};
+                            DSS_CHECK_KEY_VOCABULARY(kPreservedKeys);
+                            rejectUnknownKeys(r, kPreservedKeys, rPath,
+                                              "a calleeSavedPreservedBits row",
+                                              coll);
+                            auto const cls =
+                                parseRegClassField(r, "class",
+                                                   std::format("{}/class", rPath),
+                                                   coll);
+                            if (!cls.has_value()) {
+                                if (!r.contains("class")) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              std::format("{}/class", rPath),
+                                              "missing 'class' — a preserved-"
+                                              "width row must name the register "
+                                              "class whose callee-saved members "
+                                              "it describes");
+                                }
+                                continue;
+                            }
+                            if (!isOperableTargetRegClass(*cls)) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/class", rPath),
+                                          std::format("register class '{}' has "
+                                                      "no registers, so no "
+                                                      "callee-saved member of "
+                                                      "it can be preserved",
+                                                      targetRegClassName(*cls)));
+                                continue;
+                            }
+                            if (!r.contains("bits")
+                                || !r.at("bits").is_number_unsigned()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          std::format("{}/bits", rPath),
+                                          "missing or non-unsigned 'bits' — a "
+                                          "row must say HOW MANY bits of a "
+                                          "callee-saved register of this class "
+                                          "the ABI preserves");
+                                continue;
+                            }
+                            auto const bits = r.at("bits").get<std::uint32_t>();
+                            // ⓘ WHAT THIS READER DOES **NOT** CHECK, AND WHERE
+                            // THAT CHECK LIVES INSTEAD. Whether the declared
+                            // width is one the LIR instruction model can STATE
+                            // is not a `core` question — the closed width set
+                            // is `lir_node.hpp`'s, one tier up — so it is
+                            // refused by name at the emission site
+                            // (`lir_callconv::calleeSavedAccessFlags`). That is
+                            // the same split `vaListLayout.fpSlotBytes` already
+                            // uses: core owns the range, the LIR tier owns
+                            // "can an instruction say this". Zero IS refused
+                            // here, because a callee-save preserving no bits is
+                            // a row with no reading at any tier.
+                            if (bits == 0) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/bits", rPath),
+                                          "a preserved width of 0 says a "
+                                          "callee-saved register keeps none of "
+                                          "itself — drop the row (or the "
+                                          "register from `calleeSaved`) rather "
+                                          "than declaring a save that saves "
+                                          "nothing");
+                                continue;
+                            }
+                            auto const idx = static_cast<std::size_t>(*cls);
+                            // A duplicate row is REFUSED rather than last-wins,
+                            // for the reason `asmBareOperandWidths` states: two
+                            // rows for one class is a document whose author
+                            // believed two things about one register file.
+                            if (cc.calleeSavedPreservedBits[idx].has_value()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/class", rPath),
+                                          std::format("register class '{}' "
+                                                      "already has a preserved "
+                                                      "width on this convention "
+                                                      "— one row per class",
+                                                      targetRegClassName(*cls)));
+                                continue;
+                            }
+                            cc.calleeSavedPreservedBits[idx] = bits;
+                        }
+                    }
+                }
                 std::string const ccPath = std::format("/callingConventions/{}", i);
                 readBoundedInt(c, coll, ccPath, "stackAlignment",   cc.stackAlignment);
                 readBoundedInt(c, coll, ccPath, "shadowSpaceBytes", cc.shadowSpaceBytes);

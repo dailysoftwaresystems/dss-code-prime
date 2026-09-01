@@ -53,10 +53,13 @@
 //       targets and in BOTH directions — and specifically NOT to either
 //       class's own diagonal move, which is the wrong-file miscompile above.
 //       "It lowered" is not the claim; WHICH INSTRUCTION is.
-//   (A2) A PAIR WITH NO DECLARED ROW STILL REFUSES, naming both classes. The
-//       fail-loud posture is not what changed — the TABLE is — and without this
-//       arm a regression that made every unresolved pair silently pick a
-//       neighbour would leave (A) green.
+//   (A2) A CONSTRAINT WHOSE CLASS IS THE VALUE'S CLASS NEEDS NO MOVE AT ALL,
+//       and an undeclared pair still RESOLVES TO NOTHING. ⚠ This arm used to
+//       assert that arm64's `"w"` on a `double` was REFUSED, on a config where
+//       `"w"` bound a second class over the SIMD&FP file; R1 of design A′
+//       removed that second class, gcc compiles the template, and so must DSS.
+//       The half that guards against "every unresolved pair silently picks a
+//       neighbour" survives as the lookup assertion inside it.
 //   (B) THE SAME-CLASS COPY STILL COMPILES — the diagonal must not be
 //       collateral damage of generalizing the table.
 //   (C) THE INTEGER CASE IS UNTOUCHED — `"r"` with an `int` is the overwhelming
@@ -196,40 +199,88 @@ TEST(LirAsmOperandMoveClass, ABindingWhoseClassDiffersFromItsValueUsesTheCrossCl
     }
 }
 
-// ── (A2) A PAIR WITH NO DECLARED ROW STILL REFUSES, NAMING BOTH CLASSES ─────
+// ── (A2) THE `"w"` WITNESS IS GONE BECAUSE ITS CONFIG DEFECT WAS FIXED ──────
 //
-// arm64's `"w"` binds `vr` while a `double`'s value lives in `fpr`, and this
-// lane declared NO `vr`/`fpr` row on purpose. The reason is a measurement, not
-// a scope line: on arm64 those two classes are two WIDTH VIEWS of ONE physical
-// register file — ✅ CLOSED row
-// D-TARGET-ALIASED-VIEWS-BOTH-ALLOCATABLE-DOUBLE-COUNT-ONE-FILE measured all
-// 32 pairs sharing a `dwarfNumber` — so a "move" between them would be a fake
-// copy papering over a config defect. The config fix is R1 of the operator's
-// design A′ (declare that file ONCE), tracked at
-// D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE. So this pair is
-// the live witness that an UNDECLARED pair fails loud rather than picking a
-// neighbour.
-TEST(LirAsmOperandMoveClass, APairWithNoDeclaredRowIsRefusedNamingBothClasses) {
+// ⚠⚠ THIS ARM USED TO BE `APairWithNoDeclaredRowIsRefusedNamingBothClasses`,
+// AND IT ASSERTED A REFUSAL THAT IS NOW A CONFORMANCE DEFECT RATHER THAN A
+// GUARANTEE. It lowered `double f(double x){ ... __asm__("nop" : "+w"(y)); }`
+// on arm64 and required `hasErrors()`, on the reasoning that `"w"` bound class
+// `vr` while a `double`'s value lives in `fpr`, that this lane deliberately
+// declared no `vr`/`fpr` row because those two classes were two WIDTH VIEWS of
+// ONE physical register file, and that a "move" between them would be a fake
+// copy papering over a config defect. Every clause of that was TRUE, and the
+// last one named the repair: declare the file ONCE.
+//
+// ★★★ THE REPAIR LANDED (R1 of design A′). `v0..v31` are class `fpr`, `"w"`
+// binds `fpr` — the class a C floating value already lives in — and no `vr`
+// register exists on either shipped target. So this template now COMPILES,
+// which is what gcc does (`aarch64-linux-gnu-gcc 13.3.0 -O2` emits the `nop`
+// and NO move at all), and the old arm would be asserting that DSS refuses a
+// program a working reference accepts.
+//
+// ⚠ WHAT IS LOST, STATED RATHER THAN QUIETLY DROPPED. There is no longer ANY
+// undeclared-but-reachable class pair on a shipped target — arm64 and x86_64
+// each declare both off-diagonal rows over their only two populated classes —
+// so the END-TO-END refusal (`declares no move from register class 'X' to
+// register class 'Y'`) has no live witness in this file. Pinning it would need
+// a MUTANT target with a row removed, which this test target cannot build (it
+// does not link the JSON dependency `mutate_target_schema.hpp` needs). What is
+// asserted instead, below, is the LOOKUP half — an undeclared pair still
+// resolves to nothing rather than borrowing a neighbour — which is the input
+// the refusal fires on, and which reds if a default is ever introduced.
+TEST(LirAsmOperandMoveClass, AWConstraintOnADoubleNeedsNoCrossClassMoveAtAll) {
     auto r = lowerCToLir(
         R"(double f(double x){ double y = x; __asm__("nop" : "+w"(y)); return y; })",
         "arm64");
     requireFrontEndClean(r);
-    EXPECT_TRUE(r.lirReporter.hasErrors())
-        << "no vr<->fpr row is declared, and emitting either class's own move "
-           "would encode the register NUMBER in the wrong file. Got:"
+    ASSERT_FALSE(r.lirReporter.hasErrors())
+        << "gcc 13.3.0 -O2 compiles this template and allocates the value to a "
+           "SIMD&FP register with no move at all, so DSS must — one working "
+           "reference makes the behaviour required. Got:"
         << summarize(r);
 
-    bool namedBothClasses = false;
-    for (auto const& d : r.lirReporter.all()) {
-        if (d.actual.find("class 'vr'") == std::string::npos) continue;
-        if (d.actual.find("class 'fpr'") == std::string::npos) continue;
-        namedBothClasses = true;
+    // ★ THE CONSTRAINT AND THE VALUE ARE ONE CLASS, WHICH IS WHY NO MOVE IS
+    // NEEDED. Read off the target rather than assumed: `"w"`'s declared class
+    // must be the class an FP value lives in.
+    auto const* w = r.target->asmConstraint("w");
+    ASSERT_NE(w, nullptr) << "arm64 must declare the `w` constraint letter";
+    ASSERT_TRUE(w->registerClass.has_value());
+    EXPECT_EQ(*w->registerClass, TargetRegClass::FPR)
+        << "`w` binds a class no C value ever lives in — that is "
+           "D-TARGET-ARM64-W-CONSTRAINT-BINDS-A-CLASS-NO-C-VALUE-EVER-LIVES-IN, "
+           "and it makes this template refuse by name while gcc compiles it";
+
+    // ⚠⚠ "IT LOWERED" IS NOT THE CLAIM. A cross-class move here would be a
+    // fake copy between two spellings of one physical register — the shape the
+    // second class used to force. Neither off-diagonal move may appear.
+    auto const toGpr = r.target->regClassOpOpcode(
+        TargetRegClass::FPR, TargetRegClass::GPR, RegClassOp::Move);
+    auto const toFpr = r.target->regClassOpOpcode(
+        TargetRegClass::GPR, TargetRegClass::FPR, RegClassOp::Move);
+    ASSERT_TRUE(toGpr.has_value() && toFpr.has_value());
+    Lir const& lir = r.lir.lir;
+    for (LirInstId const id : allInsts(lir)) {
+        auto const op = lir.instOpcode(id);
+        EXPECT_NE(op, *toGpr)
+            << "a `\"w\"`-bound double was moved out of the SIMD&FP file — the "
+               "value already lives there, so this is a copy between two names "
+               "for one register";
+        EXPECT_NE(op, *toFpr)
+            << "a `\"w\"`-bound double was moved into the SIMD&FP file it was "
+               "already in";
     }
-    EXPECT_TRUE(namedBothClasses)
-        << "the refusal must name BOTH the class the constraint bound and the "
-           "class the value lives in — those two names are the whole content of "
-           "the diagnostic. Got:"
-        << summarize(r);
+
+    // The LOOKUP half of the refusal, kept alive: a pair the target does not
+    // declare resolves to NOTHING. `vr` has no members on either shipped
+    // target, so this is the surviving undeclared pair.
+    EXPECT_EQ(r.target->regClassOpOpcode(TargetRegClass::FPR,
+                                         TargetRegClass::VR, RegClassOp::Move),
+              std::nullopt)
+        << "an undeclared class pair resolved to an opcode — a neighbour's "
+           "move would encode the register NUMBER in the wrong file";
+    EXPECT_EQ(r.target->regClassOpOpcode(TargetRegClass::VR,
+                                         TargetRegClass::FPR, RegClassOp::Move),
+              std::nullopt);
 }
 
 // ── (B) THE SAME-CLASS COPY STILL COMPILES ──────────────────────────────────

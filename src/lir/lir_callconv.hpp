@@ -188,10 +188,15 @@ struct ReturnPoolRow {
     LirRegClass                                        cls;
     std::vector<std::string> TargetCallingConvention::* pool;
 };
-inline constexpr std::array<ReturnPoolRow, 3> kReturnPoolRows{{
+inline constexpr std::array<ReturnPoolRow, 2> kReturnPoolRows{{
     {LirRegClass::GPR, &TargetCallingConvention::returnGprs},
     {LirRegClass::FPR, &TargetCallingConvention::returnFprs},
-    {LirRegClass::VR,  &TargetCallingConvention::returnVrs},
+    // ⚠ THERE IS NO `VR` ROW, AND ITS ABSENCE IS A DECLARATION. `returnVrs`
+    // was deleted with R1 (design A′): it named a SECOND return pool over the
+    // same physical registers `returnFprs` names, which is what arm64
+    // declaring its SIMD&FP file twice looked like in the cc section. A VR
+    // result now finds NO row and is refused by name — the fail-loud answer
+    // this table exists to give — instead of taking a wrong-file branch.
 }};
 
 // ⚠ AND THE COUNT CANNOT SILENTLY OUTRUN THE ROWS. `std::array<Row, N>` with
@@ -273,9 +278,17 @@ returnRegisterForClass(TargetSchema const&            schema,
 // NOT THE SAME SHAPE. `returnRegisterForClass` takes an `ordinal` the caller
 // supplies and every class's pool is independent. Arg passing walks CURSORS, and
 // AAPCS64 §6.4.2 stage C.1 allocates a Half/Single/Double/Quad-precision
-// floating-point OR SHORT VECTOR argument to `v[NSRN]` — ONE counter across
-// what this codebase calls FPR (the d-views) and VR (the v-views). Two rows,
-// one cursor. `argPoolsShareACursor` below is why that is DERIVED, not declared.
+// floating-point OR SHORT VECTOR argument to `v[NSRN]` — ONE counter.
+//
+// ⚠ THE SENTENCE THAT USED TO END THIS PARAGRAPH IS FALSE ON BOTH COUNTS AND IS
+// KEPT HERE AS A CORRECTION RATHER THAN DELETED: *"ONE counter across what this
+// codebase calls FPR (the d-views) and VR (the v-views). Two rows, one cursor."*
+// There is ONE row now. arm64 declares its SIMD&FP file ONCE (R1 of design A′),
+// so `v[NSRN]` is a single `argFprs` pool and the shared cursor `argPoolsShareACursor`
+// derives has nothing left to relate on either shipped target. The derivation is
+// kept because the two-pool shape is still describable and assuming independent
+// cursors hands slot k out twice — see its own banner below.
+// [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]
 // ── D-LIR-FRAME-SLOT-STRIDE-ENUMERATES-CLASSES-INSTEAD-OF-DERIVING ─────────
 //
 // The uniform byte stride of the frame's saved-register area and spill area.
@@ -306,14 +319,75 @@ frameSlotStrideForClasses(TargetSchema const& schema,
                                        occupants.begin(), occupants.size()});
 }
 
+// ── D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT ──
+//
+// THE TWO — AND ONLY TWO — WAYS A FRAME MOVE THAT CARRIES A WHOLE REGISTER MAY
+// LEARN ITS ACCESS WIDTH. Both answer in `kLirInstFlagWidth*` bits ready to
+// hand to `emitFrameStore` / `emitFrameLoad`; both return nullopt AND REPORT
+// rather than substituting a width.
+//
+// ★★★ WHY THEY EXIST, AND IT IS NOT THAT THE ANSWER WAS WRONG — IT IS THAT
+// NOBODY WAS ASKED. `emitFrameStore`'s `widthFlags` parameter used to DEFAULT
+// to 0, and `lirInstWidthBits(0)` is 64: every frame store that did not think
+// about width silently moved eight bytes, for every register class, on every
+// target. ✔MEASURED at HEAD on the shipped `pe64-x86_64-windows-exec` target,
+// `ms_x64`, whose `calleeSaved` names the SIXTEEN-byte `xmm6..xmm15`:
+//     14000101d:  f2 44 0f 11 bc 24 20 00 00 00   movsd  %xmm15,0x20(%rsp)
+//     14000112e:  f2 44 0f 10 bc 24 20 00 00 00   movsd  0x20(%rsp),%xmm15
+// — a prologue saving EIGHT bytes of a register into a slot `frameSlotStride`
+// had already made SIXTEEN wide, with no diagnostic anywhere, because width 64
+// is a perfectly encodable `movsd`. The defect was the DEFAULT, so the default
+// is gone: both emit functions now take the width as a required argument and a
+// call site that forgets it does not compile.
+//
+// ⚠ THE TWO QUESTIONS ARE DIFFERENT AND MUST NOT BE COLLAPSED, which is the
+// reason this is a PAIR rather than one function with a flag. A SPILL SLOT is
+// DSS's own memory: it must round-trip whatever the allocator can put in the
+// register, so the answer is the register's full declared width and no ABI has
+// standing. A CALLEE-SAVE is ABI-facing: the ABI publishes how much of the
+// register a callee owes its caller, and the two shipped ABIs genuinely
+// disagree (AAPCS64 §6.1.2 preserves 64 bits of `v8..v15`; Win64 preserves
+// `xmm6..xmm15` in full and its unwind vocabulary has no code for a partial
+// save). Answering the ABI question with the register question would widen
+// every AAPCS64 prologue for nothing; answering the register question with the
+// ABI one is the defect above.
+
+// The access width for a frame move carrying a WHOLE register of class `cls`
+// — the width the class's full registers declare (`registerClassNaturalWidthBits`,
+// which is DERIVED from `registers[]` and refuses a class whose full rows
+// disagree). This is the SPILL/RELOAD/save-area answer: no ABI, just "all of
+// it". Nullopt + a loud diagnostic when the class declares no full register,
+// or when its width is one the LIR instruction model cannot state.
+[[nodiscard]] DSS_EXPORT std::optional<std::uint8_t>
+wholeRegisterAccessFlags(TargetSchema const& schema, LirRegClass cls,
+                         std::string_view contextLabel,
+                         DiagnosticReporter& reporter);
+
+// The access width for a CALLEE-SAVE store (or its epilogue restore) of a
+// register of class `cls` under convention `cc`: the bits `cc` DECLARES
+// preserved for that class, or — when it declares none — the whole register.
+//
+// ⚠ THE FALLBACK IS THE WIDE ONE ON PURPOSE. An ABI that preserves everything
+// has nothing to declare, so silence must mean "all of it": the failure
+// direction of guessing wide is a slower prologue, and of guessing narrow is a
+// callee-saved register restored with garbage and nothing in the build log.
+[[nodiscard]] DSS_EXPORT std::optional<std::uint8_t>
+calleeSavedAccessFlags(TargetSchema const& schema,
+                       TargetCallingConvention const& cc, LirRegClass cls,
+                       std::string_view contextLabel,
+                       DiagnosticReporter& reporter);
+
 struct ArgPoolRow {
     LirRegClass                                        cls;
     std::vector<std::string> TargetCallingConvention::* pool;
 };
-inline constexpr std::array<ArgPoolRow, 3> kArgPoolRows{{
+inline constexpr std::array<ArgPoolRow, 2> kArgPoolRows{{
     {LirRegClass::GPR, &TargetCallingConvention::argGprs},
     {LirRegClass::FPR, &TargetCallingConvention::argFprs},
-    {LirRegClass::VR,  &TargetCallingConvention::argVrs},
+    // ⚠ NO `VR` ROW — see `kReturnPoolRows`' twin note. `argVrs` was the
+    // second arg pool over one physical file and is deleted; the AAPCS64
+    // §6.4.2 stage C.1 cursor this comment block describes is now literally
+    // one cursor over one pool, rather than two rows related after the fact.
 }};
 
 // Same anti-padding guarantee the return table carries, for the same measured
@@ -365,10 +439,16 @@ argRegisterPool(TargetCallingConvention const& cc, LirRegClass cls) noexcept {
 // physical register, so two register declarations carrying the same
 // `dwarfNumber` ARE one register wearing two widths.
 //
-// ✔MEASURED over the shipped targets: arm64 has exactly 32 shared
-// `dwarfNumber`s, each pairing a `d_k` (class fpr) with a `v_k` (class vr) —
-// the whole V-register file and nothing else; x86_64 has ZERO, so the
-// derivation is correctly inert there.
+// ⚠ ✔RE-MEASURED after R1 of design A′ (2026-08-28): NEITHER shipped target
+// declares two ARG POOLS over one file any more, so this derivation is inert on
+// both. It used to be arm64's whole story — 32 shared `dwarfNumber`s, each
+// pairing a `d_k` (class `fpr`) with a `v_k` (class `vr`), and a shared cursor
+// derived after the fact to stop the two pools handing out slot k twice. arm64
+// now declares that file ONCE, so there is one FP arg pool and nothing to
+// relate. ⓘ The 32 shared `dwarfNumber`s still EXIST (`v_k` and its `d_k`
+// view both carry 64+k, which is what keeps `.cfi_offset d8` decoding to `d8`),
+// but they are same-class VIEWS now and a view is never in a cc list.
+// [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]
 //
 // ⚠ WHY NOT A `sharedCounter` KEY ON THE CALLING CONVENTION: it would be a
 // SECOND OWNER of a fact the register table already carries, and the loader

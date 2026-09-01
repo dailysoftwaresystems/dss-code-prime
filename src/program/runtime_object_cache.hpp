@@ -292,6 +292,21 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
 
 // ── The two roots ───────────────────────────────────────────────────────────
 
+// The compiled-in override variable for THIS module's own cache — the shipped
+// runtime objects. Exported so no caller, test or sibling mechanism re-spells
+// it, and so the ONE place it is compared against a config-supplied name can
+// say which name it is comparing.
+//
+// ⚠ IT IS THE **RUNTIME OBJECT** CACHE'S NAME AND NOT "THE CACHE VARIABLE".
+// The dependency artifact cache NAMES ITS OWN variable in the project manifest
+// (`dependencyArtifactCache.rootOverrideVariable`), which is strictly better
+// than a compiled-in name and is the pattern this constant should eventually
+// lose to. It survives here because this module's own key predates the
+// manifest and is not read from one — a shipped runtime object belongs to the
+// COMPILER, not to any project.
+inline constexpr std::string_view kRuntimeCacheOverrideVariable =
+    "DSS_RUNTIME_CACHE_DIR";
+
 struct DSS_EXPORT RuntimeCacheRoots {
     // Read-only. ALWAYS present — it is a pure function of the config root, so
     // there is no arm in which it fails to resolve.
@@ -353,6 +368,28 @@ struct DSS_EXPORT RuntimeCacheRoots {
 // previous answer and pass while asserting nothing.
 [[nodiscard]] DSS_EXPORT RuntimeCacheRoots
 resolveRuntimeCacheRoots(std::filesystem::path const& configRoot);
+
+// The same walk, with the OVERRIDE VARIABLE SUPPLIED BY THE CALLER — the one
+// generalization the second subject class needed, and it is a generalization
+// rather than a copy on purpose.
+//
+// `resolveRuntimeCacheRoots(root)` is exactly
+// `resolveArtifactCacheRoots(root, kRuntimeCacheOverrideVariable)`: one walker,
+// one precedence list, one trail format, two named entry points. A second
+// resolver for the dependency cache would be a second owner of the four-arm
+// precedence and of the "set-but-empty is unset" rule, free to drift in the arm
+// nobody exercises — and the trail is a DIAGNOSTIC a user reads, so two of them
+// would eventually describe two different search orders for one machine.
+//
+// ⚠ `overrideVariable` is a NAME and it is REQUIRED to be non-empty. An empty
+// name would make arm 1 a `getenv("")` — always unset — which is a silently
+// disabled override rather than an absent one, and the caller that supplied it
+// believes it declared a location. The refusal is at the KEY builders below,
+// which is where a caller and a request meet; this function takes the name it
+// is given.
+[[nodiscard]] DSS_EXPORT RuntimeCacheRoots
+resolveArtifactCacheRoots(std::filesystem::path const& configRoot,
+                          std::string_view             overrideVariable);
 
 // A build stamp rendered as ONE filesystem-safe path component.
 //
@@ -447,6 +484,28 @@ struct DSS_EXPORT RuntimeObjectKey {
     // `RuntimeCacheRoots::trail`, carried so a store refusal can name every
     // root that was considered without re-resolving them.
     std::string rootTrail;
+
+    // The NAME of the environment variable that overrides this key's cache
+    // location — the compiled-in `kRuntimeCacheOverrideVariable` for a runtime
+    // object, the manifest-declared one for a dependency artifact.
+    //
+    // ★ CARRIED RATHER THAN RE-DERIVED because the store's refusal offers it as
+    // THE REMEDY, and a remedy naming the wrong variable is worse than none: a
+    // user who exports `DSS_RUNTIME_CACHE_DIR` because a DEPENDENCY cache told
+    // them to would watch the failure repeat with no explanation.
+    //
+    // ⚠ NOT A KEY TERM — it never enters `document`. Where the cache LIVES has
+    // no bearing on which bytes belong in it, and the header's two-roots
+    // corollary is the same argument: hashing the location in would give one
+    // artifact two identities.
+    std::string overrideVariable;
+
+    // The anchor id a reader who lands on one of THIS key's refusals should go
+    // and read. Carried for the same reason `ArchiveSiblingRequester::anchor`
+    // is: the store now serves two subject classes, and a refusal citing the
+    // shipped-runtime ruling to somebody whose DEPENDENCY failed to cache names
+    // a row that had nothing to do with their build. NOT a key term either.
+    std::string anchor;
 };
 
 // ⚠ An EMPTY `digest` on any loaded document is a REFUSAL, not a skip: it means
@@ -455,6 +514,180 @@ struct DSS_EXPORT RuntimeObjectKey {
 // a key it cannot verify" defect. Empty is detectable; wrong is not.
 [[nodiscard]] DSS_EXPORT std::expected<RuntimeObjectKey, std::string>
 computeRuntimeObjectKey(RuntimeObjectRequest const& request);
+
+// ── THE SECOND SUBJECT CLASS: A DEPENDENCY PROJECT'S ARTIFACT ───────────────
+//
+// D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C).
+//
+// ★★★ WHY THIS IS A SECOND REQUEST AND NOT A REUSE OF `RuntimeObjectRequest`,
+// WHICH IS WHAT THAT ROW ORIGINALLY PRESCRIBED ("the store is REUSED WHOLE").
+// ✔MEASURED by reading the type: `RuntimeObjectRequest` is CONFIG-ROOT-ANCHORED
+// BY CONSTRUCTION. `sourcePath` is config-root-RELATIVE and is opened as
+// `configRoot / sourcePath`; `descriptorPaths` are config-root-relative and
+// EMPTY IS A DOCUMENTED REFUSAL rather than an absent term. A dependency's
+// artifact has neither: its sources live in the CONSUMER's tree (or in a git
+// checkout under `.dss-deps/`), and no shipped-header descriptor names it at
+// all. Feeding it through that request would either need a fake descriptor set
+// — defeating the one term that request exists for — or a relaxation of the
+// empty-set refusal, which would weaken the shipped-runtime key to admit the
+// dependency key. Two subjects, two request shapes, ONE key type and ONE store.
+//
+// ★★ AND THE STORE IS GENUINELY REUSED WHOLE, because the store never sees a
+// request: `lookupRuntimeObject`, `storeRuntimeObject`, `runtimeKeyDocumentPath`
+// and the sidecar verification all take a `RuntimeObjectKey`. Both builders
+// produce that same type through the same document→hash→path tail, so the two
+// roots, the read-through order, the key-as-path rule, the 16-character index,
+// the byte-for-byte sidecar comparison, the sidecar-first write order and the
+// unverifiable-entry REFUSAL apply to a dependency artifact unchanged and by
+// construction rather than by a promise.
+//
+// ── WHAT REPLACES THE UNIT AND DESCRIPTOR TERMS ─────────────────────────────
+//
+// `inputClosureDigest` — the union of `CompilationUnit::inputDigest()` over
+// every compilation unit this artifact is built from, rendered by the CALLER in
+// BUILD ORDER (see `inputClosureDigest` below). It is the term that makes this
+// cache safe at all: a C project's `#include` closure is in no manifest, and
+// ✔MEASURED (cycle P46, lane `dc`) a dependency whose header alone is edited
+// produces a different archive while every manifest-level term is byte-
+// identical. Nobody but the front end can enumerate that closure, so nobody but
+// the front end is asked.
+struct DSS_EXPORT DependencyArtifactRequest {
+    // Absolute `.../src/dss-config`. Here it is the CACHE ANCHOR and nothing
+    // else — unlike `RuntimeObjectRequest`, no path in this request is resolved
+    // against it. It is what makes the shipped root findable and what scopes the
+    // per-user root, exactly as it does for the runtime objects.
+    std::filesystem::path configRoot;
+
+    // The NAME of the environment variable that overrides the cache location,
+    // supplied by the project manifest (`dependencyArtifactCache.
+    // rootOverrideVariable`). ⚠ EMPTY IS A REFUSAL, not "use the default":
+    // this mechanism is config-driven by construction, and silently falling
+    // back to a compiled-in name would put the cache somewhere the manifest did
+    // not declare.
+    std::string overrideVariable;
+
+    // ⚠ EMPTY IS A REFUSAL. `CompilationUnit::inputDigest()` reports EMPTY for
+    // a unit built through a path that never computed one, so an empty closure
+    // means the input set is UNKNOWN — the same failure `loadedDocuments`'
+    // empty-digest arm refuses, one tier out. A key over an unknown input set is
+    // exactly the entry that gets served after the inputs moved.
+    std::string inputClosureDigest;
+
+    // ★ THE ARTIFACT'S BASE NAME — `artifactName.value_or(sourceStem)` — AND IT
+    // DOES TWO JOBS THAT ARE ONE FACT. It names the ENTRY FILE, because
+    // `pruneSupersededSiblings` matches on `<stem>-<index><suffix>` and an entry
+    // outside that shape would be un-prunable; and it is a KEY TERM, because the
+    // name reaches the emitted bytes (archive member names follow it). Two
+    // fields carrying one value would be two owners of it, free to drift into a
+    // cache entry named after one thing and keyed on another.
+    //
+    // `artifactSuffix` is the OBJECT FORMAT's own extension, asked of the format
+    // rather than assumed — it was hardcoded `.a` while a shipped runtime
+    // archive was the only subject, and a hardcoded extension here would make
+    // the eviction policy a silent no-op for every other one.
+    //
+    // ⚠ BOTH ARE REFUSED WHEN EMPTY: an empty stem produces the name
+    // `-<index><suffix>`, which the prune's exact-match predicate would then
+    // treat as a stem-less family and delete across unrelated dependencies.
+    std::string artifactStem;
+    std::string artifactSuffix;   // WITH the leading dot, e.g. ".a" / ".lib"
+
+    // The same four terms `RuntimeObjectRequest` carries, meaning the same
+    // things and obtained from the same components.
+    std::string targetSpec;        // the --target string, verbatim
+    std::string buildFormatName;
+    std::string siblingFormatName; // from `resolveArchiveSiblingFormat`
+    std::string configName;        // "debug" / "release"
+    std::vector<LoadedConfigDocument> loadedDocuments;
+
+    // ★★★ THE LINK INPUTS — EVERY FILE THAT REACHES THE LINK WITHOUT PASSING
+    // THROUGH THE FRONT END, BY PATH AND BY CONTENT, IN LINK ORDER. Without
+    // this term the key is UNDER-invalidating, which is the direction that
+    // ships wrong bytes: an `ArtifactLink` dependency links its OWN
+    // dependencies' artifacts, its manifest's `resolveLibraries`, any
+    // pre-assembled object among its sources, and (for a non-archive format)
+    // DSS's own shipped runtime archives. `inputDigest()` cannot see any of
+    // them — it is a digest of what was PARSED, and none of these is parsed.
+    //
+    // ⚠ IN LINK ORDER, NOT SORTED, AND THAT IS THE OPPOSITE OF THE RULE
+    // `loadedDocuments` FOLLOWS. There the order is filesystem noise, so
+    // sorting makes the document a function of the SET. Here the order is
+    // OPERATOR-SUPPLIED AND LOAD-BEARING — the archive symbol map is
+    // first-wins across archives in list order, so two orders are two programs
+    // — and sorting would MERGE them onto one key, which is the under-
+    // invalidating direction again.
+    //
+    // ⚠ An EMPTY digest is a REFUSAL, same as `loadedDocuments`: it means a
+    // link input could not be read, and a key over an unreadable input is a key
+    // that cannot be verified.
+    //
+    // ⓘ EMPTY IS NOT A REFUSAL HERE — a static library built from source alone
+    // genuinely links nothing, and that is the common shape. The distinction
+    // from `RuntimeObjectRequest::descriptorPaths` (where empty IS a refusal)
+    // is real: a realized unit exists BECAUSE a descriptor named it, so an
+    // empty set there contradicts the corpus reader; nothing implies an
+    // artifact must link something.
+    //
+    // ⚠ THE PATH IS A KEY TERM AND NOT MERELY A LABEL, AND THE OBVIOUS
+    // OBJECTION TO THAT IS ANSWERED. The objection: DSS's own shipped runtime
+    // archives are link inputs, they live in a cache whose location varies, and
+    // keying on their path would mean a dependency artifact never warms. It
+    // does not, because `resolveShippedRuntimeArchives` deliberately points the
+    // link at the DURABLE cache copy rather than at its staging area — *"a hit
+    // and a miss link the same FILE and not merely the same bytes"*. The one
+    // arm where the path really is per-run is the one where the runtime store
+    // REFUSED to write, and there the build already prints a note on every run
+    // saying so; a dependency that then never warms is a consequence of that
+    // stated failure, not a silent one. Keeping the path is the conservative
+    // direction, and the conservative direction is the one the asymmetry picks.
+    std::vector<LoadedConfigDocument> linkInputs;
+
+    // ── EVERY REMAINING DRIVER KNOB THAT CAN REACH THE BYTES ────────────────
+    //
+    // ★★★ THIS LIST IS CLOSED AND IT IS AUDITED AGAINST `compileOneTarget`'S
+    // PARAMETER LIST AND `CompileOptions`' FIELD LIST, because an enumeration
+    // of inputs is exactly the instrument that fails toward HIT. What each of
+    // those inputs does here, stated so the next reader can re-audit rather
+    // than re-derive:
+    //   * cus                → `inputClosureDigest`
+    //   * grammar            → `loadedDocuments` ("language" + its references)
+    //   * targetSpecStr      → `targetSpec`; its format half → `buildFormatName`
+    //   * compileOpts.config → `configName`
+    //   * compileOpts.resolveLibraries, .objectInputs → `linkInputs`
+    //   * artifactName.value_or(sourceStem) → `artifactStem` above, which is a
+    //     key term as well as the entry's name
+    //   * compileOpts.ltoMode, imageRequest.stackReserveBytes → the two fields
+    //     below
+    //   * compileOpts.pipelineOverride → NOT a field: a non-null override is
+    //     REFUSED by the driver before a request is built. It is a raw pointer
+    //     to an in-memory pass list with no identity to digest, so the only
+    //     honest options are "refuse" and "serve the wrong bytes".
+    //   * outputDir / multiTargetBuild / perFormatOutputSubdir → NOT inputs at
+    //     all. They decide WHERE the artifact lands, and on a hit the cached
+    //     bytes are written to whatever path THIS build resolves — so the
+    //     destination is an output of the build, never an input to it.
+    //   * executor / jobsOverride → NOT inputs. A build whose bytes depend on
+    //     the thread count is a defect in that build, not a cache term; keying
+    //     on them would hide it behind a permanent miss.
+    //   * compileOpts.diagBudget, the reporter's policy axes → NOT inputs.
+    //     They decide which diagnostics are emitted and whether the build
+    //     FAILS, and a failed build stores nothing.
+    //   * analysisOnly → NOT a field: the driver never builds a request for a
+    //     knowingly-incomplete program, which writes no artifact by design.
+    std::string  ltoModeName;         // the topology, spelled by the driver
+    // nullopt ⇒ the object format's declared default stands. Rendered as a
+    // DISTINCT line from any numeric value, so "unset" and "set to the number
+    // the format happens to default to" are two keys — the format's default is
+    // a property of a document that can change under a fixed manifest.
+    std::optional<std::uint64_t> stackReserveBytes;
+};
+
+// ⚠ Same empty/malformed-digest refusals as `computeRuntimeObjectKey` over
+// `loadedDocuments`, plus the four refusals named on the fields above. It reads
+// NOTHING from disk: every content term already arrived as a digest, which is
+// the whole difference between keying an artifact and keying a shipped unit.
+[[nodiscard]] DSS_EXPORT std::expected<RuntimeObjectKey, std::string>
+computeDependencyArtifactKey(DependencyArtifactRequest const& request);
 
 // ── The key document beside an artifact ─────────────────────────────────────
 
@@ -542,8 +775,33 @@ lookupRuntimeObject(RuntimeObjectKey const& key);
 // error — an open artifact cannot be unlinked on Windows, and the cache's
 // correctness never depends on old entries being gone, only on them being
 // unreachable, which the key-as-path already guarantees.
+//
+// ── `eviction` — AND IT IS A POLICY, WHICH IS WHY IT IS A PARAMETER AND NOT A
+//    KEY TERM ───────────────────────────────────────────────────────────────
+// Two builds that differ ONLY in this value compile the SAME bytes from the
+// SAME inputs, so putting it in the key document would split one entry into two
+// and make every switch of the policy a cold cache — the "over-invalidation
+// costs one recompile" side of the asymmetry paid for nothing. It decides only
+// what happens to OTHER entries after this one lands.
+//
+// ⚠ IT HAS NO DEFAULT ARGUMENT, DELIBERATELY. A defaulted policy is a decision
+// taken by whoever forgot to state one, and the two call sites genuinely differ:
+// the shipped runtime cache supersedes (one unit has one current object), while
+// a project may need every revision retained.
+enum class CacheEviction {
+    // Storing DELETES the superseded entries sharing this entry's stem in this
+    // directory — the pre-existing, and still the only, behaviour of the
+    // shipped runtime object cache.
+    PruneSuperseded,
+    // Nothing is deleted. Every entry ever written stays addressable, which is
+    // what a workflow alternating between two revisions of one dependency needs:
+    // under pruning each build evicts the other's entry and both stay cold.
+    Retain,
+};
+
 [[nodiscard]] DSS_EXPORT std::expected<std::filesystem::path, std::string>
 storeRuntimeObject(RuntimeObjectKey const&        key,
-                   std::span<std::uint8_t const>  bytes);
+                   std::span<std::uint8_t const>  bytes,
+                   CacheEviction                  eviction);
 
 } // namespace dss::runtime

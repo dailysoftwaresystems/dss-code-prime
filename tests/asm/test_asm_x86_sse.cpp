@@ -582,6 +582,33 @@ namespace {
     return false;
 }
 
+// D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT: the
+// NO-MANDATORY-PREFIX sibling of `containsSseOp`. The whole-register SSE
+// memory forms (MOVUPS m128, xmm = 0F 11 /r and its load 0F 10 /r) carry no F2
+// / F3 / 66 prefix at all, so a searcher that starts by matching a prefix byte
+// cannot see them.
+//
+// ⚠ IT MUST REFUSE A PREFIXED INSTRUCTION, which is the whole difficulty: the
+// bytes `0F 11` also occur INSIDE `F2 0F 11`, so scanning for the pair alone
+// would report a MOVUPS wherever a MOVSD stands and this file's ability to tell
+// the two apart — the point of the pin below — would be gone. So the byte
+// before the (optional) REX is checked and any SSE mandatory prefix rejected.
+[[nodiscard]] bool containsSseOpNoPrefix(std::vector<std::uint8_t> const& bytes,
+                                         std::uint8_t op2) {
+    auto const isSsePrefix = [](std::uint8_t b) {
+        return b == 0xF2u || b == 0xF3u || b == 0x66u;
+    };
+    for (std::size_t i = 0; i + 1 < bytes.size(); ++i) {
+        if (bytes[i] != 0x0F || bytes[i + 1] != op2) continue;
+        // Walk back over an optional REX, then reject a mandatory prefix.
+        std::size_t k = i;
+        if (k > 0 && (bytes[k - 1] & 0xF0u) == 0x40u) --k;
+        if (k > 0 && isSsePrefix(bytes[k - 1])) continue;
+        return true;
+    }
+    return false;
+}
+
 // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD: like containsSseOp but ALSO pins
 // the ModR/M addressing MODE — `modrmMask`-selected bits of the byte
 // after the opcode must equal `modrmBits`. The riprel form is mod=00
@@ -817,7 +844,7 @@ TEST(X86Sse, FullPipelineRodataConstTwoLoadsKeepsLeaPlusBaseForm) {
     EXPECT_EQ(out.relocs[0].target, SymbolId{500});
 }
 
-TEST(X86Sse, FullPipelineMsX64FprPrologueSpillsViaMovsdStore) {
+TEST(X86Sse, FullPipelineMsX64FprPrologueSpillsViaClassRoutedWholeRegisterStore) {
     // The PE-float gap, end-to-end (FC2 runtime-corpus unblock,
     // 2026-06-10): i32 f(f64 a, f64 b), allocated under ms_x64 (cc
     // index 1), where the FAdd result MUST SURVIVE A CALL. Win64
@@ -825,10 +852,39 @@ TEST(X86Sse, FullPipelineMsX64FprPrologueSpillsViaMovsdStore) {
     // CANNOT sit in a caller-saved xmm — the callee is free to
     // destroy every one of them. The allocator therefore has no
     // choice, and the prologue MUST spill the callee-saved xmm with
-    // the fpr class's `store` (registerClassOps → movsd_store,
-    // F2 [REX] 0F 11) and the epilogue restore it with `load`
-    // (F2 [REX] 0F 10). SysV has no callee-saved XMMs, which is why
-    // the gap only fired on PE.
+    // the fpr class's `store` (registerClassOps → movsd_store) and the
+    // epilogue restore it with that class's `load`. SysV has no
+    // callee-saved XMMs, which is why the gap only fired on PE.
+    //
+    // ★★★ THIS TEST USED TO ASSERT THE **F2 (MOVSD, 8-byte) FORM**, AND THAT
+    // ASSERTION WAS PINNING A SILENT MISCOMPILE IN PLACE — the reason it is
+    // recorded here rather than quietly edited. It read:
+    //     EXPECT_TRUE(containsSseOp(out.bytes, 0xF2, 0x11))
+    //         << "ms_x64 prologue must spill the callee-saved xmm via the "
+    //            "MOVSD store (F2 [REX] 0F 11)";
+    // and the sibling for 0x10, and the test was NAMED
+    // `...SpillsViaMovsdStore`. The capability it exists to defend is stated
+    // in its own docblock as *"an FPR save uses the FPR store mnemonic, not a
+    // GPR mov"* — a question about the register CLASS, not about the access
+    // WIDTH. The width came along for the ride because `movsd_store` declared
+    // no wider variant and `emitFrameStore`'s `widthFlags` defaulted to 64, so
+    // MOVSD was the only thing the prologue could emit; the assertion then
+    // made that accident load-bearing.
+    //
+    // ⚠ AND THE ACCIDENT WAS WRONG. `ms_x64` names the SIXTEEN-byte
+    // `xmm6..xmm15` in `calleeSaved` and `frameSlotStride` reserves a 16-byte
+    // slot for each, so an 8-byte MOVSD saved HALF of a register the ABI says
+    // is preserved in full. ✔MEASURED against the reference 2026-08-31: MSVC
+    // 14.44.35207 `/O2 /FAs` emits `movaps XMMWORD PTR [rax-24], xmm6` — a
+    // sixteen-byte save — and Win64's unwind vocabulary spells this save
+    // `UWOP_SAVE_XMM128`, with no code for a partial one. The save is now the
+    // whole register (MOVUPS m128, `0F 11 /r`, no mandatory prefix; unaligned
+    // because a DSS frame slot is 16-byte STRIDED but not 16-byte ALIGNED).
+    // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT.
+    //
+    // ★ SO THE ASSERTIONS BELOW PIN THE CLASS ROUTING **AND** THE WIDTH, AND
+    // THE OLD FORM IS PINNED **ABSENT**: a regression back to the 8-byte save
+    // is now a RED rather than the requirement.
     //
     // ★★★ THE CALL IS THE POINT, AND IT REPLACED AN ALLOCATOR
     // ACCIDENT (plan 22 OPT8, 2026-08-26). This fixture used to have
@@ -887,12 +943,27 @@ TEST(X86Sse, FullPipelineMsX64FprPrologueSpillsViaMovsdStore) {
            "saved-reg store (L_RequiredLirOpcodeMissing = the pre-fix "
            "PE float gap)";
     if (out.rep.errorCount() != 0u) dumpDiagnostics(out.rep);
-    EXPECT_TRUE(containsSseOp(out.bytes, 0xF2, 0x11))
-        << "ms_x64 prologue must spill the callee-saved xmm via the "
-           "MOVSD store (F2 [REX] 0F 11)";
-    EXPECT_TRUE(containsSseOp(out.bytes, 0xF2, 0x10))
-        << "ms_x64 epilogue must restore the callee-saved xmm via the "
-           "MOVSD load (F2 [REX] 0F 10)";
+    EXPECT_TRUE(containsSseOpNoPrefix(out.bytes, 0x11))
+        << "ms_x64 prologue must spill the callee-saved xmm WHOLE — the fpr "
+           "class's `store` at the register's own 128-bit width, MOVUPS m128 "
+           "([REX] 0F 11 /r, no mandatory prefix). This is BOTH halves of the "
+           "claim: the mnemonic came from `registerClassOps` (not a GPR mov) "
+           "and the width came from `calleeSavedAccessFlags` (not a default)";
+    EXPECT_TRUE(containsSseOpNoPrefix(out.bytes, 0x10))
+        << "ms_x64 epilogue must restore it at the SAME width — a narrower "
+           "reload leaves the top half of a preserved register holding the "
+           "caller's value";
+    // ★ THE DISCRIMINATION. Without this the pin would pass over a build that
+    // emitted BOTH forms, or that had merely GAINED the wide encoding while
+    // the prologue kept using the narrow one.
+    EXPECT_FALSE(containsSseOp(out.bytes, 0xF2, 0x11))
+        << "the 8-byte MOVSD store (F2 [REX] 0F 11) must be GONE from this "
+           "function — it is the measured defect, and this fixture's only FPR "
+           "memory traffic is the callee-save round trip";
+    EXPECT_FALSE(containsSseOp(out.bytes, 0xF2, 0x10))
+        << "and so must its 8-byte reload";
     EXPECT_TRUE(containsSseOp(out.bytes, 0xF2, 0x58))
-        << "the function body must still contain ADDSD";
+        << "the function body must still contain ADDSD — the CONTROL that "
+           "keeps this from passing on a function that emitted no FP at all, "
+           "and the proof that ordinary scalar-FP arithmetic did NOT widen";
 }

@@ -2747,15 +2747,24 @@ struct Lowerer {
             return;
         }
         // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the SCALAR RetPiece captures
-        // from the cc's per-class return register (lir_callconv), which for an FPR
-        // piece is a d-register (returnFprs). A 16-byte binary128 HFA piece (F128,
-        // piece 1..N-1 of a multi-Q return) lives in a v-register (returnVrs), so
-        // this scalar capture would read the WRONG file (8 of 16 bytes). The
-        // 1-element HFA (the LD-4 runtime witness) has NO piece 1..N-1 (piece 0 is
-        // the call's own result, captured via lowerCall's F128 arm), so this never
-        // fires there; a 2+-element binary128 HFA RETURN captured at the CALLER is
-        // beyond the witness — fail loud rather than silently mis-file it (the
-        // callee side already lowers it via lowerReturn's per-piece vrRet loop).
+        // from the cc's per-class return register (lir_callconv) at the class's
+        // WIDTH-DEFAULT, which for an FPR piece is 64 bits. A 16-byte binary128
+        // HFA piece (F128, piece 1..N-1 of a multi-Q return) needs the width-128
+        // form of that same register, so this scalar capture would read 8 of the
+        // datum's 16 bytes. The 1-element HFA (the LD-4 runtime witness) has NO
+        // piece 1..N-1 (piece 0 is the call's own result, captured via lowerCall's
+        // F128 arm), so this never fires there; a 2+-element binary128 HFA RETURN
+        // captured at the CALLER is beyond the witness — fail loud rather than
+        // silently mis-file it (the callee side already lowers it via
+        // lowerReturn's per-piece fprRet loop).
+        //
+        // ⚠ THIS USED TO SAY THE PIECE "lives in a v-register (returnVrs)" while
+        // an FPR piece was "a d-register (returnFprs)" — two register FILES. With
+        // the SIMD&FP file declared once
+        // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]) there is one
+        // file, one `returnFprs` pool, and the gap is a WIDTH the scalar capture
+        // does not state rather than a file it reads from. The refusal is the
+        // same and stays for the same reason.
         if (interner.kind(mir.instType(id)) == TypeKind::F128) {
             reportUnsupported(MirOpcode::ReturnPiece, id);
             poisonValue(id);
@@ -5494,10 +5503,30 @@ struct Lowerer {
     // Extends the LD-1/LD-2 memory-resident model to USER call boundaries. NO
     // register-allocation model is added: an F80/F128 value is still the GPR-held
     // ADDRESS of its 16-byte home; the physical arg/return registers (st0 for
-    // SysV x87; v0..v7 for AAPCS64 binary128, read from the cc's argVrs/returnVrs
-    // config) are transient scratch marshalled around the boundary. Dispatch is
-    // on TypeKind::F80 / TypeKind::F128 only (each forms solely on its own format
-    // axis) + config — never an arch/format identity branch.
+    // SysV x87; v0..v7 for AAPCS64 binary128, read from the cc's argFprs /
+    // returnFprs config) are transient scratch marshalled around the boundary.
+    // Dispatch is on TypeKind::F80 / TypeKind::F128 only (each forms solely on
+    // its own format axis) + config — never an arch/format identity branch.
+    //
+    // ★★★ THESE SITES USED TO READ `argVrs`/`returnVrs` AND TO NAME THE CLASS
+    // `LirRegClass::VR`, AND THE REPLACEMENT IS NOT A RENAME —
+    // [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]] (design A′, R1).
+    // Those were a SECOND cc pool declared over the SAME physical SIMD&FP file
+    // `argFprs` already named, so `v0` and `d0` were two independent rows related
+    // only by a cursor derived from their DWARF numbers. arm64 now declares that
+    // file ONCE — `v0..v31` are class `fpr` at sixteen bytes, and `q`/`d`/`s`/
+    // `h`/`b` are `subOf` VIEW rows of them, also `fpr` — so there is ONE FP arg
+    // pool, ONE FP return pool, and no `vr` class on the target at all.
+    //
+    // ⚠⚠ THE WIDTH IS NOW THE INSTRUCTION'S TO STATE, AND OMITTING IT IS A
+    // SILENT WRONG-WIDTH MOVE. With one class, `classOp(FPR, Load/Store)`
+    // resolves to `fldur`/`fstur`, whose width-DEFAULT is 64. The deleted
+    // `fldur_q`/`fstur_q` opcodes are now the width-128 VARIANTS of those same
+    // rows, carrying the same bytes, elected by the LIR instruction's width
+    // flag. So every marshal of a 16-byte binary128 home below passes
+    // `kLirInstFlagWidth128` explicitly; without it eight of the sixteen bytes
+    // would move and nothing in the pipeline would object — which is precisely
+    // the operand-vs-instruction disagreement declaring the file once removes.
 
     // A SysV x87 80-bit `long double` PARAMETER (received on the incoming stack —
     // MEMORY class). Its MIR `Arg` carries the incoming-overflow BYTE OFFSET as
@@ -5520,33 +5549,42 @@ struct Lowerer {
     }
 
     // An AAPCS64 IEEE binary128 `long double` PARAMETER (or a binary128 HFA
-    // piece) arrives in a physical arg V-register v0..v7 — its MIR `Arg` argIndex
-    // is the NSRN ordinal (shared with argFprs, so an F64 and an F128 sharing a
-    // signature never collide). SPILL it to a fresh 16-byte memory home at entry
-    // (fstur_q [home] <- v{k}) — the memory-resident F128 model (the value IS its
-    // home address, recorded in allocaSlotIndex_ so consumers rematerialize it).
-    // SAFE BY POSITION: nothing is live before entry, so reading the physical
-    // v-reg as the store source cannot be clobbered (the LD-2 transient-scratch
-    // precedent, entry side). NSRN past the pool (>8 F128 params, spilled to the
-    // incoming stack) carries no byte-offset here (the AAPCS64 param loop keeps
-    // the ordinal, not a byte offset) — fail loud rather than misread it.
+    // piece) arrives in a physical arg register v0..v7 — its MIR `Arg` argIndex
+    // is the NSRN ordinal, which now indexes the SINGLE FP arg pool `argFprs`,
+    // so an F64 and an F128 sharing a signature never collide because they draw
+    // from ONE list rather than from two lists a cursor kept in step. SPILL it
+    // to a fresh 16-byte memory home at entry (`fstur` at width 128, i.e.
+    // `STUR Qt, [home]`) — the memory-resident F128 model (the value IS its home
+    // address, recorded in allocaSlotIndex_ so consumers rematerialize it).
+    // NSRN past the pool (>8 F128 params, spilled to the incoming stack) carries
+    // no byte-offset here (the AAPCS64 param loop keeps the ordinal, not a byte
+    // offset) — fail loud rather than misread it.
+    //
+    // ★ WHY THE PHYSICAL READ IS SAFE, RESTATED FOR ONE ALLOCATABLE CLASS. The
+    // old argument was "the v-reg is invisible to regalloc because VR is
+    // non-allocatable"; with the SIMD&FP file declared once that is FALSE — the
+    // fpr class IS allocatable, and this ordinal is now one the allocator SEES.
+    // What makes it safe is POSITION, which was always the load-bearing half:
+    // this store sits at FUNCTION ENTRY, before any of the function's own values
+    // exist, so nothing of the function's can be live in v{k} to be clobbered,
+    // and the incoming-argument value is consumed here and never read again.
     void lowerF128Arg(MirInstId id) {
         auto const* cc = target.callingConvention(0);
         std::uint32_t const ord = mir.argIndex(id);
-        if (cc == nullptr || ord >= cc->argVrs.size()) {
+        if (cc == nullptr || ord >= cc->argFprs.size()) {
             reportUnsupported(MirOpcode::Arg, id);
             poisonValue(id);
             return;
         }
-        auto const vrOrd = target.registerByName(cc->argVrs[ord]);
-        if (!vrOrd.has_value()) {
+        auto const fprOrd = target.registerByName(cc->argFprs[ord]);
+        if (!fprOrd.has_value()) {
             reportUnsupported(MirOpcode::Arg, id);
             poisonValue(id);
             return;
         }
-        auto const storeOp = classOp(LirRegClass::VR, RegClassOp::Store);
+        auto const storeOp = classOp(LirRegClass::FPR, RegClassOp::Store);
         if (!storeOp.has_value()) {
-            reportMissingClassOp(LirRegClass::VR, RegClassOp::Store, "MIR F128 Arg");
+            reportMissingClassOp(LirRegClass::FPR, RegClassOp::Store, "MIR F128 Arg");
             poisonValue(id);
             return;
         }
@@ -5555,32 +5593,46 @@ struct Lowerer {
         if (!slotIndex.has_value()) { poisonValue(id); return; }
         std::optional<LirReg> const homeAddr = emitLeaFrameSlot(*slotIndex);
         if (!homeAddr.has_value()) { poisonValue(id); return; }
-        LirReg const argPhys = makePhysicalReg(*vrOrd, LirRegClass::VR);
-        // fstur_q [home] <- v{k} — the shipped vr-class store shape
+        LirReg const argPhys = makePhysicalReg(*fprOrd, LirRegClass::FPR);
+        // `fstur` [home] <- v{k} AT WIDTH 128 — the fpr class's own store shape
         // ([value, base, MemBase, MemOffset]), mirroring the LD-2 softcall result
-        // store exactly.
+        // store exactly. The width flag is what elects the Q-form variant that
+        // the deleted `fstur_q` opcode used to be; at the width-default (64) this
+        // would store 8 of the datum's 16 bytes with no diagnostic.
         std::array<LirOperand, 4> stOps{
             LirOperand::makeReg(argPhys),
             LirOperand::makeReg(*homeAddr),
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        emitInst(*storeOp, InvalidLirReg, stOps);
+        emitInst(*storeOp, InvalidLirReg, stOps, /*payload=*/0,
+                 kLirInstFlagWidth128);
         allocaSlotIndex_.emplace(id.v, *slotIndex);
     }
 
     // ── D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): IEEE binary128 softcall ──
     //
     // THE REPRESENTATION mirrors LD-1's F80: an F128 SSA value is the GPR-held
-    // ADDRESS of its 16-byte memory home (a 128-bit VR register is invisible to
-    // the flat linear-scan allocator, so F128 never lives in a register as a
-    // VALUE). Where LD-1 realizes arithmetic as an inline x87 sequence, LD-2
+    // ADDRESS of its 16-byte memory home, so F128 never lives in a register as a
+    // VALUE.
+    //
+    // ⚠ THE MODEL IS UNCHANGED BUT ITS REASON IS NOT, AND THE OLD REASON WAS
+    // LEFT HERE LONG ENOUGH TO BE WORTH NAMING. This used to read "a 128-bit VR
+    // register is invisible to the flat linear-scan allocator". With the SIMD&FP
+    // file declared once — [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]
+    // — that sentence is false: `v0..v31` are ordinary allocatable `fpr` rows at
+    // sixteen bytes and the cc lists them in callerSaved/calleeSaved. Staying
+    // memory-resident is now a REPRESENTATION CHOICE at this tier (MIR carries
+    // no 128-bit float VALUE, only its home address), not a consequence of the
+    // allocator being unable to see the register.
+    //
+    // Where LD-1 realizes arithmetic as an inline x87 sequence, LD-2
     // realizes it as a CALL to a config'd softfloat helper (`__addtf3` …): the
     // operands are marshalled into the config'd physical arg registers (v0/v1 —
     // transient scratch, the x87 st0/st1 precedent), `BL <helper>`, and the
     // config'd result register is captured to a fresh home. The `BL` (a `Call`
     // opcode, isCall=true) clobbers the caller-saved v0-v7/x0-x18, so regalloc
-    // spills any live d-reg/gpr around it — zero register-allocator changes for
+    // spills any live fpr/gpr around it — zero register-allocator changes for
     // VALUES (the F128 value stays memory-resident).
 
     // Realize an F128 op as a softfloat-helper CALL. The GENERIC verb — it
@@ -5632,8 +5684,20 @@ struct Lowerer {
             if (interner.kind(mir.instType(operands[i])) == TypeKind::F128) {
                 // Memory-resident: `src` is the 16-byte home ADDRESS — LOAD it
                 // into the physical arg register with the class's load op
-                // (fldur_q), the same [base, MemBase, MemOffset] shape lowerLoad
-                // uses.
+                // (`fldur` AT WIDTH 128, i.e. `LDUR Qt`), the same
+                // [base, MemBase, MemOffset] shape lowerLoad uses.
+                //
+                // ⚠⚠ THE WIDTH FLAG IS LOAD-BEARING HERE AND THIS SITE DID NOT
+                // USED TO CARRY ONE. `argCls` is read off the register table, so
+                // when `v0` was declared class `vr` this resolved to the
+                // 128-bit-only `fldur_q` and the width was implicit in the
+                // OPCODE. With the SIMD&FP file declared once
+                // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]])
+                // `v0` is class `fpr`, this resolves to `fldur`, and `fldur`'s
+                // width-DEFAULT is 64 — so leaving the flags at 0 would load 8
+                // of the binary128's 16 bytes into the helper's argument
+                // register at rc=0 with no diagnostic. The branch is gated on
+                // TypeKind::F128, so the datum is always the 16-byte home.
                 auto const loadOp = classOp(argCls, RegClassOp::Load);
                 if (!loadOp.has_value()) {
                     reportMissingClassOp(argCls, RegClassOp::Load,
@@ -5646,7 +5710,8 @@ struct Lowerer {
                     LirOperand::makeMemBase(1),
                     LirOperand::makeMemOffset(0),
                 };
-                emitInst(*loadOp, argPhys, ldOps);
+                emitInst(*loadOp, argPhys, ldOps, /*payload=*/0,
+                         kLirInstFlagWidth128);
             } else {
                 // Register-resident (an F64/F32 source of `from_f64`): MOVE the
                 // vreg into the physical arg register with the class's move op
@@ -5697,7 +5762,12 @@ struct Lowerer {
             // reserved above; the value IS its home address (recorded in
             // allocaSlotIndex_ so consumers rematerialize it), exactly like
             // lowerF80Arith. The store shape [value, base, MemBase, MemOffset]
-            // mirrors the shipped fstur_q row + the generic FPR store.
+            // is the fpr class's own store (`fstur`) AT WIDTH 128 — the Q form
+            // the deleted `fstur_q` opcode used to be, now a width variant of
+            // the same row carrying the same bytes. Same reasoning as the
+            // operand marshal above: `resCls` comes off the register table, so
+            // this became a width-64 `fstur` the moment `v0` was redeclared
+            // `fpr`, and only the flag keeps all sixteen bytes moving.
             auto const storeOp = classOp(resCls, RegClassOp::Store);
             if (!storeOp.has_value()) {
                 reportMissingClassOp(resCls, RegClassOp::Store,
@@ -5711,7 +5781,8 @@ struct Lowerer {
                 LirOperand::makeMemBase(1),
                 LirOperand::makeMemOffset(0),
             };
-            emitInst(*storeOp, InvalidLirReg, stOps);
+            emitInst(*storeOp, InvalidLirReg, stOps, /*payload=*/0,
+                     kLirInstFlagWidth128);
             allocaSlotIndex_.emplace(id.v, *resultSlotIndex);
         } else {
             // Non-F128 result (the `to_i32` int32): MOVE the physical result
@@ -6367,7 +6438,11 @@ struct Lowerer {
         // scalar read of a 16-byte value (a silent wrong-width miscompile; and
         // the value cannot live in a scalar float register at all). Keep the lea
         // so the memory-resident load path (lowerF80Load) reads a GPR base
-        // register for its fldur_q / fld_m80.
+        // register for its width-128 `fldur` / its `fld_m80`. (That first
+        // mnemonic used to be spelled `fldur_q`, a separate opcode over a
+        // separately-declared register file; it is now the Q-form WIDTH VARIANT
+        // of `fldur` — [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]
+        // — which is exactly why the width-default probe below must not match.)
         if (interner.kind(mir.instType(user)) == TypeKind::F80
             || interner.kind(mir.instType(user)) == TypeKind::F128) return false;
         auto const userOps = mir.instOperands(user);
@@ -7150,9 +7225,16 @@ struct Lowerer {
             if (!isVoid) poisonValue(id);
         };
         // Pre-scan the args: an F128 arg MIXED with a non-F128 FPR (F32/F64) arg
-        // is unsupported — the NSRN interleaving between hand-placed v-registers
-        // and lir_callconv-placed d-registers is not modeled. Fail loud (never a
-        // silent register skew; the witness signatures are all-F128 or F128+GPR).
+        // is unsupported — the NSRN interleaving is not modeled across the TWO
+        // PLACERS. The F128 args are hand-placed by the burst below; the F32/F64
+        // args are placed by lir_callconv from its own separate walk, and the two
+        // cursors never meet. ⚠ This used to be phrased as "hand-placed
+        // v-registers and lir_callconv-placed d-registers", i.e. two register
+        // FILES; with the SIMD&FP file declared once
+        // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]) they draw
+        // from ONE pool at two widths, which removes the file confusion but not
+        // the two-placer skew. Fail loud (never a silent register skew; the
+        // witness signatures are all-F128 or F128+GPR).
         bool sawF128Arg = false, sawNonF128Fpr = false;
         for (std::size_t i = 1; i < operands.size(); ++i) {
             TypeKind const ak = interner.kind(mir.instType(operands[i]));
@@ -7170,8 +7252,15 @@ struct Lowerer {
         // Reserve the long-double RESULT home BEFORE marshalling/the call (the
         // LD-2 softcall order): the home-address vreg is a GPR live across the
         // call — regalloc parks it callee-saved — ready for the result capture
-        // IMMEDIATELY after the call (fstp_m80/fstur_q adjacency; st0/v0 survive
-        // the call, invisible/non-allocatable).
+        // IMMEDIATELY after the call. ADJACENCY IS THE WHOLE ARGUMENT: the
+        // capture (`fstp_m80` on x87, a width-128 `fstur` on AAPCS64) is emitted
+        // as the instruction right after the call, so nothing of this function's
+        // own can be live in st0/v0 between the two. ⚠ This used to add "st0/v0
+        // survive the call, invisible/non-allocatable"; with the SIMD&FP file
+        // declared once
+        // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]) v0 is an
+        // ordinary allocatable `fpr` row, so non-allocatability is no longer
+        // available as a reason and was never the load-bearing one.
         std::optional<std::uint32_t> resultSlotIndex;
         std::optional<LirReg>        resultHomeAddr;
         if (resultIsF80 || resultIsF128) {
@@ -7187,8 +7276,10 @@ struct Lowerer {
         // reg FIRST (the hoist discipline). Direct: [SymbolRef(sym), args...];
         // indirect: [callee_reg, args...]. A by-value-stack aggregate carrier
         // (an F80/SysV arg, or a stacked struct) expands to (addrReg,
-        // ByValueStackAgg). An F128 arg is collected for the v-register burst,
-        // NOT operand-listed; `nsrnCursors` tracks its shared FPR/VR ordinal.
+        // ByValueStackAgg). An F128 arg is collected for the FP-register burst,
+        // NOT operand-listed; `nsrnCursors` tracks its NSRN ordinal in the one FP
+        // arg pool (this used to say "shared FPR/VR ordinal", back when the same
+        // physical register was two rows in two pools kept in step by a cursor).
         std::vector<LirOperand> ops;
         ops.reserve(operands.size() + 2);
         if (calleeIsGlobalAddr) {
@@ -7198,16 +7289,23 @@ struct Lowerer {
             if (!callee.has_value()) return;
             ops.push_back(LirOperand::makeReg(*callee));
         }
-        std::vector<std::pair<LirReg, std::uint16_t>> f128Marshals;  // (home, vrOrd)
+        std::vector<std::pair<LirReg, std::uint16_t>> f128Marshals;  // (home, fprOrd)
         // ★★★ THE SIXTH COPY OF THE ARG CURSOR, NOW THE SAME OBJECT AS THE
         // OTHER FIVE (D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR).
-        // This was a private `std::uint32_t nsrn` indexing `cc->argVrs`, with a
-        // hand-written `++nsrn` on the F32/F64 arm carrying the AAPCS64 fact
-        // that the d-views and the v-views share ONE counter. That fact is now
-        // DERIVED from the target's `dwarfNumber`s, so the sharing cannot be
-        // half-remembered here and spelled differently three files away.
+        // This was a private `std::uint32_t nsrn` indexing a second FP arg pool,
+        // with a hand-written `++nsrn` on the F32/F64 arm carrying the AAPCS64
+        // fact that the 64-bit views and the 128-bit views share ONE counter.
+        // ★ THAT FACT NO LONGER NEEDS DERIVING AT ALL —
+        // [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]. When the
+        // SIMD&FP file was declared twice, the shared counter was inferred from
+        // the two pools' `dwarfNumber`s; the file is now declared ONCE, `argFprs`
+        // is the only FP arg pool, and both arms below advance the SAME cursor
+        // because there is only one to advance. `kArgPoolRows` accordingly has no
+        // `VR` row, so asking this object for a VR slot would now yield nullopt
+        // and refuse a perfectly good AAPCS64 call — the class named here must be
+        // FPR.
         // ⚠ A GPR argument also advances its own (independent) cursor through
-        // this object; only the vector slot is read, so that costs nothing and
+        // this object; only the FP slot is read, so that costs nothing and
         // keeps the walk identical to the one every other site performs.
         // ⚠ The cc must exist before the cursors can: the old code deferred that
         // check to the first F128 argument, so a target with no calling
@@ -7223,21 +7321,21 @@ struct Lowerer {
             MirInstId const operandMir = operands[i];
             TypeKind const ak = interner.kind(mir.instType(operandMir));
             if (ak == TypeKind::F128) {
-                auto const slot = nsrnCursors.next(LirRegClass::VR);
-                if (!slot.has_value() || slot->index >= cc->argVrs.size()) {
+                auto const slot = nsrnCursors.next(LirRegClass::FPR);
+                if (!slot.has_value() || slot->index >= cc->argFprs.size()) {
                     reportUnsupported(MirOpcode::Call, id);
                     poisonIfValueResult();
                     return;
                 }
-                auto const vrOrd = target.registerByName(cc->argVrs[slot->index]);
-                if (!vrOrd.has_value()) {
+                auto const fprOrd = target.registerByName(cc->argFprs[slot->index]);
+                if (!fprOrd.has_value()) {
                     reportUnsupported(MirOpcode::Call, id);
                     poisonIfValueResult();
                     return;
                 }
                 std::optional<LirReg> const home = regForValue(operandMir);
                 if (!home.has_value()) return;
-                f128Marshals.emplace_back(*home, *vrOrd);
+                f128Marshals.emplace_back(*home, *fprOrd);
                 continue;
             }
             std::optional<LirReg> const r = regForValue(operandMir);
@@ -7274,36 +7372,50 @@ struct Lowerer {
                     static_cast<std::uint8_t>(
                         (bvPayload >> kByValueStackArgExhaustShift) & 0x3u)));
             } else if (ak == TypeKind::F32 || ak == TypeKind::F64) {
-                // A non-F128 FPR arg consumes an NSRN slot too — and on a target
-                // whose d-views and v-views are one register file, advancing the
-                // FPR cursor advances the vector one, because they ARE one
-                // cursor. Nothing here asserts that; the register table does.
+                // A non-F128 FPR arg consumes an NSRN slot too — the SAME cursor
+                // the F128 arm above takes from, because with the SIMD&FP file
+                // declared once there is one FP arg pool and one FP cursor. This
+                // used to be phrased as the FPR cursor advancing "the vector one"
+                // via a sharing relation derived from the register table; the
+                // relation is gone because the second pool is gone —
+                // [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]].
                 (void)nsrnCursors.next(LirRegClass::FPR);
             }
         }
 
-        // Marshal each F128 arg into its physical v-register in a TIGHT burst
-        // immediately before the call (all home addresses already resolved) —
-        // preserving the LD-2 marshal→call adjacency so the BL's caller-saved
-        // clobber of the aliased d-regs protects a live double.
-        std::optional<std::uint16_t> vrLoadOp;
+        // Marshal each F128 arg into its physical arg register in a TIGHT burst
+        // immediately before the call (all home addresses already resolved).
+        // ADJACENCY IS THE ARGUMENT: these physical writes sit between the last
+        // operand resolution and the `BL`, so no value of this function's own is
+        // live across them, and the `BL`'s caller-saved clobber covers the same
+        // registers afterwards. ⚠ The old note reasoned about "the BL's
+        // caller-saved clobber of the ALIASED d-regs"; with the SIMD&FP file
+        // declared once there are no aliased d-rows to protect — v0..v7 are
+        // themselves the caller-saved rows the cc lists
+        // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]), and the
+        // allocator now SEES this ordinal instead of it being invisible in a
+        // second class.
+        std::optional<std::uint16_t> fprLoadOp;
         if (!f128Marshals.empty()) {
-            vrLoadOp = classOp(LirRegClass::VR, RegClassOp::Load);
-            if (!vrLoadOp.has_value()) {
-                reportMissingClassOp(LirRegClass::VR, RegClassOp::Load,
+            fprLoadOp = classOp(LirRegClass::FPR, RegClassOp::Load);
+            if (!fprLoadOp.has_value()) {
+                reportMissingClassOp(LirRegClass::FPR, RegClassOp::Load,
                                      "MIR F128 call arg marshal");
                 poisonIfValueResult();
                 return;
             }
         }
-        for (auto const& [home, vrOrd] : f128Marshals) {
-            LirReg const argPhys = makePhysicalReg(vrOrd, LirRegClass::VR);
+        for (auto const& [home, fprOrd] : f128Marshals) {
+            LirReg const argPhys = makePhysicalReg(fprOrd, LirRegClass::FPR);
             std::array<LirOperand, 3> ldOps{
                 LirOperand::makeReg(home),
                 LirOperand::makeMemBase(1),
                 LirOperand::makeMemOffset(0),
             };
-            emitInst(*vrLoadOp, argPhys, ldOps);
+            // WIDTH 128 — `fldur` at its 64-bit default would load half the
+            // binary128 into the callee's argument register with no diagnostic.
+            emitInst(*fprLoadOp, argPhys, ldOps, /*payload=*/0,
+                     kLirInstFlagWidth128);
         }
 
         // D-LANG-VARIADIC (step 13.4): forward the MIR Call's variadic-payload
@@ -7325,37 +7437,48 @@ struct Lowerer {
             return;
         }
         if (resultIsF128) {
-            // AAPCS64: the binary128 return is in v0 (returnVrs[0]). Emit the call
-            // (no result reg), then fstur_q [home] <- v0 into the home reserved
-            // above; the value IS its home address (allocaSlotIndex_ → consumers
-            // rematerialize it). UN-WALLS the former F128 Call-result gate.
-            if (cc == nullptr || cc->returnVrs.empty()) {
+            // AAPCS64: the binary128 return is in v0 — now `returnFprs[0]`, the
+            // ONE FP return pool, where it used to be `returnVrs[0]` of a second
+            // pool over the same physical file
+            // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]). Emit
+            // the call (no result reg), then a width-128 `fstur` [home] <- v0
+            // into the home reserved above; the value IS its home address
+            // (allocaSlotIndex_ → consumers rematerialize it). UN-WALLS the
+            // former F128 Call-result gate.
+            //
+            // ★ THE PHYSICAL READ IS SAFE BY POSITION, NOT BY INVISIBILITY: the
+            // store is emitted as the instruction IMMEDIATELY after the call, so
+            // nothing of this function's own can be live in v0 between the two.
+            if (cc == nullptr || cc->returnFprs.empty()) {
                 reportUnsupported(MirOpcode::Call, id);
                 poisonValue(id);
                 return;
             }
-            auto const vrOrd = target.registerByName(cc->returnVrs[0]);
-            auto const storeOp = classOp(LirRegClass::VR, RegClassOp::Store);
+            auto const fprOrd = target.registerByName(cc->returnFprs[0]);
+            auto const storeOp = classOp(LirRegClass::FPR, RegClassOp::Store);
             if (!storeOp.has_value()) {
-                reportMissingClassOp(LirRegClass::VR, RegClassOp::Store,
+                reportMissingClassOp(LirRegClass::FPR, RegClassOp::Store,
                                      "MIR F128 call result");
                 poisonValue(id);
                 return;
             }
-            if (!vrOrd.has_value()) {
+            if (!fprOrd.has_value()) {
                 reportUnsupported(MirOpcode::Call, id);
                 poisonValue(id);
                 return;
             }
             emitInst(*opcode(callSlot), InvalidLirReg, ops, payload);
-            LirReg const resPhys = makePhysicalReg(*vrOrd, LirRegClass::VR);
+            LirReg const resPhys = makePhysicalReg(*fprOrd, LirRegClass::FPR);
             std::array<LirOperand, 4> stOps{
                 LirOperand::makeReg(resPhys),
                 LirOperand::makeReg(*resultHomeAddr),
                 LirOperand::makeMemBase(1),
                 LirOperand::makeMemOffset(0),
             };
-            emitInst(*storeOp, InvalidLirReg, stOps);
+            // WIDTH 128 — the Q form the deleted `fstur_q` opcode used to be;
+            // `fstur`'s width-default is 64 and would store half the result.
+            emitInst(*storeOp, InvalidLirReg, stOps, /*payload=*/0,
+                     kLirInstFlagWidth128);
             allocaSlotIndex_.emplace(id.v, *resultSlotIndex);
             return;
         }
@@ -10177,10 +10300,12 @@ struct Lowerer {
         // register (cycle-broken) before the ret. Carry every operand as a reg.
         std::vector<LirOperand> ops;
         ops.reserve(operands.size());
-        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a LOCAL per-class VR return
-        // ordinal for a multi-piece binary128-HFA return (each F128 piece → the
-        // next returnVrs register). Mirrors the caller-side fprRet counter.
-        std::uint32_t vrRet = 0;
+        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a LOCAL return ordinal for
+        // a multi-piece binary128-HFA return (each F128 piece → the next
+        // `returnFprs` register). Mirrors the caller-side fprRet counter. This
+        // used to index a separate `returnVrs` pool declared over the same
+        // physical file — [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]].
+        std::uint32_t fprRet = 0;
         for (MirInstId const operand : operands) {
             TypeKind const opk = interner.kind(mir.instType(operand));
             // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a `long double` RETURN
@@ -10201,35 +10326,55 @@ struct Lowerer {
                 continue;
             }
             if (opk == TypeKind::F128) {
-                // AAPCS64: fldur_q v{returnVrs[k]} <- [home]. The physical
-                // VR write survives to the assembler (no LIR DCE; VR is
-                // non-allocatable) → v0 holds the return at `ret`.
+                // AAPCS64: `fldur` AT WIDTH 128 — `LDUR Q{returnFprs[k]}, [home]`
+                // — so v0 holds the return at `ret`.
+                //
+                // ★★ WHY THIS PHYSICAL WRITE IS SAFE, AND WHY THE OLD REASON NO
+                // LONGER APPLIES. This comment used to read "the physical VR
+                // write survives to the assembler (no LIR DCE; VR is
+                // non-allocatable)". Half of that is now FALSE: with the SIMD&FP
+                // file declared once
+                // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]) the
+                // `fpr` class IS allocatable and v0..v31 are the rows the cc
+                // lists in callerSaved/calleeSaved. What actually holds the
+                // property is POSITION: this load is emitted at the tail of the
+                // return lowering, so it sits immediately before the `ret` (the
+                // epilogue lir_callconv inserts is GPR-only and `ops` stays empty
+                // for a pure long-double return, so the return-capture loop is a
+                // no-op). Nothing of this function's own is live across it, and
+                // there is no later instruction that could redefine v0. ★ The
+                // trade is in our favour: the allocator now SEES this physical
+                // ordinal, where before it was invisible because it lived in a
+                // second register class the free lists never carried.
                 auto const* cc = target.callingConvention(0);
-                if (cc == nullptr || vrRet >= cc->returnVrs.size()) {
+                if (cc == nullptr || fprRet >= cc->returnFprs.size()) {
                     reportUnsupported(MirOpcode::Return, id);
                     return false;
                 }
-                auto const vrOrd = target.registerByName(cc->returnVrs[vrRet]);
-                if (!vrOrd.has_value()) {
+                auto const fprOrd = target.registerByName(cc->returnFprs[fprRet]);
+                if (!fprOrd.has_value()) {
                     reportUnsupported(MirOpcode::Return, id);
                     return false;
                 }
-                auto const loadOp = classOp(LirRegClass::VR, RegClassOp::Load);
+                auto const loadOp = classOp(LirRegClass::FPR, RegClassOp::Load);
                 if (!loadOp.has_value()) {
-                    reportMissingClassOp(LirRegClass::VR, RegClassOp::Load,
+                    reportMissingClassOp(LirRegClass::FPR, RegClassOp::Load,
                                          "MIR F128 Return operand");
                     return false;
                 }
                 std::optional<LirReg> const home = regForValue(operand);
                 if (!home.has_value()) return false;
-                LirReg const retPhys = makePhysicalReg(*vrOrd, LirRegClass::VR);
+                LirReg const retPhys = makePhysicalReg(*fprOrd, LirRegClass::FPR);
                 std::array<LirOperand, 3> ldOps{
                     LirOperand::makeReg(*home),
                     LirOperand::makeMemBase(1),
                     LirOperand::makeMemOffset(0),
                 };
-                emitInst(*loadOp, retPhys, ldOps);
-                ++vrRet;
+                // WIDTH 128 — `fldur`'s width-default is 64, which would return
+                // the low 8 bytes of the binary128 and nothing would object.
+                emitInst(*loadOp, retPhys, ldOps, /*payload=*/0,
+                         kLirInstFlagWidth128);
+                ++fprRet;
                 continue;
             }
             // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): call-boundary

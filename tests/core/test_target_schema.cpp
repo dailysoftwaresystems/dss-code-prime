@@ -14,6 +14,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <fstream>
 #include <gtest/gtest.h>
 #include <ios>
@@ -1765,14 +1766,29 @@ TEST(TargetSchema, WideFloatSoftcallSchemaParsesArgAndResultRegisters) {
     EXPECT_EQ(add->argRegisterOrdinals[0], *v0);
     EXPECT_EQ(add->argRegisterOrdinals[1], *v1);
     EXPECT_EQ(add->resultRegisterOrdinal, *v0);
-    // Cross-check the ordinal actually names v0/v1 (VR-class, 128-bit).
+    // Cross-check the ordinal actually names v0/v1 — the FULL 16-byte SIMD&FP
+    // register. ⚠ `regClass` USED TO BE ASSERTED AS `VR` HERE, and the change
+    // is not a rename: R1 of design A′ made arm64 declare its SIMD&FP file
+    // ONCE, so `v0` is class `fpr` at sixteen bytes and no `vr`-class register
+    // exists on either shipped target. The width is the fact that actually
+    // matters to this row (a binary128 helper argument), and it is unmoved.
     auto const* v0Info = (*r)->registerInfo(add->argRegisterOrdinals[0]);
     ASSERT_NE(v0Info, nullptr);
     EXPECT_EQ(v0Info->name, "v0");
-    EXPECT_EQ(v0Info->regClass, TargetRegClass::VR);
+    EXPECT_EQ(v0Info->regClass, TargetRegClass::FPR);
     EXPECT_EQ(v0Info->widthBytes, 16u);
-    // The from_f64 row marshals its double source through d0 (an FPR register),
-    // proving the table is register-class-agnostic (not v-register-only).
+    EXPECT_TRUE(v0Info->subOf.empty())
+        << "a softcall must marshal through the FULL register, not a view";
+    // The from_f64 row marshals its double source through d0 — the 8-byte
+    // `subOf` VIEW of that same v0 — proving the table resolves a register by
+    // NAME and does not silently require the widest row of a file.
+    //
+    // ⚠ THIS USED TO PROVE SOMETHING ELSE, AND IT NO LONGER CAN. It read
+    // "d0 (an FPR register), proving the table is register-class-agnostic (not
+    // v-register-only)" — a real claim while `v0` was `vr` and `d0` was `fpr`.
+    // With one class over the file both rows are `fpr`, so the class contrast
+    // is gone; what survives, and is now the load-bearing fact, is the WIDTH
+    // contrast between the two rows the same table resolves.
     auto const* fromF64 = (*r)->wideFloatSoftcall(::dss::WideFloatOp::FromFloat64);
     ASSERT_NE(fromF64, nullptr);
     ASSERT_EQ(fromF64->argRegisterOrdinals.size(), 1u);
@@ -1780,6 +1796,10 @@ TEST(TargetSchema, WideFloatSoftcallSchemaParsesArgAndResultRegisters) {
     ASSERT_NE(d0Info, nullptr);
     EXPECT_EQ(d0Info->name, "d0");
     EXPECT_EQ(d0Info->regClass, TargetRegClass::FPR);
+    EXPECT_EQ(d0Info->widthBytes, 8u);
+    EXPECT_EQ(d0Info->subOf, "v0")
+        << "the `double` source view and the binary128 register must be one "
+           "physical register, or the helper reads a register nobody wrote";
 
     // Negative: a softcall naming an UNRESOLVABLE register must fail loud.
     auto bad = TargetSchema::loadFromText(
@@ -1811,47 +1831,104 @@ TEST(TargetSchema, WideFloatSoftcallSchemaParsesArgAndResultRegisters) {
     EXPECT_TRUE(anyHasCode(badOp.error(), DiagnosticCode::C_MalformedJson));
 }
 
-// D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the argVrs/returnVrs calling-
-// convention lists (the AAPCS64 binary128 arg/return VR registers) parse +
-// resolve like argFprs, are validated VR-class, and a mis-classed name fails
-// loud. Mirrors the LD-2 wideFloatSoftcall schema pin.
-TEST(TargetSchema, ArgVrsReturnVrsParseResolveAndValidateVrClass) {
+// D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the AAPCS64 binary128 arg/return
+// registers parse + resolve, are validated FPR-class, and a mis-classed name
+// fails loud. Mirrors the LD-2 wideFloatSoftcall schema pin.
+//
+// ⚠⚠ THIS TEST USED TO BE `ArgVrsReturnVrsParseResolveAndValidateVrClass`, AND
+// ITS SUBJECT NO LONGER EXISTS. `argVrs`/`returnVrs` were a SECOND cc pool
+// naming the same physical registers `argFprs`/`returnFprs` named — the cc half
+// of arm64 declaring its SIMD&FP file twice — and R1 of design A′ deleted both
+// keys along with the second declaration. The binary128 arg/return registers
+// are now simply the FP ones, named at their full sixteen bytes; "128 bits of
+// it" is the access WIDTH the instruction states, not a second register class.
+//
+// ★ THE NEGATIVE IS KEPT ALIVE ON THE SURVIVING LIST. "A boundary register list
+// naming a register of the wrong class must fail loud" was the real content of
+// the old negative arm, and it is asserted below against `argFprs`.
+TEST(TargetSchema, Aapcs64Binary128ArgAndReturnRegistersAreTheFullFprPool) {
     // Positive: the shipped arm64 aapcs64 cc (index 0) declares v0..v7 args +
-    // v0..v3 returns, all resolving to VR-class 128-bit registers.
+    // v0..v3 returns, all resolving to FPR-class 128-bit ROOT registers (never
+    // a `subOf` view — naming the 8-byte `d` view is the operand-claims-half-
+    // the-width shape D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD records).
     auto r = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(r.has_value());
     ASSERT_FALSE((*r)->callingConventions().empty());
     auto const& cc = (*r)->callingConventions()[0];
     EXPECT_EQ(cc.name, "aapcs64");
-    ASSERT_EQ(cc.argVrs.size(), 8u);
-    ASSERT_EQ(cc.returnVrs.size(), 4u);
-    for (std::size_t k = 0; k < cc.argVrs.size(); ++k) {
-        EXPECT_EQ(cc.argVrs[k], std::string("v") + std::to_string(k));
-        auto const ord = (*r)->registerByName(cc.argVrs[k]);
-        ASSERT_TRUE(ord.has_value()) << cc.argVrs[k];
+    ASSERT_EQ(cc.argFprs.size(), 8u);
+    ASSERT_EQ(cc.returnFprs.size(), 4u);
+    for (std::size_t k = 0; k < cc.argFprs.size(); ++k) {
+        EXPECT_EQ(cc.argFprs[k], std::string("v") + std::to_string(k));
+        auto const ord = (*r)->registerByName(cc.argFprs[k]);
+        ASSERT_TRUE(ord.has_value()) << cc.argFprs[k];
         auto const* info = (*r)->registerInfo(*ord);
         ASSERT_NE(info, nullptr);
-        EXPECT_EQ(info->regClass, TargetRegClass::VR);
+        EXPECT_EQ(info->regClass, TargetRegClass::FPR);
         EXPECT_EQ(info->widthBytes, 16u);
+        EXPECT_TRUE(info->subOf.empty());
     }
-    EXPECT_EQ(cc.returnVrs[0], "v0");
+    EXPECT_EQ(cc.returnFprs[0], "v0");
 
-    // Negative: an argVrs naming a NON-VR register (a GPR) must fail the
-    // VR-class validation (C_MalformedJson), exactly as argFprs rejects a
-    // non-FPR name — a mis-classed boundary register is a silent wrong-file move.
+    // Negative: an argFprs naming a NON-FPR register (a GPR) must fail the
+    // class validation (C_MalformedJson) — a mis-classed boundary register is
+    // a silent wrong-file move. This is the surviving equivalent of the
+    // `argVrs`-naming-a-GPR arm this test used to carry.
     auto bad = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"},
                        {"mnemonic":"mov","result":"value"}],
             "registers":[{"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0},
-                         {"name":"v0","class":"vr","widthBytes":16,"hwEncoding":0}],
+                         {"name":"v0","class":"fpr","widthBytes":16,"hwEncoding":0}],
             "callingConventions":[
-              {"name":"cc","argVrs":["x0"],"returnVrs":["v0"],"stackAlignment":16}
+              {"name":"cc","argFprs":["x0"],"returnFprs":["v0"],"stackAlignment":16}
             ]})",
         "<inline>");
     ASSERT_FALSE(bad.has_value())
-        << "an argVrs naming a GPR (non-VR) register must fail loud";
+        << "an argFprs naming a GPR (non-FPR) register must fail loud";
     EXPECT_TRUE(anyHasCode(bad.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ★ THE RETIRED KEYS ARE REFUSED, NOT IGNORED — and that is a deliberate,
+// pinnable behaviour rather than a side effect. `argVrs`/`returnVrs` were
+// dropped from `kCallConvKeys` when they were deleted from the struct, so a
+// target still carrying one is rejected by `rejectUnknownKeys`. The
+// alternative — leaving them in the vocabulary as accepted-and-discarded —
+// would let a stale target declare a boundary register pool that silently does
+// nothing, which is the shape the closed-key vocabulary exists to prevent.
+TEST(TargetSchema, RetiredArgVrsKeyIsRefusedAsAnUnknownCallConvKey) {
+    constexpr char const* kRetired[] = {"argVrs", "returnVrs"};
+    for (char const* const key : kRetired) {
+        SCOPED_TRACE(key);
+        auto const doc = std::format(
+            R"({{"dssTargetVersion":1,"target":{{"name":"X"}},
+                "opcodes":[{{"mnemonic":"invalid","result":"none"}},
+                           {{"mnemonic":"mov","result":"value"}}],
+                "registers":[{{"name":"v0","class":"fpr","widthBytes":16,"hwEncoding":0}}],
+                "callingConventions":[
+                  {{"name":"cc","{}":["v0"],"stackAlignment":16}}
+                ]}})",
+            key);
+        auto bad = TargetSchema::loadFromText(doc, "<inline>");
+        ASSERT_FALSE(bad.has_value())
+            << "a calling convention declaring the retired key '" << key
+            << "' must be REFUSED — accepting and discarding it would leave a "
+               "stale target declaring a register pool that does nothing, with "
+               "no diagnostic";
+        bool named = false;
+        for (auto const& d : bad.error()) {
+            if (d.message.find(std::format("unknown key '{}'", key))
+                != std::string::npos) {
+                named = true;
+            }
+        }
+        EXPECT_TRUE(named)
+            << "the refusal must be the closed-key check naming '" << key
+            << "', not some unrelated failure the fixture happened to trigger; "
+               "got: "
+            << (bad.error().empty() ? std::string{"<none>"}
+                                    : bad.error().front().message);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3570,15 +3647,33 @@ TEST(TargetSchema, ShippedTargetsDeclareAsmConstraints) {
         << "one letter of case apart, two different registers — a "
            "case-folding lookup would silently bind rdx traffic to rdi";
 
-    // arm64's `w` is the V file, NOT the D file. ✔MEASURED and it is the
-    // non-obvious half: gcc prints `v0` for a `w`-constrained DOUBLE, so
-    // `fpr` would have been the plausible wrong answer. The `d0`/`s0`
-    // spellings come from the `%d`/`%s` operand modifiers, which are
-    // dialect grammar and do not live in this file.
+    // arm64's `w` binds `fpr` — the class a C floating value actually lives
+    // in — and `x86_64` declares no `w` at all, which is the per-target half
+    // this arm is here for.
+    //
+    // ⚠⚠ THIS ASSERTION USED TO READ `TargetRegClass::VR`, AND THE SENTENCE
+    // ARGUING FOR IT WAS A TRUE MEASUREMENT OF A DIFFERENT QUESTION. It said:
+    // "arm64's `w` is the V file, NOT the D file. ✔MEASURED and it is the
+    // non-obvious half: gcc prints `v0` for a `w`-constrained DOUBLE, so `fpr`
+    // would have been the plausible wrong answer." ✔The rendering is real and
+    // re-measured (gcc 13.3.0 and clang 18.1.3, -O0 and -O2, every float
+    // type: all print `v0`) — but it answers which VIEW a bare `%0` NAMES,
+    // which is `asmBareOperandWidths`' question, not which register FILE the
+    // value lives in, which is this row's. Binding the letter to a second
+    // class over the same file made `"w"(double)` refuse by name at debug AND
+    // release while gcc compiles it. With arm64's SIMD&FP file declared once
+    // (R1 of design A′) there is one class over it, so the two answers stop
+    // competing. D-TARGET-ARM64-W-CONSTRAINT-BINDS-A-CLASS-NO-C-VALUE-EVER-LIVES-IN.
+    //
+    // The `d0`/`s0` narrow spellings still come from the `%d`/`%s` operand
+    // modifiers, which are dialect grammar and do not live in this file.
     auto const* w = (*arm)->asmConstraint("w");
     ASSERT_NE(w, nullptr);
     ASSERT_TRUE(w->registerClass.has_value());
-    EXPECT_EQ(*w->registerClass, TargetRegClass::VR);
+    EXPECT_EQ(*w->registerClass, TargetRegClass::FPR);
+    EXPECT_EQ((*x86)->asmConstraint("w"), nullptr)
+        << "x86_64 declares no `w` letter, so this pair really is two "
+           "different answers from two configs rather than one shared table";
 }
 
 // ★★★ THE OPERATOR-REQUIRED TEST: THE SAME LETTER RESOLVES TO DIFFERENT
@@ -4462,23 +4557,48 @@ TEST(TargetSchema, ShippedTargetsStillLoadWithTheBankRuleInForce) {
     }
 }
 
-// ── the AAPCS64 variadic VR save block's register source ─────────────────
+// ── the AAPCS64 variadic FP save block's register source ─────────────────
 //
-// The prologue spills `fpSaveCount` FULL-WIDTH vector registers, and it takes
-// them from `argVrs`. It used to take them from `argFprs` — the 64-bit `d`
-// views of the same file — so a 16-byte `STUR Qt` named an 8-byte register and
-// emitted the right bytes only because `d0` and `v0` share hardware encoding 0.
-// A short `argVrs` would spill fewer registers than the save area reserves
-// slots for, leaving `va_arg` reading uninitialised stack for the tail.
-TEST(TargetSchema, Aapcs64VariadicSaveNeedsArgVrsToCoverFpSaveCount) {
+// The prologue spills `fpSaveCount` FULL-WIDTH SIMD&FP registers, and it takes
+// them from `argFprs`. A short `argFprs` would spill fewer registers than the
+// save area reserves slots for, leaving `va_arg` reading uninitialised stack
+// for the tail.
+//
+// ⚠⚠ THIS PIN USED TO READ `argVrs`, AND THE HISTORY IS THE REASON THE RULE
+// EXISTS RATHER THAN A RENAME. The prologue originally read `argFprs` when
+// those rows were the 64-bit `d` views, so a 16-byte `STUR Qt` named an 8-byte
+// register and emitted the right bytes only because `d0` and `v0` share
+// hardware encoding 0. The fix at the time was a SECOND list (`argVrs`) naming
+// the wide view; R1 of design A′ declared the file ONCE instead, so `argFprs`
+// now names the FULL registers `v0..v7` and the sixteen-byte access is stated
+// by the store's WIDTH FLAG. One list again — and it is this one.
+TEST(TargetSchema, Aapcs64VariadicSaveNeedsArgFprsToCoverFpSaveCount) {
     auto shipped = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(shipped.has_value());
     auto const* cc = (*shipped)->callingConventionByName("aapcs64");
     ASSERT_NE(cc, nullptr);
     ASSERT_TRUE(cc->vaListLayout.has_value());
     EXPECT_EQ(cc->vaListLayout->strategy, VaListStrategy::Aapcs64DualCursor);
-    EXPECT_GE(cc->argVrs.size(), cc->vaListLayout->fpSaveCount)
-        << "the prologue spills argVrs[0..fpSaveCount)";
+    EXPECT_GE(cc->argFprs.size(), cc->vaListLayout->fpSaveCount)
+        << "the prologue spills argFprs[0..fpSaveCount)";
     EXPECT_GT(cc->vaListLayout->fpSaveCount, 0u)
         << "a zero count would make this pin vacuous";
+    // ★ And the registers it names must be as WIDE as the slots it fills, or
+    // the operand and the instruction disagree about how many bytes move —
+    // the D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD shape, restated for
+    // one class. The old `argVrs` list said this by being a different class;
+    // with one class the width is the only thing left to check, so it is
+    // checked here.
+    for (std::uint32_t k = 0; k < cc->vaListLayout->fpSaveCount; ++k) {
+        auto const ord = (*shipped)->registerByName(cc->argFprs[k]);
+        ASSERT_TRUE(ord.has_value()) << cc->argFprs[k];
+        auto const* info = (*shipped)->registerInfo(*ord);
+        ASSERT_NE(info, nullptr);
+        EXPECT_EQ(info->widthBytes, cc->vaListLayout->fpSlotBytes)
+            << "save slot " << k << " is " << cc->vaListLayout->fpSlotBytes
+            << " bytes and names '" << cc->argFprs[k] << "', which is "
+            << info->widthBytes
+            << " — a narrower register in a wider store writes the slot's tail "
+               "from nowhere";
+    }
 }

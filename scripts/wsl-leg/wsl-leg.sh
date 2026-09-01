@@ -266,10 +266,15 @@ printf 'lock : %s (run %s)\n' "$LOCK" "$LEG_RUN"
 # what "define the functions and do nothing" means.
 # shellcheck source=../leg-tree/leg-tree.sh
 . "$SRC/scripts/leg-tree/leg-tree.sh" "" || die "cannot load scripts/leg-tree/leg-tree.sh"
-DRIVER_BRANCH=$(git -C "$SRC" rev-parse --abbrev-ref HEAD 2>/dev/null) \
-    || die "cannot read the driver's branch from $SRC"
-DRIVER_SHA=$(git -C "$SRC" rev-parse HEAD 2>/dev/null) \
-    || die "cannot read the driver's HEAD from $SRC"
+# ★ ONE OWNER FOR THE DRIVER'S IDENTITY, and it is not `git -C "$SRC"`. A lane
+# worktree's `.git` is a FILE, and a Windows-created one names a Windows-absolute
+# gitdir that a POSIX git JOINS to the worktree path instead of following -- so this
+# very line used to die `cannot read the driver's branch` for every lane, from the one
+# namespace this script always runs in. `leg_tree_driver_identity` resolves it.
+leg_tree_driver_identity "$SRC" \
+    || die "cannot read the driver's identity from $SRC -- git could not describe that tree, and a leg that cannot name the commit it measured is not a measurement"
+DRIVER_BRANCH="$LEG_TREE_DRIVER_BRANCH"
+DRIVER_SHA="$LEG_TREE_DRIVER_SHA"
 ( leg_tree_prepare "$DST" "$DRIVER_BRANCH" "$DRIVER_SHA" ) \
     || die "leg-tree could not prepare $DST (rc=$?)"
 

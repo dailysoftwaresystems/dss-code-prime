@@ -108,6 +108,17 @@ dss_add_test(NAME ffi/test_shipped_realization_oracle
 target_link_libraries(dss_ffi_test_shipped_realization_oracle
                       PRIVATE nlohmann_json::nlohmann_json)
 
+# D-FFI-DESCRIPTOR-KNOWN-NAME-HAS-NO-LIBRARY-FOR-FORMAT (P47): the arm "the
+# corpus KNOWS this name, it IS available on the active format, and the row names
+# NO image for that format" — a LATENT arm, since no shipped descriptor reaches it
+# on a backed format, so this file SYNTHESIZES its witness rather than reading one.
+# It drives the oracle through `DSS_CONFIG_ROOT`, so it MUST run under ctest: a
+# bare .exe takes the cwd walk and reads whichever tree the shell stands in, never
+# the synthetic corpus. Writes its descriptors as text and reads them through the
+# shipped reader, so it needs no json link.
+dss_add_test(NAME ffi/test_shipped_no_library_for_format
+             SOURCES test_shipped_no_library_for_format.cpp)
+
 # D-FFI-SHIPPED-DESCRIPTOR-PARSE-CACHE-SERVES-A-STALE-DOCUMENT (P42): the
 # thread-local descriptor PARSE CACHE must answer about the file on disk NOW — a
 # live defect in `dsscp --lsp`, whose persistent ThreadPool worker kept serving

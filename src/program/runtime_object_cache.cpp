@@ -99,6 +99,36 @@ namespace fs = std::filesystem;
 // term list had changed — the exact reachability this line exists to end.
 constexpr std::string_view kKeyDocumentHeader = "dss-runtime-object-cache-key/2";
 
+// The DEPENDENCY ARTIFACT subject class's own header line, and it is a separate
+// line rather than a shared one for the reason the version exists at all: the
+// two documents carry DIFFERENT TERM SETS, so a reader (and the byte-for-byte
+// sidecar comparison) must be able to tell a runtime-object key from a
+// dependency-artifact key without parsing the rest. `/1` because this is the
+// first shape of it; the same bump rule applies — add or reorder a term and
+// every previously-written entry must become UNREACHABLE, not merely stale.
+constexpr std::string_view kDependencyKeyDocumentHeader =
+    "dss-dependency-artifact-cache-key/1";
+
+// The anchor for the dependency artifact cache's own refusals. A message
+// naming the shipped-runtime ruling to somebody whose dependency failed to
+// cache would send them to a row that has nothing to do with their build — the
+// same reason `ArchiveSiblingRequester` exists.
+constexpr std::string_view kDependencyAnchor =
+    "D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION";
+
+// ★★★ THE DEPENDENCY ENTRIES' OWN SUBTREE, AND IT IS A CORRECTNESS COMPONENT
+// RATHER THAN TIDINESS. `pruneSupersededSiblings` deletes by
+// `<stem>-<16 base32><suffix>` WITHIN ONE DIRECTORY, so two subject classes
+// sharing a directory would prune each other: a dependency named `unistd`
+// building to `.a` would delete the shipped runtime object for `unistd.c`, and
+// the next build of an unrelated program would recompile it. One component
+// keeps the two families disjoint by construction.
+//
+// ⓘ ONLY THE DEPENDENCY PATHS GAIN IT. The runtime object shape is unchanged,
+// so every artifact already written — including a packaged read-only `dist/` a
+// vendor shipped — stays exactly where it is and stays addressable.
+constexpr std::string_view kDependencyPathComponent = "deps";
+
 // Cited by every refusal below so a user landing on one message can find the
 // ruling that produced this whole mechanism.
 constexpr std::string_view kAnchor =
@@ -274,18 +304,18 @@ struct RootCandidate {
     char const* spelling;  // how the trail prints it, in the host's own idiom
 };
 
-constexpr char const* kOverrideVariable = "DSS_RUNTIME_CACHE_DIR";
-
 // The vendor tail. `dsscp` (never a bare `dss`) so the directory is
 // attributable in a cache root shared with every other tool on the machine.
 constexpr char const* kVendorTail = "dsscp/runtime-cache";
 
-constexpr RootCandidate kRootCandidates[] = {
-    // The override takes the directory VERBATIM — no vendor tail. The caller
-    // already named the location, and silently appending two components under
-    // it would put the cache somewhere a hermetic build script did not choose
-    // and cannot clean up by the path it set.
-    {kOverrideVariable, "", "$DSS_RUNTIME_CACHE_DIR"},
+// The PLATFORM DEFAULTS — arms 2..4. Arm 1, the override, is composed at call
+// time from the variable the CALLER names, so it is not in this table: the
+// runtime object cache supplies its compiled-in
+// `kRuntimeCacheOverrideVariable`, a dependency artifact cache supplies the
+// name its project manifest declared. The defaults are shared because they
+// describe THE MACHINE, not the mechanism — two caches disagreeing about where
+// a user's cache directory is would be two answers to one question.
+constexpr RootCandidate kPlatformRootCandidates[] = {
     {"LOCALAPPDATA", kVendorTail, "%LOCALAPPDATA%"},
     {"XDG_CACHE_HOME", kVendorTail, "$XDG_CACHE_HOME"},
     // The XDG spec's OWN documented default when `XDG_CACHE_HOME` is unset —
@@ -345,8 +375,15 @@ constexpr RootCandidate kRootCandidates[] = {
     return index != keepIndex;
 }
 
+// ⚠ `artifactSuffix` IS A PARAMETER AND NOT `kArtifactSuffix`. It was the
+// constant while a shipped runtime archive (`.a`) was the only subject class;
+// a dependency artifact takes its OBJECT FORMAT'S OWN extension, so a hardcoded
+// `.a` would silently match NOTHING for a `.lib` and the eviction policy would
+// be a no-op nobody could see. The KEY DOCUMENT suffix stays the constant —
+// that one is this file's own and is the same for every subject.
 void pruneSupersededSiblings(fs::path const&  directory,
                              std::string_view sourceStem,
+                             std::string_view artifactSuffix,
                              std::string_view keepIndex) {
     std::error_code ec;
     fs::directory_iterator it(directory, ec);
@@ -371,7 +408,7 @@ void pruneSupersededSiblings(fs::path const&  directory,
         std::error_code typeEc;
         if (!it->is_regular_file(typeEc) || typeEc) continue;
         std::string const name = it->path().filename().string();
-        if (matchesEntryName(name, sourceStem, kArtifactSuffix, keepIndex)) {
+        if (matchesEntryName(name, sourceStem, artifactSuffix, keepIndex)) {
             supersededArtifacts.push_back(it->path());
         } else if (matchesEntryName(name, sourceStem, kKeyDocumentSuffix,
                                     keepIndex)) {
@@ -520,7 +557,12 @@ private:
         "set {} to a writable directory; it is the explicit override, it wins "
         "over every platform default, and it is what CI and hermetic builds are "
         "expected to use. Anchored: {}.",
-        reason, key.rootTrail, kOverrideVariable, kAnchor);
+        // ⚠ THE KEY'S OWN OVERRIDE NAME, never a compiled-in constant. This
+        // refusal serves two subject classes now, and a dependency artifact's
+        // override is the variable its PROJECT MANIFEST named — telling that
+        // user to set `DSS_RUNTIME_CACHE_DIR` would send them to a variable
+        // this key never consults. Same for the anchor.
+        reason, key.rootTrail, key.overrideVariable, key.anchor);
 }
 
 // ── THE COLLISION CHECK ─────────────────────────────────────────────────────
@@ -599,7 +641,8 @@ readKeyDocumentBeside(fs::path const& artifactPath) {
         "it lives in a packaged read-only tree, the package is corrupt. "
         "Anchored: {}.",
         core::genericSpelling(artifactPath), reason, key.pathDigest, key.digest,
-        core::genericSpelling(runtimeKeyDocumentPath(artifactPath)), kAnchor);
+        core::genericSpelling(runtimeKeyDocumentPath(artifactPath)),
+        key.anchor);
 }
 
 // Present + verified ⇒ empty. Otherwise the refusal text, already composed.
@@ -817,6 +860,118 @@ writeThroughTemp(RuntimeObjectKey const&       key,
     return {};
 }
 
+// ── THE THREE PIECES BOTH KEY BUILDERS SHARE ────────────────────────────────
+//
+// ★★★ FACTORED RATHER THAN COPIED, AND THE REASON IS THIS FILE'S OWN STANDING
+// ARGUMENT APPLIED ONE MORE TIME. Every one of these encodes a property the
+// header sells the design on — an unknown input is a REFUSAL, the document is a
+// function of the SET, the key IS the path and the SAME relative path is
+// anchored at BOTH roots. A second subject class that re-spelled any of them
+// would be free to drift in exactly the arm nobody exercises, and the drift
+// would not be a crash: it would be a cache that serves.
+
+// Both builders' first check. `label` prefixes the message so the user learns
+// WHICH cache refused, and `anchor` sends them to the row that owns it.
+[[nodiscard]] std::optional<std::string> refuseUnverifiableDocuments(
+    std::vector<LoadedConfigDocument> const& documents,
+    std::string_view label, std::string_view anchor) {
+    for (LoadedConfigDocument const& doc : documents) {
+        if (doc.digest.empty()) {
+            return std::format(
+                "{}: loaded config document '{}' at '{}' reports an EMPTY "
+                "content digest. It reached the build through a path that did "
+                "not record what it loaded, so the cache key would cover an "
+                "unknown input — a cache serving a key it cannot verify. "
+                "Refusing. Anchored: {}.",
+                label, doc.label, doc.path, anchor);
+        }
+        if (!isSha256HexLower(doc.digest)) {
+            return std::format(
+                "{}: loaded config document '{}' at '{}' reports a MALFORMED "
+                "content digest '{}' — expected exactly 64 lowercase hex "
+                "characters (the shape of a SHA-256). Refusing: an unrecognized "
+                "digest shape means the loader and this key disagree about what "
+                "a digest IS, and the key would silently cover something other "
+                "than the document's bytes. Anchored: {}.",
+                label, doc.label, doc.path, doc.digest, anchor);
+        }
+    }
+    return std::nullopt;
+}
+
+// ★ SORTED BY (label, path). The loaders report their documents in whatever
+// order resolution happened to reach them — which is a function of
+// `languageReferences` traversal and, for a directory-sourced set, of the
+// filesystem. Sorting makes the document a function of the SET, which is what
+// the key is actually about.
+//
+// ⓘ Pointers into the CALLER's vector, which must outlive the result. Every
+// caller is one statement away.
+[[nodiscard]] std::vector<LoadedConfigDocument const*>
+sortedDocuments(std::vector<LoadedConfigDocument> const& documents) {
+    std::vector<LoadedConfigDocument const*> sorted;
+    sorted.reserve(documents.size());
+    for (LoadedConfigDocument const& doc : documents) sorted.push_back(&doc);
+    std::sort(sorted.begin(), sorted.end(),
+              [](LoadedConfigDocument const* a, LoadedConfigDocument const* b) {
+                  return std::tie(a->label, a->path)
+                       < std::tie(b->label, b->path);
+              });
+    return sorted;
+}
+
+// Hash the finished document once, render the two forms, compose the ONE
+// relative path and anchor it at both roots.
+//
+// ★★★ ONE HASH, TWO RENDERINGS, AND THEY ARE NOT PEERS. `digest` is the
+// IDENTITY — the full 64-hex SHA-256, carried in the key document and compared
+// on every hit. `pathDigest` is an INDEX — the first 80 bits of THE SAME BYTES,
+// rendered as 16 characters of lowercase base32 so it fits a Windows path.
+// Hashed once and rendered twice rather than re-derived, because decoding the
+// hex back into bytes would be a second decoder free to disagree with the
+// encoder about what the digest even is.
+//
+// ★ The relative path is computed ONCE and anchored twice. That is not a
+// tidiness choice: it is the mechanical form of the header's two-roots
+// property. Composing the shipped and per-user paths separately would put the
+// `<dir>/<stem>-<index><suffix>` shape in two places, and the day they drifted
+// the same key would name DIFFERENT files in the two roots — which is exactly
+// the content ambiguity key-as-path exists to rule out.
+[[nodiscard]] RuntimeObjectKey
+finishKey(std::string document, fs::path relativeDirectory,
+          std::string_view stem, std::string_view suffix,
+          fs::path const& cacheAnchorRoot, std::string_view overrideVariable,
+          std::string_view anchor) {
+    RuntimeObjectKey key;
+    std::array<std::uint8_t, 32> const raw = dss::crypto::sha256OfText(document);
+    key.digest     = dss::crypto::toHexLower(raw);
+    key.pathDigest = dss::crypto::toBase32Lower(
+        std::span<std::uint8_t const>{raw.data(), kPathDigestBytes});
+    key.document   = std::move(document);
+
+    key.relativePath = std::move(relativeDirectory)
+                     / (std::string{stem} + "-" + key.pathDigest
+                        + std::string{suffix});
+
+    // ⓘ Resolved HERE and not at store time, so the key is a complete
+    // description of where its artifact may live and both probe sites read the
+    // same answer. ⚠ And resolution failure is NOT propagated as an error:
+    // a build that HITS in the shipped root never needs a writable root at all,
+    // and refusing here would break exactly the packaged read-only install this
+    // mechanism was built to serve. The failure surfaces at the first write,
+    // which is the first moment it is real.
+    RuntimeCacheRoots roots =
+        resolveArtifactCacheRoots(cacheAnchorRoot, overrideVariable);
+    key.shippedArtifactPath = roots.shipped / key.relativePath;
+    key.userArtifactPath    = roots.perUser.empty()
+                                ? fs::path{}
+                                : roots.perUser / key.relativePath;
+    key.rootTrail           = std::move(roots.trail);
+    key.overrideVariable    = std::string{overrideVariable};
+    key.anchor              = std::string{anchor};
+    return key;
+}
+
 } // namespace
 
 // ═══ THE ARCHIVE-SIBLING LOOKUP ══════════════════════════════════════════════
@@ -980,6 +1135,13 @@ std::string runtimeCacheBuildStampSegment() {
 }
 
 RuntimeCacheRoots resolveRuntimeCacheRoots(fs::path const& configRoot) {
+    // ONE walker. See `resolveArtifactCacheRoots` in the header for why this is
+    // a delegation rather than a second copy of the precedence list.
+    return resolveArtifactCacheRoots(configRoot, kRuntimeCacheOverrideVariable);
+}
+
+RuntimeCacheRoots resolveArtifactCacheRoots(fs::path const&  configRoot,
+                                            std::string_view overrideVariable) {
     RuntimeCacheRoots roots;
     roots.shipped = configRoot / "runtime" / "platform" / "dist";
 
@@ -1002,7 +1164,18 @@ RuntimeCacheRoots resolveRuntimeCacheRoots(fs::path const& configRoot) {
     // to the winner would answer "where did it look?" with a prefix, hiding the
     // very fallbacks a user whose build just refused needs to know exist. The
     // walk is four `getenv` calls; the completeness is worth more.
-    for (RootCandidate const& candidate : kRootCandidates) {
+    //
+    // ⓘ ARM 1 IS COMPOSED HERE FROM THE CALLER'S NAME rather than sitting in
+    // the table, and it takes the directory VERBATIM — no vendor tail. The
+    // caller already named the location, and silently appending two components
+    // under it would put the cache somewhere a hermetic build script did not
+    // choose and cannot clean up by the path it set.
+    std::string const overrideSpelling = "$" + std::string{overrideVariable};
+    std::string const overrideName{overrideVariable};
+    RootCandidate const overrideCandidate{overrideName.c_str(), "",
+                                          overrideSpelling.c_str()};
+
+    auto const walk = [&](RootCandidate const& candidate) {
         char const* const raw = std::getenv(candidate.variable);
         // Set-but-EMPTY is treated as unset, and that is the only reading that
         // matches how a shell behaves: `DSS_RUNTIME_CACHE_DIR=` in a CI file is
@@ -1011,7 +1184,7 @@ RuntimeCacheRoots resolveRuntimeCacheRoots(fs::path const& configRoot) {
         // whatever tree the build happened to start in.
         if (raw == nullptr || raw[0] == '\0') {
             note(std::format("{}: unset or empty", candidate.spelling));
-            continue;
+            return;
         }
 
         fs::path resolved{raw};
@@ -1023,6 +1196,17 @@ RuntimeCacheRoots resolveRuntimeCacheRoots(fs::path const& configRoot) {
         note(std::format("{} -> '{}'{}", candidate.spelling,
                          core::genericSpelling(resolved),
                          selected ? " [SELECTED]" : ""));
+    };
+
+    // ⚠ AN EMPTY OVERRIDE NAME SKIPS ARM 1 ENTIRELY RATHER THAN PROBING `""`.
+    // `getenv("")` is unset on every host, so probing would print a trail line
+    // reading `$: unset or empty` — a diagnostic naming no variable at all,
+    // which is how a caller that failed to declare one would read "the override
+    // was considered". The key builders REFUSE an empty name outright; this is
+    // the arm that keeps a direct caller from being told a comforting lie.
+    if (!overrideVariable.empty()) walk(overrideCandidate);
+    for (RootCandidate const& candidate : kPlatformRootCandidates) {
+        walk(candidate);
     }
     return roots;
 }
@@ -1039,27 +1223,10 @@ computeRuntimeObjectKey(RuntimeObjectRequest const& request) {
     // document reached the build through a path that never recorded what it
     // loaded; empty is DETECTABLE, and the wrong bytes it would otherwise
     // stand in for are not.
-    for (LoadedConfigDocument const& doc : request.loadedDocuments) {
-        if (doc.digest.empty()) {
-            return std::unexpected(std::format(
-                "runtime object cache: loaded config document '{}' at '{}' "
-                "reports an EMPTY content digest. It reached the build through "
-                "a path that did not record what it loaded, so the cache key "
-                "would cover an unknown input — a cache serving a key it "
-                "cannot verify. Refusing. Anchored: {}.",
-                doc.label, doc.path, kAnchor));
-        }
-        if (!isSha256HexLower(doc.digest)) {
-            return std::unexpected(std::format(
-                "runtime object cache: loaded config document '{}' at '{}' "
-                "reports a MALFORMED content digest '{}' — expected exactly 64 "
-                "lowercase hex characters (the shape of a SHA-256). Refusing: "
-                "an unrecognized digest shape means the loader and this key "
-                "disagree about what a digest IS, and the key would silently "
-                "cover something other than the document's bytes. Anchored: "
-                "{}.",
-                doc.label, doc.path, doc.digest, kAnchor));
-        }
+    if (auto refusal = refuseUnverifiableDocuments(
+            request.loadedDocuments, "runtime object cache", kAnchor);
+        refusal.has_value()) {
+        return std::unexpected(std::move(*refusal));
     }
 
     // ── STEP 2: the two content terms this file digests itself ──────────────
@@ -1156,68 +1323,176 @@ computeRuntimeObjectKey(RuntimeObjectRequest const& request) {
         field("descriptor-sha256=", descriptorDigests[i]);
     }
 
-    // ★ SORTED BY (label, path). The loaders report their documents in
-    // whatever order resolution happened to reach them — which is a function
-    // of `languageReferences` traversal and, for a directory-sourced set, of
-    // the filesystem. Sorting makes the document a function of the SET, which
-    // is what the key is actually about.
-    std::vector<LoadedConfigDocument const*> sorted;
-    sorted.reserve(request.loadedDocuments.size());
-    for (LoadedConfigDocument const& doc : request.loadedDocuments) {
-        sorted.push_back(&doc);
-    }
-    std::sort(sorted.begin(), sorted.end(),
-              [](LoadedConfigDocument const* a, LoadedConfigDocument const* b) {
-                  return std::tie(a->label, a->path)
-                       < std::tie(b->label, b->path);
-              });
-    for (LoadedConfigDocument const* doc : sorted) {
+    // ★ SORTED BY (label, path) — see `sortedDocuments`.
+    for (LoadedConfigDocument const* doc :
+         sortedDocuments(request.loadedDocuments)) {
         line(std::format("doc={}:{}:{}", doc->label, doc->path, doc->digest));
     }
 
-    RuntimeObjectKey key;
+    // STEPS 3b + 4 are the SHARED TAIL — see `finishKey`.
+    return finishKey(std::move(document),
+                     fs::path{request.configName}
+                         / pathComponentSafe(request.targetSpec),
+                     fs::path{request.sourcePath}.stem().string(),
+                     kArtifactSuffix, request.configRoot,
+                     kRuntimeCacheOverrideVariable, kAnchor);
+}
 
-    // ★★★ ONE HASH, TWO RENDERINGS, AND THEY ARE NOT PEERS. `digest` is the
-    // IDENTITY — the full 64-hex SHA-256, carried in the key document and
-    // compared on every hit. `pathDigest` is an INDEX — the first 80 bits of
-    // THE SAME BYTES, rendered as 16 characters of lowercase base32 so it fits
-    // a Windows path. Hashed once and rendered twice rather than re-derived,
-    // because decoding the hex back into bytes would be a second decoder free
-    // to disagree with the encoder about what the digest even is.
-    std::array<std::uint8_t, 32> const raw = dss::crypto::sha256OfText(document);
-    key.digest     = dss::crypto::toHexLower(raw);
-    key.pathDigest = dss::crypto::toBase32Lower(
-        std::span<std::uint8_t const>{raw.data(), kPathDigestBytes});
-    key.document   = std::move(document);
-
-    // ── STEP 4: the key IS the path — ONE relative path, TWO roots ──────────
+std::expected<RuntimeObjectKey, std::string>
+computeDependencyArtifactKey(DependencyArtifactRequest const& request) {
+    // ── STEP 1: the four refusals this subject class owns ───────────────────
     //
-    // ★ The relative path is computed ONCE and anchored twice. That is not a
-    // tidiness choice: it is the mechanical form of the header's two-roots
-    // property. Composing the shipped and per-user paths separately would put
-    // the `<config>/<slug>/<stem>-<index>.a` shape in two places, and the day
-    // they drifted the same key would name DIFFERENT files in the two roots —
-    // which is exactly the content ambiguity key-as-path exists to rule out.
-    std::string const stem = fs::path{request.sourcePath}.stem().string();
-    key.relativePath = fs::path{request.configName}
-                     / pathComponentSafe(request.targetSpec)
-                     / (stem + "-" + key.pathDigest
-                        + std::string{kArtifactSuffix});
+    // ⚠ EVERY ONE OF THEM IS "THE INPUT SET IS UNKNOWN OR THE ENTRY CANNOT BE
+    // NAMED", and none of them is a degradation to an uncached build DECIDED
+    // HERE. This function's contract is the same as its sibling's: it returns a
+    // key or it says why it cannot. What the DRIVER does with a refusal — print
+    // it and compile normally — is the driver's decision, taken where the
+    // difference between "an optimization is unavailable" and "the bytes might
+    // be wrong" is visible.
+    if (request.overrideVariable.empty()) {
+        return std::unexpected(std::format(
+            "dependency artifact cache: the request names NO cache-location "
+            "override variable. The location override is NAMED IN CONFIGURATION "
+            "('dependencyArtifactCache.rootOverrideVariable' on the root "
+            "manifest) precisely so it is not sniffed from a compiled-in name, "
+            "so an empty name means the policy reached this point through a "
+            "path that did not carry it. Refusing. Anchored: {}.",
+            kDependencyAnchor));
+    }
+    if (request.inputClosureDigest.empty()) {
+        return std::unexpected(std::format(
+            "dependency artifact cache: the request for artifact '{}' carries "
+            "an EMPTY input-closure digest. `CompilationUnit::inputDigest()` "
+            "reports empty for a unit built through a path that never computed "
+            "one, so the set of files this artifact was compiled from is "
+            "UNKNOWN — and a key over an unknown input set is exactly the entry "
+            "that would be served after a header it read had changed. Refusing. "
+            "Anchored: {}.",
+            request.artifactStem, kDependencyAnchor));
+    }
+    if (!isSha256HexLower(request.inputClosureDigest)) {
+        return std::unexpected(std::format(
+            "dependency artifact cache: the request for artifact '{}' carries a "
+            "MALFORMED input-closure digest '{}' — expected exactly 64 "
+            "lowercase hex characters (the shape of a SHA-256). Refusing: an "
+            "unrecognized shape means the caller and this key disagree about "
+            "what a digest IS. Anchored: {}.",
+            request.artifactStem, request.inputClosureDigest,
+            kDependencyAnchor));
+    }
+    // ⚠ THE STEM AND THE SUFFIX GATE A `remove()`, WHICH IS WHY THEY ARE
+    // REFUSED RATHER THAN DEFAULTED. `pruneSupersededSiblings` matches
+    // `<stem>-<16 base32><suffix>` EXACTLY; an empty stem would make every
+    // entry in the directory whose name is `-<index><suffix>` one family, and
+    // an empty suffix would make the artifact and its `.key` sidecar
+    // indistinguishable to `replace_extension`.
+    if (request.artifactStem.empty() || request.artifactSuffix.empty()) {
+        return std::unexpected(std::format(
+            "dependency artifact cache: the request names an artifact stem "
+            "('{}') or suffix ('{}') that is EMPTY, so the cache entry cannot "
+            "be given a name of the `<stem>-<index><suffix>` shape this store's "
+            "superseded-sibling prune matches on. Refusing rather than "
+            "composing a name whose prune would reach unrelated entries. "
+            "Anchored: {}.",
+            request.artifactStem, request.artifactSuffix, kDependencyAnchor));
+    }
 
-    // ⓘ Resolved HERE and not at store time, so the key is a complete
-    // description of where its artifact may live and both probe sites read the
-    // same answer. ⚠ And resolution failure is NOT propagated as an error from
-    // this function: a build that HITS in the shipped root never needs a
-    // writable root at all, and refusing here would break exactly the packaged
-    // read-only install this mechanism was built to serve. The failure surfaces
-    // at the first write, which is the first moment it is real.
-    RuntimeCacheRoots roots = resolveRuntimeCacheRoots(request.configRoot);
-    key.shippedArtifactPath = roots.shipped / key.relativePath;
-    key.userArtifactPath    = roots.perUser.empty()
-                                ? fs::path{}
-                                : roots.perUser / key.relativePath;
-    key.rootTrail           = std::move(roots.trail);
-    return key;
+    if (request.ltoModeName.empty()) {
+        return std::unexpected(std::format(
+            "dependency artifact cache: the request for artifact '{}' names no "
+            "link-time-optimization topology. It changes the emitted bytes, so "
+            "an unnamed one is a term missing from the key rather than a "
+            "default. Refusing. Anchored: {}.",
+            request.artifactStem, kDependencyAnchor));
+    }
+    // ── STEP 2: every loaded document must report a VERIFIABLE digest ───────
+    // The same check, the same reasoning and the same two shapes as
+    // `computeRuntimeObjectKey`'s STEP 1 — see `refuseUnverifiableDocuments`.
+    // Applied to BOTH digest-bearing lists: a link input that could not be read
+    // reports an empty digest and is exactly as unverifiable as a config
+    // document that could not.
+    if (auto refusal = refuseUnverifiableDocuments(
+            request.loadedDocuments, "dependency artifact cache",
+            kDependencyAnchor);
+        refusal.has_value()) {
+        return std::unexpected(std::move(*refusal));
+    }
+    if (auto refusal = refuseUnverifiableDocuments(
+            request.linkInputs, "dependency artifact cache",
+            kDependencyAnchor);
+        refusal.has_value()) {
+        return std::unexpected(std::move(*refusal));
+    }
+
+    // ── STEP 3: the document ────────────────────────────────────────────────
+    //
+    // ⓘ IT READS NOTHING FROM DISK, and that is the whole structural difference
+    // from the sibling builder. There, the unit and the descriptors are FILES
+    // this module opens and hashes. Here every content term arrived already
+    // digested — by the front end (`inputDigest()`) and by the config loaders —
+    // so the key is complete BY CONSTRUCTION rather than verified against a
+    // record, which is what removes the depfile failure surface entirely.
+    std::string document;
+    auto const line = [&document](std::string_view text) {
+        document += text;
+        document += '\n';
+    };
+    auto const field = [&line](std::string_view key, std::string_view value) {
+        std::string row;
+        row.reserve(key.size() + value.size());
+        row += key;
+        row += value;
+        line(row);
+    };
+
+    line(kDependencyKeyDocumentHeader);
+    field("compiler=", kCompilerStamp);
+    field("target=", request.targetSpec);
+    field("format=", request.buildFormatName);
+    field("sibling=", request.siblingFormatName);
+    field("config=", request.configName);
+    field("lto=", request.ltoModeName);
+    // ⓘ THE SAME VALUE THE ENTRY IS NAMED AFTER, hashed as a term because it
+    // reaches the emitted bytes. One field, both jobs — see `artifactStem`.
+    field("artifact-name=", request.artifactStem);
+    // ⓘ TWO DISTINCT LINES rather than a sentinel number. "The format's
+    // declared default stands" and "the manifest asked for N" are different
+    // requests even when N is today's default, because the default lives in a
+    // `.format.json` that can move under a fixed manifest — and that document
+    // is a `doc=` term below, so the two states stay distinguishable.
+    if (request.stackReserveBytes.has_value()) {
+        field("stack-reserve=", std::to_string(*request.stackReserveBytes));
+    } else {
+        line("stack-reserve=<format-default>");
+    }
+    field("inputs-sha256=", request.inputClosureDigest);
+
+    // ⓘ IN LINK ORDER, path and digest adjacent — see `linkInputs`. The COUNT
+    // leads so a document cannot be a prefix of a longer one: without it a
+    // build linking [a] and one linking [a, b] would differ only by trailing
+    // lines, which is fine for a hash but leaves the two indistinguishable to
+    // anyone reading a truncated document.
+    field("link-input-count=", std::to_string(request.linkInputs.size()));
+    for (LoadedConfigDocument const& input : request.linkInputs) {
+        field("link-input=", input.label + ":" + input.path);
+        field("link-input-sha256=", input.digest);
+    }
+
+    for (LoadedConfigDocument const* doc :
+         sortedDocuments(request.loadedDocuments)) {
+        line(std::format("doc={}:{}:{}", doc->label, doc->path, doc->digest));
+    }
+
+    // ★★★ THE ENTRY LIVES UNDER ITS OWN `deps/` COMPONENT — see
+    // `kDependencyPathComponent`. Two subject classes in one directory would
+    // prune each other's artifacts, because the prune matches on a stem.
+    return finishKey(std::move(document),
+                     fs::path{kDependencyPathComponent}
+                         / fs::path{request.configName}
+                         / pathComponentSafe(request.targetSpec),
+                     request.artifactStem, request.artifactSuffix,
+                     request.configRoot, request.overrideVariable,
+                     kDependencyAnchor);
 }
 
 // ═══ STORE / LOOKUP ══════════════════════════════════════════════════════════
@@ -1279,7 +1554,8 @@ lookupRuntimeObject(RuntimeObjectKey const& key) {
 
 std::expected<fs::path, std::string>
 storeRuntimeObject(RuntimeObjectKey const&      key,
-                   std::span<std::uint8_t const> bytes) {
+                   std::span<std::uint8_t const> bytes,
+                   CacheEviction                 eviction) {
     // ── THE WRITABLE ROOT, OR A REFUSAL ─────────────────────────────────────
     //
     // ⛔ THE FIRST AND MOST IMPORTANT ARM: no per-user root resolved at all, so
@@ -1303,16 +1579,26 @@ storeRuntimeObject(RuntimeObjectKey const&      key,
     fs::path const  directory    = destination.parent_path();
     fs::path const  documentPath = runtimeKeyDocumentPath(destination);
 
-    // The prune target is derived ONCE, up front, and held in a real string —
+    // The prune target is derived ONCE, up front, and held in real strings —
     // a `string_view` over `destination.filename().string()` would view a
     // temporary that dies at the end of the statement.
+    //
+    // ★ SPLIT ON THE INDEX, NOT ON A KNOWN SUFFIX. This used to test
+    // `ends_with("-" + pathDigest + ".a")`, which silently produced an EMPTY
+    // stem — and therefore pruned nothing — for any entry whose extension is
+    // not `.a`. The index is the one component this file always composes, so
+    // splitting on it derives BOTH halves for every subject class instead of
+    // asserting one of them. `rfind` because a stem may legitimately contain a
+    // `-` run that happens to look like an index.
     std::string const filename = destination.filename().string();
-    std::string const suffix =
-        "-" + key.pathDigest + std::string{kArtifactSuffix};
+    std::string const marker   = "-" + key.pathDigest;
+    std::size_t const markerAt = filename.rfind(marker);
+    bool const wellFormed = markerAt != std::string::npos && markerAt > 0u
+                         && markerAt + marker.size() < filename.size();
     std::string const sourceStem =
-        (filename.size() > suffix.size() && filename.ends_with(suffix))
-            ? filename.substr(0u, filename.size() - suffix.size())
-            : std::string{};
+        wellFormed ? filename.substr(0u, markerAt) : std::string{};
+    std::string const artifactSuffix =
+        wellFormed ? filename.substr(markerAt + marker.size()) : std::string{};
     // ⓘ Called on BOTH success paths (fresh rename AND destination-already-
     // present): a build that lost the race still wants the superseded sibling
     // gone, and the winner may have been a process that never had a chance to
@@ -1328,9 +1614,16 @@ storeRuntimeObject(RuntimeObjectKey const&      key,
     // where the package manager put it — it is already unreachable (nothing
     // computes its key) and deleting another owner's files is not this file's
     // business.
+    //
+    // ⓘ AND UNDER `CacheEviction::Retain` IT DOES NOTHING AT ALL — the whole
+    // policy, expressed as the one call it gates. Retaining costs disk and
+    // nothing else: the key-as-path rule already makes a superseded entry
+    // UNREACHABLE, so keeping it can never cause one to be served.
     auto const pruneNow = [&] {
-        if (sourceStem.empty()) return;
-        pruneSupersededSiblings(directory, sourceStem, key.pathDigest);
+        if (eviction == CacheEviction::Retain) return;
+        if (sourceStem.empty() || artifactSuffix.empty()) return;
+        pruneSupersededSiblings(directory, sourceStem, artifactSuffix,
+                                key.pathDigest);
     };
 
     std::error_code ec;

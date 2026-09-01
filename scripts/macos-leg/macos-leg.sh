@@ -255,8 +255,22 @@ leg_tree_remote() {
     bash "$CARRIAGE" "$(cat "$SRC/scripts/leg-tree/leg-tree.sh")
 leg_tree_${_ltr_verb}${_ltr_args}"
 }
-LEG_BRANCH=$(git -C "$SRC" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')
-LEG_SHA=$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo '')
+# ★ THE IDENTITY IS RESOLVED BY `leg-tree`, NOT BY A BARE `git -C "$SRC"`. This
+# carriage resolves from WSL and not from Git Bash, and a Windows-created lane
+# worktree's `.git` is a FILE naming a Windows-absolute gitdir a POSIX git cannot
+# follow -- so both lines answered EMPTY for every lane and the `die` below fired
+# naming the branch, which was innocent. ✔MEASURED 2026-08-31 (P47); the resolver and
+# its transcript are in `scripts/leg-tree/leg-tree.sh`. The empty argument to `.` is
+# load-bearing: without it, leg-tree's dispatch reads THIS script's positionals.
+# shellcheck source=../leg-tree/leg-tree.sh
+. "$SRC/scripts/leg-tree/leg-tree.sh" "" || die "cannot load scripts/leg-tree/leg-tree.sh"
+if leg_tree_driver_identity "$SRC"; then
+    LEG_BRANCH="$LEG_TREE_DRIVER_BRANCH"
+    LEG_SHA="$LEG_TREE_DRIVER_SHA"
+else
+    LEG_BRANCH=''
+    LEG_SHA=''
+fi
 [ -n "$LEG_BRANCH" ] || die "cannot read this checkout's branch -- the host's clone is put on the DRIVER's branch, so a driver that cannot name its own has nothing to ask for"
 say "leg-tree prepare $DST -> $LEG_BRANCH @ $LEG_SHA"
 leg_tree_remote prepare "$DST" "$LEG_BRANCH" "$LEG_SHA" || die "leg-tree could not prepare $DST"

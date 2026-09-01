@@ -1532,9 +1532,154 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             }
             return it->second;
         };
-        auto const moveIdx = checkOp("move",  row.move);
-        checkOp("load",  row.load);
-        checkOp("store", row.store);
+        auto const moveIdx        = checkOp("move",  row.move);
+        auto const loadIdx        = checkOp("load",  row.load);
+        auto const storeIdx       = checkOp("store", row.store);
+        auto const loadScaledIdx  = checkOp("loadScaled",  row.loadScaled);
+        auto const storeScaledIdx = checkOp("storeScaled", row.storeScaled);
+
+        // ★★ THE SCALED TWIN IS REACHED BY SWAP, NEVER BY NAME, SO IT IS
+        // MEANINGLESS WITHOUT THE FORM IT REPLACES
+        // (D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM). No
+        // lowering pass ever asks a class for its `loadScaled`: it asks for
+        // `load`, and the frame chokepoint substitutes the scaled form when
+        // the OFFSET overruns the short one's reach. A row declaring the twin
+        // alone names an opcode nothing can select — it loads clean, resolves,
+        // and changes nothing, which is exactly the shape a reader would read
+        // as "this class has the long-reach form".
+        auto requireShortForm = [&](char const* scaledField,
+                                    std::string const& scaledName,
+                                    char const* shortField,
+                                    std::string const& shortName) {
+            if (scaledName.empty() || !shortName.empty()) return;
+            fail(std::format("/registerClassOps/{}/{}", rowPath, scaledField),
+                 std::format(
+                     "registerClassOps {}: '{}' is declared as '{}' but '{}' "
+                     "is not declared — the scaled long-reach form is never "
+                     "requested by name, it is SUBSTITUTED for '{}' when a "
+                     "frame offset overruns that form's reach, so with no '{}' "
+                     "to substitute for it can never be selected. Declare '{}' "
+                     "on this row, or drop '{}'",
+                     rowDesc, scaledField, scaledName, shortField, shortField,
+                     shortField, shortField, scaledField));
+        };
+        requireShortForm("loadScaled",  row.loadScaled,  "load",  row.load);
+        requireShortForm("storeScaled", row.storeScaled, "store", row.store);
+
+        // ★★ BOTH LONG-REACH FORMS OR NEITHER, once the class owns both short
+        // ones. Half the pair is a target whose big-frame spill RELOADS encode
+        // and whose spill STORES fail loud (or the reverse) — a frame that
+        // works until it is large enough not to, with the two directions of one
+        // slot disagreeing about whether they are representable. The condition
+        // is guarded on the class owning both SHORT forms so a class that
+        // genuinely has only one memory direction is not forced to invent the
+        // other's twin.
+        if (!row.load.empty() && !row.store.empty()
+            && row.loadScaled.empty() != row.storeScaled.empty()) {
+            bool const haveLoad = !row.loadScaled.empty();
+            fail(std::format("/registerClassOps/{}/{}", rowPath,
+                             haveLoad ? "loadScaled" : "storeScaled"),
+                 std::format(
+                     "registerClassOps {}: this class declares both 'load' and "
+                     "'store' but only '{}' has a scaled long-reach twin — a "
+                     "frame access past the short form's reach would then "
+                     "encode in one direction and fail loud in the other, on "
+                     "the SAME slot. Declare '{}' too, or drop '{}'",
+                     rowDesc, haveLoad ? "loadScaled" : "storeScaled",
+                     haveLoad ? "storeScaled" : "loadScaled",
+                     haveLoad ? "loadScaled" : "storeScaled"));
+        }
+
+        // ★★★ A MEMORY VERB MUST MOVE THE ROW'S OWN REGISTER FILE, and this is
+        // the `move` bank check one role over
+        // (D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND). It became load-bearing when
+        // the frame chokepoint learned to swap PER CLASS: filing the integer
+        // `load_u` under `{"class": "fpr"}` would load clean, resolve, and make
+        // a large-frame FP reload emit `LDR Xt` — the float lands in an INTEGER
+        // register with the same hwEncoding and nothing is said. Checked for
+        // the short forms too, since a mis-filed `load` is the identical wrong
+        // answer reached one swap earlier.
+        //
+        // ⚠ ONLY THE DATA END IS THE ROW'S CLASS. A load/store also names a
+        // BASE register, which belongs to the address file (`x1`, not `d1`) —
+        // so unlike `move` this cannot walk every Reg operand. The data end is
+        // the RESULT for a load and the `rd`-slot operand for a store.
+        auto checkMemoryBank = [&](char const* field, std::string const& name,
+                                   std::optional<std::size_t> idx, bool isLoad) {
+            if (!idx.has_value() || *idx >= opcodes.size()) return;
+            auto const& mo = opcodes[*idx];
+            for (std::size_t vi = 0; vi < mo.encoding.variants.size(); ++vi) {
+                auto const& v = mo.encoding.variants[vi];
+                std::optional<TargetRegClass> bank;
+                if (isLoad) {
+                    bank = encodingResultRegClass(mo.encoding, v);
+                } else {
+                    for (auto const& w : v.wires) {
+                        if (w.slotKind != EncodingSlotKind::Rd) continue;
+                        if (w.index >= v.operandKinds.size()) continue;
+                        if (v.operandKinds[w.index] != OperandKindFilter::Reg) continue;
+                        bank = encodingWireRegClass(mo.encoding, w);
+                        break;
+                    }
+                }
+                if (!bank.has_value() || *bank == fromCls) continue;
+                fail(std::format("/registerClassOps/{}/{}", rowPath, field),
+                     std::format(
+                         "registerClassOps {}: the declared {} '{}' moves "
+                         "register bank '{}' in variant {}, not '{}' — a "
+                         "memory verb filed under this class must transfer "
+                         "'{}', or the encoder writes the register number into "
+                         "the wrong file and the access reads or clobbers an "
+                         "unrelated register (a silent wrong answer, not a "
+                         "diagnostic)",
+                         rowDesc, field, name, targetRegClassName(*bank), vi,
+                         fromName, fromName));
+                break;
+            }
+        };
+        checkMemoryBank("load",        row.load,        loadIdx,        true);
+        checkMemoryBank("store",       row.store,       storeIdx,       false);
+        checkMemoryBank("loadScaled",  row.loadScaled,  loadScaledIdx,  true);
+        checkMemoryBank("storeScaled", row.storeScaled, storeScaledIdx, false);
+
+        // ★★★ A SHORT-REACH MEMORY MNEMONIC MAY BELONG TO ONE CLASS ONLY, AND
+        // THIS IS A SORT-ORDER RULE, NOT A TIDINESS ONE. The frame chokepoint
+        // finds a short form's long-reach twin by looking the OPCODE up in the
+        // per-class twin table — so if two classes named one mnemonic as their
+        // `load`, the twin an out-of-reach access got would be decided by which
+        // row the walk reached first. That is exactly the failure mode
+        // recorded in
+        // [[feedback-an-opener-closer-duplicate-must-never-be-settled-by-sort-order]]
+        // and the wrong answer it produces here is an access encoded against
+        // the OTHER register file. ⚠ The bank check above catches this
+        // whenever the opcode DECLARES its bank; a bank-agnostic opcode shared
+        // by two rows slips past it, which is the case this closes.
+        // Diagonal rows only — a cross-class row carries no memory verb at all
+        // (the loader refuses one), so there is nothing here to collide.
+        for (std::size_t oi = 0; fi == ti && oi < fi; ++oi) {
+            auto const& other = registerClassOps[oi][oi];
+            if (!other.declared) continue;
+            auto const clash = [&](char const* field, std::string const& a,
+                                   std::string const& b) {
+                if (a.empty() || a != b) return;
+                fail(std::format("/registerClassOps/{}/{}", rowPath, field),
+                     std::format(
+                         "registerClassOps {}: '{}' names the mnemonic '{}', "
+                         "which class '{}' already names as ITS '{}' — one "
+                         "memory verb cannot belong to two register files. The "
+                         "frame chokepoint resolves an out-of-reach access to "
+                         "the long-reach twin by looking this opcode up per "
+                         "class, so a shared mnemonic makes WHICH twin gets "
+                         "selected an artefact of row order",
+                         rowDesc, field, a,
+                         targetRegClassName(static_cast<TargetRegClass>(oi)),
+                         field));
+            };
+            clash("load",        row.load,        other.load);
+            clash("store",       row.store,       other.store);
+            clash("loadScaled",  row.loadScaled,  other.loadScaled);
+            clash("storeScaled", row.storeScaled, other.storeScaled);
+        }
 
         // ★★★ THE MOVE'S OWN ENCODING MUST AGREE WITH THE PAIR IT IS FILED
         // UNDER, AND THIS IS THE RULE THAT KEEPS THE CROSS-CLASS SLOT FROM
@@ -1971,14 +2116,63 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         checkRefs(i, "argFprs",     cc.argFprs,     TargetRegClass::FPR);
         checkRefs(i, "returnGprs",  cc.returnGprs,  TargetRegClass::GPR);
         checkRefs(i, "returnFprs",  cc.returnFprs,  TargetRegClass::FPR);
-        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the binary128 VR
-        // arg/return registers must resolve to VR-class registers (the F128
-        // boundary verb reads them; a mis-classed name = a silent wrong-file
-        // move), exactly as argFprs must be FPR-class.
-        checkRefs(i, "argVrs",      cc.argVrs,      TargetRegClass::VR);
-        checkRefs(i, "returnVrs",   cc.returnVrs,   TargetRegClass::VR);
+        // ⚠ THERE ARE NO `argVrs`/`returnVrs` LISTS TO CHECK ANY MORE, and
+        // that is the cc half of R1 rather than a dropped rule. They named a
+        // SECOND arg/return pool over the SAME physical registers `argFprs`
+        // names, which only made sense while arm64 declared its SIMD&FP file
+        // twice. With the file declared once the binary128 pool IS the FP
+        // pool, and "128 bits of it" is the access WIDTH, not a class.
         checkRefs(i, "callerSaved", cc.callerSaved, TargetRegClass::None);
         checkRefs(i, "calleeSaved", cc.calleeSaved, TargetRegClass::None);
+
+        // ── D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT
+        //
+        // A declared preserved width must be ≤ the width the class's own
+        // registers HAVE. The reader has already refused a width the LIR
+        // instruction model cannot state; this is the half that needs the
+        // finished register table, so it lives here.
+        //
+        // ⚠ ONLY THE **OVER**-DECLARATION IS AN ERROR, and the asymmetry is
+        // the whole point of the field. Declaring FEWER bits than the register
+        // holds is the legitimate case — AAPCS64 §6.1.2 preserves 64 of
+        // `v8..v15`'s 128 — while declaring MORE describes a prologue that
+        // would store past its own operand: the emitted access would take a
+        // width variant no register of the class can source, and the encoder's
+        // refusal would name a mnemonic rather than this row.
+        //
+        // ⓘ A row for a class with NO callee-saved member is NOT refused. It
+        // is a true statement about an ABI that happens to reserve nothing of
+        // that class today, and refusing it would make `calleeSaved` and this
+        // list have to be edited in lockstep for no gain.
+        for (std::size_t c = 0; c < cc.calleeSavedPreservedBits.size(); ++c) {
+            if (!cc.calleeSavedPreservedBits[c].has_value()) continue;
+            auto const cls = static_cast<TargetRegClass>(c);
+            std::uint32_t natural = 0;
+            for (auto const& r : registers) {
+                if (r.regClass != cls || !r.subOf.empty()) continue;
+                natural = std::max(natural,
+                                   static_cast<std::uint32_t>(r.widthBytes) * 8u);
+            }
+            if (natural == 0) {
+                fail(std::format("/callingConventions/{}/calleeSavedPreservedBits", i),
+                     std::format("calling convention '{}' declares a preserved "
+                                 "width for register class '{}', which declares "
+                                 "no full registers on this target — there is "
+                                 "nothing for the width to be a fraction OF",
+                                 cc.name, targetRegClassName(cls)));
+                continue;
+            }
+            if (*cc.calleeSavedPreservedBits[c] > natural) {
+                fail(std::format("/callingConventions/{}/calleeSavedPreservedBits", i),
+                     std::format("calling convention '{}' declares that {} bits "
+                                 "of a callee-saved '{}' register are preserved, "
+                                 "but that class's full registers are only {} "
+                                 "bits wide — a prologue cannot save more of a "
+                                 "register than it has",
+                                 cc.name, *cc.calleeSavedPreservedBits[c],
+                                 targetRegClassName(cls), natural));
+            }
+        }
 
         // ── D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE
         //
@@ -2007,38 +2201,43 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
 
         // ── D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD ───────────────
         // An `aapcs64_dual_cursor` variadic prologue spills `fpSaveCount`
-        // VECTOR argument registers at `fpSlotBytes` each, through the vector
-        // class's own store opcode. The registers it spills come from
-        // `argVrs` — the list `checkRefs` above has already proved is
-        // VR-class — so the list must COVER the count.
+        // FP argument registers at `fpSlotBytes` each, through the FP class's
+        // own store opcode at the width `fpSlotBytes` states. The registers it
+        // spills come from `argFprs` — the list `checkRefs` above has already
+        // proved is FPR-class — so the list must COVER the count.
         //
-        // ⚠ THE RULE EXISTS BECAUSE THE PROLOGUE USED TO READ `argFprs`, and
-        // that is a different register file's NARROW VIEW of the same file.
-        // ✔MEASURED: `d0..d7` (8 bytes, class `fpr`) were emitted as the data
-        // operand of a 16-byte `STUR Qt`, and the bytes came out right only
-        // because `d0` and `v0` share hardware encoding 0 — the wrong-class
-        // operand that produces a correct-looking instruction, which is this
-        // anchor's entire subject. Its two symptoms were an operand claiming
-        // half the width the instruction moves, and two producers of one
-        // opcode disagreeing about its operand's register file.
+        // ⚠ THE RULE EXISTS BECAUSE THE PROLOGUE ONCE NAMED AN EIGHT-BYTE
+        // REGISTER IN A SIXTEEN-BYTE STORE. ✔MEASURED: `d0..d7` (8 bytes) were
+        // emitted as the data operand of a 16-byte `STUR Qt`, and the bytes
+        // came out right only because `d0` and `v0` shared hardware encoding 0
+        // — the wrong-width operand that produces a correct-looking
+        // instruction, which is this anchor's entire subject.
         //
-        // A short `argVrs` would silently spill FEWER registers than the
+        // ★ WHAT CHANGED UNDER R1, AND WHY THIS RULE STILL READS `argFprs`
+        // RATHER THAN THE `argVrs` IT NAMED FOR TWO CYCLES. The fix at the
+        // time was a SECOND list naming the wide view; the real defect was
+        // that the wide and narrow views were two independent ROWS at all.
+        // With the SIMD&FP file declared once, `argFprs` names the FULL
+        // registers and the sixteen bytes are stated by the store's width
+        // flag, so there is one list again — and it is this one.
+        //
+        // A short `argFprs` would silently spill FEWER registers than the
         // save-area geometry reserves slots for, so `va_arg` would read
         // uninitialised stack for the tail — refuse it here, where the ABI is
         // declared, rather than emit a prologue that does not fill its area.
         if (cc.vaListLayout.has_value()
             && cc.vaListLayout->strategy == VaListStrategy::Aapcs64DualCursor
-            && cc.vaListLayout->fpSaveCount > cc.argVrs.size()) {
-            fail(std::format("/callingConventions/{}/argVrs", i),
+            && cc.vaListLayout->fpSaveCount > cc.argFprs.size()) {
+            fail(std::format("/callingConventions/{}/argFprs", i),
                  std::format("calling convention '{}': its "
                              "`aapcs64_dual_cursor` vaListLayout reserves {} "
-                             "vector save slots but `argVrs` names only {} "
-                             "vector register(s) — the variadic prologue "
-                             "spills the FULL-WIDTH vector arg registers from "
+                             "vector save slots but `argFprs` names only {} "
+                             "FP register(s) — the variadic prologue "
+                             "spills the FULL-WIDTH FP arg registers from "
                              "this list, and a short list leaves the tail of "
                              "the save area unwritten",
                              cc.name, cc.vaListLayout->fpSaveCount,
-                             cc.argVrs.size()));
+                             cc.argFprs.size()));
         }
 
         // ── D-TARGET-ARG-POOLS-WITHOUT-DWARF-NUMBERS-CANNOT-BE-RELATED ──
@@ -2064,8 +2263,7 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         {
             std::vector<std::pair<char const*, std::vector<std::string> const*>>
                 const pools{{"argGprs", &cc.argGprs},
-                            {"argFprs", &cc.argFprs},
-                            {"argVrs",  &cc.argVrs}};
+                            {"argFprs", &cc.argFprs}};
             std::size_t declared = 0;
             for (auto const& [name, pool] : pools) {
                 if (pool->empty()) continue;
@@ -2141,23 +2339,41 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         // VR value and the ordinary `double` `a24`, at rc=0 with no
         // diagnostic. One physical register, two live values, silently.
         //
-        // ★★★ WHAT LIFTS THIS RULE — and it is a cycle, not a config edit:
-        // [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]], the
-        // sub-register-aware allocator arc. Until that lands, a config that
-        // would require it is refused HERE, where the config is judged,
-        // rather than compiling into a wrong register. This block is also the
-        // TRIPWIRE for that arc: it names the anchor in its own message, and
-        // it fires on BOTH shapes of the naive fix — naming `v0..v31` in
-        // `callerSaved` (a JSON edit) and adding `argVrs` to
-        // `kAllocatablePoolLists` (an engine edit), because the set it judges
-        // IS the set the engine absorbs.
+        // ★★★ WHAT LIFTED THIS RULE, AND THE SENTENCE THAT USED TO STAND HERE
+        // WAS WRONG ABOUT IT. It said the lift was
+        // [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]] — "a cycle,
+        // not a config edit" — meaning a sub-register-aware allocator. It was
+        // NEITHER. What lifted it (R1 of the operator's design A′, 2026-08-28)
+        // was arm64 declaring its SIMD&FP file ONCE: `v0..v31` are the class
+        // members and `q`/`d`/`s`/`h`/`b` are `subOf` VIEWS of them, all in
+        // class `fpr`, with `vr` keeping no arm64 members at all. The aliasing
+        // model the arc was going to build ALREADY EXISTED and is called
+        // `subOf`; the config was describing one file as two.
+        //
+        // ⇒ ON BOTH SHIPPED TARGETS THIS BLOCK NOW HAS NOTHING TO FIRE ON, AND
+        // THAT IS THE POINT RATHER THAN A REASON TO DELETE IT. Two rows of
+        // DIFFERENT classes over one physical register is still a describable
+        // config and still a silent wrong-register answer, so the rule still
+        // judges every target that loads. What is gone is the SHAPE, not the
+        // hazard. ⚠ Its silence is therefore NOT evidence that it works:
+        // `tests/lir/test_lir_aliased_view_allocability` pins it by
+        // SYNTHESIZING THE NEGATIVE — a fixture that re-declares the two
+        // classes over one dwarfNumber and asserts the refusal by message —
+        // never by observing that the shipped targets are quiet.
+        //
+        // ⓘ The same-class case this rule deliberately skips
+        // (`first.regClass == reg.regClass`) is covered one rule up:
+        // D-TARGET-CC-NAMES-SUB-REGISTER refuses a convention that names a
+        // view, so `d0` and `v0` can never both be allocatable now that `d0`
+        // is `subOf v0`.
         {
             // dwarfNumber → (register index, the list it was found in). Only
             // registers reachable through `kAllocatablePoolLists` are entered,
             // because only those become allocatable; a pair that is merely
-            // DECLARED (arm64's `argVrs` v0..v7 against `argFprs` d0..d7) is
-            // an ABI-placement statement and stays legal — that aliasing is
-            // modelled, deliberately, by the shared arg cursor.
+            // DECLARED is an ABI-placement statement and stays legal — that
+            // aliasing is modelled, deliberately, by the shared arg cursor.
+            // ⓘ arm64's own example of that shape (`argVrs` v0..v7 against
+            // `argFprs` d0..d7) is GONE with R1: there is one FP arg pool now.
             std::unordered_map<std::uint16_t, std::pair<std::size_t, std::size_t>>
                 byDwarf;
             for (std::size_t li = 0; li < kAllocatablePoolLists.size(); ++li) {
@@ -2248,7 +2464,6 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         // is a real misconfiguration.
         bool const hasAbiInfo = !cc.argGprs.empty() || !cc.argFprs.empty()
                               || !cc.returnGprs.empty() || !cc.returnFprs.empty()
-                              || !cc.argVrs.empty() || !cc.returnVrs.empty()
                               || !cc.callerSaved.empty() || !cc.calleeSaved.empty()
                               || cc.shadowSpaceBytes != 0 || cc.redZoneBytes != 0
                               || cc.stackAlignment   != 0

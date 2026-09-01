@@ -448,7 +448,13 @@ struct DSS_EXPORT TranslationTimestamp {
 class DSS_EXPORT PreScanMemoCounters {
 public:
     struct Row {
-        // Files read, continuation-spliced and tokenized by the pre-scan.
+        // Files continuation-spliced and tokenized by the pre-scan.
+        // ⚠ NOT "files read". The memo is keyed on the file's CONTENT DIGEST —
+        // D-PP-PRE-SCAN-MEMO-SERVES-A-SAME-SIZE-EDIT-INSIDE-ONE-TIMESTAMP-TICK-STALE
+        // — so EVERY request reads its file in order to have bytes to key on,
+        // and only a request that then does the splice and the tokenize counts
+        // here. `builds + hits` is therefore the read count, and `builds` alone
+        // is the memoized-work count.
         std::uint64_t builds = 0;
         // Pre-scan requests answered from the memo without doing that work.
         std::uint64_t hits = 0;

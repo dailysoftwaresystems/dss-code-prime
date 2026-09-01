@@ -1400,7 +1400,9 @@ TEST(ProjectConfigLoader, UnknownKeyMessageIsDerivedFromTheRealKnownKeyTable) {
     // (2) Non-degeneracy. Without this, an accessor returning an EMPTY span
     //     would satisfy (1) and (3) trivially while the message listed nothing.
     //     Bumping this number is the intended, visible cost of adding a key.
-    EXPECT_EQ(projectConfigKnownKeys().size(), 13u);
+    //     13 -> 14 on 2026-08-31: `dependencyArtifactCache`
+    //     (D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C)).
+    EXPECT_EQ(projectConfigKnownKeys().size(), 14u);
     for (std::string_view k : projectConfigKnownKeys()) {
         EXPECT_FALSE(k.empty()) << "a zero-filled table entry would whitelist "
                                    "the empty key (DSS_CHECK_KEY_VOCABULARY)";

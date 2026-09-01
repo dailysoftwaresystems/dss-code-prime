@@ -421,27 +421,67 @@ struct DSS_EXPORT TargetRegisterInfo {
     std::optional<std::uint16_t> dwarfNumber;
 };
 
-// FC2 Part B (per-register-class operation table): the three universal
+// FC2 Part B (per-register-class operation table): the universal
 // register-data-movement ROLES every lowering pass emits on a value of
 // some register class. Distinct from a mnemonic: a single x86 mnemonic
 // vocabulary covers GPRs ("mov"/"load"/"store") but the FPR class needs
 // DIFFERENT instructions (movaps / movsd) — a GPR mov against an XMM
 // hwEncoding assembles to valid-looking-but-wrong bytes (the silent
 // class-blind miscompile this table kills).
+//
+// ★★★ `LoadScaled`/`StoreScaled` ARE THE SAME ROLE AT A LONGER REACH, AND
+// THEY ARE PER-CLASS FOR THE REASON THE WHOLE TABLE IS
+// (D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM). A machine
+// whose short memory form carries a small displacement usually declares a
+// second form with a longer one — on AArch64 the unscaled `LDUR/STUR
+// [Xn,#simm9]` (±256) beside the scaled unsigned-offset `LDR/STR
+// [Xn,#pimm]` (0..4095×accessSize). WHICH of the two an access takes is a
+// property of the OFFSET VALUE, decided at the frame chokepoint, not of the
+// instruction the lowering asked for — so the long-reach twin has to be
+// reachable FROM the short one, and every class that has a short form has
+// its own long one. Declaring the long form for the integer file alone is
+// what let an FP frame access run past the short reach and fail loud with no
+// form to swap to.
+//
+// ⚠ THESE ARE NOT "the wide form" or "the large-frame form" — they name the
+// SCALED-DISPLACEMENT encoding, whose field is `byteOffset / accessSize`.
+// The scale is the instruction's OWN access width, which is why the encoder
+// derives it from the same width axis the variant guard matched rather than
+// from a per-opcode constant.
 enum class RegClassOp : std::uint8_t {
-    Move  = 0,  // register→register copy within the class
-    Load  = 1,  // register ← [memory]
-    Store = 2,  // [memory] ← register
+    Move        = 0,  // register→register copy within the class
+    Load        = 1,  // register ← [memory], the SHORT-reach form
+    Store       = 2,  // [memory] ← register, the SHORT-reach form
+    LoadScaled  = 3,  // register ← [memory], the SCALED long-reach twin of Load
+    StoreScaled = 4,  // [memory] ← register, the SCALED long-reach twin of Store
 };
-inline constexpr std::size_t kRegClassOpCount = 3;
+inline constexpr std::size_t kRegClassOpCount = 5;
 
 [[nodiscard]] constexpr std::string_view regClassOpName(RegClassOp op) noexcept {
     switch (op) {
-        case RegClassOp::Move:  return "move";
-        case RegClassOp::Load:  return "load";
-        case RegClassOp::Store: return "store";
+        case RegClassOp::Move:        return "move";
+        case RegClassOp::Load:        return "load";
+        case RegClassOp::Store:       return "store";
+        case RegClassOp::LoadScaled:  return "loadScaled";
+        case RegClassOp::StoreScaled: return "storeScaled";
     }
     return "?";
+}
+
+// The SHORT-reach role a scaled role is the long-reach twin OF, or the role
+// itself when it is not a scaled one. ONE function owns the pairing, because
+// the loader's refusal, the validator's refusal and the chokepoint's lookup
+// all have to agree about which two roles are twins — three hand-written
+// copies of `LoadScaled ↔ Load` is how one of them would come to disagree.
+[[nodiscard]] constexpr RegClassOp unscaledRegClassOp(RegClassOp op) noexcept {
+    switch (op) {
+        case RegClassOp::LoadScaled:  return RegClassOp::Load;
+        case RegClassOp::StoreScaled: return RegClassOp::Store;
+        case RegClassOp::Move:
+        case RegClassOp::Load:
+        case RegClassOp::Store:       break;
+    }
+    return op;
 }
 
 // One `registerClassOps[]` row's declared operation mnemonics. An EMPTY string
@@ -468,17 +508,32 @@ inline constexpr std::size_t kRegClassOpCount = 3;
 // They relate a register class to MEMORY, which is not a register class: there
 // is no "load from gpr into fpr". A row with `to != class` may declare `move`
 // and nothing else.
+//
+// ⚠ `loadScaled` / `storeScaled` ARE ALSO DIAGONAL-ONLY, for the same reason,
+// and each may be declared only BESIDE its short-reach twin
+// (D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM). A scaled form
+// is never asked for by name: it is SWAPPED IN for the short form when the
+// offset overruns it, so a class declaring `loadScaled` without `load` has
+// declared a swap target nothing can ever swap to — dead vocabulary that reads
+// like a declaration, refused where the config is judged. And a class that owns
+// BOTH short forms must declare BOTH long ones or NEITHER: half a pair is a
+// frame whose spill reloads encode and whose spill stores fail loud, which
+// looks like a working target until a frame gets big enough.
 struct DSS_EXPORT TargetRegisterClassOps {
     bool        declared = false;  // a JSON row exists for this class
     std::string move;
     std::string load;
     std::string store;
+    std::string loadScaled;
+    std::string storeScaled;
 
     [[nodiscard]] std::string_view nameFor(RegClassOp op) const noexcept {
         switch (op) {
-            case RegClassOp::Move:  return move;
-            case RegClassOp::Load:  return load;
-            case RegClassOp::Store: return store;
+            case RegClassOp::Move:        return move;
+            case RegClassOp::Load:        return load;
+            case RegClassOp::Store:       return store;
+            case RegClassOp::LoadScaled:  return loadScaled;
+            case RegClassOp::StoreScaled: return storeScaled;
         }
         return {};
     }
@@ -599,24 +654,38 @@ struct VaListLayout {
     Field vrOffsField{};              // __vr_offs: NEGATIVE i32 VR cursor (→0)
 
     // Register-save-area geometry. The prologue spills `gpSaveCount` integer arg
-    // regs at `gpSlotBytes` stride, then `fpSaveCount` SSE arg regs at `fpSlotBytes`
-    // stride (the SSE block follows the GPR block). For SysV: 6×8 then 8×16 = 176B.
-    // For AAPCS64 (Aapcs64DualCursor): GR 8×8 then VR 8×16 = 64 + 128 = 192B.
+    // regs at `gpSlotBytes` stride, then `fpSaveCount` FP arg regs at `fpSlotBytes`
+    // stride (the FP block follows the GPR block). For SysV: 6×8 then 8×16 = 176B.
+    // For AAPCS64 (Aapcs64DualCursor): GR 8×8 then FP 8×16 = 64 + 128 = 192B.
+    //
+    // ★ `fpSlotBytes` IS ALSO THE ACCESS WIDTH, not only the stride, and that is
+    // new with R1 of design A′. The FP spill loop turns it into the store's LIR
+    // width flag (`lirInstWidthFlagForBits`), which elects the class store's
+    // 16-byte variant — where it used to name a separate 128-bit mnemonic
+    // through a separate register class. A `fpSlotBytes` the instruction model
+    // cannot state is refused there rather than silently written at some other
+    // width.
     std::uint32_t gpSaveCount = 0;    // integer arg regs spilled (SysV: 6; AAPCS64: 8)
     std::uint32_t gpSlotBytes = 0;    // bytes per integer save slot (SysV/AAPCS64: 8)
-    std::uint32_t fpSaveCount = 0;    // SSE/VR arg regs spilled (SysV/AAPCS64: 8)
-    std::uint32_t fpSlotBytes = 0;    // bytes per SSE/VR save slot (SysV/AAPCS64: 16)
+    std::uint32_t fpSaveCount = 0;    // FP arg regs spilled (SysV/AAPCS64: 8)
+    std::uint32_t fpSlotBytes = 0;    // bytes per FP save slot (SysV/AAPCS64: 16)
     // ── WHICH REGISTERS THE VR BLOCK SAVES IS NOT DECLARED HERE ─────────────
     // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD. It is the CC's OWN
-    // `argVrs` list, and this note exists because the prologue used to read
-    // `argFprs` instead. On AArch64 those name the SIXTY-FOUR-BIT `d0..d7`
-    // views, so a 16-byte `STUR Qt` was emitted naming an 8-byte register;
-    // ✔MEASURED, it produced the right BYTES only because `d0` and `v0` share
-    // hwEncoding 0, which is exactly why nothing caught it. `validate()` now
-    // requires `argVrs` to cover `fpSaveCount` on an `Aapcs64DualCursor`
-    // layout, so the list the prologue reads is the one the ABI names
-    // (AAPCS64 §B saves `q0..q7`, sixteen bytes each) and no inference stands
-    // in for it.
+    // `argFprs` list, and `validate()` requires that list to cover
+    // `fpSaveCount` on an `Aapcs64DualCursor` layout so it cannot come up
+    // short (AAPCS64 §B saves `q0..q7`, sixteen bytes each).
+    //
+    // ⚠ THIS NOTE USED TO NAME `argVrs`, AND THE REASON IT NO LONGER CAN IS
+    // THE POINT RATHER THAN A RENAME. The prologue originally read `argFprs`
+    // when those rows were the SIXTY-FOUR-BIT `d0..d7` views, so a 16-byte
+    // `STUR Qt` was emitted naming an 8-byte register; ✔MEASURED, it produced
+    // the right BYTES only because `d0` and `v0` shared hwEncoding 0, which is
+    // exactly why nothing caught it. The fix at the time was a SECOND list
+    // (`argVrs`) naming the wide view. With arm64's SIMD&FP file declared ONCE
+    // (R1), `argFprs` names the full registers `v0..v7` and the sixteen-byte
+    // access is stated by the store's WIDTH FLAG — so the operand and the
+    // instruction can no longer disagree about how many bytes move, and the
+    // second list has nothing left to say.
 
     // `va_arg` reg-vs-overflow thresholds. gp_offset < gpOffsetLimit ⇒ read from
     // the save area (SysV: 48 = 6×8); fp_offset < fpOffsetLimit ⇒ likewise
@@ -786,20 +855,73 @@ struct DSS_EXPORT TargetCallingConvention {
     std::vector<std::string> argFprs;     // arg-passing floating-point registers, in order
     std::vector<std::string> returnGprs;  // integer-return registers (rax/rdx on SysV; rax on MS)
     std::vector<std::string> returnFprs;  // float-return registers
-    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the 128-bit VR (Q-view)
-    // arg-passing / return registers for an IEEE binary128 `long double`
-    // (AAPCS64 v0..v7 args, v0..v3 return). Parallel to argFprs/returnFprs and
-    // indexed by the SAME per-class (NSRN) ordinal — an F128 arg at NSRN k is
-    // passed in `argVrs[k]` (v{k}), which ALIASES `argFprs[k]` (d{k}), so an
-    // F64 and an F128 sharing a signature never collide by ordinal. EMPTY on
-    // every f64/x87-80 target (x87 long double uses the implicit st0 stack; the
-    // f64 axis never forms an F128), so this stays inert there. Validated
-    // VR-class in `validate()` exactly as argFprs is validated FPR-class; the
-    // MIR→LIR F128 boundary verb resolves each name→ordinal like argFprs.
-    std::vector<std::string> argVrs;      // binary128 arg-passing VR registers, in order
-    std::vector<std::string> returnVrs;   // binary128 VR-return registers
+    // ── `argVrs` / `returnVrs` ARE GONE, AND THEIR DELETION IS THE CC HALF OF
+    //    D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS ───────────────
+    //
+    // They were "the 128-bit VR (Q-view) arg-passing / return registers for an
+    // IEEE binary128 `long double`" — AAPCS64 `v0..v7` / `v0..v3` — declared
+    // ALONGSIDE `argFprs` = `d0..d7`, "indexed by the SAME ordinal" and
+    // aliasing it register for register. That sentence is the double
+    // declaration this whole change removes, wearing its cc clothes: two
+    // POOLS over one physical file, related after the fact by a shared
+    // cursor derived from their DWARF numbers.
+    //
+    // ★ WITH THE FILE DECLARED ONCE there is ONE FP arg pool (`argFprs`,
+    // naming the full registers `v0..v7`) and the 128-bit-ness of a binary128
+    // argument is a property of the VALUE, carried as the LIR instruction's
+    // width flag, which elects the Q-form variant of the class's own
+    // `load`/`store`. arm64 was the ONLY declarer of these two lists on either
+    // shipped target (✔MEASURED: x86_64's `sysv_amd64` and `ms_x64` both left
+    // them empty, because an x87 `long double` uses the implicit st0 stack),
+    // so deleting them removed schema surface rather than adding it.
+    //
+    // ⚠ THE DEFECT THEY WERE ADDED TO FIX IS STILL FIXED, by the mechanism
+    // that always did the work. `D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD`
+    // was a 16-byte `STUR Qt` naming an 8-byte `d0`: an operand claiming half
+    // the width its instruction moves. What made that undetectable was that
+    // `d0` and `v0` were two ROWS; now `v0` is the row and the store's width
+    // flag says 128, so the operand and the instruction cannot disagree.
     std::vector<std::string> callerSaved; // volatile across calls (caller must spill if reused)
     std::vector<std::string> calleeSaved; // non-volatile (callee must restore on return)
+
+    // ── D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT
+    //
+    // HOW MANY BITS OF A `calleeSaved` REGISTER OF EACH CLASS THIS ABI
+    // GUARANTEES PRESERVED across a call. Indexed by `TargetRegClass` ordinal;
+    // `nullopt` for a class means THE WHOLE REGISTER, which is the only
+    // fail-safe default — a prologue that preserves more than the ABI demands
+    // is slow, one that preserves less restores garbage with no diagnostic.
+    //
+    // ★★★ IT EXISTS BECAUSE THE TWO SHIPPED ABIS GENUINELY DISAGREE, AND THE
+    // DISAGREEMENT USED TO LIVE IN A CODE DEFAULT. AAPCS64 §6.1.2 preserves
+    // only the LOW 64 BITS of `v8..v15`; the Win64 x64 ABI preserves `xmm6..
+    // xmm15` IN FULL (its unwind vocabulary spells the save `UWOP_SAVE_XMM128`
+    // — a 16-byte slot — and has no code for a half-register one). Both were
+    // served by ONE hardcoded fallback: `emitFrameStore`'s `widthFlags`
+    // parameter defaulted to 64 for every class on every target, which made
+    // AAPCS64 accidentally right and `ms_x64` silently wrong — an 8-byte
+    // `MOVSD` into the 16-byte slot the frame had already reserved, with no
+    // refusal anywhere because width 64 is a perfectly encodable `movsd`.
+    //
+    // ⚠ IT CONSTRAINS THE **SAVE**, NOT THE ALLOCATOR, AND THE DIFFERENCE IS
+    // THE PART WORTH READING. A class whose registers are wider than the bits
+    // declared here can still be allocated a callee-saved register — DSS's own
+    // prologue then preserves exactly what the ABI publishes, which is what a
+    // FOREIGN callee would preserve too. Placing a value WIDER than this in a
+    // callee-saved register is therefore an allocation question (`v8..v15` may
+    // not carry a 128-bit value across a call under AAPCS64 no matter how wide
+    // DSS's own save is, because the callee may be gcc's). That constraint is
+    // the second half of design A′ R3 and is inert today — `LirVerifier`'s
+    // store rule keeps F80/F128 memory-resident, so no FPR virtual register
+    // holds more than 64 bits. This field is deliberately NOT that constraint,
+    // and must not be read as if it were.
+    //
+    // ⓘ SPILL SLOTS ARE NOT GOVERNED BY THIS. A spill slot is DSS's own
+    // memory with no ABI facing it, so a spill store/reload moves the WHOLE
+    // register (`wholeRegisterAccessFlags`) — see `lir_callconv.hpp`.
+    std::array<std::optional<std::uint32_t>, kTargetRegClassCount>
+        calleeSavedPreservedBits{};
+
     std::uint16_t stackAlignment   = 0;   // alignment of RSP at call site (16 on SysV/MS x64)
     std::uint16_t shadowSpaceBytes = 0;   // MS x64: 32 bytes of home space; SysV: 0
     std::uint16_t redZoneBytes     = 0;   // SysV leaf-fn red zone (128); MS x64: 0
@@ -4285,10 +4407,18 @@ public:
         if (from != TargetRegClass::GPR || to != TargetRegClass::GPR) {
             return std::nullopt;
         }
+        // ⚠ `load_u`/`store_u` ARE THE GPR DEFAULTS FOR THE SCALED ROLES AND
+        // THEY ARE OPTIONAL IN A WAY `load`/`store` ARE NOT: a target whose
+        // memory forms already carry a wide displacement (x86_64's disp32)
+        // declares no long-reach twin at all, and `opcodeByMnemonic` returning
+        // nullopt is the RIGHT answer there — the frame chokepoint then keeps
+        // the short form, which encodes every offset that target can produce.
         switch (op) {
-            case RegClassOp::Move:  return opcodeByMnemonic("mov");
-            case RegClassOp::Load:  return opcodeByMnemonic("load");
-            case RegClassOp::Store: return opcodeByMnemonic("store");
+            case RegClassOp::Move:        return opcodeByMnemonic("mov");
+            case RegClassOp::Load:        return opcodeByMnemonic("load");
+            case RegClassOp::Store:       return opcodeByMnemonic("store");
+            case RegClassOp::LoadScaled:  return opcodeByMnemonic("load_u");
+            case RegClassOp::StoreScaled: return opcodeByMnemonic("store_u");
         }
         return std::nullopt;
     }

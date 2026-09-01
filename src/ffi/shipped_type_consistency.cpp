@@ -69,14 +69,27 @@ void emitRealizationConflict(DiagnosticReporter& reporter, std::string what) {
 // between an import and an unbound reference), so the sentinel has to compare
 // unequal to every image name. It is bracketed for that reason — no config value
 // can collide with it, and it reads correctly in the diagnostic.
+// ⚠ D-FFI-DESCRIPTOR-KNOWN-NAME-HAS-NO-LIBRARY-FOR-FORMAT — ABSENCE HAS EXACTLY
+// ONE RENDERING HERE. The header above states that "absence is encoded as its own
+// value and compared like any other"; that was true of a MISSING key and false of
+// a key naming the empty string, which rendered as an empty image and therefore
+// compared UNEQUAL to a row meaning the identical thing. Both now render `<none>`.
+// The empty spelling is refused at descriptor load, so this is the interior half
+// of a totality whose boundary half is `decodeLibraryMap` — a rule that holds only
+// "by construction elsewhere" is the shape this anchor exists to remove.
+//
+// The merge is performed the SAME way `realizeRow` performs it — symbol keys win,
+// an omitted format inherits the descriptor's — rather than by a two-step lookup,
+// so the rendering and the realization can never disagree about which entry is in
+// force for a row.
 [[nodiscard]] std::string mergedEntry(
     std::unordered_map<std::string, std::string> const& docMap,
     std::unordered_map<std::string, std::string> const& symMap,
     std::string_view formatName) {
-    std::string const key{formatName};
-    if (auto const it = symMap.find(key); it != symMap.end()) return it->second;
-    if (auto const it = docMap.find(key); it != docMap.end()) return it->second;
-    return "<none>";
+    std::unordered_map<std::string, std::string> merged = docMap;
+    for (auto const& [fmt, value] : symMap) merged.insert_or_assign(fmt, value);
+    std::string_view const entry = shippedLibraryImageForFormat(merged, formatName);
+    return entry.empty() ? std::string{"<none>"} : std::string{entry};
 }
 
 // The same bracketed-absence convention for a plain optional string field.

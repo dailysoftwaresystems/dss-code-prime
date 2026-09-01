@@ -1170,7 +1170,39 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
                 + "." + kv.key() + "' must be a string");
             continue;
         }
-        out.emplace(kv.key(), kv.value().get<std::string>());
+        std::string image = kv.value().get<std::string>();
+        // ★★★ D-FFI-DESCRIPTOR-KNOWN-NAME-HAS-NO-LIBRARY-FOR-FORMAT — THE SECOND
+        // SPELLING OF ABSENCE, REFUSED HERE. A key that is PRESENT and names the
+        // EMPTY STRING is not "this format has no image": the ABSENT key already
+        // states that, and states it once. It is a key that names nothing — and
+        // the tiers read the two spellings DIFFERENTLY. The realization oracle
+        // decides its `NoLibraryForFormat` arm on whether the map HAS the key,
+        // while every binder fold (`buildCuMir`, the assembly binder, the lazy
+        // archive pull) tests the VALUE. One row therefore answered "realized,
+        // bind this image" to one tier and "there is nothing to bind" to the
+        // next, with no diagnostic at any stage. Refusing it at LOAD leaves ONE
+        // spelling of absence, which is exactly what lets every tier state the
+        // same arm instead of each deciding it privately.
+        //
+        // It is also the discipline the SIBLING axis already keeps: the
+        // `realization` map refuses its own empty value ("must be a NON-EMPTY
+        // path"), and these two decodes are written so they cannot drift.
+        //
+        // ⚠ THIS IS NOT the "available symbol with no image" rule, and the
+        // difference is the whole verdict. That outcome is LEGAL and is the
+        // STATED `NoLibraryForFormat` arm: the platform may know a name without
+        // knowing which image owns it, and C23 5.1.1.2 phase 8 puts THAT verdict
+        // at the LINK tier, never at descriptor load. What is refused here is a
+        // descriptor writing the same fact a second, ambiguous way.
+        if (image.empty()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
+                + "." + kv.key() + "' must NAME an image; the empty string is a "
+                  "second spelling of \"no image on this object format\", which "
+                  "an OMITTED key already states. Omit the key — the reference "
+                  "then routes UNBOUND to the link tier — or name the image");
+            continue;
+        }
+        out.emplace(kv.key(), std::move(image));
     }
     return true;
 }
@@ -2138,13 +2170,25 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
 
     // (2) Optional `library` MAP (Model 3): per-object-format runtime image,
     // keyed by the canonical `objectFormatKindName` vocabulary
-    // ("pe"/"elf"/"macho"). Absent ⇒ empty map (the lowering then falls back to
-    // the language's externLibraryByFormat default for every format). A present
-    // map: each key MUST be a known object-format name (a typo like "pee" fails
-    // loud HERE, not at a user's link), each value MUST be a string. A map that
-    // omits a format is legal — that format inherits the language default at
-    // resolution. AGNOSTIC: the key set is the `objectFormatKindFromName`
-    // vocabulary, never an `if (key == "pe")` identity branch.
+    // ("pe"/"elf"/"macho"). Absent ⇒ empty map, which names no image on any
+    // format. A present map: each key MUST be a known object-format name (a typo
+    // like "pee" fails loud HERE, not at a user's link), each value MUST be a
+    // NON-EMPTY string naming an image.
+    //
+    // ★ A MAP THAT OMITS A FORMAT IS LEGAL, AND WHAT IT MEANS IS NOW STATED
+    // (D-FFI-DESCRIPTOR-KNOWN-NAME-HAS-NO-LIBRARY-FOR-FORMAT). It does NOT mean
+    // "inherit a language-level default": that default (`externLibraryByFormat`)
+    // was RETIRED by UCRT-P4 Decision 1, precisely because a per-language guess
+    // was a second owner of a fact this corpus owns, and it bound one program's
+    // `printf` to the legacy pe C runtime while the rest of the same program's
+    // stdio surface was UCRT. An omitted format means the platform names NO image
+    // for this name here: the realization oracle states that as
+    // `ShippedRealizationStatus::NoLibraryForFormat` and the reference routes
+    // UNBOUND to the link tier (C23 5.1.1.2 phase 8), which is where an
+    // unresolved external reference is judged.
+    //
+    // AGNOSTIC: the key set is the `objectFormatKindFromName` vocabulary, never
+    // an `if (key == "pe")` identity branch.
     if (doc.contains("library")) {
         // SHARED chokepoint with the per-symbol `library` override (in the symbol
         // loop below) so the two decodes can NEVER drift. A non-object node hard-
@@ -3598,6 +3642,23 @@ bool objectFormatInAvailabilitySet(std::span<std::string const> availableObjectF
            != availableObjectFormats.end();
 }
 
+std::string_view shippedLibraryImageForFormat(
+    std::unordered_map<std::string, std::string> const& library,
+    std::string_view formatName) {
+    // ★ ONE OWNER for "does this row name an image on this format, and which".
+    // BOTH spellings of absence — no key, and a key whose value is empty —
+    // answer the SAME empty view, so no tier can read one of them as an image
+    // while another reads it as absence. The empty value is refused at load
+    // (`decodeLibraryMap`), which makes it unreachable through a decoded
+    // descriptor; it is collapsed HERE as well because a totality that holds
+    // only "by construction somewhere else" is precisely the shape this anchor
+    // exists to remove. A direct-API caller building the map itself gets the
+    // same answer as the reader's.
+    auto const it = library.find(std::string{formatName});
+    if (it == library.end()) return {};
+    return it->second;
+}
+
 bool shippedHeaderAvailableForFormat(std::filesystem::path const& descriptorPath,
                                      ObjectFormatKind fmt) {
     // Interner-free read with a THROWAWAY reporter: a malformed availability is
@@ -3947,9 +4008,19 @@ realizeRow(ShippedLibDescriptor const& desc, ShippedSymbol const& sym,
     // FOR this format: the platform says the symbol exists but not where it lives,
     // so there is nothing to bind. A synthesized shim needs no image at all, so a
     // `synthesize` row is REALIZED regardless of the library map.
-    real.status = (real.recipeId.empty() && !real.library.contains(formatKey))
-                      ? ShippedRealizationStatus::NoLibraryForFormat
-                      : ShippedRealizationStatus::Realized;
+    //
+    // ⚠ D-FFI-DESCRIPTOR-KNOWN-NAME-HAS-NO-LIBRARY-FOR-FORMAT: the arm is decided
+    // by `shippedLibraryImageForFormat`, NOT by `library.contains(formatKey)`. The
+    // two differ on exactly one row shape — a key present naming the empty string
+    // — and `contains` answered REALIZED there while every binder fold, which
+    // tests the VALUE, routed the same row unbound. Deciding the arm with the
+    // accessor the binders' question maps onto is what keeps the statement and
+    // the binding from being two different answers to one question.
+    real.status =
+        (real.recipeId.empty()
+         && shippedLibraryImageForFormat(real.library, formatKey).empty())
+            ? ShippedRealizationStatus::NoLibraryForFormat
+            : ShippedRealizationStatus::Realized;
     return real;
 }
 

@@ -1,0 +1,14 @@
+{
+  "$comment": "D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM: the RUN witness for AArch64's SIMD&FP scaled unsigned-offset LDR/STR in BOTH directions. Before this row the frame chokepoint could swap an out-of-reach frame access onto the scaled form only for the INTEGER file — the integer file was the only one whose twin was declared — so an FP frame access past the unscaled +-256 reach kept fldur/fstur and fail-louded A_ImmediateOperandOutOfRange at the encoder. deep() reads 16 incoming stack doubles from ABOVE a 256-byte outgoing-argument area (the LOAD direction); spillFar() holds 16 doubles live across two calls so the callee-saved SIMD&FP registers are saved above that same area (the STORE direction). deep = 1+..+24 = 300; spillFar = 2*(1+..+16) = 272; 572 & 255 = 60. RED-ON-DISABLE: (a) drop `loadScaled`/`storeScaled` from arm64.target.json's fpr registerClassOps row -> the LOADER refuses the schema (the both-or-neither rule) and NOTHING compiles; (b) revert the chokepoint to swapping only the universal GPR op -> this example fails loud A_ImmediateOperandOutOfRange on fldur/fstur and the functions are dropped from the module. ⚠ A COMPILE-ONLY PIN WOULD NOT BE ENOUGH: the scaled field is byteOffset/accessSize, so a wrong scale assembles clean and reads a DIFFERENT slot — only the exit code separates 'the refusal is gone' from 'the displacement is right'. arm64-ELF under qemu-aarch64.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 60,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ]
+}

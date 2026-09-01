@@ -203,6 +203,44 @@ lirInstWidthBits(std::uint8_t flags) noexcept {
                                               : std::uint8_t{64};
 }
 
+// ── THE INVERSE, AND IT IS PARTIAL ON PURPOSE ────────────────────────────────
+//
+// The flag bits that make `lirInstWidthBits` answer `bits`, or nullopt when the
+// LIR instruction model cannot STATE that width. A producer that computes a
+// width from config (a `vaListLayout`'s `fpSlotBytes`, an aggregate's size)
+// needs to turn a number into flags, and the alternative — an `if/else` ladder
+// at each such site — is the two-owners shape this codebase keeps paying for:
+// a site that forgets an arm emits flags meaning SOME OTHER width and the
+// instruction runs at a width nobody asked for, with nothing to see.
+//
+// ⚠ NULLOPT IS THE LOAD-BEARING ARM. `lirInstWidthBits` is TOTAL — every
+// `std::uint8_t` decodes to one of five widths — so a naive inverse would have
+// to invent an answer for 24, 48 or 96. Returning nullopt makes the caller
+// refuse, naming the width and where it came from. ⓘ `lirInstWidthBits(0)` is
+// 64, so `64` maps to NO bits, which is the same encoding every width-default
+// producer already emits.
+[[nodiscard]] constexpr std::optional<std::uint8_t>
+lirInstWidthFlagForBits(std::uint32_t bits) noexcept {
+    switch (bits) {
+        case 8:   return kLirInstFlagWidth8;
+        case 16:  return kLirInstFlagWidth16;
+        case 32:  return kLirInstFlagWidth32;
+        case 64:  return std::uint8_t{0};
+        case 128: return kLirInstFlagWidth128;
+        default:  return std::nullopt;
+    }
+}
+
+// Round trip, both directions, over the closed set — a new width that adds a
+// flag but forgets this inverse (or the reverse) fails the BUILD.
+static_assert(lirInstWidthBits(*lirInstWidthFlagForBits(8)) == 8);
+static_assert(lirInstWidthBits(*lirInstWidthFlagForBits(16)) == 16);
+static_assert(lirInstWidthBits(*lirInstWidthFlagForBits(32)) == 32);
+static_assert(lirInstWidthBits(*lirInstWidthFlagForBits(64)) == 64);
+static_assert(lirInstWidthBits(*lirInstWidthFlagForBits(128)) == 128);
+static_assert(!lirInstWidthFlagForBits(24).has_value());
+static_assert(!lirInstWidthFlagForBits(0).has_value());
+
 // True iff this instruction's result must not share a register with any of its
 // inputs. Named rather than open-coded so the one consumer and every future
 // producer agree on the bit.

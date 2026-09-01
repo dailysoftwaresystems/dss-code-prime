@@ -209,20 +209,24 @@ TEST(CompilationUnitInputDigest, EditingOnlyAQuoteIncludedHeaderMovesTheDigest) 
     // THE HEADER ALONE. `main.c` is not rewritten at any point in this case, so
     // nothing a manifest can see changes.
     //
-    // ⚠⚠ THE REPLACEMENT IS A DIFFERENT *LENGTH*, AND THAT IS NOT COSMETIC —
-    // IT IS A DEFECT IN A DIFFERENT COMPONENT, WORKED AROUND HERE ONLY SO THIS
-    // CASE TESTS ITS OWN SUBJECT
-    // ([[D-PP-PRE-SCAN-MEMO-SERVES-A-SAME-SIZE-EDIT-INSIDE-ONE-TIMESTAMP-TICK-STALE]]).
-    // ✔MEASURED 2026-08-31 (cycle P46, lane `dg`): with `2` → `3`, a SAME-SIZE
-    // edit, the preprocessor's product text came back BYTE-IDENTICAL — the
-    // per-file pre-scan memo in `src/analysis/preprocess/preprocessor.cpp` is
-    // keyed on `(PathIdentity, size, mtime)`, and neither size nor a
-    // coarse-granularity mtime moved. So the COMPILER read the old header, and
-    // the digest correctly reported the compile that actually happened. The
-    // digest is not the defect; it is the instrument that FOUND one.
-    // ⇒ this case therefore edits a different NUMBER OF BYTES, so that the
-    // subject under test is `inputDigest()` rather than that memo.
-    write(dir / "fold_impl.h", "#define DSS_FOLD_BIAS 30\n");
+    // ★★ THE REPLACEMENT IS THE SAME *LENGTH* AGAIN, AND THE HISTORY IS THE
+    // POINT. `2` → `3` is a 25-byte edit both ways, and it is the edit this
+    // case was ORIGINALLY written with. It was widened to `30` — a different
+    // NUMBER OF BYTES — in cycle P46, not for anything about `inputDigest()`
+    // but to route around a defect in a DIFFERENT component: the per-file
+    // pre-scan memo in `src/analysis/preprocess/preprocessor.cpp` was keyed on
+    // `(PathIdentity, size, mtime)`, so a same-size edit inside one filesystem
+    // timestamp tick addressed the OLD entry and the COMPILER read the old
+    // header. ✔The digest reported the compile that actually happened, which is
+    // how that defect was found: the digest was never the defect, it was the
+    // instrument.
+    // ⇒ RESTORED to the same-length edit now that
+    // D-PP-PRE-SCAN-MEMO-SERVES-A-SAME-SIZE-EDIT-INSIDE-ONE-TIMESTAMP-TICK-STALE
+    // is CLOSED (P47 lane `mm`, memo re-keyed on the file's content digest).
+    // This is the STRONGER fixture of the two: it moves the header's VALUE
+    // while holding every `stat`-visible property of the file constant, so it
+    // exercises the digest against the narrowest possible input change.
+    write(dir / "fold_impl.h", "#define DSS_FOLD_BIAS 3\n");
     std::string const mutated     = digestOf(dir);
     std::string const mutatedText = parseSourceOf(dir);
 
@@ -325,9 +329,12 @@ TEST(CompilationUnitInputDigest, AuxiliaryBuffersIsNotTheInputClosure) {
     RecordProperty("defineOnlyHeaderIsAnAuxiliaryBuffer",
                    headerIsAnAuxiliaryBuffer ? "yes" : "no");
 
-    // A different NUMBER OF BYTES, for the reason the header case above records:
-    // [[D-PP-PRE-SCAN-MEMO-SERVES-A-SAME-SIZE-EDIT-INSIDE-ONE-TIMESTAMP-TICK-STALE]].
-    write(dir / "defs_only.h", "#define DSS_BIAS 30\n");
+    // The SAME NUMBER OF BYTES, restored for the reason the header case above
+    // records now that
+    // D-PP-PRE-SCAN-MEMO-SERVES-A-SAME-SIZE-EDIT-INSIDE-ONE-TIMESTAMP-TICK-STALE
+    // is closed: `2` → `3` holds size and mtime constant and moves only the
+    // bytes, which is the narrowest input change this case can make.
+    write(dir / "defs_only.h", "#define DSS_BIAS 3\n");
     std::string const mutated = digestOf(dir);
 
     EXPECT_NE(before, mutated)

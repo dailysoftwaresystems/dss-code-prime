@@ -830,6 +830,13 @@ Resolver::buildNode_(std::size_t index, std::string const& consumerSpec,
     prog.setCompileConfig(req_.compileConfig);
     prog.setJobs(req_.jobs);
     prog.setExecutor(req_.executor);
+    // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C): ONE
+    // more entry on this same list, for the reason the list's own note gives —
+    // a sub-build that did not inherit the root's cache policy would differ
+    // from its siblings SILENTLY, and the whole point of the mechanism is that
+    // the graph's SECOND build is cheap. The ROOT's policy, never this node's
+    // own manifest copy (B.10 / U-9).
+    prog.setDependencyArtifactCache(req_.dependencyArtifactCache);
     prog.setGitRunner(&git_);
     // U-9: `<consumer output base>/deps/<name>/<formatName>/<file>`. NEVER
     // inside the dependency's own tree, which may be read-only — the same

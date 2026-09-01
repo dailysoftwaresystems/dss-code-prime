@@ -4177,6 +4177,17 @@
             ]
           },
           {
+            "$comment": "D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT: MOVUPS xmm, m128 — 0F 10 /r, no mandatory prefix. The READ half of the whole-register pair; the store's own $comment carries the measurement and the MOVUPS-vs-MOVAPS reasoning. It must exist wherever the store does, and at the same widths: an epilogue restore or a spill reload NARROWER than the save that filled the slot leaves the top of the register holding whatever was there before, which is the same silent wrong answer arriving from the other direction. ✔MEASURED under GNU as 2.42: `movups 0x20(%rsp),%xmm6` = 0F 10 74 24 20, `movups 0x20(%rsp),%xmm15` = 44 0F 10 7C 24 20. ⓘ THE `symbol` (RIP-relative) SHAPE DELIBERATELY HAS NO WIDTH-128 ARM: that shape serves the rodata float-literal fold, whose items are F32/F64 constants, and the loader's keyed/absent-mix rule is per operandKinds list — so leaving it at 32/64 refuses a 128-bit riprel load by name rather than inventing a consumer for it.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 128 },
+            "template":   { "opcode": [15, 16] },
+            "resultSlot": "modrm.reg",
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem", "regClass": "gpr"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
             "guard":      { "operandKinds": ["symbol"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "opcode": [15, 16] },
             "resultSlot": "modrm.reg",
@@ -4197,13 +4208,13 @@
       }
     },
     {
-      "$comment": "FC2 (PE float witness, 2026-06-10): FPR-class 8-byte store — MOVSD m64, xmm = F2 0F 11 /r. ModRM DIRECTION is the load's mirror (Intel SDM): 0F 10 loads (xmm ← r/m), 0F 11 stores (r/m ← xmm) — the ModRM ROLES are identical in both (reg = the xmm, rm = the memory operand); only the opcode's direction bit decides which one is read vs written. One variant: the 4-op [value_reg, base_reg, MemBase(scale), MemOffset(disp)] form mirroring the universal `store` operand shape exactly (value → modrm.reg, base → modrm.rm.mem — emitFrameStore's operand order works unchanged). First consumer: the ms_x64 prologue/epilogue saved-reg spill — Win64 declares xmm6-15 CALLEE-SAVED and regalloc prefers callee-saved, so the FIRST FPR vreg under ms_x64 needs this store (SysV has no callee-saved XMMs, never reached it). Bound to the `fpr` class's `store` slot in registerClassOps[]. The full 16-byte XMM is NOT preserved (Win64 requires only the low 64 bits of xmm6-15 to survive — MOVSD's m64 store IS the ABI contract; the regalloc SPILL path stays width-default 64 accordingly). WIDTH-KEYED since FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN closure): the F32 MOVSS store sibling (F3 0F 11, width 32) sits directly below for type-exact value stores — see the encoding-level $comment. (Audit-residue sweep c2 corrected the prior 'F64-WIDTH ONLY … when an F32 consumer exists' tail, which the variant below had already contradicted.)",
+      "$comment": "FC2 (PE float witness, 2026-06-10): the FPR class's memory STORE verb, width-elected — MOVSS m32 (F3 0F 11), MOVSD m64 (F2 0F 11) and MOVUPS m128 (0F 11, no prefix). ModRM DIRECTION is the load's mirror (Intel SDM): 0F 10 loads (xmm ← r/m), 0F 11 stores (r/m ← xmm) — the ModRM ROLES are identical in both (reg = the xmm, rm = the memory operand); only the opcode's direction bit decides which one is read vs written. Every variant is the 4-op [value_reg, base_reg, MemBase(scale), MemOffset(disp)] form mirroring the universal `store` operand shape exactly (value → modrm.reg, base → modrm.rm.mem — emitFrameStore's operand order works unchanged). First consumer: the ms_x64 prologue/epilogue saved-reg spill — Win64 declares xmm6-15 CALLEE-SAVED and regalloc prefers callee-saved, so the FIRST FPR vreg under ms_x64 needs this store (SysV has no callee-saved XMMs, never reached it). Bound to the `fpr` class's `store` slot in registerClassOps[]. ⚠⚠ THIS $COMMENT USED TO SAY 'The full 16-byte XMM is NOT preserved (Win64 requires only the low 64 bits of xmm6-15 to survive — MOVSD's m64 store IS the ABI contract; the regalloc SPILL path stays width-default 64 accordingly)', AND THAT SENTENCE WAS FALSE — it is the reason D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT looked deliberate for four cycles. ✔MEASURED 2026-08-31 against the reference: MSVC 14.44.35207 `/O2 /FAs` on a function with eight doubles live across calls emits `movaps XMMWORD PTR [rax-24], xmm6` — a SIXTEEN-byte save, for xmm6 through xmm13. Microsoft's x64 convention lists XMM6:XMM15 as nonvolatile registers, not as nonvolatile halves, and its unwind vocabulary spells the save `UWOP_SAVE_XMM128` with no code for a partial one (see src/link/format/pe.cpp). The width-128 variant below is what makes the whole-register save encodable; it is MOVUPS rather than MOVAPS because a DSS frame slot is 16-byte-STRIDED but not 16-byte-ALIGNED, and MOVAPS #GPs on a misaligned address. WIDTH-KEYED since FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN closure): the F32 MOVSS store sibling (F3 0F 11, width 32) sits directly below for type-exact value stores — see the encoding-level $comment.",
       "mnemonic": "movsd_store", "result": "none",
       "hasSideEffects": true,
       "minOperands": 4, "maxOperands": 4,
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
-        "$comment": "FC3.5 sweep-c2: width-keyed pair — MOVSD m64, xmm (F2, width 64) vs MOVSS m32, xmm (F3 0F 11, width 32; Intel SDM MOVSS). lowerStore threads the stored VALUE's type width for FPR-class stores (type-exact access width); the regalloc spill path stays width-default 64 over 8-byte slots (value-preserving for both float widths — the F32 value is the low 4 bytes either way).",
+        "$comment": "FC3.5 sweep-c2, extended by D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT: width-keyed TRIPLE — MOVSS m32 (F3 0F 11, width 32; Intel SDM MOVSS), MOVSD m64 (F2, width 64), MOVUPS m128 (0F 11, width 128). lowerStore threads the stored VALUE's type width for FPR-class stores (type-exact access width). ⚠ THE SENTENCE THAT USED TO END THIS PARAGRAPH WAS WRONG IN BOTH OF ITS CLAUSES and is kept here as the record: 'the regalloc spill path stays width-default 64 over 8-byte slots (value-preserving for both float widths — the F32 value is the low 4 bytes either way)'. The slots are not 8 bytes — `frameSlotStride` floors at max(widest GPR, widest FPR), which is SIXTEEN on this target because `fpr` rows are 16 bytes — and the spill path no longer takes a default at all: it derives the access from the class's own full-register width, so it now moves the whole register into the whole slot. The old claim was value-preserving only under the premise that nothing wider than a double ever occupies an `fpr` register, which is a statement about today's front end rather than an invariant of this table.",
         "format": "x86-variable",
         "registerClass": "fpr",
         "variants": [
@@ -4221,6 +4232,17 @@
             "$comment": "FC3.5: MOVSS m32, xmm — F3 0F 11 /r (4-byte store).",
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
             "template": { "mandatoryPrefix": [243], "opcode": [15, 17] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem", "regClass": "gpr"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT: MOVUPS m128, xmm — 0F 11 /r, NO mandatory prefix (4-byte store is F3, 8-byte is F2, whole-register is neither). The WHOLE-REGISTER arm of this class's store verb, and the arm the target was missing: `fpr`'s registers are 16 bytes, so every frame move that carries one WHOLE — a callee-save under a convention that preserves it all, a spill slot, a SysV variadic SSE save slot — needs a width-128 encoding or it silently takes the 64-bit one. arm64's `fstur` has carried its width-128 (STUR Qt) variant since R1 of design A′; this is the same axis on the same kind of verb, which is why the fix is a variant here rather than a new mnemonic. ✔MEASURED under GNU as 2.42 (`gcc -c` + `objdump -d`): `movups %xmm6,0x20(%rsp)` = 0F 11 74 24 20 and `movups %xmm15,0x20(%rsp)` = 44 0F 11 7C 24 20 — the REX.R for the high half comes from hwEncoding, exactly as the two narrower variants already rely on. ⚠ MOVUPS, NOT MOVAPS, AND THE DIFFERENCE IS A FAULT RATHER THAN A BYTE: `frameSlotStride` makes a slot 16 bytes WIDE but nothing makes the frame base 16-byte ALIGNED, and MOVAPS raises #GP on a misaligned m128. MSVC can use MOVAPS because it aligns its own xmm save area; DSS's uniform-stride frame does not, so the unaligned form is the correct one here and is the same speed on every CPU this target reaches.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 128 },
+            "template": { "opcode": [15, 17] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg"     },
               { "index": 1, "slotKind": "modrm.rm.mem", "regClass": "gpr"  },

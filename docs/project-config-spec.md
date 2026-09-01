@@ -28,6 +28,10 @@
   "postBuildScripts": [{ "run": ["./sign.sh"],          // optional — argv hooks run AFTER a SUCCESSFUL build; see §2.5
                          "runOn": ["linux", "darwin"] }],
   "dependsOn":        [{ "path": "../libfoo" }],        // optional — prerequisite projects, RESOLVED and composed in (§2.6)
+  "dependencyArtifactCache": {                          // optional — cross-BUILD dependency artifact cache; see §2.8
+    "enabled": true,                                    //   all three members REQUIRED when the object is present
+    "rootOverrideVariable": "MY_DSS_CACHE_DIR",         //   NAMES the env var that overrides the location
+    "eviction": "prune-superseded" },                   //   or "retain"
 
   "$comment":         "prose — every `$`-prefixed key is documentation (§2.7)"
 }
@@ -55,6 +59,7 @@ delegates to the existing compile path — routing by source **count** (§5).
 | `preBuildScripts` | no | array of `{"run","runOn"}` objects | Commands run **before** the build. `run` is an **argv vector**, spawned directly — never a shell. See §2.5. |
 | `postBuildScripts` | no | array of `{"run","runOn"}` objects | Commands run **after** a build that **succeeded**. Same entry shape as `preBuildScripts`. See §2.5. |
 | `dependsOn` | no | array of `{"path"}` **or** `{"git","ref"?}` objects | Prerequisite projects, **resolved recursively** and folded into this build by the composition verb the *dependency's* `artifactProfile` declares (§3). See §2.6. |
+| `dependencyArtifactCache` | no | object with **all three** of `enabled` (boolean), `rootOverrideVariable` (non-empty string), `eviction` (`"prune-superseded"` \| `"retain"`) | The cross-**build** content-addressed cache for **dependency** artifacts. Read off the **root** manifest only — a dependency's own copy is never read, the same ruling as its `targets[]` (§2.6) and its `output`. Absent ⇒ no cache: nothing is looked up and nothing is written. See §2.8. |
 
 **The three flag arrays mirror the CLI flags and *merge* with them.** Each is **optional** and defaults to
 empty; an **absent** field and a **present-but-empty `[]`** both mean "no entries" (no error). A present value
@@ -660,6 +665,52 @@ The closed set is **not relaxed** — a non-`$` typo (`"ouput"`) still fails lou
 
 > The FFI shipped-library descriptor schema (`src/dss-config/shippedLibs/README.md`) remains
 > **stricter**: it permits `$comment` only, and a `$macrosComment`-style key fails loud there.
+
+### 2.8 `dependencyArtifactCache` — the cross-build dependency artifact cache (`D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION`)
+
+Two builds of one project at one configuration rebuild every `dependsOn` prerequisite from scratch,
+because nothing outlives the process. This member declares the policy for a **content-addressed**
+store that lets the second build **serve** a dependency's artifact instead of recompiling it.
+
+```jsonc
+"dependencyArtifactCache": {
+  "enabled": true,
+  "rootOverrideVariable": "MY_DSS_CACHE_DIR",
+  "eviction": "prune-superseded"
+}
+```
+
+- **★ The ROOT manifest only.** A dependency's own copy is **never** read — the same ruling that
+  ignores its `targets[]` (§2.6) and its `output`. Caching is a property of *the build*, and a graph
+  whose nodes each declared a policy would make "is this build cached?" a question with *N* answers
+  and no owner. The root's policy is propagated onto every sub-build alongside the build
+  configuration, the job count and the executor.
+- **★ It caches DEPENDENCY artifacts, not the root's own.** The root build is the thing the operator
+  is running: its artifact is the deliverable they will inspect and its sources are the ones being
+  edited. A prerequisite nobody is editing is the shape a content-addressed cache serves well.
+- **All three members are required when the object is present**, and the degenerate spelling
+  **rejects** rather than aliasing: `{"enabled": false}` alone would mean exactly what *omitting the
+  key* means, said less clearly, and a cache whose location override is unnamed is environment
+  sniffing with an extra step.
+- **`rootOverrideVariable` NAMES an environment variable — the loader never reads one.** Its value,
+  when set and non-empty, wins outright over every per-user platform default
+  (`%LOCALAPPDATA%`, `$XDG_CACHE_HOME`, `$HOME/.cache`) and is taken **verbatim**.
+- **`eviction`** — `"prune-superseded"` keeps one current entry per artifact name in a directory
+  (bounded disk); `"retain"` keeps every entry, which is what a branch-switching or bisecting
+  workflow needs, since under pruning two alternating revisions evict each other and both stay cold.
+- **What the key covers.** The **union of every compilation unit's textual input closure**
+  (`CompilationUnit::inputDigest()` — which is why a quote-`#include`d header that appears in **no**
+  `sources[]` still moves the key), the target spec, the object format and its archive-writing
+  sibling, debug/release, the LTO topology, the stack-reserve request, the artifact's base name,
+  every link input by path **and content**, every loaded config document by its loader's own content
+  digest, and the compiler's own build stamp.
+- **Absent ⇒ no cache at all.** Nothing is looked up and nothing is written, so every manifest
+  written before this member existed builds identically.
+- **A cache that cannot verify an entry REFUSES it.** An artifact whose key document is missing,
+  unreadable or different **fails the build** (`D_FileReadFailed`) rather than being quietly
+  recompiled around — that verification is what makes the short path index safe. A key that cannot
+  be *computed*, or a store that cannot *write*, is a different matter: it is an optimization made
+  unavailable, so the build compiles normally and says so on stderr on **every** affected run.
 
 ---
 

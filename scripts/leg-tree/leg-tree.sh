@@ -73,6 +73,108 @@ leg_tree_abs() {
     esac
 }
 
+# leg_tree_driver_identity <src>
+#
+# Sets LEG_TREE_DRIVER_BRANCH, LEG_TREE_DRIVER_SHA and LEG_TREE_DRIVER_GIT_DIR from
+# the DRIVER's checkout. Returns 0 on success, 1 when this namespace's git cannot
+# describe <src> at all. LEG_TREE_DRIVER_GIT_DIR is EMPTY when a plain `git -C` sees
+# the tree, and holds the resolved gitdir when it does not -- callers that need more
+# than the identity go through `leg_tree_driver_git` rather than reading it.
+#
+# ★★★ WHY THIS IS NOT `git -C "$SRC" rev-parse` AT EACH CALL SITE, WHICH IS WHAT THE
+# CARRIAGES USED TO DO. A LANE WORKTREE'S `.git` IS A FILE, AND ON A WINDOWS-CREATED
+# WORKTREE THAT FILE NAMES A WINDOWS-ABSOLUTE GITDIR.
+# ✔MEASURED 2026-08-31 (P47), from inside WSL against `.worktrees/sq`:
+#     $ cat .worktrees/sq/.git
+#     gitdir: C:/Source/DailySoftware/dss-code-prime/.git/worktrees/sq
+#     $ git -C /mnt/c/.../.worktrees/sq rev-parse HEAD
+#     fatal: not a git repository: /mnt/c/.../.worktrees/sq/C:/Source/.../.git/worktrees/sq
+# -- because `C:/...` is not absolute to a POSIX git, so it is JOINED to the worktree
+# path. Both POSIX carriages read the driver's identity from inside WSL over `/mnt/c`,
+# so BOTH died before moving a byte (`cannot read the driver's branch from ...`), and
+# `.worktrees/` is the SANCTIONED home for lane worktrees under the 2026-08-26 ruling.
+# ⇒ no lane could run a WSL, VPS or macOS leg from its own worktree:
+#   D-SCRIPT-CARRIAGES-CANNOT-IDENTIFY-A-CROSS-NAMESPACE-LANE-WORKTREE
+#
+# ★ THE FIX IS TO RESOLVE THE GITDIR, NOT TO LET THE CALLER DECLARE THE ANSWER. A
+# `--branch`/`--sha` escape hatch would let a driver ASSERT an identity instead of
+# READING one, and the identity is the single fact a leg's whole attribution rests on.
+# ⓘ It also covers the ordinary POSIX worktree, whose `.git` file may name a RELATIVE
+# gitdir -- resolved against <src>, which is what git itself does.
+leg_tree_driver_identity() {
+    _lt_src=$(leg_tree_abs "$1")
+    LEG_TREE_DRIVER_BRANCH=''
+    LEG_TREE_DRIVER_SHA=''
+    LEG_TREE_DRIVER_GIT_DIR=''
+    [ -n "$_lt_src" ] || return 1
+
+    # The ordinary case: a real repository, or a worktree whose gitdir resolves here.
+    if _lt_s=$(git -C "$_lt_src" rev-parse HEAD 2>/dev/null) && [ -n "$_lt_s" ]; then
+        _lt_b=$(git -C "$_lt_src" rev-parse --abbrev-ref HEAD 2>/dev/null)
+        [ -n "$_lt_b" ] || return 1
+        LEG_TREE_DRIVER_SHA="$_lt_s"; LEG_TREE_DRIVER_BRANCH="$_lt_b"
+        return 0
+    fi
+
+    # A worktree whose `.git` FILE names a gitdir this namespace cannot follow.
+    [ -f "$_lt_src/.git" ] || return 1
+    _lt_gd=$(sed -n 's/^gitdir: *//p' "$_lt_src/.git" | head -1)
+    [ -n "$_lt_gd" ] || return 1
+    # ★★ THE THREE CASES ARE TRIED IN THIS ORDER AND THE ORDER IS THE WHOLE OF IT.
+    # ✔MEASURED 2026-08-31, by getting it wrong first: resolving "not POSIX-absolute"
+    # as "relative to the worktree" BEFORE testing for a foreign absolute path turns
+    # `C:/Source/.../.git/worktrees/sq` into
+    # `/mnt/c/.../.worktrees/sq/C:/Source/.../.git/worktrees/sq` -- which is byte for
+    # byte the mangling git itself performs, i.e. the resolver reproduced the very
+    # defect it exists to undo, and returned "cannot describe this tree".
+    #   1. already a directory here            -> take it (POSIX-absolute, or relative
+    #                                             to a cwd that happens to be right)
+    #   2. FOREIGN-ABSOLUTE (`X:/…` / `X:\…`)  -> translate; only wslpath is claimed
+    #   3. anything else                       -> relative to the worktree, as git does
+    if [ ! -d "$_lt_gd" ]; then
+        case "$_lt_gd" in
+            [A-Za-z]:[/\\]*)
+                # ★ `wslpath` is WSL's own, shipped with the distro, and WSL is the
+                # ONLY namespace crossing these carriages make. A second translator
+                # here would be inventing a portability claim nothing has measured.
+                command -v wslpath >/dev/null 2>&1 || return 1
+                _lt_gd=$(wslpath -u "$_lt_gd" 2>/dev/null) || return 1
+                ;;
+            /*) ;;                              # POSIX-absolute and absent: nothing to try
+            *)  _lt_gd="$_lt_src/$_lt_gd" ;;    # git allows a gitdir relative to the worktree
+        esac
+    fi
+    [ -d "$_lt_gd" ] || return 1
+
+    _lt_s=$(git --git-dir="$_lt_gd" --work-tree="$_lt_src" rev-parse HEAD 2>/dev/null) || return 1
+    _lt_b=$(git --git-dir="$_lt_gd" --work-tree="$_lt_src" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
+    [ -n "$_lt_s" ] && [ -n "$_lt_b" ] || return 1
+    LEG_TREE_DRIVER_SHA="$_lt_s"; LEG_TREE_DRIVER_BRANCH="$_lt_b"
+    LEG_TREE_DRIVER_GIT_DIR="$_lt_gd"
+    return 0
+}
+
+# leg_tree_driver_git <src> <git-arg>...
+#
+# Run ONE git command against the DRIVER's checkout, in whichever namespace can see
+# it. Requires `leg_tree_driver_identity <src>` to have succeeded first -- it is that
+# call which decides whether a `--git-dir` is needed, and re-deciding here would be a
+# second answer to a question already answered.
+# ★ THIS EXISTS SO NO CALLER READS `LEG_TREE_DRIVER_GIT_DIR` ITSELF. A carriage wants
+# `git log -1` and `git status --porcelain` for its own report, and a bare `git -C`
+# for those returned `(no git)` and `0 path(s)` on a cross-namespace worktree -- the
+# second of which is byte-identical to the reading a genuinely pristine tree produces,
+# which is the failure mode the WSL carriage already names in its own attribution
+# block. One accessor keeps both halves of the report on the same git.
+leg_tree_driver_git() {
+    _lt_g_src=$(leg_tree_abs "$1"); shift
+    if [ -n "${LEG_TREE_DRIVER_GIT_DIR:-}" ]; then
+        git --git-dir="$LEG_TREE_DRIVER_GIT_DIR" --work-tree="$_lt_g_src" "$@"
+    else
+        git -C "$_lt_g_src" "$@"
+    fi
+}
+
 # leg_tree_prepare <repo> <branch> <sha>
 #
 # ⚠ `<sha>` is the DRIVER's HEAD. It is normally already on the remote, because a gate
@@ -132,7 +234,46 @@ leg_tree_prepare() {
     # operator-visible result was a bare "could not put" with the cause deleted
     # -- an error that hides its own diagnosis, which this project treats as a
     # defect in its own right.
-    if [ -n "$_lt_sha" ] && git cat-file -e "${_lt_sha}^{commit}" 2>/dev/null; then
+    #
+    # ★★★ A DETACHED DRIVER IS THE LANE-WORKTREE CASE, AND IT IS THE NORMAL CASE --
+    # NOT AN ERROR. Every one of the four carriages derives the branch it asks for
+    # with `git rev-parse --abbrev-ref HEAD`, and that command prints the LITERAL
+    # STRING `HEAD` when the driver is detached. A lane worktree created by
+    # `scripts/lane-worktree/` is detached BY CONSTRUCTION, and `.worktrees/` is the
+    # SANCTIONED home for lane worktrees under the 2026-08-26 ruling -- so the branch
+    # value that reaches this function from a lane is `HEAD`, on every carriage.
+    # ✔MEASURED 2026-08-31 (P47) in a throwaway repo outside the repository:
+    #     git checkout -B HEAD <sha>   ->   rc=128
+    #     fatal: 'HEAD' is not a valid branch name
+    # so the `-B` arm below could not move a detached driver's leg host at all, and
+    # every carriage died at `could not put <repo> on HEAD at <sha>` (rc 3) naming a
+    # branch that CANNOT exist -- git refuses `HEAD` as a branch name outright, which
+    # is what makes the string unambiguous here rather than merely conventional.
+    # ⇒ NO LANE COULD RUN A LEG. That is the whole reason this arm exists, and it is
+    # a REAL defect in the standard rather than a convenience:
+    #   D-SCRIPT-LEG-TREE-REFUSES-A-DETACHED-DRIVER
+    # ★ THE LEG HOST IS PUT DETACHED AT THE SAME COMMIT, which is the honest mirror of
+    # what the driver IS. Inventing a branch name here would be worse than failing:
+    # the leg host's `git log` is the ONLY record of which commit a leg measured, and
+    # a fabricated branch would make two different lanes' trees answer to one name.
+    # ⚠ NO FALLBACK ARM, deliberately: a detached driver has no branch to fall back
+    # to, so a host that does not carry the commit is refused rather than silently
+    # measured at whatever it happened to be sitting on. That is the opposite trade
+    # from the branch case below, and it is forced -- there, `checkout <branch>` still
+    # lands on a tree the sync then overwrites and the ONLY casualty is the baseline
+    # `dirty` is read against; here there is no such second-best target to name.
+    if [ "$_lt_branch" = "HEAD" ]; then
+        [ -n "$_lt_sha" ] \
+            || leg_tree_die "the driver is DETACHED (branch reads as the literal 'HEAD') but named no commit. A detached driver has no branch to fall back to, so the sha is the only thing that can identify the tree under test." 4
+        git cat-file -e "${_lt_sha}^{commit}" 2>/dev/null \
+            || leg_tree_die "the driver is DETACHED at $_lt_sha and this host does not carry that commit (fetch=$_lt_fetch). Push it, or run the leg from a checkout that is on a branch -- there is no branch here to fall back to." 3
+        git checkout --quiet --detach "$_lt_sha" \
+            || leg_tree_die "could not put $_lt_repo at detached $_lt_sha (git's reason is directly above)" 3
+        _lt_at="$_lt_sha"
+        printf '! leg-tree: the driver is DETACHED, so %s is put DETACHED at %s rather than on a branch.\n' \
+            "$_lt_repo" "$_lt_sha" >&2
+        printf '  That is the honest mirror of the driver (a lane worktree), not a degraded mode.\n' >&2
+    elif [ -n "$_lt_sha" ] && git cat-file -e "${_lt_sha}^{commit}" 2>/dev/null; then
         git checkout --quiet -B "$_lt_branch" "$_lt_sha" \
             || leg_tree_die "could not put $_lt_repo on $_lt_branch at $_lt_sha (git's reason is directly above)" 3
         _lt_at="$_lt_sha"

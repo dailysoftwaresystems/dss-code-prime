@@ -5,10 +5,18 @@
 // `computeFrameLayout` sized its two uniform-stride frame areas — the saved-
 // register area and the spill area — with `max(widthForClass(GPR),
 // widthForClass(FPR))`: a TWO-MEMBER ENUMERATION of a register-class
-// vocabulary that has more members than that. arm64 declares `vr` at
-// `widthBytes` 16 while its `gpr` and `fpr` are both 8, so the stride came out
+// vocabulary that has more members than that. arm64 declared `vr` at
+// `widthBytes` 16 while its `gpr` and `fpr` were both 8, so the stride came out
 // 8 and a spilled VR value was accessed SIXTEEN bytes wide inside an EIGHT-byte
 // slot.
+//
+// ⚠ THAT CONFIG NO LONGER EXISTS, AND THE FILE IS ABOUT THE DERIVATION RATHER
+// THAN ABOUT arm64. R1 of design A′ made arm64 declare its SIMD&FP file ONCE,
+// so the 16-byte rows are class `fpr` and `max(GPR, FPR)` covers them —
+// ✔RE-MEASURED, arm64's floor is now 16 rather than 8, which is a real change
+// to every arm64 frame and is exactly what arm (A) checks stays consistent.
+// The historical measurement below is kept as the record of WHY the
+// enumeration was wrong; arm (C) reproduces the shape on a fixture.
 //
 // ✔MEASURED 2026-08-23 (cycle P28) on the shipped arm64 release pipeline, two
 // `"w"` (VR-class) inline-asm outputs in one function, disassembled with
@@ -37,10 +45,14 @@
 //       stride a function with a spill of class C gets is ≥ C's register
 //       width. Stated over the whole `LirRegClass` vocabulary, so a new class
 //       is covered on the day it is declared.
-//   (C) THE DEFECT'S OWN SHAPE — arm64 really does declare a class wider than
-//       both of the two the old expression named, which is the precondition
-//       that made the enumeration wrong. If that stops being true this file
-//       is pinning nothing and should say so out loud.
+//   (C) THE DEFECT'S OWN SHAPE — ⚠ AND IT IS NO LONGER PRESENT IN THE SHIPPED
+//       CORPUS, WHICH THIS ARM SAYS OUT LOUD RATHER THAN QUIETLY PASSING. It
+//       required a shipped target to declare a class WIDER than both GPR and
+//       FPR, "or this file is pinning nothing". R1 of design A′ folded arm64's
+//       16-byte `vr` file INTO `fpr`, so `max(GPR, FPR)` now covers every
+//       class on both targets and the precondition is gone. The derivation is
+//       therefore pinned by a SYNTHESIZED wider class instead of by the
+//       corpus — never by observing that the corpus happens not to need it.
 
 #include "core/types/target_schema.hpp"
 #include "lir/lir_callconv.hpp"
@@ -80,30 +92,62 @@ constexpr std::size_t kRegClassCount =
 
 } // namespace
 
-// ── (C) THE DEFECT'S OWN SHAPE ──────────────────────────────────────────────
+// ── (C) THE DEFECT'S OWN SHAPE, SYNTHESIZED ─────────────────────────────────
 //
-// ⚠ This arm runs FIRST in intent: it establishes that a class wider than both
-// GPR and FPR exists on a shipped target. Without it the rest of the file could
-// pass on a corpus where the old two-member expression was accidentally right.
-TEST(LirFrameSlotStride, AShippedTargetDeclaresAClassWiderThanItsGprAndFpr) {
-    bool sawWiderClass = false;
-    for (char const* const t : kTargets) {
-        auto s = TargetSchema::loadShipped(t);
-        ASSERT_TRUE(s.has_value());
-        auto const floorWidth = std::max(widestIn(**s, TargetRegClass::GPR),
-                                         widestIn(**s, TargetRegClass::FPR));
-        for (std::size_t i = 0; i < kRegClassCount; ++i) {
-            auto const cls = static_cast<TargetRegClass>(i);
-            if (cls == TargetRegClass::GPR || cls == TargetRegClass::FPR) continue;
-            if (widestIn(**s, cls) > floorWidth) sawWiderClass = true;
-        }
-    }
-    ASSERT_TRUE(sawWiderClass)
-        << "no shipped target declares a register class wider than its GPR and "
-           "FPR classes, so `max(GPR, FPR)` would be a correct stride and this "
-           "file asserts nothing — a vacuous pass is what this arm prevents. "
-           "arm64's `vr` (widthBytes 16, against gpr/fpr at 8) is the case that "
-           "made the enumeration wrong";
+// ⚠⚠ WHAT THIS ARM USED TO ASSERT AND WHY IT COULD NOT SURVIVE UNCHANGED. It
+// was `AShippedTargetDeclaresAClassWiderThanItsGprAndFpr`, and it walked both
+// shipped targets requiring SOME class wider than `max(GPR, FPR)` — "arm64's
+// `vr` (widthBytes 16, against gpr/fpr at 8) is the case that made the
+// enumeration wrong". ✔That was a true measurement of a config that declared
+// arm64's SIMD&FP file TWICE. R1 of design A′ declared it ONCE: the 16-byte
+// rows are class `fpr` now, arm64 declares no `vr` register at all, and
+// `max(GPR, FPR)` covers every class on both targets. The precondition the
+// whole file rested on is therefore ABSENT FROM THE CORPUS.
+//
+// ★★★ WHICH MAKES THE DERIVATION SOMETHING ONLY A SYNTHESIZED NEGATIVE CAN
+// PIN. If this arm were merely deleted, arms (A) and (B) would still pass on a
+// corpus where the two-member `max(GPR, FPR)` is accidentally right — exactly
+// the vacuous green the original arm existed to prevent, arrived at by the
+// opposite route. So the wider class is BUILT here: a fixture target whose
+// `vr` rows are 32 bytes against 8-byte gpr/fpr, which the derivation must
+// cover and the old enumeration could not.
+TEST(LirFrameSlotStride, AWiderClassRaisesTheStrideAboveTheGprFprFloor) {
+    // ⓘ Written as a document rather than a mutated shipped target: the point
+    // is a class the corpus does NOT have, so there is nothing to mutate.
+    auto s = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"wideVectorFixture"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[
+              {"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0},
+              {"name":"sp","class":"gpr","widthBytes":8,"hwEncoding":1},
+              {"name":"f0","class":"fpr","widthBytes":8,"hwEncoding":0},
+              {"name":"z0","class":"vr","widthBytes":32,"hwEncoding":0}],
+            "callingConventions":[
+              {"name":"cc","argGprs":["x0"],"argFprs":["f0"],
+               "stackPointer":"sp","stackAlignment":16}
+            ]})",
+        "<inline>");
+    ASSERT_TRUE(s.has_value())
+        << "the fixture target must load, or this arm measures nothing";
+
+    auto const floorWidth = std::max(widestIn(**s, TargetRegClass::GPR),
+                                     widestIn(**s, TargetRegClass::FPR));
+    ASSERT_EQ(floorWidth, 8u);
+    ASSERT_EQ(widestIn(**s, TargetRegClass::VR), 32u)
+        << "the fixture must really declare a class wider than both of the two "
+           "the old expression named — that width IS the precondition";
+
+    // The floor is untouched by a class nobody spills…
+    EXPECT_EQ(frameSlotStrideForClasses(**s, {}), floorWidth)
+        << "a class that occupies no slot must not inflate every frame";
+    EXPECT_EQ(frameSlotStrideForClasses(**s, {LirRegClass::FPR}), floorWidth);
+    // …and RAISED by one that does. `max(GPR, FPR)` answers 8 here, which is
+    // the arm64 `ldur q0,[sp,#16]` / `ldur q1,[sp,#24]` overlap this file
+    // records, reproduced on a config that still has the shape.
+    EXPECT_EQ(frameSlotStrideForClasses(**s, {LirRegClass::VR}), 32u)
+        << "the stride did not cover the widest OCCUPANT — two 32-byte slots "
+           "at an 8-byte stride overlap by 24 bytes and the second reads past "
+           "the top of the frame";
 }
 
 // ── (A) THE FLOOR IS INTACT ─────────────────────────────────────────────────

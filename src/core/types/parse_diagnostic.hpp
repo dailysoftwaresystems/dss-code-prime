@@ -1263,17 +1263,23 @@ enum class DiagnosticCode : std::uint16_t {
     S_InlineAsmNonEmptyTemplate = 0xE057,
 
     // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: a bit-field MUTATION in a
-    // compound / inc-dec / value position through a base form the single-field
-    // reconstruction cannot address — a field reached via an ANONYMOUS struct/union
-    // member (needs the intermediate MemberAccess hop chain) or an ARRAY-arrow base
-    // (`sarr->bf`, C 6.3.2.1p3 decay). The bit-field-safe `classifyMemberLvalue`
-    // reconstruction (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION) handles NAMED `.`/`->`
-    // bases only; these residual bases would otherwise fall to the generic via-ptr
-    // path, whose full-unit store CLOBBERS packed neighbours + skips truncation — a
-    // silent miscompile. FAIL LOUD instead (statement plain-`=` stays correct via
-    // `lowerAssign`; use a named member, or split the mutation). NON-bit-field
-    // members through the same bases are unaffected (they take the correct generic
-    // scalar store). Renders error[S0058].
+    // compound / inc-dec / value position whose CONTAINING AGGREGATE the
+    // bit-field-safe `classifyMemberLvalue` reconstruction could not address. Such a
+    // mutation would otherwise fall to the generic via-ptr path, whose full-unit
+    // store CLOBBERS packed neighbours + skips truncation — a silent miscompile — so
+    // it fails loud instead. NON-bit-field members are unaffected (the generic
+    // scalar store is correct for them); statement plain-`=` never routes through
+    // the reconstruction at all (`lowerAssign` passes the raw MemberAccess through).
+    // ⓘ This is now a SHOULD-NEVER-FIRE structural invariant, and is kept as one on
+    // purpose. It used to ENUMERATE two unaddressable base shapes — a field behind
+    // ANONYMOUS struct/union members, and an ARRAY-arrow decay base (`sarr->bf`,
+    // C 6.3.2.1p3) — both of which the multi-hop member-path `Lvalue` supports as of
+    // 2026-08-31 (gcc 13.3.0 / clang 18.1.3 / mingw-w64 gcc 13.2.0 compile AND run
+    // both; MSVC 19.51 accepts both). What remains is every OTHER decline, all of
+    // them type-resolution failures the generic path also reports. Stated as "any
+    // decline" rather than as a shape list, it cannot be silently re-opened by a
+    // future base shape merely failing to be enumerated — which is exactly how this
+    // class of silent miscompile arrived the first time. Renders error[S0058].
     S_BitfieldMutationUnsupportedBase = 0xE058,
 
     // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the `inline` function

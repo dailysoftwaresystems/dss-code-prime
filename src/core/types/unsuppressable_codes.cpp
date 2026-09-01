@@ -1582,11 +1582,14 @@ constexpr std::array<UnsuppressableEntry, 168> kUnsuppressableCodes{{
     // exactly two and the compiler picks one in silence.
     {DiagnosticCode::S_InlineAsmDuplicateSymbolicName, kWhyAsmDuplicateSymbolicName},
     // S_BitfieldMutationUnsupportedBase (D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL):
-    // a bit-field compound/inc-dec/value mutation through an anonymous-
-    // member or array-arrow base. Suppressed, the mutation falls to the generic
-    // via-ptr path whose full-unit store CLOBBERS packed neighbours + skips
-    // truncation — a silent miscompile. Same silent-miscompile-guard class as the
-    // S_Vla* / S_InlineAsmNonEmptyTemplate siblings above.
+    // a bit-field compound/inc-dec/value mutation whose containing aggregate the
+    // read-modify-write reconstruction could not address. Suppressed, the mutation
+    // falls to the generic via-ptr path whose full-unit store CLOBBERS packed
+    // neighbours + skips truncation — a silent miscompile. Same silent-miscompile-
+    // guard class as the S_Vla* / S_InlineAsmNonEmptyTemplate siblings above.
+    // ⓘ The anonymous-member and array-arrow bases it once named are SUPPORTED as of
+    // 2026-08-31; the code stays as the should-never-fire backstop for every other
+    // decline, and stays UNSUPPRESSABLE because what it guards has not changed.
     {DiagnosticCode::S_BitfieldMutationUnsupportedBase, kWhyBitfieldMutation},
     // S_UnknownAttribute / S_DeprecatedSymbolUsed / S_NodiscardResultDiscarded
     // (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13) are deliberately NOT

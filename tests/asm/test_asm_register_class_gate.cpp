@@ -229,44 +229,86 @@ TEST(RegisterClassGate, GprTagOnAnFprOrdinalIsRefusedEvenInAnFprField) {
 
 // ── fixed32 shape: the SAME gate, no second implementation ───────────────
 
-// arm64's `fstur_q` is `STUR Qt` — the target binds it as the VECTOR class's
-// store, so its data field draws from `vr`. `d0` (the 64-bit `fpr` VIEW of the
-// same register file) is the wrong-width, wrong-class operand that produced
-// RIGHT-LOOKING bytes for as long as it went unchecked, because `d0` and `v0`
-// share hardware encoding 0.
-TEST(RegisterClassGate, Arm64QFormStoreRefusesTheNarrowFprView) {
+// arm64's Q-form store is `STUR Qt` — `fstur` at WIDTH 128, one of that row's
+// three width variants since R2 of design A′. Its data field draws from `fpr`,
+// like every other width of the same row.
+//
+// ⚠⚠ TWO ARMS STOOD HERE AND BOTH ASSERTED A CLASS THIS TARGET NO LONGER HAS.
+// `Arm64QFormStoreRefusesTheNarrowFprView` passed `d0` (class `fpr`) to a
+// `fstur_q` whose data field drew from `vr`, and expected the refusal
+// `rd: 'vr' bank, 'fpr'-class`. `Arm64QFormStoreAcceptsTheVrView` was its
+// control, passing `v0` tagged `LirRegClass::VR`. With arm64's SIMD&FP file
+// declared ONCE (R1), `v0` and `d0` are both `fpr`, the Q form's `rd` wire
+// banks `fpr`, and there is no `vr` register anywhere — so the first arm's
+// refusal cannot fire and the second arm's operand would itself be refused.
+//
+// ★★★ AND THE GUARANTEE THE FIRST ARM CARRIED IS GENUINELY NOT A CLASS
+// QUESTION ANY MORE — STATED PLAINLY RATHER THAN QUIETLY REPLACED. `d0` in a
+// width-128 `fstur` now encodes `STUR Q0` and the bytes are CORRECT, because
+// `d0` is a declared view of `v0` and the sixteen bytes come from the
+// INSTRUCTION's width rather than from the operand's row. The operand and the
+// instruction can no longer disagree about how many bytes move, which is what
+// D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD was about. What keeps a view
+// out of the places that would matter is D-TARGET-CC-NAMES-SUB-REGISTER at
+// load time (pinned in `tests/core/test_target_subregister_validation` and in
+// `tests/lir/test_lir_aliased_view_allocability`), not this gate.
+//
+// ⇒ The two arms are replaced by the claim this gate CAN still make about the
+// Q form: a GPR in its data field is refused, and the width flag is what
+// elects the Q encoding.
+TEST(RegisterClassGate, Arm64QFormStoreRefusesAGprDataOperand) {
     auto s = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(s.has_value());
-    auto const op = (*s)->opcodeByMnemonic("fstur_q");
+    auto const op = (*s)->opcodeByMnemonic("fstur");
     ASSERT_TRUE(op.has_value());
     auto const o = encodeOne(**s, [&](LirBuilder& b) {
         LirOperand const ops[] = {
-            LirOperand::makeReg(physReg(**s, "d0", LirRegClass::FPR)),
+            LirOperand::makeReg(physReg(**s, "x2", LirRegClass::GPR)),
             LirOperand::makeReg(physReg(**s, "x1", LirRegClass::GPR)),
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0)};
-        (void)b.addInst(*op, InvalidLirReg, ops);
+        (void)b.addInst(*op, InvalidLirReg, ops, /*payload=*/0,
+                        kLirInstFlagWidth128);
     });
-    EXPECT_GT(o.errors, 0u);
-    expectNamesTheClassMismatch(o, "rd", "vr", "fpr");
+    EXPECT_GT(o.errors, 0u)
+        << "an integer register in the SIMD&FP data field would encode a "
+           "DIFFERENT physical register with valid-looking bytes";
+    expectNamesTheClassMismatch(o, "rd", "fpr", "gpr");
 }
 
-TEST(RegisterClassGate, Arm64QFormStoreAcceptsTheVrView) {
+TEST(RegisterClassGate, Arm64QFormStoreAcceptsTheFullFpRegisterAtWidth128) {
     auto s = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(s.has_value());
-    auto const op = (*s)->opcodeByMnemonic("fstur_q");
+    auto const op = (*s)->opcodeByMnemonic("fstur");
     ASSERT_TRUE(op.has_value());
-    auto const o = encodeOne(**s, [&](LirBuilder& b) {
-        LirOperand const ops[] = {
-            LirOperand::makeReg(physReg(**s, "v0", LirRegClass::VR)),
-            LirOperand::makeReg(physReg(**s, "x1", LirRegClass::GPR)),
-            LirOperand::makeMemBase(1),
-            LirOperand::makeMemOffset(0)};
-        (void)b.addInst(*op, InvalidLirReg, ops);
-    });
-    EXPECT_EQ(o.errors, 0u) << o.joined;
-    ASSERT_GE(o.bytes.size(), 4u);
-    EXPECT_EQ(o.bytes[3], 0x3C) << "STUR Q — 0x38 would be STURB";
+    auto const emit = [&](std::uint8_t flags) {
+        return encodeOne(**s, [&](LirBuilder& b) {
+            LirOperand const ops[] = {
+                LirOperand::makeReg(physReg(**s, "v0", LirRegClass::FPR)),
+                LirOperand::makeReg(physReg(**s, "x1", LirRegClass::GPR)),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0)};
+            (void)b.addInst(*op, InvalidLirReg, ops, /*payload=*/0, flags);
+        });
+    };
+
+    auto const q = emit(kLirInstFlagWidth128);
+    EXPECT_EQ(q.errors, 0u) << q.joined;
+    ASSERT_GE(q.bytes.size(), 4u);
+    EXPECT_EQ(q.bytes[3], 0x3C) << "STUR Q — 0x38 would be STURB";
+
+    // ★ THE WIDTH IS WHAT ELECTS THE Q FORM, AND THIS IS THE ARM THAT SAYS SO.
+    // The same opcode and the same operands at the width-DEFAULT (64) must
+    // encode the D form — a DIFFERENT instruction moving eight bytes. Without
+    // this control, an implementation that ignored the width flag entirely
+    // would pass the arm above.
+    auto const d = emit(0);
+    EXPECT_EQ(d.errors, 0u) << d.joined;
+    ASSERT_GE(d.bytes.size(), 4u);
+    EXPECT_EQ(d.bytes[3], 0xFC) << "STUR Dt at the width default";
+    EXPECT_NE(q.bytes[3], d.bytes[3])
+        << "the width flag changed nothing — the Q form is not being elected "
+           "by width, so a 16-byte access would silently emit an 8-byte store";
 }
 
 // A GPR in arm64's FP arithmetic — the fixed32 twin of the x86 pin, so the
@@ -368,14 +410,27 @@ TEST(RegisterClassGate, ShippedDocumentsDeclareTheMixedClassFields) {
 
     auto a = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(a.has_value());
-    auto const* fsturQ = (*a)->opcodeInfo(*(*a)->opcodeByMnemonic("fstur_q"));
-    ASSERT_NE(fsturQ, nullptr);
-    ASSERT_FALSE(fsturQ->encoding.variants.empty());
-    auto const& qv = fsturQ->encoding.variants[0];
-    ASSERT_FALSE(qv.wires.empty());
-    EXPECT_EQ(encodingWireRegClass(fsturQ->encoding, qv.wires[0]),
-              TargetRegClass::VR)
-        << "STUR Qt moves 16 bytes, so its data operand is the 128-bit V view";
+    auto const* fstur = (*a)->opcodeInfo(*(*a)->opcodeByMnemonic("fstur"));
+    ASSERT_NE(fstur, nullptr);
+    ASSERT_GT(fstur->encoding.variants.size(), 1u)
+        << "`fstur` must carry its width variants — the Q form is one of them "
+           "since R2 of design A′, not a separate mnemonic";
+    // ⚠ THIS USED TO READ THE OPCODE `fstur_q` AND EXPECT `TargetRegClass::VR`,
+    // with the reason "STUR Qt moves 16 bytes, so its data operand is the
+    // 128-bit V view". The bytes moved are still sixteen; what changed is that
+    // the width says so instead of a second register class. EVERY width of this
+    // row banks the SAME class, and that uniformity is the assertion — a row
+    // whose widest arm banked something else would be the double declaration
+    // coming back through the encoding table.
+    for (auto const& v : fstur->encoding.variants) {
+        ASSERT_FALSE(v.wires.empty());
+        EXPECT_EQ(encodingWireRegClass(fstur->encoding, v.wires[0]),
+                  TargetRegClass::FPR)
+            << "every width of the SIMD&FP store draws its data operand from "
+               "ONE class; a per-width class is one physical file declared "
+               "twice, which is "
+               "D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS";
+    }
 }
 
 // EVERY register-bearing field of BOTH shipped targets resolves to a bank.

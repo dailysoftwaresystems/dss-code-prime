@@ -2917,15 +2917,33 @@ struct Lowerer {
         TypeId                 ptrType{};    // via-ptr only: interner.pointer(member ? container : type)
         std::vector<HirNodeId> prep;         // via-ptr only: [ var ptr = &<lvalue-or-aggregate> ]
         // D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION: a bit-field-safe MEMBER lvalue.
-        // When `member`, the temp pointer addresses the CONTAINING AGGREGATE (not
-        // the bit-field sub-unit), and `lvRead`/`lvWrite` reconstruct
-        // `MemberAccess(Deref(ptr), memberFieldIdx)` so the MIR bit-field
-        // read-modify-write chokepoint (`bitfieldPlacementOf`) fires for the
-        // compound/inc-dec/value forms too — not just statement plain-`=`. The
+        // When `memberPath` is non-empty, the temp pointer addresses the CONTAINING
+        // AGGREGATE (not the bit-field sub-unit), and `lvRead`/`lvWrite` reconstruct
+        // `MemberAccess(… MemberAccess(Deref(ptr), hop) …, field)` so the MIR
+        // bit-field read-modify-write chokepoint (`bitfieldPlacementOf`) fires for
+        // the compound/inc-dec/value forms too — not just statement plain-`=`. The
         // Deref re-types to `containerType`; the reconstructed node's type is `type`.
-        bool                   member = false;
-        std::uint32_t          memberFieldIdx = 0;
+        //
+        // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: the path is a CHAIN, not
+        // a single index, because a field can sit behind one or more ANONYMOUS
+        // struct/union members (C11/C23 §6.7.2.1 ¶13) — `s.a` where `a` is declared
+        // inside an anonymous struct is `s.<anon>.a`, two MemberAccess hops. A
+        // single index cannot name it, and falling back to the generic via-ptr path
+        // would full-unit-store the packed allocation unit (clobbering neighbours,
+        // skipping truncation). The chain is ordered OUTERMOST→INNERMOST with the
+        // FINAL entry the field itself, and mirrors `combineMember`'s anon-hop
+        // synthesis exactly, so the reconstructed node is the same shape the
+        // rvalue/statement member access builds.
+        struct MemberHop {
+            std::uint32_t fieldIndex = 0;
+            TypeId        type{};     // this hop's access type (container-qualified)
+        };
+        std::vector<MemberHop> memberPath;       // empty ⇒ a non-member via-ptr lvalue
         TypeId                 containerType{};  // the aggregate type (the Deref's result type)
+        // c21: the FINAL field is `volatile`-DECLARED. `combineMember` stamps this
+        // on its MemberAccess through `recordMemberVolatility`; the reconstruction
+        // stamps it too, so the two renditions of the same access cannot drift.
+        bool                   volatileField = false;
     };
 
     // One work-stack frame. Only the DEEP arms allocate a frame; the per-arm
@@ -8927,19 +8945,33 @@ struct Lowerer {
 
     // The HIR node denoting the lvalue itself — used as a fresh rvalue READ or as
     // an assign TARGET. `simple` → `Ref(sym)`. via-ptr non-member → `Deref(ptr)`.
-    // via-ptr MEMBER → `MemberAccess(Deref(ptr), fieldIdx)` reconstructed so the
-    // MIR bit-field chokepoint fires (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION); a
+    // via-ptr MEMBER → the `memberPath` chain rebuilt over `Deref(ptr)` so the MIR
+    // bit-field chokepoint fires (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION); a
     // NON-bit-field member reconstructs to the SAME MemberAccess a plain `s.x = v`
     // uses, i.e. a plain scalar store/load — unaffected. Each call mints FRESH
     // nodes (HIR is a strict single-parent tree), all referencing the ONE temp
     // pointer bound in `prep`, so the base's side effects run exactly once.
+    //
+    // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: the chain walk is what lets
+    // a field behind ANONYMOUS struct/union members be addressed — one hop per
+    // anonymous ancestor, then the field. A one-hop chain is the ordinary named
+    // member, so the named and anonymous cases are ONE code path, not two.
     [[nodiscard]] HirNodeId lvNode(Lvalue const& lv) {
         if (lv.simple) return builder.makeRef(lv.type, lv.sym.v);
-        HirNodeId const base = builder.makeDeref(
+        HirNodeId node = builder.makeDeref(
             builder.makeRef(lv.ptrType, lv.sym.v),
-            lv.member ? lv.containerType : lv.type, HirFlags::Synthetic);
-        if (!lv.member) return base;
-        return builder.makeMemberAccess(base, lv.memberFieldIdx, lv.type, HirFlags::Synthetic);
+            lv.memberPath.empty() ? lv.type : lv.containerType, HirFlags::Synthetic);
+        for (Lvalue::MemberHop const& hop : lv.memberPath)
+            node = builder.makeMemberAccess(node, hop.fieldIndex, hop.type,
+                                            HirFlags::Synthetic);
+        // c21: stamp the FINAL field's own `volatile` exactly as `combineMember`
+        // does (`recordMemberVolatility`). The MIR site ORs the node attribute with
+        // the access TYPE's qualifier, so today the type arm alone would carry it —
+        // but the two renditions of one access must be the same node, or a future
+        // change to either arm silently splits them.
+        if (lv.volatileField && !lv.memberPath.empty())
+            volatileAcc.push_back({node, VolatileAttr{/*isVolatile=*/true}});
+        return node;
     }
     [[nodiscard]] HirNodeId lvRead(Lvalue const& lv) { return lvNode(lv); }
     [[nodiscard]] HirNodeId lvWrite(Lvalue const& lv, HirNodeId value) {
@@ -8963,29 +8995,21 @@ struct Lowerer {
     // to the SAME MemberAccess a plain `s.x = v` uses (a plain scalar store) — so
     // it is behaviour-preserving. The base is lowered EXACTLY once, so its side
     // effects (`arr[i++].a`, `f()->a`) run once. Returns nullopt (→ the generic
-    // path, whose behaviour is unchanged) for a non-member lvalue, an anonymous-
-    // member field (which needs intermediate hops the single-MemberAccess
-    // reconstruction cannot synthesize), an array-arrow base, or an unresolved
-    // member — none of which regress. Field resolution + the container-volatility
-    // qualification mirror `combineMember` EXACTLY (shared `resolveMemberField` +
-    // `volatileQualifiedAccess`), so the reconstructed node is byte-identical to
-    // the rvalue/statement member access.
-    // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: FAIL LOUD when a BIT-FIELD is
-    // mutated (compound / inc-dec / value position) through a base the single-field
-    // reconstruction cannot address — an anonymous-member hop chain or an array-arrow
-    // decay. Returning nullopt into the generic via-ptr path would silently
-    // full-unit-store (clobber neighbours + skip truncation); the emitted error makes
-    // the HIR tier unclean so the compile aborts (`tierClean`, compile_pipeline.cpp)
-    // — never a wrong binary. NON-bit-field members through the same bases stay on the
-    // (correct) generic scalar-store path; statement plain-`=` never routes here.
-    [[nodiscard]] std::optional<Lvalue> bitfieldBaseUnsupported(NodeId core) {
-        emitH(DiagnosticCode::S_BitfieldMutationUnsupportedBase, core,
-              "bit-field compound-assignment / increment / value-position mutation "
-              "through an anonymous member or an array-arrow base is not yet "
-              "supported (the read-modify-write cannot address the packed allocation "
-              "unit here) — use a named member, or a plain `=` statement");
-        return std::nullopt;
-    }
+    // path, whose behaviour is unchanged) for a non-member lvalue, an unresolved
+    // member, or a base whose TYPE did not resolve — none of which regress. Field
+    // resolution, the anonymous-member hop chain, the array-arrow decay and the
+    // container-volatility qualification mirror `combineMember` EXACTLY (shared
+    // `resolveMemberField` + the same `coerce` decay arm + `volatileQualifiedAccess`
+    // + `recordMemberVolatility`'s predicate), so the reconstructed node is
+    // byte-identical to the rvalue/statement member access.
+    // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: the two shapes the ORIGINAL
+    // single-index reconstruction could not address — a field behind ANONYMOUS
+    // struct/union members (`s.<anon>.bf`), and an ARRAY-arrow decay base
+    // (`sarr->bf`, C 6.3.2.1p3) — are first-class here now, so a bit-field mutation
+    // through either is an ordinary read-modify-write. They were REFUSED before
+    // (loudly — never miscompiled), and ✔MEASURED 2026-08-31 gcc 13.3.0, clang
+    // 18.1.3 and mingw-w64 gcc 13.2.0 all COMPILE AND RUN both correctly, MSVC
+    // 19.51 accepts both at the front end — so DSS must.
 
     [[nodiscard]] std::optional<Lvalue> classifyMemberLvalue(NodeId core) {
         NodeId baseN{}, subscriptN{};
@@ -8994,29 +9018,44 @@ struct Lowerer {
             return std::nullopt;
         auto const rf = resolveMemberField(core);
         if (!rf) return std::nullopt;                       // unresolved → generic (fail-loud there)
-        // D5.1: a bit-field field carries a resolved `: width` on its record — the
-        // detector for the fail-loud residual below (container-independent, so it
-        // works through an anonymous-member chain the generic path can't reconstruct).
+        // D5.1: a bit-field field carries a resolved `: width` on its record. PAST
+        // THIS POINT a nullopt return would drop a bit-field mutation onto the
+        // generic via-ptr path — a SILENT full-unit store — so every one of them
+        // routes through `declineMemberLvalue`, which fails loud instead.
         bool const isBitfield = rf->frec->bitFieldWidth.has_value();
-        if (!rf->frec->anonAncestorPath.empty())            // anon-member hop chain
-            return isBitfield ? bitfieldBaseUnsupported(core) : std::nullopt;
+        // FC16 anon-member promotion: resolve the ancestor RECORDS *before* lowering
+        // the base, so a missing one cannot leave an orphaned HIR subtree behind
+        // (the pre-fix array-arrow refusal lowered `baseN` and then bailed).
+        std::vector<SymbolRecord const*> anonAncestors;
+        anonAncestors.reserve(rf->frec->anonAncestorPath.size());
+        for (SymbolId ancestorSym : rf->frec->anonAncestorPath) {
+            auto const* arec = model.recordFor(ancestorSym);
+            if (arec == nullptr)                            // combineMember reports it
+                return declineMemberLvalue(core, isBitfield);
+            anonAncestors.push_back(arec);
+        }
         bool const thruPtr = (e->target == "MemberAccessThruPtr");
-        E const base = lowerExpr(baseN);                    // the aggregate / pointer, lowered ONCE
-        if (!base.type.valid()) return std::nullopt;
+        E base = lowerExpr(baseN);                          // the aggregate / pointer, lowered ONCE
+        if (!base.type.valid()) return declineMemberLvalue(core, isBitfield);
         TypeId containerType{}, ptrType{};
         HirNodeId aggPtr{};
         if (thruPtr) {
-            // `p->field`: the aggregate pointer IS the base value. An ARRAY-arrow
-            // base (c82 arrow-decay) can't be addressed by this reconstruction: a
-            // bit-field there FAILS LOUD (else a silent full-unit store), a
-            // non-bit-field defers to the (correct) generic path.
-            if (interner.kind(base.type) != TypeKind::Ptr
-                || interner.operands(base.type).empty()
-                || !interner.operands(base.type)[0].valid()) {
-                if (isBitfield && interner.kind(base.type) == TypeKind::Array)
-                    return bitfieldBaseUnsupported(core);
-                return std::nullopt;
+            // c82 (D-CSUBSET-ARRAY-ARROW-DECAY, C 6.3.2.1p3 + 6.5.2.3): an ARRAY
+            // base decays to a pointer to its first element BEFORE the arrow's
+            // deref. Reuse the ONE `coerce` Array→Ptr arm `combineMember` uses, so
+            // the bound pointer is the same value, through the same Cast shape, the
+            // rvalue path produces.
+            if (interner.kind(base.type) == TypeKind::Array
+                && !interner.operands(base.type).empty()
+                && interner.operands(base.type)[0].valid()) {
+                base = coerce(base, interner.pointer(interner.operands(base.type)[0]));
             }
+            // `p->field`: the aggregate pointer IS the (possibly decayed) base.
+            if (!base.type.valid()
+                || interner.kind(base.type) != TypeKind::Ptr
+                || interner.operands(base.type).empty()
+                || !interner.operands(base.type)[0].valid())
+                return declineMemberLvalue(core, isBitfield);
             containerType = interner.operands(base.type)[0];
             ptrType       = base.type;                      // Ptr<container>
             aggPtr        = base.id;
@@ -9026,22 +9065,68 @@ struct Lowerer {
             ptrType       = interner.pointer(containerType);
             aggPtr        = builder.makeAddressOf(base.id, ptrType, HirFlags::Synthetic);
         }
+        Lvalue lv;
+        lv.memberPath.reserve(anonAncestors.size() + 1);
+        // FC16 (C11/C23 §6.7.2.1 ¶13): one intermediate hop per ANONYMOUS ancestor,
+        // outermost→innermost, each qualified against the container it is selected
+        // FROM — the same walk `combineMember` performs, so `s.a` through an
+        // anonymous struct rebuilds as the `s.<anon>.a` chain a hand-written access
+        // lowers to. `hopContainer` rolls inward; `containerType` stays the
+        // OUTERMOST type, because that is what `lvNode`'s Deref yields.
+        TypeId hopContainer = containerType;
+        for (SymbolRecord const* arec : anonAncestors) {
+            TypeId const hopType =
+                volatileQualifiedAccess(reprOf(arec->type), hopContainer);
+            if (!hopType.valid()) return declineMemberLvalue(core, isBitfield);
+            lv.memberPath.push_back({arec->fieldIndex, hopType});
+            hopContainer = hopType;
+        }
         // The field ACCESS type — container-volatility-qualified EXACTLY as
         // combineMember computes it (so `volatileFlagForType` at the MIR site flags
-        // a `volatile`-container member's RMW). A `volatile`-declared FIELD's own
-        // storage rides `fieldType`'s top-level VolatileQual through this too.
-        TypeId const accessType = volatileQualifiedAccess(rf->fieldType, containerType);
-        if (!accessType.valid()) return std::nullopt;
-        Lvalue lv;
+        // a `volatile`-container member's RMW). Qualified against the INNERMOST
+        // container, which is the anon composite when the chain is non-empty. A
+        // `volatile`-declared FIELD's own storage rides `fieldType`'s top-level
+        // VolatileQual through this too, AND is stamped on the node by `lvNode`
+        // (c21), exactly as `combineMember`'s `recordMemberVolatility` does.
+        TypeId const accessType = volatileQualifiedAccess(rf->fieldType, hopContainer);
+        if (!accessType.valid()) return declineMemberLvalue(core, isBitfield);
+        lv.memberPath.push_back({rf->fieldIndex, accessType});
         lv.simple         = false;
-        lv.member         = true;
         lv.type           = accessType;
         lv.containerType  = containerType;
-        lv.memberFieldIdx = rf->fieldIndex;
+        lv.volatileField  = interner.isVolatileQualified(rf->frec->type);
         lv.ptrType        = ptrType;
         lv.sym            = freshSymbol();
         lv.prep.push_back(builder.makeVarDecl(ptrType, lv.sym.v, aggPtr, HirFlags::Synthetic));
         return lv;
+    }
+
+    // ★★ THE STRUCTURAL BACKSTOP THAT REPLACED A SHAPE ENUMERATION.
+    // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: `classifyMemberLvalue` is the
+    // ONLY route by which a bit-field mutation in a compound / inc-dec / value
+    // position reaches the MIR read-modify-write chokepoint. Declining to build the
+    // reconstruction hands the mutation to the generic via-ptr path, whose plain
+    // `*p` Deref takes a FULL-UNIT store — clobbering packed neighbours and skipping
+    // truncation. That is a silent miscompile, so a bit-field decline FAILS LOUD:
+    // the emitted error makes the HIR tier unclean and the compile aborts
+    // (`tierClean`, compile_pipeline.cpp), never a wrong binary.
+    // ⓘ The refusal used to ENUMERATE the two base shapes the reconstruction could
+    // not address. Both are supported now, so every remaining decline is a
+    // type-resolution failure the generic path ALSO reports — a should-never-fire
+    // invariant, deliberately KEPT rather than deleted: phrased as "any decline" it
+    // cannot be re-opened by some future base shape merely failing to be listed,
+    // which is precisely how this class of silent miscompile arrived the first time.
+    // NON-bit-field members are unaffected (the generic scalar store is correct for
+    // them); statement plain-`=` never routes here (`lowerAssign` passes the raw
+    // MemberAccess straight through to the chokepoint).
+    [[nodiscard]] std::optional<Lvalue> declineMemberLvalue(NodeId core, bool isBitfield) {
+        if (isBitfield)
+            emitH(DiagnosticCode::S_BitfieldMutationUnsupportedBase, core,
+                  "a bit-field compound-assignment / increment / value-position "
+                  "mutation cannot be lowered here because the containing "
+                  "aggregate's type did not resolve, so the read-modify-write "
+                  "cannot address the packed allocation unit");
+        return std::nullopt;
     }
 
     // Classify an lvalue CST. A plain variable → simple (no prep). A MEMBER access

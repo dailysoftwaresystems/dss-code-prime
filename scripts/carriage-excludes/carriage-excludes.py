@@ -130,9 +130,80 @@ MUST_NEVER_TRAVEL = (
 )
 
 
+# ★★★ A LANE WORKTREE'S `.git` IS A FILE, AND A WINDOWS-CREATED ONE NAMES A
+# WINDOWS-ABSOLUTE GITDIR THAT A POSIX git CANNOT FOLLOW.
+# ✔MEASURED 2026-08-31 (P47), from inside WSL, which is the ONLY namespace the WSL and
+# arm64 carriages ever run this tool from:
+#     $ cat .worktrees/sq/.git
+#     gitdir: C:/Source/DailySoftware/dss-code-prime/.git/worktrees/sq
+#     $ git -C /mnt/c/.../.worktrees/sq rev-parse --show-toplevel
+#     fatal: not a git repository: /mnt/c/.../.worktrees/sq/C:/Source/.../worktrees/sq
+# -- `C:/…` is not absolute to a POSIX git, so it is JOINED to the worktree path. This
+# tool then refused with `is not a git repository`, and the carriage that called it
+# refused to rsync at all, so NO LANE COULD CARRY ITS OWN WORKTREE TO A GATE HOST
+# while `.worktrees/` is the SANCTIONED home for lane worktrees (ruling 2026-08-26).
+# The shell half of the same defect lives in `scripts/leg-tree/leg-tree.sh`
+# (`leg_tree_driver_identity`), and this is its Python twin -- two implementations
+# because the two callers are in two languages, kept in step BY REVIEW and pinned by
+# the same measurement, exactly as the harness drivers' mirrored regions are.
+#   D-SCRIPT-CARRIAGES-CANNOT-IDENTIFY-A-CROSS-NAMESPACE-LANE-WORKTREE
+# ⚠ RESOLVED ONCE AND CACHED, not per call: `_git` runs many times per invocation and
+# re-deriving would put a `wslpath` fork in front of every one of them.
+_GIT_DIR_FOR: dict[str, list[str]] = {}
+
+
+def _git_prefix(repo: Path) -> list[str]:
+    """The argv prefix that makes git answer about `repo` in THIS namespace."""
+    key = str(repo)
+    cached = _GIT_DIR_FOR.get(key)
+    if cached is not None:
+        return cached
+
+    prefix = ["-C", key]
+    probe = subprocess.run(("git", *prefix, "rev-parse", "--git-dir"),
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+    if probe.returncode != 0:
+        dot_git = repo / ".git"
+        if dot_git.is_file():
+            raw = ""
+            for line in dot_git.read_text(encoding="utf-8",
+                                          errors="replace").splitlines():
+                if line.startswith("gitdir:"):
+                    raw = line[len("gitdir:"):].strip()
+                    break
+            # Same three cases, in the same order, as the shell twin: already a
+            # directory here; FOREIGN-ABSOLUTE (`X:/…`), translated by wslpath and by
+            # nothing else; otherwise relative to the worktree, as git itself allows.
+            # ⚠ The order matters -- testing "not POSIX-absolute" first turns
+            # `C:/…` into `<worktree>/C:/…`, which is the very mangling this undoes.
+            if raw:
+                gd = Path(raw)
+                if not gd.is_dir():
+                    if len(raw) > 1 and raw[1] == ":" and raw[0].isalpha():
+                        conv = subprocess.run(("wslpath", "-u", raw),
+                                              capture_output=True, text=True,
+                                              encoding="utf-8", errors="replace")
+                        gd = Path(conv.stdout.strip()) if conv.returncode == 0 else gd
+                    elif not raw.startswith("/"):
+                        gd = repo / raw
+                if gd.is_dir():
+                    prefix = ["--git-dir", str(gd), "--work-tree", key]
+
+    _GIT_DIR_FOR[key] = prefix
+    return prefix
+
+
 def _git(repo: Path, *argv: str) -> subprocess.CompletedProcess:
+    # ★ `cwd=repo` IS LOAD-BEARING UNDER THE `--git-dir` FORM AND INERT UNDER `-C`.
+    # `check-ignore -- <name>` resolves its pathspec against the PROCESS's working
+    # directory, and `-C` used to supply that implicitly; `--work-tree` does not move
+    # the process at all. Without this the FLOOR check would ask about `.worktrees/`
+    # relative to whatever directory the carriage happened to start in -- and a floor
+    # that answers about the wrong directory fails toward "not ignored", which is the
+    # loud direction, but for the wrong reason and with an unactionable message.
     return subprocess.run(
-        ("git", "-C", str(repo), *argv),
+        ("git", *_git_prefix(repo), *argv), cwd=str(repo),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
 

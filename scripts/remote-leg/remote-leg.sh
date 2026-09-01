@@ -271,13 +271,36 @@ if [[ -z "$JOBS" ]]; then
 fi
 printf 'jobs   : %s (ctest -j)\n' "$JOBS"
 
-LOCAL_HEAD=$(git log --oneline -1 2>/dev/null || echo '(no git)')
-LOCAL_DIRTY=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+# ★★★ THE DRIVER'S IDENTITY IS RESOLVED BY `leg-tree`, NOT BY A BARE `git rev-parse`
+# HERE. This driver runs INSIDE WSL by construction (the arm64 carriage is WSL-only),
+# and a Windows-created lane worktree's `.git` is a FILE naming a Windows-absolute
+# gitdir that a POSIX git cannot follow -- so these three lines all answered EMPTY for
+# every lane and the `die` below fired naming the branch, which was innocent.
+# ✔MEASURED 2026-08-31 (P47); the resolver and the full transcript live in
+# `scripts/leg-tree/leg-tree.sh`. Sourced with the load-bearing empty argument for the
+# same reason the WSL carriage passes one: `.` forwards THIS script's positional
+# parameters otherwise, and leg-tree's dispatch would read one as a subcommand.
+# shellcheck source=../leg-tree/leg-tree.sh
+. "$REPO_ROOT/scripts/leg-tree/leg-tree.sh" "" || die "cannot load scripts/leg-tree/leg-tree.sh"
 # ★ `LOCAL_HEAD` is a LOG LINE and cannot be handed to git as a revision. The clone
 # handling below needs a bare sha and a branch NAME, so they are read as themselves
 # rather than sliced out of a human-facing string.
-LOCAL_SHA=$(git rev-parse HEAD 2>/dev/null || echo '')
-LOCAL_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')
+# ⓘ ALL FOUR VALUES COME FROM THE SAME GIT, through `leg_tree_driver_git`. They used
+# to come from a bare `git`, which on a cross-namespace worktree answered `(no git)`
+# and `0 path(s)` -- and the second of those is byte-identical to the reading a
+# genuinely pristine tree produces, so this driver's only record of WHICH tree it
+# carried failed toward the good news.
+if leg_tree_driver_identity "$REPO_ROOT"; then
+    LOCAL_SHA="$LEG_TREE_DRIVER_SHA"
+    LOCAL_BRANCH="$LEG_TREE_DRIVER_BRANCH"
+    LOCAL_HEAD=$(leg_tree_driver_git "$REPO_ROOT" log --oneline -1 2>/dev/null || echo '(no git)')
+    LOCAL_DIRTY=$(leg_tree_driver_git "$REPO_ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+else
+    LOCAL_SHA=''
+    LOCAL_BRANCH=''
+    LOCAL_HEAD='(no git)'
+    LOCAL_DIRTY='UNKNOWN -- git could not describe this checkout'
+fi
 printf 'local  : %s\n' "$LOCAL_HEAD"
 printf 'dirty  : %s path(s)\n' "$LOCAL_DIRTY"
 [ -n "$LOCAL_BRANCH" ] || die "cannot read this checkout's branch -- the leg host's clone is put on the DRIVER's branch, so a driver that cannot name its own has nothing to ask for"
