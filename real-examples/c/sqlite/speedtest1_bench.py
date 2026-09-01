@@ -388,10 +388,30 @@ def build_dss(arm: dict, subject: dict, jobs: int, objdir: str,
                    f"benchmark option.\n" + log[-800:])
 
 
+# ── THE TWO WAYS A PRE-FLIGHT FAILS ARE DIFFERENT QUESTIONS ──────────────────
+# ★★ "THE COMPILER REFUSED" AND "I COULD NOT RUN THE CHECK" MUST NEVER SHARE AN
+# ANSWER. [[D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]]
+# The first is a VERDICT ABOUT THE BINARY — it ran, it read the config tree, and
+# it rejected vocabulary that tree now contains, which is the stale-binary
+# signature this check exists to catch. The second is a verdict about THIS
+# MACHINE: no config tree at the pin, or a path that cannot be launched at all.
+# Collapsing the two would make every environment problem read as "your compiler
+# is stale" and send the operator to rebuild a compiler that was never the
+# subject — a check that answers the adjacent question, which is worse than no
+# check because it is confidently wrong.
+# ⓘ The kinds are a CLOSED SET returned as a third tuple element rather than
+# sniffed out of the prose: `why` is free text and every attempt to classify free
+# text drifts the moment someone improves a sentence.
+PREFLIGHT_OK = "ok"
+PREFLIGHT_REFUSED = "refused"          # the compiler RAN and produced diagnostics
+PREFLIGHT_UNRUNNABLE = "unrunnable"    # the check itself could not be performed
+
+
 def preflight_dss(binary: str, config_root: str,
-                  target: str = "") -> tuple[bool, str]:
+                  target: str = "") -> tuple[bool, str, str]:
     """Can this compiler compile three lines against that config, FOR THE TARGET
-    THE MEASUREMENT WILL USE? (ok, why-not).
+    THE MEASUREMENT WILL USE? (ok, why-not, kind) — `kind` from the closed set
+    above, so a caller can tell a STALE BINARY from a check that never ran.
 
     ★ ONE IMPLEMENTATION, CALLED BY BOTH DRIVERS, ALWAYS ON THE HOST THAT WILL
     RUN THE COMPILER. The check has to happen before a configure, a 102-object
@@ -431,7 +451,8 @@ def preflight_dss(binary: str, config_root: str,
     if not os.path.isdir(os.path.join(config_root, "src", "dss-config")):
         return False, (f"no config tree at {config_root}/src/dss-config -- "
                        f"DSS_CONFIG_ROOT names the checkout root that CONTAINS "
-                       f"src/dss-config, not that directory itself")
+                       f"src/dss-config, not that directory itself"), \
+            PREFLIGHT_UNRUNNABLE
     env = dict(os.environ)
     env["DSS_CONFIG_ROOT"] = config_root
     with tempfile.TemporaryDirectory(prefix="dss-preflight-") as td:
@@ -461,15 +482,35 @@ def preflight_dss(binary: str, config_root: str,
         argv = [binary, "--compile", src, "--language", "c", "--output", td]
         if target:
             argv += ["--target", target]
+        # ⚠ THE LAUNCH ITSELF CAN FAIL, AND THAT IS NOT A VERDICT ABOUT THE
+        # COMPILER. `subprocess` raises OSError when the path is not something
+        # this OS can execute — ✔MEASURED 2026-08-31 on Windows, an extensionless
+        # `#!/bin/sh` file gives `[WinError 193] not a valid Win32 application`
+        # while a `.cmd` launches fine. Uncaught, that is a TRACEBACK where a
+        # diagnostic belongs, and the caller sees a non-zero exit it would
+        # naturally read as "the compiler refused". Named as UNRUNNABLE instead.
+        try:
+            r = run_capture(argv, env=env)
+        except OSError as exc:
+            return False, (f"{binary} could not be launched at all ({exc}) -- so "
+                           f"NOTHING was learned about the compiler here, and "
+                           f"this is a fact about the path given, not about "
+                           f"whether the binary is current"), PREFLIGHT_UNRUNNABLE
         # ⚠ rc is NOT the verdict — dsscp returns 0 on fatal errors, so
         # the log is what decides, exactly as build_dss does.
-        r = run_capture(argv, env=env)
         log = (r.stdout or "") + (r.stderr or "")
         if "error[" in log:
-            return False, next(ln for ln in log.splitlines() if "error[" in ln)[:400]
+            return (False,
+                    next(ln for ln in log.splitlines() if "error[" in ln)[:400],
+                    PREFLIGHT_REFUSED)
+        # It ran, it said nothing, and it still failed. That IS a verdict about
+        # the binary — a compiler that cannot compile three lines and cannot say
+        # why is unusable for the run about to be spent on it.
         if r.returncode != 0 and not log.strip():
-            return False, f"the compiler exited {r.returncode} and said nothing at all"
-    return True, ""
+            return (False,
+                    f"the compiler exited {r.returncode} and said nothing at all",
+                    PREFLIGHT_REFUSED)
+    return True, "", PREFLIGHT_OK
 
 
 BUILDERS = {"dss": build_dss, "unix-cc": build_unix_cc, "msvc": build_msvc}
@@ -899,7 +940,10 @@ def main() -> int:
     ap.add_argument("--preflight-dss", metavar="BIN",
                     help="prove this dsscp can compile three lines "
                          "against --config-root, and exit; run it BEFORE paying "
-                         "for a configure and a reference build")
+                         "for a configure and a reference build. Exit 0 = it "
+                         "compiles; 1 = THE COMPILER REFUSED (the stale-binary "
+                         "signature); 3 = THE CHECK COULD NOT RUN (nothing was "
+                         "learned about the compiler)")
     ap.add_argument("--config-root", metavar="DIR",
                     help="the DSS_CONFIG_ROOT to pin for --preflight-dss")
     ap.add_argument("--preflight-target", metavar="SPEC", default="",
@@ -915,8 +959,8 @@ def main() -> int:
             ap.error("--preflight-dss needs --config-root: leaving it unset lets "
                      "the working directory decide which config the measured "
                      "binary reads, which is the thing being pinned")
-        ok, why = preflight_dss(args.preflight_dss, args.config_root,
-                                args.preflight_target)
+        ok, why, kind = preflight_dss(args.preflight_dss, args.config_root,
+                                      args.preflight_target)
         if ok:
             # ⚠ SAY WHICH TARGET WAS VOUCHED FOR, and say plainly when the answer
             # is "the default one". An unqualified `preflight: OK` is what let a
@@ -929,6 +973,21 @@ def main() -> int:
             print(f"preflight: OK - {args.preflight_dss} compiles against "
                   f"{args.config_root} {scope}")
             return 0
+        # ★ THE HEADLINE NAMES THE KIND, AND SO DOES THE EXIT CODE. A caller that
+        # cannot tell "your binary is stale" from "I could not run the check"
+        # will report the first for the second — see the closed set above.
+        if kind == PREFLIGHT_UNRUNNABLE:
+            print(f"speedtest1_bench: preflight COULD NOT RUN — the compiler was "
+                  f"NOT judged\n"
+                  f"      binary : {args.preflight_dss}\n"
+                  f"      config : {args.config_root}\n"
+                  f"      target : {args.preflight_target or '(default)'}\n"
+                  f"      says   : {why}\n"
+                  f"      This says NOTHING about whether that binary is current. "
+                  f"Fix what is named above and ask again; rebuilding the "
+                  f"compiler would not change this answer.",
+                  file=sys.stderr)
+            return 3
         print(f"speedtest1_bench: preflight FAILED\n"
               f"      binary : {args.preflight_dss}\n"
               f"      config : {args.config_root}\n"

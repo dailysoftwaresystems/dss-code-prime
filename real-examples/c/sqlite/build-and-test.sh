@@ -223,6 +223,20 @@ LEG_RESOLVER="$SCRIPT_DIR/harness_legs.py"
 MANIFEST_GEN="$SCRIPT_DIR/gen-pe64-manifest.py"
 SRC_COHERENCE="$SCRIPT_DIR/check-source-coherence.sh"
 CLI_SMOKE="$SCRIPT_DIR/cli-smoke.py"
+# ★★ THE COMPILER-CURRENCY PRE-FLIGHT LIVES IN speedtest1_bench.py AND IS CALLED
+# FROM HERE RATHER THAN COPIED. [[D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]]
+# `--preflight-dss` was written for the BENCHMARK drivers and has already been
+# corrected twice by measurement — once for omitting `--target` (a control that
+# validated whatever dsscp defaults to) and once for omitting `--language`. Those
+# are precisely the mistakes a fresh copy here would make, so the file that
+# already holds the corrections is the file this driver asks. Its own docstring
+# states the reason: ONE implementation, called by every driver, always on the
+# host that will run the compiler.
+# ⓘ That it is named for the benchmark is an accident of which driver needed it
+# first; what it answers — "can this binary compile three lines against this
+# config tree for this target?" — is a question about the COMPILER, and both
+# corpus drivers ask it too as of this cycle.
+BENCH_CORE="$SCRIPT_DIR/speedtest1_bench.py"
 # The deferred-anchor registry, consulted AT the point a leg fails
 # (D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE).
 # NOT required to exist: a checkout without .plans still runs, it just gets one
@@ -2948,7 +2962,194 @@ if [[ "${DSS_BUILD_TYPE,,}" != "release" ]]; then
   DSS_BUILD_TYPE_NOTE="  (compiler build type: $DSS_BUILD_TYPE — NOT Release, DSS_ALLOW_NONRELEASE_COMPILER=1)"
   warn "DSS_ALLOW_NONRELEASE_COMPILER=1 — proceeding with a $DSS_BUILD_TYPE compiler. TIMINGS FROM THIS RUN ARE NOT COMPARABLE with build-and-test.ps1 or with any other run of this driver, which always times a Release compiler."
 fi
-pass "dsscp built: $DSS_BIN  ($DSS_BUILD_TYPE)"
+# ── WHERE THIS BINARY CAME FROM, AND WHEN — stated, never inferred ───────────
+# ★ THE CMAKE LINES ABOVE ARE AN INTENTION, NOT AN ANSWER. The search below them
+# widens to the WHOLE of $SRC_DIR/build when the tree just built holds no dsscp,
+# and that root holds other people's trees — so "this driver builds Release
+# unconditionally" does NOT establish that the binary it ends up holding was
+# built by this run. Both facts are read from the file and carried to Step 9.
+# [[D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]]
+# ⓘ THE MTIME IS READ THROUGH python3, NOT `stat`. `stat -c %y` is GNU and
+# `stat -f %Sm` is BSD, so a `stat` here would be a host-identity branch printing
+# two different formats for one fact — and this driver runs on Linux, macOS and an
+# arm64 VPS. python3 is already a hard prerequisite (Step 0 refuses without it)
+# and spells the same answer everywhere, which is what makes two hosts' ledger
+# lines comparable.
+# ⓘ FAIL-SOFT, AND THE SOFTNESS IS THE POINT rather than a convenience. This value
+# is PROVENANCE, not a gate: the currency check below is what decides whether the
+# run may proceed, and it does not read this. A `die` here would kill an otherwise
+# sound run over an unreadable timestamp, while a silent empty string would print
+# `built  — LOCATED …` and read as a build time of nothing. So it degrades to a
+# stated non-answer, the same shape as $SRC_DIVERGE_NOTE's "UNVERIFIED".
+dss_file_mtime() {   # <path>
+  local out
+  if out="$(python3 -c 'import os,sys,time; print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(sys.argv[1]))))' "$1" 2>&1)"; then
+    printf '%s\n' "$out"
+  else
+    printf '<UNREADABLE: %s>\n' "$out"
+  fi
+}
+DSS_BIN_BUILT="$(dss_file_mtime "$DSS_BIN")"
+if [[ "$DSS_BIN" == "$_dss_bdir"/* ]]; then
+  DSS_BIN_ORIGIN="BUILT by this run ($_dss_bdir)"
+else
+  DSS_BIN_ORIGIN="LOCATED by the widened root-wide search — NOT built by this run"
+fi
+# ── THE CONFIG TREE THIS RUN WILL READ, PINNED BEFORE IT IS VOUCHED FOR ──────
+# ★★ A CONTROL CANNOT VOUCH FOR AN INPUT THE MEASUREMENT IS FREE TO CHOOSE
+# DIFFERENTLY. `findShippedConfig` walks UP FROM THE CWD unless DSS_CONFIG_ROOT
+# says otherwise, so an unpinned corpus run pairs this binary with whichever
+# config tree happens to sit above wherever each compile was launched — and the
+# pre-flight below would then be certifying a tree the run need not read.
+# benchmark-speedtest1.{sh,ps1} have pinned it for exactly this reason since
+# [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]];
+# the corpus drivers never did, which is why "which config did that sqlite figure
+# read?" had no answer here.
+# ⚠ THE PIN IS THE DIRECTORY THAT *CONTAINS* `src/dss-config`, NOT THAT DIRECTORY
+# ITSELF — the resolver composes the rest, and a set-but-miss falls through to the
+# CWD walk SILENTLY by documented design, which is how the one-level-too-deep
+# spelling did nothing for its whole life.
+# ⓘ An operator's own DSS_CONFIG_ROOT is honoured, not overwritten: pinning is
+# about removing the AMBIGUITY, not about taking the choice away.
+DSS_CONFIG_ROOT_PIN="${DSS_CONFIG_ROOT:-$SRC_DIR}"
+[[ -d "$DSS_CONFIG_ROOT_PIN/src/dss-config" ]] || die \
+  "no dss config tree at $DSS_CONFIG_ROOT_PIN/src/dss-config
+      DSS_CONFIG_ROOT names the checkout root that CONTAINS src/dss-config, not that directory itself."
+export DSS_CONFIG_ROOT="$DSS_CONFIG_ROOT_PIN"
+info "config    : $DSS_CONFIG_ROOT_PIN/src/dss-config  (pinned for every compile in this run)"
+
+# >>> dss:compiler-currency >>>
+# ★★★ PROVE THE COMPILER IS CURRENT, HERE, BEFORE THE RUN IS SPENT.
+# [[D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]]
+#
+# ✔MEASURED 2026-08-31 on the .ps1 twin, which LOCATES a Release binary instead of
+# building one: a `build/rel` three days and four cycles old was found, announced
+# as `[OK] dsscp located — Release build`, and handed that day's `src/dss-config`.
+# All five legs died in 11–23 ms with 37 identical config-vocabulary refusals
+# (`unknown pragma effect 'standardFloatState'`, `unknown key 'restrictMarker' in
+# 'declarations[0]'`, `unknown attribute effect 'runBeforeEntry'`) — `0 verified …
+# 5 poisoned`, and NOT ONE sqlite3 CLI built. The refusals were CORRECT: an
+# unrecognised config key is refused rather than ignored, because a
+# silently-dropped key leaves the feature it names switched off with no
+# diagnostic. What was wrong was handing a CURRENT config to an OLDER binary.
+#
+# ⚠ AND THIS TWIN IS NOT EXEMPT BY VIRTUE OF REBUILDING. Two paths reach the same
+# place from here: the widened search above can hand back a binary from another
+# tree under $SRC_DIR/build, and — the wider hole — a CURRENT binary can be paired
+# with a config tree that moved the other way. Both mirror images were measured in
+# a single run on 2026-08-26 (D-BENCH-COMPILER-AND-CONFIG-MAY-COME-FROM-DIFFERENT-COMMITS).
+# The check is about the PAIR, so it is owed on both drivers; a capability in one
+# driver and not the other is this repository's canonical silent harness bug.
+#
+# ★ ONE PROBE PER SELECTED LEG TARGET, not one probe for the run. A CONTROL MUST
+# MATCH THE TARGET: a probe with no --target validated whatever dsscp defaults to
+# while the measurement died on a target document the probe never opened.
+# ✔MEASURED 2026-08-31: ~250-290 ms per target through the shared core, against a
+# run measured in hours. SELECTED legs, not declared ones — a leg this run will
+# not build must not be able to fail it.
+# ⚠⚠ IT SETS A GLOBAL AND PRINTS NOTHING, AND THAT IS THE WHOLE CALLING
+# CONVENTION. [[D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL]] — `die` is
+# `exit 1`, which inside a command substitution exits only the SUBSHELL. Written
+# as `OK="$(dss_assert_compiler_current …)"` the refusal would still PRINT (die
+# writes to stderr) while the parent carried on to the ERR trap and reported
+# "failed at line N" over the top of the real diagnostic. Assigning through
+# DSS_CURRENCY_OK keeps the refusal in the shell that must stop.
+dss_assert_compiler_current() {   # <python> <core> <dsscp> <built> <origin> <cfgroot> <rebuild-cmd> <spec>...
+  local py="$1" core="$2" bin="$3" built="$4" origin="$5" cfg="$6" rebuild="$7"
+  shift 7
+  # ⚠ THE INSTRUMENT'S OWN ABSENCE IS ITS OWN VERDICT, and it is NOT the
+  # stale-binary one. A check that cannot run must never be reported as a check
+  # that failed — the same distinction the core hands back as rc 3 below.
+  if [[ ! -r "$core" ]]; then
+    die "the compiler-currency pre-flight CANNOT RUN, so this run does not know whether its compiler is current.
+      missing   : $core
+      It holds the ONE implementation of that check (--preflight-dss), shared with the benchmark
+      drivers. This is a fact about the checkout, NOT about the compiler: nothing here says the
+      binary is stale, and rebuilding it would not change this answer."
+  fi
+  local spec out rc checked=""
+  for spec in "$@"; do
+    # rc read DIRECTLY off the interpreter, never after a pipe: a pipeline's
+    # status is its LAST element's, and `python3 … | sed` would report sed's.
+    if out="$("$py" "$core" --preflight-dss "$bin" --config-root "$cfg" --preflight-target "$spec" 2>&1)"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [[ $rc -eq 0 ]]; then
+      checked="${checked:+$checked, }$spec"
+      continue
+    fi
+    # ── THE CHECK COULD NOT RUN — a fact about this machine ────────────────
+    # ★★ ONLY rc 1 ACCUSES THE COMPILER, AND THE COMPLEMENT IS DEFINED RATHER
+    # THAN ENUMERATED. The core promises exactly one code for "it ran and produced
+    # diagnostics"; EVERY other non-zero — 3 for its own named cannot-run, 2 for a
+    # usage error, whatever an interpreter that failed to start returns — is a fact
+    # about the INVOCATION, and must fail toward "I could not judge it". Both arms
+    # stop the run, so nothing is trusted either way; what differs is whether an
+    # operator is sent to rebuild a compiler that was never the subject.
+    # ✔MEASURED 2026-08-31 while pinning this: the arms were written the other way
+    # round and a bad --config-root produced argparse's rc 2, which printed a usage
+    # block underneath "THE COMPILER CANNOT COMPILE THREE LINES" and a rebuild
+    # instruction. A guard whose default branch accuses will eventually accuse
+    # wrongly.
+    if [[ $rc -ne 1 ]]; then
+      die "the compiler-currency pre-flight COULD NOT RUN for target $spec (exit $rc), so this run does not know whether its compiler is current.
+$(printf '%s\n' "$out" | sed 's/^/      /')
+      compiler  : $bin
+      built     : $built
+      origin    : $origin
+      config    : $cfg/src/dss-config
+      NOTHING above says that binary is stale. Fix what the check names and ask again."
+    fi
+    # ── THE COMPILER REFUSED — a verdict about the binary ──────────────────
+    die "THE COMPILER CANNOT COMPILE THREE LINES against this run's own config tree, for target $spec.
+      This run is REFUSED here rather than after it has compiled ~189 translation units per leg
+      and reported every leg poisoned. [D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]
+$(printf '%s\n' "$out" | sed 's/^/      /')
+      compiler  : $bin
+      built     : $built
+      origin    : $origin
+      config    : $cfg/src/dss-config
+      target    : $spec
+      An error[C_Invalid...] / C_MalformedJson diagnostic naming an unknown key, pragma effect or
+      attribute effect is the STALE-BINARY signature: the config tree has grown vocabulary this
+      binary does not know, and refusing an unrecognised key is correct compiler behaviour.
+      REBUILD IT: $rebuild
+      ⚠ SKIP_DSS_BUILD=1 DOES NOT EXEMPT A BINARY FROM THIS CHECK. It is an instruction not to
+      BUILD, never an instruction to TRUST: under it, a binary that fails here is unusable and the
+      run stops with this message instead of reusing it."
+  done
+  DSS_CURRENCY_OK="$checked"
+}
+# ⚠ DEDUPED, and the dedup is not tidiness: two legs sharing one target spec would
+# otherwise pay for the same probe twice and print the spec twice in the ledger.
+DSS_CURRENCY_SPECS=()
+for _cs_leg in "${LEG_ORDER[@]}"; do
+  # `:-` so the emptiness guard below is the thing that decides, rather than
+  # `set -u` aborting the run through the ERR trap with a line number for a
+  # message. A leg with no spec is a resolver contract break; it is not this
+  # loop's job to diagnose it, only to not probe a target that does not exist.
+  _cs_spec="${LEG_SPEC[$_cs_leg]:-}"
+  [[ -n "$_cs_spec" ]] || continue
+  [[ " ${DSS_CURRENCY_SPECS[*]-} " == *" $_cs_spec "* ]] || DSS_CURRENCY_SPECS+=("$_cs_spec")
+done
+# Not reachable through Step 1, which refuses an empty plan — and stated anyway,
+# because a silent zero-iteration loop is a check that passed having examined
+# nothing, which is the one outcome this block must never produce.
+[[ ${#DSS_CURRENCY_SPECS[@]} -gt 0 ]] || die \
+  "no leg target specs to pre-flight the compiler against — the resolved plan carries no specs, so the currency check would examine nothing and report success."
+DSS_CURRENCY_OK=""
+dss_assert_compiler_current python3 "$BENCH_CORE" "$DSS_BIN" "$DSS_BIN_BUILT" \
+    "$DSS_BIN_ORIGIN" "$DSS_CONFIG_ROOT_PIN" \
+    "cmake --build '$_dss_bdir' --target dsscp   (or: scripts/local-build/local-build.sh --tree rel)" \
+    "${DSS_CURRENCY_SPECS[@]}"
+# <<< dss:compiler-currency <<<
+# Carried to the Step-9 verdict beside the compiler's path: every figure this run
+# emits was produced by THIS binary, proved current against THESE targets.
+DSS_CURRENCY_NOTE="$DSS_CONFIG_ROOT_PIN/src/dss-config — this binary PROVED it compiles against it for $DSS_CURRENCY_OK"
+info "currency  : proved for $DSS_CURRENCY_OK"
+pass "dsscp built: $DSS_BIN  ($DSS_BUILD_TYPE) — PROVED current against this run's config tree"
 
 # ── Step 6 — stage third-party headers + obtain per-leg libs ─────────────────
 step "6/9  Third-party headers (parsed agnostically) + per-leg tcl/zlib libraries"
@@ -7077,7 +7278,19 @@ step "9/9  Results"
 # sqlite gets no divergence count on purpose: Steps 3-6 run configure/make INSIDE
 # that clone and generate sources there, so its working tree always differs from
 # HEAD by construction and a number would carry no information.
+# ★★ `@ $SRC_HEAD` IS THE CHECKOUT'S HEAD, NOT THE BINARY'S, AND THIS LINE USED TO
+# LET THAT PASS FOR PROVENANCE.
+# [[D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]]
+# Step 5's search can widen past the tree it just built, and the .ps1 twin does not
+# build at all — so `<path> @ <head>` printed identically whether the binary came
+# from this commit a minute ago or from another one four cycles back. Every
+# historical veryquick/full figure in this project was quoted against a commit on
+# exactly that reading. The BUILD TIME, the ORIGIN and the CONFIG TREE THE BINARY
+# WAS PROVED AGAINST are what turn the head into a claim a reader can check, so all
+# three are printed, always, next to it.
 printf '   compiler : %s @ %s%s%s\n' "$DSS_BIN" "$SRC_HEAD" "$SRC_DIVERGE_NOTE" "$DSS_BUILD_TYPE_NOTE"
+printf '     binary : built %s — %s\n' "$DSS_BIN_BUILT" "$DSS_BIN_ORIGIN"
+printf '     config : %s\n' "$DSS_CURRENCY_NOTE"
 printf '   sqlite   : %s @ %s\n' "$SQLITE_DIR" "$(git_head_short "$SQLITE_DIR")"
 printf '   recipe   : %s TUs, %s defines (%s)\n' "${#TUS[@]}" "${#RECIPE_DEFS[@]}" "$RECIPE"
 printf '   cli recipe: %s TUs, %s defines (%s)\n' "${#CLI_TUS[@]}" "${#CLI_DEFS[@]}" "$CLI_RECIPE"
