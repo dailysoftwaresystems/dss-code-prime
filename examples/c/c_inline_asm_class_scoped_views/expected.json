@@ -1,0 +1,32 @@
+{
+  "$comment": "D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE (R5 + R8, P50) — class-scoped width-view modifier letters, by execution. ★ THE aarch64 ARMS bind BOTH register files in one template: `mov %w0, %w1` / `mov %x0, %x1` run the GPR views inside a real instruction while an FP-class `\"w\"`-bound double is live in the same statement — the class check is per OPERAND, and the two views must differ in exactly bits 63:32 of the result (a letter decoded at the wrong width moves exactly those bits; a letter refused for the wrong class kills the compile). The FP letters themselves cannot appear in an EXECUTED instruction on this port — the aarch64 gas dialect spells no FP mnemonic (the gap `c_inline_asm_fp_class_constraint` records; a different row's subject) — so their decode and both refusal directions are pinned at the asm tier in tests/asm/test_asm_class_scoped_modifiers.cpp. ★ THE x86-64 ARMS run the measured gcc-accepted construct the width-only posture exists to keep: `movsd %q1, %q0` over `\"x\"`-bound xmm operands (✔gcc renders the bare `%xmm0` — the letter degrades; clang refuses; the disjunction decides acceptance), against the bare control. ⚠ `volatile` seeds are load-bearing: the release arm must still reach the templates. Exit codes name the failing shape.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

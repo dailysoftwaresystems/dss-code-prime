@@ -43,10 +43,19 @@
  * its value intact — all four of which `nop` templates can witness and none of
  * which could be witnessed at all before.
  *
- * ⚠ AND WHY NO `%d0`-STYLE MODIFIER APPEARS. The five FP view letters
- * (`%b %h %s %d %q`) are class-scoped and undeclared on this target; a bare
- * `%0` is the shape that is expressible today. Writing `%d0` here is refused
- * at the parser, which is correct and is a different row's subject.
+ * ⚠ AND WHY NO `%d0`-STYLE MODIFIER APPEARS — THE REASON CHANGED ON
+ * 2026-09-01 AND THIS PARAGRAPH IS THE CORRECTION. It used to say the five FP
+ * view letters (`%b %h %s %d %q`) were UNDECLARED on this target and that
+ * writing `%d0` was refused at the parser. Both were true when written and
+ * both are now FALSE: P50 declared all seven letters class-scoped in
+ * `asm-arm64-gas.lang.json` and flipped the fpr row of `asmBareOperandWidths`
+ * to `registerNatural`, closing
+ * [[D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE]]. `%d0` is
+ * accepted here today. This example keeps the BARE `%0` deliberately: its
+ * subject is that a `"w"`-bound operand BINDS, allocates from the right file
+ * and survives a call — the letters are `examples/c/c_inline_asm_class_scoped_views`'s
+ * subject, and pinning them twice would make this example red for a reason
+ * that is not its own.
  *
  * ★ SHAPE 4 IS THE ONE THAT NEEDED THE FREE LIST, not merely the binding.
  * Before R1 the `vr` free list was EMPTY BY CONSTRUCTION — the AAPCS64

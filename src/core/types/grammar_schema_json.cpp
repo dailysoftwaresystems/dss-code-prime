@@ -22,6 +22,7 @@
 #include "core/types/predefined_macro_json.hpp" // parsePredefinedMacroArray (TF-C74: shared with the target loader)
 #include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
 #include "core/types/section_kind.hpp"         // dataSectionKindFromName — the ONE data-section taxonomy (`assembly.directives[].section`)
+#include "core/types/target_schema.hpp"        // targetRegClassFromName / kOperableTargetRegClassNames — `assembly.templateModifiers[].registerClass` names a row of the ONE register-class envelope
 #include "core/types/symbol_attrs.hpp"         // symbolBindingFromName / symbolVisibilityFromName
 
 #include <nlohmann/json.hpp>
@@ -16667,25 +16668,50 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         coll.emit(DiagnosticCode::C_InvalidHirLowering,
                                   "/assembly/templateModifiers",
                                   "'templateModifiers' must be a NON-EMPTY "
-                                  "array of { letter, widthBits } — the shared "
-                                  "placeholder grammar carries a width-view "
-                                  "arm, so a dialect declaring the capability "
-                                  "and no letters declares a shape whose FIRST "
-                                  "token nothing can ever mint");
+                                  "array of { letter, widthBits[, "
+                                  "registerClass] } — the shared placeholder "
+                                  "grammar carries a width-view arm, so a "
+                                  "dialect declaring the capability and no "
+                                  "letters declares a shape whose FIRST token "
+                                  "nothing can ever mint");
                         assemblyClean = false;
                     } else {
-                        static constexpr std::array<std::string_view, 2>
-                            kModifierKeys{"letter", "widthBits"};
+                        static constexpr std::array<std::string_view, 3>
+                            kModifierKeys{"letter", "widthBits",
+                                          "registerClass"};
                         DSS_CHECK_KEY_VOCABULARY(kModifierKeys);
                         // ⚠ THE WIDTHS ARE THE ONES `lirInstWidthBits` CAN
-                        // STATE, and the check is not pedantry: a width outside
-                        // the set has no LIR flag, so it would be carried to
-                        // the instruction and silently read back as 64 — a
-                        // wrong-width operation with a clean build log, the
-                        // exact outcome the refusal this surface replaces
-                        // existed to prevent.
-                        static constexpr std::array<std::uint32_t, 4>
-                            kModifierWidths{8, 16, 32, 64};
+                        // STATE, and the check is not pedantry: a width
+                        // outside the set has no LIR flag, so it would be
+                        // carried to the instruction and silently read back
+                        // as 64 — a wrong-width operation with a clean build
+                        // log, the exact outcome the refusal this surface
+                        // replaces existed to prevent.
+                        // ★ 128 JOINED THE SET IN P50 AND THE SENTENCE ABOVE
+                        // STOPPED BEING TRUE OF IT EARLIER: `kLirInstFlagWidth128`
+                        // is declared in `lir_node.hpp` and `lirInstWidthBits`
+                        // decodes it, so a 128-bit letter (`%q0` on aarch64,
+                        // ✔MEASURED rendering `q0` under gcc 13.3.0 AND clang
+                        // 18.1.3 on a `"w"`-bound double) states a width the
+                        // instruction model carries. What still refuses such a
+                        // letter's USE today is the template translator's
+                        // width-flag mapping, loudly and by name, until a
+                        // target declares a width-128 encoding variant — a
+                        // POSITIONED diagnostic, which a load-time width
+                        // refusal here would replace with a config error about
+                        // a letter both references render.
+                        // The set itself lives on `AssemblyConfig`
+                        // (`kTemplateModifierWidthBits`) so the asm tier's
+                        // test can static_assert it against
+                        // `lirInstWidthFlagForBits` — the include direction
+                        // this file cannot take.
+                        constexpr auto const& kModifierWidths =
+                            AssemblyConfig::kTemplateModifierWidthBits;
+                        // The scoped-vs-width-only census for the per-dialect
+                        // all-or-nothing rule below; the index of one row of
+                        // each flavour so the mix refusal can NAME a pair.
+                        std::optional<std::size_t> firstScoped;
+                        std::optional<std::size_t> firstUnscoped;
                         std::size_t index = 0;
                         for (auto const& m : mods) {
                             auto const path =
@@ -16696,7 +16722,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 coll.emit(DiagnosticCode::C_InvalidHirLowering,
                                           path,
                                           "each 'templateModifiers' entry must "
-                                          "be an object { letter, widthBits }");
+                                          "be an object { letter, widthBits[, "
+                                          "registerClass] }");
                                 assemblyClean = false;
                                 continue;
                             }
@@ -16704,9 +16731,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     m, kModifierKeys, path,
                                     "a 'templateModifiers' entry",
                                     DiagnosticCode::C_InvalidHirLowering, coll,
-                                    "A misspelled key would leave the letter "
-                                    "or its width undeclared and the view "
-                                    "would resolve to the wrong register")) {
+                                    "A misspelled key would leave the letter, "
+                                    "its width or its register-class scope "
+                                    "undeclared and the view would resolve to "
+                                    "the wrong register")) {
                                 assemblyClean = false;
                             }
                             if (!m.contains("letter")
@@ -16760,6 +16788,65 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 assemblyClean = false;
                                 continue;
                             }
+                            // ── the optional CLASS SCOPE ──────────────────
+                            //
+                            // ★ VALIDATED HERE, RESOLVED AT USE — the
+                            // `sectionName` layering: the name must be a row
+                            // of the ONE register-class envelope
+                            // (`kTargetRegClassTable`), and the inoperable
+                            // "none" is refused because a letter scoped to
+                            // no-class could match no operand and would be a
+                            // row-shaped way of deleting the letter.
+                            std::string regClass;
+                            if (m.contains("registerClass")) {
+                                if (!m.at("registerClass").is_string()
+                                    || m.at("registerClass")
+                                           .get<std::string>().empty()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        path + "/registerClass",
+                                        std::format(
+                                            "width-view letter '{}' declares "
+                                            "'registerClass' as something "
+                                            "other than a non-empty string — "
+                                            "the key scopes the letter to ONE "
+                                            "register class and must name it",
+                                            letter));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                regClass =
+                                    m.at("registerClass").get<std::string>();
+                                auto const cls =
+                                    targetRegClassFromName(regClass);
+                                if (!cls.has_value()
+                                    || !isOperableTargetRegClass(*cls)) {
+                                    std::string allowed;
+                                    for (auto const n
+                                         : kOperableTargetRegClassNames) {
+                                        if (!allowed.empty()) allowed += " | ";
+                                        allowed += n;
+                                    }
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        path + "/registerClass",
+                                        std::format(
+                                            "width-view letter '{}' scopes "
+                                            "itself to register class '{}', "
+                                            "which is not an operable class of "
+                                            "the envelope ({}) — an unknown "
+                                            "class would scope the letter to "
+                                            "nothing, silently",
+                                            letter, regClass, allowed));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                if (!firstScoped.has_value()) {
+                                    firstScoped = index - 1;
+                                }
+                            } else if (!firstUnscoped.has_value()) {
+                                firstUnscoped = index - 1;
+                            }
                             std::string lexeme =
                                 cfg.templatePlaceholderLexeme + letter;
                             bool duplicate = false;
@@ -16782,7 +16869,37 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             if (duplicate) continue;
                             cfg.templateModifiers.push_back(
                                 AssemblyConfig::AsmTemplateModifier{
-                                    letter, std::move(lexeme), width});
+                                    letter, std::move(lexeme), width,
+                                    std::move(regClass)});
+                        }
+                        // ★★★ THE PER-DIALECT ALL-OR-NOTHING RULE. A document
+                        // either scopes EVERY letter (aarch64: the wrong-class
+                        // application is a measured reference refusal and an
+                        // operator-ruled dissolution) or scopes NONE (x86-64:
+                        // ✔MEASURED, gcc ACCEPTS a GPR letter on an xmm
+                        // operand and renders the bare form, so scoping would
+                        // refuse a program a reference compiles). A MIX is
+                        // refused because the unscoped rows in it are
+                        // indistinguishable from rows whose class was merely
+                        // FORGOTTEN — and a forgotten class loads as
+                        // legal-on-every-class, the silent wrong-application
+                        // the scoped posture exists to kill.
+                        if (firstScoped.has_value()
+                            && firstUnscoped.has_value()) {
+                            coll.emit(
+                                DiagnosticCode::C_ConflictingField,
+                                "/assembly/templateModifiers",
+                                std::format(
+                                    "'templateModifiers' mixes CLASS-SCOPED "
+                                    "and WIDTH-ONLY letters (row {} declares "
+                                    "'registerClass', row {} does not) — the "
+                                    "posture is per dialect: scope every "
+                                    "letter, or none. An unscoped row beside "
+                                    "scoped ones reads as a forgotten class, "
+                                    "and a forgotten class would load as "
+                                    "legal-on-every-class",
+                                    *firstScoped, *firstUnscoped));
+                            assemblyClean = false;
                         }
                     }
 

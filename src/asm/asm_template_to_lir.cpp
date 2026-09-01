@@ -1154,6 +1154,99 @@ struct AsmInstructionLowering::Impl {
         // below are reached unchanged, and the width dies with the view — which
         // is also SAFE by construction, since `dataRegisterWidth` excludes
         // memory and immediate operands from the width reconciliation anyway.
+        //
+        // ★★★ A **CLASS-SCOPED** LETTER MUST ALSO MATCH THE OPERAND'S REGISTER
+        // CLASS, AND A MISMATCH REFUSES BY NAME — P50, the R8 arm of
+        // D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE, and the
+        // check runs BEFORE the form switch because the class is a property of
+        // the BINDING, not of the form the template writes around it.
+        //
+        // ✔MEASURED per reference SEPARATELY (gcc 13.3.0, clang 18.1.3 with
+        // `-fno-integrated-as`, `-O0` AND `-O2`), and the three arms below are
+        // the three measured shapes:
+        //   * Reg: an FP view letter on an `"r"`-bound integer is a hard error
+        //     under BOTH references (gcc: *invalid 'asm': incompatible floating
+        //     point / vector register operand for '%d'*; clang: *invalid
+        //     operand in inline asm*) — a unanimous refusal this arm adopts.
+        //     The REVERSE (`%x0` on a `"w"`-bound double) is accepted by both
+        //     but MEANS different registers — gcc renders `v0`, clang `d0`,
+        //     both rc=0 — and the operator ruled that construct DISSOLVED
+        //     rather than sided with: under class-scoped letters it is illegal,
+        //     and the divergence disappears with the program that exhibited it.
+        //   * MemBase: the letter still dies (the arm below), but the CLASS
+        //     check applies to the ADDRESS register the binding carries —
+        //     ✔MEASURED, `%d0` on an `"m"`-bound double is the SAME hard error
+        //     under both references as the `"r"` case, while a GPR letter on
+        //     the same binding is accepted-and-ignored. One rule, both
+        //     measured behaviours: the binding's class decides.
+        //   * ImmInt: SKIPPED. ✔MEASURED, the references SPLIT — gcc refuses
+        //     `%d0` on `"i"(7)`, clang renders `7` — and acceptance is decided
+        //     by the disjunction, so the letter dies exactly as an unscoped
+        //     one does (both references accept-and-ignore a GPR letter there).
+        //
+        // ⚠ AN EMPTY `registerClass` IS THE WIDTH-ONLY POSTURE (the x86-64
+        // document's, where gcc ACCEPTS a GPR letter on an xmm operand and
+        // renders the bare form) and skips this check entirely — the loader
+        // guarantees a dialect is all-scoped or all-unscoped, so the skip is
+        // per DOCUMENT in effect, never per row.
+        if (view != nullptr && !view->registerClass.empty()
+            && resolved.operandKind != OperandKindFilter::ImmInt) {
+            auto const scopedTo = targetRegClassFromName(view->registerClass);
+            if (!scopedTo.has_value()) {
+                // The loader validates the name at load; reaching this arm
+                // means a hand-built `AssemblyConfig` bypassed it. Refuse —
+                // treating it as width-only would apply the letter to a class
+                // its document never granted.
+                sink_.fail(node,
+                     std::format("width-view letter '{}' is scoped to register "
+                                 "class '{}', which is not a class of the "
+                                 "envelope — this dialect's configuration was "
+                                 "not produced by the loader that validates "
+                                 "it{}",
+                                 view->letter, view->registerClass,
+                                 sink_.pairSuffix()));
+                return std::nullopt;
+            }
+            auto const operandClass =
+                static_cast<TargetRegClass>(resolved.regClass);
+            if (operandClass != *scopedTo) {
+                std::string declared;
+                for (auto const& m : cfg_.templateModifiers) {
+                    auto const mc = targetRegClassFromName(m.registerClass);
+                    if (!mc.has_value() || *mc != operandClass) continue;
+                    if (!declared.empty()) declared += ", ";
+                    declared += std::format("'{}' ({} bits)", m.letter,
+                                            m.widthBits);
+                }
+                sink_.fail(node,
+                     std::format("'{}' selects a width view through letter "
+                                 "'{}', which this dialect declares for class "
+                                 "'{}' — but the operand it names lives in "
+                                 "class '{}'. {}. A view letter names a view "
+                                 "of a register FILE, and no reference gives "
+                                 "the mismatch one meaning: an FP letter on an "
+                                 "integer operand is a hard error under both "
+                                 "gcc and clang, and a GPR letter on an FP "
+                                 "operand is rendered as a DIFFERENT register "
+                                 "by each — so the construct is refused rather "
+                                 "than given whichever meaning one of them "
+                                 "picked{}",
+                                 written, view->letter, view->registerClass,
+                                 targetRegClassName(operandClass),
+                                 declared.empty()
+                                     ? std::format(
+                                           "This dialect declares no view "
+                                           "letters for '{}' at all",
+                                           targetRegClassName(operandClass))
+                                     : std::format(
+                                           "The letters declared for '{}' are "
+                                           "{}",
+                                           targetRegClassName(operandClass),
+                                           declared),
+                                 sink_.pairSuffix()));
+                return std::nullopt;
+            }
+        }
         switch (resolved.operandKind) {
             case OperandKindFilter::Reg:
                 break;

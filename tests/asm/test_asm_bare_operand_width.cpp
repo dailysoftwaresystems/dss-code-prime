@@ -335,6 +335,92 @@ TEST(AsmBareOperandWidth, UndeclaredDerivationIsRefusedNotGuessed) {
            "since the facet is declared per class: " << msg;
 }
 
+// ══ THE FP CLASS — R5 OF DESIGN A′ ════════════════════════════════════════
+//
+//     D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE
+//
+// ★★★ THE SUBJECT: a bare `%N` on an FP-class binding names the FULL 128-bit
+// `v` register on this port. ✔MEASURED at the P50 base (2026-09-01), gcc
+// 13.3.0 AND clang 18.1.3 separately (clang under `-fno-integrated-as`),
+// `-O0` and `-O2`: a bare `%0` on a `"w"`-bound `float`/`double`/`long
+// double`/`__int128` renders `v0` under both at both levels — 16/16 rows.
+// The shipped `fpr` row is therefore `registerNatural`, and
+// `registerClassNaturalWidthBits` answers 128 (the `v` roots are the class's
+// only no-`subOf` rows).
+//
+// ⚠ WHY THIS PIN READS A MESSAGE AND NOT BYTES, STATED RATHER THAN GLOSSED:
+// `asm-arm64-gas.lang.json` declares no floating-point mnemonic (✔MEASURED,
+// and `examples/c/c_inline_asm_fp_class_constraint` records the same gap), so
+// no instruction containing an FP-class operand can ENCODE today. What the
+// derivation change moves is which refusal fires: at 128 bits the template
+// translator's width-flag map refuses FIRST, naming the width — which is only
+// reachable if the derivation really answered 128. The mutant control below
+// proves the discrimination in the other direction.
+TEST(AsmBareOperandWidth, Arm64FpBareOperandNamesTheFullVectorRegister) {
+    auto const r = run(kArm, "mov %0, %1\n", {"%0", "%1"}, {"v0", "v1"}, 64,
+                       LirRegClass::FPR);
+    ASSERT_TRUE(r->parsed) << "template did not parse";
+    EXPECT_FALSE(r->ok)
+        << "a 128-bit FP operation elected a variant — no shipped arm64 "
+           "mnemonic declares one, so something substituted a narrower width";
+    auto const msg = messages(*r);
+    // ★ `ok == false` IS ITSELF THE DISCRIMINATOR: under the pre-R5
+    // `operandType` rule this exact run LOWERS CLEAN at 64 bits (the mutant
+    // control below proves it), so a refusal here can only mean a width the
+    // map has no arm for — and the message must say which.
+    EXPECT_NE(msg.find("128 bits"), std::string::npos)
+        << "the refusal must carry the derived width — 128, the register-"
+           "natural answer — or the derivation did not run: " << msg;
+}
+
+// ★★ THE REMOVE-DIRECTION MUTANT FOR R5: revert the shipped `fpr` row to
+// `operandType` and the SAME template must fail DIFFERENTLY — the 64-bit
+// binding width passes the width map, election picks the gpr `mov`, and the
+// encoder's register-bank guard refuses. Two distinct refusal texts from one
+// source shape is what proves the engine reads the DECLARATION rather than
+// carrying a 128 of its own.
+TEST(AsmBareOperandWidth, RevertingTheFpDeclarationRestoresTheNarrowTier) {
+    auto reverted = test_support::mutateShippedTargetSchemaDoc(
+        kArm.target, [](nlohmann::json& doc) {
+            ASSERT_TRUE(doc.contains("asmBareOperandWidths"));
+            bool changed = false;
+            for (auto& row : doc.at("asmBareOperandWidths")) {
+                if (row.value("class", std::string{}) != "fpr") continue;
+                ASSERT_EQ(row.value("derivation", std::string{}),
+                          "registerNatural")
+                    << "the shipped arm64 fpr row must be `registerNatural` "
+                       "(R5), or this revert is not the revert it claims to be";
+                row["derivation"] = "operandType";
+                changed = true;
+            }
+            ASSERT_TRUE(changed) << "the mutation matched no fpr row";
+        });
+    ASSERT_TRUE(reverted.has_value());
+
+    auto const r = runOn(loadDialect(kArm.dialect), *reverted,
+                         "mov %0, %1\n", {"%0", "%1"}, {"v0", "v1"}, 64,
+                         LirRegClass::FPR);
+    ASSERT_TRUE(r->parsed);
+    // ⚠ THE TWO ARMS FAIL AT DIFFERENT TIERS AND THAT IS THE WHOLE PIN. Under
+    // `operandType` the 64-bit binding passes the width map, so the LOWERING
+    // succeeds — `ok` is TRUE — and the death happens later, at the encoder's
+    // register-bank guard, whose diagnostics this harness's `assemble()` call
+    // discards; what it leaves behind is an EMPTY byte vector (the function is
+    // dropped from the module). Under `registerNatural` the lowering itself
+    // refuses, naming 128. `ok` flipping with the document is the derivation
+    // being READ.
+    EXPECT_TRUE(r->ok)
+        << "under `operandType` the 64-bit-bound bare FP operand must pass "
+           "the lowering (the width map has a 64 arm): " << messages(*r);
+    EXPECT_EQ(messages(*r).find("128 bits"), std::string::npos)
+        << "the reverted document still derived 128 — the engine is not "
+           "reading the declaration: " << messages(*r);
+    EXPECT_TRUE(r->bytes.empty())
+        << "a gpr-elected `mov` over v-registers ENCODED — the register-bank "
+           "guard one tier down has been deleted, which is a different defect "
+           "this pin must not mask: " << hex(r->bytes);
+}
+
 // ★★ THE CONTROL FOR THE MUTANT ABOVE — the arm that proves the pin is not
 // simply failing in both directions. The same document, mutated by the same
 // helper, with the derivation FLIPPED rather than removed: the lowering must

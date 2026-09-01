@@ -486,6 +486,36 @@ def place_row(root, working, anchor, row, write, insert=False, report=print):
     if was is not None and was.rel != dest:
         report("  MOVE    deleted from %s, appended to %s" % (was.rel, dest))
 
+    # ⚠⚠ A MOVE IS TWO FILE WRITES AND IT USED TO DELETE FIRST, SO A FAILURE BETWEEN
+    # THEM LOST THE ROW ENTIRELY. [[D-GATE-ANCHORS-A-MOVE-IS-NOT-ATOMIC-AND-LOST-A-ROW]]
+    # ✔MEASURED 2026-09-01 (P50) closing D-CSUBSET-NORETURN-NON-FUNCTION-OBJECT: the
+    # delete landed, the append did not (rc=1, no `WROTE` line), and the row was left in
+    # NO registry at all -- recovered only because HEAD still held it.
+    # ★ THE DANGEROUS PART IS WHICH WAY IT FAILS. `check-anchor-balance` counts OPEN rows
+    # BY NAME, so a row that vanished from both files reads exactly like a row that was
+    # CLOSED: silent loss reported as progress, in the one direction a gate must never
+    # fail in.
+    # ⇒ TWO CHANGES, BOTH ABOUT ORDER RATHER THAN ABOUT LOCKING. (1) Every destination's
+    # new content is computed BEFORE anything is written, so a malformed table or a
+    # missing heading raises while the tree is still untouched. (2) The APPEND is written
+    # FIRST and the deletions after, so an interrupted move leaves the row in BOTH places
+    # -- which THIS function refuses loudly on its next call ("One id, one home") and a
+    # human then settles. A duplicate is visible; a disappearance is not.
+    # ⓘ This is not a transaction and does not pretend to be one: two files cannot be
+    # renamed atomically. What it guarantees is that the surviving state always has AT
+    # LEAST one copy of the row.
+    pending = []
+
+    dest_path = os.path.join(root, dest)
+    dest_lines = io.open(dest_path, encoding="utf-8", newline="").read().split("\n")
+    here = existing.get(dest)
+    if here:
+        dest_lines[here[0].line_no - 1] = row
+    else:
+        _first, end = _table_bounds(dest_lines, heading)
+        dest_lines.insert(end, row)
+    pending.append((dest_path, dest_lines))
+
     for rel, rows in sorted(existing.items()):
         if rel == dest:
             continue
@@ -495,17 +525,11 @@ def place_row(root, working, anchor, row, write, insert=False, report=print):
         if len(keep) != len(lines) - 1:
             raise Refused("deleting %s from %s did not remove exactly one line"
                           % (anchor, rel))
-        _rewrite(path, keep, write)
+        pending.append((path, keep))
 
-    path = os.path.join(root, dest)
-    lines = io.open(path, encoding="utf-8", newline="").read().split("\n")
-    here = existing.get(dest)
-    if here:
-        lines[here[0].line_no - 1] = row
-    else:
-        _first, end = _table_bounds(lines, heading)
-        lines.insert(end, row)
-    _rewrite(path, lines, write)
+    # `pending[0]` is the destination by construction above -- the append goes first.
+    for path, lines in pending:
+        _rewrite(path, lines, write)
     return dest
 
 
@@ -938,6 +962,37 @@ def self_test():
                   make_row(B_, "P1", "closed", "t"), write=False, report=quiet)
         pin(io.open(os.path.join(tmp, REL["production"]), encoding="utf-8").read()
             == before, "(24) a dry run writes nothing at all")
+
+        # ── (25)(26) A MOVE NEVER LOSES THE ROW, EVEN INTERRUPTED ─────────────
+        # [[D-GATE-ANCHORS-A-MOVE-IS-NOT-ATOMIC-AND-LOST-A-ROW]]. The order is the
+        # whole fix: the APPEND is written first, so an interruption leaves the row
+        # in BOTH files -- refused loudly on the next call -- instead of in NEITHER,
+        # which the balance gate would read as a closure. Simulated by failing the
+        # SECOND write, which is where the old order lost the row.
+        box(tmp)
+        real_rewrite = globals()["_rewrite"]
+        calls = []
+
+        def _fail_after_first(path, lines, write):
+            calls.append(path)
+            if len(calls) > 1:
+                raise IOError("simulated failure on the second write of the move")
+            return real_rewrite(path, lines, write)
+
+        globals()["_rewrite"] = _fail_after_first
+        try:
+            place_row(tmp, "production", B_, make_row(B_, "P1", "closed", "t"),
+                      write=True, report=quiet)
+        except IOError:
+            pass
+        finally:
+            globals()["_rewrite"] = real_rewrite
+        prod = io.open(os.path.join(tmp, REL["production"]), encoding="utf-8").read()
+        done = io.open(os.path.join(tmp, REL["done"]), encoding="utf-8").read()
+        pin(("`%s`" % B_) in prod or ("`%s`" % B_) in done,
+            "(25) an INTERRUPTED move leaves the row SOMEWHERE, never nowhere")
+        pin(("`%s`" % B_) in done,
+            "(26) ... and specifically in the DESTINATION, because the append goes first")
 
     print("anchors self-test: %d failed" % failed[0])
     return 1 if failed[0] else 0

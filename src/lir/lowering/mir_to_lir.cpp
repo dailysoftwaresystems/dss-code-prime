@@ -960,6 +960,31 @@ struct Lowerer {
     // thread-local accesses reports the missing format capability once).
     bool tlsFormatRejectReported_ = false;
 
+    // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50, CLOSED): whether
+    // bare `char` (`TypeKind::Char`) is UNSIGNED for this compilation — the
+    // (processor × platform) fact the TARGET declares in its one
+    // `charIsUnsigned` key, resolved per object format ONE LEVEL UP
+    // (`TargetSchema::charIsUnsigned(ObjectFormatKind)` — the format kind is a
+    // required argument THERE) and threaded in as a VALUE, like every other
+    // format-resolved fact here (`externCallDispatch_` and friends). Read by
+    // exactly TWO arms, both DEFENSIVE — the shipped C frontend
+    // integer-promotes a subscript / switch discriminant before either can see
+    // a raw narrow `Char`, and no other shipped .lang.json maps a type onto
+    // `Char` at all (measured P50: zero hits over the full 1870-test corpus
+    // with a positive-controlled site instrument): the Gep runtime-index widen
+    // (SExt vs ZExt) and the switch jump-table discriminant widen. `nullopt` =
+    // nothing threaded: the Gep arm then fails LOUD (either extension picked
+    // blind is a silent wrong address on half the targets) and the jump-table
+    // arm DECLINES to the compare chain (equality at the discriminant's own
+    // width — signedness-agnostic, correct under either declaration). The
+    // production driver does not thread a value yet — a channel whose producer
+    // cannot exist is the dead-config shape this repo rejects; the first
+    // non-promoting frontend's driver passes
+    // `target.charIsUnsigned(format.kind())` exactly as it passes
+    // `externCallDispatch`, and the per-value routing is already built and
+    // pinned (tests/lir/test_mir_to_lir.cpp).
+    std::optional<bool> charIsUnsigned_;
+
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbol minting for `&&label`
     // block-address materialization. A block whose address is taken gets ONE local
     // symbol (deduped by MIR block id within the module). `nextBlockSym_` is seeded
@@ -1116,14 +1141,16 @@ struct Lowerer {
             std::optional<ExternAddrBinding> externAddrBinding,
             std::optional<TlsAccessInfo> tlsAccess,
             std::span<MirSehScope const> sehScopes,
-            std::optional<std::string> wideFloatSoftcallLibrary)
+            std::optional<std::string> wideFloatSoftcallLibrary,
+            std::optional<bool> charIsUnsigned)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
           wideFloatSoftcallLibrary_(std::move(wideFloatSoftcallLibrary)),
           dataImportBinding_(dataImportBinding),
           externAddrBinding_(externAddrBinding),
-          tlsAccess_(tlsAccess), sehScopesIn_(sehScopes) {
+          tlsAccess_(tlsAccess), sehScopesIn_(sehScopes),
+          charIsUnsigned_(charIsUnsigned) {
         baselineErrors = reporter.errorCount();
         externSymbols.reserve(externImports.size());
         for (auto const& e : externImports) {
@@ -6543,8 +6570,10 @@ struct Lowerer {
             // U32 (ZExt), and 64-bit (no-op) arms fire — an enum index promotes to
             // its underlying int (I32 → SExt), it does NOT reach `default`. The
             // narrow Char/I8/I16/U8/U16 arms are DEFENSIVE: they mirror the SExt /
-            // ZExt source-width gates (the SExt arm takes Char/I8/I16/I32, the
-            // ZExt arm U8/U16/U32) so the widen stays correct-by-construction —
+            // ZExt source-width gates (the SExt arm takes I8/I16/I32, the ZExt arm
+            // U8/U16/U32, and BOTH accept Char — the target's `charIsUnsigned`
+            // declaration picks its side; see the Char arm below) so the widen
+            // stays correct-by-construction —
             // and always one those gates accept — IF a future non-promoted narrow
             // index ever reaches here; `default` is a fail-safe for a non-integer
             // kind (which a Gep index should never be) → no widen, status quo. The
@@ -6563,15 +6592,39 @@ struct Lowerer {
                 case TypeKind::U8: case TypeKind::U16: case TypeKind::U32:
                     widenSlot = MnemonicSlot::ZExt;  // unsigned → zero-extend
                     break;
-                case TypeKind::Char: case TypeKind::I8:
+                case TypeKind::Char:
+                    // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50,
+                    // CLOSED): bare `Char`'s signedness is the TARGET's declared
+                    // `charIsUnsigned` fact (threaded in as `charIsUnsigned_` —
+                    // see its member docblock), never a hard-coded bucket: an
+                    // unsigned-char target (arm64/elf) widens ZExt, a
+                    // signed-char one (x86_64 everywhere; arm64/macho|pe) SExt.
+                    // Still DEFENSIVE — the shipped C frontend integer-promotes
+                    // a subscript before Gep lowering (cst_to_hir combineIndex),
+                    // and no other shipped .lang.json maps a type onto `Char`
+                    // (measured P50) — but a HirBuilder frontend without an
+                    // `arithmeticConversions` block reaches here by
+                    // construction. With NOTHING threaded, fail LOUD: either
+                    // extension picked blind is a silent wrong address on half
+                    // the targets — the exact defect class this row was opened
+                    // for.
+                    if (!charIsUnsigned_.has_value()) {
+                        dss::report(reporter,
+                            DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                            DiagnosticSeverity::Error,
+                            "MIR Gep (runtime index widen): the index is a bare "
+                            "`Char`, whose signedness is target-declared "
+                            "(`charIsUnsigned`), but no resolved value was "
+                            "threaded into this lowering — SExt vs ZExt cannot "
+                            "be chosen "
+                            "(D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES)");
+                        return;
+                    }
+                    widenSlot = *charIsUnsigned_ ? MnemonicSlot::ZExt
+                                                 : MnemonicSlot::SExt;
+                    break;
+                case TypeKind::I8:
                 case TypeKind::I16:  case TypeKind::I32:
-                    // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES: `Char` is
-                    // bucketed SExt here TARGET-BLIND (right for signed-char
-                    // targets, but arm64's unsigned char would want ZExt). DEAD
-                    // today — C's mandatory integer promotion widens a char index
-                    // to `int` before Gep lowering (cst_to_hir combineIndex), so a
-                    // raw narrow `Char` never reaches this arm; latent only for a
-                    // future non-promoting (non-C) frontend over this substrate.
                     widenSlot = MnemonicSlot::SExt;  // signed sub-64 → sign-extend
                     break;
                 default:
@@ -11005,15 +11058,29 @@ struct Lowerer {
             case TypeKind::U8: case TypeKind::U16: case TypeKind::U32:
                 discrimWidenSlot = MnemonicSlot::ZExt;
                 break;
-            case TypeKind::Char: case TypeKind::I8:
+            case TypeKind::Char:
+                // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50,
+                // CLOSED): the table's `discrim - minCase` index arithmetic
+                // runs at 64 bits, so a bare-`Char` discriminant widens by the
+                // TARGET's declared `charIsUnsigned` (threaded in as
+                // `charIsUnsigned_` — see its member docblock), never a
+                // hard-coded SExt. Still DEFENSIVE — the shipped C frontend
+                // integer-promotes a switch discriminant (C 6.8.4.2, cst_to_hir
+                // promoteSubIntArith) before this fast path, and `unsigned
+                // char` (=U8) already ZExt's above — but a HirBuilder frontend
+                // with no `arithmeticConversions` block reaches here by
+                // construction. With NOTHING threaded, DECLINE the table (a
+                // fall-through is not an error): the compare chain below is
+                // equality-only at the discriminant's own width, which is
+                // signedness-agnostic and therefore correct under either
+                // declaration — unlike a blind widen, which would be a silent
+                // wrong-dispatch on half the targets.
+                if (!charIsUnsigned_.has_value()) return false;
+                discrimWidenSlot = *charIsUnsigned_ ? MnemonicSlot::ZExt
+                                                    : MnemonicSlot::SExt;
+                break;
+            case TypeKind::I8:
             case TypeKind::I16:  case TypeKind::I32:
-                // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES: bare `Char`
-                // SExt here is TARGET-BLIND (arm64 unsigned char would want ZExt)
-                // but DEAD — C promotes a switch discriminant to `int` (6.8.4.2,
-                // cst_to_hir promoteSubIntArith) before this fast path, so a raw
-                // narrow `Char` never reaches it. `unsigned char` (=U8) already
-                // ZExt's above; only a future non-promoting frontend could expose
-                // the bare-Char gap.
                 discrimWidenSlot = MnemonicSlot::SExt;
                 break;
             default:
@@ -11975,7 +12042,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::optional<TlsAccessInfo> tlsAccess,
                           std::span<MirSehScope const> sehScopes,
                           std::optional<std::string> wideFloatSoftcallLibrary,
-                          std::optional<ExternAddrBinding> externAddrBinding) {
+                          std::optional<ExternAddrBinding> externAddrBinding,
+                          std::optional<bool> charIsUnsigned) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -11992,10 +12060,16 @@ MirToLirResult lowerToLir(Mir const&          mir,
     // format's F128 softcall runtime library — the F128 softcall verb
     // binds each minted extern to it; nullopt + an F128 softcall =
     // fail-loud (no unbound extern).
+    // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50): also pass the
+    // target's resolved bare-`char` signedness — the Gep runtime-index widen
+    // and the switch jump-table discriminant widen read it for a raw narrow
+    // `Char`; nullopt + a raw `Char` index = fail-loud (no blind extension),
+    // nullopt + a raw `Char` jump-table discriminant = the sign-agnostic
+    // compare chain.
     Lowerer L{mir, target, interner, reporter, externImports,
               externCallDispatch, dataImportBinding, externAddrBinding,
               tlsAccess, sehScopes,
-              std::move(wideFloatSoftcallLibrary)};
+              std::move(wideFloatSoftcallLibrary), charIsUnsigned};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

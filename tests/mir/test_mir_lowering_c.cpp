@@ -1617,6 +1617,107 @@ TEST(MirLoweringC, BareCharSignednessIsResolvedPerTargetAndFormat) {
     }
 }
 
+// D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50): `mapBinaryOp` was the
+// LAST target-blind char-signedness classification in this lowering — its local
+// signed-kind list (I8..I128, `Char` absent) classified a bare-`Char` operand
+// UNSIGNED for Div/Rem/Shr AND the ordered comparisons, opposite the
+// then-hard-coded SIGNED guess in the mir_to_lir widen arms. It now routes
+// through the ONE target-aware `isSignedIntKind` (the TF-C56 chokepoint that
+// `mapCast` already uses), so bare `Char` follows the target's `charIsUnsigned`
+// declaration: SDiv/SMod/AShr/ICmpSlt on a signed-char target, UDiv/UMod/LShr/
+// ICmpUlt on an unsigned-char one.
+//
+// Built via the public `HirBuilder`, NOT by parsing C: the C frontend CANNOT
+// produce this shape — its usual arithmetic conversions promote every binary
+// operand to >=int first (pinned by BareCharToIntPromotionIsTargetSignednessAware
+// above), which is exactly why the site sat unreachable-but-wrong. A raw `Char`
+// binop is what a non-promoting HirBuilder frontend (a language with no
+// `arithmeticConversions` block) would emit.
+//
+// RED-ON-DISABLE: restore mapBinaryOp's former local signed list (drop the
+// `isSignedIntKind` routing) → every signed-char arm below flips to the
+// U-opcodes and this test goes red by name; the I8 control arm stays green
+// (I8 is unconditional in both renditions).
+TEST(MirLoweringC, RawCharBinaryOpSignednessIsTargetKeyed) {
+    struct OpRow {
+        HirOpKind   op;
+        bool        boolResult;   // comparison: the node's type is Bool
+        MirOpcode   signedOp;     // expected when bare char is SIGNED
+        MirOpcode   unsignedOp;   // expected when bare char is UNSIGNED
+        char const* what;
+    };
+    auto lowerRawBinop = [](HirOpKind op, TypeKind operandKind, bool boolResult,
+                            bool charIsUnsigned, DiagnosticReporter& rep) {
+        TypeInterner ti{CompilationUnitId{1}};
+        TypeId const operandTy = ti.primitive(operandKind);
+        TypeId const resTy =
+            boolResult ? ti.primitive(TypeKind::Bool) : operandTy;
+        TypeId const fnTy = ti.fnSig(std::array{operandTy}, resTy, CallConv::CcSysV);
+
+        HirBuilder b{"c"};
+        HirNodeId const param = b.makeVarDecl(operandTy, /*sym=*/1);
+        HirNodeId const bin   = b.makeBinaryOp(
+            op, b.makeRef(operandTy, 1), b.makeRef(operandTy, 1), resTy);
+        HirNodeId const body = b.makeBlock(std::array{b.makeReturn(bin)});
+        HirNodeId const fn =
+            b.makeFunction(fnTy, /*sym=*/7, std::array{param}, body);
+        HirNodeId const root = b.makeModule(std::array{fn});
+        Hir hir = std::move(b).finish(root);
+
+        HirLiteralPool pool;
+        MirLoweringConfig cfg;
+        cfg.charIsUnsigned = charIsUnsigned;
+        return lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr, cfg);
+    };
+
+    for (OpRow const row : {
+             OpRow{HirOpKind::Div, false, MirOpcode::SDiv, MirOpcode::UDiv,
+                   "`c / c` divide"},
+             OpRow{HirOpKind::Rem, false, MirOpcode::SMod, MirOpcode::UMod,
+                   "`c % c` remainder"},
+             OpRow{HirOpKind::Shr, false, MirOpcode::AShr, MirOpcode::LShr,
+                   "`c >> c` right shift"},
+             OpRow{HirOpKind::Lt, true, MirOpcode::ICmpSlt, MirOpcode::ICmpUlt,
+                   "`c < c` ordered compare"},
+         }) {
+        for (bool const charIsUnsigned : {false, true}) {
+            DiagnosticReporter rep;
+            auto result = lowerRawBinop(row.op, TypeKind::Char, row.boolResult,
+                                        charIsUnsigned, rep);
+            ASSERT_TRUE(result.ok)
+                << row.what << ": raw-Char binop must lower clean: "
+                << (rep.all().empty() ? "" : rep.all()[0].actual);
+            Mir const& m = result.mir;
+            MirOpcode const want  = charIsUnsigned ? row.unsignedOp : row.signedOp;
+            MirOpcode const wrong = charIsUnsigned ? row.signedOp   : row.unsignedOp;
+            EXPECT_EQ(collectOps(m, want).size(), 1u)
+                << row.what << ": bare char with charIsUnsigned="
+                << charIsUnsigned
+                << " must take the target-declared signedness opcode";
+            EXPECT_EQ(collectOps(m, wrong).size(), 0u)
+                << row.what << ": the opposite-signedness opcode must NOT be "
+                   "emitted — a target-blind guess is the exact defect this "
+                   "row closed";
+        }
+    }
+
+    // Control: `signed char` (I8) is UNCONDITIONALLY signed — the routing
+    // through `isSignedIntKind` must not disturb any non-Char kind, even
+    // under an unsigned-char target declaration.
+    {
+        DiagnosticReporter rep;
+        auto result = lowerRawBinop(HirOpKind::Div, TypeKind::I8,
+                                    /*boolResult=*/false,
+                                    /*charIsUnsigned=*/true, rep);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(collectOps(result.mir, MirOpcode::SDiv).size(), 1u)
+            << "I8 stays SDiv under charIsUnsigned=true — only bare Char "
+               "consults the target";
+        EXPECT_EQ(collectOps(result.mir, MirOpcode::UDiv).size(), 0u);
+    }
+}
+
 // D-CSUBSET-NEG-INT-TO-PTR-SIGN-EXTEND: an integer→pointer conversion widens the
 // source to POINTER WIDTH per its signedness BEFORE IntToPtr — SExt a signed
 // narrower int, ZExt an unsigned one, and SKIP a source already at pointer width

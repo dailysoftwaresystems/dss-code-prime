@@ -110,8 +110,35 @@ cmd_add() {  # <name> [committish]
   printf '%s\n' "$abs"
 }
 
-cmd_remove() {  # <name>
-  name="${1:-}"; [ -n "$name" ] || _die 5 "usage: lane-worktree.sh remove <name>"
+# ⚠⚠ A LANE'S SCRATCHPAD IS ITS EVIDENCE, AND THIS VERB USED TO DELETE IT WITHOUT
+#    ASKING. [[D-CYCLE-LANE-WORKTREE-REMOVE-DISCARDS-AN-UNPRESERVED-SCRATCHPAD]]
+#    ✔MEASURED 2026-09-01 (cycle P50): the orchestrator ran
+#      cp -r .worktrees/t2/scratchpad/p50/t2 scratchpad/p50/t2 && echo preserved
+#      bash scripts/lane-worktree/lane-worktree.sh remove t2
+#    on ONE command line. `scratchpad/p50/` did not exist in the main tree, so `cp`
+#    failed, `&& echo` printed nothing, and the ABSENCE of output read as "fine" --
+#    then the very next command destroyed the only copy. Lane `t2`'s 14 result JSONs
+#    and its md5 ledger are gone, and the row that cites them had to be amended to
+#    admit it. ★ THE PRESERVE STEP WAS A CONVENTION LIVING IN THE ORCHESTRATOR'S
+#    HEAD, and this repository has already measured that a rule with no teeth at the
+#    moment of the decision is a rule that erodes. ⇒ the tool now owns it: a lane
+#    whose scratchpad holds files cannot be removed silently. `--preserve-to <dir>`
+#    makes the COPY this script's job so it cannot fail quietly (it copies, counts
+#    both sides, and REFUSES on any mismatch); `--discard-scratchpad` is the explicit
+#    "I do not want it", which is a decision rather than an accident.
+cmd_remove() {  # <name> [--preserve-to <dir> | --discard-scratchpad]
+  name="${1:-}"; [ -n "$name" ] || _die 5 "usage: lane-worktree.sh remove <name> [--preserve-to <dir> | --discard-scratchpad]"
+  shift || true
+  preserve_to=""; discard=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --preserve-to) preserve_to="${2:-}"; [ -n "$preserve_to" ] || _die 5 "--preserve-to needs a directory"; shift 2 ;;
+      --discard-scratchpad) discard=1; shift ;;
+      *) _die 5 "unknown option '$1' (expected --preserve-to <dir> or --discard-scratchpad)" ;;
+    esac
+  done
+  [ "$discard" -eq 1 ] && [ -n "$preserve_to" ] \
+    && _die 5 "--preserve-to and --discard-scratchpad contradict each other; pick one."
   # ⚠⚠ THE SAME NAME VALIDATION `cmd_add` PERFORMS, AND IT MATTERS MORE HERE, because
   # this verb now DELETES a directory tree. `cmd_add` refused a name with a slash or a
   # leading dot and `cmd_remove` did not -- harmless while the only verb was
@@ -121,6 +148,40 @@ cmd_remove() {  # <name>
     */*|.*) _die 5 "lane name must be a single path component and must not start with '.': '$name'" ;;
   esac
   repo="$(_repo_root)"; rel=".worktrees/$name"; abs="$repo/$rel"
+
+  # ── THE SCRATCHPAD GATE, BEFORE ANY DELETION ────────────────────────────────
+  # Counted with `find -type f`, so an empty directory tree is correctly "nothing to
+  # preserve" and a single file is enough to stop the removal.
+  pad="$abs/scratchpad"
+  pad_files=0
+  if [ -d "$pad" ]; then
+    pad_files="$(find "$pad" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+  if [ "$pad_files" -gt 0 ] && [ "$discard" -eq 0 ] && [ -z "$preserve_to" ]; then
+    _die 7 "'$rel' holds a scratchpad with $pad_files file(s) and would be DELETED with it." \
+           "A lane's scratchpad is its EVIDENCE -- probes, transcripts, mutant logs, the" \
+           "artefacts its registry row cites. Choose explicitly:" \
+           "  --preserve-to <dir>      copy it there FIRST; this script verifies the copy" \
+           "  --discard-scratchpad     delete it deliberately" \
+           "This gate exists because a hand-rolled 'cp && remove' one-liner lost lane t2's" \
+           "entire evidence tree in P50 when the destination's parent did not exist."
+  fi
+  if [ "$pad_files" -gt 0 ] && [ -n "$preserve_to" ]; then
+    mkdir -p "$preserve_to" || _die 7 "could not create '$preserve_to'"
+    # `cp -R <src>/. <dst>/` copies the CONTENTS, so an existing destination is filled
+    # rather than nested one level deeper -- the shape a re-run needs.
+    cp -R "$pad/." "$preserve_to/" || _die 7 "copy of '$pad' -> '$preserve_to' FAILED; nothing was removed."
+    got="$(find "$preserve_to" -type f 2>/dev/null | wc -l | tr -d ' ')"
+    # ⚠ VERIFY, DO NOT ASSUME. The whole defect this gate closes was a copy that
+    # failed while the caller read silence as success.
+    [ "$got" -ge "$pad_files" ] \
+      || _die 7 "preserve VERIFY FAILED: $pad_files file(s) under '$pad' but only $got under" \
+                "'$preserve_to'. REFUSING to remove '$rel' -- the evidence would be lost."
+    _say "preserved $pad_files scratchpad file(s) -> $preserve_to (verified $got present)"
+  elif [ "$pad_files" -gt 0 ]; then
+    _say "DISCARDING $pad_files scratchpad file(s) under $rel, as instructed"
+  fi
+
   # --force because a lane worktree always carries an ignored build/ tree; without
   # it git refuses and the caller is tempted to `rm -rf`, which leaves the
   # registration behind in .git/worktrees/ where `git status` never shows it.
@@ -183,5 +244,7 @@ case "${1:-}" in
   add)    shift; cmd_add    "$@" ;;
   remove) shift; cmd_remove "$@" ;;
   list)   shift; cmd_list   "$@" ;;
-  *) _die 5 "usage: lane-worktree.sh {add <name> [committish] | remove <name> | list}" ;;
+  *) _die 5 "usage: lane-worktree.sh {add <name> [committish] |" \
+            "                         remove <name> [--preserve-to <dir> | --discard-scratchpad] |" \
+            "                         list}" ;;
 esac

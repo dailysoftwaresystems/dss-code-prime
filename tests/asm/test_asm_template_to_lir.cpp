@@ -1823,10 +1823,13 @@ TEST(AsmTemplateToLir, HalfATemplateSurfaceIsRefusedAtLoadNamingEveryKey) {
 // view of operand 2, or `%l0` refused as an out-of-range label). A refusal
 // naming both owners is the only honest answer.
 //
-// ⚠ THE WIDTH ARM IS NOT PEDANTRY EITHER: `lirInstWidthBits` states 8/16/32/64
-// and nothing else, so a declared 24 would be carried onto the instruction and
-// read back as 64 — a wrong-width operation with a clean build log, which is
-// precisely what the retired `S0067` refusal existed to prevent.
+// ⚠ THE WIDTH ARM IS NOT PEDANTRY EITHER: `lirInstWidthBits` states
+// 8/16/32/64/128 and nothing else (the declarable set is
+// `AssemblyConfig::kTemplateModifierWidthBits`, static_assert-tied to the LIR
+// flags in `test_asm_class_scoped_modifiers.cpp`), so a declared 24 would be
+// carried onto the instruction and read back as 64 — a wrong-width operation
+// with a clean build log, which is precisely what the retired `S0067` refusal
+// existed to prevent.
 TEST(AsmTemplateToLir, AnIncoherentWidthViewDeclarationIsRefusedAtLoad) {
     struct Arm {
         char const* what;

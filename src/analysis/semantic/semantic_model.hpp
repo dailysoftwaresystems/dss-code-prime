@@ -607,6 +607,31 @@ struct DSS_EXPORT SymbolRecord {
     // B/C). Orthogonal to binding/visibility (a file-scope thread_local
     // keeps external linkage). Default false.
     bool            isThreadLocal = false;
+    // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH, C 6.2.2p3): TRUE iff
+    // this identifier has INTERNAL linkage — its declaration carries a
+    // `{staticStorage: true}` specifier (the SAME `linkageSpecifiers` facet the
+    // HIR linkage fold and the thread/static scans read) AND binds at FILE
+    // scope. A block-scope `static` object has NO linkage (6.2.2p6) and stays
+    // false; so do params, members and every extern/plain declaration.
+    //
+    // ★ IT INHERITS ACROSS THE REDECLARATION MERGE, AND THAT IS THE C RULE,
+    // NOT A CONVENIENCE. 6.2.2p4 gives a later `extern` (and, via p5, a later
+    // plain FUNCTION declaration) the linkage of the visible prior
+    // declaration, so `static int f(void); int f(void) { … }` makes the
+    // DEFINITION internal — and a third `static int f(void);` after it is a
+    // LEGAL redeclaration of an internal identifier (✔MEASURED: gcc, clang
+    // AND MSVC all accept the triple). `mergeOrCollideRedeclaration`
+    // OR-propagates this flag across every merged pair AT MERGE TIME (not in
+    // the post-1.5 sweep — the next merge in a chain reads the survivor's
+    // flag), which is exactly what keeps the S_LinkageRedeclarationMismatch
+    // check from firing on the inherited orderings.
+    //
+    // ⓘ Read by the merge's mismatch check ONLY. HIR emission linkage still
+    // folds from each declaration's OWN tokens (`linkageFrom`), so a merged
+    // survivor whose own spelling lacks `static` (the f1 inheritance shape)
+    // still EMITS external — a measured, documented residue on the row, not
+    // this field's consumer.
+    bool            isInternalLinkage = false;
     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
     // facts folded from the declaration's specifier prefix by
     // `scanAttributeSemantics` (Pass-1.5 declarator resolution — the

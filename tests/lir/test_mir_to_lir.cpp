@@ -3119,6 +3119,317 @@ TEST(MirToLir, GepDynamicIndexEmitsFourOperandLea) {
     EXPECT_TRUE(foundLea);
 }
 
+// D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50): the Gep RUNTIME-index
+// widen used to bucket a bare-`Char` index into the unconditional-SExt group,
+// TARGET-BLIND — wrong (a silent wrong address) the day an unsigned-char
+// target's frontend feeds a raw `Char` index. It now routes through the
+// `charIsUnsigned` value threaded into `lowerToLir` (the target's own
+// declaration, resolved per object format one level up), and with NOTHING
+// threaded it fails LOUD rather than guess. The shape is hand-built MIR
+// because no shipped frontend can produce it: the C frontend integer-promotes
+// every subscript (cst_to_hir combineIndex) — measured P50 with a
+// positive-controlled site instrument over the full corpus, zero raw-Char
+// arrivals.
+// RED-ON-DISABLE: restore `case TypeKind::Char:` into the unconditional-SExt
+// group → the unsigned-char leg emits sext (zext 0), the nullopt leg lowers
+// silently instead of failing — both go red by name.
+TEST(MirToLir, GepCharRuntimeIndexWidenIsTargetKeyed) {
+    auto const buildGepFn = [](::dss::TypeInterner& interner,
+                               ::dss::TypeKind idxKind) {
+        auto const ptrT =
+            interner.pointer(interner.primitive(::dss::TypeKind::Void));
+        auto const idxT = interner.primitive(idxKind);
+        std::array<::dss::TypeId, 2> params{ptrT, idxT};
+        auto const fnSig = interner.fnSig(params, ptrT, ::dss::CallConv::CcSysV);
+        ::dss::MirBuilder mb;
+        mb.addFunction(fnSig, ::dss::SymbolId{1});
+        ::dss::MirBlockId const bb =
+            mb.createBlock(::dss::StructCfMarker::EntryBlock);
+        mb.beginBlock(bb);
+        ::dss::MirInstId const base  = mb.addArg(0, ptrT);
+        ::dss::MirInstId const index = mb.addArg(1, idxT);
+        std::array<::dss::MirInstId, 2> gepOps{base, index};
+        ::dss::MirInstId const g =
+            mb.addInst(::dss::MirOpcode::Gep, gepOps, ptrT);
+        mb.addReturn(g);
+        return std::move(mb).finish();
+    };
+    auto const lowerWith = [](::dss::Mir const& m, ::dss::TargetSchema const& sch,
+                              ::dss::TypeInterner const& interner,
+                              ::dss::DiagnosticReporter& rep,
+                              std::optional<bool> charIsUnsigned) {
+        return ::dss::lowerToLir(m, sch, interner, rep, {}, std::nullopt,
+                                 std::nullopt, std::nullopt, {}, std::nullopt,
+                                 std::nullopt, charIsUnsigned);
+    };
+    auto const countLirOps = [](::dss::Lir const& lir, std::uint16_t opc) {
+        std::size_t n = 0;
+        ::dss::LirFuncId const f = lir.funcAt(0);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(f); ++bi) {
+            ::dss::LirBlockId const b = lir.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(b); ++i)
+                if (lir.instOpcode(lir.blockInstAt(b, i)) == opc) ++n;
+        }
+        return n;
+    };
+
+    // Leg 1 — x86_64 with the target's OWN resolved declaration: x86_64 ships
+    // no `charIsUnsigned` key at all (absent = signed on every format it
+    // serves), so the resolved value is false and the widen must SExt.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        bool const resolved =
+            sch.charIsUnsigned(::dss::ObjectFormatKind::Elf);
+        EXPECT_FALSE(resolved)
+            << "x86_64 declares no charIsUnsigned key — bare char is signed";
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildGepFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, resolved);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 1u)
+            << "signed-char target: the Char index widen must SIGN-extend";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("zext")), 0u);
+    }
+
+    // Leg 2 — arm64 with ITS resolved elf declaration (default true — the
+    // AAPCS64/GNU-Linux unsigned char): the widen must ZExt, through the
+    // arm64 opcode table (uxtb).
+    {
+        auto target = ::dss::TargetSchema::loadShipped("arm64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        bool const resolved =
+            sch.charIsUnsigned(::dss::ObjectFormatKind::Elf);
+        EXPECT_TRUE(resolved)
+            << "arm64/elf declares unsigned bare char (charIsUnsigned default)";
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildGepFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, resolved);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("zext")), 1u)
+            << "unsigned-char target: the Char index widen must ZERO-extend";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 0u);
+    }
+
+    // Leg 3 — the VALUE governs, not the schema identity: x86_64 opcode
+    // table with a synthetic unsigned-char declaration still ZExts.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildGepFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result =
+            lowerWith(m, sch, interner, rep, std::optional<bool>{true});
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("zext")), 1u)
+            << "the threaded VALUE picks the extension — no schema-identity "
+               "branch";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 0u);
+    }
+
+    // Leg 4 — NOTHING threaded (nullopt, today's production state): a raw
+    // `Char` index must FAIL LOUD, never take a blind extension.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildGepFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, std::nullopt);
+        EXPECT_FALSE(result.ok)
+            << "a raw Char Gep index with no threaded charIsUnsigned must "
+               "fail the lowering loud";
+        bool sawDiag = false;
+        for (auto const& d : rep.all()) {
+            if (d.code == ::dss::DiagnosticCode::L_UnsupportedLoweringForOpcode
+                && d.actual.find("charIsUnsigned") != std::string::npos
+                && d.actual.find("D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES") != std::string::npos) {
+                sawDiag = true;
+            }
+        }
+        EXPECT_TRUE(sawDiag)
+            << "the fail-loud diagnostic must name the target key and the "
+               "anchor";
+    }
+
+    // Leg 5 — control: `signed char` (I8) stays on the unconditional SExt arm
+    // with nothing threaded — only bare `Char` consults the target.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildGepFn(interner, ::dss::TypeKind::I8);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, std::nullopt);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 1u)
+            << "I8 is unconditionally signed — no threading required";
+    }
+}
+
+// D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50): the switch
+// jump-table discriminant widen — the second of the two mir_to_lir arms that
+// bucketed bare `Char` unconditionally SExt. It now widens by the threaded
+// `charIsUnsigned` value, and with NOTHING threaded it DECLINES the table:
+// the compare chain is equality-only at the discriminant's own width, which
+// is signedness-agnostic and correct under either declaration (a decline is
+// the documented non-error fall-through, unlike the Gep index widen, which
+// has no correct fallback and must fail loud instead).
+// RED-ON-DISABLE: restore `case TypeKind::Char:` into the unconditional-SExt
+// group → the unsigned-char leg's table widens sext (zext 0) and the nullopt
+// leg builds a table where the pin demands the chain — both red by name.
+TEST(MirToLir, SwitchCharDiscriminantJumpTableWidenIsTargetKeyed) {
+    constexpr std::size_t kCases = 10;   // >= kJumpTableMinCases, dense 0..9
+    auto const buildSwitchFn = [](::dss::TypeInterner& interner,
+                                  ::dss::TypeKind discKind) {
+        auto const discT = interner.primitive(discKind);
+        auto const voidT = interner.primitive(::dss::TypeKind::Void);
+        std::array<::dss::TypeId, 1> params{discT};
+        auto const fnSig =
+            interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+        ::dss::MirBuilder mb;
+        mb.addFunction(fnSig, ::dss::SymbolId{1});
+        ::dss::MirBlockId const entry =
+            mb.createBlock(::dss::StructCfMarker::SwitchHead);
+        std::array<::dss::MirBlockId, kCases> caseBlocks{};
+        for (auto& cb : caseBlocks)
+            cb = mb.createBlock(::dss::StructCfMarker::SwitchCase);
+        ::dss::MirBlockId const dflt =
+            mb.createBlock(::dss::StructCfMarker::SwitchCase);
+        mb.beginBlock(entry);
+        ::dss::MirInstId const disc = mb.addArg(0, discT);
+        std::array<std::pair<::dss::MirInstId, ::dss::MirBlockId>, kCases>
+            cases{};
+        for (std::size_t i = 0; i < kCases; ++i) {
+            ::dss::MirLiteralValue lv;
+            lv.value = static_cast<std::int64_t>(i);
+            lv.core  = discKind;
+            cases[i] = {mb.addConst(lv, discT), caseBlocks[i]};
+        }
+        mb.addSwitch(disc, cases, dflt);
+        for (auto const cb : caseBlocks) { mb.beginBlock(cb); mb.addReturn(); }
+        mb.beginBlock(dflt);
+        mb.addReturn();
+        return std::move(mb).finish();
+    };
+    auto const lowerWith = [](::dss::Mir const& m, ::dss::TargetSchema const& sch,
+                              ::dss::TypeInterner const& interner,
+                              ::dss::DiagnosticReporter& rep,
+                              std::optional<bool> charIsUnsigned) {
+        return ::dss::lowerToLir(m, sch, interner, rep, {}, std::nullopt,
+                                 std::nullopt, std::nullopt, {}, std::nullopt,
+                                 std::nullopt, charIsUnsigned);
+    };
+    auto const countLirOps = [](::dss::Lir const& lir, std::uint16_t opc) {
+        std::size_t n = 0;
+        ::dss::LirFuncId const f = lir.funcAt(0);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(f); ++bi) {
+            ::dss::LirBlockId const b = lir.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(b); ++i)
+                if (lir.instOpcode(lir.blockInstAt(b, i)) == opc) ++n;
+        }
+        return n;
+    };
+
+    // Leg 1 — arm64 with its resolved elf declaration (unsigned): the dense
+    // Char switch takes the table and the discriminant widen is ZExt.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("arm64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        bool const resolved =
+            sch.charIsUnsigned(::dss::ObjectFormatKind::Elf);
+        EXPECT_TRUE(resolved);
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildSwitchFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, resolved);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(result.jumpTableDescriptors.size(), 1u)
+            << "a dense 10-case Char switch with a threaded signedness must "
+               "take the jump table";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("zext")), 1u)
+            << "unsigned-char target: the table's discriminant widen must "
+               "ZERO-extend";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 0u);
+    }
+
+    // Leg 2 — x86_64 with its resolved declaration (signed): table + SExt.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        bool const resolved =
+            sch.charIsUnsigned(::dss::ObjectFormatKind::Elf);
+        EXPECT_FALSE(resolved);
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildSwitchFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, resolved);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(result.jumpTableDescriptors.size(), 1u);
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 1u)
+            << "signed-char target: the table's discriminant widen must "
+               "SIGN-extend";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("zext")), 0u);
+    }
+
+    // Leg 3 — NOTHING threaded: the table is DECLINED (no descriptor, no
+    // widen) and the switch still lowers CORRECTLY via the equality-only
+    // compare chain at the discriminant's own width — one cmp per case.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildSwitchFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, std::nullopt);
+        ASSERT_TRUE(result.ok)
+            << "declining the table is a fall-through, not an error: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(result.jumpTableDescriptors.size(), 0u)
+            << "with no threaded signedness the Char table must be declined "
+               "— a blind widen would be a silent wrong-dispatch";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("cmp")), kCases)
+            << "the compare chain carries the switch: one equality per case";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 0u);
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("zext")), 0u);
+    }
+
+    // Leg 4 — control: an I32 discriminant still takes the table with
+    // nothing threaded — the decline is Char-scoped.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildSwitchFn(interner, ::dss::TypeKind::I32);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, std::nullopt);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(result.jumpTableDescriptors.size(), 1u)
+            << "an I32 discriminant needs no char-signedness fact — the "
+               "table must not be declined";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 1u);
+    }
+}
+
 TEST(MirToLir, PhiResolutionUsesFprClassForFloatPhi) {
     // Cycle-3d review (code-reviewer H2 + type-design + test-analyzer
     // rating 9): prepassAllocatePhis previously hardcoded GPR for ALL

@@ -217,7 +217,7 @@ resolveAbi(TargetSchema const&       target,
             reporter));
     }
 
-    // D-FF3-Coherence (un-retired post-fold #4): defense-in-depth
+    // FF3 Coherence (un-retired post-fold #4): defense-in-depth
     // structural validation of the resolved cc. Catches the
     // paste-error class (e.g. `ms_arm64` cc declared with
     // `rcx,rdx,r8,r9` from `ms_x64`) when the schema reaches FF3

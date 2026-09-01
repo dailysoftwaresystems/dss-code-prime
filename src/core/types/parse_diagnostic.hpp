@@ -2067,6 +2067,74 @@ enum class DiagnosticCode : std::uint16_t {
     // the warning costs nothing an accepting compiler does not already pay.
     S_PointerDifferenceIncompatiblePointee = 0xE074,
 
+    // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH, C 6.2.2): a same-scope
+    // REDECLARATION gives an identifier internal linkage (`static` at file
+    // scope) after a prior PLAIN DEFINING declaration of the same name already
+    // gave it external linkage — `int g; static int g;` (tentative then
+    // static), `int g; static int g = 1;`, `int f(void) { … } static int
+    // f(void);` (a plain function DEFINITION then a static declaration).
+    //
+    // ★★ THE PREDICATE IS EXACTLY THE UNANIMOUS-REJECT SET, AND IT IS FAR
+    // NARROWER THAN THE ROW'S GCC-ONLY MATRIX SAID. ✔MEASURED 2026-09-01, each
+    // reference probed SEPARATELY (gcc 13.3.0 -std=c2x, clang 18.1.3 -std=c23,
+    // MSVC 19.51.36231 /std:clatest /TC): gcc and clang reject EVERY
+    // static↔non-static mix in either order ("static declaration of 'g'
+    // follows non-static declaration"), but **MSVC accepts most of them
+    // silently** (rc=0, no text) — `static int g; int g;`, `extern int g;
+    // static int g;`, `int f(void); static int f(void) { … }` all compile, and
+    // dumpbin shows the identifier simply lands INTERNAL (`Static | f`). The
+    // disjunction settles accept-vs-refuse, so DSS rejects ONLY where all
+    // three do: a `static` redeclaration after a PLAIN (storage-class-free)
+    // declaration that is DEFINING — an object tentative/real definition
+    // (MSVC C2370 "redefinition; different storage class") or a function
+    // definition (MSVC C2375 "redefinition; different linkage"). A prior bare
+    // PROTOTYPE (`int f(void); static int f(void);` — MSVC accepts), a prior
+    // `extern`, and every static-first ordering (C 6.2.2p4 makes the later
+    // extern/plain-function declaration INHERIT the internal linkage) stay
+    // accepted, and the internal-linkage bit is CARRIED across the merge so
+    // `static int f(void); int f(void) { … } static int f(void);` (unanimously
+    // accepted — the definition inherited internal linkage) never fires.
+    //
+    // UNSUPPRESSABLE — the S_ThreadLocalRedeclarationMismatch precedent:
+    // suppressed, the merge keeps ONE record's storage class, and on the
+    // keep-prior orderings the emitted artifact EXPORTS a symbol the program
+    // explicitly declared internal (`int g; static int g;` keeps the plain
+    // tentative → external emission) — a wrong-linkage artifact shipping
+    // green, C 6.2.2p7's undefined behavior realized silently.
+    S_LinkageRedeclarationMismatch = 0xE075,
+
+    // P50 (D-CSUBSET-NORETURN-NON-FUNCTION-OBJECT, C11 6.7.4p2): the
+    // `_Noreturn` KEYWORD on a declaration that does not declare a function —
+    // `_Noreturn int x;` (a plain object, file or block scope) or
+    // `_Noreturn void (*q)(void);` (a POINTER to function is still an object).
+    //
+    // ★★ A WARNING, NOT THE ERROR THE ROW ASKED FOR — THE ROW'S "expect
+    // unanimous rejection" PREMISE WAS REFUTED BY MEASUREMENT. ✔MEASURED
+    // 2026-09-01, each reference probed SEPARATELY: clang 18.1.3 and MSVC
+    // 19.51.36231 REJECT every non-function `_Noreturn`, but **gcc 13.3.0
+    // ACCEPTS them all with a warning** ("variable 'x' declared '_Noreturn'",
+    // rc=0) and IGNORES the specifier. The disjunction settles
+    // accept-vs-refuse, so an error would put DSS BELOW the union; silence
+    // (the pre-P50 state — the detection store is gated on the declared type
+    // being a function, so the flag was simply never stored) would keep the
+    // silent-inert defect the row names. DSS warns and drops the specifier,
+    // exactly gcc's meaning. The one unanimous reject in the family —
+    // `struct S { _Noreturn int m; };` — is already refused upstream by the
+    // grammar (P_NoAlternativeMatched; gcc "expected
+    // specifier-qualifier-list", clang "type name does not allow function
+    // specifier", MSVC C3829), so this code never needs to fire there.
+    //
+    // ⚠ KEYWORD FORM ONLY. The ATTRIBUTE spellings (`__attribute__((
+    // noreturn))` / `[[noreturn]]`) keep their own established behavior: GNU
+    // attribute semantics bind noreturn to the function TYPE through a pointer
+    // declarator (TF-C94 — gcc AND clang accept `__attribute__((noreturn))
+    // void (*p)(void);` SILENTLY and honor it), so the attribute-form store is
+    // untouched and the existing attribute diagnostics own the non-function
+    // attribute cases. Suppressable: gcc's own meaning is "ignored", the
+    // build proceeds identically, so hiding the advice ships nothing wrong —
+    // the S_AsmLabelOnAutomaticVariable negative-pin posture.
+    S_NoreturnNonFunctionObject = 0xE076,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-
@@ -4572,7 +4640,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   silent-failure surface where FF3 would return a `cc *`
     //   into structurally-wrong data when a caller bypasses the
     //   JSON loader (TargetSchema ctor is public + skips
-    //   validate()). (D-FF3-Coherence un-retired 2026-06-01 at
+    //   validate()). (the FF3 Coherence item, un-retired 2026-06-01 at
     //   post-fold #4 once the schema-loader-singleton premise
     //   was disproved.)
     F_AbiCcRegistersInconsistent   = 0x5013,

@@ -97,7 +97,7 @@ enum class AbiResolveErrorKind : std::uint8_t {
     Count_                          // table-size sentinel — keep LAST (codebase convention)
 };
 
-// (D-FF3-Coherence: previously retired 2026-06-01 on the premise
+// (the FF3 Coherence item: previously retired 2026-06-01 on the premise
 // that `TargetSchemaData::validate()` already closes this surface
 // at JSON load. That premise was FALSE: `TargetSchema`'s ctor is
 // public (`TargetSchema`'s converting ctor in target_schema.hpp) and

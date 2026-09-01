@@ -455,6 +455,10 @@ constexpr MembershipReason kWhyThreadLocal{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, thread storage lowers wrong: a per-call automatic, a split "
     "binding, or a link-time tpoff bit-cast into a data slot"};
+constexpr MembershipReason kWhyLinkageMismatch{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, the merge keeps one storage class and the artifact exports "
+    "a symbol the program declared internal (C 6.2.2p7 realized quietly)"};
 constexpr MembershipReason kWhyBitIntWidth{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the _BitInt(N) type has no computable width and masking "
@@ -616,7 +620,7 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // face": within the preprocessor's own codes, `#pragma` failures were
 // unsuppressable while `#include` failures were not. ✔The explicit extent did
 // its job a FIFTH time.
-constexpr std::array<UnsuppressableEntry, 168> kUnsuppressableCodes{{
+constexpr std::array<UnsuppressableEntry, 169> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1484,6 +1488,21 @@ constexpr std::array<UnsuppressableEntry, 168> kUnsuppressableCodes{{
     {DiagnosticCode::S_ThreadLocalRedeclarationMismatch, kWhyThreadLocal},
     {DiagnosticCode::S_ThreadLocalAddressNotConstant, kWhyThreadLocal},
     {DiagnosticCode::S_ThreadLocalInvalidCombination, kWhyThreadLocal},
+    // S_LinkageRedeclarationMismatch (P50,
+    // D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH, C 6.2.2p7): a `static`
+    // redeclaration after a plain DEFINING declaration — the one
+    // static↔non-static ordering gcc, clang AND MSVC all reject.
+    // UNSUPPRESSABLE for exactly the S_ThreadLocalRedeclarationMismatch
+    // reason one row up: the merge keeps ONE record's storage class, so a
+    // suppressed mismatch ships an artifact whose symbol table contradicts
+    // half the program's declarations — `int g; static int g;` keeps the
+    // plain tentative and EXPORTS a symbol the program declared internal.
+    // ⚠ S_NoreturnNonFunctionObject (minted in the same cycle) is a
+    // deliberate NEGATIVE: gcc's own meaning for `_Noreturn int x;` is
+    // "warn and ignore", the build proceeds identically with or without the
+    // warning, so it fails both prongs — the S_AsmLabelOnAutomaticVariable
+    // posture.
+    {DiagnosticCode::S_LinkageRedeclarationMismatch, kWhyLinkageMismatch},
     // S_BitInt* (D-CSUBSET-BITINT, C23 6.2.5/6.7.2): the `_BitInt(N)` width gates.
     // UNSUPPRESSABLE — a suppressed width violation would leave the type with no
     // computable / representable width and the masking + layout would silently pick

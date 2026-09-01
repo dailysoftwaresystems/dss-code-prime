@@ -32,6 +32,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/string_style.hpp"
+#include "core/types/symbol_attrs.hpp"   // P50: SymbolBinding::Local (the internal-linkage facet)
 // Inline-asm P5: `asmConstraint(letter)` / `declaredAsmConstraintLetters()` /
 // `registerByName` — the TARGET half of a constraint, which no C++ table here
 // may duplicate (`"=a"` is `%rax` on x86_64 and impossible on AArch64).
@@ -4538,9 +4539,9 @@ firstAlignasSpecInPrefix(EngineState& s, SemanticConfig const& cfg,
     return {};
 }
 
-// FC16 (D-CSUBSET-NORETURN): true iff a declaration's specifier prefix names the
-// `noreturn` function attribute — in EITHER the `_Noreturn` KEYWORD form (a token
-// of `cfg.noreturnKeywordToken`, C11 6.7.4) OR an ATTRIBUTE form (`[[noreturn]]` /
+// FC16 (D-CSUBSET-NORETURN): does a declaration's specifier prefix name the
+// `noreturn` function attribute — in the `_Noreturn` KEYWORD form (a token
+// of `cfg.noreturnKeywordToken`, C11 6.7.4) and/or an ATTRIBUTE form (`[[noreturn]]` /
 // `__attribute__((noreturn))` / `__attribute__((__noreturn__))` / `[[gnu::noreturn]]`,
 // C23 6.7.12.7 / GNU), matched by an attribute IDENTIFIER leaf (dunder-normalized
 // via the shared `stripDunder`, so `__noreturn__` ≡ `noreturn` and `[[gnu::noreturn]]`'s
@@ -4553,14 +4554,35 @@ firstAlignasSpecInPrefix(EngineState& s, SemanticConfig const& cfg,
 // kind, not an identifier). Emits NOTHING: detection that drops a flag is a SAFE
 // miss (a spurious H_VerifierFailure downstream is fail-loud), never a silent
 // miscompile — so no diagnostic surface is needed here.
-[[nodiscard]] bool
+//
+// ★★ P50 (D-CSUBSET-NORETURN-NON-FUNCTION-OBJECT): THE TWO FORMS ARE REPORTED
+// SEPARATELY, AND THE SPLIT IS A MEASURED SEMANTIC BOUNDARY, NOT PEDANTRY.
+// On a POINTER-to-function declarator the two spellings MEAN different
+// things in the references: the GNU/C23 ATTRIBUTE binds to the pointee's
+// function TYPE and is HONORED (`__attribute__((noreturn)) void (*p)(void);`
+// — gcc AND clang accept SILENTLY, TF-C94's whole point), while the C11
+// KEYWORD is a function SPECIFIER that 6.7.4p2 confines to function
+// declarations — gcc 13.3.0 warns "variable 'p' declared '_Noreturn'" and
+// IGNORES it (clang/MSVC reject outright). A single either-form bool made
+// DSS store the keyword form on pointer objects like the attribute form —
+// i.e. treat as noreturn a call the accepting reference compiles as an
+// ordinary returning call, which is an Unreachable-after-call away from a
+// trap on a gcc-clean program. The caller stores per-form and warns
+// (S_NoreturnNonFunctionObject) on the keyword-on-non-function shapes.
+struct NoreturnSpelling {
+    bool keyword   = false;   // the `_Noreturn` keyword token
+    bool attribute = false;   // a `noreturn` attribute identifier
+    [[nodiscard]] bool any() const noexcept { return keyword || attribute; }
+};
+[[nodiscard]] NoreturnSpelling
 specifierPrefixNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
                              NodeId declNode, DeclarationRule const& decl) {
+    NoreturnSpelling out;
     bool const haveKeyword = cfg.noreturnKeywordToken.has_value()
                           && cfg.noreturnKeywordToken->valid();
-    if (!haveKeyword && cfg.noreturnAttributeNames.empty()) return false;
+    if (!haveKeyword && cfg.noreturnAttributeNames.empty()) return out;
     NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
-    if (!prefix.valid()) return false;
+    if (!prefix.valid()) return out;
     std::vector<NodeId> stack{prefix};
     for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
         NodeId c = stack.back(); stack.pop_back();
@@ -4570,16 +4592,17 @@ specifierPrefixNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
         }
         // (a) the `_Noreturn` KEYWORD token.
         if (haveKeyword && tree.tokenKind(c).v == cfg.noreturnKeywordToken->v)
-            return true;
+            out.keyword = true;
         // (b) an attribute IDENTIFIER naming `noreturn` (dunder-normalized).
         if (cfg.identifierToken.valid()
             && tree.tokenKind(c) == cfg.identifierToken) {
             std::string_view const id = stripDunder(tree.text(c));
             for (std::string const& nm : cfg.noreturnAttributeNames)
-                if (id == nm) return true;
+                if (id == nm) out.attribute = true;
         }
+        if (out.keyword && out.attribute) break;   // both found — done
     }
-    return false;
+    return out;
 }
 
 // FC17 (D-CSUBSET-CONSTEXPR): true iff a declaration's specifier prefix carries
@@ -4670,6 +4693,14 @@ specifierPrefixHasInline(SemanticConfig const& cfg, Tree const& tree,
 struct SpecifierStorageFacts {
     bool threadStorage = false;   // a {threadStorage:true} entry matched
     bool staticStorage = false;   // a {staticStorage:true} entry matched
+    // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH): a {binding:local}
+    // entry matched — the config's statement that this specifier confers
+    // INTERNAL linkage (C 6.2.2p3). At FILE scope c's `static` (and C23
+    // `constexpr`, whose 6.2.2p3 effect the config declares the same way)
+    // carry it; the block-scope varDecl `static` carries it too, and the
+    // consumer's file-scope gate is what keeps a no-linkage block static
+    // (6.2.2p6) out of the linkage-mismatch machinery.
+    bool localBinding  = false;
 };
 [[nodiscard]] SpecifierStorageFacts
 scanSpecifierPrefixStorage(Tree const& tree, NodeId declNode,
@@ -4694,6 +4725,10 @@ scanSpecifierPrefixStorage(Tree const& tree, NodeId declNode,
         if (it == decl.linkageSpecifiers.end()) continue;
         if (it->second.threadStorage) out.threadStorage = true;
         if (it->second.staticStorage) out.staticStorage = true;
+        if (it->second.binding.has_value()
+            && *it->second.binding == SymbolBinding::Local) {
+            out.localBinding = true;
+        }
     }
     return out;
 }
@@ -4726,7 +4761,7 @@ firstPrefixTokenOfKinds(Tree const& tree, NodeId declNode,
 // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
 // facts folded from ONE declaration's specifier prefix (or one bare attribute-
 // declaration statement) by `scanAttributeSemantics` below. Computed once per
-// declaration (the declAlignasSpec/declHasNoreturn precedent) and applied to
+// declaration (the declAlignasSpec/declNoreturn precedent) and applied to
 // every named declarator's SymbolRecord. Messages merge first-non-empty-wins
 // across clauses/specifiers (design note F7).
 struct AttributeSemanticsFacts {
@@ -7382,6 +7417,79 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
             }
             s.reporter.report(std::move(d));
         }
+        // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH, C 6.2.2): a
+        // `static` (internal-linkage) redeclaration after a PLAIN DEFINING
+        // declaration of the same name. The predicate is EXACTLY the set gcc,
+        // clang AND MSVC all reject (✔MEASURED 2026-09-01, every ordering
+        // probed on all three): the prior declaration carries NO storage
+        // class (not `extern`, not `static`), and it DEFINES — an object
+        // tentative (`int g; static int g;`), an initialized object
+        // (`int g; static int g = 1;` / `int g = 1; static int g;`), or a
+        // function DEFINITION (`int f(void) { … } static int f(void);`).
+        // Everything else in the static↔non-static matrix is ACCEPTED by at
+        // least one reference and the disjunction decides acceptance:
+        //   • static-first orderings — `static int g; extern int g;` /
+        //     `static int f(void); int f(void) { … }` — are LEGAL C
+        //     (6.2.2p4/p5: the later declaration INHERITS internal linkage;
+        //     the OR-propagation below is what carries that fact), and
+        //   • a prior bare PROTOTYPE or `extern` — `int f(void); static int
+        //     f(void) { … }` / `extern int g; static int g;` — is accepted
+        //     by MSVC (silently; dumpbin shows the identifier lands
+        //     internal), which is DSS's keep-the-static-survivor meaning
+        //     already.
+        // Objects AND functions (unlike the TLS arm — 6.2.2 covers both);
+        // Type/Table records are excluded (a typedef repeat is TF-C97's
+        // lane, and their rows carry no storage prefix). A
+        // `maybeFnTypedefProto` CANDIDATE prior is excluded like a proto:
+        // its function-ness resolves only in Pass 1.5, and a candidate that
+        // turns out an OBJECT would make this a missed diagnostic — the safe
+        // direction (the program compiles exactly as before) — never a
+        // wrong rejection of the MSVC-accepted proto shape.
+        // The merge still proceeds below (the TLS-arm posture): the error
+        // already gates compilation, and the intact binding avoids cascades.
+        {
+            auto const cat = category(priorRec);
+            bool const priorPlainDefining =
+                (cat == DeclarationKind::Variable
+                 || cat == DeclarationKind::Function)
+                && !priorRec.isInternalLinkage
+                && !priorRec.isExternDeclaration
+                && !priorRec.isProtoDeclaration
+                && !priorRec.maybeFnTypedefProto;
+            if (priorPlainDefining && s.symbols.at(newId).isInternalLinkage) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_LinkageRedeclarationMismatch;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(nameNode);
+                d.actual   = std::format(
+                    "'{}' — this declaration gives '{}' internal linkage "
+                    "('static' at file scope), but a prior declaration of "
+                    "the same name already defined it with external linkage "
+                    "(C 6.2.2p7: an identifier may not appear with both "
+                    "internal and external linkage in one translation unit)",
+                    name, name);
+                if (priorRec.tree.v == tree.id().v) {
+                    d.related.push_back(RelatedLocation{
+                        tree.source().id(),
+                        tree.span(priorRec.declNode),
+                        "previously defined here",
+                    });
+                }
+                s.reporter.report(std::move(d));
+            }
+            // C 6.2.2p4 linkage inheritance, AT MERGE TIME on purpose: the
+            // NEXT merge in a same-TU chain reads the survivor's flag
+            // (`static int f(void); int f(void) { … } static int f(void);` —
+            // unanimously accepted — needs the definition to carry internal
+            // linkage before the third declaration arrives), so a post-1.5
+            // OR-merge would be too late. Both records get the union, the
+            // post-1.5 flag-merge precedent.
+            bool const internal = priorRec.isInternalLinkage
+                               || s.symbols.at(newId).isInternalLinkage;
+            priorRec.isInternalLinkage            = internal;
+            s.symbols.at(newId).isInternalLinkage = internal;
+        }
         if (newRank > priorRank) {
             // The NEW declaration is more-defining (rank) than the prior, so it
             // wins the binding and the prior is absorbed. Covers the classic
@@ -7896,6 +8004,30 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 .threadStorage) {
                             rec.isThreadLocal = true;
                         }
+                        // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH,
+                        // C 6.2.2p3): a specifier whose linkageSpecifiers
+                        // entry declares `{binding: local}` (c: `static`, and
+                        // C23 `constexpr` at file scope — the SAME facet the
+                        // HIR linkage fold reads, so the two tiers cannot
+                        // disagree on the vocabulary) on a FILE-scope
+                        // declaration gives the identifier INTERNAL linkage.
+                        // ⚠ The BINDING facet, not `staticStorage` — file-scope
+                        // rows deliberately declare `{binding:local}` alone
+                        // (staticStorage is the BLOCK-scope storage-duration
+                        // axis), which is exactly why an earlier staticStorage
+                        // reading of this mint measured as never-set. FILE
+                        // scope only: a block-scope `static` object has NO
+                        // linkage at all (6.2.2p6) and must not feed the
+                        // redeclaration-merge linkage check. The merge
+                        // OR-propagates this flag across each merged pair
+                        // (6.2.2p4 inheritance) and rejects the one ordering
+                        // every reference rejects — see
+                        // S_LinkageRedeclarationMismatch.
+                        if (scanSpecifierPrefixStorage(tree, node, decl)
+                                .localBinding
+                            && bindScope.v == fileScopeOf(s, tree, bindScope).v) {
+                            rec.isInternalLinkage = true;
+                        }
                         rec.isProtoDeclaration = isProto;
                         rec.maybeFnTypedefProto = maybeFnTypedefProto;
                         // D-CSUBSET-EXTERN-DEFINITION-MERGE: a non-defining
@@ -8182,6 +8314,18 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // same scan; Pass 2 + the merge own the consequences.
                     if (scanSpecifierPrefixStorage(tree, node, decl).threadStorage) {
                         rec.isThreadLocal = true;
+                    }
+                    // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH): the
+                    // positional-path mirror of the declarator-mode
+                    // internal-linkage mint. c's positional rows carry no
+                    // internal-binding specifier today (externDecl is
+                    // extern-only), so this is currently unreached in c — kept
+                    // so a positional-name language declaring one gets the
+                    // same C 6.2.2p3 marking, exactly the threadStorage
+                    // precedent one line up.
+                    if (scanSpecifierPrefixStorage(tree, node, decl).localBinding
+                        && bindScope.v == fileScopeOf(s, tree, bindScope).v) {
+                        rec.isInternalLinkage = true;
                     }
 
                     SymbolId const newId = s.symbols.mint(rec);
@@ -8922,19 +9066,27 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                     // FC16 (D-CSUBSET-NORETURN): does this declaration's specifier
                     // prefix name the `noreturn` attribute? Computed ONCE per
                     // declaration (like `declAlignasSpec`); STORED per-declarator
-                    // below, gated on the declared type being a FnSig (a `_Noreturn`
-                    // on a non-function object is inert — a named safe-miss deferral).
-                    bool const declHasNoreturn =
+                    // below. P50 (D-CSUBSET-NORETURN-NON-FUNCTION-OBJECT): the
+                    // KEYWORD and ATTRIBUTE forms are carried separately — on a
+                    // pointer-to-function declarator the attribute is honored
+                    // (TF-C94) while the keyword is warned-and-ignored (gcc's
+                    // measured meaning); see the scan's own comment.
+                    NoreturnSpelling const declNoreturn =
                         specifierPrefixNamesNoreturn(cfg, tree, node, decl);
+                    // One warning per DECLARATION, not per declarator — the
+                    // specifier is one spelling shared by the whole declarator
+                    // list (`_Noreturn int a, b;`), the alignasContextReported
+                    // precedent one page up.
+                    bool noreturnNonFnReported = false;
                     // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4):
                     // does this declaration's specifier prefix spell `inline`
                     // WITHOUT `extern`? Computed ONCE per declaration (the
-                    // `declHasNoreturn` shape); STORED per-declarator below.
+                    // `declNoreturn` shape); STORED per-declarator below.
                     bool const declHasInline =
                         specifierPrefixHasInline(cfg, tree, node, decl);
                     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): fold the standard-
                     // attribute effects from this declaration's specifier
-                    // prefix ONCE (like `declAlignasSpec`/`declHasNoreturn`);
+                    // prefix ONCE (like `declAlignasSpec`/`declNoreturn`);
                     // applied to EVERY named declarator below, so
                     // `[[maybe_unused]] int a, b;` flags both. emitUnknown=true
                     // — this is the once-per-declaration site, so an unknown
@@ -9590,16 +9742,69 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // later (the `no_sanitize_thread` "true NOW, not true by
                         // vacuity" posture).
                         //
-                        // ★ NOTHING ELSE MOVES: a non-function, non-function-pointer
-                        // declarator still gets NO flag, so the `_Noreturn int x;`
-                        // deferral is untouched, and the predicate is the SHARED
+                        // ★★ P50 (D-CSUBSET-NORETURN-NON-FUNCTION-OBJECT): THE
+                        // POINTER ARM IS ATTRIBUTE-FORM ONLY, AND THE KEYWORD
+                        // FORM ON A NON-FUNCTION IS WARNED-AND-DROPPED — the
+                        // measured union boundary, not a style choice:
+                        //   • ATTRIBUTE on a pointer: gcc AND clang accept
+                        //     SILENTLY and honor it on the pointee's function
+                        //     type (the TF-C94 paragraphs above) — stored.
+                        //   • KEYWORD on a pointer/object/typedef'd-object:
+                        //     clang and MSVC REJECT; gcc 13.3.0 ACCEPTS with
+                        //     "variable 'q' declared '_Noreturn'" and IGNORES
+                        //     the specifier. The disjunction decides
+                        //     acceptance, so DSS follows gcc: warn
+                        //     (S_NoreturnNonFunctionObject) and do NOT store.
+                        //     Storing it (the pre-P50 either-form gate) would
+                        //     wrap a call through the pointer in
+                        //     `Block{call, Unreachable}` — treating as
+                        //     noreturn a call gcc compiles as an ordinary
+                        //     returning call, an execution divergence on a
+                        //     gcc-clean program, not just a lint gap.
+                        //   • KEYWORD on a real function declarator (a FnSig,
+                        //     spelled directly or through a typedef —
+                        //     `_Noreturn fn_t f;` is accepted by ALL THREE
+                        //     references): stored, exactly as before.
+                        // A non-function, non-function-pointer declarator
+                        // still gets NO flag; the predicate is the SHARED
                         // `isFnPointerType` the call path uses — no second
                         // hand-copy to lose a term.
                         bool const noreturnCarrier =
                             isFnSig
-                            || isFnPointerType(s.lattice.interner(), declTy);
-                        if (noreturnCarrier && declHasNoreturn)
+                            || (isFnPointerType(s.lattice.interner(), declTy)
+                                && declNoreturn.attribute);
+                        if (noreturnCarrier && declNoreturn.any())
                             s.symbols.at(sym).isNoreturn = true;
+                        // The keyword-on-non-function WARNING (C11 6.7.4p2;
+                        // the S_InlineNonFunction guard shape one block down,
+                        // at Warning severity because gcc accepts): fires for
+                        // `_Noreturn int x;`, `_Noreturn void (*q)(void);`,
+                        // the block-scope `_Noreturn int y;`, and the typedef
+                        // spelling `_Noreturn fn_t *p;`. `!isFunctionForm`
+                        // keeps a declarator whose type failed to resolve from
+                        // stacking this on top of its own diagnostic; the
+                        // per-declaration latch keeps `_Noreturn int a, b;` at
+                        // one warning for its one shared spelling.
+                        if (declNoreturn.keyword && !isFnSig
+                            && declTy.valid() && !isFunctionForm
+                            && !noreturnNonFnReported) {
+                            noreturnNonFnReported = true;
+                            ParseDiagnostic d;
+                            d.code =
+                                DiagnosticCode::S_NoreturnNonFunctionObject;
+                            d.severity = DiagnosticSeverity::Warning;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(nameNode.valid() ? nameNode
+                                                                    : node);
+                            d.actual   = std::format(
+                                "'{}' — '_Noreturn' is a function specifier "
+                                "and this declaration does not declare a "
+                                "function; the specifier is IGNORED (C11 "
+                                "6.7.4p2 confines it to function "
+                                "declarations)",
+                                s.symbols.at(sym).name);
+                            s.reporter.report(std::move(d));
+                        }
                         // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99
                         // 6.7.4): record the inline-without-extern reading on a
                         // FUNCTION symbol; AND-merged across the proto/def pair
@@ -9608,7 +9813,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // definition at all (6.7.4p7).
                         //
                         // ★ THE NON-FUNCTION CASE IS LOUD, NOT INERT — the one
-                        // place this departs from `declHasNoreturn` right above.
+                        // place this departs from `declNoreturn` right above.
                         // 6.7.4p1 confines the specifier to "the declaration of
                         // a function", and unlike a stray `_Noreturn` (whose
                         // loss is a safe miss) a dropped `inline` here would be
@@ -17894,6 +18099,81 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         }
     }
 
+    // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH — the block-scope
+    // half): resolve every BLOCK-scope `extern` declaration against its own
+    // tree's FILE scope. C 6.2.2p4: a block-scope `extern int g;` with a
+    // visible file-scope declaration of `g` denotes THE SAME entity — it does
+    // not introduce a distinct object — and even the extern-FIRST ordering
+    // (`void h(void) { extern int g; } static int g;`) is accepted and bound
+    // intra-TU by MSVC (✔MEASURED 2026-09-01: builds and runs 42; gcc/clang
+    // fail it at link, but the disjunction decides acceptance).
+    //
+    // ★★ THIS SWEEP IS WHAT MAKES A BLOCK-SCOPE EXTERN WORK **INTRA-TU** AT
+    // ALL. ✔MEASURED at the P50 base: `int g = 5; void h(void) { extern int
+    // g; g = 42; }` in ONE file died K_SymbolUndefined — the block extern
+    // binds in its block scope (design-audit Finding 3: it must, so it can
+    // shadow an outer local), never meets the file-scope symbol in
+    // `mergeOrCollideRedeclaration` (different scopes), and lowers to an
+    // import row that the link tier then refuses to satisfy from the same
+    // module — while the SAME two declarations in TWO files linked fine
+    // (unanimously-accepted C, refused only when written in one file).
+    //
+    // Mechanism — entirely the existing merge machinery, pointed across the
+    // scope boundary: for each un-absorbed block-scope extern record whose
+    // own tree's FILE scope binds the same name in the Ordinary namespace
+    // (the tree-root scope holds the tree's own declarations AND the
+    // crossRefs-injected ones; the builtin/CU-root parents are deliberately
+    // NOT consulted — absorbing onto a builtin would re-route a user extern
+    // through builtin lowering),
+    //   1. the extern is ABSORBED (`isAbsorbedProto` — the exact flag the
+    //      HIR extern lowering already skips, so no import row is emitted),
+    //   2. its block binding is REPOINTED at the file-scope symbol
+    //      (`injectBinding` is last-writer-wins), so every use inside the
+    //      block resolves to the file-scope entity while still SHADOWING an
+    //      outer local exactly as before, and
+    //   3. the pair rides `mergedFnDecls`, so the post-1.5 type-compat sweep
+    //      rejects `static int g; void h(void) { extern double g; }`
+    //      (S_IncompatibleRedeclaration) like any other merged pair.
+    // Runs AFTER all of Pass 1 (order-blind on purpose: the file-scope
+    // declaration may follow the function textually — the MSVC-accepted
+    // ordering) and BEFORE Pass 1.5 (the compat sweep needs both types
+    // resolved; Pass-2 uses need the repointed binding). A block extern with
+    // NO same-tree file-scope binding keeps its import row — the cross-TU
+    // path that already worked. Category-guarded: a same-name file-scope
+    // TYPEDEF/Table is a different C 6.2.3 declaration class, and absorbing
+    // onto it would be wrong — the extern then keeps its import semantics.
+    {
+        std::unordered_map<std::uint32_t /*TreeId.v*/, Tree const*> treeById;
+        for (auto const& tree : trees) treeById[tree.id().v] = &tree;
+        // Symbol ids are dense and minted from 1; the store only grows.
+        for (std::uint32_t sv = 1; sv <= s.symbols.size(); ++sv) {
+            SymbolId const sid{sv};
+            auto& rec = s.symbols.at(sid);
+            if (!rec.isExternDeclaration || rec.isAbsorbedProto) continue;
+            if (rec.kind == DeclarationKind::Type
+                || rec.kind == DeclarationKind::Table) {
+                continue;
+            }
+            auto const tIt = treeById.find(rec.tree.v);
+            if (tIt == treeById.end()) continue;   // injected — no user scope
+            ScopeId const fileScope = fileScopeOf(s, *tIt->second, rec.scope);
+            if (!fileScope.valid() || fileScope.v == rec.scope.v) continue;
+            auto const& fileBindings = s.scopes.scopes()[fileScope.v].bindings;
+            auto const fb = fileBindings.find(rec.name);
+            if (fb == fileBindings.end()) continue;
+            SymbolId const target = fb->second;
+            if (!target.valid() || target.v == sid.v) continue;
+            auto const& targetRec = s.symbols.at(target);
+            if (targetRec.kind == DeclarationKind::Type
+                || targetRec.kind == DeclarationKind::Table) {
+                continue;
+            }
+            rec.isAbsorbedProto = true;
+            s.scopes.injectBinding(rec.scope, rec.name, target);
+            s.mergedFnDecls.push_back({target, sid});
+        }
+    }
+
     // Pass 1.5 per tree: resolve declaration types + function signatures.
     for (std::size_t ti = 0; ti < trees.size(); ++ti) {
         auto const& tree = trees[ti];
@@ -18073,11 +18353,34 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // which is the quantifier over all three. Writing the result back to
             // the absorbed record too keeps either merge ORDER equivalent, as
             // the OR-merges above do.
+            //
+            // ★ P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH): a
+            // BLOCK-scope absorbed declaration is EXCLUDED from the AND, and
+            // that exclusion is 6.7.4p7's own wording — the quantifier runs
+            // over "all of the FILE SCOPE declarations", nothing narrower or
+            // wider. The block-extern absorb sweep now routes block-scope
+            // `extern` declarations through this list, and a block
+            // `extern int f(void);` inside some function body is not a file
+            // scope declaration of f — ANDing its (necessarily false)
+            // isInline in would strip inline-definition status and emit an
+            // external definition 6.7.4p7 says this TU must not provide.
+            // Every pre-P50 pair binds its absorbed record at file scope (a
+            // re-homed block prototype included — its record's scope IS the
+            // file scope it was re-homed onto), so the guard is
+            // behavior-preserving there by construction.
             {
-                bool const inl = s.symbols.at(survivor).isInline
-                              && s.symbols.at(absorbed).isInline;
-                s.symbols.at(survivor).isInline = inl;
-                s.symbols.at(absorbed).isInline = inl;
+                auto const& abRec = s.symbols.at(absorbed);
+                auto const abTree = treeById.find(abRec.tree.v);
+                bool const absorbedAtFileScope =
+                    abTree != treeById.end()
+                    && abRec.scope.v
+                           == fileScopeOf(s, *abTree->second, abRec.scope).v;
+                if (absorbedAtFileScope) {
+                    bool const inl = s.symbols.at(survivor).isInline
+                                  && s.symbols.at(absorbed).isInline;
+                    s.symbols.at(survivor).isInline = inl;
+                    s.symbols.at(absorbed).isInline = inl;
+                }
             }
             // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): OR-merge deprecated /
             // nodiscard across the proto/def pair, the isNoreturn precedent —

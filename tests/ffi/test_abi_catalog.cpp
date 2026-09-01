@@ -616,7 +616,7 @@ TEST(FfiAbiResolve, ATargetMayNotNameACallingConventionNone) {
            "declaration ambiguous";
 }
 
-// ── (G) THE COHERENCE PASS ON THE RESOLVED ROW (D-FF3-Coherence) ────────────
+// ── (G) THE COHERENCE PASS ON THE RESOLVED ROW (FF3 Coherence) ──────────────
 
 TEST(FfiAbiResolve, ResolveAbiAcceptsShippedX86_64CcRegisters) {
     auto target = TargetSchema::loadShipped("x86_64");

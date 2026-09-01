@@ -650,6 +650,30 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/scripts/check-shell-portability/check-shell-portability.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    # Lane-worktree scratchpad gate (2026-09-01, P50 —
+    # D-CYCLE-LANE-WORKTREE-REMOVE-DISCARDS-AN-UNPRESERVED-SCRATCHPAD).
+    # `lane-worktree.sh remove` used to delete a lane's ignored scratchpad without
+    # asking, and the preserve step was a convention living in the orchestrator's head.
+    # ✔MEASURED the day this landed: a `cp … && lane-worktree remove` one-liner lost a
+    # lane's whole evidence tree because the destination's parent did not exist, `cp`
+    # failed, and the absence of output read as success. The gate moved the rule into
+    # the tool; this entry is what keeps it there.
+    # ★ INTEGRATION ARMS BY NECESSITY — the defect was in what the verb DOES to a real
+    # tree, not in a predicate that could be unit-tested, so each arm drives the real
+    # script against a real worktree and asserts the MESSAGE of the refusal it names.
+    # ⚠ It creates and removes its own `$$`-suffixed lanes and cleans up on both paths,
+    # so a parallel `ctest -j` cannot collide with itself or with a live lane.
+    if(NOT WIN32 OR CMAKE_HOST_WIN32)
+        find_program(DSS_BASH_FOR_LANE_GUARD NAMES bash)
+        if(DSS_BASH_FOR_LANE_GUARD)
+            add_test(
+                NAME lane_worktree_guard
+                COMMAND "${DSS_BASH_FOR_LANE_GUARD}"
+                        "${CMAKE_SOURCE_DIR}/scripts/lane-worktree/test-lane-worktree.sh"
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        endif()
+    endif()
+
     # Citation-stability guard (2026-08-19 — D-PLANS-CITATION-LINE-NUMBERS-SILENTLY-INVALIDATED).
     # A `path:line` citation is a claim about a file that nothing rechecks: insert
     # one line above it and it silently points at unrelated prose while still

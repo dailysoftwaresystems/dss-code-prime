@@ -1,0 +1,15 @@
+{
+  "$comment": "D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH (P50 lane li) — the BLOCK-SCOPE-extern half. C 6.2.2p4: a block-scope `extern int g;` with a visible file-scope declaration denotes THE SAME object. MEASURED 2026-09-01: gcc 13.3.0, clang 18.1.3 and MSVC 19.51.36231 all BUILD AND RUN this file (exit 42). At the P50 base commit DSS refused this exact file with K_SymbolUndefined — the block extern binds in its block scope (it must, to shadow an outer local — design-audit Finding 3), never met the file-scope symbol in the same-scope redeclaration merge, and lowered to an import row the link tier would not satisfy from the same module; the SAME two declarations split across two files already linked fine, so the refusal was intra-TU only. The P50 absorb sweep resolves each block-scope extern against its tree's file scope (order-blind: MSVC also builds the extern-FIRST ordering `void h(void){extern int g;} static int g;`, so the sweep runs after all of Pass 1), absorbs it (no import row), and repoints the block binding at the file-scope symbol. exit 42 proves the BINDING, not just the compile: the write through the block extern must reach the file-scope g. Four targets + release because 'DSS builds and runs this' is a per-target claim. RED-ON-DISABLE: remove the absorb sweep before Pass 1.5 -> K_SymbolUndefined again -> exit 42 unreachable on every target.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

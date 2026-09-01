@@ -204,6 +204,24 @@ target_link_libraries(dss_asm_test_asm_bare_operand_width
 target_include_directories(dss_asm_test_asm_bare_operand_width
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
 
+# D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE (R5 + R8, P50):
+# class-scoped width-view modifier letters. The aarch64 letters are scoped
+# (b/h/s/d/q => fpr, w/x => gpr; a wrong-class letter refuses BY NAME listing
+# the operand class's own alphabet — both references hard-error the FP-on-GPR
+# direction, and the operator ruled the GPR-on-FP direction dissolved), the
+# x86-64 letters stay width-only (gcc ACCEPTS a GPR letter on an xmm operand
+# — the disjunction decides acceptance), and the loader refuses a document
+# mixing the two postures. Also carries the cross-tier static_assert that
+# every width `AssemblyConfig::kTemplateModifierWidthBits` admits has a LIR
+# flag (core cannot include lir_node.hpp; this test includes both).
+# WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL (shipped dialect JSON
+# edited in memory), so it MUST run through ctest -- dss_add_test sets
+# DSS_CONFIG_ROOT (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_class_scoped_modifiers
+             SOURCES test_asm_class_scoped_modifiers.cpp)
+target_link_libraries(dss_asm_test_asm_class_scoped_modifiers
+    PRIVATE nlohmann_json::nlohmann_json)
+
 # D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME (the x86_64
 # half): the SSE/scalar-FP instruction rows that make the `x` constraint's
 # `fpr` register class nameable by a template. Before them the target declared

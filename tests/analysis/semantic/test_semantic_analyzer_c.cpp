@@ -16595,11 +16595,13 @@ TEST(SemanticAnalyzerC, NoreturnOnFunctionPointerObjectReachesTheSink) {
 }
 
 // (c) THE WIDENING MUST NOT LEAK. A plain data object still gets NO flag: the
-// gate admits FnSig and Ptr<FnSig> ONLY, so the pre-existing
-// `_Noreturn`-on-a-non-function safe-miss deferral is untouched and no data
-// symbol carries a codegen directive nothing can honor. Host clang WARNS on
-// this shape ("'__noreturn__' only applies to function types", measured); DSS's
-// silence here is the separate open row
+// gate admits FnSig and Ptr<FnSig> ONLY (P50 narrowed the Ptr<FnSig> arm to
+// the ATTRIBUTE spelling — the C11 KEYWORD on a non-function now warns
+// S_NoreturnNonFunctionObject and drops, D-CSUBSET-NORETURN-NON-FUNCTION-OBJECT;
+// this test's attribute spellings are unaffected), so no data symbol carries
+// a codegen directive nothing can honor. Host clang WARNS on this shape
+// ("'__noreturn__' only applies to function types", measured); DSS's
+// attribute-tier handling here is the separate row
 // D-CSUBSET-APPLIESTO-CANNOT-EXPRESS-FUNCTION-POINTER-OBJECT / the `none`-verb
 // row split, NOT something this cycle introduced.
 // RED-ON-DISABLE: widen the gate to "any declarator" → both EXPECTs flip.
@@ -19383,4 +19385,302 @@ TEST(SemanticAnalyzerC, ConditionalWithObjectPointerAndVoidPointerIsAccepted) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ConditionalOperandTypeMismatch), 0u);
     EXPECT_FALSE(model.hasErrors());
+}
+
+// ── P50: D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH ──────────────────────
+// C 6.2.2 internal/external linkage across a same-scope redeclaration chain.
+// The reject predicate is EXACTLY the unanimous-reject set (gcc 13.3.0, clang
+// 18.1.3, MSVC 19.51.36231 probed SEPARATELY, 2026-09-01): a `static`
+// redeclaration after a PLAIN (storage-class-free) DEFINING declaration.
+// Everything else in the static<->non-static matrix is accepted by at least
+// one reference (mostly MSVC, silently) and must stay accepted.
+// RED-ON-DISABLE: remove the merge-site linkage arm -> every ordering below
+// silently merges again and the counts here go 1->0.
+
+TEST(SemanticAnalyzerC, LinkageMismatchStaticAfterPlainDefiningObject) {
+    // int g; static int g;  — plain tentative then static (all three reject).
+    auto tentative = analyzeShipped("c", {
+        "int g;\n"
+        "static int g;\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(tentative.diagnostics(),
+                        DiagnosticCode::S_LinkageRedeclarationMismatch), 1u)
+        << "a static redeclaration of a plain tentative must fail loud";
+    // int g; static int g = 1;  — the static side carries the initializer.
+    auto staticInit = analyzeShipped("c", {
+        "int g;\n"
+        "static int g = 1;\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(staticInit.diagnostics(),
+                        DiagnosticCode::S_LinkageRedeclarationMismatch), 1u);
+    // int g = 1; static int g;  — the plain side carries the initializer.
+    auto plainInit = analyzeShipped("c", {
+        "int g = 1;\n"
+        "static int g;\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(plainInit.diagnostics(),
+                        DiagnosticCode::S_LinkageRedeclarationMismatch), 1u);
+    // extern int g; int g; static int g;  — the interposed plain tentative is
+    // what the third declaration collides with (unanimous reject; the
+    // extern-then-static PAIR alone is MSVC-accepted and stays legal below).
+    auto composed = analyzeShipped("c", {
+        "extern int g;\n"
+        "int g;\n"
+        "static int g;\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(composed.diagnostics(),
+                        DiagnosticCode::S_LinkageRedeclarationMismatch), 1u);
+}
+
+TEST(SemanticAnalyzerC, LinkageMismatchStaticAfterPlainFunctionDefinition) {
+    // int f(void) { ... } static int f(void);  — MSVC C2375, gcc/clang error.
+    auto direct = analyzeShipped("c", {
+        "int f(void) { return 42; }\n"
+        "static int f(void);\n"
+        "int main(void){ return f(); }\n",
+    });
+    EXPECT_EQ(countCode(direct.diagnostics(),
+                        DiagnosticCode::S_LinkageRedeclarationMismatch), 1u)
+        << "a static declaration after a plain function DEFINITION must fail";
+    // Proto + def merged first, then the static declaration arrives — the
+    // surviving binding is the definition, so the same arm must fire.
+    auto viaMerge = analyzeShipped("c", {
+        "int f(void);\n"
+        "int f(void) { return 42; }\n"
+        "static int f(void);\n"
+        "int main(void){ return f(); }\n",
+    });
+    EXPECT_EQ(countCode(viaMerge.diagnostics(),
+                        DiagnosticCode::S_LinkageRedeclarationMismatch), 1u);
+}
+
+TEST(SemanticAnalyzerC, LinkageStaticFirstOrderingsInheritAndStayLegal) {
+    // C 6.2.2p4/p5: after a static declaration, a later extern or plain
+    // FUNCTION declaration INHERITS the internal linkage — every ordering
+    // here is accepted by all three references, several only BECAUSE the
+    // internal-linkage bit is OR-propagated across each merged pair
+    // (drop the propagation and the third declaration of the f-triple sees a
+    // plain-defining prior -> a false S_LinkageRedeclarationMismatch).
+    auto cases = {
+        // static int g; int g;              (MSVC accepts; internal survives)
+        std::string{"static int g;\nint g;\nint main(void){ return 42; }\n"},
+        // static int g; extern int g;       (6.2.2p4 — unanimously legal)
+        std::string{"static int g;\nextern int g;\nint main(void){ return 42; }\n"},
+        // static int g; extern int g; int g; (MSVC accepts the composition)
+        std::string{"static int g;\nextern int g;\nint g;\nint main(void){ return 42; }\n"},
+        // static proto -> plain def          (unanimously legal inheritance)
+        std::string{"static int f(void);\nint f(void) { return 42; }\n"
+                    "int main(void){ return f(); }\n"},
+        // static proto -> extern proto -> plain def (unanimously legal)
+        std::string{"static int f(void);\nextern int f(void);\n"
+                    "int f(void){ return 42; }\nint main(void){ return f(); }\n"},
+        // static -> plain def -> static AGAIN: legal ONLY via inheritance
+        std::string{"static int f(void);\nint f(void) { return 42; }\n"
+                    "static int f(void);\nint main(void){ return f(); }\n"},
+        // static -> plain proto -> plain def (all inherit)
+        std::string{"static int f(void);\nint f(void);\n"
+                    "int f(void) { return 42; }\nint main(void){ return f(); }\n"},
+        // static tentative repeat + extern between (o11/o14)
+        std::string{"static int g;\nstatic int g;\nint main(void){ return 42; }\n"},
+        std::string{"static int g;\nextern int g;\nstatic int g;\n"
+                    "int main(void){ return 42; }\n"},
+    };
+    for (auto const& src : cases) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_LinkageRedeclarationMismatch), 0u)
+            << "wrongly rejected legal/reference-accepted ordering:\n" << src;
+        EXPECT_FALSE(model.hasErrors()) << src;
+    }
+}
+
+TEST(SemanticAnalyzerC, LinkageStaticAfterProtoOrExternStaysAccepted) {
+    // The MSVC-accepted half of the matrix (probed 2026-09-01: rc=0, silent,
+    // dumpbin shows the identifier lands internal — which is exactly DSS's
+    // keep-the-static-survivor meaning): a prior bare PROTOTYPE or a prior
+    // `extern` does NOT make a later static a mismatch. The disjunction
+    // decides acceptance, so firing here would put DSS below the union.
+    auto cases = {
+        // int f(void); static int f(void) { ... }   (prior bare proto)
+        std::string{"int f(void);\nstatic int f(void) { return 42; }\n"
+                    "int main(void){ return f(); }\n"},
+        // extern int f(void); static int f(void) { ... }
+        std::string{"extern int f(void);\nstatic int f(void) { return 42; }\n"
+                    "int main(void){ return f(); }\n"},
+        // int f(void); static int f(void); static int f(void) { ... }
+        std::string{"int f(void);\nstatic int f(void);\n"
+                    "static int f(void) { return 42; }\n"
+                    "int main(void){ return f(); }\n"},
+        // extern int g; static int g;               (object flavor)
+        std::string{"extern int g;\nstatic int g;\nint main(void){ return 42; }\n"},
+    };
+    for (auto const& src : cases) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_LinkageRedeclarationMismatch), 0u)
+            << "wrongly rejected an MSVC-accepted ordering:\n" << src;
+        EXPECT_FALSE(model.hasErrors()) << src;
+    }
+}
+
+// ── P50: the block-scope-extern half of the linkage row ────────────────────
+// C 6.2.2p4: a block-scope `extern` with a same-tree file-scope declaration
+// of the name denotes THE SAME entity. Before P50 the block extern lowered
+// to an import row that the link tier refused to satisfy intra-TU
+// (K_SymbolUndefined on `int g = 5; void h(void){ extern int g; g = 42; }`
+// in ONE file, while the same two declarations in TWO files linked fine).
+// The absorb sweep marks such externs isAbsorbedProto (no import row),
+// repoints the block binding at the file-scope symbol, and rides
+// mergedFnDecls so the post-1.5 sweep type-checks the pair.
+// RED-ON-DISABLE: remove the absorb sweep -> the mismatched-type case below
+// stops producing S_IncompatibleRedeclaration (the pair never meets) and the
+// runnable corpus example linkage_block_extern dies K_SymbolUndefined again.
+TEST(SemanticAnalyzerC, BlockScopeExternBindsToSameTreeFileScopeDeclaration) {
+    auto cases = {
+        // file-scope static, then a block extern (6.2.2p4 inherit).
+        std::string{"static int g;\nvoid h(void) { extern int g; g = 1; }\n"
+                    "int main(void){ h(); return 42; }\n"},
+        // block extern FIRST, file-scope static AFTER (MSVC builds+runs it;
+        // the sweep is deliberately order-blind).
+        std::string{"void h(void) { extern int g; g = 1; }\nstatic int g;\n"
+                    "int main(void){ h(); return 42; }\n"},
+        // plain tentative + block extern (unanimously legal).
+        std::string{"int g;\nvoid h(void) { extern int g; g = 1; }\n"
+                    "int main(void){ h(); return 42; }\n"},
+        // the FUNCTION form: a block extern prototype + a later static def.
+        std::string{"void h(void) { extern int f(void); }\n"
+                    "static int f(void) { return 42; }\n"
+                    "int main(void){ h(); return f(); }\n"},
+    };
+    for (auto const& src : cases) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_FALSE(model.hasErrors())
+            << "block-scope extern failed to bind intra-TU:\n" << src;
+    }
+    // The absorbed pair rides the shared post-1.5 type-compat sweep: a block
+    // extern whose type CONTRADICTS the file-scope declaration fails loud.
+    auto mismatched = analyzeShipped("c", {
+        "static int g;\n"
+        "void h(void) { extern double g; }\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_GE(countCode(mismatched.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "a type-mismatched block extern must fail the compat sweep";
+}
+
+// ── P50: D-CSUBSET-NORETURN-NON-FUNCTION-OBJECT ────────────────────────────
+// C11 6.7.4p2 confines `_Noreturn` to function declarations. The row asked
+// for a loud REJECT and its "expect unanimous rejection" premise was refuted
+// by measurement: gcc 13.3.0 ACCEPTS every non-function `_Noreturn` with a
+// warning ("variable 'x' declared '_Noreturn'") and IGNORES the specifier;
+// clang/MSVC reject. The disjunction decides acceptance, so DSS warns
+// (S_NoreturnNonFunctionObject) and drops the specifier — gcc's meaning.
+// A manifest carrying expectDiagnostics asserts REJECTION, so the runnable
+// half of this claim lives in examples/c/noreturn_object_warns (the
+// const_bitfield_write_warns precedent); the warning count and the
+// still-compiles verdict are pinned HERE.
+// RED-ON-DISABLE: remove the keyword warn arm -> every count below goes
+// 1->0 (the pre-P50 silent-inert state); remove the attribute-only pointer
+// store gate -> the keyword-pointer isNoreturn assertion flips true.
+TEST(SemanticAnalyzerC, NoreturnKeywordOnNonFunctionWarnsAndStillCompiles) {
+    auto object = analyzeShipped("c", {
+        "_Noreturn int x;\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(object.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u);
+    EXPECT_FALSE(object.hasErrors())
+        << "gcc accepts _Noreturn on an object — DSS must warn, not reject";
+    auto blockObject = analyzeShipped("c", {
+        "int main(void){ _Noreturn int y = 0; (void)y; return 42; }\n",
+    });
+    EXPECT_EQ(countCode(blockObject.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u);
+    EXPECT_FALSE(blockObject.hasErrors());
+    auto typedefPtr = analyzeShipped("c", {
+        "typedef void fn_t(void);\n"
+        "_Noreturn fn_t *p;\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(typedefPtr.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u)
+        << "a pointer to function is still an OBJECT declaration";
+    EXPECT_FALSE(typedefPtr.hasErrors());
+    // One SPELLING, one warning: the specifier is shared by the whole
+    // declarator list (the alignas context-report latch precedent).
+    auto multi = analyzeShipped("c", {
+        "_Noreturn int a, b;\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(multi.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u)
+        << "_Noreturn int a, b; is one spelling — one warning";
+}
+
+TEST(SemanticAnalyzerC, NoreturnKeywordVsAttributeOnFunctionPointerSplit) {
+    // The measured meaning split on a POINTER-to-function declarator:
+    //   keyword  — gcc warns "variable 'p' declared '_Noreturn'" and IGNORES
+    //              it, so DSS warns and must NOT store the flag (a stored
+    //              flag wraps calls through the pointer in Unreachable —
+    //              an execution divergence on a gcc-clean program);
+    //   attribute — gcc AND clang accept SILENTLY and bind it to the
+    //              pointee's function type (TF-C94), so DSS stores it with
+    //              no warning, unchanged.
+    auto keyword = analyzeShipped("c", {
+        "_Noreturn void (*q)(void);\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(keyword.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u);
+    EXPECT_FALSE(keyword.hasErrors());
+    bool sawKeywordQ = false;
+    for (auto const& recq : keyword.symbols()) {
+        if (recq.name == "q") {
+            sawKeywordQ = true;
+            EXPECT_FALSE(recq.isNoreturn)
+                << "the keyword form on a pointer is warned-and-DROPPED";
+        }
+    }
+    EXPECT_TRUE(sawKeywordQ);
+    auto attribute = analyzeShipped("c", {
+        "__attribute__((noreturn)) void (*q)(void);\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(attribute.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 0u)
+        << "the attribute form on a pointer is honored SILENTLY (TF-C94)";
+    bool sawAttrQ = false;
+    for (auto const& recq : attribute.symbols()) {
+        if (recq.name == "q") {
+            sawAttrQ = true;
+            EXPECT_TRUE(recq.isNoreturn)
+                << "the attribute form must keep storing on the pointer";
+        }
+    }
+    EXPECT_TRUE(sawAttrQ);
+    // The function declared THROUGH a typedef is a real function declaration
+    // (all three references accept `_Noreturn fn_t f;`) — no warning, and
+    // the flag stores.
+    auto typedefFn = analyzeShipped("c", {
+        "typedef void fn_t(void);\n"
+        "_Noreturn fn_t f;\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(typedefFn.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 0u);
+    EXPECT_FALSE(typedefFn.hasErrors());
+    bool sawF = false;
+    for (auto const& recf : typedefFn.symbols()) {
+        if (recf.name == "f") {
+            sawF = true;
+            EXPECT_TRUE(recf.isNoreturn)
+                << "_Noreturn through a function typedef is a FUNCTION use";
+        }
+    }
+    EXPECT_TRUE(sawF);
 }
