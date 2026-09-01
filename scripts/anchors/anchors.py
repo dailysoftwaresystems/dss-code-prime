@@ -83,9 +83,9 @@ Exit codes: 0 OK (or a clean dry run) · 1 not found / lint findings · 2 refuse
 (nothing written) · 3 usage error.
 
 Usage:
-    anchors.py write --production D-XX-NAME --status open --priority P1 --trigger '...'
-    anchors.py set   D-XX-NAME --status closed --closing '...'      # moves to the archive
-    anchors.py read  D-XX-NAME [--production|--harness|--done]
+    anchors.py write --production D-<AREA>-<NAME> --status open --priority P1 --trigger '...'
+    anchors.py set   D-<AREA>-<NAME> --status closed --closing '...'      # moves to the archive
+    anchors.py read  D-<AREA>-<NAME> [--production|--harness|--done]
     anchors.py list  [--production|--harness|--done] [--band P0 P1] [--open] [--lint]
     anchors.py --self-test
 """

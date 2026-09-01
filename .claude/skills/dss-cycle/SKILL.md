@@ -132,10 +132,10 @@ Each has a `.sh` and a `.ps1` launcher over one implementation (`anchors.py`), s
 drift. Every verb takes `--production` / `--harness` / `--done`.
 
 ```
-scripts/anchors/write-anchor.sh  --production D-XX-NAME --priority P1 --status open \
+scripts/anchors/write-anchor.sh  --production D-<AREA>-<NAME> --priority P1 --status open \
                                  --trigger '...' --closing '...' --cross-refs '...' --apply
-scripts/anchors/set-anchor.sh    D-XX-NAME --status closed --closing '...' --apply   # MOVES it
-scripts/anchors/read-anchor.sh   D-XX-NAME                    # the full row, field by field
+scripts/anchors/set-anchor.sh    D-<AREA>-<NAME> --status closed --closing '...' --apply   # MOVES it
+scripts/anchors/read-anchor.sh   D-<AREA>-<NAME>                    # the full row, field by field
 scripts/anchors/read-anchors.sh  --production --band P0       # name + priority + status only
 scripts/anchors/read-anchors.sh  --lint                       # every row a reader cannot key on
 ```

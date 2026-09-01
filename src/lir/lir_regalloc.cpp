@@ -327,7 +327,8 @@ collectCallPositions(Lir const& lir, TargetSchema const& schema,
 // eligible for the callee vreg; fixed-def interference from the
 // not-yet-emitted moves is not modeled. A callee parked in such a
 // register is then clobbered by its own call's arg/result setup → the
-// call jumps THROUGH a setup value (D-FC4-C2 silent garbage), or trips
+// call jumps THROUGH a setup value (the FC4 c2 silent-garbage class,
+// plan 23's own spelling of that milestone), or trips
 // the loud L_IndirectCalleeClobberedByArgSetup backstop. The consumer in
 // allocateOneFunc excludes the cc's argGprs ∪ argFprs (+ the variadic
 // vector-count register when the payload's variadic bit is set + the

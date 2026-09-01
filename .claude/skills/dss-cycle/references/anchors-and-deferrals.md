@@ -52,7 +52,7 @@ deferral is the rare exception that must earn its place, not the convenient way 
    — `Priority` is `P0`..`P5`, `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED`.
    ⚠⚠ **DO NOT HAND-WRITE THE ROW.** Use the writer, which takes the FIELDS:
 
-       bash scripts/anchors/write-anchor.sh --production D-XX-NAME \
+       bash scripts/anchors/write-anchor.sh --production D-<AREA>-<NAME> \
             --priority P1 --status open --trigger '...' --closing '...' --cross-refs '...' \
             --insert --apply
 
@@ -64,7 +64,7 @@ deferral is the rare exception that must earn its place, not the convenient way 
 2b. **CLOSING IS A MOVE, NOT AN EDIT** (operator, 2026-09-01: *"always delete a done item and put
    into `_deferred-anchor-registry-done.md` once finished"*):
 
-       bash scripts/anchors/set-anchor.sh D-XX-NAME --status closed --closing '...' --apply
+       bash scripts/anchors/set-anchor.sh D-<AREA>-<NAME> --status closed --closing '...' --apply
 
    `set-anchor` patches only the fields you name, preserves the rest byte-for-byte, deletes the row
    from its working registry and appends it to the archive's matching table. Reopening (`--status

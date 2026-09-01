@@ -38,9 +38,18 @@ Set-Location $RepoRoot
 # ✔MEASURED at the AP6 widening: it was the ONLY dangling anchor under `scripts/`,
 # so rewording it is what makes that root addable. (It read "`tools/` and `scripts/`"
 # until 2026-08-19, when those two directories became one.)
-# ⇒ A placeholder for illustration must stay UNDER the threshold the regex
-# demands: `D-XX-EXAMPLE` is safe (one hyphen-segment after the head, the pattern
-# below requires two or more), while any three-segment spelling is not.
+# ★★★ THE THRESHOLD IS `{1,}` SINCE 2026-09-01 (P50, operator ruling R3) — one
+# hyphen group after the head makes a name FORMAL. It was `{2,}`, and that hid
+# SEVENTY registered rows from this guard: the registry's own ANCHOR-NAME RULE
+# spells a compound feature word as ONE segment, so its worked example turned a
+# four-segment id this guard checked into a three-segment id it ignored. Full
+# sizing, the refused rename and the stop-condition:
+# D-GATE-ANCHOR-REGISTRY-SEGMENT-THRESHOLD-HIDES-SEVENTY-ROWS. HEAD-ONLY names
+# (`D-OPT`) stay informal — pinned by the widened-core self-test arms below.
+# ⇒ There is no under-the-threshold placeholder any more except a head-only
+# name: a fixture or illustration is ASSEMBLED FROM CONCATENATED LITERALS
+# (`'D-XX' + '-EXAMPLE'`), the pattern the self-test's own anchors use; never an
+# Allowlist entry, which silences a name repo-wide and forever.
 # See D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS, which is the row
 # that predicted this and stays open for the `scripts/` + `tests/` half.
 # ★ THE GRAMMAR IS SPELLED ONCE AND THE BOUNDARY IS BOLTED ON, mirroring the
@@ -49,7 +58,7 @@ Set-Location $RepoRoot
 # spellings of the THRESHOLD would be the duplicated-site shape this file keeps
 # closing, while two spellings of the BOUNDARY are unavoidable and so are made
 # explicit here rather than left to be rediscovered.
-$AnchorCore  = 'D-[A-Z0-9_]+(-[A-Z0-9_]+){2,}'
+$AnchorCore  = 'D-[A-Z0-9_]+(-[A-Z0-9_]+){1,}'
 $AnchorRegex = '\b' + $AnchorCore
 
 # ⚠ `-Force` IS LOAD-BEARING NOW, AND IT WAS NOT BEFORE. The header further down
@@ -297,8 +306,13 @@ $stDir = Join-Path ([IO.Path]::GetTempPath()) ("anchor-registry-selftest-" + [Gu
 [void](New-Item -ItemType Directory -Path $stDir)
 try {
     # ── arms 1-4: wrap recovery, both directions ────────────────────────────
+    # ⚠ Fixture ids ASSEMBLED FROM CONCATENATED LITERALS (`'D-CTL' + '-ONE'`) so
+    # this file's own text carries no anchor-shaped token — under `{1,}` a bare
+    # two-segment fixture would be a citation of a row that does not exist, in
+    # the guard's own source. Same pattern as `$stAnchor` below; never an
+    # Allowlist entry.
     [IO.File]::WriteAllLines((Join-Path $stDir 'wrap.txt'), [string[]]@(
-        '// a one-line citation D-CTL-ONE needs no recovery',
+        ('// a one-line citation D-CTL' + '-ONE needs no recovery'),
         '// wrapped, comment continuation D-WRAPA-',
         '// TAILA is the rest of it',
         '# wrapped, decoration continuation D-WRAPB-',
@@ -309,7 +323,7 @@ try {
         '// TAILD must not be reached'))
     $stGot = ((@(JoinWrappedInFile (Join-Path $stDir 'wrap.txt') 'wrap.txt') |
         ForEach-Object { $_.Substring($_.LastIndexOf(':') + 1) }) -join ' ') + ' '
-    St-Arm 'wrap-join-recovers-both-continuation-shapes' 'D-WRAPA-TAILA D-WRAPB-TAILB ' $stGot
+    St-Arm 'wrap-join-recovers-both-continuation-shapes' ('D-WRAPA' + '-TAILA D-WRAPB' + '-TAILB ') $stGot
     St-Arm 'wrap-join-refuses-a-lower-case-continuation' '' (($stGot -split ' ' | Where-Object { $_ -clike 'D-WRAPC*' }) -join ' ')
     St-Arm 'wrap-join-refuses-a-fragment-inside-a-longer-word' '' (($stGot -split ' ' | Where-Object { $_ -clike '*TAILD*' }) -join ' ')
     St-Arm 'wrap-join-leaves-an-unwrapped-citation-alone' '' (($stGot -split ' ' | Where-Object { $_ -clike 'D-CTL*' }) -join ' ')
@@ -317,23 +331,23 @@ try {
     # ── arms 5-6: quotation declarations ────────────────────────────────────
     $stMarker = 'ANCHOR-GUARD-QUOTED-NOT-CITED:'
     [IO.File]::WriteAllLines((Join-Path $stDir 'decl.txt'), [string[]]@(
-        'prose that quotes D-QUO-HERE as evidence of a deleted row',
-        "  > $stMarker D-QUO-HERE D-QUO-GONE WORD-D-QUO-INNER"))
+        ('prose that quotes D-QUO' + '-HERE as evidence of a deleted row'),
+        ("  > $stMarker D-QUO" + '-HERE D-QUO' + '-GONE WORD-D-QUO' + '-INNER')))
     $stGot = ((@(DeclRecordsInFile (Join-Path $stDir 'decl.txt') 'decl.txt')) -join ' ') + ' '
     St-Arm 'quotation-declaration-classifies-cited-and-absent-ids' `
-           'DECL:decl.txt:D-QUO-HERE STALE:decl.txt:D-QUO-GONE ' $stGot
+           ('DECL:decl.txt:D-QUO' + '-HERE STALE:decl.txt:D-QUO' + '-GONE ') $stGot
     # Two SEPARATE outcomes of the one boundary test, pinned separately: the
     # anchor-shaped tail inside the marker, and an id sitting in the middle of a
     # longer hyphenated word on the same line.
     St-Arm 'quotation-marker-does-not-cite-its-own-anchor-shaped-tail' '' `
            (($stGot -split ' ' | Where-Object { $_ -clike '*D-QUOTED*' }) -join ' ')
     St-Arm 'quotation-ids-must-sit-on-a-word-boundary' '' `
-           (($stGot -split ' ' | Where-Object { $_ -clike '*D-QUO-INNER*' }) -join ' ')
+           (($stGot -split ' ' | Where-Object { $_ -clike ('*D-QUO' + '-INNER*') }) -join ' ')
     # A line that merely MENTIONS the marker is prose, not a declaration. Two
     # earlier markers in this guard were defeated by exactly that - one by a row
     # whose prose said the words, the next by the row that documented the token.
     [IO.File]::WriteAllLines((Join-Path $stDir 'mid.txt'), [string[]]@(
-        "see the $stMarker convention, which would exempt D-QUO-MID"))
+        ("see the $stMarker convention, which would exempt D-QUO" + '-MID')))
     St-Arm 'quotation-declaration-recognition-is-positional' '' `
            ((@(DeclRecordsInFile (Join-Path $stDir 'mid.txt') 'mid.txt')) -join ' ')
 
@@ -377,6 +391,31 @@ try {
            $(if ($stGot -clike "*$stR4*") { 'yes' } else { $stGot })
     St-Arm 'retired-matcher-ignores-a-plain-six-cell-closure' '' `
            (($stGot -split ' ' | Where-Object { $_ -ceq $stR5 }) -join ' ')
+
+    # ── arms 18-21: the widened core, both directions of the flip ───────────
+    # The threshold moved `{2,}` → `{1,}` in P50 (the block at `$AnchorCore`
+    # holds the sizing). These arms are what the disclosure row demanded — an
+    # id of the NEWLY VISIBLE two-segment shape that resolves, one that does
+    # not, and the head-only carve-out — or the widening is unverified in the
+    # driver this host runs. Fixture ids concatenated, as everywhere here.
+    $stVis = 'D-VIS' + '-ROW'          # two-segment: newly visible under {1,}
+    $stHdo = 'D-HEAD' + 'ONLY'         # head-only: stays informal, the carve-out
+    [IO.File]::WriteAllText((Join-Path $stDir 'vis.txt'), "cite $stVis and $stHdo here`n")
+    $stGot = (([regex]::Matches((Get-Content -Raw (Join-Path $stDir 'vis.txt')), $AnchorRegex) |
+        ForEach-Object { $_.Value }) -join ' ') + ' '
+    St-Arm 'widened-core-collects-a-two-segment-id' "$stVis " $stGot
+    St-Arm 'widened-core-still-ignores-a-head-only-name' '' `
+           (($stGot -split ' ' | Where-Object { $_ -ceq $stHdo }) -join ' ')
+    # The resolve, both directions, under the same SUBSTRING contract the
+    # plan-side resolve applies (`.Contains()`): a plan-side citation resolves
+    # the id; its absence leaves the id a finding. Pinned here so the widened
+    # shape's resolve is exercised without walking the real `.plans/`.
+    $stPlansBlob = "the plans cite $stVis in prose"
+    St-Arm 'a-two-segment-id-the-plans-cite-resolves' 'yes' `
+           $(if ($stPlansBlob.Contains($stVis)) { 'yes' } else { 'no' })
+    $stNores = 'D-VIS' + '-NOWHERE'
+    St-Arm 'a-two-segment-id-the-plans-do-not-cite-stays-a-finding' 'no' `
+           $(if ($stPlansBlob.Contains($stNores)) { 'yes' } else { 'no' })
 } finally {
     Remove-Item -Recurse -Force -LiteralPath $stDir -ErrorAction SilentlyContinue
 }
@@ -384,7 +423,7 @@ if ($stFail) {
     Write-Host "anchor-registry: FAIL - the self-test did not pass, so no verdict from this run means anything."
     exit 6
 }
-Write-Host "anchor-registry: self-test OK - 17 arms (4 wrap recovery incl. 3 refusals to join, 4 quotation classification incl. the positional rule and the word boundary, 3 root existence/floor, 5 retired-id matcher incl. both production false positives and BOTH cell layouts, 1 green control); this guard is PROVEN able to fail."
+Write-Host "anchor-registry: self-test OK - 21 arms (4 wrap recovery incl. 3 refusals to join, 4 quotation classification incl. the positional rule and the word boundary, 3 root existence/floor, 5 retired-id matcher incl. both production false positives and BOTH cell layouts, 4 widened-core incl. the head-only carve-out and both resolve directions, 1 green control); this guard is PROVEN able to fail."
 
 # The scanned set MUST match the .sh sibling EXACTLY (`src/ examples/` x
 # {cpp,hpp,json,c}). It did not: this script scanned `src` without `*.c` and
