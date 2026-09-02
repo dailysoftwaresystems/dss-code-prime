@@ -1,0 +1,16 @@
+{
+  "$comment": "D-CSUBSET-NORETURN-KEYWORD-PARAMETER-AND-TYPEDEF-POSITIONS (P51 lane np) — the `_Noreturn` KEYWORD in a PARAMETER's specifiers and in a TYPEDEF head, the two positions that were `error[P_NoAlternativeMatched]` at the pre-change HEAD. MEASURED 2026-09-01, each reference probed SEPARATELY at -std=c11 AND -std=c2x: gcc 13.3.0 ACCEPTS both (rc=0, warn-and-IGNORE); clang 18.1.3 and MSVC 19.51 REJECT both. One accepting reference makes it REQUIRED, and the disjunction decides ACCEPTANCE, so DSS parses both and reproduces gcc's MEANING — the specifier is dropped. exit 42 = 40 loop iterations + 2 tally bumps, and it is only reachable because NEITHER position made a call terminate its block: had the keyword been honored on the typedef head, `bump_tally()` would lower to Block{call, Unreachable} and every statement after it would be dead. Release pipeline + all four targets because the boundary claim is 'DSS BUILDS AND RUNS this', per-target.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "$noExpectDiagnosticsComment": "DELIBERATELY NO `expectDiagnostics` — the noreturn_object_warns / const_bitfield_write_warns precedent, same split for the same reason: the runner treats any manifest carrying that key as an EXPECT-ERROR entry (asserts the compile was REJECTED and never runs the artifact), which is exactly the verdict this shape must NOT draw. THAT the parameter position warns S_NoreturnNonFunctionObject, warns ONCE per parameter, and leaves the build green is pinned by SemanticAnalyzerC.NoreturnKeywordOnParameterWarnsAndStillCompiles; THAT the flag is not propagated from a typedef head to its uses is pinned by SemanticAnalyzerC.NoreturnKeywordOnTypedefHeadIsNotPropagatedToUses; THAT the program is still built, still runs, and still reaches its return is pinned HERE by an executing artifact on four targets. No one of those instruments can hold another's half.",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

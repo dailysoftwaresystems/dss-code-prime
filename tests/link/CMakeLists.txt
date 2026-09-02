@@ -463,3 +463,16 @@ dss_add_test(NAME link/test_merge_block_symbols
 # the emitted bytes, never that the link succeeded — it always succeeded.
 dss_add_test(NAME link/test_intrasection_baked_call
              SOURCES test_intrasection_baked_call.cpp)
+
+# THE ARTIFACT INVARIANT AT ITS CHOKEPOINT: `writeBytes` is the ONE place any
+# artifact byte in this compiler reaches disk (`writeImage` delegates to it;
+# the `ar` producer calls it directly -- MEASURED, the only two call sites in
+# src/), so a compilation that recorded an error commits no artifact is
+# enforced there rather than asked of every caller. Pins the refusal, the
+# Info severity (it must not raise errorCount), the absence of any staging
+# leftover, and the non-destructive clause: a previous good artifact survives
+# byte-identical.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME link/test_artifact_withheld_after_error
+             SOURCES test_artifact_withheld_after_error.cpp)

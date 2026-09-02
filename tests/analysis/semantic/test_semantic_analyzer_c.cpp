@@ -19684,3 +19684,390 @@ TEST(SemanticAnalyzerC, NoreturnKeywordVsAttributeOnFunctionPointerSplit) {
     }
     EXPECT_TRUE(sawF);
 }
+
+// ===========================================================================
+// P51 [[D-CSUBSET-NORETURN-KEYWORD-PARAMETER-AND-TYPEDEF-POSITIONS]] — the
+// SEMANTIC half of the two grammar positions opened this cycle. The whole
+// claim of the row's closing work is that NO new semantic code is needed:
+// a parameter reaches the P50 warn-and-drop arm on its own. These pin that
+// it actually does, by RUNNING rather than by reading.
+// ===========================================================================
+
+// A PARAMETER can never be a FnSig, so the keyword written on one takes the
+// P50 `!isFnSig` arm: warn S_NoreturnNonFunctionObject, drop the specifier,
+// build green. MEASURED against gcc 13.3.0 (`-std=c11` and `-std=c2x`,
+// `-Wall -Wextra`): every shape below is rc=0 with "parameter 'x' declared
+// '_Noreturn'", ONE warning per PARAMETER — which is why the two-parameter
+// case expects TWO and the duplicated-keyword case expects ONE (each `param`
+// is its own declaration node, so the per-declaration latch is per-parameter).
+// clang 18.1.3 and MSVC 19.51 reject all of them; the disjunction decides
+// ACCEPTANCE, so gcc's reading governs.
+// RED-ON-DISABLE: delete the "NoreturnKeyword" branch from
+// `paramDeclSpecifier`'s alt in c.lang.json -> every shape below becomes a
+// P0009 parse error and each count goes 1/2 -> 0 with hasErrors() true.
+TEST(SemanticAnalyzerC, NoreturnKeywordOnParameterWarnsAndStillCompiles) {
+    auto fnPtr = analyzeShipped("c", {
+        "void g(_Noreturn void (*p)(void));\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(fnPtr.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u);
+    EXPECT_FALSE(fnPtr.hasErrors())
+        << "gcc accepts _Noreturn on a parameter — DSS must warn, not reject";
+
+    auto object = analyzeShipped("c", {
+        "void g(_Noreturn int p);\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(object.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u);
+    EXPECT_FALSE(object.hasErrors());
+
+    // A DEFINITION's parameter list, not only a prototype's.
+    auto definition = analyzeShipped("c", {
+        "void g(_Noreturn void (*p)(void)) { (void)p; }\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(definition.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u);
+    EXPECT_FALSE(definition.hasErrors());
+
+    // TWO parameters = TWO declarations = TWO warnings (gcc emits two).
+    auto twoParams = analyzeShipped("c", {
+        "void g(_Noreturn int a, _Noreturn int b);\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(twoParams.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 2u)
+        << "the per-declaration latch is per-PARAMETER, and gcc warns twice";
+
+    // The keyword twice on ONE parameter is ONE spelling — one warning, the
+    // alignas-context-latch precedent. gcc likewise emits one.
+    auto duplicated = analyzeShipped("c", {
+        "void g(_Noreturn _Noreturn int p);\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(duplicated.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u);
+    EXPECT_FALSE(duplicated.hasErrors());
+
+    // The specifier is DROPPED, not stored: a parameter object must never
+    // carry the flag (a stored flag on a function-POINTER parameter would
+    // wrap calls through it in `Unreachable` — the P50 execution divergence).
+    bool sawP = false;
+    for (auto const& rec : fnPtr.symbols()) {
+        if (rec.name == "p") {
+            sawP = true;
+            EXPECT_FALSE(rec.isNoreturn)
+                << "the keyword form on a parameter is warned-and-DROPPED";
+        }
+    }
+    EXPECT_TRUE(sawP);
+}
+
+// ** THE REFUTATION THIS ROW'S BRIEF ASKED FOR, PINNED AS A SAFETY PROPERTY.
+// The brief's positive control asserted that `typedef _Noreturn void tfn(void);
+// tfn f;` is "unanimously accepted and must still STORE noreturn". BOTH halves
+// are FALSE, MEASURED 2026-09-01:
+//   - UNANIMITY: clang 18.1.3 and MSVC 19.51 REJECT the typedef head
+//     outright; gcc 13.3.0 is the ONLY reference that compiles it.
+//   - STORE: gcc DROPS it. The differential: with `tfn f; int probe(void){
+//     f(); }`, gcc emits `-Wreturn-type` "control reaches end of non-void
+//     function" for the _Noreturn-decorated typedef EXACTLY as it does for the
+//     undecorated control, and emits NOTHING for the all-references-accept
+//     spelling `typedef void tfn(void); _Noreturn tfn f;`. So a `_Noreturn`
+//     TYPEDEF HEAD does not make the aliased function type noreturn.
+// DSS agrees with gcc on the MEANING today, and this pins that agreement so it
+// cannot be lost silently: `SymbolRecord.isNoreturn` IS set on the alias's Type
+// symbol (the P50 arm's `isFnSig` store, which cannot tell a type alias from a
+// function), but nothing reads it. If a later cycle teaches a typedef'd
+// function type to propagate the flag — a reasonable improvement for the
+// ATTRIBUTE spelling — this KEYWORD spelling would start wrapping calls in
+// `Unreachable`, an execution divergence on a gcc-clean program. This test goes
+// RED at that moment instead of the program going wrong.
+// NAMED RESIDUE: DSS emits no diagnostic here where gcc warns "typedef 'tfn'
+// declared '_Noreturn'". Closing that needs the warn arm to distinguish a
+// TYPE-ALIAS declaration from a FUNCTION declaration — a change in
+// `src/analysis/semantic/semantic_analyzer.cpp`, which P51 lane `np` did not
+// own. The gap is exactly one shape wide: a typedef aliasing a NON-function
+// (`typedef _Noreturn long T;`, `typedef _Noreturn void (*pfn)(void);`) DOES
+// warn today, asserted below so the boundary is measured, not assumed.
+// RED-ON-DISABLE: delete the "NoreturnKeyword" branch from
+// `typedefDeclSpecifiers`' post-keyword alt -> every analyze below becomes a
+// P0009 parse error and hasErrors() flips true.
+TEST(SemanticAnalyzerC, NoreturnKeywordOnTypedefHeadIsNotPropagatedToUses) {
+    auto head = analyzeShipped("c", {
+        "typedef _Noreturn void tfn(void);\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_FALSE(head.hasErrors())
+        << "gcc accepts a _Noreturn typedef head — DSS must parse it";
+
+    // THE SAFETY PIN. `f` is declared through the decorated alias; it must NOT
+    // come out noreturn, because gcc does not treat it as noreturn either.
+    auto used = analyzeShipped("c", {
+        "typedef _Noreturn void tfn(void);\n"
+        "tfn f;\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_FALSE(used.hasErrors());
+    bool sawF = false;
+    for (auto const& rec : used.symbols()) {
+        if (rec.name == "f") {
+            sawF = true;
+            EXPECT_FALSE(rec.isNoreturn)
+                << "gcc DROPS _Noreturn written on a typedef head (measured by "
+                   "-Wreturn-type differential); a stored flag here would wrap "
+                   "calls to f in Unreachable on a gcc-clean program";
+        }
+    }
+    EXPECT_TRUE(sawF);
+
+    // THE CONTROL ON THE OTHER SIDE — the spelling all three references accept
+    // must still STORE, so this test cannot pass by the flag never being set.
+    auto onDeclaration = analyzeShipped("c", {
+        "typedef void tfn(void);\n"
+        "_Noreturn tfn f;\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_FALSE(onDeclaration.hasErrors());
+    bool sawControlF = false;
+    for (auto const& rec : onDeclaration.symbols()) {
+        if (rec.name == "f") {
+            sawControlF = true;
+            EXPECT_TRUE(rec.isNoreturn)
+                << "_Noreturn on the DECLARATION is a function use — stored";
+        }
+    }
+    EXPECT_TRUE(sawControlF);
+
+    // THE BOUNDARY OF THE NAMED RESIDUE: a typedef aliasing a NON-function
+    // reaches the warn arm normally, so the silence above is one shape wide.
+    auto aliasScalar = analyzeShipped("c", {
+        "typedef _Noreturn long T;\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(aliasScalar.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u)
+        << "a typedef aliasing a scalar reaches the warn arm";
+    auto aliasFnPtr = analyzeShipped("c", {
+        "typedef _Noreturn void (*pfn)(void);\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_EQ(countCode(aliasFnPtr.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u)
+        << "a typedef aliasing a POINTER-to-function reaches the warn arm";
+
+    // ★★ INVERTED 2026-09-01 (P51, lane `el`) — THE RESIDUE IS CLOSED, AND THIS
+    // ASSERTION WAS INVERTED EXACTLY AS ITS AUTHOR INSTRUCTED ("if this becomes
+    // 1 the residue was closed; assert it, do not delete this test"). It read
+    // `0u` and asserted the SILENCE; it now asserts the WARNING. The arm gained
+    // a type-alias term (`decl.kind == DeclarationKind::Type`) rather than a
+    // widened `!isFnSig`, so the `_Noreturn fn_t f;` control above still stores
+    // and still stays silent. This line is the closing witness for the residue
+    // the comment above named.
+    EXPECT_EQ(countCode(head.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u)
+        << "the FUNCTION-typedef shape now warns, matching gcc's `typedef 'tfn' "
+           "declared '_Noreturn'`; 0 means the type-alias term was lost and the "
+           "residue re-opened";
+}
+
+// ★★★ THE _Noreturn TYPEDEF-HEAD WARNING, the residue
+// `SemanticAnalyzerC.NoreturnKeywordOnTypedefHeadIsNotPropagatedToUses` named
+// and left open for the lane that owned the semantic analyzer.
+//
+// `typedef _Noreturn void tfn(void);` declares a TYPE, not a function, so C11
+// 6.7.4p2 confines the specifier away from it — but the warn arm split on
+// `isFnSig`, which is TRUE for a typedef whose declarator is a function, and
+// the gate closed. DSS was silent where gcc warns.
+//
+// ✔MEASURED 2026-09-01 (P51, lane `el`), each reference probed SEPARATELY at
+// BOTH -std=c11 and -std=c2x, re-derived rather than inherited from the brief:
+//   gcc 13.3.0   ACCEPTS, rc=0, `warning: typedef 'tfn' declared '_Noreturn'`
+//   clang 18.1.3 REJECTS, rc=1, `'_Noreturn' can only appear on functions`
+//   MSVC 19.51   REJECTS, rc=2, C3829
+// The references split on ACCEPT-vs-REFUSE, so the disjunction governs and DSS
+// must accept. They do NOT split on MEANING: gcc drops the specifier (measured
+// by a -Wreturn-type differential — the decorated alias warns `control reaches
+// end of non-void function` exactly as the undecorated control does, while
+// `_Noreturn tfn f;` does not), and DSS drops it too. So the whole gap was one
+// missing diagnostic on a program DSS already compiled correctly.
+//
+// ⓘ NAMED RESIDUE, MEASURED NOT ASSUMED: the alias's own Type symbol still has
+// `isNoreturn` STORED (the `isFnSig` term in `noreturnCarrier`, which has the
+// same blindness this fix removed from the warn arm). Nothing reads it — the
+// sibling test's safety pin proves the flag does not reach declarations made
+// through the alias. It was left alone deliberately: gcc propagates NEITHER
+// spelling from a typedef head (✔MEASURED: the `__attribute__((noreturn))`
+// spelling on a typedef head also fails to suppress -Wreturn-type), but the
+// clang half of that differential came back DEGENERATE (its -Wreturn-type does
+// not fire on the undecorated control either), so the ATTRIBUTE spelling's
+// correct treatment is not established and widening `noreturnCarrier` on a
+// half-measured boundary would be a guess. That is its own row's work.
+TEST(SemanticAnalyzerC, NoreturnKeywordOnAFunctionTypedefHeadWarns) {
+    // THE DEFECT.
+    auto fnAlias = analyzeShipped("c", {
+        "typedef _Noreturn void tfn(void);\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_FALSE(fnAlias.hasErrors())
+        << "gcc accepts it, so the disjunction requires DSS to accept it — the "
+           "fix adds a WARNING, it must never add a rejection";
+    EXPECT_EQ(countCode(fnAlias.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 1u)
+        << "a typedef declares a TYPE; 6.7.4p2 confines '_Noreturn' to function "
+           "declarations, and gcc says so out loud";
+
+    // ★★ THE CONTROL THAT DECIDED THE SHAPE OF THE FIX. A real function
+    // DECLARATION made through an alias is accepted SILENTLY by gcc, clang AND
+    // MSVC. It reaches the arm with `isFnSig` true, exactly like the typedef
+    // head — so a fix that widened `!isFnSig` instead of adding a type-alias
+    // term would warn here and refuse-by-warning a unanimously-accepted
+    // program. This arm is the only thing that tells the two apart.
+    auto realDecl = analyzeShipped("c", {
+        "typedef void fn_t(void);\n"
+        "_Noreturn fn_t f;\n"
+        "int main(void){ return 42; }\n",
+    });
+    EXPECT_FALSE(realDecl.hasErrors());
+    EXPECT_EQ(countCode(realDecl.diagnostics(),
+                        DiagnosticCode::S_NoreturnNonFunctionObject), 0u)
+        << "`_Noreturn fn_t f;` declares a FUNCTION — all three references take "
+           "it silently; a warning here is the widened-`!isFnSig` mistake";
+    // …and it must still STORE, so the control cannot pass by the whole feature
+    // having been switched off.
+    bool sawF = false;
+    for (auto const& rec : realDecl.symbols()) {
+        if (rec.name == "f") {
+            sawF = true;
+            EXPECT_TRUE(rec.isNoreturn)
+                << "the specifier is on the DECLARATION and is honored there";
+        }
+    }
+    EXPECT_TRUE(sawF);
+
+    // The ordinary function declaration and definition — the other side of the
+    // control, and the shape the whole feature exists for.
+    for (char const* src : {"_Noreturn void die(void);\nint main(void){ return 42; }\n",
+                            "_Noreturn void die(void){ for(;;){} }\n"
+                            "int main(void){ return 42; }\n"}) {
+        auto plain = analyzeShipped("c", {src});
+        EXPECT_EQ(countCode(plain.diagnostics(),
+                            DiagnosticCode::S_NoreturnNonFunctionObject), 0u)
+            << src << " — a function declaration is precisely where the "
+                      "specifier belongs";
+    }
+
+    // The pre-existing non-function typedef shapes must be UNCHANGED — one
+    // warning each, not two. The type-alias term must not double-report a
+    // declaration the `!isFnSig` term already caught.
+    for (char const* src : {"typedef _Noreturn long T;\nint main(void){ return 42; }\n",
+                            "typedef _Noreturn void (*pfn)(void);\n"
+                            "int main(void){ return 42; }\n"}) {
+        auto alias = analyzeShipped("c", {src});
+        EXPECT_EQ(countCode(alias.diagnostics(),
+                            DiagnosticCode::S_NoreturnNonFunctionObject), 1u)
+            << src << " — exactly one warning; 2 means both terms fired and the "
+                      "per-declaration latch stopped holding";
+    }
+
+    // The MESSAGE distinguishes the two, because "does not declare a function"
+    // is actively false of a typedef whose declarator IS a function type — it
+    // declares a function TYPE. gcc names the typedef; so does DSS now.
+    std::string aliasMessage;
+    for (auto const& d : fnAlias.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_NoreturnNonFunctionObject) {
+            aliasMessage = d.actual;
+            break;
+        }
+    }
+    EXPECT_NE(aliasMessage.find("declares a TYPE"), std::string::npos)
+        << "the alias arm must not reuse the object wording verbatim — got: \""
+        << aliasMessage << "\"";
+}
+
+// ── P51 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the `extern` + GNU-spelling
+//    cross-product, the row's FOURTH baseline spelling ──────────────────────
+//
+// That row's closing witness names four baseline spellings — `inline`,
+// `static inline`, `extern inline` and `extern __inline`. The first three are
+// covered by `InlineDefinitionFollowsC99Quantifier` rows (a), (g) and (f);
+// `InlineGnuSpellingsAreSynonyms` covers the GNU spellings only in their BARE
+// form. ✔MEASURED P51 by grep over the tree at this cycle's base commit: the
+// fourth combination — `extern` TOGETHER WITH a GNU spelling — appeared in no
+// test, no example and no fixture; its only occurrences anywhere were two prose
+// `$comment`s in `c.lang.json`. It is the spelling the real header surface uses
+// for this linkage: glibc's `__extern_inline` is
+// `extern __inline __attribute__((__gnu_inline__))`, and arms 2 and 3 of Apple
+// <sys/cdefs.h>'s `__header_inline` ladder write the same two spellings.
+// ✔MEASURED via `dsscp --dump-predefined-macros`: DSS predefines
+// `__STDC_VERSION__ = 202311L`, `__GNUC__ = 4` and `__clang__ = 1` and defines
+// neither `__GNUC_GNU_INLINE__` nor `__GNUC_STDC_INLINE__`, so Apple's arm 1
+// (plain `inline`) is the one taken today — these rows pin the arms a different
+// identity claim selects, before a header trips over them.
+//
+// ★ WHY THE CROSS-PRODUCT IS NOT REDUNDANT WITH ITS TWO HALVES. The keyword
+// table maps three words to one kind, and `semantics.inline.externSpecifierTokens`
+// carries 6.7.4p7's "without extern" clause. Those are TWO independent lookups:
+// a scan that resolves the keyword through the shared kind but tests for
+// `extern` on some narrower footing would pass every bare-spelling row above
+// and still suppress THIS definition — which no diagnostic reports, because a
+// suppressed inline definition is a legal program.
+//
+// ✔GROUND TRUTH, MEASURED, not read off the standard: `gcc 13.3.0` and
+// `clang 18.1.3`, `-std=c99` and `-std=gnu17`, `-O0 -c` + `nm` on
+// `extern __inline int p(int){…}` give `T p` — a strong, defined symbol, the
+// same column plain `extern inline` produces — in all four combinations.
+// mingw-w64 gcc 13.2.0 agrees. MSVC 19.51 accepts `extern __inline` and refuses
+// `extern __inline__` (C2054), so it is not a reference for that half.
+//
+// RED-ON-DISABLE (REMOVE direction), TWO mutants, BOTH ✔EXERCISED P51:
+//   · delete `externSpecifierTokens` from `semantics.inline` in `c.lang.json`
+//     (an OPTIONAL loader key, so the document still LOADS and this is a real
+//     red rather than a cannot-run) — all three rows here flip to `true`,
+//     alongside `InlineDefinitionFollowsC99Quantifier` row (f), and the mirror
+//     test below stays GREEN, which is what separates the two failure modes;
+//   · delete the `__inline` / `__inline__` rows from the `keywords` table — the
+//     two GNU rows here fail, together with `InlineGnuSpellingsAreSynonyms` and
+//     the corpus examples that write those spellings, while the five
+//     pure-`inline` examples stay green.
+//
+// ⚠ AND WHAT THE FIRST MUTANT DOES **NOT** DO, ✔MEASURED rather than assumed:
+// it does not move the ARTIFACT. With `externSpecifierTokens` gone the bit here
+// reads `true` and a DSS-emitted `elf64-x86_64-linux` object STILL shows `T p`
+// for `extern inline`, because a definition whose `extern` is the declaration
+// rule's HEAD never reaches `lowerInlineDefinitionAsDeclaration`. This test is
+// therefore pinning the RECORDED FACT, not the emission — the linkage tier has
+// its own table in `HirLoweringC`.
+TEST(SemanticAnalyzerC, ExternWithGnuInlineSpellingsStillProvidesTheDefinition) {
+    for (std::string_view spelling : {"extern inline", "extern __inline",
+                                      "extern __inline__"}) {
+        SCOPED_TRACE(spelling);
+        auto model = analyzeShipped(
+            "c", {std::string(spelling) + " int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors()) << spelling;
+        EXPECT_FALSE(survivingFnIsInline(model, "p"))
+            << spelling << " carries 6.7.4p7's with-extern exemption, so it DOES "
+                           "provide the external definition (gcc/clang: T p)";
+    }
+}
+
+// The mirror arm, and it is what keeps the row above from passing vacuously:
+// with `extern` REMOVED, the same two GNU spellings must go back to being
+// inline definitions. A scan that had simply stopped recognizing the GNU
+// spellings altogether would satisfy the test above (nothing is an inline
+// definition when the keyword is never seen) while breaking every macOS header;
+// only the pair of arms separates "the extern clause fired" from "the keyword
+// was lost".
+TEST(SemanticAnalyzerC, BareGnuInlineSpellingsStayInlineDefinitions) {
+    for (std::string_view spelling : {"inline", "__inline", "__inline__"}) {
+        SCOPED_TRACE(spelling);
+        auto model = analyzeShipped(
+            "c", {std::string(spelling) + " int p(int x){return x+1;}\n"});
+        EXPECT_FALSE(model.hasErrors()) << spelling;
+        EXPECT_TRUE(survivingFnIsInline(model, "p"))
+            << spelling << " without `extern` IS an inline definition "
+                           "(gcc/clang: U p)";
+    }
+}

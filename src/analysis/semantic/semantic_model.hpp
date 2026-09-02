@@ -626,11 +626,29 @@ struct DSS_EXPORT SymbolRecord {
     // flag), which is exactly what keeps the S_LinkageRedeclarationMismatch
     // check from firing on the inherited orderings.
     //
-    // ⓘ Read by the merge's mismatch check ONLY. HIR emission linkage still
-    // folds from each declaration's OWN tokens (`linkageFrom`), so a merged
-    // survivor whose own spelling lacks `static` (the f1 inheritance shape)
-    // still EMITS external — a measured, documented residue on the row, not
-    // this field's consumer.
+    // ★★ TWO CONSUMERS SINCE P51, AND THE SECOND ONE IS WHY THIS FIELD DECIDES
+    // BYTES. The merge's mismatch check reads it, and so does HIR EMISSION:
+    // `recordLinkage` (`src/hir/lowering/cst_to_hir.cpp`) takes `Local` binding
+    // from this flag when the declaration's own specifier fold left the default
+    // — D-CSUBSET-LINKAGE-INHERITED-INTERNAL-EMITS-GLOBAL. ⚠ THIS COMMENT USED
+    // TO SAY THE OPPOSITE ("HIR emission linkage still folds from each
+    // declaration's OWN tokens … a merged survivor whose own spelling lacks
+    // `static` still EMITS external — a measured, documented residue"), which
+    // was true when written and became false the day that row closed. It is
+    // corrected rather than deleted because the residue it described was the
+    // whole defect: a two-TU program using the 6.2.2p4 inheritance shape was
+    // REFUSED (K_SymbolRedefinedAcrossUnits) where gcc, clang and MSVC all
+    // build and run it.
+    //
+    // ⇒ A WRONG VALUE HERE IS NOW A WRONG BINDING, NOT A WRONG DIAGNOSTIC. That
+    // raised the cost of the position-blind mint this field was fed by and is
+    // how the storage scan's own position-blindness was found (the semantic
+    // twin of
+    // D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED):
+    // an attribute
+    // clause name spelled `static` marked a symbol internal and REMOVED it from
+    // the object. Anything added to the mint below owes that consequence a
+    // thought.
     bool            isInternalLinkage = false;
     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
     // facts folded from the declaration's specifier prefix by

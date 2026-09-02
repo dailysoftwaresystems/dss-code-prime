@@ -855,10 +855,21 @@ parseProjectConfig(std::string_view jsonText,
                                       pc.resolveLibraries, sourceLabel, rep))
         return std::nullopt;
 
-    // `output` is an OPTIONAL user-authored hint: validate its type when
-    // present (fail loud on a malformed value — never a silent no-op),
-    // but its path ROUTING is deferred (D-AP2-OUTPUT-ROUTING). Absent ⇒
-    // the existing per-target output convention applies downstream.
+    // `output` is the OPTIONAL output-dir BASE (D-AP2-OUTPUT-ROUTING). Validate
+    // its type when present — fail loud on a malformed value, never a silent
+    // no-op — and stop there: `Program::compileProject` owns the ROUTING (the
+    // `--output` precedence, the relative-to-cwd rule, the override note), with
+    // the working directory and the CLI state this pure parser deliberately
+    // lacks. Absent ⇒ the existing base applies (`--output`, else `<cwd>/target`).
+    //
+    // ⚠ NO PATH-SHAPE CHECK HERE, AND THAT IS DELIBERATE — this is the opposite
+    // of `artifactName` below, which rejects `/` and `\` because it must be a
+    // bare NAME. An output BASE is a directory: separators, `..` segments and an
+    // absolute or root-prefixed spelling are all legitimate, exactly as they are
+    // for `--output`, which validates none of them either. The boundary that
+    // still bites is the routing-site containment check, which asks whether the
+    // resolved ARTIFACT is a direct child of whatever base resolution produced —
+    // so it keeps holding over a manifest-supplied base with nothing added here.
     if (doc.contains("output")) {
         json const& v = doc.at("output");
         if (!v.is_string()) {

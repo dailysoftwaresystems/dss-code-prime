@@ -95,6 +95,7 @@ the other in the same commit.
 | **`refresh_landing_log`** | `refresh_landing_log.py`, `test_refresh_landing_log.py` | regenerate the PR landing-log hash anchors in the plans from git log. |
 | **`remote-leg`** | `remote-leg.sh` | run a DSS gate leg on a physical remote host -- push the working tree over a carriage, build clean, and run ctest through run-gate. |
 | **`repo-secrets`** | `repo-secrets.sh` | print the `.secrets` directory a checkout must read, following a lane worktree back to the main checkout that holds it. |
+| **`repo-tree`** | `repo-tree.ps1` | resolve the repository tree a PowerShell script is standing in, and keep that script's git enumeration and its file reads on the SAME root. |
 | **`run-gate`** | `run-gate.ps1`, `run-gate.sh` | run a gate command and REFUSE to report success without evidence that it ran. |
 | **`sqlite-round-trip`** | `sqlite-round-trip.py` | carry a sqlite leg's DSS-built artefacts to a machine that runs their target and prove they EXECUTE there (the round trip). |
 | **`sqlite-runtime-bench`** | `sqlite-runtime-bench.py` | measure the RUNTIME of an emitted sqlite3 binary, the standing runtime-differential instrument. |

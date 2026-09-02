@@ -2326,7 +2326,7 @@ TEST(Preprocessor, FC15aHashOpDirectiveVsStringizeNoContamination) {
 // the invocation-offset inheritance (ExpToken::invOffset threaded through the
 // object-like splice) is exactly what makes it `4`.
 // ─────────────────────────────────────────────────────────────────────────────
-// TF-C59 `#line` (C23 6.10.4 -- D-CPP-LINE-DIRECTIVE). Sets the PRESUMED line,
+// TF-C59 `#line` (C23 6.10.6 -- D-CPP-LINE-DIRECTIVE). Sets the PRESUMED line,
 // and optionally the presumed file, for the lines that FOLLOW. Config-driven
 // (`lineDirective`), so an empty field leaves `#line` to the generic
 // unsupported-directive fail-loud. Every assertion below is RED-ON-DISABLE.
@@ -2358,7 +2358,7 @@ TEST(Preprocessor, Tf59LineDirectiveNumberingAdvances) {
     EXPECT_EQ(lexs[8], "101") << "numbering must ADVANCE from the directive";
 }
 
-// C23 6.10.4p3: the file operand is OPTIONAL, and when OMITTED the presumed NAME
+// C23 6.10.6p5: the file operand is OPTIONAL, and when OMITTED the presumed NAME
 // is left UNCHANGED. So a bare `#line N` AFTER a `#line M "f"` must keep "f".
 // RED-ON-DISABLE: resetting the name on a bare directive reverts __FILE__ to the
 // real buffer name -- the single subtlest rule in the directive.
@@ -2373,7 +2373,7 @@ TEST(Preprocessor, Tf59LineDirectiveOmittedFileLeavesPresumedNameUnchanged) {
     }
     EXPECT_TRUE(sawVirtual)
         << "a BARE `#line 900` must NOT revert the presumed file name set by the "
-           "earlier `#line 10 \"virtual.c\"` (C23 6.10.4p3)";
+           "earlier `#line 10 \"virtual.c\"` (C23 6.10.6p5)";
 }
 
 // A `#line` inside an ELIDED conditional branch is skipped with NO diagnostic and
@@ -2390,10 +2390,14 @@ TEST(Preprocessor, Tf59LineDirectiveInDeadBranchIsInert) {
         << "a dead-branch `#line` must NOT renumber -- the real line 4 stands";
 }
 
-// Fail loud, never silently mis-number: a non-digit operand is rejected. This is
-// also the current behaviour for the macro-expanded form (6.10.4p4), pinned by
-// D-CPP-LINE-DIRECTIVE-MACRO-OPERAND -- a wrong line number would be exactly the
-// silent-wrongness the bar forbids.
+// Fail loud, never silently mis-number: an operand that is not a digit sequence
+// AFTER macro expansion (C23 6.10.6p6) is rejected -- a wrong line number would
+// be exactly the silent-wrongness the bar forbids. `abc` names no macro, so it
+// expands to itself and lands here unchanged.
+// ⚠ THIS COMMENT USED TO SAY the macro-expanded form was ALSO refused, "pinned
+// by D-CPP-LINE-DIRECTIVE-MACRO-OPERAND". That row is now CLOSED: the expanded
+// form is ACCEPTED, and what stayed is the refusal of a RESULT that still
+// matches neither literal form -- which is what this test pins.
 TEST(Preprocessor, Tf59LineDirectiveNonDigitOperandFailsLoud) {
     PreprocessResult r;
     (void)ppLexemes("#line abc\nint x;\n", r);
@@ -2409,14 +2413,14 @@ TEST(Preprocessor, Tf59LineDirectiveMissingOperandFailsLoud) {
         << "`#line` with no operand must FAIL LOUD";
 }
 
-// C23 6.10.4p2: the digit sequence is constrained to 1..2147483647 — the range is
+// C23 6.10.6p4: the digit sequence is constrained to 1..2147483647 — the range is
 // TWO-sided. `#line 0` was silently accepted (making __LINE__ 0) until the
 // code-audit caught the one-sided check. RED-ON-DISABLE: drop the `n == 0` arm.
 TEST(Preprocessor, Tf59LineDirectiveZeroFailsLoud) {
     PreprocessResult r;
     (void)ppLexemes("#line 0\nint x = __LINE__;\n", r);
     EXPECT_TRUE(r.diagnostics->hasErrors())
-        << "`#line 0` is out of the 1..2147483647 range (C23 6.10.4p2)";
+        << "`#line 0` is out of the 1..2147483647 range (C23 6.10.6p4)";
 }
 
 // Trailing junk after the file operand must be rejected, matching handleEmbed.
@@ -2443,6 +2447,228 @@ TEST(Preprocessor, Tf59LineDirectiveSpanningContinuationIsNotOffByOne) {
     EXPECT_EQ(lexs[3], "100")
         << "a `\\`-continued #line renumbers the line after the directive ENDS "
            "(gcc gives 100); keying on the directive's first token gives 101";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-CPP-LINE-DIRECTIVE-MACRO-OPERAND — C23 6.10.6p6, the MACRO-EXPANDED operand.
+//
+// §6.10.6p6 PERMITS a `# line pp-tokens` directive matching neither literal
+// form: its operand tokens are processed "just as in normal text" (every
+// identifier currently defined as a macro name is replaced by its replacement
+// list), and the directive that RESULTS must then match one of the two literal
+// forms and is processed as that form. ✔READ from N3220 §6.10.6, in full.
+//
+// ⚠ THE SECTION IS 6.10.6, NOT 6.10.4: C23 renumbered the preprocessor, 6.10.4
+// is now `#embed` (Binary resource inclusion), and Line control moved to 6.10.6.
+// The old number was C11's, carried here and in `preprocessor.cpp` under a
+// "C23" label — which made ONE number name TWO features in one file. Every
+// `#line` citation in both files is corrected to the C23 one; the `#embed`
+// citations still read 6.10.4 and are RIGHT.
+//
+// ✔MEASURED, gcc 13.3.0 / clang 18.1.3 / MSVC 19.51.36252 probed SEPARATELY over
+// 39 shapes: the expanded form is accepted UNANIMOUSLY and renumbers exactly as
+// the literal form does; an EMPTY expansion and a non-digit RESULT are refused
+// unanimously.
+//
+// ★ EVERY TEST BELOW IS RED-ON-DISABLE IN THE REMOVE DIRECTION: delete the
+// `expandRun` call from `handleLine` (so the operand is validated raw) and each
+// accepting test reports the pre-change refusal.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// THE row's own example, and the equivalence claim stated as an assertion rather
+// than as prose: the SAME renumbering must come out of `#line L` and `#line 100`.
+// Both arms run through `parseLineOperand`, which is why they cannot drift.
+TEST(Preprocessor, LineDirectiveMacroOperandRenumbersLikeTheLiteralForm) {
+    PreprocessResult viaMacro;
+    //                       line: 1               2         3
+    auto macroLexs = ppLexemes("#define L 100\n#line L\nint x = __LINE__;\n",
+                               viaMacro);
+    EXPECT_FALSE(viaMacro.diagnostics->hasErrors())
+        << "C23 6.10.6p6: `#define L 100` + `#line L` is legal C -- gcc, clang "
+           "and MSVC all accept it";
+    ASSERT_EQ(macroLexs.size(), 5u) << "expected: int x = 100 ;";
+    EXPECT_EQ(macroLexs[3], "100")
+        << "the macro-expanded operand must renumber the FOLLOWING line to 100";
+
+    PreprocessResult viaLiteral;
+    //                         line: 1              2         3
+    auto literalLexs = ppLexemes("#define L 100\n#line 100\nint x = __LINE__;\n",
+                                 viaLiteral);
+    EXPECT_FALSE(viaLiteral.diagnostics->hasErrors());
+    EXPECT_EQ(macroLexs, literalLexs)
+        << "the two forms must produce IDENTICAL output -- they are one code "
+           "path (parseLineOperand) reached twice, not two implementations";
+}
+
+// The operand may carry BOTH halves of the second literal form in one macro.
+// A `"f"` in a replacement list lexes through the same global string rules a
+// source one does, so it arrives as the opener + body + closer run the file arm
+// already reads -- no second shape was needed for it.
+TEST(Preprocessor, LineDirectiveMacroOperandCarriesNumberAndFileName) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define LF 100 \"virtual.c\"\n#line LF\n"
+                          "int x = __LINE__;\nconst char* f = __FILE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_GE(lexs.size(), 4u);
+    EXPECT_EQ(lexs[3], "100") << "the number half of the expansion must apply";
+    bool sawVirtual = false;
+    for (auto const& s : lexs) {
+        if (s.find("virtual.c") != std::string::npos) sawVirtual = true;
+    }
+    EXPECT_TRUE(sawVirtual)
+        << "the NAME half of the same expansion must apply too -- an "
+           "implementation that took the digits and dropped the rest passes the "
+           "line assertion and fails here";
+}
+
+// The complement: a LITERAL number with the name supplied by a macro. Scored 0
+// by an implementation that expands only the first operand token.
+TEST(Preprocessor, LineDirectiveMacroOperandSuppliesOnlyTheFileName) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define F \"virtual.c\"\n#line 100 F\n"
+                          "const char* f = __FILE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool sawVirtual = false;
+    for (auto const& s : lexs) {
+        if (s.find("virtual.c") != std::string::npos) sawVirtual = true;
+    }
+    EXPECT_TRUE(sawVirtual)
+        << "`#line 100 F` must take the presumed name from F's expansion";
+}
+
+// FUNCTION-LIKE, with an argument, and with the digits assembled by `##`. Uses
+// the ordinary expander, so arity checking, argument pre-expansion and pasting
+// come for free -- a private `#line` expander would have to re-implement all
+// three, and would be the duplicated truth table this project keeps paying for.
+TEST(Preprocessor, LineDirectiveMacroOperandFunctionLikeAndPaste) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define J(a,b) a##b\n#line J(1,00)\n"
+                          "int x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int x = 100 ;";
+    EXPECT_EQ(lexs[3], "100")
+        << "`J(1,00)` pastes to `100`, which is then the digit sequence";
+}
+
+// RESCAN: a macro whose replacement is ANOTHER macro name. Pins that the operand
+// goes through the full expansion engine rather than a single substitution.
+TEST(Preprocessor, LineDirectiveMacroOperandExpandsThroughAnotherMacro) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define B 100\n#define A B\n#line A\n"
+                          "int x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int x = 100 ;";
+    EXPECT_EQ(lexs[3], "100") << "`A` -> `B` -> `100` must rescan to the digits";
+}
+
+// ★★ THE SELF-REFERENTIAL CASE, AND THE ONE MOST LIKELY TO BE SILENTLY WRONG:
+// `#line __LINE__` after an EARLIER `#line`. The operand's `__LINE__` must
+// resolve against the mapping in effect BEFORE this directive -- the record for
+// the directive being processed is pushed only after its operand validates, and
+// `activeLineDir`'s strict `<` keeps a directive's own line out of its own
+// answer. With `#line 50` on physical line 1, the `#line __LINE__` on physical
+// line 3 sees presumed 50 + (3 - 1 - 1) = 51, so the next line is 51.
+// ✔MEASURED: gcc, clang and MSVC all give 51.
+// ⚠ THIS IS THE ARM THAT FAILS TOWARD A WRONG ANSWER RATHER THAN AN ERROR.
+// Every other malformed shape reaches a fail-loud arm; this one COMPILES either
+// way and differs only in the number, which is precisely the silent wrongness
+// the bar forbids.
+TEST(Preprocessor, LineDirectiveMacroOperandLineMacroUsesThePrecedingMapping) {
+    PreprocessResult r;
+    //                    line: 1        2   3               4
+    auto lexs = ppLexemes("#line 50\n\n#line __LINE__\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int x = 51 ;";
+    EXPECT_EQ(lexs[3], "51")
+        << "the operand's __LINE__ must read the PRECEDING #line mapping (51), "
+           "not the physical line (3) and not the record being created";
+}
+
+// `__FILE__` as the file operand. A predefined macro is minted through
+// `materializeSignificant`, which RE-TOKENIZES the spelling, so it reaches the
+// file arm as the same opener + body + closer run a source `"f.h"` does.
+TEST(Preprocessor, LineDirectiveMacroOperandAcceptsFileMacroAsTheNameOperand) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#line 100 __FILE__\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "`#line 100 __FILE__` is accepted by gcc, clang and MSVC alike";
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int x = 100 ;";
+    EXPECT_EQ(lexs[3], "100");
+}
+
+// THE FAIL-LOUD ARMS SURVIVE THE EXPANSION. An operand whose expansion is EMPTY
+// matches neither literal form; all three references refuse it.
+TEST(Preprocessor, LineDirectiveMacroOperandEmptyExpansionFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define E\n#line E\nint x = __LINE__;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "an operand expanding to NOTHING must FAIL LOUD, never leave the "
+           "numbering silently unchanged";
+}
+
+// A RESULT that is still not a digit sequence.
+TEST(Preprocessor, LineDirectiveMacroOperandNonDigitResultFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define X foo\n#line X\nint x = __LINE__;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "expansion is not permission: a result matching neither literal form "
+           "must FAIL LOUD";
+}
+
+// The 1..2147483647 range (6.10.6p4) is enforced on the EXPANDED value, both
+// ends. ⚠ Here DSS is deliberately STRICTER than every reference: gcc and clang
+// accept `#line 2147483648` and renumber to it, and MSVC accepts it and WRAPS to
+// -2147483648. ISO makes both a constraint violation, and a wrapped line number
+// is a silent miscompile of the diagnostic stream.
+TEST(Preprocessor, LineDirectiveMacroOperandOutOfRangeResultFailsLoud) {
+    PreprocessResult low;
+    (void)ppLexemes("#define N 0\n#line N\nint x = __LINE__;\n", low);
+    EXPECT_TRUE(low.diagnostics->hasErrors())
+        << "`#line N` with N expanding to 0 is out of the 1..2147483647 range";
+
+    PreprocessResult high;
+    (void)ppLexemes("#define N 2147483648\n#line N\nint x = __LINE__;\n", high);
+    EXPECT_TRUE(high.diagnostics->hasErrors())
+        << "an expanded value above 2147483647 is out of range (C23 6.10.6p4)";
+}
+
+// Trailing junk INSIDE the expansion. ⚠ Another deliberate divergence, and it is
+// the literal form's rule applied to the expanded one rather than a new
+// decision: gcc and clang WARN and continue here, MSVC accepts silently, and
+// DSS refuses -- exactly as it already refuses `#line 5 "f.c" garbage`.
+TEST(Preprocessor, LineDirectiveMacroOperandTrailingJunkFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define LJ 5 \"f.c\" garbage\n#line LJ\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "tokens after the file operand must FAIL LOUD in the expanded form "
+           "too -- the two forms share one validator";
+}
+
+// C23 6.10.6p4 interprets the digit sequence "ignoring any optional digit
+// separators (6.4.4.2)". ✔MEASURED: gcc, clang and MSVC all accept `#line 1'000` and
+// renumber to 1000, in BOTH forms; DSS refused it with "requires a digit
+// sequence — got: 1'000" (the tokenizer already lexes it as ONE token, because
+// `c.lang.json` declares `numberStyle.digitSeparator`).
+// RED-ON-DISABLE: restore the `find_first_not_of("0123456789")` test and both
+// arms report the refusal.
+TEST(Preprocessor, LineDirectiveDigitSeparatorsAreIgnoredInTheDigitSequence) {
+    PreprocessResult literal;
+    auto litLexs = ppLexemes("#line 1'000\nint x = __LINE__;\n", literal);
+    EXPECT_FALSE(literal.diagnostics->hasErrors())
+        << "C23 6.10.6p4 ignores digit separators in the #line digit sequence";
+    ASSERT_EQ(litLexs.size(), 5u) << "expected: int x = 1000 ;";
+    EXPECT_EQ(litLexs[3], "1000")
+        << "the separator is IGNORED when computing the value, not merely "
+           "tolerated -- a scan that stopped at it would give 1";
+
+    PreprocessResult viaMacro;
+    auto macLexs = ppLexemes("#define S 1'000\n#line S\nint x = __LINE__;\n",
+                             viaMacro);
+    EXPECT_FALSE(viaMacro.diagnostics->hasErrors());
+    ASSERT_EQ(macLexs.size(), 5u) << "expected: int x = 1000 ;";
+    EXPECT_EQ(macLexs[3], "1000")
+        << "the same rule must hold for the macro-expanded operand -- one "
+           "validator, two surfaces";
 }
 
 // The design's HEADLINE property, which nothing pinned until the code-audit said
@@ -11510,7 +11736,7 @@ TEST(PreprocessorLineMarker, SetsThePresumedFileName) {
 
 // ★ LINE ZERO IS LEGAL HERE AND ILLEGAL IN `#line`, and that divergence is
 // MEASURED, not chosen: gcc 13.3.0's own `-E` output opens with `# 0 "tu.c"` and
-// gcc recompiles that output rc=0. Importing C23 6.10.4p2's 1..2147483647 floor
+// gcc recompiles that output rc=0. Importing C23 6.10.6p4's 1..2147483647 floor
 // would make DSS refuse the very bytes this row exists to read.
 // RED-ON-DISABLE: reuse `handleLine`'s `n == 0` arm and this goes red.
 TEST(PreprocessorLineMarker, LineZeroIsAcceptedUnlikeHashLine) {
@@ -11530,7 +11756,7 @@ TEST(PreprocessorLineMarker, HashLineZeroStillFailsLoud) {
     PreprocessResult r;
     (void)ppLexemes("#line 0 \"f.c\"\nint x = __LINE__;\n", r);
     EXPECT_TRUE(r.diagnostics->hasErrors())
-        << "`#line 0` is out of the C23 6.10.4p2 range even though a LINEMARKER "
+        << "`#line 0` is out of the C23 6.10.6p4 range even though a LINEMARKER "
            "0 is legal — the two surfaces diverge here deliberately";
 }
 
@@ -11563,7 +11789,7 @@ TEST(PreprocessorLineMarker, RepeatedFlagFailsLoud) {
 }
 
 // The file operand is REQUIRED in this form (unlike `#line`'s, which C23
-// 6.10.4p3 makes optional). MEASURED: all 331 linemarkers in one real gcc and
+// 6.10.6p5 makes optional). MEASURED: all 331 linemarkers in one real gcc and
 // clang `-E` census carry a quoted name, so a bare `# 5` is refused rather than
 // guessed at.
 TEST(PreprocessorLineMarker, MissingFileOperandFailsLoud) {

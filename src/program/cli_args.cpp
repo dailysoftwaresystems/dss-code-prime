@@ -225,9 +225,17 @@ std::string cliHelpText() {
             "`=`-form is also accepted (--target=spec).\n"
         "  --recursive            scan subdirectories (default)\n"
         "  --no-recursive         only the top-level directory\n"
+        // D-AP2-OUTPUT-ROUTING: the PRECEDENCE clause is documented here and
+        // not only in `docs/project-config-spec.md`, for the reason
+        // D-CLI-HELP-OMITS-DEFINE-FLAG records — a rule a user meets at the
+        // command line must be discoverable at the command line. Without it the
+        // only way to learn that this flag silently outranks a committed
+        // manifest value is to notice the artifact in the wrong place.
         "  --output <dir>         route emitted binaries into "
             "<dir> (default: <cwd>/target/<formatName>/). Multi-"
-            "target builds get a per-format subdirectory.\n"
+            "target builds get a per-format subdirectory. With "
+            "--project this OVERRIDES the manifest's `output` "
+            "base, and says so when the two differ.\n"
         "  --config=<debug|release>  build config "
             "(default: debug; release applies the full optimizer "
             "pipeline — plan 22)\n"

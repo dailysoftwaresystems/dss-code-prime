@@ -1589,6 +1589,17 @@ TEST(CliArgs, InvalidResolveLibraryErrorNameRoundTrip) {
               "InvalidResolveLibrary");
 }
 
+// D-AP2-OUTPUT-ROUTING: `--output` OUTRANKS a project manifest's `output`, and
+// a precedence rule a user cannot discover is one they meet by finding the
+// artifact somewhere they did not expect. Pin the CLAUSE, not the flag name —
+// the flag was already listed while the rule it now carries was undocumented.
+TEST(CliArgs, HelpTextDocumentsThatOutputOverridesTheManifestBase) {
+    auto const text = cliHelpText();
+    EXPECT_NE(text.find("--project this OVERRIDES the manifest's `output`"),
+              std::string::npos)
+        << "the --output help must state that it outranks the manifest base";
+}
+
 TEST(CliArgs, HelpTextDocumentsTheResolveLibraryImportNameSuffix) {
     // Operator-visible documentation: a capability nobody can discover is a
     // capability nobody uses. Pin the SPELLING, not merely the flag name.

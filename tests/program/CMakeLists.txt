@@ -420,3 +420,14 @@ dss_add_test(NAME program/test_compilation_unit_input_digest
 # separately and the suite is not order-dependent.
 dss_add_test(NAME program/test_dependency_artifact_cache
              SOURCES test_dependency_artifact_cache.cpp)
+
+# THE ARTIFACT INVARIANT: a compilation that recorded an error commits no
+# artifact. Two gates at two scopes -- the merge tier's snapshot at the
+# `mergeCuMirs` call site, and `link/writer.cpp::writeBytes` as the net -- plus
+# the non-destructive clause (a failing rebuild leaves the previous good
+# artifact byte-identical). The writer's own direct pin is
+# `link/test_artifact_withheld_after_error`.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_failed_build_writes_no_artifact
+             SOURCES test_failed_build_writes_no_artifact.cpp)

@@ -92,6 +92,52 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # the wrong file (or "missing"), which is the failure this mode exists to end.
 INVOKED_FROM="$(pwd -P)"
 
+# ── THE ONE ROOT, AND ONE GIT THAT CAN SEE IT ─────────────────────────────
+# ⛔ D-SCRIPT-GUARDS-ASK-GIT-FROM-THE-LANE-WORKTREE. This guard used a BARE `git`,
+# which cannot describe a Windows-created lane worktree from the POSIX namespace:
+# `.worktrees/<lane>/.git` is a FILE naming `C:/…/.git/worktrees/<lane>`, and a
+# POSIX git JOINS that to the worktree path instead of following it.
+# ✔RE-MEASURED 2026-09-01 (cycle P51, lane `gw`), from WSL over `.worktrees/gw`:
+#     rc=2, "line-endings: FAIL — HEAD does not resolve; this is not a git work
+#     tree with a commit. Refusing to report a pass over a tree it cannot read."
+# while the SAME guard over the main checkout in the same shell returned rc=0.
+# That is the SAFE direction — loud, refusing, correctly distrusting itself — but
+# it left every lane unable to check its own tree from two of the four gate legs,
+# and `.worktrees/` is the sanctioned lane mechanism under the 2026-08-26 ruling.
+#
+# ★ ONE OWNER, REUSED, NOT A THIRD SPELLING. `leg_tree_driver_identity` already
+# resolves this exact question for the carriages
+# (D-SCRIPT-CARRIAGES-CANNOT-IDENTIFY-A-CROSS-NAMESPACE-LANE-WORKTREE); its
+# three ordered cases are the answer and re-deriving them here would be a second
+# answer that drifts. The PowerShell twin has its own owner, written once, at
+# `scripts/repo-tree/repo-tree.ps1`.
+# ⚠⚠ THE EXPLICIT EMPTY ARGUMENT IS LOAD-BEARING AND WAS FOUND BY RUNNING IT.
+# `leg-tree.sh` ends in a `case "${1:-}"` dispatch so it can be both sourced and
+# run, and a SOURCED script sees the CALLER'S positional parameters. Sourcing it
+# bare from `check-line-endings.sh --selftest` therefore handed leg-tree the
+# string `--selftest` as a SUBCOMMAND: ✔MEASURED 2026-09-01, rc=4,
+# "[X] leg-tree: unknown subcommand '--selftest' (expected: prepare, restore)".
+# ⓘ An earlier probe of mine sourced it with NO arguments and concluded "no side
+# effects" — a true answer to the wrong question, and the reason this note states
+# the argument rather than the conclusion. `. file ""` selects leg-tree's own
+# "sourced or inlined" branch, and bash restores THIS script's positional
+# parameters when the source returns (✔verified by execution, `$1` intact after).
+# shellcheck source=../leg-tree/leg-tree.sh
+. "${REPO_ROOT}/scripts/leg-tree/leg-tree.sh" ""
+
+# _le_git <git-arg>...
+# ★ EVERY git query in this file goes through here, so the ENUMERATION ROOT is
+# the tree this script lives in, by construction rather than by remembering.
+_le_git() { leg_tree_driver_git "${REPO_ROOT}" "$@"; }
+
+# ⚠ RESOLVED HERE, ABOVE THE ARGUMENT DISPATCH, not down in the preconditions.
+# `--selftest` and `--audit-instruments` both ask git and both run BEFORE the main
+# body, so an identity resolved later would leave those two modes on a bare
+# `git -C` — i.e. still broken in exactly the namespace this row is about, while
+# the default mode looked fixed. The loud refusal stays in the preconditions; this
+# line only makes the answer available to every entry point.
+leg_tree_driver_identity "${REPO_ROOT}" || true
+
 # ── THE ONE CORRECT INSTRUMENT ────────────────────────────────────────────
 # ✔MEASURED (see the instrument note above): `tr -dc '\r' | wc -c` is the only
 # form that answers correctly on BOTH a CRLF file and a pure-LF file on BOTH
@@ -211,7 +257,7 @@ _run_files_mode() {
 # ── Check F: refuse a CR instrument that cannot see a CR ───────────────────
 _run_instrument_audit() {
     local _hits _marked _raw _h _hf _rest _hl
-    _raw="$(git grep -n -I -E "${_CR_BLIND}" -- . "${_CR_AUDIT_SCOPE}" 2>/dev/null \
+    _raw="$(_le_git grep -n -I -E "${_CR_BLIND}" -- . "${_CR_AUDIT_SCOPE}" 2>/dev/null \
              | grep -v -E "${_CR_EXEMPT}" || true)"
     # ── REGION EXEMPTION, and it is why this guard can document itself ──────
     # ★★ A same-line marker is right for a one-off, and USELESS for a paragraph
@@ -239,7 +285,7 @@ _run_instrument_audit() {
     _hits="${_hits%$'\n'}"
     # A census of the escape hatch on every run, so silencing trends are visible
     # rather than accumulating unseen — the ratchet shape used elsewhere here.
-    _marked="$(git grep -c -I -e 'CR-INSTRUMENT-QUOTED' -- . "${_CR_AUDIT_SCOPE}" 2>/dev/null | wc -l | tr -d ' ')"
+    _marked="$(_le_git grep -c -I -e 'CR-INSTRUMENT-QUOTED' -- . "${_CR_AUDIT_SCOPE}" 2>/dev/null | wc -l | tr -d ' ')"
     if [[ -n "${_hits}" ]]; then
         echo "line-endings: FAIL — a CR instrument that cannot see a CR:" >&2
         echo "" >&2
@@ -336,6 +382,26 @@ _run_selftest() {
     _n="$(grep -E "${_CR_BLIND}" "${_t}/marked.txt" 2>/dev/null | grep -v -c -E "${_CR_EXEMPT}" || true)"
     [[ "${_n}" -eq 0 ]] || { echo "line-endings: FAIL — selftest: the CR-INSTRUMENT-QUOTED marker did not exempt a documented idiom." >&2; _fail=1; }
 
+    # ARM 8 — ONE ROOT (D-SCRIPT-GUARDS-ASK-GIT-FROM-THE-LANE-WORKTREE).
+    # Every arm above judges BYTES; this one judges WHICH TREE the bytes came
+    # from. The twin of the `.ps1` sibling's arm 8, kept here so the pairing is by
+    # BEHAVIOUR and not by existence: the defect this pins is far worse in that
+    # shell, and a property held in only one twin is how the last four pairing
+    # defects in this repository started.
+    local _sr _st
+    _sr="$(pwd -P)"
+    _st="$(_le_git rev-parse --show-toplevel 2>/dev/null)"
+    if [[ -z "${_st}" ]]; then
+        echo "line-endings: FAIL — selftest: git will not name a top level; the guard cannot say which tree it is judging." >&2; _fail=1
+    elif [[ "$(cd "${_st}" 2>/dev/null && pwd -P)" != "${_sr}" ]]; then
+        echo "line-endings: FAIL — selftest: git enumerates from '${_st}' while this shell reads at '${_sr}'." >&2; _fail=1
+    fi
+    # ...and the identity must be the one THIS script's tree owns, not whichever
+    # tree the caller happened to be standing in.
+    if [[ "$(cd "${REPO_ROOT}" && pwd -P)" != "${_sr}" ]]; then
+        echo "line-endings: FAIL — selftest: the guard is reading at '${_sr}' but lives in '${REPO_ROOT}'." >&2; _fail=1
+    fi
+
     [[ "${_fail}" -eq 0 ]] || { echo "line-endings: FAIL — the SELF-TEST failed (above). This guard cannot be trusted until it passes; do not silence it." >&2; return 2; }
     return 0
 }
@@ -368,9 +434,40 @@ if ! command -v git >/dev/null 2>&1; then
     echo "  and an LF checkout would false-green). Refusing to report a pass." >&2
     exit 2
 fi
-if ! git rev-parse --verify --quiet HEAD >/dev/null; then
+# ★ THE IDENTITY WAS RESOLVED ABOVE, IN WHICHEVER NAMESPACE CAN SEE THE TREE. This
+# refusal replaces a bare `git rev-parse HEAD`, which answered "no" for every lane
+# worktree reached from WSL while the tree was perfectly readable.
+if [[ -z "${LEG_TREE_DRIVER_SHA:-}" ]]; then
     echo "line-endings: FAIL — HEAD does not resolve; this is not a git work tree" >&2
     echo "  with a commit. Refusing to report a pass over a tree it cannot read." >&2
+    echo "  (tried a plain \`git -C\`, then the gitdir named by ${REPO_ROOT}/.git)" >&2
+    exit 2
+fi
+if ! _le_git rev-parse --verify --quiet HEAD >/dev/null; then
+    echo "line-endings: FAIL — HEAD does not resolve; this is not a git work tree" >&2
+    echo "  with a commit. Refusing to report a pass over a tree it cannot read." >&2
+    exit 2
+fi
+
+# ── THE ENUMERATION ROOT AND THE READ ROOT MUST BE THE SAME ROOT ──────────
+# ⓷ of D-SCRIPT-GUARDS-ASK-GIT-FROM-THE-LANE-WORKTREE: PROVEN, not assumed. This
+# shell has ONE working directory, so `cd` moves the reads and the git together —
+# unlike the PowerShell twin, where `Set-Location` moves only one of the two and
+# the split is invisible until a path exists at exactly one root. The assertion is
+# carried in BOTH twins anyway: a property checked in one sibling and not the
+# other is how every pairing defect in this repository has started.
+_enum_root="$(_le_git rev-parse --show-toplevel 2>/dev/null)"
+_read_root="$(pwd -P)"
+if [[ -z "${_enum_root}" ]]; then
+    echo "line-endings: FAIL — git will not name a top level for ${REPO_ROOT}." >&2
+    echo "  Refusing to report a verdict about a tree it cannot locate." >&2
+    exit 2
+fi
+if [[ "$(cd "${_enum_root}" 2>/dev/null && pwd -P)" != "${_read_root}" ]]; then
+    echo "line-endings: FAIL — the enumeration root and the read root are NOT the same root." >&2
+    echo "    git enumerates from : ${_enum_root}" >&2
+    echo "    this shell reads at : ${_read_root}" >&2
+    echo "  Every path below would be listed from one tree and read from the other." >&2
     exit 2
 fi
 
@@ -391,8 +488,8 @@ _run_selftest || exit 2
 # churn never trips it — it catches COLLAPSE (a dead PCRE engine, an unreadable
 # ref, a moved tree), not drift. Fix the scan; never lower the floor.
 SCAN_FLOOR=1500
-_control_head="$(git grep -I -l -P '^.' HEAD 2>/dev/null | wc -l | tr -d ' ')"
-_control_index="$(git grep --cached -I -l -P '^.' 2>/dev/null | wc -l | tr -d ' ')"
+_control_head="$(_le_git grep -I -l -P '^.' HEAD 2>/dev/null | wc -l | tr -d ' ')"
+_control_index="$(_le_git grep --cached -I -l -P '^.' 2>/dev/null | wc -l | tr -d ' ')"
 _control_failed=0
 for _pair in "HEAD:${_control_head}" "index:${_control_index}"; do
     _what="${_pair%%:*}"; _n="${_pair#*:}"
@@ -424,8 +521,8 @@ done
 # escape hatch that cannot do what it advertises is worse than none.
 # The REAL exemption is `binary` / `-text`, and this guard already honours it
 # through `-I` — that is how `examples/**/*.bin` keeps its 0x0D bytes.
-_offenders_head="$(git grep -I -l -P '\r$' HEAD 2>/dev/null | sed 's|^HEAD:||')"
-_offenders_index="$(git grep --cached -I -l -P '\r$' 2>/dev/null)"
+_offenders_head="$(_le_git grep -I -l -P '\r$' HEAD 2>/dev/null | sed 's|^HEAD:||')"
+_offenders_index="$(_le_git grep --cached -I -l -P '\r$' 2>/dev/null)"
 
 # ── STALE-CHECKOUT DETECTION — the git history here may not describe this tree ──
 #
@@ -459,7 +556,7 @@ done <<< "${_all_history_offenders}"
 if [[ -n "${_stale_evidence}" ]]; then
     echo "line-endings: HISTORY SCAN SKIPPED — this work tree's .git does not describe its files." >&2
     echo "    evidence: '${_stale_evidence}' is recorded as CRLF in HEAD/index but carries ZERO CR on disk." >&2
-    echo "    HEAD here is $(git rev-parse --short HEAD 2>/dev/null || echo '<unresolved>')." >&2
+    echo "    HEAD here is $(_le_git rev-parse --short HEAD 2>/dev/null || echo '<unresolved>')." >&2
     echo "    This is the expected shape of a tree synced WITHOUT .git (see the WSL leg of the" >&2
     echo "    3-leg gate, D-GATE-WSL-SYNC-LEAVES-GIT-HEAD-STALE). Convicting on that history would" >&2
     echo "    report violations belonging to another commit — so checks A and C are suspended here." >&2
@@ -488,7 +585,7 @@ _check_set "staged (index)"   "${_offenders_index}"
 # never read" shape this file already fails closed against on the history side.
 # So the row count carries the same floor as the positive control above.
 # ✔MEASURED 2026-08-10: 2,265 tracked paths.
-_eol_rows="$(git ls-files --eol 2>/dev/null)"
+_eol_rows="$(_le_git ls-files --eol 2>/dev/null)"
 _eol_row_count="$(printf '%s' "${_eol_rows}" | grep -c . || true)"
 if [[ "${_eol_row_count}" -lt "${SCAN_FLOOR}" ]]; then
     echo "line-endings: FAIL — \`git ls-files --eol\` returned only ${_eol_row_count} rows, below its floor of ${SCAN_FLOOR}." >&2
@@ -504,7 +601,7 @@ fi
 # `i/-text` is an INDEX fact, so a stale index answers about a different commit.
 _binary_in_pinned=""
 [[ -n "${_skip_binary_check:-}" ]] || \
-_binary_in_pinned="$(git ls-files --eol -- '*.c' '*.h' '*.cpp' '*.hpp' '*.cmake' 'CMakeLists.txt' '*/CMakeLists.txt' '*.md' 'VERSION' 2>/dev/null \
+_binary_in_pinned="$(_le_git ls-files --eol -- '*.c' '*.h' '*.cpp' '*.hpp' '*.cmake' 'CMakeLists.txt' '*/CMakeLists.txt' '*.md' 'VERSION' 2>/dev/null \
     | awk '$1 == "i/-text" { sub(/^[^\t]*\t/, ""); print }')"
 if [[ -n "${_binary_in_pinned}" ]]; then
     while IFS= read -r _f; do
@@ -570,7 +667,7 @@ fi
 # rewrite. Convicting there would be a false red on a correctly-configured host,
 # so E1 states the situation instead of convicting — and E2 (untracked files,
 # which were never checked out) keeps convicting either way.
-_autocrlf="$(git config core.autocrlf 2>/dev/null || true)"
+_autocrlf="$(_le_git config core.autocrlf 2>/dev/null || true)"
 [[ -n "${_autocrlf}" ]] || _autocrlf='<unset>'
 # E1 — TRACKED, text, NOT covered by an `eol=lf` pin, CRLF/mixed on disk.
 # `i/-text` is binary (its 0x0D is legitimate) and `i/none` is empty; both are
@@ -612,12 +709,12 @@ while IFS= read -r _f; do
     grep -qI . -- "${_f}" 2>/dev/null || continue
     # An explicit `binary` / `-text` declaration is an exemption, exactly as `-I`
     # honours it for the blob tiers.
-    case "$(git check-attr text -- "${_f}" 2>/dev/null)" in *": text: unset") continue;; esac
-    case "$(git check-attr eol  -- "${_f}" 2>/dev/null)" in *": eol: lf")     continue;; esac
+    case "$(_le_git check-attr text -- "${_f}" 2>/dev/null)" in *": text: unset") continue;; esac
+    case "$(_le_git check-attr eol  -- "${_f}" 2>/dev/null)" in *": eol: lf")     continue;; esac
     if [[ "$(tr -dc '\r' < "${_f}" | wc -c | tr -d ' ')" -ne 0 ]]; then
         _worktree_untracked+="${_f}"$'\n'
     fi
-done <<< "$(git ls-files --others --exclude-standard 2>/dev/null)"
+done <<< "$(_le_git ls-files --others --exclude-standard 2>/dev/null)"
 if [[ -n "${_worktree_untracked}" ]]; then
     while IFS= read -r _f; do
         [[ -z "${_f}" ]] && continue

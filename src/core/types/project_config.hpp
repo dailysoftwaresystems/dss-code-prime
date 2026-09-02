@@ -62,10 +62,26 @@ namespace dss {
 //                         via `core/types/glob_match.hpp`); a metacharacter-free
 //                         entry stays literal. Base = the process working
 //                         directory; a zero-match pattern fails loud there.
-//   * `output`          — artifact output hint. Parsed + type-validated
-//                         (a user-authored schema field); its path
-//                         ROUTING is deferred (D-AP2-OUTPUT-ROUTING) — AP2
-//                         uses the existing per-target output convention.
+//   * `output`          — OPTIONAL output-dir BASE: the `<base>` each target's
+//                         artifact routes into as `<base>/<formatName>/
+//                         <artifactName-or-stem><ext>`, i.e. the same thing the
+//                         CLI `--output` names. Absent ⇒ `--output` when given,
+//                         else `<cwd>/target` (both defaults unchanged).
+//                         A DIRECTORY, never a file path — `artifactName` owns
+//                         the emitted binary's NAME, and one fact does not get a
+//                         second owner. RELATIVE resolves against the PROCESS
+//                         working directory, the same base `sources[]` and
+//                         `preBuildScripts` use, so a manifest composes with
+//                         itself. PRECEDENCE: the CLI `--output` WINS (the
+//                         `stackReserve` rule) and the override is ANNOUNCED on
+//                         the driver note channel when the two name different
+//                         directories. Wired by `Program::compileProject`
+//                         (D-AP2-OUTPUT-ROUTING) — the LOADER still only parses
+//                         and type-validates, per the pure-parser rule below.
+//                         ⓘ A DEPENDENCY manifest's `output` is NOT read, the
+//                         U-9 ruling: the output base is a property of THE
+//                         BUILD, exactly as `targets[]` and
+//                         `dependencyArtifactCache` are.
 //   * `artifactName`    — OPTIONAL base NAME for the emitted binary (no
 //                         extension, no path separators — a name, not a path).
 //                         Absent ⇒ the source stem (unchanged). A project build
@@ -232,6 +248,7 @@ struct DSS_EXPORT ProjectConfig {
     std::string              artifactProfile;
     std::vector<std::string> targets;
     std::vector<std::string> sources;
+    // The output-dir BASE (D-AP2-OUTPUT-ROUTING); see the field note above.
     std::optional<std::string> output;   // nullopt iff the field is absent
     // OPTIONAL base NAME for the emitted binary (no extension / path
     // separators). nullopt ⇒ the source stem. In a project build each target's

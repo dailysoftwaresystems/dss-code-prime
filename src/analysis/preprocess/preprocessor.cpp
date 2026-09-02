@@ -4920,7 +4920,7 @@ private:
             handleEmbed(in, p, end, body);
         } else if (!cfg().lineDirective.empty()
                    && word == cfg().lineDirective) {
-            // TF-C59 C23 6.10.4 (D-CPP-LINE-DIRECTIVE). Reached ONLY for a LIVE
+            // TF-C59 C23 6.10.6 (D-CPP-LINE-DIRECTIVE). Reached ONLY for a LIVE
             // `#line` (the dead-branch gate above already returned, so a `#line`
             // in an elided branch is skipped with no diagnostic — the
             // #define/#include/#pragma/#embed parity). The line's tokens are NOT
@@ -5196,8 +5196,37 @@ private:
 
     // Macro-expand a token run with the SAME engine `run()` uses (object +
     // function-like, hide-set-precise): lift into the ExpToken working set,
-    // expand, drop the hide sets. Used by the `#if` evaluator's callback so the
-    // controlling expression's macros expand identically to the body's.
+    // expand, drop the hide sets.
+    //
+    // ★ THIS IS THE ORDINARY EXPANDER, AND IT HAS EXACTLY TWO DIRECTIVE-SIDE
+    // CALLERS: `expandTokens` (a `#if`/`#elif` controlling expression, which
+    // wraps it in the `defined` barrier) and `handleLine` (C23 6.10.6p6, whose
+    // operand must NOT get that barrier — a `#line` operand token spelled
+    // `defined` is an ordinary identifier there). The barrier is therefore the
+    // ONLY difference between the two, and it lives in the caller that needs it
+    // rather than being re-decided inside a second expansion path. A private
+    // expander for one directive is the duplicated-truth-table shape this
+    // project keeps paying for; there is one engine and one lift.
+    std::vector<Token> expandRun(std::vector<Token> const& toks) {
+        // FC15b: seed each token's own offset as its invocation anchor (a
+        // `__LINE__` in a directive operand resolves against that operand's
+        // line). `liftRun` additionally stamps `spacedBefore` from this run's
+        // trivia, so a `#`-stringize reached from a directive operand spells the
+        // same as in the body.
+        std::vector<ExpToken> expanded = expand(liftRun(toks), 0);
+        std::vector<Token> out;
+        out.reserve(expanded.size());
+        // FC15 paste residuals: backstop drop of any stray placemarker (see
+        // `run()`); the primary drop is at `collapsePastes` return.
+        for (ExpToken const& et : expanded) {
+            if (et.placemarker) continue;
+            out.push_back(et.tok);
+        }
+        return out;
+    }
+
+    // The `#if` evaluator's callback, so the controlling expression's macros
+    // expand identically to the body's.
     std::vector<Token> expandTokens(std::vector<Token> const& toks) {
         // D-PP-DEFINED-VIA-MACRO-EXPANSION: this is the ONLY entry point that
         // expands a `#if`/`#elif` CONTROLLING EXPRESSION (the `run()` body pass
@@ -5214,20 +5243,38 @@ private:
             ArmedBarrier(ArmedBarrier const&)            = delete;
             ArmedBarrier& operator=(ArmedBarrier const&) = delete;
         } const armed{&ifDefinedBarrier_, &barrier};
-        // FC15b: seed each token's own offset as its invocation anchor (a
-        // `__LINE__` in a `#if` operand resolves against that operand's line).
-        // `liftRun` additionally stamps `spacedBefore` from this run's trivia, so a
-        // `#`-stringize reached from a `#if` operand spells the same as in the body.
-        std::vector<ExpToken> expanded = expand(liftRun(toks), 0);
-        std::vector<Token> out;
-        out.reserve(expanded.size());
-        // FC15 paste residuals: backstop drop of any stray placemarker (see
-        // `run()`); the primary drop is at `collapsePastes` return.
-        for (ExpToken const& et : expanded) {
-            if (et.placemarker) continue;
-            out.push_back(et.tok);
+        return expandRun(toks);
+    }
+
+    // TRUE iff `after` holds the same SIGNIFICANT tokens as `before`, byte for
+    // byte — same count, same spans. The expander returns a run verbatim when no
+    // macro name occurs in it, so this answers "did anything actually expand?"
+    // by looking at the RESULT rather than by re-deriving it from the input
+    // (which would mean re-implementing the hide-set and function-like-arity
+    // rules, i.e. a second copy of the decision `expand` already made).
+    //
+    // Trivia is skipped on BOTH sides deliberately: the lift keeps white space in
+    // the run and a splice may add or drop it, so comparing raw indices would
+    // report "expanded" for runs whose preprocessing tokens are identical.
+    [[nodiscard]] static bool sameSignificantRun(std::vector<Token> const& before,
+                                                 std::vector<Token> const& after) {
+        std::size_t i = 0;
+        std::size_t j = 0;
+        for (;;) {
+            while (i < before.size()
+                   && (isTrivia(before[i]) || isNewline(before[i]))) ++i;
+            while (j < after.size()
+                   && (isTrivia(after[j]) || isNewline(after[j]))) ++j;
+            if (i >= before.size() || j >= after.size()) {
+                return i >= before.size() && j >= after.size();
+            }
+            if (before[i].span.start() != after[j].span.start()
+                || before[i].span.end() != after[j].span.end()) {
+                return false;
+            }
+            ++i;
+            ++j;
         }
-        return out;
     }
 
     bool isParenOpen(Token const& t) const {
@@ -5875,16 +5922,52 @@ private:
         }
     }
 
-    // TF-C59 C23 6.10.4 (D-CPP-LINE-DIRECTIVE): `#line digits ["file"]` sets the
+    // TF-C59 C23 6.10.6 (D-CPP-LINE-DIRECTIVE): `#line digits ["file"]` sets the
     // PRESUMED line — and optionally the presumed file name — reported by
     // `__LINE__`/`__FILE__` for the lines that FOLLOW. Records a per-origin entry
     // consumed by `presumedLine`/`presumedFile`.
     //
-    // The MACRO-EXPANDED operand form (6.10.4p4 — `#line SOME_MACRO`) is NOT yet
-    // handled: such an operand is not a digit sequence, so it hits the fail-loud
-    // below rather than being silently mis-numbered. Anchored
-    // `D-CPP-LINE-DIRECTIVE-MACRO-OPERAND`; generated C (lemon/bison/flex) always
-    // emits the literal-digit form, which is what unblocks sqlite's `parse.c`.
+    // ⚠ THE SECTION NUMBER IS 6.10.6, NOT 6.10.4, AND THE OLD NUMBER WAS NOT A
+    // TYPO — IT WAS C11's. C23 renumbered the preprocessor: 6.10.4 is now
+    // *Binary resource inclusion* (`#embed`, which `handleEmbed` correctly cites
+    // by that number a few hundred lines above), and *Line control* moved to
+    // 6.10.6. ✔MEASURED against N3220 §6.10.6. Carrying the C11 number under a
+    // "C23" label made this ONE file cite ONE number for TWO different features.
+    //
+    // ── D-CPP-LINE-DIRECTIVE-MACRO-OPERAND, C23 6.10.6p6 ──────────────────────
+    //
+    // A directive of the form `# line pp-tokens new-line` that matches NEITHER
+    // literal form is PERMITTED: its operand tokens are processed "just as in
+    // normal text" — every identifier currently defined as a macro name is
+    // replaced by its replacement list — and the directive that RESULTS must
+    // then match one of the two literal forms.
+    //
+    // ⇒ the operand run is macro-expanded through the ORDINARY expander
+    // (`expandRun` — the same engine `run()` and the `#if` evaluator use, minus
+    // the `defined` barrier that belongs only to a controlling expression) and
+    // the RESULT is handed to `parseLineOperand`, which is the ONE validator
+    // both forms go through. The fail-loud arms are unchanged and now guard the
+    // EXPANSION as well: a result that still matches neither form is refused,
+    // never silently mis-numbered.
+    //
+    // ★ WHY EXPANSION IS UNCONDITIONAL RATHER THAN A FALLBACK AFTER THE LITERAL
+    // FORMS FAIL. Both literal forms are FIXED POINTS of expansion: a digit
+    // sequence is not an identifier and neither is a string literal's opener,
+    // body or closer, so no token of `#line 42` or `#line 42 "f.h"` can name a
+    // macro. Expanding first is therefore observably identical for them, and it
+    // buys the property the row asked for — `#line 42` and `#define L 42` +
+    // `#line L` are not two implementations that agree today, they are ONE code
+    // path reached twice.
+    //
+    // ✔MEASURED, all three references probed SEPARATELY (gcc 13.3.0, clang
+    // 18.1.3, MSVC 19.51.36252) over 39 shapes: the macro-expanded operand is
+    // accepted UNANIMOUSLY and renumbers exactly as the literal form does —
+    // object-like, function-like (with and without an argument), a macro
+    // expanding through another macro, a `##` paste producing the digits, a
+    // macro carrying BOTH the number and the quoted name, a macro supplying only
+    // the name, and `__LINE__`/`__FILE__` in the operand. And unanimously
+    // REFUSED for a result that is not a digit sequence, and for an EMPTY
+    // expansion.
     void handleLine(std::vector<Token> const& in, std::size_t p,
                     std::size_t end) {
         std::size_t const dirTok = p;          // first operand token (span source)
@@ -5895,71 +5978,33 @@ private:
                    "#line requires a line number");
             return;
         }
-        std::string_view const numTx = text(in[p]);
-        if (numTx.empty()
-            || numTx.find_first_not_of("0123456789") != std::string_view::npos) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
-                   in[p].span,
-                   std::string{"#line requires a digit sequence — got: "}
-                       + std::string{numTx});
-            return;
-        }
-        unsigned long long n = 0;
-        for (char const c : numTx) {
-            n = n * 10ull + static_cast<unsigned long long>(c - '0');
-            if (n > 2147483647ull) {
-                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
-                       synth_->id(), in[p].span, "#line number out of range");
-                return;
-            }
-        }
-        // C23 6.10.4p2 constrains the digit sequence to 1..2147483647 — the range
-        // is TWO-sided. `#line 0` was silently accepted before (gcc
-        // -pedantic-errors rejects it), which would make `__LINE__` 0.
-        if (n == 0) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
-                   in[p].span, "#line number out of range");
-            return;
-        }
+        // The operand run is every token up to — but NOT including — the
+        // terminating newline. `end` is ONE PAST that newline (`lineEnd`), so
+        // slicing to `end` would lift the newline into the expansion working set
+        // as a real token of the run.
+        std::size_t opEnd = p;
+        while (opEnd < end && !isNewline(in[opEnd])) ++opEnd;
+        std::vector<Token> const source(
+            in.begin() + static_cast<std::ptrdiff_t>(p),
+            in.begin() + static_cast<std::ptrdiff_t>(opEnd));
+        std::vector<Token> const expanded = expandRun(source);
+
+        // Did a macro actually fire? Only then can a diagnostic's subject be an
+        // expansion PRODUCT, whose bytes are MINTED and have no position a
+        // reader can look at — [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]] settles
+        // that case: a diagnostic whose subject is a product token points at the
+        // EXPANSION SITE. When nothing expanded, every token is the original one
+        // and each diagnostic keeps the exact position the literal-only
+        // implementation has always reported.
+        bool const fromMacro = !sameSignificantRun(source, expanded);
+
         LineDirectiveRec rec;
-        rec.presumedLine = static_cast<std::uint32_t>(n);
+        if (!parseLineOperand(expanded, in[p].span, fromMacro, rec)) return;
 
-        // OPTIONAL "file" operand (6.10.4p3): absent => presumed name UNCHANGED.
-        std::size_t const q = skipTrivia(in, p + 1);
-        if (q < end && !isNewline(in[q])) {
-            // A quoted operand is THREE tokens, exactly as `#include`/`#embed` see
-            // it: the OPENER (config kind `quoteIncludeToken`, which consumed only
-            // the `"`), the coalesced BODY token whose text is the raw bytes
-            // between the quotes, and the CLOSER
-            // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN). Keying on the CONFIG kinds +
-            // position keeps this agnostic — never a hard-coded `"` scan of one
-            // token's text.
-            if (quoteIncludeKind_.valid() && in[q].schemaKind == quoteIncludeKind_
-                && q + 1 < end && !isNewline(in[q + 1])) {
-                rec.file    = std::string{text(in[q + 1])};
-                rec.hasFile = true;
-                // Reject trailing junk LOUDLY, mirroring handleEmbed: silently
-                // ignoring tokens after the operand would let an unsupported
-                // form be half-honoured (`#line 5 "f" <anything>`). The scan
-                // starts past the CLOSER, not at `q + 2` — the closing `"` is a
-                // real token now and would otherwise BE the reported junk,
-                // rejecting every well-formed `#line 100 "f.c"`.
-                std::size_t const t = skipTrivia(in, pastBodyAndCloser(in, q + 1));
-                if (t < end && !isNewline(in[t])) {
-                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
-                           synth_->id(), in[t].span,
-                           std::string{"unexpected token after the #line file "
-                                       "operand: "} + std::string{text(in[t])});
-                    return;
-                }
-            } else {
-                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
-                       synth_->id(), in[q].span,
-                       "#line file operand must be a \"quoted\" string");
-                return;
-            }
-        }
-
+        // Recorded against the ORIGINAL token vector, deliberately: the presumed
+        // position is a property of where the DIRECTIVE physically sits, and the
+        // expanded run's tokens may carry minted spans that resolve to no source
+        // line at all.
         recordPresumedPosition(in, dirTok, end, rec);
     }
 
@@ -5993,7 +6038,7 @@ private:
     //
     // ⚠ THREE PLACES THIS DELIBERATELY DIVERGES FROM `handleLine`, each measured:
     //
-    //  (1) LINE ZERO IS LEGAL HERE AND ILLEGAL IN `#line`. C23 6.10.4p2 constrains
+    //  (1) LINE ZERO IS LEGAL HERE AND ILLEGAL IN `#line`. C23 6.10.6p4 constrains
     //      the `#line` digit sequence to 1..2147483647, and `handleLine` enforces
     //      that. ✔MEASURED: gcc 13.3.0's OWN `-E` output opens with `# 0 "tu.c"`
     //      and gcc recompiles that output with rc=0, so importing `#line`'s floor
@@ -7002,7 +7047,7 @@ private:
     // the synth buffer -- a Number for `__LINE__`/Constant, a StringStart +
     // StringLiteral pair for `__FILE__`/`__DATE__`/`__TIME__` (exactly as a
     // stringize product). Dispatches ONLY on `def.kind`, never the name.
-    // ── TF-C59 `#line` presumed-position map (C23 6.10.4 / D-CPP-LINE-DIRECTIVE) ──
+    // ── TF-C59 `#line` presumed-position map (C23 6.10.6 / D-CPP-LINE-DIRECTIVE) ──
     // One record per `#line` DIRECTIVE, keyed by the ORIGIN buffer it appeared in
     // (a header and its includer each keep their own numbering) and the PHYSICAL
     // line the directive itself sat on. `#line N` renumbers the line FOLLOWING the
@@ -7016,7 +7061,7 @@ private:
         std::uint32_t physLine     = 0;      // line the `#line` itself is on
         std::uint32_t presumedLine = 0;      // N — the number given to physLine+1
         std::string   file;                  // presumed name (empty => inherit)
-        bool          hasFile      = false;  // operand present (6.10.4p3)
+        bool          hasFile      = false;  // operand present (6.10.6p5)
     };
     std::unordered_map<void const*, std::vector<LineDirectiveRec>> lineDirs_;
 
@@ -7045,6 +7090,172 @@ private:
     // off-by-one per extra line. `end` is one past the terminating newline, so
     // `end-1` is that newline (or the last real token at EOF with no trailing
     // newline) — identical for the single-line case.
+    // The language's declared digit separator, or '\0' when it declares none.
+    // C23 6.10.6p4 interprets the `#line` digit sequence "ignoring any optional
+    // digit separators (6.4.4.2)", and 6.4.4.2 names `'` for C — but the BYTE is
+    // the language's, so it is read from `numberStyle.digitSeparator` rather
+    // than spelled here. A language with no numeric literals declares no
+    // `numberStyle` at all and gets '\0', i.e. digits only. Same derivation
+    // `number_decode.hpp` uses, written the same way on purpose.
+    //
+    // ⚠ AND THAT IS WHY `normalizeIntegerLiteral` IS NOT REUSED HERE, THOUGH IT
+    // ALREADY DROPS SEPARATORS: it also strips an integer SUFFIX and resolves a
+    // radix PREFIX, and 6.10.6p4 asks for a plain decimal digit sequence. Reusing
+    // it would silently make `#line 42u` and `#line 0x2A` legal — accepted-and-
+    // renumbered. Sharing the separator FACT while keeping the acceptance rule
+    // local is the split that stays correct.
+    // ⓘ ✔MEASURED, and the references are NOT unanimous on the suffix case:
+    // gcc 13.3.0 and clang 18.1.3 refuse `#line 42u` ("not a positive integer" /
+    // "requires a simple digit sequence"), MSVC 19.51 ACCEPTS it and renumbers
+    // to 42. ISO is explicit (6.10.6p4 wants a digit sequence, 6.10.6p6 wants
+    // the expansion RESULT to match one of the two forms), so refusing is
+    // conformant. This is the LITERAL form's long-standing behaviour and is
+    // UNCHANGED here; whether the disjunction rule should follow MSVC on it is a
+    // separate question and deliberately not decided in this edit.
+    [[nodiscard]] char declaredDigitSeparator() const {
+        NumberStyle const* const ns = schema_->numberStyle();
+        if (ns == nullptr || !ns->digitSeparator.has_value()) return '\0';
+        return *ns->digitSeparator;
+    }
+
+    // ── C23 6.10.6p4/p5 — THE ONE `#line` OPERAND VALIDATOR ───────────────────
+    //
+    // `op` is the directive's operand run AFTER macro expansion (6.10.6p6), with
+    // the terminating newline already excluded. Returns true and fills `rec` iff
+    // the run matches one of the two literal forms; every false return has
+    // already emitted a positioned, fail-loud diagnostic.
+    //
+    // ★ ONE VALIDATOR, TWO SURFACES, DELIBERATELY. A literal operand carries no
+    // macro name, so it reaches here having expanded to itself — `#line 42` and
+    // `#define L 42` + `#line L` are the SAME code reached twice rather than two
+    // implementations that agree today and drift tomorrow. That is also what
+    // lets one pin prove both forms equivalent.
+    //
+    // `site` is the span of the operand as WRITTEN in the source. `fromMacro`
+    // says whether any macro actually fired; when it did, EVERY diagnostic is
+    // emitted at `site` instead of at the offending token, because that token's
+    // bytes may be minted and carry no position a reader can look at
+    // ([[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]] — point at the expansion site).
+    // When nothing fired the two are the same token, so the literal form's
+    // diagnostic positions are byte-for-byte what they always were.
+    [[nodiscard]] bool parseLineOperand(std::vector<Token> const& op,
+                                        SourceSpan site, bool fromMacro,
+                                        LineDirectiveRec& rec) {
+        auto const at = [&](std::size_t i) {
+            return fromMacro ? site : op[i].span;
+        };
+        std::size_t const p = skipTrivia(op, 0);
+        if (p >= op.size()) {
+            // 6.10.6p6 with an operand whose expansion is EMPTY (`#define E` +
+            // `#line E`) matches neither form. ✔MEASURED refused by all three
+            // references. There is no source token left to point at, so the
+            // expansion site is the only honest position.
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   site, "#line requires a line number");
+            return false;
+        }
+        std::string_view const numTx = text(op[p]);
+
+        // PASS 1 — the CHARACTER SET. 6.10.6p4's digit sequence is decimal
+        // digits, plus the language's declared digit separator, which is ignored
+        // when the value is computed. ✔MEASURED: gcc, clang and MSVC all accept
+        // `#line 1'000` and renumber to 1000, in the literal AND the
+        // macro-expanded form; DSS refused it with "requires a digit sequence —
+        // got: 1'000", because this test used to be a literal `"0123456789"`
+        // set. The tokenizer already lexes it as ONE token (`c.lang.json`
+        // declares `numberStyle.digitSeparator`), so the refusal was here.
+        // Two passes rather than one so the MESSAGE for a doubly-malformed
+        // operand does not depend on which defect the scan meets first: a
+        // non-digit is always "requires a digit sequence", an in-range-character
+        // overflow is always "out of range".
+        char const sep = declaredDigitSeparator();
+        bool sawDigit  = false;
+        bool digitsOnly = !numTx.empty();
+        for (char const c : numTx) {
+            if (sep != '\0' && c == sep) continue;
+            if (c < '0' || c > '9') { digitsOnly = false; break; }
+            sawDigit = true;
+        }
+        if (!digitsOnly || !sawDigit) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   at(p),
+                   std::string{"#line requires a digit sequence — got: "}
+                       + std::string{numTx});
+            return false;
+        }
+
+        // PASS 2 — the VALUE, separators skipped (6.10.6p4).
+        unsigned long long n = 0;
+        for (char const c : numTx) {
+            if (sep != '\0' && c == sep) continue;
+            n = n * 10ull + static_cast<unsigned long long>(c - '0');
+            if (n > 2147483647ull) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), at(p), "#line number out of range");
+                return false;
+            }
+        }
+        // C23 6.10.6p4 constrains the digit sequence to 1..2147483647 — the
+        // range is TWO-sided. `#line 0` was silently accepted before (gcc
+        // -pedantic-errors rejects it), which would make `__LINE__` 0.
+        if (n == 0) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   at(p), "#line number out of range");
+            return false;
+        }
+        rec.presumedLine = static_cast<std::uint32_t>(n);
+
+        // OPTIONAL "file" operand (6.10.6p5): absent => presumed name UNCHANGED.
+        std::size_t const q = skipTrivia(op, p + 1);
+        if (q < op.size()) {
+            // A quoted operand is THREE tokens, exactly as `#include`/`#embed` see
+            // it: the OPENER (config kind `quoteIncludeToken`, which consumed only
+            // the `"`), the coalesced BODY token whose text is the raw bytes
+            // between the quotes, and the CLOSER
+            // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN). Keying on the CONFIG kinds +
+            // position keeps this agnostic — never a hard-coded `"` scan of one
+            // token's text.
+            //
+            // ★ AND THIS IS WHY THE MACRO FORM NEEDED NO SECOND SHAPE HERE. A
+            // macro-produced name arrives as the SAME three tokens: a `"f.h"` in
+            // a replacement list lexes through the global string rules, and a
+            // predefined `__FILE__` is minted through `materializeSignificant`,
+            // which RE-TOKENIZES the spelling for exactly this reason. ✔MEASURED
+            // accepted by all three references: `#line 42 __FILE__`, and
+            // `#define F "renamed.h"` + `#line 42 F`.
+            // 6.10.6p1 makes the string literal a CHARACTER string literal, so an
+            // encoding prefix (`L"f"`, `u8"f"`) is a constraint violation.
+            // ✔MEASURED refused by all three references, and refused here too:
+            // whatever the prefix lexes as, it is not the declared opener KIND at
+            // this position, so the else-arm below takes it.
+            if (quoteIncludeKind_.valid() && op[q].schemaKind == quoteIncludeKind_
+                && q + 1 < op.size()) {
+                rec.file    = std::string{text(op[q + 1])};
+                rec.hasFile = true;
+                // Reject trailing junk LOUDLY, mirroring handleEmbed: silently
+                // ignoring tokens after the operand would let an unsupported
+                // form be half-honoured (`#line 5 "f" <anything>`). The scan
+                // starts past the CLOSER, not at `q + 2` — the closing `"` is a
+                // real token now and would otherwise BE the reported junk,
+                // rejecting every well-formed `#line 100 "f.c"`.
+                std::size_t const t = skipTrivia(op, pastBodyAndCloser(op, q + 1));
+                if (t < op.size()) {
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                           synth_->id(), at(t),
+                           std::string{"unexpected token after the #line file "
+                                       "operand: "} + std::string{text(op[t])});
+                    return false;
+                }
+            } else {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), at(q),
+                       "#line file operand must be a \"quoted\" string");
+                return false;
+            }
+        }
+        return true;
+    }
+
     void recordPresumedPosition(std::vector<Token> const& in, std::size_t dirTok,
                                 std::size_t end, LineDirectiveRec rec) {
         if (lineMap_ == nullptr || lineMap_->empty()) return;
@@ -7084,7 +7295,7 @@ private:
         return rec->presumedLine + (physLine - rec->physLine - 1u);
     }
 
-    // PRESUMED file name. C23 6.10.4p3: the file operand is OPTIONAL and when
+    // PRESUMED file name. C23 6.10.6p5: the file operand is OPTIONAL and when
     // omitted the presumed name is left UNCHANGED — so walk back to the most
     // recent record that actually CARRIED a name, and leave `name` untouched if
     // none did. (A `#line N` after a `#line M "f"` keeps reporting "f".)
@@ -7103,7 +7314,7 @@ private:
         switch (def.kind) {
         case PredefinedMacroKind::Line: {
             // C 6.10.8.1: the LINE number of the macro's INVOCATION -- but the
-            // PRESUMED one, which `#line` may have remapped (C23 6.10.4p2-3).
+            // PRESUMED one, which `#line` may have remapped (C23 6.10.6p4-5).
             // Resolve the invocation offset through the line-map to its ORIGIN
             // buffer + offset, read the 1-based PHYSICAL line, then apply any
             // active `#line` for that origin. Null/empty line-map -> line 1
@@ -7122,7 +7333,7 @@ private:
             // C 6.10.8.1: the PRESUMED NAME of the current source file. Resolve
             // the invocation offset to its ORIGIN buffer so a `__FILE__` inside an
             // `#include`'d header reports the HEADER's name, not the main file's,
-            // then let an active `#line "file"` override it (C23 6.10.4p3 -- the
+            // then let an active `#line "file"` override it (C23 6.10.6p5 -- the
             // file operand is OPTIONAL, and when omitted the presumed name is
             // left UNCHANGED, so the override only applies when one was given).
             // `\` -> `/` normalized, then quoted as a C string literal.

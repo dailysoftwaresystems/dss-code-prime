@@ -560,6 +560,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_UnwindRuleUnrepresentable";
         case DiagnosticCode::K_FormatLacksWeakDefinitionDialect:
             return "K_FormatLacksWeakDefinitionDialect";
+        case DiagnosticCode::K_ArtifactWithheldAfterError:
+            return "K_ArtifactWithheldAfterError";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

@@ -2334,6 +2334,50 @@ struct Lowerer {
         if (sym.valid()) {
             auto const* rec = model.recordFor(sym);
             if (rec != nullptr) attr.staticInit.mergeFrom(rec->staticInit);
+            // ★★ THE C 6.2.2p4/p5 INHERITANCE ARM. Anchor:
+            // D-CSUBSET-LINKAGE-INHERITED-INTERNAL-EMITS-GLOBAL
+            //
+            // `static int f(void); int f(void) { … }` — the DEFINITION carries
+            // no storage-class token of its own, so the specifier fold above it
+            // yields the default (`Global`), yet 6.2.2p5 routes a plain function
+            // declaration through p4 and p4 gives it the linkage of the VISIBLE
+            // PRIOR declaration: INTERNAL. Same for the object definition arm
+            // (`static int g; int g = 3;`). Emitting `Global` there is not a
+            // cosmetic wrong answer — it is a REFUSAL of a legal program the
+            // moment a second TU uses the same shape, because two strong
+            // definitions of one name collide at `mergeCuMirs`
+            // (K_SymbolRedefinedAcrossUnits). ✔MEASURED at 2423995f, all three
+            // references probed SEPARATELY on the two-file program: gcc 13.3.0,
+            // clang 18.1.3 and MSVC 19.51 all BUILD AND RUN it to the same
+            // answer (MSVC's own .obj files the proof of WHY — `dumpbin
+            // /symbols` classes each TU's `f` `Static`), and DSS refused it.
+            //
+            // ★ IT READS THE SURVIVOR AND DERIVES NOTHING. `isInternalLinkage`
+            // is the semantic tier's OWN answer, minted at file scope and
+            // OR-propagated across every merged pair by
+            // `mergeOrCollideRedeclaration` (P50,
+            // D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH). Re-walking the
+            // prior declarations HERE would make this tier a SECOND owner of a
+            // fact that already has one, and the two owners would drift; the
+            // record is the single source. That is why this rides `recordLinkage`
+            // — the ONE place a folded `LinkageAttr` becomes a stored fact, and
+            // the place already consulting the same record for `staticInit`, so
+            // a future emission arm cannot acquire the defect by forgetting a
+            // call.
+            //
+            // ★ AND IT IS A FALLBACK, NEVER AN OVERRIDE — the `== Global` guard
+            // is the whole of the "before defaulting to its own specifier
+            // tokens" half. `SymbolBinding::Global` is UNWRITABLE from config
+            // (see `LinkageAttr::visibilitySpecified`'s comment for the measured
+            // argument), so `binding == Global` means the tokens specified NO
+            // binding and the record is the only one with an answer. A declarator
+            // that DID specify one keeps it: `__attribute__((weak))` still lands
+            // `Weak` (weak is a linker BINDING, not a 6.2.2 linkage class — the
+            // `prototypeSynthesizesExtern` gate's `!= Local` comment carries the
+            // measurement), and an explicit `static` is already `Local`.
+            if (rec != nullptr && rec->isInternalLinkage
+                && attr.binding == SymbolBinding::Global)
+                attr.binding = SymbolBinding::Local;
         }
         // ⚠ THE SPARSENESS TEST HAD TO GROW WITH THE STRUCT. It is what decides
         // whether the attribute is stored at all, so a new field that it does not
@@ -11318,7 +11362,22 @@ struct Lowerer {
             for (std::size_t k = 0; k < declarators.size(); ++k) {
                 if (declarators[k].v == from.v) { attr = perDeclarator[k]; break; }
             }
-            recordLinkage(out[i], attr);
+            // D-CSUBSET-LINKAGE-INHERITED-INTERNAL-EMITS-GLOBAL: the OBJECT half
+            // of the 6.2.2p4 inheritance arm needs the declared symbol here, so
+            // `recordLinkage` can consult the merge survivor's
+            // `isInternalLinkage` for `static int g; int g = 3;` (where the
+            // initialized definition outranks the `static` tentative and becomes
+            // the emitting declaration, carrying no `static` token of its own).
+            // Derived from the ORIGIN declarator by the same two calls
+            // `lowerVarLikeInto` uses for its own per-declarator symbol, rather
+            // than by index arithmetic over `out` — the emitted-node count is not
+            // the declarator count, which is why `origins` exists at all.
+            SymbolId sym{};
+            if (from.valid()) {
+                NodeId const nameNode = declaratorNameNode(tree(), from, dc);
+                if (nameNode.valid()) sym = model.symbolAt(nameNode);
+            }
+            recordLinkage(out[i], attr, sym);
         }
     }
 
@@ -11371,7 +11430,13 @@ struct Lowerer {
             break;
         }
         HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
-        recordLinkage(g, linkAttr);
+        // `sym` carries the 6.2.2p4 inherited-internal answer as well as the
+        // static-initializer schedule (D-CSUBSET-LINKAGE-INHERITED-INTERNAL-EMITS-GLOBAL).
+        // Passed on the LEGACY positional path too, so the two file-scope global
+        // producers cannot disagree about a symbol's binding — a split here is
+        // exactly the shape a per-language config change would surface as a
+        // miscompile in one grammar and not the other.
+        recordLinkage(g, linkAttr, sym);
         recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
         recordThreadLocal(g, sym);  // TLS C1 (D-CSUBSET-THREAD-LOCAL)
         recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN

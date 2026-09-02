@@ -48,8 +48,11 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <iostream>                     // std::cerr — the driver NOTE channel the
+                                        // `output`/`--output` override pins read
 #include <optional>
 #include <span>
+#include <sstream>                      // the note channel's capture sink
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -4708,6 +4711,328 @@ TEST(CompileProjectArtifactName, FollowsTheManifestsOwnFirstSourceNotSortOrder) 
     ASSERT_TRUE(paths[0].has_value());
     EXPECT_EQ(paths[0]->stem().string(), "zeta")
         << "and the driver's own report of what it wrote agrees";
+}
+
+// ══ D-AP2-OUTPUT-ROUTING — the `output` FIELD as the output-dir base ════════
+//
+// The field was PARSED, type-validated and carried on `ProjectConfig.output`
+// while every reader ignored it: ✔MEASURED at the base of this lane, `pc.output`
+// had exactly ONE write site (the loader) and ZERO read sites anywhere in
+// `src/`. A user wrote `output` in a manifest, the loader accepted it, and the
+// artifact landed somewhere else — accepted-and-silently-ignored, the
+// WRONG-OUTPUT class this row is banded for.
+//
+// Every pin below asserts WHERE THE FILE LANDED ON DISK, never merely that the
+// build succeeded, because a routing defect BY DEFINITION produces a successful
+// build with the artifact in the wrong place — a pass/fail assertion cannot see
+// it. Each also asserts the ABSENCE of the artifact at the place the refuted
+// design would have put it, so a regression cannot pass by writing to both.
+//
+// Host-agnostic: a fixed cross-target ELF exec (never RUN), so the layout is
+// pinned on every leg rather than on whichever host happens to be native.
+namespace {
+
+// The one ELF exec spec these pins route through, and its emitted extension
+// (ELF exec ⇒ none). Named so the expected path reads as the formula
+// `<base>/<formatName>/<artifactName-or-stem><ext>` rather than as a literal.
+constexpr std::string_view kOutputBaseSpec   = "x86_64:elf64-x86_64-linux-exec";
+constexpr std::string_view kOutputBaseFormat = "elf64-x86_64-linux-exec";
+
+// Capture everything the driver writes to stderr for the object's lifetime.
+// The `--output`-overrides-`output` announcement goes out the driver NOTE
+// channel (`dsscp: note: …` on `std::cerr`), NOT a `D_*` diagnostic, so the
+// reporter cannot see it and this is the only instrument that can. Same shape
+// as `tests/analysis/test_diagnostic_position_origin_coordinates.cpp`'s.
+class CapturedStderr {
+public:
+    CapturedStderr() : saved_{std::cerr.rdbuf(sink_.rdbuf())} {}
+    CapturedStderr(CapturedStderr const&)            = delete;
+    CapturedStderr& operator=(CapturedStderr const&) = delete;
+    ~CapturedStderr() { std::cerr.rdbuf(saved_); }
+    [[nodiscard]] std::string text() const { return sink_.str(); }
+
+private:
+    std::ostringstream sink_;
+    std::streambuf*    saved_;
+};
+
+// Write `<dir>/<name>.c` + `<dir>/<name>.dss-project.json` naming it, and
+// return the manifest path. `outputField` / `artifactNameField` are the raw
+// JSON string values (already escaped by the caller if they need it); nullopt
+// omits the key entirely, which is the shipped default every existing manifest
+// uses.
+[[nodiscard]] std::filesystem::path
+writeOutputBaseProject(std::filesystem::path const&      dir,
+                       std::string_view                  name,
+                       std::optional<std::string> const& outputField,
+                       std::optional<std::string> const& artifactNameField) {
+    auto const srcPath = dir / (std::string{name} + ".c");
+    writeText(srcPath, "int main(void){ return 0; }\n");
+    std::string manifest =
+        std::string{"{\n  \"language\": \"c\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + std::string{kOutputBaseSpec} + "\"],\n"
+        + "  \"sources\": [\"" + srcPath.generic_string() + "\"]";
+    if (outputField) manifest += ",\n  \"output\": \"" + *outputField + "\"";
+    if (artifactNameField) {
+        manifest += ",\n  \"artifactName\": \"" + *artifactNameField + "\"";
+    }
+    manifest += "\n}";
+    auto const projPath = dir / (std::string{name} + ".dss-project.json");
+    writeText(projPath, manifest);
+    return projPath;
+}
+
+// `<base>/<formatName>/<name>` — the routed artifact, spelled through the
+// formula rather than restated per test.
+[[nodiscard]] std::filesystem::path
+routedArtifact(std::filesystem::path const& base, std::string_view name) {
+    return base / std::string{kOutputBaseFormat} / std::string{name};
+}
+
+}  // namespace
+
+// The manifest's `output` REDIRECTS the base dir when the CLI supplied none.
+// Relative, so this also witnesses the cwd-rooting rule; the absolute case is
+// covered by the override pin below, which uses one.
+//
+// RED-ON-DISABLE: delete the `setOutputDir(manifestBase)` stamp in
+// `Program::compileProject` and the base falls back to `<cwd>/target` ⇒ the
+// declared path is ABSENT *and* the default path EXISTS ⇒ both arms go red, and
+// `artifactPaths()` — the driver's own account of what it wrote — disagrees too.
+TEST(CompileProjectOutputField, ManifestOutputRedirectsTheBaseDir) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir  = scratch.path();
+    auto const proj = writeOutputBaseProject(dir, "app",
+                                             std::optional<std::string>{"declared"},
+                                             std::nullopt);
+    scratch.useAsCwd();   // `<cwd>/declared` and the `<cwd>/target` default both
+                          // land inside the scratch dir, so both are assertable.
+    // The cwd AS THE PROCESS REPORTS IT — the value the driver's own
+    // `absoluteKeepingRoot` will resolve the relative `output` against. Using
+    // `scratch.path()` here instead would compare two spellings of one directory
+    // on a host that re-spells its cwd (8.3 short form, case).
+    auto const cwd = std::filesystem::current_path();
+
+    Program prog;                  // NO setOutputDir — the manifest is the only
+    DiagnosticReporter rep;        // source of a base in this build.
+    ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
+        << "the project must compile + emit";
+
+    auto const declared = routedArtifact(cwd / "declared", "app");
+    EXPECT_TRUE(std::filesystem::exists(declared))
+        << "the manifest `output` must be the routed base; expected "
+        << declared.string();
+    EXPECT_FALSE(std::filesystem::exists(dir / "target"))
+        << "the `<cwd>/target` default must not be used when the manifest "
+           "declares an output base";
+
+    auto const& paths = prog.artifactPaths();
+    ASSERT_EQ(paths.size(), 1u);
+    ASSERT_TRUE(paths[0].has_value());
+    // ⓘ THE DRIVER'S OWN ACCOUNT IS RELATIVE HERE, AND THAT IS THE MECHANISM,
+    // NOT A DEFECT — ✔MEASURED: it reports `declared/<formatName>/app`. The base
+    // is stored VERBATIM (the manifest half deliberately matches `cli_args.cpp`'s
+    // treatment of `--output`), so a relative `output` yields a relative artifact
+    // path, and `reportArtifactWritten` is the one place that absolutizes for the
+    // operator-facing line. Resolve the same way here rather than assuming the
+    // driver did it — asserting against a bare absolute path would have been a
+    // test that pins the wrong fact and reds on correct behaviour.
+    std::error_code absEc;
+    auto const reported =
+        dss::core::normalizeKeepingRoot(
+            dss::core::absoluteKeepingRoot(*paths[0], absEc));
+    EXPECT_FALSE(absEc) << "the reported artifact path must resolve";
+    EXPECT_EQ(reported, dss::core::normalizeKeepingRoot(declared))
+        << "and the driver's own report of what it wrote must name that path";
+}
+
+// A RELATIVE `output` resolves against the PROCESS working directory, NOT
+// against the manifest's own directory — the base this manifest's `sources[]`
+// and `preBuildScripts` already use, so a manifest composes with itself.
+//
+// The manifest sits in `<cwd>/proj/`, so the two candidate bases are DIFFERENT
+// directories and the pin discriminates them. This is the whole reason the test
+// exists: the manifest-relative reading is the intuitive one, and adopting it
+// would leave a pre-build hook writing `dist/` and an `"output": "dist"` naming
+// two different places with nothing to say so.
+//
+// RED-ON-DISABLE: base the stamp on `fs::path{projectFilePath}.parent_path()`
+// instead of the raw value and BOTH arms flip — the cwd-rooted path vanishes and
+// the manifest-rooted one appears.
+TEST(CompileProjectOutputField, ManifestOutputRelativeResolvesAgainstProcessCwd) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    std::filesystem::create_directories(dir / "proj");
+    auto const proj = writeOutputBaseProject(dir / "proj", "sub",
+                                             std::optional<std::string>{"reldist"},
+                                             std::nullopt);
+    scratch.useAsCwd();   // cwd = <dir>, while the manifest lives in <dir>/proj
+    auto const cwd = std::filesystem::current_path();
+
+    Program prog;
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
+        << "the project must compile + emit";
+
+    EXPECT_TRUE(std::filesystem::exists(routedArtifact(cwd / "reldist", "sub")))
+        << "a relative `output` is cwd-rooted, like a relative `--output`";
+    EXPECT_FALSE(std::filesystem::exists(dir / "proj" / "reldist"))
+        << "it must NOT be rooted at the manifest's own directory — that is the "
+           "base a DEPENDENCY manifest uses, a different question";
+}
+
+// PRECEDENCE: the CLI `--output` WINS over the manifest `output`, and the
+// override is ANNOUNCED rather than silent. Both halves are asserted, because
+// either alone is the defect: a silent override loses a committed value without
+// saying so, and a refusal would make `--output` unusable on a project that
+// declares one — ✔MEASURED, BOTH corpus runners set an output dir on every
+// project build.
+//
+// RED-ON-DISABLE (two independent levers):
+//   * flip the precedence (manifest wins) ⇒ the CLI path is absent and the
+//     manifest path exists ⇒ the two location arms go red;
+//   * drop the `reportDriverNote` call ⇒ the note arm goes red while the
+//     locations still pass, which is exactly the silent-override regression.
+TEST(CompileProjectOutputField, CliOutputOverridesManifestAndSaysSo) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir         = scratch.path();
+    auto const fromCli     = dir / "fromcli";
+    auto const fromManifest = dir / "frommanifest";
+    // Absolute, and JSON-escaped by spelling it generically (forward slashes
+    // need no escape in a JSON string; a backslash would).
+    auto const proj = writeOutputBaseProject(
+        dir, "both",
+        std::optional<std::string>{fromManifest.generic_string()},
+        std::nullopt);
+
+    Program prog;
+    prog.setOutputDir(fromCli);          // what `Program::run` stamps from --output
+    DiagnosticReporter rep;
+    std::string noteText;
+    {
+        CapturedStderr cap;
+        ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
+            << "the project must compile + emit";
+        noteText = cap.text();
+    }
+
+    EXPECT_TRUE(std::filesystem::exists(routedArtifact(fromCli, "both")))
+        << "the command-line output dir must win";
+    EXPECT_FALSE(std::filesystem::exists(fromManifest))
+        << "the overridden manifest base must not even be created";
+    EXPECT_NE(noteText.find("overrides the project manifest"), std::string::npos)
+        << "a committed `output` that did not apply must be announced, not "
+           "silently dropped; stderr was:\n" << noteText;
+    EXPECT_NE(noteText.find(fromManifest.generic_string()), std::string::npos)
+        << "the note must name the manifest value that was not used";
+}
+
+// …and the announcement fires only on a REAL override. Two SPELLINGS of one
+// directory are not a conflict, and calling them one would be a false alarm on
+// a build where nothing was lost — the failure mode that trains a reader to
+// ignore the channel.
+//
+// RED-ON-DISABLE: compare the two bases with `==` instead of `sameOutputBase`
+// and this spelling difference reads as an override ⇒ the note arm goes red.
+TEST(CompileProjectOutputField, EqualBaseSpelledDifferentlyIsNotAnnounced) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir  = scratch.path();
+    auto const proj = writeOutputBaseProject(dir, "same",
+                                             std::optional<std::string>{"declared"},
+                                             std::nullopt);
+    scratch.useAsCwd();
+
+    Program prog;
+    // The SAME directory the manifest names, spelled absolutely and with a `.`
+    // segment: a different string, an identical location. Derived from
+    // `current_path()` rather than from `scratch.path()` deliberately — that is
+    // the exact value `absoluteKeepingRoot` will resolve the manifest's relative
+    // spelling against, so the two sides cannot differ by a host's own
+    // re-spelling of the cwd (8.3 short form, case) and turn this into a
+    // portability flake instead of the equality pin it is.
+    prog.setOutputDir(std::filesystem::current_path() / "." / "declared");
+    DiagnosticReporter rep;
+    std::string noteText;
+    {
+        CapturedStderr cap;
+        ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
+            << "the project must compile + emit";
+        noteText = cap.text();
+    }
+
+    EXPECT_TRUE(std::filesystem::exists(routedArtifact(dir / "declared", "same")))
+        << "the artifact lands in the one directory both doors name";
+    EXPECT_EQ(noteText.find("overrides the project manifest"), std::string::npos)
+        << "two spellings of one directory are not an override; stderr was:\n"
+        << noteText;
+}
+
+// The `artifactName` containment BOUNDARY holds over a manifest-supplied base,
+// unchanged and un-duplicated. It is expressed against whatever base resolution
+// produced — not against `--output` specifically — so wiring a second door into
+// that base needs no second check, and this pin is what proves that rather than
+// assuming it.
+//
+// ⚠ The base itself is deliberately NOT contained by anything: an output BASE is
+// a directory, and `..`, an absolute spelling and a root prefix are all
+// legitimate in one, exactly as they are for `--output`. There is no enclosing
+// tree for it to escape. What must not escape is the ARTIFACT, out of the base.
+//
+// RED-ON-DISABLE: delete the containment postcheck in `compileOneTarget` and
+// this exact-code count drops to 0 (the routing carries `<base>/..` onward).
+TEST(CompileProjectOutputField, ManifestBaseStillEnforcesArtifactContainment) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir  = scratch.path();
+    auto const base = dir / "out";
+    auto const proj = writeOutputBaseProject(
+        dir, "esc",
+        std::optional<std::string>{base.generic_string()},
+        std::optional<std::string>{".."});   // no separator ⇒ survives the loader
+    scratch.useAsCwd();   // so the `<cwd>/target` fallback is assertable — and
+                          // lands in the scratch rather than the repo root.
+
+    Program prog;                            // NO setOutputDir: the base under
+    DiagnosticReporter rep;                  // test is the MANIFEST's.
+    EXPECT_NE(prog.compileProject(proj.string(), rep), 0)
+        << "a '..' artifactName escapes the manifest base and must fail the build";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactNameEscapesOutputDir), 1u)
+        << "the routing containment boundary must reject the escape over a "
+           "manifest-supplied base exactly as it does over --output";
+    // ★ THE DISCRIMINATOR, without which this pin passes for the WRONG REASON.
+    // The refusal alone proves only that SOME base was contained — the default
+    // `<cwd>/target` refuses a '..' just as loudly. `create_directories` runs
+    // BEFORE the containment check, so the base the router actually resolved is
+    // the one left on disk: assert the MANIFEST's subdir exists and the default
+    // base does not. Un-wire the `output` stamp and both flip.
+    EXPECT_TRUE(std::filesystem::exists(base / std::string{kOutputBaseFormat}))
+        << "the router must have resolved the MANIFEST's base (it creates the "
+           "directory before the containment check refuses the name)";
+    EXPECT_FALSE(std::filesystem::exists(dir / "target"))
+        << "the `<cwd>/target` default must not be the base under test";
+    bool leaked = false;
+    if (std::filesystem::exists(base)) {
+        for (auto const& e : std::filesystem::directory_iterator(base)) {
+            if (e.is_regular_file()) { leaked = true; break; }
+        }
+    }
+    EXPECT_FALSE(leaked)
+        << "no artifact must be written outside the routed <formatName>/ subdir";
 }
 
 // ── The fixture-mode entry point ────────────────────────────────────────────

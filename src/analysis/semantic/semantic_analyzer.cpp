@@ -4680,12 +4680,19 @@ specifierPrefixHasInline(SemanticConfig const& cfg, Tree const& tree,
 
 // TLS C1 (D-CSUBSET-THREAD-LOCAL): the storage-duration facts folded from ONE
 // declaration's specifier prefix. Keyed on the SAME per-row `linkageSpecifiers`
-// facet CST→HIR's `linkageFrom` folds (token SOURCE TEXT → effect), so the
-// semantic mark and the HIR linkage fold can never disagree on WHICH tokens
-// confer thread/static storage — one config facet, two consumers. Skips
-// `linkageSpecifierIgnoredRules` subtrees wholesale (the linkageFrom skip
-// mirrored: a `[[...]]`/alignas identifier that happens to spell a specifier
-// text must not mark the record when the linkage scan would not fold it). A
+// facet CST→HIR's `linkageFrom` folds (token SOURCE TEXT → effect) — one config
+// facet, two consumers. ⚠ THIS COMMENT USED TO CLAIM THE TWO "can never disagree
+// on WHICH tokens confer thread/static storage", AND THAT WAS FALSE FOR FOUR
+// CYCLES: sharing a VOCABULARY is not sharing a POSITION rule, and this scan
+// stayed position-blind after P42 fixed `linkageFrom`
+// -- the semantic-tier twin of
+// D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED.
+// The attribute-shape skip in the
+// loop below is what makes the claim true, and it is a defect fix rather than a
+// tidy-up. Skips `linkageSpecifierIgnoredRules` subtrees wholesale (the
+// linkageFrom skip mirrored: a `[[...]]`/alignas identifier that happens to
+// spell a specifier text must not mark the record when the linkage scan would
+// not fold it), and the language's own attribute-specifier shapes likewise. A
 // row with NO linkageSpecifiers (forDecl — deliberately, so a for-init static
 // errors instead of routing) yields all-false; the row's gatedMarkers own the
 // loud reject there. Emits NOTHING: Pass 2's validateThreadLocalDeclarator
@@ -4703,8 +4710,8 @@ struct SpecifierStorageFacts {
     bool localBinding  = false;
 };
 [[nodiscard]] SpecifierStorageFacts
-scanSpecifierPrefixStorage(Tree const& tree, NodeId declNode,
-                           DeclarationRule const& decl) {
+scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
+                           NodeId declNode, DeclarationRule const& decl) {
     SpecifierStorageFacts out;
     if (decl.linkageSpecifiers.empty()) return out;
     NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
@@ -4717,6 +4724,71 @@ scanSpecifierPrefixStorage(Tree const& tree, NodeId declNode,
             for (RuleId rid : decl.linkageSpecifierIgnoredRules) {
                 if (tree.rule(c).v == rid.v) { skip = true; break; }
             }
+            // ★★ AN ATTRIBUTE CLAUSE NAME IS NOT A DECLARATION SPECIFIER.
+            // The semantic-tier twin of the HIR-tier row
+            // D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED.
+            //
+            // The three facts this scan produces are STORAGE-CLASS facts, and a
+            // storage class is a declaration specifier — C has no attribute form
+            // of one. Without this skip the walk descended into the language's
+            // own attribute-specifier shapes and resolved a token spelled
+            // `static` / `constexpr` / `thread_local` worn as an attribute CLAUSE
+            // NAME (`__attribute__((static)) int gv = 1;`, legal to WRITE since
+            // D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED)
+            // against the KEYWORD's own entry — one map holding two vocabularies,
+            // asked the wrong question. ✔MEASURED, and it cost three distinct
+            // wrong answers, two of them on programs BOTH references accept and
+            // RUN (gcc 13.3.0 and clang 18.1.3 warn-and-ignore every one):
+            // `__attribute__((thread_local)) int tf(void){…}` was REFUSED rc=1
+            // S_ThreadLocalOnFunction; the 6.2.2p7 mismatch diagnostic BOTH
+            // references emit for `__attribute__((static)) int gv = 1; static int
+            // gv;` was MISSED because the mis-mint made the prior declaration
+            // look internal; and once the HIR emission tier began reading
+            // `isInternalLinkage` (D-CSUBSET-LINKAGE-INHERITED-INTERNAL-EMITS-GLOBAL)
+            // the same mis-mint REMOVED `gv` from the object, so a sibling TU's
+            // `extern int gv;` no longer linked — where both references keep it
+            // external (`nm` reports `D gv`).
+            //
+            // ★ WHY A WHOLESALE SUBTREE SKIP RATHER THAN THE HIR TWIN'S
+            // PER-TOKEN MARK. `linkageFrom` (`src/hir/lowering/cst_to_hir.cpp`)
+            // fixed the same class in P42 with a parallel `fromAttrName` vector
+            // plus a keyword DENIAL asked of `GrammarSchema::lookupLexeme` — see
+            // D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED.
+            // It needs the finer instrument because it must still RESOLVE `weak`
+            // and `visibility` in attribute position while denying keywords
+            // there. THIS scan has nothing to resolve in attribute position at
+            // all: ✔MEASURED across all four shipped `linkageSpecifiers` rows,
+            // every entry setting one of these three facets is a declaration-
+            // specifier keyword (`static`, `constexpr`, `_Thread_local`,
+            // `thread_local`), and the only attribute-named entries (`weak`,
+            // `visibility:*`) set `binding:weak` / `visibility`, which this scan
+            // does not read. So the coarser rule is the EXACT rule here, and it
+            // deliberately does NOT re-derive the keyword-vs-attribute-name
+            // question that P42 already owns one tier over — a second derivation
+            // is precisely what would drift.
+            //
+            // ⚠ NAMED RESIDUE, because the coarse rule buys its simplicity with
+            // an assumption the config cannot yet state: a language declaring an
+            // ATTRIBUTE that genuinely confers storage would have that entry
+            // silently inert HERE while it still folds in the HIR tier. No
+            // shipped config does. The closing shape is a PER-ENTRY position
+            // declaration on the `linkageSpecifiers` row itself (`"static":
+            // {…, "position": "specifier"}` / `"weak": {…, "position":
+            // "attribute"}`), which would state the fact once in the document
+            // that owns the vocabulary and would subsume P42's `lookupLexeme`
+            // derivation as well as this skip — see the row.
+            //
+            // Config-driven throughout: WHICH rules are attribute shapes is the
+            // language's own declaration (the same `attrSpecRule` / `stdAttrRule`
+            // pair `collectAttrNodes` and `linkageTierJudgesAttributeNames` read
+            // in this file), never a spelling; an invalid rule skips nothing, so
+            // a language with no attribute surface behaves exactly as before.
+            if (!skip
+                && ((cfg.attrSpecRule.valid()
+                     && tree.rule(c).v == cfg.attrSpecRule.v)
+                    || (cfg.stdAttrRule.valid()
+                        && tree.rule(c).v == cfg.stdAttrRule.v)))
+                skip = true;
             if (skip) continue;
             for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
             continue;
@@ -7113,7 +7185,7 @@ void validateThreadLocalDeclarator(EngineState& s, SemanticConfig const& cfg,
     }
     if (rec.isExternDeclaration) return;   // extern satisfies 6.7.1p3
     if (rec.scope.v == fileScopeOf(s, tree, rec.scope).v) return;  // file scope
-    if (!scanSpecifierPrefixStorage(tree, declNode, decl).staticStorage) {
+    if (!scanSpecifierPrefixStorage(cfg, tree, declNode, decl).staticStorage) {
         emit(DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern, nameNode,
              std::format("'{}' — a block-scope thread_local object requires "
                          "'static' or 'extern' (C 6.7.1p3)", rec.name));
@@ -7238,7 +7310,7 @@ void validateVlaDeclarator(EngineState& s, SemanticConfig const& cfg,
     // BLOCK scope but non-automatic storage (`static`/`extern`) — IMPORTANT-1.
     bool const isExtern = rec.isExternDeclaration;
     bool const isStatic =
-        scanSpecifierPrefixStorage(tree, declNode, decl).staticStorage;
+        scanSpecifierPrefixStorage(cfg, tree, declNode, decl).staticStorage;
     if (!isExtern && !isStatic) return;   // automatic storage — a legal VLA
     emit(DiagnosticCode::S_VlaWithStaticStorage,
          std::format("'{}' — a variable-length array requires automatic storage "
@@ -7892,7 +7964,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             && !isProto
                             && !decl.nonDefiningDeclaration
                             && bindScope.v != fileScopeOf(s, tree, bindScope).v
-                            && !scanSpecifierPrefixStorage(tree, node, decl)
+                            && !scanSpecifierPrefixStorage(cfg, tree, node, decl)
                                     .staticStorage) {
                             ParseDiagnostic d;
                             d.code     = DiagnosticCode::
@@ -8000,7 +8072,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // object). Pass 2's validateThreadLocalDeclarator
                         // enforces the 6.7.1 constraints; the redeclaration
                         // merge rejects a same-TU mismatch (6.7.1p3).
-                        if (scanSpecifierPrefixStorage(tree, node, decl)
+                        if (scanSpecifierPrefixStorage(cfg, tree, node, decl)
                                 .threadStorage) {
                             rec.isThreadLocal = true;
                         }
@@ -8023,7 +8095,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // (6.2.2p4 inheritance) and rejects the one ordering
                         // every reference rejects — see
                         // S_LinkageRedeclarationMismatch.
-                        if (scanSpecifierPrefixStorage(tree, node, decl)
+                        if (scanSpecifierPrefixStorage(cfg, tree, node, decl)
                                 .localBinding
                             && bindScope.v == fileScopeOf(s, tree, bindScope).v) {
                             rec.isInternalLinkage = true;
@@ -8312,7 +8384,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // `extern thread_local int e;` mints HERE (externDecl's
                     // externSpecifiers prefix carries the specifier). Same facet,
                     // same scan; Pass 2 + the merge own the consequences.
-                    if (scanSpecifierPrefixStorage(tree, node, decl).threadStorage) {
+                    if (scanSpecifierPrefixStorage(cfg, tree, node, decl).threadStorage) {
                         rec.isThreadLocal = true;
                     }
                     // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH): the
@@ -8323,7 +8395,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // so a positional-name language declaring one gets the
                     // same C 6.2.2p3 marking, exactly the threadStorage
                     // precedent one line up.
-                    if (scanSpecifierPrefixStorage(tree, node, decl).localBinding
+                    if (scanSpecifierPrefixStorage(cfg, tree, node, decl).localBinding
                         && bindScope.v == fileScopeOf(s, tree, bindScope).v) {
                         rec.isInternalLinkage = true;
                     }
@@ -9785,7 +9857,47 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // stacking this on top of its own diagnostic; the
                         // per-declaration latch keeps `_Noreturn int a, b;` at
                         // one warning for its one shared spelling.
-                        if (declNoreturn.keyword && !isFnSig
+                        // ★★ THE TYPE-ALIAS TERM, AND WHY IT IS A SEPARATE TERM
+                        // RATHER THAN A WIDENING OF `!isFnSig`.
+                        //
+                        // `typedef _Noreturn void tfn(void);` has a declarator
+                        // that IS a function, so `isFnSig` is TRUE and the gate
+                        // above used to close — DSS said NOTHING where gcc
+                        // 13.3.0 says `typedef 'tfn' declared '_Noreturn'`. But
+                        // a TYPE ALIAS is not a function DECLARATION: 6.7.4p2
+                        // confines the specifier to function declarations, and
+                        // this declaration declares a TYPE. The row's own
+                        // declared kind answers that — the same
+                        // `decl.kind == DeclarationKind::Type` predicate the
+                        // type-alias sites in this file already read, so it is
+                        // config-driven and no spelling is tested.
+                        //
+                        // ⚠ WIDENING `!isFnSig` INSTEAD WOULD HAVE BEEN WRONG,
+                        // and the control that proves it is one line of C:
+                        // `typedef void fn_t(void); _Noreturn fn_t f;` declares a
+                        // real FUNCTION through an alias, is accepted SILENTLY by
+                        // gcc, clang AND MSVC (✔MEASURED), and must stay silent.
+                        // It reaches here with `isFnSig` true and `decl.kind`
+                        // NOT Type, so the two terms are exactly what separates
+                        // the two shapes.
+                        //
+                        // ✔MEASURED 2026-09-01, all three references probed
+                        // SEPARATELY at -std=c11 AND -std=c2x: gcc ACCEPTS the
+                        // typedef head (rc=0) and WARNS; clang 18.1.3 REJECTS it
+                        // (`'_Noreturn' can only appear on functions`); MSVC
+                        // 19.51 REJECTS it (C3829). The references split on
+                        // ACCEPT-vs-REFUSE, so the disjunction governs and DSS
+                        // accepts — and gcc's meaning is that the specifier is
+                        // DROPPED, which DSS already reproduces (✔MEASURED by
+                        // -Wreturn-type differential: the decorated alias warns
+                        // `control reaches end of non-void function` exactly as
+                        // the undecorated control does, while the
+                        // all-references-accept `_Noreturn tfn f;` spelling does
+                        // not). So this is a MISSING DIAGNOSTIC on an otherwise
+                        // correct program, never a meaning divergence.
+                        bool const typeAliasRow =
+                            decl.kind == DeclarationKind::Type;
+                        if (declNoreturn.keyword && (!isFnSig || typeAliasRow)
                             && declTy.valid() && !isFunctionForm
                             && !noreturnNonFnReported) {
                             noreturnNonFnReported = true;
@@ -9796,13 +9908,28 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             d.buffer   = tree.source().id();
                             d.span     = tree.span(nameNode.valid() ? nameNode
                                                                     : node);
-                            d.actual   = std::format(
-                                "'{}' — '_Noreturn' is a function specifier "
-                                "and this declaration does not declare a "
-                                "function; the specifier is IGNORED (C11 "
-                                "6.7.4p2 confines it to function "
-                                "declarations)",
-                                s.symbols.at(sym).name);
+                            // A typedef of a FUNCTION type would be actively
+                            // misdescribed by the object wording ("does not
+                            // declare a function" — it declares a function
+                            // TYPE), so the alias arm says what gcc says
+                            // instead. Same code, same severity: only the
+                            // sentence differs.
+                            d.actual = typeAliasRow
+                                ? std::format(
+                                      "'{}' — '_Noreturn' is a function "
+                                      "specifier and this declaration declares "
+                                      "a TYPE, not a function; the specifier is "
+                                      "IGNORED and does NOT travel to "
+                                      "declarations made through this alias "
+                                      "(C11 6.7.4p2)",
+                                      s.symbols.at(sym).name)
+                                : std::format(
+                                      "'{}' — '_Noreturn' is a function "
+                                      "specifier and this declaration does not "
+                                      "declare a function; the specifier is "
+                                      "IGNORED (C11 6.7.4p2 confines it to "
+                                      "function declarations)",
+                                      s.symbols.at(sym).name);
                             s.reporter.report(std::move(d));
                         }
                         // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99

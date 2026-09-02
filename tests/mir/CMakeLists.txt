@@ -111,3 +111,17 @@ dss_add_test(NAME mir/test_mir_text_global_attrs
 # DIAGNOSED malformation; these two shapes set no `errors_` at all.
 dss_add_test(NAME mir/test_mir_text_unsealed_block
              SOURCES test_mir_text_unsealed_block.cpp)
+
+# D-CSUBSET-C11-THREADS-MACHO-MTX-PLAIN-RECURSIVE + D-CSUBSET-C11-THREADS-MTX-PLAIN-RECURSIVE
+# (P51 lane mx): `mtx_init`'s C11 `type` argument. The macho recipe passed a NULL
+# mutexattr, so `mtx_init(&m, mtx_recursive)` yielded a NON-recursive Darwin mutex
+# and a same-thread re-lock DEADLOCKED — a hang out of a discarded argument. The
+# corpus witness `examples/c/c11_mtx_recursive` proves the behaviour but its macho
+# arm runs only on a Mac; this asserts the emitted body of BOTH vehicles from ANY
+# host, at the OPERAND level (the kind is traced back to Arg#1 through its whole
+# Mul/ZExt/ICmpNe/And chain, with both platform literals pinned by value), so a
+# regression reds on the Windows leg. Its win32 half is a deliberate NEGATIVE:
+# same-thread re-lock of a plain mutex is UNDEFINED and the three references
+# disagree three ways, so pe must keep NOT growing a recursion guard.
+dss_add_test(NAME mir/test_synth_threads_mtx_type
+             SOURCES test_synth_threads_mtx_type.cpp)

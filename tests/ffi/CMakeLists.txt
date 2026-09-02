@@ -194,3 +194,19 @@ dss_add_test(NAME ffi/test_shipped_threads_timed_declarations
              SOURCES test_shipped_threads_timed_declarations.cpp)
 target_link_libraries(dss_ffi_test_shipped_threads_timed_declarations
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CSUBSET-C11-THREADS-MACHO-MTX-PLAIN-RECURSIVE + D-CSUBSET-C11-THREADS-MTX-PLAIN-RECURSIVE
+# (P51 lane mx): the DECLARED half of `mtx_init`'s `type` argument. The macho
+# recipe now READS that parameter to pick a pthread mutex kind, so a threads.json
+# that narrowed the signature would leave the shim materializing an Arg the
+# declaration does not promise — a wrong-kind mutex that compiles, links and hangs.
+# Also pins the three `mtx_*` constants the pass masks against, including that
+# mtx_recursive is a SINGLE BIT (C11 spells a recursive mutex as an OR, so a
+# recursive request can arrive as 1 or as 3 and the pass must mask, not compare).
+# Builds REMOVE-direction mutants of the shipped descriptor on a COPY (strip the
+# i32 parameter; delete the mtx_recursive constant row), so it needs the JSON
+# reader directly like its siblings.
+dss_add_test(NAME ffi/test_shipped_mtx_type_declarations
+             SOURCES test_shipped_mtx_type_declarations.cpp)
+target_link_libraries(dss_ffi_test_shipped_mtx_type_declarations
+                      PRIVATE nlohmann_json::nlohmann_json)

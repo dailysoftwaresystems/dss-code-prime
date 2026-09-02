@@ -4228,24 +4228,66 @@ struct Lowerer {
             // address → access violation. SExt signed / ZExt unsigned (mapCast)
             // — the SAME widen the Index path (p[i]) already does (the positive
             // p+n cases worked only because their high bits were 0).
+            //
+            // D-CSUBSET-POINTER-ARITH-ENUM-INDEX: the index's SCALAR INTEGER
+            // KIND is what `mapCast` needs, and that is NOT always the type's own
+            // kind. `mapCast` is TypeKind-only (it cannot read the interner), so
+            // an Enum and a narrow `_BitInt` — both integer types under C23
+            // 6.2.5, and both admitted as the integer operand of C23 6.5.7p2 —
+            // arrive with a kind `mapCast`'s `isInt` deliberately excludes. Ask
+            // `resolveScalarIntKind`, THE file's one owner of "what plain integer
+            // does this scalar project onto" (enum → its declared underlying via
+            // `scalars[0]`, narrow `_BitInt` → its native container, anything
+            // else → itself), so this site has no second opinion of its own.
+            // ★ THE WIDEN'S SIGN THEN FALLS OUT OF THE RESOLVED KIND and needs no
+            // rule here: `mapCast` picks SExt for a signed underlying and ZExt for
+            // an unsigned one, which is what C23 6.5.7p8 requires (the integer
+            // operand keeps its OWN type and its own sign — a pointer/integer pair
+            // undergoes no usual arithmetic conversion). Choosing that sign wrongly
+            // is a silent miscompile, not a refusal, which is why it is derived
+            // rather than spelled.
+            // ⚠ `resolveScalarIntKind` is FATAL on a WIDE `_BitInt` (N>64) — its
+            // `bitIntContainerKind` has no answer for a multi-limb value — so a
+            // wide index is refused ABOVE it, and refused on its own terms: a wide
+            // integer is memory-resident and arrives here as an ADDRESS (the
+            // request flip), so `mapCast(I128, I64)`'s plain Trunc would narrow an
+            // ADDRESS into a byte offset. ✔MEASURED at this commit: that Trunc
+            // walls one tier down (D-CSUBSET-32BIT-ALU-FORMS / the 128-bit Const
+            // width refusal), so nothing miscompiles today — but the wall is
+            // incidental, and this tier is the one that knows the operand is an
+            // address. Refuse it HERE, by intent.
             TypeId const i64ty = interner.primitive(TypeKind::I64);
             MirInstId intIdx = rhs;
-            if (interner.kind(indexTy) != TypeKind::I64) {
-                MirOpcode const ext = mapCast(interner.kind(indexTy), TypeKind::I64);
-                // c65: a non-integer index kind (Array/Enum/…) has no widening
-                // cast → mapCast returns Invalid. FAIL LOUD here — passing Invalid
-                // to addInst std::abort()s the whole compiler (the c65 sqlite
-                // crash class: `p - arrayName`, now fixed at the HIR tier by array
-                // decay → ptrSub; an Enum index is the deferred
-                // D-CSUBSET-POINTER-ARITH-ENUM-INDEX). The pre-existing
-                // `.valid()` guard below runs AFTER addInst, i.e. too late.
+            TypeKind const rawIndexKind = interner.kind(indexTy);
+            if (isWideInt(interner, indexTy)) {
+                unsupported(node, std::format(
+                    "pointer arithmetic: a WIDE integer index ({}) is "
+                    "memory-resident and reaches this site as an ADDRESS, so it "
+                    "cannot be narrowed to a 64-bit byte offset by a cast "
+                    "(D-CSUBSET-INT128-LIR-WIDTH / D-CSUBSET-BITINT-C2-WIDE)",
+                    wideIntSpelling(indexTy)));
+                return InvalidMirInst;
+            }
+            if (rawIndexKind != TypeKind::I64) {
+                MirOpcode const ext =
+                    mapCast(resolveScalarIntKind(indexTy), TypeKind::I64);
+                // c65: a NON-INTEGER index kind (Array/Struct/…) still has no
+                // widening cast → mapCast returns Invalid. FAIL LOUD here —
+                // passing Invalid to addInst std::abort()s the whole compiler (the
+                // c65 sqlite crash class: `p - arrayName`, now fixed at the HIR
+                // tier by array decay → ptrSub). The pre-existing `.valid()` guard
+                // below runs AFTER addInst, i.e. too late.
+                // ⚠ The message no longer names the enum: an enum index is
+                // SUPPORTED, so keeping it in the text would send the next reader
+                // after a cause that cannot fire, and would name a closed row as
+                // the reason for an unrelated refusal.
                 if (ext == MirOpcode::Invalid) {
                     unsupported(node, std::format(
-                        "pointer arithmetic: index TypeKind {} has no widening "
-                        "cast to a 64-bit offset (an array index must decay to a "
-                        "pointer difference; an enum index is deferred — "
-                        "D-CSUBSET-POINTER-ARITH-ENUM-INDEX)",
-                        static_cast<unsigned>(interner.kind(indexTy))));
+                        "pointer arithmetic: index TypeKind {} is not an integer "
+                        "type and has no widening cast to a 64-bit offset (C23 "
+                        "6.5.7p2 admits only an integer operand; an array index "
+                        "must decay to a pointer difference)",
+                        static_cast<unsigned>(rawIndexKind)));
                     return InvalidMirInst;
                 }
                 std::array<MirInstId, 1> eo{rhs};

@@ -42,8 +42,13 @@ namespace dss::linker {
 // file identity (see `writeBytes` below — the artifact is staged in a
 // sibling temp and renamed over the target; it is never truncated in
 // place). Returns `true` iff the bytes landed on disk. On failure, emits
-// one of six remediation-distinct K_* codes into `reporter` and
+// one of seven remediation-distinct K_* codes into `reporter` and
 // returns `false`:
+//   * `K_ArtifactWithheldAfterError` — the compilation had already
+//                                    recorded an error (the artifact
+//                                    invariant; enforced in `writeBytes`
+//                                    below, which every image write
+//                                    passes through)
 //   * `K_ImageNotOk`               — `image.ok() == false`
 //   * `K_ImageEmpty`               — `ok() == true` but bytes empty
 //   * `K_ImageWriteParentMissing`  — parent dir absent
@@ -91,15 +96,41 @@ writeImage(LinkedImage const&             image,
 // delegates to AFTER its LinkedImage-shape preconditions -- factored out so
 // other artifact producers that are NOT a `LinkedImage` (the c163 `ar`
 // static-archive writer -- an archive has no `ok()`/function-count contract)
-// reuse the SAME fail-loud discipline. Returns true iff every byte landed on
+// reuse the SAME fail-loud discipline.
+//
+// ★★★ THE ARTIFACT INVARIANT LIVES HERE: A COMPILATION THAT RECORDED AN ERROR
+// COMMITS NO ARTIFACT. Because this is the ONE place any artifact byte in this
+// compiler reaches disk, the FIRST thing it asks is whether `reporter` already
+// holds an error; if so it emits `K_ArtifactWithheldAfterError` at INFO
+// severity (a consequence, never a second fault -- see the code's own note)
+// and returns false WITHOUT touching `path`. The reporter a real build hands
+// down is `runCusToTargets`'s fresh per-target scratch, and that same
+// `hasErrors()` decides the target's exit code, so the predicate that says the
+// build failed and the predicate that withholds the file are ONE predicate.
+// The gate can only ever fire on a run whose exit code is already 1, so it
+// cannot turn a passing build red -- it changes what a FAILING build leaves on
+// disk. A caller that needs to commit bytes irrespective of compile outcome
+// must use a reporter that is not the compilation's, and should say why.
+//
+// Returns true iff every byte landed on
 // disk; on failure emits one of the same four remediation-distinct K_* codes
-// into `reporter`:
+// into `reporter` (plus `K_ArtifactWithheldAfterError` above):
 //   * `K_ImageWriteParentMissing`  -- parent dir absent
 //   * `K_ImageWriteOpenFailed`     -- path has no filename component, the
 //                                     staging temp could not be created, or
 //                                     the commit rename failed
 //   * `K_ImageWriteShort`          -- write() mid-stream failbit
 //   * `K_ImageWriteCloseFailed`    -- close() flush failbit
+//
+// NON-DESTRUCTIVE ON EVERY REFUSAL. Whichever precondition fails -- the
+// artifact invariant above, an empty filename, a missing parent, or a mid-write
+// error -- a file already at `path` is left BYTE-INTACT. This compiler never
+// destroys an artifact it did not write; it only ever declines to write a new
+// one. ⓘ That is a MEASURED divergence from gcc 13.3.0 / clang 18.1.3 / MSVC
+// 19.51 for a failed LINK specifically (all three unlink the previous output
+// there; all three LEAVE it byte-identical when the FRONT END fails), and it is
+// deliberate: a compiler that deletes a working binary on a build it aborted
+// before opening the file destroys something it cannot give back.
 //
 // ATOMIC REPLACE, NEW IDENTITY (D-LK-WRITER-TRUNCATES-INSTEAD-OF-RENAMING).
 // The bytes are staged in a uniquely-named SIBLING temp (`<path>.dsstmp-*`,

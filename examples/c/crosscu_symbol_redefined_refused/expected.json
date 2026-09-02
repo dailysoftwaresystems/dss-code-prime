@@ -1,0 +1,18 @@
+{
+  "$comment": "THE ARTIFACT INVARIANT: a compilation that recorded an error commits no artifact. Two translation units both define `f` STRONGLY, which gcc 13.3.0, clang 18.1.3 and MSVC 19.51 each refuse (probed separately: `multiple definition of 'f'` / `LNK2005`), and each of the three produces NO output file for it. DSS reported `K_SymbolRedefinedAcrossUnits`, exited 1 -- and printed `dsscp: artifact ...a.exe` and left a runnable `a.exe` returning 42, CU#1's answer, with the two rival definitions resolved by an election nobody made. That is the fail-loud bar inverted and, by this project's definition, a SILENT MISCOMPILE. * WHY THIS EXAMPLE AND NOT ONLY A UNIT TEST: the defect was reachable ONLY through the whole-program merge, so it needs TWO compilation units, and the expect-error corpus could not express one -- both runners' error arms were hardcoded to a single source. They now take a `sources` array whenever every declared code is `positioned: false`, and BOTH now assert that a rejected build leaves NO file in its output directory, so all 30-odd expect-error examples witness the invariant rather than this one alone. * `positioned: false` is honest rather than a shortcut: a cross-unit redefinition is a WHOLE-PROGRAM fact with no single declaration at fault, and the diagnostic is emitted at a span-less tier. * RED-ON-DISABLE: remove the merge tier's snapshot gate at the `mergeCuMirs` call site in program.cpp and the pipeline runs on over a module it knows is wrong; remove `writeBytes`'s error gate as well and the artifact reappears and this example's no-artifact assertion reddens in BOTH runners. Unit-level pins: program/test_failed_build_writes_no_artifact and link/test_artifact_withheld_after_error.",
+  "language": "c",
+  "sources": ["a.c", "b.c"],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "K_SymbolRedefinedAcrossUnits",
+      "line": 1,
+      "col": 1,
+      "positioned": false
+    }
+  ]
+}

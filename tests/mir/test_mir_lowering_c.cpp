@@ -15377,3 +15377,144 @@ TEST(MirLoweringC, OrdinaryControllingExpressionsAreUntouchedByTheVoidRefusal) {
                "untouched: " << d.actual;
     }
 }
+
+// ── D-CSUBSET-POINTER-ARITH-ENUM-INDEX — the `p ± n` index widen ─────────────
+//
+// C23 6.2.5p22 makes an enumerated type an INTEGER type and 6.5.7p2 admits any
+// integer operand beside a pointer, so `p + e` must lower. It did not: the widen
+// to a 64-bit byte offset asks `mapCast`, which is TypeKind-only and whose
+// `isInt` deliberately excludes Enum (and `_BitInt`) because resolving either
+// needs the interner. The fix asks `resolveScalarIntKind` — this file's one
+// owner of "what plain integer does this scalar project onto" — before mapCast.
+//
+// ★★ THE SIGN OF THAT WIDEN IS THE LOAD-BEARING HALF, and it is the reason
+// these pins assert an OPCODE rather than `mir.ok`. C 6.5.7p8 gives the integer
+// operand no usual arithmetic conversion: it keeps its own type and its own
+// sign, so a signed underlying must SExt and an unsigned one must ZExt. Choosing
+// that backwards produces a WRONG ADDRESS with no diagnostic — the silent
+// miscompile class — and `mir.ok` is true in both worlds. The value-level twin
+// runs in `examples/c/pointer_arith_enum_index`, whose exit code separates the
+// two sign choices (192 correct, 104 inverted) without leaving its buffer.
+//
+// RED-ON-DISABLE for all four positive arms: revert the `resolveScalarIntKind`
+// resolution at `combineBinaryOp`'s `p ± n` widen and each stops lowering
+// (H_UnsupportedLoweringForKind), so `ASSERT_TRUE(L.mir.ok)` fires first.
+
+TEST(MirLoweringC, PointerArithSignedUnderlyingEnumIndexSignExtends) {
+    // `signed char` underlying: the enum can hold a NEGATIVE index, so the widen
+    // must SIGN-extend. A ZExt here turns -2 into 0xFFFFFFFE — a huge positive
+    // byte offset — which is the exact failure the I64 widen exists to prevent.
+    auto L = lowerC(
+        "enum SNarrow : signed char { S_BACK = -2 };\n"
+        "int *f(int *p, enum SNarrow e) { return p + e; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "an enum index in `p + e` must lower (C23 6.5.7p2): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 1u)
+        << "a SIGNED-underlying enum index must SIGN-extend to the 64-bit offset";
+    EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 0u)
+        << "a ZExt of a negative enum index is a silent wrong-address miscompile";
+}
+
+TEST(MirLoweringC, PointerArithUnsignedUnderlyingEnumIndexZeroExtends) {
+    // `unsigned char` underlying holding 200: an SExt would read it as -56 and
+    // step BACKWARDS. The polarity twin of the arm above — together they pin that
+    // the sign comes from the UNDERLYING type rather than from a fixed choice.
+    auto L = lowerC(
+        "enum UNarrow : unsigned char { U_FAR = 200 };\n"
+        "char *f(char *p, enum UNarrow e) { return p + e; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 1u)
+        << "an UNSIGNED-underlying enum index must ZERO-extend to the 64-bit offset";
+    EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 0u)
+        << "an SExt of `unsigned char` 200 reads it as -56 — a wrong address";
+}
+
+TEST(MirLoweringC, PointerArithEnumIndexInSubtractionWidensBeforeTheNegate) {
+    // `p - e` negates the index at I64 AFTER the widen. Negating first (or
+    // widening after) would sign-flip a 32-bit value into the high half of the
+    // register. Pins the ordering by pinning that the widen exists at all on the
+    // subtraction arm, which reaches the same site through a different opcode.
+    auto L = lowerC(
+        "enum Step { ST_TWO = 2 };\n"
+        "int *f(int *p, enum Step e) { return p - e; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 1u)
+        << "a default (int) underlying is signed → SExt to the 64-bit offset";
+    ASSERT_EQ(collectOps(m, MirOpcode::Neg).size(), 1u)
+        << "`p - e` must negate the widened index";
+    auto const& interner = L.model.lattice().interner();
+    EXPECT_EQ(interner.kind(m.instType(collectOps(m, MirOpcode::Neg)[0])),
+              TypeKind::I64)
+        << "the negate must run at the WIDENED type, never at the enum's width";
+}
+
+TEST(MirLoweringC, PointerArithNarrowBitIntIndexWidensThroughItsContainer) {
+    // The same site, the same `mapCast` exclusion, a different type: C23 6.2.5
+    // makes `_BitInt(N)` an integer type too, and clang 18.1.3 compiles and runs
+    // `p + b` (✔MEASURED; gcc 13.3.0 has no `_BitInt` at all, so the disjunction
+    // rests on clang). `resolveScalarIntKind` projects a NARROW `_BitInt` onto its
+    // native container, so asking it fixes this arm with no second rule.
+    auto L = lowerC(
+        "int *f(int *p, _BitInt(8) b) { return p + b; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "a narrow `_BitInt` index must widen through its container: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 1u)
+        << "a signed `_BitInt(8)` container is signed → SExt to the 64-bit offset";
+}
+
+TEST(MirLoweringC, PointerArithWideIntegerIndexIsRefusedAsAnAddressNotTruncated) {
+    // THE NEGATIVE ARM, and it guards two distinct failures at once:
+    //   * `resolveScalarIntKind` is FATAL on a wide `_BitInt` — it would abort the
+    //     compiler, turning a clean refusal into a lost process;
+    //   * a wide value reaches this site as an ADDRESS (the request flip), and
+    //     `mapCast(I128, I64)` is a plain Trunc — narrowing an ADDRESS into a byte
+    //     offset. ✔MEASURED before the fix: that Trunc walled one tier down on
+    //     x86_64, so nothing miscompiled, but the wall was incidental and this
+    //     tier is the one that knows the operand is an address.
+    // A polarity note: this must stay a REFUSAL and not become a "refuse every
+    // index" shortcut — the four arms above are what forbid that.
+    auto L = lowerC("int *f(int *p, __int128 w) { return p + w; }\n");
+    ASSERT_FALSE(L.mir.ok) << "a WIDE integer index must NOT be truncated silently";
+    bool named = false;
+    for (auto const& d : L.mirReporter.all()) {
+        if (d.actual.find("WIDE integer index") != std::string::npos
+            && d.actual.find("ADDRESS") != std::string::npos)
+            named = true;
+    }
+    EXPECT_TRUE(named)
+        << "the refusal must say the operand is a wide integer reaching the site "
+           "as an ADDRESS, not repeat the pre-fix 'enum index is deferred' text";
+}
+
+TEST(MirLoweringC, PointerArithNonIntegerIndexRefusalNoLongerNamesTheEnum) {
+    // The message the fix had to rewrite. Its old text said "an enum index is
+    // deferred — D-CSUBSET-POINTER-ARITH-ENUM-INDEX", which after the fix names a
+    // cause that can no longer fire and points a reader at a closed row. Asserting
+    // the ABSENCE of that phrase is what stops it being reinstated by a revert
+    // that keeps the behaviour: a stale diagnostic is the failure mode nothing
+    // else in this suite can see.
+    // ⓘ The positive arms above already prove an enum index LOWERS, so no fixture
+    // here can reach the refusal through an enum any more; this reads the shipped
+    // text directly at its one live call site instead of synthesising a
+    // non-integer index that the HIR tier decays before MIR ever sees it.
+    auto L = lowerC("int *f(int *p, __int128 w) { return p + w; }\n");
+    ASSERT_FALSE(L.mir.ok);
+    for (auto const& d : L.mirReporter.all()) {
+        EXPECT_EQ(d.actual.find("an enum index is deferred"), std::string::npos)
+            << "an enum index is SUPPORTED — no refusal may still call it deferred";
+    }
+}

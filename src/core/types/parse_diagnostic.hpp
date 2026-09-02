@@ -4519,7 +4519,33 @@ enum class DiagnosticCode : std::uint16_t {
     //   never sees one never needs the key, so this is not a back-door
     //   requirement on every schema.
     K_FormatLacksWeakDefinitionDialect = 0x8022,
-    // K-NEXT-SLOT: 0x8023 — grep this marker before adding a K_* code.
+    // K_ArtifactWithheldAfterError
+    //   The byte commit was REACHED while this compilation had already
+    //   recorded an error, so no artifact was written.
+    //   `linker::writeBytes` is the ONE
+    //   place any artifact byte in this compiler reaches disk, and this is
+    //   its outermost precondition: a build that reports failure must not
+    //   also hand back the file that failure denies.
+    //   ★ SEVERITY IS `Info`, DELIBERATELY, for the same reason
+    //   `D_LaterPhasesNotRun` is: the notice is emitted AT a gate that reads
+    //   `hasErrors()`, so an Error-severity notice would count a second
+    //   failure for one defect, could itself trip the diagnostic cap, and
+    //   would make the reason for the withholding compete with the reason
+    //   for the failure. The build was ALREADY failing when this fires —
+    //   `runCusToTargets` sets `exitCode = 1` from the same per-target
+    //   `scratch.hasErrors()` this gate reads — so the code can never turn a
+    //   passing build red. It reports a CONSEQUENCE, never a new fault.
+    //   ⓘ REACHING IT AT ALL MEANS AN UPSTREAM TIER REPORTED AN ERROR AND
+    //   LET THE PIPELINE RUN ON. Every tier gate in `compile_pipeline.cpp` is
+    //   a `tierClean(reporter, entryCount)` SNAPSHOT — deliberately, so one
+    //   tier does not fail on another's errors — and that discipline has no
+    //   whole-compilation level. This notice is that level, so its appearance
+    //   is worth investigating even though it is not itself a fault.
+    //   ⓘ The pre-existing file at the path (a previous good build's
+    //   artifact) is left BYTE-INTACT: the refusal happens before the
+    //   staging-temp claim, so the commit rename never runs.
+    K_ArtifactWithheldAfterError   = 0x8023,
+    // K-NEXT-SLOT: 0x8024 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

@@ -3019,3 +3019,134 @@ TEST(ParserCSmoke, AttributeBeforeExternKeywordStaysRejected) {
         << "an attribute before `extern` must stay LOUD — FIRST(externDecl) has "
            "to remain {ExternKeyword} or the schema fails to load at all";
 }
+
+// ===========================================================================
+// P51 [[D-CSUBSET-NORETURN-KEYWORD-PARAMETER-AND-TYPEDEF-POSITIONS]] — the
+// `_Noreturn` KEYWORD in the two grammar positions that used to refuse it.
+//
+// ✔MEASURED 2026-09-01, each reference probed SEPARATELY at `-std=c11` AND
+// `-std=c2x`: gcc 13.3.0 ACCEPTS both positions (rc=0, "parameter 'p' declared
+// '_Noreturn'" / "typedef 'tfn' declared '_Noreturn'" — warn and IGNORE);
+// clang 18.1.3 REJECTS both ("'_Noreturn' can only appear on functions");
+// MSVC 19.51 REJECTS both (error C3829). ONE accepting reference makes the
+// behaviour REQUIRED, so DSS must parse both. At the pre-change HEAD the
+// parameter position was `error[P0009] expected 'EndStatement' or 'BlockOpen'
+// — got '('` and the typedef head was `error[P0009] expected 'Identifier',
+// 'VoidKeyword', … — got '_Noreturn'`.
+//
+// RED-ON-DISABLE: delete the `"NoreturnKeyword"` branch from
+// `paramDeclSpecifier`'s alt -> the parameter test below fails; delete it from
+// `typedefDeclSpecifiers`' post-keyword alt -> the typedef test below fails.
+// ===========================================================================
+
+// The PARAMETER position. The keyword must land in the stripped specifier
+// PREFIX, never inside `declHeadForParam`: a token inside the type-resolved
+// head is offered to `resolveTypeNodeImpl` as a candidate TYPE, which is the
+// silent-miscompile shape `D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK`
+// exists to prevent and which the three attribute-position tests above pin.
+TEST(ParserCSmoke, NoreturnKeywordInParameterSpecifiersParses) {
+    for (char const* src : {
+             "void g(_Noreturn void (*p)(void));\n",
+             "void g(_Noreturn int p);\n",
+             "void g(_Noreturn void (*p)(void)) { (void)p; }\n",
+             "void g(_Noreturn int a, _Noreturn int b);\n",
+             "void g(_Noreturn __attribute__((unused)) int p);\n"}) {
+        Tree t = parseC(src);
+        ASSERT_NE(t.root(), InvalidNode) << src;
+        EXPECT_FALSE(t.diagnostics().hasErrors())
+            << src << " must parse (gcc accepts it): " << firstErrorText(t);
+    }
+
+    Tree t = parseC("void g(_Noreturn int p);\n");
+    // ⚠ FATAL, not EXPECT: everything below reads the tree's SHAPE, and
+    // `visibleChildRoles`/`prettyPrintSubtree` call `Tree::tokenKind` on any
+    // child that is not Internal — which ABORTS on the error nodes a failed
+    // parse leaves behind. MEASURED this cycle: with the grammar branch
+    // deleted, the EXPECT form ran on to the structural reads and the process
+    // died `Tree::tokenKind on non-Token node` (0xc0000409) BEFORE gtest could
+    // print the failing NAME, so the red-on-disable arm reported a crash and
+    // zero names. A test whose disabled arm hides its own name is not a pin.
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    NodeId const param = findFirstNodeWithRule(t, "param");
+    ASSERT_TRUE(param.valid());
+    EXPECT_EQ(visibleChildRoles(t, param),
+              "rule:paramDeclSpecifiers/rule:declHeadForParam/rule:declarator")
+        << "the keyword must ride the stripped specifier prefix, so the row's "
+           "head: 0 / declarator: 1 are byte-identical decorated or not";
+    NodeId const prefix = findFirstNodeWithRule(t, "paramDeclSpecifiers");
+    ASSERT_TRUE(prefix.valid());
+    EXPECT_EQ(visibleChildRoles(t, prefix), "rule:paramDeclSpecifier")
+        << "one specifier, one singular-alt node — the run is a run of the "
+           "named singular rule, at the SAME depth `compositeAttr` held";
+    // The anti-hijack half: no `_Noreturn` token anywhere under the head.
+    NodeId const head = findFirstNodeWithRule(t, "declHeadForParam");
+    ASSERT_TRUE(head.valid());
+    EXPECT_EQ(prettyPrintSubtree(t, head).find("_Noreturn"), std::string::npos)
+        << "a specifier inside the type-resolved head is tried as a TYPE";
+}
+
+// The TYPEDEF HEAD. The post-keyword run gained the branch INLINE rather than
+// by wrapping the run in a named rule, precisely so every already-parsing
+// attribute keeps its exact depth — `TypedefPostKeywordAttributeRidesThe
+// SpecifierPrefix` above pins that shape as `tok:TypedefKeyword/rule:attrSpec`
+// and a wrapper turned it RED (MEASURED, this cycle).
+TEST(ParserCSmoke, NoreturnKeywordInTypedefHeadParses) {
+    for (char const* src : {
+             "typedef _Noreturn void tfn(void);\n",
+             "typedef _Noreturn _Noreturn void tfn(void);\n",
+             "typedef _Noreturn void (*pfn)(void);\n",
+             "typedef _Noreturn __attribute__((aligned(16))) long T;\n"}) {
+        Tree t = parseC(src);
+        ASSERT_NE(t.root(), InvalidNode) << src;
+        EXPECT_FALSE(t.diagnostics().hasErrors())
+            << src << " must parse (gcc accepts it): " << firstErrorText(t);
+    }
+
+    Tree t = parseC("typedef _Noreturn void tfn(void);\n");
+    // FATAL for the same measured reason as the parameter test above: the
+    // structural reads abort on an error tree, which would swallow this
+    // test's own name on the red-on-disable arm.
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    NodeId const decl = findFirstNodeWithRule(t, "typedefDecl");
+    ASSERT_TRUE(decl.valid());
+    EXPECT_EQ(visibleChildRoles(t, decl), kCanonicalTypedefRoles)
+        << "the keyword must not shift head: 0 / declaratorList: 2";
+    NodeId const prefix = findFirstNodeWithRule(t, "typedefDeclSpecifiers");
+    ASSERT_TRUE(prefix.valid());
+    EXPECT_EQ(visibleChildRoles(t, prefix),
+              "tok:TypedefKeyword/tok:NoreturnKeyword")
+        << "the keyword rides the stripped prefix as a DIRECT token child — "
+           "the depth the inline alt preserves";
+    NodeId const head = findFirstNodeWithRule(t, "typedefHeadFull");
+    ASSERT_TRUE(head.valid());
+    EXPECT_EQ(prettyPrintSubtree(t, head).find("_Noreturn"), std::string::npos)
+        << "a specifier inside the type-resolved head is tried as a TYPE";
+}
+
+// ★ THE ANTI-WIDENING CENSUS. A grammar ALTERNATIVE is the one change class
+// that can silently widen what parses ELSEWHERE, so the shapes adjacent to the
+// two positions opened above are pinned as still-REFUSED — each one MEASURED
+// against gcc 13.3.0 this cycle, and each refusal justified by that reading.
+TEST(ParserCSmoke, NoreturnKeywordStaysRejectedInTheAdjacentPositions) {
+    struct Shape { char const* src; char const* why; };
+    for (Shape const& s : {
+             // gcc ERRORS too ("expected specifier-qualifier-list before
+             // '_Noreturn'") — `structMemberDeclSpecifier` was NOT widened.
+             Shape{"struct S { _Noreturn int x; };\n",
+                   "a struct member is a unanimous reject"},
+             // gcc ERRORS too ("'_Noreturn' in empty declaration").
+             Shape{"typedef _Noreturn void;\n",
+                   "a typedef with no declarator is a unanimous reject"},
+             // gcc ACCEPTS (warn-and-ignore) — NAMED LOUD RESIDUE, not an
+             // oversight: admitting the LEADING run would put NoreturnKeyword
+             // into FIRST(typedefDecl), where it collides with topLevelDecl's
+             // `declSpecifiers` at /shapes/topLevel — the same
+             // C_AmbiguousAlternatives wall `AttributeBeforeExternKeywordStays
+             // Rejected` records. Its own anchor, not a variation of this one.
+             Shape{"_Noreturn typedef void tfn(void);\n",
+                   "the LEADING typedef position is deliberately not opened"}}) {
+        Tree t = parseC(s.src);
+        EXPECT_TRUE(t.diagnostics().hasErrors())
+            << s.src << " must stay a LOUD refusal: " << s.why;
+    }
+}

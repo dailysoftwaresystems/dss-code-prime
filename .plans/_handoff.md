@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-01 — cycles **P14 … P50**.
+**Last updated:** 2026-09-01 — cycles **P14 … P51**.
 
 ---
 
@@ -17,47 +17,47 @@
 
 **State, ✔measured at the tip and not re-quoted:** branch `feature/c23-conformance-burndown-5`,
 **PR #56 OPEN**. ⚠ **NO SHA IS PINNED HERE ON PURPOSE** — a handoff cannot name its own commit,
-since writing it moves HEAD, and the public-repo bot rebases and squashes besides. **P50 landed as
-TWO commits**: the operator-ruled segment-threshold flip alone, then wave 1; re-derive with
-`git log --oneline -4`. `git worktree list` → **the repo only**.
+since writing it moves HEAD, and the public-repo bot rebases and squashes besides. Re-derive with
+`git log --oneline -3`. `git worktree list` → **the repo only**.
 
-★★★ **P50 RAN ONE SOLO ITEM AND THEN FOUR LANES AT THE CAP, CLOSING SEVEN ROWS — FIVE OF WHICH
-THE GATE CAN SEE — AND OPENING TWO THAT ARE NAMED AS P51's FIRST ITEMS.** The solo item was the
-operator's R3 from P49: the anchor guard's segment threshold. Wave 1 was `li ch as t2`, every
-lane from the PRODUCTION bucket.
+★★★ **P51 RAN EIGHT LANES IN THREE WAVES AND CLOSED SEVENTEEN ROWS — NINE OF WHICH THE GATE CAN
+SEE — WHILE OPENING TWO THAT ARE NAMED AS P52's FIRST PRODUCTION ITEMS.** Wave 1 `el np mx gw`,
+wave 2 `fa ei ld`, wave 3 `in ap`; twelve closures were PRODUCTION and five were harness. Eight of
+the seventeen were **born closed inside the cycle**, which the balance gate cannot see because it
+counts rows by NAME across the base and the tip.
 
-⚠⚠ **THE CYCLE'S TWO SHARPEST FINDINGS ARE BOTH ABOUT MY OWN INSTRUMENTS, AND BOTH FAILED IN THE
-DIRECTION WHOSE RESULT LOOKS LIKE SUCCESS. Read §0.5 before trusting any tooling here.** One
-destroyed a lane's entire evidence tree behind a `&&` that swallowed its own error; the other
-deleted a registry row from one file and failed to write it to the other, leaving it in NO
-registry — which `check-anchor-balance`, counting rows by name, reads as a CLOSURE. Both are
-fixed at the tool and pinned; both are born-closed harness rows.
+⚠⚠ **THE CYCLE'S RECURRING LESSON IS THAT AN INSTRUMENT REPORTED GREEN WHILE MEASURING NOTHING —
+FIVE SEPARATE TIMES, AND FOUR OF THEM WERE CAUGHT ONLY BY READING SOMETHING OTHER THAN THE
+VERDICT.** Read §0.4 before trusting any transcript here. A lane's `Copy-Item` preserved mtime so
+ninja rebuilt nothing and three mutant arms passed off ONE compilation; two of my own red-on-disable
+drafts measured a condition that never occurred; a lane's mutant reported 2 of 3 failing names
+because the process aborted before gtest printed the third; and the Windows gate figure P50
+published turned out to be a property of the shell it was launched from.
 
 ## §0.1 — The four gate legs, verbatim
 
 ```
-cmake --build build/dbg  &&  ctest --test-dir build/dbg --output-on-failure -j 12
+cmake --build build/dbg  &&  ctest --test-dir build/dbg --output-on-failure -j 8
 wsl.exe -e bash /mnt/c/Source/DailySoftware/dss-code-prime/scripts/wsl-leg/wsl-leg.sh --mode full
 wsl.exe -e bash /mnt/c/Source/DailySoftware/dss-code-prime/scripts/remote-leg/remote-leg.sh --carriage arm64-vps --mode full
 wsl.exe -e bash /mnt/c/Source/DailySoftware/dss-code-prime/scripts/remote-leg/remote-leg.sh --carriage macos     --mode full
 ```
 
-⛔⛔ **RUN THOSE THREE FROM POWERSHELL, WITH AN ABSOLUTE `/mnt/c/...` PATH, AND NOT FROM GIT
-BASH.** Git Bash's MSYS argument conversion rewrites a leading `/mnt/c/...` into
-`C:/Program Files/Git/mnt/c/...` before `wsl.exe` ever sees it.
+⛔⛔ **RUN THOSE THREE FROM POWERSHELL, WITH AN ABSOLUTE `/mnt/c/...` PATH, AND NOT FROM GIT BASH.**
+Git Bash's MSYS argument conversion rewrites a leading `/mnt/c/...` into
+`C:/Program Files/Git/mnt/c/...` before `wsl.exe` ever sees it. `scripts/run-gate/` has a `.ps1`
+twin with the identical argv contract — use it for the three remote legs.
 
 ⚠⚠ **NEVER READ A LEG'S — OR A GATE'S — VERDICT THROUGH A PIPE.** `scripts/run-gate/` captures rc
 DIRECTLY, refuses to call a run successful without a caller-supplied success witness, and writes
-both to the log. Use it for every gate; read the LOG, not the notification.
+both to the log. The witness for every leg is ctest's own `100% tests passed`. Read the LOG.
 
-⚠ **A leg tests the tree AS SYNCED.** ✔P50: three legs were dispatched, a fourth lane then
-folded, and all three had to be killed and re-run — they were measuring a tree that no longer
-existed. **Fold everything first, then gate.** Killing them left all three hosts clean
-(HEAD at the driver commit, `git status` rc=0 with 0 dirty, verified directly), but that is the
-carriage's restore working, not a licence to interleave.
+⚠ **A leg tests the tree AS SYNCED — fold everything first, then gate.** ✔P51 took an INTEGRATION
+checkpoint on the intermediate tree (five lanes folded, 1899/1899) precisely so a cross-lane break
+would surface before the real gate, and stated it as a checkpoint rather than a gate.
 
 ⚠ **A `.plans/`-only edit still needs the repo guards re-run** — several read `.plans/**`:
-`ctest --test-dir build/dbg -L repo-guard` takes ~2.5 min. **There are 21 of them since P50.**
+`ctest --test-dir build/dbg -L repo-guard`. **There are 22 of them since P51.**
 
 ## §0.2 — The reference toolchains, and WHERE MSVC IS
 
@@ -74,167 +74,164 @@ probed **separately** — "the reference" is not one voice.
 
 ★★ **MSVC IS REACHABLE WITHOUT `vcvars` FOR A FRONT-END QUESTION.** `cl.exe /c` compiles only —
 write the fixture so it includes **no system header**.
-★★★ **AND MSVC IS THE REFERENCE THAT KEEPS CHANGING THE ANSWER. ✔P50, twice:** it SILENTLY
-ACCEPTS most `static`↔non-`static` linkage-mismatched redeclarations that gcc rejects, which
-narrowed a row's whole reject set; and P49's `_Generic` row had never probed it at all. **A
-gcc-only matrix in a row is not a measurement of the union — re-probe all three before closing.**
-⚠ `mingw-w64 gcc` and `WSL gcc` are DIFFERENT references and they DISAGREE.
+★★★ **AND MSVC KEPT CHANGING THE ANSWER IN P51 TOO, IN BOTH DIRECTIONS.** It REFUSED
+`typedef _Noreturn void tfn(void);` (C3829) where gcc accepts — turning a "gcc-only" row into an
+accept-vs-refuse split the disjunction settles; it ACCEPTS `#line 42u` where gcc and clang refuse
+and ISO calls it a constraint violation (see §0.3); and it gives a bare `inline` definition an
+`External` COMDAT where gcc and clang provide no external definition at all. **A two-reference
+matrix is not a measurement of the union.**
+⚠ `mingw-w64 gcc` and `WSL gcc` are DIFFERENT references and they DISAGREE. ⓘ mingw-w64 ships **no**
+`<threads.h>`, so it is not a reference for C11 threads questions at all.
 
 ## §0.3 — What is OWED, stated so it is not mistaken for done
 
-1. **`D-SCRIPT-GUARDS-ASK-GIT-FROM-THE-LANE-WORKTREE` is THREE cycles old** — opened P47,
-   untaken by P48, P49 and P50. Enumeration-root must equal read-root. **Well past the
-   no-follow-ups exception boundary: take it in P51 or state plainly why not.**
-2. **The `veryquick` integration debt is DISCHARGED** (P49, pe64 leg: 3 errors out of 394,437
-   tests, zero DSS-attributable; the P47 confound rows were seen to APPLY and the repaired
-   oracle classifier reported `SAME-PLATFORM`). ⓘ What remains unexercised, and is NOT a standing
-   exit: the elf/macho corpus legs at this tree, and
-   [[D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE]]. `veryquick` still exits 1 by design —
-   `vtabH-3.1` is deliberately undeclared; read the ledger, do not chase it.
-3. **`speedtest1` is NOT part of the standing exit** — owed only by a cycle that explicitly
-   targets compile time or the optimizer pipeline. **P50 does not meet the predicate.**
-4. **The clang ASan/UBSan leg is still absent from `scripts/`** — anchored twice
+1. **[[D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE]] — P52's FIRST production item.** `e[p]`, `2[p]`
+   and `i[data]` are refused where all three references compile and run them, and ISO requires it
+   (`E1[E2]` ≡ `*((E1)+(E2))`). Found by lane `ei`, which could not take it because
+   `src/hir/lowering/cst_to_hir.cpp` was held by a live sibling for the whole cycle. ⚠ The row
+   carries a SECOND defect: the refusal names an internal node ordinal
+   (`hir node #N (HirKind ordinal 34)`) and no construct. **Both halves must close together.**
+2. **[[D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS]] — P52's second.** `inline extern int
+   p(int){…}` is refused where gcc, clang AND MSVC all accept and emit `T p`, and C §6.7.1 makes the
+   specifiers an unordered set. ⚠ The obvious fix was MEASURED AND REJECTED by the lane that found
+   it: admitting `extern` into the specifier alternation collides with the `externDecl`
+   import-synthesis route. Reconciling those two readings of `extern` IS the work.
+3. **`scripts/lane-worktree/lane-worktree.sh`'s `_repo_root()` is cwd-keyed** — a bare
+   `git rev-parse --show-toplevel`, i.e. the tree of the CWD and not the tree the script lives in.
+   Disclosed by lane `gw`, deliberately NOT repaired: changing which tree that script calls its own
+   changes the guard's SUBJECT. ctest pins the cwd via `WORKING_DIRECTORY`, so the only exposure is
+   a hand-run from elsewhere, and it fails to a loud verdict. **Reuse an existing per-language
+   resolver — `leg_tree_driver_identity` (`.sh`) or `Get-RepoTreeIdentity` (`.ps1`) — never a third.**
+4. **An operator question, raised by lane `ld` and NOT decided:** `#line 42u` is accepted by MSVC and
+   refused by gcc and clang, while ISO §6.10.6p4/p6 makes it a constraint violation. A mechanical
+   reading of the disjunction says DSS must accept; the standard says it is invalid. DSS's refusal
+   is UNCHANGED. Same shape, also unchanged and also stricter than at least one reference:
+   `#line 0`, `#line 2147483648` (MSVC **wraps** it to −2147483648), and trailing junk after the file
+   operand. **This is the "accepting what one reference accepts versus what ISO forbids" boundary the
+   `#pragma once` ruling did not cover.**
+5. **The clang ASan/UBSan leg is still absent from `scripts/`** — anchored twice
    (`D-CI-ASAN-LEG-WALL-CLOCK-GROWS-WITH-THE-CORPUS`, `D-CI-ARM64-EXAMPLES-NEVER-SANITIZED`).
-5. ⚠ **WSL's leg repo carries a SECOND registered worktree, `~/src/dss-sq` at `f8ebafb2`
-   (detached), left from P47's lane `sq`.** It is a SIBLING directory, so the leg's own checkout
-   reads 0 dirty and the examples glob does not see it — but a gate host is meant to hold the
-   repo and nothing else. **Not removed by P50 deliberately:** it is another cycle's artifact and
-   `git worktree remove` there could destroy unmeasured work. Measure it, then remove it.
-6. **`D-SQLITE-CLI-BUILT-ON-NO-LEG` is CLOSED** (Table 1 20/20, Table 2 40/40). ⚠ Its 40 cells
-   were run with **no matched reference control** (`hasReference: false` on every payload), so
-   they prove each artefact RUNS CORRECTLY on its target platform — **not** a DSS-vs-gcc
-   differential. Do not cite them as one.
+6. **The elf/macho sqlite corpus legs at this tree**, and
+   [[D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE]]. `veryquick` still exits 1 by design —
+   `vtabH-3.1` is deliberately undeclared; read the ledger, do not chase it. **`speedtest1` is NOT
+   part of the standing exit** — it is owed only by a cycle that explicitly targets compile time or
+   the optimizer, and P51 does not meet that predicate.
+7. ✅ **DISCHARGED IN P51, recorded so it is not re-done:** WSL's stray `~/src/dss-sq` worktree from
+   P47 is GONE (its one untracked file preserved and md5-verified on both sides first, then a PLAIN
+   `git worktree remove`, never `--force`). The VPS is clean. On macOS an empty probe-fixture
+   directory was removed with `rmdir`; ⚠ `~/src/dss-code-prime-2` was measured and **deliberately
+   LEFT** — it is a real clone of the origin remote at a merged public commit, i.e. the operator's
+   own checkout, in the operator's own `~/src`.
 
-## §0.4 — Traps, and the ones that were paid for AGAIN in P50
+## §0.4 — Traps, and the FIVE times in P51 an instrument reported nothing as green
 
-- ⛔⛔ **`cmd && cmd2` ON ONE LINE HID A FAILED `cp` AND COST A LANE ITS ENTIRE EVIDENCE TREE.**
-  ✔P50: the destination's parent did not exist, `cp` failed, `&&` swallowed the echo, and **the
-  ABSENCE of output read as success** — then the next command destroyed the only copy.
-  ⇒ `lane-worktree remove` now REFUSES a lane whose scratchpad holds files unless given
-  `--preserve-to <dir>` (it does the copy and VERIFIES it) or `--discard-scratchpad`. **Use
-  `--preserve-to`. Never hand-roll the copy again.**
-- ⛔ **A quoted heredoc EATS BACKSLASHES, and so does an inline `python -c` through Git Bash.**
-  Any throwaway script goes in a FILE, asserting by `os.path.realpath` PREFIX that it is not
-  inside the repository before it deletes anything.
-- ⛔⛔ **`grep -P` IS UNUSABLE ON THIS HOST** — *"-P supports only unibyte and UTF-8 locales"* —
-  and it **returns 0 silently**. Write a boundary-anchored Python matcher instead.
-- ⛔ **A Windows command line caps near 32 KB.** ✔P50: a 56 KB row could not be passed as argv at
-  all (`WinError 206`). Splitting the cell to fit would be the workaround; call the same writer
-  IN-PROCESS instead (`scratchpad/p50/apply_big.py` is the pattern).
-- ⛔ **MSYS ARGUMENT CONVERSION** — see §0.1. **A `| tail` MASKS THE EXIT CODE** — see §0.1.
-- ⚠⚠ **A `cd` PERSISTS BETWEEN Bash TOOL CALLS.** ✔Paid again in P50: a `cd .worktrees/t2` made
-  the next call resolve a scratchpad path against the wrong root and report "No such file".
-- ⚠⚠ **AN INSTRUMENT THAT CANNOT RUN IS NOT A GREEN ONE.** ✔P50: a mutant driver reported
-  *"VACUOUS — the pin stayed green"* on an `rc=127` that was `bash` missing from the subprocess
-  PATH; the pin had never executed. **Separate CANNOT-RUN from RED from GREEN by the pin's own
-  terminal verdict line, never by the exit code alone.**
-- ⚠ **A LANE'S BUILD OUTPUTS CAN RIDE ITS EXAMPLE DIRECTORY INTO THE COMMIT.** ✔P50: lane `as`
-  left `outa/main` and `outar/main` inside its new `examples/c/…/` directory; `lane-fold` offered
-  them as sources. **Read the fold list before applying it.**
+- ⛔⛔ **A MUTANT ARM THAT CANNOT REPRODUCE ITS CONDITION IS NOT A GREEN ONE.** ✔P51, twice in my own
+  work on one fix: a red-on-disable driver ran under the inherited PATH, where Git's `usr/bin`
+  already came first, so the condition under test never occurred and the mutant read GREEN; the
+  next draft REPLACED PATH with a minimal list and every arm returned `configure rc=1` because
+  cmake had lost its own toolchain — vacuous again, for a new reason. **PIN the condition, then
+  ASSERT that a failure was the one you were testing for.**
+- ⛔⛔ **AND READ THE CONTROL, NOT ONLY THE MUTANT.** ✔P51: my first candidate-search fix walked ONE
+  directory level up from `git`, which is right for `<root>/cmd/git.exe` (PowerShell's PATH) and
+  wrong for `<root>/mingw64/bin/git.exe` (Git Bash's, same installation). **The CONTROL went red
+  beside the mutant**, and reading only the mutant's verdict would have shipped a fix that worked
+  from one shell and not the other.
+- ⛔ **`Copy-Item` PRESERVES mtime, so ninja rebuilds NOTHING.** ✔P51, lane `ei`: all three arms came
+  back green off ONE compilation, caught only by the object md5 not moving. **The md5 is not
+  ceremony.**
+- ⛔ **A CRASHING TEST SWALLOWS ITS OWN FAILING NAMES.** ✔P51, lane `np`: a mutant reported 2 of 3
+  names because the test ran on to structural reads over an ERROR tree and the process aborted
+  (`0xc0000409`) before gtest printed the third. Take a FATAL assert before any shape read.
+- ⛔ **A GUARD THAT CANNOT RUN MUST FAIL, NEVER VANISH.** ✔P51: `lane_worktree_guard`'s
+  registration was `if(bash_found)`, so on a host where the probe failed the entry ceased to exist
+  and the gate figure silently stopped covering it. It now registers a FAILING `cmake -P` refusal.
+- ⚠ **A registry cell can go false while the prose it was copied from stays true.** ✔P51: **32 of
+  the 67 banded rows had a `Priority` cell contradicting their own banner**, 11 of them UNDER-rated,
+  including two `P0 WRONG-OUTPUT` rows filed P2. `check-anchor-balance` ARM 6 tests exactly this
+  shape one column over, for `Status`, and there is no arm for `Priority` — **that arm is the
+  predicate for the next cycle: it must ACCEPT a row whose banner declares no band and reject ONLY
+  a contradiction**, since 444 of 511 open rows declare none.
+- ⛔ **A quoted heredoc EATS BACKSLASHES, and so does an inline `python -c` through Git Bash.** Paid
+  again in P51 on a regex full of them. Any throwaway script goes in a FILE, asserting by
+  `os.path.realpath` PREFIX that it is not inside the repository before it deletes anything.
+- ⛔ **`cmd && cmd2` ON ONE LINE HID A FAILED `cp` AND COST A LANE ITS ENTIRE EVIDENCE TREE** (P50).
+  `lane-worktree remove` now REFUSES unless given `--preserve-to <dir>` or `--discard-scratchpad`.
+  **Use `--preserve-to`. Never hand-roll the copy.**
+- ⛔ **A Windows command line caps near 32 KB**; call the writer IN-PROCESS instead
+  (`scratchpad/p51/mint_row.py` and `apply_big.py` are the pattern). ⚠ A registry write can also
+  fail with `PermissionError` on `os.replace` from a transient lock — ✔P51: it left a `.anchors-tmp`
+  beside the file and **applied nothing**, which is `anchors.py`'s P50 append-first ordering working.
+  Verify the census, remove the temp, retry.
+- ⚠⚠ **A `cd` PERSISTS BETWEEN Bash TOOL CALLS.** ⛔ **`grep -P` IS UNUSABLE ON THIS HOST** and
+  returns 0 silently. ⚠ **PowerShell expands `$?` inside DOUBLE quotes** before bash sees it —
+  single-quote any string carrying shell metacharacters.
+- ⚠ **The macOS login shell prints an EMSDK banner on EVERY non-interactive command**, and it
+  interleaves into captured output. Match on explicit markers, never on line or column position.
 
-## §0.5 — P50 IN ONE PARAGRAPH
+## §0.5 — The P51 gate, ✔MEASURED at the folded tree
 
-**One solo item, then four lanes at the cap.** The cycle opened with the operator-ruled
-segment-threshold flip (landed alone as `67714dad`), then wave 1: `li ch as t2`.
-✔`check-anchor-balance --base 67714dad` ⇒ **closed 5, opened 2, net −3** COUNTED; **7 closed
-and 2 opened IN TRUTH**, because two rows were born-closed inside the cycle and the gate counts
-rows by NAME [[feedback-the-gate-cannot-see-a-row-born-in-the-cycle]]. Registry OPEN
-**841 → 838**; buckets **PRODUCTION 324 · harness 189 · per-plan 323**, which sums to the gate's
-own denominator. ⚠ Both OPENED rows are P51's first items and each NAMES why it was not taken
-now — the ruling's "brutally rare exception" clause satisfied explicitly rather than by silence.
+Every leg through `scripts/run-gate/`, whose exit 0 means **rc=0 AND the success witness was found
+in the log** — it refuses to call a run successful on an exit code alone.
 
-**The flip.** `check-anchor-registry`'s core moved `{2,}` → `{1,}` in BOTH twins with four new
-self-test arms each (17 → 21), taking **distinct src-cited anchors under guard 1548 → 1652
-(+104)**. 98 guard self-test fixture ids stopped being anchor-shaped in SOURCE while every
-RUNTIME value stayed byte-identical — `check-anchor-balance.py` alone took 172 token-exact seam
-edits applied through Python's tokenizer so a seam could not land inside the wrong literal.
-⚠ **Two of my own instrument errors were caught by RUNNING the flipped guard rather than trusting
-the planning scan**, and the second is the instructive one: my re-measurement of the twelve
-outside-`scripts/` danglers was CIRCULAR — three resolved only through the disclosure row's own
-sizing prose, which my closure then rewrote.
+| leg | result |
+|---|---|
+| Windows x86_64 (**includes the 22 repo guards**) | **1907 / 1907** |
+| WSL x86_64 | **1885 / 1885** |
+| arm64-VPS (native) | **1885 / 1885** |
+| macOS arm64 | **1885 / 1885** |
 
-**What the lanes landed.** `li` closed the linkage-mismatch and `_Noreturn`-on-object rows;
-`ch` routed three target-blind char-signedness sites through the one target-aware chokepoint;
-`as` landed R5 plus the class-scoped modifier letters its own precondition named; `t2` took the
-sqlite round-trip table **12 → 40 of 40**, closing `D-SQLITE-CLI-BUILT-ON-NO-LEG`.
+★ **1885 = 1907 − 22, and that identity holding on THREE independent remote hosts is the cross-leg
+cross-check** — the remote legs run `-LE repo-guard` (their own output says `ctest (guards
+skipped)`), so a remote total that is not exactly the Windows total minus the root-host-only guards
+means the hosts did not test the same tree.
 
-★★ **THREE OF THE FOUR LANES REFUTED THE BRIEF I GAVE THEM, TWICE IN THE DIRECTION THAT WOULD
-HAVE SHIPPED A CONFORMANCE REGRESSION.** `li`'s linkage row carried a gcc-only matrix; ✔MSVC
-19.51 SILENTLY ACCEPTS most static-vs-non-static orderings, so the unanimous-reject set the
-disjunction permits is far narrower than the row demanded — and `static int f(void);
-int f(void){…} static int f(void);` is unanimously ACCEPTED, C 6.2.2p4 inheritance, so the fix
-needed propagation across the merge and not just a check. `li`'s `_Noreturn` row demanded a hard
-error "expecting unanimous rejection"; ✔**gcc ACCEPTS every non-function `_Noreturn` with a
-warning**, so under the disjunction DSS must accept, and it closed as a WARNING. `as` found the
-references SPLIT on an FP letter applied to an immediate, and that the arm64 dialect comment's
-claim that FP letters render EMPTY on `"r"` operands was simply false. ⇒
-[[feedback-a-brief-premise-is-a-hypothesis]], again, and the briefs were mine.
+⚠⚠ **THE WINDOWS LEG WENT RED THE FIRST TIME AND MY OWN SHELL LINE ALMOST HID IT.** It came to
+1906/1907 with `plan_citations_guard` FAILED and run-gate `rc: 8` — while **the harness reported the
+command's exit code as 0**, because I had written `bash run-gate.sh …; echo "rc=$?"` and the
+trailing `echo` became the command's exit status. This is §0.4's rule in a spelling it did not
+have: I did not PIPE the verdict, I APPENDED to it, and the effect was identical. **run-gate's log
+is what carried the truth.** Re-run with no trailing echo: **1907/1907, rc=0**.
 
-⚠⚠ **AND TWO INSTRUMENTS OF MINE DESTROYED EVIDENCE BEFORE I FIXED THEM. Both are born-closed
-harness rows, and both failed in the direction whose RESULT LOOKS LIKE SUCCESS.**
-(1) [[D-CYCLE-LANE-WORKTREE-REMOVE-DISCARDS-AN-UNPRESERVED-SCRATCHPAD]] — I ran
-`cp -r … && echo preserved` and `lane-worktree remove t2` on ONE command line; the destination's
-parent did not exist, `cp` failed, `&&` swallowed the echo, and **the ABSENCE of output read as
-success** while the next command destroyed the only copy. Lane `t2`'s 14 result JSONs and its md5
-ledger are gone; its row states the loss rather than citing a path that will not open. The same
-command was correct for `gi` and `tw` in P49 only because that parent happened to exist.
-(2) [[D-GATE-ANCHORS-A-MOVE-IS-NOT-ATOMIC-AND-LOST-A-ROW]] — `anchors.py`'s close-as-move DELETED
-a row from production and failed to append it to the archive, leaving it in **NO registry at
-all**. ★ **`check-anchor-balance` counts OPEN rows BY NAME, so a vanished row reads EXACTLY like
-a closed one** — silent loss reported as progress. Recovered from `git show HEAD:` (never
-`git checkout --`, which would have discarded four legitimate closures in the same file), and a
-full census — every row NAME at HEAD across all three registries against the working tree,
-**2083 → 2084, zero vanished** — proved nothing else had been lost.
+⇒ **The cause was the move-on-close ratchet interaction, and the honest verb was the burn-down
+one.** Closing seventeen rows MOVED them out of `_deferred-anchor-registry-production.md`, and their
+positional citations moved with them, leaving `ceiling 341, actual 334` — unclaimed headroom, which
+`check-plan-citations` refuses because that headroom is where the next citation hides.
+`--write` (the BURN-DOWN verb, which can only LOWER and refuses to launder a new citation) lowered
+exactly that one ceiling and touched nothing else. **NOT `--baseline`** — its own header says *"Do
+NOT reach for `--baseline` to make a red go away"*; P50 needed it only because the archive's count
+ROSE past its ceiling, which did not happen here. ⓘ The guard's own success line calls itself
+**DEBT, not a pass**: the plans still cite 2750 line numbers.
 
-## §0.6 — THE NEXT SET
+ⓘ **SCOPE OF THAT RE-RUN, STATED RATHER THAN GLOSSED:** the only file the fix changed is
+`scripts/check-plan-citations/inventory.json`, read solely by a repo guard. The three remote legs
+run `-LE repo-guard` and had already synced, so their verdicts are untouched by it and were NOT
+re-run. Only the Windows leg carries the guards.
 
-**1. `D-CSUBSET-LINKAGE-INHERITED-INTERNAL-EMITS-GLOBAL`** (P1, opened by P50) — DSS REFUSES a
-legal two-TU C program. P50 shipped the semantic half (`SymbolRecord.isInternalLinkage`, OR-
-propagated across every merge) and the EMISSION half never asks it: `cst_to_hir`'s linkage fold
-reads the definition's own specifier tokens, so an inherited-internal definition emits GLOBAL and
-two such TUs collide at `K_SymbolRedefinedAcrossUnits`. All three references build and run it.
-**The closing predicate is in the row**; the pin must be a TWO-TU example, a shape the corpus does
-not yet have.
+✔**BOTH REMOTE HOSTS RE-VERIFIED DIRECTLY AFTER THEIR LEGS**, not inferred from the leg's own exit:
+HEAD at the driver commit, `git status` **rc=0** with **0 dirty**, **1 worktree**. The rc matters —
+a failed `git status` piped to a counter also reads 0 dirty. `leg-tree` restored each host and
+reported which build roots it deliberately KEPT (cold rebuilds are expensive); those roots now sit
+over a tree they were not built from, so **rebuild before trusting a binary from one**.
 
-**2. `D-CSUBSET-NORETURN-KEYWORD-PARAMETER-AND-TYPEDEF-POSITIONS`** (P2, opened by P50) — the
-`_Noreturn` keyword is a PARSE error in a parameter's specifiers and in a typedef head while gcc
-accepts both. Below the union; grammar-alternative work in `c.lang.json`, and the semantic arm
-that gives it meaning already shipped in P50.
+## §0.6 — Where the evidence is
 
-**3. `D-SCRIPT-GUARDS-ASK-GIT-FROM-THE-LANE-WORKTREE`** — enumeration-root must equal read-root.
-Opened in P47, untaken by P48, P49 and P50. **Three cycles old and well past the exception
-boundary. Take it or state plainly why not.**
+Every lane's scratchpad was preserved by `lane-worktree remove --preserve-to` before the worktree
+was destroyed, and the counts were verified on both sides: `scratchpad/p51/{el,np,mx,gw,fa,ei,ld,in,ap}/`
+(131, 57, 44, 36, 20, 172, 54, 185, 31 files respectively). The orchestrator's own instruments —
+the priority census and its over-loose first draft, the registry appliers, the bash-candidate mutant
+driver — are in the session scratchpad and named in the rows that used them.
 
-**4. `D-CSUBSET-C11-THREADS-MACHO-MTX-PLAIN-RECURSIVE`** — still the one `<threads.h>` item open,
-a mutex TYPE rather than a function. Small, bounded, finishes the header.
+---
 
-**Then the production P0 band, ✔re-derived at the tip** with
-`python scripts/burndown-queue/burndown-queue.py --band P0 --schedulable`. ⚠ **The band is a sort
-key, not a verdict — read the row before acting on it.** At the tip of P50:
+★★★ **P50: ONE SOLO ITEM AND THEN FOUR LANES AT THE CAP — SEVEN ROWS CLOSED, FIVE OF THEM VISIBLE TO THE GATE, AND BOTH OF THE CYCLE'S SHARPEST FINDINGS WERE DEFECTS IN MY OWN INSTRUMENTS.** ✔`check-anchor-balance --base 67714dad` ⇒ **closed 5, opened 2, net −3** COUNTED; **7 closed and 2 opened IN TRUTH**, two rows born-closed inside the cycle. Registry OPEN **841 → 838**. The solo item was the operator's R3 from P49 — the anchor guard's segment threshold flipped from `{2,}` to `{1,}`, putting **+104 previously invisible ids** under the guard and seaming 98 self-test fixtures. Wave 1 was `li ch as t2`, every lane from the PRODUCTION bucket.
 
-- `D-CSUBSET-INLINE-FUNCTION-SPECIFIER` — ⚠ read its own text first: the specifier SHIPPED in
-  TF-C79 and the row stays open only for witnesses (b) and (c), which are re-measurements of two
-  consumer rows. It may be closable by measurement alone.
-- `D-CSUBSET-PACKED-ATOMIC-MEMBER` and `D-CSUBSET-PACKED-BITFIELD-INTERACTION` — both were
-  ⏳ GATED on `D-CSUBSET-PACKED`, which is ✅ CLOSED, so **the gate has fired and both are
-  takeable**. ⓘ The ATOMIC one may be MOOT: `_Atomic` is not yet modelled as a type qualifier, so
-  the shape may be inexpressible — measure before designing.
-- `D-CSUBSET-POINTER-ARITH-ENUM-INDEX` — guarded fail-loud, not a crash; needs `hir_to_mir`.
-- `D-FC7-INLINE-MULTI-PIECE-RETURN` — banded P0 by the sieve but its own text says **P2
-  DIVERGENT/LOW**; the silent-miscompile half closed in 2026-06-16. A band-vs-row disagreement,
-  and the row wins.
-- `D-TARGET-ENCODING-WIDTH-GUARD` — likewise self-described **P4 RECORD/LOW**, rewritten to
-  post-FC3.5 truth. Read before scheduling.
+★★ **THREE OF THE FOUR LANES REFUTED THE BRIEF I GAVE THEM, EACH IN THE DIRECTION THAT WOULD HAVE SHIPPED A REGRESSION.** `li` found the linkage row's matrix was gcc-only: **MSVC 19.51 SILENTLY ACCEPTS most `static`↔non-`static` redeclaration orderings** (`dumpbin` shows the accepted function cases landing `Static | f`, internally consistent), so the unanimous-reject set the disjunction permits is far narrower than the row claimed — and a `static`-first ordering is legal C 6.2.2p4/p5 INHERITANCE, so the fix needed propagation across the merge rather than a check. Its second row demanded a hard error and predicted unanimous rejection; **FALSE — gcc accepts every non-function `_Noreturn` with a warning and drops the specifier**, so it closed as a suppressable WARNING instead. `ch` found the char-signedness row WIDER than recorded (`mapBinaryOp`'s local list also drove the ordered comparisons, so a raw `char <` was `ICmpUlt` target-blind) and re-measured reachability rather than inheriting a 2026-07-24 premise. `as` found gcc and clang **SPLIT** on an FP modifier letter applied to an immediate, and that the arm64 dialect comment's claim that FP letters "render EMPTY" on `"r"` operands was simply false — both references hard-error.
 
-⚠ **PICK NON-CONFLICTING FILE SETS.** The two `PACKED` rows and the `INLINE` row plausibly contend
-in `src/analysis/semantic/**`; the enum-index row wants `src/mir/lowering/hir_to_mir.cpp`, which
-P50's `ch` lane held. Use `scripts/lane-worktree/` + `scripts/lane-fold/` so the check is
-mechanical rather than remembered.
+⚠⚠ **THE TWO INSTRUMENT DEFECTS, BOTH BORN CLOSED, BOTH FAILING IN THE DIRECTION WHOSE RESULT LOOKS LIKE SUCCESS.** [[D-CYCLE-LANE-WORKTREE-REMOVE-DISCARDS-AN-UNPRESERVED-SCRATCHPAD]]: I destroyed lane `t2`'s entire evidence tree — `cp -r … && echo preserved` and `lane-worktree remove t2` on ONE line, the destination's parent did not exist, `cp` failed, `&&` swallowed the echo, and **the ABSENCE of output read as success**. The identical command had been correct for two earlier lanes only because that parent happened to exist. `remove` now REFUSES a lane whose scratchpad holds files unless given `--preserve-to` (it does the copy and verifies both sides) or `--discard-scratchpad`. [[D-GATE-ANCHORS-A-MOVE-IS-NOT-ATOMIC-AND-LOST-A-ROW]]: closing a row DELETED it from production and failed to append it to the archive, leaving it in NO registry — and **`check-anchor-balance` counts OPEN rows BY NAME, so a row that vanishes from every file reads EXACTLY like a row that was CLOSED**. Silent loss reported as progress. Fixed by ORDER rather than locking: every destination's content is computed before anything is written and the APPEND goes FIRST, so an interruption leaves a duplicate — which `place_row` already refuses loudly — instead of a disappearance, which nothing can see.
 
-★★ **AND THE OPERATOR'S STANDING NOTE STILL GOVERNS:** *"treat its predicates as measured claims,
-not settled law, and tell me when one blocks honest work rather than routing around it."* Two of
-the five rows listed above disagree with their own band; three lanes refuted their briefs this
-cycle. **Read the row, not the summary.**
+★ **`t2` closed [[D-SQLITE-CLI-BUILT-ON-NO-LEG]]** by taking Table 2 (the round trip) from 12 to **40 of 40** with ZERO structural skips, every payload sha256-re-hashed on the run host before any assertion. ⚠ **QUALIFICATION THAT MUST TRAVEL WITH IT:** every payload records `hasReference: false`, so those 40 cells prove each artefact RUNS CORRECTLY on its target platform — they are **NOT** a DSS-vs-gcc differential.
+
+**Gate, ✔MEASURED at the folded tree, every leg through `scripts/run-gate/`:** Windows **1884/1884** (all 21 repo guards) · WSL x86_64 **1863/1863** · arm64-VPS **1863/1863** · macOS **1863/1863** — 1863 = 1884 minus the 21 root-host-only guards, and that identity is the cross-leg cross-check. ⚠ That Windows figure was later found to be **PATH-dependent rather than a property of the tree** — see P51.
 
 ---
 

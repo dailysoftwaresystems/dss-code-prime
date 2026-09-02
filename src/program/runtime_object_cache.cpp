@@ -545,7 +545,7 @@ private:
     // which is why it stays. What it forbids is a SILENT degradation — success
     // reported while every later build recompiles the same unit, the cost
     // permanent and invisible. This function is the loud half of that bargain;
-    // the caller's obligation is to SAY SO, and `reportRuntimeCacheNote` in
+    // the caller's obligation is to SAY SO, and `reportDriverNote` in
     // `program.cpp` prints this text verbatim on every affected build.
     return std::format(
         "runtime object cache: a cache MISS could not be WRITTEN, so the "

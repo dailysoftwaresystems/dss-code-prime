@@ -9968,3 +9968,398 @@ TEST(HirLoweringC, GnuConstructorOnThePrototypeSurvivesToTheDefinition) {
     EXPECT_EQ(*s.beforeEntry(), 101u) << "…with its PRIORITY intact, not merely "
                                          "the fact that a schedule exists";
 }
+
+// ★★ D-CSUBSET-LINKAGE-INHERITED-INTERNAL-EMITS-GLOBAL (C 6.2.2p4/p5).
+//
+// A plain definition whose linkage is INHERITED from a visible prior `static`
+// declaration is INTERNAL, and until P51 the HIR linkage fold read only the
+// definition's OWN specifier tokens — a bare `int f(void){…}` carries no
+// `static`, so it emitted `Global`. Single-TU programs could not see it (nothing
+// contradicts a binding inside one image); the two-TU corpus example
+// `examples/c/linkage_inherited_internal_crosscu` is where it became a REFUSAL
+// of a legal program. THIS pin is the unit-tier statement of the same fact, and
+// it is the one that names the axis directly rather than through an exit code.
+//
+// Both halves of the shape are pinned because they reach the emission arm by
+// DIFFERENT routes: the function definition outranks a PROTOTYPE in the
+// redeclaration merge, the initialized object definition outranks a TENTATIVE.
+TEST(HirLoweringC, InheritedInternalLinkageReachesTheEmittedBinding) {
+    struct Case {
+        char const* what;
+        char const* src;
+        char const* name;
+        SymbolBinding want;
+    };
+    for (Case const c : {
+             // THE DEFECT, function half: the definition has no `static` token.
+             Case{"function inheritance",
+                  "static int f(void);\n"
+                  "int f(void){ return 21; }\n"
+                  "int main(void){ return f(); }\n",
+                  "f", SymbolBinding::Local},
+             // THE DEFECT, object half: the INITIALIZED definition outranks the
+             // `static` tentative and becomes the emitting declaration.
+             Case{"object inheritance",
+                  "static int g;\n"
+                  "int g = 3;\n"
+                  "int main(void){ return g; }\n",
+                  "g", SymbolBinding::Local},
+             // CONTROL, and the one that would catch an over-reach: with NO
+             // prior `static` the identical definition shapes must stay
+             // externally visible. A fix that read the record unconditionally —
+             // or that confused "has a record" with "is internal" — makes these
+             // Local and hides every symbol from the linker.
+             Case{"external function control",
+                  "int h(void);\n"
+                  "int h(void){ return 21; }\n"
+                  "int main(void){ return h(); }\n",
+                  "h", SymbolBinding::Global},
+             Case{"external object control",
+                  "int gg;\n"
+                  "int gg = 3;\n"
+                  "int main(void){ return gg; }\n",
+                  "gg", SymbolBinding::Global},
+             // CONTROL on the other side: the path that ALREADY worked (the
+             // definition spells `static` itself) must be unchanged, so a green
+             // first arm cannot be the fix having simply forced Local everywhere.
+             Case{"explicit static definition",
+                  "static int s(void){ return 21; }\n"
+                  "int main(void){ return s(); }\n",
+                  "s", SymbolBinding::Local},
+             // CONTROL for the FALLBACK-not-override half. `weak` is a linker
+             // binding, not a 6.2.2 linkage class, and the record consult is
+             // guarded on `binding == Global` (= "the tokens specified none")
+             // precisely so a specified binding survives. Drop that guard and
+             // this arm is the only one that moves.
+             Case{"weak is not overridden",
+                  "__attribute__((weak)) int w(void){ return 21; }\n"
+                  "int main(void){ return w(); }\n",
+                  "w", SymbolBinding::Weak},
+         }) {
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors()) << c.what;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr) << c.what;
+        ASSERT_TRUE(res->ok) << c.what << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(declaredBinding(*res, model, c.name), std::optional{c.want})
+            << c.what << " — `" << c.name << "`. `std::nullopt` would mean the "
+               "declaration emitted no module decl at all, which is a different "
+               "failure from a wrong binding and must not read as one";
+    }
+}
+
+// The INHERITANCE is a property of the merge SURVIVOR, not of adjacency, so a
+// third declaration between the `static` and the definition must not lose it —
+// and the `static` may equally arrive AFTER the definition (the unanimously
+// accepted `static int f(void); int f(void){…} static int f(void);` triple, plus
+// the ordering where the plain PROTOTYPE comes first). Each of these folds a
+// different pair through `mergeOrCollideRedeclaration`; all must land Local,
+// because the OR-propagation is what carries the fact and this pin is what
+// notices if the emission tier starts reading the LAST declaration's tokens
+// instead of the record.
+TEST(HirLoweringC, InheritedInternalLinkageSurvivesEveryDeclarationOrdering) {
+    for (char const* prelude : {
+             "static int f(void);\nint f(void){ return 21; }\n",
+             "static int f(void);\nstatic int f(void);\nint f(void){ return 21; }\n",
+             "static int f(void);\nint f(void);\nint f(void){ return 21; }\n",
+             "static int f(void);\nint f(void){ return 21; }\nstatic int f(void);\n",
+         }) {
+        std::string const src =
+            std::string(prelude) + "int main(void){ return f(); }\n";
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors()) << prelude;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr) << prelude;
+        ASSERT_TRUE(res->ok) << prelude << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(declaredBinding(*res, model, "f"),
+                  std::optional{SymbolBinding::Local})
+            << prelude << " — the definition inherits internal linkage from the "
+               "`static` declaration wherever it sits in the chain; `Global` is "
+               "the emission tier reading tokens again";
+    }
+}
+
+// ★★★ THE SEMANTIC-TIER TWIN OF
+// D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED —
+// the SEMANTIC tier's
+// `scanSpecifierPrefixStorage` resolved a declaration-specifier KEYWORD worn as
+// an attribute CLAUSE NAME against that keyword's own `linkageSpecifiers` entry.
+// P42 fixed exactly this class in the HIR twin `linkageFrom`
+// (D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED);
+// the semantic scan kept the defect for four cycles because its ONE consumer
+// was a diagnostic predicate, where a wrong answer is a missed message rather
+// than wrong bytes.
+//
+// ★ THESE PINS LIVE IN THE HIR FILE ON PURPOSE, NOT FOR CONVENIENCE. Two of the
+// three consequences are only visible from here: the BINDING half is a HIR
+// residue, and `analyzeC` hands back the SemanticModel with its own reporter, so
+// the semantic half is readable through `model.diagnostics()` at the same seam.
+// A third consequence — the missing 6.2.2p7 mismatch on
+// `__attribute__((static)) int gv = 1; static int gv;` — needs a
+// `tests/analysis/semantic/` pin and is NOT written here; see the row.
+//
+// gcc 13.3.0 and clang 18.1.3 were probed SEPARATELY on every arm below and
+// WARN-AND-IGNORE all of them (`'static' attribute directive ignored` /
+// `unknown attribute 'static' ignored`), building and running each program.
+TEST(HirLoweringC, KeywordSpelledAttributeNameConfersNoStorageClass) {
+    // THE BINDING HALF. `Local` here is the symbol LEAVING the object: with the
+    // P51 emission consult reading `isInternalLinkage`, a mis-mint stops a
+    // sibling TU from linking `extern int gv;` at all.
+    for (char const* spec : {"__attribute__((static))",
+                             "__attribute__((__static__))",
+                             "__attribute__((constexpr))",
+                             "__attribute__((__constexpr__))"}) {
+        std::string const src = std::string(spec)
+            + " int gv = 1;\n"
+              "int main(void){ return gv - 1; }\n";
+        SemanticModel model = analyzeC(src);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr) << spec;
+        EXPECT_EQ(declaredBinding(*res, model, "gv"),
+                  std::optional{SymbolBinding::Global})
+            << spec << " — a storage class is a DECLARATION SPECIFIER; C has no "
+                       "attribute form of one, and both references keep `gv` "
+                       "exported (nm: `D gv`). `Local` is the symbol vanishing "
+                       "from the object";
+    }
+    // THE THREAD-STORAGE HALF, and it was the loudest: a mis-minted
+    // `isThreadLocal` reached Pass 2's 6.7.1 constraint check, so DSS REFUSED
+    // (rc=1, S_ThreadLocalOnFunction) a program both references build and run.
+    for (char const* spec : {"__attribute__((thread_local))",
+                             "__attribute__((__thread_local__))",
+                             "__attribute__((_Thread_local))"}) {
+        std::string const src = std::string(spec)
+            + " int tf(void) { return 0; }\n"
+              "int main(void){ return tf(); }\n";
+        SemanticModel model = analyzeC(src);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_ThreadLocalOnFunction), 0u)
+            << spec << " — the attribute confers no thread storage, so the "
+                       "6.7.1 constraint check has nothing to fire on. A count "
+                       "of 1 is a legal program REFUSED";
+    }
+    // THE MISSING-DIAGNOSTIC HALF, and it is the arm that fails in the OTHER
+    // direction — everything above is DSS saying too much, this is DSS saying
+    // nothing. The mis-mint made the attribute-spelled declaration look
+    // INTERNAL, so `mergeOrCollideRedeclaration`'s `priorPlainDefining` was
+    // false and the 6.2.2p7 conflict went unreported. gcc: `error: static
+    // declaration of 'gv' follows non-static declaration`; clang: the same
+    // error; DSS: rc=0 and silence (✔MEASURED before the fix).
+    //
+    // ⓘ This is a SEMANTIC-tier diagnostic pinned from the HIR suite on
+    // purpose: `analyzeC` returns the model with its own reporter, so the seam
+    // is reachable here and no `tests/analysis/**` pin is needed for it.
+    {
+        SemanticModel model = analyzeC(
+            "__attribute__((static)) int gv = 1;\n"
+            "static int gv;\n"
+            "int main(void){ return gv; }\n");
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_LinkageRedeclarationMismatch), 1u)
+            << "the attribute leaves `gv` EXTERNAL, so the later `static` is the "
+               "6.2.2p7 conflict both references reject. 0 is the missed "
+               "diagnostic the position-blind mint caused";
+    }
+    // …and the CONTROL for it, because a count of 1 above could equally come
+    // from a check that fires on everything: two REAL `static` declarations are
+    // a legal redeclaration of an internal identifier and must stay silent.
+    {
+        SemanticModel model = analyzeC(
+            "static int gv = 1;\n"
+            "static int gv;\n"
+            "int main(void){ return gv - 1; }\n");
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_LinkageRedeclarationMismatch), 0u)
+            << "two `static` declarations agree about linkage; a diagnostic here "
+               "would be a legal program refused";
+    }
+}
+
+// ★★ THE CONTROLS, AND THEY CARRY THE WHOLE RISK OF THE FIX ABOVE. The scan now
+// skips the language's attribute-specifier shapes wholesale, and the cheap wrong
+// version of that — skipping attributes everywhere the linkage vocabulary is
+// read — would SILENTLY LOSE `weak` and `visibility`, which are attribute names
+// and legitimately live inside `attrSpec`. Only these arms can tell the two
+// apart: they assert the attribute vocabulary still APPLIES while the keyword
+// vocabulary is denied, which is the exact line the fix had to draw.
+TEST(HirLoweringC, AttributeVocabularyStillAppliesAfterTheKeywordDenial) {
+    struct Case { char const* src; char const* name; };
+    // `weak` and `visibility` reach the HIR fold through the SAME `attrSpec`
+    // subtree the storage scan now refuses to enter, so a fix applied one tier
+    // too wide reds here and nowhere else.
+    {
+        SemanticModel model = analyzeC(
+            "__attribute__((weak)) int wv = 1;\n"
+            "int main(void){ return wv - 1; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_EQ(declaredBinding(*res, model, "wv"),
+                  std::optional{SymbolBinding::Weak})
+            << "`weak` is an ATTRIBUTE NAME and must still bind; `Global` means "
+               "the attribute subtree stopped being read at all";
+    }
+    {
+        SemanticModel model = analyzeC(
+            "__attribute__((visibility(\"hidden\"))) int hv = 1;\n"
+            "int main(void){ return hv - 1; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_EQ(declaredVisibility(*res, model, "hv"),
+                  std::optional{SymbolVisibility::Hidden})
+            << "the COMPOSITE attribute key must still resolve through the same "
+               "subtree";
+    }
+    // THE ALREADY-IMMUNE ROWS. Three of the four shipped `linkageSpecifiers`
+    // rows list `attrSpec` in `linkageSpecifierIgnoredRules` and were never
+    // exposed; the new skip must be a byte-for-byte no-op on them. A block-scope
+    // declaration routes through one of those rows, so these two arms are the
+    // control that the change did not reach where it had no business.
+    {
+        // A REAL block-scope `static` still confers static storage: the local is
+        // promoted to a hidden module global, so it retains its value.
+        SemanticModel model = analyzeC(
+            "int bump(void){ static int x = 0; x = x + 1; return x; }\n"
+            "int main(void){ bump(); return bump(); }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(declaredBinding(*res, model, "x"),
+                  std::optional{SymbolBinding::Local})
+            << "the static local is still emitted as an internal module global; "
+               "`nullopt` means the promotion stopped happening";
+    }
+    {
+        // …and the attribute spelling still confers NONE, at block scope too.
+        SemanticModel model = analyzeC(
+            "int bump(void){ __attribute__((static)) int x = 0; x = x + 1; "
+            "return x; }\n"
+            "int main(void){ bump(); return bump(); }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_EQ(declaredBinding(*res, model, "x"), std::nullopt)
+            << "an attribute-spelled `static` promotes nothing, so there is no "
+               "module-level declaration for `x` at all — it stays an automatic "
+               "local, which is what both references do";
+    }
+}
+
+// ── P51 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the LINKAGE-tier truth table
+//    over the four baseline spellings ─────────────────────────────────────────
+//
+// That row's closing witness is "the 4 baseline spellings compile AND the
+// emitted symbol's LINKAGE is asserted for each (red-on-disable at the linkage
+// tier, never 'it parses')". ✔MEASURED P51: what the tree already carried was
+// the SEMANTIC bit (`SemanticAnalyzerC.InlineDefinitionFollowsC99Quantifier`
+// asserts `SymbolRecord::isInline`) and the OBSERVABLE consequence (the
+// `examples/c/inline_c99_*` exit codes). Neither states what this tier decides —
+// which of {an ExternFunction declaration and no emitted body}, {an emitted
+// definition with internal binding}, {an emitted definition with external
+// binding} the declaration produces. That decision is `lowerInlineDefinitionAsDeclaration`,
+// and this is the tier at which it is nameable.
+//
+// ★ EVERY EXPECTATION IS GROUND TRUTH FROM A REAL TOOLCHAIN. Each row was
+// MEASURED with `gcc 13.3.0` and `clang 18.1.3`, `-std=c99` AND `-std=gnu17`,
+// `-O0 -c` + `nm`, on this exact source shape; mingw-w64 gcc 13.2.0 agrees on
+// all four. The `nm` column each row names is what it is asserting a DSS
+// equivalent of:
+//   `inline`          -> `U p`  — no external definition in this TU, and the
+//                                 reference survives, so the linker sees an
+//                                 undefined symbol (it does: DSS reports
+//                                 K_SymbolUndefined on this program at debug).
+//   `static inline`   -> `t p`  — internal linkage, emitted.
+//   `extern inline`   -> `T p`  — 6.7.4p7's with-extern exemption, emitted.
+//   `extern __inline` -> `T p`  — the same, through the GNU spelling.
+//
+// ★★ THE THREE COLUMNS ARE NOT REDUNDANT, and that is why this is a table
+// rather than three assertions. `externDecl` alone cannot tell a suppressed
+// definition from one that was never lowered; `marked` alone cannot tell an
+// unmarked body from an absent one; `binding` alone is Global for two rows that
+// differ in everything else. Only the triple names one cell of the truth table.
+//
+// ⚠ WHAT THIS DELIBERATELY DOES NOT CLAIM. `static inline`'s `t` column is
+// about INTERNAL LINKAGE, which this tier records as `SymbolBinding::Local`.
+// ✔MEASURED P51 at the object tier: a DSS-emitted `elf64-x86_64-linux`
+// relocatable carries NO symbol-table entry at all for an internal-linkage
+// function — for `static inline int p` and for a plain `static int p` alike —
+// where gcc and clang both emit `t p`. That divergence is a property of `static`,
+// not of `inline` (the plain-`static` control shows it identically), so it is
+// reported rather than pinned here; this row asserts the linkage DSS records,
+// which is the fact `inline` is responsible for.
+//
+// RED-ON-DISABLE (REMOVE direction), ✔EXERCISED P51: delete the `__inline` and
+// `__inline__` rows from the `keywords` table in `c.lang.json` — the C99 word
+// left alone — and this test FAILS by name, on the `extern __inline` row, while
+// `HirLoweringC` keeps its other 312 passes. The control on the other side is
+// the same run's five pure-`inline` corpus examples, which stay green.
+//
+// ⚠ AND THE MUTANT THAT DOES **NOT** REACH THIS TIER, ✔MEASURED P51 RATHER THAN
+// ASSUMED — the first draft of this comment named it and was WRONG. Deleting
+// `externSpecifierTokens` from `semantics.inline` flips `SymbolRecord::isInline`
+// to TRUE for all three `extern` spellings (`SemanticAnalyzerC`'s rows redden),
+// and NOTHING here moves: no row of this table changes, the corpus examples stay
+// green, and a DSS-emitted `elf64-x86_64-linux` object still shows `T p` for
+// `extern inline`. A definition whose `extern` is the DECLARATION RULE'S HEAD
+// does not reach `lowerInlineDefinitionAsDeclaration` at all, so on that route
+// the semantic bit is not what suppresses a body. Both facts are true and this
+// tier is the one that decides the artifact — which is precisely why this table
+// is not a restatement of the semantic truth table.
+TEST(HirLoweringC, InlineBaselineSpellingsCarryTheReferenceLinkageState) {
+    struct Row {
+        char const*   spelling;
+        std::size_t   externRows;   // an ExternFunction declaration was planted
+        bool          marked;       // ...and the body carries the 6.7.4p7 mark
+        SymbolBinding binding;
+        char const*   referenceNm;
+    };
+    static constexpr Row kRows[] = {
+        {"inline",          1u, true,  SymbolBinding::Global, "U p"},
+        {"static inline",   0u, false, SymbolBinding::Local,  "t p"},
+        {"extern inline",   0u, false, SymbolBinding::Global, "T p"},
+        {"extern __inline", 0u, false, SymbolBinding::Global, "T p"},
+    };
+    for (Row const& row : kRows) {
+        SCOPED_TRACE(row.spelling);
+        SemanticModel model = analyzeC(
+            std::string(row.spelling) + " int p(int x) { return x + 1; }\n"
+                                        "int main(void) { return p(41); }\n");
+        ASSERT_FALSE(model.hasErrors()) << row.spelling;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_TRUE(res->ok) << row.spelling;
+
+        EXPECT_EQ(externRowsNamed(*res, "p"), row.externRows)
+            << row.spelling << " — reference `nm` column " << row.referenceNm
+            << "; an ExternFunction row is DSS's spelling of `U p`, and exactly "
+               "one row must exist iff this TU provides no external definition";
+
+        HirNodeId const f = functionNamed(res->hir, model, "p");
+        ASSERT_TRUE(f.valid())
+            << row.spelling << " — the body is lowered in EVERY row (the "
+               "optimizer needs it even where it is never emitted); an absent "
+               "Function node means it was dropped, not suppressed";
+        bool const marked = res->inlineDefinitionMap.has(f)
+                            && res->inlineDefinitionMap.get(f).isInlineDefinition;
+        EXPECT_EQ(marked, row.marked)
+            << row.spelling << " — the 6.7.4p7 mark is what makes the optimizer's "
+               "strip epilogue drop the body; losing it on the first row emits a "
+               "second external definition, and setting it on the others deletes "
+               "a definition the program needs";
+
+        EXPECT_EQ(declaredBinding(*res, model, "p"),
+                  std::optional{row.binding})
+            << row.spelling << " — reference `nm` column " << row.referenceNm;
+    }
+}

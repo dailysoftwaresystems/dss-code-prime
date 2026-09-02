@@ -188,6 +188,19 @@ public:
     /// (`fs::create_directories`); failure surfaces as
     /// `D_OutputDirCreateFailed` (same code as the legacy
     /// `<cwd>/target/...` path's mkdir failure).
+    ///
+    /// D-AP2-OUTPUT-ROUTING (the `output`-field half): this is ALSO the seam a
+    /// project manifest's `output` lands on. `Program::compileProject` stamps it
+    /// from that field when — and only when — this is still unset, so the CLI
+    /// `--output` WINS (the `setStackReserveBytes` precedence rule, for the same
+    /// reason: a scalar cannot merge, and an explicit command-line argument
+    /// overrides a committed file). Because the manifest value arrives THROUGH
+    /// this setter rather than beside it, every reader of the base — the
+    /// per-target artifact router AND the dependency graph's
+    /// `artifactOutputBase` — follows the manifest automatically, with no second
+    /// copy of the rule to drift. The value is stored VERBATIM either way, so a
+    /// relative manifest `output` resolves against the process working directory
+    /// exactly as a relative `--output` does.
     void setOutputDir(std::optional<std::filesystem::path> dir) {
         outputDir_ = std::move(dir);
     }

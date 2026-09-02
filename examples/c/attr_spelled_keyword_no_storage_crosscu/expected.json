@@ -1,0 +1,16 @@
+{
+  "$comment": "The semantic-tier twin of D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED: a declaration-specifier KEYWORD worn as an attribute CLAUSE NAME confers NO storage class and NO linkage. The semantic tier's `scanSpecifierPrefixStorage` descended into the language's attribute-specifier subtrees and resolved `static` / `constexpr` / `thread_local` written as attribute names against those KEYWORDS' own `linkageSpecifiers` entries — one map holding two vocabularies, asked the wrong question, the same class P42 fixed in the HIR twin `linkageFrom`. TWO TUs because the worst consequence is a LINK-time one: the mis-mint marked `sharedCounter` internal, and once HIR emission began reading that mark (D-CSUBSET-LINKAGE-INHERITED-INTERNAL-EMITS-GLOBAL) the symbol LEFT provider.c's object and main.c's `extern int sharedCounter;` had nothing to bind — invisible in one TU, which never asks another unit for a symbol. provider.c also pins the STORAGE half (an attribute-spelled `static` local must stay AUTOMATIC: `step` re-zeroes on every call so each call adds exactly 2 — a promoted static would give 27, not 25) and the dunder CONTROL (`__static__`, which never reached the entry even before the fix because this scan does not dunder-normalize, unlike its HIR twin). 21 + 2 + 2 = 25. REFERENCES probed SEPARATELY 2026-09-01: gcc 13.3.0 and clang 18.1.3 both WARN-AND-IGNORE every spelling here ('static' attribute directive ignored / unknown attribute 'static' ignored) and both BUILD AND RUN, keeping the object exported (`nm` reports `D sharedCounter`). DSS emits H_UnknownLinkageSpecifier WARNINGS for the file-scope spellings and runs — deliberately not declared via `expectDiagnostics`, which routes an example down the compile-and-fail path and would forfeit the RUN that carries this pin. RED-ON-DISABLE: drop the attribute-shape skip in `scanSpecifierPrefixStorage` (src/analysis/semantic/semantic_analyzer.cpp) -> `sharedCounter` is minted internal, leaves the object, and the program fails K_SymbolUndefined. Legs mirror bare_proto_crosscu / block_scope_extern.",
+  "language": "c",
+  "sources": ["main.c", "provider.c"],
+  "exitCode": 25,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

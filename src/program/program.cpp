@@ -643,6 +643,34 @@ void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
     return fs::current_path() / "target" / formatName;
 }
 
+// D-AP2-OUTPUT-ROUTING (`output` field): do two output-dir BASES name the same
+// directory? Asked by `Program::compileProject` to decide whether a CLI
+// `--output` genuinely overrides a manifest `output`, or merely re-spells it —
+// `--output ./dist` and `"output": "dist"` are the same place, and announcing
+// that as an override would be a false alarm on a build where nothing was lost.
+//
+// LEXICAL, and it has to be: neither base need EXIST yet (`create_directories`
+// runs later, per target), so `canonical`/`PathIdentity` cannot answer. The
+// construction is `reportArtifactWritten`'s — `absoluteKeepingRoot` then
+// `normalizeKeepingRoot`, the pair that resolves a relative spelling against the
+// one cwd BOTH doors already use while leaving a leading separator RUN intact
+// [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]]. Bare
+// `lexically_normal` would map a `//host/share` base onto the local drive and
+// call two different directories equal — silence exactly where the caller most
+// needs the note.
+//
+// ⚠ FAILS TOWARD "DIFFERENT", never toward equal: a process with no usable cwd
+// cannot resolve either side, and the honest response to "I cannot tell" is to
+// TELL THE USER, not to suppress the line.
+[[nodiscard]] bool sameOutputBase(fs::path const& a, fs::path const& b) {
+    std::error_code ecA;
+    std::error_code ecB;
+    fs::path const absA = core::absoluteKeepingRoot(a, ecA);
+    fs::path const absB = core::absoluteKeepingRoot(b, ecB);
+    if (ecA || ecB) return false;
+    return core::normalizeKeepingRoot(absA) == core::normalizeKeepingRoot(absB);
+}
+
 // Compile one resolved (CU, target, format) triple to one artifact.
 // Returns THE ARTIFACT'S PATH on success; `std::nullopt` on failure,
 // with the reason already emitted via `reporter`.
@@ -1971,12 +1999,45 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         entryVerb = resolvedEntry->verb;
     }
 
+    // ── THE MERGE TIER'S OWN SNAPSHOT GATE ─────────────────────────────────
+    //
+    // ★★ THE MERGE IS A TIER AND IT WAS THE ONLY ONE WITHOUT A TIER GATE.
+    // Every other stage in this pipeline checkpoints `reporter.errorCount()`
+    // against the count it saw at entry (`compile_pipeline.cpp::tierClean` —
+    // a snapshot rather than `errorCount() == 0`, because the reporter is
+    // shared and upstream errors stay accumulated). The merge had only
+    // `if (!merged)`, and `mergeCuMirs` REPORTS each cross-unit strong
+    // redefinition and then returns a perfectly well-formed module in which
+    // one of the conflicting definitions has silently won.
+    //
+    // ⚠ THE COMMENT THAT USED TO SIT ON THE `if (!merged)` LINE ASSERTED THE
+    // MISSING BEHAVIOUR — it read *"merge failure (conflict / verify) already
+    // reported"*, and a CONFLICT never produced a merge failure. ✔MEASURED on
+    // the shipped CLI: `dsscp --compile a.c b.c` where both define `f` printed
+    // `dsscp: artifact …a.exe`, reported K_SymbolRedefinedAcrossUnits, exited
+    // 1, and left a runnable `a.exe` returning CU#1's answer.
+    //
+    // ★ THIS IS NOT THE SAME QUESTION `linker::writeBytes` NOW ASKS, and the
+    // two are not a duplicated truth table. This gate stops the WORK — there
+    // is nothing to gain from optimizing, lowering, assembling and linking a
+    // module already known to be semantically wrong, and every one of those
+    // tiers would be reasoning about a program the source does not describe.
+    // The writer's gate stops the ARTIFACT, for this tier and for every future
+    // one that forgets to add a gate here. Different scopes, one each.
+    //
+    // ⓘ Kept at the CALL SITE rather than inside `mergeCuMirs`: the merge's
+    // contract is "report what you found, hand back the best module you can",
+    // which the linker's own resolution follows too, and the tier gates in
+    // this pipeline all live at their call sites.
+    auto const mergeEntry = reporter.errorCount();
     auto merged = mergeCuMirs(
         std::span<MergeCuInput const>{mergeInputs.data(), mergeInputs.size()},
         std::move(host),
         std::span<std::string const>{entryNames.data(), entryNames.size()},
         reporter);
-    if (!merged) return std::nullopt;  // merge failure (conflict / verify) already reported.
+    // Merge REFUSED (nullopt), or merge SUCCEEDED while reporting a conflict
+    // it resolved by election. Both are already reported; both stop here.
+    if (!merged || reporter.errorCount() != mergeEntry) return std::nullopt;
 
     // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE + D-FFI-PE-CRT-UCRT-MIGRATION):
     // MATERIALIZE the resolved entry's arguments per its verb × the format's declared
@@ -2988,13 +3049,26 @@ readWholeBinaryFile(fs::path const& path) {
     return bytes;
 }
 
-// A dependency-artifact cache miss or refusal is a NOTE on stderr and never a
-// diagnostic, for the identical reason `reportRuntimeCacheNote` is: it belongs
-// to no source position and no band, and routing it through the reporter would
-// let `--warnings-as-errors` turn a full disk into a compile error. LOUD on
-// every affected build is the other half of "a mechanism that silently does
-// nothing is worse than one that fails".
-void reportDependencyCacheNote(std::string_view text) {
+// ★★ THE OPERATIONAL NOTE CHANNEL — `std::cerr`, beside `dsscp: artifact …`,
+// and NOT a `D_*` diagnostic. Its subjects are statements about the MACHINE or
+// about the INVOCATION — an unwritable cache root, a full disk, a scrubbed
+// environment, a committed manifest value a command-line flag overrode — never
+// about the program being compiled: they have no source position, no buffer and
+// no band, and routing them through the diagnostic reporter would let
+// `--warnings-as-errors` turn a full disk (or a `--output` flag) into a compile
+// error. It is still LOUD — `runtime_object_cache.hpp`'s standing rule is that a
+// mechanism which silently does nothing is worse than one that fails, and every
+// later build re-emitting the line is the intended behaviour, not noise to be
+// suppressed.
+//
+// ⚠ ONE EMITTER, DELIBERATELY — this used to be TWO byte-identical functions
+// (`reportRuntimeCacheNote` and `reportDependencyCacheNote`) differing only in
+// which subject their docblock named, which is a fact with two owners and a
+// prefix free to drift between them. The SUBJECT belongs in the message the
+// caller passes; the CHANNEL is one thing. Folded when a third subject (the
+// D-AP2-OUTPUT-ROUTING `output`/`--output` override) was about to add a fourth
+// copy.
+void reportDriverNote(std::string_view text) {
     std::cerr << "dsscp: note: " << text << '\n';
 }
 
@@ -3062,7 +3136,7 @@ void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
     // build. What it must not be is INVISIBLE, hence the note.
     auto const bytes = readWholeBinaryFile(artifactPath);
     if (!bytes.has_value()) {
-        reportDependencyCacheNote(
+        reportDriverNote(
             "the artifact '" + core::genericSpelling(artifactPath)
             + "' could not be read back, so it was not added to the dependency "
               "artifact cache; the next build will compile it again.");
@@ -3071,7 +3145,7 @@ void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
     auto const stored = dss::runtime::storeRuntimeObject(
         ticket.key, std::span<std::uint8_t const>{bytes->data(), bytes->size()},
         ticket.eviction);
-    if (!stored.has_value()) reportDependencyCacheNote(stored.error());
+    if (!stored.has_value()) reportDriverNote(stored.error());
 }
 
 // ── THE STAGING AREA ────────────────────────────────────────────────────────
@@ -3131,19 +3205,6 @@ public:
 private:
     fs::path dir_;
 };
-
-// ★★ THE OPERATIONAL NOTE CHANNEL — `std::cerr`, beside `dsscp: artifact …`,
-// and NOT a `D_*` diagnostic. A cache that could not be written is a statement
-// about this MACHINE (an unwritable root, a full disk, a scrubbed environment),
-// not about the program being compiled: it has no source position, no buffer
-// and no band, and routing it through the diagnostic reporter would let
-// `--warnings-as-errors` turn a full disk into a compile error. It is still
-// LOUD — `runtime_object_cache.hpp`'s standing rule is that a mechanism which
-// silently does nothing is worse than one that fails, and every later build
-// re-emitting this line is the intended behaviour, not noise to be suppressed.
-void reportRuntimeCacheNote(std::string_view text) {
-    std::cerr << "dsscp: note: " << text << '\n';
-}
 
 // Append the documents a loaded schema is a function of: the document itself,
 // plus every OTHER document its loader folded in (`languageReferences` and
@@ -3736,7 +3797,7 @@ buildDependencyArtifactKey(
         // line on stderr, never a build.
         auto const bytes = readWholeBinaryFile(archives.back());
         if (!bytes.has_value()) {
-            reportRuntimeCacheNote(
+            reportDriverNote(
                 "the shipped runtime archive '"
                 + core::genericSpelling(archives.back())
                 + "' could not be read back, so it was not added to the runtime "
@@ -3754,7 +3815,7 @@ buildDependencyArtifactKey(
             *key, std::span<std::uint8_t const>{bytes->data(), bytes->size()},
             dss::runtime::CacheEviction::PruneSuperseded);
         if (!stored.has_value()) {
-            reportRuntimeCacheNote(stored.error());
+            reportDriverNote(stored.error());
             continue;
         }
         // ★ THE STORED COPY REPLACES THE STAGING COPY IN THE LINK INPUTS, so a
@@ -4617,7 +4678,7 @@ int runCusToTargets(
                 // says why on every affected run. The arm that DOES stop a
                 // build is an unverifiable ENTRY, which lives at the lookup
                 // inside `compileOneTarget`.
-                reportDependencyCacheNote(key.error());
+                reportDriverNote(key.error());
             }
         }
         // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the grammar THIS target's
@@ -5235,6 +5296,77 @@ int Program::compileProject(
     // `--compile` build's names + single-target flat layout stay byte-identical.
     setArtifactName(pc.artifactName);
     setPerFormatOutputSubdir(true);
+
+    // D-AP2-OUTPUT-ROUTING (the `output`-FIELD half). The manifest's OPTIONAL
+    // `output` names the OUTPUT-DIR BASE this build routes into — the same
+    // `<base>` the CLI `--output` names, and the value `resolveArtifactOutputDir`
+    // joins `<formatName>/<artifactName-or-stem><ext>` onto.
+    //
+    // ★ IT IS A DIRECTORY, NEVER A FILE PATH, AND THAT IS THE DECISION — NOT AN
+    // ABBREVIATION OF ONE. `setOutputDir` has no file arm to mirror: it takes a
+    // directory unconditionally, and both arms of `resolveArtifactOutputDir`
+    // return one. The stronger reason is ownership — `artifactName` ALREADY owns
+    // the emitted binary's base name, with a loader check (a bare name; `/` and
+    // `\` reject) and `compileOneTarget`'s containment boundary enforcing it. A
+    // path-shaped `output` would give ONE fact TWO owners, and
+    // `{"output": "dist/a", "artifactName": "b"}` would have no non-arbitrary
+    // answer. Plan 06 §2.2's `"output": "dist/myprog"` sketch predates
+    // `artifactName` (2026-07-24) and is superseded by it: the directory half of
+    // that sketch is this field, the name half is `artifactName`.
+    //
+    // ★ A RELATIVE VALUE RESOLVES AGAINST THE PROCESS WORKING DIRECTORY, NOT
+    // AGAINST THE MANIFEST'S OWN DIRECTORY — the SAME base this manifest's
+    // `sources[]` and `preBuildScripts` already use (this function's
+    // `expandAndDedupProjectSources` and `runBuildScripts` calls each pass an
+    // EMPTY base, each with its own note saying that is a statement rather than
+    // an omission). ⚠ The manifest-relative reading is
+    // the intuitive one and it is WRONG here: a hook that writes `dist/` and an
+    // `"output": "dist"` must name the same directory, or the manifest does not
+    // compose with itself. The manifest's own directory is the base a DEPENDENCY
+    // manifest uses, which is a different question with a different answer.
+    // The value is stored VERBATIM, exactly as `cli_args.cpp` stores `--output`,
+    // so one relative-path rule serves both doors.
+    //
+    // ★ PRECEDENCE — the CLI `--output` WINS, and the override is ANNOUNCED.
+    // Same rule and same reason as `stackReserve` immediately below (a SCALAR
+    // cannot merge, so it needs a stated rule, and "an explicit command-line
+    // argument overrides a committed configuration file" is the universal one);
+    // giving the two manifest scalars OPPOSITE precedence would leave a user
+    // with no rule to learn. It is also the only rule that keeps `--output`
+    // usable on a project that declares `output` — ✔MEASURED, BOTH corpus
+    // runners (`tests/examples/examples_runner.cpp`, `integrated_tests/runner.cpp`)
+    // set an output dir on EVERY project build, so a refuse-on-both rule would
+    // make a manifest declaring `output` un-runnable by this project's own
+    // harnesses.
+    // ⚠ But precedence is not a licence to be SILENT about it: a committed value
+    // that did not apply is exactly the wrong-output surprise this row is banded
+    // for. The note fires only when the two RESOLVE to different directories —
+    // `--output ./dist` and `"output": "dist"` are the same place, and calling
+    // that a conflict would be a false alarm. It goes out the operational NOTE
+    // channel (`reportDriverNote`), not a `D_*`: it is a statement about the
+    // INVOCATION, not about the program being compiled — no source position, no
+    // buffer, no band — and routing it through the reporter would let
+    // `--warnings-as-errors` turn "I passed --output" into a compile error.
+    if (pc.output.has_value()) {
+        fs::path const manifestBase{*pc.output};
+        if (!outputDir().has_value()) {
+            setOutputDir(manifestBase);
+        } else if (!sameOutputBase(*outputDir(), manifestBase)) {
+            // `artifactPathForReport`, NOT bare `core::genericSpelling`:
+            // the latter THROWS for a path the current locale cannot
+            // encode, and this note sits on a SUCCESS path -- a throw here
+            // would abort a build that was about to work. The other
+            // `genericSpelling` call sites in this file are on paths that
+            // are ALREADY failing. This wrapper is what every
+            // operator-facing report line already uses, u8 fallback and all.
+            reportDriverNote(
+                "the command-line output directory '"
+                + artifactPathForReport(*outputDir())
+                + "' overrides the project manifest's `output` ('"
+                + artifactPathForReport(manifestBase)
+                + "'), which was not used.");
+        }
+    }
 
     // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the manifest's OPTIONAL
     // `stackReserve` (bytes).

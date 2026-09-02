@@ -1,0 +1,33 @@
+{
+  "$comment": "D-CSUBSET-POINTER-ARITH-ENUM-INDEX (C23 6.5.7p2 + 6.2.5p22): an enum-typed operand IS an integer operand of pointer +/-, so `p + e`, `e + p`, `p - e`, `p += e`, `p -= e`, an enumeration CONSTANT, an ANONYMOUS enum's enumerator and a TYPEDEF'd enum must all compile and answer as a plain integer index does. Every one of them refused before the fix at the MIR `p +/- n` index-widen site (mapCast is TypeKind-only and its isInt excludes Enum, so the widen to a 64-bit byte offset had no opcode); the SUBSCRIPT spelling `p[e]` never refused, because the HIR tier's combineIndex integer-promotes a subscript while a pointer/integer additive pair undergoes no usual arithmetic conversion. THE EXIT CODE DISCRIMINATES THE SIGN OF THE WIDEN, not merely that one happened: a signed-char-backed enum holding -2 must SExt and an unsigned-char-backed enum holding 200 must ZExt, and each read is placed so BOTH sign choices land inside `buf` -- a fully inverted sign returns 104 where the correct answer is 192, instead of crashing. Every enum value is loaded from an argc-indexed table, so none is a compile-time constant and the widen really executes under the release pipeline too. exit 192 measured under gcc 13.3.0 and clang 18.1.3, -std=c17 and -std=c2x, at -O0/-O1/-O2/-O3/-Os -- all eight agree. Red-on-disable: revert the resolveScalarIntKind resolution at the combineBinaryOp `p +/- n` widen site and this stops COMPILING (H_UnsupportedLoweringForKind). Data-model independent, so the one exit code holds on all four targets.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 192,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

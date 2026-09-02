@@ -220,6 +220,10 @@ bool synthesizeThreadsShim(
     TypeId const phSig_i32_3pV    = sig({pVoid, pVoid, pVoid}, i32Ty);   // pthread_cond_timedwait(c, m, abstime)
     TypeId const phSig_i32_i32pV  = sig({i32Ty, pVoid}, i32Ty);          // clock_gettime(clk_id, timespec*)
     TypeId const phSig_i32_2u64   = sig({u64Ty, u64Ty}, i32Ty);          // pthread_equal(t1, t2)
+    // Cycle 4 (D-CSUBSET-C11-THREADS-MACHO-MTX-PLAIN-RECURSIVE) libSystem helper
+    // signature. `pthread_mutexattr_init` and `pthread_mutexattr_destroy` reuse
+    // `phSig_i32_pV`; only `settype`'s (attr*, int) shape is new.
+    TypeId const phSig_i32_pVi32  = sig({pVoid, i32Ty}, i32Ty);          // pthread_mutexattr_settype(attr, kind)
 
     // ── pthread shim (recipe) signatures (the macho thrd_t/tss_t are u64) ──
     TypeId const rSigP_mtx_init   = sig({pVoid, i32Ty}, i32Ty);
@@ -462,10 +466,38 @@ bool synthesizeThreadsShim(
             // ══ win32 vehicle — bodies over kernel32 primitives (the pe64 shim) ══
             // ── mutex ──
             if (recipe == "mtx_init") {          // InitializeCriticalSection(m); ret success
+                // D-CSUBSET-C11-THREADS-MTX-PLAIN-RECURSIVE — CLOSED WITHOUT A CODE
+                // CHANGE, on a measurement rather than on symmetry with the macho half.
+                //
+                // A Win32 CRITICAL_SECTION is ALWAYS recursion-capable, so `type` is
+                // accepted and not consulted. That is conforming, and here is the
+                // measurement that says so rather than an argument from convenience.
+                //
+                // The two directions are NOT symmetric. `mtx_plain | mtx_recursive`
+                // REQUIRES a re-lockable mutex, and pe already gives one. `mtx_plain`
+                // merely forbids the CALLER to re-lock: C11 7.26.4.3 / C23 7.28.4.3 say
+                // "If the mutex is non-recursive, it shall not be locked by the calling
+                // thread" — a `shall` on the caller outside a Constraints clause, so a
+                // program that does it is UNDEFINED, not implementation-defined.
+                //
+                // ✔MEASURED, and the references prove it is undefined by disagreeing
+                // three ways on the same program: same-thread re-lock of an `mtx_plain`
+                // mutex BLOCKS FOREVER under glibc 2.39 (identical through gcc 13.3.0
+                // and clang 18.1.3, probed separately), FAIL-FAST ABORTS under MSVC
+                // 19.51's own <threads.h> (exit 0xC0000409), and proceeds here. No two
+                // agree, and none is wrong.
+                // ⇒ ADDING an owner/recursion-count guard to force a deadlock would
+                // INVENT a fourth behaviour no reference requires, spend a lock word and
+                // two branches on every mtx_lock in the program, and convert a class of
+                // buggy-but-running programs into hangs. The union governs ACCEPTANCE;
+                // it cannot legislate inside undefined behaviour.
+                // ⚠ So `Arg 1` is deliberately NOT materialized on this arm — there is
+                // nothing to read it for. The macho twin DOES read it, because there the
+                // RECURSIVE direction was genuinely broken.
                 begin(sym, rSig_mtx_init);
-                MirInstId const m = builder.addArg(0, pVoid);   // (Arg 1 `type` ignored: a
-                call1("InitializeCriticalSection", hSig_v_pV, InvalidType, m); // CRITICAL_SECTION
-                builder.addReturn(i32c(0));                     // is always recursion-capable)
+                MirInstId const m = builder.addArg(0, pVoid);
+                call1("InitializeCriticalSection", hSig_v_pV, InvalidType, m);
+                builder.addReturn(i32c(0));
             } else if (recipe == "mtx_lock") {   // EnterCriticalSection(m); ret success
                 begin(sym, rSig_i32_pV);
                 call1("EnterCriticalSection", hSig_v_pV, InvalidType, builder.addArg(0, pVoid));
@@ -849,16 +881,102 @@ bool synthesizeThreadsShim(
         } else {  // LibrarySynthVehicle::Pthread
             // ══ pthread vehicle — bodies over Darwin libSystem pthread primitives ══
             // pthread_* return 0 on success + errno (nonzero) on failure — the INVERSE of
-            // win32's nonzero-on-success (see isNonZeroI32). The mtx TYPE arg is ignored: a
-            // NULL attr = PTHREAD_MUTEX_NORMAL, correct for the tested mtx_plain (mtx_recursive
-            // → a non-recursive mutex, a SILENT deadlock-on-relock divergence unobservable this
-            // cycle without thrd_create — D-CSUBSET-C11-THREADS-MACHO-MTX-PLAIN-RECURSIVE).
+            // win32's nonzero-on-success (see isNonZeroI32).
             // ── mutex ──
-            if (recipe == "mtx_init") {          // pthread_mutex_init(m, NULL); ret success
+            if (recipe == "mtx_init") {
+                // D-CSUBSET-C11-THREADS-MACHO-MTX-PLAIN-RECURSIVE — the recipe now HONOURS
+                // the C11 `type` argument instead of passing a NULL mutexattr.
+                //
+                // ── WHAT WAS WRONG, AND WHY IT WAS THE WORST SHAPE OF WRONG ─────────
+                // A NULL attr yields PTHREAD_MUTEX_DEFAULT, and on Darwin that is
+                // PTHREAD_MUTEX_NORMAL — non-recursive. So `mtx_init(&m, mtx_recursive)`
+                // produced a mutex whose same-thread re-lock BLOCKS FOREVER: not a wrong
+                // answer, not a diagnostic, a HANG. ✔MEASURED on the operator's macOS
+                // 26.6.2 arm64 host: with a NULL attr the relock did not return inside a
+                // 2 s bounded wait; with a RECURSIVE attr it returned immediately.
+                // It was filed as unobservable because Cycle 1 had no `thrd_create`;
+                // P49 landed `thrd_create` on all three formats, so the program can now
+                // be multi-threaded and the deadlock is reachable.
+                //
+                // ── WHY THIS IS BELOW THE UNION, NOT A FREE CHOICE ─────────────────
+                // The RECURSIVE direction is not undefined behaviour — C11 7.26.4.2 /
+                // C23 7.28.4.2 make `mtx_plain | mtx_recursive` a mutex the owning
+                // thread MAY re-lock, and both non-DSS references that ship
+                // <threads.h> honour it: ✔MEASURED, glibc 2.39 (through gcc 13.3.0 AND
+                // clang 18.1.3, probed separately) and MSVC 19.51's own <threads.h>
+                // each let the relock proceed. DSS deadlocking there is strictly below
+                // (gcc ∪ clang ∪ MSVC) ∪ ISO C.
+                //
+                // ── THE SHAPE: SINGLE BLOCK, ONE ALLOCA, BRANCHLESS SELECT ─────────
+                // The row proposed "multi-block shim recipes OR a branchless
+                // attr-select", on the 2026-07-14 premise that an `Alloca` would break
+                // this pass's single-block/alloca-free invariant. THAT INVARIANT NO
+                // LONGER EXISTS — P49's timed recipes (`thrd_sleep`, `mtx_timedlock`,
+                // `cnd_timedwait`) and Cycle 2's `thrd_join` already Alloca and already
+                // create blocks on BOTH vehicles. Neither escape hatch is needed: the
+                // attr dance is straight-line, and the kind is selected with the same
+                // Mul-by-a-zero-extended-predicate idiom the clamps above use, so the
+                // recipe stays ONE block and adds no CFG for `rederiveStructCfMarkers`.
+                //
+                // ⚠ THE THREE LITERALS BELOW ARE A SECOND OWNER OF A DARWIN FACT, and
+                // that is stated rather than hidden — the same standing seam as this
+                // file's `hSig_*` block and its `struct timespec` offsets, tracked as
+                // D-MIR-SYNTH-SHIM-HELPER-SIGNATURES-DUPLICATE-THE-DESCRIPTOR. It
+                // cannot be dissolved here: `synthesizeThreadsShim` receives a recipe
+                // map and a vehicle, never a descriptor, so there is no config channel
+                // reaching this seam. What binds the two owners is a RUNTIME witness,
+                // not a comment — `examples/c/c11_mtx_recursive` re-locks a
+                // `mtx_recursive` mutex on the thread that owns it, so a wrong kind
+                // constant HANGS the example instead of passing quietly.
+                //   ✔MEASURED on macOS 26.6.2 arm64 (and the x86_64 arm links):
+                //     PTHREAD_MUTEX_NORMAL = 0, PTHREAD_MUTEX_RECURSIVE = 2,
+                //     PTHREAD_MUTEX_DEFAULT = 0, sizeof(pthread_mutexattr_t) = 16,
+                //     _Alignof(pthread_mutexattr_t) = 8.
+                // Note NORMAL and RECURSIVE differ from glibc's (1 and 2 there, with
+                // NORMAL 0): this constant is a property of the PTHREAD VEHICLE, which
+                // today is Darwin's only. An elf target never reaches here — glibc
+                // exports the C11 names and elf binds them as ordinary FFI.
+                static constexpr std::int32_t kC11MtxRecursiveBit    = 1;  // C11 mtx_recursive
+                static constexpr std::int32_t kPthreadMutexNormal    = 0;  // Darwin PTHREAD_MUTEX_NORMAL
+                static constexpr std::int32_t kPthreadMutexRecursive = 2;  // Darwin PTHREAD_MUTEX_RECURSIVE
+                static constexpr std::int32_t kPthreadMutexAttrBytes = 16; // sizeof(pthread_mutexattr_t)
+                // The branchless select is `NORMAL + (RECURSIVE - NORMAL) * wants`, and
+                // the Add folds away only because NORMAL is zero. Assert that here, so a
+                // future Darwin renumbering is a BUILD failure rather than a mutex
+                // silently initialized to kind 2 when it should be kind NORMAL.
+                static_assert(kPthreadMutexNormal == 0,
+                              "the branchless kind select below drops the NORMAL base term");
                 begin(sym, rSigP_mtx_init);
-                MirInstId const m = builder.addArg(0, pVoid);
-                (void)builder.addArg(1, i32Ty);              // the C11 mtx type (ignored — NULL attr)
-                call2("pthread_mutex_init", phSig_i32_pVpV, i32Ty, m, nullPtr());
+                // ⚠ BOTH `Arg`s ARE MATERIALIZED BEFORE THE FIRST CALL — an `Arg` reads
+                // the incoming parameter location and a Call is free to clobber it. This
+                // file's `thrd_equal` arm records that as a MEASURED wrong answer, not a
+                // style rule, and this recipe is the second one to read a second argument.
+                MirInstId const m    = builder.addArg(0, pVoid);
+                MirInstId const type = builder.addArg(1, i32Ty);   // the C11 mtx type — now READ
+                // The attr slot. `payload2` (the over-alignment channel) is left 0 like
+                // every sibling Alloca here: 0 means "no over-alignment recorded", so the
+                // frame places the slot on `ccStackAlignment()` = 16, which already
+                // exceeds the measured _Alignof(pthread_mutexattr_t) = 8.
+                MirInstId const attr =
+                    builder.addInst(MirOpcode::Alloca, {}, pVoid, kPthreadMutexAttrBytes);
+                call1("pthread_mutexattr_init", phSig_i32_pV, i32Ty, attr);
+                // wants = ((type & mtx_recursive) != 0) ? 1 : 0.  The MASK rather than an
+                // equality is what C11 asks for: the four legal values are mtx_plain,
+                // mtx_timed, and either of those OR'd with mtx_recursive, so `== 1` would
+                // miss `mtx_timed | mtx_recursive` (3) — the exact value glibc and MSVC
+                // both treat as recursive (✔MEASURED, both).
+                MirInstId const recursiveBit =
+                    bin(MirOpcode::And, type, i32c(kC11MtxRecursiveBit), i32Ty);
+                MirInstId const wants = isNonZeroI32(recursiveBit);
+                MirInstId const kind  = bin(MirOpcode::Mul, wants,
+                                            i32c(kPthreadMutexRecursive - kPthreadMutexNormal),
+                                            i32Ty);
+                call2("pthread_mutexattr_settype", phSig_i32_pVi32, i32Ty, attr, kind);
+                call2("pthread_mutex_init", phSig_i32_pVpV, i32Ty, m, attr);
+                // The attr is a VALUE copied into the mutex at init, so destroying it
+                // immediately is correct and leaks nothing (Darwin's destroy only clears
+                // the signature word).
+                call1("pthread_mutexattr_destroy", phSig_i32_pV, i32Ty, attr);
                 builder.addReturn(i32c(0));
             } else if (recipe == "mtx_lock") {   // pthread_mutex_lock(m); ret success (discard)
                 begin(sym, rSigP_i32_pV);
