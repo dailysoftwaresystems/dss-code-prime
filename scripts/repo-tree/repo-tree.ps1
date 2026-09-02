@@ -66,6 +66,46 @@ class RepoTreeCollapse : System.Exception {
     RepoTreeCollapse([string]$m) : base($m) {}
 }
 
+function script:Resolve-RepoTreeRealPath([string]$Path) {
+    # ⚠⚠ SYMLINKS IN *ANCESTOR* COMPONENTS, WHICH IS WHY `GetFullPath` ALONE IS NOT ENOUGH.
+    # ✔MEASURED 2026-09-02 on macOS 26.6.2 and on CI's macos-latest, reproduced identically:
+    # `/var` is a symlink to `/private/var`, so a temp tree has TWO correct spellings —
+    # `/var/folders/…/lane` (what a caller passes) and `/private/var/folders/…/lane` (what
+    # `[Environment]::CurrentDirectory` and `git rev-parse --show-toplevel` both return). A string
+    # compare of two correct answers then REFUSED A CORRECTLY ENTERED TREE, reddening self-test
+    # arms 3 and 6 and the whole `repo_tree_guard` on every POSIX CI host.
+    # ★ `[IO.Path]::GetFullPath` normalises `.`/`..` and separators and does NOT follow links, and
+    # `ResolveLinkTarget` follows only the LEAF — the link here is an ANCESTOR, so neither alone
+    # sees it. Hence the walk: every component is resolved, from the root down.
+    # ⓘ This does NOT weaken the assertion. Two genuinely different directories still resolve to
+    # different paths; what it removes is a false alarm between two spellings of ONE directory.
+    # ⓘ A non-existent path resolves to itself — the mangled-path arm below compares paths that
+    # were never meant to exist, and must keep working.
+    if ([string]::IsNullOrEmpty($Path)) { return $Path }
+    $full = $Path
+    try { $full = [IO.Path]::GetFullPath($Path) } catch { return $Path }
+    $sep  = [IO.Path]::DirectorySeparatorChar
+    $root = [IO.Path]::GetPathRoot($full)
+    if ([string]::IsNullOrEmpty($root)) { return $full }
+    $cur = $root
+    foreach ($part in $full.Substring($root.Length).Split($sep, [StringSplitOptions]::RemoveEmptyEntries)) {
+        $cur = [IO.Path]::Combine($cur, $part)
+        # Bounded: a symlink cycle must not hang a guard.
+        for ($hop = 0; $hop -lt 32; $hop++) {
+            $t = $null
+            try { $t = [IO.Directory]::ResolveLinkTarget($cur, $false) } catch { }
+            if ($null -eq $t) { try { $t = [IO.File]::ResolveLinkTarget($cur, $false) } catch { } }
+            if ($null -eq $t) { break }
+            $tgt = $t.FullName
+            if (-not [IO.Path]::IsPathRooted($tgt)) {
+                $tgt = [IO.Path]::Combine([IO.Path]::GetDirectoryName($cur), $tgt)
+            }
+            try { $cur = [IO.Path]::GetFullPath($tgt) } catch { break }
+        }
+    }
+    return $cur
+}
+
 function script:ConvertTo-RepoTreeComparable([string]$Path) {
     # One spelling for a path that three different producers hand back: git uses
     # forward slashes, .NET uses backslashes on Windows, and either may carry a
@@ -75,6 +115,8 @@ function script:ConvertTo-RepoTreeComparable([string]$Path) {
     if ([string]::IsNullOrEmpty($Path)) { return '' }
     $p = $Path.Replace('/', [IO.Path]::DirectorySeparatorChar)
     try { $p = [IO.Path]::GetFullPath($p) } catch { }
+    # …and one spelling for a path whose ANCESTOR is a symlink. See the walk above.
+    $p = Resolve-RepoTreeRealPath $p
     return $p.TrimEnd([IO.Path]::DirectorySeparatorChar).ToLowerInvariant()
 }
 

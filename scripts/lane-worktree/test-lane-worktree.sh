@@ -36,7 +36,18 @@ set -uo pipefail
 _here="$(cd "$(dirname "$0")" && pwd -P)"
 LW="$_here/lane-worktree.sh"
 REPO="$(cd "$_here/../.." && pwd -P)"
-[ -x "$LW" ] || { echo "lane-worktree self-test: CANNOT RUN -- $LW is missing" >&2; exit 1; }
+# ⚠⚠ `-r`, NOT `-x`, AND THE TWO REFUSALS ARE SEPARATE BECAUSE THEY ARE DIFFERENT FACTS.
+# ✔MEASURED 2026-09-02 on CI: this arm read `[ -x "$LW" ]`, and `lane-worktree.sh` is committed
+# mode 100644 — so on a fresh POSIX checkout (linux-arm64 and macOS) the guard refused with
+# "is missing" while the file sat right there, and on Windows it passed because MSYS reports every
+# readable file as executable. A Windows-only measurement published as a property of the tree,
+# which is the same class as the gate figure this guard was written for.
+# ★ `-x` was never the right question: every call below invokes it as `bash "$LW" …`, so the
+# executable bit is not consulted by anything this test does. READABILITY is the real precondition.
+# ⓘ Deliberately NOT "fixed" by chmod +x in git: that would make the exec bit load-bearing for a
+# file nothing execs directly, and Windows checkouts cannot carry it faithfully anyway.
+[ -e "$LW" ] || { echo "lane-worktree self-test: CANNOT RUN -- $LW does not exist" >&2; exit 1; }
+[ -r "$LW" ] || { echo "lane-worktree self-test: CANNOT RUN -- $LW exists but is not readable" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
 L1="padtest$$a"; L2="padtest$$b"; L3="padtest$$c"; L4="padtest$$d"
