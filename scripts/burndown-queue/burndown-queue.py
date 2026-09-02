@@ -162,6 +162,49 @@ NS_HARNESS = ("D-TEST-", "D-GATE-", "D-HARNESS-", "D-BUILD-", "D-CYCLE-", "D-EXA
 NS_RECORD = ("D-DOC-", "D-PLANS-")
 NS_ENV = ("D-ENV-", "D-UPSTREAM-")
 
+# ★★★ THE BUCKET IS THE FILE, NOT THE PREFIX -- operator ruling 2026-08-25, *"the
+# priority is always production anchors. ALWAYS"*. The registry is TWO FILES, and which
+# one holds a row IS the production/harness verdict. `NS_HARNESS` above is a GUESS over
+# the anchor's spelling, and a guess is what this instrument used to band by.
+#
+# ⚠⚠ ✔MEASURED 2026-08-31 (cycle P46), and it cost a near-miss rather than a report:
+# `D-CONF-REFERENCE-DIFFERENTIAL-ORACLE` lives in `-harness.md` and was printed as the
+# **#1 row of the P0 WRONG-OUTPUT band**, with nothing on the line saying it was
+# harness -- because `D-CONF-` is not in `NS_HARNESS` and never was. The orchestrator
+# read the queue top-down and came within one step of seeding a lane on it, which the
+# standing ruling forbids outright (harness is drained BY ENCOUNTER, never scheduled).
+# ★ The instrument was not lying. It was answering *"does this id LOOK harness-y?"*
+# when the question is *"which registry file holds this row?"* -- an adjacent question,
+# and it failed toward *schedulable*, which is the flattering direction.
+#
+# ⇒ GROUND TRUTH WHERE IT EXISTS, HEURISTIC ONLY WHERE IT DOES NOT. For the two
+# registry files the FILE decides, in BOTH directions: a harness-registry row is P3
+# however it is spelled, and a production-registry row is NEVER demoted to P3 by its
+# prefix. Per-plan rows have no such file, so they keep the namespace sieve.
+# ⇒ D-QUEUE-BURNDOWN-BANDED-A-HARNESS-ROW-INTO-THE-PRODUCTION-QUEUE (closed 2026-08-31)
+REG_PRODUCTION = ".plans/_deferred-anchor-registry-production.md"
+REG_HARNESS = ".plans/_deferred-anchor-registry-harness.md"
+# ★ THE ARCHIVE (operator, 2026-09-01). The registry became THREE documents: the two
+# WORKING lists above hold what is LEFT, and every closed row is moved out to this one.
+# It is named here so a row from it is IMPOSSIBLE to band -- see `BUCKET_ARCHIVE`.
+REG_DONE = ".plans/_deferred-anchor-registry-done.md"
+REGISTRIES = (REG_PRODUCTION, REG_HARNESS, REG_DONE)
+BUCKET_PRODUCTION = "PRODUCTION"
+BUCKET_HARNESS = "harness"
+BUCKET_PLAN = "plan"
+BUCKET_ARCHIVE = "archive"
+
+
+def bucket_of(rel):
+    """-> which registry file holds this row. `plan` = a per-plan section 3.1 row."""
+    if rel == REG_PRODUCTION:
+        return BUCKET_PRODUCTION
+    if rel == REG_HARNESS:
+        return BUCKET_HARNESS
+    if rel == REG_DONE:
+        return BUCKET_ARCHIVE
+    return BUCKET_PLAN
+
 BANDS = ("P0", "P1", "P2", "P3", "P4", "P5")
 BAND_TITLE = {
     "P0": "WRONG-OUTPUT   -- ships a bad binary: silent wrongness, or a crash on legal input",
@@ -250,13 +293,17 @@ def evidence(flat, match, width=54):
     return ("..." if lo else "") + flat[lo:hi].strip() + ("..." if hi < len(flat) else "")
 
 
-def band_of(name, flat):
+def band_of(name, flat, bucket=BUCKET_PLAN):
     """-> (band, evidence, demoted_phrase_or_None).
 
     `demoted` is set when a WRONG phrase was FOUND and then disbelieved -- attributive
     or negated. It is carried out so the report can print it: a sieve that silently
     swallows the thing it decided not to count is unauditable, which is the whole
     complaint against the census this instrument is modelled on avoiding.
+
+    ⚠ `bucket` is GROUND TRUTH and outranks every namespace guess below -- see the
+    `bucket_of` comment. It defaults to `plan` so that a caller which does not know the
+    row's home gets the old heuristic rather than a silent mis-band.
     """
     base = name.split("#")[-1]
     if base.startswith(NS_ENV):
@@ -264,9 +311,17 @@ def band_of(name, flat):
     if base.startswith(NS_RECORD):
         return "P4", "namespace", None
     m, sup = first_own_match(WRONG, flat)
-    if base.startswith(NS_HARNESS):
+    if bucket == BUCKET_HARNESS:
+        # ★ THE FILE SAID SO. No prefix needs to agree, and this is the arm that catches
+        # `D-CONF-*`, `D-SCRIPT-*` and every other harness id nobody thought to list.
+        return "P3", ("registry file; note: %s" % evidence(flat, m)) if m else \
+            "registry file (-harness.md)", None
+    if bucket != BUCKET_PRODUCTION and base.startswith(NS_HARNESS):
         # ⚠ A harness row can still describe a PRODUCT miscompile it found. Band it by
         # what it IS -- a harness row -- but say so, because the sieve saw the phrase.
+        # ⚠ SKIPPED ENTIRELY for a production-registry row: the file already said the
+        # row is production, and letting a spelling demote it to P3 is this defect in
+        # the OTHER direction -- a real production error filed under the workshop.
         return "P3", ("namespace; note: %s" % evidence(flat, m)) if m else "namespace", None
     if m:
         return "P0", evidence(flat, m), None
@@ -326,8 +381,27 @@ def load_row_text(root):
                 # correct disagree about which rows exist.
                 key = bal.row_key(rel, bal.row_name(cells[1]))
                 flat = bal.strip_decoration(line)
-                status = bal.strip_decoration(cells[2])
-                out.setdefault(key, (flat, status))
+                # ★★ THE REGISTRY GREW A `Priority` AND A `Status` COLUMN ON 2026-09-01,
+                # so its verdict is cell 3 and its band is cell 2 -- while every
+                # plan-side §3.1 table still leads with the glyph in cell 2.
+                # ⚠ KEYED ON THE FILE, NOT ON THE CELL COUNT. plan-00 §0.2 also carries
+                # six columns (`# | Deferred item | Why deferred | Class | Owner | Trigger`),
+                # so counting cells would read ITS "Why deferred" prose as a status. The
+                # file is ground truth about the shape exactly as it is about the bucket
+                # -- the same principle `bucket_of` above already states.
+                declared = ""
+                if rel in REGISTRIES and len(cells) > 3:
+                    status = bal.strip_decoration(cells[3])
+                    declared = bal.strip_decoration(cells[2]).strip()
+                else:
+                    status = bal.strip_decoration(cells[2])
+                # ⚠ `rel` IS CARRIED even though `row_key` deliberately canonicalises
+                # the two registry files to ONE prefix. That canonicalisation is right
+                # for the BALANCE gate -- moving a row between buckets must be a no-op
+                # there -- and exactly wrong here, where the file IS the priority.
+                # Reusing the key without re-reading the home is how this instrument
+                # lost the production/harness distinction in the first place.
+                out.setdefault(key, (flat, status, rel, declared))
     return out
 
 
@@ -341,13 +415,37 @@ def build(root):
     text = load_row_text(root)
     items, residue = [], []
     for key in scan.rows:
-        flat, status = text.get(key, ("", ""))
+        flat, status, rel, declared = text.get(key, ("", "", "", ""))
         if not flat:
             # A row the balance scanner counted OPEN but whose line this reader could
             # not find. NEVER silent: it is the difference between the two instruments.
             residue.append(key)
             continue
-        band, why, demoted_phrase = band_of(key, flat)
+        bucket = bucket_of(rel)
+        # ⚠⚠ AN OPEN ROW IN THE ARCHIVE IS A STRUCTURAL FAILURE, NOT A ROW TO BAND.
+        # The archive holds finished work; a live row filed there is invisible to this
+        # queue by design, so silently banding it would hide the one defect the split
+        # of 2026-09-01 made possible. `check-anchor-balance`'s partition arm refuses
+        # it too -- this is the SAME invariant seen from the consumer's side, and a
+        # consumer that quietly copes is how an invariant stops being one.
+        if bucket == BUCKET_ARCHIVE:
+            sys.exit("burndown-queue: FAIL -- %s is OPEN in the ARCHIVE (%s). The two "
+                     "working registries are what this queue reads; a live row filed in "
+                     "the archive can never be picked up. Move it back with:\n"
+                     "    python scripts/anchors/anchors.py set %s --status open --apply"
+                     % (key.split("#")[-1], rel, key.split("#")[-1]))
+        # ★★★ THE BAND IS A DECLARATION WHERE ONE EXISTS, AND THE SIEVE ONLY WHERE IT
+        # DOES NOT. Every registry row has carried an explicit `Priority` cell since
+        # 2026-09-01; the keyword sieve below now SEEDS a new row and is the fallback
+        # for plan-side tables, which have no such column. This is the correction this
+        # instrument's own docstring asks for: it warns that the band is *"a sort key,
+        # not a verdict"* because a census built from the same kind of sieve reported
+        # 103 where the truth was 4. A cell a human can correct, and whose correction
+        # SURVIVES, is strictly better than re-running the sieve forever.
+        if declared in BANDS:
+            band, why, demoted_phrase = declared, "declared in the Priority column", None
+        else:
+            band, why, demoted_phrase = band_of(key, flat, bucket)
         gated = key in scan.gated_rows
         unblocked = key in scan.unblocked
         items.append({
@@ -355,6 +453,8 @@ def build(root):
             "key": key,
             "anchor": key.split("#")[-1],
             "home": key.split("#")[0],
+            "source": rel,
+            "bucket": bucket,
             "band": band,
             "why": why,
             "sev": severity_of(status),
@@ -401,13 +501,20 @@ def main(argv):
           % (len(items),
              sum(1 for r in items if r["schedulable"]),
              sum(1 for r in items if not r["schedulable"])))
-    print("\nBAND       total  schedulable   RED  ORANGE  YELLOW  GREEN")
+    prod_total = sum(1 for r in items if r["bucket"] == BUCKET_PRODUCTION)
+    print("burndown-queue: BY BUCKET (the operator's outer sort key) -- "
+          "PRODUCTION %d, harness %d, per-plan %d"
+          % (prod_total,
+             sum(1 for r in items if r["bucket"] == BUCKET_HARNESS),
+             sum(1 for r in items if r["bucket"] == BUCKET_PLAN)))
+    print("\nBAND       total  schedulable  PROD   RED  ORANGE  YELLOW  GREEN")
     for b in BANDS:
         rows = [r for r in items if r["band"] == b]
         if not rows:
             continue
-        print("  %-3s %9d %12d %5d %7d %7d %6d   %s"
+        print("  %-3s %9d %12d %5d %5d %7d %7d %6d   %s"
               % (b, len(rows), sum(1 for r in rows if r["schedulable"]),
+                 sum(1 for r in rows if r["bucket"] == BUCKET_PRODUCTION),
                  sum(1 for r in rows if r["sev_name"] == "RED"),
                  sum(1 for r in rows if r["sev_name"] == "ORANGE"),
                  sum(1 for r in rows if r["sev_name"] == "YELLOW"),
@@ -423,8 +530,12 @@ def main(argv):
         if r["band"] != band:
             band = r["band"]
             print("\n=== %s %s ===" % (band, BAND_TITLE[band]))
-        print("  %-6s %-9s %s%s"
+        # ★ THE BUCKET IS ON EVERY LINE, not just in the summary. A reader takes the
+        # NEXT TICKET off this list, and the ruling that harness is never scheduled has
+        # to be visible at the row a lane would be seeded on -- not two screens up.
+        print("  %-6s %-9s %-10s %s%s"
               % (r["sev_name"], "" if r["schedulable"] else "GATED",
+                 "" if r["bucket"] == BUCKET_PRODUCTION else r["bucket"],
                  r["anchor"], "  [UNBLOCKED]" if r["unblocked"] else ""))
         if a.evidence:
             print("           why: %s" % r["why"])
@@ -470,5 +581,87 @@ def _residue_report(residue):
         print("    ... and %d more" % (len(residue) - 40))
 
 
+def selftest():
+    """Pin the bucket rule in BOTH directions, and the two arms my own premise got wrong.
+
+    ★ WHY THIS EXISTS AT ALL: `burndown-queue.py` is not wired into ctest and had no
+    self-test, so the defect this pins -- a harness row printed at the top of the P0
+    band -- was caught by a human reading the output, once. The proof that fixed it
+    lived in a scratchpad script that does not survive the cycle. An instrument nobody
+    can regression-test is an instrument that silently drifts back.
+
+    ★ PURE-FUNCTION ARMS. `bucket_of` and `band_of` need no tree, no temp repo and no
+    git, so this costs milliseconds and runs on EVERY invocation rather than behind a
+    flag nobody passes.
+
+    ⚠ EVERY POSITIVE ARM HAS A CONTROL THAT MOVES. (a) and (b) each re-band the SAME
+    fixture text under a different bucket, so a green arm proves the BUCKET did the
+    work -- not the sieve agreeing by luck, which is how a vacuous arm reads green
+    forever.
+    """
+    failed = [0]
+
+    def pin(ok, why, detail=""):
+        print("  %-4s %s%s" % ("ok" if ok else "FAIL", why,
+                               ("   " + detail) if detail else ""))
+        if not ok:
+            failed[0] += 1
+
+    # ⓘ "miscompiles" is a live WRONG phrase: an own claim, unnegated, no anchor token
+    # in its clause. If the sieve's vocabulary changes, arm (a2) goes red and says so.
+    wrong = "OPEN. This miscompiles the emitted image."
+    plain = "OPEN. A capability that is absent."
+
+    b, _, _ = band_of("x#D-CONF-REFERENCE-DIFFERENTIAL-ORACLE", wrong, BUCKET_HARNESS)
+    pin(b == "P3", "(a) a harness-registry row with a NON-harness prefix bands P3, "
+        "not P0 -- the measured defect", "got %s" % b)
+    b2, _, _ = band_of("x#D-CONF-REFERENCE-DIFFERENTIAL-ORACLE", wrong, BUCKET_PLAN)
+    pin(b2 == "P0", "(a2) CONTROL: identical text with no registry home still bands "
+        "P0 -- so (a) is the BUCKET's doing, not the sieve's", "got %s" % b2)
+
+    # ⚠ EVERY FIXTURE ID BELOW IS A REAL REGISTRY ROW, AND THAT IS NOT DECORATION.
+    # `scripts/` is a root `check-anchor-registry` scans, so a plausible-looking
+    # invented id here is an anchor cited in the tree with no row -- precisely the leak
+    # that guard exists to catch, and the first draft of this self-test minted two.
+    # ⓘ `band_of` is a pure function of (name, flat, bucket), so passing a real id with
+    # a bucket it does not actually live in is exactly what arm (b) needs to ask; it
+    # asserts nothing about where that row is really filed.
+    b, _, _ = band_of("x#D-BUILD-CONCURRENT-CONTENTION-YIELDS-TRUNCATED-OBJECT-TREATED-AS-CURRENT",
+                      wrong, BUCKET_PRODUCTION)
+    pin(b == "P0", "(b) a production-registry row is NOT demoted to P3 by a "
+        "harness-looking prefix -- the strictly worse direction", "got %s" % b)
+    b2, _, _ = band_of("x#D-BUILD-CONCURRENT-CONTENTION-YIELDS-TRUNCATED-OBJECT-TREATED-AS-CURRENT",
+                       wrong, BUCKET_PLAN)
+    pin(b2 == "P3", "(b2) CONTROL: the same id with no registry home still takes the "
+        "namespace sieve", "got %s" % b2)
+
+    pin(bucket_of(REG_PRODUCTION) == BUCKET_PRODUCTION
+        and bucket_of(REG_HARNESS) == BUCKET_HARNESS
+        and bucket_of(".plans/14-linker-plan - tbd.md") == BUCKET_PLAN,
+        "(c) bucket_of maps production / harness / per-plan")
+
+    # ⚠ (d) AND (d2) PIN THE THING I FIRST GOT WRONG. The invariant I reached for was
+    # "every harness row bands P3", and the measurement refuted it with 23 rows. Both
+    # bands below are LOWER priority than P3 and the verdict is more specific, so the
+    # code is right; these arms exist so nobody "fixes" it back by reordering `band_of`.
+    b, _, _ = band_of("x#D-ENV-MACOS-GATEKEEPER-ADMISSION-IRREDUCIBLE", wrong,
+                      BUCKET_HARNESS)
+    pin(b == "P5", "(d) a D-ENV-* row in -harness.md bands P5, NOT P3 -- deliberate: "
+        "ENV is more specific AND lower", "got %s" % b)
+    b, _, _ = band_of("x#D-PLANS-LINE-CITATION-ROT", wrong, BUCKET_HARNESS)
+    pin(b == "P4", "(d2) a D-PLANS-* row in -harness.md bands P4, NOT P3 -- same "
+        "reason", "got %s" % b)
+
+    b, _, _ = band_of("x#D-CSUBSET-VLA", plain, BUCKET_PRODUCTION)
+    pin(b == "P2", "(e) GREEN CONTROL: an ordinary production row with no wrong or "
+        "refusal phrase still bands P2 -- the fix did not move normal banding",
+        "got %s" % b)
+
+    print("burndown-queue: self-test %s - 8 arm(s), %d failure(s); this instrument is "
+          "PROVEN able to fail." % ("OK" if not failed[0] else "FAIL", failed[0]))
+    return 1 if failed[0] else 0
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    _rc = selftest()
+    sys.exit(_rc or main(sys.argv[1:]))

@@ -56,6 +56,8 @@ the other in the same commit.
 <!-- BEGIN GENERATED SCRIPT INDEX -->
 | Script | Runs as | Purpose |
 | --- | --- | --- |
+| **`anchors`** | `anchors.py`, `read-anchor.ps1`, `read-anchor.sh`, `read-anchors.ps1`, `read-anchors.sh`, `set-anchor.ps1`, `set-anchor.sh`, `write-anchor.ps1`, `write-anchor.sh` | read and write deferred-anchor registry rows in the one canonical form, so a row is never hand-assembled. |
+| **`apply-registry-row`** | `apply-registry-row.py` | replace one deferred-anchor registry row with a lane's verbatim row text from a file. |
 | **`burndown-queue`** | `burndown-queue.py` | re-derive the prioritized burndown queue from the registry, production errors first. |
 | **`carriage-excludes`** | `carriage-excludes.py` | emit the transport exclude list for a gate carriage, derived from what git ignores rather than re-typed once per carriage. |
 | **`check-anchor-balance`** | `check-anchor-balance.py` | refuse a cycle that ends with more OPEN deferral-registry rows than it began. |
@@ -82,7 +84,8 @@ the other in the same commit.
 | **`compile-bench`** | `compile-bench.py`, `compile-bench.sh` | time dsscp against gcc/clang/MSVC/tcc on ONE host over a subject size ladder, naming every reference it could not find. |
 | **`corpus-census`** | `corpus-census.ps1`, `corpus-census.py`, `corpus-census.sh` | census the real-example corpus into a run-identified report instead of one overwritten log. |
 | **`examples-census`** | `examples-census.py` | re-derive every corpus-manifest figure examples/README.md states, by parsing the manifests. |
-| **`lane-worktree`** | `lane-worktree.ps1`, `lane-worktree.sh` | create and remove lane worktrees inside the ignored .worktrees/, refusing any root that would exceed Windows MAX_PATH. |
+| **`lane-fold`** | `lane-fold.py` | seed a lane worktree from the main tree and fold only that lane's real changes back. |
+| **`lane-worktree`** | `lane-worktree.ps1`, `lane-worktree.sh`, `test-lane-worktree.sh` | create and remove lane worktrees inside the ignored .worktrees/, refusing any root that would exceed Windows MAX_PATH. |
 | **`leg-tree`** | `leg-tree.sh` | put a gate host's own clone on the tree under test before a leg, and restore it to pristine afterwards. |
 | **`local-build`** | `local-build.ps1`, `local-build.sh` | build dsscp incrementally on this host, and optionally run ctest. |
 | **`macho-alias-ld64-matrix`** | `macho-alias-ld64-matrix.remote.sh`, `macho-alias-ld64-matrix.sh` | measure what Apple's ld64 does with a SECOND defined symbol at the same address as a canonical one, with and without -dead_strip. |
@@ -91,7 +94,10 @@ the other in the same commit.
 | **`profile-compile`** | `profile-compile-dispatch.sh`, `profile-compile-support.py`, `profile-compile.sh` | compile one fixed subject with a RELEASE dsscp on this host and report where the time went, so the HOST is the only variable across legs. |
 | **`refresh_landing_log`** | `refresh_landing_log.py`, `test_refresh_landing_log.py` | regenerate the PR landing-log hash anchors in the plans from git log. |
 | **`remote-leg`** | `remote-leg.sh` | run a DSS gate leg on a physical remote host -- push the working tree over a carriage, build clean, and run ctest through run-gate. |
+| **`repo-secrets`** | `repo-secrets.sh` | print the `.secrets` directory a checkout must read, following a lane worktree back to the main checkout that holds it. |
+| **`repo-tree`** | `repo-tree.ps1` | resolve the repository tree a PowerShell script is standing in, and keep that script's git enumeration and its file reads on the SAME root. |
 | **`run-gate`** | `run-gate.ps1`, `run-gate.sh` | run a gate command and REFUSE to report success without evidence that it ran. |
+| **`sqlite-round-trip`** | `sqlite-round-trip.py` | carry a sqlite leg's DSS-built artefacts to a machine that runs their target and prove they EXECUTE there (the round trip). |
 | **`sqlite-runtime-bench`** | `sqlite-runtime-bench.py` | measure the RUNTIME of an emitted sqlite3 binary, the standing runtime-differential instrument. |
 | **`ssh-arm64-vps`** | `ssh-arm64-vps.ps1`, `ssh-arm64-vps.sh` | reach the native aarch64 Linux VPS (the carriage; WSL only). |
 | **`ssh-macos`** | `ssh-macos.ps1`, `ssh-macos.sh` | reach the operator's physical macOS host (the carriage). |

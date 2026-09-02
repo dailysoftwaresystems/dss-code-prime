@@ -6,7 +6,7 @@ D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED -- the specie
 this guard mechanises.
 
 ★★★ WHY THIS EXISTS, AND WHY THE WINDOW IS MINUTES RATHER THAN CYCLES.
-An author writes *"X therefore stays refused fail-loud (D-SOME-ROW)"* while that
+An author writes *"X therefore stays refused fail-loud (D-SOME-…)"* while that
 row is OPEN. A sibling lane closes the row IN THE SAME COMMIT. The sentence was
 TRUE WHEN IT WAS TYPED and FALSE WHEN THE COMMIT LANDED -- and it still READS as
 evidence, so the next author is sent to fix an engine gap that no longer exists.
@@ -64,7 +64,7 @@ is the fix and not the gap. ✔MEASURED: admitting the copula moves the populati
 `stays`, `remains`, `not yet`, `today`, `currently` -- and every known instance is
 spelled that way, which is why the class is the whole of the positive test rather
 than one member of it.
-⚠ THE COST IS STATED RATHER THAN HIDDEN: a bare *"X is refused (D-CLOSED-ROW)"*
+⚠ THE COST IS STATED RATHER THAN HIDDEN: a bare *"X is refused (D-CLOSED-…)"*
 that went stale is NOT reported. That is the FP-safe direction, and this guard's
 first false accusation is the one that gets it turned off.
 
@@ -843,17 +843,19 @@ def list_sites(root):
 # guard has two distinct failures sharing exit 1 (a new site / a stale ceiling)
 # and three sharing exit 2, and an arm that checks only the code cannot tell which
 # one it proved. That exact mistake was measured in a sibling guard.
-# ⚠⚠ EVERY SYNTHETIC ROW NAME SPELLED IN THIS FILE CARRIES TWO SEGMENTS AFTER THE
-# `D-` (`D-XX-BAZ`), WHICH IS UNDER `anchor_registry_guard`'s THREE-SEGMENT
-# COLLECTION THRESHOLD while still being matched by `check-anchor-balance`'s
-# two-segment `ANCHOR_TOKEN` -- fixtures live in exactly that gap. A longer
-# literal here would be a citation of an anchor with no row, INSIDE the guard that
-# reports stale citations, and the registry guard refuses the whole tree for it.
-# ✔MEASURED on this file's first draft: a three-segment fixture reddened
+# ⚠⚠ EVERY SYNTHETIC ROW NAME IN THIS FILE IS ASSEMBLED FROM FRAGMENTS
+# (`"D-XX" + "-BAZ"`), NEVER SPELLED WHOLE. The two-segment gap this comment used
+# to describe CLOSED in P50: `anchor_registry_guard`'s threshold is `{1,}` since
+# 2026-09-01 (D-GATE-ANCHOR-REGISTRY-SEGMENT-THRESHOLD-HIDES-SEVENTY-ROWS), so a
+# bare two-segment fixture is now a citation of an anchor with no row, INSIDE the
+# guard that reports stale citations, and the registry guard refuses the whole
+# tree for it. `check-anchor-balance`'s two-segment `ANCHOR_TOKEN` still matches
+# the ASSEMBLED value at run time, which is what the arms need.
+# ✔MEASURED on this file's first draft: an over-threshold fixture reddened
 # `check-anchor-registry` at once. Settled precedent, not preference --
 # D-GATE-ANCHOR-BALANCE-SELFTEST-FIXTURES-ARE-ANCHOR-SHAPED renamed eleven such
 # names rather than allowlisting them, because an allowlist entry silences a name
-# repo-wide and forever.
+# repo-wide and forever; the fragment pattern is that ruling's successor.
 # ⚠ THE TRAP THAT ROW RECORDS FROM ITS OWN FIX IS PROSE: it came back twice, once
 # in a FAIL help string and once in a docstring that spelled a fixture out in
 # order to EXPLAIN the rename. So the comments and the help text obey the same
@@ -878,10 +880,11 @@ _PLAN_HEADER = ("| Anchor | Trigger | Closing work | Cross-refs |\n"
                 "| --- | --- | --- | --- |\n")
 # ★ THE SUBJECT'S NAME DELIBERATELY CARRIES A REFUSAL WORD, because that is the
 # false-positive class the mask exists for and a fixture that cannot reproduce it
-# cannot pin it. Two segments, so the registry guard never sees it.
-_CLOSED_ROW = "D-XX-REFUSED"
-_OPEN_ROW = "D-XX-BAR"
-_FILLER_ROW = "D-XX-BAZ"
+# cannot pin it. Assembled from fragments, so the registry guard's scan never
+# sees an anchor-shaped token in this source (the block above holds the why).
+_CLOSED_ROW = "D-XX" + "-REFUSED"
+_OPEN_ROW = "D-XX" + "-BAR"
+_FILLER_ROW = "D-XX" + "-BAZ"
 # ★ ASSEMBLED, NEVER WRITTEN, and for the reason `check-wrapped-anchor-ids`
 # records: a four-segment `D-…` literal in this file is a citation of an anchor
 # with no row, and `anchor_registry_guard` would refuse it. The arm that needs a
@@ -983,7 +986,7 @@ def selftest(root):
           hits("%s landed but %s still refuses it.\n" % (_CLOSED_ROW, _OPEN_ROW))
           == [])
     check("an id that names NO row is not a citation",
-          hits("it still stays refused (D-ZZ-NOSUCH).\n") == [])
+          hits("it still stays refused (%s).\n" % ("D-ZZ" + "-NOSUCH")) == [])
     check("a citation with no refusal claim is not a finding",
           hits("the memory-direction axis lives here (%s).\n" % _CLOSED_ROW) == [])
     check("a refusal claim with no citation is not a finding",

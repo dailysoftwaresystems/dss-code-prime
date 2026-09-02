@@ -3966,8 +3966,18 @@ TEST(LirCallconvAbiFC12c, SysVAndWin64VaListUnchanged) {
 }
 
 // Gate #9 (host-independent): an AAPCS64 variadic callee reserves the 192B callee-local
-// register-save-area + spills x0..x7 (GR) and v0..v7 (VR via fstur_q) into it. A
-// stubbed/absent spill emits zero save-area stores — the red-on-disable.
+// register-save-area + spills x0..x7 (GR) and v0..v7 (the SIMD&FP block, via the FP
+// class's own `fstur` AT WIDTH 128) into it. A stubbed/absent spill emits zero
+// save-area stores — the red-on-disable.
+//
+// ⚠⚠ THE FP HALF USED TO MATCH THE MNEMONIC `fstur_q`, AND THAT OPCODE NO LONGER
+// EXISTS. R1/R2 of design A′ folded it onto `fstur`'s WIDTH AXIS: the Q form is now
+// `fstur` at width 128, carrying the exact fixedWord the deleted opcode had. So the
+// match is opcode + WIDTH, and the width half is not incidental — it is the whole
+// content of the change. At `fstur`'s width-DEFAULT of 64 this prologue would store
+// eight of each register's sixteen bytes and `va_arg(double)` would read a save area
+// half-written from nowhere, at rc=0. Matching the bare mnemonic would be GREEN on
+// exactly that miscompile.
 TEST(LirCallconvVariadicFC12c, Aapcs64VariadicCalleeReservesAndSpillsSaveArea) {
     auto bundle = lowerThroughRewrite(
         "int sum(int n, ...) {\n"
@@ -3999,25 +4009,46 @@ TEST(LirCallconvVariadicFC12c, Aapcs64VariadicCalleeReservesAndSpillsSaveArea) {
     EXPECT_EQ(layout->vaRegSaveAreaSize, 192u);
 
     // Count store-shaped insts (a Reg source operand). The GR spill uses the class
-    // GPR store, the VR spill uses fstur_q — both are 4-operand stores with a Reg
-    // value source. We require AT LEAST gpSaveCount + fpSaveCount = 16 spill stores
-    // (a stubbed spill emits 0). The base is a scratch register (add scratch, sp, #off)
-    // so MemOffsets are small; matching by store-shape + the fstur_q opcode is robust.
-    auto const fsturQ = bundle.lowered.target->opcodeByMnemonic("fstur_q");
-    ASSERT_TRUE(fsturQ.has_value());
+    // GPR store, the FP spill uses the class FP store `fstur` at width 128 — both are
+    // 4-operand stores with a Reg value source. We require AT LEAST gpSaveCount +
+    // fpSaveCount = 16 spill stores (a stubbed spill emits 0). The base is a scratch
+    // register (add scratch, sp, #off) so MemOffsets are small; matching by
+    // store-shape + the opcode-and-width pair is robust.
+    auto const fstur = bundle.lowered.target->opcodeByMnemonic("fstur");
+    ASSERT_TRUE(fstur.has_value())
+        << "arm64 must declare the FP class store `fstur`; the Q form is its "
+           "width-128 variant, not a separate mnemonic";
+    EXPECT_FALSE(bundle.lowered.target->opcodeByMnemonic("fstur_q").has_value())
+        << "`fstur_q` is back as a second mnemonic for one instruction family's "
+           "widest arm — the shape R2 of design A′ removed, and the reason the "
+           "count below is width-gated rather than mnemonic-gated";
     Lir const& dst = result.lir;
     LirFuncId const fn = dst.funcAt(0);
-    std::uint32_t vrSpills = 0;   // fstur_q stores specifically (the VR block)
+    std::uint32_t fpSpills     = 0;  // `fstur` AT WIDTH 128 (the SIMD&FP block)
+    std::uint32_t narrowFpStores = 0;  // any `fstur` that is NOT 128 bits wide
     for (std::uint32_t bi = 0; bi < dst.funcBlockCount(fn); ++bi) {
         LirBlockId const b = dst.funcBlockAt(fn, bi);
         for (std::uint32_t i = 0; i < dst.blockInstCount(b); ++i) {
             LirInstId const inst = dst.blockInstAt(b, i);
-            if (dst.instOpcode(inst) == *fsturQ) ++vrSpills;
+            if (dst.instOpcode(inst) != *fstur) continue;
+            if (lirInstWidthBits(dst.instFlags(inst)) == 128) ++fpSpills;
+            else                                              ++narrowFpStores;
         }
     }
-    EXPECT_EQ(vrSpills, vl.fpSaveCount)
+    EXPECT_EQ(fpSpills, vl.fpSaveCount)
         << "the AAPCS64 prologue must spill all " << vl.fpSaveCount
-        << " VR arg registers via fstur_q (a stubbed/absent VR spill emits 0)";
+        << " FP arg registers via `fstur` at width 128 (a stubbed/absent FP "
+           "spill emits 0)";
+    EXPECT_EQ(narrowFpStores, 0u)
+        << "a save-area store came out at some width other than 128 — that is "
+           "the half-register spill the width flag exists to prevent, and it "
+           "leaves the tail of each 16-byte slot unwritten";
+    // ★ AND THE SLOT GEOMETRY MUST AGREE WITH THE WIDTH THAT WAS EMITTED. The
+    // store's width is derived from `fpSlotBytes`, so a layout and an
+    // instruction that disagree is the defect, not a rounding difference.
+    EXPECT_EQ(vl.fpSlotBytes * 8u, 128u)
+        << "the FP save slots are not 128 bits, so the width asserted above is "
+           "no longer the width this prologue should be emitting";
 }
 
 // FOLD #1 (adversarial-review) red-on-disable: the AAPCS64 variadic prologue's
@@ -4962,4 +4993,267 @@ TEST(LirCallconvVariadicFC12c, Aapcs64VarArgNonHfaStructStackAfterExhaustion) {
     EXPECT_GE(layout->outgoingArgAreaSize, 16u)
         << "the outgoing area must reserve ceil(16/8)*8 = 16 bytes for the forced "
            "{long,long} struct vararg (plus the 8 overflow longs' slots)";
+}
+
+// ── D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM ──────────────
+//
+// The chokepoint pins above are the INTEGER file's. These are the SIMD&FP
+// file's, and they are the ones that were missing: `selectFrameMemOp` swapped
+// only when the op it was handed was the universal GPR `load`/`store`, so an
+// FP frame access past the unscaled ±256 reach kept `fldur`/`fstur` and fail-
+// louded at the encoder with no form to select. ✔MEASURED before the fix:
+// `examples/c/varargs_aapcs64_struct` produced eight
+// `A_ImmediateOperandOutOfRange` refusals on 'fstur'/'fldur' at offsets
+// 256/272/288/320 and the function was dropped from the module.
+//
+// ★ THE FIXTURES ARE DETERMINISTIC AND DO NOT DEPEND ON THE OPTIMIZER. A
+// high-index `double` param is an INCOMING STACK slot at a displacement fixed
+// by the parameter INDEX, not by a register-pressure spill — the lesson OPT8
+// taught the integer pin one screen up, applied to this one from the start.
+
+TEST(LirCallconv, Aarch64HighStackDoubleParamUsesScaledFpFrameLoad) {
+    // EIGHTY fixed `double` params: AAPCS64 passes the first 8 in v0..v7 and
+    // the rest on the incoming stack, so p79 is read from `[sp + frame + 568]`.
+    // 568 alone is past the unscaled imm9 reach for ANY frame size, and the
+    // read's class is FPR — so the chokepoint must swap `fldur` for the FP
+    // class's OWN scaled twin, never for the integer one.
+    auto bundle = lowerThroughRewrite(
+        "double f(double p00,double p01,double p02,double p03,\n"
+        "         double p04,double p05,double p06,double p07,\n"
+        "         double p08,double p09,double p10,double p11,\n"
+        "         double p12,double p13,double p14,double p15,\n"
+        "         double p16,double p17,double p18,double p19,\n"
+        "         double p20,double p21,double p22,double p23,\n"
+        "         double p24,double p25,double p26,double p27,\n"
+        "         double p28,double p29,double p30,double p31,\n"
+        "         double p32,double p33,double p34,double p35,\n"
+        "         double p36,double p37,double p38,double p39,\n"
+        "         double p40,double p41,double p42,double p43,\n"
+        "         double p44,double p45,double p46,double p47,\n"
+        "         double p48,double p49,double p50,double p51,\n"
+        "         double p52,double p53,double p54,double p55,\n"
+        "         double p56,double p57,double p58,double p59,\n"
+        "         double p60,double p61,double p62,double p63,\n"
+        "         double p64,double p65,double p66,double p67,\n"
+        "         double p68,double p69,double p70,double p71,\n"
+        "         double p72,double p73,double p74,double p75,\n"
+        "         double p76,double p77,double p78,double p79) {\n"
+        "  return p08 + p40 + p79;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok());
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+
+    auto const fldrU = bundle.lowered.target->opcodeByMnemonic("fldr_u");
+    ASSERT_TRUE(fldrU.has_value())
+        << "arm64 must declare fldr_u — the SIMD&FP scaled unsigned-offset load";
+    EXPECT_GT(countOpcodeInModule(cc.lir, *fldrU), 0u)
+        << "an 80-double AAPCS64 callee must emit at least one fldr_u: p79 sits "
+           "at frame + 568, past the unscaled reach for ANY frame size. 0 means "
+           "the chokepoint is back to swapping only the integer file's op "
+           "(red-on-disable).";
+
+    // ★ AND THE INTEGER TWIN MUST NOT HAVE BEEN USED FOR AN FP LOAD. This is
+    // the arm that separates "the swap fired" from "the swap fired CORRECTLY":
+    // a lookup that returned the GPR twin for an FPR base op would also make
+    // the count above nonzero — with the double landing in an X register.
+    auto const loadU = bundle.lowered.target->opcodeByMnemonic("load_u");
+    ASSERT_TRUE(loadU.has_value());
+    EXPECT_NE(*fldrU, *loadU);
+
+    // The module must still assemble clean — the whole point is that the
+    // refusal is gone, not that a different opcode appears.
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    (void)assemble(cc.lir, *bundle.lowered.target, lirToMir, asmRep);
+    EXPECT_EQ(asmRep.errorCount(), 0u)
+        << "every beyond-reach FP frame load took the encodable scaled form";
+}
+
+// ── THE OUTGOING-ARGUMENT STORE TWIN OF THE ARM ABOVE ──────────────────────
+//
+// ★★ THIS PIN EXISTS AGAIN, AND ITS ABSENCE WAS THE WHOLE OF
+// D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO.
+// Lane `fo` wrote it in P47, measured ZERO scaled stores, and REMOVED it rather
+// than ship a green test about nothing — the correct call, and the row was
+// filed from it. What the row could not see is WHY: `lowerCToLir` passed a NULL
+// `ffiMap`, so the `double g(...);` PROTOTYPE this source needs was refused at
+// HIR->MIR, the call to it was dropped as an unbound Ref, and the module `fo`
+// measured had no call in it at all. `mirReporter` carried both errors and
+// `HirToMirResult.ok` was FALSE the entire time; the fixture returned them
+// unread. The map is threaded now and the fixture states its verdict, so the
+// same source lowers the same forty stores the CLI always emitted.
+//
+// ⚠ THE ARGUMENT COUNT WAS NEVER THE TRIGGER. `Aarch64HighStackDoubleParamUses
+// ScaledFpFrameLoad` above passes the identical eighty doubles as PARAMETERS
+// and always lowered clean, because a definition's parameter list mints no
+// extern node. The load twin worked and the store twin did not for one reason:
+// only the store twin needed a callee to call.
+TEST(LirCallconv, Aarch64HighOutgoingStackDoubleArgUsesScaledFpFrameStore) {
+    // EIGHTY outgoing `double` args: AAPCS64 passes the first 8 in v0..v7 and
+    // stores the rest at [sp + i*8], so the last lands at sp+568 — past the
+    // unscaled imm9 reach — and its class is FPR. The store direction must
+    // therefore reach for the FP file's OWN scaled twin, exactly as the load
+    // direction does one screen up.
+    //
+    // ⚠ THE ARGUMENTS ARE TWO PARAMETERS ALTERNATED, NOT EIGHTY CONSTANTS, AND
+    // THAT IS A MEASUREMENT RATHER THAN A STYLE CHOICE. Eighty distinct
+    // constants make eighty simultaneously-live FP vregs, and `lowerThroughRewrite`
+    // — which runs allocate → rewrite with none of the passes `compile_pipeline`
+    // interposes — then refuses with *"rewriteOneFunc: function 1 exhausted the
+    // per-class scratch pool"*. ✔MEASURED: the CLI compiles the identical
+    // eighty-constant source CLEAN on this target (`R_SpilledDueToPressure: func
+    // 1 spilled 49 vreg(s)`, artifact emitted), so the wall is this helper's
+    // shorter pipeline, NOT a codegen defect — and NOT something to widen the
+    // source until it squeaks past. Two live values keep the pressure at two
+    // while the outgoing offsets still climb to 568, which is the only property
+    // this pin is about.
+    auto bundle = lowerThroughRewrite(
+        "double g(\n"
+        "         double p00,double p01,double p02,double p03,\n"
+        "         double p04,double p05,double p06,double p07,\n"
+        "         double p08,double p09,double p10,double p11,\n"
+        "         double p12,double p13,double p14,double p15,\n"
+        "         double p16,double p17,double p18,double p19,\n"
+        "         double p20,double p21,double p22,double p23,\n"
+        "         double p24,double p25,double p26,double p27,\n"
+        "         double p28,double p29,double p30,double p31,\n"
+        "         double p32,double p33,double p34,double p35,\n"
+        "         double p36,double p37,double p38,double p39,\n"
+        "         double p40,double p41,double p42,double p43,\n"
+        "         double p44,double p45,double p46,double p47,\n"
+        "         double p48,double p49,double p50,double p51,\n"
+        "         double p52,double p53,double p54,double p55,\n"
+        "         double p56,double p57,double p58,double p59,\n"
+        "         double p60,double p61,double p62,double p63,\n"
+        "         double p64,double p65,double p66,double p67,\n"
+        "         double p68,double p69,double p70,double p71,\n"
+        "         double p72,double p73,double p74,double p75,\n"
+        "         double p76,double p77,double p78,double p79\n"
+        "        );\n"
+        "double f(double x, double y) {\n"
+        "  return g(\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y,\n"
+        "         x,y,x,y\n"
+        "        );\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    // ⚠ EACH STAGE REPORTS ITS OWN REFUSAL. `lowerThroughRewrite` RETURNS EARLY
+    // on a failed allocation, so a bare `ASSERT_TRUE(rewritten.ok)` names the
+    // wrong stage — the read-the-verdict discipline this pin exists to restore,
+    // applied to the stages BELOW the fixture.
+    ASSERT_TRUE(bundle.alloc.ok())
+        << (bundle.regallocRep.all().empty()
+                ? std::string{} : bundle.regallocRep.all()[0].actual);
+    ASSERT_TRUE(bundle.rewritten.ok)
+        << (bundle.rewriteRep.all().empty()
+                ? std::string{} : bundle.rewriteRep.all()[0].actual);
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok())
+        << (ccRep.all().empty() ? std::string{} : ccRep.all()[0].actual);
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+
+    auto const fstrU = bundle.lowered.target->opcodeByMnemonic("fstr_u");
+    ASSERT_TRUE(fstrU.has_value())
+        << "arm64 must declare fstr_u — the SIMD&FP scaled unsigned-offset "
+           "store, and the twin the loader refuses to accept fldr_u without";
+    EXPECT_GT(countOpcodeInModule(cc.lir, *fstrU), 0u)
+        << "an 80-double outgoing argument list must emit at least one fstr_u: "
+           "the trailing arguments sit past the unscaled reach whatever the "
+           "frame size. 0 means the chokepoint swaps only the integer file's "
+           "op — the defect D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-"
+           "MEMORY-FORM closed, in the direction its own lane could not pin.";
+
+    // The arm that separates "the swap fired" from "the swap fired CORRECTLY":
+    // the INTEGER twin must not have been used for an FP store, which would put
+    // the double in an X register on its way to memory.
+    auto const storeU = bundle.lowered.target->opcodeByMnemonic("store_u");
+    ASSERT_TRUE(storeU.has_value());
+    EXPECT_NE(*fstrU, *storeU);
+
+    // And it must still assemble: the point is that the refusal is gone, not
+    // that a different opcode appears.
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    (void)assemble(cc.lir, *bundle.lowered.target, lirToMir, asmRep);
+    EXPECT_EQ(asmRep.errorCount(), 0u)
+        << "every beyond-reach FP outgoing-argument store took the encodable "
+           "scaled form";
+}
+
+// The STORE direction is ALSO pinned outside this tier, and those pins stand:
+//   * `Arm64Encoder.FpScaledStore*` — the encoder, byte-exact, every leg;
+//   * `TargetRegisterClassPairOps.HalfTheLongReachPairIsLoadTimeFatal` —
+//     the config, which refuses a store direction without its twin;
+//   * `examples/c/fp_frame_scaled_reach_arm64` and
+//     `examples/c/varargs_aapcs64_struct` — RUN-witnessed under qemu, where
+//     a wrong store displacement changes the exit code.
+
+// AGNOSTIC corroboration: the SAME shape on x86_64 gains NO scaled form of any
+// class. x86_64 declares none — its memory ops carry a disp32 — so the
+// per-class lookup finds no twin and the chokepoint is inert. Guards against
+// the swap leaking onto a target that never needed it.
+TEST(LirCallconv, X8664HighStackDoubleParamHasNoScaledFpFrameOps) {
+    auto bundle = lowerThroughRewrite(
+        "double f(double p00,double p01,double p02,double p03,\n"
+        "         double p04,double p05,double p06,double p07,\n"
+        "         double p08,double p09,double p10,double p11,\n"
+        "         double p12,double p13,double p14,double p15,\n"
+        "         double p16,double p17,double p18,double p19,\n"
+        "         double p20,double p21,double p22,double p23,\n"
+        "         double p24,double p25,double p26,double p27,\n"
+        "         double p28,double p29,double p30,double p31,\n"
+        "         double p32,double p33,double p34,double p35,\n"
+        "         double p36,double p37,double p38,double p39) {\n"
+        "  return p08 + p20 + p39;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"x86_64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok());
+    EXPECT_FALSE(bundle.lowered.target->opcodeByMnemonic("fldr_u").has_value())
+        << "x86_64 must NOT declare fldr_u — the long-reach form is declared "
+           "by the targets that need one, never assumed by the chokepoint";
+    EXPECT_FALSE(bundle.lowered.target->opcodeByMnemonic("fstr_u").has_value());
 }

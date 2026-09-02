@@ -1,6 +1,7 @@
 #include "program/compile_pipeline.hpp"
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "core/substrate/path_identity.hpp"  // genericSpelling
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "asm/asm.hpp"
@@ -110,6 +111,16 @@ effectiveLongDoubleFormat([[maybe_unused]] TargetSchema const& target,
     // exists to fall back to (see the header docblock). `None` propagates as
     // the honest undeclared state; the semantic bind fails loud on it.
     return format.longDoubleFormat();
+}
+
+UnnamedBitFieldAlignment
+effectiveUnnamedBitFieldAlignment([[maybe_unused]] TargetSchema const& target,
+                                  ObjectFormatSchema const&            format) noexcept {
+    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: FORMAT-only — no target-side field
+    // exists to fall back to (see the header docblock). `None` propagates as the
+    // honest undeclared state; the layout engine fails loud on it, and only when an
+    // unnamed bit-field actually needs the rule.
+    return format.unnamedBitFieldAlignment();
 }
 
 // ── NOT HERE: `effectiveCharIsUnsigned` (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM)
@@ -347,10 +358,17 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // supplies only the alignment rule). A `sizeof` over a bit-field struct in an
     // array dimension then folds with the byte-ABI-exact layout.
     auto const effectiveBfStrategy = effectiveBitFieldStrategy(target, format);
+    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: resolved beside the strategy and
+    // overlaid at the SAME three consumer sites, because the two axes are read by one
+    // packer and a site that got one without the other would lay out to a mixture of
+    // two ABIs.
+    auto const effectiveUnnamedBfAlign =
+        effectiveUnnamedBitFieldAlignment(target, format);
     std::optional<AggregateLayoutParams> analyzeLayout;
     if (target.aggregateLayoutLoaded()) {
         analyzeLayout = target.aggregateLayout();
         analyzeLayout->bitFieldStrategy = effectiveBfStrategy;
+        analyzeLayout->unnamedBitFieldAlignment = effectiveUnnamedBfAlign;
     }
     // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2): capture the RESOLVED CC's
     // WHOLE `vaListLayout` block. Read from the SAME resolved CC the MirLoweringConfig
@@ -454,7 +472,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
                     "--resolve-library: failed to open '{}' for reading "
                     "(the resolve-library binary must exist + be readable at "
                     "compile time). Check the path.",
-                    lib.path.generic_string());
+                    core::genericSpelling(lib.path));
                 reporter.report(std::move(d));
                 continue;  // unopenable: nothing to classify, one message is enough
             }
@@ -844,6 +862,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // gnu_packed), not just whatever the target declared.
     mirCfg.aggregateLayout       = target.aggregateLayout();
     mirCfg.aggregateLayout.bitFieldStrategy = effectiveBfStrategy;
+    mirCfg.aggregateLayout.unnamedBitFieldAlignment = effectiveUnnamedBfAlign;
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
     // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75
@@ -995,6 +1014,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // D-CSUBSET-C11-THREADS-MACHO: capture the format's synth vehicle (win32/pthread +
     // import library) the SAME post-construction way as libraryShimRecipes, so the LOWER
     // half's `synthesizeThreadsShim` picks the right primitive family. nullopt on elf.
+    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: set post-construction (the
+    // `librarySynthesis` idiom) rather than positionally, so adding this axis cannot
+    // silently shift a neighbouring member of the aggregate initializer above.
+    cuMir.unnamedBitFieldAlignment = effectiveUnnamedBfAlign;
     cuMir.librarySynthesis = format.librarySynthesis();
     // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN (C4): the DECLARED rule, not the identity.
     cuMir.cSymbolDecoration = format.cSymbolDecoration().scheme;
@@ -1075,6 +1098,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          TargetSchema const&                         target,
                          DataModel                                   dataModel,
                          BitFieldStrategy                            bitFieldStrategy,
+                         UnnamedBitFieldAlignment                    unnamedBitFieldAlignment,
                          std::uint16_t                               callingConventionIndex,
                          CompilationUnitId                           cuId,
                          std::optional<ExternCallDispatch>           externCallDispatch,
@@ -1420,6 +1444,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     if (target.aggregateLayoutLoaded()) {
         globalsLayout = target.aggregateLayout();
         globalsLayout->bitFieldStrategy = bitFieldStrategy;
+        globalsLayout->unnamedBitFieldAlignment = unnamedBitFieldAlignment;
     }
     // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): find the target's ABSOLUTE-64 pointer
     // relocation kind by FORMULA (widthBytes==8 && !pcRelative), never by name —
@@ -1879,7 +1904,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::span<EntryMaterialization const> entryVerbs,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
-                     ObjectFormatKind                  fmtKind,
+                     std::string_view                  wideFloatSoftcallLibrary,
                      DiagnosticReporter&               reporter) {
     SemanticModel&       model   = cuMir.model;
     GrammarSchema const& grammar = *cuMir.grammar;
@@ -2083,25 +2108,34 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                  : std::string{};
     };
 
-    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): resolve the ACTIVE format's
-    // F128 softcall runtime library inline (fmtKind + the CU's target are both
-    // in scope here — no new CuMirModule field needed). Empty = the format
-    // declares none (nullopt → an F128 softcall fails loud).
-    std::string_view const wfLib =
-        cuMir.target->wideFloatSoftcallLibrary(fmtKind);
-    std::optional<std::string> wideFloatSoftcallLibrary =
-        wfLib.empty() ? std::nullopt
-                      : std::optional<std::string>(std::string(wfLib));
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the ACTIVE format's F128
+    // softcall runtime library. Empty = the format declares none (nullopt → an
+    // F128 softcall fails loud).
+    //
+    // ★ D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES (the residual half):
+    // THIS FUNCTION USED TO TAKE THE FORMAT'S *KIND* AND DO THE LOOKUP ITSELF.
+    // It now takes the RESOLVED LIBRARY — the fact — which is the same
+    // decomposition every other parameter here already follows: `processArgs`,
+    // `entryVerbs` and `sehPersonality` are all facts READ OFF the format by
+    // the caller rather than an identity this function re-interrogates. The
+    // caller holds the schema handle and is the right place to ask it; the
+    // lowering has no business knowing which FAMILY of object format it is
+    // serving, only what that family declared.
+    std::optional<std::string> wideFloatSoftcallLibraryOpt =
+        wideFloatSoftcallLibrary.empty()
+            ? std::nullopt
+            : std::optional<std::string>(
+                  std::string(wideFloatSoftcallLibrary));
 
     return lowerMirModuleToAssembly(
         cuMir.mir, model.lattice().interner(), nameOf,
         std::move(cuMir.externImports), userEntry, *cuMir.target,
-        cuMir.dataModel, cuMir.bitFieldStrategy,
+        cuMir.dataModel, cuMir.bitFieldStrategy, cuMir.unnamedBitFieldAlignment,
         cuMir.callingConventionIndex, cuMir.cuId,
         cuMir.externCallDispatch, cuMir.dataImportBinding,
         cuMir.externAddrBinding,
         cuMir.tlsAccess,
-        std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
+        std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt), reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -2124,6 +2158,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       TargetSchema const& target,
                       DataModel           dataModel,
                       BitFieldStrategy    bitFieldStrategy,
+                      UnnamedBitFieldAlignment unnamedBitFieldAlignment,
                       std::uint16_t       callingConventionIndex,
                       CompilationUnitId   cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
@@ -2153,7 +2188,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
     return lowerMirModuleToAssembly(
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
-        dataModel, bitFieldStrategy, callingConventionIndex, cuId,
+        dataModel, bitFieldStrategy, unnamedBitFieldAlignment,
+        callingConventionIndex, cuId,
         externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
 }
@@ -2584,6 +2620,69 @@ bool isRelocatableObjectFile(std::filesystem::path const& path,
         std::span<std::uint8_t const>{buf, got});
 }
 
+// D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE — the dispatch
+// and the drop, in one place, so neither can move without the other. Contract +
+// the severity measurement are on the declaration and on the diagnostic's own
+// docblock; this is only the mechanism.
+ResolveLibraryPartition
+partitionResolveLibraries(std::span<ResolveLibrarySpec const> libraries,
+                          ObjectFormatSchema const&           format,
+                          DiagnosticReporter&                 reporter) {
+    // ★ THE REPORT IS A CLOSURE OVER THE ARM, not a statement repeated in two
+    // branches. A second copy is how the archive arm and the object arm would
+    // come to disagree about what they say — which is the shape this whole
+    // surface has already paid for once (the asm binder restating `ingest()`'s
+    // symbol-version policy clause for clause).
+    auto const reportUnrecordable =
+        [&](ResolveLibrarySpec const&                lib,
+            DeclaredImportNameUnrecordableReason     reason) {
+            if (lib.declaredImportName.empty()) return;  // nothing was stated
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_DeclaredImportNameNotRecordable;
+            d.severity = DiagnosticSeverity::Warning;
+            // ⚠ BOTH VALUES, SPELLED OUT. The path is what the operator must
+            // find in their manifest or command line and the name is what they
+            // must move or delete; a message carrying only one of them sends
+            // the reader hunting for the other, which is the half of this
+            // anchor a bare "importName ignored" would have left open.
+            d.actual   = std::format(
+                "--resolve-library '{0}={1}': the declared import name '{1}' "
+                "is IGNORED for '{0}' (reason: {2}) -- {3}",
+                core::genericSpelling(lib.path), lib.declaredImportName,
+                declaredImportNameUnrecordableReasonName(reason),
+                declaredImportNameUnrecordableRemedy(reason));
+            reporter.report(std::move(d));
+        };
+
+    ResolveLibraryPartition out;
+    for (auto const& lib : libraries) {
+        // ★ THE ORDER OF THE THREE PROBES IS THE PRE-EXISTING ONE AND IS NOT
+        // ARBITRARY -- `ar` first (a container's members are objects, so the
+        // relocatable probe must never see the container), then the object
+        // probe asked OF THE FORMAT, then the dynamic residual. An unreadable
+        // path answers false to both and stays DYNAMIC, where the eager
+        // open-probe fails it loud; it is deliberately NOT reported here, since
+        // a file we could not classify has not been shown to be unable to carry
+        // the name, and one message about a bad path is enough.
+        if (isArArchiveFile(lib.path)) {
+            reportUnrecordable(
+                lib, DeclaredImportNameUnrecordableReason::MergedStaticArchive);
+            out.staticArchives.push_back(lib.path);
+        } else if (isRelocatableObjectFile(lib.path, format)) {
+            reportUnrecordable(
+                lib,
+                DeclaredImportNameUnrecordableReason::MergedRelocatableObject);
+            out.objectInputs.push_back(lib.path);
+        } else {
+            // The WHOLE SPEC rides to the dynamic side: this is the one arm
+            // that can record a stated identity, and it is the control that
+            // must stay silent.
+            out.dynamicLibraries.push_back(lib);
+        }
+    }
+    return out;
+}
+
 // ── D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT ────
 //
 // THE FORMAT AN ARCHIVE MEMBER **IS**, WHICH IS NOT THE FORMAT THE LINK IS
@@ -2674,7 +2773,7 @@ archiveMemberFormat(ArchiveMemberFormat&          cache,
             "relocatable member; the member's own object format {}. {} "
             "Anchored: D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-"
             "OBJECT-FORMAT.",
-            memberName, archivePath.generic_string(), linkFormat.name(),
+            memberName, core::genericSpelling(archivePath), linkFormat.name(),
             objectFormatName.empty()
                 ? std::string{"could not be resolved"}
                 : std::format("resolved to '{}' but could not be loaded",
@@ -2752,29 +2851,39 @@ readArchiveMemberModule(std::span<std::uint8_t const> memberBytes,
 
     CompilationUnitId const memberCu =
         substrate::mintMonotonicId<CompilationUnitId>();
-    switch (format.kind()) {
-        case ObjectFormatKind::Elf:
-            return elf::readRelocatableObject(
-                memberBytes, target, format, reporter, memberCu);
-        case ObjectFormatKind::MachO:
-            return macho::readRelocatableObject(
-                memberBytes, target, format, reporter, memberCu);
-        case ObjectFormatKind::Pe:
-            return pe::readRelocatableObject(
-                memberBytes, target, format, reporter, memberCu);
-        default: {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
-            d.severity = DiagnosticSeverity::Error;
-            d.actual   = std::format(
-                "archive member reader: object format '{}' (kind {}) has no "
-                "relocatable-object reader -- cannot pull archive members for "
-                "this format.",
-                format.name(), objectFormatKindName(format.kind()));
-            reporter.report(std::move(d));
-            return std::nullopt;
-        }
+
+    // ── D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES ────────────────────
+    //
+    // A 3-arm `switch (format.kind())` STOOD HERE, plus a `default:` arm that
+    // emitted the no-reader refusal. It is GONE: the member's own schema has
+    // already resolved to a backend, and reading a relocatable object is that
+    // backend's job — the exact counterpart of `encode`, which TF-C125 moved
+    // onto this same interface for this same reason.
+    //
+    // ★ THE `default:` ARM MOVED RATHER THAN VANISHING, AND IT GOT STRONGER.
+    // Its wording and F_ code are unchanged, but it now lives in the wasm and
+    // spirv backends as an OVERRIDE of a PURE VIRTUAL. A `default:` silently
+    // absorbs every format nobody thought about; a pure virtual makes a sixth
+    // backend unable to COMPILE without answering the question.
+    //
+    // ⚠ A null backend cannot reach here — `archiveMemberFormat` above returns
+    // a schema that LOADED, and a document with no resolvable `kind` is refused
+    // at load. Defended anyway, because `ObjectFormatSchema{ObjectFormatData}`
+    // is a public constructor and an in-memory producer bypasses that entirely.
+    link::ObjectFormatBackend const* const backend = format.backend();
+    if (backend == nullptr) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "archive member reader: object format '{}' resolved no backend -- "
+            "cannot read archive members for a schema with no format identity.",
+            format.name());
+        reporter.report(std::move(d));
+        return std::nullopt;
     }
+    return backend->readRelocatableObject(memberBytes, target, format,
+                                          reporter, memberCu);
 }
 
 std::optional<std::vector<AssembledModule>>
@@ -2804,7 +2913,7 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
             d.actual   = std::format(
                 "static-link: failed to open archive '{}' for reading "
                 "(D-LK-STATIC-LINK).",
-                archivePath.generic_string());
+                core::genericSpelling(archivePath));
             reporter.report(std::move(d));
             return std::nullopt;
         }
@@ -3124,7 +3233,7 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
             d.actual   = std::format(
                 "fat-archive: failed to open input static archive '{}' for "
                 "reading (D-FF1-STATICLIB-FAT-ARCHIVE).",
-                archivePath.generic_string());
+                core::genericSpelling(archivePath));
             reporter.report(std::move(d));
             return std::nullopt;
         }
@@ -3190,7 +3299,7 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
                 "a link input, so it cannot be skipped -- an omitted object "
                 "would link into a smaller image that may still run "
                 "(D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION).",
-                objectPath.generic_string());
+                core::genericSpelling(objectPath));
             reporter.report(std::move(d));
             return std::nullopt;
         }
@@ -3331,9 +3440,33 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
     // dispatch axis), never a format-name branch. Without this a PE static
     // library would ship SysV-only and MS link.exe could not resolve its
     // members (the c169 default was SysV; c171 threads the real flavor).
-    auto const flavor = (format.kind() == ObjectFormatKind::Pe)
-                            ? link::format::ArArchiveFlavor::Coff
-                            : link::format::ArArchiveFlavor::SysV;
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: this was
+    // `(format.kind() == ObjectFormatKind::Pe) ? Coff : SysV`. ⚠ THE COMMENT
+    // ABOVE USED TO DEFEND IT AS "the closed enum, the existing agnostic
+    // dispatch axis, never a format-name branch" — and that defence is exactly
+    // the rationalization the veto rejects: a closed enum keyed on IDENTITY is
+    // an identity branch whether it is spelled as an `if`, a `switch` or a
+    // table. The flavor is now DECLARED by the format that writes the archive.
+    // The switch below is over a declared VERB, not an identity, and the
+    // `-Werror=switch` backstop makes a new flavor a build error here rather
+    // than a silent SysV fallback.
+    link::format::ArArchiveFlavor flavor = link::format::ArArchiveFlavor::SysV;
+    switch (format.archiveFlavor()) {
+        case ArchiveFlavor::Coff: flavor = link::format::ArArchiveFlavor::Coff; break;
+        case ArchiveFlavor::SysV: flavor = link::format::ArArchiveFlavor::SysV; break;
+        case ArchiveFlavor::Unspecified:
+            // Unreachable through the loader (`validate()` requires the key on
+            // every `container: archive` format) and unreachable here anyway —
+            // this function only runs for an archive. Fail LOUD rather than
+            // write a guessed layout: a wrong `ar` variant produces a `.lib`
+            // whose members `link.exe` silently cannot resolve.
+            report(reporter, DiagnosticCode::C_MissingField,
+                   DiagnosticSeverity::Error,
+                   std::format("object format '{}' writes a static archive but "
+                               "declares no `archiveFlavor` — refusing to guess "
+                               "an archive layout", format.name()));
+            return false;
+    }
     auto const archive = link::format::writeArArchive(members, reporter, flavor);
     if (!tierClean(reporter, entry)) {
         return false;   // a writer fail-loud belt fired (name/size/offset).
@@ -3361,9 +3494,10 @@ assembleUnit(CompilationUnit const&        cu,
     auto cuMir = buildCuMir(cu, grammar, target, format,
                             callingConventionIndex, reporter, opts);
     if (!cuMir) return std::nullopt;
-    return lowerCuMirToAssembly(*cuMir, format.processArgs(),
-                                format.entryVerbs(), format.sehPersonality(),
-                                format.name(), format.kind(), reporter);
+    return lowerCuMirToAssembly(
+        *cuMir, format.processArgs(), format.entryVerbs(),
+        format.sehPersonality(), format.name(),
+        target.wideFloatSoftcallLibrary(format.kind()), reporter);
 }
 
 namespace {

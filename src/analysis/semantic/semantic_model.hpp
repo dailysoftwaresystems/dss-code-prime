@@ -5,7 +5,9 @@
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"  // c97: heterogeneous scope-binding lookup
 #include "core/types/data_model.hpp"
+#include "core/types/declared_qualification.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/section_kind.hpp"   // StaticInitSchedule (leaf header — no cycle)
 #include "core/types/semantic_config.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
@@ -178,6 +180,35 @@ struct DSS_EXPORT SymbolRecord {
     // found in the type subtree. A reassignment of a const symbol emits
     // S_ConstViolation.
     bool            isConst = false;
+    // ★★ P48 (D-CSUBSET-POINTEE-CONST-ENFORCEMENT): `isConst` above answers ONE
+    // question — is the declared OBJECT const — and that is why const enforcement
+    // stopped at a plain-identifier assignment LHS. Writing through a const
+    // POINTEE (`const char *p; *p = 'x';`), into a const MEMBER, or into an
+    // element of a const array all need the qualifier at a DEEPER derivation
+    // level, and this carries the whole spine: bit i == level i is const, level 0
+    // being the object itself and level i+1 what level i points to or contains.
+    //
+    // ★★★ IT IS A `QualifierSpine` AND NOT A `QualBit::Const` IN THE INTERNER,
+    // AND THAT IS THE ARCHITECTURE'S OWN ANSWER RATHER THAN A SHORTCUT. The row
+    // that asked for this named *"a transparent `ConstQual` mirroring c27's
+    // `VolatileQual`"* and called the choice a §B type-system decision. That fork
+    // has since been decided the other way and written down where the data lives
+    // — `declared_qualification.hpp` and `c.lang.json`'s `$p44RestrictMarkerComment`
+    // both state that `const` is deliberately NOT interned because *"interning it
+    // would perturb every type comparison in the compiler to serve one rule"*.
+    // `volatile` and `_Atomic` ARE interned because they change access codegen;
+    // `const` and `restrict` do not, and they ride this side channel instead.
+    //
+    // ⚠ ABSENT IS NOT UNQUALIFIED (the rule this header's producer states): a
+    // `nullopt` spine means the declarator shape was not modelled, and the
+    // const-lvalue check then makes NO claim about the deeper levels rather than
+    // inventing "unqualified". A missed diagnostic is the safe direction; a
+    // fabricated one refuses correct code.
+    //
+    // ⓘ Level 0 is deliberately NOT read by the const-lvalue check — `isConst`
+    // above stays the sole answer there, so every verdict that existed before P48
+    // is produced by exactly the code that produced it before.
+    std::optional<QualifierSpine> qualSpine;
     // c27 (D-CSUBSET-VOLATILE-POINTEE) RETIRED the c21 `isVolatile` bool: volatile
     // is now a TYPE qualifier (TypeKind::VolatileQual), so OBJECT-volatility is
     // read directly off a symbol's resolved `type` (top-level VolatileQual) at
@@ -343,16 +374,22 @@ struct DSS_EXPORT SymbolRecord {
     // object aliases; `InvalidSymbol` (default) for every other symbol. C99
     // §6.7.7p2: the size expression `n` is evaluated ONCE, when the typedef `R`
     // is reached, and FROZEN — every later `R a;` allocates with that frozen
-    // size. `R a;`'s VLA-ness comes entirely from the head alias, so the object's
-    // own declarator carries no size to capture; this field records WHICH typedef
-    // froze it. Set in `resolveDeclTypesPost` ONLY when the object's declared type
-    // is EXACTLY the head type (`declTy == headTy` — a pure `R a;`, no own suffix
-    // / stars) AND that head type is (or contains) a VLA; the `declTy == headTy`
-    // gate excludes the deferred stacked-suffix (`R a[m]`) and ptr (`R *p`)
-    // shapes. Read at HIR lowering (record a.v→R.v into `typedefVlaOriginBySymbol`
-    // + skip the object's own size capture) and threaded to HIR→MIR, where `R a;`'s
-    // alloca copies R's decl-frozen size slots down into its own. A dropped/unset
-    // origin is a safe fail-loud downstream (no captured size), never a miscompile.
+    // size. The object's VLA-ness comes from the head alias, in whole or in part,
+    // so this field records WHICH typedef froze it. Set in `resolveDeclTypesPost`
+    // when the head type CARRIES a runtime bound (`aliasHeadCarriesVla` — an array
+    // that is or contains a VLA, or a pointer whose pointee does) AND the declared
+    // type derives from that head by nothing but this declarator's own decoration
+    // (`declaredTypeDerivesFromAliasHead`): EXACTLY the head (`R a;`), the head
+    // under this declarator's own array suffix(es) (`R a[m];`), or a pointer to it
+    // (`R *p;`). ⚠ THE GATE USED TO BE THE BARE `declTy == headTy` AND THE TWO
+    // SHAPES IT EXCLUDED WERE THIS ROW'S RESIDUE — both are compiled and run by
+    // gcc 13.3.0 and clang 18.1.3 (✔MEASURED 2026-09-01, probed separately), so
+    // excluding them was a conformance gap. Read at HIR lowering (record a.v→R.v
+    // into `typedefVlaOriginBySymbol`, and capture the object's OWN suffixes when
+    // it has any) and threaded to HIR→MIR, where the object's alloca copies the
+    // alias's decl-frozen size slots down into its own and folds its own
+    // dimensions over them. A dropped/unset origin is a safe fail-loud downstream
+    // (no captured size), never a miscompile.
     SymbolId        vlaTypedefOrigin{};
     // FC16 (D-CSUBSET-NORETURN): TRUE iff this FUNCTION symbol is declared
     // `noreturn` (C11 6.7.4 `_Noreturn` / C23 6.7.12.7 `[[noreturn]]` / GNU
@@ -440,6 +477,25 @@ struct DSS_EXPORT SymbolRecord {
     // composes freely with `noinline`, `always_inline` and the pragma-borne
     // `isNoOptimize`. Default false.
     bool            isNoSanitizeThread = false;
+    // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: this FUNCTION
+    // symbol's place in the program's static-initializer schedule, from the
+    // `runBeforeEntry` / `runAfterEntry` attribute effects. Empty ⇒ an ordinary
+    // function, which is every symbol before this landed.
+    //
+    // ★ MERGED ACROSS DECLARATIONS FOR THE SAME REASON `isNoSanitizeThread` IS,
+    // and the merge is `StaticInitSchedule::mergeFrom` rather than an OR because
+    // the fact is not a bit: the ordinary C shape annotates a prototype in a
+    // header and defines plainly in the .c, and the DEFINITION's symbol is the one
+    // HIR→MIR stamps from, so the schedule has to survive the join with its
+    // PRIORITY intact. Strictest-wins there, so a re-declaration can pull an
+    // initializer earlier but never silently push it later.
+    //
+    // ★ FnSig-GATED at the fold site, the `isNoInline` discipline: this feeds a
+    // CODEGEN decision (a slot in an emitted table and a call from the entry
+    // trampoline), so a symbol whose kind cannot honor it must not carry it.
+    // `__attribute__((constructor)) int x;` is diagnosed by the shared decl-kind
+    // gate — the row declares `appliesTo: ["function"]` — and is inert here.
+    StaticInitSchedule staticInit{};
     // ★★ TF-C85: TRUE iff this FUNCTION symbol's declaration sits inside an MSVC
     // `#pragma optimize("", off)` region. Its two neighbours above come from an
     // ATTRIBUTE on the declaration; this one comes from a LEXICALLY SCOPED
@@ -551,6 +607,49 @@ struct DSS_EXPORT SymbolRecord {
     // B/C). Orthogonal to binding/visibility (a file-scope thread_local
     // keeps external linkage). Default false.
     bool            isThreadLocal = false;
+    // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH, C 6.2.2p3): TRUE iff
+    // this identifier has INTERNAL linkage — its declaration carries a
+    // `{staticStorage: true}` specifier (the SAME `linkageSpecifiers` facet the
+    // HIR linkage fold and the thread/static scans read) AND binds at FILE
+    // scope. A block-scope `static` object has NO linkage (6.2.2p6) and stays
+    // false; so do params, members and every extern/plain declaration.
+    //
+    // ★ IT INHERITS ACROSS THE REDECLARATION MERGE, AND THAT IS THE C RULE,
+    // NOT A CONVENIENCE. 6.2.2p4 gives a later `extern` (and, via p5, a later
+    // plain FUNCTION declaration) the linkage of the visible prior
+    // declaration, so `static int f(void); int f(void) { … }` makes the
+    // DEFINITION internal — and a third `static int f(void);` after it is a
+    // LEGAL redeclaration of an internal identifier (✔MEASURED: gcc, clang
+    // AND MSVC all accept the triple). `mergeOrCollideRedeclaration`
+    // OR-propagates this flag across every merged pair AT MERGE TIME (not in
+    // the post-1.5 sweep — the next merge in a chain reads the survivor's
+    // flag), which is exactly what keeps the S_LinkageRedeclarationMismatch
+    // check from firing on the inherited orderings.
+    //
+    // ★★ TWO CONSUMERS SINCE P51, AND THE SECOND ONE IS WHY THIS FIELD DECIDES
+    // BYTES. The merge's mismatch check reads it, and so does HIR EMISSION:
+    // `recordLinkage` (`src/hir/lowering/cst_to_hir.cpp`) takes `Local` binding
+    // from this flag when the declaration's own specifier fold left the default
+    // — D-CSUBSET-LINKAGE-INHERITED-INTERNAL-EMITS-GLOBAL. ⚠ THIS COMMENT USED
+    // TO SAY THE OPPOSITE ("HIR emission linkage still folds from each
+    // declaration's OWN tokens … a merged survivor whose own spelling lacks
+    // `static` still EMITS external — a measured, documented residue"), which
+    // was true when written and became false the day that row closed. It is
+    // corrected rather than deleted because the residue it described was the
+    // whole defect: a two-TU program using the 6.2.2p4 inheritance shape was
+    // REFUSED (K_SymbolRedefinedAcrossUnits) where gcc, clang and MSVC all
+    // build and run it.
+    //
+    // ⇒ A WRONG VALUE HERE IS NOW A WRONG BINDING, NOT A WRONG DIAGNOSTIC. That
+    // raised the cost of the position-blind mint this field was fed by and is
+    // how the storage scan's own position-blindness was found (the semantic
+    // twin of
+    // D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED):
+    // an attribute
+    // clause name spelled `static` marked a symbol internal and REMOVED it from
+    // the object. Anything added to the mint below owes that consequence a
+    // thought.
+    bool            isInternalLinkage = false;
     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
     // facts folded from the declaration's specifier prefix by
     // `scanAttributeSemantics` (Pass-1.5 declarator resolution — the
@@ -752,6 +851,14 @@ struct DSS_EXPORT SuppressedShippedSymbol {
     // recipe-less row's copy is simply unread today) so the field's meaning is
     // "what the descriptor declared", never "what one consumer needed".
     TypeId signature;
+    // ★★ P44 (item (a) of D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES):
+    // the descriptor row's `const` / `restrict` claim, carried verbatim from
+    // `ShippedSymbol::qualification`. `signature` above CANNOT hold it — neither
+    // qualifier is interned, so `fn(ptr<const<char>>, ...)` and
+    // `fn(ptr<char>, ...)` are the same TypeId by design — and C23 6.7.6.1p2
+    // makes a pointed-to qualifier part of the type for redeclaration
+    // compatibility. NULL is "this row says nothing", never "unqualified".
+    std::shared_ptr<DeclaredQualification const> qualification;
     // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the suppressed row's
     // per-target LINK BASE NAME (`ShippedSymbol::linkName`, already resolved for
     // the active target), or EMPTY. Rides here for the SAME reason `version`

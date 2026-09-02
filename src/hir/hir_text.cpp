@@ -2206,9 +2206,41 @@ public:
     // `parseType` production used by the module parser, then require the input to
     // be exhausted (no second type, no stray tokens). The grammar itself is the
     // private `parseType` below — this is only the single-type framing.
-    [[nodiscard]] TypeId parseTypeFromTextEntry() {
+    [[nodiscard]] TypeId parseTypeFromTextEntry(DeclaredQualification* outQual) {
+        // P44: the qualification channel is ARMED on this path unconditionally,
+        // not gated on `outQual`. Arming it is what makes `const<…>` a legal
+        // spelling here; gating it would make one descriptor row parse or fail
+        // depending on which consumer asked, which is a worse property than
+        // computing a claim nobody reads. The module path leaves it disarmed, so
+        // a `const<…>` in a HIR dump stays a loud malformed-type error.
+        qualArmed_ = true;
         TypeId const t = parseType();
         if (!peekIs(Tk::Eof)) malformed("unexpected trailing tokens after type");
+        // ★★★ A CLAIM IS MADE ONLY BY A TEXT THAT SPELLS A QUALIFIER, AND THAT
+        // GATE IS THE WHOLE "ABSENT IS NOT UNQUALIFIED" RULE, ENFORCED AT THE
+        // PRODUCER.
+        //
+        // Without `qualSawQualifier_` every signature yields a fully-populated
+        // spine whose bits happen to be zero — which is not silence, it is a
+        // POSITIVE claim of "unqualified" — and an unannotated corpus row then
+        // refuses correct C. ✔MEASURED, and it was not hypothetical: with the
+        // gate absent, DSS's OWN shipped runtime shims failed to compile —
+        // `void *opendir(const char *name)` in `runtime/platform/src/dirent.c`
+        // was refused against `dirent.json`'s unannotated `fn(ptr<char>) ->
+        // ptr<void>`, and `int truncate(const char *, long)` likewise. Both are
+        // correct C that gcc and clang accept; the descriptor simply had not
+        // been annotated yet, and silence had been read as a statement.
+        //
+        // ★ THE GRANULARITY IS THE ROW, NOT THE PARAMETER, AND THAT IS RIGHT
+        // rather than convenient: an annotated row's signature was verified as an
+        // EXACT type against both references, so every one of its positions is
+        // stated, including the deliberately-unqualified ones (`sprintf`'s first
+        // parameter really is `char *`). Claiming only the qualified positions
+        // would silently un-judge the others.
+        if (outQual != nullptr && qualTopFilled_ && qualSawQualifier_
+            && !qualTop_.empty()) {
+            *outQual = std::move(qualTop_);
+        }
         return t;
     }
 
@@ -2222,6 +2254,71 @@ private:
     // empty on the module path). Storage owned by the caller.
     std::span<NamedTypeBinding const> namedTypes_;
     std::uint32_t preCounter_ = 0;
+
+    // ── P44: THE QUALIFICATION SIDE CHANNEL (type-text path only) ────────────
+    //
+    // `const` and `restrict` are not interned, so they cannot ride the TypeId
+    // `parseType` returns. They ride here, as the level-indexed bitsets the C23
+    // oracle compares — the SAME `QualifierSpine` the semantic declarator walk
+    // builds, assembled by the same rule: level 0 is the outermost derivation,
+    // the base sits deepest, and a qualifier keyword is NOT a level of its own.
+    //
+    // ⚠ `qualModelled_` IS THE HONEST-SILENCE SWITCH. A constructor this channel
+    // cannot place in a C derivation chain (`ref`, `nullable`, `optional`,
+    // `slice`, `vec`, `mat`, `ext`) clears it, and the frame then yields NO
+    // CLAIM rather than a spine with the wrong number of levels. A wrong level
+    // count does not merely miss a diagnostic — it makes two comparable spines
+    // incomparable, or worse, two different types compare equal.
+    bool          qualArmed_     = false;
+    // Set by the FIRST `const<…>` / `restrict<…>` this text contains. See
+    // `parseTypeFromTextEntry` for why a claim exists only when one appeared.
+    bool          qualSawQualifier_ = false;
+    bool          qualModelled_  = true;
+    std::uint32_t qualDepth_     = 0;
+    std::uint32_t qualMaxDepth_  = 0;
+    std::uint64_t qualConst_     = 0;
+    std::uint64_t qualRestrict_  = 0;
+    std::vector<std::pair<std::uint8_t,
+                          std::shared_ptr<DeclaredQualification const>>>
+                          qualFnParams_;
+    DeclaredQualification qualTop_;
+    bool                  qualTopFilled_ = false;
+
+    // One spine's worth of state, saved while a SIBLING chain is parsed. Each
+    // parameter of a function — and the result of the TOP-LEVEL one — is its own
+    // chain with its own level 0, exactly as `harvestFunctionQualification`
+    // treats them on the semantic side.
+    struct QualFrame {
+        bool          modelled;
+        std::uint32_t depth;
+        std::uint32_t maxDepth;
+        std::uint64_t constBits;
+        std::uint64_t restrictBits;
+        std::vector<std::pair<std::uint8_t,
+                              std::shared_ptr<DeclaredQualification const>>> fn;
+    };
+    [[nodiscard]] QualFrame qualPush() {
+        QualFrame f{qualModelled_, qualDepth_, qualMaxDepth_, qualConst_,
+                    qualRestrict_, std::move(qualFnParams_)};
+        qualModelled_ = true; qualDepth_ = 0; qualMaxDepth_ = 0;
+        qualConst_ = 0; qualRestrict_ = 0; qualFnParams_.clear();
+        return f;
+    }
+    [[nodiscard]] std::optional<QualifierSpine> qualPop(QualFrame&& f) {
+        std::optional<QualifierSpine> out;
+        if (qualArmed_ && qualModelled_ && qualMaxDepth_ < 63) {
+            QualifierSpine sp;
+            sp.levels       = static_cast<std::uint8_t>(qualMaxDepth_ + 1);
+            sp.constBits    = qualConst_;
+            sp.restrictBits = qualRestrict_;
+            sp.fnParams     = std::move(qualFnParams_);
+            out = std::move(sp);
+        }
+        qualModelled_ = f.modelled; qualDepth_ = f.depth;
+        qualMaxDepth_ = f.maxDepth; qualConst_ = f.constBits;
+        qualRestrict_ = f.restrictBits; qualFnParams_ = std::move(f.fn);
+        return out;
+    }
 
     // ── token helpers ────────────────────────────────────────────────────────
     [[nodiscard]] Tk peekKind() const { return lex_.peek().kind; }
@@ -3350,9 +3447,46 @@ private:
         return ts;
     }
     [[nodiscard]] TypeId parseType() {
+        // P44: the DEEPEST point this chain reaches is the base, and the base's
+        // depth is what makes `levels`. Recorded here rather than at each leaf
+        // arm, so a leaf added later cannot forget to count itself.
+        if (qualArmed_ && qualDepth_ > qualMaxDepth_) qualMaxDepth_ = qualDepth_;
         if (!peekIs(Tk::Ident)) { malformed("expected a type"); return InvalidType; }
         std::string kw = lex_.take().text;
         if (kw == "invalid") return InvalidType;
+        // ★★ P44 — THE QUALIFIER SPELLING, AND IT RETURNS ITS OPERAND UNCHANGED.
+        // `const<T>` / `restrict<T>` record a bit at the CURRENT derivation level
+        // and hand back T's own TypeId: neither qualifier is interned, so there
+        // is nothing to wrap, and a qualifier is not a derivation level of its
+        // own (`const char *` is a 2-level spine, not a 3-level one). Checked
+        // BEFORE `primFromName` so a language that ever named a primitive `const`
+        // could not shadow it silently.
+        //
+        // ⚠ LOUD ON THE MODULE PATH. `qualArmed_` is only set by the standalone
+        // type-text entry; in a HIR module dump this is a malformed type, because
+        // the printer cannot emit it back and a silently-round-tripped-away
+        // qualifier is exactly the silent drop this project refuses.
+        if (kw == "const" || kw == "restrict") {
+            if (!qualArmed_) {
+                malformed("`" + kw + "<…>` is a qualification spelling for a "
+                          "standalone TYPE TEXT (a shipped-library descriptor "
+                          "signature) only — it has no HIR-module rendering, "
+                          "because neither qualifier is interned and the printer "
+                          "could not emit it back");
+                return InvalidType;
+            }
+            expect(Tk::LAngle, "'<'");
+            qualSawQualifier_ = true;
+            if (qualDepth_ < 63) {
+                if (kw == "const") qualConst_    |= (std::uint64_t{1} << qualDepth_);
+                else               qualRestrict_ |= (std::uint64_t{1} << qualDepth_);
+            } else {
+                qualModelled_ = false;
+            }
+            TypeId const e = parseType();   // SAME depth — not a derivation level
+            expect(Tk::RAngle, "'>'");
+            return e;
+        }
         if (auto p = primFromName(kw)) {
             // D-LANG-TYPE-IDENTITY-VOCABULARY: an OPTIONAL quoted VOCABULARY TAG
             // after the core (`u64 "unsigned long long"`, the `struct "N"` naming
@@ -3367,14 +3501,25 @@ private:
             if (peekIs(Tk::Str)) return interner_.primitive(*p, lex_.take().text);
             return interner_.primitive(*p);
         }
-        auto wrap1 = [&](TypeId (TypeInterner::*fn)(TypeId)) -> TypeId {
-            expect(Tk::LAngle, "'<'"); TypeId e = parseType(); expect(Tk::RAngle, "'>'"); return (interner_.*fn)(e);
+        // P44: `addsLevel` says whether this constructor is a DERIVATION LEVEL in
+        // the C sense — the thing a `QualifierSpine` counts. `ptr` is; a qualifier
+        // skin is not. `modelled` says whether the constructor can appear in a C
+        // declarator chain AT ALL: the four non-C ones below clear the flag so the
+        // frame yields NO CLAIM instead of a spine whose level count is a guess.
+        auto wrap1 = [&](TypeId (TypeInterner::*fn)(TypeId), bool addsLevel = false,
+                         bool modelled = true) -> TypeId {
+            expect(Tk::LAngle, "'<'");
+            if (!modelled) qualModelled_ = false;
+            if (addsLevel) ++qualDepth_;
+            TypeId e = parseType();
+            if (addsLevel) --qualDepth_;
+            expect(Tk::RAngle, "'>'"); return (interner_.*fn)(e);
         };
-        if (kw == "ptr") return wrap1(&TypeInterner::pointer);
-        if (kw == "ref") return wrap1(&TypeInterner::reference);
-        if (kw == "nullable") return wrap1(&TypeInterner::nullable);
-        if (kw == "optional") return wrap1(&TypeInterner::optional);
-        if (kw == "slice") return wrap1(&TypeInterner::slice);
+        if (kw == "ptr") return wrap1(&TypeInterner::pointer, /*addsLevel=*/true);
+        if (kw == "ref") return wrap1(&TypeInterner::reference, false, /*modelled=*/false);
+        if (kw == "nullable") return wrap1(&TypeInterner::nullable, false, false);
+        if (kw == "optional") return wrap1(&TypeInterner::optional, false, false);
+        if (kw == "slice") return wrap1(&TypeInterner::slice, false, false);
         // C99 _Complex (D-CSUBSET-COMPLEX, M1): `complex<elem>` reinterns via the
         // single-operand `complex` builder — the appendType twin. Placed among the
         // wrap1 keywords (the `signature` decode of `__builtin_complex`'s
@@ -3422,14 +3567,18 @@ private:
         }
         if (kw == "fnptr") { expect(Tk::LAngle, "'<'"); (void)parseType(); expect(Tk::RAngle, "'>'");
             malformed("fnptr<> is not constructible in this interner"); return InvalidType; }
-        if (kw == "vec") { expect(Tk::LAngle, "'<'"); TypeId e = parseType(); expect(Tk::Comma, "','");
+        if (kw == "vec") { expect(Tk::LAngle, "'<'"); qualModelled_ = false; TypeId e = parseType(); expect(Tk::Comma, "','");
             std::int64_t n = static_cast<std::int64_t>(takeInt()); expect(Tk::RAngle, "'>'");
             return interner_.vector(e, n); }
-        if (kw == "mat") { expect(Tk::LAngle, "'<'"); TypeId e = parseType(); expect(Tk::Comma, "','");
+        if (kw == "mat") { expect(Tk::LAngle, "'<'"); qualModelled_ = false; TypeId e = parseType(); expect(Tk::Comma, "','");
             std::int64_t r = static_cast<std::int64_t>(takeInt()); expect(Tk::Comma, "','");
             std::int64_t c = static_cast<std::int64_t>(takeInt()); expect(Tk::RAngle, "'>'");
             return interner_.matrix(e, r, c); }
-        if (kw == "arr") { expect(Tk::LAngle, "'<'"); TypeId e = parseType(); expect(Tk::Comma, "','");
+        if (kw == "arr") { expect(Tk::LAngle, "'<'");
+            // P44: an array IS a derivation level, and it sits OUTSIDE the stars
+            // in `declaratorDeclaredType`'s fold — the same placement the
+            // semantic spine walk gives it.
+            ++qualDepth_; TypeId e = parseType(); --qualDepth_; expect(Tk::Comma, "','");
             std::int64_t n = static_cast<std::int64_t>(takeInt()); expect(Tk::RAngle, "'>'");
             return interner_.array(e, n); }
         if (kw == "tuple") { expect(Tk::LAngle, "'<'"); auto ts = parseTypeListUntil(Tk::RAngle); expect(Tk::RAngle, "'>'");
@@ -3577,21 +3726,64 @@ private:
             // `...` variadic marker is accepted as the last "param" instead of
             // tripping parseType's "expected a type". Shapes: `fn()`, `fn(i32)`,
             // `fn(ptr<char>, i32, ...)` (variadic), `fn(...)` (variadic, no fixed).
+            // ★★ P44 — ONE SYNTAX, TWO PLACES IN A QUALIFICATION CLAIM, AND THE
+            // DISCRIMINATOR IS THE DEPTH. At depth 0 this `fn` IS the signature
+            // being decoded, so its result and its parameters become the
+            // top-level `DeclaredQualification` — exactly the shape
+            // `harvestFunctionQualification` builds for a function DECLARATOR,
+            // whose fn suffix likewise adds no level. NESTED (under a `ptr<>`, the
+            // only way a function type can be an operand) it is a LEVEL: its
+            // parameters ride `fnParams` at that level and its RESULT continues
+            // as the deeper levels of the SAME spine, which is the placement the
+            // declarator ordering rule `ctors(D') ++ suffixes(D) ++ reverse(L(D))`
+            // produces. The two sides model it identically or they cannot compare.
+            bool const qualTopSig =
+                qualArmed_ && qualDepth_ == 0 && !qualTopFilled_;
+            auto const qualFnLevel = static_cast<std::uint8_t>(qualDepth_);
             expect(Tk::LParen, "'('");
             std::vector<TypeId> params;
+            std::vector<std::optional<QualifierSpine>> paramSpines;
             bool isVariadic = false;
             while (!peekIs(Tk::RParen) && !peekIs(Tk::Eof)) {
                 if (accept(Tk::Ellipsis)) { isVariadic = true; break; }   // `...` only valid trailing
+                QualFrame f = qualPush();
                 params.push_back(parseType());
+                paramSpines.push_back(qualPop(std::move(f)));
                 if (!accept(Tk::Comma)) break;
             }
             expect(Tk::RParen, "')'");
-            expect(Tk::Arrow, "'->'"); TypeId result = parseType();
+            expect(Tk::Arrow, "'->'");
+            TypeId result = InvalidType;
+            if (qualTopSig) {
+                QualFrame f = qualPush();
+                result = parseType();
+                auto resultSpine = qualPop(std::move(f));
+                qualTop_.result = std::move(resultSpine);
+                qualTop_.params = std::move(paramSpines);
+                qualTopFilled_  = true;
+            } else {
+                if (qualArmed_) {
+                    auto claim = std::make_shared<DeclaredQualification>();
+                    claim->params = std::move(paramSpines);
+                    if (!claim->empty() && qualFnLevel < 63) {
+                        qualFnParams_.emplace_back(
+                            qualFnLevel,
+                            std::shared_ptr<DeclaredQualification const>(
+                                std::move(claim)));
+                    }
+                    ++qualDepth_;
+                    result = parseType();
+                    --qualDepth_;
+                } else {
+                    result = parseType();
+                }
+            }
             CallConv cc = CallConv::CcSysV;
             if (acceptKeyword("cc")) { std::string n = takeIdent(); cc = orMalformed(kCallConvTable, n, "calling convention", CallConv::CcSysV); }
             return interner_.fnSig(params, result, cc, isVariadic);
         }
         if (kw == "ext") {
+            qualModelled_ = false;   // P44: not a C derivation chain — make no claim
             std::string name = takeStr();
             expect(Tk::LParen, "'('"); auto args = parseTypeListUntil(Tk::RParen); expect(Tk::RParen, "')'");
             std::vector<std::int64_t> scalars;
@@ -3678,14 +3870,15 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
 
 TypeId parseTypeFromText(std::string_view typeText, TypeInterner& interner,
                          TypeRegistry& typeReg, DiagnosticReporter& reporter,
-                         std::span<NamedTypeBinding const> namedTypes) {
+                         std::span<NamedTypeBinding const> namedTypes,
+                         DeclaredQualification* outQual) {
     std::size_t const errBefore = reporter.errorCount();
 
     // Reuse the ONE type-grammar decoder: drive the module parser's `parseType`
     // production over `typeText`, interning into the caller's interner/registry.
     Parser parser{typeText, interner, typeReg, reporter};
     parser.setNamedTypes(namedTypes);   // c82: caller-supplied identifier aliases
-    TypeId const ty = parser.parseTypeFromTextEntry();
+    TypeId const ty = parser.parseTypeFromTextEntry(outQual);
 
     // A standalone type string must be exactly one type. Trailing tokens (e.g.
     // `"i32 i32"`) are malformed — `parseTypeFromTextEntry` reports them.
@@ -3694,7 +3887,13 @@ TypeId parseTypeFromText(std::string_view typeText, TypeInterner& interner,
     // truncated `"fn(ptr<"`, an unknown keyword, leftover tokens), the text did
     // not name a well-formed type — return InvalidType rather than let a
     // half-built type escape as if it were valid.
-    if (reporter.errorCount() != errBefore) return InvalidType;
+    if (reporter.errorCount() != errBefore) {
+        // A half-built type must not escape, and NEITHER must a half-built claim:
+        // a spine harvested from text that failed to decode would describe levels
+        // the type does not have. Both halves are discarded together.
+        if (outQual != nullptr) *outQual = DeclaredQualification{};
+        return InvalidType;
+    }
     return ty;
 }
 

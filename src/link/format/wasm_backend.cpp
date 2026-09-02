@@ -28,12 +28,15 @@
 #include "link/format/object_format_backends.hpp"
 
 #include "core/substrate/diagnostic_collector.hpp"
+#include "core/types/parse_diagnostic.hpp"
 #include "link/format/wasm.hpp"
 #include "link/object_format_schema.hpp"
 
 #include "link/object_format_identity_doc.hpp"
 
 #include <cstdint>
+#include <format>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -227,6 +230,35 @@ public:
         return wasm::encode(module, targetSchema, objectFormatSchema,
                                   reporter);
     }
+
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: this format has NO
+    // relocatable-object reader, and says so ITSELF.
+    //
+    // ★ THE REFUSAL MOVED HERE FROM A SHARED `default:` ARM, AND THAT IS WHY
+    // THE METHOD IS PURE VIRTUAL. A `default:` silently absorbs every format
+    // nobody thought about; a pure virtual makes a SIXTH backend unable to
+    // compile without answering. The wording and the F_ code are unchanged, so
+    // the diagnostic a caller sees is byte-identical to the switch's.
+    [[nodiscard]] std::optional<AssembledModule>
+    readRelocatableObject(std::span<std::uint8_t const> bytes,
+                          TargetSchema const&           targetSchema,
+                          ObjectFormatSchema const&     objectFormatSchema,
+                          DiagnosticReporter&           reporter,
+                          CompilationUnitId             cuId) const override {
+        (void)bytes; (void)targetSchema; (void)cuId;
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "archive member reader: object format '{}' (kind {}) has no "
+            "relocatable-object reader -- cannot pull archive members for "
+            "this format.",
+            objectFormatSchema.name(),
+            objectFormatKindName(objectFormatSchema.kind()));
+        reporter.report(std::move(d));
+        return std::nullopt;
+    }
+
 };
 
 } // namespace

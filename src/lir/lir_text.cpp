@@ -753,13 +753,18 @@ private:
     // shortened form round-trip byte-for-byte instead.
     std::vector<std::uint32_t>                  currentBlockSuccSlots_;
     bool                                        errors_ = false;
-    // Set ONLY by `refuseTerminator` — "the open block was left without a
-    // terminator, on purpose, with a diagnostic already reported". Distinct
-    // from `errors_` (which every recoverable diagnostic sets and the parser
-    // deliberately keeps parsing through, so one bad inst still yields one
-    // diagnostic per bad inst). This flag is NOT recoverable: `LirBuilder`
-    // hard-`abort()`s on the NEXT `beginBlock`/`addFunction` when a block is
-    // unterminated, so the parse must stop driving the builder immediately.
+    // Set ONLY through `markUnterminatedBlock` — "a block was abandoned in a
+    // state `LirBuilder` cannot close, on purpose, with a diagnostic already
+    // reported". Two shapes reach it: an OPEN block left without a terminator
+    // (a refused terminator, or one panic-skipped away with the malformed
+    // instruction that carried it), and a pre-created block never
+    // `beginBlock`'d because its body brace was missing.
+    //
+    // Distinct from `errors_`, which every recoverable diagnostic sets and the
+    // parser deliberately keeps parsing through, so one bad inst still yields
+    // one diagnostic per bad inst. THIS flag is NOT recoverable: `LirBuilder`
+    // hard-`abort()`s on the next `beginBlock`/`addFunction`/`finish()` in
+    // either shape, so the parse must stop driving the builder immediately.
     bool                                        unterminatedBlock_ = false;
 
     void emit(DiagnosticCode code, std::string what) {
@@ -771,17 +776,48 @@ private:
         errors_ = true;
     }
 
-    // Refuse a terminator the dispatch cannot materialize: report, and mark
-    // the open block unterminated. The two halves are INSEPARABLE, which is
-    // why they live in one helper rather than at each call site:
+    // Refuse to leave the open block sealed: report, mark the block
+    // unterminated, and poison the builder. The three halves are
+    // INSEPARABLE, which is why they live in one helper rather than at each
+    // call site:
     //   * reporting without the flag = "diagnostic, then `std::abort()`" —
     //     the builder's `beginBlock`/`closeFunction_` invariant check fires
     //     next and kills the process, naming the builder instead of the
     //     opcode the parser actually refused;
-    //   * flagging without the diagnostic = the silent drop this closes.
+    //   * flagging without the diagnostic = the silent drop this closes;
+    //   * both without the poison = a guarantee resting on the parser's own
+    //     `return`s. `LirBuilder::poison` exists precisely because a caller
+    //     that READS a refusal flag and keeps driving the builder anyway
+    //     compiles clean and still aborts (D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE).
+    //     This parser is such a caller: three `return`s and two loop guards
+    //     stand between a refusal here and `finish()`. Poisoning makes the
+    //     worst case an EMPTY module beside an already-emitted diagnostic
+    //     instead of a process kill, so the safety no longer depends on
+    //     every one of those five sites staying correct.
+    //
+    // ⚠ NAMED FOR THE OUTCOME, NOT THE CALLER. Most call sites are the
+    // terminator dispatch refusing an opcode it cannot materialize; the
+    // `parseBlock` site (D-LIR-TEXT-PARSE-UNSEALED-BLOCK-ABORT) reaches the
+    // SAME state from the other direction — a block whose terminator never
+    // arrived at all, because a malformed NON-terminator instruction was
+    // panic-skipped past it or the block simply held none. One state, one
+    // unwind: adding a second would give the two halves of one class two
+    // different failure modes.
     void refuseTerminator(std::string what) {
         emit(DiagnosticCode::I_TextMalformed, std::move(what));
+        markUnterminatedBlock();
+    }
+
+    // The MARK half of `refuseTerminator`, split out for the paths whose
+    // diagnostic was already emitted by whatever detected the problem
+    // (`resolveTargets`' unknown-successor report, and `parseInst`'s
+    // per-instruction diagnostics ahead of the `parseBlock` sealing check).
+    // ⚠ NEVER call this without having reported first — a flag with no
+    // diagnostic is exactly the silent drop `refuseTerminator` exists to
+    // prevent. It is private to that pairing, not a general "give up".
+    void markUnterminatedBlock() {
         unterminatedBlock_ = true;
+        builder_.poison();
     }
 
     [[nodiscard]] std::unique_ptr<LirParseResult> makeEmptyResult() {
@@ -1457,6 +1493,14 @@ private:
         if (it == blockMap_.end()) {
             emit(DiagnosticCode::I_TextUnknownName,
                  std::format("block ^b{} not pre-declared", slot));
+            // D-LIR-TEXT-PARSE-BLOCK-HEADER-WITHOUT-BODY-BRACE-ABORT.
+            // `scanBlockHeaders` pre-created a `LirBlockId` for every depth-1
+            // `block ^bN` it saw; abandoning this one leaves at least one of
+            // those never `beginBlock`'d, which is its own `closeFunction_`
+            // fatal (*"block created but never `beginBlock`'d"*) on the next
+            // `addFunction`. Same class as the unsealed-block row, same
+            // unwind — the diagnostic is out, so stop driving the builder.
+            markUnterminatedBlock();
             return;
         }
         // Optional `[entry]` marker — informational only; the LIR
@@ -1494,7 +1538,26 @@ private:
             }
             (void)expect(TokKind::RBracket);
         }
-        if (!expect(TokKind::LBrace)) return;
+        // ★★ D-LIR-TEXT-PARSE-BLOCK-HEADER-WITHOUT-BODY-BRACE-ABORT
+        // — THE BODY BRACE IS WHAT MAKES THE PRE-CREATED BLOCK REAL. Without
+        // it `beginBlock` is never called for a block `scanBlockHeaders`
+        // already created, and `closeFunction_` kills the process on the next
+        // `addFunction` with *"block created but never `beginBlock`'d"* — the
+        // sibling fatal of the unsealed-block one below, reached from a
+        // malformed block HEADER instead of a malformed instruction, and
+        // hidden by the same asymmetry (harmless in the last function, fatal
+        // in any earlier one).
+        //
+        // ⚠ ✔MEASURED, AND THE MEASUREMENT CORRECTED THE FIRST ACCOUNT OF IT:
+        // whether this is reachable depends on whether the corruption keeps
+        // the BRACES PAIRED. A `{` simply DELETED desynchronises
+        // `scanBlockHeaders`' count, the module loop's panic skip then stops
+        // at the first `}`, no later `function` is reached and nothing
+        // aborts. A `{` REPLACED by another token leaves every brace paired,
+        // the parse walks on to the next function, and `closeFunction_`
+        // fires. The pin uses the second shape; the first was written,
+        // measured GREEN against the mutant, and discarded.
+        if (!expect(TokKind::LBrace)) { markUnterminatedBlock(); return; }
         builder_.beginBlock(it->second);
         while (true) {
             Tok pk = lex_.peek();
@@ -1502,6 +1565,52 @@ private:
             parseInst();
         }
         (void)expect(TokKind::RBrace);
+        // ★★★ D-LIR-TEXT-PARSE-UNSEALED-BLOCK-ABORT — THE OTHER HALF OF THE
+        // REFUSAL CLASS THE TERMINATOR DISPATCH ALREADY HANDLES.
+        //
+        // Every `refuseTerminator` above answers "the terminator ARRIVED and
+        // this parser cannot materialize it". Nothing answered "the
+        // terminator never arrived at all", and that is the state the ENTIRE
+        // panic-mode recovery family lands in: an unknown mnemonic, a
+        // non-identifier where the mnemonic belongs, a missing `;`, a missing
+        // `payload=`/`flags=` tail — each reports its diagnostic and then
+        // `skipToNextInstOrBlockEnd`s, which is correct recovery for a
+        // NON-terminator and silently drops the block's seal when the
+        // instruction it skipped WAS the terminator. A block holding only
+        // well-formed non-terminators, or no instruction at all, reaches the
+        // same state with no diagnostic whatsoever.
+        //
+        // ⚠ WHY THIS WAS INVISIBLE FOR THE WHOLE LIFE OF THE FILE: an
+        // unsealed FINAL block never reaches the abort, because `finalize`
+        // short-circuits on `errors_` before `builder_.finish()` runs. Only a
+        // NON-final block does — the next `parseBlock` calls `beginBlock`,
+        // whose *"current block has no terminator"* fatal kills the process on
+        // input the parser exists to reject. Every malformed-input test in the
+        // suite happened to sit on the one non-aborting arrangement.
+        //
+        // The check asks the BUILDER, which already tracks the seal for its
+        // own guards (`openBlockIsTerminated`, the read half published for
+        // `mir_to_lir`'s `asm goto`). A parser-side mirror flag set at each
+        // successful terminator call would be a second copy of arena state,
+        // and state that mirrors the arena is state that can disagree with it
+        // — the lesson `LirBuilder::hasAnyInst` was introduced to record.
+        //
+        // `unterminatedBlock_` is re-checked because the dispatch refusals
+        // have ALREADY named this exact block — re-reporting there would be
+        // two diagnostics for one cause. It is deliberately NOT extended to
+        // `errors_`: a per-instruction diagnostic says WHICH instruction was
+        // rejected, never that the block lost its seal, and that second fact
+        // is what explains why the parse stops at this block instead of
+        // continuing to the next. One diagnostic per unsealed block is
+        // bounded, unlike the per-token cascade
+        // `skipToNextInstOrBlockEnd` exists to prevent.
+        if (!unterminatedBlock_ && !builder_.openBlockIsTerminated()) {
+            refuseTerminator(std::format(
+                "block ^b{} closes without a terminator instruction; every LIR "
+                "block must end in one, and a `.dsslir` reader may not kill the "
+                "process over text that does not",
+                slot));
+        }
     }
 
     // ── instructions / operands ────────────────────────────────────
@@ -1890,7 +1999,7 @@ private:
                         } else {
                             // `resolveTargets` already reported the unknown
                             // successor; still a refusal, so flag the block.
-                            unterminatedBlock_ = true;
+                            markUnterminatedBlock();
                         }
                         return;
                     }
@@ -1928,7 +2037,7 @@ private:
                                              mnem.text, ts->size()));
                         } else {
                             // Ditto the Br arm: `resolveTargets` reported it.
-                            unterminatedBlock_ = true;
+                            markUnterminatedBlock();
                         }
                         return;
                     }
@@ -1994,7 +2103,7 @@ private:
                                              mnem.text));
                         } else {
                             // Ditto the Br arm: `resolveTargets` reported it.
-                            unterminatedBlock_ = true;
+                            markUnterminatedBlock();
                         }
                         return;
                     }

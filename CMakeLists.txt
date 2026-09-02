@@ -650,6 +650,174 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/scripts/check-shell-portability/check-shell-portability.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    # Lane-worktree scratchpad gate (2026-09-01, P50 —
+    # D-CYCLE-LANE-WORKTREE-REMOVE-DISCARDS-AN-UNPRESERVED-SCRATCHPAD).
+    # `lane-worktree.sh remove` used to delete a lane's ignored scratchpad without
+    # asking, and the preserve step was a convention living in the orchestrator's head.
+    # ✔MEASURED the day this landed: a `cp … && lane-worktree remove` one-liner lost a
+    # lane's whole evidence tree because the destination's parent did not exist, `cp`
+    # failed, and the absence of output read as success. The gate moved the rule into
+    # the tool; this entry is what keeps it there.
+    # ★ INTEGRATION ARMS BY NECESSITY — the defect was in what the verb DOES to a real
+    # tree, not in a predicate that could be unit-tested, so each arm drives the real
+    # script against a real worktree and asserts the MESSAGE of the refusal it names.
+    # ⚠ It creates and removes its own `$$`-suffixed lanes and cleans up on both paths,
+    # so a parallel `ctest -j` cannot collide with itself or with a live lane.
+    #
+    # ⛔⛔ 2026-09-01 (P51, lane `gw`) — THIS ENTRY'S GREEN WAS A PROPERTY OF THE
+    # SHELL THE OPERATOR HAPPENED TO LAUNCH ctest FROM, NOT OF THE TREE, AND P50'S
+    # CYCLE REPORT PUBLISHED IT AS A TREE MEASUREMENT ("Windows 1884/1884,
+    # including all 21 repo guards"). It is the ONLY bash-launched ctest entry in
+    # this file, so nothing else was exposed and nothing else caught it.
+    # ✔MEASURED, four arms, each with the child's own tool census taken:
+    #   PATH as ctest hands it today, cwd = the tree      git yes, dirname NO,
+    #     mktemp NO   -> rc=1  "CANNOT RUN -- .../lane-worktree.sh is missing"
+    #   PATH + the bash's own directory PREPENDED         all three present
+    #                                                     -> rc=0  "OK - 9 assertions"
+    #   PATH REPLACED by bashdir + system32               git NO
+    #                                                     -> rc=1  "CANNOT RUN -- add failed"
+    #   PATH + bashdir, cwd = a DIFFERENT checkout        all three present
+    #                                                     -> rc=1  "FAILED - the
+    #                                                     scratchpad gate is not
+    #                                                     doing what it says"
+    # ★ `dirname`, `mktemp`, `rm`, `cp` and `md5sum` are EXTERNAL binaries in
+    # Git-for-Windows' `usr/bin`, not shell builtins, and ctest launches bash
+    # NON-LOGIN with its own inherited PATH — so the profile that normally puts
+    # `usr/bin` on PATH never runs. Patching `dirname` out of the script would be a
+    # workaround that moves the death two lines down onto `mktemp`.
+    # ★★ HENCE `path_list_prepend` AND NOT `ENVIRONMENT "PATH=..."`: the third arm
+    # above is what a REPLACING form produces — `usr/bin` present, `git` gone,
+    # and a DIFFERENT refusal. The inherited environment must be MODIFIED, never
+    # rebuilt, and the value is derived from the bash CMake actually found rather
+    # than hardcoded. (`ENVIRONMENT_MODIFICATION` needs CMake >= 3.22; this project
+    # requires 4.0.)
+    # ★★★ AND THE BASH IS PROVED, NOT TRUSTED TO SEARCH ORDER. On this host bare
+    # `bash` also resolves to `C:/WINDOWS/system32/bash.exe`, the WSL shim, which
+    # cannot open a `C:/...` path at all — a host ordering PATH differently would
+    # get a `bash` for which this whole entry is meaningless. `find_program` picked
+    # Git's on both configures here, which is luck, not a guarantee. The probe below
+    # runs the found bash, WITH the prepended PATH, against the two facts the script
+    # actually needs: that it can see the repository through the native-form path it
+    # will be handed, and that the external toolchain resolves.
+    # ⚠ A FAILED PROBE REGISTERS A FAILING TEST RATHER THAN SKIPPING. A guard that
+    # quietly does not exist is precisely how P50 published a figure that was not
+    # about the tree; `if(bash)` alone would repeat that in a new spelling.
+    if(NOT WIN32 OR CMAKE_HOST_WIN32)
+        # ⛔⛔ AND SEARCH ORDER ALONE IS NOT ENOUGH EITHER — the "luck" above RAN OUT
+        # the same day it was written. ✔MEASURED 2026-09-01 (P51, lanes `ei` and `fa`
+        # independently): in a FRESH build directory on this host `find_program(NAMES
+        # bash)` resolves to `C:/WINDOWS/system32/bash.exe`, the WSL shim, and the
+        # probe below then correctly refuses — so EVERY newly-configured Windows build
+        # reddened this entry. The earlier configures only passed because
+        # DSS_BASH_FOR_LANE_GUARD was already CACHED from a shell that had Git first.
+        # ⇒ A refusal that is right about a host that HAS a working bash is still a
+        # gate figure keyed on the operator's PATH, which is the very thing the probe
+        # exists to stop. So the candidates are ENUMERATED and each is PROVED, and the
+        # first that passes wins; the refusal is reserved for a host where NONE does.
+        # ★ THE EXTRA CANDIDATE IS DERIVED, NEVER HARDCODED: Git for Windows ships
+        # bash beside its own `git`, so `git`'s location yields `<root>/bin/bash` and
+        # `<root>/usr/bin/bash`. A host without Git contributes nothing here and falls
+        # back to PATH exactly as before.
+        set(_dss_lane_probe
+            "test -f '${CMAKE_SOURCE_DIR}/scripts/lane-worktree/lane-worktree.sh' && command -v dirname >/dev/null && command -v mktemp >/dev/null && command -v git >/dev/null")
+        if(CMAKE_HOST_WIN32)
+            string(ASCII 59 _dss_lane_path_sep)
+        else()
+            set(_dss_lane_path_sep ":")
+        endif()
+        set(_dss_lane_candidates "")
+        # An explicit -DDSS_BASH_FOR_LANE_GUARD is honoured FIRST: an operator who
+        # names a bash is answering this question deliberately.
+        if(DSS_BASH_FOR_LANE_GUARD)
+            list(APPEND _dss_lane_candidates "${DSS_BASH_FOR_LANE_GUARD}")
+        endif()
+        # ⚠ ANCESTORS, NOT "THE PARENT" — ✔MEASURED, and the first draft got this wrong in
+        # a way its own red-on-disable arm caught: `git` is at `<root>/cmd/git.exe` when
+        # PATH comes from PowerShell, but at `<root>/mingw64/bin/git.exe` when it comes
+        # from Git Bash. Taking one level up yields `<root>/mingw64`, which holds no
+        # bash, so the derivation silently produced NOTHING and the entry refused — the
+        # CONTROL arm went red beside the mutant, which is how the defect surfaced.
+        find_program(_dss_lane_git NAMES git NO_CACHE)
+        if(_dss_lane_git)
+            get_filename_component(_dss_lane_anc "${_dss_lane_git}" DIRECTORY)
+            foreach(_dss_lane_up RANGE 3)
+                get_filename_component(_dss_lane_anc "${_dss_lane_anc}" DIRECTORY)
+                foreach(_dss_lane_rel "bin/bash.exe" "usr/bin/bash.exe" "bin/bash" "usr/bin/bash")
+                    if(EXISTS "${_dss_lane_anc}/${_dss_lane_rel}")
+                        list(APPEND _dss_lane_candidates "${_dss_lane_anc}/${_dss_lane_rel}")
+                    endif()
+                endforeach()
+            endforeach()
+        endif()
+        find_program(_dss_lane_path_bash NAMES bash NO_CACHE)
+        if(_dss_lane_path_bash)
+            list(APPEND _dss_lane_candidates "${_dss_lane_path_bash}")
+        endif()
+        list(REMOVE_DUPLICATES _dss_lane_candidates)
+        set(_dss_lane_tried "")
+        foreach(_dss_lane_cand IN LISTS _dss_lane_candidates)
+            get_filename_component(_dss_lane_cand_dir "${_dss_lane_cand}" DIRECTORY)
+            set(_dss_lane_saved_path "$ENV{PATH}")
+            set(ENV{PATH} "${_dss_lane_cand_dir}${_dss_lane_path_sep}${_dss_lane_saved_path}")
+            execute_process(
+                COMMAND "${_dss_lane_cand}" -c "${_dss_lane_probe}"
+                RESULT_VARIABLE _dss_lane_cand_rc
+                OUTPUT_VARIABLE _dss_lane_cand_out
+                ERROR_VARIABLE  _dss_lane_cand_err)
+            set(ENV{PATH} "${_dss_lane_saved_path}")
+            string(APPEND _dss_lane_tried " [${_dss_lane_cand} -> exit ${_dss_lane_cand_rc}]")
+            if(_dss_lane_cand_rc EQUAL 0)
+                set(DSS_BASH_FOR_LANE_GUARD "${_dss_lane_cand}" CACHE FILEPATH
+                    "bash proved able to run the lane-worktree scratchpad guard" FORCE)
+                break()
+            endif()
+        endforeach()
+        set(_dss_lane_refusal "")
+        if(DSS_BASH_FOR_LANE_GUARD)
+            get_filename_component(_dss_lane_bash_dir "${DSS_BASH_FOR_LANE_GUARD}" DIRECTORY)
+            # `_dss_lane_path_sep` is derived ONCE above, with `string(ASCII 59 ...)`
+            # rather than a literal `;` — which CMake would read as a list separator
+            # in the middle of the PATH being built.
+            set(_dss_lane_saved_path "$ENV{PATH}")
+            set(ENV{PATH} "${_dss_lane_bash_dir}${_dss_lane_path_sep}${_dss_lane_saved_path}")
+            # The SAME probe text the selection loop used — one owner, so the arm that
+            # CHOOSES a bash and the arm that REFUSES one cannot come to disagree.
+            execute_process(
+                COMMAND "${DSS_BASH_FOR_LANE_GUARD}" -c "${_dss_lane_probe}"
+                RESULT_VARIABLE _dss_lane_bash_rc
+                OUTPUT_VARIABLE _dss_lane_bash_out
+                ERROR_VARIABLE  _dss_lane_bash_err)
+            set(ENV{PATH} "${_dss_lane_saved_path}")
+            if(NOT _dss_lane_bash_rc EQUAL 0)
+                set(_dss_lane_refusal
+                    "lane_worktree_guard CANNOT RUN: the bash CMake found (${DSS_BASH_FOR_LANE_GUARD}) could not, with its own directory prepended to PATH, both open ${CMAKE_SOURCE_DIR}/scripts/lane-worktree/lane-worktree.sh and resolve dirname, mktemp and git (probe exit ${_dss_lane_bash_rc}). On Windows a bare 'bash' can resolve to the WSL shim, which cannot open a C:/ path at all. Point DSS_BASH_FOR_LANE_GUARD at a bash that can, or install Git for Windows. This test FAILS rather than disappearing, because a guard that silently does not run publishes a gate figure that is about the operator's PATH and not about the tree.")
+            endif()
+        else()
+            set(_dss_lane_refusal
+                "lane_worktree_guard CANNOT RUN: no bash on this host could both open ${CMAKE_SOURCE_DIR}/scripts/lane-worktree/lane-worktree.sh and resolve dirname, mktemp and git, so the scratchpad gate for lane-worktree.sh was never exercised. Candidates tried, each with its own directory prepended to PATH:${_dss_lane_tried} (empty means no bash was found at all). On Windows a bare 'bash' can resolve to the WSL shim, which cannot open a C:/ path; Git for Windows' bin/bash.exe or usr/bin/bash.exe can. Point -DDSS_BASH_FOR_LANE_GUARD at one that works. This test FAILS rather than disappearing, because a guard that silently does not run publishes a gate figure that is about the host and not about the tree.")
+        endif()
+        if(_dss_lane_refusal STREQUAL "")
+            add_test(
+                NAME lane_worktree_guard
+                COMMAND "${DSS_BASH_FOR_LANE_GUARD}"
+                        "${CMAKE_SOURCE_DIR}/scripts/lane-worktree/test-lane-worktree.sh"
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            # ⚠ MODIFIES the inherited environment; see the measured note above for
+            # what a REPLACING `ENVIRONMENT` property costs.
+            set_tests_properties(lane_worktree_guard PROPERTIES
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
+        else()
+            set(_dss_lane_refusal_script
+                "${CMAKE_CURRENT_BINARY_DIR}/lane_worktree_guard_refusal.cmake")
+            file(WRITE "${_dss_lane_refusal_script}"
+                 "message(FATAL_ERROR \"${_dss_lane_refusal}\")\n")
+            add_test(
+                NAME lane_worktree_guard
+                COMMAND ${CMAKE_COMMAND} -P "${_dss_lane_refusal_script}")
+            message(STATUS "lane_worktree_guard registered as a REFUSAL: ${_dss_lane_refusal}")
+        endif()
+    endif()
+
     # Citation-stability guard (2026-08-19 — D-PLANS-CITATION-LINE-NUMBERS-SILENTLY-INVALIDATED).
     # A `path:line` citation is a claim about a file that nothing rechecks: insert
     # one line above it and it silently points at unrelated prose while still
@@ -1011,6 +1179,51 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/scripts/check-stale-refusal-citations/check-stale-refusal-citations.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Repo-tree guard (2026-09-01 — D-SCRIPT-GUARDS-ASK-GIT-FROM-THE-LANE-WORKTREE).
+    # `scripts/repo-tree/repo-tree.ps1` is the PowerShell owner of "which tree am I
+    # standing in?", the third and last of the three one-per-language resolvers
+    # (`leg_tree_driver_identity` for .sh, `_git_prefix` for .py). This entry runs
+    # its arms.
+    #
+    # ★★ WHAT IT PINS, AND WHY NOTHING ELSE COULD. `Set-Location` moves the
+    # PowerShell provider location — which native children (git) inherit — and does
+    # NOT move `[Environment]::CurrentDirectory`, which is what every `[IO.File]`
+    # relative read follows. A guard built from both ENUMERATES FROM ONE TREE AND
+    # READS FROM ANOTHER, and when both roots hold the path — which is all of them,
+    # for a lane that only EDITS files — nothing throws: the verdict is simply about
+    # the wrong tree. ✔MEASURED 2026-09-01 on `check-line-endings.ps1`, which died
+    # on a lane-only file and would otherwise have passed silently.
+    # ⇒ The arms build a REAL `git worktree add` fixture (so the lane's `.git` is a
+    # FILE), put DIFFERENT bytes at the SAME relative path in the two roots, and run
+    # a CHILD process standing in the wrong one. A CONTROL arm reproduces the defect
+    # on demand, so the positive arm cannot pass vacuously.
+    # ⚠ A self-test run only from the main checkout would be vacuous BY CONSTRUCTION
+    # here — the defect exists only where two roots hold the same path — which is
+    # why the fixture manufactures both roots instead of hoping to be run inside one.
+    # ✔RED-ON-DISABLE 2026-09-01: removing the one `[Environment]::CurrentDirectory`
+    # assignment from `Enter-RepoTree` reds arms 3 and 6 BY NAME (rc 0 -> 1, md5
+    # moved and returned); the unmutated control is green on both sides of it.
+    #
+    # ⓘ PowerShell-only by nature, so it is REQUIRED on Windows (the host whose
+    # ctest run this repository treats as primary, and the only host where a lane
+    # worktree is created) and registered elsewhere only if pwsh is present. It is
+    # never SKIPPED on Windows: a pin that quietly does not run is the failure class
+    # this file is full of refusals about.
+    if(WIN32)
+        find_program(DSS_PWSH_FOR_REPO_TREE_GUARD NAMES pwsh powershell REQUIRED)
+    else()
+        find_program(DSS_PWSH_FOR_REPO_TREE_GUARD NAMES pwsh)
+    endif()
+    if(DSS_PWSH_FOR_REPO_TREE_GUARD)
+        add_test(
+            NAME repo_tree_guard
+            COMMAND "${DSS_PWSH_FOR_REPO_TREE_GUARD}"
+                    -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_SOURCE_DIR}/scripts/repo-tree/repo-tree.ps1"
+                    --selftest
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    endif()
 endif()
 
 # ── `repo-guard`: the label that lets an indirect leg skip what it cannot learn ──

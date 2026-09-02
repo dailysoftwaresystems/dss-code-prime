@@ -31,6 +31,7 @@
 #include "core/types/config_key_vocabulary.hpp"  // detail::{keysOf,renderAllowedList}
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/elf.hpp"
+#include "link/format/elf_object_reader.hpp"
 #include "link/object_format_schema.hpp"
 
 #include "link/object_format_identity_doc.hpp"
@@ -820,6 +821,21 @@ public:
         (void)request;
         return elf::encode(module, targetSchema, objectFormatSchema, reporter);
     }
+
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the read counterpart of
+    // `encode` above. `compile_pipeline.cpp::readArchiveMemberModule` used to
+    // pick this call with a 3-arm `switch (format.kind())`; the backend the
+    // member's own schema already resolved to now answers for itself.
+    [[nodiscard]] std::optional<AssembledModule>
+    readRelocatableObject(std::span<std::uint8_t const> bytes,
+                          TargetSchema const&           targetSchema,
+                          ObjectFormatSchema const&     objectFormatSchema,
+                          DiagnosticReporter&           reporter,
+                          CompilationUnitId             cuId) const override {
+        return elf::readRelocatableObject(bytes, targetSchema,
+                                         objectFormatSchema, reporter, cuId);
+    }
+
 };
 
 } // namespace

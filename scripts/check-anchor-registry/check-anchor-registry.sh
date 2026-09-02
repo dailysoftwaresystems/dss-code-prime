@@ -38,8 +38,24 @@ cd "${REPO_ROOT}"
 
 # Anchor regex: D- followed by 3+ uppercase-or-digit segments separated by `-`.
 # Same pattern the developer-side audit grep uses (see the cross-plan
-# staleness sweep commit message). Two-segment names like `D-OPT` are
-# treated as informal; the registry contract enforces ≥3 segments.
+# staleness sweep commit message).
+# ★★★ THE THRESHOLD IS `{1,}` SINCE 2026-09-01 (P50, operator ruling R3) — one
+# hyphen group after the head makes a name FORMAL. It was `{2,}`, and that hid
+# SEVENTY registered rows from this guard: the registry's own ANCHOR-NAME RULE
+# spells a compound feature word as ONE segment (`ALWAYSINLINE`), so its worked
+# example turned a four-segment id this guard checked into a three-segment id it
+# ignored — the rule written to prevent guard failures was MANUFACTURING
+# guard-invisible anchors. ✔SIZED 2026-09-01 before the flip: 195 ids became
+# visible, 97 of them resolving (rows like D-CSUBSET-VLA at 275 citations, plus
+# plan-side prose), and every non-resolver was a guard self-test FIXTURE inside
+# `scripts/` — now assembled from fragments below, NEVER allowlisted. Full
+# sizing, the refused rename alternative and the stop-condition:
+# D-GATE-ANCHOR-REGISTRY-SEGMENT-THRESHOLD-HIDES-SEVENTY-ROWS.
+# ⚠ HEAD-ONLY names (`D-OPT`) STAY informal — the carve-out the rule exists
+# for, pinned by the widened-core self-test arms below.
+# ⚠ `scripts/anchors/anchors.py` deliberately keeps `{2,}` for MINTING a NEW
+# row (stricter than resolution is the safe direction — nothing mintable is
+# invisible); do not "sync" it to this without the operator asking.
 # ── THE LEADING `\<` IS LOAD-BEARING; the `.ps1` twin spells it `\b` ──────────
 # It stops the regex reaching INSIDE a longer hyphenated word and lifting a false
 # anchor out of its tail. The live case is the phrase `FIXED-32-BIT-WORD` at
@@ -49,8 +65,11 @@ cd "${REPO_ROOT}"
 # ⚠ Do NOT illustrate that tail by writing it out as a standalone literal — it
 # becomes a citation of an anchor with no row, in the guard's own source. The
 # `.ps1` twin carried exactly that from TF-C111 until AP6 (2026-08-14) and it was
-# the sole thing blocking `scripts/` from being scanned. Any placeholder must stay
-# UNDER the threshold: `D-XX-EXAMPLE` is inert here, three segments are not.
+# the sole thing blocking `scripts/` from being scanned. ⚠ Under `{1,}` there is
+# no under-the-threshold placeholder any more except a HEAD-ONLY name — any
+# hyphenated example is a citation now, so a fixture or illustration is
+# ASSEMBLED FROM ADJACENT LITERALS (`"D-XX""-EXAMPLE"`), the same pattern the
+# self-test's own anchors below have always used.
 # See D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS.
 # ★ THE GRAMMAR IS SPELLED ONCE AND THE BOUNDARY IS BOLTED ON, because a second
 # engine needs the same grammar with a DIFFERENT boundary syntax. `\<` is a grep
@@ -59,7 +78,7 @@ cd "${REPO_ROOT}"
 # spellings of the threshold would be the duplicated-site shape this file keeps
 # closing everywhere else; two spellings of the BOUNDARY are unavoidable and are
 # therefore made explicit here rather than left to be rediscovered.
-_ANCHOR_CORE='D-[A-Z0-9_]+(-[A-Z0-9_]+){2,}'
+_ANCHOR_CORE='D-[A-Z0-9_]+(-[A-Z0-9_]+){1,}'
 ANCHOR_REGEX="\\<${_ANCHOR_CORE}"
 
 # ── EVERY **GREP** IN THIS FILE RUNS IN THE BYTE LOCALE (`LC_ALL=C`) ─────────
@@ -525,10 +544,21 @@ END { if (have) emitWrap(prevFile, prev, "") }
 # this file and the self-test drive the same program. Its rationale, and the two
 # production false positives that shaped it, are documented at the extraction
 # site under the heading RETIRED IDS.
+#
+# ⚠⚠ TWO CELL POSITIONS ARE READ, AND THAT IS A REPAIR RATHER THAN A WIDENING.
+# On 2026-09-01 the registry gained explicit `Priority` and `Status` columns --
+# `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |` -- so the
+# glyph-led prose this matcher keys on moved from field 3 to field 5. ✔MEASURED: with
+# only `$3` this scan returned ZERO and the guard refused the whole tree, which is its
+# fail-closed arm working exactly as its own message predicts ("the registry's column
+# layout moved"). Plan-side §3.1 tables were NOT migrated and still lead with the glyph
+# in field 3, so BOTH positions are read -- the marker is anchored to the START of a
+# cell either way, which is what keeps this from becoming a substring search.
 RETIRED_ID_AWK='
     /^\| `D-/ {
         key = $2; gsub(/[` ]/, "", key)
-        if ($3 ~ /^ *\**✅ \*\*CLOSED [0-9-]+ — RETIRED-ID/) print key
+        if ($3 ~ /^ *\**✅ \*\*CLOSED [0-9-]+ — RETIRED-ID/) { print key; next }
+        if ($5 ~ /^ *\**✅ \*\*CLOSED [0-9-]+ — RETIRED-ID/) print key
     }
 '
 
@@ -810,8 +840,13 @@ _st_arm() {
 _st_dir="$(mktemp -d)"; _tmps+=("${_st_dir}")
 
 # ── arms 1-5: wrap recovery, both directions ────────────────────────────────
+# ⚠ The fixture ids here are ASSEMBLED FROM ADJACENT LITERALS (`"D-CTL""-ONE"`)
+# so this file's own text carries no anchor-shaped token — under the `{1,}`
+# threshold a bare two-segment fixture would be a citation of a row that does
+# not exist, in the guard's own source. Same pattern as `_st_anchor` below;
+# never an Allowlist entry, which would silence the name repo-wide and forever.
 {
-    printf '%s\n' "// a one-line citation D-CTL-ONE needs no recovery"
+    printf '%s\n' "// a one-line citation D-CTL""-ONE needs no recovery"
     printf '%s\n' "// wrapped, comment continuation D-WRAPA-"
     printf '%s\n' "// TAILA is the rest of it"
     printf '%s\n' "# wrapped, decoration continuation D-WRAPB-"
@@ -822,7 +857,7 @@ _st_dir="$(mktemp -d)"; _tmps+=("${_st_dir}")
     printf '%s\n' "// TAILD must not be reached"
 } > "${_st_dir}/wrap.txt"
 _st_got="$(awk "${WRAP_JOIN_AWK}" "${_st_dir}/wrap.txt" | sed 's/^.*://' | tr '\n' ' ')"
-_st_arm "wrap-join-recovers-both-continuation-shapes" "D-WRAPA-TAILA D-WRAPB-TAILB " "${_st_got}"
+_st_arm "wrap-join-recovers-both-continuation-shapes" "D-WRAPA""-TAILA D-WRAPB""-TAILB " "${_st_got}"
 _st_arm "wrap-join-refuses-a-lower-case-continuation" "" "$(printf '%s' "${_st_got}" | grep -o 'D-WRAPC[^ ]*' || true)"
 _st_arm "wrap-join-refuses-a-fragment-inside-a-longer-word" "" "$(printf '%s' "${_st_got}" | grep -o '[^ ]*TAILD' || true)"
 _st_arm "wrap-join-leaves-an-unwrapped-citation-alone" "" "$(printf '%s' "${_st_got}" | grep -o 'D-CTL[^ ]*' || true)"
@@ -830,12 +865,12 @@ _st_arm "wrap-join-leaves-an-unwrapped-citation-alone" "" "$(printf '%s' "${_st_
 # ── arms 6-7: quotation declarations ────────────────────────────────────────
 _st_marker="ANCHOR-GUARD-QUOTED-NOT-CITED:"
 {
-    printf '%s\n' "prose that quotes D-QUO-HERE as evidence of a deleted row"
-    printf '%s\n' "  > ${_st_marker} D-QUO-HERE D-QUO-GONE WORD-D-QUO-INNER"
+    printf '%s\n' "prose that quotes D-QUO""-HERE as evidence of a deleted row"
+    printf '%s\n' "  > ${_st_marker} D-QUO""-HERE D-QUO""-GONE WORD-D-QUO""-INNER"
 } > "${_st_dir}/decl.txt"
 _st_got="$(awk "${QUOTE_DECL_AWK}" "${_st_dir}/decl.txt" | sed "s#${_st_dir}/##" | tr '\n' ' ')"
 _st_arm "quotation-declaration-classifies-cited-and-absent-ids" \
-        "DECL:decl.txt:D-QUO-HERE STALE:decl.txt:D-QUO-GONE " "${_st_got}"
+        "DECL:decl.txt:D-QUO""-HERE STALE:decl.txt:D-QUO""-GONE " "${_st_got}"
 # Two SEPARATE properties, pinned separately because they are protected by two
 # different lines and a single fixture would let either one rot: the marker strip
 # keeps the marker's own anchor-shaped tail out, and the word-boundary test keeps
@@ -843,11 +878,11 @@ _st_arm "quotation-declaration-classifies-cited-and-absent-ids" \
 _st_arm "quotation-marker-does-not-cite-its-own-anchor-shaped-tail" \
         "" "$(printf '%s' "${_st_got}" | grep -o 'D-QUOTED[^ ]*' || true)"
 _st_arm "quotation-ids-must-sit-on-a-word-boundary" \
-        "" "$(printf '%s' "${_st_got}" | grep -o 'D-QUO-INNER' || true)"
+        "" "$(printf '%s' "${_st_got}" | grep -o 'D-QUO''-INNER' || true)"
 # A line that merely MENTIONS the marker is prose, not a declaration. Two earlier
 # markers in this file were defeated by exactly that - one by a row whose prose
 # said the words, the next by the row that documented the token.
-printf '%s\n' "see the ${_st_marker} convention, which would exempt D-QUO-MID" > "${_st_dir}/mid.txt"
+printf '%s\n' "see the ${_st_marker} convention, which would exempt D-QUO""-MID" > "${_st_dir}/mid.txt"
 _st_arm "quotation-declaration-recognition-is-positional" "" \
         "$(awk "${QUOTE_DECL_AWK}" "${_st_dir}/mid.txt" | tr '\n' ' ')"
 
@@ -891,12 +926,20 @@ _st_arm "below-floor-root-refuses-and-names-the-floor" "yes" \
 _st_got="$(_scan_one_root "${_st_dir}/root" 1 '*.md' "${_st_dir}/sink" 2>&1 || true)"
 _st_arm "at-floor-root-passes-and-collects" "|${_st_anchor}" "${_st_got}|$(cat "${_st_dir}/sink")"
 
-# ── arms 11-13: the retired-id matcher, against its two production false positives
+# ── arms 11-15: the retired-id matcher, against its two production false positives
+# AND both cell layouts. The four-cell rows are plan-side §3.1 tables, which were not
+# migrated; the six-cell rows are the registry as it has stood since 2026-09-01.
+# ⚠ WITHOUT THE SIX-CELL PAIR THE `$5` CLAUSE IS UNTESTED, and an untested clause is one
+# a later edit deletes in silence -- which is exactly how this matcher came to read only
+# `$3` while the live registry had already moved past it.
 _st_r1="D-RETA""-FIXTURE-ROW"; _st_r2="D-RETB""-FIXTURE-ROW"; _st_r3="D-RETC""-FIXTURE-ROW"
+_st_r4="D-RETD""-FIXTURE-ROW"; _st_r5="D-RETE""-FIXTURE-ROW"
 {
     printf '| `%s` | ✅ **CLOSED 2026-01-01 — RETIRED-ID, renamed** | t | c |\n' "${_st_r1}"
     printf '| `%s` | 🟠 **OPEN** — the prose here merely says "as a retired id" | t | c |\n' "${_st_r2}"
     printf '| `%s` | 🟠 **OPEN** — this row DOCUMENTS the RETIRED-ID token | t | c |\n' "${_st_r3}"
+    printf '| `%s` | P1 | ✅ CLOSED | ✅ **CLOSED 2026-01-01 — RETIRED-ID, renamed** | t | c |\n' "${_st_r4}"
+    printf '| `%s` | P1 | ✅ CLOSED | ✅ **CLOSED 2026-01-01 — an ordinary closure** | t | c |\n' "${_st_r5}"
 } > "${_st_dir}/registry.md"
 _st_got="$(LC_ALL=C awk -F'|' "${RETIRED_ID_AWK}" "${_st_dir}/registry.md" | tr '\n' ' ')"
 _st_arm "retired-matcher-extracts-a-positionally-marked-row" "yes" \
@@ -905,12 +948,41 @@ _st_arm "retired-matcher-ignores-prose-that-says-retired-id" "" \
         "$(printf '%s' "${_st_got}" | grep -o "${_st_r2}" || true)"
 _st_arm "retired-matcher-ignores-a-row-that-documents-the-token" "" \
         "$(printf '%s' "${_st_got}" | grep -o "${_st_r3}" || true)"
+_st_arm "retired-matcher-reads-the-SIX-cell-layout-too" "yes" \
+        "$(case "${_st_got}" in (*"${_st_r4}"*) echo yes ;; (*) echo "${_st_got}" ;; esac)"
+_st_arm "retired-matcher-ignores-a-plain-six-cell-closure" "" \
+        "$(printf '%s' "${_st_got}" | grep -o "${_st_r5}" || true)"
+
+# ── arms 18-21: the widened core, both directions of the flip ────────────────
+# The threshold moved `{2,}` → `{1,}` in P50 (the block at `_ANCHOR_CORE` holds
+# the sizing). These arms are what the disclosure row demanded — an id of the
+# NEWLY VISIBLE two-segment shape that resolves, one that does not, and the
+# head-only carve-out — or the widening is unverified in the driver the other
+# host runs. Fixture ids assembled from adjacent literals, as everywhere here.
+_st_vis="D-VIS""-ROW"          # two-segment: newly visible under {1,}
+_st_hdo="D-HEAD""ONLY"         # head-only: stays informal, the D-OPT carve-out
+printf 'cite %s and %s here\n' "${_st_vis}" "${_st_hdo}" > "${_st_dir}/vis.txt"
+_st_got="$(LC_ALL=C grep -oE "${ANCHOR_REGEX}" "${_st_dir}/vis.txt" | tr '\n' ' ')"
+_st_arm "widened-core-collects-a-two-segment-id" "${_st_vis} " "${_st_got}"
+_st_arm "widened-core-still-ignores-a-head-only-name" "" \
+        "$(printf '%s' "${_st_got}" | grep -o "${_st_hdo}" || true)"
+# The resolve, both directions, under the same SUBSTRING contract phases 1b/3
+# apply (`index()` / `grep -qrF`): a plan-side citation resolves the id; its
+# absence leaves the id a finding. Pinned here so the widened shape's resolve
+# is exercised without walking the real `.plans/`.
+mkdir -p "${_st_dir}/plans"
+printf 'the plans cite %s in prose\n' "${_st_vis}" > "${_st_dir}/plans/p.md"
+_st_arm "a-two-segment-id-the-plans-cite-resolves" "yes" \
+        "$(LC_ALL=C grep -qrF -- "${_st_vis}" "${_st_dir}/plans" && echo yes || echo no)"
+_st_nores="D-VIS""-NOWHERE"
+_st_arm "a-two-segment-id-the-plans-do-not-cite-stays-a-finding" "no" \
+        "$(LC_ALL=C grep -qrF -- "${_st_nores}" "${_st_dir}/plans" && echo yes || echo no)"
 
 if [[ "${_st_fail}" -ne 0 ]]; then
     echo "anchor-registry: FAIL - the self-test did not pass, so no verdict from this run means anything." >&2
     exit 6
 fi
-echo "anchor-registry: self-test OK - 15 arms (4 wrap recovery incl. 3 refusals to join, 4 quotation classification incl. the positional rule and the word boundary, 3 root existence/floor, 3 retired-id matcher incl. both production false positives, 1 green control); this guard is PROVEN able to fail."
+echo "anchor-registry: self-test OK - 21 arms (4 wrap recovery incl. 3 refusals to join, 4 quotation classification incl. the positional rule and the word boundary, 3 root existence/floor, 5 retired-id matcher incl. both production false positives and BOTH cell layouts, 4 widened-core incl. the head-only carve-out and both resolve directions, 1 green control); this guard is PROVEN able to fail."
 
 # ── RUN CHECK 2 (cell-width) FIRST, but do NOT exit on it yet.
 # Both checks report in ONE run. The `.sh` learned this the hard way on the

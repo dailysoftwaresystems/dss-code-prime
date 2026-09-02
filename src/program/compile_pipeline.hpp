@@ -6,6 +6,10 @@
 #include "core/types/data_model.hpp"  // DataModel (CuMirModule member + lowerMergedToAssembly arg)
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+// EnumNameTable<E,N> + DSS_CHECK_ENUM_NAME_TABLE — the closed vocabulary the
+// `--resolve-library` unrecordable-identity reason + remedy tables are built on
+// (D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE).
+#include "core/types/enum_name_table.hpp"
 #include "core/types/extern_import.hpp"  // ExternImport (CuMirModule member)
 #include "core/types/grammar_schema.hpp"
 #include "core/types/strong_ids.hpp"  // CompilationUnitId (CuMirModule member)
@@ -371,6 +375,19 @@ effectiveBitFieldStrategy(TargetSchema const&       target,
 effectiveLongDoubleFormat(TargetSchema const&       target,
                           ObjectFormatSchema const& format) noexcept;
 
+// D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: resolve whether an UNNAMED bit-field
+// contributes its declared type's alignment, for a (target, format) pair. The
+// `effectiveLongDoubleFormat` twin, NOT the `effectiveBitFieldStrategy` one: the axis
+// is FORMAT-ONLY, so there is no target-side field to fall back to and `None` means
+// genuinely undeclared. The layout engine then fails loud — but ONLY if an unnamed
+// bit-field is actually laid out under `gnu_packed`, so the wasm/spirv skeletons that
+// declare no C ABI stay unaffected. Never a silent default: BOTH answers are a real
+// ABI somewhere (`ignored` on SysV/Darwin, `contributes` on AAPCS), so guessing one
+// would be a silent miscompile on every platform holding the other.
+[[nodiscard]] DSS_EXPORT UnnamedBitFieldAlignment
+effectiveUnnamedBitFieldAlignment(TargetSchema const&       target,
+                                  ObjectFormatSchema const& format) noexcept;
+
 // ★ NO `effectiveCharIsUnsigned` HERE — and its absence is the design, not an
 // omission (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM, TF-C75). The two resolvers
 // above exist because their axes have contributions from BOTH schemas that must
@@ -711,6 +728,13 @@ struct DSS_EXPORT CuMirModule {
     // exact for the active format. The target's alignment params come from
     // `*target`; this overlays the per-format bit-field rule onto them.
     BitFieldStrategy bitFieldStrategy = BitFieldStrategy::None;
+    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: the FORMAT-resolved unnamed-bit-field
+    // alignment rule, captured for the SAME reason as `bitFieldStrategy` above — the
+    // LOWER half sees only this struct, and a const-init global whose struct carries a
+    // zero-width bit-field must be laid out to the active format's ABI, not to
+    // whichever one the target happened to imply.
+    UnnamedBitFieldAlignment unnamedBitFieldAlignment =
+        UnnamedBitFieldAlignment::None;
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER) + D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3):
     // shim SymbolId.v → recipe id for EVERY `synthesize`-tagged shipped-library symbol this
     // CU touched, carried from the BUILD half's `CstToHirResult.synthRecipeBySymbol` so the
@@ -923,7 +947,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::span<EntryMaterialization const> entryVerbs,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
-                     ObjectFormatKind                  fmtKind,
+                     std::string_view                  wideFloatSoftcallLibrary,
                      DiagnosticReporter&               reporter);
 
 // ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: PROGRAM-ENTRY RESOLUTION ───────────────
@@ -1025,6 +1049,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       TargetSchema const&  target,
                       DataModel            dataModel,
                       BitFieldStrategy     bitFieldStrategy,
+                      UnnamedBitFieldAlignment unnamedBitFieldAlignment,
                       std::uint16_t        callingConventionIndex,
                       CompilationUnitId    cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
@@ -1107,6 +1132,137 @@ isArArchiveFile(std::filesystem::path const& path);
 [[nodiscard]] DSS_EXPORT bool
 isRelocatableObjectFile(std::filesystem::path const& path,
                         ObjectFormatSchema const&    format);
+
+// ── D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE ────────────
+//
+// WHY a `--resolve-library` entry's STATED runtime identity cannot be recorded.
+// One closed verb per arm of the dispatch the two predicates above open, so the
+// diagnostic's remedy is looked up rather than written at the branch — the same
+// shape `StackReserveUnsupportedReason` already uses for the other operator
+// request this project refuses to drop silently.
+//
+// ⚠ THERE IS DELIBERATELY NO VERB FOR THE DYNAMIC ARM. A dynamic library CAN
+// record the identity (it is `recordedImportIdentity` precedence level 1), so
+// "honourable" is the ABSENCE of a reason, not a row here — an enum carrying its
+// own no-op member is one a caller can pass by accident.
+enum class DeclaredImportNameUnrecordableReason : std::uint8_t {
+    // The path is an `ar` static archive. Its members are PULLED and MERGED
+    // into the image, so their code ships inside the artifact and no runtime
+    // dependency is recorded for the stated name to be.
+    MergedStaticArchive     = 1,
+    // The path is a relocatable object. Same merge, one container fewer.
+    MergedRelocatableObject = 2,
+};
+
+inline constexpr EnumNameTable<DeclaredImportNameUnrecordableReason, 2>
+kDeclaredImportNameUnrecordableReasonTable{{{
+    { DeclaredImportNameUnrecordableReason::MergedStaticArchive,
+      "merged-static-archive" },
+    { DeclaredImportNameUnrecordableReason::MergedRelocatableObject,
+      "merged-relocatable-object" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kDeclaredImportNameUnrecordableReasonTable);
+
+[[nodiscard]] constexpr std::string_view
+declaredImportNameUnrecordableReasonName(
+    DeclaredImportNameUnrecordableReason r) noexcept {
+    return kDeclaredImportNameUnrecordableReasonTable.name(r);
+}
+
+// The REMEDY prose, one row per verb, kept beside the vocabulary so the verb and
+// its explanation cannot drift apart. Looked up through a generic table walk —
+// the engine never asks which format or which language it is holding.
+inline constexpr EnumNameTable<DeclaredImportNameUnrecordableReason, 2>
+kDeclaredImportNameUnrecordableRemedyTable{{{
+    { DeclaredImportNameUnrecordableReason::MergedStaticArchive,
+      "an `ar` static archive is MERGED into the image -- the members defining "
+      "otherwise-unresolved symbols are pulled and their code ships inside the "
+      "artifact -- so the build records no runtime dependency the stated name "
+      "could name. State the identity on the DYNAMIC library "
+      "(.so/.dll/.dylib) the artifact should import from instead, or drop the "
+      "`=<import-name>` half and let the archive be linked in statically." },
+    { DeclaredImportNameUnrecordableReason::MergedRelocatableObject,
+      "a relocatable object is MERGED into the image exactly as a `--compile`d "
+      "translation unit is, so the build records no runtime dependency the "
+      "stated name could name. State the identity on the DYNAMIC library "
+      "(.so/.dll/.dylib) the artifact should import from instead, or drop the "
+      "`=<import-name>` half and let the object be linked in." },
+}}};
+
+DSS_CHECK_ENUM_NAME_TABLE(kDeclaredImportNameUnrecordableRemedyTable);
+
+[[nodiscard]] constexpr std::string_view
+declaredImportNameUnrecordableRemedy(
+    DeclaredImportNameUnrecordableReason r) noexcept {
+    return kDeclaredImportNameUnrecordableRemedyTable.name(r);
+}
+
+// What the `--resolve-library` list becomes once the magic-byte dispatch has run
+// over it: three disjoint lists whose union is the input, in input order.
+struct DSS_EXPORT ResolveLibraryPartition {
+    // The DYNAMIC residual — the only arm that keeps the whole spec, because it
+    // is the only one that can record a STATED runtime identity.
+    std::vector<ResolveLibrarySpec>    dynamicLibraries;
+    // `ar` containers, pulled + merged at link time. PATH only.
+    std::vector<std::filesystem::path> staticArchives;
+    // Relocatable objects, which join the same list a `--compile`d object input
+    // lands in. PATH only.
+    std::vector<std::filesystem::path> objectInputs;
+};
+
+// ★★★ THE `--resolve-library` DISPATCH, AS A FUNCTION — and it reports the
+// identity it had to drop (D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE).
+//
+// ── WHY IT IS A FUNCTION AND NOT FIFTEEN LINES AT THE ONE CALL SITE ─────────
+// The dispatch and the DROP are the same act: the archive and object arms take
+// the PATH and leave `declaredImportName` behind, which is correct (neither form
+// records a runtime dependency) and was SILENT, which was the defect. Written
+// inline, the branch that drops the name and the diagnostic that reports it are
+// two statements a later edit can separate; written here they are one. This is
+// the same remedy `recordedImportIdentity` and `checkLibraryMatchesTargetFormat`
+// already applied to the two other facts this surface used to state twice.
+//
+// ⓘ The header's own supply-risk note on `isArArchiveFile` says the risk is "the
+// driver not making the CALL". That risk is now smaller by construction: a
+// caller cannot obtain the partition WITHOUT the check, because the check is
+// inside the only thing that produces it.
+//
+// Reports `F_DeclaredImportNameNotRecordable` at WARNING severity, once per
+// entry that stated a name the arm it took cannot record, naming the PATH, the
+// IGNORED NAME, the reason verb and its remedy. Warning, not Error, because the
+// artifact is CORRECT and every reference toolchain accepts the same
+// unhonourable declaration — the measurement is on the diagnostic's docblock.
+// `--warnings-as-errors` promotes it for anyone wanting the refusal.
+//
+// AGNOSTIC: the archive question is answered by MAGIC BYTES and the object
+// question is asked OF `format`; no arm compares a format name, a target or an
+// extension, and the remedy prose is looked up from the closed table above.
+// An unreadable path falls to the dynamic residual exactly as before, so the
+// eager open-probe still reports it loud and this function never second-guesses
+// a file it could not read.
+//
+// ⚠ THE PREDICATE KEYS ON THE **INPUT** KIND, NEVER ON THE OUTPUT FORMAT, AND
+// THE BOUNDARY IS MEASURED. Building a RELOCATABLE or `-staticlib` OUTPUT while
+// naming a legitimate dynamic library with a stated identity also puts nothing
+// in the artifact -- ✔MEASURED 2026-09-01 (shipped CLI, pe64): the stated name
+// is ABSENT from `main.obj` and from `main.lib`, and PRESENT in `main.exe` from
+// the identical command line. That is NOT this defect and must NOT warn. A
+// relocatable output records an undefined symbol's NAME and nothing else --
+// which is why `allowsUndefinedImports()` answers `true` for every non-image
+// format ("relocatable: later linker resolves") and why the operator names the
+// library AGAIN at the link that produces the image, where it IS recorded. The
+// identity is DEFERRED there, not dropped. Here it is dropped: a merged input's
+// code ships inside the artifact and no later stage will ever record a
+// dependency for it. Warning on the deferral would fire on every correct
+// separate-compilation build.
+[[nodiscard]] DSS_EXPORT ResolveLibraryPartition
+partitionResolveLibraries(std::span<ResolveLibrarySpec const> libraries,
+                          ObjectFormatSchema const&           format,
+                          DiagnosticReporter&                 reporter);
 
 // Pull the archive members that define `clientModule`'s (transitively)
 // unresolved externs, each parsed back into a mergeable `AssembledModule` via

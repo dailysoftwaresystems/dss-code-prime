@@ -38,7 +38,8 @@ it is always a flag rather than an auto-fix.
 | Anchor guard (src↔registry) | `scripts/check-anchor-registry/check-anchor-registry.ps1` (or `.sh`) |
 | Push state | `git rev-list --left-right --count origin/<branch>...HEAD` |
 | All plans | `.plans/` (numbered `00`–`22`, `08.x`, registry, `v2-gap-catalog`, `ZZ-final-goal`) |
-| Anchor registry | `.plans/_deferred-anchor-registry*.md` |
+| Anchor registry — WORKING (open rows only) | `.plans/_deferred-anchor-registry-{production,harness}.md` |
+| Anchor registry — ARCHIVE (closed rows, moved on close) | `.plans/_deferred-anchor-registry-done.md` |
 | Sibling: per-cycle plan update | the `dss-cycle` skill, step 8 |
 | Sibling: incidental plan hygiene | the `dss-audit` skill §I |
 | `.plans/` system + conventions | the `dss-code-prime` skill — **it wins on any conflict** |

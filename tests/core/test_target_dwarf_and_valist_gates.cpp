@@ -181,7 +181,10 @@ TEST(TargetDwarfNumbering, ATargetDeclaringNeitherHalfStillLoads) {
 // compares the `dwarfNumber` of their slot-0 registers, because that is the
 // only field that says "these two class names are two widths of one physical
 // file" (`hwEncoding` is a per-file register NUMBER and ✔MEASURED not to
-// discriminate: arm64 gpr×vr share all 32 values). The derivation is
+// discriminate: on arm64 the integer and SIMD&FP files share all 32 values —
+// ⓘ this clause used to say "gpr×vr", and since R1 of design A′ arm64 declares
+// no `vr` class at all; the collision it names is now gpr×fpr and is unmoved,
+// `x0` and `v0` both encoding 0). The derivation is
 // fail-closed, so an absent number yields INDEPENDENT cursors — a safe answer,
 // but one nobody chose. A target that numbers its registers and then omits the
 // numbers on the pools that carry its ABI is refused.

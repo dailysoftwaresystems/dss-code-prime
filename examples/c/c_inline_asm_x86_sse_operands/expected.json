@@ -1,0 +1,24 @@
+{
+  "$comment": "THE `\"x\"` CONSTRAINT WITH A TEMPLATE THAT CAN NAME AN INSTRUCTION (D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME, cycle P45). ★★★ EVERY SHAPE IN THIS FILE WAS INEXPRESSIBLE BEFORE THE SSE BLOCK LANDED: ✔MEASURED 2026-08-29 at the CLI, `x86_64.target.json` declared 103 opcodes and `asm-x86_64-att.lang.json` spelled 36 of them, with ALL EIGHTEEN FP/SSE opcodes UNSPELLED — so `\"x\"` bound the `fpr` class (`__asm__(\"nop\" : \"=x\"(r))` compiled rc=0) while every FP mnemonic a template might write returned `A_AsmTextUnsupported … unknown mnemonic`. A constraint that can be bound but never used is what this example retires. ★★ THE ASSERTED VALUES DISCRIMINATE THE ELECTED VARIANT'S **WIDTH**, which is the failure mode a run could otherwise not see: the `sd`/`ss` suffix pair is ONE target opcode under two width-keyed guards (F2 = scalar double, F3 = scalar single), so a row declared at the wrong width still assembles and still runs — it computes on the wrong half of the register. Shapes 0 and 2 use 152+152 in each format; shapes 6 and 7 read ABOVE BIT 31 (3000000000) so a 32-bit variant cannot produce the answer by accident; shape 5 round-trips 152.5, exactly representable in both formats, through the two width-CHANGING conversions that need `destWidth` and are refused by the width-honesty gate without it. ⚠ SHAPE 8 IS THE MATCHED NEGATIVE CONTROL and asserts its own blindness: 2.0 + 2.0 is 4.0 under either width, so it would pass over a wrongly-declared row — it is here to show that the discriminating power of shapes 0 and 2 lives in the VALUES they chose, not in the shape of the template. ★ THE `release` ARM IS NOT DECORATION: every seed is `volatile` so the optimized pipeline still reaches the template, and a fold would surface as a shape failure rather than as a silently vacuous pass. ⓘ x86_64 ONLY, AND THAT IS A MEASUREMENT RATHER THAN A PREFERENCE: the arm64 twin cannot run, because `\"w\"` binds the `vr` class while a `double` lives in `fpr` and `MirToLir::emitAsmOperandMove` refuses that pair by name. ★ THE CLAIM STANDS AND ITS ATTRIBUTION CHANGED: D-TARGET-NO-CROSS-CLASS-MOVE-VERB is CLOSED (P46 lane xm) and is no longer what blocks this — `registerClassOps` is now keyed by the ORDERED PAIR, so the refusal comes from an UNDECLARED `{fpr, vr}` pair rather than from a missing slot. ⚠ Declaring that pair would be a MISTAKE rather than a fix: `vr` and `fpr` are two width views of ONE physical SIMD&FP file, so a move between them would paper over a config defect. The live blockers are D-TARGET-ARM64-W-CONSTRAINT-BINDS-A-CLASS-NO-C-VALUE-EVER-LIVES-IN and D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS, both still OPEN.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

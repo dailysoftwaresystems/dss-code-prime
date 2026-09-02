@@ -34,6 +34,14 @@
 #                                        MEASURED, the reference launcher comes
 #                                        from the CATALOGUE, and the host-identity
 #                                        flag appears NOWHERE in the block
+#   O  the dss:compiler-currency region  the LOCATED compiler is PROVED current
+#                                        before the run is spent: a stale one
+#                                        ABORTS naming the binary, its build time
+#                                        and the rebuild command; SKIP_DSS_BUILD=1
+#                                        does not exempt it; and a check that
+#                                        COULD NOT RUN is a different answer from
+#                                        a stale binary
+#      [D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]
 #   F  RED-ON-DISABLE                    every guard above is BROKEN in a copy
 #                                        and the pin MUST go red
 # ⓘ The letters are not contiguous: H and G were already taken when K/L were added
@@ -1291,6 +1299,150 @@ function Pin-Precondition($driver) {
      "segments=$($budget + 1) resumes=$budget stop=BUDGET-EXHAUSTED" (Drive $diff)
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# O - THE LOCATED COMPILER IS PROVED CURRENT BEFORE THE RUN IS SPENT
+# ═══════════════════════════════════════════════════════════════════════════
+# D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN.
+#
+# ★★ THIS PIN DRIVES THE SHIPPED REGION, NOT A FUNCTION LIFTED OUT OF IT. The
+# defect is not "the function returns the wrong answer" - it is "the run continues
+# anyway", which is a property of the CALL SITE. Same reason
+# Pin-ConfoundSupplyStopsTheDriver exists. So the whole `dss:compiler-currency`
+# region runs in a CHILD pwsh with a statement AFTER it that must not be reached.
+#
+# ★★ THE COMPILER IS A FAKE AND IT IS THE ONLY FAKE HERE. Everything else in the
+# path is shipped code: this driver's own region, and the real
+# `speedtest1_bench.py --preflight-dss` it calls. A pin that stubbed the pre-flight
+# would be asserting over its own idea of the contract.
+# ⓘ A `.cmd`, because the pre-flight launches the compiler through Python's
+# subprocess: ✔MEASURED 2026-08-31, `.cmd` and `.bat` launch, an extensionless
+# `#!/bin/sh` file gives `[WinError 193] not a valid Win32 application`. The .sh
+# twin makes the mirror-image choice for the same measured reason.
+function New-FakeDsscp($dir, $name, $line) {
+  $p = Join-Path $dir "$name.cmd"
+  $body = @('@echo off')
+  if ($line) { $body += "echo $line" }
+  $body += 'exit /b 0'
+  Set-Content -LiteralPath $p -Value $body -Encoding ascii
+  return $p
+}
+function Pin-CompilerCurrency($driver) {
+  $pwshCmd = Get-Command pwsh -ErrorAction SilentlyContinue
+  if (-not $pwshCmd) {
+    Skipped 'O: pwsh is not on PATH, so a child-process refusal cannot be observed'
+    return
+  }
+  $py = Get-Command python3 -ErrorAction SilentlyContinue
+  if (-not $py) { $py = Get-Command python -ErrorAction SilentlyContinue }
+  if (-not $py) {
+    Skipped 'O: python3 is not on PATH (the driver requires it at Step 0; this host has none)'
+    return
+  }
+  $text = (Get-Content -LiteralPath $driver) -join "`n"
+  $region = if ($text -match '(?s)>>> dss:compiler-currency >>>(.*?)<<< dss:compiler-currency <<<') { $Matches[1] } else { '' }
+  if (-not $region) {
+    $script:PinFails++
+    if (-not $script:Quiet) { Bad "could not extract the dss:compiler-currency region from $(Split-Path -Leaf $driver) - this pin would assert over nothing" }
+    return
+  }
+  # THE SUBJECT, ASSERTED PRESENT BEFORE IT IS RUN. A region that still DEFINES
+  # the assertion but no longer CALLS it would execute cleanly and prove nothing.
+  CkHas 'the region defines the currency assertion' $region 'function Assert-DssCompilerCurrent('
+  CkHas '...and CALLS it, so the check is not merely available' $region '$DssCurrencyOk = Assert-DssCompilerCurrent '
+  $bench    = Join-Path $Here 'speedtest1_bench.py'
+  $repoRoot = (Resolve-Path (Join-Path $Here '../../..')).Path
+  $fakeStale = New-FakeDsscp $Work 'stale-dsscp' "error[C_InvalidSemantics]: unknown key 'restrictMarker' in 'declarations[0]'"
+  $fakeOk    = New-FakeDsscp $Work 'current-dsscp' ''
+  $script = Join-Path ([IO.Path]::GetTempPath()) ("dss-currency-callsite-" + [Guid]::NewGuid().ToString('N') + ".ps1")
+  # Everything between the stubs and the marker is the shipped driver's own text.
+  # ⚠ `Die` EXITS here exactly as it does in the driver: what is under test is that
+  # the process STOPS, which cannot be observed from inside one that does not.
+  $body = @(
+    'param($BenchCore, $DssBin, $DssConfigRoot)',
+    "`$ErrorActionPreference = 'Stop'",
+    'function Info($m) { }',
+    'function Warn($m) { }',
+    'function Pass($m) { }',
+    'function Die($m) { Write-Host "DIE: $m"; exit 1 }',
+    "`$python3 = Get-Command $($py.Name) -ErrorAction SilentlyContinue",
+    "`$RepoRoot = '$repoRoot'",
+    "`$dssAge = '2026-08-28 09:30:36'",
+    "`$DssOrigin = 'LOCATED under an eligible build root - NOT built by this run'",
+    # ★ SUPPLIED, so the rebuild instruction is exercised on its PRIMARY path -
+    # the tree the located binary actually came from. Left undefined, the region
+    # would silently take its `build\rel` fallback and the arm below would pass
+    # over a branch nobody drove.
+    '$DssInfo = [pscustomobject]@{ Tree = "D:\a-tree-that-produced-this-binary" }',
+    '$Legs = @(',
+    '  [pscustomobject]@{ label = "elf64-x86_64"; spec = "x86_64:elf64-x86_64-linux-exec" },',
+    '  [pscustomobject]@{ label = "pe64-x86_64";  spec = "x86_64:pe64-x86_64-windows-exec" })',
+    $region,
+    'Write-Host "REACHED-NEXT-STATEMENT ok=[$DssCurrencyOk]"'
+  ) -join "`n"
+  Set-Content -LiteralPath $script -Value $body -Encoding utf8
+  # ── THE REMOVE-DIRECTION ARM: a STALE compiler must STOP the run ─────────
+  # ✔The signature is the one measured on 2026-08-31: an `error[C_Invalid...]`
+  # naming config vocabulary the binary does not know.
+  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script $bench $fakeStale $repoRoot 2>&1 | Out-String
+  $rc = $LASTEXITCODE
+  Ck 'a STALE compiler STOPS the driver at Step 5 (rc)' 1 $rc
+  CkHas '...naming the BINARY' $out $fakeStale
+  CkHas '...naming WHEN it was built' $out 'built     : 2026-08-28 09:30:36'
+  CkHas '...naming how it was obtained' $out 'NOT built by this run'
+  CkHas '...naming the REBUILD command' $out 'REBUILD IT: cmake --build'
+  CkHas '...pointed at the tree THIS binary came from' $out 'D:\a-tree-that-produced-this-binary'
+  CkHas "...and quoting the compiler's own diagnostic" $out "unknown key 'restrictMarker'"
+  Ck '...and the statement AFTER the region never ran' 'no' `
+     $(if ($out -match 'REACHED-NEXT-STATEMENT') { 'yes' } else { 'no' })
+  # ── THE GREEN CONTROL: a CURRENT compiler must be let through ────────────
+  # Without it the arm above would pass for a driver that refuses everything.
+  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script $bench $fakeOk $repoRoot 2>&1 | Out-String
+  $rc = $LASTEXITCODE
+  Ck 'a CURRENT compiler is let through (rc)' 0 $rc
+  CkHas '...reaching the statement after the region' $out 'REACHED-NEXT-STATEMENT'
+  CkHas '...having recorded BOTH declared targets, deduped and in order' $out `
+     'ok=[x86_64:elf64-x86_64-linux-exec, x86_64:pe64-x86_64-windows-exec]'
+  # ── SKIP_DSS_BUILD=1 IS NOT AN INSTRUCTION TO TRUST ──────────────────────
+  # ★ THE ARM MOST LIKELY TO BE GOT WRONG. `SKIP_DSS_BUILD` says do not BUILD; a
+  # reading of it as "do not CHECK" restores the whole defect silently, because the
+  # flag's own branch is the one that reuses a binary nobody looked at.
+  $env:SKIP_DSS_BUILD = '1'
+  try {
+    $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script $bench $fakeStale $repoRoot 2>&1 | Out-String
+    $rc = $LASTEXITCODE
+  } finally { Remove-Item Env:\SKIP_DSS_BUILD -ErrorAction SilentlyContinue }
+  Ck 'SKIP_DSS_BUILD=1 does NOT exempt a stale binary (rc)' 1 $rc
+  CkHas '...and the refusal says so in as many words' $out 'SKIP_DSS_BUILD=1 DOES NOT EXEMPT A BINARY FROM THIS CHECK'
+  # ── "I COULD NOT RUN THE CHECK" IS A DIFFERENT ANSWER ────────────────────
+  # ⚠ A check that reports an environment problem as a stale binary sends the
+  # operator to rebuild a compiler that was never the subject. $Work is a real
+  # directory with no src\dss-config under it.
+  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script $bench $fakeOk $Work 2>&1 | Out-String
+  $rc = $LASTEXITCODE
+  Ck 'a check that CANNOT RUN still stops the run (rc)' 1 $rc
+  CkHas '...saying the compiler was NOT judged' $out 'COULD NOT RUN'
+  CkHas '...and saying so about staleness explicitly' $out 'NOTHING above says that binary is stale'
+  Ck '...and it does NOT tell the operator to rebuild' 'no' `
+     $(if ($out -match 'REBUILD IT:') { 'yes' } else { 'no' })
+  # ── AN UNEXPECTED EXIT CODE IS NOT AN ACCUSATION EITHER ──────────────────
+  # ★ THE ONE ARM THAT REPLACES THE CORE, and it says so rather than pretending
+  # otherwise: the property under test belongs to the DRIVER's classification of an
+  # exit code, and the real core cannot be made to return an arbitrary one through
+  # the argv the driver builds. ✔MEASURED 2026-08-31 with the real core: a bad
+  # --config-root reaches argparse as rc 2, and the first version of this gate
+  # printed argparse's usage block underneath "THE LOCATED COMPILER CANNOT COMPILE
+  # THREE LINES" plus a rebuild instruction. Only rc 1 may accuse.
+  $stub = Join-Path $Work 'rc2-core.py'
+  Set-Content -LiteralPath $stub -Value @('import sys', 'print("usage: ...", file=sys.stderr)', 'sys.exit(2)') -Encoding ascii
+  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script $stub $fakeOk $repoRoot 2>&1 | Out-String
+  $rc = $LASTEXITCODE
+  Ck 'an UNEXPECTED exit code stops the run (rc)' 1 $rc
+  CkHas '...reported as COULD NOT RUN, naming the code' $out 'COULD NOT RUN for target x86_64:elf64-x86_64-linux-exec (exit 2)'
+  Ck '...and NOT as an accusation against the compiler' 'no' `
+     $(if ($out -match 'CANNOT COMPILE THREE LINES') { 'yes' } else { 'no' })
+  Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
+}
+
 Green 'A+B  the verdict recorders + the shared run decision' 'Pin-Verdicts'
 Green 'C    Read-CorpusSegment keeps the first diagnostic'   'Pin-ReadSegment'
 # ★★ THE PARITY PIN, RUN FROM THE PowerShell SIDE TOO. Its twin lives in
@@ -1310,6 +1462,7 @@ Green 'K    the launcher-prerequisite gate'                  'Pin-LauncherPrereq
 Green 'L    the smoke argv: MEASURED targets, DECLARED launcher' 'Pin-SmokeArgv'
 Green 'M    the precondition discriminator, silent crash included' 'Pin-Precondition'
 Green 'N    the confound report is PRINTED, per leg'          'Pin-ConfoundReport'
+Green 'O    the located compiler is PROVED current'           'Pin-CompilerCurrency'
 
 # ═══════════════════════════════════════════════════════════════════════════
 # F - RED-ON-DISABLE. Every guard above is REMOVED in a copy; the pin must fail.
@@ -1669,6 +1822,170 @@ if (Invoke-Mutation 'F19 downgrade the gating refusal to a note' $m19 "not 'prob
       })
     }) {
   Red "F19 the supply's refusal STOPS THE DRIVER" 'Pin-ConfoundSupplyStopsTheDriver' $m19
+}
+
+# F20 - RESTORE THE WARNING WHERE THE CHECK NOW STANDS. This is the MEASURED
+# pre-cycle state of this very driver: Step 5 ended with `Warn "if the build below
+# fails with a stale-manifest-field error ... rebuild it"` and let the run proceed.
+# The region still DEFINES the assertion, so nothing is missing to read - only to
+# run. [D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]
+$m20 = Join-Path $Work 'm20.ps1'
+if (Invoke-Mutation 'F20 warn about a stale compiler instead of refusing' $m20 '$DssCurrencyOk = Assert-DssCompilerCurrent ' {
+      param($src)
+      return @($src | ForEach-Object {
+        if ($_.Contains('$DssCurrencyOk = Assert-DssCompilerCurrent ')) {
+          '$DssCurrencyOk = "(not checked)"; Warn "if the build below fails with a stale-manifest-field error, this binary predates the project-config extensions"'
+        } else { $_ }
+      })
+    }) {
+  Red 'F20 a stale compiler is REFUSED, not warned about' 'Pin-CompilerCurrency' $m20
+}
+
+# F21 - GUARD THE CALL ON SKIP_DSS_BUILD, i.e. "only check the binary we built".
+# The single most plausible wrong reading of that flag, and the one that restores
+# the defect in silence: the branch it governs is precisely the one that reuses a
+# binary nobody looked at.
+# ⚠ THE GUARDED CALL IS SPELLED THROUGH THE CALL OPERATOR, and that is what makes
+# the mutation legal rather than cosmetic. ✔MEASURED while writing this: a first
+# version wrapped the call in an `if` and re-emitted it verbatim, so the witness
+# reappeared INSIDE its own replacement and Invoke-Mutation correctly refused —
+# a mutation that KEEPS the witness text can never satisfy check (2). `& 'Name'`
+# is an ordinary PowerShell invocation of the same function, so the mutant is the
+# wrong READING and not a different program.
+$m21 = Join-Path $Work 'm21.ps1'
+if (Invoke-Mutation 'F21 let SKIP_DSS_BUILD bypass the check' $m21 '$DssCurrencyOk = Assert-DssCompilerCurrent ' {
+      param($src)
+      return @($src | ForEach-Object {
+        if ($_.Contains('$DssCurrencyOk = Assert-DssCompilerCurrent ')) {
+          '$DssCurrencyOk = "(not checked under SKIP_DSS_BUILD=1)"; if ($env:SKIP_DSS_BUILD -ne ''1'') { $DssCurrencyOk = & ''Assert-DssCompilerCurrent'' $python3.Source $BenchCore $DssBin $dssAge $DssOrigin $DssConfigRoot $DssCurrencySpecs $DssRebuildCmd }'
+        } else { $_ }
+      })
+    }) {
+  Red 'F21 SKIP_DSS_BUILD does not exempt a binary' 'Pin-CompilerCurrency' $m21
+}
+
+# F22 - COLLAPSE THE TWO FAILURE KINDS INTO ONE. Without the rc-3 arm, "I could
+# not run the check" is reported with the stale-binary message and the rebuild
+# instruction - a true-sounding answer to the adjacent question, which sends the
+# operator to rebuild a compiler that was never the subject.
+$m22 = Join-Path $Work 'm22.ps1'
+if (Invoke-Mutation 'F22 report an unrunnable check as a stale binary' $m22 '    if ($rc -ne 1) {' {
+      param($src)
+      $out = New-Object 'System.Collections.Generic.List[string]'
+      $skip = $false
+      foreach ($l in $src) {
+        if ($l -eq '    if ($rc -ne 1) {') { $skip = $true; continue }
+        if ($skip -and $l -eq '    }') { $skip = $false; continue }
+        if (-not $skip) { [void]$out.Add($l) }
+      }
+      return $out.ToArray()
+    }) {
+  Red 'F22 an unrunnable check is NOT a stale-binary verdict' 'Pin-CompilerCurrency' $m22
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P - A LOCATED COMPILER IS REFRESHED, NOT TRUSTED
+#     [D-HARNESS-PS1-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-SOURCES-IT-COMPILES]
+#
+# The sibling pin O proves a located binary can READ today's config. That is a
+# DIFFERENT question from whether it was BUILT from today's sources, and the two
+# were conflated until a run compiled the sqlite corpus with a compiler four
+# cycles old and reported it as the current tree's.
+# ⓘ THE BUILD IS INJECTED, so this pin never shells out to cmake: a self-test that
+# ran a real build would measure the machine rather than this logic, and would be
+# skipped on any host without a configured tree - which is every CI host.
+# ═══════════════════════════════════════════════════════════════════════════
+function Pin-CompilerRefresh($driver) {
+  $fns = Get-Fns $driver @('Update-LocatedDssCompiler')
+  if (-not $fns) { return }
+  . ([scriptblock]::Create($fns))
+
+  # (1) IT BUILDS, AND IT BUILDS THE LOCATED TREE - not a default, not the repo
+  #     root. A refresh aimed at the wrong tree leaves the located binary exactly
+  #     as stale as before while printing that it refreshed something.
+  $seen = New-Object 'System.Collections.Generic.List[string]'
+  $okBuild = { param($t, $j) [void]$seen.Add("$t|$j"); return 0 }
+  $ret = Update-LocatedDssCompiler 'T:\rel' 'T:\rel\bin\dss\dsscp.exe' '2026-08-31 23:25:16' 7 $okBuild
+  Ck 'P1   the LOCATED tree is what gets rebuilt, with this run''s job count' 'T:\rel|7' ($seen -join ',')
+  Ck 'P2   ...and the refresh reports back the tree it built'                 'T:\rel'   "$ret"
+
+  # (3) A FAILED REBUILD REFUSES. This is the whole point: falling back to the
+  #     binary we found is the defect, dressed as resilience.
+  $badBuild = { param($t, $j) return 1 }
+  $msg = ''
+  $threw = $false
+  try { [void](Update-LocatedDssCompiler 'T:\rel' 'T:\rel\bin\dss\dsscp.exe' '2026-08-31 23:25:16' 7 $badBuild) }
+  catch { $threw = $true; $msg = "$_" }
+  if ($threw) {
+    Ok 'P3   a FAILED rebuild REFUSES, never falls back to the located binary'
+  } else {
+    $script:PinFails++
+    if (-not $script:Quiet) { Bad 'P3   a failed rebuild did NOT refuse - the run would proceed on an unverifiable compiler' }
+  }
+  # The message must name what a fallback would reinstate, or the next reader
+  # "fixes" the refusal by removing it. Asserted as a FRAGMENT: a whole anchor id
+  # here would be a citation this file does not own.
+  CkHas 'P4   ...and says which defect a fallback would reinstate' $msg 'OLDER-THAN-THE-SOURCES-IT-COMPILES'
+
+  # (5) NO TREE IS ITS OWN REFUSAL, distinct from a failed build - a binary whose
+  #     build root cannot be named cannot be refreshed, and that is not the same
+  #     fact as a build that ran and failed.
+  $msg2 = ''
+  $threw2 = $false
+  try { [void](Update-LocatedDssCompiler '' 'T:\somewhere\dsscp.exe' '2026-08-31 23:25:16' 7 $okBuild) }
+  catch { $threw2 = $true; $msg2 = "$_" }
+  if ($threw2) {
+    Ok 'P5   a binary with NO build tree REFUSES, and is not silently reused'
+  } else {
+    $script:PinFails++
+    if (-not $script:Quiet) { Bad 'P5   an untreed binary did NOT refuse' }
+  }
+  CkHas 'P6   ...and the two refusals are told apart' $msg2 'build TREE could not be determined'
+
+  # (6b) A LEAKY BUILDER IS ITS OWN REFUSAL, NOT A FAILED BUILD. ✔MEASURED on the
+  #      first real run of this fix: `& cmake ...; return $LASTEXITCODE` in a
+  #      scriptblock returns [...every output line..., code], because a native
+  #      command's stdout IS pipeline output - and the refusal above then fired on
+  #      a compiler that had just been rebuilt successfully. Coercing with $rc[-1]
+  #      would read the right number and HIDE the leak; charging it to the build
+  #      sends the reader to repair a tree that is fine.
+  $leaky = { param($t, $j) return @('[1/5] dss: computing DSS_BUILD_STAMP', '[5/5] Linking', 0) }
+  $msg3 = ''
+  $threw3 = $false
+  try { [void](Update-LocatedDssCompiler 'T:\rel' 'T:\rel\bin\dss\dsscp.exe' '2026-08-31 23:25:16' 7 $leaky) }
+  catch { $threw3 = $true; $msg3 = "$_" }
+  if ($threw3) {
+    Ok 'P6b  a builder that LEAKS its child''s stdout is refused in its own words'
+  } else {
+    $script:PinFails++
+    if (-not $script:Quiet) { Bad 'P6b  a leaky builder was accepted - a successful build would be read as a failed one' }
+  }
+  CkHas 'P6c  ...and is NOT reported as a failed build' $msg3 'did not return an EXIT CODE'
+  # The CONTROL for P6b: a plain integer 0 must still pass, or P6b is passing
+  # because the function refuses everything.
+  $seen2 = New-Object 'System.Collections.Generic.List[string]'
+  $ret2 = Update-LocatedDssCompiler 'T:\rel2' 'T:\rel2\dsscp.exe' 'w' 3 { param($t, $j) [void]$seen2.Add($t); return 0 }
+  Ck 'P6d  CONTROL: a scalar 0 still refreshes' 'T:\rel2' "$ret2"
+
+  # (7) THE CALL SITE. A function that is defined and never called is precisely
+  #     the vacuity this file exists to refuse - pin O learned the same lesson.
+  $text = (Get-Content -LiteralPath $driver) -join "`n"
+  CkHas 'P7   the located-binary branch CALLS the refresh' $text '[void](Update-LocatedDssCompiler $DssInfo.Tree'
+  CkHas 'P8   ...and the origin line says the run rebuilt it' $text 'then REBUILT by this run (incremental)'
+}
+Green 'P    a located compiler is REFRESHED, not trusted' 'Pin-CompilerRefresh'
+
+# F23 - TAKE THE FATAL ARM AWAY, i.e. "a failed rebuild is not worth stopping
+# for". That is the exact reading the pre-fix driver embodied by never building at
+# all, and it fails toward *clean*: the run continues on whatever the root held.
+$m23 = Join-Path $Work 'm23.ps1'
+if (Invoke-Mutation 'F23 let a failed rebuild fall back to the located binary' $m23 '  if ($rc -ne 0) {   # FATAL: falling back to the binary we located IS the defect' {
+      param($src)
+      return @($src | ForEach-Object {
+        if ($_.Contains('# FATAL: falling back to the binary we located IS the defect')) { '  if ($false) {' } else { $_ }
+      })
+    }) {
+  Red 'F23 a failed rebuild is FATAL, not a fallback' 'Pin-CompilerRefresh' $m23
 }
 
 Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue

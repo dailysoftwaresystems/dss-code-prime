@@ -157,12 +157,27 @@ aggregateClassKindFromName(std::string_view s) noexcept {
 // byte-ABI-EXACT to their platform's native compiler, verified by a structural
 // conformance witness (dss's computed sizeof/bit-offsets == the native
 // compiler's — cl.exe for MSVC, gcc for SysV, clang for Apple via the macOS leg):
-//   * GnuPacked   — SysV/Itanium/GNU/AAPCS64/Apple little-endian. (Apple arm64
-//     does NOT diverge from generic AAPCS64 on bit-field PACKING — Apple's
-//     enumerated arm64 divergences are char/wchar_t signedness, long double=double,
-//     va_list, the red zone, stack argument area, and empty-struct handling, NOT
-//     bit-field allocation; so Mach-O uses gnu_packed and the macOS clang leg
-//     CONFIRMS it — no separate Apple strategy is needed.)
+//   * GnuPacked   — SysV/Itanium/GNU/AAPCS64/Apple little-endian, for the PACKING
+//     of bit-fields that have storage: LSB-first into the declared-type unit, with
+//     the same straddle bump. Mach-O and both ELF families share this strategy and
+//     one Apple strategy enumerator is still not needed.
+//     ⚠⚠ THIS COMMENT USED TO ASSERT THAT APPLE arm64 DOES NOT DIVERGE FROM GENERIC
+//     AAPCS64 ON BIT-FIELD ALLOCATION AT ALL, AND THAT IS MEASURED FALSE. It does
+//     diverge, on the alignment an UNNAMED bit-field contributes:
+//         `struct { char c; unsigned :0; char d; }`
+//         Apple arm64 5/1 · Apple x86_64 5/1 · x86_64-linux 5/1  (contributes NOTHING)
+//         aarch64-linux 8/4 · arm-linux-gnueabihf 8/4            (contributes 4)
+//     ✔MEASURED P45: Apple clang 21.0.0 via `/usr/bin/clang -arch arm64` on the
+//     physical macOS host (`_Static_assert` on sizeof AND _Alignof, rc=0), and
+//     independently by gcc 13.3.0 + clang 18.1.3 per target — the two references
+//     agree with EACH OTHER per target rather than with each other across targets,
+//     which is what makes it an ABI property and not a compiler quirk.
+//     ⇒ That axis is NOT part of this enum. It is its own config key,
+//     `UnnamedBitFieldAlignment` below, because it cuts ACROSS gnu_packed rather
+//     than selecting between strategies. See D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT.
+//     ★ The stale sentence is recorded rather than deleted because it was load-bearing:
+//     it is why the divergence went unmodelled, and a `$comment` asserting a settled
+//     answer gets probed LESS than one in code.
 //   * MsvcStraddle — Microsoft x64 (PE). MSVC starts a NEW allocation unit, aligned
 //     to the new field's declared-type natural alignment, whenever the next
 //     bit-field's declared-type SIZE differs from the current open unit's type size
@@ -325,6 +340,94 @@ vaListStrategyFromName(std::string_view s) noexcept {
     return kVaListStrategyTable.fromName(s);
 }
 
+// D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: does an UNNAMED bit-field contribute its
+// declared type's alignment to the enclosing composite?
+//
+// ★★ WHY THIS IS ITS OWN AXIS AND NOT A `BitFieldStrategy` ROW. It cuts ACROSS
+// gnu_packed instead of selecting between strategies: `elf64-x86_64-linux` and
+// `elf64-aarch64-linux` are the SAME strategy, the same LSB-first packing, the same
+// straddle bump — and they answer THIS question differently. A new strategy
+// enumerator would have to duplicate every other gnu_packed rule to vary one bit,
+// and the duplicate is where the two copies drift.
+//
+// ✔MEASURED P45, `struct Z { char c; unsigned :0; char d; }`, gcc 13.3.0 and clang
+// 18.1.3 agreeing PER TARGET (so: an ABI property, not a compiler quirk), plus Apple
+// clang 21.0.0 on the physical macOS host for the Apple rows:
+//     Ignored     5/1 : x86_64-linux · arm64-apple · x86_64-apple · riscv64 · ppc64le
+//     Contributes 8/4 : aarch64-linux · arm-linux-gnueabihf
+// This is gcc's `TARGET_ALIGN_ANON_BITFIELD` and clang's
+// `UseZeroLengthBitfieldAlignment` — one hook, and the references implement it as
+// one, which is why it is ONE key here.
+//
+// ★★ IT IS NAMED FOR *UNNAMED*, NOT FOR *ZERO-WIDTH*, DELIBERATELY. The same hook
+// governs an unnamed bit-field WITH storage: `{char c; unsigned :3; char d;}` is 3/1
+// where `{char c; unsigned x:3; char d;}` is 4/4 (✔MEASURED on x86_64-linux AND on
+// the macOS host — Apple clang 21.0.0 gives 3/1). ⚠ THE ENGINE CANNOT SEE THAT CASE
+// TODAY: `TypeInterner` stores a per-field WIDTH and no per-field NAME, so a
+// width-3 unnamed field is indistinguishable from a width-3 named one. Zero width is
+// unaffected — a NAMED zero-width bit-field is a hard error, so width 0 is unnamed BY
+// CONSTRUCTION and needs no name channel. The key is therefore named for the rule it
+// states rather than for the subset currently observable, so that threading field
+// names through the interner later needs NO second decision and mints no second key.
+// See D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT for the blocked half.
+enum class UnnamedBitFieldAlignment : std::uint8_t {
+    None        = 0,  // not declared → fail-loud when the rule is actually needed
+    Ignored     = 1,  // SysV/Darwin/RISC-V/PowerPC: an unnamed bit-field contributes
+                      // NO alignment. It still breaks the packing cursor (zero-width)
+                      // and still consumes bits (non-zero width) — only the alignment
+                      // contribution is dropped.
+    Contributes = 2,  // AAPCS64 / AAPCS32 ELF: an unnamed bit-field contributes its
+                      // declared type's NATURAL alignment. ⚠ UNCAPPED by `#pragma
+                      // pack(N)` — MEASURED, `pack(1) {char c; u64 :0; char d;}` is
+                      // 16/8 on aarch64-linux, the same uncapped quantity that
+                      // already determines the zero-width cursor break.
+};
+
+// ★ `none` IS A ROW, for the `BitFieldStrategy` reason: a site that must refuse it
+// tells "you wrote the reserved word" apart from "you wrote a spelling nobody
+// claims". A `.format.json` may NOT write it — this axis is FORMAT-ONLY (no
+// target-side fallback field exists, the `longDoubleFormat` shape), so `none` there
+// would mean nothing an omission does not already mean.
+inline constexpr EnumNameTable<UnnamedBitFieldAlignment, 3>
+kUnnamedBitFieldAlignmentTable{{{
+    { UnnamedBitFieldAlignment::None,        "none"        },
+    { UnnamedBitFieldAlignment::Ignored,     "ignored"     },
+    { UnnamedBitFieldAlignment::Contributes, "contributes" },
+}}};
+
+DSS_CHECK_ENUM_NAME_TABLE(kUnnamedBitFieldAlignmentTable);
+
+[[nodiscard]] constexpr bool
+isSelectableUnnamedBitFieldAlignment(UnnamedBitFieldAlignment a) noexcept {
+    return a != UnnamedBitFieldAlignment::None;
+}
+
+// The selectable projection a diagnostic advertises. Derived, never typed — the
+// `kSelectableBitFieldStrategyNames` discipline, including its static_assert that
+// exactly ONE row is unselectable (a second sentinel would silently shrink the list).
+inline constexpr auto kSelectableUnnamedBitFieldAlignmentNames =
+    namesWhere<2>(kUnnamedBitFieldAlignmentTable, isSelectableUnnamedBitFieldAlignment);
+static_assert(kUnnamedBitFieldAlignmentTable.rows.size()
+                  == kSelectableUnnamedBitFieldAlignmentNames.size() + 1,
+              "kUnnamedBitFieldAlignmentTable must have exactly ONE unselectable row "
+              "(none); the selectable projection is derived from the predicate");
+
+[[nodiscard]] constexpr std::string_view
+unnamedBitFieldAlignmentName(UnnamedBitFieldAlignment a) noexcept {
+    // The `-Werror=switch` backstop — it owns no spelling. See `dataModelName`.
+    switch (a) {
+        case UnnamedBitFieldAlignment::None:
+        case UnnamedBitFieldAlignment::Ignored:
+        case UnnamedBitFieldAlignment::Contributes:
+            break;
+    }
+    return kUnnamedBitFieldAlignmentTable.nameOrEmpty(a);
+}
+[[nodiscard]] constexpr std::optional<UnnamedBitFieldAlignment>
+unnamedBitFieldAlignmentFromName(std::string_view s) noexcept {
+    return kUnnamedBitFieldAlignmentTable.fromName(s);
+}
+
 // The per-ABI aggregate-layout parameter block parsed from `.target.json`. A
 // default-constructed value is NOT valid (scalarAlignment 0 / maxAlignment 0 —
 // the loader requires both; validate() rejects a zero/non-pow2 maxAlignment).
@@ -336,6 +439,15 @@ struct AggregateLayoutParams {
     // a struct containing a bit-field, so a target that omits it keeps every
     // existing (bitfield-free) layout byte-identical.
     BitFieldStrategy    bitFieldStrategy = BitFieldStrategy::None;
+    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: overlaid by
+    // `effectiveUnnamedBitFieldAlignment` from the FORMAT document. Consulted ONLY
+    // by the gnu_packed packer and only when an UNNAMED bit-field is present, so a
+    // composite without one lays out byte-identically whatever this says — and
+    // msvc_straddle never reads it, because the MSVC rule is a property OF that
+    // strategy (a zero-width field is inert unless it terminates an open unit) and
+    // is measured identical on x64 and arm64 PE.
+    UnnamedBitFieldAlignment unnamedBitFieldAlignment =
+        UnnamedBitFieldAlignment::None;
 };
 
 } // namespace dss

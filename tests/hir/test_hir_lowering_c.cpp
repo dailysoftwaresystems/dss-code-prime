@@ -1743,24 +1743,39 @@ TEST(HirLoweringC, LeadingPackedAttributeRejectedLoud) {
         << "leading [[gnu::packed]] must fail loud, never silently drop packed";
 }
 
-// D-CSUBSET-PACKED (F-3): the GNU spelling of the SAME leading form —
-// `__attribute__((packed)) struct S {…} gv;` — is likewise UNHONORED and fails loud.
-// Sibling to LeadingPackedAttributeRejectedLoud (the C23 `[[gnu::packed]]` form):
-// here `attrSpec` is NOT in the linkage-ignored rules, so the leading
-// `__attribute__((packed))` takes the RECOGNIZED-specifier path, `packed` is not a
-// linkage keyword, and lowering fails loud H_UnknownLinkageSpecifier (exactly like a
-// leading `__attribute__((bogus))`). Must NOT be silently honored-or-dropped.
-TEST(HirLoweringC, LeadingGnuPackedAttributeRejectedLoud) {
+// ★★ P44 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY) — RETARGETED, AND THE
+// MEASUREMENT THAT RETARGETED IT REVERSES THE ONE THIS PIN WAS BUILT ON.
+//
+// It asserted that `__attribute__((packed)) struct S { char c; int v; } gv;` must
+// FAIL LOUD, on the reasoning that accepting it would "silently drop packed" and
+// leave a struct of the wrong size. ✔RE-MEASURED against the REFERENCES rather
+// than against the unpacked control: gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
+// (`-std=c23`), probed SEPARATELY, BOTH compile this exact program at rc=0 with
+// `'packed' attribute ignored [-Wattributes]` and BOTH report `sizeof(struct S)
+// == 8`. A leading `packed` does not reach the composite in ANY of the three
+// implementations, so 8 is the CORRECT answer and there was never a layout fact
+// to drop — the earlier finding compared DSS to the UNPACKED control and read
+// agreement-with-the-references as a miscompile.
+//
+// So the contract is: ACCEPTED, and NOT HONORED. The refusal half is pinned here
+// (a return of the hardcoded Error reds this); the layout half — the part that
+// would be a real miscompile — is pinned where `sizeof` is observable, by
+// `SemanticAnalyzerC.LeadingGnuPackedDoesNotPackTheComposite`, because this
+// fixture analyses with no layout in scope and could not see it.
+TEST(HirLoweringC, LeadingGnuPackedAttributeIsAcceptedNotRefused) {
     SemanticModel model = analyzeC(
         "__attribute__((packed)) struct S { char c; int v; } gv;\n"
         "int main(void){ return 0; }\n");
     ASSERT_FALSE(model.hasErrors())
-        << "test setup: the leading GNU attribute parses + analyzes cleanly; the "
-           "rejection is at lowering, not at parse/semantic";
+        << "test setup: the leading GNU attribute parses + analyzes cleanly";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
-        << "leading __attribute__((packed)) must fail loud, never silently drop packed";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "`packed` is attribute vocabulary this language MODELS — the linkage "
+           "scan must not adjudicate it as an unrecognized linkage specifier";
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok) << "every reference compiles this program";
+    EXPECT_FALSE(r.hasErrors());
 }
 
 // CONTRAST: a leading standard-ignorable attribute (`[[deprecated]]`) STAYS silently
@@ -2441,16 +2456,39 @@ TEST(HirLoweringC, GnuSemanticAttributeSpellingsFileScopeLowerClean) {
 // The Fork-2 BOUNDARY regression guard: an UNKNOWN GNU attribute at file scope
 // STILL fails loud H_UnknownLinkageSpecifier (the by-name skip covers ONLY the
 // declared semantic-attribute names — it must not become a wholesale ignore).
-TEST(HirLoweringC, GnuUnknownAttributeFileScopeStillFailsLoud) {
+// ★★ P44 ([[D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY]], THE THIRD TIER) — THIS
+// PIN WAS RENAMED AND GREW ITS SECOND HALF, and the reason is worth keeping: it
+// was called `GnuUnknownAttributeFileScopeStillFailsLoud` and asserted ONLY the
+// diagnostic COUNT, so when the verdict became a warning it stayed GREEN while its
+// NAME became a lie. A pin whose name says "FailsLoud" about a program that
+// compiles is a misnamed red waiting for the next reader.
+//
+// It now asserts BOTH halves, which is what makes it able to fail in either
+// direction:
+//   * the name is still REPORTED — the typo protection this gate exists for. Drop
+//     the emit in `linkageFrom` and the count goes to 0.
+//   * the program is NOT REFUSED — ✔gcc 13.3.0, ✔clang 18.1.3 and ✔mingw-w64 gcc
+//     13.2.0, probed SEPARATELY, all compile this and exit 0 with
+//     `'frobnicate' attribute directive ignored [-Wattributes]`. Restore the
+//     hardcoded `Error` severity and `res->ok` goes false.
+// The severity is the DECLARATION ROW's (`unknownStrictAttributeIsError`, which
+// `topLevelDecl` declares false), so this pin also witnesses that the HIR tier
+// reads that key rather than overriding it.
+TEST(HirLoweringC, GnuUnknownAttributeAtFileScopeIsWarnedNotRefused) {
     SemanticModel model = analyzeC(
         "__attribute__((frobnicate)) int f(void) { return 1; } "
         "int main(){ return f() - 1; }");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    (void)res;
     EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
-        << "an unknown GNU attribute must keep the loud typo-protection gate";
+        << "an unknown GNU attribute must keep the typo-protection diagnostic";
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok)
+        << "…but it must not REFUSE the program: every reference compiles it";
+    EXPECT_FALSE(r.hasErrors())
+        << "the diagnostic must be a WARNING — a program both references build "
+           "must not come out of this tier with an error recorded";
 }
 
 // P42 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY) — THE DRIFTED SECOND ROSTER,
@@ -2482,14 +2520,24 @@ TEST(HirLoweringC, GnuInertHintNamesAreNotUnknownLinkageSpecifiers) {
     }
 }
 
-// THE CONTROL, and it is what stops the repair above from being read as
-// "silence more things": the three names deliberately LEFT OUT carry real
-// layout / aliasing / ABI weight that DSS does not implement, so the loud
-// refusal is the only tier still saying so. Silencing them would trade a
-// refusal for a SILENT DROP with observable consequences — a leading
-// `__attribute__((packed)) struct S {…} s;` is not reached by the composite
-// scan, so it would go from a loud error to a wrong `sizeof`.
-TEST(HirLoweringC, GnuWeightBearingHintNamesStayLoudAtFileScope) {
+// ★★ P44 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY) — THIS PIN IS INVERTED, AND
+// THE INVERSION IS THE FIX. It used to require `packed`, `may_alias` and
+// `transparent_union` to STAY LOUD at file scope, on the reasoning that they
+// carry layout/aliasing weight DSS does not implement, so the refusal was "the
+// only tier still saying so".
+// ✔RE-MEASURED, each reference separately: `__attribute__((may_alias)) int gv =
+// 7;` is SILENT on gcc 13.3.0 AND clang 18.1.3 — DSS was reporting a name this
+// very config models, and refusing the program outright before P44's engine half.
+// The layout fear is answered by
+// `HirLoweringC.LeadingGnuPackedAttributeIsAcceptedNotRefused` above and by the
+// `sizeof` pin in the semantic suite: both references also give `sizeof == 8` for
+// the leading `packed`, so nothing is dropped by accepting it.
+// The roster these names had drifted out of is now DERIVED from the effects
+// table, so their silence is a consequence of the language modelling them rather
+// than of anyone remembering to list them.
+// RED-ON-DISABLE: delete the derivation loop in `grammar_schema_json.cpp` and
+// every count here returns to 1.
+TEST(HirLoweringC, GnuModelledInertNamesAreNotUnknownLinkageSpecifiers) {
     for (char const* name : {"packed", "may_alias", "transparent_union"}) {
         SemanticModel model = analyzeC(
             std::string("__attribute__((") + name + ")) int gv = 7; "
@@ -2497,11 +2545,29 @@ TEST(HirLoweringC, GnuWeightBearingHintNamesStayLoudAtFileScope) {
         ASSERT_FALSE(model.hasErrors()) << name;
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        (void)res;
-        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
-            << "an attribute DSS cannot honor must not be silently dropped: "
-            << name;
+        ASSERT_TRUE(res != nullptr) << name;
+        EXPECT_TRUE(res->ok) << name;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << "a name the effects table declares KNOWN must not be adjudicated "
+               "by the linkage scan's separate roster: " << name;
     }
+}
+
+// THE CONTROL that stops the change above from being read as "silence more
+// things": a name the language models NOWHERE is still reported. Without this
+// pair, deleting the whole unknown-name arm would look like a fix.
+TEST(HirLoweringC, GnuGenuinelyUnmodelledNameIsStillReportedAtFileScope) {
+    SemanticModel model = analyzeC(
+        "__attribute__((frobnicate_xyz)) int gv = 7; "
+        "int main(){ return gv - 7; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "the typo protection must survive the derivation";
+    EXPECT_TRUE(res->ok)
+        << "…as a WARNING: both references compile it and exit 0";
 }
 
 // ── TfC71 (D-HIR-ADJACENT-CONCAT-WALL-UNTESTED): the linkage-specifier
@@ -4507,30 +4573,70 @@ TEST(HirLoweringC, IncludeDirectiveIsSkippedNotFailed) {
     EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Function);
 }
 
+// The mutation-lvalue RECONSTRUCTION shape: a `MemberAccess` chain of exactly
+// `hops` links standing on the `Deref` of the temp pointer `classifyMemberLvalue`
+// binds. `hops == 1` is an ordinary named member; `hops == 2` is a field behind ONE
+// anonymous struct/union member (`s.<anon>.f`), and so on. Counting the chain — not
+// merely "a MemberAccess exists" — is what makes this test fail in the REMOVE
+// direction: the generic via-ptr path this fix replaces emits a bare `Deref(Ref)`
+// with NO MemberAccess above it, so the count drops to zero.
+[[nodiscard]] std::size_t countReconstructedChains(Hir const& hir, HirNodeId n,
+                                                   std::size_t hops) {
+    if (!n.valid()) return 0;
+    std::size_t total = 0;
+    if (hir.kind(n) == HirKind::MemberAccess) {
+        HirNodeId cur = n;
+        std::size_t depth = 0;
+        while (cur.valid() && hir.kind(cur) == HirKind::MemberAccess) {
+            ++depth;
+            auto const kids = hir.children(cur);
+            cur = kids.empty() ? HirNodeId{} : kids.front();
+        }
+        // The chain must END on the Deref of the bound temp pointer. A source-level
+        // `s.anon.f` rvalue also stacks MemberAccess nodes, but over a `Ref`, not a
+        // `Deref` — so this counts reconstructions only.
+        if (depth == hops && cur.valid() && hir.kind(cur) == HirKind::Deref) {
+            auto const dk = hir.children(cur);
+            if (!dk.empty() && hir.kind(dk.front()) == HirKind::Ref) ++total;
+        }
+    }
+    for (HirNodeId c : hir.children(n))
+        total += countReconstructedChains(hir, c, hops);
+    return total;
+}
+
 // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: the bit-field-safe reconstruction
-// (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION) handles NAMED `.`/`->` bit-field
-// mutation; a bit-field reached through an ANONYMOUS-member hop chain or an
-// ARRAY-arrow base cannot be addressed by the single-field lvalue, so a
-// compound/inc-dec/value mutation there FAILS LOUD (S_BitfieldMutationUnsupportedBase)
-// rather than silently full-unit-store via the generic via-ptr path (which would
-// clobber the packed neighbour + skip truncation). Statement plain-`=` stays correct
-// (lowerAssign never routes through classifyMemberLvalue), and NON-bit-field members
-// through the same bases are unaffected. RED-ON-DISABLE: drop the `isBitfield`
-// fail-loud arms in classifyMemberLvalue → the anon/array-arrow bit-field mutation
-// silently lowers (0 S0058) into the neighbour-clobbering full-unit store.
-TEST(HirLoweringC, AnonAndArrowBitfieldMutationFailsLoud) {
-    // (1) compound `+=` on an ANON-struct bit-field → fail loud.
+// (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION) once handled NAMED `.`/`->` bit-field
+// mutation ONLY. A bit-field reached through an ANONYMOUS-member hop chain, or
+// through an ARRAY-arrow decay base (`sarr->bf`, C 6.3.2.1p3), could not be named by
+// the single-field `Lvalue`, so a compound / inc-dec / value mutation there was
+// REFUSED (S_BitfieldMutationUnsupportedBase) — loud, never a miscompile, but a
+// capability gap: ✔MEASURED 2026-08-31, gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc
+// 13.2.0 all COMPILE AND RUN both shapes correctly and MSVC 19.51 accepts both, so
+// DSS must. The `Lvalue` now carries an ordered member-hop CHAIN (one hop per
+// anonymous ancestor, then the field) and the arrow base runs through the same
+// `coerce` Array→Ptr decay arm `combineMember` uses — so both shapes reconstruct
+// the very `MemberAccess` chain the MIR bit-field read-modify-write chokepoint keys
+// on. RED-ON-DISABLE: collapse the chain back to a single index (or drop the decay)
+// → these mutations either refuse again or fall to the generic via-ptr path, and the
+// reconstruction-chain counts below go to zero.
+TEST(HirLoweringC, AnonAndArrowBitfieldMutationReconstructsTheMemberChain) {
+    // (1) compound `+=` on an ANON-struct bit-field: compiles, and rebuilds the
+    //     TWO-hop chain `Deref(p).<anon>.a` the RMW chokepoint needs.
     {
         SemanticModel model = analyzeC(
             "struct O { struct { unsigned a : 4; unsigned b : 4; }; };\n"
             "void f(struct O* o) { o->a += 1; }\n");
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_GE(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 1u)
-            << "anon-member bit-field compound mutation must fail loud, not silently "
-               "full-unit-store";
+        ASSERT_TRUE(res->ok) << "anon-member bit-field `+=` must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
+            << "the anon-member bit-field mutation is supported — nothing to refuse";
+        EXPECT_GE(countReconstructedChains(res->hir, res->hir.root(), 2), 2u)
+            << "the read AND the write-back must each rebuild the 2-hop anon chain, "
+               "or the mutation is a neighbour-clobbering full-unit store";
     }
-    // (2) inc-dec on an anon bit-field (statement + value) → fail loud.
+    // (2) inc-dec on an anon bit-field (statement + value) both reconstruct.
     {
         SemanticModel model = analyzeC(
             "struct O { struct { unsigned a : 4; unsigned b : 4; }; };\n"
@@ -4538,11 +4644,28 @@ TEST(HirLoweringC, AnonAndArrowBitfieldMutationFailsLoud) {
             "unsigned g(struct O* o) { return (++o->a); }\n");
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_GE(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 2u)
-            << "anon-member bit-field inc/dec (statement + value) must both fail loud";
+        ASSERT_TRUE(res->ok) << "anon-member bit-field inc/dec must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u);
+        EXPECT_GE(countReconstructedChains(res->hir, res->hir.root(), 2), 4u)
+            << "statement `o->a++` (read+write) and value `++o->a` (read+write+yield) "
+               "must all rebuild the anon chain";
     }
-    // (3) STATEMENT plain-`=` on the SAME anon bit-field stays CORRECT (compiles,
-    //     no fail-loud — it routes through lowerAssign, not classifyMemberLvalue).
+    // (3) NESTED anonymous members — TWO anon levels, a THREE-hop chain. The chain
+    //     is a loop over `anonAncestorPath`, so one level working is no evidence
+    //     that two do; this is the assertion a single-hop special case fails.
+    {
+        SemanticModel model = analyzeC(
+            "struct O { struct { struct { unsigned a : 4; unsigned b : 4; }; }; };\n"
+            "void f(struct O* o) { o->a += 1; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << "a doubly-nested anon bit-field `+=` must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u);
+        EXPECT_GE(countReconstructedChains(res->hir, res->hir.root(), 3), 2u)
+            << "two anonymous levels must produce a 3-hop chain, not a truncated one";
+    }
+    // (4) STATEMENT plain-`=` on the SAME anon bit-field stays CORRECT — it routes
+    //     through lowerAssign, not classifyMemberLvalue, and always did.
     {
         SemanticModel model = analyzeC(
             "struct O { struct { unsigned a : 4; unsigned b : 4; }; };\n"
@@ -4551,38 +4674,61 @@ TEST(HirLoweringC, AnonAndArrowBitfieldMutationFailsLoud) {
         auto res = lowerToHir(model, r);
         EXPECT_TRUE(res->ok) << "statement plain-`=` on an anon bit-field must compile";
         EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
-            << "statement plain-`=` on an anon bit-field is correct — no fail-loud";
+            << "statement plain-`=` on an anon bit-field is correct — no refusal";
     }
-    // (4) a NON-bit-field anon member compound-assign is UNAFFECTED (generic path).
+    // (5) a NON-bit-field anon member compound-assign compiles. It now takes the
+    //     reconstruction too (it used to fall through to the generic path); the
+    //     chain it rebuilds is the SAME node a plain `o->x = v` builds, so the store
+    //     stays an ordinary scalar store. This is the blast-radius guard.
     {
         SemanticModel model = analyzeC(
             "struct O { struct { int x; int y; }; };\n"
             "void f(struct O* o) { o->x += 1; }\n");
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_TRUE(res->ok) << "non-bit-field anon member compound-assign must compile";
-        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
-            << "a non-bit-field anon member takes the correct generic scalar store";
+        ASSERT_TRUE(res->ok) << "non-bit-field anon member compound-assign must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u);
+        EXPECT_GE(countReconstructedChains(res->hir, res->hir.root(), 2), 2u)
+            << "a non-bit-field anon member reconstructs the same 2-hop chain";
     }
-    // (5) an ARRAY-arrow bit-field base (`sarr->a`, C 6.3.2.1p3 decay) → fail loud;
-    //     a NON-bit-field array-arrow member is unaffected.
+    // (6) an ARRAY-arrow bit-field base (`sarr->a`, C 6.3.2.1p3 decay): compiles,
+    //     and rebuilds a ONE-hop chain over the DECAYED pointer.
     {
         SemanticModel model = analyzeC(
             "struct S { unsigned a : 4; unsigned b : 4; };\n"
             "void f(void) { struct S sarr[2]; sarr->a += 1; }\n");
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_GE(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 1u)
-            << "array-arrow bit-field compound mutation must fail loud";
+        ASSERT_TRUE(res->ok) << "array-arrow bit-field `+=` must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u);
+        EXPECT_GE(countReconstructedChains(res->hir, res->hir.root(), 1), 2u)
+            << "the array-arrow base must decay and reconstruct, not full-unit-store";
     }
+    // (7) a NON-bit-field array-arrow member is unaffected (and now reconstructs).
     {
         SemanticModel model = analyzeC(
             "struct S { int a; int b; };\n"
             "void f(void) { struct S sarr[2]; sarr->a += 1; }\n");
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u)
-            << "a non-bit-field array-arrow member is unaffected";
+        ASSERT_TRUE(res->ok) << "a non-bit-field array-arrow member must compile";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_BitfieldMutationUnsupportedBase), 0u);
+    }
+    // (8) CONTROL: a plain NAMED member keeps its ONE-hop reconstruction — the
+    //     shape this fix generalised must not have moved for the case that already
+    //     worked. Without this arm a chain-walk bug that added a phantom hop
+    //     everywhere would still satisfy every assertion above.
+    {
+        SemanticModel model = analyzeC(
+            "struct S { unsigned a : 4; unsigned b : 4; };\n"
+            "void f(struct S* s) { s->a += 1; }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok);
+        EXPECT_GE(countReconstructedChains(res->hir, res->hir.root(), 1), 2u)
+            << "a named member is a ONE-hop chain — unchanged by the generalisation";
+        EXPECT_EQ(countReconstructedChains(res->hir, res->hir.root(), 2), 0u)
+            << "a named member must NOT grow a phantom anonymous hop";
     }
 }
 
@@ -8842,7 +8988,18 @@ TEST(HirLoweringC, TFC112IncompatibleRedeclarationOfAShimSymbolFailsLoud) {
         "int printf(const char *fmt);\n"   // NOT variadic — cannot be the shim
         "int main(void) { return printf(\"hi\\n\"); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
-    ASSERT_FALSE(model.hasErrors());
+    // ★ P44 ([[D-CSUBSET-INCOMPATIBLE-REDECL-DIAGNOSED-AT-CALL-SITE-NOT-DECLARATION]]):
+    // this used to `ASSERT_FALSE(model.hasErrors())` — the semantic tier said
+    // NOTHING about a declaration that contradicts the platform's own, which is
+    // the wrong-TIER half of that row and is why the identical source on an ELF
+    // target (where `printf` is an ordinary import, so this gate never runs)
+    // compiled completely clean. The declaration-site diagnostic now fires, and
+    // this gate is the BACKSTOP rather than the only voice. Both must speak: a
+    // shim gate that went quiet once the analyzer complained would leave the
+    // wrong-ABI binding unrefused for any caller that lowers anyway.
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "C23 6.7p4 wants the diagnostic AT THE DECLARATION";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
@@ -8864,7 +9021,10 @@ TEST(HirLoweringC, TFC112WrongArityRedeclarationOfAShimSymbolFailsLoud) {
         "int sprintf(char *b, const char *f, int extra, ...);\n"
         "int main(void) { char b[8]; return sprintf(b, \"%d\", 1, 2); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
-    ASSERT_FALSE(model.hasErrors());
+    // P44: the declaration-site diagnostic now fires here too — see the
+    // arity-arm's sibling above for why both tiers must speak.
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u);
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
@@ -8940,7 +9100,11 @@ TEST(HirLoweringC, TFC112IncompatibleInlineDefinitionOfAShimSymbolFailsLoud) {
         "inline int printf(const char *fmt) { return -1; }\n"   // not variadic
         "int main(void) { return printf(\"inl\\n\"); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
-    ASSERT_FALSE(model.hasErrors());
+    // P44: the declaration-site diagnostic now fires for the inline-definition
+    // spelling as well — the C99 6.7.4p7 arm is a DECLARATION for compatibility
+    // purposes, so it must be judged like one.
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u);
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
@@ -9659,4 +9823,543 @@ TEST(HirLoweringC, NullptrTObjectIsProjectedToItsPointerRepresentation) {
         << "both nullptr_t locals must be typed Ptr<Void> (C23 6.2.5: the size, "
            "alignment and representation of `void *`), alongside the real void* "
            "local";
+}
+
+// ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ─────────────
+//
+// The STATIC-INITIALIZER SCHEDULE, at the tier where the front-end fact becomes
+// a carried one. Everything below the HIR reads `LinkageAttr::staticInit`, so a
+// fact missing here is a program whose initializer never runs — the exact defect
+// this anchor was filed for.
+//
+// ⚠⚠ THE PAIR OF PINS BELOW IS THE POINT, NOT EITHER ONE ALONE. Adding
+// `constructor` to the language's `attributeEffects` table SILENCES the
+// `H_UnknownLinkageSpecifier` warning BY CONSTRUCTION — the ignored-names roster
+// is DERIVED from that table and the derivation is verb-blind. So "the warning
+// stopped" is NOT evidence the attribute is honoured; it is equally consistent
+// with the attribute having become silently inert, which is STRICTLY WORSE than
+// the announced divergence it replaced. The schedule assertion is what tells the
+// two apart, and the `frobnicate` control is what stops the silencing from
+// widening to names the language really does not model.
+TEST(HirLoweringC, GnuConstructorAttributeRecordsTheBeforeEntrySchedule) {
+    SemanticModel model = analyzeC(
+        "static int g = 0; "
+        "__attribute__((constructor)) static void init(void){ g = 42; } "
+        "int main(void){ return g; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "`constructor` is vocabulary this language now MODELS, so the linkage "
+           "scan must not adjudicate it";
+    HirNodeId const f = functionNamed(res->hir, model, "init");
+    ASSERT_TRUE(f.valid());
+    ASSERT_TRUE(res->linkageMap.has(f))
+        << "the side-table is sparse, and `recordLinkage`'s sparseness test had "
+           "to GROW to ask about the schedule — an absent entry here means a "
+           "non-`static` constructor would have been dropped while the `static` "
+           "spelling worked";
+    auto const sched = res->linkageMap.get(f).staticInit;
+    ASSERT_TRUE(sched.beforeEntry().has_value())
+        << "the function must be recorded in the BEFORE-entry channel";
+    EXPECT_EQ(*sched.beforeEntry(), kUnprioritizedStaticInit)
+        << "the bare spelling is the UNPRIORITIZED priority, which sorts LAST "
+           "among constructors — a zero here would sort it first, the opposite "
+           "of what all three references do";
+    EXPECT_FALSE(sched.afterEntry().has_value())
+        << "a `constructor` joins ONE channel";
+}
+
+// THE CONTROL for the pin above: silencing `constructor` must not silence a name
+// the language models NOWHERE. Without this pair, deleting the unknown-name arm
+// outright would look like the feature working.
+TEST(HirLoweringC, GnuConstructorSilencingDoesNotWidenToUnmodelledNames) {
+    SemanticModel model = analyzeC(
+        "__attribute__((frobnicate)) int gv = 11; "
+        "__attribute__((constructor)) static void init(void){ gv = 42; } "
+        "int main(void){ return gv; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok) << "…as a WARNING: every reference compiles this";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "EXACTLY one — `frobnicate` still reported, `constructor` no longer. "
+           "A count of 2 means the schedule landed without the config row; a "
+           "count of 0 means the config row silenced the typo protection too, "
+           "which is the announced-to-silent regression this anchor forbids";
+}
+
+// The PRIORITY argument reaches the schedule. An implementation that parsed the
+// attribute and dropped `(101)` runs a program's initializers in an order all
+// three references disagree with, and nothing above this tier could tell.
+TEST(HirLoweringC, GnuConstructorPriorityArgumentReachesTheSchedule) {
+    SemanticModel model = analyzeC(
+        "__attribute__((constructor(101))) static void early(void){} "
+        "__attribute__((destructor(102)))  static void late(void){} "
+        "int main(void){ return 0; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok);
+    HirNodeId const e = functionNamed(res->hir, model, "early");
+    HirNodeId const l = functionNamed(res->hir, model, "late");
+    ASSERT_TRUE(e.valid() && l.valid());
+    ASSERT_TRUE(res->linkageMap.has(e) && res->linkageMap.has(l));
+    auto const es = res->linkageMap.get(e).staticInit;
+    auto const ls = res->linkageMap.get(l).staticInit;
+    ASSERT_TRUE(es.beforeEntry().has_value());
+    EXPECT_EQ(*es.beforeEntry(), 101u);
+    EXPECT_FALSE(es.afterEntry().has_value());
+    ASSERT_TRUE(ls.afterEntry().has_value());
+    EXPECT_EQ(*ls.afterEntry(), 102u);
+    EXPECT_FALSE(ls.beforeEntry().has_value())
+        << "`destructor` joins the AFTER-entry channel only — a schedule that "
+           "filed it in both would run it twice";
+}
+
+// ✔MEASURED (mingw-w64 gcc 13.2.0): `__attribute__((constructor,destructor))`
+// compiles clean under `-Wall -Wextra` and runs at BOTH ends. One function, two
+// channels, and each may carry its own priority — which is why the schedule is
+// two independent optionals rather than a phase plus a priority. A design that
+// collapsed them would silently drop one half of every such declaration.
+TEST(HirLoweringC, GnuConstructorAndDestructorOnOneFunctionOccupyBothChannels) {
+    SemanticModel model = analyzeC(
+        "__attribute__((constructor(101))) __attribute__((destructor(102))) "
+        "static void both(void){} "
+        "int main(void){ return 0; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok);
+    HirNodeId const f = functionNamed(res->hir, model, "both");
+    ASSERT_TRUE(f.valid());
+    ASSERT_TRUE(res->linkageMap.has(f));
+    auto const s = res->linkageMap.get(f).staticInit;
+    ASSERT_TRUE(s.beforeEntry().has_value());
+    ASSERT_TRUE(s.afterEntry().has_value());
+    EXPECT_EQ(*s.beforeEntry(), 101u);
+    EXPECT_EQ(*s.afterEntry(), 102u);
+}
+
+// The ordinary C header/impl split: annotate the PROTOTYPE, define plainly. MIR
+// is stamped from the DEFINITION's symbol, so without the redeclaration merge the
+// schedule would be lost between two declarations of one function.
+TEST(HirLoweringC, GnuConstructorOnThePrototypeSurvivesToTheDefinition) {
+    SemanticModel model = analyzeC(
+        "__attribute__((constructor(101))) static void init(void); "
+        "static void init(void){} "
+        "int main(void){ return 0; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok);
+    HirNodeId const f = functionNamed(res->hir, model, "init");
+    ASSERT_TRUE(f.valid());
+    ASSERT_TRUE(res->linkageMap.has(f))
+        << "the prototype's schedule must reach the definition's node";
+    auto const s = res->linkageMap.get(f).staticInit;
+    ASSERT_TRUE(s.beforeEntry().has_value());
+    EXPECT_EQ(*s.beforeEntry(), 101u) << "…with its PRIORITY intact, not merely "
+                                         "the fact that a schedule exists";
+}
+
+// ★★ D-CSUBSET-LINKAGE-INHERITED-INTERNAL-EMITS-GLOBAL (C 6.2.2p4/p5).
+//
+// A plain definition whose linkage is INHERITED from a visible prior `static`
+// declaration is INTERNAL, and until P51 the HIR linkage fold read only the
+// definition's OWN specifier tokens — a bare `int f(void){…}` carries no
+// `static`, so it emitted `Global`. Single-TU programs could not see it (nothing
+// contradicts a binding inside one image); the two-TU corpus example
+// `examples/c/linkage_inherited_internal_crosscu` is where it became a REFUSAL
+// of a legal program. THIS pin is the unit-tier statement of the same fact, and
+// it is the one that names the axis directly rather than through an exit code.
+//
+// Both halves of the shape are pinned because they reach the emission arm by
+// DIFFERENT routes: the function definition outranks a PROTOTYPE in the
+// redeclaration merge, the initialized object definition outranks a TENTATIVE.
+TEST(HirLoweringC, InheritedInternalLinkageReachesTheEmittedBinding) {
+    struct Case {
+        char const* what;
+        char const* src;
+        char const* name;
+        SymbolBinding want;
+    };
+    for (Case const c : {
+             // THE DEFECT, function half: the definition has no `static` token.
+             Case{"function inheritance",
+                  "static int f(void);\n"
+                  "int f(void){ return 21; }\n"
+                  "int main(void){ return f(); }\n",
+                  "f", SymbolBinding::Local},
+             // THE DEFECT, object half: the INITIALIZED definition outranks the
+             // `static` tentative and becomes the emitting declaration.
+             Case{"object inheritance",
+                  "static int g;\n"
+                  "int g = 3;\n"
+                  "int main(void){ return g; }\n",
+                  "g", SymbolBinding::Local},
+             // CONTROL, and the one that would catch an over-reach: with NO
+             // prior `static` the identical definition shapes must stay
+             // externally visible. A fix that read the record unconditionally —
+             // or that confused "has a record" with "is internal" — makes these
+             // Local and hides every symbol from the linker.
+             Case{"external function control",
+                  "int h(void);\n"
+                  "int h(void){ return 21; }\n"
+                  "int main(void){ return h(); }\n",
+                  "h", SymbolBinding::Global},
+             Case{"external object control",
+                  "int gg;\n"
+                  "int gg = 3;\n"
+                  "int main(void){ return gg; }\n",
+                  "gg", SymbolBinding::Global},
+             // CONTROL on the other side: the path that ALREADY worked (the
+             // definition spells `static` itself) must be unchanged, so a green
+             // first arm cannot be the fix having simply forced Local everywhere.
+             Case{"explicit static definition",
+                  "static int s(void){ return 21; }\n"
+                  "int main(void){ return s(); }\n",
+                  "s", SymbolBinding::Local},
+             // CONTROL for the FALLBACK-not-override half. `weak` is a linker
+             // binding, not a 6.2.2 linkage class, and the record consult is
+             // guarded on `binding == Global` (= "the tokens specified none")
+             // precisely so a specified binding survives. Drop that guard and
+             // this arm is the only one that moves.
+             Case{"weak is not overridden",
+                  "__attribute__((weak)) int w(void){ return 21; }\n"
+                  "int main(void){ return w(); }\n",
+                  "w", SymbolBinding::Weak},
+         }) {
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors()) << c.what;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr) << c.what;
+        ASSERT_TRUE(res->ok) << c.what << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(declaredBinding(*res, model, c.name), std::optional{c.want})
+            << c.what << " — `" << c.name << "`. `std::nullopt` would mean the "
+               "declaration emitted no module decl at all, which is a different "
+               "failure from a wrong binding and must not read as one";
+    }
+}
+
+// The INHERITANCE is a property of the merge SURVIVOR, not of adjacency, so a
+// third declaration between the `static` and the definition must not lose it —
+// and the `static` may equally arrive AFTER the definition (the unanimously
+// accepted `static int f(void); int f(void){…} static int f(void);` triple, plus
+// the ordering where the plain PROTOTYPE comes first). Each of these folds a
+// different pair through `mergeOrCollideRedeclaration`; all must land Local,
+// because the OR-propagation is what carries the fact and this pin is what
+// notices if the emission tier starts reading the LAST declaration's tokens
+// instead of the record.
+TEST(HirLoweringC, InheritedInternalLinkageSurvivesEveryDeclarationOrdering) {
+    for (char const* prelude : {
+             "static int f(void);\nint f(void){ return 21; }\n",
+             "static int f(void);\nstatic int f(void);\nint f(void){ return 21; }\n",
+             "static int f(void);\nint f(void);\nint f(void){ return 21; }\n",
+             "static int f(void);\nint f(void){ return 21; }\nstatic int f(void);\n",
+         }) {
+        std::string const src =
+            std::string(prelude) + "int main(void){ return f(); }\n";
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors()) << prelude;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr) << prelude;
+        ASSERT_TRUE(res->ok) << prelude << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(declaredBinding(*res, model, "f"),
+                  std::optional{SymbolBinding::Local})
+            << prelude << " — the definition inherits internal linkage from the "
+               "`static` declaration wherever it sits in the chain; `Global` is "
+               "the emission tier reading tokens again";
+    }
+}
+
+// ★★★ THE SEMANTIC-TIER TWIN OF
+// D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED —
+// the SEMANTIC tier's
+// `scanSpecifierPrefixStorage` resolved a declaration-specifier KEYWORD worn as
+// an attribute CLAUSE NAME against that keyword's own `linkageSpecifiers` entry.
+// P42 fixed exactly this class in the HIR twin `linkageFrom`
+// (D-C-LINKAGE-SPECIFIER-LOOKUP-IS-POSITION-BLIND-AND-NOT-DUNDER-NORMALIZED);
+// the semantic scan kept the defect for four cycles because its ONE consumer
+// was a diagnostic predicate, where a wrong answer is a missed message rather
+// than wrong bytes.
+//
+// ★ THESE PINS LIVE IN THE HIR FILE ON PURPOSE, NOT FOR CONVENIENCE. Two of the
+// three consequences are only visible from here: the BINDING half is a HIR
+// residue, and `analyzeC` hands back the SemanticModel with its own reporter, so
+// the semantic half is readable through `model.diagnostics()` at the same seam.
+// A third consequence — the missing 6.2.2p7 mismatch on
+// `__attribute__((static)) int gv = 1; static int gv;` — needs a
+// `tests/analysis/semantic/` pin and is NOT written here; see the row.
+//
+// gcc 13.3.0 and clang 18.1.3 were probed SEPARATELY on every arm below and
+// WARN-AND-IGNORE all of them (`'static' attribute directive ignored` /
+// `unknown attribute 'static' ignored`), building and running each program.
+TEST(HirLoweringC, KeywordSpelledAttributeNameConfersNoStorageClass) {
+    // THE BINDING HALF. `Local` here is the symbol LEAVING the object: with the
+    // P51 emission consult reading `isInternalLinkage`, a mis-mint stops a
+    // sibling TU from linking `extern int gv;` at all.
+    for (char const* spec : {"__attribute__((static))",
+                             "__attribute__((__static__))",
+                             "__attribute__((constexpr))",
+                             "__attribute__((__constexpr__))"}) {
+        std::string const src = std::string(spec)
+            + " int gv = 1;\n"
+              "int main(void){ return gv - 1; }\n";
+        SemanticModel model = analyzeC(src);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr) << spec;
+        EXPECT_EQ(declaredBinding(*res, model, "gv"),
+                  std::optional{SymbolBinding::Global})
+            << spec << " — a storage class is a DECLARATION SPECIFIER; C has no "
+                       "attribute form of one, and both references keep `gv` "
+                       "exported (nm: `D gv`). `Local` is the symbol vanishing "
+                       "from the object";
+    }
+    // THE THREAD-STORAGE HALF, and it was the loudest: a mis-minted
+    // `isThreadLocal` reached Pass 2's 6.7.1 constraint check, so DSS REFUSED
+    // (rc=1, S_ThreadLocalOnFunction) a program both references build and run.
+    for (char const* spec : {"__attribute__((thread_local))",
+                             "__attribute__((__thread_local__))",
+                             "__attribute__((_Thread_local))"}) {
+        std::string const src = std::string(spec)
+            + " int tf(void) { return 0; }\n"
+              "int main(void){ return tf(); }\n";
+        SemanticModel model = analyzeC(src);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_ThreadLocalOnFunction), 0u)
+            << spec << " — the attribute confers no thread storage, so the "
+                       "6.7.1 constraint check has nothing to fire on. A count "
+                       "of 1 is a legal program REFUSED";
+    }
+    // THE MISSING-DIAGNOSTIC HALF, and it is the arm that fails in the OTHER
+    // direction — everything above is DSS saying too much, this is DSS saying
+    // nothing. The mis-mint made the attribute-spelled declaration look
+    // INTERNAL, so `mergeOrCollideRedeclaration`'s `priorPlainDefining` was
+    // false and the 6.2.2p7 conflict went unreported. gcc: `error: static
+    // declaration of 'gv' follows non-static declaration`; clang: the same
+    // error; DSS: rc=0 and silence (✔MEASURED before the fix).
+    //
+    // ⓘ This is a SEMANTIC-tier diagnostic pinned from the HIR suite on
+    // purpose: `analyzeC` returns the model with its own reporter, so the seam
+    // is reachable here and no `tests/analysis/**` pin is needed for it.
+    {
+        SemanticModel model = analyzeC(
+            "__attribute__((static)) int gv = 1;\n"
+            "static int gv;\n"
+            "int main(void){ return gv; }\n");
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_LinkageRedeclarationMismatch), 1u)
+            << "the attribute leaves `gv` EXTERNAL, so the later `static` is the "
+               "6.2.2p7 conflict both references reject. 0 is the missed "
+               "diagnostic the position-blind mint caused";
+    }
+    // …and the CONTROL for it, because a count of 1 above could equally come
+    // from a check that fires on everything: two REAL `static` declarations are
+    // a legal redeclaration of an internal identifier and must stay silent.
+    {
+        SemanticModel model = analyzeC(
+            "static int gv = 1;\n"
+            "static int gv;\n"
+            "int main(void){ return gv - 1; }\n");
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_LinkageRedeclarationMismatch), 0u)
+            << "two `static` declarations agree about linkage; a diagnostic here "
+               "would be a legal program refused";
+    }
+}
+
+// ★★ THE CONTROLS, AND THEY CARRY THE WHOLE RISK OF THE FIX ABOVE. The scan now
+// skips the language's attribute-specifier shapes wholesale, and the cheap wrong
+// version of that — skipping attributes everywhere the linkage vocabulary is
+// read — would SILENTLY LOSE `weak` and `visibility`, which are attribute names
+// and legitimately live inside `attrSpec`. Only these arms can tell the two
+// apart: they assert the attribute vocabulary still APPLIES while the keyword
+// vocabulary is denied, which is the exact line the fix had to draw.
+TEST(HirLoweringC, AttributeVocabularyStillAppliesAfterTheKeywordDenial) {
+    struct Case { char const* src; char const* name; };
+    // `weak` and `visibility` reach the HIR fold through the SAME `attrSpec`
+    // subtree the storage scan now refuses to enter, so a fix applied one tier
+    // too wide reds here and nowhere else.
+    {
+        SemanticModel model = analyzeC(
+            "__attribute__((weak)) int wv = 1;\n"
+            "int main(void){ return wv - 1; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_EQ(declaredBinding(*res, model, "wv"),
+                  std::optional{SymbolBinding::Weak})
+            << "`weak` is an ATTRIBUTE NAME and must still bind; `Global` means "
+               "the attribute subtree stopped being read at all";
+    }
+    {
+        SemanticModel model = analyzeC(
+            "__attribute__((visibility(\"hidden\"))) int hv = 1;\n"
+            "int main(void){ return hv - 1; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_EQ(declaredVisibility(*res, model, "hv"),
+                  std::optional{SymbolVisibility::Hidden})
+            << "the COMPOSITE attribute key must still resolve through the same "
+               "subtree";
+    }
+    // THE ALREADY-IMMUNE ROWS. Three of the four shipped `linkageSpecifiers`
+    // rows list `attrSpec` in `linkageSpecifierIgnoredRules` and were never
+    // exposed; the new skip must be a byte-for-byte no-op on them. A block-scope
+    // declaration routes through one of those rows, so these two arms are the
+    // control that the change did not reach where it had no business.
+    {
+        // A REAL block-scope `static` still confers static storage: the local is
+        // promoted to a hidden module global, so it retains its value.
+        SemanticModel model = analyzeC(
+            "int bump(void){ static int x = 0; x = x + 1; return x; }\n"
+            "int main(void){ bump(); return bump(); }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(declaredBinding(*res, model, "x"),
+                  std::optional{SymbolBinding::Local})
+            << "the static local is still emitted as an internal module global; "
+               "`nullopt` means the promotion stopped happening";
+    }
+    {
+        // …and the attribute spelling still confers NONE, at block scope too.
+        SemanticModel model = analyzeC(
+            "int bump(void){ __attribute__((static)) int x = 0; x = x + 1; "
+            "return x; }\n"
+            "int main(void){ bump(); return bump(); }\n");
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_EQ(declaredBinding(*res, model, "x"), std::nullopt)
+            << "an attribute-spelled `static` promotes nothing, so there is no "
+               "module-level declaration for `x` at all — it stays an automatic "
+               "local, which is what both references do";
+    }
+}
+
+// ── P51 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the LINKAGE-tier truth table
+//    over the four baseline spellings ─────────────────────────────────────────
+//
+// That row's closing witness is "the 4 baseline spellings compile AND the
+// emitted symbol's LINKAGE is asserted for each (red-on-disable at the linkage
+// tier, never 'it parses')". ✔MEASURED P51: what the tree already carried was
+// the SEMANTIC bit (`SemanticAnalyzerC.InlineDefinitionFollowsC99Quantifier`
+// asserts `SymbolRecord::isInline`) and the OBSERVABLE consequence (the
+// `examples/c/inline_c99_*` exit codes). Neither states what this tier decides —
+// which of {an ExternFunction declaration and no emitted body}, {an emitted
+// definition with internal binding}, {an emitted definition with external
+// binding} the declaration produces. That decision is `lowerInlineDefinitionAsDeclaration`,
+// and this is the tier at which it is nameable.
+//
+// ★ EVERY EXPECTATION IS GROUND TRUTH FROM A REAL TOOLCHAIN. Each row was
+// MEASURED with `gcc 13.3.0` and `clang 18.1.3`, `-std=c99` AND `-std=gnu17`,
+// `-O0 -c` + `nm`, on this exact source shape; mingw-w64 gcc 13.2.0 agrees on
+// all four. The `nm` column each row names is what it is asserting a DSS
+// equivalent of:
+//   `inline`          -> `U p`  — no external definition in this TU, and the
+//                                 reference survives, so the linker sees an
+//                                 undefined symbol (it does: DSS reports
+//                                 K_SymbolUndefined on this program at debug).
+//   `static inline`   -> `t p`  — internal linkage, emitted.
+//   `extern inline`   -> `T p`  — 6.7.4p7's with-extern exemption, emitted.
+//   `extern __inline` -> `T p`  — the same, through the GNU spelling.
+//
+// ★★ THE THREE COLUMNS ARE NOT REDUNDANT, and that is why this is a table
+// rather than three assertions. `externDecl` alone cannot tell a suppressed
+// definition from one that was never lowered; `marked` alone cannot tell an
+// unmarked body from an absent one; `binding` alone is Global for two rows that
+// differ in everything else. Only the triple names one cell of the truth table.
+//
+// ⚠ WHAT THIS DELIBERATELY DOES NOT CLAIM. `static inline`'s `t` column is
+// about INTERNAL LINKAGE, which this tier records as `SymbolBinding::Local`.
+// ✔MEASURED P51 at the object tier: a DSS-emitted `elf64-x86_64-linux`
+// relocatable carries NO symbol-table entry at all for an internal-linkage
+// function — for `static inline int p` and for a plain `static int p` alike —
+// where gcc and clang both emit `t p`. That divergence is a property of `static`,
+// not of `inline` (the plain-`static` control shows it identically), so it is
+// reported rather than pinned here; this row asserts the linkage DSS records,
+// which is the fact `inline` is responsible for.
+//
+// RED-ON-DISABLE (REMOVE direction), ✔EXERCISED P51: delete the `__inline` and
+// `__inline__` rows from the `keywords` table in `c.lang.json` — the C99 word
+// left alone — and this test FAILS by name, on the `extern __inline` row, while
+// `HirLoweringC` keeps its other 312 passes. The control on the other side is
+// the same run's five pure-`inline` corpus examples, which stay green.
+//
+// ⚠ AND THE MUTANT THAT DOES **NOT** REACH THIS TIER, ✔MEASURED P51 RATHER THAN
+// ASSUMED — the first draft of this comment named it and was WRONG. Deleting
+// `externSpecifierTokens` from `semantics.inline` flips `SymbolRecord::isInline`
+// to TRUE for all three `extern` spellings (`SemanticAnalyzerC`'s rows redden),
+// and NOTHING here moves: no row of this table changes, the corpus examples stay
+// green, and a DSS-emitted `elf64-x86_64-linux` object still shows `T p` for
+// `extern inline`. A definition whose `extern` is the DECLARATION RULE'S HEAD
+// does not reach `lowerInlineDefinitionAsDeclaration` at all, so on that route
+// the semantic bit is not what suppresses a body. Both facts are true and this
+// tier is the one that decides the artifact — which is precisely why this table
+// is not a restatement of the semantic truth table.
+TEST(HirLoweringC, InlineBaselineSpellingsCarryTheReferenceLinkageState) {
+    struct Row {
+        char const*   spelling;
+        std::size_t   externRows;   // an ExternFunction declaration was planted
+        bool          marked;       // ...and the body carries the 6.7.4p7 mark
+        SymbolBinding binding;
+        char const*   referenceNm;
+    };
+    static constexpr Row kRows[] = {
+        {"inline",          1u, true,  SymbolBinding::Global, "U p"},
+        {"static inline",   0u, false, SymbolBinding::Local,  "t p"},
+        {"extern inline",   0u, false, SymbolBinding::Global, "T p"},
+        {"extern __inline", 0u, false, SymbolBinding::Global, "T p"},
+    };
+    for (Row const& row : kRows) {
+        SCOPED_TRACE(row.spelling);
+        SemanticModel model = analyzeC(
+            std::string(row.spelling) + " int p(int x) { return x + 1; }\n"
+                                        "int main(void) { return p(41); }\n");
+        ASSERT_FALSE(model.hasErrors()) << row.spelling;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_TRUE(res->ok) << row.spelling;
+
+        EXPECT_EQ(externRowsNamed(*res, "p"), row.externRows)
+            << row.spelling << " — reference `nm` column " << row.referenceNm
+            << "; an ExternFunction row is DSS's spelling of `U p`, and exactly "
+               "one row must exist iff this TU provides no external definition";
+
+        HirNodeId const f = functionNamed(res->hir, model, "p");
+        ASSERT_TRUE(f.valid())
+            << row.spelling << " — the body is lowered in EVERY row (the "
+               "optimizer needs it even where it is never emitted); an absent "
+               "Function node means it was dropped, not suppressed";
+        bool const marked = res->inlineDefinitionMap.has(f)
+                            && res->inlineDefinitionMap.get(f).isInlineDefinition;
+        EXPECT_EQ(marked, row.marked)
+            << row.spelling << " — the 6.7.4p7 mark is what makes the optimizer's "
+               "strip epilogue drop the body; losing it on the first row emits a "
+               "second external definition, and setting it on the others deletes "
+               "a definition the program needs";
+
+        EXPECT_EQ(declaredBinding(*res, model, "p"),
+                  std::optional{row.binding})
+            << row.spelling << " — reference `nm` column " << row.referenceNm;
+    }
 }

@@ -3,54 +3,69 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
-#include "core/types/type_lattice/core_type.hpp"  // CallConv
 #include "link/object_format_schema.hpp"
 
 #include <cstdint>
 #include <expected>
-#include <span>
 #include <string>
 #include <string_view>
 
-// Plan 11 FF3 — ABI catalog. Resolves a (target × format) pair to
-// a calling-convention selection plus a pointer into the target
-// schema's `callingConventions` array.
+// Plan 11 FF3 — ABI resolution. Resolves a (target × format) pair to a pointer
+// into the target schema's `callingConventions` array.
 //
-// D-FF3-3 CLOSED (2026-06-01 post-fold #5): `resolveAbi` is now
-// threaded through `compileOneTarget` → `compileSingleUnit` →
-// `allocateRegisters(ccIndex)`. A `target=x86_64
-// format=pe64-x86_64-windows` pair correctly dispatches to
-// `ms_x64` (the cc resolved here), not the pre-fix hardcoded
-// `sysv_amd64` (cc[0]). The behavioral pin lives at
-// `tests/lir/test_lir_callconv.cpp::CcIndex1DrivesDifferentArgGprThanCc0`.
+// D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY CLOSED
+// (P44): the selection is READ, not derived. The `.format.json` declares
+// `cCallingConvention.convention` — the NAME of one of the paired target's
+// `callingConventions[]` rows, or the reserved `"none"` — and `resolveAbi`
+// resolves that name against the target's own O(1) index. The closed C++ table
+// `kAbiCatalog`, keyed on (target name, `ObjectFormatKind`), is DELETED, along
+// with `AbiCatalogRow`, `abiCatalogTable()` and the `CallConv` column each row
+// carried; see the note at the top of `abi_catalog.cpp` for the full argument
+// and for what replaced its `consteval` uniqueness assert.
 //
-// Closed-table dispatch keyed on (target.name, format.kind) →
-// (CallConv enum, expected cc name string). FF3 looks up the row,
-// then resolves the cc by name against the target's
-// `callingConventions` array. Either lookup miss fails loud with
-// a distinct F_* code.
+// ★ NEITHER THIS HEADER NOR ITS `.cpp` SPEAKS `ObjectFormatKind` ANY MORE — the
+// name survives in both files only inside this note about its removal, and in no
+// declaration, signature or expression. That is the same load-bearing property
+// `c_mangle.hpp` gained when `kCManglingRules` went: with the identity absent
+// from every signature, an identity branch is not something a reviewer must look
+// for, it is unrepresentable. `#include "link/object_format_schema.hpp"` stays
+// because `resolveAbi` takes an `ObjectFormatSchema const&` — it asks that
+// schema what it DECLARES, never what it IS.
 //
-// Layout-side (pointer size, integer-type sizes, struct padding,
-// va_arg handling) is anchored as D-FF3-1 — not in v1 because no
-// shipped target.json yet declares layout, and adding the fields
-// is a cross-tier extension to TargetSchema beyond FF3's scope.
+// D-FF3-3 CLOSED (2026-06-01 post-fold #5): `resolveAbi` is threaded through
+// `compileOneTarget` → `compileSingleUnit` → `allocateRegisters(ccIndex)`. A
+// `target=x86_64 format=pe64-x86_64-windows` pair correctly dispatches to
+// `ms_x64`, not the pre-fix hardcoded `sysv_amd64` (cc[0]). The behavioral pin
+// lives at `tests/lir/test_lir_callconv.cpp::CcIndex1DrivesDifferentArgGprThanCc0`.
+//
+// Layout-side (pointer size, integer-type sizes, struct padding, va_arg
+// handling) is anchored as D-FF3-1 — not in v1 because no shipped target.json
+// yet declares layout, and adding the fields is a cross-tier extension to
+// TargetSchema beyond FF3's scope. When it lands it belongs INSIDE the
+// `cCallingConvention` block as a sibling key, which is why that block is an
+// object rather than a bare string.
 
 namespace dss::ffi {
 
 // Resolved ABI for a (target, format) pair.
 struct DSS_EXPORT AbiTuple {
-    // The CallConv enum value the type lattice's FnSig should
-    // carry for symbols compiled into this (target, format) pair.
-    CallConv callingConvention = CallConv::CcSysV;
-
     // Pointer into the resolving target's `callingConventions()`
     // span. NON-null for register-machine targets (where ML7
     // callconv lowering needs the structured register data).
-    // NULL for operand-stack (WASM) / result-id (SPIR-V) targets
-    // — those abi-models bypass register allocation entirely, so
-    // there's no cc table to attach. Lifetime: tied to the
-    // TargetSchema passed to `resolveAbi`. The caller MUST keep
-    // the target schema alive for the AbiTuple's lifetime.
+    // NULL when the format declares `cCallingConvention` `"none"`
+    // — an operand-stack (WASM) or result-id (SPIR-V) format has no
+    // register-passing convention at all, and a null here is the
+    // signal the driver and FFI ingest already refuse on. Lifetime:
+    // tied to the TargetSchema passed to `resolveAbi`. The caller
+    // MUST keep the target schema alive for the AbiTuple's lifetime.
+    //
+    // ⚠ THIS STRUCT USED TO CARRY A SECOND FIELD, `CallConv
+    // callingConvention`, AND IT IS DELETED RATHER THAN MOVED.
+    // ✔MEASURED at closure: no site in `src/` ever read it — all four
+    // `resolveAbi` callers read `cc` — and its only consumer was a
+    // test asserting the deleted table against itself. The struct is
+    // kept (rather than collapsing the return type to a bare pointer)
+    // because D-FF3-1's layout facts belong here when they land.
     TargetCallingConvention const* cc = nullptr;
 };
 
@@ -61,14 +76,28 @@ struct DSS_EXPORT AbiTuple {
 // without a row; `Count_` increments alongside any addition. Matches
 // `HirOpKind::Count_` codebase precedent).
 enum class AbiResolveErrorKind : std::uint8_t {
-    UnknownTuple              = 0,  // (target.name, format.kind) not in catalog
-    NoMatchingCcInTarget      = 1,  // target.json lacks the cc the catalog says it needs
-    FormatAbiModelMismatch    = 2,  // defensive — abiModel/format-kind disagreement
-    CcRegistersInconsistent   = 3,  // cc row carries register names absent from target.registers[]
+    // The (target, format) pair declares NO ABI. Two ways to reach it, and
+    // both are the same statement: the format declares `cCallingConvention`
+    // `"none"` while the target passes arguments in registers, or the format
+    // declares nothing at all (reachable only from a hand-built
+    // `ObjectFormatData`, since the loader requires the key).
+    // ⚠ THE NAME PREDATES THE FIX AND ITS OLD MEANING WAS NARROWER — it named
+    // a (target.name, format.kind) tuple absent from the deleted `kAbiCatalog`.
+    // It is kept because the CONDITION it reports is the same one under the new
+    // shape ("this pairing has no declared ABI") and because renaming it would
+    // churn a shared `DiagnosticCode` enum for no gain in truth.
+    UnknownTuple              = 0,
+    // The format NAMES a convention the target ships no row for.
+    NoMatchingCcInTarget      = 1,
+    // Defensive — the format names a register convention while the target
+    // declares a non-register abi-model (or the inverse is caught above).
+    FormatAbiModelMismatch    = 2,
+    // The resolved cc row carries register names absent from target.registers[].
+    CcRegistersInconsistent   = 3,
     Count_                          // table-size sentinel — keep LAST (codebase convention)
 };
 
-// (D-FF3-Coherence: previously retired 2026-06-01 on the premise
+// (the FF3 Coherence item: previously retired 2026-06-01 on the premise
 // that `TargetSchemaData::validate()` already closes this surface
 // at JSON load. That premise was FALSE: `TargetSchema`'s ctor is
 // public (`TargetSchema`'s converting ctor in target_schema.hpp) and
@@ -98,19 +127,5 @@ std::expected<AbiTuple, AbiResolveError>
 resolveAbi(TargetSchema const&       target,
            ObjectFormatSchema const& format,
            DiagnosticReporter&       reporter);
-
-// Test-exposed: the catalog table. Row 0..N-1 each map
-// (target.name, format.kind) → (CallConv, expected cc name).
-// Lets unit tests pin coverage + uniqueness without
-// re-implementing the lookup.
-struct DSS_EXPORT AbiCatalogRow {
-    std::string_view targetName;
-    ObjectFormatKind formatKind;
-    CallConv         callingConvention;
-    std::string_view expectedCcName;
-};
-
-[[nodiscard]] DSS_EXPORT std::span<AbiCatalogRow const>
-    abiCatalogTable() noexcept;
 
 } // namespace dss::ffi

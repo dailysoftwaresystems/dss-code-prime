@@ -1,0 +1,24 @@
+{
+  "$comment": "D-FFI-DESCRIPTOR-TYPE-ALIAS-SPELLING-KEYED-ON-DATA-MODEL-ALONE (P48 lane st) — the runnable Darwin half of the row. WHAT IT CLOSES: every shipped 64-bit type alias selected its SPELLING on `when:{dataModel}` ALONE, on the assumption (written into stdint.json's own $comment) that uint64_t/uintptr_t/uintmax_t/size_t are `unsigned long` on LP64 and `unsigned long long` on LLP64. Darwin is a THIRD world: LP64, yet `uint64_t` is `unsigned long long` (usr/include/_types/_uint64_t.h) while `size_t` stays `unsigned long` (__darwin_size_t). Every candidate is 8 bytes, so NOTHING miscompiled by size — DSS simply recorded a false ABI SPELLING, which since type identity was split off representation is a real defect: `_Generic` takes no arm and `unsigned long long *p = &u64var;` is a bare S_TypeMismatch. ★ WHY THE PIN IS POINTERS AND _Generic AND NOT sizeof: sizeof cannot see it. Both discriminators are used, at the two times they are answerable — pointer-assignment compatibility at COMPILE time (so every host that BUILDS these Mach-O legs runs the pin, Mac or not; tests/examples compiles every target spec on every host and skips only the spawn) and _Generic at RUN time (so the expectedStdout below is an independent second channel). ⚠ `_Static_assert(_Generic(...))` was tried FIRST and DSS refuses it — S_StaticAssertFailed 'condition is not an integer constant expression' — which gcc/clang/MSVC all accept; that is a separate conformance gap, reported by this lane and NOT worked around here, which is why the compile-time half is spelled with pointers. ★ THE SPLIT IS THE POINT, so both sides are asserted: uint64_t/int64_t move to `long long` on Darwin while uintmax_t/uintptr_t/size_t/intmax_t stay `long`/`unsigned long` exactly as on glibc — a fix that flipped the whole header would satisfy the first rows and fail the rest. ✔MEASURED 2026-09-01 on the operator's physical Mac (macOS 26.6.2, build 25G83, MacOSX26.5.sdk, Apple clang 21.0.0) with a compile-only _Generic probe testing every alias against every candidate named type under BOTH -arch arm64 and -arch x86_64; the two arches answered byte-identically, which is why both Mach-O targets ship here and expect the same output. ✔EXECUTED, not predicted: the DSS-built arm64 artifact was scp'd to that Mac and run (md5-verified on arrival, f2ff2e57a8788e49df4b63a9784f736c), printing this exact line and exiting 42; the x86_64 artifact was run there under Rosetta (065f7787ffc834ff67618f54f21b0924) with byte-identical output; and the SAME source built by /usr/bin/clang -Wall -Wextra for both arches produced byte-identical output and exit 42 — the reference oracle agrees with DSS cell for cell. RED-ON-DISABLE: reverting stdint.json to its `when:{dataModel}` form makes the first initializer S_TypeMismatch on both Mach-O legs and no artifact is emitted; the identity table is additionally pinned in C++ across elf/macho/pe by tests/ffi/test_stdint_alias_identity.cpp, whose mutants DELETE json keys (the macho arms, and the `format` keys this row added) rather than adding fixtures. FOLD-RESISTANCE: the five values arrive through `volatile` seeds read via the identity pointers, so the exit arithmetic (8+9+10+7+8) stays live instead of folding to one immediate, and the release arm runs the shipped release pipeline over the same source.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "u64=ull umax=ul uptr=ul size=ul i64=ll imax=l\n",
+  "targets": [
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -70,6 +70,114 @@ namespace {
 
 // ── Happy path: structural FnSig inspection ──────────────────────────────────
 
+// ── [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]] ─────
+//
+// A `realization.source` THAT NAMES AN AUTHORITY MUST BE REFUSED. The decode
+// states the rule plainly — the path is "RELATIVE to src/dss-config/" and "a
+// `..` component or an absolute/rooted spelling would let a descriptor reach an
+// arbitrary file on the host, so both are refused HERE rather than at the
+// filesystem" — and the predicate it asked did not implement it.
+//
+// ★★★ THE HOLE, ✔MEASURED 2026-08-28 on the toolchain that builds DSS:
+//     '//host/share/x'.is_absolute()        -> FALSE
+//     '//host/share/x'.has_root_name()      -> FALSE   (empty root_name)
+//     '//host/share/x'.has_root_directory() -> TRUE
+// The guard asked `is_absolute() || has_root_name()`, so an all-forward-slash
+// authority passed every test it applied: the backslash check never saw one, and
+// none of `//`, `host`, `share`, `x` is `.` or `..`. `resolveShippedSource` then
+// JOINS it, and `operator/` with a rooted right operand REPLACES rather than
+// appends — so the composed path is the descriptor's, not the config root's.
+//
+// ⚠ NO HOST UNC SUPPORT IS NEEDED AND THAT IS WHY THIS ARM CARRIES THE CLASS ON
+// EVERY LEG. The defect is in CLASSIFYING a string, not in reaching a file, so
+// there is nothing to skip: `//host/share/x` is refused, or it is not.
+//
+// ⚠⚠ THE ASSERTION IS ON THE CONTAINMENT MESSAGE, NOT ON `hasErrors()`, AND THAT
+// CORRECTION CAME FROM THE RED-ON-DISABLE ITSELF. The first version of this arm
+// asked only whether the read reported ANY error; it stayed GREEN over a built,
+// verified mutant (object md5 moved and returned) because a descriptor naming a
+// source that is not there ALSO fails, one tier later, with a completely
+// different diagnostic. A true answer to an adjacent question — and it fails
+// toward "clean", so nothing would have flagged it.
+[[nodiscard]] bool sawContainmentRefusal(DiagnosticReporter const& rep) {
+    for (auto const& d : rep.all())
+        if (d.actual.find("must be a non-empty path RELATIVE to")
+            != std::string::npos)
+            return true;
+    return false;
+}
+
+TEST(ShippedLibDescriptor, RealizationSourceNamingAnAuthorityIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib-escape"};
+    auto const path = writeTemp(dir, "escape.json", R"({
+        "header": "escape.h",
+        "realization": { "elf": { "source": "//host/share/evil.c" } },
+        "symbols": [
+            { "name": "e", "signature": "fn() -> i32",
+              "kind": "function", "linkage": "external" }
+        ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    static_cast<void>(readShippedLibDescriptor(path, interner, typeReg, rep));
+    EXPECT_TRUE(sawContainmentRefusal(rep))
+        << "a realization source whose root is a multi-separator authority was "
+           "accepted as a path relative to src/dss-config/, so a descriptor can "
+           "name a file on another machine";
+}
+
+// The same rule for a SINGLE leading separator, which the old predicate also let
+// through on this host: `/abs/x` answers `is_absolute()` FALSE with an empty
+// `root_name()` wherever a drive letter is what makes a path absolute. It is a
+// location on the current drive, not inside the config root, so it escapes too.
+TEST(ShippedLibDescriptor, RealizationSourceNamingARootedPathIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib-escape-rooted"};
+    auto const path = writeTemp(dir, "rooted.json", R"({
+        "header": "rooted.h",
+        "realization": { "elf": { "source": "/etc/evil.c" } },
+        "symbols": [
+            { "name": "r", "signature": "fn() -> i32",
+              "kind": "function", "linkage": "external" }
+        ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    static_cast<void>(readShippedLibDescriptor(path, interner, typeReg, rep));
+    EXPECT_TRUE(sawContainmentRefusal(rep))
+        << "a root-relative realization source escaped the config root";
+}
+
+// The CONTROL, chosen to be INERT: an ordinary relative source with no root at
+// all must still be ACCEPTED. This is what keeps the widened predicate from
+// being a blanket refusal — `isRootedPath` answers FALSE here, exactly as the
+// pair it replaced did.
+TEST(ShippedLibDescriptor, RealizationSourceThatIsPlainlyRelativeIsAccepted) {
+    ScratchDir dir{Location::Temp, "shipped-lib-escape-control"};
+    auto const path = writeTemp(dir, "ok.json", R"({
+        "header": "ok.h",
+        "realization": { "elf": { "source": "runtime/ok.c" } },
+        "symbols": [
+            { "name": "k", "signature": "fn() -> i32",
+              "kind": "function", "linkage": "external" }
+        ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    static_cast<void>(readShippedLibDescriptor(path, interner, typeReg, rep));
+    // The descriptor names a source that does not exist in this scratch tree, so
+    // the read legitimately reports THAT. What must not appear is the
+    // containment refusal — the assertion is on the message, not on the count.
+    EXPECT_FALSE(sawContainmentRefusal(rep))
+        << "a plainly relative realization source was refused as an escape — "
+           "the widened predicate became a regression";
+}
+
 TEST(ShippedLibDescriptor, ReadsPutsWithDecodedFnSig) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "stdio.json", R"({
@@ -4750,12 +4858,23 @@ TEST(ShippedLibDescriptor, RealResourcePerFormatRusageTimeval) {
 // ── c106 (the shell.c pe header/descriptor batch) ──────────────────────────
 
 // Decode a REAL shipped descriptor for one format (the RealTimeStructTm idiom).
+// ⚠ `model` DEFAULTS TO Lp64 AND THE DEFAULT IS ONLY RIGHT FOR elf/macho.
+// D-FFI-DESCRIPTOR-TYPE-ALIAS-SPELLING-KEYED-ON-DATA-MODEL-ALONE (P48 lane st)
+// made the shipped type-alias selectors name BOTH axes — `when:{dataModel,format}`
+// — because Darwin is LP64 while spelling `uint64_t` `unsigned long long`. Once
+// both axes participate, handing this helper an object format and a data model
+// that DO NOT GO TOGETHER asks about a target that does not exist: every pe
+// `.format.json` declares LLP64, so `(Pe, Lp64)` matches no arm and the alias is
+// not injected. Before that row the pair silently resolved — to the LP64 arm, on
+// a pe-only descriptor — so `RealIntrinHeaderIsPeOnlyAndCarriesNoEagerSymbols`
+// was reading an arm that can never be selected and checking only its 8-byte
+// WIDTH, which both spellings share. Pass the model that matches `fmt`.
 static std::optional<ShippedLibDescriptor> decodeShippedFor(
     fs::path const& p, TypeInterner& interner, TypeRegistry& typeReg,
-    ObjectFormatKind fmt) {
+    ObjectFormatKind fmt, DataModel model = DataModel::Lp64) {
     DiagnosticReporter rep;
     auto desc = readShippedLibDescriptor(p, interner, typeReg, rep,
-                                         DataModel::Lp64,
+                                         model,
                                          std::string_view{"x86_64"}, fmt);
     EXPECT_TRUE(desc.has_value()) << p.generic_string();
     EXPECT_FALSE(rep.hasErrors()) << p.generic_string();
@@ -4813,8 +4932,12 @@ TEST(ShippedLibDescriptor, RealIntrinHeaderIsPeOnlyAndCarriesNoEagerSymbols) {
     ASSERT_FALSE(root.empty());
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry typeReg;
+    // (Pe, Llp64) — the pair a real Windows target actually is. See the
+    // `decodeShippedFor` note: `size_t`'s arm is `when:{dataModel:LLP64,
+    // format:pe}` since D-FFI-DESCRIPTOR-TYPE-ALIAS-SPELLING-KEYED-ON-DATA-MODEL-ALONE,
+    // and the LP64 arm that used to answer here was unreachable dead config.
     auto desc = decodeShippedFor(root / "intrin.json", interner, typeReg,
-                                 ObjectFormatKind::Pe);
+                                 ObjectFormatKind::Pe, DataModel::Llp64);
     ASSERT_TRUE(desc.has_value());
     EXPECT_EQ(desc->header, "intrin.h");
     // (1) the header-level gate is exactly ["pe"].
@@ -5289,6 +5412,17 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
     // … + the 3 trampolines.
     {"thrd_create", ShimFamily::Threads},   {"thrd_join", ShimFamily::Threads},
     {"call_once", ShimFamily::Threads},
+    // … + the 4 that closed the header on every leg (D-CSUBSET-C11-THREADS-TIMED,
+    // P49 lane tw). ★ THREE OF THESE GRADUATED OUT OF `kNonRecipes` BELOW, where they
+    // sat as "deferred threads ids" — the negative list was RIGHT while the deferral
+    // stood and is WRONG the moment it lifts, which is why the graduation is a
+    // deliberate two-place edit rather than an append. What gated them was a pe
+    // `struct timespec` layout nobody had measured; P49 lane th measured it (tv_nsec
+    // is `long` = FOUR bytes on LLP64, against 8 on LP64, at the same offset in a
+    // struct of the same size on both) and the recipes could then be written without
+    // guessing. `thrd_equal` was never in the negative list — it was simply absent.
+    {"thrd_sleep", ShimFamily::Threads},    {"mtx_timedlock", ShimFamily::Threads},
+    {"cnd_timedwait", ShimFamily::Threads}, {"thrd_equal", ShimFamily::Threads},
     // <stdio.h> printf/scanf family over the UCRT __stdio_common_v* cores — SIX recipes
     // as of TF-C119, where `sprintf` was once the only one and P3 grew it to five.
     // ucrtbase.dll exports NOT ONE of these six names (in a real MSVC build each is a
@@ -5340,7 +5474,13 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
 // through it), and it has no descriptor row, so a recipe landing ahead of one still reds.
 constexpr char const* kNonRecipes[] = {
     "vsnprintf", "snprintf_s",                               // unshipped stdio arms
-    "thrd_sleep", "mtx_timedlock", "cnd_timedwait",          // deferred threads ids
+    // ★ `thrd_sleep`, `mtx_timedlock` and `cnd_timedwait` USED TO SIT HERE as
+    // "deferred threads ids" and MOVED into kPinnedRecipes in P49
+    // (D-CSUBSET-C11-THREADS-TIMED): they are real recipes on pe and macho now. The
+    // negative below is the deliberate replacement — `thrd_sleep_until` is not a C11
+    // function at all, so no descriptor row can ever justify a recipe for it, which is
+    // exactly the property a member of this list must have.
+    "thrd_sleep_until",
     "puts", "fputs", "__stdio_common_vsprintf",
     "mtx_lokc", "SPRINTF", "Sprintf", "sprintf ", " sprintf", "",
 };
@@ -5369,7 +5509,10 @@ TEST(ShippedLibDescriptor, ShimFamilyOfPartitionsEveryRecipeInTheVocabulary) {
         (r.family == ShimFamily::Threads ? threads : stdio) += 1;
     }
     // The shape of the vocabulary itself, so a silent addition/removal is visible.
-    EXPECT_EQ(threads, 21u) << "the <threads.h> family is the 18 non-trampoline + 3 trampolines";
+    EXPECT_EQ(threads, 25u)
+        << "the <threads.h> family is the 18 non-trampoline + 3 trampolines + the 4 "
+           "timed/identity recipes that closed the header on every leg "
+           "(D-CSUBSET-C11-THREADS-TIMED)";
     EXPECT_EQ(stdio, 6u)
         << "the <stdio.h> family ships EXACTLY "
            "printf/fprintf/sprintf/snprintf/vfprintf/sscanf (P3 grew it from 1 to 5; "

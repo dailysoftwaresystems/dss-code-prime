@@ -336,7 +336,16 @@ wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
         // the peel declines it anyway — but naming it here states the reason
         // (evalNode owns it) instead of relying on a child count that a future
         // grammar edit could change underneath.
-        (cfg.chooseExprRule.valid()  && rule.v == cfg.chooseExprRule.v)
+        (cfg.chooseExprRule.valid()  && rule.v == cfg.chooseExprRule.v)   ||
+        // P49 (D-CSUBSET-GENERIC-SELECTION-IS-NOT-AN-INTEGER-CONSTANT-EXPRESSION):
+        // `_Generic` is the SECOND compile-time selection and is named here for
+        // the same reason as the first. Its controlling expression plus its
+        // association list are ≥2 meaningful Internal children today, so the peel
+        // declines it on the count alone — but a count is not a decision, and
+        // peeling a `_Generic` would descend into its CONTROLLING expression,
+        // which 6.5.1.1p3 says is not even evaluated. Naming it makes evalNode's
+        // ownership explicit.
+        (cfg.genericRule.valid()     && rule.v == cfg.genericRule.v)
         // P31: `__builtin_offsetof` / `__builtin_types_compatible_p` — each has a
         // castTypeRef child the peel would descend into and then reject as
         // non-constant, exactly the sizeof hazard one row up.
@@ -631,16 +640,34 @@ evalNode(NodeId                              expr,
         return ok(std::move(lit));
     }
 
-    // P31: `__builtin_choose_expr` in a const-expr context. The closure hands
-    // back the SELECTED arm and this engine then evaluates ONLY that node, so the
-    // discarded arm is never visited at all — which is why
-    // `__builtin_choose_expr(1, 4, 1/0)` folds to 4 here instead of tripping the
-    // divide-by-zero wall, matching gcc.
-    if (cfg.chooseExprRule.valid() && rule.v == cfg.chooseExprRule.v) {
-        if (!env.resolveChosenExpr) {
+    // P31 / P49: a COMPILE-TIME SELECTION in a const-expr context —
+    // `__builtin_choose_expr` (winner picked by an integer constant condition)
+    // and C11/C23 6.5.1.1 `_Generic` (winner picked by the controlling
+    // expression's TYPE). ONE arm for both, because what this engine does with a
+    // selection does not depend on how the winner was chosen — the same reason
+    // the CST→HIR tier lowers both through one `lowerRecordedSelection`.
+    //
+    // The closure hands back the SELECTED arm and this engine then evaluates ONLY
+    // that node, so the discarded arms are never visited at all. For
+    // `__builtin_choose_expr` that is why `__builtin_choose_expr(1, 4, 1/0)`
+    // folds to 4 instead of tripping the divide-by-zero wall, matching gcc; for
+    // `_Generic` it is 6.5.1.1p3 itself — the unselected associations are
+    // unevaluated, so `_Generic(x, int: 4, default: f())` folds to 4 while
+    // `_Generic(x, int: f(), default: 4)` stays non-constant BECAUSE the ordinary
+    // fold of the returned arm fails, not because of any second opinion here.
+    // ⚠ THE FOLD OF THE ARM IS THE ONLY CONSTNESS TEST. A resolver that answered
+    // "this selection is constant" instead of "this is the arm" would be a second
+    // owner of that question, and the over-broad answer (a selection is always an
+    // ICE) is exactly the shape that passes the easy cases and breaks the
+    // standard's boundary.
+    bool const isCompileTimeSelection =
+        (cfg.chooseExprRule.valid() && rule.v == cfg.chooseExprRule.v)
+        || (cfg.genericRule.valid() && rule.v == cfg.genericRule.v);
+    if (isCompileTimeSelection) {
+        if (!env.resolveSelectedArm) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
-        auto const arm = env.resolveChosenExpr(expr);
+        auto const arm = env.resolveSelectedArm(expr);
         if (!arm.has_value() || !arm->valid()) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <format>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -11,88 +12,53 @@ namespace dss::ffi {
 
 namespace {
 
-// Closed-table: each row pins ONE (target.name, format.kind) →
-// (CallConv enum, expected calling-convention name in the
-// target.json). Adding a new (target, format) combination = add
-// a row here AND ship the cc with the same name in the target's
-// JSON. The static_asserts below catch duplicate rows.
+// ── D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY ────────
 //
-// Source/target/linker agnostic invariant: the catalog encodes
-// the platform ABI **convention** (which cc applies on which
-// OS+ISA combination), not the register allocation itself —
-// that comes from the target schema's per-cc struct that this
-// row points at.
+// THE CLOSED C++ TABLE `kAbiCatalog` STOOD HERE AND IS GONE, along with the
+// `AbiCatalogRow` type, the `abiCatalogTable()` accessor, its `consteval`
+// uniqueness assert, the `lookupCatalog` scan, and the `CallConv` column each
+// row carried. Six rows keyed on (target NAME, `ObjectFormatKind`) selected the
+// calling convention for every C symbol this compiler emits.
 //
-// Currently SHIPPED combinations (both target.json + format.json
-// present + cc row exists):
-//   x86_64 + Elf   → sysv_amd64
-//   x86_64 + Pe    → ms_x64
-//   x86_64 + MachO → sysv_amd64  (Apple's x86_64 ABI is SysV-with-quirks)
-//   arm64  + Elf   → aapcs64
+// ★ IT IS THE SAME DEFECT AS `kCManglingRules`, WHICH A PRIOR CYCLE DELETED
+// (D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN) — a table keyed on format identity is
+// an `if` on format identity with the branch spelled as data — AND THE SAME
+// EVIDENCE WAS SITTING IN PLAIN SIGHT: the strings the table produced,
+// `"sysv_amd64"` / `"ms_x64"` / `"apple_arm64"` / `"aapcs64"`, were ALREADY
+// written in the shipped descriptors. The fourth column was not deriving
+// anything; it was RE-STATING a declaration, in a second language, with nothing
+// forcing the two to agree.
 //
-// Anchored but NOT yet shipped (FF3 will fail loud
-// `NoMatchingCcInTarget` if used; remediation = ship the matching
-// format.json + add the cc row in target.json + ALSO add a
-// matching CallConv enum variant when the convention is
-// arch-distinct):
-//   arm64 + Pe    → ms_arm64    — Microsoft ARM64 ABI. PLACEHOLDER
-//                                  CallConv: re-uses `CcMS64`
-//                                  pending a proper `CcMSARM64`
-//                                  variant; the two share `MS_*`
-//                                  history but differ in arg
-//                                  registers (x0..x7 vs rcx/rdx/r8/r9)
-//                                  + return-reg + shadow space.
-//                                  D-FF3-4 anchor: split CallConv.
-//   arm64 + MachO → apple_arm64 — Apple ARM64 ABI. Divergent from
-//                                  AAPCS64 (developer.apple.com:
-//                                  /documentation/xcode/writing-arm64-code-for-apple-platforms)
-//                                  on varargs (always-stack) and
-//                                  indirect-result. CcApple
-//                                  variant exists.
-constexpr std::array<AbiCatalogRow, 6> kAbiCatalog{{
-    { "x86_64", ObjectFormatKind::Elf,   CallConv::CcSysV,    "sysv_amd64"  },
-    { "x86_64", ObjectFormatKind::Pe,    CallConv::CcMS64,    "ms_x64"      },
-    { "x86_64", ObjectFormatKind::MachO, CallConv::CcSysV,    "sysv_amd64"  },
-    { "arm64",  ObjectFormatKind::Elf,   CallConv::CcAAPCS64, "aapcs64"     },
-    { "arm64",  ObjectFormatKind::Pe,    CallConv::CcMS64,    "ms_arm64"    },  // placeholder CallConv — see D-FF3-4
-    { "arm64",  ObjectFormatKind::MachO, CallConv::CcApple,   "apple_arm64" },
-}};
-
-// Compile-time uniqueness: a duplicate (targetName, formatKind)
-// row would silently be dead code (the linear scan returns the
-// FIRST match) while a maintainer thinks both rows are honored.
-// Mirrors `kTargetArchMachineCodes`'s consteval discipline from
-// cross_validate_target_format.cpp.
-consteval bool kAbiCatalogTuplesUnique() {
-    for (std::size_t i = 0; i < kAbiCatalog.size(); ++i) {
-        for (std::size_t j = i + 1; j < kAbiCatalog.size(); ++j) {
-            if (kAbiCatalog[i].targetName == kAbiCatalog[j].targetName
-                && kAbiCatalog[i].formatKind == kAbiCatalog[j].formatKind) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-static_assert(kAbiCatalogTuplesUnique(),
-              "kAbiCatalog rows must be unique on (targetName, formatKind) "
-              "— a duplicate is dead code that masks a paste-error.");
-
-[[nodiscard]] AbiCatalogRow const*
-lookupCatalog(std::string_view targetName, ObjectFormatKind kind) noexcept {
-    for (auto const& row : kAbiCatalog) {
-        if (row.targetName == targetName && row.formatKind == kind) {
-            return &row;
-        }
-    }
-    return nullptr;
-}
-
-// (`findCcByName` helper retired post-FF3-#2 — replaced by
-// `TargetSchema::callingConventionByName` which is the existing
-// O(1) hashmap lookup, not a linear scan. code-reviewer HIGH
-// fold; matches the codebase rule "use existing index when one
-// exists".)
+// The selection now arrives as a DECLARED VERB read out of `.format.json`
+// (`cCallingConvention.convention`), and this file no longer speaks
+// `ObjectFormatKind` at all. That last part is the load-bearing half, exactly as
+// it was in `c_mangle.cpp`: with the identity absent from every signature below,
+// an identity branch is not something a reviewer has to look for — it is
+// unrepresentable here.
+//
+// ★★ WHAT ELSE WENT, AND WHY IT COULD: THE `CallConv` COLUMN. Each row also
+// pinned a `CallConv` enum value, surfaced as `AbiTuple::callingConvention`, and
+// the anchor's own hazard text dramatised it as "arguments in the wrong
+// registers". ✔MEASURED: NOTHING IN `src/` EVER READ IT. Every one of the four
+// `resolveAbi` call sites (`program.cpp`, `compile_pipeline.cpp`, and both in
+// `ingest.cpp`) reads `abi->cc` — the pointer into the target's own
+// `callingConventions[]` — and none reads the enum; its only consumer was a test
+// asserting the table against itself. The live hazard was the NAME column, and
+// an inflated hazard misdirects a fix as surely as an understated one.
+//
+// ★ WHAT REPLACED THE `consteval` UNIQUENESS ASSERT. Its job was to notice two
+// rows claiming the same (target, format) pair, one of which would then be dead
+// code. That job did not disappear, it BECAME STRUCTURAL: a format declares
+// exactly one `cCallingConvention`, so two claims on one pair are no longer
+// representable, and JSON object-key duplication is refused by the parser one
+// tier below. A whole class of assert was replaced by a shape in which the
+// mistake cannot be written.
+//
+// ★ WHY THE ARCH IS NOT PART OF THE KEY ANY MORE. `crossValidateTargetFormat`
+// refuses any (target, format) pair whose declared machine code disagrees with
+// the target's arch, so a format document that reaches here has exactly one arch
+// it can ever be paired with. The old first column was carrying no information
+// that the format did not already carry.
 
 // Closed-table error-kind → name + F_* code mapping. Mirrors the
 // pattern from `kHeaderReadErrorTable` (c_header_parser.cpp).
@@ -146,81 +112,112 @@ abiResolveErrorKindName(AbiResolveErrorKind k) noexcept {
     return kAbiResolveErrorTable[idx].name;
 }
 
-std::span<AbiCatalogRow const>
-abiCatalogTable() noexcept {
-    return {kAbiCatalog.data(), kAbiCatalog.size()};
-}
-
 std::expected<AbiTuple, AbiResolveError>
 resolveAbi(TargetSchema const&       target,
            ObjectFormatSchema const& format,
            DiagnosticReporter&       reporter) {
-    // Operand-stack + result-id targets: no cc table to bind.
-    // crossValidateTargetFormat enforces abiModel↔format-kind
-    // compatibility upstream; FF3 trusts that gate but treats a
-    // mismatch defensively rather than dispatching to a stale
-    // catalog row.
-    if (target.abiModel() == TargetAbiModel::OperandStack) {
-        if (format.kind() != ObjectFormatKind::Wasm) {
-            return std::unexpected(emitAndReturn(
-                AbiResolveErrorKind::FormatAbiModelMismatch,
-                std::format("target '{}' is operand-stack abi-model but "
-                            "format kind is '{}' (expected wasm). "
-                            "crossValidateTargetFormat should have caught "
-                            "this upstream — file a bug.",
-                            target.name(),
-                            objectFormatKindName(format.kind())),
-                reporter));
-        }
-        return AbiTuple{CallConv::CcWasm, nullptr};
-    }
-    if (target.abiModel() == TargetAbiModel::ResultId) {
-        if (format.kind() != ObjectFormatKind::Spirv) {
-            return std::unexpected(emitAndReturn(
-                AbiResolveErrorKind::FormatAbiModelMismatch,
-                std::format("target '{}' is result-id abi-model but format "
-                            "kind is '{}' (expected spirv). "
-                            "crossValidateTargetFormat should have caught "
-                            "this upstream — file a bug.",
-                            target.name(),
-                            objectFormatKindName(format.kind())),
-                reporter));
-        }
-        return AbiTuple{CallConv::CcSpirv, nullptr};
-    }
+    // ── THE FORMAT'S DECLARED SELECTION ─────────────────────────────────────
+    //
+    // One read. Not a lookup, not a scan, not a dispatch: the descriptor was
+    // asked which convention it uses, and it answered.
+    std::string_view const declared = format.cCallingConvention().convention;
 
-    // Register-machine path: look up the catalog row keyed on
-    // (target.name, format.kind), then resolve the cc by name
-    // in the target's `callingConventions` array.
-    AbiCatalogRow const* row = lookupCatalog(target.name(), format.kind());
-    if (row == nullptr) {
+    // An EMPTY selection can only reach here from a HAND-BUILT
+    // `ObjectFormatData` — `ObjectFormatSchema{ObjectFormatData}` is a public
+    // constructor that runs no validation, so test fixtures, backend-synthesized
+    // descriptors and future binary-cache reloads all arrive without passing the
+    // JSON tier. The loader REQUIRES the key and `validate()` refuses the empty
+    // sentinel, so this arm defends only that one path — but it must defend it,
+    // because the alternative is treating "never declared" as "declares none"
+    // and silently returning a null cc to a register-machine pipeline.
+    if (!format.cCallingConvention().declared()) {
         return std::unexpected(emitAndReturn(
             AbiResolveErrorKind::UnknownTuple,
-            std::format("FF3 ABI catalog has no row for "
-                        "(target='{}', format-kind='{}'). "
-                        "Either the (target, format) pair is unsupported, "
-                        "or a new row must be added to kAbiCatalog "
-                        "(src/ffi/abi/abi_catalog.cpp).",
-                        target.name(), objectFormatKindName(format.kind())),
+            std::format("object format '{}' declares no `cCallingConvention` — "
+                        "the field is REQUIRED at config load, so this schema "
+                        "was constructed in memory without passing the loader. "
+                        "Set `ObjectFormatData::cCallingConvention` (a "
+                        "callingConventions[] row name from the paired target, "
+                        "or \"{}\") before handing the schema to FF3.",
+                        format.name(), kCCallingConventionNone),
             reporter));
     }
 
+    // ── THE `none` ARM: A FORMAT WITH NO REGISTER-LEVEL C ABI ───────────────
+    //
+    // WASM's operand stack and SPIR-V's result ids are not conventions this
+    // engine has yet to learn — they are the absence of a register-passing
+    // convention, and the format says so. A null `cc` is the signal the driver
+    // (`D_TargetAbiModelUnsupportedByDriver`) and FFI ingest
+    // (`F_FfiIngestAbiModelUnsupported`) already refuse on.
+    //
+    // ⚠ THE COHERENCE CHECK BELOW READS `abiModel`, WHICH IS A DECLARED TARGET
+    // PROPERTY, NOT AN IDENTITY. That distinction is the whole point: the old
+    // code compared `format.kind()` against `Wasm`/`Spirv` literals — two more
+    // identity branches — to reach the same conclusion. Two DECLARATIONS
+    // disagreeing is a config error and is judged as one; neither party is named
+    // by the engine.
+    bool const targetIsRegisterMachine =
+        target.abiModel() == TargetAbiModel::RegisterMachine;
+
+    if (format.cCallingConvention().declaresNoConvention()) {
+        if (targetIsRegisterMachine) {
+            return std::unexpected(emitAndReturn(
+                AbiResolveErrorKind::UnknownTuple,
+                std::format("target '{}' declares abiModel '{}' — it passes "
+                            "arguments in REGISTERS — but object format '{}' "
+                            "declares `cCallingConvention` \"{}\", i.e. no "
+                            "register-level C calling convention at all. The "
+                            "pair has no declared ABI: either the format must "
+                            "name one of the target's callingConventions[] "
+                            "rows, or this target must not be paired with it.",
+                            target.name(),
+                            targetAbiModelName(target.abiModel()),
+                            format.name(), kCCallingConventionNone),
+                reporter));
+        }
+        return AbiTuple{nullptr};
+    }
+
+    // The inverse disagreement: a format that names a convention paired with a
+    // target that does not pass arguments in registers. `crossValidateTargetFormat`
+    // catches the pairing upstream; FF3 is defensive because its schema arguments
+    // can arrive without having passed it.
+    if (!targetIsRegisterMachine) {
+        return std::unexpected(emitAndReturn(
+            AbiResolveErrorKind::FormatAbiModelMismatch,
+            std::format("object format '{}' declares `cCallingConvention` '{}' "
+                        "— a register-passing convention — but target '{}' "
+                        "declares abiModel '{}', which has no register "
+                        "convention to resolve it against. Expected \"{}\" for "
+                        "this pairing. crossValidateTargetFormat should have "
+                        "caught this upstream — file a bug.",
+                        format.name(), declared, target.name(),
+                        targetAbiModelName(target.abiModel()),
+                        kCCallingConventionNone),
+            reporter));
+    }
+
+    // ── RESOLVE THE DECLARED NAME AGAINST THE TARGET'S OWN VOCABULARY ───────
+    //
+    // `callingConventionByName` is the schema's existing O(1) index, not a scan.
+    // A miss is the format naming a convention this processor does not declare —
+    // loud, and the message says which name and which document to fix.
     TargetCallingConvention const* cc =
-        target.callingConventionByName(row->expectedCcName);
+        target.callingConventionByName(declared);
     if (cc == nullptr) {
         return std::unexpected(emitAndReturn(
             AbiResolveErrorKind::NoMatchingCcInTarget,
-            std::format("target '{}' paired with format-kind '{}' requires "
-                        "callingConventions row named '{}', but target.json "
-                        "ships no such row. Extend the target.json's "
-                        "callingConventions array.",
-                        target.name(),
-                        objectFormatKindName(format.kind()),
-                        row->expectedCcName),
+            std::format("object format '{}' declares `cCallingConvention` '{}', "
+                        "but target '{}' ships no callingConventions[] row with "
+                        "that name. Either extend the target's "
+                        "callingConventions array, or correct the format's "
+                        "`cCallingConvention.convention`.",
+                        format.name(), declared, target.name()),
             reporter));
     }
 
-    // D-FF3-Coherence (un-retired post-fold #4): defense-in-depth
+    // FF3 Coherence (un-retired post-fold #4): defense-in-depth
     // structural validation of the resolved cc. Catches the
     // paste-error class (e.g. `ms_arm64` cc declared with
     // `rcx,rdx,r8,r9` from `ms_x64`) when the schema reaches FF3
@@ -267,7 +264,7 @@ resolveAbi(TargetSchema const&       target,
         }
     }
 
-    return AbiTuple{row->callingConvention, cc};
+    return AbiTuple{cc};
 }
 
 } // namespace dss::ffi

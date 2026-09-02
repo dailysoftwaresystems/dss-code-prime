@@ -559,6 +559,20 @@ $Stage        = Join-Path $Work 'stage'          # the staged sqlite tree + head
 $OutRoot      = Join-Path $Work 'out'
 $GenPy        = Join-Path $PSScriptRoot 'gen-pe64-manifest.py'
 $CliSmokePy   = Join-Path $PSScriptRoot 'cli-smoke.py'
+# ★★ THE COMPILER-CURRENCY PRE-FLIGHT LIVES IN speedtest1_bench.py AND IS CALLED
+# FROM HERE RATHER THAN COPIED. [[D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]]
+# `--preflight-dss` was written for the BENCHMARK drivers and has already been
+# corrected twice by measurement — once for omitting `--target` (a control that
+# validated whatever dsscp defaults to) and once for omitting `--language`. Those
+# two corrections are exactly the mistakes a fresh copy in this file would make,
+# so the file that already holds them is the file this driver asks. Its own
+# docstring states the reason it lives there: ONE implementation, called by every
+# driver, always on the host that will run the compiler.
+# ⓘ That it is named for the benchmark is an accident of which driver needed it
+# first; what it answers — "can this binary compile three lines against this
+# config tree for this target?" — is a question about the COMPILER, and both
+# corpus drivers ask it too as of this cycle.
+$BenchCore    = Join-Path $PSScriptRoot 'speedtest1_bench.py'
 # ── THE SHARED CORE ──────────────────────────────────────────────────────────
 # base-harness.ps1 holds the artifact read-back, the manifest/build wrappers and
 # the per-(leg, artifact) verdict ledger — the decisions this driver and
@@ -2946,7 +2960,88 @@ function Get-DssSearchNote {
           "outside these roots.")
 }
 
+# ⚠⚠ REFRESH A *LOCATED* COMPILER — A BINARY THAT WAS FOUND IS NOT EVIDENCE IT WAS
+# BUILT FROM THE SOURCES THIS RUN WILL COMPILE.
+# [[D-HARNESS-PS1-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-SOURCES-IT-COMPILES]]
+#
+# TWO EXISTING INSTRUMENTS LOOK LIKE THEY COVER THIS AND NEITHER DOES — each answers
+# a NEIGHBOURING question, and both fail toward *clean*:
+#   · the compiler-currency pre-flight (`Assert-DssCompilerCurrent`, below) proves the
+#     binary can CONSUME today's `src/dss-config` vocabulary. That is CONFIG drift —
+#     D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN — and a
+#     binary from four cycles ago passes it whenever no config KEY moved.
+#   · Step 9's `(+N file(s) differ from HEAD)` compares the WORKING TREE to HEAD and says
+#     nothing about the BINARY. ✔MEASURED 2026-09-01: it read `+56 file(s) differ from
+#     HEAD` BYTE-IDENTICALLY in a run whose compiler was built four cycles earlier and in
+#     the re-run whose compiler was built minutes before. It cannot separate the two, and
+#     it prints AFTER the run is spent besides.
+# ✔MEASURED, same day: the located-binary branch handed `veryquick` a `build\rel\dsscp`
+# built 08/31 23:25 while the working tree carried a whole cycle of `src/` changes;
+# forcing the build recompiled 144 targets. The corpus would have been compiled by the
+# PREVIOUS cycle's compiler and reported as this one's. It survived only because sqlite
+# reaches no <threads.h> recipe — LUCK, not design, since that cycle moved `threads.json`
+# and the closed recipe vocabulary TOGETHER, which is exactly the config/source pair the
+# currency probe cannot see across.
+#
+# ⇒ THE FIX MAKES THE QUESTION UNASKABLE INSTEAD OF ANSWERING IT, WHICH IS WHAT THE .sh
+# TWIN ALREADY DOES (build-and-test.sh Step 5 runs `cmake --build` unconditionally). The
+# twins now agree on what compiler a run uses. An incremental build of a current tree is a
+# ninja no-op against a run measured in hours.
+# ⚠ A FAILED REBUILD IS FATAL, NEVER A FALLBACK TO THE BINARY WE FOUND. Falling back is
+# the defect itself: an unverifiable compiler under a reassuring [OK].
+# ⓘ THE BUILD IS INJECTED (`$invokeBuild`) so the pin can drive this WITHOUT a cmake or a
+# configured tree — a self-test that shells out to a real build measures the machine, not
+# this logic. It returns the child's exit code.
+function Update-LocatedDssCompiler($tree, $binPath, $builtWhen, $jobs, $invokeBuild) {
+  if (-not $tree) {
+    Die @"
+the located Release compiler's build TREE could not be determined, so this run cannot refresh it
+      and cannot know that its compiler embodies the sources it is about to compile.
+      binary : $binPath (built $builtWhen)
+      Name one with `$env:DSS_BIN, or build a Release tree (cmake -S . -B build/rel -DCMAKE_BUILD_TYPE=Release).
+"@
+  }
+  $rc = & $invokeBuild $tree $jobs
+  # ⚠⚠ A NATIVE COMMAND'S STDOUT IS PIPELINE OUTPUT, so a builder that does not
+  # SWALLOW it returns `[...every line..., code]` and `$rc -ne 0` is then TRUE for
+  # a build that SUCCEEDED. ✔MEASURED 2026-09-01: the first call site written here
+  # did exactly that, and this function refused a compiler it had just rebuilt —
+  # the message read `could not be rebuilt (exit [0/2] Re-checking globbed
+  # directories... )`, with ninja's own progress where the code belongs.
+  # ⇒ REFUSE THE CONTRACT VIOLATION IN ITS OWN WORDS rather than coercing it. A
+  # silent `$rc[-1]` would read the right number and hide a builder that is
+  # printing into its own return value, which is the next reader's trap; and
+  # treating it as a failed build sends them to repair a tree that is fine.
+  if ($null -eq $rc -or -not ($rc -is [int])) {
+    Die @"
+the injected build did not return an EXIT CODE, so this run cannot tell a successful rebuild from a
+      failed one.
+      tree     : $tree
+      returned : $(if ($null -eq $rc) { '<null>' } else { "$($rc.GetType().Name) — " + (($rc | Select-Object -First 3) -join ' / ') })
+      A builder must SWALLOW the child's stdout (…| Out-Host) and return only `$LASTEXITCODE — a
+      native command's output is pipeline output, so an unswallowed line becomes part of the value.
+"@
+  }
+  if ($rc -ne 0) {   # FATAL: falling back to the binary we located IS the defect
+    Die @"
+the LOCATED Release compiler could not be rebuilt (exit $rc), so this run cannot know that its
+      compiler embodies the sources it is about to compile.
+      tree   : $tree
+      binary : $binPath (built $builtWhen)
+      This is FATAL rather than a fallback: reusing the binary found here is precisely the defect
+      D-HARNESS-PS1-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-SOURCES-IT-COMPILES describes.
+      Repair the tree (cmake -S . -B $tree -DCMAKE_BUILD_TYPE=Release), point this run at another
+      one, or set SKIP_DSS_BUILD=1 to reuse a binary DELIBERATELY — that path says so in every
+      report line of the run.
+"@
+  }
+  return $tree
+}
+
 $DssBin = $null; $DssInfo = $null; $DssCands = @()
+# Every branch below sets this; the initial value is what a branch added LATER
+# and not extended would report, and "unstated" is the only honest default.
+$DssOrigin = 'origin UNSTATED — a branch of Step 5 did not say how it obtained this binary'
 if ($env:DSS_BIN) {
   # ★ AN EXPLICITLY NAMED BINARY IS USED, NEVER SEARCHED FOR — AND IT IS STILL
   # ASKED WHAT IT IS. `$env:DSS_BIN` decides WHICH binary runs; it does not
@@ -2962,6 +3057,10 @@ if ($env:DSS_BIN) {
   }
   $DssBin  = (Resolve-Path -LiteralPath $env:DSS_BIN).Path
   $DssInfo = Get-DssCompilerBuildType $DssBin
+  # ★ HOW THE BINARY WAS OBTAINED IS CARRIED TO THE STEP-9 LEDGER, because it is
+  # what decides whether this checkout's HEAD says anything about it at all.
+  # [[D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]]
+  $DssOrigin = "named by `$env:DSS_BIN — NOT built by this run"
   Info "using `$env:DSS_BIN — $DssBin"
 } elseif ($env:SKIP_DSS_BUILD -eq '1') {
   $DssCands = Find-DssCandidates
@@ -2988,6 +3087,7 @@ $(Format-DssCandidateList $DssCands)
 "@
   }
   $DssBin = $DssInfo.Path
+  $DssOrigin = 'REUSED under SKIP_DSS_BUILD=1 — NOT built by this run'
   Info "SKIP_DSS_BUILD=1 — reusing $DssBin"
 } else {
   $DssCands = Find-DssCandidates
@@ -3018,9 +3118,26 @@ $(Format-DssCandidateList $DssCands)
     if ($LASTEXITCODE -ne 0) { Die "dsscp build failed" }
     $DssCands = Find-DssCandidates
     $DssInfo  = Select-DssCompiler $DssCands
-    if ($DssInfo) { $DssBin = $DssInfo.Path }
+    if ($DssInfo) { $DssBin = $DssInfo.Path; $DssOrigin = 'BUILT by this run' }
   } else {
+    # ⚠⚠ THE BRANCH THE OLD ROW WAS OPENED ON — IT NOW REFRESHES RATHER THAN MERELY
+    # LOCATING. The reasoning, the measurement and the two instruments that each
+    # answer a neighbouring question are stated at `Update-LocatedDssCompiler`.
     $DssBin = $DssInfo.Path
+    Info "refreshing the located Release compiler ($($DssInfo.Tree)) — a located binary is not evidence it was built from these sources"
+    # ⚠ `| Out-Host` IS LOAD-BEARING, NOT COSMETIC: it keeps ninja's progress on the
+    # console while keeping it OUT of this scriptblock's return value. Without it the
+    # value is `[...output..., code]` and the refusal above fires on a build that
+    # succeeded — ✔measured, and the reason that refusal names the contract.
+    [void](Update-LocatedDssCompiler $DssInfo.Tree $DssBin $DssInfo.LastWriteTime $Jobs `
+             { param($t, $j) & cmake --build $t --config Release --target dsscp -j $j | Out-Host; return $LASTEXITCODE })
+    # RE-READ rather than assume the build moved it: the reported timestamp must be
+    # the one on disk NOW, and a build that landed elsewhere must not be reported as
+    # this one. Same discipline as the from-scratch branch above.
+    $DssCands = Find-DssCandidates
+    $DssInfo  = Select-DssCompiler $DssCands
+    if ($DssInfo) { $DssBin = $DssInfo.Path }
+    $DssOrigin = 'LOCATED under an eligible build root, then REBUILT by this run (incremental)'
   }
 }
 if (-not $DssBin -or -not (Test-Path -LiteralPath $DssBin)) {
@@ -3076,8 +3193,171 @@ this run would be timed against a NON-RELEASE compiler. It REFUSES rather than p
   $DssBuildTypeNote = "  (compiler build type: $($DssInfo.Type) — NOT Release, DSS_ALLOW_NONRELEASE_COMPILER=1)"
   Warn "DSS_ALLOW_NONRELEASE_COMPILER=1 — proceeding with a $($DssInfo.Type) compiler. TIMINGS FROM THIS RUN ARE NOT COMPARABLE with build-and-test.sh or with any other run: that driver always times a Release compiler."
 }
-Warn "if the build below fails with a stale-manifest-field error (e.g. unknown 'artifactName'), this binary predates the project-config extensions — rebuild it (delete build-rel or set SKIP_DSS_BUILD off)."
-Pass "dsscp located — $($DssInfo.Type) build"
+# ── THE CONFIG TREE THIS RUN WILL READ, PINNED BEFORE IT IS VOUCHED FOR ─────
+# ★★ A CONTROL CANNOT VOUCH FOR AN INPUT THE MEASUREMENT IS FREE TO CHOOSE
+# DIFFERENTLY. `findShippedConfig` walks UP FROM THE CWD unless DSS_CONFIG_ROOT
+# says otherwise, so an unpinned corpus run pairs this binary with whichever
+# config tree happens to sit above wherever each compile was launched — and the
+# pre-flight below would then be certifying a tree the run need not read.
+# benchmark-speedtest1.{ps1,sh} have pinned it for exactly this reason since
+# [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]];
+# the corpus drivers never did, which is why "which config did that sqlite figure
+# read?" had no answer here.
+# ⚠ THE PIN IS THE DIRECTORY THAT *CONTAINS* `src\dss-config`, NOT THAT DIRECTORY
+# ITSELF — the resolver composes the rest, and a set-but-miss falls through to the
+# CWD walk SILENTLY by documented design, which is how the one-level-too-deep
+# spelling did nothing for its whole life.
+# ⓘ An operator's own DSS_CONFIG_ROOT is honoured, not overwritten: pinning is
+# about removing the AMBIGUITY, not about taking the choice away.
+# ⚠ `$DssConfigRoot`, NOT `$CfgRoot`: THAT NAME IS ALREADY TAKEN IN THIS FILE, by
+# the STAGED SQLITE CONFIG HEADER DIRECTORY (`$CfgRoot = Join-Path $Stage 'cfg'`,
+# Step 6's `--cfg-dest`). The two are unrelated — one is where sqlite_cfg.h is
+# written, the other is which dss-config tree the COMPILER reads — and reusing the
+# spelling would have left a live variable silently reassigned mid-script for
+# whoever added the next reader of it.
+$DssConfigRoot = if ($env:DSS_CONFIG_ROOT) { $env:DSS_CONFIG_ROOT } else { $RepoRoot }
+if (-not (Test-Path -LiteralPath (Join-Path $DssConfigRoot 'src\dss-config') -PathType Container)) {
+  Die "no dss config tree at $DssConfigRoot\src\dss-config`n      DSS_CONFIG_ROOT names the checkout root that CONTAINS src\dss-config, not that directory itself."
+}
+$env:DSS_CONFIG_ROOT = $DssConfigRoot
+Info "config    : $DssConfigRoot\src\dss-config  (pinned for every compile in this run)"
+
+# >>> dss:compiler-currency >>>
+# ★★★ PROVE THE COMPILER IS CURRENT, HERE, BEFORE THE RUN IS SPENT.
+# [[D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]]
+#
+# WHAT STOOD HERE WAS A WARNING, AND A WARNING IS NOT A CHECK. It read: "if the
+# build below fails with a stale-manifest-field error (e.g. unknown
+# 'artifactName'), this binary predates the project-config extensions — rebuild
+# it". It named the right cause, in advance, every single run — which is what
+# made it read as boilerplate — and it cost a whole run to act on.
+# ✔MEASURED 2026-08-31: this step found `build\rel\bin\dss\dsscp.exe` built three
+# days and four cycles earlier, printed `[OK] dsscp located — Release build`, and
+# compiled the staged sqlite tree with it against that day's `src/dss-config`.
+# All five legs died in 11–23 ms with 37 identical config-vocabulary refusals
+# (`unknown pragma effect 'standardFloatState'`, `unknown key 'restrictMarker' in
+# 'declarations[0]'`, `unknown attribute effect 'runBeforeEntry'`). The ledger read
+# `0 verified … 5 poisoned (of 5 declared legs)` and NOT ONE sqlite3 CLI was built.
+#
+# ★ THE REFUSALS WERE CORRECT AND THE COMPILER WAS NOT AT FAULT. An unrecognised
+# config key is refused rather than ignored precisely because a silently-dropped
+# key leaves the feature it names switched off with no diagnostic. The defect was
+# that this step handed a CURRENT configuration to a binary that PREDATED it.
+#
+# ⚠⚠ AND THE FOUR-LEG ctest GATE CANNOT SEE THIS, BY CONSTRUCTION. It builds and
+# tests `build/dbg`; this step compiles with `build/rel`, which it LOCATES and
+# (unlike the .sh twin) does not rebuild. The two roots drift independently and
+# nothing compares them, so a green gate is no evidence at all about the binary
+# this run will use.
+#
+# ★ ONE PROBE PER DECLARED LEG TARGET, not one probe for the run. A CONTROL MUST
+# MATCH THE TARGET: the same rule this repository learned about reference
+# compilers arrived a second time wearing config's clothes
+# (D-BENCH-COMPILER-AND-CONFIG-MAY-COME-FROM-DIFFERENT-COMMITS) — a probe with no
+# --target validated whatever dsscp defaults to while the measurement died on a
+# target document the probe never opened. ✔MEASURED 2026-08-31: ~250-290 ms per
+# target through the shared core, against a run measured in hours.
+# ⓘ SELECTED legs, not declared ones: a leg this run will not build must not be
+# able to fail it. That keeps the check's blast radius equal to the run's own.
+function Assert-DssCompilerCurrent($python, $benchCore, $dssBin, $builtWhen, $origin, $dssConfigRoot, $specs, $rebuildCmd) {
+  # ⚠ THE INSTRUMENT'S OWN ABSENCE IS ITS OWN VERDICT, and it is NOT the
+  # stale-binary one. A check that cannot run must never be reported as a check
+  # that failed — see the CANNOT-RUN arm below for the same distinction coming
+  # back from the core.
+  if (-not (Test-Path -LiteralPath $benchCore -PathType Leaf)) {
+    Die @"
+the compiler-currency pre-flight CANNOT RUN, so this run does not know whether its compiler is current.
+      missing   : $benchCore
+      It holds the ONE implementation of that check (--preflight-dss), shared with the benchmark
+      drivers. This is a fact about the checkout, NOT about the compiler: nothing here says the
+      binary is stale, and rebuilding it would not change this answer.
+"@
+  }
+  $checked = @()
+  foreach ($spec in $specs) {
+    # ⚠ 2>&1 INTO A VARIABLE, and the rc read on the very next line. The core
+    # writes its refusal to stderr; letting that reach the host unread would put
+    # the diagnostic above the message that explains it.
+    $out = & $python $benchCore '--preflight-dss' $dssBin '--config-root' $dssConfigRoot '--preflight-target' $spec 2>&1
+    $rc  = $LASTEXITCODE
+    $txt = ((@($out) | ForEach-Object { "      $_" }) -join "`n")
+    if ($rc -eq 0) { $checked += $spec; continue }
+    # ── THE COMPILER REFUSED — a verdict about the binary ──────────────────
+    # ★★ ONLY rc 1 ACCUSES THE COMPILER, AND THE COMPLEMENT IS DEFINED RATHER
+    # THAN ENUMERATED. The core promises exactly one code for "it ran and
+    # produced diagnostics"; EVERY other non-zero — 3 for its own named
+    # cannot-run, 2 for a usage error, whatever an interpreter that failed to
+    # start returns — is a fact about the INVOCATION, and must fail toward "I
+    # could not judge it". Both arms stop the run, so nothing is trusted either
+    # way; what differs is whether an operator is sent to rebuild a compiler.
+    # ✔MEASURED 2026-08-31 while pinning this: the arms were written the other way
+    # round (rc 3 = cannot-run, everything else = refused) and a bad
+    # `--config-root` produced argparse's rc 2, which printed a usage block
+    # underneath "THE LOCATED COMPILER CANNOT COMPILE THREE LINES" and a rebuild
+    # instruction. A guard whose default branch accuses is a guard that will
+    # eventually accuse wrongly.
+    if ($rc -ne 1) {
+      Die @"
+the compiler-currency pre-flight COULD NOT RUN for target $spec (exit $rc), so this run does not know whether its compiler is current.
+$txt
+      compiler  : $dssBin
+      built     : $builtWhen
+      origin    : $origin
+      config    : $dssConfigRoot\src\dss-config
+      NOTHING above says that binary is stale. Fix what the check names and ask again.
+"@
+    }
+    # ⚠ NO BACKTICKS IN THIS STRING. In a double-quoted here-string PowerShell's
+    # escape character is the BACKTICK, so a markdown-style `error[...]` renders
+    # as an ESC byte followed by "rror[...]" — ✔MEASURED here, the shipped message
+    # read "An <ESC>rror[C_Invalid...]" until this run of the real check printed it.
+    Die @"
+THE LOCATED COMPILER CANNOT COMPILE THREE LINES against this run's own config tree, for target $spec.
+      This run is REFUSED here rather than after it has compiled ~189 translation units per leg
+      and reported every leg poisoned. [D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]
+$txt
+      compiler  : $dssBin
+      built     : $builtWhen
+      origin    : $origin
+      config    : $dssConfigRoot\src\dss-config
+      target    : $spec
+      An error[C_Invalid...] / C_MalformedJson diagnostic naming an unknown key, pragma effect or
+      attribute effect is the STALE-BINARY signature: the config tree has grown vocabulary this
+      binary does not know, and refusing an unrecognised key is correct compiler behaviour.
+      REBUILD IT: $rebuildCmd
+      ⚠ SKIP_DSS_BUILD=1 DOES NOT EXEMPT A BINARY FROM THIS CHECK. It is an instruction not to
+      BUILD, never an instruction to TRUST: under it, a binary that fails here is unusable and the
+      run stops with this message instead of reusing it.
+"@
+  }
+  return ($checked -join ', ')
+}
+$DssCurrencySpecs = @($Legs | ForEach-Object { $_.spec } | Where-Object { $_ } | Select-Object -Unique)
+if ($DssCurrencySpecs.Count -eq 0) {
+  # Not reachable through Step 1b, which refuses an empty plan — and stated
+  # anyway, because a silent zero-iteration loop is a check that passed having
+  # examined nothing, which is the one outcome this file must never produce.
+  Die "no leg target specs to pre-flight the compiler against — Step 1b resolved a plan with no specs, so the currency check would examine nothing and report success."
+}
+# ⚠ BUILT INTO A VARIABLE FIRST. In a COMMAND-style call PowerShell parses `+` as
+# a further positional argument rather than as concatenation, so an inline
+# expression here would pass the three pieces as three separate parameters and
+# the message would name a rebuild command consisting of the word `cmake`.
+# ⚠ IT NAMES THE TREE THAT PRODUCED *THIS* BINARY, read from Get-DssCompilerBuildType,
+# not a spelling of where a Release tree is usually kept. `build/rel`, `build-rel`
+# and an $env:DSS_BIN from another checkout entirely all reach this line, and a
+# rebuild instruction pointing at a tree the operator is not using is a diagnostic
+# that names a fix which does not work — the defect this step already recorded once
+# about DSS_ALLOW_NONRELEASE_COMPILER.
+$DssRebuildTree = if ($DssInfo.Tree) { $DssInfo.Tree } else { Join-Path $RepoRoot 'build\rel' }
+$DssRebuildCmd = "cmake --build $DssRebuildTree --config Release --target dsscp   (or: scripts\local-build\local-build.ps1 -Tree rel)"
+$DssCurrencyOk = Assert-DssCompilerCurrent $python3.Source $BenchCore $DssBin $dssAge $DssOrigin $DssConfigRoot $DssCurrencySpecs $DssRebuildCmd
+# <<< dss:compiler-currency <<<
+# Carried to the Step-9 verdict beside the compiler's path: every figure this run
+# emits was produced by THIS binary, proved current against THESE targets.
+$DssCurrencyNote = "$DssConfigRoot\src\dss-config — this binary PROVED it compiles against it for $DssCurrencyOk"
+Info "currency  : proved for $DssCurrencyOk"
+Pass "dsscp located — $($DssInfo.Type) build, PROVED current against this run's config tree"
 
 # ── Step 6 — PER-LEG build inputs (each leg's OWN tcl + z resolve-libraries) ──
 # ★ WHAT CHANGED AND WHY. This used to be two globals — $TclDll/$ZlibDll — that
@@ -6213,7 +6493,18 @@ $legRec.Report = $rep
 Step '9/9  Results'
 # $dssDivergeNote is the Step-2 measurement, reprinted verbatim so the opening
 # banner and the closing verdict cannot disagree about the same run.
+# ★★ `@ $dssHead` IS THE CHECKOUT'S HEAD, NOT THE BINARY'S, AND THIS LINE USED TO
+# LET THAT PASS FOR PROVENANCE.
+# [[D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]]
+# Step 5 LOCATES a Release binary and does not rebuild it, so `<path> @ <head>`
+# was printed identically whether that binary had been built from this commit a
+# minute ago or from another one four cycles back — and every historical
+# veryquick/full figure in this project's README was quoted against a commit on
+# exactly that reading. The BUILD TIME and the ORIGIN are what turn the head into
+# a claim a reader can check, so both are printed, always, next to it.
 Info "compiler : $DssBin @ $dssHead$dssDivergeNote$DssBuildTypeNote"
+Info "  binary : built $dssAge — $DssOrigin"
+Info "  config : $DssCurrencyNote"
 Info "sqlite   : $SqliteWslDir @ $sqliteHead   (staged: $Stage)"
 Info "recipe   : $nTus TUs, $nDefs defines"
 # The ATTRIBUTION ORACLE, surfaced where a human triaging a failure will actually

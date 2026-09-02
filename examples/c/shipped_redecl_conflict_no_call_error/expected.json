@@ -1,0 +1,12 @@
+{
+  "$comment": "D-CSUBSET-INCOMPATIBLE-REDECL-DIAGNOSED-AT-CALL-SITE-NOT-DECLARATION (negative, P44 lane a): `extern int printf();` over `#include <stdio.h>` is an incompatible redeclaration — C23 makes an empty parameter list mean `(void)`, so it declares a NO-PARAMETER printf against the platform's variadic one. C23 6.7p4 requires the diagnostic AT THE DECLARATION, and it is raised there (S_IncompatibleRedeclaration at 24:12, the declared NAME), by the same C23 6.7.6.3p15 oracle the merged-declaration sweep and the CST->HIR shipped-shim gate call. ★★ THE FILE CONTAINS NO CALL, WHICH IS THE WHOLE POINT: DSS used to report only S_ArgCountMismatch at the first CALL SITE, so this exact program compiled rc=0 with ZERO diagnostics — the defect hid in precisely the case nothing else catches. gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 all refuse it (`conflicting types for 'printf'`), probed separately. RED-ON-DISABLE: delete the compatibility check in the semantic tier's platform-realization pass (the `includeSuppressed` loop) and this compiles clean, so the runner no longer finds S_IncompatibleRedeclaration. Both an elf and a pe target are listed because the two legs realize `printf` DIFFERENTLY — an ordinary libc import on elf, a compiler-synthesized UCRT shim on pe — and the declaration-site verdict must not depend on that: before P44 the pe leg refused this at the HIR shim gate while elf accepted it, which is exactly the tier confusion the row names.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" },
+    { "spec": "x86_64:pe64-x86_64-windows-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "S_IncompatibleRedeclaration", "line": 24, "col": 12 }
+  ]
+}

@@ -1,5 +1,7 @@
 #include "core/substrate/process_spawn.hpp"
 
+#include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot -- UNC-safe absolute
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -444,7 +446,13 @@ std::optional<fs::path> probeCandidate(fs::path const& candidate,
 // and must not silently re-root it against the child's).
 fs::path makeAbsolute(fs::path const& hit) {
     std::error_code ec;
-    fs::path const  abs = fs::absolute(hit, ec);
+    // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: NOT bare `fs::absolute`,
+    // and this is the site where that mattered most. ✔MEASURED — the bare call
+    // re-roots `\\host\share\tool.exe` to `C:\host\share\tool.exe` and reports NO
+    // error, so a tool on a UNC share became a path on the local drive. That does
+    // not merely fail to spawn: if anything happens to exist at the re-rooted
+    // name, this spawns THE WRONG BINARY with no diagnostic anywhere.
+    fs::path const  abs = core::absoluteKeepingRoot(hit, ec);
     // `absolute` is a pure lexical/cwd operation; a failure here means the
     // cwd itself is gone. The un-absolute hit is still a real file relative
     // to that same cwd, so returning it is strictly better than losing the

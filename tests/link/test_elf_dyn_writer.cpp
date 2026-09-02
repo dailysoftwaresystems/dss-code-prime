@@ -410,6 +410,8 @@ TEST(ElfDynFormatJson, InterpreterOnDynRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-with-interp","kind":"elf"},
@@ -429,6 +431,8 @@ TEST(ElfDynFormatJson, EntryPointOnDynRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-with-entry","kind":"elf"},
@@ -447,6 +451,8 @@ TEST(ElfDynFormatJson, TextVaNotEqualPageAlignRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-exec-va","kind":"elf"},
@@ -482,6 +488,8 @@ TEST(ElfDynFormatJson, DeletedCopyRelocationBindingRefusedAtLoadOnEveryFlavour) 
     auto dyn = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-copy-reloc","kind":"elf"},
@@ -502,6 +510,8 @@ TEST(ElfDynFormatJson, DeletedCopyRelocationBindingRefusedAtLoadOnEveryFlavour) 
     auto exec = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-copy-reloc","kind":"elf"},
@@ -524,6 +534,8 @@ TEST(ElfDynFormatJson, DeletedCopyRelocationBindingRefusedAtLoadOnEveryFlavour) 
     auto good = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-got-indirect","kind":"elf"},
@@ -540,6 +552,8 @@ TEST(ElfDynFormatJson, SonameOnNonDynRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-with-soname","kind":"elf"},
@@ -600,6 +614,8 @@ TEST(ElfDynWriter, SonameEmittedWhenConfigured) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".so",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-with-soname","kind":"elf"},
@@ -1109,6 +1125,8 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
     auto a = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-half-interp","kind":"elf"},
@@ -1128,6 +1146,8 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
     auto b = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-half-exit","kind":"elf"},
@@ -1161,6 +1181,8 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
     auto c = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-half-args","kind":"elf"},
@@ -1196,6 +1218,8 @@ TEST(ElfPieFormatJson, SonameWithEntryClusterRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"pie-with-soname","kind":"elf"},

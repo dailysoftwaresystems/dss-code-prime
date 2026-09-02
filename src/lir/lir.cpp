@@ -52,7 +52,8 @@ Lir::Lir(TargetSchemaId target, InstArena instArena, BlockArena blockArena,
          FuncArena funcArena, std::vector<LirOperand> operandPool,
          std::vector<LirBlockId> succPool,
          LirLiteralPool literalPool,
-         LirRegConstraintPool regConstraintPool) noexcept
+         LirRegConstraintPool regConstraintPool,
+         std::vector<LirStaticInitEntry> staticInit) noexcept
     : target_(target),
       instArena_(std::move(instArena)),
       blockArena_(std::move(blockArena)),
@@ -60,7 +61,8 @@ Lir::Lir(TargetSchemaId target, InstArena instArena, BlockArena blockArena,
       operandPool_(std::move(operandPool)),
       succPool_(std::move(succPool)),
       literalPool_(std::move(literalPool)),
-      regConstraintPool_(std::move(regConstraintPool)) {
+      regConstraintPool_(std::move(regConstraintPool)),
+      staticInit_(std::move(staticInit)) {
     // Cross-arena module-id check — all four arenas must share one tag.
     if (instArena_.id() != blockArena_.id()
      || instArena_.id() != funcArena_.id()) {
@@ -386,6 +388,16 @@ std::uint32_t LirBuilder::literalPoolAdd(LirLiteralValue value) {
     return literalPool_.add(std::move(value));
 }
 
+// D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN
+void LirBuilder::staticInitAdd(SymbolId symbol, StaticInitSchedule schedule) {
+    // ⚠ BOTH GUARDS ARE REFUSALS, NOT TIDINESS. An entry with no channel names a
+    // function the runtime would never call, and an entry with no symbol names
+    // nothing the linker can resolve — either one would reach the emitted table
+    // as a slot pointing at the wrong thing or at nothing.
+    if (!symbol.valid() || !schedule.any()) return;
+    staticInit_.push_back(LirStaticInitEntry{symbol, schedule});
+}
+
 namespace {
 
 // Resolve one register NAME through the active schema, or abort naming
@@ -560,6 +572,8 @@ Lir LirBuilder::finish() && {
         std::move(succPool_),
         std::move(literalPool_),
         std::move(regConstraintPool_),
+        // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN
+        std::move(staticInit_),
     };
 }
 

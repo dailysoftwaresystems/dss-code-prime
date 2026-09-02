@@ -15,12 +15,31 @@
 #   This script never accepts, stores or forwards a password, and no key material lives
 #   in the repo — `.secrets/` holds the key's PATH, never the key.
 #
+# ⓘ THE TRANSPORT VERBS (`--rsync`, `--rsync-from`) LIVE ONLY IN THIS `.sh`, AND
+# THAT IS THE JUDGEMENT NOT A DRIFT. The `.ps1` sibling has never carried either:
+# Windows PowerShell has no `rsync`, and this carriage is reachable only from WSL
+# anyway (its key exists there). A PowerShell twin of a verb that cannot run under
+# PowerShell would be a second implementation with no host to work on.
+#
 # Usage: scripts/ssh-arm64-vps/ssh-arm64-vps.sh              # interactive
 #        scripts/ssh-arm64-vps/ssh-arm64-vps.sh uname -m     # run a command, exit with ITS status
 set -uo pipefail
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-CONF=$REPO/.secrets/arm64-vps.env
+# ★ `.secrets/` IS GITIGNORED, SO A LANE WORKTREE HAS NONE -- `git worktree add`
+# writes only tracked files. Resolved through the one owner rather than assumed to sit
+# beside this script: `scripts/repo-secrets/` follows a linked worktree back to the
+# main checkout that actually holds the file. Without it this carriage refused rc=3
+# for every lane, naming a path inside the worktree and inviting the one repair that
+# must never be made (a second copy of key material, per lane).
+# ⚠ THE EMPTY ARGUMENT IS LOAD-BEARING: `.` forwards THIS script's positional
+# parameters unless given its own, and this carriage is routinely called with a remote
+# command as `$1`.
+# shellcheck source=../repo-secrets/repo-secrets.sh
+. "$REPO/scripts/repo-secrets/repo-secrets.sh" "" \
+    || { echo "ssh-arm64-vps: cannot load $REPO/scripts/repo-secrets/repo-secrets.sh" >&2; exit 3; }
+SECRETS=$(repo_secrets_dir "$REPO")
+CONF=$SECRETS/arm64-vps.env
 
 # ★ ENV MUST WIN OVER THE CONFIG FILE — see the twin block in `ssh-macos.sh` for the
 # measurement. `.` sources into THIS shell, so a bare `. "$CONF"` overwrites what the
@@ -59,7 +78,7 @@ DSS_VPS_KEY=$(eval printf '%s' "\"$DSS_VPS_KEY\"")   # allow $HOME in the config
 # repo-local key is used; only then do we fail. A non-existent explicit path does
 # NOT silently fall through to a different key — that would answer a question the
 # caller did not ask — but it DOES fall through to discovery, and says so.
-_repo_key=$REPO/.secrets/arm64-vps.key
+_repo_key=$SECRETS/arm64-vps.key
 if [ -n "$DSS_VPS_KEY" ] && [ ! -f "$DSS_VPS_KEY" ] && [ -f "$_repo_key" ]; then
     echo "ssh-arm64-vps: DSS_VPS_KEY='$DSS_VPS_KEY' does not exist; using the repo-local key $_repo_key" >&2
     DSS_VPS_KEY=$_repo_key
@@ -154,6 +173,47 @@ if [ "${1:-}" = "--rsync" ]; then
     _dest=${!#}
     set -- "${@:1:$#-1}"
     exec rsync -a --delete -e "$_rsh" "$@" "$DSS_VPS_USER@$DSS_VPS_HOST:$_dest"
+fi
+
+# ★★ `--rsync-from <remote-src...> <local-dest>` — THE OTHER DIRECTION, and it is
+# not symmetry for its own sake. `--rsync` above serves the LEG shape: the driver
+# owns the tree and pushes it out. The ROUND TRIP (Table 2 of the cross-leg matrix)
+# has the opposite shape — a build host that is NOT the driver produces an artefact
+# which then has to reach the machine its target runs on, and that machine is
+# usually back here. Until this verb existed there was no carriage-sanctioned way
+# to bring a byte home, so every such transport in this project's history was
+# hand-rolled, and the registry records what hand-rolling cost: a one-file `scp`
+# that left `zlib.dll` behind and produced 14 smoke failures reading exactly like
+# "macOS emits a broken PE".
+#
+# ⚠ NOT A `tar czf - | ssh` PULL, for the reason the block above documents one hop
+# over: that shape depends on the remote login profile being quiet, which is not a
+# property any caller can test. `exec`ing rsync keeps `$?` rsync's own status here
+# too.
+#
+# ⓘ NO `--delete` HERE, and the asymmetry is deliberate. On the push side the
+# remote directory is the driver's to own. On the pull side the LOCAL destination
+# is a directory a caller chose, and a transport verb that can erase local files
+# the caller did not name is a footgun aimed at the wrong host.
+if [ "${1:-}" = "--rsync-from" ]; then
+    shift
+    if [ $# -lt 2 ]; then
+        echo "ssh-arm64-vps: --rsync-from needs at least <remote-src> and <local-dest>" >&2
+        exit 2
+    fi
+    _rsh=ssh
+    for _o in "${args[@]}"; do
+        _rsh="$_rsh '$_o'"
+    done
+    # The LAST argument is the LOCAL destination; everything before it is remote.
+    _dest=${!#}
+    set -- "${@:1:$#-1}"
+    _srcs=""
+    for _s in "$@"; do
+        _srcs="$_srcs $DSS_VPS_USER@$DSS_VPS_HOST:$_s"
+    done
+    # shellcheck disable=SC2086  # each element was built above and carries no spaces by construction
+    exec rsync -a -e "$_rsh" $_srcs "$_dest"
 fi
 
 args+=("$DSS_VPS_USER@$DSS_VPS_HOST")

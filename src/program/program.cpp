@@ -1,5 +1,6 @@
 #include "program/program.hpp"
 
+#include "core/crypto/sha256.hpp"  // the ONE content digest — the artifact cache's input closure
 #include "core/substrate/path_identity.hpp"
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
@@ -54,6 +55,13 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+// D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
+// `serveArtifactFromCache` and `buildDependencyArtifactKey` return
+// `std::expected`. It arrived transitively through `runtime_object_cache.hpp`
+// and compiled — which is exactly how this class of fragility survives review
+// until an unrelated include is pruned (the house rule, stated at the top of
+// that same header).
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -245,8 +253,14 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
     // write-failure diagnostics for this very artifact already use. Forward
     // slashes on every host — that is what this codebase prints, and every
     // consumer of the line (POSIX shell, PowerShell, .NET `Path`) takes them.
+    // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: `core::genericSpelling`,
+    // NOT `generic_string()`. ✔MEASURED — the latter collapses a leading
+    // separator RUN, so a path naming another machine printed as one on the
+    // local drive root. The exported spelling substitutes the model's OWN
+    // separator per character and leaves the run intact, giving the same
+    // forward-slash result this line has always printed for an ordinary path.
     try {
-        return p.generic_string();
+        return core::genericSpelling(p);
     } catch (...) {
         auto const u8 = p.u8string();
         return std::string(reinterpret_cast<char const*>(u8.data()), u8.size());
@@ -270,13 +284,20 @@ void reportArtifactWritten(std::string const& targetSpec,
     // disk — the bytes are already committed, and re-statting here would only
     // create a way for the report to disagree with the write.
     std::error_code ec;
-    fs::path abs = fs::absolute(outPath, ec);
+    // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: NOT bare `fs::absolute`.
+    // ⚠ The "stays TRUE either way" claim below held only for the FAILURE arm.
+    // On a UNC `--output` the bare call SUCCEEDS having re-rooted the path, so
+    // this line reported `C:\host\share\…` for an artifact written to
+    // `\\host\share\…` — a diagnostic naming a file that is not there, which is
+    // worse than losing the absolute guarantee it was written to protect.
+    fs::path abs = core::absoluteKeepingRoot(outPath, ec);
     // Not a silent fallback: `outPath` IS the path the writer committed to, so
     // the line stays TRUE either way. Only the ABSOLUTE guarantee is lost, and
     // only when the process has no usable cwd to resolve against.
     if (ec) abs = outPath;
     std::cerr << "dsscp: artifact " << targetSpec << ' '
-              << artifactPathForReport(abs.lexically_normal()) << '\n';
+              << artifactPathForReport(core::normalizeKeepingRoot(abs))
+              << '\n';
 }
 
 // Emit a driver-tier D_* diagnostic. Wraps `dss::report` so all
@@ -546,6 +567,69 @@ void recordJobBatch(JobBatchRecord rec) {
 // rule to be nameable, and a rule with a name has exactly one definition. Pure:
 // no filesystem effect, no diagnostics — the mkdir + containment check stay at
 // the call site, where the reporter is.
+// ── D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C) ────────
+//
+// What one target's build carries in order to participate in the cross-build
+// artifact cache. The KEY is computed at the `buildCus` boundary in
+// `runCusToTargets` — where every CU is front-ended, no target has been
+// compiled, and the union of `cu.inputDigest()` is therefore visible — and the
+// eviction policy comes from the ROOT manifest. DISENGAGED ⇒ this build does
+// not participate: nothing is looked up and nothing is stored.
+//
+// ★★ THE KEY IS BUILT AT THAT BOUNDARY AND USED **HERE**, IN
+// `compileOneTarget`, AND THE SPLIT IS THE POINT. The boundary is the only
+// place the input closure exists; `compileOneTarget` is the only place the
+// artifact's final on-disk path exists (see `resolveArtifactOutputDir`'s own
+// note on why that formula has exactly one owner). Serving a hit means writing
+// the cached bytes to THAT path, so a consult that lived entirely at the
+// boundary would need a second copy of the path formula — the drift this
+// codebase rejects everywhere.
+struct ArtifactCacheTicket {
+    dss::runtime::RuntimeObjectKey key;
+    dss::runtime::CacheEviction    eviction;
+};
+
+// The manifest's eviction vocabulary → the store's.
+//
+// ★ A `switch` WITH NO `default`, NOT A TERNARY, AND THAT IS THE POINT. The
+// ternary this replaced mapped `Retain` to `Retain` and EVERYTHING ELSE to
+// `PruneSuperseded`, so a third manifest token would have silently acquired
+// pruning semantics nobody wrote — the "enumerate the members, never the
+// complement" trap this repo has paid for before. With no `default` arm, adding
+// an enumerator is a COMPILE error at exactly the site that must decide.
+[[nodiscard]] dss::runtime::CacheEviction
+storeEvictionFor(DependencyArtifactCacheEviction manifestPolicy) noexcept {
+    switch (manifestPolicy) {
+        case DependencyArtifactCacheEviction::PruneSuperseded:
+            return dss::runtime::CacheEviction::PruneSuperseded;
+        case DependencyArtifactCacheEviction::Retain:
+            return dss::runtime::CacheEviction::Retain;
+    }
+    // Unreachable for every declared enumerator; present because a value
+    // outside the enumeration is undefined behaviour rather than a case, and
+    // the pruning arm is the one that DELETES files.
+    return dss::runtime::CacheEviction::Retain;
+}
+
+// Consult the cache for `ticket` and, on a VERIFIED hit, place the cached bytes
+// at `outPath`.
+//   * `true`      — served; the artifact is on disk and the pipeline is skipped.
+//   * `false`     — an ordinary MISS. Compile.
+//   * error       — a REFUSAL, and it FAILS THE TARGET. The entry at the key's
+//                   path cannot be shown to be this key's (absent, unreadable
+//                   or differing sidecar), which is the one arm where the
+//                   question is whether the BYTES ARE RIGHT rather than whether
+//                   an optimization is available.
+[[nodiscard]] std::expected<bool, std::string>
+serveArtifactFromCache(ArtifactCacheTicket const& ticket,
+                       fs::path const&            outPath);
+
+// Add a freshly written artifact to the cache. Best-effort by contract: the
+// bytes are already correct and already on disk, so a failure costs a note and
+// a recompile next time, never this build.
+void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
+                               fs::path const&            artifactPath);
+
 [[nodiscard]] fs::path resolveArtifactOutputDir(
     std::optional<std::filesystem::path> const& outputDir,
     std::string const&                          formatName,
@@ -557,6 +641,34 @@ void recordJobBatch(JobBatchRecord rec) {
                  : *outputDir;
     }
     return fs::current_path() / "target" / formatName;
+}
+
+// D-AP2-OUTPUT-ROUTING (`output` field): do two output-dir BASES name the same
+// directory? Asked by `Program::compileProject` to decide whether a CLI
+// `--output` genuinely overrides a manifest `output`, or merely re-spells it —
+// `--output ./dist` and `"output": "dist"` are the same place, and announcing
+// that as an override would be a false alarm on a build where nothing was lost.
+//
+// LEXICAL, and it has to be: neither base need EXIST yet (`create_directories`
+// runs later, per target), so `canonical`/`PathIdentity` cannot answer. The
+// construction is `reportArtifactWritten`'s — `absoluteKeepingRoot` then
+// `normalizeKeepingRoot`, the pair that resolves a relative spelling against the
+// one cwd BOTH doors already use while leaving a leading separator RUN intact
+// [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]]. Bare
+// `lexically_normal` would map a `//host/share` base onto the local drive and
+// call two different directories equal — silence exactly where the caller most
+// needs the note.
+//
+// ⚠ FAILS TOWARD "DIFFERENT", never toward equal: a process with no usable cwd
+// cannot resolve either side, and the honest response to "I cannot tell" is to
+// TELL THE USER, not to suppress the line.
+[[nodiscard]] bool sameOutputBase(fs::path const& a, fs::path const& b) {
+    std::error_code ecA;
+    std::error_code ecB;
+    fs::path const absA = core::absoluteKeepingRoot(a, ecA);
+    fs::path const absB = core::absoluteKeepingRoot(b, ecB);
+    if (ecA || ecB) return false;
+    return core::normalizeKeepingRoot(absA) == core::normalizeKeepingRoot(absB);
 }
 
 // Compile one resolved (CU, target, format) triple to one artifact.
@@ -631,7 +743,19 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                     // write nothing. It is never set by a
                                     // healthy build, so the ordinary path is
                                     // byte-identical.
-                                    bool                   analysisOnly) {
+                                    bool                   analysisOnly,
+                                    // Clause (C) of
+                                    // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION:
+                                    // this target's cross-build artifact cache
+                                    // ticket, or DISENGAGED for every build
+                                    // that does not participate — which is
+                                    // every CLI build, every root project
+                                    // build, and every dependency build under
+                                    // a manifest that declares no
+                                    // `dependencyArtifactCache`. Disengaged ⇒
+                                    // byte-identical behaviour.
+                                    std::optional<ArtifactCacheTicket> const&
+                                                           cacheTicket) {
     // ★★★ [[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]] — EVERY DIAGNOSTIC
     // THIS COMPILE PRODUCES LEAVES IN ORIGIN COORDINATES, WHATEVER TIER MADE IT
     // AND WHICHEVER EXIT IT LEAVES BY.
@@ -815,7 +939,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // `D_DirectoryScanFailed` (mid-scan failure on input dirs).
         emitDriver(reporter, DiagnosticCode::D_OutputDirCreateFailed,
                    "failed to create output directory '"
-                   + outDir.generic_string() + "': " + ec.message());
+                   + core::genericSpelling(outDir) + "': " + ec.message());
         return std::nullopt;
     }
     auto const outPath =
@@ -855,13 +979,29 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // above names still fires: a bare ".." normalizes the parent away, and a
     // differing root-name ("D:app") makes `operator/` REPLACE `outDir` so the
     // parents differ by root.
+    //
+    // ★★ AND BOTH SIDES GO THROUGH `core::normalizeKeepingRoot`, NOT
+    // `lexically_normal()`.
+    // [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]]
+    // Normalising IDENTICALLY is necessary but not
+    // sufficient: `lexically_normal()` collapses a leading separator RUN, so for
+    // an `outDir` naming a share it maps TWO different locations onto ONE
+    // spelling. ✔MEASURED 2026-08-28 — `//host/share/out` normalises to
+    // `\host\share\out`, which is what a genuinely LOCAL `/host/share/out`
+    // normalises to as well. An artifact name carrying that root would then
+    // match the basis and be judged CONTAINED while resolving onto the local
+    // drive — the escape this block exists to refuse, admitted by the
+    // comparison rather than by the rule. `normalizeKeepingRoot` is identical to
+    // `lexically_normal()` for every path with a run below 2, so the `--output .`
+    // repair described above is untouched.
     auto const containmentBasis =
-        (outDir / "dss-containment-probe").lexically_normal().parent_path();
-    if (outPath.lexically_normal().parent_path() != containmentBasis) {
+        core::normalizeKeepingRoot(outDir / "dss-containment-probe")
+            .parent_path();
+    if (core::normalizeKeepingRoot(outPath).parent_path() != containmentBasis) {
         emitDriver(reporter, DiagnosticCode::D_ArtifactNameEscapesOutputDir,
                    "artifact name '" + artifactName.value_or(sourceStem)
                    + "' resolves outside the output directory '"
-                   + outDir.generic_string()
+                   + core::genericSpelling(outDir)
                    + "' — it must be a bare file name (no path separators, no "
                      "drive/root prefix, and not '.' or '..').");
         return std::nullopt;
@@ -890,13 +1030,91 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // RETURN VALUE is untouched, so `Program::artifactPaths()` still answers
     // where the archive landed — which is how the cache finds the bytes to
     // store. The `wrote` predicate remains the single owner of both facts.
+    // ⓘ D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C): it
+    // is ALSO where a freshly written artifact enters the cross-build cache,
+    // and for the same single-owner reason. `wrote` is the one predicate that
+    // knows an artifact exists at `outPath`; a store attached anywhere else
+    // would either need to re-derive that fact or would cache a file some
+    // route wrote without reporting.
+    bool servedFromCache = false;
     auto const reported = [&](bool wrote) -> std::optional<std::filesystem::path> {
         if (!wrote) return std::nullopt;
+        // ⛔ AND NOT STORED WHEN THIS TARGET REPORTED AN ERROR. Storing there
+        // would put a FAILING build's bytes in the cache, and the next build
+        // would serve them, emit none of the errors (they were the previous
+        // run's) and go GREEN — the silent wrong answer this whole mechanism is
+        // built to make impossible, reachable through the cache instead of
+        // through the key. `runCusToTargets` asserts the state exists in the
+        // very conjunction it applies one line after this call: *"a scratch
+        // error alongside a written file means the build is failing, and
+        // handing a consumer that file would let a failed dependency be linked
+        // into something that then 'succeeds'"*.
+        //
+        // ⚠⚠ AND I MUST SAY SO: **THIS GUARD IS DEFENCE IN DEPTH AND NO TEST
+        // WITNESSES IT.** ✔MEASURED 2026-08-31 by REMOVE-direction mutation —
+        // delete the `!reporter.hasErrors()` clause and
+        // `program/test_dependency_artifact_cache` stays GREEN (build rc 0,
+        // `program.cpp.obj` md5 moved and returned, controls green either side).
+        // ✔TWO ROUTES TO THE STATE WERE MEASURED AND BOTH ABORT BEFORE THE
+        // WRITE: a `stackReserve` the dependency's format cannot carry, and an
+        // `S_UnknownAttribute` warning promoted by `warningsAsErrors`. It is
+        // KEPT on the neighbour's own claim and on the asymmetry the store
+        // states (a wrongly-cached artifact ships wrong bytes; a wrongly-
+        // uncached one costs one recompile) — but the claim here is UNWITNESSED
+        // rather than load-bearing, and it must not be deleted on the strength
+        // of the mutant alone. [[feedback-a-brief-premise-is-a-hypothesis]].
+        //
+        // ⓘ WARNINGS ARE NOT ERRORS AND DO NOT BLOCK THE STORE, and the
+        // consequence — a warm build re-emits none of them — is the ORDINARY
+        // semantics of an up-to-date build rather than a loss this mechanism
+        // invents: `make` does not re-warn about an object file it did not
+        // rebuild either. What must never be lost is a build that FAILED, and
+        // that is what the guard covers.
+        //
+        // ⓘ NOT re-stored when the bytes came OUT of the cache: the entry is
+        // already there and was verified byte-for-byte on the way in, so a
+        // second store would read the artifact back only to re-confirm a
+        // sidecar it has just matched.
+        if (cacheTicket.has_value() && !servedFromCache
+            && !reporter.hasErrors()) {
+            storeBuiltArtifactInCache(*cacheTicket, outPath);
+        }
         if (!gCompilingShippedRuntimeUnit) {
             reportArtifactWritten(targetSpecStr, outPath);
         }
         return outPath;
     };
+
+    // ── THE CACHE CONSULT ───────────────────────────────────────────────────
+    //
+    // ★★ HERE AND NOT EARLIER: `outPath` and its containment check are the two
+    // things a served hit needs, and both are decided immediately above. ★★ AND
+    // HERE AND NOT LATER: everything below this point is the pipeline the hit
+    // exists to skip — semantic analysis, CST→HIR, HIR→MIR, the optimizer,
+    // MIR→LIR, assembly and the link. The front end has already run (the CUs
+    // arrived built), which is exactly the cost a hit still pays and the reason
+    // the key is COMPLETE BY CONSTRUCTION rather than verified against a record.
+    //
+    // ⚠ A REFUSAL FAILS THE TARGET and does not fall through to compiling —
+    // see `serveArtifactFromCache`. A MISS is silent and ordinary.
+    if (cacheTicket.has_value()) {
+        auto const served = serveArtifactFromCache(*cacheTicket, outPath);
+        if (!served.has_value()) {
+            // ⓘ `D_FileReadFailed` is the CLOSEST code the driver band carries
+            // rather than an exact one — the same judgement, and the same
+            // reasoning, as the runtime cache's wiring records at its own
+            // unverifiable-entry arm. Nothing is lost to a reader: the message
+            // carries the path, the 16-character index, the full identity
+            // digest, the remedy and the anchor.
+            emitDriver(reporter, DiagnosticCode::D_FileReadFailed,
+                       served.error());
+            return std::nullopt;
+        }
+        if (*served) {
+            servedFromCache = true;
+            return reported(true);
+        }
+    }
 
     // c165 (D-LK-STATIC-LINK): partition `--resolve-library` into DYNAMIC
     // libraries (`.so`/`.dll`/`.dylib` -- read for their export surface during
@@ -912,8 +1130,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // D-FFI-DECLARED-IMPORT-NAME: a STATED import name is meaningful only on
     // the DYNAMIC side (it names a runtime dependency); a static archive is
     // merged into the image and records no import at all. The partition keeps
-    // the whole spec on the dynamic side and takes only the PATH for archives,
-    // so nothing is silently dropped where it would have had an effect.
+    // the whole spec on the dynamic side and takes only the PATH for archives.
+    // ⚠ THAT DROP USED TO BE SILENT AND IS THE ANCHOR
+    // D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE: correct to
+    // drop, wrong to say nothing. `partitionResolveLibraries` now owns BOTH the
+    // dispatch and the report, so the branch that drops the name and the
+    // diagnostic that names it cannot be separated by a later edit.
     // ── D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION: the THIRD arm
     // of the same dispatch ────
     //
@@ -924,35 +1146,23 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // had no arm for the file's actual shape. ✔MEASURED on the shipped CLI
     // before the arm landed.
     //
-    // ★ THE ORDER OF THE THREE PROBES IS NOT ARBITRARY. `ar` first, because an
-    // archive's global magic is unambiguous and its members are objects (a
-    // relocatable probe must never see the container). Then the object probe,
-    // which is asked OF THE FORMAT. Dynamic last, as the residual -- keeping the
-    // pre-existing rule that an unreadable path stays dynamic so its eager
-    // open-probe fails loud rather than being silently diverted.
-    //
-    // The whole spec rides to the dynamic side; the object and archive sides
-    // take only the PATH, because a merged input records no runtime import for a
-    // STATED import name to name (D-FFI-DECLARED-IMPORT-NAME). Nothing is
-    // dropped where it would have had an effect.
-    std::vector<std::filesystem::path> staticArchives;
+    // The probe ORDER, the unreadable-path-stays-dynamic rule and the
+    // whole-spec-rides-to-the-dynamic-side rule all live with the function now;
+    // this site states only what it does with the three lists.
+    auto resolveLibs = partitionResolveLibraries(
+        std::span<ResolveLibrarySpec const>{compileOpts.resolveLibraries},
+        **formatR, reporter);
+    std::vector<std::filesystem::path> staticArchives =
+        std::move(resolveLibs.staticArchives);
     CompileOptions perCuOpts = compileOpts;
-    {
-        std::vector<ResolveLibrarySpec> dynamicLibs;
-        for (auto const& lib : compileOpts.resolveLibraries) {
-            if (isArArchiveFile(lib.path)) {
-                staticArchives.push_back(lib.path);
-            } else if (isRelocatableObjectFile(lib.path, **formatR)) {
-                // Joins the SAME list a `--compile`-named object lands in --
-                // one channel, so there is one definition of what an object
-                // input means and no second engine to keep in step.
-                perCuOpts.objectInputs.push_back(lib.path);
-            } else {
-                dynamicLibs.push_back(lib);
-            }
-        }
-        perCuOpts.resolveLibraries = std::move(dynamicLibs);
-    }
+    // Objects join the SAME list a `--compile`-named object lands in -- one
+    // channel, so there is one definition of what an object input means and no
+    // second engine to keep in step. APPENDED, never assigned: `compileOpts`
+    // may already carry objects the source partition routed here.
+    perCuOpts.objectInputs.insert(perCuOpts.objectInputs.end(),
+                                  resolveLibs.objectInputs.begin(),
+                                  resolveLibs.objectInputs.end());
+    perCuOpts.resolveLibraries = std::move(resolveLibs.dynamicLibraries);
 
     // Cycle 24/25 build-then-lower sequence. LOOP 1: build EVERY CU's MIR up front
     // (`buildCuMir` — sem→HIR→FFI→MIR→optimize), holding each `CuMirModule` (which keeps
@@ -1220,8 +1430,13 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // arm) and `enforceArtifactProfileFormat` already validated the project's
     // `staticlib` profile against this format's served set.
     if ((*formatR)->isStaticArchive()) {
-        std::string const memberExt =
-            (*formatR)->kind() == ObjectFormatKind::Pe ? ".obj" : ".o";
+        // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: this line READ
+        // `kind() == ObjectFormatKind::Pe ? ".obj" : ".o"`. The member
+        // extension is a NAMING fact about the ecosystem this archive belongs
+        // to, so the archive format declares it (`archiveMemberExtension`,
+        // presence-paired with `container: archive` and refused on any format
+        // that packages no members).
+        std::string const memberExt{(*formatR)->archiveMemberExtension()};
         std::vector<AssembledModule> members;
         std::vector<std::string>     memberNames;
         members.reserve(cuMirs.size());
@@ -1284,11 +1499,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                 cuMirs[i].externImports)) {
                 return std::nullopt;  // optimize-stage failure already reported
             }
-            auto mod = lowerCuMirToAssembly(cuMirs[i], (*formatR)->processArgs(),
-                                            (*formatR)->entryVerbs(),
-                                            (*formatR)->sehPersonality(),
-                                            (*formatR)->name(),
-                                            (*formatR)->kind(), reporter);
+            auto mod = lowerCuMirToAssembly(
+                cuMirs[i], (*formatR)->processArgs(), (*formatR)->entryVerbs(),
+                (*formatR)->sehPersonality(), (*formatR)->name(),
+                cuMirs[i].target->wideFloatSoftcallLibrary(
+                    (*formatR)->kind()),
+                reporter);
             if (!mod) return std::nullopt;  // back-half tier failure already reported
             members.push_back(std::move(*mod));
             // Member file name: THIS CU's own source stem (see the block above),
@@ -1517,7 +1733,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 std::string objs;
                 for (auto const& p : objectPaths) {
                     if (!objs.empty()) objs += ", ";
-                    objs += p.generic_string();
+                    objs += core::genericSpelling(p);
                 }
                 emitDriver(reporter, DiagnosticCode::K_SymbolUndefined,
                            "no program entry: none of the object inputs ("
@@ -1569,11 +1785,11 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                             cuMirs[0].externImports)) {
             return std::nullopt;  // optimize-stage failure already reported
         }
-        auto mod = lowerCuMirToAssembly(cuMirs[0], (*formatR)->processArgs(),
-                                        (*formatR)->entryVerbs(),
-                                        (*formatR)->sehPersonality(),
-                                        (*formatR)->name(),
-                                        (*formatR)->kind(), reporter);
+        auto mod = lowerCuMirToAssembly(
+            cuMirs[0], (*formatR)->processArgs(), (*formatR)->entryVerbs(),
+            (*formatR)->sehPersonality(), (*formatR)->name(),
+            cuMirs[0].target->wideFloatSoftcallLibrary((*formatR)->kind()),
+            reporter);
         if (!mod) {              // back-half tier failure already reported via `reporter`
             emitNullNoDiagnostic("back-half lower (lowerCuMirToAssembly)");
             return std::nullopt;
@@ -1783,12 +1999,45 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         entryVerb = resolvedEntry->verb;
     }
 
+    // ── THE MERGE TIER'S OWN SNAPSHOT GATE ─────────────────────────────────
+    //
+    // ★★ THE MERGE IS A TIER AND IT WAS THE ONLY ONE WITHOUT A TIER GATE.
+    // Every other stage in this pipeline checkpoints `reporter.errorCount()`
+    // against the count it saw at entry (`compile_pipeline.cpp::tierClean` —
+    // a snapshot rather than `errorCount() == 0`, because the reporter is
+    // shared and upstream errors stay accumulated). The merge had only
+    // `if (!merged)`, and `mergeCuMirs` REPORTS each cross-unit strong
+    // redefinition and then returns a perfectly well-formed module in which
+    // one of the conflicting definitions has silently won.
+    //
+    // ⚠ THE COMMENT THAT USED TO SIT ON THE `if (!merged)` LINE ASSERTED THE
+    // MISSING BEHAVIOUR — it read *"merge failure (conflict / verify) already
+    // reported"*, and a CONFLICT never produced a merge failure. ✔MEASURED on
+    // the shipped CLI: `dsscp --compile a.c b.c` where both define `f` printed
+    // `dsscp: artifact …a.exe`, reported K_SymbolRedefinedAcrossUnits, exited
+    // 1, and left a runnable `a.exe` returning CU#1's answer.
+    //
+    // ★ THIS IS NOT THE SAME QUESTION `linker::writeBytes` NOW ASKS, and the
+    // two are not a duplicated truth table. This gate stops the WORK — there
+    // is nothing to gain from optimizing, lowering, assembling and linking a
+    // module already known to be semantically wrong, and every one of those
+    // tiers would be reasoning about a program the source does not describe.
+    // The writer's gate stops the ARTIFACT, for this tier and for every future
+    // one that forgets to add a gate here. Different scopes, one each.
+    //
+    // ⓘ Kept at the CALL SITE rather than inside `mergeCuMirs`: the merge's
+    // contract is "report what you found, hand back the best module you can",
+    // which the linker's own resolution follows too, and the tier gates in
+    // this pipeline all live at their call sites.
+    auto const mergeEntry = reporter.errorCount();
     auto merged = mergeCuMirs(
         std::span<MergeCuInput const>{mergeInputs.data(), mergeInputs.size()},
         std::move(host),
         std::span<std::string const>{entryNames.data(), entryNames.size()},
         reporter);
-    if (!merged) return std::nullopt;  // merge failure (conflict / verify) already reported.
+    // Merge REFUSED (nullopt), or merge SUCCEEDED while reporting a conflict
+    // it resolved by election. Both are already reported; both stop here.
+    if (!merged || reporter.errorCount() != mergeEntry) return std::nullopt;
 
     // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE + D-FFI-PE-CRT-UCRT-MIGRATION):
     // MATERIALIZE the resolved entry's arguments per its verb × the format's declared
@@ -1991,6 +2240,8 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     auto mod = lowerMergedToAssembly(*merged, grammar, **targetR,
                                      (*formatR)->dataModel(),
                                      effectiveBitFieldStrategy(**targetR, **formatR),
+                                     effectiveUnnamedBitFieldAlignment(**targetR,
+                                                                       **formatR),
                                      ccIndex, cuMirs[0].cuId,
                                      (*formatR)->externCallDispatch(),
                                      (*formatR)->dataImportBinding(),
@@ -2524,7 +2775,7 @@ struct ShippedSourceLanguage {
         emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                    "shipped-source realization: the shipped language directory "
                    "(src/dss-config/sources) could not be located, so '"
-                   + path.generic_string() + "' has no front end to compile it");
+                   + core::genericSpelling(path) + "' has no front end to compile it");
         return {};
     }
 
@@ -2570,7 +2821,7 @@ struct ShippedSourceLanguage {
                 emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                            "shipped-source realization: shipped language '" + name
                            + "' is the only one that claims the extension '" + ext
-                           + "' of '" + path.generic_string()
+                           + "' of '" + core::genericSpelling(path)
                            + "', but it could not be loaded — the reason is in the "
                              "configuration diagnostic(s) above (config: "
                              "src/dss-config/sources/" + name + ".lang.json)");
@@ -2594,11 +2845,11 @@ struct ShippedSourceLanguage {
     emitDriver(rep, DiagnosticCode::D_UnknownFileExtension,
                claimants.empty()
                    ? "shipped-source realization: no shipped language claims the "
-                     "extension '" + ext + "' of '" + path.generic_string()
+                     "extension '" + ext + "' of '" + core::genericSpelling(path)
                          + "', so there is no front end to compile it"
                    : "shipped-source realization: " + std::to_string(claimants.size())
                          + " shipped languages claim the extension '" + ext
-                         + "' of '" + path.generic_string()
+                         + "' of '" + core::genericSpelling(path)
                          + "', so the extension alone cannot name one — refusing "
                            "rather than guessing which front end owns this file");
     return {};
@@ -2728,7 +2979,7 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
     if (ec) {
         emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
                    "shipped-source realization: the descriptor corpus at '"
-                   + descriptorDir.generic_string()
+                   + core::genericSpelling(descriptorDir)
                    + "' could not be walked (" + ec.message()
                    + "), so the descriptor(s) declaring each shipped runtime "
                      "unit cannot be identified — and the runtime object "
@@ -2757,7 +3008,8 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
         // honest answer; `computeRuntimeObjectKey` resolves it against the root
         // and reports the miss where it is real.
         std::string const spelling =
-            (relEc || rel.empty()) ? it->path().generic_string()
+            // The RELATIVE arm has no root to lose; the ABSOLUTE fallback does.
+            (relEc || rel.empty()) ? core::genericSpelling(it->path())
                                    : rel.generic_string();
         for (auto const& source : declared)
             declarers[source].push_back(spelling);
@@ -2771,7 +3023,7 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
                        "shipped-source realization: object format '" + formatKey
                        + "' realizes '" + source
                        + "', but no descriptor under '"
-                       + descriptorDir.generic_string()
+                       + core::genericSpelling(descriptorDir)
                        + "' was found to declare it. The corpus reader and the "
                          "descriptor walk disagree, so the runtime object "
                          "cache key would omit the declaring descriptor's "
@@ -2795,6 +3047,105 @@ readWholeBinaryFile(fs::path const& path) {
                                     std::istreambuf_iterator<char>()};
     if (in.bad()) return std::nullopt;
     return bytes;
+}
+
+// ★★ THE OPERATIONAL NOTE CHANNEL — `std::cerr`, beside `dsscp: artifact …`,
+// and NOT a `D_*` diagnostic. Its subjects are statements about the MACHINE or
+// about the INVOCATION — an unwritable cache root, a full disk, a scrubbed
+// environment, a committed manifest value a command-line flag overrode — never
+// about the program being compiled: they have no source position, no buffer and
+// no band, and routing them through the diagnostic reporter would let
+// `--warnings-as-errors` turn a full disk (or a `--output` flag) into a compile
+// error. It is still LOUD — `runtime_object_cache.hpp`'s standing rule is that a
+// mechanism which silently does nothing is worse than one that fails, and every
+// later build re-emitting the line is the intended behaviour, not noise to be
+// suppressed.
+//
+// ⚠ ONE EMITTER, DELIBERATELY — this used to be TWO byte-identical functions
+// (`reportRuntimeCacheNote` and `reportDependencyCacheNote`) differing only in
+// which subject their docblock named, which is a fact with two owners and a
+// prefix free to drift between them. The SUBJECT belongs in the message the
+// caller passes; the CHANNEL is one thing. Folded when a third subject (the
+// D-AP2-OUTPUT-ROUTING `output`/`--output` override) was about to add a fourth
+// copy.
+void reportDriverNote(std::string_view text) {
+    std::cerr << "dsscp: note: " << text << '\n';
+}
+
+std::expected<bool, std::string>
+serveArtifactFromCache(ArtifactCacheTicket const& ticket,
+                       fs::path const&            outPath) {
+    auto const hit = dss::runtime::lookupRuntimeObject(ticket.key);
+    // ⛔ AN UNVERIFIABLE ENTRY IS A REFUSAL AND IT PROPAGATES. Treating it as a
+    // miss would restore the un-verified 80-bit behaviour by the back door —
+    // the store's rule is `destination already exists ⇒ same key ⇒ same bytes`,
+    // which is exactly the inference a sidecar mismatch has broken.
+    if (!hit.has_value()) return std::unexpected(hit.error());
+    if (!hit->has_value()) return false;   // an ordinary miss
+
+    // ★★ THE CACHED BYTES ARE COPIED TO THE PATH **THIS** BUILD RESOLVED, never
+    // linked or reported from the cache root. A warm build must leave the same
+    // tree a cold one does — the operator asked for an artifact at a location,
+    // and a mechanism that silently stopped producing it there once a cache
+    // warmed would be a build whose OUTPUT depends on cache state.
+    //
+    // ⛔ THE DESTINATION IS UNLINKED FIRST, AND `copy_options::none` IS THE
+    // POINT — `overwrite_existing` DOES NOT OVERWRITE HERE. ✔MEASURED
+    // 2026-08-31 on Windows/MinGW: with a previous artifact still at `outPath`,
+    // `fs::copy_file(src, outPath, copy_options::overwrite_existing)` failed
+    // with *"File exists"*. That is the state EVERY real rebuild into a dirty
+    // output tree is in, so the flag-only form served exactly once per clean
+    // tree and refused forever after. It was found by a REMOVE-direction mutant
+    // that turned an unrelated pin's second build into a hit, not by the warm
+    // pin — which had deleted the destination and could not see it.
+    // `copy_options::none` after the unlink then makes a surviving destination
+    // a LOUD failure rather than a silent skip.
+    //
+    // ⓘ NOT ATOMIC, deliberately and consistently: the link step's own write to
+    // this same path is not atomic either, so a temp-and-rename here would give
+    // the cached path a stronger guarantee than the compiled path it must be
+    // indistinguishable from. A crash between the two leaves no artifact, which
+    // is the state a crashed link leaves too.
+    std::error_code ec;
+    fs::remove(outPath, ec);
+    ec.clear();
+    fs::copy_file(**hit, outPath, fs::copy_options::none, ec);
+    if (ec) {
+        // ⚠ A HARD FAILURE, NOT A FALL-THROUGH TO COMPILING. The verified entry
+        // IS this build's artifact; failing to place it is a failure to produce
+        // the artifact, and compiling instead would hide an undeletable or
+        // unwritable output path behind a slow build that sometimes works.
+        return std::unexpected(std::format(
+            "dependency artifact cache: a VERIFIED entry for this build was "
+            "found at '{}' but could not be placed at '{}': {}. The entry is "
+            "this build's artifact, so this is a failure to produce it rather "
+            "than a reason to compile again. Anchored: "
+            "D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION.",
+            core::genericSpelling(**hit), core::genericSpelling(outPath),
+            ec.message()));
+    }
+    return true;
+}
+
+void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
+                               fs::path const&            artifactPath) {
+    // The artifact is already on disk and already correct, so nothing below can
+    // change WHAT this build produced — only whether the NEXT build repeats it.
+    // That is what keeps the cache an optimization: an unwritable root, a full
+    // disk or an environment with no HOME costs a line on stderr, never a
+    // build. What it must not be is INVISIBLE, hence the note.
+    auto const bytes = readWholeBinaryFile(artifactPath);
+    if (!bytes.has_value()) {
+        reportDriverNote(
+            "the artifact '" + core::genericSpelling(artifactPath)
+            + "' could not be read back, so it was not added to the dependency "
+              "artifact cache; the next build will compile it again.");
+        return;
+    }
+    auto const stored = dss::runtime::storeRuntimeObject(
+        ticket.key, std::span<std::uint8_t const>{bytes->data(), bytes->size()},
+        ticket.eviction);
+    if (!stored.has_value()) reportDriverNote(stored.error());
 }
 
 // ── THE STAGING AREA ────────────────────────────────────────────────────────
@@ -2855,19 +3206,6 @@ private:
     fs::path dir_;
 };
 
-// ★★ THE OPERATIONAL NOTE CHANNEL — `std::cerr`, beside `dsscp: artifact …`,
-// and NOT a `D_*` diagnostic. A cache that could not be written is a statement
-// about this MACHINE (an unwritable root, a full disk, a scrubbed environment),
-// not about the program being compiled: it has no source position, no buffer
-// and no band, and routing it through the diagnostic reporter would let
-// `--warnings-as-errors` turn a full disk into a compile error. It is still
-// LOUD — `runtime_object_cache.hpp`'s standing rule is that a mechanism which
-// silently does nothing is worse than one that fails, and every later build
-// re-emitting this line is the intended behaviour, not noise to be suppressed.
-void reportRuntimeCacheNote(std::string_view text) {
-    std::cerr << "dsscp: note: " << text << '\n';
-}
-
 // Append the documents a loaded schema is a function of: the document itself,
 // plus every OTHER document its loader folded in (`languageReferences` and
 // friends). Asked of the LOADER, never hand-listed — the header's rule, and the
@@ -2891,6 +3229,224 @@ void appendSchemaDocuments(
     }
 }
 
+// ══ D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C) ════════
+//
+// The cross-build DEPENDENCY ARTIFACT cache's driver half: the input-closure
+// union, the key, the note channel, and the ticket a target's build carries.
+// The store itself is `runtime_object_cache.{hpp,cpp}` — reused, never
+// re-spelled.
+
+// ★★★ THE UNION OF EVERY LIVE CU'S `inputDigest()`, AS ONE SHA-256 — the term
+// that makes this cache safe at all.
+//
+// ⚠ EMPTY IS RETURNED FOR EVERY STATE IN WHICH THE CLOSURE IS NOT FULLY KNOWN,
+// and the caller treats empty as a REFUSAL:
+//   * NO units — the all-object-link shape. The inputs are then the object
+//     FILES, which no front end read and no digest covers. (They ARE covered
+//     as link inputs, but a build with nothing parsed has no closure to speak
+//     of, and inventing an "empty closure" digest would make every all-object
+//     link share one key.)
+//   * ANY unit reporting an EMPTY digest — a CU built through a path that
+//     never computed one. `inputDigest()`'s own contract says empty means NOT
+//     COMPUTED and that a key builder must refuse it.
+//
+// ★ THE UNITS ARE RENDERED IN BUILD ORDER, NOT SORTED, and that is deliberate
+// and opposite to how config documents are treated. This order is the order the
+// operator's `sources[]` produced; it decides link order and therefore which
+// definition wins, so two orders are two programs. Sorting would merge them
+// onto one key — the under-invalidating direction.
+[[nodiscard]] std::string unionInputDigest(std::span<CompilationUnit const> cus) {
+    if (cus.empty()) return {};
+    std::string document = "dss-cu-input-closure/1\n";
+    document += "units=" + std::to_string(cus.size()) + "\n";
+    for (CompilationUnit const& cu : cus) {
+        std::string_view const digest = cu.inputDigest();
+        if (digest.empty()) return {};
+        document += "unit=";
+        document += digest;
+        document += '\n';
+    }
+    return dss::crypto::sha256Hex(document);
+}
+
+// One link input, digested. EMPTY digest ⇒ the key builder REFUSES, which is
+// why an unreadable library is not silently skipped: it is an input whose bytes
+// decide the artifact.
+[[nodiscard]] dss::runtime::LoadedConfigDocument
+digestLinkInput(std::string_view label, fs::path const& path) {
+    auto const bytes = readWholeBinaryFile(path);
+    return dss::runtime::LoadedConfigDocument{
+        std::string{label}, core::genericSpelling(path),
+        bytes.has_value()
+            ? dss::crypto::sha256Hex(std::string_view{
+                  reinterpret_cast<char const*>(bytes->data()), bytes->size()})
+            : std::string{}};
+}
+
+// Build ONE target's dependency-artifact cache key, or say why it cannot be
+// built. Called at the `buildCus` boundary in `runCusToTargets`.
+//
+// ⚠ A REFUSAL HERE IS NOT A BUILD FAILURE. It means the optimization is
+// unavailable for this target, which the caller reports as a note and then
+// compiles normally — the same bargain `storeRuntimeObject`'s unwritable-miss
+// refusal already carries. The arm that DOES stop a build is an unverifiable
+// ENTRY, and that one lives at the lookup.
+[[nodiscard]] std::expected<dss::runtime::RuntimeObjectKey, std::string>
+buildDependencyArtifactKey(
+    DependencyArtifactCacheConfig const& policy,
+    std::string const&                   targetSpec,
+    TargetSchema const&                  target,
+    ObjectFormatSchema const&            buildFormat,
+    GrammarSchema const&                 buildGrammar,
+    std::span<CompilationUnit const>     cus,
+    std::string const&                   artifactBaseName,
+    std::string_view                     artifactSuffix,
+    CompileOptions const&                compileOpts,
+    ImageRequest const&                  imageRequest) {
+    static constexpr std::string_view kAnchor =
+        "D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION";
+
+    // ⛔ AN INJECTED OPTIMIZER PIPELINE IS A REFUSAL, NOT A TERM. It is a raw
+    // pointer to an in-memory pass list with no content identity to digest, and
+    // it CHANGES THE EMITTED BYTES. The only two honest answers are "refuse to
+    // cache" and "serve an artifact built by a different pipeline"; this is the
+    // first. It is reachable only from the examples runner's differential arm
+    // and from MIR tests, neither of which is a project build.
+    if (compileOpts.pipelineOverride != nullptr) {
+        return std::unexpected(std::format(
+            "dependency artifact cache: this build injects an optimizer "
+            "pipeline directly, which changes the emitted bytes and carries no "
+            "content identity that could enter a cache key. Not cached. "
+            "Anchored: {}.",
+            kAnchor));
+    }
+
+    std::string const closure = unionInputDigest(cus);
+    if (closure.empty()) {
+        return std::unexpected(std::format(
+            "dependency artifact cache: target '{}' has no usable input closure "
+            "— it builds {} translation unit(s), and a closure is available "
+            "only when there is at least one and every one of them reports "
+            "`CompilationUnit::inputDigest()`. An all-object link has nothing "
+            "parsed to digest. Not cached. Anchored: {}.",
+            targetSpec, cus.size(), kAnchor));
+    }
+
+    // The CONFIG ROOT — the cache anchor, and the directory the archive-sibling
+    // lookup scans. Derived from ONE walk, exactly as
+    // `resolveShippedRuntimeArchives` derives it: two walks could answer with
+    // two different trees on a host with more than one checkout.
+    auto const objectFormatsDir = findShippedConfigDir("object-formats");
+    if (!objectFormatsDir) {
+        return std::unexpected(std::format(
+            "dependency artifact cache: the shipped object-format directory "
+            "(src/dss-config/object-formats) could not be located, so neither "
+            "the cache root nor the archive-writing sibling can be resolved. "
+            "Not cached. Anchored: {}.",
+            kAnchor));
+    }
+    fs::path const configRoot = objectFormatsDir->parent_path();
+
+    // The archive sibling is a real input: it is the writer that produced the
+    // runtime archives this artifact links. Its own requester label and anchor,
+    // never the runtime cache's — a refusal saying "runtime object cache" to
+    // somebody whose DEPENDENCY did not cache names the wrong mechanism.
+    static constexpr dss::runtime::ArchiveSiblingRequester kRequester{
+        "dependency artifact cache",
+        "D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION"};
+    auto const siblingName = dss::runtime::resolveArchiveSiblingFormat(
+        buildFormat, target, *objectFormatsDir, kRequester);
+    if (!siblingName.has_value()) return std::unexpected(siblingName.error());
+    auto const siblingSchema = ObjectFormatSchema::loadShipped(*siblingName);
+    if (!siblingSchema.has_value()) {
+        return std::unexpected(std::format(
+            "dependency artifact cache: the archive-writing sibling format '{}' "
+            "could not be loaded, so its content digest cannot enter the cache "
+            "key. Not cached. Anchored: {}.",
+            *siblingName, kAnchor));
+    }
+
+    auto const parsedSpec = TargetSpec::parse(targetSpec);
+    if (!parsedSpec.has_value()) {
+        return std::unexpected(std::format(
+            "dependency artifact cache: the target spec '{}' does not parse, so "
+            "the key's target term cannot be composed. Not cached. Anchored: "
+            "{}.",
+            targetSpec, kAnchor));
+    }
+
+    dss::runtime::DependencyArtifactRequest request;
+    request.configRoot          = configRoot;
+    request.overrideVariable    = policy.rootOverrideVariable;
+    request.inputClosureDigest  = closure;
+    request.artifactStem        = artifactBaseName;
+    request.artifactSuffix      = std::string{artifactSuffix};
+    request.targetSpec          = targetSpec;
+    request.buildFormatName     = std::string{buildFormat.name()};
+    request.siblingFormatName   = *siblingName;
+    request.configName          = std::string{compileConfigName(compileOpts.config)};
+    // Spelled from the closed enum rather than from a number, so the document
+    // stays readable and a new topology cannot silently reuse an old key.
+    request.ltoModeName =
+        compileOpts.ltoMode == CompileOptions::LtoMode::Thin ? "thin" : "full";
+    request.stackReserveBytes = imageRequest.stackReserveBytes;
+
+    // The config documents this build ALREADY LOADED, asked of the loaders that
+    // own them — never hand-listed. Identical set and identical construction to
+    // `resolveShippedRuntimeArchives`'s, through the SAME helper.
+    appendSchemaDocuments(request.loadedDocuments, "language",
+                          buildGrammar.configDocumentPath(),
+                          buildGrammar.contentDigest(),
+                          buildGrammar.referencedDocuments(), configRoot);
+    appendSchemaDocuments(request.loadedDocuments, "target",
+                          "targets/" + parsedSpec->targetName + ".target.json",
+                          target.contentDigest(), {}, configRoot);
+    appendSchemaDocuments(request.loadedDocuments, "format",
+                          "object-formats/" + std::string{buildFormat.name()}
+                              + ".format.json",
+                          buildFormat.contentDigest(), {}, configRoot);
+    appendSchemaDocuments(request.loadedDocuments, "sibling-format",
+                          "object-formats/" + *siblingName + ".format.json",
+                          (*siblingSchema)->contentDigest(), {}, configRoot);
+
+    // ⓘ THE SAME TWO LISTS `compileOneTarget` WILL HAND THE LINK, IN THE SAME
+    // ORDER, read from the SAME `CompileOptions` — not a second gathering of
+    // "what this build probably links". By this point the runtime archives have
+    // already been appended by the caller, so the list is complete.
+    request.linkInputs.reserve(compileOpts.resolveLibraries.size()
+                               + compileOpts.objectInputs.size());
+    for (ResolveLibrarySpec const& lib : compileOpts.resolveLibraries) {
+        auto entry = digestLinkInput("resolve-library", fs::path{lib.path});
+        // ⚠ THE DECLARED IMPORT NAME RIDES WITH THE PATH. On the DYNAMIC arm it
+        // outranks the binary's own embedded soname and is therefore recorded
+        // INTO the artifact — two builds differing only in it produce different
+        // bytes.
+        // ⓘ CORRECTED 2026-09-01 (D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE):
+        // that sentence used to be stated UNCONDITIONALLY and it is FALSE for a
+        // MERGED input. ✔MEASURED at `c1754511`: two execs built from one
+        // archive, one with `=totally_bogus_name.dll` and one with no stated
+        // name, were BYTE-IDENTICAL (md5 1039fd348f4713b2bba4859a5fd6f567).
+        // Keying on it anyway is deliberate and is the SAFE direction —
+        // over-invalidation costs one rebuild, under-invalidation serves an
+        // artifact built by a different command line, and the partition that
+        // decides which arm a path takes runs BELOW this point (per target),
+        // while the key is computed ABOVE it (once for the CU set), so this
+        // site cannot know which arm the entry will reach without moving the
+        // dispatch it does not own. The build now WARNS about the moot half
+        // (`F_DeclaredImportNameNotRecordable`), so the operator is told rather
+        // than left to discover it in a cache miss.
+        if (!lib.declaredImportName.empty()) {
+            entry.path += "=" + lib.declaredImportName;
+        }
+        request.linkInputs.push_back(std::move(entry));
+    }
+    for (fs::path const& object : compileOpts.objectInputs) {
+        request.linkInputs.push_back(digestLinkInput("object-input", object));
+    }
+
+    return dss::runtime::computeDependencyArtifactKey(request);
+}
+
 // ══ THE ONE SEAM ═════════════════════════════════════════════════════════════
 //
 // Every shipped runtime archive this (target, format, config) needs, as paths a
@@ -2904,7 +3460,6 @@ void appendSchemaDocuments(
     std::string const&          targetSpec,
     TargetSchema const&         target,
     ObjectFormatSchema const&   buildFormat,
-    ObjectFormatKind            formatKind,
     GrammarSchema const&        buildGrammar,
     ShippedSourceLanguageCache& grammarCache,
     CompileConfig               config,
@@ -2924,7 +3479,14 @@ void appendSchemaDocuments(
     // different trees on a host that has more than one checkout, which is the
     // D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE shape.
     fs::path const    configRoot = descriptorDir->parent_path();
-    std::string const formatKey{objectFormatKindName(formatKind)};
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES (the residual half): the
+    // kind is READ OFF THE FORMAT HANDLE this function already holds, rather
+    // than accepted as a second parameter beside it. The old signature took
+    // BOTH `buildFormat` and its own `kind()`, so a caller could pass a kind
+    // that disagreed with the schema and nothing would notice — the two are
+    // now one fact with one owner, and the only spelling of the enum's TYPE
+    // that this function needed is gone with the parameter.
+    std::string const formatKey{objectFormatKindName(buildFormat.kind())};
 
     auto const claims = attributeShippedRuntimeUnits(configRoot, *descriptorDir,
                                                      formatKey, rep);
@@ -3145,7 +3707,7 @@ void appendSchemaDocuments(
         if (mkEc && !fs::is_directory(unitDir)) {
             emitDriver(rep, DiagnosticCode::D_OutputDirCreateFailed,
                        "shipped-source realization: could not create the "
-                       "staging directory '" + unitDir.generic_string()
+                       "staging directory '" + core::genericSpelling(unitDir)
                        + "' for shipped runtime unit '" + claim.source
                        + "': " + mkEc.message());
             continue;
@@ -3235,17 +3797,25 @@ void appendSchemaDocuments(
         // line on stderr, never a build.
         auto const bytes = readWholeBinaryFile(archives.back());
         if (!bytes.has_value()) {
-            reportRuntimeCacheNote(
-                "the shipped runtime archive '" + archives.back().generic_string()
+            reportDriverNote(
+                "the shipped runtime archive '"
+                + core::genericSpelling(archives.back())
                 + "' could not be read back, so it was not added to the runtime "
                   "object cache; this build links it from the staging area and "
                   "the next build will compile it again.");
             continue;
         }
+        // ⓘ `PruneSuperseded` STATED rather than defaulted, and it is this
+        // site's pre-existing behaviour written down: ONE shipped unit has ONE
+        // current object per (target, config), so an entry a rebuild supersedes
+        // is dead weight. The policy is a parameter because the OTHER subject
+        // class — a project's dependency artifacts — legitimately wants the
+        // opposite; see `CacheEviction`.
         auto const stored = dss::runtime::storeRuntimeObject(
-            *key, std::span<std::uint8_t const>{bytes->data(), bytes->size()});
+            *key, std::span<std::uint8_t const>{bytes->data(), bytes->size()},
+            dss::runtime::CacheEviction::PruneSuperseded);
         if (!stored.has_value()) {
-            reportRuntimeCacheNote(stored.error());
+            reportDriverNote(stored.error());
             continue;
         }
         // ★ THE STORED COPY REPLACES THE STAGING COPY IN THE LINK INPUTS, so a
@@ -3322,7 +3892,13 @@ int runCusToTargets(
     // hands them to the link step, where the format's DECLARED capability
     // gates them. Passed PER TARGET, not resolved once: two targets of one
     // build can differ in whether their format can carry the request.
-    ImageRequest const&                         imageRequest) {
+    ImageRequest const&                         imageRequest,
+    // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C): the
+    // ROOT manifest's cross-build artifact cache policy, threaded verbatim from
+    // the `Program` knob. nullopt (every CLI build, every root project build,
+    // every dependency under a manifest that declares none) ⇒ no consult, no
+    // store, byte-identical behaviour.
+    std::optional<DependencyArtifactCacheConfig> const& artifactCachePolicy) {
     // ── TF-C74 (a): resolve every target — and every object format — BEFORE
     //    the CU build ───────────────────────────────────────────────────────
     //
@@ -3986,7 +4562,7 @@ int runCusToTargets(
                     resolvedArchives = resolveShippedRuntimeArchives(
                         spec, *targetByName.at(parsedForRuntime->targetName),
                         *formatByName.at(parsedForRuntime->formatName),
-                        *keyPerTarget[i].format, *grammarPerTarget[i],
+                        *grammarPerTarget[i],
                         shippedSourceGrammars, config, runtimeStaging, scratch);
                 }
                 if (scratch.errorCount() != errorsBefore) {
@@ -4054,6 +4630,57 @@ int runCusToTargets(
                 compileOpts.resolveLibraries.push_back(
                     ResolveLibrarySpec{archive});
         }
+        // ── D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
+        //    THE `buildCus` BOUNDARY, WHICH IS WHERE THE KEY IS COMPUTABLE ───
+        //
+        // ★★★ EVERY CU OF EVERY KEY IS FRONT-ENDED BY NOW (the `cuByKey` loop
+        // above ran to completion) AND THIS TARGET HAS NOT BEEN COMPILED, so
+        // `∪ cu.inputDigest()` over `cus` exists and nothing downstream of it
+        // has happened yet. That is the ONLY point in the driver where both are
+        // true. `compile_pipeline.cpp`'s per-CU `analyze()` is NOT it — it sits
+        // inside the per-unit half and cannot see the union, so a key built
+        // there would key a WHOLE-ARTIFACT cache from inside a per-unit loop.
+        //
+        // ⚠ IT IS BUILT AFTER `compileOpts` IS COMPLETE, INCLUDING THE RUNTIME
+        // ARCHIVES APPENDED JUST ABOVE. Those archives are link inputs and
+        // therefore key terms; building the key any earlier would omit them.
+        //
+        // ⚠ AND NOT WHEN `analysisOnly` IS SET: that program is knowingly
+        // incomplete and writes no artifact by design, so there is nothing to
+        // serve and nothing to store.
+        std::optional<ArtifactCacheTicket> cacheTicket;
+        if (artifactCachePolicy.has_value() && artifactCachePolicy->enabled
+            && !analysisOnly) {
+            auto const parsedForCache = TargetSpec::parse(spec);
+            auto key = parsedForCache.has_value()
+                         ? buildDependencyArtifactKey(
+                               *artifactCachePolicy, spec,
+                               *targetByName.at(parsedForCache->targetName),
+                               *formatByName.at(parsedForCache->formatName),
+                               *grammarPerTarget[i],
+                               std::span<CompilationUnit const>{cus.data(),
+                                                                liveCus},
+                               artifactName.value_or(sourceStem),
+                               outputExtensionFor(
+                                   *formatByName.at(parsedForCache->formatName)),
+                               compileOpts, imageRequest)
+                         : std::unexpected(std::string{
+                               "dependency artifact cache: the target spec does "
+                               "not parse, so no key can be composed."});
+            if (key.has_value()) {
+                cacheTicket = ArtifactCacheTicket{
+                    std::move(*key),
+                    storeEvictionFor(artifactCachePolicy->eviction)};
+            } else {
+                // ⚠ LOUD, AND NOT FATAL. A key that cannot be COMPUTED means
+                // the optimization is unavailable for this target — not that
+                // any bytes are suspect — so the build compiles normally and
+                // says why on every affected run. The arm that DOES stop a
+                // build is an unverifiable ENTRY, which lives at the lookup
+                // inside `compileOneTarget`.
+                reportDriverNote(key.error());
+            }
+        }
         // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the grammar THIS target's
         // CU was parsed under — never the invocation's, which no longer
         // exists as a single value.
@@ -4062,7 +4689,7 @@ int runCusToTargets(
             *grammarPerTarget[i], sourceStem, spec, scratch,
             outputDir, /*multiTargetBuild*/ targets.size() > 1u,
             artifactName, perFormatOutputSubdir, compileOpts,
-            executor, jobsOverride, imageRequest, analysisOnly);
+            executor, jobsOverride, imageRequest, analysisOnly, cacheTicket);
         mergeWithTargetContext(scratch, spec, rep);
         // AP6: a target counts as having produced an artifact only if it BOTH
         // wrote one and reported no error — the same conjunction the exit code
@@ -4303,6 +4930,30 @@ int Program::run(int argc, char* argv[]) {
     setOutputDir(args.outputDir);
     setUserDefines(args.defines);  // c105: --define NAME[=VALUE] → the CU builds
     setIncludeDirs(args.includeDirs);  // -I<dir> quote-include path (SQLite-testfixture arc C3)
+    // D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED (the ACCEPTANCE half):
+    // an unusable `-I` is named HERE, at the point the driver accepts it,
+    // rather than surfacing later as a missing-header error pointing at the
+    // `#include`. It WARNS and never refuses — see
+    // `InputResolver::checkSearchDirectoriesUsable` for the gcc/MSVC
+    // measurement that settles which of the two it has to be.
+    //
+    // ★ THIS SITE COVERS EVERY MODE, because it sits before the dispatch fork
+    // beside the other CLI stamps. The manifest's `includes` are checked at
+    // their own acceptance point in `compileProject`, where they are merged —
+    // one check per SURFACE, so neither is silent and neither doubles up.
+    //
+    // ⓘ The reporter is local and buffer-less, matching the other pre-parse
+    // driver-tier sites: these diagnostics carry no source location because
+    // their subject is a command-line argument, not a token.
+    {
+        DiagnosticReporter argRep{cfg};
+        (void)InputResolver::checkSearchDirectoriesUsable(
+            args.includeDirs, "-I", argRep);
+        drainDiagnosticsToStderr(argRep);
+        // Only `--warnings-as-errors` can make this fatal; without it the
+        // count stays zero and the run continues, exactly as gcc and MSVC do.
+        if (argRep.errorCount() > 0u) return 1;
+    }
     // D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG: thread the CLI's
     // `--config=<debug|release>` into the kernel so the right
     // shipped pipeline gets loaded at compile_pipeline step 3.5.
@@ -4601,6 +5252,17 @@ int Program::compileProject(
     // twice would double-append; that is out of contract (single-use), not a
     // supported reuse mode.
     {
+        // D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED (the ACCEPTANCE half),
+        // the MANIFEST surface. Checked BEFORE the merge and over `pc.includes`
+        // ALONE, not over the merged list: the CLI's own `-I` entries were
+        // already checked at their acceptance point in `Program::run`, and
+        // re-checking them here would report each of them TWICE for every
+        // project build — the "one check per surface" rule the CLI site states.
+        // `rep` is this call's reporter, so a manifest warning renders with the
+        // project's diagnostics rather than through a second channel.
+        (void)InputResolver::checkSearchDirectoriesUsable(
+            pc.includes, "the project manifest's `includes`", rep);
+
         std::vector<std::string> mergedIncludes = includeDirs();
         mergedIncludes.reserve(mergedIncludes.size() + pc.includes.size());
         mergedIncludes.insert(mergedIncludes.end(),
@@ -4634,6 +5296,77 @@ int Program::compileProject(
     // `--compile` build's names + single-target flat layout stay byte-identical.
     setArtifactName(pc.artifactName);
     setPerFormatOutputSubdir(true);
+
+    // D-AP2-OUTPUT-ROUTING (the `output`-FIELD half). The manifest's OPTIONAL
+    // `output` names the OUTPUT-DIR BASE this build routes into — the same
+    // `<base>` the CLI `--output` names, and the value `resolveArtifactOutputDir`
+    // joins `<formatName>/<artifactName-or-stem><ext>` onto.
+    //
+    // ★ IT IS A DIRECTORY, NEVER A FILE PATH, AND THAT IS THE DECISION — NOT AN
+    // ABBREVIATION OF ONE. `setOutputDir` has no file arm to mirror: it takes a
+    // directory unconditionally, and both arms of `resolveArtifactOutputDir`
+    // return one. The stronger reason is ownership — `artifactName` ALREADY owns
+    // the emitted binary's base name, with a loader check (a bare name; `/` and
+    // `\` reject) and `compileOneTarget`'s containment boundary enforcing it. A
+    // path-shaped `output` would give ONE fact TWO owners, and
+    // `{"output": "dist/a", "artifactName": "b"}` would have no non-arbitrary
+    // answer. Plan 06 §2.2's `"output": "dist/myprog"` sketch predates
+    // `artifactName` (2026-07-24) and is superseded by it: the directory half of
+    // that sketch is this field, the name half is `artifactName`.
+    //
+    // ★ A RELATIVE VALUE RESOLVES AGAINST THE PROCESS WORKING DIRECTORY, NOT
+    // AGAINST THE MANIFEST'S OWN DIRECTORY — the SAME base this manifest's
+    // `sources[]` and `preBuildScripts` already use (this function's
+    // `expandAndDedupProjectSources` and `runBuildScripts` calls each pass an
+    // EMPTY base, each with its own note saying that is a statement rather than
+    // an omission). ⚠ The manifest-relative reading is
+    // the intuitive one and it is WRONG here: a hook that writes `dist/` and an
+    // `"output": "dist"` must name the same directory, or the manifest does not
+    // compose with itself. The manifest's own directory is the base a DEPENDENCY
+    // manifest uses, which is a different question with a different answer.
+    // The value is stored VERBATIM, exactly as `cli_args.cpp` stores `--output`,
+    // so one relative-path rule serves both doors.
+    //
+    // ★ PRECEDENCE — the CLI `--output` WINS, and the override is ANNOUNCED.
+    // Same rule and same reason as `stackReserve` immediately below (a SCALAR
+    // cannot merge, so it needs a stated rule, and "an explicit command-line
+    // argument overrides a committed configuration file" is the universal one);
+    // giving the two manifest scalars OPPOSITE precedence would leave a user
+    // with no rule to learn. It is also the only rule that keeps `--output`
+    // usable on a project that declares `output` — ✔MEASURED, BOTH corpus
+    // runners (`tests/examples/examples_runner.cpp`, `integrated_tests/runner.cpp`)
+    // set an output dir on EVERY project build, so a refuse-on-both rule would
+    // make a manifest declaring `output` un-runnable by this project's own
+    // harnesses.
+    // ⚠ But precedence is not a licence to be SILENT about it: a committed value
+    // that did not apply is exactly the wrong-output surprise this row is banded
+    // for. The note fires only when the two RESOLVE to different directories —
+    // `--output ./dist` and `"output": "dist"` are the same place, and calling
+    // that a conflict would be a false alarm. It goes out the operational NOTE
+    // channel (`reportDriverNote`), not a `D_*`: it is a statement about the
+    // INVOCATION, not about the program being compiled — no source position, no
+    // buffer, no band — and routing it through the reporter would let
+    // `--warnings-as-errors` turn "I passed --output" into a compile error.
+    if (pc.output.has_value()) {
+        fs::path const manifestBase{*pc.output};
+        if (!outputDir().has_value()) {
+            setOutputDir(manifestBase);
+        } else if (!sameOutputBase(*outputDir(), manifestBase)) {
+            // `artifactPathForReport`, NOT bare `core::genericSpelling`:
+            // the latter THROWS for a path the current locale cannot
+            // encode, and this note sits on a SUCCESS path -- a throw here
+            // would abort a build that was about to work. The other
+            // `genericSpelling` call sites in this file are on paths that
+            // are ALREADY failing. This wrapper is what every
+            // operator-facing report line already uses, u8 fallback and all.
+            reportDriverNote(
+                "the command-line output directory '"
+                + artifactPathForReport(*outputDir())
+                + "' overrides the project manifest's `output` ('"
+                + artifactPathForReport(manifestBase)
+                + "'), which was not used.");
+        }
+    }
 
     // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the manifest's OPTIONAL
     // `stackReserve` (bytes).
@@ -4700,6 +5433,22 @@ int Program::compileProject(
     depRequest.compileConfig  = compileConfig();
     depRequest.jobs           = jobs();
     depRequest.executor       = executor();
+    // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C): the
+    // ROOT manifest's policy, read HERE — the one place a root manifest is in
+    // hand — and carried to `Resolver::buildNode_`, which stamps it onto every
+    // DEPENDENCY's fresh `Program`.
+    //
+    // ★★ IT IS DELIBERATELY **NOT** STAMPED ONTO **THIS** `Program`, so the
+    // ROOT's own artifact is never served from the cache, and the member's name
+    // is the statement of that scope rather than an accident of wiring. A root
+    // build is the thing the operator is running: they expect it to happen, its
+    // artifact is the deliverable they will inspect, and its sources are the
+    // ones being edited — so it is the build where a cache buys least and where
+    // a wrong hit would be hardest to notice. A dependency is a PREREQUISITE
+    // nobody is editing, which is exactly the shape a content-addressed cache
+    // serves well. Widening this is a decision to take deliberately, with its
+    // own row; it is not a wiring change.
+    depRequest.dependencyArtifactCache = pc.dependencyArtifactCache;
     depRequest.forceGitCache  = forceGitCache();
     auto resolved = resolveProjectDependencies(
         pc, depRequest, gitRunner() != nullptr ? *gitRunner() : systemGit, rep);
@@ -4950,7 +5699,12 @@ void applyIncludeDirs(UnitBuilder& builder,
                       std::vector<std::string> const& dirs) {
     std::error_code ec;
     for (std::string const& d : dirs) {
-        fs::path const abs = fs::absolute(fs::path{d}, ec);
+        // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: NOT bare
+        // `fs::absolute`. ✔MEASURED — it re-roots `-I //host/share/inc` onto the
+        // local drive with no error, so the search dir named a directory that
+        // cannot exist and the header missed 0/30 for BOTH slash spellings while
+        // the acceptance check, which saw the ORIGINAL string, stayed silent.
+        fs::path const abs = core::absoluteKeepingRoot(fs::path{d}, ec);
         builder.addIncludeDir(ec ? fs::path{d} : abs);
         ec.clear();
     }
@@ -5102,7 +5856,12 @@ int Program::compileFiles(
         executor_, jobs_,
         // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the CLI/manifest stack-reserve
         // request (nullopt = the format default stands).
-        ImageRequest{stackReserveBytes_});
+        ImageRequest{stackReserveBytes_},
+        // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
+        // the cross-build artifact cache policy. nullopt on every CLI build and
+        // on every ROOT project build; engaged only on a DEPENDENCY sub-build,
+        // where `Resolver::buildNode_` stamped the ROOT manifest's policy on.
+        dependencyArtifactCache_);
 }
 
 int Program::compileUnits(
@@ -5335,7 +6094,10 @@ int Program::compileUnits(
         executor_, jobs_,
         // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the CLI/manifest stack-reserve
         // request (nullopt = the format default stands).
-        ImageRequest{stackReserveBytes_});
+        ImageRequest{stackReserveBytes_},
+        // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
+        // the cross-build artifact cache policy — see the `compileFiles` twin.
+        dependencyArtifactCache_);
 }
 
 // D-CAP-MARKER-COMPILE-DIR-PIN anchor: compileDirectory has NO

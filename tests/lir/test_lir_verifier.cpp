@@ -125,7 +125,12 @@ std::uint16_t op(std::string_view mnemonic) {
                std::move(operandPool),
                std::vector<LirBlockId>{},
                std::move(literals),
-               std::move(constraints)};
+               std::move(constraints),
+               // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the
+               // third module-level side structure. Empty here — this fixture
+               // exercises the pool shrink checks, and the schedule's own shrink
+               // check is exercised by its own record.
+               std::vector<LirStaticInitEntry>{}};
 }
 
 [[nodiscard]] detail::LirInst movInst(std::uint32_t operandStart,

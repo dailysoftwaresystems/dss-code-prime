@@ -100,6 +100,8 @@ namespace {
 constexpr std::string_view kElfMinimal = R"({
   "dssObjectFormatVersion": 1,
   "cSymbolDecoration": { "scheme": "none" },
+  "cCallingConvention": { "convention": "none" },
+  "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
   "format": {
@@ -156,6 +158,8 @@ TEST(ObjectFormatSchemaLoader, UnknownKindRejected) {
         R"({"dssObjectFormatVersion":1,
   "dataModel": "LP64","headerNameMatching": "case-sensitive",
   "cSymbolDecoration": { "scheme": "none" },
+  "cCallingConvention": { "convention": "none" },
+  "outputExtension": ".o",
   "format":{"name":"x","kind":"notafmt"}})");
     ASSERT_FALSE(r.has_value());
 }
@@ -265,6 +269,8 @@ TEST(ObjectFormatSchemaLoader, ExternAddrBindingRoundTripAndRejectsUnknown) {
     auto ok = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".o",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
@@ -283,6 +289,8 @@ TEST(ObjectFormatSchemaLoader, ExternAddrBindingRoundTripAndRejectsUnknown) {
     auto bad = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "aapcs64" },
+      "outputExtension": ".o",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
@@ -307,6 +315,8 @@ TEST(ObjectFormatSchemaLoader, DuplicateRelocationNameRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "aapcs64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
@@ -337,6 +347,8 @@ TEST(ObjectFormatSchemaLoader, UnknownRelocationRowKeyRejected) {
     auto ok = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "aapcs64" },
+      "outputExtension": ".o",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
@@ -352,6 +364,8 @@ TEST(ObjectFormatSchemaLoader, UnknownRelocationRowKeyRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
@@ -375,6 +389,8 @@ TEST(ObjectFormatSchemaLoader, ZeroKindRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
@@ -395,6 +411,8 @@ TEST(ObjectFormatSchemaLoader, DuplicateRelocationKindRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
@@ -424,6 +442,8 @@ TEST(ObjectFormatSchemaLoader, UnknownSentinelKindRejectedByValidate) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "aapcs64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"unknown"},
@@ -458,6 +478,8 @@ TEST(ObjectFormatSchemaLoader, SentinelKindDoesNotCascadeIntoIdentityBlockNoise)
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "aapcs64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"unknown"},
@@ -479,6 +501,8 @@ TEST(ObjectFormatSchemaLoader, RelocationsNotArrayRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "aapcs64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
@@ -770,6 +794,8 @@ TEST(LibrarySynthesis, UnknownVehicleRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "aapcs64" },
+      "outputExtension": ".o",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
@@ -795,6 +821,8 @@ TEST(LibrarySynthesis, MissingRoleRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "aapcs64" },
+      "outputExtension": ".o",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
@@ -846,6 +874,8 @@ TEST(LK10EntrySliceB, ProcessExitWithoutEntryCcRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -870,6 +900,8 @@ TEST(LK10EntrySliceB, EntryCcWithoutProcessExitRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -891,6 +923,8 @@ TEST(LK10EntrySliceB, UnknownMechanismRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -910,6 +944,8 @@ TEST(LK10EntrySliceB, SyscallArmMissingNumberRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".obj",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -936,6 +972,8 @@ TEST(LK10EntrySliceB, ByNameImportArmMissingRoleRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".obj",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "pe" },
@@ -956,6 +994,8 @@ TEST(LK10EntrySliceB, OpcodeByteOutOfRangeRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".obj",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -983,6 +1023,8 @@ TEST(LK10EntrySliceB, MechanismNoneStringRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -1001,6 +1043,8 @@ TEST(LK10EntrySliceB, MechanismKeyOmittedRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -1019,6 +1063,8 @@ TEST(LK10EntrySliceB, SyscallArmMissingNumGprRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -1040,6 +1086,8 @@ TEST(LK10EntrySliceB, SyscallOpcodeBytesEmptyArrayRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".obj",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -1062,6 +1110,8 @@ TEST(LK10EntrySliceB, ByNameImportArmMissingMangledNameRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".obj",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "pe" },
@@ -1087,6 +1137,8 @@ TEST(LK10EntrySliceB, ProcessExitOnRelocatableFormatRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".obj",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-obj", "version": "0.1", "kind": "elf" },
@@ -1123,6 +1175,8 @@ TEST(LK10EntrySliceB, EntryCcLeadingWhitespaceRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -1164,6 +1218,8 @@ TEST(LK10EntrySliceB, WasmFormatRejectsProcessExit) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".wasm",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-wasm", "version": "0.1", "kind": "wasm" },
@@ -1299,6 +1355,8 @@ TEST(ProcessArgsSubstrate, UnknownMechanismRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -1321,6 +1379,8 @@ TEST(ProcessArgsSubstrate, MechanismNoneStringRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -1343,6 +1403,8 @@ TEST(ProcessArgsSubstrate, StackVectorMissingArgcOffsetRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -1366,6 +1428,8 @@ TEST(ProcessArgsSubstrate, StackVectorMissingArgvOffsetRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -1390,6 +1454,8 @@ TEST(ProcessArgsSubstrate, OffsetBeyondInt32Rejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -1426,6 +1492,8 @@ TEST(ProcessArgsSubstrate, ProcessArgsWithoutProcessExitRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
@@ -1466,6 +1534,8 @@ TEST(ProcessArgsSubstrate, ProcessArgsOnRelocatableFormatRejected) {
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".wasm",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-obj", "version": "0.1", "kind": "elf" },
@@ -1499,6 +1569,8 @@ TEST(ProcessArgsSubstrate, WasmFormatRejectsProcessArgs) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".wasm",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-wasm", "version": "0.1", "kind": "wasm" },
@@ -1546,6 +1618,8 @@ std::string elfWithArtifactProfiles(std::string_view profilesArrayJson) {
     return std::string{R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","kind":"elf"},
@@ -1573,6 +1647,8 @@ TEST(ObjectFormatArtifactProfiles, AbsentIsEmptyServesNothing) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","kind":"elf"},
@@ -1687,6 +1763,25 @@ TEST(StaticLibraryFormats, ArchiveContainerRejectedOnImageFlavor) {
     // guard below would still fire but `relProblems.empty()` would red for a
     // reason that has nothing to do with containers.
     data.cSymbolDecoration.scheme = CSymbolDecorationScheme::None;
+    // D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY: the same
+    // story one axis further over — REQUIRED, empty == the INVALID sentinel,
+    // and enforced on this hand-built loader-bypassing path by validate()
+    // alone. Left unset, `relProblems.empty()` would red for a reason that has
+    // nothing to do with containers.
+    data.cCallingConvention.convention = "sysv_amd64";
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the artifact
+    // NAMING fact, REQUIRED on every format and DISENGAGED is its invalid
+    // sentinel (an engaged EMPTY value is a real answer -- a Unix
+    // executable). On this hand-built loader-bypassing path validate() is
+    // the only enforcement, so leaving it unset would make this fixture
+    // report two problems where its assertions expect one.
+    data.outputExtension = ".a";
+    // And the two facts a `container: archive` format must carry: the
+    // member naming and the `ar` variant. The Rel arm below must validate
+    // with ZERO problems, so every REQUIRED field has to be present or the
+    // control measures the wrong thing.
+    data.archiveMemberExtension = ".o";
+    data.archiveFlavor = ArchiveFlavor::SysV;
     data.name             = "synth-staticlib";
     // TF-C125: a hand-built `ObjectFormatData` now names its format by
     // resolving the BACKEND, exactly as the loader does. `data.kind` is
@@ -1739,6 +1834,8 @@ TEST(StaticLibraryFormats, UnknownContainerSpellingFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","kind":"elf"},
@@ -1783,6 +1880,8 @@ std::string peWithStackReserveControl(std::string_view blockJson) {
     return std::string{R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".obj",
       "dataModel": "LLP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-pe","version":"1.0","kind":"pe"},
@@ -1795,6 +1894,8 @@ std::string elfWithStackReserveControl(std::string_view blockJson) {
     return std::string{R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".obj",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","version":"1.0","kind":"elf"},
@@ -1926,6 +2027,8 @@ TEST(StackReserveControl, ValidBlockLoadsAndIsExposedVerbatim) {
     auto none = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "aapcs64" },
+      "outputExtension": ".obj",
       "dataModel": "LLP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-pe","version":"1.0","kind":"pe"},
@@ -2095,6 +2198,8 @@ TEST(StackReserveControl, WasmSchemaRejectsTheWholeBlock) {
     expectRejectedAt(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".wasm",
       "dataModel": "ILP32",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-wasm","version":"0.1","kind":"wasm"},
@@ -2615,6 +2720,8 @@ namespace {
     return std::string{R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
       "dataModel": "LP64",
       )"} + std::string{matchingLine} + R"(
       "format": { "name": "hnm-stub", "version": "1.0", "kind": "elf" },

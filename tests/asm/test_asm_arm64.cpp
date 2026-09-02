@@ -1738,23 +1738,34 @@ TEST(Arm64Encoder, StoreSturEncodes) {
     EXPECT_EQ(bytes[3], 0xF8);
 }
 
-TEST(Arm64Encoder, FldurQEncodesLdurQImmediate) {
-    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): fldur_q v0, [X1, #0] ->
-    // LDUR Q0, [X1, #0]. Fixed word 0x3CC00000.
+TEST(Arm64Encoder, FldurAtWidth128EncodesLdurQImmediate) {
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): `fldur` v0, [X1, #0] AT WIDTH
+    // 128 -> LDUR Q0, [X1, #0]. Fixed word 0x3CC00000.
     //   Rt(rd) = Q0 (0) at bits 0..4  -> 0x00
     //   Rn     = X1 (1) at bits 5..9  -> 0x20
     //   Imm9   = 0      at bits 12..20 -> 0
     // word = 0x3CC00020; LE: 20 00 C0 3C. (Assembler-confirmed against the
-    // shipped fstur_q pin STUR Q0,[X1] = 0x3C800020.)
+    // shipped Q-form store pin STUR Q0,[X1] = 0x3C800020.)
+    //
+    // ⚠⚠ THIS ARM USED TO NAME A SEPARATE OPCODE `fldur_q` AND CLASS
+    // `LirRegClass::VR`, AND THE BYTES IT PINS ARE UNMOVED. R1/R2 of design A′
+    // made arm64 declare its SIMD&FP file ONCE: `v0` is class `fpr` at sixteen
+    // bytes, and the Q form is `fldur`'s width-128 VARIANT carrying this exact
+    // fixedWord verbatim. The pin is therefore the SAME assembler-confirmed
+    // word reached through a width flag instead of a second mnemonic — and the
+    // width flag is what the variant guard matches on, so an arm that dropped
+    // it would encode LDUR Dt (64-bit) over a 16-byte datum.
     auto s = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(s.has_value());
-    auto const fldurQ = (*s)->opcodeByMnemonic("fldur_q");
+    auto const fldurQ = (*s)->opcodeByMnemonic("fldur");
     auto const retOp  = (*s)->opcodeByMnemonic("ret");
     ASSERT_TRUE(fldurQ.has_value() && retOp.has_value());
+    EXPECT_FALSE((*s)->opcodeByMnemonic("fldur_q").has_value())
+        << "`fldur_q` is back as a second mnemonic for this row's widest arm";
     auto const v0Ord = (*s)->registerByName("v0");
     ASSERT_TRUE(v0Ord.has_value());
     LirReg const q0 = makePhysicalReg(static_cast<std::uint32_t>(*v0Ord),
-                                      LirRegClass::VR);
+                                      LirRegClass::FPR);
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
     auto blk = b.createBlock();
@@ -1764,7 +1775,7 @@ TEST(Arm64Encoder, FldurQEncodesLdurQImmediate) {
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(0)
     };
-    (void)b.addInst(*fldurQ, q0, ops);
+    (void)b.addInst(*fldurQ, q0, ops, /*payload=*/0, kLirInstFlagWidth128);
     (void)b.addReturn(*retOp, {});
     Lir lir = std::move(b).finish();
     DiagnosticReporter rep;
@@ -3198,6 +3209,69 @@ TEST(Arm64Encoder, FmovEncodesRegisterDouble) {
     EXPECT_EQ(bytes[3], 0x1E);
 }
 
+// ★★★ `fmov` DECLARES 16/32/64 AND DELIBERATELY NO 128, AND THE ABSENCE MUST
+// FAIL LOUD RATHER THAN FALL BACK. A width-128 register-to-register SIMD move
+// is NOT a wider FMOV — AArch64 spells it ORR (`mov v_d.16b, v_n.16b`), a
+// different instruction with different bytes. Since R1 of design A′ the whole
+// SIMD&FP file is ONE class, so `classOp(FPR, Move)` resolves `fmov` for every
+// width including 128; if that election silently fell back to the D form it
+// would encode `FMOV Dd, Dn` for a 128-bit move and DROP THE TOP HALF, at rc=0.
+//
+// ⓘ This is a NEW hazard, created by folding the widths onto one row, and it is
+// the reason the shipped `registerClassOps` `fpr` row can carry `move` at all:
+// declaring ORR with no consumer would be dead vocabulary, and leaving `fmov`
+// unguarded would be worse. The widths that exist are declared, 128 elects
+// nothing, and this arm is what proves "elects nothing" means a diagnostic.
+TEST(Arm64Encoder, FmovHasNoWidth128VariantAndRefusesRatherThanNarrowing) {
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const fmovOp = (*s)->opcodeByMnemonic("fmov");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(fmovOp.has_value() && retOp.has_value());
+    // The class `move` row really is this opcode, so a 128-bit FP copy would
+    // reach it — without this the arm is about an opcode nobody would elect.
+    EXPECT_EQ((*s)->regClassOpOpcode(TargetRegClass::FPR, RegClassOp::Move),
+              fmovOp);
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(makePhysicalReg(
+            static_cast<std::uint32_t>(*(*s)->registerByName("v1")),
+            LirRegClass::FPR))};
+    (void)b.addInst(*fmovOp,
+                    makePhysicalReg(
+                        static_cast<std::uint32_t>(*(*s)->registerByName("v0")),
+                        LirRegClass::FPR),
+                    ops, /*payload=*/0, kLirInstFlagWidth128);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a 128-bit `fmov` was ENCODED — arm64 declares no such form, so "
+           "whatever came out is a narrower move over a 16-byte value";
+    // And nothing was emitted for it: a refusal that still wrote bytes would
+    // put the narrowing instruction in the stream beside the diagnostic.
+    // ⓘ The FMOV mask/base are spelled here rather than shared with the
+    // `Arm64Fpr` fixture's constants further down this file, which are declared
+    // after this point; the word is the same one `FmovEncodes...` above pins.
+    constexpr std::uint32_t kFmovRegMask = 0xFFFFFC00u;
+    constexpr std::uint32_t kFmovRegBase = 0x1E604000u;
+    for (std::size_t i = 0; i + 3 < bytes.size(); i += 4) {
+        std::uint32_t const w = static_cast<std::uint32_t>(bytes[i])
+                              | (static_cast<std::uint32_t>(bytes[i + 1]) << 8)
+                              | (static_cast<std::uint32_t>(bytes[i + 2]) << 16)
+                              | (static_cast<std::uint32_t>(bytes[i + 3]) << 24);
+        EXPECT_NE(w & kFmovRegMask, kFmovRegBase)
+            << "an FMOV word survived the refusal of a width this target does "
+               "not declare";
+    }
+}
+
 TEST(Arm64Encoder, FldurEncodes) {
     // fldur d2, [x3, #16] → LDUR D2, [X3, #16] (SIMD&FP 64-bit,
     // unscaled — the GPR LDUR word with V=1 at bit 26):
@@ -3275,8 +3349,8 @@ TEST(Arm64Encoder, FsturEncodesNegativeImm9) {
     EXPECT_EQ(bytes[3], 0xFC);
 }
 
-// FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE, BLOCKER-1): the 128-bit FPR store fstur_q
-// (STUR Qt, [Xn, #simm9]) used to spill v0..v7 into the AAPCS64 variadic VR save
+// FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE, BLOCKER-1): the 128-bit FPR store
+// (STUR Qt, [Xn, #simm9]) that spills v0..v7 into the AAPCS64 variadic FP save
 // block (16-byte slots). The fixedWord MUST be 0x3C800000 — 0x3C000000 is STURB
 // (8-bit byte store), which would spill 1 byte per FP slot → va_arg(double) garbage.
 // Byte-pin STUR Q0,[X1,#0]:
@@ -3285,36 +3359,50 @@ TEST(Arm64Encoder, FsturEncodesNegativeImm9) {
 //   | Rt = q0 (0)      → 0x00000000
 //   | Imm9 = 0         → 0x00000000
 //   = 0x3C800020 — LE bytes: 20 00 80 3C. A regression to 0x3C000000 (STURB) flips
-//   byte[3] to 0x38 (and would silently mis-encode the whole VR spill).
-TEST(Arm64Encoder, FsturQEncodesByteExact) {
+//   byte[3] to 0x38 (and would silently mis-encode the whole FP spill).
+//
+// ⚠⚠ THE OPCODE IS `fstur` AT WIDTH 128, NOT A MNEMONIC `fstur_q`. R2 of design
+// A′ folded that separate opcode onto this row's WIDTH AXIS carrying the same
+// fixedWord verbatim, because it existed only while the SIMD&FP file was
+// declared as two register CLASSES. ★ THE BYTES BELOW ARE UNCHANGED, which is
+// the whole evidence that the fold moved nothing.
+TEST(Arm64Encoder, FsturAtWidth128EncodesByteExact) {
     auto s = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(s.has_value());
-    auto const stOp  = (*s)->opcodeByMnemonic("fstur_q");
+    auto const stOp  = (*s)->opcodeByMnemonic("fstur");
     auto const retOp = (*s)->opcodeByMnemonic("ret");
-    ASSERT_TRUE(stOp.has_value()) << "arm64 must declare the fstur_q opcode (FC12c)";
+    ASSERT_TRUE(stOp.has_value()) << "arm64 must declare the FP class store `fstur`";
     ASSERT_TRUE(retOp.has_value());
+    EXPECT_FALSE((*s)->opcodeByMnemonic("fstur_q").has_value())
+        << "`fstur_q` is back as a second mnemonic for this row's widest arm — "
+           "the shape R2 of design A′ removed";
 
     LirBuilder b{**s};
     (void)b.addFunction(SymbolId{1});
     auto blk = b.createBlock();
     b.beginBlock(blk);
     LirOperand const ops[] = {
-        // ★ THE 128-BIT V VIEW, NOT THE 64-BIT D ONE
-        // (D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD). This line used to
-        // read `fpr(**s, "d0")` with the comment "q0 shares the d0 ordinal",
-        // and that sharing is precisely why the substitution was invisible:
-        // `d0` and `v0` carry the same hardware encoding, so a sixteen-byte
-        // `STUR Qt` naming an EIGHT-byte register emitted the right bytes. The
-        // target's `registerClassOps` binds `fstur_q` as the `vr` class's
-        // store; its data operand is a `vr` register.
+        // ★ THE FULL 16-BYTE REGISTER, NOT THE 8-BYTE `d0` VIEW
+        // (D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD). This line once read
+        // `fpr(**s, "d0")` with the comment "q0 shares the d0 ordinal", and that
+        // sharing is precisely why the substitution was invisible: `d0` and `v0`
+        // carry the same hardware encoding, so a sixteen-byte `STUR Qt` naming
+        // an EIGHT-byte register emitted the right bytes.
+        //
+        // ⚠ THE CLASS USED TO BE `LirRegClass::VR` AND IS NOW `FPR`, AND THAT IS
+        // NOT A RENAME. `v0` is an `fpr` row now; the sixteen bytes are stated by
+        // the instruction's WIDTH FLAG below, so the operand and the instruction
+        // can no longer disagree about how many bytes move — which is exactly
+        // what the second class was standing in for.
         LirOperand::makeReg(makePhysicalReg(
             static_cast<std::uint32_t>(*(*s)->registerByName("v0")),
-            LirRegClass::VR)),
+            LirRegClass::FPR)),
         LirOperand::makeReg(gpr(**s, "x1")),
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(0)
     };
-    (void)b.addInst(*stOp, InvalidLirReg, ops);
+    (void)b.addInst(*stOp, InvalidLirReg, ops, /*payload=*/0,
+                    kLirInstFlagWidth128);
     (void)b.addReturn(*retOp, {});
     Lir lir = std::move(b).finish();
 
@@ -3327,16 +3415,22 @@ TEST(Arm64Encoder, FsturQEncodesByteExact) {
     EXPECT_EQ(bytes[1], 0x00);
     EXPECT_EQ(bytes[2], 0x80);
     EXPECT_EQ(bytes[3], 0x3C)
-        << "fstur_q byte[3] must be 0x3C (STUR Q) — 0x38 would be STURB (1-byte)";
+        << "byte[3] must be 0x3C (STUR Q) — 0x38 would be STURB (1-byte)";
 }
 
 // FC12c (BLOCKER-1): the matching 128-bit Q disasm arm round-trips. Disassemble a
 // hand-encoded STUR Q3,[X5,#16] and verify the Rd/Rn/Imm9 wires decode (proves the
-// fixed32_disasm windowFor learned the Imm9 + MemBaseNoScale slots fstur_q uses).
-TEST(Arm64Encoder, FsturQDisassemblesRoundTrip) {
+// fixed32_disasm windowFor learned the Imm9 + MemBaseNoScale slots the Q form uses).
+//
+// ⚠ THE OPCODE HANDLE IS `fstur` NOW; THE DISASSEMBLER IDENTIFIES THE VARIANT
+// FROM THE BYTES. The caller supplies the opcode because the oracle verifies
+// bytes AGAINST an encoding row rather than identifying it from scratch, and
+// the Q form is one of that row's width variants since R2 of design A′. If this
+// arm stops resolving, the fold lost a variant rather than the window.
+TEST(Arm64Encoder, FsturQFormDisassemblesRoundTrip) {
     auto s = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(s.has_value());
-    auto const stOp = (*s)->opcodeByMnemonic("fstur_q");
+    auto const stOp = (*s)->opcodeByMnemonic("fstur");
     ASSERT_TRUE(stOp.has_value());
     // STUR Q3, [X5, #16]: 0x3C800000 | (16<<12)=0x10000 | (5<<5)=0xA0 | 3 = 0x3C8100A3.
     // LE bytes: A3 00 81 3C.
@@ -3344,7 +3438,8 @@ TEST(Arm64Encoder, FsturQDisassemblesRoundTrip) {
     DiagnosticReporter rep;
     auto disasmed = disassembleInst(**s, *stOp, bytes, rep);
     ASSERT_TRUE(disasmed.has_value())
-        << "fstur_q must disassemble — the fixed32_disasm Imm9/MemBaseNoScale window";
+        << "the Q-form store must disassemble — the fixed32_disasm "
+           "Imm9/MemBaseNoScale window";
     EXPECT_EQ(rep.errorCount(), 0u);
     // result slot: none (a store). Wires: rd(Rt=3), rn(Rn=5), membase(no bits), imm9(16).
     ASSERT_FALSE(disasmed->result.has_value());
@@ -3849,16 +3944,27 @@ TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
     // through the FULL real pipeline under aapcs64, down to arm64
     // machine code with ZERO diagnostics. Beyond the FADD/FCVTZS
     // presence, this pins the three declaration-driven consumers:
-    //   * the AAPCS64 d-register ARG PATH: the two `arg` ops
-    //     materialize as FMOV copies READING d0 and d1 (cc.argFprs)
-    //     — asserted via the FMOV words' Rn fields;
+    //   * the AAPCS64 FP ARG PATH: the two `arg` ops materialize as
+    //     FMOV copies READING SIMD&FP register NUMBERS 0 and 1
+    //     (cc.argFprs) — asserted via the FMOV words' Rn fields;
     //   * the fpr `move` row (those copies ARE fmov, not the GPR
     //     ORR-alias mov against a D hwEncoding);
-    //   * the fpr `store`/`load` rows: AAPCS64 declares d8-d15
-    //     callee-saved, and the FAdd result MUST SURVIVE A CALL, so
-    //     it cannot live in a caller-saved d-reg — the prologue must
-    //     FSTUR-spill a d8-d15 and the epilogue FLDUR-reload it (the
-    //     exact shape that surfaced movsd_store on ms_x64).
+    //   * the fpr `store`/`load` rows: AAPCS64 declares SIMD&FP
+    //     registers 8-15 callee-saved, and the FAdd result MUST
+    //     SURVIVE A CALL, so it cannot live in a caller-saved one —
+    //     the prologue must FSTUR-spill one and the epilogue
+    //     FLDUR-reload it (the exact shape that surfaced
+    //     movsd_store on ms_x64).
+    //
+    // ⚠ THE ASSERTIONS READ REGISTER NUMBERS, AND THE CC NAMES THE
+    // FULL REGISTERS. These clauses used to say `d0`/`d1` and
+    // `d8-d15` because `cc.argFprs`/`cc.calleeSaved` literally named
+    // the `d` rows; since R1 of design A′ they name `v0`/`v1` and
+    // `v8..v15`. Nothing here moved, because `d_k` is a declared
+    // `subOf` view of `v_k` sharing its hwEncoding and the D-form
+    // encodings below address that shared number. The instructions
+    // are still the D forms — this function's values are 64-bit
+    // `double`s and the WIDTH is the instruction's to state.
     //
     // ★★★ THE CALL REPLACED AN ALLOCATOR ACCIDENT (plan 22 OPT8,
     // 2026-08-26). This fixture had no call and leaned on the
@@ -3915,8 +4021,10 @@ TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
     EXPECT_TRUE(containsWordMasked(ws, kFcvtzsMask, kFcvtzsBase))
         << "encoded function must contain FCVTZS Xd, Dn";
 
-    // The AAPCS64 d-register arg path: the incoming doubles arrive in d0 and
-    // d1 and must be CONSUMED from there. Two encodings satisfy that, and the
+    // The AAPCS64 FP arg path: the incoming doubles arrive in SIMD&FP
+    // registers 0 and 1 — `cc.argFprs` names them `v0`/`v1`, and a 64-bit
+    // access to those numbers is spelled `d0`/`d1` — and must be CONSUMED from
+    // there. Two encodings satisfy that, and the
     // test admits both:
     //   * an FMOV copying the argument out (Rn at bits 5..9) — what the
     //     calling-convention materializer emits when the allocator homed the
@@ -3950,13 +4058,18 @@ TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
         << "aapcs64 arg 1 must be consumed from d1 — either an FMOV copies it "
            "out or the FADD reads it in place";
 
-    // Callee-saved d-reg discipline (d8-d15 + callee-saved-first
+    // Callee-saved SIMD&FP discipline (registers 8-15 + callee-saved-first
     // regalloc): the prologue spills via FSTUR, the epilogue reloads
     // via FLDUR — the fpr store/load rows' first in-pipeline consumer.
+    // ⓘ The masked words below are the D forms (0xFC00_0000 / 0xFC40_0000),
+    // i.e. `fstur`/`fldur` at their width-DEFAULT of 64, which is right for a
+    // `double`. The Q forms are the SAME rows at width 128 since R2 of design
+    // A′, so a spill that came out 128 bits wide would NOT match these masks —
+    // which is what keeps this pin from accepting a wider access.
     EXPECT_TRUE(containsWordMasked(ws, kFpMemMask, kFsturBase))
-        << "prologue must spill the callee-saved d-reg via STUR(D)";
+        << "prologue must spill the callee-saved SIMD&FP register via STUR(D)";
     EXPECT_TRUE(containsWordMasked(ws, kFpMemMask, kFldurBase))
-        << "epilogue must reload the callee-saved d-reg via LDUR(D)";
+        << "epilogue must reload the callee-saved SIMD&FP register via LDUR(D)";
 }
 
 TEST(Arm64Fpr, FullPipelineDoublePlusRodataConstEncodesLeaFldurFadd) {
@@ -4200,4 +4313,237 @@ TEST(Arm64EncoderRedOnDisable,
         EXPECT_NE(*word, 0xD29FFEE0u)
             << "the masked complement must NEVER be emitted";
     }
+}
+
+// ── D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM ─────────────
+//
+// The SIMD&FP SCALED unsigned-offset LDR/STR (`fldr_u` / `fstr_u`) — the
+// long-reach twins of `fldur`/`fstur`, and the forms that were MISSING when
+// the SIMD&FP file was declared once, every frame slot got a 16-byte stride,
+// and the FP slots ran past the unscaled ±256 reach with nothing to swap to.
+//
+// ★★ EVERY WORD BELOW WAS ✔MEASURED AGAINST TWO INDEPENDENT REFERENCES that
+// agree byte-for-byte — `aarch64-linux-gnu-as` 13.3.0 and `clang 18.1.3
+// --target=aarch64-linux-gnu`.
+//
+// ★★★ THE THREE WIDTHS AT ONE BYTE OFFSET ARE THE POINT OF THE PIN SET. The
+// SAME `[sp, #256]` encodes imm12 = 64 (S), 32 (D) and 16 (Q), because the
+// field is byteOffset/accessSize and the scale comes off the instruction's own
+// width. A constant divisor would pass one of these three and silently encode
+// the wrong displacement for the other two — a frame clobber reachable only on
+// a frame large enough to need this form at all.
+
+namespace {
+[[nodiscard]] LirReg fprOf(TargetSchema const& s, std::string_view name) {
+    return makePhysicalReg(static_cast<std::uint32_t>(*s.registerByName(name)),
+                           LirRegClass::FPR);
+}
+// Assemble ONE SIMD&FP scaled-form instruction and return its bytes.
+// `isStore` selects the operand shape: the STORE is [value, base, membase,
+// memoffset] with no result, the LOAD is [base, membase, memoffset] + result.
+[[nodiscard]] std::vector<std::uint8_t>
+assembleFpScaled(TargetSchema const& s, char const* mnem,
+                 std::string_view dataReg, std::int32_t offset,
+                 std::uint8_t widthFlags, bool isStore,
+                 DiagnosticReporter& rep) {
+    auto const op    = s.opcodeByMnemonic(mnem);
+    auto const retOp = s.opcodeByMnemonic("ret");
+    if (!op.has_value() || !retOp.has_value()) return {};
+    LirBuilder b{s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    if (isStore) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(fprOf(s, dataReg)),
+            LirOperand::makeReg(gpr(s, "sp")),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(offset)
+        };
+        (void)b.addInst(*op, InvalidLirReg, ops, /*payload=*/0, widthFlags);
+    } else {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(gpr(s, "sp")),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(offset)
+        };
+        (void)b.addInst(*op, fprOf(s, dataReg), ops, /*payload=*/0, widthFlags);
+    }
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    return assembleFirstFn(lir, s, rep);
+}
+[[nodiscard]] bool sawImmRangeError(DiagnosticReporter const& rep) {
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) return true;
+    }
+    return false;
+}
+} // namespace
+
+TEST(Arm64Encoder, FpScaledStoreEncodesDFormAt256) {
+    // fstr_u(width 64) d8, [SP, #256] → STR D8, [SP, #256]. Base 0xFD000000;
+    // accessSize 8 ⇒ imm12 = 256/8 = 32 at bits 10..21 → 0x8000; Rn = SP (31)
+    // → 0x3E0; Rt = d8 (8). word = 0xFD0083E8; LE: E8 83 00 FD.
+    // ✔MEASURED: `str d8, [sp, #256]` assembles to fd0083e8 under BOTH
+    // references. This is the EXACT instruction that used to fail loud as
+    // `fstur` — the corpus refusal this row closes.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    DiagnosticReporter rep;
+    // ⓘ Width 64 is flags == 0 — the LIR width axis spells its DEFAULT as the
+    // absence of a flag, which is why the /*width 64*/ comment is here and a
+    // `kLirInstFlagWidth64` constant is not.
+    auto bytes = assembleFpScaled(**s, "fstr_u", "d8", 256,
+                                  /*widthFlags=*/0, /*isStore=*/true, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE8);
+    EXPECT_EQ(bytes[1], 0x83);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0xFD)
+        << "byte[3] must be 0xFD (STR D unsigned-offset) — 0xFC is STUR D "
+           "(imm9), the form that cannot reach 256";
+}
+
+TEST(Arm64Encoder, FpScaledLoadEncodesDFormAt256) {
+    // fldr_u(width 64) d0, [SP, #256] → LDR D0, [SP, #256]. Base 0xFD400000 |
+    // (32<<10) | (31<<5) | 0 = 0xFD4083E0; LE: E0 83 40 FD.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    DiagnosticReporter rep;
+    auto bytes = assembleFpScaled(**s, "fldr_u", "d0", 256,
+                                  /*widthFlags=*/0 /* width 64 */, /*isStore=*/false, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE0);
+    EXPECT_EQ(bytes[1], 0x83);
+    EXPECT_EQ(bytes[2], 0x40);
+    EXPECT_EQ(bytes[3], 0xFD);
+}
+
+TEST(Arm64Encoder, FpScaledLoadScalesByFourAtWidth32) {
+    // fldr_u(width 32) s3, [SP, #256] → LDR S3, [SP, #256]. accessSize 4 ⇒
+    // imm12 = 64 (NOT 32 — a /8 divisor would encode HALF the displacement and
+    // read the wrong slot). 0xBD400000 | (64<<10) | (31<<5) | 3 = 0xBD4103E3;
+    // LE: E3 03 41 BD. ✔MEASURED: `ldr s3,[sp,#256]` = bd4103e3.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    DiagnosticReporter rep;
+    auto bytes = assembleFpScaled(**s, "fldr_u", "s3", 256,
+                                  kLirInstFlagWidth32, /*isStore=*/false, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE3);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x41);
+    EXPECT_EQ(bytes[3], 0xBD)
+        << "byte[3] 0xBD is LDR S unsigned-offset; a /8 scale would have put "
+           "imm12 = 32 here and byte[1] would read 0x83";
+}
+
+TEST(Arm64Encoder, FpScaledStoreScalesBySixteenAtWidth128) {
+    // fstr_u(width 128) v0, [SP, #256] → STR Q0, [SP, #256]. accessSize 16 ⇒
+    // imm12 = 16. 0x3D800000 | (16<<10) | (31<<5) = 0x3D8043E0; LE: E0 43 80 3D.
+    // ✔MEASURED: `str q0,[sp,#256]` = 3d8043e0. The Q form is what the AAPCS64
+    // variadic VR save block needs once the save area sits past the short reach.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    DiagnosticReporter rep;
+    auto bytes = assembleFpScaled(**s, "fstr_u", "v0", 256,
+                                  kLirInstFlagWidth128, /*isStore=*/true, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE0);
+    EXPECT_EQ(bytes[1], 0x43);
+    EXPECT_EQ(bytes[2], 0x80);
+    EXPECT_EQ(bytes[3], 0x3D);
+}
+
+TEST(Arm64Encoder, FpScaledLoadEncodesQFormAt256) {
+    // fldr_u(width 128) v0, [SP, #256] → LDR Q0, [SP, #256].
+    // 0x3DC00000 | (16<<10) | (31<<5) = 0x3DC043E0; LE: E0 43 C0 3D.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    DiagnosticReporter rep;
+    auto bytes = assembleFpScaled(**s, "fldr_u", "v0", 256,
+                                  kLirInstFlagWidth128, /*isStore=*/false, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE0);
+    EXPECT_EQ(bytes[1], 0x43);
+    EXPECT_EQ(bytes[2], 0xC0);
+    EXPECT_EQ(bytes[3], 0x3D);
+}
+
+TEST(Arm64Encoder, FpScaledLoadReachesQFormMaximum) {
+    // The Q form's reach is 4095 × 16 = 65520, EIGHT times the D form's — the
+    // reach is a function of the access size, so a pin at the 8-byte maximum
+    // would say nothing about this one.
+    // 0x3DC00000 | (4095<<10) | (31<<5) = 0x3DFFFFE0; LE: E0 FF FF 3D.
+    // ✔MEASURED: `ldr q0,[x1,#65520]` = 3dfffc20 (Rn=x1); Rn=sp gives the above.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    DiagnosticReporter rep;
+    auto bytes = assembleFpScaled(**s, "fldr_u", "v0", 65520,
+                                  kLirInstFlagWidth128, /*isStore=*/false, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE0);
+    EXPECT_EQ(bytes[1], 0xFF);
+    EXPECT_EQ(bytes[2], 0xFF);
+    EXPECT_EQ(bytes[3], 0x3D);
+}
+
+TEST(Arm64Encoder, FpScaledLoadPastQFormMaximumFailsLoud) {
+    // One access PAST the reach: 65536/16 = 4096 > 4095. Fail loud — the
+    // genuinely-unencodable tail stays a refusal, never a wrapped field.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    DiagnosticReporter rep;
+    (void)assembleFpScaled(**s, "fldr_u", "v0", 65536,
+                           kLirInstFlagWidth128, /*isStore=*/false, rep);
+    EXPECT_TRUE(sawImmRangeError(rep));
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(Arm64Encoder, FpScaledStoreRefusesOffsetUnalignedToTheAccessSize) {
+    // ★ THE ANTI-CONSTANT-DIVISOR ARM. Offset 8 is a perfectly good D-form
+    // displacement and a perfectly good GPR one — and it is UNENCODABLE for
+    // the Q form, whose field is byteOffset/16. If the encoder scaled by a
+    // constant 8 this would encode 1 and write SIXTEEN bytes eight bytes low,
+    // clobbering the neighbouring slot with no diagnostic.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    DiagnosticReporter rep;
+    (void)assembleFpScaled(**s, "fstr_u", "v0", 8,
+                           kLirInstFlagWidth128, /*isStore=*/true, rep);
+    EXPECT_TRUE(sawImmRangeError(rep))
+        << "a Q-form displacement that is not a multiple of 16 has no scaled "
+           "encoding — it must refuse, not round";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(Arm64Encoder, FpScaledFormsAreBoundToTheFprClassLongReachSlots) {
+    // The BINDING, not just the bytes: an opcode that exists but is bound to
+    // no class slot is vocabulary the chokepoint can never select. ANTI-VACUITY
+    // for every pin above — if `registerClassOps` lost the two keys, the bytes
+    // would still assemble and every pin above would still pass.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const& sc = **s;
+    EXPECT_EQ(sc.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::LoadScaled),
+              sc.opcodeByMnemonic("fldr_u"))
+        << "arm64's fpr class must bind `loadScaled` to fldr_u, or the frame "
+           "chokepoint has nothing to swap an out-of-reach FP load for";
+    EXPECT_EQ(sc.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::StoreScaled),
+              sc.opcodeByMnemonic("fstr_u"));
+    // And they are DISTINCT from the short forms and from the integer twins —
+    // a binding that resolved to `fldur` would look declared and change nothing.
+    EXPECT_NE(sc.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::LoadScaled),
+              sc.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::Load));
+    EXPECT_NE(sc.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::LoadScaled),
+              sc.regClassOpOpcode(TargetRegClass::GPR, RegClassOp::LoadScaled));
+    EXPECT_NE(sc.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::StoreScaled),
+              sc.regClassOpOpcode(TargetRegClass::GPR, RegClassOp::StoreScaled));
 }

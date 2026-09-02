@@ -1,0 +1,45 @@
+{
+  "$comment": "D-CSUBSET-C11-THREADS-TIMED (P49 lane th) — the RUNNABLE half of the pe `struct timespec` layout fix, and the only instrument in this project that can see the defect on the machine rather than in the descriptor. THE DEFECT: <time.h> and sys/stat.json both declared `timespec` FLAT {i64 tv_sec, i64 tv_nsec} while being available on pe, where the nanoseconds field is `long` = FOUR bytes. THE TRAP: sizeof is 16 on BOTH worlds and tv_nsec is at offset 8 on BOTH, so neither a size check nor an offset check discriminates — LP64 spends the 16 bytes on two 8-byte fields, LLP64 on 8 + 4 + 4 of trailing pad. THE INSTRUMENT: the struct is poisoned with 0xAB, ONE store is made to tv_nsec, and the tail bytes 12..15 are read back through `unsigned char` — an 8-byte store wipes them, a 4-byte store leaves them. That is a direct observation of the STORE WIDTH, which is the thing that miscompiles; a compile-only pin cannot make the distinction. Bytes 8..11 are a POSITIVE CONTROL asserted on both arms, so `tail kept poison` cannot pass by the store having been elided altogether, and tv_sec gets its own 8-bytes-and-not-9 check so a change that shrank the wrong member is caught too. THE ARM SPLIT is `__LP64__`, the object format's own declaration (D-PP-FORMAT-DATA-MODEL-PREDEFINES) — elf64/macho64 declare it, pe64 deliberately does not — so the #else arm IS the LLP64 world and states the stronger direction. `offsetof` is not used because <stddef.h> does not ship it (D-FFI-OFFSETOF-MACRO); the offsets are taken by pointer arithmetic at run time, which is the stronger measurement anyway. THE EXIT CODE IS 42 ON EVERY TARGET BY CONSTRUCTION, so the status alone cannot tell the worlds apart — the per-target expectedStdout is what does, and no blanket answer satisfies both. ✔MEASURED 2026-09-01 with a compile-only _Static_assert battery (sizeof/offsetof/_Alignof) plus _Generic for the exact C spelling, references probed SEPARATELY and each with a CONTROL arm carrying one deliberately-false assertion that failed to compile on all four: mingw-w64 gcc 13.2.0 (ucrt) and MSVC 19.51.36252 BOTH answer {long long tv_sec @0 (8B), long tv_nsec @8 (4B)}, sizeof 16, _Alignof 8; WSL gcc 13.3.0 and clang 18.1.3 both answer {long tv_sec @0 (8B), long tv_nsec @8 (8B)}, sizeof 16, _Alignof 8. The two pe references do not split on the width. RED-ON-DISABLE: restoring either descriptor's flat {i64,i64} body reddens the pe64 target of this example at RUN time with exit 5 and `FAIL LLP64 tv_nsec stored 8 bytes over a 4-byte field`, while the elf targets stay green — which is what makes this a pe pin and the elf targets its control. The macho targets are the second control: their arm is byte-identical to elf and the row did not touch it.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "timespec nsec=8 tail=cleared\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "expectedStdout": "timespec nsec=4 tail=kept\r\n"
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "timespec nsec=8 tail=cleared\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "timespec nsec=8 tail=cleared\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "timespec nsec=8 tail=cleared\n"
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "timespec nsec=8 tail=cleared\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

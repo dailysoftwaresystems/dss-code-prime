@@ -997,11 +997,20 @@ bool encode(Lir const&                  lir,
                     return false;
                 }
                 // accessSizeBytes from the inst's operation width (max(1,
-                // width/8) — width is 8/16/32/64 here, so this is 1/2/4/8;
-                // the max guards a 0 width defensively). Deriving the scale
-                // from the SAME width axis the variant selector matched on
-                // keeps the scaled encode width-exact (a 32-bit LDR scales
-                // by 4, a 64-bit by 8) with no per-opcode constant.
+                // width/8) — width is 8/16/32/64/128 here, so this is
+                // 1/2/4/8/16; the max guards a 0 width defensively). Deriving
+                // the scale from the SAME width axis the variant selector
+                // matched on keeps the scaled encode width-exact (a 32-bit LDR
+                // scales by 4, a 64-bit by 8, a SIMD&FP Q-form by 16) with no
+                // per-opcode constant.
+                //
+                // ★ THE 128 ARM IS NOT HYPOTHETICAL AND THE DERIVATION IS WHY
+                // IT NEEDED NO CODE HERE
+                // (D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM):
+                // declaring `fldr_u`/`fstr_u`'s Q-form
+                // variants made this handler scale by 16 the first time one was
+                // encoded. A per-opcode constant would have had to be found and
+                // edited; a width axis did not.
                 std::uint32_t const accessSizeBytes =
                     std::max(1u, static_cast<std::uint32_t>(instWidth) / 8u);
                 std::int32_t const disp = srcOp.offset;

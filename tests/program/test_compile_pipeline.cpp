@@ -1971,6 +1971,8 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
     auto mod = lowerMergedToAssembly(*merged, *grammar, **targetR,
                                      (*formatR)->dataModel(),
                                      effectiveBitFieldStrategy(**targetR, **formatR),
+                                     effectiveUnnamedBitFieldAlignment(**targetR,
+                                                                       **formatR),
                                      ccIndex,
                                      cuMirs[0].cuId,
                                      /*externCallDispatch=*/std::nullopt,
@@ -4087,9 +4089,17 @@ TEST(Program_CompileFiles, TFC74InvalidTargetFormatPairDiagnosedWithoutCascade) 
     // pinned separately in the multi-target test below.
     bool named = false;
     for (auto const& d : rep.all()) {
+        // ⚠ THE FIELD NAME MOVED WITH THE ANCHOR, AND THE ASSERTION'S INTENT IS
+        // UNCHANGED. This used to look for "elf.machine" — the per-kind field
+        // the deleted `switch (format.kind())` compared against
+        // `kTargetArchMachineCodes` (D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES).
+        // The pairing is now decided by the format's declared `targetArch`, so
+        // that is the field the diagnostic must name. The property being pinned
+        // — "the message names the target AND the format field that disagree"
+        // — is the same one, aimed at the field that now decides.
         if (d.code == DiagnosticCode::D_TargetMachineCodeMismatch
             && d.actual.find("arm64") != std::string::npos
-            && d.actual.find("elf.machine") != std::string::npos) {
+            && d.actual.find("targetArch") != std::string::npos) {
             named = true;
         }
     }

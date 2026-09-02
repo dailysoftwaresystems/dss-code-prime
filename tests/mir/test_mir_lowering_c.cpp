@@ -1617,6 +1617,107 @@ TEST(MirLoweringC, BareCharSignednessIsResolvedPerTargetAndFormat) {
     }
 }
 
+// D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50): `mapBinaryOp` was the
+// LAST target-blind char-signedness classification in this lowering — its local
+// signed-kind list (I8..I128, `Char` absent) classified a bare-`Char` operand
+// UNSIGNED for Div/Rem/Shr AND the ordered comparisons, opposite the
+// then-hard-coded SIGNED guess in the mir_to_lir widen arms. It now routes
+// through the ONE target-aware `isSignedIntKind` (the TF-C56 chokepoint that
+// `mapCast` already uses), so bare `Char` follows the target's `charIsUnsigned`
+// declaration: SDiv/SMod/AShr/ICmpSlt on a signed-char target, UDiv/UMod/LShr/
+// ICmpUlt on an unsigned-char one.
+//
+// Built via the public `HirBuilder`, NOT by parsing C: the C frontend CANNOT
+// produce this shape — its usual arithmetic conversions promote every binary
+// operand to >=int first (pinned by BareCharToIntPromotionIsTargetSignednessAware
+// above), which is exactly why the site sat unreachable-but-wrong. A raw `Char`
+// binop is what a non-promoting HirBuilder frontend (a language with no
+// `arithmeticConversions` block) would emit.
+//
+// RED-ON-DISABLE: restore mapBinaryOp's former local signed list (drop the
+// `isSignedIntKind` routing) → every signed-char arm below flips to the
+// U-opcodes and this test goes red by name; the I8 control arm stays green
+// (I8 is unconditional in both renditions).
+TEST(MirLoweringC, RawCharBinaryOpSignednessIsTargetKeyed) {
+    struct OpRow {
+        HirOpKind   op;
+        bool        boolResult;   // comparison: the node's type is Bool
+        MirOpcode   signedOp;     // expected when bare char is SIGNED
+        MirOpcode   unsignedOp;   // expected when bare char is UNSIGNED
+        char const* what;
+    };
+    auto lowerRawBinop = [](HirOpKind op, TypeKind operandKind, bool boolResult,
+                            bool charIsUnsigned, DiagnosticReporter& rep) {
+        TypeInterner ti{CompilationUnitId{1}};
+        TypeId const operandTy = ti.primitive(operandKind);
+        TypeId const resTy =
+            boolResult ? ti.primitive(TypeKind::Bool) : operandTy;
+        TypeId const fnTy = ti.fnSig(std::array{operandTy}, resTy, CallConv::CcSysV);
+
+        HirBuilder b{"c"};
+        HirNodeId const param = b.makeVarDecl(operandTy, /*sym=*/1);
+        HirNodeId const bin   = b.makeBinaryOp(
+            op, b.makeRef(operandTy, 1), b.makeRef(operandTy, 1), resTy);
+        HirNodeId const body = b.makeBlock(std::array{b.makeReturn(bin)});
+        HirNodeId const fn =
+            b.makeFunction(fnTy, /*sym=*/7, std::array{param}, body);
+        HirNodeId const root = b.makeModule(std::array{fn});
+        Hir hir = std::move(b).finish(root);
+
+        HirLiteralPool pool;
+        MirLoweringConfig cfg;
+        cfg.charIsUnsigned = charIsUnsigned;
+        return lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr, cfg);
+    };
+
+    for (OpRow const row : {
+             OpRow{HirOpKind::Div, false, MirOpcode::SDiv, MirOpcode::UDiv,
+                   "`c / c` divide"},
+             OpRow{HirOpKind::Rem, false, MirOpcode::SMod, MirOpcode::UMod,
+                   "`c % c` remainder"},
+             OpRow{HirOpKind::Shr, false, MirOpcode::AShr, MirOpcode::LShr,
+                   "`c >> c` right shift"},
+             OpRow{HirOpKind::Lt, true, MirOpcode::ICmpSlt, MirOpcode::ICmpUlt,
+                   "`c < c` ordered compare"},
+         }) {
+        for (bool const charIsUnsigned : {false, true}) {
+            DiagnosticReporter rep;
+            auto result = lowerRawBinop(row.op, TypeKind::Char, row.boolResult,
+                                        charIsUnsigned, rep);
+            ASSERT_TRUE(result.ok)
+                << row.what << ": raw-Char binop must lower clean: "
+                << (rep.all().empty() ? "" : rep.all()[0].actual);
+            Mir const& m = result.mir;
+            MirOpcode const want  = charIsUnsigned ? row.unsignedOp : row.signedOp;
+            MirOpcode const wrong = charIsUnsigned ? row.signedOp   : row.unsignedOp;
+            EXPECT_EQ(collectOps(m, want).size(), 1u)
+                << row.what << ": bare char with charIsUnsigned="
+                << charIsUnsigned
+                << " must take the target-declared signedness opcode";
+            EXPECT_EQ(collectOps(m, wrong).size(), 0u)
+                << row.what << ": the opposite-signedness opcode must NOT be "
+                   "emitted — a target-blind guess is the exact defect this "
+                   "row closed";
+        }
+    }
+
+    // Control: `signed char` (I8) is UNCONDITIONALLY signed — the routing
+    // through `isSignedIntKind` must not disturb any non-Char kind, even
+    // under an unsigned-char target declaration.
+    {
+        DiagnosticReporter rep;
+        auto result = lowerRawBinop(HirOpKind::Div, TypeKind::I8,
+                                    /*boolResult=*/false,
+                                    /*charIsUnsigned=*/true, rep);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(collectOps(result.mir, MirOpcode::SDiv).size(), 1u)
+            << "I8 stays SDiv under charIsUnsigned=true — only bare Char "
+               "consults the target";
+        EXPECT_EQ(collectOps(result.mir, MirOpcode::UDiv).size(), 0u);
+    }
+}
+
 // D-CSUBSET-NEG-INT-TO-PTR-SIGN-EXTEND: an integer→pointer conversion widens the
 // source to POINTER WIDTH per its signedness BEFORE IntToPtr — SExt a signed
 // narrower int, ZExt an unsigned one, and SKIP a source already at pointer width
@@ -3845,16 +3946,23 @@ TEST(MirLoweringCLinkage, StaticNoreturnKeepsInternalLinkage) {
     }
 
     // The name-skip is EXACT — only names in `linkageSpecifierIgnoredNames` skip.
-    // An UNKNOWN attribute co-present with `static` must STILL fail loud
-    // (H_UnknownLinkageSpecifier): `static` must not rescue it and the strict
-    // fail-loud default survives. Extends `UnknownAttributeOnFunctionFailsLoud`
-    // (below) with a co-present `static`. RED-ON-DISABLE: widen the name-skip to a
-    // wholesale attrSpec ignore and `frobnicate` is silently dropped (n==0).
+    // An UNKNOWN attribute co-present with `static` must STILL BE REPORTED
+    // (H_UnknownLinkageSpecifier): `static` must not rescue it into SILENCE.
+    // Extends `UnknownGnuAttributeOnAFunctionIsWarnedNotRefused` (below) with a
+    // co-present `static`. RED-ON-DISABLE: widen the name-skip to a wholesale
+    // attrSpec ignore and `frobnicate` is silently dropped (n==0).
+    // ★ P44 ([[D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY]]): this asserted
+    // `EXPECT_FALSE(L.hir->ok)` — that the program is REFUSED. It is now COMPILED
+    // with a warning, because `topLevelDecl` declares
+    // `unknownStrictAttributeIsError: false` and this tier finally honours that
+    // key. The COUNT assertion below is untouched, and it is the half that
+    // carries the typo protection this test was really written for.
     {
         auto L = lowerC(
             "static __attribute__((frobnicate)) int f(void){ return 0; }\n");
-        EXPECT_FALSE(L.hir->ok)
-            << "an unknown attribute co-present with static must still fail HIR lowering";
+        EXPECT_TRUE(L.hir->ok)
+            << "an unknown GNU attribute name is C23-ignorable vocabulary, not a "
+               "refusal — gcc, clang and mingw-w64 gcc all warn and exit 0 here";
         std::size_t n = 0;
         for (auto const& d : L.hirReporter.all())
             if (d.code == DiagnosticCode::H_UnknownLinkageSpecifier) ++n;
@@ -4074,27 +4182,41 @@ TEST(MirLoweringCThreadLocal, TlsAddressInStaticInitializerFailsLoud) {
 
 // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC (cycle 14): an UNRECOGNIZED
 // specifier inside `__attribute__((...))` — a typo (`bogus`) or an unsupported
-// attribute — FAILS LOUD (H_UnknownLinkageSpecifier), never silently ignored. The
+// attribute — is REPORTED (H_UnknownLinkageSpecifier), never silently ignored. The
 // validation lives in the single `linkageFrom` chokepoint, which `lowerTopLevel`
 // (func + var) AND `lowerExternDecl` all route through — so coverage is
 // by-construction across every decl-lowering arm. RED-ON-DISABLE: drop the emit in
 // `linkageFrom` and `bogus` is silently skipped → both these go green-when-broken.
-TEST(MirLoweringCLinkage, UnknownAttributeOnFunctionFailsLoud) {
+//
+// ★★ P44 ([[D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY]]) — THE SEVERITY MOVED AND
+// THE TEST NAME MOVED WITH IT. This was `UnknownAttributeOnFunctionFailsLoud` and
+// asserted `EXPECT_FALSE(L.hir->ok)`: DSS REFUSED a program that ✔gcc 13.3.0,
+// ✔clang 18.1.3 and ✔mingw-w64 gcc 13.2.0 — probed SEPARATELY — all compile with a
+// warning and exit 0 (`'bogus' attribute directive ignored [-Wattributes]`).
+// `topLevelDecl` already DECLARED that posture
+// (`unknownStrictAttributeIsError: false`); this tier simply was not reading the
+// key, which is the whole of the third-tier asymmetry. A test name that says
+// "FailsLoud" about something that must not fail is a misnamed red waiting to
+// happen, so the name moved too. The COUNT assertion is UNCHANGED — the typo is
+// still reported, it just no longer breaks the build, and `--warnings-as-errors`
+// restores the old verdict for a caller who wants it.
+TEST(MirLoweringCLinkage, UnknownGnuAttributeOnAFunctionIsWarnedNotRefused) {
     auto L = lowerC("__attribute__((bogus)) int f() { return 0; }\n");
-    EXPECT_FALSE(L.hir->ok)
-        << "an unrecognized linkage specifier must fail HIR lowering, not be ignored";
+    EXPECT_TRUE(L.hir->ok)
+        << "an unrecognized GNU attribute name is ignorable vocabulary, not a "
+           "constraint violation — every reference compiles this";
     std::size_t n = 0;
     for (auto const& d : L.hirReporter.all())
         if (d.code == DiagnosticCode::H_UnknownLinkageSpecifier) ++n;
     EXPECT_EQ(n, 1u) << "exactly one H_UnknownLinkageSpecifier for 'bogus'";
 }
 
-// The variable FORM (the other arm through lowerTopLevel) — same fail-loud, proving
+// The variable FORM (the other arm through lowerTopLevel) — same verdict, proving
 // the contract holds for every form that carries a specifier prefix, not just funcs.
-TEST(MirLoweringCLinkage, UnknownAttributeOnVariableFailsLoud) {
+TEST(MirLoweringCLinkage, UnknownGnuAttributeOnAVariableIsWarnedNotRefused) {
     auto L = lowerC("__attribute__((bogus)) int g;\n");
-    EXPECT_FALSE(L.hir->ok)
-        << "an unrecognized linkage specifier on a variable must fail loud";
+    EXPECT_TRUE(L.hir->ok)
+        << "an unrecognized linkage specifier on a variable is warned, not refused";
     std::size_t n = 0;
     for (auto const& d : L.hirReporter.all())
         if (d.code == DiagnosticCode::H_UnknownLinkageSpecifier) ++n;
@@ -12375,17 +12497,45 @@ TEST(MirLoweringC, VlaTypedefObjectAllocaLoadsFrozenSizeNotReLoweredN) {
            "8-byte slot — so `a[i]` / `sizeof a` Load a's own copied slot";
 }
 
-// VLA C4b (D-CSUBSET-VLA) — the DEFERRED shapes STAY fail-loud (I4). Type-dedup makes
-// `vlaArray(int)` a shared TypeId, so a VLA-typedef-WITH-OWN-SUFFIX object looks type-
-// identical to the in-scope `R a;` and MUST be pinned distinct. All three below fail loud
-// (no binary), never a silent miscompile. Red-on-disable: were the `declTy == headTy`
-// origin gate to leak and admit an own-suffix / ptr shape, the C4b copy-down would
-// mis-size (a captured-bound / array-level mismatch).
+// VLA (D-CSUBSET-VLA) — THE COMPOSED VLA-TYPEDEF SHAPES LOWER. These three tests were
+// the C4b DEFERRAL pins ("the DEFERRED shapes STAY fail-loud (I4)") and they are now the
+// CAPABILITY pins for the same three shapes, because ✔MEASURED 2026-09-01 gcc 13.3.0 and
+// clang 18.1.3 — probed SEPARATELY, `-std=c17 -Wall -Wextra`, one self-contained
+// block-scope TU each — COMPILE AND RUN all three and print the expected values, so
+// `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` requires them. (MSVC 19.51.36252 refuses all
+// three, but for having no C99 VLA at all: `error C2057: expected constant expression`
+// on the typedef's own bound. A refusal that lands on the whole feature is not a vote
+// about these shapes.) The distinctness the old I4 pins protected still holds and is
+// still checked: type-dedup makes `vlaArray(int)` a shared TypeId, so each test asserts
+// the SIZES its shape must produce, which a mis-composed spine would get wrong.
+//
+// Each asserts a POSITIVE instruction count on the lowered body before reading anything
+// out of it — a lowering that produced NOTHING would otherwise satisfy every "no error"
+// assertion vacuously.
 
-// (a) Stacked-suffix `typedef int R[5]; R a[n];` — R is FIXED, the object adds a VLA `[n]`:
-// type `int[n][5]` (2 array levels) with only 1 declarator bound captured → the
-// computeVlaByteSize depth-vs-dims guard fires → fail loud.
-TEST(MirLoweringC, VlaTypedefStackedFixedThenVlaSuffixFailsLoud) {
+namespace {
+// The count of instructions across every block of the lowered module's single function.
+// A pin whose subject is an emitted sequence must first establish that a sequence WAS
+// emitted; `mir.ok` alone does not.
+[[nodiscard]] std::uint32_t totalInstCount(Mir const& m) {
+    std::uint32_t total = 0;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        MirFuncId const fn = m.funcAt(f);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b)
+            total += m.blockInstCount(m.funcBlockAt(fn, b));
+    }
+    return total;
+}
+}   // namespace
+
+// (a) Stacked FIXED alias + a VLA object suffix, `typedef int R[5]; R a[n];` — type
+// `int[n][5]`: 2 array levels but only 1 declarator bound. The alias's sub-spine is
+// FULLY FIXED, so it has a COMPILE-TIME size and needs no freeze; `computeVlaByteSize`
+// seeds the fold with that constant instead of failing the depth-vs-dims guard. The
+// object is a plain VLA local from there on — one runtime-operand Alloca.
+// RED-ON-DISABLE: remove the fixed-sub-spine seam in `computeVlaByteSize` and the
+// depth-vs-dims guard fires again, `mir.ok` goes false.
+TEST(MirLoweringC, VlaTypedefStackedFixedThenVlaSuffixLowers) {
     auto L = lowerC(
         "int main(void) {\n"
         "  int n;\n"
@@ -12394,17 +12544,46 @@ TEST(MirLoweringC, VlaTypedefStackedFixedThenVlaSuffixFailsLoud) {
         "  R a[n];\n"
         "  return a[0][0];\n"
         "}\n");
-    EXPECT_FALSE(L.mir.ok)
-        << "a fixed typedef with a VLA object suffix (`typedef int R[5]; R a[n];`) is a "
-           "2-level type with 1 captured bound — must fail loud (deferred), never guess";
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? ""
+                                                : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "a fixed typedef with a VLA object suffix (`typedef int R[5]; R a[n];`) must "
+           "lower — gcc and clang both compile and run it: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    ASSERT_GT(totalInstCount(m), 0u)
+        << "the lowered body must contain instructions — a zero-instruction lowering "
+           "would satisfy every assertion below vacuously";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // Exactly ONE runtime-operand Alloca — the object itself. The alias contributes a
+    // compile-time constant, so no size slot is frozen for it and no Load is needed.
+    int runtimeAllocas = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && !m.instOperands(id).empty())
+            ++runtimeAllocas;
+    }
+    EXPECT_EQ(runtimeAllocas, 1)
+        << "`R a[n];` reserves exactly one runtime-sized slot (the object); the fixed "
+           "`int[5]` row contributes a compile-time constant, never a second one";
 }
 
-// (b) VLA-typedef WITH its own suffix `typedef int R[n]; R a[m];` — R is a VLA, the object
-// adds another VLA `[m]`: type `int[m][n]`, again 2 levels vs 1 captured bound. The
-// `declTy == headTy` origin gate EXCLUDES it (declTy has the extra dim) → normal capture +
-// depth mismatch → fail loud. THE type-dedup distinctness pin (I4): it must NOT slip into
-// the C4b copy-down path just because `vlaArray(int)` dedups with the in-scope `R a;`.
-TEST(MirLoweringC, VlaTypedefWithOwnVlaSuffixFailsLoud) {
+// (b) VLA alias + the object's OWN VLA suffix, `typedef int R[n]; R a[m];` — type
+// `int[m][n]`, 2 levels, 1 captured bound. THE COMPOSITION: the alias's frozen
+// whole-object size (C99 6.7.7p2) is COPIED DOWN into the object's inner-level slot and
+// the object's own `[m]` multiplies it. THE I4 DISTINCTNESS PIN SURVIVES AS A SIZE
+// CHECK: the object's alloca size must be a Mul (its own dimension applied), NOT a bare
+// Load — a bare Load would mean it slipped into the suffix-less `R a;` copy-down and
+// allocated ONE row instead of `m`.
+// RED-ON-DISABLE: revert the semantic origin gate to `declTy == headTy` and this shape
+// loses its origin, falls back to its own capture, and fails the depth-vs-dims guard.
+TEST(MirLoweringC, VlaTypedefWithOwnVlaSuffixComposesOwnDimOverFrozenAlias) {
     auto L = lowerC(
         "int main(void) {\n"
         "  int n; int m;\n"
@@ -12413,15 +12592,61 @@ TEST(MirLoweringC, VlaTypedefWithOwnVlaSuffixFailsLoud) {
         "  R a[m];\n"
         "  return a[0][0];\n"
         "}\n");
-    EXPECT_FALSE(L.mir.ok)
-        << "a VLA typedef with its own VLA object suffix (`typedef int R[n]; R a[m];`) must "
-           "STAY fail-loud — NOT take the C4b copy-down path (I4)";
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? ""
+                                                : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "`typedef int R[n]; R a[m];` must lower — gcc and clang both compile and run "
+           "it: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    ASSERT_GT(totalInstCount(m), 0u)
+        << "the lowered body must contain instructions";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // The object's runtime Alloca: the operand-bearing Alloca whose pointee is a
+    // vlaArray. (The alias's own freeze emits only 8-byte fixed size slots.)
+    MirInstId objAlloca{};
+    int objCount = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Alloca) continue;
+        if (m.instOperands(id).empty()) continue;
+        TypeId const t = m.instType(id);
+        if (in.kind(t) != TypeKind::Ptr) continue;
+        auto const po = in.operands(t);
+        if (po.size() == 1u && in.isVlaArray(po[0])) { objAlloca = id; ++objCount; }
+    }
+    ASSERT_EQ(objCount, 1) << "exactly one composed VLA object alloca (ptr<vlaArray>)";
+
+    auto const aOps = m.instOperands(objAlloca);
+    ASSERT_EQ(aOps.size(), 1u);
+    EXPECT_EQ(m.instOpcode(aOps[0]), MirOpcode::Mul)
+        << "`R a[m];`'s alloca size must be `m * <alias's frozen row size>` — a bare "
+           "Load would mean it took the suffix-less `R a;` copy-down and reserved ONE "
+           "row (the I4 type-dedup distinctness this shape must keep)";
+
+    // And the multiplied-in value must itself be a LOAD of the alias's frozen slot —
+    // NOT a fresh Mul, which would mean `n` was re-evaluated at the object (freeze-once
+    // violated, C99 6.7.7p2).
+    auto const mulOps = m.instOperands(aOps[0]);
+    ASSERT_EQ(mulOps.size(), 2u);
+    EXPECT_EQ(m.instOpcode(mulOps[1]), MirOpcode::Load)
+        << "the row size the object multiplies must be a LOAD of the alias's decl-frozen "
+           "slot — re-lowering `n` here would break freeze-once (C99 6.7.7p2)";
 }
 
-// (c) Ptr-to-VLA typedef `typedef int (*P)[n]; P p;` — the pointee is a VLA; the C4a+C4b
-// composition is deferred. `P p`'s declarator carries no array suffix, so captureVlaSize
-// fails loud (H0009) at the HIR tier (hir->ok flips false).
-TEST(MirLoweringC, PtrToVlaTypedefObjectFailsLoud) {
+// (c) Ptr-to-VLA typedef `typedef int (*P)[n]; P p;` — the alias freezes ONE quantity at
+// its own declaration, the POINTEE ROW STRIDE, and the object copies it. `p` itself is
+// an ordinary 8-byte pointer: it must NOT acquire a runtime-operand alloca.
+// RED-ON-DISABLE: drop the Ptr arm from the MIR TypeDecl freeze and `P p;` finds no
+// frozen slot → the "origin froze no whole-object size slot" fail-loud.
+TEST(MirLoweringC, PtrToVlaTypedefObjectCopiesFrozenPointeeStride) {
     auto L = lowerC(
         "int main(void) {\n"
         "  int n;\n"
@@ -12431,9 +12656,45 @@ TEST(MirLoweringC, PtrToVlaTypedefObjectFailsLoud) {
         "  (void)p;\n"
         "  return 0;\n"
         "}\n");
-    EXPECT_FALSE(L.hir->ok)
-        << "a ptr-to-VLA typedef object (`typedef int (*P)[n]; P p;`) is deferred — must "
-           "fail loud (H0009 at HIR), never silently produce a bogus pointer";
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? ""
+                                                : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "a ptr-to-VLA typedef object (`typedef int (*P)[n]; P p;`) must lower — gcc "
+           "and clang both compile and run it: "
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    ASSERT_GT(totalInstCount(m), 0u)
+        << "the lowered body must contain instructions";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // NO runtime-operand Alloca: a pointer is a fixed 8 bytes however variable its
+    // pointee is. A runtime one here would mean `P p;` took the array copy-down path.
+    // And the stride copy-down IS present: a Store whose value is a Load, into an
+    // 8-byte slot.
+    int runtimeAllocas   = 0;
+    bool sawStrideCopy   = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && !m.instOperands(id).empty())
+            ++runtimeAllocas;
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto const ops = m.instOperands(id);
+        if (ops.size() == 2u && m.instOpcode(ops[0]) == MirOpcode::Load
+            && m.instOpcode(ops[1]) == MirOpcode::Alloca
+            && m.instPayload(ops[1]) == 8u) {
+            sawStrideCopy = true;
+        }
+    }
+    EXPECT_EQ(runtimeAllocas, 0)
+        << "`P p;` is a fixed 8-byte pointer — it must never take a runtime-sized slot";
+    EXPECT_TRUE(sawStrideCopy)
+        << "`P p;` must COPY the alias's frozen pointee row stride into its own slot — "
+           "a Load(P's slot) Stored into an 8-byte slot — so `p[i]` steps by it";
 }
 
 // (d) CHAINED VLA typedef `typedef int R[n]; typedef R S;` — S aliases a VLA typedef with
@@ -15114,5 +15375,146 @@ TEST(MirLoweringC, OrdinaryControllingExpressionsAreUntouchedByTheVoidRefusal) {
         EXPECT_NE(d.code, DiagnosticCode::S_TypeMismatch)
             << "an int / pointer controlling expression is scalar and must lower "
                "untouched: " << d.actual;
+    }
+}
+
+// ── D-CSUBSET-POINTER-ARITH-ENUM-INDEX — the `p ± n` index widen ─────────────
+//
+// C23 6.2.5p22 makes an enumerated type an INTEGER type and 6.5.7p2 admits any
+// integer operand beside a pointer, so `p + e` must lower. It did not: the widen
+// to a 64-bit byte offset asks `mapCast`, which is TypeKind-only and whose
+// `isInt` deliberately excludes Enum (and `_BitInt`) because resolving either
+// needs the interner. The fix asks `resolveScalarIntKind` — this file's one
+// owner of "what plain integer does this scalar project onto" — before mapCast.
+//
+// ★★ THE SIGN OF THAT WIDEN IS THE LOAD-BEARING HALF, and it is the reason
+// these pins assert an OPCODE rather than `mir.ok`. C 6.5.7p8 gives the integer
+// operand no usual arithmetic conversion: it keeps its own type and its own
+// sign, so a signed underlying must SExt and an unsigned one must ZExt. Choosing
+// that backwards produces a WRONG ADDRESS with no diagnostic — the silent
+// miscompile class — and `mir.ok` is true in both worlds. The value-level twin
+// runs in `examples/c/pointer_arith_enum_index`, whose exit code separates the
+// two sign choices (192 correct, 104 inverted) without leaving its buffer.
+//
+// RED-ON-DISABLE for all four positive arms: revert the `resolveScalarIntKind`
+// resolution at `combineBinaryOp`'s `p ± n` widen and each stops lowering
+// (H_UnsupportedLoweringForKind), so `ASSERT_TRUE(L.mir.ok)` fires first.
+
+TEST(MirLoweringC, PointerArithSignedUnderlyingEnumIndexSignExtends) {
+    // `signed char` underlying: the enum can hold a NEGATIVE index, so the widen
+    // must SIGN-extend. A ZExt here turns -2 into 0xFFFFFFFE — a huge positive
+    // byte offset — which is the exact failure the I64 widen exists to prevent.
+    auto L = lowerC(
+        "enum SNarrow : signed char { S_BACK = -2 };\n"
+        "int *f(int *p, enum SNarrow e) { return p + e; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "an enum index in `p + e` must lower (C23 6.5.7p2): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 1u)
+        << "a SIGNED-underlying enum index must SIGN-extend to the 64-bit offset";
+    EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 0u)
+        << "a ZExt of a negative enum index is a silent wrong-address miscompile";
+}
+
+TEST(MirLoweringC, PointerArithUnsignedUnderlyingEnumIndexZeroExtends) {
+    // `unsigned char` underlying holding 200: an SExt would read it as -56 and
+    // step BACKWARDS. The polarity twin of the arm above — together they pin that
+    // the sign comes from the UNDERLYING type rather than from a fixed choice.
+    auto L = lowerC(
+        "enum UNarrow : unsigned char { U_FAR = 200 };\n"
+        "char *f(char *p, enum UNarrow e) { return p + e; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 1u)
+        << "an UNSIGNED-underlying enum index must ZERO-extend to the 64-bit offset";
+    EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 0u)
+        << "an SExt of `unsigned char` 200 reads it as -56 — a wrong address";
+}
+
+TEST(MirLoweringC, PointerArithEnumIndexInSubtractionWidensBeforeTheNegate) {
+    // `p - e` negates the index at I64 AFTER the widen. Negating first (or
+    // widening after) would sign-flip a 32-bit value into the high half of the
+    // register. Pins the ordering by pinning that the widen exists at all on the
+    // subtraction arm, which reaches the same site through a different opcode.
+    auto L = lowerC(
+        "enum Step { ST_TWO = 2 };\n"
+        "int *f(int *p, enum Step e) { return p - e; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 1u)
+        << "a default (int) underlying is signed → SExt to the 64-bit offset";
+    ASSERT_EQ(collectOps(m, MirOpcode::Neg).size(), 1u)
+        << "`p - e` must negate the widened index";
+    auto const& interner = L.model.lattice().interner();
+    EXPECT_EQ(interner.kind(m.instType(collectOps(m, MirOpcode::Neg)[0])),
+              TypeKind::I64)
+        << "the negate must run at the WIDENED type, never at the enum's width";
+}
+
+TEST(MirLoweringC, PointerArithNarrowBitIntIndexWidensThroughItsContainer) {
+    // The same site, the same `mapCast` exclusion, a different type: C23 6.2.5
+    // makes `_BitInt(N)` an integer type too, and clang 18.1.3 compiles and runs
+    // `p + b` (✔MEASURED; gcc 13.3.0 has no `_BitInt` at all, so the disjunction
+    // rests on clang). `resolveScalarIntKind` projects a NARROW `_BitInt` onto its
+    // native container, so asking it fixes this arm with no second rule.
+    auto L = lowerC(
+        "int *f(int *p, _BitInt(8) b) { return p + b; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "a narrow `_BitInt` index must widen through its container: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 1u)
+        << "a signed `_BitInt(8)` container is signed → SExt to the 64-bit offset";
+}
+
+TEST(MirLoweringC, PointerArithWideIntegerIndexIsRefusedAsAnAddressNotTruncated) {
+    // THE NEGATIVE ARM, and it guards two distinct failures at once:
+    //   * `resolveScalarIntKind` is FATAL on a wide `_BitInt` — it would abort the
+    //     compiler, turning a clean refusal into a lost process;
+    //   * a wide value reaches this site as an ADDRESS (the request flip), and
+    //     `mapCast(I128, I64)` is a plain Trunc — narrowing an ADDRESS into a byte
+    //     offset. ✔MEASURED before the fix: that Trunc walled one tier down on
+    //     x86_64, so nothing miscompiled, but the wall was incidental and this
+    //     tier is the one that knows the operand is an address.
+    // A polarity note: this must stay a REFUSAL and not become a "refuse every
+    // index" shortcut — the four arms above are what forbid that.
+    auto L = lowerC("int *f(int *p, __int128 w) { return p + w; }\n");
+    ASSERT_FALSE(L.mir.ok) << "a WIDE integer index must NOT be truncated silently";
+    bool named = false;
+    for (auto const& d : L.mirReporter.all()) {
+        if (d.actual.find("WIDE integer index") != std::string::npos
+            && d.actual.find("ADDRESS") != std::string::npos)
+            named = true;
+    }
+    EXPECT_TRUE(named)
+        << "the refusal must say the operand is a wide integer reaching the site "
+           "as an ADDRESS, not repeat the pre-fix 'enum index is deferred' text";
+}
+
+TEST(MirLoweringC, PointerArithNonIntegerIndexRefusalNoLongerNamesTheEnum) {
+    // The message the fix had to rewrite. Its old text said "an enum index is
+    // deferred — D-CSUBSET-POINTER-ARITH-ENUM-INDEX", which after the fix names a
+    // cause that can no longer fire and points a reader at a closed row. Asserting
+    // the ABSENCE of that phrase is what stops it being reinstated by a revert
+    // that keeps the behaviour: a stale diagnostic is the failure mode nothing
+    // else in this suite can see.
+    // ⓘ The positive arms above already prove an enum index LOWERS, so no fixture
+    // here can reach the refusal through an enum any more; this reads the shipped
+    // text directly at its one live call site instead of synthesising a
+    // non-integer index that the HIR tier decays before MIR ever sees it.
+    auto L = lowerC("int *f(int *p, __int128 w) { return p + w; }\n");
+    ASSERT_FALSE(L.mir.ok);
+    for (auto const& d : L.mirReporter.all()) {
+        EXPECT_EQ(d.actual.find("an enum index is deferred"), std::string::npos)
+            << "an enum index is SUPPORTED — no refusal may still call it deferred";
     }
 }

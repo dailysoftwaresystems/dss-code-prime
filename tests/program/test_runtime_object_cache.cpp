@@ -1052,7 +1052,7 @@ TEST(RuntimeObjectCacheStore, LookupMissesBeforeStoreAndHitsAfter) {
     EXPECT_FALSE(lookupExpectingNoRefusal(*key).has_value())
         << "a cold cache reported a hit.";
 
-    auto const stored = storeRuntimeObject(*key, kBytesA);
+    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
     ASSERT_TRUE(stored.has_value()) << stored.error();
     EXPECT_EQ(stored->generic_string(), key->userArtifactPath.generic_string());
 
@@ -1086,11 +1086,11 @@ TEST(RuntimeObjectCacheStore, StoringTheSameKeyTwiceSucceedsAndLeavesOneFile) {
     auto const key = computeRuntimeObjectKey(makeRequest(scratch.path()));
     ASSERT_TRUE(key.has_value()) << key.error();
 
-    auto const first = storeRuntimeObject(*key, kBytesA);
+    auto const first = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
     ASSERT_TRUE(first.has_value()) << first.error();
 
     // "Already exists" is SUCCESS, not a conflict: same key ⇒ same bytes.
-    auto const second = storeRuntimeObject(*key, kBytesA);
+    auto const second = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
     ASSERT_TRUE(second.has_value())
         << "re-storing an identical key reported a conflict: " << second.error();
     EXPECT_EQ(second->generic_string(), key->userArtifactPath.generic_string());
@@ -1117,8 +1117,8 @@ TEST(RuntimeObjectCacheStore, StoreUnderADifferentKeyLeavesTheFirstArtifact) {
     ASSERT_NE(debugKey->userArtifactPath.generic_string(),
               releaseKey->userArtifactPath.generic_string());
 
-    ASSERT_TRUE(storeRuntimeObject(*debugKey, kBytesA).has_value());
-    ASSERT_TRUE(storeRuntimeObject(*releaseKey, kBytesB).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*debugKey, kBytesA, CacheEviction::PruneSuperseded).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*releaseKey, kBytesB, CacheEviction::PruneSuperseded).has_value());
 
     EXPECT_TRUE(fs::is_regular_file(debugKey->userArtifactPath))
         << "storing a second key destroyed the first artifact.";
@@ -1142,7 +1142,7 @@ TEST(RuntimeObjectCacheStore, StoringASupersedingKeyPrunesTheStaleSibling) {
 
     auto const staleKey = computeRuntimeObjectKey(makeRequest(scratch.path()));
     ASSERT_TRUE(staleKey.has_value()) << staleKey.error();
-    ASSERT_TRUE(storeRuntimeObject(*staleKey, kBytesA).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*staleKey, kBytesA, CacheEviction::PruneSuperseded).has_value());
     ASSERT_TRUE(fs::is_regular_file(staleKey->userArtifactPath));
 
     ASSERT_NO_FATAL_FAILURE(
@@ -1159,7 +1159,7 @@ TEST(RuntimeObjectCacheStore, StoringASupersedingKeyPrunesTheStaleSibling) {
         runtimeKeyDocumentPath(staleKey->userArtifactPath);
     ASSERT_TRUE(fs::is_regular_file(staleDocument));
 
-    ASSERT_TRUE(storeRuntimeObject(*freshKey, kBytesB).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*freshKey, kBytesB, CacheEviction::PruneSuperseded).has_value());
 
     EXPECT_TRUE(fs::is_regular_file(freshKey->userArtifactPath));
     EXPECT_FALSE(fs::exists(staleKey->userArtifactPath))
@@ -1223,7 +1223,7 @@ TEST(RuntimeObjectCacheStore, PruningMatchesExactlyAndLeavesEveryNearMissAlone) 
     fs::path const prunable = directory / ("unit-" + other + ".a");
     ASSERT_NO_FATAL_FAILURE(writeFile(prunable, "superseded\n"));
 
-    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded).has_value());
 
     EXPECT_FALSE(fs::exists(prunable))
         << "nothing was pruned at all, so the near misses below survived for "
@@ -1513,7 +1513,7 @@ TEST(RuntimeObjectCacheReadThrough, StoreLandsOnlyInThePerUserRootAndLeavesTheSh
     fs::path const userDocument =
         runtimeKeyDocumentPath(key->userArtifactPath);
 
-    auto const stored = storeRuntimeObject(*key, kBytesA);
+    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
     ASSERT_TRUE(stored.has_value()) << stored.error();
 
     // It landed in the PER-USER root — BOTH files…
@@ -1561,7 +1561,7 @@ TEST(RuntimeObjectCacheReadThrough, ShippedRootWinsWhenBothRootsHoldTheSameKey) 
     auto const key = computeRuntimeObjectKey(makeRequest(scratch.path()));
     ASSERT_TRUE(key.has_value()) << key.error();
 
-    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded).has_value());
     // The SAME key document in both roots — the artifacts differ only because
     // the fixture is deliberately impossible; the entries are still THIS key's,
     // so neither root may refuse.
@@ -1610,7 +1610,7 @@ TEST(RuntimeObjectCacheStore, UnwritablePerUserRootRefusesAndNamesRootsAndOverri
         << "the override did not resolve, so this case would be exercising the "
            "NO-ROOT arm instead of the UNWRITABLE one.";
 
-    auto const stored = storeRuntimeObject(*key, kBytesA);
+    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
     ASSERT_FALSE(stored.has_value())
         << "an unwritable per-user root was accepted — the miss was compiled "
            "and silently discarded, which is the one outcome this refusal "
@@ -1680,7 +1680,7 @@ TEST(RuntimeObjectCacheStore, NoWritableRootAtAllRefusesAndNamesEveryCandidate) 
     ASSERT_TRUE(fs::remove(runtimeKeyDocumentPath(key->shippedArtifactPath)));
     ASSERT_FALSE(lookupExpectingNoRefusal(*key).has_value());
 
-    auto const stored = storeRuntimeObject(*key, kBytesA);
+    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
     ASSERT_FALSE(stored.has_value())
         << "a store with nowhere to write reported SUCCESS — the artifact was "
            "discarded and every later build would recompile it in silence.";
@@ -1730,7 +1730,7 @@ TEST(RuntimeObjectCacheKeyDocument, AMissingKeyDocumentBesideAnArtifactRefuses) 
 
     auto const key = computeRuntimeObjectKey(makeRequest(scratch.path()));
     ASSERT_TRUE(key.has_value()) << key.error();
-    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded).has_value());
 
     fs::path const document = runtimeKeyDocumentPath(key->userArtifactPath);
     ASSERT_TRUE(fs::is_regular_file(document));
@@ -1798,7 +1798,7 @@ TEST(RuntimeObjectCacheKeyDocument, ACollidingIndexWithADifferentKeyIsNotServed)
     // This is the arm a "treat it as a miss" design cannot get right: a miss
     // returns to a store whose rule is `already exists ⇒ same bytes`, so the
     // foreign artifact would come straight back as a success.
-    auto const stored = storeRuntimeObject(*key, kBytesA);
+    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
     ASSERT_FALSE(stored.has_value())
         << "the store wrote over a DIFFERENT key's entry, or accepted it as "
            "its own: "
@@ -1830,7 +1830,7 @@ TEST(RuntimeObjectCacheKeyDocument, AShippedCollisionRefusesRatherThanFallingThr
     ASSERT_TRUE(other.has_value()) << other.error();
 
     // A PERFECTLY GOOD per-user entry — the copy a fall-through would return.
-    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded).has_value());
     ASSERT_TRUE(lookupExpectingNoRefusal(*key).has_value());
 
     ASSERT_NO_FATAL_FAILURE(layDownEntry(key->shippedArtifactPath,
@@ -1875,7 +1875,7 @@ TEST(RuntimeObjectCacheKeyDocument, AnInterruptedStoreLeavesAKeyDocumentAndNotAn
     EXPECT_FALSE(found->has_value());
 
     // …and the next store completes it.
-    auto const stored = storeRuntimeObject(*key, kBytesA);
+    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
     ASSERT_TRUE(stored.has_value()) << stored.error();
     auto const hit = lookupExpectingNoRefusal(*key);
     ASSERT_TRUE(hit.has_value());
@@ -1909,7 +1909,7 @@ TEST(RuntimeObjectCacheKeyDocument, TheArtifactIsNotWrittenWhenTheKeyDocumentCan
         << "the blocker is the SUBJECT of this case; without it the store "
            "would simply succeed.";
 
-    auto const stored = storeRuntimeObject(*key, kBytesA);
+    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
     ASSERT_FALSE(stored.has_value())
         << "the store reported success though its key document could not be "
            "written: "
@@ -2021,7 +2021,7 @@ TEST(RuntimeObjectCachePathBudget, AnOverlongNameRefusesNamingThePathAndItsLengt
     key.userArtifactPath  = real->userArtifactPath.parent_path()
                          / (longStem + "-" + key.pathDigest + ".a");
 
-    auto const stored = storeRuntimeObject(key, kBytesA);
+    auto const stored = storeRuntimeObject(key, kBytesA, CacheEviction::PruneSuperseded);
     ASSERT_FALSE(stored.has_value())
         << "a 400-character filename component was written; this host does not "
            "enforce the name limit the case assumes: "
@@ -2215,7 +2215,7 @@ TEST(RuntimeObjectCacheStore, TempClaimStepsOverPlantedDanglingCandidates) {
         }
     }
 
-    auto const stored = storeRuntimeObject(*key, kBytesA);
+    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
     ASSERT_TRUE(stored.has_value())
         << "the store refused outright — the loop must STEP OVER occupied "
            "candidate names, not exhaust itself on them: " << stored.error();

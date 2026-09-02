@@ -18,7 +18,7 @@
   "artifactProfile":  "cli",                            // required — one profile (see §3)
   "targets":          ["x86_64:elf64-x86_64-linux-exec"], // required — ≥1 "<targetName>:<formatName>" spec
   "sources":          ["src/**/*.c"],                   // required — ≥1 source path OR glob pattern (§2)
-  "output":           "dist/myprog",                    // optional — see §6 (parsed, not yet routed)
+  "output":           "dist",                           // optional — output-dir BASE (mirrors CLI --output); see §5
   "artifactName":     "myapp",                          // optional — binary base NAME (no ext / path sep); see §5
   "includes":         ["vendor/include"],               // optional — quote-include dirs   (mirrors CLI -I)
   "defines":          ["NDEBUG", "MAX=64"],             // optional — NAME[=VALUE] macros   (mirrors CLI --define)
@@ -28,6 +28,10 @@
   "postBuildScripts": [{ "run": ["./sign.sh"],          // optional — argv hooks run AFTER a SUCCESSFUL build; see §2.5
                          "runOn": ["linux", "darwin"] }],
   "dependsOn":        [{ "path": "../libfoo" }],        // optional — prerequisite projects, RESOLVED and composed in (§2.6)
+  "dependencyArtifactCache": {                          // optional — cross-BUILD dependency artifact cache; see §2.8
+    "enabled": true,                                    //   all three members REQUIRED when the object is present
+    "rootOverrideVariable": "MY_DSS_CACHE_DIR",         //   NAMES the env var that overrides the location
+    "eviction": "prune-superseded" },                   //   or "retain"
 
   "$comment":         "prose — every `$`-prefixed key is documentation (§2.7)"
 }
@@ -46,7 +50,7 @@ delegates to the existing compile path — routing by source **count** (§5).
 | `artifactProfile` | **yes** | non-empty string | The **single** output shape to produce (§3). Singular — the language declares a *set*, the project picks *one*. |
 | `targets` | **yes** | non-empty array of non-empty strings | Each entry is a `"<targetName>:<formatName>"` spec (e.g. `"x86_64:elf64-x86_64-linux-exec"`). One artifact is produced per target. |
 | `sources` | **yes** | non-empty array of non-empty strings | The source files — each entry is a literal path **or a glob pattern** (`D-AP2-SOURCES-GLOB`, see §2.1). In the **root** manifest, relative entries resolve against the process working directory; in a manifest reached through `dependsOn`, against **that manifest's own directory** (§2.6). An absolute entry resolves directly under either. |
-| `output` | no | non-empty string when present | A user output hint. **Parsed + type-validated, but its path routing is not yet wired** (`D-AP2-OUTPUT-ROUTING`) — artifacts currently land at the per-target convention (§5). |
+| `output` | no | non-empty string when present | The output-dir **base** — the `<base>` each target's artifact routes into as `<base>/<formatName>/<artifactName-or-stem><ext>`, i.e. the file-driven form of the CLI `--output <dir>` (§5). Absent ⇒ `--output` when given, else `<cwd>/target`. It is a **directory, never a file path**: `artifactName` owns the emitted binary's *name*, and one fact does not get a second owner. A **relative** value resolves against the **process working directory** — the same base this manifest's `sources[]` and `preBuildScripts` use, so a hook that writes `dist/` and an `"output": "dist"` name the same place. Unlike `artifactName` it is **not** shape-checked at load: separators, `..` segments and an absolute or root-prefixed spelling are all legitimate in a directory, exactly as they are for `--output`. **Precedence: the CLI `--output` wins** (the `stackReserve` rule, §2.4), and when the two name *different* directories the override is announced on the driver note channel (`dsscp: note: …`) rather than silently applied. A **dependency** manifest's `output` is never read (§2.6, the U-9 ruling — the output base is a property of *the build*). |
 | `artifactName` | no | non-empty string when present, **no path separators** | The base **name** for the emitted binary (no extension). Absent ⇒ the source stem (unchanged). A project build routes each target's artifact to `<output-dir>/<formatName>/<artifactName-or-stem><ext>`; the base dir is the `--output` flag (or the default `<cwd>/target`). It is a bare *name*, not a path — a value with `/` or `\` fails loud at load (`C_MalformedJson`), and the router additionally rejects any name that would resolve **outside** the output dir (a `..` component, or a drive/root prefix) with a fail-loud `D_ArtifactNameEscapesOutputDir` (§5), so a bare name can never escape `--output`. The name + per-platform-subdir half of `D-AP2-OUTPUT-ROUTING` (§5, §7). |
 | `includes` | no | array of non-empty strings | Quote-include search dirs (C 6.10.2). The file-driven form of the CLI `-I <dir>` (`Program::setIncludeDirs`). |
 | `defines` | no | array of non-empty strings | `NAME[=VALUE]` preprocessor macros. The file-driven form of the CLI `--define` (`Program::setUserDefines`). |
@@ -55,6 +59,7 @@ delegates to the existing compile path — routing by source **count** (§5).
 | `preBuildScripts` | no | array of `{"run","runOn"}` objects | Commands run **before** the build. `run` is an **argv vector**, spawned directly — never a shell. See §2.5. |
 | `postBuildScripts` | no | array of `{"run","runOn"}` objects | Commands run **after** a build that **succeeded**. Same entry shape as `preBuildScripts`. See §2.5. |
 | `dependsOn` | no | array of `{"path"}` **or** `{"git","ref"?}` objects | Prerequisite projects, **resolved recursively** and folded into this build by the composition verb the *dependency's* `artifactProfile` declares (§3). See §2.6. |
+| `dependencyArtifactCache` | no | object with **all three** of `enabled` (boolean), `rootOverrideVariable` (non-empty string), `eviction` (`"prune-superseded"` \| `"retain"`) | The cross-**build** content-addressed cache for **dependency** artifacts. Read off the **root** manifest only — a dependency's own copy is never read, the same ruling as its `targets[]` (§2.6) and its `output`. Absent ⇒ no cache: nothing is looked up and nothing is written. See §2.8. |
 
 **The three flag arrays mirror the CLI flags and *merge* with them.** Each is **optional** and defaults to
 empty; an **absent** field and a **present-but-empty `[]`** both mean "no entries" (no error). A present value
@@ -565,8 +570,10 @@ unobservable: there is no output to be missing and no diagnostic to be absent.
 <consumer output base>/deps/<derived-dep-name>/<formatName>/<artifact>
 ```
 
-The base is the `--output` directory when given, else the default `<cwd>/target` — the **same** rule
-the consumer's own artifact follows (§5), and ✔MEASURED one function owns it
+The base is the `--output` directory when given, else the ROOT manifest's `output` when it declares
+one, else the default `<cwd>/target` — the **same** rule the consumer's own artifact follows (§5),
+and it stays one rule by construction rather than by agreement: the manifest value is stamped onto
+`Program::setOutputDir`, which is what this base is read from. ✔MEASURED one function owns it
 (`resolveArtifactOutputDir`, `src/program/program.cpp`), so the path a dependency is written to and
 the path the consumer links against cannot be derived twice and drift. The layout is collision-free
 by construction, and it **never writes into the dependency's own tree**, which may be read-only for
@@ -661,6 +668,52 @@ The closed set is **not relaxed** — a non-`$` typo (`"ouput"`) still fails lou
 > The FFI shipped-library descriptor schema (`src/dss-config/shippedLibs/README.md`) remains
 > **stricter**: it permits `$comment` only, and a `$macrosComment`-style key fails loud there.
 
+### 2.8 `dependencyArtifactCache` — the cross-build dependency artifact cache (`D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION`)
+
+Two builds of one project at one configuration rebuild every `dependsOn` prerequisite from scratch,
+because nothing outlives the process. This member declares the policy for a **content-addressed**
+store that lets the second build **serve** a dependency's artifact instead of recompiling it.
+
+```jsonc
+"dependencyArtifactCache": {
+  "enabled": true,
+  "rootOverrideVariable": "MY_DSS_CACHE_DIR",
+  "eviction": "prune-superseded"
+}
+```
+
+- **★ The ROOT manifest only.** A dependency's own copy is **never** read — the same ruling that
+  ignores its `targets[]` (§2.6) and its `output`. Caching is a property of *the build*, and a graph
+  whose nodes each declared a policy would make "is this build cached?" a question with *N* answers
+  and no owner. The root's policy is propagated onto every sub-build alongside the build
+  configuration, the job count and the executor.
+- **★ It caches DEPENDENCY artifacts, not the root's own.** The root build is the thing the operator
+  is running: its artifact is the deliverable they will inspect and its sources are the ones being
+  edited. A prerequisite nobody is editing is the shape a content-addressed cache serves well.
+- **All three members are required when the object is present**, and the degenerate spelling
+  **rejects** rather than aliasing: `{"enabled": false}` alone would mean exactly what *omitting the
+  key* means, said less clearly, and a cache whose location override is unnamed is environment
+  sniffing with an extra step.
+- **`rootOverrideVariable` NAMES an environment variable — the loader never reads one.** Its value,
+  when set and non-empty, wins outright over every per-user platform default
+  (`%LOCALAPPDATA%`, `$XDG_CACHE_HOME`, `$HOME/.cache`) and is taken **verbatim**.
+- **`eviction`** — `"prune-superseded"` keeps one current entry per artifact name in a directory
+  (bounded disk); `"retain"` keeps every entry, which is what a branch-switching or bisecting
+  workflow needs, since under pruning two alternating revisions evict each other and both stay cold.
+- **What the key covers.** The **union of every compilation unit's textual input closure**
+  (`CompilationUnit::inputDigest()` — which is why a quote-`#include`d header that appears in **no**
+  `sources[]` still moves the key), the target spec, the object format and its archive-writing
+  sibling, debug/release, the LTO topology, the stack-reserve request, the artifact's base name,
+  every link input by path **and content**, every loaded config document by its loader's own content
+  digest, and the compiler's own build stamp.
+- **Absent ⇒ no cache at all.** Nothing is looked up and nothing is written, so every manifest
+  written before this member existed builds identically.
+- **A cache that cannot verify an entry REFUSES it.** An artifact whose key document is missing,
+  unreadable or different **fails the build** (`D_FileReadFailed`) rather than being quietly
+  recompiled around — that verification is what makes the short path index safe. A key that cannot
+  be *computed*, or a store that cannot *write*, is a different matter: it is an optimization made
+  unavailable, so the build compiles normally and says so on stderr on **every** affected run.
+
 ---
 
 ## 3. Artifact profiles
@@ -752,7 +805,14 @@ is not project-buildable.
   expansion (§2.1) — a 2-match glob routes as two sources, exactly as two literal entries would.
 - **Output path.** A **project build** routes each target's artifact to
   `<base>/<formatName>/<artifactName-or-stem><ext>`:
-  - `<base>` — the `--output` directory when given, else the default `<cwd>/target`.
+  - `<base>` — the `--output` directory when given, else the manifest's `output` when it declares
+    one, else the default `<cwd>/target`. Both doors store the value **verbatim**, so a relative
+    spelling resolves against the process working directory either way. When BOTH are given and they
+    name **different** directories, `--output` wins and the driver announces it — `dsscp: note: the
+    command-line output directory '…' overrides the project manifest's `output` ('…'), which was not
+    used.` — on the operational note channel rather than as a `D_*` diagnostic (it is a statement
+    about the *invocation*, not about the program, so `--warnings-as-errors` must not turn it into a
+    compile error). Two spellings of one directory are not an override and are not announced.
   - `<formatName>/` — the **per-platform subdir**, applied to **every** project build
     (single- *and* multi-target), so a project's artifacts never collide across platforms and
     the on-disk layout is uniform. `<formatName>` already encodes machine + OS.
@@ -764,8 +824,10 @@ is not project-buildable.
   - `<ext>` — from `ObjectFormatKind × objectType` (ELF/Mach-O executable ⇒ no extension; PE
     executable ⇒ `.exe`; relocatable ⇒ `.o`).
 
-  The `output` field does **not** yet redirect `<base>` (`D-AP2-OUTPUT-ROUTING`, §7) — use
-  `--output`.
+  The manifest's `output` redirects `<base>` (`D-AP2-OUTPUT-ROUTING`, §7). It is wired through
+  `Program::setOutputDir` — the *same* seam `--output` lands on — so every reader of the base
+  follows it with no second copy of the rule: the per-target artifact router **and** the dependency
+  graph's output base (§2.6) both move together.
 
   > **The CLI `--compile` path is unchanged.** A non-project compile keeps the legacy layout:
   > single-target is **flat** at `<output>/<stem><ext>` (no `<formatName>/` subdir), and only a
@@ -860,7 +922,7 @@ does not over-promise:
 | Anchor | Gap |
 |---|---|
 | `D-AP2-SOURCES-GLOB` | **Realized** (§2.1). `sources[]` entries with a glob metacharacter (`* ? [`) are expanded against the filesystem in `Program::compileProject` before routing; literals are kept verbatim, zero-match fails loud. |
-| `D-AP2-OUTPUT-ROUTING` | **Partially addressed.** The `artifactName` field (binary base name) **and** the per-platform `<formatName>/` subdir for project builds are now wired (§5). Still deferred: the **`output` field as an output directory** — it is parsed + validated but does not yet redirect the base dir; use `--output` to set it. |
+| `D-AP2-OUTPUT-ROUTING` | **Realized** (§5). All three halves are wired: the `artifactName` field (binary base name), the per-platform `<formatName>/` subdir for project builds, and the `output` field as the output-dir **base** — a directory, cwd-rooted when relative, stamped onto `Program::setOutputDir` so the artifact router and the dependency output base follow one value. The CLI `--output` takes precedence and a real override is announced on the driver note channel. |
 | `D-AP2-TARGET-NAME-DEFAULT-FORMAT` | `targets[]` require the explicit `:<formatName>` half; bare names (`"linux-x86_64"`) with an inferred default format aren't resolved yet. |
 | `D-AP2-COMPILATION-CONTEXT` | the resolved profile is **not** threaded to codegen (entry-symbol / subsystem / extension); deferred until a profile drives a codegen difference its `(target:format)` doesn't already encode (e.g. `gui`). |
 | plan 06 §B (`dependsOn` resolution) | **Realized** (§2.6). The resolver, both composition arms, git acquisition, the `.dss-deps/` cache and its lockfile, `--force-git-cache`, and every `D_Dependency*` code (§6.1) are built; the `D_PlanNotLanded` refusal this row used to describe is gone. |

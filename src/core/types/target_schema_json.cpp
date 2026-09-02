@@ -4,6 +4,7 @@
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table_json.hpp"
+#include "core/types/config_document_parse.hpp"   // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"   // TF-C74: the shared closed-key guard
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/predefined_macro_json.hpp"   // TF-C74: the shared predefine parser
@@ -1169,14 +1170,20 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     std::string digest = crypto::sha256Hex(jsonText);
 
     Collector coll;
-    json doc;
-    try {
-        doc = json::parse(jsonText);
-    } catch (json::parse_error const& e) {
-        coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
-                  std::format("JSON parse error: {}", e.what()));
+    // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`). A raw
+    // `json::parse` here would accept a document whose key is declared twice
+    // and silently keep the LAST declaration —
+    // D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC, whose
+    // measured consequence on THIS family was a different emitted binary at
+    // rc=0 with zero diagnostics.
+    auto parsed = detail::parseConfigDocument(jsonText);
+    if (!parsed) {
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  parsed.error().locus(sourceLabel),
+                  parsed.error().detailText("JSON parse error: "));
         return std::unexpected(std::move(coll).release());
     }
+    json doc = std::move(*parsed);
     if (!doc.is_object()) {
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   "top-level value must be a JSON object");
@@ -3098,8 +3105,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     }
 
     // ── registerClassOps (FC2 Part B — optional) ───────────────────
-    // Per-register-class move/load/store mnemonic table. A class with
-    // no row resolves to the universal defaults iff it is GPR (see
+    // The register-data-movement mnemonic table, keyed by the ORDERED PAIR
+    // (`class` → `to`; `to` omitted means the diagonal — see
+    // `TargetRegisterClassOps` and D-TARGET-NO-CROSS-CLASS-MOVE-VERB). A pair
+    // with no row resolves to the universal defaults iff it is GPR→GPR (see
     // TargetSchema::regClassOpOpcode); a declared row may omit slots
     // (consumers fail loud on an omitted slot — trigger discipline).
     if (doc.contains("registerClassOps")) {
@@ -3116,59 +3125,86 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               "registerClassOps entry must be an object");
                     continue;
                 }
-                static constexpr std::array<std::string_view, 4> kRegClassOpKeys{
-                    "class", "move", "load", "store"};
+                static constexpr std::array<std::string_view, 7> kRegClassOpKeys{
+                    "class", "to", "move", "load", "store",
+                    "loadScaled", "storeScaled"};
                 DSS_CHECK_KEY_VOCABULARY(kRegClassOpKeys);
                 rejectUnknownKeys(r, kRegClassOpKeys,
                                   std::format("/registerClassOps/{}", i),
                                   "a registerClassOps row", coll);
-                if (!r.contains("class") || !r.at("class").is_string()) {
-                    coll.emit(DiagnosticCode::C_MissingField,
-                              std::format("/registerClassOps/{}/class", i),
-                              "missing or non-string 'class'");
-                    continue;
+                // ★ ONE resolver for BOTH ends of the pair, so the `to` half
+                // inherits every refusal the `class` half already made — the
+                // no-class sentinel, the unknown spelling, and the allowed-list
+                // rendering. A second hand-written copy is how the two ends
+                // would come to disagree about what a class name is.
+                auto readClassField =
+                    [&](char const* field) -> std::optional<TargetRegClass> {
+                    auto const path =
+                        std::format("/registerClassOps/{}/{}", i, field);
+                    if (!r.contains(field) || !r.at(field).is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField, path,
+                                  std::format("missing or non-string '{}'",
+                                              field));
+                        return std::nullopt;
+                    }
+                    auto const c =
+                        targetRegClassFromName(r.at(field).get<std::string>());
+                    if (!c.has_value()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                  std::format("expected {}",
+                                              detail::renderAllowedList(
+                                                  kOperableTargetRegClassNames,
+                                                  " / ")));
+                        return std::nullopt;
+                    }
+                    // The sentinel SPELLS correctly, so the lookup above accepts
+                    // it — the `isSelectableObjectFormatKind` hazard, on this
+                    // vocabulary. A row naming the no-class sentinel would
+                    // declare move/load/store mnemonics for registers that by
+                    // definition do not exist. See `isOperableTargetRegClass`.
+                    if (!isOperableTargetRegClass(*c)) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                  std::format("'{}' is the no-class sentinel, "
+                                              "not a class that owns registers "
+                                              "— a registerClassOps row naming "
+                                              "it could never fire. Expected {}",
+                                              targetRegClassName(*c),
+                                              detail::renderAllowedList(
+                                                  kOperableTargetRegClassNames,
+                                                  " / ")));
+                        return std::nullopt;
+                    }
+                    return c;
+                };
+                auto const cls = readClassField("class");
+                if (!cls.has_value()) continue;
+                // `to` ABSENT IS THE DIAGONAL, and that is what every row
+                // written before this key existed meant. Present, it is
+                // resolved by the same predicate as `class`.
+                std::optional<TargetRegClass> dst = cls;
+                if (r.contains("to")) {
+                    dst = readClassField("to");
+                    if (!dst.has_value()) continue;
                 }
-                auto const cls =
-                    targetRegClassFromName(r.at("class").get<std::string>());
-                if (!cls.has_value()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/registerClassOps/{}/class", i),
-                              std::format("expected {}",
-                                          detail::renderAllowedList(
-                                              kOperableTargetRegClassNames,
-                                              " / ")));
-                    continue;
-                }
-                // The sentinel SPELLS correctly, so the lookup above accepts
-                // it — the `isSelectableObjectFormatKind` hazard, on this
-                // vocabulary. A row for the no-class sentinel would occupy
-                // slot 0 of `registerClassOps` and declare move/load/store
-                // mnemonics for registers that by definition do not exist.
-                // See `isOperableTargetRegClass`.
-                if (!isOperableTargetRegClass(*cls)) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/registerClassOps/{}/class", i),
-                              std::format("'{}' is the no-class sentinel, not a "
-                                          "class that owns registers — a "
-                                          "registerClassOps row under it could "
-                                          "never fire. Expected {}",
-                                          targetRegClassName(*cls),
-                                          detail::renderAllowedList(
-                                              kOperableTargetRegClassNames,
-                                              " / ")));
-                    continue;
-                }
-                auto& row = data.registerClassOps[static_cast<std::size_t>(*cls)];
+                auto& row = data.registerClassOps[static_cast<std::size_t>(*cls)]
+                                                 [static_cast<std::size_t>(*dst)];
                 if (row.declared) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               std::format("/registerClassOps/{}/class", i),
-                              std::format("duplicate registerClassOps row for "
-                                          "class '{}'",
-                                          targetRegClassName(*cls)));
+                              *cls == *dst
+                                  ? std::format("duplicate registerClassOps row "
+                                                "for class '{}'",
+                                                targetRegClassName(*cls))
+                                  : std::format("duplicate registerClassOps row "
+                                                "for the class pair '{}' -> "
+                                                "'{}'",
+                                                targetRegClassName(*cls),
+                                                targetRegClassName(*dst)));
                     continue;
                 }
                 row.declared = true;
-                auto readOp = [&](char const* field, std::string& out) {
+                auto readOp = [&](char const* field, std::string& out,
+                                  bool diagonalOnly) {
                     if (!r.contains(field)) return;
                     if (!r.at(field).is_string()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,
@@ -3176,11 +3212,43 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                   "must be a mnemonic string");
                         return;
                     }
+                    // ⚠ MEMORY IS NOT A REGISTER CLASS. `load`/`store` relate a
+                    // class to memory, so on a CROSS-CLASS row they ask
+                    // nothing — there is no "load from 'gpr' into 'fpr'".
+                    // Refused HERE, where the config is judged, rather than
+                    // stored into a slot `regClassOpOpcode` then has to refuse
+                    // to read: a key that loads clean and can never resolve is
+                    // dead vocabulary that reads like a declaration.
+                    if (diagonalOnly && *cls != *dst) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/registerClassOps/{}/{}", i, field),
+                                  std::format(
+                                      "'{}' is declared on a CROSS-CLASS row "
+                                      "('{}' -> '{}'), where it means nothing: "
+                                      "'{}' relates a register class to MEMORY, "
+                                      "and memory is not a register class. Only "
+                                      "'move' is meaningful when 'to' differs "
+                                      "from 'class'; declare '{}' on the "
+                                      "same-class row for '{}'",
+                                      field, targetRegClassName(*cls),
+                                      targetRegClassName(*dst), field, field,
+                                      targetRegClassName(*cls)));
+                        return;
+                    }
                     out = r.at(field).get<std::string>();
                 };
-                readOp("move",  row.move);
-                readOp("load",  row.load);
-                readOp("store", row.store);
+                readOp("move",  row.move,  /*diagonalOnly=*/false);
+                readOp("load",  row.load,  /*diagonalOnly=*/true);
+                readOp("store", row.store, /*diagonalOnly=*/true);
+                // D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM:
+                // the SCALED long-reach twins. Diagonal-only for the identical
+                // reason — they relate a class to MEMORY. Their pairing rules
+                // (a twin needs its short form; both-or-neither when the class
+                // owns both short forms) live in `validate()`, beside the
+                // mnemonic-resolution check they extend, rather than here:
+                // this loop reads keys one at a time and cannot see the row.
+                readOp("loadScaled",  row.loadScaled,  /*diagonalOnly=*/true);
+                readOp("storeScaled", row.storeScaled, /*diagonalOnly=*/true);
             }
         }
     }
@@ -3407,7 +3475,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 static constexpr std::array<std::string_view, 27> kCallConvKeys{
                     "name",
                     "argGprs", "argFprs", "returnGprs", "returnFprs",
-                    "argVrs", "returnVrs", "callerSaved", "calleeSaved",
+                    "callerSaved", "calleeSaved",
+                    // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT:
+                    // how much of a callee-saved register this ABI preserves,
+                    // per register class. Absent ⇒ the whole register.
+                    "calleeSavedPreservedBits",
                     "stackAlignment", "shadowSpaceBytes", "redZoneBytes",
                     "entryStackPointerBias", "callPushBytes",
                     "stackProbePageBytes", "aggregateMaxRegBytes",
@@ -3416,6 +3488,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     "aggregateStackExhaustsRegisters",
                     "stackArgPacking",
                     "linkRegister", "stackPointer", "framePointer",
+                    // D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
+                    // WHEN the frame pointer leaves the allocatable pool. A key
+                    // absent from THIS array is REFUSED AT LOAD, so the
+                    // vocabulary row lands before the descriptors that declare
+                    // it, never after.
+                    "framePointerReservation",
                     "variadicVectorCountReg", "indirectResultRegister",
                     "vaListLayout"};
                 DSS_CHECK_KEY_VOCABULARY(kCallConvKeys);
@@ -3430,16 +3508,160 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     continue;
                 }
                 cc.name = c.at("name").get<std::string>();
+                // D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY:
+                // a `.format.json` selects its platform C ABI by NAMING one of
+                // these rows, and reserves one spelling to mean "this format
+                // has no register-level C calling convention at all". That is
+                // an in-band sentinel inside a name space, which is the exact
+                // hazard `objectFormatKindName`'s "★ THE SENTINEL SPELLS
+                // CORRECTLY" note describes — a sentinel that RESOLVES is worse
+                // than a typo, because it passes every lookup and dies quietly
+                // downstream. Closing it needs BOTH sides: the format loader
+                // refuses an empty convention, and this refuses a row that
+                // would make the reserved spelling ambiguous. Refused at LOAD,
+                // once, rather than defended against at every use.
+                if (cc.name == kCCallingConventionNone) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/callingConventions/{}/name", i),
+                              std::format("'{}' is a RESERVED calling-convention "
+                                          "name — a .format.json spells it to "
+                                          "declare that the format has NO "
+                                          "register-level C calling convention, "
+                                          "so a row carrying it would make that "
+                                          "declaration ambiguous. Rename the row.",
+                                          kCCallingConventionNone));
+                    continue;
+                }
                 readStringArray(c, i, "argGprs",     cc.argGprs);
                 readStringArray(c, i, "argFprs",     cc.argFprs);
                 readStringArray(c, i, "returnGprs",  cc.returnGprs);
                 readStringArray(c, i, "returnFprs",  cc.returnFprs);
-                // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the binary128 VR
-                // arg/return register lists (empty on non-ieee128 targets).
-                readStringArray(c, i, "argVrs",      cc.argVrs);
-                readStringArray(c, i, "returnVrs",   cc.returnVrs);
+                // ⚠ `argVrs`/`returnVrs` ARE RETIRED KEYS, and they are absent
+                // from `kCallConvKeys` on purpose so a target still declaring
+                // one is REFUSED by `rejectUnknownKeys` rather than silently
+                // ignored. They named a second arg/return pool over the same
+                // physical registers `argFprs`/`returnFprs` name — the cc half
+                // of arm64 declaring its SIMD&FP file twice (R1, design A′).
                 readStringArray(c, i, "callerSaved", cc.callerSaved);
                 readStringArray(c, i, "calleeSaved", cc.calleeSaved);
+                // ── calleeSavedPreservedBits (optional, per register class) ──
+                //
+                // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT.
+                // Same row shape as `asmBareOperandWidths` — `[{class, bits}]`
+                // — and the same three refusals: an unknown/inoperable class, a
+                // width the LIR instruction model cannot STATE, and a duplicate
+                // row for one class. The `bits <= the class's own natural
+                // width` cross-check belongs to `validate()`, which sees the
+                // finished register table.
+                //
+                // ⚠ ABSENT IS A DECISION AND IT IS THE **WIDE** ONE. Unlike
+                // `asmBareOperandWidths` (where undeclared means REFUSE), a cc
+                // that says nothing here preserves the WHOLE register: an ABI
+                // that guarantees everything has nothing to declare, and the
+                // failure direction of guessing wide is a slower prologue
+                // rather than a restored-garbage register.
+                if (c.contains("calleeSavedPreservedBits")) {
+                    auto const cspPath =
+                        std::format("/callingConventions/{}/calleeSavedPreservedBits", i);
+                    if (!c.at("calleeSavedPreservedBits").is_array()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, cspPath,
+                                  "'calleeSavedPreservedBits' must be an array "
+                                  "of per-register-class rows");
+                    } else {
+                        auto const& rows = c.at("calleeSavedPreservedBits");
+                        for (std::size_t ri = 0; ri < rows.size(); ++ri) {
+                            auto const& r = rows[ri];
+                            auto const rPath = std::format("{}/{}", cspPath, ri);
+                            if (!r.is_object()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, rPath,
+                                          "a calleeSavedPreservedBits entry "
+                                          "must be an object");
+                                continue;
+                            }
+                            static constexpr std::array<std::string_view, 2>
+                                kPreservedKeys{"class", "bits"};
+                            DSS_CHECK_KEY_VOCABULARY(kPreservedKeys);
+                            rejectUnknownKeys(r, kPreservedKeys, rPath,
+                                              "a calleeSavedPreservedBits row",
+                                              coll);
+                            auto const cls =
+                                parseRegClassField(r, "class",
+                                                   std::format("{}/class", rPath),
+                                                   coll);
+                            if (!cls.has_value()) {
+                                if (!r.contains("class")) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              std::format("{}/class", rPath),
+                                              "missing 'class' — a preserved-"
+                                              "width row must name the register "
+                                              "class whose callee-saved members "
+                                              "it describes");
+                                }
+                                continue;
+                            }
+                            if (!isOperableTargetRegClass(*cls)) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/class", rPath),
+                                          std::format("register class '{}' has "
+                                                      "no registers, so no "
+                                                      "callee-saved member of "
+                                                      "it can be preserved",
+                                                      targetRegClassName(*cls)));
+                                continue;
+                            }
+                            if (!r.contains("bits")
+                                || !r.at("bits").is_number_unsigned()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          std::format("{}/bits", rPath),
+                                          "missing or non-unsigned 'bits' — a "
+                                          "row must say HOW MANY bits of a "
+                                          "callee-saved register of this class "
+                                          "the ABI preserves");
+                                continue;
+                            }
+                            auto const bits = r.at("bits").get<std::uint32_t>();
+                            // ⓘ WHAT THIS READER DOES **NOT** CHECK, AND WHERE
+                            // THAT CHECK LIVES INSTEAD. Whether the declared
+                            // width is one the LIR instruction model can STATE
+                            // is not a `core` question — the closed width set
+                            // is `lir_node.hpp`'s, one tier up — so it is
+                            // refused by name at the emission site
+                            // (`lir_callconv::calleeSavedAccessFlags`). That is
+                            // the same split `vaListLayout.fpSlotBytes` already
+                            // uses: core owns the range, the LIR tier owns
+                            // "can an instruction say this". Zero IS refused
+                            // here, because a callee-save preserving no bits is
+                            // a row with no reading at any tier.
+                            if (bits == 0) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/bits", rPath),
+                                          "a preserved width of 0 says a "
+                                          "callee-saved register keeps none of "
+                                          "itself — drop the row (or the "
+                                          "register from `calleeSaved`) rather "
+                                          "than declaring a save that saves "
+                                          "nothing");
+                                continue;
+                            }
+                            auto const idx = static_cast<std::size_t>(*cls);
+                            // A duplicate row is REFUSED rather than last-wins,
+                            // for the reason `asmBareOperandWidths` states: two
+                            // rows for one class is a document whose author
+                            // believed two things about one register file.
+                            if (cc.calleeSavedPreservedBits[idx].has_value()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/class", rPath),
+                                          std::format("register class '{}' "
+                                                      "already has a preserved "
+                                                      "width on this convention "
+                                                      "— one row per class",
+                                                      targetRegClassName(*cls)));
+                                continue;
+                            }
+                            cc.calleeSavedPreservedBits[idx] = bits;
+                        }
+                    }
+                }
                 std::string const ccPath = std::format("/callingConventions/{}", i);
                 readBoundedInt(c, coll, ccPath, "stackAlignment",   cc.stackAlignment);
                 readBoundedInt(c, coll, ccPath, "shadowSpaceBytes", cc.shadowSpaceBytes);
@@ -3706,6 +3928,41 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                       std::format("{}/framePointer", ccPath),
                                       std::format("frame pointer '{}' is not "
                                                   "in the register table", name));
+                        }
+                    }
+                }
+                // D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
+                // WHEN that register is withheld from the allocator's pool.
+                // OPTIONAL, defaulting to `dynamic-frame-only` — the behavior
+                // every shipped convention had before the key existed — so
+                // adding the vocabulary changes no frame by itself; only a
+                // convention that DECLARES `always` loses the register. An
+                // unknown spelling is a HARD error, the `dataModel` discipline:
+                // a typo silently falling back to `dynamic-frame-only` would
+                // re-open the exact defect the key closes, on the one
+                // convention whose author was trying to close it.
+                if (c.contains("framePointerReservation")) {
+                    if (!c.at("framePointerReservation").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/framePointerReservation", ccPath),
+                                  std::format("must be a string ({})",
+                                              detail::renderAllowedList(
+                                                  allNames(kFramePointerReservationTable),
+                                                  " or ")));
+                    } else {
+                        auto const s =
+                            c.at("framePointerReservation").get<std::string>();
+                        auto const r = framePointerReservationFromName(s);
+                        if (!r.has_value()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/framePointerReservation", ccPath),
+                                      std::format("unknown framePointerReservation "
+                                                  "'{}' — expected one of {}", s,
+                                                  detail::renderAllowedList(
+                                                      allNames(kFramePointerReservationTable),
+                                                      ", ")));
+                        } else {
+                            cc.framePointerReservation = *r;
                         }
                     }
                 }

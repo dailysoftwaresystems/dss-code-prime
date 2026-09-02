@@ -37,22 +37,113 @@ Operator ruling 2026-08-19: *"we must never crash on correct code, even if gcc f
 
 **The test is the DISJUNCTION, not the consensus.** If ANY reference (gcc, clang, MSVC, …) compiles and runs a correct construct, DSS must too. A reference's FAILURE is therefore never evidence against DSS — when DSS accepts what one reference rejects and another accepts, DSS is **right**, and the divergence is a **NON-DSS CONFOUND** to attribute and record. **Never make DSS fail in order to match a failing reference.** This bounds the bidirectional rule: "accepting what no reference accepts is a defect" turns on **NO** — not one. The implementation still owes the full bar (agnostic, config-driven, best-long-term, fail-loud, strictly tested): "it works" is the requirement, not the excuse. ⚠ Probe references **separately** — "the reference" is not one voice, and P14 nearly narrowed a working header chain because only gcc's failure was on file and MSVC's success was not. Full case: `references/the-bar.md` §A.3b.
 
+### ★★★★ THE DISJUNCTION DECIDES **ACCEPTANCE**, NOT **MEANING** — operator ruling 2026-08-28
+
+**The rule above settles whether a construct is ACCEPTED. It does NOT automatically settle what a
+program MEANS when the references disagree about the meaning itself.** ✔The case that produced this,
+measured with each reference probed separately: `#pragma once` — gcc dedups two DIFFERENT files with
+byte-identical contents (**content-keyed**); clang 18.1.3 and MSVC 19.51 do not (**identity-keyed**).
+The unanimous rows (`./h.h`, `sub/../h.h`, symlink, hard link — all DEDUP everywhere) make
+`core::PathIdentity` REQUIRED; the split row decides the KEY.
+
+A mechanical reading of the disjunction picks **gcc, the minority**. ⇒ **THE OPERATOR RULED
+IDENTITY-KEYED**: DSS refuses a program gcc compiles (a vendored/copied header), deliberately.
+
+**The two reasons, because they generalise:**
+1. **Content-keying does not merely accept MORE — it SILENTLY OMITS TEXT** in a constructible case
+   (two byte-identical headers whose meaning differs because a macro was redefined between the
+   `#include`s). "Accept more" is not a virtue when the extra acceptance is bought by DROPPING code,
+   and a silent omission is the class the bar most abhors.
+2. **2 of 3, including the vendor that invented the pragma.** A minority-of-one winning on the
+   disjunction deserves a second look — not a veto, a prompt to state the trade-off.
+
+⇒ **Before invoking the disjunction, ask which question the references are splitting on.**
+Accept-vs-refuse ⇒ the disjunction governs and the accepting reference wins. Disagreement about what
+a valid program MEANS ⇒ **that is an architectural fork: PAUSE and ask.**
+⇒ **Record the refusal cost in the row**, or a later cycle applying the disjunction by reflex will
+"fix" it back. This ruling is exactly that shape.
+
 ## ★★★ PRODUCTION ANCHORS ARE THE PRIORITY, ALWAYS — operator ruling 2026-08-25
 
 > *"the priority is always production anchors. ALWAYS. harness we fix as we need when we face the
 > problem (NEVER LATER)."*
 
-The registry is **two files** since 2026-08-25, split at the operator's instruction (*"the priority
-is real errors, not cosmetics"*):
+The registry is **three files** — two WORKING lists and one ARCHIVE. It split into production and
+harness on 2026-08-25 (*"the priority is real errors, not cosmetics"*), and the archive was carved
+out on 2026-09-01 (*"split what's done from what's to be done. this way we adjust our skills to only
+read what's yet to be done"*):
 
 | file | holds |
 |---|---|
-| `.plans/_deferred-anchor-registry-production.md` | a defect **a user of the compiler could hit** — in the shipped binary, or in the config it reads |
-| `.plans/_deferred-anchor-registry-harness.md` | a defect **only we can hit** — tests, gates, guards, cycle machinery, plans, scripts, carriages, CI |
+| `.plans/_deferred-anchor-registry-production.md` | a **still-open** defect **a user of the compiler could hit** — in the shipped binary, or in the config it reads |
+| `.plans/_deferred-anchor-registry-harness.md` | a **still-open** defect **only we can hit** — tests, gates, guards, cycle machinery, plans, scripts, carriages, CI |
+| `.plans/_deferred-anchor-registry-done.md` | every **CLOSED** row, in two tables that preserve which working list it came from. **Nothing here is work.** |
+
+### ★★★ MOVE ON CLOSE — a closed row does not stay where it was
+
+> *"the `_deferred-anchor-registry-{harness|production}.md` is a list of remaining items, that
+> always delete a done item and put into `_deferred-anchor-registry-done.md` once finished."*
+> — operator, 2026-09-01
+
+- **Closing a row MOVES it.** It is deleted from its working registry and appended to the archive's
+  matching table. Reopening moves it BACK. Neither is an edit in place.
+- **You do not do this by hand.** `scripts/anchors/anchors.py` performs the move as part of writing
+  the row, and `apply-registry-row` delegates to it. Hand-editing the tables is how the two halves
+  drift.
+- **`check-anchor-balance` refuses both directions** (ARM 6's sibling, the partition arm): a CLOSED
+  row left in a working registry, or an OPEN row filed in the archive. The second is the dangerous
+  one — every queue in this project reads the two working registries ONLY, so a live row filed in
+  the archive can never be picked up.
+- ⚠ **The audit trail is NOT deleted, it is RELOCATED.** "Never delete a closed row" still holds;
+  the archive is where it goes.
+- ★ **RESOLUTION reads all three; ORIENTATION reads only the two working ones.** A `D-*` cited in
+  `src/` must resolve wherever its row now lives, so every guard that RESOLVES a citation globs
+  `_deferred-anchor-registry*.md`. Everything that asks *what is left* — `burndown-queue`, Step 1's
+  priority pick, this skill — reads production and harness and stops there.
 
 ⚠ A row's bucket follows the **DEFECT, never the instrument that found it**. `D-CONFIG-*` and
 `D-DIAG-*` are PRODUCTION deliberately: in this architecture a `.lang/.target/.format.json` document
 IS the compiler's behaviour, and a diagnostic IS its output to a user.
+
+### ★★★ THE ROW SHAPE IS SIX CELLS, AND TWO OF THEM ARE DECLARATIONS
+
+    | Anchor | Priority | Status | Trigger | Closing work | Cross-refs |
+
+Operator, 2026-09-01: *"add columns for priority and status ... then the write explicitly writes it
+correctly, this way we always have clean statuses."* `Priority` is `P0`..`P5`; `Status` is a
+three-value controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED`.
+
+- ⚠ **The status cell keeps its glyph, and the glyph is the contract.** A row is CLOSED iff its
+  status cell OPENS with ✅ after stripping `*_ ` — the complement defined, never the variants. A
+  column holding the bare word `CLOSED` would make that test false for every closed row at once.
+- ⚠ **`Priority` is a DECLARATION, not a sieve result.** `burndown-queue` seeds it on a new row and
+  then READS it; its own docstring warns a band is *"a sort key, not a verdict"* because a census
+  built from that keyword sieve reported 103 where the truth was 4. Correct the cell and the
+  correction survives.
+- ⚠ **`check-anchor-balance` ARM 6 refuses a row whose `Status` column contradicts the verdict
+  leading its `Trigger` prose.** Two cells now state the same fact, so they can disagree — silently,
+  because the gate would believe the column while every human reads the prose.
+- ★ **Plan-side §3.1 tables were NOT migrated** and still use the four-cell shape. Both are
+  recognized; only the three registry documents changed.
+
+### The four verbs — `scripts/anchors/`
+
+Each has a `.sh` and a `.ps1` launcher over one implementation (`anchors.py`), so the pair cannot
+drift. Every verb takes `--production` / `--harness` / `--done`.
+
+```
+scripts/anchors/write-anchor.sh  --production D-<AREA>-<NAME> --priority P1 --status open \
+                                 --trigger '...' --closing '...' --cross-refs '...' --apply
+scripts/anchors/set-anchor.sh    D-<AREA>-<NAME> --status closed --closing '...' --apply   # MOVES it
+scripts/anchors/read-anchor.sh   D-<AREA>-<NAME>                    # the full row, field by field
+scripts/anchors/read-anchors.sh  --production --band P0       # name + priority + status only
+scripts/anchors/read-anchors.sh  --lint                       # every row a reader cannot key on
+```
+
+⚠ **Never hand-assemble a row.** The writer takes the FIELDS, so a wrapped anchor id (invisible to
+every grep, and it MINTS a false id), an unescaped `|` (silently adds a column) and a wrong cell
+count are all inexpressible. `set-anchor` is the ordinary way to close a row: it patches only the
+fields you name, preserves the rest byte-for-byte, and performs the move.
 
 **How the ruling binds this loop, clause by clause:**
 
@@ -151,6 +242,12 @@ an inflated OPEN count is indistinguishable from a cycle that is filing instead 
 the operator is reading that number.
 
 ### ⚠ A LANE THAT **EXITS** DISCHARGES NOTHING — operator, 2026-08-27
+### ⚠ AND A LANE THAT **REPORTS** HAS NOT LANDED — *"complete means folded"*, operator 2026-08-28
+
+**Both halves of the same rule, and neither is satisfied by a lane looking finished.** A lane's
+report is a claim about ITS OWN WORKTREE; the project has nothing until the work is FOLDED into the
+main tree and its rows applied. See *A COMPLETED SET OF LANES IS A COMMIT POINT* below for the
+definition and for what to do the moment a lane reports.
 
 > *"if they don't address you must create another lane once they finish using /dss-cycle to
 > address remanescent anchors from current running lanes"*
@@ -285,6 +382,67 @@ expanded only where it appears unquoted in the source text. `leg-tree` normalise
 where both verbs share it. ★ The dangerous half was not the failed `cd`: `restore` returns 0 when
 the directory is missing, so an unexpanded path would have left every host dirty forever while
 every leg reported success.
+
+## ★★★ A COMPLETED SET OF LANES IS A COMMIT POINT — operator ruling 2026-08-28
+
+> *"once a set of 4 lanes are fully done and green, that's a good time to commit + push (and create
+> the PR if not done yet) before the next set of 4 lanes in the loop"*
+> … *"complete means folded"* — operator, clarifying the same day.
+
+## ★★★★ "COMPLETE" MEANS **FOLDED**. A LANE THAT HAS REPORTED IS NOT DONE.
+
+**A lane's report is a claim about ITS OWN WORKTREE. Until its work is folded into the main tree,
+the project has nothing.** A reported-but-unfolded lane is still IN FLIGHT, and every one of these
+is FALSE of it: "the lane is done", "that work has landed", "the set is complete", "we can count
+those rows".
+
+⚠ **THIS IS A DEFINITION, NOT AN EMPHASIS, AND IT BINDS EVERY USE OF THE WORD.** The failure it
+prevents is silent and reads as success: a lane reports a green tree, the orchestrator writes it
+into the ledger as finished, the set is declared complete, and the commit ships WITHOUT it. Nothing
+reddens, because the tests that would have failed are in the worktree that was never folded.
+
+⇒ **On a lane's report, the orchestrator's next action is to FOLD it** — not to summarise it, not to
+queue it, not to dispatch the next lane. Fold, then apply the lane's rows, then re-derive the
+balance. A row held out of the registry reads as `closed 0, opened 0`: no fix at all.
+
+⇒ **A lane that has reported but cannot yet be folded** (a sibling is mid-edit in the same files, a
+gate is running against the tree) **is still in flight and stays counted against the ≤4 cap.** Say
+"reported, not folded" — never "done".
+
+**The unit of shipping is the LANE SET, not the cycle.** When the four (or fewer) lanes in flight
+have all reported **AND BEEN FOLDED**, and the tree is green, that is a landing point: **commit,
+push, and open the PR if one is not open yet — THEN seed the next set.** Under `/loop` this repeats;
+a long loop therefore produces a series of pushed commits on one PR rather than one enormous commit
+at the end.
+
+**The sequence at a set boundary:**
+1. Every lane in the set has reported **AND BEEN FOLDED** — folded is the test, reported is not
+   (see the definition above). Verify by looking at the MAIN tree, never by re-reading the lane's
+   report: `git status` there is the evidence, and a lane's own green figure is evidence about a
+   worktree that may no longer exist. A lane that exited without discharging its rows is not "done"
+   either — spawn its remnant lane first (see the no-follow-ups ruling above).
+2. Apply every lane's ROWS, then re-derive the balance with
+   `check-anchor-balance --base <cycle-start-sha>` and run `check-anchor-registry.sh`. **Both**, for
+   the reason that section gives: a green balance is not evidence that nothing was opened.
+3. The full gate on the FOLDED tree — the leg matrix, not one host.
+4. `.plans/_handoff.md` rewritten in the SAME commit.
+5. Commit `-s`, push (`-u` on the first push of a branch), open the PR if absent.
+6. **Only then** create and seed the next set of worktrees.
+
+⚠ **WHY THIS ORDER, AND NOT "SEED THE NEXT SET WHILE THE GATE RUNS".** A lane worktree is SEEDED
+from the main tree's current state. Seeding before the commit means the next set inherits
+uncommitted work whose provenance is a scratchpad manifest rather than a commit — and if the gate
+then reddens and the tree changes, every seeded lane is measuring a tree that will never exist.
+Seeding from a COMMITTED tree makes "what did this lane start from" answerable by `git`, which is
+the only durable answer.
+
+⚠ **A SET BOUNDARY IS NOT A LICENCE TO STOP MID-LANE.** Do not interrupt lanes that are still
+running to force a boundary. The boundary is where the set *finishes*; the rule sets the CADENCE of
+committing, it does not add a new reason to pause. Work already in flight continues to completion.
+
+⚠ **AND IT DOES NOT WEAKEN THE GATE.** "Green" here means the same four-leg gate every commit
+already owes — this ruling changes HOW OFTEN that gate runs and a commit lands, never what the gate
+consists of. A set that cannot go green does not get committed because a boundary arrived.
 
 ## ★★★ A LANE WORKTREE LIVES INSIDE THE REPO, AT `.worktrees/<short-name>` — operator ruling 2026-08-26
 
@@ -426,7 +584,12 @@ hand-typing every edit or reading every subsystem.
 
 0. **Orient.** Read `.plans/_handoff.md` first — the previous cycle's claim, not ground truth; where
    it disagrees with your own measurements, say so and correct it this cycle. Check `git status`,
-   branch, last commit subject. Read plan-00 §0.1 and skim the anchor registry. Establish a green
+   branch, last commit subject. Read plan-00 §0.1 and skim the anchor registry.
+   ⚠ **ORIENTATION READS THE TWO WORKING REGISTRIES ONLY** — `-production.md` and `-harness.md`
+   hold what is LEFT, and `bash scripts/anchors/read-anchors.sh --production` is the whole list in
+   one screen. **Do not read `_deferred-anchor-registry-done.md` to choose work**: it is the
+   archive, it is by far the largest of the three, and reading it to orient is how a closed row got
+   recommended three times in this project's history. Establish a green
    baseline (`cmake --build build`, then full `ctest`). **A red baseline with no WIP-repair context
    is itself a pause gate** — present it; do not silently "fix it".
 1. **Pick the next priority** from §0.1, top-to-bottom. An explicit argument overrides the auto-pick
@@ -450,6 +613,20 @@ hand-typing every edit or reading every subsystem.
    `references/delegation.md`. Build the best long-term agnostic solution: extend
    config vocabulary, never branch the engine on identity. Any new `D-*` cited in `src/` is
    registered in the same commit.
+   ⚠⚠ **CONTENTION IS PER *FILE*, NOT PER DIRECTORY — AND A DIRECTORY-SHAPED
+   FORBIDDEN LIST COSTS A LANE ITS WHOLE RUN.** ✔MEASURED 2026-08-28 (P44): lane `h` was
+   forbidden `src/core/**`, `src/ffi/**` and `src/program/**` because a sibling owned *some*
+   files beneath them. It needed three specific files, **none of which the sibling touched**,
+   and it stopped rather than edit a forbidden path — correctly, by the rule as written
+   — after a ~27-minute run that produced zero edits. Justifying the grant then took one
+   `grep`. ⇒ **State each lane's owned and forbidden sets as PATHS, and when a lane asks
+   for a file inside a forbidden directory, MEASURE whether any sibling touches that FILE
+   before refusing.** A directory-shaped forbidden list is a GUESS about contention, not a
+   measurement of it — and the guess fails in the expensive direction, because a lane that
+   obeys it looks compliant while doing nothing. ★ The repair is cheap and does not restart
+   the work: grant the file, say why it is safe, and **resume the SAME agent** rather than
+   spawning a fresh one that has to re-derive everything.
+
    ★★ **THE ORCHESTRATOR IS A LANE TOO — ITS OWN EDITS OBEY THE SAME OWNERSHIP.**
    `src/dss-config/**` is a FILE SET like any other, and a config document is an INPUT to
    every lane's build. Editing one while a lane is running does not merely risk a merge
@@ -522,6 +699,17 @@ hand-typing every edit or reading every subsystem.
    next three red-on-disable cycles executed the WRONG SCRIPT with the first lane's arguments.
    Nothing was corrupted only because that harness restored its subject from a `finally` and
    verified the hash. ⇒ Name `scratchpad/<cycle>/<lane>/` in the brief.
+   ★★★ **AND THE BRIEF MUST REQUIRE THE LANE TO *WRITE ITS ROW TO A FILE* THERE, NOT MERELY TO
+   EMIT IT.** ✔MEASURED TWICE in cycle P44: a finished lane's task transcript came back **0 BYTES**,
+   so its row — correct, complete, already written — reached the orchestrator not at all. The
+   second time it was a lane that had emitted the row as a TOOL OUTPUT rather than as prose, which
+   a text-only harvester silently drops. **Both failures look identical from the orchestrator's
+   side: a harvest that simply reports one fewer row, indistinguishable from a lane that produced
+   none.** ⇒ Every brief names an exact path (`…/<lane>/row.md`) and says: write the row there
+   VERBATIM as one physical line, and reply with the path and a byte count. ⚠ The recovery is
+   always to ASK THE LANE TO WRITE IT — **never to retype the row from a report**, because a
+   retyped row can WRAP an anchor id, and a wrapped id does not fail: it goes invisible to every
+   grep and MINTS a false one.
    ★★ **AN ANCHOR ID IS NEVER LINE-WRAPPED, AND THIS CLAUSE IS THE PROOF OF WHY.** The row
    above was cited here for hours WITHOUT EXISTING, and the step-10 audit was the first thing
    to notice — because the id was split across two lines, so neither the registry guard nor a
@@ -680,7 +868,14 @@ hand-typing every edit or reading every subsystem.
    below. **Re-review the fold** if folding changed logic; iterate to a fixed point. Passes that
    keep surfacing logic findings without converging are a pause signal — stop and report, do not grind.
 7. **Fail-loud gate** — the mechanical battery, including the anchor-balance gate.
-8. **Pin every deferral** discovered this cycle.
+8. **Pin every deferral** discovered this cycle — and **CLOSE by MOVING**, never by editing a status
+   in place. `scripts/anchors/set-anchor.sh <ANCHOR> --status closed --closing '...' --apply` rewrites
+   the row and lifts it out of the working registry into `_deferred-anchor-registry-done.md`; a lane
+   handing you a verbatim row FILE goes through `apply-registry-row`, which delegates to the same
+   writer. A NEW row is `write-anchor.sh --production|--harness ... --insert --apply`. ⚠ Never
+   hand-edit a table: `check-anchor-balance`'s partition arm fails the tree for a closed row left
+   behind or an open row filed in the archive, and its ARM 6 fails it for a `Status` column that
+   contradicts its own `Trigger` prose.
 9. **Cross-plan update**, including rewriting `.plans/_handoff.md`, in the same commit as the code.
 10. **Self-audit before lock** — an **independent** subagent runs the `dss-audit` rule-lens and
     guardrails on the complete, gate-passed cycle. On findings, return to step 5 and re-flow through
@@ -688,8 +883,13 @@ hand-typing every edit or reading every subsystem.
 11. **Commit and push.** `.plans/_handoff.md` must be staged in THIS commit — it ships with the work
     it describes, never in a follow-up. Subject `Cycle <id>: <concise summary>`; body lists anchors
     closed/opened plus the test delta; end with the repo's standard Co-Authored-By trailer (currently
-    `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`). Push immediately — it starts CI while
-    context is hot. Stay on the current feature branch.
+    `Co-authored-by: Claude Opus 5 <noreply@anthropic.com>`). ⚠ DO NOT TRUST THAT SPELLING FROM HERE — it said 4.8 until 2026-08-28, when the last six commits actually carried Opus 5 five times. Read the trailer off `git log` before committing; a hardcoded model name in a skill is stale the moment the model changes.. Push immediately — it starts CI while
+    context is hot. Stay on the current feature branch. **Open the PR here if the branch does not
+    have one yet.**
+    ⚠ **THIS STEP IS REACHED ONCE PER COMPLETED LANE SET, NOT ONCE PER CYCLE** — see
+    *A COMPLETED SET OF LANES IS A COMMIT POINT* above. A cycle running several sets of lanes lands
+    several commits on one PR, and **the next set is seeded only AFTER this step**, so every lane
+    can name a COMMIT as the tree it started from.
 12. **Report and end** (contract below). The invocation ends here; under `/loop` the next invocation
     begins the next cycle with fresh context.
 
@@ -932,6 +1132,10 @@ never lowers the bar.
 
 ## Failure modes this skill exists to prevent
 
+- **Calling a lane "done" when it has only REPORTED.** *"Complete means folded"* (operator,
+  2026-08-28). The report describes a worktree; until the fold, the main tree has nothing — and this
+  one ships green, because the tests that would have caught the absence are in the tree that was
+  never folded. Check the MAIN tree, not the report.
 - **Guessing past a decision.** A pending definition, a real fork, an unfired trigger, or a hard stop
   is a pause — not a default, not a pivot to other work.
 - **Inventing a fork to avoid the hard part.** If you cannot state a second defensible design, the

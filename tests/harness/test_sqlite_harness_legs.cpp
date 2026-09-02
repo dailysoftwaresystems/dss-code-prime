@@ -2058,13 +2058,26 @@ TEST_F(HarnessLegs, ACrossKernelLegDoesNotHonourAVerdictMeasuredByThisDriver) {
         // condition was "this leg runs somewhere else", which was the right thing
         // to say only while the probe could not GO there. Printing it now would be
         // a fresh instance of the claim-rot this anchor exists to remove.
+        // ⚠ THE COUNT IS DERIVED, NEVER TYPED.
+        // [D-HARNESS-A-WITHHOLDING-PIN-WAS-COUPLED-TO-THE-CONFOUND-CATALOGUES-SIZE]
+        // What this assertion is ABOUT is that NO row was withheld — `N of N` for
+        // whatever N this leg declares. Spelling N as the literal 7 coupled a
+        // WITHHOLDING claim to the catalogue's SIZE, so earning one more confound
+        // reddened a test that has nothing to say about how many there are. It
+        // fails in the safe direction, which is exactly why it survived: the red
+        // names a kernel-attribution test and the cause is an unrelated `legs.json`
+        // row. Deriving it keeps the real claim — withhold one and `wire` shrinks
+        // while the report reads `(N-1 of N)`, so neither side matches.
+        auto const activeLine = "confound rows ACTIVE ("
+                                + std::to_string(wire.size()) + " of "
+                                + std::to_string(wire.size()) + ")";
         bool namesKernel = false, caveat = false, allActive = false;
         for (auto const& l : leg.at("confoundReport")) {
             auto const t = l.get<std::string>();
             if (t.find("executes in kernel 'wsl-linux'") != std::string::npos)
                 namesKernel = true;
             if (t.find("CAVEAT") != std::string::npos) caveat = true;
-            if (t.find("confound rows ACTIVE (7 of 7)") != std::string::npos)
+            if (t.find(activeLine) != std::string::npos)
                 allActive = true;
         }
         EXPECT_TRUE(namesKernel)
@@ -2073,9 +2086,10 @@ TEST_F(HarnessLegs, ACrossKernelLegDoesNotHonourAVerdictMeasuredByThisDriver) {
         EXPECT_FALSE(caveat)
             << "the measurement came from the right kernel, so a 'NOT APPLIED'"
                " caveat would be false — and it would sit one line above ACTIVE"
-               " (7 of 7), which is exactly the pairing V1 shipped.";
+               " (N of N), which is exactly the pairing V1 shipped.";
         EXPECT_TRUE(allActive)
-            << "the caveat's absence must be TRUE: the rows must be in force.";
+            << "the caveat's absence must be TRUE: the rows must be in force."
+               " Looked for: " << activeLine;
         // AND THE PER-KERNEL RECORD IS AT THE TOP OF THE PLAN, keyed on the kernel.
         ASSERT_TRUE(plan.at("environmentProbes").contains("wsl-linux"))
             << "the plan must file the measurement under the kernel it describes.";

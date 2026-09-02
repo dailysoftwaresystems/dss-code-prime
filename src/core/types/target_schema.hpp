@@ -299,6 +299,13 @@ inline constexpr EnumNameTable<TargetRegClass, 5> kTargetRegClassTable{{{
 // would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
 DSS_CHECK_ENUM_NAME_TABLE(kTargetRegClassTable);
 
+// The number of register classes, DERIVED from the table rather than restated
+// beside it — the `registerClassOps` matrix below is indexed by a PAIR of these
+// ordinals, so an added class must grow that storage, and a second owner for
+// this count is exactly how the two would drift apart.
+inline constexpr std::size_t kTargetRegClassCount =
+    kTargetRegClassTable.rows.size();
+
 [[nodiscard]] constexpr std::string_view targetRegClassName(TargetRegClass c) noexcept {
     return kTargetRegClassTable.name(c);
 }
@@ -414,47 +421,119 @@ struct DSS_EXPORT TargetRegisterInfo {
     std::optional<std::uint16_t> dwarfNumber;
 };
 
-// FC2 Part B (per-register-class operation table): the three universal
+// FC2 Part B (per-register-class operation table): the universal
 // register-data-movement ROLES every lowering pass emits on a value of
 // some register class. Distinct from a mnemonic: a single x86 mnemonic
 // vocabulary covers GPRs ("mov"/"load"/"store") but the FPR class needs
 // DIFFERENT instructions (movaps / movsd) — a GPR mov against an XMM
 // hwEncoding assembles to valid-looking-but-wrong bytes (the silent
 // class-blind miscompile this table kills).
+//
+// ★★★ `LoadScaled`/`StoreScaled` ARE THE SAME ROLE AT A LONGER REACH, AND
+// THEY ARE PER-CLASS FOR THE REASON THE WHOLE TABLE IS
+// (D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM). A machine
+// whose short memory form carries a small displacement usually declares a
+// second form with a longer one — on AArch64 the unscaled `LDUR/STUR
+// [Xn,#simm9]` (±256) beside the scaled unsigned-offset `LDR/STR
+// [Xn,#pimm]` (0..4095×accessSize). WHICH of the two an access takes is a
+// property of the OFFSET VALUE, decided at the frame chokepoint, not of the
+// instruction the lowering asked for — so the long-reach twin has to be
+// reachable FROM the short one, and every class that has a short form has
+// its own long one. Declaring the long form for the integer file alone is
+// what let an FP frame access run past the short reach and fail loud with no
+// form to swap to.
+//
+// ⚠ THESE ARE NOT "the wide form" or "the large-frame form" — they name the
+// SCALED-DISPLACEMENT encoding, whose field is `byteOffset / accessSize`.
+// The scale is the instruction's OWN access width, which is why the encoder
+// derives it from the same width axis the variant guard matched rather than
+// from a per-opcode constant.
 enum class RegClassOp : std::uint8_t {
-    Move  = 0,  // register→register copy within the class
-    Load  = 1,  // register ← [memory]
-    Store = 2,  // [memory] ← register
+    Move        = 0,  // register→register copy within the class
+    Load        = 1,  // register ← [memory], the SHORT-reach form
+    Store       = 2,  // [memory] ← register, the SHORT-reach form
+    LoadScaled  = 3,  // register ← [memory], the SCALED long-reach twin of Load
+    StoreScaled = 4,  // [memory] ← register, the SCALED long-reach twin of Store
 };
-inline constexpr std::size_t kRegClassOpCount = 3;
+inline constexpr std::size_t kRegClassOpCount = 5;
 
 [[nodiscard]] constexpr std::string_view regClassOpName(RegClassOp op) noexcept {
     switch (op) {
-        case RegClassOp::Move:  return "move";
-        case RegClassOp::Load:  return "load";
-        case RegClassOp::Store: return "store";
+        case RegClassOp::Move:        return "move";
+        case RegClassOp::Load:        return "load";
+        case RegClassOp::Store:       return "store";
+        case RegClassOp::LoadScaled:  return "loadScaled";
+        case RegClassOp::StoreScaled: return "storeScaled";
     }
     return "?";
 }
 
-// One register class's declared operation mnemonics (the JSON
-// `registerClassOps[]` row). An EMPTY string means "not declared" —
-// an op consulted on a declared row with an empty slot fails loud at
-// the consumer (e.g. x86_64's fpr declares move+load but NO store
+// The SHORT-reach role a scaled role is the long-reach twin OF, or the role
+// itself when it is not a scaled one. ONE function owns the pairing, because
+// the loader's refusal, the validator's refusal and the chokepoint's lookup
+// all have to agree about which two roles are twins — three hand-written
+// copies of `LoadScaled ↔ Load` is how one of them would come to disagree.
+[[nodiscard]] constexpr RegClassOp unscaledRegClassOp(RegClassOp op) noexcept {
+    switch (op) {
+        case RegClassOp::LoadScaled:  return RegClassOp::Load;
+        case RegClassOp::StoreScaled: return RegClassOp::Store;
+        case RegClassOp::Move:
+        case RegClassOp::Load:
+        case RegClassOp::Store:       break;
+    }
+    return op;
+}
+
+// One `registerClassOps[]` row's declared operation mnemonics. An EMPTY string
+// means "not declared" — an op consulted on a declared row with an empty slot
+// fails loud at the consumer (e.g. x86_64's fpr declares move+load but NO store
 // until a real FPR-store consumer exists — trigger discipline; a
 // silent fallback to the GPR "store" would 8-byte-GPR-write an XMM
 // ordinal).
+//
+// ★★★ A ROW'S SUBJECT IS AN ORDERED **PAIR** OF CLASSES, AND THE SAME-CLASS ROW
+// IS THE DIAGONAL OF THAT PAIR (D-TARGET-NO-CROSS-CLASS-MOVE-VERB). The JSON
+// row's `class` names the SOURCE class and its optional `to` names the
+// DESTINATION; `to` omitted means `to == class`, which is what every row that
+// predates the generalization meant. So `move` answers ONE question —
+// *"how does this machine copy a bit pattern from class A to class B?"* — for
+// every (A,B) including A == B, and it answers it in ONE table.
+//
+// ⚠ WHY ONE TABLE AND NOT TWO, which is the whole ruling: a separate
+// `crossClassMoves` list would give that one question two homes, and a reader
+// asking it would find whichever home their grep reached first. The diagonal
+// and the off-diagonal are the same question about different arguments.
+//
+// ⚠ `load` / `store` ARE DIAGONAL-ONLY, and the loader refuses them off it.
+// They relate a register class to MEMORY, which is not a register class: there
+// is no "load from gpr into fpr". A row with `to != class` may declare `move`
+// and nothing else.
+//
+// ⚠ `loadScaled` / `storeScaled` ARE ALSO DIAGONAL-ONLY, for the same reason,
+// and each may be declared only BESIDE its short-reach twin
+// (D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM). A scaled form
+// is never asked for by name: it is SWAPPED IN for the short form when the
+// offset overruns it, so a class declaring `loadScaled` without `load` has
+// declared a swap target nothing can ever swap to — dead vocabulary that reads
+// like a declaration, refused where the config is judged. And a class that owns
+// BOTH short forms must declare BOTH long ones or NEITHER: half a pair is a
+// frame whose spill reloads encode and whose spill stores fail loud, which
+// looks like a working target until a frame gets big enough.
 struct DSS_EXPORT TargetRegisterClassOps {
     bool        declared = false;  // a JSON row exists for this class
     std::string move;
     std::string load;
     std::string store;
+    std::string loadScaled;
+    std::string storeScaled;
 
     [[nodiscard]] std::string_view nameFor(RegClassOp op) const noexcept {
         switch (op) {
-            case RegClassOp::Move:  return move;
-            case RegClassOp::Load:  return load;
-            case RegClassOp::Store: return store;
+            case RegClassOp::Move:        return move;
+            case RegClassOp::Load:        return load;
+            case RegClassOp::Store:       return store;
+            case RegClassOp::LoadScaled:  return loadScaled;
+            case RegClassOp::StoreScaled: return storeScaled;
         }
         return {};
     }
@@ -575,24 +654,38 @@ struct VaListLayout {
     Field vrOffsField{};              // __vr_offs: NEGATIVE i32 VR cursor (→0)
 
     // Register-save-area geometry. The prologue spills `gpSaveCount` integer arg
-    // regs at `gpSlotBytes` stride, then `fpSaveCount` SSE arg regs at `fpSlotBytes`
-    // stride (the SSE block follows the GPR block). For SysV: 6×8 then 8×16 = 176B.
-    // For AAPCS64 (Aapcs64DualCursor): GR 8×8 then VR 8×16 = 64 + 128 = 192B.
+    // regs at `gpSlotBytes` stride, then `fpSaveCount` FP arg regs at `fpSlotBytes`
+    // stride (the FP block follows the GPR block). For SysV: 6×8 then 8×16 = 176B.
+    // For AAPCS64 (Aapcs64DualCursor): GR 8×8 then FP 8×16 = 64 + 128 = 192B.
+    //
+    // ★ `fpSlotBytes` IS ALSO THE ACCESS WIDTH, not only the stride, and that is
+    // new with R1 of design A′. The FP spill loop turns it into the store's LIR
+    // width flag (`lirInstWidthFlagForBits`), which elects the class store's
+    // 16-byte variant — where it used to name a separate 128-bit mnemonic
+    // through a separate register class. A `fpSlotBytes` the instruction model
+    // cannot state is refused there rather than silently written at some other
+    // width.
     std::uint32_t gpSaveCount = 0;    // integer arg regs spilled (SysV: 6; AAPCS64: 8)
     std::uint32_t gpSlotBytes = 0;    // bytes per integer save slot (SysV/AAPCS64: 8)
-    std::uint32_t fpSaveCount = 0;    // SSE/VR arg regs spilled (SysV/AAPCS64: 8)
-    std::uint32_t fpSlotBytes = 0;    // bytes per SSE/VR save slot (SysV/AAPCS64: 16)
+    std::uint32_t fpSaveCount = 0;    // FP arg regs spilled (SysV/AAPCS64: 8)
+    std::uint32_t fpSlotBytes = 0;    // bytes per FP save slot (SysV/AAPCS64: 16)
     // ── WHICH REGISTERS THE VR BLOCK SAVES IS NOT DECLARED HERE ─────────────
     // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD. It is the CC's OWN
-    // `argVrs` list, and this note exists because the prologue used to read
-    // `argFprs` instead. On AArch64 those name the SIXTY-FOUR-BIT `d0..d7`
-    // views, so a 16-byte `STUR Qt` was emitted naming an 8-byte register;
-    // ✔MEASURED, it produced the right BYTES only because `d0` and `v0` share
-    // hwEncoding 0, which is exactly why nothing caught it. `validate()` now
-    // requires `argVrs` to cover `fpSaveCount` on an `Aapcs64DualCursor`
-    // layout, so the list the prologue reads is the one the ABI names
-    // (AAPCS64 §B saves `q0..q7`, sixteen bytes each) and no inference stands
-    // in for it.
+    // `argFprs` list, and `validate()` requires that list to cover
+    // `fpSaveCount` on an `Aapcs64DualCursor` layout so it cannot come up
+    // short (AAPCS64 §B saves `q0..q7`, sixteen bytes each).
+    //
+    // ⚠ THIS NOTE USED TO NAME `argVrs`, AND THE REASON IT NO LONGER CAN IS
+    // THE POINT RATHER THAN A RENAME. The prologue originally read `argFprs`
+    // when those rows were the SIXTY-FOUR-BIT `d0..d7` views, so a 16-byte
+    // `STUR Qt` was emitted naming an 8-byte register; ✔MEASURED, it produced
+    // the right BYTES only because `d0` and `v0` shared hwEncoding 0, which is
+    // exactly why nothing caught it. The fix at the time was a SECOND list
+    // (`argVrs`) naming the wide view. With arm64's SIMD&FP file declared ONCE
+    // (R1), `argFprs` names the full registers `v0..v7` and the sixteen-byte
+    // access is stated by the store's WIDTH FLAG — so the operand and the
+    // instruction can no longer disagree about how many bytes move, and the
+    // second list has nothing left to say.
 
     // `va_arg` reg-vs-overflow thresholds. gp_offset < gpOffsetLimit ⇒ read from
     // the save area (SysV: 48 = 6×8); fp_offset < fpOffsetLimit ⇒ likewise
@@ -679,6 +772,75 @@ struct StackArgPackingRules {
     StackArgPacking variadic        = StackArgPacking::Slot;
 };
 
+// D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
+// WHEN this calling convention's `framePointer` register is withheld from the
+// register allocator's pool.
+//
+// ★ THIS IS A REGISTER-ROLE FACT, AND THE CONVENTIONS MEASURABLY DISAGREE ABOUT
+// IT. ✔MEASURED 2026-08-28, one high-register-pressure source compiled six ways
+// (-O2/-O3/-Os, each with `-fomit-frame-pointer` EXPLICITLY requested), counting
+// instructions that write or read x29 outside the prologue/epilogue save pair:
+//   * `clang --target=arm64-apple-macos11` — ZERO, at every level, under
+//     maximum pressure, with frame-pointer omission asked for. Apple's platform
+//     ABI reserves x29 UNCONDITIONALLY and clang declines the flag rather than
+//     honoring it.
+//   * `clang --target=aarch64-linux-gnu` — FOUR (`eor x29, x9, x7`,
+//     `mov x0, x29`, `add x9, x29, x0`, `eor x10, x10, x29`) at -O2 and -O3.
+//     On ELF the register really is ordinary once no frame is needed.
+//   * `aarch64-linux-gnu-gcc -fomit-frame-pointer` — ZERO, but by CHOICE, not
+//     by prohibition; it is the same permission clang exercises.
+// ⇒ Under `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` the disjunction PERMITS
+// allocating x29 on AAPCS64/ELF (clang does) and FORBIDS it on Apple ARM64 (no
+// reference will, at any level, however asked). One axis, two answers, and the
+// answer belongs to the CONVENTION — never to an `if (format == MachO)` in the
+// allocator, which is what having no vocabulary for it would have forced.
+//
+// ★ WHY THIS IS NOT [[D-CODEGEN-MACHO-ARM64-X29-ALLOCATED-WITH-NO-FRAME-RECORD]],
+// WHICH IS CLOSED AND STAYS CLOSED. That row asked whether unwinding HAPPENS to
+// work and measured that it does — the tables describe the frame regardless of
+// which register holds what. This one asks whether the register's RESERVED ROLE
+// is respected, and the consumer is every tool that walks frames WITHOUT tables:
+// a sampling profiler, a crash reporter, `lldb` on a stripped image. Those read
+// x29 directly and, today, read garbage.
+enum class FramePointerReservation : std::uint8_t {
+    // The register is withheld ONLY from a function that needs it as a stable
+    // frame base — i.e. one that moves SP at runtime (a VLA / dynamic alloca).
+    // Everywhere else it is an ordinary allocatable callee-saved GPR. This is
+    // the default, so every convention that declares nothing keeps byte-
+    // identical frames.
+    DynamicFrameOnly = 0,
+    // The platform ABI reserves the register unconditionally: it is never
+    // allocatable, in any function, at any optimization level.
+    Always           = 1,
+};
+
+inline constexpr EnumNameTable<FramePointerReservation, 2>
+kFramePointerReservationTable{{{
+    { FramePointerReservation::DynamicFrameOnly, "dynamic-frame-only" },
+    { FramePointerReservation::Always,           "always"             },
+}}};
+
+// Well-formedness of the table itself (no empty spelling, no duplicate spelling,
+// no duplicate enumerator) — an under-filled table is legal C++ and would make
+// "" resolve to `DynamicFrameOnly`, i.e. silently re-open the defect for a
+// convention that declared the reservation.
+DSS_CHECK_ENUM_NAME_TABLE(kFramePointerReservationTable);
+
+[[nodiscard]] constexpr std::string_view
+framePointerReservationName(FramePointerReservation r) noexcept {
+    // The `-Werror=switch` backstop — it owns no spelling.
+    switch (r) {
+        case FramePointerReservation::DynamicFrameOnly:
+        case FramePointerReservation::Always:
+            break;
+    }
+    return kFramePointerReservationTable.nameOrEmpty(r);
+}
+[[nodiscard]] constexpr std::optional<FramePointerReservation>
+framePointerReservationFromName(std::string_view s) noexcept {
+    return kFramePointerReservationTable.fromName(s);
+}
+
 // One calling convention. A target may declare multiple (SysV AMD64,
 // Microsoft x64, fastcall, ...); the front-end picks one via attribute /
 // driver flag. The `argGprs` / `argFprs` ordering is significant — the
@@ -693,20 +855,73 @@ struct DSS_EXPORT TargetCallingConvention {
     std::vector<std::string> argFprs;     // arg-passing floating-point registers, in order
     std::vector<std::string> returnGprs;  // integer-return registers (rax/rdx on SysV; rax on MS)
     std::vector<std::string> returnFprs;  // float-return registers
-    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the 128-bit VR (Q-view)
-    // arg-passing / return registers for an IEEE binary128 `long double`
-    // (AAPCS64 v0..v7 args, v0..v3 return). Parallel to argFprs/returnFprs and
-    // indexed by the SAME per-class (NSRN) ordinal — an F128 arg at NSRN k is
-    // passed in `argVrs[k]` (v{k}), which ALIASES `argFprs[k]` (d{k}), so an
-    // F64 and an F128 sharing a signature never collide by ordinal. EMPTY on
-    // every f64/x87-80 target (x87 long double uses the implicit st0 stack; the
-    // f64 axis never forms an F128), so this stays inert there. Validated
-    // VR-class in `validate()` exactly as argFprs is validated FPR-class; the
-    // MIR→LIR F128 boundary verb resolves each name→ordinal like argFprs.
-    std::vector<std::string> argVrs;      // binary128 arg-passing VR registers, in order
-    std::vector<std::string> returnVrs;   // binary128 VR-return registers
+    // ── `argVrs` / `returnVrs` ARE GONE, AND THEIR DELETION IS THE CC HALF OF
+    //    D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS ───────────────
+    //
+    // They were "the 128-bit VR (Q-view) arg-passing / return registers for an
+    // IEEE binary128 `long double`" — AAPCS64 `v0..v7` / `v0..v3` — declared
+    // ALONGSIDE `argFprs` = `d0..d7`, "indexed by the SAME ordinal" and
+    // aliasing it register for register. That sentence is the double
+    // declaration this whole change removes, wearing its cc clothes: two
+    // POOLS over one physical file, related after the fact by a shared
+    // cursor derived from their DWARF numbers.
+    //
+    // ★ WITH THE FILE DECLARED ONCE there is ONE FP arg pool (`argFprs`,
+    // naming the full registers `v0..v7`) and the 128-bit-ness of a binary128
+    // argument is a property of the VALUE, carried as the LIR instruction's
+    // width flag, which elects the Q-form variant of the class's own
+    // `load`/`store`. arm64 was the ONLY declarer of these two lists on either
+    // shipped target (✔MEASURED: x86_64's `sysv_amd64` and `ms_x64` both left
+    // them empty, because an x87 `long double` uses the implicit st0 stack),
+    // so deleting them removed schema surface rather than adding it.
+    //
+    // ⚠ THE DEFECT THEY WERE ADDED TO FIX IS STILL FIXED, by the mechanism
+    // that always did the work. `D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD`
+    // was a 16-byte `STUR Qt` naming an 8-byte `d0`: an operand claiming half
+    // the width its instruction moves. What made that undetectable was that
+    // `d0` and `v0` were two ROWS; now `v0` is the row and the store's width
+    // flag says 128, so the operand and the instruction cannot disagree.
     std::vector<std::string> callerSaved; // volatile across calls (caller must spill if reused)
     std::vector<std::string> calleeSaved; // non-volatile (callee must restore on return)
+
+    // ── D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT
+    //
+    // HOW MANY BITS OF A `calleeSaved` REGISTER OF EACH CLASS THIS ABI
+    // GUARANTEES PRESERVED across a call. Indexed by `TargetRegClass` ordinal;
+    // `nullopt` for a class means THE WHOLE REGISTER, which is the only
+    // fail-safe default — a prologue that preserves more than the ABI demands
+    // is slow, one that preserves less restores garbage with no diagnostic.
+    //
+    // ★★★ IT EXISTS BECAUSE THE TWO SHIPPED ABIS GENUINELY DISAGREE, AND THE
+    // DISAGREEMENT USED TO LIVE IN A CODE DEFAULT. AAPCS64 §6.1.2 preserves
+    // only the LOW 64 BITS of `v8..v15`; the Win64 x64 ABI preserves `xmm6..
+    // xmm15` IN FULL (its unwind vocabulary spells the save `UWOP_SAVE_XMM128`
+    // — a 16-byte slot — and has no code for a half-register one). Both were
+    // served by ONE hardcoded fallback: `emitFrameStore`'s `widthFlags`
+    // parameter defaulted to 64 for every class on every target, which made
+    // AAPCS64 accidentally right and `ms_x64` silently wrong — an 8-byte
+    // `MOVSD` into the 16-byte slot the frame had already reserved, with no
+    // refusal anywhere because width 64 is a perfectly encodable `movsd`.
+    //
+    // ⚠ IT CONSTRAINS THE **SAVE**, NOT THE ALLOCATOR, AND THE DIFFERENCE IS
+    // THE PART WORTH READING. A class whose registers are wider than the bits
+    // declared here can still be allocated a callee-saved register — DSS's own
+    // prologue then preserves exactly what the ABI publishes, which is what a
+    // FOREIGN callee would preserve too. Placing a value WIDER than this in a
+    // callee-saved register is therefore an allocation question (`v8..v15` may
+    // not carry a 128-bit value across a call under AAPCS64 no matter how wide
+    // DSS's own save is, because the callee may be gcc's). That constraint is
+    // the second half of design A′ R3 and is inert today — `LirVerifier`'s
+    // store rule keeps F80/F128 memory-resident, so no FPR virtual register
+    // holds more than 64 bits. This field is deliberately NOT that constraint,
+    // and must not be read as if it were.
+    //
+    // ⓘ SPILL SLOTS ARE NOT GOVERNED BY THIS. A spill slot is DSS's own
+    // memory with no ABI facing it, so a spill store/reload moves the WHOLE
+    // register (`wholeRegisterAccessFlags`) — see `lir_callconv.hpp`.
+    std::array<std::optional<std::uint32_t>, kTargetRegClassCount>
+        calleeSavedPreservedBits{};
+
     std::uint16_t stackAlignment   = 0;   // alignment of RSP at call site (16 on SysV/MS x64)
     std::uint16_t shadowSpaceBytes = 0;   // MS x64: 32 bytes of home space; SysV: 0
     std::uint16_t redZoneBytes     = 0;   // SysV leaf-fn red zone (128); MS x64: 0
@@ -938,6 +1153,25 @@ struct DSS_EXPORT TargetCallingConvention {
     // rather than silently miscompiling. A NON-VLA function never consults it — its
     // frame stays SP-relative + byte-identical (the zero-blast-radius invariant).
     std::optional<NamedRegisterRef> framePointer;
+
+    // D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
+    // WHEN `framePointer` is withheld from the allocator's pool. See
+    // `FramePointerReservation` above for the measured evidence that the shipped
+    // conventions genuinely disagree about this. The default is
+    // `DynamicFrameOnly` — the pre-existing behavior — so a convention that
+    // declares nothing keeps byte-identical frames, and only a convention that
+    // SAYS its platform reserves the register loses it from the pool.
+    // ⚠ INERT when `framePointer` is empty: there is no register to withhold,
+    // and `TargetSchemaData::validate()` refuses the pairing rather than letting
+    // a declared reservation quietly reserve nothing.
+    // Consumed by `lir_regalloc`'s pool build (which publishes it to
+    // `lir_rewrite`'s scratch pool through `LirFuncAllocation::
+    // reservedFramePointer`). It does NOT make the callconv pass emit a frame
+    // record — capturing a frame base stays the VLA path's job, and this field
+    // deliberately says only "not allocatable", which is the whole claim its
+    // anchor makes.
+    FramePointerReservation framePointerReservation =
+        FramePointerReservation::DynamicFrameOnly;
 
     // D-LANG-VARIADIC (step 13.4, 2026-06-02): the register the caller
     // MUST load with the count of vector (FPR) arguments passed in
@@ -3676,17 +3910,25 @@ struct DSS_EXPORT TargetSchemaData {
     // half a numbering is a table that loads clean and cannot be used.
     std::optional<std::uint16_t> dwarfReturnAddressColumn;
 
-    // FC2 Part B: per-register-class move/load/store mnemonic table
-    // (the JSON `registerClassOps[]` section), indexed by the
-    // TargetRegClass ordinal. A class WITHOUT a row resolves to the
-    // universal default bindings ("mov"/"load"/"store") iff it is the
-    // substrate's default class (GPR — the class every existing
-    // lowering pass assumed); any OTHER row-less class resolves to
-    // nothing so the consumer fails loud instead of silently emitting
-    // the GPR instruction forms against a foreign register file.
-    // validate() guarantees every DECLARED mnemonic resolves to an
-    // opcode row. arm64 (no table, no fpr registers) is untouched.
-    std::array<TargetRegisterClassOps, 5> registerClassOps{};
+    // FC2 Part B, generalized to class×class by
+    // D-TARGET-NO-CROSS-CLASS-MOVE-VERB: the register-data-movement mnemonic
+    // table (the JSON `registerClassOps[]` section), indexed
+    // `[fromClass][toClass]` by the TargetRegClass ordinals. The DIAGONAL
+    // (`from == to`) is the within-a-file copy plus that class's memory
+    // load/store; an OFF-DIAGONAL entry is the cross-FILE move, a distinct
+    // machine operation (arm64 `fmov x0, d0`, x86_64 `movq %xmm0, %rax`) that
+    // the table previously had no slot to declare at all.
+    //
+    // A PAIR WITHOUT a row resolves to the universal default bindings
+    // ("mov"/"load"/"store") iff it is the substrate's default class on the
+    // DIAGONAL (GPR→GPR — the copy every existing lowering pass assumed); any
+    // OTHER row-less pair resolves to nothing so the consumer fails loud
+    // instead of silently emitting one class's instruction forms against a
+    // foreign register file. validate() guarantees every DECLARED mnemonic
+    // resolves to an opcode row.
+    std::array<std::array<TargetRegisterClassOps, kTargetRegClassCount>,
+               kTargetRegClassCount>
+        registerClassOps{};
 
     // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the per-`WideFloatOp`
     // softfloat-libcall table (the JSON `wideFloatSoftcalls[]` section),
@@ -4127,37 +4369,68 @@ public:
         return d_.dwarfReturnAddressColumn;
     }
 
-    // FC2 Part B: resolve the opcode handle that performs `op` on a
-    // value of register class `cls` (the per-register-class operation
-    // table — `registerClassOps[]` in the target JSON). Resolution:
-    //   * class has a declared row + the row names this op → that
+    // FC2 Part B, generalized by D-TARGET-NO-CROSS-CLASS-MOVE-VERB: resolve the
+    // opcode handle that performs `op` moving a value OUT OF class `from` INTO
+    // class `to` (the `registerClassOps[]` table in the target JSON, indexed by
+    // the class PAIR). Resolution:
+    //   * the pair has a declared row + the row names this op → that
     //     mnemonic's opcode (validate() guarantees it resolves; the
     //     optional still guards a hand-built schema);
-    //   * class has a declared row but the row OMITS this op →
-    //     nullopt — the CALLER fails loud naming class+op (e.g. an
+    //   * the pair has a declared row but the row OMITS this op →
+    //     nullopt — the CALLER fails loud naming the pair+op (e.g. an
     //     FPR store with no declared store mnemonic must never fall
     //     back to the GPR `store` encoding);
-    //   * class has NO row: GPR (the substrate default class — what
-    //     every pre-FC2 lowering pass emitted unconditionally) → the
-    //     universal "mov"/"load"/"store" bindings; any other class →
-    //     nullopt (fail loud at the caller).
+    //   * the pair has NO row: GPR→GPR (the substrate default class on the
+    //     diagonal — what every pre-FC2 lowering pass emitted
+    //     unconditionally) → the universal "mov"/"load"/"store" bindings; any
+    //     other pair → nullopt (fail loud at the caller).
+    //
+    // ⚠ `Load` / `Store` OFF THE DIAGONAL ARE A CATEGORY ERROR, not an
+    // omission: memory is not a register class, so "load from gpr into fpr"
+    // asks nothing. The loader refuses such a row, and this returns nullopt
+    // for one regardless — a hand-built schema must not be able to reach a
+    // memory mnemonic through a cross-class query.
     [[nodiscard]] std::optional<std::uint16_t> regClassOpOpcode(
-            TargetRegClass cls, RegClassOp op) const noexcept {
-        auto const idx = static_cast<std::size_t>(cls);
-        if (idx >= d_.registerClassOps.size()) return std::nullopt;
-        auto const& row = d_.registerClassOps[idx];
+            TargetRegClass from, TargetRegClass to,
+            RegClassOp op) const noexcept {
+        auto const fromIdx = static_cast<std::size_t>(from);
+        auto const toIdx   = static_cast<std::size_t>(to);
+        if (fromIdx >= d_.registerClassOps.size())      return std::nullopt;
+        if (toIdx   >= d_.registerClassOps[fromIdx].size()) return std::nullopt;
+        if (from != to && op != RegClassOp::Move)       return std::nullopt;
+        auto const& row = d_.registerClassOps[fromIdx][toIdx];
         if (row.declared) {
             auto const name = row.nameFor(op);
             if (name.empty()) return std::nullopt;
             return opcodeByMnemonic(name);
         }
-        if (cls != TargetRegClass::GPR) return std::nullopt;
+        if (from != TargetRegClass::GPR || to != TargetRegClass::GPR) {
+            return std::nullopt;
+        }
+        // ⚠ `load_u`/`store_u` ARE THE GPR DEFAULTS FOR THE SCALED ROLES AND
+        // THEY ARE OPTIONAL IN A WAY `load`/`store` ARE NOT: a target whose
+        // memory forms already carry a wide displacement (x86_64's disp32)
+        // declares no long-reach twin at all, and `opcodeByMnemonic` returning
+        // nullopt is the RIGHT answer there — the frame chokepoint then keeps
+        // the short form, which encodes every offset that target can produce.
         switch (op) {
-            case RegClassOp::Move:  return opcodeByMnemonic("mov");
-            case RegClassOp::Load:  return opcodeByMnemonic("load");
-            case RegClassOp::Store: return opcodeByMnemonic("store");
+            case RegClassOp::Move:        return opcodeByMnemonic("mov");
+            case RegClassOp::Load:        return opcodeByMnemonic("load");
+            case RegClassOp::Store:       return opcodeByMnemonic("store");
+            case RegClassOp::LoadScaled:  return opcodeByMnemonic("load_u");
+            case RegClassOp::StoreScaled: return opcodeByMnemonic("store_u");
         }
         return std::nullopt;
+    }
+
+    // The DIAGONAL query — `regClassOpOpcode(cls, cls, op)`, spelled once.
+    // Kept as the terse form because the overwhelming majority of call sites
+    // ask about a copy WITHIN one class (a spill, a phi copy, a two-address
+    // legalization), and because it is the same table: this is a shorthand for
+    // one argument pair, never a second lookup path.
+    [[nodiscard]] std::optional<std::uint16_t> regClassOpOpcode(
+            TargetRegClass cls, RegClassOp op) const noexcept {
+        return regClassOpOpcode(cls, cls, op);
     }
 
     // ── Wide-float softcalls (LD-2, D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH) ──

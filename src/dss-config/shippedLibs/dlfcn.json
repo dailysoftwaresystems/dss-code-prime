@@ -5,8 +5,8 @@
   "availableObjectFormats": ["elf", "macho"],
   "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
-    { "name": "dlopen",  "signature": "fn(ptr<char>, i32) -> ptr<void>",  "kind": "function", "linkage": "external" },
-    { "name": "dlsym",   "signature": "fn(ptr<void>, ptr<char>) -> ptr<void>", "kind": "function", "linkage": "external" },
+    { "name": "dlopen",  "signature": "fn(ptr<const<char>>, i32) -> ptr<void>",  "kind": "function", "linkage": "external" },
+    { "name": "dlsym",   "signature": "fn(ptr<void>, ptr<const<char>>) -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "dlclose", "signature": "fn(ptr<void>) -> i32",              "kind": "function", "linkage": "external" },
     { "name": "dlerror", "signature": "fn() -> ptr<char>",                 "kind": "function", "linkage": "external" }
   ],

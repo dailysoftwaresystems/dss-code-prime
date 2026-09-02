@@ -99,6 +99,14 @@ target_link_libraries(dss_lir_test_lir_aliased_view_allocability
 dss_add_test(NAME lir/test_lir_frame_slot_stride
              SOURCES test_lir_frame_slot_stride.cpp)
 
+# D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT: the
+# SIBLING of the row above — the stride sized the slot correctly and the store
+# then wrote 8 bytes into it, because `emitFrameStore`'s width DEFAULTED to 64
+# for every class on every target. Drives the real c -> ... -> assemble
+# pipeline on both shipped targets and closes on the emitted ENCODING.
+dss_add_test(NAME lir/test_lir_frame_access_width
+             SOURCES test_lir_frame_access_width.cpp)
+
 # D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND + D-TARGET-NO-CROSS-CLASS-MOVE-VERB: the
 # inline-asm operand materialisation used ONE module-wide integer `mov` for
 # every operand whatever class it bound — a live silent miscompile on both
@@ -165,3 +173,55 @@ dss_add_test(NAME lir/test_lir_label_address_static_table
 # survivable, so the guarantee does not rest on five independent `return`s.
 dss_add_test(NAME lir/test_lir_rebuild_unwind
              SOURCES test_lir_rebuild_unwind.cpp)
+
+# D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
+# WHEN the frame pointer leaves the allocatable pool is a DECLARED per-convention
+# fact (`framePointerReservation`), and these pins assert on the MATERIALIZED
+# instruction stream — the emitted code — because the pre-fix program ran fine
+# and no ordinary run could have noticed. Consumes mutate_target_schema.hpp for
+# the REMOVE-direction mutant, hence nlohmann_json.
+dss_add_test(NAME lir/test_lir_frame_pointer_reservation
+             SOURCES test_lir_frame_pointer_reservation.cpp)
+target_link_libraries(dss_lir_test_lir_frame_pointer_reservation
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LIR-TEXT-PARSE-UNSEALED-BLOCK-ABORT: a malformed instruction in a NON-FINAL
+# block used to kill the process. Panic-mode recovery reports the bad
+# instruction and keeps driving `LirBuilder`, so a block whose terminator was
+# skipped reached the next `beginBlock` unsealed and hit its *"current block has
+# no terminator"* fatal. Every pre-existing malformed-input test placed the bad
+# instruction in the LAST block, the one arrangement `finalize`'s `errors_`
+# short-circuit keeps away from the abort — so the suite could not see it. Its
+# own target because the regression mode is a DEAD RUNNER, not a failed
+# assertion: keep it away from the 100-odd unrelated pins in test_lir_text.
+dss_add_test(NAME lir/test_lir_text_unsealed_block
+             SOURCES test_lir_text_unsealed_block.cpp)
+
+# D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: a local whose alignment exceeds the
+# convention's `stackAlignment` cannot be placed by CHOOSING an offset — the
+# post-prologue stack pointer is congruent to 0 modulo that and no finer. It is
+# placed by reserving spare bytes and rounding the address at run time. These pins
+# are over the two published derivations that decide the reservation, and over the
+# SUFFICIENCY PROPERTY (rounding any raw slot address must land inside its own
+# reservation) rather than over a table of offsets — a table would be right at 32 and
+# silent at 64. Nothing here drives the unit-tier front end — a sufficiency property
+# is pinned harder by calling the derivation directly than by inspecting one lowered
+# program, and the file's own banner carries the reason (the row it used to cite,
+# D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO, closed
+# in P49 and no longer states a live hazard). The end-to-end evidence is the runtime
+# corpus (`examples/c/alignas_local_over32`, `alignas_local_cacheline64`,
+# `alignas_member_over32_local`).
+dss_add_test(NAME lir/test_lir_overaligned_local_frame
+             SOURCES test_lir_overaligned_local_frame.cpp)
+
+# D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO:
+# the pin over `lowered_lir_fixture.hpp` ITSELF. `lowerCToLir` used to return a
+# refused lowering looking exactly like an accepted one, so every pin driving it
+# could be asserting over a mutilated module. Its arms run the fixture INSIDE
+# `EXPECT_NONFATAL_FAILURE` — an instrument that reports is worth nothing until
+# it has been seen to report — and carry the false-red controls (an empty body,
+# and a body whose one statement is a bare `return`) that keep the refusal off
+# correct C. Its own target because it is the only file here that asserts the
+# harness fails rather than that the compiler succeeds.
+dss_add_test(NAME lir/test_lir_fixture_vacuity_guard
+             SOURCES test_lir_fixture_vacuity_guard.cpp)

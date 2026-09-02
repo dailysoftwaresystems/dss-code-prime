@@ -60,6 +60,8 @@ namespace {
 constexpr std::string_view kFormatMatchingX86_64 = R"({
   "dssObjectFormatVersion": 1,
   "cSymbolDecoration": { "scheme": "none" },
+  "cCallingConvention": { "convention": "sysv_amd64" },
+  "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
   "format": {"name": "test-elf", "kind": "elf"},
@@ -85,6 +87,8 @@ constexpr std::string_view kFormatMatchingX86_64 = R"({
 constexpr std::string_view kFormatMissingReloc = R"({
   "dssObjectFormatVersion": 1,
   "cSymbolDecoration": { "scheme": "none" },
+  "cCallingConvention": { "convention": "sysv_amd64" },
+  "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
   "format": {"name": "test-elf-bare", "kind": "elf"},
@@ -258,6 +262,8 @@ TEST(Linker, ImageWithNoDataBindingStillRejectsReferencedDataExtern) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".exe",
       "dataModel": "LLP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-exec-no-data-binding","kind":"pe"},

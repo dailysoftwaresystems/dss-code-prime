@@ -2809,6 +2809,38 @@ void runErrorExampleViaCli(std::string const& compiler,
           "rc=" + std::to_string(sysRc) + ", cli log: "
           + cliLog.generic_string());
 
+    // ★★★ THE ARTIFACT INVARIANT, THROUGH THE SHIPPED CLI. A build that
+    // reports failure must not also produce the file that failure denies.
+    // This arm asserted the exit code and the rendered diagnostics and never
+    // once asked what was on disk afterwards — and ✔MEASURED at the base of
+    // this lane, `dsscp --compile a.c b.c` on a cross-unit symbol redefinition
+    // printed `dsscp: artifact …a.exe`, exited 1, and left a runnable `a.exe`
+    // returning CU#1's answer. The in-process runner carries the identical
+    // assertion (`examples_runner.cpp::runErrorTarget`); a capability change
+    // must hit BOTH, and an invariant is exactly that kind of change.
+    //
+    // ⓘ `cli.log` is this harness's OWN file, written into the same directory
+    // by the redirection above, so it is excluded BY NAME rather than by
+    // extension — an artifact could legitimately be called anything.
+    {
+        std::vector<std::string> leftovers;
+        std::error_code          ec;
+        for (auto it = fs::recursive_directory_iterator(outDir, ec);
+             !ec && it != fs::recursive_directory_iterator{}; it.increment(ec)) {
+            if (!it->is_regular_file(ec)) continue;
+            if (it->path().filename() == cliLog.filename()) continue;
+            leftovers.push_back(it->path().generic_string());
+        }
+        check(exampleName + ": CLI writes NO artifact for a rejected build",
+              leftovers.empty(),
+              std::to_string(leftovers.size()) + " file(s) under "
+                  + outDir.generic_string() + ", first: "
+                  + (leftovers.empty() ? std::string{} : leftovers.front())
+                  + " — the compiler reported failure and produced the binary "
+                    "anyway; anything keying on the artifact's existence gets "
+                    "a program the compiler just refused");
+    }
+
     std::ifstream f(cliLog.string());
     std::string const body((std::istreambuf_iterator<char>(f)),
                            std::istreambuf_iterator<char>());

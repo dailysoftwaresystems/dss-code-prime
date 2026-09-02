@@ -533,7 +533,10 @@ TEST(InlineAsmConstraintParse, OneLetterTwoTargetsIsAConfigAnswerNotACodeBranch)
     // `a` is x86's %rax and is UNDECLARED on arm64.
     EXPECT_NE(x86->asmConstraint("a"), nullptr);
     EXPECT_EQ(arm->asmConstraint("a"), nullptr);
-    // `w` is arm64's vector class and is UNDECLARED on x86_64.
+    // `w` is arm64's SIMD&FP class and is UNDECLARED on x86_64. ⓘ It used to
+    // be described as "arm64's vector class": since R1 of design A′ arm64
+    // declares that register file ONCE, under class `fpr`, and `w` binds it —
+    // there is no separate vector class to name.
     EXPECT_NE(arm->asmConstraint("w"), nullptr);
     EXPECT_EQ(x86->asmConstraint("w"), nullptr);
     // `r` is declared by BOTH — and resolves into disjoint register sets.

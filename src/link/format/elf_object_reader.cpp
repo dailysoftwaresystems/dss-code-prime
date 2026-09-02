@@ -1505,6 +1505,172 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
 
+    // -- (6.9) INTER-ATOM PADDING: PRESERVE THE DISTANCES A BAKED, RELOC-LESS
+    //          DISPLACEMENT WAS ASSEMBLED AGAINST -----------------------------
+    //
+    // D-LK-STATIC-LINK-INTRASECTION-BAKED-CALL.
+    //
+    // ★★★ THE ONE PLACE THE SYMBOL-ATOMIC MODEL IS NOT FREE. A `.o` built
+    // WITHOUT `-ffunction-sections` -- gcc's DEFAULT -- puts several functions
+    // in ONE `.text`, and the assembler resolves a call between two of them
+    // ITSELF: `compute` calls a static `helper` as a bare `E8 rel32` with **NO
+    // relocation at all**. Nothing downstream can repair that displacement,
+    // because nothing downstream knows it exists. It is correct if and only if
+    // the DISTANCE between the two atoms survives re-layout.
+    //
+    // ⚠ AND `st_size` DOES NOT COVER THE PADDING. gcc aligns functions, so the
+    // section carries inter-function NOPs owned by NO symbol. Slicing one atom
+    // per `STT_FUNC` drops them, the writer concatenates the bodies
+    // back-to-back, and every distance across a dropped gap SHRINKS.
+    //
+    // ✔MEASURED 2026-08-28 on a PLAIN `gcc -O2 -c` object (no flags at all --
+    // `helper`@0x00/4, `filler`@0x10/9, `compute`@0x20/13, no `.rela.text`):
+    // DSS linked it with rc 0 and ZERO diagnostics, `compute`'s baked call
+    // resolved to `main+0x7`, and the binary SEGFAULTED where the native gcc
+    // link of the same two objects exits 42. `-O2` and `-O3` both emit this
+    // shape; `-O0`/`-O1`/`-Os` pack the functions tight and hide it.
+    //
+    // ★ THE FIX REPRODUCES THE INPUT SECTION'S BYTE LAYOUT rather than hunting
+    // the call. A detector would have to DISASSEMBLE to find a displacement
+    // that carries no relocation, and would still have to enumerate every
+    // instruction form that can bake one. Re-materialising the padding makes
+    // the concatenation byte-identical to the input section, so EVERY internal
+    // displacement -- baked, relocated, or in a form nobody has thought of --
+    // stays valid by construction.
+    //
+    // ★★ THE PADDING IS ITS OWN ANONYMOUS ATOM, NOT BYTES APPENDED TO THE
+    // FUNCTION BEFORE IT. Appending was tried first and the repo refused it:
+    // the ELF writer rejects a function whose FDE `address_range` disagrees
+    // with its byte count (`K_UnwindRuleUnrepresentable`), because an FDE that
+    // stops short lets an unwinder walk off the end silently. Growing the atom
+    // to satisfy that guard would have made `st_size` and the FDE range
+    // OVER-report every padded function -- 16 bytes for a 4-byte `helper` --
+    // and `st_size` is what a profiler, a crash reporter and `nm --print-size`
+    // read. A separate atom keeps both numbers exact.
+    //
+    // ⚠⚠ AND IT NEVER REORDERS. An intermediate version sorted each section's
+    // atoms into address order, on the reasoning that `outIdx` is dead by here
+    // so the order is free to change. ✔MEASURED FALSE: it broke
+    // `TfC54TwoTusCollidingStaticsReadBackLocalMergeClean` and
+    // `ElfSizedNoTypeTextBodyIsRecoveredByGeometry`, whose sections contain NO
+    // padding at all (`pads=0`) -- so the reordering alone was the regression,
+    // not the padding. Emission order is load-bearing to callers this pass
+    // cannot see. A section whose atoms are out of address order AND carries
+    // padding is therefore REFUSED, not guessed at.
+    //
+    // ★★ AND ONLY ELF NEEDS IT -- ONE POLICY, ONE FORMAT THAT VIOLATED IT.
+    // The rule is format-agnostic: *an atom's extent must cover the bytes up to
+    // the next atom in the same section*. COFF and Mach-O satisfy it by
+    // construction, because neither format's symbol carries a size and both
+    // readers therefore derive an atom's END FROM THE NEXT BOUNDARY -- the
+    // padding is already inside the preceding atom, so there is no gap to drop.
+    // ELF is the outlier precisely because `st_size` is EXACT: it describes the
+    // body and nothing else, so the alignment padding falls between two atoms
+    // and belongs to neither.
+    //
+    // ✔MEASURED, not reasoned from the analogy: a mingw-w64 gcc 13.2.0
+    // `-c -O2` COFF object with the identical shape (one `.text`, `helper`@0x00
+    // / `filler`@0x10 / `compute`@0x20, ZERO `.text` relocations, the same
+    // `E8 D7 FF FF FF`) links through DSS and RUNS on Windows to exit 42, with
+    // the baked displacement landing correctly -- so the COFF reader was
+    // already right and needed no change. An earlier draft of this row asserted
+    // the opposite as a residual for both sibling readers; that was an
+    // inference from shape, and the shape is not where the defect lived.
+    // ⓘ SAFE TO INSERT HERE, AND ONLY HERE: this pass runs LAST, after the
+    // relocation routing and the `.eh_frame` attach have consumed every
+    // `Interval::outIdx`. Run one step sooner and inserting an atom would
+    // silently re-point every relocation in the module.
+    //
+    // ⓘ NO-OP WHERE THERE IS NO GAP: a `-ffunction-sections` object has one
+    // atom per section and never enters the loop, and a contiguous multi-atom
+    // section mints nothing. Byte-identical output for every input that was
+    // already correct -- which is why the two tests above pass again.
+    {
+        std::vector<std::pair<std::size_t, AssembledFunction>> padAtoms;
+        std::uint32_t nextPadId = static_cast<std::uint32_t>(numSyms);
+        for (auto const& f : mod.functions)
+            nextPadId = std::max(nextPadId, f.symbol.v + 1u);
+        for (auto const& d : mod.dataItems)
+            nextPadId = std::max(nextPadId, d.symbol.v + 1u);
+
+        for (auto& [secIdx, ivs] : funcIntervalsBySec) {
+            if (ivs.size() < 2) continue;
+            if (secIdx >= secs.size()) continue;
+            Shdr const& psec = secs[secIdx];
+            if (psec.type == kShtNobits) continue;   // no file bytes to carry
+            std::vector<Interval> ordered = ivs;
+            std::sort(ordered.begin(), ordered.end(),
+                      [](Interval const& a, Interval const& b) {
+                          return a.start < b.start;
+                      });
+            bool anyGap = false;
+            for (std::size_t k = 1; k < ordered.size(); ++k) {
+                if (ordered[k].start > ordered[k - 1].start + ordered[k - 1].len) {
+                    anyGap = true;
+                    break;
+                }
+            }
+            if (!anyGap) continue;   // nothing to preserve; leave it untouched
+            // Padding can only be re-materialised in place when the atoms are
+            // already emitted in address order. They usually are; when they are
+            // not, the honest answer is a refusal, because reordering them
+            // breaks callers (✔MEASURED above) and packing them silently moves
+            // a baked call.
+            for (std::size_t k = 1; k < ordered.size(); ++k) {
+                if (ordered[k].outIdx > ordered[k - 1].outIdx) continue;
+                return fail(DiagnosticCode::F_UnsupportedBinaryFormat,
+                    "elf::readRelocatableObject: section #"
+                    + std::to_string(secIdx) + " holds "
+                    + std::to_string(ordered.size()) + " function atoms with "
+                    "inter-function padding, emitted in an order that does not "
+                    "match their addresses -- the padding cannot be restored "
+                    "without reordering, and a call baked into this section "
+                    "without a relocation would be silently redirected "
+                    "(D-LK-STATIC-LINK-INTRASECTION-BAKED-CALL). Refusing "
+                    "instead of emitting a wrong jump target.");
+            }
+            for (std::size_t k = 1; k < ordered.size(); ++k) {
+                std::uint64_t const gapStart =
+                    ordered[k - 1].start + ordered[k - 1].len;
+                std::uint64_t const gapEnd = ordered[k].start;
+                if (gapEnd <= gapStart) continue;
+                std::uint64_t const gapLen = gapEnd - gapStart;
+                if (!sliceInBounds(psec, gapStart, gapLen)) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "elf::readRelocatableObject: inter-function padding [+"
+                        + std::to_string(gapStart) + ", +"
+                        + std::to_string(gapEnd) + ") escapes section '"
+                        + psec.name + "'.");
+                }
+                std::size_t const off =
+                    static_cast<std::size_t>(psec.offset + gapStart);
+                AssembledFunction pad;
+                // A fresh id above every real symbol, with NO ModuleSymbol --
+                // the module-private, never-cross-CU-folded discipline the
+                // (6.5) data gap atoms already use.
+                pad.symbol = SymbolId{nextPadId++};
+                pad.bytes.assign(bytes.begin() + off,
+                                 bytes.begin() + off
+                                     + static_cast<std::size_t>(gapLen));
+                padAtoms.emplace_back(ordered[k - 1].outIdx, std::move(pad));
+            }
+            // ⓘ `ivs` KEEPS THE ORIGINAL EXTENTS: they routed relocations to
+            // their owning atom and are not consulted again.
+        }
+
+        if (!padAtoms.empty()) {
+            std::vector<AssembledFunction> rebuilt;
+            rebuilt.reserve(mod.functions.size() + padAtoms.size());
+            for (std::size_t idx = 0; idx < mod.functions.size(); ++idx) {
+                rebuilt.push_back(std::move(mod.functions[idx]));
+                for (auto& [after, pad] : padAtoms) {
+                    if (after == idx) rebuilt.push_back(std::move(pad));
+                }
+            }
+            mod.functions = std::move(rebuilt);
+        }
+    }
+
     mod.expectedFuncCount = mod.functions.size();
     return mod;
 }

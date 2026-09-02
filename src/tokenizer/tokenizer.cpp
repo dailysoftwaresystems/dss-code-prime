@@ -341,7 +341,114 @@ struct NumberScan {
     return best;
 }
 
-[[nodiscard]] NumberScan scanNumber(SourceReader& r, NumberStyle const& style) noexcept {
+// ── [[D-PP-PASTE-REJECTS-A-VALID-PREPROCESSING-NUMBER]]: the PREPROCESSING
+//    NUMBER tail (C 6.4.8) ────────────────────────────────────────────────
+//
+// A pp-number is a MUCH wider grammar than any language's numeric literal: once
+// a number has started, it swallows every following digit, identifier byte,
+// fraction point, and exponent-letter-plus-sign, and only phase 7 asks whether
+// the run is a literal anybody can convert. `0y1`, `1e` and `1x` are all single
+// valid pp-numbers.
+//
+// ★★ WHY THIS IS A SCANNER RULE AND NOT A PREPROCESSOR ONE. The consumer that
+// needs it is `##` paste validity (C 6.10.3.3p3 — "if the result is not a valid
+// preprocessing token, the behavior is undefined"), and that question is
+// LEXICAL. Answering it inside the preprocessor would mean a second, private
+// copy of "what continues a number" living next to the real scanner, which is
+// the knob-that-lies shape arriving from the other direction. So the scanner
+// answers it, and the preprocessor asks.
+//
+// ⚠ EVERY BYTE CLASS HERE COMES FROM CONFIG. Identifier bytes from
+// `GrammarSchema::identifierClass()`, the fraction point and the exponent
+// letters from `NumberStyle`. The only literal characters are the exponent
+// SIGNS, which the float continuation above already spells the same way. No
+// language name is consulted and a schema with no `numberStyle` never gets here.
+//
+// ── [[D-PP-SKIPPED-CONDITIONAL-GROUP-VALIDATED-AS-A-PHASE-7-NUMBER]]: THE
+//    LETTER SET IS THE UNION, AND READING ONLY HALF OF IT MADE THE OTHER HALF
+//    SILENT ────────────────────────────────────────────────────────────────
+//
+// A `NumberStyle` declares exponent letters in TWO places, because two grammars
+// need them: `numberStyle.exponent` is the DECIMAL exponent (`e`/`E` in C), and
+// each `integerPrefixes[].float.exponent` is that prefix's own (`p`/`P` for a
+// C23 hex float). C 6.4.8's pp-number continues on `e+ e- E+ E- p+ p- P+ P-` —
+// all of them — so this predicate is the UNION or it is wrong.
+//
+// ✔MEASURED 2026-08-31, and the direction is the dangerous one. Reading only the
+// per-prefix half left `e`/`E` out entirely, so `0x1e+2` scanned as three tokens
+// and DSS BUILT AN ARTIFACT computing 32 — while gcc 13.3.0 and clang 18.1.3
+// BOTH refuse it (`invalid suffix "+2" on integer constant`), as they do
+// `0xFE+1` and `0x1e-2`. Every OTHER divergence in this family fails toward a
+// visible refusal; this one failed toward a wrong answer with a successful exit
+// code, which is why it is fixed here rather than recorded. ⓘ It only ever bites
+// a HEX literal — a decimal run cannot END in `e` unless the exponent already
+// failed (`1e`), and `0x1a+2` stays legal on all three because `a` is a digit,
+// not an exponent letter. Zero occurrences of the affected spelling exist in
+// this repository's corpus, tests or config.
+[[nodiscard]] bool isExponentLetter(NumberStyle const& style, char c) noexcept {
+    if (style.exponent.has_value()) {
+        for (char l : style.exponent->letters) {
+            if (l == c) return true;
+        }
+    }
+    for (auto const& p : style.integerPrefixes) {
+        if (!p.floating.has_value()) continue;
+        for (char l : p.floating->exponentLetters) {
+            if (l == c) return true;
+        }
+    }
+    return false;
+}
+
+// Consume the maximal preprocessing-number tail starting at the reader's
+// position, and report whether anything was consumed. `prev` is the byte just
+// scanned (the last byte of the number so far) — the sign rule needs it, because
+// a `+` continues a pp-number ONLY immediately after an exponent letter.
+// The "no previous byte" sentinel for the pp-number tail's sign rule. Named
+// rather than spelled inline: it is the same value `SourceReader::peek`
+// already answers past the end, and it continues nothing.
+inline constexpr char run_none = static_cast<char>(0);
+
+[[nodiscard]] bool consumePreprocessingNumberTail(SourceReader& r,
+                                                  NumberStyle const& style,
+                                                  IdentifierClass const& idents,
+                                                  char prev) noexcept {
+    bool consumed = false;
+    while (true) {
+        // No explicit EOF guard: `peek()` answers NUL past the end, which
+        // continues no identifier, is no language's fraction point, and is
+        // no sign -- so every arm below already declines it. A separate
+        // guard would be a second place for the end condition to live.
+        const char c = r.peek();
+        if (idents.continuesIdentifier(c)) {
+            prev = c;
+            r.advance(1);
+            consumed = true;
+            continue;
+        }
+        if (style.fractionPoint.has_value() && c == *style.fractionPoint) {
+            prev = c;
+            r.advance(1);
+            consumed = true;
+            continue;
+        }
+        if ((c == '+' || c == '-') && isExponentLetter(style, prev)) {
+            prev = c;
+            r.advance(1);
+            consumed = true;
+            continue;
+        }
+        break;
+    }
+    return consumed;
+}
+
+// The language's own NUMERIC LITERAL grammar — phase 7's answer, and the whole
+// scan as it stood before a preprocessing-number tail existed. It has THREE
+// exits (two in the prefix arm, one at the end), which is exactly why the phase
+// 3 tail cannot live inside it: see `scanNumber` below.
+[[nodiscard]] NumberScan scanNumberLiteral(SourceReader& r,
+                                           NumberStyle const& style) noexcept {
     NumberScan out;
 
     // 1. Try integer prefixes in declaration order. The loader's
@@ -622,16 +729,74 @@ struct NumberScan {
     return out;
 }
 
+// ── PHASE 3 (C 6.4.8): absorb the maximal PREPROCESSING-NUMBER tail. ──
+//
+// Runs ONLY when the caller asked for preprocessing tokens (`ppTailIdents`
+// non-null). Whatever the literal grammar accepted, a pp-number keeps going
+// while the next byte continues an identifier, is the fraction point, or is a
+// sign directly after an exponent letter. If that consumes anything at all, the
+// language's own literal grammar did NOT accept the whole run, so the token is
+// MALFORMED — one token plus `P_MalformedNumber`, never a silent split.
+//
+// ★ THIS IS THE SAME DOCTRINE THE FLOAT CONTINUATION ALREADY STATES — "once
+// committed and unable to complete, the WHOLE span is ONE malformed token, never
+// a silent split, because a split re-lexes the tail into value-corrupting
+// pieces". Phase 3 simply commits earlier and on more input, which is precisely
+// what makes `0 ## y1` a paste both reference compilers accept.
+//
+// ── [[D-PP-SKIPPED-CONDITIONAL-GROUP-VALIDATED-AS-A-PHASE-7-NUMBER]]: WHY THIS
+//    IS A WRAPPER AND NOT THE LAST PARAGRAPH OF THE SCAN ────────────────────
+//
+// It used to be the tail of `scanNumberLiteral`, after that function's final
+// `return` — and the PREFIX arm has TWO EARLIER RETURNS of its own. So the
+// phase-3 tail never ran for ANY prefixed literal: `0x1e+2`, `0x1g` and `0b1z`
+// each came back as a number plus a separate token, and `0x1 ## g` was refused
+// as "not a single valid token" — the very paste the sibling row exists to
+// accept. The decimal arm reached the tail and the prefix arm did not, which is
+// the one difference no reader of the old code could see, because the tail was
+// written where the eye expects a common exit.
+//
+// ⇒ THE LITERAL GRAMMAR KEEPS ITS THREE EXITS AND THE TAIL GETS ITS OWN, so
+// "phase 3 continues the run" is stated ONCE, at a single return, and a fourth
+// exit inside the literal grammar cannot silently opt out of it.
+//
+// ✔MEASURED 2026-08-31 (gcc 13.3.0, clang 18.1.3, probed separately): both
+// REFUSE `0x1e+2`, `0xFE+1`, `0x1e-2` and `0x1g`; both ACCEPT `0x1a+2`, `12+3`,
+// `0x1p+3` and `0xFFu`. DSS built an artifact for the first group and computed a
+// value — the only member of this defect family that failed toward a WRONG
+// ANSWER rather than toward a visible refusal.
+[[nodiscard]] NumberScan scanNumber(SourceReader& r, NumberStyle const& style,
+                                    IdentifierClass const* ppTailIdents) noexcept {
+    // Where the run began, so the phase-3 tail can read the byte the literal
+    // grammar stopped after.
+    const std::size_t ppStart = r.position();
+    NumberScan        out     = scanNumberLiteral(r, style);
+    if (ppTailIdents != nullptr) {
+        const std::size_t stopped = r.position();
+        // The byte the literal grammar stopped AFTER. Read back out of the
+        // reader's own slice rather than remembered in a variable, so it
+        // cannot drift from where the scan actually ended.
+        std::string_view const run = r.slice(ppStart, stopped);
+        const char prev = run.empty() ? run_none : run.back();
+        if (consumePreprocessingNumberTail(r, style, *ppTailIdents, prev)) {
+            out.malformed = true;
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 Tokenizer::Tokenizer(std::shared_ptr<SourceBuffer>        src,
                      std::shared_ptr<GrammarSchema const> schema,
                      DiagnosticBudget                     budget,
-                     LexerModeId                          initialMode)
+                     LexerModeId                          initialMode,
+                     Phase                                phase)
     : source_(std::move(src))
     , schema_(std::move(schema))
     , reporter_(std::make_unique<DiagnosticReporter>(budget.asConfig()))
-    , initialMode_(initialMode) {
+    , initialMode_(initialMode)
+    , phase_(phase) {
     if (!source_) tokenizerFatal("source is null");
     if (!schema_) tokenizerFatal("schema is null");
 }
@@ -1270,7 +1435,12 @@ TokenizeResult Tokenizer::tokenize() && {
             return false;
         };
         if (startsNumberLiteral()) {
-            const auto scan = scanNumber(r, *numberStyle);
+            // [[D-PP-PASTE-REJECTS-A-VALID-PREPROCESSING-NUMBER]]: hand the
+            // identifier class to the scanner ONLY in phase 3, so the phase-7
+            // scan is byte-identical to what it always was.
+            IdentifierClass const* const ppTail =
+                (phase_ == Phase::PreprocessingTokens) ? &identClass : nullptr;
+            const auto scan = scanNumber(r, *numberStyle, ppTail);
             const auto emitKind =
                 scan.isFloat ? numberStyle->emitKind.floating
                              : numberStyle->emitKind.integer;

@@ -1,0 +1,16 @@
+{
+  "$comment": "D-CSUBSET-POINTEE-CONST-ENFORCEMENT (P48 lane cq) — the ONE shape in the const-lvalue family where the four references SPLIT, and they split on ACCEPT-vs-REFUSE, so the disjunction governs. MEASURED 2026-09-01, each reference probed SEPARATELY at -O0 AND -O2: a write to a member that is BOTH declared `const` AND a BIT-FIELD is a WARNING THAT COMPILES on gcc 13.3.0 and mingw-w64 gcc 13.2.0 (`assignment of read-only location 's.v'`, exit 0, unchanged under -std=c17, -Wall -Wextra and -pedantic-errors) while clang 18.1.3 and MSVC 19.51.36252 REJECT it; gcc's built program returns 42 at BOTH -O0 and -O2, so the write is genuinely performed. An Error in DSS would be a refusal BELOW the union; silence would drop a diagnostic ISO C 6.5.16.1 requires and all four references emit. DSS warns and builds. THIS ENTRY IS RUNNABLE ON PURPOSE: sibling `const_pointee_write_error` asserts WHICH diagnostics the unanimous shapes produce, but a manifest carries no severity field, so only an EXECUTING artifact can assert that the program was still BUILT — the whole content of the boundary decision. exit 42 = 34 (the const bit-field slot, written) + 8 (its plain twin). RED-ON-DISABLE, both directions: delete `constMarker` from c.lang.json's `structField` row and the diagnostic vanishes entirely (pre-P48 silence, and the S_ConstViolation this manifest expects goes unproduced); make the bit-field arm of `ConstLvalueVerdict` an unconditional Error and this entry FAILS TO BUILD, so exit 42 is unreachable. Release pipeline + all four targets, because the boundary claim is 'DSS BUILDS AND RUNS THIS' and that claim is per-target.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "$noExpectDiagnosticsComment": "⚠ THIS ENTRY DELIBERATELY DECLARES NO `expectDiagnostics`, AND THAT IS THE WHOLE POINT RATHER THAN AN OMISSION. ✔MEASURED: the runner treats any manifest carrying that key as an EXPECT-ERROR entry — it asserts the compile was REJECTED (`expect-error example compiled with rc=0 (should be rejected)`) and never runs the artifact at all, which is exactly the verdict this shape must NOT draw. The two halves of the claim are therefore split between the two instruments that can each actually hold one: THAT the warning is emitted, and that it is a WARNING, is pinned by SemanticAnalyzerC.WriteToAConstDeclaredBitFieldWarnsAndStillCompiles (which asserts the S_ConstViolation count AND `!hasErrors()`); THAT the program is still built and still works is pinned HERE, by an artifact that executes and returns 42 on four targets. Neither instrument can answer the other's question, and giving one of them both would have silently converted this entry into an assertion that DSS REFUSES the program.",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

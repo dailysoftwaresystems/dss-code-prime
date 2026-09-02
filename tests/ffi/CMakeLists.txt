@@ -108,6 +108,17 @@ dss_add_test(NAME ffi/test_shipped_realization_oracle
 target_link_libraries(dss_ffi_test_shipped_realization_oracle
                       PRIVATE nlohmann_json::nlohmann_json)
 
+# D-FFI-DESCRIPTOR-KNOWN-NAME-HAS-NO-LIBRARY-FOR-FORMAT (P47): the arm "the
+# corpus KNOWS this name, it IS available on the active format, and the row names
+# NO image for that format" — a LATENT arm, since no shipped descriptor reaches it
+# on a backed format, so this file SYNTHESIZES its witness rather than reading one.
+# It drives the oracle through `DSS_CONFIG_ROOT`, so it MUST run under ctest: a
+# bare .exe takes the cwd walk and reads whichever tree the shell stands in, never
+# the synthetic corpus. Writes its descriptors as text and reads them through the
+# shipped reader, so it needs no json link.
+dss_add_test(NAME ffi/test_shipped_no_library_for_format
+             SOURCES test_shipped_no_library_for_format.cpp)
+
 # D-FFI-SHIPPED-DESCRIPTOR-PARSE-CACHE-SERVES-A-STALE-DOCUMENT (P42): the
 # thread-local descriptor PARSE CACHE must answer about the file on disk NOW — a
 # live defect in `dsscp --lsp`, whose persistent ThreadPool worker kept serving
@@ -118,3 +129,84 @@ target_link_libraries(dss_ffi_test_shipped_realization_oracle
 # the shipped reader.
 dss_add_test(NAME ffi/test_shipped_descriptor_cache_staleness
              SOURCES test_shipped_descriptor_cache_staleness.cpp)
+
+# D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY (P44): the
+# ABI-resolution pins became CONFIG pins when `kAbiCatalog` was deleted — they
+# now build REMOVE-direction mutants of the shipped `.format.json` documents
+# (strip the required key; re-point the declared convention) and assert the
+# engine follows the document. That needs the JSON reader directly, like the
+# descriptor sweeps above it.
+target_link_libraries(dss_ffi_test_abi_catalog
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-FFI-DARWIN-FSID-T-SHAPE + D-FFI-DARWIN-MALLOC-ZONE-TAIL-OPAQUE (P48): the two
+# Darwin FFI struct SHAPES, pinned by OFFSET and TOTAL SIZE. One of the two rows
+# closed with NO edit to the tree — the SDK confirmed the inferred `fsid`/`val`
+# spelling — so this file is the only durable record of that measurement, and a
+# later edit that moves it has nothing else to trip over. Builds REMOVE-direction
+# mutants of the shipped descriptors (drop a variant arm, drop a member, drop a
+# struct entry) on a COPY, so it needs the JSON reader directly like its siblings.
+dss_add_test(NAME ffi/test_darwin_struct_shapes
+             SOURCES test_darwin_struct_shapes.cpp)
+target_link_libraries(dss_ffi_test_darwin_struct_shapes
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-FFI-DESCRIPTOR-TYPE-ALIAS-SPELLING-KEYED-ON-DATA-MODEL-ALONE (P48): WHICH named
+# C type each shipped 64-bit alias IS, per (data model, object format). The defect
+# was a `when:{dataModel}` selector describing a two-world universe that has three
+# worlds in it — Darwin is LP64 and spells `uint64_t` `unsigned long long` while
+# keeping `size_t` `unsigned long`. Every alias is 8 bytes everywhere, so this is an
+# IDENTITY pin, not a width one: the assertions are TypeId equalities against a
+# reference vocabulary read into the same interner. Builds REMOVE-direction mutants
+# of the shipped descriptor on a COPY (drop the macho arms; drop just the `format`
+# keys this row added), so it needs the JSON reader directly like its siblings.
+dss_add_test(NAME ffi/test_stdint_alias_identity
+             SOURCES test_stdint_alias_identity.cpp)
+target_link_libraries(dss_ffi_test_stdint_alias_identity
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CSUBSET-C11-THREADS-TIMED (P49 lane th): the per-format `struct timespec`
+# body, in BOTH descriptors that declare it. `time.json` and `sys/stat.json` each
+# carried a FLAT {i64,i64} body while listing `pe` among their formats, and on
+# LLP64 the nanoseconds field is `long` = FOUR bytes. sizeof is 16 on both worlds
+# and tv_nsec is at offset 8 on both, so neither a size nor an offset assertion
+# can discriminate — this is a WIDTH + IDENTITY pin, like the timeval one it
+# follows. Builds REMOVE-direction mutants of the shipped descriptors on a COPY
+# (drop the pe arm from both files; drop it from only one, the half-fix the
+# cross-file identity guard caught), so it needs the JSON reader directly like
+# its siblings.
+dss_add_test(NAME ffi/test_shipped_timespec_layout
+             SOURCES test_shipped_timespec_layout.cpp)
+target_link_libraries(dss_ffi_test_shipped_timespec_layout
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CSUBSET-C11-THREADS-TIMED (P49 lane tw): the FOUR C11 <threads.h> functions
+# that were declared on NO object format — thrd_sleep (elf only), mtx_timedlock,
+# cnd_timedwait, thrd_equal — and the per-format MECHANISM each now uses. The
+# corpus examples prove the BEHAVIOUR but only on the host whose format they
+# target; this asserts all three formats' declarations from ANY host, so dropping
+# the macho arms reds on the Windows leg instead of waiting for a Mac. Builds
+# REMOVE-direction mutants of the shipped descriptor on a COPY (delete the pe/macho
+# rows; delete only the `synthesize` KEY, which is the state that produced a
+# cleanly-compiled .exe that would not LOAD), so it needs the JSON reader directly
+# like its siblings.
+dss_add_test(NAME ffi/test_shipped_threads_timed_declarations
+             SOURCES test_shipped_threads_timed_declarations.cpp)
+target_link_libraries(dss_ffi_test_shipped_threads_timed_declarations
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CSUBSET-C11-THREADS-MACHO-MTX-PLAIN-RECURSIVE + D-CSUBSET-C11-THREADS-MTX-PLAIN-RECURSIVE
+# (P51 lane mx): the DECLARED half of `mtx_init`'s `type` argument. The macho
+# recipe now READS that parameter to pick a pthread mutex kind, so a threads.json
+# that narrowed the signature would leave the shim materializing an Arg the
+# declaration does not promise — a wrong-kind mutex that compiles, links and hangs.
+# Also pins the three `mtx_*` constants the pass masks against, including that
+# mtx_recursive is a SINGLE BIT (C11 spells a recursive mutex as an OR, so a
+# recursive request can arrive as 1 or as 3 and the pass must mask, not compare).
+# Builds REMOVE-direction mutants of the shipped descriptor on a COPY (strip the
+# i32 parameter; delete the mtx_recursive constant row), so it needs the JSON
+# reader directly like its siblings.
+dss_add_test(NAME ffi/test_shipped_mtx_type_declarations
+             SOURCES test_shipped_mtx_type_declarations.cpp)
+target_link_libraries(dss_ffi_test_shipped_mtx_type_declarations
+                      PRIVATE nlohmann_json::nlohmann_json)

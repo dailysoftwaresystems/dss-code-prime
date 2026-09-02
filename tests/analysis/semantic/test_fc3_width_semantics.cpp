@@ -840,6 +840,8 @@ namespace {
     return std::string{R"({
   "dssObjectFormatVersion": 1,
   "cSymbolDecoration": { "scheme": "none" },
+  "cCallingConvention": { "convention": "none" },
+  "outputExtension": ".o",
   )"} + dataModelLine + R"(
   "headerNameMatching": "case-sensitive",
   "format": { "name": "fc3-stub", "version": "1.0", "kind": "elf" },

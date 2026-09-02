@@ -56,6 +56,8 @@ TEST(WasmFormatJson, WasmKindWithElfBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".wasm",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"wasm-with-elf-block","kind":"wasm"},
@@ -70,6 +72,8 @@ TEST(WasmFormatJson, WasmKindWithPeBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".wasm",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"wasm-with-pe-block","kind":"wasm"},
@@ -84,6 +88,8 @@ TEST(WasmFormatJson, WasmKindWithMachoBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".wasm",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"wasm-with-macho-block","kind":"wasm"},
@@ -102,6 +108,8 @@ TEST(WasmFormatJson, WasmKindWithUniversalFieldRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".wasm",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"wasm-with-relocations","kind":"wasm"},
@@ -120,6 +128,8 @@ TEST(ObjectFormatJsonCrossKind, ElfKindWithPeBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".wasm",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"elf-with-pe-block","kind":"elf"},
@@ -136,6 +146,8 @@ TEST(ObjectFormatJsonCrossKind, PeKindWithMachoBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".wasm",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-with-macho-block","kind":"pe"},
@@ -154,6 +166,8 @@ TEST(ObjectFormatJsonCrossKind, MachoKindWithOptionalHeaderBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-with-pe-oh-block","kind":"macho"},

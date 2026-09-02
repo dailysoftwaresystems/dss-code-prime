@@ -35,9 +35,20 @@
 // Spelling out the expected message here would be the same retyping one level
 // up: both halves of the comparison would be literals nobody re-derives.
 //
-// ⚠ Runs against BOTH shipped targets. `returnVrs` is declared by arm64 and
-// EMPTY on x86_64, so a pin that only ever saw one of them would not know
-// whether it was testing the rows or one target's declarations.
+// ⚠ Runs against BOTH shipped targets, so a pin cannot confuse "the rows say
+// so" with "this one target declares it that way". The two differ in the sizes
+// of their pools (x86_64's `returnFprs` is 2 or 1; arm64's is 4) rather than in
+// which pools exist.
+//
+// ⚠⚠ THIS NOTE USED TO SAY "`returnVrs` is declared by arm64 and EMPTY on
+// x86_64", AND THAT DIFFERENCE IS GONE ALONG WITH THE KEY. R1 of the operator's
+// design A′ made arm64 declare its SIMD&FP file ONCE, so a binary128 result
+// comes back in `returnFprs[0]` = `v0` (the FULL register) rather than in a
+// second `returnVrs` pool over the same physical registers, `kReturnPoolRows`
+// is two rows, and no shipped target declares a `vr`-class register at all.
+// ★ A VR result therefore now finds NO ROW and is refused BY NAME — the
+// fail-loud answer this file exists to make observable — which is a stronger
+// statement of the same defect, not a weaker one.
 
 #include "core/types/config_key_vocabulary.hpp"   // detail::renderAllowedList
 #include "core/types/diagnostic_reporter.hpp"
@@ -215,12 +226,21 @@ TEST(LirReturnPoolProjection, EachRowResolvesTheRegisterTheCcNames) {
 // advertised the two rows that remained. Self-consistent and wrong is exactly
 // the failure mode this whole file is about, one level up.
 //
-// So this claim is about the SHIPPED ABI rather than about the rows. arm64
-// declares `returnVrs` (AAPCS64 §5.5 — a binary128 result comes back in v0) and
-// `mir_to_lir`'s F128 return verb reads `cc->returnVrs[0]` to capture it; a
-// build where a `vr` result does not resolve THROUGH that list is a
-// wrong-register capture with no diagnostic. The three field names below are the
-// corpus claim, not a second copy of the row set.
+// So this claim is about the SHIPPED ABI rather than about the rows. AAPCS64
+// §5.5 returns a binary128 result in `v0`, and `mir_to_lir`'s F128 return verb
+// reads `cc->returnFprs[0]` to capture it; a build where that result does not
+// resolve THROUGH that list is a wrong-register capture with no diagnostic. The
+// field names below are the corpus claim, not a second copy of the row set.
+//
+// ⚠⚠ A THIRD ROW `{LirRegClass::VR, &cc->returnVrs, "returnVrs"}` USED TO SIT
+// IN THIS TABLE, GUARDED BY A `sawPopulatedVrPool` NON-VACUITY FLAG BECAUSE
+// x86_64 LEFT THE POOL EMPTY. R1 of design A′ deleted `returnVrs` — it named a
+// SECOND return pool over the same physical registers `returnFprs` names — so
+// the row cannot be spelled any more and the flag it needed has nothing to
+// count. ★ The ABI fact it carried did not disappear: it moved into the
+// `returnFprs` row below, where `v0` is now named at its full sixteen bytes,
+// and the width assertion is what keeps that from silently becoming the 8-byte
+// view again.
 TEST(LirReturnPoolProjection, TheShippedCcDeclaredPoolsAreEachReachedByTheLookup) {
     struct DeclaredPool {
         LirRegClass                     cls;
@@ -228,7 +248,6 @@ TEST(LirReturnPoolProjection, TheShippedCcDeclaredPoolsAreEachReachedByTheLookup
         char const*                     field;
     };
 
-    bool sawPopulatedVrPool = false;
     for (char const* const t : kTargets) {
         SCOPED_TRACE(t);
         auto s = TargetSchema::loadShipped(t);
@@ -239,13 +258,12 @@ TEST(LirReturnPoolProjection, TheShippedCcDeclaredPoolsAreEachReachedByTheLookup
         DeclaredPool const declared[] = {
             {LirRegClass::GPR, &cc->returnGprs, "returnGprs"},
             {LirRegClass::FPR, &cc->returnFprs, "returnFprs"},
-            {LirRegClass::VR,  &cc->returnVrs,  "returnVrs"},
         };
         for (auto const& d : declared) {
-            // x86_64 declares no VR return pool at all; an empty list is a
-            // legitimate config answer and not something to assert against.
-            if (d.names->empty()) continue;
-            if (d.cls == LirRegClass::VR) sawPopulatedVrPool = true;
+            ASSERT_FALSE(d.names->empty())
+                << "the shipped cc declares an EMPTY " << d.field
+                << ", so this row probed nothing — every shipped cc returns "
+                   "both an integer and a floating result in registers";
             SCOPED_TRACE(d.field);
             DiagnosticReporter rep;
             auto const reg = returnRegisterForClass(**s, *cc, d.cls, 0, kLabel, rep);
@@ -259,9 +277,29 @@ TEST(LirReturnPoolProjection, TheShippedCcDeclaredPoolsAreEachReachedByTheLookup
                 << "the lookup did not resolve through " << d.field;
         }
     }
-    EXPECT_TRUE(sawPopulatedVrPool)
-        << "no shipped target populates a VR return pool, so the VR half of "
-           "this arm probed nothing — re-aim it before trusting it";
+
+    // ★ THE HALF THE DELETED `returnVrs` ROW USED TO CARRY, AS AN ABI CLAIM
+    // ABOUT AArch64. A binary128 result comes back in v0 — the FULL 16-byte
+    // SIMD&FP register — so the FP return pool must name that register and not
+    // its 8-byte `d0` view. This is written per-target rather than derived,
+    // because it is the fact a second pool used to state and something has to
+    // keep stating it.
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(arm.has_value());
+    auto const* aapcs64 = (*arm)->callingConvention(0);
+    ASSERT_NE(aapcs64, nullptr);
+    ASSERT_FALSE(aapcs64->returnFprs.empty());
+    EXPECT_EQ(aapcs64->returnFprs[0], "v0");
+    auto const v0 = (*arm)->registerByName(aapcs64->returnFprs[0]);
+    ASSERT_TRUE(v0.has_value());
+    auto const* v0Info = (*arm)->registerInfo(*v0);
+    ASSERT_NE(v0Info, nullptr);
+    EXPECT_EQ(v0Info->widthBytes, 16u)
+        << "the FP return register must be the FULL SIMD&FP register — an "
+           "8-byte view here captures half of a binary128 result and the other "
+           "half comes from nowhere";
+    EXPECT_TRUE(v0Info->subOf.empty())
+        << "a calling convention must name a full register, never a view";
 }
 
 // ── (B)+(C) THE REFUSAL FOR A CLASS WITH NO ROW ─────────────────────────────

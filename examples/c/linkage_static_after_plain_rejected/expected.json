@@ -1,0 +1,7 @@
+{
+  "$comment": "D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH (P50 lane li) — the OBJECT ordering every reference rejects. MEASURED 2026-09-01, each reference probed SEPARATELY: `int g; static int g;` is 'static declaration of g follows non-static declaration' on gcc 13.3.0 (-std=c2x) and clang 18.1.3 (-std=c23), and C2370 'redefinition; different storage class' on MSVC 19.51.36231 (/std:clatest /TC). This is the UNANIMOUS-reject subset only: MSVC silently ACCEPTS most other static<->non-static orderings (`static int g; int g;`, `extern int g; static int g;`, static-after-bare-prototype), so those stay accepted in DSS — see linkage_static_extern_legal for the inheritance side. Diagnostic at the second declarator's name (8:12), related location at the first. RED-ON-DISABLE: remove the merge-site linkage arm in mergeOrCollideRedeclaration -> the file compiles silently again (the pre-P50 state, returns 42) -> this manifest's expected diagnostic set is unmet.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:elf64-x86_64-linux-exec" } ],
+  "expectDiagnostics": [ { "code": "S_LinkageRedeclarationMismatch", "line": 8, "col": 12 } ]
+}

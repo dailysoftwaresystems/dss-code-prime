@@ -2388,15 +2388,19 @@ TEST(GrammarSchema, AttributeEffectAlignLoads) {
 TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
     // TF-C78 (D-CSUBSET-NOINLINE) added `noInline`; TF-C81
     // (D-CSUBSET-ALWAYSINLINE) added `alwaysInline`; TF-C92
-    // (D-CSUBSET-NO-SANITIZE-THREAD) added `noSanitizeThread`. This list is the
-    // hand-maintained mirror of the loader's `kEffectVerbs`, and it going RED
-    // on a vocabulary change is the test working as designed — the whole point
-    // is that a verb cannot be added to the loader without the closed-set
-    // message and this mirror both accounting for it.
+    // (D-CSUBSET-NO-SANITIZE-THREAD) added `noSanitizeThread`; P44 lane h
+    // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN) added
+    // `runBeforeEntry` and `runAfterEntry`. This list is the hand-maintained
+    // mirror of the loader's `kEffectVerbs`, and it going RED on a vocabulary
+    // change is the test working as designed — the whole point is that a verb
+    // cannot be added to the loader without the closed-set message and this
+    // mirror both accounting for it.
     constexpr std::string_view kVerbs[] = {"suppressUnused", "warnOnUse",
                                            "warnOnDiscard", "align",
                                            "noInline", "alwaysInline",
-                                           "noSanitizeThread", "none"};
+                                           "noSanitizeThread",
+                                           "runBeforeEntry", "runAfterEntry",
+                                           "none"};
     // The message under test.
     auto const bad = attrVocabSchema(
         R"([ { "names": ["aligned"], "effect": "algin" } ])", "", "");
@@ -2941,17 +2945,20 @@ TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedC) {
 // BASELINE. A consistent vocabulary loads clean, so every negative below
 // cannot pass for the wrong reason.
 //
-// ★★ P42 — THAT POSITIVE PIN WAS ATTACKED THIS CYCLE AND **SURVIVED BY
-// MEASUREMENT**; it is stronger than its own wording suggests, so read the
-// engine comment beside the `AttributeEffect::None` skip before touching it.
-// Deleting the skip looks right — nothing else forces an inert name into the
-// roster, which is exactly how three of the shipped c's inert names drifted out
-// of it unnoticed. But the roster entry the check then demands ✔MEASURED turns
+// ~~ P42 recorded here that the `AttributeEffect::None` skip was load-bearing,
+// on a measurement P44 REVERSED. Kept as a tombstone because the reasoning is
+// the kind that recurs. The finding was: adding `packed` to the roster turned
 // `__attribute__((packed)) struct S { char c; int v; } gv;` from a loud refusal
-// into rc=0 with `sizeof == 8`, byte-identical to the UNPACKED control: the
-// ignored-name list is consulted BEFORE anything can honor the attribute, so
-// the entry discards a LAYOUT FACT rather than a diagnostic. The exemption is
-// load-bearing, not unfinished.
+// into rc=0 with `sizeof == 8`, "byte-identical to the UNPACKED control" ⇒ a
+// discarded layout fact. ✔RE-MEASURED against the REFERENCES instead of against
+// the unpacked control: gcc 13.3.0 and clang 18.1.3 BOTH give `sizeof == 8` on
+// that exact program, both warning `'packed' attribute ignored`. 8 is the
+// CORRECT answer — a leading `packed` reaches the composite in none of the three
+// — so nothing was discarded and the control was the wrong one. ✔The mechanism
+// claim fails independently too: `deprecated` has always been in this roster AND
+// is honored (it warns at the use site), so ignoring a name in the linkage scan
+// does not blind the semantic scan. The skip is gone, and with it the whole
+// clause; the roster's attribute half is DERIVED from `attributeEffects` now. ~~
 TEST(GrammarSchema, AttributeVocabularyConsistentPairLoadsCleanly) {
     auto const cfg =
         attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, "");
@@ -2961,32 +2968,82 @@ TEST(GrammarSchema, AttributeVocabularyConsistentPairLoadsCleanly) {
     EXPECT_EQ((*r)->semantics().attributeEffects.size(), 2u);
 }
 
-// CLAUSE B, DRIFTED. `deprecated` keeps its declaration-attached effect but is
-// dropped from the row's ignore list — exactly what happens when someone edits
-// one list and not the other. Left unchecked this is not a load error but a
-// COMPILE error on legal source: a leading `__attribute__((deprecated))` fails
-// H_UnknownLinkageSpecifier, so the effects row can never fire.
-TEST(GrammarSchema, AttributeVocabularyDriftedIgnoreListReportsInvalid) {
+namespace {
+// Membership in a row's EFFECTIVE (post-derivation) ignore roster. The
+// derivation stores dunder-stripped names, which is what `linkageFrom` compares
+// against, so the tests below ask the question in the reader's own terms.
+[[nodiscard]] bool ignoresName(DeclarationRule const& d, std::string_view n) {
+    return std::ranges::find(d.linkageSpecifierIgnoredNames, std::string{n})
+           != d.linkageSpecifierIgnoredNames.end();
+}
+} // namespace
+
+// ★★ P44 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY) — CLAUSE B IS GONE AND
+// THESE PINS REPLACE IT, ASSERTING THE DERIVATION THAT MADE IT UNNECESSARY.
+//
+// Clause B used to REFUSE this very config, demanding the author hand-copy
+// `deprecated` from the effects table into the row's roster. It was right about
+// the defect (an unignored declaration-attached name means a leading
+// `__attribute__((deprecated))` fails H_UnknownLinkageSpecifier, so the effects
+// row can never fire) and wrong about the remedy: a guard whose fix is "keep two
+// lists in sync" institutionalises the drift it detects. The loader now DERIVES
+// the attribute half of the roster from `attributeEffects`, so the same input
+// LOADS and the name is ignored anyway.
+//
+// This is a strictly stronger assertion than the refusal it replaces: the old
+// pin only proved the loader could say no, this one proves what the loaded
+// config MEANS. RED-ON-DISABLE (REMOVE direction): delete the derivation loop in
+// `grammar_schema_json.cpp` and `ignoresName(..., "deprecated")` goes false.
+TEST(GrammarSchema, AttributeVocabularyDeclarationAttachedEffectIsIgnoredByDerivation) {
     auto const cfg = attrVocabSchema(
         kConsistentEffects, R"("linkageSpecifierIgnoredNames": ["noreturn"],)",
         "");
     auto r = GrammarSchema::loadFromText(cfg);
-    ASSERT_FALSE(r.has_value())
-        << "an effects name with a declaration-attached effect that the row's "
-           "strict linkage scan neither ignores nor recognizes must fail the "
-           "load";
-    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
-    bool namesBothLists = false;
-    for (auto const& d : r.error()) {
-        if (d.message.find("attributeSemantics.effects") != std::string::npos
-            && d.message.find("linkageSpecifierIgnoredNames")
-                   != std::string::npos) {
-            namesBothLists = true;
-        }
-    }
-    EXPECT_TRUE(namesBothLists)
-        << "the drift message must name BOTH lists — the reader has to know "
-           "which two surfaces disagree, not merely that something does";
+    ASSERT_TRUE(r.has_value())
+        << "a row that does not hand-copy the effects vocabulary must LOAD — "
+           "the roster is derived, not transcribed: "
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    auto const& d = (*r)->semantics().declarations[0];
+    EXPECT_TRUE(ignoresName(d, "deprecated"))
+        << "a declaration-attached effect name must be ignored by the strict "
+           "linkage scan without anyone writing it down twice";
+    EXPECT_TRUE(ignoresName(d, "fallthrough"))
+        << "and the INERT names come with it — the `none`-verb exemption that "
+           "let three shipped names drift out of the roster is gone";
+    EXPECT_TRUE(ignoresName(d, "noreturn"))
+        << "the hand-written entry survives: this key can still name an "
+           "identifier that is not attribute vocabulary at all";
+}
+
+// ★★★ THE EXCLUSION, AND IT IS THE ONE PROPERTY THIS DERIVATION MUST NEVER LOSE.
+// A name the row declares as ITS OWN linkage specifier is never ignored, even
+// when an `effects` row also carries it — and c has exactly that shape, because
+// `weak` and `visibility` carry an inert row for their kind axis while
+// `topLevelDecl` models them as real linkage. `linkageFrom` consults this roster
+// BEFORE it assembles the composite `<name>:<body>` key, so an unguarded
+// derivation would make a hidden symbol silently default-visible: a
+// linker-visible wrong answer, not a missing warning.
+// The COMPOSITE key is tested, not the plain one, because the identifier half is
+// the only half source text can spell and it is the half the exclusion must
+// compare.
+TEST(GrammarSchema, AttributeVocabularyDerivationNeverIgnoresTheRowsOwnLinkageSpecifier) {
+    auto const cfg = attrVocabSchema(
+        R"([ { "names": ["visibility"], "appliesTo": ["variable"],
+               "effect": "none" },
+             { "names": ["deprecated"], "appliesTo": ["variable"],
+               "effect": "warnOnUse" } ])",
+        "", "",
+        R"("visibility:hidden": { "binding": "local" }, )");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    auto const& d = (*r)->semantics().declarations[0];
+    EXPECT_FALSE(ignoresName(d, "visibility"))
+        << "a name this row models as LINKAGE must never be derived into its "
+           "ignore roster — the linkage fact would be silently dropped";
+    EXPECT_TRUE(ignoresName(d, "deprecated"))
+        << "…while a name it does NOT model as linkage still is, which is what "
+           "makes the exclusion a discrimination rather than a switch-off";
 }
 
 // CLAUSE B, INERT NAMES STAY EXEMPT. The same drifted shape but with the name
@@ -2995,28 +3052,18 @@ TEST(GrammarSchema, AttributeVocabularyDriftedIgnoreListReportsInvalid) {
 // ignored everywhere" rule, which would reject the shipped c (whose
 // `fallthrough`/`likely`/`packed` rows are deliberately not ignore-listed).
 //
-// ★★★ P42 — THIS PIN IS **STRONGER THAN IT LOOKS, AND IT WAS EARNED**. The
-// exemption reads like an unfinished carve-out, and this cycle tried to delete
-// it: nothing else forces an inert name into `linkageSpecifierIgnoredNames`,
-// which is exactly how `packed`, `may_alias` and `transparent_union` drifted out
-// of the shipped roster unnoticed, leaving `__attribute__((packed)) int gv = 1;`
-// a loud `error[H000C]` where clang 18.1.3 and gcc 13.3.0 both compile at rc=0.
+// ★★ P44 — WHAT THIS PIN NOW MEANS. There is no `none`-verb exemption any more,
+// because there is no clause B: the loader DERIVES the attribute half of every
+// strict-scan row's roster from `attributeEffects`, so an inert name is
+// neutralised exactly like a firing one and neither has to be written down
+// twice. This test still passes and is still worth keeping — it says a config
+// that declares an inert name and does NOT hand-list it loads clean — but it is
+// no longer pinning an exemption, it is pinning the ordinary case.
 //
-// ⛔ THE REMEDY THE CHECK PRESCRIBES IS A SILENT MISCOMPILE FOR THOSE THREE.
-// ✔MEASURED end-to-end with the shipped CLI, the skip deleted and `packed` duly
-// added to the roster: `__attribute__((packed)) struct S { char c; int v; } gv;`
-// went from a loud refusal to **rc=0 with `sizeof(struct S) == 8`** — identical
-// to the UNPACKED control, while the trailing spelling still yields 5. The
-// linkage scan consults the ignored-name list BEFORE anything can honor the
-// attribute, so the entry discards a LAYOUT FACT, not a diagnostic.
-//
-// ★ The general reading, which is the part worth carrying: the check infers
-// "this effects row is UNREACHABLE" from "this declaration form refuses the
-// name". For a FIRING verb that holds. For an INERT name it does not — c's
-// `packed` row is reached from `typedefDecl`/`structSpec`/the member rows, none
-// of which runs the strict scan, and the file-scope refusal is a DELIBERATE
-// statement that DSS cannot honor `packed` there. Do not delete this exemption
-// without a way to tell those two apart.
+// ~~ P42's reasoning for the exemption is preserved above, at the baseline pin,
+// together with the re-measurement that reversed it. In short: the "silent
+// miscompile" it feared was DSS agreeing with gcc and clang, read against the
+// unpacked control instead of against the references. ~~
 TEST(GrammarSchema, AttributeVocabularyInertEffectNeedsNoIgnoreEntry) {
     auto const cfg = attrVocabSchema(
         R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
@@ -3044,37 +3091,29 @@ TEST(GrammarSchema, AttributeVocabularyInertEffectNeedsNoIgnoreEntry) {
 // The gate now reads `linkageSpecifierIgnoredRules` FIRST and the name list
 // only as a fallback, giving three tiers. The four tests below pin each.
 
-// (i) TIER 2 — DELETING THE WHOLE NAMES KEY MUST STILL FAIL. The row ignores
-// `stdAttr` wholesale but leaves `attrSpec` LIVE, so it has demonstrably
-// reasoned about attribute syntax reaching this declaration form and part of
-// that syntax still routes identifiers to the strict name lookup. The gate
-// therefore keys on the RULES list, which this edit does not touch — the whole
-// point, since deleting the names list is exactly how the old gate was
-// switched off.
-TEST(GrammarSchema, AttributeVocabularyWholeIgnoredNamesKeyDeletedReportsInvalid) {
+// (i) THE WHOLE NAMES KEY ABSENT — the edit that used to be the one that
+// ESCAPED the old gate (emptying the list disarmed the check that read it), and
+// which the derivation makes a non-event. There is nothing to empty: the roster
+// is computed, so a config that never writes the key gets the same effective
+// vocabulary as one that writes all of it.
+// P44: replaces `AttributeVocabularyWholeIgnoredNamesKeyDeletedReportsInvalid`,
+// which asserted a refusal that would now be DSS demanding a transcription.
+TEST(GrammarSchema, AttributeVocabularyDerivationSurvivesTheWholeNamesKeyBeingAbsent) {
     auto const cfg = attrVocabSchema(
         kConsistentEffects,
         R"("linkageSpecifierIgnoredRules": ["stdAttr"],)", "");
     auto r = GrammarSchema::loadFromText(cfg);
-    ASSERT_FALSE(r.has_value())
-        << "deleting the ENTIRE 'linkageSpecifierIgnoredNames' key is the SAME "
-           "drift as deleting one entry from it, and must not be the version "
-           "that escapes by emptying the list the gate reads";
-    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
-    bool rightDiag = false;
-    for (auto const& d : r.error()) {
-        if (d.code == DiagnosticCode::C_InvalidSemantics
-            && d.path == "/semantics/declarations/0/"
-                         "linkageSpecifierIgnoredNames"
-            && d.message.find("attribute-vocabulary drift") != std::string::npos
-            && d.message.find("deprecated") != std::string::npos) {
-            rightDiag = true;
-        }
-    }
-    EXPECT_TRUE(rightDiag)
-        << "the diagnostic must be the drift one, AT the ignore-names path, "
-           "naming 'deprecated' — asserting only that the load failed would "
-           "pass for any unrelated error";
+    ASSERT_TRUE(r.has_value())
+        << "no 'linkageSpecifierIgnoredNames' key at all must load — the "
+           "attribute half of the roster has one owner and it is the effects "
+           "table: "
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    auto const& d = (*r)->semantics().declarations[0];
+    EXPECT_TRUE(ignoresName(d, "deprecated"));
+    EXPECT_TRUE(ignoresName(d, "fallthrough"));
+    EXPECT_FALSE(ignoresName(d, "st"))
+        << "the row's own linkage keyword is not attribute vocabulary and must "
+           "not appear — a roster that swallowed it would ignore real linkage";
 }
 
 // ★★ TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the NEW verb participates in the SAME
@@ -3090,50 +3129,43 @@ TEST(GrammarSchema, AttributeVocabularyWholeIgnoredNamesKeyDeletedReportsInvalid
 // contract for the verb whose config edits are newest and therefore likeliest to be
 // half-reverted.
 //
-// BOTH DIRECTIONS ARE ASSERTED: without the ignored name the load must FAIL with the
-// drift diagnostic naming the attribute; with it the load must SUCCEED. The second
-// half matters as much as the first — a check that rejected the consistent
-// configuration too would be indistinguishable from a working one here.
-TEST(GrammarSchema, NoSanitizeThreadEffectRequiresTheIgnoredNameToo) {
+// BOTH DIRECTIONS ARE ASSERTED: with the effects row ALONE the derived roster
+// must already carry the name (the half-landed config edit is no longer a
+// half-landed edit — there is only one half); and with a redundant hand-written
+// entry the load must still succeed and the name must appear ONCE, because a
+// roster that grew a duplicate on every reload would be a slow leak nobody looks
+// at.
+// P44: this pin used to require the SECOND, hand-copied config edit and to
+// assert the loader refused without it. The three-coordinated-edits problem it
+// was written for is dissolved rather than guarded: there is now one edit.
+TEST(GrammarSchema, NoSanitizeThreadEffectIsIgnoredWithoutAHandWrittenEntry) {
     constexpr std::string_view kEffects =
         R"([ { "names": ["no_sanitize_thread"], "appliesTo": ["function"],
                "effect": "noSanitizeThread" } ])";
 
-    // (a) the effect row alone — the half-landed config edit.
-    auto const missing = attrVocabSchema(
+    // (a) the effect row alone — what used to be the half-landed config edit.
+    auto const alone = attrVocabSchema(
         kEffects, R"("linkageSpecifierIgnoredRules": ["stdAttr"],)", "");
-    auto rBad = GrammarSchema::loadFromText(missing);
-    ASSERT_FALSE(rBad.has_value())
-        << "a declaration-attached `noSanitizeThread` effect whose name is NOT in "
-           "this row's linkageSpecifierIgnoredNames must fail the LOAD — otherwise "
-           "the effects row is unreachable config: a leading "
+    auto rAlone = GrammarSchema::loadFromText(alone);
+    ASSERT_TRUE(rAlone.has_value())
+        << "declaring the effect is the whole edit: "
+        << errorDiags(rAlone.error());
+    EXPECT_TRUE(ignoresName((*rAlone)->semantics().declarations[0],
+                            "no_sanitize_thread"))
+        << "otherwise the effects row is unreachable config — a leading "
            "__attribute__((no_sanitize_thread)) would die at the linkage tier "
            "before the semantic scan ever runs";
-    EXPECT_TRUE(hasDiagCode(rBad.error(), DiagnosticCode::C_InvalidSemantics));
-    bool rightDrift = false;
-    for (auto const& d : rBad.error()) {
-        if (d.code == DiagnosticCode::C_InvalidSemantics
-            && d.path == "/semantics/declarations/0/"
-                         "linkageSpecifierIgnoredNames"
-            && d.message.find("attribute-vocabulary drift") != std::string::npos
-            && d.message.find("no_sanitize_thread") != std::string::npos) {
-            rightDrift = true;
-        }
-    }
-    EXPECT_TRUE(rightDrift)
-        << "the diagnostic must be the drift one, AT the ignore-names path, and it "
-           "must NAME the attribute the author has to add: "
-        << errorDiags(rBad.error());
 
-    // (b) both halves present — must load clean. This is the shape the shipped
-    // c config uses on BOTH its topLevelDecl and externDecl rows.
-    auto const consistent = attrVocabSchema(
+    // (b) a redundant hand-written entry — still loads, and does not double.
+    auto const redundant = attrVocabSchema(
         kEffects, R"("linkageSpecifierIgnoredNames": ["no_sanitize_thread"],)", "");
-    auto rGood = GrammarSchema::loadFromText(consistent);
-    ASSERT_TRUE(rGood.has_value())
-        << "the CONSISTENT pairing must load — a gate that also rejected this "
-           "would look identical to a working one in half (a): "
-        << errorDiags(rGood.error());
+    auto rRedundant = GrammarSchema::loadFromText(redundant);
+    ASSERT_TRUE(rRedundant.has_value()) << errorDiags(rRedundant.error());
+    auto const& names =
+        (*rRedundant)->semantics().declarations[0].linkageSpecifierIgnoredNames;
+    EXPECT_EQ(std::ranges::count(names, std::string{"no_sanitize_thread"}), 1)
+        << "a hand entry the derivation would also produce must not be added "
+           "twice — the derivation dedups against what the row already says";
 }
 
 // (i-b) TIER 3 — a row that mentions NO attribute rule at all and ignores
@@ -3182,21 +3214,24 @@ TEST(GrammarSchema, AttributeVocabularyRowIgnoringAttrRulesWholesaleIsExempt) {
         << errorDiags(r.error());
 }
 
-// (iii) THE EXEMPTION IS ALL-OR-NOTHING. Skipping `attrSpec` while leaving
-// `stdAttr` live still lets a `[[deprecated]]` identifier reach the strict
-// lookup, so a PARTIAL wholesale skip must NOT exempt the row. Without this the
-// fix for (ii) would be "any ignoredRules entry disarms the check" — trading
-// one silent hole for another.
-TEST(GrammarSchema, AttributeVocabularyPartialWholesaleSkipIsNotExempt) {
+// (iii) A PARTIAL WHOLESALE SKIP STILL GETS THE DERIVATION. Skipping `attrSpec`
+// while leaving `stdAttr` live lets a `[[deprecated]]` identifier reach the
+// strict lookup, so the row still needs the attribute vocabulary neutralised —
+// and gets it without asking. P44: this replaces a pin that asserted the loader
+// REFUSED such a row. The tiering that decision needed is gone with clause B;
+// the derivation applies to every row whose strict scan runs, which is a simpler
+// rule and a stricter one (tier 3's documented reachability hole — a row that
+// mentions no attribute rule and ignores nothing by name — closed with it).
+TEST(GrammarSchema, AttributeVocabularyPartialWholesaleSkipStillGetsTheDerivation) {
     auto const cfg = attrVocabSchema(
         kConsistentEffects,
         R"("linkageSpecifierIgnoredRules": ["attrSpec"],)", "");
     auto r = GrammarSchema::loadFromText(cfg);
-    ASSERT_FALSE(r.has_value())
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    EXPECT_TRUE(ignoresName((*r)->semantics().declarations[0], "deprecated"))
         << "ignoring only SOME attribute rules still leaves the others' "
-           "identifiers reaching the strict lookup — the wholesale exemption "
-           "must require ALL of them";
-    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+           "identifiers reaching the strict lookup, so the name must be "
+           "neutralised there too";
 }
 
 // CLAUSE A, DRIFTED. `packed.attributeNames` names a spelling the dedicated
@@ -6661,60 +6696,75 @@ TEST(GrammarSchema, AttributeVocabularyCrossCheckAcceptsShippedC) {
         << errorDiags(result.error());
 }
 
-// (2) THE LIVE PROOF. A wall alone can pass because the check never runs. So
-//     drift the REAL config by one character — delete `deprecated` from
-//     `topLevelDecl`'s ignore list while its `warnOnUse` effects row stays —
-//     and the load must FAIL. Without this, a cross-check that silently
-//     no-ops on the shipped config would look identical to one that works.
-TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnDriftedShippedC) {
-    std::string text = shippedCTextForPrefixTest();
+// (2) THE LIVE PROOF, AGAINST THE REAL CONFIG. A wall alone can pass because
+//     nothing ran. P44 replaced the two mutation pins that used to live here —
+//     they deleted an entry, and then the whole key, from `topLevelDecl`'s
+//     28-name roster and required the LOAD to fail. That roster no longer
+//     exists: the attribute half is derived, so there is nothing to delete and
+//     "the load fails" is no longer the property worth pinning.
+//
+//     What is pinned instead is the derived CONTENT of the shipped rows, which
+//     is what the compiler actually consumes — including the three names that
+//     had DRIFTED OUT of the hand roster (`packed`, `may_alias`,
+//     `transparent_union`, ✔MEASURED as `error[H000C]` on legal C before this
+//     change) and the two that must NEVER be in it.
+TEST(GrammarSchema, DerivedIgnoredNamesCoverShippedCsEffectsVocabulary) {
+    std::string const text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
-    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c must load clean before mutation";
-    std::string const needle = R"("linkageSpecifierIgnoredNames": ["noreturn", "deprecated",)";
-    auto const pos = text.find(needle);
-    ASSERT_NE(pos, std::string::npos)
-        << "the topLevelDecl ignore list was not found — if the list was "
-           "reformatted, update this needle rather than dropping the pin";
-    text.replace(pos, needle.size(),
-                 R"("linkageSpecifierIgnoredNames": ["noreturn",)");
-    auto result = GrammarSchema::loadFromText(text);
-    ASSERT_FALSE(result.has_value())
-        << "dropping a declaration-attached effect's name from the real "
-           "config's ignore list must fail the load — otherwise a leading "
-           "__attribute__((deprecated)) rejects legal C at COMPILE time and "
-           "nothing said so at LOAD time";
-    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidSemantics));
+    auto r = GrammarSchema::loadFromText(text);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    auto const& sem = (*r)->semantics();
+    DeclarationRule const* top = nullptr;
+    for (auto const& d : sem.declarations)
+        if (d.ruleName == "topLevelDecl") { top = &d; break; }
+    ASSERT_NE(top, nullptr) << "shipped c must still carry a topLevelDecl row";
+    for (char const* n : {"deprecated", "no_sanitize_thread", "fallthrough",
+                          "packed", "may_alias", "transparent_union"}) {
+        EXPECT_TRUE(ignoresName(*top, n))
+            << "every effects name must be neutralised at the strict linkage "
+               "scan, inert ones included — the `none`-verb exemption is what "
+               "let three of these drift out: " << n;
+    }
+    for (char const* n : {"weak", "visibility"}) {
+        EXPECT_FALSE(ignoresName(*top, n))
+            << "…except a name this row models as LINKAGE, which the derivation "
+               "must exclude or the binding is silently dropped: " << n;
+    }
 }
 
-// (3) THE LIVE PROOF FOR THE WHOLE-KEY EDIT. Deleting ONE entry (above) is the
-//     small edit; deleting the ENTIRE `linkageSpecifierIgnoredNames` key is the
-//     large one, and it used to be the one that escaped — the gate exempted any
-//     row whose list was empty, so emptying the list disarmed the check for that
-//     row. Same config, same drift, one keystroke further.
-TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnWholeKeyDeletedFromShippedC) {
+// (3) THE LIVE PROOF THAT THE DERIVATION IS RUNNING, in the REMOVE direction —
+//     the only direction that can fail toward "clean". An ADD-direction mutant
+//     (splice a new name into `effects` and watch it appear) would stay green if
+//     the derivation were deleted and the shipped roster hand-written again,
+//     because the hand roster already carries every name. Removing `deprecated`
+//     from the shipped EFFECTS table must therefore remove it from the derived
+//     ignore roster: nothing else in the document mentions it.
+TEST(GrammarSchema, DerivedIgnoredNamesLoseANameRemovedFromShippedCsEffects) {
     std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
-    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c must load clean before mutation";
-    // `topLevelDecl`'s list — the row that does NOT ignore `attrSpec`
-    // wholesale, so its per-name opt-in is the only thing keeping a leading
-    // `__attribute__((deprecated))` from failing H_UnknownLinkageSpecifier.
-    std::string const needle = R"("linkageSpecifierIgnoredNames": ["noreturn", "deprecated",)";
+    // The NAMES array of the shipped `warnOnUse` row. Matching the names alone
+    // (not the whole row) keeps this needle stable against the row's `$comment`
+    // and `appliesTo` moving, which is what a full-row needle would break on.
+    std::string const needle = R"("names": ["deprecated"], "appliesTo")";
     auto const pos = text.find(needle);
     ASSERT_NE(pos, std::string::npos)
-        << "the topLevelDecl ignore list was not found — if the list was "
+        << "the shipped `deprecated` effects row was not found — if it was "
            "reformatted, update this needle rather than dropping the pin";
-    auto const close = text.find("],", pos);
-    ASSERT_NE(close, std::string::npos);
-    text.erase(pos, close + 2 - pos);
-    auto result = GrammarSchema::loadFromText(text);
-    ASSERT_FALSE(result.has_value())
-        << "deleting the ENTIRE ignore-names key from the real config must "
-           "fail the load — an empty list is not an opt-out, it is the same "
-           "drift as deleting one entry and must not be the version that "
-           "escapes";
-    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidSemantics));
+    text.replace(pos, needle.size(),
+                 R"("names": ["deprecated_xyz"], "appliesTo")");
+    auto r = GrammarSchema::loadFromText(text);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    DeclarationRule const* top = nullptr;
+    for (auto const& d : (*r)->semantics().declarations)
+        if (d.ruleName == "topLevelDecl") { top = &d; break; }
+    ASSERT_NE(top, nullptr);
+    EXPECT_FALSE(ignoresName(*top, "deprecated"))
+        << "the roster tracks the effects table — a name the table no longer "
+           "declares must stop being ignored, or the derivation is not what is "
+           "producing this list";
+    EXPECT_TRUE(ignoresName(*top, "deprecated_xyz"))
+        << "…and the renamed one must take its place, which is the other half "
+           "of the same claim";
 }
 
 // (4) THE LIVE PROOF THAT THE CHECK IS NOT OVER-STRICT. `varDecl` ignores

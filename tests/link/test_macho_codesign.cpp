@@ -97,6 +97,8 @@ namespace {
     return std::string(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-adhoc","kind":"macho"},
@@ -343,6 +345,8 @@ namespace {
     return std::string(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-bad","kind":"macho"},
@@ -491,6 +495,8 @@ TEST(MachOAdHocCodeSign, ObjectFiletypeWithCodeSignatureFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-obj-with-cs","kind":"macho"},

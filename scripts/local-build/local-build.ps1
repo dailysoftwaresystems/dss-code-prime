@@ -9,6 +9,20 @@
 #   scripts\local-build\local-build.ps1 -Tree rel           # operate on build\rel instead
 #   scripts\local-build\local-build.ps1 -Tree lane1 -BuildType Debug
 #
+# ⚠ A LANE TREE TAKES -BuildType EXACTLY ONCE, ON ITS FIRST CONFIGURE, AND
+# REFUSES IT EVER AFTER. Only `dbg` -> Debug and `rel` -> Release are names this
+# repository has an established meaning for; any other tree name must be TOLD its
+# type the first time (rc 3 otherwise, naming the flag), and passing the flag to a
+# tree whose cache already declares one is ALSO rc 3 -- so a caller cannot flip a
+# configured tree underneath the artifacts already in it. Both refusals are
+# deliberate; what was missing was saying so here.
+#   first  run:  -Tree <lane> -Configure -BuildType Debug
+#   after that:  -Tree <lane>            (and -Clean to change the type)
+# ✔MEASURED by EXECUTION 2026-08-29, after a cycle brief stated this invocation
+# from the usage text WITHOUT running it and cost a lane two failed rounds --
+# D-CYCLE-BRIEF-STATED-AN-INVOCATION-ITS-AUTHOR-HAD-NEVER-RUN, one level out: the
+# usage text is itself an interface claim, and it was making one it could not keep.
+#
 # ★★★ `build\` IS A CONTAINER, NOT A BUILD TREE (the one-root layout, operator
 # 2026-08-17: one root `build/`, one SUBDIRECTORY per build). This script used to
 # treat `build\` itself as the tree, and `-Clean` was `Remove-Item -Recurse -Force

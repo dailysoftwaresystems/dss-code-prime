@@ -193,3 +193,57 @@ dss_add_test(NAME analysis/semantic/test_paren_declarator_function
              SOURCES test_paren_declarator_function.cpp)
 target_include_directories(dss_analysis_semantic_test_paren_declarator_function
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P44 lane a: [[D-CSUBSET-SUPPRESSED-SHIPPED-ROW-SIGNATURE-UNCHECKED]],
+# [[D-LANG-TYPE-IDENTITY-QUALIFIER-BLIND-VS-C23-REDECL]] and
+# [[D-CSUBSET-INCOMPATIBLE-REDECL-DIAGNOSED-AT-CALL-SITE-NOT-DECLARATION]] --
+# ONE C23 6.7.6.3p15 / 6.7.6.1p2 compatibility oracle and its three callers.
+# Lives here rather than only in the runnable corpus because almost everything
+# that separates a landed fix from an over-reach is a REFUSAL beside its nearest
+# ACCEPTING twin, and an example must BUILD: the accept half alone passes under a
+# check that was deleted, and the refuse half alone passes under one that refuses
+# everything. It also owns the SCOPE guard -- a name the source never `#include`d
+# must NOT be judged against the shipped corpus -- which is measurable only by
+# running the real descriptor corpus at two object formats in one process. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root for the same
+# reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_redeclaration_compat
+             SOURCES test_redeclaration_compat.cpp)
+target_include_directories(dss_analysis_semantic_test_redeclaration_compat
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P45 lane td: [[D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK]] — the SWEEP.
+# `resolveTypeNodeImpl` picks a type head FIRST-CHILD-THAT-RESOLVES-WINS, so any
+# identifier a decoration drags into a type-resolved child list can win over the
+# real head and silently retype the declaration. This suite pins the resolved
+# TYPE (never "compiles clean" — a hijack IS clean-compiling) at every head rule
+# in the shipped c grammar, and APPLIES the tempting wrong fix (the attribute run
+# moved inside `typedefHeadFull`) to the SHIPPED document to prove the engine now
+# refuses it loudly instead of miscompiling. It perturbs that document, so like
+# the FC3 suite it needs nlohmann and the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_type_head_hijack_sweep
+             SOURCES test_type_head_hijack_sweep.cpp)
+target_include_directories(dss_analysis_semantic_test_type_head_hijack_sweep
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(dss_analysis_semantic_test_type_head_hijack_sweep
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# P49 lane gi: [[D-CSUBSET-GENERIC-SELECTION-IS-NOT-AN-INTEGER-CONSTANT-EXPRESSION]]
+# — C23 6.5.1.1p3 makes a generic selection an integer constant expression when
+# its SELECTED assignment-expression is one, and leaves the unselected
+# associations unevaluated. `examples/c/generic_selection_constant_expression/`
+# owns the accepting half and the RUNTIME proof (the array extent is observed
+# through `sizeof`, so the example witnesses the selected VALUE and not merely a
+# successful build). This file owns what an example structurally cannot: the two
+# BOUNDARY pins, which point in opposite directions — a non-constant SELECTED arm
+# must STAY refused (the control that stops the fix closing into "a selection is
+# always constant"), while a non-constant UNSELECTED arm must fold ANYWAY. It
+# also pins all four const-expr consumers separately (`_Static_assert`, a file-
+# and block-scope array dimension, a struct member array, an enumerator value),
+# because each fails loud in its own words and the block-scope one failed
+# SILENTLY — as a VLA. Shares `semantic_test_fixture.hpp`, so it needs the tests/
+# include root for the same reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_generic_selection_constant_expression
+             SOURCES test_generic_selection_constant_expression.cpp)
+target_include_directories(dss_analysis_semantic_test_generic_selection_constant_expression
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

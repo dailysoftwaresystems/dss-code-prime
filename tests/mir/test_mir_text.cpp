@@ -6,6 +6,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_asm_descriptor.hpp"
+#include "core/types/section_kind.hpp"
 #include "mir/mir_text.hpp"
 
 #include <gtest/gtest.h>
@@ -888,4 +889,121 @@ TEST(MirText, InlineAsmGotoRendersEveryEdgeAndNamesTheUnspelledDescriptor) {
     EXPECT_FALSE(parsed->ok)
         << "the text format does not spell an asm descriptor; the parser must "
            "refuse rather than build a module missing one";
+}
+
+// ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ─────────────
+//
+// The static-initializer schedule through the `.dssir` round trip — the only
+// per-function axis here that is NOT a bool, and the only one whose printer takes
+// an ARGUMENT.
+//
+// ★★ THE PRIORITY IS THE HALF THAT NEEDS PINNING. A printer that emitted
+// `initbefore` and dropped the `(101)` round-trips a module whose initializers
+// run in a DIFFERENT ORDER than the one it was handed — and every assertion that
+// only asked "is it scheduled?" would stay green through it. Order is the entire
+// contract of a schedule, so the pins below read the priority back, not the flag.
+//
+// RED-ON-DISABLE: drop the `if (*prio != kUnprioritizedStaticInit)` argument
+// emission in `appendFuncAttrs` and %2/%3 come back unprioritized while %1 stays
+// green; delete the parser arm and every function comes back unscheduled; forget
+// `!si.any()` in the printer's all-default early return and %1 — whose only
+// non-default axis is this one — prints no `[...]` list at all.
+TEST(MirText, StaticInitScheduleSurvivesRoundTripWithItsPriority) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const voidTy = ti.primitive(TypeKind::Void);
+    TypeId const fnSig  = ti.fnSig(std::span<TypeId const>{}, voidTy, CallConv::CcSysV);
+
+    StaticInitSchedule bareBefore;
+    bareBefore.setPriorityFor(StaticInitPhase::BeforeEntry,
+                              kUnprioritizedStaticInit);
+    StaticInitSchedule prioBefore;
+    prioBefore.setPriorityFor(StaticInitPhase::BeforeEntry, 101);
+    StaticInitSchedule bothChannels;
+    bothChannels.setPriorityFor(StaticInitPhase::BeforeEntry, 102);
+    bothChannels.setPriorityFor(StaticInitPhase::AfterEntry, 103);
+
+    MirBuilder b;
+    // %1 — the BARE before-entry form and NOTHING else, so it is what forces the
+    // printer's all-default early return to account for this axis.
+    (void)b.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                        SymbolVisibility::Default, false, false, false, false,
+                        bareBefore);
+    b.beginBlock(b.createBlock(StructCfMarker::EntryBlock)); b.addReturn();
+    // %2 — a PRIORITIZED before-entry initializer.
+    (void)b.addFunction(fnSig, SymbolId{2}, SymbolBinding::Global,
+                        SymbolVisibility::Default, false, false, false, false,
+                        prioBefore);
+    b.beginBlock(b.createBlock(StructCfMarker::EntryBlock)); b.addReturn();
+    // %3 — BOTH channels at DIFFERENT priorities, composed with a linkage axis and
+    // a flag. One function occupying both channels is a measured real shape, and
+    // the two priorities differ so a printer that emitted one twice is caught.
+    (void)b.addFunction(fnSig, SymbolId{3}, SymbolBinding::Local,
+                        SymbolVisibility::Hidden, /*noInline=*/true, false, false,
+                        false, bothChannels);
+    b.beginBlock(b.createBlock(StructCfMarker::EntryBlock)); b.addReturn();
+    // %4 — no schedule: prints no attribute list, so ordinary golden text is
+    // byte-unchanged by this axis.
+    (void)b.addFunction(fnSig, SymbolId{4});
+    b.beginBlock(b.createBlock(StructCfMarker::EntryBlock)); b.addReturn();
+    Mir m = std::move(b).finish();
+
+    std::vector<std::string> names{"", "bare", "prio", "both", "plain"};
+    DiagnosticReporter r1, r2;
+    MirTextContext ctx{&ti, &names};
+    std::string const text = emitMir(m, ctx, r1);
+    auto parsed = parseMir(text, CompilationUnitId{1}, r2);
+    ASSERT_NE(parsed, nullptr);
+    ASSERT_TRUE(parsed->ok) << text;
+    ASSERT_EQ(parsed->mir.moduleFuncCount(), 4u);
+
+    auto findBySym = [&](std::uint32_t sym) -> MirFuncId {
+        for (std::uint32_t i = 0; i < parsed->mir.moduleFuncCount(); ++i) {
+            MirFuncId const f = parsed->mir.funcAt(i);
+            if (parsed->mir.funcSymbol(f).v == sym) return f;
+        }
+        return MirFuncId{};
+    };
+
+    MirFuncId const f1 = findBySym(1);
+    ASSERT_TRUE(f1.valid());
+    auto const s1 = parsed->mir.funcStaticInit(f1);
+    ASSERT_TRUE(s1.beforeEntry().has_value()) << text;
+    EXPECT_EQ(*s1.beforeEntry(), kUnprioritizedStaticInit)
+        << "the BARE form must come back UNPRIORITIZED, not priority 0 — a zero "
+           "sorts it FIRST, which is the opposite of what every reference does";
+    EXPECT_FALSE(s1.afterEntry().has_value());
+
+    MirFuncId const f2 = findBySym(2);
+    ASSERT_TRUE(f2.valid());
+    auto const s2 = parsed->mir.funcStaticInit(f2);
+    ASSERT_TRUE(s2.beforeEntry().has_value());
+    EXPECT_EQ(*s2.beforeEntry(), 101u)
+        << "the PRIORITY is the round trip's whole point:\n" << text;
+
+    MirFuncId const f3 = findBySym(3);
+    ASSERT_TRUE(f3.valid());
+    auto const s3 = parsed->mir.funcStaticInit(f3);
+    ASSERT_TRUE(s3.beforeEntry().has_value());
+    ASSERT_TRUE(s3.afterEntry().has_value());
+    EXPECT_EQ(*s3.beforeEntry(), 102u);
+    EXPECT_EQ(*s3.afterEntry(), 103u)
+        << "the two channels are independent and must not share one value";
+    EXPECT_TRUE(parsed->mir.funcNoInline(f3))
+        << "…and compose with the flag axes on one function";
+    EXPECT_EQ(parsed->mir.funcBinding(f3), SymbolBinding::Local);
+
+    MirFuncId const f4 = findBySym(4);
+    ASSERT_TRUE(f4.valid());
+    EXPECT_FALSE(parsed->mir.funcStaticInit(f4).any())
+        << "an unscheduled function must not acquire a schedule";
+    EXPECT_NE(text.find("function %4 : fn() -> void {"), std::string::npos)
+        << "an all-default function must still emit NO `[...]` list:\n" << text;
+
+    EXPECT_NE(text.find("initbefore(101)"), std::string::npos)
+        << "the printer must emit the priority in the `.dssir` text:\n" << text;
+    EXPECT_NE(text.find("initafter(103)"), std::string::npos) << text;
+
+    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    DiagnosticReporter r3;
+    EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
 }

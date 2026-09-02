@@ -41,16 +41,26 @@ using ::dss::TargetSchema;
 
 // Two register pairs per class, each a full register plus a declared
 // narrower view of it. Deliberately mirrors the shipped shape
-// (`eax`.subOf == `rax`, `w0`.subOf == `x0`, and the d/q views arm64
-// anticipates for VR) without depending on a shipped file.
+// (`eax`.subOf == `rax`, `w0`.subOf == `x0`, and arm64's `d0`.subOf ==
+// `v0`) without depending on a shipped file.
+//
+// ⚠ THE v0/d0 PAIR USED TO BE DECLARED `class:"vr"`, AND THE COMMENT ABOVE
+// USED TO CALL IT "the d/q views arm64 anticipates for VR". The anticipation
+// resolved the other way: R1 of design A′ made arm64 declare its SIMD&FP file
+// ONCE, so `v0` is a 16-byte `fpr` ROOT and `d0` is its 8-byte `fpr` VIEW,
+// and no shipped target declares a `vr` register at all. The fixture follows
+// the shipped shape because that is the shape the rule now has to catch: a
+// WIDE root and a NARROW view inside ONE class, which is exactly the pair
+// D-TARGET-ALIASED-VIEWS-BOTH-ALLOCATABLE-DOUBLE-COUNT-ONE-FILE deliberately
+// does not judge (it skips same-class pairs) and this rule therefore must.
 constexpr std::string_view kRegisters = R"(
     {"name":"rax", "class":"gpr","widthBytes":8,"hwEncoding":0},
     {"name":"eax", "class":"gpr","widthBytes":4,"hwEncoding":0,"subOf":"rax"},
     {"name":"rbx", "class":"gpr","widthBytes":8,"hwEncoding":3},
     {"name":"xmm0","class":"fpr","widthBytes":8,"hwEncoding":0},
     {"name":"xmm0s","class":"fpr","widthBytes":4,"hwEncoding":0,"subOf":"xmm0"},
-    {"name":"v0",  "class":"vr", "widthBytes":16,"hwEncoding":0},
-    {"name":"d0",  "class":"vr", "widthBytes":8,"hwEncoding":0,"subOf":"v0"}
+    {"name":"v0",  "class":"fpr","widthBytes":16,"hwEncoding":1},
+    {"name":"d0",  "class":"fpr","widthBytes":8,"hwEncoding":1,"subOf":"v0"}
 )";
 
 // A target whose single calling convention carries `ccBody`. Everything
@@ -99,9 +109,9 @@ constexpr std::string_view kRegisters = R"(
 // ── the rule fires, on every list ────────────────────────────────────────
 
 // The plural-list half. Each of the six lists `buildFreeLists` /
-// `pickScratchRegs` absorb into their `allocatable` set is covered, plus
-// the two VR lists that share the same resolution path — one rule at one
-// site, not a per-list special case, so a future seventh list inherits it.
+// `pickScratchRegs` absorb into their `allocatable` set is covered — one
+// rule at one site, not a per-list special case, so a future seventh list
+// inherits it.
 TEST(TargetSubRegisterValidation, SubRegisterInAnyCcListRejectedAtLoad) {
     struct Case {
         char const* field;
@@ -111,6 +121,16 @@ TEST(TargetSubRegisterValidation, SubRegisterInAnyCcListRejectedAtLoad) {
     // Each sub-register is CORRECTLY CLASSED for its list, so the only
     // rule that can fire is the sub-register rule — a class-mismatch
     // diagnostic could otherwise mask a missing rejection.
+    //
+    // ⚠ TWO ROWS WERE DELETED HERE AND TWO REPLACE THEM. The deleted pair was
+    // {"argVrs","d0","v0"} / {"returnVrs","d0","v0"} — "the two VR lists that
+    // share the same resolution path". Those cc keys no longer exist: R1 of
+    // design A′ removed the second declaration of arm64's SIMD&FP file, and
+    // `argVrs`/`returnVrs` went with it (a cc still declaring one is now
+    // refused as an UNKNOWN KEY — pinned in `test_target_schema`). The v0/d0
+    // pair is kept and re-aimed at the FP lists, because that pair is now the
+    // SHIPPED arm64 shape and this rule is what keeps `d0` out of the free
+    // list beside `v0`.
     constexpr Case kCases[] = {
         {"argGprs",     "eax",   "rax"},
         {"returnGprs",  "eax",   "rax"},
@@ -118,8 +138,8 @@ TEST(TargetSubRegisterValidation, SubRegisterInAnyCcListRejectedAtLoad) {
         {"calleeSaved", "eax",   "rax"},
         {"argFprs",     "xmm0s", "xmm0"},
         {"returnFprs",  "xmm0s", "xmm0"},
-        {"argVrs",      "d0",    "v0"},
-        {"returnVrs",   "d0",    "v0"},
+        {"argFprs",     "d0",    "v0"},
+        {"callerSaved", "d0",    "v0"},
     };
 
     for (auto const& c : kCases) {
@@ -196,10 +216,15 @@ TEST(TargetSubRegisterValidation, RejectionNamesRegisterListAndParent) {
 TEST(TargetSubRegisterValidation, FullRegistersInEveryCcRoleStillLoad) {
     auto r = TargetSchema::loadFromText(
         targetWithCc(
+            // ⚠ `"argVrs":["v0"],"returnVrs":["v0"]` USED TO SIT HERE. Those
+            // keys are retired and are now REFUSED as unknown, so leaving
+            // them would make this positive control fail for a reason that
+            // has nothing to do with `subOf`. `v0` keeps its place in the
+            // fixture through `callerSaved`, so the FULL 16-byte root really
+            // is exercised in an allocatable list.
             R"("argGprs":["rax","rbx"],"returnGprs":["rax"],
-                "callerSaved":["rax"],"calleeSaved":["rbx"],
+                "callerSaved":["rax","v0"],"calleeSaved":["rbx"],
                 "argFprs":["xmm0"],"returnFprs":["xmm0"],
-                "argVrs":["v0"],"returnVrs":["v0"],
                 "stackPointer":"rbx","framePointer":"rax",
                 "linkRegister":"rax","indirectResultRegister":"rbx")"),
         "<inline>");

@@ -1072,3 +1072,30 @@ TEST(UnsuppressableCodes, EveryMemberHasAnEmitSiteOrIsMarkedRetired) {
                "code is live.";
     }
 }
+
+// P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH +
+// D-CSUBSET-NORETURN-NON-FUNCTION-OBJECT): the two codes minted in one cycle
+// took OPPOSITE suppression polarities, and the asymmetry is the measured
+// union boundary, so pin BOTH directions (the #error/#warning pair
+// precedent above):
+//   - the linkage mismatch is the one static<->non-static ordering gcc,
+//     clang AND MSVC all reject; suppressed, the merge keeps one record's
+//     storage class and the artifact exports a symbol the program declared
+//     internal (the S_ThreadLocalRedeclarationMismatch reason, one axis
+//     over) -> MEMBER;
+//   - the noreturn warning follows gcc's accept-and-ignore meaning; the
+//     build proceeds identically with or without it, so it fails both
+//     membership prongs and must stay suppressable (the
+//     S_AsmLabelOnAutomaticVariable posture) -> NON-member.
+TEST(UnsuppressableCodes, P50LinkagePairPinsBothPolarities) {
+    EXPECT_TRUE(
+        isUnsuppressable(DiagnosticCode::S_LinkageRedeclarationMismatch))
+        << "silencing the C 6.2.2p7 mismatch ships a wrong-linkage artifact "
+           "green (int g; static int g; keeps the plain tentative and "
+           "EXPORTS a symbol the program declared internal)";
+    EXPECT_FALSE(
+        isUnsuppressable(DiagnosticCode::S_NoreturnNonFunctionObject))
+        << "gcc's own meaning for _Noreturn on a non-function is warn-and-"
+           "ignore; hiding the advice changes nothing in the artifact, so "
+           "membership would loosen the table's one criterion";
+}

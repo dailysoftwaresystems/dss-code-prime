@@ -7,6 +7,7 @@
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table_json.hpp"
 #include "core/types/artifact_profile.hpp"  // isRegisteredArtifactProfile / registeredArtifactProfileList (AP3, shared w/ grammar loader)
+#include "core/types/config_document_parse.hpp"  // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY (TF-C74 extraction)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/predefined_macro_json.hpp"  // detail::parsePredefinedMacroArray (TF-C97 — the SHARED predefine grammar, 3rd family)
@@ -238,14 +239,20 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     std::string digest = crypto::sha256Hex(jsonText);
 
     Collector coll;
-    json doc;
-    try {
-        doc = json::parse(jsonText);
-    } catch (json::parse_error const& e) {
-        coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
-                  std::format("JSON parse error: {}", e.what()));
+    // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`) —
+    // D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC. This
+    // family is the one where a silently-dropped declaration bites hardest:
+    // `dataModel`, `bitFieldStrategy`, `longDoubleFormat`, `externCallDispatch`
+    // and `tlsAccess` all carry silent-miscompile semantics, and a second
+    // declaration of any of them used to win without a word.
+    auto parsed = detail::parseConfigDocument(jsonText);
+    if (!parsed) {
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  parsed.error().locus(sourceLabel),
+                  parsed.error().detailText("JSON parse error: "));
         return std::unexpected(std::move(coll).release());
     }
+    json doc = std::move(*parsed);
     if (!doc.is_object()) {
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   "top-level value must be a JSON object");
@@ -328,11 +335,33 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // weak definition in — so 27 + 1 = 28. It is OPTIONAL (presence is the
     // declaration), so the asymmetry above applies in its harmless direction
     // for the 22 documents that do not declare it.
-    static constexpr std::array<std::string_view, 28> kFormatDocumentKeys{
+    // RE-DERIVED an eighth time in P44
+    // (D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY): one
+    // new root key, `cCallingConvention` — WHICH of the paired target's
+    // callingConventions[] rows is the platform C ABI for this format — so
+    // 28 + 1 = 29. It is REQUIRED, so the asymmetry above applies in its
+    // HARMFUL direction and the vocabulary row landing before the 24
+    // descriptors is not optional: all 24 declare it in the same change.
+    // RE-DERIVED a ninth time in P44
+    // (D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES): three new root keys —
+    // `outputExtension` (REQUIRED on every format; the driver's artifact
+    // naming, which was a seven-mention per-kind switch in
+    // `program/target_spec.cpp`) plus `archiveMemberExtension` and
+    // `archiveFlavor` (both presence-PAIRED with `container: archive`). So
+    // 29 + 3 = 32. One is required and two are conditionally required, so the
+    // ASYMMETRY above applies in its harmful direction for all three: the
+    // vocabulary lands before the descriptors, never after.
+    // RE-DERIVED a tenth time in P44, same anchor: one more root key,
+    // `targetArch` — WHICH `.target.json` this format is for. OPTIONAL
+    // (absence is "makes no claim", the deleted table's own behaviour for an
+    // unlisted target), so the asymmetry applies in its harmless direction.
+    // 32 + 1 = 33.
+    static constexpr std::array<std::string_view, 35> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
         "dataModel", "bitFieldStrategy", "longDoubleFormat",
+        "unnamedBitFieldAlignment",
         // the per-OS `#include` header-NAME case rule — a silent WRONG-ACCEPT
         // in one direction and a wrong REJECT in the other if it typos
         "headerNameMatching",
@@ -340,10 +369,23 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // DIFFERENT FUNCTION (`_exit` is a real, distinct export on both
         // undecorated formats), so a typo here is a silent-miscompile risk
         "cSymbolDecoration",
+        // the per-format platform C ABI selection — a wrong value PASSES
+        // ARGUMENTS IN THE WRONG REGISTERS (ms_x64 takes rcx/rdx/r8/r9 where
+        // sysv_amd64 takes rdi/rsi/rdx/rcx), so a typo here is the same
+        // species of silent-miscompile risk as the row above it
+        "cCallingConvention",
         // the C-visible face of those axes (TF-C97 — `__LP64__`/`_LP64`)
         "predefinedMacros",
         // output packaging + artifact vocabulary
         "container", "artifactProfiles",
+        // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the driver's
+        // artifact NAMING, and the two facts an `ar` archive needs. A wrong
+        // `archiveFlavor` writes a `.lib` that link.exe cannot resolve, so it
+        // is the same silent-breakage species as the two ABI rows above.
+        "outputExtension", "archiveMemberExtension", "archiveFlavor",
+        // WHICH target this format serves — the name half of the pairing
+        // check that replaced `kTargetArchMachineCodes`.
+        "targetArch",
         // program-entry cluster
         "entryPoint", "entryCallingConvention", "processExit", "processArgs",
         // the set of program-entry materialization VERBS this format realizes
@@ -371,7 +413,14 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // it at all.
         "weakDefinition",
         // section / relocation description
-        "sections", "relocations", "supportedDataSections"};
+        "sections", "relocations", "supportedDataSections",
+        // WHO RUNS THE STATIC-INITIALIZER SCHEDULE
+        // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN). It sits
+        // with the program-entry cluster in spirit — it answers a question about
+        // what happens around the entry function — but it is listed here because
+        // the thing it governs is the emitted init-array/fini-array SECTIONS
+        // directly above, and the validate() rule below ties the two together.
+        "staticInitializers"};
     DSS_CHECK_KEY_VOCABULARY(kFormatDocumentKeys);
 
     // ★ THE PER-KIND IDENTITY BLOCKS ARE **NOT** LISTED ABOVE ANY MORE, and
@@ -756,6 +805,202 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // ── D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY:
+    //    `cCallingConvention` ───────────────────────────────────────────
+    //
+    // WHICH of the paired target's `callingConventions[]` rows is the platform
+    // C ABI for code compiled into this format. A BLOCK for the reason the
+    // block above is one — a future per-format ABI parameter gains a sibling
+    // key inside it rather than a second root key.
+    //
+    // ★ AN OPEN STRING, NOT A CLOSED VERB, AND THAT IS THE OPPOSITE CHOICE
+    // FROM `cSymbolDecoration` ONE BLOCK UP — deliberately. A decoration
+    // SCHEME is an engine capability: only arms this engine implements can be
+    // honored, so a free string would let config request decorations nothing
+    // realizes. A calling-convention NAME is the opposite kind of thing: it is
+    // the PROCESSOR'S vocabulary, declared in that processor's own
+    // `.target.json`, and a closed C++ enum of legal names here would rebuild
+    // exactly the second owner this key deletes — a new arch could not name
+    // its own convention without an engine edit.
+    //
+    // ★ REQUIRED ON EVERY FORMAT, UNCONDITIONALLY — same discipline, same
+    // reason as the block above. A format with no register-level C ABI says so
+    // with the reserved `none` spelling rather than by omission, because
+    // omission is indistinguishable from an oversight and a defaulted
+    // oversight is a silent wrong-register answer.
+    //
+    // ★ WHAT IS *NOT* CHECKED HERE, AND WHY. That the name RESOLVES is a
+    // property of the (target, format) PAIR; a format document has no target
+    // in scope. `dss::ffi::resolveAbi` judges it with both in hand and fails
+    // loud (`F_AbiNoMatchingCcInTarget`). Reaching for a target here is the
+    // coupling the anchor exists to remove.
+    if (!doc.contains("cCallingConvention")) {
+        coll.emit(DiagnosticCode::C_MissingField, "/cCallingConvention",
+                  std::format("missing required 'cCallingConvention' — every "
+                              "object format must declare WHICH of the paired "
+                              "target's callingConventions[] rows is the "
+                              "platform C ABI for code compiled into it (a "
+                              "block {{\"convention\": \"<name>\"}}), or the "
+                              "reserved \"{}\" for a format with no "
+                              "register-level C calling convention; a silent "
+                              "default would re-hide the selection in the "
+                              "engine's C++ table, which is the two-owner "
+                              "defect this key exists to remove",
+                              kCCallingConventionNone));
+    } else if (!doc.at("cCallingConvention").is_object()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, "/cCallingConvention",
+                  std::format("'cCallingConvention' must be an object with a "
+                              "'convention' string (a callingConventions[] row "
+                              "name from the paired target, or \"{}\")",
+                              kCCallingConventionNone));
+    } else {
+        auto const& ccc = doc.at("cCallingConvention");
+        // One key, and it decides which registers every C argument travels in.
+        // A misspelled `"conventions"` would otherwise load clean and surface
+        // as the missing-key diagnostic, which names the absent key rather
+        // than the present typo.
+        static constexpr std::array<std::string_view, 1>
+            kCCallingConventionKeys{"convention"};
+        DSS_CHECK_KEY_VOCABULARY(kCCallingConventionKeys);
+        rejectUnknownKeys(ccc, kCCallingConventionKeys, "/cCallingConvention",
+                          "the 'cCallingConvention' block", coll);
+        if (!ccc.contains("convention") || !ccc.at("convention").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/cCallingConvention/convention",
+                      std::format("'cCallingConvention' requires a "
+                                  "'convention' string (a callingConventions[] "
+                                  "row name from the paired target, or "
+                                  "\"{}\")", kCCallingConventionNone));
+        } else {
+            auto s = ccc.at("convention").get<std::string>();
+            // The EMPTY string is the in-memory invalid sentinel, so it must
+            // not be reachable from a document: `""` is what a truncated edit
+            // produces, and accepting it would produce a schema that
+            // `validate()` then rejects with the MISSING-key wording while the
+            // key is present — the `cSymbolDecoration` `"scheme": ""` argument,
+            // one field over.
+            if (s.empty()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/cCallingConvention/convention",
+                          std::format("'cCallingConvention.convention' must not "
+                                      "be empty — name a callingConventions[] "
+                                      "row from the paired target, or the "
+                                      "reserved \"{}\"",
+                                      kCCallingConventionNone));
+            } else {
+                data.cCallingConvention.convention = std::move(s);
+            }
+        }
+    }
+
+    // ── D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: `outputExtension` ──
+    //
+    // The extension the driver appends to an artifact this format produces.
+    // REQUIRED on every format, because every format produces an artifact and
+    // every artifact is named.
+    //
+    // ★ AND THE EMPTY STRING IS ACCEPTED HERE, WHICH IS THE OPPOSITE OF THE
+    // `cCallingConvention` RULE TWO BLOCKS UP — deliberately, and the contrast
+    // is the point. There, `""` could only ever be a truncated edit. Here it is
+    // the CORRECT answer for a Unix executable, so refusing it would reject
+    // four shipped formats. The invalid state is the key being ABSENT, which
+    // `doc.contains` catches and an emptiness test never could.
+    if (!doc.contains("outputExtension")) {
+        coll.emit(DiagnosticCode::C_MissingField, "/outputExtension",
+                  "missing required 'outputExtension' — every object format "
+                  "must declare the extension the driver appends to an "
+                  "artifact it produces (\".o\", \".exe\", \".dylib\", "
+                  "\".so\", \".a\", \".lib\", \".wasm\", \".spv\", or \"\" "
+                  "for a Unix executable, which is a DECLARED answer and not "
+                  "an omission); a silent default would re-hide the naming "
+                  "rule in the engine's per-kind switch");
+    } else if (!doc.at("outputExtension").is_string()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, "/outputExtension",
+                  "'outputExtension' must be a string (\"\" is legal and means "
+                  "this format's artifacts carry no extension)");
+    } else {
+        data.outputExtension = doc.at("outputExtension").get<std::string>();
+    }
+
+    // ── D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the archive facts ──
+    //
+    // Presence-PAIRED with `container: archive`; `ObjectFormatData::validate()`
+    // owns the pairing in both directions (declared-without-archive is refused
+    // too — a fact about an artifact the format never produces reads as
+    // authority and is never consulted). This tier only decodes.
+    if (doc.contains("archiveMemberExtension")) {
+        if (!doc.at("archiveMemberExtension").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/archiveMemberExtension",
+                      "'archiveMemberExtension' must be a string (the "
+                      "ecosystem's relocatable extension, \".o\" or \".obj\")");
+        } else {
+            auto s = doc.at("archiveMemberExtension").get<std::string>();
+            // Unlike `outputExtension`, empty is NOT a real answer here: an
+            // archive member is a file inside the archive and every ecosystem
+            // names it with an extension. An empty one would silently produce
+            // members named `foo_0`, which `ar t` shows and no toolchain
+            // expects.
+            if (s.empty()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/archiveMemberExtension",
+                          "'archiveMemberExtension' must not be empty — an "
+                          "archive member is a named file and every ecosystem "
+                          "gives it an extension");
+            } else {
+                data.archiveMemberExtension = std::move(s);
+            }
+        }
+    }
+    if (doc.contains("archiveFlavor")) {
+        if (!doc.at("archiveFlavor").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/archiveFlavor",
+                      std::format("'archiveFlavor' must be a string ({})",
+                                  allowedList(allNames(kArchiveFlavorTable),
+                                              " or ")));
+        } else {
+            auto const s = doc.at("archiveFlavor").get<std::string>();
+            auto const f = archiveFlavorFromName(s);
+            // A HARD error, the `dataModel` discipline: a typo falling back to
+            // `sysv` would write a `.lib` with no second linker member, and
+            // `link.exe` would fail to resolve its members at LINK time in
+            // somebody else's build.
+            if (!f.has_value()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/archiveFlavor",
+                          std::format("unknown archiveFlavor '{}' — expected "
+                                      "one of {}", s,
+                                      allowedList(allNames(kArchiveFlavorTable),
+                                                  ", ")));
+            } else {
+                data.archiveFlavor = *f;
+            }
+        }
+    }
+
+    // ── D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: `targetArch` ──
+    //
+    // The `.target.json` NAME this format is for. OPTIONAL — a document that
+    // omits it makes no claim, and `crossValidateTargetFormat` then skips the
+    // pairing check exactly as the deleted `kTargetArchMachineCodes` lookup did
+    // for a target it had no row for. An EMPTY string is refused, because that
+    // is a truncated edit rather than a decision not to claim: omit the key.
+    if (doc.contains("targetArch")) {
+        if (!doc.at("targetArch").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/targetArch",
+                      "'targetArch' must be a string naming the .target.json "
+                      "this format is for (e.g. \"x86_64\")");
+        } else {
+            auto s = doc.at("targetArch").get<std::string>();
+            if (s.empty()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/targetArch",
+                          "'targetArch' must not be empty — omit the key "
+                          "entirely to make no claim about which target this "
+                          "format serves");
+            } else {
+                data.targetArch = std::move(s);
+            }
+        }
+    }
+
     // ── TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): OPTIONAL
     //    `predefinedMacros` ────────────────────────────────────────────
     //
@@ -841,6 +1086,59 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                       bitFieldStrategyName(BitFieldStrategy::None)));
             } else {
                 data.bitFieldStrategy = *bs;
+            }
+        }
+    }
+
+    // ── D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: OPTIONAL
+    //    `unnamedBitFieldAlignment` ────────────────────────────────────────────
+    //
+    // Does an UNNAMED bit-field contribute its declared type's alignment to the
+    // enclosing composite? MEASURED (`{char c; unsigned :0; char d;}`): 5/1 under
+    // SysV-x86_64, Apple arm64 and Apple x86_64; 8/4 under AAPCS64/AAPCS32 ELF.
+    // gcc 13.3.0 and clang 18.1.3 agree PER TARGET, so it is an ABI property.
+    //
+    // ★ A SEPARATE KEY FROM `bitFieldStrategy`, NOT A NEW STRATEGY ROW: it cuts
+    // ACROSS gnu_packed (elf64-x86_64-linux and elf64-aarch64-linux are the SAME
+    // strategy and differ here), and a duplicate strategy would have to restate
+    // every other gnu_packed rule to vary one bit.
+    //
+    // ⚠ FORMAT-ONLY — no target-side fallback field exists (the `longDoubleFormat`
+    // shape, NOT the `bitFieldStrategy` one). So `none` is refused here for a
+    // DIFFERENT reason than it is on bitFieldStrategy: not because it would be
+    // ambiguous with a fallback, but because omitting the key already says
+    // "undeclared" and a spelled `none` adds nothing while looking like an answer.
+    // A wrong spelling is a HARD error — a typo must never silently pick an ABI.
+    if (doc.contains("unnamedBitFieldAlignment")) {
+        if (!doc.at("unnamedBitFieldAlignment").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/unnamedBitFieldAlignment",
+                      std::format("'unnamedBitFieldAlignment' must be a string ({})",
+                                  allowedList(
+                                      kSelectableUnnamedBitFieldAlignmentNames)));
+        } else {
+            auto const s = doc.at("unnamedBitFieldAlignment").get<std::string>();
+            auto const ua = unnamedBitFieldAlignmentFromName(s);
+            if (!ua) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/unnamedBitFieldAlignment",
+                          std::format("unknown unnamedBitFieldAlignment '{}' — "
+                                      "accepted: {}", s,
+                                      allowedList(
+                                          kSelectableUnnamedBitFieldAlignmentNames)));
+            } else if (!isSelectableUnnamedBitFieldAlignment(*ua)) {
+                // ⓘ NO APOSTROPHE IN THE PROSE — this sentence quotes vocabulary
+                // spellings and the projection pins pair `'` characters. See the
+                // identical note on bitFieldStrategy above.
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/unnamedBitFieldAlignment",
+                          std::format("unnamedBitFieldAlignment '{}' is not "
+                                      "selectable — omit the field to leave the "
+                                      "axis undeclared (there is no target-side "
+                                      "fallback to inherit)",
+                                      unnamedBitFieldAlignmentName(
+                                          UnnamedBitFieldAlignment::None)));
+            } else {
+                data.unnamedBitFieldAlignment = *ua;
             }
         }
     }
@@ -2533,6 +2831,67 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     }
                 }
                 ++i;
+            }
+        }
+    }
+
+    // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ──
+    //
+    // `staticInitializers` — WHO walks the init-array / fini-array tables this
+    // format emits. A `{ "runner": ... }` OBJECT rather than a bare scalar,
+    // mirroring `processExit`'s shape, because the question "who runs the
+    // schedule" is the first of a family (a future document may need to name the
+    // boundary symbols a foreign crt expects) and a scalar would have to be
+    // widened incompatibly on the day the second key arrives.
+    //
+    // Absent ⇒ the document makes no claim, which is correct for a relocatable
+    // object or a static library. The validate() rule pairs it with the section
+    // rows so an EXEC flavor cannot emit a table nothing walks.
+    if (doc.contains("staticInitializers")) {
+        static constexpr std::array<std::string_view, 1> kStaticInitKeys{
+            {"runner"}};
+        DSS_CHECK_KEY_VOCABULARY(kStaticInitKeys);
+        json const& si = doc.at("staticInitializers");
+        if (!si.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/staticInitializers",
+                      "'staticInitializers' must be an OBJECT — the "
+                      "`processExit` shape, so a second key can join it without "
+                      "an incompatible widening");
+        } else {
+            for (auto const& [k, unused] : si.items()) {
+                (void)unused;
+                if (k.starts_with('$')) continue;
+                if (std::ranges::find(kStaticInitKeys, k) != kStaticInitKeys.end())
+                    continue;
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("/staticInitializers/{}", k),
+                          std::format("unknown key '{}' in 'staticInitializers' "
+                                      "(accepted: {})",
+                                      k, allowedList(kStaticInitKeys)));
+            }
+            if (!si.contains("runner") || !si.at("runner").is_string()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/staticInitializers/runner",
+                          std::format("'runner' is REQUIRED and must be one of "
+                                      "{} — a `staticInitializers` block that "
+                                      "names no runner declares the capability "
+                                      "and answers nothing, which is the one "
+                                      "state that emits an initializer table "
+                                      "with nothing to walk it",
+                                      allowedList(allNames(kStaticInitRunnerTable))));
+            } else {
+                auto const name = si.at("runner").get<std::string>();
+                auto const r    = staticInitRunnerFromName(name);
+                if (!r.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/staticInitializers/runner",
+                              std::format("unknown static-initializer runner "
+                                          "'{}' (expected {})",
+                                          name,
+                                          allowedList(allNames(kStaticInitRunnerTable))));
+                } else {
+                    data.staticInitRunner = *r;
+                }
             }
         }
     }

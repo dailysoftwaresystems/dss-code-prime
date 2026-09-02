@@ -17,6 +17,12 @@ dss_add_test(NAME core/test_diagnostic_reporter SOURCES test_diagnostic_reporter
 dss_add_test(NAME core/test_diagnostic_budget_threading SOURCES test_diagnostic_budget_threading.cpp)
 dss_add_test(NAME core/test_unsuppressable_codes SOURCES test_unsuppressable_codes.cpp)
 dss_add_test(NAME core/test_header_name_matching SOURCES test_header_name_matching.cpp)
+# D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED: a header named from a ROOT
+# resolves where it points, in every spelling of that root. Its multi-separator
+# arm SKIPS LOUDLY AND BY NAME where no UNC spelling is reachable -- an
+# unmeasured property must never read as a passing one.
+dss_add_test(NAME core/test_include_path_rooted_resolution
+             SOURCES test_include_path_rooted_resolution.cpp)
 dss_add_test(NAME core/test_grammar_schema      SOURCES test_grammar_schema.cpp)
 # Plan 15 CFI slice (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO): the
 # shared PC-keyed unwind representation -- per-PC state, the remember/restore
@@ -344,3 +350,39 @@ dss_add_test(NAME core/test_config_document_memo
 #    an ATOMIC replace; the shipped tree is only ever READ.
 dss_add_test(NAME core/test_config_memo_all_families
              SOURCES test_config_memo_all_families.cpp)
+
+# D-TARGET-NO-CROSS-CLASS-MOVE-VERB: `registerClassOps` keyed by the CLASS PAIR
+# (`class` -> `to`, `to` omitted = the diagonal) so the cross-FILE move has a
+# slot at all -- ONE table, the same-class move at its diagonal. Pins the four
+# load-time refusals the new surface owes, and the REMOVE-direction config
+# mutant that no C++ mutant can stand in for.
+# * The bank-coherence refusal is the load-bearing one: filing the integer `mov`
+#   as the gpr->fpr move would load clean and re-create
+#   D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND through the very table that closes it.
+# ** Mutates the SHIPPED JSON in memory (nlohmann consumer), never a parallel
+#    hand-written file that could drift from the real config.
+dss_add_test(NAME core/test_target_register_class_pair_ops
+             SOURCES test_target_register_class_pair_ops.cpp)
+target_link_libraries(dss_core_test_target_register_class_pair_ops
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC: a config
+# document that declares a key TWICE used to load at rc=0 with zero
+# diagnostics, keeping the LAST declaration -- ✔MEASURED by the operator to
+# MOVE the emitted bytes. `dss::detail::parseConfigDocument` is now the ONE
+# entry every config-document reader parses through, and a repeat REFUSES the
+# load naming the JSON pointer of the offending key.
+# * Tier 3 is the load-bearing one: it scans every .cpp/.hpp under src/ for the
+#   THREE spellings that ingest JSON (`json::parse`, `sax_parse`, and
+#   `operator>>` into a json-typed name) and refuses a new reader outside the
+#   owner -- the chokepoint is what makes tiers 1 and 2 durable.
+# ** The scanner has its own fixtures: synthesised sources carrying each
+#    spelling, plus prose/string-literal negatives, so a scan that has stopped
+#    seeing anything reds instead of reporting a clean tree.
+# *** The target-loader pin READS the shipped arm64 document and mutates the
+#     bytes IN MEMORY (the `test_target_register_class_pair_ops` precedent);
+#     nothing under src/dss-config/ is written.
+dss_add_test(NAME core/test_config_document_parse
+             SOURCES test_config_document_parse.cpp)
+target_link_libraries(dss_core_test_config_document_parse
+                      PRIVATE nlohmann_json::nlohmann_json)

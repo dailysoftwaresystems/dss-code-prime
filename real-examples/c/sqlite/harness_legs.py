@@ -3465,6 +3465,94 @@ def spec_target_os(spec):
     return parts[-2] if len(parts) >= 3 else ""
 
 
+# ── THE SECOND TARGET VOCABULARY: A BINARY'S OWN MEASURED IDENTITY ──────────
+#
+# ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-ORACLE-CLASSIFIER-READS-AN-IDENTITY-TRIPLE-WITH-THE-LEG-SPEC-READERS
+#
+# ★★★ THIS HARNESS NAMES A TARGET TWO WAYS AND THEY ARE NOT THE SAME SHAPE.
+# ABOVE: a leg's DECLARED `spec` — `<arch>:<formatName>`, TWO colon-fields, where
+# the OS is the second-to-last token of the FORMAT NAME
+# (`x86_64:elf64-x86_64-linux-exec`). HERE: a binary's MEASURED identity —
+# `<arch>:<container>:<targetOs>`, THREE colon-fields, which is what
+# `binary_target_identity` can actually read out of a header. The second is NOT a
+# short spelling of the first and the two CANNOT be collapsed: an ELF header
+# carries an `e_machine` and an `EI_OSABI`, never a `.format.json` name, so no
+# amount of parsing turns `elf64` into `elf64-x86_64-linux-exec`. Synthesising one
+# from a binary would be fabricating a catalogue fact out of eight bytes.
+#
+# ★ THE DEFECT THIS SECTION EXISTS TO END, AND IT RAN ON EVERY LEG OF EVERY RUN.
+# `--identify-binary` prints the three fields TAB-separated; BOTH drivers join
+# them with this separator and hand the result to `--reference-target`; and
+# `oracle_class_for_leg` then read that value with `spec_target_os`, whose rule is
+# the FORMAT NAME's. ✔MEASURED at 6a37dbca against this project's own preserved
+# reference (11,111,128 bytes, gcc 13.3.0, written by the very run that then
+# reported NO ORACLE): `binary_target_identity` answers `('x86_64', 'elf64',
+# 'linux')`, the drivers hand over `x86_64:elf64:linux`, `spec_target_os` of that
+# is `''`, the classifier's `"" in (...)` guard fires, and ALL FIVE legs classify
+# `absent` — including `elf64-x86_64`, which that binary is a genuine
+# same-platform control for. Handed the leg-spec shape instead, the SAME reference
+# classifies `same-platform`: same binary, same leg, opposite verdicts.
+#
+# ★ WHY NO PIN SAW IT. The self-test hand-wrote its reference as
+# `x86_64:elf64-x86_64-linux-exec` — a LEG-SPEC value NO CALLER EVER PRODUCES — so
+# the classifier was exercised only on input it could parse. A true answer (the
+# comparison rule is sound) to the wrong question (can it read what its own caller
+# builds?), failing toward "no control", which reads as innocent.
+# [[feedback-an-instrument-that-answers-an-adjacent-question]]
+#
+# ⇒ ONE OWNER FOR THE TRIPLE, HERE. Every consumer in this file reads it through
+# `parse_binary_identity` — the oracle classifier and `--launcher-for-target`,
+# which had its own inline copy of the split — and any other shape is REFUSED out
+# loud. ⛔ A reader that accepted BOTH shapes was considered and rejected: it is
+# the second spelling again, one layer up, and it would let a caller hand over the
+# wrong vocabulary and still get a plausible verdict — which is exactly how this
+# defect survived two cycles.
+BINARY_IDENTITY_SEPARATOR = ":"
+BINARY_IDENTITY_FIELDS = ("arch", "container", "targetOs")
+
+
+def binary_identity_string(arch, container, target_os):
+    """The three fields `binary_target_identity` returns, as the ONE string the
+    rest of this harness passes around. PURE.
+
+    The drivers reach the same value by translating `--identify-binary`'s TABs to
+    this separator, which is why the separator is named HERE rather than spelled
+    once in each of them — and why the pins build their fixture through this
+    function instead of retyping a string."""
+    return BINARY_IDENTITY_SEPARATOR.join((arch, container, target_os))
+
+
+def parse_binary_identity(identity, who):
+    """(arch, container, targetOs) out of an identity triple, or a LegError.
+
+    PURE. `who` names the caller so the refusal says which value was wrong.
+
+    ⚠ IT RAISES RATHER THAN DEGRADING, and the reason is the one
+    `oracle_class_for_leg` already states about an unrecognised oracle status: a
+    verdict line is exactly where a wrongly-shaped value must not buy silence. The
+    shape that reached here for two cycles — a LEG SPEC — parsed as two fields
+    with an unreadable OS and produced a confident, pessimistic, WRONG verdict on
+    every leg. An empty string is a different claim ("nothing was measured") and
+    is the caller's to handle before it gets here."""
+    parts = (identity or "").split(BINARY_IDENTITY_SEPARATOR)
+    if (len(parts) != len(BINARY_IDENTITY_FIELDS)
+            or not all(p.strip() for p in parts)):
+        raise LegError(
+            "%s was handed %r, which is not a binary IDENTITY TRIPLE. That shape "
+            "is %s (e.g. %r) — the three fields `--identify-binary` prints, joined "
+            "with %r. ⚠ A leg's declared `spec` is a DIFFERENT vocabulary (e.g. "
+            "%r) and is NOT accepted here: parsing one with the other's rule is "
+            "the defect this parser exists to make impossible "
+            "[D-HARNESS-ORACLE-CLASSIFIER-READS-AN-IDENTITY-TRIPLE-WITH-THE-LEG-SPEC-READERS]."
+            % (who, identity,
+               BINARY_IDENTITY_SEPARATOR.join(
+                   "<%s>" % f for f in BINARY_IDENTITY_FIELDS),
+               binary_identity_string("x86_64", "elf64", "linux"),
+               BINARY_IDENTITY_SEPARATOR,
+               "x86_64:elf64-x86_64-linux-exec"))
+    return tuple(p.strip() for p in parts)
+
+
 # ── THE TARGET C COMPILER — A NAME IS NOT A DECLARATION OF TARGET ───────────
 #
 # D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN, and the anchor it
@@ -3695,6 +3783,17 @@ ORACLE_CLASSES = {
                              "control can be built HERE — an environment limit, "
                              "not a finding about this leg",
     "absent": "no reference binary survived this run at all",
+    # ★ SPLIT OUT OF `absent` 2026-09-01, IN THE EDIT THAT FIXED THE SHAPE READER,
+    # because `absent`'s own sentence was FALSE here: a binary DID survive, is
+    # named on the very next line of the report, and cannot be placed. The two
+    # lines contradicted each other in a verdict a human triages by — the same
+    # class of defect as the anchor that split `absent` three ways, met while
+    # repairing the reader, so fixed here rather than filed
+    # [D-HARNESS-ORACLE-CLASSIFIER-READS-AN-IDENTITY-TRIPLE-WITH-THE-LEG-SPEC-READERS].
+    "unidentified": "a reference binary EXISTS, but one side of the comparison "
+                    "could not be placed on a platform, so whether it is an "
+                    "oracle for this leg is UNKNOWN — and an unknown control is "
+                    "not a control",
 }
 
 # The fallback control, named once. The row that opened this anchor insisted the
@@ -3731,7 +3830,15 @@ def oracle_class_for_leg(leg, ref_target, ref_path, oracle_status=""):
 
     ⚠ An UNRECOGNISED status RAISES rather than degrading to `absent`. A verdict
     line is exactly where a typo'd flag value must not buy silence: it would
-    print the most pessimistic class and read as a measured fact."""
+    print the most pessimistic class and read as a measured fact.
+
+    ⚠ AND SO DOES A WRONGLY-SHAPED `ref_target`, for the same reason and with a
+    receipt: a LEG SPEC handed here parsed as two fields with an unreadable OS and
+    produced a confident, pessimistic, WRONG verdict on every leg of every run for
+    two cycles. "" remains the legitimate UNMEASURED value; anything that is
+    neither empty nor an identity triple is refused by `parse_binary_identity`
+    [D-HARNESS-ORACLE-CLASSIFIER-READS-AN-IDENTITY-TRIPLE-WITH-THE-LEG-SPEC-READERS].
+    STILL PURE: no filesystem, no process, no host — the parser is string work."""
     if oracle_status not in ORACLE_STATUSES:
         raise LegError(
             "oracle status %r is not one this catalogue declares (known: %s). "
@@ -3752,24 +3859,40 @@ def oracle_class_for_leg(leg, ref_target, ref_path, oracle_status=""):
                     "HERE — the leg is fine; this host cannot check it")
         return ("absent", "no reference binary was produced or preserved")
     if not ref_target:
-        return ("absent",
+        return ("unidentified",
                 "a reference binary exists at %s but its target could not be "
                 "MEASURED, so whether it is an oracle for this leg is unknown — "
                 "and an unknown control is not a control" % ref_path)
-    # --identify-binary answers `arch<TAB>format`, joined with ':' by the
-    # drivers — the same `<arch>:<format>` shape a leg's `spec` is written in, so
-    # ONE pair of readers answers for both artefacts and neither side is parsed
-    # by a rule written for the other.
+    # ★★ TWO VOCABULARIES, TWO READERS, AND THAT IS THE WHOLE FIX. `ref_target` is
+    # a MEASURED IDENTITY TRIPLE (`<arch>:<container>:<targetOs>`, what
+    # `--identify-binary` prints and both drivers join); `spec` is a DECLARED LEG
+    # SPEC (`<arch>:<formatName>`). Each is parsed by ITS OWN owner — see
+    # `parse_binary_identity`, whose header records what reading the first with the
+    # second's rule cost: every leg reported NO ORACLE, on every run, over a
+    # control the harness had just built and preserved.
+    # [D-HARNESS-ORACLE-CLASSIFIER-READS-AN-IDENTITY-TRIPLE-WITH-THE-LEG-SPEC-READERS]
+    # ⓘ THE COMPARISON IS arch+OS AND DELIBERATELY NOT arch+container+OS. It is the
+    # same rule `machine_matches_spec` applies to a compiler's `-dumpmachine`,
+    # which names no container at all — so adding one here would make the two
+    # readers of "does this artefact belong to that target" disagree, for a field
+    # that in this catalogue is a function of the OS anyway (linux⇒elf64,
+    # windows⇒pe64, darwin⇒macho64). The container is READ, and named in the
+    # cross-platform verdict, so a future divergence is visible rather than silent.
     spec = leg.get("spec", "")
     want = (canon_arch(spec_target_arch(spec)), canon_os(spec_target_os(spec)))
-    got = (canon_arch(spec_target_arch(ref_target)),
-           canon_os(spec_target_os(ref_target)))
-    if "" in (spec_target_os(spec), spec_target_os(ref_target)):
-        return ("absent",
-                "the reference (%s) or this leg (%s) does not name an OS in the "
-                "shape this catalogue reads, so whether they share a platform "
-                "cannot be DECIDED — and an undecided control is not a control"
-                % (ref_target, spec or "<undeclared>"))
+    ref_arch, ref_container, ref_os = parse_binary_identity(
+        ref_target, "the oracle classifier's --reference-target")
+    got = (canon_arch(ref_arch), canon_os(ref_os))
+    if not spec_target_os(spec):
+        # ONLY the leg can be shapeless now: the reference side is parsed by an
+        # owner that REFUSES anything else, so this branch is a CATALOGUE defect
+        # and says so instead of implicating a binary that is perfectly readable.
+        return ("unidentified",
+                "this leg's own declared spec (%s) does not name an OS in the "
+                "shape this catalogue reads, so whether it shares a platform with "
+                "the reference (%s, container %s) cannot be DECIDED — and an "
+                "undecided control is not a control"
+                % (spec or "<undeclared>", ref_target, ref_container))
     if want == got:
         return ("same-platform",
                 "the reference targets %s/%s, which is this leg's own target (%s)"
@@ -7583,14 +7706,14 @@ def launcher_for_target(legs, target, host_os, host_arch, available):
 
     NO NEW VOCABULARY AND NO NEW DECISION: the leg is found by its own declared
     `spec` and the answer comes from `plan_leg`, so this cannot disagree with the
-    plan a driver is running."""
-    parts = (target or "").split(":")
-    if len(parts) != 3 or not all(parts):
-        raise LegError(
-            "--launcher-for-target takes <arch>:<container>:<targetOs> (e.g. "
-            "arm64:elf64:linux), got %r. That is the triple --identify-binary "
-            "prints, so the two can be piped together." % target)
-    arch, container, target_os = parts
+    plan a driver is running.
+
+    ★ THE SPLIT IS `parse_binary_identity`'s, not a local one. This function used
+    to own an inline copy — correct, but a SECOND spelling of a shape that has an
+    owner, and the oracle classifier's failure to use that owner is the anchor
+    that section carries."""
+    arch, container, target_os = parse_binary_identity(
+        target, "--launcher-for-target")
     for leg in legs:
         spec = leg.get("spec", "")
         if (spec_target_arch(spec) == arch
@@ -7804,17 +7927,38 @@ ASSIGNMENT_RE = re.compile(r"^[A-Z][A-Z0-9_]*(\[[^\]]*\])?=")
 
 
 def sh_statements(text):
-    """Split emitted shell text into STATEMENTS, honouring shlex.quote's single
-    quotes. A value may legitimately contain newlines (search paths are
-    newline-separated so a path with spaces survives), so a naive splitlines()
-    would see a quoted path as its own statement — which is precisely the
-    misreading that would let a real injected command hide behind one."""
-    statements, current, in_quote = [], [], False
+    """Split emitted shell text into STATEMENTS, honouring shlex.quote's quoting.
+    A value may legitimately contain newlines (search paths are newline-separated
+    so a path with spaces survives), so a naive splitlines() would see a quoted
+    path as its own statement — which is precisely the misreading that would let
+    a real injected command hide behind one.
+
+    ── ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-SH-STATEMENT-SCANNER-CANNOT-READ-SHLEX-QUOTES-OWN-ESCAPE
+    ★★★ IT TRACKED SINGLE QUOTES ONLY, AND `shlex.quote` ESCAPES AN EMBEDDED
+    APOSTROPHE AS `'"'"'` — which carries THREE single quotes, so EVERY apostrophe
+    in a value flips the scanner's parity. ✔MEASURED at 6a37dbca over the SHIPPED
+    catalogue, on a plan this harness really runs (`--launchers-none`): the old
+    scanner returned **154** statements of which **5 WERE NOT ASSIGNMENTS**, while
+    a POSIX scan of the same bytes returns **186, all assignments**. So the pin
+    that proves `build-and-test.sh`'s `eval` can only populate variables was being
+    evaluated over a MIS-SPLIT text, and it passed only because the self-test
+    happened to drive the ONE launcher set whose emission parses correctly by
+    luck. ⚠ AND THE OTHER FAILURE DIRECTION IS A FALSE FATAL THAT ABORTS A RUN:
+    when the total apostrophe count came out odd — which DECLARING ONE MORE
+    CONFOUND ROW is enough to do — the scanner raised "unterminated quote" against
+    a perfectly balanced emission, blaming the emitter for the reader's defect.
+    ⇒ Both quote characters are tracked, the way `sh` itself tokenises: inside
+    single quotes a `"` is data, inside double quotes a `'` is data. The refusal
+    keeps its teeth — a genuinely unterminated quote still raises."""
+    statements, current, in_single, in_double = [], [], False, False
     for ch in text:
-        if ch == "'":
-            in_quote = not in_quote
+        if ch == "'" and not in_double:
+            in_single = not in_single
             current.append(ch)
-        elif ch == "\n" and not in_quote:
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            current.append(ch)
+        elif ch == "\n" and not in_single and not in_double:
             statements.append("".join(current))
             current = []
         else:
@@ -7822,8 +7966,10 @@ def sh_statements(text):
     tail = "".join(current)
     if tail:
         statements.append(tail)
-    if in_quote:
-        raise LegError("the sh emitter produced an unterminated quote")
+    if in_single or in_double:
+        raise LegError(
+            "the sh emitter produced an unterminated %s quote"
+            % ("single" if in_single else "double"))
     return [s for s in statements if s]
 
 
@@ -8914,6 +9060,24 @@ DSS_REGIONS = {
         "drivers": ["build-and-test.sh"], "verifiers": [],
         "why": "a navigation marker; the run-directory PLAN it applies is "
                "resolved by harness_legs.py --run-dir-plan and pinned there."},
+    # ANCHOR, ONE LINE, DO NOT WRAP:
+    # D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN
+    # BOTH DRIVERS, and `mirror` deliberately NOT claimed. The two halves are the
+    # same CAPABILITY in two languages — prove the located compiler compiles three
+    # lines against THIS run's config tree, for every SELECTED leg's target,
+    # before the run is spent — and both call the SAME implementation of the probe
+    # itself (speedtest1_bench.py --preflight-dss), which is where the answer is
+    # actually produced and where a differential comparison would have something
+    # to compare. What differs between the halves is only how each shell composes
+    # a refusal, so a text differential would be asserting a sameness that was
+    # never true. What IS enforced here is the pairing — the region must exist in
+    # BOTH drivers — and each half is driven THROUGH ITS OWN REAL CALL SITE, in a
+    # child interpreter, by its own verifier: a stale compiler must STOP the run,
+    # a current one must be let through, SKIP_DSS_BUILD=1 must not exempt either,
+    # and a check that COULD NOT RUN must not be reported as a stale binary.
+    "compiler-currency": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": ["test-driver-contracts.sh", "test-driver-contracts.ps1"]},
 }
 
 
@@ -10693,6 +10857,29 @@ def self_test(path=CATALOGUE, out=sys.stdout):
             failed += 1
             out.write("FAIL: %s%s\n" % (name, ("\n      " + detail) if detail else ""))
 
+    # ── THE ELF HEADER FIXTURE, HOISTED SO TWO BATTERIES SHARE ONE BUILDER ───
+    # Its main users are the header-reader batteries far below, alongside `_pe`
+    # and `_macho`; it lives up here because the ORACLE battery needs it too, and
+    # a second ELF builder written there would be exactly the duplicate spelling
+    # the oracle anchor is about.
+    # ⚠ NAMED `_elf_header`, NOT `_elf`, AND THAT IS NOT COSMETIC: a later battery
+    # binds the plain name to the elf64-x86_64 LEG DICT, so a builder called `_elf`
+    # was reachable only because it was RE-DEFINED after that rebinding. Hoisting
+    # it under the old name made every later call a `'dict' object is not callable`
+    # — loud, and only because this file's own self-test runs. Every identity field
+    # carries a default, so the
+    # `binary_shared_lib_shape` assertions read as they did before those fields
+    # existed, and `endian` is a parameter because `binary_target_identity` takes
+    # byte order from EI_DATA and must be shown doing so.
+    def _elf_header(etype, cls=2, machine=EM_X86_64, osabi=0, endian="<"):
+        order = "little" if endian == "<" else "big"
+        head = bytearray(b"\x7fELF" + bytes([cls]) + b"\0" * 15 + b"\0" * 4)
+        head[5] = 1 if endian == "<" else 2      # EI_DATA
+        head[7] = osabi                          # EI_OSABI
+        head[16:18] = etype.to_bytes(2, order)   # e_type
+        head[18:20] = machine.to_bytes(2, order)  # e_machine
+        return bytes(head)
+
     findings = lint(path)
     check("the leg catalogue lints clean", not findings, "\n      ".join(findings))
 
@@ -11695,6 +11882,34 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           len({frozenset(v) for v in _sets.values()}) > 1,
           "identical sets on every leg would be the old global list in a per-leg "
           "costume; got %r" % _sets)
+    # ── THE ATTRIBUTION DECLARED 2026-09-01, PINNED BY NAME AND IN BOTH DIRECTIONS
+    # [D-HARNESS-CORPUS-ORACLE-SEEKS-A-COMPILER-WHEN-A-BUILT-REFERENCE-IS-ALREADY-STAGED]
+    # ★★ `scanstatus-5.1.2` was run to ground in P42 and DISCHARGED BY HAND, so
+    # every run since re-reported it UNCLASSIFIED — the confound-catalogue form of
+    # [[feedback-apply-the-row-when-the-lane-reports]]. It is declared on the THREE
+    # legs whose corpus.log at this tree shows the failure and on NEITHER macho leg,
+    # which ran smoke only and have observed nothing. ⚠ BOTH ARMS ARE THE POINT:
+    # deleting the row from legs.json reddens the first, and PRE-PROPAGATING it to a
+    # leg that never ran it reddens the second — which is the exact discipline the
+    # `sessionnoact-4.3` rows celebrate a leg for obeying.
+    _scan = "^scanstatus-5\\.1\\.2$"
+    _scan_legs = {l["label"] for l in legs
+                  if any(r["pattern"] == _scan for r in l["confounds"])}
+    check("the scanstatus attribution is declared on the three legs that RAN it",
+          _scan_legs == {"elf64-x86_64", "elf64-arm64", "pe64-x86_64"},
+          "got %r" % sorted(_scan_legs))
+    check("...and reaches each of those legs' ACTIVE set, not merely the file",
+          all(_scan in _sets[lbl] for lbl in _scan_legs),
+          "a row that never reaches the supply excuses nothing; got %r"
+          % {lbl: sorted(_sets[lbl]) for lbl in sorted(_scan_legs)})
+    check("...and is NOT pre-propagated to a leg that has not observed it",
+          not any(_scan in _sets[l["label"]] for l in legs
+                  if l["label"] not in _scan_legs),
+          "an unearned excusal is the one direction that can hide a miscompile")
+    check("...and every one of those rows shows its work",
+          all(row.get(k, "").strip()
+              for l in legs for row in l["confounds"]
+              if row["pattern"] == _scan for k in CONFOUND_PROVENANCE_KEYS))
     _pe_leg_for_oracle = leg_by_label(legs, "pe64-x86_64", path)
     # ── THE PER-LEG ATTRIBUTION ORACLE ──────────────────────────────────────
     # [D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE] The defect was an OUTPUT LINE:
@@ -11702,10 +11917,67 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # that binary is not. These drive the real classifier and the real report over
     # the SHIPPED catalogue, and they assert the WORDS, because the words are the
     # thing that was wrong.
-    _elf_ref = "x86_64:elf64-x86_64-linux-exec"
+    # ── THE REFERENCE FIXTURE IS DERIVED, NOT TYPED ─────────────────────────
+    # ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-ORACLE-CLASSIFIER-READS-AN-IDENTITY-TRIPLE-WITH-THE-LEG-SPEC-READERS
+    #
+    # ★★★ THIS LINE USED TO READ `_elf_ref = "x86_64:elf64-x86_64-linux-exec"` —
+    # A LEG-SPEC STRING NO CALLER EVER PRODUCES — and that single retyped literal
+    # is why the classifier's inability to read its own caller's value shipped for
+    # two cycles with a green pin over it. The fixture is now built the way the
+    # PRODUCTION path builds it: the reader that answers `--identify-binary`, then
+    # the joiner both drivers' `\t`→`:` translation lands on. Neither the field
+    # order nor the separator can drift from the code under test, because neither
+    # is written here.
+    _ref_identity = binary_target_identity(_elf_header(2, machine=EM_X86_64, osabi=0))
+    _elf_ref = binary_identity_string(*_ref_identity)
+    check("the oracle fixture IS what --identify-binary measures, not a retyped spec",
+          _ref_identity == ("x86_64", "elf64", "linux")
+          and _elf_ref == "x86_64:elf64:linux",
+          "identity=%r joined=%r" % (_ref_identity, _elf_ref))
+    check("...and it is the THREE-field identity shape, never the two-field spec",
+          len(_elf_ref.split(BINARY_IDENTITY_SEPARATOR)) == len(BINARY_IDENTITY_FIELDS)
+          and _elf_ref not in {_l.get("spec") for _l in legs},
+          _elf_ref)
+    # ★★ THE ASSERTION THAT WOULD HAVE CAUGHT THE DEFECT ON DAY ONE: the shape the
+    # drivers actually build must classify the leg it is genuinely a control for.
+    # ✔MEASURED at 6a37dbca, this exact value against this exact catalogue: ALL
+    # FIVE legs answered `absent`, i.e. "NO ORACLE", over an 11 MB gcc reference
+    # sitting on disk that the same run had just written.
+    check("the DRIVERS' own shape classifies the leg it is a control for",
+          oracle_class_for_leg(legs[0], _elf_ref, "/out/reference-testfixture")[0]
+          == "same-platform",
+          "legs[0]=%s spec=%s ref=%s -> %r"
+          % (legs[0]["label"], legs[0]["spec"], _elf_ref,
+             oracle_class_for_leg(legs[0], _elf_ref, "/out/reference-testfixture")))
+    # ⚠ AND THE OTHER VOCABULARY IS REFUSED, NOT SILENTLY REINTERPRETED. A reader
+    # that accepted both would let the two spellings drift apart again.
+    _spec_shaped = ""
+    try:
+        oracle_class_for_leg(legs[0], legs[0]["spec"], "/out/ref")
+    except LegError as _exc:
+        _spec_shaped = str(_exc)
+    check("handing the classifier a LEG SPEC is REFUSED, naming both vocabularies",
+          "IDENTITY TRIPLE" in _spec_shaped and "declared `spec`" in _spec_shaped,
+          "got: %r" % _spec_shaped)
+    # ONE OWNER, TWO READERS: `--launcher-for-target` parses the same triple
+    # through the same function, so a change to the shape cannot reach one and
+    # miss the other.
+    check("the launcher resolver refuses a non-triple through the SAME owner",
+          _raises(lambda: launcher_for_target(legs, "x86_64:elf64-x86_64-linux-exec",
+                                              "linux", "x86_64", set()))
+          and _raises(lambda: launcher_for_target(legs, "", "linux", "x86_64", set())))
+    check("the joiner and the parser are inverses",
+          parse_binary_identity(binary_identity_string("arm64", "macho64", "darwin"),
+                                "<self-test>") == ("arm64", "macho64", "darwin"))
+    _ref_arch, _ref_os = _ref_identity[0], _ref_identity[2]
     for _l in legs:
         _cls, _why = oracle_class_for_leg(_l, _elf_ref, "/out/reference-testfixture")
-        _same = _l["spec"] == _elf_ref
+        # SAMENESS IS arch+OS, computed from the two vocabularies through their
+        # OWN readers — never a string equality between a spec and a triple, which
+        # is the comparison that could not have held for any real reference.
+        _same = ((canon_arch(spec_target_arch(_l["spec"])),
+                  canon_os(spec_target_os(_l["spec"])))
+                 == (canon_arch(_ref_arch), canon_os(_ref_os)))
         check("oracle class for %s against an ELF/Linux reference is %s"
               % (_l["label"], "same-platform" if _same else "cross-platform"),
               _cls == ("same-platform" if _same else "cross-platform"),
@@ -11733,12 +12005,23 @@ def self_test(path=CATALOGUE, out=sys.stdout):
             check("the %s report names the FALLBACK control" % _l["label"],
                   "FALLBACK CONTROL" in _lines and "vary the RUNTIME" in _lines,
                   _lines)
-    # An UNMEASURED reference is not a control, and neither is an absent one.
+    # An UNMEASURED reference is not a control, and neither is an absent one —
+    # but they are DIFFERENT states and the report must not say the binary is
+    # missing when it is named on the next line. `unidentified` was split out of
+    # `absent` in the edit that fixed the shape reader, for exactly that reason.
     _cls, _ = oracle_class_for_leg(legs[0], "", "/out/reference-testfixture")
     check("a reference whose target could not be MEASURED is not an oracle",
-          _cls == "absent")
+          _cls == "unidentified", "got %r" % (_cls,))
+    _unid = "\n".join(oracle_report_lines(
+        legs[0], "", "/out/reference-testfixture", None, None))
+    check("...and the report never claims the binary is missing when it is not",
+          "no reference binary survived this run at all" not in _unid
+          and ": NO ORACLE" in _unid and "EXISTS" in _unid, _unid)
     check("no reference at all is not an oracle",
           oracle_class_for_leg(legs[0], _elf_ref, "")[0] == "absent")
+    check("...and THAT one does say the binary is missing",
+          "no reference binary survived this run at all"
+          in "\n".join(oracle_report_lines(legs[0], _elf_ref, "", None, None)))
     # ── D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE ───────────
     # ★★★ THE THREE STATES `absent` USED TO SPELL AS ONE. The defect was never
     # that the harness lacked the fact — `--build-reference-oracle` returns it
@@ -11769,7 +12052,17 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # NO-BINARY case; a cross-platform binary stays cross-platform however the
     # build went, or a green status would launder another platform's reference
     # into this leg's oracle — the exact defect the sibling row closed.
-    _cross = [_l for _l in legs if _l["spec"] != _elf_ref]
+    # ⚠ THE MEMBERSHIP TEST IS arch+OS, NOT `spec != _elf_ref`. That string
+    # comparison was between a LEG SPEC and a REFERENCE TARGET, i.e. between the
+    # two vocabularies this section exists to keep apart — it could never be true
+    # for a value any caller produces, so the set was silently "every leg".
+    _cross = [_l for _l in legs
+              if (canon_arch(spec_target_arch(_l["spec"])),
+                  canon_os(spec_target_os(_l["spec"])))
+              != (canon_arch(_ref_arch), canon_os(_ref_os))]
+    check("the cross-platform set is the four legs the reference is NOT a control for",
+          len(_cross) == len(legs) - 1 and legs[0] not in _cross,
+          [_l["label"] for _l in _cross])
     check("a status never re-classifies a binary that EXISTS",
           all(oracle_class_for_leg(_l, _elf_ref, "/out/ref", _s)[0]
               == "cross-platform"
@@ -13276,22 +13569,36 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           "a verdict printed with no machine attached is what let ABSENT-on-"
           "Windows read as a fact about a fixture running in WSL2; got %r"
           % _cross_rep)
+    # ★ THE TWO COUNTS ARE DERIVED FROM THE LEG'S OWN DECLARATION, NOT TYPED.
+    # They were the literals `7 of 7` and `4 of 7`, which is the same claim only
+    # for as long as this leg declares exactly seven rows — so DECLARING A ROW
+    # broke a pin about the CAVEAT, which has nothing to do with how many rows
+    # there are. Deriving them asserts strictly more, because the split itself is
+    # now claimed: EVERY row is active when the kernel answered, and exactly the
+    # rows that NAME a probe go inactive when it could not be asked.
+    _all_rows = len(_elf["confounds"])
+    _conditional_rows = sum(1 for r in _elf["confounds"] if r.get("requires"))
     check("...and a leg MEASURED IN ITS OWN KERNEL carries NO not-applied caveat",
           not any("CAVEAT" in l for l in _cross_rep)
-          and any("confound rows ACTIVE (7 of 7)" in l for l in _cross_rep),
+          and any("confound rows ACTIVE (%d of %d)" % (_all_rows, _all_rows) in l
+                  for l in _cross_rep),
           "the measurement came from the right place, so the old caveat would now "
           "be false in the other direction - and it would sit one line above "
-          "`ACTIVE (7 of 7)`, which is exactly the pairing V1 shipped; got %r"
-          % _cross_rep)
+          "`ACTIVE (%d of %d)`, which is exactly the pairing V1 shipped; got %r"
+          % (_all_rows, _all_rows, _cross_rep))
     # THE OTHER HALF: the kernel was right and could not be asked.
     _un_dec = leg_confound_decisions(_elf, _unreach)
     _un_rep = confound_report_lines("elf64-x86_64", _un_dec, _unreach)
     check("a kernel that could not be MEASURED prints the caveat, and it is TRUE",
           any("CAVEAT: NOT MEASURED IN KERNEL 'wsl-linux'" in l
               for l in _un_rep)
-          and any("confound rows ACTIVE (4 of 7)" in l for l in _un_rep)
+          and any("confound rows ACTIVE (%d of %d)"
+                  % (_all_rows - _conditional_rows, _all_rows) in l
+                  for l in _un_rep)
           and sum(1 for l in _un_rep
-                  if "INACTIVE" in l and "confound row" in l) == 3,
+                  if "INACTIVE" in l and "confound row" in l)
+          == _conditional_rows
+          and _conditional_rows > 0,
           "a caveat that contradicts the decision beside it is worse than none; "
           "got %r" % _un_rep)
     check("...and it says the ABSENCE of a measurement, never a measured absence",
@@ -13740,6 +14047,50 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     for stmt in statements:
         check("the sh emitter emits assignments only",
               ASSIGNMENT_RE.match(stmt) is not None, stmt)
+    # ── THE SCANNER MUST READ `shlex.quote`'s OWN ESCAPE ────────────────────
+    # ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-SH-STATEMENT-SCANNER-CANNOT-READ-SHLEX-QUOTES-OWN-ESCAPE
+    # ★ THE FIXTURE IS BUILT BY THE ESCAPER, NEVER TYPED, so the pin cannot drift
+    # from the thing it is about: `shlex.quote("it's")` is `'it'"'"'s'`, five
+    # single quotes, and a single-quote-only scanner desynchronises on it.
+    # ⚠ THE REFUSAL IS CAUGHT AND TURNED INTO A VALUE. A scanner that cannot read
+    # `shlex.quote`'s escape RAISES on this fixture, and an uncaught raise here
+    # aborts the whole battery with a FATAL instead of reddening a NAMED check —
+    # which is a strictly worse witness, and was ✔MEASURED as exactly what the
+    # REMOVE-direction mutant produced before this wrapper existed.
+    def _statements_or_why(text):
+        try:
+            return sh_statements(text)
+        except LegError as exc:
+            return ["<REFUSED: %s>" % exc]
+
+    _apostrophe = "V=%s" % shlex.quote("it's a value\nwith a newline")
+    check("a quoted value containing an APOSTROPHE is ONE statement, not two",
+          _statements_or_why(_apostrophe + "\nW=2\n") == [_apostrophe, "W=2"],
+          "got %r" % (_statements_or_why(_apostrophe + "\nW=2\n"),))
+    check("...and a double quote inside single quotes is DATA, not a quote",
+          _statements_or_why("V=%s\nW=2\n" % shlex.quote('a " b'))
+          == ["V=%s" % shlex.quote('a " b'), "W=2"],
+          "got %r" % (_statements_or_why("V=%s\nW=2\n" % shlex.quote('a " b')),))
+    # ⚠ THE REFUSAL KEEPS ITS TEETH — both kinds, because the scanner now tracks
+    # both and a fix that only ever returns cleanly is a check that has been
+    # switched off.
+    check("a genuinely unterminated SINGLE quote is still REFUSED",
+          _raises(lambda: sh_statements("V='oops\n")))
+    check("a genuinely unterminated DOUBLE quote is still REFUSED",
+          _raises(lambda: sh_statements('V="oops\n')))
+    # ★★ AND THE SHIPPED CATALOGUE UNDER A SECOND REAL PLAN. The block above
+    # drives ONE launcher set; ✔MEASURED at 6a37dbca, the `--launchers-none` plan
+    # is the one the old scanner mis-split (154 statements, 5 of them NOT
+    # assignments) while this one passed. A pin that exercises a single plan is
+    # how that survived, so both are driven now.
+    _none_sh = emit_sh(plan("linux", "x86_64", set(), path))
+    _none_statements = _statements_or_why(_none_sh)
+    check("the sh emitter emits assignments only on a launchers-NONE plan too",
+          len(_none_statements) == 1 + len(labels) * 37
+          and all(ASSIGNMENT_RE.match(s) for s in _none_statements),
+          "got %d statements, %r"
+          % (len(_none_statements),
+             [s for s in _none_statements if not ASSIGNMENT_RE.match(s)][:3]))
 
     # ── Declared library acquisition ────────────────────────────────────────
     # D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER. Everything
@@ -14228,19 +14579,9 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # with this reader on all three).
     # ONE set of builders for BOTH header readers — `binary_shared_lib_shape`
     # (what KIND of image is this?) and `binary_target_identity` (what TARGET is
-    # it for?). The identity fields carry defaults so every assertion below
-    # reads exactly as it did before they existed, and the endianness parameter
-    # is there because `binary_target_identity` takes byte order from EI_DATA
-    # and must be shown doing so.
-    def _elf(etype, cls=2, machine=EM_X86_64, osabi=0, endian="<"):
-        order = "little" if endian == "<" else "big"
-        head = bytearray(b"\x7fELF" + bytes([cls]) + b"\0" * 15 + b"\0" * 4)
-        head[5] = 1 if endian == "<" else 2      # EI_DATA
-        head[7] = osabi                          # EI_OSABI
-        head[16:18] = etype.to_bytes(2, order)   # e_type
-        head[18:20] = machine.to_bytes(2, order)  # e_machine
-        return bytes(head)
-
+    # it for?). ⓘ `_elf_header` is defined at the TOP of this function, not here
+    # beside its siblings, because the ORACLE battery needs it thousands of lines
+    # earlier; the comment there records why, and why it is not called `_elf`.
     def _pe(chars, machine=IMAGE_FILE_MACHINE_AMD64):
         head = bytearray(b"MZ" + b"\0" * 0x3E)
         head[0x3C:0x40] = (0x40).to_bytes(4, "little")
@@ -14255,9 +14596,9 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                 + filetype.to_bytes(4, "little") + b"\0" * 16)
 
     for _blob, _want in [
-        (_elf(ET_DYN), ("elf64", True)),
-        (_elf(2), ("elf64", False)),              # ET_EXEC — compiled, not loadable
-        (_elf(ET_DYN, cls=1), ("", False)),       # 32-bit
+        (_elf_header(ET_DYN), ("elf64", True)),
+        (_elf_header(2), ("elf64", False)),              # ET_EXEC — compiled, not loadable
+        (_elf_header(ET_DYN, cls=1), ("", False)),       # 32-bit
         (_pe(IMAGE_FILE_DLL | 0x22), ("pe64", True)),
         (_pe(0x22), ("pe64", False)),             # an EXE emitted under a .dll name
         (_macho(MH_DYLIB), ("macho64", True)),
@@ -14270,7 +14611,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
               (_c, _s) == _want, "got (%r, %r) — %s" % (_c, _s, _d))
     check("every shape carries a reason, on both outcomes",
           all(binary_shared_lib_shape(b)[2]
-              for b in (b"", _elf(ET_DYN), _pe(0x22), _macho(2), b"junk")))
+              for b in (b"", _elf_header(ET_DYN), _pe(0x22), _macho(2), b"junk")))
 
     # ── WHICH TARGET A BINARY IS FOR, READ OUT OF THE BINARY ────────────────
     # The other half of the same question, and the input a smoke gate needs
@@ -14279,8 +14620,8 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # the two apart. ALL FIVE of this catalogue's targets, over SYNTHESISED
     # headers, so every arm is asserted on whatever host is running.
     for _blob, _want in [
-        (_elf(2, machine=EM_X86_64), ("x86_64", "elf64", "linux")),
-        (_elf(2, machine=EM_AARCH64), ("arm64", "elf64", "linux")),
+        (_elf_header(2, machine=EM_X86_64), ("x86_64", "elf64", "linux")),
+        (_elf_header(2, machine=EM_AARCH64), ("arm64", "elf64", "linux")),
         (_pe(0x22, machine=IMAGE_FILE_MACHINE_AMD64),
          ("x86_64", "pe64", "windows")),
         (_pe(0x22, machine=IMAGE_FILE_MACHINE_ARM64),
@@ -14305,30 +14646,30 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # failure would at least be loud — but it would be loud about the wrong
     # thing).
     check("the identity reader is not host-endian",
-          binary_target_identity(_elf(2, machine=EM_AARCH64, endian=">"))
+          binary_target_identity(_elf_header(2, machine=EM_AARCH64, endian=">"))
           == ("arm64", "elf64", "linux"))
     # ★ AND THE REFUSALS. Every one of these must RAISE rather than default:
     # the caller is deciding whether a binary that would not run is this
     # compiler's fault, and a guess there is a verdict about the compiler.
     check("an UNKNOWN EI_OSABI RAISES rather than defaulting to linux",
           _raises(lambda: binary_target_identity(
-              _elf(2, machine=EM_X86_64, osabi=9))),
+              _elf_header(2, machine=EM_X86_64, osabi=9))),
           "ELFOSABI_FREEBSD=9 — ELF's identity does not carry an OS the way PE "
           "and Mach-O do, so an unmapped value is a target nobody declared")
     check("...and the refusal names EI_OSABI and the values it does know",
           "EI_OSABI" in _raise_text(lambda: binary_target_identity(
-              _elf(2, machine=EM_X86_64, osabi=9))))
+              _elf_header(2, machine=EM_X86_64, osabi=9))))
     check("EI_OSABI 0 (SysV) and 3 (GNU) both read as linux — the two values "
           "this catalogue's own compilers emit",
-          binary_target_identity(_elf(2, osabi=0))[2] == "linux"
-          and binary_target_identity(_elf(2, osabi=3))[2] == "linux",
+          binary_target_identity(_elf_header(2, osabi=0))[2] == "linux"
+          and binary_target_identity(_elf_header(2, osabi=3))[2] == "linux",
           "MEASURED: every shipped elf64-*.format.json declares osabi 'sysv' "
           "(0), and /bin/ls on this host's WSL carries 0 too")
     for _what, _blob in (
-            ("an e_machine no leg targets", _elf(2, machine=0x28)),
+            ("an e_machine no leg targets", _elf_header(2, machine=0x28)),
             ("a PE Machine no leg targets", _pe(0x22, machine=0x1C0)),
             ("a Mach-O cputype no leg targets", _macho(2, cputype=0x0000000C)),
-            ("a 32-bit ELF", _elf(2, cls=1)),
+            ("a 32-bit ELF", _elf_header(2, cls=1)),
             ("an empty file", b""),
             ("bytes in no container at all", b"junk-not-a-binary"),
             ("a Mach-O universal archive",
@@ -14391,7 +14732,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                                              endian=">"))
           == (_ARTEFACT_INTERP, _ARTEFACT_NEEDED))
     check("a binary with neither segment yields empty, not a crash",
-          elf_runtime_dependencies(_elf(2)) == ("", []))
+          elf_runtime_dependencies(_elf_header(2)) == ("", []))
     # THE SHIPPED DECLARATION, against a synthetic artefact with the real
     # interpreter and library set. This is the POSITIVE CONTROL for the mutation
     # row at the bottom of this self-test: if it did not pass here, that row
@@ -14763,7 +15104,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
         # An ELF where a PE was asked for: the leg's declared format is the only
         # thing that decides, and it catches a wrong --target as readily as a
         # broken emitter.
-        _r = _call(runner=_fake_dss(_elf(ET_DYN)))
+        _r = _call(runner=_fake_dss(_elf_header(ET_DYN)))
         check("an artefact for the WRONG container is refused by the leg's own "
               "declared format",
               _r["verdictClass"] == "poisoned" and "elf64 image" in _r["detail"],
@@ -15166,10 +15507,18 @@ def main(argv=None):
                         "NO ORACLE, in those terms, and the fallback control is "
                         "named. Needs --reference-target (what --identify-binary "
                         "MEASURED off the reference) and --reference-path.")
-    p.add_argument("--reference-target", default="", metavar="ARCH:FORMAT",
-                   help="the run reference's own MEASURED target, from "
-                        "--identify-binary. NEVER a guess: an unmeasured "
-                        "reference is reported as no oracle at all.")
+    p.add_argument("--reference-target", default="",
+                   metavar="ARCH:CONTAINER:TARGETOS",
+                   help="the run reference's own MEASURED target — the IDENTITY "
+                        "TRIPLE --identify-binary prints, joined with ':', "
+                        "exactly as both drivers build it. ⚠ NOT a leg `spec`: "
+                        "the metavar said ARCH:FORMAT and the classifier duly "
+                        "parsed it with the spec readers, so every leg reported "
+                        "NO ORACLE over a control that was on disk "
+                        "[D-HARNESS-ORACLE-CLASSIFIER-READS-AN-IDENTITY-TRIPLE-WITH-THE-LEG-SPEC-READERS]. "
+                        "Empty is the only other accepted value and means "
+                        "UNMEASURED; a wrongly-shaped one is REFUSED, never "
+                        "guessed at.")
     p.add_argument("--reference-path", default="", metavar="PATH",
                    help="the run reference binary, or empty when none survived")
     p.add_argument("--leg-oracle", default="", metavar="PATH",
@@ -15845,6 +16194,11 @@ def main(argv=None):
                 sys.stderr.write("harness_legs.py: %s: %s\n"
                                  % (_fwd(args.identify_binary), exc))
                 return 3
+            # TAB-separated on the wire, in BINARY_IDENTITY_FIELDS order, because
+            # a caller that wants the fields wants them SPLIT; the drivers then
+            # translate the tabs to BINARY_IDENTITY_SEPARATOR and hand the result
+            # to a reader that parses it through `parse_binary_identity`. Two
+            # renderings of ONE ordered fact, and the order is named there.
             sys.stdout.write("%s\t%s\t%s\n" % (arch, container, target_os))
             return 0
 

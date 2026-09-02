@@ -9,7 +9,736 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-28 — cycles **P14 … P43**.
+**Last updated:** 2026-09-01 — cycles **P14 … P51**.
+
+---
+
+# §0 — RESUME HERE (a session with no context reads this block first)
+
+**State, ✔measured at the tip and not re-quoted:** branch `feature/c23-conformance-burndown-5`,
+**PR #56 OPEN**. ⚠ **NO SHA IS PINNED HERE ON PURPOSE** — a handoff cannot name its own commit,
+since writing it moves HEAD, and the public-repo bot rebases and squashes besides. Re-derive with
+`git log --oneline -3`. `git worktree list` → **the repo only**.
+
+★★★ **P51 RAN EIGHT LANES IN THREE WAVES AND CLOSED SEVENTEEN ROWS — NINE OF WHICH THE GATE CAN
+SEE — WHILE OPENING TWO THAT ARE NAMED AS P52's FIRST PRODUCTION ITEMS.** Wave 1 `el np mx gw`,
+wave 2 `fa ei ld`, wave 3 `in ap`; twelve closures were PRODUCTION and five were harness. Eight of
+the seventeen were **born closed inside the cycle**, which the balance gate cannot see because it
+counts rows by NAME across the base and the tip.
+
+⚠⚠ **THE CYCLE'S RECURRING LESSON IS THAT AN INSTRUMENT REPORTED GREEN WHILE MEASURING NOTHING —
+FIVE SEPARATE TIMES, AND FOUR OF THEM WERE CAUGHT ONLY BY READING SOMETHING OTHER THAN THE
+VERDICT.** Read §0.4 before trusting any transcript here. A lane's `Copy-Item` preserved mtime so
+ninja rebuilt nothing and three mutant arms passed off ONE compilation; two of my own red-on-disable
+drafts measured a condition that never occurred; a lane's mutant reported 2 of 3 failing names
+because the process aborted before gtest printed the third; and the Windows gate figure P50
+published turned out to be a property of the shell it was launched from.
+
+## §0.1 — The four gate legs, verbatim
+
+```
+cmake --build build/dbg  &&  ctest --test-dir build/dbg --output-on-failure -j 8
+wsl.exe -e bash /mnt/c/Source/DailySoftware/dss-code-prime/scripts/wsl-leg/wsl-leg.sh --mode full
+wsl.exe -e bash /mnt/c/Source/DailySoftware/dss-code-prime/scripts/remote-leg/remote-leg.sh --carriage arm64-vps --mode full
+wsl.exe -e bash /mnt/c/Source/DailySoftware/dss-code-prime/scripts/remote-leg/remote-leg.sh --carriage macos     --mode full
+```
+
+⛔⛔ **RUN THOSE THREE FROM POWERSHELL, WITH AN ABSOLUTE `/mnt/c/...` PATH, AND NOT FROM GIT BASH.**
+Git Bash's MSYS argument conversion rewrites a leading `/mnt/c/...` into
+`C:/Program Files/Git/mnt/c/...` before `wsl.exe` ever sees it. `scripts/run-gate/` has a `.ps1`
+twin with the identical argv contract — use it for the three remote legs.
+
+⚠⚠ **NEVER READ A LEG'S — OR A GATE'S — VERDICT THROUGH A PIPE.** `scripts/run-gate/` captures rc
+DIRECTLY, refuses to call a run successful without a caller-supplied success witness, and writes
+both to the log. The witness for every leg is ctest's own `100% tests passed`. Read the LOG.
+
+⚠ **A leg tests the tree AS SYNCED — fold everything first, then gate.** ✔P51 took an INTEGRATION
+checkpoint on the intermediate tree (five lanes folded, 1899/1899) precisely so a cross-lane break
+would surface before the real gate, and stated it as a checkpoint rather than a gate.
+
+⚠ **A `.plans/`-only edit still needs the repo guards re-run** — several read `.plans/**`:
+`ctest --test-dir build/dbg -L repo-guard`. **There are 22 of them since P51.**
+
+## §0.2 — The reference toolchains, and WHERE MSVC IS
+
+`DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` is only checkable if all three can be RUN, and each must be
+probed **separately** — "the reference" is not one voice.
+
+| reference | version | how to reach it |
+|---|---|---|
+| gcc | 13.3.0 | inside WSL: `wsl.exe -e gcc` |
+| clang | 18.1.3 | inside WSL: `wsl.exe -e clang` |
+| mingw-w64 gcc | 13.2.0 | on PATH natively as `gcc` on the Windows host |
+| **MSVC** | **19.51.36252 (VS 18 / MSVC 14.51)** | **`C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64\cl.exe`** |
+| **Apple clang** | **21.0.0 (clang-2100.1.1.101), MacOSX.sdk 26.5** | **on the Mac, via `scripts/ssh-macos/`** |
+
+★★ **MSVC IS REACHABLE WITHOUT `vcvars` FOR A FRONT-END QUESTION.** `cl.exe /c` compiles only —
+write the fixture so it includes **no system header**.
+★★★ **AND MSVC KEPT CHANGING THE ANSWER IN P51 TOO, IN BOTH DIRECTIONS.** It REFUSED
+`typedef _Noreturn void tfn(void);` (C3829) where gcc accepts — turning a "gcc-only" row into an
+accept-vs-refuse split the disjunction settles; it ACCEPTS `#line 42u` where gcc and clang refuse
+and ISO calls it a constraint violation (see §0.3); and it gives a bare `inline` definition an
+`External` COMDAT where gcc and clang provide no external definition at all. **A two-reference
+matrix is not a measurement of the union.**
+⚠ `mingw-w64 gcc` and `WSL gcc` are DIFFERENT references and they DISAGREE. ⓘ mingw-w64 ships **no**
+`<threads.h>`, so it is not a reference for C11 threads questions at all.
+
+## §0.3 — What is OWED, stated so it is not mistaken for done
+
+1. **[[D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE]] — P52's FIRST production item.** `e[p]`, `2[p]`
+   and `i[data]` are refused where all three references compile and run them, and ISO requires it
+   (`E1[E2]` ≡ `*((E1)+(E2))`). Found by lane `ei`, which could not take it because
+   `src/hir/lowering/cst_to_hir.cpp` was held by a live sibling for the whole cycle. ⚠ The row
+   carries a SECOND defect: the refusal names an internal node ordinal
+   (`hir node #N (HirKind ordinal 34)`) and no construct. **Both halves must close together.**
+2. **[[D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS]] — P52's second.** `inline extern int
+   p(int){…}` is refused where gcc, clang AND MSVC all accept and emit `T p`, and C §6.7.1 makes the
+   specifiers an unordered set. ⚠ The obvious fix was MEASURED AND REJECTED by the lane that found
+   it: admitting `extern` into the specifier alternation collides with the `externDecl`
+   import-synthesis route. Reconciling those two readings of `extern` IS the work.
+3. **`scripts/lane-worktree/lane-worktree.sh`'s `_repo_root()` is cwd-keyed** — a bare
+   `git rev-parse --show-toplevel`, i.e. the tree of the CWD and not the tree the script lives in.
+   Disclosed by lane `gw`, deliberately NOT repaired: changing which tree that script calls its own
+   changes the guard's SUBJECT. ctest pins the cwd via `WORKING_DIRECTORY`, so the only exposure is
+   a hand-run from elsewhere, and it fails to a loud verdict. **Reuse an existing per-language
+   resolver — `leg_tree_driver_identity` (`.sh`) or `Get-RepoTreeIdentity` (`.ps1`) — never a third.**
+4. **An operator question, raised by lane `ld` and NOT decided:** `#line 42u` is accepted by MSVC and
+   refused by gcc and clang, while ISO §6.10.6p4/p6 makes it a constraint violation. A mechanical
+   reading of the disjunction says DSS must accept; the standard says it is invalid. DSS's refusal
+   is UNCHANGED. Same shape, also unchanged and also stricter than at least one reference:
+   `#line 0`, `#line 2147483648` (MSVC **wraps** it to −2147483648), and trailing junk after the file
+   operand. **This is the "accepting what one reference accepts versus what ISO forbids" boundary the
+   `#pragma once` ruling did not cover.**
+5. **The clang ASan/UBSan leg is still absent from `scripts/`** — anchored twice
+   (`D-CI-ASAN-LEG-WALL-CLOCK-GROWS-WITH-THE-CORPUS`, `D-CI-ARM64-EXAMPLES-NEVER-SANITIZED`).
+6. **The elf/macho sqlite corpus legs at this tree**, and
+   [[D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE]]. `veryquick` still exits 1 by design —
+   `vtabH-3.1` is deliberately undeclared; read the ledger, do not chase it. **`speedtest1` is NOT
+   part of the standing exit** — it is owed only by a cycle that explicitly targets compile time or
+   the optimizer, and P51 does not meet that predicate.
+7. ✅ **DISCHARGED IN P51, recorded so it is not re-done:** WSL's stray `~/src/dss-sq` worktree from
+   P47 is GONE (its one untracked file preserved and md5-verified on both sides first, then a PLAIN
+   `git worktree remove`, never `--force`). The VPS is clean. On macOS an empty probe-fixture
+   directory was removed with `rmdir`; ⚠ `~/src/dss-code-prime-2` was measured and **deliberately
+   LEFT** — it is a real clone of the origin remote at a merged public commit, i.e. the operator's
+   own checkout, in the operator's own `~/src`.
+
+## §0.4 — Traps, and the FIVE times in P51 an instrument reported nothing as green
+
+- ⛔⛔ **A MUTANT ARM THAT CANNOT REPRODUCE ITS CONDITION IS NOT A GREEN ONE.** ✔P51, twice in my own
+  work on one fix: a red-on-disable driver ran under the inherited PATH, where Git's `usr/bin`
+  already came first, so the condition under test never occurred and the mutant read GREEN; the
+  next draft REPLACED PATH with a minimal list and every arm returned `configure rc=1` because
+  cmake had lost its own toolchain — vacuous again, for a new reason. **PIN the condition, then
+  ASSERT that a failure was the one you were testing for.**
+- ⛔⛔ **AND READ THE CONTROL, NOT ONLY THE MUTANT.** ✔P51: my first candidate-search fix walked ONE
+  directory level up from `git`, which is right for `<root>/cmd/git.exe` (PowerShell's PATH) and
+  wrong for `<root>/mingw64/bin/git.exe` (Git Bash's, same installation). **The CONTROL went red
+  beside the mutant**, and reading only the mutant's verdict would have shipped a fix that worked
+  from one shell and not the other.
+- ⛔ **`Copy-Item` PRESERVES mtime, so ninja rebuilds NOTHING.** ✔P51, lane `ei`: all three arms came
+  back green off ONE compilation, caught only by the object md5 not moving. **The md5 is not
+  ceremony.**
+- ⛔ **A CRASHING TEST SWALLOWS ITS OWN FAILING NAMES.** ✔P51, lane `np`: a mutant reported 2 of 3
+  names because the test ran on to structural reads over an ERROR tree and the process aborted
+  (`0xc0000409`) before gtest printed the third. Take a FATAL assert before any shape read.
+- ⛔ **A GUARD THAT CANNOT RUN MUST FAIL, NEVER VANISH.** ✔P51: `lane_worktree_guard`'s
+  registration was `if(bash_found)`, so on a host where the probe failed the entry ceased to exist
+  and the gate figure silently stopped covering it. It now registers a FAILING `cmake -P` refusal.
+- ⚠ **A registry cell can go false while the prose it was copied from stays true.** ✔P51: **32 of
+  the 67 banded rows had a `Priority` cell contradicting their own banner**, 11 of them UNDER-rated,
+  including two `P0 WRONG-OUTPUT` rows filed P2. `check-anchor-balance` ARM 6 tests exactly this
+  shape one column over, for `Status`, and there is no arm for `Priority` — **that arm is the
+  predicate for the next cycle: it must ACCEPT a row whose banner declares no band and reject ONLY
+  a contradiction**, since 444 of 511 open rows declare none.
+- ⛔ **A quoted heredoc EATS BACKSLASHES, and so does an inline `python -c` through Git Bash.** Paid
+  again in P51 on a regex full of them. Any throwaway script goes in a FILE, asserting by
+  `os.path.realpath` PREFIX that it is not inside the repository before it deletes anything.
+- ⛔ **`cmd && cmd2` ON ONE LINE HID A FAILED `cp` AND COST A LANE ITS ENTIRE EVIDENCE TREE** (P50).
+  `lane-worktree remove` now REFUSES unless given `--preserve-to <dir>` or `--discard-scratchpad`.
+  **Use `--preserve-to`. Never hand-roll the copy.**
+- ⛔ **A Windows command line caps near 32 KB**; call the writer IN-PROCESS instead
+  (`scratchpad/p51/mint_row.py` and `apply_big.py` are the pattern). ⚠ A registry write can also
+  fail with `PermissionError` on `os.replace` from a transient lock — ✔P51: it left a `.anchors-tmp`
+  beside the file and **applied nothing**, which is `anchors.py`'s P50 append-first ordering working.
+  Verify the census, remove the temp, retry.
+- ⚠⚠ **A `cd` PERSISTS BETWEEN Bash TOOL CALLS.** ⛔ **`grep -P` IS UNUSABLE ON THIS HOST** and
+  returns 0 silently. ⚠ **PowerShell expands `$?` inside DOUBLE quotes** before bash sees it —
+  single-quote any string carrying shell metacharacters.
+- ⚠ **The macOS login shell prints an EMSDK banner on EVERY non-interactive command**, and it
+  interleaves into captured output. Match on explicit markers, never on line or column position.
+
+## §0.5 — The P51 gate, ✔MEASURED at the folded tree
+
+Every leg through `scripts/run-gate/`, whose exit 0 means **rc=0 AND the success witness was found
+in the log** — it refuses to call a run successful on an exit code alone.
+
+| leg | result |
+|---|---|
+| Windows x86_64 (**includes the 22 repo guards**) | **1907 / 1907** |
+| WSL x86_64 | **1885 / 1885** |
+| arm64-VPS (native) | **1885 / 1885** |
+| macOS arm64 | **1885 / 1885** |
+
+★ **1885 = 1907 − 22, and that identity holding on THREE independent remote hosts is the cross-leg
+cross-check** — the remote legs run `-LE repo-guard` (their own output says `ctest (guards
+skipped)`), so a remote total that is not exactly the Windows total minus the root-host-only guards
+means the hosts did not test the same tree.
+
+⚠⚠ **THE WINDOWS LEG WENT RED THE FIRST TIME AND MY OWN SHELL LINE ALMOST HID IT.** It came to
+1906/1907 with `plan_citations_guard` FAILED and run-gate `rc: 8` — while **the harness reported the
+command's exit code as 0**, because I had written `bash run-gate.sh …; echo "rc=$?"` and the
+trailing `echo` became the command's exit status. This is §0.4's rule in a spelling it did not
+have: I did not PIPE the verdict, I APPENDED to it, and the effect was identical. **run-gate's log
+is what carried the truth.** Re-run with no trailing echo: **1907/1907, rc=0**.
+
+⇒ **The cause was the move-on-close ratchet interaction, and the honest verb was the burn-down
+one.** Closing seventeen rows MOVED them out of `_deferred-anchor-registry-production.md`, and their
+positional citations moved with them, leaving `ceiling 341, actual 334` — unclaimed headroom, which
+`check-plan-citations` refuses because that headroom is where the next citation hides.
+`--write` (the BURN-DOWN verb, which can only LOWER and refuses to launder a new citation) lowered
+exactly that one ceiling and touched nothing else. **NOT `--baseline`** — its own header says *"Do
+NOT reach for `--baseline` to make a red go away"*; P50 needed it only because the archive's count
+ROSE past its ceiling, which did not happen here. ⓘ The guard's own success line calls itself
+**DEBT, not a pass**: the plans still cite 2750 line numbers.
+
+ⓘ **SCOPE OF THAT RE-RUN, STATED RATHER THAN GLOSSED:** the only file the fix changed is
+`scripts/check-plan-citations/inventory.json`, read solely by a repo guard. The three remote legs
+run `-LE repo-guard` and had already synced, so their verdicts are untouched by it and were NOT
+re-run. Only the Windows leg carries the guards.
+
+✔**BOTH REMOTE HOSTS RE-VERIFIED DIRECTLY AFTER THEIR LEGS**, not inferred from the leg's own exit:
+HEAD at the driver commit, `git status` **rc=0** with **0 dirty**, **1 worktree**. The rc matters —
+a failed `git status` piped to a counter also reads 0 dirty. `leg-tree` restored each host and
+reported which build roots it deliberately KEPT (cold rebuilds are expensive); those roots now sit
+over a tree they were not built from, so **rebuild before trusting a binary from one**.
+
+## §0.6 — Where the evidence is
+
+Every lane's scratchpad was preserved by `lane-worktree remove --preserve-to` before the worktree
+was destroyed, and the counts were verified on both sides: `scratchpad/p51/{el,np,mx,gw,fa,ei,ld,in,ap}/`
+(131, 57, 44, 36, 20, 172, 54, 185, 31 files respectively). The orchestrator's own instruments —
+the priority census and its over-loose first draft, the registry appliers, the bash-candidate mutant
+driver — are in the session scratchpad and named in the rows that used them.
+
+---
+
+★★★ **P50: ONE SOLO ITEM AND THEN FOUR LANES AT THE CAP — SEVEN ROWS CLOSED, FIVE OF THEM VISIBLE TO THE GATE, AND BOTH OF THE CYCLE'S SHARPEST FINDINGS WERE DEFECTS IN MY OWN INSTRUMENTS.** ✔`check-anchor-balance --base 67714dad` ⇒ **closed 5, opened 2, net −3** COUNTED; **7 closed and 2 opened IN TRUTH**, two rows born-closed inside the cycle. Registry OPEN **841 → 838**. The solo item was the operator's R3 from P49 — the anchor guard's segment threshold flipped from `{2,}` to `{1,}`, putting **+104 previously invisible ids** under the guard and seaming 98 self-test fixtures. Wave 1 was `li ch as t2`, every lane from the PRODUCTION bucket.
+
+★★ **THREE OF THE FOUR LANES REFUTED THE BRIEF I GAVE THEM, EACH IN THE DIRECTION THAT WOULD HAVE SHIPPED A REGRESSION.** `li` found the linkage row's matrix was gcc-only: **MSVC 19.51 SILENTLY ACCEPTS most `static`↔non-`static` redeclaration orderings** (`dumpbin` shows the accepted function cases landing `Static | f`, internally consistent), so the unanimous-reject set the disjunction permits is far narrower than the row claimed — and a `static`-first ordering is legal C 6.2.2p4/p5 INHERITANCE, so the fix needed propagation across the merge rather than a check. Its second row demanded a hard error and predicted unanimous rejection; **FALSE — gcc accepts every non-function `_Noreturn` with a warning and drops the specifier**, so it closed as a suppressable WARNING instead. `ch` found the char-signedness row WIDER than recorded (`mapBinaryOp`'s local list also drove the ordered comparisons, so a raw `char <` was `ICmpUlt` target-blind) and re-measured reachability rather than inheriting a 2026-07-24 premise. `as` found gcc and clang **SPLIT** on an FP modifier letter applied to an immediate, and that the arm64 dialect comment's claim that FP letters "render EMPTY" on `"r"` operands was simply false — both references hard-error.
+
+⚠⚠ **THE TWO INSTRUMENT DEFECTS, BOTH BORN CLOSED, BOTH FAILING IN THE DIRECTION WHOSE RESULT LOOKS LIKE SUCCESS.** [[D-CYCLE-LANE-WORKTREE-REMOVE-DISCARDS-AN-UNPRESERVED-SCRATCHPAD]]: I destroyed lane `t2`'s entire evidence tree — `cp -r … && echo preserved` and `lane-worktree remove t2` on ONE line, the destination's parent did not exist, `cp` failed, `&&` swallowed the echo, and **the ABSENCE of output read as success**. The identical command had been correct for two earlier lanes only because that parent happened to exist. `remove` now REFUSES a lane whose scratchpad holds files unless given `--preserve-to` (it does the copy and verifies both sides) or `--discard-scratchpad`. [[D-GATE-ANCHORS-A-MOVE-IS-NOT-ATOMIC-AND-LOST-A-ROW]]: closing a row DELETED it from production and failed to append it to the archive, leaving it in NO registry — and **`check-anchor-balance` counts OPEN rows BY NAME, so a row that vanishes from every file reads EXACTLY like a row that was CLOSED**. Silent loss reported as progress. Fixed by ORDER rather than locking: every destination's content is computed before anything is written and the APPEND goes FIRST, so an interruption leaves a duplicate — which `place_row` already refuses loudly — instead of a disappearance, which nothing can see.
+
+★ **`t2` closed [[D-SQLITE-CLI-BUILT-ON-NO-LEG]]** by taking Table 2 (the round trip) from 12 to **40 of 40** with ZERO structural skips, every payload sha256-re-hashed on the run host before any assertion. ⚠ **QUALIFICATION THAT MUST TRAVEL WITH IT:** every payload records `hasReference: false`, so those 40 cells prove each artefact RUNS CORRECTLY on its target platform — they are **NOT** a DSS-vs-gcc differential.
+
+**Gate, ✔MEASURED at the folded tree, every leg through `scripts/run-gate/`:** Windows **1884/1884** (all 21 repo guards) · WSL x86_64 **1863/1863** · arm64-VPS **1863/1863** · macOS **1863/1863** — 1863 = 1884 minus the 21 root-host-only guards, and that identity is the cross-leg cross-check. ⚠ That Windows figure was later found to be **PATH-dependent rather than a property of the tree** — see P51.
+
+---
+
+★★★ **P49: EIGHT ROWS CLOSED AND ONE OPENED ACROSS SIX LANES IN TWO WAVES, AND AN OPERATOR RULING TURNED MY ONE-ROW FIX INTO A SEVENTY-ROW DISCLOSURE.** ✔`check-anchor-balance --base c1754511` ⇒ **closed 5, opened 1, net −4** COUNTED; **8 closed and 1 opened IN TRUTH**, three rows born-closed inside the cycle. The one row OPENED was `🔵` disclosed pre-existing debt, which the gate exempts by design. Registry OPEN **846 → 842**; buckets **PRODUCTION 329 · harness 190 · per-plan 323**.
+
+**Wave 1 `vl th fi lt`; wave 2 `gi tw`.** `vl` finished the VLA arc's residue as ONE seam rather than five special cases; `th` measured the pe `struct timespec` layout and found **a live latent miscompile that had already shipped** — `time.json` and `sys/stat.json` declared it FLAT `{i64,i64}` while both list `pe`, so every pe TU wrote 8 bytes into a 4-byte `tv_nsec`, invisible because `sizeof` is 16 and `tv_nsec` sits at offset 8 in BOTH worlds and only the WIDTH moves; `fi` closed the silently-dropped `--resolve-library` identity on a merged archive; `lt` made `lowerCToLir` refuse to report success having produced no instructions, which is what every `tests/lir` pin's meaning rested on; `gi` made a generic selection an integer constant expression; `tw` completed `<threads.h>` on all three object formats.
+
+★★★ **THE OPERATOR RULING IS THE CYCLE.** `scripts/anchors/anchors.py` refused to UPDATE a row the registry already held, because `make_row` enforced the anchor guard's ≥3-segment id rule on every path. I proposed renaming the blocked id. **The operator REFUSED THE RENAME NOW AND LATER** and corrected three of my measurements: the rename costs 291 citations across 87 files (I said 350/90 by counting 13 SIBLING ids a whole-word matcher excludes), it fixes **ONE ROW OF SEVENTY**, and the registry's own ANCHOR-NAME RULE MANUFACTURES the invisible ids — its worked example, `D-CSUBSET-ALWAYS-INLINE` → `D-CSUBSET-ALWAYSINLINE`, takes a four-segment id the guard checks and produces a three-segment id it ignores. **The rule written to prevent guard failures is what produces guard-invisible anchors.** Two rows carry it: [[D-GATE-ANCHORS-WRITER-CANNOT-MAINTAIN-A-ROW-THE-REGISTRY-ALREADY-HOLDS]] (born closed — the segment count became a MINTING rule; `place_row`'s existing-row refusal was always the stronger identity check) and [[D-GATE-ANCHOR-REGISTRY-SEGMENT-THRESHOLD-HIDES-SEVENTY-ROWS]] (the disclosure, closed by P50's flip).
+
+★★ **THE CYCLE'S OWN INSTRUMENTS PRODUCED THREE FINDINGS, ALL FAILING TOWARD *CLEAN*.** The writer seized up hardest exactly where the registry is weakest — the rows it refused to maintain are the ones the guard does not watch. The guard then caught **my own self-test fixture** `D-AAA-BBB-CCC` as an anchor cited with no row, the very class the disclosure describes, demonstrating itself while the disclosure was being written; de-anchored through the fragment pattern, never allowlisted. And `check-anchor-balance` ARM 6 caught `D-CSUBSET-VLA` with a `✅ CLOSED` Status column over a Trigger still leading 🟢.
+
+⚠ **TWO SENTENCES IN THAT SAME CLOSED ROW HAD ALREADY GONE FALSE INSIDE THE CYCLE** — both said a LIR pin *"is RED"*, true when lane `vl` wrote them and false once lane `lt` folded and the pin was inverted. ⇒ **when a lane reports work it could not do because a sibling held the tree, the orchestrator owes the row a second pass after that sibling folds** — the lane cannot, because it is gone.
+
+⚠ **AND TWO CORPUS COMMENTS CITED THE CLOSED VLA ROW AS A LIVE BLOCKER; THE FIX WAS NOT THE GUARD'S SUGGESTED ONE.** ✔I re-measured both through the shipped CLI before touching a word: a FILE-scope VLA still refuses with `S_NonConstantArrayLength` and a VLA struct member with `S_FlexibleArraySoleMember`, and **both refusals are ISO C's own constraints that every reference enforces** — outside anything the closed row deferred. The CLAIM was true and the CITATION was the stale half. Editing those headers then moved the subject lines and reddened `analysis/test_diagnostic_corpus`, whose goldens pin `line:col`; refreshed and verified cell-wise that **only the LINE moved**.
+
+★★ **THE `veryquick` INTEGRATION DEBT FROM P47 WAS DISCHARGED, AND DISCHARGING IT FOUND A FRESH DEFECT.** pe64 leg: **3 errors out of 394,437 tests, zero DSS-attributable**, CLI smoke 14/14; the P47 confound rows were SEEN TO APPLY (`scanstatus-5.1.2` and `sessionnoact-4.3` matched and excused) and the repaired oracle classifier reported `elf64-x86_64: SAME-PLATFORM` — the case that read NO ORACLE on every leg before P47's fix. ⚠ But the first run used a `build/rel` compiler **four cycles stale** while printing `[OK] … PROVED current`: the currency probe answers CONFIG drift, Step 9's `+N files differ from HEAD` compares the WORKING TREE to HEAD, and **neither answers "was this binary built from these sources"** — ✔measured, that line read `+56` byte-identically in the stale run and the fresh one. [[D-HARNESS-PS1-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-SOURCES-IT-COMPILES]]: the located tree is now REFRESHED, as the `.sh` twin always did. ★ The fix's own first run then caught a defect in the fix — a scriptblock returning `& cmake …; return $LASTEXITCODE` returns `[…ninja output…, 0]`, so a SUCCESSFUL build read as failed.
+
+**Gate, ✔MEASURED at the folded tree, every leg through `scripts/run-gate/`:** Windows **1870/1870** (all 20 repo guards) · WSL x86_64 **1850/1850** · arm64-VPS **1850/1850** · macOS **1850/1850** — 1850 = 1870 minus the 20 root-host-only guards, and that identity is the cross-leg cross-check. ✔Both remote hosts re-verified DIRECTLY after their legs (`HEAD`, `git status` **rc=0** with 0 dirty, 1 worktree) — the rc matters, because a failed status piped to a counter also reads 0 dirty.
+
+---
+
+★★★ **P48: TEN ROWS CLOSED AND ONE OPENED ACROSS SIX LANES IN TWO WAVES, FIVE LANES REFUTED THE PREMISE THEY WERE HANDED, AND THE CYCLE'S MOST INSTRUCTIVE EVENT WAS A CLOSURE OF MY OWN THAT I HAD TO WITHDRAW.** ✔`check-anchor-balance --base dac121cc` ⇒ **closed 8, opened 1, net −7** COUNTED, of which 1 is a bookkeeping closure (`✅🧾`); **10 closed and 1 opened IN TRUTH**, because two rows were born-closed inside the cycle and the gate counts rows by NAME across base and tip [[feedback-the-gate-cannot-see-a-row-born-in-the-cycle]]. Registry OPEN **530 → 523**; buckets **PRODUCTION 333 · harness 190 · per-plan 323**, sum **846**.
+
+**Wave 1 — `pp sm al ff`; `st` replaced `ff` and `cq` replaced `sm` as each exited**, so the operator's cap of four held throughout. Every lane was picked from **P0 WRONG-OUTPUT in the PRODUCTION bucket**.
+
+**What landed:** computed `#include MACRO` now RESOLVES rather than being silently dropped (lane `pp`, and the "minimum" fail-loud path the row offered was refused because all three references resolve it); the Darwin `malloc_zone_t` 176-byte opaque tail is GONE with all 25 members typed and executed on real hardware, and `fsid_t` was confirmed correct so `sys/mount.json` needed no edit at all (lane `ff`); over-aligned stack locals are HONOURED by reserving frame headroom and rounding the address, with no arch-keyed code and no new opcode, config key or diagnostic code (lane `al`); `const` enforcement now reaches every non-plain-identifier lvalue including declared-const fields (lanes `sm` + `cq`); and the shipped type-alias spellings are keyed on `format` **with** `dataModel` instead of `dataModel` alone (lane `st`).
+
+⚠⚠ **A ROW WAS CLOSED THAT SHOULD NOT HAVE BEEN, AND THE CLOSURE WAS WITHDRAWN INSIDE THE SAME CYCLE.** `D-CSUBSET-VLA` read *"ARC COMPLETE"* with an **EMPTY closing-work cell**, which is exactly the `dss-cycle` skill's *"shipped but only the glyph is open"* class. Its own witnesses were verified (six corpus examples present, `ctest` 24/24, `__STDC_NO_VLA__` correctly absent) and it was marked ✅. **Every one of those measurements was true and the conclusion was still false**: ✔gcc 13.3.0 and clang 18.1.3 both COMPILE AND RUN `typedef int R[n]; R a[2];` and `R *p = a;`, which DSS refused — and that exclusion was recorded in a **test comment**, never in the row. ⇒ **an empty closing-work cell is not evidence that nothing is owed; it is evidence that nobody wrote down what was.** [[feedback-a-rows-premise-has-a-shelf-life]] runs BOTH ways: a status cell can go stale toward OPEN, and it can go stale toward COMPLETE. ★ **`check-stale-refusal-citations` is what caught it**, reddening the moment the closure landed over three sentences that assert a refusal while citing the now-closed row. Its own suggested fix — past-tense governors — would have cleared the guard and buried a real conformance gap under three tidy comments. **Read a stale-refusal red as a question about the CLOSURE first and the SENTENCE second.** (P49 closed the row for real, on the residue this withdrawal named.)
+
+⚠⚠ **`lane-fold` WAS SILENTLY DISCARDING EVERY DELETION.** ✔MEASURED folding lane `al`: it printed *"WROTE 17 path(s)"*, exited 0, and left behind the example that lane had REPLACED — one asserting a refusal its own change had made legal. `git status` always reported the `D` record; `classify()` hit `if not os.path.isfile(src): continue` and dropped it. It fails toward keeping stale assertions alive, and the resulting red would have been charged to the lane's compiler work rather than to the tool. FIXED with the same drift-refusal a copy carries, deletions printed on their own line, and two REMOVE-direction self-test arms ([[D-CYCLE-LANE-FOLD-DROPS-A-LANE-S-DELETION]]). ✔It worked in P49 on the first real deletion it met.
+
+★★ **FIVE LANES REFUTED A PREMISE THEY WERE HANDED, AND THREE OF THOSE REFUTATIONS CHANGED WHAT SHIPPED — TWICE BY STOPPING A CONFORMANCE REGRESSION THE ROW ITSELF DEMANDED.** `sm` measured that `D-CSUBSET-POINTER-DIFF-EDGE-CASES`'s requested "loud diagnostic" would have put DSS BELOW the union (MSVC compiles `char* - int*`), and that DSS's EXISTING refusal was already below it and CONTEXT-DEPENDENT — `(int)(a-b)` silent while `long n = a-b;` refused, the same expression judged by where it landed. `cq` measured that supplying the const marker alone would NEWLY refuse `struct S { const int v : 3; };`, which gcc and mingw-w64 gcc compile, and built a severity fork rather than ship the regression. `al` refuted its row's prescribed dynamic-SP-realignment design and built something strictly smaller. ⇒ **a brief's premise is a HYPOTHESIS** [[feedback-a-brief-premise-is-a-hypothesis]].
+
+★ **AND TWO LANES FOUND SILENT DEFECTS OUTSIDE THEIR OWN SUBJECTS.** `al` found `recover_parent_frame_slot` computing a Win64 SEH parent local's address from an **alloca scan index** treated as a slot index — already wrong for any parent carrying a multi-slot local ahead of the referenced one — and fixed it; it then found that its OWN fix would have introduced a NEW silent miscompile in the same area, which nothing had ever exercised because the construct was refused before. `st` found `decodeShippedFor` hard-coding `DataModel::Lp64` for every format, so a test was asking about `(Pe, LP64)` — a pair no target is.
+
+⚠⚠ **THE REGISTRY BECAME THREE FILES DURING THIS CYCLE, BY AN OPERATOR CHANGE MADE IN A PARALLEL SESSION, AND IT LANDED IN THE SAME COMMIT.** Closed rows are ARCHIVED to `.plans/_deferred-anchor-registry-done.md`, the row shape gained two columns — `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |` with `Priority` `P0`..`P5` and a THREE-VALUE controlled status vocabulary (`✅ CLOSED` / `🟠 OPEN` / `⏳ GATED`) — and `scripts/anchors/` is the deterministic door: `read-anchor`, `read-anchors`, `write-anchor`, `set-anchor`, each a `.sh`/`.ps1` launcher over ONE `anchors.py` so the pair cannot drift. ⇒ **STOP HAND-WRITING REGISTRY ROWS.** ★ **The glyph is still the contract**: `is_closed` is *"the cell OPENS with ✅ after stripping `*_ `"*, complement defined and never enumerated, so the new `CLOSED` word is for the reader and the glyph is what the battery agrees on.
+
+★ **THE COMMIT CARRIED A SECOND CYCLE'S WORTH OF CLOSURES THAT ARE NOT P48's.** The parallel session filed **five rows, ALL BORN CLOSED** — `D-CONFIG-A-LANGUAGE-IS-LOOKED-UP-BY-ITS-DECLARED-NAME-NOT-ITS-DOCUMENT-STEM`, `D-RUNTIME-OBJECT-CACHE-IS-WIRED-TO-NOTHING`, `D-GATE-ANCHOR-REGISTRY-RETIRED-ID-SCAN-READS-ONE-CELL-LAYOUT`, `D-STATE-DRIVER-COUNTS-THE-ALLOWLIST-AS-OPEN-ANCHORS`, `D-HARNESS-SPEEDTEST1-BENCH-MEASURES-ONLY-THE-FIRST-REFERENCE-COMPILER-IT-FINDS`. ⇒ across the whole commit: **15 closed, 1 opened IN TRUTH; `closed 8, opened 1` COUNTED**.
+
+✔**THE MIGRATION WAS REVIEWED BY MEASUREMENT, NOT ACCEPTED**: anchor ids across the two old files at `dac121cc` versus the three new ones — **2070 → 2078 rows, ZERO LOST**, the eight gained being P48's three and the parallel session's five. ⚠ And the citation ratchet was checked for the one edit that is a HAND-SEEDED ceiling rather than a tool output: **zero raised**, three lowered (harness 503→251, production 1462→359, `malloc.json` 9→7), one added for the new archive at 1351. ⓘ The seeded ceiling is **4 BELOW** what a pure relocation would need, conservative in the only direction the ratchet permits.
+
+⚠⚠ **AND MY FIRST REVIEW INSTRUMENT WAS WRONG IN THE INSTRUCTIVE WAY.** It reported two rows flipping CLOSED → OPEN. ✔Both read `⚠️` at HEAD *and* now, byte-identical — the "flip" was my reader ENUMERATING a glyph list that omitted `⚠️` and falling through to a different cell under the old shape. **The project's own rule is to define the COMPLEMENT and never enumerate glyphs**, and a review script that breaks it manufactures findings. ★ The explicit `Status` COLUMN is what makes that class impossible.
+
+**Gate, ✔MEASURED at the folded tree, all four legs through `scripts/run-gate/`.** Windows 1854/1854 (all 20 repo guards, re-run after the handoff edit) · WSL x86_64 1834/1834 · arm64-VPS 1834/1834 · macOS 1834/1834 — the 20-test difference is the root-host-only guard set, and that identity is the cross-leg cross-check. ⚠ **SEQUENCING, STATED RATHER THAN GLOSSED:** the four legs ran against a tree that did NOT carry the registry-policy change, which landed at 09:54–10:05, after the Windows leg.
+
+---
+
+★★★ **P47: TEN ROWS CLOSED IN TRUTH AND FOUR BY THE GATE'S COUNT, ACROSS SEVEN LANES IN TWO WAVES — AND THE CYCLE'S THREE SHARPEST MOMENTS WERE ALL A MEASUREMENT KILLING A PLAUSIBLE DESIGN, TWICE MINE.** ✔MEASURED `check-anchor-balance --base f8ebafb2` ⇒ **closed 4, opened 2, net −2** counted; **10 closed, 2 opened in truth** (§0.5 owes both figures and so does every report). Registry **532 → 530**, production **344 → 340**.
+
+**Wave 1 — `mm` `r1` `bf` `sq`; Wave 2 — `ac` `fl` `fo` `cw`** (the orchestrator replaced each lane as it exited, holding the operator's cap of four).
+
+**The four production closures.** `mm` re-keyed the pre-scan memo to `(PathIdentity, SHA-256 of the file's bytes)` and **deleted** `size`/`mtime` rather than tightening beside a third term — the read now precedes the lookup, because there is nothing to key on until the bytes are in hand. `bf` gave `Lvalue` an ordered member-hop chain so an anonymous-member or array-arrow bit-field base reconstructs through ONE code path, and **kept the refusal** as a structural backstop (`declineMemberLvalue`) instead of deleting it, so a future base shape cannot re-open the silent full-unit store merely by not being enumerated. `fl` closed the FFI library-map hole. `ac` built the dependency artifact cache at the `buildCus` boundary, reusing the runtime object store whole.
+
+**Every one of those four lanes refuted a premise it was handed, and three of the refutations changed what got built.**
+- `mm` refuted **its own row's cost claim**. The row said a content digest *"costs one hash of a buffer the code is holding"* — true of `ConfigDocumentMemoStore`, false here, because the memo's HIT path previously did no read at all. ✔MEASURED by interleaved A/B with **two complete driver sets** (the code is in `libdsscp.dll`; an exe-only swap measures nothing): **+1.59% at 41 TUs, +3.37% at 161 TUs ≈ 19 ms/MB**. 🧠INFERRED against sqlite's 109.2 MB of include reads: ~2.1 s against the memo's ✔measured 10.2 s saving — **the memo keeps about four fifths of its win**, and that is the price of an exact key.
+- `mm` also refuted the SCOPE premise it inherited (that bytes can only change at a driver-controlled build-phase boundary): `LspServer::run()` is a `while (!exitReceived_)` loop rebuilding a `CompilationUnit` per request with only the MAIN document in memory, so every `#include` is read from a disk an external editor writes to. An invalidation epoch could not have been shown correct. **The content digest was the only exact key.**
+- `ac` refuted **the row's key-term list**, and in the dangerous direction: the terms named covered only what the FRONT END parsed, so everything reaching the LINK without passing through it — transitive dependency artifacts, `resolveLibraries`, object inputs, shipped runtime archives — was uncovered. That is **under-invalidation, which ships wrong bytes**, not over-invalidation, which costs a rebuild.
+- `fl` refuted the row's CENTRAL premise: the *"unenumerated fallthrough"* had been a stated arm (`ShippedRealizationStatus::NoLibraryForFormat`) since `60eb8ed8` — **two days after the row was written**. It then found the residual the row never named: a `library` key present naming the **empty string**, which `decodeLibraryMap` accepted while its sibling `decodeRealizationMap` already refuses exactly that; one row, two verdicts, no diagnostic. And it **refused the row's recommended fix on measurement** — a load-time "available ⇒ must name an image" rule would fail loud on the six most central C descriptors, because **125 of 567 symbol rows** declare no `availableObjectFormats` at all while naming images only for elf/pe/macho.
+
+**The arm64 arc is the cycle's spine, and it took three lanes.** `r1` declared arm64's SIMD&FP file ONCE — `v0..v31` are the `fpr` class members, `d`/`s`/`h`/`b` are `subOf` views, `argVrs`/`returnVrs` are **deleted** — and witnessed it by execution under qemu: eight simultaneously-live `"w"` operands allocate, which the old empty `vr` free list made impossible. ⚠ **But neither of its rows closed**, because the wider FP class doubled `frameSlotStride` and pushed FP frame accesses past `fstur`/`fldur`'s ±256 unscaled reach — `examples/c/varargs_aapcs64_struct` red, ×9 diagnostics, **failing LOUD**. Per the operator's *"if you depend on something to be built … this needed build enters in priority list"*, the orchestrator **folded the red tree with a rollback snapshot** and dispatched `fo` rather than filing a follow-up.
+★ `r1` also caught a silent miscompile it would have introduced: `lowerWideFloatSoftcall` resolves its register class DYNAMICALLY, so it never spells `VR`; with `v0` becoming `fpr` it would have marshalled every `__addtf3`-family call at width 64 instead of 128. **No grep finds that class** — the defect is an ABSENT argument, not a present wrong one.
+
+**`fo` closed the blocker and refuted BOTH attributions, including the orchestrator's.** ✔MEASURED: `D-ASM-AARCH64-FRAME-OFFSET-BEYOND-SCALED-IMM12` (✅ CLOSED, P42-era) does **not** own this — it covers the genuinely UNENCODABLE tail, and these offsets (256–320 ⇒ imm12 32–40) are trivially encodable; there was simply **no form declared** to encode them with. ✔And the orchestrator's `frameSlotStride` suspicion is refuted: the `max(GPR, FPR)` floor is deliberate, deriving downward would shrink x86_64 from 16 to 8 in every function without an FPR spill, and **the fix needed zero change there**. The actual shape: `RegClassOp` gains `LoadScaled`/`StoreScaled`, arm64 declares `fldr_u`/`fstr_u` at 32/64/128, and `selectFrameMemOp` takes a **per-class twin table** instead of a `universalGprOp` parameter — which also removed the integer file's special case, previously resolved by a SECOND mechanism. **The encoder needed no change at all**: its `Imm12Scaled` handler already derived the scale from `instWidth/8`.
+
+**`cw` closed a latent silent-wrongness and refuted the orchestrator's preferred design with an ABI measurement.** The row (filed hours earlier from `fo`'s finding) proposed deriving the save width from the register class's declared full width. ✔MEASURED: that **would have broken arm64** — MSVC emits `movaps` because Win64 preserves xmm6–15 **in full**, while 📄AAPCS64 §6.1.2 preserves only the **low 64 bits** of v8–v15. The same default is wrong on one target and right on the other, so the width is now **DECLARED** (`calleeSavedPreservedBits` on the calling convention, absent ⇒ whole register) for the ABI-facing save and the class's natural width for spills — **two different questions that a single "full width" rule would have conflated.** `ms_x64` needed no new config; arm64 is byte-identical, its 64 now coming from a declaration instead of a code default. ★ It also found **a third instance nobody had named** — `sysv_amd64`'s variadic SSE save half-filled each of eight 16-byte XMM slots on **every** Linux/macOS variadic callee — **an existing test that was PINNING the defect in place** (`…SpillsViaMovsdStore` *required* the 8-byte form; the MOVSD form is now pinned ABSENT), and **two false `$comment`s in shipped config** asserting Win64 needs only the low 64 bits and that spill slots are 8 bytes. `src/link/format/pe.cpp` disagreed and was right.
+
+**Lane `sq` cleared the carriage family that was blocking every lane from every gate host** — four born-closed rows: `leg-tree` refusing a detached driver, carriages unable to identify a cross-namespace lane worktree, carriages looking for `.secrets/` inside a worktree, and the macOS carriage calling ONE mDNS miss a down host. ⚠ **The second of those failed toward CLEAN**: `remote-leg.sh` reported `dirty: 0 path(s)` for such a tree because `git status --porcelain 2>/dev/null | wc -l` counts zero when git FAILED — byte-identical to a genuinely pristine reading, and those two lines are the driver's only record of which tree it carried. `sq` took `D-SQLITE-CLI-BUILT-ON-NO-LEG`'s **Table 1 from 0 to 20 of 20** cells proven by execution (four hosts × five legs × both artefacts) and Table 2 from 0 to 12 of 40, and refuted **both** of P46's named blockers — the "stale `c-subset` regenerator" has no root to fix (the generator writes `"language": "c"` unconditionally and has since P36), and "the Mac's sshd is down" was our own instrument reading one mDNS miss as a verdict, which had cost that row 22 of 40 obligations.
+
+⚠⚠ **THE ORCHESTRATOR'S OWN INSTRUMENTS FAILED THREE TIMES, ALL QUIETLY AND ALL TOWARD *LESS*.** A citation-cell merge split only on `·` while one row used `;`, so a single matched subject discarded the whole chunk and dropped `target_schema.hpp` plus two wiki-links. A containment check built as a sliding window called a legitimate cell-head prepend a content drop — a TRUE answer to the WRONG question, since a prepend must fail such a check by construction. And an `amend_row` assertion caught the orchestrator about to re-status a ✅ CLOSED row to ★★ by prepending an amendment whose first glyph became the status — **that one was caught by the assertion, which is the argument for writing the assertion.** [[feedback-an-instrument-that-answers-an-adjacent-question]] is now a four-time finding.
+
+★ **A COVERAGE ASYMMETRY WAS CONFIRMED AS POLICY, AND ITS DEFECTIVE HALF ANCHORED.** `integrated_tests/c/varargs_aapcs64_struct` read **Passed** while the identical example failed to encode for arm64 under the in-process runner. ✔The asymmetry itself is deliberate and documented (`D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-…`, ✅ closed). **The defect is that `SKIP_RETURN_CODE` is set on the `adjudicate` entry and NOT on the per-example ones**, so an entry whose every arm is structurally skipped exits 0 and ctest prints `Passed` — the runner's own report says *"0 verified"* and *"1 of 1 declared target arms NOT verified"*, and the one-line summary everybody actually reads contradicts it. Amended into `D-TEST-STRICT-ARM-VERDICTS-INERT-ON-WINDOWS` rather than minted as a duplicate.
+
+**Gate, ✔MEASURED at the folded tree, all four legs through `scripts/run-gate/` so a zero exit without the success witness would have been REFUSED.** **Windows 1825/1825 (all 20 repo guards) · WSL x86_64 1805/1805 · arm64-VPS 1805/1805 · macOS 1805/1805** — 1805 = 1825 minus the 20 root-host-only guards, and that identity is the cross-leg cross-check. ✔**Both remote hosts re-verified DIRECTLY after their legs** — `HEAD=f8ebafb2, dirty=0, worktrees=1` on each — rather than trusting the leg's own restore line, because a truncated log has made a completed restore look unwitnessed before. ⚠ Both hosts KEEP their build roots on purpose (`leg-tree` says so explicitly); those roots were built from a tree since discarded, so **rebuild before trusting any binary found in them**.
+
+---
+
+★★★ **P46: ELEVEN ROWS CLOSED IN TRUTH AND THREE BY THE GATE'S COUNT, ONE ROW LEFT OPEN ON PURPOSE, AND THE CYCLE'S TWO SHARPEST FINDINGS WERE A LANE REFUTING MY BRIEF AND MY OWN PROBE REFUTING A LANE THAT WAS RIGHT.** ✔MEASURED `check-anchor-balance --base f865897c` ⇒ **closed 3, opened 1, net −2** counted; **11 closed in truth, 1 opened** (§0.5 owes both figures and so does every report).
+
+### ★★★ THE HEADLINE: TWICE THIS CYCLE AN INSTRUMENT ANSWERED AN ADJACENT QUESTION, AND BOTH TIMES IT FAILED TOWARD *CLEAN*
+
+Not a lane defect either time — **both were mine, and both were caught by USING the instrument rather than by auditing it.**
+
+1. **`burndown-queue.py` banded by the anchor's SPELLING where the ruling defines the bucket by the FILE.** `D-CONF-REFERENCE-DIFFERENTIAL-ORACLE` lives in `-harness.md` and was printed as the **#1 row of the P0 WRONG-OUTPUT band**, with nothing on the line saying harness, because `D-CONF-` is not in `NS_HARNESS` and never was. ⚠ **I read the queue top-down to pick the 4th lane and came ONE STEP from seeding a lane on a harness row**, which the standing ruling forbids outright. ✔Census: **18 harness rows banded above P3, two of them in P0**. The reverse direction — a PRODUCTION row hidden under P3 — measured **0 today, and only by luck of spelling**. Fixed so the FILE decides in BOTH directions; 8 self-test arms now ship and run on every invocation, with a two-mutant red-on-disable transcript through the real CLI.
+2. **`lane-worktree.sh remove` REPORTED SUCCESS OVER 4.4 GB STILL ON DISK.** Lane `cm` was folded mid-flight with its `.git` emptied, so `git worktree remove` could not see it and exited non-zero; control fell through to `prune` and printed `removed …` unconditionally. ⚠ **The failure is invisible from the caller** — `git worktree list` agrees the worktree is gone, because the registration WAS pruned. Only `ls .worktrees/` disagrees and nothing in the cycle runs it. Now it removes, **verifies**, and only then speaks. ⚠ Fixing it dragged in a hazard first: **`cmd_add` validated the lane name and `cmd_remove` did not** — harmless while the verb merely declined an unknown path, and not harmless the moment an `rm -rf` stands behind it.
+
+### ★★★ THE SECOND HEADLINE: A LANE WAS RIGHT AND MY PROBE SAID IT WAS WRONG
+
+Lane `dw` reported that ten `tgmath.json` macros now carry three format arms asserting a difference that no longer exists. ✔My probe compared whole arms by serialisation and reported **0 collapsible** — because `when: {format: …}` differs BY CONSTRUCTION in every arm. **The question is not *"are the arms identical"* but *"are they identical APART FROM THE SELECTOR"*.** Re-measured correctly, `dw`'s list reproduced exactly: **ten collapsible (`sqrt sin cos tan asin acos atan exp log pow`), two genuinely format-dependent (`fabs`, `ldexp`, because pe lacks `fabsf`/`ldexpf`)**. ⇒ a confident, true answer to the wrong question would have discarded a correct finding from a lane that had done the work properly. **The collapse landed** (25129 → 20183 chars, 20 arm-lines out), and it is NOT cosmetic: this compiler is config-driven, so a user can add a format, and under the old structure those ten macros went **silently undefined** for it.
+
+### THE LANES
+
+| lane | closed | the part worth carrying |
+|---|---|---|
+| `pn` | `D-PP-SKIPPED-CONDITIONAL-GROUP-VALIDATED-AS-A-PHASE-7-NUMBER` | **Three defects wearing one symptom**, and the blocker for the WHOLE sqlite corpus. The phase-7 gate was spelled with ONE code name; the phase-3 pp-number tail was **unreachable from the prefix arm**; `isExponentLetter` read **half its config**, so `0x1e+2` BUILT AN ARTIFACT where gcc and clang both refuse. ✔Both sqlite artefacts now `rc=0`. It also **declined** my second row with three measured reasons — the control loop working. |
+| `jk` | `D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC` | **Eleven ingestion sites, THREE spellings** — a `json::parse` grep alone misses two real readers. One owner (`detail::parseConfigDocument`), refusal not warning, and a tier-3 scanner that refuses a NEW reader outside the owner. ⚠ Its own guard-stripper had the defect it exists to catch (digit separators `1'000` blanked whole regions). |
+| `dw` | `D-CSUBSET-TGMATH-COMPLEX` | The Darwin oracle, unblocked by the operator's *"MacOS is UP"*. **66 `nm -u` probes**, all eleven complex symbols plain on both arches; then a **link-and-run** the oracle does not ask for, and Mach-O arm64 binaries built on Windows and executed on the Mac. Refuted my brief's probe header (`tgmath.h`, not `complex.h`) and my "also check `f`/`l` variants" (no such rows exist). |
+| `cm` | `D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED` (+1 born closed) | The conversion is 8 lines of C++; the `<tgmath.h>` complex dispatch shipped with it as **pure config**. Deliberately wrote its Mach-O test to FAIL once the oracle landed — a tripwire, not a hole — which `dw` then replaced one-for-one. |
+| `xm` | `D-TARGET-NO-CROSS-CLASS-MOVE-VERB` (+1 born closed) | `registerClassOps` keyed by the **ordered pair** `{class, to}`, `to` omitted = the diagonal. **Two call sites lost their class comparison entirely.** |
+| `dg` | (2 born closed) | Config-document memo FIFO→LRU, capacity 16→128. |
+| `dc`, `rt` | — | `rt` created the skipped-group row `pn` then closed, and left `scripts/sqlite-round-trip/`. |
+
+### ⚠ WHAT THIS CYCLE DID NOT DO, NAMED SO IT IS NOT MISTAKEN FOR DONE
+
+- **The PR exit regime is still unspent** (§0.3.1). The README still says *"THREE hosts"*.
+- **The one open row** (§0.6) is scoped and owner-shaped, not started.
+- **`_Generic`'s unselected arm** (§0.6, last paragraph) is still un-anchored by design.
+- **Ten `variants` collapsed; `fabs`/`ldexp` were left** — correctly, and the row says why.
+
+★★★ **P45: FOUR ROWS CLOSED, ONE CORRECTLY REFUSED, AND THE TWO DEFECTS THAT MATTERED MOST WERE IN MY OWN INSTRUMENTS.** ✔MEASURED `check-anchor-balance --base 94971261` ⇒ **closed 3, opened 0, net −3** counted, **6 closed in truth** (three rows born closed are invisible to the gate — see §0.5, which owes both figures and so does every report).
+
+### ★★★ THE HEADLINE: A LANE THAT REFUSED TO CLOSE ITS ROW WAS THE MOST VALUABLE LANE
+
+Lane `cx` was briefed to close `D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED`. It measured all four references separately — gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 all accept complex→real in **both** assignment and argument position; MSVC **abstains** (no `_Complex` specifier at all, `error C2146`) — so under the bar the conversion is **REQUIRED**. It then built the fix and **reproduced a silent wrong answer**: with the conversion shipped alone, `#include <tgmath.h>` + `sqrt(z)` on `(0,4i)` compiles and exits **0** where all three references dispatch to `csqrt` and exit **1**. The tgmath binding lives in `tgmath.json` + `c.lang.json`, which the lane did not own.
+
+⇒ It shipped **comment-only** (behaviour byte-identical to its seed, proven by diff against seed-time backups) and stopped. ★ **That is the control loop working, and the report must not read it as a lane underdelivering.** The row stays 🟠 OPEN with an owner named in §0.6.
+
+★★ **AND IT REFUTED THE ROW'S OWN RATIONALE.** `tgmath.json` asserts that `(double)z` "silently drops the imaginary part → a conformance MISCOMPILE". ✔All three references do exactly that drop for `<math.h>`'s `double sqrt(double)` (exit 0). **The drop is CONFORMANT; the miscompile is a tgmath MACRO reaching a real prototype at all.** Three pins had copied the same false rationale — corrected in place, assertions untouched.
+
+### ★★★ TWO HARNESS DEFECTS, BOTH IN INSTRUMENTS I PROMOTED THIS CYCLE, BOTH FOUND BY USING THEM
+
+**1. `lane-fold` walked an untracked directory past `.gitignore`.** ✔MEASURED on the live fold of `cx`: the dry run offered **five** paths as the lane's work and **two were `scripts/{lane-fold,apply-registry-row}/__pycache__/*.cpython-314.pyc`** — gitignored, and listed by `git status` in neither tree. The route in has nothing to do with Python: **both script directories are NEW THIS CYCLE and therefore UNTRACKED**, so `git status --porcelain` reports the bare directory `?? scripts/lane-fold/`, and `expand_paths` answered that with `os.walk`. Any untracked directory a lane owns folds its droppings. **It was both directions** — `seed` and `fold` share `changed_paths`, so the walk had already shipped those files INTO the lane, which is why their md5 could move and present them back as the lane's own work.
+
+⚠⚠ **THE IRONY IS THE FINDING.** The function directly BELOW that walk carries a comment written *this same cycle, by the same author*, proving the `.worktrees` floor must **not** rely on `.gitignore` — safety by accident of a file you do not own. That reasoning is right, and it is about the direction where TRUSTING the ignore file makes you unsafe. **The walk fifteen lines above fails in the opposite direction: it never CONSULTS it.** One instrument, two opposite ignore-file mistakes, one screen, one afternoon.
+
+**2. `check-plan-citations`'s self-test blamed the guard for the tree.** ✔MEASURED twice in one cycle: the suite printed **`self-test FAILED -- this guard is NOT proven able to fail`** while the guard was working perfectly, and running `--write` on `.plans/` — **ZERO change to the script** — flipped it to `OK - 39 arms`. `selftest()` builds its fixture as a `copytree` of the live tree and its design is *perturb → assert red → restore → assert green*, so **every green arm asserts the LIVE TREE is green**. The trigger was therefore **somebody doing the right thing**: a stale ceiling is what the ratchet reports when a lane converts a `path:line` citation to a stable reference — debt going DOWN. Two conditions, one headline, and the headline named the wrong one.
+
+★ Both fixed, both with red-on-disable transcripts (REMOVE-direction, md5 moved AND returned, controls both sides, failing arm read by NAME). The control-arm discipline was **not** weakened and no arm was removed; arm 0 is unchanged in code and stronger in meaning.
+
+### THE OTHER LANES
+
+- **`td`** — `D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK` ✅. Refuted its own brief: `lowerTypeDecl`'s strip-aware lowering was **already live** on every C typedef; the comment saying otherwise had rotted.
+- **`bf`** — `D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT` ✅, and **the row's prescribed fix would have repaired five ABIs and broken the one that was already right**. It was never one mislaid fold; it was a missing per-ABI axis, now `unnamedBitFieldAlignment` in 22 format documents. End-to-end by EXECUTION: pe64 **27/27 vs cl.exe**, elf64-aarch64 **27/27 IDENTICAL to gcc** under qemu, macho64-arm64 **25/27 vs Apple clang with the DSS-built Mach-O executed on the Mac itself**.
+- **`am`** — the x86_64 SSE dialect rows, and it refuted the FP row's trigger sentence: *"live in every emitted aarch64 image"* describes an **EMPTY set**, because `"w"`-bound FP operands are refused one tier below by the cross-class arm.
+- **`pp`** — `D-PP-PRAGMA-RECOGNIZED-SEMANTICS` ✅. `#pragma once` is honoured on IDENTITY (the operator's 2026-08-28 ruling) and `#pragma STDC` is recognized, accepted and per-form judged: **6 satisfied silently / 3 diverging, accepted and named**. It found the row's own closing pin unsatisfiable — *"FP_CONTRACT OFF disables FMA contraction"* — because there is no contraction to disable.
+
+### ⚠ WHAT THIS CYCLE DID NOT DO, NAMED SO IT IS NOT MISTAKEN FOR DONE
+
+- The **sqlite legs and the README** (§0.3.1) — untouched, third cycle running.
+- The **`_Generic` unselected-arm divergence** is recorded in §0.6 and **has no row**; that is deliberate, and the lane that fixes it files the row born closed.
+- **No lanes were seeded for the next set** — the operator halted the loop at this commit.
+
+
+### ★★★ THE TWO BRIEFS, IN FULL — a scratchpad does not survive a session
+
+⚠ Every premise below was RE-MEASURED by me on the P45 tree rather than relayed from the
+ruling; each says which instrument took it. A premise taken by READING source is labelled
+as such and is a HYPOTHESIS the lane must confirm by running the compiler.
+
+### Lane brief — R6, the cross-class move slot
+
+Row to close: **`D-TARGET-NO-CROSS-CLASS-MOVE-VERB`** (production).
+Operator ruling of 2026-08-28, clause R6. This lane depends on neither R1/R2/R3 nor
+R4/R5/R7 — the operator's words were *"start R6 now"*.
+
+---
+
+### What the operator ruled (relay, not my words)
+
+> **R6 — the cross-class move slot.** `{from, to, mnemonic}` or generalize to class×class —
+> *the lane picks whichever leaves ONE table rather than two*. Closes
+> `D-TARGET-NO-CROSS-CLASS-MOVE-VERB`.
+
+And the two corrections that set it up, which the operator flagged as load-bearing:
+
+> **C1** — the cross-class move verb is **not missing vocabulary**. `movq_gpr_to_xmm` and
+> `movq_xmm_to_gpr` already ship byte-pinned on both targets. What is missing is the **SLOT**:
+> `TargetRegisterClassOps` is indexed by ONE class, so the cross-product has nowhere to live.
+> Settling it by routing through memory is **REFUSED**.
+>
+> **C2** — `MnemonicSlot::MovqXClass` is **the defect, not the foundation**. It gets DELETED.
+
+---
+
+### Premises I have MEASURED (2026-08-29, on the P45 integrated tree)
+
+Every line below I ran myself. Re-measure anything you intend to rely on — a brief's premise
+is a hypothesis, mine included, and three of four lanes refuted one of mine last cycle.
+
+1. **`registerClassOps` is indexed by ONE class, in the config and therefore in the schema.**
+   ✔MEASURED by parsing both target documents:
+   - `x86_64`: `[{class: fpr, move: movaps, load: movsd_load, store: movsd_store}]`
+   - `arm64`: `[{class: fpr, move: fmov, load: fldur, store: fstur}, {class: vr, load: fldur_q, store: fstur_q}]`
+
+   There is no `from`/`to` anywhere in the shape. This is C1 confirmed: the vocabulary exists,
+   the SLOT does not.
+
+2. **Both cross-class mnemonics ship, byte-pinned, on BOTH targets.** ✔MEASURED by name lookup
+   over the opcode tables: `movq_gpr_to_xmm` and `movq_xmm_to_gpr` are declared on x86_64 (104
+   opcodes) and on arm64 (87). x86_64 pins `movq xmm1, rdx` = `66 48 0F 6E CA`; arm64 pins
+   `fmov s3, w7` = `0x1E2700E3` and `fmov x7, d3` = `0x9E660067`, verified in their own
+   `$comment`s against `aarch64-linux-gnu-as`.
+
+3. **Both targets' own comments already state why one bidirectional opcode cannot work**, in
+   almost the operator's words — the variant guard keys only on `(operandKinds, width)`, both
+   directions are `reg` at the same width, so a single opcode carrying both *"would silently
+   pick a direction"*. Read the `$comment` on `movq_xmm_to_gpr` in either document before you
+   design anything: the argument you need is already written there, by whoever declined to
+   take the shortcut.
+
+4. **`MnemonicSlot::MovqXClass` has exactly one consumer**: the cross-class arm of
+   `lowerBitcast` in `src/lir/lowering/mir_to_lir.cpp`. ✔MEASURED with
+   `git grep -n "MovqXClass" -- src/` — the enumerator, its `"movq_xclass"` spelling in the
+   slot-name table, and the three lines in `lowerBitcast`. Nothing else names it.
+
+5. **`lowerBitcast`'s same-class arm ALREADY routes through the per-class table**
+   (`classOp(dstCls, RegClassOp::Move)`), and its own comment says that arm *"WAS the
+   class-dispatch pattern the table generalizes"*. ⇒ **The shape R6 asks for is the shape this
+   function is already half-way into.** The cross-class arm is the half that never got the
+   table, and `MovqXClass` is the placeholder it got instead.
+
+6. **x86_64 DECLARES `movq_xclass` — and the row carries NO `encoding` key.** ✔MEASURED by
+   dumping the opcode row: it has `mnemonic`, `result`, `minOperands`/`maxOperands`,
+   `minSuccessors`/`maxSuccessors`, a `$comment`, and nothing else. arm64 does **not** declare
+   it at all (✔measured the same way), and says so deliberately in `movq_xmm_to_gpr`'s comment:
+   *"arm64 therefore still declares NO `movq_xclass` and a cross-class Bitcast still fails loud
+   there; closing that is a different row's work, not this one's."* **You are that row.**
+
+---
+
+### The question that decides what this row IS — answered by READING, not by running
+
+An opcode declared with no `encoding` **fails loud**. ✔MEASURED **by reading source, which is a
+weaker instrument than running it, and I am saying so**: `TargetEncodingShape::None` is the
+default in `src/core/types/target_schema.hpp` (*"no encoding declared (substrate refuses to
+guess)"*), and `src/asm/asm.cpp`'s encode switch answers that case with
+`DiagnosticCode::A_NoEncodingDeclared` at `DiagnosticSeverity::Error` and returns false.
+`asm_variant_elect.hpp` carries the matching election rejection: *"the target declares the
+opcode but gives it no encoding."*
+
+⇒ **There is NO live silent miscompile here.** A cross-class `Bitcast` refuses on **both**
+targets today — on x86_64 through `movq_xclass`'s missing encoding, on arm64 through
+`lowerBitcast`'s `reportMissingOpcode`. **R6 is an ENABLEMENT, and the row must say that
+plainly** rather than borrowing the urgency of a wrong-output defect.
+
+⚠ **Confirm it by EXECUTION anyway, before you design.** Reading source is how this project
+generates hypotheses, not how it settles them, and the difference between *refuses* and *emits
+nothing* is exactly the kind of thing a switch statement can mislead you about. Build a program
+that produces a cross-class MIR `Bitcast`, on x86_64 **and** on arm64, run it through the
+shipped CLI, and read the actual rc and diagnostic code. If it does **not** refuse, stop and
+tell me — that finding outranks this entire brief.
+
+---
+
+### What to build
+
+**One table, not two.** That is the operator's tie-breaker and it is the whole design brief.
+Whether the schema key is a `{from, to, mnemonic}` list or `registerClassOps` generalized to a
+class×class matrix is **your call, made on that criterion** — but the same-class move must not
+end up in one table and the cross-class move in another, because the identical question
+("how do I copy a bit pattern from class A to class B?") would then have two homes and a
+future reader would find the wrong one.
+
+Non-negotiable, from the bar and from the ruling:
+
+- **`MnemonicSlot::MovqXClass` is DELETED** — the enumerator, its name-table row, and the
+  `lowerBitcast` arm that reads it. Not deprecated, not left unreachable. C2 is explicit.
+- **`movq_xclass` comes out of `x86_64.target.json`** with it. An opcode nothing can name is
+  dead vocabulary, and the load-time closed-key check should be the thing that tells you if
+  you missed a reference.
+- **Route-through-memory is REFUSED** as a settlement. The operator named it; do not
+  rediscover it.
+- **Every new schema surface owes its own load-time refusal AND its own registry row, born
+  closed.** A `to` class that names nothing, a `{from,to}` pair declared twice, a pair whose
+  mnemonic is not a declared opcode — each is a config error that must be refused where the
+  config is judged, with a message naming the JSON path. That is the house rule the aliased-
+  views block in `target_schema.cpp` demonstrates; read it as the model.
+- **NET OPEN ≤ 0.** Rows you open, you close in this lane.
+
+### What lands as a result, and must be shown by execution
+
+arm64's cross-class Bitcast goes from *fails loud* to *works*, using bytes that already ship.
+Pin it: a C program that bit-casts across classes, built and **EXECUTED** on
+`elf64-aarch64-linux-exec` under qemu **with `QEMU_LD_PREFIX=/usr/aarch64-linux-gnu`**, and on
+x86_64. Never emit-and-eyeball. A corpus example under `examples/c/` with a `release` arm, and
+arms in both examples runners (`tests/examples` in-process AND `integrated_tests` CLI) — a
+capability change must hit both.
+
+### Red-on-disable
+
+REMOVE-direction mutants only (an ADD-direction mutant stays green when the real config loses
+the feature). For a config-driven change **at least one mutant must delete the KEY from the
+JSON**, not the C++ — every C++ mutant is blind to the difference between a live key and dead
+config. Assert build rc; md5 moved AND returned; verdict through `ctest`, never a bare `.exe`;
+read failing NAMES, not counts; a CONTROL arm on both sides; bump mtime on restore or ninja
+skips the rebuild and your "clean" control measures the mutant.
+
+### Files
+
+Yours: `src/core/types/target_schema.{hpp,cpp}` and its `_json` sibling,
+`src/lir/lowering/mir_to_lir.cpp`, `src/dss-config/targets/{x86_64,arm64}.target.json`, your
+own tests and example.
+
+⚠ **`src/asm/asm_template_to_lir.cpp` is NOT yours** — it is contended, and the R1/R2/R3 and
+R4/R5/R7 lanes need it. If your work reaches into it, STOP and tell me rather than editing it.
+
+### Deliverable
+
+`scratchpad/p45/row-R6.md` — the row, ONE physical line, exactly 4 content cells, LF only, the
+anchor id whole and never wrapped. I apply it; you do not touch either registry file. Nothing
+committed, nothing pushed, worktree left in place.
+
+
+---
+
+### Lane brief — R1 + R2 + R3, arm64 declares its SIMD&FP file ONCE
+
+Rows this lane must close (production), all of them, no follow-ups:
+
+- **`D-TARGET-ARM64-W-CONSTRAINT-BINDS-A-CLASS-NO-C-VALUE-EVER-LIVES-IN`**
+- **`D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS`**
+
+and it must leave `D-TARGET-ALIASED-VIEWS-BOTH-ALLOCATABLE-DOUBLE-COUNT-ONE-FILE`'s load-time
+refusal honest — see *"what happens to the tripwire"* below, which is the subtlest part of the
+whole lane.
+
+Operator ruling of 2026-08-28, clauses R1/R2/R3. **Sequence: this lane depends on nothing, but
+R4+R5+R7 depends on it.** It contends with nobody currently in flight if `asm_template_to_lir.cpp`
+stays out (see Files).
+
+---
+
+### The ruling (relay)
+
+> **C3** — the aliasing model **already exists and is called `subOf`**.
+> `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS` *"does not need the arc it gates. It
+> needs arm64 to stop declaring one physical file twice."*
+>
+> **R1** — arm64 declares its SIMD&FP file ONCE: `v0..v31` are the class members (16 bytes, no
+> `subOf`); `q`/`d`/`s`/`h`/`b` become `subOf: v_k` views; the class label is `fpr`; `vr` keeps
+> **NO** arm64 members; `asmConstraints` rebinds `w → fpr`. **`regClassForCoreType` is NOT
+> touched — it is right already; the config was wrong.**
+>
+> **R2** — width views mean width-elected verbs: fold `fldur_q`/`fstur_q` onto the `guard.width`
+> axis and **DELETE** the `_q` mnemonics. The width-128 reg-to-reg FP move is a **DIFFERENT
+> AArch64 instruction** (ORR, `mov v.16b`) — not a wider FMOV.
+>
+> **R3** — the AAPCS64 callee-saved guarantee is **64 bits wide** and the cc lists cannot say so.
+> A cc register entry may carry `preservedWidthBits`; **absent = full width**. Demoting v8..v15
+> to caller-saved is **REFUSED**.
+
+⚠ The operator's own words on all of this: *"every claim taken from reading source rather than
+running the compiler is a HYPOTHESIS, including C3. A lane that REFUTES one says so and stops;
+it does not build a workaround around my sentence."*
+
+---
+
+### Premises I have MEASURED (2026-08-29, on the P45 integrated tree)
+
+Re-measure anything you rely on. Mine are reads and JSON parses, not compiler runs, and I say
+so per item.
+
+1. **arm64 really does declare one physical file twice.** ✔MEASURED by parsing
+   `src/dss-config/targets/arm64.target.json`: 129 register rows — `gpr` 65 (32 of them
+   carrying `subOf`, the `w` views), `fpr` **32** (`d0..d31`, `widthBytes` 8, `dwarfNumber`
+   64..95, **zero `subOf`**), `vr` **32** (`v0..v31`, `widthBytes` 16, `dwarfNumber` **64..95
+   again**, **zero `subOf`**). Same `hwEncoding` in each pair. C3 confirmed at the config.
+
+2. **`subOf`'s shape, from the rows that already use it:**
+   `{"name": "w0", "class": "gpr", "widthBytes": 4, "subOf": "x0", "hwEncoding": 0}` — same
+   class, narrower width, names its parent by name, and **carries no `dwarfNumber`**. That last
+   detail is a decision you must make deliberately for the FP views, not inherit — see (5).
+
+3. **`asmConstraints` binds `w → vr`.** ✔MEASURED:
+   `{"letter": "w", "binds": "registerClass", "registerClass": "vr"}`. And `vr`'s own `$comment`
+   says its rows are *"DELIBERATELY absent from the AAPCS64 calling-convention register lists …
+   so lir_regalloc's buildFreeLists SKIPS them (not allocatable) — no VR virtual register is
+   ever minted."* ⇒ **`w` binds a class no C value can ever live in.** That is
+   `D-TARGET-ARM64-W-CONSTRAINT-BINDS-A-CLASS-NO-C-VALUE-EVER-LIVES-IN`, measured directly, and
+   R1's rebind is its fix.
+
+4. **The existing load-time tripwire, and read this block before you touch anything.**
+   `src/core/types/target_schema.cpp` carries a refusal named
+   `D-TARGET-ALIASED-VIEWS-BOTH-ALLOCATABLE-DOUBLE-COUNT-ONE-FILE`, whose comment states:
+   - it fires when two rows of **different classes** share a `dwarfNumber` and both become
+     allocatable; `subOf` deliberately does **not** cover that shape;
+   - `dwarfNumber` is the field and `hwEncoding` is **not** (hwEncoding is a per-file number, so
+     a rule reading it would refuse the integer and vector files on both targets);
+   - **it was proven by building the naive fix as a mutant** (P28): `d7` carried both a VR value
+     and an ordinary `double` at rc=0 with no diagnostic;
+   - it names `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS` in its own message as the
+     arc that lifts it.
+
+   ★★ **What happens to it under R1 is the question this lane turns on.** With `vr` empty on
+   arm64 and the d/s/h/b/q rows carrying `subOf`, the double-declaration this block judges
+   **ceases to exist** — the block should stop having anything to fire on, not be deleted for
+   being quiet. **Do not remove it.** It still guards the shape on any future target. But its
+   comment's central claim — *"WHAT LIFTS THIS RULE … is a cycle, not a config edit"* — becomes
+   **false**, and leaving that sentence standing is exactly the rotted-premise failure this
+   project keeps paying for. Rewrite the comment to say what actually lifted it, and pin that
+   the block still refuses by **synthesizing the negative** (a fixture that re-declares the two
+   classes and asserts the refusal), never by observing that it is silent.
+
+5. **The DWARF reverse map already handles shared numbers, and its rule is load-bearing.**
+   ✔MEASURED in `src/link/format/dwarf_cfi_decode.hpp`, `DwarfRegisterReverseMap::build`: two
+   rows sharing a `dwarfNumber` with the **same** `hwEncoding` are width views and **the
+   NARROWEST wins**; with different `hwEncoding` it **refuses** with a message about writing a
+   table a debugger follows into the wrong frame. Its comment says the narrowest choice is *"a
+   statement about what a save rule MEANS"* — on AArch64 the callee-save contract covers the low
+   64 bits of v8–v15, *"which is exactly `d8`–`d15`, and exactly what GNU `as` translates
+   `.cfi_offset d8` into."*
+   ⇒ **`d8..d15` must keep their `dwarfNumber`s through this change**, even though the `w` views
+   they now resemble carry none. If you strip `dwarfNumber` from the d views, the reverse map
+   starts answering `v8`, and `.cfi_offset` decoding silently changes meaning. **Pin this with
+   an execution-level CFI test, not a unit assertion about the map.**
+
+6. **`classFullWidthBits` takes the WIDEST register in the class**, and does **not** skip
+   `subOf` rows. ✔MEASURED in `src/lir/lir_regalloc.cpp`. Today `fpr`'s widest is 8 bytes ⇒ 64
+   bits. **After R1 it becomes 128**, because `v0..v31` join the class.
+   ⇒ Its caller asks *"is this copy writing the WHOLE register"* to decide coalescing. A 64-bit
+   `fmov d0, d1` would stop comparing equal to 128 and **coalescing would stop happening for
+   ordinary FP copies**. The function's own comment says it is conservative *"in the direction
+   that matters: a narrow copy can never equal it, so a partial-register write is never mistaken
+   for a full one"* — so this fails toward **missed optimization, not wrong code**. That is a
+   real regression you must MEASURE (release arm64 disassembly, before and after) and FIX, not
+   accept silently. The honest fix is probably to ask the width question of the register's own
+   row rather than of its class's maximum; the comment already notes that `lir_peephole`'s R1
+   does exactly that post-regalloc.
+
+7. **Spill-slot sizing.** The operator named it and I have **not** measured it. A `double`
+   allocated into a class whose members are 16 bytes wide must not silently get a 16-byte spill
+   slot (waste) nor an 8-byte one written by a 16-byte store (corruption). Measure it by
+   execution — a function with more live `double`s than physical registers, built and run on
+   `elf64-aarch64-linux-exec` under qemu — and read the actual stack offsets.
+
+---
+
+### R2, in the terms the ruling set
+
+Folding `fldur_q`/`fstur_q` onto the `guard.width` axis is the same move the target already
+makes for `si_to_fp`/`ui_to_fp` and for `movq_gpr_to_xmm` (✔measured: those key their variants
+on a width axis and select FMOV `Dd,Xn` vs `Sd,Wn` from it). Follow the shape that is already
+there.
+
+⚠ **The width-128 reg-to-reg FP move is NOT a wider FMOV.** The operator named the instruction:
+AArch64 spells a 128-bit register-to-register SIMD move as **ORR** (`mov v_d.16b, v_n.16b` is
+the assembler alias). If you fold a `move` onto the width axis of the `fpr` class row, the
+width-128 arm needs ORR's bytes, not FMOV's. **Byte-pin it against `aarch64-linux-gnu-as` and
+say so in the `$comment`, as every other row in that file does.**
+
+ⓘ Today `registerClassOps` declares `vr` with `load`/`store` and **no `move`**, deliberately —
+its `$comment` explains the trigger discipline (*"declaring a Q-form FMOV with no consumer would
+be dead vocabulary"*). Under R1 there is no `vr` row on arm64 at all, so that discipline
+question moves onto the `fpr` row's width axis: **declare the width-128 move only if something
+consumes it.** If nothing does, say so in the comment rather than declaring it.
+
+### R3, in the terms the ruling set
+
+`preservedWidthBits` on a cc register entry, **absent = full width**. This is new schema
+surface, so by the standing rule it owes:
+- its own **load-time refusal** (a value that is not a positive multiple of 8, a value wider
+  than the register it annotates, the key on a target that cannot mean it), with a message
+  naming the JSON path; and
+- its own **registry row, born ✅ CLOSED**.
+
+⚠ **Demoting v8..v15 to caller-saved is REFUSED.** The operator named it. It would be correct
+and catastrophic for code quality, and it is the shortcut this clause exists to forbid.
+
+The consumer is whatever decides how many bytes a callee-save spill of a v8..v15 register
+writes. AAPCS64 guarantees the **low 64 bits** only; saving 16 would be wrong in the sense that
+matters for an unwinder reading a CFI table that says 8. Pin the emitted prologue/epilogue bytes
+and the CFI, by execution.
+
+---
+
+### The bar, restated for this lane
+
+- **`regClassForCoreType` IS NOT TOUCHED.** The operator was explicit: *"it is right already;
+  the config was wrong."* If you find yourself wanting to edit it, that is the signal to stop
+  and report, not to edit it.
+- **Route-arounds are refused.** No `if (arch == ...)`, no host-keyed or arch-keyed branch in
+  `src/{opt,mir,hir,lir,core,analysis,asm,tokenizer,link,preprocess}`. Vocabulary lives in the
+  `.target.json`.
+- **Every new schema surface owes a load-time refusal and a born-closed row.** NET OPEN ≤ 0.
+- **Four legs at the final tree**, and the arm64 leg is an **EXECUTION** arm under qemu with
+  `QEMU_LD_PREFIX=/usr/aarch64-linux-gnu` — never emit-and-eyeball.
+- **Red-on-disable, REMOVE-direction only.** At least one mutant must delete a **JSON key**, not
+  C++ — a C++ mutant cannot distinguish a live key from dead config. Assert build rc; md5 moved
+  AND returned; verdict through `ctest`, never a bare `.exe`; failing NAMES not counts; control
+  arms both sides; bump mtime on restore.
+- **A corpus example** under `examples/c/` with a `release` arm, wired into **both** examples
+  runners.
+
+### Files
+
+Yours: `src/dss-config/targets/arm64.target.json`, `src/core/types/target_schema.{hpp,cpp}` and
+its `_json` sibling, `src/lir/lir_regalloc.cpp`, `src/lir/lir_callconv.{hpp,cpp}`,
+`src/link/format/dwarf_cfi*.hpp`, your own tests and example.
+
+⚠ **`src/asm/asm_template_to_lir.cpp` is NOT yours** — R4+R5+R7 needs it and so may R6. If your
+work reaches into it, STOP and tell me.
+⚠ **`src/lir/lowering/mir_to_lir.cpp` may be held by the R6 lane.** Check with me before editing
+it.
+
+### Deliverable
+
+`scratchpad/p45/row-R1R2R3.md` — one file per row you close, each ONE physical line, exactly 4
+content cells, LF only, anchor ids whole and never wrapped. I apply them; you touch neither
+registry file. Nothing committed, nothing pushed, worktree left in place.
+
+
+---
+
+★★★ **P44: TWENTY-ONE ANCHORS CLOSED ACROSS NINE LANES, THE GATE CAN SEE NINETEEN OF THEM, AND NOTHING THIS CYCLE OPENED IS STILL OPEN.** ✔MEASURED `check-anchor-balance --base b1684e7f` ⇒ **closed 19, opened 0, net −19**; registry **556 → 537** (**production 349 OPEN / harness 188**, and the sum is the cross-check). Both anchor gates run, plus `stale-refusal-citations`, `wrapped-anchor-ids`, `plan-citations`, `path-identity` and `retyped-closed-sets`, all rc=0. ⚠⚠ **THE GATE CANNOT SEE TWO OF THE TWENTY-ONE, AND THE REPORT OWES BOTH FIGURES**: it counts ROWS BY NAME across base and tip, so a row MINTED and closed inside the cycle (lane `a` → lane `h`) and a row written BORN CLOSED (lane `i`) are invisible — ✔measured from both bases, `b1684e7f` reads closed 19 and `6c6d6077` reads closed 1, and 19+1≠21. That blindness is RIGHT for *"did this cycle leave more open than it found?"* and WRONG for *"what did it fix?"*; **never soften the instrument, report both numbers.**
+
+★★★ **P44's HEADLINE: TWO LANES SHIPPED TWO CORRECT HALVES, BOTH CORRECTLY DECLINED TO CLOSE THE ROW, AND THE COMPOSED BINARY WAS STILL 0/30.** The cause was one tier below either lane: bare `fs::absolute` re-roots a path that already names an AUTHORITY (`//host/share`) onto the local drive. ★ **A lane that ships a correct half and declines to close is the process working**; the orchestrator owes the composition measurement, and nobody's green was wrong.
+
+★★ **AND THE SECOND-BIGGEST FINDING WAS A BRIEF OF MINE BEING REFUTED.** Lane `h` was told to emit `.init_array` / `__mod_init_func` / `.CRT$XCU`; it measured `readelf -d` on a DSS artifact instead — **no `DT_INIT_ARRAY`, no `DT_INIT`** — and observed that ld.so walks the TAG, not the section, while PE never links the UCRT startup. **DSS links no crt: the synthesized `_start` IS the runtime**, so such a section would be bytes nothing reads. Four lanes measured one of my premises this cycle and **three refuted it**. A brief's premise is a HYPOTHESIS carrying its author's confidence and not their measurement.
 
 ★★★ **P43: THE TWO RED CI LEGS WERE TWO DIFFERENT WAYS OF NOT BEING ABLE TO SEE A DEFECT LOCALLY, AND BOTH ARE NOW STATIC OR DETERMINISTIC.** ✔MEASURED `check-anchor-balance --base 73f74972`: **closed 0, opened 0, net +0**, registry+plans **879 → 879** — the correct reading for a cycle whose five rows are ALL **BORN CLOSED**, since a row that did not exist at base cannot be counted as newly closed. **Three production fixes and two harness fixes.** ⚠ **Only TWO of the five were the reported CI failures.** Repairing the Windows BUILD break ran the MSVC suite for the first time since P34 and uncovered two production defects underneath it — one a symlink escape in the staging-temp claim; a third was faced while taking the gate itself and fixed in the lane that hit it, per *"harness we fix as we need when we face the problem (NEVER LATER)"*. ★ **A build break does not just stop a build: it hides every test behind it, and the longer it stands the more it hides.**
 
@@ -720,6 +1449,306 @@ second pattern beside the one P23 built and pinned.**
   same search over the sqlite real-example tree returns **0**. No corpus example exercises `"w"`.
 
 ---
+
+## 0.00000000000000000000000000000000000000000 ★★★ CYCLE P44 — NINE LANES CLOSED TWENTY-ONE ANCHORS, THE GATE CAN ONLY SEE NINETEEN OF THEM, AND THE ONE THAT MATTERED MOST WAS FOUND BY MEASURING THE COMPOSITION OF TWO GREEN LANES
+
+**Balance at this commit, re-measured rather than re-quoted:**
+`python scripts/check-anchor-balance/check-anchor-balance.py --base b1684e7f` ⇒
+**closed 19, opened 0, net −19**; registry **556 → 537**. Per bucket via the gate's own
+`scan_document`: **production 349 OPEN / harness 188 OPEN / sum 537**, which equals the gate's
+registry figure — that sum is the cross-check, and it is the only thing that catches a
+mis-bucketed or double-counted row.
+
+⚠⚠ **AND THE GATE CANNOT SEE TWO OF THE TWENTY-ONE ANCHORS THIS CYCLE CLOSED, WHICH IS
+WHY THE HEADLINE SAYS BOTH NUMBERS.** `check-anchor-balance` counts ROWS BY NAME across the base
+and the tip, so a row that did not exist at `b1684e7f` cannot be counted as newly closed no matter
+what it records. Two rows are in exactly that position: lane `a` MINTED
+`D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN` mid-cycle and lane `h` closed it,
+and lane `i` wrote `D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS` BORN CLOSED.
+✔MEASURED both ways: against `b1684e7f` the gate reads **closed 19, opened 0**; against the
+cycle's own first commit `6c6d6077` it reads **closed 1, opened 0**, and 19 + 1 ≠ 21 because
+the born-closed row is invisible from BOTH bases. ★ The blindness is the RIGHT behaviour for
+the question the gate is asked (*"did this cycle leave more open than it found?"*) and the WRONG
+number for *"what did this cycle fix?"* — so a cycle report owes both, and a lane whose whole
+output is a born-closed row reads as **zero** in the only figure the ruling watches.
+`scripts/check-anchor-registry/check-anchor-registry.sh` ⇒ **rc=0**, 0 cell-width violations,
+15 self-test arms proving the guard can fail. **Both gates were run**: a green balance is not
+evidence that nothing was opened.
+
+`D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN` — minted by lane `a` when
+closing a refusal exposed what the refusal had been hiding — **is CLOSED at this commit by lane
+`h`**, in the cycle that opened it. Nothing this cycle opened is still open.
+
+### ★★★ THE HEADLINE: TWO LANES SHIPPED TWO CORRECT HALVES, BOTH CORRECTLY DECLINED TO CLOSE THE ROW, AND THE COMPOSED BINARY WAS STILL BROKEN
+
+`D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED` had two halves in two lanes. Lane `f` shipped the
+driver-side `-I` acceptance; lane `g` root-caused the resolver (undefined behaviour — a reference
+bound to the `native()` of a by-value temporary — and measured `//wsl.localhost` answering YES
+**141/200** by reference vs **0/200** by value). Each verified its own worktree. Each refused to
+close a row whose other half it had never compiled. **Both judgements were right.**
+
+The composed binary — the first artefact ever to hold both — resolved a UNC `-I` header **0/30 for
+both slash spellings**, with a byte-identical local-absolute control at **30/30**.
+
+**The cause sat one tier outside everything either lane owned.** `applyIncludeDirs` ran every `-I`
+value through a bare `fs::absolute`. ✔MEASURED, one path object, `.string()`:
+
+| property | value |
+|---|---|
+| `is_absolute()` | **false** |
+| `has_root_name()` / `root_name()` | **false** / **empty** |
+| `absolute()` | **`C:\wsl.localhost\Ubuntu\home\rafael\p44_unc_inc`** |
+| `exists(input)` / `exists(absolute())` | **true** / **false** |
+| `weakly_canonical` | **`<error> No such file or directory`** |
+
+It does not prepend the cwd. It **re-roots a path naming another machine onto the local drive, and
+reports no error.** Every tier below the driver was then handed a directory that cannot exist and
+answered correctly about it — which is exactly why all of `tests/core` was green over a live defect.
+
+⇒ ★★★ **A LANE'S GREEN IS A STATEMENT ABOUT ITS OWN TREE. THE COMPOSITION IS A NEW OBJECT NOBODY
+HAS MEASURED**, and where two lanes deliberately split one row, the seam between them is the one
+place neither lane's gate can reach. Measure the composed tree against the row's own closing
+predicate before closing it — not the sum of two reports.
+
+### ★★★ THREE FINDINGS FROM THAT FIX, EACH GENERAL
+
+**(1) `fs::absolute` and `weakly_canonical` fail in OPPOSITE directions, and only one needs a guard.**
+✔MEASURED on the same reachable UNC path: `weakly_canonical` **errors**, so every call site's
+existing keep-the-original-on-error arm was already correct — `config_path_walk`'s executable
+resolution is **not** a further instance, and that was measured rather than assumed (a sibling's
+report covered the UNREACHABLE case, which behaves differently). `fs::absolute` **succeeds wrongly**,
+which no error arm can catch. **A helper that fails toward an ERROR is defended by the caller's
+existing error arm; one that fails toward a WRONG ANSWER is naked.** That distinction is the right
+sort key for a call-site audit and cut a ~25-file list to a handful.
+
+**(2) ONE PATH, THREE TRANSFORMS, EACH REMOVING ONE SEPARATOR — and a partial fix reads exactly like
+a complete one.** The artifact-written report ran `absolute` → `lexically_normal` → `generic_string`.
+Fixing only `absolute` moved the reported path from `C:\host\share\…` to `/host/share/…`: still
+wrong, still naming the local drive, **now wrong for a different reason**, and both spellings are
+equally absent from disk. It was caught only because the mutation arm that reverted that fix
+reddened **NOTHING** — the fix had shipped unpinned — and the pin written in response then **failed
+at baseline**, which is how collapses 2 and 3 were found at all.
+
+**(3) THE DISCRIMINATOR IS THE SEPARATOR RUN, NOT `isRootedPath` AND NOT `is_absolute()`.** A run of
+ONE (`/foo`) genuinely is a location on the current drive and MUST still be made absolute; reusing
+the row's own exported `isRootedPath` here would have been **a regression dressed as a fix**. Pinned
+by `AbsoluteStillResolvesSingleSeparatorAndRelative`. `core::absoluteKeepingRoot` and
+`core::normalizeKeepingRoot` now sit beside `core::genericSpelling`, three transforms sharing ONE
+invariant and ONE private discriminator (`leadingSeparatorRun >= 2`).
+
+**RED-ON-DISABLE, five arms, VALID.** Baseline 45 OK / 0 FAILED / **0 SKIPPED** (no vacuous arm on
+this leg). Every arm: build rc=0, per-TU OBJECT md5 MOVED and RETURNED, run through `ctest`, failing
+NAMES read, `core/test_header_name_matching` carried as a CONTROL and green (16 arms) throughout.
+m1 (substrate guard neutered) → **3 RED**; m2 (driver reverted) → **1 RED, the driver pin ALONE —
+so the resolver-tier pins do NOT cover a driver-tier wiring defect**; m3a/m3b/m3c (each of the three
+report transforms reverted independently) → **1 RED each, the same pin**, proving all three are
+independently load-bearing.
+
+### THE FOUR-LEG GATE AT THIS COMMIT — measured on THIS tree, not re-quoted from the previous set
+
+| leg | result |
+|---|---|
+| Windows (root host) | **1793/1793**, all 20 repo guards — and the 20 were **re-run alone after the last `.plans/` edit**, since the full pass predated it |
+| WSL x86_64 | **1773/1773**, `run-gate` OK on a tool-emitted witness, **+ emulator witness: arm64 artifacts were spawned and RAN** |
+| arm64 VPS (native) | **1773/1773**, `run-gate` OK |
+| macOS (native arm64) | **1773/1773**, `run-gate` OK |
+
+**1773 = 1793 − the 20 root-host-only repo guards, on every leg, no residual.** The count rose
+1790 → 1793 with lane `h`'s three new tests. ★ **The macOS leg is the one that tests lane
+`h`'s least-certain claim** — that Mach-O runs its static initializers through the same
+`entryTrampoline` as every other exec flavor rather than needing a loader-recognized section —
+because `examples/c/gnu_constructor_attribute_runs` declares a `macho64-arm64-darwin-exec` target
+with `runOn: ["darwin"]`. It is not a formality on that leg. ⓘ The macOS leg ran
+~27 min of `ctest` against the other legs' ~13; that was **probed live** (`ctest` at 27:08 elapsed
+with a freshly-spawned `dsscp` child, load 2.33) rather than assumed to be a hang — a silent leg is a
+question, not a verdict.
+
+Residue scan on the composed tree: **42 marker candidates across 146 changed files, ZERO live** —
+every hit under `src/` is a comment or a fixture (the preprocessor discussing `#if 0`, English
+"mutate the top", and one `MUTANT` token inside a `$comment` field where a lane recorded its own
+red-on-disable measurement).
+
+### ★★★ LANE `h`: THE ATTRIBUTE RUNS — AND THE BRIEF'S SECOND HALF WAS REFUTED BY READING THE EMITTED IMAGE
+
+`__attribute__((constructor))` / `((destructor))` are honoured end to end. ✔MEASURED: the row's
+own program exits **42** (it exited **0**, with a warning naming the attribute it had dropped) on
+`pe64-x86_64-windows-exec` natively, `elf64-x86_64-linux-exec` under WSL and
+`elf64-aarch64-linux-exec` under `qemu-aarch64`, at `--config=debug` AND `--config=release`. A
+six-initializer probe gives `c101 c102 cBARE | MAIN | dBARE d102 d101` on every leg and both
+configs — byte-identical to gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0, each probed
+SEPARATELY.
+
+★★ **THE BRIEF SAID TO EMIT `.init_array` / `__mod_init_func` / `.CRT$XCU`. THE LANE
+REFUTED THAT BY MEASUREMENT RATHER THAN SKIPPING IT.** ✔`readelf -d` on a DSS
+`elf64-x86_64-linux-exec` artifact shows an eleven-entry dynamic section with **no `DT_INIT_ARRAY`
+and no `DT_INIT`** — and ld.so walks the TAG, never the section; PE never links the UCRT
+startup object, so `_initterm` never runs. Those sections are how a program tells a **C runtime**
+what to run before main, and **DSS links no crt: `injectEntryTrampoline` synthesises `_start`, and
+that entry IS the runtime.** On every image DSS produces and starts, such a section would be bytes
+nothing reads. What shipped instead is the axis that is real and per-format:
+`staticInitializers.runner`, declared beside `processExit` / `processArgs` / `entryVerbs` —
+every exec flavor says `entryTrampoline`; a shared library, a relocatable object and a static
+library declare NOTHING, so the linker REFUSES such a program **by name** rather than building one
+whose initializers never run.
+⚠ **This contradicts the brief I wrote, including its claim about Mach-O**, which I had said
+would need `imageLoader`; it uses `entryTrampoline` like the others. **THREE OF THE FOUR LANES THAT
+MEASURED A PREMISE OF MINE THIS CYCLE REFUTED IT** (`e` on the config tier, `d` withdrawing its own
+residual, `h` here). A brief's premise is a HYPOTHESIS carrying its author's measurement and no
+more; relaying one inherits that, and this one was wrong the day it was written rather than decayed.
+
+★★ **TWO REAL BUGS, BOTH FOUND BY REVIEW AND NEITHER BY A TEST.** (1) DCE deleted every
+`static` constructor at `--config=release` — invisible in debug, whose pipeline is `Identity`,
+which is why the corpus example's release arm is load-bearing and not a formality. (2) The
+before-entry calls **clobbered the caller-saved argument registers**, so `main(int argc, char
+**argv)` received garbage: argc/argv are materialised into the convention's ARGUMENT registers
+before the ABI prologue, and a `call` inserted between that and `call main` destroys them.
+
+⚠⚠ **AND THE WITNESS FOR THAT SECOND FIX WAS VACUOUS THREE TIMES, EVERY ONE CAUGHT BY
+RUNNING THE MUTANT RATHER THAN BY READING THE PIN.** (i) the example's constructors were pure
+arithmetic and never touched an argument register, so argc survived the missing park by accident;
+(ii) on Windows only the `pe64` arm runs, and PE fetches argv through **CRT accessor calls**, so the
+park is INERT on the one leg observing it; (iii) the structural pin's bound `> 10` was cleared by the
+mutant at 19, because deleting the RESTORE half leaves the SAVE half. Calibrated bound is now
+`>= 25`, and the end-to-end statement is made on the leg that can make it: the example built for
+`elf64-x86_64-linux-exec` exits 42 clean, **9** under the mutant (its own `argc != 1` code, firing by
+name) and 42 on restore. **Six mutants, all REMOVE-direction, control green in every arm, object md5
+moved AND returned on all five code arms.**
+
+⚠ **THE MUTATION HARNESS ITSELF HAD THE ONE DEFECT SUCH A HARNESS MUST NEVER HAVE**, and it is
+recorded because it is the INSTRUMENT: its first version restored by searching for the REPLACEMENT
+text and asserting exactly one occurrence — the wrong question for a DELETION, since one arm's
+replacement was the EMPTY STRING and counting an empty string over a file returns its LENGTH. The
+guard tripped at 24512, the restore was SKIPPED, and `dce.cpp` was left MUTATED in the tree. Restore
+is now a full-content snapshot with an md5 check on the way back, and the tree was verified clean.
+
+### ★★ LANE `i`: THE PATH-SPELLING AUDIT — AND THREE OF THE WORST SITES WERE NOT THE FUNCTION THE ROW NAMED
+
+The census that opened the row handed over 15 files; the audit found the class in **four more**, and
+three of the worst instances were not `generic_string()` at all. **Eight sites were judged PROVABLY
+SAFE and left untouched, each with its reason** (`lexically_relative()` results — ✔measured
+leading-separator run **0** — plus `filename()` and `extension()`, none of which can carry a
+root), and the rest converted. ★ The row named **three sites in two files the lane did not own**
+and marked them OWNED AND PENDING rather than filing a follow-up; they were discharged in this
+commit's pre-commit gate once lane `h` freed the files. `src/link/writer.cpp`'s `pathForDiag` was the
+sharpest: **its two arms disagreed about which file they name** — the `try` arm's
+`generic_string()` collapsed a UNC path's leading separator run to one (naming a path on the local
+drive root), while the `catch` arm's `u8string()` kept the run and also kept native separators. One
+path object, two spellings, and which one a user saw depended on whether narrowing happened to throw
+for an unrelated reason. Both arms now go through the run-preserving transforms and differ in
+ENCODING only, which is the one axis that fallback exists for.
+
+✔**THE LIST IS EXHAUSTED RATHER THAN SHORTENED**, measured after the gate: **zero** bare
+`fs::absolute` and **zero** `generic_string()` / `generic_u8string()` on a path that can carry a root
+anywhere in `src/`. Of the fourteen remaining mentions, five are comments citing the rule, eight are
+the sites this row judged safe, and one is `src/lsp/workspace_project.cpp` — a PRIOR sighting of
+the same defect, handled locally and correctly: it detects the authority from `root_name()` precisely
+BECAUSE the generic rendering had already eaten the run.
+
+### THE OTHER LANES
+
+| lane | outcome |
+|---|---|
+| `a` | 3 rows; refuses-what-a-reference-accepts 5 → 3. Minted the constructor row when closing a refusal exposed what it hid. |
+| `b` | 3 preprocessor rows (token paste ×2, origin-offset validation). It ALSO measured the UNC row at **23/30** and explicitly declined both to close it and to ship a test — *"a test that passes four times in five is indistinguishable from a flaky harness, and a green run would be read as a close"*. ★ That judgement was correct and is the reason the eventual pin is honest: the row became pinnable only once lane `g` made the behaviour deterministic. |
+| `c` | 4 rows; 26 identity branches → 0; refused closure-by-delegation. |
+| `d` | 6 rows across 5 waves; wave 4 measured the COFF/Mach-O twins **immune** and withdrew its own residual. |
+| `e` | `D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY` closed (a THIRD tier was hardcoding the severity, refuting the brief's premise); then `D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES` closed across all three sources. ⚠ It INTRODUCED the over-reach its own row forbade — a claim for every signature whose bits merely happened to be zero — and DSS's own shipped runtime shims stopped compiling. Caught by measurement, fixed with a producer-side gate. |
+| `f` | `imagerel32` **withdrawn by measurement**; compile-error pin 6 → 3; `-I` acceptance shipped as a **warning**, because an error would put DSS ABOVE the union (gcc and MSVC are both silent rc=0 on every shape). |
+| `g` | The UNC resolver UB, above. |
+
+### ⚠ WHAT THIS CYCLE DID NOT DO, NAMED SO IT IS NOT MISTAKEN FOR DONE
+
+- **`#pragma once` IS REFUSED BY DSS** (`P_PreprocessorPragma`, exit 1), found while building the UNC
+  fixture — every arm went red, the control included. The owning row `D-PP-PRAGMA-RECOGNIZED-SEMANTICS`
+  is OPEN, already concedes the bar makes it REQUIRED, and files it **"QUEUED WORK, low priority"**
+  while describing the behaviour as *"currently have NO effect"*. ★★ **That description was already
+  false when written**: a sibling row records the loud refusal since 2026-07-29, three weeks earlier.
+  *"Has no effect"* reads as a minor gap; **"refuses the translation unit" means every real-world
+  header using the commonest guard idiom fails to compile**, against an idiom gcc, clang and MSVC all
+  accept. ⇒ **The stale sentence did not merely misdescribe the defect, it set its priority.** Not
+  dispatched only because it contends with lanes `h` and `i` for `src/analysis/**`, `src/dss-config/**`
+  and `src/core/substrate/path_identity.*`. ⚠ Re-date its premise too: *"honouring the pragma would be
+  a guess"* was true when written, and `core::PathIdentity` landed 2026-08-18 precisely so that every
+  spelling of one file reduces to one key — the machinery an include-once set needs **had already been
+  built, by someone else, for another reason**.
+  ★★★ **THE OPERATOR RULED ON IT 2026-08-28 AND THE RULING BOUNDS THE BAR ITSELF.**
+  ✔MEASURED across all three references separately, one self-contained program per question:
+  gcc, clang and MSVC all dedup `./h.h`, `sub/../h.h`, a symlink and a hard link — but on **two
+  different files with byte-identical contents**, gcc DEDUPS (content-keyed) while clang and MSVC do
+  NOT (identity-keyed). A mechanical reading of the disjunction picks gcc. **The operator chose
+  IDENTITY-KEYED**: `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` decides whether a construct is
+  ACCEPTED, and does **not** automatically decide what a program MEANS when the references disagree
+  about the meaning. Content-keying does not merely accept more — it **silently omits text** when
+  a macro is redefined between two `#include`s of byte-identical headers, which is the class the bar
+  most abhors. DSS will deliberately refuse a program gcc compiles, with the cost recorded in the row
+  so a later cycle does not "discover" the divergence and fix it back. **Dispatchable now: lanes `h`
+  and `i` have landed and the file-set contention is gone.**
+- **The wider path-spelling audit LANDED as lane `i`** — see its subsection above. ✔Zero
+  residue in `src/` afterwards, measured rather than asserted.
+- **sqlite `veryquick` / `speedtest1` not re-run.** Deferred to the cycle's closing gate rather than
+  spent per commit: it costs hours and measures a tree that still changes with every landing set.
+  ⚠ **This is the STANDING PR EXIT REGIME and PR #56 inherits it undischarged**: units + sqlite
+  `veryquick` + `speedtest1` on FOUR legs, then the README — which still says *"THREE hosts"*
+  and has **no arm64-VPS table**.
+
+### ★★★ START HERE — the state at THIS COMMIT (the tip of `feature/c23-conformance-burndown-5`, PR #56), for a session with no context
+
+**Worktrees:** none. Lanes `a`, `b`, `d`, `h`, `i` were removed after folding; `git worktree list`
+should show only the repo itself. **PR #56 is open** on
+`feature/c23-conformance-burndown-5`; both P44 commits are pushed.
+
+**The next lane set, from `scripts/burndown-queue/burndown-queue.py` — four disjoint tiers so
+they cannot contend.** ⚠ Re-derive every status from the registry before acting: a row's
+status lives in its status cell, and this list will be stale the moment something lands.
+
+1. ★★★ **`D-PP-PRAGMA-RECOGNIZED-SEMANTICS`** (preprocess tier) — **take this
+   first, and it is READY TO BRIEF**: the measurement and the operator's ruling are both already
+   IN the row. `#pragma once` does not merely lack effect, **DSS REFUSES the translation unit**
+   (`P_PreprocessorPragma`, exit 1) against an idiom gcc, clang and MSVC all accept, so every
+   real-world header using the commonest guard fails to compile. The dedup key is **RULED
+   IDENTITY, not content** (operator 2026-08-28): `core::PathIdentity`, which landed 2026-08-18
+   and is exactly the machinery needed. The full 7-case reference matrix and the stated cost of
+   the deliberate divergence from gcc are in the row.
+2. **`D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT`** (type-layout tier) — P0 RED, a **silent
+   layout miscompile**, trigger fired, independent of `#pragma pack`. Ground truth is in the row.
+3. **`D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK`** (semantic/HIR tier) — P0 RED; the row
+   exists to stop the tempting WRONG fix being re-proposed, so read it before designing.
+4. **`D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE`** (asm tier) — a NAMED
+   EXCEPTION carrying its own closing predicate; check whether the infrastructure it waits on now
+   exists, per *"a buildable prerequisite is not a gate"*.
+
+⚠ **All four may want `src/dss-config/sources/c.lang.json`.** The fold instrument REFUSES a
+destination the main tree has drifted on, so a collision fails loud rather than silently reverting
+a sibling — but tell each lane to keep its config edit minimal and to report the exact keys it
+added.
+
+⚠⚠ **THE ORCHESTRATOR'S CYCLE INSTRUMENTS LIVE IN A SESSION-SCOPED SCRATCHPAD AND DO NOT
+SURVIVE A NEW SESSION.** They are at
+`C:\Users\rafae\AppData\Local\Temp\claude\C--Source-DailySoftware-dss-code-prime\0da5ab3a-fae5-4d34-b834-a49c20f74be6\scratchpad\p44\`
+and that directory still exists on disk — **read them from there rather than rewriting them.**
+The ones that earned their keep: `porcelain.py` (`git status -z`, because git C-QUOTES a path with
+spaces and this repo holds one), `seed_lane.py` + `fold_seeded.py` (a lane's contribution is
+*its status set MINUS seeded paths whose md5 is unchanged*, and the fold REFUSES a destination the
+main tree has drifted on), `apply_one_row.py` (replaces one row from a FILE, never retyped — a
+retyped row can WRAP an anchor id, which does not fail: it goes invisible and mints a false one),
+and `bucket_counts.py` (per-bucket OPEN split **through the gate's own `scan_document`**, because
+a hand-rolled row scanner counted commented-out rows and reported 562 where the gate said 556).
+★ **They are cycle machinery, they get rewritten every session, and `scripts/wsl-leg.sh`'s own
+header records that exact waste happening three times in one session. Decide at the START of the
+next cycle whether they are promoted into `scripts/`** — recorded as a decision to take, not
+filed as a row nobody closes.
+
+### ⓘ A HARNESS DEFECT FIXED THE MOMENT IT BLOCKED, per the standing ruling
+
+Seeding lanes `h`/`i` died creating a directory named `".plans`. `git status --porcelain` **C-quotes**
+a path that needs it, and this repository holds one — `.plans/23-full-c-plan - tbd.md` (spaces).
+Three orchestrator instruments read the path as `line[3:]`. Fixed at the source with one `-z` helper
+(NUL-separated, never quoted — so no quoting convention is left to reimplement; `core.quotePath=false`
+would NOT have sufficed, as it governs non-ASCII bytes and not the quoting a space triggers).
+✔**The repo's own scripts were checked BEFORE the fix and are NOT affected** — every one only counts
+porcelain LINES, and a quoted path is still one line. No repo anchor is owed.
+⚠ The failure mode worth remembering: on earlier seeds the naive parse did **not** error, it just
+silently omitted that path.
 
 ## 0.0000000000000000000000000000000000000000 ★★★ CYCLE P43 — TWO RED CI LEGS, TWO DIFFERENT BLIND SPOTS, AND NEITHER WAS CLOSED BY LOOSENING ANYTHING
 

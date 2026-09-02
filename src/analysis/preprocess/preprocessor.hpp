@@ -237,6 +237,24 @@ struct DSS_EXPORT PreprocessResult {
     // pass through untouched.
     [[nodiscard]] std::function<void(BufferId&, SourceSpan&)> makeRemap() const;
 
+    // ── [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the same rewrite over a WHOLE
+    //    diagnostic ────────────────────────────────────────────────────────────
+    //
+    // Primary span, every related location, AND — when the diagnostic's subject
+    // is a macro-expansion PRODUCT token — an appended
+    // `note: expanded from macro 'X'` at that macro's `#define`. The position
+    // half is the same `remapOnePosition` `makeRemap` uses; only the annotation
+    // needs the diagnostic, which a `(BufferId&, SourceSpan&)` closure cannot
+    // reach.
+    //
+    // ★ BOTH SHAPES EXIST BECAUSE BOTH CONSUMERS DO. `makeRemap`'s callers —
+    // the LSP position map, the shipped-descriptor refs, every post-parse tier's
+    // `remapPreprocessedPositions` — convert a bare coordinate and have no
+    // diagnostic to annotate. `DiagnosticReporter::remapBuffers` accepts either
+    // and dispatches on the callable's signature, so `Tree::remapDiagnostics`
+    // and every other call site is unchanged.
+    [[nodiscard]] std::function<void(ParseDiagnostic&)> makeDiagnosticRemap() const;
+
     // The Eof token that terminates `tokens`.
     //
     // ★ USE THIS, NEVER `tokens.back()` ([[D-PP-RESULT-CONTRACT-SINGLE-EXIT]]).
@@ -430,7 +448,13 @@ struct DSS_EXPORT TranslationTimestamp {
 class DSS_EXPORT PreScanMemoCounters {
 public:
     struct Row {
-        // Files read, continuation-spliced and tokenized by the pre-scan.
+        // Files continuation-spliced and tokenized by the pre-scan.
+        // ⚠ NOT "files read". The memo is keyed on the file's CONTENT DIGEST —
+        // D-PP-PRE-SCAN-MEMO-SERVES-A-SAME-SIZE-EDIT-INSIDE-ONE-TIMESTAMP-TICK-STALE
+        // — so EVERY request reads its file in order to have bytes to key on,
+        // and only a request that then does the splice and the tokenize counts
+        // here. `builds + hits` is therefore the read count, and `builds` alone
+        // is the memoized-work count.
         std::uint64_t builds = 0;
         // Pre-scan requests answered from the memo without doing that work.
         std::uint64_t hits = 0;

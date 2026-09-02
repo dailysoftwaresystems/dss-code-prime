@@ -107,44 +107,48 @@ namespace fs = std::filesystem;
                       DiagnosticBudget::libraryDefault());
 }
 
-// Move `path`'s write time to a stamp the pre-scan memo CANNOT match, and
-// PROVE it moved. Both include cases below need this, and neither may express
-// it as a wall-clock margin.
+// Put `path`'s write time BACK to the stamp the memo recorded, and PROVE it
+// landed there. Both include cases below need this.
 //
-// ★★ WHY THIS MEASURES INSTEAD OF GUESSING. The margin a stamp bump needs is a
-// property of the FILESYSTEM (its timestamp granularity), not of the code — so
-// any constant written here is sized on whichever machine happened to write it
-// and is wrong everywhere else, which is exactly the defect
-// [[D-TEST-A-NEW-WALL-CLOCK-LITERAL-IN-A-TEST-IS-UNGUARDED]] refuses. This
-// steps by the file clock's OWN smallest representable tick and doubles until
-// the filesystem actually RECORDS a different stamp: a coarse filesystem takes
-// a few more doublings and a fine one stops at the first, so the granularity is
-// discovered rather than assumed.
+// ★★★ THIS IS THE EXACT INVERSE OF THE HELPER IT REPLACES, AND THE INVERSION IS
+// THE WHOLE POINT.
+// [[D-PP-PRE-SCAN-MEMO-SERVES-A-SAME-SIZE-EDIT-INSIDE-ONE-TIMESTAMP-TICK-STALE]]
+// This file used to carry `forceADistinctWriteTime`, which walked the file
+// clock FORWARD until the filesystem recorded a different stamp. Under the old
+// `(identity, size, mtime)` key that made both cases below pass — and in doing
+// so it stepped around the one window where the old key was WRONG. A reader
+// concluded the same-length case was covered; it was not. The defect lived in
+// exactly the interval that helper skipped: a same-size rewrite landing inside
+// ONE filesystem timestamp tick, ✔MEASURED at 114 collisions in 200 back-to-back
+// rewrites on this host (tick ≈ 15.6 ms; with a 20 ms gap, 0 in 5).
 //
-// ⚠ AND THE RANGE IS DISCOVERED THE SAME WAY. ✔MEASURED 2026-08-26, Windows /
-// MinGW: displacing the stamp by its own distance from the clock epoch — the
-// first spelling tried here — is REFUSED by the OS with `cannot set file time:
-// Invalid argument`, because the result leaves the range `SetFileTime` accepts.
-// So this uses the `error_code` overload and treats a refusal as "too far, keep
-// looking" rather than letting it throw.
+// ⛔ SO A CASE HERE MUST NOT RACE FOR THE COLLISION — IT MUST FORCE IT. A pin
+// that writes twice and hopes the two writes land in one tick is 57% flaky
+// wearing the costume of a red-on-disable, and 43% of the time it reports a
+// broken tree clean, which is the failure direction this project treats as
+// worst. Stamping the recorded time back explicitly makes the collision
+// DETERMINISTIC, on every host, at every filesystem granularity.
 //
-// ⓘ DIRECTION IS IRRELEVANT, which is what makes a forward step safe to choose
-// freely: `PreScanKey::operator==` compares `mtime` with `==`, never with `<`,
-// so ANY distinct stamp is a miss.
-void forceADistinctWriteTime(fs::path const& path,
-                             fs::file_time_type const& from) {
-    auto step = fs::file_time_type::duration{1};
-    for (int attempt = 0; attempt < 40; ++attempt) {
-        std::error_code ec;
-        fs::last_write_time(path, from + step, ec);
-        if (!ec && fs::last_write_time(path) != from) return;
-        step *= 2;
-    }
-    FAIL() << "could not move " << path.string()
-           << "'s write time to any stamp distinguishable from the one the "
-              "memo recorded, after 40 doublings of the file clock tick - the "
-              "case downstream cannot say anything about the mtime component "
-              "of the memo key";
+// ⚠ THE OS CAN REFUSE A STAMP, so this uses the `error_code` overload and says
+// so rather than throwing. ✔MEASURED 2026-08-26, Windows / MinGW: a stamp
+// outside the range `SetFileTime` accepts comes back `cannot set file time:
+// Invalid argument`. A stamp this process READ off the same file moments ago is
+// in range by construction — which is why the inverse direction is the safe one
+// — but the refusal is still checked instead of assumed.
+void forceTheWriteTimeBackTo(fs::path const& path,
+                             fs::file_time_type const& stamp) {
+    std::error_code ec;
+    fs::last_write_time(path, stamp, ec);
+    ASSERT_FALSE(ec)
+        << "could not stamp " << path.string()
+        << "'s write time back to the one the memo recorded (" << ec.message()
+        << ") - without it the case downstream is racing for the collision "
+           "rather than forcing it, and a pass would mean nothing";
+    ASSERT_EQ(fs::last_write_time(path), stamp)
+        << "the filesystem did not record the stamp this case set on "
+        << path.string()
+        << ", so the (size, mtime) pair is NOT colliding and the case "
+           "downstream is not exercising the window it exists for";
 }
 
 // The SIGNIFICANT lexemes of a result — what the parser actually consumes.
@@ -549,11 +553,19 @@ TEST(PpIncludeNoRework, TheMemoServesTheFileThatWasAskedFor) {
 }
 
 TEST(PpIncludeNoRework, AnEditedHeaderIsNotServedFromTheMemo) {
-    // The memo's key carries size + last-write-time precisely so a file that
+    // The memo's key carries the file's CONTENT DIGEST precisely so a file that
     // CHANGES inside one process misses rather than being served stale. A
-    // compile does not normally edit its own inputs — but a cache that CANNOT
-    // notice would be a silent wrong answer, and this is the case that says it
-    // notices.
+    // compile does not normally edit its own inputs — but `preBuildScripts`
+    // GENERATE them, one process runs every dependency sub-build, and the LSP
+    // preprocesses across a session an external editor writes into, so a memo
+    // that CANNOT notice is a silent wrong answer. This is the case that says
+    // it notices when the length moves; its sibling below says it notices when
+    // the length does NOT.
+    //
+    // ⓘ The write time is stamped BACK to the one the memo recorded, so mtime
+    // is held CONSTANT across the edit and cannot do the discriminating here.
+    // That makes this case about `size`-and-content and its sibling about
+    // content ALONE, which is a decomposition rather than a duplicate.
     test_support::ScratchDir scratch{test_support::Location::Temp, "pp-include-edited"};
     fs::path const dir = scratch.path();
     fs::create_directories(dir);
@@ -576,9 +588,9 @@ TEST(PpIncludeNoRework, AnEditedHeaderIsNotServedFromTheMemo) {
         os << "int after_the_edit_and_longer(void);\n";
     }
 
-    // Force a stamp the memo cannot match, by measuring the filesystem's
-    // granularity rather than guessing a margin. See `forceADistinctWriteTime`.
-    forceADistinctWriteTime(h, stampInMemo);
+    // Hold mtime CONSTANT across the edit, so nothing but the bytes (and their
+    // count) can produce the miss. See `forceTheWriteTimeBackTo`.
+    ASSERT_NO_FATAL_FAILURE(forceTheWriteTimeBackTo(h, stampInMemo));
 
     PreprocessResult const second = pp("#include \"mutable.h\"\n", dirs, "e2.c");
     ASSERT_FALSE(second.diagnostics->hasErrors());
@@ -594,20 +606,33 @@ TEST(PpIncludeNoRework, AnEditedHeaderIsNotServedFromTheMemo) {
                            "unit";
     EXPECT_FALSE(sawOld)
         << "the PREVIOUS content of an edited header was served out of the "
-           "per-file pre-scan memo — the key is not carrying the file's size "
-           "and write time";
+           "per-file pre-scan memo — the key is not carrying the file's "
+           "content";
 }
 
 TEST(PpIncludeNoRework, AHeaderRewrittenToTheSameLengthIsNotServedFromTheMemo) {
-    // ISOLATES THE MTIME COMPONENT, and it exists because its sibling above
-    // cannot. That case rewrites to a DIFFERENT length, so the `size` half of
-    // `PreScanKey` already forces the miss on its own and the case stays green
-    // even if `mtime` were dropped from the key entirely. Here the replacement
-    // text is byte-for-byte the SAME LENGTH as the original and the file is the
-    // same file, so identity and size both still match: the write time is the
-    // ONLY thing left that can produce a miss. Drop `mtime` from the key and
-    // this case goes red while its sibling stays green, which is what makes the
-    // two a decomposition of the key rather than a duplicate of one assertion.
+    // ★★★ THE CLOSING CASE FOR
+    // [[D-PP-PRE-SCAN-MEMO-SERVES-A-SAME-SIZE-EDIT-INSIDE-ONE-TIMESTAMP-TICK-STALE]],
+    // AND IT IS THE ONE THAT DISCRIMINATES.
+    //
+    // ⚠ THIS CASE EXISTED BEFORE THAT ROW AND IT WAS GREEN OVER THE DEFECT —
+    // which is the part worth remembering. It rewrote to the same length and
+    // then called `forceADistinctWriteTime`, so `mtime` produced the miss and
+    // the case passed; a reader concluded the same-length edit was covered. It
+    // was covered only WHEN THE WRITE TIME MOVED, and the shipped compiler's
+    // hole was precisely the window where it does not.
+    //
+    // Now identity, size AND write time are ALL held equal across the edit —
+    // the last of them stamped back EXPLICITLY rather than raced for — so the
+    // file's BYTES are the only term left that can produce a miss. Under the
+    // old `(identity, size, mtime)` key this is a guaranteed HIT and the unit
+    // gets the pre-edit header; under the content-digest key it is a guaranteed
+    // MISS. That is a deterministic red-on-disable in both directions, on every
+    // host, at every filesystem timestamp granularity.
+    //
+    // Its sibling above rewrites to a DIFFERENT length under the same constant
+    // stamp, so the two are a decomposition — sibling: content changed and the
+    // length moved; here: content changed and NOTHING a `stat` can see moved.
     test_support::ScratchDir scratch{test_support::Location::Temp, "pp-include-same-length"};
     fs::path const dir = scratch.path();
     fs::create_directories(dir);
@@ -629,15 +654,15 @@ TEST(PpIncludeNoRework, AHeaderRewrittenToTheSameLengthIsNotServedFromTheMemo) {
         os << "int aaa_afterx(void);\n";
     }
     // The premise of this case, asserted rather than trusted: if the rewrite
-    // changed the length then the size half of the key would do the work and
-    // this case would prove nothing about mtime.
+    // changed the length then the size term would do the work and this case
+    // would prove nothing about the file's content.
     ASSERT_EQ(fs::file_size(h), sizeInMemo)
         << "the two texts are not the same length, so this case is no longer "
-           "isolating the mtime component of the memo key";
+           "isolating the content term of the memo key";
 
-    // Same construction as the sibling, and here it is the ONLY thing that can
-    // produce the miss.
-    forceADistinctWriteTime(h, stampInMemo);
+    // ⛔ FORCE the (size, mtime) collision — never wait for one. This is the
+    // line that makes the case deterministic instead of 57% reproducible.
+    ASSERT_NO_FATAL_FAILURE(forceTheWriteTimeBackTo(h, stampInMemo));
 
     PreprocessResult const second = pp("#include \"same_length.h\"\n", dirs, "s2.c");
     ASSERT_FALSE(second.diagnostics->hasErrors());
@@ -652,9 +677,11 @@ TEST(PpIncludeNoRework, AHeaderRewrittenToTheSameLengthIsNotServedFromTheMemo) {
     EXPECT_TRUE(sawNew) << "the edited header's new content did not reach the "
                            "unit";
     EXPECT_FALSE(sawOld)
-        << "a header whose SIZE was unchanged was served stale out of the "
-           "per-file pre-scan memo - the key's mtime component is not carrying "
-           "its weight, so only a length change can invalidate an entry";
+        << "a header whose size AND write time were both unchanged was served "
+           "STALE out of the per-file pre-scan memo, and the compiler compiled "
+           "the pre-edit header with a clean exit code. The key is a `stat` "
+           "heuristic for \"same bytes\" rather than the bytes themselves - "
+           "D-PP-PRE-SCAN-MEMO-SERVES-A-SAME-SIZE-EDIT-INSIDE-ONE-TIMESTAMP-TICK-STALE";
 }
 
 }  // namespace

@@ -807,12 +807,67 @@ struct DSS_EXPORT AssemblyConfig {
     // supports fails LOUD at variant election; it never widens in silence,
     // which is the failure `S_InlineAsmOperandModifierUnsupported` was refusing
     // the whole form to prevent.
+    //
+    // ★★★ `registerClass` — THE CLASS THIS LETTER IS DECLARED **FOR**, OR EMPTY
+    // FOR A WIDTH-ONLY LETTER, AND THE TWO POSTURES ARE MEASURED RATHER THAN
+    // STYLISTIC (P50, D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE,
+    // the operator's design A′ R5/R8).
+    //
+    //   * CLASS-SCOPED (the name of a `TargetRegClass` row — "gpr", "fpr"): the
+    //     letter selects a view of a register OF THAT CLASS, and an operand of
+    //     any other class REFUSES BY NAME, listing the letters the operand's
+    //     class does declare. ✔MEASURED on aarch64, gcc 13.3.0 AND clang 18.1.3
+    //     separately, `-O0` and `-O2`: the five FP view letters `%b %h %s %d %q`
+    //     on an `"r"`-bound integer are a hard error under BOTH (gcc: *invalid
+    //     'asm': incompatible floating point / vector register operand for
+    //     '%d'*; clang: *invalid operand in inline asm*) — a UNANIMOUS refusal
+    //     DSS adopts. The reverse (`%w`/`%x` on a `"w"`-bound double) is
+    //     accepted by both but MEANS different registers (gcc renders `v0`,
+    //     clang `d0`), and the operator ruled the construct DISSOLVED rather
+    //     than sided with: class-scoped letters make it illegal, so the
+    //     divergence disappears along with the program that exhibited it.
+    //
+    //   * WIDTH-ONLY (empty): the pre-P50 shape — the letter states its width
+    //     on an operand of ANY class, and legality is decided downstream by the
+    //     width-honesty gate and variant election. This is NOT a legacy default
+    //     kept for compatibility; it is what the x86-64 references DO:
+    //     ✔MEASURED, x86-64 gcc 13.3.0 ACCEPTS `%q0` on an `"x"`-bound `double`
+    //     and renders `%xmm0` (the letter degrades to the bare form) while
+    //     clang refuses — so acceptance is required by the disjunction, and a
+    //     class-scoped `q` would refuse a program gcc compiles AND this
+    //     pipeline compiles today (`movsd %q1, %q0` over `"x"` operands
+    //     lowers and encodes at HEAD).
+    //
+    // ⚠ THE POSTURES ARE PER **DIALECT**, NOT PER ROW — the loader refuses a
+    // document mixing scoped and unscoped rows, because a letter whose class
+    // was merely FORGOTTEN would otherwise load as legal-on-every-class, the
+    // exact silent wrong-application the scoped posture exists to kill.
+    //
+    // ★ STORED AS A NAME, RESOLVED BY THE LOWERING — the same layering
+    // `sectionName` and `opcodeNames` use, and for the same structural reason:
+    // `TargetRegClass` lives in `target_schema.hpp`, which includes
+    // `grammar_schema.hpp`, which includes THIS header. The LOADER still
+    // validates the name against `targetRegClassFromName` (and refuses the
+    // inoperable "none"), so an unknown class is a load error naming the
+    // closed set — never a letter that silently scopes to nothing.
     struct AsmTemplateModifier {
         std::string   letter;      // as declared ("w")
         std::string   lexeme;      // sigil + letter, composed by the loader ("%w")
         std::uint32_t widthBits = 0;
+        std::string   registerClass;  // "" = width-only; else a TargetRegClass name
     };
     std::vector<AsmTemplateModifier> templateModifiers;
+
+    // ★ THE WIDTHS A `templateModifiers` ROW MAY DECLARE — exactly the widths
+    // `lirInstWidthBits` can state, so a declared letter always reaches an
+    // instruction flag rather than being read back as 64. DECLARED HERE (the
+    // loader's vocabulary) because this header cannot include `lir_node.hpp`
+    // (include direction is core ← LIR);
+    // `tests/asm/test_asm_class_scoped_modifiers.cpp` static_asserts every
+    // entry against `lirInstWidthFlagForBits`, which is the cross-tier
+    // tripwire that keeps the two sets from drifting.
+    static constexpr std::array<std::uint32_t, 5>
+        kTemplateModifierWidthBits{8, 16, 32, 64, 128};
 
     // The LANGUAGE's operand-placeholder sigil, carried from the join above.
     // ★ IT IS HERE SO THE LOWERING CAN REBUILD THE **UNMODIFIED** SPELLING OF A

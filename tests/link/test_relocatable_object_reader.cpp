@@ -1012,6 +1012,8 @@ TEST(RelocatableObjectReader, DuplicateNativeIdInSchemaFailsLoudAtLoad) {
     auto collide = ObjectFormatSchema::loadFromText(
         R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
             "cSymbolDecoration":{"scheme":"none"},
+            "cCallingConvention": { "convention": "sysv_amd64" },
+            "outputExtension": ".o",
             "format":{"name":"elf-collide","kind":"elf"},
             "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
             "relocations":[{"name":"A","kind":1,"nativeId":7},
@@ -1035,6 +1037,8 @@ TEST(RelocatableObjectReader, EmitOnlyAliasLoadsAndDecodesThroughTheRealRow) {
     auto aliased = ObjectFormatSchema::loadFromText(
         R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
             "cSymbolDecoration":{"scheme":"none"},
+            "cCallingConvention": { "convention": "sysv_amd64" },
+            "outputExtension": ".o",
             "format":{"name":"elf-alias","kind":"elf"},
             "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
             "relocations":[{"name":"A","kind":1,"nativeId":7},
@@ -1063,6 +1067,8 @@ TEST(RelocatableObjectReader, EmitOnlyRowThatAliasesNothingFailsLoud) {
     auto orphan = ObjectFormatSchema::loadFromText(
         R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
             "cSymbolDecoration":{"scheme":"none"},
+            "cCallingConvention": { "convention": "sysv_amd64" },
+            "outputExtension": ".o",
             "format":{"name":"elf-orphan","kind":"elf"},
             "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
             "relocations":[{"name":"A","kind":1,"nativeId":7},
@@ -1090,6 +1096,8 @@ TEST(RelocatableObjectReader, IsCallOnAnEmitOnlyAliasFailsLoud) {
     auto ok = ObjectFormatSchema::loadFromText(
         R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
             "cSymbolDecoration":{"scheme":"none"},
+            "cCallingConvention": { "convention": "none" },
+            "outputExtension": ".wasm",
             "format":{"name":"elf-role-ok","kind":"elf"},
             "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
             "relocations":[{"name":"A","kind":1,"nativeId":7,"isCall":true},
@@ -1103,6 +1111,8 @@ TEST(RelocatableObjectReader, IsCallOnAnEmitOnlyAliasFailsLoud) {
     auto bad = ObjectFormatSchema::loadFromText(
         R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
             "cSymbolDecoration":{"scheme":"none"},
+            "cCallingConvention": { "convention": "none" },
+            "outputExtension": ".wasm",
             "format":{"name":"elf-role-bad","kind":"elf"},
             "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
             "relocations":[{"name":"A","kind":1,"nativeId":7},
@@ -1126,6 +1136,8 @@ TEST(RelocatableObjectReader, NonElfFormatSchemaFailsLoud) {
     auto wasm = ObjectFormatSchema::loadFromText(
         R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
             "cSymbolDecoration":{"scheme":"none"},
+            "cCallingConvention": { "convention": "none" },
+            "outputExtension": ".wasm",
             "format":{"name":"w","kind":"wasm"}})");
     ASSERT_TRUE(wasm.has_value());
     DiagnosticReporter rep;

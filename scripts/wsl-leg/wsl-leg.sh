@@ -266,10 +266,15 @@ printf 'lock : %s (run %s)\n' "$LOCK" "$LEG_RUN"
 # what "define the functions and do nothing" means.
 # shellcheck source=../leg-tree/leg-tree.sh
 . "$SRC/scripts/leg-tree/leg-tree.sh" "" || die "cannot load scripts/leg-tree/leg-tree.sh"
-DRIVER_BRANCH=$(git -C "$SRC" rev-parse --abbrev-ref HEAD 2>/dev/null) \
-    || die "cannot read the driver's branch from $SRC"
-DRIVER_SHA=$(git -C "$SRC" rev-parse HEAD 2>/dev/null) \
-    || die "cannot read the driver's HEAD from $SRC"
+# ★ ONE OWNER FOR THE DRIVER'S IDENTITY, and it is not `git -C "$SRC"`. A lane
+# worktree's `.git` is a FILE, and a Windows-created one names a Windows-absolute
+# gitdir that a POSIX git JOINS to the worktree path instead of following -- so this
+# very line used to die `cannot read the driver's branch` for every lane, from the one
+# namespace this script always runs in. `leg_tree_driver_identity` resolves it.
+leg_tree_driver_identity "$SRC" \
+    || die "cannot read the driver's identity from $SRC -- git could not describe that tree, and a leg that cannot name the commit it measured is not a measurement"
+DRIVER_BRANCH="$LEG_TREE_DRIVER_BRANCH"
+DRIVER_SHA="$LEG_TREE_DRIVER_SHA"
 ( leg_tree_prepare "$DST" "$DRIVER_BRANCH" "$DRIVER_SHA" ) \
     || die "leg-tree could not prepare $DST (rc=$?)"
 
@@ -427,15 +432,30 @@ if [[ "$MODE" == "build" ]]; then
 fi
 
 # ── test, through run-gate so a silent no-run cannot report success ──────────
-# ★★ THE REPO GUARDS ARE SKIPPED, by operator ruling 2026-08-25: WSL is an INDIRECT leg.
-# They check the SOURCE TREE and this tree was rsynced FROM the root host, which already
-# checked it -- ✔MEASURED 18 entries / 159.1 s of pure repetition. `DSS_LEG_GUARDS=1`
-# restores them.
-# ⓘ WHAT THIS COSTS, said out loud: CMakeLists dispatches on WIN32, so the root host runs
-# the `.ps1` guards and this leg used to be the only place the `.sh` twins ran. They are now
-# exercised in CI only. The twins HAVE silently diverged before.
+# ★★★ THE REPO GUARDS RUN HERE, by operator ruling 2026-09-02 — REVERSING the 2026-08-25
+# ruling that skipped them, because that ruling's PREMISE was measured false in P52.
+# Verbatim: *"so run the guards always on root host + linux wsl which is fast and can run
+# the guards without loosing too many time"*.
+#
+# ⛔ WHY THE OLD PREMISE WAS WRONG. It called this leg's guard run "pure repetition" of the
+# root host's -- ✔18 entries / 159.1 s -- but the paragraph directly beneath it already
+# recorded the refutation and nobody acted on it: `CMakeLists.txt` dispatches on WIN32, so
+# the root host runs the `.ps1` guards and this leg is the ONLY local place the `.sh` twins
+# and the POSIX behaviour of every guard ever run. It is not repetition; it is the only
+# coverage of a different code path.
+# ✔MEASURED 2026-09-02, and this is what the gap cost: `lane_worktree_guard` refused at its
+# FIRST LINE on every POSIX host from P50 onward (`[ -x ]` against a mode-644 file) and
+# `repo_tree_guard` refused a sound tree on macOS from P51 onward (`/var` -> `/private/var`).
+# Both were GREEN on all four local legs the entire time, and both surfaced only when a CI
+# matrix was paid for. A gate that runs a battery on one platform and reports a four-leg
+# result is publishing a one-platform claim.
+# ⓘ THE COST IS ACCEPTED DELIBERATELY AND IT IS BOUNDED: ~159 s on the fastest leg, and only
+# on this one. The arm64-VPS and macOS legs KEEP `-LE repo-guard` -- the defect class is
+# platform-conditional guard logic, one POSIX host exhibits it, and three would buy little
+# for three times the wall clock.
+# `DSS_LEG_GUARDS=0` skips them for a deliberately narrow run; the default is now ON.
 GUARD_SKIP=""
-[[ "${DSS_LEG_GUARDS:-0}" == "1" ]] || GUARD_SKIP="-LE repo-guard"
+[[ "${DSS_LEG_GUARDS:-1}" == "1" ]] || GUARD_SKIP="-LE repo-guard"
 say "ctest${FILTER:+ (-R $FILTER)}${GUARD_SKIP:+ (guards skipped)}"
 # shellcheck disable=SC2086
 if [[ -n "$FILTER" ]]; then

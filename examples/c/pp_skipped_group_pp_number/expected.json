@@ -1,0 +1,37 @@
+{
+  "$comment": "[[D-PP-SKIPPED-CONDITIONAL-GROUP-VALIDATED-AS-A-PHASE-7-NUMBER]] runtime witness. A skipped conditional group's text is divided into preprocessing tokens and NOT otherwise processed (C 6.10.1p6); `2d`, `1e` and `0x1e+2` are valid preprocessing numbers (C 6.4.8) that convert to no numeric literal, so they are errors ONLY in phase 7. DSS ran the phase-7 numeric grammar over the skipped text and refused the whole TU (P_MalformedNumber), which is the shape upstream sqlite's `#if 0` Tcl script in src/printf.c hits. prints \"skipped\", exits 42. The observable behaviour is the coarsest available -- the program compiles and runs at all -- so a regression produces NO artifact and the harness fails on the build, not on the comparison.",
+  "$commentWhyNotVacuous": "The live half is NOT decoration. `0x1e` is the exact spelling whose preprocessing-number tail would absorb a following `+2`; keeping it live proves the retiming did not disturb the phase-7 literal grammar, since a mangled `0x1e` changes the exit code from 42. The unit pins in tests/analysis/preprocess/test_skipped_group_not_otherwise_processed.cpp carry the other direction (a LIVE `2d` must STILL be refused) -- neither half is provable from the other.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "skipped\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "skipped\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "skipped\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "expectedStdout": "skipped\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

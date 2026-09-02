@@ -63,6 +63,28 @@ $RepoRoot  = Split-Path -Parent (Split-Path -Parent $ScriptDir)
 # silently answers about the wrong file.
 $InvokedFrom = (Get-Location).Path
 
+# ── THE ONE ROOT ──────────────────────────────────────────────────────────
+# ⛔⛔ D-SCRIPT-GUARDS-ASK-GIT-FROM-THE-LANE-WORKTREE. Until 2026-09-01 this file
+# said `Set-Location $RepoRoot` and then read repo-relative paths git had handed
+# it with `[IO.File]::ReadAllBytes`. `Set-Location` moves the PowerShell provider
+# location -- which native children (git) inherit -- and does NOT move
+# `[Environment]::CurrentDirectory`, which is what every `[IO.File]` relative
+# path follows. ✔MEASURED 2026-09-01 (cycle P51, lane `gw`): this guard,
+# ENUMERATING from a lane worktree while READING at the main checkout, listed
+# `scripts/check-line-endings/GW-CR-PROBE.md` (present only in the lane) and died
+# on `[IO.File]::ReadAllBytes` at the OTHER root.
+# ★★ IT DIED ONLY BECAUSE THE FILE WAS NEW. For every path both roots hold --
+# which is all of them, for a lane that only EDITS files -- it read the wrong
+# tree's bytes and reported a verdict about it. A CR introduced in a lane was
+# invisible; a CR fixed in a lane still convicted. That is a wrong-root read that
+# FAILS TOWARD GREEN.
+# ⇒ the root, the git namespace and the read root are now settled ONCE by
+# `Enter-RepoTree`, which moves BOTH working directories and then PROVES they and
+# git agree. `$RepoTree` is that identity; nothing below asks git or resolves a
+# path any other way.
+. (Join-Path $RepoRoot 'scripts/repo-tree/repo-tree.ps1')
+$RepoTree = $null
+
 function Get-GitLines([string[]]$GitArgs) {
     # `git grep` exits 1 for "no match", which is a legitimate answer here, so
     # only the LINES are returned; callers that need to distinguish "empty"
@@ -70,9 +92,18 @@ function Get-GitLines([string[]]$GitArgs) {
     # ⚠ DEFINED HERE, above the argument dispatch, because `--audit-instruments`
     # calls it: in PowerShell a function must exist when it is CALLED, and the
     # dispatch runs before the main body.
-    $out = & git @GitArgs 2>$null
-    if ($null -eq $out) { return @() }
-    return @($out | Where-Object { $_ -ne '' })
+    # ⚠ `$RepoTree` is read at CALL time, so every caller is downstream of the
+    # `Enter-RepoTree` that set it. A call before that is a bug and must not be
+    # rescued by falling back to a bare `git` -- that fallback IS the defect.
+    if ($null -eq $RepoTree) {
+        Write-Error "line-endings: FAIL - a git query was made before the guard entered its tree. Refusing to answer from an unidentified root."
+        exit 2
+    }
+    # ⚠ PLAIN `@(...)`. A caller that needs `.Count` writes `@(...)` at ITS call
+    # site -- the idiom this file already uses everywhere else. See the measured
+    # note on `Invoke-RepoTreeGit` for why the `,@(...)` shortcut is worse: it
+    # reaches a pipeline as one object and silently disables the next filter.
+    return @(Invoke-RepoTreeGit $RepoTree $GitArgs)
 }
 
 # ── THE ONE CORRECT INSTRUMENT ────────────────────────────────────────────
@@ -104,6 +135,11 @@ $CrAuditScope = ':(exclude).plans/'
 function Test-InQuotedRegion([string]$Path, [int]$LineNo) {
     # A BEGIN/END region marks a whole documentation block at once. Inclusive of
     # both marker lines, matching the .sh sibling's awk exactly.
+    # ⛔ `$Path` arrives repo-relative from `git grep -n`, so it is rooted at the
+    # tree git enumerated it from before either resolver sees it -- otherwise
+    # `Test-Path` answers about one tree and `[IO.File]::ReadAllLines` reads the
+    # other, and the exemption would be granted or refused on the wrong file.
+    $Path = Resolve-RepoTreePath $RepoTree $Path
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     $inRegion = $false; $n = 0
     foreach ($line in [IO.File]::ReadAllLines($Path)) {
@@ -237,6 +273,33 @@ function Invoke-SelfTest {
         # ARM 7 - the marker must exempt, or nobody can document the idiom.
         $marked = "awk $q/${b}r$d/$q f   CR-INSTRUMENT-QUOTED"
         if (($marked -match $CrBlind) -and ($marked -notmatch $CrExempt)) { Write-Host "line-endings: FAIL - selftest: the CR-INSTRUMENT-QUOTED marker did not exempt a documented idiom."; $fail = 1 }
+        # ARM 8 - ONE ROOT (D-SCRIPT-GUARDS-ASK-GIT-FROM-THE-LANE-WORKTREE).
+        # Every arm above judges BYTES; this one judges WHICH TREE the bytes came
+        # from, which is the question checks C/D/E answered wrongly for a lane.
+        # The expensive proof -- a real `git worktree add` fixture, a child process
+        # standing in the other root, and a control that reproduces the wrong-root
+        # read -- lives with the owner (`repo-tree.ps1 --selftest`, ctest entry
+        # `repo_tree_guard`). What belongs HERE is that THIS guard is actually
+        # standing on it.
+        if ($null -eq $RepoTree) {
+            Write-Host "line-endings: FAIL - selftest: the guard reached its self-test without entering a tree; every verdict below would be about an unidentified root."
+            $fail = 1
+        } else {
+            try { Assert-RepoTreeOneRoot $RepoTree }
+            catch { Write-Host "line-endings: FAIL - selftest: $($_.Exception.Message)"; $fail = 1 }
+            # ...and a repo-relative path from git must land under THAT root, not
+            # under whatever directory this process happened to start in.
+            $probeRel = 'scripts/check-line-endings/check-line-endings.ps1'
+            $probeAbs = Resolve-RepoTreePath $RepoTree $probeRel
+            if ((Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $probeAbs))) -ne $RepoTree.Root) {
+                Write-Host "line-endings: FAIL - selftest: a repo-relative path resolved to '$probeAbs', which is not under the enumerated root '$($RepoTree.Root)'."
+                $fail = 1
+            }
+            if (-not (Test-Path -LiteralPath $probeAbs -PathType Leaf)) {
+                Write-Host "line-endings: FAIL - selftest: the resolved path '$probeAbs' does not exist; the guard is rooted somewhere it cannot read."
+                $fail = 1
+            }
+        }
     }
     finally { Remove-Item -Recurse -Force -LiteralPath $tr -ErrorAction SilentlyContinue }
     if ($fail -ne 0) {
@@ -289,13 +352,11 @@ if ($args.Count -gt 0) {
                 Write-Host "line-endings: FAIL - cannot read path list '$src'"; exit 2 }
             exit (Invoke-FilesMode @($lines | Where-Object { $_ -ne '' }))
         }
-        '--audit-instruments' { Set-Location $RepoRoot; exit (Invoke-InstrumentAudit) }
-        '--selftest'          { Set-Location $RepoRoot; exit (Invoke-SelfTest) }
+        '--audit-instruments' { $RepoTree = Enter-RepoTree $RepoRoot; exit (Invoke-InstrumentAudit) }
+        '--selftest'          { $RepoTree = Enter-RepoTree $RepoRoot; exit (Invoke-SelfTest) }
         default { Write-Host "line-endings: FAIL - unknown argument '$($args[0])' (see --help)"; exit 2 }
     }
 }
-
-Set-Location $RepoRoot
 
 # ── fail-closed preconditions ─────────────────────────────────────────────
 # A guard that cannot run must FAIL, never skip.
@@ -303,8 +364,18 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Write-Error "line-endings: FAIL - git is not on PATH. This guard reads BLOBS, so it cannot fall back to the working tree (a CRLF checkout would false-red and an LF checkout would false-green). Refusing to report a pass."
     exit 2
 }
-$null = git rev-parse --verify --quiet HEAD 2>$null
-if ($LASTEXITCODE -ne 0) {
+# ★ `Enter-RepoTree` IS the precondition: it refuses when git cannot describe the
+# tree AND when the enumeration root and the read root disagree. The old code
+# tested only the first with a bare `git rev-parse HEAD`, which is exactly the
+# check that passes while every read lands somewhere else.
+try {
+    $RepoTree = Enter-RepoTree $RepoRoot
+} catch {
+    Write-Error "line-endings: FAIL - $($_.Exception.Message) Refusing to report a pass over a tree it cannot read."
+    exit 2
+}
+$null = Get-GitLines @('rev-parse','--verify','--quiet','HEAD')
+if ([string]::IsNullOrWhiteSpace($RepoTree.Sha)) {
     Write-Error "line-endings: FAIL - HEAD does not resolve; this is not a git work tree with a commit. Refusing to report a pass over a tree it cannot read."
     exit 2
 }
@@ -374,8 +445,13 @@ $OffendersIndex = Get-GitLines @('grep','--cached','-I','-l','-P','\r$')
 #   the last four instances survived.
 $SkipHistoryScan = $false
 foreach ($f in (@($OffendersHead) + @($OffendersIndex) | Sort-Object -Unique)) {
-    if ([string]::IsNullOrEmpty($f) -or -not (Test-Path -LiteralPath $f)) { continue }
-    $bytes = [IO.File]::ReadAllBytes($f)
+    # ⛔ `$f` IS REPO-RELATIVE, STRAIGHT OUT OF `git grep`. It must be resolved
+    # against the root git ENUMERATED it from. `Test-Path` follows the provider
+    # location and `[IO.File]` follows [Environment]::CurrentDirectory, so the
+    # unresolved pair could answer about two different trees in one `if`.
+    $abs = Resolve-RepoTreePath $RepoTree $f
+    if ([string]::IsNullOrEmpty($f) -or -not (Test-Path -LiteralPath $abs)) { continue }
+    $bytes = [IO.File]::ReadAllBytes($abs)
     if (($bytes | Where-Object { $_ -eq 13 } | Select-Object -First 1) -eq $null) {
         Write-Host "line-endings: HISTORY SCAN SKIPPED — this work tree's .git does not describe its files."
         Write-Host "    evidence: '$f' is recorded as CRLF in HEAD/index but carries ZERO CR on disk."
@@ -471,7 +547,11 @@ foreach ($row in $AllTrackedEolRows) {
 # and E2 (untracked files, never checked out) keeps convicting either way.
 # Kept behaviourally identical to the .sh sibling, measured by the same `git`
 # subcommands with the same arguments.
-$AutoCrlf = (& git config core.autocrlf 2>$null)
+# ⚠ `@(...)` around the call: this is the one query here whose answer is a SINGLE
+# line, and an unwrapped one-element result unrolls to a String, on which
+# `Set-StrictMode -Version Latest` makes `.Count` a terminating error.
+$AutoCrlfRows = @(Get-GitLines @('config','core.autocrlf'))
+$AutoCrlf = if ($AutoCrlfRows.Count -ge 1) { [string]$AutoCrlfRows[0] } else { '' }
 if ([string]::IsNullOrEmpty($AutoCrlf)) { $AutoCrlf = '<unset>' }
 # E1 - TRACKED, text, NOT covered by an `eol=lf` pin, CRLF/mixed on disk.
 # `i/-text` is binary (its 0x0D is legitimate) and `i/none` is empty; both are
@@ -502,8 +582,13 @@ foreach ($row in $AllTrackedEolRows) {
 # normalises it on `git add`, so it cannot land CRLF, and a guard that reds on a
 # state git is about to fix teaches people to ignore it.
 foreach ($f in (Get-GitLines @('ls-files','--others','--exclude-standard'))) {
-    if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
-    $bytes = [IO.File]::ReadAllBytes($f)
+    # ⛔ Same wrong-root read as check C above, and THIS is the site that died in
+    # the measurement: `ls-files --others` lists a file that exists ONLY in the
+    # lane, and the unresolved `[IO.File]::ReadAllBytes` looked for it at the
+    # other root.
+    $abs = Resolve-RepoTreePath $RepoTree $f
+    if (-not (Test-Path -LiteralPath $abs -PathType Leaf)) { continue }
+    $bytes = [IO.File]::ReadAllBytes($abs)
     if ($bytes.Length -eq 0) { continue }
     # BINARY skip via git's own heuristic (a NUL in the first 8000 bytes), so the
     # answer matches what `git grep -I` would have decided for a tracked blob.
@@ -513,8 +598,8 @@ foreach ($f in (Get-GitLines @('ls-files','--others','--exclude-standard'))) {
     if ($isBinary) { continue }
     # An explicit `binary` / `-text` declaration is an exemption, exactly as `-I`
     # honours it for the blob tiers.
-    if ((& git check-attr text -- $f 2>$null) -match ': text: unset$') { continue }
-    if ((& git check-attr eol  -- $f 2>$null) -match ': eol: lf$')     { continue }
+    if ((Get-GitLines @('check-attr','text','--',$f)) -match ': text: unset$') { continue }
+    if ((Get-GitLines @('check-attr','eol','--',$f))  -match ': eol: lf$')     { continue }
     $hasCr = $false
     foreach ($b in $bytes) { if ($b -eq 13) { $hasCr = $true; break } }
     if ($hasCr) {

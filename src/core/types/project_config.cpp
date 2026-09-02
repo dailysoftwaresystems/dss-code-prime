@@ -1,5 +1,6 @@
 #include "core/types/project_config.hpp"
 
+#include "core/types/config_document_parse.hpp"  // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey + DSS_CHECK_KEY_VOCABULARY
 #include "core/types/parse_diagnostic.hpp"
 #include "program/platform_token.hpp"            // kRunOnPlatformTokens / isValidRunOnToken / runOnTokenList
@@ -33,12 +34,30 @@ using json = nlohmann::json;
 // The human-readable "recognized fields" list in the diagnostic is DERIVED
 // from this array by `projectConfigKnownKeyList()` — see the header note. Do
 // not re-type it anywhere.
-constexpr std::array<std::string_view, 13> kKnownKeys = {
+constexpr std::array<std::string_view, 14> kKnownKeys = {
     "language", "artifactProfile", "targets", "sources", "output",
     "artifactName", "includes", "defines", "resolveLibraries",
     "stackReserve", "preBuildScripts", "postBuildScripts", "dependsOn",
+    "dependencyArtifactCache",
 };
 DSS_CHECK_KEY_VOCABULARY(kKnownKeys);
+
+// ── the CLOSED `dependencyArtifactCache.eviction` vocabulary ────────────────
+//
+// The token table and the enumerator table are index-parallel and asserted so
+// here, rather than being one `switch` a future enumerator can silently fall
+// out of. `parseDependencyArtifactCacheEviction` and the reject message both
+// read THIS table, so a token that is accepted is a token the message lists.
+constexpr std::array<std::string_view, 2> kEvictionTokens = {
+    "prune-superseded", "retain",
+};
+DSS_CHECK_KEY_VOCABULARY(kEvictionTokens);
+
+constexpr std::array<DependencyArtifactCacheEviction, kEvictionTokens.size()>
+    kEvictionValues = {
+        DependencyArtifactCacheEviction::PruneSuperseded,
+        DependencyArtifactCacheEviction::Retain,
+};
 
 // Comma-join a closed-key table for a diagnostic. ONE joiner for every table
 // in this file, so no message can list a key set by hand.
@@ -599,7 +618,141 @@ bool readOptionalDependsOn(json const& doc,
     return true;
 }
 
+// ── OPTIONAL `dependencyArtifactCache` ──────────────────────────────────────
+//
+// D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C). Absent ⇒
+// `nullopt` + no error (every manifest that predates this field must build
+// byte-identically). PRESENT ⇒ an object with ALL THREE members; everything
+// else fails loud `C_MalformedJson`.
+//
+// ⚠ NO MEMBER IS OPTIONAL, and this is the `resolveLibraries` object-form rule
+// rather than strictness for its own sake. A partial policy is a policy nobody
+// declared: `{"enabled": true}` alone would leave the location override and the
+// eviction rule to a compiled-in default, which is exactly the "100% config
+// driven" property this member exists to establish. And the fully degenerate
+// spelling — `{"enabled": false}` with nothing else — says what DELETING the
+// key says, so it rejects rather than aliasing.
+//
+// ⚠ THE ENVIRONMENT IS NOT READ HERE. `rootOverrideVariable` is validated as a
+// NON-EMPTY NAME and kept verbatim, exactly as `sources[]` and a dependency
+// `path` are: resolving it needs the environment, and this is a pure parser.
+bool readOptionalDependencyArtifactCache(
+    json const& doc, char const* key,
+    std::optional<DependencyArtifactCacheConfig>& out,
+    std::string_view label, DiagnosticReporter& rep) {
+    out.reset();  // defensive: never inherit a caller's stale contents
+    if (!doc.contains(key)) return true;  // absent ⇒ nullopt; no error
+
+    json const& v = doc.at(key);
+    std::string const at = std::string{"field '"} + key + "' ";
+    if (!v.is_object()) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         at + "must be an object {\"enabled\": …, "
+                              "\"rootOverrideVariable\": …, \"eviction\": …}");
+        return false;
+    }
+
+    // Unknown members reject, same rule + same rationale as the top-level gate
+    // and the `resolveLibraries` entry gate: a mistyped member is a silent drop
+    // of the very policy the object exists to state. `$`-prefixed members are
+    // PROSE and are skipped by `firstUnknownKey`, so a nested `$comment` cannot
+    // reinstate D-AP2-PROJECT-MANIFEST-REJECTS-COMMENT-KEY one level down.
+    static constexpr std::array<std::string_view, 3> kMemberKeys = {
+        "enabled", "rootOverrideVariable", "eviction"};
+    DSS_CHECK_KEY_VOCABULARY(kMemberKeys);
+    if (auto bad = detail::firstUnknownKey(v, kMemberKeys)) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         at + "has unknown member '" + *bad
+                         + "' (recognized members: " + joinKeys(kMemberKeys)
+                         + ")");
+        return false;
+    }
+
+    DependencyArtifactCacheConfig cfg;
+
+    if (!v.contains("enabled")) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         at + "is missing required member 'enabled'");
+        return false;
+    }
+    if (!v.at("enabled").is_boolean()) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         at + "member 'enabled' must be a boolean");
+        return false;
+    }
+    cfg.enabled = v.at("enabled").get<bool>();
+
+    if (!v.contains("rootOverrideVariable")) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         at + "is missing required member "
+                              "'rootOverrideVariable' — the cache location "
+                              "override is NAMED in configuration rather than "
+                              "sniffed from a compiled-in variable, so there is "
+                              "no default to fall back to");
+        return false;
+    }
+    if (!v.at("rootOverrideVariable").is_string()) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         at + "member 'rootOverrideVariable' must be a string "
+                              "naming an environment variable");
+        return false;
+    }
+    cfg.rootOverrideVariable =
+        v.at("rootOverrideVariable").get<std::string>();
+    if (cfg.rootOverrideVariable.empty()) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         at + "member 'rootOverrideVariable' must be a "
+                              "non-empty environment variable NAME");
+        return false;
+    }
+
+    if (!v.contains("eviction")) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         at + "is missing required member 'eviction' "
+                              "(one of: "
+                         + dependencyArtifactCacheEvictionTokenList() + ")");
+        return false;
+    }
+    if (!v.at("eviction").is_string()) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         at + "member 'eviction' must be a string (one of: "
+                         + dependencyArtifactCacheEvictionTokenList() + ")");
+        return false;
+    }
+    std::string const eviction = v.at("eviction").get<std::string>();
+    bool matched = false;
+    for (std::size_t i = 0; i < kEvictionTokens.size(); ++i) {
+        if (kEvictionTokens[i] != eviction) continue;
+        cfg.eviction = kEvictionValues[i];
+        matched      = true;
+        break;
+    }
+    if (!matched) {
+        // The message names the offending token AND the accepted set, derived
+        // from the one table — the same shape (and the same reason) as the
+        // `runOn` platform-token reject: a policy word the loader silently
+        // reinterpreted would be a cache behaving under a rule nobody wrote.
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         at + "member 'eviction' has unrecognized value '"
+                         + eviction + "' (accepted: "
+                         + dependencyArtifactCacheEvictionTokenList() + ")");
+        return false;
+    }
+
+    out = std::move(cfg);
+    return true;
+}
+
 } // namespace
+
+std::span<std::string_view const>
+dependencyArtifactCacheEvictionTokens() noexcept {
+    return std::span<std::string_view const>{kEvictionTokens};
+}
+
+std::string dependencyArtifactCacheEvictionTokenList() {
+    return joinKeys(kEvictionTokens);
+}
 
 std::span<std::string_view const> projectConfigKnownKeys() noexcept {
     return std::span<std::string_view const>{kKnownKeys};
@@ -611,14 +764,19 @@ std::optional<ProjectConfig>
 parseProjectConfig(std::string_view jsonText,
                    std::string_view sourceLabel,
                    DiagnosticReporter& rep) {
-    json doc;
-    try {
-        doc = json::parse(jsonText);
-    } catch (json::parse_error const& e) {
+    // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`) —
+    // D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC. The
+    // manifest is the document a USER hand-edits most often, so it is the one
+    // most likely to grow a second `language` or `target` on a copy-paste — and
+    // the loser is the declaration nearer the top of the file, the one the user
+    // is looking at.
+    auto parsed = detail::parseConfigDocument(jsonText);
+    if (!parsed) {
         emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
-                         std::string{"invalid JSON — "} + e.what());
+                         parsed.error().detailTextWithLocus("invalid JSON — "));
         return std::nullopt;
     }
+    json doc = std::move(*parsed);
     if (!doc.is_object()) {
         emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
                          "project config root must be a JSON object");
@@ -697,10 +855,21 @@ parseProjectConfig(std::string_view jsonText,
                                       pc.resolveLibraries, sourceLabel, rep))
         return std::nullopt;
 
-    // `output` is an OPTIONAL user-authored hint: validate its type when
-    // present (fail loud on a malformed value — never a silent no-op),
-    // but its path ROUTING is deferred (D-AP2-OUTPUT-ROUTING). Absent ⇒
-    // the existing per-target output convention applies downstream.
+    // `output` is the OPTIONAL output-dir BASE (D-AP2-OUTPUT-ROUTING). Validate
+    // its type when present — fail loud on a malformed value, never a silent
+    // no-op — and stop there: `Program::compileProject` owns the ROUTING (the
+    // `--output` precedence, the relative-to-cwd rule, the override note), with
+    // the working directory and the CLI state this pure parser deliberately
+    // lacks. Absent ⇒ the existing base applies (`--output`, else `<cwd>/target`).
+    //
+    // ⚠ NO PATH-SHAPE CHECK HERE, AND THAT IS DELIBERATE — this is the opposite
+    // of `artifactName` below, which rejects `/` and `\` because it must be a
+    // bare NAME. An output BASE is a directory: separators, `..` segments and an
+    // absolute or root-prefixed spelling are all legitimate, exactly as they are
+    // for `--output`, which validates none of them either. The boundary that
+    // still bites is the routing-site containment check, which asks whether the
+    // resolved ARTIFACT is a direct child of whatever base resolution produced —
+    // so it keeps holding over a manifest-supplied base with nothing added here.
     if (doc.contains("output")) {
         json const& v = doc.at("output");
         if (!v.is_string()) {
@@ -808,6 +977,18 @@ parseProjectConfig(std::string_view jsonText,
                              sourceLabel, rep))
         return std::nullopt;
     if (!readOptionalDependsOn(doc, "dependsOn", pc.dependsOn, sourceLabel, rep))
+        return std::nullopt;
+
+    // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C): the
+    // cross-build dependency artifact cache policy. Absent ⇒ nullopt ⇒ no cache
+    // at all, so every manifest written before this field builds byte-
+    // identically. Shape only here — WHERE the cache lives (the named override
+    // variable's value, the per-user default chain) and WHETHER a given build
+    // consults it are decided by `src/program/`, which has the environment, the
+    // config root and the target this parser deliberately lacks.
+    if (!readOptionalDependencyArtifactCache(doc, "dependencyArtifactCache",
+                                             pc.dependencyArtifactCache,
+                                             sourceLabel, rep))
         return std::nullopt;
 
     return pc;

@@ -1,0 +1,12 @@
+{
+  "$comment": "c116b x C11/C23 6.7.5 (D-WIN64-SEH-FUNCLETS H1 x D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL): a SEH __except FILTER reading OVER-ALIGNED parent locals. The filter funclet recovers a parent local off the establisher frame (the parent's post-prologue SP) at the parent's slot offset — but an over-aligned local is NOT at its raw slot address: the parent rounds it up at run time, because no compile-time offset can carry an alignment finer than the stack's own. The funclet must apply the identical rounding to the identical base or the two functions address one local two different ways. This program did not compile at all until that row closed, so the funclet's raw read has no history behind it. TWO over-aligned locals with a plain one between them, deliberately: the error a dropped rounding produces is `alignUp(base,32) - base`, which is ZERO whenever the runtime base is already 32-aligned, so a SINGLE local would pass at random about half the time; two sit 48 bytes apart (16-byte slot + 16 bytes of headroom + `gap`'s 16-byte slot) and 48 is 16 mod 32, so whatever the stack pointer's residue EXACTLY ONE of them is misread. Exit 42 iff the funclet recovered both at the addresses the parent uses; a wrong value makes the filter FALSE -> CONTINUE_SEARCH -> the AV escapes uncaught -> crash, never a silent pass. The `release` arm proves it composes with the full optimizer (mem2reg SKIPS SEH functions, so the locals stay frame slots). pe64-ONLY: x64 SEH + windows.h are Windows. Red-on-disable: drop the `emitAlignUpToPowerOfTwo` call in `lowerRecoverParentFrameSlot` and this crashes instead of returning 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

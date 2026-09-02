@@ -1,5 +1,6 @@
 #include "program/git_acquire.hpp"
 
+#include "core/substrate/path_identity.hpp"  // genericSpelling
 #include "core/substrate/process_spawn.hpp"
 
 #include <atomic>
@@ -185,7 +186,7 @@ GitCommandResult SystemGitRunner::fetch(fs::path const&    checkoutDir,
     return fromSpawn(
         substrate::spawnAndWaitInherit(gitFetchArgv(exe->string(), ref),
                                        checkoutDir),
-        "git fetch in '" + checkoutDir.generic_string() + "'");
+        "git fetch in '" + core::genericSpelling(checkoutDir) + "'");
 }
 
 GitCommandResult SystemGitRunner::checkout(fs::path const&    checkoutDir,
@@ -228,14 +229,14 @@ GitCommandResult SystemGitRunner::revParse(fs::path const&    checkoutDir,
     out = fromSpawn(
         substrate::spawnAndWaitRedirectStdout(gitRevParseArgv(exe->string(), rev),
                                               checkoutDir, slot.file),
-        "git rev-parse " + rev + " in '" + checkoutDir.generic_string() + "'");
+        "git rev-parse " + rev + " in '" + core::genericSpelling(checkoutDir) + "'");
     if (!out.ok) return out;
 
     std::ifstream in{slot.file, std::ios::binary};
     if (!in) {
         out.ok     = false;
         out.detail = "git rev-parse succeeded but its captured output at '"
-                   + slot.file.generic_string() + "' could not be read";
+                   + core::genericSpelling(slot.file) + "' could not be read";
         return out;
     }
     out.output = trimAscii(std::string{std::istreambuf_iterator<char>{in},
@@ -247,7 +248,7 @@ GitCommandResult SystemGitRunner::revParse(fs::path const&    checkoutDir,
     if (out.output.empty()) {
         out.ok     = false;
         out.detail = "git rev-parse " + rev + " in '"
-                   + checkoutDir.generic_string()
+                   + core::genericSpelling(checkoutDir)
                    + "' exited 0 but printed nothing, so there is no commit id "
                      "to record";
     }

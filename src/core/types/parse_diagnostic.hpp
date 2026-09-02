@@ -1263,17 +1263,23 @@ enum class DiagnosticCode : std::uint16_t {
     S_InlineAsmNonEmptyTemplate = 0xE057,
 
     // D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL: a bit-field MUTATION in a
-    // compound / inc-dec / value position through a base form the single-field
-    // reconstruction cannot address — a field reached via an ANONYMOUS struct/union
-    // member (needs the intermediate MemberAccess hop chain) or an ARRAY-arrow base
-    // (`sarr->bf`, C 6.3.2.1p3 decay). The bit-field-safe `classifyMemberLvalue`
-    // reconstruction (D-CSUBSET-BITFIELD-ASSIGN-VALUE-POSITION) handles NAMED `.`/`->`
-    // bases only; these residual bases would otherwise fall to the generic via-ptr
-    // path, whose full-unit store CLOBBERS packed neighbours + skips truncation — a
-    // silent miscompile. FAIL LOUD instead (statement plain-`=` stays correct via
-    // `lowerAssign`; use a named member, or split the mutation). NON-bit-field
-    // members through the same bases are unaffected (they take the correct generic
-    // scalar store). Renders error[S0058].
+    // compound / inc-dec / value position whose CONTAINING AGGREGATE the
+    // bit-field-safe `classifyMemberLvalue` reconstruction could not address. Such a
+    // mutation would otherwise fall to the generic via-ptr path, whose full-unit
+    // store CLOBBERS packed neighbours + skips truncation — a silent miscompile — so
+    // it fails loud instead. NON-bit-field members are unaffected (the generic
+    // scalar store is correct for them); statement plain-`=` never routes through
+    // the reconstruction at all (`lowerAssign` passes the raw MemberAccess through).
+    // ⓘ This is now a SHOULD-NEVER-FIRE structural invariant, and is kept as one on
+    // purpose. It used to ENUMERATE two unaddressable base shapes — a field behind
+    // ANONYMOUS struct/union members, and an ARRAY-arrow decay base (`sarr->bf`,
+    // C 6.3.2.1p3) — both of which the multi-hop member-path `Lvalue` supports as of
+    // 2026-08-31 (gcc 13.3.0 / clang 18.1.3 / mingw-w64 gcc 13.2.0 compile AND run
+    // both; MSVC 19.51 accepts both). What remains is every OTHER decline, all of
+    // them type-resolution failures the generic path also reports. Stated as "any
+    // decline" rather than as a shape list, it cannot be silently re-opened by a
+    // future base shape merely failing to be enumerated — which is exactly how this
+    // class of silent miscompile arrived the first time. Renders error[S0058].
     S_BitfieldMutationUnsupportedBase = 0xE058,
 
     // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the `inline` function
@@ -2005,6 +2011,129 @@ enum class DiagnosticCode : std::uint16_t {
     // gap with its own row — [[D-CSUBSET-INCDEC-CONST-LVALUE]] — because a const
     // lvalue IS addressable and passes the shape guard this code reports on.
     S_AssignNeedsModifiableLvalue = 0xE072,
+
+    // P48 (D-CSUBSET-TERNARY-ARRAY-ARM-INCOMPATIBLE): the second and third
+    // operands of a conditional satisfy NONE of the C 6.5.15p3 pairings —
+    // specifically, one arm is a pointer (or an array/function designator that
+    // decays to one) and the other is an INTEGER that is not a null pointer
+    // constant. `cond ? "%s" : 1`, `cond ? p : n`.
+    //
+    // ★★ IT IS A WARNING, AND THAT SEVERITY IS MEASURED RATHER THAN CHOSEN.
+    // ✔MEASURED 2026-09-01, each reference probed SEPARATELY at -O0 AND -O2 on
+    // `void f(int c) { (void)(c ? "%s" : 1); }`: gcc 13.3.0 (`-std=c2x`) and
+    // mingw-w64 gcc 13.2.0 say *"pointer/integer type mismatch in conditional
+    // expression"*, clang 18.1.3 (`-std=c23`) says the same under
+    // `-Wconditional-type-mismatch`, and MSVC 19.51.36252 (`/std:c17`) says
+    // `C4047: ':': 'char [3]' differs in levels of indirection from 'int'`.
+    // ALL FOUR compile it (rc=0) — so under `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C`
+    // an ERROR here would REFUSE a program every reference accepts, which is a
+    // conformance regression rather than a fix. The strict posture stays
+    // reachable through `--warnings-as-errors`, exactly as it does for gcc's
+    // `-Werror` / `-pedantic-errors`.
+    //
+    // ⓘ The pairings C 6.5.15p3 DOES admit are handled elsewhere and stay
+    // silent: two arithmetic arms, two compatible pointers, pointer-and-null-
+    // pointer-constant (`S_` never fires — `D-CSUBSET-TERNARY-NULL-STRING-LITERAL`
+    // types those), and object-pointer-and-`void*`.
+    S_ConditionalOperandTypeMismatch = 0xE073,
+
+    // P48 (D-CSUBSET-POINTER-DIFF-EDGE-CASES part 2): `p - q` where both operands
+    // are pointers (or arrays that decay to pointers) whose POINTEE types are not
+    // compatible — `char *a; int *b; a - b`. A C 6.5.6p3 constraint violation.
+    //
+    // ★★ ALSO A WARNING, AND FOR THE OPPOSITE REASON TO THE ROW THAT ASKED FOR
+    // IT. The row's stated closing work was *"emit a loud diagnostic at the
+    // binary node"*. ✔MEASURED 2026-09-01, each reference probed SEPARATELY at
+    // -O0 AND -O2: gcc 13.3.0 (*"invalid operands to binary - (have 'char *' and
+    // 'int *')"*), clang 18.1.3 (*"'char *' and 'int *' are not pointers to
+    // compatible types"*) and mingw-w64 gcc 13.2.0 all REJECT it — but **MSVC
+    // 19.51.36252 COMPILES it** (rc=0) with `C4133: '-': incompatible types -
+    // from 'int *' to 'char *'`. The disjunction settles accept-vs-refuse and the
+    // accepting reference wins, so a hard error would put DSS BELOW the union.
+    //
+    // ★★★ AND THE MESSAGE'S OWN WORDING TOLD US THE MEANING. C4133 says
+    // *"from 'int *' TO 'char *'"* — MSVC converts the RIGHT operand to the
+    // LEFT's type and then performs an ordinary same-type difference, so the
+    // stride is `sizeof(*LEFT)`. ✔MEASURED from MSVC's own `/FAs` listing at /O2:
+    // `char* - int*` emits a bare `sub` (stride 1); `int* - char*` emits
+    // `sub; sar 2` (stride 4); `double* - char*` emits `sub; sar 3` (stride 8).
+    // DSS therefore types the result as the language's pointer-difference type
+    // and divides by the LEFT pointee's stride — matching the only reference that
+    // accepts the construct, instead of the raw unscaled byte count it used to
+    // produce for one operand order and refuse for the other.
+    //
+    // ⓘ `int* - unsigned int*` is NOT diagnosed by MSVC at all and IS rejected by
+    // gcc/clang; DSS warns, because the pointees are genuinely incompatible and
+    // the warning costs nothing an accepting compiler does not already pay.
+    S_PointerDifferenceIncompatiblePointee = 0xE074,
+
+    // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH, C 6.2.2): a same-scope
+    // REDECLARATION gives an identifier internal linkage (`static` at file
+    // scope) after a prior PLAIN DEFINING declaration of the same name already
+    // gave it external linkage — `int g; static int g;` (tentative then
+    // static), `int g; static int g = 1;`, `int f(void) { … } static int
+    // f(void);` (a plain function DEFINITION then a static declaration).
+    //
+    // ★★ THE PREDICATE IS EXACTLY THE UNANIMOUS-REJECT SET, AND IT IS FAR
+    // NARROWER THAN THE ROW'S GCC-ONLY MATRIX SAID. ✔MEASURED 2026-09-01, each
+    // reference probed SEPARATELY (gcc 13.3.0 -std=c2x, clang 18.1.3 -std=c23,
+    // MSVC 19.51.36231 /std:clatest /TC): gcc and clang reject EVERY
+    // static↔non-static mix in either order ("static declaration of 'g'
+    // follows non-static declaration"), but **MSVC accepts most of them
+    // silently** (rc=0, no text) — `static int g; int g;`, `extern int g;
+    // static int g;`, `int f(void); static int f(void) { … }` all compile, and
+    // dumpbin shows the identifier simply lands INTERNAL (`Static | f`). The
+    // disjunction settles accept-vs-refuse, so DSS rejects ONLY where all
+    // three do: a `static` redeclaration after a PLAIN (storage-class-free)
+    // declaration that is DEFINING — an object tentative/real definition
+    // (MSVC C2370 "redefinition; different storage class") or a function
+    // definition (MSVC C2375 "redefinition; different linkage"). A prior bare
+    // PROTOTYPE (`int f(void); static int f(void);` — MSVC accepts), a prior
+    // `extern`, and every static-first ordering (C 6.2.2p4 makes the later
+    // extern/plain-function declaration INHERIT the internal linkage) stay
+    // accepted, and the internal-linkage bit is CARRIED across the merge so
+    // `static int f(void); int f(void) { … } static int f(void);` (unanimously
+    // accepted — the definition inherited internal linkage) never fires.
+    //
+    // UNSUPPRESSABLE — the S_ThreadLocalRedeclarationMismatch precedent:
+    // suppressed, the merge keeps ONE record's storage class, and on the
+    // keep-prior orderings the emitted artifact EXPORTS a symbol the program
+    // explicitly declared internal (`int g; static int g;` keeps the plain
+    // tentative → external emission) — a wrong-linkage artifact shipping
+    // green, C 6.2.2p7's undefined behavior realized silently.
+    S_LinkageRedeclarationMismatch = 0xE075,
+
+    // P50 (D-CSUBSET-NORETURN-NON-FUNCTION-OBJECT, C11 6.7.4p2): the
+    // `_Noreturn` KEYWORD on a declaration that does not declare a function —
+    // `_Noreturn int x;` (a plain object, file or block scope) or
+    // `_Noreturn void (*q)(void);` (a POINTER to function is still an object).
+    //
+    // ★★ A WARNING, NOT THE ERROR THE ROW ASKED FOR — THE ROW'S "expect
+    // unanimous rejection" PREMISE WAS REFUTED BY MEASUREMENT. ✔MEASURED
+    // 2026-09-01, each reference probed SEPARATELY: clang 18.1.3 and MSVC
+    // 19.51.36231 REJECT every non-function `_Noreturn`, but **gcc 13.3.0
+    // ACCEPTS them all with a warning** ("variable 'x' declared '_Noreturn'",
+    // rc=0) and IGNORES the specifier. The disjunction settles
+    // accept-vs-refuse, so an error would put DSS BELOW the union; silence
+    // (the pre-P50 state — the detection store is gated on the declared type
+    // being a function, so the flag was simply never stored) would keep the
+    // silent-inert defect the row names. DSS warns and drops the specifier,
+    // exactly gcc's meaning. The one unanimous reject in the family —
+    // `struct S { _Noreturn int m; };` — is already refused upstream by the
+    // grammar (P_NoAlternativeMatched; gcc "expected
+    // specifier-qualifier-list", clang "type name does not allow function
+    // specifier", MSVC C3829), so this code never needs to fire there.
+    //
+    // ⚠ KEYWORD FORM ONLY. The ATTRIBUTE spellings (`__attribute__((
+    // noreturn))` / `[[noreturn]]`) keep their own established behavior: GNU
+    // attribute semantics bind noreturn to the function TYPE through a pointer
+    // declarator (TF-C94 — gcc AND clang accept `__attribute__((noreturn))
+    // void (*p)(void);` SILENTLY and honor it), so the attribute-form store is
+    // untouched and the existing attribute diagnostics own the non-function
+    // attribute cases. Suppressable: gcc's own meaning is "ignored", the
+    // build proceeds identically, so hiding the advice ships nothing wrong —
+    // the S_AsmLabelOnAutomaticVariable negative-pin posture.
+    S_NoreturnNonFunctionObject = 0xE076,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -4390,7 +4519,33 @@ enum class DiagnosticCode : std::uint16_t {
     //   never sees one never needs the key, so this is not a back-door
     //   requirement on every schema.
     K_FormatLacksWeakDefinitionDialect = 0x8022,
-    // K-NEXT-SLOT: 0x8023 — grep this marker before adding a K_* code.
+    // K_ArtifactWithheldAfterError
+    //   The byte commit was REACHED while this compilation had already
+    //   recorded an error, so no artifact was written.
+    //   `linker::writeBytes` is the ONE
+    //   place any artifact byte in this compiler reaches disk, and this is
+    //   its outermost precondition: a build that reports failure must not
+    //   also hand back the file that failure denies.
+    //   ★ SEVERITY IS `Info`, DELIBERATELY, for the same reason
+    //   `D_LaterPhasesNotRun` is: the notice is emitted AT a gate that reads
+    //   `hasErrors()`, so an Error-severity notice would count a second
+    //   failure for one defect, could itself trip the diagnostic cap, and
+    //   would make the reason for the withholding compete with the reason
+    //   for the failure. The build was ALREADY failing when this fires —
+    //   `runCusToTargets` sets `exitCode = 1` from the same per-target
+    //   `scratch.hasErrors()` this gate reads — so the code can never turn a
+    //   passing build red. It reports a CONSEQUENCE, never a new fault.
+    //   ⓘ REACHING IT AT ALL MEANS AN UPSTREAM TIER REPORTED AN ERROR AND
+    //   LET THE PIPELINE RUN ON. Every tier gate in `compile_pipeline.cpp` is
+    //   a `tierClean(reporter, entryCount)` SNAPSHOT — deliberately, so one
+    //   tier does not fail on another's errors — and that discipline has no
+    //   whole-compilation level. This notice is that level, so its appearance
+    //   is worth investigating even though it is not itself a fault.
+    //   ⓘ The pre-existing file at the path (a previous good build's
+    //   artifact) is left BYTE-INTACT: the refusal happens before the
+    //   staging-temp claim, so the commit rename never runs.
+    K_ArtifactWithheldAfterError   = 0x8023,
+    // K-NEXT-SLOT: 0x8024 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
@@ -4511,7 +4666,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   silent-failure surface where FF3 would return a `cc *`
     //   into structurally-wrong data when a caller bypasses the
     //   JSON loader (TargetSchema ctor is public + skips
-    //   validate()). (D-FF3-Coherence un-retired 2026-06-01 at
+    //   validate()). (the FF3 Coherence item, un-retired 2026-06-01 at
     //   post-fold #4 once the schema-loader-singleton premise
     //   was disproved.)
     F_AbiCcRegistersInconsistent   = 0x5013,
@@ -4825,6 +4980,64 @@ enum class DiagnosticCode : std::uint16_t {
     //   ONE implementation, not three (see
     //   `src/link/format/object_atom_coverage.hpp`).
     F_ObjectReaderSymbolBodyDropped = 0x5027,
+    // ── D-FFI-DECLARED-IMPORT-NAME-SILENTLY-MOOT-ON-A-STATIC-ARCHIVE ────────
+    //
+    // A `--resolve-library <path>=<import-name>` (or a manifest
+    // `{"path","importName"}` entry) whose PATH turns out to be an input the
+    // build MERGES rather than IMPORTS FROM — an `ar` static archive, or a
+    // relocatable object. Those forms record no runtime dependency for the
+    // stated identity to name, so the name has nowhere to go.
+    //
+    // ✔MEASURED at `c1754511`, shipped CLI, pe64 leg, before this code existed:
+    // `--resolve-library dsslib.lib=totally_bogus_name.dll` returned rc=0 with
+    // ZERO diagnostics, and the emitted `main.exe` was BYTE-IDENTICAL (md5
+    // 1039fd348f4713b2bba4859a5fd6f567) to the one built with no `=<name>` at
+    // all, while the string `totally_bogus_name.dll` appeared nowhere in the
+    // image. Not merely unreported — entirely without effect. The relocatable
+    // OBJECT arm was silent in the same way, and `--warnings-as-errors` did not
+    // change either outcome. The DYNAMIC control DID carry its stated name into
+    // the import descriptor, which is what makes the silence a defect rather
+    // than a description of the feature.
+    //
+    // ── WHY A WARNING AND NOT AN ERROR, AND IT IS MEASURED, NOT PREFERRED ────
+    // The row's own closing sentence asked for a rejection ("a declaration
+    // error, not a no-op"). That half is REFUTED, by the probe this project
+    // already uses to settle exactly this question (`test_suppress_request_-
+    // ignored`'s `ReferenceCompilersDoNotRejectAnUnhonourableSilencingRequest`
+    // — an unhonourable request on a script-driven flag). ✔MEASURED 2026-09-01,
+    // each toolchain separately, over the closest available analogue — an
+    // operator STATING a runtime identity where the chosen mode records none:
+    //   gcc 13.3.0     `-c … -Wl,-soname,libfoo.so.1`      rc=0, SILENT
+    //   gcc 13.3.0     `-static … -Wl,-soname,…`           rc=0, SILENT
+    //   clang 18.1.3   `-c … -Wl,-soname,libfoo.so.1`      rc=0, WARNS
+    //                  (`'linker' input unused`, -Wunused-command-line-argument)
+    //   clang 18.1.3   `-static … -Wl,-soname,…`           rc=0, SILENT
+    //   GNU ld 2.42    `ld -r … -soname libfoo.so.1`       rc=0, SILENT
+    //   MSVC 19.51     `/c /Fe:bogus.exe`                  rc=0, SILENT
+    // ZERO of four refuse; ONE warns. An Error would make DSS the only
+    // toolchain that fails a build every reference accepts AND that produces a
+    // correct, runnable artifact — and the artifact here IS correct: the
+    // archive's members are merged, the program links and runs, nothing is
+    // miscompiled. So this is the clang position, and `--warnings-as-errors` is
+    // the strict posture for anyone who wants the refusal.
+    //
+    // ⚠ It is NOT the `--stack-reserve` shape, which DOES refuse
+    // (`K_FormatLacksStackReserveControl`), and the difference is the one that
+    // decides severity: a silently-dropped stack reserve is a RUNTIME HAZARD —
+    // the program can overflow — while a silently-dropped import name costs the
+    // operator only a self-contained artifact where they expected a dependent
+    // one. Fail-loud is about wrong bytes; there are none here.
+    //
+    // SUPPRESSIBLE (deliberately NOT in the unsuppressable table): neither
+    // membership prong applies — no wrong artifact can ship green, and the
+    // build does not fail, so suppressing it cannot leave a non-zero exit with
+    // an empty explanation.
+    //
+    // The `.actual` NAMES BOTH VALUES and the remedy: the path, the ignored
+    // name, what the input turned out to BE, and where the identity would be
+    // honoured. A message reading only "importName ignored" sends the reader
+    // hunting through a manifest for which entry it meant.
+    F_DeclaredImportNameNotRecordable = 0x5028,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
@@ -4881,6 +5094,41 @@ inline constexpr char kUnallocatedFamilyLetter = '?';
 // Exposed so a test can assert the renderer and the family table agree for
 // EVERY allocated code rather than for a hand-listed sample.
 [[nodiscard]] DSS_EXPORT char diagnosticFamilyLetter(DiagnosticCode c) noexcept;
+
+// ── [[D-PP-SKIPPED-CONDITIONAL-GROUP-VALIDATED-AS-A-PHASE-7-NUMBER]]: WHICH
+//    TRANSLATION PHASE'S JUDGEMENT A SCANNER DIAGNOSTIC IS ──────────────────
+//
+// C 5.1.1.2 draws the line this predicate names. PHASE 3 decomposes source text
+// into PREPROCESSING tokens; PHASE 7 converts each preprocessing token into a
+// token. A judgement phase 7 makes cannot apply to a preprocessing token that is
+// never converted — the text of a skipped conditional group is divided into
+// preprocessing tokens and, per C 6.10.1p6, *not otherwise processed*.
+//
+// ★★ WHY IT IS A PROPERTY OF THE CODE AND NOT A LIST AT THE GATE. The
+// preprocessor already suppressed exactly ONE code (`P_IllegalChar`) inside a
+// dead conditional region, with a comment stating that every other tokenizer
+// diagnostic forwards unconditionally. That is the same rule, spelled as one
+// name — and the second consumption site (a preprocessing NUMBER, C 6.4.8) was
+// therefore missed when the pp-number tail scan arrived, refusing every
+// translation unit that keeps a script inside `#if 0`. Naming the CLASS here
+// means a third conversion diagnostic inherits the rule by classifying itself,
+// at the tier that owns diagnostic identity, instead of by someone remembering
+// to widen a condition in `preprocess()`.
+//
+// ✔MEASURED 2026-08-31, gcc 13.3.0 and clang 18.1.3 probed SEPARATELY, one TU
+// per shape with a positive control compiled in the same run. Inside `#if 0`
+// BOTH ACCEPT a pp-number (`2d`, `1e`), a stray `@`, an invalid escape (`"\q"`)
+// and an unterminated `'`; BOTH REFUSE an unterminated COMMENT — because a
+// comment is replaced by one space in phase 3 whether or not its group is
+// skipped. That single split is the whole classification below.
+//
+// ⚠ THE DEFAULT IS `false`, AND THE DIRECTION IS LOAD-BEARING. An unclassified
+// code is a code that is FORWARDED: a wrong `false` costs a false positive an
+// operator can see and report, while a wrong `true` silences a real diagnostic
+// inside a dead branch, which is a silent miscompile arriving by omission. Only
+// the tokenizer's own codes reach the phase gate; everything else answers
+// `false` and keeps its existing unconditional delivery.
+[[nodiscard]] DSS_EXPORT bool isTokenConversionDiagnostic(DiagnosticCode c) noexcept;
 
 // A secondary location attached to a diagnostic — "matching opener here",
 // "previously declared here", etc. May reference a *different* buffer than

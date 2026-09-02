@@ -1,0 +1,15 @@
+{
+  "$comment": "D-CSUBSET-SUPPRESSED-SHIPPED-ROW-SIGNATURE-UNCHECKED (positive, P44 lane a): the ACCEPTING half of the new C23 6.7.6.3p15 compatibility check. C23 7.1.4p2 lets a program declare a library function itself, and real code does it constantly, so a check that refuses the ordinary spellings would be worse than no check at all. Three declarations gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 all accept (probed separately) are redeclared over `#include <stdio.h>`: `int puts(const char *)` (spelled with `const` where the descriptor row spells a bare `ptr<char>` — the row makes NO qualification claim, so C23 6.7.6.1p2 cannot be enforced against it and this must stay accepted, [[D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES]]); `extern int printf(const char *, ...)` (which on pe is a compiler-SYNTHESIZED UCRT shim rather than an import, so the CST->HIR shim gate answers through the same oracle); and `int puts(const char s[])` (C 6.7.6.3p7 adjusts an array parameter to a pointer, so it IS the row's `ptr<char>` written another way — a structural comparison that forgot the adjustment would refuse it). RUNTIME is the witness, not just the compile: exit 42 requires `puts` to return non-negative (C 7.21.7.10) AND `printf` to return 11 (C 7.21.6.3 — ten digits plus a newline), which is reachable only if both redeclared names bound the platform's real implementations. FOUR targets, and the pe one is deliberate rather than decorative: an elf-only manifest is a VACUOUS PASS on a Windows host (0 arms verified, 4 skipped-by-runOn — measured before this line was added), and pe is also the leg where printf/puts reach the COMPILER-SYNTHESIZED UCRT shim, so the accepting half of the shim gate gets a real RUN witness on the gate host. Return counts are platform-invariant: Windows text-mode translates the newline but the Microsoft CRT returns the count BEFORE translation (the shipped_printf_redecl_shim measurement), so exit 42 holds on every leg and no per-target expectedStdout is needed. RED-ON-DISABLE runs the OTHER way for this example, which is exactly what the pair is for: over-tighten the check — read an ABSENT descriptor qualification claim as 'unqualified', or drop the C 6.7.6.3p7 parameter adjustment before comparing — and this REFUSES to compile. The release arm runs the optimizer over the two opaque external calls.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

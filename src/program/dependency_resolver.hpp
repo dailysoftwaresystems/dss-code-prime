@@ -146,6 +146,20 @@ struct DSS_EXPORT DependencyResolveRequest {
     unsigned              jobs          = 0;
     substrate::IExecutor* executor      = nullptr;
 
+    // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C): the
+    // ROOT manifest's cross-build artifact cache policy, propagated onto every
+    // sub-build on the same M3 list and for the same reason — its ABSENCE from
+    // a dependency would be a SILENT difference, here the difference between a
+    // graph that caches and a graph half of which does.
+    //
+    // ⚠ THE ROOT'S, AND ONLY THE ROOT'S. A dependency's own
+    // `dependencyArtifactCache` member is NOT read, exactly as its `targets[]`
+    // (B.10) and its `output` (U-9) are not.
+    //
+    // nullopt ⇒ no cache anywhere in the graph — the state every manifest
+    // without the member is in, so an existing build is byte-identical.
+    std::optional<DependencyArtifactCacheConfig> dependencyArtifactCache;
+
     // `--force-git-cache`: bypass the cache-hit short-circuit and re-fetch.
     // U-10 — a silent no-op when the graph declares no git dependency, which
     // falls out of the cache being opened LAZILY (see the .cpp).

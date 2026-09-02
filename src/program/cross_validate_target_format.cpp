@@ -2,192 +2,122 @@
 
 #include "core/types/parse_diagnostic.hpp"
 
-#include <array>
 #include <format>
 
 namespace dss {
 
-namespace {
-
-// Closed-enum table of known target-arch machine codes. Two arches
-// shipped at v1; add a row here when a new arch lands AND the
-// shipped target.json + format.json pair declare the matching
-// machine value.
+// ── D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES ─────────────────────────
 //
-// Sources:
-//   ELF EM_* values per the AMD64 / AArch64 ELF psABIs + gABI fig 4-2.
-//   PE IMAGE_FILE_MACHINE_* per Microsoft PE/COFF spec.
-//   Mach-O CPU_TYPE_* per <mach/machine.h>.
-constexpr std::array<TargetArchMachineCodes, 2> kTargetArchMachineCodes{{
-    // x86_64: EM_X86_64=62, IMAGE_FILE_MACHINE_AMD64=0x8664, CPU_TYPE_X86_64=CPU_ARCH_ABI64|7=0x01000007.
-    { "x86_64", 62u,  0x8664u, 0x01000007u },
-    // arm64: EM_AARCH64=183, IMAGE_FILE_MACHINE_ARM64=0xAA64, CPU_TYPE_ARM64=CPU_ARCH_ABI64|12=0x0100000C.
-    { "arm64",  183u, 0xAA64u, 0x0100000Cu },
-}};
-
-// Static uniqueness check: `lookupTargetArch` returns the FIRST
-// match by linear scan, so a duplicate `targetName` row (paste-error
-// from adding a 3rd arch) would silently be dead code while the
-// first row served as the sole authority. Catch the typo at compile
-// time. (silent-failure HIGH-1 post-fold #1.)
-consteval bool targetArchNamesAreUnique() {
-    for (std::size_t i = 0; i < kTargetArchMachineCodes.size(); ++i) {
-        for (std::size_t j = i + 1; j < kTargetArchMachineCodes.size(); ++j) {
-            if (kTargetArchMachineCodes[i].targetName
-                == kTargetArchMachineCodes[j].targetName) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-static_assert(targetArchNamesAreUnique(),
-              "kTargetArchMachineCodes contains duplicate targetName "
-              "rows. lookupTargetArch returns the FIRST match, so a "
-              "duplicate row is dead code that masks a paste-error.");
-
-[[nodiscard]] TargetArchMachineCodes const*
-lookupTargetArch(std::string_view targetName) noexcept {
-    for (auto const& row : kTargetArchMachineCodes) {
-        if (row.targetName == targetName) return &row;
-    }
-    return nullptr;
-}
-
-void emitMismatch(DiagnosticReporter& reporter,
-                  std::string_view targetName,
-                  std::string_view kindName,
-                  std::uint64_t expected,
-                  std::uint64_t actual,
-                  std::string_view fieldName) {
-    dss::report(reporter, DiagnosticCode::D_TargetMachineCodeMismatch,
-                DiagnosticSeverity::Error,
-                std::format("target '{}' expects {} {}=0x{:X} ({}), "
-                            "but the format schema declares 0x{:X} ({}). "
-                            "Mismatched (target, format) pair would "
-                            "silently dispatch to the wrong walker — "
-                            "fix the format JSON's '{}' field OR pair "
-                            "the source with a format whose machine "
-                            "code matches the target arch. "
-                            "Anchored: plan 14 §3.1 D-LK6-8.2.",
-                            targetName, kindName, fieldName,
-                            expected, expected,
-                            actual, actual,
-                            fieldName));
-}
-
-} // namespace
-
-std::span<TargetArchMachineCodes const>
-targetArchMachineCodesTable() noexcept {
-    return {kTargetArchMachineCodes.data(), kTargetArchMachineCodes.size()};
-}
-
-// ABI-model ↔ format-kind compatibility (silent-failure CRITICAL-1
-// post-fold #1). The previous version of this file claimed `abiModel()`
-// gated WASM/SPIR-V compatibility "upstream" but no consumer ever read
-// the field. Result: a `RegisterMachine` x86_64 target paired with a
-// WASM format silently passed through cross-validate, reached
-// `compileSingleUnit`, and the WASM walker had no awareness of the
-// register-machine LIR shape. The check below makes the claim real.
+// FOURTEEN of the anchor's twenty-six mentions lived in this file, and they were
+// TWO different things wearing one costume. Sorting them was the work; both
+// piles are gone, but for different reasons.
 //
-// Closed-enum dispatch on the target's abi-model:
-//   RegisterMachine → Elf / Pe / MachO are valid; Wasm / Spirv reject.
-//   OperandStack    → Wasm valid; everything else rejects.
-//   ResultId        → Spirv valid; everything else rejects.
-[[nodiscard]] bool
-abiModelMatchesFormatKind(TargetAbiModel abi, ObjectFormatKind kind) noexcept {
-    switch (abi) {
-        case TargetAbiModel::RegisterMachine:
-            return kind == ObjectFormatKind::Elf
-                || kind == ObjectFormatKind::Pe
-                || kind == ObjectFormatKind::MachO
-                || kind == ObjectFormatKind::Unknown;  // defer to linker
-        case TargetAbiModel::OperandStack:
-            return kind == ObjectFormatKind::Wasm
-                || kind == ObjectFormatKind::Unknown;
-        case TargetAbiModel::ResultId:
-            return kind == ObjectFormatKind::Spirv
-                || kind == ObjectFormatKind::Unknown;
-    }
-    return false;  // unreachable per closed enum
-}
+// ★ PILE ONE — `abiModelMatchesFormatKind` (8 mentions). It decided whether a
+// pairing was LEGAL by testing the format's IDENTITY against a hardcoded set
+// per abi-model (`kind == Elf || kind == Pe || kind == MachO`, …). A validator
+// may compare two declarations; it may not carry its own hardcoded opinion
+// about which identities satisfy which rule. It is replaced by a coherence
+// check between two DECLARATIONS that both already exist and are both REQUIRED:
+// the target's `abiModel` and the format's `cCallingConvention`. A format that
+// names a calling convention passes arguments in registers; one that declares
+// the reserved `none` does not. That IS the execution-model claim, stated by
+// the document, and it costs no new key.
+//
+// ★ PILE TWO — the machine-code `switch` (6 mentions). It read a DIFFERENT
+// FIELD per identity (`elf.machine` / `pe.machine` / `macho.cputype`) and
+// compared each against `kTargetArchMachineCodes`, a C++ table keyed on
+// (target name x format kind). That table is DELETED, with `lookupTargetArch`,
+// `emitMismatch`, its `consteval` uniqueness assert and the public
+// `targetArchMachineCodesTable()` accessor, which had no caller outside this
+// file. ⚠ THE ARGUMENT IS ONE-OWNER, NOT TIDINESS: "arm64 is EM_AARCH64 = 183"
+// had TWO owners — each format document's own `machine` field and that C++ row
+// — with nothing forcing them to agree. Exactly the shape of `kCManglingRules`
+// and `kAbiCatalog`. The number now lives only in the document that emits it,
+// and the pairing question is answered by a NAME the document states outright.
+//
+// ⚠⚠ WHAT THIS NARROWED, STATED PLAINLY RATHER THAN LEFT TO BE FOUND. The
+// deleted `abiModelMatchesFormatKind` distinguished all THREE abi-models;
+// `cCallingConvention` distinguishes only register-passing from not. So
+// (operand-stack target x SPIR-V format) and (result-id target x WASM format)
+// are no longer refused HERE. Both pairings are unreachable today — no
+// `wasm32.target.json` or `spirv.target.json` ships, and neither has ever been
+// pinned by a test — and both are still refused downstream, where `resolveAbi`
+// yields a null cc and the driver emits
+// `D_TargetAbiModelUnsupportedByDriver`. ★ CLOSING PREDICATE: this arm returns
+// the moment a WASM or SPIR-V `.target.json` ships (plan 18 / plan 17), and the
+// key it needs is a one-line `targetAbiModel` on the two format skeletons. It
+// is recorded as a narrowing, not carried as a silent loss.
+//
+// ★ WHAT DID NOT MOVE, AND WHY THAT IS CORRECT. The `D_TargetMachineCodeMismatch`
+// code and its message keep their names. The failure CLASS is unchanged — "this
+// format is not for this target, and dispatching would emit the wrong
+// instruction set into the image" — so renaming a shared `DiagnosticCode`
+// enumerator would churn a cross-cutting header to describe the same event.
 
 bool crossValidateTargetFormat(TargetSchema const&       target,
                                 ObjectFormatSchema const& format,
                                 DiagnosticReporter&       reporter) {
-    // ABI-model ↔ format-kind cross-check (CRITICAL-1 post-fold #1).
-    // Catches `RegisterMachine` target paired with Wasm/Spirv format
-    // AND `OperandStack`/`ResultId` target paired with native format.
-    // This MUST run before the per-arch machine-code check below —
-    // WASM/SPIR-V skip the machine check (no machine field), so a
-    // mismatched abi-model would slip past the table lookup silently.
-    if (!abiModelMatchesFormatKind(target.abiModel(), format.kind())) {
-        dss::report(reporter, DiagnosticCode::D_TargetAbiModelMismatch,
+    // ── (1) EXECUTION MODEL — the silent-failure CRITICAL-1 gate ───────────
+    //
+    // Catches a register-machine target paired with a WASM/SPIR-V format (which
+    // would reach `compileSingleUnit` and hand a register-machine LIR shape to a
+    // walker that has no awareness of it) AND the inverse.
+    //
+    // Guarded on `declared()` because `ObjectFormatSchema{ObjectFormatData}` is
+    // a public constructor running no validation: an in-memory producer can
+    // arrive with no claim at all, and treating "never declared" as "declares
+    // none" would invent a refusal the document never asked for. Every LOADED
+    // schema has it — the key is REQUIRED — so this guard is unreachable from
+    // config and cannot weaken the shipped path.
+    if (format.cCallingConvention().declared()) {
+        bool const targetPassesInRegisters =
+            target.abiModel() == TargetAbiModel::RegisterMachine;
+        bool const formatPassesInRegisters =
+            !format.cCallingConvention().declaresNoConvention();
+        if (targetPassesInRegisters != formatPassesInRegisters) {
+            dss::report(reporter, DiagnosticCode::D_TargetAbiModelMismatch,
+                        DiagnosticSeverity::Error,
+                        std::format("target '{}' declares abiModel='{}' but "
+                                    "object format '{}' declares "
+                                    "cCallingConvention '{}'. A "
+                                    "register-machine target passes arguments "
+                                    "in registers and requires a format that "
+                                    "names one of its calling conventions; a "
+                                    "format declaring the reserved 'none' has "
+                                    "no register-level C ABI and requires a "
+                                    "non-register target. Anchored: plan 14 "
+                                    "§3.1 D-LK6-8.2.",
+                                    target.name(),
+                                    targetAbiModelName(target.abiModel()),
+                                    format.name(),
+                                    format.cCallingConvention().convention));
+            return false;
+        }
+    }
+
+    // ── (2) THE PAIRING — two DECLARED NAMES, compared ─────────────────────
+    //
+    // An empty `targetArch` means the document makes NO CLAIM about which
+    // target it serves, and the check does not apply — byte-for-byte the
+    // behaviour the deleted `lookupTargetArch(...) == nullptr` path had for a
+    // target absent from its table. It is not "any target will do": every
+    // shipped format declares the key, and a corpus sweep pins that it does.
+    if (!format.targetArch().empty() && format.targetArch() != target.name()) {
+        dss::report(reporter, DiagnosticCode::D_TargetMachineCodeMismatch,
                     DiagnosticSeverity::Error,
-                    std::format("target '{}' declares abiModel='{}' "
-                                "but the format schema has kind='{}'. "
-                                "Register-machine targets require ELF/PE/Mach-O; "
-                                "operand-stack requires WASM; result-id requires "
-                                "SPIR-V. Anchored: plan 14 §3.1 D-LK6-8.2.",
-                                target.name(),
-                                targetAbiModelName(target.abiModel()),
-                                objectFormatKindName(format.kind())));
+                    std::format("object format '{}' declares targetArch '{}' "
+                                "but was paired with target '{}'. A mismatched "
+                                "(target, format) pair would silently dispatch "
+                                "to the wrong walker and emit the wrong "
+                                "instruction set into the image — fix the "
+                                "format JSON's 'targetArch' field OR pair the "
+                                "source with a format that serves this target. "
+                                "Anchored: plan 14 §3.1 D-LK6-8.2.",
+                                format.name(), format.targetArch(),
+                                target.name()));
         return false;
     }
 
-    auto const* row = lookupTargetArch(target.name());
-    if (row == nullptr) {
-        // Target not in the cross-check table. Defer to format-side
-        // validation (WASM/SPIR-V/future ISAs without machine codes
-        // legitimately reach this branch).
-        return true;
-    }
-
-    switch (format.kind()) {
-        case ObjectFormatKind::Elf: {
-            std::uint32_t const actual =
-                static_cast<std::uint32_t>(format.elf().machine);
-            if (actual != row->elfMachine) {
-                emitMismatch(reporter, target.name(), "ELF",
-                             row->elfMachine, actual, "elf.machine");
-                return false;
-            }
-            return true;
-        }
-        case ObjectFormatKind::Pe: {
-            std::uint32_t const actual =
-                static_cast<std::uint32_t>(format.pe().machine);
-            if (actual != row->peMachine) {
-                emitMismatch(reporter, target.name(), "PE",
-                             row->peMachine, actual, "pe.machine");
-                return false;
-            }
-            return true;
-        }
-        case ObjectFormatKind::MachO: {
-            std::uint32_t const actual = format.macho().cputype;
-            if (actual != row->machoCpuType) {
-                emitMismatch(reporter, target.name(), "Mach-O",
-                             row->machoCpuType, actual,
-                             "macho.cputype");
-                return false;
-            }
-            return true;
-        }
-        case ObjectFormatKind::Wasm:
-        case ObjectFormatKind::Spirv:
-            // WASM + SPIR-V are abstract VMs with no machine-code
-            // identity. Target/format compatibility is enforced via
-            // `abiModel()` (OperandStack / ResultId) at the dispatch
-            // layer; no cross-check at this tier.
-            return true;
-        case ObjectFormatKind::Unknown:
-            // Unknown format kind reaches the linker's own
-            // K_NoMatchingObjectFormat guard — don't double-fail at
-            // the driver tier.
-            return true;
-    }
     return true;
 }
 

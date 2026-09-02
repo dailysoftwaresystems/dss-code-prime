@@ -159,6 +159,8 @@ namespace {
       "dssObjectFormatVersion": 1,
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
       )"} + std::string{decorationLine} + R"(
       "format": { "name": "csd-stub", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 }
@@ -352,6 +354,18 @@ TEST(CSymbolDecorationValidate, HandBuiltSchemaLeftAtTheSentinelIsRejected) {
     data.elf.machine        = 62;  // EM_X86_64
     // `cSymbolDecoration` DELIBERATELY LEFT UNSET — the zero value is the
     // invalid sentinel.
+    // D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY: its
+    // sibling IS set, and must be, or this pin stops measuring the decoration
+    // sentinel and starts measuring two missing fields at once — which is
+    // exactly what the "ONLY complaint" assertion below exists to forbid.
+    data.cCallingConvention.convention = "sysv_amd64";
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the artifact
+    // NAMING fact, REQUIRED on every format and DISENGAGED is its invalid
+    // sentinel (an engaged EMPTY value is a real answer -- a Unix
+    // executable). On this hand-built loader-bypassing path validate() is
+    // the only enforcement, so leaving it unset would make this fixture
+    // report two problems where its assertions expect one.
+    data.outputExtension = ".o";
 
     auto const problems = data.validate();
     std::size_t atKey = 0;

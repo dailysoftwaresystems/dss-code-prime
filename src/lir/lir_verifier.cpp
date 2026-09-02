@@ -921,6 +921,15 @@ bool verifyLirRebuild(Lir const& before, Lir const& after,
                after.literalPool().size());
     poolShrank("register-constraint pool", before.regConstraintPool().size(),
                after.regConstraintPool().size());
+    // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the third
+    // side structure gets the same shrink guard, and it NEEDS one more than
+    // the pools do. A dropped literal leaves a dangling INDEX that check (2)
+    // catches downstream; a dropped schedule entry leaves nothing dangling at
+    // all — the module verifies clean, links clean, runs, and simply never
+    // calls the initializer. This is the only instrument that can see it.
+    poolShrank("static-initializer schedule",
+               before.staticInitSchedule().size(),
+               after.staticInitSchedule().size());
 
     // (2) The module-local rules on the OUTPUT — dangling indices, and
     // constraint entries nothing references.

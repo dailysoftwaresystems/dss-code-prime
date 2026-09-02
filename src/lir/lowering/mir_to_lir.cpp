@@ -204,8 +204,13 @@ enum class MnemonicSlot : std::uint8_t {
     // cycle 3d float arithmetic + casts
     FAdd, FSub, FMul, FDiv, FNeg,
     FpCvt, FpToSi, FpToUi, SiToFp, UiToFp,
-    // cycle 3d cross-class move (movq via FPR↔GPR Bitcast)
-    MovqXClass,
+    // ⓘ `MovqXClass` USED TO LIVE HERE and is DELETED, not deprecated
+    // (D-TARGET-NO-CROSS-CLASS-MOVE-VERB). A cross-class move is not a
+    // module-wide mnemonic SLOT — it is one cell of the `registerClassOps`
+    // class×class table, resolved by `classOp(from, to, RegClassOp::Move)`
+    // like every other register-data movement. The slot existed only because
+    // that table had no room for the off-diagonal, and it named an x86_64
+    // opcode that carried no `encoding` at all.
     // cycle 3e: Call + IntrinsicCall (GlobalAddr reuses Mov via SymbolRef)
     Call, IntrinsicCall,
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): indirect
@@ -520,7 +525,6 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::FpToUi,        "fp_to_ui"},
     {MnemonicSlot::SiToFp,        "si_to_fp"},
     {MnemonicSlot::UiToFp,        "ui_to_fp"},
-    {MnemonicSlot::MovqXClass,    "movq_xclass"},
     {MnemonicSlot::Call,           "call"},
     {MnemonicSlot::IntrinsicCall,  "intrinsic_call"},
     {MnemonicSlot::CallIndirectViaExtern, "call_indirect_via_extern"},
@@ -699,14 +703,19 @@ struct Lowerer {
     // gates the one-shot diagnostic.
     std::array<MnemonicCache, kMnemonicCount> cache_;
 
-    // FC2 Part B: per-(register-class, op) opcode handles resolved from
-    // the target's `registerClassOps[]` table (with the GPR universal
-    // defaults — see TargetSchema::regClassOpOpcode). `nullopt` = the
-    // class has no such operation; consumers fail loud at the use site
-    // (a class/op combination a module never emits must not fail the
-    // whole lowering at construction). Generalizes the lowerBitcast
-    // class-dispatch pattern to EVERY mov/load/store emission.
-    std::array<std::array<std::optional<std::uint16_t>, kRegClassOpCount>, 5>
+    // FC2 Part B, class×class per D-TARGET-NO-CROSS-CLASS-MOVE-VERB:
+    // per-(fromClass, toClass, op) opcode handles resolved from the target's
+    // `registerClassOps[]` table (with the GPR→GPR universal defaults — see
+    // TargetSchema::regClassOpOpcode). `nullopt` = the pair has no such
+    // operation; consumers fail loud at the use site (a pair/op combination a
+    // module never emits must not fail the whole lowering at construction).
+    // The DIAGONAL is the within-a-file copy; an OFF-DIAGONAL cell is the
+    // cross-FILE move, which is why `lowerBitcast` and `emitAsmOperandMove`
+    // no longer branch on whether the two classes agree.
+    std::array<std::array<std::array<std::optional<std::uint16_t>,
+                                     kRegClassOpCount>,
+                          kTargetRegClassCount>,
+               kTargetRegClassCount>
         classOpCache_{};
 
     // Per-function state. Cleared at the top of `lowerFunction`.
@@ -742,6 +751,41 @@ struct Lowerer {
     // assigns the alloca's frame offset under. Both reset per function.
     std::unordered_map<std::uint32_t, std::uint32_t> allocaSlotIndex_;
     std::uint32_t                   allocaLirCount_ = 0;
+
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the EFFECTIVE alignment of each
+    // reserved frame slot, indexed by the SAME 0-based scan-order index
+    // `allocaLirCount_` hands out — one entry pushed at every reservation site, so
+    // `allocaSlotAlign_.size() == allocaLirCount_` always holds. `0` = no explicit
+    // override (the overwhelming majority; a compiler-internal home such as an x87
+    // scratch slot always records 0). Read at `emitLeaFrameSlot` to decide whether a
+    // slot's address needs the RUNTIME align-up: a slot whose alignment EXCEEDS the
+    // cc's stack alignment cannot be placed at a statically-aligned frame offset
+    // (post-prologue SP is only congruent to 0 modulo `stackAlignment`), so its
+    // address is rounded up at each materialization inside the headroom
+    // `lir_callconv` reserves above it. Reset per function alongside the counter.
+    std::vector<std::uint32_t>      allocaSlotAlign_;
+    // Per-function record of the above, keyed by MIR function index — the source
+    // the post-lowering harvest CROSS-CHECKS its own frozen-LIR walk against. The
+    // two must agree element-for-element: the harvest decides how much headroom the
+    // frame reserves, this vector decides which addresses get rounded up, and a
+    // scan-order skew between them would round up an address the frame never
+    // reserved room for (a silent overrun of the neighbouring slot).
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>
+                                    allocaSlotAlignByFunc_;
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: for the SEH
+    // filter funclet currently being lowered, the MIR function whose frame its
+    // `RecoverParentFrameSlot` ops read. Set per function from the scope records
+    // (`MirSehScope` carries both symbols), empty for every ordinary function.
+    //
+    // ★ WHY A FUNCLET NEEDS THIS AT ALL. It addresses a parent local off the
+    // ESTABLISHER frame — the parent's post-prologue SP at fault time — at the
+    // parent's own slot offset. When that local is OVER-ALIGNED the parent does not
+    // use the raw slot address either: it rounds it up. The funclet must apply the
+    // IDENTICAL rounding to the identical base, or the two disagree about where the
+    // local is, which is a silent miscompile in the one direction that used to be
+    // impossible only because the whole construct was refused.
+    std::optional<MirFuncId>        currentFuncletParent_;
+    std::unordered_map<std::uint32_t, MirFuncId> funcletParentByFuncSymbol_;
 
     // ── inline-asm P5 state ───────────────────────────────────────────────
     //
@@ -916,6 +960,31 @@ struct Lowerer {
     // thread-local accesses reports the missing format capability once).
     bool tlsFormatRejectReported_ = false;
 
+    // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50, CLOSED): whether
+    // bare `char` (`TypeKind::Char`) is UNSIGNED for this compilation — the
+    // (processor × platform) fact the TARGET declares in its one
+    // `charIsUnsigned` key, resolved per object format ONE LEVEL UP
+    // (`TargetSchema::charIsUnsigned(ObjectFormatKind)` — the format kind is a
+    // required argument THERE) and threaded in as a VALUE, like every other
+    // format-resolved fact here (`externCallDispatch_` and friends). Read by
+    // exactly TWO arms, both DEFENSIVE — the shipped C frontend
+    // integer-promotes a subscript / switch discriminant before either can see
+    // a raw narrow `Char`, and no other shipped .lang.json maps a type onto
+    // `Char` at all (measured P50: zero hits over the full 1870-test corpus
+    // with a positive-controlled site instrument): the Gep runtime-index widen
+    // (SExt vs ZExt) and the switch jump-table discriminant widen. `nullopt` =
+    // nothing threaded: the Gep arm then fails LOUD (either extension picked
+    // blind is a silent wrong address on half the targets) and the jump-table
+    // arm DECLINES to the compare chain (equality at the discriminant's own
+    // width — signedness-agnostic, correct under either declaration). The
+    // production driver does not thread a value yet — a channel whose producer
+    // cannot exist is the dead-config shape this repo rejects; the first
+    // non-promoting frontend's driver passes
+    // `target.charIsUnsigned(format.kind())` exactly as it passes
+    // `externCallDispatch`, and the per-value routing is already built and
+    // pinned (tests/lir/test_mir_to_lir.cpp).
+    std::optional<bool> charIsUnsigned_;
+
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbol minting for `&&label`
     // block-address materialization. A block whose address is taken gets ONE local
     // symbol (deduped by MIR block id within the module). `nextBlockSym_` is seeded
@@ -1072,14 +1141,16 @@ struct Lowerer {
             std::optional<ExternAddrBinding> externAddrBinding,
             std::optional<TlsAccessInfo> tlsAccess,
             std::span<MirSehScope const> sehScopes,
-            std::optional<std::string> wideFloatSoftcallLibrary)
+            std::optional<std::string> wideFloatSoftcallLibrary,
+            std::optional<bool> charIsUnsigned)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
           wideFloatSoftcallLibrary_(std::move(wideFloatSoftcallLibrary)),
           dataImportBinding_(dataImportBinding),
           externAddrBinding_(externAddrBinding),
-          tlsAccess_(tlsAccess), sehScopesIn_(sehScopes) {
+          tlsAccess_(tlsAccess), sehScopesIn_(sehScopes),
+          charIsUnsigned_(charIsUnsigned) {
         baselineErrors = reporter.errorCount();
         externSymbols.reserve(externImports.size());
         for (auto const& e : externImports) {
@@ -1157,14 +1228,17 @@ struct Lowerer {
             cache_[i].id       = target.opcodeByMnemonic(r.mnemonic);
         }
 
-        // FC2 Part B: resolve the per-class move/load/store handles
+        // FC2 Part B: resolve the per-class-PAIR move/load/store handles
         // once (mirrors the mnemonic cache). Unresolvable cells stay
         // nullopt — diagnosed at the emitting site, not here.
-        for (std::size_t c = 0; c < classOpCache_.size(); ++c) {
-            for (std::size_t o = 0; o < kRegClassOpCount; ++o) {
-                classOpCache_[c][o] = target.regClassOpOpcode(
-                    static_cast<TargetRegClass>(c),
-                    static_cast<RegClassOp>(o));
+        for (std::size_t f = 0; f < classOpCache_.size(); ++f) {
+            for (std::size_t t = 0; t < classOpCache_[f].size(); ++t) {
+                for (std::size_t o = 0; o < kRegClassOpCount; ++o) {
+                    classOpCache_[f][t][o] = target.regClassOpOpcode(
+                        static_cast<TargetRegClass>(f),
+                        static_cast<TargetRegClass>(t),
+                        static_cast<RegClassOp>(o));
+                }
             }
         }
 
@@ -1347,33 +1421,73 @@ struct Lowerer {
     // shared sign matcher. The lowering is target-blind; the config picks the
     // encoding. See lowerGep's const-disp arm.)
 
-    // FC2 Part B: the opcode that performs `op` on a value of register
-    // class `cls` (the registerClassOps resolution). GPR resolves to
-    // the universal mov/load/store; a class with no declared operation
-    // returns nullopt — callers MUST route through
-    // `reportMissingClassOp` rather than falling back to the GPR
-    // handle (the silent class-blind miscompile this table kills).
+    // FC2 Part B, class×class per D-TARGET-NO-CROSS-CLASS-MOVE-VERB: the
+    // opcode that performs `op` moving a value OUT OF class `from` INTO class
+    // `to` (the registerClassOps resolution). GPR→GPR resolves to the
+    // universal mov/load/store; a pair with no declared operation returns
+    // nullopt — callers MUST route through `reportMissingClassOp` rather than
+    // falling back to either class's own handle (the silent class-blind
+    // miscompile this table kills).
     [[nodiscard]] std::optional<std::uint16_t>
-    classOp(LirRegClass cls, RegClassOp op) const {
-        auto const c = static_cast<std::size_t>(cls);
-        if (c >= classOpCache_.size()) return std::nullopt;
-        return classOpCache_[c][static_cast<std::size_t>(op)];
+    classOp(LirRegClass from, LirRegClass to, RegClassOp op) const {
+        auto const f = static_cast<std::size_t>(from);
+        auto const t = static_cast<std::size_t>(to);
+        if (f >= classOpCache_.size())    return std::nullopt;
+        if (t >= classOpCache_[f].size()) return std::nullopt;
+        return classOpCache_[f][t][static_cast<std::size_t>(op)];
     }
 
-    void reportMissingClassOp(LirRegClass cls, RegClassOp op,
+    // The DIAGONAL query, spelled once — a copy WITHIN one class, which is
+    // what every spill, phi copy and value plumb asks for.
+    [[nodiscard]] std::optional<std::uint16_t>
+    classOp(LirRegClass cls, RegClassOp op) const {
+        return classOp(cls, cls, op);
+    }
+
+    void reportMissingClassOp(LirRegClass from, LirRegClass to, RegClassOp op,
                               std::string_view context) {
+        auto const fromName =
+            targetRegClassName(static_cast<TargetRegClass>(from));
+        auto const toName =
+            targetRegClassName(static_cast<TargetRegClass>(to));
+        // ⚠ THE CROSS-FILE SENTENCE IS A DIFFERENT SENTENCE, because the fix
+        // is different: a missing DIAGONAL move is a class whose vocabulary
+        // the target never declared; a missing OFF-DIAGONAL move is a machine
+        // operation (arm64 `fmov x0, d0`, x86_64 `movq %xmm0, %rax`) whose
+        // row simply is not in the table. Both are `registerClassOps` edits,
+        // and telling the author WHICH one saves them re-deriving it.
         dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
             DiagnosticSeverity::Error,
-            std::format(
-                "target '{}' declares no '{}' operation for register "
-                "class '{}' (required for lowering {}) — declare it in "
-                "the target's `registerClassOps[]` (the universal "
-                "mov/load/store bindings cover only the GPR class); "
-                "falling back to the GPR instruction forms would "
-                "silently mis-encode",
-                target.name(), regClassOpName(op),
-                targetRegClassName(static_cast<TargetRegClass>(cls)),
-                context));
+            from == to
+                ? std::format(
+                    "target '{}' declares no '{}' operation for register "
+                    "class '{}' (required for lowering {}) — declare it in "
+                    "the target's `registerClassOps[]` (the universal "
+                    "mov/load/store bindings cover only the GPR class); "
+                    "falling back to the GPR instruction forms would "
+                    "silently mis-encode",
+                    target.name(), regClassOpName(op), fromName, context)
+                : std::format(
+                    "target '{}' declares no move from register class '{}' "
+                    "to register class '{}' (required for lowering {}). "
+                    "Moving between two register FILES is a distinct machine "
+                    "operation from a copy within one (arm64 spells it "
+                    "`fmov x0, d0`, x86_64 `movq %xmm0, %rax`) — declare it "
+                    "in the target's `registerClassOps[]` as a row with "
+                    "`\"class\": \"{}\"` and `\"to\": \"{}\"`. Emitting "
+                    "either class's own move instead would encode the "
+                    "register NUMBER in the wrong file and read an unrelated "
+                    "register, which is a silent wrong answer rather than a "
+                    "diagnostic",
+                    target.name(), fromName, toName, context,
+                    fromName, toName));
+    }
+
+    // The diagonal-only spelling, kept so the ~20 same-class call sites read
+    // as the one-class question they are asking.
+    void reportMissingClassOp(LirRegClass cls, RegClassOp op,
+                              std::string_view context) {
+        reportMissingClassOp(cls, cls, op, context);
     }
 
     // ── D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND ───────────────────────────────
@@ -1385,43 +1499,71 @@ struct Lowerer {
     // module-wide `MnemonicSlot::Mov` per BLOCK and using it for every operand
     // whatever class it bound. See the call site in `expandInlineAsm` for the
     // two measured disassemblies.
+    // ★★★ D-TARGET-NO-CROSS-CLASS-MOVE-VERB: THE CLASS COMPARISON IS GONE.
+    // `registerClassOps` is now keyed by the class PAIR, so "copy this bit
+    // pattern from the value's file into the constraint's file" is ONE lookup
+    // whether or not the two files are the same one. A target that declares
+    // the cross-FILE row gets the machine's own instruction (arm64
+    // `fmov x0, d0`, x86_64 `movq %xmm0, %rax`); one that does not is refused
+    // by the same `reportMissingClassOp` that names a missing diagonal move.
+    // The special case that used to sit here WAS the missing slot.
     [[nodiscard]] std::optional<LirInstId>
     emitAsmOperandMove(MirInstId at, LirReg dest, LirReg src,
                        std::string_view role, std::size_t gnuIndex,
-                       std::string_view constraint) {
-        // ⚠ A CROSS-FILE MOVE IS A DIFFERENT MACHINE OPERATION FROM A COPY
-        // WITHIN A FILE, and `registerClassOps` binds one move PER class. There
-        // is no slot to ask, so this refuses rather than picking one of the two
-        // classes and encoding the register NUMBER into the wrong file.
-        if (dest.regClass() != src.regClass()) {
-            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
-                DiagnosticSeverity::Error,
-                std::format(
-                    "inline asm (MIR inst {}): {} {} (constraint \"{}\") binds "
-                    "register class '{}', but the value it carries lives in "
-                    "class '{}'. Moving between two register FILES is a "
-                    "distinct machine operation from a copy within one (arm64 "
-                    "spells it `fmov x0, d0`, x86_64 `movq %xmm0, %rax`), and "
-                    "no target declares it — `registerClassOps` binds one move "
-                    "PER class. Emitting that class's move would encode the "
-                    "register NUMBER in the wrong file and read an unrelated "
-                    "register, which is a silent wrong answer rather than a "
-                    "diagnostic. Bind this operand with a constraint whose "
-                    "class matches the value, or route the value through "
-                    "memory (D-TARGET-NO-CROSS-CLASS-MOVE-VERB)",
-                    at.v, role, gnuIndex, constraint,
-                    lirRegClassName(dest.regClass()),
-                    lirRegClassName(src.regClass())));
-            return std::nullopt;
-        }
-        auto const op = classOp(dest.regClass(), RegClassOp::Move);
+                       std::string_view constraint,
+                       std::uint32_t widthBits) {
+        auto const op = classOp(src.regClass(), dest.regClass(),
+                                RegClassOp::Move);
         if (!op.has_value()) {
-            reportMissingClassOp(dest.regClass(), RegClassOp::Move,
-                                 "inline asm operand materialisation");
+            // The operand's own coordinates go in the context so the refusal
+            // still locates the `%N` a programmer wrote, which is the half of
+            // the old message that was about THIS site rather than about the
+            // table.
+            reportMissingClassOp(
+                src.regClass(), dest.regClass(), RegClassOp::Move,
+                std::format("inline asm (MIR inst {}) {} {} (constraint "
+                            "\"{}\") — bind this operand with a constraint "
+                            "whose class matches the value, or declare the "
+                            "cross-class row",
+                            at.v, role, gnuIndex, constraint));
             return std::nullopt;
         }
+        // ⚠ THE WIDTH IS LOAD-BEARING ON A CROSS-FILE MOVE AND WAS NOT NEEDED
+        // BEFORE. A within-a-file copy is width-agnostic on both shipped
+        // targets (x86_64 `movaps` copies the whole XMM, arm64 `fmov d,d`
+        // copies the D view), but the cross-file instruction is width-KEYED —
+        // arm64 elects FMOV Xd,Dn at 64 and FMOV Wd,Sn at 32, and the two
+        // read different numbers of bytes out of the source file. Emitting the
+        // 64-bit form for a 32-bit operand is the wrong-bytes answer this row
+        // exists to stop, so the operand's own declared width is threaded here
+        // rather than left at the width-default.
         std::array<LirOperand, 1> const pin{LirOperand::makeReg(src)};
-        return emitInst(*op, dest, pin);
+        return emitInst(*op, dest, pin, /*payload=*/0,
+                        lirWidthFlagsForBits(widthBits));
+    }
+
+    // Project an operand's declared width in BITS onto the LIR instruction
+    // width flags of a register-to-register COPY (`lirInstWidthBits` is the
+    // inverse). 64 is the width-default and carries no flag; an unmodelled
+    // width also falls to the default, where the encoding-variant election
+    // refuses it by name rather than silently electing a neighbour.
+    //
+    // ⚠ SUB-32 PROMOTES TO 32, THE SAME RULE `registerOpWidthFlags` APPLIES
+    // to every other register plumb: a sub-32-bit register WRITE is a
+    // partial-register hazard, and neither shipped target declares a
+    // byte/half-word register-to-register move at all — asking for one would
+    // turn a `"r"`-bound `char` operand from a working 32-bit copy into
+    // `A_NoMatchingEncodingVariant`. The narrowing realizes at the
+    // width-exact CONSUMER, never in the plumbing.
+    [[nodiscard]] static constexpr std::uint8_t
+    lirWidthFlagsForBits(std::uint32_t bits) noexcept {
+        switch (bits) {
+            case 8:
+            case 16:
+            case 32:  return kLirInstFlagWidth32;
+            case 128: return kLirInstFlagWidth128;
+            default:  return 0;
+        }
     }
 
     // Map a MIR `TypeId` to the LIR register class that holds its
@@ -2667,15 +2809,24 @@ struct Lowerer {
             return;
         }
         // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the SCALAR RetPiece captures
-        // from the cc's per-class return register (lir_callconv), which for an FPR
-        // piece is a d-register (returnFprs). A 16-byte binary128 HFA piece (F128,
-        // piece 1..N-1 of a multi-Q return) lives in a v-register (returnVrs), so
-        // this scalar capture would read the WRONG file (8 of 16 bytes). The
-        // 1-element HFA (the LD-4 runtime witness) has NO piece 1..N-1 (piece 0 is
-        // the call's own result, captured via lowerCall's F128 arm), so this never
-        // fires there; a 2+-element binary128 HFA RETURN captured at the CALLER is
-        // beyond the witness — fail loud rather than silently mis-file it (the
-        // callee side already lowers it via lowerReturn's per-piece vrRet loop).
+        // from the cc's per-class return register (lir_callconv) at the class's
+        // WIDTH-DEFAULT, which for an FPR piece is 64 bits. A 16-byte binary128
+        // HFA piece (F128, piece 1..N-1 of a multi-Q return) needs the width-128
+        // form of that same register, so this scalar capture would read 8 of the
+        // datum's 16 bytes. The 1-element HFA (the LD-4 runtime witness) has NO
+        // piece 1..N-1 (piece 0 is the call's own result, captured via lowerCall's
+        // F128 arm), so this never fires there; a 2+-element binary128 HFA RETURN
+        // captured at the CALLER is beyond the witness — fail loud rather than
+        // silently mis-file it (the callee side already lowers it via
+        // lowerReturn's per-piece fprRet loop).
+        //
+        // ⚠ THIS USED TO SAY THE PIECE "lives in a v-register (returnVrs)" while
+        // an FPR piece was "a d-register (returnFprs)" — two register FILES. With
+        // the SIMD&FP file declared once
+        // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]) there is one
+        // file, one `returnFprs` pool, and the gap is a WIDTH the scalar capture
+        // does not state rather than a file it reads from. The refusal is the
+        // same and stays for the same reason.
         if (interner.kind(mir.instType(id)) == TypeKind::F128) {
             reportUnsupported(MirOpcode::ReturnPiece, id);
             poisonValue(id);
@@ -2837,6 +2988,16 @@ struct Lowerer {
         std::uint16_t ordinal = 0;     // meaningful iff `pinned`
         std::string   name;            // canonical parent name iff `pinned`
         std::uint32_t widthBits = 64;
+        // ★★★ THE CLASS THE **VALUE** LIVES IN, WHICH IS NOT ALWAYS `cls`
+        // (D-TARGET-NO-CROSS-CLASS-MOVE-VERB). `cls` is the CONSTRAINT's class
+        // — the register file the template's `%N` denotes — and GNU inline asm
+        // lets the two disagree routinely: the class is the constraint's, never
+        // the type's, so `"r"` with a `double` and `"x"` with an `int` are both
+        // legal. An OUTPUT whose value class differs must be moved back out of
+        // the constraint's file into its own before it becomes the MIR value,
+        // or the LIR verifier meets an `fpr`-typed MIR value living in a `gpr`
+        // register — which is the loud half of the same fact.
+        LirRegClass   valueCls = LirRegClass::None;
         // ★★★ EVERY spelling the template may write for this operand, CARRIED
         // from the descriptor — the positional form and, when the source named
         // the operand, the symbolic one. One binding row is emitted per entry,
@@ -2928,6 +3089,10 @@ struct Lowerer {
                    AsmBound& out) {
         out.spellings  = o.spellings;
         out.widthBits  = asmWidthBitsForType(valueType);
+        // The VALUE's own class, recorded once here beside its width and from
+        // the same `valueType`. Every arm below sets `cls` from the CONSTRAINT;
+        // this is the other half of the pair the cross-class move needs.
+        out.valueCls   = regClassForType(valueType);
         out.constraint = o.constraint;
         // ⚠ `"+r"` IS BOUND LIKE ANY OTHER OPERAND **HERE**, AND TIED IN
         // `tieAsmReadWriteOperands` (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE). This
@@ -3139,6 +3304,22 @@ struct Lowerer {
         out.ordinal = ord;
         out.name    = std::move(name);
         return true;
+    }
+
+    // ★★★ WHEN AN OUTPUT MUST BE COPIED OUT OF THE REGISTER THE TEMPLATE WROTE.
+    // TWO independent reasons, and stating them once keeps the in-block loop and
+    // the `asm goto` edge loop from drifting apart:
+    //   * PINNED — the value sits in a PHYSICAL register the block also
+    //     clobbers, so it has to be read out before anything else can take it;
+    //   * a CLASS CHANGE — the constraint's file is not the value's file
+    //     (`"r"` with a `double`), so the bit pattern has to physically move
+    //     between register FILES before it can be the MIR value
+    //     (D-TARGET-NO-CROSS-CLASS-MOVE-VERB).
+    // An unpinned output whose classes AGREE still needs no copy: the template
+    // wrote the operand's own vreg, which IS the `%N` binding, and a copy of a
+    // register into a fresh one of the same class would be dead.
+    [[nodiscard]] static bool asmOutputNeedsCapture(AsmBound const& b) noexcept {
+        return b.pinned || b.cls != b.valueCls;
     }
 
     // ★★★ `"+r"` — THE TIE IS A **LOCATION IDENTITY**, AND THIS IS WHERE IT IS
@@ -3692,9 +3873,10 @@ struct Lowerer {
         // meantime: the alternative measured above is a wrong register, quietly.
         auto emitOperandMove =
             [this, id](LirReg dest, LirReg src, std::string_view role,
-                       std::size_t gnuIndex,
-                       std::string_view constraint) -> std::optional<LirInstId> {
-            return emitAsmOperandMove(id, dest, src, role, gnuIndex, constraint);
+                       std::size_t gnuIndex, std::string_view constraint,
+                       std::uint32_t widthBits) -> std::optional<LirInstId> {
+            return emitAsmOperandMove(id, dest, src, role, gnuIndex, constraint,
+                                      widthBits);
         };
 
         // ── 3. parse the template on the RIGHT SURFACE ──
@@ -3776,7 +3958,8 @@ struct Lowerer {
             // Same early-out shape as the `regForValue` line above: this runs
             // BEFORE any capture block is opened, so there is none to seal.
             if (!emitOperandMove(ins[j].reg, *src, "input", j,
-                                 ins[j].constraint).has_value()) {
+                                 ins[j].constraint,
+                                 ins[j].widthBits).has_value()) {
                 return false;
             }
         }
@@ -3932,14 +4115,17 @@ struct Lowerer {
         // placement differs, the capture does not.
         if (!isGoto) {
             for (std::size_t k = 0; k < outs.size(); ++k) {
-                if (!outs[k].pinned) continue;
-                LirReg const dest = lir.newVReg(outs[k].cls);
-                // Same class on both sides by construction (`bindAsmOperand`
-                // takes `out.cls` from the pinned register itself), so this
-                // copy can only ever fail on a target that declares no `move`
-                // for that class — which `emitOperandMove` names.
+                if (!asmOutputNeedsCapture(outs[k])) continue;
+                LirReg const dest = lir.newVReg(outs[k].valueCls);
+                // The destination is the VALUE's class, not the constraint's
+                // (D-TARGET-NO-CROSS-CLASS-MOVE-VERB). When the two agree this
+                // is the readout it always was and can only fail on a target
+                // declaring no `move` for that class; when they differ it is
+                // the cross-FILE move that carries the value home. Either way
+                // `emitOperandMove` names the pair it could not resolve.
                 if (!emitOperandMove(dest, outs[k].reg, "output", k,
-                                     outs[k].constraint).has_value()) {
+                                     outs[k].constraint,
+                                     outs[k].widthBits).has_value()) {
                     sealOrphanedAsmCaptureBlocks(captureBlocks);
                     return false;
                 }
@@ -4134,16 +4320,19 @@ struct Lowerer {
             reportMissingOpcode(MnemonicSlot::Jmp, "MIR InlineAsmGoto edge");
             return false;
         }
-        // One destination vreg per pinned output, minted ONCE and written at the
-        // head of every edge. The MIR reads the piece in ONE place (the landing
-        // block's `ReturnPiece`), so the paths must agree on the register; the
-        // several defs sit on mutually exclusive paths, which is the shape a
-        // linear scan over live ranges already handles (`firstDef` takes the
-        // minimum — the same widening a `"+r"` operand's two defs produce).
+        // One destination vreg per captured output, minted ONCE and written at
+        // the head of every edge. The MIR reads the piece in ONE place (the
+        // landing block's `ReturnPiece`), so the paths must agree on the
+        // register; the several defs sit on mutually exclusive paths, which is
+        // the shape a linear scan over live ranges already handles (`firstDef`
+        // takes the minimum — the same widening a `"+r"` operand's two defs
+        // produce). The class is the VALUE's and the capture predicate is
+        // `asmOutputNeedsCapture`, both shared with the in-block loop so the
+        // edge placement is the only thing that differs.
         std::vector<LirReg> captureDest(outs.size(), InvalidLirReg);
         for (std::size_t k = 0; k < outs.size(); ++k) {
-            if (!outs[k].pinned) continue;
-            captureDest[k] = lir.newVReg(outs[k].cls);
+            if (!asmOutputNeedsCapture(outs[k])) continue;
+            captureDest[k] = lir.newVReg(outs[k].valueCls);
         }
         // D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND: the edge captures are the SAME
         // copy the in-block capture loop emits, so they go through the SAME
@@ -4154,10 +4343,11 @@ struct Lowerer {
         bool captureOk = true;
         auto emitCaptures = [&] {
             for (std::size_t k = 0; k < outs.size(); ++k) {
-                if (!outs[k].pinned) continue;
+                if (!asmOutputNeedsCapture(outs[k])) continue;
                 auto const li = emitAsmOperandMove(at, captureDest[k],
                                                    outs[k].reg, "output", k,
-                                                   outs[k].constraint);
+                                                   outs[k].constraint,
+                                                   outs[k].widthBits);
                 if (!li.has_value()) { captureOk = false; return; }
                 if (constraintHandle.has_value()) {
                     lir.setInstRegConstraints(*li, *constraintHandle);
@@ -4178,9 +4368,11 @@ struct Lowerer {
             if (!captureOk) return false;
             emitBr(*jmpOp, lirSucc(succs[j]));
         }
-        // The VALUE now lives in the vreg rather than in the pin, on every path.
+        // The VALUE now lives in the vreg rather than in the register the
+        // template wrote, on every path — the pin for a pinned output, the
+        // constraint's file for a cross-class one.
         for (std::size_t k = 0; k < outs.size(); ++k) {
-            if (outs[k].pinned) outs[k].reg = captureDest[k];
+            if (asmOutputNeedsCapture(outs[k])) outs[k].reg = captureDest[k];
         }
         return true;
     }
@@ -4943,6 +5135,65 @@ struct Lowerer {
 
     // ── memory ops (cycle 3c) ────────────────────────────────────────
 
+    // ── THE SHARED RUNTIME ALIGN-UP PRIMITIVE ────────────────────────────────
+    //
+    // `alignUp(value, alignBytes)` = `(value + (alignBytes-1)) & ~(alignBytes-1)`,
+    // emitted as ordinary width-64 LIR over VIRTUAL registers, returning the fresh
+    // vreg holding the rounded result (`value` itself when `alignBytes` is 0 or 1 —
+    // no instruction at all). Two callers, and they are the only two places a value
+    // the stack layout cannot round at compile time has to be rounded at run time:
+    // the VLA byte count (D-CSUBSET-VLA), and the address of a frame slot whose
+    // alignment exceeds what a static frame offset can promise
+    // (D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL).
+    //
+    // ★ AGNOSTIC BY CONSTRUCTION, and this is the whole reason the over-aligned-local
+    // case needs no target-shaped machinery. The mask is a NEGATIVE constant
+    // materialized into a register and consumed by a REG-REG `and` — the single form
+    // both shipped ISAs share (x86_64 also declares an AND-imm32; AArch64's logical
+    // immediates are a different encoding entirely, so a reg-imm spelling would be
+    // one ISA's shape imposed on the other). `emitBareConstToFresh` owns the
+    // per-target materialization (x86 sign-extending mov-imm32, arm64 MOVZ/MOVK).
+    // Everything downstream — 2-address legalization, register allocation,
+    // peepholes — sees three unremarkable arithmetic instructions on vregs.
+    //
+    // nullopt (with the fail-loud already reported, naming `context`) when the target
+    // declares no `add`/`and` or the constant cannot be materialized. NEVER a
+    // silently un-rounded value: an under-aligned address that still runs is the
+    // miscompile both callers exist to prevent.
+    [[nodiscard]] std::optional<LirReg>
+    emitAlignUpToPowerOfTwo(LirReg value, std::uint32_t alignBytes,
+                            std::string_view context) {
+        if (alignBytes <= 1) return value;
+        auto const addOp = opcode(MnemonicSlot::Add);
+        if (!addOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::Add, context);
+            return std::nullopt;
+        }
+        auto const andOp = opcode(MnemonicSlot::And);
+        if (!andOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::And, context);
+            return std::nullopt;
+        }
+        LirReg const biased = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 2> ops{
+                LirOperand::makeReg(value),
+                LirOperand::makeImmInt32(
+                    static_cast<std::int32_t>(alignBytes) - 1)};
+            emitInst(*addOp, biased, ops, /*payload=*/0, /*flags=*/0);  // width 64
+        }
+        std::optional<LirReg> const mask =
+            emitBareConstToFresh(-static_cast<std::int64_t>(alignBytes));
+        if (!mask.has_value()) return std::nullopt;
+        LirReg const rounded = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 2> ops{
+                LirOperand::makeReg(biased), LirOperand::makeReg(*mask)};
+            emitInst(*andOp, rounded, ops, /*payload=*/0, /*flags=*/0);  // width 64
+        }
+        return rounded;
+    }
+
     // VLA C1b (D-CSUBSET-VLA): lower a runtime-sized `Alloca` (a variable-length
     // array `int a[n]`) to the LEAF dynamic-stack sequence. The MIR Alloca's
     // operand[0] is the total runtime BYTE size (an i64 `Mul(count, stride)`, C1a);
@@ -4974,51 +5225,101 @@ struct Lowerer {
             poisonValue(id);
             return;
         }
-        // The VLA base is only as aligned as the stack pointer the `sub` leaves it at
-        // (rounded to stackAlignment below). An element demanding MORE alignment than
-        // the stack guarantees would land under-aligned — reuse the over-aligned-local
-        // fail-loud class (the dynamically-realigned-SP case is a separate cycle).
+        // ★★ AN OVER-ALIGNED VLA ELEMENT IS HONOURED, AND IT IS THE SAME ANSWER THE
+        // FIXED-SIZE OVER-ALIGNED LOCAL GOT — reserve headroom, round the address, leave
+        // the stack pointer alone (D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL, which
+        // closed by reserving `align - stackAlignment` bytes above a frame SLOT and
+        // rounding at each materialization). A VLA never visits the frame-slot walk —
+        // its base IS the post-`sub sp` stack pointer — so the SAME reservation rides
+        // its runtime size instead: over-allocate `elemAlign` bytes and round the
+        // captured base up to `elemAlign`.
+        //
+        // ⚠⚠ THE RESERVATION IS `elemAlign`, NOT `elemAlign - stackAlign`, AND THE
+        // DIFFERENCE IS A MEASURED SILENT STACK MISCOMPILE, NOT A MARGIN OF TASTE.
+        // `elemAlign - stackAlign` is the bound the FIXED-local mechanism uses
+        // (`frameSlotAlignHeadroom`), and it is correct THERE because it rests on a
+        // premise about the frame base. It does NOT transfer: this base is the live
+        // stack pointer, and ✔MEASURED on `x86_64:pe64-x86_64-windows-exec` the
+        // post-`sub sp` SP of a VLA leaf is congruent to 8 mod 16, NOT to 0 mod
+        // `cc.stackAlignment`. Two live VLAs in one function then sat 120 bytes apart
+        // where the first is 128 bytes long — an 8-byte OVERLAP of two distinct
+        // objects, found by a corpus example that writes every byte of both (an earlier
+        // draft wrote only the named members and missed it entirely, because the
+        // overrun landed in the last element's trailing padding). The round-up consumes
+        // up to `elemAlign - 1` bytes for an arbitrary base residue, so the reservation
+        // must cover that with no premise about SP at all. `elemAlign` is the smallest
+        // power of two that does, which keeps the arithmetic below in powers of two.
+        //
+        // THIS USED TO FAIL LOUD with `L_OverAlignedStackLocal`, on the stated premise
+        // that it "needs a dynamically realigned stack pointer". It does not, and no
+        // reference agrees with the refusal: ✔MEASURED 2026-09-01, gcc 13.3.0 and clang
+        // 18.1.3 probed SEPARATELY (`-std=c17 -Wall -Wextra`) both compile AND run a VLA
+        // of a member-`alignas(32)` struct and hand back a genuinely 32-aligned base.
+        // (MSVC refuses it, but for having no C99 VLA at all — `error C2057` on the
+        // bound — so the disjunction, not unanimity, decides.)
+        //
+        // ★ AGNOSTIC: `emitAlignUpToPowerOfTwo` is the shared primitive the fixed-local
+        // rounding already uses, and its docblock carries the argument for the reg-reg
+        // `and` + materialized negative mask. Nothing here is keyed on an architecture
+        // or an object format; SP, the prologue, the unwind data and the C5 teardown
+        // watermark (captured BEFORE the `sub`) are all untouched.
         std::uint32_t const elemAlign  = mir.instPayload2(id);
         std::uint32_t const stackAlign =
             cc->stackAlignment > 0 ? cc->stackAlignment : 16u;
-        if (elemAlign > stackAlign) {
+        // A non-power-of-two alignment would make the `(x + A-1) & ~(A-1)` round-up
+        // below meaningless (its mask is only a mask for a power of two). The semantic
+        // tier validates `alignas` as a power of two and every composite's alignment is
+        // one by construction, so this is an INVARIANT guard rather than a user-facing
+        // refusal — and it is the only site left that can raise this code, which is
+        // deliberate: an unreachable guard against a broken invariant is honest, while
+        // rounding by a nonsense mask would be a silent under-alignment.
+        if (elemAlign > stackAlign
+            && (elemAlign & (elemAlign - 1u)) != 0u) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::L_OverAlignedStackLocal;
             d.severity = DiagnosticSeverity::Error;
             d.actual   = std::format(
-                "variable-length array element requires {}-byte alignment, which "
-                "exceeds the {}-byte stack alignment the dynamic `sub sp` guarantees "
-                "— an over-aligned VLA element needs a dynamically realigned stack "
-                "pointer, not built (D-CSUBSET-VLA)",
-                elemAlign, stackAlign);
+                "variable-length array element requires {}-byte alignment, which is "
+                "not a power of two — the runtime align-up cannot express it "
+                "(D-CSUBSET-VLA)",
+                elemAlign);
             reporter.report(std::move(d));
             poisonValue(id);
             return;
         }
+        std::uint32_t const alignHeadroom = elemAlign > stackAlign ? elemAlign : 0u;
         std::optional<LirReg> const sizeRaw = regForValue(mir.instOperands(id)[0]);
         if (!sizeRaw.has_value()) { poisonValue(id); return; }
-        // alignUp(size, A) = (size + (A-1)) & ~(A-1), all width-64 (byte counts). The
-        // `& ~(A-1)` mask is a wide NEGATIVE constant materialized into a register (a
-        // reg-reg `and` — the single AArch64/x86 form both targets share; a bitmask-
-        // immediate AND is not portable, and the const materialization is arch-correct
-        // via emitBareConstToFresh: x86 sign-extending mov-imm32, arm64 MOVZ/MOVK).
-        std::int64_t const addend = static_cast<std::int64_t>(stackAlign) - 1;
-        LirReg const t0 = lir.newVReg(LirRegClass::GPR);
-        {
+        // Reserve the rounding headroom INSIDE the allocation before the stack-alignment
+        // round-up, so the whole array still fits below the pre-`sub` SP. Zero headroom
+        // emits nothing — a VLA whose element needs no over-alignment is byte-identical
+        // to before this change.
+        LirReg sizeWithHeadroom = *sizeRaw;
+        if (alignHeadroom > 0) {
+            auto const addOp = opcode(MnemonicSlot::Add);
+            if (!addOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Add,
+                                    "an over-aligned variable-length array element's "
+                                    "rounding headroom");
+                poisonValue(id);
+                return;
+            }
+            LirReg const withRoom = lir.newVReg(LirRegClass::GPR);
             std::array<LirOperand, 2> ops{
                 LirOperand::makeReg(*sizeRaw),
-                LirOperand::makeImmInt32(static_cast<std::int32_t>(addend))};
-            emitInst(*addOp, t0, ops, /*payload=*/0, /*flags=*/0);  // width 64
+                LirOperand::makeImmInt32(static_cast<std::int32_t>(alignHeadroom))};
+            emitInst(*addOp, withRoom, ops, /*payload=*/0, /*flags=*/0);  // width 64
+            sizeWithHeadroom = withRoom;
         }
-        std::optional<LirReg> const mask =
-            emitBareConstToFresh(-static_cast<std::int64_t>(stackAlign));
-        if (!mask.has_value()) { poisonValue(id); return; }
-        LirReg const size16 = lir.newVReg(LirRegClass::GPR);
-        {
-            std::array<LirOperand, 2> ops{
-                LirOperand::makeReg(t0), LirOperand::makeReg(*mask)};
-            emitInst(*andOp, size16, ops, /*payload=*/0, /*flags=*/0);  // width 64
-        }
+        // alignUp(size, A) = (size + (A-1)) & ~(A-1), all width-64 (byte counts) —
+        // now the SHARED `emitAlignUpToPowerOfTwo` primitive, which this sequence
+        // used to spell inline. Its docblock carries the agnosticism argument for
+        // the reg-reg `and` + materialized negative mask.
+        std::optional<LirReg> const size16Opt =
+            emitAlignUpToPowerOfTwo(sizeWithHeadroom, stackAlign,
+                                    "a variable-length array's runtime byte size");
+        if (!size16Opt.has_value()) { poisonValue(id); return; }
+        LirReg const size16 = *size16Opt;
         // `sub sp, size16`: descend the stack. operand0 = the physical SP (the r/m
         // destination+source1 on x86, the baked Rd=Rn=sp on arm64), operand1 = the
         // aligned byte count. result:none (SP mutates in place). A physical-reg
@@ -5033,10 +5334,23 @@ struct Lowerer {
         // `base = sp_copy SP`: capture the POST-sub SP as the VLA base. hasSideEffects
         // on BOTH ops pins the order — the capture cannot float above the sub. Every
         // `a[i]` address use routes to `base` via `defineValue`/`regForValue`.
-        LirReg const base = lir.newVReg(LirRegClass::GPR);
+        LirReg const rawBase = lir.newVReg(LirRegClass::GPR);
         {
             std::array<LirOperand, 1> ops{LirOperand::makeReg(sp)};
-            emitInst(*copyOp, base, ops, /*payload=*/0, /*flags=*/0);
+            emitInst(*copyOp, rawBase, ops, /*payload=*/0, /*flags=*/0);
+        }
+        // An OVER-ALIGNED element: round the captured base up into the headroom
+        // reserved above. Every later `a[i]` reads this rounded vreg, so the whole
+        // object — not merely element 0 — sits at the demanded alignment (the elements
+        // are `elemAlign`-strided by construction, since a type's size is a multiple of
+        // its alignment).
+        LirReg base = rawBase;
+        if (alignHeadroom > 0) {
+            std::optional<LirReg> const alignedBase = emitAlignUpToPowerOfTwo(
+                rawBase, elemAlign,
+                "an over-aligned variable-length array's runtime base address");
+            if (!alignedBase.has_value()) { poisonValue(id); return; }
+            base = *alignedBase;
         }
         defineValue(id, base);
     }
@@ -5115,6 +5429,10 @@ struct Lowerer {
         // `allocaLirCount_` post-increments: the index recorded is the 0-based
         // position of this `alloca` op among the function's alloca ops, == the
         // index lir_callconv's scan assigns its offset under.
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: record THIS slot's effective
+        // alignment under the same index. MUST be pushed before the early-return-free
+        // tail below so `allocaSlotAlign_.size()` tracks `allocaLirCount_` exactly.
+        allocaSlotAlign_.push_back(mir.instPayload2(id));
         if (opcode(MnemonicSlot::LeaFrameSlot).has_value()) {
             allocaSlotIndex_.emplace(id.v, allocaLirCount_);
         } else {
@@ -5124,9 +5442,46 @@ struct Lowerer {
             // without the pressure relief (no shipped target hits this: both x86_64
             // and arm64 declare lea_frame_slot; a register-machine schema with
             // `alloca` but no `lea_frame_slot` is a config that predates c69).
-            defineValue(id, result);
+            // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: this single-vreg model
+            // needs the SAME runtime rounding the remat path applies — the address
+            // is bound ONCE here, so rounding it here rounds every use of it.
+            std::uint32_t const rtAlign =
+                (mir.instPayload2(id) > ccStackAlignment()) ? mir.instPayload2(id)
+                                                            : 0u;
+            std::optional<LirReg> const bound =
+                (rtAlign != 0)
+                    ? emitAlignUpToPowerOfTwo(
+                          result, rtAlign,
+                          "an over-aligned local's frame address")
+                    : std::optional<LirReg>{result};
+            if (bound.has_value()) defineValue(id, *bound);
+            else                   poisonValue(id);
         }
         ++allocaLirCount_;
+    }
+
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the cc's stack alignment — the
+    // bound a STATIC frame offset can promise, because the post-prologue stack
+    // pointer is congruent to 0 modulo exactly this and nothing finer. cc index 0
+    // is the canonical source at MIR→LIR (pre-abi-resolution): the stack alignment
+    // is TARGET-uniform, which is the same reason `lowerVlaAlloca` reads it there.
+    // The 16 fallback covers only a schema that declares no stack alignment at all.
+    [[nodiscard]] std::uint32_t ccStackAlignment() const {
+        auto const* cc = target.callingConvention(0);
+        return (cc != nullptr && cc->stackAlignment > 0)
+            ? static_cast<std::uint32_t>(cc->stackAlignment) : 16u;
+    }
+
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the alignment slot `slotIndex`'s
+    // ADDRESS must be rounded up to at run time, or 0 when the static frame offset
+    // already carries it (every slot on every shipped corpus today). An unknown
+    // index answers 0 — a compiler-internal home reserved through a path that
+    // recorded nothing is never over-aligned, and answering "no rounding" for it
+    // reproduces the pre-existing behaviour exactly.
+    [[nodiscard]] std::uint32_t runtimeAlignForSlot(std::uint32_t slotIndex) const {
+        if (slotIndex >= allocaSlotAlign_.size()) return 0u;
+        std::uint32_t const a = allocaSlotAlign_[slotIndex];
+        return (a > ccStackAlignment()) ? a : 0u;
     }
 
     // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): emit a fresh `lea_frame_slot k`
@@ -5160,6 +5515,47 @@ struct Lowerer {
             reportMissingOpcode(MnemonicSlot::LeaFrameSlot,
                                 "MIR Alloca address rematerialization");
             return std::nullopt;
+        }
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: a slot whose effective
+        // alignment EXCEEDS the cc's stack alignment cannot be placed at a
+        // statically-aligned frame offset — post-prologue SP is congruent to 0
+        // modulo `stackAlignment` and no finer, so `sp + <const>` is only ever
+        // `stackAlignment`-aligned. lir_callconv therefore reserves
+        // `align - stackAlignment` bytes of HEADROOM above such a slot and this arm
+        // rounds the address up into it at every materialization. The rounding is a
+        // pure function of the (fixed, post-prologue) frame base, so every
+        // rematerialization of the same slot yields the SAME address — which is the
+        // invariant the c69 remat model rests on.
+        //
+        // ⚠ THE DISPLACEMENT IS FOLDED AFTER THE ROUNDING, NEVER INTO IT:
+        // `alignUp(x) + d` and `alignUp(x + d)` are different addresses, and folding
+        // `d` into the `lea` would compute the second one. It rides a materialized
+        // constant + a REG-REG `add` rather than an immediate operand, because the
+        // immediate `add` forms the two shipped ISAs declare do not cover the same
+        // set (AArch64's are bounded and unsigned; a negative `&a[-1]` displacement
+        // has no variant there) — a reg-reg add has no range or sign hazard at all.
+        if (std::uint32_t const rtAlign = runtimeAlignForSlot(slotIndex);
+            rtAlign != 0) {
+            LirReg const raw = lir.newVReg(LirRegClass::GPR);
+            emitInst(*op, raw, std::span<LirOperand const>{},
+                     /*payload=*/slotIndex);
+            std::optional<LirReg> const aligned =
+                emitAlignUpToPowerOfTwo(
+                    raw, rtAlign, "an over-aligned local's frame address");
+            if (!aligned.has_value() || byteDisp == 0) return aligned;
+            auto const addOp = opcode(MnemonicSlot::Add);
+            if (!addOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Add,
+                                    "over-aligned frame-slot displacement");
+                return std::nullopt;
+            }
+            std::optional<LirReg> const disp = emitBareConstToFresh(byteDisp);
+            if (!disp.has_value()) return std::nullopt;
+            LirReg const shifted = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 2> ops{LirOperand::makeReg(*aligned),
+                                          LirOperand::makeReg(*disp)};
+            emitInst(*addOp, shifted, ops, /*payload=*/0, /*flags=*/0);  // width 64
+            return shifted;
         }
         LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
         if (byteDisp == 0) {
@@ -5222,6 +5618,12 @@ struct Lowerer {
         emitInst(*allocaOp, reservation, std::span<LirOperand const>{},
                  /*payload=*/bytes);
         std::uint32_t const slotIndex = allocaLirCount_;
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: a compiler-internal home has no
+        // source-level `alignas`, so it records 0 (no override) — the SAME value the
+        // frozen-LIR harvest derives for it (`lirToMir` maps it to a non-Alloca MIR
+        // inst). One push per reservation keeps this vector index-parallel with the
+        // counter.
+        allocaSlotAlign_.push_back(0u);
         ++allocaLirCount_;
         return slotIndex;
     }
@@ -5373,10 +5775,30 @@ struct Lowerer {
     // Extends the LD-1/LD-2 memory-resident model to USER call boundaries. NO
     // register-allocation model is added: an F80/F128 value is still the GPR-held
     // ADDRESS of its 16-byte home; the physical arg/return registers (st0 for
-    // SysV x87; v0..v7 for AAPCS64 binary128, read from the cc's argVrs/returnVrs
-    // config) are transient scratch marshalled around the boundary. Dispatch is
-    // on TypeKind::F80 / TypeKind::F128 only (each forms solely on its own format
-    // axis) + config — never an arch/format identity branch.
+    // SysV x87; v0..v7 for AAPCS64 binary128, read from the cc's argFprs /
+    // returnFprs config) are transient scratch marshalled around the boundary.
+    // Dispatch is on TypeKind::F80 / TypeKind::F128 only (each forms solely on
+    // its own format axis) + config — never an arch/format identity branch.
+    //
+    // ★★★ THESE SITES USED TO READ `argVrs`/`returnVrs` AND TO NAME THE CLASS
+    // `LirRegClass::VR`, AND THE REPLACEMENT IS NOT A RENAME —
+    // [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]] (design A′, R1).
+    // Those were a SECOND cc pool declared over the SAME physical SIMD&FP file
+    // `argFprs` already named, so `v0` and `d0` were two independent rows related
+    // only by a cursor derived from their DWARF numbers. arm64 now declares that
+    // file ONCE — `v0..v31` are class `fpr` at sixteen bytes, and `q`/`d`/`s`/
+    // `h`/`b` are `subOf` VIEW rows of them, also `fpr` — so there is ONE FP arg
+    // pool, ONE FP return pool, and no `vr` class on the target at all.
+    //
+    // ⚠⚠ THE WIDTH IS NOW THE INSTRUCTION'S TO STATE, AND OMITTING IT IS A
+    // SILENT WRONG-WIDTH MOVE. With one class, `classOp(FPR, Load/Store)`
+    // resolves to `fldur`/`fstur`, whose width-DEFAULT is 64. The deleted
+    // `fldur_q`/`fstur_q` opcodes are now the width-128 VARIANTS of those same
+    // rows, carrying the same bytes, elected by the LIR instruction's width
+    // flag. So every marshal of a 16-byte binary128 home below passes
+    // `kLirInstFlagWidth128` explicitly; without it eight of the sixteen bytes
+    // would move and nothing in the pipeline would object — which is precisely
+    // the operand-vs-instruction disagreement declaring the file once removes.
 
     // A SysV x87 80-bit `long double` PARAMETER (received on the incoming stack —
     // MEMORY class). Its MIR `Arg` carries the incoming-overflow BYTE OFFSET as
@@ -5399,33 +5821,42 @@ struct Lowerer {
     }
 
     // An AAPCS64 IEEE binary128 `long double` PARAMETER (or a binary128 HFA
-    // piece) arrives in a physical arg V-register v0..v7 — its MIR `Arg` argIndex
-    // is the NSRN ordinal (shared with argFprs, so an F64 and an F128 sharing a
-    // signature never collide). SPILL it to a fresh 16-byte memory home at entry
-    // (fstur_q [home] <- v{k}) — the memory-resident F128 model (the value IS its
-    // home address, recorded in allocaSlotIndex_ so consumers rematerialize it).
-    // SAFE BY POSITION: nothing is live before entry, so reading the physical
-    // v-reg as the store source cannot be clobbered (the LD-2 transient-scratch
-    // precedent, entry side). NSRN past the pool (>8 F128 params, spilled to the
-    // incoming stack) carries no byte-offset here (the AAPCS64 param loop keeps
-    // the ordinal, not a byte offset) — fail loud rather than misread it.
+    // piece) arrives in a physical arg register v0..v7 — its MIR `Arg` argIndex
+    // is the NSRN ordinal, which now indexes the SINGLE FP arg pool `argFprs`,
+    // so an F64 and an F128 sharing a signature never collide because they draw
+    // from ONE list rather than from two lists a cursor kept in step. SPILL it
+    // to a fresh 16-byte memory home at entry (`fstur` at width 128, i.e.
+    // `STUR Qt, [home]`) — the memory-resident F128 model (the value IS its home
+    // address, recorded in allocaSlotIndex_ so consumers rematerialize it).
+    // NSRN past the pool (>8 F128 params, spilled to the incoming stack) carries
+    // no byte-offset here (the AAPCS64 param loop keeps the ordinal, not a byte
+    // offset) — fail loud rather than misread it.
+    //
+    // ★ WHY THE PHYSICAL READ IS SAFE, RESTATED FOR ONE ALLOCATABLE CLASS. The
+    // old argument was "the v-reg is invisible to regalloc because VR is
+    // non-allocatable"; with the SIMD&FP file declared once that is FALSE — the
+    // fpr class IS allocatable, and this ordinal is now one the allocator SEES.
+    // What makes it safe is POSITION, which was always the load-bearing half:
+    // this store sits at FUNCTION ENTRY, before any of the function's own values
+    // exist, so nothing of the function's can be live in v{k} to be clobbered,
+    // and the incoming-argument value is consumed here and never read again.
     void lowerF128Arg(MirInstId id) {
         auto const* cc = target.callingConvention(0);
         std::uint32_t const ord = mir.argIndex(id);
-        if (cc == nullptr || ord >= cc->argVrs.size()) {
+        if (cc == nullptr || ord >= cc->argFprs.size()) {
             reportUnsupported(MirOpcode::Arg, id);
             poisonValue(id);
             return;
         }
-        auto const vrOrd = target.registerByName(cc->argVrs[ord]);
-        if (!vrOrd.has_value()) {
+        auto const fprOrd = target.registerByName(cc->argFprs[ord]);
+        if (!fprOrd.has_value()) {
             reportUnsupported(MirOpcode::Arg, id);
             poisonValue(id);
             return;
         }
-        auto const storeOp = classOp(LirRegClass::VR, RegClassOp::Store);
+        auto const storeOp = classOp(LirRegClass::FPR, RegClassOp::Store);
         if (!storeOp.has_value()) {
-            reportMissingClassOp(LirRegClass::VR, RegClassOp::Store, "MIR F128 Arg");
+            reportMissingClassOp(LirRegClass::FPR, RegClassOp::Store, "MIR F128 Arg");
             poisonValue(id);
             return;
         }
@@ -5434,32 +5865,46 @@ struct Lowerer {
         if (!slotIndex.has_value()) { poisonValue(id); return; }
         std::optional<LirReg> const homeAddr = emitLeaFrameSlot(*slotIndex);
         if (!homeAddr.has_value()) { poisonValue(id); return; }
-        LirReg const argPhys = makePhysicalReg(*vrOrd, LirRegClass::VR);
-        // fstur_q [home] <- v{k} — the shipped vr-class store shape
+        LirReg const argPhys = makePhysicalReg(*fprOrd, LirRegClass::FPR);
+        // `fstur` [home] <- v{k} AT WIDTH 128 — the fpr class's own store shape
         // ([value, base, MemBase, MemOffset]), mirroring the LD-2 softcall result
-        // store exactly.
+        // store exactly. The width flag is what elects the Q-form variant that
+        // the deleted `fstur_q` opcode used to be; at the width-default (64) this
+        // would store 8 of the datum's 16 bytes with no diagnostic.
         std::array<LirOperand, 4> stOps{
             LirOperand::makeReg(argPhys),
             LirOperand::makeReg(*homeAddr),
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        emitInst(*storeOp, InvalidLirReg, stOps);
+        emitInst(*storeOp, InvalidLirReg, stOps, /*payload=*/0,
+                 kLirInstFlagWidth128);
         allocaSlotIndex_.emplace(id.v, *slotIndex);
     }
 
     // ── D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): IEEE binary128 softcall ──
     //
     // THE REPRESENTATION mirrors LD-1's F80: an F128 SSA value is the GPR-held
-    // ADDRESS of its 16-byte memory home (a 128-bit VR register is invisible to
-    // the flat linear-scan allocator, so F128 never lives in a register as a
-    // VALUE). Where LD-1 realizes arithmetic as an inline x87 sequence, LD-2
+    // ADDRESS of its 16-byte memory home, so F128 never lives in a register as a
+    // VALUE.
+    //
+    // ⚠ THE MODEL IS UNCHANGED BUT ITS REASON IS NOT, AND THE OLD REASON WAS
+    // LEFT HERE LONG ENOUGH TO BE WORTH NAMING. This used to read "a 128-bit VR
+    // register is invisible to the flat linear-scan allocator". With the SIMD&FP
+    // file declared once — [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]
+    // — that sentence is false: `v0..v31` are ordinary allocatable `fpr` rows at
+    // sixteen bytes and the cc lists them in callerSaved/calleeSaved. Staying
+    // memory-resident is now a REPRESENTATION CHOICE at this tier (MIR carries
+    // no 128-bit float VALUE, only its home address), not a consequence of the
+    // allocator being unable to see the register.
+    //
+    // Where LD-1 realizes arithmetic as an inline x87 sequence, LD-2
     // realizes it as a CALL to a config'd softfloat helper (`__addtf3` …): the
     // operands are marshalled into the config'd physical arg registers (v0/v1 —
     // transient scratch, the x87 st0/st1 precedent), `BL <helper>`, and the
     // config'd result register is captured to a fresh home. The `BL` (a `Call`
     // opcode, isCall=true) clobbers the caller-saved v0-v7/x0-x18, so regalloc
-    // spills any live d-reg/gpr around it — zero register-allocator changes for
+    // spills any live fpr/gpr around it — zero register-allocator changes for
     // VALUES (the F128 value stays memory-resident).
 
     // Realize an F128 op as a softfloat-helper CALL. The GENERIC verb — it
@@ -5511,8 +5956,20 @@ struct Lowerer {
             if (interner.kind(mir.instType(operands[i])) == TypeKind::F128) {
                 // Memory-resident: `src` is the 16-byte home ADDRESS — LOAD it
                 // into the physical arg register with the class's load op
-                // (fldur_q), the same [base, MemBase, MemOffset] shape lowerLoad
-                // uses.
+                // (`fldur` AT WIDTH 128, i.e. `LDUR Qt`), the same
+                // [base, MemBase, MemOffset] shape lowerLoad uses.
+                //
+                // ⚠⚠ THE WIDTH FLAG IS LOAD-BEARING HERE AND THIS SITE DID NOT
+                // USED TO CARRY ONE. `argCls` is read off the register table, so
+                // when `v0` was declared class `vr` this resolved to the
+                // 128-bit-only `fldur_q` and the width was implicit in the
+                // OPCODE. With the SIMD&FP file declared once
+                // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]])
+                // `v0` is class `fpr`, this resolves to `fldur`, and `fldur`'s
+                // width-DEFAULT is 64 — so leaving the flags at 0 would load 8
+                // of the binary128's 16 bytes into the helper's argument
+                // register at rc=0 with no diagnostic. The branch is gated on
+                // TypeKind::F128, so the datum is always the 16-byte home.
                 auto const loadOp = classOp(argCls, RegClassOp::Load);
                 if (!loadOp.has_value()) {
                     reportMissingClassOp(argCls, RegClassOp::Load,
@@ -5525,7 +5982,8 @@ struct Lowerer {
                     LirOperand::makeMemBase(1),
                     LirOperand::makeMemOffset(0),
                 };
-                emitInst(*loadOp, argPhys, ldOps);
+                emitInst(*loadOp, argPhys, ldOps, /*payload=*/0,
+                         kLirInstFlagWidth128);
             } else {
                 // Register-resident (an F64/F32 source of `from_f64`): MOVE the
                 // vreg into the physical arg register with the class's move op
@@ -5576,7 +6034,12 @@ struct Lowerer {
             // reserved above; the value IS its home address (recorded in
             // allocaSlotIndex_ so consumers rematerialize it), exactly like
             // lowerF80Arith. The store shape [value, base, MemBase, MemOffset]
-            // mirrors the shipped fstur_q row + the generic FPR store.
+            // is the fpr class's own store (`fstur`) AT WIDTH 128 — the Q form
+            // the deleted `fstur_q` opcode used to be, now a width variant of
+            // the same row carrying the same bytes. Same reasoning as the
+            // operand marshal above: `resCls` comes off the register table, so
+            // this became a width-64 `fstur` the moment `v0` was redeclared
+            // `fpr`, and only the flag keeps all sixteen bytes moving.
             auto const storeOp = classOp(resCls, RegClassOp::Store);
             if (!storeOp.has_value()) {
                 reportMissingClassOp(resCls, RegClassOp::Store,
@@ -5590,7 +6053,8 @@ struct Lowerer {
                 LirOperand::makeMemBase(1),
                 LirOperand::makeMemOffset(0),
             };
-            emitInst(*storeOp, InvalidLirReg, stOps);
+            emitInst(*storeOp, InvalidLirReg, stOps, /*payload=*/0,
+                     kLirInstFlagWidth128);
             allocaSlotIndex_.emplace(id.v, *resultSlotIndex);
         } else {
             // Non-F128 result (the `to_i32` int32): MOVE the physical result
@@ -5738,6 +6202,32 @@ struct Lowerer {
     // op — operand[0] = the establisher-frame base register, payload = the slot
     // index. lir_callconv materializes it into `lea result, [establisherReg +
     // parentLocalAreaOffset(slotIndex)]` (the parent's config-driven FrameLayout).
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: the EFFECTIVE
+    // alignment of the parent function's alloca at 0-based scan index `index`.
+    //
+    // The walk is deliberately the SAME one three other places already run — the
+    // funclet's `payload` is minted by `synth_seh_funclets.cpp::parentAllocaSlotIds`
+    // over blocks-then-instructions, `lir_callconv`'s `functionLocalAllocaPayloads`
+    // resolves the offset over the same order, and this reads the alignment off it.
+    // An index the parent cannot answer returns nullopt, and the caller refuses
+    // rather than guessing an alignment for a slot it cannot identify.
+    [[nodiscard]] std::optional<std::uint32_t>
+    parentAllocaAlign(MirFuncId parent, std::uint32_t index) const {
+        std::uint32_t seen = 0;
+        std::uint32_t const nb = mir.funcBlockCount(parent);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(parent, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                MirInstId const inst = mir.blockInstAt(b, ii);
+                if (mir.instOpcode(inst) != MirOpcode::Alloca) continue;
+                if (seen == index) return mir.instPayload2(inst);
+                ++seen;
+            }
+        }
+        return std::nullopt;
+    }
+
     void lowerRecoverParentFrameSlot(MirInstId id) {
         auto const op = opcode(MnemonicSlot::RecoverParentFrameSlot);
         if (!op.has_value()) {
@@ -5756,7 +6246,58 @@ struct Lowerer {
         if (!base.has_value()) { poisonValue(id); return; }
         LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
         std::array<LirOperand, 1> ops{LirOperand::makeReg(*base)};
-        emitInst(*op, result, ops, /*payload=*/mir.instPayload(id));
+        std::uint32_t const slot = mir.instPayload(id);
+        emitInst(*op, result, ops, /*payload=*/slot);
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the recovered address is the
+        // parent's RAW slot address off the establisher frame. If the parent's local
+        // is over-aligned the parent itself does not use that address either — it
+        // rounds it up — so the funclet must round identically or the two disagree
+        // about where the local is. The establisher frame IS the parent's
+        // post-prologue stack pointer, so it carries exactly the congruence the
+        // rounding's bound rests on, and the SAME primitive applies to it.
+        //
+        // ⚠ AND AN UNRESOLVABLE PARENT IS A REFUSAL, NOT A SHRUG. This construct was
+        // refused outright until this row closed, so "the alignment is probably 0"
+        // has no history behind it: guessing here would newly permit a funclet and
+        // its parent to address one local two different ways.
+        if (!currentFuncletParent_.has_value()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "mir_to_lir: RecoverParentFrameSlot (MIR inst {}) appears in a "
+                "function with no resolvable SEH parent, so the parent local's "
+                "alignment cannot be read and the recovered address cannot be "
+                "proven to match the parent's own "
+                "(D-WIN64-SEH-FUNCLETS x D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL)",
+                id.v);
+            reporter.report(std::move(d));
+            poisonValue(id);
+            return;
+        }
+        std::optional<std::uint32_t> const parentAlign =
+            parentAllocaAlign(*currentFuncletParent_, slot);
+        if (!parentAlign.has_value()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "mir_to_lir: RecoverParentFrameSlot (MIR inst {}) references parent "
+                "local-alloca index {}, which the parent function does not have "
+                "(D-WIN64-SEH-FUNCLETS)",
+                id.v, slot);
+            reporter.report(std::move(d));
+            poisonValue(id);
+            return;
+        }
+        if (*parentAlign > ccStackAlignment()) {
+            std::optional<LirReg> const rounded = emitAlignUpToPowerOfTwo(
+                result, *parentAlign,
+                "an over-aligned parent local recovered by a SEH funclet");
+            if (!rounded.has_value()) { poisonValue(id); return; }
+            defineValue(id, *rounded);
+            return;
+        }
         defineValue(id, result);
     }
 
@@ -6029,8 +6570,10 @@ struct Lowerer {
             // U32 (ZExt), and 64-bit (no-op) arms fire — an enum index promotes to
             // its underlying int (I32 → SExt), it does NOT reach `default`. The
             // narrow Char/I8/I16/U8/U16 arms are DEFENSIVE: they mirror the SExt /
-            // ZExt source-width gates (the SExt arm takes Char/I8/I16/I32, the
-            // ZExt arm U8/U16/U32) so the widen stays correct-by-construction —
+            // ZExt source-width gates (the SExt arm takes I8/I16/I32, the ZExt arm
+            // U8/U16/U32, and BOTH accept Char — the target's `charIsUnsigned`
+            // declaration picks its side; see the Char arm below) so the widen
+            // stays correct-by-construction —
             // and always one those gates accept — IF a future non-promoted narrow
             // index ever reaches here; `default` is a fail-safe for a non-integer
             // kind (which a Gep index should never be) → no widen, status quo. The
@@ -6049,15 +6592,39 @@ struct Lowerer {
                 case TypeKind::U8: case TypeKind::U16: case TypeKind::U32:
                     widenSlot = MnemonicSlot::ZExt;  // unsigned → zero-extend
                     break;
-                case TypeKind::Char: case TypeKind::I8:
+                case TypeKind::Char:
+                    // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50,
+                    // CLOSED): bare `Char`'s signedness is the TARGET's declared
+                    // `charIsUnsigned` fact (threaded in as `charIsUnsigned_` —
+                    // see its member docblock), never a hard-coded bucket: an
+                    // unsigned-char target (arm64/elf) widens ZExt, a
+                    // signed-char one (x86_64 everywhere; arm64/macho|pe) SExt.
+                    // Still DEFENSIVE — the shipped C frontend integer-promotes
+                    // a subscript before Gep lowering (cst_to_hir combineIndex),
+                    // and no other shipped .lang.json maps a type onto `Char`
+                    // (measured P50) — but a HirBuilder frontend without an
+                    // `arithmeticConversions` block reaches here by
+                    // construction. With NOTHING threaded, fail LOUD: either
+                    // extension picked blind is a silent wrong address on half
+                    // the targets — the exact defect class this row was opened
+                    // for.
+                    if (!charIsUnsigned_.has_value()) {
+                        dss::report(reporter,
+                            DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                            DiagnosticSeverity::Error,
+                            "MIR Gep (runtime index widen): the index is a bare "
+                            "`Char`, whose signedness is target-declared "
+                            "(`charIsUnsigned`), but no resolved value was "
+                            "threaded into this lowering — SExt vs ZExt cannot "
+                            "be chosen "
+                            "(D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES)");
+                        return;
+                    }
+                    widenSlot = *charIsUnsigned_ ? MnemonicSlot::ZExt
+                                                 : MnemonicSlot::SExt;
+                    break;
+                case TypeKind::I8:
                 case TypeKind::I16:  case TypeKind::I32:
-                    // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES: `Char` is
-                    // bucketed SExt here TARGET-BLIND (right for signed-char
-                    // targets, but arm64's unsigned char would want ZExt). DEAD
-                    // today — C's mandatory integer promotion widens a char index
-                    // to `int` before Gep lowering (cst_to_hir combineIndex), so a
-                    // raw narrow `Char` never reaches this arm; latent only for a
-                    // future non-promoting (non-C) frontend over this substrate.
                     widenSlot = MnemonicSlot::SExt;  // signed sub-64 → sign-extend
                     break;
                 default:
@@ -6105,12 +6672,18 @@ struct Lowerer {
     }
 
     // Bitcast lowering — closes the cycle-3c-anchored hazard 3 review
-    // agents flagged. If src + dst share a register class (GPR↔GPR or
-    // FPR↔FPR), emit a plain `mov` (bit-pattern-preserving). If they
-    // differ, emit `movq_xclass` (cycle-3d cross-class move that AS1
-    // maps to x86_64 `movq xmm,rax` or `movq rax,xmm`). A regression
-    // omitting the cross-class case would silently mis-lower float
-    // reinterpretation.
+    // agents flagged. A bit-pattern-preserving copy from the SOURCE value's
+    // register class into the RESULT's.
+    //
+    // ★★★ ONE LOOKUP, NO CLASS COMPARISON (D-TARGET-NO-CROSS-CLASS-MOVE-VERB).
+    // This function used to fork: same class → the per-class move table,
+    // different classes → a dedicated `MnemonicSlot::MovqXClass`. Its own
+    // comment said the same-class arm "WAS the class-dispatch pattern the
+    // table generalizes" — and the cross-class arm was the half that never
+    // got the table. `registerClassOps` is now keyed by the class PAIR, so
+    // the diagonal and the off-diagonal are the same question with different
+    // arguments, and the fork is gone along with the placeholder slot it
+    // needed. A target that declares no move for the pair is refused by name.
     void lowerBitcast(MirInstId id) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 1) {
@@ -6121,31 +6694,22 @@ struct Lowerer {
         if (!src.has_value()) return;
         LirRegClass const srcCls = src->regClass();
         LirRegClass const dstCls = regClassFor(id);
-        // FC2 Part B: the same-class arm now routes through the
-        // per-register-class move table (this function WAS the
-        // class-dispatch pattern the table generalizes) — an FPR↔FPR
-        // bitcast copies via the class's move (x86_64 movaps), never
-        // the GPR mov. Cross-class keeps the dedicated movq_xclass.
-        std::optional<std::uint16_t> copyOp;
-        if (srcCls == dstCls) {
-            copyOp = classOp(dstCls, RegClassOp::Move);
-            if (!copyOp.has_value()) {
-                reportMissingClassOp(dstCls, RegClassOp::Move,
-                                     "MIR Bitcast (same-class)");
-                poisonValue(id);
-                return;
-            }
-        } else {
-            if (!opcode(MnemonicSlot::MovqXClass).has_value()) {
-                reportMissingOpcode(MnemonicSlot::MovqXClass,
-                                    "MIR Bitcast (cross-class)");
-                return;
-            }
-            copyOp = opcode(MnemonicSlot::MovqXClass);
+        auto const copyOp = classOp(srcCls, dstCls, RegClassOp::Move);
+        if (!copyOp.has_value()) {
+            reportMissingClassOp(srcCls, dstCls, RegClassOp::Move,
+                                 "MIR Bitcast");
+            poisonValue(id);
+            return;
         }
         LirReg const result = lir.newVReg(dstCls);
         std::array<LirOperand, 1> ops{LirOperand::makeReg(*src)};
-        emitInst(*copyOp, result, ops);
+        // The cross-FILE move is width-KEYED on arm64 (FMOV Xd,Dn at 64,
+        // FMOV Wd,Sn at 32) and on x86_64 (MOVQ at 64, MOVD at 32), so the
+        // value's own plumbing width decides the variant. The diagonal moves
+        // both shipped targets declare carry no width guard, so this is a
+        // no-op there — one call, correct on both.
+        emitInst(*copyOp, result, ops, /*payload=*/0,
+                 registerOpWidthFlags(mir.instType(id)));
         defineValue(id, result);
     }
 
@@ -6249,7 +6813,11 @@ struct Lowerer {
         // scalar read of a 16-byte value (a silent wrong-width miscompile; and
         // the value cannot live in a scalar float register at all). Keep the lea
         // so the memory-resident load path (lowerF80Load) reads a GPR base
-        // register for its fldur_q / fld_m80.
+        // register for its width-128 `fldur` / its `fld_m80`. (That first
+        // mnemonic used to be spelled `fldur_q`, a separate opcode over a
+        // separately-declared register file; it is now the Q-form WIDTH VARIANT
+        // of `fldur` — [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]
+        // — which is exactly why the width-default probe below must not match.)
         if (interner.kind(mir.instType(user)) == TypeKind::F80
             || interner.kind(mir.instType(user)) == TypeKind::F128) return false;
         auto const userOps = mir.instOperands(user);
@@ -7032,9 +7600,16 @@ struct Lowerer {
             if (!isVoid) poisonValue(id);
         };
         // Pre-scan the args: an F128 arg MIXED with a non-F128 FPR (F32/F64) arg
-        // is unsupported — the NSRN interleaving between hand-placed v-registers
-        // and lir_callconv-placed d-registers is not modeled. Fail loud (never a
-        // silent register skew; the witness signatures are all-F128 or F128+GPR).
+        // is unsupported — the NSRN interleaving is not modeled across the TWO
+        // PLACERS. The F128 args are hand-placed by the burst below; the F32/F64
+        // args are placed by lir_callconv from its own separate walk, and the two
+        // cursors never meet. ⚠ This used to be phrased as "hand-placed
+        // v-registers and lir_callconv-placed d-registers", i.e. two register
+        // FILES; with the SIMD&FP file declared once
+        // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]) they draw
+        // from ONE pool at two widths, which removes the file confusion but not
+        // the two-placer skew. Fail loud (never a silent register skew; the
+        // witness signatures are all-F128 or F128+GPR).
         bool sawF128Arg = false, sawNonF128Fpr = false;
         for (std::size_t i = 1; i < operands.size(); ++i) {
             TypeKind const ak = interner.kind(mir.instType(operands[i]));
@@ -7052,8 +7627,15 @@ struct Lowerer {
         // Reserve the long-double RESULT home BEFORE marshalling/the call (the
         // LD-2 softcall order): the home-address vreg is a GPR live across the
         // call — regalloc parks it callee-saved — ready for the result capture
-        // IMMEDIATELY after the call (fstp_m80/fstur_q adjacency; st0/v0 survive
-        // the call, invisible/non-allocatable).
+        // IMMEDIATELY after the call. ADJACENCY IS THE WHOLE ARGUMENT: the
+        // capture (`fstp_m80` on x87, a width-128 `fstur` on AAPCS64) is emitted
+        // as the instruction right after the call, so nothing of this function's
+        // own can be live in st0/v0 between the two. ⚠ This used to add "st0/v0
+        // survive the call, invisible/non-allocatable"; with the SIMD&FP file
+        // declared once
+        // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]) v0 is an
+        // ordinary allocatable `fpr` row, so non-allocatability is no longer
+        // available as a reason and was never the load-bearing one.
         std::optional<std::uint32_t> resultSlotIndex;
         std::optional<LirReg>        resultHomeAddr;
         if (resultIsF80 || resultIsF128) {
@@ -7069,8 +7651,10 @@ struct Lowerer {
         // reg FIRST (the hoist discipline). Direct: [SymbolRef(sym), args...];
         // indirect: [callee_reg, args...]. A by-value-stack aggregate carrier
         // (an F80/SysV arg, or a stacked struct) expands to (addrReg,
-        // ByValueStackAgg). An F128 arg is collected for the v-register burst,
-        // NOT operand-listed; `nsrnCursors` tracks its shared FPR/VR ordinal.
+        // ByValueStackAgg). An F128 arg is collected for the FP-register burst,
+        // NOT operand-listed; `nsrnCursors` tracks its NSRN ordinal in the one FP
+        // arg pool (this used to say "shared FPR/VR ordinal", back when the same
+        // physical register was two rows in two pools kept in step by a cursor).
         std::vector<LirOperand> ops;
         ops.reserve(operands.size() + 2);
         if (calleeIsGlobalAddr) {
@@ -7080,16 +7664,23 @@ struct Lowerer {
             if (!callee.has_value()) return;
             ops.push_back(LirOperand::makeReg(*callee));
         }
-        std::vector<std::pair<LirReg, std::uint16_t>> f128Marshals;  // (home, vrOrd)
+        std::vector<std::pair<LirReg, std::uint16_t>> f128Marshals;  // (home, fprOrd)
         // ★★★ THE SIXTH COPY OF THE ARG CURSOR, NOW THE SAME OBJECT AS THE
         // OTHER FIVE (D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR).
-        // This was a private `std::uint32_t nsrn` indexing `cc->argVrs`, with a
-        // hand-written `++nsrn` on the F32/F64 arm carrying the AAPCS64 fact
-        // that the d-views and the v-views share ONE counter. That fact is now
-        // DERIVED from the target's `dwarfNumber`s, so the sharing cannot be
-        // half-remembered here and spelled differently three files away.
+        // This was a private `std::uint32_t nsrn` indexing a second FP arg pool,
+        // with a hand-written `++nsrn` on the F32/F64 arm carrying the AAPCS64
+        // fact that the 64-bit views and the 128-bit views share ONE counter.
+        // ★ THAT FACT NO LONGER NEEDS DERIVING AT ALL —
+        // [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]. When the
+        // SIMD&FP file was declared twice, the shared counter was inferred from
+        // the two pools' `dwarfNumber`s; the file is now declared ONCE, `argFprs`
+        // is the only FP arg pool, and both arms below advance the SAME cursor
+        // because there is only one to advance. `kArgPoolRows` accordingly has no
+        // `VR` row, so asking this object for a VR slot would now yield nullopt
+        // and refuse a perfectly good AAPCS64 call — the class named here must be
+        // FPR.
         // ⚠ A GPR argument also advances its own (independent) cursor through
-        // this object; only the vector slot is read, so that costs nothing and
+        // this object; only the FP slot is read, so that costs nothing and
         // keeps the walk identical to the one every other site performs.
         // ⚠ The cc must exist before the cursors can: the old code deferred that
         // check to the first F128 argument, so a target with no calling
@@ -7105,21 +7696,21 @@ struct Lowerer {
             MirInstId const operandMir = operands[i];
             TypeKind const ak = interner.kind(mir.instType(operandMir));
             if (ak == TypeKind::F128) {
-                auto const slot = nsrnCursors.next(LirRegClass::VR);
-                if (!slot.has_value() || slot->index >= cc->argVrs.size()) {
+                auto const slot = nsrnCursors.next(LirRegClass::FPR);
+                if (!slot.has_value() || slot->index >= cc->argFprs.size()) {
                     reportUnsupported(MirOpcode::Call, id);
                     poisonIfValueResult();
                     return;
                 }
-                auto const vrOrd = target.registerByName(cc->argVrs[slot->index]);
-                if (!vrOrd.has_value()) {
+                auto const fprOrd = target.registerByName(cc->argFprs[slot->index]);
+                if (!fprOrd.has_value()) {
                     reportUnsupported(MirOpcode::Call, id);
                     poisonIfValueResult();
                     return;
                 }
                 std::optional<LirReg> const home = regForValue(operandMir);
                 if (!home.has_value()) return;
-                f128Marshals.emplace_back(*home, *vrOrd);
+                f128Marshals.emplace_back(*home, *fprOrd);
                 continue;
             }
             std::optional<LirReg> const r = regForValue(operandMir);
@@ -7156,36 +7747,50 @@ struct Lowerer {
                     static_cast<std::uint8_t>(
                         (bvPayload >> kByValueStackArgExhaustShift) & 0x3u)));
             } else if (ak == TypeKind::F32 || ak == TypeKind::F64) {
-                // A non-F128 FPR arg consumes an NSRN slot too — and on a target
-                // whose d-views and v-views are one register file, advancing the
-                // FPR cursor advances the vector one, because they ARE one
-                // cursor. Nothing here asserts that; the register table does.
+                // A non-F128 FPR arg consumes an NSRN slot too — the SAME cursor
+                // the F128 arm above takes from, because with the SIMD&FP file
+                // declared once there is one FP arg pool and one FP cursor. This
+                // used to be phrased as the FPR cursor advancing "the vector one"
+                // via a sharing relation derived from the register table; the
+                // relation is gone because the second pool is gone —
+                // [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]].
                 (void)nsrnCursors.next(LirRegClass::FPR);
             }
         }
 
-        // Marshal each F128 arg into its physical v-register in a TIGHT burst
-        // immediately before the call (all home addresses already resolved) —
-        // preserving the LD-2 marshal→call adjacency so the BL's caller-saved
-        // clobber of the aliased d-regs protects a live double.
-        std::optional<std::uint16_t> vrLoadOp;
+        // Marshal each F128 arg into its physical arg register in a TIGHT burst
+        // immediately before the call (all home addresses already resolved).
+        // ADJACENCY IS THE ARGUMENT: these physical writes sit between the last
+        // operand resolution and the `BL`, so no value of this function's own is
+        // live across them, and the `BL`'s caller-saved clobber covers the same
+        // registers afterwards. ⚠ The old note reasoned about "the BL's
+        // caller-saved clobber of the ALIASED d-regs"; with the SIMD&FP file
+        // declared once there are no aliased d-rows to protect — v0..v7 are
+        // themselves the caller-saved rows the cc lists
+        // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]), and the
+        // allocator now SEES this ordinal instead of it being invisible in a
+        // second class.
+        std::optional<std::uint16_t> fprLoadOp;
         if (!f128Marshals.empty()) {
-            vrLoadOp = classOp(LirRegClass::VR, RegClassOp::Load);
-            if (!vrLoadOp.has_value()) {
-                reportMissingClassOp(LirRegClass::VR, RegClassOp::Load,
+            fprLoadOp = classOp(LirRegClass::FPR, RegClassOp::Load);
+            if (!fprLoadOp.has_value()) {
+                reportMissingClassOp(LirRegClass::FPR, RegClassOp::Load,
                                      "MIR F128 call arg marshal");
                 poisonIfValueResult();
                 return;
             }
         }
-        for (auto const& [home, vrOrd] : f128Marshals) {
-            LirReg const argPhys = makePhysicalReg(vrOrd, LirRegClass::VR);
+        for (auto const& [home, fprOrd] : f128Marshals) {
+            LirReg const argPhys = makePhysicalReg(fprOrd, LirRegClass::FPR);
             std::array<LirOperand, 3> ldOps{
                 LirOperand::makeReg(home),
                 LirOperand::makeMemBase(1),
                 LirOperand::makeMemOffset(0),
             };
-            emitInst(*vrLoadOp, argPhys, ldOps);
+            // WIDTH 128 — `fldur` at its 64-bit default would load half the
+            // binary128 into the callee's argument register with no diagnostic.
+            emitInst(*fprLoadOp, argPhys, ldOps, /*payload=*/0,
+                     kLirInstFlagWidth128);
         }
 
         // D-LANG-VARIADIC (step 13.4): forward the MIR Call's variadic-payload
@@ -7207,37 +7812,48 @@ struct Lowerer {
             return;
         }
         if (resultIsF128) {
-            // AAPCS64: the binary128 return is in v0 (returnVrs[0]). Emit the call
-            // (no result reg), then fstur_q [home] <- v0 into the home reserved
-            // above; the value IS its home address (allocaSlotIndex_ → consumers
-            // rematerialize it). UN-WALLS the former F128 Call-result gate.
-            if (cc == nullptr || cc->returnVrs.empty()) {
+            // AAPCS64: the binary128 return is in v0 — now `returnFprs[0]`, the
+            // ONE FP return pool, where it used to be `returnVrs[0]` of a second
+            // pool over the same physical file
+            // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]). Emit
+            // the call (no result reg), then a width-128 `fstur` [home] <- v0
+            // into the home reserved above; the value IS its home address
+            // (allocaSlotIndex_ → consumers rematerialize it). UN-WALLS the
+            // former F128 Call-result gate.
+            //
+            // ★ THE PHYSICAL READ IS SAFE BY POSITION, NOT BY INVISIBILITY: the
+            // store is emitted as the instruction IMMEDIATELY after the call, so
+            // nothing of this function's own can be live in v0 between the two.
+            if (cc == nullptr || cc->returnFprs.empty()) {
                 reportUnsupported(MirOpcode::Call, id);
                 poisonValue(id);
                 return;
             }
-            auto const vrOrd = target.registerByName(cc->returnVrs[0]);
-            auto const storeOp = classOp(LirRegClass::VR, RegClassOp::Store);
+            auto const fprOrd = target.registerByName(cc->returnFprs[0]);
+            auto const storeOp = classOp(LirRegClass::FPR, RegClassOp::Store);
             if (!storeOp.has_value()) {
-                reportMissingClassOp(LirRegClass::VR, RegClassOp::Store,
+                reportMissingClassOp(LirRegClass::FPR, RegClassOp::Store,
                                      "MIR F128 call result");
                 poisonValue(id);
                 return;
             }
-            if (!vrOrd.has_value()) {
+            if (!fprOrd.has_value()) {
                 reportUnsupported(MirOpcode::Call, id);
                 poisonValue(id);
                 return;
             }
             emitInst(*opcode(callSlot), InvalidLirReg, ops, payload);
-            LirReg const resPhys = makePhysicalReg(*vrOrd, LirRegClass::VR);
+            LirReg const resPhys = makePhysicalReg(*fprOrd, LirRegClass::FPR);
             std::array<LirOperand, 4> stOps{
                 LirOperand::makeReg(resPhys),
                 LirOperand::makeReg(*resultHomeAddr),
                 LirOperand::makeMemBase(1),
                 LirOperand::makeMemOffset(0),
             };
-            emitInst(*storeOp, InvalidLirReg, stOps);
+            // WIDTH 128 — the Q form the deleted `fstur_q` opcode used to be;
+            // `fstur`'s width-default is 64 and would store half the result.
+            emitInst(*storeOp, InvalidLirReg, stOps, /*payload=*/0,
+                     kLirInstFlagWidth128);
             allocaSlotIndex_.emplace(id.v, *resultSlotIndex);
             return;
         }
@@ -10059,10 +10675,12 @@ struct Lowerer {
         // register (cycle-broken) before the ret. Carry every operand as a reg.
         std::vector<LirOperand> ops;
         ops.reserve(operands.size());
-        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a LOCAL per-class VR return
-        // ordinal for a multi-piece binary128-HFA return (each F128 piece → the
-        // next returnVrs register). Mirrors the caller-side fprRet counter.
-        std::uint32_t vrRet = 0;
+        // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a LOCAL return ordinal for
+        // a multi-piece binary128-HFA return (each F128 piece → the next
+        // `returnFprs` register). Mirrors the caller-side fprRet counter. This
+        // used to index a separate `returnVrs` pool declared over the same
+        // physical file — [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]].
+        std::uint32_t fprRet = 0;
         for (MirInstId const operand : operands) {
             TypeKind const opk = interner.kind(mir.instType(operand));
             // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a `long double` RETURN
@@ -10083,35 +10701,55 @@ struct Lowerer {
                 continue;
             }
             if (opk == TypeKind::F128) {
-                // AAPCS64: fldur_q v{returnVrs[k]} <- [home]. The physical
-                // VR write survives to the assembler (no LIR DCE; VR is
-                // non-allocatable) → v0 holds the return at `ret`.
+                // AAPCS64: `fldur` AT WIDTH 128 — `LDUR Q{returnFprs[k]}, [home]`
+                // — so v0 holds the return at `ret`.
+                //
+                // ★★ WHY THIS PHYSICAL WRITE IS SAFE, AND WHY THE OLD REASON NO
+                // LONGER APPLIES. This comment used to read "the physical VR
+                // write survives to the assembler (no LIR DCE; VR is
+                // non-allocatable)". Half of that is now FALSE: with the SIMD&FP
+                // file declared once
+                // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]) the
+                // `fpr` class IS allocatable and v0..v31 are the rows the cc
+                // lists in callerSaved/calleeSaved. What actually holds the
+                // property is POSITION: this load is emitted at the tail of the
+                // return lowering, so it sits immediately before the `ret` (the
+                // epilogue lir_callconv inserts is GPR-only and `ops` stays empty
+                // for a pure long-double return, so the return-capture loop is a
+                // no-op). Nothing of this function's own is live across it, and
+                // there is no later instruction that could redefine v0. ★ The
+                // trade is in our favour: the allocator now SEES this physical
+                // ordinal, where before it was invisible because it lived in a
+                // second register class the free lists never carried.
                 auto const* cc = target.callingConvention(0);
-                if (cc == nullptr || vrRet >= cc->returnVrs.size()) {
+                if (cc == nullptr || fprRet >= cc->returnFprs.size()) {
                     reportUnsupported(MirOpcode::Return, id);
                     return false;
                 }
-                auto const vrOrd = target.registerByName(cc->returnVrs[vrRet]);
-                if (!vrOrd.has_value()) {
+                auto const fprOrd = target.registerByName(cc->returnFprs[fprRet]);
+                if (!fprOrd.has_value()) {
                     reportUnsupported(MirOpcode::Return, id);
                     return false;
                 }
-                auto const loadOp = classOp(LirRegClass::VR, RegClassOp::Load);
+                auto const loadOp = classOp(LirRegClass::FPR, RegClassOp::Load);
                 if (!loadOp.has_value()) {
-                    reportMissingClassOp(LirRegClass::VR, RegClassOp::Load,
+                    reportMissingClassOp(LirRegClass::FPR, RegClassOp::Load,
                                          "MIR F128 Return operand");
                     return false;
                 }
                 std::optional<LirReg> const home = regForValue(operand);
                 if (!home.has_value()) return false;
-                LirReg const retPhys = makePhysicalReg(*vrOrd, LirRegClass::VR);
+                LirReg const retPhys = makePhysicalReg(*fprOrd, LirRegClass::FPR);
                 std::array<LirOperand, 3> ldOps{
                     LirOperand::makeReg(*home),
                     LirOperand::makeMemBase(1),
                     LirOperand::makeMemOffset(0),
                 };
-                emitInst(*loadOp, retPhys, ldOps);
-                ++vrRet;
+                // WIDTH 128 — `fldur`'s width-default is 64, which would return
+                // the low 8 bytes of the binary128 and nothing would object.
+                emitInst(*loadOp, retPhys, ldOps, /*payload=*/0,
+                         kLirInstFlagWidth128);
+                ++fprRet;
                 continue;
             }
             // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): call-boundary
@@ -10420,15 +11058,29 @@ struct Lowerer {
             case TypeKind::U8: case TypeKind::U16: case TypeKind::U32:
                 discrimWidenSlot = MnemonicSlot::ZExt;
                 break;
-            case TypeKind::Char: case TypeKind::I8:
+            case TypeKind::Char:
+                // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50,
+                // CLOSED): the table's `discrim - minCase` index arithmetic
+                // runs at 64 bits, so a bare-`Char` discriminant widens by the
+                // TARGET's declared `charIsUnsigned` (threaded in as
+                // `charIsUnsigned_` — see its member docblock), never a
+                // hard-coded SExt. Still DEFENSIVE — the shipped C frontend
+                // integer-promotes a switch discriminant (C 6.8.4.2, cst_to_hir
+                // promoteSubIntArith) before this fast path, and `unsigned
+                // char` (=U8) already ZExt's above — but a HirBuilder frontend
+                // with no `arithmeticConversions` block reaches here by
+                // construction. With NOTHING threaded, DECLINE the table (a
+                // fall-through is not an error): the compare chain below is
+                // equality-only at the discriminant's own width, which is
+                // signedness-agnostic and therefore correct under either
+                // declaration — unlike a blind widen, which would be a silent
+                // wrong-dispatch on half the targets.
+                if (!charIsUnsigned_.has_value()) return false;
+                discrimWidenSlot = *charIsUnsigned_ ? MnemonicSlot::ZExt
+                                                    : MnemonicSlot::SExt;
+                break;
+            case TypeKind::I8:
             case TypeKind::I16:  case TypeKind::I32:
-                // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES: bare `Char`
-                // SExt here is TARGET-BLIND (arm64 unsigned char would want ZExt)
-                // but DEAD — C promotes a switch discriminant to `int` (6.8.4.2,
-                // cst_to_hir promoteSubIntArith) before this fast path, so a raw
-                // narrow `Char` never reaches it. `unsigned char` (=U8) already
-                // ZExt's above; only a future non-promoting frontend could expose
-                // the bare-Char gap.
                 discrimWidenSlot = MnemonicSlot::SExt;
                 break;
             default:
@@ -11001,6 +11653,18 @@ struct Lowerer {
         // per-function scan callconv runs (`functionLocalAllocaPayloads` is per-fn).
         allocaSlotIndex_.clear();
         allocaLirCount_ = 0;
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: same per-function lifetime as
+        // the counter it is indexed by.
+        allocaSlotAlign_.clear();
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: if this
+        // function is a filter funclet, the parent whose frame its recovered locals
+        // live in. Empty for every other function, which is why an ordinary function
+        // can never take the funclet arm's refusal.
+        currentFuncletParent_.reset();
+        if (auto const it = funcletParentByFuncSymbol_.find(mir.funcSymbol(mf).v);
+            it != funcletParentByFuncSymbol_.end()) {
+            currentFuncletParent_ = it->second;
+        }
         computeValueUses(mf);
         // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: which of this
         // function's `BlockAddress` values exist ONLY to be exported to static
@@ -11016,6 +11680,13 @@ struct Lowerer {
             exportOnlyBlockAddrs_.insert(valueV);
         }
         lir.addFunction(mir.funcSymbol(mf));
+        // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the
+        // per-function MIR fact becomes a module-level LIR entry here, and the
+        // change of shape is the point — see `LirStaticInitEntry` for why each
+        // tier carries it in whatever its own rebuild path already maintains.
+        // `staticInitAdd` refuses an empty schedule, so the ordinary function
+        // costs one predicate and adds nothing.
+        lir.staticInitAdd(mir.funcSymbol(mf), mir.funcStaticInit(mf));
 
         // Pre-pass 1: pre-allocate LIR blocks (1:1 with MIR blocks).
         std::uint32_t const blockCount = mir.funcBlockCount(mf);
@@ -11042,6 +11713,12 @@ struct Lowerer {
             MirBlockId const mb = mir.funcBlockAt(mf, i);
             lowerBlock(mb);
         }
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: hand this function's
+        // reservation-order alignment record to the post-lowering harvest, which
+        // cross-checks it against its own frozen-LIR walk and fails loud on any
+        // skew. Keyed by MIR function id so the harvest can find it without
+        // depending on either walk's ordering.
+        allocaSlotAlignByFunc_[mf.v] = allocaSlotAlign_;
     }
 
     // Record the LIR inst → source MIR inst mapping. Resizes the
@@ -11174,6 +11851,23 @@ struct Lowerer {
         // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED — must precede every
         // symbol mint and every block-address lowering. See the function's docblock.
         bindPreMintedBlockSymbols();
+        // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: bind each
+        // filter funclet to its parent MIR function BEFORE any function is lowered.
+        // A MODULE-WIDE pre-pass for the same reason `bindPreMintedBlockSymbols` is
+        // one: `synthesizeSehFunclets` APPENDS the funclets after the parents today,
+        // so a lazy binding would happen to work — and would break silently the day
+        // that order changed. The scope records carry both symbols, so the binding is
+        // a lookup rather than an inference.
+        for (auto const& s : sehScopesIn_) {
+            std::size_t const nf = mir.moduleFuncCount();
+            for (std::uint32_t fi = 0; fi < nf; ++fi) {
+                MirFuncId const f = mir.funcAt(fi);
+                if (mir.funcSymbol(f).v == s.parentFuncSymbol.v) {
+                    funcletParentByFuncSymbol_[s.filterFuncletSymbol.v] = f;
+                    break;
+                }
+            }
+        }
         std::size_t const fnCount = mir.moduleFuncCount();
         for (std::uint32_t i = 0; i < fnCount; ++i) {
             // D-OPT-SWITCH-JUMP-TABLE (c70): `lir.addFunction` runs in this same
@@ -11241,6 +11935,39 @@ struct Lowerer {
                         maxLocalAlign = std::max(maxLocalAlign, a);
                         perAllocaAlign.push_back(a);
                     }
+                }
+                // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: CROSS-CHECK this
+                // frozen-LIR walk against the reservation-order record `lowerFunction`
+                // kept. The two answer the same question by different routes (this one
+                // walks the finished LIR and maps back through `lirToMir`; the other
+                // was written at each reservation site), and they DECIDE DIFFERENT
+                // HALVES OF ONE MECHANISM: this list is what `lir_callconv` sizes the
+                // headroom from, and that one is what `emitLeaFrameSlot` rounded an
+                // address up with. A scan-order skew between them would round an
+                // address up into space the frame never reserved — a silent overrun of
+                // the next slot, which is exactly the miscompile class this row exists
+                // to remove. Fail loud instead; they agree on every shipped shape.
+                // ⚠ Bounded on the MIR side before asking: this loop counts FROZEN
+                // LIR functions, and `mir.funcAt` past the MIR module's own count is
+                // not a question with an answer. The two counts agree today (one
+                // `addFunction` per lowered MIR function) — the guard is so that
+                // ceasing to agree is a skipped cross-check, never a bad read.
+                auto const rec = (fi < mir.moduleFuncCount())
+                    ? allocaSlotAlignByFunc_.find(mir.funcAt(fi).v)
+                    : allocaSlotAlignByFunc_.end();
+                if (rec != allocaSlotAlignByFunc_.end()
+                    && rec->second != perAllocaAlign) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = std::format(
+                        "mir_to_lir: the frozen-LIR per-alloca alignment walk ({} "
+                        "entries) disagrees with the reservation-order record ({} "
+                        "entries) for function index {} — the frame-headroom source "
+                        "and the address-rounding source have drifted "
+                        "(D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL)",
+                        perAllocaAlign.size(), rec->second.size(), fi);
+                    reporter.report(std::move(d));
                 }
                 if (maxLocalAlign > gprWidth)
                     funcLocalAlignments.push_back(
@@ -11315,7 +12042,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::optional<TlsAccessInfo> tlsAccess,
                           std::span<MirSehScope const> sehScopes,
                           std::optional<std::string> wideFloatSoftcallLibrary,
-                          std::optional<ExternAddrBinding> externAddrBinding) {
+                          std::optional<ExternAddrBinding> externAddrBinding,
+                          std::optional<bool> charIsUnsigned) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -11332,10 +12060,16 @@ MirToLirResult lowerToLir(Mir const&          mir,
     // format's F128 softcall runtime library — the F128 softcall verb
     // binds each minted extern to it; nullopt + an F128 softcall =
     // fail-loud (no unbound extern).
+    // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50): also pass the
+    // target's resolved bare-`char` signedness — the Gep runtime-index widen
+    // and the switch jump-table discriminant widen read it for a raw narrow
+    // `Char`; nullopt + a raw `Char` index = fail-loud (no blind extension),
+    // nullopt + a raw `Char` jump-table discriminant = the sign-agnostic
+    // compare chain.
     Lowerer L{mir, target, interner, reporter, externImports,
               externCallDispatch, dataImportBinding, externAddrBinding,
               tlsAccess, sehScopes,
-              std::move(wideFloatSoftcallLibrary)};
+              std::move(wideFloatSoftcallLibrary), charIsUnsigned};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

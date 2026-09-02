@@ -163,6 +163,12 @@ dss_add_test(NAME link/test_link_writer_exclusive_claim
 # (first DSS-produced binary the OS actually runs).
 dss_add_test(NAME link/test_lk10_entry_slice_c   SOURCES test_lk10_entry_slice_c.cpp)
 
+# D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the link tier's
+# half of the static-initializer feature -- the whole-program ORDER, the
+# per-format RUNNER axis (including the `imageLoader` arm no shipped document
+# selects, which nothing else exercises), and the shipped-document sweep.
+dss_add_test(NAME link/test_static_init_schedule SOURCES test_static_init_schedule.cpp)
+
 # c163 (D-LK-STATIC-ARCHIVE-WRITER, writer half of D-FF1-AR-WRITER-STATIC-LINK)
 # — the GNU/System V `ar` static-archive WRITER: byte-exact framing + armap
 # pins, round-trip through the shipped c161 reader (the inverse-pair oracle),
@@ -446,3 +452,27 @@ dss_add_test(NAME link/test_lto_summary_ir_sections
 # cannot fire, which is why a 103-TU program found it and no single-CU pin did.
 dss_add_test(NAME link/test_merge_block_symbols
              SOURCES test_merge_block_symbols.cpp)
+
+# D-LK-STATIC-LINK-INTRASECTION-BAKED-CALL: a gcc `.o` built WITHOUT
+# `-ffunction-sections` — gcc's DEFAULT — bakes an intra-`.text` call as a
+# reloc-LESS `E8 rel32`, and the inter-function padding belongs to no symbol.
+# Slicing one atom per STT_FUNC and re-laying them out packed drops that padding
+# and silently redirects the call. ⚠ MEASURED on a plain `gcc -O2 -c` object:
+# DSS linked it with rc 0 and zero diagnostics and the binary SEGFAULTED where
+# the native gcc link exits 42. The pins assert the DISPLACEMENT recovered from
+# the emitted bytes, never that the link succeeded — it always succeeded.
+dss_add_test(NAME link/test_intrasection_baked_call
+             SOURCES test_intrasection_baked_call.cpp)
+
+# THE ARTIFACT INVARIANT AT ITS CHOKEPOINT: `writeBytes` is the ONE place any
+# artifact byte in this compiler reaches disk (`writeImage` delegates to it;
+# the `ar` producer calls it directly -- MEASURED, the only two call sites in
+# src/), so a compilation that recorded an error commits no artifact is
+# enforced there rather than asked of every caller. Pins the refusal, the
+# Info severity (it must not raise errorCount), the absence of any staging
+# leftover, and the non-destructive clause: a previous good artifact survives
+# byte-identical.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME link/test_artifact_withheld_after_error
+             SOURCES test_artifact_withheld_after_error.cpp)

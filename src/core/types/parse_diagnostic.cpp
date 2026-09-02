@@ -113,6 +113,14 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_VlaInitializerNotEmpty";
         case DiagnosticCode::S_AssignNeedsModifiableLvalue:
             return "S_AssignNeedsModifiableLvalue";
+        case DiagnosticCode::S_ConditionalOperandTypeMismatch:
+            return "S_ConditionalOperandTypeMismatch";
+        case DiagnosticCode::S_PointerDifferenceIncompatiblePointee:
+            return "S_PointerDifferenceIncompatiblePointee";
+        case DiagnosticCode::S_LinkageRedeclarationMismatch:
+            return "S_LinkageRedeclarationMismatch";
+        case DiagnosticCode::S_NoreturnNonFunctionObject:
+            return "S_NoreturnNonFunctionObject";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -513,6 +521,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "F_ShippedCorpusInvariantBroken";
         case DiagnosticCode::F_ObjectReaderSymbolBodyDropped:
             return "F_ObjectReaderSymbolBodyDropped";
+        case DiagnosticCode::F_DeclaredImportNameNotRecordable:
+            return "F_DeclaredImportNameNotRecordable";
 
         // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
         // later cycles but not mirrored here until the per-file -Werror=switch
@@ -550,6 +560,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_UnwindRuleUnrepresentable";
         case DiagnosticCode::K_FormatLacksWeakDefinitionDialect:
             return "K_FormatLacksWeakDefinitionDialect";
+        case DiagnosticCode::K_ArtifactWithheldAfterError:
+            return "K_ArtifactWithheldAfterError";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";
@@ -683,6 +695,51 @@ char diagnosticFamilyLetter(DiagnosticCode c) noexcept {
 
 bool diagnosticCodeIsAllocated(DiagnosticCode c) noexcept {
     return diagnosticCodeName(c) != kUnallocatedDiagnosticCodeName;
+}
+
+// [[D-PP-SKIPPED-CONDITIONAL-GROUP-VALIDATED-AS-A-PHASE-7-NUMBER]]. The header
+// carries the rule and the reference matrix that placed each arm; this is the
+// table. It lists the tokenizer's ENTIRE emitted set — the four conversion
+// judgements AND the one decomposition failure — rather than only the `true`
+// arms, so the split is legible here and a future reader can see that
+// `P_UnterminatedComment` was CONSIDERED and placed, not forgotten.
+bool isTokenConversionDiagnostic(DiagnosticCode c) noexcept {
+    switch (c) {
+        // Phase 7 converts a preprocessing token into a token, and these are the
+        // ways that conversion fails. Each is a statement about a token nobody
+        // has to convert unless it survives preprocessing.
+        case DiagnosticCode::P_MalformedNumber:
+            // A pp-number (C 6.4.8) that is no numeric literal — `2d`, `1e`.
+            return true;
+        case DiagnosticCode::P_IllegalChar:
+            // C 6.4p1's last alternative makes a stray byte a preprocessing
+            // token in its own right; only the conversion to a token fails.
+            return true;
+        case DiagnosticCode::P_InvalidEscape:
+            // The escape sequences inside a string/char literal are interpreted
+            // when the literal becomes a token, not when its extent is found.
+            return true;
+        case DiagnosticCode::P_UnterminatedString:
+            // ⓘ CLASSIFIED, and today INERT: the diagnostic's span sits at
+            // end-of-buffer (the unterminated frame is swept there), so the
+            // byte-liveness gate only ever sees it as live unless the file ENDS
+            // inside a dead group — in which case the missing-`#endif` refusal
+            // is already the loud one. Placed by measurement all the same: gcc
+            // and clang accept an unterminated `'` inside `#if 0`.
+            return true;
+        case DiagnosticCode::P_UnterminatedComment:
+            // ★ THE ONE DECOMPOSITION FAILURE. C 5.1.1.2 phase 3 replaces each
+            // comment by one space BEFORE any group is skipped, so a comment
+            // that never closes breaks the decomposition itself and stays loud
+            // everywhere. ✔MEASURED: gcc 13.3.0 and clang 18.1.3 BOTH refuse
+            // `#if 0` / `/*` / `#endif`, and both accept every other shape.
+            return false;
+        default:
+            // See the header: an unclassified code is FORWARDED. Nothing outside
+            // the tokenizer reaches the phase gate, and a wrong `true` here
+            // would be a diagnostic lost in silence rather than one seen twice.
+            return false;
+    }
 }
 
 std::string diagnosticCodePrefix(DiagnosticCode c) {

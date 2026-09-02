@@ -2671,18 +2671,30 @@ TEST(MirToLir, FloatArithmeticLowersToFPRClassResults) {
     }
 }
 
-TEST(MirToLir, BitcastCrossClassEmitsMovqXClass) {
-    // The cycle-3c-anchored cross-class Bitcast hazard: F64 → I64 must
-    // emit `movq_xclass` (not plain `mov`) because the source register
-    // class differs from the destination class. The cycle-3c lowering
-    // unconditionally emitted `mov` regardless of class — silently
-    // wrong for cross-class. Cycle 3d closes this via the regClassFor
-    // check in `lowerBitcast`.
-    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+namespace {
+// One cross-class Bitcast, lowered on `targetName`, asserting that the emitted
+// copy is the target's DECLARED move for that exact class pair — and that it is
+// neither class's own diagonal move, which is the wrong-file write.
+//
+// ★★★ WHY THE SUBJECT MOVED (D-TARGET-NO-CROSS-CLASS-MOVE-VERB). These arms
+// used to assert `movq_xclass`, a MnemonicSlot minted because
+// `registerClassOps` was indexed by ONE class and the cross-product had nowhere
+// to live. That slot is DELETED and so is the x86_64 opcode it named — which
+// carried no `encoding` at all, so a cross-class Bitcast on x86_64 lowered and
+// then failed at ENCODE time, and arm64 declared no `movq_xclass` whatsoever
+// and failed one tier earlier. The table is now keyed by the class PAIR, both
+// targets declare both directions out of opcodes that already shipped
+// byte-pinned, and the assertion is about the pair rather than about a slot.
+void expectCrossClassBitcastUsesTheDeclaredPairMove(
+        char const* targetName, ::dss::TypeKind fromKind,
+        ::dss::TypeKind toKind, ::dss::TargetRegClass fromCls,
+        ::dss::TargetRegClass toCls) {
+    SCOPED_TRACE(targetName);
+    auto target = ::dss::TargetSchema::loadShipped(targetName);
     ASSERT_TRUE(target.has_value());
     auto const& sch = **target;
-    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::F64};
-    auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::I64,
+    std::array<::dss::TypeKind, 1> paramKinds{fromKind};
+    auto syn = buildSyntheticFn(paramKinds, toKind,
         [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
             std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
             ::dss::MirInstId const a = mb.addArg(0, params[0]);
@@ -2691,77 +2703,110 @@ TEST(MirToLir, BitcastCrossClassEmitsMovqXClass) {
         });
     ::dss::DiagnosticReporter rep;
     auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
-    ASSERT_TRUE(result.ok);
-    auto const movqOp = *sch.opcodeByMnemonic("movq_xclass");
+    ASSERT_TRUE(result.ok) << "a cross-class Bitcast must lower";
+    auto const pairMove =
+        sch.regClassOpOpcode(fromCls, toCls, ::dss::RegClassOp::Move);
+    ASSERT_TRUE(pairMove.has_value())
+        << targetName << " declares no move for this class pair — the arm "
+           "below would assert nothing";
+    auto const fromDiag = sch.regClassOpOpcode(fromCls, ::dss::RegClassOp::Move);
+    auto const toDiag   = sch.regClassOpOpcode(toCls,   ::dss::RegClassOp::Move);
+    ASSERT_TRUE(fromDiag.has_value());
+    ASSERT_TRUE(toDiag.has_value());
+    // The discriminating precondition: were the cross-class cell the same
+    // opcode as a diagonal one, the search below would pass over the miscompile.
+    ASSERT_NE(*pairMove, *fromDiag);
+    ASSERT_NE(*pairMove, *toDiag);
+
     ::dss::Lir const& lir = result.lir;
     LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
-    bool foundXClass = false;
+    bool found = false;
     for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
-        if (lir.instOpcode(lir.blockInstAt(entry, i)) == movqOp) {
-            foundXClass = true; break;
+        LirInstId const id = lir.blockInstAt(entry, i);
+        auto const op = lir.instOpcode(id);
+        if (op == *pairMove) {
+            found = true;
+            EXPECT_EQ(static_cast<::dss::TargetRegClass>(
+                          lir.instResult(id).regClass()),
+                      toCls)
+                << "the pair's move must LAND in the destination class";
         }
+        EXPECT_NE(op, *fromDiag)
+            << "a cross-class Bitcast emitted the SOURCE class's own move — "
+               "the encoder writes the register number into the wrong file";
+        EXPECT_NE(op, *toDiag)
+            << "a cross-class Bitcast emitted the DESTINATION class's own move";
     }
-    EXPECT_TRUE(foundXClass)
-        << "FPR→GPR Bitcast must emit `movq_xclass`, not plain `mov`";
+    EXPECT_TRUE(found)
+        << "no cross-class move was emitted, so the bit pattern never changed "
+           "register files";
+}
+} // namespace
+
+TEST(MirToLir, BitcastCrossClassFprToGprUsesTheDeclaredPairMove) {
+    for (char const* const t : {"x86_64", "arm64"}) {
+        expectCrossClassBitcastUsesTheDeclaredPairMove(
+            t, ::dss::TypeKind::F64, ::dss::TypeKind::I64,
+            ::dss::TargetRegClass::FPR, ::dss::TargetRegClass::GPR);
+    }
 }
 
-TEST(MirToLir, BitcastCrossClassEmitsMovqXClassReverse) {
-    // Reverse direction of `BitcastCrossClassEmitsMovqXClass`
-    // (cycle-3e deferral D-3e.8 folded ML6 cycle 1). The lowerer's
-    // class-symmetric check at `lowerBitcast` is direction-agnostic
-    // — same operand-shape exercises the I64→F64 path with the
-    // source class flipped to GPR and the destination class flipped
-    // to FPR.
-    auto target = ::dss::TargetSchema::loadShipped("x86_64");
-    ASSERT_TRUE(target.has_value());
-    auto const& sch = **target;
-    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::I64};
-    auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::F64,
-        [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
-            std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
-            ::dss::MirInstId const a = mb.addArg(0, params[0]);
-            std::array<::dss::MirInstId, 1> ops{a};
-            mb.addReturn(mb.addInst(::dss::MirOpcode::Bitcast, ops, retT));
-        });
-    ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
-    ASSERT_TRUE(result.ok);
-    auto const movqOp = *sch.opcodeByMnemonic("movq_xclass");
-    ::dss::Lir const& lir = result.lir;
-    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
-    bool foundXClass = false;
-    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
-        if (lir.instOpcode(lir.blockInstAt(entry, i)) == movqOp) {
-            foundXClass = true; break;
-        }
+TEST(MirToLir, BitcastCrossClassGprToFprUsesTheDeclaredPairMove) {
+    // The reverse direction (cycle-3e deferral D-3e.8 folded ML6 cycle 1).
+    // ★ IT IS A SEPARATE OPCODE ON BOTH TARGETS AND DELIBERATELY SO: the
+    // encoding-variant guard keys only on (operandKinds, width) and both
+    // directions are `reg` at the same width, so one opcode carrying both
+    // would silently pick a direction.
+    for (char const* const t : {"x86_64", "arm64"}) {
+        expectCrossClassBitcastUsesTheDeclaredPairMove(
+            t, ::dss::TypeKind::I64, ::dss::TypeKind::F64,
+            ::dss::TargetRegClass::GPR, ::dss::TargetRegClass::FPR);
     }
-    EXPECT_TRUE(foundXClass)
-        << "GPR→FPR Bitcast must emit `movq_xclass`, not plain `mov`";
 }
 
-TEST(MirToLir, BitcastSameClassStaysAsMov) {
-    // Positive control: I64 → Ptr (both GPR-class) emits `mov`, not
-    // `movq_xclass`. Pins the class-symmetry branch.
-    auto target = ::dss::TargetSchema::loadShipped("x86_64");
-    ASSERT_TRUE(target.has_value());
-    auto const& sch = **target;
-    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::I64};
-    auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::Ptr,
-        [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
-            std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
-            ::dss::MirInstId const a = mb.addArg(0, params[0]);
-            std::array<::dss::MirInstId, 1> ops{a};
-            mb.addReturn(mb.addInst(::dss::MirOpcode::Bitcast, ops, retT));
-        });
-    ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
-    ASSERT_TRUE(result.ok);
-    auto const movqOp = *sch.opcodeByMnemonic("movq_xclass");
-    ::dss::Lir const& lir = result.lir;
-    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
-    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
-        EXPECT_NE(lir.instOpcode(lir.blockInstAt(entry, i)), movqOp)
-            << "same-class Bitcast must use `mov`, not `movq_xclass`";
+TEST(MirToLir, BitcastSameClassStaysOnTheDiagonal) {
+    // Positive control: I64 → Ptr (both GPR-class) takes the DIAGONAL cell of
+    // the same table — the plain `mov` — and never either cross-class move.
+    // Pins that generalizing the table to class×class did not move the
+    // same-class case off it.
+    for (char const* const t : {"x86_64", "arm64"}) {
+        SCOPED_TRACE(t);
+        auto target = ::dss::TargetSchema::loadShipped(t);
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::I64};
+        auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::Ptr,
+            [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+                std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
+                ::dss::MirInstId const a = mb.addArg(0, params[0]);
+                std::array<::dss::MirInstId, 1> ops{a};
+                mb.addReturn(mb.addInst(::dss::MirOpcode::Bitcast, ops, retT));
+            });
+        ::dss::DiagnosticReporter rep;
+        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+        ASSERT_TRUE(result.ok);
+        auto const toFpr = *sch.regClassOpOpcode(::dss::TargetRegClass::GPR,
+                                                 ::dss::TargetRegClass::FPR,
+                                                 ::dss::RegClassOp::Move);
+        auto const toGpr = *sch.regClassOpOpcode(::dss::TargetRegClass::FPR,
+                                                 ::dss::TargetRegClass::GPR,
+                                                 ::dss::RegClassOp::Move);
+        auto const gprMove = *sch.regClassOpOpcode(::dss::TargetRegClass::GPR,
+                                                   ::dss::RegClassOp::Move);
+        ::dss::Lir const& lir = result.lir;
+        LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+        bool sawDiagonal = false;
+        for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+            auto const op = lir.instOpcode(lir.blockInstAt(entry, i));
+            if (op == gprMove) sawDiagonal = true;
+            EXPECT_NE(op, toFpr)
+                << "same-class Bitcast must use the diagonal move";
+            EXPECT_NE(op, toGpr)
+                << "same-class Bitcast must use the diagonal move";
+        }
+        EXPECT_TRUE(sawDiagonal)
+            << "the same-class Bitcast emitted no diagonal move at all, so the "
+               "two EXPECT_NEs above are vacuous";
     }
 }
 
@@ -2851,8 +2896,9 @@ INSTANTIATE_TEST_SUITE_P(
         CastCase{::dss::MirOpcode::ZExt,     "zext",  ::dss::TypeKind::Bool, ::dss::TypeKind::I64, LirRegClass::GPR},
         CastCase{::dss::MirOpcode::IntToPtr, "mov",   ::dss::TypeKind::I64, ::dss::TypeKind::Ptr, LirRegClass::GPR},
         CastCase{::dss::MirOpcode::PtrToInt, "mov",   ::dss::TypeKind::Ptr, ::dss::TypeKind::I64, LirRegClass::GPR},
-        // Bitcast same-class is mov; different test (BitcastCrossClass)
-        // pins the cross-class movq_xclass path.
+        // Bitcast same-class is the DIAGONAL cell of `registerClassOps`
+        // (`mov` for gpr); the cross-class cells are pinned by the two
+        // `BitcastCrossClass…UsesTheDeclaredPairMove` tests above.
         CastCase{::dss::MirOpcode::Bitcast,  "mov",   ::dss::TypeKind::I64, ::dss::TypeKind::Ptr, LirRegClass::GPR},
         // Cycle 3d float casts. fpcvt handles BOTH FPTrunc + FPExt.
         // FPToSI/FPToUI: float → integer, result is GPR.
@@ -3071,6 +3117,317 @@ TEST(MirToLir, GepDynamicIndexEmitsFourOperandLea) {
         break;
     }
     EXPECT_TRUE(foundLea);
+}
+
+// D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50): the Gep RUNTIME-index
+// widen used to bucket a bare-`Char` index into the unconditional-SExt group,
+// TARGET-BLIND — wrong (a silent wrong address) the day an unsigned-char
+// target's frontend feeds a raw `Char` index. It now routes through the
+// `charIsUnsigned` value threaded into `lowerToLir` (the target's own
+// declaration, resolved per object format one level up), and with NOTHING
+// threaded it fails LOUD rather than guess. The shape is hand-built MIR
+// because no shipped frontend can produce it: the C frontend integer-promotes
+// every subscript (cst_to_hir combineIndex) — measured P50 with a
+// positive-controlled site instrument over the full corpus, zero raw-Char
+// arrivals.
+// RED-ON-DISABLE: restore `case TypeKind::Char:` into the unconditional-SExt
+// group → the unsigned-char leg emits sext (zext 0), the nullopt leg lowers
+// silently instead of failing — both go red by name.
+TEST(MirToLir, GepCharRuntimeIndexWidenIsTargetKeyed) {
+    auto const buildGepFn = [](::dss::TypeInterner& interner,
+                               ::dss::TypeKind idxKind) {
+        auto const ptrT =
+            interner.pointer(interner.primitive(::dss::TypeKind::Void));
+        auto const idxT = interner.primitive(idxKind);
+        std::array<::dss::TypeId, 2> params{ptrT, idxT};
+        auto const fnSig = interner.fnSig(params, ptrT, ::dss::CallConv::CcSysV);
+        ::dss::MirBuilder mb;
+        mb.addFunction(fnSig, ::dss::SymbolId{1});
+        ::dss::MirBlockId const bb =
+            mb.createBlock(::dss::StructCfMarker::EntryBlock);
+        mb.beginBlock(bb);
+        ::dss::MirInstId const base  = mb.addArg(0, ptrT);
+        ::dss::MirInstId const index = mb.addArg(1, idxT);
+        std::array<::dss::MirInstId, 2> gepOps{base, index};
+        ::dss::MirInstId const g =
+            mb.addInst(::dss::MirOpcode::Gep, gepOps, ptrT);
+        mb.addReturn(g);
+        return std::move(mb).finish();
+    };
+    auto const lowerWith = [](::dss::Mir const& m, ::dss::TargetSchema const& sch,
+                              ::dss::TypeInterner const& interner,
+                              ::dss::DiagnosticReporter& rep,
+                              std::optional<bool> charIsUnsigned) {
+        return ::dss::lowerToLir(m, sch, interner, rep, {}, std::nullopt,
+                                 std::nullopt, std::nullopt, {}, std::nullopt,
+                                 std::nullopt, charIsUnsigned);
+    };
+    auto const countLirOps = [](::dss::Lir const& lir, std::uint16_t opc) {
+        std::size_t n = 0;
+        ::dss::LirFuncId const f = lir.funcAt(0);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(f); ++bi) {
+            ::dss::LirBlockId const b = lir.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(b); ++i)
+                if (lir.instOpcode(lir.blockInstAt(b, i)) == opc) ++n;
+        }
+        return n;
+    };
+
+    // Leg 1 — x86_64 with the target's OWN resolved declaration: x86_64 ships
+    // no `charIsUnsigned` key at all (absent = signed on every format it
+    // serves), so the resolved value is false and the widen must SExt.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        bool const resolved =
+            sch.charIsUnsigned(::dss::ObjectFormatKind::Elf);
+        EXPECT_FALSE(resolved)
+            << "x86_64 declares no charIsUnsigned key — bare char is signed";
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildGepFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, resolved);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 1u)
+            << "signed-char target: the Char index widen must SIGN-extend";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("zext")), 0u);
+    }
+
+    // Leg 2 — arm64 with ITS resolved elf declaration (default true — the
+    // AAPCS64/GNU-Linux unsigned char): the widen must ZExt, through the
+    // arm64 opcode table (uxtb).
+    {
+        auto target = ::dss::TargetSchema::loadShipped("arm64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        bool const resolved =
+            sch.charIsUnsigned(::dss::ObjectFormatKind::Elf);
+        EXPECT_TRUE(resolved)
+            << "arm64/elf declares unsigned bare char (charIsUnsigned default)";
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildGepFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, resolved);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("zext")), 1u)
+            << "unsigned-char target: the Char index widen must ZERO-extend";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 0u);
+    }
+
+    // Leg 3 — the VALUE governs, not the schema identity: x86_64 opcode
+    // table with a synthetic unsigned-char declaration still ZExts.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildGepFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result =
+            lowerWith(m, sch, interner, rep, std::optional<bool>{true});
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("zext")), 1u)
+            << "the threaded VALUE picks the extension — no schema-identity "
+               "branch";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 0u);
+    }
+
+    // Leg 4 — NOTHING threaded (nullopt, today's production state): a raw
+    // `Char` index must FAIL LOUD, never take a blind extension.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildGepFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, std::nullopt);
+        EXPECT_FALSE(result.ok)
+            << "a raw Char Gep index with no threaded charIsUnsigned must "
+               "fail the lowering loud";
+        bool sawDiag = false;
+        for (auto const& d : rep.all()) {
+            if (d.code == ::dss::DiagnosticCode::L_UnsupportedLoweringForOpcode
+                && d.actual.find("charIsUnsigned") != std::string::npos
+                && d.actual.find("D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES") != std::string::npos) {
+                sawDiag = true;
+            }
+        }
+        EXPECT_TRUE(sawDiag)
+            << "the fail-loud diagnostic must name the target key and the "
+               "anchor";
+    }
+
+    // Leg 5 — control: `signed char` (I8) stays on the unconditional SExt arm
+    // with nothing threaded — only bare `Char` consults the target.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildGepFn(interner, ::dss::TypeKind::I8);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, std::nullopt);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 1u)
+            << "I8 is unconditionally signed — no threading required";
+    }
+}
+
+// D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50): the switch
+// jump-table discriminant widen — the second of the two mir_to_lir arms that
+// bucketed bare `Char` unconditionally SExt. It now widens by the threaded
+// `charIsUnsigned` value, and with NOTHING threaded it DECLINES the table:
+// the compare chain is equality-only at the discriminant's own width, which
+// is signedness-agnostic and correct under either declaration (a decline is
+// the documented non-error fall-through, unlike the Gep index widen, which
+// has no correct fallback and must fail loud instead).
+// RED-ON-DISABLE: restore `case TypeKind::Char:` into the unconditional-SExt
+// group → the unsigned-char leg's table widens sext (zext 0) and the nullopt
+// leg builds a table where the pin demands the chain — both red by name.
+TEST(MirToLir, SwitchCharDiscriminantJumpTableWidenIsTargetKeyed) {
+    constexpr std::size_t kCases = 10;   // >= kJumpTableMinCases, dense 0..9
+    auto const buildSwitchFn = [](::dss::TypeInterner& interner,
+                                  ::dss::TypeKind discKind) {
+        auto const discT = interner.primitive(discKind);
+        auto const voidT = interner.primitive(::dss::TypeKind::Void);
+        std::array<::dss::TypeId, 1> params{discT};
+        auto const fnSig =
+            interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+        ::dss::MirBuilder mb;
+        mb.addFunction(fnSig, ::dss::SymbolId{1});
+        ::dss::MirBlockId const entry =
+            mb.createBlock(::dss::StructCfMarker::SwitchHead);
+        std::array<::dss::MirBlockId, kCases> caseBlocks{};
+        for (auto& cb : caseBlocks)
+            cb = mb.createBlock(::dss::StructCfMarker::SwitchCase);
+        ::dss::MirBlockId const dflt =
+            mb.createBlock(::dss::StructCfMarker::SwitchCase);
+        mb.beginBlock(entry);
+        ::dss::MirInstId const disc = mb.addArg(0, discT);
+        std::array<std::pair<::dss::MirInstId, ::dss::MirBlockId>, kCases>
+            cases{};
+        for (std::size_t i = 0; i < kCases; ++i) {
+            ::dss::MirLiteralValue lv;
+            lv.value = static_cast<std::int64_t>(i);
+            lv.core  = discKind;
+            cases[i] = {mb.addConst(lv, discT), caseBlocks[i]};
+        }
+        mb.addSwitch(disc, cases, dflt);
+        for (auto const cb : caseBlocks) { mb.beginBlock(cb); mb.addReturn(); }
+        mb.beginBlock(dflt);
+        mb.addReturn();
+        return std::move(mb).finish();
+    };
+    auto const lowerWith = [](::dss::Mir const& m, ::dss::TargetSchema const& sch,
+                              ::dss::TypeInterner const& interner,
+                              ::dss::DiagnosticReporter& rep,
+                              std::optional<bool> charIsUnsigned) {
+        return ::dss::lowerToLir(m, sch, interner, rep, {}, std::nullopt,
+                                 std::nullopt, std::nullopt, {}, std::nullopt,
+                                 std::nullopt, charIsUnsigned);
+    };
+    auto const countLirOps = [](::dss::Lir const& lir, std::uint16_t opc) {
+        std::size_t n = 0;
+        ::dss::LirFuncId const f = lir.funcAt(0);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(f); ++bi) {
+            ::dss::LirBlockId const b = lir.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(b); ++i)
+                if (lir.instOpcode(lir.blockInstAt(b, i)) == opc) ++n;
+        }
+        return n;
+    };
+
+    // Leg 1 — arm64 with its resolved elf declaration (unsigned): the dense
+    // Char switch takes the table and the discriminant widen is ZExt.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("arm64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        bool const resolved =
+            sch.charIsUnsigned(::dss::ObjectFormatKind::Elf);
+        EXPECT_TRUE(resolved);
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildSwitchFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, resolved);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(result.jumpTableDescriptors.size(), 1u)
+            << "a dense 10-case Char switch with a threaded signedness must "
+               "take the jump table";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("zext")), 1u)
+            << "unsigned-char target: the table's discriminant widen must "
+               "ZERO-extend";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 0u);
+    }
+
+    // Leg 2 — x86_64 with its resolved declaration (signed): table + SExt.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        bool const resolved =
+            sch.charIsUnsigned(::dss::ObjectFormatKind::Elf);
+        EXPECT_FALSE(resolved);
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildSwitchFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, resolved);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(result.jumpTableDescriptors.size(), 1u);
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 1u)
+            << "signed-char target: the table's discriminant widen must "
+               "SIGN-extend";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("zext")), 0u);
+    }
+
+    // Leg 3 — NOTHING threaded: the table is DECLINED (no descriptor, no
+    // widen) and the switch still lowers CORRECTLY via the equality-only
+    // compare chain at the discriminant's own width — one cmp per case.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildSwitchFn(interner, ::dss::TypeKind::Char);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, std::nullopt);
+        ASSERT_TRUE(result.ok)
+            << "declining the table is a fall-through, not an error: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(result.jumpTableDescriptors.size(), 0u)
+            << "with no threaded signedness the Char table must be declined "
+               "— a blind widen would be a silent wrong-dispatch";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("cmp")), kCases)
+            << "the compare chain carries the switch: one equality per case";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 0u);
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("zext")), 0u);
+    }
+
+    // Leg 4 — control: an I32 discriminant still takes the table with
+    // nothing threaded — the decline is Char-scoped.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildSwitchFn(interner, ::dss::TypeKind::I32);
+        ::dss::DiagnosticReporter rep;
+        auto const result = lowerWith(m, sch, interner, rep, std::nullopt);
+        ASSERT_TRUE(result.ok)
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(result.jumpTableDescriptors.size(), 1u)
+            << "an I32 discriminant needs no char-signedness fact — the "
+               "table must not be declined";
+        EXPECT_EQ(countLirOps(result.lir, *sch.opcodeByMnemonic("sext")), 1u);
+    }
 }
 
 TEST(MirToLir, PhiResolutionUsesFprClassForFloatPhi) {
@@ -5466,12 +5823,47 @@ TEST(MirToLir, F80ArithmeticAndStoreLowerToX87Sequence) {
 // (__addtf3 …) with the operands marshalled into the config'd physical arg
 // registers (v0/v1) and the result captured to a fresh 16-byte home — the
 // memory-resident model of F80, one axis over. These pins prove: (a) the
-// contiguous fldur_q/fldur_q/call/fstur_q sequence, (b) the fixtfsi / extenddftf2
-// conversion shapes, (c) once-only extern injection, (d) the config-row-ABSENCE
-// gate (RED-on-disable), (e) the still-firing LD-4 boundary walls + the phi
-// wall, and (f) the v0/d0 regalloc-aliasing safety.
+// contiguous Q-form load/load/call/store sequence, (b) the fixtfsi /
+// extenddftf2 conversion shapes, (c) once-only extern injection, (d) the
+// config-row-ABSENCE gate (RED-on-disable), (e) the still-firing LD-4 boundary
+// walls + the phi wall, and (f) the v0/d0 aliasing safety.
+//
+// ★★★ THE Q FORM IS A WIDTH, NOT A MNEMONIC, SINCE R2 OF DESIGN A′ — AND THAT
+// IS WHY EVERY PIN BELOW MATCHES A WIDTH AS WELL AS AN OPCODE. These arms used
+// to name the opcodes `fldur_q` and `fstur_q`; both are DELETED. arm64 declared
+// its SIMD&FP file TWICE (class `fpr` = d0..d31 at 8 bytes, class `vr` =
+// v0..v31 at 16), so the 16-byte access looked like a different register
+// CLASS's load/store and needed its own mnemonic bound to that class's
+// `registerClassOps` row. With the file declared ONCE (R1) there is one class,
+// `fldur`/`fstur` are its load/store, and the Q form is their width-128
+// VARIANT carrying the byte-pinned fixedWords the deleted opcodes had.
+//
+// ⚠⚠ MATCHING THE MNEMONIC ALONE WOULD NOW BE GREEN ON A MISCOMPILE. `fldur`'s
+// width-DEFAULT is 64, so a marshal that forgot its width flag would move eight
+// of a binary128's sixteen bytes at rc=0 with nothing to see. The physical
+// registers these pins name are `LirRegClass::FPR` for the same reason: there
+// is no VR class on this target any more.
 
 namespace {
+
+// "This instruction is the Q form": the right opcode AND the width that elects
+// its 128-bit variant. One helper so every F128 pin below states both halves
+// and none can be edited into stating only the first.
+[[nodiscard]] ::testing::AssertionResult
+isQForm(::dss::Lir const& lir, ::dss::LirInstId id, std::uint16_t qOpcode) {
+    if (lir.instOpcode(id) != qOpcode) {
+        return ::testing::AssertionFailure()
+               << "opcode " << lir.instOpcode(id) << " != expected " << qOpcode;
+    }
+    auto const bits = ::dss::lirInstWidthBits(lir.instFlags(id));
+    if (bits != 128) {
+        return ::testing::AssertionFailure()
+               << "the SIMD&FP access is " << unsigned{bits}
+               << " bits wide, not 128 — a binary128 datum would move in "
+                  "halves and nothing downstream would object";
+    }
+    return ::testing::AssertionSuccess();
+}
 // The arm64-ELF lowering context the driver threads for
 // arm64:elf64-aarch64-linux-exec: direct-plt extern dispatch + the libgcc
 // softcall library. (A bare `lowerToLir(m, target, interner, rep)` would pass
@@ -5540,12 +5932,14 @@ findCallToSymbol(::dss::Lir const& lir, ::dss::LirBlockId bb,
 
 TEST(MirToLir, F128AddLowersToSoftcallSequence) {
     // Table-drive the four commutative/non-commutative binary ops. Each must
-    // lower to the CONTIGUOUS softcall sequence:
-    //   fldur_q(v0)<-[pa] ; fldur_q(v1)<-[pb] ; call(__Xtf3) ; fstur_q([home])<-v0
+    // lower to the CONTIGUOUS softcall sequence, every memory access at the
+    // Q width:
+    //   fldur.128(v0)<-[pa] ; fldur.128(v1)<-[pb] ; call(__Xtf3) ;
+    //   fstur.128([home])<-v0
     auto target = ::dss::TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
-    auto const fldurQ = (*target)->opcodeByMnemonic("fldur_q");
-    auto const fsturQ = (*target)->opcodeByMnemonic("fstur_q");
+    auto const fldurQ = (*target)->opcodeByMnemonic("fldur");
+    auto const fsturQ = (*target)->opcodeByMnemonic("fstur");
     auto const callOp = (*target)->opcodeByMnemonic("call");
     ASSERT_TRUE(fldurQ.has_value() && fsturQ.has_value() && callOp.has_value());
     auto const v0Ord = (*target)->registerByName("v0");
@@ -5582,23 +5976,23 @@ TEST(MirToLir, F128AddLowersToSoftcallSequence) {
         // The two immediately-preceding insts are the v0/v1 operand marshals.
         auto const m0 = lir.blockInstAt(bb, *callIdx - 2);
         auto const m1 = lir.blockInstAt(bb, *callIdx - 1);
-        EXPECT_EQ(lir.instOpcode(m0), *fldurQ) << c.helper;
-        EXPECT_EQ(lir.instOpcode(m1), *fldurQ) << c.helper;
+        EXPECT_TRUE(isQForm(lir, m0, *fldurQ)) << c.helper;
+        EXPECT_TRUE(isQForm(lir, m1, *fldurQ)) << c.helper;
         LirReg const r0 = lir.instResult(m0);
         LirReg const r1 = lir.instResult(m1);
-        EXPECT_TRUE(r0.isPhysical && r0.regClass() == LirRegClass::VR);
-        EXPECT_TRUE(r1.isPhysical && r1.regClass() == LirRegClass::VR);
+        EXPECT_TRUE(r0.isPhysical && r0.regClass() == LirRegClass::FPR);
+        EXPECT_TRUE(r1.isPhysical && r1.regClass() == LirRegClass::FPR);
         EXPECT_EQ(r0.id, *v0Ord) << c.helper << ": first operand -> v0";
         EXPECT_EQ(r1.id, *v1Ord) << c.helper << ": second operand -> v1";
         // The immediately-following inst is the result store of physical v0.
         ASSERT_LT(*callIdx + 1, lir.blockInstCount(bb));
         auto const st = lir.blockInstAt(bb, *callIdx + 1);
-        EXPECT_EQ(lir.instOpcode(st), *fsturQ) << c.helper;
+        EXPECT_TRUE(isQForm(lir, st, *fsturQ)) << c.helper;
         auto const stOps = lir.instOperands(st);
         ASSERT_GE(stOps.size(), 1u);
         EXPECT_TRUE(stOps[0].kind == LirOperandKind::Reg
                     && stOps[0].reg.isPhysical
-                    && stOps[0].reg.regClass() == LirRegClass::VR
+                    && stOps[0].reg.regClass() == LirRegClass::FPR
                     && stOps[0].reg.id == *v0Ord)
             << c.helper << ": the result store must store physical v0";
     }
@@ -5606,7 +6000,7 @@ TEST(MirToLir, F128AddLowersToSoftcallSequence) {
 
 TEST(MirToLir, F128FixTfsiLowersToSoftcallSequence) {
     // int g(long double* p) { return (int)(*p); } — the F128->int32 conversion:
-    //   fldur_q(v0)<-[p] ; call(__fixtfsi) ; mov(result, x0) width-32.
+    //   fldur.128(v0)<-[p] ; call(__fixtfsi) ; mov(result, x0) width-32.
     auto target = ::dss::TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
@@ -5638,7 +6032,7 @@ TEST(MirToLir, F128FixTfsiLowersToSoftcallSequence) {
 
     Lir const& lir = result.lir;
     LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
-    auto const fldurQ = (*target)->opcodeByMnemonic("fldur_q");
+    auto const fldurQ = (*target)->opcodeByMnemonic("fldur");
     auto const callOp = (*target)->opcodeByMnemonic("call");
     auto const movOp  = (*target)->opcodeByMnemonic("mov");
     auto const x0Ord  = (*target)->registerByName("x0");
@@ -5647,8 +6041,8 @@ TEST(MirToLir, F128FixTfsiLowersToSoftcallSequence) {
     auto const callIdx = findCallToSymbol(lir, bb, *callOp, *helperSym);
     ASSERT_TRUE(callIdx.has_value());
     ASSERT_GE(*callIdx, 1u);
-    // The operand marshal is a single fldur_q into v0 (the F128 source).
-    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, *callIdx - 1)), *fldurQ);
+    // The operand marshal is a single Q-form `fldur` into v0 (the F128 source).
+    EXPECT_TRUE(isQForm(lir, lir.blockInstAt(bb, *callIdx - 1), *fldurQ));
     // The following inst is the int32 capture: mov result <- x0 (physical).
     ASSERT_LT(*callIdx + 1, lir.blockInstCount(bb));
     auto const cap = lir.blockInstAt(bb, *callIdx + 1);
@@ -5666,7 +6060,8 @@ TEST(MirToLir, F128FixTfsiLowersToSoftcallSequence) {
 
 TEST(MirToLir, F128ExtendFromDoubleLowersToSoftcallSequence) {
     // void g(double d, long double* pr) { *pr = (long double)d; } — the
-    // double->F128 widen: fmov(d0)<-src ; call(__extenddftf2) ; fstur_q([home])<-v0.
+    // double->F128 widen: fmov(d0)<-src ; call(__extenddftf2) ;
+    // fstur.128([home])<-v0.
     auto target = ::dss::TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
@@ -5701,7 +6096,7 @@ TEST(MirToLir, F128ExtendFromDoubleLowersToSoftcallSequence) {
     Lir const& lir = result.lir;
     LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
     auto const fmovOp = (*target)->opcodeByMnemonic("fmov");
-    auto const fsturQ = (*target)->opcodeByMnemonic("fstur_q");
+    auto const fsturQ = (*target)->opcodeByMnemonic("fstur");
     auto const callOp = (*target)->opcodeByMnemonic("call");
     auto const d0Ord  = (*target)->registerByName("d0");
     ASSERT_TRUE(fmovOp.has_value() && fsturQ.has_value() && callOp.has_value()
@@ -5709,17 +6104,25 @@ TEST(MirToLir, F128ExtendFromDoubleLowersToSoftcallSequence) {
     auto const callIdx = findCallToSymbol(lir, bb, *callOp, *helperSym);
     ASSERT_TRUE(callIdx.has_value());
     ASSERT_GE(*callIdx, 1u);
-    // The operand marshal is an fmov of the double source into physical d0
-    // (an FPR-class arg register, NOT a v-register — the config row says d0).
+    // The operand marshal is an fmov of the double source into physical d0 —
+    // the 64-bit VIEW the `from_f64` softcall row names, which is the register
+    // a `double` occupies. ⚠ THIS COMMENT USED TO READ "an FPR-class arg
+    // register, NOT a v-register": with the SIMD&FP file declared once, `d0`
+    // and `v0` are both FPR and `d0` is a declared `subOf` view of `v0`, so
+    // the contrast is a WIDTH one now (8 bytes here, 16 for the result below)
+    // rather than a class one. The config row still says `d0`, and that the
+    // row's own spelling is what this arm follows is the point.
     auto const marshal = lir.blockInstAt(bb, *callIdx - 1);
     EXPECT_EQ(lir.instOpcode(marshal), *fmovOp);
     LirReg const marshalDst = lir.instResult(marshal);
     EXPECT_TRUE(marshalDst.isPhysical && marshalDst.regClass() == LirRegClass::FPR
                 && marshalDst.id == *d0Ord)
         << "the double source must be fmov'd into physical d0";
-    // The following inst stores the physical v0 result to the F128 home.
+    // The following inst stores the physical v0 result to the F128 home, at
+    // the Q width — the result is sixteen bytes even though the source was
+    // eight, which is exactly the disagreement the width flag has to carry.
     ASSERT_LT(*callIdx + 1, lir.blockInstCount(bb));
-    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, *callIdx + 1)), *fsturQ);
+    EXPECT_TRUE(isQForm(lir, lir.blockInstAt(bb, *callIdx + 1), *fsturQ));
 }
 
 TEST(MirToLir, F128SoftcallInjectsExternImportOnce) {
@@ -5804,8 +6207,11 @@ namespace {
 // F128 twins of the F80 call-boundary probes — lowered WITH the arm64 softcall
 // config ACTIVE. D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4) UN-WALLS these: an
 // F128 param/call-result/return now lowers to the AAPCS64 v-register boundary
-// (fstur_q/fldur_q), the memory-resident model extended to user calls. The three
-// tests below are the positive lowering pins (INVERTED from the LD-2 walls).
+// (`fstur`/`fldur` AT WIDTH 128 — the Q form, which was the separate
+// `fstur_q`/`fldur_q` mnemonics until R2 of design A′ folded them onto those
+// rows' width axis), the memory-resident model extended to user calls. The
+// three tests below are the positive lowering pins (INVERTED from the LD-2
+// walls).
 [[nodiscard]] GuardProbe lowerF128ArgProbe() {
     auto target = ::dss::TargetSchema::loadShipped("arm64");
     EXPECT_TRUE(target.has_value());
@@ -5873,8 +6279,14 @@ namespace {
 TEST(MirToLir, F128ArgLowersToEntryVRegisterSpill) {
     // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): INVERTED from the F128 Arg WALL.
     // An AAPCS64 binary128 PARAMETER arrives in v0 and is SPILLED to a memory home
-    // at entry (fstur_q [home] <- v0, the memory-resident model). Red-on-disable:
-    // revert the lowerArg F128 interception → the Arg width gate re-walls it.
+    // at entry (`fstur.128 [home] <- v0`, the memory-resident model).
+    // Red-on-disable: revert the lowerArg F128 interception → the Arg width gate
+    // re-walls it.
+    //
+    // ⚠ THE WIDTH IS PART OF THE PIN. The spill used to name the 128-bit-only
+    // `fstur_q`; it now names the class store `fstur`, whose width-DEFAULT is
+    // 64, so a lowering that dropped the width flag would spill EIGHT of the
+    // parameter's sixteen bytes and leave the rest of the home uninitialised.
     auto probe = lowerF128ArgProbe();
     EXPECT_TRUE(probe.ok)
         << "an F128 parameter must lower to the entry v-register spill: "
@@ -5883,7 +6295,7 @@ TEST(MirToLir, F128ArgLowersToEntryVRegisterSpill) {
         << "the Arg width wall must NOT fire for F128 any more";
     auto target = ::dss::TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
-    auto const fsturQ = (*target)->opcodeByMnemonic("fstur_q");
+    auto const fsturQ = (*target)->opcodeByMnemonic("fstur");
     auto const v0Ord  = (*target)->registerByName("v0");
     ASSERT_TRUE(fsturQ.has_value() && v0Ord.has_value());
     Lir const& lir = probe.lir;
@@ -5891,38 +6303,41 @@ TEST(MirToLir, F128ArgLowersToEntryVRegisterSpill) {
     bool sawSpill = false;
     for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
         auto const inst = lir.blockInstAt(bb, i);
-        if (lir.instOpcode(inst) != *fsturQ) continue;
-        auto const ops = lir.instOperands(inst);   // fstur_q [home] <- v0
+        if (!isQForm(lir, inst, *fsturQ)) continue;
+        auto const ops = lir.instOperands(inst);   // fstur.128 [home] <- v0
         if (!ops.empty() && ops[0].kind == LirOperandKind::Reg
-            && ops[0].reg.isPhysical && ops[0].reg.regClass() == LirRegClass::VR
+            && ops[0].reg.isPhysical && ops[0].reg.regClass() == LirRegClass::FPR
             && ops[0].reg.id == *v0Ord)
             sawSpill = true;
     }
     EXPECT_TRUE(sawSpill)
-        << "the F128 param must spill physical v0 to its home via fstur_q";
+        << "the F128 param must spill physical v0 to its home via `fstur` at "
+           "width 128";
 }
 
-TEST(MirToLir, F128CallResultLowersToFsturQAfterCall) {
+TEST(MirToLir, F128CallResultLowersToAQFormStoreAfterCall) {
     // INVERTED from the F128 Call-result WALL. A call RETURNING binary128 now
-    // LOWERS — the v0 return is captured by fstur_q [home] <- v0 IMMEDIATELY after
-    // the call (ADJACENCY). Red-on-disable: revert the lowerCall F128-result arm.
+    // LOWERS — the v0 return is captured by `fstur.128 [home] <- v0` IMMEDIATELY
+    // after the call (ADJACENCY). Red-on-disable: revert the lowerCall
+    // F128-result arm. ⓘ The capture used to name `fstur_q`; that mnemonic is
+    // deleted and the Q form is this row's width-128 variant.
     auto probe = lowerF128CallResultProbe();
     EXPECT_TRUE(probe.ok)
-        << "a call returning long double must lower (v0 → fstur_q): "
+        << "a call returning long double must lower (v0 → Q-form store): "
         << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
     EXPECT_FALSE(sawAnchor(probe.rep, "MIR Call result"))
         << "the Call-result width wall must NOT fire for F128 any more";
     auto target = ::dss::TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     auto const callOp = (*target)->opcodeByMnemonic("call");
-    auto const fsturQ = (*target)->opcodeByMnemonic("fstur_q");
+    auto const fsturQ = (*target)->opcodeByMnemonic("fstur");
     auto const v0Ord  = (*target)->registerByName("v0");
     ASSERT_TRUE(callOp.has_value() && fsturQ.has_value() && v0Ord.has_value());
     Lir const& lir = probe.lir;
     LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
     bool sawCapture = false;
     for (std::uint32_t i = 1; i < lir.blockInstCount(bb); ++i) {
-        if (lir.instOpcode(lir.blockInstAt(bb, i)) != *fsturQ) continue;
+        if (!isQForm(lir, lir.blockInstAt(bb, i), *fsturQ)) continue;
         if (lir.instOpcode(lir.blockInstAt(bb, i - 1)) != *callOp) continue;
         auto const ops = lir.instOperands(lir.blockInstAt(bb, i));
         if (!ops.empty() && ops[0].kind == LirOperandKind::Reg
@@ -5930,24 +6345,27 @@ TEST(MirToLir, F128CallResultLowersToFsturQAfterCall) {
             sawCapture = true;
     }
     EXPECT_TRUE(sawCapture)
-        << "the F128 call result must be captured by fstur_q [home] <- v0 "
-           "IMMEDIATELY after the call";
+        << "the F128 call result must be captured by a width-128 `fstur` "
+           "[home] <- v0 IMMEDIATELY after the call";
 }
 
-TEST(MirToLir, F128ReturnOperandLowersToFldurQBeforeBareRet) {
+TEST(MirToLir, F128ReturnOperandLowersToAQFormLoadBeforeBareRet) {
     // INVERTED from the F128 Return-operand WALL. `long double f(long double x)
-    // {return x;}` now LOWERS — the return operand is loaded into v0 by fldur_q
-    // v0,[home] BEFORE the bare ret (no reg operand). Red-on-disable: revert the
-    // lowerReturn F128 arm.
+    // {return x;}` now LOWERS — the return operand is loaded into v0 by
+    // `fldur.128 v0,[home]` BEFORE the bare ret (no reg operand).
+    // Red-on-disable: revert the lowerReturn F128 arm. ⓘ The load used to name
+    // `fldur_q`; that mnemonic is deleted and the Q form is this row's
+    // width-128 variant, so the width is asserted alongside the opcode.
     auto probe = lowerF128ReturnProbe();
     EXPECT_TRUE(probe.ok)
-        << "long double f(long double){return x;} must lower (fldur_q v0): "
+        << "long double f(long double){return x;} must lower (Q-form load into "
+           "v0): "
         << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
     EXPECT_FALSE(sawAnchor(probe.rep, "MIR Return operand"))
         << "the Return-operand width wall must NOT fire for F128 any more";
     auto target = ::dss::TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
-    auto const fldurQ = (*target)->opcodeByMnemonic("fldur_q");
+    auto const fldurQ = (*target)->opcodeByMnemonic("fldur");
     auto const retOp  = (*target)->opcodeByMnemonic("ret");
     auto const v0Ord  = (*target)->registerByName("v0");
     ASSERT_TRUE(fldurQ.has_value() && retOp.has_value() && v0Ord.has_value());
@@ -5960,14 +6378,15 @@ TEST(MirToLir, F128ReturnOperandLowersToFldurQBeforeBareRet) {
     bool fldurBeforeRet = false;
     for (std::uint32_t i = 0; i < *retIdx; ++i) {
         auto const inst = lir.blockInstAt(bb, i);
-        if (lir.instOpcode(inst) != *fldurQ) continue;
+        if (!isQForm(lir, inst, *fldurQ)) continue;
         LirReg const res = lir.instResult(inst);
-        if (res.isPhysical && res.regClass() == LirRegClass::VR
+        if (res.isPhysical && res.regClass() == LirRegClass::FPR
             && res.id == *v0Ord)
             fldurBeforeRet = true;
     }
     EXPECT_TRUE(fldurBeforeRet)
-        << "the F128 return must load [home] into physical v0 (fldur_q) before ret";
+        << "the F128 return must load [home] into physical v0 with a width-128 "
+           "`fldur` before ret";
     bool retHasReg = false;
     for (auto const& op : lir.instOperands(lir.blockInstAt(bb, *retIdx)))
         if (op.kind == LirOperandKind::Reg) retHasReg = true;
@@ -5980,9 +6399,11 @@ TEST(MirToLir, F128CallArgsMarshalIntoV0V1BeforeCall) {
     //   void g(long double* pa, long double* pb, long double* pr) {
     //       *pr = add(*pa, *pb);   // add: long double(long double,long double)
     //   }
-    // The two F128 args are marshalled into v0/v1 (fldur_q burst) IMMEDIATELY
-    // before the call — NOT operand-listed — and the F128 result is captured from
-    // v0 (fstur_q) IMMEDIATELY after (the LD-2 marshal→call adjacency).
+    // The two F128 args are marshalled into v0/v1 (a burst of Q-form `fldur`s)
+    // IMMEDIATELY before the call — NOT operand-listed — and the F128 result is
+    // captured from v0 by a Q-form `fstur` IMMEDIATELY after (the LD-2
+    // marshal→call adjacency). ⓘ Those two accesses used to be the separate
+    // `fldur_q`/`fstur_q` mnemonics; they are width-128 variants now.
     auto target = ::dss::TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
@@ -6018,8 +6439,8 @@ TEST(MirToLir, F128CallArgsMarshalIntoV0V1BeforeCall) {
     ASSERT_TRUE(result.ok)
         << "a user call with two F128 args + F128 result must lower: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
-    auto const fldurQ = (*target)->opcodeByMnemonic("fldur_q");
-    auto const fsturQ = (*target)->opcodeByMnemonic("fstur_q");
+    auto const fldurQ = (*target)->opcodeByMnemonic("fldur");
+    auto const fsturQ = (*target)->opcodeByMnemonic("fstur");
     auto const callOp = (*target)->opcodeByMnemonic("call");
     auto const v0Ord  = (*target)->registerByName("v0");
     auto const v1Ord  = (*target)->registerByName("v1");
@@ -6030,23 +6451,23 @@ TEST(MirToLir, F128CallArgsMarshalIntoV0V1BeforeCall) {
     auto const callIdx = findCallToSymbol(lir, bb, *callOp, 2u);
     ASSERT_TRUE(callIdx.has_value()) << "the direct user call to add must be found";
     ASSERT_GE(*callIdx, 2u);
-    // The two immediately-preceding insts are the v0/v1 arg marshals (fldur_q).
+    // The two immediately-preceding insts are the v0/v1 arg marshals.
     auto const m0 = lir.blockInstAt(bb, *callIdx - 2);
     auto const m1 = lir.blockInstAt(bb, *callIdx - 1);
-    EXPECT_EQ(lir.instOpcode(m0), *fldurQ);
-    EXPECT_EQ(lir.instOpcode(m1), *fldurQ);
+    EXPECT_TRUE(isQForm(lir, m0, *fldurQ));
+    EXPECT_TRUE(isQForm(lir, m1, *fldurQ));
     EXPECT_TRUE(lir.instResult(m0).isPhysical
-                && lir.instResult(m0).regClass() == LirRegClass::VR
+                && lir.instResult(m0).regClass() == LirRegClass::FPR
                 && lir.instResult(m0).id == *v0Ord)
         << "first F128 arg → v0";
     EXPECT_TRUE(lir.instResult(m1).isPhysical
-                && lir.instResult(m1).regClass() == LirRegClass::VR
+                && lir.instResult(m1).regClass() == LirRegClass::FPR
                 && lir.instResult(m1).id == *v1Ord)
         << "second F128 arg → v1";
-    // The immediately-following inst is the result capture (fstur_q [home] <- v0).
+    // The immediately-following inst is the result capture (Q-form store of v0).
     ASSERT_LT(*callIdx + 1, lir.blockInstCount(bb));
     auto const cap = lir.blockInstAt(bb, *callIdx + 1);
-    EXPECT_EQ(lir.instOpcode(cap), *fsturQ);
+    EXPECT_TRUE(isQForm(lir, cap, *fsturQ));
     auto const capOps = lir.instOperands(cap);
     ASSERT_GE(capOps.size(), 1u);
     EXPECT_TRUE(capOps[0].kind == LirOperandKind::Reg
@@ -6056,13 +6477,21 @@ TEST(MirToLir, F128CallArgsMarshalIntoV0V1BeforeCall) {
 
 TEST(MirToLir, DoubleArgDoesNotAliasF128ArgVRegisterAtEntry) {
     // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): the novel ENTRY-side aliasing
-    // case (the cross-class regalloc pin). A `double` arg sharing a signature with
-    // an AAPCS64 F128 arg must land in a register that does NOT alias the F128
-    // arg's incoming v-register (v{k} shares hwEncoding with d{k}) — else the F128
-    // entry spill `fstur_q [home] <- v{k}` would read whatever regalloc put in the
-    // aliased d-register. The shared NGRN/NSRN counter gives them DIFFERENT
-    // ordinals (double NSRN 0 → d0/hwEnc 0; F128 NSRN 1 → v1/hwEnc 1), so their
-    // physical registers never share an encoding. Runs the REAL regalloc.
+    // case. A `double` arg sharing a signature with an AAPCS64 F128 arg must land
+    // in a register that does NOT alias the F128 arg's incoming register — else
+    // the F128 entry spill `fstur.128 [home] <- v{k}` would read whatever regalloc
+    // put there. The NSRN gives them DIFFERENT ordinals (double NSRN 0 → v0/hwEnc
+    // 0; F128 NSRN 1 → v1/hwEnc 1), so their physical registers never share an
+    // encoding. Runs the REAL regalloc.
+    //
+    // ⚠ THIS USED TO BE "the cross-class regalloc pin", AND IT IS NOT CROSS-CLASS
+    // ANY MORE. The `double` went to `argFprs` (class `fpr`, d-views) and the F128
+    // to `argVrs` (class `vr`, v-views) — two pools over one file, kept in step by
+    // a derived cursor, which is what made the hazard hard to see. With the file
+    // declared ONCE (R1 of design A′) both draw ordinals from the SAME `argFprs`
+    // list, so the collision the shared cursor prevented is now prevented by there
+    // being one cursor at all. The pin stays because it measures the OUTCOME —
+    // what regalloc actually assigned — rather than the mechanism.
     //   void f(double d, long double ld, double* pd, long double* pld) {
     //       *pd = d; *pld = ld;   // both live PAST the entry spill
     //   }
@@ -6102,7 +6531,7 @@ TEST(MirToLir, DoubleArgDoesNotAliasF128ArgVRegisterAtEntry) {
     std::uint16_t const v1Enc = v1Info->hwEncoding;
 
     // Find the double's arg vreg: the FPR-class `arg` op (ld's F128 arg lowered to
-    // fstur_q, NOT an `arg` op, so the sole FPR `arg` is the double).
+    // a Q-form `fstur`, NOT an `arg` op, so the sole FPR `arg` is the double).
     Lir const& lir = result.lir;
     LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
     auto const argOp = (*target)->opcodeByMnemonic("arg");
@@ -6139,7 +6568,7 @@ TEST(MirToLir, DoubleArgDoesNotAliasF128ArgVRegisterAtEntry) {
 TEST(MirToLir, LongDoubleUserCallComposesWithSoftcall) {
     // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4) compose check:
     //   void g(long double* pa,*pb,*pc,*pr) { *pr = add(*pa,*pb) + *pc; }
-    // A USER Call returning F128 (LD-4: v-register marshal + fstur_q capture)
+    // A USER Call returning F128 (LD-4: v-register marshal + Q-form store capture)
     // FEEDS an F128 FAdd (LD-2 softcall __addtf3). Both are memory-resident: the
     // call-result's home feeds the softcall via regForValue unchanged; the
     // softcall's OWN bare-[SymbolRef] Call never re-enters the user-call F128 arm.
@@ -6317,10 +6746,22 @@ TEST(MirToLir, F128StoreLowersToGprPairCopy) {
 }
 
 TEST(MirToLir, F128SoftcallDoesNotClobberDoubleLiveAcrossCall) {
-    // Risk-C net (the v0/d0 aliasing safety): a `double` LIVE ACROSS the F128
-    // softcall must NOT be assigned d0/d1 — the BL's caller-saved clobber of
-    // v0-v7 (aliasing d0-d7) is what keeps it off them. This runs the REAL
-    // regalloc and inspects the post-regalloc assignment.
+    // Risk-C net: a `double` LIVE ACROSS the F128 softcall must NOT be assigned
+    // the SIMD&FP registers the helper uses as transient scratch — the BL's
+    // caller-saved clobber of v0-v7 is what keeps it off them. This runs the
+    // REAL regalloc and inspects the post-regalloc assignment.
+    //
+    // ⚠⚠ THE COMPARISON BELOW USED TO BE AGAINST THE ORDINALS OF `d0`/`d1` AND
+    // WOULD NOW BE VACUOUS. It read "must NOT be assigned d0/d1 ... the BL's
+    // caller-saved clobber of v0-v7 (aliasing d0-d7) is what keeps it off
+    // them", and compared `phys.id` to `registerByName("d0")`. With arm64's
+    // SIMD&FP file declared ONCE (R1 of design A′) the `d` rows are `subOf`
+    // VIEWS and are NEVER allocatable, so the allocator can only ever hand out
+    // a `v` ordinal and the inequality would hold for every possible outcome —
+    // including the miscompile. ★ The check is therefore against the ordinals
+    // the softcall ACTUALLY names (`v0`/`v1`, read off the target's own
+    // `wideFloatSoftcall` row rather than typed here), which is the register
+    // identity that was always the subject.
     //   double f(long double* pa, long double* pb, long double* pr, double d) {
     //       *pr = (*pa) + (*pb);   // the softcall (a `call`, isCall=true)
     //       return d;              // d must survive the call
@@ -6382,18 +6823,43 @@ TEST(MirToLir, F128SoftcallDoesNotClobberDoubleLiveAcrossCall) {
     auto const* a = alloc.perFunc[0].forVReg(dVreg->id);
     ASSERT_NE(a, nullptr) << "the double vreg must have an assignment";
     // A value live across a call must not sit in a caller-saved arg register.
-    auto const d0Ord = (*target)->registerByName("d0");
-    auto const d1Ord = (*target)->registerByName("d1");
-    ASSERT_TRUE(d0Ord.has_value() && d1Ord.has_value());
+    // ★ The forbidden ordinals come from the target's OWN softcall row, so a
+    // config that moved the helper's scratch registers moves this pin with it
+    // — and a pin typed against register NAMES could not follow.
+    auto const* add =
+        (*target)->wideFloatSoftcall(::dss::WideFloatOp::Add);
+    ASSERT_NE(add, nullptr) << "arm64 must declare the F128 `add` softcall row";
+    ASSERT_EQ(add->argRegisterOrdinals.size(), 2u);
     ASSERT_FALSE(a->isSpilled())
-        << "the double should get a callee-saved d-reg (d8-d15), not spill";
+        << "the double should get a callee-saved SIMD&FP register (8-15), not "
+           "spill";
     LirReg const phys = a->physReg();
-    EXPECT_NE(phys.id, *d0Ord)
-        << "a double live across the F128 softcall must NOT be in d0 (the "
-           "softcall's v0 scratch aliases it) — the BL caller-saved clobber "
-           "must have pushed it to a callee-saved register";
-    EXPECT_NE(phys.id, *d1Ord)
-        << "likewise not d1 (aliases the softcall's v1 scratch)";
+    EXPECT_NE(phys.id, add->argRegisterOrdinals[0])
+        << "a double live across the F128 softcall must NOT be in the "
+           "helper's first scratch register — the BL caller-saved clobber must "
+           "have pushed it to a callee-saved one";
+    EXPECT_NE(phys.id, add->argRegisterOrdinals[1])
+        << "likewise not the helper's second scratch register";
+    EXPECT_NE(phys.id, add->resultRegisterOrdinal)
+        << "nor the register the helper's RESULT comes back in";
+    // ⓘ And the ordinal really is one the allocator could have chosen, so the
+    // inequalities above are not satisfied by construction: the forbidden
+    // registers must be members of the allocatable FP set this cc names.
+    auto const* cc = (*target)->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    auto const scratchName =
+        (*target)->registerInfo(add->argRegisterOrdinals[0])->name;
+    bool scratchIsAllocatable = false;
+    for (auto const* list : {&cc->argFprs, &cc->returnFprs, &cc->callerSaved,
+                             &cc->calleeSaved}) {
+        for (auto const& n : *list) {
+            if (n == scratchName) scratchIsAllocatable = true;
+        }
+    }
+    EXPECT_TRUE(scratchIsAllocatable)
+        << "the softcall's scratch register '" << scratchName
+        << "' is not in any allocatable cc list, so the allocator could never "
+           "have assigned it and the inequalities above assert nothing";
 }
 
 // ══ C99 _Complex (D-CSUBSET-COMPLEX / design test #11): long-double-complex
@@ -7181,7 +7647,23 @@ TEST(MirToLir, VlaBlockScopeStackRestoreLowersToSpRestore) {
 // at MIR->LIR — the base a `sub sp` leaves is only stack-aligned, so a 32-aligned
 // element would land under-aligned. RED-ON-DISABLE: drop the elemAlign gate in
 // lowerVlaAlloca -> the VLA would silently under-align its elements.
-TEST(MirToLir, VlaOverAlignedElementFailsLoud) {
+// VLA (D-CSUBSET-VLA): a VLA whose ELEMENT is over-aligned beyond the alignment the
+// dynamic `sub sp` guarantees is HONOURED — the runtime size carries `elemAlign` bytes of
+// rounding headroom and the captured base is rounded up through the shared
+// `emitAlignUpToPowerOfTwo`, with SP never realigned.
+//
+// ⚠ THIS TEST USED TO ASSERT THE OPPOSITE, as `VlaOverAlignedElementFailsLoud`, on the
+// premise that honouring the shape needed a dynamically realigned stack pointer.
+// ✔MEASURED 2026-09-01: gcc 13.3.0 and clang 18.1.3 both compile the shape, run it, and
+// hand back a genuinely 32-aligned base — so the refusal was a conformance gap, not a
+// design choice, and the premise went false while the assertion kept passing.
+//
+// ★ THE LOAD-BEARING PIN IS NOT HERE. An address's alignment, and its non-overlap with a
+// neighbouring VLA, are RUN-TIME facts that cannot be read off a lowering — the runtime
+// witness is `examples/c/c99_vla_element_overaligned`, whose first draft passed OVER an
+// 8-byte overlap of two live objects because the overrun landed in trailing padding.
+// This test pins only that the lowering no longer REFUSES, and that it emitted something.
+TEST(MirToLir, VlaOverAlignedElementLowers) {
     auto L = lowerCToLir(
         "int f(int n) {\n"
         "  _Alignas(32) int a[n];\n"
@@ -7189,14 +7671,24 @@ TEST(MirToLir, VlaOverAlignedElementFailsLoud) {
         "}\n");
     ASSERT_FALSE(L.model.hasErrors());
     ASSERT_TRUE(L.mir.ok);
-    EXPECT_FALSE(L.lir.ok)
-        << "an over-aligned VLA element must fail the LIR lowering";
-    bool sawOverAlign = false;
+    EXPECT_TRUE(L.lir.ok)
+        << "an over-aligned VLA element must LOWER — the runtime size carries the "
+           "rounding headroom and the captured base is rounded";
     for (auto const& d : L.lirReporter.all()) {
-        if (d.code == DiagnosticCode::L_OverAlignedStackLocal) sawOverAlign = true;
+        EXPECT_NE(d.code, DiagnosticCode::L_OverAlignedStackLocal)
+            << "L_OverAlignedStackLocal survives only as the non-power-of-two invariant "
+               "guard; an ordinary _Alignas(32) element must not reach it";
     }
-    EXPECT_TRUE(sawOverAlign)
-        << "an over-aligned VLA element must surface L_OverAlignedStackLocal";
+    // ⚠ A lowering that emitted NOTHING would satisfy both assertions vacuously — the
+    // exact class D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO
+    // was closed for this cycle. Assert a POSITIVE count rather than trusting `ok`.
+    std::uint32_t insts = 0;
+    for (std::size_t f = 0; f < L.lir.lir.moduleFuncCount(); ++f) {
+        LirFuncId const fn = L.lir.lir.funcAt(static_cast<std::uint32_t>(f));
+        for (std::uint32_t b = 0; b < L.lir.lir.funcBlockCount(fn); ++b)
+            insts += L.lir.lir.blockInstCount(L.lir.lir.funcBlockAt(fn, b));
+    }
+    EXPECT_GT(insts, 0u) << "the lowered function must contain instructions";
 }
 
 // ── FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): native-vs-SWAR lowering ─────────

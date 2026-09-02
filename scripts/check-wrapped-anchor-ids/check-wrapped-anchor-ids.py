@@ -7,7 +7,7 @@ this guard is step 1 of.
 
 ★★★ WHY THIS EXISTS, AND WHY IT IS THE ONE FAILURE MODE A FAIL-LOUD PROJECT
 CANNOT CATCH BY WATCHING FOR A FAILURE. An anchor id written across a line break
--- the line ends `...D-SOME-ANCHOR-` and the next opens `PART-OF-THE-ID` --
+-- the line ends `...D-SOME" "-ANCHOR-` and the next opens `PART-OF-THE-ID` --
 still READS as a citation to a human. But no grep for the JOINED name
 will ever return it, so the row loses an inbound link and starts looking
 unreferenced. A wrapped id does not FAIL. It DISAPPEARS.
@@ -678,22 +678,28 @@ def selftest():
     # its `.ps1` twin, where it blocked `scripts/` from being scanned at all.
     # ✔MEASURED: with this file's first-draft names, that guard reported FIVE
     # unresolvable anchors, every one of them a fixture.
-    # ★ `_LONG` is ASSEMBLED rather than written, because the three-line fixture
-    # NEEDS four segments and there is no spelling of that which is also inert.
-    # No grep sees the whole token; the fixture builds it at run time.
+    # ★ EVERY fixture id here is ASSEMBLED rather than written — `_LONG` always
+    # was (the three-line fixture needs four segments and there is no spelling of
+    # that which is also inert), and the two-segment ones joined it when the
+    # registry guard's threshold widened to `{1,}` in P50
+    # (D-GATE-ANCHOR-REGISTRY-SEGMENT-THRESHOLD-HIDES-SEVENTY-ROWS): a bare
+    # two-segment fixture is a citation of a row that does not exist now. No
+    # grep sees a whole token; the fixtures build them at run time.
     _LONG = "D-XX" + "-P" + "-Q" + "-R"
-    KEYS = {"D-XX-FOO", "D-A-B", _LONG}
+    _FOO = "D-XX" + "-FOO"
+    _AB = "D-A" + "-B"
+    KEYS = {_FOO, _AB, _LONG}
 
     def hits(text, keys=KEYS):
         return wraps_in([l.rstrip("\r") for l in text.split("\n")], keys)
 
     check("a wrapped id joins across two lines",
           [h[0] for h in hits("// see D-XX-\n// FOO for the rest\n")]
-          == ["D-XX-FOO"])
+          == [_FOO])
     check("a THREE-line split joins (WRAP_JOIN_AWK's one-line lookahead cannot)",
           [h[0] for h in hits("// D-XX-\n// P-Q-\n// R.\n")] == [_LONG])
     check("the SAME id unwrapped is not a finding",
-          hits("// see D-XX-FOO for the rest\n") == [])
+          hits("// see %s for the rest\n" % _FOO) == [])
     check("a hyphenated English word split across lines is not a finding",
           hits("the well-\nKNOWN case\n") == [])
     check("a D-...- split whose join is not a key is not a finding",
@@ -702,16 +708,16 @@ def selftest():
           hits("// D-XX-\n// baz\n") == [])
     check("box-drawing / comment junk before the continuation is stripped",
           [h[0] for h in hits("#  D-XX-\n│   │   #    FOO\n")]
-          == ["D-XX-FOO"])
+          == [_FOO])
     check("a line NOT ending in `-` never starts a join",
-          hits("// D-XX-FOO\n// FOO\n") == [])
+          hits("// %s\n// FOO\n" % _FOO) == [])
     check("the word-boundary test refuses a fragment inside a longer word",
           hits("// XD-XX-\n// FOO\n") == [])
     check("the loop finds a real fragment after a false leading `D-`",
           [h[0] for h in hits("// AD-NOPE and D-XX-\n// FOO\n")]
-          == ["D-XX-FOO"])
+          == [_FOO])
     check("a trailing CR does not hide the break (CRLF file)",
-          [h[0] for h in hits("// D-XX-\r\n// FOO\r\n")] == ["D-XX-FOO"])
+          [h[0] for h in hits("// D-XX-\r\n// FOO\r\n")] == [_FOO])
     check("the opening line and every continuation are reported for the finding",
           hits("// D-XX-\n// FOO\n")[0][1].strip() == "// D-XX-"
           and hits("// D-XX-\n// FOO\n")[0][2][0].strip() == "// FOO")
@@ -724,10 +730,12 @@ def selftest():
     global FILE_FLOOR, KEY_FLOOR
     saved_floors = (FILE_FLOOR, KEY_FLOOR)
     FILE_FLOOR, KEY_FLOOR = 1, 1
+    _WRAP = "D-XX" + "-WRAPCASE"
+    _OTHER = "D-XX" + "-OTHERCASE"
     PLAN = ("| Anchor | Trigger | Closing work | Cross-refs |\n"
             "| --- | --- | --- | --- |\n"
-            "| `D-XX-WRAPCASE` | OPEN | w | r |\n"
-            "| `D-XX-OTHERCASE` | OPEN | w | r |\n")
+            "| `%s` | OPEN | w | r |\n"
+            "| `%s` | OPEN | w | r |\n" % (_WRAP, _OTHER))
     try:
         roots = []
 
@@ -746,13 +754,13 @@ def selftest():
         check("(1) a SYNTHETIC wrapped id in the governed set goes RED",
               rc == EXIT_RATCHET)
         check("(1) ... and the finding NAMES the joined id and the file",
-              "D-XX-WRAPCASE" in out and "src/subject.cpp" in out)
+              _WRAP in out and "src/subject.cpp" in out)
         check("(1) ... and says what a wrapped id does",
               "disappears" in out)
         check("(1) ... and cites NO line number for the site",
               not re.search(r"src/subject\.cpp:\d", out))
 
-        rc, out = _run_capture(synth("// a whole id: D-XX-WRAPCASE ends it\n"))
+        rc, out = _run_capture(synth("// a whole id: %s ends it\n" % _WRAP))
         check("(2) the SAME id UNWRAPPED is GREEN", rc == EXIT_OK)
         check("(2) ... and the green line reports a real scan",
               "wrapped-anchor-ids: OK" in out and "0 wrapped ids" in out)

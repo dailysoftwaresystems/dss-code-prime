@@ -4,6 +4,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
+#include "core/substrate/path_identity.hpp"       // genericSpelling
 #include "core/types/config_path_walk.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -228,7 +229,8 @@ slurpFile(std::filesystem::path const& path, DiagnosticReporter& reporter) {
         return std::unexpected(emitAndReturn(
             HeaderReadErrorKind::FileOpenFailed,
             (err.kind == core::FileReadFailure::OpenFailed
-                 ? "FFI header file could not be opened: " + path.generic_string()
+                 ? "FFI header file could not be opened: "
+                       + core::genericSpelling(path)
                  : "FFI header file: " + err.message),
             reporter));
     }
@@ -475,7 +477,11 @@ readCHeader(std::filesystem::path const& headerPath,
             DiagnosticReporter&          reporter) {
     auto contents = slurpFile(headerPath, reporter);
     if (!contents) return std::unexpected(contents.error());
-    return readCHeaderFromText(*contents, headerPath.generic_string(),
+    // This string becomes the unit's FILE NAME — the locator on every
+    // diagnostic the header's own parse emits, and the key a line map is built
+    // against. A collapsed authority is therefore not a cosmetic loss here: it
+    // renames the compilation unit.
+    return readCHeaderFromText(*contents, core::genericSpelling(headerPath),
                                 importLibrary, reporter);
 }
 

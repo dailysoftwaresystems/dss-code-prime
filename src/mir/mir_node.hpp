@@ -2,6 +2,7 @@
 
 #include "core/substrate/arena_tag.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/section_kind.hpp"           // StaticInitSchedule
 #include "core/types/symbol_attrs.hpp"           // SymbolBinding / SymbolVisibility
 #include "core/types/type_lattice/type_id.hpp"   // TypeId
 #include "mir/mir_opcode.hpp"
@@ -394,6 +395,31 @@ struct MirFunc {
     // for SIX more before the static_assert below fails.
     // ★ Re-MEASURE before quoting these numbers again — a plausible-sounding
     // size claim went unchecked into this comment once already.
+    //
+    // ★★ D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: THE FIRST
+    // MEMBER HERE THAT IS NOT A FLAG, and the first one to move the size past the
+    // old `<= 32` budget. This function's place in the program's static-
+    // initializer schedule — which of the two channels it joins, and at what
+    // priority in each. Empty for every ordinary function.
+    //
+    // ★ WHY IT IS 8 BYTES AND NOT 16. The natural spelling is two
+    // `std::optional<std::uint32_t>` members, which is 16 and would have put this
+    // record at 44. `StaticInitSchedule` therefore stores two raw `uint32_t` with
+    // an absent sentinel and hands callers `std::optional` through accessors — the
+    // encoding is private to that struct and no reader here has to know it exists.
+    // Even so the record grows 28 → 36, which BREACHES the old `<= 32` budget: the
+    // budget was a statement about a run of 1-byte flags, and it is restated below
+    // as `<= 40` with the same four bytes of slack it always carried, so the next
+    // addition still trips a compile error rather than sliding through.
+    //
+    // ★ IT IS CARRIED THROUGH EVERY CREATE / COPY / REBUILD / SERIALIZE PATH on
+    // exactly the discipline the flags above already state, and for this axis the
+    // consequence of missing one is the worst in the record: a rebuilt function
+    // that lost its schedule is a program whose initializer stops running, with
+    // no diagnostic anywhere. `mir_text` prints it and `parseFunction` reads it
+    // back, so a dropped hop is visible in a `.dssir` round trip rather than only
+    // in a run.
+    StaticInitSchedule staticInit{};                           // 8
 };
 // ★★ TF-C92: the EXACT size + alignment, not only the ceiling. The `<= 32`
 // budget assert below has FOUR BYTES OF SLACK at the current 28, so it pinned
@@ -416,14 +442,24 @@ struct MirFunc {
 // A flag added WITHOUT updating these two lines is now a compile error naming the
 // new size, which is the moment to re-do the budget arithmetic rather than to
 // discover later that a stale comment was quoted.
-static_assert(sizeof(MirFunc) == 28,
-              "detail::MirFunc is 28 bytes (roundUp4(20 + 6 one-byte flags)) — "
-              "if you added a flag, re-measure and update the padding-budget "
-              "comment above along with this number");
+// ★★ 2026-08-28 (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN):
+// the arithmetic above is a closed form for a run of ONE-BYTE FLAGS, and this
+// record now also carries an 8-byte `StaticInitSchedule`. The form generalizes
+// to `size = roundUp4(20 + flagCount) + sizeof(staticInit)` = roundUp4(26) + 8
+// = 28 + 8 = **36**, still alignof 4 (the schedule is two `uint32_t`). The
+// exact pins below moved with it; the BUDGET moved from `<= 32` to `<= 40`,
+// which keeps the SAME four bytes of slack the old ceiling carried, so the next
+// four flags still fit and the fifth is still a compile error. Widening the
+// budget to swallow the addition silently would have retired the only guard that
+// makes anyone re-do this arithmetic.
+static_assert(sizeof(MirFunc) == 36,
+              "detail::MirFunc is 36 bytes (roundUp4(20 + 6 one-byte flags) + an "
+              "8-byte StaticInitSchedule) — if you added a member, re-measure and "
+              "update the padding-budget comment above along with this number");
 static_assert(alignof(MirFunc) == 4,
               "detail::MirFunc is 4-byte aligned because TypeId is two uint32_t "
               "— the whole padding budget above assumes 4-byte growth steps");
-static_assert(sizeof(MirFunc) <= 32, "detail::MirFunc grew unexpectedly — review layout");
+static_assert(sizeof(MirFunc) <= 40, "detail::MirFunc grew unexpectedly — review layout");
 static_assert(std::is_trivially_copyable_v<MirFunc>);
 
 // ── global POD ──────────────────────────────────────────────────────────────────

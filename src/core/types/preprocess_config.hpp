@@ -638,10 +638,86 @@ enum class PragmaEffect : std::uint8_t {
     // Real translation semantics DSS has NOT implemented → loud + unsuppressable.
     Unsupported,
     // TF-C87: the pragma declares its FILE include-once (C's `#pragma once`).
-    // Still loud at `applyPragma` (DSS implements no include-once dedup); the
-    // verb exists so the include-guard detector can NAME the mechanism instead
-    // of reporting "no include guard detected". See the argument above.
+    // ⚠ THE SENTENCE THAT SAT HERE IS SUPERSEDED AND KEPT ONLY AS THE TRAIL:
+    // "Still loud at `applyPragma` (DSS implements no include-once dedup)".
+    // D-PP-PRAGMA-RECOGNIZED-SEMANTICS BUILT the dedup on 2026-08-29, so this
+    // verb now has a REAL SINK: `SynthBuilder` keeps a TU-wide include-once
+    // registry keyed on file IDENTITY, the reached pragma records the file, and
+    // a later `#include` naming it is skipped. `applyPragma` is silent on this
+    // verb because the effect has already happened during the SPLICE — the only
+    // phase that can honour it. The verb is ALSO still read by the include-guard
+    // detector, which is why it exists separately from the packing/optimizer
+    // sinks.
     IncludeOnce,
+    // ★★★ D-PP-PRAGMA-RECOGNIZED-SEMANTICS: the two `#pragma STDC` verbs
+    // (C23 6.10.8 `standard-pragma`). APPENDED LAST so every pre-existing
+    // enumerator keeps its numeric value — the convention this file's other
+    // append notes state.
+    //
+    // ★★ THEY ARE A PAIR ON PURPOSE, AND THE SPLIT IS THE WHOLE POINT. A single
+    // accepting verb would have been FALSE for three of the nine standard forms,
+    // and false in the direction that ships wrong numerics in silence. The
+    // registry's job is to make a per-form JUDGEMENT readable in config, so the
+    // judgement is what the verb encodes.
+    //
+    // `StandardFloatState` — the requested state is one THIS implementation's
+    // behaviour SATISFIES, so the pragma is accepted and inert. ✔MEASURED
+    // against C23 N3220 rather than assumed:
+    //   • `FP_CONTRACT ON`  — 7.12.2p2 says the pragma "can be used to ALLOW (if
+    //     the state is on)" contraction. ON is a PERMISSION, never a
+    //     requirement, so an implementation that never contracts satisfies it.
+    //   • `FP_CONTRACT OFF` — disallows contraction, which is already true:
+    //     MEASURED, zero FMA/contraction/fast-math/reassociation sites exist in
+    //     src/{opt,mir,lir,hir,asm}.
+    //   • `FP_CONTRACT DEFAULT` / `FENV_ACCESS DEFAULT` — 7.12.2p2 and 7.6.1p2
+    //     BOTH say the default state is IMPLEMENTATION-DEFINED, so DSS defining
+    //     it as never-contract / fenv-unaware is conforming by construction.
+    //   • `FENV_ACCESS OFF` — the permissive state; 7.6.1 footnote 248 says the
+    //     translator may then assume flags are untested and default modes hold.
+    //   • `CX_LIMITED_RANGE ON` — 7.3.4p2 says ON informs the implementation
+    //     that "the usual mathematical formulas are acceptable", and the usual
+    //     formulas are exactly what DSS emits.
+    //
+    // `StandardFloatStateDiverges` — the requested state is one this
+    // implementation does NOT satisfy. The translation unit is still ACCEPTED,
+    // and a WARNING NAMES the divergence at the pragma.
+    //
+    // ⛔ WHY ACCEPTED-WITH-NOTICE RATHER THAN EITHER OBVIOUS ALTERNATIVE, since
+    // both were considered and both are wrong:
+    //   • ACCEPT SILENTLY is a silent wrong-numerics program, the class the bar
+    //     most abhors — worse than the refusal it would replace, because a
+    //     refusal is at least visible.
+    //   • REFUSE LOUD is below the reference union. ✔MEASURED 2026-08-29, all
+    //     four references ACCEPT all nine forms rc=0 (WSL gcc 13.3.0 and
+    //     mingw-w64 gcc 13.2.0 silently; WSL clang 18.1.3 and MSVC 19.51.36252
+    //     with a warning), so refusing is a conformance defect.
+    // Accepted-with-notice is neither silent nor below the union. The notice
+    // rides `P_PreprocessorPragma`, which is a member of `kUnsuppressableCodes`
+    // — so it bypasses the cap and dedup gates and `--suppress` cannot silence
+    // it, while Warning severity leaves the TU compiling. Unsuppressable governs
+    // SUPPRESSION, not SEVERITY; the two are independent here and that is what
+    // makes this shape available at all.
+    //
+    // ✔THE THREE DIVERGING FORMS, MEASURED:
+    //   • `FENV_ACCESS ON` — 7.6.1 footnote 248: the pragma exists to disallow
+    //     "global common subexpression elimination, code motion, and constant
+    //     folding" that could subvert flag tests. MEASURED, DSS's
+    //     `isCseCandidateOpcode` excludes only terminators, Phi and
+    //     side-effecting opcodes, so FAdd/FMul/FDiv ARE CSE candidates and an
+    //     intervening call is not a barrier. ⚠ This is NOT the same claim as
+    //     "unreachable": `<fenv.h>` is not shipped (a program including it dies
+    //     at F_ShippedHeaderNotFound), which makes the C-level facility absent,
+    //     but DSS has inline assembly as its own source language, so a program
+    //     CAN still change rounding modes. Not satisfied; merely hard to reach.
+    //   • `CX_LIMITED_RANGE OFF` and `DEFAULT` — DSS lowers complex `*` and `/`
+    //     with the usual algebraic formulas (`materializeComplexBinaryOp` says
+    //     so, and Annex-G recovery is deferred at D-CSUBSET-COMPLEX-ANNEX-G).
+    //     ★ DEFAULT IS IN THE SAME POSITION AS OFF AND THAT IS MEASURED, NOT
+    //     INFERRED: unlike the other two pragmas, 7.3.4p2 MANDATES the default
+    //     — "The default state for the pragma is off" — so DEFAULT is not
+    //     implementation-defined here and cannot be defined into conformance.
+    StandardFloatState,
+    StandardFloatStateDiverges,
 };
 
 // One registry row: the leading WORD(S) that identify a pragma, and what DSS

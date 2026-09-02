@@ -62,10 +62,26 @@ namespace dss {
 //                         via `core/types/glob_match.hpp`); a metacharacter-free
 //                         entry stays literal. Base = the process working
 //                         directory; a zero-match pattern fails loud there.
-//   * `output`          — artifact output hint. Parsed + type-validated
-//                         (a user-authored schema field); its path
-//                         ROUTING is deferred (D-AP2-OUTPUT-ROUTING) — AP2
-//                         uses the existing per-target output convention.
+//   * `output`          — OPTIONAL output-dir BASE: the `<base>` each target's
+//                         artifact routes into as `<base>/<formatName>/
+//                         <artifactName-or-stem><ext>`, i.e. the same thing the
+//                         CLI `--output` names. Absent ⇒ `--output` when given,
+//                         else `<cwd>/target` (both defaults unchanged).
+//                         A DIRECTORY, never a file path — `artifactName` owns
+//                         the emitted binary's NAME, and one fact does not get a
+//                         second owner. RELATIVE resolves against the PROCESS
+//                         working directory, the same base `sources[]` and
+//                         `preBuildScripts` use, so a manifest composes with
+//                         itself. PRECEDENCE: the CLI `--output` WINS (the
+//                         `stackReserve` rule) and the override is ANNOUNCED on
+//                         the driver note channel when the two name different
+//                         directories. Wired by `Program::compileProject`
+//                         (D-AP2-OUTPUT-ROUTING) — the LOADER still only parses
+//                         and type-validates, per the pure-parser rule below.
+//                         ⓘ A DEPENDENCY manifest's `output` is NOT read, the
+//                         U-9 ruling: the output base is a property of THE
+//                         BUILD, exactly as `targets[]` and
+//                         `dependencyArtifactCache` are.
 //   * `artifactName`    — OPTIONAL base NAME for the emitted binary (no
 //                         extension, no path separators — a name, not a path).
 //                         Absent ⇒ the source stem (unchanged). A project build
@@ -159,11 +175,80 @@ struct DSS_EXPORT DependencyEntry {
     friend bool operator==(DependencyEntry const&, DependencyEntry const&) = default;
 };
 
+// ── OPTIONAL cross-build dependency artifact cache
+//    (`dependencyArtifactCache`) ──────────────────────────────────────────────
+//
+// D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C). Two builds
+// of one project at one configuration recompile every dependency from scratch,
+// because nothing outlives the process. This declares the policy for a
+// CONTENT-ADDRESSED store that lets the second build serve a dependency's
+// artifact instead of rebuilding it.
+//
+// ★★★ IT IS READ OFF THE **ROOT** MANIFEST ONLY, AND A DEPENDENCY'S OWN COPY IS
+// NOT READ. That is the same ruling that ignores a dependency's `targets[]`
+// (plan 06 §5.1 B.10) and its `output` (U-9), applied to the same kind of fact:
+// caching is a property of THE BUILD, not of a prerequisite, and a graph whose
+// nodes each declared their own policy would make "is this build cached?" a
+// question with N answers and no owner. `Resolver::buildNode_` propagates the
+// root's policy onto every sub-build, on the list that already carries
+// `setCompileConfig` / `setJobs` / `setExecutor`.
+//
+// ★★★ `rootOverrideVariable` **NAMES** THE ENVIRONMENT VARIABLE, IN CONFIG —
+// this loader never reads the environment, and neither does anything else on
+// the strength of a compiled-in name. It is strictly better than
+// `runtime_object_cache.hpp`'s compiled-in `DSS_RUNTIME_CACHE_DIR`: a hermetic
+// build declares the variable it already sets, and two projects on one machine
+// can keep separate caches without either of them patching the compiler.
+//
+// ⚠ ALL THREE MEMBERS ARE REQUIRED WHEN THE OBJECT IS PRESENT, and the
+// degenerate spelling REJECTS rather than aliasing — the same rule + rationale
+// as `resolveLibraries`' object form. `{"enabled": false}` alone would mean
+// exactly what OMITTING the key means, said less clearly; and a cache whose
+// location override is unnamed is environment sniffing with an extra step.
+enum class DependencyArtifactCacheEviction {
+    // Storing an entry DELETES the superseded entries that share its stem in
+    // the same directory — the discipline `runtime_object_cache.cpp`'s
+    // `pruneSupersededSiblings` already applies. Bounded disk; a rebuilt
+    // dependency leaves one current entry behind.
+    PruneSuperseded,
+    // Every entry is KEPT. Deliberately unbounded, and it is the policy a
+    // branch-switching or bisecting workflow needs: under pruning, alternating
+    // between two revisions of one dependency evicts each other's entry and
+    // both arms stay permanently cold.
+    Retain,
+};
+
+struct DSS_EXPORT DependencyArtifactCacheConfig {
+    // false ⇒ nothing is looked up and nothing is stored, exactly as if the
+    // member were absent. Present-and-false is legal so a manifest can carry a
+    // policy it has switched off without deleting the declaration.
+    bool        enabled = false;
+    // The NAME of the environment variable that overrides the cache location.
+    // Never read here — this loader touches no environment, exactly as it
+    // touches no filesystem (the pure-parser rule on `parseProjectConfig`).
+    std::string rootOverrideVariable;
+    DependencyArtifactCacheEviction eviction =
+        DependencyArtifactCacheEviction::PruneSuperseded;
+    friend bool operator==(DependencyArtifactCacheConfig const&,
+                           DependencyArtifactCacheConfig const&) = default;
+};
+
+// The accepted `eviction` tokens, and that same list comma-joined for a
+// message. Exported for the reason `projectConfigKnownKeys()` is: a test that
+// pins the reject message must not re-type the vocabulary, or the drift the
+// derivation removes reappears one layer out.
+[[nodiscard]] DSS_EXPORT std::span<std::string_view const>
+dependencyArtifactCacheEvictionTokens() noexcept;
+
+[[nodiscard]] DSS_EXPORT std::string
+dependencyArtifactCacheEvictionTokenList();
+
 struct DSS_EXPORT ProjectConfig {
     std::string              language;
     std::string              artifactProfile;
     std::vector<std::string> targets;
     std::vector<std::string> sources;
+    // The output-dir BASE (D-AP2-OUTPUT-ROUTING); see the field note above.
     std::optional<std::string> output;   // nullopt iff the field is absent
     // OPTIONAL base NAME for the emitted binary (no extension / path
     // separators). nullopt ⇒ the source stem. In a project build each target's
@@ -199,6 +284,11 @@ struct DSS_EXPORT ProjectConfig {
     std::vector<ScriptEntry>     preBuildScripts;   // run BEFORE the build
     std::vector<ScriptEntry>     postBuildScripts;  // run AFTER the build
     std::vector<DependencyEntry> dependsOn;         // prerequisite projects
+    // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C).
+    // nullopt iff the member is absent ⇒ NO cache: nothing is looked up and
+    // nothing is written, so every manifest that predates this field builds
+    // byte-identically. Read off the ROOT manifest only — see the note above.
+    std::optional<DependencyArtifactCacheConfig> dependencyArtifactCache;
 };
 
 // Parse a project config from JSON text. `sourceLabel` names the input

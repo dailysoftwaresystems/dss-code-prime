@@ -333,6 +333,27 @@ lowerToLir(Mir const&          mir,
            // `wideFloatSoftcallLibrary`) so existing positional callers
            // are unaffected; the production driver passes the format's
            // value. Defaults to nullopt.
-           std::optional<ExternAddrBinding> externAddrBinding = std::nullopt);
+           std::optional<ExternAddrBinding> externAddrBinding = std::nullopt,
+           // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50, CLOSED):
+           // whether bare `char` (`TypeKind::Char`) is UNSIGNED for this
+           // compilation — the (processor × platform) fact the TARGET
+           // declares in its ONE `charIsUnsigned` key, resolved per object
+           // format one level up (`TargetSchema::charIsUnsigned(
+           // ObjectFormatKind)` — the format kind is a REQUIRED argument
+           // there, which is why this arrives here as an already-resolved
+           // VALUE, like every format-resolved parameter above). Read by
+           // exactly two DEFENSIVE arms no shipped frontend can reach (the C
+           // frontend integer-promotes a subscript / switch discriminant
+           // first; no other shipped .lang.json maps a type onto `Char` —
+           // measured P50): the Gep RUNTIME-index widen and the switch
+           // jump-table discriminant widen, each choosing SExt (signed char)
+           // vs ZExt (unsigned char). `std::nullopt` = not threaded: a raw
+           // narrow `Char` Gep index then fails loud (no blind extension — a
+           // wrong pick is a silent wrong address), and a raw narrow `Char`
+           // jump-table discriminant declines to the signedness-agnostic
+           // compare chain. Defaults to nullopt; the first non-promoting
+           // frontend's driver threads the target's resolved value exactly
+           // as `externCallDispatch` is threaded.
+           std::optional<bool> charIsUnsigned = std::nullopt);
 
 } // namespace dss

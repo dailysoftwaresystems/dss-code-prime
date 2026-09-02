@@ -2755,8 +2755,15 @@ TEST(LirRegAllocCoalesce, ACrossBankMoveIsNeverACoalescingCandidate) {
                                               RegClassOp::Move);
     ASSERT_TRUE(gprMove.has_value());
     ASSERT_TRUE(fprMove.has_value());
-    for (char const* crossBank : {"movq_gpr_to_xmm", "movq_xmm_to_gpr",
-                                  "movq_xclass"}) {
+    // ⓘ `movq_xclass` USED TO BE THE THIRD NAME HERE and is DELETED
+    // (D-TARGET-NO-CROSS-CLASS-MOVE-VERB): it was a placeholder for a slot the
+    // per-class table did not have, and the table is now keyed by the class
+    // PAIR. The two survivors are the pair's declared moves, which makes this
+    // guard STRONGER rather than weaker — they are no longer merely "opcodes
+    // nothing resolves to", they are what a cross-bank copy actually emits, so
+    // a coalescer reading them as copies would now have live input to be wrong
+    // about.
+    for (char const* crossBank : {"movq_gpr_to_xmm", "movq_xmm_to_gpr"}) {
         auto const op = sch.opcodeByMnemonic(crossBank);
         ASSERT_TRUE(op.has_value())
             << crossBank << " is gone from the shipped target — this pin has "
@@ -2766,6 +2773,14 @@ TEST(LirRegAllocCoalesce, ACrossBankMoveIsNeverACoalescingCandidate) {
         EXPECT_NE(*op, *fprMove) << crossBank << " resolves as the FPR class "
                                     "move; a cross-bank copy would be coalesced";
     }
+    // And they ARE the declared cross-class moves, so this pin cannot go
+    // vacuous by the rows quietly leaving the config.
+    EXPECT_EQ(sch.regClassOpOpcode(TargetRegClass::GPR, TargetRegClass::FPR,
+                                   RegClassOp::Move),
+              sch.opcodeByMnemonic("movq_gpr_to_xmm"));
+    EXPECT_EQ(sch.regClassOpOpcode(TargetRegClass::FPR, TargetRegClass::GPR,
+                                   RegClassOp::Move),
+              sch.opcodeByMnemonic("movq_xmm_to_gpr"));
 
     // GUARD 2 — THE CLASS CHECK, asserted through the ALLOCATOR rather than by
     // reading it: two vregs of different classes can never be handed the same

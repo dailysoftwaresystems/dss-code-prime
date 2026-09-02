@@ -203,3 +203,43 @@ target_link_libraries(dss_asm_test_asm_bare_operand_width
     PRIVATE nlohmann_json::nlohmann_json)
 target_include_directories(dss_asm_test_asm_bare_operand_width
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE (R5 + R8, P50):
+# class-scoped width-view modifier letters. The aarch64 letters are scoped
+# (b/h/s/d/q => fpr, w/x => gpr; a wrong-class letter refuses BY NAME listing
+# the operand class's own alphabet — both references hard-error the FP-on-GPR
+# direction, and the operator ruled the GPR-on-FP direction dissolved), the
+# x86-64 letters stay width-only (gcc ACCEPTS a GPR letter on an xmm operand
+# — the disjunction decides acceptance), and the loader refuses a document
+# mixing the two postures. Also carries the cross-tier static_assert that
+# every width `AssemblyConfig::kTemplateModifierWidthBits` admits has a LIR
+# flag (core cannot include lir_node.hpp; this test includes both).
+# WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL (shipped dialect JSON
+# edited in memory), so it MUST run through ctest -- dss_add_test sets
+# DSS_CONFIG_ROOT (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_class_scoped_modifiers
+             SOURCES test_asm_class_scoped_modifiers.cpp)
+target_link_libraries(dss_asm_test_asm_class_scoped_modifiers
+    PRIVATE nlohmann_json::nlohmann_json)
+
+# D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME (the x86_64
+# half): the SSE/scalar-FP instruction rows that make the `x` constraint's
+# `fpr` register class nameable by a template. Before them the target declared
+# 103 opcodes, this dialect spelled 36, and ALL EIGHTEEN FP/SSE opcodes were
+# unspelled -- so `"x"` could be bound and never used.
+# The pins read the MANDATORY PREFIX, because that is the only byte separating
+# the `sd`/`ss` pair: one target opcode under two width-keyed guards, so a row
+# declared at the wrong width still assembles and still runs. Also pins the
+# ucomisd/ucomiss prefix ASYMMETRY (66 vs none, against the F2/F3 pattern every
+# arithmetic row follows) and the near-miss set that must REFUSE rather than
+# bind to a neighbouring opcode.
+# WARNING ITS RED-ON-DISABLE MUTANT IS CONFIG-LEVEL -- it removes a row from the
+# SHIPPED dialect document -- so it MUST run through ctest: dss_add_test sets
+# DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever tree
+# the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_x86_sse_dialect_rows
+             SOURCES test_asm_x86_sse_dialect_rows.cpp)
+target_link_libraries(dss_asm_test_asm_x86_sse_dialect_rows
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_x86_sse_dialect_rows
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)

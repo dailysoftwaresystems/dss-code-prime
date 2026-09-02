@@ -2,6 +2,11 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+// D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
+// `DependencyArtifactCacheConfig` is a VALUE held by a member below, so the
+// definition is needed rather than a forward declaration. `project_config.hpp`
+// is already this tier's manifest vocabulary and `program.cpp` includes it.
+#include "core/types/project_config.hpp"
 #include "opt/optimizer.hpp"
 #include "program/cli_args.hpp"      // CompileConfig
 #include "program/input_resolver.hpp"
@@ -183,6 +188,19 @@ public:
     /// (`fs::create_directories`); failure surfaces as
     /// `D_OutputDirCreateFailed` (same code as the legacy
     /// `<cwd>/target/...` path's mkdir failure).
+    ///
+    /// D-AP2-OUTPUT-ROUTING (the `output`-field half): this is ALSO the seam a
+    /// project manifest's `output` lands on. `Program::compileProject` stamps it
+    /// from that field when — and only when — this is still unset, so the CLI
+    /// `--output` WINS (the `setStackReserveBytes` precedence rule, for the same
+    /// reason: a scalar cannot merge, and an explicit command-line argument
+    /// overrides a committed file). Because the manifest value arrives THROUGH
+    /// this setter rather than beside it, every reader of the base — the
+    /// per-target artifact router AND the dependency graph's
+    /// `artifactOutputBase` — follows the manifest automatically, with no second
+    /// copy of the rule to drift. The value is stored VERBATIM either way, so a
+    /// relative manifest `output` resolves against the process working directory
+    /// exactly as a relative `--output` does.
     void setOutputDir(std::optional<std::filesystem::path> dir) {
         outputDir_ = std::move(dir);
     }
@@ -238,6 +256,30 @@ public:
     /// can override directly.
     void setCompileConfig(CompileConfig c) noexcept { compileConfig_ = c; }
     [[nodiscard]] CompileConfig compileConfig() const noexcept { return compileConfig_; }
+
+    /// D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C): the
+    /// cross-build artifact cache policy, read off the ROOT `.dss-project.json`
+    /// by `Program::compileProject` and PROPAGATED onto every dependency's own
+    /// fresh `Program` by `Resolver::buildNode_` (the setCompileConfig pattern,
+    /// on the propagation list that already carries config / jobs / executor).
+    ///
+    /// nullopt, or an engaged value whose `enabled` is false, ⇒ NO cache: the
+    /// build looks nothing up and writes nothing, byte-identically to every
+    /// build that predates this knob. It is nullopt on the CLI path, so
+    /// `--compile` is untouched.
+    ///
+    /// ⚠ A DEPENDENCY'S OWN MANIFEST COPY IS NEVER READ — B.10's ruling for
+    /// `targets[]` and U-9's for `output`, applied to the same kind of fact.
+    /// Caching is a property of the BUILD; a graph whose nodes each declared a
+    /// policy would make "is this build cached?" a question with N answers.
+    void setDependencyArtifactCache(
+        std::optional<DependencyArtifactCacheConfig> policy) {
+        dependencyArtifactCache_ = std::move(policy);
+    }
+    [[nodiscard]] std::optional<DependencyArtifactCacheConfig> const&
+    dependencyArtifactCache() const noexcept {
+        return dependencyArtifactCache_;
+    }
 
     /// D-OPT11-LAZY-IMPORT-EDGE: the link-time-optimization TOPOLOGY, stamped
     /// from `CliArgs::lto` by `Program::run` before dispatch (the
@@ -447,6 +489,10 @@ private:
     std::optional<std::filesystem::path>   outputDir_;
     std::optional<std::string>             artifactName_;             // D-AP2-OUTPUT-ROUTING: project binary base name (nullopt = source stem)
     bool                                   perFormatOutputSubdir_ = false;  // D-AP2-OUTPUT-ROUTING: project ⇒ force <formatName>/ subdir
+    // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
+    // nullopt ⇒ no cross-build artifact cache at all (the CLI path, and every
+    // manifest without the member).
+    std::optional<DependencyArtifactCacheConfig> dependencyArtifactCache_;
     std::optional<::dss::opt::OptPipeline> optimizerPipelineOverride_;
     CompileConfig                          compileConfig_ = CompileConfig::Debug;
     LtoModeArg                             ltoMode_ = LtoModeArg::Full;

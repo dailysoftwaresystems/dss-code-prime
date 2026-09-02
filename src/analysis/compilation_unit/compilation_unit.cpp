@@ -4,13 +4,20 @@
 #include "ffi/shipped_lib_descriptor.hpp"   // readShippedLibTypedefNames (c43 follow-up: the cast-vs-call oracle)
 #include "analysis/preprocess/preprocessor.hpp"
 #include "analysis/syntactic/parser.hpp"
+#include "core/crypto/sha256.hpp"            // the ONE content digest — `inputDigest()`
 #include "core/substrate/mint_monotonic_id.hpp"
+#include "core/substrate/path_identity.hpp"  // genericSpelling — one spelling per descriptor path
 #include "core/substrate/phase_timers.hpp"   // c97: per-phase --time accumulation
+// `digestConfigDocumentFile` — the ONE checked read + digest for a config
+// document, reused rather than re-spelled so an unreadable descriptor is
+// reported the same way here as it is to the schema memo.
+#include "core/types/config_document_memo.hpp"
 #include "core/types/config_path_walk.hpp"   // resolveSystemDirs — THE owner of the shippedLibDirs walk
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "tokenizer/tokenizer.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -94,7 +101,8 @@ CompilationUnit::CompilationUnit(PrivateTag,
                                  std::vector<std::unordered_set<std::uint32_t>>
                                      pragmaNoOptimizeSets,
                                  std::vector<PreprocessedPositionMap>
-                                     preprocessedPositionMaps)
+                                     preprocessedPositionMaps,
+                                 std::string                          inputDigest)
     : id_(id)
     , schema_(std::move(schema))
     , trees_(std::move(trees))
@@ -105,7 +113,8 @@ CompilationUnit::CompilationUnit(PrivateTag,
     , auxiliaryBuffers_(std::move(auxiliaryBuffers))
     , pragmaPackMaps_(std::move(pragmaPackMaps))
     , pragmaNoOptimizeSets_(std::move(pragmaNoOptimizeSets))
-    , preprocessedPositionMaps_(std::move(preprocessedPositionMaps)) {}
+    , preprocessedPositionMaps_(std::move(preprocessedPositionMaps))
+    , inputDigest_(std::move(inputDigest)) {}
 
 CompilationUnit::~CompilationUnit()                                            = default;
 CompilationUnit::CompilationUnit(CompilationUnit&&) noexcept                   = default;
@@ -120,6 +129,8 @@ std::span<ShippedDescriptorRef const>
 CompilationUnit::shippedLibDescriptors() const noexcept { return shippedLibDescriptors_; }
 std::span<std::shared_ptr<SourceBuffer> const>
 CompilationUnit::auxiliaryBuffers() const noexcept { return auxiliaryBuffers_; }
+std::string_view
+CompilationUnit::inputDigest() const noexcept { return inputDigest_; }
 
 std::unordered_map<std::uint32_t, std::uint32_t> const&
 CompilationUnit::pragmaPackFor(std::size_t treeIndex) const noexcept {
@@ -363,6 +374,14 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
                                          formatPredefinedMacros_);
         phase.reset();
         auto remap = pp.makeRemap();
+        // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the DIAGNOSTIC-shaped
+        // twin. It carries the same position rewrite `remap` does, plus the
+        // `expanded from macro 'X'` note a product-token subject needs — so
+        // the two tiers that hand whole diagnostics through (this parse and
+        // the FC2 oracle reparse below) use it, while every POSITION-only
+        // consumer (the LSP map, the descriptor refs, the post-parse tiers)
+        // keeps `remap`. Both are derived from the SAME line map.
+        auto diagRemap = pp.makeDiagnosticRemap();
         std::shared_ptr<SourceBuffer> synth = pp.synthBuffer;
         // The parser consumes a stream built from a COPY of the preprocessed
         // tokens; the vector is retained in the sidecar for the FC2 oracle
@@ -452,7 +471,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         // Remap the produced tree's diagnostics off the synth buffer onto the
         // origin file(s) before ingest, so a header-origin (and post-splice
         // main-origin) diagnostic is attributed to its real file.
-        result.tree.remapDiagnostics(remap);
+        result.tree.remapDiagnostics(diagRemap);
         // Retain the PP's origin buffers (original main + every spliced header)
         // so the driver can register them for diagnostic rendering -- a
         // remapped diagnostic now references one of these buffers, not the
@@ -469,6 +488,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         sidecar.schema          = std::move(schema);
         sidecar.ppTokens        = std::move(pp.tokens);
         sidecar.ppRemap         = std::move(remap);
+        sidecar.ppDiagRemap     = std::move(diagRemap);
         // [[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]]: record the SYNTH
         // buffer so the finished CU can answer "is this position in synthesized
         // coordinates" for EVERY later tier — the parse tier is simply the only
@@ -1054,7 +1074,9 @@ CompilationUnit UnitBuilder::finish() && {
                         Parser p{sc.source, sc.schema, std::move(stream),
                                  budget_, std::move(cfg), nullptr};
                         ParseResult r = std::move(p).parse();
-                        if (sc.ppRemap) r.tree.remapDiagnostics(sc.ppRemap);
+                        if (sc.ppDiagRemap) {
+                            r.tree.remapDiagnostics(sc.ppDiagRemap);
+                        }
                         return r;
                     }
                     Tokenizer tk{sc.source, sc.schema, budget_};
@@ -1168,6 +1190,122 @@ CompilationUnit UnitBuilder::finish() && {
         pragmaNoOptimizeSets.push_back(std::move(sc.pragmaNoOptimize));
     }
 
+    // ═══ THE UNIT'S TEXTUAL INPUT CLOSURE ════════════════════════════════════
+    // The contract, every term's justification, and what it deliberately leaves
+    // to the loaders that already own it are on `CompilationUnit::inputDigest()`.
+    // Computed HERE because this is the one point at which every contributing
+    // datum is simultaneously alive and none has been moved out yet: the trees
+    // still hold their parse sources, the sidecars still hold the preprocessed
+    // token streams, and the two pragma side tables have just been flattened.
+    //
+    // ★ RENDERED TO ONE CANONICAL DOCUMENT AND HASHED ONCE, with a VERSION
+    // line first. The version is not decoration: this rendering IS a cache key's
+    // meaning, so a change to what the closure covers must make every previously
+    // computed digest unreachable rather than silently reinterpreted. Bump it
+    // whenever a term is added, removed, or spelled differently.
+    //
+    // ⚠ EVERY UNORDERED CONTAINER IS SORTED BEFORE IT IS RENDERED. A
+    // `#pragma pack` map iterated in hash order digests differently on two runs
+    // of the SAME inputs, which would make the digest a random number: a cache
+    // that never hits is merely slow, but a digest that moves without its inputs
+    // also destroys the red-on-disable argument that the digest MEANS anything.
+    std::string doc;
+    doc += "dss-unit-input-closure/1\n";
+    for (std::size_t i = 0; i < trees_.size(); ++i) {
+        SourceBuffer const& src = trees_[i].source();
+        doc += "tree ";
+        doc += std::to_string(i);
+        doc += ' ';
+        doc += src.name();
+        doc += '\n';
+        // LENGTH-PREFIXED, so no source text can impersonate the framing that
+        // follows it. Without it a file whose last line reads `tokens 0` would
+        // be indistinguishable from an empty token stream.
+        doc += "text ";
+        doc += std::to_string(src.text().size());
+        doc += '\n';
+        doc += src.text();
+        doc += '\n';
+        if (i < sidecars_.size()) {
+            auto const& tokens = sidecars_[i].ppTokens;
+            doc += "tokens ";
+            doc += std::to_string(tokens.size());
+            doc += '\n';
+            for (Token const& t : tokens) {
+                doc += std::to_string(static_cast<unsigned>(t.coreKind));
+                doc += ' ';
+                doc += std::to_string(t.schemaKind.v);
+                doc += ' ';
+                doc += std::to_string(static_cast<unsigned>(t.flags));
+                doc += ' ';
+                doc += std::to_string(t.span.start());
+                doc += ' ';
+                doc += std::to_string(t.span.end());
+                doc += '\n';
+            }
+        }
+        // ★★ THE TWO PRAGMA SIDE TABLES — the terms a digest over text and
+        // tokens alone would MISS, because the directives that set them are
+        // removed from the token stream and their effect survives only here.
+        if (i < pragmaPackMaps.size()) {
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> pack(
+                pragmaPackMaps[i].begin(), pragmaPackMaps[i].end());
+            std::sort(pack.begin(), pack.end());
+            doc += "pragma-pack ";
+            doc += std::to_string(pack.size());
+            doc += '\n';
+            for (auto const& [offset, align] : pack) {
+                doc += std::to_string(offset);
+                doc += ' ';
+                doc += std::to_string(align);
+                doc += '\n';
+            }
+        }
+        if (i < pragmaNoOptimizeSets.size()) {
+            std::vector<std::uint32_t> noopt(pragmaNoOptimizeSets[i].begin(),
+                                             pragmaNoOptimizeSets[i].end());
+            std::sort(noopt.begin(), noopt.end());
+            doc += "pragma-no-optimize ";
+            doc += std::to_string(noopt.size());
+            doc += '\n';
+            for (std::uint32_t const offset : noopt) {
+                doc += std::to_string(offset);
+                doc += '\n';
+            }
+        }
+    }
+    // The angle-`#include` half: a neutral JSON descriptor is never spliced and
+    // never tokenized, so it is invisible to every term above while deciding the
+    // declarations the unit compiles against. Deduped and sorted by the resolved
+    // path — one descriptor reached through two includes is ONE input, and the
+    // order two includes were written in is not.
+    {
+        std::vector<std::string> descriptorPaths;
+        descriptorPaths.reserve(shippedLibDescriptors.size());
+        for (auto const& d : shippedLibDescriptors) {
+            descriptorPaths.push_back(core::genericSpelling(d.path));
+        }
+        std::sort(descriptorPaths.begin(), descriptorPaths.end());
+        descriptorPaths.erase(
+            std::unique(descriptorPaths.begin(), descriptorPaths.end()),
+            descriptorPaths.end());
+        doc += "descriptors ";
+        doc += std::to_string(descriptorPaths.size());
+        doc += '\n';
+        for (auto const& p : descriptorPaths) {
+            // ⚠ AN UNREADABLE DESCRIPTOR IS RENDERED AS A DISTINCT MARKER, NOT
+            // SKIPPED. Skipping would make an unreadable input digest the same
+            // as an absent one — the flattering direction — and the marker
+            // additionally cannot collide with any 64-hex digest.
+            auto const digest = detail::digestConfigDocumentFile(p);
+            doc += p;
+            doc += ' ';
+            doc += digest.has_value() ? *digest : std::string{"<unreadable>"};
+            doc += '\n';
+        }
+    }
+    std::string const inputDigest = crypto::sha256Hex(doc);
+
     finished_ = true;
     return CompilationUnit{
         CompilationUnit::PrivateTag{},
@@ -1182,6 +1320,7 @@ CompilationUnit UnitBuilder::finish() && {
         std::move(pragmaPackMaps),
         std::move(pragmaNoOptimizeSets),
         std::move(preprocessedPositionMaps),
+        inputDigest,
     };
 }
 

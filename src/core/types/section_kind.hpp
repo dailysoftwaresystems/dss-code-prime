@@ -399,6 +399,180 @@ enum class DataSectionKind : std::uint8_t {
     RelRoConst = static_cast<std::uint8_t>(SectionKind::RelRoConst),
 };
 
+// D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: WHICH SIDE OF THE
+// ENTRY FUNCTION a static initializer runs on. This is the vocabulary the
+// LANGUAGE tier resolves an attribute effect into and every tier below carries
+// unchanged, so it lives beside the sections it selects rather than in any one
+// tier's headers.
+//
+// ★ IT NAMES THE ENTRY FUNCTION, NOT `main`. Which function the program enters
+// through is per-language config (`AssembledModule::userEntrySymbol`), so a
+// vocabulary spelled `runBeforeMain` would bake one language's spelling into the
+// shared enum. C's `constructor`/`destructor` are the C SPELLINGS of these two.
+enum class StaticInitPhase : std::uint8_t {
+    BeforeEntry = 0,  // C `__attribute__((constructor))`
+    AfterEntry  = 1,  // C `__attribute__((destructor))`
+};
+
+// ★★ THE SORT KEY, AND IT IS ONE ORDERING READ IN TWO DIRECTIONS — ✔MEASURED
+// 2026-08-28 against gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0, probed
+// SEPARATELY, each function printing its own tag so stdout order IS run order.
+// All three agree exactly:
+//     c101 c102 cBARE | MAIN | dBARE d102 d101
+// Constructors run ASCENDING by priority with the UNPRIORITIZED form LAST;
+// destructors run that same sequence BACKWARD. So there is one comparator and
+// the phase decides which way it is walked — never two orderings that can drift.
+//
+// ⚠⚠ ORDER **AMONG EQUAL PRIORITIES** IS NOT PORTABLE AND MUST NOT BE PINNED:
+// two bare same-priority constructors run 1,2 under Linux gcc and clang and
+// **2,1** under mingw-w64 gcc — MEASURED. DSS may choose any order there, so a
+// test that asserts a sequence for equal priorities asserts a fact no reference
+// agrees on. Corpus examples must accumulate COMMUTATIVELY.
+//
+// The unprioritized form sorts last by taking a near-maximum key, which is why
+// the sentinel is a MAXIMUM and not a zero: gcc reserves 0..100 for the
+// implementation, so a zero sentinel would sort an unprioritized initializer
+// FIRST — the opposite of what all three references do.
+inline constexpr std::uint32_t kUnprioritizedStaticInit = 0xFFFFFFFEu;
+
+// ONE declaration's place in the static-initializer schedule, carried unchanged
+// from the semantic tier that reads the attribute down to the linker that emits
+// the tables and the entry trampoline that calls them.
+//
+// ★★ TWO INDEPENDENT AXES, NOT A PHASE PLUS A PRIORITY, AND THAT IS FORCED BY
+// MEASUREMENT rather than chosen for symmetry. ✔MEASURED 2026-08-28 (mingw-w64
+// gcc 13.2.0): `__attribute__((constructor,destructor)) static void b(void)` and
+// the two-clause `((constructor(101))) ((destructor(102)))` BOTH compile clean
+// under `-Wall -Wextra` and BOTH run at both ends — output `T B | MAIN | B T`.
+// So one function can occupy BOTH channels, each at its OWN priority, and a
+// single `{phase, priority}` pair cannot say that. A design that collapsed them
+// would silently drop one half of every such declaration.
+//
+// Each channel is `nullopt` when the declaration is not in it, and otherwise
+// carries the priority (`kUnprioritizedStaticInit` for the bare spelling).
+//
+// ★ THE STORAGE IS TWO RAW `uint32_t` WITH AN ABSENT SENTINEL, AND THE API IS
+// `std::optional` — deliberately not both the same. Two `std::optional<uint32_t>`
+// members would be 16 bytes, and this struct is embedded in `detail::MirFunc`,
+// whose size is pinned to the byte with a budget narrative attached. Eight bytes
+// keeps that record at 36 instead of 44. The optional-returning accessors are
+// what callers see, so no reader has to know the sentinel exists — which is the
+// only way an encoding like this stays safe.
+//
+// ⚠ `kAbsent` and `kUnprioritizedStaticInit` are DIFFERENT VALUES and must stay
+// so. They mean "not in this channel" and "in this channel, at the end"; collapse
+// them and every bare `__attribute__((constructor))` silently stops being an
+// initializer at all. The semantic tier refuses a source priority `>=
+// kUnprioritizedStaticInit` precisely so the two ranges cannot meet.
+struct StaticInitSchedule {
+    static constexpr std::uint32_t kAbsent = 0xFFFFFFFFu;
+    static_assert(kAbsent != kUnprioritizedStaticInit,
+                  "the ABSENT sentinel and the UNPRIORITIZED priority must be "
+                  "distinct values — merging them turns every bare "
+                  "`constructor` into a function that is not in the schedule");
+
+    std::uint32_t beforeEntryRaw_ = kAbsent;
+    std::uint32_t afterEntryRaw_  = kAbsent;
+
+    [[nodiscard]] constexpr std::optional<std::uint32_t>
+    beforeEntry() const noexcept {
+        return beforeEntryRaw_ == kAbsent ? std::nullopt
+                                          : std::optional{beforeEntryRaw_};
+    }
+    [[nodiscard]] constexpr std::optional<std::uint32_t>
+    afterEntry() const noexcept {
+        return afterEntryRaw_ == kAbsent ? std::nullopt
+                                         : std::optional{afterEntryRaw_};
+    }
+
+    [[nodiscard]] constexpr bool any() const noexcept {
+        return beforeEntryRaw_ != kAbsent || afterEntryRaw_ != kAbsent;
+    }
+    // The priority in ONE channel, or nullopt when this declaration is not in it.
+    // Reading through the phase — never through the two members by name — is what
+    // lets a caller be written once and run for both directions.
+    [[nodiscard]] constexpr std::optional<std::uint32_t>
+    priorityFor(StaticInitPhase p) const noexcept {
+        return p == StaticInitPhase::BeforeEntry ? beforeEntry() : afterEntry();
+    }
+    constexpr void setPriorityFor(StaticInitPhase p, std::uint32_t prio) noexcept {
+        (p == StaticInitPhase::BeforeEntry ? beforeEntryRaw_ : afterEntryRaw_) =
+            prio;
+    }
+    // MERGE, not overwrite: one declaration's facts fold over another's for the
+    // same symbol (a prototype and its definition, two declarators sharing a
+    // specifier prefix). The STRICTEST — numerically smallest, i.e. earliest —
+    // priority wins in each channel, so a re-declaration can tighten a schedule
+    // but never silently loosen one.
+    constexpr void mergeFrom(StaticInitSchedule const& o) noexcept {
+        for (auto p : {StaticInitPhase::BeforeEntry, StaticInitPhase::AfterEntry}) {
+            auto const incoming = o.priorityFor(p);
+            if (!incoming.has_value()) continue;
+            auto const mine = priorityFor(p);
+            if (!mine.has_value() || *incoming < *mine) setPriorityFor(p, *incoming);
+        }
+    }
+
+    [[nodiscard]] friend constexpr bool
+    operator==(StaticInitSchedule const&, StaticInitSchedule const&) noexcept
+        = default;
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// WHO RUNS THE SCHEDULE — a per-FORMAT capability, declared beside
+// `processExit` / `processArgs` / `entryVerbs` in each object-format document.
+// D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN.
+// ═══════════════════════════════════════════════════════════════════════
+//
+// ★★ THIS AXIS EXISTS BECAUSE THE ANSWER GENUINELY DIFFERS BY FORMAT, and
+// getting it wrong in either direction is a live defect rather than a style
+// choice: pick the wrong arm and the initializers either run TWICE or not at
+// all. It is declared, never branched on a format name.
+//
+// ✔MEASURED on the emitted image, not inferred from the writer: `readelf -d` on
+// a DSS `elf64-x86_64-linux-exec` artifact shows an eleven-entry dynamic section
+// (NEEDED/STRTAB/STRSZ/SYMTAB/SYMENT/HASH/RELA/RELASZ/RELAENT/FLAGS_1/NULL) with
+// NO `DT_INIT_ARRAY` and no `DT_INIT`. ld.so walks the DYNAMIC TAG, never the
+// section, so an emitted `.init_array` is inert to the loader and the DSS entry
+// trampoline is the only thing that can run it. PE is the same story for a
+// different reason: DSS synthesizes `_start` and never links the UCRT startup, so
+// no `_initterm` exists to walk `.CRT`.
+//
+// ⚠ MACH-O IS THE ONE ARM WHERE THE LOADER CLAIMS THE CHANNEL — dyld runs a
+// section typed `S_MOD_INIT_FUNC_POINTERS`. That is DOCUMENTED, NOT MEASURED
+// HERE: the lane that landed this exercised no darwin leg, and the ELF evidence
+// above has no Mach-O counterpart yet. It is provable only on real Apple
+// hardware, and until it is exercised there the `imageLoader` arm is the only
+// claim in this feature resting on documentation rather than on a run.
+enum class StaticInitRunner : std::uint8_t {
+    // The linker-synthesized program entry calls each scheduled function around
+    // the user entry. The emitted section is then CONVENTION and INTEROP — it is
+    // what a foreign linker or an inspector reads — but nothing at run time
+    // depends on it.
+    EntryTrampoline = 0,
+    // The platform image loader walks the section itself, so the trampoline must
+    // emit NO calls. Emitting them anyway is not a redundancy: every initializer
+    // would run twice.
+    ImageLoader     = 1,
+};
+
+inline constexpr EnumNameTable<StaticInitRunner, 2> kStaticInitRunnerTable{{{
+    { StaticInitRunner::EntryTrampoline, "entryTrampoline" },
+    { StaticInitRunner::ImageLoader,     "imageLoader"     },
+}}};
+
+DSS_CHECK_ENUM_NAME_TABLE(kStaticInitRunnerTable);
+
+[[nodiscard]] constexpr std::string_view
+staticInitRunnerName(StaticInitRunner r) noexcept {
+    return kStaticInitRunnerTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<StaticInitRunner>
+staticInitRunnerFromName(std::string_view s) noexcept {
+    return kStaticInitRunnerTable.fromName(s);
+}
+
+
 [[nodiscard]] constexpr SectionKind
 toSectionKind(DataSectionKind d) noexcept {
     return static_cast<SectionKind>(static_cast<std::uint8_t>(d));

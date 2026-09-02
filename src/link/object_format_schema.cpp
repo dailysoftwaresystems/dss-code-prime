@@ -400,6 +400,118 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                              allNames(kCSymbolDecorationSchemeTable), " or ")));
     }
 
+    // ── D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY:
+    //    the C calling convention is REQUIRED on EVERY format ───────────
+    //
+    // The sibling of the rule directly above, and every word of its "★★ THE
+    // TEETH" note applies verbatim: the guard is the constant `true`, there
+    // is no `if (isExecFlavor())` and no `if (kind == …)`, and adding one
+    // would make the rule stop enforcing on whatever it excluded — silently.
+    // The concrete reason it must not be exec-gated is the one the format
+    // cluster already learned the hard way: `entryCallingConvention`, which
+    // names the SAME kind of thing for the entry trampoline, IS exec-gated,
+    // and that is precisely why it could not be reused here. A relocatable
+    // `.o`, a staticlib member and a dylib all carry ordinary C calls whose
+    // argument registers this field decides.
+    //
+    // ★ WHY THIS ARM IS NOT REDUNDANT WITH THE LOADER'S. `ObjectFormatSchema
+    // {ObjectFormatData}` is a public constructor that runs NO validation, so
+    // every in-memory producer — test fixture, backend-synthesized descriptor,
+    // future binary-cache reload — reaches the linker and the walkers without
+    // passing the JSON tier at all.
+    //
+    // ★ AND WHY IT CHECKS ONLY NON-EMPTINESS. Whether the NAME resolves is
+    // not a question a format document can answer: it is a property of the
+    // (target, format) PAIR, judged by `dss::ffi::resolveAbi` with the target
+    // in hand, loudly, at `F_AbiNoMatchingCcInTarget`. Asserting more here
+    // would need the format schema to know a target, which is the coupling
+    // this whole anchor exists to remove.
+    if (!cCallingConvention.declared()) {
+        fail("/cCallingConvention",
+             std::format("missing required 'cCallingConvention' — every object "
+                         "format must declare WHICH of the paired target's "
+                         "callingConventions[] rows is the platform C ABI for "
+                         "code compiled into it (a block "
+                         "{{\"convention\": \"<name>\"}}), or the reserved "
+                         "'{}' for a format with no register-level C calling "
+                         "convention; a silent default would re-hide the "
+                         "selection in the engine's C++ table, which is the "
+                         "two-owner defect this key exists to remove",
+                         kCCallingConventionNone));
+    }
+
+    // ── D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: output naming +
+    //    the archive facts ────────────────────────────────────────────
+    //
+    // ★ THE OUTPUT-EXTENSION RULE IS UNIVERSAL, and its guard is the constant
+    // `true` for the reason the two rules above say at length. Every format
+    // produces an artifact and every artifact is named.
+    //
+    // ⚠ IT TESTS `has_value()`, NEVER `empty()`. `""` is the CORRECT declared
+    // answer for a Unix executable, so an emptiness test would reject four
+    // shipped formats while accepting the one state that is actually wrong —
+    // the author never having answered. This is the `bitFieldStrategy` "none"
+    // discipline inverted: there, a spellable sentinel had to be refused; here,
+    // the empty spelling is a real answer and only ABSENCE is the sentinel.
+    if (!outputExtension.has_value()) {
+        fail("/outputExtension",
+             "missing required 'outputExtension' — every object format must "
+             "declare the extension the driver appends to an artifact it "
+             "produces (\".o\", \".exe\", \".dylib\", \".so\", \".a\", "
+             "\".lib\", \".wasm\", \".spv\", or \"\" for a Unix executable, "
+             "which is a DECLARED answer and not an omission). A silent "
+             "default would re-hide the naming rule in the engine's per-kind "
+             "switch, which is the defect this key exists to remove");
+    }
+
+    // The two archive facts are presence-PAIRED with `container: archive`, in
+    // BOTH directions: an archive format that omits them would fall back to
+    // whatever the engine guessed (the defect), and a non-archive format that
+    // declares them has written down a fact about an artifact it never
+    // produces — which reads as authority and is never consulted.
+    bool const isArchive = container == ObjectFormatContainer::Archive;
+    if (isArchive && !archiveMemberExtension.has_value()) {
+        fail("/archiveMemberExtension",
+             "format declares `container: archive` but no "
+             "'archiveMemberExtension' — an archive PACKAGES relocatable "
+             "members and each member is named; declare the ecosystem's "
+             "relocatable extension (\".o\" / \".obj\")");
+    }
+    if (!isArchive && archiveMemberExtension.has_value()) {
+        fail("/archiveMemberExtension",
+             "format declares 'archiveMemberExtension' but is not "
+             "`container: archive` — it packages no members, so the "
+             "declaration would never be read");
+    }
+    // ⚠ `archiveFlavor` IS NOT ARCHIVE-ONLY, AND AN EARLIER DRAFT OF THIS RULE
+    // GOT THAT WRONG — the refutation is worth keeping. It first REFUSED the key
+    // on any format without `container: archive`, reasoning that such a format
+    // writes no archive so the declaration would never be read. ✔MEASURED: two
+    // suites went red (`link/test_ar_writer`, `program/test_static_link`),
+    // because `linkAndWriteStaticArchive` is reachable with the RELOCATABLE
+    // format of the ecosystem, not only with the archive one. And that is the
+    // faithful reading of what was deleted: `kind() == Pe ? Coff : SysV`
+    // answered for WHATEVER format it was handed, so the fact it encoded is
+    // "which `ar` variant this ECOSYSTEM uses" — a property every ELF, PE and
+    // Mach-O document can state — and not "which variant this archive is".
+    // Restricting it to archives would have been a NEW restriction wearing the
+    // old one's name.
+    //
+    // So: REQUIRED when the format writes archives, OPTIONAL and meaningful on
+    // any other native format, and absent on the two skeletons whose ecosystems
+    // have no `ar` at all.
+    if (isArchive && archiveFlavorName(archiveFlavor).empty()) {
+        fail("/archiveFlavor",
+             std::format("format declares `container: archive` but no "
+                         "'archiveFlavor' — the `ar` variant decides a BYTE "
+                         "LAYOUT (the coff flavor carries the second linker "
+                         "member link.exe requires to resolve members at all), "
+                         "so a guess here produces an archive the ecosystem's "
+                         "linker cannot read ({})",
+                         detail::renderAllowedList(
+                             allNames(kArchiveFlavorTable), " or ")));
+    }
+
     // ── D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: a PRESENT
     //    `weakDefinition` block must name a real dialect ─────────────────
     //
@@ -748,6 +860,32 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                  "image-flavor format requires a Text section row "
                  "(SectionKind::Text). No such row was declared.");
         }
+    }
+
+    // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ──
+    //
+    // `entryTrampoline` says "the entry DSS synthesizes for this format calls the
+    // scheduled functions". Only an EXEC flavor HAS such an entry — the injector
+    // is gated on `isExecFlavor()` — so on any other flavor the claim is false and
+    // the initializers would silently never run. Refuse it at LOAD, where the
+    // claim is written, rather than at link time on some program that happens to
+    // use a constructor.
+    //
+    // ★ THE OTHER ARM IS NOT SO GATED, DELIBERATELY. `imageLoader` says the
+    // PLATFORM walks a section, which is exactly what a non-exec image (a Mach-O
+    // dylib) can be true of — it is the arm a shared library would use once a
+    // writer emits a loader-recognized section. Gating both on exec-ness would
+    // write today's missing writer into the schema as a permanent rule.
+    if (staticInitRunner == StaticInitRunner::EntryTrampoline && !isExecFlavor) {
+        fail("/staticInitializers/runner",
+             "format declares `\"runner\": \"entryTrampoline\"` but is not an "
+             "EXEC flavor, so DSS synthesizes no entry for it and there is "
+             "nothing to make those calls. A shared library / relocatable object "
+             "/ static library must declare `imageLoader` (once a writer emits a "
+             "loader-recognized section for it) or declare no "
+             "`staticInitializers` block at all, which makes the linker REFUSE a "
+             "program that schedules initializers for this format instead of "
+             "silently never running them.");
     }
 
     // D-LK10-ENTRY Slice B (plan 14 §2.13): cross-field coherence

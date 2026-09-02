@@ -1,0 +1,33 @@
+{
+  "$comment": "P49 [[D-CSUBSET-GENERIC-SELECTION-IS-NOT-AN-INTEGER-CONSTANT-EXPRESSION]]: C23 6.5.1.1p3 makes a generic selection an integer constant expression when its SELECTED assignment-expression is one, and leaves the UNSELECTED associations unevaluated -- so `_Generic` is legal in a `_Static_assert` condition, an array declarator's length and an enumerator value. Every array here is measured with `sizeof` TWICE, at compile time through a `_Static_assert` and at run time into the exit code, because an example that only BUILDS proves the length folded to something rather than to 4. The compile-time half is what covers `blockLocal`: at block scope a non-constant length is a legal VLA, so before this fix DSS did not refuse that declaration at all -- it silently built a VLA -- and a run-time measurement cannot tell a 4-element VLA from `int[4]`, while `sizeof` of a VLA failing to be an ICE can. Exit code 63 = all six observations held; each bit names one, so a failure says WHICH selection went wrong. Data-model-independent (int=4, double=8 on LP64 and LLP64; no `long` in a size-sensitive position), so the selections resolve identically on all four targets. The `release` arm loads the shipped release pipeline so the folds witness end-to-end under real optimization.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 63,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

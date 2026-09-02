@@ -1,5 +1,10 @@
 #include "core/types/glob_match.hpp"
 
+#include "core/substrate/path_identity.hpp"     // genericSpelling /
+                                                // normalizeKeepingRoot
+#include "core/types/include_path_resolve.hpp"  // isRootedPath — the ONE
+                                                // rooted-path predicate
+
 #include <algorithm>
 #include <cstddef>
 #include <filesystem>
@@ -171,8 +176,18 @@ bool expandGlob(std::string_view pattern,
     // An EMPTY `baseDir` leaves the path untouched, which is what makes every
     // pre-AP6 call byte-identical: `fs::path{"src"}` is walked verbatim, i.e.
     // against the process cwd, exactly as before.
+    //
+    // ⚠ `isRootedPath`, NOT `is_absolute()`
+    // ([[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]). ✔MEASURED: a pattern
+    // whose root is a MULTI-SEPARATOR authority answers `is_absolute()` FALSE on
+    // the toolchain that builds DSS. ⇒ the bare test classifies
+    // `\\server\share\src\*.c` as RELATIVE and re-bases it -- exactly the silent
+    // relocation the note above says must not happen. Reported as a
+    // classification defect, which is what was measured; no glob over such a
+    // pattern was run. The ONE exported predicate answers it correctly on every
+    // path model.
     auto rebase = [&baseDir](fs::path p) {
-        if (baseDir.empty() || p.is_absolute()) return p;
+        if (baseDir.empty() || isRootedPath(p)) return p;
         // `baseDir / "."` would leave a "." component that `lexically_relative`
         // below then has to reason about; the bare `baseDir` is the same
         // directory with no such component, so say it directly.
@@ -193,8 +208,13 @@ bool expandGlob(std::string_view pattern,
         std::error_code fec;
         auto const lit = rebase(fs::path{std::string{pattern}});
         if (fs::exists(lit, fec) && !fec) {
+            // `core::genericSpelling` and NOT `lit.generic_string()`: what this
+            // pushes is not a message, it is the SOURCE PATH the compiler will
+            // open. `rebase` above is careful to leave a multi-separator
+            // authority alone; rendering it here with the lossy spelling would
+            // hand that care straight back.
             out.push_back(baseDir.empty() ? std::string{pattern}
-                                          : lit.generic_string());
+                                          : core::genericSpelling(lit));
         }
         return true;
     }
@@ -257,9 +277,20 @@ bool expandGlob(std::string_view pattern,
         // error) is fatal.
         entEc.clear();
         if (!it->is_regular_file(entEc)) continue;
+        // ⚠ THE TWO RENDERINGS BELOW ARE DELIBERATELY DIFFERENT, AND THE
+        // ASYMMETRY IS THE MEASUREMENT. `lexically_relative` yields a path with
+        // NO root — ✔MEASURED 2026-08-28 against a reachable UNC base:
+        // `//localhost/C$/…/leaf.c` relative to `//localhost/C$/…` is `leaf.c`,
+        // leading run 0 — so nothing there can lose an authority and the plain
+        // spelling is exact. The MATCH, by contrast, is the absolute source path
+        // handed on to be compiled, and it passes through BOTH lossy transforms:
+        // measured on that same base, `lexically_normal()` alone already
+        // returned `\localhost\C$\…\leaf.c`. A glob over a share would have
+        // yielded a whole source list naming a local drive that has none of it.
         std::string const rel = it->path().lexically_relative(base).generic_string();
         if (globMatch(tail, rel)) {
-            matched.push_back(it->path().lexically_normal().generic_string());
+            matched.push_back(
+                core::genericSpelling(core::normalizeKeepingRoot(it->path())));
         }
     }
 

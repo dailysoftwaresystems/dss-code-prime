@@ -18,6 +18,7 @@
 #include "core/substrate/path_identity.hpp"
 
 #include "scratch_dir.hpp"
+#include "unc_spelling.hpp"
 
 #include <gtest/gtest.h>
 
@@ -192,6 +193,121 @@ TEST(PathIdentitySubstrate, AbsenceIsNotAnError) {
     EXPECT_FALSE(id.string().empty());
 }
 
+// [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] — nor is a path the LIBRARY
+// cannot walk but the OS opens without trouble.
+//
+// ✔MEASURED: `fs::weakly_canonical` fails ENOENT 200 times out of 200 on every
+// spelling of a reachable path with a multi-separator root, while `exists()`,
+// `file_size()` and a directory walk of its parent all answer normally. That is
+// the path MODEL failing, not the host refusing, and forwarding it as `ec` made
+// the caller above — which fails the whole build loud on this flag, and whose
+// own comment asserts this "means a genuine filesystem failure" — reject a
+// perfectly readable source.
+TEST(PathIdentitySubstrate, AReachablePathIsNeverReportedAsAFilesystemFailure) {
+    dss::test_support::ScratchDir sd{dss::test_support::Location::Temp,
+                                     "path-identity"};
+    fs::path const local = sd.path() / "reachable.c";
+    { std::ofstream f{local}; f << "int x;\n"; }
+    ASSERT_TRUE(fs::exists(local));
+
+    fs::path const unc = dss::test_support::uncSpellingOf(local);
+    if (unc.empty())
+        GTEST_SKIP()
+            << "D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED: this host offers "
+               "no reachable multi-separator-root spelling of '"
+            << local.string()
+            << "', so this arm WAS NOT MEASURED on this leg. Unmeasured is not "
+               "passing.";
+    ASSERT_TRUE(fs::exists(unc)) << unc.string();
+
+    std::error_code ec;
+    auto const      id = PathIdentity::of(unc, ec);
+    EXPECT_FALSE(ec) << "a path the OS opens was reported as a filesystem "
+                        "refusal (" << ec.message()
+                     << "), which fails the build for a source that is right "
+                        "there: " << unc.string();
+    EXPECT_FALSE(id.string().empty());
+}
+
+// ── [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] ──────────────────────
+//
+// A path whose spelling begins with a run of TWO OR MORE separators names a
+// location on ANOTHER machine on the path models that give the authority no
+// `root_name()` of its own. Both halves of the shipped derivation deleted that
+// run — `lexically_normal()` on the degraded arm and `generic_string()` on the
+// way out — so the key named a directory on the LOCAL drive root instead.
+//
+// ★ NO SHARE IS NEEDED TO PIN THIS, and that is not a convenience — it is where
+// the defect is WORST. When the authority is unreachable, `weakly_canonical`
+// does not fail: it SUCCEEDS, having quietly re-rooted the path onto the local
+// drive (MEASURED: `//no-such-server/share/x.h` -> `C:\no-such-server\share\x.h`,
+// no error). The key it produced was then byte-identical to a real local file's,
+// which is a collision — two distinct files, one identity — and the maps this
+// type keys would serve one file's contents for the other.
+TEST(PathIdentitySubstrate, AMultiSeparatorRootIsNotCollapsedOntoTheLocalDrive) {
+    fs::path const authority{"//dss-no-such-server/share/hdr.h"};
+    fs::path const localSameName{"/dss-no-such-server/share/hdr.h"};
+    EXPECT_NE(PathIdentity::of(authority), PathIdentity::of(localSameName))
+        << "a path naming another machine and a path naming the local drive "
+           "root collapsed onto ONE identity ("
+        << PathIdentity::of(authority).string()
+        << ") — that is a wrong-content hazard, not a duplicate-work one";
+
+    // ★ THE EXACT COLLISION AS MEASURED, and it needs no drive letter written
+    // here: whatever root NAME this host qualifies its paths with is asked for
+    // rather than assumed, so the arm degenerates to the one above on a host
+    // that has none. ✔MEASURED against the shipped derivation, byte-identical
+    // keys for two different locations:
+    //     '//no-such-server/share/x.h'    -> 'C:/no-such-server/share/x.h/'
+    //     'C:/no-such-server/share/x.h'   -> 'C:/no-such-server/share/x.h/'
+    fs::path const driveQualified =
+        fs::current_path().root_name() / localSameName;
+    EXPECT_NE(PathIdentity::of(authority), PathIdentity::of(driveQualified))
+        << "a path naming another machine keyed identically to a LOCAL file of "
+           "the same name ("
+        << PathIdentity::of(authority).string()
+        << "), so every map this type keys would serve one file's contents for "
+           "the other";
+}
+
+// The two spellings of one such root are the SAME location and must key alike;
+// this is the other direction of the arm above, and a fix that merely preserved
+// the separators verbatim would fail it.
+TEST(PathIdentitySubstrate, BothSpellingsOfOneRootShareOneIdentity) {
+    fs::path const forward{"//dss-no-such-server/share/hdr.h"};
+    fs::path const preferred = fs::path{forward}.make_preferred();
+    EXPECT_EQ(PathIdentity::of(forward), PathIdentity::of(preferred))
+        << "one location spelled two ways produced two identities: '"
+        << PathIdentity::of(forward).string() << "' vs '"
+        << PathIdentity::of(preferred).string() << "'";
+}
+
+// ── An identity must not change when the file comes into being ────────────
+//
+// The header's own note makes the not-yet-created path a FIRST-CLASS input
+// (output artifacts, a `path` dependency resolved before its directory is
+// confirmed, the cycle key needed for a reject's own message). ✔MEASURED before
+// the fix, one path and two keys differing only in whether it existed yet:
+//     before : 'C:/.../idtmp/notyet.o/'      <- trailing separator
+//     after  : 'C:/.../idtmp/notyet.o'
+// The short-name walk built its tail with `filename() / tail` against an EMPTY
+// tail, and appending to an empty path appends a SEPARATOR.
+TEST(PathIdentitySubstrate, CreatingTheFileDoesNotChangeItsIdentity) {
+    dss::test_support::ScratchDir sd{dss::test_support::Location::Temp,
+                                     "path-identity"};
+    fs::path const artifact = sd.path() / "notyet.o";
+    ASSERT_FALSE(fs::exists(artifact));
+    auto const before = PathIdentity::of(artifact);
+    { std::ofstream f{artifact}; f << "x"; }
+    ASSERT_TRUE(fs::exists(artifact));
+    EXPECT_EQ(before, PathIdentity::of(artifact))
+        << "the identity of one path changed when the file was created ('"
+        << before.string() << "' -> '"
+        << PathIdentity::of(artifact).string()
+        << "'), so anything keyed before the write and read after it holds TWO "
+           "entries for one file";
+}
+
 // ── Separator convention is uniform ───────────────────────────────────────
 //
 // The sites this replaced were SPLIT between `.string()` and
@@ -203,4 +319,125 @@ TEST(PathIdentitySubstrate, IdentityUsesOneSeparatorConvention) {
     auto const id = PathIdentity::of(sd.path() / "sub" / "leaf.c");
     EXPECT_EQ(id.string().find('\\'), std::string::npos)
         << "identity keys must use one separator convention: " << id.string();
+}
+
+// ── `absoluteKeepingRoot` — making a path absolute must not invent a drive ──
+//
+// ★★★ THE DEFECT, MEASURED BEFORE THIS PIN EXISTED. Four tiers called bare
+// `fs::absolute` on a caller-supplied path (`-I` search dirs, the shipped-config
+// walk, the artifact-written report, and the executable lookup in
+// `process_spawn`). On a path model that gives a UNC authority no `root_name()`,
+// `fs::absolute("//host/share/x")` does NOT fail — it returns
+// `C:\host\share\x`, with NO error. A path naming another machine silently
+// became a path on the local drive.
+//
+// ★★ THAT IS A DIFFERENT FAILURE DIRECTION FROM `weakly_canonical`, WHICH IS WHY
+// ONLY ONE OF THEM NEEDED FIXING. ✔MEASURED on the same host, same path:
+// `weakly_canonical` ERRORS ("No such file or directory"), so every caller's
+// existing on-error-keep-the-original arm already did the right thing.
+// `absolute` SUCCEEDS WRONGLY, which no error arm can catch. A helper that fails
+// toward a wrong answer is the one that needs the guard.
+TEST(PathIdentitySubstrate, AbsoluteDoesNotRerootAMultiSeparatorPath) {
+    dss::test_support::ScratchDir sd{dss::test_support::Location::Temp,
+                                     "abs-keeping-root"};
+    fs::path const unc = dss::test_support::uncSpellingOf(sd.path());
+    if (unc.empty())
+        GTEST_SKIP()
+            << "D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED: this host offers "
+               "no reachable UNC spelling of '"
+            << sd.path().string()
+            << "', so the re-rooting arm WAS NOT MEASURED on this leg. This is "
+               "an unmeasured property, NOT a passing one.";
+    ASSERT_GE(dss::test_support::leadingSeparatorRun(unc), 2u);
+
+    std::error_code ec;
+    fs::path const got = dss::core::absoluteKeepingRoot(unc, ec);
+    EXPECT_FALSE(ec) << "preserving a rooted path cannot fail: " << ec.message();
+    EXPECT_GE(dss::test_support::leadingSeparatorRun(got), 2u)
+        << "the leading separator run was collapsed, so this no longer names "
+           "the machine that was asked for: " << got.string();
+    std::error_code existsEc;
+    EXPECT_TRUE(fs::exists(got, existsEc))
+        << "the result must still name a directory that is there: "
+        << got.string();
+}
+
+// ── [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]] ─────
+//
+// THE `u8` SPELLING LOSES THE RUN EXACTLY AS THE NARROW ONE DOES, and that is
+// not obvious from the name — `generic_u8string()` reads like the LOSSLESS
+// member, and it is, but only along the ENCODING axis.
+//
+// ★★★ ✔MEASURED 2026-08-28, one path object, all three renderings printed side
+// by side on a REACHABLE UNC directory:
+//     .string()           '//localhost/C$/Source/DailySoftware'   run 2
+//     .generic_string()   '/localhost/C$/Source/DailySoftware'    run 1
+//     .generic_u8string() '/localhost/C$/Source/DailySoftware'    run 1
+// `renderCandidatePath` in the header-case diagnostic had moved to the `u8` form
+// to stop `std::system_error` on a name the active code page cannot encode
+// ([[D-PP-HEADER-CASE-NON-ASCII-NAME-NARROWING-THROW]]) — a real repair on a
+// DIFFERENT axis, which left the report naming the wrong MACHINE while spelling
+// the filename perfectly.
+TEST(PathIdentitySubstrate, GenericSpellingU8KeepsAMultiSeparatorRoot) {
+    dss::test_support::ScratchDir sd{dss::test_support::Location::Temp,
+                                     "generic-u8-keeping-root"};
+    fs::path const unc = dss::test_support::uncSpellingOf(sd.path());
+    if (unc.empty())
+        GTEST_SKIP()
+            << "D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS"
+               ": this host offers no reachable multi-separator spelling of '"
+            << sd.path().string()
+            << "', so the u8 rendering WAS NOT MEASURED on this leg. This is an "
+               "UNMEASURED property, not a passing one.";
+    ASSERT_GE(dss::test_support::leadingSeparatorRun(unc), 2u);
+
+    std::u8string const got = dss::core::genericSpellingU8(unc);
+    std::string const   narrow(reinterpret_cast<char const*>(got.data()),
+                             got.size());
+    EXPECT_GE(dss::test_support::leadingSeparatorRun(fs::path{narrow}), 2u)
+        << "the u8 spelling collapsed the leading run, so a diagnostic built "
+           "from it names a path on this drive instead of the host that was "
+           "asked about: " << narrow;
+    // The generic CONVENTION still holds — this is a spelling fix, not a
+    // licence to leak native separators into a rendered path.
+    EXPECT_EQ(narrow.find('\\'), std::string::npos)
+        << "a rendered spelling must use one separator convention: " << narrow;
+}
+
+// The CONTROL for the u8 spelling: a path with NO multi-separator root must come
+// back byte-identical to what it always was, so the new transform cannot be the
+// reason any existing diagnostic's wording moved.
+TEST(PathIdentitySubstrate, GenericSpellingU8LeavesAnOrdinaryPathAlone) {
+    dss::test_support::ScratchDir sd{dss::test_support::Location::Temp,
+                                     "generic-u8-control"};
+    std::u8string const got = dss::core::genericSpellingU8(sd.path());
+    std::string const   narrow(reinterpret_cast<char const*>(got.data()),
+                             got.size());
+    EXPECT_EQ(narrow, sd.path().generic_string())
+        << "on a path with a leading run below 2 the two spellings must agree "
+           "exactly — this arm is what keeps the fix inert everywhere else";
+}
+
+// The CONTROL, and it is the arm that stops the fix from becoming a regression.
+// A run of ONE separator is a genuine location on the current drive and MUST
+// still be made absolute — `isRootedPath` would have called it rooted and
+// skipped it, which is why the discriminator is the separator RUN and not that
+// predicate. A relative path must also still resolve against the cwd.
+TEST(PathIdentitySubstrate, AbsoluteStillResolvesSingleSeparatorAndRelative) {
+    std::error_code ec;
+    fs::path const rel = dss::core::absoluteKeepingRoot(fs::path{"some_relative_leaf"}, ec);
+    EXPECT_FALSE(ec) << ec.message();
+    EXPECT_TRUE(rel.is_absolute())
+        << "a relative path stopped being resolved against the cwd: "
+        << rel.string();
+
+    ec.clear();
+    fs::path const rooted = dss::core::absoluteKeepingRoot(fs::path{"/single_sep_leaf"}, ec);
+    EXPECT_FALSE(ec) << ec.message();
+    // On Windows this acquires the current drive; on POSIX it is already
+    // absolute and comes back unchanged. Both are `is_absolute()`, and asking
+    // only that keeps the arm free of a platform branch.
+    EXPECT_TRUE(rooted.is_absolute())
+        << "a single-separator root must still be made absolute — skipping it "
+           "would leave the drive undecided: " << rooted.string();
 }

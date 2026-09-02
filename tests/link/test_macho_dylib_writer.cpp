@@ -1133,6 +1133,8 @@ namespace {
     std::string s = R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".dylib",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"t-dylib","kind":"macho"},
@@ -1213,6 +1215,8 @@ TEST(MachoDylibFormatJsonValidate, InstallNameOnExecRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".dylib",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"t-exec-badid","kind":"macho"},
@@ -1242,6 +1246,8 @@ TEST(MachoDylibFormatJsonValidate, MissingInstallNameRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".dylib",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"t-dylib-noid","kind":"macho"},

@@ -1,0 +1,7 @@
+{
+  "$comment": "D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH (P50 lane li) — the FUNCTION flavor of the unanimous reject. MEASURED 2026-09-01: `int f(void) { ... } static int f(void);` is 'static declaration of f follows non-static declaration' on gcc 13.3.0 and clang 18.1.3, and C2375 'redefinition; different linkage' on MSVC 19.51.36231. The prior declaration must be a plain DEFINITION for the reject to be unanimous: `int f(void); static int f(void) { ... }` (prior is a bare PROTOTYPE) is silently accepted by MSVC — dumpbin shows f lands Static, i.e. internal — so DSS accepts it too and this manifest deliberately pins only the definition-first shape. Diagnostic at the static declarator's name (8:12). RED-ON-DISABLE: remove the merge-site linkage arm -> silent compile returning 42 -> expected diagnostic unmet.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:elf64-x86_64-linux-exec" } ],
+  "expectDiagnostics": [ { "code": "S_LinkageRedeclarationMismatch", "line": 8, "col": 12 } ]
+}

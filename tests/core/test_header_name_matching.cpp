@@ -20,6 +20,7 @@
 // only the filesystem varied): config tree on ext4 -> `<windows.h>` rc=0,
 // `<Windows.h>` rc=1 error[F001A]; the SAME tree via /mnt/c DrvFs -> BOTH rc=0.
 
+#include "core/substrate/path_identity.hpp"
 #include "core/types/ascii_case.hpp"
 #include "core/types/header_name_matching.hpp"
 #include "core/types/header_case_diagnostic.hpp"
@@ -33,6 +34,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <cstdlib>
 #include <limits>
 #include <map>
@@ -51,6 +53,33 @@ void writeFile(fs::path const& p, std::string_view text = "{}\n") {
     fs::create_directories(p.parent_path());
     std::ofstream out(p, std::ios::binary);
     out << text;
+}
+
+[[nodiscard]] std::string u8Bytes(std::u8string_view s) {
+    return std::string(reinterpret_cast<char const*>(s.data()), s.size());
+}
+
+// ⚠⚠ NARROW WITHOUT THROWING — `path::string()` AND `generic_string()` NARROW THROUGH THE ANSI
+// CODE PAGE ON MS STL AND THROW ON A NAME THEY CANNOT MAP.
+// That is [[D-PP-HEADER-CASE-NON-ASCII-NAME-NARROWING-THROW]], a P0 CLOSED for the production
+// sites — and MISSED in this file, which owns the one scan that walks ARBITRARY trees.
+// ✔MEASURED 2026-09-02 on a pt-BR host (CP1252) under MSVC Release: one directory whose name held
+// U+F03A (how Windows stores a `:` written by a POSIX tool that treated `C:/…` as relative) made
+// `ShippedConfigTreeHasNoCaseCollidingPaths` die with `C++ exception with description "Não existe
+// mapeamento para o caractere Unicode…"` — a localized message naming NO PATH, thrown by a guard
+// whose entire job is to name paths. gcc and clang narrow as UTF-8 and never saw it.
+// ★ THE FALLBACK IS THE CALLER'S BY DESIGN, WHICH IS WHY IT LIVES HERE AND NOT IN THE OWNER.
+// `genericSpellingU8` throws exactly where `u8string()` does, deliberately: a native name can be
+// text no encoding accepts (NTFS permits lone surrogates), and swallowing that inside the owner
+// would hand back a name that is not the file's. So the owner is reused for the spelling, and the
+// decision about an unrenderable entry is made by each caller — here, an EMPTY string meaning
+// "cannot classify", counted rather than silently skipped.
+[[nodiscard]] std::string narrowUtf8OrEmpty(fs::path const& p) {
+    try {
+        return u8Bytes(dss::core::genericSpellingU8(p));
+    } catch (...) {
+        return {};
+    }
 }
 
 // Can THIS filesystem hold two entries whose names differ only by ASCII case?
@@ -85,7 +114,11 @@ bool hostCanHoldCaseCollidingPair(fs::path const& dir) {
     std::error_code ec;
     std::size_t entries = 0;
     for (fs::directory_iterator it{dir, ec}, end; !ec && it != end; it.increment(ec)) {
-        std::string const n = it->path().filename().string();
+        // Same narrowing hazard as the sweep below, and NOT hypothetical here either: this
+        // directory lives under TEMP, whose path carries the account name — on a host whose
+        // user name the code page cannot map, `.string()` would throw and take the host-capability
+        // probe with it, turning "can this filesystem hold a colliding pair?" into a crash.
+        std::string const n = narrowUtf8OrEmpty(it->path().filename());
         if (asciiToLower(n) == "dss_case_probe.tmp") ++entries;
     }
     fs::remove(lower, ec);
@@ -100,10 +133,6 @@ bool hostCanHoldCaseCollidingPair(fs::path const& dir) {
 // universal-character escapes, so the fixture bytes are identical on every
 // host and every toolchain. Nothing exotic is ever COMMITTED — the names are
 // created at runtime in a scratch dir and removed with it.
-[[nodiscard]] std::string u8Bytes(std::u8string_view s) {
-    return std::string(reinterpret_cast<char const*>(s.data()), s.size());
-}
-
 constexpr std::u8string_view kNaive = u8"na\u00EFve.json";       // Latin-1 range
 constexpr std::u8string_view kZhong = u8"\u4E2D\u6587.json";    // CJK, distinct...
 constexpr std::u8string_view kNihon = u8"\u65E5\u672C.json";    // ...from this one
@@ -166,6 +195,20 @@ constexpr std::u8string_view kNihon = u8"\u65E5\u672C.json";    // ...from this 
 // on a default APFS/HFS+ volume (git will either collide the two onto one file
 // or leave the tree permanently dirty), so a repo that contains one only works
 // on ext4 — a non-starter for a project whose whole point is any-host.
+// ⚠⚠ NARROW WITHOUT THROWING — `path::string()` AND `generic_string()` NARROW THROUGH THE ANSI
+// CODE PAGE ON MS STL AND THROW ON A NAME THEY CANNOT MAP.
+// That is [[D-PP-HEADER-CASE-NON-ASCII-NAME-NARROWING-THROW]], a P0 CLOSED for the production
+// sites — and MISSED here, in the one scan that walks ARBITRARY trees. ✔MEASURED 2026-09-02 on a
+// pt-BR host (CP1252) under MSVC Release: a single directory whose name held U+F03A (how Windows
+// stores a `:` written by a POSIX tool) made `ShippedConfigTreeHasNoCaseCollidingPaths` die with
+// `C++ exception with description "Não existe mapeamento para o caractere Unicode…"` — a localized
+// message naming NO PATH, from a guard whose whole job is to name paths.
+// ★ THE FALLBACK IS THE CALLER'S BY DESIGN. `genericSpellingU8` throws exactly where `u8string()`
+// does, deliberately, because a native name can be text no encoding accepts (NTFS permits lone
+// surrogates) and swallowing that inside the owner would hand back a name that is not the file's.
+// So the owner is reused and the fallback lives HERE: an unrenderable entry yields an EMPTY
+// spelling, which the callers treat as "cannot classify" and COUNT, rather than aborting a sweep
+// over a whole repository because of one path it only needed to compare.
 struct CaseCollisionScan {
     std::vector<std::vector<std::string>> groups;   // each >= 2 fold-equal paths
     // ★ THE SCAN MUST REPORT ITS OWN DENOMINATOR. `groups` is empty both when
@@ -179,6 +222,11 @@ struct CaseCollisionScan {
     // in this very tree.
     std::size_t     filesScanned = 0;
     std::error_code walkError;   // non-empty ⇒ TRUNCATED walk, never a pass
+    // ★ THE SAME DENOMINATOR DISCIPLINE, ONE STEP FURTHER: an entry whose name cannot be
+    // rendered is SKIPPED, and a silent skip is the vacuous-pass class this struct already
+    // guards against. Counting it makes the limit legible — the sweep can then say "clean over
+    // N files, and M I could not spell" instead of implying it looked at everything.
+    std::size_t     unrenderable = 0;
 };
 
 // `prunedSubtrees` names ABSOLUTE subtrees to skip — the path-anchored half of
@@ -214,17 +262,26 @@ CaseCollisionScan caseCollisionsUnder(fs::path const&              root,
         if (ec) { scan.walkError = ec; return scan; }   // truncated — NOT a pass
         std::error_code dirEc;
         if (it->is_directory(dirEc)) {
+            // An unrenderable directory name yields "" — which is not a generated name, so the
+            // walk DESCENDS rather than pruning. Erring toward scanning more is the safe
+            // direction for a collision guard.
             bool const prunedHere =
-                isGeneratedDirName(it->path().filename().string())
+                isGeneratedDirName(narrowUtf8OrEmpty(it->path().filename()))
                 || std::find(pruned.begin(), pruned.end(),
                              it->path().lexically_normal()) != pruned.end();
             if (prunedHere) it.disable_recursion_pending();
             continue;
         }
         std::error_code relEc;
-        std::string const rel =
-            fs::relative(it->path(), root, relEc).generic_string();
-        if (rel.empty()) continue;
+        fs::path const  relPath = fs::relative(it->path(), root, relEc);
+        std::string const rel   = narrowUtf8OrEmpty(relPath);
+        if (rel.empty()) {
+            // Distinguish the two reasons rather than folding them: `relative` failing is a
+            // walk problem, an unrenderable spelling is a text problem, and only the second is
+            // this scan's own blind spot.
+            if (!relPath.empty()) ++scan.unrenderable;
+            continue;
+        }
         ++scan.filesScanned;
         byFolded[asciiToLower(rel)].push_back(rel);
     }
@@ -540,6 +597,14 @@ TEST(HeaderNameMatching, ShippedConfigTreeHasNoCaseCollidingPaths) {
             << ") — a partial tree is not a clean tree";
         EXPECT_GT(scan.filesScanned, 0u)
             << sub << ": scanned ZERO files, so an empty result says nothing";
+        // NOT a failure: an entry this host cannot spell is a real limit of the sweep, not a
+        // collision. It is REPORTED so a clean verdict cannot quietly mean "clean over the part
+        // I could read" — the same reason `filesScanned` is asserted at all.
+        if (scan.unrenderable > 0)
+            std::cerr << "[ note ] " << sub << ": " << scan.unrenderable
+                      << " entr" << (scan.unrenderable == 1 ? "y" : "ies")
+                      << " could not be rendered on this host's code page and were not "
+                         "compared\n";
         for (auto const& g : scan.groups) {
             std::string joined;
             for (auto const& p : g) { joined += "\n  "; joined += p; }

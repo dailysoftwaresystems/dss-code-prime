@@ -1,5 +1,6 @@
 #include "link/writer.hpp"
 
+#include "core/substrate/path_identity.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
 #include <atomic>
@@ -349,17 +350,33 @@ using StagedFile = std::unique_ptr<std::FILE, StagedFileCloser>;
 // current locale's ANSI codepage. A throw inside the failure-
 // reporting path would silently abort the writer mid-diagnostic.
 //
-// Safe approach: try the narrow form first; on throw, fall back
-// to `u8string()` (returns `std::u8string`, guaranteed UTF-8, never
-// throws per the C++20 spec) and reinterpret to `std::string`.
+// Safe approach: try the narrow form first; on throw, fall back to the
+// UTF-8 form and reinterpret to `std::string`.
 // (silent-failure-hunter HIGH fold #2, LK10 cycle 1 post-fold #2
 // review — the post-fold #1 `generic_string()`-only fix did not
 // fully close the Windows throw hazard.)
+//
+// ★★★ AND THE TWO ARMS USED TO DISAGREE ABOUT WHICH FILE THEY NAME, which is
+// strictly worse than the throw they were written for. `generic_string()`
+// collapses a UNC path's leading separator RUN, so the try arm reported
+// `//host/share/x` as `/host/share/x` — a path on the LOCAL drive root, a
+// different file — while the catch arm's `u8string()` kept the run and also
+// kept NATIVE separators. One path object, two spellings, and which one a user
+// saw depended on whether narrowing happened to throw for an unrelated reason.
+// Both arms now go through the run-preserving transforms
+// ([[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]), so they differ in ENCODING
+// only — which is the one axis this fallback exists for.
+//
+// ⚠ `genericSpellingU8` throws exactly where `u8string()` does (a native name
+// can be text no encoding accepts), which is unchanged from the code this
+// replaced: the catch arm could always propagate. Swallowing it here would hand
+// back a name that is not the file's, and this function's whole job is to name
+// the file.
 [[nodiscard]] std::string pathForDiag(std::filesystem::path const& p) {
     try {
-        return p.generic_string();
+        return core::genericSpelling(p);
     } catch (...) {
-        auto const u8 = p.u8string();
+        auto const u8 = core::genericSpellingU8(p);
         return std::string(reinterpret_cast<char const*>(u8.data()),
                            u8.size());
     }
@@ -410,8 +427,10 @@ bool writeImage(LinkedImage const&             image,
                  + ", bytes.size()="
                  + std::to_string(image.bytes.size())
                  + "). The upstream walker likely emitted a "
-                   "diagnostic; check `reporter.errorCount()` "
-                   "before calling writeImage.");
+                   "diagnostic; `writeBytes` below enforces "
+                   "`reporter.errorCount() == 0` for every "
+                   "artifact, so a compile that failed earlier "
+                   "never reaches this arm's write.");
         return false;
     }
     // The `ok()` check requires resolvedFuncCount == expectedFuncCount
@@ -477,6 +496,75 @@ bool writeImage(LinkedImage const&             image,
 bool writeBytes(std::span<std::uint8_t const> bytes,
                 std::filesystem::path const&  path,
                 DiagnosticReporter&           reporter) {
+    // ── THE ARTIFACT INVARIANT: A COMPILATION THAT RECORDED AN ERROR COMMITS
+    //    NO ARTIFACT ────────────────────────────────────────────────────────
+    //
+    // ★★★ FIRST, AND IN THIS FUNCTION RATHER THAN IN ANY CALLER, BECAUSE THIS
+    // IS THE ONE PLACE ANY ARTIFACT BYTE IN THIS COMPILER REACHES DISK.
+    // `writeImage` delegates its byte commit here after its LinkedImage-shape
+    // preconditions, and the `ar` static-archive producer calls it directly;
+    // ✔MEASURED — those are the only two call sites in `src/`. A caller that
+    // adds a third inherits the invariant instead of having to remember it,
+    // which is the whole reason the question is asked here and not twice in
+    // `compile_pipeline.cpp`.
+    //
+    // ⚠ THE PRECONDITION ALREADY EXISTED — AS A SENTENCE ADDRESSED TO
+    // CALLERS, AND NO CALLER OBEYED IT. `writeImage`'s K_ImageNotOk arm has
+    // told the reader to *"check `reporter.errorCount()` before calling
+    // writeImage"* since the LK10 substrate landed. A precondition every
+    // caller must check and none does is a precondition in the wrong place.
+    //
+    // ★ WHY `errorCount()` ON THIS REPORTER IS EXACTLY "THIS COMPILATION",
+    // with no snapshot to thread and no cross-target leak: `compileOneTarget`
+    // is the single owner of an output path (✔MEASURED: one call site) and is
+    // handed a FRESH per-target `DiagnosticReporter scratch` by
+    // `runCusToTargets`, which then decides that target's exit code from the
+    // very same `scratch.hasErrors()` one statement after the call. So the
+    // predicate that says the build FAILED and the predicate that withholds
+    // the file are now ONE predicate — which is the defect stated positively:
+    // the tool could report rc=1 and hand back the binary that rc denied.
+    //
+    // ★★ IT CANNOT TURN A PASSING BUILD RED. A recorded error already makes
+    // `runCusToTargets` set `exitCode = 1`, so every run this gate can reach
+    // was failing before it existed. The change is in what such a run LEAVES
+    // ON DISK, never in which runs succeed.
+    //
+    // ⓘ REACHING THIS GATE MEANS AN UPSTREAM TIER REPORTED AN ERROR AND LET
+    // THE PIPELINE RUN ON. Every tier gate in `compile_pipeline.cpp` is a
+    // `tierClean(reporter, entryCount)` SNAPSHOT — right, and deliberately so,
+    // since a shared reporter accumulates and a tier must not fail on another
+    // tier's errors — but that discipline has no WHOLE-COMPILATION level, and
+    // this is it. ✔MEASURED on the shipped CLI at the base of this lane: the
+    // one live producer is `mergeCuMirs`, which reports each cross-unit strong
+    // redefinition and then returns a valid merged module, so a two-TU program
+    // redefining a symbol printed `dsscp: artifact …`, exited 1, and left a
+    // runnable `.exe` bound to CU#1's definition.
+    //
+    // ⓘ AND THE PREVIOUS ARTIFACT IS LEFT BYTE-INTACT. The refusal is ahead of
+    // the staging-temp claim, so the commit rename never runs and a good
+    // binary from an earlier build is neither replaced nor removed. That is a
+    // DELIBERATE, MEASURED divergence from all three references on a failed
+    // LINK (gcc 13.3.0, clang 18.1.3 and MSVC 19.51 each unlink the previous
+    // output when `ld`/`link` fails; all three LEAVE it byte-identical when
+    // the FRONT END fails, ✔measured separately per reference) and it is the
+    // same non-destructive policy `writeBytes` already documents for a failed
+    // write: this compiler never destroys an artifact it did not write, it
+    // only ever declines to write a new one. Removing one instead would make
+    // a compiler delete a working user binary on a build it aborted before
+    // opening the file.
+    if (reporter.errorCount() != 0) {
+        dss::report(reporter, DiagnosticCode::K_ArtifactWithheldAfterError,
+                    DiagnosticSeverity::Info,
+                    std::string{"link::writeBytes: withholding the artifact '"}
+                        + pathForDiag(path) + "' — this compilation recorded "
+                        + std::to_string(reporter.errorCount())
+                        + " error(s), and a build that reports failure must "
+                          "not also produce the file that failure denies. "
+                          "Nothing was written; any file already at that path "
+                          "is untouched. The error(s) above are the fault — "
+                          "this line is only its consequence.");
+        return false;
+    }
     // Precondition: the path names a FILE. `rename()` needs a real final
     // component, and an empty one (an unset config field passing "") could
     // never name an artifact. Reject up front so a bad path can never leave

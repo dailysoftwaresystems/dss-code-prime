@@ -2693,23 +2693,51 @@ void runErrorTarget(fs::path const&        exampleDir,
                   " (nothing is spawned)");
     ASSERT_FALSE(t.spec.empty())
         << "expect-error target needs a 'spec' to drive the compile";
-    // Single-source keeps position resolution unambiguous: one source
-    // buffer, so a diagnostic's span offset maps to exactly this file.
-    ASSERT_EQ(m.sources.size(), 1u)
-        << "expectDiagnostics examples must be single-source";
+    // ★ SINGLE-SOURCE ONLY WHERE POSITIONS ARE ASSERTED. A diagnostic's span
+    // offset is resolved below through ONE `SourceBuffer`, so a POSITIONED
+    // expectation genuinely needs exactly one source file — that is the whole
+    // of the original reason, and it is kept verbatim. A manifest whose
+    // declared codes are ALL `positioned:false` asserts no coordinate at all,
+    // and refusing it cost the corpus every CROSS-UNIT refusal: a cross-unit
+    // symbol redefinition, an ambiguous program entry and an unresolved
+    // sibling reference are inexpressible in one translation unit BY
+    // DEFINITION, so the single-source rule was excluding exactly the refusals
+    // that need two files to happen at all.
+    bool anyPositioned = false;
+    for (auto const& e : m.expectDiagnostics) anyPositioned |= e.positioned;
+    if (anyPositioned) {
+        ASSERT_EQ(m.sources.size(), 1u)
+            << "expectDiagnostics examples that assert a POSITIONED code must "
+               "be single-source — one buffer, so a span offset maps to "
+               "exactly this file. Declare every code `positioned:false` to "
+               "use two or more sources.";
+    }
+    ASSERT_FALSE(m.sources.empty()) << "expect-error example declares no source";
 
     ScratchDir scratch{Location::InsideRepo, "examples"};
+    std::vector<std::string> srcPaths;
+    srcPaths.reserve(m.sources.size());
+    for (auto const& rel : m.sources) {
+        auto const p = scratch.path() / rel;
+        fs::copy_file(exampleDir / rel, p, fs::copy_options::overwrite_existing);
+        srcPaths.push_back(p.generic_string());
+    }
     auto const srcRel  = m.sources.front();
     auto const srcPath = scratch.path() / srcRel;
-    fs::copy_file(exampleDir / srcRel, srcPath,
-                  fs::copy_options::overwrite_existing);
     scratch.useAsCwd();
 
     Program            prog;
     DiagnosticReporter rep;
-    prog.setOutputDir(scratch.path() / "out");
-    int const rc =
-        prog.compileFiles({srcPath.generic_string()}, m.language, {t.spec}, rep);
+    auto const         outDir = scratch.path() / "out";
+    prog.setOutputDir(outDir);
+    // Same entry-point choice the SUCCESS arm makes: a `sources` array is the
+    // CU6 multi-CU model (`compileUnits`, one CU per file, merged at link), a
+    // single `source` is the CU5 one-unit model (`compileFiles`). Routing the
+    // error arm through `compileFiles` unconditionally would fold two files
+    // into ONE unit, where "two units define `f`" cannot be said.
+    int const rc = m.multiCu
+        ? prog.compileUnits(srcPaths, m.language, {t.spec}, rep)
+        : prog.compileFiles(srcPaths, m.language, {t.spec}, rep);
 
     // A malformed source MUST be rejected — both the driver return code and
     // the error-severity count confirm the compile failed (not a silent pass).
@@ -2719,6 +2747,34 @@ void runErrorTarget(fs::path const&        exampleDir,
     EXPECT_GT(rep.errorCount(), 0u)
         << "expect-error example produced no error-severity diagnostics: "
         << exampleDir.generic_string();
+
+    // ★★★ THE ARTIFACT INVARIANT, ASSERTED OVER THE WHOLE EXPECT-ERROR CORPUS.
+    // A build that reports failure must not also produce the file that failure
+    // denies. This arm already knew the compile had to FAIL; it never once
+    // looked at whether an executable was left behind, and ✔MEASURED at the
+    // base of this lane a two-TU cross-unit redefinition printed
+    // `dsscp: artifact …`, exited 1, and left a runnable `.exe` bound to CU#1's
+    // definition of the redefined symbol. Every declared expect-error example
+    // now witnesses the invariant, not only the one written for it — which is
+    // the difference between a pin and a census.
+    std::vector<std::string> leftovers;
+    {
+        std::error_code ec;
+        for (auto it = fs::recursive_directory_iterator(outDir, ec);
+             !ec && it != fs::recursive_directory_iterator{}; it.increment(ec)) {
+            if (it->is_regular_file(ec)) {
+                leftovers.push_back(it->path().generic_string());
+            }
+        }
+    }
+    EXPECT_TRUE(leftovers.empty())
+        << "expect-error example " << exampleDir.generic_string()
+        << " REPORTED FAILURE AND STILL WROTE AN ARTIFACT ("
+        << leftovers.size()
+        << " file(s), first: " << (leftovers.empty() ? "" : leftovers.front())
+        << "). rc was non-zero and errors were reported; any build script or "
+           "harness keying on the binary's existence gets a program the "
+           "compiler just refused.";
 
     // Resolve every diagnostic's START position through the SAME
     // SourceBuffer::lineCol the compiler uses, so the asserted 1-based
@@ -2750,8 +2806,21 @@ void runErrorTarget(fs::path const&        exampleDir,
     std::vector<std::string> actual;
     actual.reserve(rep.all().size());
     for (auto const& d : rep.all()) {
+        // ⚠ RESOLVE A POSITION ONLY WHERE ONE IS ASSERTED. `srcBuf` is built
+        // from `sources.front()`, which is the ONLY source whenever any
+        // declared code is positioned (asserted above). A multi-source
+        // manifest is all-`positioned:false` by construction, so `render`
+        // discards the coordinate — and asking `lineCol` for an offset that
+        // belongs to a SIBLING file would be reading one buffer with another
+        // file's offset, which is the shape of answer that looks like a
+        // measurement and is not one.
+        auto const name = diagnosticCodeName(d.code);
+        if (codeOnly.count(std::string{name}) != 0) {
+            actual.push_back(render(name, 0, 0));
+            continue;
+        }
         auto const lc = srcBuf->lineCol(d.span.start());
-        actual.push_back(render(diagnosticCodeName(d.code), lc.line, lc.column));
+        actual.push_back(render(name, lc.line, lc.column));
     }
     std::vector<std::string> expected;
     expected.reserve(m.expectDiagnostics.size());

@@ -297,8 +297,20 @@ namespace detail::type_rules {
     // C99 _Complex (D-CSUBSET-COMPLEX §6.3.1.7/§6.5.16.1, D8): a real OR a
     // differently-elemented complex is assignable INTO a complex lhs — real->complex
     // constructs (v, 0); complex->complex element-converts. A complex rhs into a REAL
-    // lhs is NOT implicitly assignable (the imaginary part is discarded only on an
-    // EXPLICIT cast — an implicit complex->real is a constraint violation → loud).
+    // lhs is admitted by the SEPARATE admits-or-falls-through arm below (P46,
+    // [[D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED]]) and deliberately NOT
+    // by this returning block — the long note there says why the two shapes differ.
+    // ⚠ THE CLAUSE THAT USED TO CLOSE THIS SENTENCE — *"an implicit complex->real is
+    // a constraint violation → loud"* — ASSERTED THE STANDARD AND GOT IT BACKWARDS,
+    // and it SURVIVED the P42 correction that rewrote the note below: one false rule
+    // with two renditions, of which only one was fixed. That is the shape of
+    // feedback-a-partial-fix-reads-as-a-complete-one applied to a COMMENT (bare, not
+    // `[[…]]`: that bracket form is the registry's ANCHOR link and this is a topic,
+    // not an anchor — the tests/mir precedent spells it this way too), and it
+    // is worse than the original error because the surviving half now contradicts,
+    // in the same function, the note that corrects it. C 6.3.1.7p2 DEFINES the
+    // conversion (the imaginary part is discarded) and requires no cast to request
+    // it; C 6.5.16.1p1 asks only that both operands have arithmetic type.
     // UNGATED shape admission: Complex only ever appears in a `_Complex`-declaring
     // schema, so this is inert elsewhere (the coerce `isArithmeticCore`-BitInt
     // precedent). The identical-type case already returned via `sameType` above.
@@ -308,59 +320,104 @@ namespace detail::type_rules {
             || unsignedIntRank(rk) != 0 || rk == TypeKind::Bool
             || rk == TypeKind::Char;                // a real constructs (v, 0)
     }
-    // ★★★ THE MIRROR DIRECTION — AN IMPLICIT COMPLEX → REAL — IS LEGAL C AND IS
-    //     STILL REFUSED HERE ON PURPOSE, AND THE REASON IS NOT THE ONE THIS
-    //     COMMENT USED TO GIVE. D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED.
+    // ★★★ THE MIRROR DIRECTION — AN IMPLICIT COMPLEX → REAL — IS LEGAL C, AND AS OF
+    //     P46 IT IS ADMITTED. D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED
+    //     IS CLOSED, TOGETHER WITH THE TGMATH DISPATCH THAT MAKES IT SAFE.
     //
-    // The text that used to sit here called an implicit complex→real *"a
-    // constraint violation"*. That is WRONG: C 6.3.1.7p2 defines the conversion —
-    // the imaginary part is discarded — with no requirement that a cast request
-    // it, and C 6.5.16.1p1 asks only that both operands have ARITHMETIC type,
-    // which C 6.2.5p11+p18 make true of a complex. ✔MEASURED 2026-08-27 (shipped
-    // CLI, x86_64:pe64-x86_64-windows-exec, binaries RUN): `double d = z;` on a
-    // `(3,4)` complex exits 3 under gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
-    // (`-std=c23`), probed SEPARATELY; DSS refuses `error[S0003]`. So this is a
-    // KNOWN DIVERGENCE, correctly described, not a rule.
+    // C 6.3.1.7p2 DEFINES the conversion (the imaginary part is discarded) with no
+    // requirement that a cast request it; C 6.5.16.1p1 asks only that both operands
+    // have ARITHMETIC type, which C 6.2.5p11+p18 make true of a complex; and C
+    // 6.5.2.2p7 converts a call ARGUMENT *"as if by assignment"*, so assignment and
+    // argument are ONE rule with no seam. ✔MEASURED (binaries RUN, each reference
+    // probed SEPARATELY): `double d = z;` on a (3,4) exits 3 under gcc 13.3.0
+    // `-std=c2x`, clang 18.1.3 `-std=c23` AND mingw-w64 gcc 13.2.0; the argument form
+    // `takes_double(z)` exits 3 on all three. MSVC 19.51 ABSTAINS — it has no
+    // `_Complex` type specifier at all (`error C2146`), an ABSTENTION rather than a
+    // refusal. ⇒ REQUIRED under `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C`.
     //
-    // ⚠⚠ THE ARM WAS WRITTEN, BUILT, AND WITHDRAWN THE SAME DAY, BECAUSE IT
-    // CONVERTED A LOUD REFUSAL INTO A SILENT WRONG ANSWER SOMEWHERE ELSE — and
-    // that coupling is the finding, not the arm. `src/dss-config/shippedLibs/
-    // tgmath.json` borrows its `_Complex` loudness FROM THIS REFUSAL: its own
-    // `$comment` says the `default:` arm must stay a BARE `sqrt((x))` because
-    // *"(double)z is legal C, silently drops the imaginary part → a conformance
-    // MISCOMPILE"*, and concludes *"Bare ⇒ a complex arg fails S_TypeMismatch
-    // LOUD"*. That conclusion holds ONLY while this conversion is missing.
-    // ✔MEASURED with the arm present: `#include <tgmath.h>` + `sqrt(z)` on a
-    // `(0, 4i)` COMPILED and returned 0, where gcc dispatches to `csqrt` and
-    // returns 1 — a silently wrong answer, which this project ranks below a
-    // crash. Three pins caught it (`SemanticAnalyzerC.TgmathComplexArg{Sqrt,Pow,
-    // Fabs}FailsLoud*`) and they were RIGHT.
-    // ⇒ ADMITTING THIS CONVERSION REQUIRES AN OWNER FOR THE TGMATH COMPLEX
-    // DISPATCH FIRST — [[D-CSUBSET-TGMATH-COMPLEX]] riding
-    // [[D-CSUBSET-COMPLEX-TRANSCENDENTAL]] (`csqrt`/`cpow`/`cabs`…). A
-    // `_Generic` arm cannot substitute: `_Generic`'s UNSELECTED arms are fully
-    // type-checked (that file's own cast discipline depends on it), so an arm
-    // naming an unshipped `csqrt` would break EVERY `sqrt` call, not only the
-    // complex one. The two must land together.
-    // ★ The general shape, which is why this is written at length instead of
-    // deleted: a guard whose loudness comes from a DIFFERENT tier's missing
-    // feature is one fact with two owners, and fixing either half alone breaks
-    // the other. The same duplicated-truth-table defect this cycle has now met
-    // repeatedly.
+    // ⚠⚠ WHY THIS ARM COULD NOT LAND ALONE, AND WHAT LANDED WITH IT. Until P46
+    // `src/dss-config/shippedLibs/tgmath.json` borrowed its `_Complex` loudness FROM
+    // THIS REFUSAL: its `default:` arm was a BARE `sqrt((x))`, loud for a complex
+    // argument only because this conversion was missing. ✔MEASURED in P45: admit the
+    // conversion alone and `#include <tgmath.h>` + `sqrt(z)` on a `(0,4i)` compiles
+    // and exits 0, where gcc, clang and mingw-w64 gcc all dispatch to `csqrt` and
+    // exit 1 — a SILENT WRONG ANSWER, which this project ranks below a crash. Three
+    // pins caught it and they were RIGHT.
+    // ⇒ P46 gave that loudness its own owner instead of deleting it. `tgmath.json`
+    // now (a) DISPATCHES a complex argument to the `<complex.h>` function C23 7.25
+    // requires (`csqrt`/`cpow`/`cabs`/… as extern libcalls) for the eleven macros
+    // that HAVE a complex counterpart, and (b) refuses a complex argument LOUDLY for
+    // the six that do not, through a `_Generic` whose real-only association set the
+    // complex controlling type matches at all — `S_GenericSelectionNoMatch`, the C
+    // 6.5.1.1 constraint itself, which is the same mechanism gcc and clang refuse
+    // with (✔MEASURED: both reject `floor(z)`, `ceil(z)`, `log10(z)`, `atan2(z,1.0)`,
+    // `fmod(z,4.0)` and `ldexp(z,2)`). [[D-CSUBSET-TGMATH-COMPLEX]].
+    // ★ The general shape, kept because it is what made this expensive: a guard whose
+    // loudness comes from a DIFFERENT tier's missing feature is one fact with two
+    // owners, and fixing either half alone breaks the other.
+    //
+    // ⚠⚠ THE SHAPE OF THIS ARM IS LOAD-BEARING AND "MIRROR THE real→complex ARM
+    // ABOVE" IS A TRAP, ✔MEASURED in P45. That arm is a RETURNING block
+    // (`if (lk == Complex) { … return …; }`) which OWNS every rhs once the lhs is
+    // complex. Mirroring its SHAPE here — returning the rank disjunction — answers
+    // FALSE for a `_Bool` lhs and stops `_Bool b = z;` from ever reaching
+    // `scalarConvertsToBool`, whose roster already names Complex, regressing the
+    // execution-verified
+    // [[D-CSUBSET-COMPLEX-TO-BOOL-ASSIGNMENT-NOT-ADMITTED-BY-THE-SEMANTIC-TIER]].
+    // So this ADMITS-OR-FALLS-THROUGH, the shape every gated arm below uses, and a
+    // Bool lhs deliberately falls through to its own arm.
+    // ⚠ UNGATED, and for the same reason the real→complex arm above is: a `Complex`
+    // TypeId only ever exists in a `_Complex`-declaring schema, so no `.lang.json`
+    // key can make this more inert than it already is in every other language (the
+    // `coerce` `isArithmeticCore`-BitInt precedent). The realize side is the SAME
+    // `Cast(complex -> real)` node the EXPLICIT cast already builds, which `mapCast`'s
+    // C 6.3.1.7 discard arm in `src/mir/lowering/hir_to_mir.cpp` already lowers — no
+    // new lowering was introduced.
+    if (rk == TypeKind::Complex
+        && (floatRank(lk) != 0 || signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)) {
+        return true;
+    }
     // C 6.3.1.4 / 6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION, int→float): an integer
     // value is implicitly assignable to a floating lhs — `double d = 5;`,
     // `f(anInt)` to a `double` param (the sqlite `kahanBabuskaNeumaierStep(pSum,
     // iBig)` shape: `i64` → `volatile double`). The same-type/same-rank arms above
     // returned for a float↔float pair, so this arm is reached only for an int
     // rhs / float lhs MIX. The rhs side admits BOTH the signed AND the unsigned int
-    // ranks (Char/Bool/Enum are handled by their own arms above; an Enum here has
-    // already been bridged to its underlying int by those, and a Char rhs flowing
-    // into a float is still rank-0 here — not yet admitted, an intentional narrow
-    // scope). Gated on `intConvertsToFloat`; the HIR `coerce()` arithmetic-core arm
+    // ranks (Bool/Enum are handled by their own arms above; an Enum here has
+    // already been bridged to its underlying int by those, and a Char rhs is
+    // admitted by the P46 clause spelled below, not by a rank). Gated on
+    // `intConvertsToFloat`; the HIR `coerce()` arithmetic-core arm
     // materializes the MIR SIToFP/UIToFP, so the post-coerce verifier (gate default
     // false) stays strict. Pointers/structs (rank 0 in every helper) stay rejected.
+    // ★ P46: `TypeKind::Char` JOINS THE RHS SIDE, and the clause it needed is the
+    // COMPOSITION of two gates already here rather than a new key. The sentence
+    // above used to end *"a Char rhs flowing into a float is still rank-0 here —
+    // not yet admitted, an intentional narrow scope"*, and the scope was too
+    // narrow: `char` is an integer type (C 6.3.1.1), it promotes to `int`
+    // (C 6.3.1.1p2) and an `int` converts to a floating type (C 6.3.1.4), so
+    // `double d = aChar;` is two conversions the language already spells out
+    // separately. ✔MEASURED 2026-08-31, binaries RUN: `char c = 7; double r =
+    // floor(c);` exits 7 under gcc 13.3.0 `-std=c2x` and clang 18.1.3 `-std=c23`,
+    // while DSS refused `error[S_TypeMismatch]` — BELOW the union, in both
+    // directions. ⚠ FOUND FROM THE OTHER END, which is why it had gone unfiled:
+    // it is invisible through a `char` VARIABLE in ordinary code (`aChar + 0.0`
+    // reaches a float by the usual arithmetic conversions on the BINARY path,
+    // which is a different code path from assignment), and it surfaced only
+    // through `<tgmath.h>`, where a `char` argument must reach a `double`
+    // PARAMETER — C 6.5.2.2p7 assignment semantics — and `floor(aChar)` refused.
+    // ⚠ BOTH GATES ARE REQUIRED AND NEITHER IS REDUNDANT: `charConvertsToArith`
+    // is what says this schema's `char` participates in arithmetic at all, and
+    // `intConvertsToFloat` is what says an integer may reach a float. A schema
+    // that opts into one and not the other gets exactly what it asked for. No new
+    // key — a fact with an owner does not get a second owner.
+    // D-CSUBSET-INT-FLOAT-CONVERSION owns this axis and its gates; it closed in
+    // P19 with this ONE TypeKind missed, which is the partial-fix-reads-as-complete
+    // shape applied to a CLOSED row. The registry record of the miss is a
+    // born-closed row of its own; the CODE cites the parent here deliberately, so
+    // the anchor guard resolves whichever order the two land in.
     if (intConvertsToFloat
-        && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0)
+        && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0
+            || (charConvertsToArith && rk == TypeKind::Char))
         && floatRank(lk) != 0) {
         return true;
     }
@@ -371,9 +428,20 @@ namespace detail::type_rules {
     // Gated on `floatConvertsToInt`; the HIR `coerce()` arithmetic-core arm
     // materializes the MIR FPToSI/FPToUI, so the post-coerce verifier (gate default
     // false) stays strict. Pointers/structs (rank 0 in every helper) stay rejected.
+    // ★ P46: the MIRROR, and it lands with its twin because fixing one direction
+    // of a two-directional conversion is the shape that reads as a complete fix
+    // and is not one. ✔MEASURED, both references RUN: `double d = 3.5; char c =
+    // d;` exits 3 under gcc 13.3.0 and clang 18.1.3 (truncation toward zero),
+    // while DSS refused `error[S_TypeMismatch]`. Same two gates, same reason.
+    // D-CSUBSET-INT-FLOAT-CONVERSION owns this axis and its gates; it closed in
+    // P19 with this ONE TypeKind missed, which is the partial-fix-reads-as-complete
+    // shape applied to a CLOSED row. The registry record of the miss is a
+    // born-closed row of its own; the CODE cites the parent here deliberately, so
+    // the anchor guard resolves whichever order the two land in.
     if (floatConvertsToInt
         && floatRank(rk) != 0
-        && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)) {
+        && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0
+            || (charConvertsToArith && lk == TypeKind::Char))) {
         return true;
     }
     // An ACTUAL `_Bool` value WIDENS into an arithmetic slot (C99 6.3.1.2 —
@@ -1062,6 +1130,29 @@ indexResultType(TypeInterner const& interner, TypeId base) noexcept {
         && !interner.operands(base).empty())
         return interner.operands(base)[0];
     return InvalidType;
+}
+
+// C 6.3.2.1p3 ARRAY-TO-POINTER DECAY, as a lattice law: an `Array<T,N>` in a
+// value context is `Ptr<T>`; anything else passes through UNCHANGED. It is the
+// one place that law is spelled, so every consumer that must ask "what pointer
+// does this operand contribute" — the conditional's arm pairing, the pointer
+// SUBTRACTION arm, and the P48 pointer/integer and incompatible-pointee
+// diagnostics — asks the SAME question. A degenerate elementless Array is
+// returned unchanged rather than turned into a pointer to nothing.
+//
+// ⚠ IT IS NOT A UNIVERSAL REWRITE, AND THE EXCEPTIONS ARE WHY IT IS A CALLED
+// HELPER RATHER THAN SOMETHING THE TYPER APPLIES EVERYWHERE. `sizeof`,
+// `_Alignof` and unary `&` are the C 6.3.2.1p3 decay EXCEPTIONS — an operand
+// there keeps its array type — so only the sites that genuinely place the
+// operand in a value context call this.
+// ⚠ The interner is taken by NON-const reference because forming `Ptr<T>` INTERNS
+// a type — the decay is a lattice CONSTRUCTION, not a query, which is why it
+// cannot sit beside the `const&` `derefResultType`/`indexResultType` laws.
+[[nodiscard]] inline TypeId
+arrayToPointerDecay(TypeInterner& interner, TypeId t) noexcept {
+    if (!t.valid() || interner.kind(t) != TypeKind::Array) return t;
+    auto const elems = interner.operands(t);
+    return elems.empty() ? t : interner.pointer(elems[0]);
 }
 
 // ── FC3 c1: config-driven usual arithmetic conversions (C 6.3.1.8) ──────

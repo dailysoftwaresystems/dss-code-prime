@@ -1,5 +1,6 @@
 #include "program/input_resolver.hpp"
 
+#include "core/substrate/path_identity.hpp"  // genericSpelling
 #include "core/types/parse_diagnostic.hpp"
 
 #include <algorithm>
@@ -13,6 +14,13 @@ namespace fs = std::filesystem;
 
 void emit(DiagnosticReporter& rep, DiagnosticCode code, std::string msg) {
     dss::report(rep, code, DiagnosticSeverity::Error, std::move(msg));
+}
+
+// The WARNING twin. Separate from `emit` rather than a severity parameter on
+// it, so that a site cannot silently drop from Error to Warning by editing one
+// argument — the two are different contracts and read differently at the call.
+void warn(DiagnosticReporter& rep, DiagnosticCode code, std::string msg) {
+    dss::report(rep, code, DiagnosticSeverity::Warning, std::move(msg));
 }
 
 // Common extension match for both recursive + flat scans. Returns
@@ -36,7 +44,7 @@ bool InputResolver::resolveDirectory(
     std::error_code ec;
     if (!fs::exists(directoryPath, ec) || !fs::is_directory(directoryPath, ec)) {
         emit(reporter, DiagnosticCode::D_FileNotFound,
-             "InputResolver: '" + directoryPath.generic_string()
+             "InputResolver: '" + core::genericSpelling(directoryPath)
              + "' does not exist or is not a directory.");
         return false;
     }
@@ -54,13 +62,16 @@ bool InputResolver::resolveDirectory(
                 emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
                      "InputResolver: directory-scan interrupted after "
                      "partial enumeration of '"
-                     + directoryPath.generic_string() + "': "
+                     + core::genericSpelling(directoryPath) + "': "
                      + ec.message());
                 return false;
             }
             if (!iter->is_regular_file()) continue;
             if (extensionMatches(iter->path(), fileExtensions)) {
-                matched.push_back(iter->path().generic_string());
+                // Not a message — the INPUT LIST the compiler goes on to open.
+                // `iter` walks `directoryPath`, so every entry inherits that
+                // path's root, authority included.
+                matched.push_back(core::genericSpelling(iter->path()));
             }
         }
         return true;
@@ -72,7 +83,7 @@ bool InputResolver::resolveDirectory(
         if (ec) {
             emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
                  "InputResolver: failed to open directory '"
-                 + directoryPath.generic_string() + "': " + ec.message());
+                 + core::genericSpelling(directoryPath) + "': " + ec.message());
             return false;
         }
         scanOk = captureMatches(it);
@@ -81,7 +92,7 @@ bool InputResolver::resolveDirectory(
         if (ec) {
             emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
                  "InputResolver: failed to open directory '"
-                 + directoryPath.generic_string() + "': " + ec.message());
+                 + core::genericSpelling(directoryPath) + "': " + ec.message());
             return false;
         }
         scanOk = captureMatches(it);
@@ -91,7 +102,7 @@ bool InputResolver::resolveDirectory(
     if (matched.empty()) {
         emit(reporter, DiagnosticCode::D_EmptyInput,
              "InputResolver: no files in '"
-             + directoryPath.generic_string()
+             + core::genericSpelling(directoryPath)
              + "' match the configured extensions.");
         return false;
     }
@@ -148,6 +159,75 @@ bool InputResolver::validateFiles(
             continue;
         }
         out.push_back(path);
+    }
+    return allOk;
+}
+
+bool InputResolver::checkSearchDirectoriesUsable(
+        std::span<std::string const>    directories,
+        std::string_view                optionSpelling,
+        DiagnosticReporter&             reporter) {
+    // See the header for WHY this warns instead of refusing (a measured
+    // gcc/MSVC survey) and why absoluteness is never asked.
+    std::string const opt{optionSpelling};
+    bool allOk = true;
+    for (auto const& dir : directories) {
+        // An EMPTY argument is its own case and would otherwise be reported
+        // as "the current directory is fine": `fs::directory_iterator("")`
+        // fails, but `exists("")` is false, so it would land in the absent
+        // arm with an empty name in the message and tell the reader nothing.
+        if (dir.empty()) {
+            warn(reporter, DiagnosticCode::D_FileNotFound,
+                 "InputResolver: " + opt + " was given an EMPTY directory "
+                 "argument, which names no directory and contributes no "
+                 "header to the search path. It is IGNORED; a header that "
+                 "was meant to be found through it will be reported as "
+                 "missing at its `#include`.");
+            allOk = false;
+            continue;
+        }
+        std::error_code ec;
+        // ★ ONE QUESTION, ASKED OF THE FILESYSTEM DIRECTLY: can this be
+        //   enumerated? `directory_iterator`'s own failure is the authority,
+        //   because it is the exact operation the include search performs.
+        //   The `exists` / `is_directory` split below runs only to CLASSIFY
+        //   a failure that already happened, so a directory that enumerates
+        //   fine is never described by anything but success — and no
+        //   pre-check can disagree with the operation it is predicting.
+        fs::directory_iterator const probe(dir, ec);
+        if (!ec) continue;                     // enumerable — nothing to say
+
+        std::error_code       existsEc;
+        bool const            present = fs::exists(dir, existsEc);
+        std::error_code       dirEc;
+        bool const            isDir   = fs::is_directory(dir, dirEc);
+        if (!present && !existsEc) {
+            warn(reporter, DiagnosticCode::D_FileNotFound,
+                 "InputResolver: " + opt + " names '" + dir
+                 + "', which does not exist. It contributes no header to "
+                   "the search path and is IGNORED; a header that was meant "
+                   "to be found through it will be reported as missing at "
+                   "its `#include` rather than here.");
+        } else if (present && !isDir && !dirEc) {
+            warn(reporter, DiagnosticCode::D_DirectoryScanFailed,
+                 "InputResolver: " + opt + " names '" + dir
+                 + "', which exists but is NOT a directory. It is IGNORED; "
+                   "a header that was meant to be found through it will be "
+                   "reported as missing at its `#include` rather than here.");
+        } else {
+            // Present, a directory, and STILL not enumerable — permission
+            // denied, an I/O error, an unreachable network authority. This
+            // is the arm the row was filed for, and the one whose cause is
+            // invisible from a missing-header message.
+            warn(reporter, DiagnosticCode::D_DirectoryScanFailed,
+                 "InputResolver: " + opt + " names '" + dir
+                 + "', which cannot be enumerated: " + ec.message()
+                 + ". It contributes no header to the search path and is "
+                   "IGNORED; a header that was meant to be found through it "
+                   "will be reported as missing at its `#include` rather "
+                   "than here.");
+        }
+        allOk = false;
     }
     return allOk;
 }

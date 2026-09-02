@@ -690,21 +690,26 @@ struct Lowerer {
     // Floating-point uses the F-prefixed opcodes. Returns
     // `MirOpcode::Invalid` for unsupported combinations so the caller can
     // diagnose with the actual HirOpKind name.
-    [[nodiscard]] static MirOpcode mapBinaryOp(HirOpKind op, TypeKind tk) noexcept {
+    //
+    // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES (P50, CLOSED): NON-static
+    // — the sign split (Div/Rem/Shr AND the ordered comparisons) routes through
+    // the ONE target-aware `isSignedIntKind`, exactly as `mapCast` already does
+    // (TF-C56 deleted ITS target-blind local twin; this was the last local sign
+    // list in this file). The former list here (I8..I128, `Char` absent)
+    // classified bare `Char` UNSIGNED target-blind — opposite the mir_to_lir
+    // widen arms' then-hard-coded SIGNED guess, the scattered inconsistency the
+    // TF-C56 audit flagged. Unreachable with a `Char` operand through every
+    // shipped config (C's usual arithmetic conversions promote each binary
+    // operand to >=int first, and no other shipped .lang.json maps any type
+    // onto TypeKind::Char — measured P50, corpus-wide instrumented run), but
+    // reachable BY CONSTRUCTION for a frontend built on the public HirBuilder
+    // whose language declares no `arithmeticConversions` block; such a
+    // frontend now inherits the target's declared answer instead of a guess.
+    [[nodiscard]] MirOpcode mapBinaryOp(HirOpKind op, TypeKind tk) const noexcept {
         bool const isFloat = (tk == TypeKind::F16 || tk == TypeKind::F32
                            || tk == TypeKind::F64 || tk == TypeKind::F80
                            || tk == TypeKind::F128);
-        // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES: bare `Char` is absent
-        // here → classified UNSIGNED for Div/Rem/Shr (UDiv/UMod/LShr), TARGET-BLIND
-        // (and opposite the mir_to_lir widen arms' signed default — the scattered-
-        // but-dead inconsistency the TF-C56 audit flagged). DEAD: C's usual
-        // arithmetic conversions promote a char operand to `int` before any binary
-        // op, so `tk` here is always a post-UAC kind, never a bare `Char`. Route
-        // through the target `charIsUnsigned` (or fail loud) if a non-promoting
-        // frontend ever feeds a raw narrow Char.
-        bool const isSigned = (tk == TypeKind::I8 || tk == TypeKind::I16
-                            || tk == TypeKind::I32 || tk == TypeKind::I64
-                            || tk == TypeKind::I128);
+        bool const isSigned = isSignedIntKind(tk);
         switch (op) {
             case HirOpKind::Add: return isFloat ? MirOpcode::FAdd : MirOpcode::Add;
             case HirOpKind::Sub: return isFloat ? MirOpcode::FSub : MirOpcode::Sub;
@@ -4223,24 +4228,66 @@ struct Lowerer {
             // address → access violation. SExt signed / ZExt unsigned (mapCast)
             // — the SAME widen the Index path (p[i]) already does (the positive
             // p+n cases worked only because their high bits were 0).
+            //
+            // D-CSUBSET-POINTER-ARITH-ENUM-INDEX: the index's SCALAR INTEGER
+            // KIND is what `mapCast` needs, and that is NOT always the type's own
+            // kind. `mapCast` is TypeKind-only (it cannot read the interner), so
+            // an Enum and a narrow `_BitInt` — both integer types under C23
+            // 6.2.5, and both admitted as the integer operand of C23 6.5.7p2 —
+            // arrive with a kind `mapCast`'s `isInt` deliberately excludes. Ask
+            // `resolveScalarIntKind`, THE file's one owner of "what plain integer
+            // does this scalar project onto" (enum → its declared underlying via
+            // `scalars[0]`, narrow `_BitInt` → its native container, anything
+            // else → itself), so this site has no second opinion of its own.
+            // ★ THE WIDEN'S SIGN THEN FALLS OUT OF THE RESOLVED KIND and needs no
+            // rule here: `mapCast` picks SExt for a signed underlying and ZExt for
+            // an unsigned one, which is what C23 6.5.7p8 requires (the integer
+            // operand keeps its OWN type and its own sign — a pointer/integer pair
+            // undergoes no usual arithmetic conversion). Choosing that sign wrongly
+            // is a silent miscompile, not a refusal, which is why it is derived
+            // rather than spelled.
+            // ⚠ `resolveScalarIntKind` is FATAL on a WIDE `_BitInt` (N>64) — its
+            // `bitIntContainerKind` has no answer for a multi-limb value — so a
+            // wide index is refused ABOVE it, and refused on its own terms: a wide
+            // integer is memory-resident and arrives here as an ADDRESS (the
+            // request flip), so `mapCast(I128, I64)`'s plain Trunc would narrow an
+            // ADDRESS into a byte offset. ✔MEASURED at this commit: that Trunc
+            // walls one tier down (D-CSUBSET-32BIT-ALU-FORMS / the 128-bit Const
+            // width refusal), so nothing miscompiles today — but the wall is
+            // incidental, and this tier is the one that knows the operand is an
+            // address. Refuse it HERE, by intent.
             TypeId const i64ty = interner.primitive(TypeKind::I64);
             MirInstId intIdx = rhs;
-            if (interner.kind(indexTy) != TypeKind::I64) {
-                MirOpcode const ext = mapCast(interner.kind(indexTy), TypeKind::I64);
-                // c65: a non-integer index kind (Array/Enum/…) has no widening
-                // cast → mapCast returns Invalid. FAIL LOUD here — passing Invalid
-                // to addInst std::abort()s the whole compiler (the c65 sqlite
-                // crash class: `p - arrayName`, now fixed at the HIR tier by array
-                // decay → ptrSub; an Enum index is the deferred
-                // D-CSUBSET-POINTER-ARITH-ENUM-INDEX). The pre-existing
-                // `.valid()` guard below runs AFTER addInst, i.e. too late.
+            TypeKind const rawIndexKind = interner.kind(indexTy);
+            if (isWideInt(interner, indexTy)) {
+                unsupported(node, std::format(
+                    "pointer arithmetic: a WIDE integer index ({}) is "
+                    "memory-resident and reaches this site as an ADDRESS, so it "
+                    "cannot be narrowed to a 64-bit byte offset by a cast "
+                    "(D-CSUBSET-INT128-LIR-WIDTH / D-CSUBSET-BITINT-C2-WIDE)",
+                    wideIntSpelling(indexTy)));
+                return InvalidMirInst;
+            }
+            if (rawIndexKind != TypeKind::I64) {
+                MirOpcode const ext =
+                    mapCast(resolveScalarIntKind(indexTy), TypeKind::I64);
+                // c65: a NON-INTEGER index kind (Array/Struct/…) still has no
+                // widening cast → mapCast returns Invalid. FAIL LOUD here —
+                // passing Invalid to addInst std::abort()s the whole compiler (the
+                // c65 sqlite crash class: `p - arrayName`, now fixed at the HIR
+                // tier by array decay → ptrSub). The pre-existing `.valid()` guard
+                // below runs AFTER addInst, i.e. too late.
+                // ⚠ The message no longer names the enum: an enum index is
+                // SUPPORTED, so keeping it in the text would send the next reader
+                // after a cause that cannot fire, and would name a closed row as
+                // the reason for an unrelated refusal.
                 if (ext == MirOpcode::Invalid) {
                     unsupported(node, std::format(
-                        "pointer arithmetic: index TypeKind {} has no widening "
-                        "cast to a 64-bit offset (an array index must decay to a "
-                        "pointer difference; an enum index is deferred — "
-                        "D-CSUBSET-POINTER-ARITH-ENUM-INDEX)",
-                        static_cast<unsigned>(interner.kind(indexTy))));
+                        "pointer arithmetic: index TypeKind {} is not an integer "
+                        "type and has no widening cast to a 64-bit offset (C23 "
+                        "6.5.7p2 admits only an integer operand; an array index "
+                        "must decay to a pointer difference)",
+                        static_cast<unsigned>(rawIndexKind)));
                     return InvalidMirInst;
                 }
                 std::array<MirInstId, 1> eo{rhs};
@@ -5484,7 +5531,15 @@ struct Lowerer {
         // the object's own size capture was skipped at CST→HIR, so `vlaSizeMap[a.v]` is
         // absent and `vlaAllocaForLocal`/`computeVlaByteSize(a)` would fail loud on the
         // missing side-table.
-        if (typedefVlaOriginMap != nullptr) {
+        // ⚠ ARRAY TOP TYPES ONLY, AND THE GATE IS LOAD-BEARING. A POINTER to a VLA
+        // typedef (`typedef int R[n]; R *p;`) also carries a typedef origin, but `p` is
+        // an ORDINARY 8-byte pointer local — it takes the fixed path below, and its
+        // origin is read at its VarDecl SITE to copy the pointee's frozen row stride.
+        // Routing it here would be a silent miscompile in the making: a pointer's own
+        // alloca is entry-HOISTED, and at entry the alias's frozen slots have not been
+        // Stored yet.
+        if (typedefVlaOriginMap != nullptr
+            && interner.kind(ty) == TypeKind::Array) {
             if (auto it = typedefVlaOriginMap->find(sym.v);
                 it != typedefVlaOriginMap->end())
                 return vlaAllocaFromTypedef(sym, SymbolId{it->second}, ty, ptrTy,
@@ -5609,6 +5664,67 @@ struct Lowerer {
         return mir.addInst(ext, eo, i64ty);
     }
 
+    // VLA (D-CSUBSET-VLA): peel a nested array type into its per-LEVEL shape types
+    // (level 0 = `arrayTy` itself, each next = its element via `operands[0]`) and
+    // return the innermost NON-array base element. Appends to `levelTypes`. The level
+    // TypeIds ARE the size-slot keys (`vlaSlotKey(sym, levelType)`), so every walker of
+    // the same spine MUST produce the same sequence — which is why this is one function
+    // and not three. Returns InvalidType (with the fail-loud already reported) on an
+    // array level with no element; an empty `levelTypes` on return means `arrayTy` was
+    // not an array at all, which each caller judges for itself.
+    [[nodiscard]] TypeId peelArrayLevels(TypeId arrayTy, HirNodeId anchor,
+                                         std::vector<TypeId>& levelTypes) {
+        TypeId walk = arrayTy;
+        for (int guard = 0; guard < 4096 && walk.valid()
+                            && interner.kind(walk) == TypeKind::Array; ++guard) {
+            levelTypes.push_back(walk);
+            auto const ops = interner.operands(walk);
+            if (ops.empty()) {
+                unsupported(anchor, "variable-length array type has an array level with "
+                                    "no element (interner invariant violated)");
+                return InvalidType;
+            }
+            walk = ops[0];
+        }
+        return walk;
+    }
+
+    // VLA (D-CSUBSET-VLA): the hidden 8-byte slot `sym` froze for array level `levelTy`,
+    // or InvalidMirInst when it froze none. A MISS is not necessarily an error — a
+    // fully-FIXED intermediate level is deliberately never slotted (its stride is a
+    // compile-time `elementStride`) — so this reports nothing and leaves the judgement
+    // to the caller.
+    [[nodiscard]] MirInstId frozenVlaLevelSlot(SymbolId sym, TypeId levelTy) const {
+        auto const it = vlaStrideSlot.find(vlaSlotKey(sym.v, levelTy.v));
+        return it == vlaStrideSlot.end() ? InvalidMirInst : it->second;
+    }
+
+    // VLA (D-CSUBSET-VLA): copy an ALREADY-LOCATED frozen size slot down into a fresh
+    // `(to, levelTy)` slot and return the loaded value. This is how a VLA-typedef object
+    // inherits the size C99 §6.7.7p2 froze at the typedef WITHOUT re-lowering the bound
+    // — `n` may have changed since, and re-reading it would be the freeze-once
+    // invariant's silent miscompile. InvalidMirInst = a builder failure (distinct from
+    // `frozenVlaLevelSlot`'s "no such slot", which is a legitimate skip).
+    [[nodiscard]] MirInstId copyFrozenVlaLevel(MirInstId srcSlot, SymbolId to,
+                                               TypeId levelTy) {
+        std::array<MirInstId, 1> ld{srcSlot};
+        MirInstId const val = mir.addInst(MirOpcode::Load, ld, vlaSizeTy());
+        if (!val.valid()) return InvalidMirInst;
+        MirInstId const slot =
+            mir.addInst(MirOpcode::Alloca, {}, vlaSizePtrTy(), /*payload=*/8,
+                        MirInstFlags::None, /*payload2=*/8);
+        if (!slot.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> st{val, slot};
+        mir.addInst(MirOpcode::Store, st, InvalidType);
+        vlaStrideSlot[vlaSlotKey(to.v, levelTy.v)] = slot;
+        return val;
+    }
+
+    // VLA (D-CSUBSET-VLA): a pre-computed byte size for the array level `level` of the
+    // type `computeVlaByteSize` is walking — the composition seam between an object's
+    // OWN declarator dimensions and the levels an aliased typedef already owns.
+    struct VlaSeed { MirInstId bytes{}; std::size_t level{}; };
+
     // VLA (D-CSUBSET-VLA): the total runtime BYTE size of a nested array type + its
     // innermost base element type. Shared by the direct-VLA `Alloca` sizing
     // (`vlaAllocaForLocal`, `arrayTy` = the whole object) and the ptr-to-VLA row-stride
@@ -5622,14 +5738,29 @@ struct Lowerer {
     // `sizeof a[0]`. A FULLY-FIXED intermediate level (`int a[n][5]`'s `int[5]` row) is
     // NOT slotted (its stride is a compile-time `elementStride`). `freezeLevelSlots=false`
     // freezes no level (the ptr caller freezes only the single pointee slot). The captured
-    // dim count MUST equal the array-level count — a mismatch (e.g. a VLA whose element
-    // comes from an array typedef) is deferred (fail loud). nullopt on any belt fail-loud
+    // dim count MUST equal the number of levels this declarator is responsible for — a
+    // mismatch is an internal desync (fail loud). nullopt on any belt fail-loud
     // (already reported). Program-order: the dim size-exprs (`int a[f()]`) lower HERE, at
     // the caller's decl site — never the entry hoist.
+    //
+    // ★ `seed` IS THE VLA-TYPEDEF COMPOSITION SEAM, and it is why this function is
+    // shared rather than copied. `typedef int R[n]; R a[m];` gives `a` TWO array levels
+    // but only ONE declarator bound: the object owns `[m]` and the ALIAS owns the level
+    // below it, whose byte size was frozen ONCE at the typedef (C99 §6.7.7p2) and must
+    // not be re-derived. With a seed, the accumulator STARTS at `seed.bytes` — the byte
+    // size at level `seed.level` — instead of at the base element's stride, the fold
+    // runs only over levels `[0, seed.level)`, and the captured dim count is compared
+    // against `seed.level` rather than the full depth. Levels at and below `seed.level`
+    // are the seed provider's to freeze (the caller copies them down); this call freezes
+    // only the object's OWN levels, with the same predicate and the same slot keys, so a
+    // composed object's `a[i]` / `sizeof a` / `sizeof a[0]` Load exactly what a directly
+    // declared one would. `seed.level == 0` (a pure `R a;`) folds nothing and returns
+    // the seed unchanged — byte-identical to the pre-composition C4b path.
     struct VlaByteSize { MirInstId totalBytes{}; TypeId baseElemTy{}; };
     [[nodiscard]] std::optional<VlaByteSize>
     computeVlaByteSize(SymbolId sym, TypeId arrayTy, HirNodeId anchor,
-                       bool freezeLevelSlots) {
+                       bool freezeLevelSlots,
+                       std::optional<VlaSeed> seed = std::nullopt) {
         TypeId const i64ty = i64Ty();
         // The per-dimension bound exprs were captured by CST→HIR (un-skipping EVERY
         // array suffix) keyed by SymbolId, in outer→inner order. Absent ⇒ an internal
@@ -5638,74 +5769,111 @@ struct Lowerer {
         if (vlaSizeMap != nullptr)
             if (auto it = vlaSizeMap->find(sym.v); it != vlaSizeMap->end())
                 dims = &it->second;
-        if (dims == nullptr || dims->empty()) {
-            unsupported(anchor, "variable-length array local has no captured runtime "
-                                "size expression (internal side-table desync)");
-            return std::nullopt;
-        }
         // Walk the nested array type into per-LEVEL shape types (level 0 = `arrayTy`, the
         // whole object; each next = its element via ops[0]) down to the non-array
         // base. A level is EITHER a VLA (runtime dim) or a fixed Array (compile-time
         // dim) — both are kind Array; the base terminates the walk.
         std::vector<TypeId> levelTypes;
-        TypeId walk = arrayTy;
-        for (int guard = 0; guard < 4096 && walk.valid()
-                            && interner.kind(walk) == TypeKind::Array; ++guard) {
-            levelTypes.push_back(walk);
-            auto const ops = interner.operands(walk);
-            if (ops.empty()) {
-                unsupported(anchor, "variable-length array type has an array level with "
-                                    "no element (interner invariant violated)");
-                return std::nullopt;
-            }
-            walk = ops[0];
-        }
-        TypeId const baseElemTy = walk;   // the innermost non-array element
+        TypeId const baseElemTy = peelArrayLevels(arrayTy, anchor, levelTypes);
+        if (!baseElemTy.valid()) return std::nullopt;   // belt already reported
         std::size_t const depth = levelTypes.size();
-        // The captured dim count MUST equal the array-level count — one bound per
+        if (seed.has_value() && seed->level > depth) {
+            unsupported(anchor, std::format(
+                "variable-length array composition seam at level {} is deeper than the "
+                "type's {} array level(s) (internal side-table desync)",
+                seed->level, depth));
+            return std::nullopt;
+        }
+        std::size_t const capturedDims = dims != nullptr ? dims->size() : 0u;
+        // How many levels does THIS declarator own? Without a seam, all of them: one
+        // bound per declarator suffix. With one, only the levels ABOVE it — the rest
+        // belong to whatever supplied the seam value. TWO kinds of seam:
+        //   * an EXPLICIT seed — a VLA typedef whose runtime size was frozen at the
+        //     typedef and is copied down (`typedef int R[n]; R a[m];`);
+        //   * a FULLY FIXED sub-spine — an alias with no runtime bound at all
+        //     (`typedef int R[5]; R a[n];` → `int[n][5]`, two levels but one suffix).
+        //     Its size is a COMPILE-TIME constant, so there is nothing to freeze and no
+        //     origin to consult; the constant seeds the fold directly, which makes the
+        //     result identical instruction-for-instruction to the directly-spelled
+        //     `int a[n][5]`. ✔MEASURED 2026-09-01: gcc 13.3.0 and clang 18.1.3 both
+        //     compile and run this shape, so the refusal it used to get was a
+        //     conformance gap, not a design boundary.
+        // A sub-spine that DOES carry a runtime bound and has no explicit seed is still
+        // a desync and still fails loud below — the direction that never miscompiles.
+        std::size_t ownedLevels = depth;
+        bool fixedSubSpineSeam = false;
+        if (seed.has_value()) {
+            ownedLevels = seed->level;
+        } else if (capturedDims < depth) {
+            TypeId const seamTy = levelTypes[capturedDims];
+            if (!interner.isVlaArray(seamTy) && !interner.typeContainsVla(seamTy)) {
+                ownedLevels        = capturedDims;
+                fixedSubSpineSeam  = true;
+            }
+        }
+        // The captured dim count MUST equal the owned-level count — one bound per
         // declarator suffix. A mismatch means the type carries array levels that are
-        // NOT declarator suffixes on this object — realistically a VLA whose element
-        // comes from an array typedef (`typedef int R[5]; R a[n];` → type `int[n][5]`,
-        // one `[n]` suffix but two levels). C3 captures only declarator suffixes, so
-        // this shape is deferred (C4) — fail loud with a real diagnostic, never guess.
-        if (dims->size() != depth) {
+        // NOT declarator suffixes on this object and are NOT covered by a seed —
+        // realistically a VLA whose element comes from an array typedef the origin
+        // stamp did not recognize. Fail loud with a real diagnostic, never guess.
+        if (capturedDims != ownedLevels) {
             unsupported(anchor, std::format(
                 "a variable-length array of this shape is not yet supported: its type "
-                "has {} array level(s) but only {} declarator dimension bound(s) were "
-                "captured (e.g. a VLA whose element comes from an array typedef, "
-                "`typedef int R[5]; R a[n];`) — deferred (D-CSUBSET-VLA)",
-                depth, dims->size()));
+                "has {} array level(s), {} of them declared by this declarator, but {} "
+                "declarator dimension bound(s) were captured — deferred "
+                "(D-CSUBSET-VLA)",
+                depth, ownedLevels, capturedDims));
+            return std::nullopt;
+        }
+        // An UNSEEDED walk with zero levels has nothing to size — the caller reached a
+        // VLA path with a non-array type, an internal desync. (A SEEDED walk with
+        // `ownedLevels == 0` is the pure `R a;` shape and is correct: the seed IS the
+        // answer.)
+        if (ownedLevels == 0 && !seed.has_value()) {
+            unsupported(anchor, "variable-length array local has no captured runtime "
+                                "size expression (internal side-table desync)");
             return std::nullopt;
         }
         // Lower + widen each dimension bound to an i64 count, in OUTER→INNER (source)
         // order so any side effects (`int a[(k+=3)][(k+=5)]`) evaluate ONCE, in
         // program order (C 6.7.6.2p2). The per-dim belts apply to EVERY dimension.
         std::vector<MirInstId> counts;
-        counts.reserve(depth);
-        for (HirNodeId const dimNode : *dims) {
-            MirInstId const c = widenVlaDim(dimNode, anchor);
+        counts.reserve(ownedLevels);
+        for (std::size_t i = 0; i < ownedLevels; ++i) {
+            MirInstId const c = widenVlaDim((*dims)[i], anchor);
             if (!c.valid()) return std::nullopt;
             counts.push_back(c);
         }
-        // baseElemSize = the innermost element's byte size (a COMPILE-TIME constant).
-        // nullopt / 0 → fail loud (incomplete / empty-aggregate element), never a
-        // `Mul(count, 0)` that makes every index alias offset 0.
-        std::optional<std::uint64_t> const baseStride =
-            baseElemTy.valid() ? elementStride(baseElemTy) : std::nullopt;
-        if (!baseStride.has_value() || *baseStride == 0) {
-            unsupported(anchor, "variable-length array base element type has no "
-                                "computable non-zero size (incomplete element or no "
-                                "aggregateLayout)");
-            return std::nullopt;
+        // The fold's SEED value — the byte size AT the seam level, which the fold then
+        // multiplies by this declarator's own bounds. An EXPLICIT seed was already
+        // materialized by the aliased typedef (its own freeze ran the belt below, so
+        // re-running it here would only re-ask an answered question). Otherwise it is a
+        // COMPILE-TIME constant: the fully-fixed sub-spine's size when there is one, and
+        // the innermost element's stride when the fold runs all the way down. nullopt /
+        // 0 → fail loud (incomplete / empty-aggregate element), never a `Mul(count, 0)`
+        // that makes every index alias offset 0.
+        MirInstId acc;
+        if (seed.has_value()) {
+            acc = seed->bytes;
+        } else {
+            TypeId const seamTy =
+                fixedSubSpineSeam ? levelTypes[ownedLevels] : baseElemTy;
+            std::optional<std::uint64_t> const seamStride =
+                seamTy.valid() ? elementStride(seamTy) : std::nullopt;
+            if (!seamStride.has_value() || *seamStride == 0) {
+                unsupported(anchor, "variable-length array base element type has no "
+                                    "computable non-zero size (incomplete element or no "
+                                    "aggregateLayout)");
+                return std::nullopt;
+            }
+            acc = constIntOfType(static_cast<std::int64_t>(*seamStride), vlaSizeTy());
         }
         // Cumulative product BOTTOM-UP (see the doc comment). Each runtime-sized level is
         // frozen into a per-object (sym, levelType) slot ONLY when `freezeLevelSlots`.
         // The cumulative byte size is typed as the SLOT's type from the moment it
         // is produced (`vlaSizeTy`), seed included -- so a depth-0 walk that runs
         // no Mul still yields a correctly-typed value rather than a stray i64.
-        MirInstId acc =
-            constIntOfType(static_cast<std::int64_t>(*baseStride), vlaSizeTy());
-        for (std::size_t L = depth; L-- > 0;) {
+        for (std::size_t L = ownedLevels; L-- > 0;) {
             std::array<MirInstId, 2> mo{counts[L], acc};
             acc = mir.addInst(MirOpcode::Mul, mo, vlaSizeTy());
             if (!acc.valid()) return std::nullopt;
@@ -5789,78 +5957,88 @@ struct Lowerer {
     // a;`) runtime `Alloca` by COPYING the typedef origin R's decl-frozen per-level size
     // slots DOWN into the object's OWN `(a, levelType)` slots — NOT by re-lowering `n`
     // (C99 §6.7.7p2: the size was frozen ONCE, when R was reached; `n` may have changed
-    // since — the freeze-once invariant). `a`'s type is byte-identical to R's (the
-    // semantic `declTy == headTy` gate), so the interned level-type peel yields the SAME
-    // TypeIds R froze under → the copied keys EXACTLY match what `a[i]` /
+    // since — the freeze-once invariant). `a`'s type ENDS in R's (the semantic
+    // `declaredTypeDerivesFromAliasHead` gate), so the interned level-type peel yields
+    // the SAME TypeIds R froze under → the copied keys EXACTLY match what `a[i]` /
     // `sizeof a`(/`sizeof a[0]`) later Load (I3, no depth arithmetic). Only the levels R
     // ACTUALLY froze are copied (a FIXED intermediate level — `R[n][5]`'s `int[5]` — was
-    // never slotted; its stride is compile-time). Level 0 (the whole object) is a VLA by
-    // construction (a VLA-typedef object is a VLA at the top), so it is always frozen,
-    // and its value doubles as `a`'s runtime alloca byte size. Emitted at `a`'s VarDecl
+    // never slotted; its stride is compile-time). The SEAM level (the alias's own whole
+    // object) is a VLA by construction, so it is always frozen. ★ `R a[m];` ADDS the
+    // object's own dimension(s) ABOVE the seam — accepted by gcc 13.3.0 and clang 18.1.3
+    // (✔MEASURED 2026-09-01) and therefore required — and they are folded onto the
+    // copied alias size by the SHARED `computeVlaByteSize`, seeded at the seam. For the
+    // suffix-less `R a;` the seam is level 0, nothing folds, and the copied whole-object
+    // value IS `a`'s runtime alloca byte size, byte-identical to before. Emitted at `a`'s VarDecl
     // site in program order, AFTER R's TypeDecl freeze — a VLA local is NOT entry-hoisted
     // (`computeLayout` nullopts on the -2 level → the hoist skips it), the load-bearing
     // ordering that keeps this copy-down reading R's already-Stored (live) frozen slots.
     [[nodiscard]] MirInstId vlaAllocaFromTypedef(SymbolId a, SymbolId origin, TypeId ty,
                                                  TypeId ptrTy, HirNodeId anchor) {
-        // The slot's declared type is the ONE type both the Load and the Store
-        // below use -- see `vlaSizeTy`.
-        TypeId const sizeTy = vlaSizeTy();
         // Peel `ty`'s array spine into per-LEVEL shape types (level 0 = whole object,
         // each next via ops[0]) down to the non-array base — the SAME walk
         // `computeVlaByteSize` used when it froze R's slots (so the level TypeIds, hence
         // the slot keys, are identical).
         std::vector<TypeId> levelTypes;
-        TypeId walk = ty;
-        for (int guard = 0; guard < 4096 && walk.valid()
-                            && interner.kind(walk) == TypeKind::Array; ++guard) {
-            levelTypes.push_back(walk);
-            auto const ops = interner.operands(walk);
-            if (ops.empty()) {
-                unsupported(anchor, "variable-length array typedef object has an array "
-                                    "level with no element (interner invariant "
-                                    "violated)");
-                return InvalidMirInst;
-            }
-            walk = ops[0];
-        }
+        TypeId const baseElemTy = peelArrayLevels(ty, anchor, levelTypes);
+        if (!baseElemTy.valid()) return InvalidMirInst;   // belt already reported
         if (levelTypes.empty()) {
             unsupported(anchor, "variable-length array typedef object has a non-array "
                                 "top type (internal side-table desync)");
             return InvalidMirInst;
         }
-        // Copy each level R froze down into a's own slot, keyed IDENTICALLY so `a[i]` /
-        // `sizeof a` Load them (I3 — copy ONLY the HITS; a fixed intermediate level R
-        // never slotted is skipped, matching `computeVlaByteSize`'s freeze predicate).
-        // Capture level 0's copied value as a's whole-object runtime byte size.
-        MirInstId total = InvalidMirInst;
-        for (std::size_t L = 0; L < levelTypes.size(); ++L) {
-            auto const it =
-                vlaStrideSlot.find(vlaSlotKey(origin.v, levelTypes[L].v));
-            if (it == vlaStrideSlot.end()) continue;   // R did not freeze this level
-            std::array<MirInstId, 1> ld{it->second};
-            MirInstId const val = mir.addInst(MirOpcode::Load, ld, sizeTy);
-            if (!val.valid()) return InvalidMirInst;
-            MirInstId const slot =
-                mir.addInst(MirOpcode::Alloca, {}, vlaSizePtrTy(), /*payload=*/8,
-                            MirInstFlags::None, /*payload2=*/8);
-            if (!slot.valid()) return InvalidMirInst;
-            std::array<MirInstId, 2> st{val, slot};
-            mir.addInst(MirOpcode::Store, st, InvalidType);
-            vlaStrideSlot[vlaSlotKey(a.v, levelTypes[L].v)] = slot;
-            if (L == 0) total = val;   // level 0's frozen value == whole-object total
+        // ★ WHERE THE OBJECT ENDS AND THE ALIAS BEGINS. `R a;` is the whole object;
+        // `R a[m];` puts the object's OWN `[m]` above the alias's spine. The seam is at
+        // exactly the number of bounds CST→HIR captured for `a` — none for `R a;`, one
+        // per own suffix for `R a[m];` — because the HIR capture un-skips this
+        // declarator's suffixes and nothing else. Below the seam every level is the
+        // alias's, frozen once at the typedef (C99 §6.7.7p2).
+        std::size_t ownDims = 0;
+        if (vlaSizeMap != nullptr)
+            if (auto it = vlaSizeMap->find(a.v); it != vlaSizeMap->end())
+                ownDims = it->second.size();
+        if (ownDims >= levelTypes.size()) {
+            unsupported(anchor, std::format(
+                "variable-length array typedef object declares {} dimension(s) of its "
+                "own but its type has only {} array level(s), leaving none for the "
+                "typedef it aliases (internal side-table desync)",
+                ownDims, levelTypes.size()));
+            return InvalidMirInst;
         }
-        if (!total.valid()) {
-            // Level 0 (the whole object) is a VLA by construction, so R MUST have frozen
-            // it — absent ⇒ an internal side-table desync (R's TypeDecl freeze did not
-            // run, or keyed differently). Fail loud, never a 0-sized / stale alloca.
+        // Copy each level R froze down into a's own slot, keyed IDENTICALLY so `a[i]` /
+        // `sizeof a[0]` Load them (I3 — copy ONLY the HITS; a fixed intermediate level R
+        // never slotted is skipped, matching `computeVlaByteSize`'s freeze predicate).
+        // Only levels AT OR BELOW the seam: a's own levels are sized by its own bounds
+        // just below, and R never froze them.
+        MirInstId aliasTotal = InvalidMirInst;
+        for (std::size_t L = ownDims; L < levelTypes.size(); ++L) {
+            MirInstId const src = frozenVlaLevelSlot(origin, levelTypes[L]);
+            if (!src.valid()) continue;   // R did not freeze this level
+            MirInstId const val = copyFrozenVlaLevel(src, a, levelTypes[L]);
+            if (!val.valid()) return InvalidMirInst;
+            if (L == ownDims) aliasTotal = val;   // the alias's whole-object size
+        }
+        if (!aliasTotal.valid()) {
+            // The seam level is the ALIAS's whole object, a VLA by construction, so R
+            // MUST have frozen it — absent ⇒ an internal side-table desync (R's TypeDecl
+            // freeze did not run, or keyed differently). Fail loud, never a 0-sized /
+            // stale alloca.
             unsupported(anchor, "variable-length array typedef object's origin froze no "
                                 "whole-object size slot (internal side-table desync)");
             return InvalidMirInst;
         }
-        // Effective alignment from the BASE element (`walk` = the innermost non-array
-        // element) + any `alignas` override — mirror `vlaAllocaForLocal` (the VLA levels
+        // The object's OWN dimensions multiply the alias's frozen size, bottom-up, and
+        // freeze each of a's own runtime-sized levels into a's `(a, levelType)` slots —
+        // the same fold, the same predicate and the same keys a DIRECTLY declared VLA
+        // gets, which is why `sizeof a` and `a[i]` need no separate composed path.
+        // `ownDims == 0` folds nothing and returns `aliasTotal` unchanged.
+        auto const sz = computeVlaByteSize(a, ty, anchor, /*freezeLevelSlots=*/true,
+                                           VlaSeed{aliasTotal, ownDims});
+        if (!sz.has_value()) return InvalidMirInst;
+        MirInstId const total = sz->totalBytes;
+        // Effective alignment from the BASE element (the innermost non-array element)
+        // + any `alignas` override — mirror `vlaAllocaForLocal` (the VLA levels
         // have no static layout; the PRIMARY payload stays 0 = runtime-sized).
-        std::uint32_t const effectiveAlign = vlaEffectiveAlign(walk, anchor);
+        std::uint32_t const effectiveAlign = vlaEffectiveAlign(baseElemTy, anchor);
         std::array<MirInstId, 1> aops{total};
         MirInstId const av =
             mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
@@ -6904,15 +7082,25 @@ struct Lowerer {
             }
             auto const it = vlaStrideSlot.find(vlaSlotKey(root.v, elemTy.v));
             if (it == vlaStrideSlot.end()) {
-                // A DECLARED VLA object's decl materializes its stride slots and
-                // dominates every use, so a missing slot here means the subscript base
-                // is NOT such an object — realistically a pointer-to-VLA
-                // (`int (*p)[m]; p[i]`), whose runtime row stride C3 does not yet track.
-                // Fail loud with a real diagnostic (deferred, C4), never a guessed stride.
-                unsupported(node, "a pointer-to-variable-length-array subscript (or a "
-                                  "similar VLA row not reached as a declared VLA object) "
-                                  "is not yet supported — its runtime row stride is not "
-                                  "tracked (deferred, D-CSUBSET-VLA)");
+                // A DECLARED VLA object, and a pointer that FROZE a pointee row stride
+                // at its own declaration, each materialize their stride slots at the
+                // decl and dominate every use — so a missing slot here means the base
+                // is NEITHER. ⚠ THIS COMMENT USED TO NAME `int (*p)[m]; p[i]` AS THE
+                // REALISTIC CASE AND THAT WENT FALSE WHEN C4a SHIPPED: a declared
+                // pointer-to-VLA subscripts correctly, and so now does a pointer to a
+                // VLA TYPEDEF. What is left is a pointer this tier never saw declared
+                // with a VLA pointee — a member, an element of an ARRAY of such
+                // pointers (`R *q[3]`), or a pointer reached through another pointer
+                // (`R **r`), each of which would need a stride keyed per pointer OBJECT
+                // rather than per symbol. ✔MEASURED 2026-09-01: gcc 13.3.0 and clang
+                // 18.1.3 accept those shapes, so this is a gap and not a boundary —
+                // but every one of them lands HERE, loud, never on a guessed stride.
+                unsupported(node, "this variable-length-array row is reached through a "
+                                  "base whose runtime row stride was never frozen at a "
+                                  "declaration — any base other than a declared VLA "
+                                  "object or a declared pointer to one is still "
+                                  "unsupported, and its stride cannot be recovered "
+                                  "(D-CSUBSET-VLA)");
                 return InvalidMirInst;
             }
             // The stride Load carries the SLOT'S DECLARED TYPE (`vlaSizeTy`), not
@@ -11864,8 +12052,39 @@ struct Lowerer {
                 // is part of `p`'s type, evaluated when the declaration is reached.
                 if (interner.kind(ty) == TypeKind::Ptr) {
                     auto const pops = interner.operands(ty);
-                    if (!pops.empty() && interner.typeContainsVla(pops[0]))
-                        if (!storePtrToVlaStride(sym, pops[0], node)) return false;
+                    if (!pops.empty() && interner.typeContainsVla(pops[0])) {
+                        // ★ D-CSUBSET-VLA: a pointer to a VLA TYPEDEF
+                        // (`typedef int R[n]; R *p;`) takes its runtime row stride from
+                        // the size the ALIAS froze at ITS declaration, never by
+                        // re-lowering `n` — C99 §6.7.7p2 evaluated `n` once, and `n` may
+                        // have changed since, so re-reading it here is precisely the
+                        // freeze-once miscompile. The pointee type IS the alias's whole
+                        // object, so the alias's own whole-object slot is exactly the
+                        // stride `p[i]` needs and the copy is a single level. ✔MEASURED
+                        // 2026-09-01: gcc 13.3.0 and clang 18.1.3 both compile and run
+                        // this shape, so it is required by the reference disjunction.
+                        // A pointer with NO origin is the C4a `int (*p)[n]` form and
+                        // still computes its stride from its own captured bound.
+                        SymbolId origin{};
+                        if (typedefVlaOriginMap != nullptr)
+                            if (auto it = typedefVlaOriginMap->find(sym.v);
+                                it != typedefVlaOriginMap->end())
+                                origin = SymbolId{it->second};
+                        if (origin.valid()) {
+                            MirInstId const src = frozenVlaLevelSlot(origin, pops[0]);
+                            if (!src.valid()) {
+                                unsupported(node,
+                                    "pointer to a variable-length-array typedef whose "
+                                    "origin froze no whole-object size slot (internal "
+                                    "side-table desync)");
+                                return false;
+                            }
+                            if (!copyFrozenVlaLevel(src, sym, pops[0]).valid())
+                                return false;
+                        } else if (!storePtrToVlaStride(sym, pops[0], node)) {
+                            return false;
+                        }
+                    }
                 }
                 if (auto initN = hir.varDeclInit(node); initN.has_value()) {
                     // FC7 (D-FC7-MEMBER-ACCESS): a struct/union initializer
@@ -12609,12 +12828,27 @@ struct Lowerer {
                 // bound(s) were captured in `lowerTypeDecl` under R's SymbolId. On a
                 // belt fail-loud (M4): seal the open block + return false, mirroring
                 // the `vlaAllocaForLocal` caller (never a silently-dropped freeze).
+                //
+                // ★ A POINTER typedef whose POINTEE is a VLA (`typedef int (*P)[n];`)
+                // freezes exactly one quantity — the POINTEE ROW STRIDE `p[i]` steps by
+                // — and freezes it HERE for the same §6.7.7p2 reason: `n` is evaluated
+                // once, when the typedef is reached. `storePtrToVlaStride` is the same
+                // helper the direct `int (*p)[n]` decl uses, so the stride a `P p;`
+                // inherits is derived by the identical arithmetic. ✔MEASURED 2026-09-01:
+                // both gcc 13.3.0 and clang 18.1.3 compile and run this shape.
                 TypeId   const ty = hir.typeDeclType(node);
                 SymbolId const R  = hir.typeDeclSymbol(node);
-                if (R.valid() && ty.valid()
-                    && (interner.isVlaArray(ty) || interner.typeContainsVla(ty))) {
-                    if (!computeVlaByteSize(R, ty, node, /*freezeLevelSlots=*/true)
-                             .has_value()) {
+                if (R.valid() && ty.valid()) {
+                    bool ok = true;
+                    if (interner.isVlaArray(ty) || interner.typeContainsVla(ty)) {
+                        ok = computeVlaByteSize(R, ty, node, /*freezeLevelSlots=*/true)
+                                 .has_value();
+                    } else if (interner.kind(ty) == TypeKind::Ptr) {
+                        auto const pops = interner.operands(ty);
+                        if (!pops.empty() && interner.typeContainsVla(pops[0]))
+                            ok = storePtrToVlaStride(R, pops[0], node);
+                    }
+                    if (!ok) {
                         if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                         return false;
                     }
@@ -12756,8 +12990,19 @@ struct Lowerer {
         if (noSanitizeThreadMap != nullptr)
             if (auto const* p = noSanitizeThreadMap->tryGet(node))
                 noSanitizeThread = p->isNoSanitizeThread;
+        // ★★ D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: THE
+        // FIFTH MINT SITE, and the only one that reads from `la` — the
+        // `LinkageAttr` this call already consults for binding and visibility —
+        // rather than from a side map of its own. That is deliberate and is
+        // explained at `LinkageAttr::staticInit`: a separate `Hir*Map` would need
+        // a `lowerHirToMir` parameter, and every such parameter is passed from
+        // the program tier, so it would have landed defaulted to nullptr — a
+        // feature dead in the shipped pipeline while hand-built unit tests stayed
+        // green. `la` is already threaded, so the schedule travels with the
+        // linkage it belongs beside.
         mir.addFunction(signature, symbol, la.binding, la.visibility, noInline,
-                        alwaysInline, noOptimize, noSanitizeThread);
+                        alwaysInline, noOptimize, noSanitizeThread,
+                        la.staticInit);
         MirBlockId const entry = mir.createBlock(StructCfMarker::EntryBlock);
         mir.beginBlock(entry);
 

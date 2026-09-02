@@ -1,0 +1,49 @@
+{
+  "$comment": "P51 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the FOURTH baseline spelling that row's closing witness names -- `extern __inline` -- plus its `extern __inline__` twin. The other three (`inline`, `static inline`, `extern inline`) are witnessed by inline_c99_inline_definition_crosscu and inline_c99_storage_classes; ✔MEASURED P51 by grep at this cycle's base commit, the fourth appeared in no example, no test and no fixture -- its only occurrences anywhere were two prose $comments in c.lang.json. It is the spelling the REAL header surface uses for this linkage: glibc's `__extern_inline` is `extern __inline __attribute__((__gnu_inline__))`, and arms 2 and 3 of Apple <sys/cdefs.h>'s `__header_inline` ladder write the same two spellings. ✔MEASURED via `dsscp --dump-predefined-macros` on all four legs: DSS predefines __STDC_VERSION__ = 202311L, __GNUC__ = 4 and __clang__ = 1 and defines neither __GNUC_GNU_INLINE__ nor __GNUC_STDC_INLINE__, so Apple's arm 1 is the arm DSS takes today and this file pins the arms a different identity claim would select. ★ THE QUESTION IS NOT WHETHER THE SPELLING PARSES, it is whether it reaches the SAME without-extern scan the C99 keyword does: C99 6.7.4p7 exempts a definition carrying `extern` from the no-external-definition rule, so a scan that sees the keyword but misses the extern test SUPPRESSES these bodies -- and the program still compiles, still links, and emits ZERO diagnostics, because cu_b.c's WEAK fallbacks win. Arithmetic makes each half nameable: payload_a 40 / payload_b 2 against weak fallbacks 1 and 1, so 42 means BOTH external definitions were provided, 3 means payload_a was lost, 41 means payload_b was lost, 2 means both. ✔MEASURED on gcc 13.3.0 and clang 18.1.3, this exact file, `-std=c99` and `-std=gnu17`, `-O0` and `-O2`: `nm cu_a.o` shows `T payload_a` and `T payload_b` in all eight combinations and the linked pair exits 42. ✔MEASURED on DSS at x86_64:elf64-x86_64-linux-exec: `nm` shows `T payload_a` / `T payload_b` and the image exits 42 at baseline AND at --config=release, with the two images differing (md5 moved), which is why the release arm carries mustDifferFromBaseline. ⚠ MSVC 19.51 is NOT a reference for the `__inline__` half -- it accepts `extern __inline` and refuses `extern __inline__` with C2054; gcc and clang accept it, so the disjunction requires DSS to. RED-ON-DISABLE (REMOVE direction), ✔EXERCISED P51: delete the `__inline` and `__inline__` rows from the `keywords` table in c.lang.json, leaving the C99 word alone, and this example FAILS IN BOTH RUNNERS while the five pure-`inline` examples beside it stay green -- the control that says the mutant is targeted and not a blanket break. ⚠ THE OTHER MUTANT DOES NOT REDDEN THIS FILE, AND THAT IS MEASURED RATHER THAN ASSUMED -- an earlier draft of this comment claimed it did: deleting `externSpecifierTokens` from `semantics.inline` flips SymbolRecord::isInline to true for all three extern spellings and moves NOTHING here, because a definition whose `extern` is the declaration rule's HEAD never reaches lowerInlineDefinitionAsDeclaration. The exit code stays 42 and `nm` still shows T payload_a / T payload_b.",
+  "language": "c",
+  "sources": [
+    "cu_a.c",
+    "cu_b.c"
+  ],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "cu_a.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "cu_a",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "cu_a",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "cu_a",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

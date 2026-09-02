@@ -456,7 +456,7 @@ TEST(LirAsmGotoLabels, AnUnboundBranchTargetIsRefusedNamingTheBoundLabels) {
         "  __asm__ goto (\"jmp Lnowhere\" : : \"r\"(x) : : done);\n"
         "  r = 1; return r;\n"
         "done: return 2; }",
-        "x86_64");
+        "x86_64", /*mirCcIndex=*/0, LoweringExpectation::Refuses);
     ASSERT_FALSE(L.model.hasErrors()) << firstError(L.model.diagnostics());
     ASSERT_TRUE(L.mir.ok) << firstError(L.mirReporter);
     EXPECT_FALSE(L.lir.ok)
@@ -495,7 +495,7 @@ TEST(LirAsmGotoLabels, ARefusalAfterTheCaptureBlocksExistIsReportedNotAborted) {
         "  __asm__ goto (\"frobnicate %0\" : \"=a\"(r) : \"r\"(x) : : done);\n"
         "  return r;\n"
         "done: return 2; }",
-        "x86_64");
+        "x86_64", /*mirCcIndex=*/0, LoweringExpectation::Refuses);
     ASSERT_FALSE(L.model.hasErrors()) << firstError(L.model.diagnostics());
     ASSERT_TRUE(L.mir.ok) << firstError(L.mirReporter);
     EXPECT_FALSE(L.lir.ok)

@@ -260,6 +260,15 @@ public:
     [[nodiscard]] bool funcNoSanitizeThread(MirFuncId id) const {
         return funcArena_.at(id).noSanitizeThread;
     }
+    // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: this
+    // function's place in the program's static-initializer schedule. Unlike its
+    // four neighbours this one is NOT a bool and NOT diagnostic-only: the linker
+    // reads it to emit the format's init-array / fini-array table and to decide
+    // which calls the synthesized entry makes, so a lost value is a program whose
+    // initializer never runs. See `detail::MirFunc::staticInit`.
+    [[nodiscard]] StaticInitSchedule funcStaticInit(MirFuncId id) const {
+        return funcArena_.at(id).staticInit;
+    }
 
     // ── global accessors ──
     [[nodiscard]] TypeId   globalType(MirGlobalId id) const {
@@ -477,7 +486,18 @@ public:
                           bool             noInline     = false,
                           bool             alwaysInline = false,
                           bool             noOptimize   = false,
-                          bool             noSanitizeThread = false);
+                          bool             noSanitizeThread = false,
+                          // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN:
+                          // the static-initializer schedule, on the same terms as
+                          // the flags above — a SYNTHESIZED function carries no
+                          // source attribute, so the empty default reads
+                          // naturally, and every site that COPIES an existing
+                          // MirFunc must pass `funcStaticInit(...)` explicitly.
+                          // ★ THIS ONE IS NOT LIKE THE FLAGS in what a miss
+                          // costs: a dropped `noSanitizeThread` is an unrecorded
+                          // directive, a dropped schedule is an initializer that
+                          // stops running.
+                          StaticInitSchedule staticInit = {});
 
     // ── literal pool ──
     // Append `value` to the module's literal pool and return the index.

@@ -138,6 +138,8 @@ TEST(MachOCodeSignPlaceholder, NonMultipleOfEightRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bad-cs","kind":"macho"},
@@ -177,6 +179,8 @@ TEST(MachOCodeSignPlaceholder, ZeroAcceptedAsDisabled) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-no-cs","kind":"macho"},
@@ -205,6 +209,8 @@ TEST(MachOCodeSignPlaceholder, ObjectFiletypeRejectsCodeSigField) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-obj-with-cs","kind":"macho"},
@@ -234,6 +240,8 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsNonZeroCodeSigSize) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-static","kind":"macho"},
@@ -282,6 +290,8 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsTakesPrecedenceOverBindNow) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs+lazy-no-externs","kind":"macho"},
@@ -336,6 +346,8 @@ TEST(MachOCodeSignPlaceholder, DynamicPathEmitsLcCodeSignatureWithZeroReservatio
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-dyn","kind":"macho"},
@@ -451,6 +463,8 @@ TEST(MachOCodeSignPlaceholder, ZeroSizeOmitsLcCodeSignature) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-no-cs-walk","kind":"macho"},
@@ -721,6 +735,8 @@ TEST(PeCertPlaceholder, NonMultipleOfEightRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".exe",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-bad-cert","kind":"pe"},
@@ -769,6 +785,8 @@ TEST(PeCertPlaceholder, ObjFormatRejectsCertField) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".exe",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-obj-with-cert","kind":"pe"},
@@ -794,6 +812,8 @@ TEST(PeCertPlaceholder, WalkerEmitsSecurityDirAndZeroReservation) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".exe",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-with-cert","kind":"pe"},
@@ -862,6 +882,8 @@ TEST(PeExecFormatJsonValidate,
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".exe",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-no-exec-bit","kind":"pe"},
@@ -908,6 +930,8 @@ TEST(PeCertPlaceholder, CertTableLandsAfterIdataWhenImportsPresent) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".exe",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-imports-with-cert","kind":"pe"},

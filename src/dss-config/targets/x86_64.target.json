@@ -4024,13 +4024,7 @@
       }
     },
     {
-      "$comment": "Cross-class bit-pattern move (GPR↔FPR). AS1 emits x86_64 `movq` (the QWord variant). Cycle-3d Bitcast lowers via this opcode whenever src and dst register classes differ; same-class Bitcasts continue to use `mov` (handled by cycle 3c).",
-      "mnemonic": "movq_xclass", "result": "value",
-      "minOperands": 1, "maxOperands": 1,
-      "minSuccessors": 0, "maxSuccessors": 0
-    },
-    {
-      "$comment": "FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): xmm→r64 bit-copy — MOVQ r/m64, xmm = 66 REX.W 0F 7E /r (Intel SDM MOVQ, the store-to-GPR direction). The CALLER of a Win64 variadic function duplicates each FP vararg into its matching integer (home) register so the callee's va_arg(double) can read it from the home slot. A SEPARATE opcode from `movq_xclass`: the variant guard keys only on (operandKinds, width) and CANNOT disambiguate the two MOVQ directions (both are `reg`/width-64), and `movq_xclass` is consumed bidirectionally by Bitcast — overloading it would force a silent miscompile on the GPR→FPR Bitcast direction. ModR/M.reg = the xmm SOURCE (the wired source operand → modrm.reg), ModR/M.rm = the r64 DESTINATION (the result vreg → modrm.rm). Byte-pin: `movq rdx, xmm1` = 66 48 0F 7E CA (66 prefix; REX.W=0x48; 0F 7E; ModR/M mod=11 reg=xmm1=001 rm=rdx=010 → 0xCA).",
+      "$comment": "FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): xmm→GPR bit-copy — MOVQ r/m64, xmm = 66 REX.W 0F 7E /r and MOVD r/m32, xmm = 66 0F 7E /r (Intel SDM, the store-to-GPR direction). The CALLER of a Win64 variadic function duplicates each FP vararg into its matching integer (home) register so the callee's va_arg(double) can read it from the home slot. ★ D-TARGET-NO-CROSS-CLASS-MOVE-VERB: this opcode is ALSO the `fpr` -> `gpr` cell of `registerClassOps`, so a cross-class Bitcast and a `\"r\"`-bound floating inline-asm operand both lower through the bytes that already shipped here. It stays a SEPARATE opcode from its `movq_gpr_to_xmm` mirror: the variant guard keys only on (operandKinds, width) and CANNOT disambiguate the two directions (both are `reg` at the same width), so one opcode carrying both would silently pick a direction. ModR/M.reg = the xmm SOURCE (the wired source operand → modrm.reg), ModR/M.rm = the GPR DESTINATION (the result vreg → modrm.rm). ⚠ THE ONLY BYTE SEPARATING THE TWO WIDTHS IS REX.W, so a wrong-width row still assembles and still runs — both spellings are byte-pinned, ✔MEASURED 2026-08-31 under GNU as 2.42 AND clang, agreeing: `movq rdx, xmm1` = 66 48 0F 7E CA and `movd edx, xmm1` = 66 0F 7E CA (66 prefix; REX.W present only at 64; 0F 7E; ModR/M mod=11 reg=xmm1=001 rm=rdx=010 → 0xCA).",
       "mnemonic": "movq_xmm_to_gpr", "result": "value",
       "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
@@ -4044,12 +4038,19 @@
             "template":   { "mandatoryPrefix": [102], "rexW": true, "opcode": [15, 126] },
             "resultSlot": "modrm.rm",
             "wires":      [{ "index": 0, "slotKind": "modrm.reg", "regClass": "fpr" }]
+          },
+          {
+            "$comment": "MOVD r/m32, xmm — the 32-bit view. `movd %xmm1,%edx` = 66 0F 7E CA, ✔measured. Without it a `float` bound to an integer constraint would elect the 64-bit form and read eight bytes out of a four-byte value.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [102], "opcode": [15, 126] },
+            "resultSlot": "modrm.rm",
+            "wires":      [{ "index": 0, "slotKind": "modrm.reg", "regClass": "fpr" }]
           }
         ]
       }
     },
     {
-      "$comment": "D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE: r64→xmm bit-copy — MOVQ xmm, r/m64 = 66 REX.W 0F 6E /r (Intel SDM MOVQ, the load-from-GPR direction). The EXACT MIRROR of `movq_xmm_to_gpr` above and a SEPARATE opcode for the SAME reason that one is: the variant guard keys only on (operandKinds, width) and both directions are `reg`/width-64, so one opcode carrying both would silently pick a direction. Why it exists now: an FP constant in a lowering sequence travels as a GPR bit pattern (the encoding table cannot name a constant-pool entry), so the sequence needs a DECLARED way to put that pattern in an XMM. ⚠ NOT declared on `movq_xclass` — that opcode is consumed BIDIRECTIONALLY by Bitcast, and giving it these bytes would silently mis-encode the FPR→GPR direction (the trap `movq_xmm_to_gpr` was minted to avoid). ModR/M.reg = the xmm DESTINATION (resultSlot), ModR/M.rm = the r64 SOURCE. Byte-pin: `movq xmm1, rdx` = 66 48 0F 6E CA (66 prefix; REX.W=0x48; 0F 6E; ModR/M mod=11 reg=xmm1=001 rm=rdx=010 → 0xCA).",
+      "$comment": "D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE: GPR→xmm bit-copy — MOVQ xmm, r/m64 = 66 REX.W 0F 6E /r and MOVD xmm, r/m32 = 66 0F 6E /r (Intel SDM, the load-from-GPR direction). The EXACT MIRROR of `movq_xmm_to_gpr` above and a SEPARATE opcode for the SAME reason that one is: the variant guard keys only on (operandKinds, width) and both directions are `reg` at the same width, so one opcode carrying both would silently pick a direction. Why it exists: an FP constant in a lowering sequence travels as a GPR bit pattern (the encoding table cannot name a constant-pool entry), so the sequence needs a DECLARED way to put that pattern in an XMM. ★ D-TARGET-NO-CROSS-CLASS-MOVE-VERB: it is ALSO the `gpr` -> `fpr` cell of `registerClassOps`. ModR/M.reg = the xmm DESTINATION (resultSlot), ModR/M.rm = the GPR SOURCE. Byte-pins ✔MEASURED 2026-08-31 under GNU as 2.42 AND clang, agreeing: `movq xmm1, rdx` = 66 48 0F 6E CA and `movd xmm1, edx` = 66 0F 6E CA.",
       "mnemonic": "movq_gpr_to_xmm", "result": "value",
       "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
@@ -4061,6 +4062,13 @@
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [102], "rexW": true, "opcode": [15, 110] },
+            "resultRegClass": "fpr", "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "MOVD xmm, r/m32 — the 32-bit view. `movd %edx,%xmm1` = 66 0F 6E CA, ✔measured.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [102], "opcode": [15, 110] },
             "resultRegClass": "fpr", "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
@@ -4112,6 +4120,31 @@
       }
     },
     {
+      "$comment": "★★★ THE REGISTER-to-REGISTER SCALAR MOVE — MOVSD xmm1, xmm2 = F2 0F 10 /r and MOVSS = F3 0F 10 /r, both mod=11 (D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME, cycle P45). ★★ IT IS A SEPARATE OPCODE FROM `movsd_load`/`movsd_store` BECAUSE IT IS A SEPARATE INSTRUCTION, not a variant of a load: those two guard on MEMORY operand shapes ([reg, membase, memoffset] and [reg, reg, membase, memoffset]) and a register-to-register move reads no address at all. Adding a [reg] guard to `movsd_load` would have made an opcode whose NAME says `load` encode something that loads nothing. ★★★ AND IT IS NOT `movaps` EITHER — THE DIFFERENCE IS SEMANTIC, NOT COSMETIC, AND IT IS MEASURED BY EXECUTION RATHER THAN REASONED ABOUT. ✔MEASURED 2026-08-29 under gcc 13.3.0, two doubles packed in one xmm: after `movsd %xmm1, %xmm0` the destination's HIGH LANE is UNCHANGED (111), and after `movaps %xmm1, %xmm0` it is CLOBBERED (222). MOVSD merges into the upper lane — the false dependency the `movaps` row above already names — so a dialect that reached the register move through `movaps` would silently destroy the high half of every destination, with correct-looking low-lane results. That is exactly the near-miss this block's refusals exist to prevent, and it is why the spelling needed its own encoding rather than a redirect. ★★ EVERY BYTE MEASURED DIRECTLY, NOT DERIVED FROM THE MEMORY FORM, under GNU as 2.42 AND clang 18.1.3 which agree on all eight probes: `movsd %xmm1, %xmm0` = F2 0F 10 C1, `movss %xmm1, %xmm0` = F3 0F 10 C1, `movsd %xmm3, %xmm5` = F2 0F 10 EB. ⚠ THE HIGH-REGISTER FORMS PIN THE PREFIX/REX ORDER, which is load-bearing and would decode as a different instruction if reversed: `movsd %xmm8, %xmm9` = F2 45 0F 10 C8 — the mandatory prefix PRECEDES the REX byte, the same order `fadd` (F2 45 0F 58) already relies on. ⓘ WIDTH-KEYED like every other scalar-FP pair here: F2 = scalar double = width 64, F3 = scalar single = width 32, one opcode under two guards. ⓘ NO PRODUCER FROM THE C FRONT END BY DESIGN — `registerClassOps` binds the `fpr` class's `move` slot to `movaps`, which is the right codegen choice for a whole-register copy; this opcode exists so a hand-written `.s` or an `__asm__` template can WRITE the spelling gas accepts.",
+      "mnemonic": "movsd_reg", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [242], "opcode": [15, 16] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "opcode": [15, 16] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "FC2 Part B: FPR-class 8-byte load — MOVSD xmm, m64 = F2 0F 10 /r. Two variants: (a) the 3-op [base + disp32] form mirroring the universal `load` operand shape ([base_reg, MemBase(scale), MemOffset(disp)]) — what MIR Load-of-pointer lowers to (GlobalAddr → `lea reg, [rip+sym]` materializes the address, this loads through it); (b) the 1-op RIP-relative SymbolRef form mirroring `lea`'s riprel.disp32 variant (F2 0F 10 05 rel32 + rel32 relocation) — byte-pinned now, consumed end-to-end when a GlobalAddr+Load fold peephole lands. Bound to the `fpr` class's `load` slot in registerClassOps[]. The STORE form is `movsd_store` (next row — landed with its first consumer, the ms_x64 FPR saved-reg prologue spill). WIDTH-KEYED since FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN closure): the F64 variants (F2, width 64) carry their F32 MOVSS siblings (F3 0F 10, width 32) directly below — see the encoding-level $comment. (Audit-residue sweep c2 corrected the prior 'F64-WIDTH ONLY … when an F32 consumer exists' tail, which the variants below had already contradicted.)",
       "mnemonic": "movsd_load", "result": "value",
       "hasSideEffects": false,
@@ -4144,6 +4177,17 @@
             ]
           },
           {
+            "$comment": "D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT: MOVUPS xmm, m128 — 0F 10 /r, no mandatory prefix. The READ half of the whole-register pair; the store's own $comment carries the measurement and the MOVUPS-vs-MOVAPS reasoning. It must exist wherever the store does, and at the same widths: an epilogue restore or a spill reload NARROWER than the save that filled the slot leaves the top of the register holding whatever was there before, which is the same silent wrong answer arriving from the other direction. ✔MEASURED under GNU as 2.42: `movups 0x20(%rsp),%xmm6` = 0F 10 74 24 20, `movups 0x20(%rsp),%xmm15` = 44 0F 10 7C 24 20. ⓘ THE `symbol` (RIP-relative) SHAPE DELIBERATELY HAS NO WIDTH-128 ARM: that shape serves the rodata float-literal fold, whose items are F32/F64 constants, and the loader's keyed/absent-mix rule is per operandKinds list — so leaving it at 32/64 refuses a 128-bit riprel load by name rather than inventing a consumer for it.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 128 },
+            "template":   { "opcode": [15, 16] },
+            "resultSlot": "modrm.reg",
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem", "regClass": "gpr"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
             "guard":      { "operandKinds": ["symbol"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "opcode": [15, 16] },
             "resultSlot": "modrm.reg",
@@ -4164,13 +4208,13 @@
       }
     },
     {
-      "$comment": "FC2 (PE float witness, 2026-06-10): FPR-class 8-byte store — MOVSD m64, xmm = F2 0F 11 /r. ModRM DIRECTION is the load's mirror (Intel SDM): 0F 10 loads (xmm ← r/m), 0F 11 stores (r/m ← xmm) — the ModRM ROLES are identical in both (reg = the xmm, rm = the memory operand); only the opcode's direction bit decides which one is read vs written. One variant: the 4-op [value_reg, base_reg, MemBase(scale), MemOffset(disp)] form mirroring the universal `store` operand shape exactly (value → modrm.reg, base → modrm.rm.mem — emitFrameStore's operand order works unchanged). First consumer: the ms_x64 prologue/epilogue saved-reg spill — Win64 declares xmm6-15 CALLEE-SAVED and regalloc prefers callee-saved, so the FIRST FPR vreg under ms_x64 needs this store (SysV has no callee-saved XMMs, never reached it). Bound to the `fpr` class's `store` slot in registerClassOps[]. The full 16-byte XMM is NOT preserved (Win64 requires only the low 64 bits of xmm6-15 to survive — MOVSD's m64 store IS the ABI contract; the regalloc SPILL path stays width-default 64 accordingly). WIDTH-KEYED since FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN closure): the F32 MOVSS store sibling (F3 0F 11, width 32) sits directly below for type-exact value stores — see the encoding-level $comment. (Audit-residue sweep c2 corrected the prior 'F64-WIDTH ONLY … when an F32 consumer exists' tail, which the variant below had already contradicted.)",
+      "$comment": "FC2 (PE float witness, 2026-06-10): the FPR class's memory STORE verb, width-elected — MOVSS m32 (F3 0F 11), MOVSD m64 (F2 0F 11) and MOVUPS m128 (0F 11, no prefix). ModRM DIRECTION is the load's mirror (Intel SDM): 0F 10 loads (xmm ← r/m), 0F 11 stores (r/m ← xmm) — the ModRM ROLES are identical in both (reg = the xmm, rm = the memory operand); only the opcode's direction bit decides which one is read vs written. Every variant is the 4-op [value_reg, base_reg, MemBase(scale), MemOffset(disp)] form mirroring the universal `store` operand shape exactly (value → modrm.reg, base → modrm.rm.mem — emitFrameStore's operand order works unchanged). First consumer: the ms_x64 prologue/epilogue saved-reg spill — Win64 declares xmm6-15 CALLEE-SAVED and regalloc prefers callee-saved, so the FIRST FPR vreg under ms_x64 needs this store (SysV has no callee-saved XMMs, never reached it). Bound to the `fpr` class's `store` slot in registerClassOps[]. ⚠⚠ THIS $COMMENT USED TO SAY 'The full 16-byte XMM is NOT preserved (Win64 requires only the low 64 bits of xmm6-15 to survive — MOVSD's m64 store IS the ABI contract; the regalloc SPILL path stays width-default 64 accordingly)', AND THAT SENTENCE WAS FALSE — it is the reason D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT looked deliberate for four cycles. ✔MEASURED 2026-08-31 against the reference: MSVC 14.44.35207 `/O2 /FAs` on a function with eight doubles live across calls emits `movaps XMMWORD PTR [rax-24], xmm6` — a SIXTEEN-byte save, for xmm6 through xmm13. Microsoft's x64 convention lists XMM6:XMM15 as nonvolatile registers, not as nonvolatile halves, and its unwind vocabulary spells the save `UWOP_SAVE_XMM128` with no code for a partial one (see src/link/format/pe.cpp). The width-128 variant below is what makes the whole-register save encodable; it is MOVUPS rather than MOVAPS because a DSS frame slot is 16-byte-STRIDED but not 16-byte-ALIGNED, and MOVAPS #GPs on a misaligned address. WIDTH-KEYED since FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN closure): the F32 MOVSS store sibling (F3 0F 11, width 32) sits directly below for type-exact value stores — see the encoding-level $comment.",
       "mnemonic": "movsd_store", "result": "none",
       "hasSideEffects": true,
       "minOperands": 4, "maxOperands": 4,
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
-        "$comment": "FC3.5 sweep-c2: width-keyed pair — MOVSD m64, xmm (F2, width 64) vs MOVSS m32, xmm (F3 0F 11, width 32; Intel SDM MOVSS). lowerStore threads the stored VALUE's type width for FPR-class stores (type-exact access width); the regalloc spill path stays width-default 64 over 8-byte slots (value-preserving for both float widths — the F32 value is the low 4 bytes either way).",
+        "$comment": "FC3.5 sweep-c2, extended by D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT: width-keyed TRIPLE — MOVSS m32 (F3 0F 11, width 32; Intel SDM MOVSS), MOVSD m64 (F2, width 64), MOVUPS m128 (0F 11, width 128). lowerStore threads the stored VALUE's type width for FPR-class stores (type-exact access width). ⚠ THE SENTENCE THAT USED TO END THIS PARAGRAPH WAS WRONG IN BOTH OF ITS CLAUSES and is kept here as the record: 'the regalloc spill path stays width-default 64 over 8-byte slots (value-preserving for both float widths — the F32 value is the low 4 bytes either way)'. The slots are not 8 bytes — `frameSlotStride` floors at max(widest GPR, widest FPR), which is SIXTEEN on this target because `fpr` rows are 16 bytes — and the spill path no longer takes a default at all: it derives the access from the class's own full-register width, so it now moves the whole register into the whole slot. The old claim was value-preserving only under the premise that nothing wider than a double ever occupies an `fpr` register, which is a statement about today's front end rather than an invariant of this table.",
         "format": "x86-variable",
         "registerClass": "fpr",
         "variants": [
@@ -4188,6 +4232,17 @@
             "$comment": "FC3.5: MOVSS m32, xmm — F3 0F 11 /r (4-byte store).",
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
             "template": { "mandatoryPrefix": [243], "opcode": [15, 17] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem", "regClass": "gpr"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT: MOVUPS m128, xmm — 0F 11 /r, NO mandatory prefix (4-byte store is F3, 8-byte is F2, whole-register is neither). The WHOLE-REGISTER arm of this class's store verb, and the arm the target was missing: `fpr`'s registers are 16 bytes, so every frame move that carries one WHOLE — a callee-save under a convention that preserves it all, a spill slot, a SysV variadic SSE save slot — needs a width-128 encoding or it silently takes the 64-bit one. arm64's `fstur` has carried its width-128 (STUR Qt) variant since R1 of design A′; this is the same axis on the same kind of verb, which is why the fix is a variant here rather than a new mnemonic. ✔MEASURED under GNU as 2.42 (`gcc -c` + `objdump -d`): `movups %xmm6,0x20(%rsp)` = 0F 11 74 24 20 and `movups %xmm15,0x20(%rsp)` = 44 0F 11 7C 24 20 — the REX.R for the high half comes from hwEncoding, exactly as the two narrower variants already rely on. ⚠ MOVUPS, NOT MOVAPS, AND THE DIFFERENCE IS A FAULT RATHER THAN A BYTE: `frameSlotStride` makes a slot 16 bytes WIDE but nothing makes the frame base 16-byte ALIGNED, and MOVAPS raises #GP on a misaligned m128. MSVC can use MOVAPS because it aligns its own xmm save area; DSS's uniform-stride frame does not, so the unaligned form is the correct one here and is the same speed on every CPU this target reaches.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 128 },
+            "template": { "opcode": [15, 17] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg"     },
               { "index": 1, "slotKind": "modrm.rm.mem", "regClass": "gpr"  },
@@ -4317,9 +4372,13 @@
     { "class": "gpr", "derivation": "operandType" },
     { "class": "fpr", "derivation": "operandType" }
   ],
-  "$registerClassOpsComment": "FC2 Part B: per-register-class move/load/store mnemonics. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (a GPR mov against an XMM hwEncoding assembles to valid-looking-but-WRONG bytes — the class-blind silent miscompile this table kills). fpr's `store` landed with its FIRST consumer (trigger discipline honored): the ms_x64 prologue saved-reg spill — Win64 callee-saved xmm6-15 + regalloc's callee-saved-first policy put the first FPR vreg in a callee-saved xmm, and classOpHandle failed loud L_RequiredLirOpcodeMissing until movsd_store was declared.",
-  "registerClassOps": [
-    { "class": "fpr", "move": "movaps", "load": "movsd_load", "store": "movsd_store" }
+  "$registerClassOpsComment": "FC2 Part B: per-register-class move/load/store mnemonics. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (a GPR mov against an XMM hwEncoding assembles to valid-looking-but-WRONG bytes — the class-blind silent miscompile this table kills). fpr's `store` landed with its FIRST consumer (trigger discipline honored): the ms_x64 prologue saved-reg spill — Win64 callee-saved xmm6-15 + regalloc's callee-saved-first policy put the first FPR vreg in a callee-saved xmm, and classOpHandle failed loud L_RequiredLirOpcodeMissing until movsd_store was declared. ★★ THE TWO PARAGRAPHS ABOVE AND BELOW WERE TWO SEPARATE `$registerClassOpsComment` KEYS IN THIS DOCUMENT UNTIL 2026-08-30 (cycle P46), AND JSON LET THAT PASS: every mainstream parser -- nlohmann, which is what DSS uses -- keeps the LAST occurrence and drops the first WITHOUT A DIAGNOSTIC. So the paragraph above this sentence was dead text the loader never saw, while being the one a reader meets first. Merged rather than deleted, because neither subsumes the other: the first says WHY this table exists and what a missing row costs, the second says what a ROW MEANS now that its subject is an ordered pair. D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC. D-TARGET-NO-CROSS-CLASS-MOVE-VERB: a row's subject is an ORDERED PAIR of register classes — `class` is the SOURCE and the optional `to` is the DESTINATION, `to` omitted meaning the DIAGONAL (a copy within one file), which is what every row written before this key existed meant. ★ ONE TABLE, not two: `move` answers the single question *how does this machine copy a bit pattern from class A to class B?* for every (A,B) including A == B. A separate cross-class list would have given that one question two homes and a reader would have found whichever their grep reached first. ⚠ `load`/`store` are DIAGONAL-ONLY and the loader refuses them off it: they relate a class to MEMORY, and memory is not a register class. ⚠ AND THE MOVE'S OWN ENCODING IS CHECKED AGAINST THE PAIR IT IS FILED UNDER — filing the integer `mov` as the gpr->fpr move would load clean and re-create D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND (a register NUMBER written into the wrong file, silently), so `validate()` refuses a move whose declared banks disagree with its row.",
+"registerClassOps": [
+    { "class": "fpr", "move": "movaps", "load": "movsd_load", "store": "movsd_store" },
+    { "$comment": "gpr -> fpr, the cross-FILE move. MOVQ/MOVD xmm, r/m — the SAME opcode the Win64 variadic caller and the FP-constant materialization already use, so this row mints no vocabulary; it fills the slot the table never had. Reachable from ordinary C as an inline-asm operand whose constraint class differs from its value's (`double y; __asm__(\"nop\" : \"+r\"(y));`, which gcc 13.3.0 -O2 compiles) and from a cross-class MIR Bitcast.",
+      "class": "gpr", "to": "fpr", "move": "movq_gpr_to_xmm" },
+    { "$comment": "fpr -> gpr, the mirror direction. A SEPARATE opcode from the row above and deliberately so: both directions are `reg` at the same width, so one opcode carrying both would silently pick a direction — the trap both opcode rows document in their own $comments.",
+      "class": "fpr", "to": "gpr", "move": "movq_xmm_to_gpr" }
   ],
   "$callingConventionsComment": "Per-platform x86_64 ABIs. ML7 callconv lowering selects one based on driver flag / function attribute. SysV AMD64 = Linux/macOS/BSD; ms_x64 = Windows. argGprs/argFprs ordering is significant (caller MUST place int args in those registers in that order, then spill to stack).",
   "callingConventions": [

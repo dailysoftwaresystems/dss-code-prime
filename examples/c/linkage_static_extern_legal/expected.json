@@ -1,0 +1,15 @@
+{
+  "$comment": "D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH (P50 lane li) — the POSITIVE control: C 6.2.2p4/p5 linkage INHERITANCE. MEASURED 2026-09-01, every ordering probed on gcc 13.3.0, clang 18.1.3 AND MSVC 19.51.36231 separately, ALL THREE accept every line of this file: after `static int g;`, the later `extern int g;` inherits internal linkage (p4); after `static int f(void);`, the later PLAIN definition inherits it too (p5 routes a plain function declaration through p4), and a THIRD `static int f(void);` after that definition is a legal redeclaration of the now-internal identifier. That last line is the load-bearing one: DSS OR-propagates the internal-linkage bit across each redeclaration merge, and without the propagation the third declaration would see a plain-defining prior and mis-fire S_LinkageRedeclarationMismatch on unanimously-legal C. exit 42 = f() = 42 + g where g is the zero-initialized internal tentative. Runnable on all four targets + the release pipeline because the claim is 'DSS BUILDS AND RUNS the inheritance orderings', per-target. RED-ON-DISABLE: drop the OR-propagation in mergeOrCollideRedeclaration (keep the reject arm) -> this file is wrongly REJECTED and exit 42 is unreachable; drop the whole arm instead -> this file still passes but the two linkage_*_rejected siblings go red, so the pair of manifests pins the boundary from both sides.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

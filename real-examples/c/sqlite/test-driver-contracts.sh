@@ -29,6 +29,15 @@
 #                                               headers, the reference launcher
 #                                               comes from the CATALOGUE, and no
 #                                               host-identity branch chooses it
+#   O  the dss:compiler-currency region         the LOCATED compiler is PROVED
+#                                               current before the run is spent:
+#                                               a stale one ABORTS naming the
+#                                               binary, its build time and the
+#                                               rebuild command; SKIP_DSS_BUILD=1
+#                                               does not exempt it; and a check
+#                                               that COULD NOT RUN is a different
+#                                               answer from a stale binary
+#      [D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]
 #   H  RED-ON-DISABLE                           every guard above is BROKEN in a
 #                                               copy and the pin MUST go red
 #
@@ -1373,6 +1382,146 @@ pin_smoke_argv() { # pin_smoke_argv <driver>
   esac
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# O — THE LOCATED COMPILER IS PROVED CURRENT BEFORE THE RUN IS SPENT
+# ═══════════════════════════════════════════════════════════════════════════
+# D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN.
+#
+# ★★ THIS PIN DRIVES THE SHIPPED REGION, NOT A FUNCTION LIFTED OUT OF IT. The
+# defect being guarded against is not "the function returns the wrong answer" —
+# it is "the run continues anyway", which is a property of the CALL SITE. Same
+# reason pin_confound_supply_stops_the_driver exists: every pin that captured a
+# refusal's status directly stayed green while the shipped driver sailed past it.
+# So the whole `dss:compiler-currency` region is extracted and executed in a CHILD
+# bash, with a statement AFTER it that must not be reached.
+#
+# ★★ THE COMPILER IS A FAKE, AND IT IS THE ONLY FAKE HERE. Everything else in the
+# path is shipped code: the driver's own region, and the real
+# `speedtest1_bench.py --preflight-dss` it calls. A pin that stubbed the pre-flight
+# would be asserting over its own idea of the contract — the exact "supplies its
+# subject's input in a shape the subject never sees" trap this file records twice.
+# ⓘ WHY THE FAKE'S SHAPE IS HOST-DEPENDENT, stated rather than hidden: the
+# pre-flight launches the compiler through Python's subprocess, and ✔MEASURED
+# 2026-08-31 on Windows an extensionless `#!/bin/sh` file gives `[WinError 193]`
+# while a `.cmd` launches fine. That is the same fact `Find-DssCandidates` encodes
+# by probing both `dsscp.exe` and `dsscp`: how a file is made launchable is a
+# property of the machine, not of this test.
+fake_dsscp() {  # fake_dsscp <dir> <name> <line-to-print-or-empty>  -> prints the path
+  local dir="$1" name="$2" line="$3" p
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      p="$dir/$name.cmd"
+      { printf '@echo off\r\n'
+        [ -n "$line" ] && printf 'echo %s\r\n' "$line"
+        printf 'exit /b 0\r\n'
+      } > "$p" ;;
+    *)
+      p="$dir/$name"
+      { printf '#!/bin/sh\n'
+        [ -n "$line" ] && printf 'echo "%s"\n' "$line"
+        printf 'exit 0\n'
+      } > "$p"
+      chmod +x "$p" ;;
+  esac
+  printf '%s\n' "$p"
+}
+pin_compiler_currency() { # pin_compiler_currency <driver>
+  local drv="$1" region script out rc fake_stale fake_ok
+  region="$(LC_ALL=C sed -n -e '/^# >>> dss:compiler-currency >>>$/,/^# <<< dss:compiler-currency <<</p' "$drv")"
+  if [ -z "$region" ]; then
+    PIN_FAILS=$((PIN_FAILS + 1))
+    [ "$QUIET" -eq 1 ] || bad "could not extract the dss:compiler-currency region from ${drv##*/} — this pin would assert over nothing"
+    return 0
+  fi
+  # THE SUBJECT, ASSERTED PRESENT BEFORE IT IS RUN. A region that still contains
+  # the function but no longer CALLS it would execute cleanly and prove nothing,
+  # so the call is named here as well as exercised below.
+  ck_has "the region defines the currency assertion" "$region" 'dss_assert_compiler_current() {'
+  ck_has "...and CALLS it, so the check is not merely available" "$region" 'dss_assert_compiler_current python3'
+  if ! command -v python3 >/dev/null 2>&1; then
+    skip "the compiler-currency arms need python3 (the driver requires it at Step 0; this host has none)"
+    return 0
+  fi
+  fake_stale="$(fake_dsscp "$WORK" stale-dsscp "error[C_InvalidSemantics]: unknown key 'restrictMarker' in 'declarations[0]'")"
+  fake_ok="$(fake_dsscp "$WORK" current-dsscp '')"
+  script="$(mktemp "${TMPDIR:-/tmp}/dss-currency-callsite-XXXXXX.sh")"
+  # Everything between the stubs and the marker is the shipped driver's own text.
+  # ⚠ `die` EXITS here exactly as it does in the driver: what is under test is
+  # that the shell STOPS, which cannot be observed from inside a shell that does
+  # not.
+  {
+    printf '%s\n' 'set -Eeuo pipefail'
+    printf '%s\n' 'declare -A LEG_SPEC=()'
+    printf '%s\n' 'declare -a LEG_ORDER=()'
+    printf '%s\n' 'die()  { printf "DIE: %s\n" "$*" >&2; exit 1; }'
+    printf '%s\n' 'info() { :; }'
+    printf '%s\n' 'warn() { :; }'
+    printf '%s\n' 'BENCH_CORE="${1:?core}"'
+    printf '%s\n' 'DSS_BIN="${2:?bin}"'
+    printf '%s\n' 'DSS_CONFIG_ROOT_PIN="${3:?cfg}"'
+    printf '%s\n' 'DSS_BIN_BUILT="2026-08-28 09:30:36"'
+    printf '%s\n' 'DSS_BIN_ORIGIN="LOCATED under an eligible build root — NOT built by this run"'
+    printf '%s\n' '_dss_bdir="/nowhere/build/rel"'
+    printf '%s\n' 'LEG_ORDER=(elf64-x86_64 pe64-x86_64)'
+    printf '%s\n' 'LEG_SPEC[elf64-x86_64]="x86_64:elf64-x86_64-linux-exec"'
+    printf '%s\n' 'LEG_SPEC[pe64-x86_64]="x86_64:pe64-x86_64-windows-exec"'
+    printf '%s\n' "$region"
+    printf '%s\n' 'printf "REACHED-NEXT-STATEMENT ok=[%s]\n" "$DSS_CURRENCY_OK"'
+  } > "$script"
+  # ── THE REMOVE-DIRECTION ARM: a STALE compiler must STOP the run ─────────
+  # ✔The signature is the one measured on 2026-08-31: an `error[C_Invalid…]`
+  # naming config vocabulary the binary does not know.
+  out="$("$BASH" "$script" "$HERE/speedtest1_bench.py" "$fake_stale" "$HERE/../../.." 2>&1)"; rc=$?
+  ck "a STALE compiler STOPS the driver at Step 5 (rc)" "1" "$rc"
+  ck_has "...naming the BINARY" "$out" "$fake_stale"
+  ck_has "...naming WHEN it was built" "$out" "built     : 2026-08-28 09:30:36"
+  ck_has "...naming how it was obtained" "$out" "NOT built by this run"
+  ck_has "...naming the REBUILD command" "$out" "REBUILD IT: cmake --build"
+  ck_has "...and quoting the compiler's own diagnostic" "$out" "unknown key 'restrictMarker'"
+  ck "...and the statement AFTER the region never ran" "no" \
+     "$(printf '%s' "$out" | grep -q 'REACHED-NEXT-STATEMENT' && echo yes || echo no)"
+  # ── THE GREEN CONTROL: a CURRENT compiler must be let through ────────────
+  # Without this the arm above would pass for a driver that refuses everything.
+  out="$("$BASH" "$script" "$HERE/speedtest1_bench.py" "$fake_ok" "$HERE/../../.." 2>&1)"; rc=$?
+  ck "a CURRENT compiler is let through (rc)" "0" "$rc"
+  ck_has "...reaching the statement after the region" "$out" "REACHED-NEXT-STATEMENT"
+  ck_has "...having recorded BOTH declared targets, deduped and in order" "$out" \
+     "ok=[x86_64:elf64-x86_64-linux-exec, x86_64:pe64-x86_64-windows-exec]"
+  # ── SKIP_DSS_BUILD=1 IS NOT AN INSTRUCTION TO TRUST ──────────────────────
+  # ★ THE ARM MOST LIKELY TO BE GOT WRONG. `SKIP_DSS_BUILD` says do not BUILD; a
+  # reading of it as "do not CHECK" restores the whole defect silently, because the
+  # flag's own branch is the one that reuses a binary nobody looked at.
+  out="$(SKIP_DSS_BUILD=1 "$BASH" "$script" "$HERE/speedtest1_bench.py" "$fake_stale" "$HERE/../../.." 2>&1)"; rc=$?
+  ck "SKIP_DSS_BUILD=1 does NOT exempt a stale binary (rc)" "1" "$rc"
+  ck_has "...and the refusal says so in as many words" "$out" "SKIP_DSS_BUILD=1 DOES NOT EXEMPT A BINARY FROM THIS CHECK"
+  # ── "I COULD NOT RUN THE CHECK" IS A DIFFERENT ANSWER ────────────────────
+  # ⚠ A check that reports an environment problem as a stale binary sends the
+  # operator to rebuild a compiler that was never the subject. The config root
+  # here is a real directory with no src/dss-config under it.
+  out="$("$BASH" "$script" "$HERE/speedtest1_bench.py" "$fake_ok" "$WORK" 2>&1)"; rc=$?
+  ck "a check that CANNOT RUN still stops the run (rc)" "1" "$rc"
+  ck_has "...saying the compiler was NOT judged" "$out" "COULD NOT RUN"
+  ck_has "...and saying so about staleness explicitly" "$out" "NOTHING above says that binary is stale"
+  ck "...and it does NOT tell the operator to rebuild" "no" \
+     "$(printf '%s' "$out" | grep -q 'REBUILD IT:' && echo yes || echo no)"
+  # ── AN UNEXPECTED EXIT CODE IS NOT AN ACCUSATION EITHER ──────────────────
+  # ★ THE ONE ARM THAT REPLACES THE CORE, and it says so rather than pretending
+  # otherwise: the property under test belongs to the DRIVER's classification of
+  # an exit code, and the real core cannot be made to return an arbitrary one
+  # through the argv the driver builds. ✔MEASURED 2026-08-31 with the real core: a
+  # bad --config-root reaches argparse as rc 2, and the first version of this gate
+  # printed argparse's usage block underneath "THE COMPILER CANNOT COMPILE THREE
+  # LINES" plus a rebuild instruction. Only rc 1 may accuse.
+  local stub="$WORK/rc2-core.py"
+  printf '%s\n' 'import sys' 'print("usage: ...", file=sys.stderr)' 'sys.exit(2)' > "$stub"
+  out="$("$BASH" "$script" "$stub" "$fake_ok" "$HERE/../../.." 2>&1)"; rc=$?
+  ck "an UNEXPECTED exit code stops the run (rc)" "1" "$rc"
+  ck_has "...reported as COULD NOT RUN, naming the code" "$out" "COULD NOT RUN for target x86_64:elf64-x86_64-linux-exec (exit 2)"
+  ck "...and NOT as an accusation against the compiler" "no" \
+     "$(printf '%s' "$out" | grep -q 'CANNOT COMPILE THREE LINES' && echo yes || echo no)"
+  rm -f "$script"
+}
+
 green "A+B  the not-run recorder + the shared run decision" pin_verdicts
 green "C    the Step-8 gate sequence, executed"             pin_step8_gates
 green "D    parse_segment keeps the first diagnostic"       pin_parse_segment
@@ -1394,6 +1543,7 @@ green "K    a forwarded PATH crosses through its declared group" pin_env_forward
 green "L    the launcher-prerequisite gate"                 pin_launcher_prereq
 green "M    the smoke argv: MEASURED targets, DECLARED launcher" pin_smoke_argv
 green "N    the confound report is PRINTED, per leg"        pin_confound_report
+green "O    the located compiler is PROVED current"         pin_compiler_currency
 
 # ═══════════════════════════════════════════════════════════════════════════
 # H — RED-ON-DISABLE. Every guard above is REMOVED in a copy; the pin must fail.
@@ -1619,6 +1769,50 @@ if mutate "H19 re-fuse the supply call into the eval" "$WORK/m19.sh" \
         print "  eval \"CONFOUND_PATTERNS=($(leg_confound_patterns \"$leg\"))\""; next }
     { print }'; then
   red "H19 the supply's refusal STOPS THE DRIVER" pin_confound_supply_stops_the_driver "$WORK/m19.sh"
+fi
+
+# H20 — STOP CALLING THE CURRENCY CHECK. This is the MEASURED pre-cycle state of
+# the .ps1 twin exactly: the step ended in a conditional WARNING that named the
+# right cause and let the run proceed. The region still defines the assertion, so
+# nothing is missing to read — only to run.
+# [D-HARNESS-SQLITE-REUSES-A-RELEASE-BINARY-OLDER-THAN-THE-CONFIG-IT-IS-GIVEN]
+if mutate "H20 stop calling the currency check" "$WORK/m20.sh" 'dss_assert_compiler_current python3 "$BENCH_CORE"' '
+    /^dss_assert_compiler_current python3 "\$BENCH_CORE"/ { print "DSS_CURRENCY_OK=\"(not checked)\""; skip = 1; next }
+    skip && /^    "\$\{DSS_CURRENCY_SPECS\[@\]\}"$/ { skip = 0; next }
+    skip { next }
+    { print }'; then
+  red "H20 a stale compiler is REFUSED, not warned about" pin_compiler_currency "$WORK/m20.sh"
+fi
+
+# H21 — GUARD THE CALL ON SKIP_DSS_BUILD, i.e. "only check the binary we built".
+# The single most plausible wrong reading of that flag, and the one that restores
+# the defect in silence: the branch it governs is precisely the one that reuses a
+# binary nobody looked at.
+# ⚠ THE WITNESS IS THE CALL SITE'S OWN INITIALISER, AND THE MUTATION CONSUMES IT.
+# ✔MEASURED while writing this: an earlier version added the bypass to the END of
+# a line it kept, so `grep -F` found the witness inside its own replacement and
+# `mutate` correctly refused — a mutation that ADDS to a line can never satisfy the
+# witness-absence check, so it has to REPLACE one.
+if mutate "H21 let SKIP_DSS_BUILD bypass the check" "$WORK/m21.sh" 'DSS_CURRENCY_OK=""' '
+    /^DSS_CURRENCY_OK=""$/ {
+      print "DSS_CURRENCY_OK=\"(not checked under SKIP_DSS_BUILD=1)\""
+      print "if [[ \"${SKIP_DSS_BUILD:-}\" != 1 ]]; then"; next }
+    /^    "\$\{DSS_CURRENCY_SPECS\[@\]\}"$/ { print; print "fi"; next }
+    { print }'; then
+  red "H21 SKIP_DSS_BUILD does not exempt a binary" pin_compiler_currency "$WORK/m21.sh"
+fi
+
+# H22 — COLLAPSE THE TWO FAILURE KINDS INTO ONE. Without the rc-3 arm, "I could
+# not run the check" is reported with the stale-binary message and the rebuild
+# instruction — a true-sounding answer to the adjacent question, which sends the
+# operator to rebuild a compiler that was never the subject.
+if mutate "H22 report an unrunnable check as a stale binary" "$WORK/m22.sh" '    if [[ $rc -ne 1 ]]; then' '
+    /^    if \[\[ \$rc -ne 1 \]\]; then$/ { skip = 1; next }
+    skip && /^      NOTHING above says that binary is stale\. Fix what the check names and ask again\."$/ { next }
+    skip && /^    fi$/ { skip = 0; next }
+    skip { next }
+    { print }'; then
+  red "H22 an unrunnable check is NOT a stale-binary verdict" pin_compiler_currency "$WORK/m22.sh"
 fi
 
 printf '\n'

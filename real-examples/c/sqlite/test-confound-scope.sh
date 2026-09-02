@@ -125,7 +125,10 @@ fails='writecrash-1.1.1 walsetlk-2.1.3 zipfile-25.0 sometest-9.9'
 # a pass over work it did not do.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN,
 # by design. One line to update, against an instrument that would otherwise lie.
-TOTAL_ASSERTIONS=152     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+TOTAL_ASSERTIONS=158     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+                         # +6 (2026-09-01): the identity-triple JOIN in both
+                         # drivers, and what each hands --reference-target
+                         # [D-HARNESS-ORACLE-CLASSIFIER-READS-AN-IDENTITY-TRIPLE-WITH-THE-LEG-SPEC-READERS]
                          # + 28 loadext staging + 6 staged sqlite_cfg.h (this driver)
                          # + 4 launcher argv form (this driver, 2 of them behavioural)
                          # + 46 driver-pairing (.ps1-gated): 12 original + 28 for
@@ -946,6 +949,31 @@ else
   check "the .ps1 passes a MEASURED --reference-target" "'--reference-target', \$RefCliTarget" "$PS1CODE"
   check "the .sh asks --launcher-for-target for the reference's launcher"  '--launcher-for-target' "$SHCODE"
   check "the .ps1 asks --launcher-for-target too"                          '--launcher-for-target' "$PS1CODE"
+  # ── THE JOIN, AND WHAT THE ORACLE REPORT IS ACTUALLY HANDED ───────────────
+  # ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-ORACLE-CLASSIFIER-READS-AN-IDENTITY-TRIPLE-WITH-THE-LEG-SPEC-READERS
+  # ★★★ `--identify-binary` prints THREE TAB-separated fields and each driver
+  # joins them with ':' — that joined value is the `<arch>:<container>:<targetOs>`
+  # IDENTITY TRIPLE, and it is NOT the two-field `<arch>:<formatName>` a leg's
+  # `spec` is written in. The oracle classifier read it with the SPEC readers, so
+  # `spec_target_os('x86_64:elf64:linux')` came back empty and EVERY leg reported
+  # NO ORACLE on every run, over an 11 MB gcc reference the same run had just
+  # written. harness_legs.py now owns the parse; these pin the DRIVER half, so the
+  # two spellings cannot drift apart again while a green pin sits over them.
+  check "the .sh joins --identify-binary's TABs into the ':' triple"  "tr '\\t' ':'" "$SHCODE"
+  check "the .ps1 joins them the same way, in its own dialect" \
+        'Select-Object -First 1) -replace ' "$PS1CODE"
+  # ★ AND THE VALUE THAT REACHES THE ORACLE REPORT IS THAT MEASURED TRIPLE. The
+  # option name alone is satisfied by a driver passing a leg's DECLARED spec, which
+  # is exactly the vocabulary confusion this anchor is about, so both halves of the
+  # chain are named: what the variable is SET FROM, and what it is PASSED TO.
+  check "the .sh sets its oracle reference target FROM the measured triple" \
+        'REF_FIXTURE_TARGET="$IDENTIFY_TRIPLE"' "$SHCODE"
+  check "...and hands THAT to the oracle report" \
+        '--reference-target "$REF_FIXTURE_TARGET"' "$SHCODE"
+  check "the .ps1 sets its oracle reference target FROM the measured triple" \
+        '$RefOracleTarget = $refFixId.Target' "$PS1CODE"
+  check "...and hands THAT to the oracle report" \
+        "'--reference-target', \$RefOracleTarget" "$PS1CODE"
   # ★★ AND THE ABSENCE, WHICH IS THE FIX. The host-identity flag that used to pick
   # the reference's launcher is what made the oracle unmatched. Asserted over the
   # .ps1's Step-7c block INCLUDING ITS COMMENTS — the driver is written so the name

@@ -4,6 +4,7 @@
 
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"   // DataModel (signatureByDataModel resolution)
+#include "core/types/declared_qualification.hpp" // DeclaredQualification (a row's const/restrict claim)
 #include "core/types/include_path_resolve.hpp" // HeaderNameMatching + HeaderSearchResult (the `includes` closure walk's case policy)
 #include "core/types/named_type_binding.hpp" // NamedTypeBinding (c82 va_list alias thread-through)
 #include "core/types/object_format_kind.hpp" // ObjectFormatKind (availability predicate)
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -134,6 +136,25 @@ enum class ShippedSymbolLinkage : std::uint8_t {
 struct DSS_EXPORT ShippedSymbol {
     std::string          name;
     TypeId               signature;
+    // ★★ P44 (item (a) of D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES):
+    // WHAT THIS ROW CLAIMS ABOUT `const` / `restrict`, WHICH `signature` CANNOT
+    // CARRY AND NEVER WILL. Neither qualifier is interned (type_interner.hpp:
+    // `const` never affects codegen or layout), so `fn(ptr<const<char>>, ...)
+    // -> i32` and `fn(ptr<char>, ...) -> i32` intern to the SAME TypeId by
+    // design. C23 6.7.6.1p2 nonetheless makes a pointed-to qualifier part of the
+    // type for REDECLARATION compatibility, and ✔MEASURED, gcc 13.3.0
+    // (`-std=c2x`) and clang 18.1.3 (`-std=c23`) probed SEPARATELY both REFUSE
+    // `extern int printf(char *, ...);` over `#include <stdio.h>` while both
+    // ACCEPT the `const char *` twin — a divergence DSS could not see while this
+    // field did not exist.
+    //
+    // ⚠ NULL IS "NO CLAIM", NEVER "UNQUALIFIED". A row that spells no qualifier
+    // says NOTHING about the axis and the oracle then does not judge it; reading
+    // silence as `char *` would refuse the ubiquitous and legal
+    // `int printf(const char *, ...);` against every row in the corpus that has
+    // not been annotated. Shared, because a claim is immutable once read and one
+    // descriptor row is consulted from several passes.
+    std::shared_ptr<DeclaredQualification const> qualification;
     ShippedSymbolKind    kind    = ShippedSymbolKind::Function;
     ShippedSymbolLinkage linkage = ShippedSymbolLinkage::External;
     // Optional per-SYMBOL availability — which object-formats this symbol EXISTS
@@ -1187,6 +1208,36 @@ DSS_EXPORT void forEachDescriptorInClosure(
 [[nodiscard]] DSS_EXPORT bool objectFormatInAvailabilitySet(
     std::span<std::string const> availableObjectFormats, ObjectFormatKind fmt);
 
+// ★★★ D-FFI-DESCRIPTOR-KNOWN-NAME-HAS-NO-LIBRARY-FOR-FORMAT — THE ONE OWNER of
+// "which IMAGE does this per-object-format `library` map name on `formatName`".
+// Returns the image, or an EMPTY view when the row names NONE.
+//
+// `formatName` is the DECLARED object-format spelling (`objectFormatKindName`),
+// which is what the maps are keyed on — this predicate knows no format identity
+// and no image name, exactly like `objectFormatInAvailabilitySet` above.
+//
+// ★ BOTH SPELLINGS OF ABSENCE COLLAPSE TO ONE ANSWER. A map with no entry for
+// the format, and a map whose entry names the empty string, are the same fact
+// and answer the same way. That is the reason this exists as a function rather
+// than an inline `find`: the two spellings were read DIFFERENTLY by the two
+// tiers that ask (`realizeRow` asked `contains`, the binder folds ask for the
+// VALUE), so one row could be REALIZED to the tier that states the platform's
+// answer and UNBOUND to the tier that acts on it. The empty spelling is now
+// refused at descriptor load, and this accessor keeps the interior total even
+// for a map a direct-API caller built itself.
+//
+// ⛔ AN EMPTY ANSWER IS NOT AN ERROR. "The corpus knows this name, it IS
+// available here, and no image is named for this format" is a LEGAL, STATED
+// platform answer — `ShippedRealizationStatus::NoLibraryForFormat` — and it
+// routes the reference UNBOUND to the link tier, where C23 5.1.1.2 phase 8 puts
+// every unresolved external reference. It is never a compile error, because it
+// is a statement about the PLATFORM's image inventory and not about the user's
+// program: a sibling translation unit or an operator-named library may still
+// provide the symbol.
+[[nodiscard]] DSS_EXPORT std::string_view shippedLibraryImageForFormat(
+    std::unordered_map<std::string, std::string> const& library,
+    std::string_view                                    formatName);
+
 // True iff the shipped header whose descriptor is at `descriptorPath` is
 // available on `fmt`. Reads `availableObjectFormats` interner-free
 // (`readShippedLibAvailability`) then applies `objectFormatInAvailabilitySet`.
@@ -1320,6 +1371,28 @@ enum class ShippedRealizationStatus : std::uint8_t {
     // live bug (the eight POSIX descriptors once cited as evidence are top-level
     // gated ["elf","macho"] with zero pe-gated symbol rows, which makes their
     // absent `pe` key CORRECT and puts them in `UnavailableForFormat` above).
+    //
+    // ★★★ AND THE VERDICT IS UNBOUND, NOT A LOAD ERROR — decided on measurement,
+    // D-FFI-DESCRIPTOR-KNOWN-NAME-HAS-NO-LIBRARY-FOR-FORMAT. Making a descriptor
+    // that declares an available symbol with no image MALFORMED was the other
+    // candidate closing, and it is wrong: ✔MEASURED, 125 rows across
+    // ctype/math/memory/stdio/stdlib/string.json declare NO `availableObjectFormats`
+    // — which this codebase reads as available on EVERY format, `wasm` and `spirv`
+    // among them — while naming images only for elf/pe/macho, so a load-time
+    // "available ⇒ must name an image" rule fails loud on the six most central C
+    // descriptors the day it ships. Scoping it to EXPLICIT availability lists to
+    // dodge that would be loud on the NARROWER claim and silent on the BROADER one.
+    // And this reader is consulted for descriptors the user never `#include`d, so a
+    // load error here either meets the "a descriptor that fails to read is SKIPPED"
+    // contract below and does nothing, or turns one unrelated descriptor into every
+    // program's build failure. C23 5.1.1.2 phase 8 owns this verdict: an unresolved
+    // external reference is the LINK tier's to judge.
+    //
+    // ⚠ THE ARM IS DECIDED BY `shippedLibraryImageForFormat`, never by asking the
+    // map whether it CONTAINS the format key. A key present naming the empty string
+    // is a second spelling of this very outcome, and `contains` called it
+    // `Realized` while every binder fold called it unbound. That spelling is now
+    // refused at descriptor load and collapsed by the accessor.
     NoLibraryForFormat,
     // ★★★ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF. Declared, available here, and the
     // platform states that the BODY IS SHIPPED rather than imported: no image

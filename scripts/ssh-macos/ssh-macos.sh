@@ -39,7 +39,21 @@
 set -uo pipefail
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-CONF=$REPO/.secrets/macos.env
+# ★ `.secrets/` IS GITIGNORED, SO A LANE WORKTREE HAS NONE -- `git worktree add`
+# writes only tracked files, and `.worktrees/` is the SANCTIONED home for lane
+# worktrees. Resolved through the one owner rather than assumed to sit beside this
+# script: `scripts/repo-secrets/` follows a linked worktree back to the main checkout
+# that holds the file. Without it this carriage refused rc=3 for every lane, naming a
+# path inside the worktree and inviting the one repair that must never be made (a
+# second copy of key material, per lane).
+# ⚠ THE EMPTY ARGUMENT IS LOAD-BEARING: `.` forwards THIS script's positional
+# parameters unless given its own, and this carriage is routinely called with a remote
+# command as `$1`.
+# shellcheck source=../repo-secrets/repo-secrets.sh
+. "$REPO/scripts/repo-secrets/repo-secrets.sh" "" \
+    || { echo "ssh-macos: cannot load $REPO/scripts/repo-secrets/repo-secrets.sh" >&2; exit 3; }
+SECRETS=$(repo_secrets_dir "$REPO")
+CONF=$SECRETS/macos.env
 
 # ★ RESOLVED BY EXECUTION, NOT BY `command -v` -- which LIES on these hosts, and a
 # `WindowsApps` stub answers yes and then does nothing. `python` is the name a
@@ -65,14 +79,73 @@ done
 # {$conf[...]}`) — this is the CAPABILITY PAIR having drifted, which is precisely what
 # the header's pairing note exists to prevent.
 _envHost=${DSS_MACOS_HOST:-} ; _envUser=${DSS_MACOS_USER:-} ; _envKey=${DSS_MACOS_KEY:-}
+# ⚠ THE PATH PREFIX CAPTURES *SET-NESS*, NOT EMPTINESS, AND THE OTHER THREE DELIBERATELY
+# DO NOT — D-SCRIPT-SSH-MACOS-PATH-PREFIX-CANNOT-BE-DISABLED-BY-AN-EMPTY-VALUE.
+# For host/user/key an EMPTY value is meaningless and `:-` is right. For this one an
+# empty value is the DISABLE switch, so `:-` erases the very state the caller is
+# expressing. ✔MEASURED 2026-08-28, and it made this script's own commissioning A/B
+# VACUOUS: `DSS_MACOS_PATH_PREFIX="" ssh-macos.sh 'command -v cmake'` was run as the
+# CONTROL arm — the arm that is supposed to reproduce the pre-fix breakage — and the
+# `${VAR:=default}` below re-assigned the default over the empty string, so the control
+# ran WITH the repair and returned `/opt/homebrew/bin/cmake`. ★ The failure direction is
+# the dangerous one: a control that silently becomes a second treatment arm agrees with
+# the treatment, which reads as "the fix works" no matter what the fix does.
+_envPathPrefixSet=${DSS_MACOS_PATH_PREFIX+set}
+_envPathPrefix=${DSS_MACOS_PATH_PREFIX:-}
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && . "$CONF"
 if [ -n "$_envHost" ]; then DSS_MACOS_HOST=$_envHost ; fi
 if [ -n "$_envUser" ]; then DSS_MACOS_USER=$_envUser ; fi
 if [ -n "$_envKey"  ]; then DSS_MACOS_KEY=$_envKey   ; fi
-unset _envHost _envUser _envKey
+if [ -n "$_envPathPrefixSet" ]; then DSS_MACOS_PATH_PREFIX=$_envPathPrefix ; fi
+unset _envHost _envUser _envKey _envPathPrefix _envPathPrefixSet
 
 : "${DSS_MACOS_HOST:=}" ; : "${DSS_MACOS_USER:=}" ; : "${DSS_MACOS_KEY:=}"
+
+# ★★★ THE REMOTE PATH IS REPAIRED BEFORE ANY PAYLOAD RUNS —
+# D-TOOLS-SSH-MACOS-NONINTERACTIVE-PATH-IS-CLOBBERED-BY-EMSDK.
+#
+# ✔MEASURED 2026-08-04 and re-faced 2026-08-27: this host runs an emsdk shell hook
+# that REPLACES `PATH` with `<emsdk dirs>:/usr/bin:/bin:/usr/sbin:/sbin` for a
+# NON-INTERACTIVE session, dropping `/opt/homebrew/bin` AND `/usr/local/bin`. So
+# `command -v cmake` answers MISSING while `ls /opt/homebrew/bin` shows cmake,
+# ninja, tclsh and tclsh9.0 all present.
+#
+# ★★ THE DIRECTION OF THE WRONG ANSWER IS WHAT MAKES THIS WORTH REPAIRING RATHER
+# THAN DOCUMENTING: it is a FALSE NEGATIVE — "the tool is not installed" — which
+# silently SHRINKS what the project believes it can do, and it has already put a
+# refuted sentence ("Homebrew is not installed") into a commit message as a measured
+# fact used to justify a design decision. A capability question answered wrongly
+# does not fail; it re-plans the work around a machine that was never limited.
+#
+# ⚠ WHY NOT A LOGIN SHELL, which is the other arm the anchor offered: a login shell
+# runs the profile, and THIS host's profile is exactly what the `.local`-resolver
+# note below records CONSUMING A SCRIPT PIPED TO `bash -s`. Repairing PATH by
+# invoking the thing that breaks stdin trades a false negative for a silent
+# truncation, which is strictly worse. The prefix is deterministic and touches
+# nothing else.
+#
+# ⚠ IT IS A PREFIX, NOT A REPLACEMENT. The remote `PATH` is kept and appended, so a
+# tool that lives only in the emsdk dirs is still found; and `$PATH` is written to
+# expand ON THE FAR SIDE (single-quoted here) — expanding it locally would ship
+# THIS machine's PATH to macOS.
+#
+# ⚠ IT IS `export ...;`, A STATEMENT, NOT `PATH=... cmd`, AN ASSIGNMENT PREFIX. ssh
+# hands the payload to the remote shell as ONE string, so an assignment prefix binds
+# only to the FIRST command: `PATH=x cd d && make` would run `make` with the broken
+# PATH. The `export` form covers a compound payload, and — the case that matters
+# most here — it is inherited by `bash -s`, so the piped-script transports get the
+# repair without a second mechanism and without touching their stdin.
+#
+# ⚠ `+set`, NOT `:=` — an EMPTY value is the caller's DISABLE switch and must survive.
+# See the set-ness note in the env-precedence block above for the measurement.
+if [ -z "${DSS_MACOS_PATH_PREFIX+set}" ]; then
+    DSS_MACOS_PATH_PREFIX=/opt/homebrew/bin:/usr/local/bin
+fi
+remote_path_stmt=
+if [ -n "$DSS_MACOS_PATH_PREFIX" ]; then
+    remote_path_stmt='export PATH="'$DSS_MACOS_PATH_PREFIX':$PATH"; '
+fi
 DSS_MACOS_KEY=$(eval printf '%s' "\"$DSS_MACOS_KEY\"")
 
 # ★★★ THE SCRIPT FINDS THE KEY — the caller never does anything manually.
@@ -84,7 +157,7 @@ DSS_MACOS_KEY=$(eval printf '%s' "\"$DSS_MACOS_KEY\"")
 # ⚠ CAPABILITY-PAIRED with `ssh-macos.ps1` and with BOTH arm64-vps carriages: a
 # change to one lands in all four, or the pairing this file's header claims is a
 # claim nothing checks.
-_repo_key=$REPO/.secrets/macos.key
+_repo_key=$SECRETS/macos.key
 if [ -n "$DSS_MACOS_KEY" ] && [ ! -f "$DSS_MACOS_KEY" ] && [ -f "$_repo_key" ]; then
     echo "ssh-macos: DSS_MACOS_KEY='$DSS_MACOS_KEY' does not exist; using the repo-local key $_repo_key" >&2
     DSS_MACOS_KEY=$_repo_key
@@ -126,13 +199,27 @@ if ! printf '%s' "$DSS_MACOS_HOST" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; t
     # survives byte-exact ... the 2026-08-18 note claiming the login profile eats
     # stdin is expired"). That note was RIGHT; the measurement which overturned it
     # tested DATA over stdin, not a shell READING A SCRIPT from it.
-    resolved=$(getent hosts "$DSS_MACOS_HOST" 2>/dev/null </dev/null | awk '{print $1; exit}')
-    [ -z "$resolved" ] && resolved=$(ping -c1 -W1 "$DSS_MACOS_HOST" 2>/dev/null </dev/null \
-        | sed -n 's/.*(\([0-9.]\{7,15\}\)).*/\1/p' | head -1)
-    # ★ avahi, when this is a Linux box that actually has an mDNS responder.
-    if [ -z "$resolved" ] && command -v avahi-resolve-host-name >/dev/null 2>&1; then
-        resolved=$(avahi-resolve-host-name -4 "$DSS_MACOS_HOST" 2>/dev/null </dev/null | awk '{print $2; exit}')
-    fi
+    # ★★★ THE WHOLE LADDER IS ATTEMPTED SEVERAL TIMES, BECAUSE ONE mDNS QUERY IS NOT
+    # A MEASUREMENT OF WHETHER A HOST IS UP.
+    # ✔MEASURED 2026-08-31 (P47), this host, the Mac demonstrably UP the whole time
+    # (`Test-NetConnection -Port 22` -> True, `ssh` by literal IP -> rc=0):
+    #   * two consecutive `ssh-macos.sh` invocations printed "cannot resolve ...";
+    #   * a 5-arm control run seconds later resolved 192.168.0.71 on ALL FIVE arms,
+    #     including the byte-identical `powershell.exe` command this script uses.
+    # ⇒ the ladder is CORRECT and INTERMITTENT. mDNS has no authoritative negative:
+    # a responder that does not answer within the resolver's window is indistinguish-
+    # able from one that is not there, and the answer is then cached either way.
+    # ⛔⛔ AND THE COST OF TREATING ONE MISS AS AN ANSWER IS THE LARGEST THIS ROW HAS
+    # PAID: P46 concluded from exactly this failure that "the Bonjour responder is up
+    # and sshd is not", wrote the macOS carriage off as a BLOCKER in
+    # [[D-SQLITE-CLI-BUILT-ON-NO-LEG]], and 22 of that row's 40 obligations were
+    # declared blocked on a host that was answering on port 22.
+    #   D-SCRIPT-MACOS-CARRIAGE-CALLS-ONE-MDNS-MISS-A-DOWN-HOST
+    # ★ BOUNDED AND SILENT WHEN IT SUCCEEDS FIRST TIME, so the ordinary path costs
+    # nothing; only a retry says so, and only on stderr, because a carriage that
+    # narrates its own plumbing into stdout corrupts every caller that reads a witness.
+    #
+    # ── THE LADDER, AS ONE FUNCTION, SO THE RETRY CANNOT DRIFT FROM IT ──────────
     # ★★★ DELEGATE TO THE WINDOWS RESOLVER — THE ONE THAT ACTUALLY SPEAKS mDNS HERE.
     # ✔MEASURED 2026-08-17: from Git Bash and WSL, `getent` and `ping` both fail on a
     # `.local` name because neither has an mDNS responder — but WINDOWS resolves it
@@ -144,21 +231,86 @@ if ! printf '%s' "$DSS_MACOS_HOST" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; t
     # ⛔ THIS IS WHY THE CONFIG HOLDS A NAME AND NEVER AN IP: the Mac is on DHCP and
     # a pinned address is wrong the moment the lease changes — a hardcoded IP turns a
     # transient lookup problem into a permanently wrong file.
-    if [ -z "$resolved" ]; then
-        for _psh in powershell.exe pwsh.exe; do
-            command -v "$_psh" >/dev/null 2>&1 || continue
-            resolved=$("$_psh" -NoProfile -NonInteractive -Command \
-                "try { [System.Net.Dns]::GetHostAddresses('$DSS_MACOS_HOST') | Where-Object { \$_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1 -ExpandProperty IPAddressToString } catch { }" \
-                2>/dev/null </dev/null | tr -d '\r' | grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -1)
-            [ -n "$resolved" ] && break
-        done
-        unset _psh
+    _mac_resolve_once() {
+        _r=$(getent hosts "$DSS_MACOS_HOST" 2>/dev/null </dev/null | awk '{print $1; exit}')
+        [ -z "$_r" ] && _r=$(ping -c1 -W1 "$DSS_MACOS_HOST" 2>/dev/null </dev/null \
+            | sed -n 's/.*(\([0-9.]\{7,15\}\)).*/\1/p' | head -1)
+        # ★ avahi, when this is a Linux box that actually has an mDNS responder.
+        if [ -z "$_r" ] && command -v avahi-resolve-host-name >/dev/null 2>&1; then
+            _r=$(avahi-resolve-host-name -4 "$DSS_MACOS_HOST" 2>/dev/null </dev/null | awk '{print $2; exit}')
+        fi
+        if [ -z "$_r" ]; then
+            for _psh in powershell.exe pwsh.exe; do
+                command -v "$_psh" >/dev/null 2>&1 || continue
+                _r=$("$_psh" -NoProfile -NonInteractive -Command \
+                    "try { [System.Net.Dns]::GetHostAddresses('$DSS_MACOS_HOST') | Where-Object { \$_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1 -ExpandProperty IPAddressToString } catch { }" \
+                    2>/dev/null </dev/null | tr -d '\r' | grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -1)
+                [ -n "$_r" ] && break
+            done
+            unset _psh
+        fi
+        printf '%s' "$_r"
+    }
+    # ★★★ A SHORT-LIVED CACHE, BECAUSE A DRIVER CALLS THIS CARRIAGE MANY TIMES AND
+    # EVERY CALL WAS ROLLING THE SAME DICE.
+    # ✔MEASURED 2026-08-31 (P47): a three-hop round trip (mkdir, rsync, run) against a
+    # Mac answering on port 22 the whole time resolved on hops 1 and 2 and then MISSED
+    # EIGHT CONSECUTIVE ATTEMPTS on hop 3. Retrying makes ONE lookup reliable; it does
+    # nothing about N independent lookups, and a driver's failure probability grows
+    # with N. Resolving ONCE per TTL is the fix for that, and it is also politer to a
+    # link-local protocol that answers by multicast.
+    # ⚠ TTL-BOUNDED AND SHORT (default 900 s) BECAUSE THE MAC IS ON DHCP, and this file
+    # already says why an address must never be PINNED: a stale lease would make a
+    # cached address permanently wrong. A stale entry fails LOUDLY at `ssh` with a
+    # connection error naming the address, which is actionable; it can never produce a
+    # wrong ANSWER, only a wrong destination that refuses to connect.
+    # ⓘ Deleting the cache file is always safe: the ladder simply runs again.
+    _mac_cache="${XDG_CACHE_HOME:-$HOME/.cache}/dsscp/macos-addr-$(printf '%s' "$DSS_MACOS_HOST" | tr -c 'A-Za-z0-9._-' '_')"
+    _mac_ttl=${DSS_MACOS_RESOLVE_TTL:-900}
+    resolved=""
+    if [ -f "$_mac_cache" ] && [ "$_mac_ttl" -gt 0 ] 2>/dev/null; then
+        _mac_age=$(( $(date +%s) - $(awk 'NR==1{print $1+0}' "$_mac_cache" 2>/dev/null || echo 0) ))
+        if [ "$_mac_age" -ge 0 ] && [ "$_mac_age" -lt "$_mac_ttl" ]; then
+            resolved=$(awk 'NR==1{print $2}' "$_mac_cache" 2>/dev/null \
+                | grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -1)
+        fi
     fi
+    _mac_tries=${DSS_MACOS_RESOLVE_TRIES:-6}
+    _mac_try=1
+    while [ -z "$resolved" ]; do
+        resolved=$(_mac_resolve_once)
+        [ -n "$resolved" ] && break
+        [ "$_mac_try" -ge "$_mac_tries" ] && break
+        # ⚠ ON STDERR, NEVER STDOUT. Callers of this carriage read stdout as the
+        # remote command's own output; a progress line there is a corrupted witness.
+        printf 'ssh-macos: mDNS did not answer for %s (attempt %s of %s) -- retrying\n' \
+            "$DSS_MACOS_HOST" "$_mac_try" "$_mac_tries" >&2
+        sleep 2
+        _mac_try=$((_mac_try + 1))
+    done
+    if [ -n "$resolved" ] && [ "$_mac_ttl" -gt 0 ] 2>/dev/null; then
+        mkdir -p "$(dirname "$_mac_cache")" 2>/dev/null \
+            && printf '%s %s\n' "$(date +%s)" "$resolved" > "$_mac_cache" 2>/dev/null || true
+    fi
+    unset -f _mac_resolve_once 2>/dev/null || true
     if [ -z "$resolved" ]; then
         {
-          echo "ssh-macos: cannot resolve '$DSS_MACOS_HOST' from this host."
-          echo "  Most likely: the Mac is OFF or asleep — personal machine, not CI. Ask before waking it."
-          echo "  Or:          no mDNS responder here (usual under WSL). Put a literal IP in DSS_MACOS_HOST."
+          echo "ssh-macos: cannot resolve '$DSS_MACOS_HOST' after $_mac_tries attempt(s) from this host."
+          # ⛔⛔ THE ORDER OF THESE CAUSES IS DELIBERATE AND IT WAS THE OTHER WAY ROUND
+          # UNTIL 2026-08-31. "The Mac is OFF" led the list, and a P46 lane read it as
+          # the verdict: it recorded "the Bonjour responder is up and sshd is not" in
+          # [[D-SQLITE-CLI-BUILT-ON-NO-LEG]] and declared 22 of that row's 40
+          # obligations BLOCKED. ✔MEASURED 2026-08-31, minutes apart, the Mac
+          # answering on port 22 the whole time: this same message, twice, then a
+          # 5-arm control resolving 192.168.0.71 on every arm. A DIAGNOSIS IS NOT A
+          # MEASUREMENT, and the most confident-sounding cause was the wrong one.
+          echo "  Most likely: mDNS did not answer — it is UNRELIABLE, not authoritative, and a miss"
+          echo "               is INDISTINGUISHABLE from an absent host. Re-run, or raise"
+          echo "               DSS_MACOS_RESOLVE_TRIES. ⚠ A miss is NOT evidence the Mac is down:"
+          echo "               check it from Windows first — Test-NetConnection <name> -Port 22."
+          echo "  Or:          no mDNS responder here at all (usual under WSL when the Windows"
+          echo "               delegation below is also unavailable). Put a literal IP in DSS_MACOS_HOST."
+          echo "  Or:          the Mac really is OFF or asleep — personal machine, not CI. Ask before waking it."
           # ★★ AND THE THIRD CAUSE IS THE ONE THAT DEFEATS THE ADVICE ON THE LINE
           # ABOVE, WHICH IS WHY IT IS PRINTED RATHER THAN LEFT TO BE REDISCOVERED.
           # D-SCRIPT-MACOS-HOST-OVERRIDE-DOES-NOT-CROSS-THE-WSLENV-BOUNDARY:
@@ -378,7 +530,7 @@ if [ "${1:-}" = "--push" ]; then
     fi
     tar -c -C "$_src" -X "$_excl" \
         -f - . \
-      | ssh "${args[@]}" "mkdir -p $_dst && cd $_dst && mkdir -p build && touch build/.dss-push-stamp && sleep 1 && tar -x -m -f - && echo $_witness:\$(pwd -P)" \
+      | ssh "${args[@]}" "$remote_path_stmt" "mkdir -p $_dst && cd $_dst && mkdir -p build && touch build/.dss-push-stamp && sleep 1 && tar -x -m -f - && echo $_witness:\$(pwd -P)" \
       > "${TMPDIR:-/tmp}/ssh-macos-push.$$" 2>&1
     _st=("${PIPESTATUS[@]}")
     _out=$(cat "${TMPDIR:-/tmp}/ssh-macos-push.$$" 2>/dev/null)
@@ -445,7 +597,7 @@ echo "PRUNED_DIRS=$_dirs"
 PRUNE_EOF
 )
         printf 'D=%s\n%s\n' "$_dst" "$_prune_body" \
-          | ssh "${args[@]}" 'bash -s' > "${TMPDIR:-/tmp}/ssh-macos-prune.$$" 2>&1
+          | ssh "${args[@]}" "$remote_path_stmt" 'bash -s' > "${TMPDIR:-/tmp}/ssh-macos-prune.$$" 2>&1
         _pout=$(cat "${TMPDIR:-/tmp}/ssh-macos-prune.$$" 2>/dev/null)
         rm -f "${TMPDIR:-/tmp}/ssh-macos-prune.$$"
         # A witness, not an exit code: the status of a pipeline is the last stage's, and
@@ -480,7 +632,12 @@ if [ "${1:-}" = "--rsync" ]; then
 fi
 
 args+=("$DSS_MACOS_USER@$target")
-[ $# -gt 0 ] && args+=("$@")
+# An EMPTY payload is an interactive session; prefixing it would turn a login into a
+# one-shot `export` and hand back a shell that exits immediately.
+if [ $# -gt 0 ]; then
+    [ -n "$remote_path_stmt" ] && args+=("$remote_path_stmt")
+    args+=("$@")
+fi
 
 ssh "${args[@]}"
 exit $?

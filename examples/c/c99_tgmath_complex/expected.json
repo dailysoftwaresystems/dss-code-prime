@@ -1,0 +1,34 @@
+{
+  "$comment": "P46 (D-CSUBSET-TGMATH-COMPLEX + D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED): the runtime witness for the <tgmath.h> complex dispatch C23 7.25 requires, which is the only thing that keeps the implicit complex->real conversion from being a silent wrong answer. WHY THE TWO HAD TO LAND TOGETHER: until P46 `sqrt(z)` under <tgmath.h> was loud ONLY because `double d = z;` was refused one subsystem over; MEASURED in P45, admitting the conversion alone made `sqrt(z)` on a (0,4i) compile and answer 0 where gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 all dispatch to `csqrt` and answer 1. This example goes red on EITHER half being reverted, which is exactly the coupling. DISPATCH IS OBSERVABLE TWICE OVER: checks 1-3 are COMPILE-TIME (`_Generic` selection is static and `sizeof` does not evaluate, so `sizeof(sqrt(z)) == 16` iff the complex arm was selected and 8 iff the macro reached the real prototype, and `sizeof(fabs(z)) == 8` because cabs returns a REAL), checks 4-9 are the RUNTIME values a wrong-symbol binding would break while the sizeof witness stayed green, and checks 10-12 exercise the conversion in the three positions one rule governs. THE ELEVEN COMPLEX IMPORTS ARE REAL LIBCALLS, NOT INTRINSICS: csqrt/csin/ccos/ctan/casin/cacos/catan/cexp/clog/cpow/cabs are extern rows in shippedLibs/tgmath.json resolving to libm.so.6 (elf) and ucrtbase.dll (pe) — MEASURED present in ucrtbase.dll's export table and in libm.so.6's dynamic symbols (weak W with a GLIBC version suffix, which is safe under the eager-import law; absent is not). THE COMPLEX-BY-VALUE ABI WAS MEASURED AGAINST THE REFERENCES RATHER THAN ASSUMED, because a mismatch is a silent wrong answer and not a link error: on elf64-x86_64 DSS passes and returns a `double _Complex` in xmm0/xmm1 exactly as gcc does; on elf64-aarch64 in d0/d1 exactly as aarch64-linux-gnu-gcc does; on pe64 INDIRECTLY (rcx = hidden sret pointer, rdx = pointer to the argument) exactly as mingw-w64 gcc 13.2.0 does — and ucrtbase's own csqrt/cabs/cexp were driven through that convention and RUN, returning 1.414214+1.414214i, 5.000000 and 1.000000+0.000000i. ★★ THE DARWIN ARM LANDED 2026-08-31 (cycle P46, lane `dw`) AND THE WAY IT GOT HERE IS THE POINT. This example shipped WITHOUT one: the eleven complex rows were gated `availableObjectFormats: [pe, elf]` because `tests/ffi/test_darwin_link_name_oracle` requires every Mach-O-visible imported function to have a MEASURED row in `tests/ffi/data/darwin-link-names.tsv` saying what a REAL Darwin compiler emits for that identifier per arch, and none of the eleven had one. The oracle was RIGHT and was not routed around — an export check cannot settle this class, because a wrong-but-existing spelling links clean, loads clean and misbinds SILENTLY (the `_fstat` vs `_fstat$INODE64` case that made sqlite call every database malformed) — so macho REFUSED a complex argument loudly instead of guessing. ✔THE MEASUREMENT WAS THEN TAKEN, on macOS 26.6.2 with Apple clang 21.0.0: cabs cacos casin catan ccos cexp clog cpow csin csqrt ctan, both arches, `cc -arch <a> -fno-builtin -fno-stack-protector -w -c` then `nm -u`, one undefined symbol each and ALL ELEVEN PLAIN (`_csqrt`, no `$INODE64`-style rename) — so every one implies an ABSENT linkName, which is precisely the answer a guess would have gotten right for the wrong reason and a one-armed table would have gotten wrong. All eleven also LINK against libSystem on both arches (the eager-import law: an ABSENT symbol breaks the LOAD of every binary including the header), and csqrt/cabs/cpow were RUN natively returning 1.414214+1.414214i, 5.000000 and -4.000000+0.000000i — the same values ucrtbase.dll and libm.so.6 produced in this example's pe and elf arms. The gate is off, each macho arm now carries the text its elf arm already carried, and the semantic tripwire that was written to FAIL when this happened is replaced by `TgmathComplexArgDispatchesToTheComplexFunctionOnMachO`. REAL-ONLY MACROS ARE ABSENT HERE TOO: floor/ceil/log10/atan2/fmod/ldexp have no <complex.h> counterpart, so a complex argument must REFUSE on EVERY format (MEASURED: gcc and clang reject all six), and a refusal cannot be witnessed by a program that runs — it is pinned at the semantic tier, the tier that can assert a diagnostic. ANTI-FOLD: every operand rides a MUTABLE GLOBAL (the c11_atomic / c99_tgmath precedent) so the `release` shippedPipeline arm witnesses real dispatched libm calls rather than constants a const-fold could answer at compile time. TOLERANCES: csqrt/cpow/cexp/clog are transcendentals whose last ulp legitimately differs between glibc and ucrtbase, so those are compared within 1e-9; `cabs(3+4i) == 5` and every conversion result are pinned EXACTLY, which is where exactness carries meaning. exit = 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

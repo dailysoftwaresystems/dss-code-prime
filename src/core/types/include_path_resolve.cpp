@@ -1,8 +1,11 @@
 #include "core/types/include_path_resolve.hpp"
 
+#include "core/substrate/path_identity.hpp"  // genericSpelling — the ONE lossless
+                                             // separator normalisation
 #include "core/types/ascii_case.hpp"   // asciiToLower — the ONE folding helper
 
 #include <algorithm>
+#include <vector>
 #include <utility>
 
 namespace dss {
@@ -136,19 +139,169 @@ HeaderSearchResult descend(fs::path base, fs::path const& rel,
     return HeaderSearchResult::found(std::move(base));
 }
 
+// ── [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] ───────────────────────
+//
+// ★★★ THE INTERMITTENCY IS ROOT-CAUSED AND IT WAS NEVER THE FILESYSTEM. The
+// first cut of this file made a UNC include resolve 23 times in 30 and nobody
+// could say why the other 7 missed; every filesystem primitive here was hammered
+// in isolation (>2000 operations, 0 failures) and `--jobs 1` did not move the
+// rate, so the cause was correctly stated as "inside DSS, not root-caused". IT
+// WAS UNDEFINED BEHAVIOUR IN `isListedInItsParent` BELOW — a reference bound to
+// the `native()` of a TEMPORARY `fs::path` — and the named lead
+// (`weakly_canonical` failing on UNC, degrading `core::PathIdentity`) is
+// REFUTED as its cause: the miss happens in `rootPrefixOf`, strictly before any
+// identity key is computed. See that function for the measurement.
+
+// The ROOT PREFIX of a rooted path, plus the components below it.
+//
+// ★★★ WHY THE MODEL'S OWN SPLIT CANNOT BE USED, MEASURED RATHER THAN ARGUED.
+// `descend` used to be handed `rel.root_path()` and `rel.relative_path()`, and
+// that split IS NOT LOSSLESS on every path model:
+//     path("//server/share/x.h").root_path()     -> "/"   (ONE slash)
+//     path("//server/share/x.h").relative_path() -> "server/share/x.h"
+//     root_path() / relative_path()              -> "/server/share/x.h"  != input
+// The authority is demoted to an ordinary component, so the walk restarted from
+// the bare separator, asked for a directory named after the SERVER, found
+// nothing, and reported the HEADER missing. The same split round-trips fine for
+// `C:/...` and for a relative path -- which is exactly why every local test
+// stayed green while the cross-host route was dead.
+//
+// ★★ THE RULE, AND IT ASKS THE FILESYSTEM RATHER THAN THE PLATFORM. A root
+// prefix is exactly the part of a path that NO DIRECTORY LISTING CONTAINS: a
+// drive letter is not an entry in any directory, the bare separator is not, and
+// neither is a server nor the share below it. So the root prefix is the DEEPEST
+// ancestor whose own parent cannot be enumerated -- and the model's `root_path()`
+// when there is no such ancestor. ✔MEASURED walking a real UNC header on this
+// host: the server alone does not exist; the SHARE exists but its parent cannot
+// be enumerated (that is the boundary); every ancestor below it has an
+// enumerable parent AND is listed in it. On a local drive path EVERY ancestor is
+// listed in its own parent, so the boundary stays at the drive root and local
+// behaviour is byte-for-byte what it was -- a wrong-case absolute include is
+// still rejected at the first component.
+//
+// ⚠ NO PLATFORM MACRO, NO UNC SPELLING, AND DELIBERATELY NOT A SECOND COPY OF
+// `platformModelsUncRoots` (src/lsp/workspace_project.cpp, cycle P43). That
+// predicate asks "does this path type model an authority as a root NAME", which
+// is the right question for URI round-tripping and the wrong one here: this code
+// does not care how the authority is modelled, only where the part of the path
+// that can be case-checked BEGINS. Two notions of "does this platform model UNC
+// roots" would be the two-oracles problem; there is still exactly one, and this
+// is not it.
+//
+// The ancestors come from the `parent_path()` chain, which ✔MEASURED preserves
+// the input exactly in every case tried (both UNC spellings, a drive path, a
+// relative path) -- unlike accumulating `base /= component`, which loses the
+// authority and flips separators besides.
+// Is `p` an ENTRY IN ITS OWN PARENT'S LISTING? That is the operational form of
+// "a directory listing contains this". A server, a share, a drive letter and the
+// bare separator all answer NO; every ordinary directory and file answers YES.
+// Byte-exact on the native string, and a fold-match would only mean "this IS an
+// ordinary component", which is the safe direction.
+//
+// ★★★ `want` IS A VALUE AND MUST NEVER BE A REFERENCE AGAIN. This line shipped
+// as `NativeString const& want = p.filename().native();` and that is UNDEFINED
+// BEHAVIOUR: `filename()` returns an `fs::path` BY VALUE, `native()` hands back
+// a reference INTO that temporary, and binding a reference to the RESULT OF A
+// CALL does not extend the temporary's lifetime the way binding to the
+// temporary itself would. The path died at the end of that statement and the
+// loop below then compared every directory entry against freed memory.
+//
+// ✔MEASURED — the whole of this row's unexplained intermittency, in one A/B
+// inside a single process, same path, only the binding differing:
+//     path                shipped (reference)   fixed (value)
+//     //wsl.localhost     YES 141/200           YES   0/200
+//     \\wsl.localhost     YES  86/200           YES   0/200
+//     C:\Users            YES 200/200           YES 200/200
+// ⓘ THE DIVERGENCE ABOVE IS MEASURED; THE MECHANISM BELOW IS INFERRED, and the
+// fix does not rest on it. The freed buffer is very likely reused by
+// `directory_iterator`'s own allocation and comes back holding an ENTRY NAME, so
+// the comparison matches on the first entry -- which fits the observed
+// "answers YES immediately". Whatever the allocator actually did, reading freed
+// memory has no defined answer. It fails toward YES,
+// which for the shallowest ancestor of a UNC path collapses `rootPrefixOf`'s
+// boundary to 0, sends `descend` at `root_path()` -- ONE separator, the local
+// drive root -- and reports the header missing.
+//
+// ★★ WHY ONLY UNC PATHS EVER SHOWED IT, which is also why a local control was
+// inert at 15/15 in every arm and could never have caught this. On a drive path
+// EVERY ancestor genuinely IS listed in its parent, so a spurious YES and the
+// true YES agree; the boundary lands one step apart and both splits resolve. A
+// UNC path is the one shape where the correct answer at the shallowest ancestor
+// is NO and a spurious YES changes the verdict.
+[[nodiscard]] bool isListedInItsParent(fs::path const& p) {
+    std::error_code ec;
+    NativeString const want = p.filename().native();
+    if (want.empty()) return false;
+    for (fs::directory_iterator it{p.parent_path(), ec}, end; !ec && it != end;
+         it.increment(ec)) {
+        if (it->path().filename().native() == want) return true;
+    }
+    return false;
+}
+
+[[nodiscard]] fs::path rootPrefixOf(fs::path const& full, fs::path& below) {
+    std::vector<fs::path> chain;   // deepest first
+    for (fs::path q = full; !q.empty() && q != q.parent_path();
+         q = q.parent_path()) {
+        chain.push_back(q);
+    }
+    below.clear();
+    if (chain.empty()) return full.root_path();
+    // The LEADING RUN of ancestors that no listing contains. It stops at the
+    // first ordinary component, so a MISSING header -- whose own last component
+    // is also unlisted -- can never be swallowed into the "root": that component
+    // is at the END of the path, never in the leading run.
+    std::size_t boundary = 0;
+    for (std::size_t shallow = 0; shallow < chain.size(); ++shallow) {
+        if (isListedInItsParent(chain[chain.size() - 1 - shallow])) break;
+        boundary = shallow + 1;
+    }
+    fs::path base = (boundary == 0) ? full.root_path()
+                                    : chain[chain.size() - boundary];
+    // \u26a0 THE GUARD THAT KEEPS A MISSING HEADER MISSING, AND IT IS STRUCTURAL ON
+    // PURPOSE. A path on an unreachable server has NO listed ancestor at all, so
+    // the run would swallow the WHOLE path, leave nothing to verify, and
+    // `descend` would answer "found" for a file nobody can open. If the run
+    // consumed every component it is not a root prefix: fall back to the model's
+    // own `root_path()`, which walks and fails exactly as it did before.
+    //
+    // \u2605\u2605 IT ASKS THE FILESYSTEM NOTHING, AND THAT IS THE POINT. The first
+    // version guarded with `is_directory(base)`, and \u2714MEASURED over 30 compiles
+    // the UNC arms failed 6 times: a cold SMB connection makes a probe on a UNC
+    // ancestor fail transiently, "could not tell" was read as "not a directory",
+    // and the fallback then lost the header. A decision that must be STABLE
+    // cannot rest on a call that fails for reasons that are not about the path.
+    if (boundary >= chain.size()) {
+        base     = full.root_path();
+        boundary = 0;
+    }
+    for (std::size_t shallow = boundary; shallow < chain.size(); ++shallow) {
+        below /= chain[chain.size() - 1 - shallow].filename();
+    }
+    return base;
+}
+
 // Resolve a name that may be absolute or relative-to-`dir`, applying the
 // policy to every component the SOURCE wrote. Directory-list entries
 // (`-I` dirs, systemDirs) are NOT case-checked: they come from the driver and
 // the build config, not from a header name in the program text.
 HeaderSearchResult resolveMaybeAbsolute(fs::path const& rel, fs::path const& dir,
                                         HeaderNameMatching matching) {
-    if (rel.is_absolute()) {
-        return descend(rel.root_path(), rel.relative_path(), matching);
+    if (isRootedPath(rel)) {
+        fs::path below;
+        fs::path const base = rootPrefixOf(rel, below);
+        return descend(base, below, matching);
     }
     return descend(dir, rel, matching);
 }
 
 } // namespace
+
+// [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] -- see the header for the
+// measurement and for why this is exported rather than repeated per tier.
+bool isRootedPath(fs::path const& p) {
+    return p.is_absolute() || p.has_root_directory();
+}
 
 HeaderSearchResult resolveInDir(fs::path const& dir, std::string_view relName,
                                 HeaderNameMatching matching) {
@@ -159,7 +312,9 @@ HeaderSearchResult findInDirs(std::string_view              filename,
                               std::span<fs::path const>     dirs,
                               HeaderNameMatching            matching) {
     fs::path const rel{filename};
-    if (rel.is_absolute()) return resolveMaybeAbsolute(rel, {}, matching);
+    // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: `isRootedPath`, never a
+    // bare `is_absolute()` -- see that predicate for the measurement.
+    if (isRootedPath(rel)) return resolveMaybeAbsolute(rel, {}, matching);
     for (fs::path const& dir : dirs) {
         HeaderSearchResult r = descend(dir, rel, matching);
         // An ambiguity anywhere ends the search: falling through to a later
@@ -194,7 +349,10 @@ HeaderSearchResult resolveIncludePath(std::string_view              filename,
                                       std::span<fs::path const>     includeDirs,
                                       HeaderNameMatching            matching) {
     fs::path const rel{filename};
-    if (rel.is_absolute()) return resolveMaybeAbsolute(rel, {}, matching);
+    // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: a UNC include answers
+    // FALSE to `is_absolute()` on this build and was therefore searched against
+    // the include dirs as though it were a relative name.
+    if (isRootedPath(rel)) return resolveMaybeAbsolute(rel, {}, matching);
     if (!includingDir.empty()) {
         HeaderSearchResult r = descend(includingDir, rel, matching);
         if (r.status != HeaderSearchStatus::NotFound) return r;
@@ -219,7 +377,17 @@ HeaderSearchResult resolveSystemDescriptor(std::string_view          filename,
     // decides whether that name reaches `windows.json`.
     fs::path const requested{filename};
     fs::path const relStem = requested.parent_path() / requested.stem();
-    std::string const descriptorName = relStem.generic_string() + ".json";
+    // ⚠ `core::genericSpelling` AND NOT `relStem.generic_string()`
+    // ([[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]). ✔MEASURED in a live
+    // trace of the quote->angle fallback: `generic_string()` collapses the
+    // leading separator RUN, so the rewritten name for a rooted request came out
+    // as `/server/share/x.json` -- one separator -- and the search that followed
+    // was aimed at the LOCAL DRIVE ROOT. It missed here, but the shape is a
+    // silent WRONG ACCEPT: a same-named descriptor happening to sit under
+    // `C:\server\share\` would have been spliced for a request that named
+    // another machine. The rewrite must stay pure byte slicing (the header says
+    // so) -- it just must not slice the root off.
+    std::string const descriptorName = core::genericSpelling(relStem) + ".json";
     return findInDirs(descriptorName, systemDirs, matching);
 }
 
