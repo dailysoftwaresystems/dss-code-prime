@@ -283,10 +283,28 @@ void writeJson(fs::path const& p, nlohmann::json const& doc) {
         << "the mutation did not reach disk: " << p.generic_string();
 }
 
+// ⚠⚠ COMPARE THE STRING, NOT THE `json` — `json == std::string_view` IS AMBIGUOUS UNDER MSVC.
+// ✔MEASURED 2026-09-02, CI `windows-msvc-release` and reproduced locally with the same cl.exe
+// (19.51.36252): `error C2666: 'basic_json::operator ==': overloaded functions have similar
+// conversions`, because `basic_json::operator==(const basic_json&)` and
+// `std::operator==(string_view, string_view)` are both viable for `(json, string_view)` — the
+// second via a synthesized reversed candidate. It is a HARD ERROR, so the whole TU fails to
+// build and the windows leg dies at ninja rather than at a test.
+// ★ The sibling comparisons in this tree are safe for a reason worth knowing rather than
+// copying blindly: they compare against STRING LITERALS (`== "pe"`), and `const char*` converts
+// to `basic_json` on exactly one side, so no reversed candidate competes. Only a `string_view`
+// operand — which is what `kTimedNames` holds — produces the tie.
+// ⓘ gcc and clang accept the ambiguous form, which is why this shipped in P49 and survived every
+// local gate: the Windows build here is MinGW-w64 g++, and MSVC is exercised in CI only.
 [[nodiscard]] bool isTimedName(nlohmann::json const& row) {
     if (!row.contains("name")) return false;
+    auto const& spelling = row.at("name");
+    // `get_ref` throws on a non-string node, so the type is asked rather than assumed; a
+    // malformed row must answer "not a timed name", never abort the scan.
+    if (!spelling.is_string()) return false;
+    std::string_view const have{spelling.get_ref<std::string const&>()};
     for (auto const n : kTimedNames)
-        if (row.at("name") == n) return true;
+        if (have == n) return true;
     return false;
 }
 
