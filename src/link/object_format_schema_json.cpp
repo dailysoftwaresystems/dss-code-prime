@@ -356,7 +356,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // (absence is "makes no claim", the deleted table's own behaviour for an
     // unlisted target), so the asymmetry applies in its harmless direction.
     // 32 + 1 = 33.
-    static constexpr std::array<std::string_view, 35> kFormatDocumentKeys{
+    static constexpr std::array<std::string_view, 36> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -402,7 +402,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // ROLE → IMAGE table + the roles that name it. A typo in either is a
         // wrong-IMAGE bind, i.e. the eager-import 0xC0000139 class on pe and an
         // undefined symbol elsewhere — never a silent fallback.
-        "runtimeLibraries", "sehPersonality",
+        "runtimeLibraries", "sehPersonality", "atomicsRuntime",
         // stack-reserve capability + its remedy axis
         "stackReserveControl", "stackReserveUnsupportedReason",
         // the weak-DEFINITION spelling (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED).
@@ -1520,8 +1520,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // ── UCRT-P4: `runtimeLibraries` — the ROLE → IMAGE table ─────────────
     //
     // Parsed FIRST among the role-consuming blocks (`processExit`,
-    // `processArgs`, `sehPersonality`, `librarySynthesis` all resolve against
-    // it), so `resolveRuntimeRole` below is available to every one of them.
+    // `processArgs`, `sehPersonality`, `librarySynthesis`, `atomicsRuntime` all
+    // resolve against it), so `resolveRuntimeRole` below is available to every
+    // one of them.
     // Each row is `{"role": <closed enum>, "image": <non-empty string>}`; roles
     // are unique cross-row. An unknown role spelling, the `none` sentinel, a
     // missing/empty image, or a duplicate role all REFUSE the document — the
@@ -1705,6 +1706,76 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 out.mangledName = sp.at("mangledName").get<std::string>();
             }
             if (ok) data.sehPersonality = std::move(out);
+        }
+    }
+
+    // ── D-CSUBSET-PACKED-ATOMIC-MEMBER: `atomicsRuntime` ──────────────────
+    //
+    // `{"role": <runtimeLibraries role>, "loadMangledName": <non-empty>,
+    //   "storeMangledName": <non-empty>}`. All three halves REQUIRED when the
+    // block is present, for the `sehPersonality` reason one level over: a
+    // runtime with no role has no image to import from, and one missing either
+    // entry name can lower only half of `_Atomic` — and the HALF THAT LOWERS
+    // would read as a working fix while the other direction kept faulting,
+    // which is the partial-fix-reads-as-complete shape exactly.
+    //
+    // OPTIONAL as a block. A format that declares none supplies no atomics
+    // runtime; the TARGET's `underAlignedAtomicForm` then decides (refuse under
+    // `traps`, keep the native form under `losesAtomicity`) — see
+    // `ObjectFormatData::atomicsRuntime`.
+    static constexpr std::array<std::string_view, 3>
+        kAtomicsRuntimeKeys{"role", "loadMangledName", "storeMangledName"};
+    DSS_CHECK_KEY_VOCABULARY(kAtomicsRuntimeKeys);
+    if (doc.contains("atomicsRuntime")) {
+        if (!doc.at("atomicsRuntime").is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/atomicsRuntime",
+                      std::format("'atomicsRuntime' must be an object with the "
+                                  "keys {}",
+                                  allowedList(kAtomicsRuntimeKeys, ", ")));
+        } else {
+            auto const& ar = doc.at("atomicsRuntime");
+            rejectUnknownKeys(ar, kAtomicsRuntimeKeys, "/atomicsRuntime",
+                              "the 'atomicsRuntime' block", coll);
+            AtomicsRuntime out;
+            bool ok = resolveRuntimeRole(ar, "/atomicsRuntime", out.libraryPath);
+            if (ok) {
+                out.role = *runtimeLibraryRoleFromName(
+                    ar.at("role").get<std::string>());
+            }
+            // The two entry names, ALREADY MANGLED for this format (Mach-O's
+            // leading underscore is the format's own `cSymbolDecoration`, and
+            // declaring it here rather than re-deriving it in the lowerer is
+            // the `processExit.importMangledName` pattern).
+            struct NameField { char const* key; std::string* out;
+                               char const* what; };
+            NameField const names[2] = {
+                {"loadMangledName",  &out.loadMangledName,
+                 "the GENERIC atomics LOAD entry "
+                 "(elf: \"__atomic_load\", macho: \"___atomic_load\")"},
+                {"storeMangledName", &out.storeMangledName,
+                 "the GENERIC atomics STORE entry "
+                 "(elf: \"__atomic_store\", macho: \"___atomic_store\")"},
+            };
+            for (auto const& n : names) {
+                if (!ar.contains(n.key) || !ar.at(n.key).is_string()
+                 || ar.at(n.key).get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::string{"/atomicsRuntime/"} + n.key,
+                              std::format(
+                                  "requires a non-empty '{}' — {}. ⚠ It must be "
+                                  "the GENERIC, runtime-sized entry, never a "
+                                  "sized `__atomic_load_N`: the sized family "
+                                  "resolves to the INLINE realization and "
+                                  "SIGBUSes on the very access this block "
+                                  "exists to route around "
+                                  "(D-CSUBSET-PACKED-ATOMIC-MEMBER).",
+                                  n.key, n.what));
+                    ok = false;
+                } else {
+                    *n.out = ar.at(n.key).get<std::string>();
+                }
+            }
+            if (ok) data.atomicsRuntime = std::move(out);
         }
     }
 
@@ -2746,10 +2817,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     if (!data.runtimeLibraries.empty()) {
         // Which roles does ANY block name? Gathered from the document, generically
         // — the list of role-NAMING block keys is the only thing enumerated, and it
-        // is the same four the parsers above read.
+        // is the same five the parsers above read.
         std::vector<RuntimeLibraryRole> named;
         for (char const* blockKey : {"processExit", "processArgs",
-                                     "sehPersonality", "librarySynthesis"}) {
+                                     "sehPersonality", "librarySynthesis",
+                                     "atomicsRuntime"}) {
             if (!doc.contains(blockKey) || !doc.at(blockKey).is_object()) continue;
             auto const& blk = doc.at(blockKey);
             if (!blk.contains("role") || !blk.at("role").is_string()) continue;

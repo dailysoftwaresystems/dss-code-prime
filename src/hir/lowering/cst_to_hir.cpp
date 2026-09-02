@@ -1711,7 +1711,8 @@ struct Lowerer {
     [[nodiscard]] LinkageAttr linkageFrom(std::span<NodeId const> roots,
                                           DeclarationRule const& decl,
                                           bool* staticStorageOut = nullptr,
-                                          LinkageAttr seed = {}) {
+                                          LinkageAttr seed = {},
+                                          bool* nonDefiningOut = nullptr) {
         LinkageAttr attr = seed;
         if (roots.empty() || decl.linkageSpecifiers.empty()) return attr;
         // Collect every root's tokens in SOURCE order (the composite-key
@@ -2269,6 +2270,16 @@ struct Lowerer {
                 }
                 if (it->second.staticStorage && staticStorageOut != nullptr)
                     *staticStorageOut = true;
+                // P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): the
+                // NON-DEFINING axis, reported the same way `staticStorage` is —
+                // an out-param rather than a `LinkageAttr` field, because it is
+                // a routing question answered before any node exists, not a
+                // linkage fact any consumer reads off the side-table. It rides
+                // THIS walk (never a second one) so the tier that ROUTES a
+                // declaration to the import lowering and the tier that folds its
+                // linkage read the one vocabulary at the one position.
+                if (it->second.nonDefining && nonDefiningOut != nullptr)
+                    *nonDefiningOut = true;
             } else {
                 // ── [[D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY]] — THE THIRD TIER ──
                 //
@@ -4759,8 +4770,26 @@ struct Lowerer {
                 }
             }
             if (ok) {
-                double const d = decodeFloat(text, numberStyle, ok);
-                if (ok) val.value = d;
+                // ★★ D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION: decode at
+                // the TARGET's mantissa width. `core` above is what the
+                // config-driven ladder resolved through the FORMAT's declared
+                // `longDoubleFormat` axis, so an F80 (64-bit significand) or
+                // F128 (113-bit) literal is parsed from its decimal text
+                // DIRECTLY at that precision and lands in the `WideFloatValue`
+                // pool arm. It used to go through `decodeFloat` → `strtod` → a
+                // host `double`, so the LEAF carried a binary64-rounded value
+                // before any fold: `0.1L` emitted `00 d0 cc cc cc cc cc cc fb 3f`
+                // where gcc 13.3.0 and clang 18.1.3 both emit
+                // `cd cc cc cc cc cc cc cc fb 3f` (✔MEASURED). Every other float
+                // kind keeps the `double` arm and the strtod path unchanged.
+                if (WideFloatValue::isSupportedKind(core)) {
+                    auto wf = decodeFloatWide(text, numberStyle, core, ok);
+                    if (ok && wf.has_value()) val.value = *wf;
+                    else                      ok = false;   // stays loud below
+                } else {
+                    double const d = decodeFloat(text, numberStyle, ok);
+                    if (ok) val.value = d;
+                }
             }
         } else if (std::optional<bool> const bpSigned =
                        (!sem.integerLiteralTyping.empty() && numberStyle != nullptr
@@ -5796,10 +5825,88 @@ struct Lowerer {
     }
 
     // The INDEX epilogue given the ALREADY-lowered `base` and subscript `idxE`.
-    // Shared by `lowerPostfix` and the driver's Postfix frame. Byte-identical to
-    // the prior inline `Index` arm: integer-promote the subscript, derive the
-    // element type, emit makeIndex.
+    // Shared by `lowerPostfix` and the driver's Postfix frame: ASK which operand
+    // is the container, integer-promote the OTHER one, derive the element type,
+    // emit makeIndex with the container first.
+    //
+    // ★★★ D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE. C 6.5.3.2p1 defines
+    // `E1[E2]` as `*((E1)+(E2))` and states its constraint symmetrically, so
+    // `i[p]` / `2[p]` / `e[data]` are exactly as legal as `p[i]` / `p[2]` /
+    // `data[e]`; gcc 13.3.0, clang 18.1.3 and MSVC 19.51 compile and RUN every
+    // spelling (✔MEASURED separately, 2026-09-02). This arm used to derive the
+    // element type from `children[0]` alone, i.e. it ASSUMED the base was the
+    // pointer. The question now goes to the ONE shared law
+    // (`indexContainerOperand` in type_rules.hpp), which the semantic-tier typer
+    // asks too — neither tier owns a private answer.
+    //
+    // ★ THE OPERANDS ARE NORMALIZED, NOT SPECIAL-CASED DOWNSTREAM. The emitted
+    // `Index` node always carries `children[0] = container, children[1] = index`,
+    // so MIR (`combineIndexAddr`), the lvalue path and every later consumer keep
+    // the single invariant they already relied on, and the commuted spelling is
+    // invisible past this point. C leaves the ORDER of evaluation of `E1` and
+    // `E2` unspecified (6.5p3 — there is no sequence point in `[]`), so
+    // presenting them container-first is conforming, not a reordering the
+    // standard notices.
     E combineIndex(NodeId node, E base, E idxE) {
+        // ★★ THE CONSTRAINT, CHECKED WHERE THE SOURCE CONSTRUCT IS STILL KNOWN.
+        // 6.5.3.2p1 wants ONE pointer and ONE integer. Two containers (`p[q]`)
+        // and no container (`a[b]`) both fail it, and neither used to be
+        // reported here: the first ABORTED THE PROCESS inside the type lattice
+        // with no `error[…]` line at all (✔MEASURED at this cycle's base:
+        // `TypeInterner::primitive: TypeKind Ptr is not a LEAF kind`, exit
+        // 0xC0000409), and the second reached the HIR verifier as
+        // `hir node #N (HirKind ordinal 34)` — an internal node ordinal shown to
+        // a user who wrote `a[b]`. gcc and clang both refuse both at the user's
+        // own token ("array subscript is not an integer" / "subscripted value is
+        // neither array nor pointer nor vector").
+        auto const which =
+            indexContainerOperand(interner, base.type, idxE.type);
+        if (which == IndexContainerOperand::Ambiguous
+            || which == IndexContainerOperand::Neither) {
+            // Cascade-suppress: an operand that is already InvalidType is a
+            // DOWNSTREAM effect of a fault reported earlier, so saying anything
+            // here would pile a second complaint onto one defect. The untyped
+            // node still fails loud at the verifier.
+            if (base.type.valid() && idxE.type.valid()) {
+                emitH(DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger,
+                      node,
+                      which == IndexContainerOperand::Ambiguous
+                          ? "both operands of a subscript are pointers or arrays; "
+                            "C 6.5.3.2p1 requires one operand to be a pointer to a "
+                            "complete object type and the OTHER to have integer "
+                            "type (either spelling — `p[i]` and `i[p]` are the "
+                            "same expression)"
+                          : "neither operand of a subscript is a pointer or an "
+                            "array; C 6.5.3.2p1 requires one operand to be a "
+                            "pointer to a complete object type and the OTHER to "
+                            "have integer type (either spelling — `p[i]` and "
+                            "`i[p]` are the same expression)");
+            }
+            // The house Error sentinel, not an untyped `Index`: `HirKind::Error`
+            // carries `HasError`, so the verifier's cascade suppression covers
+            // the whole subtree and the refusal above is the ONLY thing the user
+            // reads.
+            return {errorNode(node), InvalidType};
+        }
+        // Normalize to container-first. `E1[E2]` == `E2[E1]` by 6.5.3.2p1, so
+        // this is the same expression written the other way round — not a
+        // rewrite that needs a Cast or a temporary.
+        if (which == IndexContainerOperand::Subscript) std::swap(base, idxE);
+        // ★★ AND THE OTHER HALF OF THE SAME CONSTRAINT: the operand that is NOT
+        // the container "shall have integer type". Judged only where the lattice
+        // can PROVE it is not one, so the check can never refuse a correct
+        // program (see `isDefinitelyNotIndexInteger`). Without it a float index
+        // travelled all the way to the ASSEMBLER and was refused there as a
+        // register-class mismatch — a machine fact standing in for a source
+        // constraint — and a struct or function-designator index ABORTED THE
+        // PROCESS with no diagnostic at all (✔MEASURED at P53's base).
+        if (isDefinitelyNotIndexInteger(interner, idxE.type)) {
+            emitH(DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger, node,
+                  "the operand of a subscript that is not the pointer must have "
+                  "integer type (C 6.5.3.2p1); gcc 13.3.0 and clang 18.1.3 both "
+                  "refuse this with \"array subscript is not an integer\"");
+            return {errorNode(node), InvalidType};
+        }
         // D-CSUBSET-INDEX-INTEGER-PROMOTION (C 6.3.1.1 / 6.5.2.1): the
         // subscript undergoes INTEGER PROMOTION — a `char`/`short` index
         // promotes to `int` BEFORE the index arithmetic. Without it, a narrow
@@ -5816,9 +5923,12 @@ struct Lowerer {
             if (promoted.valid() && promoted.v != idxE.type.v)
                 idxE = coerce(idxE, promoted);
         }
-        // element-of-base derivation — the SINGLE source shared with the
-        // semantic-tier typer (type_rules.hpp `indexResultType`).
-        TypeId const inferred = indexResultType(interner, base.type);
+        // element-of-container derivation — the SINGLE source shared with the
+        // semantic-tier typer (type_rules.hpp `indexResultType`). Both operand
+        // types go in: after the swap above `base` IS the container, but the law
+        // is asked the same two-operand question at both tiers so neither can
+        // drift into a private "which one is the pointer" answer.
+        TypeId const inferred = indexResultType(interner, base.type, idxE.type);
         TypeId const elemType = typeAtOr(node, inferred);
         // c27 (D-CSUBSET-VOLATILE-POINTEE): indexing a `volatile`-qualified
         // CONTAINER (`volatile T va[]` / a `volatile`-array struct member) yields a
@@ -11243,8 +11353,16 @@ struct Lowerer {
         // The SHARED base: the declaration-specifier prefix, folded once. Each
         // declarator folds its OWN after-declarator run on top of this below, so
         // `int a __attribute__((weak)), b;` weakens `a` alone.
+        //
+        // P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): the SAME fold
+        // also answers "is this declaration non-defining?" — see the route
+        // decision below. Reading it out of this walk is the whole point: the
+        // route is selected by the FOLDED SPECIFIER, not by which rule matched.
+        bool prefixNonDefining = false;
         LinkageAttr const prefixLink =
-            linkageFrom(linkagePrefixRoots(node, decl), decl);
+            linkageFrom(linkagePrefixRoots(node, decl), decl,
+                        /*staticStorageOut=*/nullptr, /*seed=*/{},
+                        &prefixNonDefining);
         // Function iff the kindByChild discriminator matches (the block
         // tail). bodyPath empty ⇒ the matched node IS the body (the
         // declarator-mode convention — params live in the declarator).
@@ -11331,6 +11449,40 @@ struct Lowerer {
                 emitH(DiagnosticCode::S_DeclarationDeclaresNothing, node,
                       std::string{tree().text(node)});
             }
+            return;
+        }
+
+        // ★★★ P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS) — THE
+        // CST→HIR EXTERN ROUTE, SELECTED BY THE FOLDED SPECIFIER RATHER THAN BY
+        // THE RULE'S IDENTITY. This is the reconciliation the merge owes.
+        //
+        // Before P53 a file-scope `extern` declaration was its OWN grammar rule
+        // (`externDecl`), so the dispatcher above picked the import lowering by
+        // hirKind — "which rule matched" and "was `extern` written" were the
+        // same question. C 6.7.1 makes the declaration specifiers an unordered
+        // SET, and two declaration branches on one lead token cannot both
+        // survive a long function body (✔MEASURED, P53 lane `ex`: the parser's
+        // all-fail replay re-parses the declared-LAST structural candidate
+        // non-speculatively, so the alt ORDER decides which reading dies). The
+        // merge is what makes the set unordered; the cost is exactly this line,
+        // and paying it here rather than in a second lowering is what keeps
+        // `externDecl`'s import synthesis alive: the SAME `lowerExternDeclInto`
+        // runs, reading the MERGED row's own roles.
+        //
+        // The three conditions are each load-bearing:
+        //   * `prefixNonDefining` — a `{nonDefining:true}` specifier is present
+        //     (c's `extern`). Config, not a keyword: nothing here names it.
+        //   * `!isFn` — an `extern int f(void){…}` DEFINITION is DEFINING (C
+        //     6.9.1; the body is the definition) and must lower as a real
+        //     Function with external linkage. `isFn` is the row's own
+        //     kindByChild verdict, so the two tiers agree by construction with
+        //     Pass 1's `effectiveKind != Function` suppression.
+        //   * a NAMED declarator — `extern struct S { int a; };` declares only a
+        //     tag (gcc: "useless storage class specifier in empty declaration",
+        //     accepted); it must take the TypeDecl path above, which it does,
+        //     since this test sits AFTER the no-named-declarator arm returns.
+        if (prefixNonDefining && !isFn) {
+            lowerExternDeclInto(node, out);
             return;
         }
 

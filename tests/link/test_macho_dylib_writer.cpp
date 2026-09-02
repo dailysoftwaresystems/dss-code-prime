@@ -1503,9 +1503,25 @@ TEST(MachoImageSymbolNames,
 
         auto target = TargetSchema::loadShipped(port.targetName);
         ASSERT_TRUE(target.has_value()) << label;
-        auto fmt = ObjectFormatSchema::loadShipped(
-            isDylibCell ? port.dylibFormat : port.execFormat);
+        // ★ THE STATIC CELL DRIVES AN *UNSIGNED* COUNTERPART OF THE SHIPPED
+        // exec document — D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM.
+        // `encodeExec` builds no __LINKEDIT and can host no LC_CODE_SIGNATURE,
+        // so `macho::encode` REFUSES a zero-extern module against a format
+        // that requests one. EVERY shipped Darwin exec document requests one,
+        // which would turn this cell into a test of that refusal and delete
+        // every assertion it was written to make. The shared fixture is the
+        // shipped document minus the signature and NOTHING else -- in
+        // particular the arm64 one KEEPS `image.buildVersion`, so the
+        // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION branch below still fires on
+        // that port exactly as it did before, and this file remains the only
+        // place that boundary is pinned by EXECUTION.
+        using FmtLoad = LoadResult<std::shared_ptr<ObjectFormatSchema>>;
+        auto fmt = (arm == ImageArm::StaticExec)
+            ? FmtLoad{dss::macho::test::loadUnsignedExec(port.execFormat)}
+            : ObjectFormatSchema::loadShipped(
+                  isDylibCell ? port.dylibFormat : port.execFormat);
         ASSERT_TRUE(fmt.has_value()) << label;
+        ASSERT_NE(*fmt, nullptr) << label;
 
         AssembledModule mod;
         mod.expectedFuncCount = 3;
@@ -2035,9 +2051,25 @@ TEST(MachoImageSymbolNames,
 
         auto target = TargetSchema::loadShipped(port.targetName);
         ASSERT_TRUE(target.has_value()) << label;
-        auto fmt = ObjectFormatSchema::loadShipped(
-            isDylibCell ? port.dylibFormat : port.execFormat);
+        // ★ THE STATIC CELL DRIVES AN *UNSIGNED* COUNTERPART OF THE SHIPPED
+        // exec document — D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM.
+        // `encodeExec` builds no __LINKEDIT and can host no LC_CODE_SIGNATURE,
+        // so `macho::encode` REFUSES a zero-extern module against a format
+        // that requests one. EVERY shipped Darwin exec document requests one,
+        // which would turn this cell into a test of that refusal and delete
+        // every assertion it was written to make. The shared fixture is the
+        // shipped document minus the signature and NOTHING else -- in
+        // particular the arm64 one KEEPS `image.buildVersion`, so the
+        // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION branch below still fires on
+        // that port exactly as it did before, and this file remains the only
+        // place that boundary is pinned by EXECUTION.
+        using FmtLoad = LoadResult<std::shared_ptr<ObjectFormatSchema>>;
+        auto fmt = (arm == ImageArm::StaticExec)
+            ? FmtLoad{dss::macho::test::loadUnsignedExec(port.execFormat)}
+            : ObjectFormatSchema::loadShipped(
+                  isDylibCell ? port.dylibFormat : port.execFormat);
         ASSERT_TRUE(fmt.has_value()) << label;
+        ASSERT_NE(*fmt, nullptr) << label;
 
         AssembledModule mod;
         mod.expectedFuncCount = 2;
@@ -2351,9 +2383,25 @@ TEST(MachoImageWeakAlias, EveryImageArmRefusesAWeakAliasAndNamesIt) {
 
         auto target = TargetSchema::loadShipped(port.targetName);
         ASSERT_TRUE(target.has_value()) << label;
-        auto fmt = ObjectFormatSchema::loadShipped(
-            isDylibCell ? port.dylibFormat : port.execFormat);
+        // ★ THE STATIC CELL DRIVES AN *UNSIGNED* COUNTERPART OF THE SHIPPED
+        // exec document — D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM.
+        // `encodeExec` builds no __LINKEDIT and can host no LC_CODE_SIGNATURE,
+        // so `macho::encode` REFUSES a zero-extern module against a format
+        // that requests one. EVERY shipped Darwin exec document requests one,
+        // which would turn this cell into a test of that refusal and delete
+        // every assertion it was written to make. The shared fixture is the
+        // shipped document minus the signature and NOTHING else -- in
+        // particular the arm64 one KEEPS `image.buildVersion`, so the
+        // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION branch below still fires on
+        // that port exactly as it did before, and this file remains the only
+        // place that boundary is pinned by EXECUTION.
+        using FmtLoad = LoadResult<std::shared_ptr<ObjectFormatSchema>>;
+        auto fmt = (arm == ImageArm::StaticExec)
+            ? FmtLoad{dss::macho::test::loadUnsignedExec(port.execFormat)}
+            : ObjectFormatSchema::loadShipped(
+                  isDylibCell ? port.dylibFormat : port.execFormat);
         ASSERT_TRUE(fmt.has_value()) << label;
+        ASSERT_NE(*fmt, nullptr) << label;
 
         AssembledModule mod;
         mod.expectedFuncCount = 1;

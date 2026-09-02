@@ -1,0 +1,35 @@
+{
+  "$comment": "D-CSUBSET-PACKED-BITFIELD-INTERACTION: a `packed` aggregate carrying BIT-FIELDS compiles, lays out to the references' bytes, and RUNS. DSS refused this program outright until this cycle — the semantic front door `S_PackedBitfieldUnsupported` (now RETIRED) plus a `packed && anyBitfield -> nullopt` belt in computeLayout's struct AND union arms — while all four reference toolchains accept it: gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 via `__attribute__((packed))`, and cl.exe 19.51 via `#pragma pack(1)` (its only spelling). All four were COMPILED AND RUN and all four exit 42. `#pragma pack(1)` has taken this same code path since TF-C97 and the two spellings are MEASURED byte-identical, which is why lifting the refusal was a deletion rather than a new packing algorithm. exit = sizeof(4) + _Alignof(1) + runtime stride(4) + ver(5) + ihl(6) + flags(3) + ttl(17) + neighbours-intact(2) = 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "$targetGating": "ALL FOUR targets, deliberately — and that is a property of the SHAPE, not an oversight about strategy divergence. `packed` + bit-fields is normally exactly where gnu_packed and msvc_straddle disagree (examples/c/packed_bitfield_align is GNU-only for that reason). Here every bit-field's declared type is `unsigned char`, so its allocation unit is ONE byte under both strategies, and no field straddles its unit — so both land on the identical 4/1 layout. Verified by execution on both sides: gcc/clang give 42 with SysV bit-fields, cl.exe and mingw-w64 gcc give 42 with MS bit-fields.",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

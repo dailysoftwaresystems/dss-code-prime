@@ -8195,3 +8195,261 @@ TEST(MirToLir, Int128MemoryAccessFailsLoud) {
            "32-bit-ALU-forms message shares the same DiagnosticCode, so an "
            "error-count assertion alone would not be red-on-disable";
 }
+
+// ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the UNDER-ALIGNED `_Atomic` arm ────────
+//
+// ★★ THESE ARE THE PINS THAT ARE VISIBLE ON EVERY HOST, and that matters more
+// here than anywhere else in this file. The DEFECT — an `_Atomic int` at byte
+// offset 1 of a packed struct emitting the inline `stlr`/`ldar` pair — is a
+// `rc 135, Bus error` on NATIVE aarch64 and exits 42 everywhere DSS's gate
+// actually runs: qemu-user does not enforce the LDAR/STLR alignment check, and
+// x86-64 tolerates the misaligned access outright. So the RUNTIME witness lives
+// off-corpus on real hardware, and what is pinned HERE is the EMITTED FORM,
+// which every leg can see.
+//
+// Each pin carries its own CONTROL — the naturally-aligned access of the same
+// type, which must keep the native instruction. Without it a "fix" that routed
+// EVERY `_Atomic` access through the runtime would pass every fault test.
+namespace {
+
+// The lvalue's provable alignment travels on `payload2` (hir_to_mir's
+// `atomicAlignPayload`). 1 = the packed-member case, 4 = naturally aligned.
+[[nodiscard]] Mir buildAtomicLoadFnMirAligned(std::uint32_t provableAlign,
+                                              TypeInterner& interner) {
+    TypeId const i32  = interner.primitive(TypeKind::I32);
+    TypeId const i32p = interner.pointer(i32);
+    TypeId const params[] = {i32p};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const ptr = mb.addArg(0, i32p);
+    MirInstId const loadOps[] = {ptr};
+    MirInstId const v = mb.addInst(MirOpcode::AtomicLoad, loadOps, i32,
+                                   /*payload=*/5, MirInstFlags::None,
+                                   provableAlign);
+    mb.addReturn(v);
+    return std::move(mb).finish();
+}
+
+[[nodiscard]] Mir buildAtomicStoreFnMirAligned(std::uint32_t provableAlign,
+                                               TypeInterner& interner) {
+    TypeId const i32  = interner.primitive(TypeKind::I32);
+    TypeId const i32p = interner.pointer(i32);
+    TypeId const params[] = {i32p, i32};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const ptr = mb.addArg(0, i32p);
+    MirInstId const val = mb.addArg(1, i32);
+    MirInstId const storeOps[] = {val, ptr};
+    (void)mb.addInst(MirOpcode::AtomicStore, storeOps, InvalidType,
+                     /*payload=*/5, MirInstFlags::None, provableAlign);
+    mb.addReturn(val);
+    return std::move(mb).finish();
+}
+
+// The elf spelling of the two GENERIC entries + the image that owns them, as
+// `elf64-aarch64-linux-exec.format.json` declares them.
+[[nodiscard]] dss::AtomicsRuntime elfAtomicsRuntime() {
+    dss::AtomicsRuntime ar;
+    ar.role             = dss::RuntimeLibraryRole::AtomicsRuntime;
+    ar.libraryPath      = "libatomic.so.1";
+    ar.loadMangledName  = "__atomic_load";
+    ar.storeMangledName = "__atomic_store";
+    return ar;
+}
+
+}  // namespace
+
+TEST(MirToLirPackedAtomic, UnderAlignedStoreCallsTheAtomicsRuntimeNotStlr) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ASSERT_EQ((*target)->underAlignedAtomicForm(),
+              dss::UnderAlignedAtomicForm::Traps)
+        << "arm64 must declare `atomics.underAlignedNativeForm: traps` — its "
+           "inline STLR/LDAR pair is a MEASURED rc 135 SIGBUS on real hardware";
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, elfAtomicsRuntime());
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0)
+        << "RED-ON-DISABLE: an UNDER-ALIGNED atomic store must NOT emit the "
+           "native STLR — that instruction faults on this access.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 1)
+        << "it must be one call to the format's generic atomics entry.";
+    bool bound = false;
+    for (auto const& e : lirR.externImports) {
+        if (e.mangledName == "__atomic_store") {
+            bound = true;
+            EXPECT_EQ(e.libraryPath, "libatomic.so.1")
+                << "the minted import must bind the image the FORMAT declared, "
+                   "never a literal in the lowerer";
+            EXPECT_TRUE(e.version.empty())
+                << "unversioned, so the image DEFAULT version binds "
+                   "(MEASURED: the entries export @@LIBATOMIC_1.0)";
+            EXPECT_FALSE(e.isData);
+        }
+    }
+    EXPECT_TRUE(bound) << "the lowerer must MINT the `__atomic_store` import";
+}
+
+TEST(MirToLirPackedAtomic, NaturallyAlignedStoreKeepsTheNativeStlr) {
+    // THE CONTROL. Same target, same runtime declared, same opcode — only the
+    // provable alignment differs. A fix that routed every `_Atomic` access
+    // through the runtime would pass the sibling above and red here.
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/4, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, elfAtomicsRuntime());
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 1)
+        << "a naturally-aligned atomic store keeps the native STLR.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 0)
+        << "RED-ON-DISABLE: it must NOT pay for a libcall it does not need.";
+    EXPECT_TRUE(lirR.externImports.empty())
+        << "no atomics import may be minted for an aligned access.";
+}
+
+TEST(MirToLirPackedAtomic, UnderAlignedLoadCallsTheAtomicsRuntimeNotLdar) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicLoadFnMirAligned(/*provableAlign=*/1, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, elfAtomicsRuntime());
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load_acquire"), 0)
+        << "RED-ON-DISABLE: an UNDER-ALIGNED atomic load must NOT emit LDAR.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 1);
+    bool bound = false;
+    for (auto const& e : lirR.externImports) {
+        if (e.mangledName == "__atomic_load") bound = true;
+    }
+    EXPECT_TRUE(bound) << "the lowerer must MINT the `__atomic_load` import";
+}
+
+TEST(MirToLirPackedAtomic, NaturallyAlignedLoadKeepsTheNativeLdar) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicLoadFnMirAligned(/*provableAlign=*/4, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, elfAtomicsRuntime());
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load_acquire"), 1);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 0);
+}
+
+TEST(MirToLirPackedAtomic, UnknownAlignmentKeepsTheNativeFormByteForByte) {
+    // `payload2 == 0` is the "could not derive an alignment" sentinel. It must
+    // read as ALIGNED, so a producer that never learned to stamp leaves output
+    // byte-identical to before this arm existed rather than silently changing
+    // every atomic in the program.
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/0, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, elfAtomicsRuntime());
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 1);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 0);
+}
+
+TEST(MirToLirPackedAtomic, TrapsTargetWithNoAtomicsRuntimeRefusesLoud) {
+    // The native form here is a CERTAIN fault, so emitting it is a silent
+    // miscompile. No runtime declared ⇒ REFUSE, naming the config key.
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, std::nullopt);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "RED-ON-DISABLE: a `traps` target with no atomics runtime must "
+           "refuse the access, never emit an instruction known to fault.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0)
+        << "and it must not emit the faulting form on the way out.";
+}
+
+TEST(MirToLirPackedAtomic,
+     LosesAtomicityTargetWithNoRuntimeKeepsTheNativeFormRatherThanRefusing) {
+    // ⚠⚠ THIS IS THE pe64 ARM AND IT IS THE ONE THE FIRST CUT GOT WRONG.
+    // ✔MEASURED while building P53 lane a3: with a single "no runtime ⇒ refuse"
+    // rule, `dsscp --target x86_64:pe64-x86_64-windows-exec` REJECTED a packed
+    // `_Atomic` member — a construct mingw-w64 gcc accepts and whose emitted
+    // `xchgl`/`movl` pair RUNS rc 42 on Windows. Refusing it is BELOW the
+    // (gcc ∪ clang ∪ MSVC) ∪ ISO C union, i.e. a new conformance defect
+    // manufactured by the fix for another one. UCRT exports no `__atomic_*`
+    // symbol and there is no PE atomics image to name, so this is not a
+    // hypothetical arm — it is every Windows build.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ASSERT_EQ((*target)->underAlignedAtomicForm(),
+              dss::UnderAlignedAtomicForm::LosesAtomicity);
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::IndirectSlot, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, std::nullopt);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "RED-ON-DISABLE: refusing here would put DSS below the reference "
+           "union on the one shipped format with no atomics image.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 1)
+        << "the native xchg stands — it is what gcc emits, and it runs.";
+}
+
+TEST(MirToLirPackedAtomic, LosesAtomicityTargetWithARuntimeStillTakesTheLibcall) {
+    // The other half of the same rule: where an image DOES exist (elf64/macho64
+    // on x86_64), the ruling is to use it — clang emits `callq __atomic_store@PLT`
+    // for this lvalue on x86-64 too, and gcc's paired plain `movl` is not
+    // architecturally atomic across a cache line.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, elfAtomicsRuntime());
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 1);
+}

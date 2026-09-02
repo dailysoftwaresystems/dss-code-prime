@@ -668,6 +668,87 @@ rewriteOneFunc(Lir const&               src,
                 }
             }
 
+            // ── THE COALESCED COPY IS NOT EMITTED AT ALL ────────────────────
+            //
+            // ★★★ D-LIR-COPY-COALESCING-ASKS-THE-REGISTERS-WIDTH-NOT-THE-VALUES.
+            // `lir_regalloc.hpp` states the contract as *"the copy is removed
+            // AT ITS SOURCE — the allocator stops creating the difference"*,
+            // and until this arm that sentence was aspirational: the allocator
+            // handed both ends one register and then EMITTED `mov p,p` anyway,
+            // leaving `lir_peephole`'s R1 to recognize it afterwards. R1 can
+            // only delete a copy it can prove is a no-op OF THE REGISTER, so a
+            // copy NARROWER than the physical register survived — every FP copy
+            // on both shipped targets, because an FPR class move carries the
+            // width-default flags (64) while `xmm`/`v` are 16 bytes.
+            // ✔MEASURED at HEAD over `examples/c/**`: TEN identity `fmov` and
+            // TEN identity `movaps` reached the emitted stream of ONE probe
+            // function while all fifteen identity `mov`s were deleted.
+            //
+            // ★★ TWO HALVES, AND NEITHER ALONE IS ENOUGH. **The PROOF** comes
+            // from the allocation (`coalescedCopyInsts`): the coalescer bounded
+            // every stated access to both ends by this copy's own width, so no
+            // reader observes a bit the copy did not transfer. **The OUTCOME**
+            // is re-checked HERE on the mapped registers: the two ends actually
+            // landed on one physical register. ⚠ THE PROOF IS NOT OPTIONAL AND
+            // THE OUTCOME IS NOT SUFFICIENT — two abutting vregs can share a
+            // register by the scan's coincidence with no proof at all, and
+            // dropping a copy there is a WRONG ANSWER whenever something reads
+            // the value wider than the copy (AArch64's `FMOV Dd,Dn` zeroes bits
+            // 127:64, so a following 128-bit access would see the source's old
+            // top half instead of zero).
+            //
+            // ★ WHY THE PROOF CANNOT BE RE-DERIVED DOWNSTREAM. It is a fact
+            // about VIRTUAL registers, and this is the last pass that has any.
+            // That is also why `lir_peephole`'s R1 must KEEP its own, stricter
+            // register-width test: an inline-asm template can write
+            // `movl %eax,%eax` between two AUTHOR-PINNED physical registers,
+            // where the zeroing of the upper half is the point of the
+            // instruction rather than an artifact of it. Such an instruction
+            // never reaches this arm — its ends were never virtual, so the
+            // coalescer never saw a copy to prove anything about.
+            //
+            // ⚠ EVERY OTHER GUARD BELOW IS LOAD-BEARING TOO.
+            // `loads`/`pendingStore` empty: a spilled end means the value is not
+            // in a register at all and the reload/store around it is the real
+            // transfer. `classExhausted`: the operand mapping failed, so
+            // `newOps` is not the finished instruction. The constraint-handle
+            // test keeps the only namer of a side-structure entry alive
+            // (`L_SideStructureReferenceLost`).
+            //
+            // ⚠⚠ AND THE SHAPE TESTS ARE **NOT** REDUNDANT WITH THE MEMBERSHIP
+            // TEST EVEN THOUGH THE COALESCER ALREADY MADE EVERY ONE OF THEM.
+            // `coalescedCopyInsts` holds raw `LirInstId.v`s, which name
+            // instructions only in the module the allocation was computed over
+            // — the same hazard `originalSymbol` exists for one level up. A
+            // caller that hands this pass a DIFFERENT module would have every
+            // id resolve to some unrelated instruction and silently delete it;
+            // re-deriving the shape from THIS module's instruction turns that
+            // into a no-op instead of a deletion.
+            if (!classExhausted && loads.empty() && !pendingStore.has_value()
+                && std::binary_search(alloc.coalescedCopyInsts.begin(),
+                                      alloc.coalescedCopyInsts.end(), inst.v)
+                && info != nullptr && !info->isTerminator()
+                && !info->hasSideEffects
+                && !info->implicitRegisters.has_value()
+                && src.instRegConstraintHandle(inst) == kLirNoRegConstraints
+                && ops.size() == 1 && newOps.size() == 1
+                && ops[0].kind == LirOperandKind::Reg && ops[0].reg.valid()
+                && ops[0].reg.isPhysical == 0
+                && srcResult.valid() && srcResult.isPhysical == 0
+                && srcResult.regClass() == ops[0].reg.regClass()
+                && newOps[0].kind == LirOperandKind::Reg
+                && newOps[0].reg.valid() && newOps[0].reg.isPhysical != 0
+                && newResult.valid() && newResult.isPhysical != 0
+                && newOps[0].reg == newResult) {
+                auto const movOpcode = schema.regClassOpOpcode(
+                    static_cast<TargetRegClass>(
+                        static_cast<std::size_t>(srcResult.regClass())),
+                    RegClassOp::Move);
+                if (movOpcode.has_value() && op == *movOpcode) {
+                    continue;  // the difference was never created
+                }
+            }
+
             // D-LIR-PER-INST-REG-CONSTRAINTS: carry the source instruction's
             // per-instruction side data onto the instruction emitted HERE.
             //
@@ -807,13 +888,32 @@ static void dumpRewrittenFuncsIfRequestedImpl(Lir const&          lir,
 }
 
 // Stage-labelled wrapper so the pipeline can dump at any post-regalloc point.
+//
+// ★★ THE STAGE LINE CARRIES A CENSUS, AND THE CENSUS IS THE INSTRUMENT
+// (D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT). The
+// per-function body below is filtered by `DSS_DUMP_LIR_MIN_INSTS` and prints
+// MNEMONICS — which carry neither the operation width nor the register class,
+// the two things `lir_peephole` R1's verdict turns on. Counting the string
+// "mov" across that dump therefore answers an ADJACENT question, and a
+// stage-to-stage claim built on it cannot be checked. `icm=` is the whole
+// module, unfiltered, computed by the SAME predicate R1 acts on: the identity
+// class-move population, then R1's verdict for each member. Subtract two stage
+// lines and you have that pass's contribution, per bucket.
 void dumpLirFuncs(Lir const& lir, TargetSchema const& schema, char const* stage) {
     if (std::getenv("DSS_DUMP_LIR_MIN_INSTS") == nullptr) return;
     char const* const path = std::getenv("DSS_DUMP_LIR_FILE");
     if (std::FILE* const f =
             std::fopen(path != nullptr ? path : "dss_lir_dump.txt", "a")) {
-        std::fprintf(f, "########## STAGE %s ##########\n",
-                     stage != nullptr ? stage : "?");
+        auto const c = lir_pass_util::censusIdentityClassMoves(lir, schema);
+        std::fprintf(f,
+                     "########## STAGE %s ##########"
+                     " self=%zu icm=%zu del=%zu narrow=%zu sfx=%zu nowidth=%zu"
+                     " pinned=%zu\n",
+                     stage != nullptr ? stage : "?",
+                     c.selfReferentialSingleOperand, c.population, c.deletable,
+                     c.refusedNarrowerThanRegister, c.refusedSideEffects,
+                     c.refusedUndeclaredRegisterWidth,
+                     c.refusedNamesConstraintPoolEntry);
         std::fclose(f);
     }
     dumpRewrittenFuncsIfRequestedImpl(lir, schema);

@@ -901,6 +901,21 @@ struct Lowerer {
     std::optional<std::string>              wideFloatSoftcallLibrary_;
     std::vector<ExternImport>               newWideFloatExterns_;
     std::unordered_map<std::string, SymbolId> softcallExternByHelper_;
+
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: the ACTIVE object format's atomics
+    // runtime — image + the two ALREADY-MANGLED generic entry names — captured
+    // from `ObjectFormatSchema::atomicsRuntime()` one level up, exactly like
+    // `wideFloatSoftcallLibrary_` above. std::nullopt = the format supplies
+    // none; the TARGET's `underAlignedAtomicForm` then decides whether that is
+    // a refusal (`traps`) or the native form standing (`losesAtomicity`).
+    // ★ THE MINTED IMPORTS RIDE `newWideFloatExterns_` AND
+    // `softcallExternByHelper_` DELIBERATELY, rather than getting a second
+    // pair: those two are not F128-specific machinery, they are "the extern
+    // imports THIS LOWERER minted" and "dedup them by mangled name within the
+    // CU", and a second copy would be a second answer to one question — the
+    // shape [[feedback-a-partial-fix-reads-as-a-complete-one]] warns about, one
+    // tier down.
+    std::optional<AtomicsRuntime>           atomicsRuntime_;
     // Caller-supplied extern imports keyed by mangled name — so a minted
     // softcall REUSES a user import of the same helper instead of minting a
     // duplicate (which would be a link-time "declared more than once"). Built
@@ -1142,11 +1157,13 @@ struct Lowerer {
             std::optional<TlsAccessInfo> tlsAccess,
             std::span<MirSehScope const> sehScopes,
             std::optional<std::string> wideFloatSoftcallLibrary,
-            std::optional<bool> charIsUnsigned)
+            std::optional<bool> charIsUnsigned,
+            std::optional<AtomicsRuntime> atomicsRuntime)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
           wideFloatSoftcallLibrary_(std::move(wideFloatSoftcallLibrary)),
+          atomicsRuntime_(std::move(atomicsRuntime)),
           dataImportBinding_(dataImportBinding),
           externAddrBinding_(externAddrBinding),
           tlsAccess_(tlsAccess), sehScopesIn_(sehScopes),
@@ -7468,6 +7485,40 @@ struct Lowerer {
     // without an extra mov. (A stray ByValueStackArg whose result is consumed by
     // anything OTHER than a Call's by-value-stack arm would simply read the address,
     // which is harmless — but no such source path exists.)
+    // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the OWN byte alignment of the datum
+    // a `ByValueStackArg` carrier carries, for the `ByValueStackAgg` marker. 0 means
+    // NOT STATED, and the overflow cursor floors an unstated alignment at the slot —
+    // i.e. the classic flat stride, byte-for-byte.
+    //
+    // `carrierPtrTy` is the carrier's MIR type, which is `pointer(datum)` at every
+    // producer (`appendByValueStackArg` and the F80 scalar arm of
+    // `finishScalarCallArg`), so the datum's kind is one operand away.
+    //
+    // ★ WHY A SCALAR CAN BE ANSWERED HERE AND AN AGGREGATE CANNOT. A scalar's
+    // alignment is the config's bounded-natural rule — `min(size, maxAlignment)`,
+    // both read from `aggregateLayout`, no arch branch — and the size is the payload
+    // this marker already carries. An aggregate's alignment is a LAYOUT result
+    // (max over its members, raised by an `alignas`), and this tier deliberately has
+    // no layout engine: the carrier exists precisely because the LIR tier cannot
+    // compute layouts. So an aggregate states NOTHING and gets the slot.
+    //
+    // ⚠ THAT SILENCE IS SAFE ONLY WHILE AN OVER-ALIGNED AGGREGATE CANNOT REACH HERE,
+    // and it cannot: an aggregate's alignment exceeds the 8-byte slot only if it has
+    // a `long double` / `_BitInt(128)` / `alignas(16)` member, and a long-double-leaf
+    // aggregate is walled loud upstream (D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI). The
+    // day that wall lifts, the alignment must be stated at the MIR tier rather than
+    // re-derived here — the marker already has the byte for it.
+    [[nodiscard]] std::uint8_t byValueCarrierAlignment(TypeId carrierPtrTy,
+                                                       std::uint32_t bytes) const {
+        if (!carrierPtrTy.valid()) return 0;
+        auto const ptrOps = interner.operands(carrierPtrTy);
+        if (ptrOps.empty()) return 0;
+        if (!isPrimitiveTypeKind(interner.kind(ptrOps[0]))) return 0;
+        std::uint32_t const a =
+            naturalScalarAlignment(bytes, target.aggregateLayout());
+        return a > 0xFFu ? std::uint8_t{0} : static_cast<std::uint8_t>(a);
+    }
+
     void lowerByValueStackArg(MirInstId id) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 1) {
@@ -7742,10 +7793,18 @@ struct Lowerer {
                 // into the outgoing area instead of register-passing it, AND clamps
                 // the exhausted arg-cursor (AAPCS64) so a later same-class arg stacks.
                 std::uint32_t const bvPayload = mir.instPayload(operandMir);
+                std::uint32_t const bvBytes =
+                    bvPayload & kByValueStackArgSizeMask;
                 ops.push_back(LirOperand::makeByValueStackAgg(
-                    bvPayload & kByValueStackArgSizeMask,
+                    bvBytes,
                     static_cast<std::uint8_t>(
-                        (bvPayload >> kByValueStackArgExhaustShift) & 0x3u)));
+                        (bvPayload >> kByValueStackArgExhaustShift) & 0x3u),
+                    // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: state the carried
+                    // datum's OWN alignment so the overflow cursor can honour the
+                    // boundary the CC declares. Derived from the carrier's own MIR
+                    // type, which is `pointer(datum)` — this is the last tier that
+                    // still has it.
+                    byValueCarrierAlignment(mir.instType(operandMir), bvBytes)));
             } else if (ak == TypeKind::F32 || ak == TypeKind::F64) {
                 // A non-F128 FPR arg consumes an NSRN slot too — the SAME cursor
                 // the F128 arm above takes from, because with the SIMD&FP file
@@ -9806,6 +9865,332 @@ struct Lowerer {
                 mirOpcodeName(op), id.v, target.name()));
     }
 
+    // ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the UNDER-ALIGNED atomic arm ───────
+    //
+    // ★★ THE WHOLE DEFECT IN ONE SENTENCE: a `_Atomic int` at byte offset 1 of
+    // a `__attribute__((packed))` struct compiled with NO diagnostic and emitted
+    // the inline `stlr w16,[x15]` / `ldar w15,[x15]` pair, which is ✔MEASURED
+    // `rc 135, Bus error (core dumped)` on a NATIVE arm64 VPS. ⚠⚠ THE SAME
+    // BYTES EXIT 42 UNDER qemu-aarch64, because qemu-user does not enforce the
+    // LDAR/STLR alignment check — three of the four gate legs are structurally
+    // incapable of seeing this class, so no future cycle may read a green
+    // emulated run as safety here ([[feedback_the_blindness_of_the_instrument_2026_08_21]]).
+    //
+    // TWO DECLARATIONS DECIDE, AND NEITHER IS AN ARCH NAME:
+    //   * the TARGET's `underAlignedAtomicForm` — what the native inline form
+    //     DOES under-aligned (arm64 `traps`, x86_64 `losesAtomicity`);
+    //   * the FORMAT's `atomicsRuntime` block — which image owns the GENERIC
+    //     `__atomic_load`/`__atomic_store` entries and how they are spelled
+    //     there (Mach-O's leading underscore is the format's own decoration).
+    //
+    // ⓘ WHY THE GENERIC ENTRIES AND NOT THE SIZED `__atomic_load_4`: ✔MEASURED
+    // on the VPS — the sized family are IFUNCs that resolve to the inline
+    // realization and SIGBUS on the very access this arm exists to survive;
+    // only the generic, runtime-sized entries dispatch through libatomic's lock
+    // table. rc 42 against rc 135, over the same lvalue.
+
+    // Is this atomic access provably under-aligned for its width? `payload2`
+    // carries the lvalue's provable alignment, stamped by HIR→MIR's
+    // `atomicAlignPayload` (0 = "could not derive one" → treated as aligned,
+    // which is byte-for-byte today's output and never a NEW refusal).
+    // The natural byte size of the atomic's own MIR POINTER operand — the
+    // address width every one of the call's three pointer-class arguments takes.
+    // Read off a real MIR type rather than assumed, exactly as `lowerCall`
+    // states each argument's natural size from its operand's type.
+    [[nodiscard]] std::uint8_t atomicPointerArgBytes(MirInstId ptrOperand) const {
+        return static_cast<std::uint8_t>(
+            lirInstWidthBits(memAccessWidthFlags(mir.instType(ptrOperand),
+                                                 LirRegClass::GPR)) / 8u);
+    }
+
+    [[nodiscard]] bool atomicAccessIsUnderAligned(MirInstId id,
+                                                  std::uint8_t widthFlags) const {
+        std::uint32_t const provable = mir.instPayload2(id);
+        if (provable == 0) return false;
+        return provable < (lirInstWidthBits(widthFlags) / 8u);
+    }
+
+    // What this access should be lowered as. THREE outcomes, not two, and the
+    // third is the one a boolean could not express — see `UnderAlignedAtomicForm`.
+    enum class AtomicLowering : std::uint8_t {
+        Native,          // the inline LDAR/STLR (or XCHG) pair — today's output
+        RuntimeCall,     // the format's generic __atomic_load / __atomic_store
+        RefuseNoRuntime, // the native form is a CERTAIN fault and no runtime exists
+    };
+
+    // ⚠⚠ THE `LosesAtomicity` + NO-RUNTIME ARM IS THE ONE THAT MUST NOT REFUSE,
+    // AND THE FIRST CUT OF THIS FUNCTION DID. ✔MEASURED while building this
+    // lane: with a single "no runtime ⇒ refuse" rule, `dsscp --target
+    // x86_64:pe64-x86_64-windows-exec` REJECTED a packed `_Atomic` member —
+    // a construct mingw-w64 gcc accepts and whose emitted `xchgl`/`movl` pair
+    // ✔RUNS rc 42 on Windows. That is below the (gcc ∪ clang ∪ MSVC) ∪ ISO C
+    // union, i.e. a NEW conformance defect manufactured by the fix for another
+    // one. pe64 is the only shipped format with no atomics-runtime image (UCRT
+    // exports no `__atomic_*` symbol and there is nothing to name), so this arm
+    // is not hypothetical — it is Windows.
+    //
+    // The asymmetry is a property of the two answers, not a tuning: under
+    // `traps` the native form is a MEASURED rc 135 SIGBUS, so emitting it is a
+    // silent miscompile and refusing loud is the only honest outcome; under
+    // `losesAtomicity` it is exactly what gcc ships and it works.
+    [[nodiscard]] AtomicLowering
+    atomicLoweringFor(MirInstId id, std::uint8_t widthFlags) const {
+        if (!atomicAccessIsUnderAligned(id, widthFlags)) {
+            return AtomicLowering::Native;
+        }
+        switch (target.underAlignedAtomicForm()) {
+            case UnderAlignedAtomicForm::RemainsAtomic:
+            case UnderAlignedAtomicForm::None:
+                return AtomicLowering::Native;
+            case UnderAlignedAtomicForm::Traps:
+                return atomicsRuntime_.has_value()
+                    ? AtomicLowering::RuntimeCall
+                    : AtomicLowering::RefuseNoRuntime;
+            case UnderAlignedAtomicForm::LosesAtomicity:
+                return atomicsRuntime_.has_value()
+                    ? AtomicLowering::RuntimeCall
+                    : AtomicLowering::Native;
+        }
+        return AtomicLowering::Native;
+    }
+
+    // Resolve (or MINT) the extern import for one of the two generic atomics
+    // entry points. The `resolveWideFloatSoftcallExtern` shape exactly — reuse
+    // an existing user import of the same mangled name, draw the SymbolId from
+    // the shared monotone sequence, bind the config-sourced library, leave
+    // `version` EMPTY so the image's DEFAULT version binds (✔MEASURED: the
+    // entries are exported `@@LIBATOMIC_1.0`, i.e. default-versioned), and
+    // re-assert the extern-call dispatch gate. nullopt = fail-loud, reported.
+    [[nodiscard]] std::optional<SymbolId>
+    resolveAtomicsRuntimeExtern(std::string const& mangledName,
+                                std::string_view context) {
+        if (auto it = softcallExternByHelper_.find(mangledName);
+            it != softcallExternByHelper_.end()) {
+            return it->second;
+        }
+        if (auto it = suppliedExternByName_.find(mangledName);
+            it != suppliedExternByName_.end()) {
+            softcallExternByHelper_.emplace(mangledName, it->second);
+            return it->second;
+        }
+        if (!externCallDispatch_.has_value()) {
+            dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "{}: the under-aligned _Atomic access must call '{}' but "
+                    "the active object format declares no `externCallDispatch` "
+                    "shape — the call site would have no defined form. Declare "
+                    "it in the format's `.format.json` "
+                    "(D-FFI-EXTERN-CALL-DISPATCH).",
+                    context, mangledName));
+            return std::nullopt;
+        }
+        MnemonicSlot const needSlot =
+            externCallUsesIndirectShape(*externCallDispatch_)
+                ? MnemonicSlot::CallIndirectViaExtern
+                : MnemonicSlot::Call;
+        if (!opcode(needSlot).has_value()) {
+            reportMissingOpcode(needSlot, "under-aligned _Atomic access "
+                                          "(atomics-runtime call)");
+            return std::nullopt;
+        }
+        SymbolId const sym = mintJumpTableSymbol();
+        ExternImport imp;
+        imp.symbol      = sym;
+        imp.mangledName = mangledName;
+        imp.libraryPath = atomicsRuntime_->libraryPath;
+        imp.isData      = false;
+        imp.version     = "";   // unversioned → binds the default @@LIBATOMIC_1.0
+        externSymbols.insert(sym.v);
+        newWideFloatExterns_.push_back(std::move(imp));
+        softcallExternByHelper_.emplace(mangledName, sym);
+        return sym;
+    }
+
+    // The format supplies no atomics runtime and the target says the native
+    // form is not usable. Under `traps` that is a REFUSAL, never a quiet
+    // emission: the instruction pair we would otherwise emit is a certain
+    // SIGBUS, and shipping one is the silent-miscompile class the bar forbids.
+    // Under `losesAtomicity` the caller does not reach here — the native form
+    // is what gcc itself ships there, it works, and refusing would put DSS
+    // below the (gcc ∪ clang ∪ MSVC) ∪ ISO C union on pe64, the one shipped
+    // format with no atomics image.
+    void reportMissingAtomicsRuntime(MirOpcode op, MirInstId id) {
+        dss::report(reporter,
+            DiagnosticCode::L_UnsupportedLoweringForOpcode,
+            DiagnosticSeverity::Error,
+            std::format(
+                "MIR {} (inst {}): this _Atomic access is provably under-"
+                "aligned ({} byte(s)) and target '{}' declares "
+                "`atomics.underAlignedNativeForm: {}` — its native inline "
+                "atomic instructions FAULT on such an access (MEASURED rc 135, "
+                "Bus error, on native aarch64) — but the active object format "
+                "declares no `atomicsRuntime` block, so there is "
+                "no generic `__atomic_load`/`__atomic_store` entry to call. "
+                "Emitting the native form here would be a guaranteed runtime "
+                "fault with no diagnostic. Declare an `atomicsRuntime` role + "
+                "block in the format's `.format.json` "
+                "(D-CSUBSET-PACKED-ATOMIC-MEMBER).",
+                mirOpcodeName(op), id.v, mir.instPayload2(id), target.name(),
+                underAlignedAtomicFormName(target.underAlignedAtomicForm())));
+    }
+
+    // Emit ONE generic atomics-runtime call:
+    //     void __atomic_{load,store}(size_t size, void *mem, void *slot,
+    //                                int model)
+    // ✔The signature, the argument ORDER and the fact that BOTH directions
+    // travel through a caller-supplied SLOT were read off clang's own x86-64
+    // sequence rather than a document: `movl $4,%edi` (size FIRST) · `%rsi` =
+    // the object address · `%rdx` = a stack slot holding the value on the store
+    // side and receiving the result on the load side · `movl $5,%ecx` (model
+    // LAST, and 5 IS seq_cst). ★ The model needs NO translation — DSS's own
+    // AtomicLoad/AtomicStore payload encoding (relaxed=0 … seq_cst=5) is
+    // byte-identical to the `__ATOMIC_*` constants libatomic reads.
+    //
+    // The args are ordinary `ArgReg` operands, so `lir_callconv` places them by
+    // the target's OWN calling convention — the F128 softcall's hand-placed
+    // physical registers are deliberately NOT copied here: that verb marshals
+    // 128-bit values the classifier cannot see, while these four are plain
+    // integer/pointer arguments the classifier handles exactly right.
+    [[nodiscard]] bool
+    emitAtomicsRuntimeCall(SymbolId sym, LirReg objectAddr, LirReg slotAddr,
+                           std::uint32_t sizeBytes, std::uint32_t order,
+                           std::uint8_t ptrBytes, std::string_view context) {
+        auto const sizeReg = emitBareConstToFresh(
+            static_cast<std::int64_t>(sizeBytes));
+        if (!sizeReg.has_value()) return false;
+        auto const orderReg = emitBareConstToFresh(
+            static_cast<std::int64_t>(order));
+        if (!orderReg.has_value()) return false;
+        bool const useIndirect = externCallDispatch_.has_value()
+            && externCallUsesIndirectShape(*externCallDispatch_);
+        MnemonicSlot const callSlot = useIndirect
+            ? MnemonicSlot::CallIndirectViaExtern
+            : MnemonicSlot::Call;
+        auto const callOp = opcode(callSlot);
+        if (!callOp.has_value()) {
+            reportMissingOpcode(callSlot, context);
+            return false;
+        }
+        // `ptrBytes` is the ADDRESS width, taken from the atomic's own MIR
+        // pointer operand by the caller — the one datum at this site that
+        // genuinely has a MIR type. `size_t` takes the same width (it IS
+        // pointer-width on every LP64/LLP64 target DSS serves) and the
+        // memory-order model is a plain `int`.
+        std::array<LirOperand, 5> ops{
+            LirOperand::makeSymbolRef(sym.v),
+            LirOperand::makeArgReg(*sizeReg,   ptrBytes),
+            LirOperand::makeArgReg(objectAddr, ptrBytes),
+            LirOperand::makeArgReg(slotAddr,   ptrBytes),
+            LirOperand::makeArgReg(*orderReg,  std::uint8_t{4}),
+        };
+        emitInst(*callOp, InvalidLirReg, ops);
+        return true;
+    }
+
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: an under-aligned AtomicLoad →
+    //     alloca slot ; __atomic_load(size, obj, &slot, order) ; load slot
+    // ⚠ THE READBACK TEMPORARY IS THE UNQUALIFIED SCALAR BY CONSTRUCTION: it is
+    // a compiler-internal frame slot with no MIR type at all, read with the
+    // ordinary GPR load. Giving it the `_Atomic` type would trip the MIR
+    // verifier's `checkAtomicAccessLowered` belt — the fix reporting itself as
+    // the defect.
+    // ⓘ THE BELT DOES NOT COVER THIS ARM AND IS NOT MEANT TO: it fires only on
+    // a plain `Load` whose result type is atomic and a plain `Store` whose
+    // address pointee is, so a `Call` never trips it. That is why this arm has
+    // its own red-on-disable pin rather than inheriting the belt's.
+    [[nodiscard]] bool lowerUnderAlignedAtomicLoad(MirInstId id,
+                                                   std::uint8_t widthFlags) {
+        auto const operands = mir.instOperands(id);
+        std::optional<LirReg> const objectAddr = regForValue(operands[0]);
+        if (!objectAddr.has_value()) return false;
+        std::uint32_t const sizeBytes = lirInstWidthBits(widthFlags) / 8u;
+        auto const slotIndex = emitF80ScratchSlot(
+            sizeBytes, "under-aligned _Atomic load (result slot)");
+        if (!slotIndex.has_value()) return false;
+        std::optional<LirReg> const slotAddr = emitLeaFrameSlot(*slotIndex);
+        if (!slotAddr.has_value()) return false;
+        auto const sym = resolveAtomicsRuntimeExtern(
+            atomicsRuntime_->loadMangledName, "MIR AtomicLoad");
+        if (!sym.has_value()) return false;
+        if (!emitAtomicsRuntimeCall(*sym, *objectAddr, *slotAddr, sizeBytes,
+                                    mir.instPayload(id),
+                                    atomicPointerArgBytes(operands[0]),
+                                    "under-aligned _Atomic load (call)")) {
+            return false;
+        }
+        // Read the result back out of the slot with the ordinary GPR load at
+        // the access width. `emitLeaFrameSlot` is re-run rather than reusing
+        // the pre-call address vreg: the call clobbers every caller-saved
+        // register, and a tiny-range rematerialization is what every other
+        // frame-slot consumer here does.
+        std::optional<LirReg> const readbackAddr = emitLeaFrameSlot(*slotIndex);
+        if (!readbackAddr.has_value()) return false;
+        auto const loadOp = classOp(LirRegClass::GPR, RegClassOp::Load);
+        if (!loadOp.has_value()) {
+            reportMissingClassOp(LirRegClass::GPR, RegClassOp::Load,
+                                 "under-aligned _Atomic load (result readback)");
+            return false;
+        }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 3> ldOps{
+            LirOperand::makeReg(*readbackAddr),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        emitInst(*loadOp, result, ldOps, /*payload=*/0, widthFlags);
+        defineValue(id, result);
+        return true;
+    }
+
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: an under-aligned AtomicStore →
+    //     alloca slot ; store value into slot ; __atomic_store(size, obj,
+    //     &slot, order)
+    // ⚠ BOTH DIRECTIONS NEED THE SLOT, NOT JUST THE LOAD — ✔MEASURED from
+    // clang's own sequence: `__atomic_store` takes `void *val`, so clang
+    // materializes the value into a stack slot (`movl $7,12(%rsp)` then
+    // `leaq 12(%rsp),%rdx`) exactly as it materializes the load's result slot.
+    // Passing the value in a register would be a silent ABI mismatch that reads
+    // whatever the callee finds at that address.
+    [[nodiscard]] bool lowerUnderAlignedAtomicStore(MirInstId id,
+                                                    std::uint8_t widthFlags) {
+        auto const operands = mir.instOperands(id);
+        std::optional<LirReg> const value      = regForValue(operands[0]);
+        std::optional<LirReg> const objectAddr = regForValue(operands[1]);
+        if (!value.has_value() || !objectAddr.has_value()) return false;
+        std::uint32_t const sizeBytes = lirInstWidthBits(widthFlags) / 8u;
+        auto const slotIndex = emitF80ScratchSlot(
+            sizeBytes, "under-aligned _Atomic store (value slot)");
+        if (!slotIndex.has_value()) return false;
+        std::optional<LirReg> const slotAddr = emitLeaFrameSlot(*slotIndex);
+        if (!slotAddr.has_value()) return false;
+        auto const storeOp = classOp(LirRegClass::GPR, RegClassOp::Store);
+        if (!storeOp.has_value()) {
+            reportMissingClassOp(LirRegClass::GPR, RegClassOp::Store,
+                                 "under-aligned _Atomic store (value slot)");
+            return false;
+        }
+        std::array<LirOperand, 4> stOps{
+            LirOperand::makeReg(*value),
+            LirOperand::makeReg(*slotAddr),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        emitInst(*storeOp, InvalidLirReg, stOps, /*payload=*/0, widthFlags);
+        auto const sym = resolveAtomicsRuntimeExtern(
+            atomicsRuntime_->storeMangledName, "MIR AtomicStore");
+        if (!sym.has_value()) return false;
+        // Rematerialize the slot address for the call (the value store above is
+        // the last use of the first one, and the call's own arg placement wants
+        // a fresh short-range vreg).
+        std::optional<LirReg> const callSlotAddr = emitLeaFrameSlot(*slotIndex);
+        if (!callSlotAddr.has_value()) return false;
+        return emitAtomicsRuntimeCall(*sym, *objectAddr, *callSlotAddr,
+                                      sizeBytes, mir.instPayload(id),
+                                      atomicPointerArgBytes(operands[1]),
+                                      "under-aligned _Atomic store (call)");
+    }
+
     // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): lower a MIR AtomicLoad to a
     // per-order load. Operand [ptr]; result = the loaded value. The order
     // (`payload`) selects the fence via a CLOSED (order, op)→slot matrix,
@@ -9840,6 +10225,22 @@ struct Lowerer {
             poisonValue(id);
             return;
         }
+        std::uint8_t const loadWidthFlags =
+            memAccessWidthFlags(mir.instType(id), cls);
+        // D-CSUBSET-PACKED-ATOMIC-MEMBER: an under-aligned access does NOT get
+        // the native LDAR — it goes through the format's atomics runtime.
+        switch (atomicLoweringFor(id, loadWidthFlags)) {
+            case AtomicLowering::Native: break;
+            case AtomicLowering::RuntimeCall:
+                if (!lowerUnderAlignedAtomicLoad(id, loadWidthFlags)) {
+                    poisonValue(id);
+                }
+                return;
+            case AtomicLowering::RefuseNoRuntime:
+                reportMissingAtomicsRuntime(MirOpcode::AtomicLoad, id);
+                poisonValue(id);
+                return;
+        }
         auto const acqOp = opcode(MnemonicSlot::LoadAcquire);
         if (!acqOp.has_value()) {
             reportMissingOpcode(MnemonicSlot::LoadAcquire,
@@ -9852,7 +10253,7 @@ struct Lowerer {
         // The loaded type drives the access width EXACTLY as lowerLoad
         // (memAccessWidthFlags: int→width-32, ptr/i64→width-64) — the atomic
         // qualifier is transparent to `reprKind`, so `_Atomic int` reads as int.
-        std::uint8_t const widthFlags = memAccessWidthFlags(mir.instType(id), cls);
+        std::uint8_t const widthFlags = loadWidthFlags;
         LirReg const result = lir.newVReg(cls);
         // Unified [ptr, MemBase(1), MemOffset(0)] shape (x86 memory addressing
         // needs the disp32; arm64 LDAR carries no offset field and pins
@@ -9903,11 +10304,22 @@ struct Lowerer {
             reportNonGprAtomic(MirOpcode::AtomicStore, id);
             return;
         }
+        std::uint8_t const widthFlags =
+            memAccessWidthFlags(mir.instType(operands[0]), cls);
+        // D-CSUBSET-PACKED-ATOMIC-MEMBER: an under-aligned store does NOT get
+        // the native STLR/XCHG — it goes through the format's atomics runtime.
+        switch (atomicLoweringFor(id, widthFlags)) {
+            case AtomicLowering::Native: break;
+            case AtomicLowering::RuntimeCall:
+                (void)lowerUnderAlignedAtomicStore(id, widthFlags);
+                return;
+            case AtomicLowering::RefuseNoRuntime:
+                reportMissingAtomicsRuntime(MirOpcode::AtomicStore, id);
+                return;
+        }
         std::optional<LirReg> const value = regForValue(operands[0]);
         std::optional<LirReg> const base  = regForValue(operands[1]);
         if (!value.has_value() || !base.has_value()) return;
-        std::uint8_t const widthFlags =
-            memAccessWidthFlags(mir.instType(operands[0]), cls);
 
         // release/acq_rel → StoreRelease; everything else (seq_cst + any
         // store-invalid order) → StoreSeqCst (the strongest — over-fence, never
@@ -12043,7 +12455,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::span<MirSehScope const> sehScopes,
                           std::optional<std::string> wideFloatSoftcallLibrary,
                           std::optional<ExternAddrBinding> externAddrBinding,
-                          std::optional<bool> charIsUnsigned) {
+                          std::optional<bool> charIsUnsigned,
+                          std::optional<AtomicsRuntime> atomicsRuntime) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -12066,10 +12479,16 @@ MirToLirResult lowerToLir(Mir const&          mir,
     // `Char`; nullopt + a raw `Char` index = fail-loud (no blind extension),
     // nullopt + a raw `Char` jump-table discriminant = the sign-agnostic
     // compare chain.
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: also pass the active format's atomics
+    // runtime — an under-aligned `_Atomic` access routes through its generic
+    // entries instead of the native LDAR/STLR pair, which is a MEASURED rc 135
+    // SIGBUS on real arm64 hardware. nullopt + a `traps` target + an
+    // under-aligned access = fail-loud (never a certain fault emitted quietly).
     Lowerer L{mir, target, interner, reporter, externImports,
               externCallDispatch, dataImportBinding, externAddrBinding,
               tlsAccess, sehScopes,
-              std::move(wideFloatSoftcallLibrary), charIsUnsigned};
+              std::move(wideFloatSoftcallLibrary), charIsUnsigned,
+              std::move(atomicsRuntime)};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

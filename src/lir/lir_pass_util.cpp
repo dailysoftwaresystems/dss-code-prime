@@ -269,6 +269,135 @@ carryInstSideData(Lir const& src, LirInstId srcInst,
         dstInst, lirRegConstraintIndexForHandle(handle));
 }
 
+std::optional<std::uint16_t>
+ClassMoveOpcodeCache::resolve(TargetSchema const& schema, LirRegClass cls) {
+    auto const c = static_cast<std::size_t>(cls);
+    if (c >= byClass_.size()) return std::nullopt;
+    if (!byClass_[c].has_value()) {
+        byClass_[c] = schema.regClassOpOpcode(static_cast<TargetRegClass>(c),
+                                              RegClassOp::Move);
+    }
+    return *byClass_[c];
+}
+
+IdentityClassMoveVerdict
+classifyIdentityClassMove(Lir const& lir, LirInstId inst,
+                          TargetSchema const&   schema,
+                          ClassMoveOpcodeCache& cache) {
+    auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
+    if (info == nullptr) return IdentityClassMoveVerdict::NotIdentityClassMove;
+    // A terminator is never a copy, and deleting one would leave the block
+    // unterminated — the builder's abort, not a diagnostic.
+    if (info->isTerminator()) {
+        return IdentityClassMoveVerdict::NotIdentityClassMove;
+    }
+
+    LirReg const result = lir.instResult(inst);
+    if (!result.valid() || result.isPhysical == 0) {
+        return IdentityClassMoveVerdict::NotIdentityClassMove;
+    }
+
+    // ★ THE OPCODE IDENTITY TEST. Not a mnemonic, not an encoded byte — the
+    // handle the SCHEMA names as this class's copy. On the shipped x86_64
+    // target THREE opcodes (`mov`, `trunc`, `zext`) encode to bytes every
+    // disassembler prints as `mov`, and only the first is a no-op when
+    // source and destination coincide.
+    auto const movOpcode = cache.resolve(schema, result.regClass());
+    if (!movOpcode.has_value() || lir.instOpcode(inst) != *movOpcode) {
+        return IdentityClassMoveVerdict::NotIdentityClassMove;
+    }
+
+    // Exactly one operand, a physical register identical to the result.
+    auto const ops = lir.instOperands(inst);
+    if (ops.size() != 1) return IdentityClassMoveVerdict::NotIdentityClassMove;
+    if (ops[0].kind != LirOperandKind::Reg) {
+        return IdentityClassMoveVerdict::NotIdentityClassMove;
+    }
+    if (ops[0].reg.isPhysical == 0 || !(ops[0].reg == result)) {
+        return IdentityClassMoveVerdict::NotIdentityClassMove;
+    }
+
+    // ── in the POPULATION from here down; the rest is why R1 may refuse.
+
+    // A declared side effect (or a declared implicit register read/clobber)
+    // is an observable this rule cannot reason about from the operands.
+    if (info->hasSideEffects || info->implicitRegisters.has_value()) {
+        return IdentityClassMoveVerdict::RefusedSideEffects;
+    }
+
+    // ★ THE WIDTH TEST — the second, independent guard on the partial-
+    // register-write hazard. A copy NARROWER than the register it names
+    // writes bits it did not read (x86-64's 32-bit GPR forms zero the upper
+    // half), so it is NOT a no-op even when source and destination are the
+    // same register.
+    auto const* regInfo =
+        schema.registerInfo(static_cast<std::uint16_t>(result.id));
+    if (regInfo == nullptr || regInfo->widthBytes == 0) {
+        return IdentityClassMoveVerdict::RefusedUndeclaredRegisterWidth;
+    }
+    auto const regWidthBits =
+        static_cast<std::uint32_t>(regInfo->widthBytes) * 8u;
+    if (static_cast<std::uint32_t>(lirInstWidthBits(lir.instFlags(inst)))
+        != regWidthBits) {
+        return IdentityClassMoveVerdict::RefusedNarrowerThanRegister;
+    }
+
+    // ★ NEVER DELETE THE ONLY NAMER OF A SIDE-STRUCTURE ENTRY. The
+    // per-instruction register-constraint pool is referenced by index from
+    // the instruction stream and `verifyLirRebuild` counts the references on
+    // both sides; orphaning an entry is `L_SideStructureReferenceLost`.
+    // Keeping a redundant copy costs one instruction — the fail-safe arm.
+    if (lir.instRegConstraintHandle(inst) != kLirNoRegConstraints) {
+        return IdentityClassMoveVerdict::RefusedNamesConstraintPoolEntry;
+    }
+    return IdentityClassMoveVerdict::Deletable;
+}
+
+IdentityClassMoveCensus
+censusIdentityClassMoves(Lir const& lir, TargetSchema const& schema) {
+    IdentityClassMoveCensus out{};
+    ClassMoveOpcodeCache    cache{};
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t k = 0; k < lir.blockInstCount(blk); ++k) {
+                LirInstId const inst = lir.blockInstAt(blk, k);
+                // The superset, opcode-blind on purpose: it is the number the
+                // opcode test has to REJECT down to.
+                LirReg const res = lir.instResult(inst);
+                auto const   ops = lir.instOperands(inst);
+                if (res.valid() && ops.size() == 1
+                    && ops[0].kind == LirOperandKind::Reg && ops[0].reg.valid()
+                    && ops[0].reg == res) {
+                    ++out.selfReferentialSingleOperand;
+                }
+                switch (classifyIdentityClassMove(lir, inst, schema, cache)) {
+                case IdentityClassMoveVerdict::NotIdentityClassMove:
+                    continue;
+                case IdentityClassMoveVerdict::Deletable:
+                    ++out.deletable;
+                    break;
+                case IdentityClassMoveVerdict::RefusedSideEffects:
+                    ++out.refusedSideEffects;
+                    break;
+                case IdentityClassMoveVerdict::RefusedUndeclaredRegisterWidth:
+                    ++out.refusedUndeclaredRegisterWidth;
+                    break;
+                case IdentityClassMoveVerdict::RefusedNarrowerThanRegister:
+                    ++out.refusedNarrowerThanRegister;
+                    break;
+                case IdentityClassMoveVerdict::RefusedNamesConstraintPoolEntry:
+                    ++out.refusedNamesConstraintPoolEntry;
+                    break;
+                }
+                ++out.population;
+            }
+        }
+    }
+    return out;
+}
+
 void
 carryInstSideData(Lir const& src, LirInstId srcInst, LirBuilder& dst) {
     // Deliberately does NOT short-circuit on "no constraints" before

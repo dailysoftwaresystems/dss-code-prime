@@ -1,0 +1,34 @@
+{
+  "$comment": "P53 (D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE, C 6.5.3.2p1): `E1[E2]` is defined as `*((E1)+(E2))` and the constraint is stated symmetrically, so `2[p]`, `i[p]` and `e[data]` are exactly as legal as their `p[...]` spellings. ✔MEASURED 2026-09-02, each reference invoked SEPARATELY: gcc 13.3.0 `-std=c2x`, clang 18.1.3 `-std=c23` and MSVC 19.51 `/std:clatest` accept every spelling in main.c and the gcc/clang images exit 42; at P53's base DSS refused each one with `error[H_TypeUnresolved]: hir node #N (HirKind ordinal 34)`. ★★ THE EXIT CODE DISCRIMINATES, WHICH IS THE POINT: the failure worth guarding is not the refusal (that one is loud) but a fix that parses the reversed spelling and then resolves the WRONG operand -- so `data` holds a distinct value per slot and each check compares the reversed read against BOTH the value it must equal and the forward read, returning its own non-42 code. ★ THREE TIERS ARE COVERED IN ONE PROGRAM because three separate transforms shared the assumption: the CST->HIR lowering (`combineIndex`), the semantic type oracle (`subtreeType`'s postfix Index arm -- checks 16-20; `_Generic(j[dp], double: ...)` compiled CLEAN and selected `default` at the base, a silent wrong answer, not a refusal), and the const-lvalue spine walk (`constQualifiedLvalue` -- not exercised here, it is a REFUSAL and lives in the unit pins). ⚠ THE FORWARD SPELLING IS THE CONTROL AND IT IS IN THE SAME PROGRAM (checks 1-3, 21-22): a fix that swapped unconditionally, or one that simply stopped checking, passes a reversed-only pin and fails here. RED-ON-DISABLE (REMOVE direction), ✔EXERCISED P53: delete the `IndexContainerOperand::Subscript` arm from `indexContainerOperand` in src/analysis/semantic/type_rules.hpp and this example FAILS IN BOTH RUNNERS while `array_storage_index`, `agg_string_index` and `sizeof_value_array_dim` stay green -- the control that says the mutant is targeted rather than a blanket break.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

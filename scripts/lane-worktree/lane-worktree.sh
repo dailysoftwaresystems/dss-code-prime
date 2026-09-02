@@ -59,9 +59,71 @@ MARGIN=20
 _say()  { printf 'lane-worktree: %s\n' "$*"; }
 _die()  { code=$1; shift; for l in "$@"; do printf 'lane-worktree: %s\n' "$l" >&2; done; exit "$code"; }
 
+# ⚠⚠ ANCHORED ON THIS FILE'S OWN LOCATION, RESOLVED BEFORE ANYTHING CAN `cd`.
+# [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]] -- see `_repo_root` below.
+_LW_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd -P)" \
+  || _die 2 "cannot resolve this script's own directory."
+
+# ★★ THE `.sh` OWNER OF "WHICH TREE CONTAINS THIS PATH?", REUSED RATHER THAN RESPELT.
+# ⚠ THE EMPTY ARGUMENT IS LOAD-BEARING: `.` forwards the CALLER's positional
+# parameters, so a plain `. leg-tree.sh` while `$1` is `add` reaches leg-tree.sh's
+# bottom dispatch as an unknown subcommand and exits 4. ✔MEASURED 2026-09-02, both
+# spellings. Five other scripts in this repository source it exactly this way.
+# shellcheck source=../leg-tree/leg-tree.sh
+. "$_LW_HERE/../leg-tree/leg-tree.sh" "" \
+  || _die 2 "cannot load scripts/leg-tree/leg-tree.sh"
+
+# Set by the `--repo <path>` pre-pass in the dispatch at the bottom of this file.
+LW_REPO_OVERRIDE=""
+
+# ★★★ WHICH TREE THIS VERB IS ABOUT, AND THE ANSWER IS NOT "WHERE AM I STANDING".
+# [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]]
+#
+# This was a bare `git rev-parse --show-toplevel`, which answers "what repository is
+# my CALLER'S SHELL in?" -- so `abs`, the scratchpad gate's `pad`, and the `rm -rf`
+# target were all rooted at whichever repository somebody happened to have cd'd into.
+# ✔MEASURED 2026-09-02, driving this file out of `.worktrees/lw` from a throwaway
+# repository outside the checkout: `list` reported the THROWAWAY repository's
+# `.worktrees/`. ✔MEASURED in P52 for real: a run whose fixtures were seeded in the
+# WSL leg clone was answered about the driver clone, and five of nine assertions
+# reported a gate that had not fired -- a true answer about a tree nobody asked about.
+#
+# ★ THE QUESTION IS "WHICH TREE DOES MY OWN FILE BELONG TO?", and the two rejected
+# answers are worth naming because each is defensible until it is measured:
+#
+#   * `$PWD`'s tree (what this did) -- a property of the caller's shell, not of the
+#     verb. Refuted above.
+#   * THE MAIN CHECKOUT -- "only the primary worktree owns `.worktrees/`", reached by
+#     `--git-common-dir` or `git worktree list`. ⛔ REFUTED, and in the dangerous
+#     direction. ✔MEASURED 2026-09-02: from `.worktrees/lw`, that answer resolves
+#     `remove io` to `<main>/.worktrees/io` -- A LIVE SIBLING LANE'S UNCOMMITTED WORK
+#     -- and would delete it, while this answer resolves it to
+#     `.worktrees/lw/.worktrees/io`, which does not exist, and refuses. A resolver
+#     whose mistake reaches ANOTHER tree is the failure direction this row exists to
+#     close. ✔MEASURED the same day: nested worktrees are ordinary git (a linked
+#     worktree adds one under itself and it works), so "only the main checkout owns
+#     `.worktrees/`" is this repository's CONVENTION, not a fact about git -- and a
+#     convention belongs in who runs the verb, not welded into its resolver.
+#     ⓘ And it is the answer that would have re-created the P52 mismatch in the other
+#     direction: `test-lane-worktree.sh` seeds its fixtures at ITS OWN
+#     `$_here/../..`, so a script resolving to the main checkout would once again
+#     look somewhere the test did not write.
+#
+# ⇒ the anchor is `_LW_HERE`, this file's own directory, and the tree is derived from
+# it by `leg_tree_owning_root`. `--repo <path>` stays as the explicit way to mean
+# another tree, so the CAPABILITY survives while the DEFAULT stops being an accident.
 _repo_root() {
-  git rev-parse --show-toplevel 2>/dev/null \
-    || _die 2 "not inside a git repository -- cannot place a lane worktree."
+  if [ -n "$LW_REPO_OVERRIDE" ]; then
+    _lw_r="$(cd "$LW_REPO_OVERRIDE" 2>/dev/null && pwd -P)" \
+      || _die 2 "--repo '$LW_REPO_OVERRIDE': no such directory."
+    leg_tree_owning_root "$_lw_r" \
+      || _die 2 "--repo '$LW_REPO_OVERRIDE' is not inside a git working tree."
+    return 0
+  fi
+  leg_tree_owning_root "$_LW_HERE" \
+    || _die 2 "not inside a git repository -- cannot place a lane worktree." \
+              "This script resolves the tree IT LIVES IN ($_LW_HERE), never the caller's" \
+              "cwd; pass --repo <path> to name a different tree deliberately."
 }
 
 # `.worktrees/` must be IGNORED, and that is checked rather than assumed: it is the
@@ -240,11 +302,37 @@ cmd_list() {
   fi
 }
 
+# ── `--repo <path>` PRE-PASS ────────────────────────────────────────────────────
+# Extracted from ANYWHERE in the argument list, before the verb dispatch, so each
+# verb keeps the argument grammar it already had -- `cmd_remove`'s option loop in
+# particular still refuses every option it does not know.
+# ⓘ THIS IS THE CAPABILITY THE OLD BEHAVIOUR PROVIDED BY ACCIDENT. Driving the verb
+# at another tree used to be done by cd'ing there and hoping; it is now said out
+# loud, which is the difference between a decision and a side effect.
+_lw_args=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --repo)
+      [ "$#" -ge 2 ] || _die 5 "--repo needs a directory"
+      LW_REPO_OVERRIDE="$2"; shift 2 ;;
+    --repo=*)
+      LW_REPO_OVERRIDE="${1#--repo=}"
+      [ -n "$LW_REPO_OVERRIDE" ] || _die 5 "--repo needs a directory"
+      shift ;;
+    *) _lw_args+=("$1"); shift ;;
+  esac
+done
+set -- ${_lw_args+"${_lw_args[@]}"}
+
 case "${1:-}" in
   add)    shift; cmd_add    "$@" ;;
   remove) shift; cmd_remove "$@" ;;
   list)   shift; cmd_list   "$@" ;;
-  *) _die 5 "usage: lane-worktree.sh {add <name> [committish] |" \
+  *) _die 5 "usage: lane-worktree.sh [--repo <path>]" \
+            "                        {add <name> [committish] |" \
             "                         remove <name> [--preserve-to <dir> | --discard-scratchpad] |" \
-            "                         list}" ;;
+            "                         list}" \
+            "" \
+            "The tree acted on defaults to the one THIS SCRIPT LIVES IN, never the" \
+            "caller's cwd. --repo <path> names another tree deliberately." ;;
 esac

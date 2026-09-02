@@ -2576,6 +2576,88 @@ TEST(SynthSehFunclets, ExtractsFilterFuncletAndStubsParent) {
     EXPECT_TRUE(verifier.verify(rep)) << "the SEH-lowered module must verify";
 }
 
+// D-MIR-ADDINST-ADMITS-BLOCKADDRESS-WITH-A-FORWARDED-BLOCK-ID, the SIXTH
+// verbatim-copy site — and the one that was protected by NOTHING.
+//
+// This pass CLONES the filter block's instructions into a SEPARATE funclet
+// function, so its `default:` arm forwards `mir.instPayload(oldId)` into a
+// destination whose blocks are entirely different ones. Every other copy site
+// either has a `BlockAddress` re-mapping arm (`mir_rebuild_helper`,
+// `MultiBlockInliner::emitCallerInst`, `FunctionCloner`) or is kept away from the
+// opcode by a gate (`emitCalleeInst` by `inlineLegalityGate`, LICM's hoist by the
+// leaf-exclusion list). This one had neither: `__except(f(&&L))` reached the
+// verbatim clone and published a parent block id as a funclet block address.
+//
+// A re-map is not merely missing here, it is not MEANINGFUL — the funclet is a
+// different function and a parent block has no counterpart in it — so the answer
+// is a REPORTED refusal rather than an arm. `MirBuilder::addInst` now also refuses
+// the opcode outright, but reaching THAT would abort the compiler on valid C,
+// which is why this arm exists ahead of it.
+//
+// RED-ON-DISABLE: delete the `case MirOpcode::BlockAddress:` arm in
+// `synth_seh_funclets.cpp` and this dies on `addInst`'s dedicated-builder abort
+// instead of returning false — i.e. the test crashes rather than failing, which is
+// itself the demonstration that the backstop is real and that the arm is what
+// turns it into a diagnostic.
+TEST(SynthSehFunclets, LabelAddressInAFilterExpressionIsRefusedNotCloned) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const u32  = in.primitive(TypeKind::U32);
+    TypeId const pI32 = in.pointer(i32);
+    TypeId const vptr = in.pointer(in.primitive(TypeKind::Void));
+    TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
+
+    MirBuilder mb;
+    mb.addFunction(sig, SymbolId{100});
+    MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const filterBB = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const handlerBB= mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const joinBB   = mb.createBlock(StructCfMarker::Linear);
+    std::uint32_t const region = 0;
+
+    mb.beginBlock(entry);
+    mb.addSehTryBegin(tryBB, filterBB, region);
+
+    mb.beginBlock(tryBB);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    (void)mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot}, i32);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, region);
+    mb.addBr(joinBB);
+
+    mb.beginBlock(filterBB);
+    // `&&join` INSIDE the filter expression — the whole point of the fixture. It is
+    // built through the sanctioned `addBlockAddress`, exactly as HIR→MIR would; what
+    // is under test is what the funclet CLONER does with it afterwards.
+    (void)mb.addBlockAddress(joinBB, vptr);
+    MirInstId const code = mb.addInst(MirOpcode::SehExceptionCode, {}, u32);
+    MirLiteralValue av; av.value = std::int64_t{0xC0000005}; av.core = TypeKind::U32;
+    MirInstId const avc = mb.addConst(std::move(av), u32);
+    MirInstId const cmp = mb.addInst(MirOpcode::ICmpEq,
+                                     std::array<MirInstId, 2>{code, avc}, i32);
+    mb.addSehFilterReturn(cmp, handlerBB, region);
+
+    mb.beginBlock(handlerBB);
+    mb.addBr(joinBB);
+    mb.beginBlock(joinBB);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    EXPECT_FALSE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                       CSymbolDecorationScheme::None,
+                                       "pe64-x86_64-windows-exec", scopes, rep))
+        << "a parent block address cannot be carried into a funclet";
+    EXPECT_GT(rep.errorCount(), 0u) << "and the refusal must be REPORTED, not silent";
+    bool named = false;
+    for (auto const& d : rep.all())
+        if (d.actual.find("address of a label") != std::string::npos) named = true;
+    EXPECT_TRUE(named)
+        << "the diagnostic must name the construct, not just fail generically";
+}
+
 TEST(SynthSehFunclets, NoSehIsANoOp) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32 = in.primitive(TypeKind::I32);

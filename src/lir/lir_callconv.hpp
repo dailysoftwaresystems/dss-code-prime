@@ -663,21 +663,32 @@ public:
         return place(rules_.variadic, naturalBytes);
     }
 
-    // Place ONE stacked by-value AGGREGATE of `aggBytes`: ceil(aggBytes/slot)
-    // whole slots at slot alignment.
+    // Place ONE stacked by-value AGGREGATE of `aggBytes` whose own alignment is
+    // `aggAlign`: ceil(aggBytes/slot) whole slots, begun on the boundary the CC
+    // declares it honours for that alignment.
     //
-    // ⚠ THIS AXIS HAS ONE BUILDABLE VALUE AND THE OTHER IS REFUSED AT LOAD, not
-    // approximated here. ✔MEASURED: BOTH shipped ABIs slot-round aggregates
+    // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: `aggAlign` is the datum's OWN
+    // alignment and `stackArgPacking.aggregateAlignment` is the clamp — the CC
+    // decides how much of it survives, and an undeclared CC keeps the flat slot
+    // stride byte-for-byte. It CANNOT be derived from `aggBytes`: ✔MEASURED, gcc
+    // 13.3.0 and clang 18.1.3 agreeing, `struct{long x,y;}` and `struct
+    // aligned(16){long x,y;}` are BOTH 16 bytes and land at +8 and +16
+    // respectively after one stacked 8-byte argument. A size-keyed rule would
+    // over-align the first — a byte-offset mismatch in the other direction, and a
+    // new silent miscompile rather than a fix.
+    //
+    // ⚠ THE PACKING AXIS STILL HAS ONE BUILDABLE VALUE, for a reason unrelated to
+    // alignment. ✔MEASURED: BOTH shipped ABIs slot-round an aggregate's SIZE
     // (Apple puts an `int` after a 3-byte struct at +8, and after a 12-byte
-    // struct at +16 — not +3 / +12), so `slot` is what the vocabulary needs
-    // today. A CC declaring `namedAggregates: "natural"` would need the
-    // aggregate's own ALIGNMENT, which the `ByValueStackAgg` carrier does not
-    // state (it carries a byte SIZE only) — so the loader REFUSES that spelling
-    // rather than letting this method guess slot alignment and call it natural.
-    // (`target_schema_json.cpp`, the `stackArgPacking` reader.)
-    [[nodiscard]] std::uint32_t placeNamedAggregate(std::uint32_t aggBytes) noexcept {
-        std::uint32_t const span = ((aggBytes + slot_ - 1u) / slot_) * slot_;
-        std::uint32_t const off  = alignUp(cursor_, slot_);
+    // struct at +16 — not +3 / +12), so nothing has measured `natural` there and
+    // the loader refuses that spelling rather than shipping an unmeasured rule
+    // under a measured one's name (`target_schema_json.cpp`, the
+    // `stackArgPacking` reader).
+    [[nodiscard]] std::uint32_t placeNamedAggregate(std::uint32_t aggBytes,
+                                                    std::uint32_t aggAlign) noexcept {
+        std::uint32_t const span  = ((aggBytes + slot_ - 1u) / slot_) * slot_;
+        std::uint32_t const align = rules_.aggregateAlignment(aggAlign, slot_);
+        std::uint32_t const off   = alignUp(cursor_, align);
         cursor_ = off + span;
         return off;
     }
@@ -710,7 +721,17 @@ private:
         bool const natural = rule == StackArgPacking::Natural
                              && naturalBytes != 0 && naturalBytes <= slot_;
         std::uint32_t const size  = natural ? naturalBytes : slot_;
-        std::uint32_t const align = natural ? naturalBytes : slot_;
+        // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: a scalar's own alignment IS
+        // its natural size, and the CC's scalar cap decides how much of it
+        // survives above the slot. For every naturalBytes a producer states today
+        // (0/1/2/4/8 — `argNaturalBytes` is a byte the isel fills from
+        // `memAccessWidthFlags`) the clamp floors at the slot, so this is the
+        // identity and every shipped placement is byte-unchanged; it is the rule
+        // a >slot scalar (AAPCS64's binary128 `long double`, ✔MEASURED at +16
+        // after one stacked 8-byte arg) needs, and declaring it here is what
+        // keeps the two tiers' clamps ONE function rather than two.
+        std::uint32_t const align =
+            natural ? naturalBytes : rules_.scalarAlignment(naturalBytes, slot_);
         std::uint32_t const off   = alignUp(cursor_, align);
         cursor_ = off + size;
         return Placement{off, natural ? widthFlagsForBytes(naturalBytes)

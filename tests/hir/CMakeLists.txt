@@ -17,6 +17,15 @@ dss_add_test(NAME hir/test_hir_verifier      SOURCES test_hir_verifier.cpp)
 dss_add_test(NAME hir/test_const_eval        SOURCES test_const_eval.cpp)
 dss_add_test(NAME hir/test_hir_text          SOURCES test_hir_text.cpp)
 dss_add_test(NAME hir/test_hir_lowering_c SOURCES test_hir_lowering_c.cpp)
+# D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION. Separate from
+# test_hir_lowering_c.cpp because that file's fixture deliberately pins the
+# long-double axis at `None` ("moving it would silently re-point every one of
+# this file's fixtures at a different ABI"), and this pin's whole subject is what
+# a DECLARED axis does to the literal leaf. It also answers the question the
+# Windows leg cannot answer by running the corpus example, whose x87-80 and
+# ieee128 arms are BUILT but never EXECUTED there.
+dss_add_test(NAME hir/test_hir_long_double_literal_decode
+             SOURCES test_hir_long_double_literal_decode.cpp)
 dss_add_test(NAME hir/test_hir_lowering_toy   SOURCES test_hir_lowering_toy.cpp)
 dss_add_test(NAME hir/test_hir_lowering_generic   SOURCES test_hir_lowering_generic.cpp)
 dss_add_test(NAME hir/test_hir_lowering_tsql  SOURCES test_hir_lowering_tsql.cpp)

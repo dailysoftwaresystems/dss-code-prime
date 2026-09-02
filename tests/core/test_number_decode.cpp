@@ -38,7 +38,12 @@ namespace {
     s.digitSeparator = '\'';
     s.integerSuffixes = {"u", "U", "l", "L", "ll", "LL", "ul", "UL",
                          "lu", "LU", "ull", "ULL", "llu", "LLU"};
-    s.floatSuffixes   = {"f", "F"};
+    // ✔MEASURED against `src/dss-config/sources/c.lang.json`'s own
+    // `numberStyle.floatSuffixes`: the shipped list is f/F/l/L. The l/L pair is
+    // load-bearing for the D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION pins
+    // below — without it `0.1L` would keep its suffix and no decoder would parse
+    // it, so the pins would pass VACUOUSLY on the refusal path.
+    s.floatSuffixes   = {"f", "F", "l", "L"};
     return s;
 }
 
@@ -270,4 +275,209 @@ TEST(NumberDecode, IntegerDigitValuedPrefixRuleIsDerivedFromTheDeclaredRadix) {
     EXPECT_EQ(decodeInteger("7", &digitish), std::uint64_t{7});
     // With a body it is a marker again, exactly as `010` is.
     EXPECT_EQ(decodeInteger("71", &digitish), std::uint64_t{1});
+}
+
+// ─── D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION: decodeFloatWide ────────
+//
+// ★★★ THE ORACLE IS THE REFERENCE COMPILER'S BIT PATTERN, NEVER DSS'S OWN.
+// Comparing a DSS-decoded literal against a DSS-decoded literal would pass with
+// both wrong together, which is how this defect survived from 2026-07-18 to
+// 2026-09-02: `20.0L` and `0.5L` are EXACT in binary64 and the corpus held
+// nothing else. Every `want` pair below is the `{lo, hi}` of the 16 bytes a
+// reference compiler ACTUALLY EMITTED for that literal as a static initializer,
+// ✔MEASURED 2026-09-02:
+//   * F80  — gcc 13.3.0 AND clang 18.1.3, x86_64-linux `long double`, probed
+//            SEPARATELY and agreeing byte-for-byte.
+//   * F128 — gcc 13.3.0 via `__float128` on x86_64 AND aarch64-linux-gnu-gcc
+//            13.3.0's own `long double`, agreeing byte-for-byte.
+// `WideFloatValue::pack()` is byte-identical to what `appendWideFloatBits`
+// writes (lo = the low 8 LE bytes of the 16-byte slot, hi = the high 8), so a
+// `pack()` equality here IS a comparison of emitted bytes.
+namespace {
+
+struct WantBits { std::uint64_t lo, hi; };
+
+[[nodiscard]] WantBits packOf(WideFloatValue const& v) {
+    auto const p = v.pack();
+    return {p.lo, p.hi};
+}
+
+void expectDecodes(char const* text, TypeKind kind, WantBits want,
+                   char const* provenance) {
+    auto const s = cStyle();
+    bool ok = false;
+    auto const v = decodeFloatWide(text, &s, kind, ok);
+    ASSERT_TRUE(ok) << text << " (" << provenance << ") did not decode";
+    ASSERT_TRUE(v.has_value());
+    auto const got = packOf(*v);
+    EXPECT_EQ(got.lo, want.lo) << text << " low half — reference: " << provenance;
+    EXPECT_EQ(got.hi, want.hi) << text << " high half — reference: " << provenance;
+}
+
+}  // namespace
+
+// THE ROW ITSELF. `0.1L` needs more than 53 mantissa bits, so the old
+// strtod→host-`double` decode produced a value whose low 11 (F80) / 60 (F128)
+// significand bits were ZERO. ✔MEASURED at the emitted bytes: DSS used to write
+// `00 d0 cc cc cc cc cc cc fb 3f` where both references write
+// `cd cc cc cc cc cc cc cc fb 3f`.
+TEST(NumberDecodeWide, TenthDecodesAtTargetPrecisionNotHostDouble) {
+    expectDecodes("0.1L", TypeKind::F80,
+                  {0xCCCCCCCCCCCCCCCDull, 0x3FFBull},
+                  "gcc 13.3.0 + clang 18.1.3, x86_64 long double");
+    expectDecodes("0.1L", TypeKind::F128,
+                  {0x999999999999999Aull, 0x3FFB999999999999ull},
+                  "aarch64 gcc 13.3.0 long double / x86_64 gcc __float128");
+}
+
+// ★ THE DIRECT REFUTATION, stated as an INEQUALITY rather than a pattern: the
+// target-precision decode must NOT equal the host `double` decode widened. A
+// pattern-only fixture would still pass if a future change re-routed the decode
+// through binary64 and the expected pattern were regenerated from DSS itself;
+// this one cannot.
+TEST(NumberDecodeWide, TargetPrecisionDecodeDiffersFromTheWidenedHostDouble) {
+    auto const s = cStyle();
+    for (auto kind : {TypeKind::F80, TypeKind::F128}) {
+        bool wideOk = false, hostOk = false;
+        auto const wide  = decodeFloatWide("0.1L", &s, kind, wideOk);
+        double const hostD = decodeFloat("0.1L", &s, hostOk);
+        ASSERT_TRUE(wideOk);
+        ASSERT_TRUE(hostOk);
+        ASSERT_TRUE(wide.has_value());
+        auto const widened = WideFloatValue::fromDouble(hostD, kind);
+        EXPECT_FALSE(*wide == widened)
+            << "0.1L decoded at target precision must differ from the binary64 "
+               "value widened — equality means the leaf is still host-rounded";
+        if (kind == TypeKind::F80) {
+            // ...and the widened one is exactly the WRONG pattern that shipped.
+            EXPECT_EQ(packOf(widened).lo, 0xCCCCCCCCCCCCD000ull)
+                << "the pre-fix F80 significand, low 11 bits zeroed";
+        }
+    }
+}
+
+// ★★ ROUND-TO-NEAREST-EVEN AT THE BOUNDARY — where a decimal parser fails. Both
+// decimals below are EXACT midpoints between two adjacent normals (generated
+// with Python `Decimal`, prec=200), so neither is decidable by "enough digits";
+// only the tie rule settles them. The first's lower neighbour is 1.0, whose
+// significand is EVEN, so the tie rounds DOWN; the second's lower neighbour is
+// odd, so the same tie rounds UP.
+TEST(NumberDecodeWide, F80HalfwayCasesRoundToNearestEven) {
+    // 1 + 2^-64 → 1.0 exactly (significand 0x8000000000000000, exp field 0x3FFF)
+    expectDecodes("1.0000000000000000000542101086242752217003726400434970855712890625L",
+                  TypeKind::F80, {0x8000000000000000ull, 0x3FFFull},
+                  "gcc 13.3.0 + clang 18.1.3: 00 00 00 00 00 00 00 80 ff 3f");
+    // 1 + 2^-63 + 2^-64 → rounds UP to 0x8000000000000002
+    expectDecodes("1.0000000000000000001626303258728256651011179201304912567138671875L",
+                  TypeKind::F80, {0x8000000000000002ull, 0x3FFFull},
+                  "gcc 13.3.0 + clang 18.1.3: 02 00 00 00 00 00 00 80 ff 3f");
+}
+
+TEST(NumberDecodeWide, F128HalfwayCasesRoundToNearestEven) {
+    // 1 + 2^-113 → 1.0 exactly (fraction 0)
+    expectDecodes("1.00000000000000000000000000000000009629649721936179265279889712"
+                  "924636592690508241076940976199693977832794189453125L",
+                  TypeKind::F128, {0ull, 0x3FFF000000000000ull},
+                  "gcc 13.3.0 __float128: 00 …00 ff 3f");
+    // 1 + 2^-112 + 2^-113 → rounds UP to fraction 2
+    expectDecodes("1.00000000000000000000000000000000028888949165808537795839669138"
+                  "773909778071524723230822928599081933498382568359375L",
+                  TypeKind::F128, {2ull, 0x3FFF000000000000ull},
+                  "gcc 13.3.0 __float128: 02 00 …00 ff 3f");
+}
+
+// A 36-digit transcendental — the ordinary case a maths header ships, and where
+// a decimal parser that is merely "close" is visibly wrong.
+TEST(NumberDecodeWide, LongDecimalTranscendentalsAreBitExact) {
+    expectDecodes("3.14159265358979323846264338327950288L", TypeKind::F80,
+                  {0xC90FDAA22168C235ull, 0x4000ull},
+                  "gcc 13.3.0 + clang 18.1.3: 35 c2 68 21 a2 da 0f c9 00 40");
+    expectDecodes("3.14159265358979323846264338327950288L", TypeKind::F128,
+                  {0x8469898CC51701B8ull, 0x4000921FB54442D1ull},
+                  "aarch64 gcc 13.3.0: b8 01 17 c5 8c 89 69 84 d1 42 44 b5 1f 92 00 40");
+    expectDecodes("2.71828182845904523536028747135266250L", TypeKind::F80,
+                  {0xADF85458A2BB4A9Bull, 0x4000ull},
+                  "gcc 13.3.0 + clang 18.1.3: 9b 4a bb a2 58 54 f8 ad 00 40");
+}
+
+// The hex-float door is the SAME decoder and must stay exact: a hex float is
+// already binary, so every bit of it survives at any target precision.
+TEST(NumberDecodeWide, HexFloatsDecodeExactlyAtTargetPrecision) {
+    expectDecodes("0x1.fp3L", TypeKind::F80,
+                  {0xF800000000000000ull, 0x4002ull}, "15.5L");
+    expectDecodes("0x1.fp3L", TypeKind::F128,
+                  {0ull, 0x4002F00000000000ull}, "15.5L");
+    // Digit separators go through the SAME shared body normalization
+    // `decodeFloat` uses, so the two decoders cannot disagree about the digits.
+    expectDecodes("0x1'8p4L", TypeKind::F80,
+                  {0xC000000000000000ull, 0x4007ull}, "384.0L = 0x1.8p8");
+}
+
+// ★ A VALUE THE HOST `double` PATH CANNOT EVEN CARRY. `1e-320` is SUBNORMAL in
+// binary64 (strtod sets ERANGE, so `decodeFloat` refuses it loud) and perfectly
+// NORMAL in F80/F128 — a literal DSS rejected on every axis and now decodes
+// bit-exactly on the wide ones. That the host path still refuses it is itself
+// the proof this is TARGET precision and not a host facility.
+TEST(NumberDecodeWide, SubnormalInBinary64IsNormalAtTargetPrecision) {
+    auto const s = cStyle();
+    bool hostOk = true;
+    (void)decodeFloat("1e-320L", &s, hostOk);
+    EXPECT_FALSE(hostOk) << "the host double path must still refuse it (ERANGE)";
+    expectDecodes("1e-320L", TypeKind::F80,
+                  {0xFD00B897478238D1ull, 0x3BD7ull},
+                  "gcc 13.3.0 + clang 18.1.3: d1 38 82 47 97 b8 00 fd d7 3b");
+    expectDecodes("1e-320L", TypeKind::F128,
+                  {0x71A1124161312AAAull, 0x3BD7FA01712E8F04ull},
+                  "aarch64 gcc 13.3.0");
+}
+
+// Zero and the loud contract. `ok` keeps `decodeFloat`'s meaning exactly: a body
+// the grammar cannot FULLY consume, a value outside the target's NORMAL range,
+// or a kind the wide kernel does not realize all leave it false — never a silent
+// zero, never a silently truncated value.
+TEST(NumberDecodeWide, ZeroAndTheLoudRefusalContract) {
+    auto const s = cStyle();
+    bool ok = false;
+
+    auto const z = decodeFloatWide("0.0L", &s, TypeKind::F80, ok);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(z.has_value());
+    EXPECT_TRUE(z->isZero());
+
+    // A kind the soft-float kernel does not realize — refused, never guessed.
+    ok = true;
+    EXPECT_FALSE(decodeFloatWide("0.1", &s, TypeKind::F64, ok).has_value());
+    EXPECT_FALSE(ok);
+
+    // A body the grammar cannot fully consume (the `1.5^3` case `decodeFloat`
+    // already refuses — the two decoders must draw the line in the same place).
+    for (char const* bad : {"1.5^3", "L", "1e", "0xL", ".L"}) {
+        ok = true;
+        EXPECT_FALSE(decodeFloatWide(bad, &s, TypeKind::F80, ok).has_value()) << bad;
+        EXPECT_FALSE(ok) << bad;
+    }
+
+    // Out of the target's NORMAL range in both directions.
+    ok = true;
+    EXPECT_FALSE(decodeFloatWide("1e5000L", &s, TypeKind::F80, ok).has_value());
+    EXPECT_FALSE(ok) << "overflow to infinity is refused, never baked silently";
+    ok = true;
+    EXPECT_FALSE(decodeFloatWide("1e-5000L", &s, TypeKind::F80, ok).has_value());
+    EXPECT_FALSE(ok) << "a subnormal RESULT is the fail-loud verdict roundNormal "
+                        "already carries for add/sub/mul/div";
+}
+
+// The register handed to the rounding chokepoint must be NORMALIZED, and a
+// caller that gets that wrong fails loud rather than rounding a value it was not
+// given. (The decoder always normalizes; this pins the guard itself.)
+TEST(NumberDecodeWide, FromExactBinaryRefusesAnUnNormalizedRegister) {
+    std::uint64_t const bad[4] = {0, 0, 0, 1};   // highest set bit is 192, not 255
+    EXPECT_FALSE(WideFloatValue::fromExactBinary(
+        TypeKind::F80, false, 0, bad, false).has_value());
+    std::uint64_t const good[4] = {0, 0, 0, std::uint64_t{1} << 63};
+    auto const one = WideFloatValue::fromExactBinary(
+        TypeKind::F80, false, 0, good, false);
+    ASSERT_TRUE(one.has_value());
+    EXPECT_EQ(one->pack().lo, 0x8000000000000000ull);
+    EXPECT_EQ(one->pack().hi, 0x3FFFull);
 }

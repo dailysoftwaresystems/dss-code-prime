@@ -15518,3 +15518,149 @@ TEST(MirLoweringC, PointerArithNonIntegerIndexRefusalNoLongerNamesTheEnum) {
             << "an enum index is SUPPORTED — no refusal may still call it deferred";
     }
 }
+
+// ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the PROVABLE-ALIGNMENT stamp ───────────
+//
+// HIR→MIR stamps every AtomicLoad/AtomicStore's `payload2` with the lvalue's
+// provable alignment in bytes, and MIR→LIR reads it to choose between the
+// target's native inline atomic instruction and the format's atomics runtime.
+// This is the LAST tier that has the HIR access chain, so it is the only one
+// that can derive the fact at all.
+//
+// ★ THE RULE, and it reproduces clang on all six lvalue forms measured (P53,
+// clang 18.1.3 `--target=aarch64-linux-gnu -S` plus Apple clang 21):
+//     align(L) = min over the chain of
+//                { the aggregate's own StructLayout.align,
+//                  the largest power of two dividing each field offset }
+// with a `Deref` STOPPING the walk at the pointee's natural alignment (C
+// 6.5.3.2 guarantees an `_Atomic T *` points at a properly-aligned object, and
+// clang assumes exactly that).
+//
+// ⚠⚠ THE RECURSION IS THE PART THAT IS EASY TO GET WRONG AND IMPOSSIBLE TO SEE.
+// A one-level `min(StructLayout.align, 2^ctz(offset))` calls `p.q.a` ALIGNED
+// when `q` (align 4, offset 0 within itself) sits at byte offset 1 of a packed
+// `p` — a silent SIGBUS at depth 2 on real aarch64, invisible on every gate leg
+// that RUNS. `NestedPackedMemberIsUnderAlignedAtDepthTwo` below is that case.
+namespace {
+
+// The `payload2` of the FIRST AtomicLoad (or AtomicStore) in the module, or
+// nullopt when the module contains none.
+[[nodiscard]] std::optional<std::uint32_t>
+firstAtomicAlign(Mir const& m, MirOpcode want) {
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                if (m.instOpcode(id) == want) return m.instPayload2(id);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+TEST(MirLoweringC, PackedAtomicMemberStampsAnUnderAlignedProvableAlignment) {
+    // `g.a` sits at byte offset 1 of an align-1 struct: provable alignment 1,
+    // against a natural alignment of 4.
+    auto L = lowerC(
+        "struct __attribute__((packed)) P { char pad; _Atomic int a; };\n"
+        "struct P g;\n"
+        "int main(void) { g.a = 7; return g.a; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+    auto const ld = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicLoad);
+    ASSERT_TRUE(st.has_value()) << "the packed member write must be an atomic store";
+    ASSERT_TRUE(ld.has_value()) << "the packed member read must be an atomic load";
+    EXPECT_EQ(*st, 1u) << "RED-ON-DISABLE: a packed member at offset 1 is provably "
+                          "1-byte aligned; anything larger routes it back onto the "
+                          "faulting native instruction";
+    EXPECT_EQ(*ld, 1u);
+}
+
+TEST(MirLoweringC, UnpackedAtomicMemberStampsItsNaturalAlignment) {
+    // THE CONTROL. Same member type, same access, ordinary struct.
+    auto L = lowerC(
+        "struct Q { char pad; _Atomic int a; };\n"
+        "struct Q h;\n"
+        "int main(void) { h.a = 7; return h.a; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(*st, 4u) << "a naturally-aligned member must stamp its full "
+                          "alignment, or every atomic in the program pays for a "
+                          "libcall it does not need";
+}
+
+TEST(MirLoweringC, PackedMemberAtOffsetZeroIsStillUnderAligned) {
+    // ★ THE STRUCT-ALIGN TERM IS LOAD-BEARING. Offset 0 divides by every power
+    // of two, so an offset-only rule would call this ALIGNED — but the object
+    // itself is only 1-byte aligned because the struct is packed, so the member
+    // can land anywhere. clang libcalls this case too (measured).
+    auto L = lowerC(
+        "struct __attribute__((packed)) R { _Atomic int a; char pad; };\n"
+        "struct R r;\n"
+        "int main(void) { r.a = 7; return r.a; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(*st, 1u)
+        << "RED-ON-DISABLE: drop the aggregate-alignment term and this reads 4 "
+           "while the object is byte-aligned — a silent fault on aarch64";
+}
+
+TEST(MirLoweringC, NestedPackedMemberIsUnderAlignedAtDepthTwo) {
+    // ⚠⚠ THE RECURSION PIN. `q` is an ORDINARY struct (align 4, its `a` at
+    // offset 0), nested at byte offset 1 of a PACKED outer struct. A one-level
+    // rule looks only at `q`'s own layout, sees align 4 and offset 0, and
+    // answers ALIGNED — which is a SIGBUS on real hardware and green on every
+    // emulated leg. Only walking the whole lvalue chain gets this right.
+    auto L = lowerC(
+        "struct Inner { _Atomic int a; };\n"
+        "struct __attribute__((packed)) Outer { char pad; struct Inner q; };\n"
+        "struct Outer o;\n"
+        "int main(void) { o.q.a = 7; return o.q.a; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(*st, 1u)
+        << "RED-ON-DISABLE: apply the alignment rule ONE LEVEL instead of over "
+           "the whole chain and this reads 4 — the depth-2 silent SIGBUS";
+}
+
+TEST(MirLoweringC, PlainAtomicGlobalAndPointerDerefStampFullAlignment) {
+    // The two forms that must NOT be pessimised. A plain `_Atomic` object is
+    // naturally aligned; a deref of an `_Atomic int *` is guaranteed so by C
+    // 6.5.3.2, and routing every pointer-mediated atomic through a libcall
+    // would be a large cost bought with no measured safety.
+    {
+        auto L = lowerC("_Atomic int g;\n"
+                        "int main(void) { g = 7; return g; }\n");
+        ASSERT_TRUE(L.mir.ok);
+        auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+        ASSERT_TRUE(st.has_value());
+        EXPECT_EQ(*st, 4u) << "a plain _Atomic global is naturally aligned";
+    }
+    {
+        auto L = lowerC("int f(_Atomic int *p) { *p = 7; return *p; }\n");
+        ASSERT_TRUE(L.mir.ok);
+        auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+        ASSERT_TRUE(st.has_value());
+        EXPECT_EQ(*st, 4u)
+            << "a deref STOPS the walk at the pointee's guaranteed alignment";
+    }
+}
+
+TEST(MirLoweringC, PackedAtomicThroughAPointerIsStillUnderAligned) {
+    // The pointer's POINTEE is the packed struct, so the walk restarts at
+    // align 1 and the member offset keeps it there. clang libcalls this too.
+    auto L = lowerC(
+        "struct __attribute__((packed)) P { char pad; _Atomic int a; };\n"
+        "int f(struct P *p) { p->a = 7; return p->a; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(*st, 1u);
+}

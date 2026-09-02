@@ -50,11 +50,11 @@ REPO="$(cd "$_here/../.." && pwd -P)"
 [ -r "$LW" ] || { echo "lane-worktree self-test: CANNOT RUN -- $LW exists but is not readable" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
-L1="padtest$$a"; L2="padtest$$b"; L3="padtest$$c"; L4="padtest$$d"
+L1="padtest$$a"; L2="padtest$$b"; L3="padtest$$c"; L4="padtest$$d"; L5="padtest$$e"
 fail=0
 
 _cleanup() {
-  for l in "$L1" "$L2" "$L3" "$L4"; do
+  for l in "$L1" "$L2" "$L3" "$L4" "$L5"; do
     [ -e "$REPO/.worktrees/$l" ] && bash "$LW" remove "$l" --discard-scratchpad >/dev/null 2>&1
   done
   rm -rf "$TMP"
@@ -105,9 +105,94 @@ out="$(bash "$LW" remove "$L4" --preserve-to "$TMP/x" --discard-scratchpad 2>&1)
 _arm "(6) --preserve-to with --discard-scratchpad is a usage refusal" "contradict each other" "$out"
 bash "$LW" remove "$L4" --discard-scratchpad >/dev/null 2>&1
 
-if [ "$fail" -eq 0 ]; then
-  echo "lane-worktree self-test: OK - 9 assertions over 6 arms (5 gate, 1 control); this gate is PROVEN able to fail."
+# ── (7) THE ROOT IS THE SCRIPT'S OWN TREE, NOT THE CALLER'S CWD ──────────────
+# [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]]
+#
+# ⚠⚠ THIS ARM MUST SET A DIFFERENT CWD DELIBERATELY, AND THAT IS THE WHOLE REASON IT
+# EXISTS. Under ctest `WORKING_DIRECTORY` pins the cwd to the repository, so a pin
+# that merely runs cannot see this defect at all: the cwd and the script's tree agree
+# by construction and the wrong resolver looks exactly like the right one. Every arm
+# below therefore runs the verb from a THROWAWAY REPOSITORY that is not this one.
+#
+# ★ THE FIXTURE IS A REPOSITORY, NOT JUST A DIRECTORY. A bare `git rev-parse
+# --show-toplevel` from a non-repository FAILS, and the verb would die -- which would
+# make this arm pass over the broken resolver for the wrong reason. It has to be a
+# tree git can answer about, holding a DECOY lane by the same name, so the old code
+# succeeds while answering about the wrong tree.
+#
+# ⚠ NOTHING IS EVER REMOVED HERE. Every assertion reads `list`, which writes nothing.
+# The verb under test is the one whose `remove` deletes trees, and an arm that
+# exercised `remove` while probing root resolution would be exercising it against
+# whichever root the code under test picked -- which is the defect. Reading is enough:
+# if `list` names the wrong tree, so would `remove`.
+FOREIGN="$TMP/foreign"
+mkdir -p "$FOREIGN"
+if git init -q "$FOREIGN" 2>/dev/null \
+   && git -C "$FOREIGN" -c user.email=s@e.invalid -c user.name=s \
+          commit -q --allow-empty -m base 2>/dev/null; then
+  printf '/.worktrees/\n' > "$FOREIGN/.gitignore"
+  mkdir -p "$FOREIGN/.worktrees/decoylane"
+  printf 'decoy\n' > "$FOREIGN/.worktrees/decoylane/marker.txt"
+
+  # ⚠ REALPATH PREFIX, NEVER A SUBSTRING TEST -- the fixture must be outside the
+  # repository before anything runs in it.
+  _f_real="$(cd "$FOREIGN" && pwd -P)"
+  case "$_f_real/" in
+    "$REPO"/*) echo "  FAIL (7) fixture $_f_real is INSIDE $REPO -- refusing to probe"; fail=1 ;;
+    *)
+      # ★ THE POSITIVE HALF IS A LANE THE VERB ITSELF CREATED IN ITS OWN TREE, not a
+      # path string. ⓘ Deliberately NOT a comparison against `$REPO`: this test
+      # derives that with `pwd -P` (POSIX spelling, `/c/...` under MSYS) while `git
+      # worktree list` prints the Windows spelling (`C:/...`), so a string compare of
+      # two CORRECT answers would red on a correct tree -- the same two-spellings
+      # trap `repo-tree.ps1` already carries a symlink walk for. A lane NAME is
+      # spelling-independent.
+      bash "$LW" add "$L5" >/dev/null 2>&1
+      out="$(cd "$FOREIGN" && bash "$LW" list 2>&1)"
+      _arm "(7) driven from a FOREIGN repo's cwd, the verb still answers about the tree it LIVES in" \
+           "$L5" "$out"
+      # The NEGATIVE half, and it is the one with teeth: today's bare `rev-parse`
+      # prints the decoy, and a positive-only pin would pass on a resolver that
+      # reached BOTH trees.
+      case "$out" in
+        *decoylane*)
+          fail=1
+          printf '  FAIL (7) the verb reported the FOREIGN cwd'"'"'s lane "decoylane" -- the root is cwd-keyed\n       got   : %s\n' "$out" ;;
+        *) printf '  ok   (7) ... and does NOT report the foreign cwd'"'"'s lane\n' ;;
+      esac
+      bash "$LW" remove "$L5" --discard-scratchpad >/dev/null 2>&1
+
+      # (8) `--repo <path>` IS THE EXPLICIT ESCAPE HATCH. Without this arm the fix
+      # reads as "the tree is no longer selectable", and the capability the old
+      # cwd-keying provided BY ACCIDENT would have been removed rather than named.
+      out="$(cd "$REPO" && bash "$LW" --repo "$FOREIGN" list 2>&1)"
+      _arm "(8) --repo names another tree deliberately, from a cwd that is NOT it" \
+           "decoylane" "$out"
+      ;;
+  esac
 else
-  echo "lane-worktree self-test: FAILED - the scratchpad gate is not doing what it says." >&2
+  fail=1
+  printf '  FAIL (7) could not build the foreign-repo fixture -- the cwd arm did not run\n'
+fi
+
+# ── (9) CONTROL FOR (7): the decoy the negative half looks for really EXISTS ──
+# ⚠ WITHOUT THIS, (7)'s negative half passes VACUOUSLY on a fixture that was never
+# built -- a failed `git init`, a bad path, a `list` that printed nothing at all.
+# It is deliberately a plain filesystem question with NO dependence on the resolver
+# under test: coupling it to (7)'s outcome would make it red for (7)'s reason
+# instead of measuring its own. ⓘ (8) is the other half of this control -- it proves
+# the decoy is not merely present but REACHABLE by this verb when the tree is named
+# on purpose, so "decoylane did not appear in (7)" means "the resolver did not go
+# there", not "there was nothing to find".
+if [ -f "$FOREIGN/.worktrees/decoylane/marker.txt" ]; then
+  printf '  ok   (9) CONTROL: the decoy lane the negative half looks for really exists\n'
+else
+  fail=1; printf '  FAIL (9) CONTROL: the decoy fixture was never built -- (7) measured nothing\n'
+fi
+
+if [ "$fail" -eq 0 ]; then
+  echo "lane-worktree self-test: OK - 13 assertions over 9 arms (7 gate, 2 control); this gate is PROVEN able to fail."
+else
+  echo "lane-worktree self-test: FAILED - the scratchpad gate or the root resolver is not doing what it says." >&2
 fi
 exit "$fail"

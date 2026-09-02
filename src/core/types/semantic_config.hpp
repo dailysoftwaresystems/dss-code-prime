@@ -447,6 +447,75 @@ struct DSS_EXPORT LinkageSpecifierEffect {
     // co-present static's binding/staticStorage (the noreturn
     // linkage-clobber lesson: each axis folds independently).
     bool                            threadStorage = false;
+    // D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS (P53): the NON-DEFINING
+    // axis — the 5th ORTHOGONAL one. A specifier carrying it declares that the
+    // declaration it appears on ANNOUNCES a name whose storage/body lives
+    // elsewhere (C `extern`), exactly what the per-ROW `nonDefiningDeclaration`
+    // flag says for a declaration form that owns the keyword as its rule HEAD.
+    //
+    // ★★ WHY THE FACT MOVED FROM THE ROW TO THE SPECIFIER, AND WHY THAT IS THE
+    // WHOLE FIX. While `extern` was a rule head, "which rule matched" and "was
+    // `extern` written" were the same question, so a per-row boolean answered
+    // both. C 6.7.1 makes the declaration specifiers an UNORDERED SET, so a
+    // grammar that gives one specifier its own top-level rule can never admit
+    // `inline extern` — two declaration branches on one lead token cannot both
+    // survive (✔MEASURED, P53 lane `ex`). Merging the two rules is what makes
+    // the set unordered, and it costs exactly this: the non-defining fact has to
+    // be read from the SPECIFIER that states it rather than from the rule's
+    // identity. A row keeps its own `nonDefiningDeclaration` (the block-scope
+    // `externDecl` still uses it); the two are OR-ed, never exclusive.
+    //
+    // Consumed by the semantic Pass-1 specifier scan (→
+    // `SymbolRecord.isExternDeclaration`, the tentative-definition suppression
+    // and the block-scope re-home guard) and by CST→HIR, which routes the
+    // declaration to the extern/import lowering on THIS fact rather than on the
+    // rule name. OR-only across a prefix, like the two storage axes.
+    bool                            nonDefining = false;
+    // ★★ C 6.7.1p2 AS CONFIG, NOT AS ENGINE `if`s
+    // (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS, P53). The name of a
+    // MUTUAL-EXCLUSION group this specifier belongs to: at most ONE DISTINCT
+    // member of a group may appear in one declaration's specifier prefix. C's
+    // storage-class specifiers (`static`, `extern`, `constexpr`) share one
+    // group; the standard's own exception — "except that `_Thread_local` may
+    // appear with `static` or `extern`" — is stated by `_Thread_local` simply
+    // NOT declaring the group, so the exception lives in the vocabulary
+    // document beside the entry it is about rather than as an engine carve-out.
+    //
+    // ★ DISTINCT members, not repeats, and that is MEASURED rather than chosen:
+    // gcc and MSVC reject `static static int g;` but clang 18.1.3 ACCEPTS it
+    // (✔MEASURED 2026-09-02, all three probed separately), so under
+    // `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` a repeated specifier must keep
+    // compiling. `extern static` / `static extern` / `extern constexpr` /
+    // `constexpr extern` are refused by all three and must stay refused.
+    //
+    // Empty ⇒ this specifier excludes nothing (every entry before P53).
+    // Agnostic: the group's NAME is the language's own word and is rendered
+    // verbatim in the diagnostic; the engine compares strings it was handed.
+    std::string                     exclusiveGroup;
+    // ★★ THE GROUP'S NAMED EXCEPTIONS — C 6.7.1's own "except that …" clause,
+    // which is NOT one exception but a LIST of pairs, and a flat group cannot
+    // express it. C23 6.7.1p3 (N3096): `thread_local` may appear with `static`
+    // or `extern`, AND `constexpr` may appear with `auto`, `register` or
+    // `static`. So `static constexpr` is LEGAL while `extern constexpr` is a
+    // constraint violation — ✔MEASURED, and gcc 13.3.0 is the only reference
+    // that can answer it: it compiles `static constexpr int K = 4;` at rc 0 and
+    // refuses `extern constexpr int K = 4;` with "'constexpr' used with
+    // 'extern'". clang 18.1.3 and MSVC 19.51.36252 do not implement C23
+    // `constexpr` at all ("unknown type name 'constexpr'" / C2054), so they
+    // abstain on this pair rather than voting against it.
+    //
+    // ⚠ THE FIRST CUT OF THIS TABLE HAD NO SUCH FIELD AND IT REFUSED A SHIPPED
+    // EXAMPLE: `examples/c/constexpr_array_dim` writes `static constexpr double
+    // PI2 = 3.5 * 2;`. A group alone is the RIGHT shape for "at most one" and
+    // the WRONG shape for "except with"; both halves of the standard's sentence
+    // have to be sayable, or the config states a rule the language does not
+    // have.
+    //
+    // Read SYMMETRICALLY: the pair is compatible if EITHER entry names the
+    // other, so one statement is enough — though the shipped config declares
+    // both directions, because a half-declared pair reads as an accident.
+    // Empty ⇒ this specifier is compatible with no other member of its group.
+    std::vector<std::string>        compatibleWith;
 };
 
 // FC4 c1 (M5): a config-driven fail-loud gate on a declaration form. When the

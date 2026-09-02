@@ -872,14 +872,27 @@ enum class DiagnosticCode : std::uint16_t {
     // `H_UnknownLinkageSpecifier`: fail loud rather than silently drop an attribute
     // the program may depend on. The `.actual` names the offending spelling.
     S_UnknownTypeAttribute        = 0xE031,
-    // FC16 (D-CSUBSET-PACKED / D-CSUBSET-PACKED-BITFIELD-INTERACTION): a `packed`
-    // struct/union that ALSO contains a bit-field member. Bit-granular packed
-    // packing is a distinct algorithm (a named, deferred gap); combining the two is
-    // UNSUPPORTED — fail loud at the SEMANTIC tier rather than silently emit a
-    // NON-packed layout (the layout engine's nullopt belt is the backstop). Emitted
-    // at the composite-completion site; unsuppressable (a suppressed one would ship
-    // the wrong — padded — bytes).
-    S_PackedBitfieldUnsupported   = 0xE032,
+    // FC16 (D-CSUBSET-PACKED): formerly "a `packed` struct/union that ALSO contains
+    // a bit-field member is UNSUPPORTED". RETIRED by
+    // D-CSUBSET-PACKED-BITFIELD-INTERACTION:
+    // the combination is SUPPORTED — `packed` takes the same two per-ABI
+    // bit-field packers `#pragma pack(N)` takes, and the two spellings are MEASURED
+    // byte-identical (gcc 13.3.0 + clang 18.1.3 for gnu_packed; cl.exe 19.51 +
+    // mingw-w64 gcc 13.2.0 for msvc_straddle). The refusal was a conformance
+    // divergence: every reference accepts the construct.
+    //
+    // The code + its span slot are KEPT (never renumber — the append-only
+    // discipline) so every historical 0xE032 golden stays stable; no live site
+    // references it. De-listed from `kUnsuppressableCodes` in the same change, the
+    // 0xE04E precedent: an unemittable code cannot be suppressed, and leaving it
+    // listed is what makes a dead code read as load-bearing.
+    //
+    // ⚠ The residual it used to cover is NOT this code's job and never was: a
+    // bit-field that CROSSES its declared allocation unit is unrepresentable in
+    // `BitFieldPlacement` and still fails loud at layout — MEASURED identical on both
+    // spellings (`H_UnsupportedLoweringForKind`), which is the pre-existing
+    // `#pragma pack` behaviour rather than a new one.
+    S_PackedBitfieldUnsupported   = 0xE032,  // RETIRED — see comment
     // C23 §6.5 (D-CSUBSET-NULLPTR): the predefined constant `nullptr` (type
     // nullptr_t) used as an operand where nullptr_t is not permitted — any
     // arithmetic/bitwise/shift binary (`nullptr + 1`), any relational (`nullptr <
@@ -2134,6 +2147,54 @@ enum class DiagnosticCode : std::uint16_t {
     // build proceeds identically, so hiding the advice ships nothing wrong —
     // the S_AsmLabelOnAutomaticVariable negative-pin posture.
     S_NoreturnNonFunctionObject = 0xE076,
+    // C 6.5.3.2p1 (D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE): a subscript
+    // `a[b]` whose operands cannot satisfy the constraint — "one operand shall
+    // be a pointer to a complete object type, the OTHER shall have integer
+    // type". TWO shapes, one predicate, two messages: BOTH operands are
+    // containers (`p[q]`), or NEITHER is (`a[b]` on two ints). The constraint is
+    // stated symmetrically and `E1[E2]` is defined as `*((E1)+(E2))`, so this
+    // code is about the operand TYPES and never about which side they are
+    // written on — `p[i]` and `i[p]` are the same expression and both reach here
+    // only when the pair is genuinely wrong.
+    //
+    // ★ IT EXISTS BECAUSE NEITHER SHAPE WAS REPORTED AT ALL. ✔MEASURED at P53's
+    // base: `int *p, *q; return p[q];` ABORTED the process inside the type
+    // lattice (`TypeInterner::primitive: TypeKind Ptr is not a LEAF kind`, exit
+    // 0xC0000409) with no `error[…]` line, and `int a, b; return a[b];` reached
+    // the HIR verifier as `hir node #8 (HirKind ordinal 34)` — an internal node
+    // ordinal shown to a user who wrote `a[b]`. gcc 13.3.0 and clang 18.1.3 both
+    // refuse both shapes at the user's own token.
+    //
+    // Emitted by the CST→HIR tier, which still knows the source construct.
+    // Suppressable: silencing it cannot ship a wrong artifact, because the
+    // lowering returns an Error sentinel either way and the build still fails.
+    S_SubscriptOperandsNotPointerAndInteger = 0xE077,
+    // C 6.7.1p2 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): TWO DISTINCT
+    // members of one config-declared mutual-exclusion group appear in one
+    // declaration's specifier prefix — for C, two different storage-class
+    // specifiers (`extern static int g;`, `constexpr extern int g = 1;`).
+    //
+    // ★★ IT EXISTS BECAUSE A GRAMMAR ACCIDENT STOPPED ENFORCING THE CONSTRAINT.
+    // Until P53 `extern` was the HEAD of its own declaration rule, so `extern
+    // static` could not parse and the refusal was a by-product of the rule
+    // shape. Merging the two file-scope declaration rules — the only design that
+    // makes C's specifier SET genuinely unordered — deletes that accident, so
+    // the constraint has to be STATED. ✔MEASURED 2026-09-02, all three
+    // references probed separately: gcc 13.3.0, clang 18.1.3 and MSVC
+    // 19.51.36252 each REFUSE `extern static` / `static extern` /
+    // `extern constexpr` / `constexpr extern`; without this code DSS would
+    // compile all four at rc 0, i.e. sit ABOVE the reference union.
+    //
+    // ⚠ DISTINCT members only. clang ACCEPTS `static static int g;` and
+    // `extern extern int g;` (gcc and MSVC refuse), so under the union rule a
+    // REPEATED specifier must keep compiling and is deliberately not reported.
+    //
+    // WHICH specifiers exclude which is entirely per-language config (the
+    // `exclusiveGroup` field on a `linkageSpecifiers` entry); the engine holds
+    // no pair list, and C 6.7.1p2's own `_Thread_local` exception is expressed
+    // by that entry not declaring the group. Emitted by the semantic tier, once
+    // per declaration, naming BOTH specifiers. Renders error[S078].
+    S_ConflictingStorageClassSpecifiers = 0xE078,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

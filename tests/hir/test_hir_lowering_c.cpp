@@ -2942,10 +2942,25 @@ TEST(HirLoweringC, VisibilityDefaultRowsAreIndependentlyLoadBearing) {
         "__attribute__((visibility(\"default\"))) int f_vd(int v) "
         "{ return v + 1; }\n"
         "int main(void){ return f_vd(g_vd); }\n";
+    // ⚠ P53 CORRECTION, BY MEASUREMENT
+    // (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): this source used to be
+    // written at FILE scope, and that spelling no longer routes through
+    // `externDecl` at all — the file-scope declaration rules were MERGED, so a
+    // file-scope `extern` now reads `topLevelDecl`'s map and the two arms below
+    // measured the same row twice (✔MEASURED: row-1 disabled gave 2, not 0).
+    // The INVARIANT is unchanged and still worth pinning — two scan roots, two
+    // maps, independently load-bearing — but `externDecl` survives only as the
+    // BLOCK-scope rule (D-CSUBSET-BLOCK-SCOPE-EXTERN), so that is where its form
+    // has to be spelled. A test whose premise moves out from under it while its
+    // assertions still pass is the failure this repository names
+    // [[feedback-a-rows-premise-has-a-shelf-life]]; here the premise moved and
+    // the assertion went red, which is the instrument working.
     std::string const externSrc =
-        "extern __attribute__((visibility(\"default\"))) int g_ed;\n"
-        "extern __attribute__((visibility(\"default\"))) int f_ed(int);\n"
-        "int main(void){ return f_ed(g_ed); }\n";
+        "int main(void){\n"
+        "  extern __attribute__((visibility(\"default\"))) int g_ed;\n"
+        "  extern __attribute__((visibility(\"default\"))) int f_ed(int);\n"
+        "  return f_ed(g_ed);\n"
+        "}\n";
 
     // Row 1 = topLevelDecl: both attributed top-level declarations go loud.
     EXPECT_EQ(unknownLinkageWithDefaultRowDisabled(topLevelSrc, 1), 2u)
@@ -10315,6 +10330,18 @@ TEST(HirLoweringC, AttributeVocabularyStillAppliesAfterTheKeywordDenial) {
 // the semantic bit is not what suppresses a body. Both facts are true and this
 // tier is the one that decides the artifact — which is precisely why this table
 // is not a restatement of the semantic truth table.
+//   ~~ P53 CORRECTION, BY MEASUREMENT
+// (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): the sentence above about
+// "a definition whose `extern` is the DECLARATION RULE'S HEAD" describes a tree
+// that no longer exists. At FILE scope `extern` is now an ordinary
+// `singleDeclSpecifier` and every declaration routes through `topLevelDecl`, so
+// these definitions DO reach `lowerInlineDefinitionAsDeclaration` — and reach it
+// carrying the keyword, which is why `specifierPrefixHasInline`'s `extern` test
+// (`semantics.inline.externSpecifierTokens`) is now load-bearing on this route
+// rather than moot. That is the SECOND symptom this row named, closed BY the
+// merge rather than beside it. The paragraph is kept because its P51 measurement
+// was true of the P51 tree and the `externSpecifierTokens` mutant's reach is a
+// fact worth not re-deriving; do not read it as describing the current one.
 TEST(HirLoweringC, InlineBaselineSpellingsCarryTheReferenceLinkageState) {
     struct Row {
         char const*   spelling;
@@ -10328,6 +10355,19 @@ TEST(HirLoweringC, InlineBaselineSpellingsCarryTheReferenceLinkageState) {
         {"static inline",   0u, false, SymbolBinding::Local,  "t p"},
         {"extern inline",   0u, false, SymbolBinding::Global, "T p"},
         {"extern __inline", 0u, false, SymbolBinding::Global, "T p"},
+        // ★★★ P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): THE SAME
+        // SPELLINGS WITH THE SPECIFIERS IN THE OTHER ORDER. Every one of these
+        // was `error[P_NoAlternativeMatched]` before the file-scope declaration-
+        // rule merge, because `extern` was the HEAD of its own rule — so the
+        // table above could only ever measure half of C 6.7.1's unordered set.
+        // They carry the SAME expectations as their mirrors, and that identity
+        // is the assertion: `nm` on gcc 13.3.0 and clang 18.1.3 objects
+        // (probed separately 2026-09-02, this exact shape) gives `T p` for BOTH
+        // `extern inline` and `inline extern`, so the two orders do not merely
+        // both compile — they MEAN the same external definition.
+        {"inline extern",   0u, false, SymbolBinding::Global, "T p"},
+        {"__inline extern", 0u, false, SymbolBinding::Global, "T p"},
+        {"inline static",   0u, false, SymbolBinding::Local,  "t p"},
     };
     for (Row const& row : kRows) {
         SCOPED_TRACE(row.spelling);
@@ -10362,4 +10402,311 @@ TEST(HirLoweringC, InlineBaselineSpellingsCarryTheReferenceLinkageState) {
                   std::optional{row.binding})
             << row.spelling << " — reference `nm` column " << row.referenceNm;
     }
+}
+
+// ── D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE (C 6.5.3.2p1) ────────────────
+//
+// `E1[E2]` is `*((E1)+(E2))` and the constraint is stated symmetrically, so the
+// lowering must ASK which operand is the container rather than assume the base
+// is. The corpus example `subscript_commuted_operands` pins the VALUES a running
+// program reads; these pin the two REFUSALS, which a running program cannot
+// witness, and the positive/negative pair in one place.
+//
+// ⚠ THE TWO REFUSALS ARE WHY A "just admit the reversed spelling" FIX WOULD BE
+// WRONG: if the lowering merely stopped asking, `p[q]` and `a[b]` would go quiet
+// too. Both are refused by gcc 13.3.0 and clang 18.1.3 at the user's own token
+// ("array subscript is not an integer" / "subscripted value is neither array nor
+// pointer nor vector") — ✔MEASURED 2026-09-02, each probed SEPARATELY.
+TEST(HirLoweringC, CommutedSubscriptLowersCleanBothDirections) {
+    SemanticModel model = analyzeC(
+        "static int d[4] = {0,1,2,3};\n"
+        "int main(void) { int *p = d; int i = 2; return i[p] + p[i]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok)
+        << "`i[p]` is `p[i]` (C 6.5.3.2p1) — the lowering must type both; "
+        << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger),
+              0u)
+        << "one pointer and one integer satisfies the constraint in EITHER order";
+}
+// RED-ON-DISABLE: delete the `Ambiguous` arm from `indexContainerOperand` and
+// this reds — the law answers `Base`, the integer promotion is then handed a
+// pointer, and the process ABORTS inside the type lattice instead of reporting
+// (`TypeInterner::primitive: TypeKind Ptr is not a LEAF kind`, exit 0xC0000409,
+// ✔MEASURED at P53's base through the shipped CLI).
+TEST(HirLoweringC, SubscriptOfTwoPointersIsRefusedNotResolved) {
+    SemanticModel model = analyzeC(
+        "static int d[4];\n"
+        "int main(void) { int *p = d; int *q = d; return p[q]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_FALSE(res->ok) << "`p[q]` satisfies 6.5.3.2p1 in NEITHER direction";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger),
+              1u)
+        << "exactly one refusal, naming the construct rather than a node ordinal";
+}
+TEST(HirLoweringC, SubscriptOfTwoIntegersIsRefusedNamingTheConstruct) {
+    SemanticModel model = analyzeC(
+        "int main(void) { int a = 1, b = 2; return a[b]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_FALSE(res->ok) << "neither operand of `a[b]` can be the pointer";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger),
+              1u);
+    // ★ THE DIAGNOSTIC-QUALITY HALF THE ROW CARRIES. At P53's base this shape
+    // reached the HIR verifier as `hir node #8 (HirKind ordinal 34)` — an
+    // internal enumerator number shown to a user who wrote `a[b]`. The refusal
+    // must name the CONSTRUCT and the standard clause, and no message anywhere
+    // in the run may spell a raw kind ordinal.
+    bool sawSubscriptText = false;
+    for (auto const& d : r.all()) {
+        EXPECT_EQ(d.actual.find("HirKind ordinal"), std::string::npos)
+            << "a user-facing message must not name an internal kind ordinal: "
+            << d.actual;
+        if (d.code == DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger
+            && d.actual.find("6.5.3.2p1") != std::string::npos
+            && d.actual.find("subscript") != std::string::npos) {
+            sawSubscriptText = true;
+        }
+    }
+    EXPECT_TRUE(sawSubscriptText)
+        << "the refusal must name the construct and the constraint it violates";
+}
+
+// The OTHER half of 6.5.3.2p1 — "the other shall have INTEGER type". Both
+// shapes below ABORTED THE PROCESS at P53's base (exit 0xC0000409, no
+// `error[…]` line at all), and a float index instead travelled to the ASSEMBLER
+// and was refused there as a register-CLASS mismatch naming xmm3 — a machine
+// fact standing in for a source constraint. gcc 13.3.0 and clang 18.1.3 refuse
+// all three at the user's own token with "array subscript is not an integer"
+// (✔MEASURED 2026-09-02, each probed SEPARATELY).
+//
+// ⚠ THE CONTROL IS THE POINT AND IT IS BELOW: the check judges only kinds the
+// lattice can PROVE are not integers, so `char`, `_Bool`, `enum`, `long` and
+// `unsigned char` indices must stay clean. An accept-list would have had to
+// enumerate them and one omission REFUSES A CORRECT PROGRAM.
+TEST(HirLoweringC, FloatSubscriptIsRefusedAtTheSourceTier) {
+    SemanticModel model = analyzeC(
+        "static int d[4];\n"
+        "int main(void) { int *p = d; double x = 1.0; return p[x]; }\n");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_FALSE(res->ok) << "a double cannot be a subscript (C 6.5.3.2p1)";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger),
+              1u);
+}
+TEST(HirLoweringC, StructSubscriptIsRefusedNotAborted) {
+    SemanticModel model = analyzeC(
+        "struct S { int a; };\nstatic int d[4];\n"
+        "int main(void) { int *p = d; struct S s = {0}; return p[s]; }\n");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_FALSE(res->ok) << "a struct cannot be a subscript (C 6.5.3.2p1)";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger),
+              1u);
+}
+TEST(HirLoweringC, NarrowAndNominalIntegerSubscriptsStayClean) {
+    // char / _Bool / enum / long / unsigned char, forward AND commuted. These
+    // are the accept-list this check deliberately does NOT enumerate.
+    SemanticModel model = analyzeC(
+        "enum E { E_TWO = 2 };\nstatic int d[8];\n"
+        "int main(void) {\n"
+        "  int *p = d; char c = 1; _Bool b = 1; enum E e = E_TWO;\n"
+        "  long l = 3; unsigned char u = 2;\n"
+        "  return p[c] + c[p] + p[b] + b[p] + p[e] + e[p]\n"
+        "       + p[l] + l[p] + p[u] + u[p];\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger),
+              0u)
+        << "every C integer type is a legal subscript in EITHER position";
+}
+
+// ═══ P53 — [[D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS]], the HIR half ══
+//
+// THE PROPERTY: after the file-scope declaration-rule merge, the CST->HIR
+// EXTERN ROUTE is selected by the FOLDED SPECIFIER, not by which grammar rule
+// matched. `externDecl` no longer appears in /shapes/topLevel at all, so a
+// file-scope `extern` reaches `lowerExternDeclInto` only because
+// `topLevelDecl`'s `linkageSpecifiers` maps the keyword to {nonDefining:true}
+// and `lowerTopLevelInto` reads that fold.
+//
+// ★★ THIS IS THE TIER WHERE THE SILENT MISCOMPILE LIVED. With the grammar merge
+// alone -- no `extern` entry on the map -- dsscp reported
+// warning[H_UnknownLinkageSpecifier] and EXITED 0: the extern-ness was dropped,
+// every extern OBJECT became a tentative definition and emitted its own
+// storage. A SEMANTIC-tier test cannot see that (it merges either way with zero
+// diagnostics); only the Global-vs-ExternGlobal split here can, exactly as
+// TentativeDefAfterExternEmitsStorageNotImport records for its own axis.
+//
+// RED-ON-DISABLE (REMOVE direction): delete the `"extern"` entry from
+// topLevelDecl's `linkageSpecifiers` in c.lang.json -> these arms go red (one
+// Global, zero ExternGlobals, plus H_UnknownLinkageSpecifier) while
+// BlockScopeExternRehomesToModuleDecls stays GREEN -- the control that says the
+// mutant hit the FILE-scope specifier fact and not the extern machinery, since
+// the block-scope rule still carries its own per-row nonDefiningDeclaration.
+
+TEST(HirLoweringC, ExternSpecifierRoutesToTheImportLoweringInEveryOrder) {
+    for (std::string_view const decl : {"extern int g;\n",
+                                        "extern __attribute__((weak)) int g;\n",
+                                        "extern int g, h;\n"}) {
+        SemanticModel model = analyzeC(std::string{decl}
+                                       + "int use(void){ return g; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << decl
+            << (model.diagnostics().all().empty()
+                    ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << decl << (r.all().empty() ? "" : r.all()[0].actual);
+        std::size_t globals = 0, externGlobals = 0;
+        for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+            if (res->hir.kind(d) == HirKind::Global)       ++globals;
+            if (res->hir.kind(d) == HirKind::ExternGlobal) ++externGlobals;
+        }
+        EXPECT_EQ(globals, 0u)
+            << decl << " -- an `extern` OBJECT must emit NO storage in this TU";
+        EXPECT_GE(externGlobals, 1u)
+            << decl << " -- it must emit an ExternGlobal IMPORT";
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << decl
+            << " -- `extern` must RESOLVE in the linkage map. An unresolved one "
+               "is a WARNING, so the extern-ness would be dropped at rc 0.";
+    }
+}
+
+// A file-scope `extern` FUNCTION prototype must still lower to an
+// ExternFunction import through the merged rule, and its per-declaration
+// import-library override (D-CSUBSET-EXTERN-LIBRARY-SYNTAX) must still be
+// decoded -- that trailing `stringLiteralExpr` slot moved from `externDecl`'s
+// sequence into `topLevelDecl`'s, where a wrong index would shift the
+// kindByChild discriminator and mis-lower every function definition in the TU.
+TEST(HirLoweringC, MergedRuleKeepsExternFunctionImportAndLibraryOverride) {
+    SemanticModel model = analyzeC(
+        "extern void* GetStdHandle(int) \"kernel32.dll\";\n"
+        "int use(void){ return GetStdHandle(0) != 0; }\n"
+        "int def(int x){ return x + 1; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t externFns = 0, fns = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::ExternFunction) ++externFns;
+        if (res->hir.kind(d) == HirKind::Function)       ++fns;
+    }
+    EXPECT_EQ(externFns, 1u)
+        << "the extern prototype must lower to ONE ExternFunction import";
+    EXPECT_EQ(fns, 2u)
+        << "the two ordinary definitions must still lower as Functions -- a "
+           "shifted kindByChild index would turn a definition into a "
+           "declaration silently";
+    bool sawLibrary = false;
+    for (auto const& row : res->externDecls) {
+        for (auto const& [format, lib] : row.libraryOverride) {
+            (void)format;
+            if (lib == "kernel32.dll") sawLibrary = true;
+        }
+    }
+    EXPECT_TRUE(sawLibrary)
+        << "the trailing per-declaration library override must still be decoded "
+           "after the slot moved into topLevelDecl's sequence";
+}
+
+// ⓘ C99 6.7.4p7 THROUGH THE REVERSED ORDER — the row's SECOND symptom — is
+// pinned by EXTENDING `InlineBaselineSpellingsCarryTheReferenceLinkageState`'s
+// table with the `inline extern` / `__inline extern` / `inline static` rows,
+// NOT by a second test here. That table already asserts the triple
+// (externRows, 6.7.4p7 mark, binding) against measured `nm` ground truth, and a
+// function-COUNT assertion beside it would have been a weaker instrument that
+// disagreed with it: the body is lowered in EVERY row (the optimizer needs it),
+// so counting Functions cannot tell a suppressed definition from an emitted one.
+// That is not a hypothetical — it was written that way first and went red
+// against its own subject.
+
+// ★★★ [[D-CSUBSET-ATTRIBUTE-BEFORE-EXTERN-KEYWORD]] — CLOSED BY THIS MERGE, AND
+// ITS OWN CLOSING CELL DEMANDS THE EFFECT, NOT THE PARSE ("both spellings compile
+// clean AND the attribute's EFFECT is asserted — a binding read back, or an
+// address — never that the line parses").
+//
+// That row prescribed escape (ii), the shared-prefix factoring, as its closing
+// work and rejected escape (i) outright. This is escape (ii): with ONE top-level
+// declaration rule there is no second FIRST set for `AttributeKeyword` to
+// collide with, so the `C_AmbiguousAlternatives`-at-LOAD wall it recorded has
+// nothing left to detect. ✔MEASURED 2026-09-02, gcc 13.3.0 `-std=c2x` and clang
+// 18.1.3 `-std=c23` probed SEPARATELY: both ACCEPT
+// `__attribute__((weak)) extern int g;` and `__attribute__((weak)) extern int
+// f(int);` at rc 0, so the previous DSS refusal was BELOW the reference union.
+//
+// The BINDING is what is asserted here — read back off the HIR linkage map for
+// the emitted import — because a leading attribute that parses and silently
+// drops its binding is the exact failure TF-C73 measured for the trailing
+// position, and it is invisible until link time.
+TEST(HirLoweringC, AttributeBeforeExternKeywordBindsItsAttribute) {
+    SemanticModel model = analyzeC(
+        "__attribute__((weak)) extern int wf(int);\n"
+        "__attribute__((visibility(\"hidden\"))) extern int hg;\n"
+        "int use(void){ return wf(1) + hg; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "a leading attribute must RESOLVE, not fall through the unknown gate";
+    EXPECT_EQ(declaredBinding(*res, model, "wf"),
+              std::optional{SymbolBinding::Weak})
+        << "an attribute BEFORE the storage-class keyword must bind, not merely "
+           "parse — a silently dropped `weak` is wrong linkage at link time with "
+           "no diagnostic anywhere";
+    auto const hl = declaredLinkage(*res, model, "hg");
+    ASSERT_TRUE(hl.has_value());
+    EXPECT_EQ(hl->visibility, SymbolVisibility::Hidden);
+}
+
+// An `extern` declaration that declares ONLY A TAG (`extern struct S { int a; };`)
+// must take the TypeDecl path, not the import path: gcc accepts it with
+// "useless storage class specifier in empty declaration". The route test is
+// ordered AFTER the no-named-declarator arm precisely so this shape never
+// reaches lowerExternDeclInto, and this pin is what says so.
+TEST(HirLoweringC, ExternOnATagOnlyDeclarationEmitsNoImport) {
+    SemanticModel model = analyzeC(
+        "extern struct S { int a; };\n"
+        "int use(void){ struct S s = {1}; return s.a; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t externGlobals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root()))
+        if (res->hir.kind(d) == HirKind::ExternGlobal) ++externGlobals;
+    EXPECT_EQ(externGlobals, 0u)
+        << "a tag-only declaration declares no object, so there is nothing to "
+           "import";
 }

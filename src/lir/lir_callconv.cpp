@@ -742,7 +742,14 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                             static_cast<std::uint32_t>(*placed) + span;
                         if (end > statedEndBytes) statedEndBytes = end;
                     } else {
-                        (void)stackCursor.placeNamedAggregate(aggBytes);
+                        // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the RESERVATION
+                        // pre-scan must consume the same pad the placement walk
+                        // inserts, or an over-aligned stacked argument is written
+                        // past the end of the area this function reserves — stack
+                        // corruption, strictly worse than the misplacement it fixes.
+                        // Same object, same carrier, same stated alignment.
+                        (void)stackCursor.placeNamedAggregate(
+                            aggBytes, ops[k + 1].byValueAggAlign());
                     }
                     // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64
                     // EXHAUSTS the carrier's class — a later same-class arg also stacks.
@@ -3978,10 +3985,15 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                        inst.v, argRegionIdx));
                             return false;
                         }
+                        // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the residual
+                        // (un-placed) arm walks the same cursor with the same
+                        // carrier-stated alignment, so the two producers of an
+                        // offset cannot disagree about the pad.
                         std::uint32_t const relOffset =
                             placed.has_value()
                                 ? static_cast<std::uint32_t>(*placed)
-                                : stackCursor.placeNamedAggregate(aggBytes);
+                                : stackCursor.placeNamedAggregate(
+                                      aggBytes, ops[i + 1].byValueAggAlign());
                         std::int32_t const dstOffset =
                             static_cast<std::int32_t>(
                                 static_cast<std::uint32_t>(cc.shadowSpaceBytes)

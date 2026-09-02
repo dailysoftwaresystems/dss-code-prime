@@ -792,8 +792,22 @@ TEST(ParserCSmoke, CompoundAssignmentIsRightAssociative) {
 // (the externTail's tail-only difference is what matters for that
 // arm; the externDecl frame shape is already covered by the function
 // form). Broken-path coverage in `test_parser_recovery.cpp`.
+// ★★ P53 SCOPE MOVE (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS), and it
+// applies to EVERY `externDecl`-shaped pin in this block. The source below used
+// to be written at FILE scope. It is now written INSIDE A BLOCK, because
+// `externDecl` no longer appears in `/shapes/topLevel` at all: C 6.7.1 makes the
+// declaration specifiers an unordered SET, and two declaration branches on one
+// lead token cannot both survive a long function body at any alt order
+// (✔MEASURED, P53 lane `ex`), so the file-scope rules were MERGED and
+// `topLevelDecl` owns `extern` there. `externDecl` survives UNCHANGED as the
+// BLOCK-scope rule (D-CSUBSET-BLOCK-SCOPE-EXTERN), which is why every expected
+// tree below is byte-identical to what it was — the rule did not change, its
+// reachable POSITION did.
+// ⓘ The FILE-scope shape is pinned by `ExternAtFileScopeParsesThroughTheMergedRule`
+// below, and the two together are what say the merge moved the spelling without
+// losing it.
 TEST(ParserCSmoke, ExternFunctionPrototypeParses) {
-    auto h = loadAndTokenize("extern int printf(char x);");
+    auto h = loadAndTokenize("int use(void){ extern int printf(char x); return 0; }");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
@@ -861,15 +875,34 @@ TEST(ParserCSmoke, ExternFunctionDefinitionParses) {
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors())
         << "`extern int f(void){ return 0; }` must parse as a function definition";
-    ASSERT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
-    const NodeId ext = findFirstNodeWithRule(t, "externDecl");
-    ASSERT_NE(ext, NodeId{});
-    // The externDeclTail's chosen arm is a `block` (a function-definition body),
-    // NOT an EndStatement token — this is what distinguishes the definition from
-    // the prototype/declaration forms.
-    const NodeId tail = findFirstNodeWithRule(t, "externDeclTail");
+    // ★★ P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): this is the ONE
+    // `extern` form that CANNOT move to block scope with its siblings above — a
+    // block-scope `extern int f(void){…}` is a NESTED FUNCTION, which is not C
+    // and which `lowerStmtNode`'s ExternDecl arm rejects fail-loud. So it is the
+    // form that pins the MERGED file-scope shape instead: `topLevelDecl` with
+    // `extern` sitting in a `singleDeclSpecifier`, and the definition still
+    // distinguished from the declaration by a `block` on the tail. The FACT
+    // being pinned is unchanged (D-CSUBSET-EXTERN-FN-DEFINITION); only which
+    // rule owns it moved.
+    ASSERT_TRUE(hasInternalNodeWithRule(t, "topLevelDecl"));
+    ASSERT_FALSE(hasInternalNodeWithRule(t, "externDecl"))
+        << "`externDecl` must no longer be reachable at FILE scope — one owner "
+           "per lead token is what keeps every specifier ordering off the "
+           "128-token speculative probe";
+    const NodeId spec = findFirstNodeWithRule(t, "singleDeclSpecifier");
+    ASSERT_NE(spec, NodeId{})
+        << "`extern` must ride the ordinary declaration-specifier run";
+    bool specIsExtern = false;
+    for (NodeId c : t.children(spec))
+        if (t.kind(c) == NodeKind::Token && t.text(c) == "extern")
+            specIsExtern = true;
+    EXPECT_TRUE(specIsExtern);
+    // The topLevelDeclTail's chosen arm is a `block` (a function-definition
+    // body), NOT an EndStatement token — this is what distinguishes the
+    // definition from the prototype/declaration forms.
+    const NodeId tail = findFirstNodeWithRule(t, "topLevelDeclTail");
     ASSERT_NE(tail, NodeId{})
-        << "externDecl must carry an externDeclTail wrapper";
+        << "topLevelDecl must carry a topLevelDeclTail wrapper";
     bool tailHasBlock = false;
     for (NodeId c : t.children(tail)) {
         if (t.kind(c) == NodeKind::Internal
@@ -880,6 +913,84 @@ TEST(ParserCSmoke, ExternFunctionDefinitionParses) {
         << "an extern function DEFINITION's tail is a `block` body, not `;`";
 }
 
+// ★★★ P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS) — THE FILE-SCOPE
+// SHAPE, PINNED IN FULL, so the block-scope moves above cannot be read as
+// coverage lost. `extern` is an ordinary `singleDeclSpecifier` inside
+// `declSpecifiers`, and the declaration is an ordinary `topLevelDecl`: that is
+// what makes C 6.7.1's specifier SET unordered, because there is no second
+// declaration rule for the keyword to lead.
+TEST(ParserCSmoke, ExternAtFileScopeParsesThroughTheMergedRule) {
+    auto h = loadAndTokenize("extern int printf(int fmt);");
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    const NodeId decl = findFirstNodeWithRule(t, "topLevelDecl");
+    ASSERT_NE(decl, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:topLevelDecl\n"
+        "  rule:declSpecifiers\n"
+        "    rule:singleDeclSpecifier\n"
+        "      tok:\"extern\"\n"
+        "  rule:topLevelHead\n"
+        "    rule:typeSpecifierSeq\n"
+        "      tok:\"int\"\n"
+        "  rule:declAttrRun\n"
+        "  rule:initDeclaratorList\n"
+        "    rule:initDeclarator\n"
+        "      rule:declarator\n"
+        "        rule:directDeclarator\n"
+        "          tok:\"printf\"\n"
+        "          rule:fnSuffixTail\n"
+        "            tok:\"(\"\n"
+        "            rule:paramList\n"
+        "              rule:param\n"
+        "                rule:declHeadForParam\n"
+        "                  rule:typeSpecifierSeq\n"
+        "                    tok:\"int\"\n"
+        "                rule:declarator\n"
+        "                  rule:directDeclarator\n"
+        "                    tok:\"fmt\"\n"
+        "            tok:\")\"\n"
+        "  rule:topLevelDeclTail\n"
+        "    tok:\";\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, decl), kExpected);
+}
+
+// The REVERSED orders, in the shape that matters: `extern` is not required to
+// lead, so the specifier run may hold any of them in any order. A shape pin
+// rather than a full tree, because the point is the RUN, not one spelling.
+TEST(ParserCSmoke, ReversedExternSpecifierOrdersRideOneSpecifierRun) {
+    for (char const* src : {"inline extern int p(int);",
+                            "__inline extern int p(int);",
+                            "_Noreturn extern void die(int);",
+                            "_Thread_local extern int e;",
+                            "thread_local extern int e;",
+                            "_Noreturn inline extern void die(int);"}) {
+        auto h = loadAndTokenize(src);
+        Parser p{h.src, h.schema, std::move(h.stream),
+                 DiagnosticBudget::libraryDefault()};
+        auto result = std::move(p).parse();
+        auto const& t = result.tree;
+        EXPECT_FALSE(t.diagnostics().hasErrors()) << src;
+        EXPECT_TRUE(hasInternalNodeWithRule(t, "topLevelDecl")) << src;
+        const NodeId run = findFirstNodeWithRule(t, "declSpecifiers");
+        ASSERT_NE(run, NodeId{}) << src;
+        bool sawExtern = false;
+        for (NodeId c : t.children(run)) {
+            if (t.kind(c) != NodeKind::Internal) continue;
+            for (NodeId g : t.children(c))
+                if (t.kind(g) == NodeKind::Token && t.text(g) == "extern")
+                    sawExtern = true;
+        }
+        EXPECT_TRUE(sawExtern)
+            << src << " — `extern` must be one member of the specifier run, not "
+                      "the head of a rule of its own";
+    }
+}
+
 // D-CSUBSET-EXTERN-FN-DEFINITION regression: the DSS per-declaration import-
 // library override (`extern void* g(int) "kernel32.dll";`) still parses — the
 // `{optional stringLiteralExpr}` stays a DIRECT child BEFORE the externDeclTail
@@ -887,7 +998,12 @@ TEST(ParserCSmoke, ExternFunctionDefinitionParses) {
 // the wrapper. RED-ON-DISABLE: nest the string inside externDeclTail -> the
 // override lowering would no longer find it as a direct role child.
 TEST(ParserCSmoke, ExternImportLibraryOverrideParses) {
-    auto h = loadAndTokenize("extern void* g(int) \"kernel32.dll\";");
+    // P53 scope move — see `ExternFunctionPrototypeParses`. The FILE-scope form
+    // of this same override is pinned end-to-end by
+    // `HirLoweringC.MergedRuleKeepsExternFunctionImportAndLibraryOverride`,
+    // which asserts the decoded library rather than the node shape.
+    auto h = loadAndTokenize(
+        "int use(void){ extern void* g(int) \"kernel32.dll\"; return 0; }");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
@@ -915,7 +1031,8 @@ TEST(ParserCSmoke, ExternImportLibraryOverrideParses) {
 // initDeclarator children. RED-ON-DISABLE: reverting externDecl to the legacy
 // single-declarator spine P0009's on the comma, so this test would not parse.
 TEST(ParserCSmoke, ExternMultiDeclaratorParses) {
-    auto h = loadAndTokenize("extern int a, b;");
+    // P53 scope move — see `ExternFunctionPrototypeParses`.
+    auto h = loadAndTokenize("int use(void){ extern int a, b; return a; }");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
@@ -926,7 +1043,16 @@ TEST(ParserCSmoke, ExternMultiDeclaratorParses) {
     ASSERT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
     const NodeId ext = findFirstNodeWithRule(t, "externDecl");
     ASSERT_NE(ext, NodeId{});
-    const NodeId list = findFirstNodeWithRule(t, "initDeclaratorList");
+    // ⚠ The list must be found UNDER `ext`, not by a whole-tree search: since
+    // the P53 scope move this source also carries the enclosing function's own
+    // `topLevelDecl`, whose `use(void)` declarator list comes FIRST in document
+    // order. A tree-wide `findFirstNodeWithRule` counts that one and reports 1.
+    NodeId list{};
+    for (NodeId c : t.children(ext)) {
+        if (t.kind(c) == NodeKind::Internal
+            && t.rules().name(t.rule(c)) == "initDeclaratorList")
+            list = c;
+    }
     ASSERT_NE(list, NodeId{})
         << "externDecl must carry an initDeclaratorList (the multi-declarator list)";
     std::size_t initDeclarators = 0;
@@ -968,7 +1094,8 @@ TEST(ParserCSmoke, ExternMultiDeclaratorPerDeclaratorPointerParses) {
 }
 
 TEST(ParserCSmoke, ExternVariableDeclParses) {
-    auto h = loadAndTokenize("extern int errno;");
+    // P53 scope move — see `ExternFunctionPrototypeParses`.
+    auto h = loadAndTokenize("int use(void){ extern int errno; return errno; }");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
@@ -1000,7 +1127,8 @@ TEST(ParserCSmoke, ExternVariableDeclParses) {
 // revert the trailing slot to `{optional ConstKeyword}` -> P0009 "expected
 // 'Identifier', 'ParenOpen', 'StarOp' or 'BracketOpen' -- got 'volatile'".
 TEST(ParserCSmoke, ExternTypedefNameTrailingQualifierParses) {
-    auto h = loadAndTokenize("extern LONG volatile d;");
+    // P53 scope move — see `ExternFunctionPrototypeParses`.
+    auto h = loadAndTokenize("int use(void){ extern LONG volatile d; return 0; }");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
@@ -1034,7 +1162,8 @@ TEST(ParserCSmoke, ExternTypedefNameTrailingQualifierParses) {
 // fields consume the one const-only trailing slot). The trailing `volatile` rides a
 // `headQualifier` AFTER the base `typeSpecifierSeq`. RED-ON-DISABLE: same revert.
 TEST(ParserCSmoke, ExternBuiltinTrailingQualifierParses) {
-    auto h = loadAndTokenize("extern int volatile d;");
+    // P53 scope move — see `ExternFunctionPrototypeParses`.
+    auto h = loadAndTokenize("int use(void){ extern int volatile d; return 0; }");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
@@ -1059,7 +1188,9 @@ TEST(ParserCSmoke, ExternBuiltinTrailingQualifierParses) {
 // volatile) after the base. RED-ON-DISABLE: the const-only `{optional}` slot admits
 // at most the single leading `const`, so `volatile` P0009s.
 TEST(ParserCSmoke, ExternTrailingQualifierRunParses) {
-    auto h = loadAndTokenize("extern LONG const volatile cv;");
+    // P53 scope move — see `ExternFunctionPrototypeParses`.
+    auto h = loadAndTokenize(
+        "int use(void){ extern LONG const volatile cv; return 0; }");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
@@ -2970,9 +3101,34 @@ TEST(ParserCSmoke, MidPositionAttributeParses) {
 // RED-ON-DISABLE: add `stdAttr` beside `attrSpec` in `declAttrRun` or in
 // `externSpecifiers`'s repeat alt → the corresponding line parses clean and this
 // test fails. That is the demonstration; keep it.
+// ⚠⚠ P53 CORRECTION, BY MEASUREMENT
+// (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS). The mode-1 line used to be
+// written at FILE scope, where the exclusion belonged to `externSpecifiers`'s
+// repeat. That rule no longer governs file scope, so the line has MOVED into a
+// block — where `externDecl` still owns it and the exclusion is still real.
+//
+// ★ AND THE FILE-SCOPE ANSWER CHANGED, WHICH THIS COMMENT STATES RATHER THAN
+// HIDES: `extern [[deprecated]] int dg;` at file scope now PARSES, because
+// `stdAttr` has always been one of `singleDeclSpecifier`'s alts and `extern` has
+// joined them. ⓘ THAT IS NOT A NEW CLASS — it makes a PRE-EXISTING permissiveness
+// UNIFORM. ✔MEASURED 2026-09-02 through the shipped CLI at P53's base, before
+// any of this row's edits: `static [[deprecated]] int sg = 1;` and
+// `_Thread_local [[deprecated]] int tg;` ALREADY compiled rc 0, and gcc 13.3.0
+// and clang 18.1.3 REFUSE all three ("an attribute list cannot appear here";
+// C23 puts the `[[…]]` sequence BEFORE the declaration specifiers, not among
+// them). So DSS was above the union on every storage-class specifier EXCEPT
+// `extern`, and strict there only because `extern` happened to be a rule head —
+// the same accident C 6.7.1p2 was being enforced by. The merge removes the
+// accident; the divergence is recorded on this row's cells and belongs to
+// [[D-CSUBSET-ATTRIBUTE-TYPE-POSITION]], which already owns the C23
+// attribute-position question and already needs an engine capability to fix it.
+// Do NOT "repair" it by deleting `stdAttr` from `singleDeclSpecifier`: that
+// would refuse `[[deprecated]] int gv;`, which BOTH references accept.
 TEST(ParserCSmoke, StdAttrStaysRejectedInBothNewSlots) {
     for (char const* src : {
-             "extern [[deprecated]] int dg;",   // mode 1 slot
+             // mode 1 slot — `externSpecifiers`'s repeat, at the block scope
+             // that is now the only place that rule is reachable.
+             "int use(void){ extern [[deprecated]] int dg; return dg; }",
              "int [[deprecated]] gv;"}) {       // mode 2 slot
         auto h = loadAndTokenize(src);
         Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
@@ -3004,20 +3160,43 @@ TEST(ParserCSmoke, MidPositionAttributeNameCollidingWithATypedefParses) {
     }
 }
 
-// ★ THE ORDER WALL. An attribute BEFORE `extern` is deliberately NOT admitted:
-// it would put AttributeKeyword into FIRST(externDecl), colliding with
-// `topLevelDecl`'s `{optional declSpecifiers}` at `/shapes/topLevel`. MEASURED
-// with a throwaway patched config tree, that collision is caught at LOAD time —
-// `error[C_AmbiguousAlternatives] at /shapes/topLevel` + `D_SchemaLoadFailed`,
-// exit 1 — so the wall is real and loud rather than a silent mis-parse. The form
-// is carved into its own anchor; until then it must stay a clean parse error.
-TEST(ParserCSmoke, AttributeBeforeExternKeywordStaysRejected) {
-    auto h = loadAndTokenize("__attribute__((weak)) extern int g;");
-    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
-    auto result = std::move(p).parse();
-    EXPECT_TRUE(result.tree.diagnostics().hasErrors())
-        << "an attribute before `extern` must stay LOUD — FIRST(externDecl) has "
-           "to remain {ExternKeyword} or the schema fails to load at all";
+// ★★★ THE ORDER WALL IS GONE, AND ITS REMOVAL IS THE POINT — P53
+// (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS), which is the escape (ii)
+// that [[D-CSUBSET-ATTRIBUTE-BEFORE-EXTERN-KEYWORD]]'s own closing cell
+// prescribes.
+//
+// This test used to assert the OPPOSITE — that `__attribute__((weak)) extern
+// int g;` must stay a clean parse ERROR — on the grounds that admitting it
+// would put AttributeKeyword into FIRST(externDecl) and collide with
+// `topLevelDecl` at `/shapes/topLevel`. That reasoning was correct for a tree
+// with TWO top-level declaration rules. There is now ONE: `externDecl` left
+// `/shapes/topLevel`, `extern` is an ordinary `singleDeclSpecifier`, and an
+// attribute before it is simply an earlier member of the same specifier run —
+// no new FIRST, no collision, nothing to detect.
+//
+// ★ IT IS A CONFORMANCE GAIN, NOT A TOLERATED SIDE EFFECT. ✔MEASURED
+// 2026-09-02, gcc 13.3.0 `-std=c2x` and clang 18.1.3 `-std=c23` probed
+// SEPARATELY: BOTH ACCEPT `__attribute__((weak)) extern int g;` and
+// `__attribute__((weak)) extern int f(int);` at rc 0, so the old refusal sat
+// BELOW the reference union. The C23 spelling `[[deprecated]] extern int eg;`
+// is accepted by both too, and now parses here as well.
+// ⓘ `__attribute__((weak)) static int g;` is a DIFFERENT question and both
+// references still refuse it ("weak declaration of 'g' must be public") — a
+// semantic conflict on the attribute, not a position rule, and untouched here.
+TEST(ParserCSmoke, AttributeBeforeExternKeywordNowParses) {
+    for (char const* src : {"__attribute__((weak)) extern int g;",
+                            "__attribute__((weak)) extern int f(int);",
+                            "[[deprecated]] extern int eg;"}) {
+        auto h = loadAndTokenize(src);
+        Parser p{h.src, h.schema, std::move(h.stream),
+                 DiagnosticBudget::libraryDefault()};
+        auto result = std::move(p).parse();
+        EXPECT_FALSE(result.tree.diagnostics().hasErrors())
+            << src
+            << " — gcc and clang both accept an attribute BEFORE the storage-"
+               "class keyword; the old refusal was below the reference union and "
+               "existed only because `extern` headed a declaration rule of its own";
+    }
 }
 
 // ===========================================================================

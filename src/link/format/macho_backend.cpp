@@ -1004,14 +1004,21 @@ public:
             // The message keeps naming ONLY the rejected keys, so it stays a
             // true statement of what fired rather than a list that has to be
             // read against an exception.
+            // The two signature keys are folded into the ONE
+            // `requestsCodeSignature` predicate rather than re-spelled
+            // here: three hand-written copies of that disjunction are
+            // how D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM was
+            // born, and this disjunction is where a fourth would go
+            // unnoticed longest — an over-narrow term inside a nine-way
+            // `||` fails toward ACCEPTING a config, silently, with no
+            // arm of its own to read.
             bool const anySet = mi.pageZeroSize != 0
                 || mi.segmentPageSize != kDefaultMachoSegmentPageSize
                 || !mi.dylinkerPath.empty()
                 || !mi.loadDylibs.empty()
                 || !mi.installName.empty()
                 || !mi.bindNow
-                || mi.codeSignatureSize != 0
-                || mi.codeSignature.has_value();
+                || dss::macho::requestsCodeSignature(mi);
             if (anySet) {
                 fail("/image",
                      "Mach-O MH_OBJECT format must NOT declare an "
@@ -1216,6 +1223,42 @@ public:
                                  "reserved bytes with a CodeDirectory "
                                  "blob whose layout requires 8-byte "
                                  "alignment).",
+                                 mi.codeSignatureSize));
+            }
+            // ── D-LK-MACHO-CODESIGN-SIZE-SILENTLY-OVERRIDDEN-BY-ADHOC
+            //
+            // The two signature keys are ALTERNATIVES, never a pair.
+            // `codeSignature` makes the walker DERIVE the reservation
+            // from the blob it is about to build — via
+            // `adHocCodeSignatureSize`, over the same codeLimit /
+            // pageSize / identifier the fill uses — and the fill then
+            // asserts the built blob occupies that reservation
+            // EXACTLY. A hand-typed
+            // `codeSignatureSize` declared alongside can therefore
+            // never be honoured — the walker read past it in silence,
+            // which is a declared config key with no effect and no
+            // diagnostic. That is the failure the derivation exists to
+            // prevent, so the pair is refused HERE, at the reader,
+            // rather than resolved by precedence in the encoder: it is
+            // a schema-consistency question answerable with no module
+            // in hand, and refusing at load is what puts a JSON pointer
+            // in front of the person who typed the key. Normalising
+            // (clearing the size) would be the same silent drop wearing
+            // a tidier name.
+            if (mi.codeSignature.has_value() && mi.codeSignatureSize != 0) {
+                fail("/image/codeSignatureSize",
+                     std::format("'image.codeSignatureSize' ({}) is "
+                                 "declared alongside "
+                                 "'image.codeSignature'. The two are "
+                                 "alternatives: with an ad-hoc block "
+                                 "present the reservation length is "
+                                 "DERIVED from the blob the walker "
+                                 "builds, so this value can never take "
+                                 "effect. Remove "
+                                 "'image.codeSignatureSize' to sign "
+                                 "ad-hoc, or remove "
+                                 "'image.codeSignature' to reserve a "
+                                 "placeholder for a post-link fill.",
                                  mi.codeSignatureSize));
             }
             // ── Mach-O MH_DYLIB shape rules — c153, D-LK3-3 (the

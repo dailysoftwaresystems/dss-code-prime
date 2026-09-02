@@ -1120,15 +1120,123 @@ derefResultType(TypeInterner const& interner, TypeId operand) noexcept {
     return InvalidType;
 }
 
-// `Index` (`a[i]`): the element type of the base — an Array/Ptr/Slice (each
-// stores its element as operand[0]); any other base → InvalidType.
+// Is `t` a type `[]` can index — a CONTAINER that stores its element in
+// operand[0]? Array (C 6.3.2.1p3 decays it in this value context), Ptr and
+// Slice. A degenerate elementless container is NOT one: there is no element to
+// name, and calling it a container would hand the caller `operands()[0]` on an
+// empty span.
+[[nodiscard]] inline bool
+isIndexContainerType(TypeInterner const& interner, TypeId t) noexcept {
+    if (!t.valid()) return false;
+    TypeKind const k = interner.kind(t);
+    return (k == TypeKind::Array || k == TypeKind::Ptr || k == TypeKind::Slice)
+        && !interner.operands(t).empty();
+}
+
+// ★★★ WHICH OPERAND OF `a[b]` IS THE CONTAINER — the ONE place that question is
+// answered, for every tier. D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE.
+//
+// C 6.5.3.2p1 defines `E1[E2]` as `*((E1)+(E2))` and states the constraint
+// SYMMETRICALLY — "one operand shall be a pointer to a complete object type,
+// the other shall have integer type" — naming neither position. Addition is
+// commutative, so `2[p]`, `i[p]` and `e[data]` are exactly as legal as their
+// `p[…]` spellings, and gcc 13.3.0, clang 18.1.3 and MSVC 19.51 all compile and
+// RUN every one of them (✔MEASURED separately, 2026-09-02).
+//
+// ⚠ THE BASE-FIRST PROBE ORDER IS LOAD-BEARING, NOT STYLE. Trying `base` first
+// makes every shape that works today take the IDENTICAL arm it took before, so
+// admitting the reversed spelling cannot move `p[e]`.
+//
+// ⚠ `Ambiguous` (BOTH operands are containers, e.g. `p[q]`) is NOT "pick one".
+// The constraint requires the other operand to have INTEGER type, so two
+// containers satisfies no reading of it; picking the base silently indexed one
+// pointer by another and then aborted deep in the type lattice
+// (✔MEASURED at this cycle's base: `int *p, *q; p[q]` killed the process with
+// `TypeInterner::primitive: TypeKind Ptr is not a LEAF kind` and NO
+// user-facing diagnostic). The caller owes a loud refusal.
+enum class IndexContainerOperand : std::uint8_t {
+    Base,        // `a` in `a[b]` — the spelling C programs almost always use
+    Subscript,   // `b` in `a[b]` — the commuted spelling
+    Ambiguous,   // both are containers: no operand can be the integer one
+    Neither      // neither is: nothing to index
+};
+
+// ★★ THE OTHER HALF OF 6.5.3.2p1: "the other shall have INTEGER type". True iff
+// `t` is a type that provably CANNOT be one — the C-taxonomy COMPLEMENT of
+// "integer type", expressed in lattice kinds: floating, void, and the aggregate
+// / function kinds. Pointer and array are deliberately absent because a
+// container operand is already answered by `indexContainerOperand`
+// (`p[q]` is Ambiguous, not "q is not an integer").
+//
+// ⚠ IT ASKS "DEFINITELY NOT", NOT "NOT DEFINITELY", AND THE DIRECTION IS THE
+// DECISION. An accept-list of integer kinds would have to enumerate Bool, Char,
+// Byte, Enum, BitInt and both rank ladders, and one omission there REFUSES A
+// CORRECT PROGRAM — the defect this whole row is about. A refuse-list can only
+// ever leave a shape behaving as it does today. The kinds it does not judge —
+// Vector, Matrix, Ref, FnPtr, Nullable, Optional, Slice, Param, Bind, Extension
+// — are not C types at all, and this law is shared with every language the
+// engine loads, so a C constraint must not decide them.
+//
+// ✔MEASURED at P53's base, all through the shipped CLI: `double x; p[x]` and its
+// commuted twin reached the ASSEMBLER and were refused there as a register-CLASS
+// mismatch (`A_NoMatchingEncodingVariant` on `mul`/`lea`, naming xmm3) — loud,
+// but naming a machine fact for a source constraint; `struct S s; p[s]` and
+// `p[g]` for a function `g` ABORTED THE PROCESS (exit 0xC0000409) with no
+// `error[…]` line at all. gcc 13.3.0 and clang 18.1.3 refuse all four at the
+// user's own token with "array subscript is not an integer", while `char`,
+// `_Bool`, `enum`, `long` and `unsigned char` indices compile and run.
+[[nodiscard]] inline bool
+isDefinitelyNotIndexInteger(TypeInterner const& interner, TypeId t) noexcept {
+    if (!t.valid()) return false;                 // cascade — judge nothing
+    TypeKind const k = interner.kind(t);
+    if (detail::type_rules::floatRank(k) != 0) return true;
+    switch (k) {
+        case TypeKind::Void:
+        case TypeKind::Struct:
+        case TypeKind::Union:
+        case TypeKind::Tuple:
+        case TypeKind::FnSig:
+            return true;
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] inline IndexContainerOperand
+indexContainerOperand(TypeInterner const& interner, TypeId base,
+                      TypeId subscript) noexcept {
+    bool const baseIsContainer = isIndexContainerType(interner, base);
+    bool const subIsContainer  = isIndexContainerType(interner, subscript);
+    if (baseIsContainer && subIsContainer) return IndexContainerOperand::Ambiguous;
+    if (baseIsContainer) return IndexContainerOperand::Base;
+    if (subIsContainer)  return IndexContainerOperand::Subscript;
+    return IndexContainerOperand::Neither;
+}
+
+// `Index` (`a[b]`): the element type of whichever operand is the container.
+// Ambiguous / Neither → InvalidType (cascade-suppress; the CST→HIR tier refuses
+// loud at the site that still knows the SOURCE construct, which is why this law
+// stays a pure derivation and reports nothing itself).
+//
+// ⚠ BOTH operand types are required. Passing only the base was the defect: it
+// assumed the base is the pointer instead of ASKING which operand is, and BOTH
+// tiers did it — the CST→HIR `combineIndex` and this file's own caller in the
+// semantic-tier `subtreeType`. One value, two transforms
+// ([[feedback-a-partial-fix-reads-as-a-complete-one]]): fixing only the lowering
+// left `sizeof(i[p])` refusing and `_Generic(i[p], double: …)` silently
+// selecting `default` (✔MEASURED, both, at this cycle's base).
 [[nodiscard]] inline TypeId
-indexResultType(TypeInterner const& interner, TypeId base) noexcept {
-    if (!base.valid()) return InvalidType;
-    TypeKind const bk = interner.kind(base);
-    if ((bk == TypeKind::Array || bk == TypeKind::Ptr || bk == TypeKind::Slice)
-        && !interner.operands(base).empty())
-        return interner.operands(base)[0];
+indexResultType(TypeInterner const& interner, TypeId base,
+                TypeId subscript) noexcept {
+    switch (indexContainerOperand(interner, base, subscript)) {
+        case IndexContainerOperand::Base:
+            return interner.operands(base)[0];
+        case IndexContainerOperand::Subscript:
+            return interner.operands(subscript)[0];
+        case IndexContainerOperand::Ambiguous:
+        case IndexContainerOperand::Neither:
+            break;
+    }
     return InvalidType;
 }
 

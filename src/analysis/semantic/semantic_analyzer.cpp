@@ -4708,6 +4708,23 @@ struct SpecifierStorageFacts {
     // consumer's file-scope gate is what keeps a no-linkage block static
     // (6.2.2p6) out of the linkage-mismatch machinery.
     bool localBinding  = false;
+    // P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): a
+    // `{nonDefining:true}` entry matched — c's `extern`, once it stopped being
+    // a rule HEAD and became an ordinary declaration specifier. OR-ed with the
+    // row's own `nonDefiningDeclaration` by `declarationIsNonDefining`, which is
+    // the ONE predicate every consumer now asks; neither half alone is the
+    // answer (the block-scope `externDecl` row still carries the flag, and the
+    // merged file-scope row carries only the specifier).
+    bool nonDefining   = false;
+    // ★★ C 6.7.1p2, OBSERVED BUT NOT REPORTED HERE. The first two DISTINCT
+    // members of one config-declared `exclusiveGroup` found in this prefix, in
+    // SOURCE order, plus the group's own name. `conflictGroup` empty ⇒ no
+    // conflict. This scan's contract is that it EMITS NOTHING (it is called
+    // from six sites and would multiply one diagnostic by six); `pass1Node`
+    // owns the single report, exactly once per declaration node.
+    std::string conflictGroup;
+    NodeId conflictFirst{};
+    NodeId conflictSecond{};
 };
 [[nodiscard]] SpecifierStorageFacts
 scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
@@ -4716,6 +4733,16 @@ scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
     if (decl.linkageSpecifiers.empty()) return out;
     NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
     if (!prefix.valid()) return out;
+    // C 6.7.1p2 bookkeeping: every prefix token that resolved to an entry
+    // declaring an `exclusiveGroup`, with the spelling the user wrote (the
+    // diagnostic must show the source, never a derived key).
+    struct GroupHit {
+        std::string group;
+        std::string text;
+        NodeId      node;
+        std::vector<std::string> const* compatible;   // never null once pushed
+    };
+    std::vector<GroupHit> grouped;
     std::vector<NodeId> stack{prefix};
     for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
         NodeId c = stack.back(); stack.pop_back();
@@ -4797,12 +4824,85 @@ scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
         if (it == decl.linkageSpecifiers.end()) continue;
         if (it->second.threadStorage) out.threadStorage = true;
         if (it->second.staticStorage) out.staticStorage = true;
+        if (it->second.nonDefining)   out.nonDefining   = true;
         if (it->second.binding.has_value()
             && *it->second.binding == SymbolBinding::Local) {
             out.localBinding = true;
         }
+        if (!it->second.exclusiveGroup.empty())
+            grouped.push_back({it->second.exclusiveGroup,
+                               std::string{tree.text(c)}, c,
+                               &it->second.compatibleWith});
+    }
+    // C 6.7.1p2 — at most ONE DISTINCT member of a group per declaration.
+    // ★ THE SORT IS LOAD-BEARING, not cosmetic: the DFS above pops children in
+    // REVERSE source order, so the raw hit order would name the LATER specifier
+    // first and point the diagnostic at the wrong end of the declaration.
+    std::sort(grouped.begin(), grouped.end(),
+              [&](GroupHit const& a, GroupHit const& b) {
+                  return tree.span(a.node).start() < tree.span(b.node).start();
+              });
+    for (std::size_t i = 0; i + 1 < grouped.size() && out.conflictGroup.empty();
+         ++i) {
+        for (std::size_t j = i + 1; j < grouped.size(); ++j) {
+            // A REPEATED specifier is NOT a conflict: clang 18.1.3 accepts
+            // `static static int g;` (gcc and MSVC refuse), and the union rule
+            // makes the accepting reference decisive. Only two DIFFERENT
+            // members of one group violate the constraint.
+            if (grouped[i].group != grouped[j].group) continue;
+            if (grouped[i].text == grouped[j].text) continue;
+            // C 6.7.1's NAMED EXCEPTIONS, read symmetrically: `constexpr` may
+            // appear with `static` (C23 6.7.1p3) while `extern constexpr` stays
+            // a constraint violation. ✔MEASURED on gcc 13.3.0 — the only
+            // reference that implements C23 `constexpr` — which compiles
+            // `static constexpr int K = 4;` and refuses `extern constexpr int
+            // K = 4;` with "'constexpr' used with 'extern'". Either entry
+            // naming the other is enough, so one statement suffices; the
+            // shipped config declares both directions.
+            auto const names = [](std::vector<std::string> const* list,
+                                  std::string const& what) {
+                if (list == nullptr) return false;
+                return std::find(list->begin(), list->end(), what) != list->end();
+            };
+            if (names(grouped[i].compatible, grouped[j].text)
+                || names(grouped[j].compatible, grouped[i].text)) {
+                continue;
+            }
+            out.conflictGroup  = grouped[i].group;
+            out.conflictFirst  = grouped[i].node;
+            out.conflictSecond = grouped[j].node;
+            break;
+        }
     }
     return out;
+}
+
+// ★★★ P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): IS THIS
+// DECLARATION NON-DEFINING? — the ONE predicate every consumer asks, replacing
+// the direct `decl.nonDefiningDeclaration` reads.
+//
+// Two config facets answer it and NEITHER is redundant:
+//   * the per-ROW `nonDefiningDeclaration` flag — for a declaration form that
+//     owns the keyword as its rule HEAD, so "which rule matched" already IS the
+//     answer (c's block-scope `externDecl`);
+//   * a `{nonDefining:true}` SPECIFIER in the prefix — for a form where the
+//     keyword is one member of an unordered specifier set (c's file-scope
+//     `topLevelDecl` after the P53 merge).
+// OR-ed, because a language may legitimately do both, and because the file-scope
+// and block-scope readings of `extern` must not be allowed to disagree.
+//
+// ⚠ WHY THE ROW FLAG COULD NOT SIMPLY BE DELETED: `extern` stopped being a rule
+// head only at FILE scope. `externDecl` is still the block-item rule (C 6.2.2p4
+// shadow correctness — D-CSUBSET-BLOCK-SCOPE-EXTERN), it still ignores
+// `ExternKeyword` BY KIND, and its `linkageSpecifiers` map has no `extern`
+// entry, so the specifier half is silent there and the row flag is the only
+// answer. Reading only the specifier would have silently turned every
+// block-scope `extern` into a tentative definition.
+[[nodiscard]] bool
+declarationIsNonDefining(SemanticConfig const& cfg, Tree const& tree,
+                         NodeId declNode, DeclarationRule const& decl) {
+    if (decl.nonDefiningDeclaration) return true;
+    return scanSpecifierPrefixStorage(cfg, tree, declNode, decl).nonDefining;
 }
 
 // TLS C1 (D-CSUBSET-THREAD-LOCAL): the first specifier-prefix TOKEN whose kind
@@ -7696,6 +7796,44 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 s.reporter.report(std::move(d));
             }
 
+            // ★★ C 6.7.1p2 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS):
+            // at most ONE DISTINCT member of a config-declared mutual-exclusion
+            // group in one declaration's specifier prefix.
+            //
+            // ⚠ THIS CHECK EXISTS BECAUSE THE MERGE DELETED AN ACCIDENT. While
+            // `extern` was the HEAD of its own file-scope declaration rule,
+            // `extern static int g;` could not PARSE and the constraint was
+            // enforced by the grammar's shape rather than by anything that knew
+            // what C 6.7.1p2 says. Making the specifier set genuinely unordered
+            // (the only design that admits `inline extern`) removes that shape,
+            // so the constraint has to be STATED — and stated in the document
+            // that owns the specifier vocabulary, never as an engine pair list.
+            // ✔MEASURED 2026-09-02, three references probed separately: gcc,
+            // clang and MSVC all refuse `extern static` / `static extern` /
+            // `extern constexpr` / `constexpr extern`, so without this DSS would
+            // sit ABOVE the reference union on four spellings.
+            //
+            // ONCE PER DECLARATION NODE, deliberately: the storage scan is
+            // called from six sites and emits nothing itself, so the report
+            // lives here where the declaration is visited exactly once. Both
+            // specifiers are named, and the span is the LATER one — the token
+            // whose removal fixes the program.
+            if (auto const facts =
+                    scanSpecifierPrefixStorage(cfg, tree, node, decl);
+                !facts.conflictGroup.empty()) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_ConflictingStorageClassSpecifiers;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(facts.conflictSecond);
+                d.actual   = std::format(
+                    "'{}' and '{}' are both {} specifiers — a declaration may "
+                    "carry at most one",
+                    tree.text(facts.conflictFirst),
+                    tree.text(facts.conflictSecond), facts.conflictGroup);
+                s.reporter.report(std::move(d));
+            }
+
             // Evaluate the kindByChild discriminator (if any) BEFORE
             // minting the symbol so its `kind` reflects the structural
             // choice in the tree (e.g. c's topLevelDecl with a
@@ -7856,7 +7994,8 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // shadow rule for BOTH forms; a file-scope extern is already at
                         // file scope, so the guard is a no-op there.
                         ScopeId bindScope = current;
-                        if (isProto && !decl.nonDefiningDeclaration)
+                        if (isProto
+                            && !declarationIsNonDefining(cfg, tree, node, decl))
                             bindScope = fileScopeOf(s, tree, current);
                         // c33 (D-CSUBSET-TENTATIVE-DEFINITION): a FILE-SCOPE object
                         // declaration with NO initializer is a TENTATIVE DEFINITION
@@ -7888,7 +8027,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         bool const isTentativeDefinition =
                             (effectiveKind == DeclarationKind::Variable)
                             && !isProto
-                            && !decl.nonDefiningDeclaration
+                            && !declarationIsNonDefining(cfg, tree, node, decl)
                             && decl.declaratorListChild.has_value()
                             && bindScope == fileScopeOf(s, tree, current)
                             && cfg.declarators.has_value()
@@ -7962,7 +8101,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         if (!rec.asmName.empty()
                             && effectiveKind == DeclarationKind::Variable
                             && !isProto
-                            && !decl.nonDefiningDeclaration
+                            && !declarationIsNonDefining(cfg, tree, node, decl)
                             && bindScope.v != fileScopeOf(s, tree, bindScope).v
                             && !scanSpecifierPrefixStorage(cfg, tree, node, decl)
                                     .staticStorage) {
@@ -8119,7 +8258,15 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // stays non-defining. Generic — any declarator-mode row that
                         // is BOTH nonDefiningDeclaration AND kindByChild-Function
                         // resolves a definition as defining (only externDecl is today).
-                        bool const isExtern = decl.nonDefiningDeclaration
+                        // P53: the non-defining fact is now the OR of the row flag
+                        // and a `{nonDefining:true}` SPECIFIER — see
+                        // `declarationIsNonDefining`. `extern int f(void){…}` written
+                        // through the MERGED file-scope row lands here with the
+                        // specifier set and effectiveKind Function, so the
+                        // definition-is-defining suppression below covers both
+                        // spellings by the same test it always used.
+                        bool const isExtern =
+                            declarationIsNonDefining(cfg, tree, node, decl)
                             && effectiveKind != DeclarationKind::Function;
                         rec.isExternDeclaration = isExtern;
                         // c33 (D-CSUBSET-TENTATIVE-DEFINITION): record the tentative
@@ -8378,7 +8525,12 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // declares a positional `name`, not declarator-mode). Mark it
                     // non-defining so it merges with an in-TU definition of the same
                     // name (handled below via the shared mergeOrCollideRedeclaration).
-                    rec.isExternDeclaration = decl.nonDefiningDeclaration;
+                    // P53: the SAME OR-ed predicate the declarator-mode path uses, so
+                    // a positional-name language that spells `extern` as an ordinary
+                    // specifier gets the identical answer — the two mint paths must
+                    // never disagree about what non-defining means.
+                    rec.isExternDeclaration =
+                        declarationIsNonDefining(cfg, tree, node, decl);
                     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the positional-path mirror
                     // of the declarator-mode thread-storage mint — c's
                     // `extern thread_local int e;` mints HERE (externDecl's
@@ -8428,7 +8580,8 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             mergeOrCollideRedeclaration(
                                 s, tree, bindScope, resolved.name, resolved.node,
                                 prior, newId,
-                                /*newNonDef=*/decl.nonDefiningDeclaration);
+                                /*newNonDef=*/declarationIsNonDefining(
+                                    cfg, tree, node, decl));
                         } else {
                             ParseDiagnostic d;
                             d.code     = DiagnosticCode::S_RedeclaredSymbol;
@@ -9278,7 +9431,34 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // bear a flexible array member. `structField` and
                         // `externDecl` are the only two rows that declare it, and
                         // both keep byte-identical behaviour.
-                        bool const allowIncomplete = decl.allowFlexibleArray;
+                        //
+                        // ★★★ P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS)
+                        // — THE SECOND CONDITIONAL FACET, AND IT IS A SECOND
+                        // CONDITIONAL FACET FOR THE SAME REASON AS THE FIRST.
+                        // `extern char v[];` (D-CSUBSET-EXTERN-INCOMPLETE-ARRAY)
+                        // used to reach here through `externDecl`, a row that
+                        // declares `allowFlexibleArray`. At FILE scope that row is
+                        // gone — `topLevelDecl` owns the declaration now — so the
+                        // admission has to come from somewhere, and the honest
+                        // source is the DECLARATION's own non-definingness, not a
+                        // row-wide flag: C 6.9.2 lets a NON-DEFINING declaration
+                        // name an incomplete array precisely because the defining
+                        // declaration elsewhere completes it.
+                        //
+                        // ⚠ SETTING `allowFlexibleArray: true` ON `topLevelDecl`
+                        // WAS TRIED FIRST AND IT IS THE WRONG INSTRUMENT — ✔MEASURED,
+                        // 20 tests red: the flag ALSO gates the init-inference
+                        // completion below (`if (!decl.allowFlexibleArray)`), so
+                        // every file-scope `char msg[] = "hello";` in the tree
+                        // stopped being sized from its initializer and became an
+                        // incomplete object (S_IncompleteTypeObject), and a
+                        // file-scope `int v[0];` silently stopped being
+                        // S_ArrayLengthOutOfRange. A row-wide flag cannot say
+                        // "incomplete is fine on the declarations that do not
+                        // define"; the per-declaration fact can.
+                        bool const allowIncomplete =
+                            decl.allowFlexibleArray
+                            || declarationIsNonDefining(cfg, tree, node, decl);
                         // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF: a row that declares a
                         // TYPE rather than an object may name an INCOMPLETE array
                         // (C 6.7.6.2p1) — `typedef int T[];`. Config-declared via
@@ -11029,14 +11209,21 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 // D-CSUBSET-PACKED: scan the composite's attribute
                                 // surfaces for a honored `packed` (emitting the
                                 // S_UnknownTypeAttribute typo diagnostic exactly ONCE
-                                // here). packed applies only to struct/union. A packed
-                                // composite that ALSO has a bit-field member is
-                                // UNSUPPORTED (D-CSUBSET-PACKED-BITFIELD-INTERACTION):
-                                // fail loud S_PackedBitfieldUnsupported and complete it
-                                // UNPACKED (so the type still lays out — the build
-                                // fails via the unsuppressable diagnostic; the layout
-                                // nullopt belt is the backstop for interner-direct
-                                // construction that bypasses this scan).
+                                // here). packed applies only to struct/union.
+                                //
+                                // ★ D-CSUBSET-PACKED-BITFIELD-INTERACTION: a packed
+                                // composite that ALSO carries a bit-field is NO LONGER
+                                // refused here. It used to fail loud
+                                // (S_PackedBitfieldUnsupported) and complete UNPACKED;
+                                // all three references accept the construct — gcc
+                                // 13.3.0 and clang 18.1.3 spell it
+                                // `__attribute__((packed))`, cl.exe 19.51 and
+                                // mingw-w64 gcc 13.2.0 spell it `#pragma pack(1)` —
+                                // so the refusal was a conformance divergence. The
+                                // layout engine now routes `packed` through the same
+                                // two bit-field packers `#pragma pack(N)` already
+                                // used, and a placement it cannot EXPRESS still fails
+                                // loud there rather than being mis-laid.
                                 //
                                 // TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): the SAME scan
                                 // now also returns a honored whole-composite
@@ -11196,27 +11383,17 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     // ignored; struct and union consume them here,
                                     // byte-identically to before the hoist (the
                                     // P33 `warnOnUse` write moved UP, unchanged).
+                                    // ★ D-CSUBSET-PACKED-BITFIELD-INTERACTION: `packed`
+                                    // is now passed through UNCONDITIONALLY. The
+                                    // bit-field scan that used to stand here — walking
+                                    // `fieldBitWidths` for a non-`kNotBitfield` entry,
+                                    // reporting S_PackedBitfieldUnsupported and then
+                                    // clearing `composedPacked` — is deleted, not
+                                    // downgraded: clearing the flag was the part that
+                                    // made the refusal a SILENT wrong layout for any
+                                    // consumer that suppressed the diagnostic.
                                     composedPacked = composedAttrs.packed;
                                     composedAlign  = composedAttrs.alignment;
-                                    if (composedPacked) {
-                                        bool anyBitfieldMember = false;
-                                        for (std::int64_t const w : fieldBitWidths)
-                                            if (w != kNotBitfield) {
-                                                anyBitfieldMember = true;
-                                                break;
-                                            }
-                                        if (anyBitfieldMember) {
-                                            ParseDiagnostic d;
-                                            d.code = DiagnosticCode::S_PackedBitfieldUnsupported;
-                                            d.severity = DiagnosticSeverity::Error;
-                                            d.buffer = tree.source().id();
-                                            d.span = tree.span(
-                                                specNode.valid() ? specNode : resolved.node);
-                                            d.actual = std::string{srec.name};
-                                            s.reporter.report(std::move(d));
-                                            composedPacked = false;   // complete UNPACKED
-                                        }
-                                    }
                                 }
                                 // FC6: flexible-array-member constraints (C99
                                 // §6.7.2.1), positioned at the offending field.
@@ -12588,10 +12765,45 @@ constQualifiedLvalue(EngineState& s, SemanticConfig const& cfg, Tree const& tree
         if (hirCfg.postfixExprRule.valid() && r == hirCfg.postfixExprRule.v) {
             auto const tgt = targetOf(cur, hirCfg.postfixOps);
             if (tgt == "Index") {
-                NodeId const base = firstInternal(cur);
-                if (!base.valid()) return {};
+                // ★★ D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE — THE THIRD
+                // TRANSFORM ON THE SAME VALUE, and the one that fails toward a
+                // SILENT ACCEPT rather than a refusal. This walk climbs the
+                // pointer spine to decide whether the designated object is
+                // const-qualified, and it used to take `firstInternal` — the
+                // BASE — on the same assumption the two typers made. For the
+                // commuted spelling the base is the INDEX (`i` in `i[cp]`), so
+                // the walk left the spine at an integer, made no claim, and
+                // `const int *cp; i[cp] = 5;` COMPILED while `cp[i] = 5;` was
+                // correctly refused. ✔MEASURED, both directions: gcc 13.3.0 and
+                // clang 18.1.3 refuse BOTH spellings identically ("assignment of
+                // read-only location" / "read-only variable is not assignable").
+                // ⓘ Fixing only the lowering and the type oracle would have
+                // TURNED a refusal into a silent accept here — the shape
+                // [[feedback-a-partial-fix-reads-as-a-complete-one]] names.
+                //
+                // The container is chosen by the SAME shared law both typers
+                // ask, so no fourth answer to "which operand is the pointer" is
+                // minted. The two operand types are derived here (this walk is
+                // structural and carries none), which is the residual cost of
+                // being a separate walk — the member arm above already pays it
+                // through `resolveMemberAccess`.
+                NodeId first{}, second{};
+                for (NodeId c : visibleChildren(tree, cur)) {
+                    if (tree.kind(c) == NodeKind::Token) continue;
+                    if (!first.valid())       first  = c;
+                    else if (!second.valid()) second = c;
+                }
+                if (!first.valid()) return {};
+                NodeId container = first;
+                if (second.valid()
+                    && indexContainerOperand(s.lattice.interner(),
+                                             subtreeType(s, tree, first, here),
+                                             subtreeType(s, tree, second, here))
+                           == IndexContainerOperand::Subscript) {
+                    container = second;
+                }
                 ++levels;
-                cur = base;
+                cur = container;
                 continue;
             }
             if (tgt != "MemberAccess" && tgt != "MemberAccessThruPtr")
@@ -15950,8 +16162,18 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         return promotedUnaryType(ot);
     };
     auto const combinePostfix =
-        [&](NodeId node, HirOperatorEntry const* e, TypeId bt) -> TypeId {
-        if (e->target == "Index")   return indexResultType(interner, bt);
+        [&](NodeId node, HirOperatorEntry const* e, TypeId bt,
+            TypeId st) -> TypeId {
+        // D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE: BOTH operand types go to
+        // the shared law, which asks which one is the container rather than
+        // assuming the base is. This tier had the SAME assumption the CST→HIR
+        // tier had — one value, two transforms — and fixing only the lowering
+        // would have left `sizeof(i[p])` refusing and, worse,
+        // `_Generic(i[p], double: 42, default: 1)` compiling CLEAN and selecting
+        // `default` (✔MEASURED, both, at P53's base: rc 0, exit 1 where gcc and
+        // clang exit 42). The type oracle IS the answer `_Generic`, `sizeof`,
+        // `typeof` and `auto` read, so a wrong answer here is silent.
+        if (e->target == "Index")   return indexResultType(interner, bt, st);
         if (e->target == "PostInc" || e->target == "PostDec") return bt;
         if (e->target == "Call") {
             TypeId sig{};
@@ -16377,14 +16599,26 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         }
         // ── postfix: [base(Internal), OP-token, rest...] ──
         if (r.v == hirCfg.postfixExprRule.v) {
-            NodeId baseN{};
+            NodeId baseN{}, subscriptN{};
             for (NodeId c : visibleChildren(tree, node)) {
-                if (tree.kind(c) != NodeKind::Token) { baseN = c; break; }
+                if (tree.kind(c) == NodeKind::Token) continue;
+                if (!baseN.valid()) { baseN = c; continue; }
+                if (!subscriptN.valid()) { subscriptN = c; }
             }
             HirOperatorEntry const* e = opEntryFor(node, hirCfg.postfixOps);
             if (e == nullptr) { result = InvalidType; return; }
-            work.push_back(Frame{node, Frame::Kind::Postfix, 0, baseN, {}, e,
-                                 {}, 0, {}});
+            // D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE: `Index` needs BOTH
+            // operand types, because C 6.5.3.2p1 lets EITHER of them be the
+            // container. `n1` carries the subscript for that arm and stays
+            // invalid for every other postfix verb (Call / PostInc / PostDec /
+            // member access), whose frame is unchanged — the extra child scan
+            // costs one more loop iteration and changes no other result. It
+            // mirrors `cst_to_hir`'s driver, which has always built base THEN
+            // subscript through its own two-phase Postfix frame, so the tiers
+            // agree on the traversal as well as on the law.
+            if (e->target != "Index") subscriptN = NodeId{};
+            work.push_back(Frame{node, Frame::Kind::Postfix, 0, baseN, subscriptN,
+                                 e, {}, 0, {}});
             return;
         }
         // ── ternary: operands = the 3 non-token visible children [cond,then,else] ──
@@ -16454,9 +16688,23 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             break;
         case Frame::Kind::Postfix:
             if (f.phase == 0) { f.phase = 1; NodeId n = f.n0; enter(n); }
+            else if (f.phase == 1 && f.n1.valid()) {
+                // `Index` only (n1 is invalid for every other postfix verb):
+                // type the SUBSCRIPT before combining, so the shared law can be
+                // asked WHICH operand is the container instead of assuming the
+                // base is. Base-then-subscript is the same order cst_to_hir's
+                // driver uses.
+                f.c0 = result; f.phase = 2; NodeId n = f.n1; enter(n);
+            }
             else {
+                // CAPTURE before pop_back — `f` is a reference into `work` and
+                // the pop dangles it (the Ternary arm below carries the same
+                // note, and learned it the expensive way).
                 NodeId node = f.node; HirOperatorEntry const* e = f.e;
-                work.pop_back(); result = combinePostfix(node, e, result);
+                TypeId subT = f.phase == 2 ? result : InvalidType;
+                TypeId baseT = f.phase == 2 ? f.c0   : result;
+                work.pop_back();
+                result = combinePostfix(node, e, baseT, subT);
             }
             break;
         case Frame::Kind::Ternary:

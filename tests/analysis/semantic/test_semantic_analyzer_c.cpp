@@ -2074,6 +2074,15 @@ TEST(SemanticAnalyzerC, StaticAssertAlignofFoldsFalseFailsLoud) {
 // _Alignof pins use (Natural, stack-align 16) so member layout is exact.
 namespace {
 constexpr AggregateLayoutParams kAlignasLayout{ScalarAlignmentRule::Natural, 16};
+// D-CSUBSET-PACKED-BITFIELD-INTERACTION: the same params PLUS a declared
+// bit-field strategy, for the pins that lay a bit-field out end to end.
+// `kAlignasLayout` leaves `bitFieldStrategy` at `None`, which is the correct
+// fail-loud default and exactly why it cannot serve here.
+// `Ignored` is the x86_64-linux / Apple answer for an unnamed bit-field's
+// alignment contribution (D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT).
+constexpr AggregateLayoutParams kGnuBitfieldLayout{
+    ScalarAlignmentRule::Natural, 16, BitFieldStrategy::GnuPacked,
+    UnnamedBitFieldAlignment::Ignored};
 }  // namespace
 
 // PARSE: a global variable `alignas(16) int x;` (value form) parses cleanly —
@@ -2304,19 +2313,64 @@ TEST(SemanticAnalyzerC, PackedStructFollowedByDeclaratorParses) {
     EXPECT_NE(findSym(model, "g"), nullptr);
 }
 
-// FAIL-LOUD: packed + a bit-field member → S_PackedBitfieldUnsupported (bit-granular
-// packed packing is a distinct, deferred algorithm —
-// D-CSUBSET-PACKED-BITFIELD-INTERACTION). NEVER a silent NON-packed layout.
-TEST(SemanticAnalyzerC, PackedBitfieldFailsLoud) {
+// ★★ D-CSUBSET-PACKED-BITFIELD-INTERACTION — RETARGETED, AND RENAMED FROM
+// `PackedBitfieldFailsLoud`. This pin used to assert an Error
+// (`S_PackedBitfieldUnsupported`, now a RETIRED code), which was DSS refusing
+// BELOW the union: ✔MEASURED, probed SEPARATELY, every reference ACCEPTS a packed
+// aggregate carrying a bit-field — gcc 13.3.0 and clang 18.1.3 spell it
+// `__attribute__((packed))`, cl.exe 19.51 and mingw-w64 gcc 13.2.0 spell it
+// `#pragma pack(1)` (MSVC has no attribute form). It is now ACCEPTED and laid out.
+//
+// The four sizes below are gcc's and clang's own, taken from a `_Static_assert`
+// battery on sizeof AND `_Alignof` that both compile at rc=0
+// (x86_64-linux, `-std=c17`), NOT hand-derived:
+//     `{unsigned a:3; unsigned b:5;}`          1/1
+//     `{char c; unsigned b:9;}`                3/1
+//     `{unsigned a:3; char x; unsigned b:5;}`  3/1
+//     `union {unsigned a:3; unsigned b:30; char x;}`  4/1
+// The UNPACKED twin of the first is 4/4 and is asserted alongside, so this is a
+// pin on `packed` doing something rather than on a number that happens to match.
+//
+// RED-ON-DISABLE: restore either `packed && anyBitfield → nullopt` belt in
+// `computeLayout` (struct arm or union arm) and the `_Static_assert`s stop being
+// integer constant expressions; restore the semantic scan that cleared
+// `composedPacked` and the packed sizes revert to the unpacked ones (4/4, 8/4,
+// 12/4, 4/4) while `hasErrors()` goes true.
+TEST(SemanticAnalyzerC, PackedBitfieldIsAcceptedAndLaidOutGnuTight) {
     auto cu = buildShippedUnit("c", {
-        "struct S { int a : 3; } __attribute__((packed));\n"
+        "struct S1 { unsigned a : 3; unsigned b : 5; } __attribute__((packed));\n"
+        "struct S3 { char c; unsigned b : 9; } __attribute__((packed));\n"
+        "struct S5 { unsigned a : 3; char x; unsigned b : 5; } __attribute__((packed));\n"
+        "union  U9 { unsigned a : 3; unsigned b : 30; char x; } __attribute__((packed));\n"
+        "struct N1 { unsigned a : 3; unsigned b : 5; };\n"
+        "_Static_assert(sizeof(struct S1) == 1, \"gcc/clang: 1\");\n"
+        "_Static_assert(_Alignof(struct S1) == 1, \"gcc/clang: 1\");\n"
+        "_Static_assert(sizeof(struct S3) == 3, \"gcc/clang: 3\");\n"
+        "_Static_assert(_Alignof(struct S3) == 1, \"gcc/clang: 1\");\n"
+        "_Static_assert(sizeof(struct S5) == 3, \"gcc/clang: 3\");\n"
+        "_Static_assert(_Alignof(struct S5) == 1, \"gcc/clang: 1\");\n"
+        "_Static_assert(sizeof(union U9) == 4, \"gcc/clang: 4\");\n"
+        "_Static_assert(_Alignof(union U9) == 1, \"gcc/clang: 1\");\n"
+        "_Static_assert(sizeof(struct N1) == 4, \"the UNPACKED twin: 4\");\n"
+        "_Static_assert(_Alignof(struct N1) == 4, \"the UNPACKED twin: 4\");\n"
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                         kGnuBitfieldLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_PackedBitfieldUnsupported), 1u);
-    EXPECT_TRUE(model.hasErrors());
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "every size/alignment above is gcc's and clang's own measured answer";
+    // The RETIREMENT itself, pinned: 0xE032 must never fire again. Asserting ZERO
+    // (rather than deleting the name from this file) is also what keeps the code
+    // NAMED by a compiled test — `diagnostic_codes_guard` refuses a code no test
+    // pins, and a retired code is exactly the kind that quietly loses its witness.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_PackedBitfieldUnsupported), 0u)
+        << "S_PackedBitfieldUnsupported is RETIRED; nothing may emit it";
+    EXPECT_FALSE(model.hasErrors())
+        << "all three references accept packed + a bit-field; refusing it was a "
+           "conformance divergence, not a guard";
 }
 
 // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack` AMBIGUITY pair. These two
@@ -20069,5 +20123,226 @@ TEST(SemanticAnalyzerC, BareGnuInlineSpellingsStayInlineDefinitions) {
         EXPECT_TRUE(survivingFnIsInline(model, "p"))
             << spelling << " without `extern` IS an inline definition "
                            "(gcc/clang: U p)";
+    }
+}
+
+// ── D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE, the const-lvalue spine ──────
+//
+// `constQualifiedLvalue` climbs the pointer spine to decide whether the
+// designated object is const-qualified, and its subscript arm used to descend
+// into `children[0]` on the same assumption the two typers made. That is the
+// THIRD transform on one value, and the only one that fails toward a SILENT
+// ACCEPT: for `i[cp]` the base is the INDEX, the walk left the spine at an
+// integer and made no claim.
+//
+// ⚠ THIS PAIR IS THE REASON THE SUBSCRIPT FIX IS NOT COMPLETE WITHOUT IT.
+// Before P53 every commuted spelling was refused for an unrelated reason
+// (H_TypeUnresolved at the HIR verifier), so admitting the spelling would have
+// TURNED a refusal into a silent accept — a fix that reads as complete while
+// making one shape strictly worse. gcc 13.3.0 and clang 18.1.3, probed
+// SEPARATELY 2026-09-02, refuse BOTH spellings identically ("assignment of
+// read-only location" / "read-only variable is not assignable").
+//
+// RED-ON-DISABLE (REMOVE direction): revert the subscript arm of
+// `constQualifiedLvalue` to `firstInternal(cur)` and the COMMUTED test reds
+// (0 diagnostics) while the FORWARD one stays green — the control that says
+// this pins the operand choice and not the const rule.
+TEST(SemanticAnalyzerC, ConstPointeeWriteRefusedThroughForwardSubscript) {
+    auto cu = buildShippedUnit("c", {
+        "int f(const int *cp, int i){ cp[i] = 5; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+TEST(SemanticAnalyzerC, ConstPointeeWriteRefusedThroughCommutedSubscript) {
+    auto cu = buildShippedUnit("c", {
+        "int f(const int *cp, int i){ i[cp] = 5; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u)
+        << "`i[cp]` IS `cp[i]` (C 6.5.3.2p1) — the const-lvalue spine must reach "
+           "the same verdict through either spelling, or the commuted one is a "
+           "silent way past the qualifier";
+}
+// The CONTROL that keeps the pair honest: a MUTABLE pointee must stay clean in
+// BOTH spellings, so a walk that simply started claiming const-ness would fail
+// here rather than pass the pair above.
+TEST(SemanticAnalyzerC, MutablePointeeWriteIsCleanThroughEitherSubscript) {
+    auto cu = buildShippedUnit("c", {
+        "int f(int *p, int i){ p[i] = 5; i[p] = 6; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+
+// ═══ P53 — [[D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS]] ═════════════
+//
+// THE PROPERTY THIS BLOCK OWNS: once `extern` stops being a declaration rule's
+// HEAD and becomes an ordinary member of C 6.7.1's unordered specifier SET, the
+// two facts that used to come free from the rule's IDENTITY must be STATED and
+// must still hold.
+//
+// ★★ (1) NON-DEFININGNESS. `externDecl` carried `nonDefiningDeclaration: true`
+// as a per-ROW boolean; the merged `topLevelDecl` reads a `{nonDefining:true}`
+// SPECIFIER instead (`declarationIsNonDefining` ORs the two). Without it every
+// `extern int e;` becomes a TENTATIVE DEFINITION that emits storage in its own
+// TU — a silent wrong answer at rc 0, which is exactly why P53 lane `ex` built
+// the grammar half, measured it, and REVERTED it rather than shipping it alone.
+//
+// ★★ (2) C 6.7.1p2. The grammar used to refuse `extern static int g;` BY
+// ACCIDENT (the keyword was a rule head, so the two spellings could not both
+// parse). The merge deletes that accident, so the constraint is now stated in
+// CONFIG — an `exclusiveGroup` on each storage-class specifier's
+// `linkageSpecifiers` entry — and enforced once per declaration.
+// MEASURED 2026-09-02, three references probed SEPARATELY: gcc 13.3.0
+// -std=c2x, clang 18.1.3 -std=c23, MSVC 19.51.36252 /std:clatest — all three
+// REFUSE the four mixed spellings, and clang ACCEPTS the two REPEATED ones
+// (`static static`, `extern extern`) where gcc and MSVC refuse, so under
+// DSS = (gcc u clang u MSVC) u ISO C a repeat must keep compiling. That
+// asymmetry is the whole reason the guard is keyed on DISTINCT members.
+//
+// RED-ON-DISABLE (REMOVE direction): delete the `exclusiveGroup` cells from
+// `topLevelDecl`'s `linkageSpecifiers` in `c.lang.json` -> the four conflict
+// arms go red while `RepeatedStorageClassSpecifierStillCompiles` and the
+// `_Thread_local` control stay green. Delete the `extern` ENTRY instead ->
+// `ExternSpecifierMakesTheFileScopeDeclarationNonDefining` reds AND
+// H_UnknownLinkageSpecifier returns at the HIR tier.
+
+TEST(SemanticAnalyzerC, ConflictingStorageClassSpecifiersRefusedInBothOrders) {
+    for (std::string_view const decl : {"extern static int g;\n",
+                                        "static extern int g;\n",
+                                        "extern constexpr int g = 1;\n",
+                                        "constexpr extern int g = 1;\n"}) {
+        auto cu = buildShippedUnit("c", {std::string{decl}});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_ConflictingStorageClassSpecifiers),
+                  1u)
+            << decl
+            << " -- C 6.7.1p2 allows at most one storage-class specifier; gcc, "
+               "clang and MSVC all refuse this, so DSS must too or it sits "
+               "ABOVE the reference union. EXACTLY ONE report: the check runs "
+               "once per DECLARATION, not once per declarator or per scan site.";
+    }
+}
+
+// BOTH spellings must be NAMED. A message that mentions only one sends the
+// reader looking for a second offender that is never identified -- and the
+// FIRST-then-SECOND source order is what makes the span point at the token
+// whose removal fixes the program. (The specifier walk pops children in REVERSE
+// source order, so this arm is the one that catches a lost sort.)
+TEST(SemanticAnalyzerC, StorageClassConflictNamesBothSpecifiersInSourceOrder) {
+    auto cu = buildShippedUnit("c", {"static extern int g;\n"});
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    std::string msg;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_ConflictingStorageClassSpecifiers) {
+            msg = d.actual;
+            break;
+        }
+    }
+    ASSERT_FALSE(msg.empty());
+    auto const posStatic = msg.find("static");
+    auto const posExtern = msg.find("extern");
+    EXPECT_NE(posStatic, std::string::npos) << msg;
+    EXPECT_NE(posExtern, std::string::npos) << msg;
+    EXPECT_LT(posStatic, posExtern)
+        << "the message must name the specifiers in SOURCE order; got: " << msg;
+    EXPECT_NE(msg.find("storage-class"), std::string::npos)
+        << "the group's NAME comes from config and must be rendered verbatim, "
+           "so the engine holds no hardcoded word for it; got: " << msg;
+}
+
+// THE CONTROL THAT SAYS THE GUARD IS DISTINCT-KEYED, NOT COUNT-KEYED.
+// MEASURED: clang 18.1.3 compiles `static static int g;` and
+// `extern extern int g;` at rc 0 (gcc and MSVC refuse), so the union rule makes
+// a REPEAT legal for DSS. A guard written as "at most one member of the group"
+// would red here -- which is precisely the wrong answer.
+TEST(SemanticAnalyzerC, RepeatedStorageClassSpecifierStillCompiles) {
+    for (std::string_view const decl : {"static static int g;\n",
+                                        "extern extern int g;\n"}) {
+        auto cu = buildShippedUnit("c", {std::string{decl}});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_ConflictingStorageClassSpecifiers),
+                  0u)
+            << decl << " -- clang accepts a repeated storage-class specifier";
+    }
+}
+
+// C 6.7.1p2's OWN EXCEPTION -- "except that `_Thread_local` may appear with
+// `static` or `extern`" -- expressed by `_Thread_local` simply not declaring the
+// `exclusiveGroup`, so the standard's sentence lives in the config document
+// rather than as an engine carve-out. Both orders, both spellings.
+TEST(SemanticAnalyzerC, ThreadLocalIsExemptFromTheStorageClassConstraint) {
+    for (std::string_view const decl : {"static _Thread_local int g;\n",
+                                        "_Thread_local static int g;\n",
+                                        "static thread_local int g;\n",
+                                        "thread_local static int g;\n",
+                                        "extern _Thread_local int g;\n",
+                                        "_Thread_local extern int g;\n"}) {
+        auto cu = buildShippedUnit("c", {std::string{decl}});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_ConflictingStorageClassSpecifiers),
+                  0u)
+            << decl << " -- 6.7.1p2 exempts the thread-storage specifier";
+    }
+}
+
+// THE NON-DEFINING FACT, READ OFF THE RECORD RATHER THAN OFF THE GRAMMAR.
+// `isExternDeclaration` is the flag the tentative-definition fold, the
+// redeclaration-merge direction and the block-scope re-home guard all consult.
+// Every ordering must set it, because every ordering is the same declaration.
+TEST(SemanticAnalyzerC, ExternSpecifierMakesTheFileScopeDeclarationNonDefining) {
+    for (std::string_view const decl : {"extern int e;\n",
+                                        "extern _Thread_local int e;\n",
+                                        "_Thread_local extern int e;\n",
+                                        "extern thread_local int e;\n",
+                                        "thread_local extern int e;\n"}) {
+        auto model = analyzeShipped("c", {std::string{decl}});
+        SymbolRecord const* e = findSym(model, "e");
+        ASSERT_NE(e, nullptr) << decl;
+        EXPECT_TRUE(e->isExternDeclaration)
+            << decl
+            << " -- an `extern` OBJECT declaration announces a name defined "
+               "elsewhere. Without this it becomes a TENTATIVE DEFINITION and "
+               "emits storage in every TU, silently, at rc 0.";
+        EXPECT_FALSE(e->isTentativeDefinition) << decl;
+    }
+}
+
+// The CONTROL for the arm above: the SAME declaration without `extern` IS a
+// tentative definition (C 6.9.2). A predicate that simply started answering
+// "non-defining" would fail here rather than pass the loop above.
+TEST(SemanticAnalyzerC, WithoutTheExternSpecifierTheDeclarationIsTentative) {
+    auto model = analyzeShipped("c", {"int e;\n"});
+    SymbolRecord const* e = findSym(model, "e");
+    ASSERT_NE(e, nullptr);
+    EXPECT_FALSE(e->isExternDeclaration);
+    EXPECT_TRUE(e->isTentativeDefinition);
+}
+
+// An `extern` on a FUNCTION DEFINITION is DEFINING (C 6.9.1 -- the body IS the
+// definition), in EITHER order. The merged row's kindByChild verdict is what
+// suppresses the non-defining mark, so this pins that the specifier fact did
+// not override the structural one.
+TEST(SemanticAnalyzerC, ExternOnAFunctionDefinitionStaysDefining) {
+    for (std::string_view const src : {"extern int p(int x){return x+1;}\n",
+                                       "extern inline int p(int x){return x+1;}\n",
+                                       "inline extern int p(int x){return x+1;}\n"}) {
+        auto model = analyzeShipped("c", {std::string{src}});
+        EXPECT_FALSE(model.hasErrors()) << src;
+        SymbolRecord const* p = findSym(model, "p");
+        ASSERT_NE(p, nullptr) << src;
+        EXPECT_FALSE(p->isExternDeclaration)
+            << src << " -- a definition is DEFINING despite the specifier";
     }
 }

@@ -6048,6 +6048,14 @@ TEST(ShippedLibDescriptor, TypedefDataModelVariantSelectsAndFailsLoud) {
 // end-to-end by `examples/c/shipped_ioctl_iowr_macho/`, which
 // `_Static_assert`s the encoded numbers (0xc0207a17 &c.) that were measured
 // against the real SDK sys/ioccom.h.
+//
+// D-FFI-IOCTL-SIZE-FIELD-OVERFLOW-SILENT: the three SIZED arms now end in a
+// per-format SIZE CEILING — a named array member of length 1 in range and -1
+// over it, inside a `struct` defined in `sizeof` and multiplied by `0u`, so an
+// oversized type is a C 6.7.6.2p1 constraint violation and the encoded value of
+// every accepted type is unchanged. This file pins the ceiling as TEXT (which
+// arm carries which literal); `test_shipped_ioctl_size_ceiling.cpp` pins the
+// BEHAVIOUR by compiling boundary types through the real front end.
 TEST(ShippedLibDescriptor, RealIoctlRequestEncodingMacrosPerFormat) {
     fs::path const root = shippedLibsRoot();
     ASSERT_FALSE(root.empty());
@@ -6122,19 +6130,137 @@ TEST(ShippedLibDescriptor, RealIoctlRequestEncodingMacrosPerFormat) {
     expectBody(macho, "_IO",
                "(0x20000000u | (((0u) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
     expectBody(macho, "_IOR",
-               "(0x40000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+               "(0x40000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n)"
+               " | (0u * sizeof(struct { char "
+               "dss_ioctl_arg_size_exceeds_IOCPARM_MASK_8191"
+               "[(sizeof(t) > 0x1fffu) ? -1 : 1]; })))", "macho");
     expectBody(macho, "_IOW",
-               "(0x80000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+               "(0x80000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n)"
+               " | (0u * sizeof(struct { char "
+               "dss_ioctl_arg_size_exceeds_IOCPARM_MASK_8191"
+               "[(sizeof(t) > 0x1fffu) ? -1 : 1]; })))", "macho");
     expectBody(macho, "_IOWR",
-               "(0xc0000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+               "(0xc0000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n)"
+               " | (0u * sizeof(struct { char "
+               "dss_ioctl_arg_size_exceeds_IOCPARM_MASK_8191"
+               "[(sizeof(t) > 0x1fffu) ? -1 : 1]; })))", "macho");
     expectBody(elf, "_IO",
                "(((0u) << 30) | ((g) << 8) | (n) | ((0u) << 16))", "elf");
     expectBody(elf, "_IOR",
-               "(((2u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16))", "elf");
+               "(((2u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16)"
+               " | (0u * sizeof(struct { char "
+               "dss_ioctl_arg_size_exceeds_IOC_SIZEMASK_16383"
+               "[(sizeof(t) > 0x3fffu) ? -1 : 1]; })))", "elf");
     expectBody(elf, "_IOW",
-               "(((1u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16))", "elf");
+               "(((1u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16)"
+               " | (0u * sizeof(struct { char "
+               "dss_ioctl_arg_size_exceeds_IOC_SIZEMASK_16383"
+               "[(sizeof(t) > 0x3fffu) ? -1 : 1]; })))", "elf");
     expectBody(elf, "_IOWR",
-               "(((3u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16))", "elf");
+               "(((3u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16)"
+               " | (0u * sizeof(struct { char "
+               "dss_ioctl_arg_size_exceeds_IOC_SIZEMASK_16383"
+               "[(sizeof(t) > 0x3fffu) ? -1 : 1]; })))", "elf");
+
+    // D-FFI-IOCTL-SIZE-FIELD-OVERFLOW-SILENT: each SIZED arm carries ITS OWN
+    // format's ceiling and NOT the other's. The exact-text pins above already
+    // fix this, but they fail as one opaque string diff; these say which half
+    // moved. `_IO` has no size operand on either format, so it carries neither.
+    struct CeilingExpectation {
+        std::vector<ShippedMacro> const* macros;
+        char const*                      fmtName;
+        char const*                      mine;
+        char const*                      theirs;
+    };
+    for (auto const& exp : std::vector<CeilingExpectation>{
+             {&macho, "macho", "(sizeof(t) > 0x1fffu) ? -1 : 1",
+              "(sizeof(t) > 0x3fffu) ? -1 : 1"},
+             {&elf, "elf", "(sizeof(t) > 0x3fffu) ? -1 : 1",
+              "(sizeof(t) > 0x1fffu) ? -1 : 1"}}) {
+        for (auto const& name : {"_IOR", "_IOW", "_IOWR"}) {
+            auto const* sized = find(*exp.macros, name);
+            ASSERT_NE(sized, nullptr) << name << " on " << exp.fmtName;
+            EXPECT_NE(sized->replacement.find(exp.mine), std::string::npos)
+                << name << " on " << exp.fmtName
+                << " lost its size CEILING — an oversized type would encode a "
+                   "well-formed WRONG request number with no diagnostic "
+                   "(macho truncates to 13 bits, elf overflows into the "
+                   "2-bit DIRECTION field and turns _IOR into _IOWR)";
+            EXPECT_EQ(sized->replacement.find(exp.theirs), std::string::npos)
+                << name << " on " << exp.fmtName
+                << " carries the OTHER format's ceiling — the two are 8191 "
+                   "(Darwin IOCPARM_MASK) and 16383 (Linux _IOC_SIZEMASK), so "
+                   "a copy-paste between the arms mis-sizes one of them";
+        }
+        auto const* io = find(*exp.macros, "_IO");
+        ASSERT_NE(io, nullptr) << "_IO on " << exp.fmtName;
+        EXPECT_EQ(io->replacement.find("? -1 : 1"), std::string::npos)
+            << "_IO on " << exp.fmtName
+            << " has no size operand, so it must carry no ceiling either";
+    }
+
+    // ★★ THE CEILING'S ARRAY MUST STAY *NAMED*, AND THAT IS NOW A MEASURED
+    // CHOICE RATHER THAN THE SHAPE A PARSER GAP ONCE FORCED.
+    //
+    // The exact-text pins above would already catch a lost name — but they fail
+    // as one opaque 200-character string diff, and a lane deliberately
+    // simplifying this guard would simply update them and see green. This
+    // assertion is the one that refuses, and it names the alternative it
+    // refuses so the refusal is arguable rather than mysterious.
+    //
+    // WHY. `sizeof(char[(e) ? -1 : 1])` is the strictly-ISO spelling; DSS could
+    // not parse it when the ceiling shipped, and it CAN since
+    // D-CSUBSET-ABSTRACT-ARRAY-TYPE-NAME closed. It was then re-measured
+    // through this very descriptor and REJECTED, because an abstract declarator
+    // has no identifier at all (C 6.7.7p1) and the identifier is the entire
+    // announcement. At ceiling+1, each reference invoked separately:
+    //   gcc 13.3.0 / mingw-w64 gcc 13.2.0
+    //     named  : size of array 'dss_ioctl_arg_size_exceeds_…' is negative
+    //     plain  : size of unnamed array is negative
+    //   clang 18.1.3
+    //     named  : '…' declared as an array with a negative size
+    //     plain  : array size is negative
+    //   MSVC 19.51 — C2118 negative subscript for both; it names neither.
+    // Three of four references print the name. DSS matters most of all: it
+    // still mislocates a macro-expanded constraint violation to the synthetic
+    // define block and renders a raw source slice, so this identifier is the
+    // ONLY token in its whole message that says WHICH limit was exceeded.
+    // Removing it buys a shorter line and spends the entire signal.
+    struct NamedCeiling {
+        std::vector<ShippedMacro> const* macros;
+        char const*                      fmtName;
+        char const*                      identifier;
+    };
+    for (auto const& exp : std::vector<NamedCeiling>{
+             {&macho, "macho", "dss_ioctl_arg_size_exceeds_IOCPARM_MASK_8191"},
+             {&elf, "elf", "dss_ioctl_arg_size_exceeds_IOC_SIZEMASK_16383"}}) {
+        // `<identifier>[` — the name must sit immediately before the length, so
+        // a name left behind in prose while the declarator went anonymous does
+        // not pass.
+        std::string const declarator = std::string{exp.identifier} + "[";
+        for (auto const& name : {"_IOR", "_IOW", "_IOWR"}) {
+            auto const* sized = find(*exp.macros, name);
+            ASSERT_NE(sized, nullptr) << name << " on " << exp.fmtName;
+            EXPECT_NE(sized->replacement.find(declarator), std::string::npos)
+                << name << " on " << exp.fmtName
+                << ": the size ceiling still fires, but its array is no longer "
+                   "NAMED, so the refusal no longer says what it refused. Three "
+                   "of four references print this identifier and DSS carries it "
+                   "too; without it a user one byte over the limit is told only "
+                   "that an array length must be positive, at a location inside "
+                   "a synthetic define block. See the `$comment` in "
+                   "src/dss-config/shippedLibs/sys/ioctl.json for the five-way "
+                   "measurement behind this.";
+            EXPECT_EQ(sized->replacement.find("sizeof(char["), std::string::npos)
+                << name << " on " << exp.fmtName
+                << ": the ceiling was rewritten to the anonymous ISO form "
+                   "`sizeof(char[(e) ? -1 : 1])`. That form does parse now and "
+                   "it does fire — this is not a conformance objection. It was "
+                   "measured against the named one and lost on diagnostic "
+                   "quality alone. If it is to be adopted anyway, the argument "
+                   "has to beat that measurement, not skip it.";
+        }
+    }
 
     // The per-format VARIANT SELECTION really diverged — if the selector ever
     // handed one format the other's arm, these would compare equal. This is the

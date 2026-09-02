@@ -956,6 +956,32 @@ if(DSS_BUILD_TESTS)
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    # `lane-fold.py --self-test` — registered 2026-09-02 (P53) for exactly the
+    # reason the entry above exists, and it is the SAME defect class as
+    # D-GATE-TWO-GUARDS-SELF-TEST-BEHIND-A-FLAG-NOBODY-PASSES.
+    #
+    # ⚠ ✔MEASURED at the P53 fold by lane `lw`, which could not fix it because
+    # this file is outside a lane's set: `lane_worktree_guard` was registered and
+    # its Python TWIN was not, so `lane-fold`'s arms ran only when somebody typed
+    # them. That asymmetry is the dangerous half — the two verbs are one
+    # workflow, `lane-fold` is the one that WRITES over the main tree, and every
+    # arm it carries is a way a fold can destroy work while reporting success
+    # (an INHERITED path silently reverting a sibling lane; a DRIFTED destination
+    # that must refuse the WHOLE fold; a deletion whose destination moved).
+    #
+    # ★ The arms are all REFUSALS by design — a fold that copies the right files
+    # is right by construction and proves nothing — so this entry cannot pass
+    # without the instrument demonstrating it can fail. P53 added arms (i) and
+    # (j): driven from ANOTHER repository's cwd the root still names the tree the
+    # FILE lives in, and `--repo` still reaches elsewhere deliberately
+    # (D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED).
+    add_test(
+        NAME lane_fold_selftest_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/lane-fold/lane-fold.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     # Wrapped-anchor-id guard (2026-08-23 —
     # D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP).
     # An anchor id split across a line break — the line ends `…D-SOME-ANCHOR-`

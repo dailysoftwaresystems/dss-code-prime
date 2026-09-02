@@ -427,10 +427,6 @@ constexpr MembershipReason kWhySilentConstraint{
     MembershipProng::BuildFailsWithNothingSaid,
     "the build already fails on this constraint violation; silenced, it "
     "fails with ZERO diagnostics shown and no statement of why"};
-constexpr MembershipReason kWhyPackedBitfield{
-    MembershipProng::WrongArtifactShipsGreen,
-    "silenced, a packed struct carrying a bit-field is laid out padded "
-    "instead, the wrong ABI"};
 constexpr MembershipReason kWhyNullptrOperand{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, nullptr lowers through the integer-0 null constant and "
@@ -620,7 +616,14 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // face": within the preprocessor's own codes, `#pragma` failures were
 // unsuppressable while `#include` failures were not. ✔The explicit extent did
 // its job a FIFTH time.
-constexpr std::array<UnsuppressableEntry, 169> kUnsuppressableCodes{{
+// ⓘ EXTENT 169 → 168 (2026-09-02, cycle P53, D-CSUBSET-PACKED-BITFIELD-INTERACTION):
+// `S_PackedBitfieldUnsupported` (0xE032) LEAVES — the first DEPARTURE this extent
+// has recorded, every previous move having been an arrival. Its code is retired
+// (packed + a bit-field is supported now), and an unemittable code cannot be
+// suppressed. ✔The explicit extent did its job a SIXTH time, in the other
+// direction: the three well-formedness `static_assert`s fired on the `None` slot
+// the removal left behind, so shrinking the table could not be forgotten.
+constexpr std::array<UnsuppressableEntry, 168> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1398,17 +1401,17 @@ constexpr std::array<UnsuppressableEntry, 169> kUnsuppressableCodes{{
     {DiagnosticCode::S_AlignasWeakerThanNatural, kWhySilentConstraint},
     {DiagnosticCode::S_AlignasInvalidContext, kWhySilentConstraint},
     {DiagnosticCode::S_AlignasNonConstant, kWhySilentConstraint},
-    // S_PackedBitfieldUnsupported (FC16, D-CSUBSET-PACKED, 2026-07-08): a `packed`
-    // struct/union that ALSO carries a bit-field member — an UNSUPPORTED combination
-    // (bit-granular packed packing is a distinct, deferred algorithm). Unlike the
-    // S_Alignas* constraint violations above, suppressing THIS would ship WRONG BYTES:
-    // the layout engine's nullopt belt fails the type out on the packed+bitfield path,
-    // so a suppressed diagnostic would leave the composite to be laid out padded (the
-    // wrong ABI). Closed here so a packed bit-field struct is never silently mislaid.
-    // (S_UnknownTypeAttribute is deliberately NOT a member — it mirrors the suppressible
-    // H_UnknownLinkageSpecifier typo diagnostic, and the build still fails via
-    // hasErrors when it fires unsuppressed.)
-    {DiagnosticCode::S_PackedBitfieldUnsupported, kWhyPackedBitfield},
+    // S_PackedBitfieldUnsupported (0xE032) IS DELIBERATELY ABSENT, and its absence is
+    // the point. It was a member from 2026-07-08 until
+    // D-CSUBSET-PACKED-BITFIELD-INTERACTION
+    // retired the code: `packed` + a bit-field is SUPPORTED now (the same
+    // two per-ABI packers `#pragma pack(N)` uses), so nothing emits it. An unemittable
+    // code cannot be suppressed, and leaving it listed is exactly what made 0xE04E
+    // read as load-bearing for a month after ITS retirement — de-list at retirement,
+    // in the same change, every time.
+    // (S_UnknownTypeAttribute is deliberately NOT a member either — it mirrors the
+    // suppressible H_UnknownLinkageSpecifier typo diagnostic, and the build still
+    // fails via hasErrors when it fires unsuppressed.)
     // S_NullptrInvalidOperand (FC17, D-CSUBSET-NULLPTR): `nullptr` used as an
     // invalid operator operand (`nullptr + 1`, `nullptr < p`, `-nullptr`). Unlike a
     // plain type mismatch, suppressing THIS would ship a SILENT MISCOMPILE: the HIR
@@ -1424,7 +1427,7 @@ constexpr std::array<UnsuppressableEntry, 169> kUnsuppressableCodes{{
     // a suppressed invalid-underlying would silently lay the enum out at the default
     // int width/signedness instead of failing, and a suppressed out-of-range value
     // would be truncated/wrapped into the underlying type — a wrong constant. Same
-    // silent-miscompile-guard class as S_PackedBitfieldUnsupported above. (The
+    // silent-miscompile-guard class as the S_Alignas* entries above. (The
     // default-int enum path never emits either, so unsuppressing changes nothing
     // for existing enums.)
     {DiagnosticCode::S_InvalidEnumUnderlyingType, kWhyEnumUnderlying},

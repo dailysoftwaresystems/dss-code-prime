@@ -272,6 +272,23 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsNonZeroCodeSigSize) {
         if (d.code == DiagnosticCode::K_FormatLacksImportSupport
          && d.actual.find("D-LK7-1") != std::string::npos) {
             sawAnchor = true;
+            // The MATCHED HALF of the key-naming pin in
+            // `StaticPathRefusesAdHocCodeSignatureRequest`: this format
+            // requests through the SIZE key only, so the refusal must name
+            // that one and must not invent an ad-hoc block. Together the two
+            // tests pin `codeSignatureRequestKeys` in both directions — a
+            // helper that always named one key would pass one of them.
+            EXPECT_NE(d.actual.find("'image.codeSignatureSize'"),
+                      std::string::npos)
+                << "refusal must name the placeholder size as the requesting "
+                   "key: " << d.actual;
+            // Note the trailing quote: "'image.codeSignature'" is NOT a
+            // substring of "'image.codeSignatureSize'", so this really does
+            // distinguish the two keys.
+            EXPECT_EQ(d.actual.find("'image.codeSignature'"),
+                      std::string::npos)
+                << "refusal names an ad-hoc block this format does not "
+                   "declare: " << d.actual;
         }
     }
     EXPECT_TRUE(sawAnchor);
@@ -639,7 +656,7 @@ TEST(MachOCodeSignPlaceholder, ShippedX86DarwinExecEmitsAdHocSignature) {
            "walker-invented one";
 }
 
-// ── FLIP MARKER: the static exec arm DROPS an ad-hoc request ─────────
+// ── THE FLIP MARKER HAS FLIPPED: the static exec arm now REFUSES ─────
 //
 // D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM — the REGISTERED id, read
 // back from .plans/_deferred-anchor-registry*.md rather than restated from
@@ -657,36 +674,45 @@ TEST(MachOCodeSignPlaceholder, ShippedX86DarwinExecEmitsAdHocSignature) {
 // the sentence this comment replaced. Look the old id up in the registry, where
 // it has a row whose only job is to redirect here.
 //
-// MEASURED 2026-08-05. `macho::encode`'s dispatch gate routes a
-// codesign request to the dynamic arm by testing
-// `machoImage().codeSignatureSize != 0` ONLY
-// (src/link/format/macho.cpp), and `encodeExec`'s defensive
-// invariant belt re-tests the SAME field only. Neither looks at
-// `image.codeSignature`. So a zero-extern module against a schema whose
-// ONLY signature request is the ad-hoc block takes the static arm,
-// which emits no __LINKEDIT and no LC_CODE_SIGNATURE — the request is
-// dropped with NO diagnostic. That is a silent-miscompile shape: the
-// build reports success and the binary dies at `exec` on any machine
-// that enforces signing.
+// ★ WHAT THIS TEST USED TO BE, because the change is the point. It was a
+// DUAL-MODE marker: it drove the defect, and branched on `bytes.empty()` so it
+// stayed green in the broken world (asserting the signature was absent) AND in
+// the fixed one (asserting a loud D-LK7-1 refusal). Its own docblock instructed
+// the fixing cycle to flip it to the single-mode shape of its sibling
+// `StaticPathRejectsNonZeroCodeSigSize`. That instruction is now carried out,
+// and carrying it out is NOT cosmetic: a test with a green branch on both sides
+// of a rule cannot go red when the rule is removed, so as a PIN the dual-mode
+// version was worth nothing — it was a marker, and the marker's job ended when
+// the defect did.
 //
-// It is UNREACHABLE through the shipped pipeline, which is why it has
-// survived: every Darwin exec schema declares `processExit`, so
-// `linker::link` injects an entry trampoline importing `_exit`, so a
-// real build always has >= 1 extern and always takes the dynamic arm.
-// Only a direct walker call (this test) reaches it.
+// WHAT IT PINS NOW. `macho::encode`'s dispatch gate and `encodeExec`'s
+// defensive belt both read the single `dss::macho::requestsCodeSignature`
+// predicate, so an ad-hoc-ONLY schema — `image.codeSignature` set,
+// `codeSignatureSize` absent, which is what every shipped Darwin exec and
+// dylib document actually declares — is refused on the static arm instead of
+// being encoded with its signature silently dropped. The old behaviour was a
+// silent-miscompile shape: a green build and a binary AMFI refuses at load.
 //
-// This test PINS the defect rather than blessing it. The fix is one
-// condition — `|| im.codeSignature.has_value()` at both sites — and it
-// lives in src/link/format/macho.cpp, out of this cycle's scope. WHEN
-// THAT LANDS this test goes RED, and the correct response is to flip it
-// to the shape its sibling `StaticPathRejectsNonZeroCodeSigSize`
-// already has (empty bytes + a loud D-LK7-1 diagnostic), NOT to delete
-// it.
-TEST(MachOCodeSignPlaceholder, StaticPathDropsAdHocCodeSignatureRequest) {
+// THE FIXTURE IS THE SHIPPED FORMAT ON PURPOSE. A synthetic copy would let the
+// shipped file drift out from under the pin — and the shipped file is exactly
+// the specimen the defect needed, since it is the ad-hoc-only shape.
+//
+// ⓘ Still UNREACHABLE through the shipped pipeline, and that is unchanged by
+// the fix: every Darwin exec schema declares `processExit`, so `linker::link`
+// injects an entry trampoline importing `_exit`, so a real build always has
+// >= 1 extern and always takes the dynamic arm. A direct walker call is the
+// only instrument that reaches this arm, which is why the pin lives here and
+// not in examples/.
+TEST(MachOCodeSignPlaceholder, StaticPathRefusesAdHocCodeSignatureRequest) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
     ASSERT_TRUE(fmt.has_value());
+    // The fixture's PREMISE, both halves: the request arrives through the
+    // ad-hoc block and ONLY through it. If the shipped file ever grew a
+    // hand-typed size this pin would silently become a test of the OTHER key
+    // (and validate() would reject the pair outright — see
+    // `AdHocBlockAlongsideHandTypedSizeRejected`).
     ASSERT_TRUE((*fmt)->machoImage().codeSignature.has_value());
     ASSERT_EQ((*fmt)->machoImage().codeSignatureSize, 0u);
 
@@ -694,39 +720,126 @@ TEST(MachOCodeSignPlaceholder, StaticPathDropsAdHocCodeSignatureRequest) {
     DiagnosticReporter rep;
     auto bytes = encodeMachoUntrampolined(mod, **target, **fmt, rep);
 
-    if (bytes.empty()) {
-        // The FIXED world: the dispatch gate learned about
-        // `codeSignature`. Assert it failed LOUD with the D-LK7-1
-        // anchor its `codeSignatureSize` sibling uses, then update this
-        // test to the sibling's shape and retire the marker.
-        bool sawAnchor = false;
-        for (auto const& d : rep.all()) {
-            if (d.code == DiagnosticCode::K_FormatLacksImportSupport
-             && d.actual.find("D-LK7-1") != std::string::npos) {
-                sawAnchor = true;
-            }
-        }
-        EXPECT_TRUE(sawAnchor)
-            << "the static arm now refuses an ad-hoc codeSignature "
-               "request — good — but it must cite D-LK7-1 like the "
-               "codeSignatureSize path does";
-        return;
+    ASSERT_TRUE(bytes.empty())
+        << "the static arm encoded an image for a format that requests an "
+           "ad-hoc signature — it builds no __LINKEDIT, so the signature was "
+           "dropped and the binary would be refused by AMFI at load";
+    // Pinned by DIAGNOSTIC CODE and MESSAGE, never by emptiness alone: an
+    // empty return with the wrong diagnostic is a different defect wearing
+    // this one's outcome.
+    bool sawRefusal = false;
+    for (auto const& d : rep.all()) {
+        if (d.code != DiagnosticCode::K_FormatLacksImportSupport) continue;
+        if (d.actual.find("D-LK7-1") == std::string::npos)          continue;
+        sawRefusal = true;
+        // The message must name the key that ACTUALLY fired. Naming
+        // `codeSignatureSize` here would send the reader looking for a key
+        // this format does not declare — fail-misleading, not fail-loud.
+        EXPECT_NE(d.actual.find("'image.codeSignature'"), std::string::npos)
+            << "refusal must name the ad-hoc block as the requesting key: "
+            << d.actual;
+        EXPECT_EQ(d.actual.find("'image.codeSignatureSize'"),
+                  std::string::npos)
+            << "refusal names a key this format does not declare: "
+            << d.actual;
+        // ★ WHICH SITE REFUSED, not merely that something did. Both the
+        // dispatch gate in `macho::encode` and the defensive belt in
+        // `macho::encodeExec` now read the same predicate, and both emit
+        // K_FormatLacksImportSupport citing D-LK7-1 — so a test that asked
+        // only "was there a D-LK7-1 refusal" would stay GREEN with the
+        // dispatch gate narrowed back to its defective spelling, caught by
+        // the belt one layer down. That is a green branch over a live defect,
+        // the same shape as the marker this test replaced. The gate is the
+        // CONTRACT; the belt firing is by definition an internal invariant
+        // violation and must never be the user-visible diagnostic.
+        EXPECT_NE(d.actual.find("macho::encode:"), std::string::npos)
+            << "the refusal must come from the dispatch gate in "
+               "macho::encode: " << d.actual;
+        EXPECT_EQ(d.actual.find("invariant violation"), std::string::npos)
+            << "the refusal came from encodeExec's defensive belt — the "
+               "dispatch gate leaked a signature request onto the static arm "
+               "and only the belt caught it: " << d.actual;
     }
-    // TODAY'S world: encoded green, signature silently absent.
-    ASSERT_EQ(rep.errorCount(), 0u);
-    std::uint32_t const ncmds = readU32LE(bytes, 16);
-    std::size_t off = 32;
-    bool foundCS = false;
-    for (std::uint32_t i = 0; i < ncmds; ++i) {
-        std::uint32_t const cmd     = readU32LE(bytes, off);
-        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
-        if (cmd == 0x1Du) foundCS = true;
-        off += cmdsize;
-    }
-    EXPECT_FALSE(foundCS)
-        << "the static arm emitted LC_CODE_SIGNATURE — it builds no "
-           "__LINKEDIT, so the blob would sit outside every segment and "
-           "the kernel's cs_validate_range would reject the binary";
+    EXPECT_TRUE(sawRefusal)
+        << "the static arm must refuse an ad-hoc codeSignature request with "
+           "K_FormatLacksImportSupport citing D-LK7-1, exactly as the "
+           "codeSignatureSize path does";
+}
+
+// ── The reader refuses the inconsistent PAIR ────────────────────────
+//
+// D-LK-MACHO-CODESIGN-SIZE-SILENTLY-OVERRIDDEN-BY-ADHOC. Found while
+// enumerating the sites that ask about a code signature, and fixed in the same
+// change. `image.codeSignature` and `image.codeSignatureSize` are ALTERNATIVES:
+// with the ad-hoc block present the walker DERIVES the reservation from the
+// blob it is about to build, and then asserts the built blob fills that
+// reservation exactly — so a hand-typed size declared alongside can never take
+// effect. It used to be read past in silence, which is a declared config key
+// with no behaviour and no diagnostic. It is refused at the READER now, where
+// the diagnostic can carry the JSON pointer of the key that was typed.
+TEST(MachOCodeSignPlaceholder, AdHocBlockAlongsideHandTypedSizeRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+  "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
+      "format": {"name":"macho-cs-both-keys","kind":"macho"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "entryPoint": "",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "codeSignatureSize": 4096,
+        "codeSignature": {"kind":"adhoc","hashAlgorithm":"sha256","pageSize":4096,"identifier":"com.dss.both"}
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ]
+    })");
+    ASSERT_FALSE(r.has_value()) << "a schema declaring BOTH signature keys "
+                                  "loaded — the hand-typed size can never "
+                                  "take effect and was accepted in silence";
+    EXPECT_EQ(countAtPath(r, "/image/codeSignatureSize"), 1u)
+        << rejectSummary(r);
+    // The MATCHED CONTROL: the same document minus the hand-typed size must
+    // load. Without it this test cannot tell "the pair is refused" from "this
+    // fixture is malformed for some unrelated reason".
+    auto ok = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+  "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
+      "format": {"name":"macho-cs-adhoc-only","kind":"macho"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "entryPoint": "",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "codeSignature": {"kind":"adhoc","hashAlgorithm":"sha256","pageSize":4096,"identifier":"com.dss.both"}
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ]
+    })");
+    ASSERT_TRUE(ok.has_value())
+        << "the ad-hoc-only control must still load — otherwise the rejection "
+           "above proves nothing about the pair";
+    EXPECT_TRUE((*ok)->machoImage().codeSignature.has_value());
+    EXPECT_EQ((*ok)->machoImage().codeSignatureSize, 0u);
 }
 
 // ── PE: schema validate-reject for invalid reservation sizes ─────────

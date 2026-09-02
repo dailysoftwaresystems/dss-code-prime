@@ -176,6 +176,57 @@ struct Built {
     return out;
 }
 
+// ── D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-UNIONS ──────────────────────────
+//
+// A UNION needs its OWN builder, and the reason is the whole point of the row.
+// `buildVarDeclInit` above emits one child per member because that is what a
+// STRUCT initializer looks like; a union initializer names exactly ONE member
+// (C 6.7.9p17), which is what `lowerUnionBraceInit` emits and what
+// `synthZeroOrError`'s composite arm emits (`n = (core == Union) ? 1 :
+// ops.size()`). Reusing the struct builder here would hand the lowering a shape
+// no front end produces — and would trip the new multi-child refusal instead of
+// exercising the union route.
+//
+// `childCount` is a parameter so the SAME builder can produce both the real
+// shape (1) and the impossible one (>1) the refusal exists for.
+[[nodiscard]] Built buildUnionVarDeclInit(TypeInterner& ti, TypeId unionTy,
+                                          std::int64_t value,
+                                          std::size_t childCount = 1) {
+    Built        out;
+    HirBuilder   b{"c"};
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+
+    auto const variants = ti.operands(unionTy);
+    std::vector<HirNodeId> children;
+    for (std::size_t i = 0; i < childCount && i < variants.size(); ++i) {
+        HirLiteralValue lit;
+        lit.core  = ti.kind(variants[i]);
+        lit.value = value;
+        children.push_back(b.makeLiteral(variants[i], out.literals.add(lit)));
+    }
+    HirNodeId const agg  = b.makeConstructAggregate(children, unionTy,
+                                                    HirFlags::Synthetic);
+    HirNodeId const decl = b.makeVarDecl(unionTy, /*symbol=*/1, agg);
+    HirLiteralValue zero;
+    zero.core  = TypeKind::I32;
+    zero.value = std::int64_t{0};
+    HirNodeId const ret  = b.makeReturn(b.makeLiteral(i32, out.literals.add(zero)));
+    HirNodeId const body = b.makeBlock(std::array{decl, ret});
+    HirNodeId const fn   = b.makeFunction(ti.fnSig({}, i32, CallConv::CcSysV),
+                                          /*symbol=*/2, {}, body);
+    out.hir = std::move(b).finish(b.makeModule(std::array{fn}));
+    return out;
+}
+
+// `union U { unsigned a; unsigned long long b; }` — neither explicit offsets nor
+// bit-fields, two sizeable members, both at byte 0. The shape
+// `compositeFieldsOverlap` used to call disjoint.
+[[nodiscard]] TypeId plainUnion(TypeInterner& ti) {
+    std::array<TypeId, 2> const variants{ti.primitive(TypeKind::U32),
+                                         ti.primitive(TypeKind::U64)};
+    return ti.unionType("U", variants);
+}
+
 // A float-typed overlay whose FIRST element is `-0.0` — numerically zero but with
 // its sign bit SET, so its object representation is NOT all-zero bytes. Kept as a
 // dedicated builder because the integer builder cannot express it.
@@ -530,4 +581,95 @@ TEST(OverlapStructZeroInit, RefusalCarriesTheAggregateSourceSpan) {
         located = true;
     }
     EXPECT_TRUE(located) << "no locatable overlap refusal was reported";
+}
+
+// ── 8 · D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-UNIONS ──────────────────────
+//
+// `compositeFieldsOverlap` now tells the truth about a union: its members all sit
+// at byte 0, so a union with two or more sizeable members OVERLAPS. That is the
+// right answer to the question the predicate asks — and it is the wrong gate for
+// this lowering, which is why `lowerAggregateInitIntoSlot` routes unions past it.
+//
+// The gate's real question is "would a positional member-wise write clobber a
+// sibling", and a union brace-init writes exactly ONE member at offset 0. Nothing
+// can be lost, so `union U u = {1};` must keep lowering to that one Store — the
+// same behaviour it had while the predicate was answering `false` for the wrong
+// reason.
+//
+// RED-ON-DISABLE: delete the `interner.kind(aggTy) == TypeKind::Union` route in
+// `lowerAggregateInitIntoSlot` and this test fails with the overlapping-members
+// refusal instead of a Store — i.e. a conformance regression on a construct gcc,
+// clang and MSVC all accept.
+TEST(OverlapStructZeroInit, NonZeroUnionInitStillLowersToItsSingleMemberStore) {
+    TypeInterner ti = makeInterner();
+    TypeId const u  = plainUnion(ti);
+
+    // Fixture preconditions: the predicate really does answer `true` here, so this
+    // test cannot pass by the gate simply not firing.
+    ASSERT_FALSE(ti.hasExplicitOffsets(u));
+    ASSERT_TRUE(ti.scalars(u).empty());
+    ASSERT_TRUE(compositeFieldsOverlap(u, ti, kNatural16, DataModel::Lp64))
+        << "fixture precondition: the authority must call this union overlapping";
+
+    Built built = buildUnionVarDeclInit(ti, u, /*value=*/1);
+    Lowered L;
+    lowerInto(L, built, ti);
+    ASSERT_TRUE(L.result.ok) << "a union brace-init must not be refused";
+    EXPECT_FALSE(sawUnsupported(L.reporter, "overlapping"))
+        << "the union must be routed AWAY from the overlapping-members gate";
+
+    ASSERT_EQ(L.stores.size(), 1u)
+        << "exactly one member is initialized, so exactly one Store";
+    EXPECT_EQ(L.stores[0].offset, 0u) << "every union member lives at byte 0";
+    EXPECT_EQ(L.stores[0].width, 4u)  << "the FIRST variant's width (u32), not the union's";
+    EXPECT_FALSE(L.stores[0].valueIsZeroConst) << "the value is 1, not a zero-fill";
+}
+
+// The ALL-ZERO union initializer takes the same route — it is one Store of 0, NOT
+// the whole-object zero-fill an overlapping STRUCT gets. Kept as a separate pin
+// because the two paths diverge here and a single test could not tell them apart:
+// a union routed to `lowerByteWiseZeroFill` would emit chunk stores covering
+// [0, 8) instead of one 4-byte store at 0.
+TEST(OverlapStructZeroInit, ZeroUnionInitIsOneStoreNotAWholeObjectFill) {
+    TypeInterner ti = makeInterner();
+    TypeId const u  = plainUnion(ti);
+    Built built = buildUnionVarDeclInit(ti, u, /*value=*/0);
+    Lowered L;
+    lowerInto(L, built, ti);
+    ASSERT_TRUE(L.result.ok);
+    ASSERT_EQ(L.stores.size(), 1u);
+    EXPECT_EQ(L.stores[0].offset, 0u);
+    EXPECT_EQ(L.stores[0].width, 4u);
+    EXPECT_TRUE(L.stores[0].valueIsZeroConst);
+}
+
+// ★ THE ASSERT THAT IS EXPECTED NEVER TO FIRE, PINNED ANYWAY. Routing unions past
+// the overlap gate is sound ONLY because a union initializer supplies exactly one
+// member, and ✔MEASURED THREE independent things already guarantee that:
+// `lowerUnionBraceInit` returns a 1-child ConstructAggregate, `synthZeroOrError`
+// computes `n = 1` for a union, and `HirVerifier::checkConstructAggregate` refuses
+// any other child count outright. No front end can build the shape below.
+//
+// It is pinned because all three guarantees live UPSTREAM and the verifier is a
+// SEPARATE PASS that `lowerToMir` neither runs nor requires — which this very test
+// demonstrates, since it reaches the lowering with a 2-child union that the
+// verifier would have rejected. The failure mode of the route is asymmetric: a
+// multi-child union aggregate arriving here would be silently GRANTED exactly the
+// positional clobber the gate exists to refuse, the second Store overwriting the
+// first at the same offset with nothing to observe it. A refusal that never fires
+// costs nothing; a silent permission costs a miscompile.
+//
+// RED-ON-DISABLE: delete the `unionKids.size() > 1` refusal and this lowers
+// SILENTLY to two Stores at offset 0 — `L.result.ok` becomes true and
+// `L.stores.size()` becomes 2, which is the miscompile stated as a measurement.
+TEST(OverlapStructZeroInit, MultiChildUnionAggregateIsRefusedLoud) {
+    TypeInterner ti = makeInterner();
+    TypeId const u  = plainUnion(ti);
+    Built built = buildUnionVarDeclInit(ti, u, /*value=*/1, /*childCount=*/2);
+    Lowered L;
+    lowerInto(L, built, ti);
+    EXPECT_FALSE(L.result.ok)
+        << "two members supplied for one union is a positional clobber, not an init";
+    EXPECT_TRUE(sawUnsupported(L.reporter, "more than one member"))
+        << "and the refusal must say WHICH rule it is (C 6.7.9p17), not the generic text";
 }

@@ -763,13 +763,94 @@ stackArgPackingFromName(std::string_view s) noexcept {
     return kStackArgPackingTable.fromName(s);
 }
 
-// The three measured axes, declared per calling convention. An OMITTED
-// `stackArgPacking` object (and an omitted key inside it) means `Slot`, so every
-// pre-existing CC is byte-unchanged by construction rather than by testing.
+// D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the byte alignment a stacked
+// argument of own-alignment `ownAlign` actually receives, given the CC's
+// declared `cap` and its stack-slot quantum `slotBytes`.
+//
+// ★ THE SINGLE OWNER OF THE CLAMP, DELIBERATELY IN THE SCHEMA RATHER THAN IN
+// EITHER TIER THAT APPLIES IT. Two tiers place stacked arguments — `hir_to_mir`
+// walks the CALLEE's incoming region (the only tier that still has TYPES, hence
+// the only one that can compute an alignment) and `StackArgCursor` (lir_callconv)
+// walks the CALLER's outgoing one. If those two clamp differently the caller
+// writes where the callee does not read, which is exactly the silent
+// byte-offset mismatch this anchor records. Putting the arithmetic beside the
+// fields it reads means neither tier spells it, so neither can drift.
+//
+// `cap == 0` (an undeclared CC) and `ownAlign == 0` (an unstated datum) both
+// yield the plain slot — i.e. the classic flat stride, byte-for-byte. That is
+// what keeps every CC that declares nothing unchanged by construction.
+[[nodiscard]] constexpr std::uint32_t
+stackedArgAlignment(std::uint32_t ownAlign, std::uint32_t cap,
+                    std::uint32_t slotBytes) noexcept {
+    std::uint32_t const slot = slotBytes == 0 ? 1u : slotBytes;
+    if (cap == 0 || ownAlign == 0) return slot;
+    std::uint32_t const honoured = ownAlign < cap ? ownAlign : cap;
+    return honoured < slot ? slot : honoured;
+}
+
+// D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the OWN alignment of a scalar of
+// `sizeBytes` bytes under `params` — the config's bounded-natural rule, which is
+// `min(size, maxAlignment)`. The SAME arithmetic `type_layout`'s `scalarAlign`
+// applies; restated here (over a SIZE rather than a TypeId) because the two tiers
+// that place stacked arguments hold the size, not the layout engine, and they must
+// not each spell it. AGNOSTIC: both operands are config, no arch branch.
+[[nodiscard]] constexpr std::uint32_t
+naturalScalarAlignment(std::uint32_t sizeBytes,
+                       AggregateLayoutParams params) noexcept {
+    switch (params.scalarAlignment) {
+        case ScalarAlignmentRule::Natural:
+            break;
+    }
+    std::uint32_t const size = sizeBytes == 0 ? 1u : sizeBytes;
+    std::uint32_t const cap  = params.maxAlignment;
+    return (cap != 0 && size > cap) ? cap : size;
+}
+
+// The three measured PACKING axes plus the two measured ALIGNMENT CAPS, declared
+// per calling convention. An OMITTED `stackArgPacking` object (and an omitted key
+// inside it) means `Slot` / cap 0, so every pre-existing CC is byte-unchanged by
+// construction rather than by testing.
+//
+// ⚠ THE CAPS ARE NOT A FOURTH PACKING AXIS — read the `StackArgPacking` docblock's
+// "do NOT add a fourth axis speculatively" note as the rule it is. Packing answers
+// "how many bytes does this datum OWN"; a cap answers "how far may this datum's own
+// ALIGNMENT push the cursor before its slot begins". They are independent: Apple
+// arm64 packs named scalars naturally and caps aggregate alignment at the slot,
+// while x86_64 SysV packs everything by slot and honours a 16-byte alignment.
+//
+// ✔MEASURED 2026-09-02, gcc 13.3.0 and clang 18.1.3 agreeing byte-for-byte on
+// every case, callee-side offsets read out of `-O1 -S` (incoming offset 0 = the
+// first stack argument), each datum placed after an ODD number of 8-byte stack
+// args so a 16-byte alignment is observable as a PAD:
+//   x86_64 SysV   `long double` after 1 stacked long → +16 (not +8)  ⇒ cap ≥ 16
+//   x86_64 SysV   `struct{long double;}`             → +16           ⇒ aggregate too
+//   x86_64 SysV   `struct{long x,y;}` (align 8)      → +8            ⇒ NOT size-driven
+//   x86_64 SysV   `struct aligned(16){long x,y;}`    → +16
+//   x86_64 SysV   `struct aligned(32){long x,y;}`    → +32           ⇒ cap ≥ 32
+//   AAPCS64       binary128 `long double`            → +16           ⇒ scalar cap 16
+//   AAPCS64       `struct aligned(16){long x,y;}`    → +8            ⇒ aggregate cap 8
+// ★ The last two rows are why this is CONFIG and not a constant: the two ABIs
+// give the SAME 16-byte-aligned aggregate DIFFERENT answers, and the third and
+// fourth rows are why it cannot be derived from the datum's SIZE — two 16-byte
+// aggregates with different alignments land at different offsets.
 struct StackArgPackingRules {
     StackArgPacking namedScalars    = StackArgPacking::Slot;
     StackArgPacking namedAggregates = StackArgPacking::Slot;
     StackArgPacking variadic        = StackArgPacking::Slot;
+    // The largest own-alignment this CC honours for a stacked SCALAR / stacked
+    // by-value AGGREGATE. 0 ⇒ none above the slot (the pre-existing behaviour).
+    // Validated as 0-or-a-power-of-two at load, like every other alignment field.
+    std::uint16_t   maxScalarAlignment    = 0;
+    std::uint16_t   maxAggregateAlignment = 0;
+
+    [[nodiscard]] constexpr std::uint32_t
+    scalarAlignment(std::uint32_t ownAlign, std::uint32_t slotBytes) const noexcept {
+        return stackedArgAlignment(ownAlign, maxScalarAlignment, slotBytes);
+    }
+    [[nodiscard]] constexpr std::uint32_t
+    aggregateAlignment(std::uint32_t ownAlign, std::uint32_t slotBytes) const noexcept {
+        return stackedArgAlignment(ownAlign, maxAggregateAlignment, slotBytes);
+    }
 };
 
 // D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
@@ -1100,6 +1181,13 @@ struct DSS_EXPORT TargetCallingConvention {
     // in JSON ⇒ all three `Slot` ⇒ every pre-existing CC keeps its exact
     // placement AND its 8-byte access width. `apple_arm64` declares
     // `namedScalars: "natural"`.
+    // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the same object carries the two
+    // stacked-argument ALIGNMENT CAPS. Omitted ⇒ 0 ⇒ no over-alignment honoured
+    // ⇒ the classic flat slot stride. `sysv_amd64` declares
+    // `maxScalarAlignment`/`maxAggregateAlignment` so a stacked `long double`
+    // (and a long-double-leaf aggregate) lands on the 16-byte boundary the x87
+    // ABI requires; `aapcs64` declares the scalar cap only, because a 16-byte
+    // aggregate is measurably NOT over-aligned there.
     StackArgPackingRules stackArgPacking{};
 
     // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the
@@ -2915,6 +3003,91 @@ static_assert(kExitMechanismTable.rows.size()
               "count matching while the projection silently stops being 'the "
               "table minus its sentinel'");
 
+// ── D-CSUBSET-PACKED-ATOMIC-MEMBER: what the NATIVE inline atomic form ────
+//    DOES when the access is not naturally aligned ───────────────────────
+//
+// ★★★ THE KEY IS NAMED FOR THE QUESTION IT ANSWERS, AND THAT IS THE WHOLE
+// POINT OF IT BEING A THREE-WAY ENUM RATHER THAN A BOOLEAN. The first draft of
+// this vocabulary was a single `requiresNaturalAlignment` bool, and it
+// CONFLATED two facts that are measurably different per processor:
+//   * does the native under-aligned form FAULT? and
+//   * does it stay ATOMIC?
+// ✔MEASURED 2026-09-02, one misaligned `_Atomic int` at `&g.a` offset 1:
+//   * aarch64 (NATIVE VPS, gcc 13.3.0): the inlined `stlr`/`ldar` pair dies
+//     rc 135, Bus error (core dumped). It FAULTS.
+//   * x86-64 (gcc 13.3.0, WSL + Windows): the inlined `xchgl 1+g(%rip)` /
+//     `movl 1+g(%rip)` pair RUNS, rc 42. It does NOT fault — but the two
+//     halves are not equally safe. The `xchg` carries x86's implicit LOCK and
+//     stays atomic; the paired PLAIN `movl` is not architecturally atomic when
+//     the four bytes straddle a cache line. It SILENTLY LOSES ATOMICITY.
+// A boolean forces those two into one cell, and the remedy when the format
+// supplies NO atomics runtime is opposite for each: emitting a form that is
+// certain to fault is a miscompile and must be refused, while emitting a form
+// that is what gcc itself ships is the reference-exact answer and refusing it
+// would put DSS below the (gcc ∪ clang ∪ MSVC) ∪ ISO C union. So the fact is
+// declared, per target, as what the form DOES.
+enum class UnderAlignedAtomicForm : std::uint8_t {
+    // The target declares no answer. Treated exactly as `RemainsAtomic` by the
+    // lowering (today's behaviour, byte-identical output), and kept DISTINCT
+    // from it so "unanswered" and "answered: safe" are different states in the
+    // config — a target that has never been measured must not read as one that
+    // has.
+    None           = 0,
+    // The native inline form is fully atomic at ANY alignment; no runtime call
+    // is ever needed. No shipped target declares this today; it exists because
+    // the fact is a per-processor MEASUREMENT and a processor that genuinely
+    // answers this way must be expressible without a code change.
+    RemainsAtomic  = 1,
+    // The native inline form TRAPS on an under-aligned access (aarch64
+    // LDAR/STLR — ✔MEASURED rc 135 SIGBUS on native hardware; qemu-user does
+    // NOT enforce the check, so an emulated leg is structurally blind to this).
+    // Under-aligned accesses MUST route through the format's atomics runtime; a
+    // format that declares none fails LOUD rather than emit a certain fault.
+    Traps          = 2,
+    // The native inline form completes but is not architecturally atomic when
+    // the datum straddles a cache line (x86-64's plain paired load). Under-
+    // aligned accesses route through the atomics runtime when the format
+    // supplies one; when it does not, the native form STANDS — it is what gcc
+    // emits, it works, and refusing would be below the union.
+    LosesAtomicity = 3,
+};
+
+inline constexpr EnumNameTable<UnderAlignedAtomicForm, 4>
+    kUnderAlignedAtomicFormTable{{{
+    { UnderAlignedAtomicForm::None,           "none"           },
+    { UnderAlignedAtomicForm::RemainsAtomic,  "remainsAtomic"  },
+    { UnderAlignedAtomicForm::Traps,          "traps"          },
+    { UnderAlignedAtomicForm::LosesAtomicity, "losesAtomicity" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kUnderAlignedAtomicFormTable);
+
+[[nodiscard]] constexpr std::string_view
+underAlignedAtomicFormName(UnderAlignedAtomicForm f) noexcept {
+    return kUnderAlignedAtomicFormTable.name(f);
+}
+[[nodiscard]] constexpr std::optional<UnderAlignedAtomicForm>
+underAlignedAtomicFormFromName(std::string_view s) noexcept {
+    return kUnderAlignedAtomicFormTable.fromName(s);
+}
+
+[[nodiscard]] constexpr bool
+isSelectableUnderAlignedAtomicForm(UnderAlignedAtomicForm f) noexcept {
+    return f != UnderAlignedAtomicForm::None;
+}
+
+// ⚠ Literal `M` plus the sentinel-count assert, both halves required — the
+// nine-arm measurement is written out at `kSelectableExitMechanismNames` above
+// (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
+inline constexpr auto kSelectableUnderAlignedAtomicFormNames =
+    namesWhere<3>(kUnderAlignedAtomicFormTable,
+                  isSelectableUnderAlignedAtomicForm);
+static_assert(kUnderAlignedAtomicFormTable.rows.size()
+                  == kSelectableUnderAlignedAtomicFormNames.size() + 1,
+              "kUnderAlignedAtomicFormTable must have exactly ONE unselectable "
+              "row (the 'none' sentinel) — a second one leaves `namesWhere`'s "
+              "literal count matching while the refusals silently stop naming "
+              "the set the loader accepts");
+
 // Per-OS process-exit descriptor. Lives on `ObjectFormatData`
 // (loaded from format JSON's `processExit` block). The trampoline
 // emitter (Slice C) reads the active arm based on `mechanism`:
@@ -4044,6 +4217,14 @@ struct DSS_EXPORT TargetSchemaData {
     std::array<bool, kObjectFormatKindCount> charIsUnsignedByFormat{};
     std::array<bool, kObjectFormatKindCount> charIsUnsignedByFormatDeclared{};
 
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: what this PROCESSOR's native inline
+    // atomic load/store form does when the access is not naturally aligned
+    // (`atomics.underAlignedNativeForm` in the `.target.json`). `None` = the
+    // target declares no `atomics` block. Read by MIR→LIR through the ONE
+    // accessor below; NEVER by an arch-name test.
+    UnderAlignedAtomicForm underAlignedAtomicForm =
+        UnderAlignedAtomicForm::None;
+
     // TF-C74 (D-CONFIG-PER-ARCH-PREDEFINED-MACROS): the target's
     // PER-ARCHITECTURE IDENTITY predefined macros
     // (`"predefinedMacros"` — the same entry grammar as the language's
@@ -4544,6 +4725,16 @@ public:
             return d_.charIsUnsignedByFormat[idx];
         }
         return d_.charIsUnsignedDefault;
+    }
+
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: what this processor's native inline
+    // atomic form does under an under-aligned access. `None` when the target
+    // declares no `atomics` block — the lowering then keeps the native form,
+    // which is byte-for-byte today's output. The SOLE reader is MIR→LIR's
+    // `_Atomic` arm; it asks THIS, never the target's name.
+    [[nodiscard]] UnderAlignedAtomicForm
+    underAlignedAtomicForm() const noexcept {
+        return d_.underAlignedAtomicForm;
     }
 
     // ── Per-architecture identity predefined macros (TF-C74) ──────

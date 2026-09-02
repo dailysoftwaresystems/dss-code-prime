@@ -860,13 +860,33 @@ enum class RuntimeLibraryRole : std::uint8_t {
     // Fls*). Distinct from `cLibrary` on pe; on Mach-O the same image serves
     // both, which the table expresses by pointing both roles at it.
     SystemPrimitives  = 3,
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: the image that owns the GENERIC C11
+    // atomics runtime entry points (`__atomic_load` / `__atomic_store`, size
+    // passed at RUNTIME) an under-aligned `_Atomic` access lowers to a CALL of.
+    // ✔MEASURED 2026-09-02 (`nm -D --defined-only`): `libatomic.so.1` on BOTH
+    // Linux legs (aarch64 and x86_64) exports them as ordinary global text at
+    // the default version `@@LIBATOMIC_1.0`, while `libc.so.6` and
+    // `libgcc_s.so.1` export ZERO `__atomic_*` symbols — so on ELF this is a
+    // genuinely DISTINCT image from `cLibrary`, which is the whole argument for
+    // a role rather than reusing one. On Mach-O the SAME `/usr/lib/libSystem.B.
+    // dylib` that plays `cLibrary` carries them (Apple clang links the packed
+    // case with `otool -L` showing libSystem alone), so this format family
+    // points a SECOND row at one image — the sameness the table permits without
+    // asserting.
+    // ⚠ THE GENERIC ENTRIES, NEVER THE SIZED ONES. `__atomic_load_4` and its
+    // family are IFUNCs that resolve to the INLINE realization and SIGBUS on an
+    // under-aligned aarch64 access exactly as `LDAR` does; only the generic,
+    // runtime-sized entries dispatch through libatomic's lock table. Declaring
+    // the names per format (below) is what keeps that choice in config.
+    AtomicsRuntime    = 4,
 };
 
-inline constexpr EnumNameTable<RuntimeLibraryRole, 4> kRuntimeLibraryRoleTable{{{
+inline constexpr EnumNameTable<RuntimeLibraryRole, 5> kRuntimeLibraryRoleTable{{{
     { RuntimeLibraryRole::None,              "none"              },
     { RuntimeLibraryRole::CLibrary,          "cLibrary"          },
     { RuntimeLibraryRole::UnwindPersonality, "unwindPersonality" },
     { RuntimeLibraryRole::SystemPrimitives,  "systemPrimitives"  },
+    { RuntimeLibraryRole::AtomicsRuntime,    "atomicsRuntime"    },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -905,7 +925,7 @@ isSelectableRuntimeLibraryRole(RuntimeLibraryRole r) noexcept {
 // `core/types/target_schema.hpp`
 // (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
 inline constexpr auto kSelectableRuntimeLibraryRoleNames =
-    namesWhere<3>(kRuntimeLibraryRoleTable, isSelectableRuntimeLibraryRole);
+    namesWhere<4>(kRuntimeLibraryRoleTable, isSelectableRuntimeLibraryRole);
 static_assert(kRuntimeLibraryRoleTable.rows.size()
                   == kSelectableRuntimeLibraryRoleNames.size() + 1,
               "kRuntimeLibraryRoleTable must have exactly ONE unselectable row "
@@ -957,6 +977,43 @@ struct DSS_EXPORT SehPersonality {
     RuntimeLibraryRole role = RuntimeLibraryRole::None;  // declared in JSON
     std::string libraryPath;   // DERIVED: resolved from `role` at load
     std::string mangledName;   // "__C_specific_handler"
+};
+
+// ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the atomics-runtime declaration ────────
+//
+// The two GENERIC C11 atomics entry points an UNDER-ALIGNED `_Atomic` scalar
+// access lowers to a CALL of, and the image they are imported from. Populated
+// from the format JSON's `atomicsRuntime` block, whose `role` is resolved
+// against `runtimeLibraries` AT LOAD — so `libraryPath` here is a DERIVED copy
+// of a fact the role table owns, exactly like `SehPersonality` above.
+//
+// ★★ WHY THE NAMES ARE DECLARED PER FORMAT RATHER THAN SPELLED IN THE LOWERER.
+// The C-level spelling is `__atomic_load`, but the SYMBOL a Mach-O image
+// carries is `___atomic_load` — the format's own `cSymbolDecoration` leading
+// underscore. `processExit.importMangledName` already declares its entry the
+// same already-mangled way for the same reason, and that is the shipping
+// pattern: the alternative is the MIR/LIR substrate re-deriving a decoration
+// rule it has no business knowing, which is the `synth_seh_funclets.cpp`
+// hardcoded-`msvcrt.dll` defect one tier over.
+//
+// ★ THE SIGNATURES, ✔MEASURED against clang's own x86-64 call sequence and
+// against a working aarch64 probe on native hardware (P53):
+//     void __atomic_load (size_t size, const void *mem, void *ret, int model)
+//     void __atomic_store(size_t size, void *mem, void *val, int model)
+// size FIRST, memory-order model LAST, and the value/result travels through a
+// caller-supplied SLOT in BOTH directions (never a register return). The model
+// constant needs no translation — DSS's own AtomicLoad/AtomicStore payload
+// encoding (relaxed=0 … seq_cst=5) is byte-identical to `__ATOMIC_*`.
+//
+// A format that declares NO block supplies no atomics runtime; what happens
+// then is the TARGET's `underAlignedAtomicForm` question, not this one (a
+// `traps` target refuses, a `losesAtomicity` target keeps the native form —
+// see `TargetSchema`).
+struct DSS_EXPORT AtomicsRuntime {
+    RuntimeLibraryRole role = RuntimeLibraryRole::None;  // declared in JSON
+    std::string libraryPath;        // DERIVED: resolved from `role` at load
+    std::string loadMangledName;    // "__atomic_load"  / "___atomic_load"
+    std::string storeMangledName;   // "__atomic_store" / "___atomic_store"
 };
 
 // The format's shipped-library synthesis block (`"librarySynthesis"` in

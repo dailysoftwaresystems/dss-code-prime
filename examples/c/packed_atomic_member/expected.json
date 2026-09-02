@@ -1,0 +1,35 @@
+{
+  "$comment": "D-CSUBSET-PACKED-ATOMIC-MEMBER (P53): runtime witness for an UNDER-ALIGNED `_Atomic` scalar access — an `_Atomic int` at byte offset 1 of a `__attribute__((packed))` struct — beside a naturally-aligned CONTROL of the same type in a non-packed struct. exit = 7 + 35 = 42. ⚠⚠ READ THE RUN VERDICT HONESTLY: three of the four arms below CANNOT SEE THIS DEFECT and never could. qemu-user does not enforce the LDAR/STLR alignment check, and x86-64 tolerates a misaligned access outright, so the PRE-FIX binary also exits 42 under `qemu-aarch64`, on pe64/Windows and on elf64-x86_64 — ✔MEASURED both directions at this tree. The arm that CAN see it is `darwin` (native Apple Silicon, `emulator: \"\"`, which enforces the same check Apple clang compiles for), and the decisive measurement was taken OFF the corpus entirely, on a native aarch64 Linux host: the same source, one artifact md5-verified on both ends, `rc 135 Bus error (core dumped)` with the target key mutated back to `remainsAtomic` and `rc 42` as shipped. ★ WHAT THIS EXAMPLE THEREFORE ADDS ON THE BLIND LEGS IS THE CONTROL, NOT THE FAULT: `h.a` must keep the target's NATIVE inline atomic instruction while `g.a` takes the libcall, so a 'fix' that routed every `_Atomic` access through the runtime — which would pass any fault-only test — reds the emitted-form pins in `tests/lir/test_mir_to_lir` instead of shipping. The `release` arm additionally proves the minted extern call survives Mem2Reg/CSE/LICM/DCE (a dropped atomics call would read an uninitialized slot and change the exit). ANTI-FOLD: `g` and `h` are mutable globals, so neither access is constant-foldable.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

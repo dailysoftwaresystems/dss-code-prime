@@ -1127,6 +1127,13 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          // this leg has no F128 softcall binding; an F128 softcall
                          // then fails loud). Resolved per-leg by each wrapper.
                          std::optional<std::string>                  wideFloatSoftcallLibrary,
+                         // D-CSUBSET-PACKED-ATOMIC-MEMBER: the active format's
+                         // atomics-runtime block, threaded into MIR→LIR exactly
+                         // like the F128 softcall library above (nullopt = this
+                         // format supplies none; an under-aligned `_Atomic`
+                         // access then refuses loud under a `traps` target and
+                         // keeps the native form under `losesAtomicity`).
+                         std::optional<AtomicsRuntime>               atomicsRuntime,
                          DiagnosticReporter&                         reporter) {
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
@@ -1147,7 +1154,15 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           std::move(wideFloatSoftcallLibrary),
                           // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52):
                           // trailing param on lowerToLir (positional-safe).
-                          externAddrBinding);
+                          externAddrBinding,
+                          // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES:
+                          // not threaded on this route (the frontend promotes
+                          // first) — stated rather than defaulted so the
+                          // positional slot below is visible.
+                          std::nullopt,
+                          // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's
+                          // atomics runtime.
+                          std::move(atomicsRuntime));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -1257,8 +1272,23 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // 8b. LIR PEEPHOLE (plan 22 OPT8) -- delete the register-to-register
     //     copies the allocator left redundant. See `lir_peephole.hpp` for
     //     why it runs HERE and not after callconv: callconv mints ZERO
-    //     additional identity copies (MEASURED 5575 at both stages over
-    //     `examples/c/**`) and its `perFuncCfi` is keyed BY `LirInstId`,
+    //     additional identity class moves, and its `perFuncCfi` is keyed BY
+    //     `LirInstId`,
+    //     ⚠ CORRECTED 2026-09-02 (P53,
+    //     D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT).
+    //     This repeated `lir_peephole.hpp`'s evidence verbatim -- "MEASURED
+    //     5575 at both stages" -- and that evidence could not support the
+    //     claim. post-rewrite and post-callconv were the only two dump stages
+    //     that existed, and THREE passes sit between them: 2addr synthesizes
+    //     class moves, the peephole DELETES members of exactly the counted
+    //     population, and callconv is the subject. An equal count across that
+    //     span is a NET, and a net of zero is equally consistent with the
+    //     peephole deleting N while callconv mints N. The CONCLUSION survives
+    //     -- re-measured per pass at the two boundaries that now exist,
+    //     callconv is +0 in every bucket on both targets -- but a figure is
+    //     quoted here no longer, because a count in a comment is a measurement
+    //     with no instrument attached. Re-derive it with the census the row
+    //     built.
     //     so a rebuild downstream of it would renumber every CFI row's
     //     subject -- an unwind table that loads clean and walks into the
     //     wrong frame.
@@ -1905,7 +1935,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
                      std::string_view                  wideFloatSoftcallLibrary,
-                     DiagnosticReporter&               reporter) {
+                     DiagnosticReporter&               reporter,
+                     std::optional<AtomicsRuntime> const& atomicsRuntime) {
     SemanticModel&       model   = cuMir.model;
     GrammarSchema const& grammar = *cuMir.grammar;
 
@@ -2135,7 +2166,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.externCallDispatch, cuMir.dataImportBinding,
         cuMir.externAddrBinding,
         cuMir.tlsAccess,
-        std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt), reporter);
+        std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt),
+        atomicsRuntime, reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -2176,7 +2208,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // merge path resolves it near **formatR, exactly as
                       // externCallDispatch is pre-resolved there).
                       std::optional<std::string> wideFloatSoftcallLibrary,
-                      DiagnosticReporter& reporter) {
+                      DiagnosticReporter& reporter,
+                      std::optional<AtomicsRuntime> atomicsRuntime) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
     // by the LK11a symbol-table populate (module-private), exactly as in the CU path.
@@ -2191,7 +2224,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         dataModel, bitFieldStrategy, unnamedBitFieldAlignment,
         callingConventionIndex, cuId,
         externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
-        std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
+        std::move(sehScopes), std::move(wideFloatSoftcallLibrary),
+        std::move(atomicsRuntime), reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU
@@ -3497,7 +3531,10 @@ assembleUnit(CompilationUnit const&        cu,
     return lowerCuMirToAssembly(
         *cuMir, format.processArgs(), format.entryVerbs(),
         format.sehPersonality(), format.name(),
-        target.wideFloatSoftcallLibrary(format.kind()), reporter);
+        target.wideFloatSoftcallLibrary(format.kind()), reporter,
+        // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics runtime, read
+        // off the schema here exactly as `sehPersonality` above is.
+        format.atomicsRuntime());
 }
 
 namespace {

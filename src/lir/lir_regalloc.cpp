@@ -1011,6 +1011,86 @@ LirFuncAllocation const* LirAllocation::forFunc(LirFuncId fn) const noexcept {
     return nullptr;
 }
 
+// ── THE PER-VREG ACCESS-WIDTH CENSUS ────────────────────────────────────────
+//
+// ★★★ D-LIR-COPY-COALESCING-ASKS-THE-REGISTERS-WIDTH-NOT-THE-VALUES. The widest
+// OPERATION WIDTH any instruction in the function STATES while naming each
+// virtual register — as its result or as a register operand. Indexed by vreg
+// id; index 0 is the sentinel and is never consulted.
+//
+// ⚠⚠ WHAT THIS REPLACED, AND WHY IT WAS THE WRONG QUESTION. The predecessor
+// (`classFullWidthBits`) answered *"the widest register this CLASS declares"*
+// and the copy admission test was `copyWidth == that`. It reads as a
+// conservative guard and is in fact a near-total veto: every REGISTER-TO-
+// REGISTER class move in this pipeline is emitted with the width-default flags
+// (`lir_callconv::emitMov`, `mir_to_lir`'s phi copy and `emitMovToFresh`'s
+// register form, `lir_2addr_legalize`'s synthesized tied copy — all pass 0,
+// which `lirInstWidthBits` decodes as 64; only `lowerConst`'s IMMEDIATE form
+// threads a width, and an immediate operand is not a copy candidate at all),
+// while BOTH shipped targets declare their
+// floating-point file 16 bytes wide (`xmm`, `v`). 64 never equals 128, so **no
+// FP copy on any shipped target has ever been coalesced**, on either target,
+// since the pass was written. ✔MEASURED at HEAD on one probe function: all
+// fifteen identity GPR `mov`s deleted, TEN identity `fmov` (arm64) and TEN
+// identity `movaps` (x86_64) emitted.
+//
+// ★★ THE HAZARD IS REAL AND IT IS ABOUT THE VALUE, NOT THE REGISTER. Merging
+// the two ends of `dst = MOVE_W(src)` makes reads of `dst` see src's register
+// CONTENTS above bit W instead of what the copy put there (zeroes on AArch64's
+// FMOV, the destination's old bits on a merging x86 form). That is observable
+// exactly when something READS `dst` above W — so the honest predicate is the
+// widest access to the value, which is what this census answers. A virtual
+// register's value is by construction what its single defining instruction
+// wrote, so a copy always covers the whole of its own result; the census is what
+// turns "by construction" into "checked".
+//
+// ⚠ IT IS CONSERVATIVE IN ONE KNOWN DIRECTION AND THAT IS DELIBERATE: an
+// instruction states ONE width, so a memory op's BASE register is credited with
+// the width of the DATA it moves. A GPR pointer feeding a 16-byte FP frame
+// access therefore reports 128 and its copies stop coalescing. That refuses
+// merges, never admits one — refusing is the safe direction, and separating the
+// two roles would mean re-deriving each operand's bank from the encoding wires
+// here, a second owner of a question `validate()` already asks.
+//
+// ✔MEASURED that the refusal costs nothing observable in `examples/c/**` at
+// release: NO class-move count ROSE against the pre-change census on either
+// shipped target — arm64's emitted single-operand `mov` fell 29508 → 28907 and
+// `fmov` 247 → 73, x86_64's `mov` 41058 → 40401 and `movaps` 373 → 160 — so the
+// merges the bound refuses are not merges the predecessor was making.
+//
+// ⓘ THE WALK IS THE FUNCTION'S OWN BLOCK LIST, NOT `flow.blockOrder`. RPO
+// excludes unreachable blocks; a read in one cannot execute, but the rewrite
+// still EMITS it, and a bound that ignores emitted code would be a bound about
+// the analysis rather than about the module.
+std::vector<std::uint8_t>
+lirMaxStatedAccessWidthBits(Lir const& lir, LirFuncLiveness const& flow) {
+    std::uint32_t maxId = 0;
+    for (auto const& r : flow.ranges) {
+        if (r.vreg.id > maxId) maxId = r.vreg.id;
+    }
+    std::vector<std::uint8_t> widest(maxId + 1u, 0);
+    auto const note = [&](LirReg r, std::uint8_t bits) {
+        if (!r.valid() || r.isPhysical != 0) return;
+        if (r.id == 0 || r.id > maxId) return;
+        if (bits > widest[r.id]) widest[r.id] = bits;
+    };
+    std::uint32_t const nb = lir.funcBlockCount(flow.fn);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        LirBlockId const blk = lir.funcBlockAt(flow.fn, bi);
+        std::uint32_t const n = lir.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const  inst = lir.blockInstAt(blk, i);
+            std::uint8_t const bits = lirInstWidthBits(lir.instFlags(inst));
+            note(lir.instResult(inst), bits);
+            for (auto const& o : lir.instOperands(inst)) {
+                if (o.kind != LirOperandKind::Reg) continue;
+                note(o.reg, bits);
+            }
+        }
+    }
+    return widest;
+}
+
 // ── allocate ───────────────────────────────────────────────────────
 
 namespace {
@@ -1041,32 +1121,6 @@ functionContainsOpcode(Lir const& lir, LirFuncId fn, std::uint16_t op) noexcept 
 // opcode's `requires2Address` index — and holds no mnemonic, no register name
 // and no target identity.
 
-// The full declared width, in bits, of register class `cls` on this target:
-// the widest register the table declares for that class.
-//
-// ⚠ WHY THE **WIDEST** AND NOT THE FIRST. A target register table declares the
-// narrow VIEWS alongside their parents (x86-64 `eax` is a 4-byte GPR row whose
-// `subOf` is `rax`), so "the first GPR row" answers 4 bytes on a 64-bit machine.
-// Taking the maximum answers the question this predicate actually asks — is
-// this copy writing the WHOLE register — which is the same question
-// `lir_peephole`'s R1 asks post-regalloc, where it can read the assigned
-// register's own row directly. Pre-regalloc there is no assigned row yet, so
-// the class's own maximum is the honest stand-in, and it is CONSERVATIVE in the
-// direction that matters: a narrow copy can never equal it, so a partial-
-// register write is never mistaken for a full one.
-//
-// Returns 0 when the class declares no register at all — a caller reads that as
-// "cannot prove full width" and coalesces nothing.
-[[nodiscard]] std::uint32_t
-classFullWidthBits(TargetSchema const& schema, LirRegClass cls) noexcept {
-    std::uint32_t widest = 0;
-    for (auto const& info : schema.registers()) {
-        if (static_cast<LirRegClass>(info.regClass) != cls) continue;
-        auto const bits = static_cast<std::uint32_t>(info.widthBytes) * 8u;
-        if (bits > widest) widest = bits;
-    }
-    return widest;
-}
 
 // One copy-affinity edge: `dst` and `src` are copy-related vreg ids and want
 // the same physical register.
@@ -1104,6 +1158,13 @@ struct CoalesceInput {
     std::vector<CopyEdge>         edges;
     std::vector<AntiAffinityPair> forbidden;
     std::vector<PhysAffinity>     physHints;
+    // Source `LirInstId.v` of every EXPLICIT copy admitted as an edge — the
+    // proof `LirFuncAllocation::coalescedCopyInsts` carries to the rewrite. It
+    // is one entry per `edges` entry and in the same order (the walk is
+    // instruction-ordered, so it comes out ascending), but it is a SEPARATE
+    // list because the edge is about two vregs and this is about one
+    // instruction, and only the instruction can be un-emitted.
+    std::vector<std::uint32_t>    copyInsts;
 };
 
 // The register a value of class `cls` is RETURNED in under `cc`, or nullopt
@@ -1143,7 +1204,6 @@ struct MoveOpcodeCache {
     TargetSchema const& schema;
     std::array<std::optional<std::optional<std::uint16_t>>,
                kLirRegClassCount> byClass{};
-    std::array<std::optional<std::uint32_t>, kLirRegClassCount> widthByClass{};
 
     [[nodiscard]] std::optional<std::uint16_t> moveOpcode(LirRegClass cls) {
         auto const c = static_cast<std::size_t>(cls);
@@ -1153,14 +1213,6 @@ struct MoveOpcodeCache {
                 static_cast<TargetRegClass>(c), RegClassOp::Move);
         }
         return *byClass[c];
-    }
-    [[nodiscard]] std::uint32_t fullWidthBits(LirRegClass cls) {
-        auto const c = static_cast<std::size_t>(cls);
-        if (c >= widthByClass.size()) return 0;
-        if (!widthByClass[c].has_value()) {
-            widthByClass[c] = classFullWidthBits(schema, cls);
-        }
-        return *widthByClass[c];
     }
 };
 
@@ -1279,6 +1331,10 @@ collectCoalesceInput(Lir const& lir, TargetSchema const& schema,
                      LirFuncLiveness const& flow, MoveOpcodeCache& moves,
                      DiagnosticReporter& reporter) {
     CoalesceInput out;
+    // The value-width bound the explicit-copy clause is decided against. One
+    // walk of the function, before the edge walk, because a copy's admissibility
+    // depends on accesses that may sit AFTER it.
+    std::vector<std::uint8_t> const widest = lirMaxStatedAccessWidthBits(lir, flow);
     for (auto const& blk : flow.blockOrder) {
         std::uint32_t const n = lir.blockInstCount(blk);
         for (std::uint32_t i = 0; i < n; ++i) {
@@ -1419,17 +1475,29 @@ collectCoalesceInput(Lir const& lir, TargetSchema const& schema,
                 continue;
             }
             if (result.isPhysical != 0 || src.isPhysical != 0) continue;
-            // THE WIDTH CLAUSE — R1's second, independent guard. A copy
-            // narrower than its register writes bits it did not read, so
-            // merging its two ends changes what the surviving instruction
-            // means. Only a FULL-width class move is an edge.
-            auto const full = moves.fullWidthBits(result.regClass());
-            if (full == 0) continue;
-            if (static_cast<std::uint32_t>(lirInstWidthBits(lir.instFlags(inst)))
-                != full) {
-                continue;
-            }
+            // ── THE WIDTH CLAUSE, AND IT ASKS ABOUT THE **VALUE** ───────────
+            //
+            // D-LIR-COPY-COALESCING-ASKS-THE-REGISTERS-WIDTH-NOT-THE-VALUES.
+            // Merging the two ends is meaning-preserving exactly when nothing
+            // observes a bit the copy did not transfer, so the copy must be at
+            // least as wide as the widest access to EITHER end (`widest`, the
+            // census above). Both ends, not just the destination: the merged
+            // class holds ONE register over the union of the two ranges, so the
+            // bound has to be true of every access to that register.
+            //
+            // ⚠ THE COMPARISON IS `>` AGAINST A CENSUS, NOT `==` AGAINST A
+            // REGISTER WIDTH, and the difference is the whole defect. A copy
+            // narrower than the physical register is still a WHOLE-VALUE copy
+            // when the value is narrower than the register — which is the
+            // normal case for every scalar `double` in a 16-byte SIMD register
+            // and was, under the predecessor test, unconditionally refused.
+            auto const copyWidth =
+                static_cast<std::uint32_t>(lirInstWidthBits(lir.instFlags(inst)));
+            if (result.id >= widest.size() || src.id >= widest.size()) continue;
+            if (static_cast<std::uint32_t>(widest[result.id]) > copyWidth) continue;
+            if (static_cast<std::uint32_t>(widest[src.id])    > copyWidth) continue;
             out.edges.push_back({result.id, src.id});
+            out.copyInsts.push_back(inst.v);
         }
     }
     return out;
@@ -1856,6 +1924,12 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
     CoalescePartition part = buildCoalescePartition(
         coalesceIn, rangeOf, buildPressureMap(flow, classCapacity));
     out.coalescedCopies = part.unions;
+    // The PROOF travels with the allocation, not the outcome — see the field's
+    // docblock. Sorted so the rewrite's membership test is a binary search over
+    // a contract this line establishes rather than over the walk's happening to
+    // be ordered.
+    out.coalescedCopyInsts = coalesceIn.copyInsts;
+    std::sort(out.coalescedCopyInsts.begin(), out.coalescedCopyInsts.end());
 
     // ── PRE-COLORING HINTS, one per vreg. Two sources, and the DEF-SIDE ABI
     // hint wins: an incoming parameter's home is fixed by the calling

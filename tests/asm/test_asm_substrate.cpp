@@ -1839,6 +1839,15 @@ TEST(AsmAggregateGlobal, PaddedStructFullInitEncodesByteExact) {
 // other 3 unit bytes stay zero (pre-zeroed buffer). Red-on-disable: revert the
 // encoder's bit-field arm to the `scalars(ty) empty` fail-loud and this errors
 // instead of packing; or to a full-width per-field store and b clobbers a.
+//
+// ★ D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-BITFIELDS — THIS IS ALSO THE PIN ON
+// `encodeAggregateValue`'s BIT-FIELD-FIRST ORDERING, and the precondition below is
+// what makes it one. `compositeFieldsOverlap` now answers `true` for this struct
+// (a=bits 0..2 and b=bits 3..7 are both in byte 0), so the encoder reaches this
+// packing loop ONLY because it hoists its `computeLayout` above the overlap gate
+// and consults the gate solely when `bitFields` is empty. RED-ON-DISABLE, and this
+// is the arm the row turns on: move the gate back above the layout (or drop the
+// `lay->bitFields.empty()` conjunct) and this test fails with the overlap refusal.
 TEST(AsmAggregateGlobal, BitFieldStructInitPacksIntoUnitByteExact) {
     TypeInterner ti{CompilationUnitId{1}};
     TypeId const u32 = ti.primitive(TypeKind::U32);
@@ -1847,6 +1856,10 @@ TEST(AsmAggregateGlobal, BitFieldStructInitPacksIntoUnitByteExact) {
     TypeId const s = ti.structType("Flags", f, widths);
     AggregateLayoutParams gnuPacked{ScalarAlignmentRule::Natural, 16};
     gnuPacked.bitFieldStrategy = BitFieldStrategy::GnuPacked;
+    ASSERT_TRUE(compositeFieldsOverlap(s, ti, gnuPacked, DataModel::Lp64))
+        << "fixture precondition: these two bit-fields DO share byte 0, and the "
+           "encoder must reach its packing loop in spite of that — not because "
+           "the overlap authority is blind to them";
     auto const r = lowerOneAggGlobal(
         ti, s,
         aggOf({intField(5, TypeKind::U32), intField(20, TypeKind::U32)},
@@ -1932,6 +1945,12 @@ TEST(AsmAggregateGlobal, BitFieldUnionInitPacksFirstMemberByteExact) {
     TypeId const u = ti.unionType("Flags", f, widths);
     AggregateLayoutParams gnuPacked{ScalarAlignmentRule::Natural, 16};
     gnuPacked.bitFieldStrategy = BitFieldStrategy::GnuPacked;
+    // D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-BITFIELDS: the UNION half of the
+    // bit-field-first ordering. Both members sit at offset 0 in bits [0,W), so the
+    // overlap authority answers `true` here too — and the encoder still packs,
+    // because it consults that authority only when `bitFields` is empty.
+    ASSERT_TRUE(compositeFieldsOverlap(u, ti, gnuPacked, DataModel::Lp64))
+        << "fixture precondition: a bit-field union's members share byte 0";
     auto const r = lowerOneAggGlobal(
         ti, u,
         aggOf({intField(5, TypeKind::U32)}, TypeKind::Union),   // first member a:3=5
@@ -2653,4 +2672,85 @@ TEST(AsmDataSection, ComplexGlobalEmitsTwoComponentImageAtElementOffsets) {
                                       DataModel::Lp64);
     EXPECT_GT(rf.errors, 0u)
         << "a scalar leaf cannot carry both complex components";
+}
+
+// ── D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-UNIONS, the STATIC-DATA half ─────
+//
+// `compositeFieldsOverlap` now answers `true` for a union whose members carry
+// neither explicit offsets nor bit-fields — truthfully: every union member sits at
+// byte 0. `encodeAggregateValue` consults that authority to decide whether a
+// positional member-wise write is meaningful, so the truthful answer would have
+// made it REFUSE `static union U u = {1};` — a construct gcc, clang and MSVC all
+// accept. It routes unions past the gate instead, the exact twin of the route
+// `hir_to_mir.cpp`'s `lowerAggregateInitIntoSlot` takes, because a union
+// initializer names exactly ONE member (C 6.7.9p17): one encode at
+// `fieldOffsets[0] == 0` into a `buf` pre-zeroed to the layout size.
+//
+// The union static-global cases already in this file (the enum battery's
+// `union U { enum E e; int n; }` and the `_BitInt` battery's `union UBitInt`) are
+// the incumbents this must not break; this test is the one that names the rule and
+// asserts the PRECONDITION, so it cannot pass by the gate quietly not firing.
+//
+// RED-ON-DISABLE: delete the `!isUnion &&` conjunct on the overlap gate in
+// `encodeAggregateValue` and this errors with "overlapping explicit-offset struct"
+// instead of emitting bytes.
+TEST(AsmAggregateGlobal, NonZeroUnionGlobalEncodesItsSingleMemberAtOffsetZero) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    std::array<TypeId, 2> const variants{u32, u64};
+    TypeId const u = ti.unionType("U", variants);
+
+    ASSERT_FALSE(ti.hasExplicitOffsets(u))
+        << "fixture precondition: NO explicit-offset channel";
+    ASSERT_TRUE(ti.scalars(u).empty())
+        << "fixture precondition: and NO bit-field channel either";
+    ASSERT_TRUE(compositeFieldsOverlap(u, ti, kNatural16, DataModel::Lp64))
+        << "fixture precondition: the authority must call this union overlapping, "
+           "or this test passes for the wrong reason";
+
+    auto const r = lowerOneAggGlobal(
+        ti, u, aggOf({intField(0x11223344, TypeKind::U32)}, TypeKind::Union),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(r.errors, 0u) << r.messages;
+    ASSERT_EQ(r.items.size(), 1u);
+    // The union is 8 bytes (its widest member); the initializer writes the FIRST
+    // variant's 4 and the rest stay zero. The byte vector is a SIZE assertion as
+    // well as a content one: an encode that wrote the union's full width, or that
+    // stopped short of the layout size, changes the length.
+    std::vector<std::uint8_t> const want{0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0};
+    EXPECT_EQ(r.items[0].bytes, want)
+        << "one member at offset 0, the union's remaining bytes zero";
+}
+
+// ★ THE ASSERT THAT IS EXPECTED NEVER TO FIRE, PINNED ANYWAY — the static-data twin
+// of `OverlapStructZeroInit.MultiChildUnionAggregateIsRefusedLoud`. Routing unions
+// past the overlap gate is sound ONLY because a union initializer supplies exactly
+// one member; ✔MEASURED that three independent things guarantee it (both HIR
+// producers plus `HirVerifier::checkConstructAggregate`), so no front end can build
+// the shape below today. All three live UPSTREAM of the literal pool this encoder
+// reads and none of them runs here. If a multi-child union aggregate ever did
+// arrive, the route would silently GRANT the positional clobber the gate exists to
+// refuse — the second member's bytes overwriting the first's at the same offset, in
+// the DATA SECTION, with nothing to observe it.
+//
+// RED-ON-DISABLE: delete the `isUnion && agg.fields.size() > 1` refusal and this
+// emits {0x44,0x33,0x22,0x11,...} silently overwritten by the second member,
+// `r.errors` becomes 0, and the EXPECT below flips.
+TEST(AsmAggregateGlobal, MultiMemberUnionGlobalIsRefusedLoud) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    std::array<TypeId, 2> const variants{u32, u64};
+    TypeId const u = ti.unionType("U", variants);
+
+    auto const r = lowerOneAggGlobal(
+        ti, u,
+        aggOf({intField(0x11223344, TypeKind::U32), intField(0x55, TypeKind::U64)},
+              TypeKind::Union),
+        kNatural16, DataModel::Lp64);
+    EXPECT_GT(r.errors, 0u)
+        << "two members supplied for one union is a positional clobber, not an init";
+    EXPECT_NE(r.messages.find("more than one member"), std::string::npos)
+        << "and the refusal must say WHICH rule it is (C 6.7.9p17): " << r.messages;
 }

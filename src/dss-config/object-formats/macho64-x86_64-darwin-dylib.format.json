@@ -47,6 +47,16 @@
   },
 
   "$externCallDispatchComment": "The walker synthesizes a `__stubs` entry per extern FUNCTION (x86_64 = 6-byte FF 25 disp32 through the `__got` slot, lazy/eager per bindNow) and the call site is a plain direct `call rel32` to the stub -- pc-relative, slide-safe under the dyld base slide. D-FFI-EXTERN-CALL-DISPATCH.",
+  "$runtimeLibrariesComment": "D-CSUBSET-PACKED-ATOMIC-MEMBER: this format's ROLE -> IMAGE table. It did not exist here before P53 because no spine block on this flavor named a role; `atomicsRuntime` below is the first, and the loader REFUSES a row no block names (inert config), so the two land together or not at all.",
+  "runtimeLibraries": [
+    { "role": "atomicsRuntime", "image": "/usr/lib/libSystem.B.dylib" }
+  ],
+  "$atomicsRuntimeComment": "D-CSUBSET-PACKED-ATOMIC-MEMBER: the GENERIC C11 atomics entry points an UNDER-ALIGNED `_Atomic` scalar access lowers to a CALL of, and the role naming the image that owns them. ★ THE NAMES ARE DECLARED HERE, ALREADY MANGLED FOR THIS FORMAT, for the reason `processExit.importMangledName` is: the C-level spelling is `__atomic_load`, but the SYMBOL a Mach-O image carries is `___atomic_load` — this format's own `cSymbolDecoration` leading underscore — and a lowerer re-deriving that rule would be the hardcoded-`msvcrt.dll` defect one tier over. ⚠⚠ THE GENERIC, RUNTIME-SIZED ENTRIES, NEVER THE SIZED `__atomic_load_4` FAMILY: ✔MEASURED 2026-09-02 on the native arm64 VPS, the sized entry SIGBUSes on the very access this block routes around (it is an IFUNC resolving to the inline realization), while the generic one dispatches through libatomic's lock table and returns the value — rc 42 against rc 135. A probe that calls the sized entry measures \"no working reference exists\", which is false. WHY THIS ROW POINTS AT THE IMAGE `cLibrary` ALREADY NAMES: ✔MEASURED — Apple clang links the packed case with `otool -L` showing `/usr/lib/libSystem.B.dylib` ALONE and it runs rc 42; there is no `/usr/lib/libatomic*` on darwin, libSystem itself carries the entries. The role table PERMITS that sameness without ASSERTING it, which is the whole difference from a per-format CRT string, and `imageForRole` is nullopt-fail-loud so the row has to exist even though no new dylib reaches the link line. RED-ON-DISABLE: delete this block and an under-aligned `_Atomic` access refuses at compile time under a `traps` target, naming this key.",
+  "atomicsRuntime": {
+    "role": "atomicsRuntime",
+    "loadMangledName": "___atomic_load",
+    "storeMangledName": "___atomic_store"
+  },
   "externCallDispatch": "direct-plt",
 
   "$dataImportBindingComment": "extern library DATA objects bind GOT-INDIRECT -- the walker reserves a `__got` slot per imported object; dyld's bind opcodes write the object's address into the slot and the GotIndirect lowering reads it. Copy relocations are not a Mach-O mechanism, and are no longer a DSS one either: the value was deleted from `DataImportBinding` (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET).",

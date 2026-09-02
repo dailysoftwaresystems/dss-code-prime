@@ -8938,10 +8938,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     // missing keys are BOOLEANS, so the "string
                                     // fields" half was wrong for them as well
                                     // (D-CONFIG-GRAMMAR-LOADER-KEY-SHAPE-SENTENCES-RETYPE-THEIR-VOCABULARIES).
-                                    static constexpr std::array<std::string_view, 4>
+                                    static constexpr std::array<std::string_view, 7>
                                         kLinkageEffectKeys{"binding", "visibility",
                                                            "staticStorage",
-                                                           "threadStorage"};
+                                                           "threadStorage",
+                                                           "nonDefining",
+                                                           "exclusiveGroup",
+                                                           "compatibleWith"};
                                     DSS_CHECK_KEY_VOCABULARY(kLinkageEffectKeys);
                                     if (!eff.is_object()) {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -9048,6 +9051,98 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         effect.threadStorage =
                                             eff.at("threadStorage").get<bool>();
                                         if (effect.threadStorage) any = true;
+                                    }
+                                    // D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS
+                                    // (P53): the NON-DEFINING axis — `extern` says
+                                    // the declaration announces a name defined
+                                    // elsewhere. The staticStorage/threadStorage
+                                    // mirror, third of three optional bools.
+                                    if (eff.contains("nonDefining")) {
+                                        if (!eff.at("nonDefining").is_boolean()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'nonDefining' must be a "
+                                                      "boolean");
+                                            continue;
+                                        }
+                                        effect.nonDefining =
+                                            eff.at("nonDefining").get<bool>();
+                                        if (effect.nonDefining) any = true;
+                                    }
+                                    // C 6.7.1p2 as CONFIG: the mutual-exclusion
+                                    // group this specifier belongs to (at most one
+                                    // DISTINCT member per declaration). A
+                                    // non-empty string is required — an empty one
+                                    // would declare a group nothing can be told
+                                    // apart from "no group", which is exactly the
+                                    // silently-inert facet this loader refuses
+                                    // everywhere else.
+                                    if (eff.contains("exclusiveGroup")) {
+                                        if (!eff.at("exclusiveGroup").is_string()
+                                            || eff.at("exclusiveGroup")
+                                                   .get<std::string>()
+                                                   .empty()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'exclusiveGroup' must be a "
+                                                      "non-empty string naming the "
+                                                      "mutual-exclusion group this "
+                                                      "specifier belongs to");
+                                            continue;
+                                        }
+                                        effect.exclusiveGroup =
+                                            eff.at("exclusiveGroup").get<std::string>();
+                                        any = true;
+                                    }
+                                    // C 6.7.1's "except that …" clause — the
+                                    // NAMED exceptions to the group. `static
+                                    // constexpr` is legal C23 while `extern
+                                    // constexpr` is not, so a flat group cannot
+                                    // state the rule on its own.
+                                    if (eff.contains("compatibleWith")) {
+                                        auto const& cw = eff.at("compatibleWith");
+                                        if (!cw.is_array()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'compatibleWith' must be an "
+                                                      "array of specifier-text "
+                                                      "strings naming the members "
+                                                      "of this specifier's "
+                                                      "exclusiveGroup it may "
+                                                      "legally co-occur with");
+                                            continue;
+                                        }
+                                        bool bad = false;
+                                        for (auto const& e2 : cw) {
+                                            if (!e2.is_string()
+                                                || e2.get<std::string>().empty()) {
+                                                coll.emit(
+                                                    DiagnosticCode::C_InvalidSemantics,
+                                                    effPath,
+                                                    "each 'compatibleWith' entry "
+                                                    "must be a non-empty specifier-"
+                                                    "text string");
+                                                bad = true;
+                                                break;
+                                            }
+                                            effect.compatibleWith.push_back(
+                                                e2.get<std::string>());
+                                        }
+                                        if (bad) continue;
+                                        // An exception list with no group to
+                                        // except FROM is a statement about
+                                        // nothing — the silently-inert facet
+                                        // this loader refuses everywhere else.
+                                        if (effect.exclusiveGroup.empty()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'compatibleWith' names "
+                                                      "exceptions to an "
+                                                      "'exclusiveGroup', so the "
+                                                      "entry must declare one");
+                                            continue;
+                                        }
+                                        any = true;
                                     }
                                     if (!any) {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,

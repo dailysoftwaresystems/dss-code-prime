@@ -1082,6 +1082,13 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                               librarySynthesis->libraryPath,
                               "/librarySynthesis"});
         }
+        // D-CSUBSET-PACKED-ATOMIC-MEMBER: the fifth role-naming spine block.
+        if (atomicsRuntime.has_value()
+            && atomicsRuntime->role != RuntimeLibraryRole::None) {
+            claims.push_back({atomicsRuntime->role,
+                              atomicsRuntime->libraryPath,
+                              "/atomicsRuntime"});
+        }
         for (auto const& c : claims) {
             auto const image = runtimeLibraries.imageForRole(c.role);
             if (!image.has_value()) {

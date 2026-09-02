@@ -634,3 +634,161 @@ TEST(RuntimeLibraryRoles, RepointingCLibraryChangesTheEmittedImportTable) {
            "and unwindPersonality at it, and the trampoline's exit import rides "
            "cLibrary; got: " << mutantText;
 }
+
+// ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the FIFTH role, both directions ────────
+//
+// `atomicsRuntime` joins `cLibrary` / `unwindPersonality` / `systemPrimitives`
+// as a runtime-library ROLE, and `atomicsRuntime` joins `processExit` /
+// `processArgs` / `sehPersonality` / `librarySynthesis` as a role-NAMING spine
+// block. The biconditional the table rests on therefore has two new halves, and
+// both are pinned here because either one alone would let the pair rot: a row
+// with no block is inert config (the stale-image shape), and a block with no row
+// resolves its import to NO IMAGE.
+//
+// ⚠ WHY THIS MATTERS MORE FOR THIS ROLE THAN FOR THE OTHERS: the consumer
+// MINTS an extern import bound to whatever this table says. A wrong or absent
+// image is an UNRESOLVED SYMBOL AT LINK for every program that touches an
+// under-aligned `_Atomic` — which is precisely the outcome two prior P53 lanes
+// refused to risk by shipping the config ahead of its consumer.
+
+TEST(RuntimeLibraryRoles, DeletingTheAtomicsRuntimeRowRefusesTheFormatAtLoad) {
+    std::string text = readShippedFormatText("elf64-aarch64-linux-exec");
+    ASSERT_FALSE(text.empty()) << "the shipped elf-aarch64 exec format must be readable";
+    {
+        auto ok = ObjectFormatSchema::loadFromText(text);
+        ASSERT_TRUE(ok.has_value())
+            << "the UNMUTATED shipped text must load clean, or the mutant proves "
+               "nothing";
+    }
+    constexpr std::string_view kRow =
+        R"({ "role": "atomicsRuntime", "image": "libatomic.so.1" })";
+    std::size_t occurrences = 0;
+    for (std::size_t at = text.find(kRow); at != std::string::npos;
+         at = text.find(kRow, at + 1)) {
+        ++occurrences;
+    }
+    ASSERT_EQ(occurrences, 1u)
+        << "the row under test must appear EXACTLY once in the subject, or "
+           "removing one occurrence leaves the fact in place";
+
+    std::string mutant = text;
+    ASSERT_TRUE(substituteOnce(mutant, kRow, R"({ "role": "cLibrary", "image": "libc.so.6" })"))
+        << "the mutation anchor must still exist — a no-op mutation is how a "
+           "red-on-disable pin goes green forever";
+    ASSERT_NE(mutant, text) << "the mutant must differ byte-wise from the subject";
+    ASSERT_EQ(mutant.find(kRow), std::string::npos)
+        << "the witness must be ABSENT from the mutant, by the same matcher";
+
+    auto bad = ObjectFormatSchema::loadFromText(mutant, "<mutant>");
+    ASSERT_FALSE(bad.has_value())
+        << "removing the row that `atomicsRuntime` NAMES must REFUSE the format "
+           "at LOAD — otherwise the block's minted `__atomic_load` import would "
+           "be bound to no image, i.e. an unresolved symbol at link for every "
+           "program with an under-aligned _Atomic access";
+    bool namedTheBlock = false;
+    for (auto const& d : bad.error()) {
+        if (d.path.find("atomicsRuntime") != std::string::npos) namedTheBlock = true;
+    }
+    EXPECT_TRUE(namedTheBlock)
+        << "the refusal must NAME the block whose role stopped resolving, so the "
+           "reader knows which `.format.json` key to add";
+}
+
+TEST(RuntimeLibraryRoles, DeletingTheAtomicsRuntimeBlockLeavesTheRowInertAndRefuses) {
+    // The OTHER direction. Delete the BLOCK and the row it named becomes inert
+    // config — nothing reads it, so nothing contradicts it, which is exactly how
+    // a stale image survives a migration. The loader refuses that too.
+    std::string text = readShippedFormatText("elf64-aarch64-linux-exec");
+    ASSERT_FALSE(text.empty());
+    {
+        auto ok = ObjectFormatSchema::loadFromText(text);
+        ASSERT_TRUE(ok.has_value());
+    }
+    std::size_t const blockAt = text.find(R"("atomicsRuntime": {)");
+    ASSERT_NE(blockAt, std::string::npos)
+        << "the shipped format must declare an `atomicsRuntime` BLOCK";
+    std::size_t const closeAt = text.find("\n  },\n", blockAt);
+    ASSERT_NE(closeAt, std::string::npos);
+    std::string mutant = text;
+    mutant.erase(blockAt, (closeAt + 6) - blockAt);
+    ASSERT_NE(mutant, text);
+    ASSERT_EQ(mutant.find(R"("atomicsRuntime": {)"), std::string::npos)
+        << "the block must be ABSENT from the mutant, by the same matcher";
+    ASSERT_NE(mutant.find(R"({ "role": "atomicsRuntime", "image": "libatomic.so.1" })"),
+              std::string::npos)
+        << "the ROW must SURVIVE — this mutant is about the row going unnamed, "
+           "and removing both would test nothing";
+
+    auto bad = ObjectFormatSchema::loadFromText(mutant, "<mutant>");
+    ASSERT_FALSE(bad.has_value())
+        << "a runtimeLibraries row that NO block names is inert config and must "
+           "be REFUSED at load";
+    bool namedTheTable = false;
+    for (auto const& d : bad.error()) {
+        if (d.path.find("runtimeLibraries") != std::string::npos) namedTheTable = true;
+    }
+    EXPECT_TRUE(namedTheTable)
+        << "the refusal must name the TABLE, so the reader knows which row lost "
+           "its consumer";
+}
+
+TEST(RuntimeLibraryRoles, EveryFormatThatDeclaresAnAtomicsBlockDeclaresBothEntryNames) {
+    // A block missing ONE entry name would lower half of `_Atomic` correctly and
+    // leave the other direction on the faulting native instruction — the
+    // partial-fix-reads-as-a-complete-one shape, at load time. The loader
+    // refuses it; this walks every SHIPPED format to prove none of them ships
+    // the half-declared form, and that the names carry the format's own
+    // C-symbol decoration rather than one spelling for all of them.
+    constexpr std::string_view kElf[] = {
+        "elf64-aarch64-linux-exec", "elf64-aarch64-linux-pie",
+        "elf64-aarch64-linux-dyn",  "elf64-aarch64-linux-staticlib",
+        "elf64-x86_64-linux-exec",  "elf64-x86_64-linux-pie",
+        "elf64-x86_64-linux-dyn",   "elf64-x86_64-linux-staticlib",
+    };
+    constexpr std::string_view kMacho[] = {
+        "macho64-arm64-darwin-exec",  "macho64-arm64-darwin-dylib",
+        "macho64-x86_64-darwin-exec", "macho64-x86_64-darwin-dylib",
+    };
+    for (auto const name : kElf) {
+        auto loaded = ObjectFormatSchema::loadShipped(std::string{name});
+        ASSERT_TRUE(loaded.has_value()) << name;
+        auto const& ar = (*loaded)->atomicsRuntime();
+        ASSERT_TRUE(ar.has_value())
+            << name << " must declare an `atomicsRuntime` block — without one an "
+                       "under-aligned _Atomic access has no runtime to call";
+        EXPECT_EQ(ar->loadMangledName, "__atomic_load") << name;
+        EXPECT_EQ(ar->storeMangledName, "__atomic_store") << name;
+        EXPECT_EQ(ar->libraryPath, "libatomic.so.1")
+            << name << ": MEASURED — libc and libgcc_s export ZERO __atomic_* "
+                       "symbols on both Linux legs; this is a distinct image";
+    }
+    for (auto const name : kMacho) {
+        auto loaded = ObjectFormatSchema::loadShipped(std::string{name});
+        ASSERT_TRUE(loaded.has_value()) << name;
+        auto const& ar = (*loaded)->atomicsRuntime();
+        ASSERT_TRUE(ar.has_value()) << name;
+        // ★ THE DECORATION IS THE FORMAT'S OWN AND THAT IS WHY THE NAME IS
+        // DECLARED PER FORMAT: the C symbol `__atomic_load` is carried by a
+        // Mach-O image as `___atomic_load`. A lowerer re-deriving this rule
+        // would be the hardcoded-`msvcrt.dll` defect one tier over.
+        EXPECT_EQ(ar->loadMangledName, "___atomic_load") << name;
+        EXPECT_EQ(ar->storeMangledName, "___atomic_store") << name;
+        EXPECT_EQ(ar->libraryPath, "/usr/lib/libSystem.B.dylib")
+            << name << ": MEASURED — Apple clang links the packed case with "
+                       "libSystem ALONE; the role points at the image cLibrary "
+                       "already names, which the table permits";
+    }
+    // ⚠ AND THE NEGATIVE, WHICH IS THE LOAD-BEARING HALF: pe64 declares NONE.
+    // UCRT exports no `__atomic_*` symbol and there is no Windows atomics image
+    // to name. That is exactly why the target key is a three-way enum — under
+    // `losesAtomicity` the native form STANDS here rather than the build being
+    // refused, which keeps DSS inside the reference union on Windows.
+    for (auto const name : {"pe64-x86_64-windows-exec", "pe64-x86_64-windows-dll"}) {
+        auto loaded = ObjectFormatSchema::loadShipped(std::string{name});
+        ASSERT_TRUE(loaded.has_value()) << name;
+        EXPECT_FALSE((*loaded)->atomicsRuntime().has_value())
+            << name << " must declare NO atomics runtime — naming an image that "
+                       "does not export the entries would turn a working build "
+                       "into an unresolved symbol at link";
+    }
+}

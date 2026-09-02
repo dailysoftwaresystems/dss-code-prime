@@ -1207,7 +1207,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // guard would reject every shipped target on its first load.
     //
     // Every name here is a key the loader genuinely reads.
-    static constexpr std::array<std::string_view, 17> kTargetDocumentKeys{
+    static constexpr std::array<std::string_view, 18> kTargetDocumentKeys{
         // identity + loader gates
         "dssTargetVersion", "target",
         // per-target LANGUAGE-affecting semantics
@@ -1242,6 +1242,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         "condCodeEncoding",
         // ABI / softcall surface
         "wideFloatSoftcalls", "wideFloatSoftcallLibraryByFormat",
+        // D-CSUBSET-PACKED-ATOMIC-MEMBER: what the native inline atomic form
+        // does under an under-aligned access. A typo here does NOT default
+        // silently to a safe answer — it leaves the block unread and the
+        // faulting native form emitted, which is why the key is registered so
+        // the load refuses rather than the runtime.
+        "atomics",
         "callingConventions"};
     DSS_CHECK_KEY_VOCABULARY(kTargetDocumentKeys);
     // The ROOT runs the same check as every nested object — it had its own
@@ -1994,6 +2000,63 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                             it.value().get<bool>();
                         data.charIsUnsignedByFormatDeclared[idx] = true;
                     }
+                }
+            }
+        }
+    }
+
+    // ── atomics (D-CSUBSET-PACKED-ATOMIC-MEMBER) ──────────────────────
+    //
+    // `{"underAlignedNativeForm": "traps" | "losesAtomicity" |
+    //   "remainsAtomic"}` — what this PROCESSOR's native inline atomic
+    // load/store form DOES when the accessed object is not naturally aligned.
+    // The full measurement, and why this is a three-way enum and not the
+    // boolean it was first specified as, is written out at
+    // `UnderAlignedAtomicForm` in `target_schema.hpp`.
+    //
+    // OPTIONAL as a block; absent ⇒ `None` ⇒ the native form is emitted, which
+    // is byte-for-byte today's output. The KEY inside it is REQUIRED once the
+    // block is present: an `atomics` block that answers nothing is inert config
+    // whose presence would read as "this target has been measured".
+    if (doc.contains("atomics")) {
+        json const& at = doc.at("atomics");
+        if (!at.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/atomics",
+                      "'atomics' must be an OBJECT — "
+                      R"({"underAlignedNativeForm": "traps"|"losesAtomicity"|"remainsAtomic"})");
+        } else {
+            static constexpr std::array<std::string_view, 1>
+                kAtomicsKeys{"underAlignedNativeForm"};
+            DSS_CHECK_KEY_VOCABULARY(kAtomicsKeys);
+            rejectUnknownKeys(at, kAtomicsKeys, "/atomics",
+                              "the 'atomics' block", coll);
+            if (!at.contains("underAlignedNativeForm")
+             || !at.at("underAlignedNativeForm").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/atomics/underAlignedNativeForm",
+                          std::format(
+                              "'atomics' must state 'underAlignedNativeForm' "
+                              "({}) — the block exists to record a MEASUREMENT "
+                              "about this processor, so one that answers "
+                              "nothing would read as 'measured' while leaving "
+                              "the faulting native form emitted",
+                              detail::renderAllowedList(
+                                  kSelectableUnderAlignedAtomicFormNames)));
+            } else {
+                auto const text =
+                    at.at("underAlignedNativeForm").get<std::string>();
+                auto const form = underAlignedAtomicFormFromName(text);
+                if (!form.has_value()
+                 || *form == UnderAlignedAtomicForm::None) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/atomics/underAlignedNativeForm",
+                              std::format(
+                                  "unknown under-aligned atomic form '{}' — "
+                                  "accepted: {}", text,
+                                  detail::renderAllowedList(
+                                      kSelectableUnderAlignedAtomicFormNames)));
+                } else {
+                    data.underAlignedAtomicForm = *form;
                 }
             }
         }
@@ -3788,12 +3851,16 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         coll.emit(DiagnosticCode::C_MalformedJson, sapPath,
                                   "'stackArgPacking' must be an object with the "
                                   "optional keys 'namedScalars' / "
-                                  "'namedAggregates' / 'variadic'");
+                                  "'namedAggregates' / 'variadic' / "
+                                  "'maxScalarAlignment' / "
+                                  "'maxAggregateAlignment'");
                     } else {
                         auto const& sap = c.at("stackArgPacking");
-                        static constexpr std::array<std::string_view, 3>
+                        static constexpr std::array<std::string_view, 5>
                             kStackArgPackingKeys{"namedScalars",
-                                                 "namedAggregates", "variadic"};
+                                                 "namedAggregates", "variadic",
+                                                 "maxScalarAlignment",
+                                                 "maxAggregateAlignment"};
                         DSS_CHECK_KEY_VOCABULARY(kStackArgPackingKeys);
                         rejectUnknownKeys(sap, kStackArgPackingKeys, sapPath,
                                           "a stack-arg-packing row", coll);
@@ -3832,30 +3899,67 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         readAxis("namedScalars",    cc.stackArgPacking.namedScalars);
                         readAxis("namedAggregates", cc.stackArgPacking.namedAggregates);
                         readAxis("variadic",        cc.stackArgPacking.variadic);
+                        // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the two
+                        // alignment caps. Omitted ⇒ 0 ⇒ no over-alignment
+                        // honoured, which is the pre-existing flat-slot stride.
+                        readBoundedInt(sap, coll, sapPath, "maxScalarAlignment",
+                                       cc.stackArgPacking.maxScalarAlignment);
+                        readBoundedInt(sap, coll, sapPath,
+                                       "maxAggregateAlignment",
+                                       cc.stackArgPacking.maxAggregateAlignment);
+                        // A cap is an ALIGNMENT, so it is 0 or a power of two —
+                        // the same shape rule `stackAlignment` carries. A typo'd
+                        // 24 would silently mis-place every over-aligned stacked
+                        // argument rather than failing, which is the ABI
+                        // divergence that compiles clean and breaks at the
+                        // boundary.
+                        for (auto const& [key, value] :
+                             {std::pair<char const*, std::uint16_t>{
+                                  "maxScalarAlignment",
+                                  cc.stackArgPacking.maxScalarAlignment},
+                              std::pair<char const*, std::uint16_t>{
+                                  "maxAggregateAlignment",
+                                  cc.stackArgPacking.maxAggregateAlignment}}) {
+                            if (value != 0
+                                && (value & static_cast<std::uint16_t>(
+                                                value - 1)) != 0) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    std::format("{}/{}", sapPath, key),
+                                    std::format(
+                                        "'{}' ({}) must be 0 (no over-alignment "
+                                        "honoured) or a power of two — it is the "
+                                        "largest own-alignment this calling "
+                                        "convention honours for a stacked "
+                                        "argument", key, value));
+                            }
+                        }
                         // ⚠ ONE BUILDABLE VALUE ON THE AGGREGATE AXIS, AND THE
-                        // OTHER IS REFUSED RATHER THAN APPROXIMATED. Natural
-                        // packing needs the datum's own ALIGNMENT; a stacked
-                        // aggregate reaches the placement tier through the
-                        // `ByValueStackAgg` carrier, which states a byte SIZE and
-                        // nothing else. Accepting "natural" here would make the
-                        // cursor align aggregates to the slot while advancing by
-                        // their exact size — a THIRD rule nobody measured, shipped
-                        // under the name of one that was. ✔MEASURED: both shipped
-                        // ABIs slot-round aggregates, so nothing is lost today.
+                        // OTHER IS REFUSED RATHER THAN APPROXIMATED. ✔MEASURED:
+                        // both shipped ABIs slot-round the SIZE of a stacked
+                        // aggregate (Apple puts an `int` after a 3-byte struct at
+                        // +8, after a 12-byte one at +16 — not +3 / +12), so
+                        // `slot` is the only spelling anything has measured.
+                        // Accepting "natural" would ship a rule nobody measured
+                        // under the name of one that was.
+                        // ⓘ The reason recorded here USED to be that the carrier
+                        // states a byte SIZE and no alignment. That half is now
+                        // FALSE — D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT made
+                        // the carrier state its own alignment, and
+                        // `StackArgCursor::placeNamedAggregate` reads it. What
+                        // still blocks the axis is only the missing MEASUREMENT.
                         if (cc.stackArgPacking.namedAggregates
                                 != StackArgPacking::Slot) {
                             coll.emit(
                                 DiagnosticCode::C_MalformedJson,
                                 std::format("{}/namedAggregates", sapPath),
                                 std::format(
-                                    "'namedAggregates' may only be '{}' today: "
-                                    "natural aggregate packing needs the "
-                                    "aggregate's own alignment, which the "
-                                    "by-value stack-aggregate carrier does not "
-                                    "state (it carries a byte size only), so the "
-                                    "placement tier cannot honour it — refusing "
-                                    "rather than approximating it as "
-                                    "slot-aligned-but-exactly-sized ({})",
+                                    "'namedAggregates' may only be '{}' today: no "
+                                    "measured ABI packs a stacked aggregate's SIZE "
+                                    "naturally — both shipped ones slot-round it — "
+                                    "so accepting 'natural' would ship an "
+                                    "unmeasured third rule under a measured rule's "
+                                    "name ({})",
                                     stackArgPackingName(StackArgPacking::Slot),
                                     kApplePackingAnchor));
                             cc.stackArgPacking.namedAggregates =

@@ -3,7 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
-#include "core/types/object_format_kind.hpp"  // ExternCallDispatch (extern-call shape)
+#include "core/types/object_format_kind.hpp"  // ExternCallDispatch (extern-call shape), AtomicsRuntime
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
@@ -354,6 +354,24 @@ lowerToLir(Mir const&          mir,
            // compare chain. Defaults to nullopt; the first non-promoting
            // frontend's driver threads the target's resolved value exactly
            // as `externCallDispatch` is threaded.
-           std::optional<bool> charIsUnsigned = std::nullopt);
+           std::optional<bool> charIsUnsigned = std::nullopt,
+           // D-CSUBSET-PACKED-ATOMIC-MEMBER: the ACTIVE object format's
+           // atomics-runtime declaration, read from
+           // `ObjectFormatSchema::atomicsRuntime()` one level up — the image
+           // that owns the GENERIC `__atomic_load`/`__atomic_store` entries
+           // plus their already-mangled names for this format. Consumed by
+           // exactly one arm: an `_Atomic` scalar access whose stamped
+           // `payload2` alignment is LESS than its width, under a target whose
+           // `underAlignedAtomicForm` is not `remainsAtomic`. `std::nullopt` =
+           // the format supplies none, and what happens then is the TARGET's
+           // answer, not a silent default: `traps` (arm64 — the native
+           // LDAR/STLR pair is a MEASURED rc 135 SIGBUS on real hardware)
+           // fails LOUD naming this key rather than emit a certain fault;
+           // `losesAtomicity` (x86_64, where the native form is what gcc ships
+           // and works) keeps the native form, which is the only reason pe64
+           // — the one shipped format with no atomics image — stays inside the
+           // reference union. Trailing (like `wideFloatSoftcallLibrary`) so
+           // existing positional callers are unaffected. Defaults to nullopt.
+           std::optional<AtomicsRuntime> atomicsRuntime = std::nullopt);
 
 } // namespace dss

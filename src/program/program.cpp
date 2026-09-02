@@ -1504,7 +1504,10 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 (*formatR)->sehPersonality(), (*formatR)->name(),
                 cuMirs[i].target->wideFloatSoftcallLibrary(
                     (*formatR)->kind()),
-                reporter);
+                reporter,
+                // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime
+                // block, read off the schema here exactly as sehPersonality is.
+                (*formatR)->atomicsRuntime());
             if (!mod) return std::nullopt;  // back-half tier failure already reported
             members.push_back(std::move(*mod));
             // Member file name: THIS CU's own source stem (see the block above),
@@ -1789,7 +1792,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             cuMirs[0], (*formatR)->processArgs(), (*formatR)->entryVerbs(),
             (*formatR)->sehPersonality(), (*formatR)->name(),
             cuMirs[0].target->wideFloatSoftcallLibrary((*formatR)->kind()),
-            reporter);
+            reporter,
+            // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime block.
+            (*formatR)->atomicsRuntime());
         if (!mod) {              // back-half tier failure already reported via `reporter`
             emitNullNoDiagnostic("back-half lower (lowerCuMirToAssembly)");
             return std::nullopt;
@@ -2255,7 +2260,10 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                      (*formatR)->tlsAccess(),
                                      std::move(sehScopes),
                                      std::move(wideFloatSoftcallLibrary),
-                                     reporter);
+                                     reporter,
+                                     // D-CSUBSET-PACKED-ATOMIC-MEMBER: the
+                                     // format's atomics-runtime block.
+                                     (*formatR)->atomicsRuntime());
     if (!mod) return std::nullopt;  // back-half tier failure already reported via `reporter`
     // c165 (D-LK-STATIC-LINK): the merged whole-program client module links
     // against any `ar` static archives named on `--resolve-library` the same way

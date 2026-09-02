@@ -614,7 +614,9 @@ struct DSS_EXPORT MachODylibRef {
 // CodeDirectory carries the CS_ADHOC flag and dyld trusts the embedded
 // page hashes alone. The reservation SIZE is DERIVED from this block
 // (`adHocCodeSignatureSize`), so a hand-typed `codeSignatureSize` is not
-// needed when `codeSignature` is set.
+// merely unnecessary when `codeSignature` is set -- declaring BOTH is
+// REFUSED at load. Anchored at
+// D-LK-MACHO-CODESIGN-SIZE-SILENTLY-OVERRIDDEN-BY-ADHOC.
 //
 // The two enums are closed (one variant each today) so a typo in the
 // JSON fails loud at load (mirrors `ExternCallDispatch`'s closed-enum
@@ -922,9 +924,14 @@ struct DSS_EXPORT MachOImage {
     std::uint32_t codeSignatureSize = 0;
     // Ad-hoc code-signature FILL request (D-LK7-ADHOC-CODESIGN-MACHO
     // increment 2/2). When set, the walker DERIVES the reservation size
-    // from this block (via `adHocCodeSignatureSize`) — overriding any
-    // hand-typed `codeSignatureSize` — and writes a real CodeDirectory +
-    // SuperBlob into the reserved region instead of zeroes. When unset,
+    // from this block (via `adHocCodeSignatureSize`) and writes a real
+    // CodeDirectory + SuperBlob into the reserved region instead of
+    // zeroes. ⚠ It does NOT override a hand-typed `codeSignatureSize`
+    // any more: a document declaring BOTH keys is refused at load, so
+    // the encoder sees exactly one state instead of an invisible
+    // precedence rule. Anchored at
+    // D-LK-MACHO-CODESIGN-SIZE-SILENTLY-OVERRIDDEN-BY-ADHOC.
+    // When unset,
     // the legacy `codeSignatureSize`-only placeholder path (zero-fill)
     // is preserved unchanged. validate() rejects this block on a
     // MH_OBJECT (like the rest of the image block).
@@ -1486,6 +1493,19 @@ struct DSS_EXPORT ObjectFormatData {
     // exactly what an ELF/Mach-O build carrying `__try` should get. See
     // `SehPersonality` for what two literals in `src/mir` this deletes.
     std::optional<SehPersonality> sehPersonality;
+
+    // ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the atomics-runtime declaration ────
+    //
+    // OPTIONAL top-level `"atomicsRuntime"` block (`{"role": …,
+    // "loadMangledName": …, "storeMangledName": …}`). The GENERIC C11 atomics
+    // entry points an UNDER-ALIGNED `_Atomic` scalar access lowers to a CALL
+    // of. `std::nullopt` = this format supplies NO atomics runtime, which is
+    // NOT a silent default: what happens then is the TARGET's
+    // `underAlignedAtomicForm` answer — a `traps` target refuses the access
+    // loud (emitting the native form would be a guaranteed SIGBUS), a
+    // `losesAtomicity` target keeps the native form (the reference-exact
+    // choice where no runtime image exists, MEASURED: pe64 has none).
+    std::optional<AtomicsRuntime> atomicsRuntime;
 
     // ── UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the REALIZED
     //    ENTRY-VERB set ─────────────────────────────────────────────
@@ -2263,6 +2283,13 @@ public:
     // nullopt personality — never a silently-assumed handler/image pair.
     [[nodiscard]] std::optional<SehPersonality> const&
     sehPersonality() const noexcept { return d_.sehPersonality; }
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime declaration,
+    // or nullopt if it supplies none. Threaded into `lowerToLir` as an
+    // already-resolved VALUE (the `wideFloatSoftcallLibrary` pattern): the
+    // under-aligned `_Atomic` arm mints its extern import against it, and a
+    // `traps` target reaching a nullopt fails loud naming this key.
+    [[nodiscard]] std::optional<AtomicsRuntime> const&
+    atomicsRuntime() const noexcept { return d_.atomicsRuntime; }
     // The program-entry materialization VERBS this format realizes. Non-empty on
     // every exec-flavored format, empty on every other (both directions
     // load-enforced), so EMPTY is the engine's "this build needs no program

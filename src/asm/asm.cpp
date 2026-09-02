@@ -1235,7 +1235,57 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         // remedy is specific and actionable, so it is stated in the SAME words the
         // MIR twin uses (hir_to_mir.cpp `lowerAggregateInitIntoSlot`) — one rule,
         // one wording, whichever tier the user's declaration happens to hit.
-        if (compositeFieldsOverlap(ty, in, lp, dm)) {
+        //
+        // ★ D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-BITFIELDS — BIT-FIELD-FIRST
+        // ORDERING, THE SAME ONE `lowerAggregateInitIntoSlot` ALREADY HAS. The
+        // layout is hoisted ABOVE the gate (it was computed two lines below anyway)
+        // so the gate is asked ONLY of a composite with no bit-fields. That is not a
+        // way around a truthful predicate — it is the routing this arm always owed:
+        // a full-width positional write of ANY bit-field member clobbers its
+        // co-resident neighbours whatever the overlap answer is, which is why the
+        // packing loop below exists and why it must OWN every bit-field composite.
+        // `bitFields` non-empty ⇔ the composite has a bit-field (the layout
+        // authority's invariant), and it is the exact analogue of the MIR twin's
+        // `hasBitfieldMember` test.
+        //
+        // ⓘ WHAT THE ORDER BUYS: with the gate asked only when `bitFields` is empty,
+        // a `true` can only have come from the EXPLICIT-OFFSET channel — so the
+        // refusal text below stays accurate now that `compositeFieldsOverlap` also
+        // answers `true` for bit-field composites. Hoisting the layout also means an
+        // UN-SIZEABLE aggregate fails loud on its own cause here rather than through
+        // the gate's conservative `true`, which would have named the wrong reason.
+        //
+        // ★ D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-UNIONS: A UNION IS ROUTED PAST
+        // THIS GATE, the exact twin of the route `hir_to_mir.cpp`'s
+        // `lowerAggregateInitIntoSlot` takes, and for the same reason. Once
+        // `compositeFieldsOverlap` tells the truth it answers `true` for every union
+        // with two or more sizeable members — they all sit at byte 0. But this gate
+        // asks whether a POSITIONAL member-wise write would clobber a sibling, and a
+        // union initializer names exactly ONE member (C 6.7.9p17), so the walk below
+        // performs exactly one encode at `fieldOffsets[0] == 0` into a `buf` the
+        // caller pre-zeroed to the layout size. Nothing can be lost. Without this
+        // route the truthful predicate would refuse `static union U u = {1};`, which
+        // gcc, clang and MSVC all accept.
+        //
+        // ⚠ THE ONE-CHILD PREMISE IS ASSERTED, NOT ASSUMED — see the MIR twin's note
+        // for the three-guarantee measurement (both HIR producers plus
+        // `HirVerifier::checkConstructAggregate`). All three live upstream of the
+        // literal pool this encoder reads, and none of them runs here, so the
+        // refusal is expected never to fire and is kept anyway: skipping the gate for
+        // unions would otherwise silently GRANT the clobber the gate exists to
+        // refuse, in the DATA SECTION, where the second member's bytes overwrite the
+        // first's at the same offset with nothing to observe it.
+        auto const lay = computeLayout(ty, in, lp, dm);
+        if (!lay.has_value()) return false;
+        bool const isUnion = (k == TypeKind::Union);
+        if (isUnion && agg.fields.size() > 1) {
+            why = "static initialization of a union supplied more than one member — "
+                  "a union initializer names exactly one member (C 6.7.9p17), and the "
+                  "union route past the overlapping-members gate is valid only for "
+                  "that single write";
+            return false;
+        }
+        if (!isUnion && lay->bitFields.empty() && compositeFieldsOverlap(ty, in, lp, dm)) {
             if (!isAllZeroMirLiteral(v)) {
                 why = "static initialization of an overlapping explicit-offset "
                       "struct is unsupported — its members share bytes; assign "
@@ -1245,8 +1295,6 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
             }
             return true;
         }
-        auto const  lay = computeLayout(ty, in, lp, dm);
-        if (!lay.has_value()) return false;
         auto const ops = in.operands(ty);
         if (ops.size() != lay->fieldOffsets.size()) return false;
         if (agg.fields.size() > ops.size()) return false;   // too many inits → fail loud

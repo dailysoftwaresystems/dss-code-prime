@@ -251,6 +251,80 @@ function Invoke-RepoTreeGit {
     return @($out | Where-Object { $_ -ne '' })
 }
 
+function Get-RepoTreeOwningRoot {
+    <#
+    .SYNOPSIS
+    The root of the WORKING TREE THAT CONTAINS <Path>. Throws RepoTreeCollapse when
+    no working tree does. <Path> may be a file or a directory; a file is taken by
+    its directory.
+
+    ★★★ THIS ANSWERS A DIFFERENT QUESTION FROM `Get-RepoTreeIdentity`, AND THAT IS WHY
+    IT EXISTS RATHER THAN BEING FOLDED INTO IT.
+      Get-RepoTreeIdentity  <Tree> -- "WHAT is the tree at <Tree>?" (root, gitdir, sha)
+      Get-RepoTreeOwningRoot <Path> -- "WHICH tree contains <Path>?" (a root)
+    `Get-RepoTreeIdentity` TAKES the tree as its argument and hands `.Root` straight
+    back from it: every caller must already know which tree it means. This one
+    DERIVES that argument. Making the identity function return a root would have been
+    a true answer to the wrong question -- the adjacent-instrument class -- so the
+    reuse runs the other way: this is a thin layer ON the identity function, in the
+    owner's own file, and the hard case below is one call into it. No second resolver.
+    ⓘ The `.sh` twin is `leg_tree_owning_root` in scripts/leg-tree/leg-tree.sh; the
+    three ordered cases it relies on are the ones this file already documents.
+
+    ⚠⚠ THE CALLER THIS WAS ADDED FOR PASSES `$PSCommandPath`, NOT `$PWD`.
+    [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]] `lane-worktree.ps1` derived its
+    root from a bare `git rev-parse --show-toplevel`, which answers "what repository
+    am I STANDING in?" -- so every path it computed was rooted at whichever repository
+    the caller's shell happened to be in. ✔MEASURED 2026-09-02 from a throwaway
+    repository outside this one: it reported that repository's `.worktrees/` while
+    running out of this one's checkout. A verb that manages `.worktrees/` must ask
+    which tree ITS OWN FILE belongs to -- `$PWD` is a property of the caller's shell,
+    the script's path is a property of the script, and only the second survives a `cd`.
+
+    ✔MEASURED 2026-09-02, why `--show-toplevel` and not `--git-common-dir`: for a
+    SUBMODULE checkout `--git-common-dir` names `<super>/.git/modules/<name>` and
+    `git worktree list` names it too -- neither is a working tree, and rooting a
+    removal there would aim it inside `.git`. `--show-toplevel` answers correctly.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw [RepoTreeCollapse]::new('no path given') }
+    $dir = $null
+    try { $dir = [IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar) } catch {
+        throw [RepoTreeCollapse]::new("cannot make '$Path' absolute: $($_.Exception.Message)")
+    }
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+        $dir = [IO.Path]::GetDirectoryName($dir)
+    }
+    if ([string]::IsNullOrEmpty($dir) -or -not (Test-Path -LiteralPath $dir -PathType Container)) {
+        throw [RepoTreeCollapse]::new("no such directory for '$Path'")
+    }
+
+    # 1. The ordinary case: ask git, but AT THE SCRIPT'S OWN DIRECTORY rather than at
+    #    the cwd. That relocation is the whole of the fix.
+    $top = & git -C $dir rev-parse --show-toplevel 2>$null
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($top)) {
+        return ([IO.Path]::GetFullPath($top.Trim()).TrimEnd([IO.Path]::DirectorySeparatorChar))
+    }
+
+    # 2. A worktree whose `.git` FILE names a gitdir THIS namespace cannot follow.
+    #    `git -C` fails outright there, so walk up to the directory that HOLDS the
+    #    `.git` and let `Get-RepoTreeIdentity` prove it can describe it -- the
+    #    directory holding a resolvable `.git` IS the root.
+    $cur = $dir
+    while ($true) {
+        if (Test-Path -LiteralPath (Join-Path $cur '.git')) {
+            $ok = $true
+            try { $null = Get-RepoTreeIdentity $cur } catch { $ok = $false }
+            if ($ok) { return $cur }
+        }
+        $up = [IO.Path]::GetDirectoryName($cur)
+        if ([string]::IsNullOrEmpty($up) -or $up -eq $cur) { break }
+        $cur = $up
+    }
+    throw [RepoTreeCollapse]::new("no git working tree contains '$Path'")
+}
+
 function Assert-RepoTreeOneRoot {
     <#
     .SYNOPSIS

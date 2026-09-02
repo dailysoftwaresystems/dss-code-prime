@@ -923,6 +923,29 @@ refuseWeakImageAlias(ModuleSymbol const& alias, char const* where,
     return false;
 }
 
+// Names the schema key(s) through which a signature was ACTUALLY
+// requested, for the two refusals that fire on the static exec arm.
+// D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM: the message those
+// two sites used to carry hard-coded `'image.codeSignatureSize' is
+// non-zero`, which was a FALSE statement for an ad-hoc-only schema —
+// the reader would go looking for a key the format does not declare.
+// A diagnostic that names the wrong key is not fail-loud, it is fail-
+// misleading, so the key set is derived from the same fields
+// `requestsCodeSignature` reads. Precondition: only called when that
+// predicate is true, so the result is never empty.
+[[nodiscard]] std::string
+codeSignatureRequestKeys(MachOImage const& im) {
+    std::string keys;
+    if (im.codeSignature.has_value()) {
+        keys = "'image.codeSignature'";
+    }
+    if (im.codeSignatureSize != 0) {
+        if (!keys.empty()) keys += " and ";
+        keys += "a non-zero 'image.codeSignatureSize'";
+    }
+    return keys;
+}
+
 [[nodiscard]] std::vector<std::uint8_t>
 encodeExec(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
@@ -1023,25 +1046,41 @@ encode(AssembledModule const&    module,
         // the CD blob must be mmap-able via a segment. Force the
         // dynamic path (which DOES carry __LINKEDIT) whenever a
         // codesign reservation is requested. Empty `externImports`
-        // with `codeSignatureSize > 0` is currently a no-realistic-
+        // with a signature request is currently a no-realistic-
         // use-case combination (a signed binary that imports nothing
         // is degenerate); when first observed in practice, the
         // dynamic-path arm will widen — anchored D-LK7-1 at plan 14
-        // §3.1.
-        if (fmt.machoImage().codeSignatureSize != 0
+        // §3.1. Until it does, REFUSING is the whole contract: an
+        // image whose declared signature cannot be honoured must not
+        // be emitted unsigned and called a success.
+        //
+        // ★ D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM. This
+        // gate used to test `codeSignatureSize != 0` ALONE, so an
+        // ad-hoc-only schema — which is what EVERY shipped Darwin exec
+        // and dylib document actually declares — walked straight past
+        // it into `encodeExec`, an arm that emits no __LINKEDIT and
+        // therefore no LC_CODE_SIGNATURE under any schema. The request
+        // was dropped with no diagnostic: a green build and a binary
+        // AMFI refuses at load. It reads BOTH keys now, through the one
+        // `requestsCodeSignature` predicate the belt in `encodeExec`
+        // and `emitCodeSig` in `encodeExecDynamic` also read, so the
+        // three cannot drift apart again.
+        if (requestsCodeSignature(fmt.machoImage())
          && module.externImports.empty()) {
             emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-                 "macho::encode: 'image.codeSignatureSize' is "
-                 "non-zero but the module has no externImports — "
-                 "the static encodeExec path emits no __LINKEDIT "
-                 "segment, so the LC_CODE_SIGNATURE reservation "
-                 "would land outside any LC_SEGMENT_64 and the "
-                 "kernel `cs_validate_range` would reject the "
-                 "binary at exec time. Add at least one extern "
-                 "import (which routes through encodeExecDynamic + "
-                 "synthesizes __LINKEDIT) OR clear "
-                 "'codeSignatureSize'. Anchored at plan 14 §3.1 "
-                 "D-LK7-1 (static-path __LINKEDIT synthesis).");
+                 std::format(
+                     "macho::encode: the object format requests a code "
+                     "signature ({}) but the module has no "
+                     "externImports — the static encodeExec path emits "
+                     "no __LINKEDIT segment, so the LC_CODE_SIGNATURE "
+                     "reservation would land outside any LC_SEGMENT_64 "
+                     "and the kernel `cs_validate_range` would reject "
+                     "the binary at exec time. Add at least one extern "
+                     "import (which routes through encodeExecDynamic + "
+                     "synthesizes __LINKEDIT) OR drop the signature "
+                     "request from the format. Anchored at plan 14 §3.1 "
+                     "D-LK7-1 (static-path __LINKEDIT synthesis).",
+                     codeSignatureRequestKeys(fmt.machoImage())));
             return {};
         }
         if (!module.externImports.empty()) {
@@ -2332,18 +2371,26 @@ encodeExec(AssembledModule const&    module,
         kSegmentCommand64Size + kSection64Size;  // 1 section: __text
     constexpr std::size_t kLcMainSize         = 24;
 
-    // LK7 codesign reservation is unreachable here — the dispatch
-    // in `encode()` gates `codeSignatureSize > 0` to the dynamic
-    // path (anchored D-LK7-1 for static-path __LINKEDIT synthesis).
-    // Keeping a defensive assertion so a future refactor that
-    // bypasses the gate fails loud rather than silently emitting
-    // an unsignable binary.
-    if (im.codeSignatureSize != 0) {
+    // LK7 codesign reservation is unreachable here — the dispatch in
+    // `encode()` refuses a signature request on this arm (anchored
+    // D-LK7-1 for static-path __LINKEDIT synthesis). Keeping a
+    // defensive assertion so a future refactor that bypasses the gate
+    // fails loud rather than silently emitting an unsignable binary.
+    //
+    // ★ D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM. The belt read
+    // `codeSignatureSize != 0` alone, so it was blind to exactly the
+    // requests the gate above was blind to — a belt that shares its
+    // gate's blind spot is not defence in depth, it is the same defect
+    // written twice. Both now read `requestsCodeSignature`, the ONE
+    // predicate; there is no second spelling left to drift.
+    if (requestsCodeSignature(im)) {
         emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-             "macho::encodeExec: invariant violation — the dispatch "
-             "gate in macho::encode should have rejected non-zero "
-             "codeSignatureSize on the static path. Anchored at "
-             "plan 14 §3.1 D-LK7-1.");
+             std::format(
+                 "macho::encodeExec: invariant violation — the dispatch "
+                 "gate in macho::encode should have rejected the code-"
+                 "signature request ({}) on the static path. Anchored "
+                 "at plan 14 §3.1 D-LK7-1.",
+                 codeSignatureRequestKeys(im)));
         return {};
     }
     // LC_BUILD_VERSION is emitted only on the dynamic exec path
@@ -4416,9 +4463,13 @@ encodeExecDynamic(AssembledModule const&    module,
     // file offset) is not known until the __LINKEDIT layout completes,
     // so the derivation happens at the `codeSigReserveSize` assignment
     // further down (after `codeSigFileOff`). Here we only decide
-    // whether to emit the load command at all.
-    bool const emitCodeSig =
-        im.codeSignatureSize != 0 || im.codeSignature.has_value();
+    // whether to emit the load command at all — the PRESENCE question,
+    // asked through the one `requestsCodeSignature` predicate the two
+    // static-arm refusals also ask. This site was the only one of the
+    // three that spelled the disjunction correctly by hand; it now
+    // spells it once, in the header, where the other two read it too.
+    // D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM
+    bool const emitCodeSig = requestsCodeSignature(im);
     // LC_BUILD_VERSION (platform/min-OS) is emitted iff the schema
     // declares `image.buildVersion` — required for the image to load on
     // macOS 11+ / Apple Silicon (D-LK10-ENTRY-MACHO-EXIT).
@@ -4951,6 +5002,12 @@ encodeExecDynamic(AssembledModule const&    module,
     // == the CodeDirectory `codeLimit` (everything before the signature
     // is hashed), and was just proven to fit in u32. For the legacy
     // placeholder path it stays the schema's `codeSignatureSize`.
+    //
+    // ⚠ This is a FLAVOUR question, not the presence question, and the
+    // bare `codeSignature.has_value()` is therefore CORRECT here — do
+    // not "unify" it with `requestsCodeSignature` (see that predicate's
+    // docblock in macho.hpp). Reached only when `emitCodeSig`, so
+    // exactly one of the two arms is live.
     std::uint32_t const codeSigReserveSize =
         im.codeSignature.has_value()
             ? dss::macho::detail::adHocCodeSignatureSize(
@@ -5685,6 +5742,11 @@ encodeExecDynamic(AssembledModule const&    module,
         // of the reservation).
         seekTo(codeSigFileOff, "code signature");
         if (!linkeditCursorsAgree()) return {};
+        // ⚠ FLAVOUR again, not presence: `emitCodeSig` already said a
+        // signature was requested; this picks the real ad-hoc blob over
+        // the legacy zero-fill. `requestsCodeSignature` must NOT be
+        // substituted here — it would send a placeholder-only schema
+        // into the builder with no block to build from.
         if (im.codeSignature.has_value()) {
             // Build the real ad-hoc CodeDirectory + SuperBlob over the
             // signed bytes and write it into the reservation. execSeg

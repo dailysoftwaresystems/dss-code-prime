@@ -1,7 +1,10 @@
 // SP2: TypeInterner canonicalization + cross-CU TypeId isolation.
 
+#include "core/types/aggregate_layout.hpp"
+#include "core/types/data_model.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_layout.hpp"
 
 #include <gtest/gtest.h>
 
@@ -9,6 +12,7 @@
 #include <cstdint>
 #include <set>
 #include <span>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -994,4 +998,224 @@ TEST(TypeInterner, CommonTypeOfIdenticalOperandsDropsTheQualifierSkin) {
     EXPECT_EQ(ti.commonType(vptr, vptr).v, vptr.v)
         << "a qualified POINTER pair is untouched — only arithmetic operands "
            "are subject to the usual arithmetic conversions";
+}
+
+// ── D-CSUBSET-PACKED-BITFIELD-INTERACTION: a packed aggregate that ALSO carries
+//    a bit-field, built DIRECTLY through the interner ──────────────────────────
+//
+// This is the construction path the removed `packed && anyBitfield → nullopt`
+// belts existed to catch: `completeComposite(packed=true, widths)` bypasses the
+// semantic scan entirely (a reinterned type, a shipped descriptor, a hir_text
+// round trip). The belts are gone because the combination is SUPPORTED, so what
+// is pinned here is the LAYOUT, not a refusal.
+//
+// ⚠ EVERY NUMBER BELOW IS A REFERENCE COMPILER'S, NOT A DERIVATION. Probed
+// SEPARATELY, one `_Static_assert` battery on sizeof AND `_Alignof` per
+// toolchain, each compiling at rc=0:
+//   gnu_packed    — gcc 13.3.0 and clang 18.1.3, x86_64-linux, `-std=c17`,
+//                   spelling `__attribute__((packed))`.
+//   msvc_straddle — cl.exe 19.51 (`#pragma pack(1)`, its only spelling) and
+//                   mingw-w64 gcc 13.2.0 (`__attribute__((packed))`, ms-bitfields
+//                   by default on the Windows target). The two AGREE on every
+//                   shape, which is what makes the PE column a measurement and
+//                   not a reading of MSVC's documentation.
+// The two strategies DISAGREE on four of the five shapes. That disagreement is
+// the reason both are pinned: a single golden would be wrong on one shipped
+// object format whichever value it took.
+namespace {
+constexpr AggregateLayoutParams kPkGnu{ScalarAlignmentRule::Natural, 16,
+                                       BitFieldStrategy::GnuPacked,
+                                       UnnamedBitFieldAlignment::Ignored};
+constexpr AggregateLayoutParams kPkMsvc{ScalarAlignmentRule::Natural, 16,
+                                        BitFieldStrategy::MsvcStraddle};
+
+// Mint + complete a composite with per-field bit widths and the packed flag.
+[[nodiscard]] TypeId packedBitfieldComposite(TypeInterner& ti, TypeKind kind,
+                                             std::string_view name,
+                                             std::uint64_t key,
+                                             std::span<TypeId const> fields,
+                                             std::span<std::int64_t const> widths,
+                                             bool packed) {
+    TypeId const s = ti.forwardComposite(kind, name, key);
+    ti.completeComposite(s, fields, packed, widths);
+    return s;
+}
+} // namespace
+
+TEST(TypeInterner, PackedBitfieldCompositeLaysOutGnuTight) {
+    auto ti = makeInterner(1);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const chr = ti.primitive(TypeKind::Char);
+
+    // `struct { unsigned a:3; unsigned b:5; } __attribute__((packed));` -> 1/1,
+    // both fields sharing the one 4-byte unit anchored at offset 0.
+    std::array<TypeId, 2> const f1{u32, u32};
+    std::array<std::int64_t, 2> const w1{3, 5};
+    TypeId const s1 = packedBitfieldComposite(ti, TypeKind::Struct, "S1", 1,
+                                              f1, w1, /*packed=*/true);
+    ASSERT_TRUE(ti.isPacked(s1));
+    auto const l1 = computeLayout(s1, ti, kPkGnu, DataModel::Lp64);
+    ASSERT_TRUE(l1.has_value())
+        << "the removed belt used to make this nullopt; gcc and clang both "
+           "compile it";
+    EXPECT_EQ(l1->size, 1u);
+    EXPECT_EQ(l1->align.bytes(), 1u);
+    ASSERT_EQ(l1->fieldOffsets.size(), 2u);
+    EXPECT_EQ(l1->fieldOffsets[0], 0u);
+    EXPECT_EQ(l1->fieldOffsets[1], 0u);
+    ASSERT_EQ(l1->bitFields.size(), 2u);
+    EXPECT_EQ(l1->bitFields[0].bitOffset, 0u);
+    EXPECT_EQ(l1->bitFields[0].bitWidth, 3u);
+    EXPECT_EQ(l1->bitFields[1].bitOffset, 3u)
+        << "packed flows bit-to-bit: `b` starts where `a` ended, with no "
+           "allocation-unit padding between them";
+    EXPECT_EQ(l1->bitFields[1].bitWidth, 5u);
+
+    // The UNPACKED twin is 4/4 — so the pin above is on `packed` doing something,
+    // not on a number that happens to coincide.
+    TypeId const n1 = packedBitfieldComposite(ti, TypeKind::Struct, "N1", 2,
+                                              f1, w1, /*packed=*/false);
+    auto const ln1 = computeLayout(n1, ti, kPkGnu, DataModel::Lp64);
+    ASSERT_TRUE(ln1.has_value());
+    EXPECT_EQ(ln1->size, 4u);
+    EXPECT_EQ(ln1->align.bytes(), 4u);
+
+    // `struct { char c; unsigned b:9; } packed` -> 3/1, `b` at bit 8.
+    std::array<TypeId, 2> const f3{chr, u32};
+    std::array<std::int64_t, 2> const w3{kNotBitfield, 9};
+    TypeId const s3 = packedBitfieldComposite(ti, TypeKind::Struct, "S3", 3,
+                                              f3, w3, /*packed=*/true);
+    auto const l3 = computeLayout(s3, ti, kPkGnu, DataModel::Lp64);
+    ASSERT_TRUE(l3.has_value());
+    EXPECT_EQ(l3->size, 3u);
+    EXPECT_EQ(l3->align.bytes(), 1u);
+    ASSERT_EQ(l3->bitFields.size(), 2u);
+    EXPECT_EQ(l3->bitFields[1].bitOffset, 8u);
+
+    // `struct { int f0; unsigned f1:3; } packed` -> 5/1. This is the exact shape
+    // the removed belt's own witness used, now asserting a layout not a nullopt.
+    std::array<TypeId, 2> const f4{i32, u32};
+    std::array<std::int64_t, 2> const w4{kNotBitfield, 3};
+    TypeId const s4 = packedBitfieldComposite(ti, TypeKind::Struct, "S4", 4,
+                                              f4, w4, /*packed=*/true);
+    auto const l4 = computeLayout(s4, ti, kPkGnu, DataModel::Lp64);
+    ASSERT_TRUE(l4.has_value());
+    EXPECT_EQ(l4->size, 5u);
+    EXPECT_EQ(l4->align.bytes(), 1u);
+    ASSERT_EQ(l4->fieldOffsets.size(), 2u);
+    EXPECT_EQ(l4->fieldOffsets[0], 0u);
+
+    // `struct { unsigned a:3; char x; unsigned b:5; } packed` -> 3/1, x@1,
+    // b@bit16: an ordinary member closes the open bit-unit at the next BYTE, not
+    // at the next allocation unit. That is the rule packed changes.
+    std::array<TypeId, 3> const f5{u32, chr, u32};
+    std::array<std::int64_t, 3> const w5{3, kNotBitfield, 5};
+    TypeId const s5 = packedBitfieldComposite(ti, TypeKind::Struct, "S5", 5,
+                                              f5, w5, /*packed=*/true);
+    auto const l5 = computeLayout(s5, ti, kPkGnu, DataModel::Lp64);
+    ASSERT_TRUE(l5.has_value());
+    EXPECT_EQ(l5->size, 3u);
+    EXPECT_EQ(l5->align.bytes(), 1u);
+    ASSERT_EQ(l5->fieldOffsets.size(), 3u);
+    EXPECT_EQ(l5->fieldOffsets[1], 1u);
+    ASSERT_EQ(l5->bitFields.size(), 3u);
+    EXPECT_EQ(l5->bitFields[2].bitOffset, 16u);
+
+    // `union { unsigned a:3; unsigned b:30; char x; } packed` -> 4/1. The UNION
+    // arm carried its own copy of the belt, and the reason it stated ("the packed
+    // baseline is applied ONLY on the non-bit-field path") had been false since
+    // the shared `clampedBaselineAlign` landed.
+    std::array<TypeId, 3> const f9{u32, u32, chr};
+    std::array<std::int64_t, 3> const w9{3, 30, kNotBitfield};
+    TypeId const u9 = packedBitfieldComposite(ti, TypeKind::Union, "U9", 9,
+                                              f9, w9, /*packed=*/true);
+    auto const l9 = computeLayout(u9, ti, kPkGnu, DataModel::Lp64);
+    ASSERT_TRUE(l9.has_value()) << "the union half of the belt is gone too";
+    EXPECT_EQ(l9->size, 4u);
+    EXPECT_EQ(l9->align.bytes(), 1u);
+}
+
+TEST(TypeInterner, PackedBitfieldCompositeLaysOutMsvcStraddle) {
+    auto ti = makeInterner(1);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const chr = ti.primitive(TypeKind::Char);
+
+    // Under MSVC's rule a bit-field unit is a WHOLE declared-type unit, so the
+    // same shapes come out larger — and, unlike gnu_packed, every unit lies
+    // inside the composite by construction.
+    std::array<TypeId, 2> const f1{u32, u32};
+    std::array<std::int64_t, 2> const w1{3, 5};
+    TypeId const s1 = packedBitfieldComposite(ti, TypeKind::Struct, "S1", 11,
+                                              f1, w1, /*packed=*/true);
+    auto const l1 = computeLayout(s1, ti, kPkMsvc, DataModel::Lp64);
+    ASSERT_TRUE(l1.has_value());
+    EXPECT_EQ(l1->size, 4u) << "cl.exe 19.51 and mingw-w64 gcc 13.2.0: 4";
+    EXPECT_EQ(l1->align.bytes(), 1u);
+
+    std::array<TypeId, 2> const f3{chr, u32};
+    std::array<std::int64_t, 2> const w3{kNotBitfield, 9};
+    TypeId const s3 = packedBitfieldComposite(ti, TypeKind::Struct, "S3", 13,
+                                              f3, w3, /*packed=*/true);
+    auto const l3 = computeLayout(s3, ti, kPkMsvc, DataModel::Lp64);
+    ASSERT_TRUE(l3.has_value());
+    EXPECT_EQ(l3->size, 5u) << "a fresh 4-byte unit at byte 1: 5";
+    EXPECT_EQ(l3->align.bytes(), 1u);
+    ASSERT_EQ(l3->fieldOffsets.size(), 2u);
+    EXPECT_EQ(l3->fieldOffsets[1], 1u);
+
+    std::array<TypeId, 3> const f5{u32, chr, u32};
+    std::array<std::int64_t, 3> const w5{3, kNotBitfield, 5};
+    TypeId const s5 = packedBitfieldComposite(ti, TypeKind::Struct, "S5", 15,
+                                              f5, w5, /*packed=*/true);
+    auto const l5 = computeLayout(s5, ti, kPkMsvc, DataModel::Lp64);
+    ASSERT_TRUE(l5.has_value());
+    EXPECT_EQ(l5->size, 9u) << "unit[0,4) + x@4 + unit[5,9): 9";
+    EXPECT_EQ(l5->align.bytes(), 1u);
+    ASSERT_EQ(l5->fieldOffsets.size(), 3u);
+    EXPECT_EQ(l5->fieldOffsets[1], 4u);
+
+    std::array<TypeId, 3> const f9{u32, u32, chr};
+    std::array<std::int64_t, 3> const w9{3, 30, kNotBitfield};
+    TypeId const u9 = packedBitfieldComposite(ti, TypeKind::Union, "U9", 19,
+                                              f9, w9, /*packed=*/true);
+    auto const l9 = computeLayout(u9, ti, kPkMsvc, DataModel::Lp64);
+    ASSERT_TRUE(l9.has_value());
+    EXPECT_EQ(l9->size, 4u) << "the one shape both strategies agree on";
+    EXPECT_EQ(l9->align.bytes(), 1u);
+}
+
+// The residual, and it is NOT new: a bit-field that CROSSES its declared
+// allocation unit is unrepresentable in `BitFieldPlacement` (which describes one
+// `unitBytes`-wide load/store at `fieldOffsets[i]`), so it FAILS LOUD rather than
+// being mis-placed. `#pragma pack(N)` has behaved exactly this way since TF-C97;
+// `packed` now shares the path, and ✔MEASURED end to end both spellings produce
+// the SAME positioned refusal (`H_UnsupportedLoweringForKind`) on the same source.
+//
+// gcc and clang lay this shape out at 10/1, so DSS is BELOW them here — which is
+// precisely why the refusal is loud and named rather than quietly rounded.
+TEST(TypeInterner, PackedBitfieldCrossingItsUnitStillFailsLoud) {
+    auto ti = makeInterner(1);
+    // `struct { char c; unsigned long long b:60; char d; } packed` — `b` starts at
+    // bit 8 and runs to bit 68, crossing its 64-bit unit.
+    std::array<TypeId, 3> const f{ti.primitive(TypeKind::Char),
+                                  ti.primitive(TypeKind::U64),
+                                  ti.primitive(TypeKind::Char)};
+    std::array<std::int64_t, 3> const w{kNotBitfield, 60, kNotBitfield};
+    TypeId const s = packedBitfieldComposite(ti, TypeKind::Struct, "Cross", 21,
+                                             f, w, /*packed=*/true);
+    EXPECT_FALSE(computeLayout(s, ti, kPkGnu, DataModel::Lp64).has_value())
+        << "a placement the access model cannot express must be REFUSED, never "
+           "laid out with the overhanging bits silently dropped";
+
+    // RED-ON-DISABLE partner: the same fields with a NARROWER bit-field fit their
+    // unit and lay out fine, so the refusal above is about the crossing and not
+    // about packed-plus-u64 in general.
+    std::array<std::int64_t, 3> const wFits{kNotBitfield, 56, kNotBitfield};
+    TypeId const ok = packedBitfieldComposite(ti, TypeKind::Struct, "Fits", 22,
+                                              f, wFits, /*packed=*/true);
+    auto const l = computeLayout(ok, ti, kPkGnu, DataModel::Lp64);
+    ASSERT_TRUE(l.has_value());
+    EXPECT_EQ(l->size, 9u) << "1 + 56 bits + 1 = 9 bytes";
+    EXPECT_EQ(l->align.bytes(), 1u);
 }

@@ -948,7 +948,22 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
                      std::string_view                  wideFloatSoftcallLibrary,
-                     DiagnosticReporter&               reporter);
+                     DiagnosticReporter&               reporter,
+                     // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime
+                     // block (the image owning the GENERIC `__atomic_load`/
+                     // `__atomic_store` entries + their already-mangled names for
+                     // this format). Threaded into MIR→LIR exactly like
+                     // `wideFloatSoftcallLibrary` above, and read off the schema at
+                     // the call site for the same reason. nullopt = this format
+                     // supplies none: an under-aligned `_Atomic` access then refuses
+                     // LOUD under a `traps` target (arm64 — the native LDAR/STLR pair
+                     // is a MEASURED SIGBUS) and keeps the native form under
+                     // `losesAtomicity` (x86_64, where it is what gcc ships). TRAILING
+                     // + DEFAULTED, the same positional-safe shape every format fact
+                     // on `lowerToLir` already takes, so a fixture that builds a raw
+                     // `CuMirModule` states "no format declared" by saying nothing.
+                     std::optional<AtomicsRuntime> const& atomicsRuntime =
+                         std::nullopt);
 
 // ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: PROGRAM-ENTRY RESOLUTION ───────────────
 //
@@ -1071,7 +1086,15 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // softcall runtime library, pre-resolved in program.cpp
                       // (no ObjectFormatKind in scope in the merge lower body).
                       std::optional<std::string> wideFloatSoftcallLibrary,
-                      DiagnosticReporter&  reporter);
+                      DiagnosticReporter&  reporter,
+                      // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's
+                      // atomics-runtime block, pre-resolved in program.cpp for
+                      // the same reason the softcall library above is (no
+                      // ObjectFormatKind in scope in the merge lower body).
+                      // Trailing + defaulted, like every format fact on
+                      // `lowerToLir`.
+                      std::optional<AtomicsRuntime> atomicsRuntime =
+                          std::nullopt);
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's

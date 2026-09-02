@@ -478,11 +478,6 @@ evalNode(NodeId                              expr,
         // loud, never a silent zero).
         if (ctx.floatLiteralTokens != nullptr
             && ctx.floatLiteralTokens->contains(tk.v)) {
-            bool decodeOk = true;
-            double const d = decodeFloat(tree.text(expr), ctx.numberStyle, decodeOk);
-            if (!decodeOk) {
-                return fail(ConstEvalFailure::NotAConstantExpression, expr);
-            }
             HirLiteralValue lv;
             lv.core  = TypeKind::F64;  // the fold-arithmetic core; consumers
                                        // read `.value` (see the I32 note above)
@@ -494,6 +489,14 @@ evalNode(NodeId                              expr,
             // silently fold at binary64. An axis-undeclared long-double
             // literal is simply not a foldable constant here (the semantic
             // literal typing already emitted S_LongDoubleFormatUndeclared).
+            //
+            // ★ THE LADDER RUNS BEFORE THE DECODE, and that ORDER is the fix for
+            // D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION: the core it
+            // resolves IS the target's mantissa width, so the decoder can be
+            // asked for the value AT that width instead of being handed a host
+            // `double` after the fact. (It used to decode first and stamp the
+            // core second, which is why a `0.1L` leaf could only ever carry 53
+            // significant bits no matter what the axis said.)
             if (!ctx.floatLiteralTyping.empty()) {
                 auto const r = typeFloatLiteral(tree.text(expr), ctx.numberStyle,
                                                 ctx.floatLiteralTyping,
@@ -503,7 +506,25 @@ evalNode(NodeId                              expr,
                 }
                 if (r.status == FloatLadderStatus::Typed) lv.core = r.kind;
             }
-            lv.value = d;
+            bool decodeOk = true;
+            if (WideFloatValue::isSupportedKind(lv.core)) {
+                // F80 / F128: decode at TARGET precision into the wide arm. The
+                // `double` arm stays valid for these kinds (LD-3: the widen is
+                // exact), so this is a value-precision change, not a new
+                // representation the downstream has to learn.
+                auto wf = decodeFloatWide(tree.text(expr), ctx.numberStyle,
+                                          lv.core, decodeOk);
+                if (!decodeOk || !wf.has_value()) {
+                    return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                }
+                lv.value = *wf;
+            } else {
+                double const d = decodeFloat(tree.text(expr), ctx.numberStyle, decodeOk);
+                if (!decodeOk) {
+                    return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                }
+                lv.value = d;
+            }
             return ok(std::move(lv));
         }
         // Item 1 DIRECT-VALUE path: a named constant whose value is carried

@@ -621,6 +621,136 @@ struct Lowerer {
     // access is seq_cst — the strongest, default order (C11 6.5.2.4/7.17.3).
     static constexpr std::uint32_t kAtomicOrderSeqCst = 5;
 
+    // ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the lvalue's PROVABLE alignment ────
+    //
+    // The one fact the atomic lowering needs and the only tier that still has
+    // it: how well-aligned an lvalue is GUARANTEED to be, in bytes, derived
+    // from layout alone. Stamped onto every AtomicLoad/AtomicStore's `payload2`
+    // (the free, documented secondary channel) and read at MIR→LIR, which
+    // compares it against the access width and — when the TARGET says the
+    // native inline form is not valid under-aligned — routes the access through
+    // the FORMAT's atomics runtime instead of `ldar`/`stlr`.
+    //
+    // ★ THE RULE IS A PURE LAYOUT FACT AND IT REPRODUCES clang ON ALL SIX
+    // LVALUE FORMS MEASURED (P53, clang 18.1.3 `--target=aarch64-linux-gnu -S`
+    // and Apple clang 21): packed member at offset 1 ⇒ under-aligned; packed
+    // member at offset 0 of an align-1 struct ⇒ under-aligned (the STRUCT-ALIGN
+    // term is load-bearing — offset 0 alone would wrongly say "aligned");
+    // unpacked member ⇒ aligned; `_Atomic int *` deref ⇒ aligned; packed member
+    // through a `struct P *` ⇒ under-aligned; plain `_Atomic` global ⇒ aligned.
+    //
+    // ⚠⚠ IT MUST BE APPLIED RECURSIVELY OVER THE LVALUE CHAIN, NOT ONE LEVEL.
+    // `MemberAccess` and `Index` both NEST, and a single-level
+    // `min(StructLayout.align, 2^ctz(offset))` calls `p.q.a` ALIGNED when `q`
+    // (align 4, offset 0 within itself) sits at offset 1 of a packed `p` — a
+    // silent SIGBUS at depth 2. The recursion is what closes that.
+    //
+    // ⓘ THE DEREF STOPS THE WALK, AND KEEPING THE NATIVE FORM THERE IS THE
+    // REFERENCE-EXACT ANSWER: C requires an `_Atomic T *` to point at a
+    // properly-aligned object, clang assumes exactly that, and routing every
+    // pointer-mediated atomic through a libcall would be a large pessimisation
+    // bought with no measured safety.
+    //
+    // Returns 0 when no alignment can be derived (the target declared no
+    // `aggregateLayout`, or an un-sizeable type) — the "unknown" sentinel the
+    // LIR reader treats as "assume aligned", i.e. byte-for-byte today's output.
+    [[nodiscard]] std::uint32_t naturalAlignOfType(TypeId ty) {
+        if (!ty.valid()) return 0;
+        StructLayout const* layout = cachedOperandLayout(ty);
+        if (layout == nullptr) return 0;
+        return layout->align.bytes();
+    }
+
+    // The largest power of two dividing `off` (an offset of 0 divides by every
+    // power of two, so it constrains nothing and returns the "no constraint"
+    // sentinel `kUnconstrainedAlign`).
+    static constexpr std::uint32_t kUnconstrainedAlign = 0xFFFF'FFFFu;
+    [[nodiscard]] static std::uint32_t offsetAlign(std::uint64_t off) noexcept {
+        if (off == 0) return kUnconstrainedAlign;
+        return static_cast<std::uint32_t>(off & (~off + 1u));
+    }
+
+    [[nodiscard]] std::uint32_t provableLvalueAlign(HirNodeId node,
+                                                    unsigned depth = 0) {
+        // A pathological HIR depth is a malformed tree, not a layout question;
+        // answer "unknown" rather than recurse without bound.
+        if (!node.valid() || depth > 64) return 0;
+        auto kids = hir.children(node);
+        switch (hir.kind(node)) {
+            case HirKind::MemberAccess: {
+                if (kids.size() != 1) break;
+                TypeId const aggTy = hir.typeId(kids[0]);
+                auto const off = fieldByteOffset(aggTy, hir.payload(node));
+                if (!off.has_value()) return 0;
+                std::uint32_t const base =
+                    provableLvalueAlign(kids[0], depth + 1);
+                if (base == 0) return 0;
+                return std::min(base, offsetAlign(*off));
+            }
+            case HirKind::Index: {
+                if (kids.size() != 2) break;
+                // The subscript is a RUNTIME value, so the byte offset is
+                // `i * stride` for an unknown `i` — only the STRIDE's own
+                // power-of-two factor is provable. A pointer base restarts the
+                // walk at the pointee's guaranteed alignment (the Deref rule).
+                TypeId const baseTy = hir.typeId(kids[0]);
+                TypeId const elemTy = hir.typeId(node);
+                auto const stride = elementStride(elemTy);
+                if (!stride.has_value()) return 0;
+                std::uint32_t const base =
+                    baseTy.valid() && interner.kind(baseTy) == TypeKind::Ptr
+                        ? naturalAlignOfType(elemTy)
+                        : provableLvalueAlign(kids[0], depth + 1);
+                if (base == 0) return 0;
+                return std::min(base, offsetAlign(*stride));
+            }
+            case HirKind::Deref: {
+                // C 6.5.3.2: a dereferenced pointer designates a properly
+                // aligned object of its pointee type. The walk STOPS here.
+                if (kids.size() != 1) break;
+                TypeId const ptrTy = hir.typeId(kids[0]);
+                if (!ptrTy.valid()
+                    || interner.kind(ptrTy) != TypeKind::Ptr) break;
+                auto const pointee = interner.operands(ptrTy);
+                if (pointee.size() != 1 || !pointee[0].valid()) break;
+                return naturalAlignOfType(pointee[0]);
+            }
+            default: break;
+        }
+        // Every other lvalue root — a named object, a global, a temporary — is
+        // stored at its own type's natural alignment (a packed struct's is 1,
+        // which is exactly the term that makes the member arm above answer
+        // correctly at offset 0).
+        return naturalAlignOfType(hir.typeId(node));
+    }
+
+    // The `payload2` an AtomicLoad/AtomicStore over `node` carries: the lvalue's
+    // provable alignment, clamped so it can never claim MORE than the accessed
+    // type's natural alignment (a fully-aligned access is all the LIR reader
+    // needs to know, and clamping keeps the value a small power of two).
+    [[nodiscard]] std::uint32_t atomicAlignPayload(HirNodeId node,
+                                                   TypeId accessedTy) {
+        std::uint32_t const natural = naturalAlignOfType(accessedTy);
+        std::uint32_t const provable = provableLvalueAlign(node);
+        if (provable == 0 || natural == 0) return 0;   // unknown
+        return std::min(provable, natural);
+    }
+
+    // The `payload2` for the POINTER-argument atomic builtins
+    // (`atomic_load_explicit` / `atomic_store_explicit`): the alignment C
+    // guarantees for the pointee, which is the SAME rule the `Deref` arm of
+    // `provableLvalueAlign` applies and for the same reason (6.5.3.2). The
+    // builtin takes a VALUE of pointer type, so there is no lvalue chain left
+    // to walk — that is a property of the construct, not a gap in the walk.
+    [[nodiscard]] std::uint32_t atomicPointerAlignPayload(HirNodeId ptrNode) {
+        if (!ptrNode.valid()) return 0;
+        TypeId const ptrTy = hir.typeId(ptrNode);
+        if (!ptrTy.valid() || interner.kind(ptrTy) != TypeKind::Ptr) return 0;
+        auto const pointee = interner.operands(ptrTy);
+        if (pointee.size() != 1 || !pointee[0].valid()) return 0;
+        return naturalAlignOfType(pointee[0]);
+    }
+
     // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the SINGLE scalar-access chokepoint
     // that decides atomic-vs-plain. Every scalar Load emit routes through here so
     // an `_Atomic`-qualified access lowers to `AtomicLoad` (seq_cst) BY
@@ -635,8 +765,14 @@ struct Lowerer {
             // `_Atomic` (incl. `_Atomic volatile`): AtomicLoad ALONE — its
             // hasSideEffects + opcodeClobbersMemory membership subsume volatile's
             // no-elide / no-CSE / no-hoist, so no Volatile flag is threaded.
+            // D-CSUBSET-PACKED-ATOMIC-MEMBER: `payload2` carries the lvalue's
+            // PROVABLE alignment — the layout fact MIR→LIR needs to choose
+            // between the native `ldar` and the runtime libcall, and the last
+            // tier that still has the HIR access chain to derive it from.
             return mir.addInst(MirOpcode::AtomicLoad, ptrOps, accessedTy,
-                               /*payload=*/kAtomicOrderSeqCst, MirInstFlags::None);
+                               /*payload=*/kAtomicOrderSeqCst,
+                               MirInstFlags::None,
+                               atomicAlignPayload(node, accessedTy));
         }
         return mir.addInst(MirOpcode::Load, ptrOps, accessedTy, /*payload=*/0,
                            volatileFlagFor(node) | volatileFlagForType(accessedTy));
@@ -653,8 +789,11 @@ struct Lowerer {
     void emitScalarStore(std::span<MirInstId const> storeOps, TypeId accessedTy,
                          HirNodeId node) {
         if (interner.isAtomicQualified(accessedTy)) {
+            // D-CSUBSET-PACKED-ATOMIC-MEMBER: see the `emitScalarLoad` twin —
+            // `payload2` is the lvalue's provable alignment.
             mir.addInst(MirOpcode::AtomicStore, storeOps, InvalidType,
-                        /*payload=*/kAtomicOrderSeqCst, MirInstFlags::None);
+                        /*payload=*/kAtomicOrderSeqCst, MirInstFlags::None,
+                        atomicAlignPayload(node, accessedTy));
             return;
         }
         mir.addInst(MirOpcode::Store, storeOps, InvalidType, /*payload=*/0,
@@ -3391,7 +3530,8 @@ struct Lowerer {
                         std::array<MirInstId, 1> const ld{operands[0]};
                         return mir.addInst(MirOpcode::AtomicLoad, ld, t,
                                            foldAtomicOrder(kids[1]),
-                                           MirInstFlags::None);
+                                           MirInstFlags::None,
+                                           atomicPointerAlignPayload(kids[0]));
                     }
                     case BuiltinLowering::AtomicStore: {
                         // FC17.9(d) (D-CSUBSET-ATOMIC): atomic_store_explicit(ptr, val,
@@ -3407,7 +3547,8 @@ struct Lowerer {
                         std::array<MirInstId, 2> const st{operands[1], operands[0]};
                         return mir.addInst(MirOpcode::AtomicStore, st, InvalidType,
                                            foldAtomicOrder(kids[2]),
-                                           MirInstFlags::None);
+                                           MirInstFlags::None,
+                                           atomicPointerAlignPayload(kids[0]));
                     }
                     case BuiltinLowering::AtomicFence: {
                         // D-CSUBSET-ATOMIC-FENCE + D-CSUBSET-SYNC-BUILTIN-BARRIER:
@@ -7466,8 +7607,49 @@ struct Lowerer {
         // offsets: a descriptor may pin non-overlapping offsets (a foreign layout that
         // simply is not natural), and positional Stores at disjoint offsets are exactly
         // right — that case falls through to the member-wise path below.
-        if (compositeFieldsOverlap(aggTy, interner, config.aggregateLayout,
-                                   config.dataModel)) {
+        //
+        // ★ D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-UNIONS: A UNION IS ROUTED PAST
+        // THIS GATE, and it is the routing this arm always owed rather than a way
+        // around a predicate that now tells the truth. `compositeFieldsOverlap`
+        // answers `true` for every union with two or more sizeable members — they all
+        // sit at byte 0, so they DO share bytes — but the question this gate asks is
+        // narrower: would a positional member-wise write clobber a sibling? For a
+        // union brace-init the answer is NO whatever the members share, because C
+        // 6.7.9p17 initializes exactly ONE member and the loop below therefore
+        // performs exactly ONE Store, at offset 0. There is no member ORDER to get
+        // wrong and no sibling to lose. Without this route a truthful predicate would
+        // refuse every non-zero `union U u = {1};` — a construct all three reference
+        // toolchains accept — which is a conformance regression, not a fix.
+        //
+        // ⚠ AND THE ONE-CHILD PREMISE IS ASSERTED, NOT ASSUMED. ✔MEASURED that THREE
+        // independent things already guarantee it:
+        //   * `lowerUnionBraceInit` returns a 1-child `ConstructAggregate` (its
+        //     multi-element and chained-designator forms are diagnosed there);
+        //   * `synthZeroOrError`'s composite arm computes `n = (core ==
+        //     TypeKind::Union) ? 1 : ops.size()`, so `union U u = {};` is 1-child too;
+        //   * `HirVerifier::checkConstructAggregate` REFUSES a Union aggregate whose
+        //     child count is not exactly 1 ("expected exactly 1 child (the active
+        //     variant)").
+        // So the refusal below is expected NEVER to fire, and it is here anyway for a
+        // reason the third bullet makes sharper rather than weaker: the verifier is a
+        // SEPARATE PASS, and `lowerToMir` neither runs it nor requires it to have been
+        // run. Every guarantee above lives upstream of this function, and this
+        // function is the one whose union route CONVERTS a multi-child aggregate from
+        // "refused by the overlap gate" into "silently written member-wise, second
+        // write clobbering the first at offset 0". A refusal that never fires costs
+        // nothing; a silent permission costs a miscompile.
+        if (interner.kind(aggTy) == TypeKind::Union) {
+            auto const unionKids = hir.children(aggNode);
+            if (unionKids.size() > 1) {
+                unsupported(aggNode,
+                            "brace-initialization of a union supplied more than one "
+                            "member — a union initializer names exactly one member "
+                            "(C 6.7.9p17), and the union route past the overlapping-"
+                            "members gate is valid only for that single write");
+                return false;
+            }
+        } else if (compositeFieldsOverlap(aggTy, interner, config.aggregateLayout,
+                                          config.dataModel)) {
             if (!isAllZeroAggregateInit(aggNode)) {
                 unsupported(aggNode, "brace-initialization of an overlapping "
                                      "explicit-offset struct is unsupported — its members "
@@ -8610,6 +8792,18 @@ struct Lowerer {
             // aligned to the operand list (arg_payload.hpp; this callee is
             // inline-refused, but the positions must stay consistent).
             (void)ctr.nextPosition();
+            // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: round the cursor to the
+            // boundary this CC honours for a stacked aggregate BEFORE taking the
+            // offset, with the SAME call the caller's cursor makes. An aggregate
+            // states NO own alignment (`0`) on either side — the LIR tier has no
+            // layout engine, so the caller cannot state one and the callee must
+            // therefore not USE one, or the two would round differently and the
+            // caller would write where this read does not look. That symmetry is
+            // the load-bearing part; the round-up itself is inert today (an
+            // aggregate is the first/only stacked fixed param, guarded above).
+            currentFnFixedStackBytes_ = roundUpToSlot(
+                currentFnFixedStackBytes_,
+                config.stackArgPacking.aggregateAlignment(0, stackSlotBytes()));
             MirInstId const src =
                 mir.addInst(MirOpcode::RecvByValueStackParam, {},
                             interner.pointer(aggTy),
@@ -8719,7 +8913,15 @@ struct Lowerer {
             config.stackArgPacking.namedScalars == StackArgPacking::Natural
             && nat != 0 && nat <= slot;
         std::uint32_t const size  = natural ? nat : slot;
-        std::uint32_t const align = natural ? nat : slot;
+        // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the non-natural arm asks the
+        // CC how much of the datum's own alignment it honours instead of assuming
+        // the slot — the SAME `StackArgPackingRules::scalarAlignment` call
+        // `StackArgCursor::place` makes on the caller's side, so the two walks
+        // cannot answer differently. For every natural size a producer states
+        // today (0/1/2/4/8) the clamp floors at the slot, so this is byte-for-byte
+        // the previous arithmetic.
+        std::uint32_t const align =
+            natural ? nat : config.stackArgPacking.scalarAlignment(nat, slot);
         currentFnFixedStackBytes_ =
             roundUpToSlot(currentFnFixedStackBytes_, align) + size;
         currentFnSawFixedStackParam_  = true;
@@ -13195,6 +13397,26 @@ struct Lowerer {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }
+                // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the x87 slot is
+                // 16-byte ALIGNED, not merely 16 bytes wide, so the cursor is
+                // rounded up BEFORE the offset is taken. This walk is the CALLEE's
+                // half of the contract and it must land on the same byte the
+                // CALLER's `StackArgCursor` chooses — which it does by
+                // construction, because both ask the SAME
+                // `StackArgPackingRules::aggregateAlignment` (the F80 crosses on
+                // the by-value carrier, hence the aggregate axis) with the SAME
+                // `naturalScalarAlignment` for the datum's own alignment.
+                // ✔MEASURED: gcc 13.3.0 and clang 18.1.3 both read a `long double`
+                // at incoming +16, not +8, after one stacked 8-byte argument.
+                // Undeclared caps ⇒ align == slot ⇒ this is the old `+= 16`
+                // byte-for-byte.
+                std::uint32_t const ldSlot = stackSlotBytes();
+                std::uint32_t const ldAlign =
+                    config.stackArgPacking.aggregateAlignment(
+                        naturalScalarAlignment(16, config.aggregateLayout),
+                        ldSlot);
+                currentFnFixedStackBytes_ =
+                    roundUpToSlot(currentFnFixedStackBytes_, ldAlign);
                 std::uint32_t const byteOff = currentFnFixedStackBytes_;
                 currentFnFixedStackBytes_ += 16;   // the 16-byte x87 stack slot
                 currentFnSawStackedAggregate_ = true;

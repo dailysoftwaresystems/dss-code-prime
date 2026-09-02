@@ -86,6 +86,10 @@ merely taken, because a gate cannot tell a deliberate POSIX-or-portable-only
 script from a forgotten twin.
 Exit codes: 0 OK · 2 refused (nothing written) · 3 usage error.
 
+⚠ THE TREE ACTED ON IS THE ONE THIS SCRIPT LIVES IN, never the caller's cwd --
+[[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]], see `repo_root`. `--repo <path>`
+names another tree deliberately, and works with every verb.
+
 Usage:
     python scripts/lane-fold/lane-fold.py seed <lane>           # carry the main
                                           #   tree's uncommitted state into the lane
@@ -127,16 +131,52 @@ def die(msg, code=2):
     sys.exit(code)
 
 
-def repo_root():
-    """The repository root, from git rather than from a hardcoded path.
+def repo_root(anchor=None):
+    """The root of the working tree that CONTAINS THIS SCRIPT (or `anchor`).
 
     ⚠ A predecessor hardcoded `C:\\Source\\DailySoftware\\dss-code-prime`, which makes
     the tool unusable from a worktree, from any clone, and on every non-Windows leg.
+
+    ★★★ AND ITS REPLACEMENT -- a bare `git rev-parse --show-toplevel` -- TRADED THAT
+    FOR A SUBTLER WRONG ANSWER. [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]]
+    A bare `rev-parse` answers "what repository is my CALLER'S SHELL in?", so `wt`,
+    `mpath`, every `os.path.join(root, rel)` a fold WRITES to, and every path it
+    REMOVES were rooted at whichever repository somebody happened to have cd'd into.
+    ✔MEASURED 2026-09-02, live, on this repository's own orchestrator: a shell that
+    had drifted into `.worktrees/io` ran the MAIN tree's copy of this script, and
+    `fold io --apply` refused with
+        no worktree at <repo>\\.worktrees\\io\\.worktrees\\io
+    -- the loud direction, by luck of the doubled path. ✔MEASURED the same day from a
+    throwaway repository outside the checkout: `list` reported THAT repository's
+    `.worktrees/`, which is the quiet direction, and a `fold` from there would have
+    measured one tree and written into another.
+
+    ★ THE QUESTION IS "WHICH TREE DOES MY OWN FILE BELONG TO?" -- `__file__`, not
+    `os.getcwd()`. `$PWD` is a property of the caller's shell; the script's path is a
+    property of the script, and only the second survives a `cd`. In the measured
+    incident this is exactly right: the orchestrator invoked the MAIN tree's copy, so
+    `__file__` names the main checkout no matter where the shell had wandered.
+    The rejected alternative -- "the MAIN checkout, because only it owns
+    `.worktrees/`" -- is recorded with its measurement in `lane-worktree.sh`'s
+    `_repo_root`; briefly, from a lane it aims a removal at a live SIBLING lane, and
+    for a submodule checkout it names a directory inside `.git`.
+
+    ⓘ ONE SPELLING PER LANGUAGE. The `.sh` and `.ps1` halves of this fix route
+    through their existing owners (`leg_tree_owning_root`, `Get-RepoTreeOwningRoot`).
+    Python's named owner is `scripts/carriage-excludes/carriage-excludes.py`, whose
+    `_git_prefix`/`_git` answer "how do I run git against a tree I have already
+    identified" -- the same adjacent question the other two owners' identity
+    functions answer, and not this one. This is the only Python caller that needs the
+    derivation, so it lives here, once, rather than in a shared module with one user.
     """
-    out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+    if anchor is None:
+        anchor = os.path.dirname(os.path.realpath(__file__))
+    out = subprocess.run(["git", "-C", anchor, "rev-parse", "--show-toplevel"],
                          capture_output=True)
     if out.returncode != 0:
-        die("not inside a git repository (git rev-parse --show-toplevel failed).", 3)
+        die("no git working tree contains %s.\n"
+            "  This script resolves the tree IT LIVES IN, never the caller's cwd;\n"
+            "  pass --repo <path> to name a different tree deliberately." % anchor, 3)
     return os.path.realpath(out.stdout.decode("utf-8", "surrogateescape").strip())
 
 
@@ -667,6 +707,46 @@ def self_test():
             "(h) a deletion whose destination DRIFTED is REFUSED, not carried out",
             "deleted=%s refusals=%s" % (d_drift, r_drift))
 
+        # (i) THE ROOT IS THIS SCRIPT'S OWN TREE, NOT THE CALLER'S CWD.
+        # [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]]
+        #
+        # ⚠⚠ THE ARM SETS A DIFFERENT CWD DELIBERATELY, AND THAT IS THE WHOLE REASON
+        # IT EXISTS. Everything above runs with the cwd wherever the caller left it
+        # and never notices, because a wrong root and a right one look identical
+        # while they agree. `root` here is a REAL repository -- `git init` above --
+        # so a cwd-keyed `repo_root()` succeeds and answers about IT, which is the
+        # quiet direction this row is about.
+        #
+        # ★ BOTH HALVES ARE ASSERTED. The positive (it names the tree holding this
+        # file) and the negative (it does NOT name the fixture) -- a positive-only
+        # pin would pass on a resolver that somehow reached both, and the negative
+        # alone would pass on one that returned nothing.
+        # ⓘ `os.chdir` is restored in a `finally`: the arms above measured with the
+        # original cwd and the temp directory is about to be deleted, so leaving the
+        # process inside it would break the cleanup on Windows.
+        mine_tree = os.path.realpath(
+            os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", ".."))
+        was = os.getcwd()
+        try:
+            os.chdir(root)
+            got = repo_root()
+        finally:
+            os.chdir(was)
+        pin(os.path.realpath(got) == mine_tree
+            and os.path.realpath(got) != os.path.realpath(root),
+            "(i) driven from ANOTHER repository's cwd, repo_root() still names the "
+            "tree THIS FILE lives in",
+            "got=%s wanted=%s cwd-was=%s" % (got, mine_tree, root))
+
+        # (j) `--repo <path>` IS THE EXPLICIT ESCAPE HATCH, and the CONTROL for (i).
+        # ⚠ Without it, (i) passes over a `repo_root` that had simply stopped being
+        # able to reach any tree but its own -- the capability the old cwd-keying
+        # provided BY ACCIDENT would have been removed rather than named, and
+        # nothing would have measured the difference.
+        pin(os.path.realpath(repo_root(root)) == os.path.realpath(root),
+            "(j) CONTROL: --repo <path> still reaches another tree, deliberately",
+            "got=%s wanted=%s" % (repo_root(root), root))
+
     print("lane-fold self-test: %d failed" % failed[0])
     return 1 if failed[0] else 0
 
@@ -679,8 +759,39 @@ def main(argv):
     if not argv:
         print(__doc__)
         return 3
-    verb, rest = argv[0], argv[1:]
-    root = repo_root()
+    # ── `--repo <path>` ─────────────────────────────────────────────────────────
+    # ⚠ EXTRACTED FROM THE WHOLE ARGUMENT LIST, BEFORE THE VERB IS READ, so it works
+    # on either side of the verb. A first draft scanned only `argv[1:]`, and
+    # `lane-fold.py --repo <path> fold lw` then died with "unknown verb '--repo'"
+    # while the `.sh` twin accepted the same spelling -- two halves of one tool
+    # disagreeing about their own grammar, which is a thing a caller discovers at the
+    # moment they most want the escape hatch.
+    # ⓘ THE FLAG IS THE CAPABILITY THE OLD CWD-KEYED BEHAVIOUR PROVIDED BY ACCIDENT:
+    # driving the verb at another tree used to be done by cd'ing there and hoping.
+    # Saying it out loud is the difference between a decision and a side effect.
+    override = None
+    kept = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--repo":
+            if i + 1 >= len(argv):
+                die("--repo needs a directory.", 3)
+            override, i = argv[i + 1], i + 2
+            continue
+        if argv[i].startswith("--repo="):
+            override, i = argv[i][len("--repo="):], i + 1
+            if not override:
+                die("--repo needs a directory.", 3)
+            continue
+        kept.append(argv[i])
+        i += 1
+    if not kept:
+        print(__doc__)
+        return 3
+    verb, rest = kept[0], kept[1:]
+    if override is not None and not os.path.isdir(override):
+        die("--repo %r: no such directory." % override, 3)
+    root = repo_root(override)
     if verb == "list":
         return cmd_list(root)
     if verb not in ("seed", "fold"):

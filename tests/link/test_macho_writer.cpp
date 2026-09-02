@@ -37,6 +37,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -2275,6 +2276,39 @@ namespace {
     }
     return out;
 }
+
+// ── The STATIC exec arm needs an UNSIGNED exec schema ────────────
+//
+// D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM. `encodeExec` — the static
+// arm, taken when `externImports` is empty — builds no __LINKEDIT, so it can
+// host no LC_CODE_SIGNATURE under ANY schema, and `macho::encode` now REFUSES
+// a zero-extern module whenever the format requests a signature by either key
+// rather than encoding it and dropping the request in silence. Every shipped
+// Darwin exec document requests one, so the static arm is unreachable from a
+// shipped exec schema BY CONSTRUCTION — the same conclusion `test_macho_eh_
+// frame.cpp` `MachOTextSectionAlign.TheSTATICExecArmWritesLog2Too` already
+// reached and solved the same way.
+//
+// The static-arm tests below therefore drive the shipped x86_64 exec document
+// MINUS its signature request, supplied by the SHARED fixture in
+// `macho_test_support.hpp` (which cross-checks itself field-by-field against
+// the shipped document, so it cannot drift out from under these pins). They
+// used to drive the shipped document itself, asserting `errorCount() == 0`,
+// which is exactly how ten of them stayed green over a silently dropped
+// signature.
+[[nodiscard]] Loaded loadStaticExec() {
+    Loaded out;
+    auto t = TargetSchema::loadShipped("x86_64");
+    if (!t.has_value()) {
+        ADD_FAILURE() << "loadShipped(x86_64) failed";
+        for (auto const& d : t.error()) ADD_FAILURE() << "  " << d.message;
+        return out;
+    }
+    out.target = std::move(t).value();
+    out.format = dss::macho::test::loadUnsignedExec(
+        "macho64-x86_64-darwin-exec");
+    return out;
+}
 } // namespace
 
 TEST(MachOExecFormatJson, ShippedFileLoadsCleanly) {
@@ -2290,7 +2324,7 @@ TEST(MachOExecFormatJson, ShippedFileLoadsCleanly) {
 }
 
 TEST(MachOExecWriter, MachHeaderFiletypeEqualsMhExecute) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
@@ -2303,7 +2337,7 @@ TEST(MachOExecWriter, MachHeaderFiletypeEqualsMhExecute) {
 }
 
 TEST(MachOExecWriter, PageZeroSegmentEmittedFirst) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
@@ -2321,7 +2355,7 @@ TEST(MachOExecWriter, PageZeroSegmentEmittedFirst) {
 }
 
 TEST(MachOExecWriter, LcMainEntryOffPointsToFirstFunction) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     // 2 functions: f[0] is some prelude (0x90 NOP + 0xC3 ret), f[1] is the entry.
     AssembledModule mod;
     mod.expectedFuncCount = 2;
@@ -2619,7 +2653,8 @@ TEST(MachOExecWriter, IntraModuleBranchAppliedByteForByte) {
     // Branch (rel32, kind 1) from fn[0] to fn[1].
     // sectionVa = pageZeroSize + 0x1000 = 0x100001000.
     // P = sectionVa + 1, S = sectionVa + 6, A = 0 → value = 1.
-    auto loaded = loadShippedExec();
+    // Static arm (no externImports) ⇒ the unsigned fixture.
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 2;
     AssembledFunction f0;
@@ -2666,7 +2701,7 @@ TEST(MachOExecWriter, IntraModuleBranchAppliedByteForByte) {
 }
 
 TEST(MachOExecWriter, ExternTargetFailsLoudAsUndefined) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
@@ -2893,7 +2928,7 @@ TEST(MachOExecFormatJsonValidate, MissingDylinkerPathRejected) {
 }
 
 TEST(MachOExecWriter, EmptyTextFailsLoud) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
@@ -2906,7 +2941,7 @@ TEST(MachOExecWriter, EmptyTextFailsLoud) {
 }
 
 TEST(MachOExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 2;
     AssembledFunction f0;
@@ -2938,7 +2973,7 @@ TEST(MachOExecWriter, TextSegmentVmaddrEqualsPageZeroEnd) {
     // dyld rejects both). The walker computes it; a future
     // refactor that drifts this would silently produce a non-
     // loadable image.
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
@@ -2979,7 +3014,7 @@ TEST(MachOExecWriter, LcLoadDylibStructurePinnedByteForByte) {
     // refactor changes the field layout, dyld silently looks for
     // the path at the wrong offset, fails to find libSystem, and
     // the process never starts. Pin the layout byte-for-byte.
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
@@ -3041,7 +3076,7 @@ TEST(IsImageFlavorAccessor, ConsistentAcrossThreeFormats) {
 }
 
 TEST(MachOExecWriter, DisplacementOverflowFailsLoud) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;

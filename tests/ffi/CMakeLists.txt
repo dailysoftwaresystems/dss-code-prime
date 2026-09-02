@@ -210,3 +210,15 @@ dss_add_test(NAME ffi/test_shipped_mtx_type_declarations
              SOURCES test_shipped_mtx_type_declarations.cpp)
 target_link_libraries(dss_ffi_test_shipped_mtx_type_declarations
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-FFI-IOCTL-SIZE-FIELD-OVERFLOW-SILENT (P53 lane io): the per-format SIZE
+# CEILING in the `<sys/ioctl.h>` request-encoding macros, pinned as BEHAVIOUR
+# rather than as descriptor TEXT (its sibling above does the text). It compiles
+# boundary types through the real front end for both formats and both arches of
+# each, so the REFUSE half — the whole point of the row, a program that must NOT
+# compile — has somewhere to live: the examples corpus has no compile-failure
+# convention, and both ioctl example directories declare runOn linux/darwin, so
+# neither RUNS on a Windows host. Needs no json link: it writes C source and
+# drives `Program::compileFiles`, it does not read the descriptor's JSON.
+dss_add_test(NAME ffi/test_shipped_ioctl_size_ceiling
+             SOURCES test_shipped_ioctl_size_ceiling.cpp)
