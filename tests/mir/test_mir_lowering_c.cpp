@@ -12698,12 +12698,18 @@ TEST(MirLoweringC, PtrToVlaTypedefObjectCopiesFrozenPointeeStride) {
 }
 
 // (d) CHAINED VLA typedef `typedef int R[n]; typedef R S;` — S aliases a VLA typedef with
-// NO own `[n]` suffix (D-CSUBSET-VLA-TYPEDEF-CHAINED). The semantic I1 gate stamps S's
-// `vlaTypedefOrigin` (declTy==headTy), so `lowerTypeDecl` recognizes the chained form and
-// fails loud CLEANLY (a real "not yet supported" diagnostic) instead of the generic
-// captureVlaSize "no suffix" desync. Red-on-disable: drop the vlaTypedefOrigin discriminator
-// and S routes back into captureVlaSize → the confusing internal-desync message.
-TEST(MirLoweringC, ChainedVlaTypedefFailsLoud) {
+// NO own `[n]` suffix. D-CSUBSET-VLA-TYPEDEF-CHAINED ✅ CLOSED in P57: this used to assert
+// `EXPECT_FALSE(L.hir->ok)` because S had no way to say WHICH typedef froze its size. It
+// does now — `SymbolRecord::vlaTypedefOrigin` names the typedef that OWNS a captured bound
+// (transitively, resolved at each alias's own declaration), so `S a;` reaches R's frozen
+// slots through the SAME C4b copy-down a direct `R a;` uses, and S's own TypeDecl emits no
+// node at all (it captured nothing and owes nothing — C 6.7.7p3 froze the size once, at R).
+// ✔MEASURED 2026-09-03: gcc 13.3.0 and clang 18.1.3 both compile and RUN this shape and the
+// three-deep `typedef S T;` form; MSVC ABSTAINS (no C99 VLA at all). Runtime witness:
+// examples/c/c99_vla_typedef_chained. RED-ON-DISABLE: restore the
+// `kind == DeclarationKind::Variable` gate on the vlaTypedefOrigin stamp in
+// semantic_analyzer.cpp and `ok` goes false again with the old chained-alias diagnostic.
+TEST(MirLoweringC, ChainedVlaTypedefLowersFromTheOriginsFrozenSlots) {
     auto L = lowerC(
         "int main(void) {\n"
         "  int n;\n"
@@ -12714,9 +12720,42 @@ TEST(MirLoweringC, ChainedVlaTypedefFailsLoud) {
         "  a[0] = 42;\n"
         "  return a[0];\n"
         "}\n");
-    EXPECT_FALSE(L.hir->ok)
-        << "a chained VLA typedef (`typedef int R[n]; typedef R S;`) is deferred — must "
-           "fail loud at HIR, never silently alias a frozen size";
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? ""
+                                                : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "a chained VLA typedef must LOWER — S inherits R's decl-frozen size rather than "
+           "re-evaluating `n` at its own declaration: "
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    // ⚠ THE ACCESSORS HERE WERE WRONG WHEN THIS BLOCK LANDED, and the note is kept
+    // because the failure mode is generic. Lane `vl` handed the orchestrator a
+    // replacement for the old `ChainedVlaTypedefFailsLoud` with an explicit warning that
+    // it had NOT been compiled in that lane (`tests/mir/**` was outside its grant) and
+    // that the neighbouring `PtrToVlaTypedefObjectCopiesFrozenPointeeStride` should be
+    // copied for the accessor spelling. It was applied verbatim instead, and
+    // `L.mir->entryBlock(L.mainFn)` does not compile: `L.mir` is a `HirToMirResult` BY
+    // VALUE (not a pointer) and the fixture exposes no `mainFn`. ⇒ **A brief that says
+    // "I did not compile this" is a fact about the patch, not a politeness**, and the
+    // repair is the one the note asked for: `Mir const& m = L.mir.mir;` plus
+    // `m.funcEntry(m.funcAt(0))`, exactly as every sibling in this file spells it.
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // `S a;` must take a RUNTIME-sized alloca (an Alloca WITH a size operand), exactly as a
+    // direct `R a;` does — a chained alias that silently fell back to a static layout would
+    // still report ok and would be the one wrong answer worth catching here.
+    int runtimeAllocas = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && !m.instOperands(id).empty())
+            ++runtimeAllocas;
+    }
+    EXPECT_GT(runtimeAllocas, 0)
+        << "`S a;` must allocate at RUNTIME from R's frozen whole-object slot";
 }
 
 // ── VLA C3 (D-CSUBSET-VLA): multi-dimensional VLAs (runtime row stride) ───────

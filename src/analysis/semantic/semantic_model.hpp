@@ -730,7 +730,10 @@ struct DSS_EXPORT ShippedExternSymbol {
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): the pe64 <threads.h> synth-recipe id
     // (== the symbol name, a validated descriptor invariant), or EMPTY for an ordinary
     // shipped extern. When non-empty the CST->HIR lowerer SKIPS this symbol's
-    // extern-import synthesis (kernel32 exports no mtx_lock — the eager-import law) and
+    // extern-import synthesis (kernel32 exports no `mtx_lock`, so an import of it is a
+    // pe binary the LOADER refuses at 0xC0000139 — and the skip is NOT a consequence of
+    // the retired eager law: a recipe row's own body CALLS the name, so referenced-only
+    // import would keep the import too. The row is realized, never imported) and
     // records {symbol, recipeId} into `CstToHirResult.synthRecipeBySymbol` so HIR->MIR
     // seeds `functionSymbols` (the user call lowers to GlobalAddr against a not-yet-
     // defined callee) and `synthesizeThreadsShim` supplies the definition before link.
@@ -775,10 +778,55 @@ struct DSS_EXPORT ShippedExternSymbol {
     // precise WITHOUT anyone enumerating a core set — the mechanism already in the
     // tree does it, which is also why this needs no update when a recipe is added.
     //
-    // TRUE for every ordinary declared shipped extern (D-FFI-DESCRIPTOR-EAGER-IMPORT:
-    // a `#include`d descriptor's symbol is imported whether or not the TU
-    // calls it), so every pre-existing row is byte-identical.
-    bool eagerImport = true;
+    // ★★ FALSE FOR EVERY ROW THIS STRUCT CAN HOLD, SINCE P57.
+    // [[D-FFI-DESCRIPTOR-EAGER-IMPORT]] — the id on ONE line, never wrapped.
+    //
+    // This field is a CHANNEL, and the policy it used to carry was a divergence from
+    // all four reference toolchains. It said TRUE for an ordinary declared shipped
+    // extern: a `#include`d descriptor's symbol was imported whether or not the TU
+    // called it.
+    //
+    // ★★★ THE REASON THAT WAS A DEFECT AND NOT A COST — an INTERNAL inconsistency,
+    // not bloat. C23 7.1.4p2 entitles a program to DECLARE a library function itself
+    // instead of including its header, and says the two are equivalent. ✔MEASURED in
+    // ONE eager tree, same referenced names, by walking each format's real import
+    // pointer chain:
+    //     hand-declared (`extern int puts(char const *);` …)   elf  3   pe  3
+    //     `#include <stdio.h> <string.h> <stdlib.h>`          elf 86   pe 85
+    // A hand-declared extern is producer A and was ALREADY non-eager, so two spellings
+    // the standard calls equivalent got import laws differing by ~28x — and it is the
+    // LOADER that sees the difference: one unexported name among those 86 breaks the
+    // load of EVERY binary that so much as includes the header.
+    //
+    // ✔MEASURED 2026-09-03, each reference probed SEPARATELY, each arm with a CONTROL
+    // that FIRED, at BOTH the object tier (`nm -u` / `dumpbin /symbols`) and the
+    // linked-IMAGE tier (`nm -D --undefined-only` / `dumpbin /imports` / `objdump -p`):
+    // gcc 13.3.0, clang 18.1.3, MSVC 19.51.36252 and mingw-w64 gcc 13.2.0 all emit
+    // NOTHING for a declared-but-unreferenced extern, header-declared ones included.
+    // ⚠ The FIRST MSVC arm was UNINSTRUMENTED and that is recorded rather than dropped:
+    // a default `cl` links the STATIC CRT, so the import table was EMPTY and every
+    // "absent" answer was vacuous. Only under `/MD` did the control (`puts` from
+    // api-ms-win-crt-stdio-l1-1-0.dll) fire and the absences become evidence.
+    //
+    // ★ NOTHING NEW WAS BUILT FOR THIS; A DEFAULT WAS CORRECTED. The pruning mechanism
+    // is the one the two comments above already rely on: the linker's
+    // `rejectOrDropUnreferencedExterns` keeps a NON-eager import only when a relocation
+    // in a function OR a data item references it. ⓘ AND IT HAD NEVER RUN for an
+    // ordinary `#include`-only program: that gate short-circuits on "every named import
+    // is eager", and `injectEntryTrampoline` appends the only other non-eager row such a
+    // program has (its `exit` import) AFTER the gate. Its reference scan is live for
+    // every such program only now.
+    //
+    // ⚠ THE FIELD IS NOT DEAD AND MUST NOT BE DELETED. `ExternImport::isEagerImport`
+    // still has one true producer — the SEH personality routine in
+    // `synth_seh_funclets.cpp`, whose reference lives in the pe UNWIND_INFO handler RVA
+    // rather than in any relocation, so the reloc-based gate cannot see it. EAGER means
+    // "referenced by something the gate cannot see", and no descriptor row is ever that.
+    //
+    // Pinned by `tests/ffi/test_descriptor_import_referenced_only.cpp` on all five
+    // descriptor-serving targets, and witnessed from a running program by
+    // `examples/c/descriptor_import_referenced_only`.
+    bool eagerImport = false;
     // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the CONFIG-ROOT-RELATIVE path of
     // the shipped source file that provides this symbol's body on the active
     // object format (`runtime/platform/pe/dirent.c`), or EMPTY for an ordinary

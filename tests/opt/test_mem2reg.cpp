@@ -480,46 +480,79 @@ TEST(Mem2Reg, ConditionallyInitializedFloat32AllocaPromotesViaRodataZero) {
     EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep));
 }
 
-// THE FAIL-LOUD-IN-PLACE BOUNDARY — the three float kinds that stay DE-PROMOTED, and
-// the reason differs between them, which is why the boundary is pinned rather than
-// assumed:
+// ══ THE FAIL-LOUD-IN-PLACE BOUNDARY, SPLIT IN TWO ═══════════════════════════════
 //
-//   F16       — no encodings at any width (D-TARGET-ENCODING-WIDTH-GUARD).
-//   F80/F128  — the CONSTANT would materialize fine; the PHI would not. ✔MEASURED
-//               2026-08-26 at the CLI: with these admitted, `long double x;
-//               if(c) x=p; return x+q;` at `--config=release` refuses with
-//               `L_UnsupportedLoweringForOpcode` ("long double (F80/F128)
-//               control-flow merge (phi) is not yet lowered … needs the memory-home
-//               merge (D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE)") on BOTH
-//               x86_64:elf64-x86_64-linux-exec (long double = F80) and
-//               arm64:elf64-aarch64-linux-exec (long double = F128), while the same
-//               program builds clean at `--config=debug`.
+// This used to be ONE test making TWO independent claims — F16 and F80/F128 both
+// stay de-promoted — for two unrelated reasons. `D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE`
+// answered only ONE of them, so the test had to split rather than shrink: F16's claim
+// is unchanged and keeps a pin of its own, and the long-double claim INVERTS.
+// Collapsing the pair would have traded a pin for a comment.
+
+// F16 STILL DE-PROMOTES, and its reason has nothing to do with long doubles: F16 has
+// no encodings at ANY width (D-TARGET-ENCODING-WIDTH-GUARD), so neither its zero
+// constant nor its phi can be realized. The correct answer is DE-PROMOTION (leave it
+// in memory, exactly what the debug pipeline does), never a refusal — a PERF
+// refinement may not turn a program that compiles today into one that does not. The
+// matching `onBlockBegin` abort is the invariant assert that keeps the classification
+// and the de-promotion from drifting apart.
 //
-// For all three the correct answer is DE-PROMOTION (leave it in memory, exactly what
-// the debug pipeline does), never a refusal — a PERF refinement may not turn a
-// program that compiles today into one that does not. The matching `onBlockBegin`
-// abort is the invariant assert that keeps the classification and the de-promotion
-// from drifting apart.
+// RED-on-disable: move F16 onto the `RodataLoad` arm of `zeroFormFor` → this test
+// sees `allocasPromoted == 1` and the alloca/store/load gone.
+TEST(Mem2Reg, ConditionallyInitializedF16AllocaStaysDepromoted) {
+    TypeKind const k = TypeKind::F16;
+    TypeInterner interner{CompilationUnitId{1}};
+    auto fx = runCondInitFloat(interner, k);
+    unsigned const ord = static_cast<unsigned>(k);
+    ASSERT_TRUE(fx.result.ok) << "kind ordinal " << ord
+                              << " conditional-init must still COMPILE";
+    EXPECT_EQ(fx.result.allocasPromoted,   0u)
+        << "F16 has no usable zero form (no encodings at any width) → de-promoted, "
+           "not refused — and NOT because of any long-double phi question";
+    EXPECT_EQ(fx.result.rodataZerosMinted, 0u) << "kind ordinal " << ord;
+    EXPECT_EQ(fx.mir.moduleGlobalCount(), 0u)
+        << "no global is minted for a de-promotion (kind ordinal " << ord << ")";
+    EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Alloca), 1u) << ord;
+    EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Store),  1u) << ord;
+    EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Load),   1u) << ord;
+    EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Phi),    0u) << ord;
+    DiagnosticReporter vrep;
+    EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep)) << ord;
+}
+
+// D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE — INVERTED from the de-promotion arm above.
+// A conditionally-initialized `long double` now PROMOTES on both long-double axes
+// (F80 = x87 extended, F128 = IEEE binary128), because the thing that was missing
+// was never the CONSTANT — it was the PHI, and the memory-home merge supplies it.
+// The alloca/store/load disappear and a phi appears, exactly as for F32/F64.
 //
-// RED-on-disable: move any of these onto the `RodataLoad` arm → this test sees
-// `allocasPromoted == 1` and the alloca/store/load gone for that kind.
-TEST(Mem2Reg, ConditionallyInitializedF16AndLongDoubleAllocasStayDepromoted) {
-    for (TypeKind const k : {TypeKind::F16, TypeKind::F80, TypeKind::F128}) {
+// RED-on-disable: put F80/F128 back on the `ZeroForm::None` arm of `zeroFormFor` →
+// `allocasPromoted` falls to 0, no global is minted, `phisInserted` falls to 0 and
+// the alloca/store/load survive.
+TEST(Mem2Reg, ConditionallyInitializedLongDoubleAllocaPromotesViaRodataZero) {
+    for (TypeKind const k : {TypeKind::F80, TypeKind::F128}) {
         TypeInterner interner{CompilationUnitId{1}};
         auto fx = runCondInitFloat(interner, k);
         unsigned const ord = static_cast<unsigned>(k);
         ASSERT_TRUE(fx.result.ok) << "kind ordinal " << ord
-                                  << " conditional-init must still COMPILE";
-        EXPECT_EQ(fx.result.allocasPromoted,   0u)
-            << "kind ordinal " << ord << " has no usable zero form → de-promoted, "
-               "not refused";
-        EXPECT_EQ(fx.result.rodataZerosMinted, 0u) << "kind ordinal " << ord;
-        EXPECT_EQ(fx.mir.moduleGlobalCount(), 0u)
-            << "no global is minted for a de-promotion (kind ordinal " << ord << ")";
-        EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Alloca), 1u) << ord;
-        EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Store),  1u) << ord;
-        EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Load),   1u) << ord;
-        EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Phi),    0u) << ord;
+                                  << " conditional-init must compile, not abort";
+        EXPECT_EQ(fx.result.allocasPromoted,   1u)
+            << "kind ordinal " << ord << " now has a usable zero form AND a phi "
+               "lowering (D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE)";
+        EXPECT_EQ(fx.result.phisInserted,      1u) << ord;
+        EXPECT_EQ(fx.result.loadsReplaced,     1u) << ord;
+        EXPECT_EQ(fx.result.storesEliminated,  1u) << ord;
+        EXPECT_EQ(fx.result.rodataZerosMinted, 1u)
+            << "one anonymous rodata +0.0 for the one long-double element type "
+               "(kind ordinal " << ord << ")";
+        ASSERT_EQ(fx.mir.moduleGlobalCount(), 1u) << ord;
+        MirGlobalId const g = fx.mir.globalAt(0);
+        EXPECT_EQ(fx.mir.globalType(g).v, interner.primitive(k).v) << ord;
+        MirLiteralValue const& lv =
+            fx.mir.literalValue(fx.mir.globalInitLiteralIndex(g));
+        EXPECT_EQ(lv.core, k) << "the literal's core is the ELEMENT kind" << ord;
+        EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Alloca), 0u) << ord;
+        EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Store),  0u) << ord;
+        EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Phi),    1u) << ord;
         DiagnosticReporter vrep;
         EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep)) << ord;
     }

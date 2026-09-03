@@ -309,10 +309,14 @@ struct PeBinding {
 //     `EveryDeclaredExceptionNamesAGroupMember` closes that one.
 //
 // Note what a grant does NOT excuse: naming an image that the runtime does not
-// actually export. That failure is loud by construction — DSS eagerly imports
-// every declared symbol (D-FFI-DESCRIPTOR-EAGER-IMPORT), so the LOADER rejects
-// the binary (0xC0000139) and the runtime witnesses in examples/c fail to
-// start. This table is about the SILENT hazard only.
+// actually export. ⚠ THAT FAILURE USED TO BE LOUD BY CONSTRUCTION AND IS NO
+// LONGER — this paragraph said DSS imports every declared symbol, so the LOADER
+// rejected the binary at 0xC0000139 and the runtime witnesses in examples/c
+// failed to start. P57 made imports REFERENCED-ONLY
+// ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]), so a bad image on a name NO corpus example
+// happens to reference is now caught by NOTHING here and reaches whichever
+// consumer touches it first. The table still scopes itself to the SILENT hazard,
+// but the set of hazards that are silent GREW when that law went away.
 struct DeclaredCrossRuntimeSymbol {
     char const* stem;
     char const* symbol;
@@ -641,8 +645,17 @@ TEST(PeCrtCoStateBinding, EveryDeclaredExceptionNamesAGroupMember) {
 
 // A typo in a runtime image name ("ucrtbase.dl") would bind every symbol in that
 // descriptor to a DLL that does not exist — breaking the binary LOAD at 0xC0000139
-// under the eager-import law (D-FFI-DESCRIPTOR-EAGER-IMPORT) rather than failing
-// the build. Keep the set of pe runtime images we are willing to name closed.
+// rather than failing the build. Keep the set of pe runtime images we are willing
+// to name closed.
+//
+// ⚠ WHICH binaries break moved in P57 and this guard got MORE load-bearing, not
+// less ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]). DSS used to import every symbol a
+// descriptor DECLARED, so a typo here refused every pe binary that so much as
+// `#include`d the header — loud, immediate, impossible to miss. Imports are now
+// REFERENCED-ONLY, so a typo refuses only the binaries that reference the
+// mistyped name, reached by whichever consumer touches it first. Both are silent
+// at build time; the second can sit in the tree for cycles. Spelling caught here
+// is a text edit; spelling caught there is a bug report.
 //
 // This sweeps the ROOT and every PER-SYMBOL override, and — unlike the co-state
 // check — it does NOT skip bindings the availability gate currently makes
@@ -670,9 +683,9 @@ TEST(PeCrtCoStateBinding, EveryPeRuntimeImageNamedIsAKnownRuntime) {
                                      : " symbol '" + b.symbol + "'")
                 << " names pe runtime image '" << b.image
                 << "', which is not a known pe runtime. A misspelled image does "
-                   "not fail the build — DSS eagerly imports every declared "
-                   "symbol, so the LOADER rejects the binary (0xC0000139) at run "
-                   "time instead. If this is a genuinely new runtime, add it "
+                   "not fail the build — the LOADER rejects the binary at run "
+                   "time instead (0xC0000139), when something references a name "
+                   "bound to it. If this is a genuinely new runtime, add it "
                    "here deliberately.";
         }
     }
@@ -706,10 +719,12 @@ TEST(PeCrtCoStateBinding, EveryPeRuntimeImageNamedIsAKnownRuntime) {
 //   * msvcrt.dll + `__intrinsic_setjmp` ⇒ a revert of the IMAGE that forgets the
 //     NAME, importing a UCRT-only name from the legacy CRT.
 //
-// NEITHER mixture fails the build. DSS eagerly imports every declared shipped
-// symbol (D-FFI-DESCRIPTOR-EAGER-IMPORT), so an absent name is rejected by the
-// LOADER at 0xC0000139: every pe binary that includes <setjmp.h> refuses to
-// start, with no diagnostic and no link error pointing at the JSON line.
+// NEITHER mixture fails the build. An absent name is rejected by the LOADER at
+// 0xC0000139, with no diagnostic and no link error pointing at the JSON line: a
+// pe binary that uses `setjmp` refuses to START. ⓘ Before P57 it was every pe
+// binary that so much as INCLUDED <setjmp.h>, because a descriptor row was
+// imported whether referenced or not ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]). The
+// narrower blast radius is the harder one to notice, which is why the pin stays.
 //
 // Following this file's standing rule (see the header: agreement, never a
 // literal runtime), the pin is NOT "the image is ucrtbase". It is "the (image,
@@ -798,8 +813,8 @@ TEST(PeCrtCoStateBinding, SetjmpPeBindingNamesAPairWindowsExports) {
         << "setjmp.json binds pe `_setjmp` to image '" << bind->image
         << "' under the external name '" << bind->externalName
         << "', which that runtime does not export. This does NOT fail the build: "
-           "DSS eagerly imports every declared shipped symbol, so the LOADER "
-           "rejects every pe binary that includes <setjmp.h> at 0xC0000139. The "
+           "the LOADER rejects every pe binary that USES setjmp at 0xC0000139, "
+           "and nothing says which JSON line did it. The "
            "image and the name have to move together — ucrtbase.dll needs "
            "`__intrinsic_setjmp`, msvcrt.dll needs `_setjmp`.";
 }

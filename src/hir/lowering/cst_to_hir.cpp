@@ -542,10 +542,25 @@ struct Lowerer {
             // a width-correct `void*`.
             bool const sameElem = !arrElem.empty() && !ptrElem.empty()
                                && arrElem[0] == ptrElem[0];
+            // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT (C 6.7.6.2p6): the decayed element
+            // is an ARRAY on both sides and the two are COMPATIBLE though not identical
+            // — a fixed `int b[2][2]` (rows `int[2]`) reaching an `int (*)[n]`
+            // parameter, or the mirror. This is the REALIZE half of the semantic
+            // admission and it must exist: `isAssignable` now accepts the pair, and a
+            // decay that emitted no node left MIR with `Ptr<Array>` vs `Ptr<Array>` at
+            // the call boundary (✔MEASURED: `I_CallSignatureMismatch … argument at
+            // POSITION 1 … has type 66 (Ptr<Array>) but the signature declares
+            // parameter 1 as type 57 (Ptr<Array>)`). The SAME synthetic Array→Ptr Cast
+            // the same-element decay emits carries it: `mapCast` re-types by the
+            // target and is element-agnostic, so the address arithmetic is unchanged
+            // and only the TYPE moves — admit⟺realize, one predicate on both sides.
+            bool const vlaCompatElem =
+                !arrElem.empty() && !ptrElem.empty()
+                && vlaCompatibleArrayTypes(interner, ptrElem[0], arrElem[0]);
             bool const toVoidPtr = !ptrElem.empty()
                 && sem.pointerConversions.implicitToVoidPtr
                 && interner.kind(ptrElem[0]) == TypeKind::Void;
-            if (sameElem || toVoidPtr) {
+            if (sameElem || vlaCompatElem || toVoidPtr) {
                 HirNodeId const decay = builder.makeCast(
                     child.id, target, HirFlags::Synthetic);
                 for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
@@ -736,6 +751,24 @@ struct Lowerer {
                     admit = interner.kind(toElem[0]) == TypeKind::FnSig
                         ? sem.pointerConversions.allowVoidPtrFnConvert
                         : sem.pointerConversions.implicitFromVoidPtr;
+                }
+                // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT (C 6.7.6.2p6 + 6.5.16.1): two
+                // POINTERS whose ARRAY pointees are compatible but not identical —
+                // `int (*p)[n]; int (*q)[2]; p = q;` and the reverse. The REALIZE half
+                // of the Ptr/Ptr admission `isAssignable` gained: without it the store
+                // reached MIR untyped-for-its-slot (✔MEASURED: two
+                // `I_StoreValueTypeMismatch … a stored value must have its slot's type;
+                // MIR is POST-conversion, so a … retagging conversion must already have
+                // been materialized as a Cast` — the verifier naming the exact omission).
+                // The Cast this shares with the void arms is a representation-free
+                // Bitcast at MIR: nothing about the address changes, only its type.
+                // Volatile is stripped on both sides for the reason the semantic arm
+                // strips it — a pointee qualifier difference composes with the bound
+                // difference exactly as it does for an identical pointee.
+                else if (vlaCompatibleArrayTypes(interner,
+                                                 interner.stripVolatile(fromElem[0]),
+                                                 interner.stripVolatile(toElem[0]))) {
+                    admit = true;
                 }
                 if (admit) {
                     HirNodeId const cast = builder.makeCast(
@@ -11581,6 +11614,11 @@ struct Lowerer {
                     if (!nameNode.valid()) continue;
                     sym  = model.symbolAt(nameNode);
                     type = InvalidType;
+                    // D-CSUBSET-VLA-TYPEDEF-CHAINED: set below when THIS declarator is a
+                    // chained VLA alias whose origin resolved. Declared per-iteration so a
+                    // multi-declarator typedef statement cannot leak one declarator's
+                    // verdict onto the next.
+                    bool chainedVlaAlias = false;
                     if (auto const* rec = model.recordFor(sym)) type = reprOf(rec->type);
                     // VLA C4b (D-CSUBSET-VLA): a VARIABLE-LENGTH-array typedef
                     // (`typedef int R[n];` / multi-dim `R[n][m]`/`R[5][n]`/`R[n][5]`)
@@ -11606,13 +11644,31 @@ struct Lowerer {
                         // (`typedef R S;` — VLA inherited from ANOTHER typedef, NO own
                         // suffix) by the declarator's OWN suffix presence (a
                         // self-contained HIR-tier check — no reliance on a semantic
-                        // flag). The original carries the `[n]`; a chained alias has
-                        // none → it is a distinct deferred shape
-                        // (D-CSUBSET-VLA-TYPEDEF-CHAINED) → fail loud CLEANLY here
-                        // (instead of `captureVlaSize`'s "no suffix" internal desync).
+                        // flag). The original carries the `[n]`.
+                        //
+                        // ★ D-CSUBSET-VLA-TYPEDEF-CHAINED (CLOSED): the chained alias
+                        // captures NOTHING and that is now CORRECT rather than a gap.
+                        // It has no `[n]` of its own to freeze, and it needs none: the
+                        // semantic tier stamps the alias symbol's `vlaTypedefOrigin`
+                        // with the typedef that DOES own a captured bound (transitively
+                        // — `typedef S T;` resolves past S to R), so every OBJECT of the
+                        // alias reaches R's already-frozen slots through the SAME C4b
+                        // copy-down a direct `R a;` uses. Emitting nothing here is the
+                        // whole of this tier's obligation: C 6.7.7p3 froze the size at
+                        // R's typedef, and re-evaluating the bound at S's would be
+                        // exactly the wrong answer when `n` moved in between (the
+                        // `n = 99` witness in `c99_vla_typedef_chained`).
+                        // ⚠ NOT SILENT WHEN THE CHAIN DOES NOT RESOLVE. An alias whose
+                        // origin the semantic tier declined to stamp (the shapes
+                        // `declaredTypeDerivesFromAliasHead` excludes) keeps the loud
+                        // refusal, so the only thing that got quieter is the case that
+                        // now WORKS.
+                        auto const* aliasRec = sym.valid() ? model.recordFor(sym) : nullptr;
+                        chainedVlaAlias =
+                            aliasRec != nullptr && aliasRec->vlaTypedefOrigin.valid();
                         if (declaratorHasArraySuffix(d))
                             captureVlaSize(d, sym);
-                        else
+                        else if (!chainedVlaAlias)
                             (void)reportedError(
                                 d,
                                 "a typedef that aliases a variable-length-array "
@@ -11623,8 +11679,28 @@ struct Lowerer {
                     // declare a single declarator") was true only because the
                     // GRAMMAR admitted one; it is the second half of the
                     // multi-declarator unit.
-                    out.push_back(track(builder.makeTypeDecl(
-                        type.valid() ? type : semTypeAt(node), sym.v), d));
+                    //
+                    // ★ D-CSUBSET-VLA-TYPEDEF-CHAINED: a RESOLVED chained alias emits NO
+                    // node, and that is the whole of its lowering. A TypeDecl is a purely
+                    // structural carrier at MIR — EXCEPT for a VLA-carrying one, which is
+                    // precisely where HIR→MIR FREEZES the alias's runtime size slots from
+                    // the bounds `captureVlaSize` recorded under that symbol. A chained
+                    // alias captured NOTHING (it has no `[n]` of its own) and OWES nothing
+                    // (C 6.7.7p3 froze the size once, at the origin's typedef), so emitting
+                    // the node would ask the MIR tier to freeze slots from an empty bound
+                    // list — ✔MEASURED, exactly the arity refusal `a variable-length array
+                    // of this shape is not yet supported: … 1 array level(s) … but 0
+                    // declarator dimension bound(s) were captured` that appeared the moment
+                    // the semantic gate was lifted and this omission was not yet in place.
+                    // Re-freezing from the origin's bounds would be WORSE than the refusal:
+                    // it re-evaluates `n` at S's declaration, which is the exact answer C
+                    // 6.7.7p3 forbids (the `n = 100` witness in c99_vla_typedef_chained).
+                    // `emittedPerDeclarator` is still set, so the anon-composite fallback
+                    // below cannot re-add the node this branch deliberately withheld.
+                    if (!chainedVlaAlias) {
+                        out.push_back(track(builder.makeTypeDecl(
+                            type.valid() ? type : semTypeAt(node), sym.v), d));
+                    }
                     emittedPerDeclarator = true;
                 }
             }

@@ -167,7 +167,36 @@ cmd_add() {  # <name> [committish]
   at="${2:-HEAD}"
   git -C "$repo" worktree add --detach "$rel" "$at" >/dev/null \
     || _die 2 "git worktree add failed for '$rel' at '$at'."
+
+  # ⚠⚠ RESET THIS LANE NAME'S SEED MANIFEST, AND IT IS A CORRECTNESS FIX RATHER THAN
+  #    TIDINESS. `scripts/lane-fold/lane-fold.py` adjudicates a fold as
+  #      (the lane's `git status` set) MINUS (seeded paths whose md5 is UNCHANGED),
+  #    reading `.worktrees/.manifests/seed-<name>.json`. That file is keyed by LANE
+  #    NAME ONLY -- it carries no cycle and no commit -- and lane names here are two
+  #    letters, so they are reused constantly.
+  #    ✔MEASURED 2026-09-03 (cycle P57): four worktrees were created with this verb on
+  #    a clean tree at `fcb3a9d7`, and ALL FOUR silently inherited manifests written on
+  #    Sep 1-2 by earlier lanes of the same name. `seed-ld.json` held 82 entries of
+  #    which 37 disagreed with the main tree -- including `CMakeLists.txt`,
+  #    `src/asm/asm.cpp` and `lane-fold.py` itself, files no lane this cycle touched.
+  #    The fold then REFUSED `src/lir/lowering/mir_to_lir.cpp` as "main tree DRIFTED
+  #    since seeding" against a tree that was byte-identical to HEAD.
+  #    ★ THE FALSE REFUSAL IS THE CHEAP FAILURE. The expensive one is the other
+  #    direction: a stale entry that HAPPENS to equal the lane's own file marks real
+  #    lane work as "untouched seed" and the fold SILENTLY DROPS IT -- a lane's whole
+  #    change vanishing while every report reads clean, which is the class this
+  #    project treats as worst.
+  #    ⇒ A worktree created here is a checkout of a COMMIT and carries no uncommitted
+  #    work, so its honest manifest is EMPTY: `lane-fold` measures an absent path
+  #    against the HEAD BLOB, which is exactly the right question for such a lane. An
+  #    orchestrator that then seeds uncommitted work in re-writes it via
+  #    `lane-fold.py seed <lane>`, which is the only other writer.
+  mkdir -p "$repo/.worktrees/.manifests" 2>/dev/null || :
+  printf '{}' > "$repo/.worktrees/.manifests/seed-$name.json" \
+    || _die 2 "could not reset the seed manifest for '$name'."
+
   _say "created $rel at $(git -C "$abs" rev-parse --short HEAD)"
+  _say "seed manifest reset to empty (this lane starts from the commit, not from uncommitted work)"
   _say "build into $rel/build/<lane> -- never into the main tree's build/."
   printf '%s\n' "$abs"
 }

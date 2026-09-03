@@ -115,6 +115,67 @@ namespace detail::type_rules {
     return a.valid() && b.valid() && a.v == b.v;
 }
 
+// C 6.7.6.2p6 array-type COMPATIBILITY, and it is the one array question interner
+// identity cannot answer (D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT):
+//
+//   "For two array types to be compatible, both shall have compatible element types,
+//    and if both size specifiers are present, and are integer constant expressions,
+//    then both size specifiers shall have the same constant value."
+//
+// A VLA's size specifier is NOT an integer constant expression, so a `[n]` level and
+// a `[K]` level are COMPATIBLE — C makes the mismatch UNDEFINED BEHAVIOUR only if the
+// two bounds evaluate unequal at RUNTIME, which is a callee-side obligation, not a
+// translation-time one. DSS interns the VLA bound as the `kVlaLength` sentinel, so
+// `array(int,2)` and `vlaArray(int)` are DISTINCT TypeIds and every identity compare
+// answers "incompatible" — STRICTER than C, and it rejected valid programs that
+// gcc 13.3.0 and clang 18.1.3 both compile AND RUN (✔MEASURED 2026-09-03, three
+// shapes, each `-std=c17` and `-std=c2x`, binaries executed: a fixed `int b[2][2]`
+// argument to an `int (*)[n]` parameter; `p = q` fixed-row → VLA-row; `r = p`
+// VLA-row → fixed-row. MSVC ABSTAINS on all three — it implements no C99 VLA at all
+// and stops at `error C2057: expected constant expression` on the bound itself — so
+// it casts no vote, and the disjunction `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` decides
+// on the two references that WORK).
+//
+// The predicate walks the array spine pairwise and admits a level whose lengths
+// differ ONLY when at least one side is the VLA sentinel; two DIFFERENT constants
+// stay a loud mismatch (`int (*)[2]` vs `int (*)[3]` is still `S_TypeMismatch`), and
+// so does any element-type difference below the spine. Non-array levels must be
+// interner-IDENTICAL, so this can never launder a `Ptr<int>`/`Ptr<float>` pair.
+//
+// Agnosticism: UNGATED, for the reason `isArithmetic`'s BitInt arm states — a
+// `kVlaLength` scalar only ever exists in a schema that declares a runtime array
+// bound, so in every other language no type reaches this predicate with a sentinel
+// level and it answers exactly what `sameType` already answered.
+//
+// Terminates: each step takes `operands[0]` of an Array and the interned operand DAG
+// is acyclic; the guard is belt-and-braces, matching `declaredTypeDerivesFromAliasHead`.
+[[nodiscard]] inline bool vlaCompatibleArrayTypes(TypeInterner const& interner,
+                                                  TypeId a, TypeId b) {
+    if (!a.valid() || !b.valid()) return false;
+    for (int guard = 0; guard < 4096; ++guard) {
+        if (a == b) return true;
+        if (interner.kind(a) != TypeKind::Array
+            || interner.kind(b) != TypeKind::Array) {
+            return false;
+        }
+        auto const aLen = interner.scalars(a);
+        auto const bLen = interner.scalars(b);
+        if (aLen.empty() || bLen.empty()) return false;
+        // Both bounds are integer constant expressions and they DIFFER → C says
+        // incompatible. Only a VLA level (a non-ICE bound) may straddle.
+        if (aLen[0] != bLen[0]
+            && aLen[0] != kVlaLength && bLen[0] != kVlaLength) {
+            return false;
+        }
+        auto const aElem = interner.operands(a);
+        auto const bElem = interner.operands(b);
+        if (aElem.empty() || bElem.empty()) return false;   // shapeless — malformed
+        a = aElem[0];
+        b = bElem[0];
+    }
+    return false;
+}
+
 // rhs assignable into lhs?
 //   InvalidType on either side → true (cascade suppression).
 //   Identical → true.
@@ -654,6 +715,23 @@ namespace detail::type_rules {
             if (lhsElem[0] == rhsElem[0]) {
                 return true;
             }
+            // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT (C 6.7.6.2p6): the decayed
+            // pointee is an ARRAY on both sides and the two differ ONLY in a VLA
+            // vs constant bound — `int b[2][2]` (rows `int[2]`) handed to an
+            // `int (*)[n]` parameter, and the mirror. `vlaCompatibleArrayTypes`
+            // is the C compatibility relation the interner's identity compare
+            // above cannot express; two DIFFERENT constant bounds still fall
+            // through to the loud mismatch. The decay itself is unchanged — the
+            // HIR `coerce()` synthetic decay node this branch licenses takes the
+            // address of the first element either way, so admitting it introduces
+            // no new lowering: only the ACCEPTANCE moves.
+            // ⚠ The callee keeps the runtime bound it was passed, so a caller
+            // whose constant row length disagrees with the callee's `n` is C's
+            // own UNDEFINED BEHAVIOUR (6.7.6.2p6 second sentence), NOT a DSS
+            // miscompile — the same contract gcc and clang ship.
+            if (vlaCompatibleArrayTypes(interner, lhsElem[0], rhsElem[0])) {
+                return true;
+            }
             // c50 (D-CSUBSET-ARRAY-DECAY-TO-VOID-PTR): array → void*. An array
             // decays to a pointer-to-element (C 6.3.2.1p3), which then converts
             // to void* (C 6.3.2.3p1) — composing the two existing conversions for
@@ -748,6 +826,21 @@ namespace detail::type_rules {
             // access through the lhs's stripped pointee — never a miscompile.)
             if (interner.stripVolatile(lhsElem[0])
                 == interner.stripVolatile(rhsElem[0])) {
+                return true;
+            }
+            // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT (C 6.7.6.2p6 + 6.5.16.1): two
+            // POINTERS whose pointees are compatible array types — `int (*p)[n];
+            // int (*q)[2]; p = q;` and the reverse `r = p`. This is the SAME
+            // compatibility relation the array-decay arm above admits, at the
+            // shape it takes once the array has already decayed, and the row that
+            // named only the decay UNDERCOUNTED: ✔MEASURED 2026-09-03, DSS
+            // refused all THREE shapes with `S_TypeMismatch` while gcc 13.3.0 and
+            // clang 18.1.3 compiled and RAN all three. Volatile is stripped first
+            // so a pointee qualifier difference composes with the bound
+            // difference exactly as it does for an identical pointee.
+            if (vlaCompatibleArrayTypes(interner,
+                                        interner.stripVolatile(lhsElem[0]),
+                                        interner.stripVolatile(rhsElem[0]))) {
                 return true;
             }
             bool const lhsIsVoidPtr =

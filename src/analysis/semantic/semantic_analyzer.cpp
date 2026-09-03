@@ -593,6 +593,59 @@ hasFnSuffixOnName(Tree const& tree, NodeId nameNode,
     return declaratorFnSuffixNode(tree, nameNode, dc).valid();
 }
 
+// D-CSUBSET-VLA-PARAM-STAR (C 6.7.6.3p12): every unspecified-size `[*]`
+// array-declarator suffix that belongs to THIS function declarator's OWN parameter
+// list, in source order.
+//
+// C 6.7.6.3p12 permits `[*]` only where the function declarator is NOT part of a
+// definition of that function (C 6.7.6.2p4 spells the same rule as "function prototype
+// scope"); a definition's parameters have BLOCK scope, C 6.2.1p4, and the body needs the
+// bound the `*` withholds. The caller is the C 6.9.1 definition-constraint block, so
+// every hit returned here is a constraint violation there.
+//
+// ★★ THE WALK STOPS AT A NESTED FUNCTION SUFFIX, AND THAT LINE IS THE WHOLE
+// CORRECTNESS OF THIS HELPER. A `[*]` inside a NESTED declarator's own prototype is
+// LEGAL even when the enclosing function is a definition — `int f(int (*g)(int,
+// int[*])) { … }` — because that inner declarator is not part of a definition of
+// anything. ✔MEASURED 2026-09-03, gcc 13.3.0 and clang 18.1.3 probed SEPARATELY: BOTH
+// compile and RUN it (exit 42). A plain subtree scan would have refused it and traded
+// one divergence for another, so `isFnSuffixRule` is the boundary and
+// `AbstractStarInNestedPrototypeInsideDefinitionStaysLegal` pins it.
+//
+// ⓘ An EXPLICIT HEAP work stack, not recursion: a declarator subtree is
+// input-proportional, and the standing rule is that nothing in the compiler recurses on
+// input depth. Children are pushed REVERSED so the stack pops left-to-right and the
+// diagnostics come out in source order (the `vlaTypedefOrigin` alias walk's convention).
+// Returns EMPTY for a language whose declarator config declares no `arrayStarSuffixRule`
+// — the whole construct is then unspellable, so this is inert rather than gated.
+[[nodiscard]] std::vector<NodeId>
+paramStarSuffixesOfOwnParamList(Tree const& tree, NodeId fnSuffix,
+                                DeclaratorConfig const& dc) {
+    std::vector<NodeId> hits;
+    if (!fnSuffix.valid() || !dc.arrayStarSuffixRule.has_value()) return hits;
+    std::vector<NodeId> stk;
+    {
+        auto const kids = visibleChildren(tree, fnSuffix);
+        for (std::size_t i = kids.size(); i-- > 0;) stk.push_back(kids[i]);
+    }
+    for (int guard = 0; guard < 1'000'000 && !stk.empty(); ++guard) {
+        NodeId const cur = stk.back();
+        stk.pop_back();
+        if (tree.kind(cur) != NodeKind::Internal) continue;
+        auto const r = tree.rule(cur);
+        // A nested function declarator's parameter list is its OWN prototype — not part
+        // of this definition. Do NOT descend.
+        if (isFnSuffixRule(r, dc)) continue;
+        if (r == *dc.arrayStarSuffixRule) {
+            hits.push_back(cur);
+            continue;                       // a `[*]` has no `[*]` inside it
+        }
+        auto const kids = visibleChildren(tree, cur);
+        for (std::size_t i = kids.size(); i-- > 0;) stk.push_back(kids[i]);
+    }
+    return hits;
+}
+
 // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): is `nameNode` the name of an
 // UNDECORATED declarator — a plain identifier with NO pointer layer and NO array
 // or function suffix at ANY enclosing level — so its declared type is EXACTLY the
@@ -10054,14 +10107,46 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             // §6.7.7p2 keeps the alias's levels FROZEN at the typedef).
                             // Anything else — `R *q[3]`, `R **r` — still fails to match
                             // and keeps its deferred fail-loud.
-                            // Gate to OBJECT declarations only — `vlaTypedefOrigin`
-                            // means "the VLA typedef this OBJECT froze its size from",
-                            // read solely by the object's HIR alloca. A chained VLA
-                            // typedef (`typedef R S;`) is itself DeclarationKind::Type
-                            // and is discriminated at HIR by its own suffix presence
-                            // (declaratorHasArraySuffix), so it needs no origin flag —
-                            // keeping this write off typedef symbols.
-                            if (s.symbols.at(sym).kind == DeclarationKind::Variable
+                            // ★★ D-CSUBSET-VLA-TYPEDEF-CHAINED — THE OBJECT-ONLY GATE
+                            // WAS THIS ROW'S WHOLE BLOCKER, AND LIFTING IT IS THE FIX.
+                            // The comment here used to read "Gate to OBJECT
+                            // declarations only … a chained VLA typedef (`typedef R
+                            // S;`) is itself DeclarationKind::Type and is discriminated
+                            // at HIR by its own suffix presence, so it needs no origin
+                            // flag". The discrimination was real; what it discriminated
+                            // INTO was a fail-loud, because S then had no way to say
+                            // WHICH typedef froze its size.
+                            //
+                            // A CHAINED alias is admitted on exactly the PURE form
+                            // `typedef R S;` (`declTy == headTy`: no stars, no own
+                            // suffix), and the stamp is TRANSITIVE — if the alias it
+                            // names ALREADY carries an origin, that origin is copied
+                            // rather than the alias itself. So `vlaTypedefOrigin` now
+                            // has ONE meaning at every declaration kind: *the typedef
+                            // that OWNS a capturable `[n]`, and therefore the symbol
+                            // `vlaSizeExprBySymbol` is keyed by*. `typedef int R[n];
+                            // typedef R S; typedef S T; T a;` stamps S→R, T→R and a→R,
+                            // so an arbitrarily long chain resolves in ONE hop at each
+                            // link — no walk, no cycle risk, and no HIR→MIR change at
+                            // all: `a`'s alloca copies down R's already-frozen slots by
+                            // the SAME C4b path a direct `R a;` takes.
+                            // ✔MEASURED 2026-09-03: gcc 13.3.0 and clang 18.1.3 both
+                            // compile and RUN the chained alias (`R=12 S=12` with `n`
+                            // mutated to 99 between the typedef and the object, exit 0);
+                            // MSVC ABSTAINS — it implements no C99 VLA at all.
+                            // ⚠ An alias with its OWN suffix over a VLA head
+                            // (`typedef R S[2];`) is deliberately NOT admitted here:
+                            // `declaredTypeDerivesFromAliasHead` would accept the shape,
+                            // but that alias reaches `captureVlaSize` on its own suffix
+                            // and the HIR arity check refuses it loudly ("2 array
+                            // level(s) … 1 bound(s) captured", ✔MEASURED at fcb3a9d7) —
+                            // a DISTINCT deferred shape with an intact fail-loud, and
+                            // stamping it would trade that refusal for a wrong size.
+                            // Hence `declTy == headTy` for the Type arm while the
+                            // OBJECT arm keeps the full derives-from relation.
+                            if ((s.symbols.at(sym).kind == DeclarationKind::Variable
+                                 || (s.symbols.at(sym).kind == DeclarationKind::Type
+                                     && declTy == headTy))
                                 && declaredTypeDerivesFromAliasHead(
                                        s.lattice.interner(), declTy, headTy)
                                 && aliasHeadCarriesVla(s.lattice.interner(), headTy)
@@ -10105,8 +10190,24 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         if (arec.kind == DeclarationKind::Type
                                             && arec.type.valid()
                                             && aliasHeadCarriesVla(
-                                                   s.lattice.interner(), arec.type))
-                                            s.symbols.at(sym).vlaTypedefOrigin = aliasSym;
+                                                   s.lattice.interner(), arec.type)) {
+                                            // D-CSUBSET-VLA-TYPEDEF-CHAINED: resolve to
+                                            // the typedef that OWNS the captured bound.
+                                            // `aliasSym` is the name WRITTEN in the
+                                            // head; if that name is itself a chained
+                                            // alias its own stamp already names the
+                                            // owner (it was declared EARLIER in this
+                                            // same walk), so one hop here is the whole
+                                            // transitive closure. A direct
+                                            // `typedef int R[n]; R a;` is unchanged —
+                                            // R carries no origin, so `aliasSym` is
+                                            // kept exactly as before.
+                                            SymbolId const owner =
+                                                arec.vlaTypedefOrigin.valid()
+                                                    ? arec.vlaTypedefOrigin
+                                                    : aliasSym;
+                                            s.symbols.at(sym).vlaTypedefOrigin = owner;
+                                        }
                                     }
                                 }
                             }
@@ -11262,6 +11363,54 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                               "declarator must be a function "
                                               "declarator (name followed by "
                                               "a parameter list)");
+                            }
+                            // D-CSUBSET-VLA-PARAM-STAR (C 6.7.6.3p12), reopened and
+                            // reclosed in P57: an unspecified-size `[*]` on a parameter
+                            // of a function DEFINITION. `[*]` is the PROTOTYPE-form
+                            // marker for a bound the declaration does not name, and C
+                            // permits it only where the function declarator is not part
+                            // of a definition — a definition's parameters have block
+                            // scope (C 6.2.1p4) and its body needs the bound the `*`
+                            // withholds. DSS accepted and RAN all three reachable
+                            // spellings (named / abstract / outer-dim) while gcc 13.3.0
+                            // and clang 18.1.3 both REFUSE every one and MSVC abstains
+                            // (no C99 VLA at all) — DSS ABOVE the union, which the bar
+                            // treats as a defect exactly as it treats being below.
+                            // ⚠ NOT a miscompile and the diagnostic says so by being
+                            // SUPPRESSABLE: the parameter decays to the same
+                            // `Ptr<element>` a bare `[]` gives (C 6.7.6.3p7), so the
+                            // artifact was never wrong — only the acceptance was. That is
+                            // why this is a pure constraint code and not an
+                            // unsuppressable silent-miscompile guard.
+                            // ★ Reported HERE, at the C 6.9.1 definition-constraint
+                            // block, rather than in `applyDeclaratorSuffix`: that arm
+                            // resolves a TYPE and has no signal for "my enclosing
+                            // function declarator is a definition", and threading one
+                            // through every declarator layer would put a declaration-shape
+                            // question inside type resolution. This site already knows it
+                            // is a definition and already owns C 6.9.1's other two
+                            // constraints. The helper's walk stops at a nested function
+                            // suffix, so a legal `[*]` in a nested prototype
+                            // (`int f(int (*g)(int, int[*])) {…}`, which BOTH references
+                            // compile and RUN) is untouched.
+                            for (NodeId starSuffix :
+                                 paramStarSuffixesOfOwnParamList(
+                                     tree,
+                                     declaratorFnSuffixNode(tree, nameNode,
+                                                            *cfg.declarators),
+                                     *cfg.declarators)) {
+                                ParseDiagnostic d;
+                                d.code = DiagnosticCode::
+                                    S_ArrayParamStarInFunctionDefinition;
+                                d.severity = DiagnosticSeverity::Error;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(starSuffix);
+                                d.actual =
+                                    "an unspecified-size `[*]` array parameter is "
+                                    "permitted only where the function declarator is "
+                                    "not part of a definition (C 6.7.6.3p12): `"
+                                    + std::string{tree.text(starSuffix)} + "`";
+                                s.reporter.report(std::move(d));
                             }
                             if (tree.rule(dNode)
                                     == cfg.declarators->initDeclaratorRule) {

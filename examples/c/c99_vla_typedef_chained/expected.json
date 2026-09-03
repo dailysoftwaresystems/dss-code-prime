@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-VLA-TYPEDEF-CHAINED (C 6.7.7p3): a CHAINED VLA typedef — `typedef int R[n]; typedef R S;` — where S's VLA-ness comes entirely from the head alias and S carries no `[n]` of its own to freeze; plus a THIRD link `typedef S T;` to prove the chain resolves at depth, and a chained MULTI-DIM alias for the row-stride half. C 6.7.7p3 evaluates a variably-modified typedef's size expression ONCE when the typedef is reached: R froze n = 3, and S/T/objects have nothing of their own to evaluate, so mutating n to 100 in between must be invisible to all of them. That is witness (A), and it is what would catch a 'fix' that merely re-evaluated the bound at S's own declaration — such a fix reads 100 and sizes 400 bytes instead of 12. HOW IT RESOLVES with no change below the semantic tier: `vlaTypedefOrigin` now names the typedef that OWNS a captured bound rather than the alias name a declaration spells, and the stamp is TRANSITIVE (S→R at S's declaration, T→R at T's, objects→R), so `T c;` reaches R's frozen slots through the SAME C4b copy-down a direct `R a;` uses — one hop per link, no walk. MEASURED 2026-09-03: gcc 13.3.0 and clang 18.1.3 compile and RUN both the chained and the three-deep form at -std=c17 and -std=c2x; MSVC ABSTAINS (no C99 VLA — error C2057 on the typedef itself). STILL DEFERRED and still loud: an alias carrying its OWN suffix over a VLA head (`typedef R S[2];`) reaches captureVlaSize on that suffix and the HIR arity check refuses it by name ('2 array level(s) ... 1 bound(s) captured') — a distinct shape with an intact fail-loud, deliberately not admitted here. main is a LEAF (no calls) — the C1b VLA frame-model scope, as c99_vla_typedef is. Witness (B) is the multi-dim OFF-DIAGONAL: d[1][0] and d[0][1] are DISTINCT cells, so a wrong runtime row stride would alias or transpose them, and with n already 100 a re-evaluated bound would blow the frame rather than merely mis-size it. The arm64 leg proves the runtime size/stride math on a non-host target; the `release` arm proves the frozen-size Loads survive the full optimizer. exitCode 42; returns 1..15 are strict in-program pins.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

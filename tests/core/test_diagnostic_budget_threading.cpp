@@ -322,7 +322,7 @@ TEST(DiagnosticBudgetThreadingSourceEnumeration,
         {"src/core/types/tree_builder.cpp", {}},
         {"src/analysis/preprocess/preprocessor.cpp",
          {
-             {"DiagnosticReporter scratch;", 6,
+             {"DiagnosticReporter scratch;", 4,
               "pre-scan / re-reported throwaways: their contents are either "
               "discarded or re-reported into a budgeted reporter, so they are "
               "never an operator-visible budget. RAISED 5 -> 6 (cycle P36) for "
@@ -336,7 +336,20 @@ TEST(DiagnosticBudgetThreadingSourceEnumeration,
               "per-header multiplier: if this number ever has to rise because "
               "a reporter was added per HEADER rather than per call site, that "
               "is a budget escaping into a loop and the fix is the budget, not "
-              "this number"},
+              "this number. LOWERED 6 -> 4 (cycle P57, "
+              "D-PP-SINGLE-PASS-INCLUDE-RESOLUTION): the include pre-scan's "
+              "private object-like evaluator is GONE — its macro state is now "
+              "the authoritative `MacroExpander`, hosted as an oracle — so "
+              "`sbMintProduct`'s per-mint tokenize scratch and "
+              "`sbEvalIfOperand`'s per-evaluation ICE scratch no longer exist. "
+              "The oracle's OWN reporter is budget-derived "
+              "(`preScanScratch{budget.asConfig()}`) rather than allowlisted, "
+              "so this count falls without a new entry. ⚠ A DROP is as much a "
+              "deliberate change as a rise: the two that went were the shadow "
+              "evaluator's, and if this number ever falls again without a "
+              "deletion in `preprocessor.cpp` to point at, a reporter was "
+              "silently re-pointed at a budgeted one and the question is "
+              "whether its contents can now reach the operator"},
              {"DiagnosticReporter macroRep;   // throwaway - malformed surfaced downstream",
               1, "throwaway; the malformed macro is surfaced downstream"},
          }},

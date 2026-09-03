@@ -1365,10 +1365,13 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
 // ── DEFECT ──────────────────────────────────────────────────────────────────
 //
 // MEASURED behaviour before this guard: such a descriptor compiled rc=0, emitted no
-// diagnostic, the macro silently SHADOWED the symbol at preprocess time, and the
-// symbol was STILL eagerly imported (D-FFI-DESCRIPTOR-EAGER-IMPORT) — a wasted
-// import of a name nothing could ever call. Loud at LOAD is the only place this can
-// be caught: by the time a TU is compiled the macro has already won.
+// diagnostic, and the macro silently SHADOWED the symbol at preprocess time, so no
+// spelling could reach the row. ⓘ It also cost a WASTED IMPORT of a name nothing
+// could call — that half went away in P57 with the eager-import law
+// ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]): a row nothing can reference is a row nothing
+// imports. The half this guard exists for is untouched — a platform fact declared
+// and then made unconsultable, decided at PREPROCESS time, where by the time a TU
+// compiles the macro has already won.
 //
 // ★★ …BUT "NOTHING CAN EVER CALL THE SYMBOL" IS ONLY TRUE OF AN **OBJECT-LIKE**
 // MACRO, AND THIS GUARD SHIPPED APPLYING IT TO BOTH FORMS. That is
@@ -1526,8 +1529,9 @@ void checkMacroSymbolShadowing(json const& doc, ShippedLibDescriptor const& out,
         for (auto const& body : bodiesOf(m)) {
             // C 6.10.3p10 + C 7.1.4p2 — a function-like macro is expanded ONLY where
             // its name is followed by `(`, so `&name` and `(name)(x)` reach the
-            // SYMBOL and the eager import is live. Measured identically in gcc and
-            // clang; see this function's header.
+            // SYMBOL — the row stays REACHABLE, and its import is emitted for any
+            // program that writes either. Measured identically in gcc and clang;
+            // see this function's header.
             // D-FFI-MACRO-SHADOWING-GUARD-IGNORES-C-7-1-4-FUNCTION-ADDRESSABILITY
             if (body.functionLike) continue;
             // C 6.10.3.4p2 — a replacement list is not re-scanned for the macro
@@ -1556,8 +1560,8 @@ void checkMacroSymbolShadowing(json const& doc, ShippedLibDescriptor const& out,
                 + "' — an object-like macro is expanded at EVERY occurrence of the "
                   "name, so no spelling reaches the symbol ('&"
                 + name + "' and '(" + name
-                + ")(...)' are eaten too), yet the symbol is still eagerly imported "
-                  "(a dead import in every binary). Three ways out: (a) give the "
+                + ")(...)' are eaten too), so the row declares a binding no call "
+                  "site can ever consult. Three ways out: (a) give the "
                   "macro 'params' if the symbol is meant to stay callable — a "
                   "FUNCTION-LIKE macro expands only before '(', so C 7.1.4p2 keeps "
                   "'&" + name + "' and '(" + name

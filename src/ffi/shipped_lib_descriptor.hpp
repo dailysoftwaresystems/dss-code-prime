@@ -203,7 +203,11 @@ struct DSS_EXPORT ShippedSymbol {
     // of a threads symbol (availableObjectFormats:["pe"]); the elf entry carries no tag
     // and is a plain libc FFI import (glibc exports the C11 API from libc.so.6). At
     // CST->HIR a tagged symbol is SKIPPED from extern-import synthesis (kernel32 does
-    // not export mtx_lock — the eager-import law) and instead recorded into
+    // not export `mtx_lock`, so an import of it is a pe binary the LOADER refuses at
+    // 0xC0000139). ⓘ THE SKIP DOES NOT COME FROM THE RETIRED EAGER LAW and did not
+    // relax with it ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]): a recipe row's synthesized
+    // body CALLS the name, so referenced-only import would keep the import too. The
+    // row is REALIZED, never imported.) The tag is instead recorded into
     // `CstToHirResult.synthRecipeBySymbol` so HIR->MIR seeds `functionSymbols` (the
     // call lowers to GlobalAddr) and the synth pass supplies the definition. Empty
     // (default) for every ordinary shipped extern. (D-CSUBSET-C11-THREADS-HEADER)
@@ -1564,7 +1568,13 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
 // Returns nullopt on config-discovery failure (same contract as
 // `realizeShippedExternSymbols`); an EMPTY map when nothing declares `name`. Rows
 // that are not `Realized` on this format are OMITTED — a companion that does not
-// exist here must never become an import (the eager-import law's whole point).
+// exist here must never become an import, because an import of a name its runtime
+// does not export is a binary the LOADER refuses (pe 0xC0000139 / elf exit 127) with
+// no link error and no diagnostic naming the JSON line. ⓘ Referenced-only import
+// ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]) NARROWED that blast radius from every binary
+// that so much as `#include`d the header to every binary that REFERENCES the name —
+// which makes this omission MORE load-bearing, not less: the failure is now later and
+// harder to notice, and this is where it is still cheap to prevent.
 // `name` ITSELF is included; the caller already has its realization and can skip it.
 [[nodiscard]] DSS_EXPORT
 std::optional<std::unordered_map<std::string, ShippedSymbolRealization>>

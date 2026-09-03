@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT: C 6.7.6.2p6 array-type compatibility across a VLA bound and a CONSTANT one, RUNNING on all four legs, in all THREE shapes DSS refused before: (a) a FIXED `int b[2][2]` argument decaying into an `int (*)[n]` parameter, (b) `p = q` ptr-to-fixed-row into ptr-to-VLA-row, (c) `r = p` the reverse. A VLA's size specifier is not an integer constant expression, so C makes the two array types COMPATIBLE and leaves an actual bound mismatch as runtime UB (a callee obligation); DSS's `-2` VLA sentinel made every identity compare answer 'incompatible' and rejected valid C with S_TypeMismatch. MEASURED 2026-09-03: gcc 13.3.0 and clang 18.1.3 compile and RUN all three at -std=c17 and -std=c2x with -Wall -Wextra -pedantic silent; MSVC ABSTAINS entirely (no C99 VLA — error C2057 on the bound itself), so it casts no vote. The NARROWING that keeps this from being a hole: two DIFFERENT CONSTANT bounds stay incompatible (`int (*)[3]` from `int[2][2]` is still refused — gcc and clang both DIAGNOSE that one, -Wincompatible-pointer-types, where they say nothing about the three shapes here), pinned as PtrToVlaFixedRowDifferentConstantsStillRejects. main holds NO VLA OBJECT (b is a fixed int[2][2]; p/q/r are pointers, which emit only a fixed 8-byte stride slot) so main may CALL — isolating this from the orthogonal non-leaf-VLA-frame deferral D-CSUBSET-VLA-NONLEAF-CALL-FRAME, exactly as c99_vla_ptr_param does. The correctness witness throughout is the OFF-DIAGONAL ([1][0] vs [0][1] are distinct bytes, so a wrong row stride would alias or transpose them) plus a final cell-for-cell agreement across all three views. `volatile vn` defeats const-fold so n is genuinely runtime. The arm64 leg proves the runtime-stride math on a non-host target (agnostic MIR); the `release` arm proves the stride Loads survive the full optimizer. exitCode 42; returns 1..8 are strict in-program pins.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

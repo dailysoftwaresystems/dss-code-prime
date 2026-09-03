@@ -2299,6 +2299,36 @@ enum class DiagnosticCode : std::uint16_t {
     // does. Renders warning[S079].
     S_FloatLiteralOverflowsToInfinity = 0xE079,
 
+    // VLA C4c (D-CSUBSET-VLA-PARAM-STAR, reopened + reclosed P57, C 6.7.6.3p12): the
+    // unspecified-size `[*]` array-declarator suffix appears on a parameter of a
+    // function DEFINITION. C 6.7.6.3p12 permits `[*]` only where the function
+    // declarator is NOT part of a definition of that function (C 6.7.6.2p4 spells the
+    // same rule as "function prototype scope"), because a definition's parameters have
+    // BLOCK scope (C 6.2.1p4) and the body needs a bound the `*` deliberately withholds.
+    // ✔MEASURED 2026-09-03, each reference probed SEPARATELY: gcc 13.3.0 refuses
+    // (`'[*]' not allowed in other than function prototype scope`) and clang 18.1.3
+    // refuses (`variable length array must be bound in function definition`) on all
+    // three reachable spellings — a NAMED `int f(int n, int a[*]) {…}`, the ABSTRACT
+    // `int f(int, int[*]) {…}`, and the outer-dim `int f(int a[*][3]) {…}`. MSVC
+    // ABSTAINS: it implements no C99 VLA and dies on the token (`C2059: syntax error:
+    // ']'`) at every `/std:`, so it casts no vote on the constraint. DSS accepted and
+    // RAN all three before this code existed — ABOVE the union, which the bar treats as
+    // a defect exactly as it treats being below it.
+    // ★ SCOPE, and it is the half a subtree scan gets wrong: a `[*]` in a NESTED
+    // declarator's own prototype INSIDE a definition's parameter list is LEGAL —
+    // `int f(int (*g)(int, int[*])) {…}` — because that inner declarator is not part of
+    // a definition. ✔MEASURED: gcc AND clang both compile and RUN it (exit 42). The
+    // emit site therefore stops descending at any nested function suffix, and
+    // `AbstractStarInNestedPrototypeInsideDefinitionStaysLegal` pins it.
+    // SUPPRESSABLE, deliberately, and it fails BOTH prongs of `kUnsuppressableCodes`:
+    // a `[*]` parameter decays to the SAME `Ptr<element>` a bare `[]` does (C 6.7.6.3p7),
+    // so silencing this ships the artifact the source already appears to describe —
+    // there is no second candidate lowering, no wrong size and no wrong stride to hide.
+    // The `S_AsmLabelOnAutomaticVariable` / `S_DeprecatedSymbolUsed` /
+    // `S_FloatLiteralOverflowsToInfinity` negative-pin posture: a pure CONSTRAINT
+    // diagnostic, not a silent-miscompile guard. Renders error[S07A].
+    S_ArrayParamStarInFunctionDefinition = 0xE07A,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

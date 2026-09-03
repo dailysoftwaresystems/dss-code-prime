@@ -802,8 +802,12 @@ constexpr std::array<UnsuppressableEntry, 168> kUnsuppressableCodes{{
     // guard and the family split that feeds each synth pass. Suppressed, the
     // recipe would fall out of BOTH passes and the shim symbol would go
     // undefined with no diagnostic — a silently-undefined function that
-    // breaks the binary's LOAD at user runtime (the eager-import law's
-    // failure mode), not the build. It also replaces both seams' former
+    // breaks the binary's LOAD at user runtime, not the build. (This named
+    // that as "the eager-import law's failure mode" until 2026-09-03; the law
+    // is retired — [[D-FFI-DESCRIPTOR-EAGER-IMPORT]] — but the failure mode is
+    // NOT, because a shim body that calls the missing core references it, so
+    // the import is kept and the load still fails. The reason to be
+    // unsuppressible is unchanged.) It also replaces both seams' former
     // borrow of the linker-band `K_NoMatchingObjectFormat`, itself a member
     // below — so this entry PRESERVES the non-suppressible property rather
     // than granting a new one.

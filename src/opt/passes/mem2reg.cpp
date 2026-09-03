@@ -92,31 +92,38 @@ struct PendingIncoming {
 //   None       — no materialization exists ⇒ the alloca is DE-PROMOTED (left in
 //                memory, exactly what the debug pipeline does — always correct).
 //
-// ★★ THE FLOAT SET IS F32 + F64, AND THE TWO KINDS LEFT OUT WERE EACH LEFT OUT FOR
-// A MEASURED REASON — the set is NOT simply "the kinds `hir_to_mir`'s float-literal
-// promoter mints a rodata global for", which was the first answer tried and is a
-// LARGER set (it also admits F80/F128 via LD-1/LD-2). The question that promoter
-// answers is "can this kind's CONSTANT be reached through rodata"; the question here
-// is strictly stronger, because promoting an alloca also creates a PHI:
+// ★★ THE FLOAT SET IS F32 + F64 + F80 + F128, AND THE ONE KIND LEFT OUT IS LEFT OUT
+// FOR A MEASURED REASON OF ITS OWN — the set is still NOT simply "the kinds
+// `hir_to_mir`'s float-literal promoter mints a rodata global for". The question
+// that promoter answers is "can this kind's CONSTANT be reached through rodata";
+// the question here is strictly stronger, because promoting an alloca also creates
+// a PHI, and a kind must be able to do BOTH:
 //
-//   F16   — no encodings at ANY width (D-TARGET-ENCODING-WIDTH-GUARD). The literal
-//           promoter excludes it for the same reason: pairing it with a wrong-width
-//           load or arithmetic encoding would be silent.
-//   F80 / — the CONSTANT would materialize fine, but the PHI would not.
-//   F128    ✔MEASURED 2026-08-26 at the CLI: with these two admitted,
-//           `long double x; if(c) x=p; return x+q;` at `--config=release` REFUSES
-//           with `L_UnsupportedLoweringForOpcode` — "long double (F80/F128)
-//           control-flow merge (phi) is not yet lowered … needs the memory-home
-//           merge (D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE)" — on BOTH
-//           x86_64:elf64-x86_64-linux-exec (long double = F80) and
-//           arm64:elf64-aarch64-linux-exec (long double = F128), while the same
-//           program builds clean at `--config=debug`. Admitting them would turn a
-//           program that compiles today into a refusal, which a PERF refinement is
-//           never allowed to do. They stay DE-PROMOTED (memory — exactly what debug
-//           does) until that merge lands, at which point they simply move here.
+//   F16   — STILL `None`, and its reason is unrelated to anything below: F16 has no
+//           encodings at ANY width (D-TARGET-ENCODING-WIDTH-GUARD), so neither its
+//           constant nor its phi can be realized. The literal promoter excludes it
+//           for the same reason: pairing it with a wrong-width load or arithmetic
+//           encoding would be silent. ⚠ F16 is NOT waiting on a long-double merge
+//           and must not be swept along with one — it moves here only when the
+//           encoding-width guard itself is answered.
+//   F80 / — ADMITTED 2026-09-03. Their constant always materialized fine (LD-1 /
+//   F128    LD-2 route it through rodata like every other float); what was missing
+//           was the PHI, and `D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE` supplies it: an
+//           F80/F128 phi now merges in MEMORY (a frame home per phi, an
+//           fld_m80/fstp_m80 or two-word copy on each edge) instead of walling.
+//           ✔MEASURED 2026-08-26 at the CLI, BEFORE that merge existed, and kept
+//           here because it is the evidence that the two halves are one mechanism:
+//           with these two admitted, `long double x; if(c) x=p; return x+q;` at
+//           `--config=release` REFUSED with `L_UnsupportedLoweringForOpcode` naming
+//           that anchor, on BOTH x86_64:elf64-x86_64-linux-exec (long double = F80)
+//           and arm64:elf64-aarch64-linux-exec (F128), while the same program built
+//           clean at `--config=debug`. That is why the promotion shipped as F32+F64
+//           first: A PERF REFINEMENT MAY NOT TURN A COMPILING PROGRAM INTO A
+//           REFUSAL. With the merge landed the refusal is gone and the pair moves
+//           here, which is exactly the follow-through the anchor named.
 //
-// ⚠ These, plus I128/U128 and every aggregate/vector, reach `None` and are therefore
-// DE-PROMOTED. The fail-loud-in-place half of this rule lives in `onBlockBegin`,
+// ⚠ F16 — and ONLY F16 of the floats now — plus I128/U128 and every
+// aggregate/vector, reach `None` and are therefore DE-PROMOTED. The fail-loud-in-place half of this rule lives in `onBlockBegin`,
 // which aborts if it is ever asked to materialize a `None` zero. That abort is
 // unreachable BY CONSTRUCTION (the de-promotion below removes exactly those
 // allocas); it is the invariant assert that keeps the two halves in agreement, and
@@ -134,12 +141,19 @@ enum class ZeroForm : std::uint8_t { None, IntConst, RodataLoad };
         case TypeKind::Ptr: case TypeKind::Ref: case TypeKind::FnPtr:
             return ZeroForm::IntConst;
         case TypeKind::F32: case TypeKind::F64:
+        // D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE: F80/F128 join F32/F64 now that a
+        // `long double` phi has a lowering (the memory-home merge). Their zero is
+        // the same anonymous rodata +0.0 — all-zero bits in x87-80 and binary128
+        // alike — reached by the same GlobalAddr+Load, which the LD-1/LD-2 model
+        // then address-propagates rather than reading into a register.
+        case TypeKind::F80: case TypeKind::F128:
             return ZeroForm::RodataLoad;
         default:
-            return ZeroForm::None;  // F16 (no encodings), F80/F128 (no phi lowering),
-                                    // I128/U128 (wide-int wall), Struct/Union/Tuple/
-                                    // Array/Slice/Vector/Matrix/Nullable/Optional/Void
-                                    // (no scalar zero at all)
+            return ZeroForm::None;  // F16 (no encodings at any width — its OWN
+                                    // reason, D-TARGET-ENCODING-WIDTH-GUARD, not the
+                                    // long-double one), I128/U128 (wide-int wall),
+                                    // Struct/Union/Tuple/Array/Slice/Vector/Matrix/
+                                    // Nullable/Optional/Void (no scalar zero at all)
     }
 }
 

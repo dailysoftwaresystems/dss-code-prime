@@ -213,7 +213,16 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     DiagnosticReporter&    reporter) {
     // Candidate test: does ANY named import need the gate — i.e. is there a
     // NON-EAGER row? An eager row is always kept, so a module whose every named
-    // import is eager has nothing to gate (the common `#include`-only fast path).
+    // import is eager has nothing to gate.
+    // ⚠ THIS SHORT-CIRCUIT USED TO CALL THAT "the common `#include`-only fast
+    // path", AND THAT SENTENCE MEANT THE SCAN BELOW HAD NEVER RUN FOR AN
+    // ORDINARY PROGRAM. ✔MEASURED 2026-09-03 while closing
+    // [[D-FFI-DESCRIPTOR-EAGER-IMPORT]]: every `#include`d descriptor symbol was
+    // eager, and `injectEntryTrampoline` appends the only other non-eager row
+    // AFTER this gate — so for an `#include`-only TU `anyCandidate` was false and
+    // the whole gate returned early, every time. It is no longer a fast path: a
+    // descriptor symbol is non-eager by default now, so this scan is LIVE for
+    // exactly the programs that never reached it.
     // This MUST fire for a library-bound non-eager row too (not just unbound
     // ones): otherwise an unreferenced `Sqlitetestsse_Init` in a module with no
     // unbound rows would skip the gate and survive to the loader. Every unbound

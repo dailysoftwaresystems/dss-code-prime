@@ -29,10 +29,14 @@
 // deleted mechanism, and NEITHER is "it would read NULL":
 //   * `__environ` is glibc's UNCONDITIONALLY declared spelling
 //     (/usr/include/unistd.h; plain `environ` sits behind `#ifdef __USE_GNU`)
-//     and the STRONG (GLOBAL) export, while `environ`/`_environ` are WEAK. DSS
-//     EAGER-IMPORTS every name a descriptor declares, so the safest choice is
-//     the strong, always-present one.
-//   * Declaring BOTH would emit TWO eager imports for ONE object, and an
+//     and the STRONG (GLOBAL) export, while `environ`/`_environ` are WEAK. A
+//     descriptor row is a name DSS will ask the loader to resolve the moment a
+//     program references it, so the safest choice is the strong, always-present
+//     one. (Until P57 it was worse than that: a descriptor row was imported
+//     whether referenced or not — [[D-FFI-DESCRIPTOR-EAGER-IMPORT]] — so the
+//     weak spelling would have been asked for by every including binary. That
+//     law is retired; the reason for picking the strong spelling is not.)
+//   * Declaring BOTH would emit TWO imports for ONE object, and an
 //     `environ` SYMBOL row would collide with the `environ` MACRO this design
 //     depends on (the macro wins at every call site, leaving the row
 //     unreachable while still costing a load-time binding).
@@ -47,13 +51,18 @@
 //   (1) THE SYMBOL IS `__environ`, NOT `environ` — the strong, unconditionally
 //       declared spelling, declared ALONE.
 //
-//   (2) AVAILABILITY IS elf ONLY. DSS EAGER-IMPORTS every symbol a descriptor
-//       DECLARES, not merely the ones a program calls
-//       ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]), so widening the row to a format
-//       whose runtime has no such export breaks the LOAD of EVERY binary that
-//       so much as `#include`s the header — pe dies at 0xC0000139
-//       STATUS_ENTRYPOINT_NOT_FOUND — with no link error and no diagnostic
-//       naming the JSON. And the widening is a one-token edit. ✔MEASURED
+//   (2) AVAILABILITY IS elf ONLY. Widening the row to a format whose runtime has
+//       no such export produces a binary the LOADER refuses — pe dies at
+//       0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND — with no link error and no
+//       diagnostic naming the JSON, and the widening is a one-token edit.
+//       ⚠ WHICH binaries it takes down changed in P57 and the guard got MORE
+//       load-bearing, not less ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]): DSS used to
+//       import every symbol a descriptor DECLARED, so a bad row broke EVERY
+//       binary that so much as `#include`d the header, immediately and
+//       unmissably. Imports are now referenced-only, so it breaks every binary
+//       that REFERENCES the name — a smaller blast radius reached LATER, by
+//       whichever consumer happens to touch it first. Both are silent at compile
+//       time; the second is the one nobody notices. ✔MEASURED
 //       (`objdump -p` plus a direct PE export-directory parse): ucrtbase.dll
 //       (2,484 exports) exports NO `environ`, `_environ` or `__environ`;
 //       msvcrt.dll (1,330) exports only the UNDERSCORED `_environ` data export
@@ -66,8 +75,11 @@
 //       MACRO. When a descriptor realizes a MACRO and declares a SYMBOL of the
 //       same name on the SAME format, the macro wins at every call site: the
 //       compile succeeds, no diagnostic is produced, and the symbol row becomes
-//       unreachable while its eager import is still emitted. For a DATA object
-//       that is worse than for a function — these are LVALUES, so both reads AND
+//       unreachable. ⓘ IT USED TO COST A DEAD IMPORT AS WELL, and P57 removed that
+//       half: with referenced-only import ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]) a row
+//       nothing can reach is a row nothing imports. The half that MATTERED is
+//       untouched and is why this guard stays — for a DATA object the redirection is
+//       worse than for a function, because these are LVALUES, so both reads AND
 //       writes are silently redirected. Two directions to guard: a `__environ`
 //       MACRO would shadow the row, and an `environ` SYMBOL would collide with
 //       the macro this design depends on.
@@ -202,7 +214,7 @@ resolvedAvailability(json const& doc, json const& row) {
 
 // (2) The environment data object must be bound under the STRONG glibc alias,
 //     and under it ALONE (see the header: the strong+unconditional export, one
-//     eager import, no collision with the `environ` macro).
+//     import, no collision with the `environ` macro).
 [[nodiscard]] bool bindsStrongEnvironAlias(json const& doc) {
     if (findNamed(doc, "symbols", "__environ") == nullptr) return false;
     return findNamed(doc, "symbols", "environ") == nullptr
@@ -236,11 +248,11 @@ TEST(EnvironDataObjectBinding, RealUnistdJsonEnvironElfOnlyDataObject) {
         << "unistd.json must declare `__environ` — glibc's UNCONDITIONALLY "
            "declared spelling (/usr/include/unistd.h; plain `environ` is behind "
            "#ifdef __USE_GNU) and the STRONG (GLOBAL) export, while "
-           "`environ`/`_environ` are WEAK. DSS eager-imports every declared "
-           "name, so the always-present one is the safe choice.";
+           "`environ`/`_environ` are WEAK. A descriptor row is a name DSS asks "
+           "the loader to resolve, so the always-present one is the safe choice.";
     EXPECT_TRUE(bindsStrongEnvironAlias(doc))
         << "the environment object must be bound under `__environ` ONLY. "
-           "Declaring a second spelling emits TWO eager imports for ONE object, "
+           "Declaring a second spelling emits TWO imports for ONE object, "
            "and an `environ` SYMBOL row collides with the `environ` MACRO this "
            "design depends on — the macro wins at every call site, so the row "
            "is unreachable while still costing a load-time binding.";
@@ -268,9 +280,10 @@ TEST(EnvironDataObjectBinding, RealUnistdJsonEnvironElfOnlyDataObject) {
            "bind (ucrtbase: none at all; msvcrt: only `_environ`), so a pe arm "
            "would break the LOAD of every binary including <unistd.h>";
     EXPECT_FALSE(availableOn(set, "macho"))
-        << "the macho export is UNMEASURED this cycle; under the eager-import "
-           "law an inferred row risks every macho binary's LOAD, so macho stays "
-           "a fail-loud S0001 until a consumer lands and the export is measured";
+        << "the macho export is UNMEASURED this cycle; an inferred row risks the "
+           "LOAD of every macho binary that REFERENCES it — every one that merely "
+           "included the header, before referenced-only import — so macho stays a "
+           "fail-loud S0001 until a consumer lands and the export is measured";
     EXPECT_TRUE(availabilityIsSafe(doc, *row, {"elf"}));
 
     // ── (3) THE POSIX SPELLING IS A MACRO ONTO THE STRONG ALIAS ─────────────
@@ -349,9 +362,10 @@ TEST(EnvironDataObjectBinding, NoDescriptorShadowsTheEnvironBinding) {
         std::string const where = e.path().filename().generic_string();
 
         // A `__environ` MACRO would shadow the data-object row at every call
-        // site: compile rc=0, no diagnostic, the row unreachable, its eager
-        // import still emitted -- and because this is an LVALUE, both reads and
-        // writes are silently redirected.
+        // site: compile rc=0, no diagnostic, the row unreachable -- and because
+        // this is an LVALUE, both reads and writes are silently redirected. That
+        // redirection is the whole harm now; the dead import it also used to cost
+        // went away with the eager law in P57.
         EXPECT_FALSE(hasMacroNamed(doc, "__environ"))
             << where << " declares a `macros` entry named `__environ`, which "
                         "would SHADOW the environment data-object row silently";
@@ -362,7 +376,8 @@ TEST(EnvironDataObjectBinding, NoDescriptorShadowsTheEnvironBinding) {
             EXPECT_EQ(findNamed(doc, "symbols", "environ"), nullptr)
                 << where << " declares an `environ` SYMBOL; on elf the "
                             "unistd.json macro shadows it, so the row would be "
-                            "unreachable while still emitting an eager import";
+                            "unreachable and the binding it declares would be a "
+                            "fact no call site can ever consult";
         }
     }
     // FAIL-CLOSED: an empty sweep must not read as a pass.
@@ -456,8 +471,8 @@ TEST(EnvironDataObjectBinding, WeakAliasSpellingIsCaught) {
     EXPECT_FALSE(bindsStrongEnvironAlias(weak2))
         << "the guard must REJECT `_environ` too";
 
-    // BOTH spellings present is also wrong: the weak row still emits its own
-    // eager import and still offers the wrong binding to a consumer.
+    // BOTH spellings present is also wrong: the weak row still offers the wrong
+    // binding to a consumer, and the first one to reference it gets it.
     json const both = json::parse(R"JSON({
       "header": "unistd.h",
       "symbols": [

@@ -43,6 +43,8 @@
 #include <span>
 #include <variant>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -5882,17 +5884,21 @@ TEST(MirToLir, F80ReturnOperandLowersToFld80BeforeBareRet) {
         << "a long-double return leaves the value in st0 — the ret has no reg operand";
 }
 
-// D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE (LD-1 x87 review fix): an F80 phi — a
-// `long double` crossing a control-flow JOIN (`cond ? a : b`) — must WALL LOUD,
-// NOT miscompile. The memory-resident F80 model makes an F80 SSA value a
-// GPR-held address; without the prepassAllocatePhis F80/F128 wall the phi is
-// allocated FPR-class and the edge-move emits a class-inconsistent `fld [xmm]`
-// (the silent miscompile the review caught). This builds the SAME diamond CFG
-// that lowers cleanly for an F64 phi (see the FprPhi test above) but with F80,
-// consuming the phi via an in-function FPToSI + int return so the ONLY F80 site
-// is the phi itself. Red-on-disable: removing the F80/F128 wall makes lowerToLir
-// SUCCEED (the miscompile).
-TEST(MirToLir, F80PhiControlMergeWallsFailLoud) {
+// D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE: INVERTED from the LD-1 x87-review WALL.
+// An F80 phi — a `long double` crossing a control-flow JOIN (`cond ? a : b`) —
+// now LOWERS, to a MEMORY-HOME merge. The memory-resident F80 model makes an F80
+// SSA value a GPR-held address, so the phi gets a frame home of its own and each
+// edge copies the 80-bit datum into it with fld_m80/fstp_m80; the FPR-class
+// edge-move the generic path would mint (`fld [xmm]`) was the class-inconsistent
+// silent miscompile the 2026-07-18 review caught, and it is still never emitted.
+// This builds the SAME diamond CFG that lowers cleanly for an F64 phi (see the
+// FprPhi test above) but with F80, consuming the phi via an in-function FPToSI +
+// int return so the ONLY F80 site is the phi itself.
+//
+// Red-on-disable: restore the `prepassAllocatePhis` F80/F128 refusal (or delete
+// the memPairs half of `emitPhiMovesForEdge`) → `lowerToLir` fails / the copies
+// vanish.
+TEST(MirToLir, F80PhiControlMergeLowersToMemoryHomeCopy) {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto const& sch = **target;
@@ -5943,21 +5949,184 @@ TEST(MirToLir, F80PhiControlMergeWallsFailLoud) {
 
     ::dss::DiagnosticReporter rep;
     auto const result = ::dss::lowerToLir(m, sch, interner, rep);
-    EXPECT_FALSE(result.ok)
-        << "an F80 phi (long double control-flow merge) must WALL loud, not "
-           "miscompile — the SAME diamond that lowers for an F64 phi must fail "
-           "for F80 (memory-resident: the phi would mint a class-inconsistent "
-           "fld [xmm])";
-    bool sawMerge = false;
+    ASSERT_TRUE(result.ok)
+        << "an F80 phi (long double control-flow merge) must LOWER to the "
+           "memory-home merge — the SAME diamond that lowers for an F64 phi: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
     for (auto const& d : rep.all()) {
-        if (d.actual.find("control-flow merge") != std::string::npos
-            || d.actual.find("CONTROL-MERGE") != std::string::npos) {
-            sawMerge = true;
-            break;
+        EXPECT_EQ(d.actual.find("control-flow merge"), std::string::npos)
+            << "the control-merge WALL must be gone: " << d.actual;
+    }
+    // The merge is memory, not registers: TWO 16-byte homes are reserved (the
+    // phi's own + its per-edge staging slot) and each of the two edges copies the
+    // datum in with an fld_m80/fstp_m80 PAIR (stage, then write the home) — four
+    // copies over the whole function. NO fpr move ever names the phi.
+    Lir const& lir = result.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 1u);
+    ::dss::LirFuncId const fn = lir.funcAt(0);
+    auto const allocaOp = sch.opcodeByMnemonic("alloca");
+    auto const fldOp    = sch.opcodeByMnemonic("fld_m80");
+    auto const fstpOp   = sch.opcodeByMnemonic("fstp_m80");
+    ASSERT_TRUE(allocaOp.has_value() && fldOp.has_value() && fstpOp.has_value());
+    std::uint32_t allocas = 0;
+    std::uint32_t copies  = 0;
+    std::uint32_t entryLeadingAllocas = 0;
+    std::uint32_t const bc = lir.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < bc; ++bi) {
+        ::dss::LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        std::uint32_t const ic = lir.blockInstCount(blk);
+        for (std::uint32_t ii = 0; ii < ic; ++ii) {
+            LirInstId const inst = lir.blockInstAt(blk, ii);
+            std::uint16_t const op = lir.instOpcode(inst);
+            // ⓘ COUNT THE 16-BYTE HOMES, NOT EVERY ALLOCA. This function also
+            // consumes the phi with an FPToSI, and `lowerF80ToSI` reserves a
+            // 4-byte scratch of its own for the `fisttp_m32` — a real alloca
+            // belonging to a different mechanism, in a different block.
+            if (op == *allocaOp && lir.instPayload(inst) == 16u) {
+                ++allocas;
+                // The reservations must LEAD the entry block — the placement is
+                // correctness, not tidiness: lir_callconv assigns frame offsets by
+                // a blocks-then-insts walk while the lowering counts them in
+                // emission order, and the phi edge copies live in split blocks
+                // that are appended AFTER every pre-created block.
+                if (bi == 0 && ii == entryLeadingAllocas) ++entryLeadingAllocas;
+            }
+            if (op == *fstpOp && ii > 0
+                && lir.instOpcode(lir.blockInstAt(blk, ii - 1)) == *fldOp)
+                ++copies;
         }
     }
-    EXPECT_TRUE(sawMerge)
-        << "the F80 phi wall must fire with the control-merge diagnostic";
+    EXPECT_EQ(allocas, 2u)
+        << "one 16-byte home for the phi + one per-edge staging home";
+    EXPECT_EQ(entryLeadingAllocas, 2u)
+        << "both reservations must be the LEADING instructions of the entry "
+           "block, or the callconv frame-slot scan and the lowering's own "
+           "scan-order counter disagree";
+    EXPECT_EQ(copies, 4u)
+        << "two edges x (stage the incoming, then write the phi home) — each an "
+           "fld_m80 immediately followed by an fstp_m80";
+}
+
+// D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE — THE LOST-COPY PIN, and it is the one
+// property of this merge that a "returns the right answer" example cannot see.
+//
+// Two long doubles that SWAP across a loop back edge:
+//
+//   header:  p1 = phi [a, entry], [p2, header]
+//            p2 = phi [b, entry], [p1, header]
+//
+// A direct memory merge would emit `home(p1) <- home(p2) ; home(p2) <- home(p1)`
+// on the back edge and hand p2 the value p1 had ALREADY been overwritten with —
+// the memory twin of the register half's lost-copy problem, which is why the
+// register half stages every incoming into a temp first. The memory half must
+// stage too: EVERY incoming is copied into that phi's own staging slot BEFORE
+// ANY phi home is written.
+//
+// The pin reads the frame-slot indices off the `lea_frame_slot` payloads, so it
+// asserts the ORDER of the writes, not merely their count. Reservation order is
+// (p1.home=0, p1.staging=1, p2.home=2, p2.staging=3), so every block that
+// performs this edge's copies must write slots 1,3 (stage both) and only THEN
+// 0,2 (write both homes).
+//
+// Red-on-disable: make `emitPhiMovesForEdge`'s memory half copy incoming→home
+// directly (drop the staging pass) → the write order becomes 0,2 and this fails
+// while the arithmetic tests stay green.
+TEST(MirToLir, F80PhiSwapOnABackEdgeStagesEveryIncomingBeforeAnyHomeWrite) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80    = interner.primitive(::dss::TypeKind::F80);
+    auto const i32    = interner.primitive(::dss::TypeKind::I32);
+    auto const boolT  = interner.primitive(::dss::TypeKind::Bool);
+    auto const ptrF80 = interner.pointer(f80);
+    std::array<::dss::TypeId, 3> params{boolT, ptrF80, ptrF80};
+    auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const entry  = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    ::dss::MirBlockId const header = mb.createBlock(::dss::StructCfMarker::LoopHeader);
+    ::dss::MirBlockId const exitB  = mb.createBlock(::dss::StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    ::dss::MirInstId const cond = mb.addArg(0, boolT);
+    ::dss::MirInstId const pa   = mb.addArg(1, ptrF80);
+    ::dss::MirInstId const pb   = mb.addArg(2, ptrF80);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const a = mb.addInst(::dss::MirOpcode::Load, laOps, f80);
+    std::array<::dss::MirInstId, 1> lbOps{pb};
+    ::dss::MirInstId const b = mb.addInst(::dss::MirOpcode::Load, lbOps, f80);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    ::dss::MirInstId const p1 = mb.addPhi(f80);
+    ::dss::MirInstId const p2 = mb.addPhi(f80);
+    mb.addPhiIncoming(p1, ::dss::MirPhiIncoming{a,  entry});
+    mb.addPhiIncoming(p1, ::dss::MirPhiIncoming{p2, header});
+    mb.addPhiIncoming(p2, ::dss::MirPhiIncoming{b,  entry});
+    mb.addPhiIncoming(p2, ::dss::MirPhiIncoming{p1, header});
+    mb.addCondBr(cond, header, exitB);
+    mb.beginBlock(exitB);
+    std::array<::dss::MirInstId, 1> cvtOps{p1};
+    ::dss::MirInstId const asInt = mb.addInst(::dss::MirOpcode::FPToSI, cvtOps, i32);
+    mb.addReturn(asInt);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "two swapping long-double phis on a back edge must lower: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = result.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 1u);
+    ::dss::LirFuncId const fn = lir.funcAt(0);
+    auto const leaOp    = sch.opcodeByMnemonic("lea_frame_slot");
+    auto const fstpOp   = sch.opcodeByMnemonic("fstp_m80");
+    auto const allocaOp = sch.opcodeByMnemonic("alloca");
+    ASSERT_TRUE(leaOp.has_value() && fstpOp.has_value() && allocaOp.has_value());
+    // vreg -> the frame slot index its `lea_frame_slot` materialized.
+    std::unordered_map<std::uint32_t, std::uint32_t> slotOfVreg;
+    std::uint32_t allocas = 0;
+    std::uint32_t const bc = lir.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < bc; ++bi) {
+        ::dss::LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        for (std::uint32_t ii = 0; ii < lir.blockInstCount(blk); ++ii) {
+            LirInstId const inst = lir.blockInstAt(blk, ii);
+            // 16-byte homes only — the FPToSI in the exit block reserves its
+            // own 4-byte `fisttp_m32` scratch, a different mechanism.
+            if (lir.instOpcode(inst) == *allocaOp
+                && lir.instPayload(inst) == 16u) ++allocas;
+            if (lir.instOpcode(inst) != *leaOp) continue;
+            LirReg const r = lir.instResult(inst);
+            if (r.valid()) slotOfVreg[r.id] = lir.instPayload(inst);
+        }
+    }
+    EXPECT_EQ(allocas, 4u)
+        << "two long-double phis: a home + a staging slot each";
+    // Every block that writes long-double homes must write the two STAGING slots
+    // (1 and 3) before the two HOME slots (0 and 2).
+    std::uint32_t blocksWithCopies = 0;
+    for (std::uint32_t bi = 0; bi < bc; ++bi) {
+        ::dss::LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        std::vector<std::uint32_t> writeOrder;
+        for (std::uint32_t ii = 0; ii < lir.blockInstCount(blk); ++ii) {
+            LirInstId const inst = lir.blockInstAt(blk, ii);
+            if (lir.instOpcode(inst) != *fstpOp) continue;
+            auto const ops = lir.instOperands(inst);
+            ASSERT_FALSE(ops.empty());
+            ASSERT_EQ(ops[0].kind, LirOperandKind::Reg);
+            auto const it = slotOfVreg.find(ops[0].reg.id);
+            ASSERT_NE(it, slotOfVreg.end())
+                << "an fstp_m80 destination must be a rematerialized frame slot";
+            writeOrder.push_back(it->second);
+        }
+        if (writeOrder.empty()) continue;
+        ++blocksWithCopies;
+        std::vector<std::uint32_t> const expected{1u, 3u, 0u, 2u};
+        EXPECT_EQ(writeOrder, expected)
+            << "both incomings must be STAGED (slots 1 and 3) before either phi "
+               "home (slots 0 and 2) is written — otherwise the swap loses a copy";
+    }
+    EXPECT_EQ(blocksWithCopies, 2u)
+        << "the entry edge (inline) and the back edge (its own split block)";
 }
 
 // ══ D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): F80 arithmetic LOWERS to the fixed
@@ -6863,11 +7032,14 @@ TEST(MirToLir, LongDoubleUserCallComposesWithSoftcall) {
         << "the user call to `add` (symbol 2) must be present alongside the softcall";
 }
 
-TEST(MirToLir, F128PhiControlMergeWallsFailLoud) {
-    // The F128 twin of F80PhiControlMergeWallsFailLoud: an F128 phi (a `long
-    // double` crossing a control-flow join) must WALL loud in prepassAllocatePhis
-    // (the generic F80||F128 wall), even with the softcall config active — the
-    // softcall realizes straight-line arithmetic, not a memory-home phi merge.
+TEST(MirToLir, F128PhiControlMergeLowersToMemoryHomeCopy) {
+    // The F128 twin of F80PhiControlMergeLowersToMemoryHomeCopy: an F128 phi (a
+    // `long double` crossing a control-flow join) LOWERS through the same
+    // memory-home merge, but its per-edge copy is the TWO-WORD GPR copy F128
+    // stores use (there is no x87 stack on arm64) — the one place the shared
+    // `emitWideFloatHomeCopy` verb differs by TypeKind, and it differs by
+    // TypeKind alone, never by arch identity.
+    // Red-on-disable: restore the `prepassAllocatePhis` F80/F128 refusal.
     auto target = ::dss::TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
@@ -6907,18 +7079,60 @@ TEST(MirToLir, F128PhiControlMergeWallsFailLoud) {
 
     ::dss::DiagnosticReporter rep;
     auto const result = lowerF128Arm64(m, **target, interner, rep);
-    EXPECT_FALSE(result.ok)
-        << "an F128 phi (long double control-flow merge) must WALL loud";
-    bool sawMerge = false;
+    ASSERT_TRUE(result.ok)
+        << "an F128 phi (long double control-flow merge) must LOWER: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
     for (auto const& d : rep.all()) {
-        if (d.actual.find("control-flow merge") != std::string::npos
-            || d.actual.find("CONTROL-MERGE") != std::string::npos) {
-            sawMerge = true;
-            break;
+        EXPECT_EQ(d.actual.find("control-flow merge"), std::string::npos)
+            << "the control-merge WALL must be gone: " << d.actual;
+    }
+    Lir const& lir = result.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 1u);
+    ::dss::LirFuncId const fn = lir.funcAt(0);
+    auto const allocaOp = (*target)->opcodeByMnemonic("alloca");
+    auto const leaOp    = (*target)->opcodeByMnemonic("lea_frame_slot");
+    auto const storeOp  = (*target)->opcodeByMnemonic("store");
+    ASSERT_TRUE(allocaOp.has_value() && leaOp.has_value() && storeOp.has_value());
+    std::unordered_set<std::uint32_t> frameSlotAddrVregs;
+    std::uint32_t allocas = 0;
+    std::uint32_t entryLeadingAllocas = 0;
+    std::uint32_t const bc = lir.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < bc; ++bi) {
+        ::dss::LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        std::uint32_t const ic = lir.blockInstCount(blk);
+        for (std::uint32_t ii = 0; ii < ic; ++ii) {
+            LirInstId const inst = lir.blockInstAt(blk, ii);
+            if (lir.instOpcode(inst) == *leaOp && lir.instResult(inst).valid())
+                frameSlotAddrVregs.insert(lir.instResult(inst).id);
+            if (lir.instOpcode(inst) != *allocaOp
+                || lir.instPayload(inst) != 16u) continue;
+            ++allocas;
+            if (bi == 0 && ii == entryLeadingAllocas) ++entryLeadingAllocas;
         }
     }
-    EXPECT_TRUE(sawMerge)
-        << "the F128 phi wall must fire with the control-merge diagnostic";
+    EXPECT_EQ(allocas, 2u)
+        << "one 16-byte home for the phi + one per-edge staging home";
+    EXPECT_EQ(entryLeadingAllocas, 2u)
+        << "both reservations must LEAD the entry block (the callconv frame-slot "
+           "scan walks blocks-then-insts; the lowering counts in emission order)";
+    // The copies themselves: each edge stages the incoming then writes the home,
+    // and each of those is a TWO-WORD GPR copy (offsets 0 and 8 — there is no
+    // x87 stack here). 2 edges x 2 steps x 2 words = 8 stores through a
+    // rematerialized frame-slot address.
+    std::uint32_t frameStores = 0;
+    for (std::uint32_t bi = 0; bi < bc; ++bi) {
+        ::dss::LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        for (std::uint32_t ii = 0; ii < lir.blockInstCount(blk); ++ii) {
+            LirInstId const inst = lir.blockInstAt(blk, ii);
+            if (lir.instOpcode(inst) != *storeOp) continue;
+            auto const ops = lir.instOperands(inst);
+            if (ops.size() < 2 || ops[1].kind != LirOperandKind::Reg) continue;
+            if (frameSlotAddrVregs.count(ops[1].reg.id) != 0) ++frameStores;
+        }
+    }
+    EXPECT_EQ(frameStores, 8u)
+        << "two edges x (stage the incoming, then write the phi home) x two "
+           "8-byte words of the binary128 datum";
 }
 
 TEST(MirToLir, F128StoreLowersToGprPairCopy) {

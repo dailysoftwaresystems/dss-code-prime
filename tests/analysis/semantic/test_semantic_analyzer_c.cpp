@@ -12893,28 +12893,36 @@ TEST(SemanticAnalyzerC, ThreadLocalInvalidCombinationsFailLoud) {
         << "register may not pair with thread_local (6.7.1p2)";
 }
 
-// VLA C4a-local (D-CSUBSET-VLA): a pointer-to-VLA assignability compare stays EXACT — a
-// FIXED-pointee `int (*p)[5]` initialized from a VLA object `int b[2][n]` (rows int[n])
-// is a MISMATCH (`Ptr<int[5]>` vs `array(vlaArray(int),2)`; int[5] != int[n]) and must
-// REJECT with S_TypeMismatch, never silently decay-accept. ★ This was written as the
-// forward-guard for the then-deferred init form (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING):
-// whatever made `= b` work must not weaken this exact-row compare. That row CLOSED in
-// P34 and the guard HELD — `int (*p)[n] = b;` is accepted while this stays a reject, so
-// the compare narrowed on the POINTEE's row length rather than being loosened. RED-ON-DISABLE: broaden the array-to-pointer decay
-// branch to ignore the element type → this stops firing.
-TEST(SemanticAnalyzerC, PtrToVlaFixedPointeeFromVlaObjectRejects) {
+// VLA C4a-local (D-CSUBSET-VLA / D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT ✅): a FIXED-pointee
+// `int (*p)[5]` initialized from a VLA object `int b[2][n]` (rows `int[n]`).
+//
+// ★★ THIS PIN USED TO ASSERT THE OPPOSITE, AND THE SENTENCE THAT JUSTIFIED IT WAS THE
+// PROBLEM. It read "the decay compare stays EXACT ... must REJECT with S_TypeMismatch,
+// never silently decay-accept", written as the forward-guard for the then-deferred
+// ptr-to-VLA init form. The GUARD was right; its THRESHOLD was not. C 6.7.6.2p6 requires
+// two array bounds to agree only when BOTH are integer constant expressions, and `n` is
+// not one — so `int[5]` and `int[n]` ARE compatible and this program is valid C.
+// ✔MEASURED 2026-09-03: gcc 13.3.0 and clang 18.1.3 compile and RUN it with `-Wall -Wextra
+// -pedantic` SILENT — and both DIAGNOSE the genuinely-incompatible sibling case (two
+// different constants, `PtrToVlaFixedRowDifferentConstantsStillRejects`). So the exactness
+// worth keeping is *no two constant bounds may disagree*, which that sibling now pins, and
+// *the element type below the spine is identity-compared*, which
+// `PtrToVlaRowDifferentElementTypeStillRejects` pins. Both survived this inversion; only
+// the VLA-vs-constant straddle moved.
+// RED-ON-DISABLE: remove `vlaCompatibleArrayTypes` from the decay arm and this reds.
+TEST(SemanticAnalyzerC, PtrToVlaFixedPointeeFromVlaObjectAccepts) {
     auto model = analyzeShipped("c", {
         "int main(void) {\n"
         "  volatile int vn = 4;\n"
         "  int n = vn;\n"
         "  int b[2][n];\n"
-        "  int (*p)[5] = b;\n"   // MISMATCH: rows int[5] != int[n]
-        "  return 0;\n"
+        "  int (*p)[5] = b;\n"   // int[5] vs int[n] — compatible, `n` is not an ICE
+        "  return p[0][0];\n"
         "}\n",
     });
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << "a fixed-pointee ptr initialized from a VLA object with a different row length "
-           "must reject with S_TypeMismatch (the decay compare stays exact)";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "`int (*p)[5] = b;` where b is `int[2][n]` is VALID C (6.7.6.2p6 — only two ICE "
+           "bounds must agree) and both references compile and run it silently";
 }
 
 // VLA C4a-local (D-CSUBSET-VLA): the ptr-to-VLA init-form work
@@ -12975,6 +12983,78 @@ TEST(SemanticAnalyzerC, VlaTypedefObjectAcceptsAndRecordsOrigin) {
         << "the recorded origin is the typedef R";
     EXPECT_EQ(model.symbols()[aRec->vlaTypedefOrigin.v].kind, DeclarationKind::Type)
         << "the recorded origin is a typedef (DeclarationKind::Type)";
+}
+
+// D-CSUBSET-VLA-TYPEDEF-CHAINED ✅ CLOSED: a CHAINED VLA typedef (`typedef int R[n];
+// typedef R S; typedef S T;`) now RESOLVES, and the whole mechanism is one generalized
+// invariant on `vlaTypedefOrigin`: it names the typedef that OWNS A CAPTURED BOUND, never
+// merely the alias name a declaration spells.
+//
+// The stamp used to be gated to `DeclarationKind::Variable` — the comment there said a
+// chained alias "needs no origin flag" because HIR discriminates it by suffix presence.
+// That discrimination was real; what it discriminated INTO was a fail-loud, because S then
+// had no way to say WHICH typedef froze its size. Lifting the gate for the pure `typedef R
+// S;` shape AND resolving TRANSITIVELY (S→R at S's own declaration, so each later link
+// resolves in ONE hop) means an arbitrarily long chain lands every object on R — and the
+// C4b copy-down that a direct `R a;` already used carries it with NO change below the
+// semantic tier.
+//
+// THE THREE ASSERTIONS THAT MATTER, and none of them is "it compiles":
+//   1. S→R, not S→S: a self-referential or one-short stamp would look valid and freeze
+//      nothing.
+//   2. T→R, not T→S: this is the whole transitivity claim, and it is the one an
+//      implementation that walked only one link would fail.
+//   3. the OBJECT →R: what HIR actually reads.
+// ✔MEASURED 2026-09-03: gcc 13.3.0 and clang 18.1.3 both compile and RUN this shape and the
+// three-deep form (`n` mutated between the typedef and the objects, sizes unmoved); MSVC
+// ABSTAINS — no C99 VLA at all. Runtime witness: examples/c/c99_vla_typedef_chained.
+// RED-ON-DISABLE: restore the `kind == DeclarationKind::Variable` gate and S/T carry no
+// origin (assertions 1 and 2 red); keep the gate lifted but drop the one-hop resolution and
+// assertion 2 alone reds — the two halves fail SEPARATELY, which is what makes this
+// diagnostic instead of merely red.
+TEST(SemanticAnalyzerC, ChainedVlaTypedefResolvesOriginTransitively) {
+    auto model = analyzeShipped("c", {
+        "int main(void) {\n"
+        "  volatile int vn = 3;\n"
+        "  int n = vn;\n"
+        "  typedef int R[n];\n"
+        "  typedef R S;\n"
+        "  typedef S T;\n"
+        "  n = 100;\n"
+        "  T c;\n"
+        "  c[0] = 1;\n"
+        "  return c[0];\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a chained VLA typedef must analyze clean — the alias inherits R's frozen size";
+    SymbolRecord const* rRec = findSym(model, "R");
+    SymbolRecord const* sRec = findSym(model, "S");
+    SymbolRecord const* tRec = findSym(model, "T");
+    SymbolRecord const* cRec = findSym(model, "c");
+    ASSERT_NE(rRec, nullptr);
+    ASSERT_NE(sRec, nullptr);
+    ASSERT_NE(tRec, nullptr);
+    ASSERT_NE(cRec, nullptr);
+
+    // R is the ORIGIN: it captured its own `[n]`, so it carries no origin of its own.
+    EXPECT_FALSE(rRec->vlaTypedefOrigin.valid())
+        << "R owns its `[n]` — it must NOT be given an origin, or the freeze would chase "
+           "its own tail";
+
+    auto originName = [&](SymbolRecord const* rec) -> std::string {
+        if (rec == nullptr || !rec->vlaTypedefOrigin.valid()) return "<none>";
+        if (rec->vlaTypedefOrigin.v >= model.symbols().size()) return "<out-of-range>";
+        return model.symbols()[rec->vlaTypedefOrigin.v].name;
+    };
+    EXPECT_EQ(originName(sRec), "R")
+        << "(1) the FIRST chained alias resolves to R, the typedef that owns a bound";
+    EXPECT_EQ(originName(tRec), "R")
+        << "(2) TRANSITIVITY: the SECOND link must resolve past S to R — an origin of "
+           "\"S\" would point at a symbol with no captured bound at all";
+    EXPECT_EQ(originName(cRec), "R")
+        << "(3) the OBJECT resolves to R — this is the value HIR reads to copy the "
+           "decl-frozen slots down";
 }
 
 // VLA C4a-param (D-CSUBSET-VLA): a PARAMETER pointer-to-VLA `int (*p)[n]` (n a sibling
@@ -13078,13 +13158,18 @@ TEST(SemanticAnalyzerC, StructFieldVlaSoleMemberStillFailsLoud) {
            "routes through the FAM incompleteArray path -> S_FlexibleArraySoleMember";
 }
 
-// VLA C4a-param (D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT, deferred): a FIXED arg `int b[2][2]`
-// decays to `ptr(array(int,2))`, which is DISTINCT from the param's `ptr(vlaArray)` — the
-// DSS -2 VLA sentinel is STRICTER than C's runtime VLA/fixed pointer compatibility — so it
-// rejects with S_TypeMismatch (a fail-loud reject of valid-C, NEVER a miscompile). This
-// pins that the accept is scoped to a genuinely VLA-shaped arg. RED-ON-DISABLE: a broadened
-// decay compare that ignored the element length would silently accept this mismatch.
-TEST(SemanticAnalyzerC, ParamPtrToVlaFixedArgRejects) {
+// VLA C4a-param (D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT ✅ CLOSED): a FIXED arg
+// `int b[2][2]` decays to `ptr(array(int,2))`, which is a DISTINCT interned type from the
+// param's `ptr(vlaArray)` because of the `-2` VLA sentinel — but C 6.7.6.2p6 makes the two
+// array types COMPATIBLE, since a VLA's size specifier is not an integer constant
+// expression and only BOTH-ICE bounds are required to agree. The old assertion here was the
+// exact inverse of this one and it pinned a REFUSAL OF VALID C.
+// ✔MEASURED 2026-09-03: gcc 13.3.0 and clang 18.1.3 compile and RUN this program at both
+// `-std=c17` and `-std=c2x` with `-Wall -Wextra -pedantic` silent; MSVC ABSTAINS (no C99
+// VLA at all — `error C2057` on the bound). Runtime witness: examples/c/
+// c99_vla_fixed_array_arg. RED-ON-DISABLE: remove the `vlaCompatibleArrayTypes` call from
+// `isAssignable`'s array-to-pointer decay arm and S_TypeMismatch returns.
+TEST(SemanticAnalyzerC, ParamPtrToVlaFixedArgAccepts) {
     auto model = analyzeShipped("c", {
         "int f(int n, int (*p)[n]) { return p[1][0]; }\n"
         "int main(void) {\n"
@@ -13092,9 +13177,78 @@ TEST(SemanticAnalyzerC, ParamPtrToVlaFixedArgRejects) {
         "  return f(2, b);\n"
         "}\n",
     });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "a FIXED `int b[2][2]` arg decays to `int (*)[2]`, which C 6.7.6.2p6 makes "
+           "COMPATIBLE with the param's `int (*)[n]` (the VLA bound is not an ICE)";
+    EXPECT_FALSE(model.hasErrors())
+        << "the fixed-array-argument program analyzes clean";
+}
+
+// D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT ✅ — THE OTHER TWO SHAPES, which the row named none
+// of. The same C 6.7.6.2p6 compatibility question reaches `isAssignable` at a Ptr/Ptr pair
+// once the array has already decayed, and DSS refused BOTH directions there too
+// (✔MEASURED at fcb3a9d7: two S_TypeMismatch for the two assignments below, while gcc
+// 13.3.0 and clang 18.1.3 compiled and RAN the same program). RED-ON-DISABLE: remove the
+// `vlaCompatibleArrayTypes` call from the Ptr/Ptr arm and both reappear.
+TEST(SemanticAnalyzerC, PtrToVlaRowAndFixedRowAssignInBothDirections) {
+    auto model = analyzeShipped("c", {
+        "int main(void) {\n"
+        "  volatile int vn = 2;\n"
+        "  int n = vn;\n"
+        "  int b[2][2];\n"
+        "  int (*q)[2] = b;\n"
+        "  int (*p)[n];\n"
+        "  p = q;\n"                    // fixed row -> VLA row
+        "  int (*r)[2];\n"
+        "  r = p;\n"                    // VLA row -> fixed row (the REVERSE)
+        "  return r[0][0];\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "`p = q` and `r = p` are both C 6.7.6.2p6-compatible pointer assignments — a "
+           "VLA row and a constant row differ in no ICE bound";
+    EXPECT_FALSE(model.hasErrors())
+        << "the two-direction ptr-row assignment program analyzes clean";
+}
+
+// D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT ✅ — THE BOUNDARY, and it is what keeps the fix a
+// NARROWING rather than a hole. C 6.7.6.2p6's condition is *if both size specifiers are
+// present AND are integer constant expressions, they shall have the same constant value* —
+// so TWO DIFFERENT CONSTANTS stay incompatible even though a VLA bound may straddle. gcc
+// and clang DIAGNOSE this one (`-Wincompatible-pointer-types`) where they say nothing at
+// all about the three admitted shapes (✔MEASURED 2026-09-03), so the diagnostic boundary is
+// the references' own. RED-ON-DISABLE: weaken `vlaCompatibleArrayTypes` to ignore lengths
+// (rather than to admit a sentinel level) and this stops firing.
+TEST(SemanticAnalyzerC, PtrToVlaFixedRowDifferentConstantsStillRejects) {
+    auto model = analyzeShipped("c", {
+        "int main(void) {\n"
+        "  int b[2][2];\n"
+        "  int (*p)[3] = b;\n"          // int[3] vs int[2] — BOTH ICEs, and they differ
+        "  return p[0][0];\n"
+        "}\n",
+    });
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << "a FIXED `int b[2][2]` arg (ptr(array(int,2))) is DISTINCT from the param's "
-           "ptr(vlaArray) -> S_TypeMismatch (D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT deferral)";
+        << "two DIFFERENT integer-constant array bounds stay INCOMPATIBLE (C 6.7.6.2p6) — "
+           "the VLA relaxation admits a sentinel level, never a constant disagreement";
+}
+
+// D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT ✅ — the ELEMENT type below the spine is still
+// strict. A `float (*)[n]` may not take an `int[2][2]`: the bounds straddle but the element
+// types differ, and `vlaCompatibleArrayTypes` compares the non-array base by interner
+// IDENTITY. RED-ON-DISABLE: return `true` from the helper's non-array arm and this stops
+// firing while every other pin here stays green — which is exactly the shape of laundering
+// this test exists to catch.
+TEST(SemanticAnalyzerC, PtrToVlaRowDifferentElementTypeStillRejects) {
+    auto model = analyzeShipped("c", {
+        "int f(int n, float (*p)[n]) { return (int)p[0][0]; }\n"
+        "int main(void) {\n"
+        "  int b[2][2];\n"
+        "  return f(2, b);\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "a `float (*)[n]` parameter must still REJECT an `int[2][2]` argument — the "
+           "bounds straddle but the ELEMENT types are compared by identity";
 }
 
 // ── VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): array-PARAMETER `static` / cv-qualifier
@@ -13150,8 +13304,15 @@ TEST(SemanticAnalyzerC, ArrayParamDecorationsAllDecayClean) {
 // param as a plain `int`), fails to parse `[*]`, or fails to gate the non-param form flips this.
 TEST(SemanticAnalyzerC, ArrayParamStarFormDecaysCleanNonParamFailsLoud) {
     // PARAMETER `int a[*]` — decays to a bare pointer, compiles clean.
+    // ⚠ RE-SPELLED P57: this arm used to put `[*]` on the DEFINITION
+    // (`int f(int a[*]) { … }`), which C 6.7.6.3p12 forbids and which gcc 13.3.0 and
+    // clang 18.1.3 both REFUSE (✔MEASURED 2026-09-03, each probed separately). The
+    // pin's SUBJECT is the DECAY, not the placement, so it now uses the legal spelling
+    // — the prototype carries `[*]`, the definition spells a bound — and
+    // `ArrayParamStarInFunctionDefinitionFailsLoud` owns the placement question.
     auto param = analyzeShipped("c", {
-        "int f(int a[*]) { return a[0]; }\n"
+        "int f(int a[*]);\n"
+        "int f(int a[1]) { return a[0]; }\n"
         "int main(void) { int x[1]; x[0] = 7; return f(x); }\n",
     });
     EXPECT_FALSE(param.hasErrors())
@@ -13168,6 +13329,185 @@ TEST(SemanticAnalyzerC, ArrayParamStarFormDecaysCleanNonParamFailsLoud) {
                         DiagnosticCode::S_ArrayParamQualifierNonParameter))
         << "a `[*]` on a NON-parameter (local) is a constraint violation -> 0xE054, "
            "never silently accepted with the `*` dropped";
+}
+
+// ── D-CSUBSET-VLA-PARAM-STAR, REOPENED AND RECLOSED IN P57 (C 6.7.6.3p12) ───────
+// `[*]` on a parameter of a function DEFINITION. The row closed in P56 having taught
+// DSS to PARSE and decay `[*]`; what it never checked was WHERE C allows it. C
+// 6.7.6.3p12 permits `[*]` only when the function declarator is not part of a definition
+// of that function (C 6.7.6.2p4 spells it "function prototype scope"), because a
+// definition's parameters have BLOCK scope (C 6.2.1p4) and the body needs the bound the
+// `*` withholds.
+//
+// ✔MEASURED 2026-09-03, each reference probed SEPARATELY, all shapes compiled and (where
+// accepted) RUN:
+//   gcc 13.3.0  — "'[*]' not allowed in other than function prototype scope"   REFUSES
+//   clang 18.1.3— "variable length array must be bound in function definition"  REFUSES
+//   MSVC 19.51  — `C2059: syntax error: ']'` at every /std:                     ABSTAINS
+// DSS accepted AND RAN all three reachable spellings before this (named exit 1, abstract
+// exit 3, outer-dim exit 9) — ABOVE the union, which the bar treats as a defect exactly
+// as it treats being below it. Not a miscompile: a `[*]` parameter decays to the same
+// `Ptr<element>` a bare `[]` does, which is why the new code is SUPPRESSABLE.
+//
+// RED-ON-DISABLE: delete the `paramStarSuffixesOfOwnParamList` loop from the C 6.9.1
+// definition-constraint block in semantic_analyzer.cpp and all three arms below red
+// while the two LEGAL controls stay green.
+TEST(SemanticAnalyzerC, ArrayParamStarInFunctionDefinitionFailsLoud) {
+    // (a) the NAMED spelling — the shape found in passing during P57.
+    auto named = analyzeShipped("c", {
+        "int f(int n, int a[*]) { return a[0]; }\n"
+        "int main(void) { int v[2]; v[0] = 1; return f(2, v); }\n",
+    });
+    EXPECT_EQ(countCode(named.diagnostics(),
+                        DiagnosticCode::S_ArrayParamStarInFunctionDefinition), 1u)
+        << "`int f(int n, int a[*]) { … }` is a C 6.7.6.3p12 constraint violation — "
+           "gcc and clang both refuse it and DSS compiled and RAN it";
+
+    // (b) the ABSTRACT spelling — reachable only since P57 taught the unnamed form to
+    // parse (D-CSUBSET-VLA-PARAM-STAR-ABSTRACT), so widening that gate without this
+    // check would have widened the acceptance too.
+    auto abstractForm = analyzeShipped("c", {
+        "int f(int, int[*]) { return 3; }\n"
+        "int main(void) { int v[2]; return f(2, v); }\n",
+    });
+    EXPECT_EQ(countCode(abstractForm.diagnostics(),
+                        DiagnosticCode::S_ArrayParamStarInFunctionDefinition), 1u)
+        << "the UNNAMED abstract `int[*]` in a definition is the same constraint "
+           "violation — the check must not key on the parameter having a name";
+
+    // (c) the OUTER dimension of a multi-dim parameter, `int a[*][3]`.
+    auto outerDim = analyzeShipped("c", {
+        "int f(int a[*][3]) { return a[1][2]; }\n"
+        "int main(void) { int v[2][3]; v[1][2] = 9; return f(v); }\n",
+    });
+    EXPECT_EQ(countCode(outerDim.diagnostics(),
+                        DiagnosticCode::S_ArrayParamStarInFunctionDefinition), 1u)
+        << "the OUTER `[*]` of `int a[*][3]` in a definition is the same violation — "
+           "the walk must reach a suffix that is not the declarator's last";
+}
+
+// D-CSUBSET-VLA-PARAM-STAR ✅ — THE LEGAL FORM MUST SURVIVE. `[*]` in a PROTOTYPE whose
+// definition spells a real bound is the construct's entire purpose, and it is what
+// `examples/c/c99_vla_param_star_abstract` runs on four legs. RED-ON-DISABLE: report the
+// violation from the declarator-suffix arm (where there is no definition signal) instead
+// of the C 6.9.1 block and this reds immediately — which is precisely why the check lives
+// where it does.
+TEST(SemanticAnalyzerC, ArrayParamStarInAPrototypeStaysLegal) {
+    auto model = analyzeShipped("c", {
+        "int f(int n, int a[*]);\n"
+        "int f(int n, int a[n]) { return a[n - 1]; }\n"
+        "int main(void) { int v[3]; v[0]=7; v[1]=8; v[2]=9; return f(3, v); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayParamStarInFunctionDefinition), 0u)
+        << "`[*]` in a PROTOTYPE is exactly what C 6.7.6.3p12 permits — the definition "
+           "beside it spells the real bound and must not be blamed for the prototype";
+    EXPECT_FALSE(model.hasErrors())
+        << "the prototype-plus-definition program analyzes clean";
+}
+
+// ★★ D-CSUBSET-VLA-PARAM-STAR ✅ — THE BOUNDARY, AND IT IS THE HALF A SUBTREE SCAN GETS
+// WRONG. A `[*]` inside a NESTED declarator's OWN prototype is legal even when the
+// enclosing function is a DEFINITION, because that inner declarator is not part of a
+// definition of anything: `int f(int (*g)(int, int[*])) { … }`.
+// ✔MEASURED 2026-09-03: gcc 13.3.0 and clang 18.1.3 BOTH compile and RUN this program
+// (exit 42) — so a naive "scan the definition's declarator subtree for arrayStarSuffix"
+// would have traded one divergence for another, refusing valid C in the very cycle that
+// fixed DSS for being too permissive. `paramStarSuffixesOfOwnParamList` stops descending
+// at any nested function suffix (`isFnSuffixRule`), which is the ONE line that makes this
+// pass. RED-ON-DISABLE: delete that `continue` and this test reds while the three
+// violation arms above stay green — the two failures are disjoint, which is what makes
+// this pin diagnostic rather than merely red.
+TEST(SemanticAnalyzerC, AbstractStarInNestedPrototypeInsideDefinitionStaysLegal) {
+    auto model = analyzeShipped("c", {
+        "static int cb(int n, int a[n]) { return a[0]; }\n"
+        "int f(int (*g)(int, int[*])) { int v[2]; v[0] = 5; return g(2, v); }\n"
+        "int main(void) { return f(cb) == 5 ? 42 : 1; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayParamStarInFunctionDefinition), 0u)
+        << "a `[*]` in a NESTED function-pointer parameter's own prototype is LEGAL "
+           "inside a definition — both references compile AND run it";
+    EXPECT_FALSE(model.hasErrors())
+        << "the nested-prototype program analyzes clean";
+}
+
+// D-CSUBSET-VLA-PARAM-STAR-ABSTRACT ✅ CLOSED: the UNNAMED ABSTRACT `[*]` — `int f(int,
+// int [*]);` — parses and decays exactly like the named form beside it.
+//
+// ★ THE ROW NAMED THE WRONG RULE, and the measurement is the deliverable. It said
+// `abstractDirectDeclarator`'s non-speculative suffix repeat was the blocker and that
+// making it speculative would disturb the cast-vs-value type-name triage. ✔MEASURED: an
+// unnamed abstract PARAMETER never reaches `abstractDirectDeclarator` at all — the shipped
+// `param` rule is `head + {optional declarator}`, so `int [*]` routes through
+// `directDeclarator`, whose BASE alt (where a leading `[` lands when there is no name) did
+// not list `arrayStarSuffix` while that rule's own `$comment` asserted it did. The NAMED
+// form always worked because a name puts the suffix in the REPEAT, which already listed it.
+// The fix adds the rule to the base alt, which was ALREADY speculative — no speculation was
+// introduced anywhere and `abstractDirectDeclarator` is untouched.
+// ✔MEASURED 2026-09-03: gcc 13.3.0 and clang 18.1.3 both compile and RUN the abstract form
+// (each warns about the bound mismatch and neither refuses); MSVC ABSTAINS twice over
+// (`C2059: syntax error: ']'` on `[*]`, `C2057` on every VLA bound). Runtime witness:
+// examples/c/c99_vla_param_star_abstract. RED-ON-DISABLE: remove `arrayStarSuffix` from
+// `directDeclarator`'s base alt in c.lang.json and the abstract arm reds with
+// P_BacktrackFailed while the NAMED control below stays green — which is what makes this
+// pin diagnostic rather than merely red.
+TEST(SemanticAnalyzerC, AbstractUnnamedStarArrayParamParsesAndDecays) {
+    auto abstractForm = analyzeShipped("c", {
+        "int f(int, int [*]);\n"                 // ABSTRACT + UNNAMED — the row's subject
+        "int f(int n, int a[n]) { return a[n - 1]; }\n"
+        "int main(void) { int v[3]; v[0]=7; v[1]=8; v[2]=9; return f(3, v); }\n",
+    });
+    EXPECT_EQ(countCode(abstractForm.diagnostics(),
+                        DiagnosticCode::P_BacktrackFailed), 0u)
+        << "an UNNAMED abstract `int [*]` parameter must PARSE — it lands on "
+           "directDeclarator's BASE alt, which now lists arrayStarSuffix";
+    EXPECT_FALSE(abstractForm.hasErrors())
+        << "the abstract `[*]` prototype + its bound-spelling definition analyze clean";
+
+    // The NAMED form in the SAME position is the control: it reached the suffix REPEAT and
+    // worked before this change, so a red here would mean the repeat regressed instead.
+    auto namedForm = analyzeShipped("c", {
+        "int g(int n, int a[*]);\n"
+        "int g(int n, int a[n]) { return a[0]; }\n"
+        "int main(void) { int v[3]; v[0]=7; return g(3, v); }\n",
+    });
+    EXPECT_FALSE(namedForm.hasErrors())
+        << "the NAMED `[*]` control must stay clean";
+}
+
+// D-CSUBSET-VLA-PARAM-STAR-ABSTRACT ✅ — THE ROLLBACK the new base-alt candidate must not
+// eat. `arrayStarSuffix` is the fixed 3-token `[ * ]` and sits BEFORE `arrayDeclSuffix` in
+// an ALREADY-speculative alt, so an abstract bound that is NOT a lone star has to probe it,
+// FAIL, and roll back cleanly: a constant `int [3]`, and the deref-sized C99 VLA bound
+// `int [*p]` whose `*p` is an EXPRESSION and not the star-modifier at all. RED-ON-DISABLE:
+// order `arrayStarSuffix` AFTER `arrayDeclSuffix`, or drop the base alt's `speculative`,
+// and one of these two reds while the star pin above stays green.
+TEST(SemanticAnalyzerC, AbstractArrayParamBoundsStillRollBackPastTheStarSuffix) {
+    auto constantBound = analyzeShipped("c", {
+        "int f(int, int [3]);\n"
+        "int f(int n, int a[3]) { return a[n]; }\n"
+        "int main(void) { int v[3]; v[1] = 5; return f(1, v); }\n",
+    });
+    EXPECT_EQ(countCode(constantBound.diagnostics(),
+                        DiagnosticCode::P_BacktrackFailed), 0u)
+        << "an abstract CONSTANT bound `int [3]` must roll back past arrayStarSuffix to "
+           "arrayDeclSuffix";
+    EXPECT_FALSE(constantBound.hasErrors())
+        << "the abstract constant-bound prototype analyzes clean";
+
+    // `int a[*p]` — the bound is the EXPRESSION `*p`, which begins with the same `*` the
+    // star-modifier does and is exactly where a greedy `[ * ]` probe would mis-commit.
+    auto derefBound = analyzeShipped("c", {
+        "int f(int *p, int a[*p]) { return a[0]; }\n"
+        "int main(void) { int n = 1; int v[3]; v[0] = 4; return f(&n, v); }\n",
+    });
+    EXPECT_EQ(countCode(derefBound.diagnostics(),
+                        DiagnosticCode::P_BacktrackFailed), 0u)
+        << "the deref-sized VLA bound `int a[*p]` must still parse as an EXPRESSION bound "
+           "— the star-modifier rule is a fixed 3-token `[ * ]` and must not swallow it";
+    EXPECT_FALSE(derefBound.hasErrors())
+        << "the deref-sized-bound program analyzes clean";
 }
 
 // A `[static N]` on a NON-parameter (a LOCAL) is a constraint violation — these decorations
@@ -13259,21 +13599,36 @@ TEST(SemanticAnalyzerC, DerefSizedVlaStillCompiles) {
 // argument is a distinct interned type → `S_TypeMismatch` (S0003) fail-loud (NEVER a wrong/zero
 // row stride). RED-ON-DISABLE: an inner `[*]` silently accepted with a bogus stride would flip
 // the arg-compat reject.
+// ⚠ RE-SPELLED P57 for the same reason as its sibling above: BOTH arms used to put `[*]`
+// on a function DEFINITION, which C 6.7.6.3p12 forbids and which gcc 13.3.0 and clang
+// 18.1.3 both REFUSE (✔MEASURED 2026-09-03 on `int f(int a[*][3]) { … }`, each reference
+// probed separately). This pin's subject is the multi-dim DECAY and the inner-star
+// mismatch, neither of which is about placement, so both arms move to the legal
+// prototype spelling; `ArrayParamStarInFunctionDefinitionFailsLoud` owns placement.
 TEST(SemanticAnalyzerC, ArrayStarOuterDecaysInnerStarFailsLoud) {
     auto outer = analyzeShipped("c", {
-        "int f(int a[*][3]) { return a[1][2]; }\n"
+        "int f(int a[*][3]);\n"
+        "int f(int a[2][3]) { return a[1][2]; }\n"
         "int main(void) { return 0; }\n",
     });
     EXPECT_FALSE(outer.hasErrors())
         << "`int a[*][3]` = an outer star-modifier + fixed inner: decays to `int(*)[3]` "
            "(a fixed inner stride), accepted exactly like `int a[][3]`";
     auto inner = analyzeShipped("c", {
-        "int f(int n, int a[n][*]) { return a[0][0]; }\n"
+        "int f(int n, int a[n][*]);\n"
+        "int f(int n, int a[n][3]) { return a[0][0]; }\n"
         "int main(void) { int x[2][3] = {{1,0,0},{0,0,0}}; return f(2, x); }\n",
     });
     EXPECT_TRUE(inner.hasErrors())
         << "an INNER `[*]` (`int a[n][*]`) → ptr-to-unspecified-array: a fixed-array arg is a "
            "distinct interned type → S_TypeMismatch fail-loud, NEVER a silent stride";
+    // ... and it must NOT be the PLACEMENT code doing the failing — the inner-star
+    // mismatch is a TYPE question and stays one. Without this the arm would keep passing
+    // for the wrong reason the moment the placement check over-fired.
+    EXPECT_EQ(countCode(inner.diagnostics(),
+                        DiagnosticCode::S_ArrayParamStarInFunctionDefinition), 0u)
+        << "the inner-`[*]` arm must fail on the TYPE mismatch, not on placement — the "
+           "`[*]` here is in a prototype, exactly where C 6.7.6.3p12 allows it";
 }
 
 // VLA C4c (D-CSUBSET-VLA, audit IMPORTANT 3): a multi-dim VLA parameter whose INNER dim

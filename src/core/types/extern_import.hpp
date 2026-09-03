@@ -107,14 +107,26 @@ struct DSS_EXPORT ExternImport {
     // Meaningless (stays empty) on formats that carry no symbol versioning
     // (PE/Mach-O ignore it). Rides the LK11 merge's whole-row copy for free.
     std::string   version;
-    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ an EAGER import — a shipped-
-    // library descriptor symbol (a `#include`d library export) DSS binds even
-    // when UNREFERENCED (the D-FFI-DESCRIPTOR-EAGER-IMPORT invariant). The
-    // linker's reference gate (`rejectOrDropUnreferencedExterns`) KEEPS an eager
-    // row unconditionally; a NON-eager import (a source `extern` decl / bare-
-    // proto synthesis) survives ONLY when a relocation references it — gcc's
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ an EAGER import — one DSS binds
+    // even when UNREFERENCED. The linker's reference gate
+    // (`rejectOrDropUnreferencedExterns`) KEEPS an eager row unconditionally; a
+    // NON-eager import survives ONLY when a relocation references it — gcc's
     // "an unused extern declaration emits no import" rule, now uniform across
-    // library-bound AND no-library rows. Set at HIR→MIR from
+    // library-bound AND no-library rows.
+    //
+    // ⚠ THIS COMMENT NAMED A `#include`d DESCRIPTOR SYMBOL AS *THE* EAGER CASE
+    // UNTIL 2026-09-03, AND THAT IS NOW EXACTLY BACKWARDS.
+    // [[D-FFI-DESCRIPTOR-EAGER-IMPORT]] closed by flipping
+    // `ShippedExternSymbol::eagerImport` to FALSE by default, so an ordinary
+    // `#include <stdio.h>` symbol is now the commonest NON-eager row. ✔The
+    // measurement that forced it: C23 7.1.4p2 entitles a program to hand-declare
+    // a library function instead of including its header and calls the two
+    // EQUIVALENT — yet the hand-declared spelling imported 3 symbols where the
+    // `#include` spelling imported 86, and the LOADER sees the difference. The
+    // flag survives because a descriptor row may still opt IN per symbol
+    // (`shippedSourcePath` rows, the UCRT shim-core companions), which is what
+    // it was always for.
+    // Set at HIR→MIR from
     // `FfiMetadata.isEagerImport`; rides the MIR merge's whole-row copy, and the
     // merge OR-COMBINES it when it collapses two rows — an eager `#include`d
     // symbol plus a hand-written non-eager `extern` yields an EAGER surviving

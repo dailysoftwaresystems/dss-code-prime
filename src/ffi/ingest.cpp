@@ -635,9 +635,11 @@ ingest(std::span<IngestionSource const> sources,
             }
         }
         // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker (parity
-        // with the FF5 source-decl path). Eager imports flow through
-        // `synthesizeFfiFromSourceDecls`, not this binary-reader path — but an
-        // eager ExternDeclRef routed here must not silently drop the field.
+        // with the FF5 source-decl path). No producer reaching this stage sets it
+        // today ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]] retired the one that did), but
+        // this is a CONDUIT: dropping a caller's stated value here would be a
+        // stage silently overriding its input, which is how a bit goes missing one
+        // layer below where it was set.
         meta.isEagerImport = ext.isEagerImport;
         // The raw OBSERVED embedded soname of the binary that was READ.
         // Populated now that the FF1 readers extract it; `ExternImport` carries
@@ -790,9 +792,11 @@ synthesizeFfiFromSourceDecls(
         // reader. Rides to the MIR ExternImport → the ELF writer's
         // .gnu.version_r. Empty (the default) ⇒ unversioned.
         meta.version = std::string{ext.version};
-        // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker (producer
-        // C shipped-descriptor imports) to the MIR ExternImport → the linker's
-        // reference gate, which keeps an eager row even when unreferenced.
+        // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker verbatim to
+        // the MIR ExternImport → the linker's reference gate, which keeps an eager
+        // row even when unreferenced. Shipped-descriptor rows (producer C) stopped
+        // setting it in P57 ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]); this stage still
+        // carries whatever its caller declared and decides nothing.
         meta.isEagerImport = ext.isEagerImport;
         // `soname` left empty — same convention as `ingest()`.
 

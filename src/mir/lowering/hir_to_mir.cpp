@@ -14082,7 +14082,8 @@ struct Lowerer {
 
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): pre-pass — SEED `functionSymbols` with
     // every pe64 <threads.h> shim symbol (mtx_lock etc.). CST→HIR SKIPPED these from
-    // extern-import synthesis (kernel32 exports no such name — the eager-import law), so
+    // extern-import synthesis because kernel32 exports no such name — importing one
+    // would name a symbol the DLL does not have — so
     // `collectExterns` never registers them; without this seed the user's
     // `mtx_lock(&m)` call would fail loud "HIR Ref to unbound symbol" at the Ref
     // lowering BEFORE the synth pass runs. Seeding routes the call through the ordinary

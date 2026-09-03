@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-03 — cycles **P14 … P56**. ⚠ P52 rewrote no handoff at all, so a reader
+**Last updated:** 2026-09-03 — cycles **P14 … P57**. ⚠ P52 rewrote no handoff at all, so a reader
 who opened this file during P53 saw P51 described as current state; that entry in §5 was written
 retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as
 history there.
@@ -17,6 +17,162 @@ history there.
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
+
+**Cycle P57 closed 2026-09-03.** Four lanes plus the orchestrator, on top of P56 (`fcb3a9d7`).
+✔**REAL: 9 rows closed, 0 opened.** ✔**COUNTED by `check-anchor-balance --base fcb3a9d7`: 6 closed,
+0 opened, net −6.** The three the gate cannot see are `D-CSUBSET-VLA-PARAM-STAR` (reopened and
+reclosed inside the cycle, so its name never left the archive) plus two born-closed records —
+`D-CYCLE-LANE-WORKTREE-ADD-INHERITS-A-PREVIOUS-CYCLES-SEED-MANIFEST` and
+`D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC`.
+
+★★★ **THE THROUGH-LINE: EVERY LANE REFUTED SOMETHING, AND THREE OF THE REFUTATIONS WERE ABOUT
+EVIDENCE THAT HAD LOOKED GOOD FOR CYCLES.** P56's lesson was *every record was right and nobody
+re-read it*. P57's is the harder one: **a green witness is not a true witness.**
+
+1. ⚠⚠ **A RUNNABLE CORPUS EXAMPLE WAS AN ILL-FORMED PROGRAM, AND SO WERE TWO PINS.**
+   `examples/c/c99_array_param_static` shipped `int gstar(int a[*]) { … }` as the runtime proof for
+   `D-CSUBSET-VLA-PARAM-STAR`. **Neither gcc nor clang compiles it** — C 6.7.6.3p12 forbids `[*]`
+   in a function DEFINITION. It stayed green for three cycles because **DSS was the only compiler
+   that accepted it**. ⇒ **A runnable witness proves the feature RUNS; it never proves the program
+   is LEGAL.** When a corpus example is the evidence for a conformance row, compile it with a
+   reference too — the reference is the oracle, the exit code is not.
+2. ⚠ **AN INSTRUMENT NEARLY MANUFACTURED A 207-ROW DEFECT — MINE.** Lane `ei` found
+   `D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC` cited 20 times in `src/` with no row anywhere, and I
+   began filing a harness anchor accusing `check-anchor-registry` of resolving too loosely (it
+   resolves with `grep -qrF -- "<id>" .plans/`, so it proves an id is MENTIONED, not that it owns
+   a row). ✔THE CENSUS REFUTED THE ROW BEFORE IT WAS WRITTEN: 1,511 cited ids, 2,160 anchor cells,
+   **207 cited ids own no cell** — and every one sampled (`D-ML7-2` at 26 sites, `D-LK6-8` at 15,
+   `D-CSUBSET-WHILE-LOOP-SUBSTRATE` at 17) is a **CLOSED PLAN-STEP id living in plan prose**, not a
+   deferral. Demanding a six-cell registry row for those is the wrong artifact for the wrong
+   ecology, and that guard's own header measures that narrowing the resolver strands dozens of
+   legitimate wrapped and parent-name citations. **The gap was bookkeeping — one design that
+   shipped without its row.** ⇒ `anchors.read_rows` reads the three REGISTRIES; reporting that
+   scoped result as *"has no row anywhere"* is the scoped-instrument-unscoped-claim error again,
+   this time from the party that enforces it.
+3. ⚠⚠ **I APPLIED AN UNCOMPILED PATCH TO THE MAIN TREE AFTER BEING TOLD IN WRITING IT WAS
+   UNCOMPILED.** Lane `vl` handed over a replacement block for `tests/mir/test_mir_lowering_c.cpp`
+   (outside its grant) and said the hunk had not been compiled in that lane, naming the sibling to
+   copy accessors from. I applied it verbatim: `L.mir->entryBlock(L.mainFn)` is a hard error —
+   `L.mir` is a `HirToMirResult` by value with no `mainFn`. ⇒ **"I did not compile this" is a fact
+   about the patch, not a politeness.** A handed-over hunk gets compiled before it lands, by
+   whoever lands it.
+4. ★ **A HARNESS DEFECT WITH A SILENT FAILURE MODE, FOUND BECAUSE IT MADE A NOISY ONE FIRST.**
+   `lane-worktree.sh add` created all four worktrees and left each pointing at **another cycle's
+   seed manifest** — the file is keyed by lane name alone and two-letter names get reused
+   constantly. `seed-ld.json` held 82 entries from Sep 1–2, 37 disagreeing with the tree. The
+   visible symptom was a FALSE drift refusal; the invisible one is the reverse — a stale entry that
+   happens to equal a lane's own file marks real work as untouched seed and **the fold silently
+   drops it**. Fixed at `add` (manifest reset to `{}`), proved with a poisoned manifest.
+   ⇒ **A hazard in a SEAM is invisible to both sides' self-tests**: `lane-fold` tests that it reads
+   a manifest, `lane-worktree` tests that it makes a worktree, and both were green while the pair
+   was broken. Ask which script owns a shared file's LIFECYCLE; *"neither, by construction"* is the
+   defect.
+
+## §0.1 — The four gate legs, ✔MEASURED at the folded tree, every leg through `scripts/run-gate/`
+
+| leg | result | time |
+|---|---|---|
+| Windows x86_64 | **2025 / 2025** | 533.18 s |
+| Linux x86_64 (WSL2) | **2025 / 2025** | 414.02 s |
+| macOS arm64 (Apple Silicon) | **2001 / 2001** | 911.99 s |
+| Linux arm64 (native VPS) | **2001 / 2001** | 1103.86 s |
+
+★ `2001 = 2025 − 24` held on both remote legs. Count rose 2011 → 2025.
+⚠ **THE FIRST INTEGRATED RUN WAS RED AT 2024/2025 AND THE GUARD WAS RIGHT.**
+`stale_refusal_citations_guard` refused a `$comment` in `src/dss-config/shippedLibs/stdio.json`
+asserting *"a bare `fileno` import would break every pe stdio binary's LOAD"* while citing
+`D-FFI-DESCRIPTOR-EAGER-IMPORT` — a row that CLOSED in this same commit. The deferral is still
+correct (pe exports `_fileno`, not `fileno`); what moved is the BLAST RADIUS, from every TU that
+includes `<stdio.h>` to the callers alone. Re-measured in place with a past-tense governor, which
+is what that guard asks for, and the edit re-parses as JSON before writing — a bad comment edit in
+a descriptor takes the language schema down and the failure looks nothing like a comment.
+
+## §0.2 — What landed, by area
+
+**Preprocessor (lane `pp`).** `#define ENABLED(x) (x)` + `#if ENABLED(1)` gating an `#include` was
+REFUSED at `fcb3a9d7`; all four references compile it and three of them run it. The fix hosts the
+authoritative `MacroExpander` as the pre-scan's **oracle** (`PpMacroOracle`), deleting the shadow
+object-like evaluator (`SbMacro`, `sbExpand`, and both FIX-3 uncertainty scans). ⚠ **The row's
+"a LARGE rearchitecture — plan-gated, not a cycle" framing was REFUTED**: folding include
+resolution into the macro pass was never the only way to retire the weaker evaluator. Residual,
+stated and pinned: `__COUNTER__` in a guard stays loudly refused — the two expanders advance
+separate counters by construction.
+
+**FFI import law (lane `ei`).** `ShippedExternSymbol::eagerImport` now defaults FALSE.
+★ **The argument is an INTERNAL INCONSISTENCY, not bloat**: C23 7.1.4p2 entitles a program to
+hand-declare a library function instead of including its header and calls the two EQUIVALENT — yet
+the hand-declared spelling imported **3** symbols where `#include <stdio.h>` imported **86**, and
+the LOADER sees the difference. Per target 86→5 / 86→5 / 85→8 / 97→5 / 97→5.
+⚠ Two findings worth more than the numbers: the lane's first MSVC arm was **VACUOUS** (default `cl`
+links the static CRT, so the import table was empty and every "absent" proved nothing — only `/MD`
+made the control fire), and the linker's reference gate short-circuits on *"every named import is
+eager"*, so **for an ordinary `#include`-only program that scan had never run**.
+
+**Long double (lane `ld`).** An F80/F128 value crossing a control-flow JOIN now lowers; all six
+arms EXECUTE to 42 on x86_64 ELF, arm64 ELF under qemu and pe64. ⚠ **The row's release-only framing
+was FALSE** — it refused at debug too, because `hir_to_mir`'s `Conditional` arm emits a real MIR
+`Phi`, so any long-double ternary was refused at every optimisation level.
+
+**VLA cluster (lane `vl`).** Three of seven closed with runnable witnesses; four measured and
+scoped. Then `D-CSUBSET-VLA-PARAM-STAR` reopened and reclosed for `[*]` in a function DEFINITION,
+where DSS was **above the union** (both working references refuse; MSVC abstains — it implements no
+C99 VLA at all). ★ The case that made it a fix rather than a new defect: `[*]` in a **nested
+prototype** inside a definition IS legal and both references run it, so the walk stops at
+`isFnSuffixRule` — and that one `continue` has its own mutant, disjoint from the report loop's.
+
+## §0.3 — What is OWED
+
+- **`D-TARGET-ENCODING-WIDTH-GUARD` is the next row and is RE-BANDED P4 → P1.** Its stated trigger
+  *"encode the missing width variants when a consumer arrives (F16/F128: no C producer today)"* has
+  been FALSE since 2026-07-18: `long double` is that consumer. ✔MEASURED independently at
+  `fcb3a9d7`: `if (g_a < g_b)` on two long doubles is rc 1, `L_UnsupportedLoweringForOpcode`,
+  ordinal 14 on x86_64 and 15 on arm64 — and the diagnostic names this anchor. All four references
+  compile and run it. Closing work: x87 `fcomip`/`fucomip`, and an F128 soft compare
+  (`__letf2`/`__getf2`) through `requireEncodedFloatWidth`'s FCmp arm.
+  ⚠ **No gate could have caught this one** — ARM 7 compares a row's two verdict cells against each
+  other and both of this row's agree; what was false is a claim about the TREE.
+- **`D-CSUBSET-VLA-NONLEAF-CALL-FRAME` re-banded P2 → P1** on lane `vl`'s measurement that it is the
+  ceiling on the whole VLA family, with three existing examples deliberately shaped around it.
+  ⚠ **It must ship WITH `D-CSUBSET-VLA-WIN64-UNWIND`**: closing it alone converts a loud refusal
+  into a silent mis-unwind.
+- **`D-CSUBSET-VLA-SIZEOF-TYPEFORM` (P1)** — its stated blocker is GONE: `sizeof(int[n])` parses
+  (P53's abstract-array work unblocked it) and now dies at MIR. Recommend splitting: part (1) needs
+  lowering only; part (2) is the broader composite-decay gap.
+- **`D-PP-PRESCAN-DESCRIPTOR-MACROS-UNTRACKED` (P2)** is now a one-call fix (route
+  `spliceSystemDescriptorMacros`'s `defs` through `oracle.ppOracleDefine`) but must be
+  liveness-gated, since the angle splice is deliberately un-gated.
+- **`ei`'s named residuals**, measured and deliberately not filed as rows: pe keeps 3 shim-held
+  UCRT cores (referenced by shim bodies, no load hazard); the duplicate `exit` row now collapses;
+  the reference scan is live for the first time.
+- ⚠ **Carried from P55 and still unescalated**: gcc IGNORES a GNU `noreturn` on a function-type
+  typedef, clang HONOURS it. DSS matches gcc. Per the 2026-08-28 ruling that is a MEANING fork and
+  pauses rather than being settled by the disjunction.
+- **`examples/README.md` documents 634 manifests against a live census of 767+** (plan-sweep work).
+
+## §0.4 — Traps this cycle paid for
+
+- ★★ **A ROW THAT FIXES A POSITIONAL CITATION MUST QUOTE THE CITATION IT REPLACED — and that makes
+  the row carry one.** `check-plan-citations` refused the very row that burned the debt down. The
+  answer is the escape the tool provides, never softening the tool: spell it as a QUOTATION. Same
+  species as `Trigger: ALREADY FIRED` in a row about gated rows, and as `[|]` for a literal pipe —
+  which the anchor writer also refused in a lane's cell this cycle, for a `grep` command quoted as
+  evidence.
+- ⚠ **Git Bash's `/tmp` and Python's `/tmp` are DIFFERENT DIRECTORIES on Windows.** A file written
+  by a bash redirect is invisible to a Python `open()` of the same string. Anything Python reads
+  goes in the session scratch directory by absolute path.
+- ⚠ **A second fold of the same lane drifts against HEAD by construction** — the lane's first fold
+  is already in the main tree. Adjudicate per file (`IDENTICAL` vs `lane moved forward`), verify
+  the lane's copy is a SUPERSET by grepping for the first fold's own markers, hand-place, then
+  `--settled` the rest.
+- ⓘ Free ratchet, not acted on: `check-diagnostic-codes` reports `D_DirectoryScanFailed` and
+  `P_InvalidEscape` are now covered and their `UNCOVERED_BASELINE` lines can be deleted.
+
+---
+
+★★★ **P56 — RELOCATED HERE BY P57, AND IT IS HISTORY, NOT STATE.** It was §0 until P57 closed. Every figure below is P56's own and was true at P56's tip; **re-derive anything you intend to act on.** Its through-line — *every record was right and nobody re-read it* — is the direct ancestor of P57's, which moves from the RECORDS to the EVIDENCE: a green witness is not a true witness.
+
+## ⏪ P56's former §0 (history)
+
 
 **Cycle P56 closed 2026-09-03.** Four lanes plus the orchestrator. ✔**REAL: 14 rows closed, 0 left
 open of the 3 this cycle opened.** ✔**COUNTED by `check-anchor-balance --base 6482a71b`: 5 closed,

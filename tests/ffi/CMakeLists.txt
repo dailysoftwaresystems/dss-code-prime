@@ -260,3 +260,22 @@ dss_add_test(NAME ffi/test_shipped_stat_typed_surface
              SOURCES test_shipped_stat_typed_surface.cpp)
 target_include_directories(dss_ffi_test_shipped_stat_typed_surface
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# ── D-FFI-DESCRIPTOR-EAGER-IMPORT (P57 lane `ei`) ────────────────────────────
+# REFERENCED-ONLY import of shipped-descriptor symbols, asserted on the EMITTED
+# IMAGE of all five targets the descriptor mechanism ships for. Drives the real
+# production driver (`Program::compileFiles`) and then walks each format's real
+# import pointer chain — ELF `.dynsym` SHN_UNDEF rows, the PE hint/name table,
+# Mach-O LC_SYMTAB N_UNDF|N_EXT — because the load-bearing assertions here are
+# ABSENCES, and a substring scan cannot tell an import row from an incidental
+# string in a neighbouring blob. HOST-INDEPENDENT: nothing is run, so every leg
+# answers for every target. Reads no descriptor JSON, hence no json link; it uses
+# the shared PE extractor and the ELF/Mach-O dependency tables from
+# `tests/test_support/image_dependency_table.hpp`, which `dss_add_test` already
+# puts on the include path for its siblings in this file.
+# The behaviour it pins is `ShippedExternSymbol::eagerImport`'s default in
+# `src/analysis/semantic/semantic_model.hpp`, which is FALSE — descriptor imports
+# are referenced-only. A failure here reading "the eager law is back" means that
+# default went back to `true`; fix the default, do NOT relax the pin.
+dss_add_test(NAME ffi/test_descriptor_import_referenced_only
+             SOURCES test_descriptor_import_referenced_only.cpp)

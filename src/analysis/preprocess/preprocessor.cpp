@@ -637,9 +637,9 @@ void sbHandleEndif(std::vector<CondFrame>& stack, SourceSpan at,
 //
 // The per-object-format availability predicate for a config PREDEFINED macro
 // USED TO LIVE HERE, as a shared helper the four predefine seed sites each
-// called: the include-gating pre-scan's definedness oracle (`sbNameDefined`),
-// the value-seed prefix builder, the `MacroExpander` `predefined_` seed, and
-// the function-like "<built-in>" prologue. It is now DELETED. Four call sites
+// called: the include-gating pre-scan's definedness oracle, the value-seed
+// prefix builder, the `MacroExpander` `predefined_` seed, and the function-like
+// "<built-in>" prologue. It is now DELETED. Four call sites
 // of one predicate is one careless edit away from three call sites and a
 // fourth that forgot, and a divergence between the pre-scan's seed and the
 // authoritative `predefined_` set is a SILENT P0016 seam (the pre-scan
@@ -700,8 +700,9 @@ matchPragmaEffect(PreprocessConfig const&      cfg,
 //
 // ★ THE MODEL NOW. Re-entry is PERMITTED for a header that carries a MACRO
 // include guard, because the guard is what makes the repeat expansion empty:
-// `localMacros` is SHARED across the whole builder tree, so on re-entry the
-// guard's controlling name is already defined, the whole body reads DEAD, no
+// the pre-scan's macro ORACLE is SHARED across the whole builder tree
+// ([[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]), so on re-entry the guard's
+// controlling name is already defined, the whole body reads DEAD, no
 // nested include inside it resolves, and the recursion converges after exactly
 // one extra level. The AUTHORITATIVE `MacroExpander` pass then elides the
 // duplicated text for the same reason. `kMaxIncludeDepth` is the loud backstop
@@ -1187,6 +1188,79 @@ private:
     std::vector<fs::path>                               files_;
 };
 
+// ══ [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] ═════════════════════════════════
+//
+// THE MACRO-STATE CONTRACT THE INCLUDE PRE-SCAN NEEDS — and the ONLY thing it
+// needs from a macro engine. `MacroExpander` (further down this file) is the sole
+// implementation; the pre-scan holds a reference to THIS, not to a private
+// evaluator of its own.
+//
+// ★★★ WHY THE INTERFACE EXISTS AT ALL, GIVEN THERE IS ONE IMPLEMENTATION. It is
+// not an abstraction for future implementers — it is the ONE-WAY declaration that
+// makes the dependency legal in this file's order. `SynthBuilder` must be defined
+// before `MacroExpander` (the expander's constructor is what `preprocess()` builds
+// AFTER the pre-scan has produced the buffer it reads), so the pre-scan cannot
+// name the expander's type. The alternatives were to move ~5000 lines of expander
+// above the pre-scan, or to give the pre-scan a second evaluator — which is
+// precisely the duplication this row exists to remove. Eight virtual calls per
+// directive line is not a cost worth a second macro engine.
+//
+// ★★ THE PRE-SCAN ASKS ONLY QUESTIONS IT CAN ASK IN TEXT. Every entry point takes
+// or returns RAW SOURCE BYTES rather than tokens of the pre-scan's own buffers: a
+// token is a 16-byte POD that does not carry its text, and the pre-scan walks a
+// TREE of scan buffers while the oracle owns exactly one. Handing a foreign span
+// across would slice the wrong bytes — and `SourceBuffer::slice` CLAMPS rather
+// than faults, so that failure mode is plausible-wrong-bytes, never a crash
+// (TF-C60's BLOCKER-2, paid for once already).
+class PpMacroOracle {
+public:
+    virtual ~PpMacroOracle() = default;
+
+    // The directory a `__has_include("h")` / `__has_embed("r")` inside a guard
+    // resolves against. Moves as the pre-scan descends the include tree.
+    virtual void ppOracleSetIncludingDir(fs::path dir) = 0;
+
+    // Where the NEXT question is being asked from, in the ORIGIN file's own
+    // coordinates — what `__LINE__` and `__FILE__` must answer (C 6.10.8.1: the
+    // line of the INVOCATION and the presumed name of the current source file).
+    // The authoritative pass reads those off its line-map; the oracle has none
+    // (its tokens live in a product tail that belongs to no file), so the
+    // pre-scan — which knows both, because it is the pass that BUILDS the map —
+    // states them. Line 0 / an empty name means "not known", and the oracle then
+    // counts the read in `positionDerivedMints()` instead of answering wrong.
+    virtual void ppOracleSetPresumedPosition(std::uint32_t line,
+                                             std::string file) = 0;
+
+    // Seed a `#define` / `#undef` from the raw source text of its directive line
+    // AFTER the directive word. Only ever called on a conditional-stack-LIVE line
+    // (C 6.10p1: a dead branch's directives are not processed).
+    virtual void ppOracleDefine(std::string_view directiveTail) = 0;
+    virtual void ppOracleUndef(std::string_view directiveTail)  = 0;
+
+    // `#ifdef` / `#ifndef` / `#elifdef` / `#elifndef` (C 6.10.1p1/p5) — a DIRECT
+    // definedness test, never an expression evaluation.
+    [[nodiscard]] virtual bool ppOracleIsDefined(std::string_view n) = 0;
+
+    // `#if` / `#elif` (C 6.10.1p4) — the full controlling-expression evaluation.
+    [[nodiscard]] virtual bool ppOracleEvalIf(std::string_view operandText) = 0;
+
+    // A COMPUTED `#include` operand (C23 6.10.2p4), macro-expanded. The returned
+    // tokens belong to the oracle: read them ONLY through `ppOracleText`.
+    [[nodiscard]] virtual std::vector<Token> ppOracleExpandOperand(
+        std::string_view operandText) = 0;
+    [[nodiscard]] virtual std::string_view ppOracleText(Token const& t) const = 0;
+
+    // TRUE iff the name still denotes a macro this oracle holds — the test that
+    // separates "the expansion completed and produced no header name" (report it)
+    // from "a macro name survived" (leave the directive alone).
+    [[nodiscard]] virtual bool ppOracleNameIsMacro(std::string_view n) const = 0;
+
+    // A monotone count of the POSITION-/STATE-derived predefined values this
+    // oracle has materialized (`__LINE__`/`__FILE__`/`__COUNTER__`). The pre-scan
+    // reads it as a DELTA across one evaluation — see the implementation's note.
+    [[nodiscard]] virtual std::uint64_t positionDerivedMints() const = 0;
+};
+
 struct SynthBuilder {
     std::shared_ptr<GrammarSchema const> schema;
     std::span<fs::path const>            includeDirs;
@@ -1218,32 +1292,48 @@ struct SynthBuilder {
     // a deep-nest truncation at any level reaches `preprocess()`.
     bool&                                fatal;
     // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE, Option 2 — supersedes the
-    // C19 `seededDefines` NAME-set): a `#define NAME VALUE\n` prefix for every
-    // command-line `--define` + every OBJECT-like predefined macro available on
-    // the active format, shared by const-ref across EVERY child builder. The
-    // include-gating pre-scan must see these VALUES so a `#if <cmdline/predefined>`
-    // VALUE guard (`#if SQLITE_TEST`, `#if __STDC_VERSION__ >= 201112L`) gating a
-    // quote-`#include` evaluates correctly -- it would otherwise fold to 0 -> a
-    // FALSE-DEAD skip, the un-inlined header's `#define`s vanish, and the drop
-    // surfaces as a spurious P0009/P9006 at the macro's use site
-    // (D-PP-CONDITIONAL-INCLUDE-ORDERING lineage). `build()` prepends this as a
-    // NON-EMITTED span-safe SCAN-BUFFER prefix (its `#define` lines seed
-    // `localMacros` with values whose replacement-token spans slice the SAME
-    // `scanBuf` sbExpand reads). This SUBSUMES C19's definedness-only seed AND
-    // composes with a source `#undef` (which now erases the seeded value from
-    // `localMacros`, unlike the old separate NAME set). The one-directional-
-    // divergence invariant is preserved: the values EXACTLY match the
-    // `<command-line>`/`<built-in>` prologues the authoritative pass sees, so the
-    // pre-scan is more-live only IN LOCKSTEP (P0016 stays closed).
+    // C19 `seededDefines` NAME-set): the SYNTHETIC PROLOGUE the include-gating
+    // pre-scan must see before the first source line, shared by const-ref across
+    // EVERY child builder. The pre-scan must see these VALUES so a
+    // `#if <cmdline/predefined>` VALUE guard (`#if SQLITE_TEST`,
+    // `#if __STDC_VERSION__ >= 201112L`) gating a quote-`#include` evaluates
+    // correctly -- it would otherwise fold to 0 -> a FALSE-DEAD skip, the
+    // un-inlined header's `#define`s vanish, and the drop surfaces as a spurious
+    // P0009/P9006 at the macro's use site (D-PP-CONDITIONAL-INCLUDE-ORDERING
+    // lineage). `build()` prepends it as a NON-EMITTED span-safe SCAN-BUFFER
+    // prefix; its `#define` lines are handed to the ORACLE by the main loop's
+    // ordinary `#define` arm, exactly as a source `#define` is.
+    //
+    // ★★ [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] — IT IS NOW THE *SAME BYTES*
+    // THE AUTHORITATIVE PASS GETS, which is a strictly stronger statement than
+    // the one this comment used to make. `preprocess()` builds the `<built-in>` +
+    // `<command-line>` prologue ONCE and hands the identical string here, so the
+    // one-directional-divergence invariant is no longer an argument about two
+    // parallel loops staying in step — there is one loop. It also RETIRES
+    // FINDING-A: the old prefix had to EXCLUDE every function-like predefine,
+    // because the pre-scan's private evaluator could not expand a call and
+    // value-seeding one would have made it read more-live. The oracle expands
+    // calls, so a function-like predefine is now an ordinary `#define` line in
+    // both passes — which is what the authoritative pass always did with it.
     std::string const& preScanDefinePrefix;
-    // TF-C74: the EFFECTIVE predefined-macro list — language ⊕ target, already
-    // format-resolved by `mergePredefinedMacros`. Shared by const-ref across
-    // every child builder (like `preScanDefinePrefix`), so the whole include
-    // tree's definedness oracle reads the SAME list the authoritative
-    // `MacroExpander` seeds from. Replaces the old
-    // `schema->preprocess().predefinedMacros` read + a locally re-applied
-    // format filter: seed site #1 of four.
-    std::span<PredefinedMacroDef const> effectivePredefines;
+    // ★★★ [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] — THE MACRO STATE, AND IT IS
+    // NO LONGER THIS PASS'S OWN. Every `#define`/`#undef` this builder walks is
+    // handed to the oracle, and every `#if`/`#ifdef` question is asked of it — so
+    // the guard that decides whether a quote-`#include` is spliced is evaluated by
+    // the SAME engine that will re-evaluate it authoritatively.
+    //
+    // WHAT THIS REPLACED: a `localMacros` map of `SbMacro` (object-like
+    // replacement TEXT plus a bare "is function-like" bit), an `undefinedNames`
+    // subtraction set, an `effectivePredefines` span, and ~230 lines of private
+    // expander (`sbExpand`/`sbMintProduct`/`sbTextOf`/`sbNameDefined`). Five
+    // pieces of state whose ONLY job was to approximate the expander's table.
+    //
+    // ★ SHARED BY REFERENCE across the whole builder tree, like `includeStack` /
+    // `fatal` / `includeOnce`, and for the same reason `localMacros` was: macro
+    // state is a property of the TRANSLATION UNIT in DOCUMENT ORDER, so a
+    // `#define` arriving through a nested include must be visible to the parent's
+    // later `#if`.
+    PpMacroOracle& oracle;
     // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: sink for every system-descriptor PARENT
     // this builder (and its recursive children) SPLICES for an angle `#include <h>`
     // (or the quote->angle fallback), paired with the SYNTH-BUFFER byte offset of
@@ -1257,167 +1347,7 @@ struct SynthBuilder {
     // `preprocess()` dead-filters, then expands the transitive `includes` closure +
     // dedups once into `PreprocessResult`. EMIT-ONLY.
     std::vector<std::pair<fs::path, ByteOffset>>& resolvedDescriptorsOut;
-    // c17: a SynthBuilder-local object-like macro, tracked from LIVE-branch
-    // `#define`s so a `#if FOO`/`#if FOO == 1` guard gating a quote-`#include`
-    // evaluates with the macro state visible at the include point. Independent
-    // of `MacroExpander`'s authoritative table (which still sees every
-    // verbatim-copied `#define`); divergence is one-directional + fail-loud (a
-    // false-dead skips a live include -> loud missing-symbol downstream, never a
-    // silent wrong include). A FUNCTION-like `#define` records only that the name
-    // is function-like (no replacement) -- an invocation of it in a guard forces
-    // the CONSERVATIVE (skip) direction (FIX-3). NOTE (c17 authoritative dead-
-    // regions): this pre-scan gates ONLY quote-include splicing; the dead-branch
-    // `P_IllegalChar` suppression is driven by the AUTHORITATIVE `MacroExpander`
-    // pass (`deadRanges()`), NOT this pre-scan -- so a guard this weaker eval
-    // mis-reads only ever causes a loud include skip/resolve, never a silent
-    // illegal-char drop.
-    // TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE): the replacement is stored
-    // as TEXT, not span-tokens. The map below is SHARED across the whole builder
-    // tree, and a span-token would slice the WRONG buffer in any builder other
-    // than the one that recorded it — `SourceBuffer::slice` CLAMPS rather than
-    // faults, so that failure mode is plausible-wrong-bytes, never a crash. The
-    // text is re-tokenized into the per-evaluation product tail at expansion
-    // time (`sbMintProduct`), the same FC15b mechanism `materializeSignificant`
-    // uses in the authoritative pass.
-    struct SbMacro {
-        bool        functionLike = false;
-        std::string replacementText;     // object-like body, buffer-independent
-    };
-    // TF-C60: SHARED BY REFERENCE across every child builder (the
-    // `includeStack`/`fatal`/`resolvedDescriptorsOut` pattern), so the pre-scan's
-    // macro state spans the WHOLE include tree in DOCUMENT ORDER. Before this it
-    // was per-builder: a `#define` arriving via a NESTED include was invisible to
-    // the parent's later `#if` (and a parent's source `#define` invisible to a
-    // child's), the guard folded 0 → FALSE-DEAD → the gated quote-`#include` was
-    // left verbatim → the macro pass forwarded it as inert tokens → the header
-    // was SILENTLY DROPPED (sqlite os_unix.c: sqliteInt.h→os_setup.h defines
-    // SQLITE_OS_UNIX, `#if SQLITE_OS_UNIX` gates `#include "os_common.h"`).
-    std::unordered_map<std::string, SbMacro>& localMacros;
-    // D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS: the names a LIVE `#undef` has
-    // removed. SHARED BY REFERENCE across the whole builder tree, exactly like
-    // `localMacros` beside it, because a `#undef` in a header must be visible to
-    // the parent's later guard in DOCUMENT ORDER.
-    //
-    // ★ WHY A SUBTRACTION SET AND NOT AN ERASE. `#undef` composes for every
-    // OBJECT-like predefine already: the C21 value prefix materializes those into
-    // `localMacros`, so erasing the entry is the whole story. It composes for
-    // NOTHING that `sbNameDefined` answers from the `effectivePredefines` arm —
-    // the FUNCTION-like rows (FINDING-A deliberately keeps them out of the value
-    // prefix) — because that arm walks a config list no directive can subtract
-    // from. Recording the `#undef` is the only way to make one oracle answer for
-    // both halves; the alternative (value-seeding the function-like rows so the
-    // arm could die) was MEASURED to REGRESS: `#if !__declspec` gating a
-    // quote-`#include` splices today (DSS 42, mingw-w64 gcc 13.2.0 42), and a
-    // function-like entry in `localMacros` trips FIX-3's uncertainty bail, which
-    // turns that splice into a `P_PreprocessorIncludeError` refusal.
-    //
-    // ⚠ THE DIRECTION IS WHY THIS IS A DEFECT AND NOT A TOLERATED SKEW. The
-    // one-directional-divergence invariant permits the pre-scan to read MORE live
-    // than the authoritative pass, never less. `#ifdef` inverts to `#ifndef`, so
-    // an over-answering oracle reads a `#ifndef`/`#elifndef`/`#if !defined()`
-    // group DEAD that the real pass reads LIVE — the P0016 direction. ✔MEASURED
-    // before the fix: `#undef __declspec` then any of those three gating a
-    // quote-`#include` was REFUSED (`P_PreprocessorIncludeError`), where
-    // mingw-w64 gcc 13.2.0, WSL gcc 13.3.0 and clang 18.1.3 all compile and run
-    // the program. Every entry is recorded on the LIVE branch only (C 6.10p1) and
-    // `localMacros` is consulted FIRST, so a later `#define` of the same name
-    // re-defines it with no ordering hazard.
-    std::unordered_set<std::string>& undefinedNames;
-
     PreprocessConfig const& cfg() const { return schema->preprocess(); }
-
-    // C19/C21 (D-PP-PRESCAN-DEFINEDNESS-PARITY + -PREDEFINED-VALUE-INCLUDE-GATE):
-    // the SINGLE definedness oracle for the include-gating pre-scan's
-    // `#ifdef`/`#ifndef`/`#if defined()`. Before C19 the two DISAGREED -- `#ifdef`
-    // saw only `localMacros`, `#if defined()` also saw `predefinedMacros` -- and
-    // NEITHER saw a command-line `--define`, so a `#ifdef SQLITE_TEST`-gated
-    // quote-`#include` was falsely skipped. Now BOTH consult, in one place: an
-    // in-source `#define` OR a command-line `--define` OR an object-like predefined
-    // (all now materialized in `localMacros` via the C21 value prefix that build()
-    // prepends), OR a config predefined macro via the SHARED per-format filter the
-    // authoritative MacroExpander applies (this arm keeps a FUNCTION-like predefine
-    // -- excluded from the value prefix per FINDING-A -- reporting DEFINED). So the
-    // pre-scan can only ever be MORE live IN LOCKSTEP with the authoritative pass --
-    // never resolving a branch the real pass reads dead (the one-directional
-    // divergence invariant that keeps P0016 closed). C21 IMPROVEMENT: a source
-    // `#undef` of a command-line define now COMPOSES (it erases the value from
-    // `localMacros` and the define is not a predefined, so this reports it
-    // undefined). EDGE (pre-existing + LOUD-not-silent): a `#undef` of a PREDEFINED
-    // name is still not reflected by the predefined for-loop arm -- so the pre-scan
-    // may read MORE-live than the authoritative pass; the effect is at worst a
-    // spurious include-resolve (loud `P_PreprocessorIncludeError`) or a benign
-    // splice-then-elide, NEVER a silent mis-include.
-    [[nodiscard]] bool sbNameDefined(std::string_view n) const {
-        // Option 2 (C21): a command-line `--define`'s definedness now comes from
-        // `localMacros` (the value prefix seeds it via the main-loop `#define`
-        // handler), so the separate C19 `seededDefines` NAME set is gone. KEEP the
-        // predefined arm: a FUNCTION-like predefine (EXCLUDED from the value prefix
-        // per FINDING-A) must still report DEFINED here for `#if defined(NAME)` /
-        // `#ifdef NAME`. TF-C74: the arm walks the pre-filtered EFFECTIVE list
-        // (language ⊕ target), so mere PRESENCE means available — no local filter
-        // to drift from the value prefix's predefined subset, and a per-arch
-        // target predefine (`__aarch64__`) gates a quote-`#include` exactly as a
-        // language one does.
-        if (localMacros.find(std::string{n}) != localMacros.end()) return true;
-        // D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS: a LIVE `#undef` subtracts
-        // from the arm below, which walks a CONFIG list that no directive can
-        // otherwise reach. `localMacros` is consulted FIRST (just above), so a
-        // `#undef` followed by a `#define` of the same name still reports
-        // DEFINED — the set records that the CONFIG row no longer answers, not
-        // that the name is unusable. It gates the WHOLE arm rather than one row
-        // inside it, because "this name was `#undef`ed" is a fact about the name.
-        // It falls THROUGH to the operator arm below rather than returning
-        // `false`: an operator name can never enter the set (the `#undef`
-        // tracker refuses one, matching the authoritative pass's
-        // `P_PreprocessorOperatorNameNotDefinable`), and this predicate must
-        // stay correct without depending on that invariant holding elsewhere.
-        // ⚠ THE `empty()` TEST IS NOT NOISE. This predicate runs for every
-        // `#ifndef <include guard>` in every header the pre-scan walks, and the
-        // `std::string{n}` a heterogeneous-lookup-less `find` needs ALLOCATES for
-        // any name past the small-string bound — which an include guard always
-        // is. Almost no translation unit `#undef`s anything, so the set is empty
-        // and this costs one load instead of one allocation.
-        if (!undefinedNames.empty()
-            && undefinedNames.find(std::string{n}) != undefinedNames.end()) {
-            return isConditionalInclusionOperator(n, cfg());
-        }
-        for (PredefinedMacroDef const& pm : effectivePredefines) {
-            // ★★ D-PP-PREDEFINE-REDEFINITION-PARTITION — THIS CLAUSE CLOSES THE
-            // LATENT SEAM THE PARTITION WOKE UP; IT IS NOT A TIDY-UP.
-            // The EDGE the block above documents — "a `#undef` of a PREDEFINED
-            // name is still not reflected by the predefined for-loop arm, so the
-            // pre-scan may read MORE-live than the authoritative pass" — was
-            // UNREACHABLE while the authoritative pass REFUSED every such
-            // `#undef`: a directive that never takes effect cannot desynchronise
-            // anything. Making `#undef` take effect makes the edge reachable for
-            // EVERY row, so it is closed here, in the same change that opens it.
-            // ★ The fix is to narrow the arm to exactly what it was always FOR.
-            // Every OBJECT-like row — warn-class and ordinary alike — is already
-            // seeded into `localMacros` by the C21 value prefix
-            // (`preScanDefinePrefix`), so the branch above answers for it AND a
-            // source `#undef` composes with it, exactly as for a command-line
-            // `--define`. Only a FUNCTION-like row is absent from that prefix
-            // (FINDING-A deliberately excludes it, so a bare `#if NAME` folds to
-            // 0 in both passes), and answering for those is this arm's whole
-            // C19/FINDING-A job.
-            // ⚠ THE FIRST CUT OF THIS CLAUSE SKIPPED `ordinary` ROWS INSTEAD,
-            // AND THAT BROKE THE INVARIANT IN THE DANGEROUS DIRECTION: a
-            // function-like predefine is ordinary by construction (the loader
-            // enforces it), so `#ifdef __declspec` would have read DEAD here
-            // while the authoritative pass — holding it in `table_` from the
-            // built-in prologue — read it LIVE. That is a quote-`#include`
-            // silently not spliced, i.e. P0016 itself, not the tolerated
-            // more-live direction.
-            if (!pm.isFunctionLike) continue;
-            if (pm.name == n) return true;
-        }
-        // TF-C86 (D-CSUBSET-STDARG-F001A): the language's conditional-inclusion
-        // OPERATORS are DEFINED names. Kept in lockstep with the authoritative
-        // `MacroExpander::isDefined` — both call the one shared predicate, so the
-        // pre-scan can never read `#ifndef __has_include` live while the real pass
-        // reads it dead (the one-directional divergence invariant above).
-        return isConditionalInclusionOperator(n, cfg());
-    }
 
     // Quote-include resolution for the PRE-SCAN. Historically this was a
     // PRIVATE second resolver that byte-sliced the path itself, bypassing the
@@ -1870,21 +1800,11 @@ struct SynthBuilder {
         return SystemMacroSplice::Spliced;
     }
 
-    // c17: record a LIVE-branch `#define` into `localMacros` for the pre-scan's
-    // `#if` evaluation. `[nameP, end)` are the directive-line PPTokens AFTER the
-    // `define` word. FUNCTION-like iff the function-like-open token is IMMEDIATELY
-    // ADJACENT to the macro name (C 6.10.3p3: no space) -- recorded as
-    // function-like with NO body (an invocation in a guard then forces the
-    // conservative skip, FIX-3). OBJECT-like records the replacement tokens
-    // (everything after the name, trivia-stripped) whose spans slice against the
-    // scan buffer. A malformed `#define` (no name) is ignored here (the macro
-    // pass reports it authoritatively). Mirrors the redefinition-tolerant table
-    // write (last definition wins; the pre-scan needs no compatibility check).
     // TF-C86 (D-CSUBSET-STDARG-F001A): the SUBJECT of a `#define`/`#undef` — the
     // first significant Word on the directive line, or empty when the line is
     // malformed (the authoritative pass owns that diagnostic). Extracted so both
     // pre-scan arms can ask "is this name one the implementation owns?" using the
-    // same reading of the line that `sbTrackDefine` does.
+    // same reading of the line that `sbDirectiveTailText` below hands the oracle.
     [[nodiscard]] static std::string_view
     sbFirstNameOnLine(std::vector<PPToken> const& toks, std::size_t nameP,
                       std::size_t end) {
@@ -1897,186 +1817,52 @@ struct SynthBuilder {
         return toks[p].text;
     }
 
-    void sbTrackDefine(std::vector<PPToken> const& toks, std::size_t nameP,
-                       std::size_t end, SourceBuffer const& buf) {
-        std::size_t p = nameP;
-        while (p < end && isTrivia(toks[p].tok)) ++p;
-        if (p >= end || isNewline(toks[p].tok)
-            || toks[p].tok.coreKind != CoreTokenKind::Word) {
-            return;   // malformed (no macro name) — macro pass fails loud
+    // ★ [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] — THE DIRECTIVE TAIL, AS BYTES.
+    // The raw source text of a directive line from its first significant token
+    // after the directive WORD to the end of the line, sliced out of this
+    // builder's scan buffer. That is what the oracle takes.
+    //
+    // ★★ BYTES, NOT TOKENS, AND THE REASON IS NOT CONVENIENCE. The oracle owns
+    // exactly one buffer; this builder walks a TREE of them, and its `#define`
+    // must outlive the scan buffer it was read from (the pre-scan's old macro map
+    // was shared across the whole tree for that reason). A `Token` is a 16-byte POD that
+    // carries a SPAN and no text, so handing one across would slice the oracle's
+    // buffer at this buffer's offsets — and `SourceBuffer::slice` CLAMPS rather
+    // than faults, so the failure mode is plausible-wrong-bytes with no crash.
+    // TF-C60 paid for that lesson once already and answered it by storing
+    // replacement TEXT; this is the same answer, applied to the whole line.
+    //
+    // ★ DO NOT JOIN TOKEN TEXTS. A `PPToken` is not always a self-contained
+    // spelling: the tokenizer emits a coalesced literal as an OPENER, a BODY and
+    // a CLOSER (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN), so `'A'` is the three
+    // texts `'`, `A`, `'` — joined with a separator that re-lexes as something
+    // else. `#define NL '\n'` guarding a conditional include is ordinary C.
+    // Slicing the source range keeps every byte in its original spacing, which
+    // is also what makes the oracle's object-vs-function-like discrimination
+    // (C 6.10.3p3: the `(` must be ADJACENT to the name) read the truth.
+    //
+    // The range runs from the first significant token to the END of the line
+    // (the newline's start, or the last token's end when the line is
+    // unterminated). Empty when the line has no significant token after the
+    // word — the caller then has nothing to hand over, and the authoritative
+    // pass owns the malformed-directive diagnostic.
+    [[nodiscard]] static std::string_view sbDirectiveTailText(
+        std::vector<PPToken> const& toks, std::size_t from, std::size_t end,
+        SourceBuffer const& buf) {
+        std::size_t firstStart = 0;
+        std::size_t lineEnd    = 0;
+        bool        haveFirst  = false;
+        for (std::size_t q = from; q < end; ++q) {
+            if (isNewline(toks[q].tok)) { lineEnd = toks[q].tok.span.start();
+                                          break; }
+            if (isTrivia(toks[q].tok)) continue;
+            if (!haveFirst) { firstStart = toks[q].tok.span.start();
+                              haveFirst  = true; }
+            lineEnd = toks[q].tok.span.end();
         }
-        std::string const name{toks[p].text};
-        std::size_t const nameIdx = p;
-        ++p;
-        SbMacro m;
-        const auto openKind =
-            schema->schemaTokens().find(cfg().functionLikeOpenToken);
-        if (p < end && openKind.valid()
-            && toks[p].tok.schemaKind == openKind
-            && toks[p].tok.span.start() == toks[nameIdx].tok.span.end()) {
-            m.functionLike = true;
-            // No body needed: a function-like invocation forces the conservative
-            // direction regardless of the replacement.
-        } else {
-            // TF-C60: record the replacement as RAW SOURCE TEXT — buffer-
-            // independent (the shared map outlives this builder's scan buffer)
-            // AND byte-faithful.
-            //
-            // ★ Do NOT join token TEXTS: a PPToken is not always a self-contained
-            // spelling. The tokenizer emits a coalesced literal as an OPENER
-            // token, a BODY token, and a CLOSER token
-            // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN gave the closing delimiter a
-            // token of its own; it previously had none), so `'A'` is the three
-            // texts `'`, `A`, `'` — joining them with a separator re-lexes as
-            // something else (`' A '`), and joining them bare only happens to
-            // round-trip for literals. `#define NL '\n'` guarding a conditional
-            // include is ordinary C. Slicing the source range keeps every byte in
-            // its original spacing, which no token-text join can promise.
-            //
-            // The range runs from the first significant replacement token to the
-            // END of the directive line (the newline's start, or the last token's
-            // end when the line is unterminated). Taking the whole line tail is
-            // what makes this site IDEMPOTENT across the closer-token change: it
-            // already covered the closing delimiter's bytes when they belonged to
-            // no token, and covers them still now that they belong to one. Any
-            // trailing comment re-lexes to trivia and is dropped by
-            // `sbMintProduct`.
-            std::size_t firstStart = 0;
-            std::size_t lineEnd    = 0;
-            bool        haveFirst  = false;
-            for (std::size_t q = p; q < end; ++q) {
-                if (isNewline(toks[q].tok)) { lineEnd = toks[q].tok.span.start();
-                                              break; }
-                if (isTrivia(toks[q].tok)) continue;
-                if (!haveFirst) { firstStart = toks[q].tok.span.start();
-                                  haveFirst  = true; }
-                lineEnd = toks[q].tok.span.end();
-            }
-            if (haveFirst && lineEnd > firstStart) {
-                m.replacementText =
-                    std::string{buf.slice(SourceSpan::of(
-                        static_cast<ByteOffset>(firstStart),
-                        static_cast<ByteOffset>(lineEnd)))};
-            }
-        }
-        localMacros[name] = std::move(m);
-    }
-
-    // TF-C60 (c′): read a token's TEXT product-awarely. A token minted by
-    // `sbMintProduct` spans `[bufLen + productOffset, …)` — past the scan
-    // buffer's end — so slice it from the per-eval PRODUCT string instead.
-    // (`SourceBuffer::slice` would silently CLAMP an out-of-range span to
-    // plausible wrong bytes, so this branch is correctness, not cosmetics.)
-    static std::string_view sbTextOf(Token const& t, SourceBuffer const& buf,
-                                     std::string const& product) {
-        std::size_t const bufLen = buf.text().size();
-        if (t.span.start() >= bufLen) {
-            std::size_t const s = t.span.start() - bufLen;
-            std::size_t const e = t.span.end() - bufLen;
-            if (e <= product.size() && s <= e)
-                return std::string_view{product}.substr(s, e - s);
-            return {};
-        }
-        return buf.slice(t.span);
-    }
-
-    // TF-C60 (c′, the FC15b product-tail pattern): re-tokenize a shared macro's
-    // replacement TEXT into the per-evaluation product string, minting tokens
-    // whose spans point at `[bufLen + productBase, …)` — exactly where
-    // `evaluateIfExpression` slices them from: its `IceParser::textOf` reads a
-    // span at-or-past `synth.text().size()` out of `productText()` and every
-    // other span out of the buffer itself, which is the rule `sbTextOf` just
-    // above spells for this pass (pp_if_eval). Token KINDS come
-    // from the real tokenizer, so nothing is ever re-lexed across a
-    // substitution boundary (no glue hazard, no `<a/b.h>` byte corruption).
-    std::vector<Token> sbMintProduct(std::string_view spelling,
-                                     SourceBuffer const& buf,
-                                     std::string& product) const {
-        ByteOffset const productBase = static_cast<ByteOffset>(product.size());
-        product.append(spelling);
-        auto tiny = SourceBuffer::fromString(std::string{spelling},
-                                             "<sb-product>");
-        DiagnosticReporter scratch;   // pre-scan diagnostics are never user-facing
-        auto ppToks = tokenizeToPP(tiny, schema, scratch);
-        ByteOffset const bufLen = static_cast<ByteOffset>(buf.text().size());
-        std::vector<Token> out;
-        for (PPToken const& pt : ppToks) {
-            if (isTrivia(pt.tok) || isNewline(pt.tok)) continue;
-            if (pt.tok.coreKind == CoreTokenKind::Eof) continue;
-            Token t = pt.tok;
-            t.span  = SourceSpan::of(bufLen + productBase + pt.tok.span.start(),
-                                     bufLen + productBase + pt.tok.span.end());
-            out.push_back(t);
-        }
-        return out;
-    }
-
-    // c17 (reworked TF-C60): object-like macro expansion over the SHARED
-    // `localMacros` for the `sbEvalIfOperand` `#if` evaluation. A bounded
-    // recursive rescan (so a `#define A B` / `#define B 1` chain folds), with an
-    // `active`-set self-reference guard (a `#define X X` freezes to its own
-    // name, matching the full engine) + a depth backstop. FUNCTION-like names
-    // are NEVER expanded here -- an invocation is already detected as
-    // conservative by `sbEvalIfOperand`. Substituted tokens are MINTED into the
-    // per-eval `product` string (never carried as foreign-buffer spans), so the
-    // shared map stays buffer-independent.
-    // ⚠ `barrier`: see `sbMakeIfOperandBarrier` just below this function for
-    // what it is. It is threaded BY REFERENCE through the recursion rather
-    // than re-created per frame — that is what makes it compose ACROSS the
-    // replacement-list boundary. `#define D defined` + `#if D(FOO)` produces the
-    // KEYWORD inside a recursive frame and its OPERAND in the parent's remaining
-    // input; a per-frame barrier would see the two halves separately and protect
-    // neither, and `FOO` would expand to `1` before the operator ever ran (all
-    // three references answer 1 here — the operand is protected).
-    // D-PP-DEFINED-VIA-MACRO-EXPANSION.
-    std::vector<Token> sbExpand(std::vector<Token> const& in,
-                                SourceBuffer const& buf, std::string& product,
-                                std::set<std::string>& active, int depth,
-                                PpIfOperandBarrier& barrier) const {
-        if (depth > 32) return in;   // backstop (a pathological cycle the guard
-                                     // missed never loops the host)
-        std::vector<Token> outToks;
-        outToks.reserve(in.size());
-        for (Token const& t : in) {
-            bool const isWordTok = (t.coreKind == CoreTokenKind::Word);
-            std::string name;
-            if (isWordTok) name = std::string{sbTextOf(t, buf, product)};
-            // A PROTECTED token is copied verbatim -- never looked up in the
-            // macro table, so `defined(BAR)` cannot become `defined(0)`.
-            if (barrier.protects(t, isWordTok ? std::string_view{name}
-                                              : std::string_view{})) {
-                outToks.push_back(t);
-                continue;
-            }
-            if (isWordTok) {
-                auto it = localMacros.find(name);
-                if (it != localMacros.end() && !it->second.functionLike
-                    && active.find(name) == active.end()) {
-                    active.insert(name);
-                    std::vector<Token> minted = sbMintProduct(
-                        it->second.replacementText, buf, product);
-                    std::vector<Token> sub =
-                        sbExpand(minted, buf, product, active, depth + 1,
-                                 barrier);
-                    active.erase(name);
-                    for (Token const& s : sub) outToks.push_back(s);
-                    continue;
-                }
-            }
-            outToks.push_back(t);
-        }
-        return outToks;
-    }
-
-    // D-PP-DEFINED-VIA-MACRO-EXPANSION: the ONE place this pass builds a
-    // `defined`-operand barrier (`PpIfOperandBarrier`, pp_if_eval.hpp — the same
-    // class the authoritative expander and the evaluator use, so all three
-    // agree on what a `defined` operand IS by construction). Keyword + paren
-    // KINDS come from the schema, so a language declaring no `defined` operator
-    // gets a provably inert barrier (empty keyword -> every query answers false)
-    // and this pass behaves exactly as it did before the row.
-    [[nodiscard]] PpIfOperandBarrier sbMakeIfOperandBarrier() const {
-        return PpIfOperandBarrier{*schema};
+        if (!haveFirst || lineEnd <= firstStart) return {};
+        return buf.slice(SourceSpan::of(static_cast<ByteOffset>(firstStart),
+                                        static_cast<ByteOffset>(lineEnd)));
     }
 
     // ── C23 6.10.2p4 — THE COMPUTED `#include` FORM ────────────────────────
@@ -2109,10 +1895,21 @@ struct SynthBuilder {
         std::string   name;   // header name, delimiters stripped
     };
 
-    // Expand a COMPUTED `#include` operand through the SHARED object-like map
-    // and read a header name off the result. `in` is the operand run (the
-    // tokens after the directive word, trivia and the newline already dropped);
-    // `buf` is the scan buffer.
+    // Expand a COMPUTED `#include` operand THROUGH THE ORACLE and read a header
+    // name off the result. `operandText` is the operand's raw source bytes (the
+    // directive line after the `include` word, as `sbDirectiveTailText` slices
+    // it).
+    //
+    // ★★★ [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] — WHAT CHANGED AND WHAT DID
+    // NOT. The four outcomes below are unchanged; what changed is WHO EXPANDS.
+    // The expansion used to run through a private object-like-only rescan, so
+    // `#include HDR(x)` — a function-like operand every reference resolves —
+    // came back `Unresolvable` and the authoritative pass refused the program.
+    // ✔MEASURED at fcb3a9d7: `#define HDR(x) #x` + `#include HDR(feature.h)` was
+    // refused by DSS and compiled AND RUN by WSL gcc 13.3.0, WSL clang 18.1.3
+    // and mingw-w64 gcc 13.2.0, and compiled by MSVC 19.51.36252 (each probed
+    // separately). It now runs through the same engine the authoritative pass
+    // uses, so `#`/`##`, arguments, varargs and hide sets all behave.
     //
     // ★★ THE FOUR OUTCOMES, AND WHY `Unresolvable` IS NOT FOLDED INTO
     // `Malformed`. The two say opposite things about WHOSE fault it is:
@@ -2126,35 +1923,33 @@ struct SynthBuilder {
     //                  / `expected "FILENAME" or <FILENAME>` / `error C2006`),
     //                  so the caller reports the C 6.10.2 constraint violation
     //                  itself.
-    //   Unresolvable — the expansion did NOT complete: a FUNCTION-LIKE macro
-    //                  this weaker (object-like-only) evaluator never expands,
-    //                  a self-referential one, or a name no `#define` this pass
-    //                  has seen defines (a descriptor-injected macro —
-    //                  [[D-PP-PRESCAN-DESCRIPTOR-MACROS-UNTRACKED]]). Calling
-    //                  THAT malformed would hard-error on valid C, so the
-    //                  caller leaves the directive verbatim and the
-    //                  AUTHORITATIVE macro pass — which holds the full table —
-    //                  fails loud on it there.
+    //   Unresolvable — the expansion did NOT complete: a name the oracle still
+    //                  knows as a macro survived it (a self-referential macro
+    //                  frozen by its own hide set, or an expansion stopped by
+    //                  the >256 nesting backstop). Calling THAT malformed would
+    //                  hard-error on valid C, so the caller leaves the directive
+    //                  verbatim and the AUTHORITATIVE macro pass fails loud on
+    //                  it there.
+    //   ⓘ The old third cause of `Unresolvable` — "a name no `#define` this pass
+    //     has seen defines" — is GONE for the function-like class the oracle now
+    //     expands. A descriptor-injected macro
+    //     ([[D-PP-PRESCAN-DESCRIPTOR-MACROS-UNTRACKED]]) is still untracked and
+    //     still lands here, but it lands as an ORDINARY IDENTIFIER the oracle
+    //     does not know, which is the `Malformed` reading — so the membership
+    //     test below asks the ORACLE whether the survivor is a macro rather than
+    //     assuming every surviving identifier is one.
     // ⚠ SILENCE IS THE ONE OUTCOME THIS FUNCTION MAY NEVER PRODUCE. Every
     // verdict above ends in a resolution or a loud diagnostic; that is the
     // entire content of the row this closes.
     [[nodiscard]] SbIncludeOperand sbExpandComputedInclude(
-        std::vector<Token> const& in, SourceBuffer const& buf) const {
+        std::string_view operandText) const {
         SbIncludeOperand op;
-        // The per-EXPANSION product tail, exactly as `sbEvalIfOperand` owns one
-        // per evaluation: substituted replacements are MINTED into it, so the
-        // shared `localMacros` stays buffer-independent and nothing is ever
-        // re-lexed across a substitution boundary (TF-C60's BLOCKER-2).
-        std::string           product;
-        std::set<std::string> active;
-        // The `defined`-operand barrier is deliberately NOT armed here: an
+        // The `defined`-operand barrier is deliberately NOT armed for this
+        // expansion (`ppOracleExpandOperand`, not `ppOracleEvalIf`): an
         // `#include` operand is not an `#if` controlling expression, so a token
-        // spelled `defined` in one is an ordinary identifier (C 6.10.1p4 scopes
-        // the operator to `#if`/`#elif`). `sbExpand` requires a barrier
-        // reference, and a barrier the operand never satisfies is inert.
-        PpIfOperandBarrier barrier = sbMakeIfOperandBarrier();
-        std::vector<Token> const ex =
-            sbExpand(in, buf, product, active, 0, barrier);
+        // spelled `defined` in one is an ordinary identifier — C 6.10.1p4 scopes
+        // the operator to `#if`/`#elif`.
+        std::vector<Token> const ex = oracle.ppOracleExpandOperand(operandText);
 
         // Empty after expansion -> the constraint violation all three
         // references diagnose (`#define H` then `#include H`).
@@ -2172,7 +1967,7 @@ struct SynthBuilder {
                 op.form = SbIncludeForm::Malformed;   // `#include ""` / unterminated
                 return op;
             }
-            op.name = std::string{sbTextOf(ex[1], buf, product)};
+            op.name = std::string{oracle.ppOracleText(ex[1])};
             op.form = op.name.empty() ? SbIncludeForm::Malformed
                                       : SbIncludeForm::Quote;
             return op;
@@ -2210,14 +2005,16 @@ struct SynthBuilder {
                 op.form = SbIncludeForm::Malformed;
                 return op;
             }
-            // A name token still naming a macro means expansion did NOT
-            // complete for it (`<FOO>` where FOO is function-like or
-            // self-referential). Resolving `FOO` as a literal header name would
-            // be a WRONG include, so this is the conservative verdict.
+            // A survivor the ORACLE still knows as a macro means expansion did
+            // NOT complete (a self-referential `<FOO>`, or one stopped by the
+            // nesting backstop). Resolving `FOO` as a literal header name would
+            // be a WRONG include, so this is the conservative verdict. Asking
+            // the oracle — rather than treating every surviving identifier as
+            // unfinished — is what lets an ordinary identifier inside `<...>`
+            // (`<sys/types.h>` lexes `sys` and `types` as Words) still resolve.
             for (std::size_t n = 1; n < close; ++n) {
                 if (ex[n].coreKind != CoreTokenKind::Word) continue;
-                if (localMacros.find(std::string{sbTextOf(ex[n], buf, product)})
-                    != localMacros.end()) {
+                if (oracle.ppOracleNameIsMacro(oracle.ppOracleText(ex[n]))) {
                     op.form = SbIncludeForm::Unresolvable;
                     return op;
                 }
@@ -2231,226 +2028,83 @@ struct SynthBuilder {
             // in gcc 13.3.0, clang 18.1.3 AND MSVC 19.51 (each quotes it back
             // verbatim in its not-found message), so a whitespace-NORMALIZING
             // join would disagree with all three at once. Adjacency is read off
-            // the SPANS rather than a trivia token because `sbMintProduct` drops
-            // trivia when it re-tokenizes a replacement.
+            // the SPANS rather than a trivia token because the oracle's
+            // materialization drops trivia when it re-tokenizes.
             for (std::size_t n = 1; n < close; ++n) {
                 if (n > 1 && ex[n].span.start() != ex[n - 1].span.end()) {
                     op.name += ' ';
                 }
-                op.name += sbTextOf(ex[n], buf, product);
+                op.name += oracle.ppOracleText(ex[n]);
             }
             op.form = op.name.empty() ? SbIncludeForm::Malformed
                                       : SbIncludeForm::Angle;
             return op;
         }
 
-        // (3) An IDENTIFIER survived the expansion -> this pass could not
-        // finish the job (see the Unresolvable note above); anything else
-        // completed and simply is not a header name.
-        op.form = (ex[0].coreKind == CoreTokenKind::Word)
+        // (3) A MACRO NAME survived the expansion -> this pass could not finish
+        // the job (see the Unresolvable note above); anything else — an ordinary
+        // identifier the oracle does not know included — completed and simply is
+        // not a header name.
+        op.form = (ex[0].coreKind == CoreTokenKind::Word
+                   && oracle.ppOracleNameIsMacro(oracle.ppOracleText(ex[0])))
                       ? SbIncludeForm::Unresolvable
                       : SbIncludeForm::Malformed;
         return op;
     }
 
-    // c17: evaluate an `#if`/`#elif` controlling expression in the SynthBuilder
-    // pre-scan, to decide whether a quote-`#include` nested under it should be
-    // resolved NOW (the P0016 fix). Reuses the SHARED `evaluateIfExpression`
-    // (the same ICE engine + const-eval core the macro pass uses) with
-    // `localMacros`-backed callbacks; diagnostics go to a SCRATCH reporter (the
-    // authoritative `MacroExpander` pass re-evaluates the same `#if` and reports
-    // any error -- never double-reported here). Returns the BRANCH-TAKEN
-    // boolean. FIX-3 conservative fallback: if the operand invokes a
-    // function-like macro OR the expression cannot be evaluated (nullopt),
-    // `uncertain` is set and the result is FALSE -- the P0016-safe direction
-    // (skip the include; a wrongly-skipped LIVE include fails loud downstream,
-    // never a silent wrong-include). `[p, end)` are the operand tokens; `buf` is
-    // the scan buffer; `includingDir` resolves a `__has_include`.
-    bool sbEvalIfOperand(std::vector<Token> const& toks, std::size_t p,
-                         std::size_t end, SourceBuffer const& buf,
-                         fs::path const& includingDir, bool& uncertain) {
-        uncertain = false;
-        std::size_t last = end;
-        while (last > p && isNewline(toks[last - 1])) --last;
-        std::vector<Token> operand(
-            toks.begin() + static_cast<std::ptrdiff_t>(p),
-            toks.begin() + static_cast<std::ptrdiff_t>(last));
-
-        // FIX-3: a function-like-macro invocation in the guard is NOT evaluated
-        // by this weaker (object-like) pre-scan -- force the conservative
-        // (skip) direction so a divergence can never resolve a DEAD include
-        // (which would re-open P0016).
-        for (Token const& t : operand) {
-            if (t.coreKind != CoreTokenKind::Word) continue;
-            auto it = localMacros.find(std::string{buf.slice(t.span)});
-            if (it != localMacros.end() && it->second.functionLike) {
-                uncertain = true;
-                return false;
-            }
+    // ★★★ [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] — evaluate an `#if`/`#elif`
+    // controlling expression to decide whether a quote-`#include` nested under it
+    // should be resolved NOW (the P0016 fix), BY ASKING THE ORACLE.
+    //
+    // ★★ THIS FUNCTION USED TO BE 150 LINES OF SECOND PREPROCESSOR. It bound its
+    // own `expandCb` to a private object-like-only rescan, its own `definedCb`,
+    // its own `__has_include`/`__has_embed` callbacks and its own product tail,
+    // then re-derived FIX-3's "is this guard decidable?" question TWICE (a
+    // raw-operand scan for a function-like name, and a post-expansion scan for
+    // one the expansion PRODUCED). Every one of those was a re-statement of
+    // something `MacroExpander::evalIfOperand` already does, and the FIX-3
+    // uncertainty it computed was not a property of the PROGRAM — it was a
+    // property of the weaker evaluator. It is gone: the oracle IS
+    // `MacroExpander::evalIfOperand`.
+    //
+    // ⚠ `uncertain` SURVIVES, FOR ONE CAUSE ONLY, AND IT IS DIRECTIONAL. The
+    // oracle mints into a product tail with no line-map and owns its own
+    // `__COUNTER__`, so `__LINE__` / `__FILE__` / `__COUNTER__` are the three
+    // values it CANNOT answer as the authoritative pass will. A guard that reads
+    // one is therefore still taken conservatively (skip; the authoritative pass
+    // then fails loud rather than silently dropping the header) — the pre-fix
+    // behaviour, narrowed from "any function-like macro anywhere in the operand"
+    // to "this evaluation actually materialized a position-derived value".
+    // ★ Read as a DELTA over the one evaluation, so no reset can be forgotten,
+    // and it is an escape ALMOST NO ROW TRIPS — which is the property
+    // [[feedback-an-escape-every-row-triggers-disarms-the-guard]] says to check.
+    // ✔MEASURED: the delta is zero across the whole examples corpus and the
+    // preprocessor suite.
+    //
+    // `operandText` is the operand's raw source bytes; `includingDir` is the
+    // directory a `__has_include("h")` in the guard resolves against, which moves
+    // as this pre-scan descends the include tree.
+    bool sbEvalIfOperand(std::string_view operandText,
+                         fs::path const& includingDir, LineMap const& localMap,
+                         ByteOffset scanOffset, bool& uncertain) {
+        oracle.ppOracleSetIncludingDir(includingDir);
+        // ★ STATE WHERE THE QUESTION COMES FROM, so `__LINE__`/`__FILE__` in the
+        // guard answer what the authoritative pass will answer for the SAME
+        // directive. This pass owns `localMap` — it is the one BUILDING it — so
+        // the origin buffer + offset for a scan-buffer byte is a lookup, not a
+        // guess. An unmapped offset (the non-emitted `#define` prefix, which
+        // holds no `#if`) states nothing and the oracle counts the read instead.
+        LineMap::Resolved const r = localMap.resolve(scanOffset);
+        if (r.origin != nullptr) {
+            oracle.ppOracleSetPresumedPosition(r.origin->lineCol(r.offset).line,
+                                               std::string{r.origin->name()});
+        } else {
+            oracle.ppOracleSetPresumedPosition(0, std::string{});
         }
-
-        // TF-C60 (c′): the per-EVALUATION product string. Substituted macro
-        // replacements are minted here; `productCb` hands it to
-        // `evaluateIfExpression`, which reads a product-region span straight out
-        // of it (no concatenated buffer is built — see that function's
-        // D-PERF-PP-IF-REMATERIALIZES-THE-WHOLE-SYNTH-BUFFER-PER-EVALUATION
-        // note). Owned per call — it must outlive the whole evaluation, and now
-        // strictly so: the ICE BORROWS these bytes rather than copying them, and
-        // it slices after the expand callback returns.
-        std::string sbProduct;
-        // FIX-3 completion (post-expansion arm): an object-like macro can EXPAND
-        // TO a function-like macro's NAME (`#define Z ENABLED(1)`), which the
-        // raw-operand check above cannot see. Freezing the expansion here is NOT
-        // conservative — folding an unexpandable identifier to 0 is only the safe
-        // direction at EVEN polarity; `#if !Z` inverts it to TRUE and would
-        // eagerly resolve an authoritatively-DEAD include, re-opening P0016 (the
-        // exact hazard FIX-3 exists to forbid, and now tree-wide, since a
-        // wrongly-spliced header's `#define`s pollute the SHARED map). Record the
-        // uncertainty and let the caller take the conservative skip instead.
-        bool sbPostExpandUncertain = false;
-        PpMacroExpand expandCb =
-            [this, &buf, &sbProduct,
-             &sbPostExpandUncertain](std::vector<Token> const& in) {
-                std::set<std::string> active;
-                // D-PP-DEFINED-VIA-MACRO-EXPANSION: one barrier per evaluation,
-                // threaded through the whole recursion (see `sbExpand`).
-                PpIfOperandBarrier barrier = sbMakeIfOperandBarrier();
-                std::vector<Token> out =
-                    sbExpand(in, buf, sbProduct, active, 0, barrier);
-                // D-PP-DEFINED-VIA-MACRO-EXPANSION: the uncertainty scan below
-                // asks "did the expansion leave a function-like macro NAME the
-                // pre-scan cannot expand?". A `defined` OPERAND is not such a
-                // name — it is an operand the barrier deliberately preserved, and
-                // `#if defined(F)` for a function-like `F` is a perfectly
-                // decidable 1. Re-running the SAME barrier over the OUTPUT is
-                // what keeps the two answers from disagreeing; a second,
-                // hand-written "is this a defined operand?" test here is exactly
-                // the two-paths-for-one-concept the row forbids.
-                PpIfOperandBarrier scan = sbMakeIfOperandBarrier();
-                for (Token const& t : out) {
-                    bool const isWordTok = (t.coreKind == CoreTokenKind::Word);
-                    std::string name;
-                    if (isWordTok) name = std::string{sbTextOf(t, buf, sbProduct)};
-                    if (scan.protects(t, isWordTok ? std::string_view{name}
-                                                   : std::string_view{})) {
-                        continue;
-                    }
-                    if (!isWordTok) continue;
-                    auto it = localMacros.find(name);
-                    if (it != localMacros.end() && it->second.functionLike) {
-                        sbPostExpandUncertain = true;
-                        return in;
-                    }
-                }
-                return out;
-            };
-        PpIsDefined definedCb = [this](std::string_view n) {
-            // C19/C21 (D-PP-PRESCAN-DEFINEDNESS-PARITY): unified with
-            // `#ifdef`/`#ifndef` via `sbNameDefined`. A command-line `--define` is
-            // seen through `localMacros` (the C21 value prefix seeds it), so
-            // `#if defined(SQLITE_TEST)` and `#ifdef SQLITE_TEST` agree AND both see
-            // a command-line define.
-            return sbNameDefined(n);
-        };
-        // Resolve `__has_include` EXACTLY as the include machinery / the macro
-        // pass's callback does (quote = self-dir + includeDirs; angle =
-        // `<stem>.json` on systemDirs, gated by per-format availability), so the
-        // pre-scan and the authoritative pass never disagree on a header's
-        // existence.
-        PpHasInclude hasIncludeCb =
-            [this, &includingDir](std::string_view filename,
-                                  bool isAngle) -> bool {
-            if (isAngle) {
-                // D-INCLUDE-ANGLE-SOURCE-FALLBACK + FC15c: resolve EXACTLY as the
-                // angle `#include <h>` arm does, through the SHARED funnel, so
-                // `__has_include(<h>)` and `#include <h>` can never disagree on
-                // existence. Descriptor -> keep the existing per-format availability
-                // verdict (an unavailable-on-this-format descriptor answers 0,
-                // matching the arm that then leaves the include verbatim). Source ->
-                // a real header on the -I path is includable (the arm textually
-                // splices it) -> 1. NotFound -> 0.
-                //   D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: a `__has_include(<h>)` probe
-                //   is NOT an include -- it records NOTHING for the reparse-seed oracle
-                //   (a live `#include <h>` seeds via its own splice; a probe with no
-                //   matching include resolves nothing). Left as a pure existence answer.
-                AngleIncludeResolution const ar =
-                    resolveAngleInclude(filename, systemDirs, includeDirs,
-                                        headerNameMatching);
-                switch (ar.kind) {
-                    case AngleIncludeKind::Descriptor:
-                        return !(activeFormat.has_value()
-                                 && !ffi::shippedHeaderAvailableForFormat(
-                                        ar.path, *activeFormat));
-                    case AngleIncludeKind::Source:
-                        return true;
-                    case AngleIncludeKind::NotFound:
-                        return false;
-                    case AngleIncludeKind::AmbiguousDescriptor:
-                    case AngleIncludeKind::AmbiguousSource:
-                        // Speculative pass — reporting here would break
-                        // dead-branch inertness (C 6.10p1). Answer 0. This is
-                        // safe for the OPERATOR specifically: the AUTHORITATIVE
-                        // `__has_include` (MacroExpander) re-evaluates every
-                        // LIVE `#if` operand through the same funnel and emits
-                        // there, so an operator whose answer can change the
-                        // build is never silently wrong.
-                        return false;
-                }
-                return false;   // unreachable — every AngleIncludeKind handled above
-            }
-            // Explicitly silent (speculative pass, see above); the
-            // AUTHORITATIVE quote `__has_include` re-resolves and emits.
-            return takeFound(resolveQuote(filename, includingDir),
-                             [](std::span<fs::path const>) {}).has_value();
-        };
-        // TF-C60 (c′): hand the per-eval product tail to the ICE — it assembles
-        // `combined = synth.text() + productText()` and slices minted tokens
-        // (spans at `bufLen + offset`) from the product region. An empty-view
-        // callback here would make every minted span slice past the end (CLAMPED
-        // to garbage) — exactly the silent-wrong-bytes class (b) exists to kill.
-        PpProductText productCb =
-            [&sbProduct]() { return std::string_view{sbProduct}; };
-        // FC17.9(h): the pre-scan `__has_embed`, resolving against THIS
-        // recursion's `includingDir` (the origin file of every token in the scan
-        // buffer), so it AGREES with the authoritative per-origin callback by
-        // construction. Without it, an unknown `__has_embed(` makes the eval
-        // uncertain -> the conservative quote-include SKIP (a wrongly-skipped LIVE
-        // include fails loud downstream, never silent), which would falsely fail
-        // the legitimate `#if __has_embed("r") ... #include "impl.h"` pattern. Same
-        // C23 trichotomy 0/1/2; angle form -> 0. `resolveQuote` already requires a
-        // regular file, so a miss is NOT_FOUND and `file_size` gives emptiness.
-        PpHasEmbed embedCb =
-            [this, &includingDir](std::string_view filename, bool isAngle,
-                                  SourceSpan) -> int {
-            if (isAngle) return 0;
-            // Explicitly silent (speculative pass); the AUTHORITATIVE
-            // `__has_embed` and the `#embed` directive both re-resolve + emit.
-            auto resolved = takeFound(resolveQuote(filename, includingDir),
-                                      [](std::span<fs::path const>) {});
-            if (!resolved) return 0;                       // NOT_FOUND
-            std::error_code ec;
-            auto const sz = fs::file_size(*resolved, ec);
-            if (ec) return 0;
-            return sz == 0 ? 2 /*EMPTY*/ : 1 /*FOUND*/;
-        };
-
-        DiagnosticReporter scratch;   // discard — re-reported by the macro pass
-        auto v = evaluateIfExpression(operand, *schema, expandCb, definedCb,
-                                      hasIncludeCb, buf, productCb, scratch,
-                                      embedCb);
-        // FIX-3 post-expansion arm (see `sbPostExpandUncertain` above): the
-        // expansion produced a function-like macro name, so this weaker pre-scan
-        // cannot decide the guard — take the conservative skip in BOTH polarities
-        // rather than trust a frozen-identifier fold.
-        if (sbPostExpandUncertain) {
-            uncertain = true;
-            return false;
-        }
-        if (!v.has_value()) {
-            uncertain = true;   // malformed/unsupported -> conservative (skip)
-            return false;
-        }
-        return *v;
+        std::uint64_t const before = oracle.positionDerivedMints();
+        bool const taken = oracle.ppOracleEvalIf(operandText);
+        uncertain = oracle.positionDerivedMints() != before;
+        return uncertain ? false : taken;
     }
 
     // ── TF-C87 (D-PP-INCLUDE-REENTRY-GUARD-AWARE) ────────────────────────────
@@ -2489,8 +2143,8 @@ struct SynthBuilder {
                   std::string_view                     name) {
         switch (detectIncludeOnceMechanism(headerBuf, schema)) {
             case IncludeOnceMechanism::MacroGuard:
-                // The guard's controlling name is already in `localMacros` from
-                // the first entry (the map is SHARED across the builder tree), so
+                // The guard's controlling name is already in the ORACLE's table
+                // from the first entry (it is SHARED across the builder tree), so
                 // the re-entered body reads DEAD, resolves no nested include, and
                 // the recursion converges after exactly one extra level.
                 return true;
@@ -2594,9 +2248,8 @@ struct SynthBuilder {
         // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE): prepend the command-
         // line/predefined `#define` VALUE prefix as a NON-EMITTED span-safe HEADER
         // of THIS build's scan buffer, so a `#if <cmdline/predefined>` VALUE guard
-        // (`#if SQLITE_TEST`) evaluates with the macro's value at the include point
-        // -- its replacement tokens slice the SAME `scanBuf` sbExpand reads. Two
-        // LOAD-BEARING invariants keep the prefix un-emittable (so it never
+        // (`#if SQLITE_TEST`) evaluates with the macro's value at the include point.
+        // Two LOAD-BEARING invariants keep the prefix un-emittable (so it never
         // contaminates the output and no diagnostic offset leaks):
         //   (1) it is prepended as RAW bytes with NO localMap segment (NOT through
         //       appendWithContinuationSplice), and copyVerbatim is SEGMENT-DRIVEN
@@ -2604,19 +2257,21 @@ struct SynthBuilder {
         //       is STRUCTURALLY un-copyable; AND
         //   (2) copiedUpTo starts at prefixLen (below), not 0.
         // The prefix's `#define` lines are consumed by the main loop's `#define`
-        // handler (seeding `localMacros` with VALUES) and that handler does
+        // handler (which hands each one to the ORACLE) and that handler does
         // `i=lineEndTok-1; continue;` -- it never touches copiedUpTo -- so NO
         // pre-pass is needed. appendWithContinuationSplice bases each source
         // segment at the CURRENT out.size() (== prefixLen), so the line-map stays
         // correct (source at synthStart >= prefixLen).
-        // TF-C60 (Finding 7): the prefix seeds the ROOT build ONLY. `localMacros`
-        // is now SHARED across the builder tree, so a child re-prepending it
+        // TF-C60 (Finding 7): the prefix seeds the ROOT build ONLY. The macro
+        // state is SHARED across the builder tree, so a child re-prepending it
         // would RE-ADD a command-line define the source had `#undef`'d before the
         // include — breaking the C21 "#undef composes" invariant in the exact
         // direction the authoritative pass resolves it (its prologue runs ONCE
         // per TU, then the #undef holds for the rest, children included). The
         // prefix's second historical role — providing sliceable SPANS for seeded
-        // replacement values — is obsolete: SbMacro now stores replacement TEXT.
+        // replacement values — is obsolete: the oracle mints every replacement
+        // into its OWN product tail
+        // ([[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]).
         // ── The four pure per-file results, from the memo when this is an
         // INCLUDE (`pre`), built here when it is the ROOT. Held by const
         // reference either way, so everything below reads one shape: the memo
@@ -2759,20 +2414,33 @@ struct SynthBuilder {
                 auto textOfTok =
                     [&](Token const& t) { return scanBuf->slice(t.span); };
                 auto isDefinedTok = [&](std::string_view n) {
-                    // C19 (D-PP-PRESCAN-DEFINEDNESS-PARITY): was localMacros-ONLY,
+                    // C19 (D-PP-PRESCAN-DEFINEDNESS-PARITY): this used to read a
+                    // pre-scan-LOCAL macro map only,
                     // which diverged from `#if defined()` (definedCb) and missed
                     // command-line `--define`s + predefined macros -> a
                     // `#ifdef SQLITE_TEST`-gated quote-`#include` was falsely
-                    // skipped and its `#define`s dropped. Now the SAME oracle.
-                    return sbNameDefined(n);
+                    // skipped and its `#define`s dropped. Now the SAME oracle —
+                    // and [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] made that
+                    // literal: `MacroExpander::isDefined`, the very predicate the
+                    // authoritative `#ifdef` will consult, not a parallel one.
+                    return oracle.ppOracleIsDefined(n);
                 };
-                // The `#if`/`#elif` value comes from the local pre-scan eval;
+                // The `#if`/`#elif` value comes from the oracle;
                 // `sbEvalUncertain` reports whether it was confident.
-                auto evalExprTok = [&](std::vector<Token> const& in,
+                //
+                // ⚠ THE INDEX SHIFT IS EXACT, NOT APPROXIMATE. `lineToks[x]` is
+                // `toks[i + x].tok` by construction (the flatten loop below
+                // copies `toks[i .. lineEndTok)` in order), so the operand run
+                // `[p, end)` in the handler's coordinates is `[i + p, i + end)`
+                // in this file's PPToken vector — which is what lets the raw
+                // SOURCE BYTES be sliced for the oracle without rebuilding a
+                // token vector per directive line.
+                auto evalExprTok = [&](std::vector<Token> const&,
                                        std::size_t p, std::size_t end) {
                     bool unc = false;
-                    bool const taken =
-                        sbEvalIfOperand(in, p, end, *scanBuf, includingDir, unc);
+                    bool const taken = sbEvalIfOperand(
+                        sbDirectiveTailText(toks, i + p, i + end, *scanBuf),
+                        includingDir, localMap, toks[i].tok.span.start(), unc);
                     sbEvalUncertain = unc;
                     return taken;
                 };
@@ -2855,8 +2523,8 @@ struct SynthBuilder {
                 continue;
             }
 
-            // ── c17: track STACK-LIVE `#define` / `#undef` into `localMacros` so
-            // a later `#if FOO` guard in THIS file evaluates with the macro state
+            // ── c17: hand a STACK-LIVE `#define` / `#undef` to the ORACLE so a
+            // later `#if FOO` guard in THIS file evaluates with the macro state
             // at the include point. Dead-branch defines are ignored (C 6.10p1).
             // Gated on `sbStackActive` (the line executes), NOT `includeResolvable`
             // -- macro state never resolves an include itself (the include gate is
@@ -2864,21 +2532,36 @@ struct SynthBuilder {
             // branch only improves later-guard accuracy, never causes a wrong
             // include. Then skip the directive line (the replacement list must not
             // be scanned as include syntax). ──
+            //
+            // ★★★ [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: the LINE'S RAW BYTES
+            // GO ACROSS, and the oracle's own `handleDefine`/`handleUndef` parse
+            // them. Every rule that used to be re-decided here — object vs
+            // function-like by `(`-adjacency (C 6.10.3p3), the parameter list,
+            // varargs, the redefinition policy, `#undef` composing with a
+            // predefined name — is now decided ONCE, by the code that will decide
+            // it again authoritatively. What was here before recorded a
+            // function-like `#define` as a NAME WITH NO BODY, which is what made
+            // every guard that invoked one undecidable.
+            //
             // TF-C86 (D-CSUBSET-STDARG-F001A): `sbFirstNameOnLine` reads the
             // directive's SUBJECT so both arms can refuse a conditional-inclusion
             // OPERATOR name — the pre-scan must reach the SAME macro state the
             // authoritative pass will, and that pass REFUSES the define/undef
-            // (P_PreprocessorOperatorNameNotDefinable). Recording it here would
-            // put a function-like `__has_include` in `localMacros`, which is
-            // precisely what tripped FIX-3's uncertainty bail and produced the
-            // F001A cascade. The DIAGNOSTIC stays with the authoritative pass
-            // alone (this pre-scan re-walks the same lines; emitting here would
-            // double-report one root cause).
+            // (P_PreprocessorOperatorNameNotDefinable). Handing it over would put
+            // a function-like `__has_include` in the oracle's table, shadowing
+            // the operator in the pre-scan while the real pass still answers it —
+            // one program, two verdicts on one file. ⓘ The oracle's own
+            // `handleDefine` refuses it too, so this test is belt-and-braces
+            // rather than the sole defence; it stays because it is also what
+            // keeps the DIAGNOSTIC with the authoritative pass alone (this
+            // pre-scan re-walks the same lines, and a scratch-reported refusal
+            // costs a materialization for nothing).
             if (sbStackActive(sbCondStack) && dirWord == cfg().defineDirective) {
                 std::size_t const lineEndTok = sbLineEndTok(i);
                 auto const subject = sbFirstNameOnLine(toks, j + 1, lineEndTok);
                 if (!isConditionalInclusionOperator(subject, cfg())) {
-                    sbTrackDefine(toks, j + 1, lineEndTok, *scanBuf);
+                    oracle.ppOracleDefine(
+                        sbDirectiveTailText(toks, j + 1, lineEndTok, *scanBuf));
                 }
                 i = lineEndTok - 1;
                 continue;
@@ -2888,19 +2571,18 @@ struct SynthBuilder {
                 auto const subject = sbFirstNameOnLine(toks, j + 1, lineEndTok);
                 if (!subject.empty()
                     && !isConditionalInclusionOperator(subject, cfg())) {
-                    localMacros.erase(std::string{subject});
-                    // D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS: the erase above
-                    // is the whole story ONLY for a name `localMacros` can hold.
-                    // `sbNameDefined` also answers out of `effectivePredefines`
-                    // (the FUNCTION-like rows FINDING-A keeps out of the value
-                    // prefix), and no erase reaches a config list — so RECORD the
-                    // subtraction. Unconditional on purpose: testing "is this a
-                    // function-like predefine?" here would be a second copy of
-                    // the oracle's own membership rule, and the two would drift
-                    // the moment either list changes. `sbNameDefined` reads
-                    // `localMacros` first, so a later `#define` of the same name
-                    // wins with no ordering hazard and no need to un-record.
-                    undefinedNames.insert(std::string{subject});
+                    // ★ D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS COLLAPSES HERE.
+                    // The old code had to do TWO things — erase from `localMacros`
+                    // AND record the name in a separate `undefinedNames`
+                    // subtraction set — because `sbNameDefined` answered for
+                    // function-like predefines out of a CONFIG LIST no directive
+                    // could reach. The oracle holds every predefine the
+                    // authoritative pass holds, in the two places that pass holds
+                    // them (`table_` from the prologue, `predefined_` from config),
+                    // and its `handleUndef` already knows how to subtract from
+                    // both. One call, no second set, no ordering hazard.
+                    oracle.ppOracleUndef(
+                        sbDirectiveTailText(toks, j + 1, lineEndTok, *scanBuf));
                 }
                 i = lineEndTok - 1;
                 continue;
@@ -2978,14 +2660,14 @@ struct SynthBuilder {
             // loop's hash test (`isHash`, above) has NO `firstOnLine` guard —
             // unlike the authoritative `MacroExpander` loop — so an embedded `#`
             // inside the prose is read as a directive of its own. The first shape
-            // would harvest a phantom macro into `localMacros`; the second would
+            // would harvest a phantom macro into the ORACLE's table; the second would
             // reach the include arm and eagerly resolve/splice a header the
             // program never asked for. Skipping the line is what EVERY other
             // directive this pre-scan recognises already does, and for the same
             // reason (see the conditional and define/undef arms above).
             //
             // Deliberately NOT gated on `sbStackActive`, unlike the define/undef
-            // arms: those MUTATE `localMacros`, so they must only run on a live
+            // arms: those MUTATE the oracle's macro table, so they must only run on a live
             // branch. This one mutates nothing — it only advances `i` past bytes
             // that are not include/define syntax in either case — so skipping is
             // correct live OR dead. (The DIAGNOSTIC itself is not emitted here at
@@ -3038,8 +2720,10 @@ struct SynthBuilder {
             // ★ RESOLVED HERE RATHER THAN REFUSED HERE. The row offered a
             // fail-loud "minimum"; the standing order forbids a workaround, and
             // all three references implement this, so the pre-scan RESOLVES it
-            // and the fail-loud is only the backstop for the residue this
-            // weaker evaluator cannot expand (see `sbExpandComputedInclude`).
+            // and the fail-loud is only the backstop for the residue the
+            // pre-scan cannot expand (see `sbExpandComputedInclude` — after
+            // [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] that residue is a name the
+            // ORACLE still holds as a macro, not a whole macro CLASS).
             //
             // ★ GATED ON `includeResolvable()`, LIKE THE QUOTE ARM AND UNLIKE
             // THE ANGLE SPLICE, and the asymmetry is deliberate. This does not
@@ -3063,18 +2747,21 @@ struct SynthBuilder {
             if (!isQuote && !isAngleLiteral) {
                 if (!includeResolvable()) continue;
                 std::size_t const opEndTok = sbLineEndTok(i);
-                std::vector<Token> operand;
-                operand.reserve(opEndTok - k);
                 for (std::size_t q = k; q < opEndTok; ++q) {
                     if (isTrivia(toks[q].tok) || isNewline(toks[q].tok)) continue;
-                    operand.push_back(toks[q].tok);
                     // The directive ends at the last OPERAND token, not past the
                     // newline — the literal arms cut the same way
                     // (`literalEndPastCloser`), so the line's own newline is
                     // still copied verbatim and the line map does not shift.
                     computedEnd = toks[q].tok.span.end();
                 }
-                computed = sbExpandComputedInclude(operand, *scanBuf);
+                // [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: the operand's RAW
+                // BYTES, expanded by the oracle. `k` is the first operand token;
+                // `sbDirectiveTailText` re-derives the same end this loop just
+                // computed, from the same tokens, so the two cannot disagree
+                // about where the operand stops.
+                computed = sbExpandComputedInclude(
+                    sbDirectiveTailText(toks, k, opEndTok, *scanBuf));
                 if (computed.form == SbIncludeForm::Unresolvable) {
                     continue;   // verbatim; the macro pass fails loud on it
                 }
@@ -3277,9 +2964,8 @@ struct SynthBuilder {
                                        headerNameMatching,
                                        rep, depth + 1, includeStack,
                                        includeOnce, fatal,
-                                       preScanDefinePrefix, effectivePredefines,
-                                       resolvedDescriptorsOut, localMacros,
-                                       undefinedNames};
+                                       preScanDefinePrefix, oracle,
+                                       resolvedDescriptorsOut};
                     child.build(headerBuf, out, map, headerPre);
                     includeStack.pop_back();
                     out.push_back(newline);
@@ -3507,9 +3193,8 @@ struct SynthBuilder {
             SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
                                headerNameMatching, rep,
                                depth + 1, includeStack, includeOnce, fatal,
-                               preScanDefinePrefix,
-                               effectivePredefines, resolvedDescriptorsOut,
-                               localMacros, undefinedNames};
+                               preScanDefinePrefix, oracle,
+                               resolvedDescriptorsOut};
             child.build(headerBuf, out, map, headerPre);
             includeStack.pop_back();
 
@@ -3775,7 +3460,13 @@ struct MacroDef {
     return out;
 }
 
-class MacroExpander {
+// [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: `PpMacroOracle` is the contract the
+// include PRE-SCAN reads its macro state through, and THIS is its one
+// implementation — the pre-scan and the authoritative pass now answer every
+// `#if`/`#ifdef`/`#define` question with the same code. See the interface above
+// for why it exists at all and the façade at the end of this public section for
+// how a second (oracle) instance of this class is hosted.
+class MacroExpander : public PpMacroOracle {
 public:
     // `synth` is the PREFIX buffer (the synthesized text BEFORE any `#`/`##`
     // product is appended); `prefixLen` is its byte length. FC15a (A2): a `#`/`##`
@@ -3824,8 +3515,11 @@ public:
         // are ALREADY format-resolved by `mergePredefinedMacros` — the per-format
         // availability filter that used to be re-applied here (and at the three
         // other seed sites) now runs exactly once, so this authoritative
-        // `predefined_` seed CANNOT drift from the pre-scan's value prefix +
-        // sbNameDefined. Presence in the list IS availability.
+        // `predefined_` seed CANNOT drift from the pre-scan's prologue prefix or
+        // its definedness oracle. Presence in the list IS availability.
+        // [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: the pre-scan's oracle is now a
+        // SECOND INSTANCE OF THIS CLASS seeded from the SAME span, so "cannot
+        // drift" is structural rather than a discipline this comment enforces.
         for (PredefinedMacroDef const& pm : effectivePredefines) {
             // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): a FUNCTION-LIKE predefine is
             // NOT seeded here — it lowers to a `#define name(params) value`
@@ -4180,6 +3874,151 @@ public:
         const std::string_view w = text(in[p]);
         return w == cfg().defineDirective || w == cfg().undefDirective
             || (!cfg().pragmaDirective.empty() && w == cfg().pragmaDirective);
+    }
+
+    // ══ [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] — THE PRE-SCAN ORACLE FAÇADE ══
+    //
+    // ★★★ WHAT THIS IS AND WHY IT EXISTS. The include PRE-SCAN (`SynthBuilder`)
+    // has to decide, BEFORE this pass runs, which quote-`#include`s are live —
+    // it must splice them so this pass can run over ONE frozen buffer. To decide
+    // that it must evaluate `#if`. It used to do so with a PRIVATE, weaker
+    // evaluator (`sbExpand`: object-like macros only, no arguments, no `#`/`##`),
+    // and every construct that evaluator could not decide became a CONSERVATIVE
+    // SKIP -> the include was never spliced -> this pass refused the program.
+    // ✔MEASURED at fcb3a9d7: `#define ENABLED(x) (x)` + `#if ENABLED(1)` gating
+    // `#include "h"` was REFUSED (`P_PreprocessorIncludeError`), where WSL gcc
+    // 13.3.0, WSL clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51.36252 — each
+    // probed SEPARATELY — all compile it, and the three that link also RUN it.
+    //
+    // ★★ THE FIX IS NOT A SECOND, STRONGER EVALUATOR. It is THIS ONE, hosted by
+    // the pre-scan as an oracle. A `MacroExpander` constructed over an EMPTY
+    // prefix buffer (`prefixLen_ == 0`) keeps every token it ever mints in its own
+    // append-only `productText_`, so its macro table is BUFFER-INDEPENDENT — which
+    // is exactly the property TF-C60 had to hand-build for `SbMacro` by storing
+    // replacement TEXT. Feed it the `#define`/`#undef` lines as the pre-scan walks
+    // them and ask it the `#if` questions, and the two passes answer with ONE
+    // implementation instead of two that a comment holds in agreement.
+    //
+    // ⚠ EVERY ENTRY POINT TRUNCATES THE ORACLE'S REPORTER back to the snapshot it
+    // was constructed with. The pre-scan is SPECULATIVE (C 6.10p1: a dead branch's
+    // directives are not processed at all), so nothing it says may reach the user;
+    // this pass re-walks the same bytes and is the sole reporter. Truncating per
+    // call also bounds the scratch reporter on a TU with thousands of directives.
+    void ppOracleBeginScratch() { oracleScratch_ = rep_.snapshotForRollback(); }
+    void ppOracleEndScratch() { rep_.truncateTo(oracleScratch_); }
+
+    // The directory a `__has_include("h")` / `__has_embed("r")` in a guard
+    // resolves against. The pre-scan walks a TREE of files with ONE oracle, so
+    // the includer dir moves as it descends; the authoritative pass sets it once
+    // because it walks one already-spliced buffer.
+    void ppOracleSetIncludingDir(fs::path dir) override {
+        includingDir_ = std::move(dir);
+    }
+
+    // The origin-file coordinates the NEXT oracle question is asked from, so
+    // `__LINE__`/`__FILE__` answer what the authoritative pass will answer for
+    // the same directive. Only ever consulted on the `lineMap_ == nullptr` path,
+    // so the authoritative expander is provably untouched by it.
+    void ppOracleSetPresumedPosition(std::uint32_t line,
+                                     std::string file) override {
+        oraclePresumedLine_ = line;
+        oraclePresumedFile_ = std::move(file);
+    }
+
+    // Seed a `#define` / `#undef` from its RAW SOURCE TEXT — everything on the
+    // directive line AFTER the directive word. Text, not tokens: a token from the
+    // pre-scan's scan buffer would slice THIS expander's buffer and read the wrong
+    // bytes (`SourceBuffer::slice` CLAMPS rather than faults, so that failure mode
+    // is plausible-wrong-bytes, never a crash — TF-C60's BLOCKER-2). Materializing
+    // re-tokenizes the bytes into the oracle's own product tail, where they stay
+    // valid for the whole TU because that tail is append-only.
+    // ⚠ `materializeSignificant` drops trivia and newlines but keeps every
+    // token's SPAN in the product region, so `handleDefine`'s object-vs-function
+    // discrimination (C 6.10.3p3: the `(` must be ADJACENT to the name) still
+    // reads the source's real spacing.
+    void ppOracleDefine(std::string_view directiveTail) override {
+        ppOracleBeginScratch();
+        std::vector<Token> toks = materializeSignificant(directiveTail);
+        handleDefine(toks, 0, toks.size());
+        ppOracleEndScratch();
+    }
+    void ppOracleUndef(std::string_view directiveTail) override {
+        ppOracleBeginScratch();
+        std::vector<Token> toks = materializeSignificant(directiveTail);
+        handleUndef(toks, 0, toks.size());
+        ppOracleEndScratch();
+    }
+
+    // The definedness oracle for `#ifdef` / `#ifndef` / `#elifdef` / `#elifndef`.
+    [[nodiscard]] bool ppOracleIsDefined(std::string_view n) override {
+        return isDefined(n);
+    }
+
+    // Evaluate an `#if` / `#elif` controlling expression from its RAW SOURCE
+    // TEXT. This is `evalIfOperand` — the SAME entry point `handleIf` uses on the
+    // authoritative side — so the two passes cannot disagree about a guard.
+    [[nodiscard]] bool ppOracleEvalIf(std::string_view operandText) override {
+        ppOracleBeginScratch();
+        std::vector<Token> toks = materializeSignificant(operandText);
+        bool const taken = evalIfOperand(toks, 0, toks.size());
+        ppOracleEndScratch();
+        return taken;
+    }
+
+    // Macro-expand a COMPUTED `#include` operand (C23 6.10.2p4) from its raw
+    // source text. NOT `expandTokens`: that arms the `defined`-operand barrier,
+    // and 6.10.1p4 scopes `defined` to `#if`/`#elif` — in an `#include` operand a
+    // token spelled `defined` is an ordinary identifier. `expandRun` is the same
+    // engine without the barrier, which is exactly the split `handleLine` uses.
+    [[nodiscard]] std::vector<Token> ppOracleExpandOperand(
+        std::string_view operandText) override {
+        ppOracleBeginScratch();
+        std::vector<Token> toks = materializeSignificant(operandText);
+        std::vector<Token> out = expandRun(toks);
+        ppOracleEndScratch();
+        return out;
+    }
+
+    // Read a token the oracle minted. Every token the façade hands back lives in
+    // this expander's product tail, so this is the ONLY correct reader for one.
+    [[nodiscard]] std::string_view ppOracleText(Token const& t) const override {
+        return text(t);
+    }
+
+    // TRUE iff `n` names a macro this oracle holds (an ordinary `#define` or a
+    // predefined). The computed-`#include` arm uses it to tell "the expansion
+    // COMPLETED and is not a header name" (a constraint violation to report) from
+    // "a name survived that this pass still knows as a macro" (expansion did not
+    // complete — leave the directive alone).
+    [[nodiscard]] bool ppOracleNameIsMacro(std::string_view n) const override {
+        return table_.find(std::string{n}) != table_.end()
+            || predefined_.find(std::string{n}) != predefined_.end();
+    }
+
+    // ⚠ THE ONE THING THE ORACLE STILL CANNOT ANSWER, AND IT IS DIRECTIONAL.
+    // A count of the reads whose value the oracle could NOT give the same answer
+    // the authoritative pass will:
+    //   • `__COUNTER__` — genuinely unanswerable. It is per-EXPANDER state (the
+    //     class comment on `PredefinedMacroKind::Counter` makes the per-TU reset
+    //     structural), and the oracle and the authoritative pass advance it at
+    //     different points, so no plumbing can reconcile the two.
+    //   • `__LINE__` / `__FILE__` — ONLY when the pre-scan did not state a
+    //     presumed position (`ppOracleSetPresumedPosition`). With one stated,
+    //     both passes read the same origin file and line and the read is NOT
+    //     counted.
+    // The pre-scan reads this as a DELTA across one evaluation and, when it
+    // moved, declines to commit to the guard: the conservative SKIP, which ends
+    // in this pass's fail-loud refusal rather than a silent drop.
+    //
+    // ★ COUNTED, NOT FLAGGED, so no reset can be forgotten. And the escape is
+    // DIRECTIONAL, which is the property
+    // [[feedback-an-escape-every-row-triggers-disarms-the-guard]] says to check
+    // before trusting a guard: P56's arm copied a sibling's escape that EVERY row
+    // triggered, so it refused nothing. ✔MEASURED: the delta is zero across the
+    // whole examples corpus and the preprocessor suite, and non-zero only for a
+    // guard that actually reads `__COUNTER__`.
+    [[nodiscard]] std::uint64_t positionDerivedMints() const override {
+        return positionDerivedMints_;
     }
 
 private:
@@ -5240,8 +5079,10 @@ private:
         // universal `#ifndef __has_include / #define __has_include(x) 0` shim
         // LIVE, which shadowed the real operator with a function-like macro and
         // cascaded into F001A on headers that were present all along. The SAME
-        // predicate backs `SynthBuilder::sbNameDefined`, so the two oracles
-        // cannot drift.
+        // predicate backs the include pre-scan's definedness question too — which
+        // is now THIS FUNCTION, reached through `ppOracleIsDefined`
+        // ([[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]), so the two oracles cannot
+        // drift because there is one.
         return table_.find(std::string{name}) != table_.end()
             || predefined_.find(std::string{name}) != predefined_.end()
             || isConditionalInclusionOperator(name, cfg());
@@ -7765,8 +7606,7 @@ private:
             // PRESUMED one, which `#line` may have remapped (C23 6.10.6p4-5).
             // Resolve the invocation offset through the line-map to its ORIGIN
             // buffer + offset, read the 1-based PHYSICAL line, then apply any
-            // active `#line` for that origin. Null/empty line-map -> line 1
-            // (defensive; a real TU always has a map).
+            // active `#line` for that origin.
             std::uint32_t line = 1;
             if (lineMap_ != nullptr && !lineMap_->empty()) {
                 LineMap::Resolved const r = lineMap_->resolve(invOffset);
@@ -7774,6 +7614,19 @@ private:
                     line = r.origin->lineCol(r.offset).line;
                     line = presumedLine(r.origin, line);
                 }
+            } else if (oraclePresumedLine_ != 0) {
+                // [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: the ORACLE path. It
+                // has no line-map (its tokens live in a product tail belonging to
+                // no file), but the include PRE-SCAN driving it is the pass that
+                // BUILDS the map, so it states the origin line for the directive
+                // it is asking about. That is what lets `#if __LINE__ > 5` gating
+                // a quote-`#include` be DECIDED rather than refused.
+                line = oraclePresumedLine_;
+            } else {
+                // Neither a map nor a stated position: the value is a DEFAULT,
+                // not an answer. Count it, so the pre-scan's `positionDerivedMints`
+                // delta makes the guard uncertain instead of trusting a 1.
+                ++positionDerivedMints_;
             }
             return materializeSignificant(std::to_string(line));
         }
@@ -7792,6 +7645,10 @@ private:
                     name = std::string{r.origin->name()};
                     presumedFile(r.origin, r.origin->lineCol(r.offset).line, name);
                 }
+            } else if (!oraclePresumedFile_.empty()) {
+                name = oraclePresumedFile_;   // the ORACLE path — see Line above
+            } else {
+                ++positionDerivedMints_;      // a DEFAULT, not an answer
             }
             for (char& c : name) {
                 if (c == '\\') c = '/';
@@ -7824,6 +7681,18 @@ private:
             // of the pasted identifier), but agreeing costs nothing and removes a
             // reason for a real program's assumption to be surprised — so the
             // answer is recorded here rather than left to be re-litigated.
+            //
+            // ★★ [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] — THE ONE KIND NO
+            // PLUMBING RECONCILES, counted UNCONDITIONALLY. `__LINE__`/`__FILE__`
+            // are functions of a POSITION, which the include pre-scan can state;
+            // this is a function of HOW MANY TIMES IT HAS ALREADY BEEN READ, and
+            // the pre-scan's oracle and this pass advance separate counters at
+            // different points by construction (see the per-TU note above — that
+            // is the property that makes the reset structural). So a `#if`
+            // reading it stays UNDECIDABLE for the pre-scan, and the guard takes
+            // the conservative skip that ends in the loud
+            // unresolved-live-quote-include refusal rather than a wrong splice.
+            ++positionDerivedMints_;
             return materializeSignificant(std::to_string(counter_++));
         }
         case PredefinedMacroKind::Constant:
@@ -8725,6 +8594,26 @@ private:
     // True only during the ONE expansion whose output reaches the parser (see
     // `flushExpand`). Keeps `#if`-operand expansions out of `packByOffset_`.
     bool                                 recordPack_  = false;
+    // [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: how many times this expander has
+    // materialized a POSITION- or STATE-derived predefined value
+    // (`__LINE__`/`__FILE__`/`__COUNTER__`). Read as a DELTA by the include
+    // pre-scan's oracle (see `positionDerivedMints`), which is the one consumer
+    // whose answer for those kinds cannot match the authoritative pass's. Costs
+    // one increment on a path that already re-tokenizes a spelling.
+    std::uint64_t                        positionDerivedMints_ = 0;
+    // [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: the ORIGIN-file coordinates the
+    // pre-scan states before each oracle question, so `__LINE__`/`__FILE__`
+    // answer what the authoritative pass will. Line 0 / empty name = not stated.
+    // ⚠ Read ONLY on the `lineMap_ == nullptr` branch of `materializePredefined`
+    // — the authoritative expander always has a map, so these are dead members
+    // there rather than a second, competing source of truth for a position.
+    std::uint32_t                        oraclePresumedLine_ = 0;
+    std::string                          oraclePresumedFile_;
+    // [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: the reporter mark every oracle
+    // entry point rolls back to, so a SPECULATIVE pre-scan diagnostic can never
+    // reach the user and the scratch reporter cannot grow with the TU. Unused by
+    // the authoritative expander (nothing calls the façade on it).
+    DiagnosticReporter::Snapshot         oracleScratch_{};
     // The product: synth byte offset of an EMITTED token -> the pack cap in
     // effect when it was emitted. SPARSE — only tokens under a NON-ZERO cap get
     // an entry, so a TU with no `#pragma pack` (every existing one) produces an
@@ -9143,8 +9032,16 @@ PreprocessResult preprocessRun(
     // Each prologue is its own SourceBuffer so line-mapped diagnostics point
     // at the synthetic origin by name. Empty prologues append nothing — the
     // synth stream is byte-identical to the pre-c105 shape.
+    //
+    // ★★★ [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: THE TWO PROLOGUE STRINGS ARE
+    // FUNCTION-SCOPED NOW, because the include PRE-SCAN's oracle is seeded from
+    // the SAME BYTES rather than from a second, separately-built approximation of
+    // them. `preScanDefinePrefix` below is exactly `builtinText + cliText`. The
+    // C21 comment used to argue at length that the pre-scan's own loops stayed
+    // "in lockstep" with these; there is nothing left to keep in step.
+    std::string builtinText;
+    std::string cliText;
     {
-        std::string builtinText;
         // TF-C74: the EFFECTIVE list (seed site #3 of four) — already
         // format-resolved, so no filter is re-applied here. A TARGET-declared
         // function-like predefine lowers to a "<built-in>" `#define` exactly
@@ -9203,7 +9100,6 @@ PreprocessResult preprocessRun(
             appendWithContinuationSplice(origin->text(), origin, 0, synthText,
                                          result.lineMap);
         }
-        std::string cliText;
         for (std::string const& d : userDefines) {
             // `splitUserDefine` is the ONE owner of the NAME/VALUE split and of
             // the `VALUE defaults to 1` rule — shared with the pre-scan prefix
@@ -9231,51 +9127,95 @@ PreprocessResult preprocessRun(
     // source is deliberately NOT seeded: `#pragma once` in the main file records
     // itself when the pragma is REACHED, exactly as it does in a header.
     IncludeOnceRegistry includeOnce;
-    // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE, Option 2): the `#define NAME
-    // VALUE\n` VALUE prefix for the include-gating pre-scan. So a `#if
-    // <cmdline/predefined>` VALUE guard (`#if SQLITE_TEST >= 1`,
+    // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE, Option 2): the synthetic
+    // PROLOGUE the include-gating pre-scan sees before the first source line, so
+    // a `#if <cmdline/predefined>` VALUE guard (`#if SQLITE_TEST >= 1`,
     // `#if __STDC_VERSION__ >= 201112L`) gating a quote-`#include` evaluates
-    // correctly, the pre-scan must see the macro's VALUE -- not just its
-    // definedness. Built from:
-    //   (a) every command-line `--define`, parsed by the SAME `splitUserDefine`
-    //       the `<command-line>` prologue above uses (VALUE defaults to 1) -- so
-    //       the pre-scan is more-live only IN LOCKSTEP with the authoritative
-    //       pass (the one-directional-divergence invariant that keeps P0016
-    //       closed). ★ Sharing the FUNCTION, not merely the intent: these two
-    //       sites previously each carried their own copy of the split, held in
-    //       agreement by this comment alone, and a divergence here silently
-    //       changes whether a `#if NAME`-gated quote-`#include` resolves; PLUS
-    //   (b) every OBJECT-like predefined macro available on the active format, via
-    //       the SHARED filter (FINDING-B) the authoritative `predefined_` seed +
-    //       `sbNameDefined` use -- so the sets cannot drift. FINDING-A: FUNCTION-
-    //       like predefines (`isFunctionLike`) are EXCLUDED -- a bare `#if NAME`
-    //       (no call) must fold to 0 in the pre-scan exactly as in the authoritative
-    //       pass; value-seeding one would make the pre-scan MORE-live -> a silent
-    //       P0016 re-open.
+    // correctly — the pre-scan must see the macro's VALUE, not just its
+    // definedness.
+    //
+    // ★★★ [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] — IT IS NOW LITERALLY THE
+    // AUTHORITATIVE PROLOGUE, and that deletes a whole class of argument. What
+    // stood here was a SECOND construction of the same idea: its own
+    // `splitUserDefine` loop over `userDefines`, its own filtered walk of
+    // `merged.effective`, and a paragraph explaining why the two stayed in
+    // lockstep. They are one string now — `builtinText + cliText`, built once
+    // above and prepended to `synthText` for the authoritative pass — so
+    // "lockstep" is not a property anyone has to maintain.
+    //
+    // ★★ FINDING-A IS RETIRED WITH IT. The old prefix had to EXCLUDE every
+    // FUNCTION-like predefine (`if (pm.isFunctionLike) continue;`) because the
+    // pre-scan's private evaluator could not expand a call: seeding one would
+    // have let a bare `#if NAME` read more-live there than in the real pass. The
+    // oracle expands calls, so a function-like predefine is an ordinary `#define`
+    // line in BOTH passes — which is what the `<built-in>` prologue always made
+    // it for the authoritative one. That also retires the
+    // `D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS` subtraction set, whose entire
+    // job was to let `#undef` reach the config rows this exclusion created.
+    //
     // Each SynthBuilder prepends this as a NON-EMITTED span-safe scanBuf prefix (see
     // build()). Function-scope: it outlives every (recursive) SynthBuilder, held by
     // const-ref + threaded into children.
-    std::string preScanDefinePrefix;
-    for (std::string const& d : userDefines) {
-        UserDefineSplit const s = splitUserDefine(d);
-        preScanDefinePrefix += "#define ";
-        preScanDefinePrefix += s.name;
-        preScanDefinePrefix += ' ';
-        preScanDefinePrefix += s.value;
-        preScanDefinePrefix += '\n';
-    }
-    // TF-C74: the EFFECTIVE list (seed site #4 of four) — already
-    // format-resolved, so no filter is re-applied. This is what makes a
-    // per-architecture predefine usable as a VALUE guard on a quote-`#include`
-    // (`#if __aarch64__` … `#include "x"`), not merely as a definedness test.
-    for (PredefinedMacroDef const& pm : merged.effective) {
-        if (pm.isFunctionLike) continue;   // FINDING-A: never value-seed a call macro
-        preScanDefinePrefix += "#define ";
-        preScanDefinePrefix += pm.name;
-        preScanDefinePrefix += ' ';
-        preScanDefinePrefix += pm.value;
-        preScanDefinePrefix += '\n';
-    }
+    std::string const preScanDefinePrefix = builtinText + cliText;
+    // ★★★ [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]] — THE PRE-SCAN'S MACRO ORACLE.
+    //
+    // A SECOND `MacroExpander`, constructed for ONE job: answering the pre-scan's
+    // `#if` / `#ifdef` / `#define` questions with the same code that will answer
+    // them authoritatively thirty lines below. Before this, the pre-scan carried a
+    // private object-like-only evaluator, and every guard it could not decide
+    // became a conservative skip -> an unspliced quote-`#include` -> a hard
+    // refusal of legal C. ✔MEASURED at fcb3a9d7: `#define ENABLED(x) (x)` +
+    // `#if ENABLED(1)` + `#include "h"` was refused, and WSL gcc 13.3.0, WSL clang
+    // 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51.36252 all accept it (probed
+    // separately; the three that link also RUN it).
+    //
+    // ★★ THE FOUR CONSTRUCTION ARGUMENTS THAT MAKE IT AN ORACLE RATHER THAN A
+    // SECOND COMPILER, each load-bearing:
+    //   • An EMPTY prefix buffer with `prefixLen == 0`. Every token it mints then
+    //     lands in its own APPEND-ONLY `productText_`, so its macro table is
+    //     buffer-independent and survives the whole include tree — the property
+    //     TF-C60 had to hand-build for `SbMacro` by storing replacement TEXT.
+    //     `evaluateIfExpression` splits prefix from product at `buf.size()`, which
+    //     is 0 here, so its view and the expander's agree by construction.
+    //   • A NULL line-map. It is not producing coordinates anyone will resolve;
+    //     `materializePredefined` already handles a null map defensively, and the
+    //     one consequence — `__LINE__`/`__FILE__` answering 1/`"<source>"` — is
+    //     exactly what `positionDerivedMints()` exists to make VISIBLE to the
+    //     pre-scan rather than silent.
+    //   • A SCRATCH reporter. The pre-scan is SPECULATIVE (C 6.10p1: a dead
+    //     branch's directives are not processed), so nothing it says may reach the
+    //     user; the authoritative pass re-walks the same bytes and is the sole
+    //     reporter. Every façade entry point rolls this reporter back, so it also
+    //     cannot grow with the TU.
+    //   • The SAME `merged.effective`, includeDirs, systemDirs, activeFormat and
+    //     header-name matching the authoritative expander gets, so `__has_include`
+    //     and predefined definedness answer identically in both.
+    //
+    // ⚠ IT IS NOT `run()`. Nothing walks a token stream through it — it is driven
+    // one directive at a time by `SynthBuilder`, so it never records a `#pragma
+    // pack` stamp, never builds a dead-range, and never emits a token.
+    // ⚠ BUDGET-DERIVED, even though every entry point rolls it back and nothing
+    // it holds can reach the operator. `test_diagnostic_budget_threading`'s scan
+    // says a reporter on the threaded path either carries the operator's budget
+    // or earns an allowlist entry with a reason
+    // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE), and an exception is
+    // worth strictly less than obeying the rule: the caps cost nothing on a
+    // stream that is discarded, and one fewer allowlisted shape is one fewer
+    // thing a later reader has to re-litigate.
+    DiagnosticReporter preScanScratch{budget.asConfig()};
+    auto preScanOracleBuffer = SourceBuffer::fromString(
+        std::string{}, "<pp-prescan-oracle>");
+    MacroExpander preScanOracle{preScanOracleBuffer,
+                                schema,
+                                preScanScratch,
+                                /*prefixLen=*/0,
+                                /*lineMap=*/nullptr,
+                                headerNameMatching,
+                                includeDirs,
+                                systemDirs,
+                                activeFormat,
+                                includingDirectoryOf(mainSource->name()),
+                                merged.effective};
     // c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING): the SynthBuilder is conditional-
     // aware ONLY to gate quote-`#include` splicing (a dead-branch quote include
     // must not resolve -- the P0016 fix). The dead-region byte set used to
@@ -9291,20 +9231,18 @@ PreprocessResult preprocessRun(
     // authoritatively-live set the finish() oracle's `shippedLibDescriptors` holds.
     // Threaded by reference into the SynthBuilder (and its recursive children).
     std::vector<std::pair<fs::path, ByteOffset>> resolvedParents;
-    // TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE): the ROOT owns the pre-scan
-    // macro map; every child builder threads it by reference, so `#define`s flow
-    // across include boundaries in document order (both directions).
-    std::unordered_map<std::string, SynthBuilder::SbMacro> preScanMacros;
-    // D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS: the ROOT owns the pre-scan's
-    // `#undef` record, threaded by reference into every child builder beside
-    // `preScanMacros`. Function scope, so it outlives the whole recursion.
-    std::unordered_set<std::string> preScanUndefined;
+    // TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE): the pre-scan's macro state
+    // spans the WHOLE include tree in document order, so a `#define` arriving via
+    // a nested include is visible to the parent's later `#if` and vice versa.
+    // [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: that state is now the ORACLE built
+    // above — one `MacroExpander`, threaded by reference into every child builder
+    // exactly as the `SbMacro` map and the `#undef` set used to be.
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
                          headerNameMatching,
                          *result.diagnostics, 0, includeStack, includeOnce,
                          result.fatal,
-                         preScanDefinePrefix, merged.effective,
-                         resolvedParents, preScanMacros, preScanUndefined};
+                         preScanDefinePrefix, preScanOracle,
+                         resolvedParents};
     {
         // D-PERF-1 sub-timing: the synth-buffer splice (recursive concat of the
         // main file + every quote-#include, + the line-map). Nests under the

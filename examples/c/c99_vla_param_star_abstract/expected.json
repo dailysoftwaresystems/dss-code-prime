@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-VLA-PARAM-STAR-ABSTRACT (C 6.7.6.2p4): the UNNAMED abstract `[*]` array-declarator suffix — `int f(int, int [*]);` — parses, resolves and RUNS on all four legs, beside the NAMED `int g(int n, int a[*]);` form that already worked and is kept here as the in-example control. `[*]` is the prototype-form marker for a variable-length bound the prototype does not name; C 6.7.6.2p4 permits it only in a function declarator that is not part of a definition, so each prototype is followed by a definition spelling the real bound, and the suffix decays exactly like an absent-length `[]` so the parameter is an ordinary `int *`. WHAT ACTUALLY BLOCKED IT, because the anchor named the wrong rule: the row said `abstractDirectDeclarator`'s non-speculative suffix repeat was the blocker; MEASURED, an unnamed abstract parameter never reaches that rule — the shipped `param` is `head + {optional declarator}`, so `int [*]` routes through `directDeclarator`, whose BASE alt (where a leading `[` lands with no name) did not list `arrayStarSuffix` while its own $comment claimed it did. The NAMED form worked because a name puts the suffix in the REPEAT, which already listed it. The fix adds `arrayStarSuffix` to that base alt, before `arrayDeclSuffix`; the base alt was ALREADY speculative (lookahead 64) so `[N]` and the deref-sized `[*p]` probe the fixed 3-token `[ * ]` first and roll back cleanly — no speculation was introduced and `abstractDirectDeclarator` was not touched, so the cast-vs-value type-name triage the row feared is untouched by construction. MEASURED 2026-09-03: gcc 13.3.0 and clang 18.1.3 compile and RUN both forms at -std=c17 and -std=c2x (each warns about the bound mismatch — -Wvla-parameter / -Warray-parameter — and neither refuses); MSVC ABSTAINS twice over, `C2059: syntax error: ']'` on the `[*]` itself and `C2057` on every VLA bound. The last two checks call the SAME prototypes with a SHORTER bound: `[*]` names no bound, so a declaration that had frozen 3 would read past the end or return the wrong cell. Arguments are FIXED arrays and main holds no VLA object, so main may CALL — isolated from the non-leaf-VLA-frame deferral. exitCode 42; returns 1..5 are strict in-program pins.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

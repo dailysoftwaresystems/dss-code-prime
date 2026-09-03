@@ -752,6 +752,28 @@ struct Lowerer {
     std::unordered_map<std::uint32_t, std::uint32_t> allocaSlotIndex_;
     std::uint32_t                   allocaLirCount_ = 0;
 
+    // ── D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE: the wide-float phi merge ────────
+    //
+    // An F80/F128 (`long double`) SSA value is the GPR-held ADDRESS of its
+    // memory home, so its phi merges in MEMORY: the phi RESULT gets a home of
+    // its own (recorded in `allocaSlotIndex_` above, exactly like an
+    // `lowerF80Arith` result, so `regForValue` rematerializes its address at
+    // every use) and each incoming edge COPIES the 80/128-bit datum into it.
+    // A register-class edge-move would be class-inconsistent — `fld [xmm]` —
+    // which is the silent miscompile the 2026-07-18 LD-1 x87 review caught.
+    //
+    // `prepassAllocatePhis` cannot reserve those homes itself: it runs BEFORE
+    // any LIR block is open, and a reservation is an emitted `alloca` op. So it
+    // RECORDS the phis here and `reserveWideFloatPhiHomes` drains the list at
+    // the head of the first block lowered. Both reset per function.
+    std::vector<MirInstId>          pendingWideFloatPhis_;
+    // Wide-float phi MIR value id → the scan-order slot index of its per-edge
+    // STAGING home (the memory twin of the register path's cycle-breaking temp;
+    // see `emitPhiMovesForEdge`). ONE staging slot serves every edge of a given
+    // phi: only one edge executes per traversal, and within an edge the slot is
+    // written and read back before control leaves the copy sequence.
+    std::unordered_map<std::uint32_t, std::uint32_t> wideFloatPhiStagingSlot_;
+
     // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the EFFECTIVE alignment of each
     // reserved frame slot, indexed by the SAME 0-based scan-order index
     // `allocaLirCount_` hands out — one entry pushed at every reservation site, so
@@ -5827,6 +5849,82 @@ struct Lowerer {
         defineValue(id, *addr);
     }
 
+    // ── THE ONE MEMORY-HOME COPY VERB ────────────────────────────────────────
+    //
+    // Copy one memory-resident wide float from the home at `srcAddr` to the home
+    // at `dstAddr`. THE SOLE bytes-mover for the LD model: the `long double`
+    // Store lowerings and the CONTROL-MERGE phi edge copies all funnel through
+    // it, so no two of them can drift about how wide a `long double` is.
+    // Dispatch is on TypeKind ALONE — F80 and F128 each form solely on their own
+    // format axis and the target's own opcode table decides the rest, so there
+    // is no arch/format identity branch here.
+    //
+    // ⚠⚠ F80 MOVES THROUGH THE x87 STACK, AND THAT IS NOT AN ACCIDENT OF
+    // HISTORY. An F80 home address can be ANY `long double` lvalue's address —
+    // `lowerF80Load` address-PROPAGATES, so the address may point at a 10-byte
+    // object inside a packed struct rather than at one of this lowerer's own
+    // 16-byte scratch slots. `fld_m80`/`fstp_m80` touch exactly the 10
+    // significant bytes; a two-word 16-byte GPR copy (the shape F128 uses, and
+    // the cheaper one) would OVER-READ such a source by six bytes. F128 is a
+    // true 16-byte binary128, so its 16-byte copy is exact.
+    //
+    // Fail-loud (false, diagnostic already reported) if the target declares no
+    // such op, or if `kind` is not a memory-resident wide float — the caller
+    // must not have routed it here, and a silent no-op copy would leave the
+    // destination holding a stale value.
+    [[nodiscard]] bool emitWideFloatHomeCopy(TypeKind kind, LirReg srcAddr,
+                                             LirReg dstAddr,
+                                             std::string_view context) {
+        switch (kind) {
+            case TypeKind::F80:
+                if (!emitX87MemOp(MnemonicSlot::FldM80, srcAddr, context))
+                    return false;
+                return emitX87MemOp(MnemonicSlot::FstpM80, dstAddr, context);
+            case TypeKind::F128: {
+                auto const loadOp  = classOp(LirRegClass::GPR, RegClassOp::Load);
+                auto const storeOp = classOp(LirRegClass::GPR, RegClassOp::Store);
+                if (!loadOp.has_value()) {
+                    reportMissingClassOp(LirRegClass::GPR, RegClassOp::Load, context);
+                    return false;
+                }
+                if (!storeOp.has_value()) {
+                    reportMissingClassOp(LirRegClass::GPR, RegClassOp::Store, context);
+                    return false;
+                }
+                for (std::int32_t const offset : {0, 8}) {
+                    LirReg const tmp = lir.newVReg(LirRegClass::GPR);
+                    std::array<LirOperand, 3> ldOps{
+                        LirOperand::makeReg(srcAddr),
+                        LirOperand::makeMemBase(1),
+                        LirOperand::makeMemOffset(offset),
+                    };
+                    emitInst(*loadOp, tmp, ldOps);
+                    std::array<LirOperand, 4> stOps{
+                        LirOperand::makeReg(tmp),
+                        LirOperand::makeReg(dstAddr),
+                        LirOperand::makeMemBase(1),
+                        LirOperand::makeMemOffset(offset),
+                    };
+                    emitInst(*storeOp, InvalidLirReg, stOps);
+                }
+                return true;
+            }
+            default: {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "{}: a memory-home copy was requested for TypeKind ordinal "
+                    "{}, which is not a memory-resident wide float (only F80 and "
+                    "F128 are) — the caller mis-routed it "
+                    "(D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE)",
+                    context, static_cast<unsigned>(kind));
+                reporter.report(std::move(d));
+                return false;
+            }
+        }
+    }
+
     // MIR F80 Store → memory→memory copy of the 80-bit datum:
     //   fld_m80 [value-addr] ; fstp_m80 [dest-addr]
     // operand[0] = the F80 value (a GPR-held address), [1] = the dest pointer.
@@ -5836,10 +5934,8 @@ struct Lowerer {
         std::optional<LirReg> const valueAddr = regForValue(operands[0]);
         std::optional<LirReg> const destAddr  = regForValue(operands[1]);
         if (!valueAddr.has_value() || !destAddr.has_value()) return;
-        if (!emitX87MemOp(MnemonicSlot::FldM80, *valueAddr,
-                          "MIR F80 Store (load value)")) return;
-        if (!emitX87MemOp(MnemonicSlot::FstpM80, *destAddr,
-                          "MIR F80 Store (store dest)")) return;
+        (void)emitWideFloatHomeCopy(TypeKind::F80, *valueAddr, *destAddr,
+                                    "MIR F80 Store");
     }
 
     // MIR F80 FAdd/FSub/FMul/FDiv → the fixed x87 memory sequence:
@@ -6243,34 +6339,8 @@ struct Lowerer {
         std::optional<LirReg> const valueAddr = regForValue(operands[0]);
         std::optional<LirReg> const destAddr  = regForValue(operands[1]);
         if (!valueAddr.has_value() || !destAddr.has_value()) return;
-        auto const loadOp  = classOp(LirRegClass::GPR, RegClassOp::Load);
-        auto const storeOp = classOp(LirRegClass::GPR, RegClassOp::Store);
-        if (!loadOp.has_value()) {
-            reportMissingClassOp(LirRegClass::GPR, RegClassOp::Load,
-                                 "MIR F128 Store");
-            return;
-        }
-        if (!storeOp.has_value()) {
-            reportMissingClassOp(LirRegClass::GPR, RegClassOp::Store,
-                                 "MIR F128 Store");
-            return;
-        }
-        for (std::int32_t const offset : {0, 8}) {
-            LirReg const tmp = lir.newVReg(LirRegClass::GPR);
-            std::array<LirOperand, 3> ldOps{
-                LirOperand::makeReg(*valueAddr),
-                LirOperand::makeMemBase(1),
-                LirOperand::makeMemOffset(offset),
-            };
-            emitInst(*loadOp, tmp, ldOps);
-            std::array<LirOperand, 4> stOps{
-                LirOperand::makeReg(tmp),
-                LirOperand::makeReg(*destAddr),
-                LirOperand::makeMemBase(1),
-                LirOperand::makeMemOffset(offset),
-            };
-            emitInst(*storeOp, InvalidLirReg, stOps);
-        }
+        (void)emitWideFloatHomeCopy(TypeKind::F128, *valueAddr, *destAddr,
+                                    "MIR F128 Store");
     }
 
     // Resolve (or MINT) the extern import for softfloat helper `helperSymbol`.
@@ -10916,22 +10986,50 @@ struct Lowerer {
         // Collect (phiReg, incomingReg) pairs for this edge.
         struct Pair { LirReg phi; LirReg incoming; };
         std::vector<Pair> pairs;
+        // D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE: the MEMORY half. A `long double`
+        // phi has no result register at all — it has a frame HOME — so its edge
+        // "move" is a memory→memory copy of the 80/128-bit datum, and the pair
+        // carries the two frame ADDRESSES plus the incoming value's own address.
+        struct MemPair {
+            TypeKind kind;
+            LirReg   home;      // the phi's home — written by step 2
+            LirReg   staging;   // this phi's per-edge staging home
+            LirReg   incoming;  // the incoming value's home — read by step 1
+        };
+        std::vector<MemPair> memPairs;
         std::uint32_t const n = mir.blockInstCount(successorMir);
         for (std::uint32_t i = 0; i < n; ++i) {
             MirInstId const inst = mir.blockInstAt(successorMir, i);
             if (mir.instOpcode(inst) != MirOpcode::Phi) continue;
-            if (!valueToReg.has(inst)) {
+            TypeKind const phiKind = interner.kind(mir.instType(inst));
+            bool const isWideFloat =
+                phiKind == TypeKind::F80 || phiKind == TypeKind::F128;
+            // The two pre-pass invariants — one per representation. A wide float
+            // is NEVER in `valueToReg` (it is memory-resident) and every other
+            // phi is NEVER in the slot maps, so asking the wrong one of a
+            // correctly-lowered phi would fire a false diagnostic.
+            auto const homeSlot    = allocaSlotIndex_.find(inst.v);
+            auto const stagingSlot = wideFloatPhiStagingSlot_.find(inst.v);
+            if (isWideFloat ? (homeSlot == allocaSlotIndex_.end()
+                               || stagingSlot == wideFloatPhiStagingSlot_.end())
+                            : !valueToReg.has(inst)) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
                 d.severity = DiagnosticSeverity::Error;
                 d.actual   = std::format(
-                    "MIR Phi %{} reached edge-move emission without a "
-                    "pre-allocated LirReg — pre-pass invariant broken",
-                    inst.v);
+                    "MIR Phi %{} reached edge-move emission without a {} — "
+                    "pre-pass invariant broken",
+                    inst.v,
+                    isWideFloat ? "reserved long double memory home "
+                                  "(D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE)"
+                                : "pre-allocated LirReg");
                 reporter.report(std::move(d));
                 continue;
             }
-            LirReg const phiReg = valueToReg.get(inst);
+            // A wide float has no phi REGISTER; `phiReg` stays unread on that
+            // path (the memory pair carries frame addresses instead).
+            LirReg const phiReg =
+                isWideFloat ? InvalidLirReg : valueToReg.get(inst);
             bool matched = false;
             for (MirPhiIncoming const& inc : mir.phiIncomings(inst)) {
                 if (inc.pred != currentMir) continue;
@@ -10952,7 +11050,22 @@ struct Lowerer {
                     reporter.report(std::move(d));
                     break;
                 }
-                pairs.push_back(Pair{phiReg, *v});
+                if (isWideFloat) {
+                    // Rematerialize both frame addresses HERE, on this edge —
+                    // the c69 remat discipline every other alloca consumer
+                    // follows. A frame address is valid anywhere in the frame,
+                    // so emitting it during collection (ahead of the copies) is
+                    // sound, and the ranges stay tiny.
+                    std::optional<LirReg> const homeAddr =
+                        emitLeaFrameSlot(homeSlot->second);
+                    std::optional<LirReg> const stagingAddr =
+                        emitLeaFrameSlot(stagingSlot->second);
+                    if (!homeAddr.has_value() || !stagingAddr.has_value()) break;
+                    memPairs.push_back(
+                        MemPair{phiKind, *homeAddr, *stagingAddr, *v});
+                } else {
+                    pairs.push_back(Pair{phiReg, *v});
+                }
                 break;
             }
             if (!matched) {
@@ -10965,7 +11078,7 @@ struct Lowerer {
                 reporter.report(std::move(d));
             }
         }
-        if (pairs.empty()) return;
+        if (pairs.empty() && memPairs.empty()) return;
         // Step 1: copy every incoming into a fresh temp. Breaks any
         // dependency cycle on the phi-reg side unconditionally.
         // Cycle 3d FPR plumbing: each temp's class follows the phi's
@@ -10995,6 +11108,31 @@ struct Lowerer {
             if (!movOp.has_value()) return;  // diagnosed in step 1
             std::array<LirOperand, 1> ops{LirOperand::makeReg(temps[k])};
             emitInst(*movOp, pairs[k].phi, ops);
+        }
+        // ── D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE: the MEMORY parallel copy ────
+        //
+        // The SAME two-step shape as the register half above, and for the SAME
+        // reason: on a loop header `h: p1 = phi(a, p2); p2 = phi(b, p1)` the back
+        // edge must write BOTH homes from their PRE-edge contents, and a direct
+        // `home(p1) <- home(p2); home(p2) <- home(p1)` would hand p2 the value it
+        // had already been overwritten with. Staging every incoming first breaks
+        // every such cycle unconditionally, at O(n) slots rather than O(n²) cycle
+        // detection — the same trade the register half took.
+        //
+        // The two halves cannot interfere: a register move never reads or writes
+        // a frame home, and a memory copy touches only the two homes plus its own
+        // freshly-rematerialized address vregs. A `ptr`-typed phi whose incoming
+        // is a home's ADDRESS is likewise unaffected — the address of a slot does
+        // not change when the slot's contents do.
+        for (auto const& mp : memPairs) {
+            if (!emitWideFloatHomeCopy(
+                    mp.kind, mp.incoming, mp.staging,
+                    "MIR long double phi edge (stage incoming)")) return;
+        }
+        for (auto const& mp : memPairs) {
+            if (!emitWideFloatHomeCopy(
+                    mp.kind, mp.staging, mp.home,
+                    "MIR long double phi edge (write phi home)")) return;
         }
     }
 
@@ -12128,36 +12266,26 @@ struct Lowerer {
             for (std::uint32_t i = 0; i < n; ++i) {
                 MirInstId const inst = mir.blockInstAt(mb, i);
                 if (mir.instOpcode(inst) != MirOpcode::Phi) continue;
-                // D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE (LD-1): an F80/F128
-                // (`long double`) phi — a long double crossing a control-flow
-                // JOIN (`cond ? a : b`, a loop-carried long double, or a
-                // mem2reg-promoted F80 local in release) — is NOT yet lowered.
-                // An F80 value is MEMORY-resident (its SSA value is the
-                // GPR-held ADDRESS of its memory home, never an FPR register),
-                // so a phi needs a MEMORY-HOME merge (an fld/fstp copy into a
-                // common home on each edge), NOT the FPR-class edge-move
-                // `regClassFor(inst)` (FPR) would mint below — that would emit
-                // a class-inconsistent `fld [xmm]` MISCOMPILE. Until the merge
-                // lands, WALL it LOUD (poison → the tierClean gate turns this
-                // into a clean fail-loud, no binary), NOT a silent miscompile —
-                // the same discipline as the F80 call-boundary walls. LD-1
-                // realizes STRAIGHT-LINE long double arithmetic only. This
-                // catch-all covers BOTH phi sources (ternary + mem2reg).
+                // D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE: an F80/F128 (`long
+                // double`) phi — a long double crossing a control-flow JOIN
+                // (`cond ? a : b`, a loop-carried long double, or a
+                // mem2reg-promoted F80 local in release) — merges in MEMORY,
+                // never in a register. An F80/F128 SSA value is the GPR-held
+                // ADDRESS of its memory home, so the FPR-class edge-move
+                // `regClassFor(inst)` would mint below is class-INCONSISTENT
+                // (`fld [xmm]` — the silent miscompile the 2026-07-18 LD-1 x87
+                // review caught, which is why this site was a fail-loud WALL
+                // until this cycle). Record the phi instead; its home + staging
+                // slot are reserved by `reserveWideFloatPhiHomes` at the head of
+                // the first block lowered, and each edge copies the datum in
+                // through `emitWideFloatHomeCopy`. NO `defineValue` — like every
+                // other memory-resident value, the phi's address is
+                // rematerialized per use out of `allocaSlotIndex_`, so a
+                // `valueToReg` entry would be a second, conflicting record.
+                // This catch-all covers BOTH phi sources (ternary + mem2reg).
                 if (auto const k = interner.kind(mir.instType(inst));
                     k == TypeKind::F80 || k == TypeKind::F128) {
-                    ParseDiagnostic d;
-                    d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
-                    d.severity = DiagnosticSeverity::Error;
-                    d.actual   = std::format(
-                        "long double (F80/F128) control-flow merge (phi, inst "
-                        "{}) is not yet lowered — a `long double` value crossing "
-                        "a control-flow join (`cond ? a : b`, a loop-carried "
-                        "long double) needs the memory-home merge "
-                        "(D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE). LD-1 realizes "
-                        "straight-line long double arithmetic.",
-                        inst.v);
-                    reporter.report(std::move(d));
-                    poisonValue(inst);
+                    pendingWideFloatPhis_.push_back(inst);
                     continue;
                 }
                 // Cycle 3d FPR plumbing: phi result class follows the
@@ -12171,9 +12299,47 @@ struct Lowerer {
         }
     }
 
+    // D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE: reserve, for every F80/F128 phi
+    // `prepassAllocatePhis` recorded, the two 16-byte frame slots its merge
+    // needs — the phi's own HOME (entered in `allocaSlotIndex_`, so every
+    // consumer reaches it through the ordinary `regForValue` remat path) and one
+    // per-edge STAGING slot. Drains the list, so it does real work on the FIRST
+    // block lowered and is a no-op on every later one.
+    //
+    // ⚠⚠ THE ENTRY-BLOCK PLACEMENT IS CORRECTNESS, NOT TIDINESS, AND IT IS THE
+    // ONE PLACE A RESERVATION MAY GO. `lir_callconv`'s
+    // `functionLocalAllocaPayloads` assigns each alloca its frame offset by
+    // walking BLOCKS-then-insts, while `allocaLirCount_` hands out the matching
+    // index in EMISSION order. The two agree only while every alloca is emitted
+    // into a pre-created MIR block: the phi edge copies are emitted in per-edge
+    // SPLIT blocks, and `LirBuilder::createBlock` appends those AFTER every
+    // pre-created block. A slot reserved from inside a split block would
+    // therefore be counted at one index here and at a LATER index by callconv —
+    // two allocas laid out on top of each other, which is a silent miscompile of
+    // exactly the class this row exists to remove. The entry block is first in
+    // BOTH walks by construction, so reserving there cannot skew them. (The same
+    // per-function invariant the frozen-LIR harvest cross-checks in `run()`.)
+    void reserveWideFloatPhiHomes() {
+        for (MirInstId const phi : pendingWideFloatPhis_) {
+            auto const home =
+                emitF80ScratchSlot(kF80StorageBytes, "MIR long double phi home");
+            if (!home.has_value()) { poisonValue(phi); continue; }
+            auto const staging = emitF80ScratchSlot(
+                kF80StorageBytes, "MIR long double phi edge staging home");
+            if (!staging.has_value()) { poisonValue(phi); continue; }
+            allocaSlotIndex_.emplace(phi.v, *home);
+            wideFloatPhiStagingSlot_.emplace(phi.v, *staging);
+        }
+        pendingWideFloatPhis_.clear();
+    }
+
     void lowerBlock(MirBlockId mb) {
         LirBlockId const lb = mirBlockToLirBlock.get(mb);
         lir.beginBlock(lb);
+        // D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE: before ANY other emission, so the
+        // wide-float phi homes are the leading allocas of the entry block. See
+        // the docblock above for why no other block will do.
+        reserveWideFloatPhiHomes();
         std::uint32_t const n = mir.blockInstCount(mb);
         if (n == 0) {
             // Empty MIR block — defensive seal so the LIR module finishes.
@@ -12293,6 +12459,13 @@ struct Lowerer {
         // per-function scan callconv runs (`functionLocalAllocaPayloads` is per-fn).
         allocaSlotIndex_.clear();
         allocaLirCount_ = 0;
+        // D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE: same per-function lifetime — both
+        // are keyed by the slot-index counter that just restarted at 0. The
+        // pending list is normally already empty (`reserveWideFloatPhiHomes`
+        // drains it); clearing it is the defensive reset for a function whose
+        // blocks were never lowered, so its phis cannot leak into the next one.
+        pendingWideFloatPhis_.clear();
+        wideFloatPhiStagingSlot_.clear();
         // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: same per-function lifetime as
         // the counter it is indexed by.
         allocaSlotAlign_.clear();

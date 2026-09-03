@@ -105,3 +105,19 @@ target_include_directories(
 # directly rather than through a preprocess run.
 dss_add_test(NAME analysis/preprocess/test_skipped_group_not_otherwise_processed
              SOURCES test_skipped_group_not_otherwise_processed.cpp)
+
+# [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: the include PRE-SCAN's macro state IS
+# the authoritative `MacroExpander`, hosted as an oracle — so the guard that
+# decides whether a quote-`#include` is spliced is evaluated by the same engine
+# that will re-evaluate it authoritatively, and a function-like macro in that
+# guard no longer turns legal C into a hard refusal. A separate binary rather
+# than more cases in test_preprocessor.cpp because every arm here needs a REAL
+# HEADER ON DISK reached through an InsideRepo ScratchDir made the process cwd —
+# a quote-include resolution is not observable any other way — while that file's
+# fixtures preprocess in-memory buffers with no include path at all. Same split,
+# same reason, as test_pragma_once_include_dedup beside it.
+dss_add_test(NAME analysis/preprocess/test_prescan_macro_oracle
+             SOURCES test_prescan_macro_oracle.cpp)
+target_include_directories(
+    dss_analysis_preprocess_test_prescan_macro_oracle
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests)

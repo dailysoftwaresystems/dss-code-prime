@@ -473,9 +473,12 @@ TEST(ShippedLibDescriptor, SymbolLibraryOverrideSentinelFormatFailsLoud) {
 // ══ (UCRT-P4, narrowed by P41) ═══════════════════════════════════════════════
 //
 // Before this guard the shape below compiled rc=0 with NO diagnostic: the macro
-// silently won at preprocess time, nothing could ever call the symbol, and the
-// symbol was STILL eagerly imported (D-FFI-DESCRIPTOR-EAGER-IMPORT) — a dead import
-// in every binary that included the header.
+// silently won at preprocess time and nothing could ever call the symbol. ⓘ It also
+// cost a DEAD IMPORT in every binary that included the header, because a descriptor
+// row was imported whether referenced or not; P57 retired that law
+// ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]) and the dead import went with it. What did NOT
+// go away, and is why this guard stays, is the UNREACHABLE ROW: a declared symbol no
+// call site can ever reach is a platform fact stated and then made unconsultable.
 //
 // ★ THE TESTS BELOW ARE ONE ARGUMENT AND MUST BE READ TOGETHER. The naive rule
 // "same name + overlapping format = error" is FALSE and would red 21 in-tree,
@@ -559,9 +562,10 @@ TEST(ShippedLibDescriptor, FunctionLikeMacroShadowingSymbolWithoutReferenceIsAcc
     DiagnosticReporter rep;
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     EXPECT_TRUE(desc.has_value())
-        << "C 7.1.4p2 guarantees '&g' and '(g)(1)' reach the SYMBOL, so the eager "
-           "import is LIVE — refusing this makes a standard-mandated shape "
-           "undeclarable (it is exactly C23 <stdbit.h>'s stdc_* shape)";
+        << "C 7.1.4p2 guarantees '&g' and '(g)(1)' reach the SYMBOL, so the "
+           "import is REACHABLE and gets emitted the moment a program writes "
+           "either — refusing this makes a standard-mandated shape undeclarable "
+           "(it is exactly C23 <stdbit.h>'s stdc_* shape)";
     EXPECT_FALSE(rep.hasErrors());
 }
 
@@ -597,7 +601,7 @@ TEST(ShippedLibDescriptor, MacroShadowingSymbolItReferencesIsAccepted) {
     // ★ THE C 7.25 <tgmath.h> PATTERN, WHICH THE REAL CORPUS USES 17 TIMES. The
     // replacement REFERENCES the shadowed name, so by C 6.10.3.4p2 (a replacement
     // list is not re-scanned for the macro being replaced) the symbol is the
-    // macro's OWN CALLEE and the eager import is exactly right.
+    // macro's OWN CALLEE, so the import is both reachable and exactly right.
     // RED-ON-DISABLE for the false rule: implement "same name + overlapping format
     // = error" and this test fails, naming tgmath.
     auto const path = writeTemp(dir, "shadow_benign_ref.json", R"JSON({
@@ -4949,12 +4953,15 @@ TEST(ShippedLibDescriptor, RealIntrinHeaderIsPeOnlyAndCarriesNoEagerSymbols) {
                                                ObjectFormatKind::Elf));
     EXPECT_FALSE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
                                                ObjectFormatKind::MachO));
-    // (2) no eager-import surface — a compiler-intrinsic header must never
-    //     declare linkable symbols (the 0xC0000139 loader trap).
+    // (2) NO IMPORT SURFACE AT ALL — a compiler-intrinsic header must never
+    //     declare linkable symbols (the 0xC0000139 loader trap). Asserted on the
+    //     DESCRIPTOR rather than on an emitted image, so it holds regardless of
+    //     whether any program happens to reference such a row.
     EXPECT_TRUE(desc->symbols.empty())
         << "intrin.h intrinsics are builtins, NOT descriptor symbols — a "
-           "symbols entry here eager-imports a non-export and crashes the "
-           "pe loader (STATUS_ENTRYPOINT_NOT_FOUND)";
+           "symbols entry here plants an import of a non-export, and the first "
+           "program to reference it crashes the pe loader "
+           "(STATUS_ENTRYPOINT_NOT_FOUND)";
     // (3) the size_t typedef is the non-empty payload, u64 on pe64/LLP64.
     ASSERT_EQ(desc->typedefs.size(), 1u);
     EXPECT_EQ(desc->typedefs[0].name, "size_t");
@@ -5462,8 +5469,10 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
 // popen/pclose/fileno are", and BOTH halves of that are now false — `snprintf` reads
 // [elf,macho], and so do `fileno` and (as of this cycle) `popen`/`pclose`. The staging it
 // described was real and its REASON still governs any FUTURE row (the libSystem export was
-// INFERRED, never measured, and under the eager-import law a wrong guess breaks the LOAD of
-// every macho binary that includes <stdio.h>) — it simply ENDED, on a measurement taken on
+// INFERRED, never measured, and a wrong guess breaks the LOAD of every macho binary that
+// REFERENCES the name — every one that so much as INCLUDED <stdio.h>, before P57 retired
+// the eager-import law [[D-FFI-DESCRIPTOR-EAGER-IMPORT]]) — it simply ENDED, on a
+// measurement taken on
 // the operator's real Mac. Nothing here ASSERTS an availability set, so the rot was
 // invisible to the suite; that is exactly why it is corrected rather than left.
 // `puts`/`fputs`/`__stdio_common_vsprintf` remain here and are NOT
@@ -6422,8 +6431,9 @@ static void expectMachoOnlyFn(DarwinBsdClusterRead const& r, std::string_view na
     }
     EXPECT_EQ(sym->availableObjectFormats, (std::vector<std::string>{"macho"}))
         << name << " must be gated macho-ONLY: its only consumers are inside "
-           "os_unix.c's __APPLE__ && SQLITE_ENABLE_LOCKING_STYLE region, and "
-           "DSS eager-imports every DECLARED shipped extern";
+           "os_unix.c's __APPLE__ && SQLITE_ENABLE_LOCKING_STYLE region, and a "
+           "row declared on a format whose runtime lacks the export is a binary "
+           "the LOADER refuses as soon as anything references it";
     EXPECT_TRUE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
                                               ObjectFormatKind::MachO)) << name;
     EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
@@ -6617,8 +6627,9 @@ TEST(ShippedLibDescriptor, RealStdlibJsonMallocZoneMachoOnly) {
 //       the emptiness of the availability set is asserted AND the injector gate is
 //       probed on all three formats;
 //   (4) the LIBRARY comes from the DESCRIPTOR map with pe on `ucrtbase.dll`, and the row
-//       carries NO per-symbol override — the eager-import law means a declared
-//       non-export breaks the LOAD of every binary including <stdlib.h>, and a per-symbol
+//       carries NO per-symbol override — a declared non-export breaks the LOAD of every
+//       binary that REFERENCES it (every one that merely included <stdlib.h>, before P57
+//       retired the eager law [[D-FFI-DESCRIPTOR-EAGER-IMPORT]]), and a per-symbol
 //       override would mint a SECOND owner of a fact declared once and let the two drift.
 //
 // RED-on-disable: delete the row (1 fails), re-sign it `fn(i32, ptr<char>) -> i32`
@@ -6690,9 +6701,11 @@ TEST(ShippedLibDescriptor, RealStdlibJsonSetlocaleUngatedAllFormats) {
         ASSERT_NE(it, r.desc->library.end())
             << "stdlib.json must declare a runtime image for this format";
         EXPECT_EQ(it->second, leg.image)
-            << "setlocale is eager-imported from this image by EVERY program that "
-               "includes <stdlib.h>; pe in particular must be ucrtbase.dll (measured "
-               "export) and not the legacy msvcrt.dll this arc is retiring";
+            << "setlocale is imported from this image by every program that CALLS "
+               "it (by every program that merely included <stdlib.h>, before "
+               "referenced-only import); pe in particular must be ucrtbase.dll "
+               "(measured export) and not the legacy msvcrt.dll this arc is "
+               "retiring";
         EXPECT_TRUE(sym->library.empty())
             << "NO per-symbol library override: the descriptor map already names exactly "
                "the three images setlocale lives in, and a second owner of that fact "
@@ -6772,8 +6785,8 @@ TEST(ShippedLibDescriptor, RealUnistdJsonFsctlMachoOnly) {
     // ⚠ THE CONTROL MOVED OFF `close`, AND WHY IT HAD TO IS THE POINT. Every
     // `unistd.json` symbol row is now explicitly gated, and MUST be: the header
     // opened on pe, where an ungated POSIX row would declare an extern the
-    // runtime does not export and break the binary's LOAD under the
-    // eager-import law. `lseek` is NOT a control (it is gated too) — so the
+    // runtime does not export and break the LOAD of any binary that reaches
+    // it. `lseek` is NOT a control (it is gated too) — so the
     // control is the descriptor-level fact instead, asserted on the row this
     // test already read: `fsctl` carries a set, and the set is EXACTLY [macho].
     // That keeps the control's job (prove `availableObjectFormats` is being
@@ -6850,7 +6863,7 @@ TEST(ShippedLibDescriptor, RealUnistdJsonDarwinFsSysctlMachoOnly) {
                                                    ObjectFormatKind::Elf))
             << name << " must NOT be injected on elf: glibc exports no "
                        "sysctlbyname, and declaring it there would plant an "
-                       "undefined import (DSS eager-imports every shipped extern)";
+                       "undefined import the loader cannot resolve";
     }
     // Positive control — see the twin in `RealUnistdJsonFsctlMachoOnly` for why
     // it is no longer `close`: every `unistd.json` symbol row is now explicitly
