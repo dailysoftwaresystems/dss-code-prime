@@ -57,6 +57,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <variant>
 #include <vector>
@@ -101,16 +102,45 @@ constexpr std::size_t kOrdinaryThreadReserveBytes = std::size_t{1} * 1024 * 1024
     // `maxExpressionDepth`); none of the shapes below nest parentheses, and the
     // cap is raised past the fixture depth so a loud refusal cannot be mistaken
     // for the property under test.
+    //
+    // ⚠⚠ THE OTHER TWO PARSER CAPS COME FROM THE LANGUAGE SCHEMA, NOT FROM THE
+    // `ParserConfig` C++ FALLBACKS, AND THAT WAS A LIVE INSTRUMENT DEFECT. A
+    // bare `ParserConfig pcfg;` leaves `speculationBudgetFactor` at 16 while
+    // `c.lang.json` declares 64 and `maxSpeculationDepth` at its fallback while
+    // the config declares 320 — so this fixture parsed with a STRICTER parser
+    // than the shipped compiler, and a construct the CLI compiles was refused
+    // here as `P_SpeculationBudgetExhausted`. ✔MEASURED (P56, lane `rs`): a
+    // 100-element comma chain compiled rc 0 through `dsscp` and was refused in
+    // this fixture, i.e. the fixture reported a front-end refusal for a MIR-tier
+    // probe — the "an instrument that answers an adjacent question" shape, and
+    // it fails toward *the recursion never ran*. Seeded from the schema the way
+    // `compilation_unit.cpp`'s `parserConfigFor` does it; `exprDepthCap` still
+    // overrides afterwards because the depth is what each fixture is choosing.
     auto srcBuf = SourceBuffer::fromString(std::move(src), "<deepnest>");
     Tokenizer tk{srcBuf, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
     ParserConfig pcfg;
+    if (auto cap = schema->maxSpeculationDepth())     pcfg.maxSpeculationDepth = *cap;
+    if (auto f   = schema->speculationBudgetFactor()) pcfg.speculationBudgetFactor = *f;
     pcfg.maxExpressionDepth = exprDepthCap;
     Parser p{srcBuf, schema, std::move(stream), DiagnosticBudget::libraryDefault(),
              std::move(pcfg), std::move(lexDiags)};
     ParseResult result = std::move(p).parse();
-    if (result.tree.diagnostics().hasErrors())
-        throw std::runtime_error{"deep-nest fixture did not parse cleanly"};
+    // ⚠ THE REFUSAL MUST SAY WHAT REFUSED IT. A bare "did not parse cleanly"
+    // reads as "the fixture is too deep for the site under test" when it can
+    // equally mean a CAP fired somewhere else entirely and the recursion never
+    // ran — the exact instrument defect the recursion census records twice
+    // (a green, or a red, that means *the code never executed*). Naming the
+    // first error is what tells those two apart without a second build.
+    if (result.tree.diagnostics().hasErrors()) {
+        std::string why;
+        for (auto const& d : result.tree.diagnostics().all()) {
+            if (d.severity != DiagnosticSeverity::Error) continue;
+            why = std::string{diagnosticCodeName(d.code)} + " got '" + d.actual + "'";
+            break;
+        }
+        throw std::runtime_error{"deep-nest fixture did not parse cleanly: " + why};
+    }
 
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addTree(std::move(result.tree));
@@ -121,8 +151,15 @@ constexpr std::size_t kOrdinaryThreadReserveBytes = std::size_t{1} * 1024 * 1024
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 LongDoubleFormat::None, target.get(),
                 kOrdinaryThreadReserveBytes);
-    if (model.hasErrors())
-        throw std::runtime_error{"deep-nest fixture did not analyze cleanly"};
+    if (model.hasErrors()) {
+        std::string why;
+        for (auto const& d : model.diagnostics().all()) {
+            if (d.severity != DiagnosticSeverity::Error) continue;
+            why = std::string{diagnosticCodeName(d.code)} + " got '" + d.actual + "'";
+            break;
+        }
+        throw std::runtime_error{"deep-nest fixture did not analyze cleanly: " + why};
+    }
 
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
@@ -592,6 +629,165 @@ TEST(HirToMirAggregateInit, TwentyThousandBraceLevelsCostHeapNotCallFrames) {
         << "the innermost initializer value must reach the MIR";
 }
 
+// ── D-MIR-HIRTOMIR-SEH-TRY-EXCEPT-RECURSES-PER-REGION-LEVEL ──────────────────
+//
+// Plan-24 Stage 4b flattened Block / If / While / DoWhile / For / Label /
+// Switch onto the statement driver's work stack and left `SehTryExcept` in the
+// per-node handler, where each nested `__try` cost ONE `lowerStmtNode` frame
+// (a 971-line switch) plus one `lowerStmt` driver frame with its own vector.
+//
+// ✔MEASURED before the conversion, in-process on the ordinary ~1 MiB gtest main
+// thread, through `ctest`, ramping the depth in one process and printing a mark
+// per completed level: **500 rc 0, 600 SEGFAULT** — the LOWEST ceiling in the
+// MIR tier at the time. ✔ATTRIBUTED with gdb rather than inferred from the
+// bisection: the stack was `lowerStmt` → `lowerStmtNode` (the `SehTryExcept`
+// arm's `lowerStmt(tryN)`) → `lowerStmt` → …, repeating, with nothing else in
+// the cycle.
+//
+// ✔MEASURED after, same instrument, same thread: **4000 rc 0**, and the crash
+// at 8000 is gdb-attributed to `pathTerminates` in `src/hir/hir_verifier.hpp` —
+// a DIFFERENT tier's still-recursive site, so the MIR-tier ceiling is out of
+// the way entirely and a deeper kDepth here would red for somebody else's
+// reason.
+//
+// kDepth is 2000: 4x the MEASURED pre-fix ceiling of 500, and 4x below the
+// unrelated HIR-verifier ceiling of 8000 that would confuse the verdict.
+TEST(HirToMirSehDeepNesting, NestedTryExceptRegionsCostHeapNotCallFrames) {
+    constexpr int kDepth = 2000;   // 4x the MEASURED pre-fix ceiling (500)
+
+    std::string src = "int main(void){ int rc = 0;\n";
+    for (int i = 0; i < kDepth; ++i) src += "__try { ";
+    src += "rc = rc + 1;";
+    for (int i = 0; i < kDepth; ++i) src += " } __except(1) { rc = rc - 1; }";
+    src += "\nreturn rc; }";
+
+    auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth + 4096);
+
+    // ASSERT THE MODULE IS REAL, not merely that nothing crashed: one
+    // `SehTryBegin` per source `__try`. A short walk would be a silently
+    // dropped guarded region — a miscompile, not a missing diagnostic.
+    ASSERT_GT(L.mir.mir.funcCount(), 0u);
+    std::size_t regions = 0;
+    for (std::uint32_t fi = 0; fi < L.mir.mir.moduleFuncCount(); ++fi) {
+        MirFuncId const f = L.mir.mir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < L.mir.mir.funcBlockCount(f); ++bi) {
+            MirBlockId const bb = L.mir.mir.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < L.mir.mir.blockInstCount(bb); ++ii) {
+                if (L.mir.mir.instOpcode(L.mir.mir.blockInstAt(bb, ii))
+                    == MirOpcode::SehTryBegin) {
+                    ++regions;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(regions, static_cast<std::size_t>(kDepth))
+        << "every source `__try` must mint exactly one SEH region — a short "
+           "count is a guarded body that lost its handler";
+}
+
+// ── D-MIR-TEXT-READER-PARSETYPE-AND-PARSELITERAL-RECURSE-PER-LEVEL-UNCAPPED ──
+//
+// The WRITER half of this grammar (`appendType` / `appendLiteral`) went onto
+// explicit work stacks in P55. The READER half did not: `parseType` had SIX
+// self-calls and `parseLiteral` one, neither capped, and their depth follows
+// the `.dssmir` TEXT — an input this reader does NOT produce and must not
+// trust.
+//
+// ✔MEASURED before the conversion, in-process through `ctest` on the ordinary
+// ~1 MiB main thread, with NO compiler stage in front of the reader (the text
+// is built here), so nothing else can be the thing that dies: a `ptr<…<i32>…>`
+// global type parsed with `ok=1 errors=0` at **1000** and SEGFAULTed at
+// **2000**. ✔ATTRIBUTED with gdb: the stack is `parseType` calling itself at
+// its wrapper arm, one frame per `ptr<`, with no other function in the cycle.
+// ✔MEASURED after: **16000 rc 0, errors=0** — at least 16x, with no cap
+// introduced and none needed (the work stack is bounded by the text already in
+// memory).
+//
+// kDepth is 4000: 4x the MEASURED pre-fix crash floor of 1000.
+TEST(MirTextDeepNesting, DeeplyNestedTypeParsesBackOnAnOrdinaryThread) {
+    constexpr int kDepth = 4000;   // 4x the MEASURED pre-fix crash floor (1000)
+
+    std::string text = "dssir 1\nmodule {\n  global %1 : ";
+    for (int i = 0; i < kDepth; ++i) text += "ptr<";
+    text += "i32";
+    for (int i = 0; i < kDepth; ++i) text += ">";
+    text += " = zero\n}\n";
+
+    DiagnosticReporter reporter;
+    auto parsed = parseMir(text, CompilationUnitId{1}, reporter);
+
+    // It came back at all, and CLEANLY — a reader that truncated the type would
+    // read back a DIFFERENT type, which is the silent half of this defect.
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_EQ(reporter.errorCount(), 0u);
+    // Every level survived: re-render and count. `ptr<ptr<i32>>` and
+    // `ptr<i32>` are different types, so a short count is a miscompile.
+    DiagnosticReporter back;
+    MirTextContext ctx;
+    ctx.interner = &parsed->interner;
+    std::string const again = emitMir(parsed->mir, ctx, back);
+    std::size_t levels = 0;
+    for (std::size_t at = again.find("ptr<"); at != std::string::npos;
+         at = again.find("ptr<", at + 1)) {
+        ++levels;
+    }
+    EXPECT_GE(levels, static_cast<std::size_t>(kDepth))
+        << "every pointer level must survive the READ — a truncated parse is a "
+           "silently different type";
+}
+
+// The literal half of the same row. `parseLiteral`'s ONE self-call is its `agg`
+// arm, so the depth is the brace nesting of an untrusted initializer — the
+// exact twin of the writer's `appendLiteral`, and the same shape the MIR
+// literal walker is pinned at 100_000 for.
+//
+// ⚠⚠ IT PINS TWO CONVERSIONS AT ONCE, AND THE SECOND ONE WAS FOUND BY THIS
+// TEST REFUSING TO GO DEEP. ✔MEASURED with the reader converted but the
+// literal TYPE untouched: 400…2000 parsed and read back, 3000 SEGFAULTed —
+// and ✔gdb attributed that crash to `~MirLiteralValue`, the COMPILER-GENERATED
+// chain `~variant → ~MirAggregateValue → ~vector → ~MirLiteralValue`, one host
+// frame per aggregate level. DESTRUCTION is a walk too; it was the one walk
+// nobody had written, so no grep for recursion could see it. With the iterative
+// `~MirAggregateValue` in `mir/mir_literal_pool.hpp` the same fixture reaches
+// **100_000 rc 0**.
+// ✔MEASURED for the reader itself, with the recursive `parseLiteral` restored:
+// **1000 rc 0 / 1500 SEGFAULT**. kDepth 4000 is therefore 2.6x the reader's
+// crash floor AND 2x the destructor's — either conversion removed reds it.
+TEST(MirTextDeepNesting, DeeplyNestedLiteralParsesBackOnAnOrdinaryThread) {
+    constexpr int kDepth = 4000;   // 2.6x the recursive reader's crash floor
+                                   // (1500) AND 2x the pre-fix destructor wall
+    std::string text = "dssir 1\nmodule {\n  global %1 : i64 = ";
+    for (int i = 0; i < kDepth; ++i) text += "lit agg { ";
+    text += "lit int 7 : i64";
+    for (int i = 0; i < kDepth; ++i) text += " } : i64";
+    text += "\n}\n";
+
+    DiagnosticReporter reporter;
+    auto parsed = parseMir(text, CompilationUnitId{1}, reporter);
+
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_EQ(reporter.errorCount(), 0u);
+    // The innermost value survived the whole descent — walk down ITERATIVELY
+    // (the fixture must not recurse either) and read it.
+    ASSERT_GT(parsed->mir.moduleGlobalCount(), 0u);
+    std::uint32_t const litIdx =
+        parsed->mir.globalInitLiteralIndex(parsed->mir.globalAt(0));
+    ASSERT_NE(litIdx, UINT32_MAX);
+    MirLiteralValue const* cur = &parsed->mir.literalValue(litIdx);
+    int levels = 0;
+    while (auto const* agg = std::get_if<MirAggregateValue>(&cur->value)) {
+        ASSERT_EQ(agg->fields.size(), 1u);
+        cur = &agg->fields[0];
+        ++levels;
+    }
+    EXPECT_EQ(levels, kDepth)
+        << "every brace level must survive the READ — a truncated literal is a "
+           "silently different initializer";
+    auto const* iv = std::get_if<std::int64_t>(&cur->value);
+    ASSERT_NE(iv, nullptr);
+    EXPECT_EQ(*iv, 7);
+}
+
 TEST(HirToMirAtomicAlign, DeepPackedChainStaysUnderAlignedPastTheOldDepthCap) {
     // 70 links: comfortably past the removed `depth > 64`, nowhere near the
     // MEASURED front-end ceilings for nested struct definitions.
@@ -631,4 +827,76 @@ TEST(HirToMirAtomicAlign, ShallowPackedChainIsUnderAlignedAndUnpackedIsNot) {
             << "an unpacked _Atomic int member is naturally aligned — reporting "
                "anything less would route a fine access through the libcall";
     }
+}
+
+
+// ── D-MIR-HIRTOMIR-ADDRESSOF-DEREF-REENTRY-RECURSES-PER-LINK ─────────────────
+//
+// `request` (the shared {value,address} driver's classifier) flattens the
+// straight-line arms, the CFG value arms and Call; every OTHER kind DELEGATES to
+// `lowerExprNode` / `lowerLvalueAddressNode`, which lower that one node and
+// RE-ENTER the driver for its children — a fresh `runExprDriver` with its own
+// two vectors per link. Two of those delegating arms do nothing but hand the
+// request back with the address/value flag flipped: `AddressOf`'s body is
+// `lowerLvalueAddress(child)` and the by-address `Deref`'s is
+// `lowerExpr(child)`. So `*&*&…*&p` — a chain whose depth is its LENGTH, not
+// any nesting — cost FOUR host frames per `*&` pair.
+//
+// ✔MEASURED before the fix, in-process on the ordinary ~1 MiB gtest main thread
+// through `ctest`, ramping in one process: **100 rc 0 / 200 SEGFAULT** — the
+// LOWEST ceiling anywhere in the MIR tier, below the `SehTryExcept` arm's 500
+// and below the `SeqExpr` statement re-entry's 300. ✔ATTRIBUTED with gdb: the
+// stack is `runExprDriver` → `lowerExprNode`(AddressOf) → `lowerLvalueAddress`
+// → `runExprDriver` → `lowerLvalueAddressNode`(Deref) → `lowerExpr` → …,
+// repeating, entirely inside `hir_to_mir.cpp`.
+//
+// ⚠⚠ THE CENSUS RECORDED THIS SITE AS `4000 rc 0` AND THAT NUMBER MEASURED
+// NOTHING: it was taken on a left-deep `argc+argc+…` spine, and `BinaryOp` IS
+// in `request`'s flatten set, so that input never reached the re-entry at all.
+// Confirming that a construct REACHES the recursion before recording a ceiling
+// for it is the discipline this whole class keeps paying for.
+//
+// ✔MEASURED after: **8000 rc 0** (at least 80x), and 16000 is a ctest TIMEOUT
+// rather than a stack death — the remaining limit on this shape is TIME, not
+// host frames. kDepth is 2000: 20x the measured crash floor of 100, and chosen
+// low enough that the pin stays fast.
+TEST(HirToMirAddressChain, LongAddressOfDerefChainCostsHeapNotCallFrames) {
+    constexpr int kDepth = 2000;   // 20x the MEASURED pre-fix ceiling (100)
+
+    // `*&` applied to an `int *` lvalue yields an `int *` lvalue again, so the
+    // chain is well-typed at every length and its VALUE is just `p`.
+    std::string src = "int x; int *p = &x;\nint main(void){ int *r = ";
+    for (int i = 0; i < kDepth; ++i) src += "*&";
+    src += "p;\nreturn *r; }";
+
+    auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth * 4 + 4096);
+
+    // Assert the module is REAL, and assert the SHAPE rather than just the
+    // absence of a crash: `*&` is an identity on an lvalue, so the whole chain
+    // must collapse to the same load-and-store `p` alone would produce. A
+    // rewrite that dropped or duplicated a link would show up as extra memory
+    // traffic here, not as a crash.
+    ASSERT_GT(L.mir.mir.funcCount(), 0u);
+    std::size_t loads = 0, stores = 0;
+    for (std::uint32_t fi = 0; fi < L.mir.mir.moduleFuncCount(); ++fi) {
+        MirFuncId const f = L.mir.mir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < L.mir.mir.funcBlockCount(f); ++bi) {
+            MirBlockId const bb = L.mir.mir.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < L.mir.mir.blockInstCount(bb); ++ii) {
+                MirOpcode const op =
+                    L.mir.mir.instOpcode(L.mir.mir.blockInstAt(bb, ii));
+                if (op == MirOpcode::Load)  ++loads;
+                if (op == MirOpcode::Store) ++stores;
+            }
+        }
+    }
+    // `int *r = <chain>; return *r;` — the chain reads `p` once, `r` is stored
+    // once and read once, and `*r` loads the int. A per-link Load/Store would
+    // scale with kDepth; this asserts it does not.
+    EXPECT_LT(loads,  static_cast<std::size_t>(16))
+        << "the `*&` chain must collapse — a per-link Load means the rewrite "
+           "materialized every intermediate address";
+    EXPECT_LT(stores, static_cast<std::size_t>(16))
+        << "the `*&` chain must collapse — a per-link Store means the rewrite "
+           "materialized every intermediate address";
 }

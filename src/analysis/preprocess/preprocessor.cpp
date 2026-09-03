@@ -1293,6 +1293,36 @@ struct SynthBuilder {
     // was SILENTLY DROPPED (sqlite os_unix.c: sqliteInt.h→os_setup.h defines
     // SQLITE_OS_UNIX, `#if SQLITE_OS_UNIX` gates `#include "os_common.h"`).
     std::unordered_map<std::string, SbMacro>& localMacros;
+    // D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS: the names a LIVE `#undef` has
+    // removed. SHARED BY REFERENCE across the whole builder tree, exactly like
+    // `localMacros` beside it, because a `#undef` in a header must be visible to
+    // the parent's later guard in DOCUMENT ORDER.
+    //
+    // ★ WHY A SUBTRACTION SET AND NOT AN ERASE. `#undef` composes for every
+    // OBJECT-like predefine already: the C21 value prefix materializes those into
+    // `localMacros`, so erasing the entry is the whole story. It composes for
+    // NOTHING that `sbNameDefined` answers from the `effectivePredefines` arm —
+    // the FUNCTION-like rows (FINDING-A deliberately keeps them out of the value
+    // prefix) — because that arm walks a config list no directive can subtract
+    // from. Recording the `#undef` is the only way to make one oracle answer for
+    // both halves; the alternative (value-seeding the function-like rows so the
+    // arm could die) was MEASURED to REGRESS: `#if !__declspec` gating a
+    // quote-`#include` splices today (DSS 42, mingw-w64 gcc 13.2.0 42), and a
+    // function-like entry in `localMacros` trips FIX-3's uncertainty bail, which
+    // turns that splice into a `P_PreprocessorIncludeError` refusal.
+    //
+    // ⚠ THE DIRECTION IS WHY THIS IS A DEFECT AND NOT A TOLERATED SKEW. The
+    // one-directional-divergence invariant permits the pre-scan to read MORE live
+    // than the authoritative pass, never less. `#ifdef` inverts to `#ifndef`, so
+    // an over-answering oracle reads a `#ifndef`/`#elifndef`/`#if !defined()`
+    // group DEAD that the real pass reads LIVE — the P0016 direction. ✔MEASURED
+    // before the fix: `#undef __declspec` then any of those three gating a
+    // quote-`#include` was REFUSED (`P_PreprocessorIncludeError`), where
+    // mingw-w64 gcc 13.2.0, WSL gcc 13.3.0 and clang 18.1.3 all compile and run
+    // the program. Every entry is recorded on the LIVE branch only (C 6.10p1) and
+    // `localMacros` is consulted FIRST, so a later `#define` of the same name
+    // re-defines it with no ordering hazard.
+    std::unordered_set<std::string>& undefinedNames;
 
     PreprocessConfig const& cfg() const { return schema->preprocess(); }
 
@@ -1329,6 +1359,28 @@ struct SynthBuilder {
         // target predefine (`__aarch64__`) gates a quote-`#include` exactly as a
         // language one does.
         if (localMacros.find(std::string{n}) != localMacros.end()) return true;
+        // D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS: a LIVE `#undef` subtracts
+        // from the arm below, which walks a CONFIG list that no directive can
+        // otherwise reach. `localMacros` is consulted FIRST (just above), so a
+        // `#undef` followed by a `#define` of the same name still reports
+        // DEFINED — the set records that the CONFIG row no longer answers, not
+        // that the name is unusable. It gates the WHOLE arm rather than one row
+        // inside it, because "this name was `#undef`ed" is a fact about the name.
+        // It falls THROUGH to the operator arm below rather than returning
+        // `false`: an operator name can never enter the set (the `#undef`
+        // tracker refuses one, matching the authoritative pass's
+        // `P_PreprocessorOperatorNameNotDefinable`), and this predicate must
+        // stay correct without depending on that invariant holding elsewhere.
+        // ⚠ THE `empty()` TEST IS NOT NOISE. This predicate runs for every
+        // `#ifndef <include guard>` in every header the pre-scan walks, and the
+        // `std::string{n}` a heterogeneous-lookup-less `find` needs ALLOCATES for
+        // any name past the small-string bound — which an include guard always
+        // is. Almost no translation unit `#undef`s anything, so the set is empty
+        // and this costs one load instead of one allocation.
+        if (!undefinedNames.empty()
+            && undefinedNames.find(std::string{n}) != undefinedNames.end()) {
+            return isConditionalInclusionOperator(n, cfg());
+        }
         for (PredefinedMacroDef const& pm : effectivePredefines) {
             // ★★ D-PP-PREDEFINE-REDEFINITION-PARTITION — THIS CLAUSE CLOSES THE
             // LATENT SEAM THE PARTITION WOKE UP; IT IS NOT A TIDY-UP.
@@ -2837,6 +2889,18 @@ struct SynthBuilder {
                 if (!subject.empty()
                     && !isConditionalInclusionOperator(subject, cfg())) {
                     localMacros.erase(std::string{subject});
+                    // D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS: the erase above
+                    // is the whole story ONLY for a name `localMacros` can hold.
+                    // `sbNameDefined` also answers out of `effectivePredefines`
+                    // (the FUNCTION-like rows FINDING-A keeps out of the value
+                    // prefix), and no erase reaches a config list — so RECORD the
+                    // subtraction. Unconditional on purpose: testing "is this a
+                    // function-like predefine?" here would be a second copy of
+                    // the oracle's own membership rule, and the two would drift
+                    // the moment either list changes. `sbNameDefined` reads
+                    // `localMacros` first, so a later `#define` of the same name
+                    // wins with no ordering hazard and no need to un-record.
+                    undefinedNames.insert(std::string{subject});
                 }
                 i = lineEndTok - 1;
                 continue;
@@ -3214,7 +3278,8 @@ struct SynthBuilder {
                                        rep, depth + 1, includeStack,
                                        includeOnce, fatal,
                                        preScanDefinePrefix, effectivePredefines,
-                                       resolvedDescriptorsOut, localMacros};
+                                       resolvedDescriptorsOut, localMacros,
+                                       undefinedNames};
                     child.build(headerBuf, out, map, headerPre);
                     includeStack.pop_back();
                     out.push_back(newline);
@@ -3444,7 +3509,7 @@ struct SynthBuilder {
                                depth + 1, includeStack, includeOnce, fatal,
                                preScanDefinePrefix,
                                effectivePredefines, resolvedDescriptorsOut,
-                               localMacros};
+                               localMacros, undefinedNames};
             child.build(headerBuf, out, map, headerPre);
             includeStack.pop_back();
 
@@ -9230,12 +9295,16 @@ PreprocessResult preprocessRun(
     // macro map; every child builder threads it by reference, so `#define`s flow
     // across include boundaries in document order (both directions).
     std::unordered_map<std::string, SynthBuilder::SbMacro> preScanMacros;
+    // D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS: the ROOT owns the pre-scan's
+    // `#undef` record, threaded by reference into every child builder beside
+    // `preScanMacros`. Function scope, so it outlives the whole recursion.
+    std::unordered_set<std::string> preScanUndefined;
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
                          headerNameMatching,
                          *result.diagnostics, 0, includeStack, includeOnce,
                          result.fatal,
                          preScanDefinePrefix, merged.effective,
-                         resolvedParents, preScanMacros};
+                         resolvedParents, preScanMacros, preScanUndefined};
     {
         // D-PERF-1 sub-timing: the synth-buffer splice (recursive concat of the
         // main file + every quote-#include, + the line-map). Nests under the

@@ -6710,11 +6710,18 @@ TEST(ShippedLibDescriptor, RealSysTimeJsonFutimesMachoOnly) {
         DarwinBsdClusterRead m;
         ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
                                                      ObjectFormatKind::MachO, m));
-        // The timeval pointer keeps utimes' own ptr<void> spelling (sqlite's
-        // sole call passes NULL, so no layout knowledge rides on the param).
+        // ⚠ THIS EXPECTATION WAS INVERTED IN P56 (lane sv,
+        // [[D-FFI-SHIPPED-DESCRIPTORS-DECLARE-STRUCTS-THEIR-OWN-SIGNATURES-DO-NOT-USE]])
+        // and the sentence that stood here is kept so the inversion is legible:
+        // "The timeval pointer keeps utimes' own ptr<void> spelling (sqlite's sole
+        // call passes NULL, so no layout knowledge rides on the param)". That
+        // argued from ONE CALL SITE to a TYPE — the wrong direction; a shipped
+        // signature states what the API IS. The SDK spells it
+        // `int futimes(int, const struct timeval *)`, this descriptor already
+        // declared `timeval`, so the pointee is now that STRUCT.
         expectMachoOnlyFn(m, "futimes", K::I32,
                           {K::I32, K::Ptr},
-                          {std::nullopt, K::Void});
+                          {std::nullopt, K::Struct});
     }
 
     DarwinBsdClusterRead e;

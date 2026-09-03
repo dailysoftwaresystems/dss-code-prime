@@ -30,6 +30,33 @@ struct MirLiteralValue;
 // `__module_init__` synthesis. The recursive shape mirrors the HIR side.
 struct MirAggregateValue {
     std::vector<MirLiteralValue> fields;
+
+    // ★★★ THE TEARDOWN IS PART OF THE WALK, AND IT WAS THE ONE WALK NOBODY
+    // WROTE — D-MIR-LITERAL-VALUE-TEARDOWN-RECURSES-PER-AGGREGATE-LEVEL.
+    //
+    // Every explicit walk over this tree is on a heap work stack
+    // (`forEachLiteralNode` below, and the writer/reader in `mir_text.cpp`), but
+    // DESTRUCTION is a walk too, and the compiler generated it: `~MirLiteralValue
+    // → ~variant → ~MirAggregateValue → ~vector → ~MirLiteralValue`, ONE host
+    // frame chain per brace level, uncapped, on whatever thread happens to drop
+    // the value. That is exactly the shape the operator's ruling of 2026-09-02
+    // forbids, and it is INVISIBLE to every grep for recursion because no
+    // function in this repository names itself in it.
+    //
+    // ⚠ The recursion census records this site as one that "cannot be flattened
+    // from the file that owns the walk". True of `hir_to_mir.cpp`; NOT true of
+    // the header that owns the TYPE, which is here — and fixing it here fixes it
+    // for every consumer at once rather than per call site.
+    //
+    // The rule of five is spelled out because a user-provided destructor
+    // SUPPRESSES the implicit move operations, and falling back to copies would
+    // replace a deep destructor with a deep COPY — the same defect, slower.
+    MirAggregateValue();
+    MirAggregateValue(MirAggregateValue const&);
+    MirAggregateValue(MirAggregateValue&&) noexcept;
+    MirAggregateValue& operator=(MirAggregateValue const&);
+    MirAggregateValue& operator=(MirAggregateValue&&) noexcept;
+    ~MirAggregateValue();
 };
 
 // Symbol-address literal (F5 — D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): a global whose
@@ -67,6 +94,40 @@ struct MirLiteralValue {
                  MirAggregateValue, MirSymbolAddrValue, BitIntValue, WideFloatValue> value;
     TypeKind core = TypeKind::Void;
 };
+
+// ── MirAggregateValue's SPECIAL MEMBERS, out of line because they need
+//    `MirLiteralValue` COMPLETE ─────────────────────────────────────────────
+// Four of the five are the compiler's own; only the destructor differs, and it
+// differs only in HOW it reaches the nodes, never in what it destroys.
+inline MirAggregateValue::MirAggregateValue()                                   = default;
+inline MirAggregateValue::MirAggregateValue(MirAggregateValue const&)           = default;
+inline MirAggregateValue::MirAggregateValue(MirAggregateValue&&) noexcept       = default;
+inline MirAggregateValue& MirAggregateValue::operator=(MirAggregateValue const&) = default;
+inline MirAggregateValue&
+MirAggregateValue::operator=(MirAggregateValue&&) noexcept                       = default;
+
+// Destroy the whole subtree with an explicit heap work list: lift each level's
+// children OUT before the level is dropped, so every `MirLiteralValue` that
+// actually runs its destructor holds an EMPTY aggregate and costs O(1) frames.
+// The nested `~MirAggregateValue` those empty values run re-enters this body
+// exactly once and returns immediately — bounded depth 2, not depth N.
+inline MirAggregateValue::~MirAggregateValue() {
+    if (fields.empty()) return;   // the common case, and the recursion's base
+    std::vector<MirLiteralValue> pending;
+    pending.swap(fields);
+    while (!pending.empty()) {
+        MirLiteralValue cur = std::move(pending.back());
+        pending.pop_back();
+        if (auto* agg = std::get_if<MirAggregateValue>(&cur.value)) {
+            for (auto& f : agg->fields) pending.push_back(std::move(f));
+            // Dropping the moved-from elements here costs nothing: a moved-from
+            // `MirLiteralValue` holding an aggregate holds a moved-from (empty)
+            // vector, so its destructor takes the `fields.empty()` early return.
+            agg->fields.clear();
+        }
+        // `cur` dies here owning at most an EMPTY aggregate.
+    }
+}
 
 // ── ONE OWNER FOR "VISIT EVERY NODE OF A LITERAL", ON THE HEAP ──────────────
 //

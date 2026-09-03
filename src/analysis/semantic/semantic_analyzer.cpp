@@ -4749,17 +4749,29 @@ struct NoreturnSpelling {
     bool keyword   = false;   // the `_Noreturn` keyword token
     bool attribute = false;   // a `noreturn` attribute identifier
     [[nodiscard]] bool any() const noexcept { return keyword || attribute; }
+    // Source-order-independent OR: two roots of ONE declaration each carry a
+    // spelling or do not, and `noreturn` has no "last wins" reading to lose
+    // (unlike a linkage binding, whose no-op default CAN clobber — the
+    // `linkageFrom` seed discipline). `_Noreturn void f(void) __attribute__
+    // ((noreturn));` names it twice and means it once.
+    NoreturnSpelling& operator|=(NoreturnSpelling const& o) noexcept {
+        keyword   |= o.keyword;
+        attribute |= o.attribute;
+        return *this;
+    }
 };
-[[nodiscard]] NoreturnSpelling
-specifierPrefixNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
-                             NodeId declNode, DeclarationRule const& decl) {
-    NoreturnSpelling out;
+
+// The SUBTREE primitive: fold every `noreturn` spelling under `root` into
+// `out`. Bounded descendant walk over `visibleChildren`, so an extra wrapper
+// level in the grammar is transparent (the `structMemberDeclSpecifier`
+// property TF-C94 already relies on).
+void scanNoreturnSpelling(SemanticConfig const& cfg, Tree const& tree,
+                          NodeId root, NoreturnSpelling& out) {
     bool const haveKeyword = cfg.noreturnKeywordToken.has_value()
                           && cfg.noreturnKeywordToken->valid();
-    if (!haveKeyword && cfg.noreturnAttributeNames.empty()) return out;
-    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
-    if (!prefix.valid()) return out;
-    std::vector<NodeId> stack{prefix};
+    if (!haveKeyword && cfg.noreturnAttributeNames.empty()) return;
+    if (!root.valid()) return;
+    std::vector<NodeId> stack{root};
     for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
         NodeId c = stack.back(); stack.pop_back();
         if (tree.kind(c) == NodeKind::Internal) {
@@ -4777,6 +4789,233 @@ specifierPrefixNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
                 if (id == nm) out.attribute = true;
         }
         if (out.keyword && out.attribute) break;   // both found — done
+    }
+}
+
+[[nodiscard]] NoreturnSpelling
+specifierPrefixNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
+                             NodeId declNode, DeclarationRule const& decl) {
+    NoreturnSpelling out;
+    scanNoreturnSpelling(cfg, tree, specifierPrefixChild(tree, declNode, decl),
+                         out);
+    return out;
+}
+
+// ★★★ P56 (D-CSUBSET-TRAILING-NORETURN-NOT-HONORED) — THE DECLARATION-LEVEL
+// FOLD, AND THE REASON IT EXISTS IS THAT `specifierPrefixNamesNoreturn` WAS
+// THE **WHOLE** SCAN.
+//
+// The shared standard-attribute scan (`scanAttributeSemantics`) has run from
+// THREE root classes since TF-C73/TF-C77: the specifier prefix, the
+// declaration's config-declared attribute SLOTS (`declarationAttrSlotRules` —
+// `declAttrRun`, `structMemberAttrList`, `paramTrailingAttrRun`, …), and each
+// declarator's own after-declarator run. The `noreturn` scan was given only
+// the FIRST, so an attribute written in either of the other two positions
+// parsed, reached the linkage fold and the attribute-semantics fold, and had
+// its noreturn MEANING dropped in silence.
+//
+// ✔RE-MEASURED 2026-09-03 at `6482a71b` through the shipped CLI, on runnable
+// programs (`compute` is non-void and its only non-return path calls `die`, so
+// an unhonored noreturn is `H_VerifierFailure` with NO binary and an honored
+// one exits 42 — the `extern_noreturn_specifier` example's shape). The row
+// named ONE dropped position; the tree had TWO:
+//   • `void die(int) __attribute__((__noreturn__));`         → rc=1, dropped
+//   • `extern void die(int) __attribute__((__noreturn__));`  → rc=1, dropped
+//   • `void __attribute__((__noreturn__)) die(int);`         → rc=1, dropped
+//        ^ THE SLOT POSITION, WHICH THE ROW DOES NOT MENTION AT ALL.
+//   • every LEADING spelling (`extern __attribute__((…)) void die(int);`,
+//     `__attribute__((…)) void die(int);`, `_Noreturn void die(int);`,
+//     `[[noreturn]] void die(int);`)                          → rc=0, exit 42
+// gcc 13.3.0 and clang 18.1.3 HONOR all three dropped spellings (silent where
+// the undecorated control draws -Wreturn-type); MSVC 19.51 implements no
+// `__attribute__` at all and abstains. Two working references ⇒ REQUIRED.
+//
+// ★★ GRANULARITY IS MEASURED, NOT ASSUMED, AND THE TWO POSITIONS DIFFER:
+//   • DECLARATION-level (prefix + slots) reaches EVERY declarator —
+//     ✔MEASURED, `void __attribute__((__noreturn__)) a(int), b(int);` leaves
+//     BOTH gcc and clang silent on a caller of `a` AND on a caller of `b`.
+//   • PER-DECLARATOR (the trailing run) reaches only the one it follows —
+//     ✔MEASURED, `void a(int) __attribute__((__noreturn__)), b(int);` is
+//     silent for the `a` caller and draws -Wreturn-type for the `b` caller,
+//     in gcc AND clang.
+// That is exactly the split `linkagePrefixRoots` / `declaratorAttrRoots`
+// already made for the linkage fold, for the same reason, so the two folds
+// cannot drift.
+//
+// ⛔ THE TYPE-ALIAS EXCLUSION IS A MEASURED REFUSAL, NOT AN OVERSIGHT. A row
+// whose `kind` is `Type` contributes NOTHING from its slots. gcc and clang
+// SPLIT on what a GNU `noreturn` on a function-type typedef MEANS —
+// ✔MEASURED, `typedef void tfn(int) __attribute__((__noreturn__)); tfn die;`
+// draws gcc's `'noreturn' attribute ignored` AND its -Wreturn-type at the
+// caller, while clang is silent at both (it honors it). References splitting
+// on MEANING is an architectural fork, which pauses rather than picks; and
+// P51 left a live landmine here — `SemanticAnalyzerC.NoreturnKeywordOnTypedef
+// HeadIsNotPropagatedToUses` pins that a flag on an alias must NOT propagate.
+// Reading a type row's slots would store a second unread flag on the same
+// symbol for a meaning the references dispute. The predicate is the row's own
+// declared `kind`, i.e. config — the same `DeclarationKind::Type` test the
+// `S_NoreturnNonFunctionObject` arm below already reads.
+//
+// ⛔⛔ AND ONLY THE SLOTS THAT SIT **BEFORE** THE DECLARATORS ARE
+// DECLARATION-LEVEL. `declarationAttrSlotRules` CONFLATES TWO GRANULARITIES,
+// AND FOLDING IT WHOLESALE WOULD BE WRONG IN THE **UNSAFE** DIRECTION.
+// ✔MEASURED 2026-09-03, gcc AND clang agreeing: in
+// `struct S { void (*p)(int), (*q)(int) __attribute__((__noreturn__)); };` the
+// attribute reaches `q` and NOT `p` — a caller of `p` still draws
+// -Wreturn-type in both — yet DSS's grammar parses it into `structMemberAttrList`,
+// a DECLARATION-level slot on the `structField` row. Conferring it from there
+// would mark `p` noreturn too: a fact on a symbol the programmer never
+// annotated, and one that would let a real return path be ELIDED. Dropping a
+// noreturn can only cost a spurious diagnostic; leaking one cannot.
+// The rule is GNU 6.34's own, stated positionally rather than by rule name: an
+// attribute list written before the declarators appertains to every declared
+// entity, one written after belongs to the declarator it follows. So the walk
+// STOPS at the first declarator-bearing child, and a trailing slot is left to
+// the per-declarator fold below — which, for the shapes DSS parses today, means
+// `paramTrailingAttrRun` and `structMemberAttrList` confer nothing yet. That is
+// the conservative half of a measured split, NAMED here rather than left to be
+// rediscovered: closing it needs the slot key SPLIT BY GRANULARITY, which moves
+// the linkage fold and the attribute-semantics fold too, and is its own row.
+[[nodiscard]] NoreturnSpelling
+declarationNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
+                         NodeId declNode, DeclarationRule const& decl) {
+    NoreturnSpelling out = specifierPrefixNamesNoreturn(cfg, tree, declNode, decl);
+    if (decl.kind == DeclarationKind::Type) return out;   // the fork, above
+    // ★★★ P56
+    // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY): the
+    // slot loop now asks the CONFIG which slots are declaration-level. It used
+    // to infer that POSITIONALLY — walk the children and stop at the first
+    // declarator-bearing one — because `declarationAttrSlotRules` could not
+    // say. That inference was correct for c's grammar and is GONE, deliberately:
+    // it answered a different and weaker question (where a slot SITS) than the
+    // one this fold needs (what its attributes MEAN), said nothing for a
+    // language that writes its trailing run before its declarators, and was
+    // invisible to the two sibling folds — which is exactly how the three came
+    // to disagree about the same position.
+    if (decl.declarationAttrSlotRules.empty()) return out;
+    for (NodeId slot : visibleChildren(tree, declNode)) {
+        if (tree.kind(slot) != NodeKind::Internal) continue;
+        for (AttrRunRule const& sr : decl.declarationAttrSlotRules) {
+            if (sr.appertainsTo != AttrAppertainment::Declaration) continue;
+            if (tree.rule(slot).v != sr.rule.v) continue;
+            scanNoreturnSpelling(cfg, tree, slot, out);
+            break;
+        }
+    }
+    return out;
+}
+
+// ★★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY) —
+// THE DECLARATION-LEVEL SLOTS THAT ARE NOT DECLARATION-LEVEL, AND THIS IS THE
+// FOLD THAT CLOSES [[D-CSUBSET-TRAILING-NORETURN-NOT-HONORED]]'s CONSERVATIVE
+// HALF.
+//
+// A slot the row declares at `declarator` grain is written AFTER the declarator
+// list, so it appertains to the LAST declarator — `isLast` is the caller's
+// answer to which one that is, and a non-last declarator gets nothing.
+//
+// ✔MEASURED 2026-09-03, gcc 13.3.0 and clang 18.1.3 AGREEING, and measured with
+// TWO different attributes so the answer is a property of the POSITION rather
+// than of the attribute: in
+// `struct S { void (*p)(int), (*q)(int) __attribute__((__noreturn__)); };` a
+// caller of `q` is silent in both while a caller of `p` still draws
+// -Wreturn-type; in `struct S { int p, q __attribute__((deprecated)); };` a use
+// of `q` warns in both while a use of `p` is clean. The LEADING member spelling
+// reaches every declarator — `struct S { void __attribute__((__noreturn__))
+// (*p)(int), (*q)(int); };` silences a caller of `p` too — which is the CONTROL
+// that makes the first measurement about position and not about the scan.
+//
+// ⚠⚠ THE DIRECTION IS WHY THIS COULD NOT BE GUESSED. Reading this slot at
+// declaration grain marks `p` noreturn as well: a fact on a symbol nobody
+// annotated, which lets a REAL RETURN PATH BE ELIDED. Dropping a noreturn costs
+// a spurious diagnostic; leaking one cannot be undone downstream. That asymmetry
+// is why lane `nr` left the slot conferring NOTHING and named the split as this
+// row's work rather than half-fixing it.
+//
+// ⛔ THE `kind: "type"` EXCLUSION IS INHERITED FROM THE DECLARATION-LEVEL FOLD
+// AND IS **NOT** RELAXED HERE. gcc IGNORES a GNU `noreturn` on a function-type
+// typedef while clang HONOURS it — references splitting on what a valid program
+// MEANS is an architectural fork, which pauses rather than picks. DSS matches
+// gcc, `GnuNoreturnOnATypedefRowIsNotFoldedFromItsAttributeSlots` pins it, and
+// this fold must not become the back door that moves it: c's typedef row now
+// declares a `declarator`-grain trailing slot, so WITHOUT this guard the fork
+// would move as a side effect of a granularity fix.
+[[nodiscard]] NoreturnSpelling
+declaratorSlotNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
+                            NodeId declNode, DeclarationRule const& decl,
+                            bool isLast) {
+    NoreturnSpelling out;
+    if (!isLast) return out;
+    if (decl.kind == DeclarationKind::Type) return out;   // the fork, untouched
+    if (decl.declarationAttrSlotRules.empty()) return out;
+    for (NodeId slot : visibleChildren(tree, declNode)) {
+        if (tree.kind(slot) != NodeKind::Internal) continue;
+        for (AttrRunRule const& sr : decl.declarationAttrSlotRules) {
+            if (sr.appertainsTo != AttrAppertainment::Declarator) continue;
+            if (tree.rule(slot).v != sr.rule.v) continue;
+            scanNoreturnSpelling(cfg, tree, slot, out);
+            break;
+        }
+    }
+    return out;
+}
+
+// ★★★ P56 (D-CSUBSET-TRAILING-NORETURN-NOT-HONORED) — THE PER-DECLARATOR FOLD.
+//
+// `dNode` is a carrier from `collectDeclarators`. A run is read only when it
+// appertains to THIS DECLARATOR, resolved through the shared
+// `runAppertainmentFor` so this fold, the FC17 fold and the HIR linkage fold
+// cannot disagree about what a position means.
+//
+// ★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+// this used to read a separate `afterDeclaratorEntityAttrRules` SUBSET key. The
+// measurements behind that key all RE-DERIVED true; its SHAPE could not express
+// the axis. Each reference probed SEPARATELY, 2026-09-03:
+//   • GNU `void die(int) __attribute__((__noreturn__));` — gcc 13.3.0 AND
+//     clang 18.1.3 HONOR it at -std=c11/c17/c2x alike, and they honor the GNU
+//     spelling after EVERY declarator shape. MSVC 19.51 implements no
+//     `__attribute__` in any position (C2061 at /std:c11, /std:c17 AND
+//     /std:clatest) so it ABSTAINS — not agreement. `attrSpec` ⇒ `declarator`.
+//   • C23 `void die(int) [[noreturn]];` — NO reference honors it: gcc
+//     `'noreturn' attribute ignored`, clang `error: 'noreturn' attribute
+//     cannot be applied to types` (rc=1), MSVC /std:clatest `C4649` + `C4715`.
+//   • C23 `int x [[deprecated]];` — ALL THREE honor it: gcc and clang warn at
+//     the use, MSVC C4996 at the use. SAME RUN, SAME KEY, OPPOSITE ANSWER.
+// C23 6.7.6p1 vs 6.7.6.2p1/6.7.6.3p1 is why: the sequence appertains to the
+// identifier after a bare identifier declarator and to the array or function
+// TYPE after a derived one. So `stdAttr` ⇒ `declaratorUnlessTypeDerived`, and a
+// boolean subset could only have got one of those two right.
+//
+// ⓘ The keyword form cannot arrive here in any shipped grammar (an attribute
+// run admits attribute specifiers, not declaration specifiers). It is folded
+// anyway rather than masked off, because masking would be a SILENT narrowing
+// of a config-declared root; if a language ever put the keyword in a trailing
+// run, this reports it and the carrier gate below still judges it.
+//
+// ⓘ DIRECT VISIBLE CHILDREN ONLY, matched by config-declared rule id — the
+// `declaratorAttrRoots` discipline, and for its reason: a run nested DEEPER
+// inside the declarator (a parameter's own `__attribute__((unused))`, its own
+// open anchor) must not be silently promoted to this declarator's fact. A bare
+// `declaratorRule` carrier reaches the loop and matches nothing, because the
+// grammar puts no attribute run under it.
+[[nodiscard]] NoreturnSpelling
+declaratorTrailingNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
+                                NodeId dNode) {
+    NoreturnSpelling out;
+    if (!cfg.declarators.has_value()) return out;
+    DeclaratorConfig const& dc = *cfg.declarators;
+    if (dc.afterDeclaratorAttrRules.empty()) return out;
+    if (!dNode.valid() || tree.kind(dNode) != NodeKind::Internal) return out;
+    for (NodeId c : visibleChildren(tree, dNode)) {
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        for (AttrRunRule const& ar : dc.afterDeclaratorAttrRules) {
+            if (tree.rule(c).v != ar.rule.v) continue;
+            if (runAppertainmentFor(tree, dc, ar, dNode)
+                == AttrAppertainment::Declarator) {
+                scanNoreturnSpelling(cfg, tree, c, out);
+            }
+            break;
+        }
     }
     return out;
 }
@@ -6127,8 +6366,17 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // dropped to a warning at rc=0 while `struct`/`union`/`enum` (owned by THIS
     // function) kept exiting 1 with `error[S0031]`, so one key produced two
     // verdicts. Reading the row here is what makes all THREE tiers move together.
+    //
+    // ★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+    // the lead slots are taken at `declaration` grain, which is what this scan
+    // means — a composite specifier's attribute decorates the TAG the row
+    // declares, and a composite has no declarator list for a trailing run to
+    // belong to. The three shipped composite rows declare exactly one slot each
+    // (`compositeAttrLead`, `declaration` grain), so this is inert today; naming
+    // the grain is what keeps it inert if a composite row ever grows a trailing
+    // slot, instead of silently promoting one to the whole tag.
     DeclarationRule const* owningDecl = nullptr;
-    std::vector<RuleId> slotRules;
+    std::vector<AttrRunRule> slotRules;
     if (auto const dIt = s.idx().declByRule.find(tree.rule(specNode).v);
         dIt != s.idx().declByRule.end()) {
         owningDecl = &cfg.declarations[dIt->second];
@@ -6138,8 +6386,10 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     for (NodeId c : visibleChildren(tree, specNode)) {
         if (tree.kind(c) != NodeKind::Internal) continue;
         if (tree.rule(c).v == cfg.compositeAttrListRule.v) { roots.push_back(c); continue; }
-        for (RuleId sr : slotRules)
-            if (tree.rule(c).v == sr.v) { roots.push_back(c); break; }
+        for (AttrRunRule const& sr : slotRules) {
+            if (sr.appertainsTo != AttrAppertainment::Declaration) continue;
+            if (tree.rule(c).v == sr.rule.v) { roots.push_back(c); break; }
+        }
     }
     if (roots.empty()) return facts;
     // ★★ TF-C73 — THE SILENT MISCOMPILE THIS LOOP USED TO BE.
@@ -7287,20 +7537,21 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
 // `declaratorRule` — structurally identical to how the HIR global-init lowering
 // finds the init (cst_to_hir.cpp `lowerVarLikeInto`), so the two cannot drift.
 // Config-driven on the resolved rule ROLES (no keyword / `=`-token identity).
-// TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): is `c` an AFTER-DECLARATOR attribute node
-// (`attrSpec`/`stdAttr` in an `initDeclarator`)? Every init-detection scan below
-// (which reads the "first non-declarator visible child" as the initializer) MUST
-// skip these, else `void f(void) __attribute__((format(printf,1,2)));` mis-reads
-// the attribute as the init value and type-checks its args → S_TypeMismatch.
-[[nodiscard]] inline bool isAfterDeclaratorAttrNode(Tree const& tree,
-                                                    DeclaratorConfig const& dc,
-                                                    NodeId c) {
-    if (tree.kind(c) != NodeKind::Internal) return false;
-    RuleId const r = tree.rule(c);
-    for (RuleId ar : dc.afterDeclaratorAttrRules)
-        if (r.v == ar.v) return true;
-    return false;
-}
+// TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): `isAfterDeclaratorAttrNode` — "is `c` an
+// AFTER-DECLARATOR attribute node?" — used to live here as a BOOL predicate,
+// attribute-only (asm label excluded) because it gated the FC17 attribute fold
+// rather than the init scans.
+// ⓘ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY)
+// DELETED IT, and the deletion is the point rather than a tidy-up: a BOOL cannot
+// answer the question that fold now has to ask. The fold needs the matched
+// `AttrRunRule` itself, because what it does with the run depends on that run's
+// declared `appertainsTo` grain — so it matches against
+// `afterDeclaratorAttrRules` inline and keeps the entry. Anything not in that
+// list (the asm label, the initializer) is skipped exactly as before, so the
+// attribute-ONLY property this predicate existed to provide is preserved by
+// construction instead of by a second definition.
+// The init scans keep using the WIDER shared `isDeclaratorDecorationNode`
+// (declarator_walk.hpp), which is deliberately grain-blind — see its comment.
 
 [[nodiscard]] bool declaratorHasInitializer(Tree const& tree,
                                             DeclaratorConfig const& dc,
@@ -9467,16 +9718,25 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                     // shares the head type, so the check is identical for every slot.
                     NodeId const declAlignasSpec =
                         firstAlignasSpecInPrefix(s, cfg, tree, node, decl);
-                    // FC16 (D-CSUBSET-NORETURN): does this declaration's specifier
-                    // prefix name the `noreturn` attribute? Computed ONCE per
+                    // FC16 (D-CSUBSET-NORETURN): does this declaration name the
+                    // `noreturn` attribute at DECLARATION level? Computed ONCE per
                     // declaration (like `declAlignasSpec`); STORED per-declarator
                     // below. P50 (D-CSUBSET-NORETURN-NON-FUNCTION-OBJECT): the
                     // KEYWORD and ATTRIBUTE forms are carried separately — on a
                     // pointer-to-function declarator the attribute is honored
                     // (TF-C94) while the keyword is warned-and-ignored (gcc's
                     // measured meaning); see the scan's own comment.
+                    // ★ P56 (D-CSUBSET-TRAILING-NORETURN-NOT-HONORED): this used to
+                    // read `specifierPrefixNamesNoreturn` — the PREFIX ALONE — so a
+                    // `noreturn` in a declaration-level attribute SLOT
+                    // (`void __attribute__((__noreturn__)) die(int);`) was parsed,
+                    // folded for linkage and for attribute semantics, and dropped
+                    // for noreturn. `declarationNamesNoreturn` folds the prefix AND
+                    // the row's `declarationAttrSlotRules`, i.e. exactly the roots
+                    // `scanAttributeSemantics` folds a page below, so the two scans
+                    // cannot see different sets of positions.
                     NoreturnSpelling const declNoreturn =
-                        specifierPrefixNamesNoreturn(cfg, tree, node, decl);
+                        declarationNamesNoreturn(cfg, tree, node, decl);
                     // One warning per DECLARATION, not per declarator — the
                     // specifier is one spelling shared by the whole declarator
                     // list (`_Noreturn int a, b;`), the alignasContextReported
@@ -9511,11 +9771,37 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         s, cfg, tree, specifierPrefixChild(tree, node, decl),
                         /*emitUnknown=*/true, declAttrFacts, here,
                         /*owningDecl=*/&decl);
+                    // ★★★ P56
+                    // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+                    // ONLY THE `declaration`-GRAIN SLOTS FOLD INTO THE SHARED
+                    // FACTS. This loop used to take every slot the row named,
+                    // which for `structField`/`unionField` meant folding a run
+                    // written AFTER the member declarator list into facts that
+                    // are then COPIED ONTO EVERY MEMBER. ✔MEASURED, gcc 13.3.0
+                    // and clang 18.1.3 both give `struct S { int p, q
+                    // __attribute__((deprecated)); };` to `q` ALONE. The
+                    // `declarator`-grain slots are folded per declarator below,
+                    // onto the LAST one — the same split `declNoreturn` /
+                    // `declaratorSlotNamesNoreturn` makes, from the same key, so
+                    // the two folds cannot see different sets of positions.
+                    // ⓘ WHY THIS DID NOT ALREADY SHOW AS AN OVER-APPLICATION:
+                    // `structMemberAttrList` reached here but nothing conferred
+                    // from it at all — the FC17 facts were built and then the
+                    // member loop never consulted a per-declarator slot root —
+                    // so the observable bug was a DROP (below the union) on `q`
+                    // rather than a leak onto `p`. Both halves are fixed here.
                     for (NodeId slot : visibleChildren(tree, node)) {
                         if (tree.kind(slot) != NodeKind::Internal) continue;
                         bool isSlot = false;
-                        for (RuleId sr : decl.declarationAttrSlotRules)
-                            if (tree.rule(slot).v == sr.v) { isSlot = true; break; }
+                        for (AttrRunRule const& sr : decl.declarationAttrSlotRules) {
+                            if (sr.appertainsTo != AttrAppertainment::Declaration) {
+                                continue;
+                            }
+                            if (tree.rule(slot).v == sr.rule.v) {
+                                isSlot = true;
+                                break;
+                            }
+                        }
                         if (!isSlot) continue;
                         scanAttributeSemantics(s, cfg, tree, slot,
                                                /*emitUnknown=*/true, declAttrFacts,
@@ -10200,11 +10486,43 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // still gets NO flag; the predicate is the SHARED
                         // `isFnPointerType` the call path uses — no second
                         // hand-copy to lose a term.
+                        //
+                        // ★★★ P56 (D-CSUBSET-TRAILING-NORETURN-NOT-HONORED): THE
+                        // GATE READS `nrHere`, NOT `declNoreturn`, AND THE COPY IS
+                        // THE POINT. `declNoreturn` is the DECLARATION's spelling
+                        // (prefix + slots) and applies to every declarator;
+                        // `nrHere` adds THIS declarator's own entity-conferring
+                        // trailing run into a PRIVATE copy — the `attrFacts =
+                        // declAttrFacts` discipline one block down, for the same
+                        // reason. ✔MEASURED in gcc AND clang: `void a(int)
+                        // __attribute__((__noreturn__)), b(int);` makes `a`
+                        // noreturn and leaves `b` alone, so folding the trailing
+                        // run at DECLARATION level would push a fact onto a
+                        // sibling the programmer never annotated.
+                        //
+                        // ★★★ P56
+                        // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+                        // the THIRD root, and it is the one that closes
+                        // [[D-CSUBSET-TRAILING-NORETURN-NOT-HONORED]]'s
+                        // conservative half. A declaration-level SLOT the row
+                        // declares at `declarator` grain — c's
+                        // `structMemberAttrList`, written after the member
+                        // declarator list — appertains to the LAST declarator,
+                        // so it folds HERE (into the private copy) and never
+                        // into `declNoreturn`. ✔MEASURED, gcc and clang both
+                        // give `struct S { void (*p)(int), (*q)(int)
+                        // __attribute__((__noreturn__)); };` to `q` alone.
+                        NoreturnSpelling nrHere = declNoreturn;
+                        nrHere |= declaratorTrailingNamesNoreturn(cfg, tree, dNode);
+                        nrHere |= declaratorSlotNamesNoreturn(
+                            cfg, tree, node, decl,
+                            /*isLast=*/!declarators.empty()
+                                       && dNode.v == declarators.back().v);
                         bool const noreturnCarrier =
                             isFnSig
                             || (isFnPointerType(s.lattice.interner(), declTy)
-                                && declNoreturn.attribute);
-                        if (noreturnCarrier && declNoreturn.any())
+                                && nrHere.attribute);
+                        if (noreturnCarrier && nrHere.any())
                             s.symbols.at(sym).isNoreturn = true;
                         // The keyword-on-non-function WARNING (C11 6.7.4p2;
                         // the S_InlineNonFunction guard shape one block down,
@@ -10254,6 +10572,17 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // all-references-accept `_Noreturn tfn f;` spelling does
                         // not). So this is a MISSING DIAGNOSTIC on an otherwise
                         // correct program, never a meaning divergence.
+                        //
+                        // ⓘ P56: this arm KEEPS reading `declNoreturn`, not
+                        // `nrHere`, and the asymmetry with the store above is
+                        // deliberate. It is KEYWORD-only, the keyword has no
+                        // trailing position in any shipped grammar, and its latch
+                        // (`noreturnNonFnReported`) is per-DECLARATION because the
+                        // prefix spelling is shared by every declarator. A trailing
+                        // spelling is per-declarator and would need its own latch to
+                        // avoid `_Noreturn`-style over- or under-reporting, so
+                        // widening this arm without that latch would be the bug the
+                        // latch exists to prevent.
                         bool const typeAliasRow =
                             decl.kind == DeclarationKind::Type;
                         if (declNoreturn.keyword && (!isFnSig || typeAliasRow)
@@ -10343,12 +10672,67 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // programmer never annotated. SOURCE ORDER is preserved
                         // (declaration-level first, then this declarator's), so
                         // first-non-empty-wins still means the LEFTMOST spelling.
+                        //
+                        // ★★★ P56
+                        // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY)
+                        // — THIS LOOP IS THE LIVE DEFECT, AND THE FIX IS NOT A
+                        // NARROWING. It read the WHOLE `afterDeclaratorAttrRules`
+                        // list, so a C23 trailing run was applied to the entity
+                        // no matter what declarator it followed:
+                        // ✔MEASURED at this base through the shipped CLI,
+                        // `void f(void) [[deprecated]];` produced
+                        // S_DeprecatedSymbolUsed at the call — a meaning NOT ONE
+                        // reference confers (gcc 13.3.0 `'deprecated' attribute
+                        // ignored`, clang 18.1.3 `error: cannot be applied to
+                        // types` rc=1, MSVC 19.51 /std:clatest `C4649 attributes
+                        // are ignored in this context`). Above the union, which
+                        // the bar treats exactly as seriously as being below it.
+                        //
+                        // ⚠⚠ AND THE SAME OVER-BROAD READ WAS ALSO PRODUCING A
+                        // CORRECT ANSWER, WHICH IS WHY NARROWING BY RULE NAME
+                        // WOULD HAVE TRADED ONE DEFECT FOR ANOTHER. ✔MEASURED at
+                        // the same base, `int x [[deprecated]];` ALSO conferred
+                        // — and there all three references confer (gcc and clang
+                        // warn at the use, MSVC C4996 at the use). Excluding
+                        // `stdAttr` from the entity roots fixes `f` and breaks
+                        // `x`; including it does the reverse. Only a grain that
+                        // can depend on the DECLARATOR gets both right, which is
+                        // what `declaratorUnlessTypeDerived` is for and why the
+                        // config key had to gain a grain rather than a subset.
+                        //
+                        // ★★ A `type`-GRAIN RUN IS STILL SCANNED — INTO A
+                        // THROWAWAY FACTS OBJECT. Skipping it outright would have
+                        // silently retired this position's unknown-name
+                        // diagnostic (✔MEASURED, `void f(void) [[frobnicate]];`
+                        // reports S_UnknownAttribute today) and its TF-C93
+                        // decl-kind gate. An attribute that appertains to a type
+                        // is still an attribute and still typo-checkable; what
+                        // changes is only that it has no entity to attach a fact
+                        // to. So the diagnostic surface is unchanged and only the
+                        // CONFERRAL moves — the row's warning that narrowing this
+                        // scan "also moves its unknown-name diagnostic and the
+                        // decl-kind gate across four more verbs", answered by not
+                        // moving them at all.
                         AttributeSemanticsFacts attrFacts = declAttrFacts;
                         if (cfg.declarators.has_value()
                             && tree.kind(dNode) == NodeKind::Internal) {
+                            DeclaratorConfig const& dcHere = *cfg.declarators;
+                            // Read once per declarator, not per run: the shape
+                            // question ("does this declarator derive an array or
+                            // function type?") is a property of the declarator.
+                            bool const derivesTy =
+                                declaratorDerivesType(tree, dNode, dcHere);
                             for (NodeId ac : visibleChildren(tree, dNode)) {
-                                if (!isAfterDeclaratorAttrNode(
-                                        tree, *cfg.declarators, ac)) continue;
+                                if (tree.kind(ac) != NodeKind::Internal) continue;
+                                AttrRunRule const* run = nullptr;
+                                for (AttrRunRule const& ar :
+                                         dcHere.afterDeclaratorAttrRules) {
+                                    if (tree.rule(ac).v == ar.rule.v) {
+                                        run = &ar;
+                                        break;
+                                    }
+                                }
+                                if (run == nullptr) continue;   // asm label, init
                                 // emitUnknown=true: this run is THIS declarator's own
                                 // distinct spelling, so its unknown-name diagnostic is
                                 // the first and only one for that text.
@@ -10357,9 +10741,51 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 // must not mean two different things depending on which
                                 // side of the declarator it is written, and the
                                 // unknown-name verdict is part of what it means.
-                                scanAttributeSemantics(s, cfg, tree, ac,
-                                                       /*emitUnknown=*/true, attrFacts,
-                                                       here, /*owningDecl=*/&decl);
+                                AttributeSemanticsFacts typeGrainSink;
+                                bool const confers =
+                                    resolveAppertainment(run->appertainsTo,
+                                                         derivesTy)
+                                    == AttrAppertainment::Declarator;
+                                scanAttributeSemantics(
+                                    s, cfg, tree, ac, /*emitUnknown=*/true,
+                                    confers ? attrFacts : typeGrainSink, here,
+                                    /*owningDecl=*/&decl);
+                            }
+                        }
+                        // ★★★ P56
+                        // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY)
+                        // — THE `declarator`-GRAIN DECLARATION SLOTS, ON THE LAST
+                        // DECLARATOR. c's `structMemberAttrList` is written AFTER
+                        // the member declarator list, so it appertains to the last
+                        // member and nothing else. Before the key carried a grain
+                        // this slot reached the DECLARATION-level fold above and
+                        // conferred on nobody, so DSS was BELOW the union here:
+                        // ✔MEASURED at this base, `struct S { int p, q
+                        // __attribute__((deprecated)); };` flagged NEITHER member,
+                        // where gcc 13.3.0 and clang 18.1.3 both flag `q` and both
+                        // leave `p` clean. Folding into the PRIVATE per-declarator
+                        // copy is what keeps `p` clean.
+                        if (!declarators.empty()
+                            && dNode.v == declarators.back().v) {
+                            for (NodeId slot : visibleChildren(tree, node)) {
+                                if (tree.kind(slot) != NodeKind::Internal) continue;
+                                bool isTrailingSlot = false;
+                                for (AttrRunRule const& sr :
+                                         decl.declarationAttrSlotRules) {
+                                    if (sr.appertainsTo
+                                        != AttrAppertainment::Declarator) {
+                                        continue;
+                                    }
+                                    if (tree.rule(slot).v == sr.rule.v) {
+                                        isTrailingSlot = true;
+                                        break;
+                                    }
+                                }
+                                if (!isTrailingSlot) continue;
+                                scanAttributeSemantics(s, cfg, tree, slot,
+                                                       /*emitUnknown=*/true,
+                                                       attrFacts, here,
+                                                       /*owningDecl=*/&decl);
                             }
                         }
                         // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): apply the

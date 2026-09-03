@@ -14388,3 +14388,243 @@ TEST(Preprocessor, ComputedIncludeTakesTheFirstCloserAndToleratesTrailingTokens)
     std::error_code ec;
     fs::remove_all(inc, ec);
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS — THE PRE-SCAN'S PREDEFINED
+// DEFINEDNESS ORACLE, PINNED ON BOTH AXES.
+//
+// ★ WHAT THE ROW ORIGINALLY CLAIMED, AND WHY IT IS PINNED RATHER THAN FIXED.
+// The row (2026-07-09) said the pre-scan's bare-name check (`isDefinedTok`)
+// consulted ONLY `localMacros` while `#if defined()` (`definedCb`) also saw the
+// predefines, so the two spellings of one question took DIFFERENT branches.
+// ✔MEASURED 2026-09-03 through the shipped CLI over every predefine ORIGIN the
+// `--dump-predefined-macros` axis names (language / target / format /
+// command-line) and all four bare-name directives: they AGREE. C19
+// (`D-PP-PRESCAN-DEFINEDNESS-PARITY`) routed both through `sbNameDefined`, and
+// C21 + TF-C74 + TF-C86 widened that one oracle. What was missing was a pin, so
+// the FIRST test below is the row's own claim, held.
+//
+// ★ THE GATE MUST BE FUNCTION-LIKE, for the reason the TF-C74 pins already
+// state: an OBJECT-like predefine is materialized into `localMacros` by the C21
+// value prefix, which `sbNameDefined` consults FIRST — so an object-like gate
+// masks the predefined arm and a revert leaves the test green.
+namespace {
+
+// A function-like predefine, available on every format. `Ordinary` is STATED,
+// not defaulted: a `PredefinedMacroDef` built in C++ never passes through the
+// JSON loader that would enforce it (the same note the TF-C74 pins carry).
+[[nodiscard]] PredefinedMacroDef ppFunctionLikePredefine(std::string name) {
+    PredefinedMacroDef pm;
+    pm.name               = std::move(name);
+    pm.kind               = PredefinedMacroKind::Constant;
+    pm.value              = "";
+    pm.params             = {"x"};
+    pm.isFunctionLike     = true;
+    pm.programRedefinition = PredefinedMacroRedefinition::Ordinary;
+    return pm;
+}
+
+// Every arm below is the SAME question in a different spelling, gating the SAME
+// quote-`#include`. `marker` is present iff the header was spliced.
+[[nodiscard]] bool ppSplicedUnder(std::string const& guard,
+                                  std::span<PredefinedMacroDef const> pms,
+                                  std::span<std::filesystem::path const> dirs,
+                                  PreprocessResult& out) {
+    auto lexs = ppLexemesForTarget(guard + "\n#include \"definedness_gate.h\"\n"
+                                           "#endif\nint after;\n",
+                                   ObjectFormatKind::Elf, pms, out, dirs);
+    for (auto const& l : lexs) {
+        if (l == "MARKER_DEFINEDNESS_GATE") return true;
+    }
+    return false;
+}
+
+}   // namespace
+
+// ── AXIS 1: the row's own claim. All four bare-name directives must answer a
+// predefined macro's definedness the way `#if defined()` answers it.
+//
+// RED-ON-DISABLE (REMOVE direction): drop the `effectivePredefines` arm from
+// `SynthBuilder::sbNameDefined` — the two POSITIVE bare-name arms
+// (`#ifdef`/`#elifdef`) stop splicing while the `#if defined()` CONTROL keeps
+// its verdict, which is exactly the disagreement the row names.
+TEST(Preprocessor, PredefinedDefinednessAgreesAcrossAllFourBareNameDirectives) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_pp_definedness_parity_four";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    { std::ofstream(dir / "definedness_gate.h", std::ios::binary)
+        << "int MARKER_DEFINEDNESS_GATE = 1;\n"; }
+    std::vector<fs::path> const dirs{dir};
+    std::vector<PredefinedMacroDef> pms{ppFunctionLikePredefine("__FNPROBE__")};
+
+    struct Arm { char const* name; char const* guard; bool expectSplice; };
+    // The bare-name spelling and the `defined()` spelling of the SAME question
+    // are adjacent on purpose: a fixture exercising only one path cannot see a
+    // divergence between them, which is the whole defect class.
+    Arm const arms[] = {
+        {"#ifdef",          "#ifdef __FNPROBE__",                 true},
+        {"#if defined()",   "#if defined(__FNPROBE__)",           true},
+        {"#ifndef",         "#ifndef __FNPROBE__",                false},
+        {"#if !defined()",  "#if !defined(__FNPROBE__)",          false},
+        {"#elifdef",        "#if 0\n#elifdef __FNPROBE__",        true},
+        {"#elif defined()", "#if 0\n#elif defined(__FNPROBE__)",  true},
+        {"#elifndef",       "#if 0\n#elifndef __FNPROBE__",       false},
+        {"#elif !defined()","#if 0\n#elif !defined(__FNPROBE__)", false},
+    };
+    for (Arm const& a : arms) {
+        PreprocessResult r;
+        bool const spliced = ppSplicedUnder(a.guard, pms, dirs, r);
+        EXPECT_EQ(spliced, a.expectSplice)
+            << "arm " << a.name << ": the pre-scan's definedness oracle must "
+               "give this spelling the SAME answer as every other spelling of "
+               "the same question — two spellings disagreeing is a silent wrong "
+               "branch, not a refusal";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "arm " << a.name << ": a pre-scan that reads the group DEAD "
+               "while the authoritative pass reads it LIVE is refused here — "
+               "no arm may reach that refusal";
+    }
+    fs::remove_all(dir, ec);
+}
+
+// ── AXIS 2: `#undef` composes. THE BEHAVIOUR THIS ROW CHANGED.
+//
+// `sbNameDefined` answers for a FUNCTION-like predefine out of a walk over
+// `effectivePredefines` — a CONFIG list that no directive can subtract from —
+// while the authoritative `MacroExpander` holds the same row in `table_` (c105
+// lowers it to a `<built-in>` `#define`), where `#undef` DOES erase it. So after
+// a `#undef` the pre-scan read the name DEFINED and the real pass read it
+// UNDEFINED.
+//
+// ⚠ THE POLARITY IS THE WHOLE POINT. The tolerated skew is pre-scan MORE live;
+// `#ifdef` inverts to `#ifndef`, so an over-answering oracle reads the negative
+// spellings DEAD where the real pass reads them LIVE — the P0016 direction. It
+// did not miscompile: the authoritative pass's unresolved-live-quote-include
+// arm refused it. ✔MEASURED 2026-09-03 through the shipped CLI: `#undef
+// __declspec` (c.lang.json's one function-like predefine) then `#ifndef
+// __declspec` / `#elifndef __declspec` / `#if !defined(__declspec)` gating a
+// quote-`#include` was a HARD `P_PreprocessorIncludeError`, where mingw-w64 gcc
+// 13.2.0, WSL gcc 13.3.0 and clang 18.1.3 all compile and run the program (all
+// three exit 42; probed separately).
+//
+// RED-ON-DISABLE (REMOVE direction): drop the `undefinedNames` guard from
+// `sbNameDefined` — every arm below stops splicing AND raises
+// `P_PreprocessorIncludeError`, while the AXIS-1 test stays green (it has no
+// `#undef`), which is what makes this a pin on the fix and not on the oracle.
+TEST(Preprocessor, UndefOfAFunctionLikePredefineComposesInThePreScan) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_pp_definedness_undef_composes";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    { std::ofstream(dir / "definedness_gate.h", std::ios::binary)
+        << "int MARKER_DEFINEDNESS_GATE = 1;\n"; }
+    std::vector<fs::path> const dirs{dir};
+    std::vector<PredefinedMacroDef> pms{ppFunctionLikePredefine("__FNPROBE__")};
+
+    struct Arm { char const* name; char const* guard; bool expectSplice; };
+    Arm const arms[] = {
+        // The three NEGATIVE spellings — the P0016-direction arms this fixes.
+        {"#undef + #ifndef",
+         "#undef __FNPROBE__\n#ifndef __FNPROBE__",                    true},
+        {"#undef + #if !defined()",
+         "#undef __FNPROBE__\n#if !defined(__FNPROBE__)",              true},
+        {"#undef + #elifndef",
+         "#undef __FNPROBE__\n#if 0\n#elifndef __FNPROBE__",           true},
+        // The three POSITIVE spellings — the mirror. A `#undef`ed name must now
+        // read UNDEFINED here too, so these must NOT splice. Without them the
+        // test would pass on an oracle that simply answered "defined" never.
+        {"#undef + #ifdef",
+         "#undef __FNPROBE__\n#ifdef __FNPROBE__",                     false},
+        {"#undef + #if defined()",
+         "#undef __FNPROBE__\n#if defined(__FNPROBE__)",               false},
+        {"#undef + #elifdef",
+         "#undef __FNPROBE__\n#if 0\n#elifdef __FNPROBE__",            false},
+    };
+    for (Arm const& a : arms) {
+        PreprocessResult r;
+        bool const spliced = ppSplicedUnder(a.guard, pms, dirs, r);
+        EXPECT_EQ(spliced, a.expectSplice)
+            << "arm " << a.name << ": a LIVE `#undef` must subtract from the "
+               "pre-scan's predefined arm exactly as it subtracts from the "
+               "authoritative `table_`";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "arm " << a.name << ": the pre-scan reading the group DEAD while "
+               "the real pass reads it LIVE is what raises this code";
+    }
+    fs::remove_all(dir, ec);
+}
+
+// ── AXIS 2, the ORDERING control. The `#undef` record must not be STICKY: a
+// later `#define` of the same name re-defines it. Without this the fix could be
+// implemented as a permanent poison and still pass the test above.
+// ✔The reference agrees: mingw-w64 gcc 13.2.0 compiles and runs the same shape
+// over its own predefined `__declspec` and exits 42 (MEASURED 2026-09-03).
+TEST(Preprocessor, UndefThenRedefineOfAPredefineIsDefinedAgainInThePreScan) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_pp_definedness_undef_redefine";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    { std::ofstream(dir / "definedness_gate.h", std::ios::binary)
+        << "int MARKER_DEFINEDNESS_GATE = 1;\n"; }
+    std::vector<fs::path> const dirs{dir};
+    std::vector<PredefinedMacroDef> pms{ppFunctionLikePredefine("__FNPROBE__")};
+
+    PreprocessResult r;
+    EXPECT_TRUE(ppSplicedUnder("#undef __FNPROBE__\n#define __FNPROBE__(x)\n"
+                               "#ifdef __FNPROBE__",
+                               pms, dirs, r))
+        << "`localMacros` is consulted BEFORE the `#undef` record, so a "
+           "re-definition wins with no ordering hazard";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError));
+    fs::remove_all(dir, ec);
+}
+
+// ── AXIS 2, the CROSS-BUILDER control. The `#undef` record is shared BY
+// REFERENCE across the whole builder tree, like `localMacros` beside it — a
+// `#undef` reached through a nested quote-`#include` must be visible to the
+// PARENT's later guard, in document order.
+//
+// ★ THIS IS PINNED BECAUSE THE EXACT PROPERTY BROKE BEFORE, one field over.
+// `localMacros` was per-builder until TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE):
+// a `#define` arriving via a nested include was invisible to the parent's later
+// `#if`, the guard folded 0, and the gated quote-`#include` was SILENTLY DROPPED
+// (sqlite os_unix.c). A per-builder `#undef` record would put the new field back
+// in exactly that shape — over-answering inside the header's own scope only —
+// and nothing else in this file would notice.
+// ✔The reference agrees: mingw-w64 gcc 13.2.0 runs the same shape (a header that
+// `#undef`s its own predefined `__declspec`, then the includer's `#ifndef`-gated
+// quote-include) and exits 42; DSS matches (MEASURED 2026-09-03).
+TEST(Preprocessor, UndefInsideAHeaderReachesTheParentsLaterGuardInThePreScan) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_pp_definedness_undef_crossbuilder";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    { std::ofstream(dir / "definedness_gate.h", std::ios::binary)
+        << "int MARKER_DEFINEDNESS_GATE = 1;\n"; }
+    { std::ofstream(dir / "undefs_the_predefine.h", std::ios::binary)
+        << "#undef __FNPROBE__\n"; }
+    std::vector<fs::path> const dirs{dir};
+    std::vector<PredefinedMacroDef> pms{ppFunctionLikePredefine("__FNPROBE__")};
+
+    PreprocessResult r;
+    EXPECT_TRUE(ppSplicedUnder("#include \"undefs_the_predefine.h\"\n"
+                               "#ifndef __FNPROBE__",
+                               pms, dirs, r))
+        << "a `#undef` performed by a CHILD builder must reach the parent's "
+           "later guard — a per-builder record would leave the parent still "
+           "answering DEFINED and skip this splice";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError));
+
+    // The MIRROR, so the arm above cannot pass on a builder that simply answers
+    // "undefined" for everything: WITHOUT the child's `#undef` the same guard
+    // must NOT splice.
+    PreprocessResult r2;
+    EXPECT_FALSE(ppSplicedUnder("#ifndef __FNPROBE__", pms, dirs, r2));
+    EXPECT_FALSE(hasPPCode(r2, DiagnosticCode::P_PreprocessorIncludeError));
+    fs::remove_all(dir, ec);
+}

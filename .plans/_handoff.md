@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-03 — cycles **P14 … P55**. ⚠ P52 rewrote no handoff at all, so a reader
+**Last updated:** 2026-09-03 — cycles **P14 … P56**. ⚠ P52 rewrote no handoff at all, so a reader
 who opened this file during P53 saw P51 described as current state; that entry in §5 was written
 retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as
 history there.
@@ -17,6 +17,177 @@ history there.
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
+
+**Cycle P56 closed 2026-09-03.** Four lanes plus the orchestrator. ✔**REAL: 14 rows closed, 0 left
+open of the 3 this cycle opened.** ✔**COUNTED by `check-anchor-balance --base 6482a71b`: 5 closed,
+0 opened, net −5.** The gap is not an error and must not be smoothed over: **9 of the 14 are
+structurally invisible** to an instrument that compares row NAMES across two commits, because they
+were born closed or minted-and-closed inside the cycle. Both numbers belong in any report.
+
+★★★ **THE THROUGH-LINE, AND IT COMPLETES A THREE-CYCLE ARC.** P54: *the broken thing was the
+measurement, not the code.* P55: *the measurement was right and the ATTRIBUTION was wrong.* P56:
+**every record was right, and NOBODY RE-READ IT.** Nothing in the registry was false; the cost came
+entirely from rows whose premise had gone stale while their text stayed honest.
+
+1. ⚠⚠ **16 PRODUCTION C-CONFORMANCE ROWS SAT MARKED GATED FOR TEN DAYS AFTER THEIR TRIGGER FIRED.**
+   Each stated its trigger as *"a real need"* or *"the FC18 conformance sweep"*. The operator's
+   **2026-08-24** batch ruling — *every C conformance divergence gcc/clang/MSVC get right SHIPS*,
+   plus *"production backend pending stuff = MUST DO EVERYTHING"* — **is** that need, and fired all
+   sixteen at once. They were invisible to every read-by-eye queue the whole time. (VLA ×7,
+   thread_local cross-TU, declarator/storage-class order, const-ref narrowing, attribute position,
+   pointer arith with a float operand, int→f32 codegen, address-constant global fold, the
+   descriptor `when`-format compare, single-pass include resolution.)
+   ⇒ **A RULING FIRES TRIGGERS WHOLESALE AND NOTHING SWEEPS FOR THEM.** When an operator ruling
+   lands, grep the two working registries for the trigger vocabulary it just satisfied.
+2. **16 more rows named an opener that had since CLOSED.** Same shape, mechanical to detect: the
+   gate's own UNBLOCKED line already says such a row *"is schedulable NOW"*.
+3. ★ **A ROW'S SUBJECT WAS FIXED BY A CYCLE THAT NEVER KNEW THE ROW EXISTED.**
+   `D-LAYOUT-COMPUTELAYOUT-TYPE-NODE-RECURSION` was registered against `computeLayout` by name;
+   P55 converted that function to `computeLayoutIterative` over a heap work stack under a
+   different row and closed nothing here. ⇒ **When a cycle converts a NAMED function, grep the
+   working registries for that name before the cycle ends.** No gate resolves *"is my subject
+   still there"*: `check-anchor-registry` resolves CITATIONS, `check-anchor-balance` counts NAMES,
+   neither reads a row against the tree.
+4. ⚠⚠ **A GUARD'S ESCAPE CLAUSE DISARMED THE GUARD COMPLETELY, AND ONLY THE RED-ARM ATTEMPT FOUND
+   IT.** ARM 7's first draft copied ARM 6's sibling escape (*a row declaring `Trigger: ALREADY
+   FIRED` is not gated*). ✔MEASURED: **every row this project mints carries that declaration**,
+   because a different arm refuses gate-like prose that names no opener — so the escape exonerated
+   100% of the rows the ratchet existed to refuse. Three separate mutants came back GREEN before
+   the cause was found. The repair is that the escape is **directional**: a fired trigger excuses
+   PROSE that says GATED, never a COLUMN that does. ⇒ **After adding any escape, count how many
+   rows still REACH the refusal.** If it is ~0 the arm is decorative, and it looks exactly like a
+   guard on a clean tree.
+5. **Three of four lanes corrected the brief or the row they were given** — the control loop
+   working, and the reason a brief's premise is a hypothesis and not a finding:
+   * `at`: I briefed *"the granularity answer is per-attribute."* ✔It is **constant per attribute
+     and varies by DECLARATOR SHAPE** (4 attributes × 2 shapes × 3 references, each probed
+     separately). That mattered: narrowing by rule name alone fixes `void f(void) [[deprecated]]`
+     (DSS was ABOVE the union) and breaks `int x [[deprecated]]` (DSS was correct). A
+     rule-name-only grain **cannot** be right. The row also undercounted — three live cases, not
+     one.
+   * `rs`: the recursion census's `4000 rc 0` for the `lowerExprNode` re-entry **measured nothing
+     at that site** — the probe used a left-deep `argc+argc+…` spine and `BinaryOp` is in
+     `request`'s flatten set, so it never arrived. The real ceiling on a `*&` chain is **100 rc 0 /
+     200 SEGFAULT**, the lowest in the MIR tier. A 40× error, inside the census that warns about
+     exactly this.
+   * `sv`: the row's `641 occurrences` was not an upper bound on anything — only **378** are inside
+     a `signature`, and its own cautionary example is the trap (`malloc/malloc.json` holds 178 and
+     declares zero symbols). It also found the row's list of struct-declaring descriptors omitted
+     one.
+
+## §0.1 — The four gate legs, ✔MEASURED at the folded tree, every leg through `scripts/run-gate/`
+
+| leg | result | time | how |
+|---|---|---|---|
+| Windows x86_64 | **2011 / 2011** | 562.15 s | `run-gate` + `orch-gate.sh`, witness `orch-gate: CTEST OK` |
+| Linux x86_64 (WSL2) | **2011 / 2011** | 415.95 s | `scripts/wsl-leg/wsl-leg.sh` |
+| macOS arm64 (Apple Silicon) | **1987 / 1987** | 864.91 s | `remote-leg --carriage macos` |
+| Linux arm64 (native VPS) | **1987 / 1987** | 1103.52 s | `remote-leg --carriage arm64-vps` |
+
+★ **`1987 = 2011 − 24` HELD ON BOTH REMOTE LEGS**, which is the cross-leg check that all four
+tested the same tree — the 24 are the repository-hygiene guards, which examine a source tree that
+is byte-identical everywhere. README's three count claims were moved together, the identity
+sentence included: leaving it stale while moving the totals leaves a sentence that READS as
+evidence and is false.
+⚠ Every rc above was read on the channel the WRITER uses (a file), never through a pipe — a
+pipeline's status is `tail`'s, and P54 recorded "exit code 0" over a gate that never compiled a
+line.
+
+## §0.2 — What landed, by area
+
+**MIR — input-proportional recursion (lane `rs`, 6 rows, all born closed).** Every ceiling
+✔MEASURED on the ordinary ~1 MiB thread through `ctest`, every crash gdb-attributed:
+`*&` chain re-entry **100/200 → 8000 rc 0**; `__try` nesting **500/600 → 4000**; the `.dssmir`
+reader `parseType` **1000/2000 → 16000** and `parseLiteral` **1000/1500 → 100 000**;
+`~MirLiteralValue` teardown **2000/3000 → 100 000**; and a truncated operand list that used to
+**hang 25.03 s** is now refused by name in 0.04 s.
+⚠ **One census sentence was FALSE and is corrected:** `~MirLiteralValue` was recorded as unfixable.
+True of `hir_to_mir.cpp`, **false of the header that owns the TYPE** — ~20 lines. The identical fix
+transfers verbatim to `~HirAggregateValue` in `src/hir/hir_literal_pool.hpp`, which the census also
+carries as unfixable and which is therefore **still open on a false premise**.
+
+**FFI shipped descriptors (lane `sv`).** `sys/stat`, `time`, `windows`, `sys/time`, `io`, `pwd`,
+`utime`, `sys/resource` retyped off `void`. Per-target layouts ✔measured **by execution on four
+legs** and every declared variant agreed cell-for-cell. The reader needed a second change:
+`structs`-before-`symbols` was necessary and insufficient, because a by-name dependency gate
+skipped a whole entry on a variant-less read; it now publishes the **incomplete** tag in that arm
+too.
+
+**C attribute-run granularity (lane `at`).** One `AttrAppertainment` axis
+(`declaration` / `declarator` / `type` / `declaratorUnlessTypeDerived`) declared per rule and read
+by one shared loader; `afterDeclaratorEntityAttrRules` **replaced**, because a subset can only say
+entity-or-not. Corpus example's witness is a nine-report warning set **identical to gcc's in site,
+line and column**.
+
+**The registry's own instruments (orchestrator).** `check-anchor-balance` gains **ARM 7** — a
+DIFFERENTIAL ratchet on the OPEN-vs-GATED axis, deliberately **not** a widening of ARM 6. ARM 6 is
+a day-one refusal over the whole population and is sound only because the `Status` column was
+seeded on 2026-09-01 **from `is_closed`**; that argument does not carry here, because `is_closed`
+never distinguished gated from open, so the GATED word was seeded from nothing and the skew IS
+inherited. Widening ARM 6 would have refused, on day one, exactly the debt its own rationale says
+it cannot have. Self-test **96 → 104 arms**, and ✔**proven able to fail end to end**: rc 1 with one
+row's column flipped, rc 0 restored.
+★ **The predicate tests the WORD, not the GLYPH** — 304 of 490 rows skew by glyph and almost none
+of that misleads anyone; 65 skewed by word, and every one was a claim a reader would act on.
+
+## §0.3 — What is OWED, stated so it is not mistaken for done
+
+- ⛔ **The three `SeqExpr` sites in `hir_to_mir.cpp` are OPEN and were DECLINED with the shape of
+  the fix stated.** **300 rc 0 / 400 SEGFAULT**, gdb-attributed to a six-frame
+  `SeqExpr` ⇄ `ExprStmt` ⇄ `AssignStmt` cycle, and its axis is **LIST LENGTH** — the one shape the
+  census's own sqlite analysis says is reachable. An alternating cycle only flattens when EVERY
+  edge is on one stack: the statement driver, the expression driver and `lowerDiscardedExpr`'s
+  driver must be merged, a plan-24-Stage-4-scale change. A discard-only fix flattens the comma
+  chain and leaves the assignment chain dying at 400 — a partial fix reading as a complete one.
+- **Named residue carried by [[D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED]]**:
+  `pathTerminates` in `src/hir/hir_verifier.hpp` (the new SEH wall at 8000); `~HirAggregateValue`;
+  `src/hir/hir_text.cpp`, which carries BOTH the same reader pair AND the same unterminated-list
+  shape; the non-flattened `lowerExprNode` kinds (`BuiltinCall` and siblings), **unmeasured**.
+- **`sv`'s named residuals**: the 12 `time_t*` positions (the typedef arm injects nothing on a
+  variant miss and the incomplete-tag remedy cannot be mirrored for typedefs); `GetFullPathNameW`'s
+  `LPWSTR*`, `CreateThread`'s `LPDWORD`, `SetFilePointerEx`'s by-value `LARGE_INTEGER`, and the
+  `EXCEPTION_*` aliases.
+- **31 test files hand-build a `ParserConfig`** instead of going through `compilation_unit.cpp`'s
+  chokepoint, so each can measure a stricter parser than `dsscp` ships. One was fixed and closed;
+  the other 31 are unswept.
+- ⚠ **A MEANING FORK IS STILL UNESCALATED, carried from P55**: gcc IGNORES a GNU `noreturn` on a
+  function-type typedef, clang HONOURS it. DSS matches gcc and lane `nr` pinned it. Per the
+  2026-08-28 ruling this is the shape that PAUSES rather than being settled by the disjunction.
+- **`examples/README.md` documents 634 manifests against a live census of 767+** (plan-sweep work,
+  untouched this cycle).
+
+## §0.4 — Traps this cycle paid for
+
+- ★★★ **I read a row's STATUS from its TRIGGER PROSE and briefed a lane on it.**
+  `D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS` carried `🟠 OPEN` in its status cell under a trigger
+  opening `⏳ **GATED**` — four-cell-shape residue. The lane refuted it in its first minutes. This
+  is the single most-repeated warning in my own memory index, and committing it is what produced
+  the 65-row census and ARM 7.
+- ★★ **A ROW ABOUT A CLASS BECOMES A MEMBER OF THE CLASS.** The row recording the 57-row census was
+  itself refused by the balance gate for gate-like prose without an opener; the escape
+  (`Trigger: ALREADY FIRED`) exists for exactly that, and then that same escape disarmed the arm
+  the row commissioned. Two instances, one cycle, same shape.
+- ★★ **THREE LANES WROTE `tests/analysis/semantic/test_semantic_analyzer_c.cpp` AND ONLY ONE
+  DECLARED IT.** `sv`'s copy predated `nr`'s landed noreturn loop; `at`'s predated `sv`'s fstat
+  fixture. Folding either blindly would have REVERTED a sibling's closure. The regions were
+  disjoint, so the reconciliation was: place the later lane's file, re-apply the other's block,
+  and **verify every lane's marker by grep before and after**. Backups of each intermediate state
+  are in the scratchpad. ⇒ Intersect lanes' EXPANDED file lists, not their declared ones.
+- ⚠ **A lane ran `ctest -R` in its own build tree while a full run was in flight** and got 13 reds,
+  11 of which passed on rerun. It reported the clean rerun and said so. A contaminated run looks
+  exactly like a real failure.
+- ⚠ **A heredoc collapsed a doubled backslash again** — patching a `\n` inside a Python string
+  turned it into a real newline and broke the file. The rule already existed and I broke it anyway;
+  the Edit tool was the right instrument and is what fixed it.
+- ⚠ **`scripts/check-line-endings/` has NO `.py`** — invoke `check-line-endings.sh`. Calling a
+  nonexistent `.py` exits **2**, which reads like a guard failure and is not one.
+
+---
+
+★★★ **P55 — RELOCATED HERE BY P56, AND IT IS HISTORY, NOT STATE.** It was §0 until P56 closed. Every figure below is P55's own and was true at P55's tip; **re-derive anything you intend to act on.** Its through-line — *the measurement was right and the ATTRIBUTION was wrong* — is the direct ancestor of P56's, which is the same failure one step later: the RECORD was right and nobody re-read it.
+
+## ⏪ P55's former §0 (history)
+
 
 **Cycle P55 closed 2026-09-03.** Twelve lanes. ✔**REAL: 26 rows closed, 1 opened.** ✔**COUNTED by
 `check-anchor-balance --base 0cbf3b62`: 2 closed, 1 opened, net −1.** The gap is not an error and

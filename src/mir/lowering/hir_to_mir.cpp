@@ -5141,6 +5141,17 @@ struct Lowerer {
         // caller path that has copied out its frame fields — `work.back()` may
         // dangle after.
         auto const request = [&](HirNodeId n, bool wantAddr) {
+          // ★★★ TWO ARMS ARE PURE REQUEST REWRITES AND THEY LOOP HERE RATHER
+          // THAN RE-ENTERING THE DRIVER — D-MIR-HIRTOMIR-ADDRESSOF-DEREF-REENTRY-RECURSES-PER-LINK.
+          // `lowerExprNode`'s AddressOf arm is exactly `lowerLvalueAddress(child)`
+          // and `lowerLvalueAddressNode`'s Deref arm is exactly `lowerExpr(child)`
+          // — neither emits anything of its own, and each is the SAME request
+          // with the address/value flag flipped. Written as delegations they
+          // spun up a FRESH `runExprDriver` per link, so `*&*&…p` cost four host
+          // frames per `*&` pair; written as a rewrite loop they cost none.
+          // ⚠ THE ARITY GUARDS STAY ON THE DELEGATED SIDE: a malformed node
+          // falls out of this loop and reaches its own fail-loud, unchanged.
+          for (;;) {
             HirKind const nk = hir.kind(n);
             // C23 _BitInt(N>64) (D-CSUBSET-BITINT-C2-WIDE): a wide `_BitInt` is
             // MEMORY-RESIDENT — it has NO SSA rvalue. A VALUE read of a wide-BitInt-
@@ -5171,6 +5182,17 @@ struct Lowerer {
                 wantAddr = true;
             }
             if (wantAddr) {
+                // `*p` AS AN LVALUE IS THE POINTER'S VALUE — the same request
+                // with the flag flipped, and `lowerLvalueAddressNode`'s Deref
+                // arm does nothing else. Nothing above that arm in that function
+                // can intercept a Deref (its wide-BitInt / complex / BuiltinCall
+                // / Call pre-checks all key on other kinds), so the rewrite is
+                // byte-identical.
+                if (nk == HirKind::Deref && hir.children(n).size() == 1) {
+                    n        = hir.children(n)[0];
+                    wantAddr = false;
+                    continue;
+                }
                 switch (nk) {
                     case HirKind::MemberAccess:
                         // The plain field-of-lvalue arm: its ONLY recursion is
@@ -5198,6 +5220,13 @@ struct Lowerer {
                 // its recursive body; its own re-entries still flatten.
                 result = lowerLvalueAddressNode(n);
                 return;
+            }
+            // `&x` AS A VALUE IS x's ADDRESS — the same request with the flag
+            // flipped, and `lowerExprNode`'s AddressOf arm does nothing else.
+            if (nk == HirKind::AddressOf && hir.children(n).size() == 1) {
+                n        = hir.children(n)[0];
+                wantAddr = true;
+                continue;
             }
             switch (nk) {
                 case HirKind::UnaryOp:
@@ -5294,6 +5323,8 @@ struct Lowerer {
                 default: break;
             }
             result = lowerExprNode(n);   // delegate (terminal / CFG / by-address)
+            return;
+          }
         };
 
         // Plan 24: the per-arg pump for a flattened Call (ctx at stable index
@@ -11018,7 +11049,7 @@ struct Lowerer {
     // would dangle; the index does not.
     struct StmtFrame {
         enum class Kind : std::uint8_t {
-            Block, If, While, DoWhile, For, Label, Switch
+            Block, If, While, DoWhile, For, Label, Switch, Seh
         } kind;
         HirNodeId node;
         std::uint8_t phase;
@@ -11030,17 +11061,21 @@ struct Lowerer {
         //         bb4=backTarget.
         // Label : bb0=label block.
         // Switch: bb0=exitBB (per-arm + case blocks live in blockCtxs/exprdata).
+        // Seh   : bb0=tryBB, bb1=filterBB, bb2=handlerBB, bb3=joinBB.
         MirBlockId bb0{};
         MirBlockId bb1{};
         MirBlockId bb2{};
         MirBlockId bb3{};
         MirBlockId bb4{};
         // If: tracks whether any path reaches the join (the recursive
-        // `joinReached`). While/For/DoWhile: unused.
+        // `joinReached`). Seh: the same `joinReached`. While/For/DoWhile: unused.
         bool flag0{};
-        // Block: index into `blockCtxs` (the child cursor). Unused (0) by the
-        // others. (c60: the Switch frame no longer needs a per-arm cursor — its
-        // body lowers as ONE Block via the work-stack — so it carries only `bb0`.)
+        // Block: index into `blockCtxs` (the child cursor). Seh: the SEH REGION
+        // ID minted at phase 0 — it is consumed by the `SehTryEnd` marker and by
+        // `addSehFilterReturn` in a LATER phase, so it has to survive the resume
+        // like any other per-arm bookkeeping. Unused (0) by the others. (c60: the
+        // Switch frame no longer needs a per-arm cursor — its body lowers as ONE
+        // Block via the work-stack — so it carries only `bb0`.)
         std::uint32_t aux{};
         // VLA C5 (D-CSUBSET-VLA): for a Block frame, `vlaScopeStack_.size()` captured
         // at the block's entry (phase 0). At the block's fall-through finish, the
@@ -11917,6 +11952,10 @@ struct Lowerer {
                     work.push_back({.kind = StmtFrame::Kind::Switch,
                                     .node = n, .phase = 0});
                     return;
+                case HirKind::SehTryExcept:
+                    work.push_back({.kind = StmtFrame::Kind::Seh,
+                                    .node = n, .phase = 0});
+                    return;
                 default: break;
             }
             ok = lowerStmtNode(n);   // leaf (Return/ExprStmt/VarDecl/Assign/…)
@@ -12380,6 +12419,119 @@ struct Lowerer {
                 work.pop_back(); ok = true;
                 break;
             }
+            // ── SehTryExcept (c115, D-WIN64-SEH-FUNCLETS): the region skeleton,
+            // flattened. `__try { __try { … } __except … } __except …` nests as
+            // deep as the source writes it, and the recursive arm cost ONE
+            // `lowerStmtNode` frame plus one `lowerStmt` driver frame per level.
+            //   pre      : SehTryBegin(id), succs [tryBB, filterBB]
+            //   tryBB    : guarded body …; SehTryEnd(id); Br(joinBB)
+            //   filterBB : filter expr …; SehFilterReturn(i32, id) → handlerBB
+            //   handlerBB: handler body …; Br(joinBB)
+            //   joinBB   : the continuation.
+            // phase 0 mints the region + the four blocks, opens tryBB and requests
+            // the GUARDED BODY. phase 1 closes the region, lowers the FILTER (via
+            // `lowerExpr` — a separate machine with its OWN work-stack, exactly
+            // like the If/While/Switch arms' conditions, so `f` survives it),
+            // opens handlerBB and requests the HANDLER. phase 2 finalizes the
+            // join. `bb0..bb3` are the four blocks, `aux` the region id and
+            // `flag0` the recursive arm's `joinReached` — byte-identical
+            // createBlock order, branch successors and sub-statement order.
+            case StmtFrame::Kind::Seh: {
+                if (f.phase == 0) {
+                    HirNodeId const node2 = f.node;
+                    std::uint32_t const regionId = sehRegionCounter_++;
+                    MirBlockId const tryBB =
+                        mir.createBlock(StructCfMarker::Linear);
+                    MirBlockId const filterBB =
+                        mir.createBlock(StructCfMarker::Linear);
+                    MirBlockId const handlerBB =
+                        mir.createBlock(StructCfMarker::Linear);
+                    MirBlockId const joinBB =
+                        mir.createBlock(StructCfMarker::Linear);
+                    mir.addSehTryBegin(tryBB, filterBB, regionId);
+                    f.bb0 = tryBB;     f.bb1 = filterBB;
+                    f.bb2 = handlerBB; f.bb3 = joinBB;
+                    f.aux = regionId;
+                    f.flag0 = false;   // joinReached
+                    f.phase = 1;
+                    mir.beginBlock(tryBB);
+                    enterStmt(hir.sehTryBody(node2));  // guarded body — may invalidate `f`
+                } else if (f.phase == 1) {
+                    HirNodeId  const node2     = f.node;
+                    MirBlockId const filterBB  = f.bb1;
+                    MirBlockId const handlerBB = f.bb2;
+                    MirBlockId const joinBB    = f.bb3;
+                    std::uint32_t const regionId = f.aux;
+                    if (!ok) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(filterBB);
+                        sealCreatedAsUnreachable(handlerBB);
+                        sealCreatedAsUnreachable(joinBB);
+                        work.pop_back(); ok = false; break;
+                    }
+                    if (!mir.openBlockHasTerminator()) {
+                        // The SINGLE exit — option (C), verifier-enforced
+                        // (D-CSUBSET-SEH-EARLY-EXIT); a body that seals itself
+                        // (an infinite loop) simply has no End marker.
+                        mir.addInst(MirOpcode::SehTryEnd, {}, InvalidType, regionId);
+                        mir.addBr(joinBB);
+                        f.flag0 = true;   // joinReached
+                    }
+                    // ── the filter expression (i32-coerced: MSVC's filter
+                    //    contract; a Bool comparison like `_exception_code()==E`
+                    //    ZExts) ──
+                    HirNodeId const filterN = hir.sehTryFilter(node2);
+                    mir.beginBlock(filterBB);
+                    MirInstId fval = lowerExpr(filterN);
+                    if (!fval.valid()) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(handlerBB);
+                        sealCreatedAsUnreachable(joinBB);
+                        work.pop_back(); ok = false; break;
+                    }
+                    TypeId const i32Ty = interner.primitive(TypeKind::I32);
+                    TypeId const ft    = hir.typeId(filterN);
+                    if (ft.valid() && ft != i32Ty) {
+                        MirOpcode const castOp =
+                            mapCast(interner.kind(ft), TypeKind::I32);
+                        if (castOp == MirOpcode::Invalid) {
+                            unsupported(node2,
+                                "SEH __except filter expression must be "
+                                "an integer (MSVC: the filter value is "
+                                "an int)");
+                            if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                            sealCreatedAsUnreachable(handlerBB);
+                            sealCreatedAsUnreachable(joinBB);
+                            work.pop_back(); ok = false; break;
+                        }
+                        std::array<MirInstId, 1> const castOps{fval};
+                        fval = mir.addInst(castOp, castOps, i32Ty);
+                    }
+                    mir.addSehFilterReturn(fval, handlerBB, regionId);
+                    // ── the handler body ──
+                    mir.beginBlock(handlerBB);
+                    f.phase = 2;
+                    enterStmt(hir.sehTryHandler(node2));  // handler — may invalidate `f`
+                } else {  // phase 2: after the handler body
+                    MirBlockId const joinBB = f.bb3;
+                    bool joinReached = f.flag0;
+                    if (!ok) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(joinBB);
+                        work.pop_back(); ok = false; break;
+                    }
+                    if (!mir.openBlockHasTerminator()) {
+                        mir.addBr(joinBB);
+                        joinReached = true;
+                    }
+                    mir.beginBlock(joinBB);
+                    if (!joinReached) {
+                        mir.addUnreachable();   // both paths sealed — pruned centrally
+                    }
+                    work.pop_back(); ok = true;
+                }
+                break;
+            }
             }
         }
         return ok;
@@ -12394,9 +12546,10 @@ struct Lowerer {
     // `lowerStmt` is now an explicit heap work-stack DRIVER. The deeply-nesting
     // control-flow arms — Block (its child list), IfStmt (then/else), While/
     // DoWhile/For (body), LabelStmt (labeled stmt), SwitchStmt (each arm's body
-    // list) — are flattened onto that work-stack so a deeply-nested `{{{…}}}` /
-    // `if(if(if(…)))` / `while(while(…))` / `label: label: …` nest carries FLAT
-    // O(1) host-stack cost per nesting level. This per-NODE handler is the
+    // list) and SehTryExcept (guarded body + handler) — are flattened onto that
+    // work-stack so a deeply-nested `{{{…}}}` / `if(if(if(…)))` /
+    // `while(while(…))` / `label: label: …` / `__try{__try{…}…}…` nest carries
+    // FLAT O(1) host-stack cost per nesting level. This per-NODE handler is the
     // byte-identical emission body for EVERY arm: the LEAF arms (Return,
     // Unreachable, ExprStmt, VarDecl, AssignStmt, Break, Continue, Goto,
     // IndirectGoto) are reached through the driver UNCHANGED, and the flattened
@@ -12842,6 +12995,12 @@ struct Lowerer {
                 return true;
             }
             case HirKind::SehTryExcept: {
+                // NOTE (P56): this recursive arm is DEAD via the StmtFrame driver
+                // (`enterStmt` intercepts SehTryExcept and runs the flattened
+                // `StmtFrame::Kind::Seh` machine, which reproduces the emission
+                // below byte-for-byte). It is retained as the fallback the other
+                // flattened arms are, so the two forms stay side by side and
+                // readable — but the LIVE path is the driver's.
                 // c115 SEH (D-WIN64-SEH-FUNCLETS) — the region skeleton:
                 //   pre:      SehTryBegin(id), succs [tryBB, filterBB]
                 //   tryBB:    guarded body …; SehTryEnd(id); Br(joinBB)

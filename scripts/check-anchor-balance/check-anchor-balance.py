@@ -329,6 +329,43 @@ def norm_cell(text):
     return strip_decoration(text).lower()
 
 
+# The three words a cell may LEAD with to state a verdict. `DEFERRED` is a third spelling
+# of GATED that the 2026-06-era rows use freely, and a reader treats it as one.
+_VERDICT_WORDS = {"CLOSED": "CLOSED", "OPEN": "OPEN", "GATED": "GATED", "DEFERRED": "GATED"}
+
+
+def lead_verdict_word(text):
+    """-> the verdict a cell states in its FIRST word, or None.
+
+    ★★★ THE PREDICATE MUST TEST THE WORD, NOT THE GLYPH, and the gap between the two is
+    the whole reason ARM 7 exists as a separate arm. ✔MEASURED 2026-09-03 over the two
+    working registries: **304 of 490 rows** lead with a glyph differing from their status
+    cell's, and almost all of them mislead nobody -- `⏳ **OPEN (...)**` against a
+    `🟠 OPEN` column agrees in WORDS, and ~60 rows open with `🟢` that is P42 audit
+    BANDING rather than a shipped-work claim. The WORD-level figure over the same
+    population was **65**, and every one of those was a claim a reader would act on. A
+    guard built on the glyph would refuse 304 rows on day one and be softened within a
+    cycle; one built on the word refuses only what is actually wrong.
+
+    ⚠⚠ AND IT READS ONLY THE FIRST WORD, WHICH IS THE THIRD NARROWING OF THIS PREDICATE
+    -- each earlier one produced a FALSE CONTRADICTION against a row that was correct:
+      1. scanning the first four words matched `(a) CLOSED 2026-07-30 ... ROW STAYS OPEN
+         as the CLASS index`;
+      2. requiring a capitalised run of length >= 3 still matched `BUG FIXED ... CLASS
+         OPEN ON LIMBS (B)+(C)` and `PARTIALLY CLOSED ... THE DERIVATION HALF REMAINS
+         OPEN`.
+    Both of those rows state honestly that PART of their subject shipped while the row
+    stays open, and "fixing" either would have destroyed the record. A qualifier before
+    the verdict (`BUG`, `PARTIALLY`, `LIMB (A)`) changes what the verdict is ABOUT, and
+    no scanner can enumerate which qualifiers do that. ⇒ Reading only the first word
+    cannot err in that direction: it under-counts a row that says `STILL OPEN`, and never
+    fabricates a contradiction against an author who was being precise. Under-counting is
+    the safe direction for a ratchet; a false accusation is what gets a guard turned off.
+    """
+    m = re.search(r"[A-Za-z]+", strip_decoration(text))
+    return _VERDICT_WORDS.get(m.group(0).upper()) if m else None
+
+
 # ⚠⚠ AN ESCAPED PIPE IS NOT A CELL SEPARATOR, AND READING IT AS ONE SHIFTED EVERY
 # CELL AFTER IT. `\|` is the house spelling for a literal pipe inside a cell -- the
 # registry guard's PURPOSE line is literally "refuse a markdown table row whose
@@ -1114,6 +1151,7 @@ class Scan(object):
         self.unclassified = {}
         self.unblocked = {}
         self.split_verdict = {}
+        self.split_gate = {}
         self.plan_phases = {}
 
     def merge(self, other):
@@ -1126,6 +1164,7 @@ class Scan(object):
         self.unclassified.update(other.unclassified)
         self.unblocked.update(other.unblocked)
         self.split_verdict.update(other.split_verdict)
+        self.split_gate.update(other.split_gate)
         # ⚠ UNION, not `update`: `.plans/` really does carry two `24-` plans, and an
         # overwrite would silently delete one of them from the namespace an opener
         # resolves against -- a dangling verdict on a phase that exists.
@@ -1292,6 +1331,51 @@ def scan_document(text, relpath):
                         scan.split_verdict[key] = (
                             " ".join(status.split())[:24],
                             " ".join(strip_decoration(prose).split())[:60])
+                    # ⚠ A SEVENTH ARM, AND IT IS A DIFFERENTIAL WHERE ARM 6 IS A
+                    # DAY-ONE REFUSAL. ARM 6 compares only CLOSED vs NOT-CLOSED, so
+                    # the whole OPEN-vs-GATED axis is invisible to it -- and BOTH
+                    # directions hide work: a row reading GATED is skipped by every
+                    # queue-by-eye, and a row reading OPEN while marked GATED invites
+                    # a lane to pick up something the registry says is blocked. ✔The
+                    # cost was paid on 2026-09-03, when the orchestrator read
+                    # `D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS` as gated from its
+                    # trigger, briefed a lane on it, and the lane refuted it in its
+                    # first minutes -- the exact failure the six-cell shape exists to
+                    # prevent, committed by the party that enforces it.
+                    #
+                    # ⚠⚠ WHY IT IS NOT FOLDED INTO ARM 6, and this is the load-bearing
+                    # difference: ARM 6's own rationale is that it CANNOT inherit debt,
+                    # because the Status column was seeded on 2026-09-01 FROM
+                    # `is_closed`. That argument does not carry here -- `is_closed`
+                    # never distinguished gated from open, so the GATED word was seeded
+                    # from nothing and the skew IS inherited. Widening ARM 6 would
+                    # refuse, on day one, exactly the debt its own rationale says it
+                    # cannot have, and block every commit until the backlog cleared:
+                    # which is how a guard gets softened instead of obeyed.
+                    if (shape.trigger_col != shape.status_col
+                            and prose.strip()
+                            and not is_closed(status) and not is_closed(prose)):
+                        sw = lead_verdict_word(status)
+                        tw = lead_verdict_word(prose)
+                        # ⚠⚠ THE ESCAPE IS DIRECTIONAL, and it was NOT on the first
+                        # draft of this arm -- which made the arm UNTESTABLE and was
+                        # caught trying to prove it could fail. Every row this project
+                        # mints declares `Trigger: ALREADY FIRED`, because the sibling
+                        # arm refuses gate-like prose that names no opener. An
+                        # undirected escape therefore exonerated every NEW row at
+                        # once: the ratchet could not refuse anything it was built for.
+                        # ⇒ A fired trigger excuses the PROSE saying GATED (a row must
+                        # be able to name the gate it is about). It does NOT excuse the
+                        # COLUMN saying GATED while the prose says OPEN-and-fired --
+                        # that is the column being stale, which is exactly the half a
+                        # human never reads and every queue does.
+                        if ({sw, tw} == {"OPEN", "GATED"}
+                                and not (tw == "GATED" and TRIGGER_FIRED.search(
+                                    strip_decoration(prose) + " "
+                                    + strip_decoration(closing)))):
+                            scan.split_gate[key] = (
+                                " ".join(status.split())[:24],
+                                " ".join(strip_decoration(prose).split())[:60])
                     if opened:
                         gated = is_gated(prose, closing)
                         if gated:
@@ -2408,6 +2492,56 @@ def self_test():
         "gated=%r" % {k: v[0] for k, v in s6d.gated_rows.items()})
     extra_total += 4
 
+    # ── ARM 7: OPEN-vs-GATED, THE WORD AND NOT THE GLYPH ─────────────────────
+    # ⓘ These pin the RECORDER, which is where every way of being wrong lives: the
+    # differential itself (`after - before`) is three lines in main and is the same
+    # shape arms 2-5 already use. What is worth a red arm is WHICH ROWS GET RECORDED,
+    # because each non-recording arm below corresponds to a false contradiction this
+    # predicate actually produced while it was being built.
+    def gate_probe(row):
+        return scan_document(_doc(*(REG6 + [row])), REG_REL).split_gate
+
+    pin(list(gate_probe(
+        "| `D-XX" "-G1` | P2 | \U0001f7e0 OPEN | ⏳ **GATED (opened by [[D-XX" "-Z]])** "
+        "| w | r |")) == [REG_PREFIX + "#D-XX" "-G1"],
+        "arm 7: status OPEN + prose GATED is RECORDED -- the direction that hides "
+        "schedulable work behind a stale gate marker")
+    pin(list(gate_probe(
+        "| `D-XX" "-G2` | P2 | ⏳ GATED | \U0001f7e0 **OPEN -- do this now** | w | r |"))
+        == [REG_PREFIX + "#D-XX" "-G2"],
+        "arm 7: status GATED + prose OPEN is RECORDED -- the direction that invites a "
+        "lane to start something the column says is blocked")
+    pin(list(gate_probe(
+        "| `D-XX" "-G3` | P2 | \U0001f7e0 OPEN | ⏳ **DEFERRED (surfaced 2026-06-29)** "
+        "| w | r |")) == [REG_PREFIX + "#D-XX" "-G3"],
+        "arm 7: DEFERRED is a THIRD SPELLING of GATED -- the 2026-06 rows use it, and "
+        "a predicate knowing only two spellings would call a third of the class clean")
+    pin(not gate_probe(
+        "| `D-XX" "-G4` | P2 | \U0001f7e0 OPEN | ⏳ **GATED -- Trigger: ALREADY FIRED** "
+        "| w | r |"),
+        "arm 7: the ESCAPE -- a row declaring its trigger ALREADY FIRED is not gated by "
+        "definition, and a row ABOUT gated rows must be able to name them")
+    pin(not gate_probe(
+        "| `D-XX" "-G5` | P2 | \U0001f7e0 OPEN | ⏳ **OPEN (still)** | w | r |"),
+        "arm 7: THE WORD, NOT THE GLYPH -- ⏳ against a 🟠 column agrees in words and "
+        "misleads nobody; 304 of 490 rows skew by glyph where only 65 skewed by word")
+    pin(not gate_probe(
+        "| `D-XX" "-G6` | P2 | \U0001f7e0 OPEN | \U0001f534 **PARTIALLY CLOSED 2026-08-06 "
+        "-- THE DERIVATION HALF REMAINS OPEN** | w | r |"),
+        "arm 7: a PARTIAL-CLOSURE row is not a contradiction -- reading past the "
+        "qualifier is the false positive that narrowed this predicate to one word")
+    pin(not gate_probe(
+        "| `D-XX" "-G7` | P2 | ✅ CLOSED | ⏳ **GATED** | w | r |"),
+        "arm 7: a CLOSED row is OUT OF SCOPE here -- ARM 6 owns the closed-vs-not axis, "
+        "and two arms refusing one row would name the same defect twice")
+    pin(list(gate_probe(
+        "| `D-XX" "-G8` | P2 | ⏳ GATED | \U0001f7e0 **OPEN -- Trigger: ALREADY FIRED** "
+        "| w | r |")) == [REG_PREFIX + "#D-XX" "-G8"],
+        "arm 7: THE ESCAPE IS DIRECTIONAL -- a fired trigger excuses PROSE that says "
+        "GATED, never a COLUMN that does; undirected, it exonerated every new row at "
+        "once because every row this project mints declares its trigger fired")
+    extra_total += 8
+
     # ── THE PARTITION ARM ────────────────────────────────────────────────────
     def partition_probe(prod_rows, harn_rows, done_rows, with_archive=True):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2785,6 +2919,39 @@ def main():
         print("  reword the prose only if the prose is the half that is wrong. Do NOT")
         print("  silence this by reading one cell -- the whole reason the column exists")
         print("  is that a verdict buried in prose was read differently by every tool.")
+        return 1
+
+    # == ARM 7: OPEN-vs-GATED, A RATCHET RATHER THAN A DAY-ONE REFUSAL ========
+    # Shaped like arms 2-5: the whole-population figure is reported as DEBT, and only
+    # rows THIS CYCLE ADDED OR EDITED are refused. See the recorder above for why this
+    # cannot be folded into ARM 6. The escape is the same one ARM 6's sibling already
+    # offers -- a row that declares `Trigger: ALREADY FIRED` or `Trigger: none` is not
+    # gated by definition, and a row ABOUT gated rows must be able to name them.
+    new_gate_skew = sorted(k for k in after.split_gate if k not in before.split_gate)
+    old_gate_skew = sorted(k for k in after.split_gate if k in before.split_gate)
+    if old_gate_skew:
+        print("anchor-balance: DEBT - %d row(s) predating %s disagree with their own "
+              "trigger about OPEN vs GATED (inherited; not refused here)."
+              % (len(old_gate_skew), args.base))
+    if new_gate_skew:
+        print()
+        print("anchor-balance: FAIL - %d row(s) this cycle added or edited state one "
+              "verdict in their `Status` column and the OTHER in their `Trigger` prose:"
+              % len(new_gate_skew))
+        for k in new_gate_skew:
+            col, prose = after.split_gate[k]
+            print("  ! %s\n      Status column: %s\n      Trigger prose: %s"
+                  % (k, col, prose))
+        print("  BOTH DIRECTIONS HIDE WORK, which is why this is refused and not noted:")
+        print("  a row whose prose reads GATED is skipped by every read-by-eye queue even")
+        print("  though the column says it is schedulable; a row whose prose reads OPEN")
+        print("  while the column says GATED invites a lane to start something blocked.")
+        print("  Decide which half is TRUE. If the row is genuinely gated, correct the")
+        print("  COLUMN (which also moves the row):")
+        print("      python scripts/anchors/anchors.py set <anchor> --status gated --apply")
+        print("  If the gate has fired or was never a gate, reword the PROSE's leading")
+        print("  verdict -- and say WHY in the row, so the next cycle does not undo it.")
+        print("  A row that is ABOUT gated rows may declare `Trigger: ALREADY FIRED`.")
         return 1
 
     net_new = bal.net_new

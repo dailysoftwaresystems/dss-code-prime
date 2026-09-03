@@ -32,11 +32,30 @@
  * as a typedef to the EMPTY named struct (the `FILE` precedent) so user code
  * can only ever hold a `DIR *` and member access on it fails loud. This unit
  * therefore does NOT reach into `DIR`: it allocates its own private
- * `DssDirStream` and hands back a `void *`, exactly as the descriptor's
- * `fn(ptr<char>) -> ptr<void>` says. The three definitions below spell the
- * descriptor's signature verbatim; a divergence is a compile error in this
- * file, because <dirent.h> is included and the descriptor's declarations are
- * therefore in scope.
+ * `DssDirStream` and hands the caller back a pointer to it under the opaque
+ * handle's name. The three definitions below spell the descriptor's signature
+ * verbatim; a divergence is a compile error in this file, because <dirent.h>
+ * is included and the descriptor's declarations are therefore in scope.
+ *
+ * ⚠ THE SENTENCE THAT STOOD HERE WAS TRUE WHEN WRITTEN AND IS NOW REFUTED, so
+ * it is restated rather than deleted: it said this unit "hands back a `void *`,
+ * exactly as the descriptor's `fn(ptr<char>) -> ptr<void>` says". It no longer
+ * does, and the descriptor no longer says that. P56 closed
+ * [[D-FFI-DIRENT-API-DECLARED-OVER-VOID-NOT-ITS-OWN-STRUCTS]] and the three
+ * rows are now `fn(ptr<char>) -> ptr<DIR>`, `fn(ptr<DIR>) -> ptr<dirent>` and
+ * `fn(ptr<DIR>) -> i32`. Nothing about the BYTES this unit writes changed; what
+ * changed is that the ABI it publishes is now stated in the types, so this
+ * file's own signatures are checked against it on every pe build instead of
+ * agreeing with a `void *` that could not disagree with anything.
+ *
+ * ★ THE TWO CASTS BELOW ARE THE WHOLE COST OF THAT, AND THEY ARE THE RIGHT WAY
+ * ROUND. `DIR` is INCOMPLETE here (the descriptor declares no fields for it),
+ * so this unit cannot and does not touch it; it converts its own
+ * `struct DssDirStream *` to `DIR *` on the way out and back on the way in,
+ * which is the ordinary object-pointer conversion every POSIX directory
+ * implementation performs — glibc casts to its `struct __dirstream`, mingw-w64
+ * to its own `DIR`. Casting is not circumvention: the type the CALLER holds
+ * stays one it can do nothing with but pass back.
  *
  * ★★★ AND THAT INCLUDE IS THE STRUCTURAL POINT, NOT A CONVENIENCE. `struct
  * dirent` is declared ONCE — in the descriptor — and this file consumes that
@@ -61,7 +80,7 @@
 #include <stdlib.h>
 #include <windows.h>
 
-/* The private stream object `opendir` returns as an opaque `void *`.
+/* The private stream object `opendir` returns behind the opaque `DIR *`.
  *
  * `pending` exists because Win32 has no "open the directory, then read the
  * first entry" split: `_wfindfirst64i32` OPENS and READS in one call. So the
@@ -94,7 +113,7 @@ static unsigned short *dssWidenUtf8(const char *s, int extra) {
     return w;
 }
 
-void *opendir(const char *name) {
+DIR *opendir(const char *name) {
     struct DssDirStream *d;
     unsigned short      *pattern;
     int                  i;
@@ -131,10 +150,10 @@ void *opendir(const char *name) {
         return 0;
     }
     d->pending = 1;
-    return (void *)d;
+    return (DIR *)d;
 }
 
-void *readdir(void *dirp) {
+struct dirent *readdir(DIR *dirp) {
     struct DssDirStream *d;
     int                  n;
 
@@ -162,10 +181,10 @@ void *readdir(void *dirp) {
     d->entry.d_ino = 0;
     d->entry.d_reclen = 0;
     d->entry.d_namlen = (unsigned short)(n - 1);
-    return (void *)&d->entry;
+    return &d->entry;
 }
 
-int closedir(void *dirp) {
+int closedir(DIR *dirp) {
     struct DssDirStream *d;
     int                  rc;
 

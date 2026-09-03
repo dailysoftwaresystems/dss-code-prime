@@ -1,0 +1,91 @@
+{
+  "$comment": "P56 [[D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY]]: a trailing attribute run belongs to the DECLARATION, to THIS DECLARATOR, or to the TYPE, and one config key answered for all three -- so each consumer read it at whichever grain it happened to want. ★★★ THE WITNESS IS THE EXACT WARNING SET, NOT THE EXIT CODE ALONE, and that is what makes ONE artifact pin BOTH directions: the grain decides WHICH ENTITY a `deprecated` fact lands on, `expectWarnings` is an exact set, and every use in the file is deliberate -- so an OVER-application shows up as an unexpected report and a DROP as a missing one. The exit code is there because the program must also still run. ★★ THE MEASURED AXIS IS THE DECLARATOR SHAPE, NOT THE ATTRIBUTE. ✔MEASURED 2026-09-03, four attributes (`deprecated`, `nodiscard`, `maybe_unused`, `noreturn`) x two declarator shapes, each reference probed SEPARATELY: a C23 `[[...]]` run written after a declarator appertains to the ENTITY when the declarator is a bare identifier and to the array-or-function TYPE when it derives one, and the answer is constant across the four attributes. `int x [[deprecated]];` -- gcc 13.3.0 warns at the USE, clang 18.1.3 warns at the USE, MSVC 19.51 /std:clatest C4996 at the USE. `int arr[3] [[deprecated]];` and `void f(void) [[deprecated]];` -- gcc `'deprecated' attribute ignored`, clang `error: 'deprecated' attribute cannot be applied to types` (rc=1), MSVC `C4649 attributes are ignored in this context`. C23 6.7.6p1 vs 6.7.6.2p1/6.7.6.3p1 is why. The GNU spelling has NO such split (✔MEASURED, it confers on the entity in every declarator shape in gcc and clang; MSVC implements no `__attribute__` at any /std: and ABSTAINS), which is why the grain is declared PER RULE. ★★★ AND THIS IS WHY NARROWING ONE LOOP WOULD HAVE TRADED ONE DEFECT FOR ANOTHER: ✔MEASURED at base `6482a71b` through the shipped CLI, DSS conferred on BOTH `void f(void) [[deprecated]];` (above the union -- NO reference confers) and `int x [[deprecated]];` (correct -- ALL THREE confer), out of the same over-broad read. Excluding `stdAttr` from the entity roots fixes the first and BREAKS the second. ★ WHAT THE REFERENCES DO WITH THIS EXACT FILE, stated rather than claimed clean because one of them REFUSES it and the refusal is the point: gcc 13.3.0 `-Wall -Wextra` at c11, c17 and c2x compiles it and the binary exits 42, emitting `-Wattributes` \"attribute ignored\" for the two type-appertaining C23 runs plus EXACTLY the nine `-Wdeprecated-declarations` notes listed below -- same nine sites, same lines, same columns as DSS, which is what makes DSS's set correct rather than merely self-consistent; MSVC 19.51 /std:clatest accepts the same constructs with C4996 at those uses and C4649 for the ignored runs; clang 18.1.3 REFUSES the file (`error: 'deprecated' attribute cannot be applied to types`, on the `depArr` and `depFn` DECLARATIONS). Two references that accept make the construct acceptable, and clang's refusal is a third vote that it must not CONFER -- which is precisely what this file pins. ⚠ RED-ON-DISABLE (REMOVE direction): in `src/dss-config/sources/c.lang.json` change `stdAttr`'s `appertainsTo` in `declarators.afterDeclaratorAttrRules` from `declaratorUnlessTypeDerived` to `declarator`, and this example FAILS IN BOTH RUNNERS with two UNEXPECTED `S_DeprecatedSymbolUsed` reports (`depArr` at 144:17 and `depFn` at 145:5), while `trailing_noreturn_attribute` -- whose spellings are all GNU -- stays GREEN.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "$commentExpectWarnings": "The set is EXACT, and every entry below is an ENTITY-conferring spelling. The negatives are the lines that are NOT here and are nonetheless used at runtime: `depArr[0]` at 144:17 and 153:5 (a C23 run after an ARRAY declarator), `depFn()` at 145:5 (after a FUNCTION declarator), `keptSibling` at 146:14 and 156:5 (the undecorated sibling of a trailing-decorated declarator), and `KeptAlias` at 147:5 (the FIRST alias of a trailing-decorated typedef list). Each of those symbols is really referenced, so a missing report is an assertion and not an absence of evidence.",
+  "expectWarnings": [
+    {
+      "code": "S_DeprecatedSymbolUsed",
+      "line": 131,
+      "col": 17,
+      "$comment": "depObj -- C23 run after a bare IDENTIFIER declarator. gcc, clang AND MSVC all confer here; this is the arm a rule-name-only narrowing would have broken."
+    },
+    {
+      "code": "S_DeprecatedSymbolUsed",
+      "line": 132,
+      "col": 5,
+      "$comment": "gnuFn -- CONTROL: the GNU spelling after a FUNCTION declarator DOES confer (gcc + clang; MSVC abstains), so it must survive the narrowing that silences the C23 twin two lines down in useNonConferring."
+    },
+    {
+      "code": "S_DeprecatedSymbolUsed",
+      "line": 133,
+      "col": 14,
+      "$comment": "gnuArr -- CONTROL: the GNU spelling after an ARRAY declarator confers too. Together with gnuFn this is what keeps the C23 negatives from passing vacuously."
+    },
+    {
+      "code": "S_DeprecatedSymbolUsed",
+      "line": 134,
+      "col": 14,
+      "$comment": "depFirst -- the DECORATED declarator of a multi-declarator declaration; its sibling keptSibling must stay clean."
+    },
+    {
+      "code": "S_DeprecatedSymbolUsed",
+      "line": 135,
+      "col": 5,
+      "$comment": "DeprecatedAlias -- the LAST alias of a trailing-decorated typedef list. This whole slot conferred on NOBODY before the split (below the union); gcc and clang both give it to the last alias alone."
+    },
+    {
+      "code": "S_DeprecatedSymbolUsed",
+      "line": 136,
+      "col": 5,
+      "$comment": "LeadDepA -- CONTROL for the line above: a LEADING typedef run reaches EVERY alias, so KeptAlias's silence at 147 is about the trailing slot's grain and not about a dead typedef scan."
+    },
+    {
+      "code": "S_DeprecatedSymbolUsed",
+      "line": 152,
+      "col": 5,
+      "$comment": "depObj again, at its assignment in main."
+    },
+    {
+      "code": "S_DeprecatedSymbolUsed",
+      "line": 154,
+      "col": 5,
+      "$comment": "gnuArr again, at its assignment in main."
+    },
+    {
+      "code": "S_DeprecatedSymbolUsed",
+      "line": 155,
+      "col": 5,
+      "$comment": "depFirst again, at its assignment in main -- while keptSibling's assignment on the very next line stays silent."
+    }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

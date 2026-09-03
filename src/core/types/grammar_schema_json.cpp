@@ -241,6 +241,148 @@ bool checkKeysAgainst(json const& obj, std::span<std::string_view const> known,
     return clean;
 }
 
+// ★★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+// THE **ONE** READER FOR AN ATTRIBUTE-RUN LIST, USED BY BOTH KEYS THAT DECLARE
+// ONE — `declarators.afterDeclaratorAttrRules` and every declaration row's
+// `declarationAttrSlotRules`.
+//
+// It is one function and not two blocks because the two keys were already
+// drifting: the after-declarator list validated its entries' rule names, the
+// slot list validated names AND rejected duplicates, and NEITHER could say what
+// its entries appertain to — which is the row this closes. Two readers would be
+// two chances to accept a grain-less entry.
+//
+// SHAPE: `[{ "rule": <name>, "appertainsTo": <grain> }, …]`. Both keys are
+// REQUIRED on every entry and the grain vocabulary is CLOSED
+// (`kAttrAppertainmentTable`).
+//
+// ⚠ A BARE STRING IS REFUSED, DELIBERATELY, AND THE MESSAGE SAYS WHAT TO WRITE.
+// The tempting compatibility shim — accept a string and assume a grain — is the
+// knob-that-lies shape this whole key family exists to avoid: the assumed grain
+// is right for `declAttrRun` and WRONG for `structMemberAttrList`, and being
+// wrong there is what let a trailing member attribute leak onto a sibling
+// declarator, which for `noreturn` ELIDES A RETURN PATH. There is no safe
+// default, so there is no default.
+//
+// ⚠ AN UNKNOWN RULE NAME IS A LOAD FAILURE, not a silent no-op — the reason
+// this family names rules instead of indexing children. A wrong INDEX makes the
+// scan descend, find no attributes and assert nothing; a wrong NAME cannot
+// resolve and dies here.
+//
+// ⚠ A DUPLICATE `rule` IS A LOAD FAILURE. Two entries for one rule make every
+// consumer visit that slot twice, so a per-attribute diagnostic fires twice and
+// a per-attribute effect applies twice. Silent today, never what was meant.
+// ⓘ THIS IS ALSO WHY c's TYPEDEF GRAMMAR HAD TO SPLIT ITS TRAILING RUN INTO ITS
+// OWN RULE NAME: `typedefAttrRun` occupied BOTH the lead and the trailing
+// position of one shape, so a single entry carried two grains and a
+// grain-per-rule key cannot describe that. Two positions, two rule names — the
+// `asmLabelRule` discipline.
+//
+// Returns false (and emits) on any malformation; `out` then holds only the
+// entries that were well-formed, which the caller must treat as a failed load.
+bool readAttrRunRules(json const& arr, RuleInterner const& rules,
+                      std::string const& path, std::string_view keyLabel,
+                      Collector& coll, std::vector<AttrRunRule>& out) {
+    static constexpr std::array<std::string_view, 2> kEntryKeys{
+        "rule", "appertainsTo"};
+    DSS_CHECK_KEY_VOCABULARY(kEntryKeys);
+    bool ok = true;
+    if (!arr.is_array()) {
+        coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                  std::format("'{}' must be an ARRAY of "
+                              "{{\"rule\": <shape name>, \"appertainsTo\": "
+                              "<{}>}} objects",
+                              keyLabel,
+                              renderAllowedList(
+                                  allNames(kAttrAppertainmentTable))));
+        return false;
+    }
+    for (auto const& e : arr) {
+        if (!e.is_object()) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                      std::format("each '{}' entry must be an OBJECT "
+                                  "{{\"rule\": <shape name>, "
+                                  "\"appertainsTo\": <{}>}} -- a bare rule-name "
+                                  "string is REFUSED because there is no safe "
+                                  "default grain: an attribute run written "
+                                  "BEFORE a declarator list appertains to every "
+                                  "declarator and one written AFTER it to the "
+                                  "last declarator alone, and assuming either "
+                                  "silently over- or under-applies every fact "
+                                  "the run carries",
+                                  keyLabel,
+                                  renderAllowedList(
+                                      allNames(kAttrAppertainmentTable))));
+            ok = false;
+            continue;
+        }
+        if (!checkKeysAgainst(e, kEntryKeys, path,
+                              std::format("a '{}' entry", keyLabel),
+                              DiagnosticCode::C_InvalidSemantics, coll)) {
+            ok = false;
+        }
+        if (!e.contains("rule") || !e.at("rule").is_string()) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                      std::format("each '{}' entry needs a 'rule' shape-name "
+                                  "string", keyLabel));
+            ok = false;
+            continue;
+        }
+        std::string const rn = e.at("rule").get<std::string>();
+        if (!e.contains("appertainsTo") || !e.at("appertainsTo").is_string()) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                      std::format("'{}' entry '{}' needs an 'appertainsTo' "
+                                  "string ({}) -- what the attributes in this "
+                                  "run appertain to. It is required precisely "
+                                  "because no reading is safe to assume",
+                                  keyLabel, rn,
+                                  renderAllowedList(
+                                      allNames(kAttrAppertainmentTable))));
+            ok = false;
+            continue;
+        }
+        std::string const grainName = e.at("appertainsTo").get<std::string>();
+        auto const grain = attrAppertainmentFromName(grainName);
+        if (!grain.has_value()) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                      std::format("'{}' entry '{}' declares appertainsTo '{}', "
+                                  "which is not one of {}",
+                                  keyLabel, rn, grainName,
+                                  renderAllowedList(
+                                      allNames(kAttrAppertainmentTable))));
+            ok = false;
+            continue;
+        }
+        if (!rules.contains(rn)) {
+            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                      std::format("'{}' references unknown shape '{}' -- an "
+                                  "attribute run is named, not indexed, "
+                                  "precisely so this cannot be a silent no-op",
+                                  keyLabel, rn));
+            ok = false;
+            continue;
+        }
+        bool dup = false;
+        for (AttrRunRule const& have : out) {
+            if (have.name == rn) { dup = true; break; }
+        }
+        if (dup) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                      std::format("'{}' lists '{}' more than once -- every "
+                                  "consumer would visit that run twice, so a "
+                                  "per-attribute diagnostic fires twice and a "
+                                  "per-attribute effect applies twice. One rule "
+                                  "name, one grain: give a run that occupies "
+                                  "two positions two rule names",
+                                  keyLabel, rn));
+            ok = false;
+            continue;
+        }
+        out.push_back(AttrRunRule{rules.find(rn), rn, *grain});
+    }
+    return ok;
+}
+
 // ── diagnostic provenance for a MULTI-DOCUMENT grammar (plan 29 P1+P2) ────
 //
 // Every grammar diagnostic quotes a JSON pointer into `/shapes/<name>`. That
@@ -8315,6 +8457,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             "prototypeParamScopeRule",
                             // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): the OPTIONAL list of
                             // after-declarator attribute rules (attrSpec/stdAttr).
+                            // P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+                            // each entry now carries an `appertainsTo` grain, which
+                            // SUBSUMES and replaces the short-lived
+                            // `afterDeclaratorEntityAttrRules` subset key — a
+                            // subset can only say entity-or-not, and the measured
+                            // axis has three answers. Dropping the old name from
+                            // this vocabulary is what makes a config still
+                            // carrying it fail the load LOUDLY instead of having
+                            // it silently ignored.
                             "afterDeclaratorAttrRules",
                             // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): the
                             // OPTIONAL third list shape — a comma-separated run of
@@ -8502,39 +8653,47 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // after-declarator attribute rules (`attrSpec`, `stdAttr`) —
                     // the init-detection scans skip a child of these rules so an
                     // after-declarator `__attribute__((...))` is not mistaken for
-                    // the initializer. Absent ⇒ empty (no after-declarator attr
-                    // suffix). Each entry must be a known rule name (else the load
-                    // fails, like the single-role helper).
+                    // the initializer. Absent => empty (no after-declarator attr
+                    // suffix).
+                    //
+                    // ★★★ P56
+                    // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+                    // EACH ENTRY NOW DECLARES ITS `appertainsTo` GRAIN, read by
+                    // the SHARED `readAttrRunRules` — the same reader every
+                    // declaration row's `declarationAttrSlotRules` uses, so the
+                    // two keys that describe attribute runs cannot validate them
+                    // differently again.
+                    //
+                    // ★★ IT REPLACES A SEPARATE `afterDeclaratorEntityAttrRules`
+                    // SUBSET KEY (P56 lane `nr`, hours earlier) AND THAT IS A
+                    // CORRECTION, NOT A RESHUFFLE. Every measurement behind that
+                    // key RE-DERIVED true; what was wrong was the SHAPE. A subset
+                    // key can express only a BOOLEAN — entity or not — and the
+                    // measured axis has THREE answers, one of which depends on
+                    // the declarator the run follows:
+                    //   • `int x [[deprecated]];`        gcc 13.3.0 warns at the
+                    //     USE, clang 18.1.3 warns at the USE, MSVC 19.51
+                    //     /std:clatest C4996 at the USE       => the ENTITY
+                    //   • `void f(void) [[deprecated]];` gcc `'deprecated'
+                    //     attribute ignored`, clang `error: cannot be applied to
+                    //     types` (rc=1), MSVC `C4649 attributes are ignored in
+                    //     this context`                       => the TYPE
+                    // (each reference probed SEPARATELY, 2026-09-03; C23 6.7.6p1
+                    // vs 6.7.6.3p1). Under the subset key `stdAttr` had to be
+                    // either IN — which invents the first — or OUT — which drops
+                    // the second, a fact all three references confer. The grain
+                    // says `declaratorUnlessTypeDerived` and both are right.
+                    // ⓘ It also retires the subset CROSS-CHECK: a grain written
+                    // ON an entry cannot disagree with the list it is in, so the
+                    // failure mode that check existed to catch is now
+                    // unrepresentable rather than validated.
                     if (dj.contains("afterDeclaratorAttrRules")) {
-                        auto const& arr = dj.at("afterDeclaratorAttrRules");
-                        if (!arr.is_array()) {
-                            coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                      dPath + "/afterDeclaratorAttrRules",
-                                      "'declarators.afterDeclaratorAttrRules' "
-                                      "must be an array of rule-name strings");
+                        if (!readAttrRunRules(
+                                dj.at("afterDeclaratorAttrRules"), *data.rules,
+                                dPath + "/afterDeclaratorAttrRules",
+                                "declarators.afterDeclaratorAttrRules", coll,
+                                dc.afterDeclaratorAttrRules)) {
                             dOk = false;
-                        } else {
-                            for (auto const& e : arr) {
-                                if (!e.is_string()) {
-                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                              dPath + "/afterDeclaratorAttrRules",
-                                              "each entry must be a rule-name string");
-                                    dOk = false;
-                                    continue;
-                                }
-                                std::string const nm = e.get<std::string>();
-                                if (!data.rules->contains(nm)) {
-                                    coll.emit(DiagnosticCode::C_UnknownShape,
-                                              dPath + "/afterDeclaratorAttrRules",
-                                              std::format("references unknown "
-                                                          "shape '{}'", nm));
-                                    dOk = false;
-                                    continue;
-                                }
-                                dc.afterDeclaratorAttrRuleNames.push_back(nm);
-                                dc.afterDeclaratorAttrRules.push_back(
-                                    data.rules->find(nm));
-                            }
                         }
                     }
                     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the declarator-level
@@ -9813,18 +9972,40 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // child INDICES: a wrong index is SILENT (the scan
                         // descends, finds no attributes, asserts nothing)
                         // whereas a wrong name cannot resolve and is rejected
-                        // right here — see the field's header comment. Unknown
-                        // name ⇒ C_InvalidSemantics, matching the sibling
-                        // rule-reference keys' fail-loud posture.
+                        // right here — see the field's header comment.
+                        //
+                        // ★★★ P56
+                        // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+                        // EVERY ENTRY NOW DECLARES WHAT ITS ATTRIBUTES
+                        // APPERTAIN TO, through the SHARED `readAttrRunRules`
+                        // — the same reader `declarators.afterDeclaratorAttrRules`
+                        // uses. A declaration may put attribute slots on BOTH
+                        // sides of its declarator list and the two sides mean
+                        // different things: c's `declAttrRun` sits before the
+                        // list and reaches every declarator, while
+                        // `structMemberAttrList`, `paramTrailingAttrRun` and the
+                        // trailing typedef run sit after it and reach the LAST
+                        // declarator alone (✔MEASURED 2026-09-03, gcc 13.3.0 and
+                        // clang 18.1.3 agreeing: `struct S { int p, q
+                        // __attribute__((deprecated)); };` warns at a use of `q`
+                        // and is clean at a use of `p`).
+                        //
+                        // ⚠ THE KEY USED TO SAY NEITHER, AND EACH CONSUMER
+                        // GUESSED DIFFERENTLY. The noreturn fold inferred the
+                        // grain POSITIONALLY — walk the children, stop at the
+                        // first declarator-bearing one — while the FC17
+                        // attribute fold and the HIR linkage fold did not infer
+                        // it at all. A positional inference is a weaker claim
+                        // than this key, not a cheaper spelling of it: it reads
+                        // where a slot SITS in one grammar rather than what its
+                        // attributes MEAN, says nothing for a language that
+                        // writes its trailing run before its declarators, and is
+                        // invisible to any consumer that does not reimplement
+                        // the walk — which is exactly how the three consumers
+                        // came to disagree.
                         if (entry.contains("declarationAttrSlotRules")) {
                             auto const& das = entry.at("declarationAttrSlotRules");
-                            if (!das.is_array()) {
-                                coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                          path + "/declarationAttrSlotRules",
-                                          std::format("'declarations[{}]."
-                                                      "declarationAttrSlotRules' must "
-                                                      "be an array of rule names", i));
-                            } else if (das.empty()) {
+                            if (das.is_array() && das.empty()) {
                                 // An empty list is byte-identical to omitting
                                 // the key, so writing it says nothing while
                                 // reading as a configured attribute surface —
@@ -9839,51 +10020,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                       "name the attribute slots or "
                                                       "drop it", i));
                             } else {
-                                for (auto const& elem : das) {
-                                    if (!elem.is_string()) {
-                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                  path + "/declarationAttrSlotRules",
-                                                  "each attribute-slot entry must be a "
-                                                  "rule-name string");
-                                        continue;
-                                    }
-                                    auto const rn = elem.get<std::string>();
-                                    // A repeat entry makes the semantic attribute
-                                    // scan visit that slot TWICE — every clause
-                                    // under it is then seen twice, so a
-                                    // per-attribute diagnostic fires twice and a
-                                    // per-attribute effect is applied twice.
-                                    // Silent today, and never what was meant.
-                                    if (std::ranges::find(
-                                            rule.declarationAttrSlotRuleNames, rn)
-                                        != rule.declarationAttrSlotRuleNames.end()) {
-                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                  path + "/declarationAttrSlotRules",
-                                                  std::format("'declarations[{}]."
-                                                              "declarationAttrSlotRules' "
-                                                              "lists '{}' more than once "
-                                                              "— the attribute scan would "
-                                                              "visit that slot twice",
-                                                              i, rn));
-                                        continue;
-                                    }
-                                    if (!data.rules->contains(rn)) {
-                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                  path + "/declarationAttrSlotRules",
-                                                  std::format("'declarations[{}]."
-                                                              "declarationAttrSlotRules' "
-                                                              "references unknown shape "
-                                                              "'{}' — an attribute slot "
-                                                              "is named, not indexed, "
-                                                              "precisely so this cannot "
-                                                              "be a silent no-op",
-                                                              i, rn));
-                                        continue;
-                                    }
-                                    rule.declarationAttrSlotRules.push_back(
-                                        data.rules->find(rn));
-                                    rule.declarationAttrSlotRuleNames.push_back(rn);
-                                }
+                                readAttrRunRules(
+                                    das, *data.rules,
+                                    path + "/declarationAttrSlotRules",
+                                    std::format("declarations[{}]."
+                                                "declarationAttrSlotRules", i),
+                                    coll, rule.declarationAttrSlotRules);
                             }
                         }
 

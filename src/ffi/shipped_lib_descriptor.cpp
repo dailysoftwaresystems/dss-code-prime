@@ -2462,7 +2462,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
 
     // (3.union) UNIONS — the named-member sibling of `structs`, resolved right
     // after typedefs (so a member may spell an earlier typedef by name, e.g.
-    // `ptr<Tcl_Obj>`) and BEFORE symbols/structs (so a later signature or struct
+    // `ptr<Tcl_Obj>`) and BEFORE structs/symbols (so a later signature or struct
     // FIELD may spell a union BY NAME, e.g. `Tcl_HashEntry.key : "Tcl_HashKey"`).
     // Each union interns as `TypeKind::Union` — every member overlaid at OFFSET 0
     // (C 6.7.2.1) — and the semantic phase injects a member field scope +
@@ -2534,6 +2534,424 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 mergedNamedTypes.push_back(
                     NamedTypeBinding{std::string_view{typedefNameStore.back()}, ust.typeId});
                 out.unions.push_back(std::move(ust));
+            }
+        }
+    }
+
+    // (3.struct) STRUCTS (named-field aggregate types). Each entry interns a
+    // struct type (name + positional field types) the semantic phase injects as a
+    // TAG + a field scope; the layout engine DERIVES the ABI byte offsets from the
+    // field sizes (the descriptor declares names + types, never offsets).
+    //
+    // ★★ THIS RAN AFTER `symbols` UNTIL P56, AND MOVING IT IS WHAT LET A SHIPPED
+    // SIGNATURE BE TYPED OVER ITS OWN API'S STRUCTS AT ALL
+    // ([[D-FFI-DIRENT-API-DECLARED-OVER-VOID-NOT-ITS-OWN-STRUCTS]]). Typedefs
+    // (3.pre) and unions (3.union) were both relocated ahead of `symbols` for
+    // exactly this reason, each in its own cycle; structs were the one named-type
+    // surface still decoded afterwards, so a `signature` had no way to spell one.
+    // ✔MEASURED at the time of the move: across the WHOLE shipped corpus, NOT ONE
+    // symbol signature referenced any struct its own descriptor declared — 13
+    // descriptors declare structs, `readdir`/`fstat`/`stat`/`localtime`/
+    // `getrusage`/`getpwuid` and their siblings were ALL typed over `ptr<void>`,
+    // and the missing ordering is why. Publication is strictly ADDITIVE (the
+    // named-type scan is first-match and these names resolved to NOTHING before),
+    // so no signature, constant or field that already decoded changes meaning.
+    //
+    // A struct entry declares EITHER a flat `fields` (single layout, back-compat)
+    // OR per-target `variants` (plan 25): a list of `{ "when": {arch?,format?},
+    // "fields":[…] }`, the variant matching the active (arch,format) selected so
+    // a struct can carry the correct per-target byte layout. The CRUX
+    // (plan-lock-VERIFIED): x86_64/arm64 AggregateLayoutParams are byte-identical +
+    // computeLayout is param-driven (no arch branch) → the per-target offset delta
+    // comes ENTIRELY from the selected FIELD LIST. The active identity is
+    // (arch = `*activeTarget`, format = `objectFormatKindName(*activeFormat)`); a
+    // variant matches iff EVERY key its `when` specifies equals the active value
+    // (GENERIC string equality — never an `if (arch == "x86_64")` here). >1 match
+    // ⇒ fail loud (F_ShippedStructVariantAmbiguous: an under-specified `when` would
+    // otherwise silently pick the first → a wrong layout). 0 match (variants
+    // present) ⇒ no LAYOUT is injected — never a silent wrong one — while the TAG
+    // is still published INCOMPLETE, so a pointer to it stays well formed and every
+    // use needing a size or a field fails loud (P56; the arm carries the reasoning
+    // and the measurement that refuted the stricter rule it replaced).
+    // EAGER: EVERY variant's field list is decoded regardless
+    // of which is active, so a malformed INACTIVE variant fails the read on EVERY
+    // target (anti-lurking, mirrors `signatureByDataModel`).
+    //
+    // (3.struct.pre) THE BY-NAME DEPENDENCY GATE. The loop below PUBLISHES each
+    // injected struct's tag name into `mergedNamedTypes` (the typedef/union
+    // Option C mirror), so a LATER entry may spell an EARLIER one as a field type
+    // BY NAME — `{"name":"it_interval","type":"timeval"}` — instead of restating
+    // the inner body once per format (the layout-disagreement failure class).
+    // But an earlier entry carrying per-target `variants` is NOT published when
+    // ZERO of them match: `struct timeval` genuinely does not exist on a
+    // pe/unknown-format read, so neither can a struct that embeds one. Skipping
+    // the DEPENDENT — exactly as `matchCount == 0` skips the dependency — is the
+    // honest answer. Letting the EAGER field decode fail instead would take the
+    // WHOLE descriptor down on every target lacking the inner struct (both
+    // all-descriptor sweeps read every shipped file on every format, and the
+    // nullopt direct-API/LSP read selects no variant at all).
+    //
+    // SOURCE-ORDER-EXACT, so fail-loud survives intact: only a name this
+    // descriptor declared BEFORE the referring entry can suppress it. A FORWARD
+    // name (declared later), a SELF reference, and a TYPO (declared nowhere) all
+    // fall through to the ordinary decode, where `parseTypeFromText` reports
+    // `unknown type '<name>'` and `decodeStructFieldList` adds
+    // F_ShippedLibUnsupportedType — two loud diagnostics, never a silent empty
+    // type. Content-blind: a membership test over the descriptor's OWN declared
+    // vocabulary, never an `if (name == "timeval")`.
+    // (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME)
+    auto declaredNamesOf = [&](char const* key) {
+        std::vector<std::string> names;
+        if (doc.contains(key) && doc.at(key).is_array()) {
+            for (auto const& e : doc.at(key)) {
+                if (e.is_object() && e.contains("name") && e.at("name").is_string())
+                    names.push_back(e.at("name").get<std::string>());
+            }
+        }
+        return names;
+    };
+    // Declared before the loop starts: every `typedefs` + `unions` name (both
+    // surfaces decode ABOVE). Struct names join as the loop walks past them.
+    std::vector<std::string> declaredEarlier = declaredNamesOf("typedefs");
+    {
+        auto un = declaredNamesOf("unions");
+        declaredEarlier.insert(declaredEarlier.end(), un.begin(), un.end());
+    }
+    // Tag names published INCOMPLETE by the target-less arm below. They resolve in
+    // a POINTER position (`ptr<dirent>` in a signature) and must NOT satisfy this
+    // gate, because a struct FIELD of an incomplete type has no layout to
+    // contribute — the dependent entry stays unavailable exactly as it was before
+    // the incomplete publication existed.
+    std::vector<std::string> incompletelyPublished;
+    auto publishedByName = [&](std::string const& n) {
+        if (std::find(incompletelyPublished.begin(), incompletelyPublished.end(), n)
+            != incompletelyPublished.end())
+            return false;
+        return std::any_of(mergedNamedTypes.begin(), mergedNamedTypes.end(),
+                           [&](NamedTypeBinding const& nb) { return nb.name == n; });
+    };
+    // Does this entry name an EARLIER-declared type that is NOT published for the
+    // active target? Scans the flat `fields` AND every variant's `fields` — the
+    // eager decode covers them all, so ONE unavailable reference anywhere in the
+    // entry makes the whole entry unavailable here. The test is on the WHOLE
+    // `type` text (the by-name spelling); a compound spelling that merely embeds
+    // an unavailable name (`ptr<timeval>`) is NOT admitted and still fails loud —
+    // the gate accepts only what it can prove.
+    auto referencesUnavailable = [&](json const& sdef) {
+        auto scan = [&](json const& fields) {
+            if (!fields.is_array()) return false;
+            for (auto const& f : fields) {
+                if (!f.is_object() || !f.contains("type") || !f.at("type").is_string())
+                    continue;
+                std::string const t = f.at("type").get<std::string>();
+                if (std::find(declaredEarlier.begin(), declaredEarlier.end(), t)
+                        != declaredEarlier.end()
+                    && !publishedByName(t))
+                    return true;
+            }
+            return false;
+        };
+        if (sdef.contains("fields") && scan(sdef.at("fields"))) return true;
+        if (sdef.contains("variants") && sdef.at("variants").is_array()) {
+            for (auto const& v : sdef.at("variants"))
+                if (v.is_object() && v.contains("fields") && scan(v.at("fields")))
+                    return true;
+        }
+        return false;
+    };
+    if (doc.contains("structs")) {
+        if (!doc.at("structs").is_array()) {
+            emitMalformed(reporter, "shipped-lib descriptor '" + core::genericSpelling(path)
+                                        + "': 'structs' must be an array");
+        } else {
+            std::size_t sidx = 0;
+            for (auto const& sdef : doc.at("structs")) {
+                std::string const at =
+                    "'" + core::genericSpelling(path) + "' structs[" + std::to_string(sidx) + "]";
+                ++sidx;
+                if (!sdef.is_object()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
+                    continue;
+                }
+                (void)rejectUnknownKeys(reporter, sdef,
+                                        "structs[" + std::to_string(sidx - 1) + "]",
+                                        {"name", "fields", "variants"});
+                if (!sdef.contains("name") || !sdef.at("name").is_string()
+                    || sdef.at("name").get<std::string>().empty()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": missing or empty 'name'");
+                    continue;
+                }
+                std::string const sname = sdef.at("name").get<std::string>();
+
+                // (3.struct.pre) THE BY-NAME DEPENDENCY GATE — see the note above the
+                // loop. Evaluated BEFORE `sname` joins `declaredEarlier`, so a
+                // SELF reference is a forward name and still fails loud; recorded
+                // right after, so every entry BELOW may name this one.
+                bool const dependencyUnavailable = referencesUnavailable(sdef);
+                declaredEarlier.push_back(sname);
+                if (dependencyUnavailable) {
+                    // ★★ THE TAG STILL EXISTS; WHAT THIS READ CANNOT STATE IS ITS
+                    // LAYOUT — the SAME answer, for the same reason, as the
+                    // no-variant-matched arm below
+                    // ([[D-FFI-SHIPPED-DESCRIPTORS-DECLARE-STRUCTS-THEIR-OWN-SIGNATURES-DO-NOT-USE]],
+                    // P56 lane sv). There are exactly TWO ways an entry can fail to
+                    // produce a layout on a given read — no variant matched, or a
+                    // by-name dependency is unavailable here — and BOTH are
+                    // statements about the LAYOUT, never about whether the tag is a
+                    // real type. Publishing only in the first case made them
+                    // disagree, and the disagreement was not academic: `struct stat`
+                    // names `timespec` from its macho variant, so on a TARGET-LESS
+                    // read (LSP, the direct API, the AllShippedDescriptorsDecode
+                    // sweep) the tag `stat` was not published AT ALL and
+                    // `fn(i32, ptr<stat>) -> i32` answered `unknown type 'stat'` —
+                    // ✔MEASURED: it took the WHOLE sys/stat.json read down, the
+                    // instant that signature stopped being typed over `ptr<void>`.
+                    //
+                    // Identical discipline to the arm below: published into the
+                    // TYPE-TEXT VOCABULARY ONLY, never into `out.structs`, so every
+                    // read's result object stays byte-identical and nothing
+                    // downstream can see an incomplete type where it saw a complete
+                    // one; and recorded in `incompletelyPublished`, so a FURTHER
+                    // dependent is still skipped rather than silently given a
+                    // fieldless body — a pointer to an incomplete type is legal, a
+                    // MEMBER of one is not, and that is the whole distinction the
+                    // gate exists to keep. No layout is invented in either arm.
+                    //
+                    // ⚠ NOT guarded by `hasVariants` (the other arm is): a FLAT
+                    // entry can never fail to select a variant, but it CAN name an
+                    // unavailable dependency — `itimerval` is flat and its two
+                    // members spell `timeval` — so guarding here would leave exactly
+                    // the flat-by-name case unpublished for no reason.
+                    typedefNameStore.push_back(sname);
+                    mergedNamedTypes.push_back(NamedTypeBinding{
+                        std::string_view{typedefNameStore.back()},
+                        interner.forwardComposite(TypeKind::Struct, sname, 0)});
+                    incompletelyPublished.push_back(sname);
+                    continue;   // dependency unavailable → inject no LAYOUT
+                }
+
+                // Exactly ONE of `fields` (flat, single layout) or `variants`
+                // (per-target). Both, or neither, is a malformed entry — fail loud
+                // (a struct with neither declares no layout; with both is ambiguous
+                // intent).
+                bool const hasFields   = sdef.contains("fields");
+                bool const hasVariants = sdef.contains("variants");
+                if (hasFields == hasVariants) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": a struct must declare EXACTLY one of "
+                                                  "'fields' (single layout) or 'variants' "
+                                                  "(per-target layouts)");
+                    continue;
+                }
+
+                // The SELECTED field list (flat path = `fields`; variant path = the
+                // matching variant's `fields`). `selected` stays false on the
+                // no-variant-matches case → the struct is simply not injected.
+                ShippedStruct sst;
+                sst.name = sname;
+                std::vector<TypeId> fieldTypes;
+                bool selected = false;
+
+                if (hasFields) {
+                    if (!sdef.at("fields").is_array() || sdef.at("fields").empty()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                    + ": 'fields' must be a non-empty array");
+                        continue;
+                    }
+                    if (!decodeStructFieldList(sdef.at("fields"), at, interner, typeReg,
+                                               reporter, sst.fields, fieldTypes,
+                                               mergedNamedTypes)) {
+                        continue;
+                    }
+                    selected = true;
+                } else {
+                    // PER-TARGET VARIANTS. Decode EVERY variant's field list (eager —
+                    // a malformed inactive variant fails the read on every target),
+                    // then select the variant whose `when` matches the active target.
+                    if (!sdef.at("variants").is_array() || sdef.at("variants").empty()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                    + ": 'variants' must be a non-empty array");
+                        continue;
+                    }
+                    std::string const activeFormatName =
+                        activeFormat.has_value()
+                            ? std::string{objectFormatKindName(*activeFormat)}
+                            : std::string{};
+                    bool okVariants = true;
+                    std::size_t matchCount = 0;
+                    std::size_t vidx = 0;
+                    for (auto const& vdef : sdef.at("variants")) {
+                        std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
+                        ++vidx;
+                        if (!vdef.is_object()) {
+                            emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                        + ": must be an object");
+                            okVariants = false; break;
+                        }
+                        (void)rejectUnknownKeys(reporter, vdef,
+                                                "structs[" + std::to_string(sidx - 1)
+                                                    + "] variants[" + std::to_string(vidx - 1) + "]",
+                                                {"when", "fields"});
+                        // `when` — the match selector. REQUIRED object; keys closed to
+                        // {arch, format}. An EMPTY `when:{}` matches every target
+                        // (always-match) — legal but typically ambiguous if any other
+                        // variant also matches (the ambiguity gate below catches it).
+                        if (!vdef.contains("when") || !vdef.at("when").is_object()) {
+                            emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                        + ": missing or non-object 'when' "
+                                                          "(e.g. {\"arch\":\"x86_64\",\"format\":\"elf\"})");
+                            okVariants = false; break;
+                        }
+                        // Decode this variant's field list (eager, every variant) —
+                        // BEFORE the match test so a malformed INACTIVE variant still
+                        // fails the read on every target (anti-lurking).
+                        if (!vdef.contains("fields") || !vdef.at("fields").is_array()
+                            || vdef.at("fields").empty()) {
+                            emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                        + ": 'fields' must be a non-empty array");
+                            okVariants = false; break;
+                        }
+                        std::vector<ShippedField> vFields;
+                        std::vector<TypeId>       vFieldTypes;
+                        if (!decodeStructFieldList(vdef.at("fields"), vat, interner, typeReg,
+                                                   reporter, vFields, vFieldTypes, mergedNamedTypes)) {
+                            okVariants = false; break;
+                        }
+
+                        // Does this variant's `when` MATCH the active target? (the
+                        // SHARED selector — typed surfaces allow {arch,format}.)
+                        WhenMatch const wm = matchVariantWhen(
+                            vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
+                            activeTarget, activeFormat, activeFormatName,
+                            activeDataModelName, reporter);
+                        if (wm == WhenMatch::Error) { okVariants = false; break; }
+                        if (wm == WhenMatch::Match) {
+                            ++matchCount;
+                            if (matchCount == 1) {
+                                // First match — take its fields (and keep scanning so a
+                                // second match is detected → ambiguity fail-loud).
+                                sst.fields = std::move(vFields);
+                                fieldTypes = std::move(vFieldTypes);
+                            }
+                        }
+                    }
+                    if (!okVariants) continue;
+                    if (matchCount > 1) {
+                        // >1 variant matched the active target — a silent
+                        // wrong-layout risk (which would be picked?). Fail loud.
+                        dss::report(reporter, DiagnosticCode::F_ShippedStructVariantAmbiguous,
+                                    DiagnosticSeverity::Error,
+                                    "shipped-lib descriptor " + at + ": struct '" + sname
+                                        + "' has " + std::to_string(matchCount)
+                                        + " 'variants' matching the active target (arch='"
+                                        + (activeTarget.has_value() ? std::string{*activeTarget}
+                                                                    : std::string{"<none>"})
+                                        + "', format='"
+                                        + (activeFormat.has_value() ? activeFormatName
+                                                                    : std::string{"<none>"})
+                                        + "') — exactly one variant may match (refusing an "
+                                          "ambiguous per-target layout)");
+                        continue;
+                    }
+                    // matchCount 0 ⇒ no variant for this target ⇒ no LAYOUT is
+                    // injected (never a silent wrong one); the tag itself is still
+                    // published, INCOMPLETE, by the arm below. matchCount 1 ⇒ select
+                    // it.
+                    selected = (matchCount == 1);
+                }
+
+                if (!selected) {
+                    // ★★ NO VARIANT MATCHED — AND "PUBLISH NOTHING AT ALL" IS NOT
+                    // THE HONEST ANSWER
+                    // ([[D-FFI-DIRENT-API-DECLARED-OVER-VOID-NOT-ITS-OWN-STRUCTS]]).
+                    // The tag still EXISTS; what this read cannot state is its
+                    // LAYOUT, which is a per-target fact. Publishing the tag
+                    // INCOMPLETE says exactly that and invents nothing — it is what
+                    // a C header itself says before it knows — so `ptr<dirent>` in a
+                    // signature stays a well-formed pointer type while every use
+                    // that needs a SIZE or a FIELD still fails loud. A wrong layout
+                    // remains impossible: none is published.
+                    //
+                    // ⚠⚠ THE NARROWER RULE THIS REPLACES WAS WRONG, AND THE GATE
+                    // SAID SO ON TWO LEGS AT ONCE. It published only when BOTH
+                    // selectors were absent, on the argument that a read which NAMES
+                    // a target and finds no variant is a genuine per-target absence
+                    // that ought to fail loud. ✔MEASURED, that argument is refuted:
+                    // `ShippedTypeConsistency.EveryDescriptorAgreesOnEveryTagAndTypedefPerTarget`
+                    // reads EVERY descriptor on EVERY declared (format, arch), and on
+                    // `wasm32-v1` and `spirv-1.6` — formats where `<dirent.h>` does
+                    // not exist at all, and where its `availableObjectFormats` already
+                    // says so — the reference then failed to decode and took the WHOLE
+                    // descriptor read down with it. A header having no layout on a
+                    // target it does not serve is not a defect to report; it is the
+                    // ordinary case.
+                    //
+                    // ⚠ PUBLISHED INTO THE TYPE-TEXT VOCABULARY ONLY, NEVER INTO
+                    // `out.structs`. The result object is byte-identical to before on
+                    // every read, so nothing downstream (semantic tag injection, the
+                    // cross-descriptor consistency check) can see an incomplete type
+                    // where it used to see a complete one — or nothing at all.
+                    //
+                    // The name is ALSO recorded in `incompletelyPublished` so the
+                    // by-name dependency gate above keeps treating it as UNAVAILABLE
+                    // for a struct FIELD: a pointer to an incomplete type is legal, a
+                    // MEMBER of one is not, and the gate is what stops the second.
+                    if (hasVariants) {
+                        typedefNameStore.push_back(sname);
+                        mergedNamedTypes.push_back(NamedTypeBinding{
+                            std::string_view{typedefNameStore.back()},
+                            interner.forwardComposite(TypeKind::Struct, sname, 0)});
+                        incompletelyPublished.push_back(sname);
+                    }
+                    continue;   // no variant matched → inject no LAYOUT
+                }
+                // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): if the SELECTED field list
+                // carries explicit offsets, intern the struct WITH them (an
+                // overlapping FFI layout). ALL-or-NONE within the struct; a mix is
+                // malformed. The offsets enter the content identity so this tag type
+                // matches the bare typedef's inline `struct "X" { T @off }` (same
+                // TypeId → the injected field scope resolves .member on a bare-typedef
+                // value). Empty → the ordinary natural-alignment struct (unchanged).
+                std::size_t withOffset = 0;
+                for (auto const& fld : sst.fields)
+                    if (fld.offset.has_value()) ++withOffset;
+                if (withOffset != 0 && withOffset != sst.fields.size()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": struct field 'offset' must be "
+                                                  "all-or-none (an overlapping layout "
+                                                  "declares every field's offset)");
+                    continue;
+                }
+                if (withOffset == sst.fields.size() && !sst.fields.empty()) {
+                    std::vector<std::uint64_t> offsets;
+                    offsets.reserve(sst.fields.size());
+                    for (auto const& fld : sst.fields) offsets.push_back(*fld.offset);
+                    std::span<std::int64_t const> const noWidths{};
+                    sst.typeId = interner.structType(sname, fieldTypes, noWidths, offsets);
+                } else {
+                    sst.typeId = interner.structType(sname, fieldTypes);
+                }
+                // Option C: publish this struct's TAG name so a LATER surface —
+                // above all another struct's FIELD — can spell it BY NAME
+                // (`{"name":"it_value","type":"timeval"}`), which is what keeps an
+                // inner struct's per-format widths in ONE place instead of being
+                // restated inside every outer struct. Byte-identical to the
+                // typedef/union publications (address-stable `typedefNameStore`
+                // backing). ⚠ A SELECTED entry publishes its COMPLETE type here; an
+                // UNSELECTED one is published INCOMPLETE by the no-variant arm above
+                // and recorded in `incompletelyPublished`, which is what keeps it
+                // usable through a pointer and unusable as a FIELD (P56 — before
+                // that an unselected struct was unnameable entirely, and a signature
+                // naming it took the whole descriptor read down). Publication is
+                // strictly ADDITIVE: the scan is first-match and these names
+                // resolved to nothing before, so no name that already resolved
+                // changes meaning.
+                // (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME)
+                typedefNameStore.push_back(sname);
+                mergedNamedTypes.push_back(
+                    NamedTypeBinding{std::string_view{typedefNameStore.back()}, sst.typeId});
+                out.structs.push_back(std::move(sst));
             }
         }
     }
@@ -3027,315 +3445,14 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         }
     }
 
-    // (6) `typedefs` — resolved EARLY, BEFORE symbols/constants/structs (see the
-    // Option C block just before the `symbols` loop above,
-    // D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION). Relocated so each typedef's
-    // `name -> TypeId` is threaded into `mergedNamedTypes` and can be spelled BY
-    // NAME (`ptr<Tcl_Obj>`) by every later `parseTypeFromText` call, instead of
-    // re-inlining the full `struct "Tcl_Obj" {…}` body at ~45 sites.
+    // (6) `typedefs` — resolved EARLY, at (3.pre), BEFORE structs/symbols/
+    // constants (D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION). Relocated so each
+    // typedef's `name -> TypeId` is threaded into `mergedNamedTypes` and can be
+    // spelled BY NAME (`ptr<Tcl_Obj>`) by every later `parseTypeFromText` call,
+    // instead of re-inlining the full `struct "Tcl_Obj" {…}` body at ~45 sites.
+    // The STRUCT surface joined it ahead of `symbols` in P56, at (3.struct); all
+    // three named-type surfaces now publish before anything that can name them.
 
-    // (6.5) STRUCTS (named-field aggregate types). Each entry interns a struct
-    // type (name + positional field types) the semantic phase injects as a TAG +
-    // a field scope; the layout engine DERIVES the ABI byte offsets from the
-    // field sizes (the descriptor declares names + types, never offsets).
-    //
-    // A struct entry declares EITHER a flat `fields` (single layout, back-compat)
-    // OR per-target `variants` (plan 25): a list of `{ "when": {arch?,format?},
-    // "fields":[…] }`, the variant matching the active (arch,format) selected so
-    // a struct can carry the correct per-target byte layout. The CRUX
-    // (plan-lock-VERIFIED): x86_64/arm64 AggregateLayoutParams are byte-identical +
-    // computeLayout is param-driven (no arch branch) → the per-target offset delta
-    // comes ENTIRELY from the selected FIELD LIST. The active identity is
-    // (arch = `*activeTarget`, format = `objectFormatKindName(*activeFormat)`); a
-    // variant matches iff EVERY key its `when` specifies equals the active value
-    // (GENERIC string equality — never an `if (arch == "x86_64")` here). >1 match
-    // ⇒ fail loud (F_ShippedStructVariantAmbiguous: an under-specified `when` would
-    // otherwise silently pick the first → a wrong layout). 0 match (variants
-    // present) ⇒ NOT injected (a reference fails loud as an undefined type, never a
-    // silent wrong layout). EAGER: EVERY variant's field list is decoded regardless
-    // of which is active, so a malformed INACTIVE variant fails the read on EVERY
-    // target (anti-lurking, mirrors `signatureByDataModel`).
-    //
-    // (6.5.pre) THE BY-NAME DEPENDENCY GATE. The loop below PUBLISHES each
-    // injected struct's tag name into `mergedNamedTypes` (the typedef/union
-    // Option C mirror), so a LATER entry may spell an EARLIER one as a field type
-    // BY NAME — `{"name":"it_interval","type":"timeval"}` — instead of restating
-    // the inner body once per format (the layout-disagreement failure class).
-    // But an earlier entry carrying per-target `variants` is NOT published when
-    // ZERO of them match: `struct timeval` genuinely does not exist on a
-    // pe/unknown-format read, so neither can a struct that embeds one. Skipping
-    // the DEPENDENT — exactly as `matchCount == 0` skips the dependency — is the
-    // honest answer. Letting the EAGER field decode fail instead would take the
-    // WHOLE descriptor down on every target lacking the inner struct (both
-    // all-descriptor sweeps read every shipped file on every format, and the
-    // nullopt direct-API/LSP read selects no variant at all).
-    //
-    // SOURCE-ORDER-EXACT, so fail-loud survives intact: only a name this
-    // descriptor declared BEFORE the referring entry can suppress it. A FORWARD
-    // name (declared later), a SELF reference, and a TYPO (declared nowhere) all
-    // fall through to the ordinary decode, where `parseTypeFromText` reports
-    // `unknown type '<name>'` and `decodeStructFieldList` adds
-    // F_ShippedLibUnsupportedType — two loud diagnostics, never a silent empty
-    // type. Content-blind: a membership test over the descriptor's OWN declared
-    // vocabulary, never an `if (name == "timeval")`.
-    // (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME)
-    auto declaredNamesOf = [&](char const* key) {
-        std::vector<std::string> names;
-        if (doc.contains(key) && doc.at(key).is_array()) {
-            for (auto const& e : doc.at(key)) {
-                if (e.is_object() && e.contains("name") && e.at("name").is_string())
-                    names.push_back(e.at("name").get<std::string>());
-            }
-        }
-        return names;
-    };
-    // Declared before the loop starts: every `typedefs` + `unions` name (both
-    // surfaces decode ABOVE). Struct names join as the loop walks past them.
-    std::vector<std::string> declaredEarlier = declaredNamesOf("typedefs");
-    {
-        auto un = declaredNamesOf("unions");
-        declaredEarlier.insert(declaredEarlier.end(), un.begin(), un.end());
-    }
-    auto publishedByName = [&](std::string const& n) {
-        return std::any_of(mergedNamedTypes.begin(), mergedNamedTypes.end(),
-                           [&](NamedTypeBinding const& nb) { return nb.name == n; });
-    };
-    // Does this entry name an EARLIER-declared type that is NOT published for the
-    // active target? Scans the flat `fields` AND every variant's `fields` — the
-    // eager decode covers them all, so ONE unavailable reference anywhere in the
-    // entry makes the whole entry unavailable here. The test is on the WHOLE
-    // `type` text (the by-name spelling); a compound spelling that merely embeds
-    // an unavailable name (`ptr<timeval>`) is NOT admitted and still fails loud —
-    // the gate accepts only what it can prove.
-    auto referencesUnavailable = [&](json const& sdef) {
-        auto scan = [&](json const& fields) {
-            if (!fields.is_array()) return false;
-            for (auto const& f : fields) {
-                if (!f.is_object() || !f.contains("type") || !f.at("type").is_string())
-                    continue;
-                std::string const t = f.at("type").get<std::string>();
-                if (std::find(declaredEarlier.begin(), declaredEarlier.end(), t)
-                        != declaredEarlier.end()
-                    && !publishedByName(t))
-                    return true;
-            }
-            return false;
-        };
-        if (sdef.contains("fields") && scan(sdef.at("fields"))) return true;
-        if (sdef.contains("variants") && sdef.at("variants").is_array()) {
-            for (auto const& v : sdef.at("variants"))
-                if (v.is_object() && v.contains("fields") && scan(v.at("fields")))
-                    return true;
-        }
-        return false;
-    };
-    if (doc.contains("structs")) {
-        if (!doc.at("structs").is_array()) {
-            emitMalformed(reporter, "shipped-lib descriptor '" + core::genericSpelling(path)
-                                        + "': 'structs' must be an array");
-        } else {
-            std::size_t sidx = 0;
-            for (auto const& sdef : doc.at("structs")) {
-                std::string const at =
-                    "'" + core::genericSpelling(path) + "' structs[" + std::to_string(sidx) + "]";
-                ++sidx;
-                if (!sdef.is_object()) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
-                    continue;
-                }
-                (void)rejectUnknownKeys(reporter, sdef,
-                                        "structs[" + std::to_string(sidx - 1) + "]",
-                                        {"name", "fields", "variants"});
-                if (!sdef.contains("name") || !sdef.at("name").is_string()
-                    || sdef.at("name").get<std::string>().empty()) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                + ": missing or empty 'name'");
-                    continue;
-                }
-                std::string const sname = sdef.at("name").get<std::string>();
-
-                // (6.5.pre) THE BY-NAME DEPENDENCY GATE — see the note above the
-                // loop. Evaluated BEFORE `sname` joins `declaredEarlier`, so a
-                // SELF reference is a forward name and still fails loud; recorded
-                // right after, so every entry BELOW may name this one.
-                bool const dependencyUnavailable = referencesUnavailable(sdef);
-                declaredEarlier.push_back(sname);
-                if (dependencyUnavailable) continue;   // unavailable here → inject nothing
-
-                // Exactly ONE of `fields` (flat, single layout) or `variants`
-                // (per-target). Both, or neither, is a malformed entry — fail loud
-                // (a struct with neither declares no layout; with both is ambiguous
-                // intent).
-                bool const hasFields   = sdef.contains("fields");
-                bool const hasVariants = sdef.contains("variants");
-                if (hasFields == hasVariants) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                + ": a struct must declare EXACTLY one of "
-                                                  "'fields' (single layout) or 'variants' "
-                                                  "(per-target layouts)");
-                    continue;
-                }
-
-                // The SELECTED field list (flat path = `fields`; variant path = the
-                // matching variant's `fields`). `selected` stays false on the
-                // no-variant-matches case → the struct is simply not injected.
-                ShippedStruct sst;
-                sst.name = sname;
-                std::vector<TypeId> fieldTypes;
-                bool selected = false;
-
-                if (hasFields) {
-                    if (!sdef.at("fields").is_array() || sdef.at("fields").empty()) {
-                        emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                    + ": 'fields' must be a non-empty array");
-                        continue;
-                    }
-                    if (!decodeStructFieldList(sdef.at("fields"), at, interner, typeReg,
-                                               reporter, sst.fields, fieldTypes,
-                                               mergedNamedTypes)) {
-                        continue;
-                    }
-                    selected = true;
-                } else {
-                    // PER-TARGET VARIANTS. Decode EVERY variant's field list (eager —
-                    // a malformed inactive variant fails the read on every target),
-                    // then select the variant whose `when` matches the active target.
-                    if (!sdef.at("variants").is_array() || sdef.at("variants").empty()) {
-                        emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                    + ": 'variants' must be a non-empty array");
-                        continue;
-                    }
-                    std::string const activeFormatName =
-                        activeFormat.has_value()
-                            ? std::string{objectFormatKindName(*activeFormat)}
-                            : std::string{};
-                    bool okVariants = true;
-                    std::size_t matchCount = 0;
-                    std::size_t vidx = 0;
-                    for (auto const& vdef : sdef.at("variants")) {
-                        std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
-                        ++vidx;
-                        if (!vdef.is_object()) {
-                            emitMalformed(reporter, "shipped-lib descriptor " + vat
-                                                        + ": must be an object");
-                            okVariants = false; break;
-                        }
-                        (void)rejectUnknownKeys(reporter, vdef,
-                                                "structs[" + std::to_string(sidx - 1)
-                                                    + "] variants[" + std::to_string(vidx - 1) + "]",
-                                                {"when", "fields"});
-                        // `when` — the match selector. REQUIRED object; keys closed to
-                        // {arch, format}. An EMPTY `when:{}` matches every target
-                        // (always-match) — legal but typically ambiguous if any other
-                        // variant also matches (the ambiguity gate below catches it).
-                        if (!vdef.contains("when") || !vdef.at("when").is_object()) {
-                            emitMalformed(reporter, "shipped-lib descriptor " + vat
-                                                        + ": missing or non-object 'when' "
-                                                          "(e.g. {\"arch\":\"x86_64\",\"format\":\"elf\"})");
-                            okVariants = false; break;
-                        }
-                        // Decode this variant's field list (eager, every variant) —
-                        // BEFORE the match test so a malformed INACTIVE variant still
-                        // fails the read on every target (anti-lurking).
-                        if (!vdef.contains("fields") || !vdef.at("fields").is_array()
-                            || vdef.at("fields").empty()) {
-                            emitMalformed(reporter, "shipped-lib descriptor " + vat
-                                                        + ": 'fields' must be a non-empty array");
-                            okVariants = false; break;
-                        }
-                        std::vector<ShippedField> vFields;
-                        std::vector<TypeId>       vFieldTypes;
-                        if (!decodeStructFieldList(vdef.at("fields"), vat, interner, typeReg,
-                                                   reporter, vFields, vFieldTypes, mergedNamedTypes)) {
-                            okVariants = false; break;
-                        }
-
-                        // Does this variant's `when` MATCH the active target? (the
-                        // SHARED selector — typed surfaces allow {arch,format}.)
-                        WhenMatch const wm = matchVariantWhen(
-                            vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
-                            activeTarget, activeFormat, activeFormatName,
-                            activeDataModelName, reporter);
-                        if (wm == WhenMatch::Error) { okVariants = false; break; }
-                        if (wm == WhenMatch::Match) {
-                            ++matchCount;
-                            if (matchCount == 1) {
-                                // First match — take its fields (and keep scanning so a
-                                // second match is detected → ambiguity fail-loud).
-                                sst.fields = std::move(vFields);
-                                fieldTypes = std::move(vFieldTypes);
-                            }
-                        }
-                    }
-                    if (!okVariants) continue;
-                    if (matchCount > 1) {
-                        // >1 variant matched the active target — a silent
-                        // wrong-layout risk (which would be picked?). Fail loud.
-                        dss::report(reporter, DiagnosticCode::F_ShippedStructVariantAmbiguous,
-                                    DiagnosticSeverity::Error,
-                                    "shipped-lib descriptor " + at + ": struct '" + sname
-                                        + "' has " + std::to_string(matchCount)
-                                        + " 'variants' matching the active target (arch='"
-                                        + (activeTarget.has_value() ? std::string{*activeTarget}
-                                                                    : std::string{"<none>"})
-                                        + "', format='"
-                                        + (activeFormat.has_value() ? activeFormatName
-                                                                    : std::string{"<none>"})
-                                        + "') — exactly one variant may match (refusing an "
-                                          "ambiguous per-target layout)");
-                        continue;
-                    }
-                    // matchCount 0 ⇒ no variant for this target ⇒ NOT injected
-                    // (a reference fails loud as an undefined type, never a silent
-                    // wrong layout). matchCount 1 ⇒ select it.
-                    selected = (matchCount == 1);
-                }
-
-                if (!selected) continue;   // no variant matched → inject nothing
-                // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): if the SELECTED field list
-                // carries explicit offsets, intern the struct WITH them (an
-                // overlapping FFI layout). ALL-or-NONE within the struct; a mix is
-                // malformed. The offsets enter the content identity so this tag type
-                // matches the bare typedef's inline `struct "X" { T @off }` (same
-                // TypeId → the injected field scope resolves .member on a bare-typedef
-                // value). Empty → the ordinary natural-alignment struct (unchanged).
-                std::size_t withOffset = 0;
-                for (auto const& fld : sst.fields)
-                    if (fld.offset.has_value()) ++withOffset;
-                if (withOffset != 0 && withOffset != sst.fields.size()) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                + ": struct field 'offset' must be "
-                                                  "all-or-none (an overlapping layout "
-                                                  "declares every field's offset)");
-                    continue;
-                }
-                if (withOffset == sst.fields.size() && !sst.fields.empty()) {
-                    std::vector<std::uint64_t> offsets;
-                    offsets.reserve(sst.fields.size());
-                    for (auto const& fld : sst.fields) offsets.push_back(*fld.offset);
-                    std::span<std::int64_t const> const noWidths{};
-                    sst.typeId = interner.structType(sname, fieldTypes, noWidths, offsets);
-                } else {
-                    sst.typeId = interner.structType(sname, fieldTypes);
-                }
-                // Option C: publish this struct's TAG name so a LATER surface —
-                // above all another struct's FIELD — can spell it BY NAME
-                // (`{"name":"it_value","type":"timeval"}`), which is what keeps an
-                // inner struct's per-format widths in ONE place instead of being
-                // restated inside every outer struct. Byte-identical to the
-                // typedef/union publications (address-stable `typedefNameStore`
-                // backing, appended only for a SELECTED entry so an unselected
-                // struct stays unnameable). Publication is strictly ADDITIVE: the
-                // scan is first-match, structs are published LAST, so no name that
-                // already resolved changes meaning.
-                // (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME)
-                typedefNameStore.push_back(sname);
-                mergedNamedTypes.push_back(
-                    NamedTypeBinding{std::string_view{typedefNameStore.back()}, sst.typeId});
-                out.structs.push_back(std::move(sst));
-            }
-        }
-    }
 
     // (7) MACROS (the preprocessor-macro surface, interner-free). A function-like
     // or object-like `#define` the preprocessor injects when this header is

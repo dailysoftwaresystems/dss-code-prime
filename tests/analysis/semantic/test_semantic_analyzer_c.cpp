@@ -14908,54 +14908,377 @@ TEST(SemanticAnalyzerC, ExternHeadNoreturnAttributeIsApplied) {
            "`noreturn`, exactly as it does in the leading position";
 }
 
-// ★★ A DEFECT THIS CYCLE FOUND AND DELIBERATELY DID NOT FIX — RECORDED HERE SO
-// IT IS GREPPABLE INSTEAD OF INVISIBLE.
+// ★★★ P56 (D-CSUBSET-TRAILING-NORETURN-NOT-HONORED) — THE SYMMETRY LOOP,
+// RESTORED. THIS IS THE ROW'S CLOSING WITNESS.
 //
-// This started life as a symmetry pin ("the after-keyword and after-declarator
-// positions must agree on `noreturn`") and it FAILED — which is the useful
-// outcome. MEASURED: the AFTER-DECLARATOR spelling does NOT reach the noreturn
-// sink at all. End to end, on the identical program:
+// It stood here from 2026-07-28 to 2026-09-03 as
+// `ExternTrailingNoreturnIsNotYetHonoredKnownGap`, an INVERSE pin whose
+// `EXPECT_FALSE(survivingFnIsNoreturn(trail, "die"))` asserted the bug under a
+// banner instructing the person who wired the trailing position to "flip it to
+// EXPECT_TRUE then, and fold both arms back into one symmetry loop". That is
+// what this is. The technique worked exactly as designed: the pin went red the
+// moment the wiring landed and handed over its own closing instructions.
 //
-//   extern __attribute__((__noreturn__)) void die(int);   (mode 1, NEW)  exit 0
-//   extern void die(int) __attribute__((__noreturn__));   (trailing)     H0003
-//       "non-void function may fall through without returning a value"
+// ★★ THE ROW'S ACCOUNT WAS NARROWER THAN THE TREE, AND THE RE-MEASUREMENT IS
+// WHY THE LOOP HAS FOUR ARMS RATHER THAN TWO. ✔RE-MEASURED 2026-09-03 at
+// `6482a71b` through the shipped CLI on RUNNABLE programs: the row named the
+// after-declarator position, but the declaration-level attribute SLOT
+// (`void __attribute__((__noreturn__)) die(int);` — topLevelDecl's `declAttrRun`,
+// a position the row does not mention at all) dropped the fact too, for the same
+// one-root reason. Both are fixed by the same change: the noreturn scan now
+// folds the SAME root classes `scanAttributeSemantics` already folded — the
+// specifier prefix, the row's `declarationAttrSlotRules`, and each declarator's
+// entity-conferring trailing run.
 //
-// CAUSE: `specifierPrefixNamesNoreturn` scans the row's `specifierPrefixChild`
-// ONLY. Mode 1 works because `externSpecifiers` IS that prefix. TF-C73 made the
-// after-declarator run a LINKAGE scan root but never a NORETURN one, so the
-// trailing spelling is parsed, linkage-folded, and its noreturn meaning dropped.
+// ★ ALL FOUR ARMS ARE HONORED BY gcc 13.3.0 AND clang 18.1.3, each probed
+// SEPARATELY by -Wreturn-type differential against an undecorated control (MSVC
+// 19.51 implements no `__attribute__` at all, C2061 at every /std:, so it casts
+// no vote on the GNU spelling). See `afterDeclaratorAttrRules`'s comment in
+// `c.lang.json` for the full matrix.
+// ⓘ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY)
+// retired the `afterDeclaratorEntityAttrRules` SUBSET key this comment used to
+// cite; the grain now rides each `afterDeclaratorAttrRules` entry, and every
+// measurement above RE-DERIVED true across that change.
 //
-// WHY IT IS NOT FIXED HERE: it is PRE-EXISTING (nothing in TF-C77 touches that
-// scan or that run), it is a SAFE MISS rather than a miscompile — dropping the
-// flag can only produce a SPURIOUS diagnostic, never wrong code, which is the
-// posture `specifierPrefixNamesNoreturn`'s own comment states — and closing it
-// means deciding whether a per-DECLARATOR trailing run may confer a
-// DECLARATION-level property, which is a different anchor's question.
+// RED-ON-DISABLE (REMOVE direction): drop the `appertainsTo` grain from
+// `attrSpec` in `c.lang.json` (or set it to `type`) → the two TRAILING arms go
+// red and the two LEADING/MID arms stay green. Remove the slot loop from
+// `declarationNamesNoreturn` → the MID arm goes red alone.
+TEST(SemanticAnalyzerC, NoreturnIsHonoredInEveryAttributePosition) {
+    for (char const* decl : {
+             "extern __attribute__((__noreturn__)) void die(int);",  // after-keyword
+             "extern void die(int) __attribute__((__noreturn__));",  // trailing+extern
+             "__attribute__((__noreturn__)) void die(int);",         // leading
+             "void die(int) __attribute__((__noreturn__));",         // trailing
+             "void __attribute__((__noreturn__)) die(int);",         // MID (declAttrRun)
+             "void die(int) __attribute__((noreturn));",             // undunder, trailing
+             "void die(int) __attribute__((cold, __noreturn__));",   // 2 clauses, 1 spec
+             "void die(int) __attribute__((cold)) __attribute__((__noreturn__));"}) {
+        auto model = analyzeShipped("c", {
+            std::string(decl) + "\nint main(void){ die(1); return 0; }\n" });
+        EXPECT_FALSE(model.hasErrors()) << decl;
+        EXPECT_TRUE(survivingFnIsNoreturn(model, "die"))
+            << "every attribute position on one declaration must confer the SAME "
+               "fact — one attribute does not mean two things depending on which "
+               "side of the declarator it is written: " << decl;
+    }
+}
+
+// ★★ THE NEGATIVE HALF, AND IT IS THE HALF THAT KEEPS THE FIX FROM BECOMING AN
+// INVENTED EXTENSION. A C23 `[[noreturn]]` written AFTER the declarator
+// appertains to the TYPE (C23 6.7.13.1), and NOT ONE reference honors it:
+// ✔MEASURED 2026-09-03, gcc `warning: 'noreturn' attribute ignored` with the
+// caller still drawing -Wreturn-type, clang `error: 'noreturn' attribute cannot
+// be applied to types` (rc=1), MSVC /std:clatest `C4649` + `C4715`. The LEADING
+// `[[noreturn]]` is honored by all three, so the two arms below differ in
+// exactly one thing — where the brackets sit.
 //
-// ★ THE EXPECT_FALSE BELOW ASSERTS A BUG, NOT A DESIRED PROPERTY. When the
-// trailing position is wired to the noreturn scan, this test WILL fail — that is
-// the point. Flip it to EXPECT_TRUE then, and fold both arms back into one
-// symmetry loop. Do NOT "fix" it by deleting the assertion.
-TEST(SemanticAnalyzerC, ExternTrailingNoreturnIsNotYetHonoredKnownGap) {
-    auto head = analyzeShipped("c", {
-        "extern __attribute__((__noreturn__)) void die(int);\n"
-        "int main(void){ die(1); return 0; }\n",
-    });
-    EXPECT_FALSE(head.hasErrors());
-    EXPECT_TRUE(survivingFnIsNoreturn(head, "die"))
-        << "mode 1 (after-keyword) IS honored — this half is the new behavior";
+// ⚠ A one-arm version of this test would pass VACUOUSLY if the noreturn scan
+// stopped seeing `[[…]]` anywhere, so the leading arm is the control and is
+// asserted by name.
+TEST(SemanticAnalyzerC, C23TrailingStdAttrNoreturnAppertainsToTheTypeNotTheEntity) {
+    auto lead = analyzeShipped("c", {
+        "[[noreturn]] void die(int);\n"
+        "int main(void){ die(1); return 0; }\n" });
+    EXPECT_FALSE(lead.hasErrors());
+    EXPECT_TRUE(survivingFnIsNoreturn(lead, "die"))
+        << "CONTROL: the LEADING C23 spelling IS honored (gcc, clang and MSVC "
+           "all honor it) — if this is false the negative arm below is vacuous";
 
     auto trail = analyzeShipped("c", {
-        "extern void die(int) __attribute__((__noreturn__));\n"
-        "int main(void){ die(1); return 0; }\n",
-    });
+        "void die(int) [[noreturn]];\n"
+        "int main(void){ die(1); return 0; }\n" });
     EXPECT_FALSE(trail.hasErrors())
-        << "the trailing form still PARSES and links cleanly — the gap is the "
-           "dropped semantic fact, not a rejection";
+        << "the trailing C23 form still PARSES — the question is what it MEANS";
     EXPECT_FALSE(survivingFnIsNoreturn(trail, "die"))
-        << "KNOWN GAP (see banner): if this now reads TRUE the trailing position "
-           "has been wired to the noreturn scan — flip this to EXPECT_TRUE and "
-           "restore the symmetry loop";
+        << "a trailing `[[noreturn]]` appertains to the TYPE (C23 6.7.13.1) and "
+           "no reference honors it — honoring it would be an invented extension. "
+           "`stdAttr` is deliberately absent from "
+           "`declarators.afterDeclaratorAttrRules`'s ENTITY grain: `stdAttr` "
+           "declares `appertainsTo: declaratorUnlessTypeDerived` and `die`'s "
+           "declarator derives a FUNCTION type";
+}
+
+// ★★ GRANULARITY, MEASURED IN BOTH REFERENCES BEFORE IT WAS PINNED. A trailing
+// run belongs to the ONE declarator it follows; a declaration-level spelling
+// (prefix or slot) belongs to all of them. ✔MEASURED 2026-09-03: gcc and clang
+// are both silent at a caller of `a` and both draw -Wreturn-type at a caller of
+// `b` for `void a(int) __attribute__((__noreturn__)), b(int);`, and silent at
+// BOTH callers for `void __attribute__((__noreturn__)) a(int), b(int);`.
+//
+// ⚠ THE SIBLING ARM IS THE ASSERTION THAT MATTERS. Folding the trailing run at
+// declaration level would make this whole test pass except for `b` — a fact on a
+// symbol the programmer never annotated, and (unlike the drop this row closes)
+// a fact in the UNSAFE direction: it would let a real return path be elided.
+TEST(SemanticAnalyzerC, TrailingNoreturnIsPerDeclaratorAndDeclarationLevelIsNot) {
+    auto trail = analyzeShipped("c", {
+        "void a(int) __attribute__((__noreturn__)), b(int);\n"
+        "int main(void){ a(1); b(2); return 0; }\n" });
+    EXPECT_FALSE(trail.hasErrors());
+    EXPECT_TRUE(survivingFnIsNoreturn(trail, "a"))
+        << "the declarator the trailing run follows IS noreturn";
+    EXPECT_FALSE(survivingFnIsNoreturn(trail, "b"))
+        << "a trailing attribute must NOT leak onto a sibling declarator — this "
+           "is the direction that would ELIDE a real return path";
+
+    auto midd = analyzeShipped("c", {
+        "void __attribute__((__noreturn__)) a(int), b(int);\n"
+        "int main(void){ a(1); b(2); return 0; }\n" });
+    EXPECT_FALSE(midd.hasErrors());
+    EXPECT_TRUE(survivingFnIsNoreturn(midd, "a"))
+        << "a DECLARATION-level spelling reaches every declarator";
+    EXPECT_TRUE(survivingFnIsNoreturn(midd, "b"))
+        << "…including the second one — gcc and clang both honor it there";
+}
+
+// ★★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY) —
+// THE ACCEPTANCE PAIR FOR A TRAILING DECLARATION-LEVEL SLOT, AND IT REPLACES
+// `TrailingMemberAttrSlotConfersNoreturnOnNeitherSibling`, WHICH HANDED OVER
+// EXACTLY THESE INSTRUCTIONS ("if a later cycle splits the key, flip THIS to
+// TRUE and leave `p` false; a change that flips BOTH is the over-application
+// this pin guards"). Both halves are asserted, in ONE fixture, because a fix
+// that confers on NEITHER also passes a `p`-only pin — which is precisely the
+// state this test used to record.
+//
+// ✔MEASURED 2026-09-03, gcc 13.3.0 and clang 18.1.3 AGREEING, and measured with
+// TWO different attributes so that the answer is demonstrably a property of the
+// POSITION rather than of the attribute: in
+// `struct S { void (*p)(int), (*q)(int) __attribute__((__noreturn__)); };` a
+// caller of `q` is silent in both while a caller of `p` still draws
+// -Wreturn-type; in `struct S { int p, q __attribute__((deprecated)); };` a use
+// of `q` warns in both while a use of `p` is clean. MSVC 19.51 implements no
+// `__attribute__` in any position (C2061 at /std:c11, /std:c17 AND
+// /std:clatest), so it ABSTAINS — an abstention is not agreement, and two
+// working references make the GNU spelling REQUIRED.
+//
+// ⚠⚠ THE NEGATIVE IS THE ASSERTION THAT MATTERS, because the two directions are
+// not symmetric. Dropping a noreturn costs a spurious diagnostic; LEAKING one
+// onto `p` marks a symbol nobody annotated and lets a REAL RETURN PATH BE
+// ELIDED, which is a silent wrong answer rather than a refusal.
+//
+// ⚠ WHY THIS IS ASSERTED ON THE SYMBOL RECORD AND NOT THROUGH THE CLI, stated
+// because the CLI reading is the one that looks more convincing and is WRONG
+// here. ✔MEASURED: a runnable program calling `g.q(x)` still refuses with
+// `H_VerifierFailure` even for nr's LEADING member spelling — the one nr's own
+// pin proves DOES set the flag on both members. The flag is set; the CONSUMPTION
+// path cannot see it, because `isDirectNoreturnCall` requires a `HirKind::Ref`
+// callee and a member access is not one. That is
+// [[D-CSUBSET-NORETURN-THROUGH-MEMBER-INDIRECT-CALL]], a separate open row nr
+// explicitly declined to widen. A CLI probe here answers an adjacent question
+// and fails toward *clean*, so the symbol record is the honest instrument.
+TEST(SemanticAnalyzerC, TrailingMemberAttrSlotConfersNoreturnOnTheLastDeclaratorOnly) {
+    auto cu = buildShippedUnit("c", {
+        "struct S { void (*p)(int), (*q)(int) __attribute__((__noreturn__)); };\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* p = findSym(model, "p");
+    SymbolRecord const* q = findSym(model, "q");
+    ASSERT_NE(p, nullptr);
+    ASSERT_NE(q, nullptr);
+    EXPECT_TRUE(q->isNoreturn)
+        << "POSITIVE: the trailing member run appertains to the LAST declarator "
+           "— gcc and clang are both silent at a caller of `q`";
+    EXPECT_FALSE(p->isNoreturn)
+        << "NEGATIVE, and this is the one that matters: the UNDECORATED sibling "
+           "must never carry the flag. gcc and clang both still draw "
+           "-Wreturn-type at a caller of `p`, and leaking it here would ELIDE a "
+           "real return path — a silent wrong answer, not a refusal";
+
+    // CONTROL, by name: the LEADING member position still confers, and confers
+    // to EVERY declarator — so the negative above is measuring the slot's
+    // GRAIN, not a noreturn scan that has stopped seeing members at all.
+    auto lead = analyze(buildShippedUnit("c", {
+        "struct S { __attribute__((__noreturn__)) void (*p)(int), (*q)(int); };\n" }),
+        DiagnosticBudget::libraryDefault());
+    EXPECT_FALSE(lead.hasErrors());
+    SymbolRecord const* lp = findSym(lead, "p");
+    SymbolRecord const* lq = findSym(lead, "q");
+    ASSERT_NE(lp, nullptr);
+    ASSERT_NE(lq, nullptr);
+    EXPECT_TRUE(lp->isNoreturn) << "CONTROL: the leading member position confers";
+    EXPECT_TRUE(lq->isNoreturn)
+        << "CONTROL: …to every declarator — ✔MEASURED, gcc and clang are both "
+           "silent at a caller of either member for the leading spelling";
+}
+
+// ★★ THE SAME SLOT, A DIFFERENT VERB — which is what makes the grain a property
+// of the POSITION rather than of `noreturn`. Before the key carried a grain this
+// run reached the DECLARATION-level fold and conferred on NOBODY, so DSS was
+// BELOW the union here: ✔MEASURED at the base commit, `struct S { int p, q
+// __attribute__((deprecated)); };` flagged neither member, where gcc 13.3.0 and
+// clang 18.1.3 both flag `q` and both leave `p` clean.
+// ⓘ Asserted on `isDeprecated` for the same instrument reason as above:
+// ✔MEASURED, `S_DeprecatedSymbolUsed` is not emitted for a MEMBER access at all
+// (a decorated member and an undecorated one give identical CLI output, while a
+// decorated top-level object DOES warn), so the use site cannot see this either.
+TEST(SemanticAnalyzerC, TrailingMemberAttrSlotConfersDeprecatedOnTheLastDeclaratorOnly) {
+    auto model = analyzeShipped("c", {
+        "struct S { int p, q __attribute__((deprecated)); };\n" });
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* p = findSym(model, "p");
+    SymbolRecord const* q = findSym(model, "q");
+    ASSERT_NE(p, nullptr);
+    ASSERT_NE(q, nullptr);
+    EXPECT_TRUE(q->isDeprecated) << "POSITIVE: gcc and clang both flag `q`";
+    EXPECT_FALSE(p->isDeprecated)
+        << "NEGATIVE: gcc and clang both leave `p` clean — a trailing run must "
+           "not leak leftward";
+
+    auto lead = analyzeShipped("c", {
+        "struct S { __attribute__((deprecated)) int p, q; };\n" });
+    EXPECT_FALSE(lead.hasErrors());
+    SymbolRecord const* lp = findSym(lead, "p");
+    ASSERT_NE(lp, nullptr);
+    EXPECT_TRUE(lp->isDeprecated)
+        << "CONTROL: the LEADING member run reaches every declarator, so the "
+           "negative above measures the grain and not a dead scan";
+}
+
+// ★★★ THE OTHER ACCEPTANCE PAIR — THE C23 SHAPE AXIS, WHICH IS WHY THIS ROW
+// COULD NOT BE CLOSED BY NARROWING ONE LOOP.
+//
+// A C23 attribute-specifier-sequence written after a declarator appertains to
+// the declared ENTITY when the declarator is a bare identifier and to the
+// array-or-function TYPE when it derives one. ✔MEASURED 2026-09-03, each
+// reference probed SEPARATELY, four attributes (`deprecated`, `nodiscard`,
+// `maybe_unused`, `noreturn`) × two declarator shapes — the answer is constant
+// per shape and does NOT vary by attribute:
+//   • `int x [[deprecated]];`        gcc warns at the USE · clang warns at the
+//     USE · MSVC 19.51 /std:clatest C4996 at the USE          ⇒ ENTITY
+//   • `void f(void) [[deprecated]];` gcc `'deprecated' attribute ignored` ·
+//     clang `error: cannot be applied to types` rc=1 · MSVC `C4649 attributes
+//     are ignored in this context`                            ⇒ TYPE
+//   • `int arr[3] [[deprecated]];`   the same three verdicts   ⇒ TYPE
+// C23 6.7.6p1 vs 6.7.6.2p1/6.7.6.3p1 is why.
+//
+// ⚠⚠ BOTH ARMS WERE PRODUCED BY ONE OVER-BROAD READ, AND THAT IS THE POINT OF
+// PINNING THEM TOGETHER. ✔MEASURED at the base commit, DSS conferred on `f`
+// (above the union — NO reference confers) AND on `x` (correct — ALL THREE
+// confer), out of the same "fold the whole trailing run" loop. Excluding
+// `stdAttr` from the entity roots would have fixed `f` and broken `x`; including
+// it does the reverse. A pin on either arm alone would therefore pass a fix that
+// is still wrong, which is why the shape axis is asserted as a PAIR.
+TEST(SemanticAnalyzerC, TrailingC23AttributeConfersOnAnIdentifierDeclaratorAndNotOnADerivedOne) {
+    // POSITIVE — the identifier shape. All three references confer.
+    auto obj = analyzeShipped("c", { "int x [[deprecated]];\n" });
+    EXPECT_FALSE(obj.hasErrors());
+    SymbolRecord const* x = findSym(obj, "x");
+    ASSERT_NE(x, nullptr);
+    EXPECT_TRUE(x->isDeprecated)
+        << "a C23 trailing run after a bare IDENTIFIER declarator appertains to "
+           "the declared entity — gcc, clang AND MSVC all confer it";
+
+    // NEGATIVE — the function shape. NO reference confers.
+    auto fn = analyzeShipped("c", { "void f(void) [[deprecated]];\n" });
+    EXPECT_FALSE(fn.hasErrors())
+        << "the construct still PARSES and is still ACCEPTED (gcc and MSVC both "
+           "accept it); the question is what it MEANS";
+    SymbolRecord const* f = findSym(fn, "f");
+    ASSERT_NE(f, nullptr);
+    EXPECT_FALSE(f->isDeprecated)
+        << "a C23 trailing run after a FUNCTION declarator appertains to the "
+           "function TYPE (C23 6.7.6.3p1). gcc ignores it, clang refuses the "
+           "program outright and MSVC ignores it with C4649 — conferring here "
+           "is an invented meaning, which the bar forbids exactly as strongly "
+           "as it forbids dropping a required one";
+
+    // NEGATIVE — the array shape, the same rule one derivation over.
+    auto arr = analyzeShipped("c", { "int arr[3] [[deprecated]];\n" });
+    EXPECT_FALSE(arr.hasErrors());
+    SymbolRecord const* a = findSym(arr, "arr");
+    ASSERT_NE(a, nullptr);
+    EXPECT_FALSE(a->isDeprecated)
+        << "an ARRAY declarator derives a type too — gcc ignores, clang refuses, "
+           "MSVC C4649";
+
+    // CONTROL, by name, and it is what keeps every negative above non-vacuous:
+    // the GNU spelling has NO shape split and confers in ALL THREE shapes.
+    // ✔MEASURED, gcc and clang agree on all three; MSVC abstains (C2061).
+    for (auto const& [src, name] : std::vector<std::pair<char const*, char const*>>{
+             {"void f(void) __attribute__((deprecated));\n", "f"},
+             {"int x __attribute__((deprecated));\n",        "x"},
+             {"int arr[3] __attribute__((deprecated));\n",   "arr"}}) {
+        auto m = analyzeShipped("c", { src });
+        EXPECT_FALSE(m.hasErrors()) << src;
+        SymbolRecord const* sym = findSym(m, name);
+        ASSERT_NE(sym, nullptr) << src;
+        EXPECT_TRUE(sym->isDeprecated)
+            << "CONTROL: the GNU trailing run confers on the ENTITY in every "
+               "declarator shape, so a scan that had simply stopped reading "
+               "trailing runs would fail HERE: " << src;
+    }
+}
+
+// ★★ THE THIRD POSITION THE SPLIT MOVED — a typedef's TRAILING attribute run.
+// c's grammar used to spell BOTH typedef attribute positions `typedefAttrRun`,
+// one rule name carrying two grains, which no per-rule key can describe; the
+// trailing one is now `typedefTrailingAttrRun`.
+// ✔MEASURED 2026-09-03, gcc 13.3.0 and clang 18.1.3 agreeing: `typedef int A, B
+// __attribute__((deprecated));` warns at a use of **B** and is CLEAN at a use of
+// **A**, while `typedef __attribute__((deprecated)) int A, B;` warns at a use of
+// A. So the trailing run reaches the LAST alias and the leading run reaches
+// every alias.
+// ⓘ This is the FC17 (`warnOnUse`) channel only. The noreturn channel
+// deliberately contributes NOTHING from a `kind: "type"` row — see
+// `GnuNoreturnOnATypedefRowIsNotFoldedFromItsAttributeSlots` — and this test
+// must not be read as having moved that.
+TEST(SemanticAnalyzerC, TrailingTypedefAttrRunConfersOnTheLastAliasOnly) {
+    auto model = analyzeShipped("c", {
+        "typedef int A, B __attribute__((deprecated));\n" });
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* a = findSym(model, "A");
+    SymbolRecord const* b = findSym(model, "B");
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    EXPECT_TRUE(b->isDeprecated) << "POSITIVE: the trailing run reaches `B`";
+    EXPECT_FALSE(a->isDeprecated)
+        << "NEGATIVE: gcc and clang both leave `A` clean";
+
+    auto lead = analyzeShipped("c", {
+        "typedef __attribute__((deprecated)) int A, B;\n" });
+    EXPECT_FALSE(lead.hasErrors());
+    SymbolRecord const* la = findSym(lead, "A");
+    ASSERT_NE(la, nullptr);
+    EXPECT_TRUE(la->isDeprecated)
+        << "CONTROL: the LEADING typedef run reaches every alias, so the "
+           "negative above measures the grain";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The pin below is nr's ORIGINAL conservative record, kept in the file's history
+// by name so the handover is traceable: it asserted that the trailing member
+// slot conferred on NEITHER sibling and instructed the cycle that split the key
+// to flip `q` to TRUE and leave `p` FALSE. That is exactly what
+// `TrailingMemberAttrSlotConfersNoreturnOnTheLastDeclaratorOnly` above now does,
+// so the conservative pin is CONSUMED rather than left standing — the same
+// disposal nr gave `ExternTrailingNoreturnIsNotYetHonoredKnownGap`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ★★ THE TYPE-ALIAS REFUSAL, PINNED SO IT CANNOT BE WIDENED BY ACCIDENT.
+// `declarationNamesNoreturn` contributes NOTHING from a `kind: "type"` row's
+// attribute slots. ✔MEASURED 2026-09-03: gcc and clang SPLIT on what a GNU
+// `noreturn` on a function-type typedef MEANS — gcc emits `'noreturn' attribute
+// ignored` AND its -Wreturn-type at the caller, clang is silent at both (it
+// honors it). References splitting on MEANING is an architectural fork, which
+// pauses rather than picks; and P51 left a live landmine here
+// (`NoreturnKeywordOnTypedefHeadIsNotPropagatedToUses`).
+//
+// ⓘ The assertion is on the ALIAS'S OWN symbol, because that is the thing this
+// change could have altered: reading a type row's slots would have stored a
+// second, unread flag on it. Whether the alias PROPAGATES is that other pin's
+// question and is untouched here.
+TEST(SemanticAnalyzerC, GnuNoreturnOnATypedefRowIsNotFoldedFromItsAttributeSlots) {
+    auto model = analyzeShipped("c", {
+        "typedef void tfn(int) __attribute__((__noreturn__));\n"
+        "tfn die;\n"
+        "int main(void){ die(1); return 0; }\n" });
+    EXPECT_FALSE(model.hasErrors())
+        << "the typedef must still parse and still alias a function type";
+    EXPECT_FALSE(survivingFnIsNoreturn(model, "die"))
+        << "gcc IGNORES this and clang HONORS it — the references split on "
+           "MEANING, so DSS must not pick one inside this row. If a later cycle "
+           "settles the fork, change this pin deliberately and say so";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -16948,12 +17271,32 @@ TEST(SemanticAnalyzerC, TFC112SuppressedElfStdioRowCarriesNoRecipe) {
 // INJECTION path, not this suppression path, so that rail's pin belongs in
 // tests/hir/test_hir_lowering_c.cpp and does not exist yet.
 namespace {
-// `fn(i32, ptr<void>) -> i32` IS sys/stat.json's declared shape for `fstat`, so
-// this prototype interns to the same TypeId and goal-2 suppression fires.
+// ⚠ THIS FIXTURE WAS REWRITTEN IN P56 AND THE SENTENCE IT REPLACES IS KEPT,
+// because the old one was TRUE and became FALSE without the test noticing what
+// it had started to assert. It read: "`fn(i32, ptr<void>) -> i32` IS
+// sys/stat.json's declared shape for `fstat`, so this prototype interns to the
+// same TypeId and goal-2 suppression fires", over the source
+// `int fstat(int fd, void *buf);`.
+//
+// ✔That shape was the DEFECT
+// ([[D-FFI-SHIPPED-DESCRIPTORS-DECLARE-STRUCTS-THEIR-OWN-SIGNATURES-DO-NOT-USE]],
+// closed P56): `sys/stat.json` declared `struct stat` with four per-target
+// variants and then typed `fstat` over `void`. The row is now
+// `fn(i32, ptr<stat>) -> i32`, which is what POSIX, glibc, the macOS SDK and
+// the UCRT all spell — so a TU that includes <sys/stat.h> and then restates
+// `int fstat(int, void *)` is a CONFLICTING redeclaration, and every reference
+// compiler rejects it too. DSS reporting an error there is the fix working, not
+// a regression: the old fixture only type-checked because the descriptor was
+// asserting nothing.
+//
+// So the prototype is restated with the type the API actually takes. It still
+// interns to the same TypeId as the descriptor's row, which is the ONLY property
+// this test needs — goal-2 suppression fires, and the suppressed row's
+// per-target `linkName` is what is under test.
 constexpr char const* kFstatRedeclSrc =
     "#include <sys/stat.h>\n"
-    "int fstat(int fd, void *buf);\n"
-    "int main(void) { return fstat(0, (void *)0); }\n";
+    "int fstat(int fd, struct stat *buf);\n"
+    "int main(void) { return fstat(0, (struct stat *)0); }\n";
 } // namespace
 
 TEST(SemanticAnalyzerC, TFC121SuppressedDarwinRowCarriesItsPerTargetLinkName) {

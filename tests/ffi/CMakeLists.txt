@@ -229,3 +229,34 @@ dss_add_test(NAME ffi/test_shipped_ioctl_size_ceiling
 # its verdict to an unattributable death.
 dss_add_test(NAME ffi/test_descriptor_walk_costs_heap
              SOURCES test_descriptor_walk_costs_heap.cpp)
+
+# ── D-FFI-DIRENT-API-DECLARED-OVER-VOID-NOT-ITS-OWN-STRUCTS (P56 lane `dt`) ──
+# The <dirent.h> surface typed over its OWN types (`DIR`, `struct dirent`)
+# instead of over `void`. Two tiers in one binary because the row's claim spans
+# them: the DESCRIPTOR tier (the signature carries the very TypeId the per-format
+# `structs` variant injects — asserted on all three served formats, whose layouts
+# are 280 / 268 / 1048 bytes) and the SEMANTIC tier (the REFUSALS the row exists
+# for — `int *x = readdir(d);` — each beside its accepting twin, which the
+# examples corpus has no convention for since a program that must not compile is
+# not a runnable example). Reads the descriptor through the real reader rather
+# than its JSON, so no json link; it DOES drive the front end, hence the tests/
+# include root its semantic siblings use for `semantic_test_fixture.hpp`.
+dss_add_test(NAME ffi/test_shipped_dirent_typed_surface
+             SOURCES test_shipped_dirent_typed_surface.cpp)
+target_include_directories(dss_ffi_test_shipped_dirent_typed_surface
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# [[D-FFI-SHIPPED-DESCRIPTORS-DECLARE-STRUCTS-THEIR-OWN-SIGNATURES-DO-NOT-USE]] -
+# the CORPUS-WIDE sibling of the dirent fixture above: seven descriptors whose
+# signatures now name the structs those same files already declared, plus - and
+# this is the half a sweep would have got wrong - an ACCEPTING arm for every
+# `ptr<void>` deliberately LEFT ALONE, because most of the corpus's 378
+# signature-level occurrences are the reference type. Same two tiers and the
+# same wiring as its sibling: it reads the real shipped descriptors through the
+# real reader (so no json link) AND drives the front end for the refusals,
+# hence the tests/ include root its semantic siblings use for
+# `semantic_test_fixture.hpp`.
+dss_add_test(NAME ffi/test_shipped_stat_typed_surface
+             SOURCES test_shipped_stat_typed_surface.cpp)
+target_include_directories(dss_ffi_test_shipped_stat_typed_surface
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

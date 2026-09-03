@@ -2407,9 +2407,19 @@ TEST(ParserCSmoke, AttributedLocalDeclCommitsVarDeclBranch) {
 // edit rather than an index move: `head: 0` and slot 2 are unchanged, and the
 // three decoration-position tests below still assert exactly what they asserted
 // before (a decoration in any slot shifts nothing).
+// ⓘ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+// the SECOND run is now spelled `typedefTrailingAttrRun`. The SPLIT, not a
+// rename: `declarationAttrSlotRules` declares an `appertainsTo` grain PER RULE
+// NAME, and one name occupying both the lead and the trailing position carried
+// two different grains — ✔MEASURED, gcc 13.3.0 and clang 18.1.3 both give
+// `typedef int A, B __attribute__((deprecated));` to **B** alone and
+// `typedef __attribute__((deprecated)) int A, B;` to both. What this constant
+// exists to pin is UNCHANGED and is why the split had to be done this way:
+// both runs are still NAMED rules over a lone `{repeat}`, so both still emit a
+// node when empty and `head: 0` / `declaratorList: 2` still cannot shift.
 constexpr std::string_view kCanonicalTypedefRoles =
     "rule:typedefDeclSpecifiers/rule:typedefHeadFull/rule:typedefAttrRun/"
-    "rule:typedefDeclaratorList/rule:typedefAttrRun/tok:EndStatement";
+    "rule:typedefDeclaratorList/rule:typedefTrailingAttrRun/tok:EndStatement";
 
 // TRAILING (after the declarator) — the real SDK witness
 // `bsm/audit.h`: `typedef u_int64_t au_asflgs_t __attribute__ ((aligned(8)));`

@@ -1680,6 +1680,23 @@ struct Lowerer {
     // `unionField` are the only shipped rows declaring `declarationAttrSlotRules`
     // today, and NONE of them declares `linkageSpecifiers` — so each takes the
     // early return above the loop and never reaches it.
+    //
+    // ★★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY)
+    // — THIS FUNCTION NOW NAMES THE GRAIN IT MEANS, AND IT MEANS `declaration`.
+    // It used to take EVERY `declarationAttrSlotRules` entry, and that key could
+    // not say which of its slots sit before the declarator list (declaration-
+    // level) and which sit after it (the LAST declarator only). Taking a
+    // TRAILING slot as a declaration-level linkage root is an OVER-APPLICATION
+    // of exactly the shape the trailing-roots comment below already rejects for
+    // the after-declarator run: it would push the last declarator's binding onto
+    // every earlier one.
+    // ⓘ INERT AT THIS BASE, and stated as measured rather than as reasoning: the
+    // only rows that declare a `declarator`-grain slot today
+    // (`structField`/`unionField`'s `structMemberAttrList`, `param`'s
+    // `paramTrailingAttrRun`, `typedefDecl`'s `typedefTrailingAttrRun`) declare
+    // NO `linkageSpecifiers`, so each takes the early return above the loop and
+    // never reached it. The filter is what keeps that an INVARIANT rather than a
+    // coincidence a future linkage-bearing row would silently break.
     [[nodiscard]] std::vector<NodeId>
     linkagePrefixRoots(NodeId node, DeclarationRule const& decl) {
         std::vector<NodeId> roots;
@@ -1691,8 +1708,9 @@ struct Lowerer {
         if (decl.declarationAttrSlotRules.empty()) return roots;
         for (NodeId c : visible(node)) {
             if (tree().kind(c) != NodeKind::Internal) continue;
-            for (RuleId sr : decl.declarationAttrSlotRules) {
-                if (tree().rule(c).v == sr.v) { roots.push_back(c); break; }
+            for (AttrRunRule const& sr : decl.declarationAttrSlotRules) {
+                if (sr.appertainsTo != AttrAppertainment::Declaration) continue;
+                if (tree().rule(c).v == sr.rule.v) { roots.push_back(c); break; }
             }
         }
         return roots;
@@ -1724,10 +1742,35 @@ struct Lowerer {
         // being silently promoted to declaration-level linkage. A BARE declarator
         // (not an `initDeclarator`) has no such slot and contributes nothing.
         if (tree().rule(declaratorNode).v != dc.initDeclaratorRule.v) return roots;
+        // ★★★ P56
+        // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+        // the run is taken only when it appertains to THIS DECLARATOR. It used
+        // to take the whole list, which for c meant folding a C23 `stdAttr` run
+        // for linkage no matter what declarator it followed. `runAppertainmentFor`
+        // is the shared resolver, so this fold cannot disagree with the semantic
+        // folds about what a position means — the drift this row closes.
+        // ✔MEASURED 2026-09-03 on the linkage axis specifically, by `nm` binding
+        // rather than by a diagnostic: `int f(void) __attribute__((weak));` emits
+        // a `W` symbol in gcc 13.3.0 AND clang 18.1.3 (the GNU run confers, and
+        // it keeps conferring here — `attrSpec` is `declarator` grain in every
+        // declarator shape). For the C23 spelling on a FUNCTION declarator,
+        // `int f(void) [[gnu::weak]];`, gcc c11/c17 REFUSE the syntax outright
+        // and gcc c2x emits a plain `T` with `warning: 'weak' attribute does not
+        // apply to types`; clang emits `W` while WARNING that the attribute is
+        // `ignored, because it cannot be applied to a type`. A reference whose
+        // diagnostic and whose output disagree casts no clean vote for
+        // conferring, and gcc — the one that says and does the same thing — does
+        // not confer, so the `type` grain is the reading that matches a working
+        // reference.
         for (NodeId c : visible(declaratorNode)) {
             if (tree().kind(c) != NodeKind::Internal) continue;
-            for (RuleId ar : dc.afterDeclaratorAttrRules) {
-                if (tree().rule(c).v == ar.v) { roots.push_back(c); break; }
+            for (AttrRunRule const& ar : dc.afterDeclaratorAttrRules) {
+                if (tree().rule(c).v != ar.rule.v) continue;
+                if (runAppertainmentFor(tree(), dc, ar, declaratorNode)
+                    == AttrAppertainment::Declarator) {
+                    roots.push_back(c);
+                }
+                break;
             }
         }
         return roots;

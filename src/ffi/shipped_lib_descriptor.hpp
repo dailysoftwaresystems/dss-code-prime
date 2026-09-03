@@ -965,14 +965,18 @@ validateShippedSurfaceRequirements(
 // format == `objectFormatKindName(*activeFormat)`); EVERY specified key
 // must equal the active value (generic string equality — no arch/format
 // literal in the engine). >1 variant matches ⇒ fail loud
-// (F_ShippedStructVariantAmbiguous). 0 match (variants present) ⇒ the
-// struct is NOT injected (a later reference fails loud as an undefined
-// type). EAGER: every variant's field list is decoded regardless of which
-// is active (a malformed INACTIVE variant fails the whole read on EVERY
-// target — anti-lurking, mirrors `signatureByDataModel`). Both default to
-// nullopt for direct-API/LSP/unit callers ⇒ no variant selection (a
-// flat-`fields` struct decodes exactly as before; a struct that carries
-// ONLY `variants` is not injected when no selector is available).
+// (F_ShippedStructVariantAmbiguous). 0 match (variants present) ⇒ no
+// LAYOUT is injected — the struct does not enter `structs` — while the TAG
+// is published INCOMPLETE into the type-text vocabulary, so `ptr<tag>` in a
+// signature stays a well-formed pointer and every use needing a size or a
+// field fails loud (P56 — see the arm in the .cpp for why the stricter
+// "publish nothing" rule was refuted). EAGER: every variant's field list is
+// decoded regardless of which is active (a malformed INACTIVE variant fails
+// the whole read on EVERY target — anti-lurking, mirrors
+// `signatureByDataModel`). Both default to nullopt for direct-API/LSP/unit
+// callers ⇒ no variant selection (a flat-`fields` struct decodes exactly as
+// before; a struct that carries ONLY `variants` contributes no layout when
+// no selector is available).
 // c82 `namedTypes` (D-FFI-DESCRIPTOR-VA-LIST-TYPE): optional caller-supplied
 // NAME → TypeId bindings threaded verbatim into EVERY `parseTypeFromText`
 // call this read performs (signatures, per-model overrides, typedefs, struct
