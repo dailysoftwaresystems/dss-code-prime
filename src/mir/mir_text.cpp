@@ -12,6 +12,7 @@
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_verifier.hpp"
 
+#include <algorithm>   // std::find / std::max — the emitters' explicit work stacks
 #include <array>
 #include <cctype>
 #include <cerrno>
@@ -472,10 +473,132 @@ private:
         out_ += "}\n";
     }
 
-    // Recursive structural type emitter — mirrors the HIR text emitter's
-    // discipline. The grammar must stay in sync with `parseType` below.
+    // ── THE STRUCTURAL TYPE EMITTER — AN EXPLICIT HEAP WORK STACK ────────────
+    //
+    // ★★★ D-MIR-TEXT-APPENDTYPE-RECURSES-PER-TYPE-LEVEL-AND-NEVER-TERMINATES-ON-A-SELF-REFERENTIAL-COMPOSITE
+    //
+    // ⚠⚠ THIS WALK USED TO BE HOST RECURSION *AND* IT DID NOT TERMINATE. The
+    // Struct / Union arms expand a composite's WHOLE FIELD LIST inline, and a
+    // field may be a `Ptr` back to the composite itself — `struct S { int v;
+    // struct S *next; }`, the commonest shape in C and the shape sqlite is built
+    // out of. `S → fields → ptr<S> → fields → …` has no base case, so the walk
+    // ran until the host stack was gone.
+    //
+    // ✔MEASURED (P55, lane `rc`) through `ctest`, never a bare `.exe`: the source
+    // `struct S { int v; struct S *next; }; struct S g;` compiled to MIR with
+    // rc 0 (`stop=mir`) and DIED with rc 8 / SEGFAULT the moment `emitMir` ran
+    // (`stop=text`) — on the ORDINARY gtest main thread, at nesting depth ONE.
+    // A finite acyclic type graph here is ~3 levels deep, so a crash is proof of
+    // a CYCLE and not of a deep input: this was non-termination, not a depth
+    // problem, and no stack size fixes it.
+    //
+    // TWO things are therefore fixed here, and they are independent:
+    //
+    //   1. THE HOST RECURSION IS GONE. Depth now costs HEAP (`stack`), which is
+    //      bounded and reportable, not call frames, which are not — the operator's
+    //      standing ruling of 2026-09-02, *"it's well known to not use recursive
+    //      structures in the compiler because big projects like sqlite will for
+    //      sure explode the stack"*.
+    //
+    //   2. A COMPOSITE THAT REACHES ITSELF IS REFUSED **LOUD**, BY NAME.
+    //      `openComposites_` holds the composites whose field list is currently
+    //      being expanded; re-entering one emits an `Error` naming it and the `?`
+    //      mark, which `parseType` refuses BY NAME on the way back in. That is
+    //      this file's own established discipline for a value the format cannot
+    //      spell — see the `TypeKind::Extension` arm, which likewise emits text
+    //      it says out loud the reader will not accept. Turning the crash into a
+    //      SILENT truncated type would have been worse than the crash: it would
+    //      round-trip a `struct S` whose `next` field had quietly lost its
+    //      pointee.
+    //
+    // ⚠ WHAT THIS DOES **NOT** DO, STATED RATHER THAN IMPLIED: it does not make a
+    // self-referential composite round-trip. It cannot, from here. `parseType`
+    // builds a composite with ONE call — `interner_.structType(name, fields)` —
+    // so a cyclic type is not representable by this reader at all; spelling one
+    // would need a two-phase (declare-tag-then-complete) interner entry point,
+    // i.e. a change to `src/core/types/**` and a matching grammar in BOTH text
+    // tiers. That is a format decision, not a bug fix, and it is recorded in the
+    // row rather than guessed at here.
+    //
+    // ⚠ THE TWIN IN `src/hir/hir_text.cpp`'s OWN `appendType` HAS THE IDENTICAL
+    // DEFECT — same inline field-list expansion, same absent cycle guard — and is
+    // OUTSIDE this lane's file set. It is named in the row, not silently left.
     bool internerWarned_ = false;
-    void appendType(TypeId t) {
+
+    // One unit of pending emit work. `Type` renders a type; `Text` appends a
+    // precomputed literal run (a closer, a separator, a formatted suffix);
+    // `CloseComposite` pops a tag off `openComposites_` once its field list is
+    // fully rendered. Tasks are pushed in REVERSE execution order.
+    struct TypeEmitTask {
+        enum class Kind : std::uint8_t { Type, Text, CloseComposite };
+        Kind          kind = Kind::Type;
+        TypeId        type{};
+        std::uint32_t tag  = 0;
+        std::string   text;
+    };
+
+    // The composites whose field list is currently open. A vector and a linear
+    // scan on purpose: this is the NESTING depth of one type, which is small
+    // even for a pathological input, and a vector keeps the open set in the same
+    // order as the text so the diagnostic can name what it is inside of.
+    std::vector<std::uint32_t> openComposites_;
+
+    void appendType(TypeId root) {
+        std::vector<TypeEmitTask> stack;
+        stack.push_back(TypeEmitTask{.kind = TypeEmitTask::Kind::Type,
+                                     .type = root});
+        std::size_t peak = 0;
+        while (!stack.empty()) {
+            peak = std::max(peak, stack.size());
+            TypeEmitTask task = std::move(stack.back());
+            stack.pop_back();
+            switch (task.kind) {
+                case TypeEmitTask::Kind::Text:
+                    out_ += task.text;
+                    continue;
+                case TypeEmitTask::Kind::CloseComposite:
+                    // The field list is finished; the composite is no longer an
+                    // ancestor of anything still to render.
+                    if (!openComposites_.empty()
+                        && openComposites_.back() == task.tag) {
+                        openComposites_.pop_back();
+                    } else {
+                        // Unreachable by construction (a CloseComposite is pushed
+                        // with, and only with, its own open entry). Fail loud
+                        // rather than silently desynchronize the cycle guard.
+                        report("internal: MIR type emitter's composite open-set "
+                               "desynchronized", DiagnosticSeverity::Error);
+                        openComposites_.clear();
+                    }
+                    continue;
+                case TypeEmitTask::Kind::Type:
+                    break;
+            }
+            appendTypeStep(task.type, stack);
+        }
+        (void)peak;
+    }
+
+    // Render ONE type node, pushing whatever remains onto `stack`. Every arm
+    // that used to recurse now pushes; nothing here calls itself.
+    void appendTypeStep(TypeId t, std::vector<TypeEmitTask>& stack) {
+        using Kind = TypeEmitTask::Kind;
+        auto pushText = [&](std::string s) {
+            stack.push_back(TypeEmitTask{.kind = Kind::Text, .text = std::move(s)});
+        };
+        auto pushType = [&](TypeId ty) {
+            stack.push_back(TypeEmitTask{.kind = Kind::Type, .type = ty});
+        };
+        // `ops` rendered comma-separated, then `closer`. Pushed in reverse so it
+        // comes back out in source order.
+        auto pushArgs = [&](std::span<TypeId const> ops, std::string closer) {
+            pushText(std::move(closer));
+            for (std::size_t i = ops.size(); i-- > 0;) {
+                pushType(ops[i]);
+                if (i != 0) pushText(", ");
+            }
+        };
+
         if (!t.valid()) { out_ += "invalid"; return; }
         if (ctx_.interner == nullptr) {
             if (!internerWarned_) {
@@ -493,36 +616,52 @@ private:
             return;
         }
         TypeInterner const& in = *ctx_.interner;
-        auto args = [&](std::span<TypeId const> ops) {
-            bool first = true;
-            for (TypeId o : ops) {
-                if (!first) out_ += ", ";
-                appendType(o);
-                first = false;
-            }
-        };
         switch (in.kind(t)) {
-            case TypeKind::Ptr:      out_ += "ptr<";      appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::Ref:      out_ += "ref<";      appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::Nullable: out_ += "nullable<"; appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::Optional: out_ += "optional<"; appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::Slice:    out_ += "slice<";    appendType(in.operands(t)[0]); out_ += '>'; return;
+            case TypeKind::Ptr:      out_ += "ptr<";      pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::Ref:      out_ += "ref<";      pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::Nullable: out_ += "nullable<"; pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::Optional: out_ += "optional<"; pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::Slice:    out_ += "slice<";    pushArgs(in.operands(t).first(1), ">"); return;
             case TypeKind::Array:
-                out_ += "arr<"; appendType(in.operands(t)[0]);
-                out_ += std::format(", {}>", in.scalars(t)[0]);
+                out_ += "arr<";
+                pushArgs(in.operands(t).first(1),
+                         std::format(", {}>", in.scalars(t)[0]));
                 return;
             // C99 _Complex (D-CSUBSET-COMPLEX): a complex slot is a Ptr<complex<elem>>
             // in MIR; spell the pointee so the .dssmir dump is legible (not '?').
             case TypeKind::Complex:
-                out_ += "complex<"; appendType(in.operands(t)[0]); out_ += '>'; return;
+                out_ += "complex<"; pushArgs(in.operands(t).first(1), ">"); return;
             case TypeKind::Tuple:
-                out_ += "tuple<"; args(in.operands(t)); out_ += '>'; return;
+                out_ += "tuple<"; pushArgs(in.operands(t), ">"); return;
             case TypeKind::Struct:
-                out_ += "struct "; out_ += quote(in.name(t)); out_ += " {";
-                args(in.operands(t)); out_ += '}'; return;
-            case TypeKind::Union:
-                out_ += "union "; out_ += quote(in.name(t)); out_ += " {";
-                args(in.operands(t)); out_ += '}'; return;
+            case TypeKind::Union: {
+                bool const isStruct = in.kind(t) == TypeKind::Struct;
+                out_ += isStruct ? "struct " : "union ";
+                out_ += quote(in.name(t));
+                // ★★ THE CYCLE GUARD. Reaching a composite that is already being
+                // expanded means the field list contains a path back to itself;
+                // expanding it again never terminates. Refuse it BY NAME, with
+                // the `?` mark the reader rejects, rather than truncating it into
+                // a type that would read back as something else.
+                if (std::find(openComposites_.begin(), openComposites_.end(), t.v)
+                    != openComposites_.end()) {
+                    report(std::format(
+                        "{} '{}' contains a path back to itself; this format "
+                        "expands a composite's field list inline and has no "
+                        "spelling for a self-referential type, so it is rendered "
+                        "as '?' and the text will NOT read back",
+                        isStruct ? "struct" : "union", in.name(t)),
+                        DiagnosticSeverity::Error);
+                    out_ += " ?";
+                    return;
+                }
+                openComposites_.push_back(t.v);
+                stack.push_back(TypeEmitTask{.kind = Kind::CloseComposite,
+                                             .tag  = t.v});
+                out_ += " {";
+                pushArgs(in.operands(t), "}");
+                return;
+            }
             // ★★ THE UNDERLYING KIND IS SPELLED BY NAME, NOT BY ITS ORDINAL, and
             // that is a correctness requirement rather than a readability one.
             // This arm used to write `std::to_string(sc[0])` — the raw `TypeKind`
@@ -561,17 +700,24 @@ private:
                 return;
             }
             case TypeKind::FnSig: {
-                out_ += "fn(";
-                args(in.fnParams(t));
-                out_ += ") -> ";
-                appendType(in.fnResult(t));
-                auto sc = in.scalars(t);
+                // `fn(P0, P1) -> R [cc NAME]`. The trailing calling-convention
+                // run is decided HERE (it reads only this node's scalars) and
+                // carried as a Text task so it lands after the result type.
+                std::string tail;
+                auto const sc = in.scalars(t);
                 if (!sc.empty()) {
                     auto const cc = static_cast<CallConv>(sc[0]);
                     if (cc != CallConv::CcSysV) {
-                        out_ += " cc "; out_ += callConvName(cc);
+                        tail += " cc ";
+                        tail += callConvName(cc);
                     }
                 }
+                out_ += "fn(";
+                // Reverse execution order: the cc tail, then the result, then
+                // `) -> `, then the parameter list.
+                if (!tail.empty()) pushText(std::move(tail));
+                pushType(in.fnResult(t));
+                pushArgs(in.fnParams(t), ") -> ");
                 return;
             }
             // ★★ WRITE-ONLY SPELLING, MADE LOUD RATHER THAN LEFT AS A WARNING
@@ -622,8 +768,48 @@ private:
     // Render a `MirLiteralValue` inline. Format mirrors HIR's: `lit
     // <variant-tag> <value>` where `<variant-tag>` disambiguates the
     // variant arm (int / uint / float / bool / str / agg).
-    void appendLiteral(MirLiteralValue const& lv) {
+    // ── THE LITERAL EMITTER — THE SAME EXPLICIT HEAP WORK STACK ──────────────
+    //
+    // D-MIR-NESTED-AGGREGATE-LITERAL-WALKS-RECURSE-PER-INITIALIZER-LEVEL: the
+    // `agg` arm used to call `appendLiteral` per nested field, one host frame per
+    // brace level of the source initializer, with NO CAP of any kind. Nesting now
+    // costs heap. The tail (` : <core>`) is a task of its own so a nested
+    // aggregate's core still renders — and still REPORTS — in output order, which
+    // computing it eagerly at push time would have quietly reordered.
+    struct LiteralEmitTask {
+        enum class Kind : std::uint8_t { Value, CoreSuffix, Text };
+        Kind                   kind = Kind::Value;
+        MirLiteralValue const* lit  = nullptr;
+        std::string            text;
+    };
+
+    void appendLiteral(MirLiteralValue const& root) {
+        std::vector<LiteralEmitTask> stack;
+        stack.push_back(LiteralEmitTask{.kind = LiteralEmitTask::Kind::Value,
+                                        .lit  = &root});
+        while (!stack.empty()) {
+            LiteralEmitTask task = std::move(stack.back());
+            stack.pop_back();
+            switch (task.kind) {
+                case LiteralEmitTask::Kind::Text:
+                    out_ += task.text;
+                    continue;
+                case LiteralEmitTask::Kind::CoreSuffix:
+                    appendLiteralCore(*task.lit);
+                    continue;
+                case LiteralEmitTask::Kind::Value:
+                    break;
+            }
+            appendLiteralStep(*task.lit, stack);
+        }
+    }
+
+    // Render ONE literal node. An aggregate pushes its fields; nothing recurses.
+    void appendLiteralStep(MirLiteralValue const& lv,
+                           std::vector<LiteralEmitTask>& stack) {
+        using Kind = LiteralEmitTask::Kind;
         out_ += "lit ";
+        MirAggregateValue const* agg = nullptr;
         std::visit([&](auto const& v) {
             using T = std::decay_t<decltype(v)>;
             if constexpr (std::is_same_v<T, std::monostate>) {
@@ -640,14 +826,12 @@ private:
             } else if constexpr (std::is_same_v<T, std::string>) {
                 out_ += "str "; out_ += quote(v);
             } else if constexpr (std::is_same_v<T, MirAggregateValue>) {
+                // The fields are pushed AFTER the visit returns (the closure
+                // cannot name `stack` and the task type at once without pulling
+                // the whole ladder into the template); record the aggregate and
+                // let the caller schedule it.
                 out_ += "agg {";
-                bool first = true;
-                for (auto const& f : v.fields) {
-                    if (!first) out_ += ", ";
-                    appendLiteral(f);
-                    first = false;
-                }
-                out_ += '}';
+                agg = &v;
             } else if constexpr (std::is_same_v<T, MirSymbolAddrValue>) {
                 // F5: link-time symbol-address literal (`&sym [+ addend]`).
                 out_ += std::format("symaddr %{}", v.symbol);
@@ -689,6 +873,27 @@ private:
                               "serialize as nothing");
             }
         }, lv.value);
+        if (agg == nullptr) {
+            appendLiteralCore(lv);
+            return;
+        }
+        // Reverse execution order: this node's ` : <core>` tail, then the closing
+        // brace, then the fields with their separators.
+        stack.push_back(LiteralEmitTask{.kind = Kind::CoreSuffix, .lit = &lv});
+        stack.push_back(LiteralEmitTask{.kind = Kind::Text, .text = "}"});
+        auto const& fields = agg->fields;
+        for (std::size_t i = fields.size(); i-- > 0;) {
+            stack.push_back(LiteralEmitTask{.kind = Kind::Value,
+                                            .lit  = &fields[i]});
+            if (i != 0) {
+                stack.push_back(LiteralEmitTask{.kind = Kind::Text,
+                                                .text = ", "});
+            }
+        }
+    }
+
+    // The ` : <core>` tail every literal carries, aggregate or not.
+    void appendLiteralCore(MirLiteralValue const& lv) {
         out_ += " : ";
         // ⚠ ONE OWNER FOR THE CORE SPELLINGS, both directions. The `else if` ladder
         // that used to stand here was a second copy of `parseLiteral`'s ladder, and

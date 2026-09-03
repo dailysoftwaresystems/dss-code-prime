@@ -1,0 +1,10 @@
+{
+  "$comment": "P55 D-SEMANTIC-DEPTH-CAPS-TRUNCATE-INTO-TWO-WRONG-ANSWERS (negative): the C23 6.7.6.1p2 pointee-qualifier diagnostic must survive DEPTH. Two incompatible redeclaration pairs, each PAST one of the two hard-coded depth caps `declaratorConstSpine` used to truncate at — five levels of nested function-pointer parameters (the old `nestDepth >= 4`) and seventeen nested parenthesized declarators (the old `depth > 16`, itself below ISO C23 5.2.4.1's floor of 63). Both were MEASURED compiling rc=0 with ZERO diagnostics before P55 while all four references diagnose them (gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 as an error, MSVC 19.51.36252 as warning C4028), each probed separately. NO `optimizedPipelines` arm ON PURPOSE: an arm on a diagnostic manifest is parsed and then silently discarded (D-TEST-EXAMPLES-OPTIMIZED-ARM-DROPPED-ON-DIAGNOSTIC-MANIFEST) — the runnable half of this row's witness is `deep_declarator_qualifier_spine_runs`, which carries one. RED-ON-DISABLE: restore either cap and the matching entry stops being emitted; the assertion is whole-set equality, so losing either one is red.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:elf64-x86_64-linux-exec" } ],
+  "expectDiagnostics": [
+    { "code": "S_IncompatibleRedeclaration", "line": 32, "col": 6 },
+    { "code": "S_IncompatibleRedeclaration", "line": 35, "col": 6 }
+  ]
+}

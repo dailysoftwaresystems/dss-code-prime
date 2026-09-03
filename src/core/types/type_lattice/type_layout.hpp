@@ -256,7 +256,7 @@ computeLayout(TypeId id, TypeInterner const& interner,
 // clobber a sibling", and for a union brace-init the answer is NO whatever the
 // members share: C 6.7.9p17 initializes exactly ONE member, so there is exactly one
 // write and no sibling to lose. ✔MEASURED — THREE independent things already give
-// that: `lowerUnionBraceInit` returns a one-child `ConstructAggregate`,
+// that: `prepareUnionBraceInit` and its one-slot brace level yield a one-child `ConstructAggregate`,
 // `synthZeroOrError`'s composite arm computes `n = (core == Union) ? 1 :
 // ops.size()`, and `HirVerifier::checkConstructAggregate` refuses any other child
 // count. BOTH callers nevertheless ASSERT it rather than resting on it, because all

@@ -222,3 +222,10 @@ target_link_libraries(dss_ffi_test_shipped_mtx_type_declarations
 # drives `Program::compileFiles`, it does not read the descriptor's JSON.
 dss_add_test(NAME ffi/test_shipped_ioctl_size_ceiling
              SOURCES test_shipped_ioctl_size_ceiling.cpp)
+
+# ── D-COMPILER-INPUT-PROPORTIONAL-RECURSION residue, FFI half (P55 lane `hs`) ──
+# Its own binary because a red here is a STACK OVERFLOW: the process dies with no
+# `[  FAILED  ]` line and no case name, so a sibling in a shared binary would lose
+# its verdict to an unattributable death.
+dss_add_test(NAME ffi/test_descriptor_walk_costs_heap
+             SOURCES test_descriptor_walk_costs_heap.cpp)

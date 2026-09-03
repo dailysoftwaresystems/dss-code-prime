@@ -983,6 +983,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // D-FFI-EXTERN-CALL-DISPATCH: capture the active format's extern-call
         // shape now (the LOWER half sees only this struct, not the format).
         format.externCallDispatch(),
+        // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55):
+        // and the narrowing of WHICH bindings that dispatch applies to,
+        // for the same reason.
+        format.indirectSlotBindings(),
         // D-LK-EXTERN-DATA-IMPORT (c117): capture the format's extern-DATA
         // binding model now, for the same reason (the LOWER half's MIR→LIR
         // GlobalAddr lowering selects got-indirect deref vs a direct lea).
@@ -1134,6 +1138,13 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          // access then refuses loud under a `traps` target and
                          // keeps the native form under `losesAtomicity`).
                          std::optional<AtomicsRuntime>               atomicsRuntime,
+                         // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
+                         // (P55): the format's DECLARED narrowing of which
+                         // symbol bindings the `indirect-slot` dispatch reaches
+                         // through the import slot. Empty = unnarrowed (every
+                         // import). Threaded into MIR→LIR exactly like the
+                         // dispatch itself, and read there ONLY under it.
+                         std::vector<SymbolBinding>                  indirectSlotBindings,
                          DiagnosticReporter&                         reporter) {
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
@@ -1162,7 +1173,11 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           std::nullopt,
                           // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's
                           // atomics runtime.
-                          std::move(atomicsRuntime));
+                          std::move(atomicsRuntime),
+                          // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
+                          // (P55): the format's declared slot-binding
+                          // narrowing.
+                          std::move(indirectSlotBindings));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -2167,7 +2182,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.externAddrBinding,
         cuMir.tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt),
-        atomicsRuntime, reporter);
+        atomicsRuntime, cuMir.indirectSlotBindings, reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -2209,7 +2224,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // externCallDispatch is pre-resolved there).
                       std::optional<std::string> wideFloatSoftcallLibrary,
                       DiagnosticReporter& reporter,
-                      std::optional<AtomicsRuntime> atomicsRuntime) {
+                      std::optional<AtomicsRuntime> atomicsRuntime,
+                      std::vector<SymbolBinding> indirectSlotBindings) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
     // by the LK11a symbol-table populate (module-private), exactly as in the CU path.
@@ -2225,7 +2241,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         callingConventionIndex, cuId,
         externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary),
-        std::move(atomicsRuntime), reporter);
+        std::move(atomicsRuntime), std::move(indirectSlotBindings), reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU

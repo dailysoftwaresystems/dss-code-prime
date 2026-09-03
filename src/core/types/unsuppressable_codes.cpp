@@ -973,14 +973,18 @@ constexpr std::array<UnsuppressableEntry, 168> kUnsuppressableCodes{{
     // fails the gate via errorCount.
     {DiagnosticCode::H_Utf8CharLiteralOutOfRange, kWhyWideLiteral},
     {DiagnosticCode::H_WideCharValueUnrepresentable, kWhyWideLiteral},
-    // H_InvalidUniversalCharacterName (C11/C23 6.4.3, Cycle C) + H_WideByteEscapeUnsupported
-    // (6.4.5, D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE): a malformed/invalid `\u`/`\U`
-    // universal character name, and a `\x`/octal byte escape in a wide/UTF literal.
-    // Same silent-miscompile class as the wide/UTF codes above — suppressing either
-    // would let a wrong/CESU-8/collapsed code unit ship green. Both emit an Error HIR
-    // node + fail the gate via errorCount.
+    // H_InvalidUniversalCharacterName (C11/C23 6.4.3, Cycle C) + H_EscapeValueExceedsCodeUnit
+    // (6.4.4.4 / 6.4.5, the P55 pair): a malformed/invalid `\u`/`\U` universal character
+    // name, and a `\x`/octal escape whose VALUE does not fit one code unit of the
+    // literal's element. Same silent-miscompile class as the wide/UTF codes above —
+    // suppressing either would let a wrong/CESU-8/collapsed code unit ship green.
+    // ★ The second one is unsuppressable for a MEASURED reason, not a symmetric one:
+    // the behaviour it replaced was gcc/mingw's silent truncation, so a suppressed
+    // H_EscapeValueExceedsCodeUnit would not merely hide a message — it would hand back
+    // exactly the wrong unit the P55 pair was opened to stop (`"\x100"` → a NUL,
+    // `u"\x1FFFF"` → 0xFFFF). Both emit an Error HIR node + fail the gate via errorCount.
     {DiagnosticCode::H_InvalidUniversalCharacterName, kWhyWideLiteral},
-    {DiagnosticCode::H_WideByteEscapeUnsupported, kWhyWideLiteral},
+    {DiagnosticCode::H_EscapeValueExceedsCodeUnit, kWhyWideLiteral},
     // H_ConflictingStringLiteralPrefixes (C11/C23 6.4.5p5, Cycle D): a run of adjacent
     // string literals mixing TWO DIFFERENT non-narrow encoding prefixes (`u"a" U"b"`).
     // It is a silent-failure REASON code (like S_GenericSelectionNoMatch below): on the

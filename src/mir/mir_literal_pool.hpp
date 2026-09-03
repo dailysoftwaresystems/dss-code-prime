@@ -68,6 +68,51 @@ struct MirLiteralValue {
     TypeKind core = TypeKind::Void;
 };
 
+// ── ONE OWNER FOR "VISIT EVERY NODE OF A LITERAL", ON THE HEAP ──────────────
+//
+// ★★★ D-MIR-NESTED-AGGREGATE-LITERAL-WALKS-RECURSE-PER-INITIALIZER-LEVEL
+//
+// `MirAggregateValue::fields` is a `MirLiteralValue` vector, so a literal is a
+// TREE whose depth is the brace nesting of the user's initializer. NINE separate
+// walks over that tree existed across `src/mir/**`, every one of them written as
+// host recursion and every one of them with NO CAP OF ANY KIND — the writer, the
+// merge's symbol remap and symbol assignment, the summary's global-init scan, the
+// lazy-import name collection and undefined-symbol note, the HIR→MIR literal copy
+// and its TLS screen, and the all-zero test. Each was a latent stack overflow on
+// a legal, deeply-braced initializer, and being nine copies meant nine chances to
+// miss one.
+//
+// ⇒ ONE walker, an explicit `std::vector` work stack, O(1) host frames per brace
+// level. It is a template on the visitor and const-agnostic on the literal so the
+// mutating remap and the read-only scans share the SAME traversal — the operator's
+// standing ruling of 2026-09-02, *"it's well known to not use recursive structures
+// in the compiler because big projects like sqlite will for sure explode the
+// stack"*.
+//
+// ⚠ THE VISITOR SEES **EVERY** NODE, AGGREGATES INCLUDED, and the aggregate's
+// children are walked whatever the visitor does. That is deliberate: a visitor
+// that used to `return` early after handling a symbol-address arm still behaves
+// identically, because a `MirSymbolAddrValue` node has no children — but a
+// visitor that wanted to prune a subtree would have to say so, and none does.
+// ★ Children are pushed in REVERSE so they pop in field order; the merge's symbol
+// ASSIGNMENT order and the summary's `targets` vector are both order-observable.
+template <typename Lit, typename Visit>
+void forEachLiteralNode(Lit& root, Visit&& visit) {
+    std::vector<Lit*> work;
+    work.push_back(&root);
+    while (!work.empty()) {
+        Lit* const cur = work.back();
+        work.pop_back();
+        visit(*cur);
+        if (auto* agg = std::get_if<MirAggregateValue>(&cur->value)) {
+            auto& fields = agg->fields;
+            for (std::size_t i = fields.size(); i-- > 0;) {
+                work.push_back(&fields[i]);
+            }
+        }
+    }
+}
+
 class DSS_EXPORT MirLiteralPool {
 public:
     // Append a literal value; returns its index (the Const instruction payload).

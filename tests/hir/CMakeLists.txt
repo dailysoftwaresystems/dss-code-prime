@@ -77,3 +77,19 @@ add_dependencies(dss_hir_test_torn_shipped_config_reds_not_crashes
 # unconsumed substrate's misses are latent by definition).
 dss_add_test(NAME hir/test_type_representation_projection
              SOURCES test_type_representation_projection.cpp)
+
+# ── D-COMPILER-INPUT-PROPORTIONAL-RECURSION residue, front-end half (P55 `hs`) ──
+# TWO files, and the split is the point.
+#
+# `test_frontend_deep_nesting_probe` is the stage-selectable MEASUREMENT
+# instrument: idle (skipped) unless `DSS_HS_PROBE_KIND` is set, so it costs the
+# ordinary gate one skip and lets a ceiling be walked without a rebuild.
+#
+# `test_frontend_deep_nesting_costs_heap` holds the PINS, and it is its own
+# binary on purpose: when one of them reds it reds by exhausting the stack — the
+# process dies with no `[  FAILED  ]` line and no case name, the unattributable
+# signature that must not be allowed to take a sibling test's verdict with it.
+dss_add_test(NAME hir/test_frontend_deep_nesting_probe
+             SOURCES test_frontend_deep_nesting_probe.cpp)
+dss_add_test(NAME hir/test_frontend_deep_nesting_costs_heap
+             SOURCES test_frontend_deep_nesting_costs_heap.cpp)

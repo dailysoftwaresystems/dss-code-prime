@@ -16,6 +16,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/target_schema.hpp"   // D-TEST-THE-HIR-LOWERING-FIXTURE-ANALYZES-WITH-NO-TARGET-IN-SCOPE
+#include "core/types/wide_string_encode.hpp"   // elementByteWidth (assert unit COUNTS, not format-specific bytes)
 #include "hir/const_eval.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_intrinsic_registry.hpp"
@@ -5345,37 +5346,204 @@ TEST(HirLoweringC, UcnSurrogateHalfStringFailsLoud) {
     EXPECT_EQ(countCode(r, DiagnosticCode::H_InvalidUniversalCharacterName), 1u);
 }
 
-TEST(HirLoweringC, WideStringByteEscapeFailsLoud) {
-    // FF3: `u"\xC3\xA9"` uses `\x` byte escapes in a wide/UTF string. The old path
-    // silently collapsed the two intended code units into one (0x00E9); Cycle C
-    // fails loud with H_WideByteEscapeUnsupported (a raw code-unit value is not a
-    // code point — the escape-value-as-code-unit feature is deferred). Narrow
-    // `"\xC3\xA9"` is UNCHANGED (byte-producing).
+TEST(HirLoweringC, WideStringByteEscapeAssemblesOneUnitEach) {
+    // ✅ THE CLAIM THIS TEST MAKES IS INVERTED, AND THE INVERSION IS THE FIX (P55,
+    // D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE). It used to assert that `u"\xC3\xA9"`
+    // is REFUSED, because DSS could not express an escape's value as a code unit.
+    // ⚠ IT MUST NOT BE READ AS "the guard was deleted": the behaviour BEFORE that
+    // refusal was a SILENT COLLAPSE of these exact two escapes into ONE wrong
+    // 0x00E9 unit, so the literal is pinned here BY VALUE. A regression to the
+    // collapse gives one unit and reddens arm two; a regression to the blanket
+    // refusal reddens arm one.
+    // ✔MEASURED: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51 all
+    // emit the two units 0xC3, 0xA9 for this literal.
     SemanticModel model = analyzeC("void f() { u\"\\xC3\\xA9\"; }");
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok) << "a byte escape in a wide string must fail lowering";
-    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideByteEscapeUnsupported), 1u);
+    ASSERT_TRUE(res->ok) << "u\"\\xC3\\xA9\" is two code units and must lower";
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U16);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    // Two 16-bit LE units: C3 00 A9 00 — NOT the one 0x00E9 the collapse produced.
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({static_cast<char>(0xC3), 0, static_cast<char>(0xA9), 0}))
+        << "each byte escape is its OWN code unit; the UTF-8 re-decode is bypassed";
 }
 
-TEST(HirLoweringC, WideCharByteEscapeFailsLoud) {
-    // MEDIUM-1 (code-audit): the wide-CHAR byte-escape path is the char twin of
-    // WideStringByteEscapeFailsLoud (FF3). `u'\xC3\xA9'` must fail loud with
-    // H_WideByteEscapeUnsupported (decodeWideCharCodepoint → ByteEscapeInWide), NOT
-    // silently collapse C3 A9 → one char16_t 0x00E9. This is the sole exerciser of the
-    // ByteEscapeInWide enumerator on the char path — a refactor dropping the guard would
-    // reintroduce the collapse miscompile for the char form with nothing red.
-    SemanticModel model = analyzeC("void f() { u'\\xC3\\xA9'; }");
+TEST(HirLoweringC, WideStringByteEscapeAgreesWithTheSemanticArrayLength) {
+    // ★★ THE TIER-AGREEMENT PIN, and the reason the semantic tier had to move with
+    // the encoder rather than after it. HIR emits the code units and the semantic
+    // typer derives `Array<char16_t, N+1>` from the SAME buffer through the SAME
+    // encoder; if only one of them were given the escape values, one would count a
+    // byte escape as one unit and the other would re-read its placeholder byte as
+    // UTF-8. `sizeof` reads the semantic answer and the literal pool holds HIR's,
+    // so asserting both in one test is what makes a divergence impossible to miss.
+    SemanticModel model = analyzeC("void f() { u\"\\xC3\\xA9\"; }");
+    EXPECT_FALSE(model.hasErrors()) << "the wide literal must TYPE, not merely lower";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok) << "a byte escape in a wide char must fail lowering";
-    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideByteEscapeUnsupported), 1u);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    // HIR's answer: the emitted byte string, divided by the element width.
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    std::uint32_t const w        = elementByteWidth(v.core);
+    std::size_t const   hirUnits = std::get<std::string>(v.value).size() / w;
+
+    // The semantic tier's answer: the Array bound stamped on the same node, which
+    // is `codeUnits + 1` for the NUL. Reading BOTH in one test is the point — a
+    // tier that were given the escape values while the other was not would still
+    // pass every single-tier assertion in this file.
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(hirUnits, 2u) << "two escapes, two code units";
+    EXPECT_EQ(ti.scalars(ty)[0], static_cast<std::int64_t>(hirUnits + 1))
+        << "the semantic array length and the HIR unit count must agree";
+}
+
+TEST(HirLoweringC, WideStringEscapeTooWideForElementFailsLoud) {
+    // ★ THE FAIL-LOUD CLAIM THE OLD WideStringByteEscapeFailsLoud CARRIED LIVES
+    // HERE NOW — moved to the case where the references actually split, not
+    // deleted. gcc 13.3.0 and mingw-w64 gcc 13.2.0 truncate `u"\x1FFFF"` to 0xFFFF
+    // with a warning; clang 18.1.3 and MSVC 19.51 refuse. The union over what WORKS
+    // is a refusal, because a truncation is the same silent wrong answer this
+    // anchor pair exists to end.
+    SemanticModel model = analyzeC("void f() { u\"\\x1FFFF\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "an escape wider than char16_t must fail, never truncate";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_EscapeValueExceedsCodeUnit), 1u);
+
+    // The SAME value under a 32-bit element is valid — the bound is the ELEMENT
+    // WIDTH, not Unicode and not a ban on byte escapes.
+    SemanticModel wide = analyzeC("void f() { U\"\\x1FFFF\"; }");
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(wide, r2);
+    EXPECT_TRUE(res2->ok) << "U\"\\x1FFFF\" is one char32_t unit on all four references";
+}
+
+TEST(HirLoweringC, WideStringConcatRebasesEscapeOffsets) {
+    // ★★ THE OFFSET REBASE, pinned from the direction it fails. Phase 5 decodes
+    // each segment independently and phase 6 joins the bytes, so an escape recorded
+    // at offset 0 of its OWN segment sits at offset 1 of the joined buffer here.
+    // Without the rebase in `decodeAdjacentStringBodies` the encoder splices the
+    // unit at the wrong place and re-reads a real byte as text — silently.
+    // ✔MEASURED: all four references give `u"\xF" "F"` the units 0x000F, 0x0046.
+    SemanticModel model = analyzeC("void f() { u\"\\xF\" \"F\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({0x0F, 0, 0x46, 0}))
+        << "the escape stays in the FIRST segment's position after the join";
+}
+
+TEST(HirLoweringC, WideStringEscapeIsARawUnitNotACodePoint) {
+    // ★★★ THE PROPERTY MOST LIKELY TO BE "TIDIED" AWAY by a later refactor that
+    // routes byte escapes back through the code-point validator. ✔MEASURED,
+    // unanimous in BOTH directions on all four references: `u"\xD800"` assembles a
+    // LONE SURROGATE unit and `U"\xFFFFFFFF"` a unit PAST U+10FFFF, while the UCN
+    // spellings of those same numbers are refused by all four. If a refactor makes
+    // these two fail, it has re-imposed Unicode rules on something that is not a
+    // code point.
+    SemanticModel surro = analyzeC("void f() { u\"\\xD800\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(surro, r);
+    EXPECT_TRUE(res->ok) << "a lone-surrogate VALUE is a legal code unit";
+
+    SemanticModel past = analyzeC("void f() { U\"\\xFFFFFFFF\"; }");
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(past, r2);
+    EXPECT_TRUE(res2->ok) << "0xFFFFFFFF fills a char32_t unit exactly";
+
+    // ...and the UCN spelling of the surrogate stays refused.
+    SemanticModel ucn = analyzeC("void f() { u\"\\uD800\"; }");
+    DiagnosticReporter r3;
+    auto res3 = lowerToHir(ucn, r3);
+    EXPECT_FALSE(res3->ok) << "\\uD800 names a surrogate CODE POINT and must fail";
+    EXPECT_EQ(countCode(r3, DiagnosticCode::H_InvalidUniversalCharacterName), 1u);
+}
+
+TEST(HirLoweringC, WideCharByteEscapeAssemblesOneUnit) {
+    // ✅ THE CLAIM THIS TEST MAKES IS INVERTED, AND THAT IS THE POINT (P55,
+    // D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE, character half). It used to assert that
+    // `u'\xC3\xA9'` fails loud; the reason it failed was that DSS could not express
+    // an escape's VALUE, and the reason it must not simply be deleted is that the
+    // behaviour BEFORE that refusal was a silent collapse to one 0x00E9 unit.
+    //
+    // Both hazards are now pinned positively. `u'\xFFFF'` is ONE 0xFFFF code unit —
+    // ✔MEASURED identical on gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC
+    // 19.51 — and a regression to the collapse would give 0xFFFD or a refusal, both
+    // caught here. `u'\xC3\xA9'` keeps a REFUSAL, but for the honest reason: a
+    // character constant denotes ONE code unit and that body names two.
+    SemanticModel model = analyzeC("void f() { u'\\xFFFF'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << "u'\\xFFFF' names one 0xFFFF code unit and must lower";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_EscapeValueExceedsCodeUnit), 0u);
+
+    // The two-escape body is not one unit — refused, and NOT as a width failure.
+    SemanticModel two = analyzeC("void f() { u'\\xC3\\xA9'; }");
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(two, r2);
+    EXPECT_FALSE(res2->ok) << "u'\\xC3\\xA9' is two units, not one — must fail loud";
+    EXPECT_EQ(countCode(r2, DiagnosticCode::H_WideCharValueUnrepresentable), 1u);
+}
+
+TEST(HirLoweringC, WideCharByteEscapeTooWideForElementFailsLoud) {
+    // ★ THE FAIL-LOUD CLAIM MOVED HERE rather than being dropped (P55). The
+    // references SPLIT on an escape that overflows the element: gcc 13.3.0 and
+    // mingw-w64 gcc 13.2.0 truncate `u'\x1FFFF'` to 0xFFFF WITH A WARNING, clang
+    // 18.1.3 and MSVC 19.51 REFUSE. A reference that only accepts by narrowing the
+    // value away is not a working reference, so DSS refuses — a truncation here is
+    // the same silent wrong answer the whole P55 pair exists to end.
+    SemanticModel model = analyzeC("void f() { u'\\x1FFFF'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "an escape wider than char16_t must fail, never truncate";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_EscapeValueExceedsCodeUnit), 1u);
+
+    // U'\xFFFFFFFF' EXACTLY fills a 32-bit unit and is valid on all four references
+    // — including past U+10FFFF, which is the proof that a byte escape is a raw
+    // code UNIT and not a code POINT.
+    SemanticModel wide = analyzeC("void f() { U'\\xFFFFFFFF'; }");
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(wide, r2);
+    EXPECT_TRUE(res2->ok) << "U'\\xFFFFFFFF' fills a char32_t unit exactly";
+}
+
+TEST(HirLoweringC, WideCharSurrogateEscapeIsAUnitButTheUcnIsNot) {
+    // ★★ THE SHARPEST MEASURED ASYMMETRY, and the one a later refactor is most
+    // likely to "tidy" away by routing byte escapes back through the code-point
+    // validator. ✔MEASURED, unanimous in BOTH directions on gcc 13.3.0, clang
+    // 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51: `u'\xD800'` assembles to one
+    // 0xD800 unit, while `u'\uD800'` — the same number spelled as a universal
+    // character name — is REFUSED by all four. A raw code unit may be a lone
+    // surrogate; a code point may not.
+    SemanticModel esc = analyzeC("void f() { u'\\xD800'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(esc, r);
+    EXPECT_TRUE(res->ok) << "u'\\xD800' is a raw code unit and must lower";
+
+    SemanticModel ucn = analyzeC("void f() { u'\\uD800'; }");
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(ucn, r2);
+    EXPECT_FALSE(res2->ok) << "u'\\uD800' names a surrogate CODE POINT and must fail";
+    EXPECT_EQ(countCode(r2, DiagnosticCode::H_InvalidUniversalCharacterName), 1u);
 }
 
 TEST(HirLoweringC, WideStringIllFormedUtf8FailsLoud) {
     // MEDIUM-2 (code-audit): after Cycle C, H_WideCharSurrogateUnsupported's surviving
     // trigger is a RAW ill-formed UTF-8 byte in a wide string body (astral-under-U16 now
-    // surrogate-encodes; the `\x` route is shadowed by FF3's H_WideByteEscapeUnsupported).
+    // surrogate-encodes; the `\x` route is shadowed by the wide-string escape guard).
     // A lone 0x80 (an invalid UTF-8 lead byte) must fail loud, not emit a garbage code
     // unit — this is the sole red-on-disable for that still-live diagnostic.
     std::string src = "void f() { u\"";
@@ -5598,15 +5766,32 @@ TEST(HirLoweringC, ConcatFF3MixedNarrowWidePrefixFailsLoud) {
     // The FF3-mixed hole (now CLOSED): `"a" L"\xC3"` — the run is WIDE (effective
     // prefix L) but the FIRST opener is narrow. Pre-Cycle-D the FF3 byte-escape guard
     // keyed on the first opener → narrow → MISS → the old silent UTF-8 collapse. Now
-    // the guard keys on the run's effective prefix, so the `\xC3` byte escape in a
-    // wide run fails loud with H_WideByteEscapeUnsupported.
+    // the guard keys on the run's effective prefix.
+    // ⏳ P55 INVERTS THE OUTCOME AND KEEPS THE PROPERTY. `"a" L"\xC3"` now LOWERS,
+    // because a byte escape in a wide run is a code unit rather than a refusal —
+    // but what this test exists for is unchanged and still load-bearing: the run's
+    // element must come from the EFFECTIVE prefix, never the FIRST opener. Keying
+    // on the first opener would make this run NARROW, and `\xC3` would be emitted
+    // as one raw byte inside what must be a 16-bit array — the original silent
+    // miscompile, reached by a different road. Pinning the UNITS is what detects
+    // that; a bare "it compiles" would not.
     SemanticModel model = analyzeC("void f() { \"a\" L\"\\xC3\"; }");
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok) << "a byte escape in a wide (via a later prefix) run must fail";
-    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideByteEscapeUnsupported), 1u);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_ConflictingStringLiteralPrefixes), 0u)
-        << "a SINGLE non-narrow prefix is not a conflict — only the byte escape fires";
+        << "a SINGLE non-narrow prefix is not a conflict";
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_NE(v.core, TypeKind::Char)
+        << "the run is WIDE via its later prefix — a narrow core here is the "
+           "first-opener bug returning as a silent miscompile";
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    // 'a' then the 0xC3 unit, each in the element's width (2 on pe, 4 on elf/macho
+    // for L") — so assert the UNIT COUNT rather than a format-specific byte string.
+    std::uint32_t const w = elementByteWidth(v.core);
+    EXPECT_EQ(std::get<std::string>(v.value).size(), 2u * w)
+        << "two code units: 'a' and the escape's 0xC3";
 }
 
 TEST(HirLoweringC, ConcatAllNarrowUnchanged) {
@@ -5679,8 +5864,11 @@ namespace {
 // the source by hand. MEASURED cost: that is exactly how sqlite's `shell.c`
 // `struct stat x = {0};` had to be located.
 //
-// RED-ON-DISABLE: drop the `track(...)` wrapper on either `lowerBraceInit`'s or
-// `lowerUnionBraceInit`'s returned aggregate and the matching arm below goes red.
+// RED-ON-DISABLE: drop the `track(...)` wrapper on `finishBraceLevel`'s returned
+// aggregate and the matching arm below goes red. ⚠ THAT USED TO NAME TWO SITES,
+// `lowerBraceInit`'s and `lowerUnionBraceInit`'s. There is ONE now: the brace-init
+// work-stack conversion folded the union arm in as a one-slot level, so every
+// level — struct, array and union alike — is `track`ed in one place.
 TEST(HirLoweringC, BraceInitAggregateCarriesASourceSpan) {
     SemanticModel model = analyzeC(
         "struct S { int a; int b; };\n"
@@ -6724,8 +6912,9 @@ TEST(HirLoweringC, D5_4_UnionChainedDesignatorEmitsDiag) {
     EXPECT_FALSE(res->ok);
 }
 
-// Union nested inside a struct: the recursive InitSlot path lands on
-// the union's `lowerUnionBraceInit` correctly + omitted struct slots
+// Union nested inside a struct: the InitSlot path lands on the union's own
+// level (`prepareUnionBraceInit` picks the variant, the brace-init work stack
+// runs it as a one-slot level) correctly + omitted struct slots
 // containing unions zero-fill via the corrected `synthZeroOrError`
 // Union arm (1-child first-variant).
 TEST(HirLoweringC, D5_4_UnionNestedInStruct) {
@@ -6772,8 +6961,9 @@ TEST(HirLoweringC, D5_4_UnionZeroFilledByContainingStruct) {
     EXPECT_EQ(res->hir.children(kids[1]).size(), 1u);
 }
 
-// Compound literal of union type: `(union U){.c='a'}` exercises
-// lowerCompoundLiteral → lowerBraceInit → lowerUnionBraceInit chain.
+// Compound literal of union type: `(union U){.c='a'}` exercises the
+// lowerCompoundLiteral → lowerBraceInit → openBraceLevel → prepareUnionBraceInit
+// chain (the union is a one-slot level of the brace-init work stack).
 TEST(HirLoweringC, D5_4_UnionCompoundLiteral) {
     SemanticModel model = analyzeC(
         "union U { int i; char c; };\n"

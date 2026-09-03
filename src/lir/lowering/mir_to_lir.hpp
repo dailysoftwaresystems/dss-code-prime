@@ -4,6 +4,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
 #include "core/types/object_format_kind.hpp"  // ExternCallDispatch (extern-call shape), AtomicsRuntime
+#include "core/types/symbol_attrs.hpp"        // SymbolBinding (the `indirectSlotBindings` narrowing axis)
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
@@ -377,6 +378,25 @@ lowerToLir(Mir const&          mir,
            // no shipped format today — the arm pins a RULE, not a platform.
            // Trailing (like `wideFloatSoftcallLibrary`) so
            // existing positional callers are unaffected. Defaults to nullopt.
-           std::optional<AtomicsRuntime> atomicsRuntime = std::nullopt);
+           std::optional<AtomicsRuntime> atomicsRuntime = std::nullopt,
+           // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT: WHICH
+           // symbol BINDINGS the `indirect-slot` dispatch above applies to,
+           // read from `ObjectFormatSchema::indirectSlotBindings()` one level
+           // up — the DECLARED narrowing, verbatim. EMPTY (the default, and
+           // every format that does not declare the key) = the dispatch is
+           // UNNARROWED: every import takes the slot, which is the meaning
+           // `indirect-slot` carried before the key existed, so every caller
+           // that threads nothing keeps exactly the behaviour it asserted.
+           // Consulted ONLY under `externCallDispatch == indirect-slot`; a
+           // `direct-plt` or nullopt module ignores it entirely.
+           //
+           // ⓘ THE RULE THAT DECIDES THE SET HAS ONE OWNER AND IT IS NOT HERE:
+           // `ObjectFormatSchema::externRefTakesImportSlot` — the linker's slot
+           // pass calls it directly, and the two tiers must agree symbol for
+           // symbol or the object is miscompiled in one direction or the other
+           // (a slot nothing derefs, or a direct call retargeted at pointer
+           // bytes). What is threaded here is the DECLARED DATA that rule reads,
+           // not a second copy of the rule.
+           std::vector<SymbolBinding> indirectSlotBindings = {});
 
 } // namespace dss

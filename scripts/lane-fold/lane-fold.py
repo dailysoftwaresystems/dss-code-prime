@@ -96,6 +96,10 @@ Usage:
     python scripts/lane-fold/lane-fold.py seed <lane> --empty   # created at HEAD and
                                           #   given nothing: record the manifest only
     python scripts/lane-fold/lane-fold.py fold <lane> [--apply]     # dry run without --apply
+    python scripts/lane-fold/lane-fold.py refresh-plans <lane> [--apply]
+                                          #   re-copy .plans/ into a LIVE lane and
+                                          #   update its manifest, so a row applied
+                                          #   mid-cycle stops reddening its guards
     python scripts/lane-fold/lane-fold.py list
     python scripts/lane-fold/lane-fold.py --self-test
 """
@@ -344,6 +348,76 @@ def cmd_seed(root, lane, empty=False, force=False):
     print("lane-fold: seeded lane %s with %d path(s) from the main tree"
           % (lane, len(manifest)))
     print("lane-fold: manifest %s" % os.path.relpath(mpath, root).replace("\\", "/"))
+    return 0
+
+
+# ─────────────────────────────── refresh-plans ─────────────────────────────────
+
+# ★★ THE ONE TREE A LIVE LANE MAY BE RE-SEEDED FROM, AND WHY IT IS SAFE WHERE A BULK
+# RE-SEED IS NOT. `seed` refuses a working worktree because the copy overwrites files
+# the lane is mid-edit on and the lane never re-reads a file it believes it owns. That
+# reasoning is about SOURCE. `.plans/**` is different in the one way that matters: no
+# lane owns it (the orchestrator does), nothing compiles it, and no lane's binaries can
+# change because of it.
+#
+# ⚠ ✔MEASURED 2026-09-02 (P54, lane `ar`): a lane's `anchor_registry_guard` reds for an
+# anchor whose row IS registered in the main tree, because the lane holds the snapshot
+# `seed` took before the orchestrator applied that row. **A false red every lane hits**,
+# and the dangerous half is that a lane learns to discount that guard — which is the one
+# instrument that catches an id cited in `src/` with no row anywhere.
+#
+# ★ AND UPDATING THE MANIFEST IS HALF THE FIX, not bookkeeping. A refreshed path whose
+# manifest md5 is also updated becomes INHERITED at fold time, so the fold subtracts it
+# by construction. Without that, the refresh would make `.plans/` look like the lane's
+# own change and the fold would try to write a stale registry back over the live one —
+# which is what `--settled` has been working around by hand, once per lane, all cycle.
+def cmd_refresh_plans(root, lane, apply_it):
+    wt = worktree_path(root, lane)
+    mpath = manifest_path(root, lane)
+    if not os.path.isdir(wt):
+        die("no worktree at %s" % wt)
+    if not os.path.isfile(mpath):
+        die("no seed manifest at %s -- refresh only makes sense for a seeded lane"
+            % mpath)
+    seed = json.load(io.open(mpath, encoding="utf-8"))
+
+    live = sorted(q for q in set(changed_paths(root))
+                  if q.startswith(".plans/") and os.path.isfile(os.path.join(root, q)))
+    if not live:
+        print("lane-fold: the main tree has no changed .plans/ path -- nothing to refresh")
+        return 0
+
+    moved = []
+    for rel in live:
+        src, dst = os.path.join(root, rel), os.path.join(wt, rel)
+        if os.path.isfile(dst) and md5_file(dst) == md5_file(src):
+            continue
+        moved.append(rel)
+
+    # ⚠ THE LANE MUST NOT HAVE EDITED IT. If the worktree's copy differs from BOTH the
+    # seed md5 and the main tree's, something wrote it there -- refuse rather than
+    # silently discard a lane's edit to a file it was told not to touch.
+    conflicts = [rel for rel in moved
+                 if rel in seed and os.path.isfile(os.path.join(wt, rel))
+                 and md5_file(os.path.join(wt, rel)) != seed[rel]]
+    if conflicts:
+        die("the lane's own copy of %d path(s) differs from what it was seeded with, so "
+            "refreshing would DISCARD an edit made inside the worktree: %s"
+            % (len(conflicts), ", ".join(conflicts[:4])))
+
+    print("lane-fold: %d .plans/ path(s) would refresh into lane %s:" % (len(moved), lane))
+    for rel in moved:
+        print("   %s" % rel)
+    if not apply_it:
+        print("lane-fold: dry run. pass --apply to write.")
+        return 0
+
+    for rel in moved:
+        copy_atomic(os.path.join(root, rel), os.path.join(wt, rel))
+        seed[rel] = md5_file(os.path.join(wt, rel))
+    write_atomic(mpath, json.dumps(seed, indent=1, sort_keys=True))
+    print("lane-fold: REFRESHED %d path(s) and updated the manifest, so the fold now "
+          "subtracts them as INHERITED." % len(moved))
     return 0
 
 
@@ -673,6 +747,47 @@ def self_test():
                                encoding="utf-8").read())
         write_atomic(os.path.join(root, "shared.json"), '{"from":"folded-one"}\n')
 
+        # ── `refresh-plans`, and the arm ORDER carries the argument ────────────────
+        # (m) The orchestrator applies a row to `.plans/` MID-CYCLE, so a live lane's
+        # copy goes stale and its `anchor_registry_guard` reds for an anchor that IS
+        # registered. Refreshing must fix that WITHOUT the fold then trying to write the
+        # lane's stale registry back over the live one -- which is why the manifest is
+        # updated in the same step, making the path INHERITED by construction.
+        os.makedirs(os.path.join(root, ".plans"), exist_ok=True)
+        os.makedirs(os.path.join(wt, ".plans"), exist_ok=True)
+        write_atomic(os.path.join(root, ".plans", "reg.md"), "row A\nrow B\n")
+        write_atomic(os.path.join(wt, ".plans", "reg.md"), "row A\n")
+        seed_before = json.load(io.open(manifest_path(root, "x"), encoding="utf-8"))
+        cmd_refresh_plans(root, "x", apply_it=True)
+        seed_after = json.load(io.open(manifest_path(root, "x"), encoding="utf-8"))
+        pin(io.open(os.path.join(wt, ".plans", "reg.md"), encoding="utf-8").read()
+            == "row A\nrow B\n",
+            "(m) refresh-plans carries a mid-cycle registry edit into a LIVE lane")
+        pin(seed_after.get(".plans/reg.md") != seed_before.get(".plans/reg.md")
+            and seed_after.get(".plans/reg.md") is not None,
+            "(m2) ...and UPDATES the manifest, so the fold subtracts it as inherited",
+            "before=%r after=%r" % (seed_before.get(".plans/reg.md"),
+                                    seed_after.get(".plans/reg.md")))
+        _m5, _d5, inh5, _r5, _s5 = classify(
+            root, wt, json.load(io.open(manifest_path(root, "x"), encoding="utf-8")))
+        pin(".plans/reg.md" in inh5,
+            "(m3) CONTROL: the refreshed path is INHERITED at fold time, not written back",
+            "inherited=%s" % [q for q in inh5 if q.startswith(".plans/")])
+        # (m4) THE REFUSAL: if the LANE itself edited the file, refreshing would discard
+        # that edit -- so it must refuse rather than silently overwrite.
+        write_atomic(os.path.join(root, ".plans", "reg.md"), "row A\nrow B\nrow C\n")
+        write_atomic(os.path.join(wt, ".plans", "reg.md"), "the lane wrote this\n")
+        try:
+            cmd_refresh_plans(root, "x", apply_it=True)
+            refused_lane_edit = False
+        except SystemExit as exc:
+            refused_lane_edit = exc.code == 2
+        pin(refused_lane_edit
+            and io.open(os.path.join(wt, ".plans", "reg.md"),
+                        encoding="utf-8").read() == "the lane wrote this\n",
+            "(m4) ...and REFUSES when the lane's own copy diverged from its seed, "
+            "leaving that copy untouched")
+
         # (e) THE REFUSAL THAT PROTECTS A RUNNING LANE. By this point the lane has
         # edits of its own, so a second `seed` must refuse rather than overwrite
         # them. This is the arm with teeth: every other failure here costs a rerun,
@@ -853,8 +968,8 @@ def main(argv):
     root = repo_root(override)
     if verb == "list":
         return cmd_list(root)
-    if verb not in ("seed", "fold"):
-        die("unknown verb %r -- expected seed, fold or list." % verb, 3)
+    if verb not in ("seed", "fold", "refresh-plans"):
+        die("unknown verb %r -- expected seed, fold, refresh-plans or list." % verb, 3)
     if not rest or rest[0].startswith("-"):
         die("verb %s needs a lane name." % verb, 3)
     lane = rest[0]
@@ -863,6 +978,8 @@ def main(argv):
     if verb == "seed":
         return cmd_seed(root, lane, empty="--empty" in rest,
                         force="--force" in rest)
+    if verb == "refresh-plans":
+        return cmd_refresh_plans(root, lane, apply_it="--apply" in rest)
     # `--settled <path>` is repeatable; see `classify` for why it exists and for the
     # measurement that the refusal message previously promised something impossible.
     settled, j = [], 0

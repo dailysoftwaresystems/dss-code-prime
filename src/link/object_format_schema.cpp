@@ -568,6 +568,43 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET.");
     }
 
+    // ── D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
+    //    a narrowing needs something to narrow ────────────────────────────
+    //
+    // `indirectSlotBindings` says WHICH imports the `indirect-slot` dispatch
+    // applies to. Under any other dispatch NO import takes the slot, so the
+    // list would name a rule nothing consults — config that reads as a
+    // capability and is not one, the D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE
+    // shape. Refused rather than ignored, because the direction of the
+    // mistake is the dangerous one: a format author who narrows the wrong key
+    // gets an object that still carries the unnarrowed cost and a document
+    // that says otherwise.
+    //
+    // ⓘ BOTH KEYS ARE IN `data`, so unlike the `objectImportSlot` pairing rule
+    // above this one belongs HERE rather than at the linker: it needs no
+    // `isImageFlavor()` backend question. The IMAGE side is covered without a
+    // second rule — no image format declares `indirect-slot` (their walkers
+    // point an extern's VA at a callable thunk), so this arm already refuses
+    // the narrowing on every one of them.
+    if (!indirectSlotBindings.empty()
+        && externCallDispatch != ExternCallDispatch::IndirectSlot) {
+        fail("/indirectSlotBindings",
+             std::string{"'indirectSlotBindings' narrows which imports take "
+                         "the import-slot shape, but this format declares "}
+                 + (externCallDispatch.has_value()
+                        ? std::string{"'externCallDispatch: "}
+                              + std::string{externCallDispatchName(
+                                    *externCallDispatch)} + "'"
+                        : std::string{"no 'externCallDispatch'"})
+                 + ", under which no extern reference takes a slot at all — "
+                   "so the list narrows nothing and no consumer reads it. "
+                   "Declare 'externCallDispatch: "
+                 + std::string{externCallDispatchName(
+                       ExternCallDispatch::IndirectSlot)}
+                 + "' too, or remove the narrowing. "
+                   "D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT.");
+    }
+
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): container rules ──
     //
     // `container: archive` is a STATIC-LIBRARY format: its driver output is

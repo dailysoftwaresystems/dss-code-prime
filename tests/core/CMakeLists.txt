@@ -176,6 +176,12 @@ dss_add_test(NAME core/type_lattice/test_type_interner SOURCES type_lattice/test
 dss_add_test(NAME core/type_lattice/test_type_registry SOURCES type_lattice/test_type_registry.cpp)
 dss_add_test(NAME core/type_lattice/test_type_reintern SOURCES type_lattice/test_type_reintern.cpp)
 dss_add_test(NAME core/test_type_layout                SOURCES test_type_layout.cpp)
+# P55 lane `tl` — "depth costs heap, not host call frames", the TYPE/const-eval
+# tier (D-CORE-TYPE-LAYOUT-AND-HIR-CONST-EVAL-RECURSE-PER-LEVEL). Its OWN binary
+# because a red here is a STACK OVERFLOW, which kills the process and would take
+# every sibling test in a shared executable down unattributably with it.
+dss_add_test(NAME core/test_deep_type_layout_costs_heap
+             SOURCES test_deep_type_layout_costs_heap.cpp)
 dss_add_test(NAME core/test_aggregate_abi              SOURCES test_aggregate_abi.cpp)
 # D-CSUBSET-BITFIELD-ABI-EXACT: the CI cross-compile-COMPARE witness — builds the
 # struct battery with the host's NATIVE C compiler (cl.exe / gcc / clang) and

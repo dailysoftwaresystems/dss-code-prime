@@ -264,6 +264,25 @@ struct DSS_EXPORT AsmResolvedRegister {
     // table is two chances to disagree about which row a spelling matched.
     bool          hasImmediate = false;
     std::int64_t  value        = 0;
+    // ★★★ THE SPELLING THAT WAS LOOKED UP IS A REGISTER **NAME** THE TARGET
+    // DECLARES UNSPELLABLE WITHOUT A LANE ARRANGEMENT
+    // ([[D-ASM-ARM64-BARE-V-REGISTER-ACCEPTED-IN-A-SCALAR-MEMORY-OPERAND]]).
+    //
+    // ⚠ IT IS A FACT ABOUT THE **SPELLING**, NOT ABOUT THE REGISTER, and the
+    // distinction is the whole of the field: `q0` and `v0` are ONE ordinal, and
+    // only one of them carries this. So it is decided at the lookup — where the
+    // written key and the row's canonical name are both in hand — and never
+    // re-derived downstream from the resolved register, which no longer knows
+    // which of its spellings was written.
+    // ⓘ A template placeholder (`%0`) is bound by the CALLER and names no row,
+    // so it can never carry this; only a physical spelling written in the
+    // assembly text can.
+    bool spellingRequiresLaneArrangement = false;
+    // The spelling to offer INSTEAD, when the one above is set — the row's
+    // first `aliases` entry, which `TargetSchema::validate` requires such a row
+    // to declare precisely so this is never empty. Points into the schema,
+    // which outlives every lowering.
+    std::string_view bareSpellingAlternative;
 };
 
 // The three answers a register lookup can give, and they are three rather than

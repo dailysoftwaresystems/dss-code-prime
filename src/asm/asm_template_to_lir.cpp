@@ -1973,6 +1973,50 @@ struct AsmInstructionLowering::Impl {
         out.regWidthBits = resolved.widthBits;
         out.reg          = resolved.reg;
         out.regClass     = resolved.regClass;
+        // ★★★ A REGISTER NAME THE TARGET DECLARES UNSPELLABLE BARE, WRITTEN
+        // BARE. The anchor, whole on its own line so a grep finds it:
+        // [[D-ASM-ARM64-BARE-V-REGISTER-ACCEPTED-IN-A-SCALAR-MEMORY-OPERAND]]
+        // ✔MEASURED 2026-09-03 at the P55 base: `ldr v0,[x9,#16]`
+        // compiled rc=0 and emitted 0x3DC00520, which disassembles as
+        // `ldr q0,[x9,#16]` — byte-identical to what gas 2.42 and clang 18.1.3
+        // emit for the `q0` SPELLING, and both of them REFUSE the `v0` one
+        // (`Error: unexpected register type at operand 1` / `invalid operand
+        // for instruction`). So DSS shipped an UNDECLARED ALIAS: the bytes were
+        // right and the accepted spelling was one no assembler would take, i.e.
+        // a `.s` DSS compiled and neither reference could.
+        // ★★ IT IS CHECKED **AFTER** THE RESOLVE AND **BEFORE** THE
+        // ARRANGEMENT IS APPLIED, which is the only ordering that works. Before
+        // the resolve there is no row to ask; after `applyArrangement` the
+        // distinction is gone, because that is where a lane spelling stops
+        // being distinguishable from a scalar one.
+        // ⚠ AND IT IS GATED ON `split.arrangement`, NOT ON THE WIDTH: `v0.16b`
+        // and a bare `v0` resolve to the SAME row at the SAME width, so a
+        // width test would refuse both or neither. What separates them is
+        // whether a suffix was WRITTEN, which is exactly what the split says.
+        if (split.arrangement == nullptr
+            && resolved.spellingRequiresLaneArrangement) {
+            // ⚠ THE MESSAGE IS BUILT FROM DECLARED VOCABULARY ONLY — the
+            // dialect's own arrangement suffixes and the row's own alias — so
+            // it stays true for any target that sets the key and needs no
+            // per-arch string. `validate()` guarantees the alias is there.
+            std::string suffixes;
+            for (auto const& a : cfg_.registerArrangements) {
+                suffixes += suffixes.empty() ? "" : ", ";
+                suffixes += name;
+                suffixes += a.suffix;
+            }
+            sink_.fail(node,
+                 std::format("'{}' is a register NAME this target does not "
+                             "admit as an operand on its own: it denotes the "
+                             "register only with a lane arrangement written on "
+                             "it. Write '{}' for the scalar view of the same "
+                             "register, or one of the lane views ({}){}",
+                             name, resolved.bareSpellingAlternative,
+                             suffixes.empty() ? "this dialect declares none"
+                                              : suffixes,
+                             sink_.pairSuffix()));
+            return std::nullopt;
+        }
         if (split.arrangement != nullptr
             && !applyArrangement(*split.arrangement, name, node, out)) {
             return std::nullopt;
@@ -2594,13 +2638,25 @@ struct AsmInstructionLowering::Impl {
         // v1.8b` writes a SCALAR destination out of a lane-arranged source and
         // `cnt v0.8b, v1.8b` writes a lane-arranged one, so the destination's
         // own reading is not derivable from the sources'.
+        // ⚠ AND ITS **ORDINAL**, which is the fourth fact of the same kind and
+        // the one that says WHICH REGISTER, not merely what shape it has.
+        // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
+        // `mov sp, x0` and `mov xzr, x0` are two different instructions whose
+        // destinations agree on bank, width and lanes and differ only in which
+        // of two rows at one `hwEncoding` was written. Only a PHYSICAL register
+        // has an ordinal in the target's table — a template operand bound to a C
+        // value is a vreg, whose id numbers a different space entirely.
         asm_elect::ElectedDestination const destProfile =
             (dest.isMemory || dest.role != AsmOperandRole::Register)
                 ? asm_elect::ElectedDestination{}
                 : asm_elect::ElectedDestination{
                       dest.regClass,
                       static_cast<std::uint8_t>(dest.regWidthBits),
-                      static_cast<std::uint8_t>(dest.regLaneBits)};
+                      static_cast<std::uint8_t>(dest.regLaneBits),
+                      dest.reg.isPhysical != 0
+                          ? std::optional<std::uint16_t>{
+                                static_cast<std::uint16_t>(dest.reg.id)}
+                          : std::nullopt};
 
         // ── SHAPE 3: memory destination. Sources, then the address tail. Only
         // a non-producer can take it — that is the `store` shape.
@@ -2614,7 +2670,8 @@ struct AsmInstructionLowering::Impl {
             // target declare `cmp mem, reg` (39 /r) apart from the
             // byte-identical operand list of `cmp reg, mem` (3B /r).
             auto const chosen =
-                electAmong(consumers, operands, widthBits, true, ins);
+                electAmong(consumers, operands, widthBits, true, ins, {},
+                           row.opcodesAreRankedEncodings);
             if (!chosen.has_value()) return;
             if (!checkElectedWidth(*chosen, *width, ins)) return;
             // ⚠ THE FLAG IS STAMPED ON THE INSTRUCTION, NOT MERELY USED FOR
@@ -2640,7 +2697,8 @@ struct AsmInstructionLowering::Impl {
         // The destination here is a REGISTER; any memory reference is a
         // SOURCE, so the memory-direction axis is `false`.
         Election pe = electQuiet(producers, sources, widthBits, false,
-                                 destProfile);
+                                 destProfile,
+                                 row.opcodesAreRankedEncodings);
         if (!pe.ambiguousWith.empty()) {
             reportAmbiguous(ins, pe, widthBits);
             return;
@@ -2655,7 +2713,8 @@ struct AsmInstructionLowering::Impl {
             OperandList twoAddr = OperandList::prefixedWith(
                 LirOperand::makeReg(destReg), dest.regLaneBits, sources);
             Election t = electQuiet(producers, twoAddr, widthBits, false,
-                                    destProfile);
+                                    destProfile,
+                                    row.opcodesAreRankedEncodings);
             if (!t.ambiguousWith.empty()) {
                 reportAmbiguous(ins, t, widthBits);
                 return;
@@ -2721,7 +2780,8 @@ struct AsmInstructionLowering::Impl {
             (anyMemory && !producers.empty())
                 ? Election{}
                 : electQuiet(consumers, destFirst, widthBits, false,
-                             destProfile);
+                             destProfile,
+                             row.opcodesAreRankedEncodings);
         if (!ce.ambiguousWith.empty()) {
             reportAmbiguous(ins, ce, widthBits);
             return;
@@ -2870,14 +2930,16 @@ struct AsmInstructionLowering::Impl {
                OperandList const& operands,
                std::uint8_t widthBits,
                bool memoryIsDestination,
-               asm_elect::ElectedDestination const& destination = {}) const {
+               asm_elect::ElectedDestination const& destination = {},
+               bool rankedEncodings = false) const {
         Election e;
         if (names.empty()) return e;
         e.opcode = asm_elect::electOpcode(target_, names, operands.view(),
                                           widthBits, memoryIsDestination,
                                           destination,
                                           &e.rejections,
-                                          &e.ambiguousWith);
+                                          &e.ambiguousWith,
+                                          rankedEncodings);
         if (!e.ambiguousWith.empty()) {
             // `electOpcode` returns nullopt on ambiguity; recover the FIRST
             // winner's name for the message by replaying against the prefix
@@ -2897,7 +2959,8 @@ struct AsmInstructionLowering::Impl {
                 // one real winner and one that never was.
                 if (v != nullptr
                     && asm_elect::variantAcceptsRegisterProfile(
-                           info->encoding, *v, operands.view(), destination)) {
+                           target_, info->encoding, *v, operands.view(),
+                           destination)) {
                     e.firstWinner = name;
                     break;
                 }
@@ -2951,9 +3014,11 @@ struct AsmInstructionLowering::Impl {
                OperandList const& operands, std::uint8_t widthBits,
                bool memoryIsDestination,
                AsmDecodedInstruction const& ins,
-               asm_elect::ElectedDestination const& destination = {}) {
+               asm_elect::ElectedDestination const& destination = {},
+               bool rankedEncodings = false) {
         Election e = electQuiet(names, operands, widthBits,
-                                memoryIsDestination, destination);
+                                memoryIsDestination, destination,
+                                rankedEncodings);
         if (e.opcode.has_value()) return e.opcode;
         if (!e.ambiguousWith.empty()) {
             reportAmbiguous(ins, e, widthBits);
@@ -3320,6 +3385,24 @@ AsmRegisterLookup resolvePhysicalRegister(TargetSchema const&  target,
         return AsmRegisterLookup::Reported;
     }
     out.widthBits = static_cast<std::uint32_t>(info->widthBytes) * 8u;
+    // ★★★ ASKED HERE AND NOWHERE ELSE, BECAUSE THIS IS THE LAST POINT AT WHICH
+    // THE **WRITTEN SPELLING** AND THE **ROW** ARE BOTH IN HAND.
+    // [[D-ASM-ARM64-BARE-V-REGISTER-ACCEPTED-IN-A-SCALAR-MEMORY-OPERAND]].
+    // `registerIndex` maps a row's name and every one of its `aliases` to ONE
+    // ordinal, so one line below this the resolved register can no longer say
+    // which of its spellings was typed — and the flag governs exactly one of
+    // them. ⚠ THE COMPARISON IS AGAINST THE ROW'S CANONICAL NAME, so an alias
+    // (`q0`) is never caught by a flag its row sets for `v0`.
+    // ⓘ `spelling` arrives already folded by the dialect's `spellingCase`, and
+    // a target's register names are its own canonical spelling — the same pair
+    // `registerByName` above was matched with, so this comparison agrees with
+    // that lookup by construction rather than by a second convention.
+    if (info->nameRequiresLaneArrangement && spelling == info->name) {
+        out.spellingRequiresLaneArrangement = true;
+        if (!info->aliases.empty()) {
+            out.bareSpellingAlternative = info->aliases.front();
+        }
+    }
     std::uint16_t resolved = *ordinal;
     for (int hop = 0; !info->subOf.empty(); ++hop) {
         auto const parent = target.registerByName(info->subOf);

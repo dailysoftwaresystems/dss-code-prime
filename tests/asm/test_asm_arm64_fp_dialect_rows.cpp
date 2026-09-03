@@ -400,11 +400,19 @@ TEST(AsmArm64FpDialectRows, FmovSingleIsNotTheDoubleWord) {
     // `.arch armv8.2-a+fp16`) and the reasoning attached to them inverted the
     // disjunction: it makes a construct required when SOME reference accepts
     // it, and forbidden when NONE does.
-    // ⓘ THE fp16 STORY IS PER-INSTRUCTION, NOT PER-WIDTH. The fp16 CONVERSIONS
+    // ⓘ THE fp16 STORY IS PER-INSTRUCTION, NOT PER-WIDTH. The fp16 FCVT forms
     // are base ARMv8-A and both references assemble them (`fcvt h0, s1` =
-    // 0x1E23C020, `fcvt s0, h1` = 0x1EE24020), so DSS is BELOW the union there
-    // and that gap is its own row:
+    // 0x1E23C020, `fcvt s0, h1` = 0x1EE24020), so DSS WAS BELOW the union there
+    // — closed 2026-09-02 (cycle P55, lane fp) by the target opcode `fpcvt_h`,
+    // and all four words are pinned in
+    // `tests/asm/test_asm_arm64_conversion_dialect_rows.cpp`:
     // [[D-TARGET-ARM64-FP16-CONVERSION-FORMS-UNDECLARED]].
+    // ⚠ THAT SENTENCE SAID *the fp16 CONVERSIONS* AND THE SET IS NARROWER THAN
+    // IT SOUNDS, ✔RE-MEASURED in P55: only FCVT (float↔float) has half arms at
+    // the default -march. `fcvtzs w0, h1`, `fcvtzs x0, h1`, `scvtf h0, w1`,
+    // `scvtf h0, x1`, `fcvtns w0, h1` and `fcvtas w0, h1` are ALL refused by
+    // BOTH references, so the fp16 INTEGER conversions sit beside `fmov h0, h1`
+    // on the `FEAT_FP16` side of this same fence.
     auto const h = runFp2("fmov %h0, %h1\n", 16);
     ASSERT_TRUE(h->parsed) << messages(*h);
     EXPECT_FALSE(h->ok)

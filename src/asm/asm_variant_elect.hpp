@@ -134,6 +134,18 @@ struct ElectedDestination {
     // comparison" would restore exactly the leak this axis closes — ✔MEASURED
     // at the P54 base, `cnt d0, d1` compiled and emitted `cnt v0.8b, v1.8b`.
     std::uint8_t laneBits  = 0;
+    // ★★★ THE DESTINATION REGISTER'S **ORDINAL**, so the shared-encoding role
+    // axis can ask the target's table which register was written.
+    // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
+    //
+    // ⚠ IT IS AN ORDINAL AND NOT A PRE-RESOLVED ROLE STRING, because the caller
+    // that knows the spelling is not the one that owns the meaning: resolving
+    // the role at the call site would put a second reader of `registers[]` in
+    // `asm_template_to_lir.cpp`, and two readers of one table are how a fact
+    // drifts. `nullopt` = the destination is not a register (a memory
+    // destination, or a non-producer), which is exactly the state `regClass ==
+    // None` above already describes.
+    std::optional<std::uint16_t> regOrdinal;
 };
 
 // ★★★ THE OPERANDS AN ELECTION IS ASKED ABOUT, AND THE LANE ARRANGEMENT EACH
@@ -223,11 +235,41 @@ struct ElectedOperands {
 // AGNOSTIC by the same construction the class axis has: the numbers come from
 // the target's own wires and the dialect's own arrangement table, and nothing
 // here knows what a byte lane is.
+//
+// ★★★ AND THE **SHARED-ENCODING ROLE** AXIS, THE THIRD OF THE SAME KIND.
+// [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
+//
+// Two registers may be different registers at ONE number in an instruction's
+// register field, and which one a field means is a property of the FIELD.
+// ✔MEASURED at the P55 base: `mov x0, sp` emitted 0xAA1F03E0 (`mov x0, xzr` —
+// x0 got ZERO) and `mov sp, x0` emitted 0xAA0003FF (a NO-OP), because `sp` and
+// `xzr` share `hwEncoding` 31 and every election axis was blind to which one
+// had been written. gas 2.42 and clang 18.1.3, probed SEPARATELY and agreeing
+// on all 128 probes of that census, emit 0x910003E0 / 0x9100001F — the
+// ADD-immediate alias, a DIFFERENT INSTRUCTION.
+//
+// ★★ IT ELIMINATES A CANDIDATE OPCODE, NEVER A VARIANT — the same soundness
+// argument the class axis makes above, and here it is what makes the fix
+// possible at all: the ORR form and the ADD form are two OPCODES, so election
+// choosing between them hands the encoder an opcode whose own variant set it
+// re-selects from unambiguously. A role axis inside `variantMatchesInst` would
+// have had to carry the register TABLE into a matcher that has only operands.
+//
+// ★ `requiresRegRole` IS THE SECOND HALF AND IT IS NOT SYMMETRIC WITH THE
+// OTHERS. The per-field roles say which registers a form ACCEPTS; that alone
+// leaves the SP form accepting `mov x0, x1` too (neither operand carries a
+// role, so both fit every field) and the election would report an ambiguity on
+// the commonest line in the dialect. `requiresRegRole` states the ARM ARM's own
+// alias condition — *this encoding is what the mnemonic means only when a
+// register in this role is named* — so the choice is a refusal rather than a
+// declaration order.
 [[nodiscard]] inline bool
-variantAcceptsRegisterProfile(TargetEncodingInfo const&    enc,
+variantAcceptsRegisterProfile(TargetSchema const&          target,
+                              TargetEncodingInfo const&    enc,
                               TargetEncodingVariant const& v,
                               ElectedOperands const&       instOps,
                               ElectedDestination const&    dest) noexcept {
+    bool sawRequiredRole = v.requiresRegRole.empty();
     for (auto const& w : v.wires) {
         if (w.index >= instOps.ops.size()) continue;
         auto const& op = instOps.ops[w.index];
@@ -235,13 +277,68 @@ variantAcceptsRegisterProfile(TargetEncodingInfo const&    enc,
         auto const written = instOps.laneOf(w.index);
         if (w.lanes != (written != 0)) return false;
         if (w.lanes && w.laneBits != 0 && w.laneBits != written) return false;
+        // ⚠ ONLY A **PHYSICAL** REGISTER HAS A ROLE, and the guard is not
+        // defensive: a pre-regalloc `LirReg` numbers a VIRTUAL register in its
+        // own space, so `id` would index the target's register table by
+        // coincidence and read some unrelated row's role. An embedded inline-asm
+        // template operand bound to a C value is exactly that shape.
+        //
+        // ★ A VREG IS ROLE-**LESS**, WHICH IS THE TRUE ANSWER AND NOT A SOFTENED
+        // ONE: it will be assigned out of the calling convention's allocatable
+        // pools, and a register that shares its encoding is in none of them, so
+        // it can only ever become one of the ordinary registers that are the
+        // same number in every reading. `mov sp, %0` is legal for exactly that
+        // reason — the SP-reading `rn` field takes any non-31 register.
+        if (op.reg.isPhysical != 0) {
+            auto const ordinal = static_cast<std::uint16_t>(op.reg.id);
+            if (!target.registerFitsFieldRole(ordinal, w.regRole)) return false;
+            if (!sawRequiredRole
+                && target.registerEncodingRole(ordinal) == v.requiresRegRole) {
+                sawRequiredRole = true;
+            }
+        }
         auto const wants = encodingWireRegClass(enc, w);
         if (!wants.has_value()) continue;
         auto const has = static_cast<TargetRegClass>(op.reg.regClass());
         if (has == TargetRegClass::None) continue;
         if (has != *wants) return false;
     }
-    if (!v.resultSlot.has_value()) return true;
+    // ⚠⚠ A VARIANT WITH NO `resultSlot` HAS NO RESULT FIELD, AND ITS
+    // `ElectedDestination` IS AN **INPUT** — the shape every non-producer takes,
+    // where the destination-position operand is prepended to the operand list
+    // and reaches the variant as a WIRE. ✔MEASURED while building this axis:
+    // asking the result-role question there refused `cmp sp, #16` (which both
+    // references assemble, 0xF10043FF) because `sp` was tested against an empty
+    // `resultRegRole` on a variant whose `rn` wire had already accepted it. The
+    // early-out is the same one `destWidth` and `destLanes` below sit behind,
+    // and for the same reason.
+    if (!v.resultSlot.has_value()) return sawRequiredRole;
+    if (dest.regOrdinal.has_value()) {
+        if (!target.registerFitsFieldRole(*dest.regOrdinal, v.resultRegRole)) {
+            return false;
+        }
+        // ★★★ AND EVERY **OTHER PLACEMENT** OF THE SAME RESULT REGISTER, because
+        // a multi-word macro's words can read one encoding differently.
+        // ✔MEASURED 2026-09-03: `adr xzr, main` compiled rc=0 and emitted
+        // `adrp xzr, main` followed by `add sp, sp, #:lo12:main` — arm64's
+        // `lea` places its destination in an ADRP word (Rd = the zero
+        // register) AND an ADD-immediate word (Rd = the stack pointer), and
+        // asking only the primary slot let the second word overwrite SP with a
+        // relocated address. A register must fit them ALL, which leaves a
+        // disagreeing macro accepting exactly the registers whose two readings
+        // are the same register — the honest answer.
+        for (auto const& x : v.extraResultSlots) {
+            if (!target.registerFitsFieldRole(*dest.regOrdinal, x.regRole)) {
+                return false;
+            }
+        }
+        if (!sawRequiredRole
+            && target.registerEncodingRole(*dest.regOrdinal)
+                   == v.requiresRegRole) {
+            sawRequiredRole = true;
+        }
+    }
+    if (!sawRequiredRole) return false;
     if (dest.regClass != LirRegClass::None) {
         auto const wants = encodingResultRegClass(enc, v);
         if (wants.has_value()
@@ -284,6 +381,24 @@ variantAcceptsRegisterProfile(TargetEncodingInfo const&    enc,
 // dialect row cannot say which instruction the programmer wrote, and picking
 // the first would be a coin flip baked into config order.
 //
+// ★★★ UNLESS THE DIALECT HAS DECLARED THE LIST **RANKED**
+// (`AsmInstructionSpelling::opcodesAreRankedEncodings`,
+// [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]]), WHICH IS THE ONE
+// CASE THE OBJECTION ABOVE DOES NOT COVER. It assumes a tie means the row
+// cannot say which INSTRUCTION was written — true when the candidates are
+// different instructions, and false when they are two ENCODINGS of one
+// operation, because then the programmer never chose between them. ✔MEASURED
+// 2026-09-03 on gas 2.42 and clang 18.1.3 (probed SEPARATELY, agreeing, and
+// NEITHER warning): `ldr h0,[x1,#2]` is the scaled 0x7D400420 and
+// `ldr h0,[x1,#1]` the unscaled 0x7C401020 — one spelling, the assembler
+// picking the encoding, scaled preferred where both fit.
+// ⚠ THE RANK CHOOSES ONLY AMONG CANDIDATES THAT ALL **FIT**: a candidate is
+// reached only after its own variant guard accepted these operands, so the
+// order can never select a form that cannot carry the value. That property is
+// the guards' to keep, and it is why `guard.immMultipleOf` had to exist before
+// this flag could be safe — a range-only guard matches offsets its encoder
+// refuses, and ranking would then hand the operation to exactly that form.
+//
 // `rejections` (when non-null) collects one row per eliminated candidate for
 // the caller's diagnostic.
 [[nodiscard]] inline std::optional<ElectedOpcode>
@@ -294,7 +409,8 @@ electOpcode(TargetSchema const&               target,
             bool                              memoryIsDestination,
             ElectedDestination const&         destination,
             std::vector<ElectionRejectionRow>* rejections,
-            std::string*                       ambiguousWith) {
+            std::string*                       ambiguousWith,
+            bool                               rankedEncodings = false) {
     std::optional<ElectedOpcode> winner;
     for (auto const& name : candidateNames) {
         auto const ordinal = target.opcodeByMnemonic(name);
@@ -329,14 +445,20 @@ electOpcode(TargetSchema const&               target,
         // DIFFERENT variant of this opcode would elect bytes the encoder then
         // could not reach. If the variant this opcode offers cannot take these
         // banks, the OPCODE is not what was written.
-        if (!variantAcceptsRegisterProfile(info->encoding, *variant, instOps,
-                                           destination)) {
+        if (!variantAcceptsRegisterProfile(target, info->encoding, *variant,
+                                           instOps, destination)) {
             if (rejections != nullptr) {
                 rejections->push_back(
                     {name, ElectionRejection::WrongRegisterProfile});
             }
             continue;
         }
+        // ★ A RANKED LIST RETURNS AT THE **FIRST** MATCH RATHER THAN COMPARING
+        // — which is not merely the same answer reached differently: it means
+        // a later candidate is never evaluated at all, so a fallback encoding
+        // costs nothing on the common path and can never contribute an
+        // ambiguity of its own.
+        if (rankedEncodings) return ElectedOpcode{*ordinal, info, variant};
         if (winner.has_value()) {
             if (ambiguousWith != nullptr) *ambiguousWith = name;
             return std::nullopt;

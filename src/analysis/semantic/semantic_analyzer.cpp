@@ -1299,148 +1299,67 @@ void collectParamRowNodes(SchemaIndexes const& idx, SemanticConfig const& cfg,
                           Tree const& tree, NodeId cur,
                           std::vector<NodeId>& out);
 
-[[nodiscard]] std::optional<QualifierSpine>
-declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
-                     DeclaratorConfig const& dc, SchemaTokenId constMarker,
-                     std::unordered_map<std::uint32_t, std::size_t> const*
-                         declByRule,
-                     std::span<RuleId const> opaqueRules = {},
-                     SchemaTokenId restrictMarker = {},
-                     SchemaIndexes const* idx = nullptr, int nestDepth = 0) {
-    // No const marker declared for this row, or no head to read the base
-    // qualifier from ⇒ nothing can be claimed honestly.
-    if (!constMarker.valid() || !headNode.valid()) return std::nullopt;
-    bool const headConst = subtreeContainsToken(tree, headNode, constMarker,
-                                                declByRule, opaqueRules);
-    // The one-level answer: an abstract parameter with no declarator at all
-    // (`int f(const char)`), where the head IS the whole type. A one-level spine
-    // is a BASE and nothing else, so it can carry no restrict bit.
-    auto headOnly = [&] {
-        QualifierSpine sp;
-        sp.levels    = 1;
-        sp.constBits = headConst ? 1u : 0u;
-        return std::optional<QualifierSpine>{sp};
-    };
-    if (!dNode.valid() || tree.kind(dNode) != NodeKind::Internal) return headOnly();
-    // Descend a per-slot wrapper to the inner declaratorRule — the same descent
-    // `declaratorDeclaredType` and `declaratorObjectIsConst` both make.
-    NodeId       inner = dNode;
-    RuleId const dr    = tree.rule(dNode);
-    if (dr == dc.initDeclaratorRule
-        || (dc.memberDeclaratorRule.has_value() && dr == *dc.memberDeclaratorRule)) {
-        NodeId const d = declarator_walk_detail::firstChildOfRule(
-            TreeDeclaratorView{tree}, dNode, dc.declaratorRule);
-        if (!d.valid()) return std::nullopt;
-        inner = d;
-    }
-    if (tree.kind(inner) != NodeKind::Internal
-        || tree.rule(inner) != dc.declaratorRule) {
-        return headOnly();
-    }
-    // ── THE CONSTRUCTOR CHAIN, OUTERMOST FIRST ────────────────────────────────
-    //
-    // `ctors` accumulates one entry per DERIVATION LEVEL above the base, in the
-    // order a reader sees them (level 0 first), each carrying whether THAT level
-    // is const-qualified. The base is appended last, from the head qualifier.
-    //
-    // ★★ THE ORDERING RULE, DERIVED FROM `declaratorDeclaredType`'S OWN FOLD AND
-    // WRITTEN DOWN BECAUSE GETTING IT WRONG REFUSES LEGAL CODE. For a declarator
-    // `L* ( direct )` where `direct` is `(name | ( D' )) suffix*`, that fold:
-    //   (1) binds the pointer layers L innermost-first, so the LAST star in source
-    //       order is the outermost of that run;
-    //   (2) applies the direct's suffixes to the result, outermost suffix first;
-    //   (3) then, if the direct is a parenthesized GROUP, re-enters at the inner
-    //       declarator D' and applies ITS layers on top of all of that.
-    // So the whole chain is  ctors(D') ++ suffixes(D) ++ reverse(L(D)),  and the
-    // base sits under all of it. ✔CHECKED against the fold on four shapes:
-    //   `const char **p`   → [Ptr, Ptr] + base(const)              (no group)
-    //   `char *x[3]`       → [Array, Ptr] + base   (arrays OUTSIDE the stars)
-    //   `int (*p)[3]`      → [Ptr, Array] + base   (the group's star is outermost)
-    //   `const int (*)[3]` → [Ptr, Array] + base(const)
-    // The first two are the pre-group behaviour, unchanged byte-for-byte.
-    // One entry per derivation level above the base: `.first` = const on that
-    // level, `.second` = restrict on it. Two parallel vectors would let the two
-    // axes drift apart on a level, which is the one thing a positional claim may
-    // never do.
-    struct LevelQual { bool isConst = false; bool isRestrict = false; };
-    std::vector<LevelQual> ctors;
-    bool                   modelled = true;
-    std::vector<std::pair<std::uint8_t,
-                          std::shared_ptr<DeclaredQualification const>>> fnClaims;
+// ── ONE LEVEL OF A DECLARATOR'S GROUP CHAIN, READ EXACTLY ONCE ───────────────
+//
+// P55 ([[D-SEMANTIC-DEPTH-CAPS-TRUNCATE-INTO-TWO-WRONG-ANSWERS]]). The chain
+// `L* ( direct )` → `direct`'s group → its inner declarator → … is LINEAR: each
+// level has at most one group, so the descent is a loop and not a tree. Reading
+// each level's roles once, into an explicit heap vector, is what lets the spine
+// be assembled innermost-first afterwards WITHOUT the walk calling itself.
+struct DeclaratorChainLevel {
+    NodeId              group{};       // its direct's parenthesized group, if any
+    NodeId              fnSuffix{};    // its direct's function suffix, if any
+    std::size_t         arrays = 0;    // its direct's array suffixes
+    std::vector<NodeId> layers;        // its pointer layers, SOURCE order
+};
 
-    // ★★ P44 part (c) — THE NESTED PARAMETER CLAIM for a function LEVEL.
-    //
-    // It reads the fn suffix's own parameter list through the SAME two readers
-    // the outer harvest uses (`fnSuffixParamsRule` for the list,
-    // `collectParamRowNodes` for the rows), so the two cannot disagree about
-    // which nodes are parameters — and it recurses into THIS function for each
-    // row's spine, so a parameter that is itself a function pointer is claimed
-    // the same way at every depth.
-    //
-    // ⚠ IT RETURNS nullptr RATHER THAN AN EMPTY CLAIM WHENEVER ANYTHING IS
-    // UNREADABLE, and the oracle then does not judge that level. `nullptr` is
-    // "no claim"; an empty-but-present claim would read as "this function takes
-    // no qualified parameters", which is a statement, and a wrong one for every
-    // shape this walk cannot model.
-    //
-    // The depth cap is the same defence the group descent already carries: a
-    // corrupt or cyclic node graph becomes "no claim" instead of a hang.
-    auto nestedFnParamClaim =
-        [&](NodeId fnSuffix) -> std::shared_ptr<DeclaredQualification const> {
-        if (nestDepth >= 4 || idx == nullptr || idx->cfg == nullptr) return nullptr;
-        if (!dc.fnSuffixParamsRule.has_value() || !fnSuffix.valid()) return nullptr;
-        NodeId plist{};
-        for (NodeId c : visibleChildren(tree, fnSuffix)) {
-            if (tree.kind(c) == NodeKind::Internal
-                && tree.rule(c) == *dc.fnSuffixParamsRule) { plist = c; break; }
+// ★★ THE GROUP CHAIN, OUTERMOST → INNERMOST, ON AN EXPLICIT HEAP VECTOR AND WITH
+// NO DEPTH CAP. Returns false for a shape this walk does not model — the caller
+// then makes NO CLAIM, which is the only safe direction (redeclaration_compat.hpp,
+// "ABSENT IS NOT UNQUALIFIED").
+//
+// ⚠ THE `depth > 16` THIS REPLACES WAS NOT A LIMIT, IT WAS A DROPPED DIAGNOSTIC.
+// ✔MEASURED at this cycle's HEAD through the real CLI: `void h(const char *(…(*)…));`
+// beside its `char *` twin — one legal declaration and one ill-formed against it
+// under C23 6.7.6.1p2 — is DIAGNOSED at 16 nested parenthesized declarators and
+// **compiles rc=0 with ZERO diagnostics at 17**, because the truncated walk made
+// no claim and the oracle then did not judge the qualifier axis. ✔All four
+// references probed SEPARATELY diagnose it at 17, at 24 and at 100 nesting levels
+// (gcc 13.3.0 `-std=c2x`, clang 18.1.3 `-std=c23` and mingw-w64 gcc 13.2.0 as an
+// ERROR, MSVC 19.51.36252 `/std:clatest` as `warning C4028`), and ISO C23 5.2.4.1
+// obliges an implementation to support **63** nesting levels of parenthesized
+// declarators — so 16 was below the standard's own floor as well as below the
+// union.
+//
+// ★ TERMINATION IS STRUCTURAL, NOT BUDGETED: every level consumes a DISTINCT tree
+// node (each inner declarator is a strict descendant of the group it came from),
+// so the chain cannot be longer than the tree. That bound is CHECKED rather than
+// asserted in prose — a chain longer than the arena means the node graph is
+// cyclic, i.e. memory corruption or a TreeBuilder bug, and this fails loud on it
+// exactly as `Tree`'s own release-mode child-index guard does. It can never fire
+// on a well-formed tree, so it costs no user a program.
+[[nodiscard]] bool
+readDeclaratorChain(Tree const& tree, NodeId start, DeclaratorConfig const& dc,
+                    std::vector<DeclaratorChainLevel>& chain) {
+    chain.clear();
+    std::size_t const arenaBound = tree.nodeCount();
+    for (NodeId d = start;;) {
+        if (chain.size() > arenaBound) {
+            std::fputs("dss::semantic fatal: declarator group chain is longer "
+                       "than the tree it walks — the node graph is cyclic\n",
+                       stderr);
+            std::abort();
         }
-        if (!plist.valid()) return nullptr;
-        std::vector<NodeId> rows;
-        collectParamRowNodes(*idx, *idx->cfg, tree, plist, rows);
-        if (rows.empty()) return nullptr;
-        auto claim = std::make_shared<DeclaredQualification>();
-        claim->params.assign(rows.size(), std::nullopt);
-        bool any = false;
-        for (std::size_t i = 0; i < rows.size(); ++i) {
-            auto const pIt = idx->declByRule.find(tree.rule(rows[i]).v);
-            if (pIt == idx->declByRule.end()) continue;
-            auto const& pDecl = idx->cfg->declarations[pIt->second];
-            if (!pDecl.isDeclaratorMode() || !pDecl.constMarker.has_value())
-                continue;
-            auto const pKids = declRoleChildren(tree, rows[i], pDecl);
-            if (!pDecl.headChild.has_value() || *pDecl.headChild >= pKids.size())
-                continue;
-            NodeId pDeclarator{};
-            if (pDecl.declaratorChild.has_value()
-                && *pDecl.declaratorChild < pKids.size())
-                pDeclarator = pKids[*pDecl.declaratorChild];
-            claim->params[i] = declaratorConstSpine(
-                tree, pDeclarator, pKids[*pDecl.headChild], dc,
-                *pDecl.constMarker, declByRule, opaqueRules,
-                pDecl.restrictMarker.value_or(SchemaTokenId{}), idx,
-                nestDepth + 1);
-            if (claim->params[i].has_value()) any = true;
-        }
-        return any ? std::shared_ptr<DeclaredQualification const>(std::move(claim))
-                   : nullptr;
-    };
-    // Bounded, iterative-by-recursion over the group chain; the cap turns a
-    // corrupt/cyclic node graph into "no claim" rather than a hang, exactly as
-    // `declaratorObjectIsConst`'s own descent does.
-    auto collect = [&](auto&& self, NodeId d, int depth) -> void {
-        if (!modelled) return;
-        if (depth > 16 || !d.valid() || tree.kind(d) != NodeKind::Internal
-            || tree.rule(d) != dc.declaratorRule) {
-            modelled = false;
-            return;
-        }
-        std::vector<NodeId> layers;   // source order: [0] innermost … [k-1] outermost
-        NodeId              direct{};
+        if (!d.valid() || tree.kind(d) != NodeKind::Internal
+            || tree.rule(d) != dc.declaratorRule)
+            return false;
+        DeclaratorChainLevel lvl;
+        NodeId direct{};
         for (NodeId c : visibleChildren(tree, d)) {
             if (tree.kind(c) != NodeKind::Internal) continue;
             RuleId const cr = tree.rule(c);
             if (cr == dc.pointerLayerRule) {
-                layers.push_back(c);
+                lvl.layers.push_back(c);
             } else if (!direct.valid()
                        && (cr == dc.directRule
                            || (dc.directAbstractRule.has_value()
@@ -1448,105 +1367,330 @@ declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
                 direct = c;
             }
         }
-        std::size_t arrays  = 0;
-        NodeId      fnSuffix{};
-        NodeId      group{};
         if (direct.valid()) {
             for (NodeId c : visibleChildren(tree, direct)) {
                 if (tree.kind(c) != NodeKind::Internal) continue;
                 RuleId const cr = tree.rule(c);
-                if (cr == dc.groupRule) { if (!group.valid()) group = c; }
-                else if (cr == dc.arraySuffixRule) ++arrays;
-                else if (dc.arrayStarSuffixRule.has_value()
-                         && cr == *dc.arrayStarSuffixRule) ++arrays;
-                else if (isFnSuffixRule(cr, dc) && !fnSuffix.valid()) fnSuffix = c;
+                if (cr == dc.groupRule) {
+                    if (!lvl.group.valid()) lvl.group = c;
+                } else if (cr == dc.arraySuffixRule) {
+                    ++lvl.arrays;
+                } else if (dc.arrayStarSuffixRule.has_value()
+                           && cr == *dc.arrayStarSuffixRule) {
+                    ++lvl.arrays;
+                } else if (isFnSuffixRule(cr, dc) && !lvl.fnSuffix.valid()) {
+                    lvl.fnSuffix = c;
+                }
             }
         }
-        bool const hasFn = fnSuffix.valid();
-        // ⚠ A FUNCTION SUFFIX MEANS TWO DIFFERENT THINGS, AND THE DISCRIMINATOR
-        // IS THE GROUP. Without a group, a fn suffix means THIS declarator
-        // declares a function and the spine describes its RESULT — the suffix
-        // contributes no level, which is what the `int (*)(…)`-free shapes rely
-        // on. WITH a group the object is a pointer TO a function: the suffix IS a
-        // level, and the head qualifier then qualifies the RETURN type rather
-        // than a pointee.
-        //
-        // ★★ P44 (part (c) of D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES)
-        // — THE GROUPED CASE IS NOW MODELLED, AND THE ORDERING RULE IS WHY IT
-        // COULD BE. `ctors(D') ++ suffixes(D) ++ reverse(L(D))`, base underneath,
-        // already puts the head qualifier in the right place for a function
-        // pointer: ✔CHECKED against `declaratorDeclaredType`'s own fold on
-        // `const char *(*)(void)` → [Ptr, Fn, Ptr] + base(const), where the base
-        // IS the returned pointee and 6.7.6.1p2 wants exactly that. The RETURN
-        // type therefore needs no special case — it is the deeper levels of this
-        // same spine. Only the inner function's PARAMETERS are unreachable from a
-        // flat chain, and they get a nested `DeclaredQualification` below.
-        //
-        // ⚠ ARRAYS ALONGSIDE A FN SUFFIX STILL MAKE NO CLAIM. `int (*p[4])(char)`
-        // puts an array and a function suffix on ONE direct, and their relative
-        // order in the fold is a question this walk does not read from the tree —
-        // guessing it would misplace every level above the base, and a misplaced
-        // level REFUSES LEGAL CODE. That combination stays unmodelled.
-        if (hasFn && arrays != 0) { modelled = false; return; }
-        if (group.valid()) {
-            NodeId const innerD = declarator_walk_detail::firstChildOfRule(
-                TreeDeclaratorView{tree}, group, dc.declaratorRule);
-            if (!innerD.valid()) { modelled = false; return; }
-            self(self, innerD, depth + 1);          // ctors(D') — the outermost
-            if (!modelled) return;
-        }
-        // suffixes(D), and the fn suffix is one of them WHEN there is a group.
-        // Its level carries no cv of its own — a function type cannot be
-        // qualified (C 6.7.3p9) — so the LevelQual is empty and the claim it
-        // does carry is about its PARAMETERS.
-        if (hasFn && group.valid()) {
-            ctors.push_back(LevelQual{});
-            fnClaims.emplace_back(
-                static_cast<std::uint8_t>(ctors.size() - 1),
-                nestedFnParamClaim(fnSuffix));
-        }
-        for (std::size_t i = 0; i < arrays; ++i) {
-            // An array level carries no const claim of its own: a bracket's
-            // cv-decoration is legal only on a PARAMETER, where it qualifies the
-            // decayed pointer — the parameter's own top level, which C23
-            // 6.7.6.3p15 discards anyway. The same holds for `restrict`
-            // (`void f(char arr[restrict 4])` restricts the decayed POINTER,
-            // which is that same discarded top level).
-            ctors.push_back(LevelQual{});
-        }
-        for (std::size_t i = layers.size(); i-- > 0;) {
-            // reverse(L): the LAST star in source order is the outermost of this
-            // run. An EAST qualifier inside the layer (`* const`, `* restrict`)
-            // qualifies the pointer THAT layer built (C 6.7.3) — the same reading
-            // the volatile/atomic arms of `declaratorDeclaredType` take of this
-            // node, and the ONLY place a legal `restrict` can appear.
-            ctors.push_back(LevelQual{
-                subtreeContainsToken(tree, layers[i], constMarker, declByRule,
-                                     opaqueRules),
-                restrictMarker.valid()
-                    && subtreeContainsToken(tree, layers[i], restrictMarker,
-                                            declByRule, opaqueRules)});
-        }
-    };
-    collect(collect, inner, 0);
-    if (!modelled) return std::nullopt;
-    std::size_t const levels = ctors.size() + 1;
-    if (levels > 63) return std::nullopt;   // beyond the bitset ⇒ make no claim
-    QualifierSpine sp;
-    sp.levels = static_cast<std::uint8_t>(levels);
-    // The BASE sits deepest, and the head qualifier is what qualifies it
-    // (`const char *p` ⇒ level 1 of a 2-level spine).
-    if (headConst) sp.constBits |= (std::uint64_t{1} << (levels - 1));
-    for (std::size_t i = 0; i < ctors.size(); ++i) {
-        if (ctors[i].isConst)    sp.constBits    |= (std::uint64_t{1} << i);
-        if (ctors[i].isRestrict) sp.restrictBits |= (std::uint64_t{1} << i);
+        // ⚠ ARRAYS ALONGSIDE A FN SUFFIX MAKE NO CLAIM. `int (*p[4])(char)` puts
+        // an array and a function suffix on ONE direct, and their relative order
+        // in `declaratorDeclaredType`'s fold is a question this walk does not read
+        // from the tree — guessing it would misplace every level above the base,
+        // and a misplaced level REFUSES LEGAL CODE.
+        if (lvl.fnSuffix.valid() && lvl.arrays != 0) return false;
+        NodeId const group = lvl.group;
+        chain.push_back(std::move(lvl));
+        if (!group.valid()) return true;
+        NodeId const innerD = declarator_walk_detail::firstChildOfRule(
+            TreeDeclaratorView{tree}, group, dc.declaratorRule);
+        if (!innerD.valid()) return false;
+        d = innerD;
     }
-    // A level with a null claim is dropped rather than recorded: the oracle's
-    // "no claim" is the ABSENCE of an entry, and carrying a null one would make
-    // the two spellings of nothing distinguishable to a future reader.
-    for (auto& [level, claim] : fnClaims)
-        if (claim != nullptr) sp.fnParams.emplace_back(level, std::move(claim));
-    return sp;
+}
+
+[[nodiscard]] std::optional<QualifierSpine>
+declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
+                     DeclaratorConfig const& dc, SchemaTokenId constMarker,
+                     std::unordered_map<std::uint32_t, std::size_t> const*
+                         declByRule,
+                     std::span<RuleId const> opaqueRules = {},
+                     SchemaTokenId restrictMarker = {},
+                     SchemaIndexes const* idx = nullptr) {
+    // ★★★ P55 — ONE EXPLICIT HEAP WORK STACK FOR THE WHOLE CLAIM TREE, AND THE
+    // `nestDepth >= 4` IT REPLACES WAS THE SECOND DROPPED DIAGNOSTIC IN THIS
+    // FUNCTION ([[D-SEMANTIC-DEPTH-CAPS-TRUNCATE-INTO-TWO-WRONG-ANSWERS]]).
+    //
+    // A function LEVEL's parameters get their own `DeclaredQualification`, and
+    // each of those parameters may itself be a function pointer — so the claim is
+    // a TREE, and it used to be built by this function calling itself with
+    // `nestDepth + 1` and giving up at 4. Giving up is `nullptr` = NO CLAIM, and
+    // the oracle then does not judge that level, so the C23 6.7.6.1p2 diagnostic
+    // simply vanished. ✔MEASURED at this cycle's HEAD through the real CLI:
+    // `void h(void (*)(… (const char *) …));` beside its `char *` twin is
+    // DIAGNOSED at 4 levels of nested function-pointer parameters and **compiles
+    // rc=0 with ZERO diagnostics at 5**. ✔gcc 13.3.0, clang 18.1.3 and mingw-w64
+    // gcc 13.2.0 all ERROR on it at 5 levels; MSVC 19.51.36252 warns (C4028).
+    // Every reference diagnoses; DSS said nothing.
+    //
+    // ⚠ RAISING 4 WOULD HAVE MOVED THE DEPTH AT WHICH THE ANSWER GOES WRONG
+    // WITHOUT REMOVING IT. There is no ceiling here now: the jobs live on the
+    // heap, so nesting costs heap and not host stack (the operator's 2026-09-02
+    // no-recursion ruling), and each job consumes a strictly smaller subtree of a
+    // finite tree, so the stack drains.
+    //
+    // One spine still to be built, and where its answer belongs.
+    struct SpineJob {
+        NodeId        declarator{};
+        NodeId        head{};
+        SchemaTokenId constMarker{};
+        SchemaTokenId restrictMarker{};
+        // `into == nullptr` names the ROOT spine — the one this call returns.
+        // Otherwise the answer is parameter `paramIndex` of a nested function
+        // level's claim. A raw pointer because the claim is kept alive by `links`
+        // for the whole walk and its `params` vector is sized ONCE, so neither the
+        // object nor the slot can move under a pending job.
+        DeclaredQualification* into       = nullptr;
+        std::size_t            paramIndex = 0;
+    };
+    // A nested function level's claim, and the spine level it hangs off. Attached
+    // AFTER the stack drains, because "did ANY parameter produce a spine" — the
+    // `nullptr`-versus-claim decision the old recursive form made on the way out —
+    // is only answerable once every one of them has been walked.
+    struct FnLevelLink {
+        QualifierSpine*                        owner = nullptr;
+        std::uint8_t                           level = 0;
+        std::shared_ptr<DeclaredQualification> claim;
+    };
+
+    std::optional<QualifierSpine> root;
+    std::vector<SpineJob>         work;
+    std::vector<FnLevelLink>      links;
+    work.push_back(SpineJob{dNode, headNode, constMarker, restrictMarker,
+                            nullptr, 0});
+
+    while (!work.empty()) {
+        SpineJob const job = work.back();
+        work.pop_back();
+        std::optional<QualifierSpine>& slot =
+            job.into == nullptr ? root : job.into->params[job.paramIndex];
+
+        // No const marker declared for this row, or no head to read the base
+        // qualifier from ⇒ nothing can be claimed honestly. The slot stays
+        // `nullopt`, which is "no claim".
+        if (!job.constMarker.valid() || !job.head.valid()) continue;
+        bool const headConst = subtreeContainsToken(tree, job.head,
+                                                    job.constMarker, declByRule,
+                                                    opaqueRules);
+        // The one-level answer: an abstract parameter with no declarator at all
+        // (`int f(const char)`), where the head IS the whole type. A one-level
+        // spine is a BASE and nothing else, so it can carry no restrict bit.
+        auto headOnly = [&] {
+            QualifierSpine sp;
+            sp.levels    = 1;
+            sp.constBits = headConst ? 1u : 0u;
+            slot         = sp;
+        };
+        if (!job.declarator.valid()
+            || tree.kind(job.declarator) != NodeKind::Internal) {
+            headOnly();
+            continue;
+        }
+        // Descend a per-slot wrapper to the inner declaratorRule — the same
+        // descent `declaratorDeclaredType` and `declaratorObjectIsConst` make.
+        NodeId       inner = job.declarator;
+        RuleId const dr    = tree.rule(job.declarator);
+        if (dr == dc.initDeclaratorRule
+            || (dc.memberDeclaratorRule.has_value()
+                && dr == *dc.memberDeclaratorRule)) {
+            NodeId const d = declarator_walk_detail::firstChildOfRule(
+                TreeDeclaratorView{tree}, job.declarator, dc.declaratorRule);
+            if (!d.valid()) continue;   // no claim
+            inner = d;
+        }
+        if (tree.kind(inner) != NodeKind::Internal
+            || tree.rule(inner) != dc.declaratorRule) {
+            headOnly();
+            continue;
+        }
+        std::vector<DeclaratorChainLevel> chain;
+        if (!readDeclaratorChain(tree, inner, dc, chain)) continue;   // no claim
+
+        // ── THE CONSTRUCTOR CHAIN, OUTERMOST FIRST ────────────────────────────
+        //
+        // `ctors` accumulates one entry per DERIVATION LEVEL above the base, in
+        // the order a reader sees them (level 0 first), each carrying whether THAT
+        // level is const-qualified. The base is appended last, from the head
+        // qualifier.
+        //
+        // ★★ THE ORDERING RULE, DERIVED FROM `declaratorDeclaredType`'S OWN FOLD
+        // AND WRITTEN DOWN BECAUSE GETTING IT WRONG REFUSES LEGAL CODE. For a
+        // declarator `L* ( direct )` where `direct` is `(name | ( D' )) suffix*`,
+        // that fold:
+        //   (1) binds the pointer layers L innermost-first, so the LAST star in
+        //       source order is the outermost of that run;
+        //   (2) applies the direct's suffixes to the result, outermost first;
+        //   (3) then, if the direct is a parenthesized GROUP, re-enters at the
+        //       inner declarator D' and applies ITS layers on top of all of that.
+        // So the whole chain is  ctors(D') ++ suffixes(D) ++ reverse(L(D)),  and
+        // the base sits under all of it. ✔CHECKED against the fold on four shapes:
+        //   `const char **p`   → [Ptr, Ptr] + base(const)              (no group)
+        //   `char *x[3]`       → [Array, Ptr] + base   (arrays OUTSIDE the stars)
+        //   `int (*p)[3]`      → [Ptr, Array] + base   (the group's star is outer)
+        //   `const int (*)[3]` → [Ptr, Array] + base(const)
+        //
+        // ★ THE REVERSE ITERATION OVER `chain` IS THAT RULE, UNCHANGED. The old
+        // recursion descended to the innermost group BEFORE pushing its own
+        // level's ctors, so the push order was innermost level first; walking the
+        // collected chain backwards reproduces it exactly, level for level.
+        // One entry per derivation level above the base: `.isConst` = const on
+        // that level, `.isRestrict` = restrict on it. Two parallel vectors would
+        // let the two axes drift apart on a level, which is the one thing a
+        // positional claim may never do.
+        struct LevelQual { bool isConst = false; bool isRestrict = false; };
+        std::vector<LevelQual> ctors;
+        // The function LEVELS this spine contains, in ctors order. Their nested
+        // parameter claims are ENQUEUED below rather than recursed into.
+        std::vector<std::pair<std::uint8_t, NodeId>> fnLevels;
+        for (std::size_t li = chain.size(); li-- > 0;) {
+            DeclaratorChainLevel const& lvl = chain[li];
+            // ⚠ A FUNCTION SUFFIX MEANS TWO DIFFERENT THINGS, AND THE
+            // DISCRIMINATOR IS THE GROUP. Without a group, a fn suffix means THIS
+            // declarator declares a function and the spine describes its RESULT —
+            // the suffix contributes no level, which is what the `int (*)(…)`-free
+            // shapes rely on. WITH a group the object is a pointer TO a function:
+            // the suffix IS a level, and the head qualifier then qualifies the
+            // RETURN type rather than a pointee.
+            //
+            // ★★ P44 (part (c) of D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES)
+            // — THE GROUPED CASE IS MODELLED, AND THE ORDERING RULE IS WHY IT
+            // COULD BE. `ctors(D') ++ suffixes(D) ++ reverse(L(D))`, base
+            // underneath, already puts the head qualifier in the right place for a
+            // function pointer: ✔CHECKED against `declaratorDeclaredType`'s own
+            // fold on `const char *(*)(void)` → [Ptr, Fn, Ptr] + base(const),
+            // where the base IS the returned pointee and 6.7.6.1p2 wants exactly
+            // that. The RETURN type therefore needs no special case — it is the
+            // deeper levels of this same spine. Only the inner function's
+            // PARAMETERS are unreachable from a flat chain, and they get a nested
+            // `DeclaredQualification` below.
+            //
+            // Its level carries no cv of its own — a function type cannot be
+            // qualified (C 6.7.3p9) — so the LevelQual is empty and the claim it
+            // does carry is about its PARAMETERS.
+            if (lvl.fnSuffix.valid() && lvl.group.valid()) {
+                ctors.push_back(LevelQual{});
+                fnLevels.emplace_back(static_cast<std::uint8_t>(ctors.size() - 1),
+                                      lvl.fnSuffix);
+            }
+            for (std::size_t i = 0; i < lvl.arrays; ++i) {
+                // An array level carries no const claim of its own: a bracket's
+                // cv-decoration is legal only on a PARAMETER, where it qualifies
+                // the decayed pointer — the parameter's own top level, which C23
+                // 6.7.6.3p15 discards anyway. The same holds for `restrict`
+                // (`void f(char arr[restrict 4])` restricts the decayed POINTER,
+                // which is that same discarded top level).
+                ctors.push_back(LevelQual{});
+            }
+            for (std::size_t i = lvl.layers.size(); i-- > 0;) {
+                // reverse(L): the LAST star in source order is the outermost of
+                // this run. An EAST qualifier inside the layer (`* const`,
+                // `* restrict`) qualifies the pointer THAT layer built (C 6.7.3) —
+                // the same reading the volatile/atomic arms of
+                // `declaratorDeclaredType` take of this node, and the ONLY place a
+                // legal `restrict` can appear.
+                ctors.push_back(LevelQual{
+                    subtreeContainsToken(tree, lvl.layers[i], job.constMarker,
+                                         declByRule, opaqueRules),
+                    job.restrictMarker.valid()
+                        && subtreeContainsToken(tree, lvl.layers[i],
+                                                job.restrictMarker, declByRule,
+                                                opaqueRules)});
+            }
+        }
+
+        std::size_t const levels = ctors.size() + 1;
+        // ⚠ THE ONE CEILING THAT SURVIVES, AND IT IS A REPRESENTATIONAL BOUND
+        // RATHER THAN A WALK CAP: `QualifierSpine` states its levels in a 64-bit
+        // positional bitset, so a chain deeper than that cannot be SPELLED. It
+        // degrades to NO CLAIM — a possibly missed diagnostic, never a refused
+        // legal program — which is the safe direction, and it is NOT made loud on
+        // purpose: erroring here would refuse a 63-star declaration that ✔all four
+        // references accept. ✔MEASURED: the 6.7.6.1p2 diagnostic is raised at 62
+        // pointer levels and silently dropped from 63 (`levels = N + 1`). Closing
+        // that last gap means WIDENING THE CLAIM'S REPRESENTATION in
+        // `core/types/declared_qualification.hpp` together with its other two
+        // producers (`hir/hir_text.cpp`'s type decoder and the `ffi/` descriptor
+        // reader), which is a different change in different files; the margin
+        // meanwhile is 5.25× ISO C23 5.2.4.1's floor of 12 declarators modifying a
+        // type, and 63× the deepest pointer chain in the whole sqlite corpus.
+        if (levels > 63) continue;   // beyond the bitset ⇒ make no claim
+        QualifierSpine sp;
+        sp.levels = static_cast<std::uint8_t>(levels);
+        // The BASE sits deepest, and the head qualifier is what qualifies it
+        // (`const char *p` ⇒ level 1 of a 2-level spine).
+        if (headConst) sp.constBits |= (std::uint64_t{1} << (levels - 1));
+        for (std::size_t i = 0; i < ctors.size(); ++i) {
+            if (ctors[i].isConst)    sp.constBits    |= (std::uint64_t{1} << i);
+            if (ctors[i].isRestrict) sp.restrictBits |= (std::uint64_t{1} << i);
+        }
+        slot = std::move(sp);
+
+        // ★★ P44 part (c) — THE NESTED PARAMETER CLAIM for a function LEVEL,
+        // ENQUEUED rather than recursed into.
+        //
+        // It reads the fn suffix's own parameter list through the SAME two readers
+        // the outer harvest uses (`fnSuffixParamsRule` for the list,
+        // `collectParamRowNodes` for the rows), so the two cannot disagree about
+        // which nodes are parameters — and each row's spine becomes another job on
+        // THIS stack, so a parameter that is itself a function pointer is claimed
+        // the same way at every depth, with no depth left to run out of.
+        //
+        // ⚠ NOTHING IS CLAIMED WHENEVER ANYTHING IS UNREADABLE, and the oracle then
+        // does not judge that level. An empty-but-present claim would read as "this
+        // function takes no qualified parameters", which is a statement, and a
+        // wrong one for every shape this walk cannot model.
+        if (idx == nullptr || idx->cfg == nullptr) continue;
+        if (!dc.fnSuffixParamsRule.has_value()) continue;
+        QualifierSpine* const owner = &*slot;
+        for (auto const& [level, fnSuffix] : fnLevels) {
+            NodeId plist{};
+            for (NodeId c : visibleChildren(tree, fnSuffix)) {
+                if (tree.kind(c) == NodeKind::Internal
+                    && tree.rule(c) == *dc.fnSuffixParamsRule) { plist = c; break; }
+            }
+            if (!plist.valid()) continue;
+            std::vector<NodeId> rows;
+            collectParamRowNodes(*idx, *idx->cfg, tree, plist, rows);
+            if (rows.empty()) continue;
+            auto claim = std::make_shared<DeclaredQualification>();
+            claim->params.assign(rows.size(), std::nullopt);
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                auto const pIt = idx->declByRule.find(tree.rule(rows[i]).v);
+                if (pIt == idx->declByRule.end()) continue;
+                auto const& pDecl = idx->cfg->declarations[pIt->second];
+                if (!pDecl.isDeclaratorMode() || !pDecl.constMarker.has_value())
+                    continue;
+                auto const pKids = declRoleChildren(tree, rows[i], pDecl);
+                if (!pDecl.headChild.has_value()
+                    || *pDecl.headChild >= pKids.size())
+                    continue;
+                NodeId pDeclarator{};
+                if (pDecl.declaratorChild.has_value()
+                    && *pDecl.declaratorChild < pKids.size())
+                    pDeclarator = pKids[*pDecl.declaratorChild];
+                work.push_back(SpineJob{
+                    pDeclarator, pKids[*pDecl.headChild], *pDecl.constMarker,
+                    pDecl.restrictMarker.value_or(SchemaTokenId{}), claim.get(),
+                    i});
+            }
+            links.push_back(FnLevelLink{owner, level, std::move(claim)});
+        }
+    }
+
+    // A level whose claim turned out to say NOTHING is dropped rather than
+    // recorded: the oracle's "no claim" is the ABSENCE of an entry, and carrying
+    // an empty one would make the two spellings of nothing distinguishable to a
+    // future reader. `links` is in creation order, which is ctors order per
+    // owner, so each spine's `fnParams` comes out exactly as the recursive form
+    // left it.
+    for (auto& link : links) {
+        if (link.owner == nullptr || link.claim == nullptr) continue;
+        if (link.claim->empty()) continue;
+        link.owner->fnParams.emplace_back(
+            link.level,
+            std::shared_ptr<DeclaredQualification const>(std::move(link.claim)));
+    }
+    return root;
 }
 
 // The PARAM-ROW nodes of a params subtree, in source order. The descent rule is
@@ -8836,18 +8980,21 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
                     return interner.array(
                         elem, static_cast<std::int64_t>(decoded->size() + 1));
                 }
-                // FF3 (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE): a wide element sized
-                // from a `\x`/octal byte escape stays INCOMPLETE (fail loud later),
-                // like a malformed escape — the HIR tier emits the diagnostic.
-                if (!outcome.usedByteEscape) {
-                    WideEncodeResult enc;
-                    if (!encodeWideString(*decoded, ek, enc)) {
-                        return interner.array(
-                            elem, static_cast<std::int64_t>(enc.codeUnits + 1));
-                    }
+                // D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE: `&outcome` carries each
+                // `\x`/octal escape's RAW VALUE and its offset, so a byte escape
+                // contributes ONE code unit of the declared element instead of
+                // being re-read as UTF-8 bytes. Passing it is what makes
+                // `char16_t buf[] = u"\xFFFF";` size to 2 rather than stay
+                // incomplete. An escape too wide for the element returns an error
+                // and the array stays INCOMPLETE (fail loud later, HIR names the
+                // width and the value) — never a guessed size.
+                WideEncodeResult enc;
+                if (!encodeWideString(*decoded, ek, enc, &outcome)) {
+                    return interner.array(
+                        elem, static_cast<std::int64_t>(enc.codeUnits + 1));
                 }
             }
-            return declTy;   // malformed escape / wide encode error / wide byte escape — stay incomplete
+            return declTy;   // malformed escape / wide encode error — stay incomplete
         }
         if (idx.braceInitListRule.valid() && idx.initElementRule.valid()
             && r.v == idx.braceInitListRule.v) {
@@ -12120,14 +12267,29 @@ charLiteralWideCoreOf(EngineState const& s, Tree const& tree, NodeId owningNode)
 // fault at the HIR tier's fail-loud, and a `sizeof` of it fails loud (never a
 // guessed size). Narrow strings never reach the wide path (byte-identical).
 [[nodiscard]] TypeId stringLiteralArrayType(EngineState& s, std::string const& decodedBytes,
-                                            TypeKind elementCore) {
+                                            TypeKind elementCore,
+                                            EscapeDecodeOutcome const* escapes = nullptr) {
     TypeInterner& interner = s.lattice.interner();
     if (elementCore == TypeKind::Char || elementCore == TypeKind::Byte) {
+        // ⚠ The NARROW length is the decoded BYTE count and stays so — a byte
+        // escape already contributed exactly one byte to `decodedBytes`. What
+        // changed under it is that `\x` now consumes every hex digit, so
+        // `sizeof("\x041")` is 2 where it used to be 3
+        // (D-CSUBSET-NARROW-HEX-ESCAPE-TRUNCATED-TO-TWO-DIGITS). An escape too wide
+        // for a byte is refused at the HIR tier, which is the only tier that can
+        // name the literal's position.
         return interner.array(interner.primitive(elementCore),
                               static_cast<std::int64_t>(decodedBytes.size() + 1));
     }
+    // ★ `escapes` is what keeps the two tiers agreeing on N. HIR lowers the same
+    // buffer through the same encoder with the same outcome, so a `\x`/octal
+    // escape counts as ONE code unit in BOTH places. Threading it here is the
+    // whole of the semantic half of D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE: without
+    // it this call re-reads an escape's placeholder byte as UTF-8, which either
+    // fails (leaving the node untyped) or — for a byte that happens to be valid
+    // UTF-8 — silently counts a DIFFERENT number of units than HIR emits.
     WideEncodeResult enc;
-    if (encodeWideString(decodedBytes, elementCore, enc)) return InvalidType;   // fail loud later
+    if (encodeWideString(decodedBytes, elementCore, enc, escapes)) return InvalidType;  // fail loud later
     return interner.array(interner.primitive(elementCore),
                           static_cast<std::int64_t>(enc.codeUnits + 1));
 }
@@ -12413,7 +12575,8 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
         else if (s.idx().stringLiteralBodyToken.valid()
                  && tk == s.idx().stringLiteralBodyToken
                  && !parentIsStringLiteralExprRule(s, tree, node)) {
-            if (auto decoded = decodeStringLiteralBody(tree.text(node))) {
+            EscapeDecodeOutcome tokenOutcome;
+            if (auto decoded = decodeStringLiteralBody(tree.text(node), &tokenOutcome)) {
                 // Per-token fallback (grammars with no stringLiteralExpr rule —
                 // toy/tsql, or a body not under it): the opener is the token's
                 // parent. Those grammars declare no prefix map, so the core is the
@@ -12423,7 +12586,8 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                 // SINGLE-opener path (one body token's parent) → `conflict` is
                 // structurally impossible; take the core.
                 TypeKind const core = stringLiteralElementCoreOf(s, tree, tree.parent(node)).core;
-                if (TypeId const arr = stringLiteralArrayType(s, *decoded, core); arr.valid()) {
+                if (TypeId const arr = stringLiteralArrayType(s, *decoded, core, &tokenOutcome);
+                    arr.valid()) {
                     s.nodeToType.set(node, arr);
                 }
             }
@@ -12467,16 +12631,18 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                 s.reporter.report(std::move(d));
             } else {
                 TypeKind const core = coreInfo.core;
-                // FF3 (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE): a `\x`/octal byte escape
-                // in a WIDE/UTF string names a raw code-unit value, not a code point —
-                // leave the node UNTYPED so a `sizeof` of it fails loud, matching the
-                // HIR tier. Narrow `\x`/octal is byte-producing and stays typed.
-                bool const wideByteEscape = outcome.usedByteEscape
-                    && core != TypeKind::Char && core != TypeKind::Byte;
-                if (!wideByteEscape) {
-                    if (TypeId const arr = stringLiteralArrayType(s, *decoded, core); arr.valid()) {
-                        s.nodeToType.set(node, arr);
-                    }
+                // D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE: the blanket "leave a wide
+                // run with a byte escape UNTYPED" skip that stood here is GONE — a
+                // `\x`/octal escape names a raw code-unit VALUE and `outcome` now
+                // carries it, so `u"\xFFFF"` types as `Array<char16_t,2>` exactly as
+                // HIR lowers it. What still leaves the node untyped is a genuine
+                // encode failure (ill-formed UTF-8, a code point past U+10FFFF, or
+                // an escape wider than the element), which `stringLiteralArrayType`
+                // reports as InvalidType — so a `sizeof` of it still fails loud and
+                // no size is ever guessed.
+                if (TypeId const arr = stringLiteralArrayType(s, *decoded, core, &outcome);
+                    arr.valid()) {
+                    s.nodeToType.set(node, arr);
                 }
             }
         }

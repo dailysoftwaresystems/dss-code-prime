@@ -1585,6 +1585,55 @@ struct DSS_EXPORT ObjectFormatData {
     // unknown VALUE still fails loud at load (the loader's enum check).
     std::optional<ExternCallDispatch> externCallDispatch;
 
+    // ── D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
+    //     WHICH imports `externCallDispatch` applies to ───────────────
+    //
+    // The symbol BINDINGS whose extern references take the `indirect-slot`
+    // shape. EMPTY (the key absent) = EVERY import, which is the unqualified
+    // meaning `indirect-slot` has always carried and what every format
+    // declaring it meant before this key existed.
+    //
+    // ★ WHY THIS IS A SECOND KEY AND NOT A THIRD `ExternCallDispatch` VALUE.
+    // `externCallDispatch` answers WHAT THE INDIRECT SHAPE IS for this format
+    // (deref a pointer slot vs. branch to a linker-synthesized stub). This key
+    // answers WHICH REFERENCES NEED IT. Those are orthogonal questions, and
+    // folding them into one enum would need a new member per (shape × scope)
+    // pair. The existing keys are all keyed by REFERENCE KIND —
+    // `externCallDispatch` for calls, `dataImportBinding` for data reads,
+    // `externAddrBinding` for address materialization; this one is keyed by
+    // the SYMBOL's binding, an axis none of them can express.
+    //
+    // ★★ WHY THE AXIS IS `SymbolBinding` AND NOT SOMETHING PE-SHAPED. A
+    // pc-relative code relocation can only name a target that will have a
+    // SECTION and an address. A WEAK undefined symbol may legally resolve to
+    // NOTHING, which COFF spells as an ABSOLUTE value-0 symbol — and no
+    // 32-bit displacement from a 0x140000000 image base reaches an absolute.
+    // A GLOBAL undefined symbol has no such resolution: the link either finds
+    // a definition or fails. So the question "can this reference be
+    // pc-relative here" is a question about the BINDING, in the same agnostic
+    // `SymbolBinding` vocabulary `ExternImport::binding` and
+    // `ModuleSymbol::binding` already speak. ✔MEASURED 2026-09-02 that all
+    // three references narrow on exactly this axis for FUNCTIONS, each probed
+    // separately with `weak` as the only variable: clang 18.1.3 emits
+    // `.rdata$.refptr.maybe` + two `REL32 .refptr.maybe` for a WEAK extern
+    // function and NO `.refptr` section at all for a STRONG one, on BOTH
+    // `--target=x86_64-pc-windows-msvc` AND `--target=x86_64-w64-windows-gnu`;
+    // mingw-w64 gcc 13.2.0 likewise emits `.refptr.maybe` only for the weak
+    // one. (Their DATA answer differs — see `dataImportBinding` below, which
+    // this key deliberately does NOT narrow, because the unconditional data
+    // slot has its own measured reason: `ld` refuses a direct rel32 against a
+    // symbol it must AUTO-IMPORT from a DLL.)
+    //
+    // ⚠ `SymbolBinding::Local` is REFUSED in this list at load: no format
+    // spells an undefined LOCAL symbol, so no import can ever carry it
+    // (`collectExterns` refuses one at the declaration's own span), and a
+    // list member that can never match is config that reads as a capability
+    // and is not one — the D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE shape.
+    //
+    // Read through `externRefSlotBindings()` / `externRefTakesImportSlot()`
+    // below, which are the ONE owner of the rule; no consumer re-derives it.
+    std::vector<SymbolBinding> indirectSlotBindings;
+
     // ── D-LK-EXTERN-DATA-IMPORT: extern-DATA import binding model ───
     //
     // How an imported library DATA OBJECT (libc `stdout`) is bound
@@ -2364,6 +2413,60 @@ public:
     [[nodiscard]] std::optional<ExternCallDispatch>
     externCallDispatch() const noexcept {
         return d_.externCallDispatch;
+    }
+
+    // ── D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT ──
+    //
+    // THE ONE OWNER OF "WHICH EXTERN REFERENCES TAKE THE IMPORT SLOT". Two
+    // tiers must agree symbol for symbol — MIR→LIR decides the emitted SHAPE
+    // (deref-the-slot vs. direct) and the linker decides WHICH imports get a
+    // slot minted and which relocations are retargeted — and a rule spelled
+    // twice is a rule that drifts (the reason `strongerReferenceBinding` and
+    // `stricterDuplicateMatch` exist one tier down). So the rule lives HERE,
+    // once, and both tiers consume the ANSWER: the linker calls
+    // `externRefTakesImportSlot` directly, MIR→LIR is threaded the list.
+    //
+    // The rule, in full — and this function is the only place it is written:
+    //   * dispatch != `indirect-slot`  → NO binding takes the slot.
+    //   * `indirect-slot`, no narrowing declared → EVERY binding does (the
+    //     unqualified meaning the key has always carried).
+    //   * `indirect-slot` + `indirectSlotBindings` → exactly those.
+    // Allocation-free on purpose: the linker asks it once per extern import,
+    // and a slot pass over a sqlite-scale object asks it hundreds of times.
+    [[nodiscard]] bool
+    externRefTakesImportSlot(SymbolBinding binding) const noexcept {
+        if (d_.externCallDispatch != ExternCallDispatch::IndirectSlot) {
+            return false;
+        }
+        if (d_.indirectSlotBindings.empty()) return true;  // unnarrowed
+        for (auto const b : d_.indirectSlotBindings) {
+            if (b == binding) return true;
+        }
+        return false;
+    }
+
+    // The same answer as a SET, for readers and diagnostics — DERIVED from the
+    // predicate above rather than re-deciding, so the two can never disagree,
+    // and PROJECTED over the vocabulary table rather than naming its members:
+    // a spelled-out `{Local, Global, Weak}` would be a second owner of the
+    // closed set and would silently omit a member added later
+    // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+    [[nodiscard]] std::vector<SymbolBinding>
+    externRefSlotBindings() const {
+        std::vector<SymbolBinding> out;
+        for (auto const& r : kSymbolBindingTable.rows) {
+            if (externRefTakesImportSlot(r.first)) out.push_back(r.first);
+        }
+        return out;
+    }
+
+    // The DECLARED narrowing list, verbatim (empty = the key is absent).
+    // Threaded to MIR→LIR by the driver, and read by `validate()`'s pairing
+    // rules. Consumers asking "does THIS import take the slot" want
+    // `externRefTakesImportSlot` above, never this.
+    [[nodiscard]] std::vector<SymbolBinding> const&
+    indirectSlotBindings() const noexcept {
+        return d_.indirectSlotBindings;
     }
 
     // ── D-LK-EXTERN-DATA-IMPORT accessor ─────────────────────────

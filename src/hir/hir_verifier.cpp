@@ -1046,7 +1046,7 @@ void HirVerifier::checkMemberAccess(DiagnosticReporter& reporter) const {
 void HirVerifier::checkConstructAggregate(DiagnosticReporter& reporter) const {
     // D5.4-FU1 + FU4: every ConstructAggregate's child count and types
     // must match its declared result type's shape. The HIR lowering
-    // (`lowerBraceInit` / `lowerUnionBraceInit` / `synthZeroOrError`)
+    // (`lowerBraceInit`'s work stack / `prepareUnionBraceInit` / `synthZeroOrError`)
     // produces well-formed aggregates by construction; this rule
     // catches lowering BUGS and synthetic-IR misuse.
     if (interner_ == nullptr) return;

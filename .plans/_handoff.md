@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-02 — cycles **P14 … P54**. ⚠ P52 rewrote no handoff at all, so a reader
+**Last updated:** 2026-09-03 — cycles **P14 … P55**. ⚠ P52 rewrote no handoff at all, so a reader
 who opened this file during P53 saw P51 described as current state; that entry in §5 was written
 retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as
 history there.
@@ -17,6 +17,118 @@ history there.
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
+
+**Cycle P55 closed 2026-09-03.** Twelve lanes. ✔**REAL: 26 rows closed, 1 opened.** ✔**COUNTED by
+`check-anchor-balance --base 0cbf3b62`: 2 closed, 1 opened, net −1.** The gap is not an error and
+must not be smoothed over: **24 of the 26 closures are structurally invisible** to an instrument
+that compares row NAMES across two commits, because they were born closed or minted-and-closed
+inside the cycle. Both numbers belong in any report of this cycle.
+
+★★★ **THE THROUGH-LINE, AND IT IS P54'S ONE LEVEL OUT.** P54's lesson was *the broken thing was the
+measurement, not the code*. P55's is sharper: **the measurement was right and the ATTRIBUTION was
+wrong.** Four times a ceiling was recorded against a site that did not own it, and each time the
+number itself was perfectly reproducible:
+
+1. Lane `rc` recorded a 400/1000 crash against the MIR aggregate-init cluster. ✔gdb names
+   `evalNode` ⇄ `evalImpl` in `src/hir/const_eval.cpp`. The cluster survived 2000 levels.
+2. The recursion census recorded the deep-pointer ceiling in `src/hir/**`. ✔gdb names
+   `TypeInterner::representationType` in `src/core/types/type_lattice/type_lattice.cpp`, and the
+   window is 4297/4453, not 4000/8000.
+3. The census's own table carried `nested casts 4096 rc 0`. ✔That input never reached the
+   recursion — it was REFUSED at the speculation cap and rc 0 meant *the thing did not run*.
+4. The orchestrator (me) probed a lane's finding through the CLI and nearly reported a regression.
+   ✔The CLI's own wall is 1024/2048, BELOW the depth the lane measured in-process; the numbers
+   were never comparable.
+
+⇒ **A ceiling found by bisecting a whole compile names the LOWEST recursion on that route, never
+the one you were looking at.** Attribute with a debugger before recording a site, and state which
+INSTRUMENT produced a number — in-process probe, CLI compile, or unit fixture — because the three
+have different walls and a figure without its instrument is not even wrong.
+
+## THE ONE OPEN ROW, AND IT IS THE NEXT CYCLE'S FIRST ITEM
+
+`D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED` (P1). It began as a
+vague census and is now a measured one: four corrected attributions, per-site ceilings, and a
+documented instrument defect **inside its own table**. Still unconverted, with numbers:
+
+- `lowerStmtNode`'s `SehTryExcept` arm — **400 rc 0 / 600 SEGFAULT**, the LOWEST ceiling anywhere
+  in the MIR tier. It should outrank everything else in this row.
+- The speculation drive is still host recursion (~1.63 KiB/level, 640 casts parse / 641 overflow),
+  so the shipped ceiling of 320 is floor/2 and DSS refuses at 321 where all four references
+  compile. Converting that drive is what closes the residual.
+- `parser.maxExpressionDepth` = 1024 against an ordinary-thread overflow at ~1260 — a **1.23×**
+  margin, not the ~3× its own comment claimed. **A build with fatter frames than MinGW Debug would
+  CRASH BEFORE THE CAP FIRES**, turning a loud refusal into a stack death.
+- `~MirLiteralValue` and `~HirLiteralValue` destructors cost one host frame per level and are
+  stdlib-generated; ✔proved by tearing one down iteratively (4000-crash → 100 000 rc 0).
+- `CompositeIdentityIndex::spine_` (`type_reintern.cpp`) — same shape, UNMEASURED.
+- The CLI's own 1024/2048 wall for deep array types — unattributed **deliberately**, because
+  attributing it without a debugger is the error above.
+
+## WHAT SHIPPED — SILENT WRONG ANSWERS FIRST, BECAUSE THAT IS WHAT THIS CYCLE WAS
+
+★★ **aarch64 `sp`/`xzr` share hardware encoding 31, and DSS read it per-FORM when the machine reads
+it per-FIELD.** ✔A 128-form census, gas 2.42 and clang 18.1.3 probed separately, ZERO reference
+splits: **10 forms emitted a different instruction than both references** and **15 more were
+emitted where both references refuse**; both are now 0. `mov x0, sp` gave `x0` **zero**;
+`add sp, sp, x1` **never adjusted the stack pointer**; `add xzr, x0, #16` **clobbered SP**;
+`adr xzr, main` emitted `add sp, sp, #:lo12:main`. Fixed by six config keys carrying the role
+per PLACEMENT, with `validate()` refusing a document whose registers collide without distinct
+roles. The row was filed naming two spellings; they were a quarter of it.
+
+★★ **The narrow `\x` escape truncated at two hex digits** — `"\x041"` emitted `04 31 00` where all
+four references emit `41 00`, rc 0, no diagnostic. Eight divergent narrow forms; `"a\xFFb"` matched
+NOBODY. Both range checks left the decoder (the bound is the element width, which the decoder
+cannot know), which is also why `u"\777"` had been refused as malformed.
+
+★ **`provableLvalueAlign` truncated at depth 64 and returned 0 — which `mir_to_lir` reads as
+ALIGNED.** A packed `_Atomic` past 64 chain links kept the native `ldar`/`stlr` and Bus-errors on
+native arm64, **invisible to three of the four gate legs**.
+
+★ **Two semantic caps truncated into wrong answers**: one dropped a diagnostic C23 6.7.6.1p2
+requires (and its limit of 16 sat *below* the standard's own 63-level floor), the other
+FABRICATED a redeclaration error on legal code. ⓘ The second is not reachable from any program
+written against the shipped config (585 signatures, deepest 4 levels) — measured, not assumed.
+
+★ **Nine nested casts were refused with a diagnostic blaming the user's own `int`.** FOUR stacked
+ceilings, not the two the row was filed on, each invisible until the one before it was lifted and
+all four producing the identical fabricated error. The cascade went from 19 diagnostics to 2.
+
+## THE UNION-OVER-WHAT-WORKS RULING DID REAL WORK THIS CYCLE
+
+Twice a fail-loud cap was shown to be **not an available exit**, by measurement rather than taste:
+gcc compiles 8192 nested braces (clang stops at 256), and gcc/mingw/clang/MSVC all compile 9+
+nested casts. One working reference makes the behaviour REQUIRED, so conversion — not a tidier
+refusal — was the only close. Conversely `fp` DELETED an above-the-union arm after measuring that
+both references refuse fp16 *integer* conversions at default `-march`.
+
+## HARNESS — fixed at the moment it blocked, filed born-closed
+
+- `lane-fold refresh-plans` carries `.plans/` into a LIVE worktree **and updates the seed
+  manifest**, so a mid-cycle row application stops false-reddening every sibling's
+  `anchor_registry_guard`. ⚠ Its measured residual: it does NOT carry sibling SOURCE, so a lane can
+  hold a closed row beside unrepaired prose — three lanes hit that. **A repo-wide prose guard is
+  ORCHESTRATOR-tier and authoritative only in the main tree.**
+- `wrapped_anchor_ids_guard` could not see a wrap of a row minted in the same cycle (its key set
+  is harvested from `.plans/` alone). Widened after measuring that the key test contributed **zero**
+  discrimination across 3,122 files; two self-test arms were INVERTED, not relaxed, because each
+  had encoded the blindness as intended behaviour.
+
+## FOR THE NEXT SESSION, IN ORDER
+
+1. The residue row above, `SehTryExcept` arm first.
+2. `examples/README.md` documents 634 manifests against a live census of **767** — plan-sweep work,
+   deliberately not hurried mid-cycle.
+3. Whether `tl`'s `representationType` conversion moved lane `bi`'s array-nesting ceiling is
+   **UNKNOWN**; it needs an in-process probe, not a CLI compile.
+
+---
+
+---
+
+★★★ **P54 — RELOCATED HERE BY P55, AND IT IS HISTORY, NOT STATE.** It was §0 until P55 closed. Every figure below is P54's own and was true at P54's tip; **re-derive anything you intend to act on.** Its through-line — *four times the broken thing was the measurement, not the code* — is the direct ancestor of P55's, which is the same failure one level out: a measurement attributed to the wrong FILE.
+
+## ⏪ P54's former §0 (history)
 
 **State, ✔measured at the tip and not re-quoted:** branch `feature/c23-conformance-burndown-6`.
 ⚠ **NO SHA IS PINNED HERE ON PURPOSE** — a handoff cannot name its own commit, since writing it
@@ -191,7 +303,6 @@ was the standing answer to this class — which is exactly what ruling (2) rejec
   refutation held.** Two of mine were refuted BY EXECUTION: that gcc's libatomic locks for
   misalignment (it does not — it locks only on a STRADDLE), and that a shipped-lib realization
   applies only to programs that include its header (a zero-include compile pulls three archives).
-
 ---
 
 ★★★ **P53 — RELOCATED HERE BY P54, AND IT IS HISTORY, NOT STATE.** It was §0 until P54 closed. Every figure below is P53's own and was true at P53's tip; **re-derive anything you intend to act on.** Its through-line — *ten times a true sentence had outlived the code it described* — is the direct ancestor of P54's, which is one level up: an instrument reporting correctly about the wrong thing.

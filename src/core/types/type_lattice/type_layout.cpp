@@ -6,6 +6,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <span>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace dss {
 
@@ -140,6 +144,118 @@ bitFieldStrategyRealized(BitFieldStrategy s) noexcept {
     return false;
 }
 
+// ── THE LAYOUT WALK COSTS HEAP, NOT HOST CALL FRAMES ────────────────────────
+//
+// D-CORE-TYPE-LAYOUT-AND-HIR-CONST-EVAL-RECURSE-PER-LEVEL. The operator's
+// standing ruling of 2026-09-02: *"it's well known to not use recursive
+// structures in the compiler because big projects like sqlite will for sure
+// explode the stack"*. `computeLayout` used to recurse once per TYPE LEVEL —
+// array element, struct/union field, complex component, flexible-array element
+// — and it sits BELOW every other walk in the compiler, so its ceiling WAS the
+// ceiling of every deep-type route in the pipeline.
+//
+// ✔MEASURED before the conversion, on the ordinary ~1 MiB thread and through
+// `ctest` (never a bare `.exe`): a 1000-level array or struct nest laid out with
+// rc 0 and a 2000-level one died at rc 8 with no message, no location and no
+// `[  FAILED  ]` line. The SAME two numbers bounded `lowerToMir` on hand-built
+// HIR whose types nest — a file this engine does not own — which is what makes
+// this the load-bearing site rather than merely one more of them.
+//
+// The shape is the standard one and it falls out of a property the engine
+// already had: a level's body is PURE in its children's layouts. So `layoutOne`
+// below is that body with every recursive call replaced by a `memo` read, and
+// the driver resolves the type graph bottom-up over an explicit heap work stack.
+// There is no surviving depth counter because there is no longer a depth to
+// count — the only limit is memory.
+//
+// ⚠⚠ A TYPE WALK NEEDS A VISITED SET, NOT ONLY A STACK, AND THE TWO ARE
+// DIFFERENT DEFECTS. `struct S { struct S *next; }` is not depth at all — a
+// POINTER is a scalar and this walk never steps through one, which is why the
+// commonest struct shape in C was never the problem. But `struct A { struct A
+// a; }`, and the mutual `A { B b; } / B { A a; }`, are genuine CYCLES in the
+// BY-VALUE graph, and a work stack without cycle detection converts a stack
+// overflow into an INFINITE LOOP, which is strictly worse. ✔MEASURED before
+// this conversion, same rig: both by-value shapes killed the process, while the
+// self-pointer control laid out fine. The precedent is `mir_text.cpp`'s
+// `appendType` ([[D-MIR-TEXT-APPENDTYPE-RECURSES-PER-TYPE-LEVEL-AND-NEVER-TERMINATES-ON-A-SELF-REFERENTIAL-COMPOSITE]]),
+// which never terminated on exactly this shape.
+//
+// A by-value cycle has NO size, so it answers `nullopt` — the same fail-loud
+// refusal an incomplete composite already gets from the guard at the top of
+// `layoutOne`, never a guessed size, never a truncation and never a hang.
+
+// The per-walk answer table: the layout (or the fail-loud `nullopt`) of every
+// type the walk has resolved, keyed by the VOLATILE-STRIPPED id — `volatile T`
+// and `T` have the same layout by construction (C 6.7.3), so they share one
+// entry rather than being walked twice.
+using LayoutMemo = std::unordered_map<TypeId, std::optional<StructLayout>>;
+
+// A field / element / component layout lookup — the ONE replacement for the
+// recursive call every arm used to make. `nullptr` is exactly the old `!fl`
+// ("this child has no layout, fail loud"), so each arm's refusal reads and
+// behaves as it did.
+//
+// A MISS also answers `nullptr`, and cannot happen: `forEachLayoutDependency`
+// enumerates a SUPERSET of what the arms ask for and the driver resolves every
+// one of them before running a level's body. Were the two ever to drift apart
+// the walk would REFUSE a type it could have laid out — a loud diagnostic at
+// the caller, never a guessed size and never a silent miscompile.
+[[nodiscard]] StructLayout const*
+childLayout(LayoutMemo const& memo, TypeInterner const& interner, TypeId id) {
+    auto const it = memo.find(interner.stripVolatile(id));
+    if (it == memo.end() || !it->second.has_value()) return nullptr;
+    return &*it->second;
+}
+
+// Every type id whose layout SOME arm of `layoutOne` can ask for, given an
+// already-volatile-stripped `id`. Deliberately a SUPERSET: resolving a type the
+// chosen arm turns out not to need costs one memo entry, while MISSING one
+// costs a wrong refusal.
+//   * only Complex / Array / Struct / Union descend at all — a Ptr is a scalar,
+//     which is what keeps a self-referential-by-pointer composite finite;
+//   * every operand is a candidate (the element for Complex/Array, every field
+//     for Struct/Union) whichever arm is ultimately taken;
+//   * a FLEXIBLE ARRAY MEMBER field is the one two-step edge in the engine —
+//     all three FAM arms ask for the incomplete array's ELEMENT layout, never
+//     the array's own (which is `nullopt` by design).
+template <class F>
+void forEachLayoutDependency(TypeInterner const& interner, TypeId id, F&& fn) {
+    switch (interner.kind(id)) {
+        case TypeKind::Complex:
+        case TypeKind::Array:
+        case TypeKind::Struct:
+        case TypeKind::Union:
+            break;
+        default:
+            return;   // every other kind answers from its own record alone
+    }
+    for (TypeId const c : interner.operands(id)) {
+        fn(interner.stripVolatile(c));
+        if (interner.isIncompleteArray(c)) {
+            auto const elem = interner.operands(c);
+            if (!elem.empty()) fn(interner.stripVolatile(elem[0]));
+        }
+    }
+}
+
+// Does this type need ANY child layout? The fast-path predicate: every scalar,
+// pointer, enum, `_BitInt`, incomplete composite, zero-field composite and
+// out-of-scope kind answers from its own record alone — the overwhelming
+// majority of the ~31 call sites' queries — and those must keep costing no
+// memo, no work stack and no allocation at all.
+[[nodiscard]] bool
+hasLayoutDependencies(TypeInterner const& interner, TypeId id) {
+    switch (interner.kind(id)) {
+        case TypeKind::Complex:
+        case TypeKind::Array:
+        case TypeKind::Struct:
+        case TypeKind::Union:
+            return !interner.operands(id).empty();
+        default:
+            return false;
+    }
+}
+
 // ── Per-strategy struct bit-field packers (D-CSUBSET-BITFIELD-ABI-EXACT) ──
 //
 // Each returns the fully-populated `out` (offsets, bitFields[], align, size) for
@@ -192,8 +308,8 @@ bitfieldPackerEffectiveAlign(TypeInterner const& interner, TypeId id, std::size_
 [[nodiscard]] std::optional<StructLayout>
 layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
                                TypeInterner const& interner,
-                               AggregateLayoutParams params, DataModel dm,
-                               StructLayout out) {
+                               AggregateLayoutParams params,
+                               LayoutMemo const& memo, StructLayout out) {
     out.bitFields.assign(fields.size(), BitFieldPlacement{});
     // TF-C97 (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the member-alignment cap this
     // composite was defined under — read ONCE here, then fed through
@@ -246,8 +362,8 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
                 if (i + 1 != fields.size()) return std::nullopt;
                 auto const fops = interner.operands(f);
                 if (fops.empty()) return std::nullopt;
-                auto const elem = computeLayout(fops[0], interner, params, dm);
-                if (!elem) return std::nullopt;
+                auto const* elem = childLayout(memo, interner, fops[0]);
+                if (elem == nullptr) return std::nullopt;
                 // A FAM can carry `alignas` (`alignas(16) int fam[];`): raise its
                 // effective alignment exactly as the non-bit-field path does.
                 auto const ea = bitfieldPackerEffectiveAlign(
@@ -260,8 +376,8 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
                 bitCursor = fo * 8;   // no size contribution
                 continue;
             }
-            auto const fl = computeLayout(f, interner, params, dm);
-            if (!fl) return std::nullopt;
+            auto const* fl = childLayout(memo, interner, f);
+            if (fl == nullptr) return std::nullopt;
             // Fold the cap + a member `alignas` override into the ordinary field's
             // alignment (D-CSUBSET-MEMBER-ALIGNAS) — a bit-field-bearing struct's
             // non-bit-field member may be over-aligned OR capped; the offset AND the
@@ -276,8 +392,8 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
             continue;
         }
         // Bit-field: the allocation unit is its declared type's size.
-        auto const fl = computeLayout(f, interner, params, dm);
-        if (!fl || fl->size == 0) return std::nullopt;   // non-int bitfield → fail loud
+        auto const* fl = childLayout(memo, interner, f);
+        if (fl == nullptr || fl->size == 0) return std::nullopt;   // non-int bitfield → fail loud
         // A bit-field's storage unit contributes its declared type's alignment to the
         // struct — CLAMPED by the cap, exactly like an ordinary field's. MEASURED:
         // clang's `#pragma pack(4) struct { char c; u64 b:1; }` is _Alignof 4 (the
@@ -396,10 +512,14 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
 // golden below was derived empirically from cl.exe 14.51
 // (D-CSUBSET-BITFIELD-ABI-EXACT conformance witness).
 [[nodiscard]] std::optional<StructLayout>
+// (No `params` / `dm`: this packer's whole per-ABI rule is the cl.exe-derived
+// placement below plus the per-composite `packed` / `pack(N)` channels it reads
+// from the interner. The GNU sibling still takes `params` because its
+// zero-width arm reads `unnamedBitFieldAlignment`; a parameter neither reads is
+// a claim about a dependency it does not have.)
 layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
                                   TypeInterner const& interner,
-                                  AggregateLayoutParams params, DataModel dm,
-                                  StructLayout out) {
+                                  LayoutMemo const& memo, StructLayout out) {
     out.bitFields.assign(fields.size(), BitFieldPlacement{});
     // TF-C97 (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the member-alignment cap, read
     // ONCE and fed through `clampedBaselineAlign` at every alignment site below —
@@ -429,8 +549,8 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
                 if (i + 1 != fields.size()) return std::nullopt;
                 auto const fops = interner.operands(f);
                 if (fops.empty()) return std::nullopt;
-                auto const elem = computeLayout(fops[0], interner, params, dm);
-                if (!elem) return std::nullopt;
+                auto const* elem = childLayout(memo, interner, fops[0]);
+                if (elem == nullptr) return std::nullopt;
                 // A FAM can carry `alignas`: raise its effective alignment
                 // (D-CSUBSET-MEMBER-ALIGNAS), mirroring the non-bit-field path.
                 auto const ea = bitfieldPackerEffectiveAlign(
@@ -443,8 +563,8 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
                 highWaterByte = fo;   // no size contribution
                 continue;
             }
-            auto const fl = computeLayout(f, interner, params, dm);
-            if (!fl) return std::nullopt;
+            auto const* fl = childLayout(memo, interner, f);
+            if (fl == nullptr) return std::nullopt;
             // Fold the cap + a member `alignas` override into the ordinary field's
             // alignment (D-CSUBSET-MEMBER-ALIGNAS) — legal on a non-bit-field member
             // of a bit-field-bearing struct; the offset AND struct align honor both.
@@ -459,8 +579,8 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
         }
         // Bit-field: the allocation unit is its declared type's size, aligned to
         // its declared type's natural alignment.
-        auto const fl = computeLayout(f, interner, params, dm);
-        if (!fl || fl->size == 0) return std::nullopt;   // non-int bitfield → fail loud
+        auto const* fl = childLayout(memo, interner, f);
+        if (fl == nullptr || fl->size == 0) return std::nullopt;   // non-int bitfield → fail loud
         // The unit's alignment — its declared type's, CLAMPED by the cap. Used both
         // for the struct-alignment fold and to place the unit itself below, so a
         // capped composite can never open a unit at an over-aligned byte.
@@ -708,18 +828,22 @@ bool isByValueClass(TypeInterner const& interner, TypeId id) noexcept {
     }
 }
 
-std::optional<StructLayout>
-computeLayout(TypeId id, TypeInterner const& interner,
-              AggregateLayoutParams params, DataModel dm) {
-    // c27 (D-CSUBSET-VOLATILE-POINTEE): a `volatile T` has the SAME layout as T
-    // (C 6.7.3 — a qualifier never changes size/alignment). Strip the VolatileQual
-    // skin ONCE here so the whole engine — incl. the raw-kind incomplete checks
-    // below and the recursive field/element layouts — operates on the material
-    // type. This single strip makes `sizeof(volatile T) == sizeof(T)` hold by
-    // construction and routes a volatile-qualified struct/array/scalar down its
-    // normal arm. (The transparent `kind()`/`operands()` would mostly suffice, but
-    // `isIncompleteComposite`/`isIncompleteArray` read the RAW record kind.)
-    id = interner.stripVolatile(id);
+namespace {
+
+// ── ONE TYPE LEVEL, AND NOTHING BELOW IT ────────────────────────────────────
+//
+// The whole of the old `computeLayout` body, ARM FOR ARM, with the single
+// change that every recursive `computeLayout(child, …)` is now a `childLayout`
+// read out of `memo`. That is what makes the level PURE in its children: it can
+// be run in any order the driver likes, exactly once per distinct type, with no
+// host frame per level.
+//
+// `id` arrives ALREADY volatile-stripped (the driver strips at every edge and
+// keys `memo` on the stripped id), so `isIncompleteComposite`/`isIncompleteArray`
+// still see the RAW record kind they need.
+[[nodiscard]] std::optional<StructLayout>
+layoutOne(TypeId id, TypeInterner const& interner,
+          AggregateLayoutParams params, DataModel dm, LayoutMemo const& memo) {
     TypeKind const kind = interner.kind(id);
 
     // D-CSUBSET-SELF-REFERENTIAL-STRUCT: an INCOMPLETE composite (a forward-declared
@@ -777,8 +901,8 @@ computeLayout(TypeId id, TypeInterner const& interner,
             // ABI-reject work); only its VALUE arithmetic walls loud downstream.
             auto const ops = interner.operands(id);
             if (ops.empty()) return std::nullopt;
-            auto const elem = computeLayout(ops[0], interner, params, dm);
-            if (!elem) return std::nullopt;
+            auto const* elem = childLayout(memo, interner, ops[0]);
+            if (elem == nullptr) return std::nullopt;
             std::uint64_t const es = elem->size;
             return StructLayout{es * 2, elem->align, {}, false};
         }
@@ -789,8 +913,8 @@ computeLayout(TypeId id, TypeInterner const& interner,
             auto const ops = interner.operands(id);
             auto const sc  = interner.scalars(id);
             if (ops.empty() || sc.empty() || sc[0] < 0) return std::nullopt;
-            auto const elem = computeLayout(ops[0], interner, params, dm);
-            if (!elem) return std::nullopt;
+            auto const* elem = childLayout(memo, interner, ops[0]);
+            if (elem == nullptr) return std::nullopt;
             std::uint64_t const stride = elem->align.alignUp(elem->size);
             std::uint64_t const len    = static_cast<std::uint64_t>(sc[0]);
             return StructLayout{stride * len, elem->align, {}, false};
@@ -824,8 +948,8 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 for (std::size_t i = 0; i < fields.size(); ++i) {
                     auto const off = interner.explicitFieldOffset(id, i);
                     if (!off) return std::nullopt;                 // partial offsets: malformed
-                    auto const fl = computeLayout(fields[i], interner, params, dm);
-                    if (!fl) return std::nullopt;
+                    auto const* fl = childLayout(memo, interner, fields[i]);
+                    if (fl == nullptr) return std::nullopt;
                     out.fieldOffsets.push_back(*off);
                     out.align = maxAlign(out.align, fl->align);
                     extent = std::max(extent, *off + fl->size);
@@ -931,8 +1055,8 @@ computeLayout(TypeId id, TypeInterner const& interner,
                         if (i + 1 != fields.size()) return std::nullopt;
                         auto const fops = interner.operands(f);
                         if (fops.empty()) return std::nullopt;
-                        auto const elem = computeLayout(fops[0], interner, params, dm);
-                        if (!elem) return std::nullopt;
+                        auto const* elem = childLayout(memo, interner, fops[0]);
+                        if (elem == nullptr) return std::nullopt;
                         // A FAM can carry alignas (`alignas(16) int fam[];`): raise
                         // its effective alignment the same way as an ordinary field.
                         auto const ea = effectiveAlign(i, elem->align);
@@ -943,8 +1067,8 @@ computeLayout(TypeId id, TypeInterner const& interner,
                         out.hasFlexibleArrayMember = true;
                         continue;  // no size contribution
                     }
-                    auto const fl = computeLayout(f, interner, params, dm);
-                    if (!fl) return std::nullopt;   // out-of-scope field type → fail loud
+                    auto const* fl = childLayout(memo, interner, f);
+                    if (fl == nullptr) return std::nullopt;   // out-of-scope field type → fail loud
                     auto const ea = effectiveAlign(i, fl->align);
                     if (!ea) return std::nullopt;
                     off = ea->alignUp(off);
@@ -965,10 +1089,10 @@ computeLayout(TypeId id, TypeInterner const& interner,
             switch (params.bitFieldStrategy) {
                 case BitFieldStrategy::GnuPacked:
                     return layoutStructBitfieldsGnuPacked(
-                        id, fields, interner, params, dm, std::move(out));
+                        id, fields, interner, params, memo, std::move(out));
                 case BitFieldStrategy::MsvcStraddle:
                     return layoutStructBitfieldsMsvcStraddle(
-                        id, fields, interner, params, dm, std::move(out));
+                        id, fields, interner, memo, std::move(out));
                 case BitFieldStrategy::None:
                     return std::nullopt;   // not declared → fail loud
             }
@@ -1107,8 +1231,8 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 && params.unnamedBitFieldAlignment == UnnamedBitFieldAlignment::None;
             std::uint64_t maxSize = 0;
             for (std::size_t i = 0; i < fields.size(); ++i) {
-                auto const fl = computeLayout(fields[i], interner, params, dm);
-                if (!fl) return std::nullopt;
+                auto const* fl = childLayout(memo, interner, fields[i]);
+                if (fl == nullptr) return std::nullopt;
                 auto const bw = anyBitfield ? interner.fieldBitWidth(id, i)
                                             : std::optional<std::uint32_t>{};
                 bool const isZeroWidth = bw.has_value() && *bw == 0;
@@ -1144,6 +1268,101 @@ computeLayout(TypeId id, TypeInterner const& interner,
             // (nullopt) — NEVER a guessed size.
             return std::nullopt;
     }
+}
+
+// ── THE DRIVER: one explicit heap work stack over the by-value type graph ────
+//
+// A post-order DFS with the classic three-colour marking, so it is a walk over a
+// DAG and not a tree: `memo` is BLACK (resolved — and the reason a type shared by
+// many fields is laid out ONCE rather than once per occurrence, which used to be
+// exponential on a shape like `struct L { struct L_1 a, b; }`), `gray` is the
+// current path, and everything else is white.
+//
+// ⚠ A BACK EDGE INTO `gray` IS A BY-VALUE CYCLE, and EVERY type currently on the
+// path is marked with it. That is not an approximation: a type on the path either
+// sits ON the cycle (no size — the cycle has no base case) or CONTAINS one BY
+// VALUE (no size either, because its cyclic member has none and every arm refuses
+// on a member with no layout). Both answers are `nullopt`, so marking the whole
+// path is the same answer the child-refusal would have propagated, arrived at
+// without needing the cycle to terminate first.
+//
+// ⚠ The realloc-safe rule, the same one `hir_to_mir`'s frame stacks document:
+// COPY the frame out and advance its phase BEFORE pushing anything, because
+// `work.back()` may dangle the moment the vector grows.
+[[nodiscard]] std::optional<StructLayout>
+computeLayoutIterative(TypeId root, TypeInterner const& interner,
+                       AggregateLayoutParams params, DataModel dm) {
+    enum class Phase : std::uint8_t { Expand, Resolve };
+    struct Frame {
+        TypeId id;
+        Phase  phase;
+    };
+
+    LayoutMemo                 memo;
+    std::unordered_set<TypeId> gray;     // on the current DFS path
+    std::unordered_set<TypeId> cyclic;   // on, or reaching, a by-value cycle
+    std::vector<Frame>         work;
+    work.push_back(Frame{root, Phase::Expand});
+
+    while (!work.empty()) {
+        Frame const f = work.back();
+        if (f.phase == Phase::Expand) {
+            if (memo.contains(f.id)) {   // already resolved by another parent
+                work.pop_back();
+                continue;
+            }
+            if (gray.contains(f.id)) {   // BACK EDGE — a by-value cycle
+                for (TypeId g : gray) cyclic.insert(g);
+                work.pop_back();
+                continue;
+            }
+            gray.insert(f.id);
+            work.back().phase = Phase::Resolve;
+            forEachLayoutDependency(interner, f.id, [&](TypeId c) {
+                work.push_back(Frame{c, Phase::Expand});
+            });
+            continue;
+        }
+        gray.erase(f.id);
+        work.pop_back();
+        memo.emplace(f.id, cyclic.contains(f.id)
+                               ? std::nullopt
+                               : layoutOne(f.id, interner, params, dm, memo));
+    }
+
+    auto const it = memo.find(root);
+    return it == memo.end() ? std::nullopt : it->second;
+}
+
+}  // namespace
+
+std::optional<StructLayout>
+computeLayout(TypeId id, TypeInterner const& interner,
+              AggregateLayoutParams params, DataModel dm) {
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): a `volatile T` has the SAME layout as T
+    // (C 6.7.3 — a qualifier never changes size/alignment). Strip the VolatileQual
+    // skin ONCE here so the whole engine — incl. the raw-kind incomplete checks in
+    // `layoutOne` and every field/element edge the driver walks — operates on the
+    // material type. This single strip makes `sizeof(volatile T) == sizeof(T)`
+    // hold by construction and routes a volatile-qualified struct/array/scalar
+    // down its normal arm. (The transparent `kind()`/`operands()` would mostly
+    // suffice, but `isIncompleteComposite`/`isIncompleteArray` read the RAW record
+    // kind.) It is also what makes the memo key canonical: `volatile T` and `T`
+    // share one entry instead of being resolved twice.
+    TypeId const root = interner.stripVolatile(id);
+
+    // ★ THE FAST PATH IS NOT AN OPTIMISATION FOOTNOTE, IT IS THE COMMON CASE.
+    // A type with no layout DEPENDENCIES — every scalar, pointer, enum,
+    // `_BitInt`, incomplete composite, zero-field composite and out-of-scope
+    // kind — answers from its own record, so it must not pay for a memo, a
+    // colour set or a work stack. `layoutOne` never reads `memo` on those arms
+    // (there is nothing to read), which is why handing it an empty one is exact
+    // rather than merely close.
+    if (!hasLayoutDependencies(interner, root)) {
+        LayoutMemo const noChildren;
+        return layoutOne(root, interner, params, dm, noChildren);
+    }
+    return computeLayoutIterative(root, interner, params, dm);
 }
 
 bool compositeFieldsOverlap(TypeId id, TypeInterner const& interner,

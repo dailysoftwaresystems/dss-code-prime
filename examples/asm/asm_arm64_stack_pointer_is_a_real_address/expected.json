@@ -1,0 +1,23 @@
+{
+  "$comment": "★★★ THE RUNNABLE WITNESS FOR [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]] (cycle P55, lane sp, 2026-09-03).\n\n★★★ WHAT WAS WRONG. AArch64 register field 31 names the STACK POINTER in add/subtract-immediate, in the extended-register forms and as a load/store BASE, and the ZERO REGISTER everywhere else. `sp` and `xzr` are two rows of `arm64.target.json`'s register table at that one `hwEncoding`, and nothing in the document said which one an instruction field meant — so whichever row the operand resolved to reached the encoder and the encoder wrote 31 either way. ✔MEASURED at the P55 base through the REAL CLI, every word read back with `aarch64-linux-gnu-objdump`: `mov x0, sp` emitted 0xAA1F03E0, which decodes as `mov x0, xzr` — x0 received ZERO instead of the stack pointer — and `mov sp, x0` emitted 0xAA0003FF, a NO-OP. `add x0, sp, x1` emitted 0x8B0103E0 (`add x0, xzr, x1`), `add sp, sp, x1` emitted 0x8B0103FF (the stack pointer never adjusted) and `cmp sp, x0` emitted 0xEB0003FF. rc=0, no diagnostic, wrong code, on two of the commonest lines in hand-written aarch64.\n\n★★★ THE CENSUS, BECAUSE TWO SPELLINGS WERE AN EXISTENCE PROOF AND NOT THE SCOPE. 128 forms probed against gas 2.42 AND clang 18.1.3 SEPARATELY — zero disagreements between the two references on any of them — and each DSS answer read back out of an assembled object. BEFORE: 10 forms emitted a DIFFERENT INSTRUCTION than both references (the silent miscompiles above, plus `mov sp, sp`, `mov x30, sp`, `mov sp, x30`, `sub x0, sp, x1`, `sub sp, sp, x1`), and 15 more were ACCEPTED where BOTH references refuse — among them `add x0, xzr, #16` emitting `add x0, sp, #16` (an ADDRESS where 16 was written) and `add xzr, x0, #16` emitting `add sp, x0, #16` (THE STACK POINTER CLOBBERED). AFTER: zero of either, 60 forms byte-identical to both references and 31 refused exactly where both references refuse.\n\n★★★ WHY THIS FILE EXECUTES INSTEAD OF PINNING A WORD, AND THE ARGUMENT IS STRONGER HERE THAN FOR MOST ROWS. `tests/asm/test_asm_arm64_shared_encoding_31.cpp` asserts the emitted WORD for every cell of that census. What a word cannot prove is that the value the program HOLDS is a real address: the defect was that a copy of the stack pointer silently became ZERO, and zero is a perfectly ordinary integer that arithmetic, a comparison and a byte pin all accept without complaint. So each of the four halves below takes the stack pointer through a general register and then USES it — writing through one route and reading back through a SECOND, independently computed one, with every target slot POISONED first. ⚠ NOTHING SHIPPED CAUGHT THIS: the existing arm64 assembly corpus exercises `mov` only between general registers, where encoding 31 never appears at all.\n\n★★ THE POISONS CANNOT SUM BACK TO A PASS: 100 / 200 / 300 / 400 against the correct 6 / 9 / 13 / 14. Correct is 42; any single half failing gives 136, 233, 329 or 428, and a stack pointer that moved when it should not have returns 99.\n\n✔ THE PROGRAM ITSELF IS CONTROLLED: built by the REFERENCE toolchain (`aarch64-linux-gnu-gcc -static`) and run under qemu-aarch64 it also exits 42, so a failure here is DSS's and never the test's.",
+  "language": "asm-arm64-gas",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "$commentByteIdentical": "The source of this example IS assembly, so it is assembled without ever forming the HIR/MIR an optimizer pass runs on. No pipeline can transform it and no edit to this example could make this arm differ from the baseline — the arm earns its place by pinning that naming a pipeline does not BREAK an assembly example. Deliberately NOT given \"mustDifferFromBaseline\": an honest no-op, not a missed opt-in."
+    }
+  ]
+}

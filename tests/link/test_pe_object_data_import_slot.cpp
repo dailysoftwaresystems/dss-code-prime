@@ -115,6 +115,24 @@ constexpr char const* kWeakDataImportSource =
 // fix that routed only the address through the slot would still not link. The
 // local `present` is the other direction: a module-local function's address is
 // a real code address and must NOT acquire a slot.
+// D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55): the STRONG
+// twin, `weak` the ONLY variable, so the two objects are read against each
+// other exactly as the reference probes were. ✔MEASURED 2026-09-02 that
+// DSS emitted the IDENTICAL object for both before P55 — one `FF 15` call
+// site and one 8-byte `.refptr.maybe` COMDAT — while clang 18.1.3 on BOTH
+// windows triples and mingw-w64 gcc 13.2.0 all emit a plain direct
+// `REL32 maybe` and NO `.refptr` section for this one.
+constexpr char const* kStrongFunctionImportSource =
+    "extern int maybe(void);\n"
+    "int present(void) { return 35; }\n"
+    "int main(void)\n"
+    "{\n"
+    "    int r = 0;\n"
+    "    if (maybe) { r += maybe(); } else { r += 7; }\n"
+    "    if (present) { r += present(); } else { r += 1; }\n"
+    "    return r;\n"
+    "}\n";
+
 constexpr char const* kWeakFunctionImportSource =
     "extern int maybe(void) __attribute__((weak));\n"
     "int present(void) { return 35; }\n"
@@ -318,6 +336,50 @@ TEST(PeObjectDataImportSlotDriver, WeakFunctionImportReachesTheCodeThroughACarri
         << dumpRelocs(rs);
 }
 
+TEST(PeObjectDataImportSlotDriver, StrongFunctionImportKeepsItsDirectReference) {
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55) — THE
+    // NARROWING, THROUGH THE PRODUCTION DRIVER, ON THE SHIPPED DOCUMENT.
+    //
+    // Same source as the test above with `weak` REMOVED and nothing else
+    // changed. ✔MEASURED 2026-09-02 that P54's unconditional dispatch emitted
+    // the IDENTICAL object for both — an `FF 15` call site plus an 8-byte
+    // `.refptr.maybe` COMDAT for a symbol that can never resolve to an
+    // absolute — and that all three references keep this one direct: clang
+    // 18.1.3 on `--target=x86_64-pc-windows-msvc` AND
+    // `--target=x86_64-w64-windows-gnu`, and mingw-w64 gcc 13.2.0, each
+    // probed separately with `weak` as the only variable.
+    //
+    // ⚠ THIS IS A BYTE PIN AND IT CANNOT SEE THE HALF THAT MATTERS MOST.
+    // `wf`'s sharpest P54 measurement was a mutant under which the relocation
+    // pin stayed GREEN while the program exited 0xC0000005 — both relocations
+    // still named `.refptr.maybe` and only the missing deref made it wrong.
+    // The RUN witness for this direction is
+    // `LinkExeLinksAndRunsAStrongFunctionImportDirectly` below.
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo,
+                                     "pe-import-slot"};
+    DiagnosticReporter rep;
+    auto const obj = buildObj(scratch.path(), "stfn",
+                              kStrongFunctionImportSource, rep);
+    ASSERT_FALSE(obj.empty())
+        << "the production driver must compile this to a pe64 `.obj`; errs="
+        << rep.errorCount();
+    auto const bytes = readFile(obj);
+    ASSERT_FALSE(bytes.empty());
+    auto const rs = allRelocs(bytes);
+
+    EXPECT_TRUE(hasReloc(rs, ".text", kRel32, "maybe"))
+        << "a STRONG undefined has no absolute resolution — the final link "
+           "finds a definition or fails loud — so its reference is "
+           "representable pc-relative and must stay direct"
+        << dumpRelocs(rs);
+    EXPECT_FALSE(hasReloc(rs, ".text", kRel32, ".refptr.maybe"))
+        << "no reference to a strong import may go through a slot: that is a "
+           "load per call site plus an 8-byte COMDAT bought for nothing, and "
+           "it is what every reference declines to emit" << dumpRelocs(rs);
+    EXPECT_FALSE(hasReloc(rs, ".rdata", kAddr64, "maybe"))
+        << "and no slot may be minted for it" << dumpRelocs(rs);
+}
+
 // ══ TIER 2 — the foreign linkers, and the RUN ══
 
 #if defined(_WIN32)
@@ -500,7 +562,7 @@ TEST(PeObjectDataImportSlotNative, ADefinitionPresentResolvesThroughTheSlot) {
     // The DEFINITION comes from the reference C compiler, not from DSS: a
     // second DSS object would leave both halves of the question answered by
     // one implementation.
-    writeSrc(dir, "eadef.c", "int ea = -28;\n");
+    (void)writeSrc(dir, "eadef.c", "int ea = -28;\n");
     ASSERT_TRUE(env.run("cl /nologo /c eadef.c /Foeadef.obj"))
         << "the reference C compiler must build the defining TU";
 
@@ -598,7 +660,7 @@ TEST(PeObjectDataImportSlotNative, AFunctionDefinitionPresentResolvesThroughTheS
     auto const obj = buildObj(dir, "wkfn", kWeakFunctionImportSource, rep);
     ASSERT_FALSE(obj.empty()) << "errs=" << rep.errorCount();
     fs::copy_file(obj, dir / "wkfn.obj", fs::copy_options::overwrite_existing);
-    writeSrc(dir, "maybedef.c", "int maybe(void) { return -28; }\n");
+    (void)writeSrc(dir, "maybedef.c", "int maybe(void) { return -28; }\n");
     ASSERT_TRUE(env.run("cl /nologo /c maybedef.c /Fomaybedef.obj"))
         << "the reference C compiler must build the defining TU";
 
@@ -614,5 +676,86 @@ TEST(PeObjectDataImportSlotNative, AFunctionDefinitionPresentResolvesThroughTheS
         << "-28 (returned by the definition, reached THROUGH the resolved "
            "slot) + 35. A slot whose fixup never ran would give 42 — the same "
            "number the unresolved case correctly produces.";
+}
+
+// ══ D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55):
+//    THE STRONG DIRECTION, AND IT NEEDS BOTH WITNESSES ══
+//
+// A relocation pin can show that the `E8` names `maybe` directly. It CANNOT
+// show that the resulting program runs — ✔MEASURED in P54 that a byte pin
+// stayed green over a mutant whose image exited 0xC0000005, because the
+// relocations were right and only the deref was missing. So the direct shape
+// gets a RUN too, and the number is a SUM (the definition's value + a
+// module-local call) so reversing either branch changes it.
+
+TEST(PeObjectDataImportSlotNative, LinkExeLinksAndRunsAStrongFunctionImportDirectly) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo,
+                                     "pe-import-slot"};
+    auto const dir = scratch.path();
+    auto const msvc = test_support::native_probe::locateMsvcToolchain(dir);
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    MsvcEnv const env{msvc.vcvars, dir};
+
+    DiagnosticReporter rep;
+    auto const obj = buildObj(dir, "stfn", kStrongFunctionImportSource, rep);
+    ASSERT_FALSE(obj.empty()) << "errs=" << rep.errorCount();
+    fs::copy_file(obj, dir / "stfn.obj", fs::copy_options::overwrite_existing);
+    (void)writeSrc(dir, "maybedef.c", "int maybe(void) { return -28; }\n");
+    ASSERT_TRUE(env.run("cl /nologo /c maybedef.c /Fomaybedef.obj"))
+        << "the reference C compiler must build the defining TU";
+
+    ASSERT_TRUE(env.run("link /nologo /OUT:stfndef.exe /ENTRY:main "
+                        "/SUBSYSTEM:CONSOLE /NODEFAULTLIB stfn.obj "
+                        "maybedef.obj"))
+        << "link.exe must link a DIRECT `E8` reference to a strong import "
+           "against its definition — this is the shape the narrowing restores, "
+           "and the shape clang and mingw gcc both emit";
+    auto const exe = dir / "stfndef.exe";
+    ASSERT_TRUE(fs::exists(exe));
+    auto const r = test_support::runBinary(exe);
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 7u)
+        << "-28 (the definition, reached by a DIRECT call) + 35 (the local). "
+           "A direct reference retargeted at a slot would branch into pointer "
+           "bytes; a slot that stayed null would give 42.";
+}
+
+TEST(PeObjectDataImportSlotNative, AStrongFunctionImportWithNoDefinitionIsRefusedLoudly) {
+    // ★ THE OTHER SIDE OF THE NARROWING, AND THE REASON IT IS SAFE: the slot
+    // exists because a WEAK reference may legally resolve to NOTHING. A STRONG
+    // one may not — the link must find a definition or FAIL — so removing its
+    // slot cannot produce a quietly-null program, only a loud unresolved
+    // symbol. ✔MEASURED at this tree: link.exe answers LNK2019 + LNK1120,
+    // mingw ld answers `undefined reference to 'maybe'` at BOTH call sites,
+    // and lld-link 18.1.3 answers `undefined symbol: maybe`.
+    // ⓘ AND THE DIAGNOSTIC GOT BETTER, which is worth pinning because it is
+    // the opposite of what a cost-narrowing usually does: with the reference
+    // direct, link.exe names the REFERENCING FUNCTION (LNK2019 `referenced in
+    // function main`) where before it named an anonymous COMDAT (LNK2001),
+    // and mingw ld names the two `.text` sites where before it named
+    // `.rdata[.refptr.maybe]`. The unnarrowed slot was hiding the reference
+    // site from the reader.
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo,
+                                     "pe-import-slot"};
+    auto const dir = scratch.path();
+    auto const msvc = test_support::native_probe::locateMsvcToolchain(dir);
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    MsvcEnv const env{msvc.vcvars, dir};
+
+    DiagnosticReporter rep;
+    auto const obj = buildObj(dir, "stfn", kStrongFunctionImportSource, rep);
+    ASSERT_FALSE(obj.empty()) << "errs=" << rep.errorCount();
+    fs::copy_file(obj, dir / "stfn.obj", fs::copy_options::overwrite_existing);
+
+    EXPECT_FALSE(env.run("link /nologo /OUT:stfnbare.exe /ENTRY:main "
+                         "/SUBSYSTEM:CONSOLE /NODEFAULTLIB stfn.obj"))
+        << "a STRONG import with no definition must be REFUSED — if this "
+           "linked, the narrowing would have turned a required symbol into an "
+           "optional one, which is the only way it could be unsafe";
+    EXPECT_FALSE(fs::exists(dir / "stfnbare.exe"))
+        << "and no image may be produced";
 }
 #endif  // _WIN32

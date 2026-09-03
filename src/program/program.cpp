@@ -2293,7 +2293,20 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                      reporter,
                                      // D-CSUBSET-PACKED-ATOMIC-MEMBER: the
                                      // format's atomics-runtime block.
-                                     (*formatR)->atomicsRuntime());
+                                     (*formatR)->atomicsRuntime(),
+                                     // P55, anchor
+                                     // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
+                                     // the format's
+                                     // narrowing of WHICH bindings the
+                                     // `indirect-slot` dispatch above reaches
+                                     // through the import slot. Passed here
+                                     // and not left to the default because the
+                                     // merge path emits `.obj`s too, and the
+                                     // linker's slot pass reads the format
+                                     // DIRECTLY — a merged module lowered
+                                     // without the narrowing would disagree
+                                     // with it symbol for symbol.
+                                     (*formatR)->indirectSlotBindings());
     if (!mod) return std::nullopt;  // back-half tier failure already reported via `reporter`
     // c165 (D-LK-STATIC-LINK): the merged whole-program client module links
     // against any `ar` static archives named on `--resolve-library` the same way

@@ -487,6 +487,19 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
 // pc-relative references this pass retargets are both slot references by
 // construction. The import scan below is therefore NOT restricted to data.
 //
+// ★★★ AND SINCE P55 IT IS NOT UNCONDITIONAL EITHER —
+// D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT. Every sentence above
+// is about a WEAK import and every one of them still holds; what was wrong was
+// the SCOPE, because the fix above was declared for all imports while the defect
+// it closes exists only where the reference may resolve to nothing. ✔MEASURED
+// 2026-09-02 on a DSS `.obj` for the STRONG twin of the fixture above — `weak`
+// the only variable — that it carried the identical `FF 15` + `.refptr.maybe`
+// COMDAT, and that all three references emit a plain direct `REL32 maybe` with
+// NO `.refptr` section there: clang 18.1.3 on BOTH windows triples and
+// mingw-w64 gcc 13.2.0. So the two relocatable pe64 documents now also declare
+// `indirectSlotBindings: ["weak"]` and the scan below asks the SCHEMA, per
+// import, through `externRefTakesImportSlot`.
+//
 // ⓘ ONLY PC-RELATIVE references are retargeted. A STATIC-DATA initializer
 // (`int *p = &ea;`) reaches the object as an ABSOLUTE 64-bit relocation in
 // a data item, which represents an absolute-0 target perfectly well and is
@@ -580,22 +593,41 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     // these two declared facts, and the two tiers must agree symbol for
     // symbol or the object is miscompiled in one direction or the other:
     //   * DATA import + `dataImportBinding: got-indirect` — c117's lea+deref;
-    //   * ANY import + `externCallDispatch: indirect-slot` — the call site is
-    //     `call *[rip+sym]` and `&sym` is a lea+deref of the same place.
+    //   * an import whose BINDING the format routes through the slot
+    //     (`externCallDispatch: indirect-slot`, scoped by
+    //     `indirectSlotBindings`) — its call site is `call *[rip+sym]` and
+    //     `&sym` is a lea+deref of the same place. `externRefTakesImportSlot`
+    //     on the schema is the ONE owner of that question; this pass and
+    //     MIR→LIR both read it rather than each deriving it.
     // ★ A FUNCTION import under `direct-plt` MUST NOT BE RETARGETED, and that
     // is the whole reason this is a condition rather than "every import": the
     // call site there is a plain `call rel32`, so pointing it at the slot
     // would make the program CALL the pointer bytes. That was the discriminator
     // the DATA half shipped as `if (ext.isData)`; widening it to every import
     // unconditionally would have reintroduced it one dispatch over.
-    // ⓘ NOT narrowed to WEAK imports either. Under `indirect-slot` a STRONG
-    // import's call is a slot deref too, so a weak-only rule would leave it
-    // dereferencing the import's own address — the same one-indirection error.
-    bool const slotForEveryImport =
-        fmt.externCallDispatch() == ExternCallDispatch::IndirectSlot;
+    // ⚠⚠ THE SECOND BULLET USED TO READ "ANY import + `externCallDispatch:
+    // indirect-slot`", AND THE PARAGRAPH BELOW IT SAID THE NARROWING TO WEAK
+    // IMPORTS WAS UNSAFE: "Under `indirect-slot` a STRONG import's call is a
+    // slot deref too, so a weak-only rule would leave it dereferencing the
+    // import's own address." That was TRUE OF THE CODE THAT WROTE IT and is
+    // false now, and the difference is one line in MIR→LIR:
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT moved the CALL
+    // SITE's shape off the format-level dispatch and onto the SAME per-symbol
+    // set the address arm already used, so a strong import's call is a plain
+    // `E8` again and there is no deref left to be wrong. The old sentence
+    // described a real hazard of a HALF narrowing — narrow the slot pass but
+    // leave the call shape format-wide — and it is preserved because that half
+    // is still exactly as broken as it says.
+    // ⓘ THE DATA ARM IS DELIBERATELY NOT NARROWED. `dataImportBinding`'s
+    // unconditional slot has its own measured reason recorded in the format
+    // document — `ld` refuses a direct rel32 against a symbol it must
+    // AUTO-IMPORT from a DLL — which has nothing to do with weakness, so the
+    // binding axis does not govern it.
     std::unordered_set<std::uint32_t> slotImports;
     for (auto const& ext : m.externImports) {
-        if (ext.isData || slotForEveryImport) slotImports.insert(ext.symbol.v);
+        if (ext.isData || fmt.externRefTakesImportSlot(ext.binding)) {
+            slotImports.insert(ext.symbol.v);
+        }
     }
     if (slotImports.empty()) return true;
     // `pcRelative` is read from the TARGET's own relocation table, never
@@ -992,6 +1024,40 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // The format's extern-call shape decides the reference-resolution mechanism
     // below: an indirect-slot call site needs the deref-able thunk slot; a
     // direct-plt (or undeclared-dispatch) reference binds straight to the def.
+    //
+    // ⚠⚠ THIS USED TO BE ONE FORMAT-WIDE BOOL AND IS NOW ASKED PER REFERENCE —
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT. A format may now
+    // route only SOME bindings through the slot (`indirectSlotBindings`), and
+    // this pass RETARGETS the referencing relocation: minting a thunk slot for
+    // a reference whose call site MIR→LIR emitted as a plain `E8` would point
+    // the direct call at pointer bytes and the program would execute them. The
+    // question is therefore the same per-symbol one `materializeObjectImportSlots`
+    // asks, and it is asked of the REFERENCING CU's own import row — the row
+    // MIR→LIR read when it chose the shape — never of a post-fold binding.
+    // Built ONCE rather than scanned per reference: `resolvedCrossCuRefs` is
+    // O(cross-CU edges) and the import lists are O(imports per CU), so the
+    // obvious nested scan is quadratic in exactly the shape a whole-program
+    // sqlite link produces.
+    std::unordered_map<std::uint64_t, SymbolBinding> importBindingByKey;
+    for (auto const& mod : modules) {
+        for (auto const& e : mod.externImports) {
+            importBindingByKey.emplace(
+                (static_cast<std::uint64_t>(mod.cuId.v) << 32)
+                    | static_cast<std::uint64_t>(e.symbol.v),
+                e.binding);
+        }
+    }
+    auto const referenceBinding =
+        [&](LinkedSymbolKey const& key) -> std::optional<SymbolBinding> {
+        auto const it = importBindingByKey.find(
+            (static_cast<std::uint64_t>(key.cuId.v) << 32)
+                | static_cast<std::uint64_t>(key.symbol.v));
+        if (it == importBindingByKey.end()) return std::nullopt;
+        return it->second;
+    };
+    // Whether ANY reference could want a slot — the guard the abs64-missing
+    // fail-loud below keys on, kept format-wide because it asks "can this
+    // format ever need one", not "does this reference".
     bool const useIndirectSlot =
         objectFormatSchema.externCallDispatch().has_value()
         && externCallUsesIndirectShape(*objectFormatSchema.externCallDispatch());
@@ -1198,7 +1264,21 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             continue;
         }
         std::uint32_t const defId = mergedIdFor(dit->second, ref.definition.symbol);
-        if (useIndirectSlot) {
+        // The reference's OWN binding decides, through the schema's one owner.
+        // A MISS cannot happen — `resolvedCrossCuRefs` is built FROM these
+        // modules' import rows, and the loop above already fails LOUD on the
+        // sibling breach of that same invariant (the definition's CU missing
+        // from the span). It is nevertheless TOTAL rather than assumed away,
+        // and the total answer takes the FORMAT-WIDE arm because that is the
+        // conservative direction here: a slot nothing dereferences is dead
+        // weight the final linker discards, while a missing slot under an
+        // indirect call site is a wrong call target.
+        auto const refBinding = referenceBinding(ref.reference);
+        bool const thisRefUsesSlot =
+            refBinding.has_value()
+                ? objectFormatSchema.externRefTakesImportSlot(*refBinding)
+                : useIndirectSlot;
+        if (thisRefUsesSlot) {
             std::uint32_t const thunkSlotId = nextId++;
             AssembledData slot;
             slot.symbol  = SymbolId{thunkSlotId};

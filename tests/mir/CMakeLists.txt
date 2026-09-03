@@ -125,3 +125,9 @@ dss_add_test(NAME mir/test_mir_text_unsealed_block
 # disagree three ways, so pe must keep NOT growing a recursion guard.
 dss_add_test(NAME mir/test_synth_threads_mtx_type
              SOURCES test_synth_threads_mtx_type.cpp)
+
+# P55 lane `rc` — "depth costs heap, not host call frames". Its OWN binary
+# because a red here is a STACK OVERFLOW, which kills the process and would take
+# every sibling test in a shared executable down unattributably with it.
+dss_add_test(NAME mir/test_deep_nesting_costs_heap
+             SOURCES test_deep_nesting_costs_heap.cpp)

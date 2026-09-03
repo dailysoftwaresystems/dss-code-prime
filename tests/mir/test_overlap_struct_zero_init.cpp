@@ -181,7 +181,7 @@ struct Built {
 // A UNION needs its OWN builder, and the reason is the whole point of the row.
 // `buildVarDeclInit` above emits one child per member because that is what a
 // STRUCT initializer looks like; a union initializer names exactly ONE member
-// (C 6.7.9p17), which is what `lowerUnionBraceInit` emits and what
+// (C 6.7.9p17), which is what `prepareUnionBraceInit`'s one-slot level emits and what
 // `synthZeroOrError`'s composite arm emits (`n = (core == Union) ? 1 :
 // ops.size()`). Reusing the struct builder here would hand the lowering a shape
 // no front end produces — and would trip the new multi-child refusal instead of
@@ -646,7 +646,7 @@ TEST(OverlapStructZeroInit, ZeroUnionInitIsOneStoreNotAWholeObjectFill) {
 // ★ THE ASSERT THAT IS EXPECTED NEVER TO FIRE, PINNED ANYWAY. Routing unions past
 // the overlap gate is sound ONLY because a union initializer supplies exactly one
 // member, and ✔MEASURED THREE independent things already guarantee that:
-// `lowerUnionBraceInit` returns a 1-child ConstructAggregate, `synthZeroOrError`
+// `prepareUnionBraceInit` yields a 1-child ConstructAggregate, `synthZeroOrError`
 // computes `n = 1` for a union, and `HirVerifier::checkConstructAggregate` refuses
 // any other child count outright. No front end can build the shape below.
 //

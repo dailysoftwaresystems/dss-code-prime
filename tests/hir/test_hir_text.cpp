@@ -1554,3 +1554,83 @@ TEST(HirText, InlineAsmRegisterClassOrdinalInsideTheEnumStillLoads) {
     EXPECT_EQ(res->inlineAsmPool.at(1).operands[0].regClass,
               static_cast<std::uint8_t>(TargetRegClass::GPR));
 }
+
+// ── the self-referential composite ───────────────────────────────────────────
+//
+// `struct S { int v; struct S *next; }` is the commonest shape in C, and the
+// type graph it interns is CYCLIC: the struct's second field is `ptr<struct S>`,
+// whose operand is the struct itself. `appendType` walks operands structurally
+// with nothing tracking what it is already inside, so a naive walk re-enters the
+// struct through its own field forever. That is an INTERNER CYCLE, not a depth
+// problem — no nesting cap can bound it, because the graph has no bottom.
+//
+// ✔MEASURED 2026-09-02 BEFORE the fix, on exactly the declaration below:
+// `emitHir` died with STATUS_STACK_OVERFLOW (0xC00000FD) — an uncatchable process
+// kill, no diagnostic, no output. The claim reached this lane marked INFERRED and
+// it HELD.
+//
+// The fix is a CYCLE GUARD, not a depth cap: the graph has no bottom, so a cap
+// only chooses how much stack to burn before the same crash while also refusing
+// legitimately deep acyclic types. Since this grammar has no back-reference form,
+// the honest result is a LOUD refusal with unparseable output — `opaque` would
+// reintern a COMPLETE struct as INCOMPLETE, a silent ABI drop.
+//
+// RED-ON-DISABLE, REMOVE DIRECTION: delete the `compositesOpen_` membership test
+// in `appendType` and this test does not fail — it CRASHES THE RUNNER, which is
+// the honest signal for the defect it pins.
+TEST(HirText, SelfReferentialStructTerminates) {
+    TypeInterner in{CompilationUnitId{77}};
+    TypeId const s = in.forwardComposite(TypeKind::Struct, "S", /*declSiteKey=*/7);
+    std::array<TypeId, 2> const fields{in.primitive(TypeKind::I32), in.pointer(s)};
+    in.completeComposite(s, fields, /*packed=*/false);
+
+    HirBuilder b{"toy"};
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{});
+    std::array<TypeId, 1> const params{in.pointer(s)};
+    TypeId const sig = in.fnSig(params, in.primitive(TypeKind::Void), CallConv::CcSysV);
+    HirNodeId const fn   = b.makeFunction(sig, /*symbol=*/1, {}, body);
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "f"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    DiagnosticReporter r;
+    std::string const text = emitHir(hir, ctx, r);
+    // Reaching this line at all is the primary assertion: before the guard the
+    // process died here.
+    EXPECT_LT(text.size(), 4096u) << "bounded output, not a runaway expansion";
+    EXPECT_NE(text.find("struct \"S\""), std::string::npos)
+        << "the outermost spelling still happens — only the RE-ENTRY is cut\n" << text;
+    // ...and the cut is LOUD, with output that cannot be silently re-parsed.
+    EXPECT_TRUE(r.hasErrors()) << "a type this codec cannot spell must be an Error";
+    EXPECT_NE(text.find('?'), std::string::npos)
+        << "the poison token must be present so the text is refused on reintern";
+    bool saidCyclic = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("CYCLIC") != std::string::npos) saidCyclic = true;
+    }
+    EXPECT_TRUE(saidCyclic) << "the diagnostic must name the CAUSE, not just fail";
+
+    // A sibling repeat is ordinary sharing, NOT a cycle — the guard is a stack, and
+    // a set would wrongly poison this.
+    TypeInterner in2{CompilationUnitId{78}};
+    TypeId const i32 = in2.primitive(TypeKind::I32);
+    TypeId const inner = in2.forwardComposite(TypeKind::Struct, "Inner", 8);
+    std::array<TypeId, 1> const innerFields{i32};
+    in2.completeComposite(inner, innerFields, false);
+    TypeId const outer = in2.forwardComposite(TypeKind::Struct, "Outer", 9);
+    std::array<TypeId, 2> const outerFields{inner, inner};   // the SAME type twice
+    in2.completeComposite(outer, outerFields, false);
+    HirBuilder b2{"toy"};
+    HirNodeId const body2 = b2.makeBlock(std::vector<HirNodeId>{});
+    std::array<TypeId, 1> const params2{in2.pointer(outer)};
+    TypeId const sig2 = in2.fnSig(params2, in2.primitive(TypeKind::Void), CallConv::CcSysV);
+    HirNodeId const fn2   = b2.makeFunction(sig2, 1, {}, body2);
+    Hir hir2 = std::move(b2).finish(b2.makeModule(std::vector<HirNodeId>{fn2}));
+    HirTextContext ctx2; ctx2.interner = &in2; ctx2.symbolNames = &names;
+    DiagnosticReporter r2;
+    std::string const text2 = emitHir(hir2, ctx2, r2);
+    EXPECT_FALSE(r2.hasErrors())
+        << "a sibling repeat is sharing, not a cycle — it must spell twice\n" << text2;
+    EXPECT_EQ(text2.find('?'), std::string::npos) << text2;
+}

@@ -464,6 +464,47 @@ struct AsmInstructionSpelling {
     // resolved against `TargetSchema::opcodeByMnemonic` at lowering time (the
     // opcode table lives in `.target.json`, which `core` cannot see here).
     std::vector<std::string> opcodeNames;
+    // ★★★ OPTIONAL — "`opcodeNames` IS A **RANKED** LIST OF ENCODINGS OF ONE
+    // OPERATION, NOT A SET OF ALTERNATIVE INSTRUCTIONS."
+    // [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]], 2026-09-03.
+    //
+    // ★★ WHAT IT CHANGES, AND IT IS EXACTLY ONE THING. `electOpcode` normally
+    // REFUSES when two candidates accept the same operands, because "two
+    // opcodes that both fit means the dialect row cannot say which instruction
+    // the programmer wrote, and picking the first would be a coin flip baked
+    // into config order". That objection is sound and stays the DEFAULT. This
+    // key states the case in which it does not apply: when the candidates are
+    // encodings of ONE operation, the programmer did not choose between them —
+    // they wrote a spelling that denotes the operation — and the assembler is
+    // entitled to pick, in the order the dialect ranks them.
+    //
+    // ★★★ IT IS A MEASURED PROPERTY OF THE REFERENCE, NOT A CONVENIENCE.
+    // ✔MEASURED 2026-09-03, gas 2.42 and clang 18.1.3 probed SEPARATELY,
+    // agreeing on every cell and NEITHER warning: `ldr h0,[x1,#2]` assembles to
+    // the SCALED 0x7D400420 while `ldr h0,[x1,#1]` assembles to the UNSCALED
+    // 0x7C401020 — one spelling, two encodings, scaled preferred where both
+    // fit. The same holds at every width, in both directions (`str`), and on
+    // the integer file (`ldr x0,[x1,#1]` = 0xF8401020 = `ldur x0,[x1,#1]`).
+    //
+    // ⚠⚠ THE RANK IS NOT A LICENCE TO ENCODE THE WRONG THING, AND THE REASON
+    // IS THAT THE GUARDS STILL DECIDE. A candidate is reached only if its own
+    // `encoding.variants[].guard` accepts the operands, so the ordering can
+    // only ever choose among candidates that ALL encode correctly. What makes
+    // that true here is `guard.immMultipleOf`: without it a scaled variant
+    // matches an offset its encoder then refuses, and the ranking would hand
+    // the operation to a form that cannot carry it. The two keys are one
+    // mechanism and neither is safe alone.
+    //
+    // ⚠ AND IT NEVER WIDENS WHAT IS ACCEPTED. A value no candidate can encode
+    // is still refused, by the last candidate's own encoder — ✔MEASURED that
+    // both references refuse it too (`ldr h0,[x1,#257]`, outside imm9 and not
+    // a multiple of 2, is `Error: immediate offset out of range` in gas and
+    // `index must be an integer in range [-256, 255]` in clang).
+    //
+    // ⓘ FALSE IS THE NORMAL STATE: every pre-existing row keeps the ambiguity
+    // refusal, which is what a row naming two genuinely different instructions
+    // needs.
+    bool                     opcodesAreRankedEncodings = false;
     // ★★★ OPTIONAL, BECAUSE WHERE THE WIDTH IS WRITTEN IS A DIALECT FACT.
     // ✔MEASURED 2026-08-13 against a real arm64 dialect: AT&T puts the width in
     // the MNEMONIC SUFFIX (`movq` / `movl` — same registers, different width),

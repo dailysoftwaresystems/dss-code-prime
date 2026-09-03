@@ -610,6 +610,18 @@ public:
     [[nodiscard]] TypeId commonType(TypeId a, TypeId b);
 
 private:
+    // ONE level of `representationType`, with the children's projections handed
+    // in rather than computed by a recursive call — the body that used to BE
+    // `representationType`. Split out so the walk over the type graph can be an
+    // explicit heap work stack instead of one host frame per type level
+    // (D-TYPEINTERNER-REPRESENTATIONTYPE-RECURSES-PER-TYPE-LEVEL-UNCAPPED); the
+    // `-Werror=switch` no-`default:` backstop lives in THIS function now.
+    // A source id absent from `projected` answers identity, which is the
+    // conservative direction: an unprojected `nullptr_t` is refused loudly at
+    // MIR (`I_NullptrTypeInMir`), never silently mistyped.
+    [[nodiscard]] TypeId projectRepresentationLevel(
+        TypeId id, std::unordered_map<TypeId, TypeId> const& projected);
+
     TypeId internContent(TypeKind kind, TypeKindId extensionKind,
                          std::span<TypeId const> operands,
                          std::span<std::int64_t const> scalars,

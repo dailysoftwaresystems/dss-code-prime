@@ -243,11 +243,18 @@ private:
         std::string origin;
     };
 
-    // Recursively record/verify every named type REACHABLE from `t`. `operands()`
-    // is the universal child accessor (and is qualifier-transparent), so no kind
-    // switch is needed; `visited_` makes a self-referential type terminate.
+    // Record/verify every named type REACHABLE from `t`. `operands()` is the
+    // universal child accessor (and is qualifier-transparent), so no kind switch
+    // is needed; `visited_` makes a self-referential type terminate.
+    //
+    // ★★ THE DESCENT IS AN EXPLICIT HEAP STACK, NOT HOST RECURSION
+    // (feedback-no-input-proportional-recursion). A descriptor's type graph is
+    // CONFIG, so its depth is the user's to choose; `visited_` bounded the walk's
+    // TERMINATION and never its host-stack cost. `walkOne` is the per-type body.
     void walk(TypeId t, std::string_view origin, DiagnosticReporter& reporter,
               bool& ok);
+    void walkOne(TypeId t, std::string_view origin, DiagnosticReporter& reporter,
+                 bool& ok);
 
     void recordNamed(std::unordered_map<std::string, Decl>& into,
                      char const* what, std::string name, TypeId t,

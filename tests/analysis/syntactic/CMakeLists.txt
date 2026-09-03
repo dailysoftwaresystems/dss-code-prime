@@ -4,6 +4,11 @@ dss_add_test(NAME analysis/syntactic/test_parser_c_smoke SOURCES test_parser_c_s
 dss_add_test(NAME analysis/syntactic/test_pratt_walker          SOURCES test_pratt_walker.cpp)
 dss_add_test(NAME analysis/syntactic/test_parser_recovery       SOURCES test_parser_recovery.cpp)
 dss_add_test(NAME analysis/syntactic/test_parser_cast_expr      SOURCES test_parser_cast_expr.cpp)
+# D-PARSE-NINE-NESTED-CASTS-ARE-REFUSED-BY-THE-SPECULATION-CAP-WITH-A-FABRICATED-SYNTAX-ERROR:
+# the FOUR stacked ceilings a nested cast chain walks, each one's fail-loud
+# refusal pinned separately, plus the env-gated ordinary-thread depth probe the
+# shipped numbers were measured with. See the file header.
+dss_add_test(NAME analysis/syntactic/test_parser_speculation_ceilings SOURCES test_parser_speculation_ceilings.cpp)
 # FC4 c1 (M4): the commitRequiresTypeName guard-POLARITY matrix against a
 # synthetic grammar (preferType vs requireKnownType, loader shapes, the
 # seeded-oracle channel under the strict polarity).

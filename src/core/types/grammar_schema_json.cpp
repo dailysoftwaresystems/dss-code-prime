@@ -4532,37 +4532,60 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     }
 
     // parser: optional top-level block carrying engine-parser tunables the
-    // language wants config-driven rather than baked into a C++ default. Today
-    // the only field is `maxExpressionDepth` — the Pratt walker's
-    // expression-nesting cap (the positioned `P_ExpressionTooDeep` backstop's
-    // threshold). Omitting the block (or the field) leaves the cap at the
-    // `ParserConfig` C++ fallback (256); declaring it makes the cap 100%
-    // config-driven. The value must be a positive integer; the cap is still a
-    // hard fail-loud ceiling (a deeper nest emits the positioned diagnostic and
-    // recovers — never a crash) — declaring a high value just raises HOW deep a
-    // legal nest the engine admits before the backstop trips, bounded by the
-    // worker stack the still-recursive paren arm runs on. AGNOSTIC: every
-    // language reads its own value; the loader names no language.
+    // language wants config-driven rather than baked into a C++ default. Two
+    // fields today, and they are DIFFERENT nesting quantities — do not conflate
+    // them:
+    //   * `maxExpressionDepth`  — the Pratt walker's expression-nesting cap
+    //     (the positioned `P_ExpressionTooDeep` backstop's threshold);
+    //   * `maxSpeculationDepth` — how deep the parser may nest SPECULATIVE
+    //     probes while disambiguating alternatives (the positioned
+    //     `P_MaxSpeculationDepth` backstop's threshold). One key, BOTH stacked
+    //     caps: the parser applies it to its own probe counter AND derives the
+    //     `TreeBuilder`'s checkpoint cap from it, because every probe opens
+    //     exactly one checkpoint. Splitting them into two authored numbers is
+    //     how the second one ends up binding invisibly behind the first.
+    //   * `speculationBudgetFactor` — how many tokens ONE speculative probe may
+    //     consume, as a multiple of the alt's own declared `lookahead` (the
+    //     positioned `P_SpeculationBudgetExhausted` backstop's threshold). The
+    //     THIRD ceiling on a deeply-nested construct, and the last one that was
+    //     still a bare engine constant.
+    // Omitting the block (or a field) leaves that cap at its `ParserConfig` C++
+    // fallback; declaring it makes the cap 100% config-driven. Each value must
+    // be a positive integer; both caps stay hard fail-loud ceilings (a deeper
+    // nest emits the positioned diagnostic and recovers — never a crash), so
+    // declaring a high value only raises HOW deep a legal nest the engine admits
+    // before the backstop trips, bounded by the host stack the residual
+    // recursive arms run on. AGNOSTIC: every language reads its own values; the
+    // loader names no language.
     if (doc.contains("parser")) {
         json const& parserObj = doc.at("parser");
         if (!parserObj.is_object()) {
             coll.emit(DiagnosticCode::C_ConflictingField, "/parser",
                       "'parser' must be an object");
-        } else if (parserObj.contains("maxExpressionDepth")) {
-            json const& med = parserObj.at("maxExpressionDepth");
+        } else {
             // Must be a positive integer. `is_number_unsigned` rejects negatives
             // and floats; the explicit `> 0` rejects an authored 0 (which would
             // make every expression — even a bare identifier, depth 1 — trip the
-            // cap, never producing a usable parse). Mirrors the runtime guard in
-            // the Parser ctor (`maxExpressionDepth must be >= 1`).
-            if (!med.is_number_unsigned() || med.get<std::uint64_t>() == 0) {
-                coll.emit(DiagnosticCode::C_ConflictingField,
-                          "/parser/maxExpressionDepth",
-                          "'maxExpressionDepth' must be a positive integer");
-            } else {
-                data.maxExpressionDepth =
-                    static_cast<std::size_t>(med.get<std::uint64_t>());
-            }
+            // cap, never producing a usable parse, and for the speculation cap
+            // would refuse the FIRST probe, i.e. disable disambiguation
+            // entirely). Mirrors the runtime guards in the Parser ctor.
+            auto readPositive = [&](char const* field,
+                                    std::optional<std::size_t>& out) {
+                if (!parserObj.contains(field)) return;
+                json const& v = parserObj.at(field);
+                if (!v.is_number_unsigned() || v.get<std::uint64_t>() == 0) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::string("/parser/") + field,
+                              std::format("'{}' must be a positive integer",
+                                          field));
+                    return;
+                }
+                out = static_cast<std::size_t>(v.get<std::uint64_t>());
+            };
+            readPositive("maxExpressionDepth", data.maxExpressionDepth);
+            readPositive("maxSpeculationDepth", data.maxSpeculationDepth);
+            readPositive("speculationBudgetFactor",
+                         data.speculationBudgetFactor);
         }
     }
 
@@ -17806,10 +17829,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         assemblyClean = false;
                         continue;
                     }
-                    static constexpr std::array<std::string_view, 7>
+                    static constexpr std::array<std::string_view, 8>
                         kInstRowKeys{"spelling", "opcodes", "width",
                                      "destWidth", "destWidthFromOperands",
                                      "cond",
+                                     "opcodesAreRankedEncodings",
                                      "operandSelectors"};
                     DSS_CHECK_KEY_VOCABULARY(kInstRowKeys);
                     // ★ NAME THE RENAME. `opcode` (a single string) was this
@@ -17993,6 +18017,45 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // the same exclusivity `width`-absent already has with a
                     // stated `width`, made explicit because here BOTH ends are
                     // derived and a half-stated row would look reasonable.
+                    // [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]]:
+                    // `opcodes` is a RANKED list of encodings of ONE operation
+                    // rather than a set of alternative instructions, so a tie
+                    // is settled by rank instead of refused. See the field's
+                    // comment for why the default refusal is right and why this
+                    // key is only safe beside `guard.immMultipleOf`.
+                    // ⚠ A ONE-CANDIDATE ROW IS REFUSED: there is no tie to
+                    // rank, so the key states nothing while looking like it
+                    // states something — and a reader would take it as
+                    // meaningful and copy it onto a row where it is not.
+                    if (row.contains("opcodesAreRankedEncodings")) {
+                        if (!row.at("opcodesAreRankedEncodings").is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/opcodesAreRankedEncodings",
+                                      "'opcodesAreRankedEncodings' must be a "
+                                      "boolean — it says this row's 'opcodes' "
+                                      "are encodings of ONE operation, ranked, "
+                                      "so a candidate that fits later in the "
+                                      "list is a fallback rather than a rival "
+                                      "reading of the same line");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        ins.opcodesAreRankedEncodings =
+                            row.at("opcodesAreRankedEncodings").get<bool>();
+                        if (ins.opcodesAreRankedEncodings
+                            && ins.opcodeNames.size() < 2) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      path + "/opcodesAreRankedEncodings",
+                                      "'opcodesAreRankedEncodings' ranks the "
+                                      "candidates in 'opcodes', but this row "
+                                      "names fewer than two — there is no tie "
+                                      "for a rank to settle, so the key states "
+                                      "nothing. Drop it, or name the fallback "
+                                      "encodings it is there to rank");
+                            assemblyClean = false;
+                            continue;
+                        }
+                    }
                     if (row.contains("destWidthFromOperands")) {
                         if (!row.at("destWidthFromOperands").is_boolean()) {
                             coll.emit(DiagnosticCode::C_InvalidHirLowering,

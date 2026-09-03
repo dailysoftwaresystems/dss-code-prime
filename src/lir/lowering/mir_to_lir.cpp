@@ -949,8 +949,21 @@ struct Lowerer {
     //     document as "`indirect-slot` MISCOMPILES an address-taken import":
     //     `&f` came out as the SLOT's address, and `sqlite os_win.c
     //     aSyscall[]` then called through it into data.
+    //   * D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55)
+    //     SCOPES the second bullet: `indirectSlotBindings_` is the format's
+    //     DECLARED narrowing of WHICH bindings that dispatch reaches through
+    //     the slot. Empty = unnarrowed (every import — the meaning above, and
+    //     what every non-declaring format still means). The two relocatable
+    //     pe64 documents declare `["weak"]`, because ✔MEASURED that only a
+    //     reference which may resolve to NOTHING cannot be pc-relative there:
+    //     a COFF weak external's fallback is an ABSOLUTE value-0 symbol, and a
+    //     STRONG undefined has no such resolution. All three references agree
+    //     — clang 18.1.3 on BOTH windows triples and mingw-w64 gcc 13.2.0 emit
+    //     `.refptr.<name>` for a WEAK extern function and a plain direct
+    //     `REL32 <name>` with NO `.refptr` section for a STRONG one.
     // A module under neither leaves the set empty ⇒ lowering byte-identical.
     std::optional<DataImportBinding> dataImportBinding_;
+    std::vector<SymbolBinding> indirectSlotBindings_;
     std::unordered_set<std::uint32_t> slotIndirectAddrSymbols_;
 
     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the ACTIVE format's
@@ -1175,13 +1188,15 @@ struct Lowerer {
             std::span<MirSehScope const> sehScopes,
             std::optional<std::string> wideFloatSoftcallLibrary,
             std::optional<bool> charIsUnsigned,
-            std::optional<AtomicsRuntime> atomicsRuntime)
+            std::optional<AtomicsRuntime> atomicsRuntime,
+            std::vector<SymbolBinding> indirectSlotBindings)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
           wideFloatSoftcallLibrary_(std::move(wideFloatSoftcallLibrary)),
           atomicsRuntime_(std::move(atomicsRuntime)),
           dataImportBinding_(dataImportBinding),
+          indirectSlotBindings_(std::move(indirectSlotBindings)),
           externAddrBinding_(externAddrBinding),
           tlsAccess_(tlsAccess), sehScopesIn_(sehScopes),
           charIsUnsigned_(charIsUnsigned) {
@@ -1218,9 +1233,24 @@ struct Lowerer {
         // arm: `globalAddrFoldsIntoDirectCall` runs BEFORE it and drops the
         // dead lea, and `lowerCall` folds the SymbolId straight into the
         // indirect call. Only the value use materializes an address.)
+        // ★★ D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55):
+        // ...FOR THE BINDINGS THE FORMAT SAYS SO. The paragraph above is about
+        // a WEAK import and every word of it holds there; what it got wrong
+        // was the SCOPE. A STRONG undefined has no absolute resolution — the
+        // link finds a definition or fails — so its reference is representable
+        // pc-relative and paid a load + an 8-byte COMDAT for nothing.
+        // `importTakesSlot` is the ONE question, and EVERY reference site in
+        // this lowerer now reads its ANSWER out of this set rather than
+        // re-deriving it from the dispatch, which is what lets a strong
+        // import's call go back to a plain `E8` while a weak one's stays a
+        // slot deref — the half-narrowing the linker's own comment warns
+        // about (retarget narrowed, call shape format-wide) is a miscompile,
+        // and the two halves moving together is what makes this one safe.
         if (externCallDispatch_ == ExternCallDispatch::IndirectSlot) {
             for (auto const& e : externImports) {
-                slotIndirectAddrSymbols_.insert(e.symbol.v);
+                if (importTakesSlot(e.binding)) {
+                    slotIndirectAddrSymbols_.insert(e.symbol.v);
+                }
             }
         }
         // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got`
@@ -1335,6 +1365,9 @@ struct Lowerer {
         //   * nullopt          → the format declared no dispatch model
         //                        (NO silent default to either shape).
         //   * indirect-slot    → requires `call_indirect_via_extern`.
+        //   * indirect-slot NARROWED by `indirectSlotBindings` → requires the
+        //                        universal `call` opcode TOO (P55): the format
+        //                        emits both shapes, one per import binding.
         //   * direct-plt       → requires the universal `call` opcode.
         // Static modules (no externs) skip the gate entirely — they
         // legitimately need neither the dispatch model nor the opcode.
@@ -1375,6 +1408,29 @@ struct Lowerer {
                         detail::renderAllowedList(
                             allNames(kExternCallDispatchTable), " / ")));
             } else if (*externCallDispatch_ == ExternCallDispatch::IndirectSlot
+                       && !indirectSlotBindings_.empty() && callMissing) {
+                // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
+                // (P55): a NARROWED `indirect-slot` format emits BOTH shapes —
+                // the slot deref for the declared bindings and a plain direct
+                // call for the rest — so it needs both opcodes. Checked before
+                // the indirect arm because a format missing `call` under a
+                // narrowing is the newer and less obvious of the two failures,
+                // and reporting the other one first would name the opcode that
+                // IS present.
+                dss::report(reporter,
+                    DiagnosticCode::L_RequiredLirOpcodeMissing,
+                    DiagnosticSeverity::Error,
+                    std::format(
+                        "MIR→LIR: the active format uses `{}` extern dispatch "
+                        "NARROWED by `indirectSlotBindings`, so imports outside "
+                        "that set lower to a plain direct call — but the target "
+                        "schema declares no `call` opcode. A narrowed format "
+                        "needs BOTH call encodings (x86_64 `E8 disp32` beside "
+                        "`FF 15 disp32`). Add it to the target's `.target.json` "
+                        "`opcodes[]`, or remove the narrowing. "
+                        "(D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT.)",
+                        externCallDispatchName(*externCallDispatch_)));
+            } else if (*externCallDispatch_ == ExternCallDispatch::IndirectSlot
                        && callIndirectMissing) {
                 dss::report(reporter,
                     DiagnosticCode::L_RequiredLirOpcodeMissing,
@@ -1403,6 +1459,41 @@ struct Lowerer {
                         externCallDispatchName(*externCallDispatch_)));
             }
         }
+    }
+
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55): does an
+    // import with THIS binding take the format's import-slot shape? Read at
+    // the two places an import ENTERS the lowerer — the ctor's caller-supplied
+    // span and each self-serve MINT — and nowhere else. Every consuming site
+    // asks `externRefUsesSlot(SymbolId)` instead, so the shape a reference
+    // takes is decided ONCE per symbol and cannot disagree with itself.
+    //
+    // ⚠ CALLERS MUST ALREADY HAVE ESTABLISHED `indirect-slot`. This answers
+    // only the binding half; the dispatch half is the enclosing condition at
+    // both call sites, exactly as `ObjectFormatSchema::externRefTakesImportSlot`
+    // spells the pair one tier up. An empty list is the UNNARROWED set — the
+    // meaning `indirect-slot` carried before this key existed — so a caller
+    // that threads nothing keeps the behaviour it already asserted.
+    [[nodiscard]] bool importTakesSlot(SymbolBinding binding) const noexcept {
+        if (indirectSlotBindings_.empty()) return true;
+        for (auto const b : indirectSlotBindings_) {
+            if (b == binding) return true;
+        }
+        return false;
+    }
+
+    // THE ONE QUESTION EVERY EXTERN-REFERENCE SITE ASKS: is this symbol
+    // reached through a pointer slot? The call-site shape (`lowerCall`, the
+    // F128 softcall, the atomics-runtime call) and the address shape
+    // (`lowerGlobalAddr`, and every riprel-fold suppression) must give the
+    // SAME answer for one symbol — a call that derefs a slot the address arm
+    // did not create, or the reverse, is a miscompile in one direction or the
+    // other. Before P55 the call sites read the format-level dispatch while
+    // the address sites read this set, and they agreed only because the
+    // dispatch applied to every import; once it applies to some, one set is
+    // the only way they can still agree.
+    [[nodiscard]] bool externRefUsesSlot(SymbolId s) const noexcept {
+        return slotIndirectAddrSymbols_.contains(s.v);
     }
 
     [[nodiscard]] std::optional<std::uint16_t> opcode(MnemonicSlot s) const {
@@ -6070,9 +6161,12 @@ struct Lowerer {
         auto const sym =
             resolveWideFloatSoftcallExtern(cfg.helperSymbol, "MIR F128 softcall");
         if (!sym.has_value()) { poisonValue(id); return; }
-        bool const useIndirect = externCallDispatch_.has_value()
-            && externCallUsesIndirectShape(*externCallDispatch_);
-        MnemonicSlot const callSlot = useIndirect
+        // P55: the SAME per-symbol answer `lowerCall` reads, for the same
+        // reason — the linker mints a slot for exactly the imports this
+        // lowerer derefs, and a minted helper is an import like any other.
+        // `resolveWideFloatSoftcallExtern` put it in the set (or did not) at
+        // mint time from its own declared binding.
+        MnemonicSlot const callSlot = externRefUsesSlot(*sym)
             ? MnemonicSlot::CallIndirectViaExtern
             : MnemonicSlot::Call;
         if (!opcode(callSlot).has_value()) {
@@ -6234,8 +6328,14 @@ struct Lowerer {
                     context, helperSymbol));
             return std::nullopt;
         }
+        // P55 (D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT): the
+        // shape a MINTED helper will take is decided by its own binding under
+        // the format's narrowing, exactly as a user import's is — so the gate
+        // asks the same question the mint below will answer, off the SAME
+        // default `ExternImport::binding` the row is about to carry.
         MnemonicSlot const needSlot =
-            externCallUsesIndirectShape(*externCallDispatch_)
+            (externCallUsesIndirectShape(*externCallDispatch_)
+             && importTakesSlot(ExternImport{}.binding))
                 ? MnemonicSlot::CallIndirectViaExtern
                 : MnemonicSlot::Call;
         if (!opcode(needSlot).has_value()) {
@@ -6255,6 +6355,16 @@ struct Lowerer {
         imp.isData      = false;
         imp.version     = "";   // unversioned → binds the default @@GCC_3.0
         externSymbols.insert(sym.v);
+        // P55: a self-serve mint enters the slot set on the SAME rule the
+        // ctor applies to caller-supplied imports. Without this the CALL would
+        // read the set (direct) while the LINKER read the format+binding
+        // (mint a slot, retarget the reloc) and the direct call would branch
+        // into pointer bytes — the exact disagreement `externRefUsesSlot`
+        // exists to make impossible.
+        if (externCallDispatch_ == ExternCallDispatch::IndirectSlot
+            && importTakesSlot(imp.binding)) {
+            slotIndirectAddrSymbols_.insert(sym.v);
+        }
         newWideFloatExterns_.push_back(std::move(imp));
         softcallExternByHelper_.emplace(helperSymbol, sym);
         return sym;
@@ -6942,11 +7052,19 @@ struct Lowerer {
     // `slotIndirectAddrSymbols_`. No guard is needed even so, and the reason
     // is not the old one — it is that the fold and the slot want the SAME
     // thing here. Folding drops a DEAD lea and hands the callee's SymbolId to
-    // `lowerCall`, which under that dispatch emits `call_indirect_via_extern`
-    // — itself a deref of the slot. Suppressing the fold would emit a lea+load
-    // nothing reads and leave the call unchanged, so the guard would cost
-    // bytes and change no semantics. (A `&fn` VALUE use has count ≥ 2 or a
-    // non-Call user, never folds, and takes the slot arm in `lowerGlobalAddr`.)
+    // `lowerCall`, which for a symbol IN that set emits
+    // `call_indirect_via_extern` — itself a deref of the slot. Suppressing the
+    // fold would emit a lea+load nothing reads and leave the call unchanged,
+    // so the guard would cost bytes and change no semantics. (A `&fn` VALUE use
+    // has count ≥ 2 or a non-Call user, never folds, and takes the slot arm in
+    // `lowerGlobalAddr`.)
+    // ⚠ "UNDER THAT DISPATCH" WAS THE RIGHT PHRASE UNTIL P55 AND IS NOW ONE
+    // WORD TOO WIDE: `indirectSlotBindings` can leave a strong callee OUT of
+    // the set, and `lowerCall` then emits a plain `E8`. The conclusion is
+    // unchanged and does not depend on which shape wins — in BOTH the fold
+    // drops a lea nothing else reads and the call keeps whatever shape
+    // `externRefUsesSlot` gives it, so there is still nothing for a guard here
+    // to protect (D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT).
     [[nodiscard]] bool globalAddrFoldsIntoDirectCall(MirInstId gaId) {
         auto const it = mirValueUses_.find(gaId.v);
         if (it == mirValueUses_.end() || it->second.count != 1) {
@@ -7687,10 +7805,20 @@ struct Lowerer {
         // are present under a nullopt / under-equipped format, so an
         // extern reaching here has a valid, opcode-backed dispatch model;
         // a nullopt compares unequal to IndirectSlot → falls to `Call`.)
+        // ★★★ AND IT IS ASKED PER SYMBOL, NOT PER FORMAT —
+        // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55). This
+        // read the format-level dispatch until P55, which was right while
+        // `indirect-slot` reached every import and became a MISCOMPILE the
+        // moment it reached only some: the linker mints a slot for exactly the
+        // imports this lowerer derefs, so a call whose shape came from the
+        // FORMAT and a slot whose existence came from the SYMBOL would
+        // disagree — an `FF 15` through a slot nobody minted (reading the
+        // import's own address as a pointer), or an `E8` retargeted at slot
+        // bytes. `externRefUsesSlot` is the one per-symbol answer both this
+        // site and the address arm read. A non-extern callee is never in the
+        // set, so the ordinary direct `Call` is unchanged.
         bool const useIndirectExtern =
-            calleeIsExtern
-            && externCallDispatch_.has_value()
-            && externCallUsesIndirectShape(*externCallDispatch_);
+            calleeIsExtern && externRefUsesSlot(calleeSym);
         MnemonicSlot const callSlot = useIndirectExtern
             ? MnemonicSlot::CallIndirectViaExtern
             : MnemonicSlot::Call;
@@ -10073,8 +10201,12 @@ struct Lowerer {
                     context, mangledName));
             return std::nullopt;
         }
+        // P55 (D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT): the
+        // minted entry's own binding under the format's narrowing decides the
+        // shape — the F128 sibling's reasoning, one runtime over.
         MnemonicSlot const needSlot =
-            externCallUsesIndirectShape(*externCallDispatch_)
+            (externCallUsesIndirectShape(*externCallDispatch_)
+             && importTakesSlot(ExternImport{}.binding))
                 ? MnemonicSlot::CallIndirectViaExtern
                 : MnemonicSlot::Call;
         if (!opcode(needSlot).has_value()) {
@@ -10090,6 +10222,11 @@ struct Lowerer {
         imp.isData      = false;
         imp.version     = "";   // unversioned → binds the default @@LIBATOMIC_1.0
         externSymbols.insert(sym.v);
+        // P55: enter the slot set on the ctor's rule — see the F128 mint.
+        if (externCallDispatch_ == ExternCallDispatch::IndirectSlot
+            && importTakesSlot(imp.binding)) {
+            slotIndirectAddrSymbols_.insert(sym.v);
+        }
         newWideFloatExterns_.push_back(std::move(imp));
         softcallExternByHelper_.emplace(mangledName, sym);
         return sym;
@@ -10154,9 +10291,8 @@ struct Lowerer {
         auto const orderReg = emitBareConstToFresh(
             static_cast<std::int64_t>(order));
         if (!orderReg.has_value()) return false;
-        bool const useIndirect = externCallDispatch_.has_value()
-            && externCallUsesIndirectShape(*externCallDispatch_);
-        MnemonicSlot const callSlot = useIndirect
+        // P55: the per-symbol answer, as at every other extern call site.
+        MnemonicSlot const callSlot = externRefUsesSlot(sym)
             ? MnemonicSlot::CallIndirectViaExtern
             : MnemonicSlot::Call;
         auto const callOp = opcode(callSlot);
@@ -12548,7 +12684,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::optional<std::string> wideFloatSoftcallLibrary,
                           std::optional<ExternAddrBinding> externAddrBinding,
                           std::optional<bool> charIsUnsigned,
-                          std::optional<AtomicsRuntime> atomicsRuntime) {
+                          std::optional<AtomicsRuntime> atomicsRuntime,
+                          std::vector<SymbolBinding> indirectSlotBindings) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -12576,11 +12713,15 @@ MirToLirResult lowerToLir(Mir const&          mir,
     // entries instead of the native LDAR/STLR pair, which is a MEASURED rc 135
     // SIGBUS on real arm64 hardware. nullopt + a `traps` target + an
     // under-aligned access = fail-loud (never a certain fault emitted quietly).
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT: also pass the
+    // format's DECLARED narrowing of which symbol bindings the `indirect-slot`
+    // dispatch applies to. Empty = unnarrowed (every import), the meaning the
+    // dispatch carried before the key existed.
     Lowerer L{mir, target, interner, reporter, externImports,
               externCallDispatch, dataImportBinding, externAddrBinding,
               tlsAccess, sehScopes,
               std::move(wideFloatSoftcallLibrary), charIsUnsigned,
-              std::move(atomicsRuntime)};
+              std::move(atomicsRuntime), std::move(indirectSlotBindings)};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

@@ -1,0 +1,28 @@
+{
+  "$comment": "D-PARSE-NINE-NESTED-CASTS-ARE-REFUSED-BY-THE-SPECULATION-CAP-WITH-A-FABRICATED-SYNTAX-ERROR (P55, lane nc): a RUNNABLE witness that DSS compiles nested cast chains at 9, 65 and 256 levels. exit = 3 + 4 + 5 + 30 = 42. ★ WHY THOSE THREE DEPTHS AND NOT ROUND ONES: each stands ONE PAST a ceiling that used to bind. 9 is the depth the row is named after (`ParserConfig::maxSpeculationDepth` was a hardcoded 8, and c's `operand` alt speculates once per cast because `(int)` can begin either `castExpr` or `compoundLiteralExpr`, so the LL(k) prune cannot choose); 65 is one past `BuilderConfig::maxSpeculationDepth`'s hardcoded 64, the SECOND cap, which was invisible behind the first and would have become the binding ceiling the moment the first was lifted; 256 is well past both. A fix that raised only the first cap passes at 9 and reds at 65 here, which is exactly what this example is for. ⚠ THIS EXAMPLE'S VERDICT IS COMPILE-TIME, AND THE RUN IS THE CONTROL, NOT THE FAULT. The defect was a REFUSAL: before the fix, `dsscp` exited 1 on this file with `error[P_NoAlternativeMatched]: expected 'Identifier', 'IntLiteral', ... — got 'int'` positioned on the author's own correct `int`, so there was no binary to run at all. rc 42 therefore proves both that the chains PARSE and that they mean what C says they mean — a cast chain over `int` is the identity, so any depth that silently dropped or duplicated a level would change the sum. Every leg below can see this equally; none of them is blind to it. ANTI-FOLD: `g3`/`g4`/`g5` are MUTABLE GLOBALS, so no front-end arm can fold a chain away and report green without having parsed it. The `release` arm additionally proves the result survives Mem2Reg/CSE/LICM/DCE with the same exit code. ✔MEASURED reference matrix for this shape, each reference probed SEPARATELY: gcc 13.3.0 compiles 65536; mingw-w64 gcc 13.2.0 compiles 32768; clang 18.1.3 compiles 1349 then SIGSEGVs; MSVC 19.51.36252 compiles 2985 then refuses LOUDLY with `fatal error C1026: parser stack overflow, program too complex`. All four accept 9, 65 and 256, so DSS refusing 9 was two orders of magnitude below the union. The shipped ceiling is now `parser.maxSpeculationDepth` = 320 in `c.lang.json` — see the `$parserComment` there for why 320 and not clang's 1349, and for the ordinary-thread stack measurement it comes from.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -818,6 +818,24 @@ private:
     std::vector<std::uint32_t>                       symOrder_;   // SymbolId.v in first-encounter order
     bool internerWarned_ = false;
 
+    // ★★★ THE COMPOSITES CURRENTLY BEING SPELLED, innermost last — the cycle guard
+    // for `appendType`. `struct S { int v; struct S *next; }` interns a CYCLIC type
+    // graph: the second field is `ptr<struct S>` whose operand is the struct
+    // itself. A structural walk with nothing tracking what it is already inside
+    // re-enters through that field forever. ✔MEASURED 2026-09-02 on exactly that
+    // declaration — the commonest shape in C — `emitHir` died with
+    // STATUS_STACK_OVERFLOW (0xC00000FD), an uncatchable process kill with no
+    // diagnostic at all.
+    // ⚠ NO DEPTH CAP CAN FIX THIS and reaching for one is the trap: the graph has
+    // no bottom, so a cap only chooses how much stack to burn before the same
+    // crash, and it would ALSO refuse legitimately deep acyclic types. The cycle is
+    // the thing to detect. (The operator's standing order against input-
+    // proportional recursion is the general form of this; here the recursion is not
+    // even input-proportional — it is unbounded on a finite input.)
+    // ⓘ A STACK, not a set: a type repeated as a SIBLING (`tuple<T, T>`) is ordinary
+    // sharing and must still spell twice. Only re-entry into an ANCESTOR is a cycle.
+    std::vector<std::uint32_t> compositesOpen_;
+
     // Emitter-side diagnostic. Defaults to Error: the cases that reach here
     // (non-Module root, an Extension/IntrinsicCall payload the registry doesn't
     // resolve, an unprintable type) emit a `?`/`error` token that CANNOT be
@@ -925,7 +943,45 @@ private:
             bool first = true;
             for (TypeId o : ops) { if (!first) out_ += ", "; appendType(o); first = false; }
         };
-        switch (in.kind(t)) {
+        // The cycle guard, applied to the NOMINAL composites only. A cycle can only
+        // close through one of these: a type graph becomes cyclic exactly when a
+        // forward-declared composite is completed with a field that reaches back to
+        // it, and structural kinds (ptr/arr/tuple/…) cannot be forward-declared. So
+        // this is where re-entry is both possible and detectable, and the hot
+        // structural arms pay nothing.
+        //
+        // The refusal is LOUD and the output is deliberately UNPARSEABLE. This
+        // grammar has no back-reference form, so there is no honest spelling of a
+        // cyclic type: `opaque` would reintern a COMPLETE struct as INCOMPLETE (a
+        // silent ABI drop — the very thing the `opaque` marker was added to prevent),
+        // and re-spelling the name alone would reintern as a different type. `?` is
+        // the file's established poison token, refused on the way back in, so a
+        // caller cannot mistake this for a round-trippable result.
+        TypeKind const kind = in.kind(t);
+        bool const nominal = (kind == TypeKind::Struct || kind == TypeKind::Union);
+        if (nominal) {
+            for (std::uint32_t open : compositesOpen_) {
+                if (open != t.v) continue;
+                report(std::format(
+                           "the type graph of {} \"{}\" is CYCLIC — it reaches itself "
+                           "through one of its own fields (the `struct S {{ … struct S "
+                           "*next; }}` shape). This text grammar has no back-reference "
+                           "form, so the type cannot be spelled round-trippably and is "
+                           "emitted as '?', which is refused on the way back in",
+                           kind == TypeKind::Struct ? "struct" : "union", in.name(t)),
+                       DiagnosticSeverity::Error);
+                out_ += '?';
+                return;
+            }
+            compositesOpen_.push_back(t.v);
+        }
+        // ⚠ Every arm below `return`s, so the pop cannot be written after the
+        // switch — it has to be scope-bound or it never runs.
+        struct PopGuard {
+            std::vector<std::uint32_t>* v;
+            ~PopGuard() { if (v) v->pop_back(); }
+        } popGuard{nominal ? &compositesOpen_ : nullptr};
+        switch (kind) {
             case TypeKind::Ptr:      out_ += "ptr<";      appendType(in.operands(t)[0]); out_ += '>'; return;
             case TypeKind::Ref:      out_ += "ref<";      appendType(in.operands(t)[0]); out_ += '>'; return;
             case TypeKind::Nullable: out_ += "nullable<"; appendType(in.operands(t)[0]); out_ += '>'; return;

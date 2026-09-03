@@ -6406,7 +6406,18 @@ namespace {
 // routing, not encoding — but the relocation KIND is the load-bearing half:
 // `RelocationKind{1}` is x86_64's `rel32` row, the PC-RELATIVE one, which is
 // the exact predicate the slot pass keys on.
-[[nodiscard]] AssembledModule dataImportModule(bool alsoCallAFunctionExtern) {
+// D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55): the function
+// extern's BINDING is now a parameter, because it is what decides the shape
+// under a NARROWED `indirect-slot` format. `Weak` reproduces the P54 subject
+// exactly (`callee` was Global-by-default then, and the format was unnarrowed,
+// so every import took the slot); `Global` is the case the narrowing exists
+// for. One module shape serves both so the two answers are read off ONE
+// object, never off two fixtures that could drift apart.
+[[nodiscard]] AssembledModule
+dataImportModule(bool alsoCallAFunctionExtern,
+                 SymbolBinding fnBinding = SymbolBinding::Weak,
+                 bool alsoCallASecondFunctionExtern = false,
+                 SymbolBinding fn2Binding = SymbolBinding::Global) {
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
@@ -6423,6 +6434,13 @@ namespace {
         call.target = SymbolId{51};   // the FUNCTION import
         call.kind   = RelocationKind{1};
         fn.relocations.push_back(call);
+    }
+    if (alsoCallASecondFunctionExtern) {
+        Relocation call2;
+        call2.offset = 26;
+        call2.target = SymbolId{52};  // the SECOND FUNCTION import
+        call2.kind   = RelocationKind{1};
+        fn.relocations.push_back(call2);
     }
     mod.functions.push_back(std::move(fn));
 
@@ -6443,7 +6461,17 @@ namespace {
         fnImp.mangledName = "callee";
         fnImp.libraryPath = "somelib.dll";
         fnImp.isData      = false;
+        fnImp.binding     = fnBinding;
         mod.externImports.push_back(std::move(fnImp));
+    }
+    if (alsoCallASecondFunctionExtern) {
+        ExternImport fnImp2;
+        fnImp2.symbol      = SymbolId{52};
+        fnImp2.mangledName = "callee2";
+        fnImp2.libraryPath = "somelib.dll";
+        fnImp2.isData      = false;
+        fnImp2.binding     = fn2Binding;
+        mod.externImports.push_back(std::move(fnImp2));
     }
     return mod;
 }
@@ -6541,13 +6569,25 @@ TEST(PeObjDataImportSlot, AFunctionExternReachesItsImportThroughASlotToo) {
     // read. The DISCRIMINATOR the old assertion protected has not been dropped
     // — it moved to `AFunctionExternKeepsItsDirectReferenceUnderDirectPlt`
     // below, where the dispatch is what decides rather than the symbol class.
+    // ★★ P55 (D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT) MADE
+    // THE FUNCTION IMPORT'S BINDING EXPLICIT HERE AND CHANGED NO ASSERTION.
+    // It was Global-by-default and took the slot only because the dispatch was
+    // then unnarrowed — i.e. this test was passing for a reason one step wider
+    // than the defect it pins. `Weak` is the binding the row is actually about
+    // (an ABSOLUTE value-0 resolution no rel32 reaches), so the subject now
+    // says so; the STRONG answer is the new sibling below.
     auto loaded = loadShipped();
     ASSERT_TRUE(loaded.target && loaded.format);
     ASSERT_EQ(loaded.format->externCallDispatch(),
               ExternCallDispatch::IndirectSlot)
         << "the shipped pe64 `.obj` format must declare `indirect-slot`; with "
            "`direct-plt` the rest of this test is about a different object";
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true);
+    ASSERT_TRUE(loaded.format->externRefTakesImportSlot(SymbolBinding::Weak))
+        << "the shipped pe64 `.obj` format must route a WEAK import through "
+           "the slot — that is the P0 this file exists for, and a narrowing "
+           "that excluded `weak` would make every assertion below vacuous";
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true,
+                                           SymbolBinding::Weak);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
@@ -6575,6 +6615,72 @@ TEST(PeObjDataImportSlot, AFunctionExternReachesItsImportThroughASlotToo) {
         << "one carried slot per referenced import, data AND function"
         << symTableDump(obj);
     EXPECT_TRUE(peObjHasUndefinedSymbol(obj, "callee")) << symTableDump(obj);
+}
+
+TEST(PeObjDataImportSlot, AStrongFunctionExternKeepsItsDirectReferenceOnTheShippedObjFormat) {
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55) — THE
+    // NARROWING, ON THE SHIPPED DOCUMENT, WITH BOTH ANSWERS IN ONE OBJECT.
+    //
+    // Two FUNCTION imports differing ONLY in binding: `callee` weak, `callee2`
+    // strong. The weak one must reach its import through the carried slot (the
+    // P0 that must not regress); the strong one must keep a plain direct
+    // reference. A pass that read the FORMAT instead of the SYMBOL cannot
+    // produce this object at all — it gives two slots or none.
+    //
+    // ✔MEASURED 2026-09-02 that this is what every reference emits, each
+    // probed separately with `weak` the only variable: clang 18.1.3 on BOTH
+    // `--target=x86_64-pc-windows-msvc` and `--target=x86_64-w64-windows-gnu`,
+    // and mingw-w64 gcc 13.2.0, all emit `.rdata$.refptr.maybe` for a WEAK
+    // extern function and NO `.refptr` section at all for a STRONG one.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    // The narrowing this test is about, asserted on the SHIPPED document
+    // rather than assumed — if the key is dropped the object below still
+    // links, still runs, and this test would then be reading a different
+    // decision while reporting on this one.
+    ASSERT_FALSE(loaded.format->indirectSlotBindings().empty())
+        << "the shipped pe64 `.obj` format must DECLARE `indirectSlotBindings`; "
+           "with the key absent `indirect-slot` is unnarrowed and every import "
+           "takes the slot, which is the state this row ended";
+    ASSERT_TRUE(loaded.format->externRefTakesImportSlot(SymbolBinding::Weak));
+    ASSERT_FALSE(loaded.format->externRefTakesImportSlot(SymbolBinding::Global));
+
+    AssembledModule mod =
+        dataImportModule(/*alsoCallAFunctionExtern=*/true, SymbolBinding::Weak,
+                         /*alsoCallASecondFunctionExtern=*/true,
+                         SymbolBinding::Global);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+    auto const secs = peObjSections(obj);
+    auto const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+
+    auto const weakCall   = relocAt(obj, *text, 20u);
+    auto const strongCall = relocAt(obj, *text, 26u);
+    ASSERT_TRUE(weakCall.has_value() && strongCall.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, weakCall->symbolTableIndex), ".refptr.callee")
+        << "the WEAK import still reaches its identity through the carried "
+           "slot — narrowing must not touch the case the P0 was about"
+        << symTableDump(obj);
+    EXPECT_EQ(peObjSymbolName(obj, strongCall->symbolTableIndex), "callee2")
+        << "a STRONG undefined has no absolute resolution — the final link "
+           "finds a definition or fails — so its reference is representable "
+           "pc-relative and must stay direct. Retargeting it would cost an "
+           "8-byte COMDAT and a load per call for nothing"
+        << symTableDump(obj);
+    // TWO slots, not three: the DATA import (unconditional, its own reason)
+    // and the WEAK function. The strong function gets none.
+    std::size_t slotSections = 0;
+    for (auto const& s : secs) {
+        if (s.name == ".rdata" && s.numberOfRelocations == 1u) ++slotSections;
+    }
+    EXPECT_EQ(slotSections, 2u)
+        << "one slot for the DATA import and one for the WEAK function — an "
+           "unnarrowed dispatch would mint three" << symTableDump(obj);
+    EXPECT_TRUE(peObjHasUndefinedSymbol(obj, "callee2")) << symTableDump(obj);
 }
 
 TEST(PeObjDataImportSlot, AFunctionExternKeepsItsDirectReferenceUnderDirectPlt) {
@@ -6746,6 +6852,110 @@ TEST(PeObjDataImportSlot, SlotSpellingWithNoBindingFailsLoud) {
         << "a slot spelling with no binding is config that reads as a "
            "capability and is not one — nothing is ever routed through it";
     EXPECT_TRUE(image.bytes.empty()) << diagSummary(rep);
+}
+
+// ══ D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT: the four ways
+//    the narrowing key can be wrong, each refused AT LOAD ══
+//
+// ★ WHY ALL FOUR ARE REFUSALS RATHER THAN TOLERATED SHAPES: every failure mode
+// of this key widens the dispatch back to the state the key exists to narrow,
+// and a widening reads as "correct but slower" at every tier downstream. There
+// is no arm where a reader would notice, so the loader is the only place that
+// can.
+
+TEST(PeObjDataImportSlot, IndirectSlotBindingsWithoutIndirectSlotDispatchIsRefusedAtLoad) {
+    // A narrowing needs something to narrow. Under `direct-plt` NO import
+    // takes a slot, so the list names a rule nothing consults — the
+    // D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE shape, and the dangerous
+    // direction of it: a format author who narrows the wrong key gets an
+    // object that still carries the unnarrowed cost and a document that says
+    // otherwise.
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-narrowing-without-dispatch",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "direct-plt",
+                           "indirectSlotBindings": ["weak"],
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)"),
+        "synthetic");
+    ASSERT_FALSE(fmt.has_value());
+    EXPECT_EQ(countAtPath(fmt, "/indirectSlotBindings"), 1u) << rejectSummary(fmt);
+}
+
+TEST(PeObjDataImportSlot, AnEmptyIndirectSlotBindingsListIsRefusedAtLoad) {
+    // An empty list would mean NO import takes the slot — a silent
+    // CANCELLATION of `indirect-slot`, not a narrowing of it, and the exact
+    // shape that would quietly reopen the P0 this file exists for.
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-empty-narrowing",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "indirect-slot",
+                           "indirectSlotBindings": [],
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)"),
+        "synthetic");
+    ASSERT_FALSE(fmt.has_value());
+    EXPECT_EQ(countAtPath(fmt, "/indirectSlotBindings"), 1u) << rejectSummary(fmt);
+}
+
+TEST(PeObjDataImportSlot, LocalInIndirectSlotBindingsIsRefusedAtLoad) {
+    // `local` is not a representable IMPORT binding — an import is by
+    // construction a name the object does NOT define, and no format spells an
+    // undefined LOCAL symbol — so naming it declares a member that can never
+    // match. The refusal lives here because nothing downstream can tell a
+    // never-matching member from a correctly-narrow one.
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-local-narrowing",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "indirect-slot",
+                           "indirectSlotBindings": ["weak", "local"],
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)"),
+        "synthetic");
+    ASSERT_FALSE(fmt.has_value());
+    EXPECT_EQ(countAtPath(fmt, "/indirectSlotBindings/1"), 1u) << rejectSummary(fmt);
+}
+
+TEST(PeObjDataImportSlot, AnUnknownOrDuplicateBindingSpellingIsRefusedAtLoad) {
+    // A typo must not fall through to an unnarrowed dispatch, and a repeated
+    // member is an authoring mistake this loader has no reason to guess about
+    // — the `entryVerbs` discipline, one key over.
+    auto typo = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-narrowing-typo",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "indirect-slot",
+                           "indirectSlotBindings": ["weakish"],
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)"),
+        "synthetic");
+    ASSERT_FALSE(typo.has_value());
+    EXPECT_EQ(countAtPath(typo, "/indirectSlotBindings/0"), 1u) << rejectSummary(typo);
+
+    auto dupe = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-narrowing-dupe",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "indirect-slot",
+                           "indirectSlotBindings": ["weak", "weak"],
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)"),
+        "synthetic");
+    ASSERT_FALSE(dupe.has_value());
+    EXPECT_EQ(countAtPath(dupe, "/indirectSlotBindings/1"), 1u) << rejectSummary(dupe);
+}
+
+TEST(PeObjDataImportSlot, TheTwoRelocatablePe64DocumentsDeclareTheSameNarrowing) {
+    // The `.obj` and the `.lib` are the SAME relocatable artifact reaching the
+    // SAME foreign linkers; an archive member that took a different shape from
+    // a lone object would be a defect nobody would look for. The staticlib
+    // document says it is hand-kept in sync with its sibling — this is the
+    // assertion that makes that a fact rather than a discipline.
+    auto obj = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
+    auto lib = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-staticlib");
+    ASSERT_TRUE(obj.has_value() && lib.has_value());
+    EXPECT_EQ((*obj)->externCallDispatch(), (*lib)->externCallDispatch());
+    EXPECT_EQ((*obj)->indirectSlotBindings(), (*lib)->indirectSlotBindings());
+    EXPECT_FALSE((*obj)->indirectSlotBindings().empty())
+        << "both must DECLARE the narrowing; two empty lists agree vacuously";
 }
 
 TEST(PeObjDataImportSlot, AnEmptySlotPrefixIsRefusedAtLoad) {

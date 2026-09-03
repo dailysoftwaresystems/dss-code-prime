@@ -322,3 +322,46 @@ target_link_libraries(dss_asm_test_asm_arm64_rounding_dialect_rows
     PRIVATE nlohmann_json::nlohmann_json)
 target_include_directories(dss_asm_test_asm_arm64_rounding_dialect_rows
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# D-TARGET-ARM64-HALF-BYTE-QUAD-MEMORY-FORMS-UNDECLARED (cycle P55, lane lq):
+# the H, B and Q widths of the four scalar SIMD&FP memory opcodes, plus the
+# `q0..q31` ALIAS spellings the Q half needs to be nameable at all. Byte pins at
+# two (Rt,Rn) placements each beside the S/D controls, the near-miss immediate
+# FENCE (one byte offset encodes FIVE different imm12 fields across the five
+# widths — the silent-wrong-answer risk in this family), a REMOVE-direction
+# mutant per half with a CONTROL named by name, and the double-count negative
+# SYNTHESIZED: a convention naming the alias spelling must be REFUSED AT LOAD.
+# WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL -- both over the SHIPPED
+# target (deleted width arms, deleted alias lists) -- so it MUST run through
+# ctest: dss_add_test sets DSS_CONFIG_ROOT, while a bare .exe walks the cwd and
+# would read whichever tree the shell stands in
+# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_arm64_memory_dialect_rows
+             SOURCES test_asm_arm64_memory_dialect_rows.cpp)
+target_link_libraries(dss_asm_test_asm_arm64_memory_dialect_rows
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_arm64_memory_dialect_rows
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
+# (cycle P55, lane sp): AArch64 register field 31 names the STACK POINTER in
+# some instruction forms and the ZERO REGISTER in others, and `sp`/`xzr` (and
+# `wsp`/`wzr`) are two rows of `registers[]` at that one number. Byte pins for
+# every SP-naming form both references assemble, at more than one register
+# placement each; the ZERO-register spellings pinned by name as CONTROLS (a fix
+# that routed everything through the ADD form would pass a positive-only
+# fixture and break the zero register instead); the seventeen spellings BOTH
+# references REFUSE, which DSS accepted at the P55 base while emitting a
+# plausible instruction naming the other register; the load-time rules that make
+# a role-less collision unsayable; and five REMOVE-direction mutants, each with
+# its controls printed BY NAME.
+# WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL -- over the SHIPPED target
+# AND the SHIPPED dialect -- so it MUST run through ctest: dss_add_test sets
+# DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever tree
+# the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_arm64_shared_encoding_31
+             SOURCES test_asm_arm64_shared_encoding_31.cpp)
+target_link_libraries(dss_asm_test_asm_arm64_shared_encoding_31
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_arm64_shared_encoding_31
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)

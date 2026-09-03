@@ -204,14 +204,16 @@ mergedSymbolOf(MergePlan const& plan, std::uint32_t cuIdx, SymbolId oldSym) {
 // WITHOUT this remap the global's abs64 reloc targets a STALE CU-local id in any
 // multi-`.c` build → linker `K_SymbolUndefined` (lucky) or a silently-wrong VA
 // (id collision) — a pointer miscompile invisible to a single-CU corpus.
+// D-MIR-NESTED-AGGREGATE-LITERAL-WALKS-RECURSE-PER-INITIALIZER-LEVEL: the field
+// descent was host recursion with no cap; it is now the shared heap walker in
+// `mir/mir_literal_pool.hpp`.
 void remapLiteralSymbols(MirLiteralValue& lit, MergePlan const& plan,
                          std::uint32_t cuIdx) {
-    if (auto* sa = std::get_if<MirSymbolAddrValue>(&lit.value)) {
-        sa->symbol = mergedSymbolOf(plan, cuIdx, SymbolId{sa->symbol}).v;
-    } else if (auto* agg = std::get_if<MirAggregateValue>(&lit.value)) {
-        for (MirLiteralValue& f : agg->fields)
-            remapLiteralSymbols(f, plan, cuIdx);
-    }
+    forEachLiteralNode(lit, [&](MirLiteralValue& n) {
+        if (auto* sa = std::get_if<MirSymbolAddrValue>(&n.value)) {
+            sa->symbol = mergedSymbolOf(plan, cuIdx, SymbolId{sa->symbol}).v;
+        }
+    });
 }
 
 // ── one-function clone into the shared builder ─────────────────────
@@ -877,17 +879,19 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // the set `remapLiteralSymbols` rewrites, so planning and remapping now walk
     // the same shape; a body whose literal named a symbol the plan never saw
     // would abort in `remapLiteralSymbols` with no way to tell which body did it.
-    auto const assignLiteralSymbols = [&](auto&& self, std::uint32_t ci,
+    // D-MIR-NESTED-AGGREGATE-LITERAL-WALKS-RECURSE-PER-INITIALIZER-LEVEL: was a
+    // `self(self, …)` recursive lambda, one host frame per brace level, no cap.
+    // ⚠ The ASSIGNMENT ORDER is observable (symbols are numbered as they are
+    // assigned), which is why the shared walker preserves field order.
+    auto const assignLiteralSymbols = [&](std::uint32_t ci,
                                           MirLiteralValue const& v) -> void {
-        if (auto const* sa = std::get_if<MirSymbolAddrValue>(&v.value)) {
-            SymbolId const s{sa->symbol};
-            assignSymbol(ci, s, cus[ci].nameOf(s), /*ffiRow=*/nullptr,
-                         /*isLocalDef=*/false);
-            return;
-        }
-        if (auto const* agg = std::get_if<MirAggregateValue>(&v.value)) {
-            for (auto const& fld : agg->fields) self(self, ci, fld);
-        }
+        forEachLiteralNode(v, [&](MirLiteralValue const& n) {
+            if (auto const* sa = std::get_if<MirSymbolAddrValue>(&n.value)) {
+                SymbolId const s{sa->symbol};
+                assignSymbol(ci, s, cus[ci].nameOf(s), /*ffiRow=*/nullptr,
+                             /*isLocalDef=*/false);
+            }
+        });
     };
 
     for (std::uint32_t ci = 0; ci < cus.size(); ++ci) {
@@ -938,8 +942,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                             break;
                         case MirOpcode::Const:
                             assignLiteralSymbols(
-                                assignLiteralSymbols, ci,
-                                m.literalValue(m.constLiteralIndex(inst)));
+                                ci, m.literalValue(m.constLiteralIndex(inst)));
                             break;
                         default:
                             break;

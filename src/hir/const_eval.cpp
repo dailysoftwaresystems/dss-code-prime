@@ -48,24 +48,37 @@ using detail::floatToWideIntTarget;
 }
 
 
-// Forward decl: the public expression entry is a DRIVER over an explicit
-// heap work-stack (plan 24 Stage 6 — D-PARSE-DEEP-NEST-RECURSION-MEMORY). The
-// per-node body (`evalNode` below) re-enters it for the children of every
-// DELEGATED arm, so a deeply-nested sub-expression inside a shallow complex arm
-// still flattens.
-[[nodiscard]] ConstEvalResult
-evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
-         HirNodeId expr, EvalEnvironment const& env, EvalOptions const& options,
-         std::unordered_set<std::uint32_t>& visitedSyms);
+// ── THE FOLD COSTS HEAP, NOT HOST CALL FRAMES ──────────────────────────────
+//
+// D-CORE-TYPE-LAYOUT-AND-HIR-CONST-EVAL-RECURSE-PER-LEVEL. Plan 24 Stage 6
+// flattened the three STRAIGHT-LINE arms (UnaryOp / BinaryOp / Cast) onto the
+// `evalImpl` work stack and left every other arm DELEGATED — `evalNode` folded
+// the node and re-entered `evalImpl` for its children. That left an
+// `evalImpl` ⇄ `evalNode` MUTUAL recursion of two host frames per level for
+// Ref, LogicalAnd/Or, Ternary and ConstructAggregate, i.e. for exactly the
+// shapes a C initializer nests.
+//
+// ✔MEASURED before this cycle's conversion, on the ordinary ~1 MiB thread and
+// through `ctest`: a 400-level nested aggregate, a 400-level ternary spine and
+// a 400-level `&&` spine each folded with rc 0, and all three died at 1000 with
+// rc 8 — no message, no location, and no `[  FAILED  ]` line. The same 400/1000
+// pair bounded a REAL C source route (nested struct definitions plus a global
+// initializer) through `lowerToMir`.
+//
+// ⇒ There is now ONE driver and no per-node recursive body at all: every arm
+// with children is a phased frame on the heap stack, and what is left
+// (`evalTerminal`) is childless by construction. The recursion is gone from the
+// file rather than merely unreachable, which is what keeps a later edit from
+// quietly restoring it.
 
 // ── Plan 24 Stage 6 — straight-line const-fold epilogues ───────────────────
 // Each `combine*` is the BYTE-IDENTICAL slice of a flattened arm AFTER its
 // child sub-expression(s) have been folded (their `ConstEvalResult`s passed in).
-// Shared by `evalNode`'s recursive arms AND the driver's frames — ONE source of
-// truth, so the iterative path produces the exact same value + failure code +
-// blame anchor + result `core` the recursive path did. A child-failure short-
-// circuit (`!inner.value`) returns the child's result VERBATIM (its own blame),
-// matching `if (!inner.value.has_value()) return inner;` in the recursive form.
+// ONE source of truth for the driver's frames, so the iterative path produces
+// the exact same value + failure code + blame anchor + result `core` the
+// recursive path did. A child-failure short-circuit (`!inner.value`) returns the
+// child's result VERBATIM (its own blame), matching
+// `if (!inner.value.has_value()) return inner;` in the recursive form.
 
 // UnaryOp epilogue (operand already folded to `inner`).
 [[nodiscard]] ConstEvalResult
@@ -570,202 +583,38 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     return ok(std::move(folded));
 }
 
-// Internal per-node fold body. `visitedSyms` carries the per-call cycle-
-// detection set (CE2): any `Ref(sym)` resolution checks containment
-// before descending into the symbol's defining expression. The public
-// `evaluateConstant` seeds an empty set.
+// ── The CHILDLESS arms, and only those ─────────────────────────────────────
 //
-// Plan 24 Stage 6: this is the BYTE-IDENTICAL fold body for EVERY arm. The
-// three deep STRAIGHT-LINE arms (UnaryOp / BinaryOp / Cast — whose only
-// recursion is `evalImpl(child)`) are flattened onto the `evalImpl` work-stack
-// driver and reach their `combine*` epilogue THERE; this handler keeps them as
-// the dead-via-driver recursive fallback (calling the SAME epilogues). Every
-// OTHER arm (Literal / Ref / LogicalAnd|Or / Ternary / ConstructAggregate /
-// SizeOf) is DELEGATED — handled here, re-entering `evalImpl` for its children
-// (so a deep operator spine inside a Ref's defining expr / a Ternary arm /
-// an aggregate element still flattens). Output-identity holds because the
-// delegated arms have subtle evaluation-order / cycle-set / short-circuit
-// semantics best preserved verbatim; only their CHILDREN re-enter the driver.
+// What is left after every arm with children became a driver frame: the leaves
+// (`Literal`, `SizeOf`, `AlignOf`) plus the loud refusal every malformed or
+// unmodelled node lands on. It takes no `visitedSyms` and calls nothing that
+// walks HIR, so `const_eval` has no per-node recursive body any more.
+//
+// ⚠ THE ARITY / `isCoreOp` GUARDS ARE NOT DEAD, THEY ARE THE FAILURE CODES. A
+// well-formed UnaryOp/BinaryOp/Cast/Logical/Ternary/ConstructAggregate/Ref is
+// pushed as a frame by `enter` and never arrives here; a MALFORMED one is
+// delegated here precisely so the code it always carried is still the code it
+// gets. `UnsupportedOperator` for a non-core operator, `NotAConstantExpression`
+// for everything else — the same two answers as before the flattening, which is
+// why every arm whose only failure was `NotAConstantExpression` (Cast, Logical,
+// Ternary, ConstructAggregate, Ref) now simply falls through to the shared
+// refusal at the bottom instead of restating it.
 [[nodiscard]] ConstEvalResult
-evalNode(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
-         HirNodeId expr, EvalEnvironment const& env, EvalOptions const& options,
-         std::unordered_set<std::uint32_t>& visitedSyms) {
+evalTerminal(Hir const& hir, HirLiteralPool const& literals, HirNodeId expr,
+             EvalEnvironment const& env) {
     if (!expr.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
     HirKind const k = hir.kind(expr);
     if (k == HirKind::Literal) {
         std::uint32_t const idx = hir.payload(expr);
         return ok(literals.at(idx));
     }
-    if (k == HirKind::Ref) {
-        // CE2: resolve a Ref to a constant-bound symbol via the caller's
-        // resolver callback. Absent callback (CE1's behaviour) or absent
-        // mapping → NotAConstantExpression. Cycle detection prevents
-        // infinite recursion on `int a = b; int b = a;`-shape inputs.
-        if (!env.resolveConstSymbol) {
-            return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        }
-        std::uint32_t const sym = hir.payload(expr);
-        if (visitedSyms.contains(sym)) {
-            return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        }
-        auto definingExpr = env.resolveConstSymbol(SymbolId{sym});
-        if (!definingExpr.has_value() || !definingExpr->valid()) {
-            return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        }
-        visitedSyms.insert(sym);
-        ConstEvalResult inner = evalImpl(hir, interner, literals,
-                                         *definingExpr, env, options, visitedSyms);
-        visitedSyms.erase(sym);
-        // On failure, re-blame at the Ref USE site rather than wherever
-        // the definition tree's failure surfaced. The caller (a
-        // diagnostic emitter) has the use-site span available; the
-        // definition-tree's node may live in an entirely different
-        // module decl and carry no helpful context. On success, blame
-        // stays default (no anchor needed).
-        if (!inner.value.has_value()) inner.blamedNode = expr;
-        return inner;
-    }
-    if (k == HirKind::UnaryOp) {
-        std::uint32_t const payload = hir.payload(expr);
-        if (!isCoreOp(payload)) return fail(ConstEvalFailure::UnsupportedOperator, expr);
-        auto kids = hir.children(expr);
-        if (kids.size() != 1) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        // DEAD-VIA-DRIVER fallback (the driver flattens this arm): fold the
-        // operand then route through the SHARED epilogue.
-        ConstEvalResult inner = evalImpl(hir, interner, literals, kids[0], env, options, visitedSyms);
-        return combineUnary(hir, expr, options, std::move(inner));
-    }
-    if (k == HirKind::BinaryOp) {
-        std::uint32_t const payload = hir.payload(expr);
-        if (!isCoreOp(payload)) return fail(ConstEvalFailure::UnsupportedOperator, expr);
-        auto kids = hir.children(expr);
-        if (kids.size() != 2) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        // DEAD-VIA-DRIVER fallback: fold LHS then RHS (left-to-right, two
-        // sequential statements) then route through the SHARED epilogue.
-        ConstEvalResult a = evalImpl(hir, interner, literals, kids[0], env, options, visitedSyms);
-        ConstEvalResult b = evalImpl(hir, interner, literals, kids[1], env, options, visitedSyms);
-        return combineBinary(hir, interner, expr, options, std::move(a), std::move(b));
-    }
-    if (k == HirKind::Cast) {
-        // Target-type-aware cast. Four quadrants by (source kind, target
-        // kind):
-        //   int → int : truncate/extend per width + sign; refuseOnOverflow
-        //               policy applies (CE3).
-        //   int → bool: `N != 0` truthiness (CE3 special case).
-        //   int → float (CE5, allowFloat=true): host conversion; precision
-        //               loss for very large ints is documented IEEE 754
-        //               behavior matching runtime.
-        //   float → int (CE5, allowFloat=true): C99 §6.3.1.4 truncation
-        //               toward zero. Refused (Overflow) when the truncated
-        //               value doesn't fit the integer target AND
-        //               refuseOnOverflow=true. NaN/inf always refuse with
-        //               Overflow (truncation is undefined; runtime wrap
-        //               is not portable).
-        //   float → bool: nonzero (incl. NaN) → true per C semantics.
-        //   float → float (CE5): host conversion; rounding per IEEE 754
-        //               round-to-nearest-even (host default).
-        // Pointer / aggregate targets remain non-foldable.
-        auto kids = hir.children(expr);
-        if (kids.size() != 1) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        // DEAD-VIA-DRIVER fallback: fold the operand then route through the
-        // SHARED epilogue (all four (source,target) quadrants live there).
-        ConstEvalResult inner = evalImpl(hir, interner, literals, kids[0], env, options, visitedSyms);
-        return combineCast(hir, interner, expr, options, std::move(inner));
-    }
-    if (k == HirKind::LogicalAnd || k == HirKind::LogicalOr) {
-        // C99 short-circuit semantics: evaluate `a` first. If `a` already
-        // determines the result (`0 && unfoldable` is unambiguously
-        // false; `1 || unfoldable` is unambiguously true), the engine
-        // MUST NOT recurse into `b` — otherwise a non-foldable `b`
-        // would spuriously fail the whole fold. Once `a` doesn't short-
-        // circuit, the result depends on `b`; recurse into `b` and
-        // combine. Result core is always Bool.
-        auto kids = hir.children(expr);
-        if (kids.size() != 2) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        ConstEvalResult a = evalImpl(hir, interner, literals, kids[0], env, options, visitedSyms);
-        if (!a.value.has_value()) return a;
-        // `asBool` handles both integer and float operands (the latter
-        // only when `allowFloat` is on); NaN / ±inf evaluate to true per
-        // C semantics; ±0.0 evaluates to false.
-        auto aIsTrueOpt = asBool(*a.value, options.allowFloat);
-        if (!aIsTrueOpt.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-        bool const aIsTrue = *aIsTrueOpt;
-        bool const isAnd   = (k == HirKind::LogicalAnd);
-        // && short-circuits when `a` is false; || short-circuits when `a`
-        // is true. Either way the determined value IS `aIsTrue`.
-        bool const shortCircuits = isAnd ? !aIsTrue : aIsTrue;
-        if (shortCircuits) {
-            return ok(makeBoolLiteral(aIsTrue ? 1 : 0));
-        }
-        // No short-circuit; need `b` to determine the result.
-        ConstEvalResult b = evalImpl(hir, interner, literals, kids[1], env, options, visitedSyms);
-        if (!b.value.has_value()) return b;
-        auto bIsTrueOpt = asBool(*b.value, options.allowFloat);
-        if (!bIsTrueOpt.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-        return ok(makeBoolLiteral(*bIsTrueOpt ? 1 : 0));
-    }
-    if (k == HirKind::Ternary) {
-        // children: [cond, then, else]. Fold cond first; recurse into ONLY
-        // the selected arm. The unselected arm may be non-constant — a
-        // legitimate compile-time-known choice between a constant and a
-        // computation (`cond ? known : maybe_runtime`) should still fold
-        // when cond and the chosen arm are both constants. The selected
-        // arm's failure propagates verbatim (we return the inner result;
-        // `blamedNode` retains the arm's anchor).
-        //
-        // Result core: the SELECTED arm's `core` may be narrower than
-        // the Ternary's declared `typeId` (e.g. `cond ? (int8)5 : 1000`
-        // where the Ternary type is I32). Re-tag the folded core from
-        // the Ternary node's typeId so `core` mirrors the authoritative
-        // type record (per the `hir_literal_pool.hpp` contract). Same
-        // discipline as BinaryOp's `commonType` retag above.
-        auto kids = hir.children(expr);
-        if (kids.size() != 3) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        ConstEvalResult cond = evalImpl(hir, interner, literals, kids[0], env, options, visitedSyms);
-        if (!cond.value.has_value()) return cond;
-        // Cond truthiness via the shared `asBool` (CE5): accepts float
-        // operands when `allowFloat` is on, applying the same NaN/inf →
-        // true semantics as LogicalAnd/Or.
-        auto condIsTrueOpt = asBool(*cond.value, options.allowFloat);
-        if (!condIsTrueOpt.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-        HirNodeId const selected = *condIsTrueOpt ? kids[1] : kids[2];
-        ConstEvalResult inner = evalImpl(hir, interner, literals,
-                                         selected, env, options, visitedSyms);
-        if (inner.value.has_value()) {
-            TypeId const ternTy = hir.typeId(expr);
-            if (ternTy.valid()) inner.value->core = interner.kind(ternTy);
-        }
-        return inner;
-    }
-    if (k == HirKind::ConstructAggregate) {
-        // D5.3: fold a struct / union / array aggregate construction.
-        // The node's children are the POSITIONAL element expressions
-        // (designators and zero-fills already normalized at HIR-
-        // lowering time per HIR's positional discipline). Each child
-        // must fold independently; the engine assembles their values
-        // into a recursive `HirAggregateValue` arm of `HirLiteralValue`.
-        // The first failing child propagates verbatim (failure code +
-        // blame anchor stays at the child that didn't fold), so
-        // MIR-globals' classify path can route a partially-non-constant
-        // aggregate to runtime-init while surfacing the precise refusal
-        // reason to consumers. `core` is read from the aggregate's
-        // TypeId (Struct / Union / Array — the result-type tag the
-        // engine's discipline requires).
-        TypeId const aggTy = hir.typeId(expr);
-        if (!aggTy.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        auto kids = hir.children(expr);
-        HirAggregateValue agg;
-        agg.fields.reserve(kids.size());
-        for (HirNodeId child : kids) {
-            ConstEvalResult fr = evalImpl(hir, interner, literals, child,
-                                          env, options, visitedSyms);
-            if (!fr.value.has_value()) return fr;   // propagate failure verbatim
-            agg.fields.push_back(std::move(*fr.value));
-        }
-        HirLiteralValue folded;
-        folded.core  = interner.kind(aggTy);
-        folded.value = std::move(agg);
-        return ok(std::move(folded));
+    if (k == HirKind::UnaryOp || k == HirKind::BinaryOp) {
+        // Distinguish "the engine does not model this operator" from "this node
+        // is malformed" — the one place that distinction is made, and the reason
+        // these two kinds still appear in a function that folds no operators.
+        if (!isCoreOp(hir.payload(expr)))
+            return fail(ConstEvalFailure::UnsupportedOperator, expr);
+        return fail(ConstEvalFailure::NotAConstantExpression, expr);
     }
     if (k == HirKind::SizeOf) {
         // FC6: fold `sizeof(T)` to T's byte size (result `size_t` = U64),
@@ -773,6 +622,8 @@ evalNode(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         // carries the sized type. Absent resolver (verifier consumers) or an
         // incomplete / un-sizeable type ⇒ `NotAConstantExpression` — never a
         // guessed size. The type unevaluated (C 6.5.3.4) — only its size matters.
+        // (A CHILDLESS arm despite having a child: the TypeRef is read for its
+        // TypeId, never folded, so nothing here re-enters the driver.)
         if (!env.resolveTypeSize) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
@@ -808,31 +659,47 @@ evalNode(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
     return fail(ConstEvalFailure::NotAConstantExpression, expr);
 }
 
-// ── Plan 24 Stage 6 — the iterative const-fold driver ──────────────────────
-// A POD work-stack frame for ONE flattened straight-line arm. `phase`
-// 0 = enter the (last) child; a 2-child arm (Binary) phase 1 = enter the
-// second child (after stashing the first folded result in `c0`); the final
-// phase pops and `combine*`s into `result`. (Unary / Cast are single-child:
-// phase 0 enters, phase 1 combines.) Mirrors the Stage-4 hir_to_mir
-// `ValueFrame` idiom (the realloc-safe rule: copy frame fields to locals and
-// advance `phase` BEFORE any `enter`/`push_back`; copy `result` out before
-// `pop_back`).
+// ── THE ITERATIVE CONST-FOLD DRIVER — every arm with children lives here ────
+//
+// A POD work-stack frame for ONE arm. `phase` counts children already REQUESTED;
+// the final phase pops and delivers into `result`. Mirrors the Stage-4
+// hir_to_mir `ValueFrame` idiom, and its realloc-safe rule is a hard
+// requirement, not a style: copy the frame's fields to locals and advance
+// `phase` BEFORE any `enter`/`push_back`, and copy `result` out before
+// `pop_back`, because `work.back()` may dangle the moment the vector grows.
+//
+// The three STRAIGHT-LINE arms (Unary / Binary / Cast) reach a shared
+// `combine*` epilogue. The four arms this cycle added (Ref / Logical / Ternary
+// / Aggregate) carry their own prologue and epilogue in the switch below —
+// moved out of the old `evalNode` VERBATIM, because each has semantics a
+// generic frame cannot express: the Ref's visited-symbol scope, the logical
+// arms' short-circuit, the Ternary's single-arm selection, and the aggregate's
+// positional accumulation.
 struct FoldFrame {
-    enum class Kind : std::uint8_t { Unary, Binary, Cast } kind;
+    enum class Kind : std::uint8_t {
+        Unary, Binary, Cast, Ref, Logical, Ternary, Aggregate
+    } kind;
     HirNodeId       node;
-    std::uint8_t    phase;
-    ConstEvalResult c0;   // Binary: the folded LHS (stashed between phase 1 and 2)
+    std::uint32_t   phase;
+    HirNodeId       child;   // Ref: the resolved DEFINING expression (see `enter`)
+    ConstEvalResult c0;      // Binary: the folded LHS (stashed between phase 1 and 2)
+    std::vector<HirLiteralValue> parts;   // Aggregate: elements folded so far
 };
 
-// Internal driver. `visitedSyms` carries the per-call Ref cycle-detection set,
-// threaded through every delegated arm's re-entry (the Ref arm itself stays in
-// `evalNode`, so its insert/erase discipline is preserved verbatim — only its
-// defining-expr child re-enters here). For each node, `enter` either PUSHES a
-// frame for a deep straight-line arm (Unary/Binary/Cast) or DELEGATES to
-// `evalNode` (which folds that one node and re-enters this driver for its
-// children). Output-identity: the flattened arms reproduce the recursive
-// child-fold ORDER + `combine*` exactly, so value + failure code + blame +
-// result core are byte-identical to the recursive `evalNode`.
+// Internal driver. `visitedSyms` carries the per-call Ref cycle-detection set;
+// its insert/erase discipline is now split across the Ref frame — `enter`
+// inserts when it decides to descend, the frame's final phase erases — which is
+// the same bracket the recursive form had around its `evalImpl` call.
+//
+// For each node `enter` either PUSHES a frame (every kind that has children to
+// fold) or DELEGATES to `evalTerminal` (a leaf, or a MALFORMED node whose own
+// failure code that function owns). The arity / `isCoreOp` / typeId guards here
+// mirror `evalTerminal`'s EXACTLY, so a malformed arm fails loud there with the
+// code it always carried.
+//
+// Output-identity: every flattened arm reproduces the recursive child-fold
+// ORDER and epilogue exactly, so value + failure code + blame + result core are
+// byte-identical to the pre-conversion engine.
 [[nodiscard]] ConstEvalResult
 evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
          HirNodeId expr, EvalEnvironment const& env, EvalOptions const& options,
@@ -843,14 +710,6 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
     // sentinel never leaks.
     ConstEvalResult result = fail(ConstEvalFailure::NotAConstantExpression, expr);
 
-    // Classify `n`: push a frame for a flattenable straight-line arm (and
-    // return), else fold it here via `evalNode` (delegating; its children
-    // re-enter this driver). A frame is pushed ONLY for the three arms whose
-    // sole recursion is `evalImpl(child)`. The arity / isCoreOp guards mirror
-    // `evalNode` EXACTLY so a malformed arm delegates and fails loud there
-    // byte-identically. NOTE: `enter` (push) MUST be the LAST action of any
-    // caller path that has copied out its frame fields — `work.back()` may
-    // dangle after a realloc.
     auto const enter = [&](HirNodeId n) {
         if (n.valid()) {
             HirKind const nk = hir.kind(n);
@@ -869,11 +728,56 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
                     work.push_back({.kind = FoldFrame::Kind::Cast, .node = n, .phase = 0});
                     return;
                 }
+            } else if (nk == HirKind::Ref) {
+                // CE2: resolve a Ref to a constant-bound symbol via the caller's
+                // resolver callback. Absent callback (CE1's behaviour) or absent
+                // mapping → NotAConstantExpression. Cycle detection prevents
+                // infinite recursion on `int a = b; int b = a;`-shape inputs.
+                //
+                // ⚠ THE WHOLE PROLOGUE IS HERE, not split with `evalTerminal`,
+                // and the reason is that `resolveConstSymbol` is a CALLER
+                // callback: mirroring the guard would invoke it a second time
+                // for every Ref that resolves. The resolved node is stashed in
+                // the frame so phase 0 does not have to ask again.
+                if (env.resolveConstSymbol) {
+                    std::uint32_t const sym = hir.payload(n);
+                    if (!visitedSyms.contains(sym)) {
+                        auto definingExpr = env.resolveConstSymbol(SymbolId{sym});
+                        if (definingExpr.has_value() && definingExpr->valid()) {
+                            visitedSyms.insert(sym);
+                            work.push_back({.kind  = FoldFrame::Kind::Ref,
+                                            .node  = n,
+                                            .phase = 0,
+                                            .child = *definingExpr});
+                            return;
+                        }
+                    }
+                }
+                result = fail(ConstEvalFailure::NotAConstantExpression, n);
+                return;
+            } else if (nk == HirKind::LogicalAnd || nk == HirKind::LogicalOr) {
+                if (hir.children(n).size() == 2) {
+                    work.push_back({.kind = FoldFrame::Kind::Logical, .node = n, .phase = 0});
+                    return;
+                }
+            } else if (nk == HirKind::Ternary) {
+                if (hir.children(n).size() == 3) {
+                    work.push_back({.kind = FoldFrame::Kind::Ternary, .node = n, .phase = 0});
+                    return;
+                }
+            } else if (nk == HirKind::ConstructAggregate) {
+                // `core` is read from the aggregate's TypeId (Struct / Union /
+                // Array — the result-type tag the engine's discipline requires),
+                // so an invalid one is refused BEFORE any element is folded.
+                if (hir.typeId(n).valid()) {
+                    work.push_back({.kind = FoldFrame::Kind::Aggregate, .node = n, .phase = 0});
+                    return;
+                }
             }
         }
-        // Delegate (terminal / Ref / CFG-like short-circuit / Ternary /
-        // aggregate / SizeOf / malformed straight-line arm → fail loud).
-        result = evalNode(hir, interner, literals, n, env, options, visitedSyms);
+        // Delegate: a leaf (Literal / SizeOf / AlignOf), or a malformed arm →
+        // fail loud there with its own code.
+        result = evalTerminal(hir, literals, n, env);
     };
 
     enter(expr);
@@ -926,6 +830,164 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
                 result = combineCast(hir, interner, node2, options, std::move(operand));
             }
             break;
+        case FoldFrame::Kind::Ref:
+            // Phase 0 folds the symbol's DEFINING expression (resolved once, in
+            // `enter`); phase 1 leaves the symbol's scope and re-blames.
+            if (f.phase == 0) {
+                f.phase = 1;
+                HirNodeId const definingExpr = f.child;
+                enter(definingExpr);        // may invalidate `f`
+            } else {
+                HirNodeId const node2 = f.node;
+                std::uint32_t const sym = hir.payload(node2);
+                work.pop_back();
+                visitedSyms.erase(sym);
+                // On failure, re-blame at the Ref USE site rather than wherever
+                // the definition tree's failure surfaced. The caller (a
+                // diagnostic emitter) has the use-site span available; the
+                // definition-tree's node may live in an entirely different
+                // module decl and carry no helpful context. On success, blame
+                // stays default (no anchor needed).
+                if (!result.value.has_value()) result.blamedNode = node2;
+            }
+            break;
+        case FoldFrame::Kind::Logical: {
+            // C99 short-circuit semantics: evaluate `a` first. If `a` already
+            // determines the result (`0 && unfoldable` is unambiguously false;
+            // `1 || unfoldable` is unambiguously true), the engine MUST NOT
+            // descend into `b` — otherwise a non-foldable `b` would spuriously
+            // fail the whole fold. Result core is always Bool.
+            HirNodeId const node2 = f.node;
+            if (f.phase == 0) {
+                f.phase = 1;
+                HirNodeId const lhsN = hir.children(node2)[0];
+                enter(lhsN);                // may invalidate `f`
+                break;
+            }
+            if (f.phase == 1) {
+                if (!result.value.has_value()) {   // propagate `a`'s failure verbatim
+                    work.pop_back();
+                    break;
+                }
+                // `asBool` handles both integer and float operands (the latter
+                // only when `allowFloat` is on); NaN / ±inf evaluate to true per
+                // C semantics; ±0.0 evaluates to false.
+                auto aIsTrueOpt = asBool(*result.value, options.allowFloat);
+                if (!aIsTrueOpt.has_value()) {
+                    work.pop_back();
+                    result = fail(ConstEvalFailure::UnsupportedTypeKind, node2);
+                    break;
+                }
+                bool const aIsTrue = *aIsTrueOpt;
+                bool const isAnd   = (hir.kind(node2) == HirKind::LogicalAnd);
+                // && short-circuits when `a` is false; || short-circuits when
+                // `a` is true. Either way the determined value IS `aIsTrue`.
+                if (isAnd ? !aIsTrue : aIsTrue) {
+                    work.pop_back();
+                    result = ok(makeBoolLiteral(aIsTrue ? 1 : 0));
+                    break;
+                }
+                f.phase = 2;
+                HirNodeId const rhsN = hir.children(node2)[1];
+                enter(rhsN);                // may invalidate `f`
+                break;
+            }
+            work.pop_back();
+            if (!result.value.has_value()) break;   // propagate `b`'s failure verbatim
+            auto bIsTrueOpt = asBool(*result.value, options.allowFloat);
+            if (!bIsTrueOpt.has_value()) {
+                result = fail(ConstEvalFailure::UnsupportedTypeKind, node2);
+                break;
+            }
+            result = ok(makeBoolLiteral(*bIsTrueOpt ? 1 : 0));
+            break;
+        }
+        case FoldFrame::Kind::Ternary: {
+            // children: [cond, then, else]. Fold cond first; descend into ONLY
+            // the selected arm. The unselected arm may be non-constant — a
+            // legitimate compile-time-known choice between a constant and a
+            // computation (`cond ? known : maybe_runtime`) should still fold
+            // when cond and the chosen arm are both constants. The selected
+            // arm's failure propagates verbatim (`blamedNode` retains the arm's
+            // anchor).
+            HirNodeId const node2 = f.node;
+            if (f.phase == 0) {
+                f.phase = 1;
+                HirNodeId const condN = hir.children(node2)[0];
+                enter(condN);               // may invalidate `f`
+                break;
+            }
+            if (f.phase == 1) {
+                if (!result.value.has_value()) {   // propagate cond's failure
+                    work.pop_back();
+                    break;
+                }
+                // Cond truthiness via the shared `asBool` (CE5): accepts float
+                // operands when `allowFloat` is on, applying the same NaN/inf →
+                // true semantics as LogicalAnd/Or.
+                auto condIsTrueOpt = asBool(*result.value, options.allowFloat);
+                if (!condIsTrueOpt.has_value()) {
+                    work.pop_back();
+                    result = fail(ConstEvalFailure::UnsupportedTypeKind, node2);
+                    break;
+                }
+                auto kids = hir.children(node2);
+                HirNodeId const selected = *condIsTrueOpt ? kids[1] : kids[2];
+                f.phase = 2;
+                enter(selected);            // may invalidate `f`
+                break;
+            }
+            work.pop_back();
+            // Result core: the SELECTED arm's `core` may be narrower than the
+            // Ternary's declared `typeId` (e.g. `cond ? (int8)5 : 1000` where
+            // the Ternary type is I32). Re-tag the folded core from the Ternary
+            // node's typeId so `core` mirrors the authoritative type record (per
+            // the `hir_literal_pool.hpp` contract). Same discipline as
+            // BinaryOp's `commonType` retag.
+            if (result.value.has_value()) {
+                TypeId const ternTy = hir.typeId(node2);
+                if (ternTy.valid()) result.value->core = interner.kind(ternTy);
+            }
+            break;
+        }
+        case FoldFrame::Kind::Aggregate: {
+            // D5.3: fold a struct / union / array aggregate construction. The
+            // node's children are the POSITIONAL element expressions
+            // (designators and zero-fills already normalized at HIR-lowering
+            // time per HIR's positional discipline). Each element must fold
+            // independently; the first failing one propagates VERBATIM (failure
+            // code + blame anchor stay at the element that didn't fold), so
+            // MIR-globals' classify path can route a partially-non-constant
+            // aggregate to runtime-init while surfacing the precise refusal.
+            //
+            // `phase` is the number of elements already REQUESTED, so it is both
+            // the index of the next child and the count of results collected.
+            HirNodeId const node2 = f.node;
+            auto kids = hir.children(node2);
+            if (f.phase == 0) {
+                f.parts.reserve(kids.size());
+            } else {
+                if (!result.value.has_value()) {   // propagate the element's failure
+                    work.pop_back();
+                    break;
+                }
+                f.parts.push_back(std::move(*result.value));
+            }
+            if (static_cast<std::size_t>(f.phase) == kids.size()) {
+                HirAggregateValue agg;
+                agg.fields = std::move(f.parts);
+                work.pop_back();
+                HirLiteralValue folded;
+                folded.core  = interner.kind(hir.typeId(node2));
+                folded.value = std::move(agg);
+                result = ok(std::move(folded));
+                break;
+            }
+            HirNodeId const child = kids[static_cast<std::size_t>(f.phase)];
+            f.phase += 1;
+            enter(child);                   // may invalidate `f`
+            break;
+        }
         }
     }
     return result;

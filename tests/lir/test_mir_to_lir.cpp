@@ -569,6 +569,55 @@ TEST(MirToLir, IndirectSlotExternFunctionAddressValueDerefsTheSlot) {
                "would read the jump stub's bytes. The got-indirect DATA "
                "binding must not widen to functions on an image.";
     }
+    // (3) D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55):
+    //     indirect-slot NARROWED to `weak` ⇒ this GLOBAL import's address is
+    //     the BARE lea again. The address arm and the call arm read ONE set,
+    //     so this is the same decision `NarrowedIndirectSlotKeepsAStrong
+    //     ExternCallDirect` pins at the call site — asserted at BOTH ends
+    //     because a fix applied at one is the partial fix that reads as a
+    //     complete one, and because only the pair keeps the linker's slot
+    //     pass agreeing with the emitted code symbol for symbol.
+    {
+        Mir mir = buildMir();
+        DiagnosticReporter rep;
+        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                               ExternCallDispatch::IndirectSlot,
+                               DataImportBinding::GotIndirect,
+                               /*tlsAccess=*/std::nullopt,
+                               /*sehScopes=*/{},
+                               /*wideFloatSoftcallLibrary=*/std::nullopt,
+                               /*externAddrBinding=*/std::nullopt,
+                               /*charIsUnsigned=*/std::nullopt,
+                               /*atomicsRuntime=*/std::nullopt,
+                               std::vector<SymbolBinding>{SymbolBinding::Weak});
+        ASSERT_TRUE(lirR.ok);
+        EXPECT_EQ(memAccessCount(lirR.lir), 0)
+            << "`maybe` is a GLOBAL import and the format narrows the slot to "
+               "`weak`, so its address is a plain pc-relative reference — the "
+               "shape clang and mingw gcc both emit for a strong extern.";
+    }
+    // (4) The same narrowing with the import declared WEAK: back to the deref.
+    //     `weak` is the ONLY variable between (3) and (4).
+    {
+        Mir mir = buildMir();
+        DiagnosticReporter rep;
+        std::vector<dss::ExternImport> weakExterns = externs;
+        weakExterns[0].binding = SymbolBinding::Weak;
+        auto lirR = lowerToLir(mir, **target, interner, rep, weakExterns,
+                               ExternCallDispatch::IndirectSlot,
+                               DataImportBinding::GotIndirect,
+                               /*tlsAccess=*/std::nullopt,
+                               /*sehScopes=*/{},
+                               /*wideFloatSoftcallLibrary=*/std::nullopt,
+                               /*externAddrBinding=*/std::nullopt,
+                               /*charIsUnsigned=*/std::nullopt,
+                               /*atomicsRuntime=*/std::nullopt,
+                               std::vector<SymbolBinding>{SymbolBinding::Weak});
+        ASSERT_TRUE(lirR.ok);
+        EXPECT_GE(memAccessCount(lirR.lir), 1)
+            << "a WEAK import under the same narrowing must still LOAD its "
+               "slot — the P0 case, and the one the narrowing must not touch.";
+    }
 }
 
 // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got` extern-address
@@ -4324,7 +4373,16 @@ struct ExternCallLowering {
 lowerStdExternFixture(::dss::TargetSchema const& sch,
                       std::optional<::dss::ExternCallDispatch> dispatch,
                       ::dss::DiagnosticReporter& rep,
-                      ::dss::CallConv cc = ::dss::CallConv::CcMS64) {
+                      ::dss::CallConv cc = ::dss::CallConv::CcMS64,
+                      // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
+                      // (P55): the extern's BINDING and the format's declared
+                      // narrowing — the two facts that now decide the shape
+                      // together with the dispatch. The defaults reproduce the
+                      // pre-P55 fixture exactly (a Global import under an
+                      // unnarrowed dispatch), so every pin above is unchanged.
+                      ::dss::SymbolBinding binding =
+                          ::dss::SymbolBinding::Global,
+                      std::vector<::dss::SymbolBinding> narrowing = {}) {
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
     auto const i32  = interner.primitive(::dss::TypeKind::I32);
     auto const ptrT = interner.pointer(interner.primitive(::dss::TypeKind::Void));
@@ -4370,10 +4428,19 @@ lowerStdExternFixture(::dss::TargetSchema const& sch,
     ext.symbol      = ::dss::SymbolId{kExternSym};
     ext.mangledName = "extern_fn";
     ext.libraryPath = "fictional.lib";
+    ext.binding     = binding;
     std::vector<::dss::ExternImport> externImports{ext};
 
     ExternCallLowering out{
-        ::dss::lowerToLir(m, sch, interner, rep, externImports, dispatch),
+        ::dss::lowerToLir(m, sch, interner, rep, externImports, dispatch,
+                          /*dataImportBinding=*/std::nullopt,
+                          /*tlsAccess=*/std::nullopt,
+                          /*sehScopes=*/{},
+                          /*wideFloatSoftcallLibrary=*/std::nullopt,
+                          /*externAddrBinding=*/std::nullopt,
+                          /*charIsUnsigned=*/std::nullopt,
+                          /*atomicsRuntime=*/std::nullopt,
+                          std::move(narrowing)),
         0u, 0u};
     auto const callOp         = sch.opcodeByMnemonic("call");
     auto const callIndirectOp = sch.opcodeByMnemonic("call_indirect_via_extern");
@@ -4465,6 +4532,82 @@ TEST(MirToLir, IndirectSlotWithoutOpcodeFailsLoud) {
            "NOT lower cleanly";
     EXPECT_GT(rep.errorCount(), 0u)
         << "the indirect-slot-missing-opcode guard must fire";
+}
+
+// ── D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55) ─────
+//
+// THE CALL SITE'S SHAPE IS NOW A PER-SYMBOL QUESTION. Until P55 `lowerCall`
+// read the format-level dispatch, which was right while `indirect-slot`
+// reached every import and became a MISCOMPILE the moment it reached only
+// some: the linker mints a slot for exactly the imports this lowerer derefs,
+// so a call shaped by the FORMAT and a slot minted for the SYMBOL would
+// disagree — an `FF 15` through a slot nobody minted (reading the import's
+// own address as a pointer) or an `E8` retargeted at slot bytes.
+//
+// The pair below is the SAME fixture under the SAME dispatch and the SAME
+// narrowing, with the IMPORT'S BINDING as the only variable. A lowering that
+// read the format could not produce both answers at all.
+TEST(MirToLir, NarrowedIndirectSlotKeepsAStrongExternCallDirect) {
+    // ✔MEASURED 2026-09-02 that this is the reference shape: clang 18.1.3 on
+    // BOTH `--target=x86_64-pc-windows-msvc` and `--target=x86_64-w64-windows-gnu`,
+    // and mingw-w64 gcc 13.2.0, all emit a plain direct `REL32 <name>` and NO
+    // `.refptr` section for a STRONG extern function. RED-on-disable: restore
+    // the format-level `externCallUsesIndirectShape` read in `lowerCall` and
+    // this becomes externCalls==1.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const lowered = lowerStdExternFixture(
+        **target, ::dss::ExternCallDispatch::IndirectSlot, rep,
+        ::dss::CallConv::CcMS64, ::dss::SymbolBinding::Global,
+        std::vector<::dss::SymbolBinding>{::dss::SymbolBinding::Weak});
+    ASSERT_TRUE(lowered.result.ok) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(lowered.externCalls, 0u)
+        << "a STRONG undefined has no absolute resolution — the final link "
+           "finds a definition or fails — so the reference is representable "
+           "pc-relative and must NOT pay a slot deref";
+    EXPECT_EQ(lowered.directCalls, 2u)
+        << "both the extern and the internal call use the plain `call` opcode";
+}
+
+TEST(MirToLir, NarrowedIndirectSlotStillDerefsTheSlotForAWeakExternCall) {
+    // The half that MUST NOT regress: the P0 is about a WEAK import, whose
+    // COFF fallback is an ABSOLUTE value-0 symbol no rel32 reaches. Same
+    // fixture, same narrowing, binding the ONLY variable.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const lowered = lowerStdExternFixture(
+        **target, ::dss::ExternCallDispatch::IndirectSlot, rep,
+        ::dss::CallConv::CcMS64, ::dss::SymbolBinding::Weak,
+        std::vector<::dss::SymbolBinding>{::dss::SymbolBinding::Weak});
+    ASSERT_TRUE(lowered.result.ok) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(lowered.externCalls, 1u)
+        << "the weak extern call must still DEREFERENCE the carried slot — "
+           "link.exe 14.51 answers LNK2016 on the direct form and mingw ld "
+           "truncates it to 0x100000000 with no diagnostic";
+    EXPECT_EQ(lowered.directCalls, 1u)
+        << "only the module-internal call is direct";
+}
+
+TEST(MirToLir, AnUnnarrowedIndirectSlotStillReachesEveryImport) {
+    // The BACK-COMPAT arm, stated rather than assumed: an EMPTY narrowing is
+    // the unqualified meaning `indirect-slot` carried before the key existed,
+    // so a STRONG import still takes the slot there. Every format that does
+    // not declare the key depends on this, and it is the one direction a
+    // reader would not think to check.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const lowered = lowerStdExternFixture(
+        **target, ::dss::ExternCallDispatch::IndirectSlot, rep,
+        ::dss::CallConv::CcMS64, ::dss::SymbolBinding::Global,
+        /*narrowing=*/{});
+    ASSERT_TRUE(lowered.result.ok) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(lowered.externCalls, 1u)
+        << "with no narrowing declared, EVERY import takes the slot";
 }
 
 TEST(MirToLir, NoExternImportsAllCallsLowerAsDirectCall) {

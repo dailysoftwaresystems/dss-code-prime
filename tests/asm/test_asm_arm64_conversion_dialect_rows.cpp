@@ -23,6 +23,10 @@
 // ★★ EVERY EXPECTED WORD IS ✔MEASURED AGAINST GNU as 2.42 **AND** clang 18.1.3
 // SEPARATELY, both agreeing on every probe (60 probes, zero disagreements), and
 // none is derived from a neighbouring form or read out of a manual.
+//   ⇒ cycle P55 (lane fp) added the eight half-precision `fcvt` words below on
+//     the same terms — 37 further probes, zero disagreements, each base
+//     re-derived from THREE independent (Rd,Rn) placements:
+//     [[D-TARGET-ARM64-FP16-CONVERSION-FORMS-UNDECLARED]].
 //
 // ⚠ THE OPERANDS ARE PINNED TO PHYSICAL REGISTERS: `assemble()` runs after
 // register allocation and a virtual register has no encoding, so an unpinned
@@ -244,6 +248,28 @@ constexpr std::uint32_t kUcvtfDW  = 0x1E630020u;  // ucvtf d0, w1
 constexpr std::uint32_t kFcvtSD   = 0x1E624020u;  // fcvt s0, d1
 constexpr std::uint32_t kFcvtDS   = 0x1E22C020u;  // fcvt d0, s1
 
+// ★★★ THE FOUR HALF-PRECISION `fcvt` WORDS, closed 2026-09-02 (cycle P55, lane
+// fp) — [[D-TARGET-ARM64-FP16-CONVERSION-FORMS-UNDECLARED]]. ✔MEASURED, GNU as
+// 2.42 AND clang 18.1.3 probed SEPARATELY and agreeing on all 37 probes of that
+// run, every word read back out of an assembled object with
+// `aarch64-linux-gnu-objdump`.
+//
+// ⚠ EACH BASE IS RE-DERIVED FROM **THREE** INDEPENDENT (Rd,Rn) PLACEMENTS, not
+// from one low-register probe: `h3,s7` = 0x1E23C0E3 and `h29,s16` = 0x1E23C21D;
+// `h3,d7` = 0x1E63C0E3 and `h16,d29` = 0x1E63C3B0; `s3,h7` = 0x1EE240E3 and
+// `s29,h16` = 0x1EE2421D; `d3,h7` = 0x1EE2C0E3 and `d16,h29` = 0x1EE2C3B0. A
+// field-placement error cannot hide behind a single Rd=0/Rn=1 probe, which is
+// the shape the `fcvtzs x16, s29` silent miscompile wore.
+constexpr std::uint32_t kFcvtHS   = 0x1E23C020u;  // fcvt h0, s1
+constexpr std::uint32_t kFcvtHD   = 0x1E63C020u;  // fcvt h0, d1
+constexpr std::uint32_t kFcvtSH   = 0x1EE24020u;  // fcvt s0, h1
+constexpr std::uint32_t kFcvtDH   = 0x1EE2C020u;  // fcvt d0, h1
+// The Rd=3 / Rn=7 placements of the same four.
+constexpr std::uint32_t kFcvtHS37 = 0x1E23C0E3u;  // fcvt h3, s7
+constexpr std::uint32_t kFcvtHD37 = 0x1E63C0E3u;  // fcvt h3, d7
+constexpr std::uint32_t kFcvtSH37 = 0x1EE240E3u;  // fcvt s3, h7
+constexpr std::uint32_t kFcvtDH37 = 0x1EE2C0E3u;  // fcvt d3, h7
+
 constexpr std::uint32_t kCnt8B    = 0x0E205820u;  // cnt  v0.8b,  v1.8b
 constexpr std::uint32_t kCnt16B   = 0x4E205820u;  // cnt  v0.16b, v1.16b
 constexpr std::uint32_t kAddv8B   = 0x0E31B820u;  // addv b0,     v1.8b
@@ -442,19 +468,241 @@ TEST(AsmArm64ConversionRows, EveryConversionWidthPairEncodesItsOwnWord) {
 }
 
 // ★ THE SAME-WIDTH `fcvt` SPELLINGS ARE REFUSED, WHICH IS THE REFERENCES' OWN
-// ANSWER — ✔MEASURED, gas 2.42 AND clang 18.1.3 both reject `fcvt s0, s1` and
-// `fcvt d0, d1`. DSS refuses them for a STATED reason (no `fpcvt` variant
-// declares a destination width equal to its source width) rather than by
-// accident, which is why the pin asserts the refusal rather than the message.
+// ANSWER — ✔MEASURED, gas 2.42 AND clang 18.1.3 both reject `fcvt s0, s1`,
+// `fcvt d0, d1` and `fcvt h0, h1`. DSS refuses them for a STATED reason (no
+// variant of EITHER `fcvt` opcode declares a destination width equal to its
+// source width) rather than by accident, which is why the pin asserts the
+// refusal rather than the message.
+//
+// ⚠ THE THIRD ARM AND THE WORD *EITHER* ARE NEW IN P55: this test read two
+// spellings and named `fpcvt` alone while `fpcvt` was the only opcode the
+// `fcvt` row could elect. `fpcvt_h` joined the row for
+// [[D-TARGET-ARM64-FP16-CONVERSION-FORMS-UNDECLARED]], and a same-width
+// spelling is now eliminated on BOTH candidates rather than on one — so a
+// second opcode that forgot the property would be a hole this test could not
+// see if it kept asking about the first. The width derivation is also no
+// longer inferred from where `%s0` lands in the string, which was a coincidence
+// of two spellings that happened to share a length.
 TEST(AsmArm64ConversionRows, SameWidthFcvtIsRefusedAsBothReferencesDo) {
-    for (auto const* text : {"fcvt %s0, %s1\n", "fcvt %d0, %d1\n"}) {
-        auto const w = (std::string_view{text}.find("%s0") == 5) ? 32u : 64u;
-        auto const r = run2(text, LirRegClass::FPR, w, "v0",
-                            LirRegClass::FPR, w, "v1");
-        ASSERT_TRUE(r->parsed) << text << "\n" << messages(*r);
+    struct Case {
+        char const*   text;
+        std::uint32_t width;
+    } const cases[] = {
+        {"fcvt %s0, %s1\n", 32},
+        {"fcvt %d0, %d1\n", 64},
+        {"fcvt %h0, %h1\n", 16},
+    };
+    for (auto const& c : cases) {
+        auto const r = run2(c.text, LirRegClass::FPR, c.width, "v0",
+                            LirRegClass::FPR, c.width, "v1");
+        ASSERT_TRUE(r->parsed) << c.text << "\n" << messages(*r);
         EXPECT_FALSE(r->ok)
-            << text << " was accepted, and both references refuse it";
+            << c.text << " was accepted, and both references refuse it";
+        EXPECT_EQ(firstWord(r->bytes), kRet)
+            << c.text << " emitted " << hex(r->bytes);
     }
+}
+
+// ★★★ THE FOUR HALF-PRECISION CONVERSION FORMS, EACH AT TWO REGISTER
+// PLACEMENTS — [[D-TARGET-ARM64-FP16-CONVERSION-FORMS-UNDECLARED]].
+//
+// DSS refused all four and BOTH references assemble all four at the DEFAULT
+// -march, so this was a BELOW-THE-UNION conformance defect on a hand-written-
+// assembly surface. The words come from `fpcvt` (the `fcvt s, h` widen, on its
+// free source-width-16 slot) and `fpcvt_h` (the other three); which opcode
+// answers is not this test's subject — the BYTES are, and they are the same
+// bytes either way.
+//
+// ⚠ THE SECOND PLACEMENT OF EACH FORM IS THE POINT OF THE SECOND HALF. A base
+// word verified only at Rd=0/Rn=1 leaves the Rd and Rn fields unmeasured, which
+// is exactly the shape the `fcvtzs x16, s29` silent miscompile wore: it was the
+// REGISTER-BEARING word that was wrong. `%0`→v3 and `%1`→v7 give Rd=3, Rn=7.
+TEST(AsmArm64ConversionRows, TheFp16ConversionFormsEncodeTheirOwnWords) {
+    struct Case {
+        char const*   text;
+        std::uint32_t dstW;
+        char const*   dstReg;
+        std::uint32_t srcW;
+        char const*   srcReg;
+        std::uint32_t want;
+    } const cases[] = {
+        {"fcvt %h0, %s1\n", 16, "v0", 32, "v1", kFcvtHS},
+        {"fcvt %h0, %d1\n", 16, "v0", 64, "v1", kFcvtHD},
+        {"fcvt %s0, %h1\n", 32, "v0", 16, "v1", kFcvtSH},
+        {"fcvt %d0, %h1\n", 64, "v0", 16, "v1", kFcvtDH},
+        {"fcvt %h0, %s1\n", 16, "v3", 32, "v7", kFcvtHS37},
+        {"fcvt %h0, %d1\n", 16, "v3", 64, "v7", kFcvtHD37},
+        {"fcvt %s0, %h1\n", 32, "v3", 16, "v7", kFcvtSH37},
+        {"fcvt %d0, %h1\n", 64, "v3", 16, "v7", kFcvtDH37},
+    };
+    for (auto const& c : cases) {
+        auto const r = run2(c.text, LirRegClass::FPR, c.dstW, c.dstReg,
+                            LirRegClass::FPR, c.srcW, c.srcReg);
+        ASSERT_TRUE(r->parsed) << c.text << "\n" << messages(*r);
+        EXPECT_TRUE(r->ok) << c.text << "\n" << messages(*r);
+        EXPECT_EQ(firstWord(r->bytes), c.want)
+            << c.text << " (" << c.dstReg << ", " << c.srcReg << ") emitted "
+            << hex(r->bytes);
+    }
+
+    // ★ AND THE TWO C-REACHABLE ARMS STILL ANSWER WHAT THEY ALWAYS DID, so the
+    // third variant added to `fpcvt` cannot be read as having moved them.
+    for (auto const& [text, want] :
+         {std::pair<char const*, std::uint32_t>{"fcvt %s0, %d1\n", kFcvtSD},
+          std::pair<char const*, std::uint32_t>{"fcvt %d0, %s1\n", kFcvtDS}}) {
+        auto const w = want == kFcvtSD;
+        auto const c = run2(text, LirRegClass::FPR, w ? 32u : 64u, "v0",
+                            LirRegClass::FPR, w ? 64u : 32u, "v1");
+        ASSERT_TRUE(c->parsed && c->ok) << text << "\n" << messages(*c);
+        EXPECT_EQ(firstWord(c->bytes), want) << text << hex(c->bytes);
+    }
+}
+
+// ★★★ THE RED-ON-DISABLE MUTANT FOR THE HALF FORMS, REMOVE DIRECTION, OVER THE
+// SHIPPED TARGET. Deleting `fpcvt_h` returns the target to its pre-P55 state
+// for three of the four forms. The dialect row still names it, the lines still
+// parse, and the ONLY acceptable outcome is a REFUSAL — emitting `fpcvt`'s
+// float↔double word for a half spelling is precisely the silent wrong
+// instruction this row exists to close.
+//
+// ⚠ THE CONTROL IS PRINTED BY NAME AND IT IS THE **HALF** ARM THAT SURVIVES:
+// `fcvt s0, h1` lives on `fpcvt`, so it must still encode on the mutant. A
+// control that only checked `fcvt s0, d1` would pass even if the mutation had
+// deleted every h-view spelling, which is the failure mode a mutant most often
+// hides behind.
+TEST(AsmArm64ConversionRows, RemovingTheHalfConversionOpcodeRefuses) {
+    auto mutant = test_support::mutateShippedTargetSchemaDoc(
+        kTarget, [](nlohmann::json& doc) {
+            auto&       ops     = doc.at("opcodes");
+            std::size_t removed = 0;
+            for (auto it = ops.begin(); it != ops.end();) {
+                if (it->value("mnemonic", std::string{}) == "fpcvt_h") {
+                    it = ops.erase(it);
+                    ++removed;
+                } else {
+                    ++it;
+                }
+            }
+            if (removed != 1) {
+                throw std::runtime_error{
+                    "expected exactly one `fpcvt_h` opcode in the shipped "
+                    "arm64 target, found " + std::to_string(removed)};
+            }
+        });
+    ASSERT_TRUE(mutant.has_value())
+        << "the mutated target did not load — the pin would measure a load "
+           "failure rather than the missing opcode";
+
+    struct Case {
+        char const*   text;
+        std::uint32_t dstW;
+        std::uint32_t srcW;
+        std::uint32_t neverEmit;
+    } const gone[] = {
+        // `fcvt h0, s1` shares its source width with `fcvt d0, s1`.
+        {"fcvt %h0, %s1\n", 16, 32, kFcvtDS},
+        // `fcvt h0, d1` shares its source width with `fcvt s0, d1`.
+        {"fcvt %h0, %d1\n", 16, 64, kFcvtSD},
+        // `fcvt d0, h1` shares its source width with `fcvt s0, h1`.
+        {"fcvt %d0, %h1\n", 64, 16, kFcvtSH},
+    };
+    for (auto const& c : gone) {
+        auto const r = run2(c.text, LirRegClass::FPR, c.dstW, "v0",
+                            LirRegClass::FPR, c.srcW, "v1", nullptr, *mutant);
+        ASSERT_TRUE(r->parsed) << c.text << "\n" << messages(*r);
+        EXPECT_FALSE(r->ok)
+            << c.text << " assembled after its opcode was deleted";
+        EXPECT_NE(firstWord(r->bytes), c.neverEmit)
+            << c.text << " fell through to the OTHER destination at this "
+                         "source width — the destination width is not routing "
+                         "the election: "
+            << hex(r->bytes);
+        EXPECT_EQ(firstWord(r->bytes), kRet)
+            << c.text << " emitted " << hex(r->bytes);
+    }
+
+    // THE CONTROLS, named so a passing arm is visible rather than silent.
+    struct Control {
+        char const*   name;
+        char const*   text;
+        std::uint32_t dstW;
+        std::uint32_t srcW;
+        std::uint32_t want;
+    } const controls[] = {
+        {"fcvt s0, h1 (the half arm that lives on `fpcvt`)",
+         "fcvt %s0, %h1\n", 32, 16, kFcvtSH},
+        {"fcvt s0, d1 (the C-reachable narrow)",
+         "fcvt %s0, %d1\n", 32, 64, kFcvtSD},
+        {"fcvt d0, s1 (the C-reachable widen)",
+         "fcvt %d0, %s1\n", 64, 32, kFcvtDS},
+    };
+    for (auto const& c : controls) {
+        auto const r = run2(c.text, LirRegClass::FPR, c.dstW, "v0",
+                            LirRegClass::FPR, c.srcW, "v1", nullptr, *mutant);
+        ASSERT_TRUE(r->parsed) << c.name << "\n" << messages(*r);
+        EXPECT_TRUE(r->ok) << "CONTROL " << c.name << " stopped assembling: "
+                           << messages(*r);
+        EXPECT_EQ(firstWord(r->bytes), c.want)
+            << "CONTROL " << c.name << " emitted " << hex(r->bytes);
+    }
+}
+
+// ★★★ THE OTHER HALF OF THE SAME GUARANTEE — delete the width-16 variant of
+// `fpcvt` and `fcvt s0, h1` must REFUSE rather than fall onto `fpcvt_h`'s
+// width-16 arm, which writes a DOUBLE. Both opcodes take `[reg]` at width 16
+// and differ only in the destination width they declare, so this is the exact
+// pair a destination-blind election would confuse — and the wrong answer would
+// be a 64-bit write where 32 bits were asked for, in a register the caller
+// reads as a float.
+TEST(AsmArm64ConversionRows, RemovingFpcvtsHalfArmDoesNotFallOntoTheDoubleForm) {
+    auto mutant = test_support::mutateShippedTargetSchemaDoc(
+        kTarget, [](nlohmann::json& doc) {
+            std::size_t removed = 0;
+            for (auto& op : doc.at("opcodes")) {
+                if (op.value("mnemonic", std::string{}) != "fpcvt") continue;
+                auto& vars = op.at("encoding").at("variants");
+                for (auto it = vars.begin(); it != vars.end();) {
+                    if (it->at("guard").value("width", 0u) == 16u) {
+                        it = vars.erase(it);
+                        ++removed;
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            if (removed != 1) {
+                throw std::runtime_error{
+                    "expected exactly one width-16 `fpcvt` variant in the "
+                    "shipped arm64 target, found " + std::to_string(removed)};
+            }
+        });
+    ASSERT_TRUE(mutant.has_value())
+        << "the mutated target did not load — the pin would measure a load "
+           "failure rather than the missing variant";
+
+    auto const r = run2("fcvt %s0, %h1\n", LirRegClass::FPR, 32, "v0",
+                        LirRegClass::FPR, 16, "v1", nullptr, *mutant);
+    ASSERT_TRUE(r->parsed) << messages(*r);
+    EXPECT_FALSE(r->ok)
+        << "`fcvt s0, h1` assembled after the only variant declaring a 32-bit "
+           "destination at source width 16 was deleted";
+    EXPECT_NE(firstWord(r->bytes), kFcvtDH)
+        << "the DOUBLE-destination word was emitted for a SINGLE destination: "
+        << hex(r->bytes);
+    EXPECT_NE(firstWord(r->bytes), kFcvtSH)
+        << "the word survived the deletion of the variant that declares it — "
+           "the byte pin is not reading the target: "
+        << hex(r->bytes);
+
+    // CONTROL, by name: the sibling at the same source width is untouched.
+    auto const ctl = run2("fcvt %d0, %h1\n", LirRegClass::FPR, 64, "v0",
+                          LirRegClass::FPR, 16, "v1", nullptr, *mutant);
+    ASSERT_TRUE(ctl->parsed) << messages(*ctl);
+    EXPECT_TRUE(ctl->ok)
+        << "CONTROL `fcvt d0, h1` (fpcvt_h's width-16 arm) stopped "
+           "assembling: " << messages(*ctl);
+    EXPECT_EQ(firstWord(ctl->bytes), kFcvtDH)
+        << "CONTROL `fcvt d0, h1` emitted " << hex(ctl->bytes);
 }
 
 // ★★★ THE ANTI-SILENT-MISCOMPILE MUTANT, AND IT RECREATES THE MEASURED SHAPE
@@ -963,10 +1211,19 @@ TEST(AsmArm64ConversionRows, LaneKeysWithNothingToGovernAreRefusedAtLoad) {
 // `arm64.target.json` carried a width-16 `fmov` arm that made `fmov h0, h1`
 // assemble rc=0 to 0x1EE04020 (✔MEASURED at the P54 base), i.e. DSS accepted a
 // program NEITHER reference accepts; the arm is deleted.
-// ⚠ THE CONVERSION HALF IS A SEPARATE, STILL-OPEN GAP — DSS is BELOW the union
-// on the four `fcvt` h-forms, which need their own opcodes because two variants
-// of one opcode may not share an operand shape at one width:
-// [[D-TARGET-ARM64-FP16-CONVERSION-FORMS-UNDECLARED]].
+// ⚠ THE CONVERSION HALF WAS A SEPARATE GAP AND IT IS CLOSED (2026-09-02, cycle
+// P55, lane fp): DSS was BELOW the union on the four `fcvt` h-forms, which
+// needed a second opcode because two variants of one opcode may not share an
+// operand shape at one width. `fpcvt_h` is that opcode and
+// `TheFp16ConversionFormsEncodeTheirOwnWords` pins all four words at two
+// register placements each — [[D-TARGET-ARM64-FP16-CONVERSION-FORMS-UNDECLARED]].
+// ⚠⚠ THE SENTENCE ABOVE THAT CALLS THE CONVERSIONS *base ARMv8-A* IS TRUE OF
+// FCVT AND ONLY OF FCVT, ✔RE-MEASURED in P55: the fp16 INTEGER conversions are
+// `FEAT_FP16` and both references refuse them at the default -march
+// (`fcvtzs w0,h1`, `fcvtzs x0,h1`, `scvtf h0,w1`, `scvtf h0,x1`, `fcvtns w0,h1`,
+// `fcvtas w0,h1`), so the `h` view stays unsayable on every `fcvtzs`/`fcvtzu`/
+// `scvtf`/`ucvtf` and rounding row — declaring it there would be ABOVE the
+// union exactly as the deleted `fmov` arm was.
 TEST(AsmArm64ConversionRows, TheFp16MoveIsRefusedBecauseBothReferencesAre) {
     auto const r = run2("fmov %h0, %h1\n", LirRegClass::FPR, 16, "v0",
                         LirRegClass::FPR, 16, "v1");

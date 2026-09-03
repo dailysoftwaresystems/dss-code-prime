@@ -396,6 +396,32 @@ enum class DiagnosticCode : std::uint16_t {
     // failure. At Warning it would do the same under `--warnings-as-errors`.
     P_DiagnosticsElided           = 0x9007,
 
+    // Speculative-probe TOKEN budget exhausted. A single speculative branch
+    // consumed more tokens than `ParserConfig::speculationBudgetFactor` x the
+    // alt's declared `lookahead` allows, so the parser abandoned the probe
+    // without ever deciding whether the branch was right.
+    //
+    // ★ WHY IT NEEDED ITS OWN CODE RATHER THAN THE SILENCE IT HAD. This is the
+    // THIRD ceiling stacked on one construct (after the parser's speculation
+    // DEPTH cap and the builder's checkpoint cap), and it was the only one that
+    // reported nothing at all: the probe just failed, the alt fell through to
+    // its non-speculative fallback replay, and the replay reliably ended in a
+    // `P_NoAlternativeMatched` positioned on a token the user had written
+    // CORRECTLY. ✔MEASURED: with the two depth caps lifted, `(int)` x341 nested
+    // casts compiled rc 0 and x342 was refused that way — 341 x 3 tokens = 1023,
+    // one under the 64 x 16 budget — while gcc, mingw-w64 gcc, clang and MSVC
+    // all accept far deeper. A ceiling that fabricates a syntax error against
+    // valid source is worse than one that refuses loudly, because it sends the
+    // reader to fix code that is already right
+    // (D-PARSE-NINE-NESTED-CASTS-ARE-REFUSED-BY-THE-SPECULATION-CAP-WITH-A-FABRICATED-SYNTAX-ERROR).
+    //
+    // Reported at the token the abandoned probe had reached, and RECOVERED
+    // (panic scan + graceful unwind) exactly like `P_ExpressionTooDeep` — never
+    // an abort. Deliberately NOT in `kUnsuppressableCodes`, matching its two
+    // siblings `P_MaxSpeculationDepth` / `P_BacktrackFailed`: the Error leaf it
+    // leaves behind still fails the build, so suppressing it hides no failure.
+    P_SpeculationBudgetExhausted  = 0x9008,
+
     // ── C0xxx — config loader (see plan §5.12) ──
     C_MissingField                = 0xC001,
     C_UnknownShape                = 0xC002,
@@ -3469,15 +3495,27 @@ enum class DiagnosticCode : std::uint16_t {
     //   VALID and never trips this. An `Error` HIR node continues the collect-all
     //   lowering, exactly like H_WideCharValueUnrepresentable.
     H_InvalidUniversalCharacterName = 0xF015,
-    // H_WideByteEscapeUnsupported (C11/C23 6.4.5, D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE):
-    //   a `\x` hex / `\ooo` octal escape inside a wide/UTF literal (`u"…"`/`U"…"`/
-    //   `u8"…"`/`L"…"` or the char forms). A byte escape names a raw code-unit VALUE,
-    //   not a code point; assembling that value directly is a deferred feature, so it
-    //   FAILS LOUD here rather than the old silent UTF-8-collapse (`u"\xC3\xA9"` once
-    //   became ONE 0x00E9 unit instead of two intended units). Narrow `"…"`/`'…'`
-    //   keep `\x`/octal (byte-producing, correct for a narrow element). Use `\u`/`\U`
-    //   for a code point. An `Error` HIR node continues the collect-all lowering.
-    H_WideByteEscapeUnsupported   = 0xF016,
+    // H_EscapeValueExceedsCodeUnit (C 6.4.4.4 / 6.4.5, closing the P55 pair
+    //   D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE + D-CSUBSET-NARROW-HEX-ESCAPE-TRUNCATED-TO-TWO-DIGITS):
+    //   a `\x` hex / `\ooo` octal escape whose VALUE does not fit ONE code unit of the
+    //   literal's element — `"\x101"` or `"\777"` in a narrow `char` string, `u"\x1FFFF"`
+    //   under a 16-bit `char16_t`/`wchar_t`, `u8"\x100"` under `char8_t`. A byte escape
+    //   names a raw code-unit VALUE (not a code point), so the bound is the ELEMENT WIDTH
+    //   and nothing else: `u"\xFFFF"`, `u"\xD800"` and `U"\xFFFFFFFF"` are all VALID and
+    //   assemble to one unit each. The `actual` names the WIDTH and the VALUE, because
+    //   neither alone is actionable.
+    //   ⚠ THE REFERENCES SPLIT HERE AND THE REFUSAL IS THE UNION OVER WHAT *WORKS*:
+    //   gcc 13.3.0 and mingw-w64 gcc 13.2.0 accept by TRUNCATING with a warning
+    //   (`u"\x1FFFF"` → 0xFFFF, and narrow `"\x100"` → a silent NUL), clang 18.1.3 and
+    //   MSVC 19.51 REFUSE. A reference that only accepts by narrowing the value away is
+    //   not a working reference for that literal, so DSS refuses — never truncates.
+    //   ⓘ RENAMED IN PLACE from H_WideByteEscapeUnsupported, which held this ordinal while
+    //   a byte escape in a wide literal was refused WHOLESALE. That refusal is gone (the
+    //   escape now assembles as a unit); the ordinal is retained rather than freed so no
+    //   later allocation can silently inherit an old fixture's numeric expectation, and
+    //   the old NAME resolves nowhere, which is loud.
+    //   An `Error` HIR node continues the collect-all lowering.
+    H_EscapeValueExceedsCodeUnit  = 0xF016,
     // H_ConflictingStringLiteralPrefixes (C11/C23 6.4.5p5, Cycle D): a run of
     //   ADJACENT string literals mixes TWO DIFFERENT non-narrow encoding prefixes
     //   (`u"a" U"b"`, `u8"a" u"b"`, `L"a" u"b"`, …). 6.4.5p5 leaves "whether

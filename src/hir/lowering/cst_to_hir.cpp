@@ -1475,11 +1475,19 @@ struct Lowerer {
     }
 
     // True iff the subtree rooted at `node` contains a node whose rule is
-    // explicitly deferred (e.g. an array declarator). Bounded.
+    // explicitly deferred (e.g. an array declarator).
+    //
+    // ⚠ THE `guard < 8192` ITERATION LIMIT IS GONE, AND IT WAS A SILENT WRONG
+    // ANSWER, NOT A SAFETY NET. Past 8192 visited nodes it returned `false` — "no
+    // deferred rule here" — for a subtree it had not finished looking at, with no
+    // diagnostic and no trace; a single sqlite function body is far larger than
+    // that. A CST is finite and acyclic, so the walk terminates on its own, and
+    // the heap stack means depth costs no host frames
+    // (feedback-no-input-proportional-recursion).
     [[nodiscard]] bool subtreeHasDeferred(NodeId node) const {
         if (deferred_.empty()) return false;
         std::vector<NodeId> stack{node};
-        for (int guard = 0; !stack.empty() && guard < 8192; ++guard) {
+        while (!stack.empty()) {
             NodeId c = stack.back();
             stack.pop_back();
             if (tree().kind(c) == NodeKind::Internal && deferred_.count(tree().rule(c).v) != 0)
@@ -1497,6 +1505,50 @@ struct Lowerer {
         for (NodeId c : tree().children(parent))
             if (!isEmptySpace(tree().flags(c))) out.push_back(c);
         return out;
+    }
+
+    // ★★ THE ONE OWNER OF "PRE-ORDER OVER A CST SUBTREE, ON THE HEAP"
+    // (feedback-no-input-proportional-recursion, operator 2026-09-02).
+    //
+    // Every PRE-ORDER walk in this file that used to be host recursion over
+    // `visible()` routes through here — `findCompositeSpecifierIn`,
+    // `findForwardCompositeSpecifierIn`, `collectListItems`, `collectParams` — so
+    // the standing no-input-proportional-recursion ruling is argued at ONE site
+    // instead of four times. The visitor returns a `Walk` verdict, which is what
+    // lets one traversal serve the three shapes that actually occur:
+    //   Descend — keep going into this node's children (the default);
+    //   Skip    — this node is a MATCH or a boundary: do not enter its children
+    //             (`collectListItems`' "matched: don't descend", `collectParams`'
+    //             VarDecl arm);
+    //   Stop    — the answer is known; abandon the whole walk (a first-match find).
+    //
+    // ⚠ THE POST-ORDER FOLDS DELIBERATELY DO NOT USE THIS, and that is not a
+    // missed consolidation. `resolveStampedTypeBelow`, `flattenInitSlot` and
+    // `synthZeroOrError` assemble each node's answer FROM ITS CHILDREN'S — one of
+    // them short-circuits on the first disagreeing pair, two of them build a
+    // parent node once its children exist — which a pre-order visitor cannot
+    // express. They carry their own explicit stacks. (`bodyHasReachableBreak`
+    // walks HIR, not CST, so it has its own stack for a different reason.)
+    //
+    // ORDER IS DOCUMENT ORDER, and that is load-bearing: `findCompositeSpecifierIn`
+    // documents that the FIRST match is the OUTERMOST body and `collectListItems`
+    // collects "in document order". Children are therefore pushed in REVERSE so
+    // they pop left-to-right — the order the former recursion visited them in.
+    enum class Walk : std::uint8_t { Descend, Skip, Stop };
+
+    template <class Visit>
+    void forEachCstNodeUnder(NodeId root, Visit&& visit) const {
+        if (!root.valid()) return;
+        std::vector<NodeId> pending{root};
+        while (!pending.empty()) {
+            NodeId const n = pending.back();
+            pending.pop_back();
+            Walk const verdict = visit(n);
+            if (verdict == Walk::Stop) return;
+            if (verdict == Walk::Skip) continue;
+            auto const kids = visible(n);
+            for (std::size_t i = kids.size(); i-- > 0;) pending.push_back(kids[i]);
+        }
     }
     [[nodiscard]] bool isToken(NodeId n) const { return tree().kind(n) == NodeKind::Token; }
 
@@ -3965,6 +4017,20 @@ struct Lowerer {
         return TypeKind::I32;
     }
 
+    // The config BASE element core of a STRING opener — the string twin of
+    // `charOpenerBaseCore`, and used for the same narrow purpose: to recover a
+    // usable element width when the semantic tier DROPPED the stamp, so a fail-loud
+    // reason can be classified instead of guessed. ⚠ It is the pre-override core,
+    // so `L"` reads I32 even on pe where the real element is U16; that is safe
+    // BECAUSE it is only ever a widening — an escape it lets through is still
+    // checked against the true element by `encodeWideString`, which refuses. Never
+    // use it in place of the stamp when the stamp exists.
+    [[nodiscard]] TypeKind stringOpenerBaseCore(SchemaTokenId tok) const {
+        for (auto const& px : cfg.stringLiteralPrefixes)
+            if (px.startToken.v == tok.v) return px.elementCore;
+        return TypeKind::Char;
+    }
+
     // The element CORE stamped on a char body token by the semantic tier (the ONLY
     // place wchar_t width was format-resolved). Returns `Void` when the token was
     // left UNTYPED — the semantic tier's type-drop for a wide char it could not
@@ -3981,6 +4047,32 @@ struct Lowerer {
     [[nodiscard]] static bool isWideCharCore(TypeKind core) {
         return core == TypeKind::U8 || core == TypeKind::U16
             || core == TypeKind::U32 || core == TypeKind::I32;
+    }
+
+    // THE message for H_EscapeValueExceedsCodeUnit. It must name the WIDTH and the
+    // VALUE together: "escape out of range" alone cannot be acted on, and the two
+    // anchors this closes were both cases where the compiler knew the number and
+    // did not say it. The escape's own spelling (`\x` vs octal) is named too,
+    // because the two terminate differently — `\x` runs to the last hex digit
+    // (C 6.4.4.4p7), so a reader who wrote `"a\xFFb"` needs to be told the `b` was
+    // eaten rather than left as a letter.
+    [[nodiscard]] std::string escapeTooWideDetail(EscapeValueUnit const& bad,
+                                                  TypeKind core, NodeId node) {
+        std::uint32_t const bits  = 8 * elementByteWidth(core);
+        std::uint64_t const limit = bits >= 64 ? ~std::uint64_t{0}
+                                               : ((std::uint64_t{1} << bits) - 1u);
+        return std::format(
+            "literal {} has a {} escape whose value 0x{:X} does not fit ONE {}-bit code "
+            "unit of its element type (the widest value that fits is 0x{:X}). A \\x / "
+            "octal escape names a raw code-unit VALUE, not a code point, so its bound is "
+            "the element width{} — DSS refuses rather than truncating, because a "
+            "truncated escape is a silent wrong answer",
+            std::string{tree().text(node)},
+            bad.hex ? "\\x hexadecimal" : "octal",
+            bad.value, bits, limit,
+            bad.hex ? " (note that \\x consumes EVERY following hex digit, so a letter "
+                      "a-f after the intended digits is part of the escape)"
+                    : "");
     }
 
     struct WideCharDiag { DiagnosticCode code; char const* why; };
@@ -4008,11 +4100,10 @@ struct Lowerer {
                 return {DiagnosticCode::H_InvalidUniversalCharacterName,
                         "a \\u/\\U universal character name is malformed (needs exactly "
                         "4 / 8 hex digits) or names a surrogate half / a value > U+10FFFF"};
-            case WideCharError::ByteEscapeInWide:
-                return {DiagnosticCode::H_WideByteEscapeUnsupported,
-                        "a \\x hex / octal byte escape in a wide/UTF character constant is "
-                        "not supported (it names a raw code-unit value, not a code point) "
-                        "— use a \\u/\\U universal character name"};
+            case WideCharError::EscapeValueTooWide:
+                return {DiagnosticCode::H_EscapeValueExceedsCodeUnit,
+                        "a \\x hex / octal escape names a raw code-unit VALUE that does not "
+                        "fit one code unit of this constant's element type"};
             case WideCharError::ValueUnrepresentable:
                 break;
         }
@@ -4044,6 +4135,13 @@ struct Lowerer {
                       std::format("char literal '{}' has an invalid universal character "
                                   "name (\\u needs 4 hex digits, \\U needs 8, and it must "
                                   "not name a surrogate half or a value > U+10FFFF)", body));
+            } else if (auto bad = firstEscapeValueTooWide(outcome, 8)) {
+                // `'\x101'` / `'\777'`: the escape decoded, but its VALUE overflows
+                // the one-byte narrow element. `decodeCharLiteralBody` runs this
+                // check before its single-byte test precisely so this reaches here
+                // as an out-of-range escape rather than a "multi-character" literal.
+                emitH(DiagnosticCode::H_EscapeValueExceedsCodeUnit, node,
+                      escapeTooWideDetail(*bad, TypeKind::Char, node));
             } else {
                 unsupported(node, std::format("char literal '{}' is empty, multi-character, "
                                               "or has an unsupported escape", body));
@@ -4086,6 +4184,19 @@ struct Lowerer {
         // the specific reason. `werr` keeps its ValueUnrepresentable init when the
         // base-core re-decode SUCCEEDED but the format core had dropped it (L'-pe
         // astral) — the honest generic reason.
+        // An escape too WIDE for the element gets the width-and-value message rather
+        // than the generic reason — the number the compiler already knows is the
+        // whole of what makes the diagnostic actionable.
+        if (werr == WideCharError::EscapeValueTooWide) {
+            EscapeDecodeOutcome esc;
+            std::string          scratch;
+            esc = decodeEscapedBytes(body, scratch);
+            if (auto bad = firstEscapeValueTooWide(esc, 8 * elementByteWidth(core))) {
+                emitH(DiagnosticCode::H_EscapeValueExceedsCodeUnit, node,
+                      escapeTooWideDetail(*bad, core, node));
+                return {errorNode(node), InvalidType};
+            }
+        }
         WideCharDiag const d = wideCharErrorDetail(werr);
         emitH(d.code, node,
               std::format("wide/UTF character constant {} cannot be lowered: {}",
@@ -4219,19 +4330,28 @@ struct Lowerer {
         // pass through untouched. That is the correct C 6.4.5p5 behavior: the bytes are
         // no longer a narrow byte sequence but a UTF-8 source that must decode.
         TypeKind const core = stringElementCoreOf(node);
-        // FF3: a `\x` hex / octal byte escape in a wide/UTF string names a raw
-        // code-unit VALUE, not a code point — assembling it is deferred
-        // (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE), so FAIL LOUD rather than the old
-        // silent UTF-8-collapse (`u"\xC3\xA9"` → one 0x00E9 unit instead of two).
-        // Keyed on the run's EFFECTIVE prefix (format-agnostic) so it fires even when
-        // the semantic tier left the node untyped, AND on a MIXED run `"a" L"\xC3"`
-        // whose first opener is narrow. Narrow `"…"`/SQL keep `\x`/octal (byte-producing).
-        if (outcome.usedByteEscape && isWideStringOpenerKind(eff.effectiveOpener)) {
-            emitH(DiagnosticCode::H_WideByteEscapeUnsupported, node,
-                  std::format("wide/UTF string literal {} cannot be lowered: a \\x hex / "
-                              "octal byte escape names a raw code-unit value, not a code "
-                              "point — use a \\u/\\U universal character name",
-                              std::string{tree().text(node)}));
+        // D-CSUBSET-NARROW-HEX-ESCAPE-TRUNCATED-TO-TWO-DIGITS: a `\x`/octal escape
+        // names a raw code-unit VALUE, and the value must fit ONE code unit of the
+        // element. For a NARROW run that element is one byte, so `"\x101"`,
+        // `"a\xFFb"` (the escape is `\xFFb` = 0xFFB — `b` IS a hex digit) and
+        // `"\777"` all fail loud HERE instead of silently becoming their low byte.
+        // Keyed on the run's EFFECTIVE prefix, not on the stamp: a narrow run never
+        // type-drops, so `core` is trustworthy on this side of the branch, whereas a
+        // wide run whose semantic stamp fell back to Char would give the WRONG width.
+        // ★ THE WIDTH IS THE ELEMENT'S, AND THE ELEMENT COMES FROM THE RUN'S
+        // EFFECTIVE PREFIX — never from the semantic stamp on this branch. A wide
+        // run whose encode failed leaves the node untyped and `stringElementCoreOf`
+        // then reports Char, so checking against the STAMP would test a byte width
+        // against a `char16_t` literal and refuse `u"\xFFFF"`, which is valid. The
+        // opener's declared base core is the config's answer and is what the
+        // semantic tier keyed its own type on.
+        bool const stampDropped = (core == TypeKind::Char || core == TypeKind::Byte)
+                                  && isWideStringOpenerKind(eff.effectiveOpener);
+        TypeKind const escCore =
+            stampDropped ? stringOpenerBaseCore(eff.effectiveOpener) : core;
+        if (auto bad = firstEscapeValueTooWide(outcome, 8 * elementByteWidth(escCore))) {
+            emitH(DiagnosticCode::H_EscapeValueExceedsCodeUnit, node,
+                  escapeTooWideDetail(*bad, escCore, node));
             return {errorNode(node), InvalidType};
         }
         // A wide opener (`u"`/`U"`/`u8"`/`L"`) whose node the semantic tier left
@@ -4270,7 +4390,7 @@ struct Lowerer {
         // silent wrong unit. `u8"` also flows here so its raw UTF-8 is VALIDATED
         // (an ill-formed `u8"…"` fails loud rather than emitting garbage bytes).
         WideEncodeResult enc;
-        if (auto err = encodeWideString(bytes, core, enc)) {
+        if (auto err = encodeWideString(bytes, core, enc, &outcome)) {
             emitH(DiagnosticCode::H_WideCharSurrogateUnsupported, node,
                   wideEncodeErrorDetail(*err, core, node));
             return {errorNode(node), InvalidType};
@@ -4540,11 +4660,18 @@ struct Lowerer {
     // inside another (were a grammar to allow it) is not flattened into the outer
     // list. When `matchRule` is unset, gathers the direct internal children.
     void collectListItems(NodeId parent, RuleId matchRule, std::vector<NodeId>& out) {
-        for (NodeId c : visible(parent)) {
-            if (tree().kind(c) != NodeKind::Internal) continue;
-            if (!matchRule.valid()) { out.push_back(c); continue; }
-            if (tree().rule(c).v == matchRule.v) { out.push_back(c); continue; }  // matched: don't descend
-            collectListItems(c, matchRule, out);   // descend through repeat-group wrappers
+        // The walk starts at each DIRECT child, not at `parent`: `parent` itself is
+        // the list carrier and is never a list ITEM, and the former recursion
+        // likewise only ever tested children.
+        for (NodeId top : visible(parent)) {
+            forEachCstNodeUnder(top, [&](NodeId c) {
+                if (tree().kind(c) != NodeKind::Internal) return Walk::Skip;
+                if (!matchRule.valid() || tree().rule(c).v == matchRule.v) {
+                    out.push_back(c);
+                    return Walk::Skip;        // matched: don't descend
+                }
+                return Walk::Descend;         // through repeat-group wrappers
+            });
         }
     }
 
@@ -4552,9 +4679,14 @@ struct Lowerer {
     // semantics `callRules`), or invalid if none. Descent stops at the first
     // match, so a call's own argument subtrees (which may contain nested calls)
     // are not mistaken for the operand's call.
+    //
+    // ⚠ THE `guard < 4096` ITERATION LIMIT IS GONE, for the same reason
+    // `subtreeHasDeferred`'s is: past 4096 visited nodes it answered "no call
+    // here" for a subtree it had not finished reading — a silent wrong answer, not
+    // a safety net. A CST is finite and acyclic; the walk terminates on its own.
     [[nodiscard]] NodeId findCallNode(NodeId subtree) const {
         std::vector<NodeId> stack{subtree};
-        for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+        while (!stack.empty()) {
             NodeId n = stack.back(); stack.pop_back();
             if (tree().kind(n) == NodeKind::Internal && callMap_.count(tree().rule(n).v))
                 return n;                                   // matched: don't descend
@@ -7432,7 +7564,45 @@ struct Lowerer {
     // (empty ops / scalars) emit a diagnostic against `at` rather than
     // silently falling through to a scalar literal whose declared type
     // would be `Array` — a type-system corruption.
-    [[nodiscard]] HirNodeId synthZeroOrError(NodeId at, TypeId type) {
+    //
+    // ★★ AN EXPLICIT POST-ORDER STACK, NOT HOST RECURSION
+    // (feedback-no-input-proportional-recursion, operator 2026-09-02). The depth
+    // followed the AGGREGATE TYPE's nesting — struct-in-struct, array-of-array —
+    // which is the user's declaration and nothing this project bounds.
+    // `zeroOfTypeStep` classifies ONE type: either it answers outright (a scalar,
+    // an enum, a malformed-type refusal) or it names the child types the answer is
+    // assembled from. The driver below owns the descent.
+    //
+    // ⚠ THE CHILD TYPES ARE COPIED OUT AS VALUES, which the
+    // D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD contract requires and the
+    // recursive form achieved by copying one `TypeId` at a time: building a child
+    // may INTERN, which reallocates the interner's operand pool and invalidates
+    // any retained span. An ARRAY keeps its element type ONCE plus a count rather
+    // than N copies, so a large `[N]` costs no more here than it already costs in
+    // the child node list.
+    enum class ZeroAssemble : std::uint8_t { Aggregate, ComplexCast };
+    struct ZeroFrame {
+        TypeId                 type{};
+        ZeroAssemble           how = ZeroAssemble::Aggregate;
+        std::vector<TypeId>    childTypes;      // Struct / Union / Complex
+        TypeId                 elemType{};      // Array: the ONE element type…
+        std::int64_t           elemCount = 0;   //        …repeated this many times
+        std::size_t            next      = 0;
+        std::vector<HirNodeId> kids;
+
+        [[nodiscard]] std::size_t childCount() const {
+            return elemCount > 0 ? static_cast<std::size_t>(elemCount)
+                                 : childTypes.size();
+        }
+        [[nodiscard]] TypeId childAt(std::size_t i) const {
+            return elemCount > 0 ? elemType : childTypes[i];
+        }
+    };
+
+    // Returns true and sets `out` when `type`'s zero needs no children; otherwise
+    // returns false with `f` describing what must be built first.
+    [[nodiscard]] bool zeroOfTypeStep(NodeId at, TypeId type,
+                                      HirNodeId& out, ZeroFrame& f) {
         TypeKind const core = type.valid() ? interner.kind(type) : TypeKind::I32;
         // D5.4-FU3 + D5.5-FU3: unified composite arm — Struct, Union
         // and Enum all dispatch here. Per-kind child count: Struct =
@@ -7442,18 +7612,18 @@ struct Lowerer {
         if (core == TypeKind::Struct || core == TypeKind::Union) {
             auto const ops = interner.operands(type);
             if (core == TypeKind::Union && ops.empty()) {
-                return reportedError(at,
+                out = reportedError(at,
                     "synthZero reached a malformed Union type "
                     "(no variants)");
+                return true;
             }
             std::size_t const n =
                 (core == TypeKind::Union) ? std::size_t{1} : ops.size();
-            std::vector<HirNodeId> children;
-            children.reserve(n);
-            for (std::size_t i = 0; i < n; ++i) {
-                children.push_back(synthZeroOrError(at, ops[i]));
-            }
-            return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
+            f.type = type;
+            f.how  = ZeroAssemble::Aggregate;
+            f.childTypes.reserve(n);
+            for (std::size_t i = 0; i < n; ++i) f.childTypes.push_back(ops[i]);
+            return false;
         }
         if (core == TypeKind::Enum) {
             // The enum's underlying is in scalars[0]; the zero literal
@@ -7465,9 +7635,10 @@ struct Lowerer {
             // silent-failure review).
             auto const scals = interner.scalars(type);
             if (scals.empty()) {
-                return reportedError(at,
+                out = reportedError(at,
                     "synthZero reached a malformed Enum type "
                     "(no underlying scalar)");
+                return true;
             }
             TypeKind const underlying = static_cast<TypeKind>(scals[0]);
             HirLiteralValue v;
@@ -7475,7 +7646,8 @@ struct Lowerer {
             if (isFloatCore(underlying))       v.value = 0.0;
             else if (isSignedCore(underlying)) v.value = std::int64_t{0};
             else                               v.value = std::uint64_t{0};
-            return builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
+            out = builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
+            return true;
         }
         // C99 _Complex (D-CSUBSET-COMPLEX): the zero of a complex is `(0, 0)`, and
         // it is minted as `Cast(<element zero> -> Complex)` rather than as a
@@ -7503,21 +7675,24 @@ struct Lowerer {
         if (core == TypeKind::Complex) {
             auto const ops = interner.operands(type);
             if (ops.empty()) {
-                return reportedError(at,
+                out = reportedError(at,
                     "synthZero reached a malformed Complex type "
                     "(no element operand)");
+                return true;
             }
-            TypeId const elem = ops[0];
-            HirNodeId const elemZero = synthZeroOrError(at, elem);
-            return builder.makeCast(elemZero, type, HirFlags::Synthetic);
+            f.type = type;
+            f.how  = ZeroAssemble::ComplexCast;
+            f.childTypes.push_back(ops[0]);
+            return false;
         }
         if (core == TypeKind::Array) {
             auto const ops   = interner.operands(type);
             auto const scals = interner.scalars(type);
             if (ops.empty() || scals.empty()) {
-                return reportedError(at,
+                out = reportedError(at,
                     "synthZero reached a malformed Array type "
                     "(missing element type or length)");
+                return true;
             }
             TypeId const elemT = ops[0];
             auto   const len   = scals[0];
@@ -7544,21 +7719,62 @@ struct Lowerer {
             //     VLA where C23 6.7.10p4 promises zeros — which is why the MIR side
             //     fails loud rather than falling through when it cannot size the
             //     object.
-            std::vector<HirNodeId> children;
-            if (len > 0) {
-                children.reserve(static_cast<std::size_t>(len));
-                for (std::int64_t i = 0; i < len; ++i) {
-                    children.push_back(synthZeroOrError(at, elemT));
-                }
-            }
-            return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
+            f.type      = type;
+            f.how       = ZeroAssemble::Aggregate;
+            f.elemType  = elemT;
+            f.elemCount = len > 0 ? len : 0;
+            return false;
         }
         HirLiteralValue v;
         v.core = core;
         if (isFloatCore(core))       v.value = 0.0;
         else if (isSignedCore(core)) v.value = std::int64_t{0};
         else                         v.value = std::uint64_t{0};
-        return builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
+        out = builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
+        return true;
+    }
+
+    // The driver. Emission order is unchanged from the recursive form — each
+    // child's whole subtree before the next, the parent's node last — so the HIR
+    // arena and the diagnostic stream come out byte-identical.
+    [[nodiscard]] HirNodeId synthZeroOrError(NodeId at, TypeId type) {
+        HirNodeId delivered{};
+        ZeroFrame root;
+        if (zeroOfTypeStep(at, type, delivered, root)) return delivered;
+
+        std::vector<ZeroFrame> stack;
+        stack.push_back(std::move(root));
+        bool pendingDelivery = false;
+
+        while (!stack.empty()) {
+            ZeroFrame& f = stack.back();
+            if (pendingDelivery) {
+                pendingDelivery = false;
+                f.kids.push_back(delivered);
+            }
+            if (f.next >= f.childCount()) {
+                HirNodeId const built =
+                    (f.how == ZeroAssemble::ComplexCast)
+                        ? builder.makeCast(f.kids.empty() ? HirNodeId{} : f.kids[0],
+                                           f.type, HirFlags::Synthetic)
+                        : builder.makeConstructAggregate(f.kids, f.type,
+                                                         HirFlags::Synthetic);
+                stack.pop_back();
+                delivered       = built;
+                pendingDelivery = true;
+                continue;
+            }
+            TypeId const childType = f.childAt(f.next++);
+            HirNodeId    imm{};
+            ZeroFrame    child;
+            if (zeroOfTypeStep(at, childType, imm, child)) {
+                delivered       = imm;
+                pendingDelivery = true;
+                continue;
+            }
+            stack.push_back(std::move(child));
+        }
+        return delivered;
     }
 
     // Peel wrapper-rule layers off `n` UNTIL reaching `braceInitListRule`
@@ -7638,6 +7854,17 @@ struct Lowerer {
         if (isBraceInitList(core)) {
             return lowerBraceInit(core, contextType);
         }
+        return lowerCoercedValueExpr(valueNode, contextType);
+    }
+
+    // The NON-brace arm of `lowerExprOrBraceInit`, factored out so the brace-init
+    // work-stack driver can take it WITHOUT going back through the router — the
+    // router's other arm re-enters `lowerBraceInit`, which is exactly the host
+    // recursion the driver exists to remove. `lowerExpr` is itself an explicit
+    // work stack, so this arm costs O(1) host frames however deep the EXPRESSION
+    // is (feedback-no-input-proportional-recursion).
+    [[nodiscard]] HirNodeId lowerCoercedValueExpr(NodeId valueNode,
+                                                  TypeId contextType) {
         E const ve = lowerExpr(valueNode);
         E const coerced = coerce(ve, contextType);
         return coerced.id;
@@ -7704,17 +7931,69 @@ struct Lowerer {
     // fails loud with its own positioned "did not resolve to a type" message, so
     // the outcome is a refusal rather than a wrong width. Two stamps that AGREE
     // cannot miscompile and are not an error.
+    //
+    // ★★ AN EXPLICIT POST-ORDER STACK, NOT HOST RECURSION
+    // (feedback-no-input-proportional-recursion): its depth follows CST subtree
+    // depth, which is the user's program. It does NOT use the shared
+    // `forEachCstNodeUnder` — that walker is PRE-order and this is a FOLD whose
+    // per-node answer is assembled from its children's, including the
+    // short-circuit on the first DISAGREEING pair. `Frame::found` is the partial
+    // fold; `delivered` carries a completed subtree's answer up to its parent,
+    // exactly as the recursive call's return value did.
     [[nodiscard]] TypeId resolveStampedTypeBelow(NodeId n) const {
-        if (TypeId t = semTypeAt(n); t.valid()) return t;
-        if (tree().kind(n) != NodeKind::Internal) return InvalidType;
-        TypeId found = InvalidType;
-        for (NodeId c : visible(n)) {
-            TypeId const t = resolveStampedTypeBelow(c);
-            if (!t.valid()) continue;
-            if (!found.valid())      found = t;
-            else if (found.v != t.v) return InvalidType;   // ambiguous — refuse
+        // A node whose answer needs no descent: a stamp on the node itself is
+        // authoritative, and a non-Internal node has no children to fold.
+        auto immediate = [&](NodeId node, TypeId& out) -> bool {
+            if (TypeId t = semTypeAt(node); t.valid()) { out = t; return true; }
+            if (tree().kind(node) != NodeKind::Internal) { out = InvalidType; return true; }
+            return false;
+        };
+
+        TypeId delivered = InvalidType;
+        if (immediate(n, delivered)) return delivered;
+
+        struct Frame {
+            std::vector<NodeId> kids;
+            std::size_t         next  = 0;
+            TypeId              found = InvalidType;
+        };
+        std::vector<Frame> stack;
+        stack.push_back(Frame{visible(n), 0, InvalidType});
+        bool pendingDelivery = false;   // `delivered` holds a child's answer
+
+        while (!stack.empty()) {
+            Frame& f = stack.back();
+            if (pendingDelivery) {
+                pendingDelivery = false;
+                if (delivered.valid()) {
+                    if (!f.found.valid()) {
+                        f.found = delivered;
+                    } else if (f.found.v != delivered.v) {
+                        // Ambiguous — refuse, and abandon the remaining children
+                        // exactly as the recursive form's early `return` did.
+                        stack.pop_back();
+                        delivered       = InvalidType;
+                        pendingDelivery = true;
+                        continue;
+                    }
+                }
+            }
+            if (f.next >= f.kids.size()) {
+                delivered = f.found;
+                stack.pop_back();
+                pendingDelivery = true;
+                continue;
+            }
+            NodeId const c = f.kids[f.next++];
+            TypeId       imm = InvalidType;
+            if (immediate(c, imm)) {
+                delivered       = imm;
+                pendingDelivery = true;
+                continue;
+            }
+            stack.push_back(Frame{visible(c), 0, InvalidType});
         }
-        return found;
+        return delivered;
     }
     // VLA C2 (D-CSUBSET-VLA): the SymbolId of a `sizeof <operand>` when the operand is a
     // DIRECT reference to a VLA object (`a`, `(a)`, `((a))`). Mirrors `simpleLvalue`'s
@@ -8548,25 +8827,75 @@ struct Lowerer {
     // Write `val` at the slot reachable from `s` by following the path
     // of nested-slot indices. Out-of-range step → silent no-op (callers
     // bounds-check up front; this guard is defense-in-depth).
+    // A plain loop, not recursion: the depth followed the DESIGNATOR PATH LENGTH,
+    // which is the user's source (feedback-no-input-proportional-recursion).
     void writeInitSlotAt(InitSlot& s,
                          std::span<std::uint32_t const> path,
                          HirNodeId val) {
-        if (path.empty()) { s.nested.clear(); s.value = val; return; }
-        initSlotAsAggregate(s);
-        if (path[0] >= s.nested.size()) return;
-        writeInitSlotAt(s.nested[path[0]], path.subspan(1), val);
+        InitSlot* cur = &s;
+        while (!path.empty()) {
+            initSlotAsAggregate(*cur);
+            if (path[0] >= cur->nested.size()) return;
+            cur  = &cur->nested[path[0]];
+            path = path.subspan(1);
+        }
+        cur->nested.clear();
+        cur->value = val;
     }
     // Flatten a slot to its HIR node: a direct value when set, a
     // recursive `ConstructAggregate` when sub-aggregating, or
     // `synthZeroOrError(at, type)` when empty.
+    //
+    // ★★ AN EXPLICIT POST-ORDER STACK, NOT HOST RECURSION
+    // (feedback-no-input-proportional-recursion): the slot tree's depth is the
+    // BRACE NESTING of the user's initializer. Emission order is unchanged —
+    // children left-to-right, each subtree complete before the next, the parent's
+    // `ConstructAggregate` last — so the HIR arena comes out byte-identical.
     [[nodiscard]] HirNodeId flattenInitSlot(NodeId at, InitSlot const& s) {
-        if (s.value.has_value()) return *s.value;
-        if (s.nested.empty()) return synthZeroOrError(at, s.slotType);
-        std::vector<HirNodeId> kids;
-        kids.reserve(s.nested.size());
-        for (auto const& n : s.nested) kids.push_back(flattenInitSlot(at, n));
-        return builder.makeConstructAggregate(kids, s.slotType,
-                                              HirFlags::Synthetic);
+        // A slot that needs no descent: a written value, or an empty slot that
+        // zero-fills.
+        auto immediate = [&](InitSlot const& x, HirNodeId& out) -> bool {
+            if (x.value.has_value()) { out = *x.value; return true; }
+            if (x.nested.empty()) { out = synthZeroOrError(at, x.slotType); return true; }
+            return false;
+        };
+
+        HirNodeId delivered{};
+        if (immediate(s, delivered)) return delivered;
+
+        struct Frame {
+            InitSlot const*        slot;
+            std::size_t            next = 0;
+            std::vector<HirNodeId> kids;
+        };
+        std::vector<Frame> stack;
+        stack.push_back(Frame{&s, 0, {}});
+        bool pendingDelivery = false;
+
+        while (!stack.empty()) {
+            Frame& f = stack.back();
+            if (pendingDelivery) {
+                pendingDelivery = false;
+                f.kids.push_back(delivered);
+            }
+            if (f.next >= f.slot->nested.size()) {
+                HirNodeId const agg = builder.makeConstructAggregate(
+                    f.kids, f.slot->slotType, HirFlags::Synthetic);
+                stack.pop_back();
+                delivered       = agg;
+                pendingDelivery = true;
+                continue;
+            }
+            InitSlot const& child = f.slot->nested[f.next++];
+            HirNodeId       imm{};
+            if (immediate(child, imm)) {
+                delivered       = imm;
+                pendingDelivery = true;
+                continue;
+            }
+            stack.push_back(Frame{&child, 0, {}});
+        }
+        return delivered;
     }
 
     // D5.4: union brace-init lowering. Unions hold exactly ONE active
@@ -8586,12 +8915,24 @@ struct Lowerer {
     // Result: a 1-child `ConstructAggregate(value, contextType)`.
     // Empty `{}` produces the same shape as `synthZeroOrError(union)`
     // (first-variant zero-fill per C99 §6.7.8p21).
-    [[nodiscard]] HirNodeId lowerUnionBraceInit(NodeId braceInitListNode,
-                                                TypeId contextType) {
+    //
+    // ★★ THIS IS THE NON-RECURSIVE HALF ONLY. Everything here is decided from the
+    // CST and the type — it stops at the ONE value the chosen variant still needs.
+    // `openBraceLevel` folds that value in as a ONE-SLOT level of the brace-init
+    // work stack, so a union nested inside braces costs heap like every other
+    // level instead of keeping a second host-recursion edge alive
+    // (feedback-no-input-proportional-recursion).
+    struct UnionBracePrep {
+        std::optional<HirNodeId> immediate;      // fully answered right here
+        NodeId                   valueExprCst{}; // else: lower this value...
+        TypeId                   variantType{};  // ...against this variant type
+    };
+    [[nodiscard]] UnionBracePrep prepareUnionBraceInit(NodeId braceInitListNode,
+                                                       TypeId contextType) {
         auto const variants = interner.operands(contextType);
         if (variants.empty()) {
-            return reportedError(braceInitListNode,
-                "union brace-init target has no variants");
+            return {.immediate = reportedError(braceInitListNode,
+                "union brace-init target has no variants")};
         }
         // Collect all initElement children up front so we can diagnose
         // multi-element forms before lowering anything.
@@ -8607,7 +8948,7 @@ struct Lowerer {
         if (elements.empty()) {
             // Empty `{}` — default-initialize the first variant per
             // §6.7.8p10 (overlap with synthZeroOrError's union path).
-            return synthZeroOrError(braceInitListNode, contextType);
+            return {.immediate = synthZeroOrError(braceInitListNode, contextType)};
         }
         if (elements.size() > 1) {
             reportedError(braceInitListNode,
@@ -8616,7 +8957,7 @@ struct Lowerer {
             // pipeline downstream sees a typed aggregate without
             // having to discriminate "really succeeded" from
             // "succeeded with diagnostics". res->ok is already false.
-            return synthZeroOrError(braceInitListNode, contextType);
+            return {.immediate = synthZeroOrError(braceInitListNode, contextType)};
         }
         NodeId const elem = elements[0];
 
@@ -8703,31 +9044,24 @@ struct Lowerer {
             // Still emit a structurally-valid (first-variant zero-fill)
             // aggregate so downstream lowering doesn't cascade. res->ok
             // is already false via reportedError.
-            return synthZeroOrError(braceInitListNode, contextType);
+            return {.immediate = synthZeroOrError(braceInitListNode, contextType)};
         }
         if (!valueExprCst.valid()) {
             // `union U u = { };` — already handled at the empty-list
             // check above; reaching here implies a malformed initElement.
             reportedError(elem, "union init element has no value expression");
-            return synthZeroOrError(braceInitListNode, contextType);
+            return {.immediate = synthZeroOrError(braceInitListNode, contextType)};
         }
         std::uint32_t const variant = targetVariant.value_or(0);
-        TypeId const variantType = variants[variant];
-        HirNodeId const valueNode =
-            lowerExprOrBraceInit(valueExprCst, variantType);
-
-        // Union HIR shape: a 1-child ConstructAggregate whose single
-        // child is the chosen variant's value. The variant index is
-        // implicit-by-type (the value's HIR type identifies WHICH
-        // variant); a future explicit-tag substrate can layer an
-        // index attribute when codegen needs it.
-        // D-DIAG-BRACE-INIT-AGGREGATE-SOURCE-SPAN: same span attachment as the
-        // struct/array arm — the union's top-level aggregate is what later tiers
-        // report against, so it must be locatable in the source.
-        std::vector<HirNodeId> children{ valueNode };
-        return track(builder.makeConstructAggregate(children, contextType,
-                                                    HirFlags::Synthetic),
-                     braceInitListNode);
+        // Union HIR shape: a 1-child ConstructAggregate whose single child is the
+        // chosen variant's value. The variant index is implicit-by-type (the
+        // value's HIR type identifies WHICH variant); a future explicit-tag
+        // substrate can layer an index attribute when codegen needs it. The
+        // aggregate itself is minted by `finishBraceLevel`, which `track`s it at
+        // the brace-init list's span for the same reason the struct/array arm does
+        // (D-DIAG-BRACE-INIT-AGGREGATE-SOURCE-SPAN) — the union's top-level
+        // aggregate is what later tiers report against.
+        return {.valueExprCst = valueExprCst, .variantType = variants[variant]};
     }
 
     // FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): the CLOSED allowlist
@@ -8872,7 +9206,8 @@ struct Lowerer {
     //   • index designator `{[2] = a}` with integer-literal indices
     //   • mixed positional / designator with cursor restart at the
     //     designated position (§6.7.8p17)
-    //   • chained-brace nesting `{.outer = {.inner = a}}` via recursion
+    //   • chained-brace nesting `{.outer = {.inner = a}}` — ONE HEAP FRAME PER
+    //     BRACE LEVEL, driven by `lowerBraceInit` below; see `BraceLevel`
     //   • zero-fill omitted slots (§6.7.8p21)
     //
     // One real-blocker substrate item remaining:
@@ -8881,10 +9216,175 @@ struct Lowerer {
     //     `const_eval` consumes HIR). Anchored at plan 12.5 §0.2 D6.
     //     Locked-in by `D5_3_NonLiteralIndexDesignatorEmitsDiag`.
     //
-    // Union brace-init is routed to `lowerUnionBraceInit` above
-    // (separate semantics — one active variant). D5.4 ✅.
+    // Union brace-init is folded in as a ONE-SLOT level via
+    // `prepareUnionBraceInit` above (separate semantics — one active
+    // variant). D5.4 ✅.
+
+    // ── THE BRACE-INIT LEVEL FRAME ──────────────────────────────────────────
+    //
+    // ★★ ONE HEAP FRAME PER BRACE LEVEL, ZERO HOST FRAMES — the row is
+    // [[D-HIR-BRACE-INIT-LOWERING-RECURSES-PER-BRACE-LEVEL-AND-A-CAP-IS-UNAVAILABLE]]
+    // and the standing ruling is feedback-no-input-proportional-recursion.
+    // `lowerBraceInit` and `lowerExprOrBraceInit` used to call each other once per
+    // `{`, two host frames per level.
+    // ✔MEASURED on the ORDINARY ~1 MiB thread through `ctest`, MinGW
+    // gcc 13.2 Debug, `struct S0 g = {{{…3…}}}`: 1055 lowered rc 0, 1085
+    // SEGFAULTed. The instrument is `tests/hir/test_frontend_deep_nesting_probe.cpp`
+    // (`DSS_HS_PROBE_KIND=initnest`); the pin is in
+    // `tests/hir/test_frontend_deep_nesting_costs_heap.cpp`.
+    //
+    // ⚠⚠ A FAIL-LOUD CAP WAS NOT AN AVAILABLE EXIT, AND THAT IS THE WHOLE REASON
+    // THIS IS A CONVERSION RATHER THAN A COUNTER. Under
+    // `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` the union is over what WORKS, so any
+    // cap must sit ABOVE what a working reference compiles. ✔MEASURED separately
+    // per reference (WSL, `-std=c2x -O0`, `struct SD g = {{{…3…}}}` over a D-deep
+    // nest of one-member structs, D ∈ {64,128,256,257,512,1024,2048,4096,8192}):
+    //   • gcc 13.3.0 — compiles EVERY depth rc 0, and the 8192 binary RUNS rc 0;
+    //   • clang 18.1.3 — rc 0 through 256, then a loud positioned
+    //     `fatal error: bracket nesting level exceeded maximum of 256` at 257+.
+    // One WORKING reference at 8192 makes 8192 REQUIRED, so a cap below it refuses
+    // a program gcc compiles (a conformance defect) and a cap above it never
+    // fires. No cap is reintroduced here — same conclusion, and same argument, as
+    // the deleted `guard < 8192` in `subtreeHasDeferred`.
+    //
+    // ★★ WHY NO VISITED SET, AND IT IS CHECKED RATHER THAN ASSUMED. A work stack
+    // without one turns a stack overflow into an INFINITE LOOP if any edge can
+    // revisit a node, which is worse. Two independent reasons it cannot here:
+    //   (1) STRUCTURAL — every descent is `peelToBraceInitOrCore` (a
+    //       `soleMeaningfulChild` walk, strictly DOWNWARD) applied to a
+    //       `visible()` child of the current brace node, so a pushed level is
+    //       always a strict CST DESCENDANT of its parent. A CST is finite and
+    //       acyclic, so the reachable subtree strictly shrinks and the loop
+    //       terminates on its own.
+    //   (2) EMPIRICAL — the pre-conversion ceiling was LINEAR in the source's
+    //       brace nesting (fine at 100, dead at ~1060). A cycle on this path
+    //       would have overflowed the host stack at EVERY depth.
+    //
+    // ★★ IT IS AN OUTPUT-IDENTITY TRANSFORM, NOT A REWRITE. Element k's entire
+    // subtree is still built before element k+1 is even resolved, each level still
+    // flattens its own slots only once its element list is exhausted, and the
+    // level's own `ConstructAggregate` is still minted last — so HIR node ids and
+    // DIAGNOSTIC ORDER come out unchanged (`reportedError` mints an Error node, so
+    // the two orders are the same order).
+    // ⚠ DO NOT "simplify" this by deferring every nested level to the flatten
+    // pass. That is much smaller surgery and it REORDERS both: recursion builds
+    // element k's whole subtree before element k+1's, and slot order is not
+    // element order once designators reorder.
+    struct BraceLevel {
+        enum class Kind : std::uint8_t { StructOrArray, Union };
+        Kind          kind      = Kind::StructOrArray;
+        NodeId        braceCst{};
+        TypeId        contextType{};
+        bool          isStruct  = false;
+        std::uint32_t slotCount = 0;
+        std::vector<bool>     positionallySkippable;
+        std::vector<InitSlot> rootSlots;
+        // A SNAPSHOT, taken once when the level opens: `visible()` rebuilds its
+        // vector per call, and this loop is SUSPENDED across every nested level.
+        // StructOrArray → the `initElement` nodes. Union → the ONE already-
+        // resolved value expression (its variant was chosen in `openBraceLevel`).
+        std::vector<NodeId> elements;
+        std::size_t         elemIdx = 0;
+        std::uint32_t       cursor  = 0;
+        // The SUSPENDED element, live only while a child level is running.
+        // ⚠ The residual is OWNED. The recursive form held a `std::span` into
+        // `designatorPath`, a per-iteration local — that span cannot survive a
+        // suspension, and copying it is the one substantive difference between
+        // this frame and the stack frame it replaces.
+        std::uint32_t              pendingTarget = 0;
+        std::vector<std::uint32_t> pendingResidual;
+    };
+
+    // What ONE element of a level still needs before its slot can be written: the
+    // slot to write, the residual designator path within it, and the value to
+    // lower against a target type. Resolving this needs NOTHING previously
+    // LOWERED — only `cursor` and the designator walk — which is what makes the
+    // element loop safely suspendable at its single descent point.
+    struct BraceDescent {
+        std::uint32_t              target = 0;
+        std::vector<std::uint32_t> residual;
+        NodeId                     valueExprCst{};
+        TypeId                     valueTargetType{};
+    };
+
+    // Advance `slot` past any positionally-skippable (anon bit-field) field.
+    // FC8 D-CSUBSET-BITFIELD-INIT — see `openBraceLevel` for how the mask is built.
+    [[nodiscard]] static std::uint32_t skipAnonIn(BraceLevel const& f,
+                                                  std::uint32_t slot) {
+        while (slot < f.slotCount && f.positionallySkippable[slot]) ++slot;
+        return slot;
+    }
+
+    // ── THE DRIVER ──────────────────────────────────────────────────────────
+    // The public entry every brace-init route funnels through (decl init /
+    // return / assign-RHS / call-arg / compound literal / nested designated
+    // slot). It owns the level stack; `openBraceLevel` decides whether a given
+    // brace list even NEEDS one.
     [[nodiscard]] HirNodeId lowerBraceInit(NodeId braceInitListNode,
                                            TypeId contextType) {
+        std::vector<BraceLevel> stack;
+        if (auto imm = openBraceLevel(braceInitListNode, contextType, stack);
+            imm.has_value()) {
+            return *imm;
+        }
+
+        HirNodeId delivered{};
+        bool      pendingDelivery = false;
+        while (!stack.empty()) {
+            BraceLevel& f = stack.back();
+            if (pendingDelivery) {
+                // A child level just finished: land it in the slot this level
+                // suspended on, then resume the element loop where it stopped.
+                pendingDelivery = false;
+                writeInitSlotAt(f.rootSlots[f.pendingTarget], f.pendingResidual,
+                                delivered);
+                f.cursor = f.pendingTarget + 1;
+                f.pendingResidual.clear();
+            }
+            std::optional<BraceDescent> d = nextBraceDescent(f);
+            if (!d.has_value()) {
+                HirNodeId const agg = finishBraceLevel(f);
+                stack.pop_back();
+                delivered       = agg;
+                pendingDelivery = true;
+                continue;
+            }
+            NodeId const core = peelToBraceInitOrCore(d->valueExprCst);
+            if (!isBraceInitList(core)) {
+                // The scalar arm of `lowerExprOrBraceInit`, taken directly:
+                // `lowerExpr` is its own work stack, so this costs O(1) host
+                // frames however deep the expression is.
+                HirNodeId const v =
+                    lowerCoercedValueExpr(d->valueExprCst, d->valueTargetType);
+                writeInitSlotAt(f.rootSlots[d->target], d->residual, v);
+                f.cursor = d->target + 1;
+                continue;
+            }
+            // A NESTED brace level. Everything the resume needs is stored on the
+            // frame BEFORE the push, because a push can REALLOCATE `stack` and
+            // leave `f` dangling — nothing may touch `f` after this point.
+            f.pendingTarget   = d->target;
+            f.pendingResidual = std::move(d->residual);
+            if (auto imm = openBraceLevel(core, d->valueTargetType, stack);
+                imm.has_value()) {
+                // The child answered without needing a level of its own (an
+                // empty union, a scalar target, a diagnostic): nothing was
+                // pushed, so the next iteration lands the value on this level.
+                delivered       = *imm;
+                pendingDelivery = true;
+            }
+        }
+        return delivered;
+    }
+
+    // Open a level for `braceInitListNode` against `contextType`, or answer the
+    // whole brace list outright. Everything here is decided from the CST and the
+    // type — no value is lowered — which is what lets the driver treat a level as
+    // a suspendable loop. Returns a node when the list needs no level (and pushes
+    // nothing); returns nullopt having pushed exactly one level otherwise.
+    [[nodiscard]] std::optional<HirNodeId> openBraceLevel(
+            NodeId braceInitListNode, TypeId contextType,
+            std::vector<BraceLevel>& stack) {
         if (!contextType.valid()) {
             return reportedError(braceInitListNode,
                 "brace-init requires a known context type");
@@ -8913,10 +9413,31 @@ struct Lowerer {
         // D5.4: union brace-init has distinct semantics from struct —
         // at most ONE element, initializing exactly one variant.
         // Positional → first variant; designator → that variant. No
-        // zero-fill across overlapping variants. Route to a dedicated
+        // zero-fill across overlapping variants. Its resolution is a dedicated
         // path; the rest of this function handles struct + array.
+        //
+        // A union is a ONE-SLOT LEVEL: `prepareUnionBraceInit` answers outright
+        // for every shape that has no value to lower, and otherwise hands back
+        // the single value expression + the chosen variant's type. The lone slot
+        // then flows through the SAME suspend/resume/flatten machinery as a
+        // struct field, so a union nested inside braces costs heap like anything
+        // else. `flattenInitSlot` on a slot whose `value` is set returns that
+        // value untouched, so the emitted shape is still the 1-child
+        // `ConstructAggregate` the recursive form built.
         if (isUnion) {
-            return lowerUnionBraceInit(braceInitListNode, contextType);
+            UnionBracePrep prep =
+                prepareUnionBraceInit(braceInitListNode, contextType);
+            if (prep.immediate.has_value()) return *prep.immediate;
+            BraceLevel uf;
+            uf.kind        = BraceLevel::Kind::Union;
+            uf.braceCst    = braceInitListNode;
+            uf.contextType = contextType;
+            uf.slotCount   = 1;
+            uf.rootSlots.resize(1);
+            uf.rootSlots[0].slotType = prep.variantType;
+            uf.elements.push_back(prep.valueExprCst);
+            stack.push_back(std::move(uf));
+            return std::nullopt;
         }
         // ★★ D-HIR-SENTINEL-ARRAY-LENGTH-EXPANDED-AS-A-COUNT — the THIRD site of
         // the same class (`initSlotAsAggregate` and `synthZeroOrError` carry the
@@ -9027,32 +9548,58 @@ struct Lowerer {
                 }
             }
         }
-        // Advance `slot` past any positionally-skippable (anon bit-field) field.
-        auto skipAnon = [&](std::uint32_t slot) -> std::uint32_t {
-            while (slot < slotCount && positionallySkippable[slot]) ++slot;
-            return slot;
-        };
+        // The level is now fully determined by the CST and the type, so build it
+        // and let the driver run its element loop. `skipAnon` became
+        // `skipAnonIn(frame, slot)` — the mask lives on the frame, and a lambda
+        // capturing a local by reference cannot survive the suspension.
+        BraceLevel f;
+        f.braceCst              = braceInitListNode;
+        f.contextType           = contextType;
+        f.isStruct              = isStruct;
+        f.slotCount             = slotCount;
+        f.positionallySkippable = std::move(positionallySkippable);
 
         // Root level of the InitSlot tree — one slot per top-level
         // field/element. Single-designator writes have empty residual
         // path (store directly at the slot); dot-chained writes have
         // a non-empty residual that descends into the slot's `nested`
         // sub-aggregate via `writeInitSlotAt`.
-        std::vector<InitSlot> rootSlots(slotCount);
+        f.rootSlots.resize(slotCount);
         for (std::uint32_t i = 0; i < slotCount; ++i)
-            rootSlots[i].slotType = slotType(i);
+            f.rootSlots[i].slotType = slotType(i);
 
-        // SP3.c: type-aware field-designator resolution is now inlined
-        // into the initElement-walk loop below — the resolver threads a
-        // `designatorCurrentType` cursor through each chained step so
-        // `.a.b = 1` resolves `.b` in field `.a`'s type's scope.
-
-        std::uint32_t cursor = 0;
         for (NodeId elem : visible(braceInitListNode)) {
             if (isToken(elem)) continue;
             if (tree().kind(elem) != NodeKind::Internal) continue;
             if (!cfg.initElementRule.valid()
              || tree().rule(elem).v != cfg.initElementRule.v) continue;
+            f.elements.push_back(elem);
+        }
+        stack.push_back(std::move(f));
+        return std::nullopt;
+    }
+
+    // Advance `f`'s element loop to the next element that needs a VALUE lowered,
+    // resolving its designator chain on the way. Returns nullopt once the level's
+    // elements are exhausted.
+    //
+    // ⚠ ELEMENTS THAT FAIL RESOLUTION ARE DIAGNOSED AND SKIPPED **HERE**, exactly
+    // where the recursive form skipped them, so each such diagnostic keeps its
+    // original position in the stream relative to the values lowered around it.
+    // Nothing in this resolution reads a previously LOWERED value; it reads only
+    // `f.cursor` and the designator walk.
+    [[nodiscard]] std::optional<BraceDescent> nextBraceDescent(BraceLevel& f) {
+        while (f.elemIdx < f.elements.size()) {
+            NodeId const elem = f.elements[f.elemIdx++];
+            if (f.kind == BraceLevel::Kind::Union) {
+                // `prepareUnionBraceInit` already picked the variant and the
+                // value; `elem` IS that value expression, and it lands in the
+                // level's single slot with no residual.
+                return BraceDescent{.target          = 0,
+                                    .residual        = {},
+                                    .valueExprCst    = elem,
+                                    .valueTargetType = f.rootSlots[0].slotType};
+            }
 
             // SP3.c: walk the initElement's children collecting a FULL
             // designator path (single OR dot-chained). At each step we
@@ -9061,7 +9608,7 @@ struct Lowerer {
             // struct scope (the InitSlot tree's `nested` substrate is
             // what makes the multi-step write semantically right).
             std::vector<std::uint32_t> designatorPath;
-            TypeId designatorCurrentType = contextType;
+            TypeId designatorCurrentType = f.contextType;
             bool designatorFailed = false;
             NodeId valueExprCst{};
             for (NodeId c : visible(elem)) {
@@ -9177,41 +9724,46 @@ struct Lowerer {
             // element skips any anonymous bit-field at the cursor (C 6.7.9);
             // a DESIGNATED element targets its named field directly (anon
             // fields are unnameable), so the skip applies only to positional.
-            std::uint32_t target = skipAnon(cursor);
-            std::span<std::uint32_t const> residualPath;
+            std::uint32_t target = skipAnonIn(f, f.cursor);
+            std::vector<std::uint32_t> residualPath;
             if (!designatorPath.empty()) {
                 target = designatorPath[0];
-                cursor = target;
-                residualPath = std::span<std::uint32_t const>{
-                    designatorPath}.subspan(1);
+                f.cursor = target;
+                residualPath.assign(designatorPath.begin() + 1,
+                                    designatorPath.end());
             }
-            if (target >= slotCount) {
+            if (target >= f.slotCount) {
                 reportedError(elem,
                     "init element targets position out of aggregate range");
                 continue;
             }
             // The value's target type is the slot's type AFTER following
-            // the designator path. When no path, slotType(target).
+            // the designator path. When no path, the root slot's own type.
             TypeId const valueTargetType =
-                designatorPath.empty() ? rootSlots[target].slotType
+                designatorPath.empty() ? f.rootSlots[target].slotType
                                        : designatorCurrentType;
 
-            HirNodeId const valueNode =
-                lowerExprOrBraceInit(valueExprCst, valueTargetType);
-
-            // `writeInitSlotAt(slot, residualPath, value)` writes value
-            // at the slot reachable from `slot` by the residual path;
-            // single-level designators have an empty residual, while
-            // dot-chained designators have a non-empty residual that
-            // descends into nested sub-aggregates.
-            writeInitSlotAt(rootSlots[target], residualPath, valueNode);
-            cursor = target + 1;
+            // The driver lowers the value and then performs
+            // `writeInitSlotAt(slot, residual, value)`, which writes at the slot
+            // reachable from the root slot by the residual path: single-level
+            // designators have an empty residual, while dot-chained designators
+            // have a non-empty one that descends into nested sub-aggregates.
+            return BraceDescent{.target          = target,
+                                .residual        = std::move(residualPath),
+                                .valueExprCst    = valueExprCst,
+                                .valueTargetType = valueTargetType};
         }
+        return std::nullopt;
+    }
 
+    // Every element of `f` has been resolved and written: assemble the level's
+    // own aggregate. `flattenInitSlot` is itself an explicit post-order heap
+    // stack, so this costs no host frames either.
+    [[nodiscard]] HirNodeId finishBraceLevel(BraceLevel const& f) {
         std::vector<HirNodeId> children;
-        children.reserve(slotCount);
-        for (auto const& s : rootSlots)
-            children.push_back(flattenInitSlot(braceInitListNode, s));
+        children.reserve(f.rootSlots.size());
+        for (auto const& s : f.rootSlots)
+            children.push_back(flattenInitSlot(f.braceCst, s));
         // D-DIAG-BRACE-INIT-AGGREGATE-SOURCE-SPAN: `track` the TOP-LEVEL aggregate at
         // the brace-init list's CST span. The node is `Synthetic` (it has no 1:1
         // source token of its own), but it IS the node every later tier reports
@@ -9219,9 +9771,9 @@ struct Lowerer {
         // those diagnostics print with no `--> file:line`, leaving the user to grep for
         // the construct by hand. The nested zero-fill children stay span-less: they are
         // C's implicit defaults, not text the user wrote.
-        return track(builder.makeConstructAggregate(children, contextType,
+        return track(builder.makeConstructAggregate(children, f.contextType,
                                                     HirFlags::Synthetic),
-                     braceInitListNode);
+                     f.braceCst);
     }
 
     // A fresh SymbolId for a lowering-synthesized temporary, minted above the
@@ -10002,35 +10554,53 @@ struct Lowerer {
     // Conservatism is one-directional: if in doubt we report a break exists
     // (loop NOT infinite), never the reverse — a breakable loop is never wrongly
     // wrapped.
+    //
+    // ★★ THE SCAN COSTS HEAP, NOT HOST CALL FRAMES
+    // (feedback-no-input-proportional-recursion): its depth follows the HIR
+    // nesting inside a loop body, which is the user's program, so a host frame per
+    // level is the shape the standing ruling forbids. `pending` is that stack;
+    // children are pushed in REVERSE so they pop in document order, which the
+    // former recursion visited them in. The nested loop/switch arm spells as
+    // "do not descend" what the recursive form spelled as `return false` for that
+    // subtree — the parent loop then moved to the next sibling either way, so the
+    // verdict is unchanged.
     [[nodiscard]] bool bodyHasReachableBreak(HirNodeId body) const {
-        switch (builder.kind(body)) {
-            case HirKind::BreakStmt:
-                return true;                              // targets this loop's frame
-            // A nested loop / switch captures any `break` inside it — do not
-            // descend; a break there does not exit THIS loop.
-            case HirKind::WhileStmt:
-            case HirKind::DoWhileStmt:
-            case HirKind::ForStmt:
-            case HirKind::SwitchStmt:
-                return false;
-            // FC5 — a `goto` inside a provably-infinite loop is NOT counted here
-            // (it falls to `default`; a GotoStmt is a leaf, so it returns false).
-            // This is deliberate and HARMLESS in both directions: an INTERNAL goto
-            // (target inside the loop) keeps the loop genuinely infinite, so the
-            // Block{loop,Unreachable} wrap is correct; a FRAME-ESCAPING goto
-            // (`while(1){ if(c) goto out; } out: …`) still gets the wrap, but the
-            // wrap's synthetic Unreachable lands on a no-predecessor block that the
-            // mandatory MIR unreachable-prune drops, while the goto's own Br keeps
-            // the target label live — runtime-correct (witnessed by the
-            // goto_infinite_escape corpus). Counting gotos as breaks here would be
-            // BOTH unsound (a goto has no frame, so the break's frame-respecting
-            // non-descent rule doesn't apply) and would FALSE-REJECT a valid
-            // infinite loop whose goto stays internal — so we intentionally do not.
-            default:
-                for (HirNodeId c : builder.children(body))
-                    if (bodyHasReachableBreak(c)) return true;
-                return false;
+        std::vector<HirNodeId> pending{body};
+        while (!pending.empty()) {
+            HirNodeId const here = pending.back();
+            pending.pop_back();
+            switch (builder.kind(here)) {
+                case HirKind::BreakStmt:
+                    return true;                              // targets this loop's frame
+                // A nested loop / switch captures any `break` inside it — do not
+                // descend; a break there does not exit THIS loop.
+                case HirKind::WhileStmt:
+                case HirKind::DoWhileStmt:
+                case HirKind::ForStmt:
+                case HirKind::SwitchStmt:
+                    continue;
+                // FC5 — a `goto` inside a provably-infinite loop is NOT counted
+                // here (it falls to `default`; a GotoStmt is a leaf, so it
+                // contributes nothing).
+                // This is deliberate and HARMLESS in both directions: an INTERNAL goto
+                // (target inside the loop) keeps the loop genuinely infinite, so the
+                // Block{loop,Unreachable} wrap is correct; a FRAME-ESCAPING goto
+                // (`while(1){ if(c) goto out; } out: …`) still gets the wrap, but the
+                // wrap's synthetic Unreachable lands on a no-predecessor block that the
+                // mandatory MIR unreachable-prune drops, while the goto's own Br keeps
+                // the target label live — runtime-correct (witnessed by the
+                // goto_infinite_escape corpus). Counting gotos as breaks here would be
+                // BOTH unsound (a goto has no frame, so the break's frame-respecting
+                // non-descent rule doesn't apply) and would FALSE-REJECT a valid
+                // infinite loop whose goto stays internal — so we intentionally do not.
+                default: {
+                    auto const kids = builder.children(here);
+                    for (std::size_t i = kids.size(); i-- > 0;) pending.push_back(kids[i]);
+                    continue;
+                }
+            }
         }
+        return false;
     }
 
     // A loop is PROVABLY-INFINITE iff control can never fall through past it:
@@ -11088,25 +11658,26 @@ struct Lowerer {
     }
 
     NodeId findCompositeSpecifierIn(NodeId n) {
-        // `visible()` yields TOKEN children too, and `tree().rule()` is valid
-        // only on Internal nodes. A token is never a composite body and has no
-        // children to recurse into, so stop here. (Without this guard a head
-        // that introduces NO composite — `int ;`, now grammar-parseable since
-        // the init-declarator-list became optional — drives the DFS into a
-        // leaf token and `rule()` asserts: a crash, not the fail-loud the
-        // semantic tier owns. D-CSUBSET-STRUCT-BODY-VARDECL-POSITION.)
-        if (!n.valid() || tree().kind(n) != NodeKind::Internal) return NodeId{};
-        auto it = declMap_.find(tree().rule(n).v);
-        if (it != declMap_.end()
-            && sem.declarations[it->second].fieldChildren.has_value()
-            && compositeSpecifierIsDefinition(sem.declarations[it->second], n)) {
-            return n;
-        }
-        for (NodeId c : visible(n)) {
-            NodeId const hit = findCompositeSpecifierIn(c);
-            if (hit.valid()) return hit;
-        }
-        return NodeId{};
+        NodeId hit{};
+        forEachCstNodeUnder(n, [&](NodeId c) {
+            // `visible()` yields TOKEN children too, and `tree().rule()` is valid
+            // only on Internal nodes. A token is never a composite body and has no
+            // children to descend into, so stop here. (Without this guard a head
+            // that introduces NO composite — `int ;`, now grammar-parseable since
+            // the init-declarator-list became optional — drives the DFS into a
+            // leaf token and `rule()` asserts: a crash, not the fail-loud the
+            // semantic tier owns. D-CSUBSET-STRUCT-BODY-VARDECL-POSITION.)
+            if (tree().kind(c) != NodeKind::Internal) return Walk::Skip;
+            auto it = declMap_.find(tree().rule(c).v);
+            if (it != declMap_.end()
+                && sem.declarations[it->second].fieldChildren.has_value()
+                && compositeSpecifierIsDefinition(sem.declarations[it->second], c)) {
+                hit = c;
+                return Walk::Stop;
+            }
+            return Walk::Descend;
+        });
+        return hit;
     }
 
     // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: the sibling of
@@ -11123,21 +11694,22 @@ struct Lowerer {
     // config + the declaration row's `name` child resolving to a real identifier
     // leaf, never a rule-name or keyword.
     NodeId findForwardCompositeSpecifierIn(NodeId n) {
-        if (!n.valid() || tree().kind(n) != NodeKind::Internal) return NodeId{};
-        auto it = declMap_.find(tree().rule(n).v);
-        if (it != declMap_.end()) {
-            DeclarationRule const& d = sem.declarations[it->second];
-            if (d.fieldChildren.has_value()
-                && !compositeSpecifierIsDefinition(d, n)
-                && compositeSpecifierHasTagName(d, n)) {
-                return n;
+        NodeId hit{};
+        forEachCstNodeUnder(n, [&](NodeId c) {
+            if (tree().kind(c) != NodeKind::Internal) return Walk::Skip;
+            auto it = declMap_.find(tree().rule(c).v);
+            if (it != declMap_.end()) {
+                DeclarationRule const& d = sem.declarations[it->second];
+                if (d.fieldChildren.has_value()
+                    && !compositeSpecifierIsDefinition(d, c)
+                    && compositeSpecifierHasTagName(d, c)) {
+                    hit = c;
+                    return Walk::Stop;
+                }
             }
-        }
-        for (NodeId c : visible(n)) {
-            NodeId const hit = findForwardCompositeSpecifierIn(c);
-            if (hit.valid()) return hit;
-        }
-        return NodeId{};
+            return Walk::Descend;
+        });
+        return hit;
     }
 
     // c35: does composite specifier `n` carry a tag NAME — i.e. is its `name`
@@ -12202,12 +12774,15 @@ struct Lowerer {
     // wrapper would wrap a zero-slot param in an empty Block, which the
     // HIR verifier rightly rejects in parameter position.
     void collectParams(NodeId n, std::vector<HirNodeId>& out) {
-        HirRuleMapping const* m = mappingFor(n);
-        if (m != nullptr && m->hirKind == "VarDecl") {
-            lowerVarLikeInto(n, /*asGlobal=*/false, out);
-            return;
-        }
-        for (NodeId c : visible(n)) if (!isToken(c)) collectParams(c, out);
+        forEachCstNodeUnder(n, [&](NodeId c) {
+            if (isToken(c)) return Walk::Skip;
+            HirRuleMapping const* m = mappingFor(c);
+            if (m != nullptr && m->hirKind == "VarDecl") {
+                lowerVarLikeInto(c, /*asGlobal=*/false, out);
+                return Walk::Skip;     // the param is lowered whole — do not re-enter it
+            }
+            return Walk::Descend;
+        });
     }
 
     // Direct children to scan for a global's initializer expression. A subtree

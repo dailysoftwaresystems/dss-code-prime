@@ -291,12 +291,91 @@ struct Parser::Impl {
 
     // Speculation-nesting counter. Incremented on entry to
     // `trySpeculativeBranch`, decremented on every exit path. Bound
-    // by `config.maxSpeculationDepth`; over-cap entry emits
-    // `P_MaxSpeculationDepth` and refuses the probe (caller then
-    // emits `P_BacktrackFailed` + consumes peek for forward
-    // progress). Adversarial input that nests speculative alts
-    // indefinitely would otherwise stack-loop the call stack.
+    // by `config.maxSpeculationDepth`; over-cap entry LATCHES
+    // `speculationCapHit_` and refuses the probe. Adversarial input
+    // that nests speculative alts indefinitely would otherwise
+    // stack-loop the call stack — every probe level costs one
+    // `trySpeculativeBranch` + `stepOnce` host frame, so this counter
+    // is the fail-loud stand-in for the explicit work-stack the
+    // speculation machinery does not (yet) have.
     std::size_t speculationDepth = 0;
+
+    // ── the speculation-ceiling LATCH ────────────────────────────────
+    //
+    // Set when `trySpeculativeBranch` abandons a probe because one of the
+    // speculation ceilings was reached — either the DEPTH cap
+    // (`config.maxSpeculationDepth`) or the per-probe TOKEN budget
+    // (`config.speculationBudgetFactor` × the alt's declared lookahead).
+    // Carries which ceiling, and the token the parser was looking at
+    // (span + already-rendered lexeme) so the refusal can be POSITIONED
+    // where the parse actually ran out of resource.
+    //
+    // ★ DELIBERATELY NOT CAPTURED/RESTORED BY `SpeculationProbe`, unlike
+    // every other piece of parser state. A ceiling the parse actually
+    // reached is a fact about the PARSE, not a property of the branch
+    // that discovered it — and rolling it back with the branch is
+    // exactly what used to make it invisible: the over-cap
+    // `P_MaxSpeculationDepth` was emitted INSIDE a probe, so the
+    // enclosing probe both (a) erased it on rollback and (b) read the
+    // emission as "this branch failed", cascading into a
+    // `P_NoAlternativeMatched` positioned on the user's own — correct —
+    // token. Nine nested `(int)` casts were refused with a fabricated
+    // syntax error blaming the `int`
+    // (D-PARSE-NINE-NESTED-CASTS-ARE-REFUSED-BY-THE-SPECULATION-CAP-WITH-A-FABRICATED-SYNTAX-ERROR).
+    //
+    // Lifetime: RESET at every depth-0 entry to the speculative-alt
+    // candidate loop and CONSUMED by `recoverSpeculationTooDeep_` at
+    // depth 0. So a ceiling hit under an alt that then resolved through
+    // another candidate cannot be blamed on a later, unrelated alt —
+    // the misattribution this whole mechanism exists to delete.
+    enum class SpeculationCeiling : std::uint8_t {
+        Depth,            // config.maxSpeculationDepth
+        TokenBudget,      // config.speculationBudgetFactor x alt lookahead
+        ExpressionDepth,  // config.maxExpressionDepth, hit INSIDE a probe
+    };
+    struct SpeculationCapHit {
+        SourceSpan         span;
+        std::string        actual;   // pre-rendered, quoted (renderActual)
+        std::size_t        limit;    // the ceiling's value, as configured
+        SpeculationCeiling which;
+    };
+    std::optional<SpeculationCapHit> speculationCapHit_;
+
+    // ── the cascade shield ───────────────────────────────────────────
+    //
+    // Set when a speculation ceiling has been reported and the construct
+    // it fired inside was ABANDONED. Everything still ahead of the parser
+    // in that construct is unparseable BY OUR OWN DECISION, not by the
+    // author's: each remaining alternative re-reaches the same ceiling and
+    // each failure lands on a token the author wrote correctly. ✔MEASURED
+    // on `(int)` x321 at cap 320: one honest `P_MaxSpeculationDepth`
+    // followed by ~320 `P_BacktrackFailed`, one per cast, every one of
+    // them pointing at a valid `(`.
+    //
+    // While set, a recovery site at depth 0 still RECOVERS (Error leaf +
+    // panic scan + forward progress — the tree and the exit code are
+    // unchanged) but does not SPEAK, until the parser reaches a
+    // schema-declared sync token and the region is genuinely over. That is
+    // this file's own bar — one structural error yields one diagnostic —
+    // applied to the one recovery that was exempt from it.
+    //
+    // ⚠ DEPTH 0 ONLY. A suppressed emission inside a probe would also
+    // suppress the `emittedDiag()` DELTA the probe reads as "this branch
+    // failed", and the probe would COMMIT a half-built branch. Inside a
+    // probe the diagnostics are rolled back anyway, so there is nothing to
+    // shield there.
+    bool suppressCascadeUntilSync_ = false;
+
+    // Latch one ceiling hit at `peek`. FIRST hit wins: the deepest /
+    // earliest refusal is the one that describes where the parse actually
+    // ran out, and a later outer refusal is its consequence.
+    void latchSpeculationCeiling_(SpeculationCeiling which,
+                                  std::size_t        limit) {
+        if (speculationCapHit_) return;
+        Token const& peek  = tokens.peek();
+        speculationCapHit_ = SpeculationCapHit{peek.span, renderActual(peek),
+                                               limit, which};
+    }
 
     // Pratt-walker expression-nesting depth. Incremented on every PUSH
     // onto `exprWorkStack` (each push = one logical level the recursive
@@ -354,13 +433,21 @@ struct Parser::Impl {
         , schema(std::move(sc))
         , tokens(std::move(ts))
         , budget(bdg)
+        // Designated initializers, not positional: this copies EVERY
+        // `ParserConfig` field except the walker (moved out separately
+        // below), so a field added to the struct and forgotten here would
+        // silently parse at the C++ fallback instead of the language's
+        // configured value — the exact failure shape that let the two
+        // speculation caps stay hardcoded. Naming each field makes the
+        // omission visible at the edit site.
         , config{
-            cfg.maxSpeculationDepth,
-            cfg.maxExpressionDepth,
-            cfg.recoveryStrategy,
-            cfg.maxSyncScanTokens,
-            nullptr,
-            std::move(cfg.seedGlobalTypeNames),
+            .maxSpeculationDepth     = cfg.maxSpeculationDepth,
+            .speculationBudgetFactor = cfg.speculationBudgetFactor,
+            .maxExpressionDepth      = cfg.maxExpressionDepth,
+            .recoveryStrategy        = cfg.recoveryStrategy,
+            .maxSyncScanTokens       = cfg.maxSyncScanTokens,
+            .prattWalker             = nullptr,
+            .seedGlobalTypeNames     = std::move(cfg.seedGlobalTypeNames),
           }
         , identifierKind(schema->schemaTokens().find("Identifier"))
         , errorKind(schema->schemaTokens().find("Error"))
@@ -429,6 +516,22 @@ struct Parser::Impl {
     void emitParserError(DiagnosticCode code, SourceSpan span,
                          std::string actual,
                          std::span<SchemaTokenId const> expected = {}) {
+        // THE CASCADE SHIELD (see `suppressCascadeUntilSync_`). Recovery is
+        // untouched — the Error leaf, the panic scan, the frames, the tree
+        // and the exit code are all exactly what they were — only the
+        // SPEAKING stops, and only while walking out of a construct a
+        // speculation ceiling has already reported and abandoned. Placed at
+        // the single emission chokepoint rather than at `recoverAt`, because
+        // the cascade arrives through three of them (`recoverAt`,
+        // `synthesizeMissingRule`, the direct `P_UnexpectedToken` /
+        // `P_MissingRequiredChild` sites) and shielding one leaves the
+        // others talking.
+        //
+        // ⚠ DEPTH 0 ONLY: a suppressed emission inside a probe would also
+        // suppress the `diagsEmitted` DELTA the probe reads as "this branch
+        // failed", and the probe would commit a half-built branch. Inside a
+        // probe every diagnostic is rolled back anyway.
+        if (suppressCascadeUntilSync_ && speculationDepth == 0) return;
         ParseDiagnostic d;
         d.code        = code;
         d.severity    = DiagnosticSeverity::Error;
@@ -544,6 +647,25 @@ struct Parser::Impl {
     // operator peek), so exactly one diagnostic surfaces. The Error
     // leaf propagates HasError up through every wrapper frame.
     void recoverExpressionTooDeep_(Token const& peek) {
+        // ★ INSIDE A SPECULATIVE PROBE THIS DIAGNOSTIC DOES NOT SURVIVE, so
+        // latch the fact as well. The emission below both (a) is erased when
+        // the enclosing probe rolls its reporter back and (b) marks the probe
+        // as having emitted, i.e. as having FAILED — after which the alt's
+        // non-speculative fallback replay ends in a `P_NoAlternativeMatched`
+        // against a token the user wrote correctly. So the honest ceiling
+        // (`P_ExpressionTooDeep`, which knows its own name and value) was
+        // being swapped for a fabricated syntax error, exactly as the two
+        // speculation ceilings were. ✔MEASURED on `(int)`-chains with the
+        // speculation ceilings lifted: 1023 compiled rc 0 and 1024 was
+        // refused with `expected Identifier … got 'int'` and no mention of
+        // the expression cap at all. Latching lets the outermost alt report
+        // the real ceiling by name (see `recoverSpeculationTooDeep_`).
+        // At depth 0 there is no probe to erase it, so the emission below is
+        // the whole story and nothing is latched.
+        if (speculationDepth > 0) {
+            latchSpeculationCeiling_(SpeculationCeiling::ExpressionDepth,
+                                     config.maxExpressionDepth);
+        }
         // No `expected` set — the reporter renders `got <actual>`, so
         // `actual` carries the explanation plus the offending lexeme.
         emitParserError(
@@ -554,6 +676,98 @@ struct Parser::Impl {
                 renderActual(peek), config.maxExpressionDepth));
         (void)panicRecover();
         stepRecovered_ = true;
+    }
+
+    // REPORT an OVER-SPECULATED region: while disambiguating the
+    // alternatives at some token, the parser hit one of its speculation
+    // ceilings — nested probes `config.maxSpeculationDepth` deep, one probe
+    // past its token budget, or the expression-nesting cap reached inside a
+    // probe — and abandoned, so it never learned which alternative was
+    // right. Called ONLY at `speculationDepth == 0` — the outermost alt owns
+    // the whole speculation subtree the ceiling was reached inside — and
+    // only once per hit (the latch is consumed here).
+    //
+    // ★ REPORTS ONLY; IT DOES NOT RECOVER. The alt's existing recovery (the
+    // nullable skip, the declared-last fallback replay, then
+    // `P_BacktrackFailed` + panic scan) runs immediately after this,
+    // UNCHANGED — same tokens consumed, same frames, same tree. That is
+    // deliberate: the defect being fixed is what the compiler SAYS, and a
+    // bespoke recovery path here would be a second, untested unwinder for
+    // the rarest case in the parser. ✔MEASURED: an earlier attempt that did
+    // recover here — discarding to the next sync token — left the walker
+    // still needing an operand, ate the statement's `;` and the block's `}`,
+    // and ended in `P_BuilderInvariant: scope stack non-empty at finish`.
+    // The shield below deletes the cascade instead, which is the part that
+    // was wrong.
+    //
+    // ★ THE DIAGNOSTIC NAMES ITS OWN LIMIT. The refusal is the PARSER's
+    // resource ceiling, not a defect in the program: the token at the
+    // reported position may be — and in the motivating case is —
+    // perfectly valid C that gcc, clang, mingw-w64 gcc and MSVC all
+    // accept. Saying `expected Identifier … got 'int'` there sends the
+    // reader to fix code that is already right, which is worse than
+    // saying nothing. MSVC's own ceiling reports itself the same honest
+    // way (`fatal error C1026: parser stack overflow, program too
+    // complex`) and names no token of the user's.
+    //
+    // Positioned at the token the DEEPEST refused probe was looking at
+    // (where the nesting actually ran out), then panic-scans forward to
+    // the next stop-point so the parse makes progress and the rest of the
+    // file is still diagnosed — the same shape as
+    // `recoverExpressionTooDeep_`, never an abort.
+    void reportSpeculationCeiling_() {
+        const SpeculationCapHit hit = *speculationCapHit_;
+        speculationCapHit_.reset();
+        // ONE owner for the three ceilings' vocabulary: the code, the prose
+        // name and the config key that sets it, so a reader who sees the
+        // message can find the knob and a future ceiling cannot be added
+        // with only two of the three filled in.
+        struct Ceiling {
+            DiagnosticCode code;
+            char const*    what;
+            char const*    key;
+        };
+        const Ceiling c = [&]() -> Ceiling {
+            switch (hit.which) {
+            case SpeculationCeiling::Depth:
+                return {DiagnosticCode::P_MaxSpeculationDepth,
+                        "speculation-depth limit", "maxSpeculationDepth"};
+            case SpeculationCeiling::TokenBudget:
+                return {DiagnosticCode::P_SpeculationBudgetExhausted,
+                        "per-alternative token budget",
+                        "speculationBudgetFactor"};
+            case SpeculationCeiling::ExpressionDepth:
+                break;
+            }
+            return {DiagnosticCode::P_ExpressionTooDeep,
+                    "expression-nesting limit", "maxExpressionDepth"};
+        }();
+        // No `expected` set — the reporter renders `got <actual>`, so
+        // `actual` carries the explanation plus the offending lexeme. The
+        // message names the LIMIT, its VALUE and the CONFIG KEY that sets
+        // it, and says in as many words that the token may be valid — the
+        // three things the fabricated `P_NoAlternativeMatched` it replaces
+        // got wrong.
+        emitParserError(
+            c.code, hit.span,
+            std::format(
+                "{} — the parser gave up choosing between the alternatives "
+                "that start here because it reached its {} of {}, so this "
+                "construct was not parsed; the token itself may be valid "
+                "(the limit is the language config's `parser.{}`)",
+                hit.actual, c.what, hit.limit, c.key));
+        // Raise the shield AFTER speaking, so the ceiling's own diagnostic is
+        // the one that gets through and everything the alt's ordinary
+        // recovery says on the way out of the same construct does not.
+        //
+        // ⚠ NOT RAISED AT ALL for a grammar that declares no `syncTokens`:
+        // the shield's only exit is reaching one, so without any the silence
+        // would run to end of file and swallow every later diagnostic in the
+        // translation unit. Failing toward SPEAKING is the only safe default
+        // for a mechanism whose whole job is to say less.
+        if (!schema->syncTokens().empty()) {
+            suppressCascadeUntilSync_ = true;
+        }
     }
 
     // Recover a MISSING required RULE: the dispatch needs to descend into
@@ -819,18 +1033,40 @@ struct Parser::Impl {
     // once `out.size() > cap` — the triage only ever distinguishes
     // "exactly one" from "more". Error/Missing leaves count as content
     // (a non-identifier form → rule-1 commit; semantic diagnoses).
+    //
+    // ★★ THE DESCENT COSTS HEAP, NOT HOST CALL FRAMES
+    // (feedback-no-input-proportional-recursion, operator 2026-09-02). `cap`
+    // bounds the OUTPUT, never the DEPTH: the walk still has to reach the
+    // leftmost leaf, and that path is as deep as the subtree — the parser's own
+    // `maxExpressionDepth` says nothing about it, since this runs over a subtree
+    // that is already BUILT. `pending` is that stack; children are pushed in
+    // REVERSE so they pop left-to-right, which is the order the recursion
+    // visited them in and which the "first leaf" tests below depend on.
+    //
+    // The empty-space filter stays exactly where it was — applied to CHILDREN at
+    // the push site, and to a LEAF as it is recorded (which is what makes an
+    // empty-space ROOT contribute nothing while an internal root is still
+    // entered). ✔MEASURED before the conversion, on the ordinary thread through
+    // `ctest`: no C source could drive this past a handful of levels, because in
+    // every guarded shape the leftmost path hits a token almost immediately
+    // (`(a)(x+1+…+1)` at 38812 terms returned rc 0). It is converted anyway — the
+    // bound was a property of today's grammars, not of this code.
     void collectLeavesBelow_(NodeId node, std::vector<NodeId>& out,
                              std::size_t cap) const {
-        if (out.size() > cap) return;
-        const NodeKind k = builder->nodeKind(node);
-        if (k != NodeKind::Internal) {
-            if (!isEmptySpace(builder->nodeFlags(node))) out.push_back(node);
-            return;
-        }
-        for (NodeId c : builder->nodeChildren(node)) {
-            if (isEmptySpace(builder->nodeFlags(c))) continue;
-            collectLeavesBelow_(c, out, cap);
+        std::vector<NodeId> pending{node};
+        while (!pending.empty()) {
             if (out.size() > cap) return;
+            const NodeId n = pending.back();
+            pending.pop_back();
+            if (builder->nodeKind(n) != NodeKind::Internal) {
+                if (!isEmptySpace(builder->nodeFlags(n))) out.push_back(n);
+                continue;
+            }
+            const std::span<NodeId const> kids = builder->nodeChildren(n);
+            for (std::size_t i = kids.size(); i-- > 0;) {
+                if (isEmptySpace(builder->nodeFlags(kids[i]))) continue;
+                pending.push_back(kids[i]);
+            }
         }
     }
 
@@ -1208,16 +1444,20 @@ struct Parser::Impl {
             // the delta `nowDesynced && !desyncedBefore` only fails
             // when *this branch* tripped the latch.
             , desyncedBefore_(impl.walker.isDesynced())
-            // Budget: 16× the schema's declared lookahead. The
-            // declared lookahead is the disambiguation distance,
-            // not a total-cost bound, so multiply by a generous
-            // factor to let the branch make legitimate progress
-            // (descents, token consumption) while still aborting
-            // adversarial input.
-            , budget_(static_cast<std::size_t>(
-                  impl.walker.lookahead() > 0
-                      ? impl.walker.lookahead() * 16u
-                      : 64u))
+            // Budget: `config.speculationBudgetFactor` × the schema's
+            // declared lookahead. The declared lookahead is the
+            // disambiguation distance, not a total-cost bound, so the
+            // factor is what lets the branch make legitimate progress
+            // (descents, token consumption) while still abandoning
+            // adversarial input. The factor is CONFIG-DRIVEN (fallback
+            // 16, the constant that used to be spelled here); the
+            // lookahead-less fallback keeps its historic shape of
+            // 4×factor so an alt with no declared lookahead is unchanged
+            // at the default.
+            , budget_(impl.walker.lookahead() > 0
+                          ? static_cast<std::size_t>(impl.walker.lookahead())
+                                * impl.config.speculationBudgetFactor
+                          : 4u * impl.config.speculationBudgetFactor)
             , stepRecoveredBefore_(impl.stepRecovered_)
             // FC4 c1: the forward-progress watchdog tuple is probe state
             // too. Without restoring it, a rolled-back probe leaves
@@ -1320,6 +1560,10 @@ struct Parser::Impl {
         [[nodiscard]] bool exceededBudget() const noexcept {
             return impl_.tokens.position() - probeStartPos_ > budget_;
         }
+
+        // The token budget this probe was given, for the fail-loud
+        // diagnostic that names it.
+        [[nodiscard]] std::size_t budget() const noexcept { return budget_; }
 
         [[nodiscard]] bool emittedDiag() const noexcept {
             return impl_.diagsEmitted > diagsBefore_;
@@ -1480,12 +1724,17 @@ struct Parser::Impl {
     // restore (tokens + builder + walker + frames + diag counter).
     [[nodiscard]] bool trySpeculativeBranch(RuleId branch) {
         if (speculationDepth >= config.maxSpeculationDepth) {
-            emitParserError(
-                DiagnosticCode::P_MaxSpeculationDepth,
-                tokens.peek().span,
-                std::format(
-                    "parser speculation depth {} exceeds configured cap {}",
-                    speculationDepth, config.maxSpeculationDepth));
+            // LATCH, do not emit. Emitting here would land the diagnostic
+            // inside the ENCLOSING probe, which erases it on rollback and
+            // reads the emission as "this branch failed" — the two steps
+            // that together manufactured a syntax error against a correct
+            // token. The latch survives every rollback; the OUTERMOST alt
+            // (speculationDepth == 0) turns it into one positioned,
+            // self-naming `P_MaxSpeculationDepth`. First hit wins: the
+            // deepest/earliest position is the one that describes where the
+            // nesting actually ran out.
+            latchSpeculationCeiling_(SpeculationCeiling::Depth,
+                                     config.maxSpeculationDepth);
             return false;
         }
 
@@ -1527,7 +1776,18 @@ struct Parser::Impl {
 
         while (frames.size() > probe.targetDepth()) {
             if (probe.isDesynced())     return false;
-            if (probe.exceededBudget()) return false;
+            if (probe.exceededBudget()) {
+                // The SECOND ceiling this function enforces, and the one
+                // that used to be silent: the probe ran out of its token
+                // budget before the branch closed, so — exactly as at the
+                // depth cap — the parser abandons without ever deciding.
+                // Latch (never emit inside a probe) so the outermost alt
+                // can name it instead of falling through to a fabricated
+                // `P_NoAlternativeMatched` on correct source.
+                latchSpeculationCeiling_(SpeculationCeiling::TokenBudget,
+                                         probe.budget());
+                return false;
+            }
             // Note: do NOT bail on `isAtSourceEnd && !walker.canEndSource()`
             // — the branch's last iteration legitimately runs with peek
             // == Eof when the cursor is at End and `closeFrameOnce` is
@@ -1604,6 +1864,22 @@ struct Parser::Impl {
         // the same broken region.
         const bool prevStepRecovered = stepRecovered_;
         stepRecovered_ = false;
+
+        // Lower the cascade shield the moment the parser reaches a
+        // schema-declared sync token: the abandoned construct is over and
+        // whatever comes next is the author's again, so it must be
+        // diagnosed normally. Bounding the shield by `syncTokens` — not by
+        // a token count and not by "the next recovery" — is what keeps it a
+        // ONE-REGION silence rather than a general softening of the parser.
+        // Grammar-driven: the token set is config data.
+        if (suppressCascadeUntilSync_ && !tokens.isAtEnd()) {
+            const auto sync = schema->syncTokens();
+            const SchemaTokenId k =
+                effectiveKind(tokens.peek(), identifierKind, errorKind);
+            if (std::ranges::find(sync, k) != sync.end()) {
+                suppressCascadeUntilSync_ = false;
+            }
+        }
 
         // Termination at root: `canEndSource` returns true only at
         // the root rule's nullable-tail end position; combined with
@@ -1960,10 +2236,39 @@ struct Parser::Impl {
                     return StepOutcome::Continue;
                 }
 
+                // Depth-0 entry owns the whole speculation subtree about to
+                // run, so any ceiling latch left over from an EARLIER alt —
+                // one that hit the ceiling under some candidate and then
+                // resolved through another — is not this alt's to report.
+                // Clearing it here is what keeps the ceiling diagnostic
+                // attributable: it can only ever describe speculation this
+                // alt actually performed.
+                if (speculationDepth == 0) speculationCapHit_.reset();
+
                 for (auto const branch : candidates) {
                     if (trySpeculativeBranch(branch)) {
                         return StepOutcome::Continue;
                     }
+                }
+
+                // THE CEILING, REPORTED AS ITSELF. Every candidate failed and
+                // the parse hit one of its speculation ceilings on the way —
+                // so the failure is the parser running out of a resource, not
+                // the program being malformed. Say so here, positioned and by
+                // name, BEFORE the recovery below runs: that recovery ends in
+                // the declared-last fallback replay, which on a legal-but-deep
+                // construct reliably produces `P_NoAlternativeMatched` against
+                // a token the user wrote correctly — the fabricated syntax
+                // error this whole arm exists to delete
+                // (D-PARSE-NINE-NESTED-CASTS-ARE-REFUSED-BY-THE-SPECULATION-CAP-WITH-A-FABRICATED-SYNTAX-ERROR).
+                // The recovery itself is left exactly as it was; the shield
+                // this raises silences it until the next sync token, so the
+                // region yields ONE honest diagnostic instead of one honest
+                // one buried under N fabricated ones.
+                // Checked only at depth 0: at depth > 0 the enclosing probe
+                // still owns the failure and must roll back normally.
+                if (speculationDepth == 0 && speculationCapHit_) {
+                    reportSpeculationCeiling_();
                 }
 
                 // D-PARSE-SPECULATIVE-OPTIONAL: a speculative OPTIONAL whose
@@ -2174,7 +2479,29 @@ Parser::~Parser() = default;
 ParseResult Parser::parse() && {
     auto& I = *impl_;
 
-    I.builder = std::make_unique<TreeBuilder>(I.src, I.schema, I.budget);
+    // ★ THE SECOND CAP, DERIVED — NEVER AUTHORED SEPARATELY. Before this,
+    // the builder was constructed with a DEFAULT `BuilderConfig`, whose own
+    // `maxSpeculationDepth` (64) sat behind the parser's and bound the moment
+    // the parser's was lifted past it — a second ceiling nobody could see
+    // until someone wrote one more level of nesting. The two are the SAME
+    // quantity measured at two layers: `SpeculationProbe` is the only
+    // construction site of a builder checkpoint in the whole engine (one
+    // probe ⇒ exactly one checkpoint), so the builder's checkpoint depth
+    // equals the parser's probe depth by construction. Deriving it from the
+    // one config-driven value is therefore not a coincidence to be kept in
+    // sync by hand — it is the only wiring under which the two CANNOT
+    // disagree, and it guarantees the parser's counter (which reports itself
+    // by name and position) is always the ceiling that actually fires.
+    //
+    // Equal, not padded: `trySpeculativeBranch` refuses at depth == cap, so at
+    // most `cap` probes are ever live and the builder sees at most `cap`
+    // simultaneous checkpoints — exactly what it permits. Its own one-shot
+    // `P_MaxSpeculationDepth` therefore stays reachable ONLY for a non-parser
+    // TreeBuilder client, where it remains the correct backstop.
+    BuilderConfig builderCfg;
+    builderCfg.maxSpeculationDepth = I.config.maxSpeculationDepth;
+    I.builder = std::make_unique<TreeBuilder>(I.src, I.schema, I.budget,
+                                              builderCfg);
 
     // Fold the tokenizer's lexer diagnostics into the builder's reporter
     // before the walk, so the finished Tree owns lexer + parser diagnostics

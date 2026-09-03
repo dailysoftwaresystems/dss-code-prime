@@ -530,6 +530,36 @@ struct DSS_EXPORT GrammarSchemaData {
     // it still fails loud, never crashes. See `maxExpressionDepth()`.
     std::optional<std::size_t>                        maxExpressionDepth;
 
+    // Config-driven parser SPECULATION-nesting cap (optional top-level
+    // `parser.maxSpeculationDepth`, additive — every schema version may
+    // declare it). `nullopt` when the config omits the field — the driver
+    // then leaves `ParserConfig::maxSpeculationDepth` at its C++ fallback
+    // default. When present, the loader validated it is a positive integer;
+    // the CU build copies it onto the `ParserConfig` for every parse of this
+    // language, and the parser in turn DERIVES the `TreeBuilder`'s
+    // `BuilderConfig::maxSpeculationDepth` from the same value — the two are
+    // the same nesting quantity measured at two layers (every parser
+    // speculation probe opens exactly one builder checkpoint), so ONE key
+    // drives both and they cannot disagree. A nest beyond it fails loud with
+    // a positioned, self-naming `P_MaxSpeculationDepth`, never a fabricated
+    // syntax error against the user's own token
+    // (D-PARSE-NINE-NESTED-CASTS-ARE-REFUSED-BY-THE-SPECULATION-CAP-WITH-A-FABRICATED-SYNTAX-ERROR).
+    // See `maxSpeculationDepth()`.
+    std::optional<std::size_t>                        maxSpeculationDepth;
+
+    // Config-driven multiplier for the per-probe speculative TOKEN budget
+    // (optional top-level `parser.speculationBudgetFactor`, additive).
+    // `nullopt` when the config omits the field — the driver then leaves
+    // `ParserConfig::speculationBudgetFactor` at its C++ fallback. One
+    // speculative probe may consume `factor x <the alt's declared lookahead>`
+    // tokens before it is abandoned. This is the THIRD ceiling on a nested
+    // construct, behind the two speculation-depth caps, and until it became a
+    // config key it was a bare `16` in the probe constructor that silently
+    // truncated the admissible language: a cast chain of 342 was refused where
+    // 341 compiled, with no diagnostic naming the budget at all. It now fails
+    // loud as `P_SpeculationBudgetExhausted`. See `speculationBudgetFactor()`.
+    std::optional<std::size_t>                        speculationBudgetFactor;
+
     // Panic-mode sync tokens declared at the schema level — token
     // kinds the parser treats as "safe resync points" when the input
     // is broken. Sorted ascending by `id.v` so callers can use
@@ -902,6 +932,28 @@ public:
     // language — every shipped grammar reads its own value (or the fallback).
     [[nodiscard]] std::optional<std::size_t> maxExpressionDepth() const noexcept {
         return d_.maxExpressionDepth;
+    }
+
+    // Config-driven parser speculation-nesting cap (`parser.maxSpeculationDepth`).
+    // `nullopt` when the config omits the field — the CU build then keeps the
+    // `ParserConfig` C++ fallback default. When present, a loader-validated
+    // positive value the CU build copies onto `ParserConfig::maxSpeculationDepth`,
+    // from which the parser also derives the builder's checkpoint cap — so BOTH
+    // stacked caps come from this ONE key and neither can bind invisibly behind
+    // the other. Names no language — every shipped grammar reads its own value
+    // (or the fallback).
+    [[nodiscard]] std::optional<std::size_t> maxSpeculationDepth() const noexcept {
+        return d_.maxSpeculationDepth;
+    }
+
+    // Config-driven speculative token-budget multiplier
+    // (`parser.speculationBudgetFactor`). `nullopt` when the config omits the
+    // field — the CU build then keeps the `ParserConfig` C++ fallback (16, the
+    // value this was hardcoded to before it became a key, so an omitting
+    // language is bit-identical to before). Names no language.
+    [[nodiscard]] std::optional<std::size_t>
+    speculationBudgetFactor() const noexcept {
+        return d_.speculationBudgetFactor;
     }
 
     // ── Operators ──

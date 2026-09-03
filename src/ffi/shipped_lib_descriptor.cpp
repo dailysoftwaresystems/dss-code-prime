@@ -3566,85 +3566,122 @@ void forEachDescriptorInClosure(
                        HeaderSearchResult const&)> const&    onUnresolvedInclude,
     std::function<void(std::string const&,
                        std::filesystem::path const&)> const& onUnavailableChild) {
-    // ★ CYCLE / DIAMOND GUARD (correctness must): a single DFS keyed on the
-    // weakly-canonical descriptor path (the SAME key the semantic readDescriptors
-    // dedup + cachedDescriptorJson use). A path is visited AT MOST ONCE, so a cycle
-    // A→B→A stops at the second A and a diamond's shared leaf is visited once. The
-    // recursion is bounded by the finite shipped-descriptor count — no fixpoint
-    // iteration, a single DFS is complete + terminating.
-    auto const key = descriptorPathKey(startPath);
-    if (!visited.insert(key).second) return;   // already in the closure
+    // ★★ THE DESCENT COSTS HEAP, NOT HOST CALL FRAMES
+    // (feedback-no-input-proportional-recursion, operator 2026-09-02). The depth of
+    // this walk follows the descriptor INCLUDE-GRAPH — config the user writes and
+    // ships, not something this project's corpus bounds — so a host frame per level
+    // is exactly the shape the standing ruling forbids.
+    //
+    // ⚠ AN EDGE IS RESOLVED WHEN IT IS POPPED, NOT WHEN IT IS PUSHED, AND THAT IS
+    // THE WHOLE ORDER CONTRACT. The recursion resolved child[0], gated it, walked
+    // its ENTIRE subtree, and only then resolved child[1] — so `onUnresolvedInclude`
+    // and `onUnavailableChild` for a later sibling fired AFTER every diagnostic from
+    // an earlier sibling's descendants. Pushing already-resolved paths would have
+    // hoisted every sibling's resolution ahead of the first sibling's subtree and
+    // silently reordered those callbacks. Pushing the unresolved header NAME instead
+    // keeps the resolution exactly where the recursion had it. Children are pushed
+    // in REVERSE so they pop in declaration order, and a descriptor is marked
+    // `visited` when it is POPPED, as the recursive entry marked it — so a diamond
+    // and a cycle behave as before too.
+    struct Edge {
+        std::filesystem::path path;         // the descriptor to visit (root only)
+        std::string           headerName;   // non-empty ⇒ resolve `path` from this
+    };
+    std::vector<Edge> pending;
+    pending.push_back(Edge{startPath, std::string{}});
 
-    // PARENT FIRST — visit this descriptor before the siblings its `includes`
-    // declares (so the caller records/splices parent-before-transitive-child; the
-    // semantic first-wins dedup then lets the named parent's surface beat a
-    // transitively-included sibling's on any name collision).
-    visit(startPath);
+    while (!pending.empty()) {
+        Edge const edge = std::move(pending.back());
+        pending.pop_back();
 
-    // ★ A DESCRIPTOR THAT DOES NOT EXIST ON THIS FORMAT DECLARES NOTHING ON IT —
-    // ITS EDGES INCLUDED. Only ever reached for the ROOT (a child's availability is
-    // tested in the loop below, BEFORE it is visited), and the root is the header
-    // the USER named: the caller owns that verdict (the semantic tier's
-    // `F_ShippedHeaderUnavailableForTarget`, positioned on the `#include` line), so
-    // the root is still VISITED and only the DESCENT stops.
-    // ⚠ THIS FIXED A REAL LEAK, not a hypothetical one: before the gate, a root
-    // refused as unavailable still had its whole `includes` closure recorded, so
-    // the semantic tier injected every SIBLING's surface for an `#include` that had
-    // just been rejected. It was unobservable only because the rejection also
-    // errored the compile — a coincidence, not a design.
-    if (activeFormat.has_value()
-        && !shippedHeaderAvailableForFormat(startPath, *activeFormat)) {
-        return;
-    }
-
-    // Read this descriptor's `includes` interner-free with a THROWAWAY reporter: a
-    // malformed `includes` FIELD is surfaced by the semantic readShippedLibDescriptor
-    // that reads the SAME descriptor (the import resolver records a ref per closure
-    // descriptor) — never silent, never double-reported here (the
-    // shippedHeaderAvailableForFormat throwaway-reporter precedent). A malformed
-    // field ⇒ nullopt ⇒ no children traversed (the loud report comes from semantic).
-    // `activeFormat` selects the ACTIVE edges: an entry whose `when` does not match
-    // is not an edge on this target and never appears here.
-    DiagnosticReporter throwaway;
-    auto const includes = readShippedLibIncludes(startPath, throwaway, activeFormat);
-    if (!includes) return;
-    for (std::string const& headerName : *includes) {
-        // Resolve each sibling by the SAME `<stem>.json` funnel a source
-        // `#include <h>` uses (so the transitive edge and a direct include agree
-        // byte-for-byte). An entry that resolves to NO descriptor is a config error
-        // — the caller surfaces it LOUD (this is the ONLY tier that can, since the
-        // interner-less semantic tier has no systemDirs). Continue past it so one
-        // typo does not swallow the rest of the closure.
-        // D-PP-HEADER-CASE-INSENSITIVE-PE: the SAME case policy the source
-        // spelling gets — a `includes:["Windows.h"]` edge must reach
-        // `windows.json` on a pe build from ANY host, and must NOT on an elf one.
-        HeaderSearchResult child =
-            resolveSystemDescriptor(headerName, systemDirs, matching);
-        if (child.status != HeaderSearchStatus::Found) {
-            onUnresolvedInclude(headerName, child);
-            continue;
+        std::filesystem::path here = edge.path;
+        if (!edge.headerName.empty()) {
+            // Resolve each sibling by the SAME `<stem>.json` funnel a source
+            // `#include <h>` uses (so the transitive edge and a direct include agree
+            // byte-for-byte). An entry that resolves to NO descriptor is a config
+            // error — the caller surfaces it LOUD (this is the ONLY tier that can,
+            // since the interner-less semantic tier has no systemDirs). Continue past
+            // it so one typo does not swallow the rest of the closure.
+            // D-PP-HEADER-CASE-INSENSITIVE-PE: the SAME case policy the source
+            // spelling gets — a `includes:["Windows.h"]` edge must reach
+            // `windows.json` on a pe build from ANY host, and must NOT on an elf one.
+            HeaderSearchResult child =
+                resolveSystemDescriptor(edge.headerName, systemDirs, matching);
+            if (child.status != HeaderSearchStatus::Found) {
+                onUnresolvedInclude(edge.headerName, child);
+                continue;
+            }
+            // ★★ AN ACTIVE EDGE WHOSE CHILD DOES NOT EXIST ON THIS FORMAT IS A CONFIG
+            // CONTRADICTION, AND IT IS LOUD. The config said "on this format, including
+            // me also includes X" and, in the same breath, "X does not exist on this
+            // format". There is no correct silent answer: dropping the child hides a
+            // surface the parent PROMISED, and recording it makes the semantic tier
+            // report a header the user never wrote. So the walker reports it and each
+            // tier renders it in its own voice, exactly as `onUnresolvedInclude` already
+            // works — the resolver (which alone owns a positioned `#include` span) is
+            // loud; the preprocessor stays silent so nothing double-reports.
+            // ⚠ Invariant (i) in `validateShippedIncludeClosure` refuses this STATICALLY
+            // over the whole corpus, including arms no current target selects. This arm
+            // is the belt to that invariant's braces: the invariant is a sweep, and a
+            // sweep only covers the corpus it was run over.
+            if (activeFormat.has_value()
+                && !shippedHeaderAvailableForFormat(child.path, *activeFormat)) {
+                onUnavailableChild(edge.headerName, child.path);
+                continue;
+            }
+            here = child.path;
         }
-        // ★★ AN ACTIVE EDGE WHOSE CHILD DOES NOT EXIST ON THIS FORMAT IS A CONFIG
-        // CONTRADICTION, AND IT IS LOUD. The config said "on this format, including
-        // me also includes X" and, in the same breath, "X does not exist on this
-        // format". There is no correct silent answer: dropping the child hides a
-        // surface the parent PROMISED, and recording it makes the semantic tier
-        // report a header the user never wrote. So the walker reports it and each
-        // tier renders it in its own voice, exactly as `onUnresolvedInclude` already
-        // works — the resolver (which alone owns a positioned `#include` span) is
-        // loud; the preprocessor stays silent so nothing double-reports.
-        // ⚠ Invariant (i) in `validateShippedIncludeClosure` refuses this STATICALLY
-        // over the whole corpus, including arms no current target selects. This arm
-        // is the belt to that invariant's braces: the invariant is a sweep, and a
-        // sweep only covers the corpus it was run over.
+
+        // ★ CYCLE / DIAMOND GUARD (correctness must): a single DFS keyed on the
+        // weakly-canonical descriptor path (the SAME key the semantic readDescriptors
+        // dedup + cachedDescriptorJson use). A path is visited AT MOST ONCE, so a cycle
+        // A→B→A stops at the second A and a diamond's shared leaf is visited once. The
+        // walk is bounded by the finite shipped-descriptor count — no fixpoint
+        // iteration, a single DFS is complete + terminating.
+        auto const key = descriptorPathKey(here);
+        if (!visited.insert(key).second) continue;   // already in the closure
+
+        // PARENT FIRST — visit this descriptor before the siblings its `includes`
+        // declares (so the caller records/splices parent-before-transitive-child; the
+        // semantic first-wins dedup then lets the named parent's surface beat a
+        // transitively-included sibling's on any name collision).
+        visit(here);
+
+        // ★ A DESCRIPTOR THAT DOES NOT EXIST ON THIS FORMAT DECLARES NOTHING ON IT —
+        // ITS EDGES INCLUDED. Only ever DECIDES anything for the ROOT (a child's
+        // availability is tested in the edge-resolution arm ABOVE, before it reaches
+        // `visit`, so a child that got here already passed), and the root is the header
+        // the USER named: the caller owns that verdict (the semantic tier's
+        // `F_ShippedHeaderUnavailableForTarget`, positioned on the `#include` line), so
+        // the root is still VISITED and only the DESCENT stops.
+        // ⚠ THIS FIXED A REAL LEAK, not a hypothetical one: before the gate, a root
+        // refused as unavailable still had its whole `includes` closure recorded, so
+        // the semantic tier injected every SIBLING's surface for an `#include` that had
+        // just been rejected. It was unobservable only because the rejection also
+        // errored the compile — a coincidence, not a design.
         if (activeFormat.has_value()
-            && !shippedHeaderAvailableForFormat(child.path, *activeFormat)) {
-            onUnavailableChild(headerName, child.path);
+            && !shippedHeaderAvailableForFormat(here, *activeFormat)) {
             continue;
         }
-        forEachDescriptorInClosure(child.path, systemDirs, matching, activeFormat,
-                                   visited, visit, onUnresolvedInclude,
-                                   onUnavailableChild);   // DFS recurse
+
+        // Read this descriptor's `includes` interner-free with a THROWAWAY reporter: a
+        // malformed `includes` FIELD is surfaced by the semantic readShippedLibDescriptor
+        // that reads the SAME descriptor (the import resolver records a ref per closure
+        // descriptor) — never silent, never double-reported here (the
+        // shippedHeaderAvailableForFormat throwaway-reporter precedent). A malformed
+        // field ⇒ nullopt ⇒ no children traversed (the loud report comes from semantic).
+        // `activeFormat` selects the ACTIVE edges: an entry whose `when` does not match
+        // is not an edge on this target and never appears here.
+        DiagnosticReporter throwaway;
+        auto const includes = readShippedLibIncludes(here, throwaway, activeFormat);
+        if (!includes) continue;
+        // Reverse-push the UNRESOLVED edges so the stack POPS them in declaration
+        // order and each one is resolved at the moment the walk reaches it — the
+        // order the former parent-first recursion produced. See the contract note
+        // at the top of this function for why resolving here would be wrong.
+        for (std::size_t i = includes->size(); i-- > 0;) {
+            pending.push_back(Edge{std::filesystem::path{}, (*includes)[i]});
+        }
     }
 }
 

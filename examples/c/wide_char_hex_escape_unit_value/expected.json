@@ -1,0 +1,36 @@
+{
+  "$comment": "C 6.4.4.4 (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE, CHARACTER half): a \\x hex / \\ooo octal escape in a wide/UTF character constant names a RAW CODE-UNIT VALUE and is assembled directly. This replaces a refusal that was itself repairing a SILENT MISCOMPILE (u'\\xC3\\xA9' once collapsed through the UTF-8 re-decoder into one wrong 0x00E9 unit), so the arms pin both hazards: a regression to the collapse OR back to the blanket refusal changes the exit code. The chosen values prove the escape is not a code point - u'\\xD800' is a LONE SURROGATE, U'\\xFFFFFFFF' is PAST U+10FFFF, u'\\777' is octal above 255 - each MEASURED identical on gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51 (compiled and RUN, emitted unit read back, 2026-09-02). The wide STRING form still fails loud pending the semantic code-unit-count thread (see wide_string_hex_escape_error).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "units\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "units\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "units\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "expectedStdout": "units\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "$comment": "The escape values are folded at phase 5 and reach MIR as ordinary integer constants, so the shipped pipeline has no literal-decoding work to transform and the image is expected to match the baseline. Deliberately NOT given mustDifferFromBaseline - an honest no-op. The arm's value is that a constant-folding pass cannot quietly re-derive a unit the front end already got right."}
+  ]
+}

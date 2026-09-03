@@ -1,0 +1,17 @@
+{
+  "$comment": "C 6.4.4.4p7 (D-CSUBSET-NARROW-HEX-ESCAPE-TRUNCATED-TO-TWO-DIGITS) fail-loud witness: in \"a\\xFFb\" the trailing `b` IS a hex digit, so the escape is \\xFFb = 0xFFB and it overflows a one-byte element. DSS used to emit `61 FF 62 00` here - matching NO reference in either direction. MEASURED 2026-09-02, each compiled and RUN: gcc 13.3.0 and mingw-w64 gcc 13.2.0 accept by TRUNCATING to `61 FB 00` with a warning, clang 18.1.3 and MSVC 19.51 REFUSE. A reference that only accepts by narrowing the value away is not one that WORKS, so the union over what works is a refusal. The load-bearing pin is the CODE plus a rejected compile at the literal position; the message names the WIDTH and the VALUE because neither alone is actionable.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "H_EscapeValueExceedsCodeUnit",
+      "line": 23,
+      "col": 10
+    }
+  ]
+}

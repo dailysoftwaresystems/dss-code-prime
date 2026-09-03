@@ -692,6 +692,15 @@ struct DSS_EXPORT CuMirModule {
     // selects the right call-site opcode. nullopt iff the format declared
     // none — MIR→LIR then fails loud on any extern call.
     std::optional<ExternCallDispatch> externCallDispatch;
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55): the
+    // DECLARED narrowing of WHICH symbol bindings that dispatch reaches
+    // through the import slot, captured here for the SAME reason as
+    // `externCallDispatch` — the LOWER half sees only this struct. EMPTY = the
+    // format declares no narrowing, i.e. every import (the unqualified meaning
+    // `indirect-slot` has always carried). The RULE that reads it has one
+    // owner, `ObjectFormatSchema::externRefTakesImportSlot`, which the linker
+    // calls directly; what travels here is the declared DATA.
+    std::vector<SymbolBinding> indirectSlotBindings;
     // D-LK-EXTERN-DATA-IMPORT (c117): the active object format's extern-DATA
     // binding model (got-indirect / copy-relocation), captured here for the
     // SAME reason as `externCallDispatch` — the LOWER half (which sees only
@@ -1094,7 +1103,21 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // Trailing + defaulted, like every format fact on
                       // `lowerToLir`.
                       std::optional<AtomicsRuntime> atomicsRuntime =
-                          std::nullopt);
+                          std::nullopt,
+                      // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
+                      // (P55): the format's DECLARED narrowing of WHICH symbol
+                      // bindings the `indirect-slot` dispatch above reaches
+                      // through the import slot, pre-resolved in program.cpp
+                      // for the same reason the two facts above are.
+                      // ⚠ NOT DEFAULTED-AND-FORGOTTEN AT THE CALL SITE: the
+                      // merge path emits `.obj`s too, and a merged module that
+                      // silently lost the narrowing would carry the
+                      // unnarrowed cost while its format document said
+                      // otherwise — and, worse, its call sites would disagree
+                      // with the linker's slot pass, which reads the format
+                      // directly. Defaulted only so the positional tail stays
+                      // additive; program.cpp passes it.
+                      std::vector<SymbolBinding> indirectSlotBindings = {});
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's

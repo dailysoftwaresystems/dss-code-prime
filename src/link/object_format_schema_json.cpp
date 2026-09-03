@@ -357,7 +357,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // (absence is "makes no claim", the deleted table's own behaviour for an
     // unlisted target), so the asymmetry applies in its harmless direction.
     // 32 + 1 = 33.
-    static constexpr std::array<std::string_view, 37> kFormatDocumentKeys{
+    static constexpr std::array<std::string_view, 38> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -399,6 +399,13 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         "entryVerbs",
         // import / link contract
         "externCallDispatch", "dataImportBinding", "externAddrBinding",
+        // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT: WHICH
+        // symbol bindings `externCallDispatch: indirect-slot` applies to.
+        // Registered here so a typo is REFUSED AT LOAD naming the file rather
+        // than silently leaving the dispatch unnarrowed — which reads as
+        // "correct but slower" and is exactly the state this key exists to
+        // end, so it must not be reachable by a misspelling.
+        "indirectSlotBindings",
         // D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET: the
         // OBJECT-CARRIED realization of `dataImportBinding` — the spelling a
         // RELOCATABLE artifact publishes its own data-import slot under,
@@ -1299,6 +1306,101 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                           ", ")));
             } else {
                 data.externCallDispatch = *d;
+            }
+        }
+    }
+
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
+    // `indirectSlotBindings` — WHICH symbol bindings the `indirect-slot`
+    // dispatch above applies to. An ARRAY of closed-vocabulary
+    // `SymbolBinding` names: `["weak"]`. Optional; ABSENT = every import,
+    // which is the unqualified meaning `indirect-slot` has always carried.
+    //
+    // Strict on the `entryVerbs` discipline directly below, and for the same
+    // reason one level sharper: every failure mode of this key is a SILENT
+    // widening back to the state it exists to narrow. So an unknown spelling,
+    // a duplicate, an EMPTY array, and `local` are each refused rather than
+    // absorbed. `local` in particular can never match — no format spells an
+    // undefined LOCAL symbol and `collectExterns` refuses one at the
+    // declaration's own span — so listing it is config that reads as a
+    // capability and is not one (D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE).
+    // The `indirect-slot` PAIRING rule is validate()'s, not this loader's:
+    // key ORDER in a JSON object is not guaranteed, so a rule that reads two
+    // keys belongs where both are already parsed.
+    if (doc.contains("indirectSlotBindings")) {
+        if (!doc.at("indirectSlotBindings").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/indirectSlotBindings",
+                      std::format("'indirectSlotBindings' must be an ARRAY of "
+                                  "symbol BINDING names (accepted: {})",
+                                  allowedList(allNames(kSymbolBindingTable),
+                                              ", ")));
+        } else {
+            auto const& arr = doc.at("indirectSlotBindings");
+            if (arr.empty()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/indirectSlotBindings",
+                          "'indirectSlotBindings' is present but EMPTY. An "
+                          "empty narrowing would mean no import takes the "
+                          "slot, which is not a narrowing of "
+                          "`externCallDispatch: indirect-slot` but a silent "
+                          "cancellation of it — declare `externCallDispatch: "
+                          "direct-plt` if that is what the format means, or "
+                          "name the bindings that need the slot.");
+            }
+            std::size_t i = 0;
+            for (auto const& row : arr) {
+                auto const path = std::format("/indirectSlotBindings/{}", i);
+                ++i;
+                if (!row.is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("each indirectSlotBindings entry "
+                                          "must be a symbol binding NAME "
+                                          "string (accepted: {})",
+                                          allowedList(
+                                              allNames(kSymbolBindingTable),
+                                              ", ")));
+                    continue;
+                }
+                auto const spelling = row.get<std::string>();
+                auto const b = symbolBindingFromName(spelling);
+                if (!b.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("unknown symbol binding '{}' — "
+                                          "accepted: {}", spelling,
+                                          allowedList(
+                                              allNames(kSymbolBindingTable),
+                                              ", ")));
+                    continue;
+                }
+                if (*b == SymbolBinding::Local) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format(
+                                  "'{}' is not a representable IMPORT binding, "
+                                  "so naming it here declares a narrowing "
+                                  "member that can never match. An import is "
+                                  "by construction a name the object does NOT "
+                                  "define, and no object format spells an "
+                                  "undefined LOCAL symbol — HIR→MIR refuses "
+                                  "one at the declaration's own span. Name "
+                                  "only bindings an import can carry: {}.",
+                                  spelling,
+                                  allowedList(allNames(kSymbolBindingTable),
+                                              ", ")));
+                    continue;
+                }
+                bool dupe = false;
+                for (auto const prior : data.indirectSlotBindings) {
+                    if (prior != *b) continue;
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format(
+                                  "duplicate symbol binding '{}' — this is a "
+                                  "SET, and a repeated member is an authoring "
+                                  "mistake this loader will not silently "
+                                  "absorb.", spelling));
+                    dupe = true;
+                    break;
+                }
+                if (!dupe) data.indirectSlotBindings.push_back(*b);
             }
         }
     }
