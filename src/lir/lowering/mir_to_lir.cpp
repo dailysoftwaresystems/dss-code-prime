@@ -922,22 +922,36 @@ struct Lowerer {
     // once at ctor from the same span that populates `externSymbols`.
     std::unordered_map<std::string, SymbolId> suppliedExternByName_;
 
-    // D-LK-EXTERN-DATA-IMPORT (c117): the ACTIVE format's extern-DATA
-    // binding model + the derived set of extern-DATA SymbolIds that need
-    // GOT-indirect address materialization. `externDataGotSymbols_` is
-    // populated at ctor as {extern imports with isData} ∩ {binding ==
-    // GotIndirect}: a GlobalAddr of such a symbol materializes the OBJECT's
-    // address by LOADING its __got slot (lea-of-slot + a deref Load — the
-    // linker binds `symbolVa[dataExtern]` to the __got slot VA, and dyld
-    // fills the slot with the library object's address), NOT a bare lea
-    // (whose result would be the slot's address, off by one indirection —
-    // the silent-miscompile class the fold-suppression below closes).
-    // Every IMAGE format declares GotIndirect, so this is the ONE data-
-    // import lowering; a module under a nullopt-binding (relocatable)
-    // format has no bound data imports at all and the set stays empty ⇒
-    // lowering byte-identical there.
+    // D-LK-EXTERN-DATA-IMPORT (c117) + D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET
+    // (P54): the ACTIVE format's extern-DATA binding model + the derived set
+    // of extern SymbolIds whose ADDRESS is obtained by DEREFERENCING a
+    // pointer slot rather than by computing the symbol's own VA. A
+    // GlobalAddr of such a symbol materializes the address by LOADING the
+    // slot (lea-of-slot + a deref Load — the linker binds `symbolVa[sym]`
+    // to the slot, and the loader / the final link fills it with the real
+    // address), NOT a bare lea (whose result would be the SLOT's address,
+    // off by one indirection — the silent-miscompile class the
+    // fold-suppression below closes).
+    //
+    // ★ TWO DECLARED FACTS FEED THIS ONE SET, each owning its own domain,
+    // and the set is their UNION:
+    //   * `dataImportBinding == GotIndirect` ⇒ the format's extern DATA
+    //     imports bind through a slot (ELF `.got`, Mach-O `__got`, PE IAT).
+    //     Every IMAGE format declares it. FUNCTIONS are excluded here on
+    //     purpose: under `direct-plt` the walker points a function extern's
+    //     symbolVa at a CALLABLE THUNK, so `&f` is that thunk and a deref
+    //     would read the jump stub's bytes.
+    //   * `externCallDispatch == IndirectSlot` ⇒ the format reaches an
+    //     extern's identity through a pointer slot FOR EVERY KIND of
+    //     reference, so a function's address must deref the same slot its
+    //     calls do. Excluding it was a latent hole in the `indirect-slot`
+    //     arm, recorded (before it was closed) in the pe64 exec format
+    //     document as "`indirect-slot` MISCOMPILES an address-taken import":
+    //     `&f` came out as the SLOT's address, and `sqlite os_win.c
+    //     aSyscall[]` then called through it into data.
+    // A module under neither leaves the set empty ⇒ lowering byte-identical.
     std::optional<DataImportBinding> dataImportBinding_;
-    std::unordered_set<std::uint32_t> externDataGotSymbols_;
+    std::unordered_set<std::uint32_t> slotIndirectAddrSymbols_;
 
     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the ACTIVE format's
     // extern-ADDRESS binding + the derived set of extern SymbolIds whose
@@ -947,12 +961,15 @@ struct Lowerer {
     // rather than an absolute page-pair lea. Populated at ctor as ALL
     // extern imports (BOTH data AND function — `&abs` is a function whose
     // address is taken) when the format declares `externAddrBinding ==
-    // Got`. Distinct from `externDataGotSymbols_` (the Mach-O DSS-local
+    // Got`. Distinct from `slotIndirectAddrSymbols_` (the Mach-O DSS-local
     // __got model, data-only): there the __got slot is DSS-bound + reached
     // via lea+deref; HERE the FOREIGN linker owns the slot, reached via
     // the arm64 GOT-page relocs of the `lea_extern_got` macro. The two
     // are mutually exclusive by FORMAT (a format declares dataImportBinding
     // OR externAddrBinding, never both), so their arms never contend.
+    // Likewise disjoint from the `externCallDispatch == IndirectSlot`
+    // contribution above: no shipped format declares BOTH `got` and
+    // `indirect-slot`, and the slot-deref arm is ordered first anyway.
     // Empty for every non-`got` module ⇒ lowering byte-identical.
     std::optional<ExternAddrBinding> externAddrBinding_;
     std::unordered_set<std::uint32_t> externAddrGotSymbols_;
@@ -967,7 +984,7 @@ struct Lowerer {
     // adds the linker-patched tpoff. The set is ALSO consulted at every
     // riprel-fold site (audit M-5): a folded `[rip+sym]` access of a
     // TLS symbol would resolve S=tpoff as if it were an address — a
-    // silent wrong-address access. Mirrors `externDataGotSymbols_`.
+    // silent wrong-address access. Mirrors `slotIndirectAddrSymbols_`.
     std::optional<TlsAccessInfo>      tlsAccess_;
     std::unordered_set<std::uint32_t> threadLocalSymbols_;
     // One-shot dedup for the K_FormatLacksThreadLocalSupport reject
@@ -1186,7 +1203,24 @@ struct Lowerer {
         // rather than guessing an indirection level.
         if (dataImportBinding_ == DataImportBinding::GotIndirect) {
             for (auto const& e : externImports) {
-                if (e.isData) externDataGotSymbols_.insert(e.symbol.v);
+                if (e.isData) slotIndirectAddrSymbols_.insert(e.symbol.v);
+            }
+        }
+        // D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET
+        // (P54): under an `indirect-slot` format the extern's symbolVa IS a
+        // pointer slot — that is what makes `lowerCall`'s
+        // `call_indirect_via_extern` (FF 15, deref the slot) the correct
+        // call-site shape there. The SAME slot is therefore the only lawful
+        // source of the symbol's ADDRESS, for a FUNCTION exactly as for a
+        // DATA object: a bare lea would hand the program the slot's own
+        // address. So every extern import — data AND function — joins the
+        // set under this dispatch. (`&f` used AS A CALLEE never reaches the
+        // arm: `globalAddrFoldsIntoDirectCall` runs BEFORE it and drops the
+        // dead lea, and `lowerCall` folds the SymbolId straight into the
+        // indirect call. Only the value use materializes an address.)
+        if (externCallDispatch_ == ExternCallDispatch::IndirectSlot) {
+            for (auto const& e : externImports) {
+                slotIndirectAddrSymbols_.insert(e.symbol.v);
             }
         }
         // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got`
@@ -1272,9 +1306,9 @@ struct Lowerer {
         // ⚠ THIS COMMENT USED TO MOTIVATE THE GATE WITH PE, claiming the
         // same x86_64 target "needs `call_indirect_via_extern` (FF 15,
         // deref the IAT slot) under PE". ✔MEASURED 2026-08-20 (cycle P23):
-        // that is FALSE and the shipped config says so itself. All 22
-        // object-format documents declare `direct-plt` and NOT ONE declares
-        // `indirect-slot`, because PE resolves imports through IAT import
+        // that is FALSE of every PE IMAGE and was FALSE of every shipped
+        // document then — all 22 declared `direct-plt` and NOT ONE declared
+        // `indirect-slot` — because PE resolves imports through IAT import
         // THUNKS — the linker synthesizes one `jmp *[IAT slot]` per extern
         // and points the symbol's VA at the THUNK, so the call site is a
         // plain direct `call rel32` exactly as on ELF. `pe64-x86_64-windows-
@@ -1284,6 +1318,18 @@ struct Lowerer {
         // The gate is right; its example was inverted. `indirect-slot` stays
         // in the vocabulary because a format MAY declare it — it is the
         // shape, not a prediction about who uses it.
+        // ★ AND SINCE P54 TWO DOCUMENTS DO —
+        // D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET moved
+        // `pe64-x86_64-windows` and `-staticlib` (the RELOCATABLE pe formats,
+        // never the images) to `indirect-slot`, because ✔MEASURED link.exe
+        // 14.51 refuses a direct `call rel32` to a WEAK extern with LNK2016: a
+        // COFF weak external's fallback is an ABSOLUTE value-0 symbol and no
+        // rel32 reaches one. ⓘ The `aSyscall[]` miscompile named just above is
+        // the OTHER half of that row and is closed with it: an address-taken
+        // import under `indirect-slot` now materializes as lea-of-slot + deref
+        // (`slotIndirectAddrSymbols_`) instead of a bare lea of the slot, so
+        // the two facts are consistent rather than in tension. The IMAGE
+        // formats keep `direct-plt` and their thunks.
         //
         // So the gate is keyed on `externCallDispatch_`:
         //   * nullopt          → the format declared no dispatch model
@@ -6779,16 +6825,18 @@ struct Lowerer {
     // undefined-vreg failure in `regForValue`, never a silent wrong
     // address.
     [[nodiscard]] bool globalAddrRiprelFoldsIntoLoad(MirInstId gaId) {
-        // D-LK-EXTERN-DATA-IMPORT (c117): a GOT-indirect extern-DATA symbol
-        // is NEVER foldable. Its GlobalAddr materializes the OBJECT address
-        // by LOADING its __got slot (`lowerGlobalAddr` emits lea-of-slot +
-        // deref) — a distinct indirection that must precede the C-level
-        // Load. Folding the C-level Load into the GlobalAddr would collapse
-        // to ONE riprel load returning the __got slot CONTENTS (the object's
-        // address) where the code wanted the object's VALUE — off by one
-        // indirection, the exact silent miscompile this cycle closes. Keep
-        // the two loads distinct.
-        if (externDataGotSymbols_.contains(mir.globalAddrSymbol(gaId).v)) {
+        // D-LK-EXTERN-DATA-IMPORT (c117) + P54's function half: a
+        // SLOT-INDIRECT extern symbol is NEVER foldable. Its GlobalAddr
+        // materializes the OBJECT address by LOADING its slot
+        // (`lowerGlobalAddr` emits lea-of-slot + deref) — a distinct
+        // indirection that must precede the C-level Load. Folding the
+        // C-level Load into the GlobalAddr would collapse to ONE riprel load
+        // returning the slot CONTENTS (the object's address) where the code
+        // wanted the object's VALUE — off by one indirection, the exact
+        // silent miscompile this cycle closes. Keep the two loads distinct.
+        // The set now carries FUNCTION imports too under an `indirect-slot`
+        // format; the guard reads the set, so it needed no second rule.
+        if (slotIndirectAddrSymbols_.contains(mir.globalAddrSymbol(gaId).v)) {
             return false;
         }
         // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): a `got` extern-
@@ -6885,9 +6933,20 @@ struct Lowerer {
     // GlobalAddr has OTHER uses (a `&fn` value/argument), so without `count == 1`
     // a still-needed lea would be dropped → a loud undefined-vreg fail in
     // `regForValue`. Operand-position-0 excludes a `&fn` passed as an ARGUMENT
-    // (operand ≥ 1) of the call from being mistaken for the callee. TLS/GOT-data
-    // guards are unneeded: a function callee is never a TLS or extern-DATA symbol
-    // (see the `lowerCall` marshalling note).
+    // (operand ≥ 1) of the call from being mistaken for the callee.
+    // ⚠ THE TLS/SLOT GUARD NOTE HERE USED TO READ "unneeded: a function callee
+    // is never a TLS or extern-DATA symbol". The TLS half still holds. The
+    // other half was made FALSE by
+    // D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET (P54):
+    // under an `indirect-slot` format a function callee IS in
+    // `slotIndirectAddrSymbols_`. No guard is needed even so, and the reason
+    // is not the old one — it is that the fold and the slot want the SAME
+    // thing here. Folding drops a DEAD lea and hands the callee's SymbolId to
+    // `lowerCall`, which under that dispatch emits `call_indirect_via_extern`
+    // — itself a deref of the slot. Suppressing the fold would emit a lea+load
+    // nothing reads and leave the call unchanged, so the guard would cost
+    // bytes and change no semantics. (A `&fn` VALUE use has count ≥ 2 or a
+    // non-Call user, never folds, and takes the slot arm in `lowerGlobalAddr`.)
     [[nodiscard]] bool globalAddrFoldsIntoDirectCall(MirInstId gaId) {
         auto const it = mirValueUses_.find(gaId.v);
         if (it == mirValueUses_.end() || it->second.count != 1) {
@@ -7310,7 +7369,17 @@ struct Lowerer {
         // value). This is the path EVERY image format's data imports take:
         // ELF's `.got` + R_*_GLOB_DAT, Mach-O's `__got`, PE's IAT slot all
         // present the same shape to the lowering.
-        if (externDataGotSymbols_.contains(sym.v)) {
+        // ★ D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET
+        // (P54): the SAME arm now also serves an extern FUNCTION under an
+        // `indirect-slot` format, where the symbol's VA is likewise a
+        // pointer slot (there the object CARRIES it — see the linker's
+        // `materializeObjectImportSlots`, which retargets this lea's
+        // relocation from the import to the slot it mints). Nothing in the
+        // emitted pair had to change: one declared fact more feeds one set,
+        // and the SAME lea + deref is correct for both, because in both the
+        // symbol names a pointer and the program asked for what it points
+        // at. `slotIndirectAddrSymbols_` is where the two facts meet.
+        if (slotIndirectAddrSymbols_.contains(sym.v)) {
             auto const loadOp = classOp(cls, RegClassOp::Load);
             if (!loadOp.has_value()) {
                 reportMissingClassOp(cls, RegClassOp::Load,
@@ -9925,9 +9994,28 @@ struct Lowerer {
     // a construct mingw-w64 gcc accepts and whose emitted `xchgl`/`movl` pair
     // ✔RUNS rc 42 on Windows. That is below the (gcc ∪ clang ∪ MSVC) ∪ ISO C
     // union, i.e. a NEW conformance defect manufactured by the fix for another
-    // one. pe64 is the only shipped format with no atomics-runtime image (UCRT
-    // exports no `__atomic_*` symbol and there is nothing to name), so this arm
-    // is not hypothetical — it is Windows.
+    // one.
+    //
+    // ⚠⚠ THE SENTENCE THAT USED TO CLOSE THIS PARAGRAPH — "pe64 is the only
+    // shipped format with no atomics-runtime image (UCRT exports no
+    // `__atomic_*` symbol and there is nothing to name), so this arm is not
+    // hypothetical — it is Windows" — IS RECORDED HERE BECAUSE THE WAY IT WENT
+    // FALSE IS THE LESSON, not because it still describes the tree. Its FIRST
+    // clause was true and is true today for a different reason; its SECOND was
+    // inferred from the first rather than measured, and P54 refuted it twice
+    // over. Lane `pa` measured that mingw-w64's `libatomic-1.dll` exports both
+    // generic entries and pointed the pe64 role at it; lane `la`
+    // (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64) then replaced that non-in-box image
+    // with a body DSS ships and compiles, `runtime/platform/src/atomic.c`,
+    // declared as `runtimeLibraries[].source`. So pe64 still names no IMAGE and
+    // it does declare the ROLE — `atomicsRuntime_.has_value()` is TRUE there —
+    // and NO shipped format reaches this arm today. THE RULE IT PINS IS
+    // UNCHANGED AND STILL LOAD-BEARING: any format declaring no atomics runtime
+    // at all (wasm32, spirv, a future one) must keep the native form under
+    // `losesAtomicity` rather than refuse, because refusing would be below the
+    // union. What changed is which config exercises it, and pinning the rule at
+    // the tier that decides it — rather than at whichever format happens to
+    // exercise it this cycle — is the whole point.
     //
     // The asymmetry is a property of the two answers, not a tuning: under
     // `traps` the native form is a MEASURED rc 135 SIGBUS, so emitting it is a
@@ -10013,8 +10101,12 @@ struct Lowerer {
     // SIGBUS, and shipping one is the silent-miscompile class the bar forbids.
     // Under `losesAtomicity` the caller does not reach here — the native form
     // is what gcc itself ships there, it works, and refusing would put DSS
-    // below the (gcc ∪ clang ∪ MSVC) ∪ ISO C union on pe64, the one shipped
-    // format with no atomics image.
+    // below the (gcc ∪ clang ∪ MSVC) ∪ ISO C union on any format that declares
+    // no atomics runtime. ⚠ THAT USED TO READ "on pe64, the one shipped format
+    // with no atomics image", and P54 ended it: pe64 now declares the role and
+    // fills it from a body DSS ships
+    // (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64), so no shipped format reaches this
+    // arm. The rule stands; its exemplar does not.
     void reportMissingAtomicsRuntime(MirOpcode op, MirInstId id) {
         dss::report(reporter,
             DiagnosticCode::L_UnsupportedLoweringForOpcode,

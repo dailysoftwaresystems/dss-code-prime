@@ -210,6 +210,17 @@ target_link_libraries(dss_link_test_macho_object_reader
 # fuzz, the corruption red-pins (nonzero SizeOfOptionalHeader, unknown reloc
 # nativeId, out-of-range SymbolTableIndex, out-of-range SectionNumber), non-PE
 # schema fail-loud, and the DTYPE_FUNCTION extern isData inference.
+# D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET — the
+# FOREIGN-LINKER half of the object-carried data-import slot. `test_pe_writer`
+# owns the byte pins (which relocation names which symbol); only link.exe,
+# mingw `ld` and a RUN can show that the object LINKS and takes the right
+# branch, and the defect was invisible to every DSS-internal instrument (the
+# DSS-linked PE exec returned 42 throughout). Compiles through the production
+# driver, hence the `program` surface — the same reach `ffi/test_pe_abort_
+# behavior_binding` takes for the same reason.
+dss_add_test(NAME link/test_pe_object_data_import_slot
+             SOURCES test_pe_object_data_import_slot.cpp)
+
 dss_add_test(NAME link/test_coff_object_reader SOURCES test_coff_object_reader.cpp)
 # The emission-alias pin splices ONE extra `relocations[]` row into a shipped
 # `.format.json`, deriving the aliased wire id and a free `kind` FROM the
@@ -398,6 +409,18 @@ target_link_libraries(dss_link_test_extern_dispatch_and_block_shape_projection
 # the cwd unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
 dss_add_test(NAME link/test_weak_definition_dialect
              SOURCES test_weak_definition_dialect.cpp)
+
+# D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the WEAK extern IMPORT --
+# a reference that may legally resolve to NOTHING. Asserts the SYMBOL TABLE on
+# all three formats (ELF STB_WEAK, Mach-O N_WEAK_REF, COFF WEAK_EXTERNAL plus an
+# absolute value-0 fallback), each beside its GLOBAL control in the same object,
+# plus the write/read round trip and the cross-CU strongest-wins fold. The RUN
+# witness for the resolve-to-null case is examples/c/weak_extern_import_null;
+# asserting the link SUCCEEDS is exactly what hid this defect for a year.
+# MUST run through ctest, never a bare .exe: the shipped-config resolver walks
+# the cwd unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME link/test_weak_reference_binding
+             SOURCES test_weak_reference_binding.cpp)
 target_link_libraries(dss_link_test_weak_definition_dialect
                       PRIVATE nlohmann_json::nlohmann_json)
 

@@ -81,9 +81,14 @@ def census(ms):
     def top(key):
         return sum(1 for _, m in ms if key in m)
 
+    # ⚠ THIS TUPLE MUST TRACK THE RUNNERS' CLOSED TOP-LEVEL KEY SET. A key the
+    # runners read and this census does not is exactly the "plausible zero" this
+    # script exists to prevent — it simply would not appear in the report, and a
+    # reader counting manifests from here would under-report it silently rather
+    # than crash. `expectWarnings` joined the set in P54 (lane `fw`).
     for k in ("language", "source", "sources", "project", "exitCode",
-              "expectedStdout", "expectDiagnostics", "optimizedPipelines",
-              "targets"):
+              "expectedStdout", "expectDiagnostics", "expectWarnings",
+              "optimizedPipelines", "targets"):
         c["top." + k] = top(k)
 
     tgts = [t for _, m in ms for t in m.get("targets", [])]

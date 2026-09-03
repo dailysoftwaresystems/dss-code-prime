@@ -300,6 +300,36 @@ void reportArtifactWritten(std::string const& targetSpec,
               << '\n';
 }
 
+} // namespace
+
+// ★★★ THE INVOCATION'S CONFIG PROVENANCE — the SAY-SO half of
+// [[D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE]].
+//
+// ★ A REPORT LINE, NEVER A DIAGNOSTIC, AND THE REASON IS BEHAVIOURAL RATHER
+// THAN STYLISTIC. A `Warning` here would be promoted to an ERROR by
+// `--warnings-as-errors` — so a build that is legitimately run against another
+// tree (which is what `DSS_CONFIG_ROOT` is FOR) would start FAILING because the
+// compiler got better at explaining itself. That is the "fail-more" this row
+// explicitly forbids. An `Info` diagnostic avoids that but is droppable through
+// the three gates in `DiagnosticReporter::report` (`--suppress`, the per-code
+// cap, the global cap), and an attribution line that can vanish is one that
+// cannot be relied on when attribution is exactly what is in doubt. The
+// `dsscp: ` report line above makes the same trade for the same reason.
+//
+// ★ IT SAYS NOTHING IN THE ORDINARY CASE. `configRootProvenanceNote()` is
+// engaged on exactly two surprises — the cwd walk answered a tree that is not
+// this compiler's own, or `$DSS_CONFIG_ROOT` was set and IGNORED — so an
+// in-tree build, every `dss_add_test` entry (whose override RESOLVES) and every
+// installed invocation stay byte-identical. ✔MEASURED: the full ctest gate is
+// unchanged by this line.
+void reportConfigRootProvenance(std::ostream& err) {
+    if (auto note = configRootProvenanceNote()) {
+        err << "dsscp: " << *note << '\n';
+    }
+}
+
+namespace {
+
 // Emit a driver-tier D_* diagnostic. Wraps `dss::report` so all
 // driver-side fail-loud sites take the same shape (Error severity,
 // ferried through the same reporter the kernel uses).
@@ -3479,14 +3509,44 @@ buildDependencyArtifactKey(
     // forever. See `gCompilingShippedRuntimeUnit`.
     if (gCompilingShippedRuntimeUnit) return archives;
 
-    auto const descriptorDir = findShippedConfigDir("shippedLibs");
-    if (!descriptorDir) return archives;   // no corpus ⇒ nothing realized
+    // ⚠⚠ THE DESCRIPTOR CORPUS IS ONE OF **TWO** DECLARERS SINCE
+    // D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64, SO ITS ABSENCE IS NO LONGER
+    // "NOTHING REALIZED" — and the sentence that said so was still here.
+    // ✔MEASURED by reading the shipped documents: all four pe64 formats realize
+    // `runtime/platform/src/atomic.c` from their own `runtimeLibraries` table
+    // and NO descriptor names it. A `return archives` keyed on `shippedLibs/`
+    // alone therefore made a FORMAT-declared runtime body depend on the
+    // presence of an UNRELATED directory: an installed tree carrying
+    // `object-formats/` but no `shippedLibs/` dropped every format-declared
+    // body silently, right here, before the declarer was ever consulted.
+    // ⓘ THE REACHABLE CONSEQUENCE TODAY IS NARROW AND IS STATED RATHER THAN
+    // INFLATED: `atomic.c` itself `#include`s `<stddef.h>`/`<stdint.h>`/
+    // `<stdlib.h>`, which ARE descriptors, so on a tree with no `shippedLibs/`
+    // that unit could not compile either and the build fails either way — what
+    // changes is WHERE. The silent drop is a real hole for the next
+    // format-declared body that needs no shipped header (a `libgcc`-shaped
+    // helper, a target-specific `memcpy`): it would have vanished here and
+    // surfaced as an unresolved symbol at the final link, attributed to the
+    // linker rather than to the missing corpus. Each declarer is now asked
+    // independently, and only a tree with NEITHER directory short-circuits.
+    auto const descriptorDir    = findShippedConfigDir("shippedLibs");
+    // ── THE ARCHIVE SIBLING's directory, hoisted so `configRoot` has a second
+    // derivation when the descriptor corpus is absent. The refusal that reads
+    // it stays where it is, below `claims.empty()`, so a build that realizes
+    // nothing still never demands this directory.
+    auto const objectFormatsDir = findShippedConfigDir("object-formats");
+    if (!descriptorDir && !objectFormatsDir) return archives;
 
     // `findShippedConfigDir` returns `<configRoot>/<sub>`, so the root is its
     // parent. Derived rather than re-walked: two walks could answer with two
     // different trees on a host that has more than one checkout, which is the
-    // D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE shape.
-    fs::path const    configRoot = descriptorDir->parent_path();
+    // D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE shape. ⚠ EITHER shipped
+    // subdirectory yields the SAME root by construction — `findShippedConfigDir`
+    // resolves both against one config set — so preferring one is a choice of
+    // spelling, not of tree.
+    fs::path const    configRoot = descriptorDir
+                                     ? descriptorDir->parent_path()
+                                     : objectFormatsDir->parent_path();
     // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES (the residual half): the
     // kind is READ OFF THE FORMAT HANDLE this function already holds, rather
     // than accepted as a second parameter beside it. The old signature took
@@ -3496,8 +3556,77 @@ buildDependencyArtifactKey(
     // that this function needed is gone with the parameter.
     std::string const formatKey{objectFormatKindName(buildFormat.kind())};
 
-    auto const claims = attributeShippedRuntimeUnits(configRoot, *descriptorDir,
-                                                     formatKey, rep);
+    std::vector<ShippedRuntimeClaim> claims;
+    if (descriptorDir) {
+        claims = attributeShippedRuntimeUnits(configRoot, *descriptorDir,
+                                              formatKey, rep);
+    }
+
+    // ── D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64: THE SECOND KIND OF DECLARER ────
+    //
+    // A shipped-lib DESCRIPTOR declares a realization for a symbol a PROGRAM
+    // names through a header. That mechanism cannot reach a symbol the COMPILER
+    // MINTS — an under-aligned `_Atomic` access lowers to `__atomic_load` with
+    // no user `#include` anywhere — so the FORMAT declares those, in the same
+    // `runtimeLibraries` table that already answers "who plays this runtime
+    // role", with `source` where the other rows say `image`.
+    //
+    // ★ THE TWO KINDS MEET HERE AND NOWHERE ELSE. Below this point a claim is a
+    // claim: same resolution, same language dispatch, same cache key, same
+    // nested build, same archive on the link line. Adding a THIRD declarer would
+    // add rows to this list and nothing else.
+    //
+    // ⚠ THE DECLARING DOCUMENT IS THE FORMAT'S OWN FILE, and it is attributed
+    // rather than left empty for the reason the descriptor case states: the
+    // declaring document's CONTENT is part of the runtime object cache key, and
+    // `computeRuntimeObjectKey` refuses an empty declarer set.
+    //
+    // ⚠⚠ AND A SOURCE BOTH TIERS NAME IS **ONE** BUILD-GRAPH EDGE WITH **TWO**
+    // DECLARERS — never two claims. Appending unconditionally would have queued
+    // the same unit twice, and the two entries would then differ only in their
+    // declarer sets, so they would compute two DIFFERENT cache keys for one
+    // byte-identical object and race to write the same archive. That is the
+    // merge `readShippedSourcesForFormat` already performs one tier down for a
+    // descriptor's own default-vs-per-symbol maps ("a source named twice is ONE
+    // build-graph edge — the merge and the dedup are the same operation over a
+    // set of PATHS"); the rule does not stop being true because the second
+    // declarer is a different KIND of document. Not reachable from the shipped
+    // corpus today (✔MEASURED: no descriptor names `runtime/platform/src/
+    // atomic.c`, and the four pe64 documents are its only declarers) — which is
+    // exactly why it is written down rather than left to be discovered by
+    // whichever future descriptor first claims a body a format also names.
+    {
+        auto const realized = buildFormat.runtimeLibraries().realizedSources();
+        if (!realized.empty()) {
+            fs::path const formatDoc = configRoot / "object-formats"
+                                     / (std::string{buildFormat.name()}
+                                        + ".format.json");
+            std::error_code relEc;
+            fs::path const  rel = fs::relative(formatDoc, configRoot, relEc);
+            std::string const spelling =
+                (relEc || rel.empty()) ? core::genericSpelling(formatDoc)
+                                       : rel.generic_string();
+            for (auto const& source : realized) {
+                auto const existing =
+                    std::find_if(claims.begin(), claims.end(),
+                                 [&](ShippedRuntimeClaim const& c) {
+                                     return c.source == source;
+                                 });
+                if (existing != claims.end()) {
+                    if (std::find(existing->descriptors.begin(),
+                                  existing->descriptors.end(), spelling)
+                        == existing->descriptors.end()) {
+                        existing->descriptors.push_back(spelling);
+                    }
+                    continue;
+                }
+                claims.push_back(
+                    ShippedRuntimeClaim{source,
+                                        std::vector<std::string>{spelling}});
+            }
+        }
+    }
+
     if (claims.empty()) return archives;
 
     // ── THE ARCHIVE SIBLING: the format that WRITES the bytes ────────────────
@@ -3505,7 +3634,9 @@ buildDependencyArtifactKey(
     // refuses on 0 or >1 rather than taking a first match — `directory_iterator`
     // is sorted on NTFS and hash-ordered on ext4, so first-match would let the
     // filesystem decide which format compiled the runtime.
-    auto const objectFormatsDir = findShippedConfigDir("object-formats");
+    // ⓘ The directory itself was resolved at the top of this function, where
+    // `configRoot` needs it as its second derivation; the REFUSAL stays here so
+    // a build that realizes nothing never demands the directory at all.
     if (!objectFormatsDir) {
         emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                    "shipped-source realization: object format '" + formatKey
@@ -4923,6 +5054,11 @@ int Program::run(int argc, char* argv[]) {
         std::cout << cliHelpText();
         return 0;
     }
+    // WHICH CONFIG TREE THIS INVOCATION WILL READ, but only when the answer is
+    // a surprise — see `reportConfigRootProvenance`. Placed AFTER `--help`
+    // (which consults no config and must keep printing exactly its text) and
+    // BEFORE every mode that does, so one site covers the whole dispatch fork.
+    reportConfigRootProvenance(std::cerr);
     if (args.lspMode) {
         return runLspMode(args);
     }

@@ -16550,7 +16550,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // two keys the loader reads two hundred lines further down. One
             // owner per fact: the OPTIONALITY is a comment, the MEMBERSHIP is
             // the table.
-            static constexpr std::array<std::string_view, 18> kAssemblyKeys{
+            static constexpr std::array<std::string_view, 19> kAssemblyKeys{
                 // required whenever the block is present
                 "unitRule",      "lineRule",      "elementRule",
                 "directiveRule", "statementRule", "labelTailRule",
@@ -16559,6 +16559,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 "templateLexerMode", "templateOperandRule",
                 "templateLabelRule", "templateModifierRule",
                 "templateModifiers",
+                // OPTIONAL, and NOT part of the template capability census
+                // below: a lane arrangement is written in a standalone `.s`
+                // exactly as it is in a template, so a dialect may declare it
+                // with or without a template surface.
+                // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME.
+                "registerArrangements",
                 // OPTIONAL, and validated separately below: a dialect with no
                 // directive vocabulary refuses every directive by name, which
                 // is a coherent state.
@@ -16788,13 +16794,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // decodes it, so a 128-bit letter (`%q0` on aarch64,
                         // ✔MEASURED rendering `q0` under gcc 13.3.0 AND clang
                         // 18.1.3 on a `"w"`-bound double) states a width the
-                        // instruction model carries. What still refuses such a
-                        // letter's USE today is the template translator's
-                        // width-flag mapping, loudly and by name, until a
-                        // target declares a width-128 encoding variant — a
-                        // POSITIONED diagnostic, which a load-time width
-                        // refusal here would replace with a config error about
-                        // a letter both references render.
+                        // instruction model carries.
+                        // ⚠ THE CLAUSE THAT FOLLOWED — *what still refuses such
+                        // a letter's USE today is the template translator's
+                        // width-flag mapping … until a target declares a
+                        // width-128 encoding variant* — WENT FALSE ON
+                        // 2026-09-02 AND ITS CONCLUSION SURVIVED. `arm64.target
+                        // .json`'s `popcount_bytes` and `addlanes_bytes` grew
+                        // width-128 arms (CNT/ADDV over sixteen byte lanes,
+                        // ✔MEASURED against gas 2.42 and clang 18.1.3), the
+                        // translator's `case 128:` landed in the same change,
+                        // and a 128-bit template operand now ELECTS. What is
+                        // unchanged is why the check here stays a width-SET
+                        // test rather than a use-time one: a load-time refusal
+                        // would be a config error about a letter both
+                        // references render, where the translator's is a
+                        // POSITIONED diagnostic about the line that used it.
                         // The set itself lives on `AssemblyConfig`
                         // (`kTemplateModifierWidthBits`) so the asm tier's
                         // test can static_assert it against
@@ -16995,6 +17010,244 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     "legal-on-every-class",
                                     *firstScoped, *firstUnscoped));
                             assemblyClean = false;
+                        }
+                    }
+
+                    // ── registerArrangements ── OPTIONAL; the LANE ARRANGEMENT
+                    // suffixes this dialect writes on a vector register.
+                    // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME.
+                    //
+                    // ★ THE SAME THREE FIELDS `templateModifiers` DECLARES —
+                    // spelling, width, class — because it is the same fact
+                    // written on the other side of the name: `v1.8b` is a
+                    // 64-bit view of `v1` exactly as `d1` is. It is parsed
+                    // beside them rather than inside them because the SHAPES
+                    // differ (a modifier is a sigil-composed PREFIX, an
+                    // arrangement a self-contained SUFFIX) and folding two
+                    // shapes into one list would make every reader ask which
+                    // one a row was.
+                    //
+                    // ⚠ `registerClass` IS REQUIRED HERE, where a modifier's is
+                    // optional: an unscoped modifier is a measured posture
+                    // (gcc accepts `%k0` on an xmm operand), while an unscoped
+                    // arrangement has no referent at all — lanes are a property
+                    // of a vector file.
+                    //
+                    // ⚠⚠ AND SO IS `laneBits`, WHICH IS THE FOURTH FIELD AND THE
+                    // ONE A MODIFIER HAS NO ANALOGUE FOR —
+                    // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]].
+                    // The three-field row above states a WIDTH and a CLASS and
+                    // stops, so `.8b`, `.4h`, `.2s` and `.1d` were ONE row's
+                    // worth of information four times over, and a scalar `d1`
+                    // was a fifth. Requiring the key rather than defaulting it
+                    // is deliberate: a defaulted lane width would be a number
+                    // the author never wrote, keying an election that eliminates
+                    // candidates — see the struct comment for the two measured
+                    // spellings that reached the wrong instruction without it.
+                    if (as.contains("registerArrangements")) {
+                        json const& arr = as.at("registerArrangements");
+                        if (!arr.is_array() || arr.empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      "/assembly/registerArrangements",
+                                      "'registerArrangements' must be a "
+                                      "non-empty array of {suffix, widthBits, "
+                                      "laneBits, registerClass} rows; omit the "
+                                      "key entirely on a dialect whose registers "
+                                      "carry no lane arrangement");
+                            assemblyClean = false;
+                        } else {
+                            constexpr auto const& kArrWidths =
+                                AssemblyConfig::kTemplateModifierWidthBits;
+                            for (std::size_t ai = 0; ai < arr.size(); ++ai) {
+                                auto const path = std::format(
+                                    "/assembly/registerArrangements/{}", ai);
+                                json const& a = arr[ai];
+                                static constexpr std::array<std::string_view, 4>
+                                    kArrKeys{"suffix", "widthBits", "laneBits",
+                                             "registerClass"};
+                                DSS_CHECK_KEY_VOCABULARY(kArrKeys);
+                                if (!a.is_object()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        path,
+                                        "each 'registerArrangements' entry "
+                                        "must be an object");
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                if (!checkKeysAgainst(
+                                        a, kArrKeys, path,
+                                        "a 'registerArrangements' row",
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        coll, "")) {
+                                    assemblyClean = false;
+                                }
+                                if (!a.contains("suffix")
+                                    || !a.at("suffix").is_string()
+                                    || a.at("suffix").get<std::string>()
+                                           .empty()) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              path + "/suffix",
+                                              "'suffix' is required and must "
+                                              "be the arrangement AS WRITTEN, "
+                                              "INCLUDING its separator "
+                                              "(\".8b\", not \"8b\") — the "
+                                              "engine never spells a separator "
+                                              "byte of its own");
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                auto suffix =
+                                    a.at("suffix").get<std::string>();
+                                if (!a.contains("widthBits")
+                                    || !a.at("widthBits").is_number_unsigned()) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              path + "/widthBits",
+                                              std::format(
+                                                  "arrangement '{}' must "
+                                                  "declare 'widthBits' — how "
+                                                  "wide the register IS when "
+                                                  "written this way (lanes x "
+                                                  "lane width)",
+                                                  suffix));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                auto const width =
+                                    a.at("widthBits").get<std::uint32_t>();
+                                if (std::find(kArrWidths.begin(),
+                                              kArrWidths.end(), width)
+                                    == kArrWidths.end()) {
+                                    std::string allowed;
+                                    for (std::uint32_t const w : kArrWidths) {
+                                        if (!allowed.empty()) allowed += " | ";
+                                        allowed += std::to_string(w);
+                                    }
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        path + "/widthBits",
+                                        std::format(
+                                            "arrangement '{}' declares "
+                                            "'widthBits' {}, which is not one "
+                                            "of the operation widths LIR can "
+                                            "state ({}) — a width outside the "
+                                            "set carries no instruction flag "
+                                            "and would be read back as the "
+                                            "register's own",
+                                            suffix, width, allowed));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                // ── laneBits ── REQUIRED. See the block above.
+                                if (!a.contains("laneBits")
+                                    || !a.at("laneBits").is_number_unsigned()
+                                    || a.at("laneBits").get<std::uint32_t>()
+                                           == 0) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              path + "/laneBits",
+                                              std::format(
+                                                  "arrangement '{}' must "
+                                                  "declare a non-zero "
+                                                  "'laneBits' — the width of "
+                                                  "ONE lane. Without it '{}' is "
+                                                  "indistinguishable from every "
+                                                  "other arrangement of the "
+                                                  "same total width, AND from a "
+                                                  "scalar spelling of the same "
+                                                  "register, so an instruction "
+                                                  "declared for one lane shape "
+                                                  "is reachable from all of "
+                                                  "them",
+                                                  suffix, suffix));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                auto const laneBits =
+                                    a.at("laneBits").get<std::uint32_t>();
+                                if (laneBits > width || width % laneBits != 0) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        path + "/laneBits",
+                                        std::format(
+                                            "arrangement '{}' declares "
+                                            "'widthBits' {} over 'laneBits' {}, "
+                                            "which is not a whole number of "
+                                            "lanes — a view of a register is "
+                                            "N lanes of L bits and {} / {} is "
+                                            "not an integer, so the row "
+                                            "describes no operand shape the "
+                                            "machine has",
+                                            suffix, width, laneBits, width,
+                                            laneBits));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                if (!a.contains("registerClass")
+                                    || !a.at("registerClass").is_string()
+                                    || a.at("registerClass").get<std::string>()
+                                           .empty()) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              path + "/registerClass",
+                                              std::format(
+                                                  "arrangement '{}' must name "
+                                                  "the register class it views "
+                                                  "— lanes are a property of a "
+                                                  "vector FILE, so there is no "
+                                                  "unscoped arrangement the "
+                                                  "way there is an unscoped "
+                                                  "width-view letter",
+                                                  suffix));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                auto regClass =
+                                    a.at("registerClass").get<std::string>();
+                                auto const cls =
+                                    targetRegClassFromName(regClass);
+                                if (!cls.has_value()
+                                    || !isOperableTargetRegClass(*cls)) {
+                                    std::string allowed;
+                                    for (auto const n
+                                         : kOperableTargetRegClassNames) {
+                                        if (!allowed.empty()) allowed += " | ";
+                                        allowed += n;
+                                    }
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        path + "/registerClass",
+                                        std::format(
+                                            "arrangement '{}' names register "
+                                            "class '{}', which is not an "
+                                            "operable class of the envelope "
+                                            "({})",
+                                            suffix, regClass, allowed));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                bool duplicate = false;
+                                for (auto const& prev :
+                                     cfg.registerArrangements) {
+                                    if (prev.suffix != suffix) continue;
+                                    duplicate = true;
+                                    coll.emit(
+                                        DiagnosticCode::C_ConflictingField,
+                                        path + "/suffix",
+                                        std::format(
+                                            "arrangement '{}' is declared "
+                                            "twice ({} bits and {} bits) — one "
+                                            "spelling cannot name two widths, "
+                                            "and which one answered would be "
+                                            "decided by table order",
+                                            suffix, prev.widthBits, width));
+                                    assemblyClean = false;
+                                    break;
+                                }
+                                if (duplicate) continue;
+                                cfg.registerArrangements.push_back(
+                                    AssemblyConfig::AsmRegisterArrangement{
+                                        std::move(suffix), width, laneBits,
+                                        std::move(regClass)});
+                            }
                         }
                     }
 
@@ -17553,9 +17806,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         assemblyClean = false;
                         continue;
                     }
-                    static constexpr std::array<std::string_view, 6>
+                    static constexpr std::array<std::string_view, 7>
                         kInstRowKeys{"spelling", "opcodes", "width",
-                                     "destWidth", "cond",
+                                     "destWidth", "destWidthFromOperands",
+                                     "cond",
                                      "operandSelectors"};
                     DSS_CHECK_KEY_VOCABULARY(kInstRowKeys);
                     // ★ NAME THE RENAME. `opcode` (a single string) was this
@@ -17729,6 +17983,45 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                         ins.destWidth = row.at("destWidth").get<std::uint32_t>();
+                    }
+                    // ── destWidthFromOperands ── OPTIONAL; "this spelling has
+                    // TWO widths and the REGISTERS state both". Anchor:
+                    // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME.
+                    // ★★ REFUSED BESIDE `width` OR `destWidth` — each of those
+                    // STATES a number this key says the operands state, and a
+                    // fact with two owners is how the two go out of sync. It is
+                    // the same exclusivity `width`-absent already has with a
+                    // stated `width`, made explicit because here BOTH ends are
+                    // derived and a half-stated row would look reasonable.
+                    if (row.contains("destWidthFromOperands")) {
+                        if (!row.at("destWidthFromOperands").is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/destWidthFromOperands",
+                                      "'destWidthFromOperands' must be a "
+                                      "boolean — it says the REGISTERS state "
+                                      "both of this spelling's widths, which a "
+                                      "conversion mnemonic needs because one "
+                                      "spelling covers N width pairs");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        ins.destWidthFromOperands =
+                            row.at("destWidthFromOperands").get<bool>();
+                        if (ins.destWidthFromOperands
+                            && (ins.width.has_value()
+                                || ins.destWidth.has_value())) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      path + "/destWidthFromOperands",
+                                      "'destWidthFromOperands' says the "
+                                      "operands state both of this spelling's "
+                                      "widths, so it cannot appear beside "
+                                      "'width' or 'destWidth', which STATE "
+                                      "them — one fact, two owners, and "
+                                      "nothing would report the day they "
+                                      "disagreed");
+                            assemblyClean = false;
+                            continue;
+                        }
                     }
                     // ── operandSelectors ── OPTIONAL; the written operands that
                     // are part of the MNEMONIC rather than operands of it.

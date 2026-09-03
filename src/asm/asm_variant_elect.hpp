@@ -76,6 +76,17 @@ enum class ElectionRejection : std::uint8_t {
     UnknownToTarget,    // the target declares no opcode by that name
     NoEncodingDeclared, // declared, but `encoding.shape == None`
     NoMatchingVariant,  // declared + encodable, but no variant takes this shape
+    // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME: the
+    // shape and the width fit, but a register the line names lives in a bank
+    // this opcode's field does not draw from, or the destination it writes is
+    // a different width than this variant writes.
+    // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]] added the LANE
+    // half to the same verdict rather than a fourth enumerator, because it is
+    // the same sentence about the same fields: a lane arrangement is part of
+    // how a field reads its register, exactly as its bank and its width are,
+    // and splitting it out would ask a reader to know which of three things a
+    // "profile" meant before they could read the message.
+    WrongRegisterProfile,
 };
 
 struct ElectionRejectionRow {
@@ -93,8 +104,171 @@ electionRejectionText(ElectionRejection why) noexcept {
     case ElectionRejection::NoMatchingVariant:
         return "no encoding variant of it accepts this operand shape at this "
                "width";
+    case ElectionRejection::WrongRegisterProfile:
+        return "its encoding variant takes this operand shape at this width, "
+               "but reads its registers differently than they were written — "
+               "another bank, another destination width, or a lane "
+               "arrangement where a scalar was written (or the reverse)";
     }
     return "unclassified";
+}
+
+// ★★★ THE DESTINATION AN ASSEMBLY LINE WROTE, AS THE DIALECT READ IT.
+// D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME.
+//
+// Two facts, and neither of them is in `instOps`: a producer's destination is
+// the LIR instruction's RESULT, which is not an operand. `LirRegClass::None`
+// and width 0 both mean "the caller states none" — the shape every non-producer
+// arm passes and every pre-existing caller behaved as.
+struct ElectedDestination {
+    LirRegClass  regClass  = LirRegClass::None;
+    std::uint8_t widthBits = 0;
+    // ★ THE LANE ARRANGEMENT THE DESTINATION WAS **WRITTEN** WITH, in bits per
+    // lane — 0 when it was written with none.
+    // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]].
+    //
+    // ⚠ UNLIKE `regClass` AND `widthBits` ABOVE, 0 IS A CLAIM AND NOT AN
+    // ABSTENTION, and the asymmetry is the point rather than an oversight: a
+    // spelling either carried an arrangement suffix or it did not, so there is
+    // no state in which the caller "does not know". Reading 0 as "skip the
+    // comparison" would restore exactly the leak this axis closes — ✔MEASURED
+    // at the P54 base, `cnt d0, d1` compiled and emitted `cnt v0.8b, v1.8b`.
+    std::uint8_t laneBits  = 0;
+};
+
+// ★★★ THE OPERANDS AN ELECTION IS ASKED ABOUT, AND THE LANE ARRANGEMENT EACH
+// WAS **WRITTEN** WITH. [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]].
+//
+// ★★ WHY THE LANE FACT RIDES BESIDE THE OPERANDS RATHER THAN ON THEM. A
+// `LirOperand` is what the ENCODER re-selects from post-regalloc, and a LIR
+// instruction carries no lane shape — the same argument `destWidth`'s comment
+// makes about a second width. Widening the LIR operand would put a fact in the
+// hot type that only the text tier can produce and only the text tier reads,
+// and the encoder's re-selection would still have nothing to read it from. So
+// the lane widths travel as a side-channel to exactly the one tier that knows
+// what the programmer wrote, and the election's answer is carried in the
+// OPCODE, which the encoder does read.
+//
+// ⚠ AN EMPTY `laneBits` MEANS "EVERY OPERAND WAS WRITTEN WITHOUT AN
+// ARRANGEMENT" — the state every caller that cannot spell one is in, and the
+// STRICT reading rather than a permissive one. A short array reads 0 past its
+// end for the same reason: 0 eliminates a lane-declaring candidate, so a
+// truncation fails toward a loud refusal and never toward a wrong instruction.
+struct ElectedOperands {
+    std::span<LirOperand const>   ops;
+    std::span<std::uint8_t const> laneBits;
+
+    [[nodiscard]] std::uint8_t laneOf(std::size_t i) const noexcept {
+        return i < laneBits.size() ? laneBits[i] : std::uint8_t{0};
+    }
+};
+
+// ★★★ THE REGISTER-PROFILE AXIS — the one this anchor is named for, and the
+// only election axis whose vocabulary was ALREADY DECLARED before it existed.
+//
+// ✔MEASURED 2026-09-02 (cycle P54): `electOpcode` keyed on operand SHAPE and
+// WIDTH only. Three arm64 opcodes — `fmov`, `movq_xmm_to_gpr`,
+// `movq_gpr_to_xmm` — all take `[reg]` at width 64 and differ ONLY in which
+// bank each end lives in, so a dialect row naming all three was refused as
+// AMBIGUOUS and a row naming one left `fmov x0, d1` electing the diagonal.
+// `load_u`/`fldr_u` are the same statement about memory: identical operand
+// shapes at identical widths, differing only in the DATA register's class.
+//
+// ★★ THE AXIS IS THE TARGET'S OWN, NOT A NEW KEY. `encoding.registerClass`,
+// `wires[].regClass` and `resultRegClass` have declared exactly this since
+// D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD; `encodingWireRegClass` and
+// `encodingResultRegClass` are the target's own resolvers. Election simply
+// stopped ignoring them. ⇒ no `if (arch ==)` anywhere, and any target that
+// declares its banks gets the axis with no engine change.
+//
+// ★★ WHY IT LIVES HERE AND NOT IN `variantMatchesInst`. The class can never
+// separate two variants of ONE opcode: two variants with the same
+// `operandKinds` at the same width are refused by `validate()` regardless of
+// their banks, so a class-blind matcher and a class-aware one pick the SAME
+// variant within an opcode. Putting the axis in the shared matcher would
+// therefore change nothing about variant choice while REPLACING the encoder's
+// precise wrong-bank diagnostic (`hwEncodingOf`, which names both banks and
+// the ordinal) with a generic "no matching variant". So election uses it to
+// eliminate an OPCODE, and the encoder's gate stays the last word on a
+// wrong-bank operand — two checks that cannot drift, because the encoder's
+// re-selection is within the opcode election already fixed.
+//
+// ⚠ AN UNSTATED CLASS (`LirRegClass::None`) OR WIDTH (0) SKIPS ITS COMPARISON
+// RATHER THAN FAILING IT, and that is deliberate: it is exactly the state
+// every caller was in before this axis existed, so an operand carrying no
+// class tag elects precisely as it always did — and `hwEncodingOf` still
+// refuses it at encode time. Silence here is never the last word.
+//
+// ★★★ THE **LANE** AXIS SITS BESIDE THEM AND IS THE ONE ASYMMETRY IN THIS
+// FUNCTION. [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]].
+//
+// Class and width can be UNSTATED — a caller that never asked. A lane shape
+// cannot: an operand spelling either carried an arrangement suffix or it did
+// not, and both answers are facts. So this comparison is TOTAL, in both
+// directions, and it is the totality that closes the anchor:
+//
+//   * a field declared SCALAR refuses an operand written with an arrangement.
+//     ✔MEASURED at the P54 base, `fadd v0.8b, v1.8b, v2.8b` compiled and
+//     emitted `fadd d0, d1, d2` (0x1E622820) — a scalar double add for a
+//     byte-lane spelling, which both references reject. That direction was a
+//     silent WRONG ANSWER, not merely an over-acceptance.
+//   * a field declared LANES refuses an operand written without one.
+//     ✔MEASURED, `cnt d0, d1` compiled and emitted `cnt v0.8b, v1.8b`.
+//   * a field declared LANES **AT A WIDTH** refuses another lane width, while
+//     a field declared LANES with no width takes any. ✔MEASURED, that split is
+//     the machine's own: clang 18.1.3 assembles `mov v0.8b/.4h/.2s/.1d` to the
+//     ONE word 0x0EA11C20 (the ORR alias is bitwise), while `addv h0, v1.4h` =
+//     0x0E71B820 and `addv b0, v1.8b` = 0x0E31B820 are two instructions.
+//
+// AGNOSTIC by the same construction the class axis has: the numbers come from
+// the target's own wires and the dialect's own arrangement table, and nothing
+// here knows what a byte lane is.
+[[nodiscard]] inline bool
+variantAcceptsRegisterProfile(TargetEncodingInfo const&    enc,
+                              TargetEncodingVariant const& v,
+                              ElectedOperands const&       instOps,
+                              ElectedDestination const&    dest) noexcept {
+    for (auto const& w : v.wires) {
+        if (w.index >= instOps.ops.size()) continue;
+        auto const& op = instOps.ops[w.index];
+        if (op.kind != LirOperandKind::Reg) continue;
+        auto const written = instOps.laneOf(w.index);
+        if (w.lanes != (written != 0)) return false;
+        if (w.lanes && w.laneBits != 0 && w.laneBits != written) return false;
+        auto const wants = encodingWireRegClass(enc, w);
+        if (!wants.has_value()) continue;
+        auto const has = static_cast<TargetRegClass>(op.reg.regClass());
+        if (has == TargetRegClass::None) continue;
+        if (has != *wants) return false;
+    }
+    if (!v.resultSlot.has_value()) return true;
+    if (dest.regClass != LirRegClass::None) {
+        auto const wants = encodingResultRegClass(enc, v);
+        if (wants.has_value()
+            && static_cast<TargetRegClass>(dest.regClass) != *wants) {
+            return false;
+        }
+    }
+    // The WIDTH half of the same fact. Both sides must have stated it: an
+    // undeclared `destWidth` is "as wide as the operation", which the width
+    // axis already decided.
+    if (v.destWidthBits != 0 && dest.widthBits != 0
+        && v.destWidthBits != dest.widthBits) {
+        return false;
+    }
+    // ⚠ THE LANE HALF IS ASKED ONLY OF A DESTINATION THAT IS A REGISTER, which
+    // `regClass == None` is the caller's statement of (a memory destination and
+    // a non-producer both pass the default `ElectedDestination`). Asking it of
+    // a `store`'s absent result would refuse every lane-declaring variant on a
+    // shape that has no result field at all.
+    if (dest.regClass != LirRegClass::None) {
+        if (v.destLanes != (dest.laneBits != 0)) return false;
+        if (v.destLanes && v.destLaneBits != 0
+            && v.destLaneBits != dest.laneBits) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // ★ ELECT ONE OPCODE FROM A CANDIDATE SET, BY ASKING THE TARGET.
@@ -115,9 +289,10 @@ electionRejectionText(ElectionRejection why) noexcept {
 [[nodiscard]] inline std::optional<ElectedOpcode>
 electOpcode(TargetSchema const&               target,
             std::span<std::string const>      candidateNames,
-            std::span<LirOperand const>       instOps,
+            ElectedOperands const&            instOps,
             std::uint8_t                      instWidthBits,
             bool                              memoryIsDestination,
+            ElectedDestination const&         destination,
             std::vector<ElectionRejectionRow>* rejections,
             std::string*                       ambiguousWith) {
     std::optional<ElectedOpcode> winner;
@@ -139,12 +314,26 @@ electOpcode(TargetSchema const&               target,
             continue;
         }
         auto const* variant =
-            selectEncodingVariant(*info, instOps, instWidthBits,
+            selectEncodingVariant(*info, instOps.ops, instWidthBits,
                                   memoryIsDestination);
         if (variant == nullptr) {
             if (rejections != nullptr) {
                 rejections->push_back(
                     {name, ElectionRejection::NoMatchingVariant});
+            }
+            continue;
+        }
+        // ★ THE REGISTER-PROFILE AXIS ELIMINATES THE CANDIDATE, NEVER THE
+        // VARIANT. `selectEncodingVariant` above already made the ONE choice
+        // the encoder will re-make; asking the profile question about a
+        // DIFFERENT variant of this opcode would elect bytes the encoder then
+        // could not reach. If the variant this opcode offers cannot take these
+        // banks, the OPCODE is not what was written.
+        if (!variantAcceptsRegisterProfile(info->encoding, *variant, instOps,
+                                           destination)) {
+            if (rejections != nullptr) {
+                rejections->push_back(
+                    {name, ElectionRejection::WrongRegisterProfile});
             }
             continue;
         }
@@ -190,6 +379,43 @@ variantHonorsDeclaredWidth(TargetEncodingVariant const& elected,
         return true;
     }
     return declaredWidthBits == lirInstWidthBits(0);
+}
+
+// ★★★ THE DESTINATION-WIDTH HONESTY GATE — the sibling of the one above, and
+// the thing that makes a wrong-width election UNSAYABLE rather than merely
+// unlikely. D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME.
+//
+// The axis in `variantAcceptsRegisterProfile` eliminates a candidate that
+// DECLARES a `destWidth` and disagrees. That alone is not enough, because a
+// candidate that declares NOTHING is eliminated by nothing — which is exactly
+// the state every conversion opcode was in when a throwaway `fcvtzs` row
+// compiled `fcvtzs %w0, %s1` rc=0 and emitted `fcvtzs x16, s29` (0x9E3803B0),
+// the X form, ✔MEASURED. The programmer wrote a 32-bit destination and got a
+// 64-bit one with no diagnostic.
+//
+// So the gate is stated from the other side, over the substrate's own
+// vocabulary and with no per-target exception:
+//
+//   an instruction whose DESTINATION width differs from its OPERATION width
+//   is a two-width instruction, and the only variant that may encode it is one
+//   that SAYS which destination width it writes.
+//
+// ⇒ a one-width instruction (`destWidthBits == 0`, or equal to the operation
+// width) is unaffected — every pre-existing spelling on both shipped dialects.
+// A two-width instruction elected onto a silent variant is REFUSED, and a
+// target closes that by declaring the key. ⚠ Deliberately NOT symmetric with
+// `variantHonorsDeclaredWidth`, which asks whether the WIDTH reached the bytes:
+// there is no natural destination width to fall back to, so the question here
+// is whether the variant stated one at all.
+[[nodiscard]] inline bool
+variantHonorsDeclaredDestWidth(TargetEncodingVariant const& elected,
+                               std::uint8_t declaredDestWidthBits,
+                               std::uint8_t instWidthBits) noexcept {
+    if (declaredDestWidthBits == 0
+        || declaredDestWidthBits == instWidthBits) {
+        return true;
+    }
+    return elected.destWidthBits == declaredDestWidthBits;
 }
 
 } // namespace dss::asm_elect

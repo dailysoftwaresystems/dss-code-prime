@@ -349,7 +349,7 @@ def cmd_seed(root, lane, empty=False, force=False):
 
 # ──────────────────────────────────── fold ─────────────────────────────────────
 
-def classify(root, wt, seed):
+def classify(root, wt, seed, settled=()):
     """-> (mine, deleted, inherited, refusals). Pure measurement; writes nothing.
 
     ⚠⚠ `deleted` EXISTS BECAUSE A LANE'S DELETION USED TO VANISH AT THE FOLD.
@@ -367,6 +367,7 @@ def classify(root, wt, seed):
     the main tree's bytes must still match the seed (or the HEAD blob), or the fold
     REFUSES the whole batch rather than destroying work it cannot account for."""
     mine, deleted, inherited, refusals = [], [], [], []
+    settled_paths = []
     for rel in sorted(set(changed_paths(wt))):
         if is_lane_tree(rel):
             continue          # a nested lane tree is never this lane's contribution
@@ -398,6 +399,22 @@ def classify(root, wt, seed):
         if not inside(root, dest):
             refusals.append("escapes the repository: %s" % rel)
             continue
+        if rel in settled:
+            # ★★ DECLARED SETTLED BY HAND -- the ONE escape from an all-or-nothing
+            # refusal, and it exists because the refusal message PROMISED it and the
+            # tool did not provide it. ✔MEASURED 2026-09-02 (P54): the message says
+            # "merge the second lane's changes by hand, then re-run this fold: the
+            # remaining paths still land automatically". They cannot. The drift test
+            # compares the DESTINATION against the SEED, so a hand-merge makes the
+            # destination differ MORE, and re-running refuses identically -- twice in
+            # one cycle, on `.plans/` documents two lanes had both written.
+            # ⚠ IT IS NOT A --force. It drops ONE named path from this lane's change
+            # set so the OTHER paths can land; nothing about that path is written,
+            # and the caller is asserting they have already reconciled it themselves.
+            # Every settled path is REPORTED, because a silent skip is how a lane's
+            # work goes missing while the fold says it succeeded.
+            settled_paths.append(rel)
+            continue
         if rel in seed and md5_file(src) == seed[rel]:
             inherited.append(rel)
             continue
@@ -427,10 +444,10 @@ def classify(root, wt, seed):
                 refusals.append("untracked at HEAD yet present in the main tree: %s" % rel)
                 continue
         mine.append(rel)
-    return mine, deleted, inherited, refusals
+    return mine, deleted, inherited, refusals, settled_paths
 
 
-def cmd_fold(root, lane, apply_it):
+def cmd_fold(root, lane, apply_it, settled=()):
     wt = worktree_path(root, lane)
     mpath = manifest_path(root, lane)
     if not os.path.isdir(wt):
@@ -442,7 +459,7 @@ def cmd_fold(root, lane, apply_it):
             % (mpath, lane))
     seed = json.load(io.open(mpath, encoding="utf-8"))
 
-    mine, deleted, inherited, refusals = classify(root, wt, seed)
+    mine, deleted, inherited, refusals, settled_paths = classify(root, wt, seed, settled)
 
     if refusals:
         print("lane-fold: REFUSED -- nothing written. %d problem(s):" % len(refusals))
@@ -450,9 +467,22 @@ def cmd_fold(root, lane, apply_it):
             print("   " + r)
         print("  A DRIFT refusal is usually TWO LANES ON ONE FILE. Merge the second "
               "lane's declared changes into the main tree by hand, then re-run this "
-              "fold: the remaining paths still land automatically.")
+              "fold: then re-run naming each reconciled path\n"
+              "  `--settled <path>` (repeatable), which drops JUST those paths from "
+              "this lane's\n  change set so the rest can land. ⚠ A bare re-run will "
+              "refuse identically: the\n  drift test compares the DESTINATION against "
+              "the SEED, so merging by hand makes\n  the destination differ MORE, not "
+              "less. `--settled` is an assertion that YOU have\n  already reconciled "
+              "that path; it is not a --force, and nothing is written for it.")
         return 2
 
+    if settled_paths:
+        # Never silent: a skipped path is how a lane's work goes missing while the
+        # fold reports success.
+        print("lane-fold: %d path(s) DECLARED SETTLED BY HAND -- not written, not "
+              "compared:" % len(settled_paths))
+        for rel in settled_paths:
+            print("   %s" % rel)
     print("lane-fold: lane %s -- %d inherited path(s) skipped, %d path(s) are this "
           "lane's:" % (lane, len(inherited), len(mine)))
     for rel in mine:
@@ -584,7 +614,7 @@ def self_test():
         # (a) the lane leaves the seeded file alone and edits two of its own.
         write_atomic(os.path.join(wt, "tracked.txt"), "lane edit\n")
         write_atomic(os.path.join(wt, "a file - with spaces.md"), "lane edit\n")
-        mine, _del, inherited, refusals = classify(root, wt, seed)
+        mine, _del, inherited, refusals, _s = classify(root, wt, seed)
         pin(not refusals, "a clean fold refuses nothing", "refusals=%s" % refusals)
         pin(inherited == ["shared.json"],
             "(a) a seeded path the lane never touched is INHERITED, not folded back",
@@ -595,7 +625,7 @@ def self_test():
 
         # (b) the main tree drifts under the lane.
         write_atomic(os.path.join(root, "tracked.txt"), "someone else\n")
-        mine2, _del2, _inh2, refusals2 = classify(root, wt, seed)
+        mine2, _del2, _inh2, refusals2, _s2 = classify(root, wt, seed)
         pin(len(refusals2) == 1 and "DRIFTED from HEAD" in refusals2[0],
             "(b) a destination that drifted from HEAD is REFUSED", "got=%s" % refusals2)
         pin(cmd_fold(root, "x", apply_it=True) == 2,
@@ -609,10 +639,39 @@ def self_test():
         # the seeded document drifts too -- the two-lanes-on-one-file case.
         write_atomic(os.path.join(wt, "shared.json"), '{"from":"lane-two"}\n')
         write_atomic(os.path.join(root, "shared.json"), '{"from":"folded-one"}\n')
-        _m3, _d3, _i3, refusals3 = classify(root, wt, seed)
+        _m3, _d3, _i3, refusals3, _s3 = classify(root, wt, seed)
         pin(any("DRIFTED since seeding" in r and "shared.json" in r for r in refusals3),
             "two lanes on ONE shared document REFUSES rather than reverting the first",
             "got=%s" % refusals3)
+
+        # ── `--settled`, and the arm ORDER is the argument for it ──────────────────
+        # (k) The refusal above used to end the story: the message told the caller to
+        # merge by hand and re-run, and a bare re-run REFUSES IDENTICALLY because the
+        # drift test compares the DESTINATION to the SEED -- a hand-merge moves the
+        # destination FURTHER from the seed, never back. ✔MEASURED 2026-09-02 (P54),
+        # twice in one cycle. So the promised remedy is pinned here as a real one.
+        _m4, _d4, _i4, refusals4, settled4 = classify(
+            root, wt, seed, settled=("shared.json",))
+        # ⚠ The assertion is "no refusal NAMES shared.json", not "no refusals at all":
+        # by this point the fixture carries an unrelated drift on `tracked.txt` from an
+        # earlier arm, and a blanket `not refusals4` would pass or fail on that instead
+        # of on the property under test.
+        pin(not any("shared.json" in r for r in refusals4) and settled4 == ["shared.json"],
+            "(k) --settled drops the reconciled path so the lane's OTHER work can land",
+            "refusals=%s settled=%s" % (refusals4, settled4))
+        pin(_m4 == ["a file - with spaces.md"],
+            "(k2) ...and the paths it did NOT name are still folded",
+            "got=%s" % _m4)
+        # (l) THE CONTROL, because a flag that silently skips is worse than a refusal:
+        # the settled path must NOT be written, and the destination must keep the
+        # content the hand-merge left there.
+        cmd_fold(root, "x", apply_it=True, settled=("shared.json",))
+        pin(io.open(os.path.join(root, "shared.json"), encoding="utf-8").read()
+            == '{"from":"folded-one"}\n',
+            "(l) a --settled path is NOT written -- the hand-merged content survives",
+            "got=%r" % io.open(os.path.join(root, "shared.json"),
+                               encoding="utf-8").read())
+        write_atomic(os.path.join(root, "shared.json"), '{"from":"folded-one"}\n')
 
         # (e) THE REFUSAL THAT PROTECTS A RUNNING LANE. By this point the lane has
         # edits of its own, so a second `seed` must refuse rather than overwrite
@@ -694,14 +753,14 @@ def self_test():
             subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "add todelete"],
                            capture_output=True, check=True)
         os.remove(os.path.join(wt, "todelete.txt"))
-        m_del, d_del, _i, r_del = classify(root, wt, {})
+        m_del, d_del, _i, r_del, _s4 = classify(root, wt, {})
         pin("todelete.txt" in d_del and "todelete.txt" not in m_del
             and not [x for x in r_del if "todelete.txt" in x],
             "(h) a path the lane DELETED is measured as a deletion, not dropped",
             "deleted=%s mine=%s refusals=%s" % (d_del, m_del, r_del))
 
         write_atomic(os.path.join(root, "todelete.txt"), "someone else edited this\n")
-        _m, d_drift, _i2, r_drift = classify(root, wt, {})
+        _m, d_drift, _i2, r_drift, _s5 = classify(root, wt, {})
         pin("todelete.txt" not in d_drift
             and any("refusing to DELETE" in x and "todelete.txt" in x for x in r_drift),
             "(h) a deletion whose destination DRIFTED is REFUSED, not carried out",
@@ -804,7 +863,23 @@ def main(argv):
     if verb == "seed":
         return cmd_seed(root, lane, empty="--empty" in rest,
                         force="--force" in rest)
-    return cmd_fold(root, lane, apply_it="--apply" in rest)
+    # `--settled <path>` is repeatable; see `classify` for why it exists and for the
+    # measurement that the refusal message previously promised something impossible.
+    settled, j = [], 0
+    while j < len(rest):
+        if rest[j] == "--settled":
+            if j + 1 >= len(rest):
+                die("--settled needs a repo-relative path.", 3)
+            settled.append(rest[j + 1].replace(os.sep, "/"))
+            j += 2
+            continue
+        if rest[j].startswith("--settled="):
+            value = rest[j][len("--settled="):]
+            if not value:
+                die("--settled needs a repo-relative path.", 3)
+            settled.append(value.replace(os.sep, "/"))
+        j += 1
+    return cmd_fold(root, lane, apply_it="--apply" in rest, settled=tuple(settled))
 
 
 if __name__ == "__main__":

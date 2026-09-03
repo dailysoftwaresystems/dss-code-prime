@@ -759,8 +759,11 @@ allShippedSourcesForFormat(std::filesystem::path const& descriptorDir,
 //       declared entry and therefore free — that is its load-bearing home, because
 //       it is the refusal that can otherwise produce a build silently missing a
 //       body. It is repeated here so the sweep is a TOTAL statement about the tree.
-//   R2  a source file NO descriptor names ⇒ refusal (inert config: nothing can
-//       ever add it to a build graph). ⚠ GATE-TEST ONLY, and that is a deliberate
+//   R2  a source file NO DECLARER names ⇒ refusal (inert config: nothing can
+//       ever add it to a build graph). ⚠ "declarer" and not "descriptor" since
+//       D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64 gave a format's role table the same
+//       power; the rule did not change, the set of declarer KINDS did.
+//       ⚠ GATE-TEST ONLY, and that is a deliberate
 //       departure from the ruling's "LOAD ERROR" wording, stated rather than left
 //       to look like verbatim compliance: without the deleted manifest this costs
 //       a directory walk PLUS a corpus scan on EVERY compile, and an inert `.c`
@@ -786,10 +789,45 @@ allShippedSourcesForFormat(std::filesystem::path const& descriptorDir,
 // outright rather than scanned. (⚠⚠ Not closed by filtering to `.c`: that
 // would make this silently ignore a stray `.txt`/`.o` in the AUTHORED tree, which
 // is exactly the inert-config case R2 exists to catch. The subject was the bug.)
+//
+// ★★ `foreignDeclarations` IS THE SECOND DECLARER, AND IT IS PASSED RATHER
+// THAN DERIVED FOR A LAYERING REASON, NOT A CONVENIENCE ONE
+// (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64). A shipped-lib descriptor is no longer
+// the only document that can name a file in this tree: an object format's
+// `runtimeLibraries[].source` names one too, for a role whose entries the
+// COMPILER MINTS and which therefore has no descriptor row to hang off. Reading
+// `.format.json` here would put the object-format schema inside `ffi`, so the
+// caller hands over the sources it found. ⚠ A CALLER THAT READS THE KEY ITSELF
+// RATHER THAN LOADING THE FORMAT BECOMES A SECOND READER OF A CONFIG KEY, which
+// is how a sweep and a loader come to disagree about what a document says — so
+// `tests/link/test_runtime_library_roles.cpp` pins the two against each other:
+// every `source` the raw key spells is exactly what `ObjectFormatSchema`'s own
+// `realizedSources()` reports, per shipped flavour.
+//
+// ★ IT CARRIES A LOCATOR, NOT JUST A PATH, AND THAT IS A FAIL-LOUD REQUIREMENT
+// RATHER THAN A NICETY (P54 lane `ar`). The first cut passed bare strings and
+// synthesized the subject inside R1, which rendered
+// `shipped-lib descriptor 'an object format's runtimeLibraries[].source.(object
+// format)' declares … the object format '(object format)' would be left …` —
+// a placeholder printed as data, naming neither the document nor the role, and
+// calling a format document a descriptor. The caller is the only tier that KNOWS
+// which document and which row it read, so the locator travels with the claim.
+struct DSS_EXPORT ShippedSourceDeclaration {
+    // A COMPLETE subject phrase for a diagnostic, naming the document and the
+    // row — e.g. "object format 'pe64-x86_64-windows-exec'
+    // runtimeLibraries[atomicsRuntime]".
+    std::string declarer;
+    // Config-root-relative, the same spelling a descriptor's
+    // `realization.<format>.source` takes.
+    std::string source;
+};
+
 [[nodiscard]] DSS_EXPORT bool
-validateShippedSourceTree(std::filesystem::path const& descriptorDir,
-                          std::filesystem::path const& runtimeRootDir,
-                          DiagnosticReporter&          reporter);
+validateShippedSourceTree(
+    std::filesystem::path const&              descriptorDir,
+    std::filesystem::path const&              runtimeRootDir,
+    std::span<ShippedSourceDeclaration const> foreignDeclarations,
+    DiagnosticReporter&                       reporter);
 
 // Every NAME the descriptor at `path` contributes on object format `fmt` — the
 // ONE surface-presence oracle, shared by the corpus invariants and by the

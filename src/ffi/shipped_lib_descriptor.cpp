@@ -393,10 +393,33 @@ template <typename Names>
     };
     if (eqi(s, "inf") || eqi(s, "+inf")) return std::numeric_limits<double>::infinity();
     if (eqi(s, "-inf")) return -std::numeric_limits<double>::infinity();
-    // A finite float literal. ns=nullptr → plain decimal / hex-float (strtod);
-    // `ok` is false on a partial parse OR an ERANGE overflow (overflow → infinity
-    // is rejected here — an infinity must be spelled "inf", never reached by an
-    // out-of-range finite literal).
+    // A finite float literal. ns=nullptr → plain decimal / hex-float (strtod).
+    // ⚠ THIS COMMENT SAID `ok` is false on a partial parse OR AN ERANGE OVERFLOW.
+    // The overflow half went false in P54: under
+    // D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY an
+    // overflowing literal now DECODES, with `ok` true, to the correctly-rounded
+    // signed infinity. ★ THE BEHAVIOUR HERE IS UNCHANGED AND STILL CORRECT, but it
+    // is now enforced by a DIFFERENT term of the same condition: `std::isinf(d)`
+    // below, not `!ok`. The rule it enforces is unmoved — in a DESCRIPTOR an
+    // infinity must be spelled "inf" (handled above) and must never be reached by
+    // an out-of-range finite literal, because a descriptor constant has no source
+    // location to diagnose and a silently-infinite bound is unreviewable.
+    //
+    // ★★ AND THAT LAST CLAUSE IS NOW LOAD-BEARING IN A SECOND WAY. P54 lane `fw`
+    // added the source WARNING the sibling row had left unraised —
+    // `S_FloatLiteralOverflowsToInfinity`, raised when a float literal's
+    // correctly-rounded value is an infinity. THIS CALL SITE MUST NEVER RAISE IT,
+    // and cannot, STRUCTURALLY rather than by remembering not to: the diagnostic
+    // is emitted by the SEMANTIC tier from `tree.span(node)` on a CST literal
+    // token, and this function has no Tree, no NodeId and no SourceSpan — its
+    // input is a JSON string from a shipped descriptor, whose "location" is the
+    // JSON pointer text (`…floatConstants[3]`) its caller renders. `decodeFloat`
+    // itself stays a PURE function that raises nothing, so there is no path by
+    // which a descriptor could point a user at a line of their source. What the
+    // descriptor reader does with the same FACT is its own, stricter verdict:
+    // where a source literal gets a warning and its infinity, a descriptor
+    // constant gets a REFUSAL, because a shipped bound is not a program the user
+    // wrote and can fix — it is data they must be able to review.
     bool ok = false;
     double const d = decodeFloat(s, /*ns=*/nullptr, ok);
     if (!ok || std::isinf(d) || std::isnan(d)) return std::nullopt;
@@ -1279,9 +1302,13 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
         // logical name, applied to a path: a `..` component or an absolute/rooted
         // spelling would let a descriptor reach an arbitrary file on the host, so
         // both are refused HERE rather than at the filesystem.
-        bool escapes = src.empty();
-        {
-            std::filesystem::path const asPath{src};
+        // ★★ THE PREDICATE MOVED TO `core::shippedConfigRelativePathEscapes`
+        // (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64) when an object format document's
+        // `runtimeLibraries[].source` became a second declarer of a path into
+        // the SAME tree. The reasoning below is PRESERVED here because it is the
+        // measurement that produced the predicate, and the header carries the
+        // rule; what changed is that there is now exactly one implementation.
+        bool const escapes = shippedConfigRelativePathEscapes(src);
             // ★★★ `isRootedPath`, NOT `is_absolute() || has_root_name()` —
             // [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]].
             // This is a CONTAINMENT check, and the pair it used to ask left a
@@ -1300,12 +1327,6 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
             // a plain `/abs/x` on this host, which also answers `is_absolute()`
             // FALSE with no root name. `isRootedPath` closes both, and it is the
             // ONE predicate the rest of the compiler already asks.
-            if (isRootedPath(asPath)
-                || src.find('\\') != std::string::npos)
-                escapes = true;
-            for (auto const& seg : asPath)
-                if (seg == ".." || seg == ".") escapes = true;
-        }
         if (escapes) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
                 + "." + kv.key() + ".source' must be a non-empty path RELATIVE to "
@@ -4427,13 +4448,23 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
 
 namespace {
 
-// One descriptor claim: which (format, config-root-relative source path) pair a
-// `realization` entry names, plus a human locator for the diagnostic
-// ("dirent.json symbols[0] realization").
+// One claim on a file in the shipped runtime tree: the config-root-relative
+// source path, plus a human locator for the diagnostic.
+//
+// ⚠ `format` IS EMPTY FOR A DECLARER THAT IS NOT FORMAT-KEYED, and R1 reads that
+// emptiness rather than a sentinel. A descriptor's `realization` map is keyed BY
+// object format, so a broken entry there can name the format left without a
+// body; an object format's own `runtimeLibraries[].source` row IS that format,
+// so there is no second name to quote and quoting one produced the sentence
+// `the object format '(object format)' would be left with…`. Naming the empty
+// case is what makes the two readings distinguishable instead of one of them
+// rendering a placeholder as data.
 struct ShippedSourceClaim {
-    std::string format;
+    std::string format;   // the object-format family key, or EMPTY (see above)
     std::string source;
-    std::string where;
+    std::string where;    // a COMPLETE subject phrase — "shipped-lib descriptor
+                          // 'dirent.json (root) realization'", "object format
+                          // 'pe64-…' runtimeLibraries[atomicsRuntime]"
 };
 
 // EVERY shipped-source claim any descriptor under `descriptorDir` makes, on ANY
@@ -4465,7 +4496,7 @@ claimedShippedSources(std::filesystem::path const& descriptorDir,
                 if (!kv.value().at("source").is_string()) continue;
                 claims.push_back(ShippedSourceClaim{
                     kv.key(), kv.value().at("source").get<std::string>(),
-                    where + " " + ctx});
+                    "shipped-lib descriptor '" + where + " " + ctx + "'"});
             }
         };
         if (docPtr->contains("realization"))
@@ -4626,11 +4657,24 @@ allShippedSourcesForFormat(std::filesystem::path const& descriptorDir,
     return out;
 }
 
-bool validateShippedSourceTree(std::filesystem::path const& descriptorDir,
-                               std::filesystem::path const& runtimeRootDir,
-                               DiagnosticReporter&          reporter) {
+bool validateShippedSourceTree(
+    std::filesystem::path const&                 descriptorDir,
+    std::filesystem::path const&                 runtimeRootDir,
+    std::span<ShippedSourceDeclaration const>    foreignDeclarations,
+    DiagnosticReporter&                          reporter) {
     std::size_t const errBefore = reporter.errorCount();
-    auto const        claims    = claimedShippedSources(descriptorDir, reporter);
+    auto              claims    = claimedShippedSources(descriptorDir, reporter);
+    // D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64: an object format's
+    // `runtimeLibraries[].source` is a SECOND kind of declarer, and R1/R2 must
+    // see it or the sweep would refuse a file the format legitimately names.
+    // Folding it into the same claim list rather than testing it separately is
+    // deliberate: both rules then read ONE list, so neither can learn about a
+    // declarer the other has not.
+    for (auto const& d : foreignDeclarations) {
+        claims.push_back(ShippedSourceClaim{
+            /*format=*/std::string{}, /*source=*/d.source,
+            /*where=*/d.declarer});
+    }
 
     // R1 lives at DESCRIPTOR READ TIME (`readShippedLibDescriptor`), where it is a
     // single `is_regular_file` per declared entry and therefore free. It is
@@ -4643,23 +4687,43 @@ bool validateShippedSourceTree(std::filesystem::path const& descriptorDir,
             claimedPaths.insert(core::PathIdentity::of(look.path));
             continue;
         }
+        // ⚠ THE SUBJECT IS THE CLAIM'S OWN, AND THE CONSEQUENCE CLAUSE IS
+        // CHOSEN BY WHETHER THE DECLARER IS FORMAT-KEYED. Composing
+        // `"shipped-lib descriptor '" + where + "." + format + "'"` for EVERY
+        // claim rendered an object-format row as
+        // `shipped-lib descriptor 'an object format's runtimeLibraries[].
+        // source.(object format)'` and then `the object format '(object
+        // format)' would be left…` — a placeholder printed as data, on a
+        // fail-loud path, calling a format document a descriptor.
         emitMalformed(reporter,
-            "shipped-lib descriptor '" + c.where + "." + c.format
-            + "' declares a shipped-source realization naming '" + c.source
-            + "', but " + describeShippedSourceLookup(look, c.source)
-            + " — the object format '" + c.format
-            + "' would be left with a DECLARED symbol and no body "
-              "(D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R1)");
+            c.where + " declares a shipped-source realization naming '"
+            + c.source + "', but " + describeShippedSourceLookup(look, c.source)
+            + (c.format.empty()
+                   ? " — the runtime role it fills would be left DECLARED with "
+                     "no body"
+                   : " — the object format '" + c.format
+                         + "' would be left with a DECLARED symbol and no body")
+            + " (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R1)");
     }
 
     // ★★ R2 + R4 ARE ONE RULE, AND FOLDING THEM IS STRICTLY STRONGER THAN
     // KEEPING THEM APART: **every regular file under the runtime tree must be
-    // named by some descriptor's `realization` map.**
+    // named by a DECLARER.**
     //
-    // R2 (a source file no descriptor names) is that rule read forwards: nothing
-    // can ever add such a file to a build graph, because the ONLY thing that adds
-    // one is a descriptor naming it. Inert config, and the direction R1
-    // structurally cannot see.
+    // ⚠ THAT SENTENCE USED TO READ "…named by some descriptor's `realization`
+    // map", AND D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64 FALSIFIED IT WITHOUT
+    // CHANGING IT. An object format's `runtimeLibraries[].source` is a second
+    // declarer — `runtime/platform/src/atomic.c` is named by four `.format.json`
+    // documents and by NO descriptor (✔MEASURED over the shipped corpus) — so
+    // the rule as written was false of a file this very function accepts, and
+    // the acceptance came from the `foreignDeclarations` span rather than from
+    // the rule. The rule is restated over DECLARERS; the set of declarer KINDS
+    // is what grew, and it is enumerated in one place (`claims`, above).
+    //
+    // R2 (a source file no declarer names) is that rule read forwards: nothing
+    // can ever add such a file to a build graph, because the ONLY things that add
+    // one are a descriptor's `realization` map and a format's role table. Inert
+    // config, and the direction R1 structurally cannot see.
     //
     // R4 (no headers in this tree) is that SAME rule read backwards, and it needed
     // no extension vocabulary at all. The layout mirrors the include namespace, so
@@ -4720,11 +4784,12 @@ bool validateShippedSourceTree(std::filesystem::path const& descriptorDir,
             if (claimedPaths.contains(core::PathIdentity::of(p))) continue;
             emitMalformed(reporter,
                 "shipped-source tree: '" + core::genericSpelling(p)
-                + "' is named by NO "
-                "shipped-lib descriptor under '"
+                + "' is named by NO DECLARER — neither a 'realization' map of a "
+                  "shipped-lib descriptor under '"
                 + core::genericSpelling(descriptorDir)
-                + "' in a 'realization' map, so nothing can ever add it to a build "
-                  "graph. Only files a descriptor names may live under '"
+                + "' nor an object format's runtimeLibraries[].source — so "
+                  "nothing can ever add it to a build "
+                  "graph. Only files a declarer names may live under '"
                 + core::genericSpelling(authored)
                 + "' — in particular a HEADER here would sit at an INCLUDE PATH and "
                   "silently shadow the descriptor a unit exists to consume "

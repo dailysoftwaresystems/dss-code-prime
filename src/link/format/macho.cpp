@@ -181,6 +181,28 @@ constexpr std::uint16_t N_ALT_ENTRY = 0x0200;
 // flags. Setting MH_WEAK_DEFINES on an MH_OBJECT would state a fact about a
 // linked image that this file is not, and no reference encoder does it.
 constexpr std::uint16_t N_WEAK_DEF  = 0x0080;
+// N_WEAK_REF declares an UNDEFINED symbol to be a weak REFERENCE: the image may
+// be built and run with nothing defining it, in which case its address is 0.
+// It is the whole of Mach-O's weak-IMPORT machinery at the relocatable tier --
+// a different fact from N_WEAK_DEF above, on a different symbol (an N_UNDF one),
+// and the two are adjacent bits in the SAME field, which is exactly why they are
+// declared side by side here rather than one of them being introduced at its use
+// site. D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE.
+//
+// ⓘ 0x0040, and the value is not guessed: `<mach-o/nlist.h>` from the installed
+// MacOSX.sdk gives `#define N_WEAK_REF 0x0040 /* symbol is weak referenced */`
+// immediately above the N_WEAK_DEF line already quoted at that constant, and the
+// same header is what fixed 0x0080 there.
+// ✔MEASURED 2026-09-02, clang 18.1.3 `--target=arm64-apple-macos` on
+// `extern int ea __attribute__((weak)); int main(void){ if (&ea) return ea;
+// return 42; }`: `llvm-nm -m` reads `(undefined) weak external _ea`, where DSS
+// before this change read `(undefined) external _ea` with `Flags [ (0x0) ]`.
+constexpr std::uint16_t N_WEAK_REF  = 0x0040;
+static_assert(N_WEAK_REF != N_WEAK_DEF,
+              "N_WEAK_REF (0x0040) and N_WEAK_DEF (0x0080) are different "
+              "n_desc bits -- conflating them would publish a weak REFERENCE "
+              "as a weak DEFINITION of nothing, and an undefined symbol "
+              "carrying N_WEAK_DEF is not a shape any reference encoder emits");
 static_assert(N_WEAK_DEF != N_ALT_ENTRY,
               "N_WEAK_DEF (0x0080) and N_ALT_ENTRY (0x0200) are different "
               "n_desc bits -- conflating them would mark every weak "
@@ -1738,6 +1760,18 @@ encode(AssembledModule const&    module,
                    ? N_SECT
                    : static_cast<std::uint8_t>(N_SECT | N_EXT);
     };
+    // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE — the UNDEFINED twin of
+    // `definedNDesc`, reading the same `SymbolBinding` vocabulary from
+    // `ObjectSymbolNames::externBinding` that `definedNDesc` reads from
+    // `definedBinding`. It is a SEPARATE function and not a widened
+    // `definedNDesc` because the two answer different questions about different
+    // symbols and disagree on the bit: a weak DEFINITION takes N_WEAK_DEF on an
+    // N_SECT symbol, a weak REFERENCE takes N_WEAK_REF on an N_UNDF one. Folding
+    // them would make each caller responsible for remembering which side it is
+    // on, and the failure would be silent in both directions.
+    auto externNDesc = [&](SymbolBinding binding) -> std::uint16_t {
+        return binding == SymbolBinding::Weak ? N_WEAK_REF : std::uint16_t{0};
+    };
 
     // ── ALIAS ROWS — D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB ──
     //
@@ -1885,10 +1919,16 @@ encode(AssembledModule const&    module,
     for (auto const& e : externSyms) {
         std::string const symName = objNames.externName(e, "_sym_");
         std::uint32_t const nameOff = strtab.add(symName);
+        // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the n_desc half of
+        // this record now carries the import's REFERENCE binding, read through
+        // the `externName`/`externBinding` lockstep pair rather than hardcoded —
+        // the same name-and-binding coupling the DEFINED loops above use. Zero
+        // for every import that is not annotated, so an object with no weak
+        // import is byte-identical to the hardcoded 0 this replaces.
         appendNlist(nameOff,
                     static_cast<std::uint8_t>(N_UNDF | N_EXT),
                     /*n_sect=*/0,
-                    /*n_desc=*/0,
+                    externNDesc(objNames.externBinding(e)),
                     /*n_value=*/0);
     }
 

@@ -293,6 +293,17 @@ struct FloatLadderResult {
     // the l/L rule, which is what keeps `20.0L` distinct from `20.0` on an
     // f64 axis where BOTH are F64.
     std::string_view  vocabularyName{};
+    // D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY (P54 lane
+    // `fw`): the matched rule's SOURCE SPELLING — "double" / "float" /
+    // "long double" for c — carried out for the range diagnostic to name the
+    // type the way the programmer wrote it. `vocabularyName` cannot serve: it is
+    // deliberately EMPTY for `double` and `float` (they are the anonymous
+    // representatives of their cores), so a message built from it would say
+    // `too large for ''`. `DataModelTypeRef::name`'s own comment already calls
+    // itself "source spelling, for diagnostics"; this is the first diagnostic to
+    // need it. A `string_view` into the rule, whose lifetime is the
+    // SemanticConfig's — the same lifetime `vocabularyName` already assumes.
+    std::string_view  typeName{};
 };
 
 [[nodiscard]] inline FloatLadderResult
@@ -304,7 +315,7 @@ typeFloatLiteral(std::string_view rawText,
     auto const resolve = [&](FloatLiteralTypingRule const& r) -> FloatLadderResult {
         auto const k = r.type.resolveCore(dm, ldf);
         if (!k.has_value()) return {FloatLadderStatus::AxisUndeclared, TypeKind::Void};
-        return {FloatLadderStatus::Typed, *k, r.type.vocabularyName};
+        return {FloatLadderStatus::Typed, *k, r.type.vocabularyName, r.type.name};
     };
     std::string_view const suffix = matchFloatSuffix(rawText, ns);
     for (auto const& r : rules) {

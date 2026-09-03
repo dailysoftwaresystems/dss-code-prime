@@ -9,13 +9,194 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-02 — cycles **P14 … P53**. ⚠ P52 rewrote no handoff at all, so a reader
-who opened this file during P53 saw P51 described as current state; its entry in §5 was written
-retroactively by P53 and says so.
+**Last updated:** 2026-09-02 — cycles **P14 … P54**. ⚠ P52 rewrote no handoff at all, so a reader
+who opened this file during P53 saw P51 described as current state; that entry in §5 was written
+retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as
+history there.
 
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
+
+**State, ✔measured at the tip and not re-quoted:** branch `feature/c23-conformance-burndown-6`.
+⚠ **NO SHA IS PINNED HERE ON PURPOSE** — a handoff cannot name its own commit, since writing it
+moves HEAD, and the public-repo bot rebases and squashes besides. Re-derive with
+`git log --oneline -3`. `git worktree list` → **the repo only**.
+
+★★★ **P54 RAN NINETEEN LANES AND CLOSED TWENTY-THREE ROWS — SIX OF WHICH THE GATE CAN SEE.**
+✔`check-anchor-balance --base 30cfe32c` ⇒ **closed 6, opened 1, net −5** COUNTED; **23 closed and
+1 opened IN TRUTH** — nineteen PRODUCTION and four harness. Seventeen are invisible to an
+instrument that counts rows by NAME across the base and the tip: born closed, minted-and-closed, or
+reopened-and-re-closed inside the cycle. Registry OPEN **497 → 492**. Suite **1936 → 1967**;
+repository guards **23 → 24**.
+
+⚠ **THE COUNTED FIGURE IS NOT WRONG AND MUST NOT BE "FIXED".** It answers *did this cycle open more
+than it closed*, and −5 is the honest answer to that question. It is simply not the same question as
+*how much landed*. Report both, always.
+
+## ★★★ THE THROUGH-LINE: FOUR TIMES THE THING THAT WAS BROKEN WAS THE MEASUREMENT, NOT THE CODE
+
+P53's through-line was ten stale claims. P54's is one level up — **an instrument that reported
+correctly about the wrong thing**, four times, each caught only by measuring something else:
+
+1. **The registry writer could not tell a pre-escaped pipe from a real one.** 35 pipes across 14
+   rows had already rotted into a stray backslash — a C `||`, a shell `||`, `awk -F"|"`, a regex
+   alternation. ★ **Its round-trip self-test stayed GREEN through all of it**, because that pin
+   reads its cell through the same un-escaping helper the defect lives in. **When a pin and the
+   defect it guards share a helper, the pin is testing the helper, not the property.**
+2. **`anchors.py --self-test` was never registered as a ctest entry** — 26 arms, on the only
+   sanctioned door to all three registries, executing zero times in every gate on every leg. Found
+   only while adding arms for (1), which would themselves never have run.
+3. **The shared comment/string stripper read a C++14 digit separator as a quote.** Nine guards use
+   it. ⚠ The reported direction was "fails toward noisy"; ✔MEASURED it is **both** — the blanked
+   span is real code, so `if (n > 20'001) { abort(); }` reports CLEAN. An ODD separator count blanks
+   to end of file; an EVEN one re-pairs by accident.
+4. **`lane-fold`'s drift refusal prescribed a remedy the tool did not implement.** *"Merge by hand,
+   then re-run: the remaining paths still land automatically."* They cannot — the drift test compares
+   DESTINATION against SEED, so a hand-merge moves it FURTHER. Now `--settled <path>`.
+
+★ **And the same shape bit the ORCHESTRATOR three times, which is the part worth carrying:** a
+census regex written `r"(\\+)\|"` reached disk through a quoted heredoc as `(\+)\|` and reported
+ZERO over-escaped pipes over a registry holding 35 — **failing toward clean**; a `run-gate`
+invocation whose rc 127 was laundered into "success" by a pipe, twice, the second time destroying a
+worktree whose deletion was guarded by `&&`; and a builtin count taken from a lane's REPORT rather
+than the tree, which was wrong in both its number and its site count.
+
+## ★★★ OPERATOR RULINGS RECEIVED THIS CYCLE — all are now in the skill or a row
+
+1. **THE UNION IS OVER WHAT *WORKS*, NOT ONLY WHAT IS ACCEPTED.** *"our own readme says
+   `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` … the tiebreaker is not clang, is whether one of the
+   references make it work or not."* ⚠ I had written the skill section as *"clang breaks the tie"*
+   and was corrected the same day: **there is no privileged reference and no tiebreaker vertex.** A
+   quality split is NOT a meaning fork and must not be escalated as one.
+2. **NO INPUT-PROPORTIONAL RECURSION IN THE COMPILER.** *"big projects like sqlite will for sure
+   explode the stack."* Convert to an explicit HEAP work stack; the nesting limit survives as a
+   COUNTER that still fails loud. Not a tuned cap, and not a bigger stack.
+3. **`__VA_ARGS__`/`__VA_OPT__` — accept and HONOUR the definition** (gcc + mingw gcc + clang; MSVC
+   discards, and a silent discard is the class the bar refuses).
+4. **Overflowing float literals — ADD THE WARNING.** No reference is silent on it.
+5. **Implement the atomics runtime OURSELVES** rather than depending on mingw's `libatomic-1.dll`.
+6. **Declare the remaining arm64 vocabulary now**, under *production backend = MUST DO EVERYTHING*.
+7. **Remaining items from landed lanes ship in THIS commit** — *"already dispatched work that was
+   not finished"*.
+
+## §0.2 — What landed, by area
+
+**Atomics — the P0 arc, four lanes.** A packed `_Atomic` member's under-aligned access now routes
+identically on all five targets, and **the pe64 runtime is OURS**: `runtime/platform/src/atomic.c`
+beside `dirent.c`/`unistd.c`, so `libatomic-1.dll` is gone and a pe64 image imports `ucrtbase.dll`
+ALONE — one FEWER load-time dependency than before the cycle. x86-64 is lock-free with no lock
+table (a `lock`-prefixed RMW is atomic at any alignment); aarch64 deliberately unchanged, because
+every aarch64 atomic primitive faults unaligned and `libatomic.so.1` is that platform's own
+arbiter, so a private lock table would interoperate WORSE.
+★★ **The witness turns an inference into an execution:** a packed `_Atomic unsigned` at byte 62 of a
+64-byte arena straddles the cache line, and every stored value has all four bytes equal — so a mixed
+value can only come from a split access. **rc 42 shipped; rc 11 with a torn value observed when the
+target key is mutated back to gcc's inline pair, 3/3 deterministic.** ⚠ It reproduces on Windows
+pe64 x86_64, which is where it belongs — the mutated key is `x86_64.target.json`.
+⚠ **The ABI still has THREE copies with nothing binding them** (`atomic.c`'s definitions, the
+lowerer's argument sequence, the format's mangled names). Named in §0.3.
+
+**Weak extern imports — two P-rows and a P0.** `weak` on an extern import reached the HIR linkage
+map and stopped; the object marked the symbol STRONG. Now threaded to all three writers.
+✔MEASURED that the row's own *"PE has no direct equivalent, must FAIL LOUD"* was the author's
+INFERENCE and is false: clang for the `windows-gnu` triple emits `scl 105` + an absolute-0 default,
+links, and runs. Then a second defect: DSS emitted a pe64 object carrying a `REL32` against an
+ABSOLUTE target — **`link.exe` refused it (LNK2016) while mingw `ld` and `lld-link` silently
+truncated to `0x100000000`**. Both halves fixed; all three linkers now link and RUN 42.
+★ ELF is green for a MECHANICAL reason — a non-PIE base of `0x400000` puts absolute 0 inside rel32
+range where PE's `0x140000000` does not. *"Fix ELF too"* is NOT the next conclusion.
+
+**arm64 inline asm — three lanes, config-only.** Opcodes **87 → 127**, dialect rows **51 → 92**,
+coverage 29 → 53. Two new election axes (register class; destination width), a three-state lane
+axis, and every rounding mode given its OWN opcode — because binding `fcvtas`/`fcvtms`/`fcvtns`/
+`fcvtps` to the toward-zero one would **silently change a conversion's rounding mode**.
+⚠⚠ **Two silent WRONG ANSWERS were found here, not merely refusals:** `fcvtzs %w0,%s1` emitted the
+**X-form where both references give the W-form**; and `fadd v0.8b,v1.8b,v2.8b` compiled rc 0 and
+emitted **`fadd d0,d1,d2`** — a scalar double add for a byte-lane spelling, plus six siblings. The
+row's own headline said *"IT IS NOT A SILENT MISCOMPILE"*; that was false in the direction nobody
+had measured.
+
+**C front end.** Float comparisons fold in EVERY integer-constant-expression context (three decision
+points, not one); `(int)1.5` folds; binary64 subnormals decode; overflowing literals yield the
+correctly-rounded ±infinity **and now warn**; `__VA_ARGS__`/`__VA_OPT__` are accepted and honoured
+in every position the union accepts. ⚠ Two adjacent SILENT WRONG ANSWERS surfaced on the same axis:
+`0.1f` carried 53 significant bits instead of 24 so `0.1f != 0.1` folded FALSE, and `(_Bool)2` folded
+to **0**, so `int a[(_Bool)2+41]` built a 41-element array and exited 41 where all four references
+give 42.
+
+**The preprocessor stack overflow — a P0, and NOT a regression.** ✔MEASURED by restoring both files
+to the cycle base: the deep-nesting tests SEGFAULT identically there, and the base's deepest
+completed nest is also **252**. P54's +379 lines cost **zero** stack levels. The defect: macro
+argument pre-expansion spent a host call frame per nesting level while its own `>256` fail-loud
+backstop sat **four levels past the cliff** — **the thing those tests assert was unreachable on the
+thread they ran on**. Now an explicit heap work stack; the ceiling is unmoved and still loud (256
+accepted, 257+ refused with the same diagnostic), and the same walk reaches 400 on an ordinary
+thread. ★ Why the CLI never hit it: every CU is built on a large worker stack, so *a bigger stack*
+was the standing answer to this class — which is exactly what ruling (2) rejects.
+
+## §0.3 — What is OWED, stated so it is not mistaken for done
+
+1. ⚠ **The one OPEN row this cycle created: `D-TARGET-ARM64-FP16-CONVERSION-FORMS-UNDECLARED`**
+   (P3). fp16 CONVERSION forms are base ARMv8-A and both references assemble them, so DSS is BELOW
+   the union; bytes already measured. ✔The fp16 *arithmetic* forms are correctly undeclared —
+   both references reject them at default `-march`, so declaring them would put DSS ABOVE the union.
+2. **The atomics ABI has three copies and nothing binds them.** The route: declare both entries as
+   always-injected builtin DECLARATIONS in `c.lang.json` (within the union — gcc and clang have them
+   as builtins). ⚠ Unmeasured risk: a builtin may **shadow** rather than conflict with a definition,
+   making the bind decorative.
+3. **Every extern call in a pe64 `.obj`/`.lib` now goes `FF 15` through a `.refptr` COMDAT**,
+   including strong imports that never needed it. clang narrows this to WEAK only. The narrowing was
+   blocked on a fact only `src/program/compile_pipeline.cpp` could supply — **that lane has landed,
+   so the blocker is gone**. Costs most on the sqlite pe64 object leg.
+4. **Recursion census, ✔MEASURED and partly open.** plan-24 Stage 7 flattened the parser,
+   `cst_to_hir`, `hir_to_mir`, semantic and const-eval — **the preprocessor was simply not in that
+   sweep**. Still recursive: the parser's paren/postfix arm (deferred, capped 3× below its ceiling);
+   `#include` nesting (✔MEASURED SAFE at every depth 8→128, cap fires cleanly at 65 — left recursive
+   ON EVIDENCE); and small walks in `semantic_analyzer`, `redeclaration_compat`, `hir_to_mir`,
+   `shipped_type_consistency`, `dependency_resolver` and `mir_verifier` **where no cap was found**.
+5. ⚠ **`lane-fold seed` snapshots `.plans/`**, so `anchor_registry_guard` reds inside a worktree for
+   anchors that ARE registered in main. A false red every future lane will hit.
+6. **Four `-j 8` flakes, none attributable to a lane**, all pass in isolation:
+   `examples/c/struct_big_neighbor_guard`, `examples/c/struct_block_scope_distinct`,
+   `analysis/semantic/test_inline_asm_template_sigil_agreement`, `integrated_tests/adjudicate`.
+7. **sqlite legs were NOT re-run this cycle** — stated, not skipped.
+
+## §0.4 — Traps, and the instrument findings that cost this cycle the most
+
+- ⚠⚠ **An object md5 witnesses RECOMPILATION, never the INTEGRITY of the source that produced it.**
+  ✔A driver rewrote **9,345 line endings to CRLF** in a file the repo pins `eol=lf`, and md5-moved,
+  md5-returned, build rc, matched count, failing names AND the named control ALL read correct over a
+  corrupted tree. **Hash the SOURCE too.**
+- ⚠⚠ **AND "md5 moved AND RETURNED" IS UNSATISFIABLE ON THIS LEG.** ✔Compiling byte-identical
+  source twice gives different object hashes — the MSVC Debug compile is not reproducible, and it
+  fails toward *clean*, since an md5 that DOES return means the build never recompiled. Use the
+  SOURCE md5 for that half, plus a post-restore green re-run read from each test's own `[ OK ]`.
+- ⚠⚠ **A mutation driver killed mid-arm LEAVES ITS MUTANT ON DISK**, and the next run captures it
+  as its pristine baseline and prints a control pass over it. ✔Happened TWICE in one lane (a power
+  cut, then a tool timeout). A driver must REFUSE TO START unless its mutation anchors are present
+  exactly once.
+- ⚠ **A quoted heredoc collapses a DOUBLED backslash** (single ones survive), so a script written to
+  a file that way is NOT safe. Use the Write tool. The corrupted regex fails toward *clean*.
+- ⚠ **Never put a command whose exit code guards a destructive step on the LEFT of a pipe** — the
+  pipeline's status is the last command's.
+- ⚠ **`--gtest_filter` separates with `:` not `|`** — a `|` filter runs 0 tests and prints
+  `[ PASSED ] 0 tests`. And a `ctest -R` matching nothing exits 0.
+- ⚠ **The DSS CLI resolves config by a THREE-arm precedence** — `$DSS_CONFIG_ROOT`, the layout
+  beside the executable, then a ≤8-hop cwd walk. A probe run from the repo root while edits sit in a
+  worktree answers about the MAIN tree, and every new spelling comes back *unknown mnemonic*. A lane
+  lost a full cycle of measurement to it. **P54 landed the attribution that makes a vocabulary
+  refusal name the config root that answered.**
+- ★ **Eighteen of nineteen lanes refuted a premise in the brief they were given, and every
+  refutation held.** Two of mine were refuted BY EXECUTION: that gcc's libatomic locks for
+  misalignment (it does not — it locks only on a STRADDLE), and that a shipped-lib realization
+  applies only to programs that include its header (a zero-include compile pulls three archives).
+
+---
+
+★★★ **P53 — RELOCATED HERE BY P54, AND IT IS HISTORY, NOT STATE.** It was §0 until P54 closed. Every figure below is P53's own and was true at P53's tip; **re-derive anything you intend to act on.** Its through-line — *ten times a true sentence had outlived the code it described* — is the direct ancestor of P54's, which is one level up: an instrument reporting correctly about the wrong thing.
+
+## ⏪ P53's former §0 (history)
 
 **State, ✔measured at the tip and not re-quoted:** branch `feature/c23-conformance-burndown-6`,
 cut fresh from `main` after PR #56 was **squashed**. ⚠ **NO SHA IS PINNED HERE ON PURPOSE** — a
@@ -197,7 +378,6 @@ ledger, including the two orchestrator errors and the x86_64 ruling), the refere
 `attribute-row.py` — both of which call `anchors.py`'s own `cmd_set` rather than editing the tables,
 because a lane's accumulated cells reached ~34 KB and exceed BOTH the Git Bash argv limit and
 Windows' 32767-character `CreateProcess` cap.
-
 ---
 
 ★★★ **P52: A CI-ONLY CYCLE, AND ITS §0 WAS NEVER WRITTEN — THIS ENTRY IS THAT DEBT PAID, RECONSTRUCTED IN P53 FROM THE ROWS AND THE TREE RATHER THAN FROM MEMORY.** ⚠ It ran between P51's commit and this branch, closed **six** rows across three commits (`e95afd86`, `dae42025`, `3d226255`), and rewrote no handoff — so a session reading §0 during P53's opening saw P51 described as current, four cycles of drift having already been corrected once. ⓘ **The commits themselves are GONE:** PR #56 squashed P44…P52 into a single `7f452a5f` still titled *"Cycle P44"* with a four-line body, so **every commit message from P45 through P52 is unrecoverable from this branch.** The registry rows and `.plans/` are the sole surviving record, which is an argument for where this project puts its substance — and it demotes `git log`, which the memory index still names as the last authority in its chain.

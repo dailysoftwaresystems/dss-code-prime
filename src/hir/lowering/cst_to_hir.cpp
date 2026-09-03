@@ -4782,14 +4782,30 @@ struct Lowerer {
                 // where gcc 13.3.0 and clang 18.1.3 both emit
                 // `cd cc cc cc cc cc cc cc fb 3f` (✔MEASURED). Every other float
                 // kind keeps the `double` arm and the strtod path unchanged.
-                if (WideFloatValue::isSupportedKind(core)) {
-                    auto wf = decodeFloatWide(text, numberStyle, core, ok);
-                    if (ok && wf.has_value()) val.value = *wf;
-                    else                      ok = false;   // stays loud below
-                } else {
-                    double const d = decodeFloat(text, numberStyle, ok);
-                    if (ok) val.value = d;
-                }
+                // ★ THE DISPATCH USED TO BE WRITTEN OUT HERE and is now the ONE
+                // shared `decodeFloatLiteralAtKind` (number_decode.hpp): wide
+                // door for a kind `WideFloatValue` realizes, otherwise strtod
+                // plus a narrow to the core's own width. The narrowing is not
+                // cosmetic — an F32 (or F16) leaf carrying 53 significant bits
+                // under a 24-bit core makes every HIR-tier fold answer as if
+                // `0.1f` were `0.1`, and ✔MEASURED gcc 13.3.0 / clang 18.1.3 /
+                // mingw-w64 gcc 13.2.0 / MSVC 19.51 all accept
+                // `_Static_assert(0.1f != 0.1, "")`, i.e. all four say the
+                // widened `0.1f` is a DIFFERENT value.
+                //
+                // ⚠ THE PARAGRAPH THAT STOOD HERE NAMED THE HAZARD THIS CHANGE
+                // RETIRES: "the CST-side evaluator's leaf (`cst_const_eval.cpp`)
+                // carries the identical call: two leaves decode float literals,
+                // so fixing one would leave the other wrong differently". There
+                // are now THREE readers of that policy — the semantic tier's
+                // range warning joined them, under
+                // D-C-FLOAT-LITERAL-OVERFLOW-RAISES-NO-RANGE-DIAGNOSTIC — and
+                // all three call the one function instead of each holding a
+                // copy.
+                auto const fd = decodeFloatLiteralAtKind(text, numberStyle, core);
+                if (!fd.ok)                   ok = false;   // stays loud below
+                else if (fd.wide.has_value()) val.value = *fd.wide;
+                else                          val.value = fd.narrow;
             }
         } else if (std::optional<bool> const bpSigned =
                        (!sem.integerLiteralTyping.empty() && numberStyle != nullptr
@@ -8375,14 +8391,32 @@ struct Lowerer {
     // two can never drift on what folds.
     [[nodiscard]] std::optional<std::int64_t> evalCstConstInt(NodeId exprNode) {
         std::unordered_set<std::uint32_t> intLits;
+        std::unordered_set<std::uint32_t> floatLits;
         for (auto const& [tok, kind] : litCore_) {
-            if (!isFloatCore(kind)) intLits.insert(tok);
+            if (isFloatCore(kind)) floatLits.insert(tok);
+            else                   intLits.insert(tok);
         }
         CstEvalContext ctx{tree(), tree().schema(), intLits, numberStyle};
         // C4b (Fork-2c): let a `wb`/`uwb` bit-precise index designator fold too, and
         // stamp standard literals' true data-model core for the BitInt UAC width.
         ctx.integerLiteralTyping = sem.integerLiteralTyping;
         ctx.dataModel = dataModel_;
+        // ★★ THIS TIER'S CONST-EXPR SURFACE WAS NARROWER THAN THE SEMANTIC TIER'S,
+        // AND NOBODY OWNED THE DIFFERENCE
+        // ([[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]). It carried no
+        // float-literal set, no `allowFloat` and — the part that surprised — NO CAST
+        // RESOLVER AT ALL, so `static int arr[3] = { [(int)1] = 7 };` was refused
+        // with `H_UnsupportedLoweringForKind: index designator must be an integer
+        // literal` while the byte-identical expression folded fine as an array
+        // bound. ✔MEASURED: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC
+        // 19.51 all accept both `[(int)1]` and `[(int)1.5]`.
+        //
+        // The float set + `allowFloat` mirror `constIntExpr` exactly, including the
+        // wall: `asInt64Bridge` at the bottom of this function refuses a float-armed
+        // RESULT, so `[1.5]` stays loud. The four references refuse it too.
+        ctx.floatLiteralTokens = &floatLits;
+        ctx.floatLiteralTyping = sem.floatLiteralTyping;
+        ctx.longDoubleFormat   = longDoubleFormat_;
         // Ref resolution: name → symbol via `symbolAt(identTok)` →
         // SymbolRecord. Only `isConst` symbols are foldable. The
         // shared `findInitExprInDecl` helper (in the engine library)
@@ -8429,7 +8463,26 @@ struct Lowerer {
             }
             return std::nullopt;
         };
-        ConstEvalResult const r = evaluateConstantCst(exprNode, ctx, env);
+        // The cast-target resolver, built from the SAME two verbs `castPrologue`
+        // uses to lower a cast — the declared `casts` row for WHERE the type node
+        // is, and Pass 2's own stamp for WHAT it resolved to. Nothing here re-asks
+        // a question the semantic tier already answered, and the TypeId →
+        // descriptor step is the shared `classifyCstCastTarget`, so this tier and
+        // the semantic tier cannot classify the same cast differently.
+        env.resolveCastTarget = [this](NodeId castNode)
+            -> std::optional<CstCastTarget> {
+            auto const* crow = castRowFor(castNode);
+            if (crow == nullptr) return std::nullopt;
+            auto const ckids = visible(castNode);
+            if (crow->typeChild >= ckids.size()) return std::nullopt;
+            NodeId const typeRefN = ckids[crow->typeChild];
+            if (!typeRefN.valid()) return std::nullopt;
+            TypeId const ty = resolveStampedTypeBelow(typeRefN);
+            return classifyCstCastTarget(interner, ty);
+        };
+        EvalOptions options;
+        options.allowFloat = true;
+        ConstEvalResult const r = evaluateConstantCst(exprNode, ctx, env, options);
         if (!r.value.has_value()) return std::nullopt;
         return asInt64Bridge(*r.value);
     }
@@ -9064,8 +9117,15 @@ struct Lowerer {
                  && r == cfg.designatedIndexRule.v) {
                     auto idx = resolveIndexDesignatorLiteral(designatorCore);
                     if (!idx.has_value()) {
+                        // ⚠ "must be an integer LITERAL" was already false when a
+                        // `[1+0]` designator folded, and is further off now that a
+                        // cast folds here too
+                        // ([[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]).
+                        // C 6.7.10p4 asks for an integer constant expression, which
+                        // is what `evalCstConstInt` actually decides.
                         reportedError(designatorCore,
-                            "index designator must be an integer literal");
+                            "index designator must be an integer constant "
+                            "expression (C 6.7.10p4)");
                         designatorFailed = true;
                         continue;
                     }

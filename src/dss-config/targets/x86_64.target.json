@@ -1158,6 +1158,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 8 },
             "template": { "opcode": [15, 182], "forceRexPrefix": true },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -1167,6 +1168,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "template": { "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -1178,6 +1180,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 16 },
             "template": { "opcode": [15, 183] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -1187,6 +1190,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
             "template": { "opcode": [15, 183] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -1211,6 +1215,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 8 },
             "template": { "opcode": [15, 190], "forceRexPrefix": true },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -1220,6 +1225,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "template": { "opcode": [15, 190] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -1231,6 +1237,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 16 },
             "template": { "opcode": [15, 191] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -1240,6 +1247,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
             "template": { "opcode": [15, 191] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -1264,6 +1272,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 8 },
             "template": { "mandatoryPrefix": [102], "opcode": [15, 182], "forceRexPrefix": true },
             "resultSlot": "modrm.reg",
+            "destWidth": 16,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -1273,6 +1282,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "template": { "mandatoryPrefix": [102], "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
+            "destWidth": 16,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -1297,6 +1307,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 8 },
             "template": { "mandatoryPrefix": [102], "opcode": [15, 190], "forceRexPrefix": true },
             "resultSlot": "modrm.reg",
+            "destWidth": 16,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -1306,6 +1317,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "template": { "mandatoryPrefix": [102], "opcode": [15, 190] },
             "resultSlot": "modrm.reg",
+            "destWidth": 16,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -2821,6 +2833,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "rexW": true, "opcode": [99] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -2828,6 +2841,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 8 },
             "template":   { "rexW": true, "opcode": [15, 190] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -2835,6 +2849,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 16 },
             "template":   { "rexW": true, "opcode": [15, 191] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -2842,6 +2857,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "template": { "rexW": true, "opcode": [15, 190] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -2853,6 +2869,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
             "template": { "rexW": true, "opcode": [15, 191] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -2864,6 +2881,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
             "template": { "rexW": true, "opcode": [99] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -2890,6 +2908,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 64 },
             "template": { "rexW": true, "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -2899,6 +2918,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "opcode": [139] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -2906,6 +2926,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 16 },
             "template":   { "rexW": true, "opcode": [15, 183] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -2913,6 +2934,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 8 },
             "template":   { "rexW": true, "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -2920,6 +2942,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "template": { "rexW": true, "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -2931,6 +2954,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
             "template": { "rexW": true, "opcode": [15, 183] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -3895,6 +3919,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "opcode": [15, 90] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -3902,6 +3927,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "mandatoryPrefix": [243], "opcode": [15, 90] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
         ]
@@ -3920,6 +3946,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 44] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm", "regClass": "fpr" }]
           },
           {
@@ -3927,6 +3954,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 44] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm", "regClass": "fpr" }]
           }
         ]
@@ -3982,6 +4010,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 42] },
             "resultRegClass": "fpr", "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -3989,6 +4018,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "mandatoryPrefix": [242], "opcode": [15, 42] },
             "resultRegClass": "fpr", "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
         ]

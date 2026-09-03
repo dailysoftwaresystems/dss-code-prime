@@ -996,8 +996,15 @@ namespace {
 // A minimal but COMPLETE pe `.obj` schema whose only variable is the
 // `weakDefinition` row. `weakDefinitionRow` is spliced verbatim and must end in
 // a comma when non-empty.
+// ⓘ `carriesRelro` (P54) adds the ONE extra pair a schema needs before a slot
+// can actually be MINTED into it: the `relro` section row + its
+// `supportedDataSections` entry. Defaulted OFF so every pre-existing caller
+// produces a byte-identical document — those arms are refusals that never
+// reach the data-section gate, and a schema that suddenly accepted relro would
+// change what they are testing.
 [[nodiscard]] std::string peObjSchemaJson(char const* formatName,
-                                          char const* weakDefinitionRow) {
+                                          char const* weakDefinitionRow,
+                                          bool carriesRelro = false) {
     std::string json = R"({
       "$comment": "Synthetic pe .obj schema for D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED. Complete except for the one row under test, so a refusal can only be about that row.",
       "dssObjectFormatVersion": 1,
@@ -1012,9 +1019,18 @@ namespace {
       "pe": { "machine": 34404, "characteristics": 0 },
       )";
     json += weakDefinitionRow;
+    if (carriesRelro) {
+        json += R"("supportedDataSections": ["relro"],
+      )";
+    }
     json += R"(
       "sections": [
-        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0}
+        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0})";
+    if (carriesRelro) {
+        json += R"(,
+        {"kind":"relro","name":".rdata","type":1073741888,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0})";
+    }
+    json += R"(
       ],
       "relocations": [
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
@@ -2160,7 +2176,23 @@ TEST(PeFormatJson, ObjDeclaresDataSectionRowsAndExternDispatch) {
     ASSERT_TRUE(fmt.externCallDispatch().has_value())
         << "pe64-x86_64-windows (.obj) must declare externCallDispatch "
            "so extern calls lower (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE)";
-    EXPECT_EQ(*fmt.externCallDispatch(), ExternCallDispatch::DirectPlt);
+    // ⚠ THIS PINNED `DirectPlt` UNTIL P54 AND THE OLD VALUE WAS NOT WRONG —
+    // it went UNLINKABLE. D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET
+    // ✔MEASURED that link.exe 14.51 refuses a direct `call rel32` to a WEAK
+    // extern (`LNK2016: absolute symbol used as target of REL32 relocation` —
+    // a COFF weak external's fallback is an absolute value-0 symbol), and
+    // refuses mingw-w64 gcc's own object for the same relocation, while clang
+    // 18.1.3 routes the call through `.refptr.<name>` on both windows triples
+    // and link.exe links THAT. `indirect-slot` makes the call site
+    // `call *[rip+sym]` and the slot pass retargets it to the carried
+    // `.refptr.` COMDAT. The pairing this creates is asserted here too,
+    // because with the dispatch declared and the slot spelling missing the
+    // linker refuses the format outright.
+    EXPECT_EQ(*fmt.externCallDispatch(), ExternCallDispatch::IndirectSlot);
+    EXPECT_TRUE(fmt.objectImportSlot().has_value())
+        << "`indirect-slot` in a RELOCATABLE format presumes a slot the "
+           "object carries itself; without `objectImportSlot` every extern "
+           "call would deref the import's own address";
 
     auto const* rodata = fmt.sectionByKind(SectionKind::Rodata);
     ASSERT_NE(rodata, nullptr);
@@ -6348,4 +6380,386 @@ TEST(PeObjWriter, AWeakFunctionsUnwindTablesAreComdatsAssociativeToItsBody) {
             << name << "'s associated section must be the weak function's own "
                        "COMDAT `.text`, not section 1";
     }
+}
+
+// ══ D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET ══
+//
+// A pe64 RELOCATABLE object routes an extern DATA import's ADDRESS through a
+// slot the object CARRIES — `.refptr.<name>`, a select-any COMDAT in the relro
+// `.rdata` holding one IMAGE_REL_AMD64_ADDR64 against the import — and the code
+// names the SLOT, never the import. The defect was a direct
+// IMAGE_REL_AMD64_REL32 against the import: unreachable when a weak external
+// resolves to its ABSOLUTE value-0 default, which link.exe refuses (LNK2016)
+// and which mingw ld and lld-link TRUNCATE with no diagnostic at all.
+//
+// ★ THESE ARE STRUCTURAL PINS ON EMITTED BYTES. The runtime half — three
+// foreign linkers consuming a DSS object and RUNNING it — lives in
+// `tests/link/test_pe_object_data_import_slot.cpp`, because no byte pin can
+// show that a linker accepts the record and no foreign link can show WHICH
+// relocation carried it. Both tiers are required; neither substitutes.
+
+namespace {
+
+// A module shaped like what MIR->LIR emits for `&ea` under a got-indirect
+// binding: a `lea` of the import's slot (rel32 patch site) followed by a
+// pointer-size deref. The BYTES are inert here — this arm tests relocation
+// routing, not encoding — but the relocation KIND is the load-bearing half:
+// `RelocationKind{1}` is x86_64's `rel32` row, the PC-RELATIVE one, which is
+// the exact predicate the slot pass keys on.
+[[nodiscard]] AssembledModule dataImportModule(bool alsoCallAFunctionExtern) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes.assign(32u, 0x90u);
+    Relocation lea;
+    lea.offset = 3;
+    lea.target = SymbolId{50};   // the DATA import
+    lea.kind   = RelocationKind{1};
+    fn.relocations.push_back(lea);
+    if (alsoCallAFunctionExtern) {
+        Relocation call;
+        call.offset = 20;
+        call.target = SymbolId{51};   // the FUNCTION import
+        call.kind   = RelocationKind{1};
+        fn.relocations.push_back(call);
+    }
+    mod.functions.push_back(std::move(fn));
+
+    ModuleSymbol fnSym;
+    fnSym.symbol = SymbolId{1};
+    fnSym.name   = "usesea";
+    mod.symbols.push_back(std::move(fnSym));
+
+    ExternImport data;
+    data.symbol      = SymbolId{50};
+    data.mangledName = "ea";
+    data.libraryPath = "somelib.dll";
+    data.isData      = true;
+    mod.externImports.push_back(std::move(data));
+    if (alsoCallAFunctionExtern) {
+        ExternImport fnImp;
+        fnImp.symbol      = SymbolId{51};
+        fnImp.mangledName = "callee";
+        fnImp.libraryPath = "somelib.dll";
+        fnImp.isData      = false;
+        mod.externImports.push_back(std::move(fnImp));
+    }
+    return mod;
+}
+
+// The relocation whose patch site is `va`, in `sec`'s table.
+[[nodiscard]] std::optional<ObjReloc>
+relocAt(std::vector<std::uint8_t> const& obj, ObjSectionHeader const& sec,
+        std::uint32_t va) {
+    for (auto const& r : peObjRelocations(obj, sec)) {
+        if (r.virtualAddress == va) return r;
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+TEST(PeObjDataImportSlot, DataExternCodeReferenceNamesTheCarriedComdatSlot) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    // The pairing this row installs, asserted on the SHIPPED document rather
+    // than assumed: if either key is dropped the rest of this test is testing
+    // something else, and its `.text` assertion would then fail for a reason
+    // that reads nothing like "the config lost a key".
+    ASSERT_TRUE(loaded.format->dataImportBinding().has_value());
+    ASSERT_TRUE(loaded.format->objectImportSlot().has_value());
+    EXPECT_EQ(loaded.format->objectImportSlot()->symbolPrefix, ".refptr.");
+
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+
+    auto const secs = peObjSections(obj);
+    auto const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+
+    // (1) THE CODE NAMES THE SLOT. Type AND target, not merely a count: a
+    //     REL32 is the shape the defect had too, so the type alone would pass
+    //     over it — what changed is WHICH SYMBOL it points at.
+    auto const codeRel = relocAt(obj, *text, 3u);
+    ASSERT_TRUE(codeRel.has_value()) << "no `.text` relocation at the lea site";
+    constexpr std::uint16_t kImageRelAmd64Rel32 = 4;
+    EXPECT_EQ(codeRel->type, kImageRelAmd64Rel32);
+    EXPECT_EQ(peObjSymbolName(obj, codeRel->symbolTableIndex), ".refptr.ea")
+        << "the code must reach the import through the carried slot; naming "
+           "`ea` directly is the defect (a rel32 cannot reach an ABSOLUTE "
+           "target, which is what a weak external's default is)"
+        << symTableDump(obj);
+
+    // (2) THE SLOT EXISTS, IS A SELECT-ANY COMDAT, AND CARRIES THE ABSOLUTE
+    //     FIXUP THE FINAL LINKER FILLS. Without the ADDR64 the slot is a
+    //     permanent null pointer and every `&ea` reads 0 even when a
+    //     definition IS linked — a silent wrong answer in the OTHER
+    //     direction, which is why the fixup is pinned by type and target too.
+    ObjSectionHeader const* slotSec = nullptr;
+    for (auto const& s : secs) {
+        if (s.name == ".rdata" && s.numberOfRelocations == 1u) slotSec = &s;
+    }
+    ASSERT_NE(slotSec, nullptr) << "no reloc-bearing `.rdata` section";
+    constexpr std::uint32_t kScnLnkComdatMask = 0x00001000u;
+    EXPECT_NE(slotSec->characteristics & kScnLnkComdatMask, 0u)
+        << "the slot must be a COMDAT: two objects importing one name both "
+           "define `.refptr.ea`, and only a COMDAT lets the final linker keep "
+           "one instead of refusing the pair";
+    EXPECT_EQ(slotSec->sizeOfRawData, 8u) << "the slot is one LLP64 pointer";
+    auto const aux = peObjSectionDefAux(obj, ".rdata");
+    ASSERT_TRUE(aux.has_value());
+    EXPECT_EQ(aux->selection, 2u) << "IMAGE_COMDAT_SELECT_ANY";
+    auto const fill = relocAt(obj, *slotSec, 0u);
+    ASSERT_TRUE(fill.has_value());
+    constexpr std::uint16_t kImageRelAmd64Addr64 = 1;
+    EXPECT_EQ(fill->type, kImageRelAmd64Addr64);
+    EXPECT_EQ(peObjSymbolName(obj, fill->symbolTableIndex), "ea")
+        << "the SLOT is what names the import" << symTableDump(obj);
+
+    // (3) The import is still an UNDEFINED external — the slot is an extra
+    //     indirection, never a substitute for importing the name.
+    EXPECT_TRUE(peObjHasUndefinedSymbol(obj, "ea")) << symTableDump(obj);
+}
+
+TEST(PeObjDataImportSlot, AFunctionExternReachesItsImportThroughASlotToo) {
+    // D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET (P54).
+    // ⚠ THIS TEST USED TO ASSERT THE OPPOSITE — "a FUNCTION import's reference
+    // must stay direct" — and it was RIGHT while the shipped `.obj` format
+    // declared `externCallDispatch: direct-plt`. ✔MEASURED 2026-09-02 that the
+    // direct form is UNLINKABLE for a weak import: link.exe 14.51 answers
+    // `LNK2016: absolute symbol 'maybe' used as target of REL32 relocation`
+    // for the CALL as well as for the address (and refuses mingw gcc's own
+    // object for exactly that one relocation), while clang 18.1.3 routes BOTH
+    // through `.refptr.maybe` on both windows triples and link.exe links that.
+    // The format now declares `indirect-slot`, so the call site is
+    // `call *[rip+sym]` and every pc-relative extern reference in it is a slot
+    // read. The DISCRIMINATOR the old assertion protected has not been dropped
+    // — it moved to `AFunctionExternKeepsItsDirectReferenceUnderDirectPlt`
+    // below, where the dispatch is what decides rather than the symbol class.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    ASSERT_EQ(loaded.format->externCallDispatch(),
+              ExternCallDispatch::IndirectSlot)
+        << "the shipped pe64 `.obj` format must declare `indirect-slot`; with "
+           "`direct-plt` the rest of this test is about a different object";
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+    auto const secs = peObjSections(obj);
+    auto const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+
+    auto const dataRel = relocAt(obj, *text, 3u);
+    auto const callRel = relocAt(obj, *text, 20u);
+    ASSERT_TRUE(dataRel.has_value() && callRel.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, dataRel->symbolTableIndex), ".refptr.ea");
+    EXPECT_EQ(peObjSymbolName(obj, callRel->symbolTableIndex), ".refptr.callee")
+        << "under `indirect-slot` the call site DEREFERENCES the slot, so its "
+           "relocation must name the slot; naming `callee` directly is the "
+           "shape link.exe answers with LNK2016 when the import is weak"
+        << symTableDump(obj);
+    // TWO carried slots now — one per referenced import.
+    std::size_t slotSections = 0;
+    for (auto const& s : secs) {
+        if (s.name == ".rdata" && s.numberOfRelocations == 1u) ++slotSections;
+    }
+    EXPECT_EQ(slotSections, 2u)
+        << "one carried slot per referenced import, data AND function"
+        << symTableDump(obj);
+    EXPECT_TRUE(peObjHasUndefinedSymbol(obj, "callee")) << symTableDump(obj);
+}
+
+TEST(PeObjDataImportSlot, AFunctionExternKeepsItsDirectReferenceUnderDirectPlt) {
+    // THE DISCRIMINATOR, RE-BASED ON THE FACT THAT ACTUALLY DECIDES IT. A slot
+    // pass that retargeted every import under a `direct-plt` format would point
+    // a plain `call rel32` at a pointer slot, and the call would execute the
+    // pointer's bytes. That is not a hypothetical shape: it is what every ELF
+    // and Mach-O relocatable format declares, and what this pe `.obj` format
+    // itself declared until P54. The two references live in ONE function so a
+    // single object shows both answers, and neither can be produced by a pass
+    // that simply did nothing.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-direct-plt-keeps-calls-direct",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "direct-plt",
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)",
+                        /*carriesRelro=*/true),
+        "synthetic");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+    auto const secs = peObjSections(obj);
+    auto const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+
+    auto const dataRel = relocAt(obj, *text, 3u);
+    auto const callRel = relocAt(obj, *text, 20u);
+    ASSERT_TRUE(dataRel.has_value() && callRel.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, dataRel->symbolTableIndex), ".refptr.ea")
+        << "the DATA half is unchanged by the dispatch" << symTableDump(obj);
+    EXPECT_EQ(peObjSymbolName(obj, callRel->symbolTableIndex), "callee")
+        << "under `direct-plt` MIR→LIR emitted a plain `call rel32`, so this "
+           "pass must leave it alone — retargeting it would call the slot"
+        << symTableDump(obj);
+    std::size_t slotSections = 0;
+    for (auto const& s : secs) {
+        if (s.name == ".rdata" && s.numberOfRelocations == 1u) ++slotSections;
+    }
+    EXPECT_EQ(slotSections, 1u)
+        << "one carried slot, for the DATA import only" << symTableDump(obj);
+}
+
+TEST(PeObjDataImportSlot, IndirectSlotDispatchWithNoSlotSpellingFailsLoud) {
+    // THE THIRD PAIRING RULE (P54). `indirect-slot` tells MIR→LIR that every
+    // extern call DEREFERENCES a pointer slot. A relocatable artifact has no
+    // import walker to mint one, so without `objectImportSlot` every call
+    // would read the import's own address as if it were a pointer — a SILENT
+    // wrong call target, which is why this is a refusal and not a fallback.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-indirect-slot-without-slot",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "indirect-slot",
+                           "dataImportBinding": "got-indirect",)"),
+        "synthetic");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, **target, **fmt, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a relocatable format declaring indirect-slot dispatch with no slot "
+           "spelling must be refused: the code already derefs a slot the "
+           "object would not carry";
+    EXPECT_TRUE(image.bytes.empty()) << diagSummary(rep);
+}
+
+TEST(PeObjDataImportSlot, AnAbsoluteDataInitializerReferenceIsNotRetargeted) {
+    // `int *p = &ea;` reaches the object as an ABSOLUTE 64-bit relocation in a
+    // DATA ITEM, which represents an absolute-0 target perfectly well and is
+    // already correct. Pointing it at the slot would store the SLOT'S address
+    // where the program asked for the object's — off by exactly the one
+    // indirection this row is about, in the opposite direction. The pass keys
+    // on PC-RELATIVE for that reason, and this is the pin that says so.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    AssembledData ptr;
+    ptr.symbol  = SymbolId{9};
+    ptr.section = DataSectionKind::Data;
+    ptr.bytes.assign(8u, 0u);
+    ptr.alignment = Alignment::ofRuntimePow2(8u);
+    Relocation abs;
+    abs.offset = 0;
+    abs.target = SymbolId{50};
+    abs.kind   = RelocationKind{2};   // x86_64 `abs64`
+    ptr.relocations.push_back(abs);
+    mod.dataItems.push_back(std::move(ptr));
+    ModuleSymbol ptrSym;
+    ptrSym.symbol = SymbolId{9};
+    ptrSym.name   = "p";
+    mod.symbols.push_back(std::move(ptrSym));
+
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+    auto const secs = peObjSections(obj);
+    auto const* data = findSection(secs, ".data");
+    ASSERT_NE(data, nullptr);
+    auto const rel = relocAt(obj, *data, 0u);
+    ASSERT_TRUE(rel.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, rel->symbolTableIndex), "ea")
+        << "a static initializer's absolute reference must keep naming the "
+           "IMPORT — it can hold an absolute-0 target, so it never met the "
+           "defect, and retargeting it would store the slot's address"
+        << symTableDump(obj);
+}
+
+// ── THE PAIRING RULE, BOTH DIRECTIONS ──────────────────────────────────
+//
+// `dataImportBinding` and `objectImportSlot` are ONE decision spelled in two
+// keys — WHETHER an extern data address is loaded from a slot, and WHAT the
+// object publishes the carried slot as — and on a RELOCATABLE format neither
+// is usable without the other. Declaring only the binding leaves MIR->LIR
+// emitting a deref of a slot that is never minted; declaring only the spelling
+// publishes a name nothing ever routes through. Both fail LOUD at the linker,
+// which is the tier that can see `isImageFlavor()` (a backend question the
+// schema's own `validate()` cannot ask).
+//
+// ★ AN IMAGE FORMAT IS NOT AFFECTED BY EITHER ARM and does not need a third:
+// its import walker owns the slot, so the pass returns before reading a key.
+// That is asserted by every existing pe64-exec test staying green rather than
+// restated here as a fourth case that could pass vacuously.
+TEST(PeObjDataImportSlot, RelocatableBindingWithNoSlotSpellingFailsLoud) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-binding-without-slot",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "dataImportBinding": "got-indirect",)"),
+        "synthetic");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, **target, **fmt, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a relocatable format declaring the binding with no slot spelling "
+           "must be refused: the code already derefs a slot the object would "
+           "not carry";
+    EXPECT_TRUE(image.bytes.empty()) << diagSummary(rep);
+}
+
+TEST(PeObjDataImportSlot, SlotSpellingWithNoBindingFailsLoud) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-slot-without-binding",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)"),
+        "synthetic");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, **target, **fmt, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a slot spelling with no binding is config that reads as a "
+           "capability and is not one — nothing is ever routed through it";
+    EXPECT_TRUE(image.bytes.empty()) << diagSummary(rep);
+}
+
+TEST(PeObjDataImportSlot, AnEmptySlotPrefixIsRefusedAtLoad) {
+    // The SHAPE rule, which is validate()'s half. An empty prefix publishes the
+    // slot under the IMPORT'S OWN name, so the object would DEFINE the symbol
+    // it is importing — a duplicate definition at the final link, or worse a
+    // self-referential slot that resolves to itself.
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-empty-slot-prefix",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": "" },)"),
+        "synthetic");
+    ASSERT_FALSE(fmt.has_value());
+    EXPECT_EQ(countAtPath(fmt, "/objectImportSlot/symbolPrefix"), 1u)
+        << rejectSummary(fmt);
 }

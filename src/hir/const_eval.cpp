@@ -38,6 +38,7 @@ using detail::toWideFloatOperand;
 using detail::asIntBits;
 using detail::valueFitsInIntTarget;
 using detail::wrapToIntTarget;
+using detail::floatToWideIntTarget;
 
 [[nodiscard]] inline ConstEvalResult fail(ConstEvalFailure why, HirNodeId blamed) {
     return ceFail(why, blamed);
@@ -259,10 +260,23 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     // Int→Int / Int→Float / Int→Bool paths below (a NARROW `_BitInt` source bridges to
     // int64 via `asInt64`; a WIDE source nullopt-fails there — a documented boundary).
     if (toK == TypeKind::BitInt) {
+        std::uint32_t const bw = static_cast<std::uint32_t>(interner.bitIntWidth(targetTy));
+        bool const          bs = interner.bitIntIsSigned(targetTy);
+        // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]: a FLOAT source
+        // reaching a bit-precise target truncates per C 6.3.1.4p1 rather than being
+        // handed to `asBitIntValue`, which answers only for integer arms and so
+        // refused `(_BitInt(16))300.5` — a conversion clang 18.1.3 folds
+        // (✔MEASURED; gcc 13.3.0 and MSVC 19.51 have no `_BitInt` at all).
+        if (auto const f = detail::floatToWideIntTarget(*inner.value, bw, bs, options)) {
+            if (!f->value.has_value()) return fail(ConstEvalFailure::Overflow, expr);
+            HirLiteralValue v;
+            v.core  = TypeKind::BitInt;
+            v.value = *f->value;
+            return ok(std::move(v));
+        }
         auto bv = detail::asBitIntValue(*inner.value);
         if (!bv.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-        bv->convertTo(static_cast<std::uint32_t>(interner.bitIntWidth(targetTy)),
-                      interner.bitIntIsSigned(targetTy));
+        bv->convertTo(bw, bs);
         HirLiteralValue v;
         v.core  = TypeKind::BitInt;
         v.value = std::move(*bv);
@@ -278,9 +292,20 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     // bit-precise one; conflating them would misname it in every later
     // diagnostic and mis-rank it in the usual arithmetic conversions).
     if (detail::isInt128Kind(toK)) {
+        bool const i128Signed = (toK == TypeKind::I128);
+        // The float twin of the `_BitInt` arm above, and the ONLY exact route for
+        // it: `(__int128)1e30` has no int64 rendering, so an `asInt64` bridge
+        // refused a conversion gcc 13.3.0 and clang 18.1.3 both fold (✔MEASURED).
+        if (auto const f = detail::floatToWideIntTarget(*inner.value, 128u, i128Signed, options)) {
+            if (!f->value.has_value()) return fail(ConstEvalFailure::Overflow, expr);
+            HirLiteralValue v;
+            v.core  = toK;
+            v.value = *f->value;
+            return ok(std::move(v));
+        }
         auto bv = detail::asBitIntValue(*inner.value);
         if (!bv.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-        bv->convertTo(128u, toK == TypeKind::I128);
+        bv->convertTo(128u, i128Signed);
         HirLiteralValue v;
         v.core  = toK;
         v.value = std::move(*bv);
@@ -356,13 +381,26 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
         if (!info.has_value() || !info->hostBacked) {
             return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         }
-        auto iv64 = asInt64(*inner.value);
-        if (!iv64.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-        if (options.refuseOnLossyFloatConversion
-         && !intToFloatIsLossless(*iv64, info->bits)) {
-            return fail(ConstEvalFailure::LossyFloatConversion, expr);
+        // ⚠ THE WIDENING READS THE SOURCE'S SIGNEDNESS FROM ITS CORE
+        // ([[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]). This used
+        // to be `asInt64`, which nullopts for an unsigned value above INT64_MAX and
+        // so refused `(double)18446744073709551615ULL` — a conversion all four
+        // references fold, to 2^64 (✔MEASURED separately). The shared verb is the
+        // one the CST walker's float-target arm calls, so the two cannot disagree.
+        auto const widenedOpt = detail::integerConstantAsDouble(*inner.value);
+        if (!widenedOpt.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        double const widened = *widenedOpt;
+        if (options.refuseOnLossyFloatConversion) {
+            // The precision question is asked as a ROUND TRIP through the target's
+            // own width, which is what `intToFloatIsLossless` does for a value with
+            // an int64 rendering and is the only form available for one without.
+            double const narrowed = narrowToFloatWidth(widened, info->bits);
+            auto const iv64 = asInt64(*inner.value);
+            bool const lossless = iv64.has_value()
+                ? intToFloatIsLossless(*iv64, info->bits)
+                : (std::isfinite(narrowed) && narrowed == widened);
+            if (!lossless) return fail(ConstEvalFailure::LossyFloatConversion, expr);
         }
-        double const widened = static_cast<double>(*iv64);
         HirLiteralValue folded;
         folded.core  = toK;
         folded.value = narrowToFloatWidth(widened, info->bits);
@@ -372,7 +410,8 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     // Float → Int: truncate toward zero (C99 §6.3.1.4); refuse when
     // the truncated value doesn't fit the integer target. NaN/inf
     // always refuse with Overflow — truncating them is undefined per
-    // the standard and the bit pattern isn't portable.
+    // the standard and the bit pattern isn't portable. The arithmetic is
+    // `const_eval_arith.hpp`'s, shared with the CST walker's cast arm.
     if (sourceFloat) {
         auto target = intKindInfo(toK);
         if (!target.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
@@ -397,50 +436,66 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
             folded.value = wrapToIntTarget(*iv, *target);
             return ok(std::move(folded));
         }
-        double const dv = *asDouble(*inner.value);
-        // NaN / inf: refuse with Overflow unless we can constructively
-        // claim a value. We cannot; refuse regardless of the knob.
-        if (std::isnan(dv) || std::isinf(dv)) {
-            return fail(ConstEvalFailure::Overflow, expr);
+        // ── THE RANGE TEST IS AT THE TARGET'S WIDTH, NOT AT INT64'S ────────
+        // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]. This used to
+        // truncate into an `int64_t` FIRST and range-check the target SECOND, so
+        // every target inherited int64's ceiling. ✔MEASURED, that refused
+        // `(unsigned long long)1.8446744e19` — a value comfortably inside
+        // `unsigned long long`, and accepted by gcc 13.3.0, clang 18.1.3,
+        // mingw-w64 gcc 13.2.0 and MSVC 19.51, probed separately. The predicates
+        // now live in `const_eval_arith.hpp` and are the SAME ones the CST walker
+        // calls, which is the point: the two walkers used to answer this question
+        // in two places, and only one of them answered it at all.
+        //
+        // NaN / ±inf have no integral part (6.3.1.4p1) — `truncateFloatTowardZero`
+        // nullopts, and the refusal is unconditional, not knob-governed.
+        auto const truncOpt = detail::truncateFloatTowardZero(*inner.value);
+        if (!truncOpt.has_value()) return fail(ConstEvalFailure::Overflow, expr);
+        double const truncated = *truncOpt;
+        if (toK == TypeKind::Bool) {
+            return ok(makeBoolLiteral(truncated != 0.0 ? 1 : 0));
         }
-        // Truncate toward zero (host `floor`/`ceil` are exact on
-        // double — no precision loss to range-check).
-        double const truncated = (dv >= 0.0) ? std::floor(dv) : std::ceil(dv);
-        // Range check against int64 storage. Naive bounds with
-        // `static_cast<double>(INT64_MAX)` are unsafe: 2^63 - 1 is
-        // not representable as a double, so the conversion ROUNDS UP
-        // to exactly 2^63, and `truncated > 2^63` then misses the
-        // `truncated == 2^63` case — UB on the subsequent
-        // `static_cast<int64_t>(truncated)`. Use 2^63 as the exclusive
-        // upper bound directly (representable exactly). The lower
-        // bound -2^63 IS representable exactly, so `< -2^63` is safe.
+        if (detail::truncatedFitsIntWidth(truncated,
+                                          static_cast<std::uint32_t>(target->bits),
+                                          target->isSigned)) {
+            HirLiteralValue fits;
+            fits.core = toK;
+            // A 64-bit UNSIGNED target is the one width whose whole range does not
+            // fit the int64 arm; it takes the uint64 arm, which `asIntBits` and
+            // `asBool` already read. Every other admitted value is ≤ 63 bits of
+            // magnitude and lands in the int64 arm exactly as before.
+            if (!target->isSigned && target->bits >= 64) {
+                fits.value = static_cast<std::uint64_t>(truncated);
+            } else {
+                fits.value = static_cast<std::int64_t>(truncated);
+            }
+            return ok(std::move(fits));
+        }
+        // Out of the target's range: UNDEFINED per 6.3.1.4p1, and the references do
+        // not agree on what they produce — ✔MEASURED `(int)1e30` is INT_MAX on
+        // gcc/clang/mingw and 0 on MSVC 19.51. There is no value to bake, so the
+        // strict knob refuses. The permissive knob (`refuseOnOverflow=false`, used
+        // by the optimizer's const-fold and one hir_to_mir site) keeps its wrap —
+        // but ONLY through the int64 domain `wrapToIntTarget` can actually express;
+        // outside it there is no portable wrap to emulate and the refusal stands
+        // whatever the knob says, exactly as before.
+        // ⚠ `wrapToIntTarget` is an INT64-DOMAIN helper and is IDENTITY at width
+        // ≥ 64 (its own comment says so), so the wrap is offered only where it can
+        // actually express the answer: a target NARROWER than 64 bits, holding a
+        // truncated value that itself fits an int64. Outside that window — a
+        // 64-bit-or-wider target the value missed, or a value outside int64 at all
+        // — there is no expressible wrap and the refusal stands. That is the same
+        // window the previous spelling admitted, stated once instead of as three
+        // guards that had to be read together.
         constexpr double kInt64MaxExclusive = 9223372036854775808.0;   // 2^63 (exact)
         constexpr double kInt64Min          = -9223372036854775808.0;  // -2^63 (exact)
-        if (truncated >= kInt64MaxExclusive || truncated < kInt64Min) {
-            // Out-of-int64 floats: C99 §6.3.1.4 leaves the bit-pattern
-            // implementation-defined, and the engine has no portable
-            // wrap to emulate. Refuse UNIFORMLY regardless of the
-            // `refuseOnOverflow` knob — same policy as NaN/inf above.
-            // The wrap-knob only governs the inner-range "fits int64
-            // but not target" case below.
+        if (options.refuseOnOverflow || target->bits >= 64
+            || truncated >= kInt64MaxExclusive || truncated < kInt64Min) {
             return fail(ConstEvalFailure::Overflow, expr);
         }
         std::int64_t const iv = static_cast<std::int64_t>(truncated);
-        if (toK == TypeKind::Bool) {
-            return ok(makeBoolLiteral(iv));
-        }
         HirLiteralValue folded;
-        folded.core = toK;
-        if (target->bits >= 64 && !target->isSigned && iv < 0) {
-            return fail(ConstEvalFailure::Overflow, expr);
-        }
-        if (valueFitsInIntTarget(iv, *target)) {
-            folded.value = iv;
-            return ok(std::move(folded));
-        }
-        if (options.refuseOnOverflow) {
-            return fail(ConstEvalFailure::Overflow, expr);
-        }
+        folded.core  = toK;
         folded.value = wrapToIntTarget(iv, *target);
         return ok(std::move(folded));
     }

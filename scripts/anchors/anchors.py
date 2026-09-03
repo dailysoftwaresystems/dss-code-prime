@@ -303,7 +303,7 @@ def render_full(row):
 
 # ────────────────────────────────── writing ───────────────────────────────────
 
-def make_cell(text):
+def make_cell(text, field="cell"):
     """One field -> one cell body. The three ways a hand-written cell breaks a row.
 
     1. NEWLINES ARE COLLAPSED. A row is ONE physical line; a wrapped anchor id does not
@@ -321,8 +321,38 @@ def make_cell(text):
     it, raw text containing a literal backslash before a pipe emits an UNESCAPED
     separator, which is the exact silent column-shift this function exists to prevent.
     Correctness on the declared input beats safety on an input that never arrives.
+
+    ⚠⚠ ✔MEASURED 2026-09-02 (P54): THAT INPUT ARRIVES, AND HAS FOR MONTHS. The sentence
+    above was true about the DESIGN and false about the WORLD -- 35 pipes across 14 rows
+    were already stored with a doubled backslash, so those cells render `\\|` where their
+    author wrote `|`: `mtx_plain \\| mtx_recursive`, `awk -F"\\|"`, `[ -x "$LW" ] \\|\\|
+    ...`, a regex alternation, a PowerShell `\\| Out-Host`, a three-way enum. TWO callers
+    produce it and NEITHER is detectable downstream -- an author who PRE-ESCAPES a pipe
+    not knowing this function escapes for them, and a lane that reads the RAW TABLE LINE
+    with grep/sed instead of `read-anchor --json` and hands the escaped form back. The
+    second COMPOUNDS: every re-close adds one more backslash, forever.
+
+    ★ THE FIX IS NOT IDEMPOTENCE -- that is still the wrong contract, for the reason
+    above. It is to REFUSE the violating input HERE, at the one place that can still tell
+    a pre-escaped pipe from a deliberate one, because after this function returns the two
+    are the same bytes. A cell that genuinely wants to SHOW a backslash before a pipe
+    (~1000 rows hold one plausible candidate) spells the pipe `[|]` or says it in words:
+    that cost falls on one author, where the silent corruption fell on every reader of 14
+    rows.
     """
     flat = " ".join(str(text).split())
+    if "\\|" in flat:
+        at = flat.find("\\|")
+        raise Refused(
+            "the %s cell's value contains a backslash immediately before a pipe. This "
+            "function escapes pipes FOR you, so a pre-escaped pipe is stored DOUBLED and "
+            "renders as a stray backslash to every reader. Two causes: (1) you escaped it "
+            "by hand -- write the plain pipe; (2) you read the cell from the RAW TABLE "
+            "LINE with grep/sed -- read it with `read-anchor --json`, whose fields come "
+            "back already un-escaped, or the escape deepens on every re-close. To DISPLAY "
+            "a backslash before a pipe deliberately, spell the pipe `[|]`.\n"
+            "  at char %d: ...%s..."
+            % (field, at, flat[max(0, at - 60):at + 60]))
     return " %s " % flat.replace("|", "\\|") if flat else " "
 
 
@@ -382,8 +412,9 @@ def make_row(anchor, priority, status, trigger, closing="", cross_refs="", minti
     row = "|" + "|".join([" `%s` " % anchor,
                           " %s " % normalise_priority(priority),
                           " %s " % normalise_status(status),
-                          make_cell(trigger), make_cell(closing),
-                          make_cell(cross_refs)]) + "|"
+                          make_cell(trigger, "Trigger"),
+                          make_cell(closing, "Closing work"),
+                          make_cell(cross_refs, "Cross-refs")]) + "|"
     # Self-check the product against the reader that will consume it, rather than
     # trusting the assembly above. Cheap, and the only thing that would catch a future
     # edit to `make_cell` that reintroduced a separator.
@@ -860,6 +891,23 @@ def self_test():
         and _rt[C_TRIGGER].strip() == "a | b",
         "(6) a cell READ from a row and written straight back is IDENTICAL -- the round "
         "trip `set-anchor` depends on", "got=%r" % _rt2[C_TRIGGER])
+    # ★ AND THE OTHER ROUND TRIP -- THE ONE THAT SILENTLY CORRUPTED 14 ROWS. Pin (6)
+    # reads the cell through `split_row`, which UN-escapes. A caller who instead reads
+    # the RAW TABLE LINE (grep/sed) gets `a \| b`, and writing that back stores `a \\| b`
+    # -- one more backslash on every re-close. An author who pre-escapes by hand hands
+    # over the identical bytes. Neither is distinguishable after `make_cell` returns, so
+    # it is refused before.
+    _pre = refuse(make_row, CC_, "P1", "open", "a \\| b") or ""
+    pin("backslash immediately before a pipe" in _pre and "read-anchor --json" in _pre,
+        "(6b) a PRE-ESCAPED pipe is REFUSED, and the message names the door that returns "
+        "un-escaped fields", "got=%r" % _pre[:80])
+    pin(refuse(make_row, CC_, "P1", "open", "t", "c \\| d") is not None
+        and refuse(make_row, CC_, "P1", "open", "t", "", "x \\| y") is not None,
+        "(6c) ...in EVERY prose cell, not only the Trigger -- the corruption was found in "
+        "all three")
+    pin("[|]" in _pre,
+        "(6d) ...and it names the spelling for a cell that WANTS to show a backslash "
+        "before a pipe, so the refusal is not a dead end")
     pin(bal.split_row(make_row(CC_, "P1", "done", "t"))[C_STATUS].strip()
         == STATUS["closed"],
         "(7) `done` is accepted as a spelling of `closed` -- the operator's own word")

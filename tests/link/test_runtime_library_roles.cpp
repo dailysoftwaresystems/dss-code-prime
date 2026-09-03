@@ -42,6 +42,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -65,44 +66,85 @@ namespace {
 // fix is not a bigger number — it is a per-member verdict that must be RESTATED
 // when the member changes.
 //
-// `mustDeclare` is the UCRT-P4 answer for that flavour, and each `why` is the
-// argument for it. An excluded flavour is NEVER silently skipped: it is asserted
-// to still be excludable, so the day it gains a table this test goes red and the
-// exclusion has to be re-argued instead of quietly widening.
+// Each verdict is the answer for that flavour, and each `why` is the argument for
+// it. An excluded flavour is NEVER silently skipped: it is asserted to still be
+// excludable, so the day it gains what it was excluded from this test goes red and
+// the exclusion has to be re-argued instead of quietly widening.
+//
+// ⚠⚠ P54 SPLIT ONE BOOLEAN INTO TWO, AND THE SPLIT IS THE POINT RATHER THAN A
+// TIDY-UP. Until D-CSUBSET-PACKED-ATOMIC-MEMBER's pe64 arm landed there was only
+// `mustDeclare`, meaning "declares a runtimeLibraries table" — and it was serving
+// as a proxy for a question it does not actually ask, namely "declares the SEH /
+// unwind spine". The two coincided for as long as `unwindPersonality` was the only
+// role any pe flavour could name. `atomicsRuntime` ended that: the .lib and .obj
+// flavours now declare a table for a reason that has NOTHING to do with unwind, and
+// the old single boolean could only have been resolved by either reddening a
+// correct config or widening an exclusion that must stay narrow. That is the same
+// shape the target key hit one tier over — one boolean fusing two facts whose
+// REMEDIES differ — so it is fixed the same way, by asking the two questions
+// separately and restating both per member.
 struct PeFlavour {
     std::string_view name;
-    bool             mustDeclare;
+    // Does this flavour declare `sehPersonality` + an `unwindPersonality` row?
+    // Governed by whether its writer arm actually EMITS .pdata/.xdata.
+    bool             mustDeclareUnwind;
+    // Does it declare an `atomicsRuntime` block + row? Governed by whether an
+    // under-aligned `_Atomic` access can reach an extern call on this flavour.
+    bool             mustDeclareAtomics;
     char const*      why;
+    char const*      whyAtomics;
 };
 
 // MEASURED 2026-08-10 (build-dbg, `--compile` of a `__try` TU at each target, then
 // reading the emitted artifact's section table) — the verdicts below are that
 // measurement, not a reading of the writers.
 constexpr PeFlavour kPeFlavours[] = {
-    {"pe64-x86_64-windows-exec", true,
+    {"pe64-x86_64-windows-exec", true, true,
      "the .exe image: encodeExec emits .pdata + .xdata, and the spine's "
      "processExit/processArgs/librarySynthesis name cLibrary + systemPrimitives "
-     "on top of the unwindPersonality row"},
-    {"pe64-x86_64-windows-dll", true,
+     "on top of the unwindPersonality row",
+     "the .exe is the artifact form the execution witness was taken on: a DSS "
+     "pe64 image whose packed `_Atomic` member calls __atomic_load/__atomic_store "
+     "and RUNS, while its naturally-aligned control keeps the native xchg/mov. "
+     "P54 lane `la` moved WHO answers those calls — from mingw-w64's "
+     "libatomic-1.dll (not in-box on Windows) to DSS's own compiled body — and "
+     "the witness moved with it: the image now imports ucrtbase.dll ALONE"},
+    {"pe64-x86_64-windows-dll", true, true,
      "the .dll image routes through the SAME encodeExec substrate as the .exe "
      "(pe.type = dll), so it genuinely carries .pdata + .xdata. MEASURED by "
      "RUNNING: a real Windows process loaded a DSS-built .dll, took a hardware "
      "divide-by-zero inside a __try and resumed in the __except body at both "
      "--config=debug and --config=release. A DLL containing __try is how much of "
-     "Windows is written, so a missing block here is a wrong-reject a USER finds"},
-    {"pe64-x86_64-windows-staticlib", false,
+     "Windows is written, so a missing block here is a wrong-reject a USER finds",
+     "a DLL can contain an under-aligned `_Atomic` access for exactly the reason "
+     "it can contain a __try — much of Windows is written as DLLs — and a "
+     "format-level omission would silently keep the non-atomic native pair there"},
+    {"pe64-x86_64-windows-staticlib", false, true,
      "the .lib archive goes through pe::encode's Obj arm, which attaches no "
      "FrameUnwindInfo and emits NO .pdata/.xdata. MEASURED by declaring the keys "
      "anyway: rc=0 and the emitted seh.lib carried `.text` ONLY, so the filter "
      "funclets and the scope table are SILENTLY DROPPED and __except can never "
      "run. Declaring here would trade a loud, correct refusal for a silent "
      "miscompile; the rationale lives in the file's "
-     "$sehPersonalityOmittedComment"},
-    {"pe64-x86_64-windows", false,
+     "$sehPersonalityOmittedComment",
+     "⚠ THE ATOMICS ANSWER IS THE OPPOSITE OF THE UNWIND ONE ON THIS SAME FILE, "
+     "which is why they cannot share a boolean. There is no silent-drop hazard "
+     "for a CALL: `externCallDispatch: direct-plt` is already declared and an "
+     "extern call is what this arm emits every day, so the member objects carry "
+     "an undefined external the final link resolves. Omitting it would split the "
+     "flavours on MEANING — the same source taking the runtime as an .exe and "
+     "silently keeping the non-atomic pair as a .lib. elf64-x86_64-linux-staticlib "
+     "declares libatomic.so.1 on identical reasoning"},
+    {"pe64-x86_64-windows", false, true,
      "the relocatable .obj, same Obj arm and the same MEASURED silent drop "
      "(`.text` only). Worse here than for the archive, because the object exists "
      "to be linked LATER and the final linker cannot notice that unwind data was "
-     "never emitted for these functions"},
+     "never emitted for these functions",
+     "same split verdict as the archive, and the contrast is what makes it safe: "
+     "the unwind omission exists because a dropped scope table is INVISIBLE to the "
+     "later linker, whereas an atomics entry that never resolves is an UNRESOLVED "
+     "SYMBOL at that same later link — loud, at the tier that can see it, and "
+     "strictly better than shipping a silent loss of atomicity"},
 };
 
 // The root key an excluded flavour must carry so the absence reads as a decision
@@ -115,9 +157,16 @@ constexpr PeFlavour kPeFlavours[] = {
 // reject any entry placed there as explaining an asymmetry that does not exist.
 constexpr std::string_view kOmissionRationaleKey = "$sehPersonalityOmittedComment";
 
-[[nodiscard]] std::size_t mustDeclareCount() {
+// A flavour carries a `runtimeLibraries` TABLE iff at least one of its two
+// verdicts is positive — the table is the union of the roles its blocks name, so
+// it is derived from the verdicts rather than being a third independent one.
+[[nodiscard]] constexpr bool declaresATable(PeFlavour const& f) {
+    return f.mustDeclareUnwind || f.mustDeclareAtomics;
+}
+
+[[nodiscard]] std::size_t tableCount() {
     std::size_t n = 0;
-    for (auto const& f : kPeFlavours) if (f.mustDeclare) ++n;
+    for (auto const& f : kPeFlavours) if (declaresATable(f)) ++n;
     return n;
 }
 
@@ -265,7 +314,53 @@ TEST(RuntimeLibraryRoles, NoPeFormatNamesTheLegacyCrtInItsRoleTable) {
         auto const& table = (*r)->runtimeLibraries();
         if (!table.empty()) ++tablesSeen;
 
-        if (flavour.mustDeclare) {
+        // (2a) THE ATOMICS VERDICT, asked separately from the unwind one on every
+        // flavour — P54. Both directions, because the negative arm is the one that
+        // ratchets: a flavour that gains or loses the block without its verdict
+        // moving reds here rather than passing quietly.
+        {
+            auto const& ar = (*r)->atomicsRuntime();
+            EXPECT_EQ(ar.has_value(), flavour.mustDeclareAtomics)
+                << flavour.name << ": the `atomicsRuntime` verdict and the shipped "
+                   "file disagree. Verdict: " << flavour.whyAtomics;
+            if (ar.has_value() && flavour.mustDeclareAtomics) {
+                EXPECT_NE(table.rowForRole(RuntimeLibraryRole::AtomicsRuntime),
+                          nullptr)
+                    << flavour.name
+                    << " declares an `atomicsRuntime` block with no matching row; "
+                       "the loader resolves the block's role against the table and "
+                       "a missing row is fail-loud by design.";
+                // ★★ P54 lane `la` (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64): THIS
+                // ROLE IS REALIZED, NOT IMPORTED, AND BOTH HALVES ARE PINNED.
+                // The previous text pinned `libraryPath == "libatomic-1.dll"`,
+                // and the measurement behind it stands — ucrtbase, vcruntime140,
+                // kernel32, msvcrt and ntdll export ZERO `__atomic_*` symbols
+                // between them, MSVC's bundled compiler-rt defines none, and
+                // mingw-w64's libatomic-1.dll exports both generic entries. What
+                // changed is the RULING: depending on an image that is not
+                // in-box on Windows was a workaround, so DSS ships the body.
+                // ⚠ THE EMPTY `libraryPath` IS THE LOAD-BEARING HALF. It is not
+                // "unset": it is the `noLibraryBinding` shape, and it is what
+                // makes the minted extern resolve out of the shipped runtime
+                // archive instead of becoming an import. A regression that put
+                // an image back here would silently return the external
+                // dependency AND leave the archive member unpulled.
+                EXPECT_EQ(ar->libraryPath, "") << flavour.name;
+                auto const src =
+                    table.sourceForRole(RuntimeLibraryRole::AtomicsRuntime);
+                ASSERT_TRUE(src.has_value())
+                    << flavour.name
+                    << ": the atomicsRuntime role must be REALIZED from a shipped "
+                       "source on every pe flavour — an `image` here is the "
+                       "external-DLL dependency P54 removed.";
+                EXPECT_EQ(*src, "runtime/platform/src/atomic.c") << flavour.name;
+                // Undecorated: this format's `cSymbolDecoration` is `none`.
+                EXPECT_EQ(ar->loadMangledName, "__atomic_load") << flavour.name;
+                EXPECT_EQ(ar->storeMangledName, "__atomic_store") << flavour.name;
+            }
+        }
+
+        if (flavour.mustDeclareUnwind) {
             // (2) PRESENT, BY NAME. Not "some flavour has a table".
             EXPECT_FALSE(table.empty())
                 << flavour.name
@@ -288,16 +383,28 @@ TEST(RuntimeLibraryRoles, NoPeFormatNamesTheLegacyCrtInItsRoleTable) {
             // (3) EXCLUDED — asserted, justified, and RATCHETED. This is the arm
             // that must never be a silent skip: it fails the moment the flavour
             // gains what it was excluded from having.
-            EXPECT_TRUE(table.empty())
+            // ⚠⚠ P54 NARROWED THIS FROM `table.empty()` TO THE UNWIND ROLE, AND
+            // THE NARROWING IS NOT A WEAKENING — it is the same correction the
+            // struct's two booleans are. `table.empty()` asserted the ABSENCE OF
+            // ANY TABLE as a stand-in for the absence of the UNWIND SPINE, which
+            // held only while unwind was the sole role a pe flavour could name.
+            // The .lib and .obj now name `atomicsRuntime` for a reason that has
+            // nothing to do with .pdata/.xdata, so the old form would have
+            // reddened a correct config and the only ways out would have been to
+            // widen an exclusion that must stay narrow or to delete the ratchet.
+            // Asserting the ROLE keeps every bit of the original guard: the day
+            // this flavour gains an unwindPersonality row, this still reds.
+            EXPECT_FALSE(table.imageForRole(RuntimeLibraryRole::UnwindPersonality)
+                             .has_value())
                 << flavour.name
-                << " is on the EXPLICIT exclusion list but now DECLARES a "
-                   "`runtimeLibraries` table. This test is deliberately red so the "
+                << " is on the EXPLICIT exclusion list but now names an "
+                   "`unwindPersonality` role. This test is deliberately red so the "
                    "exclusion gets re-argued rather than widened by accident. The "
                    "recorded reason it was excluded: " << flavour.why
                 << ". If the underlying limitation is genuinely fixed (the pe Obj "
                    "arm now emits .pdata/.xdata), move this flavour to "
-                   "mustDeclare = true and re-measure the emitted sections — do "
-                   "not delete this assertion.";
+                   "mustDeclareUnwind = true and re-measure the emitted sections — "
+                   "do not delete this assertion.";
             EXPECT_FALSE((*r)->sehPersonality().has_value())
                 << flavour.name
                 << " is excluded but declares `sehPersonality`. MEASURED: the Obj "
@@ -337,11 +444,13 @@ TEST(RuntimeLibraryRoles, NoPeFormatNamesTheLegacyCrtInItsRoleTable) {
     // verdicts, never a floor. `>= 1` is what let three absent tables read as
     // success; `== mustDeclareCount()` cannot, because it moves whenever a verdict
     // moves and disagrees the instant a table appears or disappears anywhere.
-    EXPECT_EQ(tablesSeen, mustDeclareCount())
+    EXPECT_EQ(tablesSeen, tableCount())
         << "the number of pe formats actually declaring a `runtimeLibraries` table "
            "must equal the number this file's verdicts say should — a count that "
            "merely has a FLOOR is satisfied by one file out of four, which is the "
-           "state this assertion replaced.";
+           "state this assertion replaced. Since P54 the expected count is DERIVED "
+           "from the two per-flavour verdicts (`declaresATable`) rather than being "
+           "a third independent number that could drift from both.";
 }
 
 // Every role a spine block NAMES must resolve, on every shipped format, and the
@@ -489,7 +598,18 @@ TEST(RuntimeLibraryRoles, DeletingARoleRowRefusesTheFormatAtLoad) {
 // This file's table has exactly ONE row, which makes the lever unusually sharp:
 // deleting it empties the table entirely, and `sehPersonality` — the only
 // role-naming block on this format — then resolves against nothing.
-TEST(RuntimeLibraryRoles, DeletingTheDllsOnlyRoleRowRefusesTheFormatAtLoad) {
+// ⚠ RENAMED BY P54 FROM `DeletingTheDllsOnlyRoleRowRefusesTheFormatAtLoad`, AND
+// THE RENAME IS THE HONEST HALF OF THE CHANGE. The subject is unchanged — remove
+// the row that `sehPersonality` NAMES and the format must be refused at load,
+// naming that block. What expired is the word ONLY: D-CSUBSET-PACKED-ATOMIC-MEMBER
+// added an `atomicsRuntime` row to this format, so `unwindPersonality` is no longer
+// the sole row and "empty the table" is no longer the same mutation as "delete this
+// row". ★ THE TEST CAUGHT ITS OWN STALENESS RATHER THAN PASSING THROUGH IT: the
+// old matcher removed the row without its trailing comma, FAIL-CLOSED CHECK 4
+// parsed the result, found malformed JSON and refused to score the arm — which is
+// exactly what that check exists for, since a syntax error would otherwise have
+// produced a refusal "wearing the role table's clothes" and read as green.
+TEST(RuntimeLibraryRoles, DeletingTheRowSehPersonalityNamesRefusesTheDllFormatAtLoad) {
     std::string const text = readShippedFormatText("pe64-x86_64-windows-dll");
     ASSERT_FALSE(text.empty()) << "the shipped pe dll format must be readable";
 
@@ -505,8 +625,14 @@ TEST(RuntimeLibraryRoles, DeletingTheDllsOnlyRoleRowRefusesTheFormatAtLoad) {
     // FAIL-CLOSED CHECK 1 — the witness is UNIQUE in the subject. If the row
     // appeared twice, removing one occurrence would leave the fact in place and this
     // pin would be green over a mutation that changed nothing.
+    // ⚠ THE TRAILING COMMA IS PART OF THE WITNESS, DELIBERATELY. The table now
+    // carries a second row (`atomicsRuntime`), so removing this row's text alone
+    // would leave a dangling comma and hand the loader malformed JSON — a refusal
+    // for a reason that has nothing to do with the role table. Matching the comma
+    // keeps the mutant a well-formed one-element array, which is what makes the
+    // refusal below attributable to the missing ROLE.
     constexpr std::string_view kRow =
-        R"({ "role": "unwindPersonality", "image": "ucrtbase.dll" })";
+        R"({ "role": "unwindPersonality", "image": "ucrtbase.dll" },)";
     std::size_t occurrences = 0;
     for (std::size_t at = text.find(kRow); at != std::string::npos;
          at = text.find(kRow, at + 1)) {
@@ -543,11 +669,22 @@ TEST(RuntimeLibraryRoles, DeletingTheDllsOnlyRoleRowRefusesTheFormatAtLoad) {
         ASSERT_FALSE(doc.is_discarded())
             << "the mutant must remain well-formed JSON, or the refusal below is a "
                "parse error wearing the role table's clothes";
+        // P54: the state under test is "the table no longer names the role
+        // `sehPersonality` asks for", NOT "the table is empty". Those coincided
+        // while unwindPersonality was the only row; asserting emptiness now would
+        // pin an accident of how many roles this format happens to declare.
         ASSERT_TRUE(doc.contains("runtimeLibraries")
-                    && doc.at("runtimeLibraries").is_array()
-                    && doc.at("runtimeLibraries").empty())
-            << "the mutation must leave an EMPTY runtimeLibraries array — that is "
-               "the state under test (a table that declares no role at all)";
+                    && doc.at("runtimeLibraries").is_array())
+            << "the mutation must leave a well-formed runtimeLibraries array";
+        for (auto const& row : doc.at("runtimeLibraries")) {
+            ASSERT_TRUE(row.contains("role") && row.at("role").is_string());
+            EXPECT_NE(row.at("role").get<std::string>(), "unwindPersonality")
+                << "the mutant must NOT still name the role under test — if it "
+                   "does, the refusal below cannot be attributed to its absence";
+        }
+        ASSERT_FALSE(doc.at("runtimeLibraries").empty())
+            << "and the surviving `atomicsRuntime` row must still be there, or "
+               "this became the emptied-table mutation instead of the one named";
     }
 
     auto bad = ObjectFormatSchema::loadFromText(mutant, "<mutant>");
@@ -778,17 +915,311 @@ TEST(RuntimeLibraryRoles, EveryFormatThatDeclaresAnAtomicsBlockDeclaresBothEntry
                        "libSystem ALONE; the role points at the image cLibrary "
                        "already names, which the table permits";
     }
-    // ⚠ AND THE NEGATIVE, WHICH IS THE LOAD-BEARING HALF: pe64 declares NONE.
-    // UCRT exports no `__atomic_*` symbol and there is no Windows atomics image
-    // to name. That is exactly why the target key is a three-way enum — under
-    // `losesAtomicity` the native form STANDS here rather than the build being
-    // refused, which keeps DSS inside the reference union on Windows.
-    for (auto const name : {"pe64-x86_64-windows-exec", "pe64-x86_64-windows-dll"}) {
+    // ⚠⚠ THE pe64 ARM, AND IT IS A P54 REVERSAL OF WHAT STOOD HERE. This loop
+    // used to assert pe64 declared NO atomics runtime, on the reasoning that
+    // "UCRT exports no `__atomic_*` symbol and there is no Windows atomics image
+    // to name". The FIRST clause is still true and is re-measured below; the
+    // SECOND was never measured, only inferred from it — a true answer to the
+    // narrower question (does MICROSOFT ship one) read as an answer to the wider
+    // one (does ANY image on this platform), and it failed toward the quiet
+    // outcome ([[feedback-an-instrument-that-answers-an-adjacent-question]]).
+    //
+    // ✔MEASURED 2026-09-02 (P54, `objdump -p`, every probe asserting rc=0 AND a
+    // non-trivial line count so a path-translation failure could not read as a
+    // zero): mingw-w64's `libatomic-1.dll` — shipped beside the gcc that IS this
+    // platform's C reference — exports `__atomic_load` (ord 55) and
+    // `__atomic_store` (ord 71). What is absent is a MICROSOFT image: ucrtbase
+    // (46125 export lines), vcruntime140 (3840), kernel32 (26109), msvcrt (18383)
+    // and ntdll (56304) export ZERO between them, and MSVC's own bundled
+    // compiler-rt (`clang_rt.builtins-x86_64.lib`, 2902 nm lines) defines none.
+    //
+    // ★ WHY THE LIBCALL IS REQUIRED HERE AND NOT MERELY AVAILABLE — and it is not
+    // a tiebreak between references. `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` is a
+    // union over what WORKS, not over what is merely ACCEPTED, and no vertex is
+    // privileged. A reference that accepts a construct and then emits code which
+    // faults, tears, or silently drops its meaning is not a working reference for
+    // it. gcc is that reference here: its `xchgl` store carries x86's implicit
+    // LOCK and IS atomic misaligned, but the paired plain `movl` LOAD is not
+    // architecturally atomic across a cache line. clang works. So the union
+    // requires clang's behaviour, with no adjudication involved.
+    for (auto const name : {"pe64-x86_64-windows-exec", "pe64-x86_64-windows-dll",
+                            "pe64-x86_64-windows-staticlib", "pe64-x86_64-windows"}) {
         auto loaded = ObjectFormatSchema::loadShipped(std::string{name});
         ASSERT_TRUE(loaded.has_value()) << name;
-        EXPECT_FALSE((*loaded)->atomicsRuntime().has_value())
-            << name << " must declare NO atomics runtime — naming an image that "
-                       "does not export the entries would turn a working build "
-                       "into an unresolved symbol at link";
+        auto const& ar = (*loaded)->atomicsRuntime();
+        ASSERT_TRUE(ar.has_value())
+            << name << " must declare an `atomicsRuntime` block — without one an "
+                       "under-aligned _Atomic access silently keeps a load that is "
+                       "not atomic across a cache line";
+        // Undecorated, because this format's `cSymbolDecoration` is `none` — the
+        // same key that makes the Mach-O siblings' names carry a leading
+        // underscore. Three spellings, one per format, all declared not derived.
+        EXPECT_EQ(ar->loadMangledName, "__atomic_load") << name;
+        EXPECT_EQ(ar->storeMangledName, "__atomic_store") << name;
+        // ★★ P54 lane `la` (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64) — THE PIN
+        // FLIPPED FROM AN IMAGE TO A REALIZATION, AND THE OLD MEASUREMENT IS NOT
+        // REFUTED, ONLY SUPERSEDED. It remains true that no in-box Windows DLL
+        // and no MSVC-bundled compiler-rt exports the generic entries and that
+        // mingw-w64's `libatomic-1.dll` does; depending on that non-in-box image
+        // was ruled a workaround, so DSS ships the body instead. The EMPTY
+        // library path is the `noLibraryBinding` shape and is what makes the
+        // minted extern resolve out of the shipped runtime archive rather than
+        // become an import — putting an image back here would silently restore
+        // the external dependency AND leave the archive member unpulled.
+        EXPECT_EQ(ar->libraryPath, "")
+            << name << ": the atomicsRuntime role is REALIZED here, so its "
+                       "resolved image must be EMPTY.";
+        auto const src = (*loaded)->runtimeLibraries().sourceForRole(
+            RuntimeLibraryRole::AtomicsRuntime);
+        ASSERT_TRUE(src.has_value()) << name;
+        EXPECT_EQ(*src, "runtime/platform/src/atomic.c") << name;
+    }
+}
+
+// ── D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64: the REALIZED-ROLE mechanism ───────
+//
+// ★★ THE LOADER AND THE RAW KEY MUST AGREE, ACROSS EVERY SHIPPED FORMAT. The
+// shipped-source SWEEP in `tests/ffi/test_shipped_source_realization.cpp` reads
+// `runtimeLibraries[].source` as raw JSON, because `ffi` cannot depend on the
+// object-format schema without inverting the layering. That makes it a SECOND
+// READER of a config key, which is how a sweep and a loader come to disagree
+// about what a document says — so the two are pinned against each other here,
+// where both are reachable. A format whose loader dropped, renamed or rewrote
+// the key would keep the sweep green and red HERE.
+TEST(RuntimeLibraryRoles, EveryRealizedRoleSourceMatchesTheRawKey) {
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
+    auto const dir = *root / "object-formats";
+    std::error_code ec;
+    ASSERT_TRUE(std::filesystem::is_directory(dir, ec)) << dir.generic_string();
+
+    std::size_t compared = 0;
+    for (std::filesystem::directory_iterator it{dir, ec}, end; it != end;
+         it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+        std::string const stem = it->path().filename().generic_string();
+        auto const        dot  = stem.find(".format.json");
+        if (dot == std::string::npos) continue;
+        std::string const name = stem.substr(0, dot);
+
+        std::ifstream in{it->path()};
+        ASSERT_TRUE(in.good()) << stem;
+        nlohmann::json doc;
+        in >> doc;
+
+        std::vector<std::string> raw;
+        if (doc.contains("runtimeLibraries")
+            && doc.at("runtimeLibraries").is_array()) {
+            for (auto const& row : doc.at("runtimeLibraries")) {
+                if (!row.is_object() || !row.contains("source")) continue;
+                if (!row.at("source").is_string()) continue;
+                raw.push_back(row.at("source").get<std::string>());
+            }
+        }
+
+        auto loaded = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(loaded.has_value()) << name << " must load";
+        auto const seen = (*loaded)->runtimeLibraries().realizedSources();
+        EXPECT_EQ(seen, raw)
+            << name
+            << ": the loader's realized-source list and the raw "
+               "`runtimeLibraries[].source` key disagree. The shipped-source "
+               "sweep in tests/ffi reads the RAW key, so a disagreement here "
+               "means that sweep is guarding a document the compiler does not "
+               "see.";
+        ++compared;
+    }
+    // A directory walk that matched nothing exits green; assert the COUNT.
+    EXPECT_GE(compared, 20u)
+        << "the shipped object-format corpus must have been walked; only "
+        << compared << " document(s) were compared";
+}
+
+// ══ THE FAMILY-AGREEMENT GUARD (P54 lane `ar`) ═══════════════════════════════
+//
+// **Every flavour document of one format KIND must name the SAME provider for
+// every role two of them both declare.**
+//
+// ★★★ WHY THIS EXISTS, AND IT IS THE ANSWER TO AN OPERATOR OBSERVATION RATHER
+// THAN A SPECULATIVE INVARIANT. The observation was that
+// `runtime/platform/src/atomic.c` is written FOUR times — once in each pe64
+// flavour document — while a shipped-lib descriptor declares its realization
+// ONCE for the whole format family, and that the family-level fact therefore
+// belongs at a family-level tier.
+//
+// ✔MEASURED over the 26 shipped documents, and the measurement REFRAMES the
+// observation rather than confirming it: the repetition is a property of the
+// format-document TIER, not of the atomics row.
+//   * `runtime/platform/src/atomic.c` (pe, atomicsRuntime)   appears in  4 docs
+//   * `libatomic.so.1`                (elf, atomicsRuntime)  appears in 10 docs
+//   * `/usr/lib/libSystem.B.dylib`    (macho, atomicsRuntime) appears in 8 docs
+//   * `libc.so.6`                     (elf, cLibrary)        appears in  4 docs
+// and the whole `atomicsRuntime` SPINE BLOCK is byte-identical across every
+// flavour of all five families — as are 11 of 23 top-level keys on pe64 and 14
+// of 23 on elf64. The atomics source path is the LEAST-repeated provider fact in
+// the corpus. There is no inheritance or family document in this tier, so the
+// only way to write a family fact once would be to invent one — which is above
+// a lane and would move ELF and Mach-O.
+//
+// ⇒ WHAT IS ACTUALLY AVAILABLE, AND IT IS STRICTLY BETTER THAN A DEDUPLICATION:
+// the four copies cannot be made ONE, but they CAN be made provably ONE FACT.
+// Deduplication removes the chance to disagree; this guard removes the ABILITY
+// to disagree while leaving the documents readable on their own. And it covers
+// the ten `libatomic.so.1` copies and the eight libSystem copies at the same
+// time, which a hand-move of one row would not have touched.
+//
+// ⚠ ABSENCE IS NOT DISAGREEMENT, DELIBERATELY. `-dll` declares no `cLibrary`
+// row and `-exec` does; a flavour that does not need a role must not be forced
+// to name one, and the ONLY thing forbidden is two flavours naming DIFFERENT
+// providers. That is why the rule quantifies over roles two documents BOTH
+// declare, not over the cross product.
+//
+// ⚠ AND THE GROUPING IS THE FORMAT'S OWN DECLARED KIND, read off the loaded
+// schema — never a hardcoded {pe, elf, macho} list, which would silently stop
+// covering the next kind the corpus grows.
+TEST(RuntimeLibraryRoles, EveryFlavourOfAFormatKindNamesOneProviderPerRole) {
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
+    auto const dir = *root / "object-formats";
+    std::error_code ec;
+    ASSERT_TRUE(std::filesystem::is_directory(dir, ec)) << dir.generic_string();
+
+    // (kind, role) -> provider spelling -> the documents naming it.
+    std::map<std::pair<std::string, std::string>,
+             std::map<std::string, std::vector<std::string>>> byFamily;
+    std::size_t documents = 0;
+
+    for (std::filesystem::directory_iterator it{dir, ec}, end; it != end;
+         it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+        std::string const file = it->path().filename().generic_string();
+        auto const        dot  = file.find(".format.json");
+        if (dot == std::string::npos) continue;
+        std::string const name = file.substr(0, dot);
+
+        auto loaded = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(loaded.has_value()) << name << " must load";
+        ++documents;
+        std::string const kind{objectFormatKindName((*loaded)->kind())};
+        for (auto const& b : (*loaded)->runtimeLibraries().bindings) {
+            // The provider spelling carries its KIND as well as its value, so a
+            // format naming an IMAGE called exactly what a sibling names as a
+            // SOURCE cannot collapse into agreement.
+            std::string const provider =
+                b.source.empty() ? ("image " + b.image)
+                                 : ("shipped source " + b.source);
+            byFamily[{kind, std::string{runtimeLibraryRoleName(b.role)}}]
+                    [provider].push_back(name);
+        }
+    }
+
+    std::size_t multiDocumentGroups = 0;
+    std::size_t peAtomicsDocuments  = 0;
+    for (auto const& [key, providers] : byFamily) {
+        auto const& [kind, role] = key;
+        std::size_t docs = 0;
+        for (auto const& [provider, names] : providers) docs += names.size();
+        if (docs >= 2) ++multiDocumentGroups;
+        if (kind == "pe" && role == "atomicsRuntime") peAtomicsDocuments = docs;
+        if (providers.size() <= 1) continue;
+
+        std::string detail;
+        for (auto const& [provider, names] : providers) {
+            detail += "\n    " + provider + "  <-  ";
+            for (std::size_t i = 0; i < names.size(); ++i) {
+                if (i != 0) detail += ", ";
+                detail += names[i];
+            }
+        }
+        ADD_FAILURE()
+            << "format kind '" << kind << "' declares role '" << role
+            << "' with " << providers.size()
+            << " DIFFERENT providers across its flavour documents:" << detail
+            << "\n  Who plays a runtime role is a property of the format FAMILY "
+               "— a shipped-lib descriptor declares its `library`/`realization` "
+               "per family for exactly this reason. This tier has no family "
+               "document, so the fact is written once per flavour; two spellings "
+               "means one of them is a typo or a half-finished migration, and "
+               "which flavour a program happens to build decides which runtime "
+               "it gets.";
+    }
+
+    // ⚠ A SWEEP THAT COMPARED NOTHING PASSES. Three counts, each closing a
+    // different vacuity: the corpus was walked at all; at least some groups had
+    // TWO documents to disagree (a corpus of one flavour per kind would satisfy
+    // the rule trivially); and the specific group this guard was written for —
+    // the four pe64 atomics rows — is one of them.
+    EXPECT_GE(documents, 20u)
+        << "the shipped object-format corpus must have been walked; only "
+        << documents << " document(s) loaded";
+    EXPECT_GE(multiDocumentGroups, 4u)
+        << "only " << multiDocumentGroups
+        << " (kind, role) group(s) had two or more documents, so this guard "
+           "compared almost nothing — it passes vacuously on a corpus where "
+           "every kind has a single flavour";
+    EXPECT_GE(peAtomicsDocuments, 4u)
+        << "the pe `atomicsRuntime` role was declared by " << peAtomicsDocuments
+        << " document(s); this guard exists because it is declared by FOUR, and "
+           "a drop means the rows this rule was written for stopped being "
+           "compared";
+}
+
+// ★★ EXACTLY ONE PROVIDER PER ROW, REFUSED AT LOAD IN BOTH DIRECTIONS. Neither
+// is an unfilled role; both are two owners for one body — the refusal
+// `shippedLibs`' own `library`/`realization` pair has made since
+// D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF, now at the tier where ROLES live.
+TEST(RuntimeLibraryRoles, ARuntimeLibraryRowDeclaringBothAProviderKindIsRefused) {
+    std::string const text = readShippedFormatText("pe64-x86_64-windows-exec");
+    ASSERT_FALSE(text.empty());
+    {
+        auto ok = ObjectFormatSchema::loadFromText(text);
+        ASSERT_TRUE(ok.has_value())
+            << "the UNMUTATED shipped text must load clean, or the mutants prove "
+               "nothing";
+    }
+    constexpr std::string_view kRow =
+        R"({ "role": "atomicsRuntime",    "source": "runtime/platform/src/atomic.c" })";
+    ASSERT_NE(text.find(kRow), std::string::npos)
+        << "the mutation anchor must still exist — a no-op mutation is how a "
+           "red-on-disable pin goes green forever";
+
+    // (a) BOTH.
+    {
+        std::string mutant = text;
+        ASSERT_TRUE(substituteOnce(
+            mutant, kRow,
+            R"({ "role": "atomicsRuntime", "image": "libatomic-1.dll", "source": "runtime/platform/src/atomic.c" })"));
+        auto bad = ObjectFormatSchema::loadFromText(mutant, "<both>");
+        EXPECT_FALSE(bad.has_value())
+            << "a row naming BOTH an image and a shipped source is two owners for "
+               "one body and must be refused at load";
+    }
+    // (b) NEITHER.
+    {
+        std::string mutant = text;
+        ASSERT_TRUE(substituteOnce(mutant, kRow,
+                                   R"({ "role": "atomicsRuntime" })"));
+        auto bad = ObjectFormatSchema::loadFromText(mutant, "<neither>");
+        EXPECT_FALSE(bad.has_value())
+            << "a row naming NEITHER provider is an unfilled role and must be "
+               "refused at load";
+    }
+    // (c) AN ESCAPING SOURCE PATH. The containment check is shared with the
+    // shipped-lib descriptor's `realization.<format>.source`, and it is a
+    // SECURITY predicate: a rooted spelling would let a config document reach an
+    // arbitrary file on the host.
+    {
+        std::string mutant = text;
+        ASSERT_TRUE(substituteOnce(
+            mutant, kRow,
+            R"({ "role": "atomicsRuntime", "source": "//host/share/evil.c" })"));
+        auto bad = ObjectFormatSchema::loadFromText(mutant, "<escape>");
+        EXPECT_FALSE(bad.has_value())
+            << "a rooted / escaping `source` spelling must be refused at load — "
+               "`operator/` with a rooted right operand REPLACES rather than "
+               "appends, so the document would name a file outside the config "
+               "root";
     }
 }

@@ -2514,6 +2514,44 @@ struct DSS_EXPORT TargetEncodingWire {
     // `encodingWireRegClass` below for why the two levels exist and why
     // neither one may be missing for a register-bearing field.
     std::optional<TargetRegClass> regClass;
+    // ── [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]: DOES THIS
+    // FIELD READ ITS REGISTER AS A **VECTOR OF LANES** OR AS A **SCALAR**? —
+    // the JSON key `lanes` (bool), refined by `laneBits`.
+    //
+    // ★★★ ABSENT MEANS **SCALAR**, WHICH IS A CLAIM AND NOT AN ABSTENTION, and
+    // that is the whole difference between this axis and `regClass` beside it.
+    // A register field on any ISA reads its register one of exactly two ways;
+    // there is no third "unstated" reading for an author to fall into. So the
+    // default is the STRICT arm, every pre-existing field states the truth
+    // without being edited, and the direction a forgotten key fails in is
+    // REFUSAL of a lane spelling rather than acceptance of one.
+    //
+    // ★★ WHY IT COULD NOT BE DERIVED FROM THE WIDTH — the defect this closes.
+    // ✔MEASURED 2026-09-02, both directions, gas 2.42 and clang 18.1.3 both
+    // REJECTING both spellings: `cnt d0, d1` compiled and emitted
+    // `cnt v0.8b, v1.8b` (a scalar spelling reaching a lane form), and
+    // `fadd v0.8b, v1.8b, v2.8b` compiled and emitted `fadd d0, d1, d2`
+    // (0x1E622820) — a scalar double add for a byte-lane spelling, rc=0, no
+    // diagnostic. `.8b` and `d` are BOTH 64 bits, so the width axis is blind to
+    // the difference by construction, and so is `regClass`: `v0` is `d0`'s root
+    // and the class is one file.
+    //
+    // ⚠ IT IS A DECLARATION, NOT A GUARD, for exactly the reason `destWidth`
+    // is (see its comment): a LIR instruction carries no lane shape, so the
+    // ENCODER, re-selecting post-regalloc, would have nothing to read it from.
+    // It is consumed ONLY by `asm_elect::electOpcode`, which knows what the
+    // programmer WROTE, and the election's answer is carried in the OPCODE the
+    // encoder does read — so the two tiers still cannot disagree.
+    bool             lanes           = false;
+    // The lane WIDTH this field reads, in bits. 0 with `lanes` = "this encoding
+    // does not distinguish lane widths" — the honest reading of a BITWISE
+    // vector form, and not a shortcut: ✔MEASURED, clang 18.1.3 assembles
+    // `mov v0.8b/.4h/.2s/.1d` to the one word 0x0EA11C20, because the ORR alias
+    // this target spells as `move_bytes` is bit-for-bit lane-agnostic. A
+    // lane-SENSITIVE form states the number (`addv h0, v1.4h` = 0x0E71B820
+    // against `addv b0, v1.8b` = 0x0E31B820), and then a spelling at any other
+    // lane width elects nothing. validate() refuses it without `lanes`.
+    std::uint8_t     laneBits        = 0;
     // D-AS4-3 (multi-instruction-macro encoder): which 32-bit word
     // (0-based) of a multi-word `fixed32` template this wire's slot
     // lives in. DEFAULT 0 — every existing single-word wire is
@@ -2681,6 +2719,63 @@ struct DSS_EXPORT TargetEncodingVariant {
     // one class. Meaningful only with a `resultSlot` (validate() refuses it
     // otherwise — a class for a field the variant does not have).
     std::optional<TargetRegClass>      resultRegClass;
+    // ── D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME:
+    // HOW WIDE THE RESULT FIELD IS — the JSON key `destWidth`, a SIBLING of
+    // `resultRegClass` and not a member of `guard`. 0 = not declared.
+    //
+    // ★★★ IT IS A DECLARATION, NOT A GUARD, AND THE DIFFERENCE IS THE WHOLE
+    // SOUNDNESS ARGUMENT. `guard.width` is read by BOTH tiers off the same
+    // `LirInst::flags` byte, which is what keeps the text lowering's election
+    // and the encoder's variant choice identical. A LIR instruction carries
+    // exactly ONE width, so a SECOND width cannot be a guard: the encoder,
+    // re-selecting post-regalloc, would have nothing to read it from. This key
+    // is therefore consumed ONLY by the tier that knows what the programmer
+    // WROTE — `asm_elect::electOpcode`, choosing between candidate OPCODES —
+    // and never by `variantMatchesInst`. The election's answer is then carried
+    // in the instruction's OPCODE field, which the encoder does read, so the
+    // two tiers still cannot disagree.
+    //
+    // ★★ WHY A SECOND WIDTH EXISTS AT ALL. A conversion is one mnemonic whose
+    // two ends deliberately disagree: aarch64 `fcvtzs` is FOUR instructions
+    // (Wd|Xd × Sn|Dn) that gas and clang spell identically, ✔MEASURED — gas
+    // 2.42 and clang 18.1.3 agree on all four: `fcvtzs w0,s1` = 0x1E380020,
+    // `fcvtzs w0,d1` = 0x1E780020, `fcvtzs x0,s1` = 0x9E380020, `fcvtzs x0,d1`
+    // = 0x9E780020. The SOURCE width already rides `guard.width`; only the
+    // DESTINATION width separates the first from the third. Without this key a
+    // dialect row for `fcvtzs` elects the source-width variant and silently
+    // emits the X form for a W destination — ✔MEASURED as exactly that
+    // (`fcvtzs %w0, %s1` → `fcvtzs x16, s29`, 0x9E3803B0) before this key
+    // existed.
+    //
+    // ★ AND THE GATE IS TWO-SIDED, WHICH IS WHAT MAKES THE WRONG WIDTH
+    // UNSAYABLE RATHER THAN MERELY UNLIKELY: a candidate declaring a
+    // `destWidth` that disagrees with the written destination is ELIMINATED,
+    // AND an instruction whose destination width differs from its operation
+    // width is REFUSED unless the elected variant declares a matching one
+    // (`asm_elect::variantHonorsDeclaredDestWidth`). A target that forgets the
+    // key cannot silently keep the old behaviour on the dangerous shape.
+    //
+    // ⓘ ABSENT IS "THIS VARIANT'S RESULT IS AS WIDE AS ITS OPERATION", which
+    // is true of every ordinary instruction and is why every pre-existing
+    // variant is unaffected. validate() refuses it on a variant with no
+    // `resultSlot` — a destination width for a field the variant does not have
+    // — the same coherence rule `resultRegClass` carries.
+    std::uint8_t                       destWidthBits = 0;
+    // ── [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]: the RESULT
+    // field's half of the lane axis — the JSON keys `destLanes` (bool) and
+    // `destLaneBits`, siblings of `destWidth` and read by exactly the tier that
+    // reads it. See `TargetEncodingWire::lanes` for the axis itself.
+    //
+    // ★★★ IT IS A SEPARATE FIELD FROM THE WIRES' AND NOT A CONVENIENCE. An
+    // instruction's two ends can disagree about lanes exactly as they can
+    // disagree about width: ✔MEASURED, `addv b0, v1.8b` = 0x0E31B820 reduces a
+    // vector of eight byte lanes into a SCALAR `b` destination, and both
+    // references reject `addv b0, d1` (a scalar source) and `addv v0.8b, v1.8b`
+    // (a vector destination). One key covering both ends could state neither
+    // case, and a widening form (`saddlp v0.4h, v1.8b`) disagrees in the lane
+    // WIDTH while agreeing that both ends are vectors.
+    bool                               destLanes     = false;
+    std::uint8_t                       destLaneBits  = 0;
     // D-AS4-3: additional placements of the SAME result register in a
     // multi-word template (see `ResultSlotExtra`). Empty for every
     // single-word / single-placement opcode. validate() requires a
@@ -4813,11 +4908,30 @@ public:
     static LoadResult<std::shared_ptr<TargetSchema>> loadFromText(
         std::string_view jsonText, std::string_view sourceLabel = "<inline>");
 
+    // ★★ WHERE THIS DOCUMENT CAME FROM — the label `loadFromText` was given,
+    // which for every shipped and every file load is the ABSOLUTE path the
+    // precedence walk resolved. The TARGET half of
+    // `GrammarSchema::configDocumentOrigin()`, whose docblock carries the full
+    // argument for why attribution is per-document rather than per-process
+    // ([[D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE]]).
+    //
+    // ★ BOTH FAMILIES CARRY IT BECAUSE A DIAGNOSTIC NAMES BOTH DOCUMENTS. The
+    // assembly walker's `pairSuffix()` says "this dialect and this target
+    // disagree"; naming one by path and the other by name would leave a reader
+    // able to open only half of the pair it was told to compare.
+    [[nodiscard]] std::string_view configDocumentOrigin() const noexcept {
+        return documentOrigin_;
+    }
+
 private:
     // Lowercase 64-hex SHA-256 of the document bytes — see `contentDigest()`.
     // Written ONLY by `loadFromText` (a static member, so no friend is
     // needed); every other construction path leaves it empty on purpose.
     std::string contentDigest_;
+
+    // Written ONLY by `loadFromText`, exactly as `contentDigest_` is, and empty
+    // on every other construction path — see `configDocumentOrigin()`.
+    std::string documentOrigin_;
 
     detail::TargetSchemaData d_;
 };

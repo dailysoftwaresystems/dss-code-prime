@@ -508,6 +508,58 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "govern",
                                  o.mnemonic, vi));
             }
+            // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME:
+            // `destWidth` is the WIDTH half of the same fact `resultRegClass`
+            // states the BANK half of, so it carries the identical coherence
+            // rule. A destination width on a variant that writes no
+            // destination governs nothing while reading as a guarantee — and
+            // this one would be worse than `resultRegClass`'s version, because
+            // election ELIMINATES candidates on it: a declaration that can
+            // never be true would silently narrow a candidate set.
+            if (v.destWidthBits != 0 && !v.resultSlot.has_value()) {
+                fail(std::format(
+                         "/opcodes/{}/encoding/variants/{}/destWidth", i, vi),
+                     std::format("opcode '{}' variant {}: declares "
+                                 "`destWidth` {} but has no `resultSlot` — "
+                                 "there is no destination field for the width "
+                                 "to describe, and election eliminates "
+                                 "candidates on this key",
+                                 o.mnemonic, vi,
+                                 static_cast<unsigned>(v.destWidthBits)));
+            }
+            // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]: the LANE
+            // SHAPE is the third member of that family and carries the same two
+            // coherence rules, stated once here and once per wire below.
+            //   (a) a shape for a field the variant does not have;
+            //   (b) a lane width that does not divide the width it views —
+            //       "N lanes of L bits" is only a shape when N is a whole
+            //       number, and a row failing it would elect at a total width
+            //       that happens to match while describing an operand the
+            //       machine cannot address.
+            if (v.destLanes && !v.resultSlot.has_value()) {
+                fail(std::format(
+                         "/opcodes/{}/encoding/variants/{}/destLanes", i, vi),
+                     std::format("opcode '{}' variant {}: declares "
+                                 "`destLanes` but has no `resultSlot` — there "
+                                 "is no destination field to read as a vector, "
+                                 "and election eliminates candidates on this "
+                                 "key",
+                                 o.mnemonic, vi));
+            }
+            if (v.destLaneBits != 0 && v.destWidthBits != 0
+                && (v.destLaneBits > v.destWidthBits
+                    || v.destWidthBits % v.destLaneBits != 0)) {
+                fail(std::format(
+                         "/opcodes/{}/encoding/variants/{}/destLaneBits", i,
+                         vi),
+                     std::format("opcode '{}' variant {}: `destLaneBits` {} "
+                                 "does not divide `destWidth` {} — a "
+                                 "destination read as lanes is a whole number "
+                                 "of them",
+                                 o.mnemonic, vi,
+                                 static_cast<unsigned>(v.destLaneBits),
+                                 static_cast<unsigned>(v.destWidthBits)));
+            }
             for (std::size_t wi = 0; wi < v.wires.size(); ++wi) {
                 auto const& w = v.wires[wi];
                 // Out-of-range indexes are reported by their own rule below;
@@ -537,6 +589,35 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                      o.mnemonic, vi, wi, w.index,
                                      operandKindFilterName(
                                          v.operandKinds[w.index])));
+                }
+                // The lane shape's two coherence rules, per wire — the same
+                // pair the destination carries above.
+                // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]].
+                if (w.lanes && !carriesRegister) {
+                    fail(std::format(
+                             "/opcodes/{}/encoding/variants/{}/wires/{}/lanes",
+                             i, vi, wi),
+                         std::format("opcode '{}' variant {}: wire {} declares "
+                                     "`lanes` but its guard operand {} is '{}', "
+                                     "not a register — there is no register for "
+                                     "the field to read as a vector",
+                                     o.mnemonic, vi, wi, w.index,
+                                     operandKindFilterName(
+                                         v.operandKinds[w.index])));
+                }
+                if (w.laneBits != 0 && v.guardWidthBits != 0
+                    && (w.laneBits > v.guardWidthBits
+                        || v.guardWidthBits % w.laneBits != 0)) {
+                    fail(std::format(
+                             "/opcodes/{}/encoding/variants/{}/wires/{}/laneBits",
+                             i, vi, wi),
+                         std::format("opcode '{}' variant {}: wire {} declares "
+                                     "`laneBits` {}, which does not divide the "
+                                     "guard's width {} — a source read as lanes "
+                                     "is a whole number of them",
+                                     o.mnemonic, vi, wi,
+                                     static_cast<unsigned>(w.laneBits),
+                                     static_cast<unsigned>(v.guardWidthBits)));
                 }
             }
 

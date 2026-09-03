@@ -3004,12 +3004,15 @@ integerLiteralTokenSet(EngineState const& s) {
 }
 
 // FC17 (D-CSUBSET-CONSTEXPR): the FLOAT sibling of `integerLiteralTokenSet` —
-// this schema's `literalTypeIds` filtered to float cores. Populated ONLY into
-// the float-capable `constExprValue` consumer's context (the constexpr
-// initializer check); every integer-required consumer (array dims / enums /
-// static_assert / alignas / case labels) never passes it, so a float literal
-// stays non-foldable there (`int a[1.5+1.5]` / `_Static_assert(1.5>1.0,"")`
-// keep failing loud — the F3 no-leak wall).
+// this schema's `literalTypeIds` filtered to float cores.
+// ⚠ [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]]: BOTH const-expr
+// entry points feed it now. It used to reach only `constExprValue`, on the
+// reading that an integer-required consumer must never fold a float literal at
+// all; ✔MEASURED against all four references, that reading refuses programs each
+// of them accepts (`_Static_assert(0.1L > 0.0L, "")`, `int a[0.1 > 0.0]`,
+// `int a[(int)1.5]`). `constIntExpr` folds the float and then refuses a FLOAT
+// RESULT via `asInt64Bridge`, which is the rule the references actually
+// implement — `int a[1.5+1.5]` still fails loud.
 [[nodiscard]] std::unordered_set<std::uint32_t>
 floatLiteralTokenSet(EngineState const& s) {
     std::unordered_set<std::uint32_t> out;
@@ -3282,12 +3285,16 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
         };
         // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): classify a cast's
         // TARGET type for the offsetof spine — `(T*)0` (pointer), `(char*)x`
-        // (pointer, retype), `(size_t)int` (integer width/signedness). The engine
-        // is interner-free, so this closure (which owns the interner) hands back a
-        // CstCastTarget descriptor. The cast's type-ref is the first Internal child
-        // (`( typeRef ) operand`); resolveTypeNode (c26 handles abstract cast
-        // declarators) folds it. emitOnMiss=false: an unresolved cast type ⇒
-        // nullopt ⇒ the fold fails loud (one positioned diagnostic from the caller).
+        // (pointer, retype), `(size_t)int` (integer width/signedness) — and, since
+        // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]], `(int)1.5`,
+        // `(double)3` and `(_Bool)x` too. The engine is interner-free, so this
+        // closure (which owns the interner) hands back a CstCastTarget descriptor.
+        // ⚠ The type-ref is located by the `casts` row's DECLARED `typeChild`, not
+        // by "the first Internal child" — that sentence stood here after the index
+        // was introduced below and described the code it had replaced.
+        // resolveTypeNode (c26 handles abstract cast declarators) folds it.
+        // emitOnMiss=false: an unresolved cast type ⇒ nullopt ⇒ the fold fails loud
+        // (one positioned diagnostic from the caller).
         env.resolveCastTarget = [&s, &tree, cfg, fromScope](NodeId castNode)
             -> std::optional<CstCastTarget> {
             // ★★ THE DECLARED INDEX, NOT "THE FIRST INTERNAL CHILD"
@@ -3310,82 +3317,16 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
             TypeId const ty = resolveTypeNode(s, *cfg, tree, typeRefN, fromScope,
                                               /*emitOnMiss=*/false);
             if (!ty.valid()) return std::nullopt;
-            TypeInterner const& in = s.lattice.interner();
-            CstCastTarget t;
-            TypeKind const k = in.kind(ty);
-            if (k == TypeKind::Ptr) {
-                t.isPointer = true;
-                auto const ops = in.operands(ty);
-                if (!ops.empty()) t.pointeeType = ops[0];
-                return t;
-            }
-            TypeKind ik = k;   // an enum casts as its underlying integer
-            if (k == TypeKind::Enum) {
-                auto const sc = in.scalars(ty);
-                if (!sc.empty()) ik = static_cast<TypeKind>(sc[0]);
-            }
-            switch (ik) {
-                case TypeKind::Bool: t.isInteger=true; t.intBits=1;  t.intSigned=false; break;
-                case TypeKind::Char:
-                case TypeKind::I8:   t.isInteger=true; t.intBits=8;  t.intSigned=true;  break;
-                case TypeKind::U8:   t.isInteger=true; t.intBits=8;  t.intSigned=false; break;
-                case TypeKind::I16:  t.isInteger=true; t.intBits=16; t.intSigned=true;  break;
-                case TypeKind::U16:  t.isInteger=true; t.intBits=16; t.intSigned=false; break;
-                case TypeKind::I32:  t.isInteger=true; t.intBits=32; t.intSigned=true;  break;
-                case TypeKind::U32:  t.isInteger=true; t.intBits=32; t.intSigned=false; break;
-                case TypeKind::I64:  t.isInteger=true; t.intBits=64; t.intSigned=true;  break;
-                case TypeKind::U64:  t.isInteger=true; t.intBits=64; t.intSigned=false; break;
-                // ★ D-CSUBSET-INT128-CONSTFOLD (TF-C94): the two 128-bit STANDARD
-                // kinds. WITHOUT these rows they fell to `default: nullopt` and the
-                // whole cast was non-foldable — which MEASURED as *every* 128-bit
-                // integer constant expression refusing, not just wide ones:
-                // `_Static_assert((__uint128_t)5 == 5, "")` fired S_StaticAssertFailed
-                // ("not an integer constant expression"), and so did `(__uint128_t)5`,
-                // `((__uint128_t)5 + 1) == 6` and `(int)((__uint128_t)5) == 5`, while
-                // the `_BitInt(128)` twin of the first was already clean. These rows
-                // are what make the 128-bit arm in cst_const_eval.cpp's Cast fold
-                // (which routes them through the bignum, NOT through the int64
-                // `narrowIntToBits`) reachable at all.
-                //   ★ WHY `isInteger` AND NOT `isBitPrecise`: a `__int128` is a
-                // STANDARD-rank integer, not a bit-precise one. Carrying it as
-                // `isBitPrecise` would tag the folded result `TypeKind::BitInt` and a
-                // `__int128` expression would silently change type mid-fold (the exact
-                // hazard `bitIntOperandType` orders its checks against). The 128-bit
-                // Cast arm keys on `intBits == 128` and mints an I128/U128 core.
-                //   ★ NO TRUNCATION IS OPENED BY THIS — MEASURED, and this is the
-                // load-bearing safety property. ⚠ THE RULE IS THE VALUE'S MAGNITUDE,
-                // NOT ITS DECLARED WIDTH — it was width until P42 closed
-                // [[D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE]], and a rationale
-                // that has gone false is worse than none. The folded value rides a
-                // 128-bit `BitIntValue`, and `asInt64` (const_eval_arith.hpp) bridges
-                // it to the 64-bit ICE slots IFF `INT64_MIN <= value <= INT64_MAX`;
-                // anything outside that range nullopts, so `asInt64Bridge` — the
-                // array-dimension / static-assert / enumerator bridge — fails loud
-                // rather than narrowing, and the generic `isInteger` narrowing arm
-                // below is never reached for an out-of-range operand for the same
-                // reason. `_BitInt(128)` obeys the identical rule (one predicate, both
-                // 128-bit families): `int a[(_BitInt(128))5];` ACCEPTS at 5, while
-                // `int a[((__int128)1 << 100) + 3];` MEASURED S_NonConstantArrayLength
-                // — and THAT is the cell that proves it, because 2^100+3 has low 64
-                // bits of exactly 3, so a truncating fold would have built a silent
-                // `int a[3]` instead of refusing. Pinned by
-                // `SemanticAnalyzerC.Int128WideConstantNeverTruncatesIntoA64BitSlot`.
-                case TypeKind::I128: t.isInteger=true; t.intBits=128; t.intSigned=true;  break;
-                case TypeKind::U128: t.isInteger=true; t.intBits=128; t.intSigned=false; break;
-                // C23 6.3.1.3 (D-CSUBSET-BITINT-CONSTFOLD-LARGE, C4b): a cast TO
-                // `_BitInt(N)` folds via the wrap-aware bignum at width N (mod-2^N),
-                // for ANY N (narrow AND wide) — `(_BitInt(4))15 + 1 == 0` /
-                // `(_BitInt(40))2000000 * ...`. Carried as the bit-precise descriptor
-                // (NOT `isInteger`, whose `intBits` maxes at 64 and whose narrow
-                // fold cannot express a wide `_BitInt`).
-                case TypeKind::BitInt:
-                    t.isBitPrecise = true;
-                    t.bitWidth = static_cast<std::uint32_t>(in.bitIntWidth(ty));
-                    t.bitSigned = in.bitIntIsSigned(ty);
-                    return t;
-                default: return std::nullopt;   // float / aggregate — non-foldable cast
-            }
-            return t;
+            // ★★ ONE CLASSIFIER, NOT ONE PER TIER
+            // ([[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]). The
+            // TypeId → descriptor switch that used to be written out here has
+            // MOVED (not been copied) to `classifyCstCastTarget` in
+            // `src/hir/cst_const_eval.cpp`, beside the descriptor it builds,
+            // because the HIR-lowering tier needs the identical answer for an
+            // index designator's `[(int)1.5]`. What stays here is the only part
+            // that is genuinely this tier's: finding the cast's type node through
+            // the DECLARED `casts` row and resolving it in THIS scope.
+            return classifyCstCastTarget(s.lattice.interner(), ty);
         };
         // c43: resolve a struct/union field's byte offset + type for `&((T*)0)->M`.
         // Looks the field name up in the container's MEMBER SCOPE (Pass-1 binds
@@ -3468,9 +3409,9 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
     // integer const-expr context — they are integer constant expressions per
     // C23 6.6 (closes the pre-existing `_Static_assert(true)` gap alongside the
     // shared evaluator's narrow-char arm). The map excludes NullptrT rows by
-    // construction. NO float set here — integer-required consumers keep floats
-    // non-foldable (the F3 wall).
+    // construction.
     auto fixedVals = fixedValueTokenMap(tree);
+    auto floatLits = floatLiteralTokenSet(s);
     CstEvalContext ctx{tree, tree.schema(), intLits, s.idx().numberStyle};
     ctx.fixedValueTokens = &fixedVals;
     // C4b (Fork-2c): supply the `integerLiteralTyping` rules so a `wb`/`uwb`
@@ -3478,8 +3419,34 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
     // an ICE `_BitInt` array dim). Absent cfg ⇒ empty ⇒ off (unchanged behavior).
     if (cfg != nullptr) ctx.integerLiteralTyping = cfg->integerLiteralTyping;
     ctx.dataModel = s.dataModel;
+    // ★★ [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]] — FLOAT OPERANDS
+    // FOLD HERE, AND THE WALL IS THE RESULT'S ARM, NOT THE LEAF.
+    //
+    // This used to carry NO float set and NO `allowFloat`, on the reading that an
+    // integer-required consumer must refuse a float anywhere in the expression
+    // ("the F3 wall"). ✔MEASURED, that reading is not what any reference
+    // implements: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51 —
+    // probed SEPARATELY — all four accept `_Static_assert(0.1L > 0.0L, "")`,
+    // `int a[0.1 > 0.0]`, `enum E { A = (0.1 > 0.0) }`, `struct S { int x : (0.1 >
+    // 0.0) + 3; }` and `int a[(int)1.5]`. A comparison YIELDS an int and a cast to
+    // int IS an int; C 6.6p10 lets an implementation accept such forms and all
+    // four do, so under `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` DSS must too.
+    //
+    // ★ WHAT STILL FAILS LOUD, AND WHY IT NEEDS NO NEW CODE: `asInt64Bridge`
+    // below refuses a `double`/`WideFloatValue` RESULT arm. So `int a[1.5]` and
+    // `int a[1.5 + 1.5]` fold to a FLOAT and come back nullopt exactly as before —
+    // ✔MEASURED gcc refuses both ("size of array has non-integer type"). The
+    // guarantee "no float VALUE reaches an integer-required consumer" is
+    // unchanged; only the place it is enforced moved, from a leaf that could not
+    // see the result type to the bridge that can.
+    if (cfg != nullptr) ctx.floatLiteralTyping = cfg->floatLiteralTyping;
+    ctx.floatLiteralTokens = &floatLits;
+    ctx.longDoubleFormat   = s.longDoubleFormat;
     CstEvalEnvironment env = buildConstEvalEnv(s, tree, fromScope, cfg);
-    ConstEvalResult const r = evaluateConstantCst(node, ctx, env, {}, fromScope.v);
+    EvalOptions options;
+    options.allowFloat = true;
+    ConstEvalResult const r = evaluateConstantCst(node, ctx, env, options,
+                                                 fromScope.v);
     if (!r.value.has_value()) return std::nullopt;
     return asInt64Bridge(*r.value);
 }
@@ -3777,13 +3744,15 @@ genericSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // compile-time `HirLiteralValue` (int / uint / bool / float arm), or nullopt
 // when it is not a compile-time constant. Differences from constIntExpr,
 // each deliberate:
-//   * `floatLiteralTokens` is populated (float literals fold at the leaf) and
-//     `EvalOptions.allowFloat` is on (float arithmetic folds — the SAME CE5
-//     engine walls the HIR-side evaluator uses), so `constexpr double PI2 =
-//     3.5 * 2;` validates — while every integer-required consumer keeps both
-//     off (the F3 no-leak walls);
 //   * returns the full `HirLiteralValue` (no asInt64Bridge) — the constexpr
-//     check needs "is it a compile-time constant", not an int64;
+//     check needs "is it a compile-time constant", not an int64. ⚠ THIS IS NOW
+//     THE ONLY DIFFERENCE THAT MATTERS: the float set and `allowFloat` used to
+//     be the other half of the split, and are not any more —
+//     [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]] gave `constIntExpr`
+//     both, because the reference toolchains fold a float sub-expression in an
+//     integer constant expression and reject only a float RESULT. So the two
+//     evaluators differ ONLY in what they hand back, which is what the names
+//     say;
 //   * shares `buildConstEvalEnv` (the 6 resolvers) VERBATIM with constIntExpr,
 //     so `constexpr int N = M + 1;` resolves M exactly as `int a[M + 1]` does.
 [[nodiscard]] std::optional<HirLiteralValue>
@@ -4443,13 +4412,43 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
     }
     if (!suffix.valid()) return out;   // no `: W` on this field
     out.present = true;
-    auto emit = [&](DiagnosticCode code) {
+    // ★★ [[D-DIAG-BITFIELD-REJECT-CARRIES-NO-MESSAGE]] — EVERY ARM SAYS WHAT IS
+    // WRONG. This lambda used to take a CODE and nothing else, and set
+    // `d.actual = tree.text(suffix)`. Two things were wrong with that, and the
+    // second one is why the first was never noticed:
+    //
+    //  (1) NO MESSAGE AT ALL. ✔MEASURED through the shipped CLI,
+    //      `struct P { int x : -1; };` rendered as
+    //      `error[S_BitFieldWidthOutOfRange]: [target=…] : -1` — the code, the
+    //      target, and a copy of the source the caret was already under. Four
+    //      distinct constraint violations (C 6.7.2.1 p3/p4/p5 plus DSS's own
+    //      allocation-unit ceiling) shared one code and zero words. The sibling
+    //      resolver forty lines up (`applyArraySuffix`) has taken a message per
+    //      arm all along; this is that shape, applied here.
+    //
+    //  (2) `tree.text(suffix)` IS NOT A SAFE RENDERING OF A COMPOSITE SPAN. The
+    //      suffix node's tokens need not be contiguous — or even ordered — in the
+    //      preprocessed buffer, because a token spelled inside a macro
+    //      replacement list keeps that list's offsets. ✔MEASURED: with
+    //      `#define WIDTH_LIMIT 200` / `#define GUARD(name) struct name { int
+    //      slot : WIDTH_LIMIT; }`, the `:` came from one `#define` line and the
+    //      width from another, and the message body was the bytes BETWEEN them —
+    //      `200\n#define GUARD(name) struct name { int slot :`. With a predefined
+    //      macro as the width, the same slice printed the ENTIRE `<built-in>`
+    //      prologue. The values this validator already holds describe the fault
+    //      exactly and cannot mis-slice, so they are what it reports.
+    //
+    // ⚠ The SPAN is untouched and still mis-points through a macro expansion —
+    // that is a separate, general defect (a `Token` carries its SPELLING location
+    // only), tracked at [[D-PP-DIAGNOSTIC-ATTRIBUTED-TO-BUILTIN-PROLOGUE]]. What
+    // changed is that the message no longer DEPENDS on the span being sane.
+    auto emit = [&](DiagnosticCode code, std::string why) {
         ParseDiagnostic d;
         d.code     = code;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(suffix);
-        d.actual   = std::string{tree.text(suffix)};
+        d.actual   = std::move(why);
         s.reporter.report(std::move(d));
     };
     if (!fieldType.valid()) return out;   // unresolved base — upstream already loud
@@ -4484,7 +4483,13 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
         (k == TypeKind::BitInt)
             ? static_cast<std::uint32_t>(s.lattice.interner().bitIntWidth(reprType))
             : intBits(k);
-    if (typeBits == 0) { emit(DiagnosticCode::S_BitFieldNonIntegerType); return out; }
+    if (typeBits == 0) {
+        emit(DiagnosticCode::S_BitFieldNonIntegerType,
+             "a bit-field's type shall be _Bool, signed int, unsigned int or "
+             "another implementation-defined integer type (C 6.7.2.1p5); this "
+             "one is declared with a non-integer type");
+        return out;
+    }
     // A bit-field on a >32-bit base (`long`/`long long`/I64/U64) needs a 64-bit
     // allocation-unit access. D-CSUBSET-BITFIELD-WIDE-UNIT (v0.0.2 FC8) closed the
     // last codegen gap — materializing a 64-bit constant > int32 (the wide-mask
@@ -4494,19 +4499,46 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
     // encoded, so 64-bit-base bit-fields now compile + run end-to-end. I128/U128
     // bit-fields stay rejected — there is no 128-bit allocation-unit codegen (no
     // 128-bit `mov`/ALU forms). 8/16/32/64-bit integer bases are the supported set.
-    if (typeBits > 64) { emit(DiagnosticCode::S_BitFieldWidthOutOfRange); return out; }
+    if (typeBits > 64) {
+        emit(DiagnosticCode::S_BitFieldWidthOutOfRange,
+             std::format("a bit-field's base type is {} bits wide, and this "
+                         "compiler allocates bit-field units of 8, 16, 32 or 64 "
+                         "bits only", typeBits));
+        return out;
+    }
     NodeId widthNode{};
     if (bs.widthChild.has_value()) {
         auto sufKids = visibleChildren(tree, suffix);
         if (*bs.widthChild < sufKids.size()) widthNode = sufKids[*bs.widthChild];
     }
     auto w = constIntExpr(s, tree, widthNode, fromScope, cfg);
-    if (!w.has_value() || *w < 0
-        || static_cast<std::uint64_t>(*w) > typeBits) {
-        emit(DiagnosticCode::S_BitFieldWidthOutOfRange); return out;
+    // THREE DISTINCT FAULTS, THREE DISTINCT SENTENCES — they shared one wordless
+    // diagnostic, so a reader could not tell "the width did not fold" from "the
+    // width is 200 and the type holds 32".
+    if (!w.has_value()) {
+        emit(DiagnosticCode::S_BitFieldWidthOutOfRange,
+             "a bit-field width must be an integer constant expression "
+             "(C 6.7.2.1p4), and this one does not fold to a constant");
+        return out;
+    }
+    if (*w < 0) {
+        emit(DiagnosticCode::S_BitFieldWidthOutOfRange,
+             std::format("a bit-field width must not be negative "
+                         "(C 6.7.2.1p4); this one is {}", *w));
+        return out;
+    }
+    if (static_cast<std::uint64_t>(*w) > typeBits) {
+        emit(DiagnosticCode::S_BitFieldWidthOutOfRange,
+             std::format("a bit-field width must not exceed the width of its "
+                         "base type (C 6.7.2.1p4); this one is {} and the base "
+                         "type holds {} bits", *w, typeBits));
+        return out;
     }
     if (*w == 0 && hasName) {   // C 6.7.2.1p3: a zero-width bit-field has no name
-        emit(DiagnosticCode::S_BitFieldWidthOutOfRange); return out;
+        emit(DiagnosticCode::S_BitFieldWidthOutOfRange,
+             "a bit-field of width 0 shall have no declarator, i.e. it must be "
+             "unnamed (C 6.7.2.1p3); this one has a name");
+        return out;
     }
     out.width = static_cast<std::uint32_t>(*w);
     return out;
@@ -12292,6 +12324,55 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                     s.reporter.report(std::move(d));
                     return;
                 }
+                // ★★ D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY
+                // — THE RANGE WARNING (P54 lane `fw`; the sibling row, closed
+                // hours earlier, made the literal COMPILE and deliberately said
+                // nothing about it). The correctly-rounded value of a literal
+                // like `1e400` at its own declared type is ±∞, which is a value
+                // and not an error — and it is also the one rounding a
+                // programmer essentially never intends, so it is reported.
+                //
+                // ★ WHY HERE AND NOT AT THE DECODE. The value is decoded in the
+                // CST→HIR tier, which is the obvious home and the wrong one:
+                // lowering runs only when the semantic tier produced no errors,
+                // and it never reaches a literal in an UNEVALUATED operand.
+                // ✔MEASURED 2026-09-02 that gcc 13.3.0 and clang 18.1.3 both
+                // warn about `1e400` inside `sizeof(1e400)`, a `_Static_assert`
+                // condition, an `if (0)` branch, an uncalled function and an
+                // unused file-scope static alike — i.e. the diagnostic is a
+                // property of the literal and its type, owed for every
+                // occurrence in the translation unit, not of what a later phase
+                // does with the value. `typeLiteralIfAny` is the ONE chokepoint
+                // that sees every float literal token exactly once, and it is
+                // where the INTEGER sibling's range diagnostic
+                // (S_IntegerLiteralTooLarge) already lives and already decodes a
+                // value for exactly this purpose.
+                //
+                // ★ THE DECODE IS THE SHARED ONE. `decodeFloatLiteralAtKind` is
+                // the SAME chokepoint the CST→HIR literal leaf and the CST
+                // const-evaluator now route through, so the warning cannot
+                // disagree with the value that ships: it fires exactly when the
+                // value stored in the literal pool is an infinity. Writing the
+                // wide/narrow dispatch out a third time here is what that
+                // chokepoint exists to prevent.
+                //
+                // Typing is UNAFFECTED — no `return`, the literal is a perfectly
+                // good constant of its type and the stamp below still runs.
+                if (auto const fd = decodeFloatLiteralAtKind(
+                        tree.text(node), s.idx().numberStyle, fk.kind);
+                    fd.roundedToInfinity()) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_FloatLiteralOverflowsToInfinity;
+                    d.severity = DiagnosticSeverity::Warning;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = std::format(
+                        "floating constant '{}' exceeds the range of '{}' and "
+                        "rounds to infinity", tree.text(node),
+                        fk.typeName.empty() ? std::string_view{"this floating type"}
+                                            : fk.typeName);
+                    s.reporter.report(std::move(d));
+                }
                 litTy = s.lattice.interner().primitive(fk.kind, fk.vocabularyName);
             }
             // C11/C23 6.4.4.4: a PREFIXED character constant (`L'x'`/`u'x'`/`U'x'`/
@@ -12444,6 +12525,72 @@ void preStampLiteralLeaves(EngineState& s, SemanticConfig const& cfg,
     }
 }
 
+// [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]]: one folded constant, as
+// text for a diagnostic — or nullopt for a value with no numeric rendering (a
+// pointer, a string, an aggregate), which the caller reports as "did not fold to
+// something I can show you" rather than as a number.
+//
+// ★ EVERY NUMERIC ARM IS HANDLED, INCLUDING THE TWO THAT DO NOT FIT AN INT64.
+// Routing this through `asInt64Bridge` would have collapsed a float and an
+// above-INT64_MAX unsigned into the same "no value" answer, which is precisely
+// the blindness this instrument exists to remove. An F80/F128 value renders
+// through the kernel's `toDouble()` — a diagnostic wants a readable magnitude,
+// not the exact 64-bit significand, and the value's own fold already ran at true
+// target precision.
+[[nodiscard]] std::optional<std::string>
+renderFoldedValue(HirLiteralValue const& v) {
+    if (auto const* p = std::get_if<std::int64_t>(&v.value))  return std::to_string(*p);
+    if (auto const* p = std::get_if<std::uint64_t>(&v.value)) return std::to_string(*p);
+    if (auto const* p = std::get_if<bool>(&v.value))          return std::string{*p ? "1" : "0"};
+    // A float renders so that it still READS as a float: `std::format` prints
+    // 0.0 as "0", and "(folded: 0.1 Lt 0)" in a message about a floating
+    // comparison invites the reader to think an integer got in there.
+    auto const asFloatText = [](double d) {
+        std::string t = std::format("{}", d);
+        bool const plain = t.find_first_not_of("-0123456789") == std::string::npos;
+        if (plain) t += ".0";
+        return t;
+    };
+    if (auto const* p = std::get_if<double>(&v.value))        return asFloatText(*p);
+    if (auto const* p = std::get_if<WideFloatValue>(&v.value))
+        return asFloatText(p->toDouble());
+    if (std::holds_alternative<BitIntValue>(v.value)) {
+        // The shared magnitude-correct bridge, not `BitIntValue::asI64` (which
+        // reads the low limb and would print a plausible wrong number for a
+        // wide value). No int64 rendering ⇒ say so rather than invent one.
+        if (auto const iv = asInt64Bridge(v)) return std::to_string(*iv);
+        return std::string{"<a _BitInt value wider than int64>"};
+    }
+    return std::nullopt;
+}
+
+// A node's source text, made SAFE TO PUT IN A MESSAGE: whitespace runs collapse
+// to one space and the result is capped.
+//
+// ⚠ THE CAP IS NOT TIDINESS. A composite node's span can cover unrelated bytes
+// when its tokens were spelled in different macro replacement lists, and an
+// uncapped `tree.text` then pastes that whole region into the diagnostic —
+// ✔MEASURED at the bit-field width validator, where a predefined-macro width
+// printed the ENTIRE `<built-in>` prologue as the message body. A snippet cannot
+// repair a wrong span (see [[D-PP-DIAGNOSTIC-ATTRIBUTED-TO-BUILTIN-PROLOGUE]]),
+// but it can stop one wrong span from burying every other diagnostic in the run.
+[[nodiscard]] std::string operandSpelling(Tree const& tree, NodeId n) {
+    constexpr std::size_t kMaxChars = 48;
+    std::string_view const raw = tree.text(n);
+    std::string out;
+    bool pendingSpace = false;
+    for (char const c : raw) {
+        bool const ws = (c == ' ' || c == '\t' || c == '\n' || c == '\r'
+                         || c == '\f' || c == '\v');
+        if (ws) { pendingSpace = !out.empty(); continue; }
+        if (pendingSpace) { out.push_back(' '); pendingSpace = false; }
+        if (out.size() >= kMaxChars) { out += "..."; break; }
+        out.push_back(c);
+    }
+    if (out.empty()) return "<no source text>";
+    return "`" + out + "`";
+}
+
 // D-CSUBSET-STATIC-ASSERT-OPERAND-DIAGNOSTIC: the FOLDED OPERANDS of a failing
 // static assertion's condition, rendered as a suffix for its diagnostic — or an
 // EMPTY string when the condition is not a binary comparison (degrade, never
@@ -12470,12 +12617,21 @@ void preStampLiteralLeaves(EngineState& s, SemanticConfig const& cfg,
 //
 // The condition child is an `assignmentExpr`-shaped wrapper, so a BOUNDED
 // transparent descent (single-Internal-child layers — wrappers and parens) runs
-// first. Each operand is re-folded through `constIntExpr`, the SAME evaluator that
-// folded the whole condition; it is re-callable on any sub-node and emits nothing
-// (its resolvers all run with emitOnMiss=false), so this instrument can never add
-// a diagnostic of its own. A side that does not fold (a short-circuited
-// `LogicalOr` rhs, a non-ICE operand) renders as `<non-constant>` — still
-// discriminating, still honest.
+// first. Each operand is re-folded through `constExprValue`, the SAME evaluator
+// that folded the whole condition; it is re-callable on any sub-node and emits
+// nothing (its resolvers all run with emitOnMiss=false), so this instrument can
+// never add a diagnostic of its own.
+//
+// ★★ AN OPERAND THAT DOES NOT FOLD NOW NAMES ITSELF
+// ([[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]]). It used to render the
+// fixed string `<non-constant>`, and that string is the same for every operand
+// that fails to fold — so on the one failure this suffix exists to explain, the
+// suffix said nothing at all. ✔MEASURED before this change:
+// `_Static_assert(0.1L > 0.0L, "")` reported `(folded: <non-constant> Gt
+// <non-constant>)`, naming neither operand nor the reason. The operand's own
+// SOURCE TEXT is the channel that discriminates it, and it costs the macro
+// property nothing: the sqlite `mach/message.h` case this instrument was built
+// for has operands that DO fold, so it still reports their values.
 [[nodiscard]] std::string
 foldedConditionOperands(EngineState& s, SemanticConfig const& cfg,
                         Tree const& tree, NodeId condNode, ScopeId here) {
@@ -12515,9 +12671,10 @@ foldedConditionOperands(EngineState& s, SemanticConfig const& cfg,
     }
     if (entry == nullptr) return {};   // an operator this language does not declare
     auto const side = [&](NodeId n) -> std::string {
-        auto const v = constIntExpr(s, tree, n, here, &cfg);
-        return v.has_value() ? std::to_string(*v)
-                             : std::string{"<non-constant>"};
+        if (auto const v = constExprValue(s, tree, n, here, &cfg)) {
+            if (auto rendered = renderFoldedValue(*v)) return *rendered;
+        }
+        return operandSpelling(tree, n);
     };
     return " (folded: " + side(lhsN) + " " + entry->target + " " + side(rhsN)
            + ")";
@@ -14480,12 +14637,14 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // static-assertion declaration. The construct is valid at BOTH file and block
     // scope; `pass2Post` visits it in both because it walks EVERY node (the check
     // is node-based, not symbol-based — the declaration mints no symbol). The
-    // condition is const-evaluated through the SAME `constIntExpr` evaluator that
-    // folds `sizeof(T)` / enum constants / arithmetic in an array dimension (it
-    // wires `resolveSizeof` off `s.aggregateLayout`), so `sizeof(int)==4` folds
-    // here exactly as `int a[sizeof(int)]` does. A fold to ZERO — OR a condition
-    // that does not fold to an integer constant expression (non-const / float /
-    // unresolved; C 6.7.10 requires an ICE) — fails loud with S_StaticAssertFailed.
+    // condition is const-evaluated through the SAME shared evaluator that folds
+    // `sizeof(T)` / enum constants / arithmetic in an array dimension (it wires
+    // `resolveSizeof` off `s.aggregateLayout`), so `sizeof(int)==4` folds here
+    // exactly as `int a[sizeof(int)]` does — via `constExprValue`, the full-value
+    // entry point, because this door asks for a TRUTH value and not for an int64
+    // ([[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]]). A fold to a FALSE
+    // value — OR a condition that does not fold to a compile-time constant at all
+    // (non-const / unresolved) — fails loud with S_StaticAssertFailed.
     // A NONZERO fold produces nothing (the construct also lowers to nothing: its
     // hirLowering row maps to Skip). The child roles are POSITIONAL, matching the
     // grammar `keyword '(' condition [ ',' message ] ')' ';'`: the FIRST meaningful
@@ -14512,9 +14671,32 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 message = std::move(*decoded);
             }
         }
-        std::optional<std::int64_t> folded;
-        if (condNode.valid()) folded = constIntExpr(s, tree, condNode, here, &cfg);
-        bool const failed = !folded.has_value() || *folded == 0;
+        // ★★ [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]] — THE
+        // CONDITION IS A TRUTH QUESTION, SO IT IS ASKED AS ONE.
+        //
+        // This used to fold through `constIntExpr` and compare the int64 to 0,
+        // which conflated two different refusals: "this is not a compile-time
+        // constant" and "this constant has no int64 rendering". ✔MEASURED, the
+        // second refusal rejects programs the references accept —
+        // `_Static_assert(0xFFFFFFFFFFFFFFFFULL, "")` (above INT64_MAX) compiles
+        // on all four, and `_Static_assert(1.5, "")` compiles on clang 18.1.3 and
+        // MSVC 19.51 (gcc 13.3.0 and mingw-w64 gcc 13.2.0 refuse it as "not an
+        // integer"; the disjunction governs an accept-vs-refuse split, so DSS
+        // accepts). Both have a defined TRUTH value, which is the only thing
+        // 6.7.11 asks of the condition once it is constant.
+        //
+        // ★ THE FALSE DIRECTION IS THE ONE THAT MATTERS AND IT IS UNCHANGED:
+        // `_Static_assert(0.0, "")` folds to a constant that is FALSE, so it fails
+        // as a failed assertion — ✔MEASURED all four refuse it, clang and MSVC
+        // with exactly that wording. A fix that merely stopped evaluating the
+        // operand would pass a positive-only pin and lose this.
+        std::optional<bool> truth;
+        if (condNode.valid()) {
+            if (auto const v = constExprValue(s, tree, condNode, here, &cfg)) {
+                truth = asBoolBridge(*v, /*allowFloat=*/true);
+            }
+        }
+        bool const failed = !truth.has_value() || !*truth;
         if (failed) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::S_StaticAssertFailed;
@@ -14524,7 +14706,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             // The message discriminates the two failure modes on ONE code: a
             // FALSE assertion carries the author's string; a NON-CONSTANT
             // condition says so (C requires an integer constant expression).
-            if (!folded.has_value()) {
+            if (!truth.has_value()) {
                 d.actual = "static assertion condition is not an integer constant "
                            "expression";
                 if (!message.empty())

@@ -1262,6 +1262,23 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             // elf exit 127), not a size regression. Order-INDEPENDENT: whichever
             // CU's row lands first, the bit is ORed in.
             kept.isEagerImport = kept.isEagerImport || e.isEagerImport;
+            // `binding` — STRONGEST WINS, as `ExternImport::binding`'s own
+            // contract note in extern_import.hpp mandates
+            // (D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE). A STRONG
+            // reference anywhere in the program makes the symbol REQUIRED, so a
+            // CU that declared the import plain must not have its requirement
+            // erased by a sibling CU that declared the same name `weak` — that
+            // erasure is a program which links with the symbol absent and then
+            // reads through a null address. NOT a conflict like `isData`: both
+            // rows name the same object bound the same way and differ only in
+            // whether their own TU can do without it, which is a DEFINED fold.
+            // Order-INDEPENDENT: `Weak` < `Global` in the shared enum, so the max
+            // is the same whichever row lands first, and Local never reaches here
+            // (`collectExterns` refuses it at the declaration). The rule lives in
+            // `strongerReferenceBinding` so this tier and the linker's dedup fold
+            // read ONE owner — see its docblock for why it does not compare the
+            // enumerators numerically.
+            kept.binding = strongerReferenceBinding(kept.binding, e.binding);
             // `isData` / `isThreadLocal` — silently picking either row is the
             // D-LK-EXTERN-DATA-IMPORT silent-miscompile shape: `isData` decides
             // whether the walker binds the name through the DATA-slot model (the

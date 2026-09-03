@@ -163,7 +163,11 @@ public:
 
     // Every "this pair does not realize that" message ends the same way, and
     // the tail is what makes the diagnostic actionable: it names the two config
-    // documents the reader has to open.
+    // documents the reader has to open — by PATH as well as by name, because a
+    // name is identical in every checkout and the path is the only part that
+    // says WHICH TREE answered
+    // ([[D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE]]; the definition
+    // carries the measurement).
     [[nodiscard]] std::string pairSuffix() const;
 
     [[nodiscard]] bool ok() const noexcept { return ok_; }
@@ -201,6 +205,20 @@ struct DSS_EXPORT AsmDecodedOperand {
     LirReg         reg          = InvalidLirReg;
     LirRegClass    regClass     = LirRegClass::None;
     std::uint32_t  regWidthBits = 0;
+    // ★★★ THE LANE ARRANGEMENT THE SPELLING CARRIED, in bits per lane, or 0
+    // for "it carried none". [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]].
+    //
+    // ★★ IT IS A SECOND FIELD BECAUSE `regWidthBits` CANNOT HOLD IT AND WAS
+    // BEING ASKED TO. `v1.8b`, `v1.4h`, `v1.2s` and `d1` are all 64 bits and
+    // are four different operand shapes; an arrangement applied AS a width and
+    // then discarded made all four the same query at election. ✔MEASURED at
+    // the P54 base: `cnt d0, d1` emitted `cnt v0.8b, v1.8b` and
+    // `fadd v0.8b, v1.8b, v2.8b` emitted `fadd d0, d1, d2` — two spellings gas
+    // 2.42 and clang 18.1.3 both REJECT, one of them a silent wrong answer.
+    // ⚠ 0 IS A STATEMENT ("no arrangement"), never "unknown": every decode path
+    // that produces a register operand sets it, and the election treats it as a
+    // value rather than skipping the comparison.
+    std::uint32_t  regLaneBits  = 0;
     std::string    regSpelling;   // as written, for the width diagnostic
     // Immediate / displaced-scalar role: the literal value, when the scalar
     // was a NUMBER. `symbol` is set instead when it was a name.

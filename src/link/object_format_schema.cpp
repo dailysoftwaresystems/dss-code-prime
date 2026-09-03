@@ -541,6 +541,33 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                              allNames(kWeakDefinitionDialectTable), " or ")));
     }
 
+    // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET: a
+    //    PRESENT `objectImportSlot` block must name a prefix ──────────────
+    //
+    // The SHAPE rule only, for the same reason the `weakDefinition` arm above
+    // states its own: presence is the declaration, so absence is not an error
+    // here. What IS an error is a block that is present and empty — the slot
+    // would then be published under the IMPORTED SYMBOL'S OWN NAME, which the
+    // final linker reads as this object DEFINING the name it is importing.
+    //
+    // ⚠ THE PAIRING RULE — that a relocatable format declaring
+    // `dataImportBinding` MUST declare this block, and that an IMAGE format
+    // must NOT — is enforced at the LINKER and deliberately not here. It reads
+    // `isImageFlavor()`, which is a BACKEND question (`ObjectFormatSchema`),
+    // and `validate()` runs on the DATA. Stating half of it here from the
+    // `container` field would be a second, weaker spelling of one rule, which
+    // is the drift shape this file's own `cSymbolDecoration` history records.
+    if (objectImportSlot.has_value() && objectImportSlot->symbolPrefix.empty()) {
+        fail("/objectImportSlot/symbolPrefix",
+             "'objectImportSlot' is present but declares an empty "
+             "'symbolPrefix' — a DECLARED block must state the name the "
+             "object-carried data-import slot is published under. An empty "
+             "prefix publishes the slot under the IMPORT'S OWN name, so the "
+             "object would DEFINE the symbol it is importing. Omit the block "
+             "entirely to declare that this format carries no slot. "
+             "D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET.");
+    }
+
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): container rules ──
     //
     // `container: archive` is a STATIC-LIBRARY format: its driver output is

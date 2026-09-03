@@ -181,6 +181,24 @@ static_assert(std::is_reference_v<decltype(cSubset())>,
     return std::nullopt;
 }
 
+// How MANY reports a (code, severity) pair drew.
+// D-PP-VA-SPECIAL-IDENTIFIER-OUTSIDE-REPLACEMENT-LIST: a constraint that fires
+// per OCCURRENCE needs a COUNT, not a presence bit. `hasPPCode` cannot tell one
+// report from three, and `ppCodeSeverity` returns only the FIRST — so a check
+// that collapsed every occurrence on a line into a single report, or that
+// double-reported one occurrence from two call sites, would stay green under
+// both of them. The severity is part of the key because the same code is used
+// at Error severity by the sibling refusals in this file.
+[[nodiscard]] std::size_t ppCountCodeAtSeverity(PreprocessResult const& r,
+                                                DiagnosticCode     code,
+                                                DiagnosticSeverity sev) {
+    std::size_t n = 0;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.code == code && d.severity == sev) ++n;
+    }
+    return n;
+}
+
 // Read the shipped c config TEXT so a test can REBIND a single config
 // field and reload, proving the engine reads that field from config rather than
 // hard-coding a lexeme. Returns "" if not found — the ~14 callers each already
@@ -928,6 +946,576 @@ TEST(Preprocessor, VaArgsInNonVariadicMacroFailsLoud) {
     }
 }
 
+// ══ D-PP-VA-SPECIAL-IDENTIFIER-OUTSIDE-REPLACEMENT-LIST ═════════════════════
+//
+// C23 6.10.5p5 is a CONSTRAINT: the variadic catch-all identifier and the va-opt
+// introducer "shall occur only in the replacement-list of a function-like macro
+// that uses the ellipsis notation". DSS used to enforce it ONLY inside a
+// `#define`; every other position was accepted in SILENCE.
+//
+// ★★ THE SEVERITY IS THE SUBJECT OF THESE PINS, NOT AN INCIDENTAL PROPERTY, so
+// every one of them asserts `ppCodeSeverity` rather than `hasPPCode` -- the same
+// lesson `ppCodeSeverity` was introduced for. ✔MEASURED 2026-09-02, each of the
+// four reference toolchains invoked SEPARATELY, compile-only: gcc 13.3.0 (WSL),
+// gcc 13.2.0 (mingw-w64), clang 18.1.3 (WSL) and cl 19.51.36252 EACH diagnose
+// and EACH exit 0 at their DEFAULT settings; only `-pedantic-errors` / `/W4 /WX`
+// make it fatal. The union decides ACCEPTANCE, so a refusal here would put DSS
+// above it and silence leaves it below it -- a Warning is the only answer level
+// on both axes, and `--warnings-as-errors` reproduces the strict arm.
+//
+// RED-ON-DISABLE (REMOVE direction): delete the `specialVariadicSpelling` call
+// from `Preprocessor::run`'s live-token path and the ORDINARY-CODE cases below
+// report `std::nullopt` (no diagnostic at all); delete the
+// `scanLineForSpecialVariadicIdentifiers` call at the top of `handleDirective`
+// and the DIRECTIVE-LINE cases do the same. Neither deletion touches the other,
+// which is why the two halves are pinned separately.
+TEST(Preprocessor, SpecialVariadicIdentifierOutsideReplacementListWarns) {
+    struct Case {
+        char const* src;
+        std::size_t count;   // how many OCCURRENCES must be reported
+        char const* why;
+    };
+    // Each source is written so the ONLY diagnosable thing in it is the
+    // constraint violation -- no undefined symbol, no arity error -- so a
+    // reported count is unambiguous.
+    const Case cases[] = {
+        {"int __VA_ARGS__ = 1;\n", 1,
+         "a declarator name in ordinary program text"},
+        {"int __VA_OPT__ = 1;\n", 1,
+         "the va-opt spelling as a declarator name"},
+        {"struct S { int __VA_ARGS__; };\n", 1, "a struct member name"},
+        {"struct S { int __VA_OPT__; };\n", 1,
+         "the va-opt spelling as a struct member name"},
+        {"void f(void){ __VA_ARGS__: ; }\n", 1, "a label"},
+        {"void f(void){ __VA_OPT__: ; }\n", 1,
+         "the va-opt spelling as a label"},
+        {"#define V(...) 0\nint v = V(__VA_ARGS__);\n", 1,
+         "an ARGUMENT of a variadic macro is not its replacement list"},
+        {"#if __VA_ARGS__\n#endif\nint v = 0;\n", 1,
+         "a #if controlling expression"},
+        {"#if __VA_OPT__\n#endif\nint v = 0;\n", 1,
+         "the va-opt spelling in a #if controlling expression"},
+        {"#if defined(__VA_ARGS__)\n#endif\nint v = 0;\n", 1,
+         "a defined() operand in a #if"},
+        {"#undef __VA_ARGS__\nint v = 0;\n", 1, "an #undef operand"},
+        {"#define __VA_ARGS__ 1\nint v = 0;\n", 1, "a #define macro NAME"},
+        // The name AND the later use: two occurrences, two reports. This is the
+        // pin that a per-OCCURRENCE report is not silently collapsed to one.
+        {"#define __VA_ARGS__ 1\nint v = __VA_ARGS__;\n", 2,
+         "the #define name and the ordinary-code use are two occurrences"},
+    };
+    for (Case const& c : cases) {
+        PreprocessResult r;
+        (void)ppLexemes(std::string{c.src}, r);
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "must be reported, and as a WARNING: " << c.why << "\nsrc: "
+            << c.src;
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "every reference COMPILES this at its default settings, so a "
+               "refusal would put DSS above the union: "
+            << c.why << "\nsrc: " << c.src;
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  c.count)
+            << "one report per OCCURRENCE, no more and no fewer: " << c.why
+            << "\nsrc: " << c.src;
+    }
+}
+
+// The NEGATIVE half, and it is what stops the fix from being a blanket
+// token-stream sweep: the LEGITIMATE position must stay completely silent, and
+// so must an ELIDED conditional branch.
+//
+// ⚠ THE DEAD-BRANCH ARM IS MEASURED, NOT ASSUMED. ✔MEASURED 2026-09-02: `#if 0`
+// / `int __VA_ARGS__ = 1;` / `#endif` draws NOTHING from gcc 13.3.0, gcc 13.2.0
+// (mingw), clang 18.1.3 or cl 19.51.36252 -- a skipped group is only parsed far
+// enough to track nesting (C 6.10p1), so diagnosing there would be a warning DSS
+// invents where no reference has one.
+TEST(Preprocessor, SpecialVariadicIdentifierLegitimatePositionsStaySilent) {
+    char const* const silent[] = {
+        // The one legitimate position, both spellings, invoked and not.
+        "#define V(...) g(__VA_ARGS__)\nint v = V(1,2);\n",
+        "#define V(...) g(__VA_ARGS__)\nint v = 0;\n",
+        "#define V(a, ...) g(a __VA_OPT__(,) __VA_ARGS__)\nint v = V(1,2);\n",
+        "#define V(a, ...) g(a __VA_OPT__(,) __VA_ARGS__)\nint v = V(1);\n",
+        // `__VA_OPT__()` with EMPTY content is a well-formed no-op.
+        "#define V(...) g(0 __VA_OPT__())\nint v = V();\n",
+        // An ELIDED branch: reachability, not recognition.
+        "#if 0\nint __VA_ARGS__ = 1;\n#endif\nint v = 0;\n",
+        "#if 0\nint __VA_OPT__ = 1;\n#endif\nint v = 0;\n",
+        "#if 0\n#if __VA_ARGS__\n#endif\n#endif\nint v = 0;\n",
+        // A COMMENT and a STRING that spell the identifier are not tokens of it.
+        "/* __VA_ARGS__ __VA_OPT__ */\nint v = 0;\n",
+        "char const* s = \"__VA_ARGS__ __VA_OPT__\";\n",
+    };
+    for (char const* src : silent) {
+        PreprocessResult r;
+        (void)ppLexemes(std::string{src}, r);
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  0u)
+            << "this position is legitimate (or unreachable) and must draw "
+               "NOTHING\nsrc: "
+            << src;
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << "src: " << src;
+    }
+}
+
+// ══ D-PP-VA-SPECIAL-IDENTIFIER-IN-A-NONVARIADIC-BODY-REFUSED-ABOVE-THE-UNION ═
+//
+// ★★ THIS TEST HAS NOW BEEN REPAIRED TWICE AND THE SECOND REPAIR EMPTIED IT,
+// WHICH IS WHY IT IS STILL HERE. It began as
+// `SpecialVariadicIdentifierRefusalsAreRecordedDivergences` pinning SIX
+// refusals as deliberate divergences; lane `vh` relaxed four by operator ruling
+// (2026-09-02) and left the two non-variadic-replacement-list shapes; lane `ob`
+// then relaxed those two under the same ruling, and the divergence list on the
+// ACCEPTANCE axis is now EMPTY. The name changed with the claim -- keeping
+// `RefusalsAreRecordedDivergences` over a body that records none would be a
+// name outliving its subject, the defect class this cycle found ten times.
+//
+// The test is the WHOLE FAMILY as one enumeration, and it is the instrument
+// that catches a later cycle re-introducing a refusal anywhere in it. Each
+// shape must (a) not error under any code, (b) still WARN -- 6.10.5p5 remains a
+// constraint and every reference diagnoses it, so going silent would put DSS
+// below the union on the diagnostic axis -- and (c) never reach
+// `P_PreprocessorOperatorNameNotDefinable`, which belongs to the
+// conditional-inclusion operators alone.
+//
+// ✔MEASURED 2026-09-02 (lane `ob`), each reference invoked SEPARATELY, DEFAULT
+// settings, every shape below with the macro NEVER USED: rc 0 on gcc 13.3.0,
+// gcc 13.2.0 (mingw), clang 18.1.3 and cl 19.51.36252 -- with ONE exception,
+// `#define M(a) __VA_OPT__`, where clang alone hard-errors `missing '('
+// following __VA_OPT__`. The disjunction decides acceptance and 3-1 is still
+// acceptance; that row is pinned separately and deliberately by
+// `Preprocessor.NonVariadicBodyAcceptanceDivergesFromClangByRuling`.
+TEST(Preprocessor, SpecialVariadicIdentifierFamilyHasNoSurvivingRefusals) {
+    struct Case { char const* src; char const* why; };
+    const Case shapes[] = {
+        // The four lane `vh` relaxed: the `#define`/`#undef` NAME positions and
+        // either spelling as a macro PARAMETER name.
+        {"#define __VA_OPT__ 1\nint v = 0;\n", "the va-opt spelling as a #define name"},
+        {"#undef __VA_OPT__\nint v = 0;\n", "the va-opt spelling as an #undef operand"},
+        {"#define M(__VA_ARGS__) 0\nint v = 0;\n", "the catch-all as a parameter name"},
+        {"#define M(__VA_OPT__) 0\nint v = 0;\n", "the va-opt spelling as a parameter name"},
+        // The six lane `ob` relaxed: either spelling in a NON-VARIADIC
+        // replacement list, object-like and function-like, bare and
+        // parenthesized. These were an Error until P54 -- the catch-all from
+        // `handleDefine`'s own guard, the va-opt spelling from `validateVaOpt`.
+        {"#define OBJ __VA_ARGS__\nint v = 0;\n",
+         "the catch-all in an object-like replacement list -- the shape the row was filed on"},
+        {"#define OBJ __VA_OPT__\nint v = 0;\n",
+         "the va-opt spelling in an object-like replacement list"},
+        {"#define OBJ __VA_OPT__(x)\nint v = 0;\n",
+         "the va-opt spelling FOLLOWED BY '(' in an object-like replacement list"},
+        {"#define M(a) __VA_ARGS__\nint v = 0;\n",
+         "the catch-all in a NON-VARIADIC function-like replacement list"},
+        {"#define M(a) __VA_OPT__(a)\nint v = 0;\n",
+         "the va-opt spelling followed by '(' in a non-variadic function-like list"},
+        {"#define M(a) __VA_OPT__\nint v = 0;\n",
+         "the BARE va-opt spelling in a non-variadic function-like list -- the "
+         "one shape clang refuses, accepted 3-1 by the disjunction"},
+    };
+    for (Case const& c : shapes) {
+        PreprocessResult r;
+        (void)ppLexemes(std::string{c.src}, r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "RELAXED by operator ruling 2026-09-02 -- refusing puts DSS above "
+               "the union: " << c.why << "\nsrc: " << c.src;
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "relaxing must not go SILENT: 6.10.5p5 is still a constraint and "
+               "every reference diagnoses it: " << c.why << "\nsrc: " << c.src;
+        EXPECT_FALSE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+            << "the operator-name refusal code must not be reached by any "
+               "variadic spelling -- it belongs to the conditional-inclusion "
+               "operators alone: " << c.why << "\nsrc: " << c.src;
+    }
+}
+
+// ⛔ WHAT IS STILL DIVERGENT AFTER THE FAMILY WAS RELAXED, AND IT IS NOT AN
+// ACCEPTANCE GAP. Two references lose code in this position and DSS follows
+// neither; both divergences are RULED, so a later cycle applying the
+// disjunction by reflex has to come and change a test that says why.
+//
+// ✔MEASURED 2026-09-02 (lane `ob`), each reference invoked SEPARATELY:
+//   * clang 18.1.3 REFUSES `#define M(a) __VA_OPT__` outright (`error: missing
+//     '(' following __VA_OPT__`) while gcc 13.3.0, gcc 13.2.0 (mingw) and cl
+//     19.51.36252 accept it, rc 0. ACCEPT is 3-1 and the disjunction decides
+//     acceptance, so DSS accepts. ⚠ clang does NOT refuse the same spelling in
+//     an OBJECT-LIKE body -- the union here is per-CONSTRUCT, not per-reference.
+//   * clang ELIDES a USED `__VA_OPT__( ... )` inside a NON-variadic
+//     function-like macro (`#define NV(X) v( X __VA_OPT__(,) )` / `NV(1)` gives
+//     `v( 1 )`) where gcc and mingw gcc keep it verbatim, and cl DELETES the
+//     bare token wherever it appears. DSS keeps it verbatim: 2-1 among the
+//     references that compile the use, and the reading that loses nothing.
+// The MSVC half of this ruling for the NAME positions is pinned one test over,
+// by `Preprocessor.SpecialVariadicNameMeaningDivergesFromMsvcByRuling`.
+TEST(Preprocessor, NonVariadicBodyAcceptanceDivergesFromClangByRuling) {
+    {   // The shape clang refuses. DSS accepts, warns, and defines it.
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define M(a) __VA_OPT__\nint v = M(1);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "accepted DELIBERATELY over clang 18.1.3's refusal -- gcc, mingw "
+               "gcc and cl all take it, and 3-1 is still the disjunction";
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning});
+        // int v = __VA_OPT__ ;
+        ASSERT_EQ(lexs.size(), 5u) << "expected: int v = __VA_OPT__ ;";
+        EXPECT_EQ(lexs[3], "__VA_OPT__")
+            << "and the definition takes effect -- the spelling is an ordinary "
+               "identifier, gcc's and mingw gcc's reading";
+    }
+    {   // The MEANING divergence, at the point of use.
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define NV(X) v( X __VA_OPT__(,) )\nNV(1)\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        bool kept = false;
+        for (std::string const& l : lexs) kept |= (l == "__VA_OPT__");
+        EXPECT_TRUE(kept)
+            << "DSS keeps the token; clang 18.1.3 elides the whole construct "
+               "here and cl 19.51.36252 deletes the token. Both silently drop "
+               "code the author wrote, which is the failure class that loses -- "
+               "the same tie-break as `#pragma once`";
+    }
+}
+
+// The MEANING of the relaxed position, pinned on its own rather than left to
+// the divergence test: a non-variadic replacement list carrying either spelling
+// must expand to the spelling ITSELF, so the macro denotes whatever an ordinary
+// identifier of that name denotes.
+//
+// ✔MEASURED 2026-09-02: `int __VA_ARGS__ = 42;` / `#define OBJ __VA_ARGS__` /
+// `return OBJ == 42` preprocesses to `__VA_ARGS__` and the BUILT PROGRAM EXITS
+// 0 on gcc 13.3.0, gcc 13.2.0 (mingw) and clang 18.1.3.
+//
+// ⚠ THE COUNT IS PART OF THE CLAIM AND IT IS THE REFERENCES' COUNT. gcc reports
+// ONE PER SOURCE OCCURRENCE and never per expansion: on `#define OBJ
+// __VA_ARGS__` / `int __VA_ARGS__ = 42;` / `OBJ + OBJ` it reports exactly TWO --
+// the replacement list and the declarator -- and DSS matches, because the
+// definition is scanned once and `run()` checks the SOURCE token before
+// `flushExpand`. An implementation that re-scanned expansion products would
+// report four here and still look "fail-loud".
+TEST(Preprocessor, NonVariadicBodyKeepsTheSpellingVerbatim) {
+    for (char const* spelling : {"__VA_ARGS__", "__VA_OPT__"}) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            std::string{"#define OBJ "} + spelling + "\nint v = OBJ;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << spelling;
+        // int v = <spelling> ;
+        ASSERT_EQ(lexs.size(), 5u) << spelling << ": expected int v = " << spelling << ";";
+        EXPECT_EQ(lexs[3], spelling)
+            << spelling
+            << ": the token is an ORDINARY IDENTIFIER in a non-variadic "
+               "replacement list and must pass through verbatim";
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  1u)
+            << spelling
+            << ": ONE report, at the #define. The expansion product is NOT "
+               "re-reported -- gcc reports per SOURCE occurrence";
+    }
+    {   // The full reference-count shape, both positions in one TU.
+        PreprocessResult r;
+        (void)ppLexemes("#define OBJ __VA_ARGS__\nint __VA_ARGS__ = 42;\n"
+                        "int v = OBJ + OBJ;\n", r);
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  2u)
+            << "the replacement list and the ordinary declarator are two source "
+               "occurrences; the two USES of OBJ are not. gcc 13.3.0 and gcc "
+               "13.2.0 (mingw) report exactly two on this source";
+    }
+}
+
+// `#define __VA_ARGS__ 1` now WARNS and STILL TAKES EFFECT -- the diagnostic was
+// added without moving the meaning, which is the whole reason the arm is a
+// fall-through warning and not a refusal. ✔MEASURED 2026-09-02: gcc 13.3.0, gcc
+// 13.2.0 (mingw) and clang 18.1.3 all behave this way (the definition applies);
+// cl 19.51.36252 discards it. DSS keeps the behaviour it already had, so this
+// change is a pure diagnostic addition. RED-ON-DISABLE in BOTH directions:
+// dropping the new warning fails the first assertion, and "fixing" the arm by
+// refusing (an early `return` instead of a fall-through) fails the second.
+TEST(Preprocessor, VaArgsNameAsMacroNameWarnsAndStillDefines) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define __VA_ARGS__ 42\nint v = __VA_ARGS__;\n", r);
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+              std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int v = 42 ;
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int v = 42 ;";
+    EXPECT_EQ(lexs[3], "42")
+        << "the definition must still take effect -- the warning is a "
+           "diagnostic, not a refusal, and the reference DSS follows here "
+           "(gcc/clang) applies it";
+}
+
+// ══ D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION ═══════
+//
+// The four shapes the operator relaxed on 2026-09-02, pinned POSITIVELY: each
+// must WARN, must not error, and must MEAN what gcc/mingw-gcc/clang say it
+// means. ⚠ THIS SENTENCE USED TO CONTINUE "the complement -- that the two
+// surviving refusals are still refusals -- is pinned by
+// `SpecialVariadicIdentifierRefusalsAreRecordedDivergences` above", and P54
+// lane `ob` made it false in both halves: the operator extended the same ruling
+// to those two shapes, so there is no complement left and that test is now
+// `Preprocessor.SpecialVariadicIdentifierFamilyHasNoSurvivingRefusals`, which
+// enumerates the WHOLE family instead.
+//
+// ★★ THE RULING AND ITS BASIS. ✔MEASURED 2026-09-02, each of the four reference
+// toolchains invoked SEPARATELY (gcc 13.3.0 in WSL, gcc 13.2.0 mingw-w64 native,
+// clang 18.1.3 in WSL, cl 19.51.36252), acceptance probed with the name never
+// USED so no reference's MEANING choice could masquerade as a refusal:
+//
+//   shape                     gcc    mingw   clang    cl        union
+//   #define __VA_ARGS__ 42    rc 0   rc 0    rc 0     rc 0      ACCEPT
+//   #define __VA_OPT__  42    rc 0   rc 0    rc 0     rc 0      ACCEPT
+//   #undef  __VA_ARGS__       rc 0   rc 0    rc 0     rc 0      ACCEPT
+//   #undef  __VA_OPT__        rc 0   rc 0    rc 0     rc 0      ACCEPT
+//
+// Acceptance is UNANIMOUS, so the disjunction forbids refusing. On MEANING the
+// references split 3-1: gcc, mingw gcc and clang HONOUR the definition
+// (`_Static_assert(__VA_OPT__ == 42)` passes and the built program exits 0 on
+// all three), while cl answers C4117 "'#define' ignored" and DISCARDS it. DSS
+// follows the three -- and the tie-break is not the head-count but the failure
+// class: MSVC's alternative silently drops code the author wrote. Same reasoning
+// that decided `#pragma once`.
+TEST(Preprocessor, VaOptNameAsMacroNameWarnsAndStillDefines) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define __VA_OPT__ 42\nint v = __VA_OPT__;\n", r);
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+              std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning});
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "all four references accept this at their default settings";
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int v = 42 ;";
+    EXPECT_EQ(lexs[3], "42")
+        << "the va-opt spelling is an ordinary macro NAME here and the "
+           "definition must take effect -- the gcc/mingw-gcc/clang answer";
+}
+
+// The `#undef` half of the same ruling, BOTH spellings. An `#undef` that only
+// warned without taking effect would be the worst of both readings: a
+// diagnostic with no consequence, and `#ifdef` still true.
+TEST(Preprocessor, SpecialVariadicNameUndefWarnsAndTakesEffect) {
+    for (char const* spelling : {"__VA_ARGS__", "__VA_OPT__"}) {
+        std::string const src = std::string{"#define "} + spelling
+            + " 42\n#undef " + spelling + "\n#ifdef " + spelling
+            + "\nint yes;\n#else\nint no;\n#endif\n";
+        PreprocessResult r;
+        auto lexs = ppLexemes(src, r);
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << spelling;
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << spelling << ": still a 6.10.5p5 constraint violation";
+        ASSERT_EQ(lexs.size(), 3u) << spelling;
+        EXPECT_EQ(lexs[1], "no")
+            << spelling << ": the #undef must REMOVE the definition. ✔MEASURED "
+                           "on gcc 13.3.0, gcc 13.2.0 (mingw) and clang 18.1.3, "
+                           "where the same program takes the #else arm";
+    }
+}
+
+// EITHER spelling as a macro PARAMETER NAME: accepted, warned per occurrence,
+// and the parameter BINDS. ✔MEASURED 2026-09-02 that `F(41)` is 42 on gcc
+// 13.3.0, gcc 13.2.0 (mingw) and cl 19.51.36252 for both spellings, and on
+// clang 18.1.3 for the catch-all spelling (clang refuses a replacement-list
+// `__VA_OPT__` that is not followed by `(`, which is its own reading and does
+// not narrow the union: three references accept).
+//
+// ⚠ THE COUNT IS PART OF THE PIN. gcc reports TWO here -- the parameter name and
+// the replacement-list use -- because a NON-variadic replacement list is also an
+// illegal position. Asserting only "at least one" would let the replacement-list
+// scan be deleted while this test stayed green.
+TEST(Preprocessor, SpecialVariadicNameAsMacroParameterWarnsAndBinds) {
+    for (char const* spelling : {"__VA_ARGS__", "__VA_OPT__"}) {
+        std::string const src = std::string{"#define F("} + spelling + ") (("
+            + spelling + ") + 1)\nint v = F(41);\n";
+        PreprocessResult r;
+        auto lexs = ppLexemes(src, r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << spelling << ": refusing would put DSS above the union";
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  2u)
+            << spelling << ": the parameter NAME and the replacement-list USE "
+                           "are two illegal positions, and gcc reports both";
+        // int v = ( ( 41 ) + 1 ) ;
+        ASSERT_EQ(lexs.size(), 11u) << spelling << ": expected int v = ((41)+1);";
+        EXPECT_EQ(lexs[5], "41")
+            << spelling << ": the declared PARAMETER must bind -- the argument "
+                           "reaches the replacement list";
+    }
+}
+
+// ★★ THE SHADOW RULE, which is what makes accepting the parameter name safe.
+// A declared parameter of either spelling SHADOWS the engine-provided construct
+// throughout that macro's replacement list -- so `#define F(__VA_ARGS__, ...)`
+// binds the PARAMETER, not the variadic catch-all, and `#define F(__VA_OPT__,
+// ...)` binds the PARAMETER, not the va-opt operator.
+//
+// ✔MEASURED 2026-09-02, the only row where the two readings are observably
+// different (`(__VA_OPT__ (0))` inside a variadic macro): gcc 13.3.0, gcc 13.2.0
+// (mingw) and cl 19.51.36252 all substitute the PARAMETER and then fail
+// DOWNSTREAM on `7 (0)` ("called object is not a function" / C2064) -- a type
+// error in the user's program, not a preprocessing refusal -- while only clang
+// 18.1.3 reads the operator. 3-1 for the parameter, so this is the measured
+// majority, not a tidy invention.
+//
+// RED-ON-DISABLE (REMOVE direction): delete the `declaresSpecialParam` clause
+// from `isVaArgsName` and the first case yields the variadic tail (2) instead of
+// the named argument (1); delete it from `isVaOptName` (and from
+// `validateVaOpt`) and the second case stops parsing at all.
+TEST(Preprocessor, SpecialVariadicParameterShadowsTheEngineConstruct) {
+    {
+        // The catch-all spelling as the FIRST parameter of a VARIADIC macro.
+        // Parameter binding gives 1; catch-all binding would give 2.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define F(__VA_ARGS__, ...) (__VA_ARGS__)\nint v = F(1, 2);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // int v = ( 1 ) ;
+        ASSERT_EQ(lexs.size(), 7u) << "expected: int v = ( 1 ) ;";
+        EXPECT_EQ(lexs[4], "1")
+            << "the declared PARAMETER must win over the variadic catch-all. "
+               "✔MEASURED: clang 18.1.3 and cl 19.51.36252 answer 1 (gcc "
+               "refuses the line outright as a duplicate parameter, because it "
+               "names its own variadic parameter __VA_ARGS__ internally)";
+    }
+    {
+        // The va-opt spelling as the FIRST parameter of a VARIADIC macro.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define F(__VA_OPT__, ...) (__VA_OPT__)\nint v = F(7, 9);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // int v = ( 7 ) ;
+        ASSERT_EQ(lexs.size(), 7u) << "expected: int v = ( 7 ) ;";
+        EXPECT_EQ(lexs[4], "7")
+            << "the declared PARAMETER must win over the va-opt operator. "
+               "✔MEASURED: gcc 13.3.0, gcc 13.2.0 (mingw) and cl 19.51.36252 "
+               "all answer 7";
+    }
+    {
+        // ⚠ ONE WARNING, NOT TWO. The occurrence sits in the replacement list of
+        // a VARIADIC function-like macro, which is the position 6.10.5p5
+        // permits -- only the parameter NAME is the violation. gcc reports
+        // exactly one here too. This is the pin that the replacement-list scan
+        // is gated on `!def.isVariadic` and not on "is this shadowed".
+        PreprocessResult r;
+        (void)ppLexemes(
+            "#define F(__VA_OPT__, ...) (__VA_OPT__)\nint v = F(7, 9);\n", r);
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  1u)
+            << "inside a VARIADIC replacement list the position is legitimate; "
+               "only the parameter name is diagnosed";
+    }
+}
+
+// The definition must not COST the engine construct. Honouring `#define
+// __VA_OPT__ 42` would be a bad trade if it also disabled `__VA_OPT__( ... )`,
+// and honouring `#define __VA_ARGS__ 42` would be a bad trade if it shadowed the
+// catch-all inside a variadic macro. Neither happens, because both constructs
+// are matched by CONFIG TEXT inside a variadic replacement list and never
+// through the program's macro table.
+//
+// ✔MEASURED 2026-09-02: all four references keep both constructs working across
+// a `#define` AND across an `#undef` of the same spelling -- each built program
+// exits 0 on gcc 13.3.0, gcc 13.2.0 (mingw) and clang 18.1.3, and cl compiles
+// the equivalent _Static_assert.
+TEST(Preprocessor, SpecialVariadicNameDefinitionDoesNotDisableTheConstruct) {
+    {   // `#define __VA_OPT__` then the OPERATOR, both arms of the elision.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define __VA_OPT__ 42\n"
+            "#define V(a, ...) (a __VA_OPT__(+ 1))\n"
+            "int p = V(1, 2);\nint q = V(1);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // int p = ( 1 + 1 ) ; int q = ( 1 ) ;
+        ASSERT_EQ(lexs.size(), 16u) << "expected: int p = (1 + 1); int q = (1);";
+        EXPECT_EQ(lexs[4], "1");
+        EXPECT_EQ(lexs[5], "+")
+            << "the va-opt operator must still FIRE when the variable arguments "
+               "have a non-empty substitution";
+        EXPECT_EQ(lexs[13], "1");
+        EXPECT_EQ(lexs[14], ")")
+            << "and must still ELIDE when they do not -- `42` must appear "
+               "NOWHERE in either expansion";
+        for (std::string const& l : lexs) {
+            EXPECT_NE(l, "42")
+                << "the object-like definition must not leak into the operator "
+                   "position";
+        }
+    }
+    {   // `#undef __VA_OPT__` then the OPERATOR.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#undef __VA_OPT__\n"
+            "#define V(a, ...) (a __VA_OPT__(+ 1))\n"
+            "int p = V(1, 2);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // int p = ( 1 + 1 ) ;
+        ASSERT_EQ(lexs.size(), 9u) << "expected: int p = ( 1 + 1 ) ;";
+        EXPECT_EQ(lexs[5], "+")
+            << "an #undef removes a PROGRAM macro; the operator lives in the "
+               "language document and cannot be reached from the macro table";
+    }
+    {   // `#define __VA_ARGS__` then the CATCH-ALL inside a variadic macro.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define __VA_ARGS__ 42\n"
+            "#define V(...) (__VA_ARGS__)\nint v = V(7);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // int v = ( 7 ) ;
+        ASSERT_EQ(lexs.size(), 7u) << "expected: int v = ( 7 ) ;";
+        EXPECT_EQ(lexs[4], "7")
+            << "inside a variadic replacement list the spelling is the "
+               "catch-all, not the object-like macro the program defined";
+    }
+}
+
+// ⚠⚠ THE RULED DIVERGENCE FROM MSVC, PINNED SO IT CANNOT BE QUIETLY "FIXED"
+// BACK. After this change a translation unit can MEAN different things under
+// DSS and under cl: DSS (with gcc, mingw gcc and clang) HONOURS a `#define` of
+// either special variadic spelling, while cl 19.51.36252 answers C4117 "macro
+// name '__VA_ARGS__' is reserved, '#define' ignored" and DISCARDS the
+// definition, and answers the same for `#undef`.
+//
+// This is a DELIBERATE, OPERATOR-RULED choice, not an oversight: the disjunction
+// decides ACCEPTANCE (all four accept, so DSS must), and where the references
+// split on MEANING, a reference that silently discards code the author wrote
+// does not get to be the model. A later cycle applying the disjunction by reflex
+// must come and change THIS test, which says why.
+TEST(Preprocessor, SpecialVariadicNameMeaningDivergesFromMsvcByRuling) {
+    for (char const* spelling : {"__VA_ARGS__", "__VA_OPT__"}) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(std::string{"#define "} + spelling
+                                  + " 42\nint v = " + spelling + ";\n", r);
+        ASSERT_EQ(lexs.size(), 5u) << spelling;
+        EXPECT_EQ(lexs[3], "42")
+            << spelling
+            << ": DSS follows gcc/mingw-gcc/clang and HONOURS the definition. "
+               "cl 19.51.36252 would leave the identifier verbatim (C4117, "
+               "'#define' ignored) and then fail on it -- that divergence is "
+               "RULED, not accidental";
+        // And the divergence is bounded: `#ifdef` agrees with the expansion,
+        // so DSS is at least self-consistent where the two references are not.
+        PreprocessResult r2;
+        auto lexs2 = ppLexemes(std::string{"#define "} + spelling
+                                   + " 42\n#ifdef " + spelling
+                                   + "\nint yes;\n#else\nint no;\n#endif\n", r2);
+        ASSERT_EQ(lexs2.size(), 3u) << spelling;
+        EXPECT_EQ(lexs2[1], "yes")
+            << spelling << ": a honoured definition must also read as DEFINED";
+    }
+}
+
+// ⓘ The AGNOSTICISM arm for these positions
+// (Preprocessor.SpecialVariadicNamePositionsAreConfigDriven) lives beside its
+// sibling further down, next to
+// Preprocessor.SpecialVariadicIdentifierConstraintIsConfigDriven: both need
+// `reboundC`, which is defined below this point in the file.
+
 // DUPLICATE parameter name fails loud (C 6.10.3p6): #define F(a,a) ...
 TEST(Preprocessor, DuplicateMacroParameterFailsLoud) {
     PreprocessResult r;
@@ -1407,6 +1995,174 @@ TEST(Preprocessor, VaArgsNameIsConfigDrivenNotHardcoded) {
     }
 }
 
+// D-PP-VA-SPECIAL-IDENTIFIER-OUTSIDE-REPLACEMENT-LIST, the agnosticism arm, and
+// the twin of the test above one constraint over. The spellings the 6.10.5p5
+// check matches come from the LANGUAGE DOCUMENT (`preprocess.variadicArgsName` /
+// `preprocess.vaOptName`), never from a literal in `src/`. Rebind the catch-all
+// to `__REST__` and the constraint must FOLLOW the rebound spelling while the
+// abandoned one becomes an ordinary identifier. RED-ON-DISABLE: hard-coding
+// `__VA_ARGS__` anywhere in the new check fails BOTH halves at once -- (1) goes
+// silent and (2) starts warning.
+TEST(Preprocessor, SpecialVariadicIdentifierConstraintIsConfigDriven) {
+    auto schema = reboundC("\"variadicArgsName\": \"__VA_ARGS__\"",
+                           "\"variadicArgsName\": \"__REST__\"",
+                           "<rebound-vaargs-constraint-c>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().variadicArgsName, "__REST__");
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+
+    // (1) The REBOUND spelling in ordinary code is now the violation.
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"int __REST__ = 1;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs,
+                                        dss::kDefaultHeaderNameMatching,
+                                        DiagnosticBudget::libraryDefault());
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "the constraint must follow the REBOUND spelling";
+    }
+    // (2) The ABANDONED spelling is an ordinary identifier and draws nothing.
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"int __VA_ARGS__ = 1;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs,
+                                        dss::kDefaultHeaderNameMatching,
+                                        DiagnosticBudget::libraryDefault());
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::nullopt)
+            << "with the catch-all rebound away, the literal __VA_ARGS__ is an "
+               "ordinary identifier -- proving the spelling is read from the "
+               "language document, not hard-coded";
+    }
+}
+
+// D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION, the
+// agnosticism arm for the RELAXED NAME POSITIONS, and the twin of the test
+// directly above one position over. The `#define` name arm, the `#undef` name
+// arm and the PARAMETER-NAME arm all read the spelling from the LANGUAGE
+// DOCUMENT (`preprocess.vaOptName`), never from a literal in `src/`. Rebind the
+// va-opt spelling to `DSS_OPT`: the rebound name must draw the 6.10.5p5 warning
+// and still define, and the abandoned `__VA_OPT__` must become an utterly
+// ordinary macro name that draws nothing at all. RED-ON-DISABLE: hard-coding
+// `__VA_OPT__` in any of the three arms fails both halves at once -- (1) goes
+// silent and (2) starts warning.
+TEST(Preprocessor, SpecialVariadicNamePositionsAreConfigDriven) {
+    auto schema = reboundC("\"vaOptName\": \"__VA_OPT__\"",
+                           "\"vaOptName\": \"DSS_OPT\"",
+                           "<rebound-vaopt-name-positions-c>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().vaOptName, "DSS_OPT");
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    auto run = [&](std::string text) {
+        auto buf = SourceBuffer::fromString(std::move(text), "main.c");
+        return preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+                          DiagnosticBudget::libraryDefault());
+    };
+    {   // (1) The REBOUND spelling is now the one the constraint names.
+        PreprocessResult r = run("#define DSS_OPT 42\nint v = DSS_OPT;\n");
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "the constraint must follow the REBOUND spelling";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+    {   // (2) The ABANDONED spelling draws nothing -- it is just an identifier.
+        PreprocessResult r = run("#define __VA_OPT__ 42\nint v = __VA_OPT__;\n");
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::nullopt)
+            << "with the va-opt spelling rebound away, the literal __VA_OPT__ "
+               "is an ordinary macro name -- proving the position check reads "
+               "the language document and not a hard-coded lexeme";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+    {   // (3) The PARAMETER-NAME arm follows the rebinding too.
+        PreprocessResult r = run("#define F(DSS_OPT) ((DSS_OPT) + 1)\n"
+                                 "int v = F(41);\n");
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  2u)
+            << "the parameter-name arm reads the same config field";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+    {   // (4) The `#undef` arm follows it as well, and still takes effect.
+        PreprocessResult r = run("#define DSS_OPT 42\n#undef DSS_OPT\n"
+                                 "#ifdef DSS_OPT\nint yes;\n#else\nint no;\n"
+                                 "#endif\n");
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "the #undef arm reads the same config field";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+}
+
+// D-PP-VA-SPECIAL-IDENTIFIER-IN-A-NONVARIADIC-BODY-REFUSED-ABOVE-THE-UNION, the
+// agnosticism arm for the RELAXED NON-VARIADIC REPLACEMENT-LIST position, and
+// the third of these twins. Both spellings the position check matches come from
+// the LANGUAGE DOCUMENT, never from a literal in `src/`; so does the acceptance
+// that replaced the refusal. Rebind the va-opt spelling to `DSS_OPT` and BOTH
+// halves must move together: the rebound name must warn-and-define in a
+// non-variadic body, and the abandoned `__VA_OPT__` must become an utterly
+// ordinary identifier that draws nothing.
+//
+// ⚠ THE SECOND HALF IS THE ONE THAT MATTERS HERE AND IT IS NOT REDUNDANT WITH
+// ITS SIBLINGS. `validateVaOpt`'s early return is reached through `isVaOptWord`,
+// which reads `cfg().vaOptName`; a hard-coded `__VA_OPT__` anywhere on that path
+// would keep warning about the abandoned spelling AND stop warning about the
+// rebound one, and both halves below would go red at once.
+TEST(Preprocessor, NonVariadicBodyAcceptanceIsConfigDriven) {
+    auto schema = reboundC("\"vaOptName\": \"__VA_OPT__\"",
+                           "\"vaOptName\": \"DSS_OPT\"",
+                           "<rebound-vaopt-nonvariadic-body-c>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().vaOptName, "DSS_OPT");
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    auto run = [&](std::string text) {
+        auto buf = SourceBuffer::fromString(std::move(text), "main.c");
+        return preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+                          DiagnosticBudget::libraryDefault());
+    };
+    {   // (1) The REBOUND spelling in a non-variadic body: warns, still defines.
+        PreprocessResult r = run("#define OBJ DSS_OPT\nint v = 0;\n");
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "the constraint must follow the REBOUND spelling";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+    {   // (2) The same, in a NON-VARIADIC FUNCTION-LIKE body -- the arm that
+        //     used to die inside `validateVaOpt` rather than in `handleDefine`.
+        PreprocessResult r = run("#define M(a) DSS_OPT\nint v = 0;\n");
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+    {   // (3) The ABANDONED spelling draws nothing at all -- it is not the
+        //     va-opt introducer any more, and `variadicArgsName` is untouched
+        //     here, so nothing else can be reporting it either.
+        PreprocessResult r = run("#define OBJ __VA_OPT__\nint v = 0;\n");
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::nullopt)
+            << "with the va-opt spelling rebound away, the literal __VA_OPT__ is "
+               "an ordinary identifier -- proving the acceptance and the warning "
+               "both read the language document, not a hard-coded lexeme";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+    {   // (4) And the STRUCTURAL rules still apply where they belong: inside a
+        //     VARIADIC macro the rebound introducer must still require its `(`.
+        //     The early return must be gated on `!def.isVariadic`, not blanket.
+        PreprocessResult r = run("#define V(...) q( DSS_OPT )\nV(1)\n");
+        EXPECT_TRUE(r.diagnostics->hasErrors())
+            << "a malformed va-opt inside a VARIADIC macro is still a refusal -- "
+               "there the construct really is present, and every reference "
+               "rejects it";
+    }
+}
+
 // FC13 cycle 4 (D-PP-MACRO-HIDESET-PRECISE) -- FLIP of the cycle-2/3
 // `DeepMacroExpansionFailsLoudNotSilent` premise. Under the PRECISE per-token
 // hide set a finite object-macro CHAIN (`M0`->`M1`->...->`M300`->0) expands
@@ -1451,6 +2207,76 @@ TEST(Preprocessor, DeepFiniteMacroChainExpandsToValue) {
 // nesting level pre-expands its argument one frame deeper, so the >256 guard
 // trips. RED-ON-DISABLE: removing the emitPP at the backstop makes the deep nest
 // truncate silently with NO P_Preprocessor* diagnostic -> this test fails.
+// ★★★ THE NESTING CEILING IS AN EXPLICIT COUNTER, NOT THE HOST'S THREAD STACK.
+// Operator ruling 2026-09-02: *"it's well known to not use recursive structures
+// in the compiler because big projects like sqlite will for sure explode the
+// stack"*. Argument pre-expansion used to spend a CALL FRAME per source nesting
+// level; it now spends a heap frame on `MacroExpander`'s explicit expansion
+// stack.
+//
+// ⚠⚠ THE TEST BELOW WAS PASSING FOR THE WRONG REASON, AND ON THIS HOST IT WAS
+// NOT PASSING AT ALL. ✔MEASURED 2026-09-02 (P54, lane `ob`), Windows Debug: the
+// recursive expander completed a 252-deep nest on gtest's default ~1 MiB main
+// thread and died at 256 with STATUS_STACK_OVERFLOW (rc 0xC00000FD) -- FOUR
+// levels short of its own >256 backstop, so `DeepNestedMacroArgumentFailsLoud
+// NotSilent` and `CompilationUnitPPGate.FatalMacroNestingTruncationGatesParser`
+// both SEGFAULTED. ✔MEASURED IDENTICAL (252) with `preprocessor.cpp` restored to
+// the cycle base commit, so no P54 change consumed the margin: a latent defect
+// exposed, not one introduced. It never bit through the CLI only because
+// `program.cpp` runs every CU inside `substrate::callOnLargeStack`, i.e. the old
+// answer was a BIGGER STACK -- which still fails for a deeper input, and is what
+// the ruling rejects.
+//
+// THIS test is the one the conversion is FOR, and it is deliberately far past
+// the ceiling: 1024 levels is 4x the backstop and 4x what the recursive form
+// could survive on ANY default thread (it died at 256). It runs on the ORDINARY
+// gtest thread, so it fails the instant depth goes back to costing call frames.
+// ⓘ The depth is 1024 rather than larger only because the entry is quadratic in
+// the SOURCE length, not because 1024 is a limit: the same walk reaches 4000 in
+// ~12.7 s, and the pin is worth about 3 s of Debug suite time, not thirteen.
+// ✔MEASURED after the conversion: the same walk reaches 400 with rc 0 where it
+// previously died at 256, and the CLI's boundary is unmoved -- 256 accepted,
+// 257 refused with the identical diagnostic.
+TEST(Preprocessor, DeepNestingCostsHeapNotCallFrames) {
+    const int nest = 1024;   // 4x the >256 backstop
+    std::string src = "#define F(x) (x)\nint v = ";
+    for (int n = 0; n < nest; ++n) src += "F(";
+    src += "0";
+    for (int n = 0; n < nest; ++n) src += ")";
+    src += ";\n";
+
+    PreprocessResult r;
+    (void)ppLexemes(src, r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "a nest this deep must still be REFUSED by the explicit counter, "
+           "loudly and by name -- turning the crash into a silent truncation "
+           "would be worse than the crash";
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "and the refusal is an ERROR, exactly as at 257";
+}
+
+// The other half of the same claim: a nest just BELOW the ceiling must still
+// EXPAND, correctly, on that same ordinary thread. Without this a future change
+// could satisfy the test above by lowering the limit until nothing deep runs --
+// the fix the operator ruled out in the same breath.
+TEST(Preprocessor, NestingJustBelowTheCeilingStillExpandsOnAnOrdinaryThread) {
+    const int nest = 256;   // the deepest accepted nest
+    std::string src = "#define F(x) (x)\nint v = ";
+    for (int n = 0; n < nest; ++n) src += "F(";
+    src += "42";
+    for (int n = 0; n < nest; ++n) src += ")";
+    src += ";\n";
+
+    PreprocessResult r;
+    auto lexs = ppLexemes(src, r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "256 is INSIDE the ceiling and must expand";
+    // int v = ( ( ... ( 42 ) ... ) ) ;  -> 3 + 256 + 1 + 256 + 1
+    ASSERT_EQ(lexs.size(), static_cast<std::size_t>(3 + nest + 1 + nest + 1));
+    EXPECT_EQ(lexs[3 + nest], "42")
+        << "and the innermost argument must survive every level";
+}
+
 TEST(Preprocessor, DeepNestedMacroArgumentFailsLoudNotSilent) {
     const int nest = 300;  // > the 256 nesting backstop
     std::string src = "#define F(x) (x)\nint v = ";
@@ -11264,21 +12090,70 @@ namespace {
 }
 } // namespace
 
-TEST(PreprocessorVaOpt, InANonVariadicFunctionLikeMacroFailsLoud) {
+// ★★ RENAMED AND REVERSED, NOT DELETED
+// ([[D-PP-VA-SPECIAL-IDENTIFIER-IN-A-NONVARIADIC-BODY-REFUSED-ABOVE-THE-UNION]],
+// P54 lane `ob`). These two were `InANonVariadicFunctionLikeMacroFailsLoud` and
+// `InAnObjectLikeMacroFailsLoud`, and they pinned FC18a's refusal of the va-opt
+// spelling in a non-variadic replacement list. THE OPERATOR RULED 2026-09-02
+// that the position is ACCEPTED AND WARNED, so the old names asserted the
+// opposite of the truth -- a test name is a claim, and one that says `FailsLoud`
+// over a body pinning acceptance is the comment-rot defect class with a build
+// step. The SOURCES are unchanged so the two verdicts are directly comparable.
+//
+// ✔MEASURED 2026-09-02, each reference invoked SEPARATELY, DEFAULT settings, on
+// THESE EXACT SOURCES:
+//
+//   source                                gcc/mingw expansion   clang        cl
+//   #define NV(X) v( X __VA_OPT__(,) )    v( 1 __VA_OPT__(,) )  v( 1 )       v( 1(,) )
+//   #define OL __VA_OPT__(x)              __VA_OPT__(x)         __VA_OPT__(x) (x)
+//
+// All four rc 0, all four warn (cl: C5108). DSS keeps the spelling VERBATIM,
+// which is gcc's and mingw gcc's answer on both rows and clang's on the second.
+// The construct is INERT outside a variadic macro -- there is no
+// va-opt-replacement there for 6.10.5.1p3 to constrain -- so `isVaOptName`'s
+// `def.isVariadic` requirement, which predates this change, already gave the
+// right meaning and only the definition-time refusal had to go.
+TEST(PreprocessorVaOpt, InANonVariadicFunctionLikeMacroIsInertAndWarns) {
     PreprocessResult r;
-    (void)ppLexemes("#define NV(X) v( X __VA_OPT__(,) )\nNV(1)\n", r);
-    EXPECT_TRUE(r.diagnostics->hasErrors());
+    auto lexs = ppLexemes("#define NV(X) v( X __VA_OPT__(,) )\nNV(1)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "every reference compiles this at its default settings, so refusing "
+           "puts DSS above the union: "
+        << ppAllMessages(r);
+    EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                    DiagnosticSeverity::Warning),
+              1u)
+        << "accepting must not go SILENT -- 6.10.5p5 is still a constraint and "
+           "all four references diagnose it, once, at the replacement list";
     std::string const m = ppAllMessages(r);
     EXPECT_NE(m.find("__VA_OPT__"), std::string::npos)
         << "the diagnostic must NAME the construct, not say \"expected ')'\": " << m;
     EXPECT_NE(m.find("variadic"), std::string::npos) << m;
+    // v ( 1 __VA_OPT__ ( , ) )
+    ASSERT_EQ(lexs.size(), 8u) << "expected: v ( 1 __VA_OPT__ ( , ) )";
+    EXPECT_EQ(lexs[3], "__VA_OPT__")
+        << "the spelling is an ORDINARY IDENTIFIER here and passes through "
+           "verbatim -- gcc 13.3.0 and gcc 13.2.0 (mingw) both emit "
+           "`v( 1 __VA_OPT__(,) )`. ⚠ clang 18.1.3 ELIDES it (`v( 1 )`) and cl "
+           "19.51.36252 DELETES the token (`v( 1(,) )`); DSS follows neither, "
+           "because both silently drop what the author wrote";
+    EXPECT_EQ(lexs[2], "1")
+        << "and the declared parameter still substitutes normally";
 }
 
-TEST(PreprocessorVaOpt, InAnObjectLikeMacroFailsLoud) {
+TEST(PreprocessorVaOpt, InAnObjectLikeMacroIsInertAndWarns) {
     PreprocessResult r;
-    (void)ppLexemes("#define OL __VA_OPT__(x)\nOL\n", r);
-    EXPECT_TRUE(r.diagnostics->hasErrors());
+    auto lexs = ppLexemes("#define OL __VA_OPT__(x)\nOL\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors()) << ppAllMessages(r);
+    EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                    DiagnosticSeverity::Warning),
+              1u);
     EXPECT_NE(ppAllMessages(r).find("__VA_OPT__"), std::string::npos);
+    // __VA_OPT__ ( x )
+    ASSERT_EQ(lexs.size(), 4u) << "expected: __VA_OPT__ ( x )";
+    EXPECT_EQ(lexs[0], "__VA_OPT__")
+        << "gcc 13.3.0, gcc 13.2.0 (mingw) AND clang 18.1.3 all emit "
+           "`__VA_OPT__(x)` here -- 3-1 verbatim, only cl erases it";
 }
 
 TEST(PreprocessorVaOpt, WithoutAnOpeningParenFailsLoud) {
@@ -11325,16 +12200,63 @@ TEST(PreprocessorVaOpt, PasteAtEitherEndOfTheContentFailsLoud) {
     EXPECT_TRUE(hasPPCode(r2, DiagnosticCode::P_PreprocessorPaste));
 }
 
-TEST(PreprocessorVaOpt, DefineOrUndefOfTheReservedNameFailsLoud) {
-    PreprocessResult r;
-    (void)ppLexemes("#define __VA_OPT__ 1\n", r);
-    EXPECT_TRUE(r.diagnostics->hasErrors());
-    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable));
-
-    PreprocessResult r2;
-    (void)ppLexemes("#undef __VA_OPT__\n", r2);
-    EXPECT_TRUE(r2.diagnostics->hasErrors());
-    EXPECT_TRUE(hasPPCode(r2, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable));
+// ★★ RENAMED AND REVERSED, NOT DELETED
+// ([[D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION]], P54
+// lane vh). This was `PreprocessorVaOpt.DefineOrUndefOfTheReservedNameFailsLoud`
+// and it pinned FC18a's refusal of `#define __VA_OPT__` / `#undef __VA_OPT__`
+// with `P_PreprocessorOperatorNameNotDefinable`. The operator RULED on
+// 2026-09-02 that both are ACCEPTED and the definition HONOURED, so the old name
+// asserted the opposite of the truth -- a name is a claim, and leaving one that
+// says `FailsLoud` over a body that pins acceptance is the same defect class as
+// a comment outliving its code.
+//
+// ✔MEASURED 2026-09-02, each reference invoked SEPARATELY, with the defined name
+// NEVER USED so no reference's MEANING choice could be mistaken for a refusal:
+// `#define __VA_OPT__ 42` and `#undef __VA_OPT__` are rc 0 on gcc 13.3.0 (WSL),
+// gcc 13.2.0 (mingw-w64), clang 18.1.3 AND cl 19.51.36252 -- acceptance is
+// UNANIMOUS, so refusing put DSS above the union.
+//
+// ⚠ THE FC18a REASON THE REFUSAL GAVE IS ANSWERED, NOT OVERRULED. It held that
+// honouring the directive "would shadow a construct the engine implements,
+// leaving one spelling with two meanings". It cannot: the va-opt operator is
+// matched by CONFIG TEXT inside a variadic replacement list (`isVaOptName`) and
+// never through `table_`, so a program's `#define` reaches the macro table and
+// the operator is untouched -- which the second half of this test asserts
+// directly, and `Preprocessor.SpecialVariadicNameDefinitionDoesNotDisableTheConstruct`
+// asserts across both elision arms.
+TEST(PreprocessorVaOpt, DefineOrUndefOfTheOperatorNameIsAcceptedAndHonoured) {
+    {   // The `#define` is accepted, DIAGNOSED (6.10.5p5 is still a constraint),
+        // and takes effect.
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define __VA_OPT__ 1\nint v = __VA_OPT__;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "all four references accept this at their default settings";
+        EXPECT_FALSE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+            << "that code is ERROR + unsuppressable and belongs to the "
+               "conditional-inclusion operators alone";
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "accepted, but never in silence";
+        ASSERT_EQ(lexs.size(), 5u) << "expected: int v = 1 ;";
+        EXPECT_EQ(lexs[3], "1") << "the definition must be HONOURED";
+    }
+    {   // The `#undef` is accepted and takes effect -- and the OPERATOR survives
+        // it, which is the property FC18a's refusal was protecting.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define __VA_OPT__ 1\n#undef __VA_OPT__\n"
+            "#define V(a, ...) (a __VA_OPT__(+ 1))\nint v = V(2, 3);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_FALSE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable));
+        // int v = ( 2 + 1 ) ;
+        ASSERT_EQ(lexs.size(), 9u) << "expected: int v = ( 2 + 1 ) ;";
+        EXPECT_EQ(lexs[5], "+")
+            << "the va-opt operator is config-matched inside a variadic "
+               "replacement list and cannot be reached from the macro table, so "
+               "neither the #define nor the #undef can disturb it";
+    }
 }
 
 // ── Agnosticism: the spelling comes from CONFIG, never from the C source. ────

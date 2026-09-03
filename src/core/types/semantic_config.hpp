@@ -2919,14 +2919,20 @@ struct DSS_EXPORT SemanticConfig {
     // C11/C23 6.7.10 (D-CSUBSET-STATIC-ASSERT): the `_Static_assert`/`static_assert`
     // static-assertion DECLARATION rule. When Pass 2 visits a node of this rule it
     // const-evaluates the FIRST meaningful child (the condition — the `assignmentExpr`
-    // after the keyword + `(`) via the SAME `constIntExpr` evaluator that folds
-    // sizeof(T)/enum/arithmetic in an array dimension: a fold to ZERO emits
+    // after the keyword + `(`) through the SAME shared evaluator that folds
+    // sizeof(T)/enum/arithmetic in an array dimension: a fold to a FALSE value emits
     // S_StaticAssertFailed (message = the OPTIONAL trailing string-literal child); a
-    // condition that does not fold to an integer constant expression (non-const /
-    // float / unresolved) ALSO emits S_StaticAssertFailed (C requires an ICE); a
-    // NONZERO fold produces nothing. The construct itself lowers to nothing (its
-    // hirLowering row maps to Skip). Invalid ⇒ the language has no static-assertion
-    // surface (toy/tsql — the check never runs).
+    // condition that does not fold to a compile-time constant at all (non-const /
+    // unresolved) ALSO emits S_StaticAssertFailed, with wording that distinguishes
+    // the two on the one code; a TRUE fold produces nothing. The construct itself
+    // lowers to nothing (its hirLowering row maps to Skip). Invalid ⇒ the language
+    // has no static-assertion surface (toy/tsql — the check never runs).
+    // ⚠ [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]]: this used to say the
+    // condition goes through `constIntExpr` and that a FLOAT condition is refused
+    // "because C requires an ICE". Both halves were wrong in practice — the door
+    // takes the full-value `constExprValue` and asks a TRUTHINESS question, and
+    // ✔MEASURED all four reference toolchains fold a floating comparison here and
+    // treat a bare float condition by its truth value.
     RuleId        staticAssertRule{}; std::string staticAssertRuleName;
     // FC17.9(i) + inline-asm P1 (D-CSUBSET-INLINE-ASM /
     // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED, C23 6.8 / GNU 6.47): the whole

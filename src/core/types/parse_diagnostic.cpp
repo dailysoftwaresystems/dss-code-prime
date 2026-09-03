@@ -125,6 +125,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_SubscriptOperandsNotPointerAndInteger";
         case DiagnosticCode::S_ConflictingStorageClassSpecifiers:
             return "S_ConflictingStorageClassSpecifiers";
+        case DiagnosticCode::S_FloatLiteralOverflowsToInfinity:
+            return "S_FloatLiteralOverflowsToInfinity";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";

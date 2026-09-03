@@ -804,6 +804,34 @@ public:
     // `computeRuntimeObjectKey` already refuses an empty one outright.
     [[nodiscard]] std::string                  configDocumentPath() const;
 
+    // ★★ WHERE THIS DOCUMENT CAME FROM — the label `loadFromText` was given,
+    // which for every shipped and every file load is the ABSOLUTE path the
+    // precedence walk resolved. EMPTY only for a text load with no document
+    // behind it (`<inline>` and friends are stored verbatim, so a caller sees
+    // the label rather than a lie).
+    //
+    // ★★★ IT EXISTS FOR ATTRIBUTION, AND ATTRIBUTION IS WHY IT IS PER-DOCUMENT
+    // RATHER THAN PER-PROCESS —
+    // [[D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE]].
+    // A diagnostic that refuses a spelling is making a claim about ONE
+    // config document's contents, and the only honest way to name the tree that
+    // claim came from is to ask the document. Asking the resolver again would
+    // answer a DIFFERENT question — "which tree would a fresh walk find NOW" —
+    // and the two really do diverge: `tests/core/test_config_path_walk.cpp`
+    // mutates `DSS_CONFIG_ROOT` in-process at ten sites, and the examples runner
+    // drives the compiler in-process, so a process-wide "last resolved root"
+    // would be INVOCATION-ORDER DEPENDENT. This field is written once, at the
+    // load, and is immutable like the rest of the schema.
+    //
+    // ⚠ NOT A CACHE-KEY TERM AND NOT A SUBSTITUTE FOR `configDocumentPath()`.
+    // The key line wants the CONFIG-ROOT-RELATIVE spelling, which is stable
+    // across machines; this is the absolute one, which is not. It belongs in
+    // PROSE — a diagnostic, a report line — and nowhere a value is hashed or
+    // compared.
+    [[nodiscard]] std::string_view configDocumentOrigin() const noexcept {
+        return documentOrigin_;
+    }
+
     // Every OTHER document folded into this schema's build, with the digest
     // its bytes had at that moment — see `GrammarSchemaData::referencedDocuments`
     // for why `contentDigest()` alone cannot identify this schema's inputs.
@@ -1290,6 +1318,9 @@ private:
     // The `.lang.json` stem this schema was loaded from — see `configName()`.
     // EMPTY when there was no document.
     std::string configName_;
+
+    // The label this document was loaded UNDER — see `configDocumentOrigin()`.
+    std::string documentOrigin_;
 
     // Lowercase 64-hex SHA-256 of the document bytes — see `contentDigest()`.
     // Written ONLY by `loadFromText` (a static member, so no friend is

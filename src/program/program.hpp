@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <format>
+#include <iosfwd>
 #include <map>
 #include <optional>
 #include <string>
@@ -62,6 +63,21 @@ class IGitRunner;
     double const rem = s - static_cast<double>(m) * 60.0;
     return std::format("{}m{:06.3f}s", m, rem);
 }
+
+// SAY WHICH CONFIG TREE ANSWERED, when the answer is a surprise —
+// [[D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE]]. Writes ONE
+// `dsscp: config root …` line, and only on one of two surprises — the cwd walk
+// resolved a tree that is not this compiler's own, or `$DSS_CONFIG_ROOT` was
+// set and IGNORED; otherwise it writes nothing at all. Never a diagnostic and
+// never a refusal — see the definition for why both of those would break a
+// legitimate cross-tree build.
+//
+// ⓘ TWO CALL SITES, ON PURPOSE. `Program::run` covers the whole dispatch fork,
+// and `dumpPredefinedMacros` covers the one mode that is answered ahead of
+// `Program` in `main` and would otherwise be the single instrument about config
+// that could not say which config. One function, one wording, so they cannot
+// drift into two renderings of one fact.
+DSS_EXPORT void reportConfigRootProvenance(std::ostream& err);
 
 class DSS_EXPORT Program {
 public:

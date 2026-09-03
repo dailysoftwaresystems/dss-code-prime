@@ -14,6 +14,7 @@
 // primitive alone would not have caught it, because the primitive was fine and
 // the caller never called it.
 
+#include "core/substrate/path_identity.hpp"  // genericSpelling — the spelling the note prints
 #include "core/types/config_path_walk.hpp"
 #include "repo_root.hpp"     // the repo-root VERSION — the compiler's own identity
 #include "unc_spelling.hpp"  // the ONE multi-separator-root fixture
@@ -611,4 +612,219 @@ TEST(ConfigPathWalk, NotFoundDiagnosticListsEveryPathTried) {
         << "the walk must appear among the tried paths: " << msg;
     EXPECT_TRUE(contains(msg, "no_such_target_at_all"))
         << "the message must name what was being looked for: " << msg;
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// WHICH TREE ANSWERED — [[D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE]]
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// THE DEFECT, ✔MEASURED THROUGH THE SHIPPED CLI 2026-09-02 before any of this
+// landed. One variable changed (the process working directory), same binary,
+// `DSS_CONFIG_ROOT` unset in BOTH arms, a second config tree planted outside the
+// repository with the `fadd` row removed from its arm64 dialect document:
+//     cwd in the build tree → rc 0, artifact written
+//     cwd in tree B         → rc 1, `unknown mnemonic 'fadd' … (assembly
+//                             dialect 'AsmArm64Gas', target 'arm64')`
+// The refusal was TRUE and completely unattributable: a dialect NAME is
+// identical in every checkout, so that message reads exactly like "the row you
+// just added does not work".
+//
+// ⚠ WHAT IS **NOT** BEING TESTED HERE, because it is not the fix: the
+// precedence itself is unchanged, and running against another tree is
+// LEGITIMATE — `DSS_CONFIG_ROOT` exists to do it. Nothing below refuses
+// anything. These pin that the outcome is now SAID.
+
+// The arm is reported, not inferred. A caller that re-derived it from the path
+// would be answering an adjacent question — a `$DSS_CONFIG_ROOT` aimed at the
+// cwd's own ancestor is indistinguishable by path alone — and the arm is what
+// decides whether the outcome is a surprise.
+TEST(ConfigRootProvenance, EnvOverrideIsReportedAsTheEnvArm) {
+    ScratchDir scratch(Location::Temp, "config-root-arm");
+    plantConfigDir(scratch.path(), "sources");
+
+    ScopedEnv  env("DSS_CONFIG_ROOT", scratch.path().string());
+    ScratchDir bare(Location::Temp, "config-root-arm");
+    ScopedCwd  cwd(makeNestedStart(bare.path()));   // nothing for the walk
+
+    auto const resolved = dss::resolveShippedConfigRoot();
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->arm, dss::ConfigRootArm::EnvOverride);
+    expectSameDir(resolved->root, scratch.path() / "src" / "dss-config");
+}
+
+TEST(ConfigRootProvenance, CwdWalkIsReportedAsTheWalkArm) {
+    ScratchDir scratch(Location::Temp, "config-root-arm");
+    plantConfigDir(scratch.path(), "sources");
+
+    ScopedEnv env("DSS_CONFIG_ROOT");                  // construct-to-clear
+    ScopedCwd cwd(makeNestedStart(scratch.path()));    // 3 hops below the plant
+
+    auto const resolved = dss::resolveShippedConfigRoot();
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->arm, dss::ConfigRootArm::CwdWalk);
+    expectSameDir(resolved->root, scratch.path() / "src" / "dss-config");
+}
+
+// ── THE NOTE ITSELF ────────────────────────────────────────────────────────
+//
+// Driven through the PURE form, which is handed the answer instead of going to
+// look for one. That is what lets every arm be exercised against a planted tree
+// on every host, including the INSTALLED arm, which no development build can
+// otherwise reach.
+
+// ★ THE POSITIVE — a walked tree that is not the compiler's own. This is `el`'s
+// case, and the message must name BOTH trees: naming only the resolved one
+// leaves the reader unable to tell it apart from the tree they meant.
+TEST(ConfigRootProvenance, WalkedForeignTreeIsNamedAlongsideTheBuildTree) {
+    ScratchDir foreign(Location::Temp, "config-root-note");
+    ScratchDir mine(Location::Temp, "config-root-note");
+    fs::path const root = plantConfigDir(foreign.path(), "sources").parent_path();
+    plantConfigDir(mine.path(), "sources");
+
+    auto const note = dss::configRootProvenanceNoteFor(
+        dss::ResolvedConfigRoot{root, dss::ConfigRootArm::CwdWalk}, mine.path());
+    ASSERT_TRUE(note.has_value())
+        << "a walked tree that is not the build tree is exactly the surprise "
+           "this exists to report";
+    EXPECT_TRUE(contains(*note, dss::core::genericSpelling(root)))
+        << "the note must name the tree that ANSWERED: " << *note;
+    EXPECT_TRUE(contains(*note,
+                         dss::core::genericSpelling(mine.path() / "src"
+                                                    / "dss-config")))
+        << "the note must name the tree the reader MEANT: " << *note;
+    EXPECT_TRUE(contains(*note, "DSS_CONFIG_ROOT"))
+        << "the note must say how to choose deliberately: " << *note;
+}
+
+// ★★ THE CONTROL, AND IT IS THE ONE THAT MATTERS FOR NOISE. Every in-tree
+// build, every `dss_add_test` entry and every ordinary user invocation lands
+// here; a note that fired for them would be a line on every compile, which is
+// the "fail-more" this row explicitly forbids.
+TEST(ConfigRootProvenance, OwnTreeSaysNothing) {
+    ScratchDir mine(Location::Temp, "config-root-note");
+    fs::path const root = plantConfigDir(mine.path(), "sources").parent_path();
+
+    EXPECT_FALSE(dss::configRootProvenanceNoteFor(
+                     dss::ResolvedConfigRoot{root, dss::ConfigRootArm::CwdWalk},
+                     mine.path())
+                     .has_value())
+        << "the compiler's own tree is not a surprise";
+}
+
+// ⚠ AN EQUIVALENT PATH SPELLED DIFFERENTLY IS THE SAME TREE. `..` segments, a
+// junction and a mapped drive are all one directory, and a string comparison
+// would report a foreign tree where there is none — a false alarm on an
+// attribution instrument is worse than silence, because it teaches the reader
+// to ignore the line.
+TEST(ConfigRootProvenance, ADifferentSpellingOfTheOwnTreeSaysNothing) {
+    ScratchDir mine(Location::Temp, "config-root-note");
+    plantConfigDir(mine.path(), "sources");
+    // Same directory, deliberately unnormalised: `<mine>/src/dss-config/sources/..`
+    fs::path const detour =
+        mine.path() / "src" / "dss-config" / "sources" / "..";
+
+    EXPECT_FALSE(dss::configRootProvenanceNoteFor(
+                     dss::ResolvedConfigRoot{detour, dss::ConfigRootArm::CwdWalk},
+                     mine.path())
+                     .has_value())
+        << "a second spelling of one directory is not a second tree";
+}
+
+// ★ THE TWO SILENT ARMS, and each is silent for its own stated reason.
+// `$DSS_CONFIG_ROOT` is the operator naming the tree — narrating an explicit
+// instruction back is noise, not attribution. The installed layout composes the
+// binary's own version into the path, so a foreign tree is not reachable
+// through it at all.
+TEST(ConfigRootProvenance, ExplicitOverrideAndInstalledLayoutAreSilent) {
+    ScratchDir foreign(Location::Temp, "config-root-note");
+    ScratchDir mine(Location::Temp, "config-root-note");
+    fs::path const root = plantConfigDir(foreign.path(), "sources").parent_path();
+    plantConfigDir(mine.path(), "sources");
+
+    EXPECT_FALSE(dss::configRootProvenanceNoteFor(
+                     dss::ResolvedConfigRoot{root,
+                                             dss::ConfigRootArm::EnvOverride},
+                     mine.path())
+                     .has_value())
+        << "DSS_CONFIG_ROOT exists precisely to run against another tree";
+    EXPECT_FALSE(dss::configRootProvenanceNoteFor(
+                     dss::ResolvedConfigRoot{
+                         root, dss::ConfigRootArm::InstalledLayout},
+                     mine.path())
+                     .has_value())
+        << "an installed tree agrees with its binary by construction";
+}
+
+// ── A SET-BUT-IGNORED OVERRIDE ─────────────────────────────────────────────
+//
+// ★★★ THE FALL-THROUGH IS CORRECT AND IS NOT UNDER TEST HERE — a stale override
+// must never worsen discovery, and these assert that it still does not. What is
+// under test is its SILENCE. An explicit instruction that did nothing is the
+// same invisible-outcome class as a foreign tree, and it has already cost a
+// measured 5x false regression: the speedtest1 benchmark's pin was one
+// directory too deep, missed, and fell through to the very cwd walk it existed
+// to prevent. That row fixed its own pin and left the rest as "a production
+// question, raised rather than taken":
+// [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+TEST(ConfigRootProvenance, ASetButMissedOverrideIsRecordedAndTheWalkStillAnswers) {
+    ScratchDir scratch(Location::Temp, "config-root-ignored");
+    plantConfigDir(scratch.path(), "sources");
+    // The classic mistake: naming `src/dss-config` itself instead of the
+    // directory that CONTAINS it, so the composed candidate is
+    // `<...>/src/dss-config/src/dss-config` and misses.
+    fs::path const tooDeep = scratch.path() / "src" / "dss-config";
+
+    ScopedEnv env("DSS_CONFIG_ROOT", tooDeep.string());
+    ScopedCwd cwd(makeNestedStart(scratch.path()));
+
+    auto const resolved = dss::resolveShippedConfigRoot();
+    ASSERT_TRUE(resolved.has_value())
+        << "the fall-through must still resolve — a stale override may not "
+           "worsen discovery";
+    EXPECT_EQ(resolved->arm, dss::ConfigRootArm::CwdWalk);
+    expectSameDir(resolved->root, tooDeep);
+    ASSERT_TRUE(resolved->ignoredOverride.has_value())
+        << "an override that was set and did nothing must be RECORDED";
+    EXPECT_EQ(*resolved->ignoredOverride, tooDeep.string());
+}
+
+// The note fires on the ignored override EVEN WHEN THE TREE IS THE COMPILER'S
+// OWN — which is precisely the benchmark's case, and the case a foreign-tree
+// test can never reach. It names the CAUSE (the ignored override), not only the
+// consequence.
+TEST(ConfigRootProvenance, AnIgnoredOverrideIsReportedEvenForTheOwnTree) {
+    ScratchDir mine(Location::Temp, "config-root-ignored");
+    fs::path const root = plantConfigDir(mine.path(), "sources").parent_path();
+
+    dss::ResolvedConfigRoot resolved{root, dss::ConfigRootArm::CwdWalk,
+                                     std::string{"/no/such/pin"}};
+    auto const note = dss::configRootProvenanceNoteFor(resolved, mine.path());
+    ASSERT_TRUE(note.has_value())
+        << "an explicit instruction that did nothing must not be silent just "
+           "because the fall-through happened to land on the right tree";
+    EXPECT_TRUE(contains(*note, "/no/such/pin")) << *note;
+    EXPECT_TRUE(contains(*note, "IGNORED")) << *note;
+    // And it must NOT also claim a foreign tree, which would be false here.
+    EXPECT_FALSE(contains(*note, "is NOT this compiler's own")) << *note;
+}
+
+// ── THE INVERSE OF THE COMPOSITION ─────────────────────────────────────────
+//
+// `<root>/<subdir>/<leaf>` is composed in ONE place; its inverse lives beside
+// it so the two cannot drift. A label that is not a path has no root, and
+// inventing one would name a directory nobody read.
+TEST(ConfigRootProvenance, ConfigRootOfShippedDocumentStripsSubdirAndLeaf) {
+    fs::path const doc =
+        fs::path{"/tmp/tree/src/dss-config"} / "sources" / "c.lang.json";
+    auto const root = dss::configRootOfShippedDocument(doc);
+    ASSERT_TRUE(root.has_value());
+    EXPECT_EQ(*root, fs::path{"/tmp/tree/src/dss-config"});
+
+    EXPECT_FALSE(dss::configRootOfShippedDocument(fs::path{"<inline>"})
+                     .has_value())
+        << "a text load carries a LABEL, not a path, and has no root";
+    EXPECT_FALSE(dss::configRootOfShippedDocument(fs::path{"c.lang.json"})
+                     .has_value())
+        << "one parent is not two — a bare leaf has no subdir to strip";
 }

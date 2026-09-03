@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/symbol_attrs.hpp"  // SymbolBinding
 
 #include <cstdint>
 #include <string>
@@ -171,6 +172,48 @@ struct DSS_EXPORT ExternImport {
     // library); the flag never rides an unbound row. FALSE for every non-
     // descriptor producer (the format-AGNOSTIC default — no arch/format branch).
     bool          isEagerImport = false;
+    // ★★ D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the REFERENCE binding
+    // this import carries onto the wire — the import-side companion of
+    // `ModuleSymbol::binding`, in the SAME agnostic `SymbolBinding` vocabulary so
+    // the two sides of one symbol are never described in two languages.
+    //
+    // `Global` (the default, and every import until one is annotated) ⇒ a STRONG
+    // reference: the symbol MUST be resolved, and nothing resolving it is a link
+    // error. `Weak` ⇒ the reference MAY legally resolve to NOTHING, in which case
+    // its address is 0 — which is the whole purpose of the construct (`extern int
+    // ea __attribute__((weak)); … if (&ea)`), and the ONE property that
+    // distinguishes it. Set at HIR→MIR's `collectExterns` from the declaration's
+    // `HirLinkageMap` entry, exactly as `isThreadLocal` is set from
+    // `HirThreadLocalMap` at the same site.
+    //
+    // ★ WHY THIS FIELD EXISTS AT ALL, because the attribute was already
+    // understood without it. `weak` on an extern IMPORT reached the HIR linkage
+    // map and STOPPED: HIR→MIR consumed `linkageMap` for function DEFINITIONS and
+    // GLOBALS only, so the bit was parsed, recorded, and dropped one layer below
+    // where it was recorded. The emitted object then marked the undefined symbol
+    // STRONG on all three formats (✔MEASURED at HEAD 2026-09-02: ELF `NOTYPE
+    // GLOBAL UND`, Mach-O `(undefined) external`, COFF `StorageClass: External`),
+    // and a DSS-linked image refused the program outright with `K_SymbolUndefined`
+    // where gcc and clang link it and run it to the null branch.
+    //
+    // ⚠ `Local` IS NOT A REPRESENTABLE IMPORT BINDING and never rides this field.
+    // An import is by construction a name this object does NOT define, and
+    // module-private is the one thing such a name cannot be — no format spells an
+    // undefined LOCAL symbol, and emitting one would make the reference
+    // unresolvable by any linker. `collectExterns` REFUSES it at the source span
+    // rather than folding it to Global, so a language whose config maps some
+    // specifier to `Local` on an extern declaration fails loud at the tier that
+    // can still name the declaration.
+    //
+    // ★ THE MERGE COMBINE IS STRONGEST-WINS, NOT OR-COMBINE. Where two CUs import
+    // one identity (the `ffiImportKey` / `dedupKey` triple) and disagree, the
+    // surviving row binds `Global`: a strong reference anywhere in the program
+    // makes the symbol REQUIRED, which is what C says and what gcc/clang do.
+    // Order-INDEPENDENT, like `isEagerImport`'s OR — and, unlike `isData`, a
+    // disagreement here is a DEFINED fold rather than a conflict, because the two
+    // rows describe the same object bound the same way and differ only in whether
+    // this TU could do without it.
+    SymbolBinding binding = SymbolBinding::Global;
 };
 
 } // namespace dss

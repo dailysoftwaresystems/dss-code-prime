@@ -5929,6 +5929,65 @@ TEST(HirLoweringC, D5_3_ChainedBraceNesting) {
     EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
 }
 
+// ── [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]] ───────────────
+//
+// An index designator is the ONE integer-constant-expression consumer that lives
+// at this tier, and its const-expr surface had quietly fallen behind the semantic
+// tier's: `evalCstConstInt` carried no cast-target resolver at all, so
+// `{ [(int)1] = 7 }` was refused with "index designator must be an integer
+// literal" while the byte-identical expression folded fine as an array bound.
+// ✔MEASURED: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51 all
+// accept `[(int)1]` AND `[(int)1.5]`.
+//
+// ⚠ THE ASSERTION IS WHERE THE 7 LANDED, not that lowering succeeded. A resolver
+// that folded `(int)1.5` to 0 or 2 would still lower cleanly and would still be
+// wrong; the slot is the only thing that says which.
+TEST(HirLoweringC, IndexDesignatorFoldsACastToAnInteger) {
+    struct Case { char const* src; char const* what; };
+    Case const cases[] = {
+        {"int a[3] = { [(int)1] = 7 };\n",   "an integer cast"},
+        {"int a[3] = { [(int)1.5] = 7 };\n", "a float cast, truncated toward zero"},
+        {"int a[3] = { [(int)1.9] = 7 };\n", "and truncation, not rounding"},
+    };
+    for (Case const& c : cases) {
+        SemanticModel model = analyzeC(std::string{"void f() { "} + c.src + "}\n");
+        ASSERT_FALSE(model.hasErrors()) << c.what;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok)
+            << c.what << ": " << (r.all().empty() ? "" : r.all()[0].actual);
+        HirNodeId fn   = firstFunction(res->hir);
+        HirNodeId init = firstVarInitOfFn(res->hir, fn);
+        ASSERT_TRUE(init.valid()) << c.what;
+        EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate) << c.what;
+        auto kids = res->hir.children(init);
+        ASSERT_EQ(kids.size(), 3u) << c.what;
+        // Slot 1 carries the 7; the designator resolved to index 1 and nowhere
+        // else. Slots 0 and 2 are the zero fill.
+        std::int64_t got[3] = {-1, -1, -1};
+        for (std::size_t i = 0; i < 3; ++i) {
+            ASSERT_EQ(res->hir.kind(kids[i]), HirKind::Literal) << c.what;
+            auto const lit = res->literalPool.at(res->hir.payload(kids[i]));
+            ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit.value)) << c.what;
+            got[i] = std::get<std::int64_t>(lit.value);
+        }
+        EXPECT_EQ(got[0], 0) << c.what;
+        EXPECT_EQ(got[1], 7) << c.what;
+        EXPECT_EQ(got[2], 0) << c.what;
+    }
+}
+
+// The wall this tier keeps: a float-VALUED index is refused, exactly as all four
+// references refuse `{ [1.5] = 7 }`. Without this control, "casts fold here now"
+// would be indistinguishable from "floats are integers here now".
+TEST(HirLoweringC, IndexDesignatorStillRefusesAFloatVALUE) {
+    SemanticModel model = analyzeC("void f() { int a[3] = { [1.5] = 7 }; }\n");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool const refused = model.hasErrors() || !res->ok;
+    EXPECT_TRUE(refused) << "a float-valued index designator must fail loud";
+}
+
 // Lock-in: field designator naming a NON-EXISTENT field emits a
 // diagnostic that the field doesn't belong to the target struct.
 TEST(HirLoweringC, D5_3_UnknownFieldDesignatorEmitsDiag) {
@@ -6205,11 +6264,21 @@ TEST(HirLoweringC, D5_3_CompoundLiteralInVarDeclInit) {
     EXPECT_EQ(res->hir.children(init).size(), 2u);
 }
 
-// Substrate-blocked: non-literal index designator (e.g. `[n] = 7`)
-// must emit a diagnostic that names CST-side const-eval as the blocker.
-// Strict form: when semantic accepts the input, the lowering MUST emit
-// the diagnostic (silent acceptance would be a regression the looser
+// A NON-CONSTANT index designator (`[n] = 7`, `n` a mutable local) must be
+// diagnosed. Strict form: when semantic accepts the input, the lowering MUST
+// emit the diagnostic (silent acceptance would be a regression the looser
 // `found || res->ok` form would have missed).
+//
+// ⚠ REPAIRED, NOT DELETED, under
+// [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]. Two things about
+// this pin had gone stale while the assertion it makes stayed exactly right.
+// (1) It matched the diagnostic by the words "integer literal", which described
+// a designator surface that had already grown past literals (`[1+0]` folds) and
+// has now grown a cast too — the message names C 6.7.10p4's actual requirement,
+// an integer constant EXPRESSION, so the match is on that. (2) Its comment
+// called this "substrate-blocked ... pending CST-side const-eval", which stopped
+// being the reason long ago: the substrate is here, and `n` is refused because
+// it is genuinely not a constant, which is what all four references also say.
 TEST(HirLoweringC, D5_3_NonLiteralIndexDesignatorEmitsDiag) {
     SemanticModel model = analyzeC(
         "void f() { int n = 1; int xs[3] = {[n] = 7}; }\n");
@@ -6218,17 +6287,15 @@ TEST(HirLoweringC, D5_3_NonLiteralIndexDesignatorEmitsDiag) {
     auto res = lowerToHir(model, r);
     bool found = false;
     for (auto const& d : r.all()) {
-        if (d.actual.find("integer literal") != std::string::npos
+        if (d.actual.find("integer constant") != std::string::npos
          || d.actual.find("const-eval") != std::string::npos) {
             found = true; break;
         }
     }
     EXPECT_TRUE(found)
-        << "non-literal index designator MUST be diagnosed pending "
-           "CST-side const-eval substrate";
+        << "a non-constant index designator MUST be diagnosed";
     EXPECT_FALSE(res->ok)
-        << "lowering must fail when a non-literal index designator "
-           "appears (substrate-blocked path)";
+        << "lowering must fail when a non-constant index designator appears";
 }
 
 // ── plan 12.5 §0.2 D6: CST-side const-eval ──────────────────────────
@@ -8223,14 +8290,30 @@ TEST(HirLoweringC, StaticAssertEnumConstantFolds) {
     EXPECT_FALSE(model.hasErrors());
 }
 
-// NON-CONSTANT condition (a float — not an integer constant expression) fails
-// loud. C 6.7.10 requires an integer constant expression; a float condition
-// cannot fold in `constIntExpr` → S_StaticAssertFailed.
-TEST(HirLoweringC, StaticAssertFloatConditionFailsAsNonConstant) {
-    SemanticModel model = analyzeC(
-        "_Static_assert(3.5, \"float is not an ICE\");\n"
+// A FLOAT condition is decided by its TRUTH VALUE, not refused for being a float
+// — [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]].
+//
+// ⚠⚠ THIS TEST USED TO ASSERT THE OPPOSITE, and it was wrong. It required
+// `_Static_assert(3.5, "")` to FAIL "because C 6.7.10 requires an integer
+// constant expression". ✔MEASURED at close time, probed SEPARATELY: clang 18.1.3
+// and MSVC 19.51 ACCEPT it; gcc 13.3.0 and mingw-w64 gcc 13.2.0 refuse it as
+// "not an integer". `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` governs an
+// accept-vs-refuse split, so DSS accepts. The REFUSAL the test was really
+// guarding — that a float condition cannot silently pass whatever its value —
+// is kept below and is stronger: a float that is FALSE still fails loud, which
+// all four references agree on.
+TEST(HirLoweringC, StaticAssertFloatConditionIsDecidedByItsTruthValue) {
+    SemanticModel accepted = analyzeC(
+        "_Static_assert(3.5, \"a non-zero float is true\");\n"
         "int main(void){ return 0; }\n");
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+    EXPECT_EQ(countCode(accepted.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+    SemanticModel refused = analyzeC(
+        "_Static_assert(0.0, \"a zero float is false\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(refused.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "a FALSE floating condition must still fail loud";
 }
 
 // ════════════════════════════════════════════════════════════════════════════

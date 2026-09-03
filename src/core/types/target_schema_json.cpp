@@ -602,6 +602,60 @@ parseRegClassField(json const& obj, std::string_view key,
     return c;
 }
 
+// [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]: the shared parse of
+// ONE register field's LANE SHAPE — the presence key (`lanes` / `destLanes`)
+// and its refinement (`laneBits` / `destLaneBits`). ONE reader for both sites
+// for the same reason `parseRegClassField` is one reader for three: an
+// instruction's source and destination ends state the identical kind of fact,
+// and two readers would be two chances to disagree about what "no lanes" means.
+//
+// ⚠ THE REFINEMENT WITHOUT THE PRESENCE KEY IS A LOAD ERROR, not a silent
+// promotion to `lanes: true`. An author who writes `laneBits` alone has stated
+// a lane width for a field they also said reads a scalar; promoting it would
+// guess which half they meant, and guessing wrong here widens a candidate set
+// (see `TargetEncodingWire::lanes` for the two measured wrong-instruction
+// spellings this axis exists to make unsayable).
+void parseLaneShape(json const& obj, std::string_view presenceKey,
+                    std::string_view widthKey, std::string const& path,
+                    bool& lanesOut, std::uint8_t& laneBitsOut,
+                    Collector& coll) {
+    if (obj.contains(presenceKey)) {
+        auto const& l = obj.at(presenceKey);
+        if (!l.is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("{}/{}", path, presenceKey),
+                      std::format("'{}' must be a boolean — true when this "
+                                  "field reads its register as a VECTOR OF "
+                                  "LANES, omitted when it reads it as a scalar",
+                                  presenceKey));
+        } else {
+            lanesOut = l.get<bool>();
+        }
+    }
+    if (!obj.contains(widthKey)) return;
+    auto const& lb    = obj.at(widthKey);
+    auto const  lbPath = std::format("{}/{}", path, widthKey);
+    if (!lb.is_number_integer() || lb.get<std::int64_t>() <= 0
+        || lb.get<std::int64_t>() > 255) {
+        coll.emit(DiagnosticCode::C_MalformedJson, lbPath,
+                  std::format("'{}' must be a positive integer no wider than "
+                              "255 — the width of ONE lane, in bits", widthKey));
+        return;
+    }
+    if (!lanesOut) {
+        coll.emit(DiagnosticCode::C_MalformedJson, lbPath,
+                  std::format("'{}' is declared but '{}' is not — a lane width "
+                              "on a field that reads its register as a scalar "
+                              "describes nothing, and this key ELIMINATES "
+                              "candidates at election, so a declaration that "
+                              "can never be true would silently narrow a "
+                              "candidate set",
+                              widthKey, presenceKey));
+        return;
+    }
+    laneBitsOut = static_cast<std::uint8_t>(lb.get<std::int64_t>());
+}
+
 // D-AS4-3 (multi-instruction-macro encoder): parse `extraResultSlots`
 // — additional placements of the SAME result register beyond the
 // primary `resultSlot` (word 0). Each entry is { "slotKind": <name>,
@@ -692,17 +746,23 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
         // A dropped `relocationKind` is the sharpest hazard here: the wire
         // would encode literal bits where the linker was meant to patch a
         // symbol address.
-        static constexpr std::array<std::string_view, 6> kWireKeys{
+        static constexpr std::array<std::string_view, 8> kWireKeys{
             "index", "slotKind", "relocationKind", "wordIndex",
             "prefixOpcodeBytes",
             // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: this field's
             // register-bank override.
-            "regClass"};
+            "regClass",
+            // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]: whether
+            // this field reads its register as a VECTOR OF LANES, and how wide
+            // one lane is. See `TargetEncodingWire::lanes`.
+            "lanes", "laneBits"};
         DSS_CHECK_KEY_VOCABULARY(kWireKeys);
         rejectUnknownKeys(o2, kWireKeys, wirePath, "an operand wire", coll);
         TargetEncodingWire wire;
         wire.regClass = parseRegClassField(
             o2, "regClass", std::format("{}/regClass", wirePath), coll);
+        parseLaneShape(o2, "lanes", "laneBits", wirePath, wire.lanes,
+                       wire.laneBits, coll);
         if (!o2.contains("index") || !o2.at("index").is_number_integer()) {
             coll.emit(DiagnosticCode::C_MissingField,
                       std::format("{}/index", wirePath),
@@ -847,11 +907,20 @@ void parseEncodingVariants(json const& vs,
         // leaving an ALL-DEFAULT template (fixedWord 0, no opcode bytes) that
         // the encoder would emit as zero words. The neighbouring guard loop
         // is what made the absence invisible.
-        static constexpr std::array<std::string_view, 6> kVariantKeys{
+        static constexpr std::array<std::string_view, 9> kVariantKeys{
             "guard", "template", "resultSlot", "extraResultSlots", "wires",
             // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the result
             // field's register-bank override.
-            "resultRegClass"};
+            "resultRegClass",
+            // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME:
+            // the result field's WIDTH — the other half of the same fact, and
+            // deliberately a sibling of `resultRegClass` rather than a member
+            // of `guard`. See `TargetEncodingVariant::destWidthBits`.
+            "destWidth",
+            // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]: the
+            // result field's LANE SHAPE — a third sibling in the same family,
+            // and a declaration rather than a guard for the same reason.
+            "destLanes", "destLaneBits"};
         DSS_CHECK_KEY_VOCABULARY(kVariantKeys);
         rejectUnknownKeys(v, kVariantKeys,
                           std::format("/opcodes/{}/encoding/variants/{}",
@@ -863,6 +932,34 @@ void parseEncodingVariants(json const& vs,
             std::format("/opcodes/{}/encoding/variants/{}/resultRegClass",
                         opIdx, vi),
             coll);
+        if (v.contains("destWidth")) {
+            auto const& dw   = v.at("destWidth");
+            auto const  path = std::format(
+                "/opcodes/{}/encoding/variants/{}/destWidth", opIdx, vi);
+            // ⚠ THE SAME CLOSED WIDTH VOCABULARY `guard.width` USES, and for
+            // the same reason: a width outside it is a value no operand
+            // spelling can ever state, so the variant would match nothing and
+            // the document would load clean.
+            if (!dw.is_number_integer()
+                || (dw.get<std::int64_t>() != 8 && dw.get<std::int64_t>() != 16
+                    && dw.get<std::int64_t>() != 32
+                    && dw.get<std::int64_t>() != 64
+                    && dw.get<std::int64_t>() != 128)) {
+                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                          "'destWidth' must be the integer 8, 16, 32, 64, or "
+                          "128 — the same operation-width vocabulary "
+                          "'guard.width' uses, because a destination width is "
+                          "a width a register spelling has to be able to state "
+                          "(D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME)");
+            } else {
+                variant.destWidthBits =
+                    static_cast<std::uint8_t>(dw.get<std::int64_t>());
+            }
+        }
+        parseLaneShape(
+            v, "destLanes", "destLaneBits",
+            std::format("/opcodes/{}/encoding/variants/{}", opIdx, vi),
+            variant.destLanes, variant.destLaneBits, coll);
         parseVariantGuard      (v, opIdx, vi, variant, coll);
         parseVariantTemplate   (v, opIdx, vi, variant.tmpl, coll);
         parseVariantResultSlot (v, opIdx, vi, variant, coll);
@@ -4901,6 +4998,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
 
     auto schema = std::make_shared<TargetSchema>(std::move(data));
     schema->contentDigest_ = std::move(digest);
+    // WHERE IT CAME FROM, verbatim — see `configDocumentOrigin()`. Set on the
+    // SUCCESS path only, beside the digest and for the same reason: a load that
+    // produced diagnostics and no schema has nothing to attribute.
+    schema->documentOrigin_ = std::string{sourceLabel};
     return schema;
 }
 

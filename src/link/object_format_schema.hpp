@@ -1635,6 +1635,53 @@ struct DSS_EXPORT ObjectFormatData {
     // dataImportBinding discipline).
     std::optional<ExternAddrBinding> externAddrBinding;
 
+    // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET:
+    //     the OBJECT-CARRIED realization of `dataImportBinding` ───────
+    //
+    // `dataImportBinding: "got-indirect"` says an extern DATA object's
+    // address is LOADED from a pointer slot rather than computed. On an
+    // IMAGE the slot is built by the import walker (the PE IAT entry, the
+    // ELF `.got`, the Mach-O `__got`) and nothing else is needed. A
+    // RELOCATABLE artifact has NO import walker: the same declared model
+    // can only be realized by the object CARRYING the slot itself, as a
+    // pointer-sized item holding an absolute relocation against the
+    // imported name that the FINAL linker fills.
+    //
+    // This block is that realization's DIALECT SPELLING — the symbol-name
+    // prefix the carried slot is published under — and it exists for the
+    // same reason `weakDefinition.dialect` does: the mechanism is an
+    // engine decision, the SPELLING is a per-ecosystem fact, and a
+    // spelling hardcoded in a walker is a format-identity branch wearing a
+    // string literal. It is NOT a second decision about WHETHER to
+    // indirect: that stays `dataImportBinding`'s, and the two are locked
+    // together at the linker (a relocatable format declaring the binding
+    // with no slot spelling FAILS LOUD there, and a format declaring the
+    // spelling without the binding likewise).
+    //
+    // ✔MEASURED 2026-09-02, why the prefix is `.refptr.` on PE/COFF and why
+    // matching the reference spelling is worth declaring rather than
+    // inventing: clang 18.1.3 emits `.refptr.<name>` for BOTH windows
+    // triples, and mingw-w64 gcc 13.2.0 emits it for every PE data extern.
+    // The slot is a COMDAT, so a DSS object and a clang object that import
+    // one name publish the SAME key and the final linker folds them into
+    // ONE slot; a private prefix would silently produce two.
+    //
+    // `std::nullopt` = the format declares no carried-slot spelling — the
+    // correct state for every IMAGE flavour (its walker owns the slot) and
+    // for a relocatable flavour that declares no `dataImportBinding` at all
+    // (its extern data addresses are computed directly, which is what
+    // cl.exe emits and what every ELF/Mach-O relocatable flavour does).
+    struct ObjectImportSlotInfo {
+        // The symbol-name prefix; the slot for import `ea` is published as
+        // `<symbolPrefix>ea`. Required non-empty when the block is present
+        // (validate()-enforced): an empty prefix would publish the slot
+        // under the IMPORT'S OWN NAME, which is a duplicate-symbol error at
+        // the final linker in the best case and a self-referential slot in
+        // the worst.
+        std::string symbolPrefix;
+    };
+    std::optional<ObjectImportSlotInfo> objectImportSlot;
+
     // ── D-CSUBSET-THREAD-LOCAL (TLS C1): thread-local access block ──
     //
     // HOW code reaches a thread-local object's per-thread copy under
@@ -2339,6 +2386,18 @@ public:
     [[nodiscard]] std::optional<ExternAddrBinding>
     externAddrBinding() const noexcept {
         return d_.externAddrBinding;
+    }
+
+    // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET
+    //     accessor ──────────────────────────────────────────────────
+    // The symbol-name spelling of an OBJECT-CARRIED data-import slot, or
+    // nullopt if this format carries none. Read by the linker when it must
+    // realize a declared `dataImportBinding` inside a RELOCATABLE artifact,
+    // which has no import walker to build the slot for it.
+    [[nodiscard]]
+    std::optional<detail::ObjectFormatData::ObjectImportSlotInfo> const&
+    objectImportSlot() const noexcept {
+        return d_.objectImportSlot;
     }
 
     // ── D-CSUBSET-THREAD-LOCAL accessor (TLS C1) ─────────────────

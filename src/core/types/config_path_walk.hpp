@@ -4,8 +4,10 @@
 #include "core/types/grammar_schema.hpp"   // LoadResult + ConfigDiagnostic
 #include "core/types/parse_diagnostic.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -207,5 +209,125 @@ findShippedConfigDir(
 // precedence above — would not.
 [[nodiscard]] DSS_EXPORT std::vector<std::filesystem::path>
 resolveSystemDirs(GrammarSchema const& grammar);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WHICH TREE ANSWERED — [[D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE]]
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ★★★ THE DEFECT, ✔MEASURED (P54, and by lane `el` before that). The precedence
+// above is CORRECT and is not what is being changed here: what was missing is
+// that its OUTCOME was invisible. A binary built from tree A, invoked with a
+// working directory inside tree B, reads TREE B's `src/dss-config` — and then
+// answers every vocabulary question out of it, perfectly, about config the
+// caller did not think they were using. ✔MEASURED 2026-09-02, ONE variable
+// changed (cwd), same binary, `DSS_CONFIG_ROOT` unset in both arms:
+//     cwd in the build tree → rc 0
+//     cwd in tree B         → rc 1, `unknown mnemonic 'fadd' … (assembly
+//                             dialect 'AsmArm64Gas', target 'arm64')`
+// which is indistinguishable from "the row you just added does not work". Lane
+// `el` lost a cycle of measurement to exactly that reading.
+//
+// ⚠ THE REMEDY IS FAIL-LOUD, NOT FAIL-MORE. Running a binary against another
+// tree's config is LEGITIMATE — `DSS_CONFIG_ROOT` exists to do it — so nothing
+// below refuses anything. It reports.
+//
+// ★ THE NOT-FOUND CASE WAS ALREADY SELF-DIAGNOSING and is deliberately
+// untouched: `findShippedConfig`'s miss lists EVERY path tried (✔MEASURED — an
+// unknown `--language` prints nine `tried:` lines naming both trees). The blind
+// case is the one where a document DID load, out of the wrong tree.
+
+// Which arm of the precedence answered. Reported rather than inferred: a caller
+// that re-derived it would be answering an adjacent question, and the three
+// arms mean three different things about whether the outcome is a surprise.
+enum class ConfigRootArm : std::uint8_t {
+    EnvOverride,      // 1. $DSS_CONFIG_ROOT — the operator named the tree
+    InstalledLayout,  // 2. beside the executable — agreement is by construction
+    CwdWalk,          // 3. an ancestor of the working directory — DISCOVERED
+};
+
+[[nodiscard]] DSS_EXPORT std::string_view
+configRootArmLabel(ConfigRootArm arm) noexcept;
+
+struct DSS_EXPORT ResolvedConfigRoot {
+    std::filesystem::path root;   // the `dss-config` directory itself
+    ConfigRootArm         arm{};
+
+    // `$DSS_CONFIG_ROOT` was SET and did not answer, so `arm`/`root` came from
+    // a later arm. Carries the value as the operator spelled it.
+    //
+    // ★★ THE FALL-THROUGH ON A SET-BUT-MISSED OVERRIDE IS CORRECT AND IS NOT
+    // CHANGED — a stale override must never worsen discovery. What was wrong is
+    // that it was SILENT, which is the same invisible-outcome class as the
+    // foreign tree above and has already cost a measured 5x false regression
+    // (the speedtest1 benchmark's pin was one directory too deep, missed, and
+    // fell through to the very cwd walk it existed to prevent). That row fixed
+    // its own pin and recorded the rest as "a production question, raised
+    // rather than taken":
+    // [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+    std::optional<std::string> ignoredOverride;
+};
+
+// The config ROOT for this invocation, by the same `resolveByPrecedence` the
+// two lookups above run — never a second, private walk.
+//
+// ⚠ IT ANSWERS A SLIGHTLY WIDER QUESTION THAN `findShippedConfig`, AND THE
+// DIFFERENCE IS STATED RATHER THAN GLOSSED: this probes `<root>` as a
+// DIRECTORY, so it stops at the first ancestor that has a `src/dss-config/` at
+// all, while the file form continues past an ancestor whose tree lacks the
+// requested leaf. They can therefore disagree for a PARTIALLY POPULATED tree.
+// Nothing that must be exact reads this — the provenance note below is keyed on
+// the arm and used for a report line, and `configDocumentOrigin()` on the loaded
+// schema is what a DIAGNOSTIC names, because that is the tree that actually
+// answered it.
+[[nodiscard]] DSS_EXPORT std::optional<ResolvedConfigRoot>
+resolveShippedConfigRoot();
+
+// The config ROOT a resolved shipped-document path came out of — i.e. the
+// inverse of the `<root>/<subdir>/<leaf>` composition `resolveByPrecedence`
+// performs. It lives HERE, beside that composition, because an inverse written
+// anywhere else is a second owner of the layout and free to drift from it.
+//
+// nullopt when `document` has no two parents to strip — a schema built from
+// text carries a LABEL (`<inline>`) rather than a path, and inventing a root
+// for it would name a directory nobody read.
+[[nodiscard]] DSS_EXPORT std::optional<std::filesystem::path>
+configRootOfShippedDocument(std::filesystem::path const& document);
+
+// The SOURCE TREE this compiler was built from — `CMAKE_SOURCE_DIR`, baked by
+// `src/core/CMakeLists.txt`. It is a comparison operand and NEVER a lookup arm;
+// see that file for why adding it to the precedence would be a defect.
+[[nodiscard]] DSS_EXPORT std::string_view buildSourceDir();
+
+// The one-line provenance sentence for a resolved root, or nullopt when there
+// is nothing surprising to say. PURE with respect to discovery — it is handed
+// the answer rather than going to look for one — which is what lets a test
+// drive every arm against a planted tree.
+//
+// ENGAGED ON EITHER OF TWO SURPRISES, and on neither otherwise:
+//   1. THE CWD WALK answered a root that is not this compiler's own
+//      `<buildSourceDir>/src/dss-config`. The other two arms cannot produce
+//      this surprise: `$DSS_CONFIG_ROOT` that ANSWERED is the operator saying
+//      which tree to use (narrating an explicit instruction back is noise, not
+//      attribution), and the installed layout composes the binary's own version
+//      into the path.
+//   2. `$DSS_CONFIG_ROOT` was SET AND IGNORED — an explicit instruction that
+//      silently did nothing. The fall-through itself is unchanged and correct.
+// Both hold together often (a mis-spelled override is exactly how a caller ends
+// up in a foreign tree), and the note then states the CAUSE before the
+// CONSEQUENCE.
+// ⓘ The comparison is `fs::equivalent`, not string equality: a lane worktree, a
+// junction and a mapped drive are all spellings of one directory, and a
+// spelling-based answer would report a foreign tree where there is none. An
+// error from `equivalent` means one side does not exist — which, since the
+// resolved root was just probed, means the BUILD tree is absent (a relocated or
+// shipped binary), i.e. genuinely a different tree.
+[[nodiscard]] DSS_EXPORT std::optional<std::string>
+configRootProvenanceNoteFor(ResolvedConfigRoot const&    resolved,
+                            std::filesystem::path const& buildTree);
+
+// The same question for THIS invocation: resolve, then judge. nullopt when no
+// config root resolves at all — a genuine miss is `findShippedConfig`'s to
+// report, and it already names every path it tried.
+[[nodiscard]] DSS_EXPORT std::optional<std::string> configRootProvenanceNote();
 
 } // namespace dss

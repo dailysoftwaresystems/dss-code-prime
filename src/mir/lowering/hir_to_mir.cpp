@@ -18,6 +18,7 @@
 #include <map>       // FC17.5 F2: the string-global byte-content memo
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -13659,6 +13660,43 @@ struct Lowerer {
         // diagnostic (silent-failure HIGH fold, LK6 cycle 2d
         // post-fold review).
         std::unordered_set<std::uint32_t> seenExternSyms;
+        // ★★ D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE — THE MINT SITE FOR
+        // AN IMPORT'S REFERENCE BINDING, and the one place `linkageMap` enters the
+        // IMPORT rail. Until this read existed the map was consumed for function
+        // DEFINITIONS and GLOBALS only, so `extern int ea __attribute__((weak));`
+        // was parsed, understood, recorded on the declaration node by
+        // `recordExtern` — and then dropped one layer below where it was recorded,
+        // which is why nothing upstream reported a problem and every emitted object
+        // marked the undefined symbol STRONG.
+        //
+        // ★ SHARED BY BOTH ARMS ON PURPOSE. `ExternGlobal` and `ExternFunction`
+        // build their rows separately, and a weak DATA import and a weak FUNCTION
+        // import are the same fact about the same rail; two open-coded reads is how
+        // the two would drift (the `definedNDesc` reasoning, one tier up).
+        //
+        // ⚠ Local is REFUSED here rather than folded to Global — see the field's
+        // docblock in `core/types/extern_import.hpp`. Returns nullopt having
+        // ALREADY emitted, so the caller skips the row exactly like every other
+        // fail-loud arm in this pre-pass.
+        auto importBinding =
+            [&](HirNodeId decl, std::string_view kindLabel)
+            -> std::optional<SymbolBinding> {
+            if (linkageMap == nullptr) return SymbolBinding::Global;
+            auto const* p = linkageMap->tryGet(decl);
+            if (p == nullptr) return SymbolBinding::Global;
+            if (p->binding == SymbolBinding::Local) {
+                unsupported(decl, std::format(
+                    "HIR {} (id {}) — the declaration binds `{}`, which no "
+                    "object format can spell for an UNDEFINED symbol: an import "
+                    "is a name this object does not define, and module-private "
+                    "is the one thing such a name cannot be. Emitting it under "
+                    "any other binding would silently change which linker can "
+                    "resolve it. D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE.",
+                    kindLabel, decl.v, symbolBindingName(p->binding)));
+                return std::nullopt;
+            }
+            return p->binding;
+        };
         for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
             // c82 (D-LK-EXTERN-DATA-IMPORT): ExternGlobal — an extern DATA
             // object with no intra-module definition (the same-TU-definition
@@ -13741,11 +13779,18 @@ struct Lowerer {
                         "dynamic library that owns it.", decl.v));
                     continue;
                 }
+                auto const dataBinding =
+                    importBinding(decl, "ExternGlobal");
+                if (!dataBinding.has_value()) continue;   // already reported
                 ExternImport row;
                 row.symbol      = sym;
                 row.mangledName = meta->mangledName;
                 row.libraryPath = meta->importLibrary;
                 row.version     = meta->version;   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+                // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the
+                // declaration's own reference binding, read from the SAME
+                // `linkageMap` a native global's binding comes from.
+                row.binding     = *dataBinding;
                 // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker
                 // (a shipped-descriptor DATA export, e.g. a library global) so
                 // the reference gate keeps it even when unreferenced.
@@ -13918,11 +13963,17 @@ struct Lowerer {
                     "IMAGE_IMPORT_DESCRIPTOR entry.", decl.v));
                 continue;
             }
+            auto const fnBinding = importBinding(decl, "ExternFunction");
+            if (!fnBinding.has_value()) continue;   // already reported
             ExternImport row;
             row.symbol      = sym;
             row.mangledName = meta->mangledName;
             row.libraryPath = meta->importLibrary;
             row.version     = meta->version;   // D-LK-ELF-SYMBOL-VERSIONING (c156)
+            // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the declaration's
+            // own reference binding, read from the SAME `linkageMap` a native
+            // function's binding comes from — one map, one vocabulary, both rails.
+            row.binding     = *fnBinding;
             // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker onto
             // the import row so the linker's reference gate keeps a shipped-
             // descriptor import (producer C) even when this TU never calls it.

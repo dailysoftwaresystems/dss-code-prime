@@ -2202,7 +2202,7 @@
       }
     },
     {
-      "$comment": "FC3.5 sweep-c2 (FCmp LIR lowering): FCMP Dn, Dm — floating-point compare writing NZCV, no register result (the float sibling of `cmp`). Base 0x1E602000 = 000 11110 [31:24] | ftype=01 [23:22] | 1 [21] | Rm [20:16] | op=00 [15:14] | 1000 [13:10] | Rn [9:5] | opcode2=00000 [4:0] (ARM ARM C7.2 FCMP; opcode2 bit4=1 would be FCMPE, the signaling form — DSS does not model the FP environment, so the quiet FCMP serves all predicates; the NZCV comparison RESULTS are identical). F32 sibling FCMP Sn, Sm = 0x1E202000 (ftype=00). NZCV outcomes: equal → Z=1(C=1); less → N=1; greater → C=1; unordered → C=1,V=1 — the truth table the float condCodeEncoding arms below realize (full derivation at mir_to_lir floatCmpPlan).",
+      "$comment": "FC3.5 sweep-c2 (FCmp LIR lowering): FCMP Dn, Dm — floating-point compare writing NZCV, no register result (the float sibling of `cmp`). Base 0x1E602000 = 000 11110 [31:24] | ftype=01 [23:22] | 1 [21] | Rm [20:16] | op=00 [15:14] | 1000 [13:10] | Rn [9:5] | opcode2=00000 [4:0] (ARM ARM C7.2 FCMP; opcode2 bit4=1 is FCMPE, the signaling form — DSS does not model the FP environment, so the quiet FCMP serves all predicates in the compiler's OWN lowering; the NZCV comparison RESULTS are identical). ⓘ *would be* BECAME *is* ON 2026-09-02: FCMPE is now a declared opcode of its own (`fcmpe`, lane av, D-ASM-ARM64-GAS-SPELLS-NO-ROUNDING-MODE-OR-VECTOR-MOVE), reachable only from an assembly TEXT surface because both references assemble the spelling. Nothing about THIS opcode or about which form a C comparison lowers to has changed. F32 sibling FCMP Sn, Sm = 0x1E202000 (ftype=00). NZCV outcomes: equal → Z=1(C=1); less → N=1; greater → C=1; unordered → C=1,V=1 — the truth table the float condCodeEncoding arms below realize (full derivation at mir_to_lir floatCmpPlan).",
       "mnemonic":      "fcmp",
       "result":        "none",
       "hasSideEffects": false,
@@ -2245,19 +2245,21 @@
         "registerClass": "fpr",
         "variants": [
           {
-            "$comment": "F64 source → FCVT Sd, Dn (narrow to single).",
+            "$comment": "F64 source → FCVT Sd, Dn (narrow to single). ✔gas 2.42 + clang 18.1.3, agreeing: `fcvt s0, d1` = 0x1E624020, `fcvt s3, d7` = 0x1E6240E3. ★ `destWidth` 32 is the DECLARATION this variant's two ends disagree, added 2026-09-02 (D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME): it is what lets the dialect spell `fcvt` ONCE and lets the written destination decide which arm was meant. It is NOT a guard — no LIR instruction carries a second width — so the encoder still selects on `guard.width` alone and cannot disagree with the election.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 509755392 },
             "resultSlot": "rd",
+            "destWidth":  32,
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
           },
           {
-            "$comment": "F32 source → FCVT Dd, Sn (widen to double).",
+            "$comment": "F32 source → FCVT Dd, Sn (widen to double). ✔gas 2.42 + clang 18.1.3: `fcvt d0, s1` = 0x1E22C020. ⓘ BOTH REFERENCES REFUSE the same-width spellings `fcvt s0, s1` and `fcvt d0, d1` (✔MEASURED) — and so does DSS, because no `fpcvt` variant declares a destination width equal to its source width, so the election eliminates every candidate and refuses by name.",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 505593856 },
             "resultSlot": "rd",
+            "destWidth":  64,
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
@@ -2276,18 +2278,21 @@
         "registerClass": "gpr",
         "variants": [
           {
+            "$comment": "FCVTZS Xd, Dn — ftype=01 double source. ✔gas 2.42 + clang 18.1.3: `fcvtzs x0, d1` = 0x9E780020, `fcvtzs x3, d7` = 0x9E7800E3.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 2658664448 },
             "resultSlot": "rd",
+            "destWidth":  64,
             "wires":      [
               { "index": 0, "slotKind": "rn", "regClass": "fpr" }
             ]
           },
           {
-            "$comment": "FC3.5: FCVTZS Xd, Sn — ftype=00 single source, base 0x9E380000.",
+            "$comment": "FC3.5: FCVTZS Xd, Sn — ftype=00 single source, base 0x9E380000. ✔gas 2.42 + clang 18.1.3: `fcvtzs x0, s1` = 0x9E380020.",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 2654470144 },
             "resultSlot": "rd",
+            "destWidth":  64,
             "wires":      [
               { "index": 0, "slotKind": "rn", "regClass": "fpr" }
             ]
@@ -2323,19 +2328,21 @@
         "registerClass": "gpr",
         "variants": [
           {
-            "$comment": "F64 source → FCVTZU Xd, Dn — ftype=01 double, base 0x9E790000 (the low 32 bits are the in-range U32 result; the full Xd is the NATIVE full-range U64).",
+            "$comment": "F64 source → FCVTZU Xd, Dn — ftype=01 double, base 0x9E790000 (the low 32 bits are the in-range U32 result; the full Xd is the NATIVE full-range U64). ✔gas 2.42 + clang 18.1.3: `fcvtzu x0, d1` = 0x9E790020.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 2658729984 },
             "resultSlot": "rd",
+            "destWidth":  64,
             "wires":      [
               { "index": 0, "slotKind": "rn", "regClass": "fpr" }
             ]
           },
           {
-            "$comment": "F32 source → FCVTZU Xd, Sn — ftype=00 single, base 0x9E390000.",
+            "$comment": "F32 source → FCVTZU Xd, Sn — ftype=00 single, base 0x9E390000. ✔gas 2.42 + clang 18.1.3: `fcvtzu x0, s1` = 0x9E390020.",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 2654535680 },
             "resultSlot": "rd",
+            "destWidth":  64,
             "wires":      [
               { "index": 0, "slotKind": "rn", "regClass": "fpr" }
             ]
@@ -2354,19 +2361,21 @@
         "registerClass": "gpr",
         "variants": [
           {
-            "$comment": "SCVTF Dd, Xn — sf=1 64-bit signed source -> double. base 0x9E620000. The sqlite i64 -> volatile double blocker.",
+            "$comment": "SCVTF Dd, Xn — sf=1 64-bit signed source -> double. base 0x9E620000. The sqlite i64 -> volatile double blocker. ✔gas 2.42 + clang 18.1.3: `scvtf d0, x1` = 0x9E620020, `scvtf d3, x7` = 0x9E6200E3.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 2657222656 },
             "resultRegClass": "fpr", "resultSlot": "rd",
+            "destWidth":  64,
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
           },
           {
-            "$comment": "SCVTF Dd, Wn — sf=0 32-bit signed source -> double. base 0x1E620000 (the arm64 analog of cvtsi2sd xmm,r32; an I32 fits the F64 result exactly).",
+            "$comment": "SCVTF Dd, Wn — sf=0 32-bit signed source -> double. base 0x1E620000 (the arm64 analog of cvtsi2sd xmm,r32; an I32 fits the F64 result exactly). ✔gas 2.42 + clang 18.1.3: `scvtf d0, w1` = 0x1E620020.",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 509739008 },
             "resultRegClass": "fpr", "resultSlot": "rd",
+            "destWidth":  64,
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
@@ -2402,19 +2411,21 @@
         "registerClass": "gpr",
         "variants": [
           {
-            "$comment": "UCVTF Dd, Xn — sf=1 64-bit unsigned source -> double. base 0x9E630000.",
+            "$comment": "UCVTF Dd, Xn — sf=1 64-bit unsigned source -> double. base 0x9E630000. ✔gas 2.42 + clang 18.1.3: `ucvtf d0, x1` = 0x9E630020.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 2657288192 },
             "resultRegClass": "fpr", "resultSlot": "rd",
+            "destWidth":  64,
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
           },
           {
-            "$comment": "UCVTF Dd, Wn — sf=0 32-bit unsigned source -> double. base 0x1E630000.",
+            "$comment": "UCVTF Dd, Wn — sf=0 32-bit unsigned source -> double. base 0x1E630000. ✔gas 2.42 + clang 18.1.3: `ucvtf d0, w1` = 0x1E630020.",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 509804544 },
             "resultRegClass": "fpr", "resultSlot": "rd",
+            "destWidth":  64,
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
@@ -2423,7 +2434,1283 @@
       }
     },
     {
-      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FMOV Dd, Dn — FP register-register move, double. Base 0x1E604000 = 0 0 0 11110 [31:24] | ftype=01 [23:22] | 1 [21] | opc=000000 FMOV [20:15] | 10000 [14:10] | Rn [9:5] | Rd [4:0] (FP data-processing 1 source — the single source rides Rn, NOT Rm; contrast the GPR mov's ORR alias whose source is Rm). Bound to the fpr class's `move` slot in registerClassOps[] — consumed by MIR value/phi copies and the callconv arg/return moves whenever the register class is FPR (the arm64 analog of x86's movaps role; a D-form copy moves the full 64-bit view, no upper-lane-merge hazard to dodge). FC3.5 sweep-c2 adjudication: register COPIES stay width-BLIND (variant deliberately width-absent, match-any) — the D-form move preserves an F32 value exactly (it lives in the low 4 bytes; S[n] is the low half of D[n]), the same reasoning as x86's full-register MOVAPS serving both widths. Only memory accesses (fldur/fstur) are width-exact.",
+      "$comment": "★★★ THE NARROW-DESTINATION HALF OF THE CONVERSION FAMILY — FOUR OPCODES, DECLARED 2026-09-02 (cycle P54, lane el, D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME).\n★★★ WHY THEY ARE SEPARATE OPCODES AND NOT MORE VARIANTS. `fcvtzs` is FOUR machine instructions (Wd|Xd × Sn|Dn) that gas and clang spell identically — ✔MEASURED, gas 2.42 and clang 18.1.3 agree on all four. The SOURCE width already rides `guard.width`, so the destination width has to separate the other pair, and a LIR instruction carries exactly ONE width: a second guard axis would be one the ENCODER could not read post-regalloc, and the two tiers would silently pick different variants. Making it a different OPCODE puts the answer in the one field the instruction DOES carry. ⇒ this is the same shape x86_64 has declared since D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE, where `zext`/`zext32`/`zext16` are three opcodes over one machine idea, and `AsmInstructionSpelling::destWidth` states it in words: *an instruction that writes a different width is a different opcode in `opcodeNames`*.\n★★ THE DIALECT STILL SPELLS EACH MNEMONIC ONCE: its row names BOTH opcodes as candidates and declares `destWidthFromOperands`, so the WRITTEN destination register elects between them through the `destWidth` declarations below. A destination width no candidate declares elects nothing and refuses by name — which is what makes the old silent `fcvtzs x16, s29` unsayable rather than unlikely.\n⚠ NO C PATH PRODUCES THESE. `mir_to_lir` converts to a 64-bit integer and truncates, so these four are text-reachable only — the same declared-but-unproduced posture `movsd_reg` has on x86_64, and the reason `tests/asm/test_asm_arm64_conversion_dialect_rows.cpp` pins every one of their words: an unproduced declaration is exactly how the `fmov` S- and H-form divergence survived unnoticed until P54.\n★ FCVTZS Wd,*: same 'Conversion between FP and integer' group as `fp_to_si`, sf=0. ✔gas 2.42 + clang 18.1.3, agreeing: `fcvtzs w0, s1` = 0x1E380020 ⇒ base 0x1E380000; `fcvtzs w0, d1` = 0x1E780020 ⇒ base 0x1E780000; `fcvtzs w3, s7` = 0x1E3800E3 (the field-placement pin).",
+      "mnemonic":      "fp_to_si32",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTZS Wd, Dn — ftype=01 double source, sf=0. base 0x1E780000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 511180800 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTZS Wd, Sn — ftype=00 single source, sf=0. base 0x1E380000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 506986496 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "The UNSIGNED sibling of `fp_to_si32` — FCVTZU Wd, Sn/Dn, opcode=001 where FCVTZS is 000 (+0x00010000), exactly the offset `fp_to_ui` carries over `fp_to_si`. ✔gas 2.42 + clang 18.1.3, agreeing: `fcvtzu w0, s1` = 0x1E390020 ⇒ base 0x1E390000; `fcvtzu w0, d1` = 0x1E790020 ⇒ base 0x1E790000.",
+      "mnemonic":      "fp_to_ui32",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTZU Wd, Dn — ftype=01 double source, sf=0. base 0x1E790000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 511246336 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTZU Wd, Sn — ftype=00 single source, sf=0. base 0x1E390000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 507052032 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "The F32-DESTINATION half of `si_to_fp` — SCVTF Sd, Wn/Xn (ftype=00 instead of 01). The `width` axis is the SOURCE INTEGER width, exactly as on `si_to_fp`; what differs is the DESTINATION float width, which is `destWidth` and is the only thing that could separate the two opcodes. ✔gas 2.42 + clang 18.1.3, agreeing: `scvtf s0, w1` = 0x1E220020 ⇒ base 0x1E220000; `scvtf s0, x1` = 0x9E220020 ⇒ base 0x9E220000; `scvtf s3, w7` = 0x1E2200E3.\nⓘ THIS IS NOT [[D-CSUBSET-INT-TO-F32-CODEGEN]] CLOSING. That row is about the `mir_to_lir` SIToFP arm refusing an F32 destination from the C path; nothing here is wired to it, and `si_to_fp`'s own text still records the refusal. What lands here is the TEXT surface: the bytes exist and a template can now write them, which is a strictly smaller claim than the C front end producing them.",
+      "mnemonic":      "si_to_fp32",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "SCVTF Sd, Xn — sf=1 64-bit signed source -> float. base 0x9E220000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2653028352 },
+            "resultRegClass": "fpr", "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "SCVTF Sd, Wn — sf=0 32-bit signed source -> float. base 0x1E220000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505544704 },
+            "resultRegClass": "fpr", "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "The UNSIGNED sibling of `si_to_fp32` — UCVTF Sd, Wn/Xn, opcode=011 where SCVTF is 010 (+0x00010000), exactly the offset `ui_to_fp` carries over `si_to_fp`. ✔gas 2.42 + clang 18.1.3, agreeing: `ucvtf s0, w1` = 0x1E230020 ⇒ base 0x1E230000; `ucvtf s0, x1` = 0x9E230020 ⇒ base 0x9E230000.",
+      "mnemonic":      "ui_to_fp32",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "UCVTF Sd, Xn — sf=1 64-bit unsigned source -> float. base 0x9E230000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2653093888 },
+            "resultRegClass": "fpr", "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "UCVTF Sd, Wn — sf=0 32-bit unsigned source -> float. base 0x1E230000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505610240 },
+            "resultRegClass": "fpr", "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "★★★ THE FP→INTEGER CONVERSIONS THAT NAME THEIR ROUNDING MODE — SIXTEEN OPCODES, EIGHT SPELLINGS, DECLARED 2026-09-02 (cycle P54, lane av, D-ASM-ARM64-GAS-SPELLS-NO-ROUNDING-MODE-OR-VECTOR-MOVE). ONE banner for the whole family because the sixteen differ only in `rmode` [16:15], `op` [15] and `sf` [31]; every row below carries its own measured pair.\n★★★ WHY EVERY ROUNDING MODE GETS ITS OWN OPCODE, AND IT IS THE REASON THE FAMILY EXISTS RATHER THAN A FILING CONVENTION. FCVTAS/FCVTMS/FCVTNS/FCVTPS differ from the already-declared FCVTZS in NOTHING BUT `rmode`. Bind `fcvtms` to `fp_to_si` and the program still compiles, still links, still runs, and rounds toward ZERO where the author wrote toward MINUS INFINITY: a working program with the wrong numbers and an empty build log. That is the one failure class this project vetoes outright, and it is why `fcvtzs`'s own two opcodes were never widened to carry a fifth axis. ⓘ Lane `el` named this hazard when it left the mnemonics undeclared with their bytes measured; this is that warning honoured rather than worked around.\n★★★ EACH SPELLING IS **TWO** OPCODES, WIDE AND NARROW, WHICH IS `fp_to_si`/`fp_to_si32`'s shape restated eight times. A conversion's two ends have independent widths; a LIR instruction carries ONE. The SOURCE width rides `guard.width` and the DESTINATION width rides the OPCODE, so the dialect spells each mnemonic ONCE (`destWidthFromOperands`) and the written destination register elects between the pair. A destination width no candidate declares elects nothing and refuses by name.\n★★ EVERY WORD BELOW IS ✔MEASURED AGAINST GNU as 2.42 **AND** clang 18.1.3, PROBED SEPARATELY, both agreeing on all 32 spellings — and each `fixedWord` was derived by CLEARING the Rd [4:0] and Rn [9:5] windows from the measured word and then re-inserting the register numbers to reproduce it exactly. None is copied from a neighbour and none is read out of a manual.\n⚠ NO C PATH PRODUCES ANY OF THEM. `mir_to_lir` emits only the toward-zero conversion a C cast is defined as, so all sixteen are TEXT-REACHABLE ONLY — the same declared-but-unproduced posture `fp_to_si32` already carries, and the reason `tests/asm/test_asm_arm64_rounding_dialect_rows.cpp` pins all 32 words: an unproduced declaration is exactly how the `fmov` S-form divergence survived unnoticed until P54.\nFCVTNS Xd, Sn/Dn — round to NEAREST, ties to EVEN; SIGNED; WIDE destination. ✔`fcvtns x0, s1` = 0x9E200020 ⇒ base 0x9E200000; `fcvtns x0, d1` = 0x9E600020 ⇒ base 0x9E600000.",
+      "mnemonic":      "fp_to_si_nearest",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTNS Xd, Dn — ftype=01 double source, sf=1. base 0x9E600000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657091584 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTNS Xd, Sn — ftype=00 single source, sf=1. base 0x9E200000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2652897280 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTNS Wd, Sn/Dn — the NARROW-destination half of `fcvtns`. ✔`fcvtns w0, s1` = 0x1E200020 ⇒ base 0x1E200000; `fcvtns w0, d1` = 0x1E600020 ⇒ base 0x1E600000.",
+      "mnemonic":      "fp_to_si_nearest32",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTNS Wd, Dn — ftype=01 double source, sf=0. base 0x1E600000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509607936 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTNS Wd, Sn — ftype=00 single source, sf=0. base 0x1E200000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505413632 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTNU Xd, Sn/Dn — the UNSIGNED sibling of `fp_to_si_nearest`; `op` [15] = 1 where the signed form is 0 (+0x00010000), exactly the offset `fp_to_ui` carries over `fp_to_si`. ✔`fcvtnu x0, s1` = 0x9E210020 ⇒ base 0x9E210000; `fcvtnu x0, d1` = 0x9E610020 ⇒ base 0x9E610000.",
+      "mnemonic":      "fp_to_ui_nearest",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTNU Xd, Dn — ftype=01 double source, sf=1. base 0x9E610000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657157120 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTNU Xd, Sn — ftype=00 single source, sf=1. base 0x9E210000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2652962816 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTNU Wd, Sn/Dn — the NARROW-destination half of `fcvtnu`. ✔`fcvtnu w0, s1` = 0x1E210020 ⇒ base 0x1E210000; `fcvtnu w0, d1` = 0x1E610020 ⇒ base 0x1E610000.",
+      "mnemonic":      "fp_to_ui_nearest32",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTNU Wd, Dn — ftype=01 double source, sf=0. base 0x1E610000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509673472 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTNU Wd, Sn — ftype=00 single source, sf=0. base 0x1E210000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505479168 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTAS Xd, Sn/Dn — round to NEAREST, ties AWAY FROM ZERO (rmode=00 with the `A` opcode selector); SIGNED; WIDE destination. ⚠ THIS IS THE MODE C's `lround`/`llround` ARE DEFINED AS, and it is NOT `fcvtns`: 0.5 rounds to 1 here and to 0 under ties-to-even. ✔`fcvtas x0, s1` = 0x9E240020 ⇒ base 0x9E240000; `fcvtas x0, d1` = 0x9E640020 ⇒ base 0x9E640000.",
+      "mnemonic":      "fp_to_si_ties_away",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTAS Xd, Dn — ftype=01 double source, sf=1. base 0x9E640000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657353728 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTAS Xd, Sn — ftype=00 single source, sf=1. base 0x9E240000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2653159424 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTAS Wd, Sn/Dn — the NARROW-destination half of `fcvtas`. ✔`fcvtas w0, s1` = 0x1E240020 ⇒ base 0x1E240000; `fcvtas w0, d1` = 0x1E640020 ⇒ base 0x1E640000.",
+      "mnemonic":      "fp_to_si_ties_away32",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTAS Wd, Dn — ftype=01 double source, sf=0. base 0x1E640000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509870080 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTAS Wd, Sn — ftype=00 single source, sf=0. base 0x1E240000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505675776 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTAU Xd, Sn/Dn — the UNSIGNED sibling of `fp_to_si_ties_away`. ✔`fcvtau x0, s1` = 0x9E250020 ⇒ base 0x9E250000; `fcvtau x0, d1` = 0x9E650020 ⇒ base 0x9E650000.",
+      "mnemonic":      "fp_to_ui_ties_away",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTAU Xd, Dn — ftype=01 double source, sf=1. base 0x9E650000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657419264 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTAU Xd, Sn — ftype=00 single source, sf=1. base 0x9E250000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2653224960 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTAU Wd, Sn/Dn — the NARROW-destination half of `fcvtau`. ✔`fcvtau w0, s1` = 0x1E250020 ⇒ base 0x1E250000; `fcvtau w0, d1` = 0x1E650020 ⇒ base 0x1E650000.",
+      "mnemonic":      "fp_to_ui_ties_away32",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTAU Wd, Dn — ftype=01 double source, sf=0. base 0x1E650000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509935616 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTAU Wd, Sn — ftype=00 single source, sf=0. base 0x1E250000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505741312 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTMS Xd, Sn/Dn — round toward MINUS INFINITY (the mode C's `floor` names); SIGNED; WIDE destination. ✔`fcvtms x0, s1` = 0x9E300020 ⇒ base 0x9E300000; `fcvtms x0, d1` = 0x9E700020 ⇒ base 0x9E700000.",
+      "mnemonic":      "fp_to_si_floor",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTMS Xd, Dn — ftype=01 double source, sf=1. base 0x9E700000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2658140160 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTMS Xd, Sn — ftype=00 single source, sf=1. base 0x9E300000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2653945856 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTMS Wd, Sn/Dn — the NARROW-destination half of `fcvtms`. ✔`fcvtms w0, s1` = 0x1E300020 ⇒ base 0x1E300000; `fcvtms w0, d1` = 0x1E700020 ⇒ base 0x1E700000.",
+      "mnemonic":      "fp_to_si_floor32",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTMS Wd, Dn — ftype=01 double source, sf=0. base 0x1E700000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 510656512 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTMS Wd, Sn — ftype=00 single source, sf=0. base 0x1E300000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 506462208 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTMU Xd, Sn/Dn — the UNSIGNED sibling of `fp_to_si_floor`. ✔`fcvtmu x0, s1` = 0x9E310020 ⇒ base 0x9E310000; `fcvtmu x0, d1` = 0x9E710020 ⇒ base 0x9E710000.",
+      "mnemonic":      "fp_to_ui_floor",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTMU Xd, Dn — ftype=01 double source, sf=1. base 0x9E710000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2658205696 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTMU Xd, Sn — ftype=00 single source, sf=1. base 0x9E310000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2654011392 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTMU Wd, Sn/Dn — the NARROW-destination half of `fcvtmu`. ✔`fcvtmu w0, s1` = 0x1E310020 ⇒ base 0x1E310000; `fcvtmu w0, d1` = 0x1E710020 ⇒ base 0x1E710000.",
+      "mnemonic":      "fp_to_ui_floor32",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTMU Wd, Dn — ftype=01 double source, sf=0. base 0x1E710000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 510722048 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTMU Wd, Sn — ftype=00 single source, sf=0. base 0x1E310000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 506527744 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTPS Xd, Sn/Dn — round toward PLUS INFINITY (the mode C's `ceil` names); SIGNED; WIDE destination. ✔`fcvtps x0, s1` = 0x9E280020 ⇒ base 0x9E280000; `fcvtps x0, d1` = 0x9E680020 ⇒ base 0x9E680000.",
+      "mnemonic":      "fp_to_si_ceil",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTPS Xd, Dn — ftype=01 double source, sf=1. base 0x9E680000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657615872 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTPS Xd, Sn — ftype=00 single source, sf=1. base 0x9E280000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2653421568 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTPS Wd, Sn/Dn — the NARROW-destination half of `fcvtps`. ✔`fcvtps w0, s1` = 0x1E280020 ⇒ base 0x1E280000; `fcvtps w0, d1` = 0x1E680020 ⇒ base 0x1E680000.",
+      "mnemonic":      "fp_to_si_ceil32",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTPS Wd, Dn — ftype=01 double source, sf=0. base 0x1E680000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 510132224 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTPS Wd, Sn — ftype=00 single source, sf=0. base 0x1E280000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505937920 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTPU Xd, Sn/Dn — the UNSIGNED sibling of `fp_to_si_ceil`. ✔`fcvtpu x0, s1` = 0x9E290020 ⇒ base 0x9E290000; `fcvtpu x0, d1` = 0x9E690020 ⇒ base 0x9E690000.",
+      "mnemonic":      "fp_to_ui_ceil",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTPU Xd, Dn — ftype=01 double source, sf=1. base 0x9E690000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657681408 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTPU Xd, Sn — ftype=00 single source, sf=1. base 0x9E290000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2653487104 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FCVTPU Wd, Sn/Dn — the NARROW-destination half of `fcvtpu`, and the sixteenth and last opcode of the explicit-rounding family. ✔`fcvtpu w0, s1` = 0x1E290020 ⇒ base 0x1E290000; `fcvtpu w0, d1` = 0x1E690020 ⇒ base 0x1E690000.",
+      "mnemonic":      "fp_to_ui_ceil32",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FCVTPU Wd, Dn — ftype=01 double source, sf=0. base 0x1E690000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 510197760 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          },
+          {
+            "$comment": "FCVTPU Wd, Sn — ftype=00 single source, sf=0. base 0x1E290000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 506003456 },
+            "resultSlot": "rd",
+            "destWidth":  32,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "★★★ FP ROUND-TO-INTEGRAL — SEVEN OPCODES, SEVEN SPELLINGS, FLOAT IN AND FLOAT OUT (cycle P54, lane av, D-ASM-ARM64-GAS-SPELLS-NO-ROUNDING-MODE-OR-VECTOR-MOVE). ONE banner for the seven; each row carries its own measured pair.\n★★★ THE SAME SILENT HAZARD AS THE FCVT FAMILY ABOVE, ONE STEP SHORTER. FRINTN/FRINTP/FRINTM/FRINTZ/FRINTA/FRINTX/FRINTI are ONE instruction group differing only in `opcode` [17:15]; every one of them assembles, runs and returns a NUMBER, so binding two of them together is invisible everywhere except in the answer. They therefore get seven opcodes and never a shared one with a mode parameter.\n★★ WHAT EACH MODE IS, because the mnemonic letters are not self-evident and picking the wrong one is the defect: N = nearest, ties to EVEN · P = toward +∞ (`ceil`) · M = toward −∞ (`floor`) · Z = toward ZERO (`trunc`) · A = nearest, ties AWAY from zero (`round`) · I = whatever mode FPCR currently selects · X = the same FPCR mode as I, but SIGNALLING Inexact. ⚠ `I` AND `X` ARE NOT ALIASES: they differ in the exception they raise, which is the whole reason C has both `nearbyint` (X's quiet sibling) and `rint`. Their words differ in bit 15 and both are declared.\n★★ ✔MEASURED against GNU as 2.42 AND clang 18.1.3 SEPARATELY, agreeing on all fourteen; each base derived by clearing Rd [4:0] and Rn [9:5] from the measured word and re-inserting the registers to reproduce it.\n⚠ NO C PATH PRODUCES THEM: text-reachable only, pinned word-for-word in `tests/asm/test_asm_arm64_rounding_dialect_rows.cpp`.\nFRINTN Dd/Sd — round to nearest, ties to even. ✔`frintn d0, d1` = 0x1E644020 ⇒ base 0x1E644000; `frintn s0, s1` = 0x1E244020 ⇒ base 0x1E244000.",
+      "mnemonic":      "fround_nearest",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FRINTN Dd, Dn — ftype=01 double. base 0x1E644000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509886464 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FRINTN Sd, Sn — ftype=00 single. base 0x1E244000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505692160 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FRINTA Dd/Sd — round to nearest, ties AWAY from zero (C's `round`). ✔`frinta d0, d1` = 0x1E664020 ⇒ base 0x1E664000; `frinta s0, s1` = 0x1E264020 ⇒ base 0x1E264000.",
+      "mnemonic":      "fround_ties_away",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FRINTA Dd, Dn — ftype=01 double. base 0x1E664000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 510017536 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FRINTA Sd, Sn — ftype=00 single. base 0x1E264000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505823232 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FRINTM Dd/Sd — round toward MINUS INFINITY (C's `floor`). ✔`frintm d0, d1` = 0x1E654020 ⇒ base 0x1E654000; `frintm s0, s1` = 0x1E254020 ⇒ base 0x1E254000.",
+      "mnemonic":      "fround_floor",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FRINTM Dd, Dn — ftype=01 double. base 0x1E654000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509952000 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FRINTM Sd, Sn — ftype=00 single. base 0x1E254000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505757696 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FRINTP Dd/Sd — round toward PLUS INFINITY (C's `ceil`). ✔`frintp d0, d1` = 0x1E64C020 ⇒ base 0x1E64C000; `frintp s0, s1` = 0x1E24C020 ⇒ base 0x1E24C000.",
+      "mnemonic":      "fround_ceil",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FRINTP Dd, Dn — ftype=01 double. base 0x1E64C000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509919232 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FRINTP Sd, Sn — ftype=00 single. base 0x1E24C000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505724928 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FRINTZ Dd/Sd — round toward ZERO (C's `trunc`). ⚠ NOT the same instruction as `fcvtzs`: this one lands an INTEGRAL FLOAT in the FP file, where FCVTZS produces an INTEGER in the general file. ✔`frintz d0, d1` = 0x1E65C020 ⇒ base 0x1E65C000; `frintz s0, s1` = 0x1E25C020 ⇒ base 0x1E25C000.",
+      "mnemonic":      "fround_trunc",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FRINTZ Dd, Dn — ftype=01 double. base 0x1E65C000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509984768 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FRINTZ Sd, Sn — ftype=00 single. base 0x1E25C000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505790464 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FRINTI Dd/Sd — round using the mode FPCR currently selects, QUIETLY (C's `nearbyint`). ✔`frinti d0, d1` = 0x1E67C020 ⇒ base 0x1E67C000; `frinti s0, s1` = 0x1E27C020 ⇒ base 0x1E27C000.",
+      "mnemonic":      "fround_current",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FRINTI Dd, Dn — ftype=01 double. base 0x1E67C000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 510115840 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FRINTI Sd, Sn — ftype=00 single. base 0x1E27C000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505921536 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FRINTX Dd/Sd — the FPCR mode again, but SIGNALLING Inexact (C's `rint`). ⚠ ITS ONLY DIFFERENCE FROM `fround_current` IS BIT 15 AND AN EXCEPTION, which is exactly why it is a separate opcode and not a flag: the two compute the same number and differ in what they raise. ✔`frintx d0, d1` = 0x1E674020 ⇒ base 0x1E674000; `frintx s0, s1` = 0x1E274020 ⇒ base 0x1E274000.",
+      "mnemonic":      "fround_exact",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FRINTX Dd, Dn — ftype=01 double. base 0x1E674000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 510083072 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FRINTX Sd, Sn — ftype=00 single. base 0x1E274000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505888768 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "★★ FABS Dd/Sd — floating-point ABSOLUTE VALUE, FP data-processing (1 source), the same group and word shape as the already-declared `fneg` (opcode=000001 where FNEG is 000010, as `fneg`'s own comment predicted). IEEE-exact by construction: it CLEARS the sign bit and touches nothing else, so |−0.0| = +0.0 and a NaN keeps its payload. ✔MEASURED, gas 2.42 and clang 18.1.3 agreeing: `fabs d0, d1` = 0x1E60C020 ⇒ base 0x1E60C000; `fabs s0, s1` = 0x1E20C020 ⇒ base 0x1E20C000.\n⚠ NO C PATH PRODUCES IT — `fabs()` is a library call on this pipeline — so it is text-reachable only, like the whole P54 lane-`av` set.",
+      "mnemonic":      "fabs",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FABS Dd, Dn — ftype=01 double. base 0x1E60C000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509657088 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FABS Sd, Sn — ftype=00 single. base 0x1E20C000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505462784 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FSQRT Dd/Sd — floating-point SQUARE ROOT, the third member of the 1-source group beside `fneg` and `fabs` (opcode=000011). ✔`fsqrt d0, d1` = 0x1E61C020 ⇒ base 0x1E61C000; `fsqrt s0, s1` = 0x1E21C020 ⇒ base 0x1E21C000.",
+      "mnemonic":      "fsqrt",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FSQRT Dd, Dn — ftype=01 double. base 0x1E61C000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509722624 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FSQRT Sd, Sn — ftype=00 single. base 0x1E21C000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505528320 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "★★★ THE 2-SOURCE FP FAMILY THAT WAS MISSING — FMAX / FMIN / FMAXNM / FMINNM / FNMUL, five opcodes sharing `fadd`'s exact word shape and differing only in `opcode` [15:12] (cycle P54, lane av). ONE banner; each row carries its own pair.\n★★★ `fmax` AND `fmaxnm` ARE **NOT** THE SAME INSTRUCTION AND THE DIFFERENCE IS ONLY VISIBLE ON NaN — which is precisely the shape of defect this whole lane is about. FMAX propagates a NaN operand; FMAXNM returns the OTHER operand when exactly one is a NaN (IEEE-754 `maxNum`, the one C's `fmax()` is specified as). Two instructions that agree on every ordinary input and disagree on the input a test is least likely to feed. They are separate opcodes for that reason and must never be folded.\n✔MEASURED, gas 2.42 and clang 18.1.3 agreeing on all ten. FMAX: `fmax d0, d1, d2` = 0x1E624820 ⇒ base 0x1E604800; `fmax s0, s1, s2` = 0x1E224820 ⇒ base 0x1E204800.",
+      "mnemonic":      "fmax",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FMAX Dd, Dn, Dm — ftype=01 double. base 0x1E604800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 509626368 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FMAX Sd, Sn, Sm — ftype=00 single. base 0x1E204800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 505432064 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FMIN Dd/Sd — the NaN-PROPAGATING minimum, `fmax`'s mirror. ✔`fmin d0, d1, d2` = 0x1E625820 ⇒ base 0x1E605800; `fmin s0, s1, s2` = 0x1E225820 ⇒ base 0x1E205800.",
+      "mnemonic":      "fmin",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FMIN Dd, Dn, Dm — ftype=01 double. base 0x1E605800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 509630464 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FMIN Sd, Sn, Sm — ftype=00 single. base 0x1E205800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 505436160 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FMAXNM Dd/Sd — IEEE-754 `maxNum`: with exactly one NaN operand it returns the OTHER one, where `fmax` propagates the NaN. This is the instruction C's `fmax()` is specified as. ✔`fmaxnm d0, d1, d2` = 0x1E626820 ⇒ base 0x1E606800; `fmaxnm s0, s1, s2` = 0x1E226820 ⇒ base 0x1E206800.",
+      "mnemonic":      "fmaxnm",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FMAXNM Dd, Dn, Dm — ftype=01 double. base 0x1E606800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 509634560 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FMAXNM Sd, Sn, Sm — ftype=00 single. base 0x1E206800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 505440256 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FMINNM Dd/Sd — IEEE-754 `minNum`, `fmaxnm`'s mirror and C's `fmin()`. ✔`fminnm d0, d1, d2` = 0x1E627820 ⇒ base 0x1E607800; `fminnm s0, s1, s2` = 0x1E227820 ⇒ base 0x1E207800.",
+      "mnemonic":      "fminnm",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FMINNM Dd, Dn, Dm — ftype=01 double. base 0x1E607800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 509638656 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FMINNM Sd, Sn, Sm — ftype=00 single. base 0x1E207800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 505444352 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FNMUL Dd/Sd — multiply and NEGATE the product, in one instruction. ⚠ IT IS NOT `fmul` FOLLOWED BY `fneg` IN GENERAL: the negation is applied to the rounded product, which is the same value, but the single instruction raises the multiply's exceptions once. Declared because both references assemble it and a hand-written kernel spells it. ✔`fnmul d0, d1, d2` = 0x1E628820 ⇒ base 0x1E608800; `fnmul s0, s1, s2` = 0x1E228820 ⇒ base 0x1E208800.",
+      "mnemonic":      "fnmul",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FNMUL Dd, Dn, Dm — ftype=01 double. base 0x1E608800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 509642752 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FNMUL Sd, Sn, Sm — ftype=00 single. base 0x1E208800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 505448448 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "★★★ THE FUSED MULTIPLY-ADD FAMILY — FMADD / FMSUB / FNMADD / FNMSUB, four opcodes over THREE source registers (cycle P54, lane av). ONE banner; each row carries its own pair.\n★★★ THE THIRD SOURCE RIDES `Ra` [14:10], WHICH IS THE SLOT THE INTEGER `msub` ALREADY USES — so a 3-source FP opcode needed no new encoding vocabulary at all, only the declaration. That reuse is the finding worth recording: the `fixed32` walker's slot set was general enough for a family nothing had exercised on the FP side.\n★★★ FUSED IS NOT THE SAME AS MULTIPLY-THEN-ADD, and it is why these cannot be synthesized: FMADD rounds ONCE, at the end, so it is `fma()` and not `a*b+c`. A program that spells `fmadd` and gets two roundings has a different answer, quietly.\n⚠ THE OPERAND ORDER IS Rd, Rn, Rm, Ra — the ADDEND IS LAST, so `fmadd d0, d1, d2, d3` is d0 = d1×d2 + d3. Wires 0/1/2 map to rn/rm/ra in that order.\n✔MEASURED, gas 2.42 and clang 18.1.3 agreeing on all eight. FMADD: `fmadd d0, d1, d2, d3` = 0x1F420C20 ⇒ base 0x1F400000; `fmadd s0, s1, s2, s3` = 0x1F020C20 ⇒ base 0x1F000000.",
+      "mnemonic":      "fmadd",
+      "result":        "value",
+      "minOperands":   3,
+      "maxOperands":   3,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FMADD Dd, Dn, Dm, Da — ftype=01 double. base 0x1F400000.",
+            "guard":      { "operandKinds": ["reg", "reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 524288000 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" },
+              { "index": 2, "slotKind": "ra" }
+            ]
+          },
+          {
+            "$comment": "FMADD Sd, Sn, Sm, Sa — ftype=00 single. base 0x1F000000.",
+            "guard":      { "operandKinds": ["reg", "reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 520093696 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" },
+              { "index": 2, "slotKind": "ra" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FMSUB Dd/Sd — d = a − n×m, the addend MINUS the product (`o1`=1). ✔`fmsub d0, d1, d2, d3` = 0x1F428C20 ⇒ base 0x1F408000; `fmsub s0, s1, s2, s3` = 0x1F028C20 ⇒ base 0x1F008000.",
+      "mnemonic":      "fmsub",
+      "result":        "value",
+      "minOperands":   3,
+      "maxOperands":   3,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FMSUB Dd, Dn, Dm, Da — ftype=01 double. base 0x1F408000.",
+            "guard":      { "operandKinds": ["reg", "reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 524320768 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" },
+              { "index": 2, "slotKind": "ra" }
+            ]
+          },
+          {
+            "$comment": "FMSUB Sd, Sn, Sm, Sa — ftype=00 single. base 0x1F008000.",
+            "guard":      { "operandKinds": ["reg", "reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 520126464 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" },
+              { "index": 2, "slotKind": "ra" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FNMADD Dd/Sd — d = −(n×m) − a, the whole FMADD result negated (`o0`=1). ✔`fnmadd d0, d1, d2, d3` = 0x1F620C20 ⇒ base 0x1F600000; `fnmadd s0, s1, s2, s3` = 0x1F220C20 ⇒ base 0x1F200000.",
+      "mnemonic":      "fnmadd",
+      "result":        "value",
+      "minOperands":   3,
+      "maxOperands":   3,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FNMADD Dd, Dn, Dm, Da — ftype=01 double. base 0x1F600000.",
+            "guard":      { "operandKinds": ["reg", "reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 526385152 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" },
+              { "index": 2, "slotKind": "ra" }
+            ]
+          },
+          {
+            "$comment": "FNMADD Sd, Sn, Sm, Sa — ftype=00 single. base 0x1F200000.",
+            "guard":      { "operandKinds": ["reg", "reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 522190848 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" },
+              { "index": 2, "slotKind": "ra" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FNMSUB Dd/Sd — d = n×m − a, the fourth corner of the FMA square. ✔`fnmsub d0, d1, d2, d3` = 0x1F628C20 ⇒ base 0x1F608000; `fnmsub s0, s1, s2, s3` = 0x1F228C20 ⇒ base 0x1F208000.",
+      "mnemonic":      "fnmsub",
+      "result":        "value",
+      "minOperands":   3,
+      "maxOperands":   3,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FNMSUB Dd, Dn, Dm, Da — ftype=01 double. base 0x1F608000.",
+            "guard":      { "operandKinds": ["reg", "reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 526417920 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" },
+              { "index": 2, "slotKind": "ra" }
+            ]
+          },
+          {
+            "$comment": "FNMSUB Sd, Sn, Sm, Sa — ftype=00 single. base 0x1F208000.",
+            "guard":      { "operandKinds": ["reg", "reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 522223616 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" },
+              { "index": 2, "slotKind": "ra" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "★★ FCMPE Dn, Dm — the SIGNALLING floating-point compare, `fcmp`'s sibling and the form `fcmp`'s own comment named without declaring (*opcode2 bit4=1 would be FCMPE*). It writes NZCV and no register, exactly like `fcmp`; it differs by raising Invalid for a QUIET NaN as well as a signalling one, which is what C's `<`/`>` on possibly-NaN operands are specified to do.\n★★★ Rd [4:0] IS **NOT A REGISTER SLOT** ON THIS OPCODE — it is `opcode2`, and BIT 4 IS THE E BIT. That is why the base word below ends in 0x10 and why the variant declares NO `resultSlot`: wiring one here would overwrite the flag that makes it the signalling form and silently emit a quiet FCMP. The two operands wire to Rn and Rm, and nothing else moves.\n⚠ DSS's own codegen still emits the QUIET `fcmp` for every C comparison — this opcode is TEXT-REACHABLE ONLY, and `fcmp`'s adjudication (*DSS does not model the FP environment, so the quiet FCMP serves all predicates*) is unchanged for the compiler's own lowering.\n✔MEASURED, gas 2.42 and clang 18.1.3 agreeing: `fcmpe d0, d1` = 0x1E612010 ⇒ base 0x1E602010; `fcmpe s0, s1` = 0x1E212010 ⇒ base 0x1E202010.",
+      "mnemonic":      "fcmpe",
+      "result":        "none",
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FCMPE Dn, Dm — ftype=01 double, opcode2=10000. base 0x1E602010.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 509616144 },
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FCMPE Sn, Sm — ftype=00 single, opcode2=10000. base 0x1E202010.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 505421840 },
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FMOV — FP register-register move. Word shape: 0 0 0 11110 [31:24] | ftype [23:22] | 1 [21] | opc=000000 FMOV [20:15] | 10000 [14:10] | Rn [9:5] | Rd [4:0] (FP data-processing 1 source — the single source rides Rn, NOT Rm; contrast the GPR mov's ORR alias whose source is Rm). Bound to the fpr class's `move` slot in registerClassOps[] — consumed by MIR value/phi copies and the callconv arg/return moves whenever the register class is FPR (the arm64 analog of x86's movaps role), and SPELLED `fmov` by the aarch64 gas dialect since 2026-09-02. ⚠ THE OLD FC3.5 sweep-c2 ADJUDICATION RECORDED HERE — *register COPIES stay width-BLIND (variant deliberately width-absent, match-any)* — IS FALSE TWICE OVER AND IS KEPT ONLY AS THE CLAIM THAT WAS REFUTED: R2 (P47) gave the arms a `width` guard, and P54 gave each width its OWN ftype word after ✔measuring that the shared D-form word diverged from gas 2.42 and clang 18.1.3 on every S- and H-form spelling. Its premise (an F32 value lives in the low 4 bytes, so a D-form copy preserves it) was about the VALUE and was never about the BYTES. See `$variantsComment` for the measurement. Memory accesses (fldur/fstur) were always width-exact.",
       "mnemonic":      "fmov",
       "result":        "value",
       "minOperands":   1,
@@ -2431,9 +3718,10 @@
       "encoding": {
         "format":   "fixed32",
         "registerClass": "fpr",
-        "$variantsComment": "★★ ONE ENCODING, THREE DECLARED WIDTHS, AND NO WIDTH-128 ARM — the fail-loud half of R2 (design A′, 2026-08-28). FMOV Dd,Dn copies the low 64 bits of the containing V register and ZEROES bits 127:64, which is value-preserving for every float width this pipeline puts in a register (F16/F32/F64 all live in the low part of the same register and the 5-bit hwEncoding is shared by every view) — so the three arms carry the SAME fixedWord deliberately, not by omission, and the bytes are byte-identical to what the single width-absent variant emitted before R1. ⚠⚠ THAT VARIANT CARRIED NO `width` GUARD AT ALL, and `variantMatchesInst` treats an absent width as MATCHING ANY WIDTH — which was harmless only while no 128-bit value could be FPR-class. R1 makes `\"w\"` bind `fpr`, so a `long double` operand is now an FPR-class value; an unguarded row would silently encode a 64-bit FMOV for a 128-bit move and drop the top half, a silent miscompile this change would have INTRODUCED. Width 128 now elects nothing and fails loud at the emitting site. ★ What a width-128 register-to-register SIMD move needs is ORR (`mov v_d.16b, v_n.16b`), a DIFFERENT AArch64 instruction with different bytes — undeclared here on trigger discipline, because ✔MEASURED nothing consumes one (F80 and F128 are the two memory-resident kinds, per `LirVerifier`'s store rule and `lowerF128Store`'s GPR word stores).",
+        "$variantsComment": "★★★ **TWO** DECLARED WIDTHS, TWO DIFFERENT WORDS, AND NO WIDTH-128 ARM — AND THE COUNT SAID **THREE** UNTIL 2026-09-02 (cycle P54, lane ae), WHEN THE WIDTH-16 ARM WAS DELETED FOR BEING **ABOVE THE UNION**. ✔MEASURED, gas 2.42 AND clang 18.1.3 probed separately and agreeing: `fmov h0, h1` is REJECTED by both at the default -march, as are `fmov h0, w1`, `fadd h0, h1, h2`, `fabs`/`fsqrt`/`fneg`/`fmul`/`fdiv`/`fsub`/`fcmp`/`fmax`/`fmin` over `h` registers — FP16 ARITHMETIC IS `FEAT_FP16`, an architecture feature this descriptor carries no vocabulary for. The arm was reachable and ✔MEASURED to compile: `fmov h0, h1` assembled rc=0 to 0x1EE04020 through the `.s` surface at the P54 base, so DSS accepted a program NEITHER reference accepts. ⚠⚠ AND IT WAS NOT INTRODUCED BY THE CYCLE THAT MADE IT WRONG-LOOKING — ✔MEASURED with `git show 30cfe32c` (P54's own base commit): this opcode already carried THREE width arms there, 64 / 32 / 16, ALL THREE with the same D-form word 0x1E604000. P54 gave each arm its own `ftype`, which made the `h` arm byte-CORRECT and left it above the union, and the dialect's first `fmov` row made it reachable from TEXT for the first time. Nobody declared it this cycle; it was corrected without anyone asking whether it should exist, which is why the deletion is recorded here rather than in a lane's diff. The paragraph below that reasoned *this descriptor carries no CPU-feature vocabulary, so the union's spelling is the one declared* had the rule EXACTLY BACKWARDS: the disjunction makes a construct required when SOME reference accepts it, and forbidden when NONE does. Its byte measurement is correct and is kept. ⓘ AND THE fp16 STORY IS NOT UNIFORM, which is why this is a per-instruction deletion rather than a per-width one: ✔MEASURED in the same run, the fp16 CONVERSIONS are base ARMv8-A and BOTH references assemble them — `fcvt h0, s1` = 0x1E23C020, `fcvt h0, d1` = 0x1E63C020, `fcvt s0, h1` = 0x1EE24020, `fcvt d0, h1` = 0x1EE2C020, `fcvt h3, s7` = 0x1E23C0E3, `fcvt s3, h7` = 0x1EE240E3 — so DSS is BELOW the union on those four forms, which `fpcvt` cannot hold as extra variants (two variants of one opcode may not share an operand shape at one width) and which therefore need their own opcodes: [[D-TARGET-ARM64-FP16-CONVERSION-FORMS-UNDECLARED]]. ⚠ REMOVING THE ARM DOES NOT REMOVE A CODEGEN PATH. `registerClassOps.fpr.move` names this opcode and takes its widths from these arms, so a width-16 class-internal FPR copy now elects NOTHING and fails loud at the emitting site — which is exactly what width 128 already does, and ✔MEASURED nothing can produce one: no shipped language forms an F16 value (there is no `_Float16` in this front end). The old note that called this arm *stated rather than deleted* was written before its spelling was reachable from text; it is reachable now, and a declared spelling both references refuse is not a statement, it is an acceptance defect. ⚠⚠ THE THREE ARMS USED TO CARRY THE **SAME** fixedWord (0x1E604000 = FMOV Dd,Dn) AND THAT WAS A BYTE DIVERGENCE FROM BOTH REFERENCES, CORRECTED 2026-09-02 (cycle P54, lane ad, D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME). The argument it rested on — 'FMOV Dd,Dn copies the low 64 bits and zeroes 127:64, which is value-preserving for every float width this pipeline puts in a register' — is TRUE ABOUT THE VALUE and says nothing about the BYTES, and the bytes are what a target descriptor declares. ✔MEASURED at the CLI before the fix: a `float` class-internal move at `--config=release` on `arm64:elf64-aarch64-linux-exec` disassembled to `fmov d28, d0` / `fmov d27, d28` where gcc 13.3.0 and clang 18.1.3 both emit the S-form. ⇒ ftype [23:22] IS the width axis here exactly as it is on `fadd`/`fneg`/`fcmp`, and the arms now say so: ✔BYTE-VERIFIED against GNU as 2.42 AND clang 18.1.3, agreeing on every probe — width 64 `fmov d0, d1` = 0x1E604020 ⇒ base **0x1E604000** (ftype=01); width 32 `fmov s0, s1` = 0x1E204020 ⇒ base **0x1E204000** (ftype=00); width 16 `fmov h0, h1` = 0x1EE04020 ⇒ base **0x1EE04000** (ftype=11), which BOTH references refuse at the default -march and BOTH accept under `.arch armv8.2-a+fp16` — this descriptor carries no CPU-feature vocabulary, so the union's spelling is the one declared. High-register forms pin the Rn/Rd field placement: `fmov d31, d30` = 0x1E6043DF and `fmov s31, s30` = 0x1E2043DF. ⓘ THE WIDTH-64 WORD IS UNCHANGED, so every existing F64 byte pin still reads what it always read; only the F32 and F16 arms move. ⚠⚠ NEITHER ARM HAD A REACHABLE TEXT SPELLING WHEN IT WAS WRITTEN — the aarch64 gas dialect spelled no FP mnemonic at all, so the only consumer was the compiler's own `registerClassOps.fpr.move`, and a wrong word there produces a working program with the wrong instruction in it. It is reachable from text now. ★ THE FAIL-LOUD HALF OF R2 (design A′, 2026-08-28) IS UNTOUCHED: the arms carry a `width` GUARD, which the pre-R1 single variant did not, and `variantMatchesInst` treats an absent width as MATCHING ANY WIDTH — so an unguarded row would silently encode a 64-bit FMOV for the 128-bit move R1 made formable (`\"w\"` binds `fpr`, so a `long double` operand is an FPR-class value) and drop the top half. Width 128 elects nothing and fails loud at the emitting site. ★ What a width-128 register-to-register SIMD move needs is ORR (`mov v_d.16b, v_n.16b`), a DIFFERENT AArch64 instruction with different bytes. ⚠ THE CLAUSE THAT FOLLOWED — *undeclared here on trigger discipline, because ✔MEASURED nothing consumes one* — WENT FALSE THE SAME DAY: it is declared, as the separate opcode `move_bytes` (2026-09-02, lane av, D-ASM-ARM64-GAS-SPELLS-NO-ROUNDING-MODE-OR-VECTOR-MOVE), because a TEXT consumer appeared that codegen never had — the dialect's `mov` row. The measurement it rested on is UNCHANGED and still true (F80 and F128 are the two memory-resident kinds, per `LirVerifier`'s store rule and `lowerF128Store`'s GPR word stores), which is exactly why `fmov` still has no width-128 arm and `registerClassOps.fpr.move` still elects nothing at 128: the new opcode serves the assembler surface, not the copy path.",
         "variants": [
           {
+            "$comment": "FMOV Dd, Dn — ftype=01 double, base 0x1E604000. ✔gas 2.42 + clang 18.1.3: `fmov d0, d1` = 0x1E604020.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 509624320 },
             "resultSlot": "rd",
@@ -2442,16 +3730,9 @@
             ]
           },
           {
+            "$comment": "FMOV Sd, Sn — ftype=00 single, base 0x1E204000. ✔gas 2.42 + clang 18.1.3: `fmov s0, s1` = 0x1E204020, `fmov s31, s30` = 0x1E2043DF. WAS 0x1E604000 (the D-form) until 2026-09-02.",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
-            "template":   { "fixedWord": 509624320 },
-            "resultSlot": "rd",
-            "wires":      [
-              { "index": 0, "slotKind": "rn" }
-            ]
-          },
-          {
-            "guard":      { "operandKinds": ["reg"], "width": 16 },
-            "template":   { "fixedWord": 509624320 },
+            "template":   { "fixedWord": 505430016 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
@@ -2740,11 +4021,27 @@
         "registerClass": "fpr",
         "variants": [
           {
+            "$comment": "CNT Vd.8B, Vn.8B — Q=0, eight byte lanes, 64 bits. ✔gas 2.42 + clang 18.1.3: `cnt v0.8b, v1.8b` = 0x0E205820, `cnt v3.8b, v7.8b` = 0x0E2058E3.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 237000704 },
             "resultSlot": "rd",
+            "destWidth":  64,
+            "destLanes":  true,
+            "destLaneBits": 8,
             "wires":      [
-              { "index": 0, "slotKind": "rn" }
+              { "index": 0, "slotKind": "rn", "lanes": true, "laneBits": 8 }
+            ]
+          },
+          {
+            "$comment": "★ CNT Vd.16B, Vn.16B — Q=1, SIXTEEN byte lanes, 128 bits. base 0x4E205800 = the Q=0 word | bit 30. ✔gas 2.42 + clang 18.1.3, agreeing: `cnt v0.16b, v1.16b` = 0x4E205820.\n⚠ DECLARED 2026-09-02 (cycle P54, lane el) BECAUSE THE SPELLING BECAME REACHABLE, not because a producer appeared. Until the aarch64 gas dialect could parse a lane arrangement (D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME, gap 3) nothing could write either form, and the C path's `popcount` sequence emits only the Q=0 one. With the arrangement parsable, `cnt v0.16b, v1.16b` is a program BOTH references assemble, so refusing it would put DSS below the union on a form this very opcode already encodes — the whole width axis being one bit.\nⓘ THE OLD TEXT ABOVE — *'a caller emitting it at any other width gets A_NoMatchingEncodingVariant rather than a lane count it did not ask for'* — IS STILL TRUE AND IS NOW TRUE OF A SMALLER SET: widths 8, 16 and 32 still elect nothing. What changed is that 128 is no longer among them, because at 128 the instruction genuinely does count sixteen lanes.",
+            "guard":      { "operandKinds": ["reg"], "width": 128 },
+            "template":   { "fixedWord": 1310742528 },
+            "resultSlot": "rd",
+            "destWidth":  128,
+            "destLanes":  true,
+            "destLaneBits": 8,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "lanes": true, "laneBits": 8 }
             ]
           }
         ]
@@ -2764,11 +4061,63 @@
         "registerClass": "fpr",
         "variants": [
           {
+            "$comment": "ADDV Bd, Vn.8B — Q=0, reduces eight byte lanes into the B (8-bit) view. ✔gas 2.42 + clang 18.1.3: `addv b0, v1.8b` = 0x0E31B820, `addv b3, v7.8b` = 0x0E31B8E3. ★ `destWidth` 8 is the DECLARATION that this instruction's two ends disagree — a 64-bit source reduced into an 8-bit destination — which is exactly what the dialect's `addv` row says with `destWidthFromOperands`, and what makes `addv b0, v1.8b` electable at all: without it the written `b0` and the written `v1.8b` disagree and the single-width model refuses the line.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 238139392 },
             "resultSlot": "rd",
+            "destWidth":  8,
             "wires":      [
-              { "index": 0, "slotKind": "rn" }
+              { "index": 0, "slotKind": "rn", "lanes": true, "laneBits": 8 }
+            ]
+          },
+          {
+            "$comment": "★ ADDV Bd, Vn.16B — Q=1, reduces SIXTEEN byte lanes. base 0x4E31B800 = the Q=0 word | bit 30. ✔gas 2.42 + clang 18.1.3, agreeing: `addv b0, v1.16b` = 0x4E31B820. Still WITHOUT SATURATION: sixteen lanes of at most 8 sum to at most 128, and 128 fits an unsigned byte. Declared for the same reason as `popcount_bytes`' Q=1 arm — the spelling became writable, both references assemble it, and the bytes are one bit away from the form already shipped.",
+            "guard":      { "operandKinds": ["reg"], "width": 128 },
+            "template":   { "fixedWord": 1311881216 },
+            "resultSlot": "rd",
+            "destWidth":  8,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "lanes": true, "laneBits": 8 }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "★★★ THE SIMD REGISTER-TO-REGISTER MOVE — `mov Vd.16b, Vn.16b`, WHICH IS **ORR** (cycle P54, lane av, D-ASM-ARM64-GAS-SPELLS-NO-ROUNDING-MODE-OR-VECTOR-MOVE). Lane `el` measured this word and left it undeclared; the operator ruled it in.\n★★★ ONE WRITTEN SOURCE, TWO ENCODED FIELDS, AND THAT IS THE WHOLE INSTRUCTION. AArch64 has no vector MOV: the assembler's `mov Vd.<T>, Vn.<T>` is an ALIAS for `orr Vd.<T>, Vn.<T>, Vn.<T>` — the source appears TWICE, in Rn [9:5] and Rm [20:16], and ORing a register with itself is the identity. So this opcode declares ONE operand and TWO wires from index 0. ✔MEASURED that the alias really is that instruction: `orr v0.16b, v1.16b, v1.16b` and `mov v0.16b, v1.16b` both assemble to 0x4EA11C20 on gas 2.42 AND clang 18.1.3, byte for byte.\n★★ WHY IT IS NOT `fmov`'S WIDTH-128 ARM, and `registerClassOps`'s own note says the same thing from the other side: a 128-bit register move is a DIFFERENT INSTRUCTION with different bytes, not a wider FMOV. Declaring it here leaves the `fpr` class's `move` verb (`fmov`, widths 16/32/64) exactly as it was — 128 still elects nothing there and still fails loud at the emitting site, because no F128 value ever reaches a class-internal register copy on this pipeline.\n⚠⚠ ONE MEASURED CONSEQUENCE, STATED RATHER THAN LEFT TO BE DISCOVERED: because a lane ARRANGEMENT is erased to a WIDTH before variant election, declaring these two arms also makes `mov %q0, %q1` and `mov %d0, %d1` electable — spellings GNU as 2.42 and clang 18.1.3 BOTH REJECT (✔MEASURED). That is not new with this opcode: `cnt %q0, %q1`, `cnt %d0, %d1` and `addv %b0, %d1` are ALREADY accepted at this base for the same reason, and all three are equally refused by both references. The whole class is anchored at [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]], and ⚠⚠ IT IS CLOSED AS OF 2026-09-02 (cycle P54, lane `ae`) — SO THE PARAGRAPH ABOVE DESCRIBES THIS OPCODE'S PAST AND NOT ITS PRESENT. `mov q0, q1` and `mov d0, d1` are REFUSED now, and so are `cnt d0, d1` and `addv b0, d1`. ⚠ THE PREDICTION IN THE NEXT CLAUSE WAS HALF RIGHT: it took an engine + schema change AND a target-document one. The engine carries the lane WIDTH into election; the schema grew `wires[].lanes`/`laneBits` and `destLanes`/`destLaneBits`; and THIS OPCODE had to say which of the three readings each of its fields takes — `lanes` with NO `laneBits` on both wires and on the result, because the ORR it encodes is BITWISE and its lane size reaches no bit. That is also what makes `mov v0.4h, v1.4h` and `mov v0.2s, v1.2s` electable, which clang 18.1.3 assembles (both 0x0EA11C20) and gas 2.42 refuses — the one gas-vs-clang disagreement in this family, and a spelling DSS was BELOW the union on until the lane vocabulary landed. Refusing to declare the move would not have closed that leak — it would only have kept DSS BELOW the union on `mov v0.16b, v1.16b`, which both references assemble.\n✔MEASURED, gas 2.42 and clang 18.1.3 agreeing: `mov v0.16b, v1.16b` = 0x4EA11C20 ⇒ base 0x4EA01C00 (Q=1); `mov v0.8b, v1.8b` = 0x0EA11C20 ⇒ base 0x0EA01C00 (Q=0).",
+      "mnemonic":      "move_bytes",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "ORR Vd.16B, Vn.16B, Vn.16B — Q=1, sixteen byte lanes. base 0x4EA01C00.",
+            "guard":      { "operandKinds": ["reg"], "width": 128 },
+            "template":   { "fixedWord": 1319115776 },
+            "resultSlot": "rd",
+            "destWidth":  128,
+            "destLanes":  true,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "lanes": true },
+              { "index": 0, "slotKind": "rm", "lanes": true }
+            ]
+          },
+          {
+            "$comment": "ORR Vd.8B, Vn.8B, Vn.8B — Q=0, eight byte lanes; the top half of the destination is zeroed, which is what makes it a 64-bit move rather than a partial write. base 0x0EA01C00.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 245373952 },
+            "resultSlot": "rd",
+            "destWidth":  64,
+            "destLanes":  true,
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "lanes": true },
+              { "index": 0, "slotKind": "rm", "lanes": true }
             ]
           }
         ]
@@ -2867,7 +4216,7 @@
     { "$comment": "Stack pointer shares hwEncoding=31 with XZR at the byte level (the context determines which: SP-using addressing modes vs ZR-encoding instructions). The substrate treats them as distinct names with distinct ordinals; the JSON-side ordinal is what matters for the cc lookup.",
       "name": "sp",  "class": "gpr", "widthBytes": 8, "hwEncoding": 31, "dwarfNumber": 31 },
 
-    { "$comment": "★★★ THE AArch64 SIMD&FP REGISTER FILE, DECLARED **ONCE** (R1 of the operator's design A′, 2026-08-28 — D-TARGET-ARM64-W-CONSTRAINT-BINDS-A-CLASS-NO-C-VALUE-EVER-LIVES-IN, D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS). ⚠⚠ WHAT THIS REPLACED, AND WHY IT WAS A DEFECT RATHER THAN A STYLE: this file used to declare the SAME THIRTY-TWO PHYSICAL REGISTERS TWICE — `d0..d31` as class `fpr` (8 bytes) and `v0..v31` as class `vr` (16 bytes), ✔MEASURED 32 rows each, ZERO `subOf` on either side, and the SAME `dwarfNumber` 64..95 and `hwEncoding` on every pair. Two classes over one file is what made `\"w\"` bind a class no C value can live in, what made an `{fpr, vr}` move look like a missing verb (there is nothing to move BETWEEN), and what left the `vr` free list permanently empty. The GPR file was always modelled right — `x0` is the row and `w0` is its `subOf` view — and this block now says the same thing about the SIMD&FP file. `regClassForCoreType` was CORRECT throughout and is NOT touched: the config was wrong. ★★ THE ROOTS ARE `v0..v31`: the whole 128-bit register, class `fpr`, no `subOf`, and the only FP rows a calling convention may name (D-TARGET-CC-NAMES-SUB-REGISTER refuses a cc naming a view). `hwEncoding` is the 5-bit register number EVERY SIMD&FP instruction form shares; `dwarfNumber` 64+k is the V register DWARF numbers. ★★ THE VIEWS ARE `q`/`d`/`s`/`h`/`b`, exactly the five spellings `aarch64-linux-gnu-as` accepts for a scalar SIMD&FP operand, each `subOf` its `v` root at its own `widthBytes`. They are NEVER allocatable (they appear in no cc list, which `validate()` enforces): the width an instruction runs at rides the LIR instruction's width flag and the register table supplies the shared encoding. ⚠ `q_k` is the SAME WIDTH as its root on purpose — `q0` and `v0` are two assembler spellings of one 128-bit register (scalar vs vector form), and a source language that can write `str q0, [sp]` needs the name to resolve. ★ ONLY `v_k` AND `d_k` CARRY A `dwarfNumber`, AND THAT PAIR IS LOAD-BEARING: `DwarfRegisterReverseMap::build` accepts two rows sharing a number when they share an `hwEncoding` and lets the NARROWEST win, so DWARF 72 keeps resolving to `d8` — which is exactly what GNU `as` translates `.cfi_offset d8` into, and exactly the low 64 bits AAPCS64 §6.1.2 guarantees a callee preserves of v8..v15. Giving `s`/`h`/`b` numbers too would put three more rows in that collision with nothing to decide between them. ⚠⚠ THE `q` VIEW FAMILY IS DELIBERATELY ABSENT, AND THE RULING THAT NAMED IT WAS REFUTED BY MEASUREMENT RATHER THAN OVERRULED. R1 listed `q`/`d`/`s`/`h`/`b` as the five view families. ✔MEASURED after declaring all five: `q_k` is 16 bytes with a 16-byte parent, and `TargetSubRegisters.NoSubRegisterAppearsInAnyCallingConventionList` asserts every `subOf` row's parent is STRICTLY WIDER — 32 violations, whose stated rationale is that a typo'd `subOf` parent would otherwise load clean and alias the WRONG register. Relaxing that `>` to `>=` would delete the protection to fit the config, which is backwards. ★ `q0` and `v0` are two ASSEMBLER SPELLINGS of one whole register (scalar form vs vector form), not two WIDTHS of it, so `subOf` is the wrong relation for them — a same-width ALIAS is a different key, and it is not built here because nothing consumes it: ✔MEASURED, `asm-arm64-gas.lang.json` declares 51 instructions and NOT ONE is floating, so no template can write `q0` today.",
+    { "$comment": "★★★ THE AArch64 SIMD&FP REGISTER FILE, DECLARED **ONCE** (R1 of the operator's design A′, 2026-08-28 — D-TARGET-ARM64-W-CONSTRAINT-BINDS-A-CLASS-NO-C-VALUE-EVER-LIVES-IN, D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS). ⚠⚠ WHAT THIS REPLACED, AND WHY IT WAS A DEFECT RATHER THAN A STYLE: this file used to declare the SAME THIRTY-TWO PHYSICAL REGISTERS TWICE — `d0..d31` as class `fpr` (8 bytes) and `v0..v31` as class `vr` (16 bytes), ✔MEASURED 32 rows each, ZERO `subOf` on either side, and the SAME `dwarfNumber` 64..95 and `hwEncoding` on every pair. Two classes over one file is what made `\"w\"` bind a class no C value can live in, what made an `{fpr, vr}` move look like a missing verb (there is nothing to move BETWEEN), and what left the `vr` free list permanently empty. The GPR file was always modelled right — `x0` is the row and `w0` is its `subOf` view — and this block now says the same thing about the SIMD&FP file. `regClassForCoreType` was CORRECT throughout and is NOT touched: the config was wrong. ★★ THE ROOTS ARE `v0..v31`: the whole 128-bit register, class `fpr`, no `subOf`, and the only FP rows a calling convention may name (D-TARGET-CC-NAMES-SUB-REGISTER refuses a cc naming a view). `hwEncoding` is the 5-bit register number EVERY SIMD&FP instruction form shares; `dwarfNumber` 64+k is the V register DWARF numbers. ★★ THE VIEWS ARE `q`/`d`/`s`/`h`/`b`, exactly the five spellings `aarch64-linux-gnu-as` accepts for a scalar SIMD&FP operand, each `subOf` its `v` root at its own `widthBytes`. They are NEVER allocatable (they appear in no cc list, which `validate()` enforces): the width an instruction runs at rides the LIR instruction's width flag and the register table supplies the shared encoding. ⚠ `q_k` is the SAME WIDTH as its root on purpose — `q0` and `v0` are two assembler spellings of one 128-bit register (scalar vs vector form), and a source language that can write `str q0, [sp]` needs the name to resolve. ★ ONLY `v_k` AND `d_k` CARRY A `dwarfNumber`, AND THAT PAIR IS LOAD-BEARING: `DwarfRegisterReverseMap::build` accepts two rows sharing a number when they share an `hwEncoding` and lets the NARROWEST win, so DWARF 72 keeps resolving to `d8` — which is exactly what GNU `as` translates `.cfi_offset d8` into, and exactly the low 64 bits AAPCS64 §6.1.2 guarantees a callee preserves of v8..v15. Giving `s`/`h`/`b` numbers too would put three more rows in that collision with nothing to decide between them. ⚠⚠ THE `q` VIEW FAMILY IS DELIBERATELY ABSENT, AND THE RULING THAT NAMED IT WAS REFUTED BY MEASUREMENT RATHER THAN OVERRULED. R1 listed `q`/`d`/`s`/`h`/`b` as the five view families. ✔MEASURED after declaring all five: `q_k` is 16 bytes with a 16-byte parent, and `TargetSubRegisters.NoSubRegisterAppearsInAnyCallingConventionList` asserts every `subOf` row's parent is STRICTLY WIDER — 32 violations, whose stated rationale is that a typo'd `subOf` parent would otherwise load clean and alias the WRONG register. Relaxing that `>` to `>=` would delete the protection to fit the config, which is backwards. ★ `q0` and `v0` are two ASSEMBLER SPELLINGS of one whole register (scalar form vs vector form), not two WIDTHS of it, so `subOf` is the wrong relation for them — a same-width ALIAS is a different key, and it is not built here because nothing consumes it. ⚠ THE REASON RECORDED HERE FOR *nothing consumes it* WENT FALSE ON 2026-09-02 AND THE CONCLUSION DID NOT: it used to read *✔MEASURED, `asm-arm64-gas.lang.json` declares 51 instructions and NOT ONE is floating, so no template can write `q0` today*. That dialect now declares 58 instructions of which SEVEN are floating (D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME, cycle P54). ✔RE-MEASURED at that base: `q0` is still not a register NAME this table declares (the spellings present are `v`/`d`/`s`/`h`/`b`, 32 each, plus the GPR files), so a template naming `q0` is refused at the register lookup rather than encoding something — and every FP mnemonic declared is scalar, so none of them wants the 128-bit spelling. The alias key is still unbuilt for want of a consumer; what changed is that the sentence proving it can no longer be *the dialect has no FP instruction*.",
       "name": "v0",  "class": "fpr", "widthBytes": 16, "hwEncoding": 0, "dwarfNumber": 64 },
     { "name": "v1", "class": "fpr", "widthBytes": 16, "hwEncoding": 1, "dwarfNumber": 65 },
     { "name": "v2", "class": "fpr", "widthBytes": 16, "hwEncoding": 2, "dwarfNumber": 66 },
@@ -3083,18 +4432,18 @@
       "letter": "i", "binds": "operandKind",   "operandKind":   "imm32"   }
   ],
   "$asmBareOperandWidthsComment": "★★★ WHICH REGISTER VIEW A **BARE** `%0` NAMES — the half `asmConstraints` cannot answer, because it is about the width a REFERENCE states rather than about which register a LETTER binds (D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE). ✔MEASURED 2026-08-27 from emitted code, never from documentation: `aarch64-linux-gnu-gcc` 13.3.0 AND `clang-19 --target=aarch64-linux-gnu`, `-O0` and `-O2`, template `__asm__(\"BARE %0 END\" : : \"r\"(v))` read out of `-S` — the 64-bit `x` name comes back for EVERY integer type: `_Bool`, `char`, `unsigned char`, `short`, `int`, `unsigned int`, `long`, `long long`, `void *` and `__int128` alike. The operand's own type does not enter into it. `%w` is how 32 bits is asked for, and clang says so in its own words under `-Wasm-operand-widths` (*\"value size does not match register size\"*, fix-it *use constraint modifier \"w\"*) on the exact source DSS used to miscompile. ⚠ THE OTHER PORT'S ANSWER IS THE OPPOSITE AND THAT IS WHY THIS IS DECLARED RATHER THAN DERIVED: x86_64 renders `%al`/`%ax`/`%eax`/`%rax`, tracking the type exactly. No width arithmetic reproduces both — *narrowest view ≥ the type width* yields `w0` for an `int` here (gcc renders `x0`), and *the widest view* yields `%rax` for an `int` there (gcc renders `%eax`). ★★ AND IT IS A TARGET FACT, CHECKED WITH THE INSTRUMENT `asmConstraints`' OWN CHARTER DEMANDS: under `-masm=att` vs `-masm=intel` on one processor the selected VIEW is identical and only the sigil moves, while the control (`movq %rsi, (%rdi)` → `mov QWORD PTR [rdi], rsi`) moves as a dialect fact must.",
-  "$asmBareOperandWidthsFpComment": "★★★ `fpr` IS `registerNatural` — R5 OF THE OPERATOR'S DESIGN A′, LANDED P50, AND THE ROW D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE CLOSES AT EXACTLY THIS FLIP. ✔RE-MEASURED AT THE P50 BASE (2026-09-01), gcc 13.3.0 AND clang 18.1.3 probed SEPARATELY, -O0 AND -O2, substituted text read out of `-S` (clang under `-fno-integrated-as`, without which its integrated assembler rejects the synthetic probe mnemonic — an instrument result, not a finding): a bare `%0` on a `\"w\"`-bound `float`, `double`, `long double` AND `__int128` renders `v0` under BOTH references at BOTH levels — 16 of 16 rows, unanimous, the same matrix P45 measured. `v0` is the FULL 128-bit register, so the reference rule for this class is `registerNatural`, and `TargetSchema::registerClassNaturalWidthBits` answers 128 because the `v` roots are this class's only rows with no `subOf` (R1's declaration, one file, declared once). MSVC 19.51 ABSTAINS — ✔MEASURED, `__asm__` is `error C2065: undeclared identifier`, so the disjunction here is gcc ∪ clang. ★★ THE PRECONDITION THE ROW STATED FOR THIS FLIP IS ALSO LANDED, IN THE SAME CHANGE: the seven modifier letters are declared CLASS-SCOPED in `asm-arm64-gas.lang.json` (`w`/`x` ⇒ gpr; `b`/`h`/`s`/`d`/`q` ⇒ fpr, widths 8/16/32/64/128), so a template that means the narrow view can SAY so (`%d0` renders d0 under both references) and a bare reference no longer has to carry that meaning by accident. ⚠ WHAT THE FLIP CHANGES OBSERVABLY TODAY IS A REFUSAL'S TIER AND HONESTY, NOT AN EMITTED BYTE, AND THAT IS STATED RATHER THAN DISCOVERED: this dialect declares no floating-point mnemonic yet, so a bare `\"w\"`-bound placeholder inside a real instruction previously died at the ENCODER's register-bank guard (A_NoMatchingEncodingVariant, a gpr field handed a v-register — ✔MEASURED at the P50 base) and now dies EARLIER and TRUER: the operand states 128 bits and the template translator's width-flag map refuses by name, pointing at the real limit (no shipped target declares a width-128 encoding variant). The day this document gains an FP instruction, bare references and `%q0` start electing with no further config or C++ change. ★ THE VIEW-ROW DOUBLE-TRUTH, KEPT SO NEITHER HALF IS RE-REFUTED: (a) ✔MEASURED, the view rows were NEVER needed for the WIDTH answer — `registerClassNaturalWidthBits` reads the full rows only — and that refutation STANDS; (b) the `d`/`s`/`h`/`b` view rows exist anyway (R1) because calling conventions, DWARF and the assembler's scalar spellings need them as rows. The class-scoped LETTERS resolve by WIDTH against the binding and never look a view row up by name — which is why `q` (128, the root's own width, no `q` row exists) works identically to `d` (64, a row exists): the width rides the instruction, the register table supplies the shared encoding. ✔The refusal this row was opened against — `\"w\"(double)` dying in `MirToLir::emitAsmOperandMove` — is GONE (R1), re-verified at the P50 base by execution: a `\"+w\"`-bound double through a `nop` template compiles rc=0 at debug and release and runs under qemu (`examples/c/c_inline_asm_fp_class_constraint`).",
+  "$asmBareOperandWidthsFpComment": "★★★ `fpr` IS `registerNatural` — R5 OF THE OPERATOR'S DESIGN A′, LANDED P50, AND THE ROW D-ASM-AARCH64-FP-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE CLOSES AT EXACTLY THIS FLIP. ✔RE-MEASURED AT THE P50 BASE (2026-09-01), gcc 13.3.0 AND clang 18.1.3 probed SEPARATELY, -O0 AND -O2, substituted text read out of `-S` (clang under `-fno-integrated-as`, without which its integrated assembler rejects the synthetic probe mnemonic — an instrument result, not a finding): a bare `%0` on a `\"w\"`-bound `float`, `double`, `long double` AND `__int128` renders `v0` under BOTH references at BOTH levels — 16 of 16 rows, unanimous, the same matrix P45 measured. `v0` is the FULL 128-bit register, so the reference rule for this class is `registerNatural`, and `TargetSchema::registerClassNaturalWidthBits` answers 128 because the `v` roots are this class's only rows with no `subOf` (R1's declaration, one file, declared once). MSVC 19.51 ABSTAINS — ✔MEASURED, `__asm__` is `error C2065: undeclared identifier`, so the disjunction here is gcc ∪ clang. ★★ THE PRECONDITION THE ROW STATED FOR THIS FLIP IS ALSO LANDED, IN THE SAME CHANGE: the seven modifier letters are declared CLASS-SCOPED in `asm-arm64-gas.lang.json` (`w`/`x` ⇒ gpr; `b`/`h`/`s`/`d`/`q` ⇒ fpr, widths 8/16/32/64/128), so a template that means the narrow view can SAY so (`%d0` renders d0 under both references) and a bare reference no longer has to carry that meaning by accident. ⚠ WHAT THE FLIP CHANGED OBSERVABLY AT P50 WAS A REFUSAL'S TIER AND HONESTY, NOT AN EMITTED BYTE, AND THAT WAS STATED RATHER THAN DISCOVERED: the dialect declared no floating-point mnemonic then, so a bare `\"w\"`-bound placeholder inside a real instruction previously died at the ENCODER's register-bank guard (A_NoMatchingEncodingVariant, a gpr field handed a v-register — ✔MEASURED at the P50 base) and afterwards died EARLIER and TRUER: the operand states 128 bits and the template translator's width-flag map refuses by name, pointing at the real limit (no shipped target declares a width-128 encoding variant). ★★ THE PREDICTION THAT FOLLOWED — *the day this document gains an FP instruction, bare references and `%q0` start electing with no further config or C++ change* — CAME DUE ON 2026-09-02 AND IS HALF CONFIRMED, HALF REFUTED (D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME, cycle P54: the dialect now spells `fadd`/`fsub`/`fmul`/`fdiv`/`fneg`/`fcmp`/`fmov`). ✔MEASURED: the NARROW letters elect exactly as promised and with ZERO further changes — `__asm__(\"fadd %d0, %d1, %d2\" : \"=w\"(r) : \"w\"(a), \"w\"(b))` over doubles compiles rc=0 and runs to 42 under qemu-aarch64, where the same statement was `A_AsmTextUnsupported … unknown mnemonic 'fadd'` the hour before. ⚠⚠ THE HALF THAT WAS REFUTED HAS SINCE BEEN CONFIRMED, AND THE SENTENCE RECORDING IT LASTED HOURS. It read: *But a BARE reference and `%q0` still do NOT elect … 128 elects nothing and fails loud. What unblocks those two is a width-128 encoding variant — i.e. the SIMD arrangement forms — not another instruction row.* ✔MEASURED 2026-09-02, after lane `av` declared the SIMD register move (`move_bytes`, D-ASM-ARM64-GAS-SPELLS-NO-ROUNDING-MODE-OR-VECTOR-MOVE): a bare `%0` and a `%q0` on a `\"w\"` binding BOTH elect now, and both emit ORR Vd.16B (0x4EA11C20). The mechanism named was exactly right — a width-128 encoding variant is what unblocked them — and the *not another instruction row* rider was wrong, because the variant arrived AS one: an opcode plus a `mov` row. ⚠ IT ALSO MEANS DSS ACCEPTS `mov v0, v1` AND `mov q0, q1`, WHICH BOTH REFERENCES REJECT (✔MEASURED, gas 2.42 and clang 18.1.3): an arrangement is erased to a width before election, so nothing separates `%0.16b` from `%q0` or from a bare `%0`. Anchored OPEN at [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]. ★ THE VIEW-ROW DOUBLE-TRUTH, KEPT SO NEITHER HALF IS RE-REFUTED: (a) ✔MEASURED, the view rows were NEVER needed for the WIDTH answer — `registerClassNaturalWidthBits` reads the full rows only — and that refutation STANDS; (b) the `d`/`s`/`h`/`b` view rows exist anyway (R1) because calling conventions, DWARF and the assembler's scalar spellings need them as rows. The class-scoped LETTERS resolve by WIDTH against the binding and never look a view row up by name — which is why `q` (128, the root's own width, no `q` row exists) works identically to `d` (64, a row exists): the width rides the instruction, the register table supplies the shared encoding. ✔The refusal this row was opened against — `\"w\"(double)` dying in `MirToLir::emitAsmOperandMove` — is GONE (R1), re-verified at the P50 base by execution: a `\"+w\"`-bound double through a `nop` template compiles rc=0 at debug and release and runs under qemu (`examples/c/c_inline_asm_fp_class_constraint`).",
   "asmBareOperandWidths": [
     { "class": "gpr", "derivation": "registerNatural" },
     { "class": "fpr", "derivation": "registerNatural" }
   ],
   "$registerClassOpsComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): per-register-class move/load/store mnemonics — the same FC2 Part B table x86_64 declares. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (L_RequiredLirOpcodeMissing), because the class-blind alternative is a silent miscompile (a GPR ORR/LDUR against a D-register hwEncoding assembles to valid-looking words that move the WRONG register file). fpr: move=FMOV(D), load=LDUR(D), store=STUR(D). ★★ THE TWO PARAGRAPHS ABOVE AND BELOW WERE TWO SEPARATE `$registerClassOpsComment` KEYS IN THIS DOCUMENT UNTIL 2026-08-30 (cycle P46), AND JSON LET THAT PASS: every mainstream parser -- nlohmann, which is what DSS uses -- keeps the LAST occurrence and drops the first WITHOUT A DIAGNOSTIC. So the paragraph above this sentence was dead text the loader never saw, while being the one a reader meets first. Merged rather than deleted, because neither subsumes the other: the first says WHY this table exists and what a missing row costs, the second says what a ROW MEANS now that its subject is an ordered pair. D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC. D-TARGET-NO-CROSS-CLASS-MOVE-VERB: a row's subject is an ORDERED PAIR of register classes — `class` is the SOURCE and the optional `to` is the DESTINATION, `to` omitted meaning the DIAGONAL (a copy within one file), which is what every row written before this key existed meant. ★ ONE TABLE, not two: `move` answers the single question *how does this machine copy a bit pattern from class A to class B?* for every (A,B) including A == B. ⚠ `load`/`store` are DIAGONAL-ONLY and the loader refuses them off it: they relate a class to MEMORY, and memory is not a register class. ⚠ AND THE MOVE'S OWN ENCODING IS CHECKED AGAINST THE PAIR IT IS FILED UNDER, so a move whose declared banks disagree with its row is refused at load rather than writing a register number into the wrong file at run time.",
 "registerClassOps": [
-    { "$comment": "★★★ THE ONE SIMD&FP CLASS, AND ITS MEMORY VERBS ARE WIDTH-ELECTED (R2 of design A′). ⚠⚠ WHAT THIS REPLACED: a SECOND `registerClassOps` row for class `vr` carrying `load: fldur_q` / `store: fstur_q` and deliberately no `move`. That row existed only because the register file was declared twice; with one class there is one row, and the Q-form memory ops are `fldur`/`fstur`'s **width-128 variants** — the same width axis `fldur`/`fstur` already use to pick STUR Dt (64) from STUR St (32), and the same axis `movq_gpr_to_xmm` keys its FMOV Dd,Xn / Sd,Wn pair on. The `_q` mnemonics are DELETED: they were a second spelling of one instruction family's widest arm. ★★ `move` IS `fmov` AND IT IS DECLARED AT WIDTHS 16/32/64 ONLY. A width-128 register-to-register SIMD move is NOT a wider FMOV — AArch64 spells it **ORR** (`mov v_d.16b, v_n.16b` is the assembler alias), a different instruction with different bytes. ✔MEASURED that nothing consumes one: an F128 value is memory-resident on this pipeline (`lowerF128Store` issues GPR word stores; `LirVerifier`'s store rule names F80 and F128 as the two memory-resident kinds), so no 128-bit value ever reaches a class-internal register copy. Declaring ORR with no consumer would be dead vocabulary; leaving `fmov` UNGUARDED would be worse — it would silently encode FMOV Dd,Dn for a 128-bit move and drop the top half. So the widths that exist are declared and 128 elects nothing, which fails loud at the emitting site naming the pair and the op.",
+    { "$comment": "★★★ THE ONE SIMD&FP CLASS, AND ITS MEMORY VERBS ARE WIDTH-ELECTED (R2 of design A′). ⚠⚠ WHAT THIS REPLACED: a SECOND `registerClassOps` row for class `vr` carrying `load: fldur_q` / `store: fstur_q` and deliberately no `move`. That row existed only because the register file was declared twice; with one class there is one row, and the Q-form memory ops are `fldur`/`fstur`'s **width-128 variants** — the same width axis `fldur`/`fstur` already use to pick STUR Dt (64) from STUR St (32), and the same axis `movq_gpr_to_xmm` keys its FMOV Dd,Xn / Sd,Wn pair on. The `_q` mnemonics are DELETED: they were a second spelling of one instruction family's widest arm. ★★ `move` IS `fmov` AND IT IS DECLARED AT WIDTHS **32/64** ONLY — the list read *16/32/64* until 2026-09-02 (cycle P54, lane ae), when `fmov`'s width-16 arm was deleted for being ABOVE THE UNION (✔MEASURED, gas 2.42 and clang 18.1.3 both REFUSE `fmov h0, h1` at the default -march; see that opcode's `$variantsComment`). Width 16 now elects nothing here, exactly as width 128 does, and for the same fail-loud reason: nothing on this pipeline produces an F16 class-internal copy, because no shipped language forms an F16 value at all. A width-128 register-to-register SIMD move is NOT a wider FMOV — AArch64 spells it **ORR** (`mov v_d.16b, v_n.16b` is the assembler alias), a different instruction with different bytes. ✔MEASURED that nothing consumes one: an F128 value is memory-resident on this pipeline (`lowerF128Store` issues GPR word stores; `LirVerifier`'s store rule names F80 and F128 as the two memory-resident kinds), so no 128-bit value ever reaches a class-internal register copy. Leaving `fmov` UNGUARDED would be worse — it would silently encode FMOV Dd,Dn for a 128-bit move and drop the top half. So the widths that exist are declared and 128 elects NOTHING HERE, which fails loud at the emitting site naming the pair and the op.\n⚠⚠ THE CLAUSE THAT SAID *declaring ORR with no consumer would be dead vocabulary* WENT FALSE LATER THE SAME DAY (2026-09-02, lane av, D-ASM-ARM64-GAS-SPELLS-NO-ROUNDING-MODE-OR-VECTOR-MOVE): ORR **IS** declared now, as the opcode `move_bytes`, and it has a consumer — the aarch64 gas dialect's `mov` row, which is a TEXT surface rather than a codegen one. The trigger-discipline reasoning was sound and the premise under it was about CODEGEN only; an inline `asm` can spell an instruction no pass ever produces. ⓘ **THIS ROW IS DELIBERATELY UNCHANGED**: `move` stays `fmov` at 16/32/64 and width 128 still elects nothing here. Pointing `move` at `move_bytes` would replace a fail-loud gap with an untested path — nothing in the pipeline produces a 128-bit class-internal copy, so the new verb would have no witness, which is the same dead-vocabulary objection one level up.",
       "class": "fpr", "move": "fmov", "load": "fldur", "store": "fstur",
       "$loadScaledComment": "★★★ THE LONG-REACH TWINS, AND THE SLOT IS PER-CLASS BECAUSE THE REACH IS (D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM). `fldur`/`fstur` reach ±256 bytes; every frame access funnels through `selectFrameMemOp`, which swaps an offset past that reach onto the SCALED unsigned-offset form. Before this pair the swap could only fire for the INTEGER file's `load`/`store` — the integer file was the only one whose twin was declared — so an FP frame access past ±256 kept `fstur` and fail-louded at the encoder. ⚠ THE INTEGER FILE DECLARES ITS OWN PAIR WITHOUT A ROW HERE: `gpr` has no diagonal registerClassOps row on this target, so its four memory verbs come from the universal `load`/`store`/`load_u`/`store_u` mnemonic defaults. That asymmetry is the SAME one `move` already had, not a new one.",
       "loadScaled": "fldr_u", "storeScaled": "fstr_u" },
-    { "$comment": "gpr -> fpr, the cross-FILE move: FMOV Dd,Xn at width 64 and FMOV Sd,Wn at width 32, already declared byte-pinned on `movq_gpr_to_xmm` for the SIMD popcount sequence. ★ D-TARGET-NO-CROSS-CLASS-MOVE-VERB fills the slot `registerClassOps` never had; the BYTES were here all along. The width guard is load-bearing on this target in a way it is not on the diagonal — `fmov d,d` carries no width guard, but the cross-file forms read a different number of bytes out of the source file, so the emitting site threads the operand's own width.",
+    { "$comment": "gpr -> fpr, the cross-FILE move: FMOV Dd,Xn at width 64 and FMOV Sd,Wn at width 32, already declared byte-pinned on `movq_gpr_to_xmm` for the SIMD popcount sequence. ★ D-TARGET-NO-CROSS-CLASS-MOVE-VERB fills the slot `registerClassOps` never had; the BYTES were here all along. The width guard is load-bearing here because the cross-file forms read a different number of bytes out of the source file, so the emitting site threads the operand's own width. ⚠ THE CLAUSE THAT USED TO STAND HERE — *in a way it is not on the diagonal: `fmov d,d` carries no width guard* — WAS ALREADY FALSE WHEN IT WAS WRITTEN (R2, P47, had given the diagonal `fmov` three width-guarded arms) and is doubly false since 2026-09-02, when each of those arms got its own ftype word. The diagonal is width-keyed for the SAME reason this row is: the width IS the ftype field.",
       "class": "gpr", "to": "fpr", "move": "movq_gpr_to_xmm" },
     { "$comment": "fpr -> gpr, the mirror direction: FMOV Xd,Dn at width 64 and FMOV Wd,Sn at width 32 (`movq_xmm_to_gpr`). Kept a SEPARATE opcode from the row above for the reason both opcode rows state: the variant guard keys only on (operandKinds, width) and both directions are `reg` at the same width, so one opcode carrying both would silently pick a direction.",
       "class": "fpr", "to": "gpr", "move": "movq_xmm_to_gpr" }

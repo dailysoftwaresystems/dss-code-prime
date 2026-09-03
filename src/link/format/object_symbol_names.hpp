@@ -67,6 +67,14 @@
 // + a reloc against the extern, and the writer emits the extern as an SHN_UNDEF
 // symtab entry the final (foreign) linker resolves.
 //
+// ★ AND THE IMPORT SIDE HAS THE SAME LOCKSTEP PAIR (`externBinding`,
+// D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE). It is the identical defect
+// one rail over: the writers consulted `externName` for the name and HARDCODED
+// the strong binding, so `extern int ea __attribute__((weak));` — a reference
+// the language understood, the HIR recorded and the MIR carried — reached the
+// wire as an ORDINARY undefined symbol on all three formats, losing the one
+// property that makes it weak (that it may legally resolve to nothing).
+//
 // FORMAT-NEUTRAL: the one per-format value, the internal-fallback PREFIX
 // ("sym_" on ELF/PE, "_sym_" on Mach-O), is a caller PARAMETER — the same
 // per-format vocabulary those writers already carry, NOT an `if(format)`
@@ -291,6 +299,42 @@ public:
             }
         }
         return std::string{internalPrefix} + std::to_string(id.v);
+    }
+
+    // ── The REFERENCE binding for an UNDEFINED extern symbol ──────────────
+    //    D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE
+    //
+    // The exact binding companion of `externName`, built the way
+    // `definedBinding` is built for `definedName` and for the same stated
+    // reason (the NAME<->BINDING LOCKSTEP note in this file's header): it runs
+    // the IDENTICAL `externBySym_` lookup behind the IDENTICAL
+    // `!mangledName.empty()` predicate, so a target that takes the real import
+    // NAME takes its real binding, and a target that falls back to
+    // `<prefix><id>` takes the fallback binding. The two cannot drift because
+    // there is one lookup and one predicate, written once.
+    //
+    // ★★ THE FALLBACK IS `Global`, AND THAT IS THE LOAD-BEARING HALF. A reloc
+    // target that is neither defined here nor a known import — the
+    // `<prefix><id>` arm — is a reference DSS cannot describe. Emitting it WEAK
+    // would tell the final linker it may resolve to nothing, and the program
+    // would then read through address 0 instead of failing to link: a silent
+    // wrong answer produced by the arm that exists precisely because something
+    // is unknown. Strong is the only honest answer where the binding is not
+    // known, and it is also the pre-existing behaviour, so this method is
+    // byte-identical to a hardcoded strong binding for every module that
+    // carries no weak import at all.
+    //
+    // FORMAT-NEUTRAL like everything else here: the caller maps this ONE
+    // `SymbolBinding` to its own wire vocabulary (ELF STB_WEAK, Mach-O
+    // N_WEAK_REF, COFF IMAGE_SYM_CLASS_WEAK_EXTERNAL), which is the same
+    // division of labour `definedBinding` already has.
+    [[nodiscard]] SymbolBinding externBinding(SymbolId id) const {
+        if (auto const it = externBySym_.find(id.v); it != externBySym_.end()) {
+            if (!it->second->mangledName.empty()) {
+                return it->second->binding;
+            }
+        }
+        return SymbolBinding::Global;
     }
 
 private:

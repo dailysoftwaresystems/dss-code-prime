@@ -3988,7 +3988,22 @@ public:
             // enclosing conditional branch is active (C 6.10.1 conditional
             // elision). A dead-branch token is dropped here -- so elision
             // precedes `expand` naturally (the dead tokens never reach it).
-            if (stackActive()) body.push_back(in[i]);
+            if (stackActive()) {
+                // D-PP-VA-SPECIAL-IDENTIFIER-OUTSIDE-REPLACEMENT-LIST: ORDINARY
+                // PROGRAM TEXT is the position the constraint was never checked
+                // in. This is the whole non-directive half of the axis at once
+                // -- a declarator name, a struct member, a label, a macro
+                // invocation's argument -- because every one of them arrives
+                // here as a plain source token, and none of them is a
+                // replacement list. Checking `in[i]` (the SOURCE token, before
+                // `flushExpand`) is what makes it a position check rather than
+                // an expansion-product check: a legitimate `__VA_ARGS__` inside
+                // a variadic macro lives in `table_`, never in `body`.
+                if (std::string const* s = specialVariadicSpelling(in[i])) {
+                    reportSpecialVariadicIdentifier(in[i], *s);
+                }
+                body.push_back(in[i]);
+            }
             ++i;
         }
         // c17: close a dead span still open at EOF (an unterminated `#if 0`). The
@@ -4059,7 +4074,7 @@ public:
         // folded into an integer and discarded, and recording them would put
         // offsets in the map that no tree node can ever reference.
         recordPack_ = true;
-        std::vector<ExpToken> expanded = expand(std::move(work), 0);
+        std::vector<ExpToken> expanded = expand(std::move(work));
         recordPack_ = false;
         // FC15 paste residuals: a placemarker is normally consumed inside
         // `substitute`; this BACKSTOP drops any stray one so it never reaches the
@@ -4198,6 +4213,117 @@ private:
     // table membership by text keeps expansion correct.
     static bool isWord(Token const& t) {
         return t.coreKind == CoreTokenKind::Word;
+    }
+
+    // ══ D-PP-VA-SPECIAL-IDENTIFIER-OUTSIDE-REPLACEMENT-LIST ═════════════════
+    //
+    // C23 6.10.5p5 is a CONSTRAINT: the variadic catch-all identifier and the
+    // va-opt introducer "shall occur only in the replacement-list of a
+    // function-like macro that uses the ellipsis notation". EVERY other position
+    // violates it -- ordinary program text, a non-`#define` directive line, a
+    // `#if` controlling expression, a macro invocation's ARGUMENT, a struct
+    // member, a label, a declarator name.
+    //
+    // Returns the config-declared spelling the token violates the constraint AS,
+    // or `nullptr` when the token is not one of them. ★ Both names come from the
+    // language document (`variadicArgsName` / `vaOptName`); a language that
+    // declares different spellings -- or declares neither, leaving the strings
+    // empty -- gets the identical behaviour with no change here.
+    //
+    // ⚠ Word-kind ONLY, which is what keeps the check off a COMMENT that
+    // mentions the spelling (comment bodies are trivia) and off a STRING that
+    // contains it (a string body is one token per codepoint, so no single token
+    // ever spells the whole identifier).
+    //
+    // ⚠ THE SPAN-WIDTH PRE-FILTER IS NOT MICRO-OPTIMIZATION, it is what keeps
+    // this off the hot path. `run()` calls this for EVERY live source token, and
+    // ✔MEASURED in cycle P34 the sqlite corpus put 106.3 M tokens through this
+    // pass. `text()` slices a buffer; a span WIDTH is two integers already in
+    // the token. Comparing widths first rejects every identifier that is not
+    // exactly as long as a configured spelling without touching memory, and it
+    // is EXACT rather than heuristic -- two strings of different length are
+    // never equal, so the filter can only skip a non-match.
+    [[nodiscard]] std::string const*
+    specialVariadicSpelling(Token const& t) const {
+        if (!isWord(t)) return nullptr;
+        const std::size_t width = t.span.end() - t.span.start();
+        const bool couldBeArgs = !cfg().variadicArgsName.empty()
+                              && width == cfg().variadicArgsName.size();
+        const bool couldBeOpt = !cfg().vaOptName.empty()
+                             && width == cfg().vaOptName.size();
+        if (!couldBeArgs && !couldBeOpt) return nullptr;
+        const std::string_view w = text(t);
+        if (couldBeArgs && w == cfg().variadicArgsName) {
+            return &cfg().variadicArgsName;
+        }
+        if (couldBeOpt && w == cfg().vaOptName) {
+            return &cfg().vaOptName;
+        }
+        return nullptr;
+    }
+
+    // The ONE diagnostic for a 6.10.5p5 violation found OUTSIDE a `#define`.
+    //
+    // ★★ WHY A WARNING AND NOT A REFUSAL, and this is the whole judgement the
+    // row turned on. The standing rule is `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C`
+    // and the DISJUNCTION DECIDES ACCEPTANCE, so the question is not "do the
+    // references complain" but "does any of them COMPILE the translation unit".
+    // ✔MEASURED 2026-09-02, each reference invoked SEPARATELY, compile-only, on
+    // the whole position axis (ordinary declarator, struct member, label, macro
+    // argument, `#if` operand, `#pragma` line, macro parameter name, object-like
+    // and non-variadic replacement lists):
+    //
+    //   reference             DEFAULT                         STRICT
+    //   gcc 13.3.0 (WSL)      warning, rc 0                   -pedantic-errors: error
+    //   gcc 13.2.0 (mingw)    warning, rc 0                   -pedantic-errors: error
+    //   clang 18.1.3 (WSL)    va-opt: warning rc 0            -pedantic-errors: error
+    //                         va-args: SILENT rc 0 (-Wpedantic warns)
+    //   MSVC 19.51.36252      C5100/C5108 warning, rc 0       /W4 /WX: C2220 error
+    //
+    // EVERY reference ACCEPTS at its default settings and EVERY ONE errors only
+    // in its strict mode. Refusing outright would put DSS ABOVE the union --
+    // rejecting a program all three compile -- and staying silent leaves it
+    // BELOW the union on the diagnostic axis, which is where it was. A Warning
+    // is level on both axes at once, and `--warnings-as-errors` reproduces the
+    // strict arm exactly, so the reference's `-pedantic-errors` posture is
+    // available rather than imposed. ISO C agrees and does not force the other
+    // answer: 5.1.1.3 requires a DIAGNOSTIC for a constraint violation, and 4p3
+    // lets a conforming implementation translate the program after issuing one.
+    //
+    // ⚠ NOT reached from an ELIDED conditional branch, and that is measured too,
+    // not assumed: `#if 0` / `int __VA_ARGS__ = 1;` / `#endif` is SILENT on all
+    // four references. Both call sites sit under `stackActive()`, which is the
+    // same reachability gate `#error`/`#pragma`/`#line` already use (C 6.10p1).
+    //
+    // ⚠ The message names no language and no standard clause: the spelling is
+    // whatever the active language document declares, so a citation here would
+    // be a source-language assumption baked into a language-agnostic pass.
+    void reportSpecialVariadicIdentifier(Token const&       t,
+                                         std::string const& spelling) {
+        emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+               t.span,
+               std::string{"'"} + spelling
+                   + "' may appear only in the replacement list of a variadic "
+                     "function-like macro",
+               DiagnosticSeverity::Warning);
+    }
+
+    // Scan `[from, to)` -- a whole directive LINE -- and report every 6.10.5p5
+    // violation on it. ⚠ The caller EXCLUDES `#define` and `#undef`: those two
+    // own their operand's diagnostic (`handleDefine` / `handleUndef` /
+    // `parseParamList` / `validateVaOpt`), and a `#define` of a VARIADIC
+    // function-like macro carries the ONE legitimate position, so a blanket line
+    // scan there would fire on correct code. Every other directive line -- known
+    // or unknown -- is covered here by construction, so a directive added later
+    // is covered without being remembered.
+    void scanLineForSpecialVariadicIdentifiers(std::vector<Token> const& in,
+                                               std::size_t from,
+                                               std::size_t to) {
+        for (std::size_t k = from; k < to && k < in.size(); ++k) {
+            if (std::string const* s = specialVariadicSpelling(in[k])) {
+                reportSpecialVariadicIdentifier(in[k], *s);
+            }
+        }
     }
 
     // ── TF-C82 (D-PP-PRAGMA-REGISTRY): the ONE pragma sink ────────────────────
@@ -4739,6 +4865,29 @@ private:
         if (p >= end || isNewline(in[p])) return end;
         const std::string_view word = text(in[p]);
 
+        // D-PP-VA-SPECIAL-IDENTIFIER-OUTSIDE-REPLACEMENT-LIST: the DIRECTIVE-LINE
+        // half of the axis -- `#if __VA_ARGS__`, `#if defined(__VA_ARGS__)`,
+        // `#pragma __VA_ARGS__`, and every other directive line, known or not.
+        // ✔MEASURED: all four references diagnose each of these and none of them
+        // refuses the translation unit at its default settings.
+        //
+        // ★ PLACED ABOVE THE CONDITIONAL DISPATCH ON PURPOSE, with its OWN
+        // `stackActive()` test: the `#if`/`#elif`/`#ifdef` family is dispatched
+        // unconditionally (it must track nesting inside a dead branch), so a
+        // check placed below the gate would never see a live `#if`'s operand.
+        // The explicit gate is what keeps an ELIDED branch silent, which is the
+        // measured reference behaviour and the same C 6.10p1 reachability rule
+        // `#error`/`#pragma`/`#line` follow.
+        //
+        // ⚠ `#define` and `#undef` are EXCLUDED because their operand already has
+        // an owner -- see `scanLineForSpecialVariadicIdentifiers`. Excluding them
+        // is what keeps a correct `#define V(...) __VA_ARGS__` silent and keeps
+        // one occurrence to one diagnostic.
+        if (stackActive() && word != cfg().defineDirective
+            && word != cfg().undefDirective) {
+            scanLineForSpecialVariadicIdentifiers(in, p, end);
+        }
+
         // FC14 (MF-3): the conditional-compilation directives are dispatched
         // UNCONDITIONALLY -- they must always update `condStack_` so nesting is
         // tracked correctly even inside a dead branch (an `#if` nested in an
@@ -5213,7 +5362,7 @@ private:
         // line). `liftRun` additionally stamps `spacedBefore` from this run's
         // trivia, so a `#`-stringize reached from a directive operand spells the
         // same as in the body.
-        std::vector<ExpToken> expanded = expand(liftRun(toks), 0);
+        std::vector<ExpToken> expanded = expand(liftRun(toks));
         std::vector<Token> out;
         out.reserve(expanded.size());
         // FC15 paste residuals: backstop drop of any stray placemarker (see
@@ -5566,23 +5715,71 @@ private:
             return;
         }
 
-        // FC18a (D-PP-VA-OPT, C23 6.10.5p5): `__VA_OPT__` is not an ordinary
-        // identifier -- it may occur ONLY as the introducer of a
-        // va-opt-replacement inside a variadic macro's replacement list, so it can
-        // never be a macro NAME. Same posture as the two guards above and the same
-        // reason: honoring the `#define` would shadow a construct the engine
-        // implements, leaving one spelling with two meanings. ✔MEASURED: cl 19.51
-        // answers C4117 ("reserved, '#define' ignored") and clang-18/clang-19/
-        // gcc-13 all reject it under -pedantic-errors. Config-driven name, no
-        // hard-coded spelling.
+        // C23 6.10.5p5: the VARIADIC CATCH-ALL identifier as a macro NAME. This is
+        // a constraint violation for exactly the reason the ordinary-text arm is
+        // -- a macro name is not a replacement list -- and it was the one
+        // `#define` shape that used to pass in complete silence.
+        //
+        // ★★ WARNING, AND IT FALLS THROUGH TO DEFINE THE MACRO. Same posture and
+        // same argument as the predefined-macro arm above, and it is the posture
+        // the MEASUREMENT compels rather than the one that is tidiest.
+        // ✔MEASURED 2026-09-02, each reference invoked SEPARATELY, `#define
+        // __VA_ARGS__ 42` compile-only: gcc 13.3.0 (WSL), gcc 13.2.0 (mingw) and
+        // clang 18.1.3 all WARN and exit 0, and `_Static_assert(__VA_ARGS__ ==
+        // 42)` PASSES on all three -- the definition takes effect. cl 19.51.36252
+        // answers C4117 ("macro name '__VA_ARGS__' is reserved, '#define'
+        // ignored") and also exits 0. So the references are UNANIMOUS on
+        // ACCEPTANCE and SPLIT on MEANING (gcc/clang honour the definition, MSVC
+        // discards it). The disjunction governs acceptance, so refusing is out;
+        // the meaning split is not this arm's to settle, so DSS keeps the
+        // behaviour it already had -- the gcc/clang one -- and only adds the
+        // diagnostic that was missing.
+        // ⚠ Deliberately NOT routed through `scanLineForSpecialVariadicIdentifiers`:
+        // a `#define` line's replacement list is the ONE legitimate position, so
+        // this line is checked operand by operand, never wholesale.
+        if (!cfg().variadicArgsName.empty() && name == cfg().variadicArgsName) {
+            reportSpecialVariadicIdentifier(in[nameIdx], name);
+        }
+
+        // FC18a (D-PP-VA-OPT, C23 6.10.5p5): the va-opt introducer as a macro
+        // NAME -- the TWIN of the arm directly above, and now the SAME answer.
+        //
+        // ★★ THIS USED TO BE A REFUSAL AND IS NOW A FALL-THROUGH WARNING
+        // ([[D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION]],
+        // operator ruling 2026-09-02). The refusal's own comment already recorded
+        // that it sat ABOVE the union on acceptance and was kept only because
+        // relaxing it meant settling a MEANING split. The split was then measured
+        // rather than assumed, and it is 3-1, not 2-2:
+        //
+        //   `#define __VA_OPT__ 42` then `_Static_assert(__VA_OPT__ == 42)`
+        //   ✔MEASURED 2026-09-02, each reference invoked SEPARATELY:
+        //     gcc 13.3.0 (WSL)     warns, rc 0, assertion PASSES  -> HONOURS
+        //     gcc 13.2.0 (mingw)   warns, rc 0, assertion PASSES  -> HONOURS
+        //     clang 18.1.3         warns, rc 0, assertion PASSES  -> HONOURS
+        //     cl 19.51.36252       C4117 "'#define' ignored"      -> DISCARDS
+        //   and a PURE-ACCEPTANCE probe (the name defined and never used) is rc 0
+        //   on all FOUR. So acceptance is unanimous and the meaning is 3-1.
+        //
+        // DSS follows the three. ⚠ THE TIE-BREAK IS NOT THE HEAD-COUNT: MSVC's
+        // alternative SILENTLY DISCARDS code the author wrote, which is the one
+        // failure class this project refuses outright. Same reasoning that
+        // decided `#pragma once` -- the disjunction decides acceptance, and where
+        // meaning splits, a reference that drops the program on the floor does not
+        // get to be the model.
+        //
+        // ⚠⚠ A DELIBERATE, RULED DIVERGENCE FROM MSVC IS BORN HERE: after this
+        // arm a translation unit can MEAN different things under DSS and under
+        // cl. It is recorded in the row and pinned by a test, so a later cycle
+        // applying the disjunction by reflex cannot quietly "fix" it back.
+        //
+        // ⚠ The operator is NOT lost by honouring the definition -- it is matched
+        // by CONFIG TEXT inside a variadic replacement list (`isVaOptName`),
+        // never through `table_`, so `#define __VA_OPT__ 42` leaves
+        // `__VA_OPT__( ... )` working exactly as before. ✔MEASURED on gcc, mingw
+        // gcc and clang, which all keep the operator across the definition too.
+        // Config-driven name, no hard-coded spelling.
         if (!cfg().vaOptName.empty() && name == cfg().vaOptName) {
-            emitPP(rep_,
-                   DiagnosticCode::P_PreprocessorOperatorNameNotDefinable,
-                   synth_->id(), in[nameIdx].span,
-                   std::string{"'"} + name
-                       + "' is a variadic-macro operator this implementation "
-                         "provides and may not be #defined");
-            return;
+            reportSpecialVariadicIdentifier(in[nameIdx], name);
         }
 
         MacroDef def;
@@ -5634,32 +5831,91 @@ private:
         def.text    = std::move(repText);
         def.spacing = std::move(repSpacing);
 
-        // The variadic catch-all identifier (`__VA_ARGS__`) is valid ONLY inside
-        // a VARIADIC macro's replacement (C 6.10.3p5 / 6.10.3.1p2 constraint:
-        // the identifier `__VA_ARGS__` shall occur only in the replacement-list
-        // of a function-like macro that uses the ellipsis notation). Reject it
-        // HERE, at definition time, in an object-like OR a non-variadic
-        // function-like macro -- catching the misuse where it is DECLARED rather
-        // than waiting for a (possibly absent) invocation. Matched by TEXT (it is
-        // an ordinary identifier), and only when the language actually declares a
-        // catch-all spelling (`variadicArgsName` non-empty).
-        if (!def.isVariadic && !cfg().variadicArgsName.empty()) {
-            for (Token const& r : def.replacement) {
-                if (isWord(r) && text(r) == cfg().variadicArgsName) {
-                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
-                           synth_->id(), r.span,
-                           std::string{"'"} + cfg().variadicArgsName
-                               + "' may appear only in a variadic macro's "
-                                 "replacement: " + name);
-                    return;
-                }
-            }
-        }
-
         // FC18a (D-PP-VA-OPT): every va-opt-replacement constraint, checked HERE
         // at definition time -- where the construct is WRITTEN, rather than at a
         // possibly-absent invocation. `validateVaOpt` emits its own diagnostic.
-        if (!validateVaOpt(def, name)) return;
+        //
+        // ⚠ IT ANSWERS ONLY FOR A *VARIADIC* MACRO. Every rule it enforces is a
+        // rule about a va-opt-REPLACEMENT, and by 6.10.5p5 no such construct
+        // exists outside a variadic replacement list -- see its own first lines.
+        // The non-variadic occurrence is a plain identifier and is reported by
+        // the position scan below, not by it.
+        if (!validateVaOpt(def)) return;
+
+        // C23 6.10.5p5 in the LAST position the constraint reaches: a
+        // replacement list that is NOT a variadic macro's
+        // ([[D-PP-VA-SPECIAL-IDENTIFIER-IN-A-NONVARIADIC-BODY-REFUSED-ABOVE-THE-UNION]],
+        // [[D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION]]).
+        //
+        // ★ THE GATE IS `!def.isVariadic`, NOT "is this a shadowed parameter",
+        // and that is the position the clause actually names: p5 permits these
+        // spellings in the replacement list of a function-like macro that uses
+        // the ellipsis notation, so inside a VARIADIC macro the position is
+        // legitimate however the token is then read -- operator, catch-all, or a
+        // parameter that shadows either. Outside one it never is.
+        //
+        // ★★ THIS IS NOW THE *ONLY* ANSWER TO THE NON-VARIADIC POSITION, AND IT
+        // IS A WARNING. Two refusals used to run in front of it -- an
+        // `emit`-and-`return` for `variadicArgsName` here, and `validateVaOpt`'s
+        // `!def.isVariadic` arm for `vaOptName` -- so `#define OBJ __VA_ARGS__`
+        // and `#define OBJ __VA_OPT__` were rejected outright and this scan only
+        // ever ran on a shadowed parameter reference. THE OPERATOR RULED
+        // 2026-09-02: ACCEPT AND WARN, the same treatment the sibling row's four
+        // shapes got. Both refusals are gone and the ONE position check answers
+        // both spellings, which is the point -- answering one constraint two
+        // different ways depending on which spelling it is was the defect that
+        // preceded the sibling row.
+        //
+        // ✔MEASURED 2026-09-02 (P54, lane `ob`), each reference invoked
+        // SEPARATELY, compile-only, DEFAULT and STRICT, with the macro NEVER
+        // USED so no reference's MEANING choice could masquerade as a refusal:
+        //
+        //   shape                          gcc    mingw  clang        cl
+        //   #define OBJ  __VA_ARGS__       warn   warn   SILENT       C5100
+        //   #define OBJ  __VA_OPT__        warn   warn   warn         C5108
+        //   #define OBJ  __VA_OPT__(x)     warn   warn   warn         C5108
+        //   #define F(a) __VA_ARGS__       warn   warn   SILENT       C5100
+        //   #define F(a) __VA_OPT__(a)     warn   warn   warn         C5108
+        //   #define F(a) __VA_OPT__        warn   warn   ERROR rc 1   C5108
+        //
+        // Every cell but the last is rc 0; every one becomes an error under
+        // `-pedantic-errors` / `/W4 /WX`. ⚠ THE LAST ROW REFUTES "all four
+        // accept": clang 18.1.3 adds `error: missing '(' following __VA_OPT__`
+        // for a BARE va-opt spelling in a FUNCTION-LIKE non-variadic body (and
+        // NOT in an object-like one -- `#define OBJ __VA_OPT__` is rc 0 there).
+        // The disjunction still says ACCEPT 3-1, which is why DSS accepts it,
+        // and the union here is per-CONSTRUCT rather than per-reference exactly
+        // as the sibling row measured from the other side.
+        //
+        // ✔MEASURED, THE MEANING: the token is an ORDINARY IDENTIFIER and passes
+        // through verbatim. `#define OBJ __VA_ARGS__` + `int __VA_ARGS__ = 42;`
+        // preprocesses to `__VA_ARGS__` and the built program exits 0 on gcc,
+        // mingw gcc and clang. DSS already answers this without a change:
+        // `isVaArgsName` and `isVaOptName` both require `def.isVariadic`, so
+        // neither engine construct is reachable from a non-variadic body.
+        // ⚠ TWO REFERENCES DIVERGE ON MEANING AND DSS FOLLOWS NEITHER'S LOSS:
+        // cl 19.51.36252 DELETES the token (`int = 42;`, `return == 42`), and
+        // clang ELIDES a used `__VA_OPT__( ... )` even in a non-variadic macro
+        // (`F(42)` -> nothing, and the file then fails to compile) where gcc and
+        // mingw substitute the parameter and call it. Both alternatives silently
+        // drop code the author wrote; gcc's is 2-1 among the references that
+        // compile the use, and it is the reading that loses nothing.
+        //
+        // ✔MEASURED, THE COUNT: one report per SOURCE OCCURRENCE, never per
+        // expansion. gcc reports exactly TWO for `#define OBJ __VA_ARGS__` /
+        // `int __VA_ARGS__ = 42;` / `OBJ + OBJ` -- the replacement list and the
+        // declarator -- and DSS matches by construction, because this scan sees
+        // the definition once and `run()`'s scan checks the SOURCE token before
+        // expansion. Also unchanged: on `#define F(__VA_ARGS__) ((__VA_ARGS__)
+        // + 1)` gcc and mingw gcc report TWO (the parameter name and the use)
+        // and on the variadic `#define F(__VA_OPT__, ...) (__VA_OPT__)` ONE.
+        if (!def.isVariadic) {
+            for (Token const& r : def.replacement) {
+                if (std::string const* s = specialVariadicSpelling(r)) {
+                    reportSpecialVariadicIdentifier(r, *s);
+                }
+            }
+        }
 
         // D-PP-INCOMPATIBLE-REDEFINITION-IS-FATAL: an incompatible redefinition is
         // a C 6.10.3p2 CONSTRAINT VIOLATION, so a diagnostic is REQUIRED -- but it
@@ -5713,8 +5969,6 @@ private:
     // language declares no va-opt construct at all.
     //
     // The constraints, each named where it is checked below:
-    //   6.10.5p5     -- may occur ONLY in a variadic function-like macro's
-    //                   replacement list (so: not object-like, not non-variadic).
     //   6.10.5.1p3   -- must occur as `__VA_OPT__ ( pp-tokens_opt )`: a `(` must
     //                   follow, and its matching `)` must exist.
     //   6.10.5.1p3   -- the content shall NOT contain another `__VA_OPT__`.
@@ -5727,22 +5981,57 @@ private:
     // told `expected 'ParenClose'` -- a true statement about the parser's stack
     // that named neither the construct nor the reason. Every arm below names
     // `__VA_OPT__` and the rule it broke.
-    [[nodiscard]] bool validateVaOpt(MacroDef const& def,
-                                     std::string const& macroName) {
+    //
+    // ⓘ IT TAKES NO MACRO NAME, and that is a consequence of the ruling above
+    // rather than an oversight. The one arm that named the macro was the
+    // 6.10.5p5 refusal ("may appear only in a variadic macro's replacement:
+    // NAME"), and it is gone; every surviving arm reports a malformed va-opt
+    // construct and points its caret AT the construct, where the name adds
+    // nothing the span does not already give. A dead parameter kept "for later"
+    // is how a signature stops describing what a function needs.
+    [[nodiscard]] bool validateVaOpt(MacroDef const& def) {
         if (cfg().vaOptName.empty()) return true;   // language has no va-opt
+        // ★★ NOT A VARIADIC MACRO ⇒ THERE IS NO VA-OPT-REPLACEMENT HERE TO
+        // CONSTRAIN, so every rule below is inapplicable rather than violated
+        // ([[D-PP-VA-SPECIAL-IDENTIFIER-IN-A-NONVARIADIC-BODY-REFUSED-ABOVE-THE-UNION]],
+        // operator ruling 2026-09-02). 6.10.5.1p3's grammar governs "a va-opt
+        // replacement", and 6.10.5p5 lets one exist ONLY in the replacement list
+        // of a function-like macro using the ellipsis notation -- so outside one
+        // the spelling is an ordinary identifier that happens to be spelled that
+        // way, and asking whether a `(` follows it is asking a question about a
+        // construct that is not present.
+        //
+        // ⚠ THIS RETURN IS WHAT RETIRES THE REFUSAL, AND IT DOES NOT GO SILENT.
+        // The 6.10.5p5 constraint IS still violated and is still reported: the
+        // `!def.isVariadic` position scan in `handleDefine` -- the caller,
+        // immediately after this call -- draws the same Warning every other
+        // illegal position gets, for BOTH spellings, once per occurrence. This
+        // function used to answer the same question with an Error and a
+        // `return false`, which put DSS above the union.
+        //
+        // ✔MEASURED 2026-09-02 (P54, lane `ob`) that the structural rules really
+        // are inapplicable and not merely unenforced -- the full table is in the
+        // caller. `#define OBJ __VA_OPT__(x)` and `#define F(a) __VA_OPT__` are
+        // rc 0 on gcc 13.3.0, gcc 13.2.0 (mingw) and cl 19.51.36252 (clang
+        // errors on the second, and the disjunction still says accept), and a
+        // USED `#define F(a) __VA_OPT__(a)` expands on gcc and mingw gcc to a
+        // CALL of a function named `__VA_OPT__` with the parameter substituted
+        // -- the construct is inert there, exactly as an ordinary identifier is.
+        if (!def.isVariadic) return true;
+        // ⚠ SHADOWED
+        // ([[D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION]]):
+        // this macro declares the spelling as a PARAMETER, so every occurrence in
+        // its replacement list is a parameter reference and NONE of the va-opt
+        // construct rules apply to it -- `isVaOptName` reaches the same verdict
+        // through the same predicate at substitution time. The 6.10.5p5 Warning
+        // is still emitted per occurrence: by `parseParamList` for the name, and
+        // by `handleDefine`'s non-variadic replacement scan for each use. So
+        // skipping here loses no diagnostic.
+        if (declaresSpecialParam(def, cfg().vaOptName)) return true;
         const std::size_t n = def.replacement.size();
         for (std::size_t i = 0; i < n; ++i) {
             Token const& r = def.replacement[i];
             if (!isVaOptWord(r)) continue;
-            // 6.10.5p5: only inside a VARIADIC function-like macro.
-            if (!def.isVariadic) {
-                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
-                       synth_->id(), r.span,
-                       std::string{"'"} + cfg().vaOptName
-                           + "' may appear only in a variadic macro's "
-                             "replacement: " + macroName);
-                return false;
-            }
             std::size_t open = 0;
             const std::size_t close = findVaOptClose(def.replacement, i, open);
             if (close == vaOptNpos()) {
@@ -5880,19 +6169,50 @@ private:
                 return false;
             }
             std::string param{text(in[q])};
-            // C 6.10.3p6: the configured catch-all identifier (`__VA_ARGS__`)
-            // shall NOT be used as a parameter NAME. Reject it loudly so the
-            // substitute() invariant ("`__VA_ARGS__` is not a valid parameter
-            // name") actually holds -- otherwise `#define F(__VA_ARGS__) ...`
-            // silently binds a parameter the variadic catch-all later shadows.
-            if (!cfg().variadicArgsName.empty()
-                && param == cfg().variadicArgsName) {
-                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
-                       synth_->id(), in[q].span,
-                       std::string{"'"} + cfg().variadicArgsName
-                           + "' may not be used as a macro parameter name: "
-                           + macroName);
-                return false;
+            // C23 6.10.5p5: EITHER special variadic spelling as a parameter NAME.
+            // A parameter list is not a replacement list, so both are constraint
+            // violations -- but both are DIAGNOSED AND ACCEPTED, and the
+            // parameter binds
+            // ([[D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION]],
+            // operator ruling 2026-09-02). One arm for both spellings, because
+            // answering one constraint two different ways depending on which
+            // spelling it is was the defect that preceded this.
+            //
+            // ★★ THE SHADOW RULE, WHICH IS WHAT MAKES ACCEPTANCE SAFE. Declaring
+            // the spelling as a parameter SHADOWS the catch-all / the operator
+            // throughout THIS macro's replacement list -- `declaresSpecialParam`
+            // is consulted by `isVaArgsName`, `isVaOptName` and `validateVaOpt`,
+            // so the parameter always binds and the "one spelling, two meanings"
+            // hazard the old refusal cited cannot arise. It is not a preference:
+            // it is what the references that accept each shape actually do.
+            //
+            // ✔MEASURED 2026-09-02, each reference invoked SEPARATELY, run where
+            // it links (gcc/mingw/clang) and compile-only for cl:
+            //
+            //   shape                                      gcc  mingw  clang  cl
+            //   F(__VA_ARGS__) -> ((__VA_ARGS__)+1) == 42  PARAM PARAM PARAM PARAM
+            //   F(__VA_OPT__)  -> ((__VA_OPT__)+1)  == 42  PARAM PARAM  err  PARAM
+            //   F(__VA_OPT__)  -> 42 (name unused)          ok    ok    ok    ok
+            //   F(__VA_ARGS__, ...) -> (__VA_ARGS__)       dup   dup   PARAM PARAM
+            //   F(__VA_OPT__,  ...) -> (__VA_OPT__)        PARAM PARAM  err  PARAM
+            //   F(__VA_OPT__,  ...) -> (__VA_OPT__ (0))    PARAM PARAM  OPER  PARAM
+            //
+            // Every reference that gets past preprocessing binds the PARAMETER,
+            // except clang on the last row (where `__VA_OPT__` is followed by
+            // `(`, clang reads the operator). ⇒ PARAM is the 3-1 answer on the
+            // only row where the two readings differ observably, so the shadow
+            // rule is the measured majority and not a tidy invention. `dup` is
+            // gcc's "duplicate macro parameter __VA_ARGS__" -- gcc names its own
+            // variadic parameter `__VA_ARGS__` internally, so the collision is an
+            // artefact of gcc's implementation, not a reading of the standard;
+            // clang and cl accept the same line and bind the parameter.
+            //
+            // ⚠ The diagnostic is `reportSpecialVariadicIdentifier` -- the SAME
+            // 6.10.5p5 Warning every other illegal position gets, so relaxing the
+            // refusal did not go silent. gcc and clang report the parameter name
+            // AND each replacement-list occurrence; so does DSS.
+            if (std::string const* s = specialVariadicSpelling(in[q])) {
+                reportSpecialVariadicIdentifier(in[q], *s);
             }
             for (std::string const& seen : out) {
                 if (seen == param) {
@@ -6218,20 +6538,34 @@ private:
                          "implementation provides and may not be #undef'd");
             return;
         }
-        // FC18a (D-PP-VA-OPT): the `#undef` half of the `__VA_OPT__` name guard.
-        // An `#undef __VA_OPT__` that SUCCEEDED would claim to remove something
-        // that was never in the macro table, and would read as license to then
-        // `#define` it -- the same one-spelling-two-meanings hazard the `#define`
-        // arm refuses. ✔MEASURED: cl 19.51 answers C4117 ("reserved, '#undef'
-        // ignored"); clang/gcc reject under -pedantic-errors.
+        // C23 6.10.5p5: the `#undef` half of the variadic catch-all name arm in
+        // `handleDefine`. An `#undef` operand is not a replacement list either.
+        // WARNING and FALL THROUGH to the `table_.erase` below, for the same
+        // measured reason: every reference diagnoses this and every reference
+        // exits 0 at its default settings.
+        if (!cfg().variadicArgsName.empty() && name == cfg().variadicArgsName) {
+            reportSpecialVariadicIdentifier(in[p], name);
+        }
+
+        // FC18a (D-PP-VA-OPT): the `#undef` half of the `__VA_OPT__` name arm.
+        // WARNING and FALL THROUGH to the `table_.erase` below, exactly like the
+        // catch-all twin above -- see the `#define` twin in `handleDefine` for
+        // the measurement and the ruling that govern both
+        // ([[D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION]]).
+        //
+        // ⚠ THE OLD REFUSAL'S STATED REASON -- that an `#undef` which SUCCEEDED
+        // would "claim to remove something that was never in the macro table" --
+        // is answered by what the directive actually removes. `table_` is the
+        // PROGRAM's macro table; the va-opt operator lives in the CONFIG and is
+        // matched by text inside a variadic replacement list, so erasing the name
+        // from `table_` removes only whatever the program itself put there and
+        // cannot reach the operator. ✔MEASURED 2026-09-02 that this is also the
+        // reference behaviour: with `#undef __VA_OPT__` at the top of the file,
+        // `#define V(a, ...) (a __VA_OPT__(+ 1))` still elides and still fires on
+        // gcc 13.3.0, gcc 13.2.0 (mingw), clang 18.1.3 and cl 19.51.36252 -- all
+        // four keep the operator across the `#undef`, and all four exit 0.
         if (!cfg().vaOptName.empty() && name == cfg().vaOptName) {
-            emitPP(rep_,
-                   DiagnosticCode::P_PreprocessorOperatorNameNotDefinable,
-                   synth_->id(), in[p].span,
-                   std::string{"'"} + name
-                       + "' is a variadic-macro operator this implementation "
-                         "provides and may not be #undef'd");
-            return;
+            reportSpecialVariadicIdentifier(in[p], name);
         }
         table_.erase(name);
     }
@@ -6342,9 +6676,55 @@ private:
         }
         return -1;
     }
+    // ★★ THE SHADOW PREDICATE
+    // ([[D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION]]).
+    //
+    // `#define F(__VA_ARGS__, ...)` and `#define F(__VA_OPT__, ...)` are
+    // accepted (`parseParamList` warns and binds), so ONE spelling can now name
+    // both a declared parameter and an engine-provided construct inside the same
+    // replacement list. The DECLARED PARAMETER WINS: it is written in the macro's
+    // own signature, so reading it as anything else would silently ignore what
+    // the author asked for -- the failure class this project refuses.
+    //
+    // ✔MEASURED 2026-09-02 (table in `parseParamList`): every reference that gets
+    // a collision past preprocessing binds the parameter -- gcc 13.3.0, gcc
+    // 13.2.0 (mingw) and cl 19.51.36252 on `#define F(__VA_OPT__, ...)`, clang
+    // 18.1.3 and cl on `#define F(__VA_ARGS__, ...)`. The one row where the two
+    // readings are observably different is `(__VA_OPT__ (0))`, and there gcc,
+    // mingw gcc and cl all bind the PARAMETER (their errors are the downstream
+    // `7 (0)` type error, not a preprocessing refusal) while only clang reads the
+    // operator: 3-1 for the parameter.
+    //
+    // ⚠ ONE PREDICATE, THREE CALLERS AND NO FOURTH -- `isVaArgsName` and
+    // `isVaOptName` at SUBSTITUTION time, `validateVaOpt` at DEFINITION time. A
+    // shadow honoured at substitution but not at definition would refuse the
+    // very macro it then substitutes correctly, so the definition-time check
+    // consults this function rather than a copy of its reasoning, and "accept
+    // the parameter NAME, then refuse every USE of it" is unrepresentable.
+    //
+    // ⚠ THERE WAS A FOURTH AND IT IS GONE, WHICH IS WHY THE COUNT IS WRITTEN
+    // HERE: `handleDefine`'s non-variadic catch-all-in-replacement guard needed
+    // this predicate only to avoid REFUSING a shadowed parameter reference, and
+    // that guard was retired when the operator ruled the non-variadic position
+    // accept-and-warn
+    // ([[D-PP-VA-SPECIAL-IDENTIFIER-IN-A-NONVARIADIC-BODY-REFUSED-ABOVE-THE-UNION]]).
+    // Its successor -- the `!def.isVariadic` position scan -- deliberately does
+    // NOT consult this predicate: it reports by POSITION, and gcc reports the
+    // shadowed parameter name AND each use, so suppressing the use would lose a
+    // diagnostic the references emit.
+    [[nodiscard]] static bool declaresSpecialParam(MacroDef const&    def,
+                                                   std::string const& spelling) {
+        if (spelling.empty()) return false;
+        for (std::string const& p : def.params) {
+            if (p == spelling) return true;
+        }
+        return false;
+    }
+
     [[nodiscard]] bool isVaArgsName(Token const& r, MacroDef const& def) const {
         return def.isVariadic && isWord(r) && !cfg().variadicArgsName.empty()
-            && text(r) == cfg().variadicArgsName;
+            && text(r) == cfg().variadicArgsName
+            && !declaresSpecialParam(def, cfg().variadicArgsName);
     }
 
     // ── FC18a (D-PP-VA-OPT, C23 6.10.5.1) ────────────────────────────────────
@@ -6360,9 +6740,12 @@ private:
             && text(r) == cfg().vaOptName;
     }
     // The SUBSTITUTION-time form: a va-opt is only ever acted on inside a
-    // variadic macro, which `handleDefine` has already guaranteed.
+    // variadic macro, which `handleDefine` has already guaranteed -- and only
+    // when this macro's own parameter list has not claimed the spelling (see
+    // `declaresSpecialParam`).
     [[nodiscard]] bool isVaOptName(Token const& r, MacroDef const& def) const {
-        return def.isVariadic && isVaOptWord(r);
+        return def.isVariadic && isVaOptWord(r)
+            && !declaresSpecialParam(def, cfg().vaOptName);
     }
 
     // Locate the `)` that closes the va-opt whose introducer sits at `introIdx`
@@ -7539,43 +7922,147 @@ private:
     // The `depth` backstop is defense-in-depth: a correct hide set already bounds
     // recursion, but a malformed/over-deep chain still fails LOUD here rather than
     // downstream at the parser.
-    std::vector<ExpToken> expand(std::vector<ExpToken> in, int depth) {
-        std::vector<ExpToken> out;
-        if (depth > 256) {                 // pathological-NESTING backstop
-            // FAIL LOUD (FC13 cycle 2 review fold): emit a positioned
-            // diagnostic at the backstop instead of silently returning the
-            // input verbatim. A silently-truncated deep nest otherwise fails
-            // DOWNSTREAM at the parser with an inscrutable error; surfacing it
-            // HERE attributes the real cause (macro expansion nested too deep)
-            // to the PP. Position on the first token of this run (the deepest
-            // re-entry's lead token) when available.
-            //
-            // Under the PRECISE hide set a finite macro CHAIN (`M0`->...->`Mn`)
-            // expands ITERATIVELY in one frame (each step splices + rescans,
-            // depth stays flat) and terminates correctly -- so this backstop no
-            // longer fires on a finite chain (that was a cycle-2 artifact of the
-            // recursive engine). What still recurses is NESTING: argument
-            // pre-expansion (`expand(arg, depth+1)`), so a pathological
-            // 256-deep-nested argument (`F(F(F(...F(0)...)))`) trips this guard.
-            // Defense-in-depth: the hide set already bounds macro recursion; this
-            // catches an over-deep nest (or an internal bug) loudly, not silently.
-            emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported, synth_->id(),
-                   (in.empty() ? SourceSpan::empty(0) : in.front().tok.span),
-                   "macro expansion nesting too deep (>256)");
-            truncated_ = true;   // stream is now truncated — PP fatal
-            return in;
-        }
+    // ── THE EXPANSION STACK LIVES ON THE HEAP, NOT IN CALL FRAMES ────────────
+    //
+    // ★★★ OPERATOR RULING 2026-09-02: *"it's well known to not use recursive
+    // structures in the compiler because big projects like sqlite will for sure
+    // explode the stack"*. Argument pre-expansion is the one place this expander
+    // nests -- `F(F(F(...F(0)...)))` needs one level per source nesting level --
+    // and it used to spend a CALL FRAME per level. A depth that is a function of
+    // the INPUT must not be paid in call frames: the ceiling is then the host's
+    // thread stack, which no diagnostic can see coming and which differs per
+    // host, per build and per thread.
+    //
+    // ⚠⚠ THE DEFECT THIS REPLACES WAS REAL AND MEASURED, and it was NOT a
+    // regression. ✔MEASURED 2026-09-02 (P54, lane `ob`), Windows Debug: the
+    // recursive form completed a 252-deep nest on a default ~1 MiB thread and
+    // died at 256 with STATUS_STACK_OVERFLOW (rc 0xC00000FD) -- FOUR levels short
+    // of its own `>256` backstop, so the loud refusal was unreachable on that
+    // thread and the "fail loud" guarantee was a crash instead. ✔MEASURED
+    // IDENTICAL (252) with this file restored to the cycle base commit, so the
+    // margin was not consumed by any P54 change: a latent defect exposed, not one
+    // introduced. It did not bite through the CLI only because `program.cpp` runs
+    // every CU inside `substrate::callOnLargeStack(kDeepRecursionStackBytes, …)`
+    // -- i.e. the old answer was a BIGGER STACK, which is exactly what the ruling
+    // above rejects, since a bigger stack still fails for a deeper input.
+    //
+    // ★ WHAT REPLACES IT. `ExpandFrame` is one suspended expansion; the frames
+    // live in a `std::deque` (heap, and reference-stable across push/pop at the
+    // ends, which a `vector` is not -- `f` below is held across a push). A frame
+    // that needs an argument pre-expanded records everything it will need
+    // afterwards in `PendingCall`, pushes a child frame, and is resumed when the
+    // child's `out` comes back. Depth now costs HEAP, which is bounded and
+    // reportable, instead of call frames, which are neither.
+    //
+    // ⚠ THE LIMIT STILL EXISTS AND STILL FAILS LOUD -- it is now an explicit
+    // counter (`stack.size()`) checked where a child WOULD be pushed, rather than
+    // an accident of how many frames fit. The diagnostic, its code, its severity,
+    // its position and `truncated_` are unchanged, and the >256 ceiling is
+    // reached on ANY host and ANY thread rather than only on a large-stack one.
+    // ⓘ DECLARED HERE, USED BOTH HERE AND FAR BELOW. `PendingCall` stores one by
+    // value, so the type must be complete at this point; the rationale for the
+    // context itself (WHO IS MINTING RIGHT NOW) is documented at `mint_` /
+    // `MintScope`, where the save/restore rule lives.
+    struct MintContext {
+        ByteOffset  site   = 0;
+        ByteOffset  def    = 0;
+        bool        hasDef = false;
+        std::string name;
+    };
+
+    struct PendingCall {
+        MacroDef const*                    def = nullptr;
+        // ⓘ The macro's NAME is carried here because `MacroDef` does not hold
+        // one -- the table's KEY is the name -- and the mint context needs it.
+        std::string                        name;
+        ExpToken                           t{};
+        HideSet                            hs{};
+        std::size_t                        past       = 0;
+        std::size_t                        namedCount = 0;
+        std::vector<std::vector<ExpToken>> args;
+        std::vector<ExpToken>              separators;
+        std::vector<std::vector<ExpToken>> rawArgs;
+        std::vector<ExpToken>              rawVaArgs;
+        std::vector<std::vector<ExpToken>> expandedArgs;   // one per `args` entry
+        std::size_t                        nextArg = 0;
+        ByteOffset                         callInvOffset = 0;
+        // The mint context this invocation installed, and the one to put back
+        // when it completes. ⚠ NOT a `MintScope`: the guard restores at end of
+        // BLOCK, and this context must stay installed while the CHILD frames run
+        // -- which is precisely what the recursive form did (the parent's scope
+        // was live across `expand(arg, depth + 1)`) and what `MintScope`'s own
+        // docblock describes. Save/restore is done by hand here so the lifetime
+        // follows the FRAME rather than the block.
+        MintContext                        savedMint;
+    };
+    struct ExpandFrame {
+        std::deque<ExpToken>       work;
+        std::vector<ExpToken>      out;
+        std::optional<PendingCall> call;
+    };
+
+    std::vector<ExpToken> expand(std::vector<ExpToken> in) {
         // D-PERF-1: the working stream is a FRONT-CONSUMED deque -- the cursor is
         // ALWAYS the front. The loop consumes `work` strictly front-to-back and
         // every splice happens AT the front (`spliceOver(work, 0, ...)`), so a
         // pop_front + push_front is O(consumed + repl) per expansion instead of the
         // O(n) mid-vector tail-shift the old `std::vector` cursor paid PER
         // expansion -> the O(n^2) macro pass is gone. `out` still accumulates the
-        // passed-over tokens IN ORDER (byte-identical output). (The backstop above
-        // still reads/returns the vector `in`, so its truncation semantics stay
-        // exactly as before; `in` is moved-FROM here and not touched again.)
-        std::deque<ExpToken> work(std::make_move_iterator(in.begin()),
-                                  std::make_move_iterator(in.end()));
+        // passed-over tokens IN ORDER (byte-identical output).
+        std::deque<ExpandFrame> stack;
+        stack.emplace_back();
+        stack.back().work.assign(std::make_move_iterator(in.begin()),
+                                 std::make_move_iterator(in.end()));
+        in.clear();
+        std::vector<ExpToken> childOut;
+        bool                  haveChild = false;
+
+        for (;;) {
+        ExpandFrame& f = stack.back();
+        // The explicit depth counter: frame 0 is the caller's run, every deeper
+        // frame is one level of ARGUMENT pre-expansion. Recomputed each pass
+        // because the stack grows and shrinks under it.
+        const int depth = static_cast<int>(stack.size()) - 1;
+        std::deque<ExpToken>& work = f.work;
+
+        // ── RESUME: a child argument expansion has come back ──────────────────
+        if (f.call) {
+            if (haveChild) {
+                f.call->expandedArgs.push_back(std::move(childOut));
+                childOut.clear();
+                haveChild = false;
+                ++f.call->nextArg;
+            }
+            if (f.call->nextArg < f.call->args.size()) {
+                // ⚠ THE >256 CEILING, CHECKED WHERE THE CHILD WOULD BE PUSHED.
+                // Same diagnostic, same code, same severity, same position (the
+                // first token of the run that would have been the deepest
+                // re-entry) and the same `truncated_` as the recursive form's
+                // entry check -- and the deepest run is delivered VERBATIM,
+                // which is what `return in` did there.
+                std::vector<ExpToken> arg =
+                    std::move(f.call->args[f.call->nextArg]);
+                if (depth + 1 > 256) {
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported,
+                           synth_->id(),
+                           (arg.empty() ? SourceSpan::empty(0)
+                                        : arg.front().tok.span),
+                           "macro expansion nesting too deep (>256)");
+                    truncated_ = true;   // stream is now truncated — PP fatal
+                    childOut  = std::move(arg);
+                    haveChild = true;
+                    continue;            // deliver it to this same frame
+                }
+                stack.emplace_back();
+                stack.back().work.assign(std::make_move_iterator(arg.begin()),
+                                         std::make_move_iterator(arg.end()));
+                continue;                // step the child
+            }
+            // Every argument is pre-expanded: finish the invocation.
+            finishPendingCall(f);
+            continue;
+        }
+
         // TF-C82: THE emission chokepoint. Every token that leaves this frame is
         // stamped with the `#pragma pack` cap in effect AT THAT MOMENT — which is
         // what makes a `_Pragma("pack(4)")` sitting mid-run split the run
@@ -7597,8 +8084,13 @@ private:
                 // invocations.
                 noteNoOptimizeForToken(e.tok);
             }
-            out.push_back(std::move(e));
+            f.out.push_back(std::move(e));
         };
+        // ⚠ `suspended` is the ONE exit from this loop that is not "this frame is
+        // finished": it means the frame parked a `PendingCall` and a child must
+        // run first. Every other `continue` below still means what it always
+        // meant -- keep stepping THIS frame.
+        bool suspended = false;
         while (!work.empty()) {
             // Audit fix #2 (UAF ordering): COPY the front token before any
             // pop/splice below -- `t.tok`, `t.hide`, `t.invOffset`, `t.tok.span`
@@ -7740,6 +8232,16 @@ private:
             // original-source anchor propagated through every nesting level) and
             // to THIS macro's definition. One scope over both arms, so neither
             // can acquire a minting path the other's stamp does not cover.
+            // ⚠ CAPTURED BEFORE THE GUARD, and only the function-like path uses
+            // it. `MintScope` restores at end of BLOCK, which is right for every
+            // arm that finishes inside this loop iteration -- and wrong for the
+            // one arm that SUSPENDS, because the invocation's context has to stay
+            // installed while its argument children run (that is what the
+            // recursive form did, and what `MintScope`'s docblock describes). The
+            // suspension path re-installs the invocation context after the guard
+            // has unwound and hands `outerMint` to `PendingCall::savedMint`, so
+            // the restore follows the FRAME instead of the block.
+            MintContext const outerMint = mint_;
             MintScope const mintScope{*this, t.invOffset, def.definitionSite,
                                       def.hasDefinitionSite, name};
             if (!def.isFunctionLike) {
@@ -7883,53 +8385,124 @@ private:
                                      args[k].end());
                 }
             }
-            std::vector<std::vector<ExpToken>> expandedArgs;
-            expandedArgs.reserve(namedCount);
-            for (std::size_t k = 0; k < namedCount; ++k) {
-                expandedArgs.push_back(expand(std::move(args[k]), depth + 1));
-            }
-            // Build the (pre-expanded) __VA_ARGS__ token run from the TRAILING
-            // arguments (indices >= params.size()), each pre-expanded like a
-            // named arg, re-joined with the ORIGINAL source separator commas
-            // (`separators[k]` separates arg k from arg k+1). EMPTY when the
-            // variadic portion is empty (C23). A non-variadic macro passes an
-            // empty run (substitute never consults it).
-            std::vector<ExpToken> vaArgs;
-            if (def.isVariadic) {
-                for (std::size_t k = def.params.size(); k < args.size(); ++k) {
-                    if (k > def.params.size()) {
-                        // The separator BEFORE this trailing arg is the comma
-                        // between arg (k-1) and arg k == separators[k-1].
-                        if (k - 1 < separators.size()) {
-                            vaArgs.push_back(separators[k - 1]);
-                        }
-                    }
-                    std::vector<ExpToken> ex =
-                        expand(std::move(args[k]), depth + 1);
-                    vaArgs.insert(vaArgs.end(), ex.begin(), ex.end());
-                }
-            }
+            // ★★ THE SUSPENSION POINT -- the only place this expander used to
+            // recurse, and the whole subject of the operator's ruling. The two
+            // old loops (`expandedArgs` over the NAMED args, then the variadic
+            // tail) are ONE ordered pass here, and they always were: for a
+            // variadic macro `namedCount == def.params.size()`, so the named loop
+            // covered `args[0 .. namedCount)` and the variadic loop
+            // `args[params.size() .. args.size())` -- adjacent, disjoint, in
+            // order, together exactly `args[0 .. args.size())`. For a
+            // non-variadic macro `namedCount == args.size()` and the second loop
+            // never ran. So one pass over every argument, in the SAME ORDER, is
+            // not a simplification of the semantics: it is the same sequence of
+            // `expand` calls, which matters because each can emit diagnostics and
+            // move `#pragma` state.
+            //
+            // Everything computed above that the substitution still needs is
+            // parked in the frame; the driver pushes one child frame per
+            // argument and calls `finishPendingCall` when the last one returns.
+            PendingCall pc;
+            pc.def           = &def;
+            pc.name          = name;
+            pc.t             = t;
+            pc.hs            = hs;
+            pc.past          = past;
+            pc.namedCount    = namedCount;
+            pc.args          = std::move(args);
+            pc.separators    = std::move(separators);
+            pc.rawArgs       = std::move(rawArgs);
+            pc.rawVaArgs     = std::move(rawVaArgs);
+            pc.expandedArgs.reserve(pc.args.size());
             // FC15b: the WHOLE call's replacement-origin tokens inherit the
             // invoking NAME token's invocation offset (`invOffset`), so a
             // `__LINE__` in a function-like replacement resolves to the
             // invocation line. (`t` is captured before the splice below.)
-            const ByteOffset callInvOffset = t.invOffset;
-            std::vector<ExpToken> substituted =
-                substitute(def, expandedArgs, vaArgs, rawArgs, rawVaArgs, hs,
-                           callInvOffset);
-            // The whole call `[i, past)` is replaced by this run, so the run's first
-            // token keeps the spacing that preceded the macro NAME. ✔MEASURED: a
-            // two-level stringize of `a PLAIN(1,2)` is "a g(1, 2)" and of
-            // `a+PLAIN(1,2)` is "a+g(1, 2)" on all four oracles.
-            inheritLeadingSpacing(substituted, t.spacedBefore);
-            // Splice the substituted result over the WHOLE call `[i, past)` and
-            // RESCAN from i: the invoked macro M is in every substituted token's
-            // hide set, so a self-reference is frozen; a function-like name newly
-            // exposed at the substitution's tail re-pairs with the parent's `(`.
-            spliceOver(work, 0, past, substituted);
-            continue;   // rescan the substitution + the trailing parent stream
+            pc.callInvOffset = t.invOffset;
+            pc.savedMint     = outerMint;
+            f.call.emplace(std::move(pc));
+            suspended = true;
+            break;
         }
-        return out;
+        // ── The frame ran its stream out, or parked a call ────────────────────
+        if (suspended) {
+            // `mintScope` has just unwound with the `break`, putting the OUTER
+            // context back. Re-install the invocation's own context: it must
+            // stay in force for every child argument expansion and for the
+            // `substitute` that follows, which is exactly the lifetime the
+            // recursive form gave it. `finishPendingCall` puts `savedMint` back.
+            PendingCall const& pc = *f.call;
+            mint_ = MintContext{pc.callInvOffset, pc.def->definitionSite,
+                                pc.def->hasDefinitionSite, pc.name};
+            continue;   // the driver's RESUME arm pushes the first child
+        }
+        // Nothing pending and no work left: this frame is finished. The ROOT
+        // frame's `out` is the answer; a child frame's `out` is one
+        // pre-expanded argument, handed back to the parent that parked it.
+        {
+            std::vector<ExpToken> done = std::move(f.out);
+            stack.pop_back();
+            if (stack.empty()) return done;
+            childOut  = std::move(done);
+            haveChild = true;
+        }
+        }   // for (;;)
+    }
+
+    // The second half of a suspended function-like invocation: every argument is
+    // pre-expanded, so re-join the variadic tail, substitute, splice and rescan.
+    // Split out of `expand` because it is the RESUME half of one loop iteration
+    // and reads better named than as a third state in the driver.
+    void finishPendingCall(ExpandFrame& f) {
+        PendingCall& pc  = *f.call;
+        MacroDef const& def = *pc.def;
+        // Build the (pre-expanded) __VA_ARGS__ token run from the TRAILING
+        // arguments (indices >= params.size()), each pre-expanded like a
+        // named arg, re-joined with the ORIGINAL source separator commas
+        // (`separators[k]` separates arg k from arg k+1). EMPTY when the
+        // variadic portion is empty (C23). A non-variadic macro passes an
+        // empty run (substitute never consults it).
+        std::vector<ExpToken> vaArgs;
+        if (def.isVariadic) {
+            for (std::size_t k = def.params.size();
+                 k < pc.expandedArgs.size(); ++k) {
+                if (k > def.params.size()) {
+                    // The separator BEFORE this trailing arg is the comma
+                    // between arg (k-1) and arg k == separators[k-1].
+                    if (k - 1 < pc.separators.size()) {
+                        vaArgs.push_back(pc.separators[k - 1]);
+                    }
+                }
+                vaArgs.insert(vaArgs.end(), pc.expandedArgs[k].begin(),
+                              pc.expandedArgs[k].end());
+            }
+        }
+        // `substitute` reads only the NAMED positions out of `expandedArgs`; the
+        // variadic tail reaches it through `vaArgs`. Trim rather than pass the
+        // longer vector, so the argument keeps the exact shape it had when the
+        // named loop built it.
+        std::vector<std::vector<ExpToken>> expandedArgs;
+        expandedArgs.reserve(pc.namedCount);
+        for (std::size_t k = 0; k < pc.namedCount && k < pc.expandedArgs.size();
+             ++k) {
+            expandedArgs.push_back(std::move(pc.expandedArgs[k]));
+        }
+        std::vector<ExpToken> substituted =
+            substitute(def, expandedArgs, vaArgs, pc.rawArgs, pc.rawVaArgs,
+                       pc.hs, pc.callInvOffset);
+        // The whole call `[i, past)` is replaced by this run, so the run's first
+        // token keeps the spacing that preceded the macro NAME. ✔MEASURED: a
+        // two-level stringize of `a PLAIN(1,2)` is "a g(1, 2)" and of
+        // `a+PLAIN(1,2)` is "a+g(1, 2)" on all four oracles.
+        inheritLeadingSpacing(substituted, pc.t.spacedBefore);
+        // Splice the substituted result over the WHOLE call `[i, past)` and
+        // RESCAN from i: the invoked macro M is in every substituted token's
+        // hide set, so a self-reference is frozen; a function-like name newly
+        // exposed at the substitution's tail re-pairs with the parent's `(`.
+        spliceOver(f.work, 0, pc.past, substituted);
+        // The invocation is over: put back what was in force before it.
+        mint_ = std::move(pc.savedMint);
+        f.call.reset();
     }
 
     // Replace `in[from, to)` with `repl` (the freshly produced tokens) and leave
@@ -8015,12 +8588,9 @@ private:
     // the INNERMOST macro — the one whose replacement list holds the `#`/`##`.
     // That is deliberate and it is what clang prints: the error at the invocation
     // in the user's file, the note at the definition that minted the token.
-    struct MintContext {
-        ByteOffset  site   = 0;
-        ByteOffset  def    = 0;
-        bool        hasDef = false;
-        std::string name;
-    };
+    // ⓘ `MintContext` itself is DECLARED ABOVE `PendingCall`, which stores one by
+    // value; a member type has to be complete where it is used. Its docblock is
+    // here, with `MintScope` and `mint_`, because this is where the rule lives.
     MintContext                          mint_;
     class MintScope {
     public:

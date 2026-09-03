@@ -368,9 +368,14 @@ lowerToLir(Mir const&          mir,
            // LDAR/STLR pair is a MEASURED rc 135 SIGBUS on real hardware)
            // fails LOUD naming this key rather than emit a certain fault;
            // `losesAtomicity` (x86_64, where the native form is what gcc ships
-           // and works) keeps the native form, which is the only reason pe64
-           // — the one shipped format with no atomics image — stays inside the
-           // reference union. Trailing (like `wideFloatSoftcallLibrary`) so
+           // and works) keeps the native form rather than refuse, because
+           // refusing would put a format that declares no runtime below the
+           // reference union. ⚠ THAT CLAUSE USED TO NAME pe64 as "the one
+           // shipped format with no atomics image", and P54 ended it: pe64 now
+           // declares the role and fills it from a body DSS ships and compiles
+           // (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64), so `std::nullopt` reaches
+           // no shipped format today — the arm pins a RULE, not a platform.
+           // Trailing (like `wideFloatSoftcallLibrary`) so
            // existing positional callers are unaffected. Defaults to nullopt.
            std::optional<AtomicsRuntime> atomicsRuntime = std::nullopt);
 

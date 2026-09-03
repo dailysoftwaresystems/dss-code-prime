@@ -149,6 +149,27 @@ using CstSymbolValueResolver =
 struct CstCastTarget {
     bool   isPointer = false;
     bool   isInteger = false;
+    // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]: `_Bool` is NOT a
+    // one-bit integer target and must never be folded as one. C 6.3.1.2 defines
+    // the conversion by COMPARISON — "0 if the value compares equal to 0,
+    // otherwise 1" — while a width-1 truncation keeps the low BIT, and the two
+    // disagree on every even value. ✔MEASURED before this field existed:
+    // `int a[(_Bool)2 + 41];` built a **41**-element array in DSS and a 42-element
+    // one on gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51 — a
+    // silent wrong answer with no float anywhere in it. A `_Bool` target therefore
+    // sets THIS flag and NOT `isInteger`, so the width-1 truncation is unreachable
+    // rather than merely unused.
+    bool   isBool    = false;
+    // A FLOAT target (`(double)3`, `(float)x`). The whole descriptor used to have
+    // no float classification at all, so `resolveCastTarget` fell to its
+    // `default: nullopt` and EVERY float-targeted cast was a non-constant —
+    // `_Static_assert((double)3 == 3.0, "")` included, which all four references
+    // accept (✔MEASURED). `floatKind` carries WHICH float format, because the
+    // conversion is format-specific: an F32 target must round through binary32,
+    // not merely relabel a host double (the same narrowing the float LEAF learned
+    // under [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]]). Engaged IFF
+    // the target is a float, so there is no "which float?" state to get wrong.
+    std::optional<TypeKind> floatKind{};
     // Integer target width: 1 (Bool) / 8 / 16 / 32 / 64, and — since
     // D-CSUBSET-INT128-CONSTFOLD (TF-C94) — 128 for the two STANDARD 128-bit kinds
     // (`__int128` / `unsigned __int128`, which are NOT bit-precise and so are NOT
@@ -173,6 +194,28 @@ struct CstCastTarget {
 // casts stay non-foldable (the prior behaviour). Recognizes `(T*)0`, `(char*)x`,
 // and `(size_t)int` (the offsetof spine).
 using CstCastTargetResolver = std::function<std::optional<CstCastTarget>(NodeId)>;
+
+// [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]: THE one place a
+// resolved `TypeId` becomes a `CstCastTarget`. Every `CstCastTargetResolver` in
+// the tree differs only in HOW it finds the cast's type node — the semantic tier
+// resolves it from the declared `casts` row, the HIR-lowering tier reads the
+// stamp Pass 2 already left — and they must not differ at all in how they then
+// CLASSIFY it. Written as a free function rather than duplicated in each closure
+// because the duplicate is the defect: an `isInteger` row that one tier has and
+// the other lacks is invisible until a program folds differently depending on
+// which tier reached it first.
+//
+// ⚠ THE ENGINE ITSELF STAYS INTERNER-FREE — that contract is about
+// `evaluateConstantCst`, which still takes no `TypeInterner` and never will. This
+// is the boundary function the CONSUMERS call to build the descriptor they hand
+// in, and it lives beside the descriptor for the same reason the descriptor and
+// its resolver typedef live together.
+//
+// nullopt for a target the const-expr surface has no fold for (an aggregate, a
+// function type, `void`) ⇒ the cast is non-foldable and the caller fails loud.
+class TypeInterner;
+[[nodiscard]] DSS_EXPORT std::optional<CstCastTarget>
+classifyCstCastTarget(TypeInterner const& interner, TypeId ty);
 
 // c43: field-offset resolver — given a struct/union CONTAINER TypeId + a field-name
 // token, return the field's {byteOffset, fieldType}, or nullopt (unknown field /
@@ -246,12 +289,16 @@ struct CstEvalContext {
     // FC17 (D-CSUBSET-CONSTEXPR): tokens that decode as FLOAT literals
     // (`decodeFloat`-eligible), built by the caller from
     // `SemanticConfig::literalTypes` filtered to float cores. NULLABLE and
-    // null by default — a null set keeps the engine integer-only at the leaf
-    // (today's behavior); ONLY the float-capable `constExprValue` consumer
-    // populates it (the array-dimension / enum / static_assert / designator
-    // consumers stay null so a float can never leak into an integer-required
-    // context through the leaf — their walls: this null, combineBinary/
-    // UnaryCst's !allowFloat refusal, and asInt64Bridge rejecting doubles).
+    // null by default — a null set keeps the engine integer-only at the leaf.
+    // ⚠ [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]]: it is NO LONGER
+    // true that only `constExprValue` populates it. The integer-required
+    // consumers (`constIntExpr`: array dimension / enumerator / bit-field width /
+    // `_Alignas` / index designator / static assertion) populate it too, because
+    // a float SUB-expression with an INTEGER result — `0.1L > 0.0L`, `(int)1.5` —
+    // is an accepted constant expression on all four reference toolchains. The
+    // no-leak guarantee is unchanged but is now stated in ONE place instead of
+    // three: `asInt64Bridge` rejects a float-armed RESULT, so a float VALUE still
+    // cannot reach an integer-required consumer.
     std::unordered_set<std::uint32_t> const* floatLiteralTokens = nullptr;
     // FC17 F2 (D-CSUBSET-CONSTEXPR / the pre-existing `_Static_assert(true)`
     // gap): token → the config-declared FIXED literal value of a KEYWORD
@@ -313,6 +360,23 @@ evaluateConstantCst(NodeId                expr,
 // repeated post-fold extraction in each.
 [[nodiscard]] DSS_EXPORT std::optional<std::int64_t>
 asInt64Bridge(HirLiteralValue const& v) noexcept;
+
+// [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]]: the TRUTHINESS sibling
+// of `asInt64Bridge`, for the one consumer that asks "is this constant TRUE?"
+// rather than "what integer is it?" — a static assertion. C99 truthiness: `0`
+// and `±0.0` are false, everything else (NaN and ±inf included) is true; nullopt
+// for a non-numeric arm (a pointer / string / aggregate value), which is how "not
+// a constant the language can test" stays distinguishable from "false".
+//
+// ★ WHY IT IS NOT `asInt64Bridge(v) != 0`. That bridge answers by MAGNITUDE and
+// nullopts for a value it cannot carry — a float arm, and an unsigned value above
+// INT64_MAX. Both have perfectly defined truth values, and both are accepted by
+// the references: ✔MEASURED `_Static_assert(0xFFFFFFFFFFFFFFFFULL, "")` compiles
+// on gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51. Routing the
+// truth question through the integer bridge reported those as "not an integer
+// constant expression", which is a refusal, not an answer.
+[[nodiscard]] DSS_EXPORT std::optional<bool>
+asBoolBridge(HirLiteralValue const& v, bool allowFloat) noexcept;
 
 // Find the init-expression CST node inside a declaration rule node.
 // Tries `DeclarationRule.initChild` (explicit positional index) first;

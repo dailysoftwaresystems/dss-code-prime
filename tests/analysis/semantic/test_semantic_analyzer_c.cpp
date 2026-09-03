@@ -68,9 +68,10 @@ TEST(SemanticAnalyzerC, FunctionLocalIntDeclTypedAsI32) {
     // `_byteswap_ulong`/`_byteswap_uint64` + their GCC spellings
     // `__builtin_bswap16`/`__builtin_bswap32`/`__builtin_bswap64` — six NAMES over
     // ONE `lowering: "bswap"` verb, always-injected like every other builtin).
-    ASSERT_EQ(model.symbols().size() - 1, 87u)
+    ASSERT_EQ(model.symbols().size() - 1, 88u)
         << "main + x + __va_list_tag + va_list + __builtin_va_list + __umulh + "
-           "_InterlockedCompareExchange + _ReadWriteBarrier + __sync_synchronize + "
+           "_InterlockedCompareExchange + _InterlockedCompareExchange64 + "
+           "_ReadWriteBarrier + __sync_synchronize + "
            "_exception_code + _exception_info + the 6 __builtin bit-count "
            "intrinsics + the 56 __builtin_stdc_* <stdbit.h> intrinsics + "
            "atomic_load_explicit + atomic_store_explicit + the 4 __builtin_complex/"
@@ -311,8 +312,13 @@ TEST(SemanticAnalyzerC, BareComplexSpecifierResolvesToDoubleComplex) {
 // never a silently-baked constant. Complex values have NO fold representation
 // (HirLiteralValue's single double cannot hold {re, im}): a complex-constructing
 // builtin is not const-evaluable, and a cast whose target is complex refuses at
-// the const-eval cast-target classification (not pointer/integer/bit-precise —
-// the "float / aggregate cast target" NotAConstantExpression arm). So `40.0+2.0*I`
+// the const-eval cast-target classification (not pointer / integer / bit-precise /
+// float / `_Bool` — `classifyCstCastTarget`'s `default: nullopt`). ⚠ This used to
+// say "the 'float / aggregate cast target' NotAConstantExpression arm", which
+// stopped being where the refusal happens when
+// [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]] gave FLOAT targets a
+// fold of their own; `_Complex` is refused by the classifier, one step earlier,
+// and this test is unchanged because the VERDICT never moved. So `40.0+2.0*I`
 // is ALWAYS a runtime by-address construction — the anti-fold posture the
 // c99_complex example's release arm witnesses. The negative control pins that the
 // SAME expressions are accepted at RUNTIME (the refusal is the constexpr gate, not
@@ -3483,7 +3489,7 @@ TEST(SemanticAnalyzerC, NestedBlocksShadowWithoutRedecl) {
     // builtins (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 +
     // __builtin_bswap16/32/64) + the 2 FC17.5 predefined function-name symbols
     // (__func__ + __FUNCTION__, per function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
-    EXPECT_EQ(model.symbols().size() - 1, 88u);
+    EXPECT_EQ(model.symbols().size() - 1, 89u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -3512,7 +3518,12 @@ TEST(SemanticAnalyzerC, ForwardReferenceWithinBlock) {
     // builtins (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 +
     // __builtin_bswap16/32/64) + the 2 FC17.5 predefined function-name symbols
     // (__func__ + __FUNCTION__). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 87u);
+    // ⓘ 88 since P54: `_InterlockedCompareExchange64` joined the always-injected
+    // set when the pe64 atomics runtime became DSS's own body
+    // (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64) — an under-aligned 8-byte `_Atomic`
+    // needs the 64-bit compare-exchange, and it minted no new encoding because
+    // x86_64's width-64 `lock_cmpxchg` variant already existed.
+    ASSERT_EQ(model.symbols().size() - 1, 88u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -6519,7 +6530,7 @@ TEST(SemanticAnalyzerC, ValueStarValueStaysExpressionStatement) {
     // (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 + __builtin_bswap16/32/64) +
     // the 2 FC17.5 predefined function-name symbols (__func__ + __FUNCTION__) — the
     // multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 88u)
+    EXPECT_EQ(model.symbols().size() - 1, 89u)
         << "main + a + b + __va_list_tag + va_list + __builtin_va_list + "
            "the 6 intrinsic builtins + "
            "the 6 __builtin bit-count intrinsics + the 56 __builtin_stdc_* "
@@ -10780,18 +10791,22 @@ TEST(SemanticAnalyzerC, StaticAssertTrueKeywordConditionFolds) {
     EXPECT_FALSE(model.hasErrors());
 }
 
-// F3 no-leak walls: the float capability added FOR constexpr must NOT leak into
-// integer-required consumers — a float in a static_assert condition / an array
-// dimension stays non-constant. RED-ON-DISABLE: populate floatLiteralTokens (or
-// flip allowFloat) in constIntExpr's context and both EXPECTs red.
+// The F3 no-leak wall: the float capability added FOR constexpr must not let a
+// float VALUE reach an integer-required consumer — a float array dimension stays
+// non-constant. RED-ON-DISABLE: make `asInt64Bridge` accept a float arm and this
+// goes red.
+//
+// ⚠⚠ THIS TEST USED TO ASSERT ONE MORE THING, AND THAT ASSERTION WAS WRONG —
+// [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]]. It required
+// `_Static_assert(1.5 > 1.0, "")` to FAIL, on the reading that a float anywhere
+// in the expression disqualifies it. ✔MEASURED, gcc 13.3.0, clang 18.1.3,
+// mingw-w64 gcc 13.2.0 and MSVC 19.51 — probed SEPARATELY — all four ACCEPT
+// exactly that assertion, so the pin was defending a conformance defect. The
+// wall it was named for is real and is kept below; what was wrong was WHERE it
+// sat. A float SUB-expression folds; a float RESULT is refused.
 TEST(SemanticAnalyzerC, FloatDoesNotLeakIntoIntegerConstExprConsumers) {
-    auto saModel = analyzeShipped("c", {
-        "_Static_assert(1.5 > 1.0, \"floats are not ICEs\");\n"
-        "int main(void) { return 0; }\n",
-    });
-    EXPECT_EQ(countCode(saModel.diagnostics(),
-                        DiagnosticCode::S_StaticAssertFailed), 1u)
-        << "a float condition is NOT an integer constant expression (C 6.7.10)";
+    // The half the references agree with DSS on, and the reason the wall exists:
+    // the expression's VALUE is a float, so there is no integer to be the bound.
     // VLA C1a (D-CSUBSET-VLA): pinned at FILE scope — a float bound is not an
     // integer constant, so the file-scope array stays S_NonConstantArrayLength (it
     // is not a VLA; a VLA needs automatic storage). A block-scope float bound would
@@ -10802,6 +10817,15 @@ TEST(SemanticAnalyzerC, FloatDoesNotLeakIntoIntegerConstExprConsumers) {
     EXPECT_EQ(countCode(dimModel.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 1u)
         << "a float array dimension must stay S_NonConstantArrayLength";
+    // The direction the old assertion had backwards, pinned so it cannot come
+    // back: a float sub-expression whose RESULT is an integer folds.
+    auto saModel = analyzeShipped("c", {
+        "_Static_assert(1.5 > 1.0, \"a comparison yields an int\");\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(saModel.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "all four reference toolchains accept this assertion";
 }
 
 // The fixed-value map excludes NullptrT rows BY CONSTRUCTION: `nullptr`
@@ -15897,10 +15921,18 @@ TEST(SemanticAnalyzerC, StaticAssertNonBinaryConditionEmitsWithoutOperandSuffix)
 }
 
 // The NON-CONSTANT branch also degrades cleanly: `sizeof` of an incomplete
-// array does not fold, so the LHS renders as `<non-constant>` while the RHS
-// still folds. The message keeps its own "is not an integer constant
+// array does not fold, so the LHS reports ITS OWN SPELLING while the RHS still
+// folds to a value. The message keeps its own "is not an integer constant
 // expression" wording (the two failure modes stay distinguishable on one code).
-TEST(SemanticAnalyzerC, StaticAssertNonConstantOperandRendersAsNonConstant) {
+//
+// ⚠ THIS TEST USED TO REQUIRE THE LITERAL TEXT `<non-constant>`, and that string
+// was the defect [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]] names:
+// it is IDENTICAL for every operand that fails to fold, so the suffix said
+// nothing on the one case it exists to explain. The property the test was
+// defending — "a side that does not fold must SAY so, not be omitted or
+// guessed" — is unchanged and is asserted more strictly here, because the
+// operand must now identify itself.
+TEST(SemanticAnalyzerC, StaticAssertNonConstantOperandNamesItsOwnSpelling) {
     auto cu = buildShippedUnit("c", {
         "typedef int T[];\n"
         "_Static_assert(sizeof(T) == 4, \"incomplete has no size\");\n"
@@ -15913,9 +15945,11 @@ TEST(SemanticAnalyzerC, StaticAssertNonConstantOperandRendersAsNonConstant) {
         if (d.code == DiagnosticCode::S_StaticAssertFailed) text = d.actual;
     EXPECT_NE(text.find("is not an integer constant expression"),
               std::string::npos) << text;
-    EXPECT_NE(text.find("(folded: <non-constant> Eq 4)"), std::string::npos)
-        << "a side that does not fold must say so, not be omitted or guessed; "
-           "got: " << text;
+    EXPECT_EQ(text.find("<non-constant>"), std::string::npos)
+        << "the undiscriminating placeholder must be gone; got: " << text;
+    EXPECT_NE(text.find("(folded: `sizeof(T)` Eq 4)"), std::string::npos)
+        << "a side that does not fold must NAME ITSELF, and the side that does "
+           "must still report its value; got: " << text;
 }
 
 // ── D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF (C 6.7.6.2p1) ─────────────────────────
@@ -20345,4 +20379,879 @@ TEST(SemanticAnalyzerC, ExternOnAFunctionDefinitionStaysDefining) {
         EXPECT_FALSE(p->isExternDeclaration)
             << src << " -- a definition is DEFINING despite the specifier";
     }
+}
+
+// ── [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]] ──────────────────
+//
+// A floating-point comparison is a constant expression all four reference
+// toolchains fold. ✔MEASURED separately on gcc 13.3.0, clang 18.1.3, mingw-w64
+// gcc 13.2.0 and MSVC 19.51 (transcripts under scratchpad/p54/sd/probe/): every
+// ACCEPT below is accepted by all four, and every REFUSE below is refused by all
+// four. The corpus example `examples/c/static_assert_float_comparison` carries
+// the end-to-end half (its EXIT CODE moves if a fold answers the wrong truth
+// value); these pin the SEMANTIC verdict, including the two directions an
+// example cannot reach: the refusals, and the message text.
+
+// The first message carried by a diagnostic of `code`. ★ A diagnostic that fires
+// with the right CODE and the wrong words stays green under `countCode`, which
+// is precisely how four wordless bit-field arms shipped.
+[[nodiscard]] inline std::string
+firstActualForCode(SemanticModel const& m, DiagnosticCode code) {
+    for (auto const& d : m.diagnostics().all()) {
+        if (d.code == code) return d.actual;
+    }
+    return {};
+}
+
+// ⚠ A `long double` LITERAL NEEDS AN AXIS, AND THE DEFAULT LIBRARY HARNESS HAS
+// NONE. `analyzeShipped` leaves `LongDoubleFormat::None`, under which a `0.1L`
+// leaf is correctly not a constant at all (S_LongDoubleFormatUndeclared is the
+// tier's own answer, D-CSUBSET-LONG-DOUBLE). ✔MEASURED: the first draft of these
+// tests used the plain harness and the long-double arms went red while the
+// double and float arms passed — the harness, not the subject. Every `L` arm
+// below therefore names an axis explicitly, the same way `LongDoubleResolvesPerAxis`
+// does; the driver supplies the real one per target.
+[[nodiscard]] inline SemanticModel
+analyzeWithX87Axis(std::initializer_list<std::string> sources) {
+    return analyzeWithLongDoubleAxis(sources, LongDoubleFormat::X87_80);
+}
+
+TEST(SemanticAnalyzerC, StaticAssertFloatComparisonFoldsAtEveryWidth) {
+    // The row's own reproduction is the long-double arm; the double and float
+    // arms are here because the row's predicate names them and because they take
+    // a DIFFERENT path inside the fold (the `double` variant arm vs the
+    // WideFloatValue soft-float kernel).
+    for (std::string_view const cond : {"0.1L > 0.0L", "0.1 > 0.0", "0.1f > 0.0f",
+                                        "1.0 + 2.0 == 3.0", "1.0L / 4.0L == 0.25L"}) {
+        auto model = analyzeWithX87Axis({
+            "_Static_assert(" + std::string{cond} + ", \"m\");\n"
+            "int main(void){ return 0; }\n",
+        });
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_StaticAssertFailed), 0u)
+            << cond << " -- all four references accept this assertion";
+    }
+}
+
+TEST(SemanticAnalyzerC, AnFSuffixedLiteralCarriesBinary32Precision) {
+    // 🔴 THE SILENT-WRONG-ANSWER DIRECTION, and the reason it needs its own pin:
+    // both float-literal leaves decoded through `decodeFloat` into a host `double`
+    // and stamped an F32 core on it, so `0.1f` carried 53 significant bits instead
+    // of 24 and `0.1f == 0.1` folded TRUE. ✔MEASURED gcc 13.3.0, clang 18.1.3,
+    // mingw-w64 gcc 13.2.0 and MSVC 19.51 all accept `0.1f != 0.1` — all four say
+    // the widened `0.1f` is a DIFFERENT number. RED-ON-DISABLE: drop the
+    // `narrowToFloatWidth` call from the leaf in `cst_const_eval.cpp` and this
+    // goes red while every other float pin stays green, because every other one
+    // asks a question binary64 answers the same way.
+    auto model = analyzeShipped("c", {
+        "_Static_assert(0.1f != 0.1, \"an f-suffixed literal is binary32\");\n"
+        "_Static_assert(0.5f == 0.5, \"a representable value is unaffected\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+}
+
+TEST(SemanticAnalyzerC, StaticAssertFalseFloatComparisonStillFailsLoud) {
+    // ⚠ THE CONTROL THE ROW DEMANDED. A "fix" that simply stopped evaluating a
+    // floating condition would pass every positive above and lose this one.
+    auto model = analyzeWithX87Axis({
+        "_Static_assert(0.1L < 0.0L, \"deliberately false\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "a FALSE floating comparison must still be refused (all four "
+           "references refuse it)";
+    std::string const msg = firstActualForCode(
+        model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_NE(msg.find("static assertion failed"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("deliberately false"), std::string::npos) << msg;
+}
+
+TEST(SemanticAnalyzerC, StaticAssertZeroFloatIsAFailedAssertionNotANonConstant) {
+    // `_Static_assert(0.0, "")` is refused by all four references; clang 18.1.3
+    // and MSVC 19.51 refuse it as a FAILED assertion (they test truthiness), gcc
+    // as "not an integer". DSS takes the truthiness reading, so its refusal must
+    // carry the author's string rather than the non-constant wording.
+    auto model = analyzeShipped("c", {
+        "_Static_assert(0.0, \"a bare zero float\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u);
+    std::string const msg = firstActualForCode(
+        model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_NE(msg.find("static assertion failed"), std::string::npos) << msg;
+}
+
+TEST(SemanticAnalyzerC, StaticAssertNonZeroFloatIsAccepted) {
+    // A 2-of-3 disjunction split, recorded deliberately: clang 18.1.3 and MSVC
+    // 19.51 ACCEPT `_Static_assert(1.5, "")`, while gcc 13.3.0 and mingw-w64 gcc
+    // 13.2.0 refuse it as "not an integer". `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C`
+    // governs an accept-vs-refuse split, so DSS accepts.
+    auto model = analyzeShipped("c", {
+        "_Static_assert(1.5, \"a bare non-zero float\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+TEST(SemanticAnalyzerC, StaticAssertHugeUnsignedIsTrueNotNonConstant) {
+    // The truth question no longer routes through an int64 bridge, so a value
+    // above INT64_MAX is TRUE rather than "not an integer constant expression".
+    // ✔MEASURED accepted by all four references.
+    auto model = analyzeShipped("c", {
+        "_Static_assert(0xFFFFFFFFFFFFFFFFULL, \"m\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+TEST(SemanticAnalyzerC, StaticAssertIntegerConditionsAreUnregressed) {
+    // ⚠ THE SECOND CONTROL THE ROW DEMANDED: the integer forms that already
+    // worked must keep working, in BOTH directions.
+    for (std::string_view const cond : {"1 + 1 == 2", "true", "!false",
+                                        "'a' == 97", "1 && 1", "(1 ? 2 : 0)"}) {
+        auto clean = analyzeShipped("c", {
+            "_Static_assert(" + std::string{cond} + ", \"m\");\n"
+            "int main(void){ return 0; }\n",
+        });
+        EXPECT_EQ(countCode(clean.diagnostics(),
+                            DiagnosticCode::S_StaticAssertFailed), 0u)
+            << cond << " -> "
+            << firstActualForCode(clean, DiagnosticCode::S_StaticAssertFailed);
+    }
+    // ⓘ `sizeof` needs the target's layout params — `analyzeShipped` passes
+    // nullopt, under which a sizeof fold is a DELIBERATE fail-loud (see
+    // `StaticAssertSizeofConditionFoldsTrue`). ✔MEASURED: the first draft of this
+    // control put `sizeof(int) == 4` in the loop above and went red for exactly
+    // that reason — the harness, not the subject. The layout-bearing arm is here.
+    auto cu = buildShippedUnit("c", {
+        "_Static_assert(sizeof(int) == 4, \"m\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto sizeofModel = analyze(cu, DiagnosticBudget::libraryDefault(),
+                               DataModel::Lp64,
+                               AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(sizeofModel.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(sizeofModel, DiagnosticCode::S_StaticAssertFailed);
+    auto loud = analyzeShipped("c", {
+        "_Static_assert(1 + 1 == 3, \"m\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(loud.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u);
+}
+
+TEST(SemanticAnalyzerC, FloatComparisonFoldsInEveryIntegerConstantContext) {
+    // The fold was enabled on the SHARED integer const-expr evaluator, so the
+    // enumerator, the array bound and the bit-field width get it too — which is
+    // what all four references do. An example reaches these only through a
+    // program that runs; this reaches them directly.
+    auto model = analyzeShipped("c", {
+        "enum E { A = (0.1 > 0.0), B = (0.1 < 0.0) };\n"
+        "_Static_assert(A == 1 && B == 0, \"the enumerator folded, and correctly\");\n"
+        "static int arr[(0.5 > 0.25) + 41];\n"
+        "struct S { unsigned f : (0.1 > 0.0) + 2; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    // The enumerator arm asserts the VALUE, not merely that something folded —
+    // `A == 1 && B == 0` is false if the comparison folded the wrong way.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u)
+        << "a float comparison is a valid array bound on all four references";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_BitFieldWidthOutOfRange), 0u)
+        << "a float comparison is a valid bit-field width on all four references";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(SemanticAnalyzerC, AFloatValueStillCannotReachAnIntegerRequiredContext) {
+    // ★★ THE WALL MOVED, IT DID NOT VANISH. `asInt64Bridge` refuses a float
+    // RESULT, so an array bound or enumerator that folds to a FLOAT is still
+    // loud — ✔MEASURED gcc 13.3.0 refuses `int a[1.5]` with "size of array has
+    // non-integer type". Without this pin, "floats fold now" would be
+    // indistinguishable from "floats are accepted as integers now".
+    auto dim = analyzeShipped("c", {
+        "static int a[1.5 + 1.5];\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_TRUE(dim.hasErrors())
+        << "a float-VALUED array bound must still fail loud";
+    auto en = analyzeShipped("c", {
+        "enum E { A = 1.5 };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_TRUE(en.hasErrors())
+        << "a float-VALUED enumerator must still fail loud";
+}
+
+// ── [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]] ───────────────
+//
+// C23 6.6 makes a cast of a floating constant to an integer type an integer
+// constant expression. ✔MEASURED separately on gcc 13.3.0 (-std=c2x), clang
+// 18.1.3 (-std=c23), mingw-w64 gcc 13.2.0 and MSVC 19.51 (/std:clatest): all four
+// accept every source below that these tests require to be clean.
+//
+// ⚠ EVERY ASSERTION READS A VALUE, NOT MERELY ACCEPTANCE. `(int)1.5` folding to
+// SOMETHING is not the property — it has to fold to 1, and `(int)-1.5` to -1
+// rather than -2. The `_Static_assert`s inside each source are what carry that,
+// with `S_StaticAssertFailed` counted at zero.
+//
+// ⓘ TWO HARNESS FACTS, BOTH LEARNED BY GOING RED AGAINST A CORRECT COMPILER.
+// `analyzeShipped` passes NO layout params, so any assertion spelled through
+// `sizeof` is a deliberate fail-loud there (the same trap
+// `StaticAssertIntegerConditionsAreUnregressed` documents) — the arms that read
+// an array's SIZE therefore use the layout-bearing helper below. And it leaves
+// `LongDoubleFormat::None`, under which a `1.5L` leaf is correctly not a
+// constant at all — so the `L` arm names an axis, exactly as
+// `StaticAssertFloatComparisonFoldsAtEveryWidth` does.
+namespace {
+[[nodiscard]] SemanticModel
+analyzeWithLayout(std::initializer_list<std::string> sources) {
+    auto cu = buildShippedUnit("c", sources);
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                   AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+}
+} // namespace
+
+TEST(SemanticAnalyzerC, FloatToIntCastFoldsInEveryIntegerConstantContext) {
+    // The five ICE positions the semantic tier owns. They do NOT share one
+    // decision point — the case label folds one tier down, in HIR lowering — so
+    // each is written out rather than represented by one of them.
+    auto model = analyzeWithLayout({
+        "enum E { A = (int)2.9, B = (int)-2.9 };\n"
+        "_Static_assert(A == 2 && B == -2, \"toward zero, both signs\");\n"
+        "static int arr[(int)1.5 + 41];\n"
+        "_Static_assert(sizeof arr == 42 * sizeof(int), \"array bound folded\");\n"
+        "struct S { unsigned f : (int)3.7; };\n"
+        "_Alignas((int)8.0) static char buf[4];\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_BitFieldWidthOutOfRange), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNonConstant), 0u)
+        << "`_Alignas((int)8.0)` is an integer constant expression on gcc, clang "
+           "and mingw (MSVC 19.51 refuses `_Alignas` on this declaration form "
+           "outright, cast or no cast — a separate MSVC gap, not this one)";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantEnumeratorValue), 0u);
+    EXPECT_FALSE(model.hasErrors());
+
+    // ★ THE BIT-FIELD WIDTH'S VALUE IS BRACKETED BY ITS OWN VALIDATOR, not by a
+    // `sizeof` (which a bit-field-bearing struct does not answer under this
+    // harness). `(int)33.7` must fold to 33 — one past `unsigned`'s 32 — and
+    // `(int)0.9` must fold to 0, which is illegal on a NAMED field (6.7.2.1p3).
+    // ⓘ The second is the sharpest arm in this test: a fold that ROUNDED instead
+    // of truncating would make `(int)0.9` a legal width of 1 and this would go
+    // green on a wrong answer.
+    for (char const* src : {"struct S { unsigned f : (int)33.7; };\n",
+                            "struct S { unsigned f : (int)0.9; };\n"}) {
+        auto bad = analyzeShipped("c", {std::string{src} + "int main(void){ return 0; }\n"});
+        EXPECT_TRUE(bad.hasErrors())
+            << "the folded width is out of bounds and must be refused: " << src;
+    }
+}
+
+TEST(SemanticAnalyzerC, FloatToIntCastFoldsAtEveryIntegerWidthAndSign) {
+    // The axis is the TARGET TYPE, not the one expression. Each line pins the
+    // value C 6.3.1.4p1 requires; a fold that answered at the wrong width — the
+    // shape [[D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE]] named one tier
+    // down — fails the assertion rather than merely compiling.
+    auto model = analyzeShipped("c", {
+        "_Static_assert((unsigned)3.9 == 3u, \"\");\n"
+        "_Static_assert((long long)1e18 == 1000000000000000000LL, \"\");\n"
+        "_Static_assert((char)65.9 == 65, \"\");\n"
+        "_Static_assert((signed char)-1.9 == -1, \"\");\n"
+        "_Static_assert((short)-300.7 == -300, \"\");\n"
+        "_Static_assert((long)(int)2.9 == 2, \"a cast of a cast\");\n"
+        "_Static_assert((int)1.5 + 1 == 2, \"the fold is an operand like any other\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+
+    // The `long double` source is its own arm because it takes a DIFFERENT path
+    // inside the fold — the WideFloatValue soft-float kernel's `toInt64`, not the
+    // host-double truncation — and because it needs an axis to be a constant at
+    // all. ✔MEASURED: all four references accept both lines.
+    auto ld = analyzeWithX87Axis({
+        "_Static_assert((int)1.5L == 1, \"a long double source truncates\");\n"
+        "_Static_assert((int)-1.5L == -1, \"toward zero there too\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(ld.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(ld, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(ld.hasErrors());
+}
+
+TEST(SemanticAnalyzerC, FloatToIntCastReachesTheWideIntegerTargets) {
+    // `__int128` and `_BitInt(N)` route through the bignum, not through int64 —
+    // `(__int128)1e30` has no int64 rendering at all, so an int64 bridge refused a
+    // conversion gcc 13.3.0 and clang 18.1.3 both fold (✔MEASURED; MSVC 19.51 has
+    // neither type, and gcc 13.3.0 has no `_BitInt`).
+    auto model = analyzeShipped("c", {
+        "_Static_assert((__int128)1e30 > 0, \"a value beyond int64 converts\");\n"
+        "_Static_assert((__int128)5.9 == 5, \"and a small one still lands right\");\n"
+        "_Static_assert((_BitInt(16))300.5 == 300, \"\");\n"
+        "_Static_assert((unsigned _BitInt(8))200.5 == 200uwb, \"\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(SemanticAnalyzerC, FloatToIntCastRespectsTheSourceLiteralsOwnWidth) {
+    // The cast reads whatever the LEAF produced, so an `f`-suffixed source must
+    // already have been rounded to binary32 before the truncation happens.
+    // 16777217 is the first integer binary32 cannot hold; a leaf that kept the
+    // host double would fold this to 16777217 and the assertion would fail. This
+    // is the same silent wrong answer the float LEAF was fixed for — reached
+    // through the cast, which is a second door onto one value.
+    auto model = analyzeShipped("c", {
+        "_Static_assert((int)16777217.0f == 16777216, \"binary32 rounds first\");\n"
+        "_Static_assert((int)16777217.0 == 16777217, \"binary64 does not\");\n"
+        "_Static_assert((int)((float)0.1 * 10.0f) == 1, \"\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(SemanticAnalyzerC, ExplicitBoolCastIsAComparisonNotAOneBitTruncation) {
+    // 🔴 A SILENT WRONG ANSWER, FOUND ON THIS AXIS AND WITH NO FLOAT IN IT.
+    // C 6.3.1.2: converting a scalar to `_Bool` yields "0 if the value compares
+    // equal to 0; otherwise 1". The CST fold carried `_Bool` as a width-1 INTEGER
+    // and truncated to the low bit, which disagrees on every even value.
+    // ✔MEASURED before the fix: `int a[(_Bool)2 + 41];` compiled clean and built a
+    // **41**-element array, while gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0
+    // and MSVC 19.51 all build 42 — and the SAME expression at the HIR tier was
+    // already right, so one value had two transforms and only one was C.
+    auto model = analyzeWithLayout({
+        "_Static_assert((_Bool)2 == 1, \"an even non-zero integer is TRUE\");\n"
+        "_Static_assert((_Bool)0.5 == 1, \"and so is a fraction below one\");\n"
+        "_Static_assert((_Bool)0.0 == 0, \"but zero is false\");\n"
+        "_Static_assert((_Bool)-0.5 == 1, \"sign is irrelevant to truth\");\n"
+        // The operand shapes the width-1 integer path could reach must not be
+        // lost by moving to a comparison: a null-base ADDRESS, an offsetof, a
+        // character constant, an enumerator, a `_BitInt` and an `__int128`.
+        // ✔MEASURED, gcc 13.3.0 and clang 18.1.3 accept every one.
+        "_Static_assert((_Bool)(void *)0 == 0, \"a null address is false\");\n"
+        "_Static_assert((_Bool)sizeof(int) == 1, \"\");\n"
+        "_Static_assert((_Bool)'a' == 1, \"\");\n"
+        "_Static_assert((_Bool)2wb == 1, \"\");\n"
+        "_Static_assert((_Bool)(__int128)2 == 1, \"\");\n"
+        "static int a[(_Bool)2 + 41];\n"
+        "_Static_assert(sizeof a == 42 * sizeof(int),"
+        " \"the bound is 42, not the 41 a low-bit truncation gives\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(SemanticAnalyzerC, CastToAFloatTypeFoldsButItsVALUEStaysOutOfIntegerSlots) {
+    // The reverse direction, and the boundary in one test. A cast whose TARGET is
+    // a float is a foldable constant — all four references accept
+    // `_Static_assert((double)3 == 3.0, "")` — but its VALUE is still a float, and
+    // all four REJECT the same expression as an array bound, an enumerator or a
+    // bit-field width. Widening the fold must not widen the consumer.
+    auto folds = analyzeShipped("c", {
+        "_Static_assert((double)3 == 3.0, \"a float-targeted cast folds\");\n"
+        "_Static_assert((int)(double)3 == 3, \"and converts back\");\n"
+        "_Static_assert((float)0.1 != 0.1, \"at the TARGET's precision\");\n"
+        // ⚠ An UNSIGNED source above INT64_MAX widens as UNSIGNED. The two obvious
+        // bridges each fail differently — `asInt64` refuses this outright and
+        // `asIntBits` reinterprets it as -1 — and the second line is what tells
+        // them apart. ✔MEASURED: all four references fold this to 2^64.
+        "_Static_assert((double)18446744073709551615ULL"
+        " == 18446744073709551616.0, \"unsigned widening\");\n"
+        "_Static_assert((double)18446744073709551615ULL != -1.0,"
+        " \"and NOT an int64 reinterpretation\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(folds.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(folds, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(folds.hasErrors());
+
+    char const* const integerRequired[] = {
+        "static int a[(double)3];\n",
+        "enum E { A = (double)3 };\n",
+        "struct S { int x : (double)3; };\n",
+    };
+    for (char const* src : integerRequired) {
+        auto m = analyzeShipped("c", {std::string{src} + "int main(void){ return 0; }\n"});
+        EXPECT_TRUE(m.hasErrors())
+            << "a float-VALUED cast must not satisfy an integer-required "
+               "consumer, and all four references refuse it: " << src;
+    }
+}
+
+TEST(SemanticAnalyzerC, FloatCastOutOfTargetRangeIsRefusedNotSaturated) {
+    // ⚖ THE ONE RULING IN THIS ROW, AND THE REASON FOR IT. C 6.3.1.4p1 leaves the
+    // conversion UNDEFINED when the truncated integral part is outside the
+    // target's range, and the four references do not agree on the number they
+    // produce — ✔MEASURED separately: `(int)1e30` is 2147483647 on gcc 13.3.0,
+    // clang 18.1.3 and mingw-w64 gcc 13.2.0 but 0 on MSVC 19.51; `(char)300.5` is
+    // 127 on the three and 44 on MSVC; `(unsigned)-3.5` is 0 on the three and
+    // 4294967293 on MSVC. There is no union value to bake, none of the four
+    // DIAGNOSES the saturation (measured under -Wall -Wextra), and DSS's own
+    // runtime answer for the same conversion is target-dependent (x86-64's
+    // `cvttsd2si` and aarch64's saturating `fcvtzs` differ), so folding one number
+    // would make a constant disagree with the runtime it is supposed to replace.
+    // DSS refuses. The refusal is what this test pins; it is a deliberate
+    // narrowing against three of the four toolchains on UNDEFINED behaviour.
+    char const* const outOfRange[] = {
+        "_Static_assert((int)1e30 != 0, \"m\");\n",
+        "_Static_assert((char)300.5 != 0, \"m\");\n",
+        "_Static_assert((unsigned)-3.5 != 0, \"m\");\n",
+        "static int a[(int)1e30];\n",
+        "enum E { A = (int)1e30 };\n",
+    };
+    for (char const* src : outOfRange) {
+        auto m = analyzeShipped("c", {std::string{src} + "int main(void){ return 0; }\n"});
+        EXPECT_TRUE(m.hasErrors())
+            << "an out-of-range float->int conversion must be refused, never "
+               "folded to one vendor's saturation: " << src;
+    }
+    // The CONTROL that makes the refusal a boundary rather than a blanket. Values
+    // exactly at the edge are perfectly defined and must fold.
+    auto inRange = analyzeShipped("c", {
+        "_Static_assert((int)2147483647.0 == 2147483647, \"the top of int\");\n"
+        "_Static_assert((int)-2147483648.0 == -2147483647-1, \"and the bottom\");\n"
+        "_Static_assert((unsigned)4294967295.0 == 4294967295u, \"\");\n"
+        "_Static_assert((int)2147483647.5 == 2147483647,"
+        " \"truncation happens BEFORE the range test\");\n"
+        "_Static_assert((unsigned long long)1.8446744e19 > 0,"
+        " \"a 64-bit unsigned target is not bounded by int64\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(inRange.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(inRange, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(inRange.hasErrors());
+}
+
+TEST(SemanticAnalyzerC, StaticAssertNonConstantOperandNamesItself) {
+    // The operand suffix used to render the fixed string `<non-constant>` for
+    // every operand that failed to fold — identical text for every such failure,
+    // i.e. no instrument at all on the one case it exists to explain.
+    auto model = analyzeShipped("c", {
+        "int g;\n"
+        "_Static_assert(g > 0, \"m\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u);
+    std::string const msg = firstActualForCode(
+        model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_EQ(msg.find("<non-constant>"), std::string::npos)
+        << "the placeholder must be gone: " << msg;
+    EXPECT_NE(msg.find("g"), std::string::npos)
+        << "the non-folding operand must name itself: " << msg;
+}
+
+// ── [[D-DIAG-BITFIELD-REJECT-CARRIES-NO-MESSAGE]] ───────────────────────────
+//
+// Every bit-field constraint violation carries words. Before this, all four arms
+// emitted `d.actual = tree.text(suffix)` and no message at all, so
+// `struct P { int x : -1; };` rendered as `error[S_BitFieldWidthOutOfRange]:
+// [target=…] : -1`. ⚠ EVERY assertion below reads the MESSAGE, not the code.
+TEST(SemanticAnalyzerC, BitFieldRejectsCarryAMessageNamingTheFault) {
+    struct Case { char const* src; char const* mustSay; char const* alsoSay; };
+    // Each source is refused by gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0
+    // and MSVC 19.51 alike; only the WORDS are DSS's own.
+    Case const cases[] = {
+        {"struct P { int x : -1; };\n",        "negative", "-1"},
+        {"struct P { int x : 200; };\n",       "exceed",   "200"},
+        {"struct P { int named : 0; };\n",     "unnamed",  "6.7.2.1p3"},
+        {"struct P { float f : 3; };\n",       "integer",  "6.7.2.1p5"},
+        {"int n;\nstruct P { int x : n; };\n", "constant", "6.7.2.1p4"},
+    };
+    for (Case const& c : cases) {
+        auto model = analyzeShipped("c", {
+            std::string{c.src} + "int main(void){ return 0; }\n",
+        });
+        // Either of the two codes the validator owns — this test is about the
+        // WORDS, so it deliberately does not care which arm fired.
+        std::string msg = firstActualForCode(
+            model, DiagnosticCode::S_BitFieldWidthOutOfRange);
+        if (msg.empty()) {
+            msg = firstActualForCode(model,
+                                     DiagnosticCode::S_BitFieldNonIntegerType);
+        }
+        ASSERT_FALSE(msg.empty()) << "no bit-field diagnostic for: " << c.src;
+        EXPECT_NE(msg.find("bit-field"), std::string::npos)
+            << c.src << " -> " << msg;
+        EXPECT_NE(msg.find(c.mustSay), std::string::npos)
+            << c.src << " -> " << msg;
+        EXPECT_NE(msg.find(c.alsoSay), std::string::npos)
+            << c.src << " -> " << msg;
+    }
+}
+
+TEST(SemanticAnalyzerC, BitFieldMessageIsNotASliceOfTheSourceBuffer) {
+    // ★ THE MACRO CASE, WHICH IS WHY THE MESSAGE STOPPED BEING `tree.text`.
+    // A token spelled inside a macro replacement list keeps THAT list's offsets,
+    // so the suffix node's span can cover bytes belonging to neither operand.
+    // ✔MEASURED before this change, the message body for exactly this source was
+    // `200` followed by a newline and the whole `GUARD` `#define` line — the
+    // bytes between two unrelated definitions. The message must now describe the
+    // FAULT, and must not contain the definition text it used to paste.
+    auto model = analyzeShipped("c", {
+        "#define WIDTH_LIMIT 200\n"
+        "#define GUARD(name) struct name { int slot : WIDTH_LIMIT; }\n"
+        "GUARD(SizeCeiling);\n"
+        "int main(void){ return 0; }\n",
+    });
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_BitFieldWidthOutOfRange), 1u);
+    std::string const msg = firstActualForCode(
+        model, DiagnosticCode::S_BitFieldWidthOutOfRange);
+    EXPECT_EQ(msg.find("#define"), std::string::npos)
+        << "the message must not be a slice of the preprocessed buffer: " << msg;
+    EXPECT_NE(msg.find("200"), std::string::npos)
+        << "the offending width must be named: " << msg;
+    EXPECT_NE(msg.find("32"), std::string::npos)
+        << "the limit that was exceeded must be named: " << msg;
+}
+
+TEST(SemanticAnalyzerC, ValidBitFieldsStayClean) {
+    // The regression direction for a diagnostic edit: the arms that must NOT
+    // fire. Splitting one wordless check into four worded ones could easily make
+    // a legal width take the negative arm.
+    auto model = analyzeShipped("c", {
+        "struct S { unsigned a : 1; int b : 32; unsigned long long c : 64;\n"
+        "           int : 0; unsigned d : 3; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_BitFieldWidthOutOfRange), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_BitFieldNonIntegerType), 0u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY — the RANGE
+// WARNING (P54 lane `fw`).
+//
+// The sibling half of this row made an overflowing float literal COMPILE to the
+// correctly-rounded signed infinity and deliberately said NOTHING about it. That
+// silence is what these tests are about: ✔MEASURED 2026-09-02, each reference
+// invoked SEPARATELY, DEFAULT and STRICT — gcc 13.3.0, clang 18.1.3 and
+// mingw-w64 gcc 13.2.0 WARN by default and error under `-Werror`, MSVC
+// 19.51.36252 REFUSES outright at every flag level. **No member of the union
+// accepts it silently**, so silence was the one posture no reference takes.
+//
+// The corpus entry `examples/c/float_literal_overflow_infinity` pins the BYTES
+// and that the program still builds and runs; these pin the things an example
+// cannot reach — that the diagnostic is a WARNING and not an Error, WHICH
+// literals draw it and which must stay silent, and what the message SAYS.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+// The count of range warnings a source draws, at a named long-double axis.
+[[nodiscard]] std::size_t
+overflowWarnings(SemanticModel const& m) {
+    return countCode(m.diagnostics(),
+                     DiagnosticCode::S_FloatLiteralOverflowsToInfinity);
+}
+} // namespace
+
+TEST(SemanticAnalyzerC, FloatLiteralOverflowWarnsAndTheProgramStillCompiles) {
+    auto model = analyzeShipped("c", {
+        "static const double v = 1e400;\n"
+        "int main(void){ return 0; }\n",
+    });
+    ASSERT_EQ(overflowWarnings(model), 1u)
+        << "an overflowing float literal must draw exactly one range warning";
+    // ★ THE SEVERITY IS THE WHOLE DECISION. An Error here would put DSS below
+    // gcc/clang/mingw, which compile this program; silence would put it below
+    // ALL FOUR, none of which is quiet. Asserted directly rather than inferred
+    // from `hasErrors()`, so a future severity flip cannot hide behind a second
+    // diagnostic being absent.
+    bool sawWarning = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_FloatLiteralOverflowsToInfinity) continue;
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Warning)
+            << "the range report must be a WARNING — `--warnings-as-errors` is "
+               "what reproduces gcc's `-Werror` and MSVC's refusal";
+        sawWarning = true;
+    }
+    EXPECT_TRUE(sawWarning);
+    EXPECT_FALSE(model.hasErrors())
+        << "the program compiles: +inf IS the correctly-rounded value "
+           "(C23 5.2.5.3.3p19, Annex F.2.2p1)";
+}
+
+TEST(SemanticAnalyzerC, FloatLiteralOverflowMessageNamesTheLiteralAndItsType) {
+    // ★ A diagnostic that fires with the right CODE and the wrong words stays
+    // green under a count assertion — the lesson the four wordless bit-field
+    // arms cost. Both references that speak here name the type
+    // (`exceeds range of 'double'` / `too large for type 'double'`), so DSS does.
+    struct Case { char const* src; char const* type; char const* literal; };
+    Case const cases[] = {
+        {"static const double v = 1e400;\n",  "double", "1e400"},
+        {"static const float  v = 1e40f;\n",  "float",  "1e40f"},
+    };
+    for (Case const& c : cases) {
+        auto model = analyzeShipped("c", {
+            std::string{c.src} + "int main(void){ return 0; }\n",
+        });
+        std::string const msg = firstActualForCode(
+            model, DiagnosticCode::S_FloatLiteralOverflowsToInfinity);
+        ASSERT_FALSE(msg.empty()) << "no range warning for: " << c.src;
+        EXPECT_NE(msg.find(c.literal), std::string::npos)
+            << "the message must quote the literal: " << msg;
+        EXPECT_NE(msg.find(c.type), std::string::npos)
+            << "the message must name the type whose range was exceeded: " << msg;
+        EXPECT_NE(msg.find("infinity"), std::string::npos)
+            << "the message must say what the value BECAME — the whole point is "
+               "that the literal was accepted, not refused: " << msg;
+    }
+}
+
+TEST(SemanticAnalyzerC, FloatLiteralOverflowWarnsOnEveryDoorTheDecoderHas) {
+    // Three decoder doors reach an infinity and all three must report it:
+    //   (a) strtod ERANGE            — `1e400`, `1e309`, `0x1p+99999`
+    //   (b) the F32 NARROWING        — `1e40f` decodes to a FINITE double and
+    //                                  only overflows when narrowed to binary32
+    //   (c) the wide bignum kernel   — the `L` arms below, in the axis test
+    // (b) is the one a naive implementation misses: nothing overflowed in the
+    // decode at all, which is exactly why the sibling row found DSS already
+    // emitting `7f800000` for it SILENTLY.
+    for (char const* init : {"1e400", "1e309", "1.7976931348623159e308",
+                             "0x1p+99999", "-1e400", "1e400 + 0.0"}) {
+        auto model = analyzeShipped("c", {
+            "static const double v = " + std::string{init} + ";\n"
+            "int main(void){ return 0; }\n",
+        });
+        EXPECT_EQ(overflowWarnings(model), 1u) << "double init: " << init;
+        EXPECT_FALSE(model.hasErrors()) << "double init: " << init;
+    }
+    for (char const* init : {"1e40f", "1e400f", "0x1p+9999f", "-1e40f"}) {
+        auto model = analyzeShipped("c", {
+            "static const float v = " + std::string{init} + ";\n"
+            "int main(void){ return 0; }\n",
+        });
+        EXPECT_EQ(overflowWarnings(model), 1u) << "float init: " << init;
+        EXPECT_FALSE(model.hasErrors()) << "float init: " << init;
+    }
+}
+
+TEST(SemanticAnalyzerC, FloatLiteralsTheReferencesAcceptSilentlyStayQuiet) {
+    // ⚠ THE DIRECTION THIS CHANGE RISKS. A range warning is cheap to over-fire,
+    // and a warning DSS invents where all four references are silent is noise
+    // that `--warnings-as-errors` turns into a refusal. Every literal here was
+    // ✔MEASURED clean on gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC
+    // 19.51.36252 alike, and `1.7976931348623157e308` is ONE ULP below the
+    // literal the test above requires a warning for — that pair is the only
+    // check separating "reports overflow" from "reports anything large".
+    for (char const* init : {"1.7976931348623157e308",   // DBL_MAX
+                             "1e308", "1e-320",          // subnormal: a VALUE
+                             "0.1", "0.0", "-0.0"}) {
+        auto model = analyzeShipped("c", {
+            "static const double v = " + std::string{init} + ";\n"
+            "int main(void){ return 0; }\n",
+        });
+        EXPECT_EQ(overflowWarnings(model), 0u) << "double init: " << init;
+    }
+    for (char const* init : {"3.40282347e38f", "1e38f", "0.5f", "0.0f"}) {
+        auto model = analyzeShipped("c", {
+            "static const float v = " + std::string{init} + ";\n"
+            "int main(void){ return 0; }\n",
+        });
+        EXPECT_EQ(overflowWarnings(model), 0u) << "float init: " << init;
+    }
+}
+
+TEST(SemanticAnalyzerC, FloatLiteralUnderflowToZeroStaysSilentDeliberately) {
+    // ⓘ THE DECISION THAT IS NOT SYMMETRIC WITH THE OVERFLOW ONE, and the
+    // measurement is what makes it so. ✔MEASURED 2026-09-02: on `1e-330` (and
+    // `1e-60f`) gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 all warn
+    // (`floating constant truncated to zero` / `magnitude … too small for type`)
+    // but MSVC 19.51.36252 ACCEPTS IT SILENTLY, at `/W4 /WX` as well as with no
+    // flags. So unlike overflow — where silence is a posture NO reference takes
+    // — a silent accept here IS a reference posture, and DSS matching it sits
+    // inside the union rather than below it. Two further reasons, both recorded
+    // on `S_FloatLiteralOverflowsToInfinity`: the WIDE door still REFUSES a
+    // `long double` underflow (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-SUBNORMAL-RESULT,
+    // still open), so a warning would cover one of two doors; and promoting it
+    // under `--warnings-as-errors` would restore a refusal
+    // D-C-DECODEFLOAT-TREATS-UNDERFLOW-AS-FATAL deliberately removed hours
+    // earlier in this same cycle.
+    //
+    // This test exists so that decision is a PIN and not a gap: a later author
+    // who wants the underflow warning must delete this test and say why.
+    for (char const* src : {"static const double v = 1e-330;\n",
+                            "static const double v = 1e-400;\n",
+                            "static const float  v = 1e-60f;\n"}) {
+        auto model = analyzeShipped("c", {
+            std::string{src} + "int main(void){ return 0; }\n",
+        });
+        EXPECT_EQ(overflowWarnings(model), 0u)
+            << "underflow is not overflow: " << src;
+        EXPECT_FALSE(model.hasErrors()) << src;
+    }
+}
+
+TEST(SemanticAnalyzerC, LongDoubleLiteralOverflowFollowsTheDeclaredAxis) {
+    // ★★ THE STRONGEST STATEMENT THIS ROW CAN MAKE, and the one that proves the
+    // predicate is the ROUNDED VALUE rather than a decimal-exponent threshold.
+    // `1e400L` is the SAME TEXT on all three axes and the answer differs:
+    //   f64      long double IS binary64 (pe64 x86_64, Apple arm64) → OVERFLOWS
+    //   x87-80   15-bit exponent, max ≈ 1.19e4932                   → FINITE
+    //   ieee128  15-bit exponent, max ≈ 1.19e4932                   → FINITE
+    // ✔MEASURED against the references on their own `long double`: gcc 13.3.0,
+    // clang 18.1.3 and mingw-w64 gcc 13.2.0 (all x87-80) are SILENT on
+    // `long double v = 1e400L;` while MSVC 19.51.36252 (whose `long double` is 8
+    // bytes) refuses it `error C2177: constant too big` — the same split, read
+    // off the same axis difference. Nothing here is keyed on a host or arch
+    // `#ifdef`; the axis comes from the object format's declared
+    // `longDoubleFormat`.
+    struct Row { LongDoubleFormat axis; std::size_t warnsFor1e400L; };
+    for (Row const row : {Row{LongDoubleFormat::F64,     1u},
+                          Row{LongDoubleFormat::X87_80,  0u},
+                          Row{LongDoubleFormat::Ieee128, 0u}}) {
+        auto finite = analyzeWithLongDoubleAxis(
+            {"static const long double v = 1e400L;\n"
+             "int main(void){ return 0; }\n"}, row.axis);
+        EXPECT_EQ(overflowWarnings(finite), row.warnsFor1e400L)
+            << "axis " << static_cast<int>(row.axis) << " on 1e400L";
+        EXPECT_FALSE(finite.hasErrors())
+            << "axis " << static_cast<int>(row.axis);
+
+        // Past EVERY axis's ceiling: 1e5000 overflows binary64, x87-80 and
+        // binary128 alike, so this arm must warn on all three.
+        auto over = analyzeWithLongDoubleAxis(
+            {"static const long double v = 1e5000L;\n"
+             "int main(void){ return 0; }\n"}, row.axis);
+        EXPECT_EQ(overflowWarnings(over), 1u)
+            << "axis " << static_cast<int>(row.axis) << " on 1e5000L";
+        EXPECT_FALSE(over.hasErrors())
+            << "axis " << static_cast<int>(row.axis);
+    }
+}
+
+TEST(SemanticAnalyzerC, LongDoubleOverflowWarnsOnBothWideDecoderArms) {
+    // ⚠ THE TWO WIDE ARMS ARE DIFFERENT CODE and a fix in one leaves the other
+    // wrong differently. `1e5000L` takes the magnitude PRE-FILTER; `1e4940L` is
+    // inside the decade band, is BUILT exactly as a bignum and overflows inside
+    // `roundNormal`; a literal with a fractional part reaches the DIVISION arm.
+    // All three must produce the same verdict, or the warning would depend on
+    // how the programmer happened to spell the magnitude.
+    //
+    // ⓘ `1e4940L`, not `1e4000L`: both wide formats carry a 15-bit exponent and
+    // top out near 1.19e4932, so `1e4000L` is an ordinary FINITE value — the
+    // arithmetic slip the sibling row recorded going red over correct behaviour.
+    for (char const* init : {"1e5000L", "1e4940L", "1.5e4940L", "0x1p+99999L"}) {
+        auto model = analyzeWithX87Axis(
+            {"static const long double v = " + std::string{init} + ";\n"
+             "int main(void){ return 0; }\n"});
+        EXPECT_EQ(overflowWarnings(model), 1u) << "x87-80 init: " << init;
+        EXPECT_FALSE(model.hasErrors()) << "x87-80 init: " << init;
+    }
+    // The FINITE controls on the same axis — one decade below the ceiling.
+    for (char const* init : {"1e4000L", "1.0L", "0.1L"}) {
+        auto model = analyzeWithX87Axis(
+            {"static const long double v = " + std::string{init} + ";\n"
+             "int main(void){ return 0; }\n"});
+        EXPECT_EQ(overflowWarnings(model), 0u) << "x87-80 init: " << init;
+    }
+}
+
+TEST(SemanticAnalyzerC, FloatLiteralOverflowWarnsWhereverTheLiteralAPPEARS) {
+    // ★★ THIS IS WHY THE DIAGNOSTIC LIVES IN THE SEMANTIC TIER AND NOT AT THE
+    // DECODE. The obvious home is the CST→HIR literal leaf, where the value is
+    // actually produced — and it is the wrong one twice over: lowering runs only
+    // after the semantic tier reports no errors, and it never reaches a literal
+    // in an UNEVALUATED operand at all. ✔MEASURED 2026-09-02 that gcc 13.3.0 and
+    // clang 18.1.3 both warn in EVERY position below, `sizeof` included.
+    struct Case { char const* what; std::string src; };
+    Case const cases[] = {
+        {"unevaluated sizeof operand",
+         "int main(void){ return (int)sizeof(1e400); }\n"},
+        {"static assertion condition",
+         "_Static_assert(1e400 > 0.0, \"sa\");\nint main(void){ return 0; }\n"},
+        {"unreachable branch",
+         "int main(void){ if (0) { double d = 1e400; (void)d; } return 0; }\n"},
+        {"function that is never called",
+         "static double f(void){ return 1e400; }\nint main(void){ return 0; }\n"},
+        {"unused file-scope static",
+         "static const double unused_v = 1e400;\nint main(void){ return 0; }\n"},
+        {"call argument",
+         "double g(double);\nint main(void){ return (int)g(1e400); }\n"},
+    };
+    for (Case const& c : cases) {
+        auto model = analyzeShipped("c", {c.src});
+        EXPECT_EQ(overflowWarnings(model), 1u) << c.what;
+    }
+}
+
+TEST(SemanticAnalyzerC, AnAutoOrTypeofLiteralLeafIsNotReportedTwice) {
+    // ⚠ THE CHOKEPOINT IS VISITED TWICE FOR SOME LEAVES, and this warning is the
+    // first one to depend on that not showing. `typeLiteralIfAny` runs from the
+    // Pass-2 blanket post-order walk AND from `preStampLiteralLeaves`, the Pass
+    // 1.5 pre-stamp every `auto` / `typeof` subtree needs — so a literal under
+    // one of those heads reaches the emit site TWICE with the same span. Its
+    // comment says the double visit "collapses in the reporter's recent-duplicate
+    // window (suppressible code — the dedup applies)", which is a property of
+    // `S_IntegerLiteralTooLarge` that this code INHERITS rather than one it was
+    // given. ✔MEASURED through the CLI at the same commit: `auto v = 1e400;` plus
+    // `__typeof__(1e400) w = 0.0;` emits exactly TWO warnings, one per literal.
+    // Pinned so that de-listing this code from the suppressable set — which is
+    // what would disable the dedup — cannot silently start double-reporting.
+    auto model = analyzeShipped("c", {
+        "int main(void) {\n"
+        "    auto v = 1e400;\n"
+        "    __typeof__(1e400) w = 0.0;\n"
+        "    (void)v; (void)w;\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_EQ(overflowWarnings(model), 2u)
+        << "one warning per LITERAL — the Pass-1.5 pre-stamp must not add a "
+           "second report of the same span";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(SemanticAnalyzerC, EveryOccurrenceOfAnOverflowingLiteralIsReported) {
+    // gcc and clang warn ONCE PER LITERAL, not once per distinct spelling — the
+    // diagnostic is about the token the programmer wrote. Three occurrences,
+    // three warnings; the reporter's recent-duplicate window must not collapse
+    // them, because their SPANS differ.
+    auto model = analyzeShipped("c", {
+        "static const double a = 1e400;\n"
+        "static const double b = 1e400;\n"
+        "static const double c[2] = {1e400, 0.0};\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(overflowWarnings(model), 3u);
+    EXPECT_FALSE(model.hasErrors());
 }

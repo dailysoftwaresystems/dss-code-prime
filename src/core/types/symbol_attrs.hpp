@@ -175,6 +175,62 @@ static_assert(stricterDuplicateMatch(DuplicateMatch::ExactContent,
 static_assert(stricterDuplicateMatch(DuplicateMatch::Any, DuplicateMatch::Any)
               == DuplicateMatch::Any);
 
+// ── WHEN TWO TRANSLATION UNITS REFERENCE ONE NAME AND DISAGREE ────────────
+//    D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE
+//
+// The REFERENCE-side twin of `stricterDuplicateMatch` above, and it exists for
+// the same reason: two merge tiers fold import rows (`mir_merge.cpp`'s
+// `ffiImportKey` group and `linker.cpp`'s `dedupKey` group) and a rule spelled
+// twice is a rule that drifts.
+//
+// A STRONG (`Global`) reference says the symbol MUST be resolved. A `Weak` one
+// says it MAY resolve to nothing, in which case its address is 0. Where one CU
+// requires the symbol and another can do without it, the PROGRAM requires it —
+// which is what C says and what gcc and clang do — so Global wins. The opposite
+// rule produces an image that links with the symbol absent and then reads
+// through a null address, which is a silent wrong answer rather than a link
+// error.
+//
+// ⚠ IT DOES NOT COMPARE THE ENUMERATORS NUMERICALLY, and that is not fussiness.
+// `SymbolBinding` is ordered Local(0) < Global(1) < Weak(2) — an order that
+// suits neither strength nor visibility, because it was never chosen for either.
+// A `std::max` here would return WEAK and invert the rule silently, which is the
+// exact mistake `stricterDuplicateMatch`'s static_assert exists to prevent one
+// axis over. The value order is therefore not relied on at all.
+//
+// ⚠ `Local` IS NOT A REPRESENTABLE REFERENCE BINDING — no format spells an
+// undefined LOCAL symbol — and it never reaches here: HIR→MIR's `collectExterns`
+// refuses it at the declaration's own source span. It is nevertheless TOTAL
+// rather than assumed away, and the total answer is stated as a single
+// disjunction so there is no arm that can RETURN `Local`: a Local operand
+// contributes nothing, exactly as a Weak one does, and two of them still yield
+// the representable `Weak`. A function that could hand `Local` back to a writer
+// would put an unspellable binding on an undefined symbol — the very thing the
+// refusal upstream exists to prevent — from an arm no test would think to cover.
+[[nodiscard]] constexpr SymbolBinding
+strongerReferenceBinding(SymbolBinding a, SymbolBinding b) noexcept {
+    return (a == SymbolBinding::Global || b == SymbolBinding::Global)
+               ? SymbolBinding::Global
+               : SymbolBinding::Weak;
+}
+
+static_assert(strongerReferenceBinding(SymbolBinding::Weak, SymbolBinding::Global)
+              == SymbolBinding::Global);
+static_assert(strongerReferenceBinding(SymbolBinding::Global, SymbolBinding::Weak)
+              == SymbolBinding::Global);
+static_assert(strongerReferenceBinding(SymbolBinding::Weak, SymbolBinding::Weak)
+              == SymbolBinding::Weak);
+static_assert(strongerReferenceBinding(SymbolBinding::Global, SymbolBinding::Global)
+              == SymbolBinding::Global);
+static_assert(strongerReferenceBinding(SymbolBinding::Local, SymbolBinding::Weak)
+              == SymbolBinding::Weak);
+static_assert(strongerReferenceBinding(SymbolBinding::Local, SymbolBinding::Global)
+              == SymbolBinding::Global);
+static_assert(strongerReferenceBinding(SymbolBinding::Local, SymbolBinding::Local)
+              == SymbolBinding::Weak,
+              "two non-representable operands still yield a representable "
+              "reference binding -- the fold has no arm that can return Local");
+
 // D-OPT1-SYMBOL-BINDING-VISIBILITY-THREAD invariant: a symbol whose
 // `binding == Global` AND `visibility != Hidden` AND `visibility !=
 // Internal` is externally observable — every later image (the linker,

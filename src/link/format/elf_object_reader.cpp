@@ -612,6 +612,21 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // an address-taken extern function and EVERY aarch64 extern call
             // (aarch64 declares no pltNativeId).
             ext.isData      = (stType(sy.info) != kSttFunc);
+            // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the REFERENCE
+            // binding, through the SAME `stbToBinding` every DEFINED symbol in
+            // this reader uses -- ELF spells a weak reference and a weak
+            // definition in the one `st_info` field, so there is nothing extra
+            // to decode. Reading it as Global (what this arm did until the
+            // import row could hold a binding) silently drops the property that
+            // lets the program link with the symbol absent; ✔MEASURED that gcc
+            // 13.3.0 and clang 18.1.3 both emit `NOTYPE WEAK DEFAULT UND` here,
+            // and DSS's own writer now does too, so the round trip closes.
+            // ⚠ A STB_LOCAL undefined symbol is not a shape any producer emits
+            // (an undefined LOCAL names nothing any linker could resolve);
+            // `stbToBinding` maps it to `SymbolBinding::Local`, which the
+            // link-tier fold `strongerReferenceBinding` treats as contributing
+            // nothing rather than as a third kind of reference.
+            ext.binding     = stbToBinding(stBind(sy.info));
             externBySym.emplace(static_cast<std::uint32_t>(i), mod.externImports.size());
             mod.externImports.push_back(std::move(ext));
             continue;

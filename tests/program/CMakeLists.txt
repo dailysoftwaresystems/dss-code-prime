@@ -26,6 +26,14 @@ dss_add_test(NAME program/test_include_dirs
              SOURCES test_include_dirs.cpp)
 dss_add_test(NAME program/test_system_dirs_cwd_independent
              SOURCES test_system_dirs_cwd_independent.cpp)
+
+# D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE: a binary built from tree A
+# and run with a cwd inside tree B answers out of TREE B, and said nothing about
+# it. Driver tier because the subject is what ONE INVOCATION reports — the
+# arm-by-arm behaviour of the note lives in tests/core/test_config_path_walk.cpp,
+# and a unit test there could not observe either CLI entry point.
+dss_add_test(NAME program/test_config_root_attribution
+             SOURCES test_config_root_attribution.cpp)
 dss_add_test(NAME program/test_input_resolver
              SOURCES test_input_resolver.cpp)
 dss_add_test(NAME program/test_cross_validate_target_format

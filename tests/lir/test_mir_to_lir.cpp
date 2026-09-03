@@ -420,7 +420,7 @@ TEST(MirToLir, UnsignedDivisionLowersToXorPlusDivNotCqoIDiv) {
 // VALUE was wanted — off by one indirection, a silent miscompile. Always-on
 // structural guard for the macho stdout/stderr codegen (runtime witness =
 // the `stdio_stream_objects` macho arm). RED-ON-DISABLE: drop the
-// externDataGotSymbols_ membership (bare lea) → 1 memory access; keep the
+// slotIndirectAddrSymbols_ membership (bare lea) → 1 memory access; keep the
 // fold (not suppressed) → the pair folds to ONE riprel load, 0 MemBase.
 TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
     TypeInterner interner{CompilationUnitId{1}};
@@ -478,6 +478,97 @@ TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
         << "a got-indirect data extern needs the __got DEREF load (the object "
            "address) BEFORE the C-level load (the object value) — two base-reg "
            "memory accesses; a bare lea gives 1, a folded riprel load gives 0.";
+}
+
+// D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET (P54): under an
+// `indirect-slot` format the extern's symbolVa IS a pointer slot — that is what
+// makes `call_indirect_via_extern` (FF 15, deref the slot) the correct call
+// shape there — so an extern FUNCTION's ADDRESS-as-a-VALUE must come from the
+// SAME slot: lea-of-slot + a pointer deref. A bare lea hands the program the
+// SLOT's address, which is the shape the pe64 exec document recorded as
+// "`indirect-slot` MISCOMPILES an address-taken import" (sqlite os_win.c
+// aSyscall[] then called through it into data), and which link.exe answers with
+// LNK2016 on a relocatable object because the slot symbol it names is a weak
+// external's ABSOLUTE value-0 default.
+//
+// BOTH DIRECTIONS IN ONE TEST, and the second is the load-bearing one: the same
+// module under `direct-plt` (every image format, where the walker points a
+// function extern's VA at a CALLABLE THUNK) must keep the BARE lea. A change
+// that routed every extern function address through a slot would pass the first
+// assertion and fail this one, which is exactly the regression lane `wi`
+// measured — a program that linked clean and segfaulted.
+// RED-ON-DISABLE: drop the `externCallDispatch == IndirectSlot` arm that
+// populates `slotIndirectAddrSymbols_` → the indirect-slot arm emits a bare lea,
+// 0 memory accesses, direction 1 fails.
+TEST(MirToLir, IndirectSlotExternFunctionAddressValueDerefsTheSlot) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const ptrT = interner.pointer(interner.primitive(TypeKind::Void));
+    // `void* f(void) { return &maybe; }` — GlobalAddr(maybe) used as a VALUE.
+    // Its sole use is the Return, so neither fold fires and the address arm of
+    // `lowerGlobalAddr` is what answers.
+    TypeId const callerSig =
+        interner.fnSig(std::span<TypeId const>{}, ptrT, CallConv::CcSysV);
+    SymbolId const fnSym{200};
+    auto buildMir = [&] {
+        MirBuilder mb;
+        mb.addFunction(callerSig, SymbolId{100});
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(entry);
+        MirInstId const ga = mb.addGlobalAddr(fnSym, ptrT);
+        mb.addReturn(ga);
+        return std::move(mb).finish();
+    };
+
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    std::vector<dss::ExternImport> externs;
+    dss::ExternImport ei;
+    ei.symbol      = fnSym;
+    ei.mangledName = "maybe";
+    ei.isData      = false;   // A FUNCTION import — the whole point.
+    externs.push_back(ei);
+
+    // Count the base-register memory accesses reachable from the GlobalAddr:
+    // the slot deref is one, a bare lea is none.
+    auto memAccessCount = [](Lir const& lir) {
+        LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+        int n = 0;
+        for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+            for (auto const& op : lir.instOperands(lir.blockInstAt(bb, i))) {
+                if (op.kind == LirOperandKind::MemBase) { ++n; break; }
+            }
+        }
+        return n;
+    };
+
+    // (1) indirect-slot ⇒ lea-of-slot + DEREF.
+    {
+        Mir mir = buildMir();
+        DiagnosticReporter rep;
+        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                               ExternCallDispatch::IndirectSlot,
+                               DataImportBinding::GotIndirect);
+        ASSERT_TRUE(lirR.ok);
+        EXPECT_GE(memAccessCount(lirR.lir), 1)
+            << "under `indirect-slot` the extern's VA is a POINTER SLOT, so "
+               "`&maybe` must LOAD it; a bare lea yields the slot's own "
+               "address — the miscompile link.exe answers with LNK2016 and "
+               "mingw ld truncates silently.";
+    }
+    // (2) direct-plt ⇒ the BARE lea, byte-identical to before this row.
+    {
+        Mir mir = buildMir();
+        DiagnosticReporter rep;
+        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                               ExternCallDispatch::DirectPlt,
+                               DataImportBinding::GotIndirect);
+        ASSERT_TRUE(lirR.ok);
+        EXPECT_EQ(memAccessCount(lirR.lir), 0)
+            << "under `direct-plt` the walker binds a function extern's VA to "
+               "a CALLABLE THUNK, so `&maybe` IS that address and a deref "
+               "would read the jump stub's bytes. The got-indirect DATA "
+               "binding must not widen to functions on an image.";
+    }
 }
 
 // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got` extern-address
@@ -8405,15 +8496,32 @@ TEST(MirToLirPackedAtomic, TrapsTargetWithNoAtomicsRuntimeRefusesLoud) {
 
 TEST(MirToLirPackedAtomic,
      LosesAtomicityTargetWithNoRuntimeKeepsTheNativeFormRatherThanRefusing) {
-    // ⚠⚠ THIS IS THE pe64 ARM AND IT IS THE ONE THE FIRST CUT GOT WRONG.
-    // ✔MEASURED while building P53 lane a3: with a single "no runtime ⇒ refuse"
-    // rule, `dsscp --target x86_64:pe64-x86_64-windows-exec` REJECTED a packed
-    // `_Atomic` member — a construct mingw-w64 gcc accepts and whose emitted
-    // `xchgl`/`movl` pair RUNS rc 42 on Windows. Refusing it is BELOW the
-    // (gcc ∪ clang ∪ MSVC) ∪ ISO C union, i.e. a new conformance defect
-    // manufactured by the fix for another one. UCRT exports no `__atomic_*`
-    // symbol and there is no PE atomics image to name, so this is not a
-    // hypothetical arm — it is every Windows build.
+    // The `losesAtomicity` + NO-IMAGE arm of `atomicLoweringFor`: keep the native
+    // form rather than refuse. Refusing would be BELOW the
+    // (gcc ∪ clang ∪ MSVC) ∪ ISO C union — a new conformance defect manufactured
+    // by the fix for another one — because gcc's inline pair is ACCEPTED and does
+    // not fault on a `losesAtomicity` processor.
+    //
+    // ⚠⚠ P54 CHANGED THIS TEST'S EXEMPLAR, NOT ITS SUBJECT, AND THE OLD EXEMPLAR
+    // IS RECORDED HERE RATHER THAN DELETED BECAUSE THE WAY IT EXPIRED IS THE
+    // LESSON. It used to open "THIS IS THE pe64 ARM ... UCRT exports no
+    // `__atomic_*` symbol and there is no PE atomics image to name, so this is
+    // not a hypothetical arm — it is every Windows build." The first clause is
+    // still true; the second was inferred from it rather than measured, and
+    // ✔MEASURED 2026-09-02 (P54) it is FALSE — mingw-w64's `libatomic-1.dll`
+    // exports `__atomic_load` (ord 55) and `__atomic_store` (ord 71), so all four
+    // pe64 flavours now declare the role and take the libcall like every other
+    // shipped format. What survives is the LOWERING RULE this test actually pins,
+    // which no shipped format's config can reach around: any format that declares
+    // no atomics image (wasm32, spirv, or a future one) must keep the native form
+    // under `losesAtomicity` instead of refusing. The arm is still live; it is no
+    // longer WINDOWS that exercises it.
+    //
+    // ⓘ The `atomicsRuntime = std::nullopt` below is therefore now a SYNTHETIC
+    // no-image format rather than a stand-in for a shipped one, and that is
+    // deliberate — pinning the rule at the tier that decides it, not at whichever
+    // config happens to exercise it this cycle
+    // ([[feedback-a-rows-premise-has-a-shelf-life]]).
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     ASSERT_EQ((*target)->underAlignedAtomicForm(),
@@ -8452,4 +8560,105 @@ TEST(MirToLirPackedAtomic, LosesAtomicityTargetWithARuntimeStillTakesTheLibcall)
     ASSERT_TRUE(lirR.ok);
     EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0);
     EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 1);
+}
+
+// ★★ D-CSUBSET-PACKED-ATOMIC-MEMBER (P54): the pe64 arm, driven by the SHIPPED
+// config rather than a hand-built AtomicsRuntime.
+//
+// The two tests above pin the RULE with synthetic inputs; this one pins that the
+// shipped Windows format actually reaches it. Both halves matter and only the
+// pair is meaningful — the synthetic tests would stay green if every pe64
+// `.format.json` lost its `atomicsRuntime` block tomorrow, which is exactly the
+// state this row was REOPENED to fix.
+//
+// ⚠ EVERY ASSERTION BELOW IS AN EMITTED-FORM CLAIM, NOT AN ATOMICITY CLAIM. No
+// unit test on any host can observe atomicity; what it CAN observe is which of
+// the two routes was taken, and the route is what the reference union decides.
+// The atomicity itself comes from what the RUNTIME does, not from a count of
+// mnemonics ([[feedback-an-instrument-that-answers-an-adjacent-question]]) — and
+// it now has its own EXECUTION witness in
+// `examples/c/packed_atomic_member_concurrency`, where threads race an object
+// deliberately straddling a cache line and a torn value is observable.
+//
+// ⚠⚠ THE SENTENCE THAT USED TO SIT HERE — "the runtime property comes from
+// libatomic's lock-table dispatch" — IS REFUTED AND IS KEPT AS THE CORRECTION
+// RATHER THAN DELETED. ✔MEASURED 2026-09-02 (P54 lane `la`) by disassembling
+// `libatomic.so.1.2.0`: on x86-64 the generic entries do NOT take a lock for an
+// under-aligned access that fits inside an aligned block — `__atomic_load` does
+// a plain aligned 8-byte read and extracts, `__atomic_store` runs a
+// `lock cmpxchg` loop over the containing block — and the lock is reached only
+// for a straddling object or a size above 16. And on pe64 the provider is no
+// longer libatomic at all: it is DSS's own `runtime/platform/src/atomic.c`
+// (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64), which serves n = 4 and n = 8 with a
+// width-native `lock`-prefixed RMW and takes no lock in any case.
+TEST(MirToLirPackedAtomic, ShippedPe64FormatRoutesTheUnderAlignedAccessToTheRuntime) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(fmt.has_value())
+        << "the shipped pe64 exec format must load";
+    auto const& ar = (*fmt)->atomicsRuntime();
+    ASSERT_TRUE(ar.has_value())
+        << "pe64-x86_64-windows-exec must declare an `atomicsRuntime` block — "
+           "without one an under-aligned _Atomic silently keeps gcc's plain "
+           "`movl` load, which is not atomic across a cache line.";
+
+    // (a) UNDER-ALIGNED -> the runtime call, and NO native atomic instruction.
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
+        DiagnosticReporter rep;
+        std::vector<dss::ExternImport> noExterns;
+        auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                               ExternCallDispatch::DirectPlt, std::nullopt,
+                               std::nullopt, {}, std::nullopt, std::nullopt,
+                               std::nullopt, ar);
+        ASSERT_TRUE(lirR.ok);
+        EXPECT_EQ(rep.errorCount(), 0u)
+            << "declaring the image must not turn an accepted construct into a "
+               "refusal — that would be the conformance defect the P53 arm "
+               "correctly refused to manufacture.";
+        EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0)
+            << "RED-ON-DISABLE: the native xchg must NOT stand once a Windows "
+               "atomics image is declared.";
+        EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 1)
+            << "the generic __atomic_store must be called exactly once.";
+
+        // ★★ P54 lane `la` — THE MINTED EXTERN MUST CARRY NO LIBRARY, AND THIS
+        // IS THE ASSERTION THAT SEPARATES "DSS SHIPS THE BODY" FROM "DSS IMPORTS
+        // IT FROM A DLL". An EMPTY `libraryPath` is the `noLibraryBinding` shape
+        // (the same one `dirent`/`unistd` realizations use): the linker resolves
+        // it out of the shipped runtime archive by the ordinary unresolved-symbol
+        // pull. A regression that put an image back here would compile, link and
+        // RUN — against an external `libatomic-1.dll` that is not in-box on
+        // Windows — so nothing else in this file would notice.
+        ASSERT_EQ(lirR.externImports.size(), 1u)
+            << "exactly one atomics extern must be minted";
+        EXPECT_EQ(lirR.externImports[0].mangledName, "__atomic_store");
+        EXPECT_EQ(lirR.externImports[0].libraryPath, "")
+            << "the pe64 atomicsRuntime role is REALIZED from a shipped source, "
+               "so the minted extern must be unbound and resolve out of the "
+               "shipped runtime archive — a non-empty library here is the "
+               "external-DLL dependency P54 removed.";
+    }
+
+    // (b) THE ALIGNED CONTROL — the half a fault-only or route-only test cannot
+    // see. A "fix" routing EVERY `_Atomic` access through the runtime would pass
+    // (a) and still be wrong ([[feedback-a-partial-fix-reads-as-a-complete-one]]).
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/4, interner);
+        DiagnosticReporter rep;
+        std::vector<dss::ExternImport> noExterns;
+        auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                               ExternCallDispatch::DirectPlt, std::nullopt,
+                               std::nullopt, {}, std::nullopt, std::nullopt,
+                               std::nullopt, ar);
+        ASSERT_TRUE(lirR.ok);
+        EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 1)
+            << "a naturally-aligned atomic store must KEEP the native xchg on "
+               "Windows — declaring the runtime must not pessimise it.";
+        EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 0)
+            << "and it must not call the runtime at all.";
+    }
 }

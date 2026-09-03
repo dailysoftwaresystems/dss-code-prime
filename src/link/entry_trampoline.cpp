@@ -1,4 +1,5 @@
 #include "link/entry_trampoline.hpp"
+#include "link/fresh_symbol_ids.hpp"   // maxExistingSymbolIdV — shared with linker.cpp
 #include "link/static_init_tables.hpp"
 
 #include "core/types/config_key_vocabulary.hpp"  // renderAllowedList — the ONE closed-set renderer
@@ -23,41 +24,14 @@ namespace dss::linker {
 
 namespace {
 
-// Find the max SymbolId in the module (across functions +
-// externImports). Caller mints sequential IDs as `maxV+1`,
-// `maxV+2`, ... — re-scanning after each mint would silently
-// collide when modules are partially-mutated (the bug caught at
-// Slice C build).
-[[nodiscard]] std::uint32_t maxExistingSymbolIdV(AssembledModule const& mod) {
-    std::uint32_t maxV = 0;
-    for (auto const& fn : mod.functions) {
-        if (fn.symbol.v > maxV) maxV = fn.symbol.v;
-    }
-    for (auto const& ext : mod.externImports) {
-        if (ext.symbol.v > maxV) maxV = ext.symbol.v;
-    }
-    // D-LK4-RODATA-PRODUCER-STRING audit-fold (2026-06-02): include
-    // rodata items so the trampoline's mint can't collide with a
-    // string-literal-promoted MirGlobal that landed in dataItems.
-    // The collision would surface as `K_DuplicateDataSymbol` in the
-    // PE walker's symbolVa loop, NOT here — silent at this site,
-    // loud downstream — but the diagnostic would point at the PE
-    // walker, away from the actual root cause (the missing scan).
-    for (auto const& d : mod.dataItems) {
-        if (d.symbol.v > maxV) maxV = d.symbol.v;
-    }
-    // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols (`&&label` targets) also
-    // occupy SymbolIds — mint past them too, or the trampoline's exit/_start externs
-    // collide with a block symbol (surfaces downstream as K_SymbolUndefined "declared
-    // more than once" in the linker's compound-symbol index, away from this root
-    // cause — the same silent-here/loud-downstream class the dataItems scan closes).
-    for (auto const& fn : mod.functions) {
-        for (auto const& bs : fn.blockSymbols) {
-            if (bs.symbol.v > maxV) maxV = bs.symbol.v;
-        }
-    }
-    return maxV;
-}
+// ⓘ `maxExistingSymbolIdV` USED TO LIVE HERE and is now
+// `link/fresh_symbol_ids.hpp`, unchanged in behaviour. It gained a SECOND
+// caller — the object-carried data-import slot mint
+// (D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET) — and the
+// scan has already been widened twice by a collision that reached a walker
+// (dataItems, then blockSymbols), so a copy would have inherited the old rule
+// and failed the same way from the other pass. The two widenings and the
+// sequential-mint caller contract are recorded in full at the new home.
 
 // Resolve user-entry SymbolId from the format's `entryPoint` field.
 // Empty entryPoint defaults to `functions[0]` (cycle-2 convention

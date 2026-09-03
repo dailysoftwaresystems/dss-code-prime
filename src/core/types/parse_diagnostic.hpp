@@ -2195,6 +2195,83 @@ enum class DiagnosticCode : std::uint16_t {
     // by that entry not declaring the group. Emitted by the semantic tier, once
     // per declaration, naming BOTH specifiers. Renders error[S078].
     S_ConflictingStorageClassSpecifiers = 0xE078,
+    // C23 5.2.5.3.3¶19 / Annex F.2.2¶1
+    // (D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY): a
+    // floating CONSTANT whose correctly-rounded value at its own declared type
+    // is a signed INFINITY — `1e400` for `double`, `1e40f` for `float`,
+    // `1e5000L` on a wide `long double` axis, `0x1p+99999` on any of them. The
+    // value is not wrong and the program is not refused: on an IEC 60559
+    // implementation ±∞ IS the nearest representable value, exactly as
+    // 0x3FB999999999999A is 0.1's, which is why the sibling row made DSS accept
+    // it. This code reports that the literal's MAGNITUDE was not carried — the
+    // one rounding a programmer almost never intends.
+    //
+    // ★★ WARNING, AND THE MEASUREMENT IS WHAT DECIDES IT — NOT A PREFERENCE.
+    // ✔MEASURED 2026-09-02, each reference invoked SEPARATELY, DEFAULT and
+    // STRICT columns, on `double v = 1e400;` and its `float` / `long double` /
+    // hex-float siblings:
+    //   gcc 13.3.0        DEFAULT warns `floating constant exceeds range of
+    //                     'double' [-Woverflow]` rc 0; under `-Werror` the same
+    //                     text as `error [-Werror=overflow]`, rc 1
+    //   clang 18.1.3      DEFAULT warns `magnitude of floating-point constant
+    //                     too large for type 'double'; maximum is
+    //                     1.7976931348623157E+308 [-Wliteral-range]` rc 0;
+    //                     `-Werror` promotes it, rc 1
+    //   mingw-w64 13.2.0  gcc's text verbatim, both columns
+    //   MSVC 19.51.36252  REFUSES outright, `error C2177: constant too big`,
+    //                     identically at `/W4 /WX` and with no flags
+    // ⇒ **NOT ONE MEMBER OF THE UNION ACCEPTS THIS LITERAL SILENTLY.** Three
+    // speak and one refuses. Silence was therefore the single posture no
+    // reference takes, and it is the posture DSS held between the sibling row
+    // landing and this code existing. Warning is the only severity that is
+    // simultaneously at-or-above the union's floor (something is said) and not
+    // above its ceiling (the program still compiles for the three that compile
+    // it).
+    //
+    // ⚠ `--warnings-as-errors` PROMOTES THIS, AND THAT IS THE POINT, NOT A
+    // SURPRISE. Under that flag DSS refuses `1e400` — which is precisely MSVC's
+    // unconditional behaviour and precisely gcc's and clang's under `-Werror`.
+    // Every reference posture is therefore reachable from DSS: default = the
+    // gcc/clang default, `--warnings-as-errors` = `-Werror` = MSVC. Whoever
+    // builds with that flag and hits this is seeing the strict reading they
+    // asked for.
+    //
+    // ⚠ WHERE IT MUST NOT FIRE, ✔MEASURED on all four references, which are
+    // SILENT on every one of these: `DBL_MAX` (1.7976931348623157e308) and
+    // `FLT_MAX` (3.40282347e38f) — the largest FINITE values, one ulp below the
+    // first literal that does warn; a binary64 SUBNORMAL (`1e-320`), which is an
+    // ordinary representable value; and `1e400L` on the x87-80 and binary128
+    // axes, where it is FINITE (both carry a 15-bit exponent and top out near
+    // 1.19e4932 — the overflow there begins around 1e4933). The predicate is the
+    // ROUNDED VALUE being infinite, never a decimal-exponent threshold, so those
+    // fall out rather than being special-cased.
+    //
+    // ⓘ UNDERFLOW IS DELIBERATELY NOT THIS CODE'S, and the reason is the same
+    // measurement read the other way. On flush-to-zero (`1e-330`) gcc, clang and
+    // mingw warn (`floating constant truncated to zero` / `magnitude … too
+    // small`) but ✔MEASURED MSVC 19.51.36252 ACCEPTS IT SILENTLY at `/W4 /WX` —
+    // so unlike the overflow case a silent accept IS a reference posture, and
+    // DSS matching it sits inside the union rather than below it. Two further
+    // reasons: the wide door still REFUSES a `long double` underflow
+    // (`D-CSUBSET-LONG-DOUBLE-CONSTFOLD-SUBNORMAL-RESULT`, still open), so a
+    // warning would cover one of the two doors and speak with two voices about
+    // one class; and promoting it under `--warnings-as-errors` would restore a
+    // refusal `D-C-DECODEFLOAT-TREATS-UNDERFLOW-AS-FATAL` deliberately removed.
+    //
+    // Emitted by the SEMANTIC tier from the ONE literal-typing chokepoint, so it
+    // fires once for EVERY occurrence of the literal in the translation unit
+    // regardless of what a later phase does with it — ✔MEASURED that gcc and
+    // clang warn in an unevaluated `sizeof` operand, a `_Static_assert`
+    // condition, a `if (0)` branch, an uncalled function and an unused file-scope
+    // static alike, none of which the lowering tier necessarily reaches.
+    // SUPPRESSABLE, deliberately: hiding it ships the identical artifact (the
+    // value is the correctly-rounded one either way), so it fails both prongs of
+    // `kUnsuppressableCodes` — the `S_AsmLabelOnAutomaticVariable` /
+    // `S_DeprecatedSymbolUsed` negative-pin posture. Suppressibility is also what
+    // lets the Pass-1.5 + Pass-2 double visit of a literal leaf collapse in the
+    // reporter's recent-duplicate window, exactly as `S_IntegerLiteralTooLarge`'s
+    // does. Renders warning[S079].
+    S_FloatLiteralOverflowsToInfinity = 0xE079,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
